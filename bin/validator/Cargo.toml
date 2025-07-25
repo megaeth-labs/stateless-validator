@@ -13,24 +13,23 @@ path = "src/test_main.rs"
 
 
 [dependencies]
-alloy-primitives = { version = "0.8.20", default-features = false }
-axum = "0.8"
-bincode = { version = "2.0", features = ["serde"] }
-blake3 = "1.8"
-clap = { version = "4", features = ["derive"] }
-eyre = "0.6"
-serde = { version = "1.0", default-features = false }
-tokio = { version = "1.39", features = ["rt-multi-thread", "macros", "signal"] }
-alloy-provider = { version = "0.12.6", features = ["debug-api", "reqwest"] }
-alloy-rpc-types-eth = { version = "0.12.6", default-features = false }
-alloy-transport-http = { version = "0.12.6", features = [
-    "reqwest-rustls-tls",
-], default-features = false }
+alloy-primitives.workspace = true
+alloy-provider.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-transport-http.workspace = true
+
+salt.workspace = true
+
+axum.workspace = true
+bincode.workspace = true
+blake3.workspace = true
+clap.workspace = true
+eyre.workspace = true
+serde.workspace = true
+tokio.workspace = true
 validate = { path = "../../validate" }
-salt = { workspace = true }
 
-tracing = "0.1.0"
-num_cpus = "1.17"
-futures = "0.3"
-jsonrpsee = { version = "0.24", features = ["server", "macros"] }
-
+tracing.workspace = true
+num_cpus.workspace = true
+futures.workspace = true
+jsonrpsee.workspace = true

@@ -1,7 +1,7 @@
 //! This module handles file-based operations for the stateless validator.
 //! It manages the persistence of validation status, block data, and contract code.
 use crate::{curent_time_to_u64, deserialized_state_data, serialized_state_data};
-use alloy_primitives::{B256, BlockHash, BlockNumber};
+use alloy_primitives::{B256, BlockHash, BlockNumber, Bytes};
 use eyre::{Result, anyhow};
 use fs2::FileExt;
 use rand::Rng;
@@ -371,9 +371,9 @@ pub fn load_contracts_file(data_dir: &PathBuf, file_name: &str) -> Result<HashMa
         // SAFETY: `simd-json` requires a mutable string for its parser. Using `unsafe` here
         // is the idiomatic way to handle this with `BufReader::lines`, as each line is a
         // new allocation.
-        let (hash, bytecode): (B256, Bytecode) =
-            unsafe { simd_json::from_str(&mut line.to_string()) }
-                .map_err(|e| anyhow!("Failed to parse contract line '{}': {}", line, e))?;
+        let (hash, bytes): (B256, Bytes) = unsafe { simd_json::from_str(&mut line.to_string()) }
+            .map_err(|e| anyhow!("Failed to parse contract line '{}': {}", line, e))?;
+        let bytecode = Bytecode::new_raw(bytes);
         contracts.insert(hash, bytecode);
     }
 

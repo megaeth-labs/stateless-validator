@@ -9,17 +9,43 @@ use alloy_provider::{Provider, RootProvider};
 use alloy_transport_http::{Client, Http};
 use revm::{
     DatabaseRef,
+    database::DBErrorMarker,
     database::DbAccount,
     primitives::{Bytes, KECCAK_EMPTY, U256},
     state::{AccountInfo, Bytecode},
 };
 use salt::{Account, BlockWitness, PlainKey, PlainStateProvider, PlainValue};
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 use tokio::{runtime::Handle, sync::oneshot};
 
 pub mod evm;
 pub mod file;
 pub mod rpc;
+
+/// A custom error type for the `WitnessProvider`.
+///
+/// This error type wraps a `String` and implements the `std::error::Error` trait,
+/// making it compatible with the `DatabaseRef::Error` associated type.
+#[derive(Debug)]
+pub struct WitnessProviderError(String);
+
+impl fmt::Display for WitnessProviderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Error for WitnessProviderError {}
+
+impl DBErrorMarker for WitnessProviderError {}
+
+impl From<&'static str> for WitnessProviderError {
+    fn from(s: &'static str) -> Self {
+        Self(s.to_string())
+    }
+}
 
 /// A REVM database provider that sources all its data from a `BlockWitness`.
 ///
@@ -33,13 +59,13 @@ pub struct WitnessProvider {
     /// A map of contract code hashes to their corresponding bytecode.
     pub contracts: HashMap<B256, Bytecode>,
     /// An RPC provider to fetch historical block hashes.
-    pub provider: RootProvider<Http<Client>>,
+    pub provider: RootProvider,
     /// A handle to the Tokio runtime, used for dispatching async RPC calls from sync REVM code.
     pub rt: Handle,
 }
 
 impl DatabaseRef for WitnessProvider {
-    type Error = &'static str;
+    type Error = WitnessProviderError;
 
     /// Provides basic account information (balance, nonce, code hash) from the witness.
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
@@ -80,7 +106,7 @@ impl DatabaseRef for WitnessProvider {
         self.contracts
             .get(&code_hash)
             .cloned()
-            .ok_or("Code not found in witness contracts")
+            .ok_or_else(|| WitnessProviderError("Code not found in witness contracts".to_string()))
     }
 
     /// Provides a storage slot's value for a given account.
@@ -112,17 +138,17 @@ impl DatabaseRef for WitnessProvider {
         tokio::task::block_in_place(|| {
             let (tx, rx) = oneshot::channel();
             self.rt.spawn(async move {
-                let _ = tx.send(provider.get_block_by_number(number.into(), false).await);
+                let _ = tx.send(provider.get_block_by_number(number.into()).await);
             });
 
             let res = rx
                 .blocking_recv()
-                .map_err(|_| "Failed to receive block from spawned task")?;
+                .map_err(|e| WitnessProviderError(e.to_string()))?;
 
-            let block = res.map_err(|_| "Failed to get block from provider in witness provider")?;
+            let block = res.map_err(|e| WitnessProviderError(e.to_string()))?;
 
             // SAFETY: If the block is finalized and exist. Thus, we can safely unwrap the results.
-            Ok(B256::new(*block.unwrap().header.hash.unwrap()))
+            Ok(block.unwrap().header.hash)
         })
     }
 }

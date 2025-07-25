@@ -4,47 +4,39 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-salt = { workspace = true }
-mega-evm = { workspace = true }
-revm = { workspace = true, features = ["serde"] }
-alloy-primitives = { version = "0.8.20", default-features = false }
-blake3 = "1.8"
-bytes = "1.5"
-bincode = { version = "2.0", features = ["serde"] }
-serde = { version = "1.0", default-features = false }
-serde_arrays = "0.1.0"
-serde_json = "1.0.94"
-simd-json = "0.15"
-rayon = "1.7"
-alloy-rpc-types-eth = { version = "0.12.6", default-features = false }
-alloy-provider = { version = "0.12.6", features = [
-    "reqwest",
-], default-features = false }
-alloy-transport = { version = "0.12.6" }
-alloy-transport-http = { version = "0.12.6", features = [
-    "reqwest-rustls-tls",
-], default-features = false }
-eyre = "0.6"
-futures = "0.3"
-fs2 = "0.4"
-rand = "0.8.5"
-tokio = { version = "1.39", features = ["full"] }
-jsonrpsee-types = "0.24"
+alloy-primitives.workspace = true
+alloy-provider.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-transport.workspace = true
+alloy-transport-http.workspace = true
+alloy-evm.workspace = true
+alloy-hardforks.workspace = true
+
+op-alloy-network.workspace = true
+alloy-op-hardforks.workspace = true
+alloy-op-evm.workspace = true
+
+mega-evm.workspace = true
+salt.workspace = true
+revm.workspace = true
+
+blake3.workspace = true
+bytes.workspace = true
+bincode.workspace = true
+serde.workspace = true
+serde_arrays.workspace = true
+serde_json.workspace = true
+simd-json.workspace = true
+rayon.workspace = true
+
+eyre.workspace = true
+futures.workspace = true
+fs2.workspace = true
+rand.workspace = true
+tokio.workspace = true
+jsonrpsee-types.workspace = true
 
 [dev-dependencies]
 envconfig = "0.11.0"
 #reth-db = { workspace = true, features = ["mdbx", "test-utils"] }
 tempfile = "3.8"
-
-[patch.crates-io]
-revm = { git = "https://github.com/megaeth-labs/mega-revm.git", rev = "6ba3dea5f6111b9e13a85f03751063059a2c2714" }
-revm-bytecode = { git = "https://github.com/megaeth-labs/mega-revm.git", rev = "6ba3dea5f6111b9e13a85f03751063059a2c2714" }
-revm-database = { git = "https://github.com/megaeth-labs/mega-revm.git", rev = "6ba3dea5f6111b9e13a85f03751063059a2c2714" }
-revm-state = { git = "https://github.com/megaeth-labs/mega-revm.git", rev = "6ba3dea5f6111b9e13a85f03751063059a2c2714" }
-revm-primitives = { git = "https://github.com/megaeth-labs/mega-revm.git", rev = "6ba3dea5f6111b9e13a85f03751063059a2c2714" }
-revm-interpreter = { git = "https://github.com/megaeth-labs/mega-revm.git", rev = "6ba3dea5f6111b9e13a85f03751063059a2c2714" }
-revm-inspector = { git = "https://github.com/megaeth-labs/mega-revm.git", rev = "6ba3dea5f6111b9e13a85f03751063059a2c2714" }
-revm-context = { git = "https://github.com/megaeth-labs/mega-revm.git", rev = "6ba3dea5f6111b9e13a85f03751063059a2c2714" }
-revm-context-interface = { git = "https://github.com/megaeth-labs/mega-revm.git", rev = "6ba3dea5f6111b9e13a85f03751063059a2c2714" }
-revm-database-interface = { git = "https://github.com/megaeth-labs/mega-revm.git", rev = "6ba3dea5f6111b9e13a85f03751063059a2c2714" }
-op-revm = { git = "https://github.com/megaeth-labs/mega-revm.git", rev = "6ba3dea5f6111b9e13a85f03751063059a2c2714" }

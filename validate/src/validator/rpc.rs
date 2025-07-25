@@ -7,34 +7,45 @@
 //! The `get_blob_ids` function acts as an RPC endpoint handler, allowing clients to query
 //! the validation status and retrieve blob information for a given block.
 use crate::file::{ValidateStatus, load_validate_info};
-use alloy_provider::{Provider, ProviderBuilder, RootProvider};
-use alloy_rpc_types_eth::{Block, BlockTransactionsKind};
-use alloy_transport_http::{Client, Http};
-use eyre::{Result, anyhow};
+use alloy_primitives::{Address, B256, Bytes};
+use alloy_provider::{
+    Identity, Provider, ProviderBuilder, RootProvider,
+    fillers::FillProvider,
+    fillers::{BlobGasFiller, ChainIdFiller, GasFiller, JoinFill, NonceFiller},
+};
+use alloy_rpc_types_eth::BlockNumberOrTag;
+use alloy_rpc_types_eth::{Block, BlockTransactions};
+use eyre::{Result, eyre};
 use futures::future::try_join_all;
 use jsonrpsee_types::error::{
     CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
     UNKNOWN_ERROR_CODE,
 };
+use op_alloy_network::Optimism;
 //use reth_primitives::{Address, BlockNumberOrTag, Bytes, B256};
-use alloy_primitives::{Address, B256, Bytes};
-use revm::primitives::BlockNumberOrTag;
 use std::{collections::HashMap, path::PathBuf, str::FromStr};
+
+// The concrete provider type built by `ProviderBuilder`.
+type DefaultProvider = FillProvider<
+    JoinFill<
+        Identity,
+        JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
+    >,
+    RootProvider,
+>;
 
 /// An RPC client for fetching data from a full Ethereum node.
 #[derive(Debug, Clone)]
 pub struct RpcClient {
     /// The HTTP-based RPC provider.
-    pub provider: RootProvider<Http<Client>>,
+    pub provider: DefaultProvider,
 }
 
 impl RpcClient {
     /// Creates a new `RpcClient` connected to the given API endpoint.
     pub fn new(api: &str) -> Result<Self> {
-        let provider = ProviderBuilder::new().on_http(
-            api.parse()
-                .map_err(|e| anyhow!("parse api failed: {}", e))?,
-        );
+        let provider = ProviderBuilder::new()
+            .on_http(api.parse().map_err(|e| eyre!("parse api failed: {}", e))?);
 
         Ok(Self { provider })
     }
@@ -56,7 +67,7 @@ impl RpcClient {
                     .block_id(block_number.into())
                     .await
                     .map_err(|e| {
-                        anyhow!(
+                        eyre!(
                             "get_code_at for address {single_address:?} at block {block_number:?} failed: {e}"
                         )
                     })
@@ -75,22 +86,29 @@ impl RpcClient {
 
             async move {
                 provider_clone
-                    .get_block_by_number(block_number.into(), false)
+                    .get_block(block_number.into())
                     .await
-                    .map_err(|e| anyhow!("get_block_by_number at {block_number} failed: {e}"))
+                    .map_err(|e| eyre!("get_block_by_number at {block_number} failed: {e}"))
             }
         });
 
         let results = try_join_all(futures)
             .await
-            .map_err(|e| anyhow!("Failed to gather block data from provider(s) concurrently: {}", e))
+            .map_err(|e| {
+                eyre!(
+                    "Failed to gather block data from provider(s) concurrently: {}",
+                    e
+                )
+            })
             .and_then(|block_options_vec| {
                 block_options_vec
                     .into_iter()
                     .map(|opt_block| {
-                        opt_block
-                            .and_then(|block| block.header.hash)
-                            .ok_or_else(|| anyhow!("A requested block was not found by the provider or its header is missing"))
+                        opt_block.and_then(|block| Some(block.header.hash)).ok_or_else(|| {
+                            eyre!(
+                                "A requested block was not found by the provider or its header is missing"
+                            )
+                        })
                     })
                     .collect::<Result<Vec<B256>, _>>()
             })?;
@@ -100,26 +118,38 @@ impl RpcClient {
 
     /// Fetches a full block by its hash.
     pub async fn block_by_hash(&self, hash: B256, full_txs: bool) -> Result<Block> {
-        let kind = if full_txs {
-            BlockTransactionsKind::Full
+        if full_txs {
+            self.provider
+                .get_block(hash.into())
+                .full()
+                .await
+                .map_err(|e| eyre!("get_block_by_hash at {hash} failed: {e}"))?
+                .ok_or(eyre!("block not found"))
         } else {
-            BlockTransactionsKind::Hashes
-        };
-
-        self.provider
-            .get_block_by_hash(hash, kind)
-            .await
-            .map_err(|e| anyhow!("get_block_by_hash at {hash} failed: {e}"))?
-            .ok_or(anyhow!("block not found"))
+            self.provider
+                .get_block(hash.into())
+                .await
+                .map_err(|e| eyre!("get_block_by_hash at {hash} failed: {e}"))?
+                .ok_or(eyre!("block not found"))
+        }
     }
 
     /// Fetches a full block by its number.
     pub async fn block_by_number(&self, number: u64, full_txs: bool) -> Result<Block> {
-        self.provider
-            .get_block_by_number(number.into(), full_txs)
-            .await
-            .map_err(|e| anyhow!("get_block_by_number at {number} failed: {e}"))?
-            .ok_or(anyhow!("block not found"))
+        if full_txs {
+            self.provider
+                .get_block(number.into())
+                .full()
+                .await
+                .map_err(|e| eyre!("get_block_by_number at {number} failed: {e}"))?
+                .ok_or(eyre!("block not found"))
+        } else {
+            self.provider
+                .get_block(number.into())
+                .await
+                .map_err(|e| eyre!("get_block_by_number at {number} failed: {e}"))?
+                .ok_or(eyre!("block not found"))
+        }
     }
 }
 
