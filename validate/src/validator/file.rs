@@ -259,7 +259,7 @@ fn save_validate_info(
     let file_name = validate_file_name(block_number, block_hash);
     create_dir_all(&dir)?;
 
-    let rand_num: u32 = rand::thread_rng().r#gen();
+    let rand_num: u32 = rand::rng().random();
     let tmp_path = dir.join(format!("{}.{}.tmp", file_name, rand_num));
     let final_path = dir.join(file_name);
 

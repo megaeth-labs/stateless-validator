@@ -8,13 +8,9 @@
 //! the validation status and retrieve blob information for a given block.
 use crate::file::{ValidateStatus, load_validate_info};
 use alloy_primitives::{Address, B256, Bytes};
-use alloy_provider::{
-    Identity, Provider, ProviderBuilder, RootProvider,
-    fillers::FillProvider,
-    fillers::{BlobGasFiller, ChainIdFiller, GasFiller, JoinFill, NonceFiller},
-};
+use alloy_provider::{Provider, ProviderBuilder, RootProvider};
+use alloy_rpc_types_eth::Block;
 use alloy_rpc_types_eth::BlockNumberOrTag;
-use alloy_rpc_types_eth::{Block, BlockTransactions};
 use eyre::{Result, eyre};
 use futures::future::try_join_all;
 use jsonrpsee_types::error::{
@@ -22,29 +18,21 @@ use jsonrpsee_types::error::{
     UNKNOWN_ERROR_CODE,
 };
 use op_alloy_network::Optimism;
+use op_alloy_rpc_types::Transaction;
 //use reth_primitives::{Address, BlockNumberOrTag, Bytes, B256};
 use std::{collections::HashMap, path::PathBuf, str::FromStr};
-
-// The concrete provider type built by `ProviderBuilder`.
-type DefaultProvider = FillProvider<
-    JoinFill<
-        Identity,
-        JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
-    >,
-    RootProvider,
->;
 
 /// An RPC client for fetching data from a full Ethereum node.
 #[derive(Debug, Clone)]
 pub struct RpcClient {
     /// The HTTP-based RPC provider.
-    pub provider: DefaultProvider,
+    pub provider: RootProvider<Optimism>,
 }
 
 impl RpcClient {
     /// Creates a new `RpcClient` connected to the given API endpoint.
     pub fn new(api: &str) -> Result<Self> {
-        let provider = ProviderBuilder::new()
+        let provider = ProviderBuilder::<_, _, Optimism>::default()
             .on_http(api.parse().map_err(|e| eyre!("parse api failed: {}", e))?);
 
         Ok(Self { provider })
@@ -117,7 +105,7 @@ impl RpcClient {
     }
 
     /// Fetches a full block by its hash.
-    pub async fn block_by_hash(&self, hash: B256, full_txs: bool) -> Result<Block> {
+    pub async fn block_by_hash(&self, hash: B256, full_txs: bool) -> Result<Block<Transaction>> {
         if full_txs {
             self.provider
                 .get_block(hash.into())
@@ -135,7 +123,7 @@ impl RpcClient {
     }
 
     /// Fetches a full block by its number.
-    pub async fn block_by_number(&self, number: u64, full_txs: bool) -> Result<Block> {
+    pub async fn block_by_number(&self, number: u64, full_txs: bool) -> Result<Block<Transaction>> {
         if full_txs {
             self.provider
                 .get_block(number.into())

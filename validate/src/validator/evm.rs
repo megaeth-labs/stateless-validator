@@ -1,28 +1,27 @@
 //! This module provides functions for interacting with the EVM, specifically for replaying
 //! block transactions using REVM.
+use alloy_consensus::transaction::Recovered;
 use alloy_evm::EvmEnv;
 use alloy_evm::EvmFactory as AlloyEvmFactory;
+use alloy_evm::block::BlockExecutor;
 use alloy_evm::block::BlockExecutorFactory as AlloyBlockExecutorFactory;
 use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition};
-use alloy_op_evm::block::OpAlloyReceiptBuilder;
+use alloy_network_primitives::TransactionResponse;
 use alloy_op_hardforks::{OpHardfork, OpHardforks};
-use alloy_rpc_types_eth::{Block, BlockTransactions, Transaction};
+use alloy_rpc_types_eth::{Block, BlockTransactions};
 use eyre::{Result, eyre};
-use mega_evm::{BlockExecutionCtx, BlockExecutorFactory, Context, Evm, EvmFactory, SpecId};
-use revm::{
-    DatabaseCommit, ExecuteEvm, InspectEvm, Inspector, Journal,
-    context::{
-        BlockEnv, Cfg, CfgEnv, ContextSetters, ContextTr, TxEnv,
-        result::{EVMError, ExecutionResult, ResultAndState},
-    },
-    database::CacheDB,
-    handler::{EthFrame, EvmTr, instructions::InstructionProvider},
-    inspector::{InspectorHandler, NoOpInspector},
-    interpreter::{Interpreter, InterpreterTypes},
-    primitives::{TxKind, U256},
-};
+use mega_evm::{BlockExecutionCtx, BlockExecutorFactory, EvmFactory, SpecId};
+use op_alloy_rpc_types::Transaction as OpTransaction;
+use revm::context::{BlockEnv, CfgEnv};
+use revm::database::states::StateBuilder;
 
-use super::WitnessProvider;
+use crate::validator::WitnessProvider;
+use crate::validator::evm::receipts::OpRethReceiptBuilder;
+use crate::validator::evm::signed::OpTransactionSigned;
+
+mod receipt;
+mod receipts;
+mod signed;
 
 /// Replays a block's transactions against a given pre-state represented by a `WitnessProvider`.
 ///
@@ -43,224 +42,57 @@ use super::WitnessProvider;
 /// replay process fails, such as encountering wrong transaction types, issues with
 /// block data, or errors during EVM execution.
 
-pub fn replay_block(block: Block, db: &mut CacheDB<WitnessProvider>) -> Result<()> {
+pub fn replay_block(block: Block<OpTransaction>, provider: &WitnessProvider) -> Result<()> {
     let BlockTransactions::Full(transactions) = block.transactions.clone() else {
         return Err(eyre!("Wrong transaction type, expected full transactions"));
     };
 
-    // The chain_spec is only used by `apply_beacon_root_contract_call` to check if the
-    // Cancun hardfork is active at the block's timestamp. A mainnet spec is sufficient for this
-    // purpose.
-    //let chain_spec = ChainSpecBuilder::mainnet().build();
-    // let mut context = Context::new(db, SpecId::MINI_RAX);
-    // context.with_block(block_env);
+    let mut state = StateBuilder::new().with_database_ref(provider).build();
 
-    let block_env = get_block_env(&block)?;
-    let evm_env: EvmEnv<SpecId> = EvmEnv::new(CfgEnv::default(), block_env);
-
-    let evm_factory = EvmFactory::default();
-
-    let evm = evm_factory.create_evm(db, evm_env);
+    let block_executor_factory = BlockExecutorFactory::new(
+        ChainSpec::default(),
+        EvmFactory::default(),
+        OpRethReceiptBuilder::default(),
+    );
 
     let op_block_execution_ctx = BlockExecutionCtx {
         parent_hash: block.header.parent_hash,
         parent_beacon_block_root: block.header.parent_beacon_block_root,
-        extra_data: block.header.extra_data,
+        extra_data: block.header.extra_data.clone(),
     };
 
-    let block_executor_factory = BlockExecutorFactory::new(
-        ChainSpec::default(),
-        evm_factory,
-        OpAlloyReceiptBuilder::default(),
+    let block_env = get_block_env(&block)?;
+    let evm_env: EvmEnv<SpecId> = EvmEnv::new(CfgEnv::default(), block_env);
+
+    let mut block_executor = block_executor_factory.create_executor(
+        block_executor_factory
+            .evm_factory()
+            .create_evm(&mut state, evm_env),
+        op_block_execution_ctx,
     );
 
-    let block_executor = block_executor_factory.create_executor(evm, op_block_execution_ctx);
+    block_executor
+        .apply_pre_execution_changes()
+        .map_err(|e| eyre!("apply_pre_execution_changes failed: {:?}", e))?;
 
-    // // Apply the beacon root contract call, a step specific to Optimism chains.
-    // apply_beacon_root_contract_call(
-    //     &OptimismEvmConfig::default(),
-    //     &chain_spec,
-    //     block.header.timestamp,
-    //     block.header.number.ok_or(eyre!("number is None"))?,
-    //     block.header.parent_beacon_block_root,
-    //     &mut evm,
-    // )
-    // .map_err(|e| eyre!("apply_beacon_root_contract_call failed: {:?}", e))?;
+    for tx in transactions {
+        let signer = tx.from();
 
-    // for tx in transactions {
-    //     *evm.tx_mut() = get_tx_env(&tx)?;
+        let tx_signed = OpTransactionSigned::from(tx);
+        let recovered = Recovered::new_unchecked(&tx_signed, signer);
+        block_executor.execute_transaction(recovered);
+    }
 
-    //     // Execute the transaction and commit its changes to the database.
-    //     let _result = evm
-    //         .transact_commit()
-    //         .map_err(|e| eyre!("transact_commit failed: {:?}", e))?;
-    // }
+    block_executor
+        .apply_post_execution_changes()
+        .map_err(|e| eyre!("apply_post_execution_changes failed: {:?}", e))?;
+
+    // let (evm, result) = block_executor
+    //     .finish()
+    //     .map_err(|e| eyre!("finish failed: {:?}", e))?;
 
     Ok(())
 }
-
-/// Converts an `alloy_rpc_types_eth::Transaction` to a `revm::primitives::TxEnv`.
-///
-/// This function maps the fields from the RPC transaction type to the format required
-/// by the REVM for transaction execution. It handles different transaction types
-/// (Legacy, EIP-2930, EIP-1559, EIP-4844, EIP-7702, and Optimism's Deposit type).
-///
-/// # Arguments
-///
-/// * `tx` - A reference to the `Transaction` object to be converted.
-///
-/// # Returns
-///
-/// Returns `Ok(TxEnv)` if the conversion is successful.
-/// Returns an `Err` if essential fields are missing for a given transaction type
-/// (e.g., `gas_price` for a Legacy transaction) or if the transaction type is unsupported.
-// fn get_tx_env(tx: &Transaction) -> Result<TxEnv> {
-//     let signature = tx.signature.ok_or(eyre!("signature is None"))?;
-//     let transaction = match tx.transaction_type {
-//         Some(0) => RethTransaction::Legacy(TxLegacy {
-//             chain_id: tx.chain_id,
-//             nonce: tx.nonce,
-//             gas_price: tx
-//                 .gas_price
-//                 .ok_or(eyre!("gas_price is None in Legacy tx"))?,
-//             gas_limit: tx.gas as u64,
-//             to: TxKind::from(tx.to),
-//             value: tx.value,
-//             input: tx.input.clone(),
-//         }),
-//         Some(1) => RethTransaction::Eip2930(TxEip2930 {
-//             chain_id: tx.chain_id.ok_or(eyre!("chain_id is None in Eip2930 tx"))?,
-//             nonce: tx.nonce,
-//             gas_price: tx
-//                 .gas_price
-//                 .ok_or(eyre!("gas_price is None in Eip2930 tx"))?,
-//             gas_limit: tx.gas as u64,
-//             to: TxKind::from(tx.to),
-//             value: tx.value,
-//             access_list: tx.access_list.clone().unwrap_or_default(),
-//             input: tx.input.clone(),
-//         }),
-//         Some(2) => RethTransaction::Eip1559(TxEip1559 {
-//             chain_id: tx.chain_id.ok_or(eyre!("chain_id is None in Eip1559 tx"))?,
-//             nonce: tx.nonce,
-//             gas_limit: tx.gas as u64,
-//             max_fee_per_gas: tx
-//                 .max_fee_per_gas
-//                 .ok_or(eyre!("max_fee_per_gas is None in Eip1559 tx"))?,
-//             max_priority_fee_per_gas: tx
-//                 .max_priority_fee_per_gas
-//                 .ok_or(eyre!("max_priority_fee_per_gas is None in Eip1559 tx"))?,
-
-//             to: TxKind::from(tx.to),
-//             value: tx.value,
-//             access_list: tx.access_list.clone().unwrap_or_default(),
-//             input: tx.input.clone(),
-//         }),
-//         Some(3) => RethTransaction::Eip4844(TxEip4844 {
-//             chain_id: tx.chain_id.ok_or(eyre!("chain_id is None in Eip4844 tx"))?,
-//             nonce: tx.nonce,
-//             gas_limit: tx.gas as u64,
-//             max_fee_per_gas: tx
-//                 .max_fee_per_gas
-//                 .ok_or(eyre!("max_fee_per_gas is None in Eip4844 tx"))?,
-//             max_priority_fee_per_gas: tx
-//                 .max_priority_fee_per_gas
-//                 .ok_or(eyre!("max_priority_fee_per_gas is None in Eip4844 tx"))?,
-//             placeholder: None,
-//             to: tx.to.ok_or(eyre!("to is None in Eip4844 tx"))?,
-//             value: tx.value,
-//             access_list: tx.access_list.clone().unwrap_or_default(),
-//             blob_versioned_hashes: tx.blob_versioned_hashes.clone().unwrap_or_default(),
-//             max_fee_per_blob_gas: tx
-//                 .max_fee_per_blob_gas
-//                 .ok_or(eyre!("max_fee_per_blob_gas is None in Eip4844 tx"))?,
-
-//             input: tx.input.clone(),
-//         }),
-//         Some(4) => RethTransaction::Eip7702(TxEip7702 {
-//             chain_id: tx.chain_id.ok_or(eyre!("chain_id is None in Eip7702 tx"))?,
-//             nonce: tx.nonce,
-//             gas_limit: tx.gas as u64,
-//             max_fee_per_gas: tx
-//                 .max_fee_per_gas
-//                 .ok_or(eyre!("max_fee_per_gas is None in Eip7702 tx"))?,
-//             max_priority_fee_per_gas: tx
-//                 .max_priority_fee_per_gas
-//                 .ok_or(eyre!("max_priority_fee_per_gas is None in Eip7702 tx"))?,
-//             to: TxKind::from(tx.to),
-//             value: tx.value,
-//             access_list: tx.access_list.clone().unwrap_or_default(),
-//             authorization_list: tx.authorization_list.clone().unwrap_or_default(),
-//             input: tx.input.clone(),
-//         }),
-//         Some(126) => {
-//             // This handles the Optimism-specific Deposit transaction type (type 126).
-//             // It extracts custom fields like `source_hash`, `mint`, and `is_system_transaction`
-//             // from the `other` field of the RPC transaction.
-//             let source_hash = if let Some(source_hash_value) = tx.other.get("sourceHash") {
-//                 if let Some(source_hash_str) = source_hash_value.as_str() {
-//                     source_hash_str.parse().unwrap_or_default()
-//                 } else {
-//                     B256::default()
-//                 }
-//             } else {
-//                 B256::default()
-//             };
-
-//             let mint = if let Some(mint_value) = tx.other.get("mint") {
-//                 if let Some(mint_str) = mint_value.as_str() {
-//                     U256::from_str(mint_str).ok().map(|v| v.to::<u128>())
-//                 } else if let Some(mint_num) = mint_value.as_u64() {
-//                     Some(mint_num as u128)
-//                 } else {
-//                     None
-//                 }
-//             } else {
-//                 None
-//             };
-
-//             let is_system_transaction = if let Some(is_system_tx_value) = tx.other.get("isSystemTx")
-//             {
-//                 is_system_tx_value.as_bool().unwrap_or_default()
-//             } else {
-//                 false
-//             };
-
-//             RethTransaction::Deposit(TxDeposit {
-//                 source_hash,
-//                 from: tx.from,
-//                 to: TxKind::from(tx.to),
-//                 mint,
-//                 value: tx.value,
-//                 gas_limit: tx.gas as u64,
-//                 is_system_transaction,
-//                 input: tx.input.clone(),
-//             })
-//         }
-//         _ => {
-//             return Err(eyre!(
-//                 "Unsupported transaction type: {:?}",
-//                 tx.transaction_type
-//             ));
-//         }
-//     };
-
-//     let signed_tx = TransactionSigned {
-//         hash: tx.hash,
-//         signature: Signature {
-//             r: signature.r,
-//             s: signature.s,
-//             odd_y_parity: signature.y_parity.unwrap_or_default().0,
-//         },
-//         transaction,
-//     };
-
-//     let mut env = TxEnv::default();
-
-//     signed_tx.fill_tx_env(&mut env, tx.from);
-
-//     Ok(env)
-// }
 
 /// Creates a `revm::primitives::BlockEnv` from an `alloy_rpc_types_eth::Block`.
 ///
@@ -276,7 +108,7 @@ pub fn replay_block(block: Block, db: &mut CacheDB<WitnessProvider>) -> Result<(
 ///
 /// Returns `Ok(BlockEnv)` if the conversion is successful.
 /// Returns an `Err` if essential block header fields like `number` are missing.
-fn get_block_env(block: &Block) -> Result<BlockEnv> {
+fn get_block_env(block: &Block<OpTransaction>) -> Result<BlockEnv> {
     let header = &block.header;
     let mut block_env = BlockEnv {
         number: header.number,

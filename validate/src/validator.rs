@@ -6,7 +6,6 @@
 //! block replay and validation.
 use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, RootProvider};
-use alloy_transport_http::{Client, Http};
 use revm::{
     DatabaseRef,
     database::DBErrorMarker,

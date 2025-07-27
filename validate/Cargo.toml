@@ -11,10 +11,17 @@ alloy-transport.workspace = true
 alloy-transport-http.workspace = true
 alloy-evm.workspace = true
 alloy-hardforks.workspace = true
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-rlp.workspace = true
+alloy-network-primitives.workspace = true
 
 op-alloy-network.workspace = true
 alloy-op-hardforks.workspace = true
 alloy-op-evm.workspace = true
+op-alloy-consensus.workspace = true
+op-alloy-rpc-types.workspace = true
+op-revm.workspace = true
 
 mega-evm.workspace = true
 salt.workspace = true
