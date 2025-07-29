@@ -5,10 +5,9 @@ use alloy_primitives::{B256, BlockHash, BlockNumber, Bytes};
 use eyre::{Result, anyhow};
 use fs2::FileExt;
 use rand::Rng;
-use revm::state::Bytecode;
+use revm::{primitives::HashMap, state::Bytecode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
-    collections::HashMap,
     fs::{File, OpenOptions, create_dir_all, read_dir},
     io::{BufRead, BufReader, Read, Write},
     path::PathBuf,
@@ -354,14 +353,14 @@ pub fn validate_file_name(block_num: BlockNumber, block_hash: BlockHash) -> Stri
 pub fn load_contracts_file(data_dir: &PathBuf, file_name: &str) -> Result<HashMap<B256, Bytecode>> {
     let json_file = data_dir.join(file_name);
     if !json_file.exists() {
-        return Ok(HashMap::new());
+        return Ok(HashMap::default());
     }
 
     let file = File::open(&json_file)
         .map_err(|e| anyhow!("Failed to open {} file: {}", json_file.display(), e))?;
 
     let reader = BufReader::new(file);
-    let mut contracts = HashMap::new();
+    let mut contracts = HashMap::default();
 
     for line in reader.lines() {
         let line = line.map_err(|e| anyhow!("Failed to read line: {}", e))?;

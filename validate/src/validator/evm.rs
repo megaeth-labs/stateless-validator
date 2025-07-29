@@ -1,10 +1,10 @@
 //! This module provides functions for interacting with the EVM, specifically for replaying
 //! block transactions using REVM.
 use alloy_consensus::transaction::Recovered;
-use alloy_evm::EvmEnv;
-use alloy_evm::EvmFactory as AlloyEvmFactory;
-use alloy_evm::block::BlockExecutor;
-use alloy_evm::block::BlockExecutorFactory as AlloyBlockExecutorFactory;
+use alloy_evm::{
+    EvmEnv, EvmFactory as AlloyEvmFactory, block::BlockExecutor,
+    block::BlockExecutorFactory as AlloyBlockExecutorFactory,
+};
 use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition};
 use alloy_network_primitives::TransactionResponse;
 use alloy_op_hardforks::{OpHardfork, OpHardforks};
@@ -12,8 +12,11 @@ use alloy_rpc_types_eth::{Block, BlockTransactions};
 use eyre::{Result, eyre};
 use mega_evm::{BlockExecutionCtx, BlockExecutorFactory, EvmFactory, SpecId};
 use op_alloy_rpc_types::Transaction as OpTransaction;
-use revm::context::{BlockEnv, CfgEnv};
-use revm::database::states::StateBuilder;
+use revm::{
+    context::{BlockEnv, CfgEnv},
+    database::states::{CacheAccount, StateBuilder},
+    primitives::{Address, HashMap},
+};
 
 use crate::validator::WitnessProvider;
 use crate::validator::evm::receipts::OpRethReceiptBuilder;
@@ -42,7 +45,10 @@ mod signed;
 /// replay process fails, such as encountering wrong transaction types, issues with
 /// block data, or errors during EVM execution.
 
-pub fn replay_block(block: Block<OpTransaction>, provider: &WitnessProvider) -> Result<()> {
+pub fn replay_block(
+    block: Block<OpTransaction>,
+    provider: &WitnessProvider,
+) -> Result<HashMap<Address, CacheAccount>> {
     let BlockTransactions::Full(transactions) = block.transactions.clone() else {
         return Err(eyre!("Wrong transaction type, expected full transactions"));
     };
@@ -80,7 +86,7 @@ pub fn replay_block(block: Block<OpTransaction>, provider: &WitnessProvider) -> 
 
         let tx_signed = OpTransactionSigned::from(tx);
         let recovered = Recovered::new_unchecked(&tx_signed, signer);
-        block_executor.execute_transaction(recovered);
+        let _res = block_executor.execute_transaction(recovered)?;
     }
 
     block_executor
@@ -91,7 +97,7 @@ pub fn replay_block(block: Block<OpTransaction>, provider: &WitnessProvider) -> 
     //     .finish()
     //     .map_err(|e| eyre!("finish failed: {:?}", e))?;
 
-    Ok(())
+    Ok(state.cache.accounts)
 }
 
 /// Creates a `revm::primitives::BlockEnv` from an `alloy_rpc_types_eth::Block`.

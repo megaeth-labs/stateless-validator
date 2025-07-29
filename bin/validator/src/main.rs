@@ -1,14 +1,14 @@
+use alloy_primitives::Address;
 use clap::Parser;
 use eyre::{Result, anyhow};
 use futures::stream::{self, StreamExt};
 use jsonrpsee::{RpcModule, server::Server};
 use revm::{
-    db::in_memory_db::CacheDB,
-    primitives::{B256, Bytecode},
+    primitives::{B256, HashMap, KECCAK_EMPTY},
+    state::Bytecode,
 };
 use salt::{BlockWitness, EphemeralSaltState, StateRoot};
 use std::{
-    collections::HashMap,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -17,6 +17,7 @@ use tokio::{runtime::Handle, signal, sync::Mutex};
 use tracing::{error, info};
 use validate::{
     SaltWitnessState,
+    formate::{PlainKey, PlainValue},
     generate::{curent_time_to_u64, get_witness_state},
     produce::get_chain_status,
     validator::{
@@ -281,13 +282,13 @@ async fn validate_block(
             .await?;
             let new_state_root = block.header.state_root;
 
-            block_witness.verify_proof::<BlockWitness, BlockWitness>(old_state_root)?;
+            block_witness.verify_proof::<BlockWitness, BlockWitness>(*old_state_root)?;
 
-            let code_hash_not_empty_addresses = block_witness.get_code_hash_not_empty_addresses();
+            let addresses_with_code = get_addresses_with_code(&block_witness);
 
             let mut contracts_guard = contracts.lock().await;
 
-            let new_contracts_address = code_hash_not_empty_addresses
+            let new_contracts_address = addresses_with_code
                 .iter()
                 .filter_map(|(address, code_hash)| {
                     if !contracts_guard.contains_key(code_hash) {
@@ -324,11 +325,10 @@ async fn validate_block(
                 provider: client.provider.clone(),
                 rt,
             };
-            let mut db = CacheDB::new(witness_provider);
 
-            replay_block(block.clone(), &mut db)?;
+            let accounts = replay_block(block.clone(), &witness_provider)?;
 
-            let plain_state: PlainKeyUpdate = db.accounts.into();
+            let plain_state = PlainKeyUpdate::from(accounts);
 
             let state_updates = EphemeralSaltState::new(&block_witness)
                 .update(&plain_state.data)
@@ -336,7 +336,7 @@ async fn validate_block(
 
             let mut trie = StateRoot::new();
             let (new_trie_root, _trie_updates) = trie
-                .update(&block_witness, &state_updates)
+                .update(&block_witness, &block_witness, &state_updates)
                 .map_err(|e| anyhow!("Failed to update trie: {}", e))?;
 
             if new_trie_root != new_state_root {
@@ -393,4 +393,37 @@ async fn get_root(
     }
 
     Ok(validate_info.state_root)
+}
+
+/// Extracts all addresses that have a non-empty bytecode hash from the witness.
+/// This is useful for fetching contract code required for block execution.
+fn get_addresses_with_code(block_witness: &BlockWitness) -> Vec<(Address, B256)> {
+    block_witness
+        .kvs
+        .values()
+        .filter_map(|v| {
+            let val = v.as_ref()?;
+
+            // `SaltValue.data[0]` stores the plainkey length. When the length is 0, it
+            // signifies that this `SaltValue` holds a bucket nonce, not a plainkey and
+            // plainvalue.
+            if val.data[0] == 0 {
+                return None;
+            }
+
+            let key_len = val.data[0] as usize;
+            let value_len = val.data[1] as usize;
+            let plain_key = PlainKey::decode(val.data[2..2 + key_len].as_ref());
+            let plain_value =
+                PlainValue::decode(val.data[2 + key_len..2 + key_len + value_len].as_ref());
+
+            match (plain_key, plain_value) {
+                (PlainKey::Account(address), PlainValue::Account(account)) => account
+                    .bytecode_hash
+                    .filter(|&code_hash| code_hash != KECCAK_EMPTY)
+                    .map(|code_hash| (address, code_hash)),
+                _ => None,
+            }
+        })
+        .collect()
 }

@@ -7,9 +7,9 @@ edition = "2024"
 name = "megaeth-validator"
 path = "src/main.rs"
 
-[[bin]]
-name = "test_main"
-path = "src/test_main.rs"
+# [[bin]]
+# name = "test_main"
+# path = "src/test_main.rs"
 
 
 [dependencies]
@@ -19,6 +19,7 @@ alloy-rpc-types-eth.workspace = true
 alloy-transport-http.workspace = true
 
 salt.workspace = true
+revm = { workspace = true, features = ["serde"] }
 
 axum.workspace = true
 bincode.workspace = true

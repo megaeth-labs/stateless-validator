@@ -7,15 +7,15 @@
 use crate::formate::{Account, PlainKey, PlainValue};
 use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, RootProvider};
+use op_alloy_network::Optimism;
 use revm::{
     DatabaseRef,
     database::DBErrorMarker,
-    database::DbAccount,
-    primitives::{Bytes, KECCAK_EMPTY, U256},
+    database::states::CacheAccount,
+    primitives::{Bytes, HashMap, KECCAK_EMPTY, U256},
     state::{AccountInfo, Bytecode},
 };
 use salt::{BlockWitness, PlainStateProvider};
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use tokio::{runtime::Handle, sync::oneshot};
@@ -59,7 +59,7 @@ pub struct WitnessProvider {
     /// A map of contract code hashes to their corresponding bytecode.
     pub contracts: HashMap<B256, Bytecode>,
     /// An RPC provider to fetch historical block hashes.
-    pub provider: RootProvider,
+    pub provider: RootProvider<Optimism>,
     /// A handle to the Tokio runtime, used for dispatching async RPC calls from sync REVM code.
     pub rt: Handle,
 }
@@ -157,49 +157,57 @@ impl DatabaseRef for WitnessProvider {
 ///
 /// This struct is used to hold the changes to accounts and storage that result from
 /// executing a block. It is created by converting from REVM's native `DbAccount` map.
-#[derive(Debug, Clone)]
+#[derive(Default, Debug, Clone)]
 pub struct PlainKeyUpdate {
     /// A map from a `Vec<u8>` (representing an account or storage slot) to its new value.
     /// `None` signifies a deletion.
     pub data: HashMap<Vec<u8>, Option<Vec<u8>>>,
 }
 
-impl From<HashMap<Address, DbAccount>> for PlainKeyUpdate {
+impl From<HashMap<Address, CacheAccount>> for PlainKeyUpdate {
     /// Converts REVM's state changes into the `PlainKeyUpdate` format.
-    fn from(accounts: HashMap<Address, DbAccount>) -> Self {
-        let mut data = HashMap::new();
+    fn from(accounts: HashMap<Address, CacheAccount>) -> Self {
+        let mut data = HashMap::default();
         for (address, account) in accounts {
             // Handle account updates.
             let account_key = PlainKey::Account(address).encode();
-            let plain_account = Account {
-                nonce: account.info.nonce,
-                balance: account.info.balance,
-                bytecode_hash: if account.info.code_hash == KECCAK_EMPTY {
-                    None
-                } else {
-                    Some(account.info.code_hash)
-                },
-            };
-            let plain_val = if plain_account.is_empty() {
-                None
+
+            let (info, _) = account.into_components();
+            if info == None {
+                continue;
             } else {
-                Some(PlainValue::Account(plain_account).encode())
-            };
+                let (info, storage) = info.unwrap();
+                // handle account
+                let plain_account = Account {
+                    nonce: info.nonce,
+                    balance: info.balance,
+                    bytecode_hash: if info.code_hash == KECCAK_EMPTY {
+                        None
+                    } else {
+                        Some(info.code_hash)
+                    },
+                };
 
-            data.insert(account_key, plain_val);
-
-            // Handle storage updates for the account.
-            for (slot, value) in account.storage {
-                // A value of zero in storage is equivalent to non-existence.
-                let storage_value = if value.is_zero() {
+                let plain_val = if plain_account.is_empty() {
                     None
                 } else {
-                    Some(PlainValue::Storage(value.into()).encode())
+                    Some(PlainValue::Account(plain_account).encode())
                 };
-                data.insert(
-                    PlainKey::Storage(address, B256::new(slot.to_be_bytes())).encode(),
-                    storage_value,
-                );
+                data.insert(account_key, plain_val);
+
+                // handle storage
+                for (slot, value) in storage {
+                    let storage_value = if value.is_zero() {
+                        None
+                    } else {
+                        Some(PlainValue::Storage(value.into()).encode())
+                    };
+
+                    data.insert(
+                        PlainKey::Storage(address, B256::new(slot.to_be_bytes())).encode(),
+                        storage_value,
+                    );
+                }
             }
         }
         Self { data }
