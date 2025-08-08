@@ -17,7 +17,7 @@ use tokio::{runtime::Handle, signal, sync::Mutex};
 use tracing::{error, info};
 use validate::{
     SaltWitnessState,
-    formate::{PlainKey, PlainValue},
+    formate::{PLAIN_ACCOUNT_KEY_LEN, PlainKey, PlainValue},
     generate::{curent_time_to_u64, get_witness_state},
     produce::get_chain_status,
     validator::{
@@ -400,22 +400,18 @@ async fn get_root(
 fn get_addresses_with_code(block_witness: &BlockWitness) -> Vec<(Address, B256)> {
     block_witness
         .kvs
-        .values()
-        .filter_map(|v| {
+        .iter()
+        .filter_map(|(k, v)| {
             let val = v.as_ref()?;
 
-            // `SaltValue.data[0]` stores the plainkey length. When the length is 0, it
-            // signifies that this `SaltValue` holds a bucket nonce, not a plainkey and
-            // plainvalue.
-            if val.data[0] == 0 {
+            // Skip bucket meta slots as they do not contain account information.
+            let key = val.key();
+            if k.is_bucket_meta_slot() || key.len() != PLAIN_ACCOUNT_KEY_LEN {
                 return None;
             }
 
-            let key_len = val.data[0] as usize;
-            let value_len = val.data[1] as usize;
-            let plain_key = PlainKey::decode(val.data[2..2 + key_len].as_ref());
-            let plain_value =
-                PlainValue::decode(val.data[2 + key_len..2 + key_len + value_len].as_ref());
+            let plain_key = PlainKey::decode(key);
+            let plain_value = PlainValue::decode(val.value());
 
             match (plain_key, plain_value) {
                 (PlainKey::Account(address), PlainValue::Account(account)) => account

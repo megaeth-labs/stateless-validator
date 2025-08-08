@@ -2,20 +2,20 @@ pub use alloy_primitives::Bytes;
 use alloy_primitives::{Address, B256, U256};
 
 /// data length of Key of Storage Slot
-const SLOT_KEY_LEN: usize = B256::len_bytes();
+pub const SLOT_KEY_LEN: usize = B256::len_bytes();
 /// data length of Key of Account
-const PLAIN_ACCOUNT_KEY_LEN: usize = Address::len_bytes();
+pub const PLAIN_ACCOUNT_KEY_LEN: usize = Address::len_bytes();
 /// data length of Key of Storage
-const PLAIN_STORAGE_KEY_LEN: usize = PLAIN_ACCOUNT_KEY_LEN + SLOT_KEY_LEN;
+pub const PLAIN_STORAGE_KEY_LEN: usize = PLAIN_ACCOUNT_KEY_LEN + SLOT_KEY_LEN;
 
-const U64_BYTES_LEN: usize = 8;
-const BALANCE_BYTES_LEN: usize = U256::BYTES;
+pub const U64_BYTES_LEN: usize = 8;
+pub const BALANCE_BYTES_LEN: usize = U256::BYTES;
 /// data length of Value of Account(Contract)
-const PLAIN_EOA_ACCOUNT_LEN: usize = U64_BYTES_LEN + BALANCE_BYTES_LEN;
+pub const PLAIN_EOA_ACCOUNT_LEN: usize = U64_BYTES_LEN + BALANCE_BYTES_LEN;
 /// data length of Value of Account(EOA)
-const PLAIN_CONTRACT_ACCOUNT_LEN: usize = PLAIN_EOA_ACCOUNT_LEN + B256::len_bytes();
+pub const PLAIN_CONTRACT_ACCOUNT_LEN: usize = PLAIN_EOA_ACCOUNT_LEN + B256::len_bytes();
 /// data length of Value of Storage
-const PLAIN_STORAGE_LEN: usize = U256::BYTES;
+pub const PLAIN_STORAGE_LEN: usize = U256::BYTES;
 
 /// Key of PlainAccount/StorageState.
 #[derive(Hash, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
