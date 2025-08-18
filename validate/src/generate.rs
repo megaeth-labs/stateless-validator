@@ -33,11 +33,11 @@ pub struct WitnessStatus {
     pub block_hash: BlockHash,
     /// restore the block number
     pub block_number: BlockNumber,
-    /// restore the parent block hash
-    pub parent_hash: BlockHash,
     /// restore the pre state root
     /// this is used to verify the block witness
     pub pre_state_root: B256,
+    /// restore the parent block hash
+    pub parent_hash: BlockHash,
     /// locking the task brefore the timeout
     pub lock_time: u64,
     /// record the blob ids
