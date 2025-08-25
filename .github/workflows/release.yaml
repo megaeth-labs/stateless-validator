@@ -73,6 +73,6 @@ jobs:
           url: ${{ secrets.NEXUS_URL }}
           username: ${{ secrets.NEXUS_USER }}
           password: ${{ secrets.NEXUS_PWD }}
-          repository: mega-reth/${{ steps.build_step.outputs.profile }}
+          repository: stateless-validator/${{ steps.build_step.outputs.profile }}
           artifact_name: ${{ steps.package_info.outputs.artifact_name }}
           file_path: ${{ steps.package_info.outputs.binary_path }}
