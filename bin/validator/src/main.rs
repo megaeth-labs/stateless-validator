@@ -462,3 +462,40 @@ fn get_addresses_with_code(block_witness: &BlockWitness) -> Vec<(Address, B256)>
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_validate_blocks() {
+        let stateless_dir = PathBuf::from("../../test_data/stateless");
+
+        let client = Arc::new(RpcClient::new("http://127.0.0.1:9545").unwrap());
+
+        let finalized_num = 0;
+
+        let block_counter = finalized_num + 1;
+
+        let validate_path = stateless_dir.join("validate");
+        let contracts_file = "contracts.txt";
+
+        // Load already known contracts from a file to avoid re-fetching them.
+        let contracts = Arc::new(Mutex::new(
+            load_contracts_file(&validate_path, contracts_file).unwrap_or_default(),
+        ));
+
+        for block_number in block_counter..block_counter + 20 {
+            let res = validate_block(
+                client.clone(),
+                &stateless_dir,
+                block_number,
+                5,
+                contracts.clone(),
+            )
+            .await;
+
+            println!("res: {:?}", res);
+        }
+    }
+}
