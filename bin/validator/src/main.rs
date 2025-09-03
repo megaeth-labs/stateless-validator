@@ -12,6 +12,7 @@ use revm::{
 };
 use salt::{BlockWitness, EphemeralSaltState, StateRoot};
 use std::{
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -204,6 +205,7 @@ async fn scan_and_validate_block_witnesses(
                         );
                         break;
                     }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
         })
@@ -281,7 +283,10 @@ async fn validate_block(
             } else if validate_info.status == ValidateStatus::Failed {
                 info!("Block {} validation failed, replay again...", block_counter);
                 // start with while loop to handle this block hash again
-                break;
+                return Err(anyhow!(
+                    "Block {} validation failed, replay again...",
+                    block_counter
+                ));
             }
             // Lock the block for processing to prevent other validators from working on it.
             set_validate_status(
@@ -326,11 +331,13 @@ async fn validate_block(
             let addresses_with_code = get_addresses_with_code(&block_witness);
 
             let mut contracts_guard = contracts.lock().await;
+            info!("contracts_guard: {:?}", contracts_guard);
 
             let new_contracts_address = addresses_with_code
                 .iter()
                 .filter_map(|(address, code_hash)| {
                     if !contracts_guard.contains_key(code_hash) {
+                        info!("address: {:?}, code_hash: {:?}", address, code_hash);
                         Some(*address)
                     } else {
                         None
@@ -466,36 +473,136 @@ fn get_addresses_with_code(block_witness: &BlockWitness) -> Vec<(Address, B256)>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_rpc_types_eth::{Block, BlockTransactions};
+    use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned};
+    use op_alloy_rpc_types::Transaction;
+    use validate::file::load_json_file;
+
+    #[derive(Debug)]
+    enum Input {
+        Hash(String),
+        Number(u64),
+    }
+
+    fn load_block(path: &PathBuf, input: Input) -> Result<Block<Transaction>, ErrorObjectOwned> {
+        let files = std::fs::read_dir(path).unwrap();
+
+        for file in files {
+            let file = file.unwrap();
+            let file_name = file.file_name();
+            let file_name_str = file_name.to_string_lossy();
+
+            match input {
+                Input::Hash(ref hash) => {
+                    if file_name_str.ends_with(&format!("{}.json", hash)) {
+                        let block =
+                            load_json_file::<Block<Transaction>>(&path, &file_name_str).unwrap();
+                        return Ok(block);
+                    }
+                }
+                Input::Number(number) => {
+                    if file_name_str.starts_with(&format!("{number}.")) {
+                        let mut block =
+                            load_json_file::<Block<Transaction>>(&path, &file_name_str).unwrap();
+
+                        block.transactions = BlockTransactions::Hashes(Vec::new());
+                        return Ok(block);
+                    }
+                }
+            }
+        }
+
+        Err(ErrorObject::owned(
+            CALL_EXECUTION_FAILED_CODE,
+            format!("This block {input:?} not found"),
+            None::<()>,
+        ))
+    }
 
     #[tokio::test]
     async fn test_validate_blocks() {
+        // delete the test_data/stateless/validate/*.v files
+        let validate_dir = PathBuf::from("../../test_data/stateless/validate");
+
+        // Delete all .v files in the validate directory
+        if let Ok(entries) = fs::read_dir(&validate_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(extension) = path.extension() {
+                    if extension == "v" {
+                        if let Err(e) = fs::remove_file(&path) {
+                            eprintln!("Failed to delete file {:?}: {}", path, e);
+                        } else {
+                            info!("Deleted file: {:?}", path);
+                        }
+                    }
+                }
+            }
+        }
+
+        tracing_subscriber::fmt::init();
+
         let stateless_dir = PathBuf::from("../../test_data/stateless");
 
-        let client = Arc::new(RpcClient::new("http://127.0.0.1:9545").unwrap());
-
-        let finalized_num = 0;
-
+        let finalized_num = 7342;
         let block_counter = finalized_num + 1;
 
-        let validate_path = stateless_dir.join("validate");
-        let contracts_file = "contracts.txt";
+        // First, start the mock RPC server
+        let block_path = PathBuf::from("../../test_data/blocks");
 
-        // Load already known contracts from a file to avoid re-fetching them.
-        let contracts = Arc::new(Mutex::new(
-            load_contracts_file(&validate_path, contracts_file).unwrap_or_default(),
-        ));
+        let mut module = RpcModule::new(block_path);
 
-        for block_number in block_counter..block_counter + 20 {
-            let res = validate_block(
-                client.clone(),
-                &stateless_dir,
-                block_number,
-                5,
-                contracts.clone(),
-            )
-            .await;
+        module
+            .register_method("eth_getBlockByHash", |params, path, _| {
+                let (hash, _is_full): (String, bool) = params.parse().unwrap();
+                let block = load_block(path, Input::Hash(hash));
+                block
+            })
+            .unwrap();
 
-            println!("res: {:?}", res);
-        }
+        module
+            .register_method("eth_getBlockByNumber", |params, path, _| {
+                let (number_str, _is_full): (String, bool) = params.parse().unwrap();
+                // Convert hex string starting with 0x to u64
+                let number = if number_str.starts_with("0x") {
+                    u64::from_str_radix(&number_str[2..], 16).unwrap_or(0)
+                } else {
+                    number_str.parse::<u64>().unwrap_or(0)
+                };
+                let block = load_block(path, Input::Number(number));
+                block
+            })
+            .unwrap();
+
+        let cfg = ServerConfigBuilder::default()
+            .max_response_body_size(MAX_RESPONSE_BODY_SIZE)
+            .build();
+        let server = ServerBuilder::default()
+            .set_config(cfg)
+            .build("0.0.0.0:9545")
+            .await
+            .unwrap();
+
+        let addr = server.local_addr().unwrap().to_string();
+        info!("Server listening on {}", addr);
+
+        let handle = server.start(module);
+
+        // Give the server a moment to start up
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Now create the client that will connect to our mock server
+        let client = Arc::new(RpcClient::new("http://127.0.0.1:9545").unwrap());
+
+        // Run the validator logic
+        let validator_result =
+            scan_and_validate_block_witnesses(client, &stateless_dir, block_counter, 5, 1).await;
+
+        // Finally, shut down the mock server
+        handle.stop().unwrap();
+        info!("Mock server has been shut down.");
+
+        // Check the validator result
+        validator_result.unwrap();
     }
 }
