@@ -12,7 +12,6 @@ use revm::{
 };
 use salt::{BlockWitness, EphemeralSaltState, StateRoot};
 use std::{
-    fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -246,10 +245,14 @@ async fn validate_block(
             Ok(hashes) => hashes,
             Err(_e) => {
                 // Witness for block_counter not found, waiting...
+                error!("read_block_hash_by_number_from_file error: {:?}", _e);
+
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
         };
+        info!("block_hashes: {:?}", block_hashes);
+
         for block_hash in block_hashes {
             let witness_status = get_witness_state(stateless_dir, &(block_counter, block_hash))?;
             if witness_status.status == SaltWitnessState::Idle
@@ -258,12 +261,17 @@ async fn validate_block(
                 // Wait for the witness to be completed.
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 // start with while loop to handle this block hash again
+                info!("Wait for the witness to be completed.");
+
                 break;
             }
+            info!("witness_status: {:?}", witness_status.status);
 
             let witness_bytes = witness_status.witness_data;
 
             let validate_info = load_validate_info(stateless_dir, block_counter, block_hash)?;
+            info!("validate_info: {:?}", validate_info);
+
             // Check if the block has already been validated or is being processed by another
             // validator.
             if validate_info.status == ValidateStatus::Success {
@@ -314,6 +322,8 @@ async fn validate_block(
                 )
             };
 
+            info!("blocks_result: {:?}", blocks_result);
+
             let block = blocks_result?;
             let (block_witness, _size): (BlockWitness, usize) = witness_decode_result??;
 
@@ -324,6 +334,8 @@ async fn validate_block(
                 block.header.parent_hash,
             )
             .await?;
+            info!("old_state_root: {:?}", old_state_root);
+
             let new_state_root = block.header.state_root;
 
             block_witness.verify_proof::<BlockWitness, BlockWitness>(*old_state_root)?;
@@ -473,9 +485,10 @@ fn get_addresses_with_code(block_witness: &BlockWitness) -> Vec<(Address, B256)>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_rpc_types_eth::{Block, BlockTransactions};
+    use alloy_rpc_types_eth::Block;
     use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned};
     use op_alloy_rpc_types::Transaction;
+    use std::fs;
     use validate::file::load_json_file;
 
     #[derive(Debug)]
@@ -484,7 +497,19 @@ mod tests {
         Number(u64),
     }
 
-    fn load_block(path: &PathBuf, input: Input) -> Result<Block<Transaction>, ErrorObjectOwned> {
+    fn full_block_to_without_tx(block: &Block<Transaction>) -> Block<Transaction> {
+        let transactions = block.transactions.clone();
+        let hashes = transactions.into_hashes();
+        let mut block = block.clone();
+        block.transactions = hashes;
+        block
+    }
+
+    fn load_block(
+        path: &PathBuf,
+        input: Input,
+        is_full: bool,
+    ) -> Result<Block<Transaction>, ErrorObjectOwned> {
         let files = std::fs::read_dir(path).unwrap();
 
         for file in files {
@@ -494,19 +519,25 @@ mod tests {
 
             match input {
                 Input::Hash(ref hash) => {
-                    if file_name_str.ends_with(&format!("{}.json", hash)) {
+                    if file_name_str.contains(hash) {
                         let block =
-                            load_json_file::<Block<Transaction>>(&path, &file_name_str).unwrap();
-                        return Ok(block);
+                            load_json_file::<Block<Transaction>>(path, &file_name_str).unwrap();
+                        return Ok(if is_full {
+                            block
+                        } else {
+                            full_block_to_without_tx(&block)
+                        });
                     }
                 }
                 Input::Number(number) => {
                     if file_name_str.starts_with(&format!("{number}.")) {
-                        let mut block =
-                            load_json_file::<Block<Transaction>>(&path, &file_name_str).unwrap();
-
-                        block.transactions = BlockTransactions::Hashes(Vec::new());
-                        return Ok(block);
+                        let block =
+                            load_json_file::<Block<Transaction>>(path, &file_name_str).unwrap();
+                        return Ok(if is_full {
+                            block
+                        } else {
+                            full_block_to_without_tx(&block)
+                        });
                     }
                 }
             }
@@ -521,6 +552,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_blocks() {
+        tracing_subscriber::fmt::init();
+
         // delete the test_data/stateless/validate/*.v files
         let validate_dir = PathBuf::from("../../test_data/stateless/validate");
 
@@ -531,7 +564,7 @@ mod tests {
                 if let Some(extension) = path.extension() {
                     if extension == "v" {
                         if let Err(e) = fs::remove_file(&path) {
-                            eprintln!("Failed to delete file {:?}: {}", path, e);
+                            error!("Failed to delete file {:?}: {}", path, e);
                         } else {
                             info!("Deleted file: {:?}", path);
                         }
@@ -540,36 +573,38 @@ mod tests {
             }
         }
 
-        tracing_subscriber::fmt::init();
-
         let stateless_dir = PathBuf::from("../../test_data/stateless");
 
-        let finalized_num = 7342;
+        let finalized_num = 3470;
         let block_counter = finalized_num + 1;
 
         // First, start the mock RPC server
         let block_path = PathBuf::from("../../test_data/blocks");
+        let files = fs::read_dir(&block_path).unwrap();
+        for f in files.flatten() {
+            info!("file: {:?}", f.path());
+        }
 
         let mut module = RpcModule::new(block_path);
 
         module
             .register_method("eth_getBlockByHash", |params, path, _| {
-                let (hash, _is_full): (String, bool) = params.parse().unwrap();
-                let block = load_block(path, Input::Hash(hash));
+                let (hash, is_full): (String, bool) = params.parse().unwrap();
+                let block = load_block(path, Input::Hash(hash), is_full);
                 block
             })
             .unwrap();
 
         module
             .register_method("eth_getBlockByNumber", |params, path, _| {
-                let (number_str, _is_full): (String, bool) = params.parse().unwrap();
+                let (number_str, is_full): (String, bool) = params.parse().unwrap();
                 // Convert hex string starting with 0x to u64
                 let number = if number_str.starts_with("0x") {
                     u64::from_str_radix(&number_str[2..], 16).unwrap_or(0)
                 } else {
                     number_str.parse::<u64>().unwrap_or(0)
                 };
-                let block = load_block(path, Input::Number(number));
+                let block = load_block(path, Input::Number(number), is_full);
                 block
             })
             .unwrap();
