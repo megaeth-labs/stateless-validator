@@ -251,7 +251,6 @@ async fn validate_block(
                 continue;
             }
         };
-        info!("block_hashes: {:?}", block_hashes);
 
         for block_hash in block_hashes {
             let witness_status = get_witness_state(stateless_dir, &(block_counter, block_hash))?;
@@ -265,12 +264,9 @@ async fn validate_block(
 
                 break;
             }
-            info!("witness_status: {:?}", witness_status.status);
-
             let witness_bytes = witness_status.witness_data;
 
             let validate_info = load_validate_info(stateless_dir, block_counter, block_hash)?;
-            info!("validate_info: {:?}", validate_info);
 
             // Check if the block has already been validated or is being processed by another
             // validator.
@@ -289,7 +285,7 @@ async fn validate_block(
                 );
                 return Ok(());
             } else if validate_info.status == ValidateStatus::Failed {
-                info!("Block {} validation failed, replay again...", block_counter);
+                error!("Block {} validation failed, replay again...", block_counter);
                 // start with while loop to handle this block hash again
                 return Err(anyhow!(
                     "Block {} validation failed, replay again...",
@@ -322,8 +318,6 @@ async fn validate_block(
                 )
             };
 
-            info!("blocks_result: {:?}", blocks_result);
-
             let block = blocks_result?;
             let (block_witness, _size): (BlockWitness, usize) = witness_decode_result??;
 
@@ -334,7 +328,6 @@ async fn validate_block(
                 block.header.parent_hash,
             )
             .await?;
-            info!("old_state_root: {:?}", old_state_root);
 
             let new_state_root = block.header.state_root;
 
@@ -343,13 +336,11 @@ async fn validate_block(
             let addresses_with_code = get_addresses_with_code(&block_witness);
 
             let mut contracts_guard = contracts.lock().await;
-            info!("contracts_guard: {:?}", contracts_guard);
 
             let new_contracts_address = addresses_with_code
                 .iter()
                 .filter_map(|(address, code_hash)| {
                     if !contracts_guard.contains_key(code_hash) {
-                        info!("address: {:?}, code_hash: {:?}", address, code_hash);
                         Some(*address)
                     } else {
                         None
@@ -553,8 +544,9 @@ mod tests {
     #[tokio::test]
     async fn test_validate_blocks() {
         tracing_subscriber::fmt::init();
-
-        // delete the test_data/stateless/validate/*.v files
+        // ===============================
+        // delete the test_data/stateless/validate/*.v files to re-validate the blocks
+        // ===============================
         let validate_dir = PathBuf::from("../../test_data/stateless/validate");
 
         // Delete all .v files in the validate directory
@@ -565,26 +557,14 @@ mod tests {
                     if extension == "v" {
                         if let Err(e) = fs::remove_file(&path) {
                             error!("Failed to delete file {:?}: {}", path, e);
-                        } else {
-                            info!("Deleted file: {:?}", path);
                         }
                     }
                 }
             }
         }
 
-        let stateless_dir = PathBuf::from("../../test_data/stateless");
-
-        let finalized_num = 3470;
-        let block_counter = finalized_num + 1;
-
-        // First, start the mock RPC server
+        // 1. start the mock RPC server
         let block_path = PathBuf::from("../../test_data/blocks");
-        let files = fs::read_dir(&block_path).unwrap();
-        for f in files.flatten() {
-            info!("file: {:?}", f.path());
-        }
-
         let mut module = RpcModule::new(block_path);
 
         module
@@ -618,26 +598,41 @@ mod tests {
             .await
             .unwrap();
 
-        let addr = server.local_addr().unwrap().to_string();
-        info!("Server listening on {}", addr);
-
         let handle = server.start(module);
 
         // Give the server a moment to start up
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Now create the client that will connect to our mock server
+        // 2. create the client that will connect to our mock server
         let client = Arc::new(RpcClient::new("http://127.0.0.1:9545").unwrap());
 
-        // Run the validator logic
-        let validator_result =
-            scan_and_validate_block_witnesses(client, &stateless_dir, block_counter, 5, 1).await;
+        let stateless_dir = PathBuf::from("../../test_data/stateless");
+
+        let validate_path = stateless_dir.join("validate");
+        let contracts_file = "contracts.txt";
+
+        // Load already known contracts from a file to avoid re-fetching them.
+        let contracts = Arc::new(Mutex::new(
+            load_contracts_file(&validate_path, contracts_file).unwrap_or_default(),
+        ));
+
+        let finalized_num = 75599;
+        let block_counter = finalized_num + 1;
+
+        for block_counter in block_counter..block_counter + 5 {
+            let res = validate_block(
+                client.clone(),
+                &stateless_dir,
+                block_counter,
+                5,
+                contracts.clone(),
+            )
+            .await;
+            assert!(res.is_ok());
+        }
 
         // Finally, shut down the mock server
         handle.stop().unwrap();
-        info!("Mock server has been shut down.");
-
-        // Check the validator result
-        validator_result.unwrap();
+        info!("Mock RPC server has been shut down.");
     }
 }
