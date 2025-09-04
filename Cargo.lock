@@ -1048,7 +1048,7 @@ dependencies = [
 [[package]]
 name = "banderwagon"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?branch=refactor%2Fv1.3.4_fixed_storage#8391ac41053f68b3c7e2ce56d28cb03a0bcbb664"
+source = "git+https://github.com/megaeth-labs/salt.git?branch=feature%2Fmega-reth-v2#8a11d8ab8b8eceef67a0b69ee9da4b928e69a7af"
 dependencies = [
  "ark-ec",
  "ark-ed-on-bls12-381-bandersnatch",
@@ -1830,7 +1830,7 @@ dependencies = [
 [[package]]
 name = "ffi_interface"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?branch=refactor%2Fv1.3.4_fixed_storage#8391ac41053f68b3c7e2ce56d28cb03a0bcbb664"
+source = "git+https://github.com/megaeth-labs/salt.git?branch=feature%2Fmega-reth-v2#8a11d8ab8b8eceef67a0b69ee9da4b928e69a7af"
 dependencies = [
  "banderwagon",
  "hex",
@@ -2470,7 +2470,7 @@ dependencies = [
 [[package]]
 name = "ipa-multipoint"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?branch=refactor%2Fv1.3.4_fixed_storage#8391ac41053f68b3c7e2ce56d28cb03a0bcbb664"
+source = "git+https://github.com/megaeth-labs/salt.git?branch=feature%2Fmega-reth-v2#8a11d8ab8b8eceef67a0b69ee9da4b928e69a7af"
 dependencies = [
  "banderwagon",
  "hex",
@@ -3962,7 +3962,7 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 [[package]]
 name = "salt"
 version = "1.0.0"
-source = "git+https://github.com/megaeth-labs/salt.git?branch=refactor%2Fv1.3.4_fixed_storage#8391ac41053f68b3c7e2ce56d28cb03a0bcbb664"
+source = "git+https://github.com/megaeth-labs/salt.git?branch=feature%2Fmega-reth-v2#8a11d8ab8b8eceef67a0b69ee9da4b928e69a7af"
 dependencies = [
  "ahash 0.8.11",
  "ark-ff 0.5.0",
@@ -4958,12 +4958,12 @@ dependencies = [
 [[package]]
 name = "verkle-db"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?branch=refactor%2Fv1.3.4_fixed_storage#8391ac41053f68b3c7e2ce56d28cb03a0bcbb664"
+source = "git+https://github.com/megaeth-labs/salt.git?branch=feature%2Fmega-reth-v2#8a11d8ab8b8eceef67a0b69ee9da4b928e69a7af"
 
 [[package]]
 name = "verkle-spec"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?branch=refactor%2Fv1.3.4_fixed_storage#8391ac41053f68b3c7e2ce56d28cb03a0bcbb664"
+source = "git+https://github.com/megaeth-labs/salt.git?branch=feature%2Fmega-reth-v2#8a11d8ab8b8eceef67a0b69ee9da4b928e69a7af"
 dependencies = [
  "banderwagon",
  "ethereum-types",
@@ -4975,7 +4975,7 @@ dependencies = [
 [[package]]
 name = "verkle-trie"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?branch=refactor%2Fv1.3.4_fixed_storage#8391ac41053f68b3c7e2ce56d28cb03a0bcbb664"
+source = "git+https://github.com/megaeth-labs/salt.git?branch=feature%2Fmega-reth-v2#8a11d8ab8b8eceef67a0b69ee9da4b928e69a7af"
 dependencies = [
  "anyhow",
  "banderwagon",

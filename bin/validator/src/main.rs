@@ -531,9 +531,7 @@ mod tests {
         ))
     }
 
-    #[tokio::test]
-    async fn test_validate_blocks() {
-        tracing_subscriber::fmt::init();
+    fn delete_validate_files() {
         // ===============================
         // delete the test_data/stateless/validate/*.v files to re-validate the blocks
         // ===============================
@@ -552,7 +550,12 @@ mod tests {
                 }
             }
         }
+    }
 
+    #[tokio::test]
+    async fn test_validate_blocks() {
+        tracing_subscriber::fmt::init();
+        delete_validate_files();
         // 1. start the mock RPC server
         let block_path = PathBuf::from("../../test_data/blocks");
         let mut module = RpcModule::new(block_path);
@@ -584,7 +587,7 @@ mod tests {
             .build();
         let server = ServerBuilder::default()
             .set_config(cfg)
-            .build("0.0.0.0:9545")
+            .build("0.0.0.0:59545")
             .await
             .unwrap();
 
@@ -594,7 +597,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // 2. create the client that will connect to our mock server
-        let client = Arc::new(RpcClient::new("http://127.0.0.1:9545").unwrap());
+        let client = Arc::new(RpcClient::new("http://127.0.0.1:59545").unwrap());
 
         let stateless_dir = PathBuf::from("../../test_data/stateless");
 
@@ -606,10 +609,10 @@ mod tests {
             load_contracts_file(&validate_path, contracts_file).unwrap_or_default(),
         ));
 
-        let finalized_num = 75599;
+        let finalized_num = 3079;
         let block_counter = finalized_num + 1;
 
-        for block_counter in block_counter..block_counter + 5 {
+        for block_counter in block_counter..block_counter + 21 {
             let res = validate_block(
                 client.clone(),
                 &stateless_dir,
@@ -621,6 +624,7 @@ mod tests {
             assert!(res.is_ok());
         }
 
+        delete_validate_files();
         // Finally, shut down the mock server
         handle.stop().unwrap();
         info!("Mock RPC server has been shut down.");

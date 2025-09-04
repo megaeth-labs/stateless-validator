@@ -15,7 +15,7 @@ use revm::{
     primitives::{Bytes, HashMap, KECCAK_EMPTY, U256},
     state::{AccountInfo, Bytecode},
 };
-use salt::{BlockWitness, PlainStateProvider};
+use salt::{BlockWitness, PlainStateProvider, SaltError};
 use std::error::Error;
 use std::fmt;
 use tokio::{runtime::Handle, sync::oneshot};
@@ -44,6 +44,12 @@ impl DBErrorMarker for WitnessProviderError {}
 impl From<&'static str> for WitnessProviderError {
     fn from(s: &'static str) -> Self {
         Self(s.to_string())
+    }
+}
+
+impl From<SaltError> for WitnessProviderError {
+    fn from(e: SaltError) -> Self {
+        Self(e.to_string())
     }
 }
 
