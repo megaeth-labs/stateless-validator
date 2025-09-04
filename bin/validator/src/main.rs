@@ -204,7 +204,6 @@ async fn scan_and_validate_block_witnesses(
                         );
                         break;
                     }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             }
         })
@@ -245,13 +244,10 @@ async fn validate_block(
             Ok(hashes) => hashes,
             Err(_e) => {
                 // Witness for block_counter not found, waiting...
-                error!("read_block_hash_by_number_from_file error: {:?}", _e);
-
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
         };
-
         for block_hash in block_hashes {
             let witness_status = get_witness_state(stateless_dir, &(block_counter, block_hash))?;
             if witness_status.status == SaltWitnessState::Idle
@@ -260,14 +256,12 @@ async fn validate_block(
                 // Wait for the witness to be completed.
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 // start with while loop to handle this block hash again
-                info!("Wait for the witness to be completed.");
-
                 break;
             }
+
             let witness_bytes = witness_status.witness_data;
 
             let validate_info = load_validate_info(stateless_dir, block_counter, block_hash)?;
-
             // Check if the block has already been validated or is being processed by another
             // validator.
             if validate_info.status == ValidateStatus::Success {
@@ -285,12 +279,9 @@ async fn validate_block(
                 );
                 return Ok(());
             } else if validate_info.status == ValidateStatus::Failed {
-                error!("Block {} validation failed, replay again...", block_counter);
+                info!("Block {} validation failed, replay again...", block_counter);
                 // start with while loop to handle this block hash again
-                return Err(anyhow!(
-                    "Block {} validation failed, replay again...",
-                    block_counter
-                ));
+                break;
             }
             // Lock the block for processing to prevent other validators from working on it.
             set_validate_status(
@@ -328,7 +319,6 @@ async fn validate_block(
                 block.header.parent_hash,
             )
             .await?;
-
             let new_state_root = block.header.state_root;
 
             block_witness.verify_proof::<BlockWitness, BlockWitness>(*old_state_root)?;
