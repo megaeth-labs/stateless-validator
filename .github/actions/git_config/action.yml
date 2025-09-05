@@ -1,0 +1,17 @@
+name: "Git Config"
+description: "git config for repo"
+inputs:
+  github_pat:
+    description: "github PAT"
+    required: true
+runs:
+  using: "composite"
+  steps:
+    - name: Set Git Config
+      shell: bash
+      run: |
+        git config --global credential.helper store
+        git config --global url."https://${{ inputs.github_pat }}@github.com/".insteadOf "https://github.com/"
+        git config --global http.lowSpeedLimit 0
+        git config --global http.lowSpeedTime 999999
+        git config --global --list

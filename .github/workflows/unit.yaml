@@ -20,6 +20,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           token: ${{ secrets.PAT_GAO_CI }}
+      - name: Configure Git credentials
+        uses: ./.github/actions/git_config
+        with:
+          github_pat: ${{ secrets.PAT_GAO_CI }}
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
