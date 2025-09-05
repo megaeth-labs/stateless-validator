@@ -38,7 +38,7 @@ pub struct WitnessStatus {
     pub pre_state_root: B256,
     /// restore the parent block hash
     pub parent_hash: BlockHash,
-    /// locking the task brefore the timeout
+    /// locking the task before the timeout
     pub lock_time: u64,
     /// record the blob ids
     pub blob_ids: Vec<[u8; 32]>,

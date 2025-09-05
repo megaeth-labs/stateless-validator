@@ -6,8 +6,8 @@ pub mod generate;
 pub use generate::*;
 pub mod validator;
 pub use validator::*;
-pub mod formate;
-pub use formate::*;
+pub mod format;
+pub use format::*;
 
 use alloy_primitives::{B256, BlockHash, BlockNumber, hex};
 use serde::{Deserialize, Serialize};

@@ -4,7 +4,7 @@
 //! This allows it to act as a read-only database for REVM, but instead of fetching data from a
 //! full database, it serves data from a `BlockWitness`. This is the key to enabling stateless
 //! block replay and validation.
-use crate::formate::{Account, PlainKey, PlainValue};
+use crate::format::{Account, PlainKey, PlainValue};
 use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, RootProvider};
 use op_alloy_network::Optimism;
