@@ -98,6 +98,8 @@ pub fn curent_time_to_u64() -> u64 {
         .as_secs()
 }
 
+// FIXME: 1. We need to concentrate all file naming logic into one source file
+// FIXME: 2. We need to decouple deployment method from core stateless validation logic
 /// change the witness file name to the given block number and block hash
 pub fn witness_file_name(block_num: BlockNumber, block_hash: BlockHash) -> String {
     format!("{}.{}.w", block_num, block_hash)

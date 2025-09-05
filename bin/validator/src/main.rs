@@ -38,22 +38,27 @@ use validate::{
 /// This is set to 100 MB to accommodate large block data and witness information.
 const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
 
+// FIXME: not `rerun_block`!
 /// Command line arguments for the `rerun_block` executable.
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
+    // FIXME: How is `datadir` the starting block number?
     /// The starting block number from which to begin replaying.
     #[clap(short, long)]
     datadir: String,
 
+    // FIXME: how is `lock_time` related to # consecutive blocks? what is the latter anyway?
     /// The total number of consecutive blocks to replay.
     #[clap(short, long, default_value_t = 5)]
     lock_time: u64,
 
+    // FIXME: why do we need to fetch block data? what else needs to be fetched from rpc endpoint?
     /// The URL of the Ethereum JSON-RPC API endpoint to use for fetching block data.
     #[clap(short, long)]
     api: String,
 
+    // FIXME: what is "stateless validator server"? is there a client?
     /// The port of the stateless validator server.
     #[clap(short, long)]
     port: Option<u16>,
@@ -212,6 +217,8 @@ async fn scan_and_validate_block_witnesses(
     Ok(())
 }
 
+// FIXME: any code that can be reused by other stateless validator deployments?
+// if yes, they should be moved into the library.
 /// Performs the validation for a single block.
 ///
 /// This function handles the entire lifecycle of validating a block:
