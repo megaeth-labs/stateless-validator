@@ -304,28 +304,25 @@ pub fn read_block_hash_by_number_from_file(
     for entry in read_dir(witness_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_file() {
-            if let Some(file_name_os_str) = path.file_name() {
-                if let Some(file_name_str) = file_name_os_str.to_str() {
-                    if file_name_str.starts_with(&file_prefix)
-                        && file_name_str.ends_with(FILE_SUFFIX)
-                    {
-                        let hash_part = &file_name_str
-                            [file_prefix.len()..(file_name_str.len() - FILE_SUFFIX.len())];
+        if path.is_file()
+            && let Some(file_name_os_str) = path.file_name()
+            && let Some(file_name_str) = file_name_os_str.to_str()
+            && file_name_str.starts_with(&file_prefix)
+            && file_name_str.ends_with(FILE_SUFFIX)
+        {
+            let hash_part =
+                &file_name_str[file_prefix.len()..(file_name_str.len() - FILE_SUFFIX.len())];
 
-                        // Attempt to parse the hash part of the filename.
-                        match B256::from_str(hash_part) {
-                            Ok(hash) => hashes.push(hash),
-                            Err(e) => {
-                                return Err(anyhow!(
-                                    "Failed to parse hash '{}' from file '{}': {}",
-                                    hash_part,
-                                    file_name_str,
-                                    e
-                                ));
-                            }
-                        }
-                    }
+            // Attempt to parse the hash part of the filename.
+            match B256::from_str(hash_part) {
+                Ok(hash) => hashes.push(hash),
+                Err(e) => {
+                    return Err(anyhow!(
+                        "Failed to parse hash '{}' from file '{}': {}",
+                        hash_part,
+                        file_name_str,
+                        e
+                    ));
                 }
             }
         }
