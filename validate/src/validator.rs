@@ -172,10 +172,7 @@ impl From<HashMap<Address, CacheAccount>> for PlainKeyUpdate {
             let account_key = PlainKey::Account(address).encode();
 
             let (info, _) = account.into_components();
-            if info.is_none() {
-                continue;
-            } else {
-                let (info, storage) = info.unwrap();
+            if let Some((info, storage)) = info {
                 // handle account
                 let plain_account = Account {
                     nonce: info.nonce,
