@@ -10,7 +10,7 @@ use revm::{
     primitives::{B256, HashMap, KECCAK_EMPTY},
     state::Bytecode,
 };
-use salt::{BlockWitness, EphemeralSaltState, StateRoot};
+use salt::{EphemeralSaltState, SaltWitness, StateRoot, Witness};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -310,7 +310,7 @@ async fn validate_block(
             };
 
             let block = blocks_result?;
-            let (block_witness, _size): (BlockWitness, usize) = witness_decode_result??;
+            let (block_witness, _size): (SaltWitness, usize) = witness_decode_result??;
 
             let old_state_root = get_root(
                 client.as_ref(),
@@ -321,9 +321,10 @@ async fn validate_block(
             .await?;
             let new_state_root = block.header.state_root;
 
-            block_witness.verify_proof::<BlockWitness, BlockWitness>(*old_state_root)?;
-
             let addresses_with_code = get_addresses_with_code(&block_witness);
+
+            let block_witness = Witness::from(block_witness);
+            block_witness.verify(*old_state_root)?;
 
             let mut contracts_guard = contracts.lock().await;
 
@@ -373,9 +374,9 @@ async fn validate_block(
                 .update(&plain_state.data)
                 .map_err(|e| anyhow!("Failed to update state: {}", e))?;
 
-            let mut trie = StateRoot::new();
+            let mut trie = StateRoot::new(&block_witness);
             let (new_trie_root, _trie_updates) = trie
-                .update(&block_witness, &block_witness, &state_updates)
+                .update_fin(state_updates)
                 .map_err(|e| anyhow!("Failed to update trie: {}", e))?;
 
             if new_trie_root != new_state_root {
@@ -436,7 +437,7 @@ async fn get_root(
 
 /// Extracts all addresses that have a non-empty bytecode hash from the witness.
 /// This is useful for fetching contract code required for block execution.
-fn get_addresses_with_code(block_witness: &BlockWitness) -> Vec<(Address, B256)> {
+fn get_addresses_with_code(block_witness: &SaltWitness) -> Vec<(Address, B256)> {
     block_witness
         .kvs
         .iter()
@@ -445,7 +446,7 @@ fn get_addresses_with_code(block_witness: &BlockWitness) -> Vec<(Address, B256)>
 
             // Skip bucket meta slots as they do not contain account information.
             let key = val.key();
-            if k.is_bucket_meta_slot() || key.len() != PLAIN_ACCOUNT_KEY_LEN {
+            if k.is_in_meta_bucket() || key.len() != PLAIN_ACCOUNT_KEY_LEN {
                 return None;
             }
 

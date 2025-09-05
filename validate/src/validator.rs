@@ -15,7 +15,7 @@ use revm::{
     primitives::{Bytes, HashMap, KECCAK_EMPTY, U256},
     state::{AccountInfo, Bytecode},
 };
-use salt::{BlockWitness, PlainStateProvider, SaltError};
+use salt::{EphemeralSaltState, Witness};
 use std::error::Error;
 use std::fmt;
 use tokio::{runtime::Handle, sync::oneshot};
@@ -47,12 +47,6 @@ impl From<&'static str> for WitnessProviderError {
     }
 }
 
-impl From<SaltError> for WitnessProviderError {
-    fn from(e: SaltError) -> Self {
-        Self(e.to_string())
-    }
-}
-
 /// A REVM database provider that sources all its data from a `BlockWitness`.
 ///
 /// This struct implements the `DatabaseRef` trait, allowing REVM to perform EVM execution
@@ -61,7 +55,7 @@ impl From<SaltError> for WitnessProviderError {
 #[derive(Debug, Clone)]
 pub struct WitnessProvider {
     /// The witness data, containing the necessary state subset and proof.
-    pub witness: BlockWitness,
+    pub witness: Witness,
     /// A map of contract code hashes to their corresponding bytecode.
     pub contracts: HashMap<B256, Bytecode>,
     /// An RPC provider to fetch historical block hashes.
@@ -70,15 +64,23 @@ pub struct WitnessProvider {
     pub rt: Handle,
 }
 
+impl WitnessProvider {
+    /// Return the SALT value associated with the given plain key.
+    fn get_raw(&self, plain_key: &[u8]) -> Result<Option<Vec<u8>>, WitnessProviderError> {
+        let mut state = EphemeralSaltState::new(&self.witness);
+
+        Ok(state.plain_value(plain_key)?)
+    }
+}
+
 impl DatabaseRef for WitnessProvider {
     type Error = WitnessProviderError;
 
     /// Provides basic account information (balance, nonce, code hash) from the witness.
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        let plain_state_provider = PlainStateProvider::new(&self.witness);
-
         let raw_key = PlainKey::Account(address).encode();
-        let account = if let Some(raw_value) = plain_state_provider.get_raw(&raw_key)? {
+        //self.witness.value(key)
+        let account = if let Some(raw_value) = self.get_raw(&raw_key)? {
             match PlainValue::decode(&raw_value) {
                 PlainValue::Account(acc) => {
                     // If the account has bytecode, find it in the local `contracts` map.
@@ -120,9 +122,8 @@ impl DatabaseRef for WitnessProvider {
         address: Address,
         index: U256,
     ) -> Result<U256, <Self as DatabaseRef>::Error> {
-        let plain_state_provider = PlainStateProvider::new(&self.witness);
         let raw_key = PlainKey::Storage(address, index.into()).encode();
-        let storage = if let Some(raw_value) = plain_state_provider.get_raw(&raw_key)? {
+        let storage = if let Some(raw_value) = self.get_raw(&raw_key)? {
             match PlainValue::decode(&raw_value) {
                 PlainValue::Storage(storage) => storage,
                 _ => U256::default(),

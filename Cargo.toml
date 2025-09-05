@@ -32,7 +32,7 @@ op-revm = { version = "1.0.0-alpha.6", default-features = false }
 revm = { version = "20.0.0-alpha.7", default-features = false }
 revm-inspectors = "0.17.0-alpha.1"
 
-salt = { git = "https://github.com/megaeth-labs/salt.git", branch = "feature/mega-reth-v2" }
+salt = { git = "https://github.com/megaeth-labs/salt.git", branch = "main" }
 mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", branch = "main" }
 megaeth-primitives = { git = "https://github.com/megaeth-labs/mega-reth.git", branch = "refactor/base-on-v1.3.4" }
 
@@ -48,7 +48,7 @@ jsonrpsee = { version = "0.25", features = ["server", "macros"] }
 jsonrpsee-types = { version = "0.25" }
 num_cpus = "1.17"
 rand = "0.9"
-rayon = "1.10"
+rayon = "1.11.0"
 serde = { version = "1.0", default-features = false }
 serde_arrays = "0.2"
 serde_json = "1.0"

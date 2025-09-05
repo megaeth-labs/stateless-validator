@@ -19,18 +19,6 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "ahash"
-version = "0.8.11"
-source = "git+https://github.com/megaeth-labs/ahash.git?tag=fallback-ahash#f7ec5e4aa13c998d9dc733ca181189d1a3d02824"
-dependencies = [
- "cfg-if",
- "getrandom 0.2.16",
- "once_cell",
- "version_check",
- "zerocopy 0.7.35",
-]
-
-[[package]]
-name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
@@ -78,7 +66,7 @@ dependencies = [
  "rand 0.8.5",
  "serde",
  "serde_with",
- "thiserror 2.0.12",
+ "thiserror",
 ]
 
 [[package]]
@@ -105,7 +93,7 @@ dependencies = [
  "alloy-rlp",
  "crc",
  "serde",
- "thiserror 2.0.12",
+ "thiserror",
 ]
 
 [[package]]
@@ -129,7 +117,7 @@ dependencies = [
  "alloy-rlp",
  "k256",
  "serde",
- "thiserror 2.0.12",
+ "thiserror",
 ]
 
 [[package]]
@@ -168,7 +156,7 @@ dependencies = [
  "derive_more 2.0.1",
  "op-revm",
  "revm",
- "thiserror 2.0.12",
+ "thiserror",
 ]
 
 [[package]]
@@ -206,7 +194,7 @@ dependencies = [
  "alloy-sol-types",
  "serde",
  "serde_json",
- "thiserror 2.0.12",
+ "thiserror",
  "tracing",
 ]
 
@@ -233,7 +221,7 @@ dependencies = [
  "futures-utils-wasm",
  "serde",
  "serde_json",
- "thiserror 2.0.12",
+ "thiserror",
 ]
 
 [[package]]
@@ -333,7 +321,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "thiserror 2.0.12",
+ "thiserror",
  "tokio",
  "tracing",
  "url",
@@ -415,7 +403,7 @@ dependencies = [
  "itertools 0.14.0",
  "serde",
  "serde_json",
- "thiserror 2.0.12",
+ "thiserror",
 ]
 
 [[package]]
@@ -441,7 +429,7 @@ dependencies = [
  "either",
  "elliptic-curve",
  "k256",
- "thiserror 2.0.12",
+ "thiserror",
 ]
 
 [[package]]
@@ -529,7 +517,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
- "thiserror 2.0.12",
+ "thiserror",
  "tokio",
  "tower",
  "tracing",
@@ -634,12 +622,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.98"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e16d2d3311acee920a9eb8d33b8cbc1787ce4a264e85f964c2404b969bdcd487"
-
-[[package]]
 name = "ark-bls12-381"
 version = "0.5.0"
 source = "git+https://github.com/arkworks-rs/algebra.git?rev=da450f98b9b4bf1b4c8eec8f96b4501f9705c517#da450f98b9b4bf1b4c8eec8f96b4501f9705c517"
@@ -655,7 +637,7 @@ name = "ark-ec"
 version = "0.5.0"
 source = "git+https://github.com/arkworks-rs/algebra.git?rev=da450f98b9b4bf1b4c8eec8f96b4501f9705c517#da450f98b9b4bf1b4c8eec8f96b4501f9705c517"
 dependencies = [
- "ahash 0.8.12",
+ "ahash",
  "ark-ff 0.5.0",
  "ark-poly",
  "ark-serialize 0.5.0",
@@ -811,7 +793,7 @@ name = "ark-poly"
 version = "0.5.0"
 source = "git+https://github.com/arkworks-rs/algebra.git?rev=da450f98b9b4bf1b4c8eec8f96b4501f9705c517#da450f98b9b4bf1b4c8eec8f96b4501f9705c517"
 dependencies = [
- "ahash 0.8.12",
+ "ahash",
  "ark-ff 0.5.0",
  "ark-serialize 0.5.0",
  "ark-std 0.5.0",
@@ -1048,7 +1030,7 @@ dependencies = [
 [[package]]
 name = "banderwagon"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?branch=feature%2Fmega-reth-v2#8a11d8ab8b8eceef67a0b69ee9da4b928e69a7af"
+source = "git+https://github.com/megaeth-labs/salt.git?branch=main#21b5ebf8fdacd07a833b4bfbf0ccfe436a44fe33"
 dependencies = [
  "ark-ec",
  "ark-ed-on-bls12-381-bandersnatch",
@@ -1294,9 +1276,9 @@ checksum = "b94f61472cee1439c0b966b47e3aca9ae07e45d070759512cd390ea2bebc6675"
 
 [[package]]
 name = "clone_dyn_types"
-version = "0.32.0"
+version = "0.38.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5e7603267fe5de998900bd2036a97abcabada41333b85c07eb9b267aba63660"
+checksum = "ec3ea6a6cad557cf4394aecff2bda6266914123ad9c46a9cb1c576b10f80438f"
 
 [[package]]
 name = "colorchoice"
@@ -1753,33 +1735,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ethbloom"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c22d4b5885b6aa2fe5e8b9329fb8d232bf739e434e6b87347c63bdd00c120f60"
-dependencies = [
- "crunchy",
- "fixed-hash",
- "impl-rlp",
- "impl-serde",
- "tiny-keccak",
-]
-
-[[package]]
-name = "ethereum-types"
-version = "0.14.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02d215cbf040552efcbe99a38372fe80ab9d00268e20012b79fcd0f073edd8ee"
-dependencies = [
- "ethbloom",
- "fixed-hash",
- "impl-rlp",
- "impl-serde",
- "primitive-types",
- "uint",
-]
-
-[[package]]
 name = "eyre"
 version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1825,17 +1780,6 @@ checksum = "c0b50bfb653653f9ca9095b427bed08ab8d75a137839d9ad64eb11810d5b6393"
 dependencies = [
  "rand_core 0.6.4",
  "subtle",
-]
-
-[[package]]
-name = "ffi_interface"
-version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?branch=feature%2Fmega-reth-v2#8a11d8ab8b8eceef67a0b69ee9da4b928e69a7af"
-dependencies = [
- "banderwagon",
- "hex",
- "ipa-multipoint",
- "verkle-spec",
 ]
 
 [[package]]
@@ -2400,24 +2344,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "impl-rlp"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f28220f89297a075ddc7245cd538076ee98b01f2a9c23a53a4f1105d5a322808"
-dependencies = [
- "rlp",
-]
-
-[[package]]
-name = "impl-serde"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebc88fc67028ae3db0c853baa36269d398d5f45b6982f95549ff5def78c935cd"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "impl-trait-for-tuples"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2470,7 +2396,7 @@ dependencies = [
 [[package]]
 name = "ipa-multipoint"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?branch=feature%2Fmega-reth-v2#8a11d8ab8b8eceef67a0b69ee9da4b928e69a7af"
+source = "git+https://github.com/megaeth-labs/salt.git?branch=main#21b5ebf8fdacd07a833b4bfbf0ccfe436a44fe33"
 dependencies = [
  "banderwagon",
  "hex",
@@ -2504,9 +2430,9 @@ checksum = "7943c866cc5cd64cbc25b2e01621d07fa8eb2a1a23160ee81ce38704e97b8ecf"
 
 [[package]]
 name = "iter_tools"
-version = "0.30.0"
+version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e8f4940dcd79d6700fa2ee17f8fe923e9c2b6b15da4804da152cb0dc33e0e99"
+checksum = "e68442ead22fbfa506eaa0b613826a373594f86e1e5be6db2d2d1dc1189420e8"
 dependencies = [
  "clone_dyn_types",
  "itertools 0.11.0",
@@ -2588,7 +2514,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_json",
- "thiserror 2.0.12",
+ "thiserror",
  "tokio",
  "tower",
  "tracing",
@@ -2626,7 +2552,7 @@ dependencies = [
  "serde",
  "serde_json",
  "soketto",
- "thiserror 2.0.12",
+ "thiserror",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -2643,7 +2569,7 @@ dependencies = [
  "http",
  "serde",
  "serde_json",
- "thiserror 2.0.12",
+ "thiserror",
 ]
 
 [[package]]
@@ -2839,27 +2765,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "modular-bitfield"
-version = "0.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a53d79ba8304ac1c4f9eb3b9d281f21f7be9d4626f72ce7df4ad8fbde4f38a74"
-dependencies = [
- "modular-bitfield-impl",
- "static_assertions",
-]
-
-[[package]]
-name = "modular-bitfield-impl"
-version = "0.11.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a7d5f7076603ebc68de2dc6a650ec331a062a13abaa346975be747bbfa4b789"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
 name = "nu-ansi-term"
 version = "0.50.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3026,7 +2931,7 @@ dependencies = [
  "alloy-serde",
  "derive_more 2.0.1",
  "serde",
- "thiserror 2.0.12",
+ "thiserror",
 ]
 
 [[package]]
@@ -3160,7 +3065,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1db05f56d34358a8b1066f67cbb203ee3e7ed2ba674a6263a1d5ec6db2204323"
 dependencies = [
  "memchr",
- "thiserror 2.0.12",
+ "thiserror",
  "ucd-trie",
 ]
 
@@ -3290,8 +3195,6 @@ checksum = "0b34d9fd68ae0b74a41b21c03c2f62847aa0ffea044eee893b4c140b37e244e2"
 dependencies = [
  "fixed-hash",
  "impl-codec",
- "impl-rlp",
- "impl-serde",
  "uint",
 ]
 
@@ -3375,7 +3278,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "socket2 0.5.10",
- "thiserror 2.0.12",
+ "thiserror",
  "tokio",
  "tracing",
  "web-time",
@@ -3396,7 +3299,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "slab",
- "thiserror 2.0.12",
+ "thiserror",
  "tinyvec",
  "tracing",
  "web-time",
@@ -3508,9 +3411,9 @@ dependencies = [
 
 [[package]]
 name = "rayon"
-version = "1.10.0"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b418a60154510ca1a002a752ca9714984e21e4241e804d32555251faf8b78ffa"
+checksum = "368f01d005bf8fd9b1206fb6fa653e6c4a81ceb1466406b81792d87c5677a58f"
 dependencies = [
  "either",
  "rayon-core",
@@ -3518,9 +3421,9 @@ dependencies = [
 
 [[package]]
 name = "rayon-core"
-version = "1.12.1"
+version = "1.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1465873a3dfdaa8ae7cb14b4383657caab0b3e8a0aa9ae8e04b044854c8dfce2"
+checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
@@ -3955,29 +3858,23 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 [[package]]
 name = "salt"
 version = "1.0.0"
-source = "git+https://github.com/megaeth-labs/salt.git?branch=feature%2Fmega-reth-v2#8a11d8ab8b8eceef67a0b69ee9da4b928e69a7af"
+source = "git+https://github.com/megaeth-labs/salt.git?branch=main#21b5ebf8fdacd07a833b4bfbf0ccfe436a44fe33"
 dependencies = [
- "ahash 0.8.11",
  "ark-ff 0.5.0",
- "auto_impl",
  "banderwagon",
  "blake3",
- "bytes",
  "derive_more 2.0.1",
- "ffi_interface",
  "hex",
  "ipa-multipoint",
  "iter_tools",
- "modular-bitfield",
  "once_cell",
  "rayon",
  "rustc-hash",
  "serde",
- "serde_arrays 0.1.0",
- "serde_json",
- "serde_with",
- "thiserror 1.0.69",
+ "serde_arrays",
+ "thiserror",
  "tracing",
+ "zerocopy 0.7.35",
 ]
 
 [[package]]
@@ -4056,15 +3953,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f0e2c6ed6606019b4e29e69dbaba95b11854410e5347d525002456dbbb786b6"
 dependencies = [
  "serde_derive",
-]
-
-[[package]]
-name = "serde_arrays"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38636132857f68ec3d5f3eb121166d2af33cb55174c4d5ff645db6165cbef0fd"
-dependencies = [
- "serde",
 ]
 
 [[package]]
@@ -4479,31 +4367,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
-dependencies = [
- "thiserror-impl 1.0.69",
-]
-
-[[package]]
-name = "thiserror"
 version = "2.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "567b8a2dae586314f7be2a752ec7474332959c6460e02bde30d702a66d488708"
 dependencies = [
- "thiserror-impl 2.0.12",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.104",
+ "thiserror-impl",
 ]
 
 [[package]]
@@ -4923,7 +4791,7 @@ dependencies = [
  "revm",
  "salt",
  "serde",
- "serde_arrays 0.2.0",
+ "serde_arrays",
  "serde_json",
  "simd-json",
  "tempfile",
@@ -4946,43 +4814,6 @@ dependencies = [
  "halfbrown",
  "itoa",
  "ryu",
-]
-
-[[package]]
-name = "verkle-db"
-version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?branch=feature%2Fmega-reth-v2#8a11d8ab8b8eceef67a0b69ee9da4b928e69a7af"
-
-[[package]]
-name = "verkle-spec"
-version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?branch=feature%2Fmega-reth-v2#8a11d8ab8b8eceef67a0b69ee9da4b928e69a7af"
-dependencies = [
- "banderwagon",
- "ethereum-types",
- "hex",
- "ipa-multipoint",
- "verkle-trie",
-]
-
-[[package]]
-name = "verkle-trie"
-version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?branch=feature%2Fmega-reth-v2#8a11d8ab8b8eceef67a0b69ee9da4b928e69a7af"
-dependencies = [
- "anyhow",
- "banderwagon",
- "hex",
- "ipa-multipoint",
- "itertools 0.10.5",
- "once_cell",
- "rand_chacha 0.3.1",
- "rayon",
- "sha2 0.9.9",
- "smallvec",
- "tempfile",
- "thiserror 1.0.69",
- "verkle-db",
 ]
 
 [[package]]
@@ -5370,6 +5201,7 @@ version = "0.7.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b9b4fd18abc82b8136838da5d50bae7bdea537c574d8dc1a34ed098d6c166f0"
 dependencies = [
+ "byteorder",
  "zerocopy-derive 0.7.35",
 ]
 
