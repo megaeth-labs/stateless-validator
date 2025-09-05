@@ -30,3 +30,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 num_cpus.workspace = true
 futures.workspace = true
 jsonrpsee.workspace = true
+
+[dev-dependencies]
+jsonrpsee-types.workspace = true
+op-alloy-rpc-types.workspace = true
