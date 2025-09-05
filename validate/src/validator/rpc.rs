@@ -200,10 +200,7 @@ pub fn get_blob_ids(
 }
 
 /// Get the witness for a block.
-pub fn get_witness(
-    stateless_dir: &Path,
-    block_info: String,
-) -> Result<String, ErrorObjectOwned> {
+pub fn get_witness(stateless_dir: &Path, block_info: String) -> Result<String, ErrorObjectOwned> {
     let (block_number, parent_hash) = parse_num_hash(&block_info)?;
 
     // get the witness from witness directory

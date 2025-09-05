@@ -20,7 +20,7 @@ use tokio::{runtime::Handle, signal, sync::Mutex};
 use tracing::{error, info};
 use validate::{
     SaltWitnessState,
-    formate::{PLAIN_ACCOUNT_KEY_LEN, PlainKey, PlainValue},
+    format::{PLAIN_ACCOUNT_KEY_LEN, PlainKey, PlainValue},
     generate::{curent_time_to_u64, get_witness_state},
     produce::get_chain_status,
     validator::{
