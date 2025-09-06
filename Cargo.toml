@@ -34,7 +34,6 @@ revm-inspectors = "0.17.0-alpha.1"
 
 salt = { git = "https://github.com/megaeth-labs/salt.git", branch = "main" }
 mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", branch = "main" }
-megaeth-primitives = { git = "https://github.com/megaeth-labs/mega-reth.git", branch = "refactor/base-on-v1.3.4" }
 
 axum = "0.8"
 bincode = { version = "2.0", features = ["serde"] }
