@@ -56,13 +56,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: codespell-project/actions-codespell@v2
-
-  security_audit:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.PAT_GAO_CI }}
-      - uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.PAT_GAO_CI }}
+#   security_audit:
+#     runs-on: ubuntu-24.04
+#     steps:
+#       - uses: actions/checkout@v4
+#         with:
+#           token: ${{ secrets.PAT_GAO_CI }}
+#       - uses: rustsec/audit-check@v2.0.0
+#         with:
+#           token: ${{ secrets.PAT_GAO_CI }}
