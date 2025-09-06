@@ -610,7 +610,7 @@ mod tests {
             load_contracts_file(&validate_path, contracts_file).unwrap_or_default(),
         ));
 
-        let finalized_num = 3079;
+        let finalized_num = 279;
         let block_counter = finalized_num + 1;
 
         for block_counter in block_counter..block_counter + 21 {
