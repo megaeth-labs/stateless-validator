@@ -6,13 +6,14 @@
 
 use alloy_consensus::{Transaction as TransactionTrait, Typed2718};
 use alloy_eips::{eip2718::Encodable2718, eip2930::AccessList, eip7702::SignedAuthorization};
-use alloy_evm::FromRecoveredTx;
+use alloy_evm::{FromRecoveredTx, FromTxWithEncoded};
 use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
 use mega_evm::Transaction;
 use op_alloy_consensus::OpTxEnvelope;
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use op_revm::transaction::deposit::DepositTransactionParts;
 use revm::context::TxEnv;
+use revm::context_interface::either::Either;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpTransactionSigned(pub OpTransaction);
@@ -109,7 +110,11 @@ impl FromRecoveredTx<OpTransactionSigned> for Transaction {
                     access_list: tx_eip7702.access_list.clone(),
                     blob_hashes: Default::default(),
                     max_fee_per_blob_gas: Default::default(),
-                    authorization_list: tx_eip7702.authorization_list.clone(),
+                    authorization_list: tx_eip7702
+                        .authorization_list
+                        .iter()
+                        .map(|s| Either::Left(s.clone()))
+                        .collect(),
                     tx_type: 4,
                     caller: sender,
                 }
@@ -146,7 +151,7 @@ impl FromRecoveredTx<OpTransactionSigned> for Transaction {
                     // missing This is because op-geth does not distinguish
                     // between null and 0, because this value is decoded from RLP where null is
                     // represented as 0
-                    mint: Some(tx.mint.unwrap_or_default()),
+                    mint: Some(tx.mint),
                 }
             } else {
                 Default::default()
@@ -250,5 +255,13 @@ impl Encodable2718 for OpTransactionSigned {
 
     fn encode_2718(&self, out: &mut dyn alloy_rlp::BufMut) {
         self.op_tx_envelope().encode_2718(out)
+    }
+}
+
+impl FromTxWithEncoded<OpTransactionSigned> for Transaction {
+    fn from_encoded_tx(tx: &OpTransactionSigned, sender: Address, encoded: Bytes) -> Self {
+        let mut tx = Transaction::from_recovered_tx(tx, sender);
+        tx.enveloped_tx = Some(encoded);
+        tx
     }
 }

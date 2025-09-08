@@ -36,7 +36,7 @@ impl RpcClient {
     /// Creates a new `RpcClient` connected to the given API endpoint.
     pub fn new(api: &str) -> Result<Self> {
         let provider = ProviderBuilder::<_, _, Optimism>::default()
-            .on_http(api.parse().map_err(|e| eyre!("parse api failed: {}", e))?);
+            .connect_http(api.parse().map_err(|e| eyre!("parse api failed: {}", e))?);
 
         Ok(Self { provider })
     }

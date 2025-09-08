@@ -11,25 +11,21 @@ path = "src/main.rs"
 alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-rpc-types-eth.workspace = true
-alloy-transport-http.workspace = true
 
-salt.workspace = true
 revm = { workspace = true, features = ["serde"] }
 
-axum.workspace = true
+salt.workspace = true
+
 bincode.workspace = true
-blake3.workspace = true
 clap.workspace = true
 eyre.workspace = true
-serde.workspace = true
-tokio.workspace = true
-validate = { path = "../../validate" }
-
-tracing.workspace = true
-tracing-subscriber = { version = "^0.3.20", features = ["fmt"] }
-num_cpus.workspace = true
 futures.workspace = true
 jsonrpsee.workspace = true
+num_cpus.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+validate = { path = "../../validate" }
 
 [dev-dependencies]
 jsonrpsee-types.workspace = true

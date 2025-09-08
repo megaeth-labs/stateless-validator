@@ -7,8 +7,6 @@ edition = "2024"
 alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-rpc-types-eth.workspace = true
-alloy-transport.workspace = true
-alloy-transport-http.workspace = true
 alloy-evm.workspace = true
 alloy-hardforks.workspace = true
 alloy-consensus.workspace = true
@@ -28,13 +26,10 @@ salt.workspace = true
 revm.workspace = true
 
 blake3.workspace = true
-bytes.workspace = true
 bincode.workspace = true
 serde.workspace = true
-serde_arrays.workspace = true
 serde_json.workspace = true
 simd-json.workspace = true
-rayon.workspace = true
 
 eyre.workspace = true
 futures.workspace = true
@@ -44,6 +39,4 @@ tokio.workspace = true
 jsonrpsee-types.workspace = true
 
 [dev-dependencies]
-envconfig = "0.11.0"
-#reth-db = { workspace = true, features = ["mdbx", "test-utils"] }
 tempfile = "3.8"

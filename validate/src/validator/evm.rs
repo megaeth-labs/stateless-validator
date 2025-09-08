@@ -17,7 +17,7 @@ use revm::{
     context::{BlockEnv, CfgEnv, ContextTr},
     database::states::{CacheAccount, StateBuilder},
     handler::EvmTr,
-    primitives::{Address, HashMap, U256, hardfork::SpecId as RevmSpecId},
+    primitives::{Address, HashMap, U256},
 };
 
 use crate::validator::WitnessProvider;
@@ -80,7 +80,7 @@ pub fn replay_block(
         .create_evm(&mut state, evm_env);
 
     // to fix l1_block_info.operator_fee_scalar.expect() when set blockhash in apply_pre_execution_changes
-    *evm.ctx().chain() = l1_block_info;
+    *evm.ctx_mut().chain_mut() = l1_block_info;
 
     let mut block_executor = block_executor_factory.create_executor(evm, op_block_execution_ctx);
 
@@ -120,9 +120,9 @@ pub fn replay_block(
 fn get_block_env(block: &Block<OpTransaction>) -> Result<BlockEnv> {
     let header = &block.header;
     let mut block_env = BlockEnv {
-        number: header.number,
+        number: U256::from(header.number),
         beneficiary: header.beneficiary,
-        timestamp: header.timestamp,
+        timestamp: U256::from(header.timestamp),
         gas_limit: header.gas_limit,
         basefee: header.base_fee_per_gas.unwrap_or_default(),
         difficulty: header.difficulty,
@@ -132,7 +132,9 @@ fn get_block_env(block: &Block<OpTransaction>) -> Result<BlockEnv> {
     };
 
     if let Some(excess_blob_gas) = header.excess_blob_gas {
-        block_env.set_blob_excess_gas_and_price(excess_blob_gas, true);
+        // Default blob base fee update fraction for Cancun (from EIP-4844)
+        const BLOB_GASPRICE_UPDATE_FRACTION: u64 = 3338477;
+        block_env.set_blob_excess_gas_and_price(excess_blob_gas, BLOB_GASPRICE_UPDATE_FRACTION);
     }
 
     Ok(block_env)
@@ -145,8 +147,6 @@ fn get_evm_config() -> CfgEnv<SpecId> {
     let mut cfg_env = CfgEnv::new_with_spec(SpecId::EQUIVALENCE);
 
     cfg_env.chain_id = 6342;
-    cfg_env.blob_target_and_max_count =
-        vec![(RevmSpecId::CANCUN, 3, 6), (RevmSpecId::PRAGUE, 6, 9)];
     cfg_env.memory_limit = 4294967295; // u32::MAX
     cfg_env
 }
