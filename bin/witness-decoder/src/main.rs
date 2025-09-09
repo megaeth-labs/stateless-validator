@@ -3,7 +3,7 @@ use clap::Parser;
 use eyre::{Result, anyhow};
 use serde::Serialize;
 use std::{fs::File, io::Read, path::PathBuf};
-use validate::{
+use validator_core::{
     SaltWitnessState, WitnessStatus, deserialized_state_data, file_name_hash, file_name_number,
 };
 

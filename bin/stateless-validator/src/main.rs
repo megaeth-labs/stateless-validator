@@ -18,20 +18,18 @@ use std::{
 };
 use tokio::{runtime::Handle, signal, sync::Mutex};
 use tracing::{error, info};
-use validate::{
+use validator_core::{
     SaltWitnessState,
-    format::{PLAIN_ACCOUNT_KEY_LEN, PlainKey, PlainValue},
-    generate::{curent_time_to_u64, get_witness_state},
-    produce::get_chain_status,
-    validator::{
-        PlainKeyUpdate, WitnessProvider,
-        evm::replay_block,
-        file::{
-            ValidateStatus, append_json_line_to_file, load_contracts_file, load_validate_info,
-            read_block_hash_by_number_from_file, set_validate_status,
-        },
-        rpc::{RpcClient, get_blob_ids, get_witness},
+    chain::get_chain_status,
+    client::{RpcClient, get_blob_ids, get_witness},
+    encoding::{PLAIN_ACCOUNT_KEY_LEN, PlainKey, PlainValue},
+    evm::replay_block,
+    provider::{PlainKeyUpdate, WitnessProvider},
+    storage::{
+        ValidateStatus, append_json_line_to_file, load_contracts_file, load_validate_info,
+        read_block_hash_by_number_from_file, set_validate_status,
     },
+    witness::{curent_time_to_u64, get_witness_state},
 };
 
 /// Maximum response body size for the RPC server.
@@ -478,7 +476,7 @@ mod tests {
     use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned};
     use op_alloy_rpc_types::Transaction;
     use std::fs;
-    use validate::file::load_json_file;
+    use validator_core::storage::load_json_file;
 
     #[derive(Debug)]
     enum Input {

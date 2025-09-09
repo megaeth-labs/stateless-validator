@@ -1,10 +1,10 @@
 [package]
-name = "megaeth-validator"
+name = "stateless-validator"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "megaeth-validator"
+name = "stateless-validator"
 path = "src/main.rs"
 
 [dependencies]
@@ -25,7 +25,7 @@ num_cpus.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-validate = { path = "../../validate" }
+validator-core = { path = "../../validator-core" }
 
 [dev-dependencies]
 jsonrpsee-types.workspace = true

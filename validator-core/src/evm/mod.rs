@@ -20,9 +20,9 @@ use revm::{
     primitives::{Address, HashMap, U256},
 };
 
-use crate::validator::WitnessProvider;
-use crate::validator::evm::receipts::OpRethReceiptBuilder;
-use crate::validator::evm::signed::OpTransactionSigned;
+use crate::evm::receipts::OpRethReceiptBuilder;
+use crate::evm::signed::OpTransactionSigned;
+use crate::provider::WitnessProvider;
 
 mod receipt;
 mod receipts;

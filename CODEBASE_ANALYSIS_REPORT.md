@@ -103,7 +103,7 @@ struct Args {
 - **`validator.rs`**: Main validator components and database interface
 - **`produce.rs`**: Chain status management  
 - **`generate.rs`**: Witness state management
-- **`formate.rs`**: Data format definitions and encoding/decoding
+- **`format.rs`**: Data format definitions and encoding/decoding
 
 #### Key Types:
 ```rust

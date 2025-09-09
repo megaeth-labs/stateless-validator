@@ -2879,29 +2879,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "megaeth-validator"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "alloy-provider",
- "alloy-rpc-types-eth",
- "bincode",
- "clap",
- "eyre",
- "futures",
- "jsonrpsee",
- "jsonrpsee-types",
- "num_cpus",
- "op-alloy-rpc-types",
- "revm",
- "salt",
- "tokio",
- "tracing",
- "tracing-subscriber 0.3.20",
- "validate",
-]
-
-[[package]]
 name = "memchr"
 version = "2.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4359,6 +4336,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8f112729512f8e442d81f95a8a7ddf2b7c6b8a1a6f509a95864142b30cab2d3"
 
 [[package]]
+name = "stateless-validator"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types-eth",
+ "bincode",
+ "clap",
+ "eyre",
+ "futures",
+ "jsonrpsee",
+ "jsonrpsee-types",
+ "num_cpus",
+ "op-alloy-rpc-types",
+ "revm",
+ "salt",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.20",
+ "validator-core",
+]
+
+[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4826,7 +4826,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
-name = "validate"
+name = "validator-core"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
@@ -5284,7 +5284,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
- "validate",
+ "validator-core",
 ]
 
 [[package]]

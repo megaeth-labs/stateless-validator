@@ -6,8 +6,8 @@ A Rust implementation of a stateless blockchain validator that processes witness
 
 The stateless validator consists of:
 
-- **`validate`**: Core library providing stateless validation logic, witness data handling, and file I/O operations
-- **`megaeth-validator`**: Main validator binary that processes blocks using witness data
+- **`validator-core`**: Core library providing stateless validation logic, witness data handling, and file I/O operations
+- **`stateless-validator`**: Main validator binary that processes blocks using witness data
 - **`witness-decoder`**: Utility tool for decoding and inspecting `.w` witness files
 
 ## Architecture
@@ -38,7 +38,7 @@ cargo build --release
 ### Running the Validator
 
 ```bash
-cargo run --bin megaeth-validator -- [OPTIONS]
+cargo run --bin stateless-validator -- [OPTIONS]
 ```
 
 ### Decoding Witness Files
@@ -66,11 +66,11 @@ cargo run --bin witness-decoder -- --file path/to/witness.w --hex-dump-bytes 100
 ```
 stateless-validator/
 ├── bin/
-│   ├── validator/          # Main validator binary
-│   └── witness-decoder/    # Witness file decoder utility
-├── validate/               # Core validation library
-├── test_data/              # Test blocks and witness files
-└── Cargo.toml             # Workspace configuration
+│   ├── stateless-validator/ # Main validator binary
+│   └── witness-decoder/     # Witness file decoder utility
+├── validator-core/          # Core validation library
+├── test_data/               # Test blocks and witness files
+└── Cargo.toml               # Workspace configuration
 ```
 
 ### Testing

@@ -61,7 +61,7 @@ jobs:
             VERSION="latest"
           fi
           ARTIFACT_NAME="stateless-validator-${VERSION}-${COMMIT_ID}"
-          BINARY_PATH="$GITHUB_WORKSPACE/target/release/megaeth-validator"
+          BINARY_PATH="$GITHUB_WORKSPACE/target/release/stateless-validator"
           echo "Binary path : $BINARY_PATH"
           echo "artifact_name=${ARTIFACT_NAME}" >> $GITHUB_OUTPUT
           echo "binary_path=${BINARY_PATH}" >> $GITHUB_OUTPUT

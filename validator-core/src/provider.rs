@@ -4,7 +4,7 @@
 //! This allows it to act as a read-only database for REVM, but instead of fetching data from a
 //! full database, it serves data from a `BlockWitness`. This is the key to enabling stateless
 //! block replay and validation.
-use crate::format::{Account, PlainKey, PlainValue};
+use crate::encoding::{Account, PlainKey, PlainValue};
 use alloy_primitives::{Address, B256};
 use alloy_provider::{Provider, RootProvider};
 use op_alloy_network::Optimism;
@@ -19,10 +19,6 @@ use salt::{EphemeralSaltState, Witness};
 use std::error::Error;
 use std::fmt;
 use tokio::{runtime::Handle, sync::oneshot};
-
-pub mod evm;
-pub mod file;
-pub mod rpc;
 
 /// A custom error type for the `WitnessProvider`.
 ///

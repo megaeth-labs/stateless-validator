@@ -6,7 +6,7 @@
 //!
 //! The `get_blob_ids` function acts as an RPC endpoint handler, allowing clients to query
 //! the validation status and retrieve blob information for a given block.
-use crate::file::{
+use crate::storage::{
     ValidateStatus, load_from_file_or_backup, load_validate_info,
     read_block_hash_by_number_from_file,
 };

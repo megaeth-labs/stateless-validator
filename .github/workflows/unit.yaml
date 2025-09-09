@@ -29,4 +29,4 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Run  Test
         run: |
-          cargo test --package megaeth-validator --bin megaeth-validator --all-features -- tests --show-output
+          cargo test --package stateless-validator --bin stateless-validator --all-features -- tests --show-output

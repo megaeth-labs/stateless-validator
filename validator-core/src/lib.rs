@@ -12,15 +12,18 @@
 //!
 //! ## Modules
 //!
-//! - [`produce`]: Block production and witness generation
-//! - [`generate`]: Witness data generation and state management
-//! - [`validator`]: Core validation logic and file handling
-//! - [`format`]: Data formatting and conversion utilities
+//! - [`chain`]: Chain status and finalization tracking
+//! - [`witness`]: Witness data generation and state management  
+//! - [`provider`]: Stateless database provider for REVM
+//! - [`encoding`]: Serialization formats and data encoding
+//! - [`storage`]: File system storage and backup management
+//! - [`client`]: External service communication
+//! - [`evm`]: EVM-specific validation logic
 //!
 //! ## Example Usage
 //!
 //! ```rust,no_run
-//! use validate::{StateData, serialized_state_data, deserialized_state_data};
+//! use validator_core::{StateData, serialized_state_data, deserialized_state_data};
 //!
 //! // Serialize data with hash verification
 //! let data = vec![1, 2, 3, 4];
@@ -31,14 +34,20 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-pub mod produce;
-pub use produce::*;
-pub mod generate;
-pub use generate::*;
-pub mod validator;
-pub use validator::*;
-pub mod format;
-pub use format::*;
+pub mod chain;
+pub use chain::*;
+pub mod witness;
+pub use witness::*;
+pub mod provider;
+pub use provider::*;
+pub mod encoding;
+pub use encoding::*;
+pub mod storage;
+pub use storage::*;
+pub mod client;
+pub use client::*;
+pub mod evm;
+pub use evm::*;
 
 use alloy_primitives::{B256, BlockHash, BlockNumber, hex};
 use serde::{Deserialize, Serialize};
@@ -73,7 +82,7 @@ pub struct StateData {
 ///
 /// # Example
 /// ```rust,no_run
-/// use validate::serialized_state_data;
+/// use validator_core::serialized_state_data;
 ///
 /// let data = b"Hello, world!".to_vec();
 /// let serialized = serialized_state_data(data)?;
@@ -111,7 +120,7 @@ pub fn serialized_state_data(data: Vec<u8>) -> std::io::Result<Vec<u8>> {
 ///
 /// # Example
 /// ```rust,no_run
-/// use validate::{serialized_state_data, deserialized_state_data};
+/// use validator_core::{serialized_state_data, deserialized_state_data};
 ///
 /// let original = b"test data".to_vec();
 /// let serialized = serialized_state_data(original.clone())?;
@@ -153,7 +162,7 @@ pub fn deserialized_state_data(data: Vec<u8>) -> std::io::Result<StateData> {
 ///
 /// # Example
 /// ```rust
-/// use validate::file_name_number;
+/// use validator_core::file_name_number;
 ///
 /// let number = file_name_number("280.0x03c5cb583df6c35f9dcca041f2aa609fce1ad92e170c96c694ce9a6bd3913df1.w");
 /// assert_eq!(number, 280);
@@ -181,7 +190,7 @@ pub fn file_name_number(file_name: &str) -> BlockNumber {
 ///
 /// # Example
 /// ```rust
-/// use validate::file_name_hash;
+/// use validator_core::file_name_hash;
 /// use alloy_primitives::BlockHash;
 ///
 /// let hash = file_name_hash("280.0x03c5cb583df6c35f9dcca041f2aa609fce1ad92e170c96c694ce9a6bd3913df1.w");
@@ -223,7 +232,7 @@ pub fn file_name_hash(file_name: &str) -> BlockHash {
 ///
 /// # Example
 /// ```rust
-/// use validate::backup_file;
+/// use validator_core::backup_file;
 /// use alloy_primitives::{BlockHash, B256};
 ///
 /// let hash = BlockHash::from([1u8; 32]);
@@ -253,7 +262,7 @@ pub fn backup_file(block_num: BlockNumber, block_hash: BlockHash, ext: &str) -> 
 ///
 /// # Example
 /// ```rust
-/// use validate::backup_dir;
+/// use validator_core::backup_dir;
 ///
 /// let dir = backup_dir(1000);
 /// assert!(dir.starts_with("backup/"));
