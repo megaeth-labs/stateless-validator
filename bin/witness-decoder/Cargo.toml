@@ -1,0 +1,15 @@
+[package]
+name = "witness-decoder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+validate = { path = "../../validate" }
+alloy-primitives = { workspace = true }
+blake3 = { workspace = true }
+bincode = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { version = "4.0", features = ["derive"] }
+eyre = { workspace = true }
+hex = "0.4"
