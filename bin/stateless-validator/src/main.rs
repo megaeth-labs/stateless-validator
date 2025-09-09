@@ -1,4 +1,4 @@
-use alloy_primitives::Address;
+use alloy_primitives::{Address, hex};
 use clap::Parser;
 use eyre::{Result, anyhow};
 use futures::stream::{self, StreamExt};
@@ -386,8 +386,10 @@ async fn validate_block(
 
             if new_trie_root != new_state_root {
                 error!(
-                    "Validation FAILED for block {}. Calculated state root: {:?}, Expected state root: {:?}",
-                    block_counter, new_trie_root, new_state_root
+                    "Validation FAILED for block {}. Calculated state root: 0x{}, Expected state root: 0x{}",
+                    block_counter,
+                    hex::encode(new_trie_root),
+                    hex::encode(new_state_root)
                 );
                 set_validate_status(
                     stateless_dir,
@@ -400,8 +402,9 @@ async fn validate_block(
                 )?;
             } else {
                 info!(
-                    "Validation SUCCESS for block {}. State root: {:?}",
-                    block_counter, new_trie_root
+                    "Validation SUCCESS for block {}. State root: 0x{}",
+                    block_counter,
+                    hex::encode(new_trie_root)
                 );
                 set_validate_status(
                     stateless_dir,
