@@ -1,6 +1,6 @@
 //! This module provides the core components for stateless validation.
 //!
-//! The central piece is the `WitnessProvider`, which implements the `revm::DatabaseRef` trait.
+//! The central piece is the `WitnessDatabase`, which implements the `revm::DatabaseRef` trait.
 //! This allows it to act as a read-only database for REVM, but instead of fetching data from a
 //! full database, it serves data from a `BlockWitness`. This is the key to enabling stateless
 //! block replay and validation.
@@ -20,36 +20,36 @@ use std::error::Error;
 use std::fmt;
 use tokio::{runtime::Handle, sync::oneshot};
 
-/// A custom error type for the `WitnessProvider`.
+/// A custom error type for the `WitnessDatabase`.
 ///
 /// This error type wraps a `String` and implements the `std::error::Error` trait,
 /// making it compatible with the `DatabaseRef::Error` associated type.
 #[derive(Debug)]
-pub struct WitnessProviderError(String);
+pub struct WitnessDatabaseError(String);
 
-impl fmt::Display for WitnessProviderError {
+impl fmt::Display for WitnessDatabaseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-impl Error for WitnessProviderError {}
+impl Error for WitnessDatabaseError {}
 
-impl DBErrorMarker for WitnessProviderError {}
+impl DBErrorMarker for WitnessDatabaseError {}
 
-impl From<&'static str> for WitnessProviderError {
+impl From<&'static str> for WitnessDatabaseError {
     fn from(s: &'static str) -> Self {
         Self(s.to_string())
     }
 }
 
-/// A REVM database provider that sources all its data from a `BlockWitness`.
+/// A REVM database that sources all its data from a `BlockWitness`.
 ///
 /// This struct implements the `DatabaseRef` trait, allowing REVM to perform EVM execution
 /// using only the data contained within the witness. It holds the witness itself, any required
 /// contract code, and an RPC provider for fetching historical block hashes.
 #[derive(Debug, Clone)]
-pub struct WitnessProvider {
+pub struct WitnessDatabase {
     /// The witness data, containing the necessary state subset and proof.
     pub witness: Witness,
     /// A map of contract code hashes to their corresponding bytecode.
@@ -60,17 +60,17 @@ pub struct WitnessProvider {
     pub rt: Handle,
 }
 
-impl WitnessProvider {
+impl WitnessDatabase {
     /// Return the SALT value associated with the given plain key.
-    fn get_raw(&self, plain_key: &[u8]) -> Result<Option<Vec<u8>>, WitnessProviderError> {
+    fn get_raw(&self, plain_key: &[u8]) -> Result<Option<Vec<u8>>, WitnessDatabaseError> {
         let mut state = EphemeralSaltState::new(&self.witness);
 
         Ok(state.plain_value(plain_key)?)
     }
 }
 
-impl DatabaseRef for WitnessProvider {
-    type Error = WitnessProviderError;
+impl DatabaseRef for WitnessDatabase {
+    type Error = WitnessDatabaseError;
 
     /// Provides basic account information (balance, nonce, code hash) from the witness.
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
@@ -109,7 +109,7 @@ impl DatabaseRef for WitnessProvider {
         self.contracts
             .get(&code_hash)
             .cloned()
-            .ok_or_else(|| WitnessProviderError("Code not found in witness contracts".to_string()))
+            .ok_or_else(|| WitnessDatabaseError("Code not found in witness contracts".to_string()))
     }
 
     /// Provides a storage slot's value for a given account.
@@ -145,9 +145,9 @@ impl DatabaseRef for WitnessProvider {
 
             let res = rx
                 .blocking_recv()
-                .map_err(|e| WitnessProviderError(e.to_string()))?;
+                .map_err(|e| WitnessDatabaseError(e.to_string()))?;
 
-            let block = res.map_err(|e| WitnessProviderError(e.to_string()))?;
+            let block = res.map_err(|e| WitnessDatabaseError(e.to_string()))?;
 
             // SAFETY: If the block is finalized and exist. Thus, we can safely unwrap the results.
             Ok(block.unwrap().header.hash)

@@ -20,9 +20,9 @@ use revm::{
     primitives::{Address, HashMap, U256},
 };
 
+use crate::database::WitnessDatabase;
 use crate::evm::receipts::OpRethReceiptBuilder;
 use crate::evm::signed::OpTransactionSigned;
-use crate::provider::WitnessProvider;
 
 mod data_types;
 mod receipt;
@@ -31,7 +31,7 @@ mod signed;
 
 pub use data_types::*;
 
-/// Replays a block's transactions against a given pre-state represented by a `WitnessProvider`.
+/// Replays a block's transactions against a given pre-state represented by a `WitnessDatabase`.
 ///
 /// This function simulates the execution of all transactions within a block
 /// on the provided witness-backed database. It configures a REVM instance with
@@ -40,7 +40,7 @@ pub use data_types::*;
 /// # Arguments
 ///
 /// * `block` - The `Block` to be replayed, containing full transaction details.
-/// * `db` - A mutable reference to a `CacheDB` backed by a `WitnessProvider`. This database
+/// * `db` - A mutable reference to a `CacheDB` backed by a `WitnessDatabase`. This database
 ///   provides the necessary pre-state for transaction execution and will be updated as transactions
 ///   are processed.
 ///
@@ -51,7 +51,7 @@ pub use data_types::*;
 /// block data, or errors during EVM execution.
 pub fn replay_block(
     block: Block<OpTransaction>,
-    provider: &WitnessProvider,
+    provider: &WitnessDatabase,
 ) -> Result<HashMap<Address, CacheAccount>> {
     let BlockTransactions::Full(transactions) = block.transactions.clone() else {
         return Err(eyre!("Wrong transaction type, expected full transactions"));

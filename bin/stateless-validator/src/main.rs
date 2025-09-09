@@ -22,9 +22,9 @@ use validator_core::{
     SaltWitnessState,
     chain::get_chain_status,
     client::{RpcClient, get_blob_ids, get_witness},
+    database::{PlainKeyUpdate, WitnessDatabase},
     evm::replay_block,
     evm::{PlainKey, PlainValue},
-    provider::{PlainKeyUpdate, WitnessProvider},
     storage::{
         ValidateStatus, append_json_line_to_file, load_contracts_file, load_validate_info,
         read_block_hash_by_number_from_file, set_validate_status,
@@ -364,7 +364,7 @@ async fn validate_block(
             }
 
             let rt = Handle::current();
-            let witness_provider = WitnessProvider {
+            let witness_provider = WitnessDatabase {
                 witness: block_witness.clone(),
                 contracts: contracts_for_provider,
                 provider: client.provider.clone(),
