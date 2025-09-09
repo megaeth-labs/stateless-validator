@@ -1,10 +1,10 @@
-use alloy_primitives::{BlockNumber, B256};
+use alloy_primitives::{B256, BlockNumber};
 use clap::Parser;
-use eyre::{anyhow, Result};
+use eyre::{Result, anyhow};
 use serde::Serialize;
 use std::{fs::File, io::Read, path::PathBuf};
 use validate::{
-    deserialized_state_data, file_name_hash, file_name_number, SaltWitnessState, WitnessStatus,
+    SaltWitnessState, WitnessStatus, deserialized_state_data, file_name_hash, file_name_number,
 };
 
 #[derive(Parser, Debug)]
