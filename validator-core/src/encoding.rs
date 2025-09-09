@@ -1,49 +1,82 @@
+//! EVM data types and encoding utilities.
+//!
+//! This module provides types and utilities for encoding/decoding Ethereum account
+//! and storage data into a compact binary format. External projects such as stateless
+//! validator can use these types without depending on external EVM libraries.
+//!
+//! # Types
+//!
+//! The module defines:
+//! - [`PlainKey`]: An account address or storage slot
+//! - [`PlainValue`]: Account or storage data
+//! - [`Account`]: An EVM account containing nonce, balance, and optional bytecode hash
+//!
+//! # Encoding Format
+//!
+//! ## Keys
+//! - Account keys: 20 bytes (address)
+//! - Storage keys: 52 bytes (20-byte address + 32-byte storage slot)
+//!
+//! ## Values
+//! - EOA accounts: 40 bytes (8-byte nonce + 32-byte balance)
+//! - Contract accounts: 72 bytes (8-byte nonce + 32-byte balance + 32-byte bytecode hash)
+//! - Storage values: 32 bytes (U256 value)
+
 pub use alloy_primitives::Bytes;
 use alloy_primitives::{Address, B256, U256};
 
-/// data length of Key of Storage Slot
-pub const SLOT_KEY_LEN: usize = B256::len_bytes();
-/// data length of Key of Account
-pub const PLAIN_ACCOUNT_KEY_LEN: usize = Address::len_bytes();
-/// data length of Key of Storage
-pub const PLAIN_STORAGE_KEY_LEN: usize = PLAIN_ACCOUNT_KEY_LEN + SLOT_KEY_LEN;
+/// Length of a storage slot key in bytes (32)
+const SLOT_KEY_LEN: usize = B256::len_bytes();
+/// Length of an account address in bytes (20)
+const ACCOUNT_ADDRESS_LEN: usize = Address::len_bytes();
+/// Total length of a storage key in bytes (20 + 32 = 52)
+const STORAGE_SLOT_KEY_LEN: usize = ACCOUNT_ADDRESS_LEN + SLOT_KEY_LEN;
 
-pub const U64_BYTES_LEN: usize = 8;
-pub const BALANCE_BYTES_LEN: usize = U256::BYTES;
-/// data length of Value of Account(Contract)
-pub const PLAIN_EOA_ACCOUNT_LEN: usize = U64_BYTES_LEN + BALANCE_BYTES_LEN;
-/// data length of Value of Account(EOA)
-pub const PLAIN_CONTRACT_ACCOUNT_LEN: usize = PLAIN_EOA_ACCOUNT_LEN + B256::len_bytes();
-/// data length of Value of Storage
-pub const PLAIN_STORAGE_LEN: usize = U256::BYTES;
+/// Length of an EOA account value in bytes (8-byte nonce + 32-byte balance)
+const EOA_ACCOUNT_LEN: usize = 8 + 32;
+/// Length of a contract account value in bytes (EOA + 32-byte bytecode hash)
+const CONTRACT_ACCOUNT_LEN: usize = EOA_ACCOUNT_LEN + 32;
+/// Length of a storage value in bytes (U256)
+const STORAGE_VALUE_LEN: usize = 32;
 
-/// Key of PlainAccount/StorageState.
+/// Represents a key in the EVM world state for testing.
+///
+/// This enum distinguishes between account keys (just an address) and
+/// storage slot keys (address + slot identifier).
 #[derive(Hash, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PlainKey {
-    /// Key of plainAccountState.
+    /// Key for an account state (20-byte address)
     Account(Address),
-    /// Key of plainStorageState: (address,  storage slot).
+    /// Key for a storage slot: (address, storage slot)
     Storage(Address, B256),
 }
 
 impl PlainKey {
-    /// Convert PlainKey to Vec.
+    /// Encodes the key into a byte vector.
+    ///
+    /// # Returns
+    /// - Account: 20-byte address
+    /// - Storage: 52-byte concatenation of address (20) + slot (32)
     pub fn encode(&self) -> Vec<u8> {
         match self {
             PlainKey::Account(addr) => addr.as_slice().to_vec(),
             PlainKey::Storage(addr, slot) => addr
-                .concat_const::<SLOT_KEY_LEN, PLAIN_STORAGE_KEY_LEN>(*slot)
+                .concat_const::<SLOT_KEY_LEN, STORAGE_SLOT_KEY_LEN>(*slot)
                 .as_slice()
                 .to_vec(),
         }
     }
 
+    /// Decodes a byte slice into a PlainKey.
+    ///
+    /// # Panics
+    /// Panics if the buffer length is neither 20 (account) nor 52 (storage) bytes.
     pub fn decode(buf: &[u8]) -> Self {
         match buf.len() {
-            PLAIN_ACCOUNT_KEY_LEN => PlainKey::Account(Address::from_slice(buf)),
-            PLAIN_STORAGE_KEY_LEN => {
-                let addr = Address::from_slice(&buf[..PLAIN_ACCOUNT_KEY_LEN]);
-                let slot_id = B256::from_slice(&buf[PLAIN_ACCOUNT_KEY_LEN..]);
+            ACCOUNT_ADDRESS_LEN => PlainKey::Account(Address::from_slice(buf)),
+            STORAGE_SLOT_KEY_LEN => {
+                let addr = Address::from_slice(&buf[..ACCOUNT_ADDRESS_LEN]);
+                let slot_id = B256::from_slice(&buf[ACCOUNT_ADDRESS_LEN..]);
                 PlainKey::Storage(addr, slot_id)
             }
             _ => unreachable!("unexpected length of plain key."),
@@ -51,121 +84,99 @@ impl PlainKey {
     }
 }
 
-impl From<Address> for PlainKey {
-    #[inline]
-    fn from(addr: Address) -> Self {
-        PlainKey::Account(addr)
-    }
-}
-
-impl From<(Address, B256)> for PlainKey {
-    #[inline]
-    fn from((addr, storage): (Address, B256)) -> Self {
-        PlainKey::Storage(addr, storage)
-    }
-}
-
-/// Value of PlainAccount/StorageState.
+/// Represents a value in the EVM world state for testing.
+///
+/// This enum encodes either account data or storage slot values in a
+/// compact binary format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlainValue {
-    /// If Account is empty, means the account should be deleted.
+    /// Account data containing nonce, balance, and optional bytecode hash.
+    /// An empty account (zero nonce and balance) typically indicates deletion.
     Account(Account),
-    /// Value of plainStorageState.
+    /// Storage slot value (256-bit unsigned integer)
     Storage(U256),
 }
 
 impl PlainValue {
-    /// Convert PlainValue to Vec.
+    /// Encodes the value into a byte vector.
+    ///
+    /// # Returns
+    /// - EOA Account: 40 bytes (8-byte nonce + 32-byte balance)
+    /// - Contract Account: 72 bytes (8-byte nonce + 32-byte balance + 32-byte bytecode hash)
+    /// - Storage: 32 bytes (U256 value)
+    ///
+    /// # Encoding Details
+    /// All integers are encoded in big-endian format.
     pub fn encode(&self) -> Vec<u8> {
         match self {
             PlainValue::Account(account) => {
-                let mut buffer = [0; PLAIN_CONTRACT_ACCOUNT_LEN];
-                buffer[..U64_BYTES_LEN].copy_from_slice(account.nonce.to_be_bytes().as_ref());
-                buffer[U64_BYTES_LEN..PLAIN_EOA_ACCOUNT_LEN]
-                    .copy_from_slice(account.balance.to_be_bytes::<BALANCE_BYTES_LEN>().as_ref());
+                let mut buffer = [0; CONTRACT_ACCOUNT_LEN];
+                buffer[..8].copy_from_slice(account.nonce.to_be_bytes().as_ref());
+                buffer[8..EOA_ACCOUNT_LEN]
+                    .copy_from_slice(account.balance.to_be_bytes::<32>().as_ref());
                 if let Some(bytecode_hash) = account.bytecode_hash {
-                    buffer[PLAIN_EOA_ACCOUNT_LEN..PLAIN_CONTRACT_ACCOUNT_LEN]
+                    buffer[EOA_ACCOUNT_LEN..CONTRACT_ACCOUNT_LEN]
                         .copy_from_slice(bytecode_hash.as_slice());
                     buffer.to_vec()
                 } else {
-                    buffer[..PLAIN_EOA_ACCOUNT_LEN].to_vec()
+                    buffer[..EOA_ACCOUNT_LEN].to_vec()
                 }
             }
-            PlainValue::Storage(value) => value.to_be_bytes::<PLAIN_STORAGE_LEN>().to_vec(),
+            PlainValue::Storage(value) => value.to_be_bytes::<32>().to_vec(),
         }
     }
 
-    /// Decode Vec to PlainValue.
+    /// Decodes a byte slice into a PlainValue.
+    ///
+    /// The function determines the value type based on the buffer length:
+    /// - 40 bytes: EOA account (no bytecode)
+    /// - 72 bytes: Contract account (with bytecode hash)
+    /// - 32 bytes: Storage value
+    ///
+    /// # Panics
+    /// Panics if the buffer length doesn't match any expected format.
     pub fn decode(buf: &[u8]) -> Self {
         match buf.len() {
-            PLAIN_EOA_ACCOUNT_LEN => {
-                let nonce = u64::from_be_bytes(buf[..U64_BYTES_LEN].try_into().unwrap());
-                let balance = U256::from_be_slice(&buf[U64_BYTES_LEN..PLAIN_EOA_ACCOUNT_LEN]);
+            EOA_ACCOUNT_LEN => {
+                let (nonce, balance) = Self::decode_account_fields(buf);
                 PlainValue::Account(Account {
                     nonce,
                     balance,
                     bytecode_hash: None,
                 })
             }
-            PLAIN_CONTRACT_ACCOUNT_LEN => {
-                let nonce = u64::from_be_bytes(buf[..U64_BYTES_LEN].try_into().unwrap());
-                let balance = U256::from_be_slice(&buf[U64_BYTES_LEN..PLAIN_EOA_ACCOUNT_LEN]);
-                let bytecode_hash =
-                    B256::from_slice(&buf[PLAIN_EOA_ACCOUNT_LEN..PLAIN_CONTRACT_ACCOUNT_LEN]);
+            CONTRACT_ACCOUNT_LEN => {
+                let (nonce, balance) = Self::decode_account_fields(buf);
+                let bytecode_hash = B256::from_slice(&buf[EOA_ACCOUNT_LEN..]);
                 PlainValue::Account(Account {
                     nonce,
                     balance,
                     bytecode_hash: Some(bytecode_hash),
                 })
             }
-            PLAIN_STORAGE_LEN => PlainValue::Storage(U256::from_be_slice(buf)),
+            STORAGE_VALUE_LEN => PlainValue::Storage(U256::from_be_slice(buf)),
             _ => unreachable!("unexpected length of plain value."),
         }
     }
-}
 
-impl From<Account> for PlainValue {
-    #[inline]
-    fn from(account: Account) -> Self {
-        PlainValue::Account(account)
+    /// Helper function to decode nonce and balance from account data.
+    fn decode_account_fields(buf: &[u8]) -> (u64, U256) {
+        let nonce = u64::from_be_bytes(buf[..8].try_into().unwrap());
+        let balance = U256::from_be_slice(&buf[8..EOA_ACCOUNT_LEN]);
+        (nonce, balance)
     }
 }
 
-impl From<U256> for PlainValue {
-    #[inline]
-    fn from(value: U256) -> Self {
-        PlainValue::Storage(value)
-    }
-}
-
-impl From<PlainValue> for Account {
-    #[inline]
-    fn from(value: PlainValue) -> Self {
-        match value {
-            PlainValue::Account(account) => account,
-            _ => unreachable!("PlainValue is not Account"),
-        }
-    }
-}
-
-impl From<PlainValue> for U256 {
-    #[inline]
-    fn from(value: PlainValue) -> Self {
-        match value {
-            PlainValue::Storage(value) => value,
-            _ => unreachable!("PlainValue is not U256"),
-        }
-    }
-}
-
-/// Local Account implementation when reth feature is disabled
+/// Simplified Ethereum account structure for testing.
+///
+/// Represents either an EOA (no bytecode hash) or a contract account (with bytecode hash).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Account {
-    /// Account nonce.
+    /// Transaction count for this account
     pub nonce: u64,
-    /// Account balance.
+    /// Account balance
     pub balance: U256,
-    /// Account bytecode hash.
+    /// Keccak256 hash of the contract bytecode (None for EOAs)
     pub bytecode_hash: Option<B256>,
 }
 

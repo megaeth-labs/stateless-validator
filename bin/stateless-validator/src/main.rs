@@ -22,7 +22,7 @@ use validator_core::{
     SaltWitnessState,
     chain::get_chain_status,
     client::{RpcClient, get_blob_ids, get_witness},
-    encoding::{PLAIN_ACCOUNT_KEY_LEN, PlainKey, PlainValue},
+    encoding::{PlainKey, PlainValue},
     evm::replay_block,
     provider::{PlainKeyUpdate, WitnessProvider},
     storage::{
@@ -451,7 +451,7 @@ fn get_addresses_with_code(block_witness: &SaltWitness) -> Vec<(Address, B256)> 
 
             // Skip bucket meta slots as they do not contain account information.
             let key = val.key();
-            if k.is_in_meta_bucket() || key.len() != PLAIN_ACCOUNT_KEY_LEN {
+            if k.is_in_meta_bucket() || key.len() != Address::len_bytes() {
                 return None;
             }
 
