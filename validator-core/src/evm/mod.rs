@@ -15,9 +15,9 @@ use op_alloy_rpc_types::Transaction as OpTransaction;
 use op_revm::L1BlockInfo;
 use revm::{
     context::{BlockEnv, CfgEnv, ContextTr},
-    database::states::{CacheAccount, StateBuilder},
+    database::states::StateBuilder,
     handler::EvmTr,
-    primitives::{Address, HashMap, U256},
+    primitives::{B256, HashMap, KECCAK_EMPTY, U256},
 };
 
 use crate::database::WitnessDatabase;
@@ -31,33 +31,35 @@ mod signed;
 
 pub use data_types::*;
 
-/// Replays a block's transactions against a given pre-state represented by a `WitnessDatabase`.
+/// Replays a block's transactions and returns state updates in plain key-value format.
 ///
-/// This function simulates the execution of all transactions within a block
-/// on the provided witness-backed database. It configures a REVM instance with
-/// Optimism-specific settings and applies each transaction sequentially.
+/// This function simulates the execution of all transactions within a block using the provided
+/// witness-backed database. It configures a REVM instance with Optimism-specific settings,
+/// applies each transaction sequentially, and converts the resulting state changes to a plain
+/// key-value format suitable for state trie operations.
 ///
 /// # Arguments
 ///
 /// * `block` - The `Block` to be replayed, containing full transaction details.
-/// * `db` - A mutable reference to a `CacheDB` backed by a `WitnessDatabase`. This database
-///   provides the necessary pre-state for transaction execution and will be updated as transactions
-///   are processed.
+/// * `db` - A `WitnessDatabase` that provides the necessary pre-state for transaction execution.
 ///
 /// # Returns
 ///
-/// Returns `Ok(())` if the block replay is successful. Returns an `Err` if any part of the
-/// replay process fails, such as encountering wrong transaction types, issues with
-/// block data, or errors during EVM execution.
+/// Returns `Ok(HashMap<Vec<u8>, Option<Vec<u8>>>)` containing the state updates in plain format:
+/// - Keys are encoded account addresses or storage slot identifiers
+/// - Values are encoded account data or storage values (`None` indicates deletion)
+///
+/// Returns an `Err` if any part of the replay process fails, such as encountering wrong
+/// transaction types, issues with block data, or errors during EVM execution.
 pub fn replay_block(
     block: Block<OpTransaction>,
-    provider: &WitnessDatabase,
-) -> Result<HashMap<Address, CacheAccount>> {
+    db: &WitnessDatabase,
+) -> Result<HashMap<Vec<u8>, Option<Vec<u8>>>> {
     let BlockTransactions::Full(transactions) = block.transactions.clone() else {
         return Err(eyre!("Wrong transaction type, expected full transactions"));
     };
 
-    let mut state = StateBuilder::new().with_database_ref(provider).build();
+    let mut state = StateBuilder::new().with_database_ref(db).build();
 
     let block_executor_factory = BlockExecutorFactory::new(
         ChainSpec,
@@ -103,7 +105,33 @@ pub fn replay_block(
         .apply_post_execution_changes()
         .map_err(|e| eyre!("apply_post_execution_changes failed: {:?}", e))?;
 
-    Ok(state.cache.accounts)
+    // Flatten REVM's CacheAccount format into plain key-value pairs
+    let mut kv_updates = HashMap::default();
+    for (address, cache_account) in state.cache.accounts {
+        if let (Some((info, storage)), _) = cache_account.into_components() {
+            // Handle account
+            let account = Account {
+                nonce: info.nonce,
+                balance: info.balance,
+                bytecode_hash: (info.code_hash != KECCAK_EMPTY).then_some(info.code_hash),
+            };
+
+            let account_value =
+                (!account.is_empty()).then(|| PlainValue::Account(account).encode());
+            kv_updates.insert(PlainKey::Account(address).encode(), account_value);
+
+            // Handle storage
+            for (slot, value) in storage {
+                let storage_value = (!value.is_zero()).then(|| PlainValue::Storage(value).encode());
+                kv_updates.insert(
+                    PlainKey::Storage(address, B256::new(slot.to_be_bytes())).encode(),
+                    storage_value,
+                );
+            }
+        }
+    }
+
+    Ok(kv_updates)
 }
 
 /// Creates a `revm::primitives::BlockEnv` from an `alloy_rpc_types_eth::Block`.

@@ -22,7 +22,7 @@ use validator_core::{
     SaltWitnessState,
     chain::get_chain_status,
     client::{RpcClient, get_blob_ids, get_witness},
-    database::{PlainKeyUpdate, WitnessDatabase},
+    database::WitnessDatabase,
     evm::replay_block,
     evm::{PlainKey, PlainValue},
     storage::{
@@ -363,20 +363,17 @@ async fn validate_block(
                 append_json_line_to_file(&(hash, bytecode), &validate_path, contracts_file)?;
             }
 
-            let rt = Handle::current();
             let witness_provider = WitnessDatabase {
                 witness: block_witness.clone(),
                 contracts: contracts_for_provider,
-                provider: client.provider.clone(),
-                rt,
+                client: client.provider.clone(),
+                runtime: Handle::current(),
             };
 
-            let accounts = replay_block(block.clone(), &witness_provider)?;
-
-            let plain_state = PlainKeyUpdate::from(accounts);
+            let kv_updates = replay_block(block.clone(), &witness_provider)?;
 
             let state_updates = EphemeralSaltState::new(&block_witness)
-                .update(&plain_state.data)
+                .update(&kv_updates)
                 .map_err(|e| anyhow!("Failed to update state: {}", e))?;
 
             let mut trie = StateRoot::new(&block_witness);
