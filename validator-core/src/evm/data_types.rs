@@ -1,8 +1,9 @@
 //! EVM data types and encoding utilities.
 //!
-//! This module provides types and utilities for encoding/decoding Ethereum account
-//! and storage data into a compact binary format. External projects such as stateless
-//! validator can use these types without depending on external EVM libraries.
+//! This module defines the core data types used throughout the EVM validation process,
+//! including account structures, storage keys, and their binary encoding formats.
+//! These types provide a stable interface for representing Ethereum state data
+//! without depending on external EVM libraries.
 //!
 //! # Types
 //!

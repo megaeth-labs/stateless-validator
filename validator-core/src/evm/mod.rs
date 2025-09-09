@@ -24,9 +24,12 @@ use crate::evm::receipts::OpRethReceiptBuilder;
 use crate::evm::signed::OpTransactionSigned;
 use crate::provider::WitnessProvider;
 
+mod data_types;
 mod receipt;
 mod receipts;
 mod signed;
+
+pub use data_types::*;
 
 /// Replays a block's transactions against a given pre-state represented by a `WitnessProvider`.
 ///

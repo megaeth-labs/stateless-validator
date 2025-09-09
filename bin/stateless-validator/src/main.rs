@@ -22,8 +22,8 @@ use validator_core::{
     SaltWitnessState,
     chain::get_chain_status,
     client::{RpcClient, get_blob_ids, get_witness},
-    encoding::{PlainKey, PlainValue},
     evm::replay_block,
+    evm::{PlainKey, PlainValue},
     provider::{PlainKeyUpdate, WitnessProvider},
     storage::{
         ValidateStatus, append_json_line_to_file, load_contracts_file, load_validate_info,

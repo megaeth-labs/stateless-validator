@@ -15,7 +15,7 @@
 //! - [`chain`]: Chain status and finalization tracking
 //! - [`witness`]: Witness data generation and state management  
 //! - [`provider`]: Stateless database provider for REVM
-//! - [`encoding`]: Serialization formats and data encoding
+//! - [`evm`]: EVM-specific validation logic and data types
 //! - [`storage`]: File system storage and backup management
 //! - [`client`]: External service communication
 //! - [`evm`]: EVM-specific validation logic
@@ -40,8 +40,6 @@ pub mod witness;
 pub use witness::*;
 pub mod provider;
 pub use provider::*;
-pub mod encoding;
-pub use encoding::*;
 pub mod storage;
 pub use storage::*;
 pub mod client;
