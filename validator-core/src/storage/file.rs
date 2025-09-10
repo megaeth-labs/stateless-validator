@@ -1,19 +1,37 @@
 //! This module handles file-based operations for the stateless validator.
 //! It manages the persistence of validation status, block data, and contract code.
-use crate::{SaltWitnessState, WitnessStatus, deserialized_state_data, serialized_state_data};
-use alloy_primitives::{B256, BlockHash, BlockNumber};
+
+/// The number of blocks to shift for backup file naming
+/// This is used to create a directory structure for backups, allowing for efficient storage
+const BACKUP_SHIFT: BlockNumber = 10;
+use crate::{SaltWitnessState, WitnessStatus};
+use alloy_primitives::{B256, BlockHash, BlockNumber, hex};
+use alloy_rpc_types_eth::Block;
 use eyre::{Result, anyhow};
 use fs2::FileExt;
+use op_alloy_rpc_types::Transaction;
 use rand::Rng;
 use revm::{primitives::HashMap, state::Bytecode};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions, create_dir_all, read_dir},
     io::{BufRead, BufReader, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     str::FromStr,
     time::SystemTime,
 };
+
+/// Container for file storage content with BLAKE3 hash verification
+///
+/// This structure wraps raw data with a cryptographic hash to ensure data integrity
+/// during serialization, storage, and deserialization operations.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct StateData {
+    /// BLAKE3 hash for data integrity verification
+    pub hash: B256,
+    /// Raw data stored as byte vector
+    pub data: Vec<u8>,
+}
 
 /// Represents the validation status of a block.
 #[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -53,6 +71,23 @@ pub struct ChainStatus {
     pub block_number: BlockNumber,
     /// The block hash of the finalized block
     pub block_hash: BlockHash,
+}
+
+/// Manager for block-specific file operations (validation and witness files)
+///
+/// This struct consolidates all operations that work with block-specific files,
+/// providing a cleaner API and eliminating repeated path parameters.
+pub struct BlockFileManager {
+    /// Base path for all block file operations
+    base_path: PathBuf,
+    /// Path to the validate directory (base_path/validate)
+    validate_dir: PathBuf,
+    /// Path to the witness directory (base_path/witness)
+    witness_dir: PathBuf,
+    /// Path to the contracts file (base_path/validate/contracts.txt)
+    contracts_file: PathBuf,
+    /// Path to the chain status file (base_path/chain.status)
+    chain_status_file: PathBuf,
 }
 
 /// Generic function to load binary data from primary or backup location
@@ -97,162 +132,440 @@ fn load_binary_data<T: serde::de::DeserializeOwned>(
     Ok(data)
 }
 
-/// Loads the `ValidateInfo` for a specific block from a file
-/// from validate or backup directory.
-/// If the file does not exist, it returns a default `ValidateInfo` instance.
-pub fn load_validate_info(
-    path: &Path,
-    block_number: BlockNumber,
-    block_hash: BlockHash,
-) -> Result<ValidateInfo> {
-    let validate_path = path
-        .join("validate")
-        .join(validate_file_name(block_number, block_hash));
-    let backup_path = path.join(crate::backup_file(block_number, block_hash, ".v"));
+impl BlockFileManager {
+    /// Create a new BlockFileManager for the given base path
+    pub fn new(base_path: impl AsRef<Path>) -> Self {
+        let base_path = base_path.as_ref().to_path_buf();
+        let validate_dir = base_path.join("validate");
+        let witness_dir = base_path.join("witness");
+        let contracts_file = validate_dir.join("contracts.txt");
+        let chain_status_file = base_path.join("chain.status");
 
-    if !validate_path.exists() && !backup_path.exists() {
-        return Ok(ValidateInfo::default());
+        Self {
+            base_path,
+            validate_dir,
+            witness_dir,
+            contracts_file,
+            chain_status_file,
+        }
     }
 
-    load_binary_data(validate_path, backup_path, block_number, block_hash)
-}
-
-/// Loads the `WitnessStatus` for a specific block from a file
-/// from witness or backup directory.
-pub fn load_from_file_or_backup(
-    path: &Path,
-    block_number: BlockNumber,
-    block_hash: BlockHash,
-) -> Result<WitnessStatus> {
-    let witness_path = path
-        .join("witness")
-        .join(witness_file_name(block_number, block_hash));
-    let backup_path = path.join(crate::backup_file(block_number, block_hash, ".w"));
-
-    load_binary_data(witness_path, backup_path, block_number, block_hash)
-}
-
-/// Sets and saves the validation status and other metadata for a block.
-///
-/// This function loads the existing `ValidateInfo`, updates its fields with the provided
-/// values, and then saves it back to a file atomically.
-pub fn set_validate_status(
-    path: &Path,
-    block_number: BlockNumber,
-    block_hash: BlockHash,
-    status: ValidateStatus,
-    state_root: Option<B256>,
-    lock_time: Option<u64>,
-    blob_ids: Option<Vec<[u8; 32]>>,
-) -> Result<()> {
-    let mut validate_info = load_validate_info(path, block_number, block_hash)?;
-    validate_info.status = status;
-    validate_info.block_hash = block_hash;
-    validate_info.block_number = block_number;
-    if let Some(lock_time) = lock_time {
-        validate_info.lock_time = curent_time_to_u64() + lock_time;
-    }
-    if let Some(state_root) = state_root {
-        validate_info.state_root = state_root;
-    }
-    if let Some(blob_ids) = blob_ids {
-        validate_info.blob_ids = blob_ids;
+    /// Generate a standard validation file name for a block
+    fn validate_file_name(&self, block_num: BlockNumber, block_hash: BlockHash) -> String {
+        format!("{}.{}.v", block_num, block_hash)
     }
 
-    save_validate_info(path, block_number, block_hash, validate_info)
-}
-
-/// Helper function to create JSON file path
-fn json_file_path(data_dir: &Path, file_name: &str) -> std::path::PathBuf {
-    data_dir.join(file_name)
-}
-
-/// Loads and deserializes data from a JSON file.
-///
-/// This function constructs a file path based on the provided `data_dir`,
-/// `block_number`, and `file_name`. It then attempts to open, read, and
-/// deserialize the JSON content into the specified generic type `T`.
-///
-/// # Type Parameters
-///
-/// * `T`: The type to deserialize the JSON data into. Must implement `DeserializeOwned`.
-///
-/// # Arguments
-///
-/// * `data_dir`: The base directory where data files are stored.
-/// * `file_name`: The name of the JSON file (without the .json extension).
-///
-/// # Returns
-///
-/// Returns `Ok(T)` containing the deserialized data if successful.
-/// Returns an `Err` if any step (file opening, reading, or deserialization) fails.
-pub fn load_json_file<T: DeserializeOwned>(data_dir: &Path, file_name: &str) -> Result<T> {
-    let json_file = json_file_path(data_dir, file_name);
-
-    let mut file = File::open(&json_file)
-        .map_err(|e| anyhow!("Failed to open {}: {}", json_file.display(), e))?;
-    let mut contents = Vec::new();
-    file.read_to_end(&mut contents)
-        .map_err(|e| anyhow!("Failed to read {}: {}", json_file.display(), e))?;
-
-    let data: T = simd_json::from_slice(&mut contents)
-        .map_err(|e| anyhow!("Failed to parse {}: {}", json_file.display(), e))?;
-
-    Ok(data)
-}
-
-/// Serializes data to JSON and stores it in a file.
-///
-/// This function creates necessary directories if they don't exist.
-/// It then serializes the provided `data` into JSON format and writes it to a file.
-/// If the file already exists, it will not be overwritten.
-///
-/// # Type Parameters
-///
-/// * `T`: The type of data to serialize. Must implement `Serialize`.
-///
-/// # Arguments
-///
-/// * `data`: The data to be serialized and stored.
-/// * `data_dir`: The base directory where data files will be stored.
-/// * `file_name`: The name of the JSON file to be created (without the .json extension).
-///
-/// # Returns
-///
-/// Returns `Ok(())` if the data is successfully serialized and written to the file.
-/// Returns an `Err` if any step (directory creation, file opening, serialization, or writing)
-/// fails.
-pub fn store_json_file<T: Serialize>(data: T, data_dir: &Path, file_name: &str) -> Result<()> {
-    create_dir_all(data_dir).map_err(|e| anyhow!("Failed to create directory: {}", e))?;
-
-    let json_file = json_file_path(data_dir, file_name);
-    if json_file.exists() {
-        return Ok(());
+    /// Generate a standard witness file name for a block
+    fn witness_file_name(&self, block_num: BlockNumber, block_hash: BlockHash) -> String {
+        format!("{}.{}.w", block_num, block_hash)
     }
 
-    let mut json_fp = File::options()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&json_file)
-        .map_err(|e| anyhow!("Failed to open {}: {}", json_file.display(), e))?;
+    /// Loads the `ValidateInfo` for a specific block from a file
+    /// from validate or backup directory.
+    /// If the file does not exist, it returns a default `ValidateInfo` instance.
+    pub fn load_validate_info(
+        &self,
+        block_number: BlockNumber,
+        block_hash: BlockHash,
+    ) -> Result<ValidateInfo> {
+        let validate_path = self
+            .validate_dir
+            .join(self.validate_file_name(block_number, block_hash));
+        let backup_path = self.backup_file_path(block_number, block_hash, ".v");
 
-    let json_bytes = simd_json::to_vec(&data).map_err(|e| {
-        anyhow!(
-            "Failed to serialize data for {}: {}",
-            json_file.display(),
-            e
-        )
-    })?;
+        if !validate_path.exists() && !backup_path.exists() {
+            return Ok(ValidateInfo::default());
+        }
 
-    json_fp
-        .write_all(&json_bytes)
-        .map_err(|e| anyhow!("Failed to write {}: {}", json_file.display(), e))?;
-    json_fp
-        .flush()
-        .map_err(|e| anyhow!("Failed to flush {}: {}", json_file.display(), e))?;
+        load_binary_data(validate_path, backup_path, block_number, block_hash)
+    }
 
-    Ok(())
+    /// Sets and saves the validation status and other metadata for a block.
+    ///
+    /// This function loads the existing `ValidateInfo`, updates its fields with the provided
+    /// values, and then saves it back to a file atomically.
+    pub fn set_validate_status(
+        &self,
+        block_number: BlockNumber,
+        block_hash: BlockHash,
+        status: ValidateStatus,
+        state_root: Option<B256>,
+        lock_time: Option<u64>,
+        blob_ids: Option<Vec<[u8; 32]>>,
+    ) -> Result<()> {
+        let mut validate_info = self.load_validate_info(block_number, block_hash)?;
+        validate_info.status = status;
+        validate_info.block_hash = block_hash;
+        validate_info.block_number = block_number;
+        if let Some(lock_time) = lock_time {
+            validate_info.lock_time = curent_time_to_u64() + lock_time;
+        }
+        if let Some(state_root) = state_root {
+            validate_info.state_root = state_root;
+        }
+        if let Some(blob_ids) = blob_ids {
+            validate_info.blob_ids = blob_ids;
+        }
+
+        self.save_validate_info(block_number, block_hash, validate_info)
+    }
+
+    /// Saves the `ValidateInfo` to a file atomically.
+    ///
+    /// This is achieved by writing to a temporary file first and then renaming it to the
+    /// final destination. This ensures that a reader will never see a partially written file.
+    fn save_validate_info(
+        &self,
+        block_number: BlockNumber,
+        block_hash: BlockHash,
+        validate_info: ValidateInfo,
+    ) -> Result<()> {
+        let serialized = bincode::serde::encode_to_vec(&validate_info, bincode::config::legacy())?;
+        let serialized = serialized_state_data(serialized)?;
+
+        let final_path = self
+            .validate_dir
+            .join(self.validate_file_name(block_number, block_hash));
+        write_atomic(final_path, &serialized)
+    }
+
+    /// Loads the `WitnessStatus` for a specific block from a file
+    /// from witness or backup directory.
+    pub fn load_witness_status(
+        &self,
+        block_number: BlockNumber,
+        block_hash: BlockHash,
+    ) -> Result<WitnessStatus> {
+        let witness_path = self
+            .witness_dir
+            .join(self.witness_file_name(block_number, block_hash));
+        let backup_path = self.backup_file_path(block_number, block_hash, ".w");
+
+        load_binary_data(witness_path, backup_path, block_number, block_hash)
+    }
+
+    /// Get block witness status by given block number and block hash
+    ///
+    /// Loads witness status from file or returns default idle status if file doesn't exist.
+    pub fn get_witness_state(&self, block: &(BlockNumber, BlockHash)) -> Result<WitnessStatus> {
+        let path = self
+            .witness_dir
+            .join(self.witness_file_name(block.0, block.1));
+        if !path.exists() {
+            return Ok(WitnessStatus {
+                status: SaltWitnessState::Idle,
+                block_hash: block.1,
+                block_number: block.0,
+                parent_hash: BlockHash::default(),
+                pre_state_root: B256::default(),
+                lock_time: curent_time_to_u64(),
+                blob_ids: vec![],
+                witness_data: vec![],
+            });
+        }
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let mut contents = vec![];
+        file.read_to_end(&mut contents)?;
+        let state_data =
+            deserialized_state_data(contents).map_err(|e| anyhow!("block({:?}): {}", block, e))?;
+        let deserialized =
+            bincode::serde::decode_from_slice(&state_data.data, bincode::config::legacy())
+                .map_err(|e| {
+                    anyhow!(
+                        "block({:?}): Failed to deserialize WitnessStatus: {}",
+                        block,
+                        e
+                    )
+                })?;
+        Ok(deserialized.0)
+    }
+
+    /// Reads the block hash for a given block number from a witness file name.
+    ///
+    /// Witness files are named `{block_number}.{block_hash}.w`. This function scans the witness
+    /// directory to find a file matching the block number and extracts the hash from its name.
+    pub fn find_block_hashes(&self, block_number: u64) -> Result<Vec<B256>> {
+        let witness_dir = &self.witness_dir;
+        let block_number_str = block_number.to_string();
+        let file_prefix = format!("{}.", block_number_str);
+        const FILE_SUFFIX: &str = ".w";
+
+        if !witness_dir.is_dir() {
+            return Err(anyhow!("Witness directory not found: {:?}", witness_dir));
+        }
+
+        let mut hashes = Vec::new();
+        for entry in read_dir(witness_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file()
+                && let Some(file_name_os_str) = path.file_name()
+                && let Some(file_name_str) = file_name_os_str.to_str()
+                && file_name_str.starts_with(&file_prefix)
+                && file_name_str.ends_with(FILE_SUFFIX)
+            {
+                let hash_part =
+                    &file_name_str[file_prefix.len()..(file_name_str.len() - FILE_SUFFIX.len())];
+
+                // Attempt to parse the hash part of the filename.
+                match B256::from_str(hash_part) {
+                    Ok(hash) => hashes.push(hash),
+                    Err(e) => {
+                        return Err(anyhow!(
+                            "Failed to parse hash '{}' from file '{}': {}",
+                            hash_part,
+                            file_name_str,
+                            e
+                        ));
+                    }
+                }
+            }
+        }
+
+        if hashes.is_empty() {
+            Err(anyhow!(
+                "No witness file found for block {} with pattern '{}.HASH.w' in {:?}",
+                block_number,
+                block_number_str,
+                &self.witness_dir
+            ))
+        } else {
+            Ok(hashes)
+        }
+    }
+
+    /// Get the chain status from file
+    ///
+    /// Reads chain status from the `chain.status` file in JSON format.
+    pub fn get_chain_status(&self) -> Result<ChainStatus> {
+        let path = &self.chain_status_file;
+        let mut file = OpenOptions::new().read(true).open(path)?;
+        let mut contents = String::new();
+        file.read_to_string(&mut contents)?;
+        let status: ChainStatus = serde_json::from_str(&contents)?;
+        Ok(status)
+    }
+
+    /// Loads contracts from a file where each line is a JSON array `[hash, bytecode]`.
+    ///
+    /// The contracts file is expected to live under the `validate` directory of the
+    /// manager's base path, e.g. `<base>/validate/<file_name>`.
+    pub fn load_contracts_file(&self) -> Result<HashMap<B256, Bytecode>> {
+        let json_file = &self.contracts_file;
+        if !json_file.exists() {
+            return Ok(HashMap::default());
+        }
+
+        let file = File::open(json_file)
+            .map_err(|e| anyhow!("Failed to open {} file: {}", json_file.display(), e))?;
+
+        let reader = BufReader::new(file);
+        let mut contracts = HashMap::default();
+
+        for line in reader.lines() {
+            let line = line.map_err(|e| anyhow!("Failed to read line: {}", e))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut line_bytes = line.into_bytes();
+            let (hash, bytecode): (B256, Bytecode) = simd_json::from_slice(&mut line_bytes)
+                .map_err(|e| anyhow!("Failed to parse contract line: {}", e))?;
+            contracts.insert(hash, bytecode);
+        }
+
+        Ok(contracts)
+    }
+
+    /// Loads block data from a JSON file.
+    ///
+    /// This method reads and deserializes a JSON file containing block data
+    /// into a `Block<Transaction>` struct.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_name`: The name of the JSON file to load.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(Block<Transaction>)` containing the deserialized block data if successful.
+    /// Returns an `Err` if any step (file opening, reading, or deserialization) fails.
+    pub fn load_block_data(&self, file_name: &str) -> Result<Block<Transaction>> {
+        let json_file = self.base_path.join(file_name);
+
+        let mut file = File::open(&json_file)
+            .map_err(|e| anyhow!("Failed to open {}: {}", json_file.display(), e))?;
+        let mut contents = Vec::new();
+        file.read_to_end(&mut contents)
+            .map_err(|e| anyhow!("Failed to read {}: {}", json_file.display(), e))?;
+
+        let data: Block<Transaction> = simd_json::from_slice(&mut contents)
+            .map_err(|e| anyhow!("Failed to parse {}: {}", json_file.display(), e))?;
+
+        Ok(data)
+    }
+
+    /// Appends a contract (hash, bytecode) pair to the contracts file.
+    ///
+    /// This method serializes the contract data as JSON and appends it as a new line
+    /// to the `contracts.txt` file in the validate directory. Each line contains a
+    /// JSON array `[hash, bytecode]`.
+    ///
+    /// # Arguments
+    ///
+    /// * `hash`: The contract hash (B256)
+    /// * `bytecode`: The contract bytecode
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if successful, or an `Err` if any step fails.
+    pub fn append_contract(&self, hash: B256, bytecode: &Bytecode) -> Result<()> {
+        create_dir_all(&self.validate_dir)
+            .map_err(|e| anyhow!("Failed to create directory: {}", e))?;
+
+        let json_file = &self.contracts_file;
+
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(json_file)
+            .map_err(|e| anyhow!("Failed to open {}: {}", json_file.display(), e))?;
+
+        let contract_data = (hash, bytecode);
+        let json_bytes = simd_json::to_vec(&contract_data).map_err(|e| {
+            anyhow!(
+                "Failed to serialize contract data for {}: {}",
+                json_file.display(),
+                e
+            )
+        })?;
+
+        file.write_all(&json_bytes)
+            .map_err(|e| anyhow!("Failed to write {}: {}", json_file.display(), e))?;
+        file.write_all(b"\n")
+            .map_err(|e| anyhow!("Failed to write newline {}: {}", json_file.display(), e))?;
+        file.sync_all()?;
+
+        Ok(())
+    }
+
+    /// Parse block number and hash from witness file name
+    ///
+    /// Parses both the block number and block hash from a witness file name with format
+    /// `{block_number}.{block_hash}.w`.
+    ///
+    /// # Arguments
+    /// * `filename` - The witness file name to parse
+    ///
+    /// # Returns
+    /// A tuple containing (block_number, block_hash). Returns (0, BlockHash::ZERO) if parsing fails.
+    ///
+    /// # Example
+    /// ```rust
+    /// use validator_core::storage::BlockFileManager;
+    /// use alloy_primitives::BlockHash;
+    ///
+    /// let (number, hash) = BlockFileManager::parse_filename("280.0x03c5cb583df6c35f9dcca041f2aa609fce1ad92e170c96c694ce9a6bd3913df1.w");
+    /// assert_eq!(number, 280);
+    /// assert_ne!(hash, BlockHash::ZERO);
+    ///
+    /// let (invalid_num, invalid_hash) = BlockFileManager::parse_filename("invalid.w");
+    /// assert_eq!(invalid_num, 0);
+    /// assert_eq!(invalid_hash, BlockHash::ZERO);
+    /// ```
+    pub fn parse_filename(filename: &str) -> (BlockNumber, BlockHash) {
+        let parts: Vec<&str> = filename.split('.').collect();
+
+        // Extract block number from first part
+        let block_number = parts
+            .first()
+            .and_then(|s| s.parse::<BlockNumber>().ok())
+            .unwrap_or(0);
+
+        // Extract block hash from second part
+        let block_hash = if let Some(hash_str) = parts.get(1) {
+            // Try to decode hex string, handling both with and without 0x prefix
+            let hash_bytes = if let Some(stripped) = hash_str.strip_prefix("0x") {
+                hex::decode(stripped).unwrap_or_default()
+            } else {
+                hex::decode(hash_str).unwrap_or_default()
+            };
+
+            // Return zero hash if decoding failed or wrong length
+            if hash_bytes.len() != 32 {
+                BlockHash::ZERO
+            } else {
+                BlockHash::from_slice(&hash_bytes)
+            }
+        } else {
+            BlockHash::ZERO
+        };
+
+        (block_number, block_hash)
+    }
+
+    /// Generate backup file path for a block
+    ///
+    /// Creates a hierarchical backup file path using block number and hash,
+    /// organized into directories based on shifted block numbers for efficient storage.
+    ///
+    /// # Arguments
+    /// * `block_num` - The block number
+    /// * `block_hash` - The block hash
+    /// * `ext` - File extension (e.g., ".w" for witness files)
+    ///
+    /// # Returns
+    /// Backup file path relative to the base path
+    ///
+    /// # Example
+    /// ```rust
+    /// use validator_core::storage::BlockFileManager;
+    /// use alloy_primitives::{BlockHash, B256};
+    /// use std::path::Path;
+    ///
+    /// let mgr = BlockFileManager::new(Path::new("/data"));
+    /// let hash = BlockHash::from([1u8; 32]);
+    /// let path = mgr.backup_file_path(1000, hash, ".w");
+    /// assert!(path.to_string_lossy().contains("backup"));
+    /// ```
+    pub fn backup_file_path(
+        &self,
+        block_num: BlockNumber,
+        block_hash: BlockHash,
+        ext: &str,
+    ) -> PathBuf {
+        self.base_path.join(format!(
+            "backup/{}/{}.{:x}{}",
+            block_num >> BACKUP_SHIFT,
+            block_num,
+            block_hash,
+            ext
+        ))
+    }
+
+    /// Generate backup directory path for a block range
+    ///
+    /// Creates the backup directory path based on shifted block numbers,
+    /// used to organize backup files hierarchically.
+    ///
+    /// # Arguments
+    /// * `block_num` - The block number to generate directory path for
+    ///
+    /// # Returns
+    /// Backup directory path relative to the base path
+    ///
+    /// # Example
+    /// ```rust
+    /// use validator_core::storage::BlockFileManager;
+    /// use std::path::Path;
+    ///
+    /// let mgr = BlockFileManager::new(Path::new("/data"));
+    /// let dir = mgr.backup_dir_path(1000);
+    /// assert!(dir.to_string_lossy().contains("backup"));
+    /// ```
+    pub fn backup_dir_path(&self, block_num: BlockNumber) -> PathBuf {
+        self.base_path
+            .join(format!("backup/{}", block_num >> BACKUP_SHIFT))
+    }
 }
 
 /// Write data to a file atomically using temporary file + rename
@@ -289,155 +602,86 @@ fn write_atomic(target_path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Saves the `ValidateInfo` to a file atomically.
+/// Serialize state data to a byte vector with integrity hash
 ///
-/// This is achieved by writing to a temporary file first and then renaming it to the
-/// final destination. This ensures that a reader will never see a partially written file.
-fn save_validate_info(
-    path: &Path,
-    block_number: BlockNumber,
-    block_hash: BlockHash,
-    validate_info: ValidateInfo,
-) -> Result<()> {
-    let serialized = bincode::serde::encode_to_vec(&validate_info, bincode::config::legacy())?;
-    let serialized = serialized_state_data(serialized)?;
-
-    let final_path = path
-        .join("validate")
-        .join(validate_file_name(block_number, block_hash));
-    write_atomic(final_path, &serialized)
-}
-
-/// Reads the block hash for a given block number from a witness file name.
+/// Creates a `StateData` wrapper around the input data, computes a BLAKE3 hash,
+/// and serializes the entire structure using bincode with legacy configuration.
 ///
-/// Witness files are named `{block_number}.{block_hash}.w`. This function scans the witness
-/// directory to find a file matching the block number and extracts the hash from its name.
-pub fn read_block_hash_by_number_from_file(
-    block_number: u64,
-    witness_dir: &Path,
-) -> Result<Vec<B256>> {
-    let block_number_str = block_number.to_string();
-    let file_prefix = format!("{}.", block_number_str);
-    const FILE_SUFFIX: &str = ".w";
-
-    if !witness_dir.is_dir() {
-        return Err(anyhow!("Witness directory not found: {:?}", witness_dir));
-    }
-
-    let mut hashes = Vec::new();
-    for entry in read_dir(witness_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_file()
-            && let Some(file_name_os_str) = path.file_name()
-            && let Some(file_name_str) = file_name_os_str.to_str()
-            && file_name_str.starts_with(&file_prefix)
-            && file_name_str.ends_with(FILE_SUFFIX)
-        {
-            let hash_part =
-                &file_name_str[file_prefix.len()..(file_name_str.len() - FILE_SUFFIX.len())];
-
-            // Attempt to parse the hash part of the filename.
-            match B256::from_str(hash_part) {
-                Ok(hash) => hashes.push(hash),
-                Err(e) => {
-                    return Err(anyhow!(
-                        "Failed to parse hash '{}' from file '{}': {}",
-                        hash_part,
-                        file_name_str,
-                        e
-                    ));
-                }
-            }
-        }
-    }
-
-    if hashes.is_empty() {
-        Err(anyhow!(
-            "No witness file found for block {} with pattern '{}.HASH.w' in {:?}",
-            block_number,
-            block_number_str,
-            witness_dir
-        ))
-    } else {
-        Ok(hashes)
-    }
-}
-
-/// Generate a standard file name for block-related files
-fn block_file_name(block_num: BlockNumber, block_hash: BlockHash, extension: &str) -> String {
-    format!("{}.{}.{}", block_num, block_hash, extension)
-}
-
-/// Generates the standard file name for a validation file.
-pub fn validate_file_name(block_num: BlockNumber, block_hash: BlockHash) -> String {
-    block_file_name(block_num, block_hash, "v")
-}
-
-/// Loads contracts from a file where each line is a JSON array `[hash, bytecode]`.
+/// # Arguments
+/// * `data` - Raw data to serialize and protect with hash verification
 ///
-/// # Example file content:
-/// ["0x...", "0x..."]
-/// ["0x...", "0x..."]
-pub fn load_contracts_file(data_dir: &Path, file_name: &str) -> Result<HashMap<B256, Bytecode>> {
-    let json_file = data_dir.join(file_name);
-    if !json_file.exists() {
-        return Ok(HashMap::default());
-    }
-
-    let file = File::open(&json_file)
-        .map_err(|e| anyhow!("Failed to open {} file: {}", json_file.display(), e))?;
-
-    let reader = BufReader::new(file);
-    let mut contracts = HashMap::default();
-
-    for line in reader.lines() {
-        let line = line.map_err(|e| anyhow!("Failed to read line: {}", e))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let mut line_bytes = line.into_bytes();
-        let (hash, bytecode): (B256, Bytecode) = simd_json::from_slice(&mut line_bytes)
-            .map_err(|e| anyhow!("Failed to parse contract line: {}", e))?;
-        contracts.insert(hash, bytecode);
-    }
-
-    Ok(contracts)
-}
-
-/// Appends a serializable item to a file in JSON Lines format.
+/// # Returns
+/// * `Ok(Vec<u8>)` - Serialized StateData with embedded hash
+/// * `Err(std::io::Error)` - If serialization fails
 ///
-/// The item is serialized to a JSON string and written on a new line.
-pub fn append_json_line_to_file<T: Serialize>(
-    data: &T,
-    data_dir: &Path,
-    file_name: &str,
-) -> Result<()> {
-    create_dir_all(data_dir).map_err(|e| anyhow!("Failed to create directory: {}", e))?;
+/// # Example
+/// ```rust,no_run
+/// use validator_core::storage::serialized_state_data;
+///
+/// let data = b"Hello, world!".to_vec();
+/// let serialized = serialized_state_data(data)?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn serialized_state_data(data: Vec<u8>) -> std::io::Result<Vec<u8>> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&data);
+    let hash = B256::from_slice(hasher.finalize().as_bytes());
 
-    let json_file = json_file_path(data_dir, file_name);
-
-    let mut file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&json_file)
-        .map_err(|e| anyhow!("Failed to open {}: {}", json_file.display(), e))?;
-
-    let json_bytes = simd_json::to_vec(data).map_err(|e| {
-        anyhow!(
-            "Failed to serialize data for {}: {}",
-            json_file.display(),
-            e
+    let state_data = StateData { hash, data };
+    bincode::serde::encode_to_vec(&state_data, bincode::config::legacy()).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Failed to serde state data: {}", e),
         )
-    })?;
+    })
+}
 
-    file.write_all(&json_bytes)
-        .map_err(|e| anyhow!("Failed to write {}: {}", json_file.display(), e))?;
-    file.write_all(b"\n")
-        .map_err(|e| anyhow!("Failed to write newline {}: {}", json_file.display(), e))?;
-    file.sync_all()?;
+/// Deserialize state data from a byte vector with hash verification
+///
+/// Deserializes a `StateData` structure and verifies the embedded BLAKE3 hash
+/// matches the actual data hash to ensure data integrity.
+///
+/// # Arguments
+/// * `data` - Serialized StateData bytes to deserialize and verify
+///
+/// # Returns
+/// * `Ok(StateData)` - Successfully deserialized and verified data
+/// * `Err(std::io::Error)` - If deserialization fails or hash verification fails
+///
+/// # Errors
+/// * `InvalidData` - If bincode deserialization fails
+/// * `InvalidData` - If hash verification fails (data corruption detected)
+///
+/// # Example
+/// ```rust,no_run
+/// use validator_core::storage::{serialized_state_data, deserialized_state_data};
+///
+/// let original = b"test data".to_vec();
+/// let serialized = serialized_state_data(original.clone())?;
+/// let state_data = deserialized_state_data(serialized)?;
+/// assert_eq!(state_data.data, original);
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn deserialized_state_data(data: Vec<u8>) -> std::io::Result<StateData> {
+    let deserialized: (StateData, usize) =
+        bincode::serde::decode_from_slice(&data, bincode::config::legacy()).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to deserialize state data: {}", e),
+            )
+        })?;
+    let state_data = deserialized.0;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&state_data.data);
+    let hash = B256::from_slice(hasher.finalize().as_bytes());
+    if state_data.hash != hash {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Hash mismatch",
+        ));
+    }
 
-    Ok(())
+    Ok(state_data)
 }
 
 /// Convert current time to a u64 timestamp
@@ -448,62 +692,6 @@ pub fn curent_time_to_u64() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("SystemTime before UNIX EPOCH!")
         .as_secs()
-}
-
-/// Generate witness file name for a block
-///
-/// Creates a standardized witness file name using the format `{block_number}.{block_hash}.w`
-pub fn witness_file_name(block_num: BlockNumber, block_hash: BlockHash) -> String {
-    block_file_name(block_num, block_hash, "w")
-}
-
-/// Get block witness status by given block number and block hash
-///
-/// Loads witness status from file or returns default idle status if file doesn't exist.
-pub fn get_witness_state(path: &Path, block: &(BlockNumber, BlockHash)) -> Result<WitnessStatus> {
-    let path = path
-        .join("witness")
-        .join(witness_file_name(block.0, block.1));
-    if !path.exists() {
-        return Ok(WitnessStatus {
-            status: SaltWitnessState::Idle,
-            block_hash: block.1,
-            block_number: block.0,
-            parent_hash: BlockHash::default(),
-            pre_state_root: B256::default(),
-            lock_time: curent_time_to_u64(),
-            blob_ids: vec![],
-            witness_data: vec![],
-        });
-    }
-    let mut file = OpenOptions::new().read(true).open(path)?;
-    let mut contents = vec![];
-    file.read_to_end(&mut contents)?;
-    let state_data =
-        deserialized_state_data(contents).map_err(|e| anyhow!("block({:?}): {}", block, e))?;
-    let deserialized =
-        bincode::serde::decode_from_slice(&state_data.data, bincode::config::legacy()).map_err(
-            |e| {
-                anyhow!(
-                    "block({:?}): Failed to deserialize WitnessStatus: {}",
-                    block,
-                    e
-                )
-            },
-        )?;
-    Ok(deserialized.0)
-}
-
-/// Get the chain status from file
-///
-/// Reads chain status from the `chain.status` file in JSON format.
-pub fn get_chain_status(path: &Path) -> Result<ChainStatus> {
-    let path = path.join("chain.status");
-    let mut file = OpenOptions::new().read(true).open(&path)?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-    let status: ChainStatus = serde_json::from_str(&contents)?;
-    Ok(status)
 }
 
 #[cfg(test)]
@@ -524,7 +712,8 @@ mod tests {
     fn test_load_validate_info_file_not_exist() {
         let dir = tempdir().unwrap();
         let path = dir.path().to_path_buf();
-        let res = load_validate_info(&path, 1, dummy_block_hash());
+        let block_mgr = BlockFileManager::new(&path);
+        let res = block_mgr.load_validate_info(1, dummy_block_hash());
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), ValidateInfo::default());
     }
@@ -538,7 +727,8 @@ mod tests {
 
         let block_number = 1u64;
         let block_hash = dummy_block_hash();
-        let file_name = validate_file_name(block_number, block_hash);
+        let block_mgr = BlockFileManager::new(&path);
+        let file_name = block_mgr.validate_file_name(block_number, block_hash);
         let file_path = validate_dir.join(&file_name);
 
         // Construct a ValidateInfo and serialize it to the file
@@ -555,7 +745,9 @@ mod tests {
         let mut file = File::create(&file_path).unwrap();
         file.write_all(&serialized).unwrap();
 
-        let loaded = load_validate_info(&path, block_number, block_hash).unwrap();
+        let loaded = block_mgr
+            .load_validate_info(block_number, block_hash)
+            .unwrap();
         assert_eq!(loaded, info);
     }
 
@@ -570,7 +762,7 @@ mod tests {
 
         let block_number = 2u64;
         let block_hash = dummy_block_hash();
-        let backup_file = path.join(crate::backup_file(block_number, block_hash, ".v"));
+        let backup_file = block_mgr.backup_file_path(block_number, block_hash, ".v");
 
         // Construct a ValidateInfo and serialize it to the backup file
         let info = ValidateInfo {
@@ -586,7 +778,10 @@ mod tests {
         let mut file = File::create(&backup_file).unwrap();
         file.write_all(&serialized).unwrap();
 
-        let loaded = load_validate_info(&path, block_number, block_hash).unwrap();
+        let block_mgr = BlockFileManager::new(&path);
+        let loaded = block_mgr
+            .load_validate_info(block_number, block_hash)
+            .unwrap();
         assert_eq!(loaded, info);
     }
 }

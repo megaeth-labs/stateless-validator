@@ -24,11 +24,7 @@ use validator_core::{
     database::WitnessDatabase,
     evm::replay_block,
     evm::{PlainKey, PlainValue},
-    storage::{
-        ValidateStatus, append_json_line_to_file, curent_time_to_u64, get_chain_status,
-        get_witness_state, load_contracts_file, load_validate_info,
-        read_block_hash_by_number_from_file, set_validate_status,
-    },
+    storage::{BlockFileManager, ValidateStatus, curent_time_to_u64},
 };
 
 /// Maximum response body size for the RPC server.
@@ -88,9 +84,10 @@ async fn main() -> Result<()> {
     let stateless_dir = PathBuf::from(args.datadir);
 
     let client = Arc::new(RpcClient::new(&args.api)?);
+    let block_mgr = BlockFileManager::new(&stateless_dir);
 
     // fetch the latest finalized block number.
-    let chain_status = get_chain_status(&stateless_dir)?;
+    let chain_status = block_mgr.get_chain_status()?;
     let finalized_num = chain_status.block_number;
 
     // Start validating from the block after the last finalized one.
@@ -164,12 +161,10 @@ async fn scan_and_validate_block_witnesses(
     lock_time: u64,
     concurrent_num: usize,
 ) -> Result<()> {
-    let validate_path = stateless_dir.join("validate");
-    let contracts_file = "contracts.txt";
-
     // Load already known contracts from a file to avoid re-fetching them.
+    let block_mgr = BlockFileManager::new(stateless_dir);
     let contracts = Arc::new(Mutex::new(
-        load_contracts_file(&validate_path, contracts_file).unwrap_or_default(),
+        block_mgr.load_contracts_file().unwrap_or_default(),
     ));
 
     let stateless_dir = stateless_dir.to_path_buf();
@@ -198,7 +193,8 @@ async fn scan_and_validate_block_witnesses(
                         "Failed to validate block {}: {:?}, try block({}) again",
                         block_counter, e, block_counter
                     );
-                    let chain_status = get_chain_status(&stateless_dir).unwrap_or_default();
+                    let block_mgr = BlockFileManager::new(&stateless_dir);
+                    let chain_status = block_mgr.get_chain_status().unwrap_or_default();
                     if block_counter <= chain_status.block_number {
                         info!(
                             "block({}) is less than finalized block({}), skipping",
@@ -234,9 +230,8 @@ async fn validate_block(
     lock_time: u64,
     contracts: Arc<Mutex<HashMap<B256, Bytecode>>>,
 ) -> Result<()> {
-    let validate_path = stateless_dir.join("validate");
-    let witness_dir = stateless_dir.join("witness");
-    let contracts_file = "contracts.txt";
+    // Create BlockFileManager for handling block-related file operations
+    let block_mgr = BlockFileManager::new(stateless_dir);
 
     info!("Processing block: {}", block_counter);
 
@@ -244,7 +239,7 @@ async fn validate_block(
 
     // This loop waits for the witness for the block to be generated and available.
     while loops {
-        let block_hashes = match read_block_hash_by_number_from_file(block_counter, &witness_dir) {
+        let block_hashes = match block_mgr.find_block_hashes(block_counter) {
             Ok(hashes) => hashes,
             Err(_e) => {
                 // Witness for block_counter not found, waiting...
@@ -253,7 +248,7 @@ async fn validate_block(
             }
         };
         for block_hash in block_hashes {
-            let witness_status = get_witness_state(stateless_dir, &(block_counter, block_hash))?;
+            let witness_status = block_mgr.get_witness_state(&(block_counter, block_hash))?;
             if witness_status.status == SaltWitnessState::Idle
                 || witness_status.status == SaltWitnessState::Processing
             {
@@ -265,7 +260,7 @@ async fn validate_block(
 
             let witness_bytes = witness_status.witness_data;
 
-            let validate_info = load_validate_info(stateless_dir, block_counter, block_hash)?;
+            let validate_info = block_mgr.load_validate_info(block_counter, block_hash)?;
             // Check if the block has already been validated or is being processed by another
             // validator.
             if validate_info.status == ValidateStatus::Success {
@@ -288,8 +283,7 @@ async fn validate_block(
                 break;
             }
             // Lock the block for processing to prevent other validators from working on it.
-            set_validate_status(
-                stateless_dir,
+            block_mgr.set_validate_status(
                 block_counter,
                 block_hash,
                 ValidateStatus::Processing,
@@ -359,7 +353,7 @@ async fn validate_block(
 
             // Persist new contracts to the file.
             for (hash, bytecode) in new_contracts {
-                append_json_line_to_file(&(hash, bytecode), &validate_path, contracts_file)?;
+                block_mgr.append_contract(hash, &bytecode)?;
             }
 
             let witness_provider = WitnessDatabase {
@@ -387,8 +381,7 @@ async fn validate_block(
                     hex::encode(new_trie_root),
                     hex::encode(new_state_root)
                 );
-                set_validate_status(
-                    stateless_dir,
+                block_mgr.set_validate_status(
                     block_counter,
                     block_hash,
                     ValidateStatus::Failed,
@@ -402,8 +395,7 @@ async fn validate_block(
                     block_counter,
                     hex::encode(new_trie_root)
                 );
-                set_validate_status(
-                    stateless_dir,
+                block_mgr.set_validate_status(
                     block_counter,
                     block_hash,
                     ValidateStatus::Success,
@@ -429,7 +421,8 @@ async fn get_root(
     block_number: u64,
     block_hash: B256,
 ) -> Result<B256> {
-    let validate_info = load_validate_info(stateless_dir, block_number, block_hash)?;
+    let block_mgr = BlockFileManager::new(stateless_dir);
+    let validate_info = block_mgr.load_validate_info(block_number, block_hash)?;
     if validate_info.state_root.is_zero() {
         // If state root is not in our validation records, fetch from RPC.
         let block = client.block_by_number(block_number, false).await?;
@@ -475,7 +468,7 @@ mod tests {
     use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned};
     use op_alloy_rpc_types::Transaction;
     use std::fs;
-    use validator_core::storage::load_json_file;
+    use validator_core::storage::BlockFileManager;
 
     #[derive(Debug)]
     enum Input {
@@ -496,6 +489,7 @@ mod tests {
         input: Input,
         is_full: bool,
     ) -> Result<Block<Transaction>, ErrorObjectOwned> {
+        let block_mgr = BlockFileManager::new(path);
         let files = std::fs::read_dir(path).unwrap();
 
         for file in files {
@@ -506,8 +500,7 @@ mod tests {
             match input {
                 Input::Hash(ref hash) => {
                     if file_name_str.contains(hash) {
-                        let block =
-                            load_json_file::<Block<Transaction>>(path, &file_name_str).unwrap();
+                        let block = block_mgr.load_block_data(&file_name_str).unwrap();
                         return Ok(if is_full {
                             block
                         } else {
@@ -517,8 +510,7 @@ mod tests {
                 }
                 Input::Number(number) => {
                     if file_name_str.starts_with(&format!("{number}.")) {
-                        let block =
-                            load_json_file::<Block<Transaction>>(path, &file_name_str).unwrap();
+                        let block = block_mgr.load_block_data(&file_name_str).unwrap();
                         return Ok(if is_full {
                             block
                         } else {
@@ -606,12 +598,10 @@ mod tests {
 
         let stateless_dir = PathBuf::from("../../test_data/stateless");
 
-        let validate_path = stateless_dir.join("validate");
-        let contracts_file = "contracts.txt";
-
         // Load already known contracts from a file to avoid re-fetching them.
+        let block_mgr = BlockFileManager::new(&stateless_dir);
         let contracts = Arc::new(Mutex::new(
-            load_contracts_file(&validate_path, contracts_file).unwrap_or_default(),
+            block_mgr.load_contracts_file().unwrap_or_default(),
         ));
 
         let finalized_num = 279;

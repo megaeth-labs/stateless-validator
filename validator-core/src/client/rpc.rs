@@ -6,10 +6,7 @@
 //!
 //! The `get_blob_ids` function acts as an RPC endpoint handler, allowing clients to query
 //! the validation status and retrieve blob information for a given block.
-use crate::storage::{
-    ValidateStatus, load_from_file_or_backup, load_validate_info,
-    read_block_hash_by_number_from_file,
-};
+use crate::storage::{BlockFileManager, ValidateStatus};
 use alloy_primitives::hex;
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
@@ -156,12 +153,14 @@ pub fn get_blob_ids(
     blocks: Vec<String>,
 ) -> Result<HashMap<String, Vec<B256>>, ErrorObjectOwned> {
     let mut results = HashMap::new();
+    let block_mgr = BlockFileManager::new(stateless_dir);
 
     for block in blocks {
         let (block_number, block_hash) = parse_num_hash(&block)?;
 
-        let validation =
-            load_validate_info(stateless_dir, block_number, block_hash).map_err(|e| {
+        let validation = block_mgr
+            .load_validate_info(block_number, block_hash)
+            .map_err(|e| {
                 ErrorObject::owned(CALL_EXECUTION_FAILED_CODE, e.to_string(), None::<()>)
             })?;
 
@@ -202,26 +201,21 @@ pub fn get_blob_ids(
 /// Get the witness for a block.
 pub fn get_witness(stateless_dir: &Path, block_info: String) -> Result<String, ErrorObjectOwned> {
     let (block_number, parent_hash) = parse_num_hash(&block_info)?;
+    let block_mgr = BlockFileManager::new(stateless_dir);
 
     // get the witness from witness directory
-    let witness_dir = stateless_dir.join("witness");
-    let block_hashes =
-        if let Ok(hashes) = read_block_hash_by_number_from_file(block_number, &witness_dir) {
-            hashes
-        } else {
-            let backup_dir = stateless_dir.join(crate::backup_dir(block_number));
-            read_block_hash_by_number_from_file(block_number, &backup_dir).map_err(|_| {
-                ErrorObject::owned(
-                    INVALID_PARAMS_CODE,
-                    format!("not found block number: {}", block_number),
-                    None::<()>,
-                )
-            })?
-        };
+    let block_hashes = block_mgr.find_block_hashes(block_number).map_err(|_| {
+        ErrorObject::owned(
+            INVALID_PARAMS_CODE,
+            format!("not found block number: {}", block_number),
+            None::<()>,
+        )
+    })?;
 
     for block_hash in block_hashes {
-        let witness =
-            load_from_file_or_backup(stateless_dir, block_number, block_hash).map_err(|e| {
+        let witness = block_mgr
+            .load_witness_status(block_number, block_hash)
+            .map_err(|e| {
                 ErrorObject::owned(
                     INVALID_PARAMS_CODE,
                     format!("block {block_number} err:{e}"),

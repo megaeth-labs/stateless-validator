@@ -1,7 +1,6 @@
 //! This module provides functionality to generate, store, and manage block witnesses in a file
 //! system.
-use crate::*;
-use alloy_primitives::{BlockHash, BlockNumber};
+use alloy_primitives::{B256, BlockHash, BlockNumber};
 use serde::{Deserialize, Serialize};
 
 /// Block witness Processing state

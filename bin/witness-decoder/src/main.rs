@@ -4,7 +4,8 @@ use eyre::{Result, anyhow};
 use serde::Serialize;
 use std::{fs::File, io::Read, path::PathBuf};
 use validator_core::{
-    SaltWitnessState, WitnessStatus, deserialized_state_data, file_name_hash, file_name_number,
+    SaltWitnessState, WitnessStatus,
+    storage::{BlockFileManager, deserialized_state_data},
 };
 
 #[derive(Parser, Debug)]
@@ -97,8 +98,7 @@ fn decode_witness_file(
         .unwrap_or("unknown")
         .to_string();
 
-    let file_block_number = file_name_number(&file_name);
-    let file_block_hash = file_name_hash(&file_name);
+    let (file_block_number, file_block_hash) = BlockFileManager::parse_filename(&file_name);
 
     // Create hex dump if requested
     let witness_data_hex = if hex_dump_bytes > 0 {
