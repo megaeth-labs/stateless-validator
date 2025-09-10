@@ -2883,7 +2883,6 @@ name = "megaeth-validator"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
- "alloy-provider",
  "alloy-rpc-types-eth",
  "bincode",
  "clap",
@@ -4858,7 +4857,6 @@ dependencies = [
  "serde_json",
  "simd-json",
  "tempfile",
- "tokio",
 ]
 
 [[package]]

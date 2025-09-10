@@ -16,7 +16,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{runtime::Handle, signal, sync::Mutex};
+use tokio::{signal, sync::Mutex};
 use tracing::{error, info};
 use validate::{
     SaltWitnessState,
@@ -358,12 +358,9 @@ async fn validate_block(
                 append_json_line_to_file(&(hash, bytecode), &validate_path, contracts_file)?;
             }
 
-            let rt = Handle::current();
             let witness_provider = WitnessProvider {
                 witness: block_witness.clone(),
                 contracts: contracts_for_provider,
-                provider: client.provider.clone(),
-                rt,
             };
 
             let accounts = replay_block(block.clone(), &witness_provider)?;

@@ -35,7 +35,6 @@ eyre.workspace = true
 futures.workspace = true
 fs2.workspace = true
 rand.workspace = true
-tokio.workspace = true
 jsonrpsee-types.workspace = true
 
 [dev-dependencies]

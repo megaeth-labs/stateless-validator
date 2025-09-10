@@ -5,9 +5,8 @@
 //! full database, it serves data from a `BlockWitness`. This is the key to enabling stateless
 //! block replay and validation.
 use crate::format::{Account, PlainKey, PlainValue};
+use alloy_eips::eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS};
 use alloy_primitives::{Address, B256};
-use alloy_provider::{Provider, RootProvider};
-use op_alloy_network::Optimism;
 use revm::{
     DatabaseRef,
     database::DBErrorMarker,
@@ -18,7 +17,6 @@ use revm::{
 use salt::{EphemeralSaltState, Witness};
 use std::error::Error;
 use std::fmt;
-use tokio::{runtime::Handle, sync::oneshot};
 
 pub mod evm;
 pub mod file;
@@ -58,10 +56,6 @@ pub struct WitnessProvider {
     pub witness: Witness,
     /// A map of contract code hashes to their corresponding bytecode.
     pub contracts: HashMap<B256, Bytecode>,
-    /// An RPC provider to fetch historical block hashes.
-    pub provider: RootProvider<Optimism>,
-    /// A handle to the Tokio runtime, used for dispatching async RPC calls from sync REVM code.
-    pub rt: Handle,
 }
 
 impl WitnessProvider {
@@ -136,26 +130,15 @@ impl DatabaseRef for WitnessProvider {
 
     /// Provides a historical block hash.
     ///
-    /// This function handles an async RPC call from within a synchronous context (REVM's DB
-    /// access) by using `tokio::task::block_in_place` and a oneshot channel.
+    /// Implements the retrieval mechanism from [EIP-2935](https://eips.ethereum.org/EIPS/eip-2935).
+    /// The hash for block `N` is stored at slot `N % HISTORY_SERVE_WINDOW` in the
+    /// designated contract.
     fn block_hash_ref(&self, number: u64) -> Result<B256, <Self as DatabaseRef>::Error> {
-        let provider = self.provider.clone();
-
-        tokio::task::block_in_place(|| {
-            let (tx, rx) = oneshot::channel();
-            self.rt.spawn(async move {
-                let _ = tx.send(provider.get_block_by_number(number.into()).await);
-            });
-
-            let res = rx
-                .blocking_recv()
-                .map_err(|e| WitnessProviderError(e.to_string()))?;
-
-            let block = res.map_err(|e| WitnessProviderError(e.to_string()))?;
-
-            // SAFETY: If the block is finalized and exist. Thus, we can safely unwrap the results.
-            Ok(block.unwrap().header.hash)
-        })
+        self.storage_ref(
+            HISTORY_STORAGE_ADDRESS,
+            U256::from(number % HISTORY_SERVE_WINDOW as u64),
+        )
+        .map(|res| res.into())
     }
 }
 

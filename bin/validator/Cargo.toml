@@ -9,7 +9,6 @@ path = "src/main.rs"
 
 [dependencies]
 alloy-primitives.workspace = true
-alloy-provider.workspace = true
 alloy-rpc-types-eth.workspace = true
 
 revm = { workspace = true, features = ["serde"] }
