@@ -31,17 +31,17 @@ impl DBErrorMarker for WitnessDatabaseError {}
 /// REVM database backed by witness data for partial stateless execution.
 ///
 /// This database enables stateless block validation by combining a compact witness
-/// with on-demand RPC fetching. Instead of requiring full pre-state (which would be
+/// with local bytecode cache. Instead of requiring full pre-state (which would be
 /// prohibitively large), it uses a hybrid approach:
 ///
-/// **From Witness (compact, included):**
+/// **From Witness:**
 /// - Account balances, nonces, and code hashes
 /// - Storage slot values for touched accounts
+/// - Historical block hashes (via EIP-2935 Historical Block Hashes From State)
 /// - State proofs for cryptographic verification
 ///
-/// **From RPC (fetched on-demand and cached locally):**
-/// - Contract bytecode (when executing smart contracts)
-/// - Historical block hashes (for BLOCKHASH opcode)
+/// **From RPC:**
+/// - Contract bytecode (fetched on-demand and cached locally)
 ///
 /// This partial stateless approach dramatically reduces DA bandwidth compared to
 /// a pure stateless approach, while still enabling complete block validation through
@@ -50,9 +50,10 @@ impl DBErrorMarker for WitnessDatabaseError {}
 pub struct WitnessDatabase {
     /// Compact witness containing state subset and cryptographic proofs
     pub witness: Witness,
-    /// Contract bytecode cache, populated on-demand via RPC
+    /// Contract bytecode cache, pre-populated before execution starts
     pub contracts: HashMap<B256, Bytecode>,
-    /// RPC client for fetching missing data (block hashes, additional contracts)
+    // FIXME: blockhashes will be included in the witness using EIP-2935
+    /// RPC client for fetching missing block hashes
     pub client: RootProvider<Optimism>,
     /// Runtime handle for async RPC calls within sync REVM execution context
     pub runtime: Handle,
@@ -99,7 +100,6 @@ impl DatabaseRef for WitnessDatabase {
         if code_hash == KECCAK_EMPTY {
             return Ok(Bytecode::new_raw(Bytes::new()));
         }
-        // TODO: why aren't bytecode fetched on the fly via RPC like blockhashes?
         self.contracts
             .get(&code_hash)
             .cloned()
@@ -118,7 +118,7 @@ impl DatabaseRef for WitnessDatabase {
             .unwrap_or_default())
     }
 
-    /// Provides a historical block hash via RPC
+    /// Provides a historical block hash
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
         let provider = self.client.clone();
         tokio::task::block_in_place(|| {
