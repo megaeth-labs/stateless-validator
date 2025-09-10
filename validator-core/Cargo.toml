@@ -32,7 +32,6 @@ serde_json.workspace = true
 simd-json.workspace = true
 
 eyre.workspace = true
-futures.workspace = true
 fs2.workspace = true
 rand.workspace = true
 tokio.workspace = true

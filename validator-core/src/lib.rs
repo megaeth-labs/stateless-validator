@@ -12,16 +12,14 @@
 //!
 //! ## Modules
 //!
-//! - [`witness`]: Witness data generation and state management  
 //! - [`database`]: Witness-backed database for REVM
 //! - [`evm`]: EVM-specific validation logic and data types
-//! - [`storage`]: File system storage and backup management
-//! - [`client`]: External service communication
+//! - [`manager`]: Validation manager for file system storage, witness data, and backup operations
 //!
 //! ## Example Usage
 //!
 //! ```rust,no_run
-//! use validator_core::storage::{StateData, serialized_state_data, deserialized_state_data, BlockFileManager};
+//! use validator_core::{StateData, serialized_state_data, deserialized_state_data, ValidationManager};
 //! use std::path::Path;
 //!
 //! // Serialize data with hash verification
@@ -31,19 +29,15 @@
 //! // Deserialize and verify integrity
 //! let state_data = deserialized_state_data(serialized)?;
 //!
-//! // Use BlockFileManager for file operations
-//! let file_mgr = BlockFileManager::new(Path::new("/data"));
-//! let (block_num, block_hash) = BlockFileManager::parse_filename("280.0xabc123.w");
+//! // Use ValidationManager for file operations
+//! let file_mgr = ValidationManager::new(Path::new("/data"));
+//! let (block_num, block_hash) = ValidationManager::parse_filename("280.0xabc123.w");
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-pub mod witness;
-pub use witness::*;
 pub mod database;
 pub use database::*;
-pub mod storage;
-pub use storage::*;
-pub mod client;
-pub use client::*;
+pub mod manager;
+pub use manager::*;
 pub mod evm;
 pub use evm::*;

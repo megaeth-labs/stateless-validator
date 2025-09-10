@@ -11,6 +11,8 @@ path = "src/main.rs"
 alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-rpc-types-eth.workspace = true
+op-alloy-network.workspace = true
+op-alloy-rpc-types.workspace = true
 
 revm = { workspace = true, features = ["serde"] }
 
@@ -29,4 +31,3 @@ validator-core = { path = "../../validator-core" }
 
 [dev-dependencies]
 jsonrpsee-types.workspace = true
-op-alloy-rpc-types.workspace = true

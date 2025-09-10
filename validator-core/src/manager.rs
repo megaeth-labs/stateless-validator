@@ -1,25 +1,70 @@
-//! This module handles file-based operations for the stateless validator.
+//! Validation manager for the stateless validator.
 //! It manages the persistence of validation status, block data, and contract code.
 
 /// The number of blocks to shift for backup file naming
 /// This is used to create a directory structure for backups, allowing for efficient storage
 const BACKUP_SHIFT: BlockNumber = 10;
-use crate::{SaltWitnessState, WitnessStatus};
 use alloy_primitives::{B256, BlockHash, BlockNumber, hex};
 use alloy_rpc_types_eth::Block;
 use eyre::{Result, anyhow};
 use fs2::FileExt;
+use jsonrpsee_types::error::{
+    CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
+    UNKNOWN_ERROR_CODE,
+};
 use op_alloy_rpc_types::Transaction;
 use rand::Rng;
 use revm::{primitives::HashMap, state::Bytecode};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap as StdHashMap,
     fs::{File, OpenOptions, create_dir_all, read_dir},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     str::FromStr,
     time::SystemTime,
 };
+
+/// Block witness Processing state
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum SaltWitnessState {
+    /// Idle state, no processing
+    Idle,
+    /// Processing state, the block witness is being generated
+    Processing,
+    /// Witnessed state, the block witness has been generated
+    Witnessed,
+    /// Witness verification state, the block witness is Verifying
+    Verifying,
+    /// Uploading state, the block witness is being uploaded Step 1
+    UploadingStep1,
+    /// Uploading state, the block witness is being uploaded Step 2
+    UploadingStep2,
+    /// Completed state, the block witness has been uploaded successfully
+    Completed,
+}
+
+/// WitnessStatus is used to store the status and state of a block witness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WitnessStatus {
+    /// restore the block witness status
+    pub status: SaltWitnessState,
+    /// restore the block hash
+    pub block_hash: BlockHash,
+    /// restore the block number
+    pub block_number: BlockNumber,
+    /// restore the pre state root
+    /// this is used to verify the block witness
+    pub pre_state_root: B256,
+    /// restore the parent block hash
+    pub parent_hash: BlockHash,
+    /// locking the task before the timeout
+    pub lock_time: u64,
+    /// record the blob ids
+    pub blob_ids: Vec<[u8; 32]>,
+    /// record the block witness data with bytes
+    pub witness_data: Vec<u8>,
+}
 
 /// Container for file storage content with BLAKE3 hash verification
 ///
@@ -73,11 +118,11 @@ pub struct ChainStatus {
     pub block_hash: BlockHash,
 }
 
-/// Manager for block-specific file operations (validation and witness files)
+/// Manager for validation operations (validation and witness files)
 ///
 /// This struct consolidates all operations that work with block-specific files,
 /// providing a cleaner API and eliminating repeated path parameters.
-pub struct BlockFileManager {
+pub struct ValidationManager {
     /// Base path for all block file operations
     base_path: PathBuf,
     /// Path to the validate directory (base_path/validate)
@@ -132,8 +177,8 @@ fn load_binary_data<T: serde::de::DeserializeOwned>(
     Ok(data)
 }
 
-impl BlockFileManager {
-    /// Create a new BlockFileManager for the given base path
+impl ValidationManager {
+    /// Create a new ValidationManager for the given base path
     pub fn new(base_path: impl AsRef<Path>) -> Self {
         let base_path = base_path.as_ref().to_path_buf();
         let validate_dir = base_path.join("validate");
@@ -461,14 +506,14 @@ impl BlockFileManager {
     ///
     /// # Example
     /// ```rust
-    /// use validator_core::storage::BlockFileManager;
+    /// use validator_core::ValidationManager;
     /// use alloy_primitives::BlockHash;
     ///
-    /// let (number, hash) = BlockFileManager::parse_filename("280.0x03c5cb583df6c35f9dcca041f2aa609fce1ad92e170c96c694ce9a6bd3913df1.w");
+    /// let (number, hash) = ValidationManager::parse_filename("280.0x03c5cb583df6c35f9dcca041f2aa609fce1ad92e170c96c694ce9a6bd3913df1.w");
     /// assert_eq!(number, 280);
     /// assert_ne!(hash, BlockHash::ZERO);
     ///
-    /// let (invalid_num, invalid_hash) = BlockFileManager::parse_filename("invalid.w");
+    /// let (invalid_num, invalid_hash) = ValidationManager::parse_filename("invalid.w");
     /// assert_eq!(invalid_num, 0);
     /// assert_eq!(invalid_hash, BlockHash::ZERO);
     /// ```
@@ -518,11 +563,11 @@ impl BlockFileManager {
     ///
     /// # Example
     /// ```rust
-    /// use validator_core::storage::BlockFileManager;
+    /// use validator_core::ValidationManager;
     /// use alloy_primitives::{BlockHash, B256};
     /// use std::path::Path;
     ///
-    /// let mgr = BlockFileManager::new(Path::new("/data"));
+    /// let mgr = ValidationManager::new(Path::new("/data"));
     /// let hash = BlockHash::from([1u8; 32]);
     /// let path = mgr.backup_file_path(1000, hash, ".w");
     /// assert!(path.to_string_lossy().contains("backup"));
@@ -555,16 +600,146 @@ impl BlockFileManager {
     ///
     /// # Example
     /// ```rust
-    /// use validator_core::storage::BlockFileManager;
+    /// use validator_core::ValidationManager;
     /// use std::path::Path;
     ///
-    /// let mgr = BlockFileManager::new(Path::new("/data"));
+    /// let mgr = ValidationManager::new(Path::new("/data"));
     /// let dir = mgr.backup_dir_path(1000);
     /// assert!(dir.to_string_lossy().contains("backup"));
     /// ```
     pub fn backup_dir_path(&self, block_num: BlockNumber) -> PathBuf {
         self.base_path
             .join(format!("backup/{}", block_num >> BACKUP_SHIFT))
+    }
+
+    /// Retrieve blob IDs for a set of validated blocks.
+    ///
+    /// This method processes a list of block identifiers (formatted as `"{number}.{hash}"`),
+    /// checks their validation status from the local file system, and returns the associated
+    /// blob IDs if validation was successful.
+    ///
+    /// # Arguments
+    ///
+    /// * `blocks` - A `Vec` of strings, each identifying a block in the format "{number}.{hash}".
+    ///
+    /// # Returns
+    ///
+    /// Returns a `HashMap` from the block identifier string to a `Vec` of `B256` blob IDs.
+    /// Returns a `jsonrpsee` `ErrorObjectOwned` if any block is invalid, not found, or has
+    /// not yet been successfully validated.
+    pub fn get_blob_ids(
+        &self,
+        blocks: Vec<String>,
+    ) -> Result<StdHashMap<String, Vec<B256>>, ErrorObjectOwned> {
+        let mut results = StdHashMap::new();
+
+        for block in blocks {
+            let (block_number, block_hash) = Self::parse_filename(&block);
+
+            // Validate that parsing was successful (not default values)
+            if block_number == 0 && block_hash == BlockHash::ZERO {
+                return Err(ErrorObject::owned(
+                    INVALID_PARAMS_CODE,
+                    format!("invalid block identifier format: {}", block),
+                    None::<()>,
+                ));
+            }
+
+            let validation = self
+                .load_validate_info(block_number, block_hash)
+                .map_err(|e| {
+                    ErrorObject::owned(CALL_EXECUTION_FAILED_CODE, e.to_string(), None::<()>)
+                })?;
+
+            match validation.status {
+                ValidateStatus::Failed => {
+                    return Err(ErrorObject::owned(
+                        UNKNOWN_ERROR_CODE,
+                        format!("This block {block_number} validation failed"),
+                        None::<()>,
+                    ));
+                }
+                ValidateStatus::Idle => {
+                    return Err(ErrorObject::owned(
+                        CALL_EXECUTION_FAILED_CODE,
+                        format!("This block {block_number} is too old or not validated yet"),
+                        None::<()>,
+                    ));
+                }
+                ValidateStatus::Processing => {
+                    return Err(ErrorObject::owned(
+                        CALL_EXECUTION_FAILED_CODE,
+                        format!("This block {block_number} in processing"),
+                        None::<()>,
+                    ));
+                }
+                ValidateStatus::Success => {
+                    results.insert(
+                        block,
+                        validation.blob_ids.into_iter().map(B256::from).collect(),
+                    );
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Get the witness for a block.
+    ///
+    /// This method parses a block identifier in the format "{number}.{parent_hash}",
+    /// finds the corresponding witness file, and returns the witness data as a hex-encoded string.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_info` - A string identifying a block in the format "{number}.{parent_hash}".
+    ///
+    /// # Returns
+    ///
+    /// Returns the witness data as a hex-encoded string if successful.
+    /// Returns a `jsonrpsee` `ErrorObjectOwned` if the block is not found or parsing fails.
+    pub fn get_witness(&self, block_info: String) -> Result<String, ErrorObjectOwned> {
+        let (block_number, parent_hash) = Self::parse_filename(&block_info);
+
+        // Validate that parsing was successful (not default values)
+        if block_number == 0 && parent_hash == BlockHash::ZERO {
+            return Err(ErrorObject::owned(
+                INVALID_PARAMS_CODE,
+                format!("invalid block identifier format: {}", block_info),
+                None::<()>,
+            ));
+        }
+
+        // get the witness from witness directory
+        let block_hashes = self.find_block_hashes(block_number).map_err(|_| {
+            ErrorObject::owned(
+                INVALID_PARAMS_CODE,
+                format!("not found block number: {}", block_number),
+                None::<()>,
+            )
+        })?;
+
+        for block_hash in block_hashes {
+            let witness = self
+                .load_witness_status(block_number, block_hash)
+                .map_err(|e| {
+                    ErrorObject::owned(
+                        INVALID_PARAMS_CODE,
+                        format!("block {block_number} err:{e}"),
+                        None::<()>,
+                    )
+                })?;
+            if witness.parent_hash == parent_hash {
+                // Return the witness data as a hex-encoded string
+                return Ok(hex::encode(&witness.witness_data));
+            }
+        }
+
+        Err(ErrorObject::owned(
+            INVALID_PARAMS_CODE,
+            format!("not found witness for block {block_info}"),
+            None::<()>,
+        ))
     }
 }
 
@@ -712,8 +887,8 @@ mod tests {
     fn test_load_validate_info_file_not_exist() {
         let dir = tempdir().unwrap();
         let path = dir.path().to_path_buf();
-        let block_mgr = BlockFileManager::new(&path);
-        let res = block_mgr.load_validate_info(1, dummy_block_hash());
+        let val_manager = ValidationManager::new(&path);
+        let res = val_manager.load_validate_info(1, dummy_block_hash());
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), ValidateInfo::default());
     }
@@ -727,8 +902,8 @@ mod tests {
 
         let block_number = 1u64;
         let block_hash = dummy_block_hash();
-        let block_mgr = BlockFileManager::new(&path);
-        let file_name = block_mgr.validate_file_name(block_number, block_hash);
+        let val_manager = ValidationManager::new(&path);
+        let file_name = val_manager.validate_file_name(block_number, block_hash);
         let file_path = validate_dir.join(&file_name);
 
         // Construct a ValidateInfo and serialize it to the file
@@ -745,7 +920,7 @@ mod tests {
         let mut file = File::create(&file_path).unwrap();
         file.write_all(&serialized).unwrap();
 
-        let loaded = block_mgr
+        let loaded = val_manager
             .load_validate_info(block_number, block_hash)
             .unwrap();
         assert_eq!(loaded, info);
@@ -762,7 +937,7 @@ mod tests {
 
         let block_number = 2u64;
         let block_hash = dummy_block_hash();
-        let backup_file = block_mgr.backup_file_path(block_number, block_hash, ".v");
+        let backup_file = val_manager.backup_file_path(block_number, block_hash, ".v");
 
         // Construct a ValidateInfo and serialize it to the backup file
         let info = ValidateInfo {
@@ -778,8 +953,8 @@ mod tests {
         let mut file = File::create(&backup_file).unwrap();
         file.write_all(&serialized).unwrap();
 
-        let block_mgr = BlockFileManager::new(&path);
-        let loaded = block_mgr
+        let val_manager = ValidationManager::new(&path);
+        let loaded = val_manager
             .load_validate_info(block_number, block_hash)
             .unwrap();
         assert_eq!(loaded, info);
