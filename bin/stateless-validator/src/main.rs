@@ -25,7 +25,8 @@ use validator_core::{
     evm::replay_block,
     evm::{PlainKey, PlainValue},
     storage::{
-        ValidateStatus, append_json_line_to_file, curent_time_to_u64, get_chain_status, get_witness_state, load_contracts_file, load_validate_info,
+        ValidateStatus, append_json_line_to_file, curent_time_to_u64, get_chain_status,
+        get_witness_state, load_contracts_file, load_validate_info,
         read_block_hash_by_number_from_file, set_validate_status,
     },
 };
