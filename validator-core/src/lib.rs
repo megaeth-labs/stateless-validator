@@ -34,8 +34,6 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-pub mod chain;
-pub use chain::*;
 pub mod witness;
 pub use witness::*;
 pub mod database;

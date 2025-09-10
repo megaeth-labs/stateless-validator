@@ -1,9 +1,6 @@
 //! This module handles file-based operations for the stateless validator.
 //! It manages the persistence of validation status, block data, and contract code.
-use crate::{
-    WitnessStatus, curent_time_to_u64, deserialized_state_data, serialized_state_data,
-    witness_file_name,
-};
+use crate::{SaltWitnessState, WitnessStatus, deserialized_state_data, serialized_state_data};
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use eyre::{Result, anyhow};
 use fs2::FileExt;
@@ -15,6 +12,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::Path,
     str::FromStr,
+    time::SystemTime,
 };
 
 /// Represents the validation status of a block.
@@ -46,6 +44,15 @@ pub struct ValidateInfo {
     pub lock_time: u64,
     /// A list of blob IDs associated with the block's transactions.
     pub blob_ids: Vec<[u8; 32]>,
+}
+
+/// The chain status, which contains the finalized block number, block hash
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ChainStatus {
+    /// The block number of the finalized block
+    pub block_number: BlockNumber,
+    /// The block hash of the finalized block
+    pub block_hash: BlockHash,
 }
 
 /// Loads the `ValidateInfo` for a specific block from a file
@@ -413,6 +420,81 @@ pub fn append_json_line_to_file<T: Serialize>(
 
     file.sync_all()?;
     Ok(())
+}
+
+/// Convert current time to a u64 timestamp
+///
+/// Used for lock time management in witness and validation operations.
+pub fn curent_time_to_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("SystemTime before UNIX EPOCH!")
+        .as_secs()
+}
+
+/// Generate witness file name for a block
+///
+/// Creates a standardized witness file name using the format `{block_number}.{block_hash}.w`
+pub fn witness_file_name(block_num: BlockNumber, block_hash: BlockHash) -> String {
+    format!("{}.{}.w", block_num, block_hash)
+}
+
+/// Get block witness status by given block number and block hash
+///
+/// Loads witness status from file or returns default idle status if file doesn't exist.
+pub fn get_witness_state(
+    path: &Path,
+    block: &(BlockNumber, BlockHash),
+) -> std::io::Result<WitnessStatus> {
+    let path = path
+        .join("witness")
+        .join(witness_file_name(block.0, block.1));
+    if !path.exists() {
+        return Ok(WitnessStatus {
+            status: SaltWitnessState::Idle,
+            block_hash: block.1,
+            block_number: block.0,
+            parent_hash: BlockHash::default(),
+            pre_state_root: B256::default(),
+            lock_time: curent_time_to_u64(),
+            blob_ids: vec![],
+            witness_data: vec![],
+        });
+    }
+    let mut file = OpenOptions::new().read(true).open(path)?;
+    let mut contents = vec![];
+    file.read_to_end(&mut contents)?;
+    let state_data = deserialized_state_data(contents).map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("block({:?}): {}", block, e),
+        )
+    })?;
+    let deserialized =
+        bincode::serde::decode_from_slice(&state_data.data, bincode::config::legacy()).map_err(
+            |e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "block({:?}): Failed to deserialize  WitnessStatus: {}",
+                        block, e
+                    ),
+                )
+            },
+        )?;
+    Ok(deserialized.0)
+}
+
+/// Get the chain status from file
+///
+/// Reads chain status from the `chain.status` file in JSON format.
+pub fn get_chain_status(path: &Path) -> Result<ChainStatus> {
+    let path = path.join("chain.status");
+    let mut file = OpenOptions::new().read(true).open(&path)?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    let status: ChainStatus = serde_json::from_str(&contents)?;
+    Ok(status)
 }
 
 #[cfg(test)]

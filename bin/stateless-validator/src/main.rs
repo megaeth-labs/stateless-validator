@@ -20,16 +20,14 @@ use tokio::{runtime::Handle, signal, sync::Mutex};
 use tracing::{error, info};
 use validator_core::{
     SaltWitnessState,
-    chain::get_chain_status,
     client::{RpcClient, get_blob_ids, get_witness},
     database::WitnessDatabase,
     evm::replay_block,
     evm::{PlainKey, PlainValue},
     storage::{
-        ValidateStatus, append_json_line_to_file, load_contracts_file, load_validate_info,
+        ValidateStatus, append_json_line_to_file, curent_time_to_u64, get_chain_status, get_witness_state, load_contracts_file, load_validate_info,
         read_block_hash_by_number_from_file, set_validate_status,
     },
-    witness::{curent_time_to_u64, get_witness_state},
 };
 
 /// Maximum response body size for the RPC server.
