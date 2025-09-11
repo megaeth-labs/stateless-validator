@@ -468,9 +468,11 @@ fn get_addresses_with_code(block_witness: &SaltWitness) -> Vec<(Address, B256)> 
 mod tests {
     use super::*;
     use alloy_rpc_types_eth::Block;
+    use eyre::Context;
     use fs_extra::dir;
     use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned};
     use op_alloy_rpc_types::Transaction;
+    use serde::de::DeserializeOwned;
     use validator_core::ValidationManager;
 
     /// Set up a temporary work directory and copy test data into it.
@@ -494,84 +496,86 @@ mod tests {
     }
 
     #[derive(Debug)]
-    enum Input {
+    enum BlockId {
         Hash(String),
         Number(u64),
     }
 
-    fn full_block_to_without_tx(block: &Block<Transaction>) -> Block<Transaction> {
-        let transactions = block.transactions.clone();
-        let hashes = transactions.into_hashes();
-        let mut block = block.clone();
-        block.transactions = hashes;
-        block
+    /// Loads and deserializes JSON data from a file.
+    ///
+    /// This generic function reads a JSON file and deserializes it into any type
+    /// that implements `serde::de::DeserializeOwned`.
+    ///
+    /// # Arguments
+    ///
+    /// * `file_path`: The path to the JSON file to load.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(T)` containing the deserialized data if successful.
+    /// Returns an `Err` if any step (file opening, reading, or deserialization) fails.
+    fn load_json<T: DeserializeOwned>(file_path: impl AsRef<Path>) -> Result<T> {
+        let path = file_path.as_ref();
+        let contents = std::fs::read(path)
+            .with_context(|| format!("Failed to read file {}", path.display()))?;
+        serde_json::from_slice(&contents)
+            .with_context(|| format!("Failed to parse JSON from {}", path.display()))
     }
 
     fn load_block(
-        path: &PathBuf,
-        input: Input,
-        is_full: bool,
+        block_id: BlockId,
+        transaction_details: bool,
     ) -> Result<Block<Transaction>, ErrorObjectOwned> {
-        let val_manager = ValidationManager::new(path);
-        let files = std::fs::read_dir(path).unwrap();
+        const BLOCKS_DIR: &str = "../../test_data/blocks";
 
-        for file in files {
-            let file = file.unwrap();
-            let file_name = file.file_name();
-            let file_name_str = file_name.to_string_lossy();
+        // Helper function to check if filename matches input
+        let find_block_data = |filename: &str| match block_id {
+            BlockId::Hash(ref hash) => filename.contains(hash),
+            BlockId::Number(number) => filename.starts_with(&format!("{number}.")),
+        };
 
-            match input {
-                Input::Hash(ref hash) => {
-                    if file_name_str.contains(hash) {
-                        let block = val_manager.load_block_data(&file_name_str).unwrap();
-                        return Ok(if is_full {
-                            block
-                        } else {
-                            full_block_to_without_tx(&block)
-                        });
-                    }
+        // Convert errors to ErrorObjectOwned
+        let to_rpc_error =
+            |msg: String| ErrorObject::owned(CALL_EXECUTION_FAILED_CODE, msg, None::<()>);
+
+        // Find and load the matching file
+        std::fs::read_dir(BLOCKS_DIR)
+            .map_err(|e| to_rpc_error(format!("Failed to read directory: {}", e)))?
+            .find_map(|entry| {
+                let file = entry.ok()?;
+                let file_name = file.file_name();
+                if find_block_data(&file_name.to_string_lossy()) {
+                    let block: Block<Transaction> = load_json(file.path()).ok()?;
+                    Some(if transaction_details {
+                        block
+                    } else {
+                        Block {
+                            transactions: block.transactions.clone().into_hashes(),
+                            ..block.clone()
+                        }
+                    })
+                } else {
+                    None
                 }
-                Input::Number(number) => {
-                    if file_name_str.starts_with(&format!("{number}.")) {
-                        let block = val_manager.load_block_data(&file_name_str).unwrap();
-                        return Ok(if is_full {
-                            block
-                        } else {
-                            full_block_to_without_tx(&block)
-                        });
-                    }
-                }
-            }
-        }
-
-        Err(ErrorObject::owned(
-            CALL_EXECUTION_FAILED_CODE,
-            format!("This block {input:?} not found"),
-            None::<()>,
-        ))
+            })
+            .ok_or_else(|| to_rpc_error(format!("Block {block_id:?} not found")))
     }
 
     #[tokio::test]
     async fn test_validate_blocks() {
         tracing_subscriber::fmt::init();
 
-        // Set up test data in temporary directory
-        let work_dir = setup_work_dir().unwrap();
-
-        // 1. start the mock RPC server using original blocks path (read-only)
-        let blocks_path = PathBuf::from("../../test_data/blocks");
-        let mut module = RpcModule::new(blocks_path);
-
+        // 1. start the mock RPC server
+        let mut module = RpcModule::new(());
         module
-            .register_method("eth_getBlockByHash", |params, path, _| {
+            .register_method("eth_getBlockByHash", |params, _, _| {
                 let (hash, is_full): (String, bool) = params.parse().unwrap();
-                let block = load_block(path, Input::Hash(hash), is_full);
-                block
+                load_block(BlockId::Hash(hash), is_full)
             })
             .unwrap();
 
         module
-            .register_method("eth_getBlockByNumber", |params, path, _| {
+            .register_method("eth_getBlockByNumber", |params, _, _| {
                 let (number_str, is_full): (String, bool) = params.parse().unwrap();
                 // Convert hex string starting with 0x to u64
                 let number = if number_str.starts_with("0x") {
@@ -579,8 +583,7 @@ mod tests {
                 } else {
                     number_str.parse::<u64>().unwrap_or(0)
                 };
-                let block = load_block(path, Input::Number(number), is_full);
-                block
+                load_block(BlockId::Number(number), is_full)
             })
             .unwrap();
 
@@ -602,6 +605,7 @@ mod tests {
         let client = Arc::new(RpcClient::new("http://127.0.0.1:59545").unwrap());
 
         // Load already known contracts from a file to avoid re-fetching them.
+        let work_dir = setup_work_dir().unwrap();
         let val_manager = ValidationManager::new(&work_dir);
         let contracts = Arc::new(Mutex::new(
             val_manager.load_contracts_file().unwrap_or_default(),

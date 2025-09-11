@@ -5,14 +5,12 @@
 /// This is used to create a directory structure for backups, allowing for efficient storage
 const BACKUP_SHIFT: BlockNumber = 10;
 use alloy_primitives::{B256, BlockHash, BlockNumber, hex};
-use alloy_rpc_types_eth::Block;
 use eyre::{Result, anyhow};
 use fs2::FileExt;
 use jsonrpsee_types::error::{
     CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
     UNKNOWN_ERROR_CODE,
 };
-use op_alloy_rpc_types::Transaction;
 use rand::Rng;
 use revm::{primitives::HashMap, state::Bytecode};
 use serde::{Deserialize, Serialize};
@@ -419,34 +417,6 @@ impl ValidationManager {
         }
 
         Ok(contracts)
-    }
-
-    /// Loads block data from a JSON file.
-    ///
-    /// This method reads and deserializes a JSON file containing block data
-    /// into a `Block<Transaction>` struct.
-    ///
-    /// # Arguments
-    ///
-    /// * `file_name`: The name of the JSON file to load.
-    ///
-    /// # Returns
-    ///
-    /// Returns `Ok(Block<Transaction>)` containing the deserialized block data if successful.
-    /// Returns an `Err` if any step (file opening, reading, or deserialization) fails.
-    pub fn load_block_data(&self, file_name: &str) -> Result<Block<Transaction>> {
-        let json_file = self.base_path.join(file_name);
-
-        let mut file = File::open(&json_file)
-            .map_err(|e| anyhow!("Failed to open {}: {}", json_file.display(), e))?;
-        let mut contents = Vec::new();
-        file.read_to_end(&mut contents)
-            .map_err(|e| anyhow!("Failed to read {}: {}", json_file.display(), e))?;
-
-        let data: Block<Transaction> = simd_json::from_slice(&mut contents)
-            .map_err(|e| anyhow!("Failed to parse {}: {}", json_file.display(), e))?;
-
-        Ok(data)
     }
 
     /// Appends a contract (hash, bytecode) pair to the contracts file.

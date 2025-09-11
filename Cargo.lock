@@ -4360,6 +4360,8 @@ dependencies = [
  "op-alloy-rpc-types",
  "revm",
  "salt",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
