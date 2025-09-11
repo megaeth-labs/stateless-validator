@@ -16,7 +16,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{runtime::Handle, signal, sync::Mutex};
+use tokio::{signal, sync::Mutex};
 use tracing::{error, info};
 use validator_core::{
     SaltWitnessState, ValidateStatus, ValidationManager, curent_time_to_u64,
@@ -360,10 +360,10 @@ async fn validate_block(
             }
 
             let witness_provider = WitnessDatabase {
+                block_number: block_counter,
+                parent_hash: block.header.parent_hash,
                 witness: block_witness.clone(),
                 contracts: contracts_for_provider,
-                client: client.provider.clone(),
-                runtime: Handle::current(),
             };
 
             let kv_updates = replay_block(block.clone(), &witness_provider)?;
@@ -611,7 +611,7 @@ mod tests {
             val_manager.load_contracts_file().unwrap_or_default(),
         ));
 
-        let finalized_num = 279;
+        let finalized_num = 3779;
         let block_counter = finalized_num + 1;
 
         for block_counter in block_counter..block_counter + 21 {

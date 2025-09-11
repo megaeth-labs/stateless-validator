@@ -3,7 +3,9 @@ members = ["bin/stateless-validator", "bin/witness-decoder", "validator-core"]
 resolver = "2"
 
 [workspace.dependencies]
+# alloy
 alloy-consensus = { version = "1.0.23", default-features = false }
+alloy-eips = { version = "1.0.23", default-features = false }
 alloy-evm = { version = "0.15.0", default-features = false }
 alloy-hardforks = { version = "0.2.7" }
 alloy-network-primitives = { version = "1.0.23", default-features = false }
@@ -31,6 +33,7 @@ clap = { version = "4.5", features = ["derive"] }
 eyre = "0.6"
 fs2 = "0.4"
 futures = "0.3"
+hex = "0.4"
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }
 jsonrpsee-types = { version = "0.26" }
 num_cpus = "1.17"
