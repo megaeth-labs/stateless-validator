@@ -44,12 +44,14 @@ const STORAGE_VALUE_LEN: usize = 32;
 ///
 /// This enum distinguishes between account keys (just an address) and
 /// storage slot keys (address + slot identifier).
-#[derive(Hash, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Hash, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PlainKey {
     /// Key for an account state (20-byte address)
     Account(Address),
     /// Key for a storage slot: (address, storage slot)
     Storage(Address, B256),
+    /// Unknown key format (for malformed data), preserving raw bytes
+    Unknown(Vec<u8>),
 }
 
 impl PlainKey {
@@ -58,6 +60,7 @@ impl PlainKey {
     /// # Returns
     /// - Account: 20-byte address
     /// - Storage: 52-byte concatenation of address (20) + slot (32)
+    /// - Unknown: preserved raw bytes from decode
     pub fn encode(&self) -> Vec<u8> {
         match self {
             PlainKey::Account(addr) => addr.as_slice().to_vec(),
@@ -65,13 +68,14 @@ impl PlainKey {
                 .concat_const::<SLOT_KEY_LEN, STORAGE_SLOT_KEY_LEN>(*slot)
                 .as_slice()
                 .to_vec(),
+            PlainKey::Unknown(data) => data.clone(),
         }
     }
 
     /// Decodes a byte slice into a PlainKey.
     ///
-    /// # Panics
-    /// Panics if the buffer length is neither 20 (account) nor 52 (storage) bytes.
+    /// Returns `PlainKey::Unknown` if the buffer length is neither 20 (account)
+    /// nor 52 (storage) bytes.
     pub fn decode(buf: &[u8]) -> Self {
         match buf.len() {
             ACCOUNT_ADDRESS_LEN => PlainKey::Account(Address::from_slice(buf)),
@@ -80,7 +84,7 @@ impl PlainKey {
                 let slot_id = B256::from_slice(&buf[ACCOUNT_ADDRESS_LEN..]);
                 PlainKey::Storage(addr, slot_id)
             }
-            _ => unreachable!("unexpected length of plain key."),
+            _ => PlainKey::Unknown(buf.to_vec()),
         }
     }
 }
@@ -89,13 +93,15 @@ impl PlainKey {
 ///
 /// This enum encodes either account data or storage slot values in a
 /// compact binary format.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlainValue {
     /// Account data containing nonce, balance, and optional bytecode hash.
     /// An empty account (zero nonce and balance) typically indicates deletion.
     Account(Account),
     /// Storage slot value (256-bit unsigned integer)
     Storage(U256),
+    /// Unknown value format (for malformed data), preserving raw bytes
+    Unknown(Vec<u8>),
 }
 
 impl PlainValue {
@@ -105,6 +111,7 @@ impl PlainValue {
     /// - EOA Account: 40 bytes (8-byte nonce + 32-byte balance)
     /// - Contract Account: 72 bytes (8-byte nonce + 32-byte balance + 32-byte bytecode hash)
     /// - Storage: 32 bytes (U256 value)
+    /// - Unknown: preserved raw bytes from decode
     ///
     /// # Encoding Details
     /// All integers are encoded in big-endian format.
@@ -124,6 +131,7 @@ impl PlainValue {
                 }
             }
             PlainValue::Storage(value) => value.to_be_bytes::<32>().to_vec(),
+            PlainValue::Unknown(data) => data.clone(),
         }
     }
 
@@ -134,8 +142,7 @@ impl PlainValue {
     /// - 72 bytes: Contract account (with bytecode hash)
     /// - 32 bytes: Storage value
     ///
-    /// # Panics
-    /// Panics if the buffer length doesn't match any expected format.
+    /// Returns `PlainValue::Unknown` if the buffer length doesn't match any expected format.
     pub fn decode(buf: &[u8]) -> Self {
         match buf.len() {
             EOA_ACCOUNT_LEN => {
@@ -156,7 +163,7 @@ impl PlainValue {
                 })
             }
             STORAGE_VALUE_LEN => PlainValue::Storage(U256::from_be_slice(buf)),
-            _ => unreachable!("unexpected length of plain value."),
+            _ => PlainValue::Unknown(buf.to_vec()),
         }
     }
 

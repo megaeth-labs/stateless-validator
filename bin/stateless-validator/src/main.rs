@@ -320,14 +320,14 @@ async fn validate_block(
             .await?;
             let new_state_root = block.header.state_root;
 
-            let addresses_with_code = get_addresses_with_code(&block_witness);
+            let contract_codes = extract_contract_codes(&block_witness);
 
             let block_witness = Witness::from(block_witness);
             block_witness.verify(*old_state_root)?;
 
             let mut contracts_guard = contracts.lock().await;
 
-            let new_contracts_address = addresses_with_code
+            let new_contracts_address = contract_codes
                 .iter()
                 .filter_map(|(address, code_hash)| {
                     if !contracts_guard.contains_key(code_hash) {
@@ -428,32 +428,24 @@ async fn get_root(
     Ok(validate_info.state_root)
 }
 
-/// Extracts all addresses that have a non-empty bytecode hash from the witness.
-/// This is useful for fetching contract code required for block execution.
-fn get_addresses_with_code(block_witness: &SaltWitness) -> Vec<(Address, B256)> {
-    block_witness
+/// Returns all contract addresses and their code hashes from the witness.
+///
+/// Filters witness data to find accounts with non-empty bytecode, which are
+/// needed for contract code fetching during block execution.
+fn extract_contract_codes(salt_witness: &SaltWitness) -> Vec<(Address, B256)> {
+    salt_witness
         .kvs
-        .iter()
-        .filter_map(|(k, v)| {
-            let val = v.as_ref()?;
-
-            // Skip bucket meta slots as they do not contain account information.
-            let key = val.key();
-            if k.is_in_meta_bucket() || key.len() != Address::len_bytes() {
-                return None;
-            }
-
-            let plain_key = PlainKey::decode(key);
-            let plain_value = PlainValue::decode(val.value());
-
-            match (plain_key, plain_value) {
-                (PlainKey::Account(address), PlainValue::Account(account)) => account
+        .values()
+        .filter_map(|salt_val| salt_val.as_ref())
+        .filter_map(
+            |val| match (PlainKey::decode(val.key()), PlainValue::decode(val.value())) {
+                (PlainKey::Account(addr), PlainValue::Account(acc)) => acc
                     .codehash
-                    .filter(|&code_hash| code_hash != KECCAK_EMPTY)
-                    .map(|code_hash| (address, code_hash)),
+                    .filter(|&codehash| codehash != KECCAK_EMPTY)
+                    .map(|codehash| (addr, codehash)),
                 _ => None,
-            }
-        })
+            },
+        )
         .collect()
 }
 
