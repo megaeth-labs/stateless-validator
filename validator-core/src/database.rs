@@ -5,9 +5,8 @@
 //! validation.
 
 use crate::evm::{PlainKey, PlainValue};
-use alloy_primitives::{Address, B256};
-use alloy_provider::{Provider, RootProvider};
-use op_alloy_network::Optimism;
+use alloy_eips::eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS};
+use alloy_primitives::{Address, B256, BlockHash, BlockNumber};
 use revm::{
     DatabaseRef,
     database::DBErrorMarker,
@@ -15,7 +14,6 @@ use revm::{
     state::{AccountInfo, Bytecode},
 };
 use salt::{EphemeralSaltState, Witness};
-use tokio::{runtime::Handle, sync::oneshot};
 
 /// Error type for witness database operations
 #[derive(Debug, Clone)]
@@ -48,15 +46,14 @@ impl DBErrorMarker for WitnessDatabaseError {}
 /// cryptographic proofs in the witness.
 #[derive(Debug, Clone)]
 pub struct WitnessDatabase {
+    /// The block number
+    pub block_number: BlockNumber,
+    /// The parent block hash
+    pub parent_hash: BlockHash,
     /// Compact witness containing state subset and cryptographic proofs
     pub witness: Witness,
     /// Contract bytecode cache, pre-populated before execution starts
     pub contracts: HashMap<B256, Bytecode>,
-    // FIXME: blockhashes will be included in the witness using EIP-2935
-    /// RPC client for fetching missing block hashes
-    pub client: RootProvider<Optimism>,
-    /// Runtime handle for async RPC calls within sync REVM execution context
-    pub runtime: Handle,
 }
 
 impl WitnessDatabase {
@@ -118,22 +115,18 @@ impl DatabaseRef for WitnessDatabase {
             .unwrap_or_default())
     }
 
-    /// Provides a historical block hash
+    /// Implements the retrieval mechanism from [EIP-2935](https://eips.ethereum.org/EIPS/eip-2935).
+    /// The hash for block `N` is stored at slot `N % HISTORY_SERVE_WINDOW` in the
+    /// designated contract.
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
-        let provider = self.client.clone();
-        tokio::task::block_in_place(|| {
-            let (tx, rx) = oneshot::channel();
-            self.runtime.spawn(async move {
-                let _ = tx.send(provider.get_block_by_number(number.into()).await);
-            });
+        if number == self.block_number - 1 {
+            return Ok(self.parent_hash);
+        };
 
-            let block = rx
-                .blocking_recv()
-                .map_err(|e| WitnessDatabaseError(e.to_string()))? // Channel receive error
-                .map_err(|e| WitnessDatabaseError(e.to_string()))? // RPC call error
-                .ok_or_else(|| WitnessDatabaseError("Blockhash not found".to_string()))?;
-
-            Ok(block.header.hash)
-        })
+        self.storage_ref(
+            HISTORY_STORAGE_ADDRESS,
+            U256::from(number % HISTORY_SERVE_WINDOW as u64),
+        )
+        .map(|res| res.into())
     }
 }

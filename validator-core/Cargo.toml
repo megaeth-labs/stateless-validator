@@ -5,16 +5,15 @@ edition = "2024"
 
 [dependencies]
 alloy-consensus.workspace = true
+alloy-eips.workspace = true
 alloy-evm.workspace = true
 alloy-hardforks.workspace = true
 alloy-network-primitives.workspace = true
 alloy-primitives.workspace = true
-alloy-provider.workspace = true
 alloy-rpc-types-eth.workspace = true
 
 alloy-op-evm.workspace = true
 alloy-op-hardforks.workspace = true
-op-alloy-network.workspace = true
 op-alloy-rpc-types.workspace = true
 op-revm.workspace = true
 
@@ -32,7 +31,6 @@ rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 simd-json.workspace = true
-tokio.workspace = true
 
 [dev-dependencies]
 tempfile = "3.8"
