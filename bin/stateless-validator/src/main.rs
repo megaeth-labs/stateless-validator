@@ -82,10 +82,10 @@ async fn main() -> Result<()> {
     };
     info!("Number of concurrent tasks: {}", concurrent_num);
 
-    let stateless_dir = PathBuf::from(args.datadir);
+    let work_dir = PathBuf::from(args.datadir);
 
     let client = Arc::new(RpcClient::new(&args.api)?);
-    let val_manager = ValidationManager::new(&stateless_dir);
+    let val_manager = ValidationManager::new(&work_dir);
 
     // fetch the latest finalized block number.
     let chain_status = val_manager.get_chain_status()?;
@@ -93,16 +93,16 @@ async fn main() -> Result<()> {
 
     // Start validating from the block after the last finalized one.
     let block_counter = finalized_num + 1;
-    let validator_logic = scan_and_validate_block_witnesses(
+    let validator_logic = scan_and_validate(
         client,
-        &stateless_dir,
+        &work_dir,
         block_counter,
         args.lock_time,
         concurrent_num,
     );
 
     if let Some(port) = args.port {
-        let mut module = RpcModule::new(stateless_dir.clone());
+        let mut module = RpcModule::new(work_dir.clone());
 
         module.register_method("stateless_getValidation", |params, path, _| {
             let blocks: Vec<String> = params.parse()?;
@@ -116,7 +116,6 @@ async fn main() -> Result<()> {
             val_manager.get_witness(block_info)
         })?;
 
-        //let server = Server::builder().build(format!("0.0.0.0:{}", port)).await?;
         let cfg = ServerConfigBuilder::default()
             .max_response_body_size(MAX_RESPONSE_BODY_SIZE)
             .build();
@@ -157,7 +156,7 @@ async fn main() -> Result<()> {
 ///
 /// This function creates a stream of block numbers starting from `block_counter` and processes them
 /// concurrently.
-async fn scan_and_validate_block_witnesses(
+async fn scan_and_validate(
     client: Arc<RpcClient>,
     stateless_dir: &Path,
     block_counter: u64,
@@ -236,10 +235,8 @@ async fn validate_block(
 
     info!("Processing block: {}", block_counter);
 
-    let mut loops = true;
-
     // This loop waits for the witness for the block to be generated and available.
-    while loops {
+    loop {
         let block_hashes = match val_manager.find_block_hashes(block_counter) {
             Ok(hashes) => hashes,
             Err(_e) => {
@@ -248,40 +245,42 @@ async fn validate_block(
                 continue;
             }
         };
+
         for block_hash in block_hashes {
             let witness_status = val_manager.get_witness_state(&(block_counter, block_hash))?;
-            if witness_status.status == SaltWitnessState::Idle
-                || witness_status.status == SaltWitnessState::Processing
-            {
+            if matches!(
+                witness_status.status,
+                SaltWitnessState::Idle | SaltWitnessState::Processing
+            ) {
                 // Wait for the witness to be completed.
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 // start with while loop to handle this block hash again
                 break;
             }
 
-            let witness_bytes = witness_status.witness_data;
-
             let validate_info = val_manager.load_validate_info(block_counter, block_hash)?;
-            // Check if the block has already been validated or is being processed by another
-            // validator.
-            if validate_info.status == ValidateStatus::Success {
-                info!(
-                    "Block {} has already been validated with result: {:?}",
-                    block_counter, validate_info.status
-                );
-                return Ok(());
-            } else if validate_info.status == ValidateStatus::Processing
-                && validate_info.lock_time >= curent_time_to_u64()
-            {
-                info!(
-                    "Block {} is currently being processed by another validator.",
-                    block_counter
-                );
-                return Ok(());
-            } else if validate_info.status == ValidateStatus::Failed {
-                info!("Block {} validation failed, replay again...", block_counter);
-                // start with while loop to handle this block hash again
-                break;
+            // Check if the block has already been validated or is being processed by another validator.
+            match validate_info.status {
+                ValidateStatus::Success => {
+                    info!(
+                        "Block {} has already been validated with result: {:?}",
+                        block_counter, validate_info.status
+                    );
+                    return Ok(());
+                }
+                ValidateStatus::Processing if validate_info.lock_time >= curent_time_to_u64() => {
+                    info!(
+                        "Block {} is currently being processed by another validator.",
+                        block_counter
+                    );
+                    return Ok(());
+                }
+                ValidateStatus::Failed => {
+                    info!("Block {} validation failed, replay again...", block_counter);
+                    // Continue to retry this block hash
+                    break;
+                }
+                _ => {} // Continue with processing
             }
             // Lock the block for processing to prevent other validators from working on it.
             val_manager.set_validate_status(
@@ -294,6 +293,7 @@ async fn validate_block(
             )?;
 
             // Fetch the full block details and decode the witness concurrently.
+            let witness_bytes = witness_status.witness_data;
             let (blocks_result, witness_decode_result) = {
                 let witness_bytes_clone = witness_bytes.clone();
                 tokio::join!(
@@ -313,7 +313,7 @@ async fn validate_block(
 
             let old_state_root = get_root(
                 client.as_ref(),
-                stateless_dir,
+                &val_manager,
                 block_counter - 1,
                 block.header.parent_hash,
             )
@@ -399,12 +399,10 @@ async fn validate_block(
                     None,
                     None,
                 )?;
-                loops = false;
+                return Ok(());
             }
         }
     }
-
-    Ok(())
 }
 
 /// Retrieves the state root for a given block number.
@@ -413,11 +411,10 @@ async fn validate_block(
 /// falls back to fetching the block from the RPC endpoint.
 async fn get_root(
     client: &RpcClient,
-    stateless_dir: &Path,
+    val_manager: &ValidationManager,
     block_number: u64,
     block_hash: B256,
 ) -> Result<B256> {
-    let val_manager = ValidationManager::new(stateless_dir);
     let validate_info = val_manager.load_validate_info(block_number, block_hash)?;
     if validate_info.state_root.is_zero() {
         // If state root is not in our validation records, fetch from RPC.
