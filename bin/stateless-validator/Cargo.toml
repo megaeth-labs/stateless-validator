@@ -31,3 +31,5 @@ validator-core = { path = "../../validator-core" }
 
 [dev-dependencies]
 jsonrpsee-types.workspace = true
+tempfile = "3.8"
+fs_extra = "1.3"

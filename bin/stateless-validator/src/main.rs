@@ -468,10 +468,30 @@ fn get_addresses_with_code(block_witness: &SaltWitness) -> Vec<(Address, B256)> 
 mod tests {
     use super::*;
     use alloy_rpc_types_eth::Block;
+    use fs_extra::dir;
     use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned};
     use op_alloy_rpc_types::Transaction;
-    use std::fs;
     use validator_core::ValidationManager;
+
+    /// Set up a temporary work directory and copy test data into it.
+    /// Return the path to the work directory.
+    fn setup_work_dir() -> Result<PathBuf> {
+        let temp_dir = tempfile::tempdir()
+            .map_err(|e| anyhow!("Failed to create temporary directory: {}", e))?;
+
+        let data_dir = PathBuf::from("../../test_data/stateless");
+        let work_dir = temp_dir.path().to_path_buf();
+
+        let mut options = dir::CopyOptions::new();
+        options.content_only = true;
+        dir::copy(&data_dir, &work_dir, &options)
+            .map_err(|e| anyhow!("Failed to copy test data: {}", e))?;
+
+        // Keep the temp dir alive by leaking it. OS will clean it when test process ends.
+        std::mem::forget(temp_dir);
+
+        Ok(work_dir)
+    }
 
     #[derive(Debug)]
     enum Input {
@@ -531,34 +551,16 @@ mod tests {
         ))
     }
 
-    fn delete_validate_files() {
-        // ===============================
-        // delete the test_data/stateless/validate/*.v files to re-validate the blocks
-        // ===============================
-        let validate_dir = PathBuf::from("../../test_data/stateless/validate");
-
-        // Delete all .v files in the validate directory
-        if let Ok(entries) = fs::read_dir(&validate_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(extension) = path.extension() {
-                    if extension == "v" {
-                        if let Err(e) = fs::remove_file(&path) {
-                            error!("Failed to delete file {:?}: {}", path, e);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     #[tokio::test]
     async fn test_validate_blocks() {
         tracing_subscriber::fmt::init();
-        delete_validate_files();
-        // 1. start the mock RPC server
-        let block_path = PathBuf::from("../../test_data/blocks");
-        let mut module = RpcModule::new(block_path);
+
+        // Set up test data in temporary directory
+        let work_dir = setup_work_dir().unwrap();
+
+        // 1. start the mock RPC server using original blocks path (read-only)
+        let blocks_path = PathBuf::from("../../test_data/blocks");
+        let mut module = RpcModule::new(blocks_path);
 
         module
             .register_method("eth_getBlockByHash", |params, path, _| {
@@ -599,10 +601,8 @@ mod tests {
         // 2. create the client that will connect to our mock server
         let client = Arc::new(RpcClient::new("http://127.0.0.1:59545").unwrap());
 
-        let stateless_dir = PathBuf::from("../../test_data/stateless");
-
         // Load already known contracts from a file to avoid re-fetching them.
-        let val_manager = ValidationManager::new(&stateless_dir);
+        let val_manager = ValidationManager::new(&work_dir);
         let contracts = Arc::new(Mutex::new(
             val_manager.load_contracts_file().unwrap_or_default(),
         ));
@@ -613,7 +613,7 @@ mod tests {
         for block_counter in block_counter..block_counter + 21 {
             let res = validate_block(
                 client.clone(),
-                &stateless_dir,
+                &work_dir,
                 block_counter,
                 5,
                 contracts.clone(),
@@ -621,8 +621,6 @@ mod tests {
             .await;
             assert!(res.is_ok());
         }
-
-        delete_validate_files();
         // Finally, shut down the mock server
         handle.stop().unwrap();
         info!("Mock RPC server has been shut down.");
