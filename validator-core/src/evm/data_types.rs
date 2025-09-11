@@ -115,7 +115,7 @@ impl PlainValue {
                 buffer[..8].copy_from_slice(account.nonce.to_be_bytes().as_ref());
                 buffer[8..EOA_ACCOUNT_LEN]
                     .copy_from_slice(account.balance.to_be_bytes::<32>().as_ref());
-                if let Some(bytecode_hash) = account.bytecode_hash {
+                if let Some(bytecode_hash) = account.codehash {
                     buffer[EOA_ACCOUNT_LEN..CONTRACT_ACCOUNT_LEN]
                         .copy_from_slice(bytecode_hash.as_slice());
                     buffer.to_vec()
@@ -143,7 +143,7 @@ impl PlainValue {
                 PlainValue::Account(Account {
                     nonce,
                     balance,
-                    bytecode_hash: None,
+                    codehash: None,
                 })
             }
             CONTRACT_ACCOUNT_LEN => {
@@ -152,7 +152,7 @@ impl PlainValue {
                 PlainValue::Account(Account {
                     nonce,
                     balance,
-                    bytecode_hash: Some(bytecode_hash),
+                    codehash: Some(bytecode_hash),
                 })
             }
             STORAGE_VALUE_LEN => PlainValue::Storage(U256::from_be_slice(buf)),
@@ -178,12 +178,12 @@ pub struct Account {
     /// Account balance
     pub balance: U256,
     /// Keccak256 hash of the contract bytecode (None for EOAs)
-    pub bytecode_hash: Option<B256>,
+    pub codehash: Option<B256>,
 }
 
 impl Account {
     /// Returns true if account is empty.
     pub fn is_empty(&self) -> bool {
-        self.balance.is_zero() && self.nonce == 0 && self.bytecode_hash.is_none()
+        self.balance.is_zero() && self.nonce == 0 && self.codehash.is_none()
     }
 }

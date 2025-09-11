@@ -448,7 +448,7 @@ fn get_addresses_with_code(block_witness: &SaltWitness) -> Vec<(Address, B256)> 
 
             match (plain_key, plain_value) {
                 (PlainKey::Account(address), PlainValue::Account(account)) => account
-                    .bytecode_hash
+                    .codehash
                     .filter(|&code_hash| code_hash != KECCAK_EMPTY)
                     .map(|code_hash| (address, code_hash)),
                 _ => None,
@@ -521,20 +521,16 @@ mod tests {
 
         module
             .register_method("eth_getBlockByHash", |params, _, _| {
-                let (hash, is_full): (String, bool) = params.parse().unwrap();
-                load_test_block(BlockId::Hash(hash), is_full)
+                let (hash, full_block): (String, bool) = params.parse().unwrap();
+                load_test_block(BlockId::Hash(hash), full_block)
             })
             .unwrap();
 
         module
             .register_method("eth_getBlockByNumber", |params, _, _| {
-                let (number_str, is_full): (String, bool) = params.parse().unwrap();
-                let number = if number_str.starts_with("0x") {
-                    u64::from_str_radix(&number_str[2..], 16).unwrap_or(0)
-                } else {
-                    number_str.parse::<u64>().unwrap_or(0)
-                };
-                load_test_block(BlockId::Number(number), is_full)
+                let (hex_number, full_block): (String, bool) = params.parse().unwrap();
+                let number = u64::from_str_radix(&hex_number[2..], 16).unwrap_or(0);
+                load_test_block(BlockId::Number(number), full_block)
             })
             .unwrap();
 
@@ -594,7 +590,7 @@ mod tests {
     /// - JSON parsing fails
     fn load_test_block(
         block_id: BlockId,
-        transaction_details: bool,
+        full_block: bool,
     ) -> Result<Block<Transaction>, ErrorObjectOwned> {
         // Helper function to check if a given file contains the desired block
         let find_block_data = |filename: &str| match block_id {
@@ -614,7 +610,7 @@ mod tests {
                 let file_name = file.file_name();
                 if find_block_data(&file_name.to_string_lossy()) {
                     let block: Block<Transaction> = load_json(file.path()).ok()?;
-                    Some(if transaction_details {
+                    Some(if full_block {
                         block
                     } else {
                         Block {

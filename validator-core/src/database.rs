@@ -78,13 +78,13 @@ impl DatabaseRef for WitnessDatabase {
         }) {
             Some(acc) => {
                 let code = acc
-                    .bytecode_hash
+                    .codehash
                     .and_then(|hash| self.contracts.get(&hash))
                     .cloned();
                 Ok(Some(AccountInfo {
                     balance: acc.balance,
                     nonce: acc.nonce,
-                    code_hash: acc.bytecode_hash.unwrap_or(KECCAK_EMPTY),
+                    code_hash: acc.codehash.unwrap_or(KECCAK_EMPTY),
                     code,
                 }))
             }
@@ -135,9 +135,11 @@ impl DatabaseRef for WitnessDatabase {
     /// - The witness data is corrupted or storage lookup fails
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
         // Return error for blocks beyond EIP-2935 history window
-        if number >= self.block_number || number + (HISTORY_SERVE_WINDOW as u64) < self.block_number {
+        if number >= self.block_number || number + (HISTORY_SERVE_WINDOW as u64) < self.block_number
+        {
             return Err(WitnessDatabaseError(format!(
-                "Block {} is outside the history serve window", number
+                "Block {} is outside the history serve window",
+                number
             )));
         }
 

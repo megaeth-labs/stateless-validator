@@ -113,7 +113,7 @@ pub fn replay_block(
             let account = Account {
                 nonce: info.nonce,
                 balance: info.balance,
-                bytecode_hash: (info.code_hash != KECCAK_EMPTY).then_some(info.code_hash),
+                codehash: (info.code_hash != KECCAK_EMPTY).then_some(info.code_hash),
             };
 
             let account_value =
