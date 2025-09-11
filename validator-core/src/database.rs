@@ -115,14 +115,39 @@ impl DatabaseRef for WitnessDatabase {
             .unwrap_or_default())
     }
 
-    /// Implements the retrieval mechanism from [EIP-2935](https://eips.ethereum.org/EIPS/eip-2935).
-    /// The hash for block `N` is stored at slot `N % HISTORY_SERVE_WINDOW` in the
-    /// designated contract.
+    /// Retrieves historical block hashes according to [EIP-2935](https://eips.ethereum.org/EIPS/eip-2935).
+    ///
+    /// This method provides block hashes for the EVM BLOCKHASH opcode, supporting up to
+    /// the last 8191 blocks. Block hashes are stored in a ring buffer at the designated
+    /// EIP-2935 contract address, where the hash for block `N` is stored at storage slot
+    /// `N % HISTORY_SERVE_WINDOW`.
+    ///
+    /// # Arguments
+    /// * `number` - The block number to retrieve the hash for
+    ///
+    /// # Returns
+    /// The block hash (B256) for the requested block number
+    ///
+    /// # Errors
+    /// Returns `WitnessDatabaseError` if:
+    /// - The block number is outside the EIP-2935 history serve window (> 8191 blocks old)
+    /// - The block number is >= current block number (future blocks)
+    /// - The witness data is corrupted or storage lookup fails
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        // Return error for blocks beyond EIP-2935 history window
+        if number >= self.block_number || number + (HISTORY_SERVE_WINDOW as u64) < self.block_number {
+            return Err(WitnessDatabaseError(format!(
+                "Block {} is outside the history serve window", number
+            )));
+        }
+
+        // Special case: the parent block hash is not included in the witness
+        // and must be read from the parent header directly.
         if number == self.block_number - 1 {
             return Ok(self.parent_hash);
-        };
+        }
 
+        // Look up historical block hash in EIP-2935 storage
         self.storage_ref(
             HISTORY_STORAGE_ADDRESS,
             U256::from(number % HISTORY_SERVE_WINDOW as u64),
