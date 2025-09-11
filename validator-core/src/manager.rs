@@ -682,7 +682,7 @@ fn write_atomic(target_path: impl AsRef<Path>, data: &[u8]) -> Result<()> {
 ///
 /// # Example
 /// ```rust,no_run
-/// use validator_core::storage::serialized_state_data;
+/// use validator_core::serialized_state_data;
 ///
 /// let data = b"Hello, world!".to_vec();
 /// let serialized = serialized_state_data(data)?;
@@ -720,7 +720,7 @@ pub fn serialized_state_data(data: Vec<u8>) -> std::io::Result<Vec<u8>> {
 ///
 /// # Example
 /// ```rust,no_run
-/// use validator_core::storage::{serialized_state_data, deserialized_state_data};
+/// use validator_core::{serialized_state_data, deserialized_state_data};
 ///
 /// let original = b"test data".to_vec();
 /// let serialized = serialized_state_data(original.clone())?;
@@ -826,6 +826,7 @@ mod tests {
         fs::create_dir_all(&backup_dir).unwrap();
         fs::create_dir_all(&validate_dir).unwrap();
 
+        let val_manager = ValidationManager::new(&path);
         let block_number = 2u64;
         let block_hash = dummy_block_hash();
         let backup_file = val_manager.backup_file_path(block_number, block_hash, ".v");

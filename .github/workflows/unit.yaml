@@ -27,6 +27,6 @@ jobs:
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
-      - name: Run  Test
+      - name: Run Test
         run: |
-          cargo test --package stateless-validator --bin stateless-validator --all-features -- tests --show-output
+          cargo test
