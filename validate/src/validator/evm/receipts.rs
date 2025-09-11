@@ -1,8 +1,8 @@
 //! ref
 //! https://github.com/megaeth-labs/mega-reth/blob/refactor/base-on-v1.3.4/crates/optimism/evm/src/receipts.rs
 
-use crate::validator::evm::receipt::OpReceipt;
 use crate::validator::evm::signed::OpTransactionSigned;
+use reth_optimism_primitives::OpReceipt;
 
 use alloy_consensus::{Eip658Value, Receipt};
 use alloy_evm::Evm;

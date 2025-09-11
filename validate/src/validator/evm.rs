@@ -24,7 +24,6 @@ use crate::validator::WitnessProvider;
 use crate::validator::evm::receipts::OpRethReceiptBuilder;
 use crate::validator::evm::signed::OpTransactionSigned;
 
-mod receipt;
 mod receipts;
 mod signed;
 
