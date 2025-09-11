@@ -164,11 +164,9 @@ async fn scan_and_validate_block_witnesses(
     lock_time: u64,
     concurrent_num: usize,
 ) -> Result<()> {
-    // Load already known contracts from a file to avoid re-fetching them.
-    let val_manager = ValidationManager::new(stateless_dir);
-    let contracts = Arc::new(Mutex::new(
-        val_manager.load_contracts_file().unwrap_or_default(),
-    ));
+    // TODO: populate the initial contract cache from a redis instance
+    // Start with an empty contract cache.
+    let contracts = Arc::new(Mutex::new(HashMap::default()));
 
     let stateless_dir = stateless_dir.to_path_buf();
 
@@ -354,11 +352,6 @@ async fn validate_block(
             let contracts_for_provider = contracts_guard.clone();
             drop(contracts_guard);
 
-            // Persist new contracts to the file.
-            for (hash, bytecode) in new_contracts {
-                val_manager.append_contract(hash, &bytecode)?;
-            }
-
             let witness_provider = WitnessDatabase {
                 block_number: block_counter,
                 parent_hash: block.header.parent_hash,
@@ -473,7 +466,34 @@ mod tests {
     use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned};
     use op_alloy_rpc_types::Transaction;
     use serde::de::DeserializeOwned;
-    use validator_core::ValidationManager;
+    use std::{
+        fs::File,
+        io::{BufRead, BufReader},
+    };
+
+    /// Directory containing test block data files for mock RPC server.
+    ///
+    /// Files in this directory should be named with block numbers and hashes,
+    /// e.g., "280.0xabc123.json" for block 280 with hash 0xabc123.
+    const TEST_BLOCK_DIR: &str = "../../test_data/blocks";
+
+    /// Path to the test contracts data file.
+    ///
+    /// This file contains contract bytecode data with one JSON array per line
+    /// in the format `[hash, bytecode]` for use in integration tests.
+    const CONTRACTS_FILE: &str = "../../test_data/contracts.txt";
+
+    /// Block identifier used to locate test block data files.
+    ///
+    /// This enum represents the two ways to identify a blockchain block:
+    /// by its unique hash or by its sequential number in the chain.
+    #[derive(Debug)]
+    enum BlockId {
+        /// Block identified by its hash (e.g., "0xabc123...")
+        Hash(String),
+        /// Block identified by its number (e.g., 280)
+        Number(u64),
+    }
 
     /// Set up a temporary work directory and copy test data into it.
     /// Return the path to the work directory.
@@ -495,10 +515,41 @@ mod tests {
         Ok(work_dir)
     }
 
-    #[derive(Debug)]
-    enum BlockId {
-        Hash(String),
-        Number(u64),
+    /// Set up mock RPC server and return the handle.
+    async fn setup_mock_rpc_server() -> jsonrpsee::server::ServerHandle {
+        let mut module = RpcModule::new(());
+
+        module
+            .register_method("eth_getBlockByHash", |params, _, _| {
+                let (hash, is_full): (String, bool) = params.parse().unwrap();
+                load_test_block(BlockId::Hash(hash), is_full)
+            })
+            .unwrap();
+
+        module
+            .register_method("eth_getBlockByNumber", |params, _, _| {
+                let (number_str, is_full): (String, bool) = params.parse().unwrap();
+                let number = if number_str.starts_with("0x") {
+                    u64::from_str_radix(&number_str[2..], 16).unwrap_or(0)
+                } else {
+                    number_str.parse::<u64>().unwrap_or(0)
+                };
+                load_test_block(BlockId::Number(number), is_full)
+            })
+            .unwrap();
+
+        let cfg = ServerConfigBuilder::default()
+            .max_response_body_size(MAX_RESPONSE_BODY_SIZE)
+            .build();
+        let server = ServerBuilder::default()
+            .set_config(cfg)
+            .build("0.0.0.0:59545")
+            .await
+            .unwrap();
+
+        let handle = server.start(module);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle
     }
 
     /// Loads and deserializes JSON data from a file.
@@ -522,13 +573,30 @@ mod tests {
             .with_context(|| format!("Failed to parse JSON from {}", path.display()))
     }
 
-    fn load_block(
+    /// Loads a block from test data files for mock RPC server responses.
+    ///
+    /// This function searches the test block directory for files matching the given
+    /// block identifier and returns the block data in the format expected by
+    /// JSON-RPC clients.
+    ///
+    /// # Arguments
+    ///
+    /// * `block_id` - The block identifier (hash or number) to search for
+    /// * `transaction_details` - If true, returns full transaction objects;
+    ///                          if false, returns only transaction hashes
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(Block<Transaction>)` if the block is found and successfully loaded.
+    /// Returns an `ErrorObjectOwned` compatible with jsonrpsee RPC error handling if:
+    /// - Block file is not found
+    /// - Directory cannot be read
+    /// - JSON parsing fails
+    fn load_test_block(
         block_id: BlockId,
         transaction_details: bool,
     ) -> Result<Block<Transaction>, ErrorObjectOwned> {
-        const BLOCKS_DIR: &str = "../../test_data/blocks";
-
-        // Helper function to check if filename matches input
+        // Helper function to check if a given file contains the desired block
         let find_block_data = |filename: &str| match block_id {
             BlockId::Hash(ref hash) => filename.contains(hash),
             BlockId::Number(number) => filename.starts_with(&format!("{number}.")),
@@ -539,7 +607,7 @@ mod tests {
             |msg: String| ErrorObject::owned(CALL_EXECUTION_FAILED_CODE, msg, None::<()>);
 
         // Find and load the matching file
-        std::fs::read_dir(BLOCKS_DIR)
+        std::fs::read_dir(TEST_BLOCK_DIR)
             .map_err(|e| to_rpc_error(format!("Failed to read directory: {}", e)))?
             .find_map(|entry| {
                 let file = entry.ok()?;
@@ -561,71 +629,42 @@ mod tests {
             .ok_or_else(|| to_rpc_error(format!("Block {block_id:?} not found")))
     }
 
+    /// Loads contract bytecode from a test data file.
+    ///
+    /// Reads a file where each line contains a JSON array with contract hash and bytecode:
+    /// `[hash, bytecode]`. Empty lines are ignored.
+    ///
+    /// # Arguments
+    /// * `path` - Path to the contracts file
+    ///
+    /// # Returns
+    /// A HashMap mapping contract hashes (B256) to bytecode (Bytecode)
+    fn load_contracts(path: impl AsRef<Path>) -> HashMap<B256, Bytecode> {
+        let file = File::open(path).expect("Failed to open contracts file");
+        BufReader::new(file)
+            .lines()
+            .filter_map(|line| line.ok())
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(&line).expect("Failed to parse contract"))
+            .collect()
+    }
+
     #[tokio::test]
-    async fn test_validate_blocks() {
+    async fn integration_test() {
         tracing_subscriber::fmt::init();
 
-        // 1. start the mock RPC server
-        let mut module = RpcModule::new(());
-        module
-            .register_method("eth_getBlockByHash", |params, _, _| {
-                let (hash, is_full): (String, bool) = params.parse().unwrap();
-                load_block(BlockId::Hash(hash), is_full)
-            })
-            .unwrap();
-
-        module
-            .register_method("eth_getBlockByNumber", |params, _, _| {
-                let (number_str, is_full): (String, bool) = params.parse().unwrap();
-                // Convert hex string starting with 0x to u64
-                let number = if number_str.starts_with("0x") {
-                    u64::from_str_radix(&number_str[2..], 16).unwrap_or(0)
-                } else {
-                    number_str.parse::<u64>().unwrap_or(0)
-                };
-                load_block(BlockId::Number(number), is_full)
-            })
-            .unwrap();
-
-        let cfg = ServerConfigBuilder::default()
-            .max_response_body_size(MAX_RESPONSE_BODY_SIZE)
-            .build();
-        let server = ServerBuilder::default()
-            .set_config(cfg)
-            .build("0.0.0.0:59545")
-            .await
-            .unwrap();
-
-        let handle = server.start(module);
-
-        // Give the server a moment to start up
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // 2. create the client that will connect to our mock server
+        let handle = setup_mock_rpc_server().await;
         let client = Arc::new(RpcClient::new("http://127.0.0.1:59545").unwrap());
 
-        // Load already known contracts from a file to avoid re-fetching them.
         let work_dir = setup_work_dir().unwrap();
-        let val_manager = ValidationManager::new(&work_dir);
-        let contracts = Arc::new(Mutex::new(
-            val_manager.load_contracts_file().unwrap_or_default(),
-        ));
+        let contracts = Arc::new(Mutex::new(load_contracts(&CONTRACTS_FILE)));
 
-        let finalized_num = 3779;
-        let block_counter = finalized_num + 1;
-
-        for block_counter in block_counter..block_counter + 21 {
-            let res = validate_block(
-                client.clone(),
-                &work_dir,
-                block_counter,
-                5,
-                contracts.clone(),
-            )
-            .await;
-            assert!(res.is_ok());
+        for block_num in 3780..3801 {
+            validate_block(client.clone(), &work_dir, block_num, 5, contracts.clone())
+                .await
+                .unwrap();
         }
-        // Finally, shut down the mock server
+
         handle.stop().unwrap();
         info!("Mock RPC server has been shut down.");
     }

@@ -12,12 +12,11 @@ use jsonrpsee_types::error::{
     UNKNOWN_ERROR_CODE,
 };
 use rand::Rng;
-use revm::{primitives::HashMap, state::Bytecode};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap as StdHashMap,
-    fs::{File, OpenOptions, create_dir_all, read_dir},
-    io::{BufRead, BufReader, Read, Write},
+    fs::{OpenOptions, create_dir_all, read_dir},
+    io::{Read, Write},
     path::{Path, PathBuf},
     str::FromStr,
     time::SystemTime,
@@ -127,8 +126,6 @@ pub struct ValidationManager {
     validate_dir: PathBuf,
     /// Path to the witness directory (base_path/witness)
     witness_dir: PathBuf,
-    /// Path to the contracts file (base_path/validate/contracts.txt)
-    contracts_file: PathBuf,
     /// Path to the chain status file (base_path/chain.status)
     chain_status_file: PathBuf,
 }
@@ -181,14 +178,12 @@ impl ValidationManager {
         let base_path = base_path.as_ref().to_path_buf();
         let validate_dir = base_path.join("validate");
         let witness_dir = base_path.join("witness");
-        let contracts_file = validate_dir.join("contracts.txt");
         let chain_status_file = base_path.join("chain.status");
 
         Self {
             base_path,
             validate_dir,
             witness_dir,
-            contracts_file,
             chain_status_file,
         }
     }
@@ -387,80 +382,6 @@ impl ValidationManager {
         file.read_to_string(&mut contents)?;
         let status: ChainStatus = serde_json::from_str(&contents)?;
         Ok(status)
-    }
-
-    /// Loads contracts from a file where each line is a JSON array `[hash, bytecode]`.
-    ///
-    /// The contracts file is expected to live under the `validate` directory of the
-    /// manager's base path, e.g. `<base>/validate/<file_name>`.
-    pub fn load_contracts_file(&self) -> Result<HashMap<B256, Bytecode>> {
-        let json_file = &self.contracts_file;
-        if !json_file.exists() {
-            return Ok(HashMap::default());
-        }
-
-        let file = File::open(json_file)
-            .map_err(|e| anyhow!("Failed to open {} file: {}", json_file.display(), e))?;
-
-        let reader = BufReader::new(file);
-        let mut contracts = HashMap::default();
-
-        for line in reader.lines() {
-            let line = line.map_err(|e| anyhow!("Failed to read line: {}", e))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let mut line_bytes = line.into_bytes();
-            let (hash, bytecode): (B256, Bytecode) = simd_json::from_slice(&mut line_bytes)
-                .map_err(|e| anyhow!("Failed to parse contract line: {}", e))?;
-            contracts.insert(hash, bytecode);
-        }
-
-        Ok(contracts)
-    }
-
-    /// Appends a contract (hash, bytecode) pair to the contracts file.
-    ///
-    /// This method serializes the contract data as JSON and appends it as a new line
-    /// to the `contracts.txt` file in the validate directory. Each line contains a
-    /// JSON array `[hash, bytecode]`.
-    ///
-    /// # Arguments
-    ///
-    /// * `hash`: The contract hash (B256)
-    /// * `bytecode`: The contract bytecode
-    ///
-    /// # Returns
-    ///
-    /// Returns `Ok(())` if successful, or an `Err` if any step fails.
-    pub fn append_contract(&self, hash: B256, bytecode: &Bytecode) -> Result<()> {
-        create_dir_all(&self.validate_dir)
-            .map_err(|e| anyhow!("Failed to create directory: {}", e))?;
-
-        let json_file = &self.contracts_file;
-
-        let mut file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(json_file)
-            .map_err(|e| anyhow!("Failed to open {}: {}", json_file.display(), e))?;
-
-        let contract_data = (hash, bytecode);
-        let json_bytes = simd_json::to_vec(&contract_data).map_err(|e| {
-            anyhow!(
-                "Failed to serialize contract data for {}: {}",
-                json_file.display(),
-                e
-            )
-        })?;
-
-        file.write_all(&json_bytes)
-            .map_err(|e| anyhow!("Failed to write {}: {}", json_file.display(), e))?;
-        file.write_all(b"\n")
-            .map_err(|e| anyhow!("Failed to write newline {}: {}", json_file.display(), e))?;
-        file.sync_all()?;
-
-        Ok(())
     }
 
     /// Parse block number and hash from witness file name
