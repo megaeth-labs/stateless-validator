@@ -4841,7 +4841,6 @@ name = "validator-core"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
- "alloy-eips",
  "alloy-evm",
  "alloy-hardforks",
  "alloy-network-primitives",
@@ -4849,7 +4848,6 @@ dependencies = [
  "alloy-op-hardforks",
  "alloy-primitives",
  "alloy-provider",
- "alloy-rlp",
  "alloy-rpc-types-eth",
  "bincode",
  "blake3",
@@ -4857,7 +4855,6 @@ dependencies = [
  "fs2",
  "jsonrpsee-types",
  "mega-evm",
- "op-alloy-consensus",
  "op-alloy-network",
  "op-alloy-rpc-types",
  "op-revm",

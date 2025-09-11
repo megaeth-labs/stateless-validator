@@ -3,31 +3,27 @@ members = ["bin/stateless-validator", "bin/witness-decoder", "validator-core"]
 resolver = "2"
 
 [workspace.dependencies]
-# alloy
-alloy-eips = { version = "1.0.23", default-features = false }
+alloy-consensus = { version = "1.0.23", default-features = false }
+alloy-evm = { version = "0.15.0", default-features = false }
+alloy-hardforks = { version = "0.2.7" }
+alloy-network-primitives = { version = "1.0.23", default-features = false }
 alloy-primitives = { version = "1.3.0", default-features = false }
 alloy-provider = { version = "1.0.23", features = [
     "reqwest",
 ], default-features = false }
 alloy-rpc-types-eth = { version = "1.0.23", default-features = false }
-alloy-evm = { version = "0.15.0", default-features = false }
-alloy-hardforks = { version = "0.2.7" }
-alloy-consensus = { version = "1.0.23", default-features = false }
-alloy-rlp = { version = "0.3.10", default-features = false }
-alloy-network-primitives = { version = "1.0.23", default-features = false }
 
 # op
-op-alloy-network = { version = "0.18.12", default-features = false }
-alloy-op-hardforks = "0.2.2"
 alloy-op-evm = { version = "0.15.0", default-features = false }
-op-alloy-consensus = { version = "0.18.12", default-features = false }
+alloy-op-hardforks = { version = "0.2.7" }
+op-alloy-network = { version = "0.18.12", default-features = false }
 op-alloy-rpc-types = { version = "0.18.12", default-features = false }
 op-revm = { version = "8.1.0", default-features = false }
 
 revm = { version = "27.1.0", default-features = false }
 
-salt = { git = "https://github.com/megaeth-labs/salt.git", branch = "main" }
 mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "5c7b39dfb5d7890cc5cbf1d1080af808ce2fd187" }
+salt = { git = "https://github.com/megaeth-labs/salt.git", branch = "main" }
 
 bincode = { version = "2.0", features = ["serde"] }
 blake3 = "1.8"
