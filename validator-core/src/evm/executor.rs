@@ -7,6 +7,7 @@ use alloy_evm::{
 };
 use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition};
 use alloy_network_primitives::TransactionResponse;
+use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_op_hardforks::{OpHardfork, OpHardforks};
 use alloy_rpc_types_eth::{Block, BlockTransactions};
 use eyre::{Result, eyre};
@@ -22,9 +23,7 @@ use revm::{
 
 use crate::{
     database::WitnessDatabase,
-    evm::{
-        Account, PlainKey, PlainValue, receipts::OpRethReceiptBuilder, signed::OpTransactionSigned,
-    },
+    evm::{Account, PlainKey, PlainValue},
 };
 
 /// Chain ID for the EVM configuration
@@ -67,7 +66,7 @@ pub fn replay_block(
     let block_executor_factory = BlockExecutorFactory::new(
         ChainSpec,
         EvmFactory::default(),
-        OpRethReceiptBuilder::default(),
+        OpAlloyReceiptBuilder::default(),
     );
 
     let op_block_execution_ctx = BlockExecutionCtx {
@@ -97,8 +96,8 @@ pub fn replay_block(
 
     for tx in transactions {
         let signer = tx.from();
-        let tx_signed = OpTransactionSigned::from(tx);
-        let recovered = Recovered::new_unchecked(&tx_signed, signer);
+        let op_tx_envelope = tx.inner.into_inner();
+        let recovered = Recovered::new_unchecked(&op_tx_envelope, signer);
         block_executor.execute_transaction(recovered)?;
     }
 
