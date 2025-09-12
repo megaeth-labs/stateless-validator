@@ -20,9 +20,9 @@ use tokio::{signal, sync::Mutex};
 use tracing::{error, info};
 use validator_core::{
     SaltWitnessState, ValidateStatus, ValidationManager, curent_time_to_u64,
+    data_types::{PlainKey, PlainValue},
     database::WitnessDatabase,
-    evm::replay_block,
-    evm::{PlainKey, PlainValue},
+    executor::replay_block,
 };
 
 mod rpc;

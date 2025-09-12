@@ -4,7 +4,7 @@
 //! a block witness rather than a full blockchain database, enabling stateless block
 //! validation.
 
-use crate::evm::{PlainKey, PlainValue};
+use crate::data_types::{PlainKey, PlainValue};
 use alloy_eips::eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS};
 use alloy_primitives::{Address, B256, BlockHash, BlockNumber};
 use revm::{

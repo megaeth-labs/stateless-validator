@@ -22,8 +22,8 @@ use revm::{
 };
 
 use crate::{
+    data_types::{Account, PlainKey, PlainValue},
     database::WitnessDatabase,
-    evm::{Account, PlainKey, PlainValue},
 };
 
 /// Chain ID for the EVM configuration

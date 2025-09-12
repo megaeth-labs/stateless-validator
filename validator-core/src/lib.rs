@@ -13,7 +13,8 @@
 //! ## Modules
 //!
 //! - [`database`]: Witness-backed database for REVM
-//! - [`evm`]: EVM-specific validation logic and data types
+//! - [`data_types`]: EVM-specific data types and encoding utilities
+//! - [`executor`]: Block execution logic for replaying transactions
 //! - [`manager`]: Validation manager for file system storage, witness data, and backup operations
 //!
 //! ## Example Usage
@@ -39,5 +40,7 @@ pub mod database;
 pub use database::*;
 pub mod manager;
 pub use manager::*;
-pub mod evm;
-pub use evm::*;
+pub mod data_types;
+pub use data_types::*;
+pub mod executor;
+pub use executor::*;

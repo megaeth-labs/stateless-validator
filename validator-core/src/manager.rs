@@ -188,16 +188,6 @@ impl ValidationManager {
         }
     }
 
-    /// Generate a standard validation file name for a block
-    fn validate_file_name(&self, block_num: BlockNumber, block_hash: BlockHash) -> String {
-        format!("{}.{}.v", block_num, block_hash)
-    }
-
-    /// Generate a standard witness file name for a block
-    fn witness_file_name(&self, block_num: BlockNumber, block_hash: BlockHash) -> String {
-        format!("{}.{}.w", block_num, block_hash)
-    }
-
     /// Loads the `ValidateInfo` for a specific block from a file
     /// from validate or backup directory.
     /// If the file does not exist, it returns a default `ValidateInfo` instance.
@@ -208,7 +198,7 @@ impl ValidationManager {
     ) -> Result<ValidateInfo> {
         let validate_path = self
             .validate_dir
-            .join(self.validate_file_name(block_number, block_hash));
+            .join(format!("{block_number}.{block_hash}.v"));
         let backup_path = self.backup_file_path(block_number, block_hash, ".v");
 
         if !validate_path.exists() && !backup_path.exists() {
@@ -245,25 +235,12 @@ impl ValidationManager {
             validate_info.blob_ids = blob_ids;
         }
 
-        self.save_validate_info(block_number, block_hash, validate_info)
-    }
-
-    /// Saves the `ValidateInfo` to a file atomically.
-    ///
-    /// This is achieved by writing to a temporary file first and then renaming it to the
-    /// final destination. This ensures that a reader will never see a partially written file.
-    fn save_validate_info(
-        &self,
-        block_number: BlockNumber,
-        block_hash: BlockHash,
-        validate_info: ValidateInfo,
-    ) -> Result<()> {
         let serialized = bincode::serde::encode_to_vec(&validate_info, bincode::config::legacy())?;
         let serialized = serialized_state_data(serialized)?;
 
         let final_path = self
             .validate_dir
-            .join(self.validate_file_name(block_number, block_hash));
+            .join(format!("{block_number}.{block_hash}.v"));
         write_atomic(final_path, &serialized)
     }
 
@@ -276,7 +253,7 @@ impl ValidationManager {
     ) -> Result<WitnessStatus> {
         let witness_path = self
             .witness_dir
-            .join(self.witness_file_name(block_number, block_hash));
+            .join(format!("{block_number}.{block_hash}.w"));
         let backup_path = self.backup_file_path(block_number, block_hash, ".w");
 
         load_binary_data(witness_path, backup_path, block_number, block_hash)
@@ -286,9 +263,7 @@ impl ValidationManager {
     ///
     /// Loads witness status from file or returns default idle status if file doesn't exist.
     pub fn get_witness_state(&self, block: &(BlockNumber, BlockHash)) -> Result<WitnessStatus> {
-        let path = self
-            .witness_dir
-            .join(self.witness_file_name(block.0, block.1));
+        let path = self.witness_dir.join(format!("{}.{}.w", block.0, block.1));
         if !path.exists() {
             return Ok(WitnessStatus {
                 status: SaltWitnessState::Idle,
@@ -476,31 +451,6 @@ impl ValidationManager {
             block_hash,
             ext
         ))
-    }
-
-    /// Generate backup directory path for a block range
-    ///
-    /// Creates the backup directory path based on shifted block numbers,
-    /// used to organize backup files hierarchically.
-    ///
-    /// # Arguments
-    /// * `block_num` - The block number to generate directory path for
-    ///
-    /// # Returns
-    /// Backup directory path relative to the base path
-    ///
-    /// # Example
-    /// ```rust
-    /// use validator_core::ValidationManager;
-    /// use std::path::Path;
-    ///
-    /// let mgr = ValidationManager::new(Path::new("/data"));
-    /// let dir = mgr.backup_dir_path(1000);
-    /// assert!(dir.to_string_lossy().contains("backup"));
-    /// ```
-    pub fn backup_dir_path(&self, block_num: BlockNumber) -> PathBuf {
-        self.base_path
-            .join(format!("backup/{}", block_num >> BACKUP_SHIFT))
     }
 
     /// Retrieve blob IDs for a set of validated blocks.
@@ -794,7 +744,7 @@ mod tests {
         let block_number = 1u64;
         let block_hash = dummy_block_hash();
         let val_manager = ValidationManager::new(&path);
-        let file_name = val_manager.validate_file_name(block_number, block_hash);
+        let file_name = format!("{block_number}.{block_hash}.v");
         let file_path = validate_dir.join(&file_name);
 
         // Construct a ValidateInfo and serialize it to the file
