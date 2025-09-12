@@ -6,6 +6,7 @@ use jsonrpsee::{
     RpcModule,
     server::{ServerBuilder, ServerConfigBuilder},
 };
+use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject};
 use revm::{
     primitives::{B256, HashMap, KECCAK_EMPTY},
     state::Bytecode,
@@ -85,7 +86,7 @@ async fn main() -> Result<()> {
     let work_dir = PathBuf::from(args.datadir);
 
     let client = Arc::new(RpcClient::new(&args.api)?);
-    let val_manager = ValidationManager::new(&work_dir);
+    let val_manager = ValidationManager::new(work_dir.join("validation.redb"))?;
 
     // fetch the latest finalized block number.
     let chain_status = val_manager.get_chain_status()?;
@@ -106,13 +107,19 @@ async fn main() -> Result<()> {
 
         module.register_method("stateless_getValidation", |params, path, _| {
             let blocks: Vec<String> = params.parse()?;
-            let val_manager = ValidationManager::new(path);
+            let val_manager =
+                ValidationManager::new(path.join("validation.redb")).map_err(|e| {
+                    ErrorObject::owned(CALL_EXECUTION_FAILED_CODE, e.to_string(), None::<()>)
+                })?;
             val_manager.get_blob_ids(blocks)
         })?;
 
         module.register_method("stateless_getWitness", |params, path, _| {
             let block_info: String = params.parse()?;
-            let val_manager = ValidationManager::new(path);
+            let val_manager =
+                ValidationManager::new(path.join("validation.redb")).map_err(|e| {
+                    ErrorObject::owned(CALL_EXECUTION_FAILED_CODE, e.to_string(), None::<()>)
+                })?;
             val_manager.get_witness(block_info)
         })?;
 
@@ -121,7 +128,7 @@ async fn main() -> Result<()> {
             .build();
         let server = ServerBuilder::default()
             .set_config(cfg)
-            .build(format!("0.0.0.0:{}", port))
+            .build(format!("0.0.0.0:{port}"))
             .await?;
 
         let addr = server.local_addr()?.to_string();
@@ -193,7 +200,8 @@ async fn scan_and_validate(
                         "Failed to validate block {}: {:?}, try block({}) again",
                         block_counter, e, block_counter
                     );
-                    let val_manager = ValidationManager::new(&stateless_dir);
+                    let val_manager =
+                        ValidationManager::new(stateless_dir.join("validation.redb")).unwrap();
                     let chain_status = val_manager.get_chain_status().unwrap_or_default();
                     if block_counter <= chain_status.block_number {
                         info!(
@@ -230,8 +238,8 @@ async fn validate_block(
     lock_time: u64,
     contracts: Arc<Mutex<HashMap<B256, Bytecode>>>,
 ) -> Result<()> {
-    // Create ValidationManager for handling block-related file operations
-    let val_manager = ValidationManager::new(stateless_dir);
+    // Create ValidationManager for handling block-related database operations
+    let val_manager = ValidationManager::new(stateless_dir.join("validation.redb"))?;
 
     info!("Processing block: {}", block_counter);
 
@@ -241,6 +249,7 @@ async fn validate_block(
             Ok(hashes) => hashes,
             Err(_e) => {
                 // Witness for block_counter not found, waiting...
+                info!("Witness for block {} not found, waiting...", block_counter);
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
@@ -303,7 +312,7 @@ async fn validate_block(
                             &witness_bytes_clone,
                             bincode::config::legacy(),
                         )
-                        .map_err(|e| anyhow!("Failed to parse witness: {}", e))
+                        .map_err(|e| anyhow!("Failed to parse witness: {e}"))
                     })
                 )
             };
@@ -363,12 +372,12 @@ async fn validate_block(
 
             let state_updates = EphemeralSaltState::new(&block_witness)
                 .update(&kv_updates)
-                .map_err(|e| anyhow!("Failed to update state: {}", e))?;
+                .map_err(|e| anyhow!("Failed to update state: {e}"))?;
 
             let mut trie = StateRoot::new(&block_witness);
             let (new_trie_root, _trie_updates) = trie
                 .update_fin(state_updates)
-                .map_err(|e| anyhow!("Failed to update trie: {}", e))?;
+                .map_err(|e| anyhow!("Failed to update trie: {e}"))?;
 
             if new_trie_root != new_state_root {
                 error!(
@@ -449,9 +458,9 @@ fn extract_contract_codes(salt_witness: &SaltWitness) -> Vec<(Address, B256)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::BlockHash;
     use alloy_rpc_types_eth::Block;
     use eyre::Context;
-    use fs_extra::dir;
     use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned};
     use op_alloy_rpc_types::Transaction;
     use serde::de::DeserializeOwned;
@@ -459,6 +468,7 @@ mod tests {
         fs::File,
         io::{BufRead, BufReader},
     };
+    use validator_core::{WitnessStatus, deserialized_state_data};
 
     /// Directory containing test block data files for mock RPC server.
     ///
@@ -484,19 +494,61 @@ mod tests {
         Number(u64),
     }
 
-    /// Set up a temporary work directory and copy test data into it.
+    /// Set up a temporary work directory and populate our database with test data.
     /// Return the path to the work directory.
     fn setup_work_dir() -> Result<PathBuf> {
         let temp_dir = tempfile::tempdir()
-            .map_err(|e| anyhow!("Failed to create temporary directory: {}", e))?;
-
-        let data_dir = PathBuf::from("../../test_data/stateless");
+            .map_err(|e| anyhow!("Failed to create temporary directory: {e}"))?;
         let work_dir = temp_dir.path().to_path_buf();
 
-        let mut options = dir::CopyOptions::new();
-        options.content_only = true;
-        dir::copy(&data_dir, &work_dir, &options)
-            .map_err(|e| anyhow!("Failed to copy test data: {}", e))?;
+        // Create ValidationManager with database
+        let db_path = work_dir.join("validation.redb");
+        let val_manager = ValidationManager::new(&db_path)?;
+
+        // Load witness files and populate database
+        let test_witness_dir = PathBuf::from("../../test_data/stateless/witness");
+        if test_witness_dir.exists() {
+            for entry in std::fs::read_dir(&test_witness_dir)
+                .map_err(|e| anyhow!("Failed to read test witness directory: {e}"))?
+            {
+                let entry = entry?;
+                let file_path = entry.path();
+                if file_path.extension().and_then(|s| s.to_str()) == Some("w") {
+                    // Parse filename for block info
+                    let filename = file_path.file_name().unwrap().to_str().unwrap();
+                    let (block_number, block_hash) = ValidationManager::parse_filename(filename);
+
+                    if block_number == 0 && block_hash == BlockHash::ZERO {
+                        continue; // Skip invalid files
+                    }
+
+                    // Read and deserialize witness file
+                    let file_data = std::fs::read(&file_path)?;
+                    let state_data = deserialized_state_data(file_data).map_err(|e| {
+                        anyhow!("Failed to deserialize state data from {filename}: {e}")
+                    })?;
+
+                    let (witness_status, _): (WitnessStatus, usize) =
+                        bincode::serde::decode_from_slice(
+                            &state_data.data,
+                            bincode::config::legacy(),
+                        )
+                        .map_err(|e| {
+                            anyhow!("Failed to deserialize WitnessStatus from {filename}: {e}")
+                        })?;
+
+                    // Add to database using network-style interface
+                    val_manager.add_new_block(
+                        block_number,
+                        block_hash,
+                        witness_status.parent_hash,
+                        witness_status.pre_state_root,
+                        witness_status.witness_data,
+                        witness_status.blob_ids,
+                    )?;
+                }
+            }
+        }
 
         // Keep the temp dir alive by leaking it. OS will clean it when test process ends.
         std::mem::forget(temp_dir);
@@ -553,9 +605,9 @@ mod tests {
     fn load_json<T: DeserializeOwned>(file_path: impl AsRef<Path>) -> Result<T> {
         let path = file_path.as_ref();
         let contents = std::fs::read(path)
-            .with_context(|| format!("Failed to read file {}", path.display()))?;
+            .with_context(|| format!("Failed to read file {path}", path = path.display()))?;
         serde_json::from_slice(&contents)
-            .with_context(|| format!("Failed to parse JSON from {}", path.display()))
+            .with_context(|| format!("Failed to parse JSON from {path}", path = path.display()))
     }
 
     /// Loads a block from test data files for mock RPC server responses.
@@ -593,7 +645,7 @@ mod tests {
 
         // Find and load the matching file
         std::fs::read_dir(TEST_BLOCK_DIR)
-            .map_err(|e| to_rpc_error(format!("Failed to read directory: {}", e)))?
+            .map_err(|e| to_rpc_error(format!("Failed to read directory: {e}")))?
             .find_map(|entry| {
                 let file = entry.ok()?;
                 let file_name = file.file_name();

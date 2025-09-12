@@ -23,6 +23,7 @@ clap.workspace = true
 eyre.workspace = true
 futures.workspace = true
 jsonrpsee.workspace = true
+jsonrpsee-types.workspace = true
 num_cpus.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -34,4 +35,3 @@ validator-core = { path = "../../validator-core" }
 [dev-dependencies]
 jsonrpsee-types.workspace = true
 tempfile = "3.8"
-fs_extra = "1.3"

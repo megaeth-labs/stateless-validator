@@ -54,7 +54,7 @@ fn format_state(state: &SaltWitnessState) -> String {
 }
 
 fn format_hash(hash: &B256) -> String {
-    format!("0x{}", hex::encode(hash.as_slice()))
+    format!("0x{hex_hash}", hex_hash = hex::encode(hash.as_slice()))
 }
 
 fn decode_witness_file(
@@ -62,16 +62,24 @@ fn decode_witness_file(
     verify_hash: bool,
     hex_dump_bytes: usize,
 ) -> Result<WitnessInfo> {
-    let mut file = File::open(file_path)
-        .map_err(|e| anyhow!("Failed to open file {}: {}", file_path.display(), e))?;
+    let mut file = File::open(file_path).map_err(|e| {
+        anyhow!(
+            "Failed to open file {path}: {e}",
+            path = file_path.display()
+        )
+    })?;
 
     let mut contents = Vec::new();
-    file.read_to_end(&mut contents)
-        .map_err(|e| anyhow!("Failed to read file {}: {}", file_path.display(), e))?;
+    file.read_to_end(&mut contents).map_err(|e| {
+        anyhow!(
+            "Failed to read file {path}: {e}",
+            path = file_path.display()
+        )
+    })?;
 
     // Deserialize the outer StateData structure
     let state_data = deserialized_state_data(contents)
-        .map_err(|e| anyhow!("Failed to deserialize state data: {}", e))?;
+        .map_err(|e| anyhow!("Failed to deserialize state data: {e}"))?;
 
     // Verify hash if requested
     let hash_verified = if verify_hash {
@@ -86,7 +94,7 @@ fn decode_witness_file(
     // Deserialize the inner WitnessStatus structure
     let (witness_status, _): (WitnessStatus, usize) =
         bincode::serde::decode_from_slice(&state_data.data, bincode::config::legacy())
-            .map_err(|e| anyhow!("Failed to deserialize witness status: {}", e))?;
+            .map_err(|e| anyhow!("Failed to deserialize witness status: {e}"))?;
 
     // Extract file name info
     let file_name = file_path
@@ -117,7 +125,7 @@ fn decode_witness_file(
         blob_ids: witness_status
             .blob_ids
             .iter()
-            .map(|blob_id| format!("0x{}", hex::encode(blob_id)))
+            .map(|blob_id| format!("0x{blob_hex}", blob_hex = hex::encode(blob_id)))
             .collect(),
         witness_data_size: witness_status.witness_data.len(),
         witness_data_hex,
