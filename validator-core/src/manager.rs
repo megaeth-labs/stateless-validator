@@ -145,21 +145,13 @@ impl ValidationManager {
         let read_txn = self.database.begin_read()?;
         let table = read_txn.open_table(VALIDATE_TABLE)?;
 
-        let key = (block_number, block_hash.0);
-        match table.get(key)? {
+        match table.get((block_number, block_hash.0))? {
             Some(guard) => {
-                let data = guard.value().to_vec();
-                let state_data = deserialized_state_data(data)
+                let state_data = deserialized_state_data(guard.value().to_vec())
                     .map_err(|e| anyhow!("block({block_number}): {}", e))?;
-
                 let (validate_info, _): (ValidateInfo, usize) =
                     bincode::serde::decode_from_slice(&state_data.data, bincode::config::legacy())
-                        .map_err(|e| {
-                            anyhow!(
-                                "block({block_number}, {block_hash}): Failed to deserialize ValidateInfo: {}",
-                                e
-                            )
-                        })?;
+                        .map_err(|e| anyhow!("block({block_number}, {block_hash}): Failed to deserialize ValidateInfo: {}", e))?;
                 Ok(validate_info)
             }
             None => Ok(ValidateInfo::default()),
@@ -179,31 +171,26 @@ impl ValidationManager {
         lock_time: Option<u64>,
         blob_ids: Option<Vec<[u8; 32]>>,
     ) -> Result<()> {
-        let mut validate_info = self.load_validate_info(block_number, block_hash)?;
-        validate_info.status = status;
-        validate_info.block_hash = block_hash;
-        validate_info.block_number = block_number;
-        if let Some(lock_time) = lock_time {
-            validate_info.lock_time = curent_time_to_u64() + lock_time;
-        }
-        if let Some(state_root) = state_root {
-            validate_info.state_root = state_root;
-        }
-        if let Some(blob_ids) = blob_ids {
-            validate_info.blob_ids = blob_ids;
-        }
+        let validate_info = ValidateInfo {
+            status,
+            block_hash,
+            block_number,
+            state_root: state_root.unwrap_or_default(),
+            lock_time: lock_time.map_or(0, |t| curent_time_to_u64() + t),
+            blob_ids: blob_ids.unwrap_or_default(),
+        };
 
-        let serialized = bincode::serde::encode_to_vec(&validate_info, bincode::config::legacy())?;
-        let serialized = serialized_state_data(serialized)?;
+        let serialized = serialized_state_data(bincode::serde::encode_to_vec(
+            &validate_info,
+            bincode::config::legacy(),
+        )?)?;
 
         let write_txn = self.database.begin_write()?;
         {
             let mut table = write_txn.open_table(VALIDATE_TABLE)?;
-            let key = (block_number, block_hash.0);
-            table.insert(key, serialized)?;
+            table.insert((block_number, block_hash.0), serialized)?;
         }
         write_txn.commit()?;
-
         Ok(())
     }
 
@@ -216,21 +203,13 @@ impl ValidationManager {
         let read_txn = self.database.begin_read()?;
         let table = read_txn.open_table(WITNESS_TABLE)?;
 
-        let key = (block_number, block_hash.0);
-        match table.get(key)? {
+        match table.get((block_number, block_hash.0))? {
             Some(guard) => {
-                let data = guard.value().to_vec();
-                let state_data = deserialized_state_data(data)
+                let state_data = deserialized_state_data(guard.value().to_vec())
                     .map_err(|e| anyhow!("block({block_number}): {}", e))?;
-
                 let (witness_status, _): (WitnessStatus, usize) =
                     bincode::serde::decode_from_slice(&state_data.data, bincode::config::legacy())
-                        .map_err(|e| {
-                            anyhow!(
-                                "block({block_number}, {block_hash}): Failed to deserialize WitnessStatus: {}",
-                                e
-                            )
-                        })?;
+                        .map_err(|e| anyhow!("block({block_number}, {block_hash}): Failed to deserialize WitnessStatus: {}", e))?;
                 Ok(witness_status)
             }
             None => Err(anyhow!(
@@ -246,17 +225,17 @@ impl ValidationManager {
         block_hash: BlockHash,
         witness_status: &WitnessStatus,
     ) -> Result<()> {
-        let serialized = bincode::serde::encode_to_vec(witness_status, bincode::config::legacy())?;
-        let serialized = serialized_state_data(serialized)?;
+        let serialized = serialized_state_data(bincode::serde::encode_to_vec(
+            witness_status,
+            bincode::config::legacy(),
+        )?)?;
 
         let write_txn = self.database.begin_write()?;
         {
             let mut table = write_txn.open_table(WITNESS_TABLE)?;
-            let key = (block_number, block_hash.0);
-            table.insert(key, serialized)?;
+            table.insert((block_number, block_hash.0), serialized)?;
         }
         write_txn.commit()?;
-
         Ok(())
     }
 
@@ -264,9 +243,8 @@ impl ValidationManager {
     ///
     /// Loads witness status from database or returns default idle status if record doesn't exist.
     pub fn get_witness_state(&self, block: &(BlockNumber, BlockHash)) -> Result<WitnessStatus> {
-        match self.load_witness_status(block.0, block.1) {
-            Ok(witness_status) => Ok(witness_status),
-            Err(_) => Ok(WitnessStatus {
+        self.load_witness_status(block.0, block.1).or_else(|_| {
+            Ok(WitnessStatus {
                 status: SaltWitnessState::Idle,
                 block_hash: block.1,
                 block_number: block.0,
@@ -275,8 +253,8 @@ impl ValidationManager {
                 lock_time: curent_time_to_u64(),
                 blob_ids: vec![],
                 witness_data: vec![],
-            }),
-        }
+            })
+        })
     }
 
     /// Reads the block hashes for a given block number from the witness table.
@@ -317,11 +295,7 @@ impl ValidationManager {
         let table = read_txn.open_table(CHAIN_STATUS_TABLE)?;
 
         match table.get("current")? {
-            Some(guard) => {
-                let data = guard.value().to_vec();
-                let chain_status: ChainStatus = serde_json::from_slice(&data)?;
-                Ok(chain_status)
-            }
+            Some(guard) => Ok(serde_json::from_slice(&guard.value())?),
             None => Ok(ChainStatus::default()),
         }
     }
@@ -330,15 +304,12 @@ impl ValidationManager {
     ///
     /// Saves chain status to the chain status table.
     pub fn set_chain_status(&self, chain_status: &ChainStatus) -> Result<()> {
-        let serialized = serde_json::to_vec(chain_status)?;
-
         let write_txn = self.database.begin_write()?;
         {
             let mut table = write_txn.open_table(CHAIN_STATUS_TABLE)?;
-            table.insert("current", serialized)?;
+            table.insert("current", serde_json::to_vec(chain_status)?)?;
         }
         write_txn.commit()?;
-
         Ok(())
     }
 
@@ -355,20 +326,20 @@ impl ValidationManager {
         witness_data: Vec<u8>,
         blob_ids: Vec<[u8; 32]>,
     ) -> Result<()> {
-        // Create WitnessStatus with provided data
-        let witness_status = WitnessStatus {
-            status: SaltWitnessState::Completed, // Mark as ready for validation
-            block_hash,
+        self.save_witness_status(
             block_number,
-            parent_hash,
-            pre_state_root,
-            lock_time: curent_time_to_u64(),
-            blob_ids,
-            witness_data,
-        };
-
-        // Save to database using existing method
-        self.save_witness_status(block_number, block_hash, &witness_status)
+            block_hash,
+            &WitnessStatus {
+                status: SaltWitnessState::Completed,
+                block_hash,
+                block_number,
+                parent_hash,
+                pre_state_root,
+                lock_time: curent_time_to_u64(),
+                blob_ids,
+                witness_data,
+            },
+        )
     }
 
     /// Parse block number and hash from witness file name
@@ -377,30 +348,22 @@ impl ValidationManager {
     pub fn parse_filename(filename: &str) -> (BlockNumber, BlockHash) {
         let parts: Vec<&str> = filename.split('.').collect();
 
-        // Extract block number from first part
         let block_number = parts
             .first()
             .and_then(|s| s.parse::<BlockNumber>().ok())
             .unwrap_or(0);
 
-        // Extract block hash from second part
-        let block_hash = if let Some(hash_str) = parts.get(1) {
-            // Try to decode hex string, handling both with and without 0x prefix
-            let hash_bytes = if let Some(stripped) = hash_str.strip_prefix("0x") {
-                hex::decode(stripped).unwrap_or_default()
-            } else {
-                hex::decode(hash_str).unwrap_or_default()
-            };
-
-            // Return zero hash if decoding failed or wrong length
-            if hash_bytes.len() != 32 {
-                BlockHash::ZERO
-            } else {
-                BlockHash::from_slice(&hash_bytes)
-            }
-        } else {
-            BlockHash::ZERO
-        };
+        let block_hash = parts
+            .get(1)
+            .and_then(|hash_str| {
+                let hash_bytes = if let Some(stripped) = hash_str.strip_prefix("0x") {
+                    hex::decode(stripped).ok()?
+                } else {
+                    hex::decode(hash_str).ok()?
+                };
+                (hash_bytes.len() == 32).then(|| BlockHash::from_slice(&hash_bytes))
+            })
+            .unwrap_or(BlockHash::ZERO);
 
         (block_number, block_hash)
     }
@@ -504,7 +467,6 @@ impl ValidationManager {
                     )
                 })?;
             if witness.parent_hash == parent_hash {
-                // Return the witness data as a hex-encoded string
                 return Ok(hex::encode(&witness.witness_data));
             }
         }
@@ -540,9 +502,10 @@ impl ValidationManager {
 pub fn serialized_state_data(data: Vec<u8>) -> std::io::Result<Vec<u8>> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&data);
-    let hash = B256::from_slice(hasher.finalize().as_bytes());
-
-    let state_data = StateData { hash, data };
+    let state_data = StateData {
+        hash: B256::from_slice(hasher.finalize().as_bytes()),
+        data,
+    };
     bincode::serde::encode_to_vec(&state_data, bincode::config::legacy()).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -578,18 +541,16 @@ pub fn serialized_state_data(data: Vec<u8>) -> std::io::Result<Vec<u8>> {
 /// # Ok::<(), std::io::Error>(())
 /// ```
 pub fn deserialized_state_data(data: Vec<u8>) -> std::io::Result<StateData> {
-    let deserialized: (StateData, usize) =
+    let (state_data, _): (StateData, usize) =
         bincode::serde::decode_from_slice(&data, bincode::config::legacy()).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Failed to deserialize state data: {}", e),
             )
         })?;
-    let state_data = deserialized.0;
     let mut hasher = blake3::Hasher::new();
     hasher.update(&state_data.data);
-    let hash = B256::from_slice(hasher.finalize().as_bytes());
-    if state_data.hash != hash {
+    if state_data.hash != B256::from_slice(hasher.finalize().as_bytes()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "Hash mismatch",
