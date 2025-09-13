@@ -5,10 +5,8 @@ use alloy_evm::{
     EvmEnv, EvmFactory as AlloyEvmFactory,
     block::{BlockExecutor, BlockExecutorFactory as AlloyBlockExecutorFactory},
 };
-use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition};
 use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
-use alloy_op_hardforks::{OpHardfork, OpHardforks};
 use alloy_rpc_types_eth::{Block, BlockTransactions};
 use mega_evm::{BlockExecutionCtx, BlockExecutorFactory, EvmFactory, SpecId};
 use op_alloy_rpc_types::Transaction as OpTransaction;
@@ -26,6 +24,7 @@ use thiserror::Error;
 use crate::{
     data_types::{Account, PlainKey, PlainValue},
     database::WitnessDatabase,
+    hardfork::ChainSpec,
 };
 
 /// Errors that can occur during block validation.
@@ -103,7 +102,7 @@ fn replay_block(
         extra_data: block.header.extra_data.clone(),
     };
 
-    let evm_env = EvmEnv::new(get_evm_config(), get_block_env(block));
+    let evm_env = create_evm_env(block);
 
     let mut l1_block_info = L1BlockInfo::default();
     l1_block_info.operator_fee_scalar = Some(U256::ZERO);
@@ -164,20 +163,17 @@ fn replay_block(
     Ok(kv_updates)
 }
 
-/// Creates a `revm::primitives::BlockEnv` from an `alloy_rpc_types_eth::Block`.
+/// Creates an EvmEnv with Optimism-specific configurations for the given block.
 ///
-/// This function extracts necessary header information from the RPC block type
-/// and populates a `BlockEnv` structure, which is used by REVM to set the
-/// context for block execution.
-///
-/// # Arguments
-///
-/// * `block` - A reference to the `Block` object from which to derive the `BlockEnv`.
-///
-/// # Returns
-///
-/// Creates a BlockEnv from the given block header information.
-fn get_block_env(block: &Block<OpTransaction>) -> BlockEnv {
+/// This combines both the CfgEnv (chain configuration) and BlockEnv (block-specific data)
+/// into a single EvmEnv ready for use with REVM execution.
+fn create_evm_env(block: &Block<OpTransaction>) -> EvmEnv<SpecId> {
+    // Create CfgEnv with Optimism configurations
+    let mut cfg_env = CfgEnv::new_with_spec(SpecId::EQUIVALENCE);
+    cfg_env.chain_id = CHAIN_ID;
+    cfg_env.memory_limit = MEMORY_LIMIT;
+
+    // Create BlockEnv from block header
     let header = &block.header;
     let mut block_env = BlockEnv {
         number: U256::from(header.number),
@@ -194,17 +190,7 @@ fn get_block_env(block: &Block<OpTransaction>) -> BlockEnv {
         block_env.set_blob_excess_gas_and_price(excess_blob_gas, BLOB_GASPRICE_UPDATE_FRACTION);
     }
 
-    block_env
-}
-
-/// Creates a CfgEnv with specific Optimism configurations.
-/// The configuration values (e.g., chain_id, memory_limit, spec_id) are
-/// typically derived from sequencer logs or chain specifications.
-fn get_evm_config() -> CfgEnv<SpecId> {
-    let mut cfg_env = CfgEnv::new_with_spec(SpecId::EQUIVALENCE);
-    cfg_env.chain_id = CHAIN_ID;
-    cfg_env.memory_limit = MEMORY_LIMIT;
-    cfg_env
+    EvmEnv::new(cfg_env, block_env)
 }
 
 /// Validates a block by creating a witness, replaying transactions, and comparing state roots.
@@ -264,30 +250,5 @@ pub fn validate_block(
             computed: state_root,
             claimed: block.header.state_root,
         }),
-    }
-}
-
-#[derive(Default, Clone, Copy)]
-struct ChainSpec;
-
-impl EthereumHardforks for ChainSpec {
-    fn ethereum_fork_activation(&self, fork: EthereumHardfork) -> ForkCondition {
-        use EthereumHardfork::*;
-        match fork {
-            Shanghai | Cancun | Prague => ForkCondition::Timestamp(0),
-            Osaka => ForkCondition::Never,
-            _ => ForkCondition::Block(0),
-        }
-    }
-}
-
-impl OpHardforks for ChainSpec {
-    fn op_fork_activation(&self, fork: OpHardfork) -> ForkCondition {
-        use OpHardfork::*;
-        match fork {
-            Bedrock => ForkCondition::Block(0),
-            Interop => ForkCondition::Never,
-            _ => ForkCondition::Timestamp(0),
-        }
     }
 }

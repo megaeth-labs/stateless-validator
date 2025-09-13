@@ -37,6 +37,7 @@
 //! ```
 
 mod database;
+mod hardfork;
 pub mod validator_db;
 pub use validator_db::{
     SaltWitnessState, ValidateStatus, ValidatorDB, WitnessStatus, curent_time_to_u64,
