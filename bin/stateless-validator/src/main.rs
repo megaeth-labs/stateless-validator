@@ -6,6 +6,7 @@ use jsonrpsee::{
     RpcModule,
     server::{ServerBuilder, ServerConfigBuilder},
 };
+use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, INVALID_PARAMS_CODE};
 use revm::{
     primitives::{B256, HashMap, KECCAK_EMPTY},
     state::Bytecode,
@@ -108,27 +109,17 @@ async fn main() -> Result<()> {
         let mut module = RpcModule::new(validator_db.clone());
 
         module.register_method("stateless_getValidation", |params, validator_db, _| {
-            let (block_number, block_hash): (u64, String) = params.parse()?;
-            let block_hash = parse_block_hash(&block_hash).map_err(|e| {
-                jsonrpsee_types::error::ErrorObject::owned(
-                    jsonrpsee_types::error::INVALID_PARAMS_CODE,
-                    format!("Invalid block hash: {}", e),
-                    None::<()>,
-                )
-            })?;
-            validator_db.get_blob_ids(block_number, block_hash)
-        })?;
+            // Helper function to create RPC errors
+            let make_rpc_error = |code, msg: String| ErrorObject::owned(code, msg, None::<()>);
 
-        module.register_method("stateless_getWitness", |params, validator_db, _| {
             let (block_number, block_hash): (u64, String) = params.parse()?;
             let block_hash = parse_block_hash(&block_hash).map_err(|e| {
-                jsonrpsee_types::error::ErrorObject::owned(
-                    jsonrpsee_types::error::INVALID_PARAMS_CODE,
-                    format!("Invalid block hash: {}", e),
-                    None::<()>,
-                )
+                make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid block hash: {e}"))
             })?;
-            validator_db.get_witness(block_number, block_hash)
+
+            validator_db
+                .get_validation_result(block_number, block_hash)
+                .map_err(|e| make_rpc_error(CALL_EXECUTION_FAILED_CODE, e.to_string()))
         })?;
 
         let cfg = ServerConfigBuilder::default()
@@ -313,7 +304,6 @@ async fn validate_block(
                 ValidateStatus::Processing,
                 None,
                 Some(lock_time),
-                Some(witness_status.blob_ids.clone()),
             )?;
 
             // Fetch the full block details and decode the witness concurrently.
@@ -407,7 +397,6 @@ async fn validate_block(
                     ValidateStatus::Failed,
                     Some(new_state_root),
                     None,
-                    None,
                 )?;
             } else {
                 info!(
@@ -420,7 +409,6 @@ async fn validate_block(
                     block_hash,
                     ValidateStatus::Success,
                     Some(new_state_root),
-                    None,
                     None,
                 )?;
                 return Ok(());

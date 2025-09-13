@@ -5,12 +5,8 @@
 const VALIDATE_TABLE: TableDefinition<(u64, [u8; 32]), Vec<u8>> = TableDefinition::new("validate");
 const WITNESS_TABLE: TableDefinition<(u64, [u8; 32]), Vec<u8>> = TableDefinition::new("witness");
 const CHAIN_STATUS_TABLE: TableDefinition<&str, Vec<u8>> = TableDefinition::new("chain_status");
-use alloy_primitives::{B256, BlockHash, BlockNumber, hex};
+use alloy_primitives::{B256, BlockHash, BlockNumber};
 use eyre::{Result, anyhow};
-use jsonrpsee_types::error::{
-    CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
-    UNKNOWN_ERROR_CODE,
-};
 use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
@@ -95,8 +91,6 @@ pub struct ValidateInfo {
     pub state_root: B256,
     /// A timestamp indicating when a processing lock expires.
     pub lock_time: u64,
-    /// A list of blob IDs associated with the block's transactions.
-    pub blob_ids: Vec<[u8; 32]>,
 }
 
 /// The chain status, which contains the finalized block number, block hash
@@ -169,7 +163,6 @@ impl ValidatorDB {
         status: ValidateStatus,
         state_root: Option<B256>,
         lock_time: Option<u64>,
-        blob_ids: Option<Vec<[u8; 32]>>,
     ) -> Result<()> {
         let validate_info = ValidateInfo {
             status,
@@ -177,7 +170,6 @@ impl ValidatorDB {
             block_number,
             state_root: state_root.unwrap_or_default(),
             lock_time: lock_time.map_or(0, |t| curent_time_to_u64() + t),
-            blob_ids: blob_ids.unwrap_or_default(),
         };
 
         let serialized = serialized_state_data(bincode::serde::encode_to_vec(
@@ -342,86 +334,17 @@ impl ValidatorDB {
         )
     }
 
-    /// Retrieve blob IDs for a validated block.
+    /// Retrieve validation result for a block.
     ///
     /// This method processes a single block identifier as (BlockNumber, BlockHash),
-    /// checks its validation status from the database, and returns the associated
-    /// blob IDs if validation was successful.
-    pub fn get_blob_ids(
+    /// checks its validation status from the database, and returns the validation status.
+    pub fn get_validation_result(
         &self,
         block_number: BlockNumber,
         block_hash: BlockHash,
-    ) -> Result<Vec<B256>, ErrorObjectOwned> {
-        let validation = self
-            .load_validate_info(block_number, block_hash)
-            .map_err(|e| {
-                ErrorObject::owned(CALL_EXECUTION_FAILED_CODE, e.to_string(), None::<()>)
-            })?;
-
-        match validation.status {
-            ValidateStatus::Failed => Err(ErrorObject::owned(
-                UNKNOWN_ERROR_CODE,
-                format!("This block {block_number} validation failed"),
-                None::<()>,
-            )),
-            ValidateStatus::Idle => Err(ErrorObject::owned(
-                CALL_EXECUTION_FAILED_CODE,
-                format!("This block {block_number} is too old or not validated yet"),
-                None::<()>,
-            )),
-            ValidateStatus::Processing => Err(ErrorObject::owned(
-                CALL_EXECUTION_FAILED_CODE,
-                format!("This block {block_number} in processing"),
-                None::<()>,
-            )),
-            ValidateStatus::Success => {
-                Ok(validation.blob_ids.into_iter().map(B256::from).collect())
-            }
-        }
-    }
-
-    /// Get the witness for a block.
-    ///
-    /// This method accepts a block number and parent hash directly,
-    /// finds the corresponding witness records, and returns the witness data as a hex-encoded string.
-    pub fn get_witness(
-        &self,
-        block_number: BlockNumber,
-        parent_hash: BlockHash,
-    ) -> Result<String, ErrorObjectOwned> {
-        // Get all witness records for this block number
-        let block_hashes = self.find_block_hashes(block_number).map_err(|_| {
-            ErrorObject::owned(
-                INVALID_PARAMS_CODE,
-                format!("not found block number: {}", block_number),
-                None::<()>,
-            )
-        })?;
-
-        for block_hash in block_hashes {
-            let witness = self
-                .load_witness_status(block_number, block_hash)
-                .map_err(|e| {
-                    ErrorObject::owned(
-                        INVALID_PARAMS_CODE,
-                        format!("block {block_number} err:{e}"),
-                        None::<()>,
-                    )
-                })?;
-            if witness.parent_hash == parent_hash {
-                return Ok(hex::encode(&witness.witness_data));
-            }
-        }
-
-        Err(ErrorObject::owned(
-            INVALID_PARAMS_CODE,
-            format!(
-                "not found witness for block {}.{}",
-                block_number,
-                hex::encode(parent_hash.0)
-            ),
-            None::<()>,
-        ))
+    ) -> Result<ValidateStatus> {
+        let validation = self.load_validate_info(block_number, block_hash)?;
+        Ok(validation.status)
     }
 }
 
