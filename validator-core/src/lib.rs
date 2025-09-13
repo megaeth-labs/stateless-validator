@@ -15,12 +15,12 @@
 //! - [`database`]: Witness-backed database for REVM
 //! - [`data_types`]: EVM-specific data types and encoding utilities
 //! - [`executor`]: Block execution logic for replaying transactions
-//! - [`manager`]: Validation manager for file system storage, witness data, and backup operations
+//! - [`validator_db`]: Validator database for file system storage, witness data, and backup operations
 //!
 //! ## Example Usage
 //!
 //! ```rust,no_run
-//! use validator_core::{StateData, serialized_state_data, deserialized_state_data, ValidationManager};
+//! use validator_core::{StateData, serialized_state_data, deserialized_state_data, ValidatorDB};
 //! use std::path::Path;
 //!
 //! // Serialize data with hash verification
@@ -30,16 +30,16 @@
 //! // Deserialize and verify integrity
 //! let state_data = deserialized_state_data(serialized)?;
 //!
-//! // Use ValidationManager for file operations
-//! let file_mgr = ValidationManager::new(Path::new("/data"));
-//! let (block_num, block_hash) = ValidationManager::parse_filename("280.0xabc123.w");
+//! // Use ValidatorDB for file operations
+//! let file_mgr = ValidatorDB::new(Path::new("/data"));
+//! let (block_num, block_hash) = ValidatorDB::parse_filename("280.0xabc123.w");
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
 pub mod database;
 pub use database::*;
-pub mod manager;
-pub use manager::*;
+pub mod validator_db;
+pub use validator_db::*;
 pub mod data_types;
 pub use data_types::*;
 pub mod executor;

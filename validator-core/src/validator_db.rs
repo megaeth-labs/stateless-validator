@@ -1,7 +1,7 @@
-//! Validation manager for the stateless validator.
+//! Validator database for the stateless validator.
 //! It manages the persistence of validation status, block data, and contract code.
 
-// Table definitions for ValidationManager
+// Table definitions for ValidatorDB
 const VALIDATE_TABLE: TableDefinition<(u64, [u8; 32]), Vec<u8>> = TableDefinition::new("validate");
 const WITNESS_TABLE: TableDefinition<(u64, [u8; 32]), Vec<u8>> = TableDefinition::new("witness");
 const CHAIN_STATUS_TABLE: TableDefinition<&str, Vec<u8>> = TableDefinition::new("chain_status");
@@ -108,18 +108,18 @@ pub struct ChainStatus {
     pub block_hash: BlockHash,
 }
 
-/// Manager for validation operations using redb embedded database
+/// Database for validation operations using redb embedded database
 ///
-/// This is a redb-based version of ValidationManager that provides the same API
+/// This is a redb-based version of ValidatorDB that provides the same API
 /// but uses an embedded database instead of the filesystem for improved performance,
 /// ACID transactions, and concurrent access capabilities.
-pub struct ValidationManager {
+pub struct ValidatorDB {
     /// redb database handle
     database: Database,
 }
 
-impl ValidationManager {
-    /// Create a new ValidationManager with a redb database at the given path
+impl ValidatorDB {
+    /// Create a new ValidatorDB with a redb database at the given path
     pub fn new(db_path: impl AsRef<std::path::Path>) -> Result<Self> {
         let database = Database::create(db_path)?;
 
@@ -344,7 +344,7 @@ impl ValidationManager {
 
     /// Parse block number and hash from witness file name
     ///
-    /// This is kept as a static method for compatibility with the original ValidationManager.
+    /// This is kept as a static method for compatibility with the original ValidatorDB.
     pub fn parse_filename(filename: &str) -> (BlockNumber, BlockHash) {
         let parts: Vec<&str> = filename.split('.').collect();
 

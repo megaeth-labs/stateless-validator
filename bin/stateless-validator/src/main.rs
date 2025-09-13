@@ -6,21 +6,20 @@ use jsonrpsee::{
     RpcModule,
     server::{ServerBuilder, ServerConfigBuilder},
 };
-use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject};
 use revm::{
     primitives::{B256, HashMap, KECCAK_EMPTY},
     state::Bytecode,
 };
 use salt::{EphemeralSaltState, SaltWitness, StateRoot, Witness};
 use std::{
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::{signal, sync::Mutex};
 use tracing::{error, info};
 use validator_core::{
-    SaltWitnessState, ValidateStatus, ValidationManager, curent_time_to_u64,
+    SaltWitnessState, ValidateStatus, ValidatorDB, curent_time_to_u64,
     data_types::{PlainKey, PlainValue},
     database::WitnessDatabase,
     executor::replay_block,
@@ -32,6 +31,9 @@ use rpc::RpcClient;
 /// Maximum response body size for the RPC server.
 /// This is set to 100 MB to accommodate large block data and witness information.
 const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
+
+/// Database filename for the validator.
+const VALIDATOR_DB_FILENAME: &str = "validator.redb";
 
 // FIXME: not `rerun_block`!
 /// Command line arguments for the `rerun_block` executable.
@@ -86,41 +88,33 @@ async fn main() -> Result<()> {
     let work_dir = PathBuf::from(args.datadir);
 
     let client = Arc::new(RpcClient::new(&args.api)?);
-    let val_manager = ValidationManager::new(work_dir.join("validation.redb"))?;
+    let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
 
     // fetch the latest finalized block number.
-    let chain_status = val_manager.get_chain_status()?;
+    let chain_status = validator_db.get_chain_status()?;
     let finalized_num = chain_status.block_number;
 
     // Start validating from the block after the last finalized one.
     let block_counter = finalized_num + 1;
     let validator_logic = scan_and_validate(
         client,
-        &work_dir,
+        validator_db.clone(),
         block_counter,
         args.lock_time,
         concurrent_num,
     );
 
     if let Some(port) = args.port {
-        let mut module = RpcModule::new(work_dir.clone());
+        let mut module = RpcModule::new(validator_db.clone());
 
-        module.register_method("stateless_getValidation", |params, path, _| {
+        module.register_method("stateless_getValidation", |params, validator_db, _| {
             let blocks: Vec<String> = params.parse()?;
-            let val_manager =
-                ValidationManager::new(path.join("validation.redb")).map_err(|e| {
-                    ErrorObject::owned(CALL_EXECUTION_FAILED_CODE, e.to_string(), None::<()>)
-                })?;
-            val_manager.get_blob_ids(blocks)
+            validator_db.get_blob_ids(blocks)
         })?;
 
-        module.register_method("stateless_getWitness", |params, path, _| {
+        module.register_method("stateless_getWitness", |params, validator_db, _| {
             let block_info: String = params.parse()?;
-            let val_manager =
-                ValidationManager::new(path.join("validation.redb")).map_err(|e| {
-                    ErrorObject::owned(CALL_EXECUTION_FAILED_CODE, e.to_string(), None::<()>)
-                })?;
-            val_manager.get_witness(block_info)
+            validator_db.get_witness(block_info)
         })?;
 
         let cfg = ServerConfigBuilder::default()
@@ -165,7 +159,7 @@ async fn main() -> Result<()> {
 /// concurrently.
 async fn scan_and_validate(
     client: Arc<RpcClient>,
-    stateless_dir: &Path,
+    validator_db: Arc<ValidatorDB>,
     block_counter: u64,
     lock_time: u64,
     concurrent_num: usize,
@@ -174,13 +168,11 @@ async fn scan_and_validate(
     // Start with an empty contract cache.
     let contracts = Arc::new(Mutex::new(HashMap::default()));
 
-    let stateless_dir = stateless_dir.to_path_buf();
-
     // Create an infinite stream of block numbers to process.
     stream::iter(block_counter..)
         .for_each_concurrent(Some(concurrent_num), |block_counter| {
             let client = Arc::clone(&client);
-            let stateless_dir = stateless_dir.clone();
+            let validator_db = Arc::clone(&validator_db);
             let contracts = Arc::clone(&contracts);
 
             async move {
@@ -189,7 +181,7 @@ async fn scan_and_validate(
                 // latest finalized block.
                 while let Err(e) = validate_block(
                     client.clone(),
-                    &stateless_dir,
+                    validator_db.clone(),
                     block_counter,
                     lock_time,
                     contracts.clone(),
@@ -200,9 +192,7 @@ async fn scan_and_validate(
                         "Failed to validate block {}: {:?}, try block({}) again",
                         block_counter, e, block_counter
                     );
-                    let val_manager =
-                        ValidationManager::new(stateless_dir.join("validation.redb")).unwrap();
-                    let chain_status = val_manager.get_chain_status().unwrap_or_default();
+                    let chain_status = validator_db.get_chain_status().unwrap_or_default();
                     if block_counter <= chain_status.block_number {
                         info!(
                             "block({}) is less than finalized block({}), skipping",
@@ -233,19 +223,16 @@ async fn scan_and_validate(
 /// 8. Updates the validation status of the block.
 async fn validate_block(
     client: Arc<RpcClient>,
-    stateless_dir: &Path,
+    validator_db: Arc<ValidatorDB>,
     block_counter: u64,
     lock_time: u64,
     contracts: Arc<Mutex<HashMap<B256, Bytecode>>>,
 ) -> Result<()> {
-    // Create ValidationManager for handling block-related database operations
-    let val_manager = ValidationManager::new(stateless_dir.join("validation.redb"))?;
-
     info!("Processing block: {}", block_counter);
 
     // This loop waits for the witness for the block to be generated and available.
     loop {
-        let block_hashes = match val_manager.find_block_hashes(block_counter) {
+        let block_hashes = match validator_db.find_block_hashes(block_counter) {
             Ok(hashes) => hashes,
             Err(_e) => {
                 // Witness for block_counter not found, waiting...
@@ -256,7 +243,7 @@ async fn validate_block(
         };
 
         for block_hash in block_hashes {
-            let witness_status = val_manager.get_witness_state(&(block_counter, block_hash))?;
+            let witness_status = validator_db.get_witness_state(&(block_counter, block_hash))?;
             if matches!(
                 witness_status.status,
                 SaltWitnessState::Idle | SaltWitnessState::Processing
@@ -267,7 +254,7 @@ async fn validate_block(
                 break;
             }
 
-            let validate_info = val_manager.load_validate_info(block_counter, block_hash)?;
+            let validate_info = validator_db.load_validate_info(block_counter, block_hash)?;
             // Check if the block has already been validated or is being processed by another validator.
             match validate_info.status {
                 ValidateStatus::Success => {
@@ -292,7 +279,7 @@ async fn validate_block(
                 _ => {} // Continue with processing
             }
             // Lock the block for processing to prevent other validators from working on it.
-            val_manager.set_validate_status(
+            validator_db.set_validate_status(
                 block_counter,
                 block_hash,
                 ValidateStatus::Processing,
@@ -322,7 +309,7 @@ async fn validate_block(
 
             let old_state_root = get_root(
                 client.as_ref(),
-                &val_manager,
+                &validator_db,
                 block_counter - 1,
                 block.header.parent_hash,
             )
@@ -386,7 +373,7 @@ async fn validate_block(
                     hex::encode(new_trie_root),
                     hex::encode(new_state_root)
                 );
-                val_manager.set_validate_status(
+                validator_db.set_validate_status(
                     block_counter,
                     block_hash,
                     ValidateStatus::Failed,
@@ -400,7 +387,7 @@ async fn validate_block(
                     block_counter,
                     hex::encode(new_trie_root)
                 );
-                val_manager.set_validate_status(
+                validator_db.set_validate_status(
                     block_counter,
                     block_hash,
                     ValidateStatus::Success,
@@ -420,11 +407,11 @@ async fn validate_block(
 /// falls back to fetching the block from the RPC endpoint.
 async fn get_root(
     client: &RpcClient,
-    val_manager: &ValidationManager,
+    validator_db: &ValidatorDB,
     block_number: u64,
     block_hash: B256,
 ) -> Result<B256> {
-    let validate_info = val_manager.load_validate_info(block_number, block_hash)?;
+    let validate_info = validator_db.load_validate_info(block_number, block_hash)?;
     if validate_info.state_root.is_zero() {
         // If state root is not in our validation records, fetch from RPC.
         let block = client.block_by_number(block_number, false).await?;
@@ -458,7 +445,6 @@ fn extract_contract_codes(salt_witness: &SaltWitness) -> Vec<(Address, B256)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::BlockHash;
     use alloy_rpc_types_eth::Block;
     use eyre::Context;
     use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned};
@@ -467,6 +453,7 @@ mod tests {
     use std::{
         fs::File,
         io::{BufRead, BufReader},
+        path::Path,
     };
     use validator_core::{WitnessStatus, deserialized_state_data};
 
@@ -482,6 +469,12 @@ mod tests {
     /// in the format `[hash, bytecode]` for use in integration tests.
     const CONTRACTS_FILE: &str = "../../test_data/contracts.txt";
 
+    /// Directory containing test witness data files for integration testing.
+    ///
+    /// Files in this directory should have `.w` extension and contain serialized
+    /// WitnessStatus data with BLAKE3 hash verification.
+    const TEST_WITNESS_DIR: &str = "../../test_data/stateless/witness";
+
     /// Block identifier used to locate test block data files.
     ///
     /// This enum represents the two ways to identify a blockchain block:
@@ -494,19 +487,30 @@ mod tests {
         Number(u64),
     }
 
-    /// Set up a temporary work directory and populate our database with test data.
-    /// Return the path to the work directory.
-    fn setup_work_dir() -> Result<PathBuf> {
+    /// Creates a ValidatorDB populated with test witness data for integration testing.
+    ///
+    /// Sets up a temporary database and loads witness files from `TEST_WITNESS_DIR`
+    /// (files with `.w` extension). The temporary directory will be cleaned up
+    /// automatically after the test ends.
+    ///
+    /// # Returns
+    ///
+    /// `Arc<ValidatorDB>` - Database instance with loaded test data
+    ///
+    /// # Errors
+    ///
+    /// Returns error if directory creation, file I/O, or witness deserialization fails.
+    fn setup_test_db() -> Result<Arc<ValidatorDB>> {
         let temp_dir = tempfile::tempdir()
             .map_err(|e| anyhow!("Failed to create temporary directory: {e}"))?;
         let work_dir = temp_dir.path().to_path_buf();
 
-        // Create ValidationManager with database
-        let db_path = work_dir.join("validation.redb");
-        let val_manager = ValidationManager::new(&db_path)?;
+        // Create ValidatorDB with database
+        let db_path = work_dir.join(VALIDATOR_DB_FILENAME);
+        let validator_db = ValidatorDB::new(&db_path)?;
 
         // Load witness files and populate database
-        let test_witness_dir = PathBuf::from("../../test_data/stateless/witness");
+        let test_witness_dir = PathBuf::from(TEST_WITNESS_DIR);
         if test_witness_dir.exists() {
             for entry in std::fs::read_dir(&test_witness_dir)
                 .map_err(|e| anyhow!("Failed to read test witness directory: {e}"))?
@@ -516,11 +520,7 @@ mod tests {
                 if file_path.extension().and_then(|s| s.to_str()) == Some("w") {
                     // Parse filename for block info
                     let filename = file_path.file_name().unwrap().to_str().unwrap();
-                    let (block_number, block_hash) = ValidationManager::parse_filename(filename);
-
-                    if block_number == 0 && block_hash == BlockHash::ZERO {
-                        continue; // Skip invalid files
-                    }
+                    let (block_number, block_hash) = ValidatorDB::parse_filename(filename);
 
                     // Read and deserialize witness file
                     let file_data = std::fs::read(&file_path)?;
@@ -538,7 +538,7 @@ mod tests {
                         })?;
 
                     // Add to database using network-style interface
-                    val_manager.add_new_block(
+                    validator_db.add_new_block(
                         block_number,
                         block_hash,
                         witness_status.parent_hash,
@@ -553,7 +553,7 @@ mod tests {
         // Keep the temp dir alive by leaking it. OS will clean it when test process ends.
         std::mem::forget(temp_dir);
 
-        Ok(work_dir)
+        Ok(Arc::new(validator_db))
     }
 
     /// Set up mock RPC server and return the handle.
@@ -693,13 +693,19 @@ mod tests {
         let handle = setup_mock_rpc_server().await;
         let client = Arc::new(RpcClient::new("http://127.0.0.1:59545").unwrap());
 
-        let work_dir = setup_work_dir().unwrap();
+        let validator_db = setup_test_db().unwrap();
         let contracts = Arc::new(Mutex::new(load_contracts(&CONTRACTS_FILE)));
 
         for block_num in 3780..3801 {
-            validate_block(client.clone(), &work_dir, block_num, 5, contracts.clone())
-                .await
-                .unwrap();
+            validate_block(
+                client.clone(),
+                validator_db.clone(),
+                block_num,
+                5,
+                contracts.clone(),
+            )
+            .await
+            .unwrap();
         }
 
         handle.stop().unwrap();
