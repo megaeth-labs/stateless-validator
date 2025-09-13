@@ -1,9 +1,9 @@
-use alloy_primitives::{B256, BlockNumber};
+use alloy_primitives::{B256, BlockHash, BlockNumber, hex};
 use clap::Parser;
 use eyre::{Result, anyhow};
 use serde::Serialize;
 use std::{fs::File, io::Read, path::PathBuf};
-use validator_core::{SaltWitnessState, ValidatorDB, WitnessStatus, deserialized_state_data};
+use validator_core::{SaltWitnessState, WitnessStatus, deserialized_state_data};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about = "Decode .w witness files from the stateless validator", long_about = None)]
@@ -57,6 +57,22 @@ fn format_hash(hash: &B256) -> String {
     format!("0x{hex_hash}", hex_hash = hex::encode(hash.as_slice()))
 }
 
+fn parse_filename(filename: &str) -> Result<(BlockNumber, BlockHash)> {
+    let (block_str, hash_str) = filename
+        .split_once('.')
+        .ok_or_else(|| anyhow!("Invalid filename format: {}", filename))?;
+
+    let block_number = block_str.parse()?;
+    let hash_str = hash_str.strip_prefix("0x").unwrap_or(hash_str);
+    let hash_bytes = hex::decode(hash_str)?;
+
+    if hash_bytes.len() != 32 {
+        return Err(anyhow!("Invalid filename format: {}", filename));
+    }
+
+    Ok((block_number, BlockHash::from_slice(&hash_bytes)))
+}
+
 fn decode_witness_file(
     file_path: &PathBuf,
     verify_hash: bool,
@@ -103,7 +119,7 @@ fn decode_witness_file(
         .unwrap_or("unknown")
         .to_string();
 
-    let (file_block_number, file_block_hash) = ValidatorDB::parse_filename(&file_name);
+    let (file_block_number, file_block_hash) = parse_filename(&file_name)?;
 
     // Create hex dump if requested
     let witness_data_hex = if hex_dump_bytes > 0 {

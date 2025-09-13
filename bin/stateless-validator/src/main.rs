@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, hex};
+use alloy_primitives::{Address, BlockHash, hex};
 use clap::Parser;
 use eyre::{Result, anyhow};
 use futures::stream::{self, StreamExt};
@@ -108,13 +108,27 @@ async fn main() -> Result<()> {
         let mut module = RpcModule::new(validator_db.clone());
 
         module.register_method("stateless_getValidation", |params, validator_db, _| {
-            let blocks: Vec<String> = params.parse()?;
-            validator_db.get_blob_ids(blocks)
+            let (block_number, block_hash): (u64, String) = params.parse()?;
+            let block_hash = parse_block_hash(&block_hash).map_err(|e| {
+                jsonrpsee_types::error::ErrorObject::owned(
+                    jsonrpsee_types::error::INVALID_PARAMS_CODE,
+                    format!("Invalid block hash: {}", e),
+                    None::<()>,
+                )
+            })?;
+            validator_db.get_blob_ids(block_number, block_hash)
         })?;
 
         module.register_method("stateless_getWitness", |params, validator_db, _| {
-            let block_info: String = params.parse()?;
-            validator_db.get_witness(block_info)
+            let (block_number, block_hash): (u64, String) = params.parse()?;
+            let block_hash = parse_block_hash(&block_hash).map_err(|e| {
+                jsonrpsee_types::error::ErrorObject::owned(
+                    jsonrpsee_types::error::INVALID_PARAMS_CODE,
+                    format!("Invalid block hash: {}", e),
+                    None::<()>,
+                )
+            })?;
+            validator_db.get_witness(block_number, block_hash)
         })?;
 
         let cfg = ServerConfigBuilder::default()
@@ -153,6 +167,20 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Convert hex string to BlockHash
+///
+/// Accepts hex strings with or without "0x" prefix. Must be exactly 32 bytes when decoded.
+fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
+    let hash_bytes = hex::decode(hex_str)?;
+    if hash_bytes.len() != 32 {
+        return Err(anyhow!(
+            "Block hash must be 32 bytes, got {}",
+            hash_bytes.len()
+        ));
+    }
+    Ok(BlockHash::from_slice(&hash_bytes))
+}
+
 /// Scans for and validates block witnesses concurrently.
 ///
 /// This function creates a stream of block numbers starting from `block_counter` and processes them
@@ -164,7 +192,7 @@ async fn scan_and_validate(
     lock_time: u64,
     concurrent_num: usize,
 ) -> Result<()> {
-    // TODO: populate the initial contract cache from a redis instance
+    // TODO: populate the initial contract cache from an external db instance
     // Start with an empty contract cache.
     let contracts = Arc::new(Mutex::new(HashMap::default()));
 
@@ -445,6 +473,7 @@ fn extract_contract_codes(salt_witness: &SaltWitness) -> Vec<(Address, B256)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::BlockNumber;
     use alloy_rpc_types_eth::Block;
     use eyre::Context;
     use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned};
@@ -487,6 +516,25 @@ mod tests {
         Number(u64),
     }
 
+    /// Parse block number and hash from string
+    ///
+    /// Parses strings in the format "{block_number}.{block_hash}" where
+    /// the block hash can optionally have a "0x" prefix.
+    ///
+    /// # Arguments
+    /// * `input` - String in format "280.0xabc123def456"
+    ///
+    /// # Returns
+    /// * `Ok((BlockNumber, BlockHash))` - Successfully parsed block identifiers
+    /// * `Err(eyre::Error)` - Invalid format or malformed hash
+    fn parse_block_num_and_hash(input: &str) -> Result<(BlockNumber, BlockHash)> {
+        let (block_str, hash_str) = input
+            .split_once('.')
+            .ok_or_else(|| anyhow!("Invalid format: {input}"))?;
+
+        Ok((block_str.parse()?, parse_block_hash(hash_str)?))
+    }
+
     /// Creates a ValidatorDB populated with test witness data for integration testing.
     ///
     /// Sets up a temporary database and loads witness files from `TEST_WITNESS_DIR`
@@ -519,13 +567,13 @@ mod tests {
                 let file_path = entry.path();
                 if file_path.extension().and_then(|s| s.to_str()) == Some("w") {
                     // Parse filename for block info
-                    let filename = file_path.file_name().unwrap().to_str().unwrap();
-                    let (block_number, block_hash) = ValidatorDB::parse_filename(filename);
+                    let block_num_and_hash = file_path.file_stem().unwrap().to_str().unwrap();
+                    let (block_number, block_hash) = parse_block_num_and_hash(block_num_and_hash)?;
 
                     // Read and deserialize witness file
                     let file_data = std::fs::read(&file_path)?;
                     let state_data = deserialized_state_data(file_data).map_err(|e| {
-                        anyhow!("Failed to deserialize state data from {filename}: {e}")
+                        anyhow!("Failed to deserialize state data from {block_num_and_hash}: {e}")
                     })?;
 
                     let (witness_status, _): (WitnessStatus, usize) =
@@ -534,7 +582,9 @@ mod tests {
                             bincode::config::legacy(),
                         )
                         .map_err(|e| {
-                            anyhow!("Failed to deserialize WitnessStatus from {filename}: {e}")
+                            anyhow!(
+                                "Failed to deserialize WitnessStatus from {block_num_and_hash}: {e}"
+                            )
                         })?;
 
                     // Add to database using network-style interface

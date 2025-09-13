@@ -13,7 +13,7 @@ use jsonrpsee_types::error::{
 };
 use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap as StdHashMap, time::SystemTime};
+use std::time::SystemTime;
 
 /// Block witness Processing state
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -342,111 +342,53 @@ impl ValidatorDB {
         )
     }
 
-    /// Parse block number and hash from witness file name
+    /// Retrieve blob IDs for a validated block.
     ///
-    /// This is kept as a static method for compatibility with the original ValidatorDB.
-    pub fn parse_filename(filename: &str) -> (BlockNumber, BlockHash) {
-        let parts: Vec<&str> = filename.split('.').collect();
-
-        let block_number = parts
-            .first()
-            .and_then(|s| s.parse::<BlockNumber>().ok())
-            .unwrap_or(0);
-
-        let block_hash = parts
-            .get(1)
-            .and_then(|hash_str| {
-                let hash_bytes = if let Some(stripped) = hash_str.strip_prefix("0x") {
-                    hex::decode(stripped).ok()?
-                } else {
-                    hex::decode(hash_str).ok()?
-                };
-                (hash_bytes.len() == 32).then(|| BlockHash::from_slice(&hash_bytes))
-            })
-            .unwrap_or(BlockHash::ZERO);
-
-        (block_number, block_hash)
-    }
-
-    /// Retrieve blob IDs for a set of validated blocks.
-    ///
-    /// This method processes a list of block identifiers (formatted as `"{number}.{hash}"`),
-    /// checks their validation status from the database, and returns the associated
+    /// This method processes a single block identifier as (BlockNumber, BlockHash),
+    /// checks its validation status from the database, and returns the associated
     /// blob IDs if validation was successful.
     pub fn get_blob_ids(
         &self,
-        blocks: Vec<String>,
-    ) -> Result<StdHashMap<String, Vec<B256>>, ErrorObjectOwned> {
-        let mut results = StdHashMap::new();
+        block_number: BlockNumber,
+        block_hash: BlockHash,
+    ) -> Result<Vec<B256>, ErrorObjectOwned> {
+        let validation = self
+            .load_validate_info(block_number, block_hash)
+            .map_err(|e| {
+                ErrorObject::owned(CALL_EXECUTION_FAILED_CODE, e.to_string(), None::<()>)
+            })?;
 
-        for block in blocks {
-            let (block_number, block_hash) = Self::parse_filename(&block);
-
-            // Validate that parsing was successful (not default values)
-            if block_number == 0 && block_hash == BlockHash::ZERO {
-                return Err(ErrorObject::owned(
-                    INVALID_PARAMS_CODE,
-                    format!("invalid block identifier format: {}", block),
-                    None::<()>,
-                ));
-            }
-
-            let validation = self
-                .load_validate_info(block_number, block_hash)
-                .map_err(|e| {
-                    ErrorObject::owned(CALL_EXECUTION_FAILED_CODE, e.to_string(), None::<()>)
-                })?;
-
-            match validation.status {
-                ValidateStatus::Failed => {
-                    return Err(ErrorObject::owned(
-                        UNKNOWN_ERROR_CODE,
-                        format!("This block {block_number} validation failed"),
-                        None::<()>,
-                    ));
-                }
-                ValidateStatus::Idle => {
-                    return Err(ErrorObject::owned(
-                        CALL_EXECUTION_FAILED_CODE,
-                        format!("This block {block_number} is too old or not validated yet"),
-                        None::<()>,
-                    ));
-                }
-                ValidateStatus::Processing => {
-                    return Err(ErrorObject::owned(
-                        CALL_EXECUTION_FAILED_CODE,
-                        format!("This block {block_number} in processing"),
-                        None::<()>,
-                    ));
-                }
-                ValidateStatus::Success => {
-                    results.insert(
-                        block,
-                        validation.blob_ids.into_iter().map(B256::from).collect(),
-                    );
-                }
+        match validation.status {
+            ValidateStatus::Failed => Err(ErrorObject::owned(
+                UNKNOWN_ERROR_CODE,
+                format!("This block {block_number} validation failed"),
+                None::<()>,
+            )),
+            ValidateStatus::Idle => Err(ErrorObject::owned(
+                CALL_EXECUTION_FAILED_CODE,
+                format!("This block {block_number} is too old or not validated yet"),
+                None::<()>,
+            )),
+            ValidateStatus::Processing => Err(ErrorObject::owned(
+                CALL_EXECUTION_FAILED_CODE,
+                format!("This block {block_number} in processing"),
+                None::<()>,
+            )),
+            ValidateStatus::Success => {
+                Ok(validation.blob_ids.into_iter().map(B256::from).collect())
             }
         }
-
-        Ok(results)
     }
 
     /// Get the witness for a block.
     ///
-    /// This method parses a block identifier in the format "{number}.{parent_hash}",
+    /// This method accepts a block number and parent hash directly,
     /// finds the corresponding witness records, and returns the witness data as a hex-encoded string.
-    pub fn get_witness(&self, block_info: String) -> Result<String, ErrorObjectOwned> {
-        let (block_number, parent_hash) = Self::parse_filename(&block_info);
-
-        // Validate that parsing was successful (not default values)
-        if block_number == 0 && parent_hash == BlockHash::ZERO {
-            return Err(ErrorObject::owned(
-                INVALID_PARAMS_CODE,
-                format!("invalid block identifier format: {}", block_info),
-                None::<()>,
-            ));
-        }
-
+    pub fn get_witness(
+        &self,
+        block_number: BlockNumber,
+        parent_hash: BlockHash,
+    ) -> Result<String, ErrorObjectOwned> {
         // Get all witness records for this block number
         let block_hashes = self.find_block_hashes(block_number).map_err(|_| {
             ErrorObject::owned(
@@ -473,7 +415,11 @@ impl ValidatorDB {
 
         Err(ErrorObject::owned(
             INVALID_PARAMS_CODE,
-            format!("not found witness for block {block_info}"),
+            format!(
+                "not found witness for block {}.{}",
+                block_number,
+                hex::encode(parent_hash.0)
+            ),
             None::<()>,
         ))
     }
