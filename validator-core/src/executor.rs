@@ -9,8 +9,8 @@ use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition};
 use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_op_hardforks::{OpHardfork, OpHardforks};
+use alloy_primitives::hex;
 use alloy_rpc_types_eth::{Block, BlockTransactions};
-use eyre::{Result, eyre};
 use mega_evm::{BlockExecutionCtx, BlockExecutorFactory, EvmFactory, SpecId};
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use op_revm::L1BlockInfo;
@@ -19,12 +19,39 @@ use revm::{
     database::states::StateBuilder,
     handler::EvmTr,
     primitives::{B256, HashMap, KECCAK_EMPTY, U256},
+    state::Bytecode,
 };
+use salt::{EphemeralSaltState, SaltWitness, StateRoot, Witness};
+use thiserror::Error;
 
 use crate::{
     data_types::{Account, PlainKey, PlainValue},
     database::WitnessDatabase,
 };
+
+/// Errors that can occur during block validation.
+#[derive(Debug, Error)]
+pub enum ValidationError {
+    #[error("Witness proof verification failed: {0}")]
+    WitnessVerificationFailed(String),
+
+    #[error("Block replay failed during transaction execution: {0}")]
+    BlockReplayFailed(String),
+
+    #[error("Failed to update salt state: {0}")]
+    StateUpdateFailed(String),
+
+    #[error("Failed to update salt trie: {0}")]
+    TrieUpdateFailed(String),
+
+    #[error("State root mismatch: computed 0x{computed}, claimed 0x{claimed}")]
+    StateRootMismatch {
+        /// The computed state root from transaction execution
+        computed: String,
+        /// The claimed state root from the block header
+        claimed: String,
+    },
+}
 
 /// Chain ID for the EVM configuration
 const CHAIN_ID: u64 = 6342;
@@ -51,14 +78,16 @@ const BLOB_GASPRICE_UPDATE_FRACTION: u64 = 3338477;
 /// - Keys are encoded account addresses or storage slot identifiers
 /// - Values are encoded account data or storage values (`None` indicates deletion)
 ///
-/// Returns an `Err` if any part of the replay process fails, such as encountering wrong
-/// transaction types, issues with block data, or errors during EVM execution.
-pub fn replay_block(
-    block: Block<OpTransaction>,
+/// Returns `Err(ValidationError)` if any part of the replay process fails.
+fn replay_block(
+    block: &Block<OpTransaction>,
     db: &WitnessDatabase,
-) -> Result<HashMap<Vec<u8>, Option<Vec<u8>>>> {
+) -> Result<HashMap<Vec<u8>, Option<Vec<u8>>>, ValidationError> {
     let BlockTransactions::Full(transactions) = block.transactions.clone() else {
-        return Err(eyre!("Wrong transaction type, expected full transactions"));
+        return Err(ValidationError::BlockReplayFailed(
+            "Invalid transaction type: expected full transactions, got transaction hashes"
+                .to_string(),
+        ));
     };
 
     let mut state = StateBuilder::new().with_database_ref(db).build();
@@ -75,7 +104,7 @@ pub fn replay_block(
         extra_data: block.header.extra_data.clone(),
     };
 
-    let evm_env = EvmEnv::new(get_evm_config(), get_block_env(&block)?);
+    let evm_env = EvmEnv::new(get_evm_config(), get_block_env(block));
 
     let mut l1_block_info = L1BlockInfo::default();
     l1_block_info.operator_fee_scalar = Some(U256::ZERO);
@@ -90,20 +119,22 @@ pub fn replay_block(
 
     let mut block_executor = block_executor_factory.create_executor(evm, op_block_execution_ctx);
 
-    block_executor
-        .apply_pre_execution_changes()
-        .map_err(|e| eyre!("apply_pre_execution_changes failed: {:?}", e))?;
+    block_executor.apply_pre_execution_changes().map_err(|e| {
+        ValidationError::BlockReplayFailed(format!("Pre-execution changes failed: {:?}", e))
+    })?;
 
     for tx in transactions {
         let signer = tx.from();
         let op_tx_envelope = tx.inner.into_inner();
         let recovered = Recovered::new_unchecked(&op_tx_envelope, signer);
-        block_executor.execute_transaction(recovered)?;
+        block_executor.execute_transaction(recovered).map_err(|e| {
+            ValidationError::BlockReplayFailed(format!("Transaction execution failed: {:?}", e))
+        })?;
     }
 
-    block_executor
-        .apply_post_execution_changes()
-        .map_err(|e| eyre!("apply_post_execution_changes failed: {:?}", e))?;
+    block_executor.apply_post_execution_changes().map_err(|e| {
+        ValidationError::BlockReplayFailed(format!("Post-execution changes failed: {:?}", e))
+    })?;
 
     // Flatten REVM's CacheAccount format into plain key-value pairs
     let mut kv_updates = HashMap::default();
@@ -146,9 +177,8 @@ pub fn replay_block(
 ///
 /// # Returns
 ///
-/// Returns `Ok(BlockEnv)` if the conversion is successful.
-/// Returns an `Err` if essential block header fields like `number` are missing.
-fn get_block_env(block: &Block<OpTransaction>) -> Result<BlockEnv> {
+/// Creates a BlockEnv from the given block header information.
+fn get_block_env(block: &Block<OpTransaction>) -> BlockEnv {
     let header = &block.header;
     let mut block_env = BlockEnv {
         number: U256::from(header.number),
@@ -165,7 +195,7 @@ fn get_block_env(block: &Block<OpTransaction>) -> Result<BlockEnv> {
         block_env.set_blob_excess_gas_and_price(excess_blob_gas, BLOB_GASPRICE_UPDATE_FRACTION);
     }
 
-    Ok(block_env)
+    block_env
 }
 
 /// Creates a CfgEnv with specific Optimism configurations.
@@ -176,6 +206,73 @@ fn get_evm_config() -> CfgEnv<SpecId> {
     cfg_env.chain_id = CHAIN_ID;
     cfg_env.memory_limit = MEMORY_LIMIT;
     cfg_env
+}
+
+/// Validates a block by creating a witness, replaying transactions, and comparing state roots.
+///
+/// This function performs the core validation logic:
+/// 1. Creates a Witness from the provided SaltWitness
+/// 2. Verifies the witness proof against the old state root
+/// 3. Replays the block transactions using the witness database
+/// 4. Computes the new state root and compares it with the expected one
+///
+/// # Arguments
+///
+/// * `block` - The block to validate containing transactions and header information
+/// * `salt_witness` - The salt witness data needed for state reconstruction
+/// * `old_state_root` - The previous block's state root for proof verification
+/// * `contracts` - Contract bytecode cache for transaction execution
+///
+/// # Returns
+///
+/// Returns `Ok(())` if validation succeeds (computed state root matches expected).
+/// Returns `Err(ValidationError)` with the specific validation failure.
+pub fn validate_block(
+    block: &Block<OpTransaction>,
+    salt_witness: SaltWitness,
+    old_state_root: B256,
+    contracts: HashMap<B256, Bytecode>,
+) -> Result<(), ValidationError> {
+    let block_witness = Witness::from(salt_witness);
+
+    // Verify witness proof
+    block_witness
+        .verify(*old_state_root)
+        .map_err(|e| ValidationError::WitnessVerificationFailed(e.to_string()))?;
+
+    let witness_db = WitnessDatabase {
+        block_number: block.header.number,
+        parent_hash: block.header.parent_hash,
+        witness: block_witness.clone(),
+        contracts,
+    };
+
+    let claimed_state_root = block.header.state_root;
+
+    // Replay block transactions
+    let kv_updates = replay_block(block, &witness_db)?;
+
+    // Update ephemeral salt state
+    let state_updates = EphemeralSaltState::new(&block_witness)
+        .update(&kv_updates)
+        .map_err(|e| ValidationError::StateUpdateFailed(e.to_string()))?;
+
+    // Update state root trie
+    let mut trie = StateRoot::new(&block_witness);
+    let (computed_state_root, _) = trie
+        .update_fin(state_updates)
+        .map_err(|e| ValidationError::TrieUpdateFailed(e.to_string()))?;
+
+    // Check if computed state root matches claimed state root
+    let computed_b256 = B256::from(computed_state_root);
+    if computed_b256 == claimed_state_root {
+        Ok(())
+    } else {
+        Err(ValidationError::StateRootMismatch {
+            computed: hex::encode(computed_b256),
+            claimed: hex::encode(claimed_state_root),
+        })
+    }
 }
 
 #[derive(Default, Clone, Copy)]

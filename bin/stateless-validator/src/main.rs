@@ -11,7 +11,7 @@ use revm::{
     primitives::{B256, HashMap, KECCAK_EMPTY},
     state::Bytecode,
 };
-use salt::{EphemeralSaltState, SaltWitness, StateRoot, Witness};
+use salt::SaltWitness;
 use std::{
     path::PathBuf,
     sync::Arc,
@@ -22,8 +22,7 @@ use tracing::{error, info};
 use validator_core::{
     SaltWitnessState, ValidateStatus, ValidatorDB, curent_time_to_u64,
     data_types::{PlainKey, PlainValue},
-    database::WitnessDatabase,
-    executor::replay_block,
+    executor::validate_block,
 };
 
 mod rpc;
@@ -198,7 +197,7 @@ async fn scan_and_validate(
                 // Continuously validate blocks, retrying on failure until the block becomes stale.
                 // The loop breaks if validation succeeds or if the block is older than the
                 // latest finalized block.
-                while let Err(e) = validate_block(
+                while let Err(e) = wait_and_validate(
                     client.clone(),
                     validator_db.clone(),
                     block_counter,
@@ -240,7 +239,7 @@ async fn scan_and_validate(
 /// 6. Replays the block transactions using an in-memory DB with the witness provider.
 /// 7. Computes the new state root and compares it with the one in the block header.
 /// 8. Updates the validation status of the block.
-async fn validate_block(
+async fn wait_and_validate(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
     block_counter: u64,
@@ -323,7 +322,7 @@ async fn validate_block(
             };
 
             let block = blocks_result?;
-            let (block_witness, _size): (SaltWitness, usize) = witness_decode_result??;
+            let (salt_witness, _size): (SaltWitness, usize) = witness_decode_result??;
 
             let old_state_root = get_root(
                 client.as_ref(),
@@ -332,12 +331,8 @@ async fn validate_block(
                 block.header.parent_hash,
             )
             .await?;
-            let new_state_root = block.header.state_root;
 
-            let contract_codes = extract_contract_codes(&block_witness);
-
-            let block_witness = Witness::from(block_witness);
-            block_witness.verify(*old_state_root)?;
+            let contract_codes = extract_contract_codes(&salt_witness);
 
             let mut contracts_guard = contracts.lock().await;
 
@@ -363,55 +358,44 @@ async fn validate_block(
             }
 
             contracts_guard.extend(new_contracts.clone());
-            let contracts_for_provider = contracts_guard.clone();
+            let contracts_for_validation = contracts_guard.clone();
             drop(contracts_guard);
 
-            let witness_provider = WitnessDatabase {
-                block_number: block_counter,
-                parent_hash: block.header.parent_hash,
-                witness: block_witness.clone(),
-                contracts: contracts_for_provider,
-            };
-
-            let kv_updates = replay_block(block.clone(), &witness_provider)?;
-
-            let state_updates = EphemeralSaltState::new(&block_witness)
-                .update(&kv_updates)
-                .map_err(|e| anyhow!("Failed to update state: {e}"))?;
-
-            let mut trie = StateRoot::new(&block_witness);
-            let (new_trie_root, _trie_updates) = trie
-                .update_fin(state_updates)
-                .map_err(|e| anyhow!("Failed to update trie: {e}"))?;
-
-            if new_trie_root != new_state_root {
-                error!(
-                    "Validation FAILED for block {}. Calculated state root: 0x{}, Expected state root: 0x{}",
-                    block_counter,
-                    hex::encode(new_trie_root),
-                    hex::encode(new_state_root)
-                );
-                validator_db.set_validate_status(
-                    block_counter,
-                    block_hash,
-                    ValidateStatus::Failed,
-                    Some(new_state_root),
-                    None,
-                )?;
-            } else {
-                info!(
-                    "Validation SUCCESS for block {}. State root: 0x{}",
-                    block_counter,
-                    hex::encode(new_trie_root)
-                );
-                validator_db.set_validate_status(
-                    block_counter,
-                    block_hash,
-                    ValidateStatus::Success,
-                    Some(new_state_root),
-                    None,
-                )?;
-                return Ok(());
+            // Perform the actual block validation
+            match validate_block(
+                block.clone(),
+                salt_witness,
+                old_state_root,
+                contracts_for_validation,
+            ) {
+                Ok(()) => {
+                    info!(
+                        "Validation SUCCESS for block {}. State root: 0x{}",
+                        block_counter,
+                        hex::encode(block.header.state_root)
+                    );
+                    validator_db.set_validate_status(
+                        block_counter,
+                        block_hash,
+                        ValidateStatus::Success,
+                        Some(block.header.state_root),
+                        None,
+                    )?;
+                    return Ok(());
+                }
+                Err(validation_error) => {
+                    error!(
+                        "Validation FAILED for block {}: {}",
+                        block_counter, validation_error
+                    );
+                    validator_db.set_validate_status(
+                        block_counter,
+                        block_hash,
+                        ValidateStatus::Failed,
+                        Some(block.header.state_root),
+                        None,
+                    )?;
+                }
             }
         }
     }
@@ -735,7 +719,7 @@ mod tests {
         let contracts = Arc::new(Mutex::new(load_contracts(&CONTRACTS_FILE)));
 
         for block_num in 3780..3801 {
-            validate_block(
+            wait_and_validate(
                 client.clone(),
                 validator_db.clone(),
                 block_num,

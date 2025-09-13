@@ -43,4 +43,4 @@ pub use validator_db::*;
 pub mod data_types;
 pub use data_types::*;
 pub mod executor;
-pub use executor::*;
+pub use executor::{ValidationError, validate_block};
