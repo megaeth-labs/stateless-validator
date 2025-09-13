@@ -9,7 +9,6 @@ use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition};
 use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_op_hardforks::{OpHardfork, OpHardforks};
-use alloy_primitives::hex;
 use alloy_rpc_types_eth::{Block, BlockTransactions};
 use mega_evm::{BlockExecutionCtx, BlockExecutorFactory, EvmFactory, SpecId};
 use op_alloy_rpc_types::Transaction as OpTransaction;
@@ -44,12 +43,12 @@ pub enum ValidationError {
     #[error("Failed to update salt trie: {0}")]
     TrieUpdateFailed(String),
 
-    #[error("State root mismatch: computed 0x{computed}, claimed 0x{claimed}")]
+    #[error("State root mismatch: computed {computed}, claimed {claimed}")]
     StateRootMismatch {
         /// The computed state root from transaction execution
-        computed: String,
+        computed: B256,
         /// The claimed state root from the block header
-        claimed: String,
+        claimed: B256,
     },
 }
 
@@ -81,7 +80,7 @@ const BLOB_GASPRICE_UPDATE_FRACTION: u64 = 3338477;
 /// Returns `Err(ValidationError)` if any part of the replay process fails.
 fn replay_block(
     block: &Block<OpTransaction>,
-    db: &WitnessDatabase,
+    db: &WitnessDatabase<'_>,
 ) -> Result<HashMap<Vec<u8>, Option<Vec<u8>>>, ValidationError> {
     let BlockTransactions::Full(transactions) = block.transactions.clone() else {
         return Err(ValidationError::BlockReplayFailed(
@@ -231,47 +230,40 @@ pub fn validate_block(
     block: &Block<OpTransaction>,
     salt_witness: SaltWitness,
     old_state_root: B256,
-    contracts: HashMap<B256, Bytecode>,
+    contracts: &HashMap<B256, Bytecode>,
 ) -> Result<(), ValidationError> {
-    let block_witness = Witness::from(salt_witness);
-
-    // Verify witness proof
-    block_witness
+    // Verify witness proof against the current state root
+    let witness = Witness::from(salt_witness);
+    witness
         .verify(*old_state_root)
         .map_err(|e| ValidationError::WitnessVerificationFailed(e.to_string()))?;
 
+    // Replay block transactions
     let witness_db = WitnessDatabase {
-        block_number: block.header.number,
-        parent_hash: block.header.parent_hash,
-        witness: block_witness.clone(),
+        header: &block.header,
+        witness: &witness,
         contracts,
     };
-
-    let claimed_state_root = block.header.state_root;
-
-    // Replay block transactions
     let kv_updates = replay_block(block, &witness_db)?;
 
     // Update ephemeral salt state
-    let state_updates = EphemeralSaltState::new(&block_witness)
+    let state_updates = EphemeralSaltState::new(&witness)
         .update(&kv_updates)
         .map_err(|e| ValidationError::StateUpdateFailed(e.to_string()))?;
 
     // Update state root trie
-    let mut trie = StateRoot::new(&block_witness);
-    let (computed_state_root, _) = trie
+    let (state_root, _) = StateRoot::new(&witness)
         .update_fin(state_updates)
         .map_err(|e| ValidationError::TrieUpdateFailed(e.to_string()))?;
 
     // Check if computed state root matches claimed state root
-    let computed_b256 = B256::from(computed_state_root);
-    if computed_b256 == claimed_state_root {
-        Ok(())
-    } else {
-        Err(ValidationError::StateRootMismatch {
-            computed: hex::encode(computed_b256),
-            claimed: hex::encode(claimed_state_root),
-        })
+    let state_root = B256::from(state_root);
+    match state_root == block.header.state_root {
+        true => Ok(()),
+        false => Err(ValidationError::StateRootMismatch {
+            computed: state_root,
+            claimed: block.header.state_root,
+        }),
     }
 }
 

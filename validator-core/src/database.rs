@@ -6,7 +6,8 @@
 
 use crate::data_types::{PlainKey, PlainValue};
 use alloy_eips::eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS};
-use alloy_primitives::{Address, B256, BlockHash, BlockNumber};
+use alloy_primitives::{Address, B256};
+use alloy_rpc_types_eth::Header;
 use revm::{
     DatabaseRef,
     database::DBErrorMarker,
@@ -44,28 +45,26 @@ impl DBErrorMarker for WitnessDatabaseError {}
 /// This partial stateless approach dramatically reduces DA bandwidth compared to
 /// a pure stateless approach, while still enabling complete block validation through
 /// cryptographic proofs in the witness.
-#[derive(Debug, Clone)]
-pub struct WitnessDatabase {
-    /// The block number
-    pub block_number: BlockNumber,
-    /// The parent block hash
-    pub parent_hash: BlockHash,
+#[derive(Debug)]
+pub struct WitnessDatabase<'a> {
+    /// The block header containing number, parent hash, and other metadata
+    pub header: &'a Header,
     /// Compact witness containing state subset and cryptographic proofs
-    pub witness: Witness,
+    pub witness: &'a Witness,
     /// Contract bytecode cache, pre-populated before execution starts
-    pub contracts: HashMap<B256, Bytecode>,
+    pub contracts: &'a HashMap<B256, Bytecode>,
 }
 
-impl WitnessDatabase {
+impl<'a> WitnessDatabase<'a> {
     /// Get value from witness for the given plain key
     fn plain_value(&self, plain_key: &[u8]) -> Result<Option<Vec<u8>>, WitnessDatabaseError> {
-        EphemeralSaltState::new(&self.witness)
+        EphemeralSaltState::new(self.witness)
             .plain_value(plain_key)
             .map_err(|e| WitnessDatabaseError(e.to_string()))
     }
 }
 
-impl DatabaseRef for WitnessDatabase {
+impl<'a> DatabaseRef for WitnessDatabase<'a> {
     type Error = WitnessDatabaseError;
 
     /// Provides basic account information from the witness
@@ -135,7 +134,8 @@ impl DatabaseRef for WitnessDatabase {
     /// - The witness data is corrupted or storage lookup fails
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
         // Return error for blocks beyond EIP-2935 history window
-        if number >= self.block_number || number + (HISTORY_SERVE_WINDOW as u64) < self.block_number
+        if number >= self.header.number
+            || number + (HISTORY_SERVE_WINDOW as u64) < self.header.number
         {
             return Err(WitnessDatabaseError(format!(
                 "Block {} is outside the history serve window",
@@ -145,8 +145,8 @@ impl DatabaseRef for WitnessDatabase {
 
         // Special case: the parent block hash is not included in the witness
         // and must be read from the parent header directly.
-        if number == self.block_number - 1 {
-            return Ok(self.parent_hash);
+        if number == self.header.number - 1 {
+            return Ok(self.header.parent_hash);
         }
 
         // Look up historical block hash in EIP-2935 storage

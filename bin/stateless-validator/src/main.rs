@@ -358,16 +358,9 @@ async fn wait_and_validate(
             }
 
             contracts_guard.extend(new_contracts.clone());
-            let contracts_for_validation = contracts_guard.clone();
-            drop(contracts_guard);
 
             // Perform the actual block validation
-            match validate_block(
-                block.clone(),
-                salt_witness,
-                old_state_root,
-                contracts_for_validation,
-            ) {
+            match validate_block(&block, salt_witness, old_state_root, &contracts_guard) {
                 Ok(()) => {
                     info!(
                         "Validation SUCCESS for block {}. State root: 0x{}",
@@ -397,6 +390,7 @@ async fn wait_and_validate(
                     )?;
                 }
             }
+            drop(contracts_guard);
         }
     }
 }
