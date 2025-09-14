@@ -7,7 +7,7 @@ use alloy_evm::{
 };
 use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
-use alloy_rpc_types_eth::{Block, BlockTransactions};
+use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
 use mega_evm::{BlockExecutionCtx, BlockExecutorFactory, EvmFactory, SpecId};
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use op_revm::L1BlockInfo;
@@ -22,9 +22,9 @@ use salt::{EphemeralSaltState, SaltWitness, StateRoot, Witness};
 use thiserror::Error;
 
 use crate::{
+    chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec, MEGA_CHAIN_ID},
     data_types::{Account, PlainKey, PlainValue},
     database::WitnessDatabase,
-    hardfork::ChainSpec,
 };
 
 /// Errors that can occur during block validation.
@@ -45,21 +45,14 @@ pub enum ValidationError {
     #[error("Failed to update salt trie: {0}")]
     TrieUpdateFailed(&'static str),
 
-    #[error("State root mismatch: computed {computed}, claimed {claimed}")]
+    #[error("State root mismatch: claimed {claimed}, got {actual}")]
     StateRootMismatch {
         /// The computed state root from transaction execution
-        computed: B256,
+        actual: B256,
         /// The claimed state root from the block header
         claimed: B256,
     },
 }
-
-/// Chain ID for the EVM configuration
-const CHAIN_ID: u64 = 6342;
-/// Maximum memory limit for EVM execution (u32::MAX)
-const MEMORY_LIMIT: u64 = 4294967295;
-/// Default blob gas price update fraction for Cancun (from EIP-4844)
-const BLOB_GASPRICE_UPDATE_FRACTION: u64 = 3338477;
 
 /// Replays a block's transactions and returns state updates in plain key-value format.
 ///
@@ -102,7 +95,7 @@ fn replay_block(
         extra_data: block.header.extra_data.clone(),
     };
 
-    let evm_env = create_evm_env(block);
+    let evm_env = create_evm_env(&block.header, &ChainSpec);
 
     let mut l1_block_info = L1BlockInfo::default();
     l1_block_info.operator_fee_scalar = Some(U256::ZERO);
@@ -163,19 +156,14 @@ fn replay_block(
     Ok(kv_updates)
 }
 
-/// Creates an EvmEnv with Optimism-specific configurations for the given block.
+/// Creates an EvmEnv with Optimism-specific configurations for the given block header.
 ///
 /// This combines both the CfgEnv (chain configuration) and BlockEnv (block-specific data)
 /// into a single EvmEnv ready for use with REVM execution.
-fn create_evm_env(block: &Block<OpTransaction>) -> EvmEnv<SpecId> {
-    // Create CfgEnv with Optimism configurations
-    // FIXME: move Mega hardfork (activation) logic into hardfork.rs?
-    let mut cfg_env = CfgEnv::new_with_spec(SpecId::EQUIVALENCE);
-    cfg_env.chain_id = CHAIN_ID;
-    cfg_env.memory_limit = MEMORY_LIMIT;
+fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<SpecId> {
+    let cfg_env = CfgEnv::new_with_spec(chain_spec.spec_id_at_block(header.number))
+        .with_chain_id(MEGA_CHAIN_ID);
 
-    // Create BlockEnv from block header
-    let header = &block.header;
     let mut block_env = BlockEnv {
         number: U256::from(header.number),
         beneficiary: header.beneficiary,
@@ -187,7 +175,6 @@ fn create_evm_env(block: &Block<OpTransaction>) -> EvmEnv<SpecId> {
         blob_excess_gas_and_price: None,
     };
 
-    // FIXME: I thought op doesn't support eip 4844?!
     if let Some(excess_blob_gas) = header.excess_blob_gas {
         block_env.set_blob_excess_gas_and_price(excess_blob_gas, BLOB_GASPRICE_UPDATE_FRACTION);
     }
@@ -249,7 +236,7 @@ pub fn validate_block(
     match state_root == block.header.state_root {
         true => Ok(()),
         false => Err(ValidationError::StateRootMismatch {
-            computed: state_root,
+            actual: state_root,
             claimed: block.header.state_root,
         }),
     }
