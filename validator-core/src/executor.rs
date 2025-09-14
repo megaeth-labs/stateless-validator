@@ -1,4 +1,3 @@
-
 //! Block execution and transaction replay for stateless validation.
 //!
 //! This module provides the core execution logic for validating blocks in a stateless
@@ -173,7 +172,9 @@ fn replay_block(
     };
 
     // Create EVM with L1 block info configuration
-    let mut evm = executor_factory.evm_factory().create_evm(&mut state, evm_env);
+    let mut evm = executor_factory
+        .evm_factory()
+        .create_evm(&mut state, evm_env);
 
     // Configure L1 block info to fix operator fee expectations
     let mut l1_info = L1BlockInfo::default();

@@ -43,6 +43,8 @@ pub use validator_db::{
     SaltWitnessState, ValidateStatus, ValidatorDB, WitnessStatus, curent_time_to_u64,
     deserialized_state_data,
 };
+pub mod validator_db2;
+pub use validator_db2::{ValidationResult, ValidatorDB2};
 pub mod data_types;
 pub use data_types::{PlainKey, PlainValue};
 pub mod executor;
