@@ -31,16 +31,19 @@ use crate::{
 #[derive(Debug, Error)]
 pub enum ValidationError {
     #[error("Witness proof verification failed: {0}")]
-    WitnessVerificationFailed(String),
+    WitnessVerificationFailed(#[source] salt::ProofError),
+
+    #[error("Expecting full transaction data, only found hashes")]
+    BlockIncomplete,
 
     #[error("Block replay failed during transaction execution: {0}")]
-    BlockReplayFailed(String),
+    BlockReplayFailed(#[source] alloy_evm::block::BlockExecutionError),
 
     #[error("Failed to update salt state: {0}")]
-    StateUpdateFailed(String),
+    StateUpdateFailed(&'static str),
 
     #[error("Failed to update salt trie: {0}")]
-    TrieUpdateFailed(String),
+    TrieUpdateFailed(&'static str),
 
     #[error("State root mismatch: computed {computed}, claimed {claimed}")]
     StateRootMismatch {
@@ -82,10 +85,7 @@ fn replay_block(
     db: &WitnessDatabase<'_>,
 ) -> Result<HashMap<Vec<u8>, Option<Vec<u8>>>, ValidationError> {
     let BlockTransactions::Full(transactions) = block.transactions.clone() else {
-        return Err(ValidationError::BlockReplayFailed(
-            "Invalid transaction type: expected full transactions, got transaction hashes"
-                .to_string(),
-        ));
+        return Err(ValidationError::BlockIncomplete);
     };
 
     let mut state = StateBuilder::new().with_database_ref(db).build();
@@ -117,22 +117,22 @@ fn replay_block(
 
     let mut block_executor = block_executor_factory.create_executor(evm, op_block_execution_ctx);
 
-    block_executor.apply_pre_execution_changes().map_err(|e| {
-        ValidationError::BlockReplayFailed(format!("Pre-execution changes failed: {:?}", e))
-    })?;
+    block_executor
+        .apply_pre_execution_changes()
+        .map_err(ValidationError::BlockReplayFailed)?;
 
     for tx in transactions {
         let signer = tx.from();
         let op_tx_envelope = tx.inner.into_inner();
         let recovered = Recovered::new_unchecked(&op_tx_envelope, signer);
-        block_executor.execute_transaction(recovered).map_err(|e| {
-            ValidationError::BlockReplayFailed(format!("Transaction execution failed: {:?}", e))
-        })?;
+        block_executor
+            .execute_transaction(recovered)
+            .map_err(ValidationError::BlockReplayFailed)?;
     }
 
-    block_executor.apply_post_execution_changes().map_err(|e| {
-        ValidationError::BlockReplayFailed(format!("Post-execution changes failed: {:?}", e))
-    })?;
+    block_executor
+        .apply_post_execution_changes()
+        .map_err(ValidationError::BlockReplayFailed)?;
 
     // Flatten REVM's CacheAccount format into plain key-value pairs
     let mut kv_updates = HashMap::default();
@@ -169,6 +169,7 @@ fn replay_block(
 /// into a single EvmEnv ready for use with REVM execution.
 fn create_evm_env(block: &Block<OpTransaction>) -> EvmEnv<SpecId> {
     // Create CfgEnv with Optimism configurations
+    // FIXME: move Mega hardfork (activation) logic into hardfork.rs?
     let mut cfg_env = CfgEnv::new_with_spec(SpecId::EQUIVALENCE);
     cfg_env.chain_id = CHAIN_ID;
     cfg_env.memory_limit = MEMORY_LIMIT;
@@ -186,6 +187,7 @@ fn create_evm_env(block: &Block<OpTransaction>) -> EvmEnv<SpecId> {
         blob_excess_gas_and_price: None,
     };
 
+    // FIXME: I thought op doesn't support eip 4844?!
     if let Some(excess_blob_gas) = header.excess_blob_gas {
         block_env.set_blob_excess_gas_and_price(excess_blob_gas, BLOB_GASPRICE_UPDATE_FRACTION);
     }
@@ -222,7 +224,7 @@ pub fn validate_block(
     let witness = Witness::from(salt_witness);
     witness
         .verify(*old_state_root)
-        .map_err(|e| ValidationError::WitnessVerificationFailed(e.to_string()))?;
+        .map_err(ValidationError::WitnessVerificationFailed)?;
 
     // Replay block transactions
     let witness_db = WitnessDatabase {
@@ -235,12 +237,12 @@ pub fn validate_block(
     // Update ephemeral salt state
     let state_updates = EphemeralSaltState::new(&witness)
         .update(&kv_updates)
-        .map_err(|e| ValidationError::StateUpdateFailed(e.to_string()))?;
+        .map_err(ValidationError::StateUpdateFailed)?;
 
     // Update state root trie
     let (state_root, _) = StateRoot::new(&witness)
         .update_fin(state_updates)
-        .map_err(|e| ValidationError::TrieUpdateFailed(e.to_string()))?;
+        .map_err(ValidationError::TrieUpdateFailed)?;
 
     // Check if computed state root matches claimed state root
     let state_root = B256::from(state_root);

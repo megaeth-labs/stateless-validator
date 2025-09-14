@@ -6,6 +6,7 @@ const VALIDATE_TABLE: TableDefinition<(u64, [u8; 32]), Vec<u8>> = TableDefinitio
 const WITNESS_TABLE: TableDefinition<(u64, [u8; 32]), Vec<u8>> = TableDefinition::new("witness");
 const CHAIN_STATUS_TABLE: TableDefinition<&str, Vec<u8>> = TableDefinition::new("chain_status");
 use alloy_primitives::{B256, BlockHash, BlockNumber};
+// FIXME: remove dependency on eyre in the library crate
 use eyre::{Result, anyhow};
 use redb::{Database, ReadableDatabase, TableDefinition};
 use serde::{Deserialize, Serialize};
