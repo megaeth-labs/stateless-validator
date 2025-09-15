@@ -56,23 +56,23 @@ jobs:
         run: |
           COMMIT_ID=$(git rev-parse HEAD)
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            VERSION="${GITHUB_REF#refs/tags/}"
+            TAG="${GITHUB_REF#refs/tags/}"
           else
-            VERSION="latest"
+            TAG="latest"
           fi
-          ARTIFACT_NAME="stateless-validator-${VERSION}-${COMMIT_ID}"
           BINARY_PATH="$GITHUB_WORKSPACE/target/release/megaeth-validator"
           echo "Binary path : $BINARY_PATH"
-          echo "artifact_name=${ARTIFACT_NAME}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
           echo "binary_path=${BINARY_PATH}" >> $GITHUB_OUTPUT
+          echo "version=${COMMIT_ID}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
       # upload when tagging or trigger in web ui
-      - name: Upload Package
+      - name: Archive Binary to GCP
         if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
-        uses: ./.chain-ops/.github/actions/archive_pkg
+        uses: ./.github/actions/pkg_upload_gcp
         with:
-          url: ${{ secrets.NEXUS_URL }}
-          username: ${{ secrets.NEXUS_USER }}
-          password: ${{ secrets.NEXUS_PWD }}
-          repository: stateless-validator/release
-          artifact_name: ${{ steps.package_info.outputs.artifact_name }}
-          file_path: ${{ steps.package_info.outputs.binary_path }}
+          auth_key: ${{ secrets.GCP_AUTH_KEY }}
+          package: stateless-validator
+          path: release/${{ steps.package_info.outputs.tag }}
+          version: ${{ steps.package_info.outputs.version }}
+          source_path: ${{ steps.package_info.outputs.binary_path }}
