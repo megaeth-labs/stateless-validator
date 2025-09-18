@@ -68,6 +68,33 @@ impl RpcClient {
             .map_err(|e| eyre!("get_block_by_number at {number} failed: {e}"))
     }
 
+    /// Fetches a full block by tag (e.g., "finalized", "latest").
+    pub async fn block_by_number_tag(
+        &self,
+        tag: &str,
+        full_txs: bool,
+    ) -> Result<Block<Transaction>> {
+        let block_number_or_tag = match tag {
+            "finalized" => BlockNumberOrTag::Finalized,
+            "latest" => BlockNumberOrTag::Latest,
+            "pending" => BlockNumberOrTag::Pending,
+            "earliest" => BlockNumberOrTag::Earliest,
+            _ => return Err(eyre!("Unsupported block tag: {}", tag)),
+        };
+
+        self.fetch_block(BlockId::Number(block_number_or_tag), full_txs)
+            .await
+            .map_err(|e| eyre!("get_block_by_number_tag '{}' failed: {e}", tag))
+    }
+
+    /// Fetches the latest block number from the blockchain.
+    pub async fn block_number(&self) -> Result<u64> {
+        self.provider
+            .get_block_number()
+            .await
+            .map_err(|e| eyre!("get_block_number failed: {e}"))
+    }
+
     /// Generic helper to fetch a block by its ID (hash or number).
     async fn fetch_block(&self, block_id: BlockId, full_txs: bool) -> Result<Block<Transaction>> {
         let block_request = self.provider.get_block(block_id);

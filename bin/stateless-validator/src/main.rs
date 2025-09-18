@@ -813,8 +813,39 @@ mod tests {
         module
             .register_method("eth_getBlockByNumber", |params, _, _| {
                 let (hex_number, full_block): (String, bool) = params.parse().unwrap();
-                let number = u64::from_str_radix(&hex_number[2..], 16).unwrap_or(0);
+
+                let number = if hex_number == "finalized" {
+                    // Return the smallest block number for "finalized" tag
+                    match load_test_block_range() {
+                        Ok((min_block, _)) => min_block,
+                        Err(_) => {
+                            return Err(ErrorObject::owned(
+                                CALL_EXECUTION_FAILED_CODE,
+                                "Failed to determine block range".to_string(),
+                                None::<()>,
+                            ));
+                        }
+                    }
+                } else {
+                    // Parse hex number as before
+                    u64::from_str_radix(&hex_number[2..], 16).unwrap_or(0)
+                };
+
                 load_test_block(BlockId::Number(number), full_block)
+            })
+            .unwrap();
+
+        module
+            .register_method("eth_blockNumber", |_params, _, _| {
+                // Return the largest block number available in test data
+                match load_test_block_range() {
+                    Ok((_, max_block)) => Ok(format!("0x{:x}", max_block)),
+                    Err(e) => Err(ErrorObject::owned(
+                        CALL_EXECUTION_FAILED_CODE,
+                        format!("Failed to determine block range: {}", e),
+                        None::<()>,
+                    )),
+                }
             })
             .unwrap();
 
@@ -929,12 +960,89 @@ mod tests {
             .collect()
     }
 
+    /// Scans test block directory and returns the range of available block numbers
+    ///
+    /// This function reads all files in TEST_BLOCK_DIR and extracts block numbers
+    /// from filenames in the format "{block_number}.{block_hash}.json".
+    ///
+    /// # Returns
+    /// * `Ok((min_block, max_block))` - Range of available block numbers
+    /// * `Err(eyre::Error)` - If directory cannot be read or no valid blocks found
+    fn load_test_block_range() -> Result<(u64, u64)> {
+        let test_block_dir = PathBuf::from(TEST_BLOCK_DIR);
+
+        let entries = std::fs::read_dir(&test_block_dir).map_err(|e| {
+            anyhow!(
+                "Failed to read test block directory {}: {}",
+                TEST_BLOCK_DIR,
+                e
+            )
+        })?;
+
+        let mut block_numbers = Vec::new();
+
+        for entry in entries {
+            let file = entry.map_err(|e| anyhow!("Failed to read directory entry: {}", e))?;
+            let file_name = file.file_name();
+            let file_str = file_name.to_string_lossy();
+
+            // Skip non-JSON files
+            if !file_str.ends_with(".json") {
+                continue;
+            }
+
+            // Parse filename in format "{block_number}.{block_hash}.json"
+            if let Some(dot_pos) = file_str.find('.') {
+                let block_number_str = &file_str[..dot_pos];
+                if let Ok(block_number) = block_number_str.parse::<u64>() {
+                    block_numbers.push(block_number);
+                }
+            }
+        }
+
+        if block_numbers.is_empty() {
+            return Err(anyhow!("No valid block files found in {}", TEST_BLOCK_DIR));
+        }
+
+        block_numbers.sort_unstable();
+        let min_block = *block_numbers.first().unwrap();
+        let max_block = *block_numbers.last().unwrap();
+
+        Ok((min_block, max_block))
+    }
+
     #[tokio::test]
     async fn integration_test() {
         tracing_subscriber::fmt::init();
 
         let handle = setup_mock_rpc_server().await;
         let client = Arc::new(RpcClient::new("http://127.0.0.1:59545").unwrap());
+
+        // Verify new RPC methods work correctly
+        info!("=== Testing Enhanced RPC Methods ===");
+
+        // Test eth_blockNumber method
+        let latest_block = client.block_number().await.unwrap();
+        info!("Latest block number from RPC: {}", latest_block);
+
+        // Test eth_getBlockByNumber with "finalized" tag
+        let finalized_block = client
+            .block_by_number_tag("finalized", false)
+            .await
+            .unwrap();
+        info!(
+            "Finalized block: number={}, hash={}",
+            finalized_block.header.number, finalized_block.header.hash
+        );
+
+        // Test regular block number query for comparison
+        let regular_block = client.block_by_number(latest_block, false).await.unwrap();
+        info!(
+            "Latest block: number={}, hash={}",
+            regular_block.header.number, regular_block.header.hash
+        );
+
+        info!("=== RPC Method Verification Complete ===");
 
         let validator_db = setup_test_db().unwrap();
         let contracts = Arc::new(Mutex::new(load_contracts(&CONTRACTS_FILE)));
