@@ -17,12 +17,13 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{signal, sync::Mutex};
+use tokio::{signal, sync::Mutex, task};
 use tracing::{error, info};
 use validator_core::{
-    SaltWitnessState, ValidateStatus, ValidatorDB, curent_time_to_u64,
+    SaltWitnessState, ValidateStatus, ValidatorDB, ValidatorDB2, curent_time_to_u64,
     data_types::{PlainKey, PlainValue},
     executor::validate_block,
+    validator_db2::ValidationResult,
 };
 
 mod rpc;
@@ -434,6 +435,232 @@ fn extract_contract_codes(salt_witness: &SaltWitness) -> Vec<(Address, B256)> {
             },
         )
         .collect()
+}
+
+/// Individual validation worker that processes blocks from the task queue
+///
+/// Each worker continuously:
+/// 1. Claims the next validation task from ValidatorDB2
+/// 2. Performs block validation using the existing validate_block function
+/// 3. Handles contract code caching as needed
+/// 4. Records validation results back to ValidatorDB2
+///
+/// # Arguments
+/// * `worker_id` - Unique identifier for this worker (for logging)
+/// * `client` - RPC client for fetching contract bytecode as needed
+/// * `validator_db2` - Database interface for task coordination
+async fn validation_worker(
+    worker_id: usize,
+    client: Arc<RpcClient>,
+    validator_db2: Arc<ValidatorDB2>,
+) -> Result<()> {
+    info!("Validation worker {} started", worker_id);
+
+    // Contract cache shared by this worker (following current architecture)
+    let contracts = Arc::new(Mutex::new(HashMap::default()));
+
+    loop {
+        // Step 1: Get next validation task atomically
+        match validator_db2.get_next_task()? {
+            Some((block, witness)) => {
+                let block_number = block.header.number;
+                let block_hash = block.header.hash;
+
+                info!("Worker {} validating block {}", worker_id, block_number);
+
+                // Step 2: Get the previous state root for validation
+                // TODO: This logic should be improved to handle the parent block properly
+                let old_state_root = if block_number > 0 {
+                    // For now, use a placeholder - this needs proper implementation
+                    block.header.parent_hash
+                } else {
+                    B256::ZERO
+                };
+
+                // Step 3: Handle contract code fetching (following existing pattern)
+                let contract_codes = extract_contract_codes(&witness);
+                let mut contracts_guard = contracts.lock().await;
+
+                let new_contracts_address = contract_codes
+                    .iter()
+                    .filter_map(|(address, code_hash)| {
+                        if !contracts_guard.contains_key(code_hash) {
+                            // Check if we have it in the database cache first
+                            match validator_db2.get_contract_code(*code_hash) {
+                                Ok(Some(bytecode)) => {
+                                    contracts_guard.insert(*code_hash, bytecode);
+                                    None
+                                }
+                                _ => Some(*address),
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                // Fetch any missing contract codes from RPC
+                if !new_contracts_address.is_empty() {
+                    let codes = client
+                        .codes_at(&new_contracts_address, (block_number - 1).into())
+                        .await?;
+
+                    for bytes in &codes {
+                        let bytecode = Bytecode::new_raw(bytes.clone());
+                        let code_hash = bytecode.hash_slow();
+                        contracts_guard.insert(code_hash, bytecode.clone());
+
+                        // Cache the bytecode in the database for other workers
+                        validator_db2.add_contract_code(&bytecode)?;
+                    }
+                }
+
+                // Step 4: Perform validation using existing validate_block function
+                let validation_result =
+                    match validate_block(&block, witness, old_state_root, &contracts_guard) {
+                        Ok(()) => {
+                            info!(
+                                "Worker {} successfully validated block {}",
+                                worker_id, block_number
+                            );
+                            ValidationResult {
+                                block_number,
+                                block_hash,
+                                success: true,
+                                error_message: None,
+                                completed_at: curent_time_to_u64(),
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                "Worker {} failed to validate block {}: {}",
+                                worker_id, block_number, e
+                            );
+                            ValidationResult {
+                                block_number,
+                                block_hash,
+                                success: false,
+                                error_message: Some(e.to_string()),
+                                completed_at: curent_time_to_u64(),
+                            }
+                        }
+                    };
+
+                // Step 5: Record validation result
+                validator_db2.complete_validation(validation_result)?;
+
+                drop(contracts_guard);
+            }
+            None => {
+                // No tasks available, wait a bit before checking again
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+/// Single iteration of the chain synchronizer logic
+///
+/// Performs one cycle of chain synchronization:
+/// 1. Monitor chain head progression
+/// 2. Track block finality status
+/// 3. Detect and handle reorganizations
+/// 4. Fetch new blocks and witnesses
+/// 5. Create validation tasks
+/// 6. Process validation results and advance canonical chain
+/// 7. Prune old data
+async fn chain_sync_iteration(_client: &RpcClient, validator_db2: &ValidatorDB2) -> Result<()> {
+    // TODO: Implement chain head monitoring
+    // Need to add RPC methods to get latest block number and finalized block number
+
+    // TODO: Implement block fetching and witness handling
+    // Need to determine source of witness data (not specified in current RPC client)
+
+    // TODO: Implement result processing and chain growth
+    // Process completed validation results and advance canonical chain
+
+    // TODO: Implement reorganization detection
+    // Compare local canonical tip with remote chain head
+
+    // TODO: Implement data pruning
+    // Remove old block data beyond retention policy
+
+    // Placeholder implementation - just log that we're running
+    if let Some((tip_number, tip_hash)) = validator_db2.get_canonical_tip()? {
+        info!(
+            "Current canonical tip: block {} hash {}",
+            tip_number, tip_hash
+        );
+    } else {
+        info!("No canonical chain established yet");
+    }
+
+    Ok(())
+}
+
+/// Chain synchronizer entry point - implements the Chain Synchronizer component from the design document
+///
+/// This function serves as the main orchestrator that:
+/// - Monitors chain head progression via remote RPC endpoint
+/// - Tracks block finality status via remote RPC endpoint  
+/// - Manages reorganization detection and recovery
+/// - Fetches block and witness data via remote RPC endpoint
+/// - Creates validation tasks and stores them in ValidatorDB2 for validation workers
+/// - Processes validation results to drive local chain tip progression
+/// - Prunes old block and witness data to maintain constant storage overhead
+/// - Coordinates with parallel validation workers via ValidatorDB2
+///
+/// # Arguments
+/// * `client` - RPC client for communicating with remote blockchain node
+/// * `validator_db2` - Database interface for coordinating with validation workers
+/// * `concurrent_num` - Number of parallel validation workers to spawn
+/// * `sync_interval_secs` - Time to wait between sync cycles in seconds
+async fn chain_sync(
+    client: Arc<RpcClient>,
+    validator_db2: Arc<ValidatorDB2>,
+    concurrent_num: usize,
+    sync_interval_secs: u64,
+) -> Result<()> {
+    info!(
+        "Starting chain synchronizer with {} validation workers",
+        concurrent_num
+    );
+
+    // Step 1: Recover any interrupted tasks from previous crashes
+    info!("Recovering interrupted validation tasks from previous runs...");
+    validator_db2
+        .recover_interrupted_tasks()
+        .map_err(|e| anyhow!("Failed to recover interrupted tasks: {}", e))?;
+    info!("Task recovery completed");
+
+    // Step 2: Spawn validation workers as tokio tasks
+    info!("Spawning {} validation workers...", concurrent_num);
+    let mut worker_handles = Vec::new();
+
+    for worker_id in 0..concurrent_num {
+        let client_clone = Arc::clone(&client);
+        let validator_db2_clone = Arc::clone(&validator_db2);
+
+        let handle = task::spawn(async move {
+            validation_worker(worker_id, client_clone, validator_db2_clone).await
+        });
+
+        worker_handles.push(handle);
+    }
+    info!("All validation workers started");
+
+    // Step 3: Main chain synchronizer loop
+    info!("Starting main chain synchronizer loop...");
+
+    loop {
+        if let Err(e) = chain_sync_iteration(&client, &validator_db2).await {
+            error!("Chain sync iteration failed: {}", e);
+            // Continue running despite errors - individual iterations can fail
+        }
+
+        // Wait before next sync cycle
+        tokio::time::sleep(Duration::from_secs(sync_interval_secs)).await;
+    }
 }
 
 #[cfg(test)]
