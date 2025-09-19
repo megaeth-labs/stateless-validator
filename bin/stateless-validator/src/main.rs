@@ -8,9 +8,10 @@ use jsonrpsee::{
 };
 use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, INVALID_PARAMS_CODE};
 use revm::{
-    primitives::{B256, HashMap, KECCAK_EMPTY},
+    primitives::{B256, KECCAK_EMPTY},
     state::Bytecode,
 };
+use std::collections::HashMap;
 use salt::SaltWitness;
 use std::{
     path::PathBuf,
@@ -185,7 +186,7 @@ async fn scan_and_validate(
 ) -> Result<()> {
     // TODO: populate the initial contract cache from an external db instance
     // Start with an empty contract cache.
-    let contracts = Arc::new(Mutex::new(HashMap::default()));
+    let contracts = Arc::new(Mutex::new(HashMap::<B256, Bytecode>::default()));
 
     // Create an infinite stream of block numbers to process.
     stream::iter(block_counter..)
@@ -361,7 +362,8 @@ async fn wait_and_validate(
             contracts_guard.extend(new_contracts.clone());
 
             // Perform the actual block validation
-            match validate_block(&block, salt_witness, old_state_root, &contracts_guard) {
+            let revm_contracts: revm::primitives::HashMap<B256, Bytecode> = contracts_guard.iter().map(|(k, v)| (*k, v.clone())).collect();
+            match validate_block(&block, salt_witness, old_state_root, &revm_contracts) {
                 Ok(()) => {
                     info!(
                         "Validation SUCCESS for block {}. State root: 0x{}",
@@ -457,7 +459,7 @@ async fn validation_worker(
     info!("Validation worker {} started", worker_id);
 
     // Contract cache shared by this worker (following current architecture)
-    let contracts = Arc::new(Mutex::new(HashMap::default()));
+    let contracts = Arc::new(Mutex::new(HashMap::<B256, Bytecode>::default()));
 
     loop {
         // Step 1: Get next validation task atomically
@@ -516,8 +518,9 @@ async fn validation_worker(
                 }
 
                 // Step 4: Perform validation using existing validate_block function
+                let revm_contracts: revm::primitives::HashMap<B256, Bytecode> = contracts_guard.iter().map(|(k, v)| (*k, v.clone())).collect();
                 let validation_result =
-                    match validate_block(&block, witness, old_state_root, &contracts_guard) {
+                    match validate_block(&block, witness, old_state_root, &revm_contracts) {
                         Ok(()) => {
                             info!(
                                 "Worker {} successfully validated block {}",
@@ -673,6 +676,7 @@ mod tests {
     use op_alloy_rpc_types::Transaction;
     use serde::de::DeserializeOwned;
     use std::{
+        collections::BTreeMap,
         fs::File,
         io::{BufRead, BufReader},
         path::Path,
@@ -696,6 +700,32 @@ mod tests {
     /// Files in this directory should have `.w` extension and contain serialized
     /// WitnessStatus data with BLAKE3 hash verification.
     const TEST_WITNESS_DIR: &str = "../../test_data/stateless/witness";
+
+    /// Context object containing pre-loaded test data for efficient RPC serving
+    ///
+    /// This struct holds all test data (blocks, witnesses, contracts) loaded once during
+    /// setup to eliminate file system access during RPC calls.
+    #[derive(Debug, Clone)]
+    struct RpcModuleContext {
+        /// Block data indexed by block hash (single storage)
+        blocks_by_hash: HashMap<BlockHash, Block<Transaction>>,
+
+        /// Ordered block number to hash mapping for number-based lookups
+        block_hashes: BTreeMap<u64, BlockHash>,
+
+        /// Witness data indexed by (block_number, block_hash)
+        witness_data: HashMap<(u64, BlockHash), WitnessStatus>,
+
+        /// Contract bytecode cache
+        contracts: HashMap<B256, Bytecode>,
+
+        /// Block range for quick lookups
+        min_block: u64,
+        max_block: u64,
+
+        /// Starting block (parent of minimum block)
+        starting_block: (u64, BlockHash),
+    }
 
     /// Block identifier used to locate test block data files.
     ///
@@ -799,53 +829,93 @@ mod tests {
         Ok(Arc::new(validator_db))
     }
 
-    /// Set up mock RPC server and return the handle.
-    async fn setup_mock_rpc_server() -> jsonrpsee::server::ServerHandle {
-        let mut module = RpcModule::new(());
+    /// Set up mock RPC server with pre-loaded context and return the handle.
+    async fn setup_mock_rpc_server(context: RpcModuleContext) -> jsonrpsee::server::ServerHandle {
+        let mut module = RpcModule::new(context);
 
         module
-            .register_method("eth_getBlockByHash", |params, _, _| {
-                let (hash, full_block): (String, bool) = params.parse().unwrap();
-                load_test_block(BlockId::Hash(hash), full_block)
+            .register_method("eth_getBlockByHash", |params, context, _| {
+                let (hash_str, full_block): (String, bool) = params.parse().unwrap();
+
+                // Parse hash string to BlockHash
+                let block_hash = match parse_block_hash(&hash_str) {
+                    Ok(hash) => hash,
+                    Err(e) => {
+                        return Err(ErrorObject::owned(
+                            INVALID_PARAMS_CODE,
+                            format!("Invalid block hash: {}", e),
+                            None::<()>,
+                        ));
+                    }
+                };
+
+                // Look up block in context
+                match context.blocks_by_hash.get(&block_hash) {
+                    Some(block) => {
+                        let result_block = if full_block {
+                            block.clone()
+                        } else {
+                            Block {
+                                transactions: block.transactions.clone().into_hashes(),
+                                ..block.clone()
+                            }
+                        };
+                        Ok(result_block)
+                    }
+                    None => Err(ErrorObject::owned(
+                        CALL_EXECUTION_FAILED_CODE,
+                        format!("Block {} not found", hash_str),
+                        None::<()>,
+                    )),
+                }
             })
             .unwrap();
 
         module
-            .register_method("eth_getBlockByNumber", |params, _, _| {
+            .register_method("eth_getBlockByNumber", |params, context, _| {
                 let (hex_number, full_block): (String, bool) = params.parse().unwrap();
 
-                let number = if hex_number == "finalized" {
+                let block_number = if hex_number == "finalized" {
                     // Return the smallest block number for "finalized" tag
-                    match load_test_block_range() {
-                        Ok((min_block, _)) => min_block,
-                        Err(_) => {
-                            return Err(ErrorObject::owned(
-                                CALL_EXECUTION_FAILED_CODE,
-                                "Failed to determine block range".to_string(),
-                                None::<()>,
-                            ));
-                        }
-                    }
+                    context.min_block
                 } else {
                     // Parse hex number as before
                     u64::from_str_radix(&hex_number[2..], 16).unwrap_or(0)
                 };
 
-                load_test_block(BlockId::Number(number), full_block)
+                // Look up block hash by number, then get block by hash
+                match context.block_hashes.get(&block_number) {
+                    Some(block_hash) => match context.blocks_by_hash.get(block_hash) {
+                        Some(block) => {
+                            let result_block = if full_block {
+                                block.clone()
+                            } else {
+                                Block {
+                                    transactions: block.transactions.clone().into_hashes(),
+                                    ..block.clone()
+                                }
+                            };
+                            Ok(result_block)
+                        }
+                        None => Err(ErrorObject::owned(
+                            CALL_EXECUTION_FAILED_CODE,
+                            format!("Block data not found for number {}", block_number),
+                            None::<()>,
+                        )),
+                    },
+                    None => Err(ErrorObject::owned(
+                        CALL_EXECUTION_FAILED_CODE,
+                        format!("Block {} not found", block_number),
+                        None::<()>,
+                    )),
+                }
             })
             .unwrap();
 
         module
-            .register_method("eth_blockNumber", |_params, _, _| {
+            .register_method("eth_blockNumber", |_params, context, _| {
                 // Return the largest block number available in test data
-                match load_test_block_range() {
-                    Ok((_, max_block)) => Ok(format!("0x{:x}", max_block)),
-                    Err(e) => Err(ErrorObject::owned(
-                        CALL_EXECUTION_FAILED_CODE,
-                        format!("Failed to determine block range: {}", e),
-                        None::<()>,
-                    )),
-                }
+                Ok::<String, ErrorObjectOwned>(format!("0x{:x}", context.max_block))
             })
             .unwrap();
 
@@ -960,6 +1030,156 @@ mod tests {
             .collect()
     }
 
+    /// Creates RPC module context by pre-loading all test data
+    ///
+    /// This function scans the test directories and loads all block data, witness data,
+    /// and contracts into memory for efficient RPC serving. It eliminates file system
+    /// access during RPC calls by pre-loading everything into HashMap/BTreeMap structures.
+    ///
+    /// # Returns
+    /// * `Ok(RpcModuleContext)` - Context with all test data loaded
+    /// * `Err(eyre::Error)` - If directories cannot be read or data is malformed
+    fn create_rpc_module_context() -> Result<RpcModuleContext> {
+        let mut blocks_by_hash = HashMap::new();
+        let mut block_hashes = BTreeMap::new();
+        let mut witness_data = HashMap::new();
+
+        // Load block data from TEST_BLOCK_DIR
+        info!("Loading block data from {}", TEST_BLOCK_DIR);
+        let test_block_dir = PathBuf::from(TEST_BLOCK_DIR);
+        let block_entries = std::fs::read_dir(&test_block_dir).map_err(|e| {
+            anyhow!(
+                "Failed to read test block directory {}: {}",
+                TEST_BLOCK_DIR,
+                e
+            )
+        })?;
+
+        let mut block_numbers = Vec::new();
+
+        for entry in block_entries {
+            let file = entry.map_err(|e| anyhow!("Failed to read directory entry: {}", e))?;
+            let file_name = file.file_name();
+            let file_str = file_name.to_string_lossy();
+
+            // Skip non-JSON files
+            if !file_str.ends_with(".json") {
+                continue;
+            }
+
+            // Parse filename in format "{block_number}.{block_hash}.json"
+            if let Some(dot_pos) = file_str.find('.') {
+                let block_number_str = &file_str[..dot_pos];
+                if let Ok(block_number) = block_number_str.parse::<u64>() {
+                    // Load the block data
+                    let block: Block<Transaction> = load_json(file.path())
+                        .map_err(|e| anyhow!("Failed to load block file {}: {}", file_str, e))?;
+
+                    let block_hash = BlockHash::from(block.header.hash);
+
+                    // Store block by hash and create number->hash mapping
+                    blocks_by_hash.insert(block_hash, block);
+                    block_hashes.insert(block_number, block_hash);
+                    block_numbers.push(block_number);
+                }
+            }
+        }
+
+        if block_numbers.is_empty() {
+            return Err(anyhow!("No valid block files found in {}", TEST_BLOCK_DIR));
+        }
+
+        block_numbers.sort_unstable();
+        let min_block = *block_numbers.first().unwrap();
+        let max_block = *block_numbers.last().unwrap();
+
+        info!(
+            "Loaded {} blocks (range: {} - {})",
+            block_numbers.len(),
+            min_block,
+            max_block
+        );
+
+        // Calculate starting block (parent of minimum block)
+        let min_block_hash = block_hashes.get(&min_block).unwrap();
+        let min_block_data = blocks_by_hash.get(min_block_hash).unwrap();
+        let starting_block = (
+            min_block - 1,
+            BlockHash::from(min_block_data.header.parent_hash),
+        );
+
+        info!(
+            "Starting block: number={}, hash={}",
+            starting_block.0, starting_block.1
+        );
+
+        // Load witness data from TEST_WITNESS_DIR
+        info!("Loading witness data from {}", TEST_WITNESS_DIR);
+        let test_witness_dir = PathBuf::from(TEST_WITNESS_DIR);
+        if test_witness_dir.exists() {
+            let witness_entries = std::fs::read_dir(&test_witness_dir)
+                .map_err(|e| anyhow!("Failed to read test witness directory: {}", e))?;
+
+            let mut witness_count = 0;
+            for entry in witness_entries {
+                let entry = entry?;
+                let file_path = entry.path();
+                if file_path.extension().and_then(|s| s.to_str()) == Some("w") {
+                    // Parse filename for block info
+                    let block_num_and_hash = file_path.file_stem().unwrap().to_str().unwrap();
+                    let (block_number, block_hash) = parse_block_num_and_hash(block_num_and_hash)?;
+
+                    // Read and deserialize witness file
+                    let file_data = std::fs::read(&file_path)?;
+                    let state_data = deserialized_state_data(file_data).map_err(|e| {
+                        anyhow!(
+                            "Failed to deserialize state data from {}: {}",
+                            block_num_and_hash,
+                            e
+                        )
+                    })?;
+
+                    let (witness_status, _): (WitnessStatus, usize) =
+                        bincode::serde::decode_from_slice(
+                            &state_data.data,
+                            bincode::config::legacy(),
+                        )
+                        .map_err(|e| {
+                            anyhow!(
+                                "Failed to deserialize WitnessStatus from {}: {}",
+                                block_num_and_hash,
+                                e
+                            )
+                        })?;
+
+                    witness_data.insert((block_number, block_hash), witness_status);
+                    witness_count += 1;
+                }
+            }
+            info!("Loaded {} witness files", witness_count);
+        } else {
+            info!(
+                "Witness directory {} does not exist, skipping witness data",
+                TEST_WITNESS_DIR
+            );
+        }
+
+        // Load contract data
+        info!("Loading contract data from {}", CONTRACTS_FILE);
+        let contracts = load_contracts(CONTRACTS_FILE);
+        info!("Loaded {} contracts", contracts.len());
+
+        Ok(RpcModuleContext {
+            blocks_by_hash,
+            block_hashes,
+            witness_data,
+            contracts,
+            min_block,
+            max_block,
+            starting_block,
+        })
+    }
+
     /// Scans test block directory and returns the range of available block numbers
     ///
     /// This function reads all files in TEST_BLOCK_DIR and extracts block numbers
@@ -1015,7 +1235,19 @@ mod tests {
     async fn integration_test() {
         tracing_subscriber::fmt::init();
 
-        let handle = setup_mock_rpc_server().await;
+        // Create RPC module context with pre-loaded test data
+        info!("=== Creating RPC Module Context ===");
+        let context = create_rpc_module_context().unwrap();
+        info!(
+            "Context created with {} blocks, {} witnesses, {} contracts",
+            context.blocks_by_hash.len(),
+            context.witness_data.len(),
+            context.contracts.len()
+        );
+        info!("Block range: {} - {}", context.min_block, context.max_block);
+        info!("Starting block: {}", context.starting_block.1);
+
+        let handle = setup_mock_rpc_server(context).await;
         let client = Arc::new(RpcClient::new("http://127.0.0.1:59545").unwrap());
 
         // Verify new RPC methods work correctly
