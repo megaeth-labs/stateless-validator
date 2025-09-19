@@ -441,6 +441,20 @@ impl ValidatorDB2 {
         }
     }
 
+    /// Sets the canonical chain tip manually
+    ///
+    /// This method allows setting the canonical chain tip to a specific block.
+    /// Useful for initialization and testing scenarios.
+    pub fn set_canonical_tip(&self, block_number: BlockNumber, block_hash: BlockHash) -> Result<()> {
+        let write_txn = self.database.begin_write()?;
+        {
+            let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
+            canonical_chain.insert(block_number, block_hash.0)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
     /// Retrieves cached contract bytecode
     ///
     /// Returns the bytecode for a contract if it's been cached, or None if not found.

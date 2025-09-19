@@ -605,7 +605,7 @@ async fn chain_sync_iteration(_client: &RpcClient, validator_db2: &ValidatorDB2)
 ///
 /// This function serves as the main orchestrator that:
 /// - Monitors chain head progression via remote RPC endpoint
-/// - Tracks block finality status via remote RPC endpoint  
+/// - Tracks block finality status via remote RPC endpoint
 /// - Manages reorganization detection and recovery
 /// - Fetches block and witness data via remote RPC endpoint
 /// - Creates validation tasks and stores them in ValidatorDB2 for validation workers
@@ -771,57 +771,21 @@ mod tests {
     /// # Errors
     ///
     /// Returns error if directory creation, file I/O, or witness deserialization fails.
-    fn setup_test_db() -> Result<Arc<ValidatorDB>> {
+    fn setup_test_db() -> Result<Arc<ValidatorDB2>> {
         let temp_dir = tempfile::tempdir()
             .map_err(|e| anyhow!("Failed to create temporary directory: {e}"))?;
         let work_dir = temp_dir.path().to_path_buf();
 
-        // Create ValidatorDB with database
+        // Create ValidatorDB2 with database
         let db_path = work_dir.join(VALIDATOR_DB_FILENAME);
-        let validator_db = ValidatorDB::new(&db_path)?;
+        let validator_db = ValidatorDB2::new(&db_path)?;
 
-        // Load witness files and populate database
-        let test_witness_dir = PathBuf::from(TEST_WITNESS_DIR);
-        if test_witness_dir.exists() {
-            for entry in std::fs::read_dir(&test_witness_dir)
-                .map_err(|e| anyhow!("Failed to read test witness directory: {e}"))?
-            {
-                let entry = entry?;
-                let file_path = entry.path();
-                if file_path.extension().and_then(|s| s.to_str()) == Some("w") {
-                    // Parse filename for block info
-                    let block_num_and_hash = file_path.file_stem().unwrap().to_str().unwrap();
-                    let (block_number, block_hash) = parse_block_num_and_hash(block_num_and_hash)?;
+        // Initialize canonical chain tip using RpcModuleContext
+        let context = create_rpc_module_context()?;
+        let starting_block = context.starting_block;
 
-                    // Read and deserialize witness file
-                    let file_data = std::fs::read(&file_path)?;
-                    let state_data = deserialized_state_data(file_data).map_err(|e| {
-                        anyhow!("Failed to deserialize state data from {block_num_and_hash}: {e}")
-                    })?;
-
-                    let (witness_status, _): (WitnessStatus, usize) =
-                        bincode::serde::decode_from_slice(
-                            &state_data.data,
-                            bincode::config::legacy(),
-                        )
-                        .map_err(|e| {
-                            anyhow!(
-                                "Failed to deserialize WitnessStatus from {block_num_and_hash}: {e}"
-                            )
-                        })?;
-
-                    // Add to database using network-style interface
-                    validator_db.add_new_block(
-                        block_number,
-                        block_hash,
-                        witness_status.parent_hash,
-                        witness_status.pre_state_root,
-                        witness_status.witness_data,
-                        witness_status.blob_ids,
-                    )?;
-                }
-            }
-        }
+        // Set the canonical chain tip to the starting block (parent of minimum test block)
+        validator_db.set_canonical_tip(starting_block.0, starting_block.1)?;
 
         // Keep the temp dir alive by leaking it. OS will clean it when test process ends.
         std::mem::forget(temp_dir);
@@ -952,62 +916,6 @@ mod tests {
             .with_context(|| format!("Failed to read file {path}", path = path.display()))?;
         serde_json::from_slice(&contents)
             .with_context(|| format!("Failed to parse JSON from {path}", path = path.display()))
-    }
-
-    /// Loads a block from test data files for mock RPC server responses.
-    ///
-    /// This function searches the test block directory for files matching the given
-    /// block identifier and returns the block data in the format expected by
-    /// JSON-RPC clients.
-    ///
-    /// # Arguments
-    ///
-    /// * `block_id` - The block identifier (hash or number) to search for
-    /// * `transaction_details` - If true, returns full transaction objects;
-    ///                          if false, returns only transaction hashes
-    ///
-    /// # Returns
-    ///
-    /// Returns `Ok(Block<Transaction>)` if the block is found and successfully loaded.
-    /// Returns an `ErrorObjectOwned` compatible with jsonrpsee RPC error handling if:
-    /// - Block file is not found
-    /// - Directory cannot be read
-    /// - JSON parsing fails
-    fn load_test_block(
-        block_id: BlockId,
-        full_block: bool,
-    ) -> Result<Block<Transaction>, ErrorObjectOwned> {
-        // Helper function to check if a given file contains the desired block
-        let find_block_data = |filename: &str| match block_id {
-            BlockId::Hash(ref hash) => filename.contains(hash),
-            BlockId::Number(number) => filename.starts_with(&format!("{number}.")),
-        };
-
-        // Convert errors to ErrorObjectOwned
-        let to_rpc_error =
-            |msg: String| ErrorObject::owned(CALL_EXECUTION_FAILED_CODE, msg, None::<()>);
-
-        // Find and load the matching file
-        std::fs::read_dir(TEST_BLOCK_DIR)
-            .map_err(|e| to_rpc_error(format!("Failed to read directory: {e}")))?
-            .find_map(|entry| {
-                let file = entry.ok()?;
-                let file_name = file.file_name();
-                if find_block_data(&file_name.to_string_lossy()) {
-                    let block: Block<Transaction> = load_json(file.path()).ok()?;
-                    Some(if full_block {
-                        block
-                    } else {
-                        Block {
-                            transactions: block.transactions.clone().into_hashes(),
-                            ..block.clone()
-                        }
-                    })
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| to_rpc_error(format!("Block {block_id:?} not found")))
     }
 
     /// Loads contract bytecode from a test data file.
@@ -1180,57 +1088,6 @@ mod tests {
         })
     }
 
-    /// Scans test block directory and returns the range of available block numbers
-    ///
-    /// This function reads all files in TEST_BLOCK_DIR and extracts block numbers
-    /// from filenames in the format "{block_number}.{block_hash}.json".
-    ///
-    /// # Returns
-    /// * `Ok((min_block, max_block))` - Range of available block numbers
-    /// * `Err(eyre::Error)` - If directory cannot be read or no valid blocks found
-    fn load_test_block_range() -> Result<(u64, u64)> {
-        let test_block_dir = PathBuf::from(TEST_BLOCK_DIR);
-
-        let entries = std::fs::read_dir(&test_block_dir).map_err(|e| {
-            anyhow!(
-                "Failed to read test block directory {}: {}",
-                TEST_BLOCK_DIR,
-                e
-            )
-        })?;
-
-        let mut block_numbers = Vec::new();
-
-        for entry in entries {
-            let file = entry.map_err(|e| anyhow!("Failed to read directory entry: {}", e))?;
-            let file_name = file.file_name();
-            let file_str = file_name.to_string_lossy();
-
-            // Skip non-JSON files
-            if !file_str.ends_with(".json") {
-                continue;
-            }
-
-            // Parse filename in format "{block_number}.{block_hash}.json"
-            if let Some(dot_pos) = file_str.find('.') {
-                let block_number_str = &file_str[..dot_pos];
-                if let Ok(block_number) = block_number_str.parse::<u64>() {
-                    block_numbers.push(block_number);
-                }
-            }
-        }
-
-        if block_numbers.is_empty() {
-            return Err(anyhow!("No valid block files found in {}", TEST_BLOCK_DIR));
-        }
-
-        block_numbers.sort_unstable();
-        let min_block = *block_numbers.first().unwrap();
-        let max_block = *block_numbers.last().unwrap();
-
-        Ok((min_block, max_block))
-    }
-
     #[tokio::test]
     async fn integration_test() {
         tracing_subscriber::fmt::init();
@@ -1277,19 +1134,14 @@ mod tests {
         info!("=== RPC Method Verification Complete ===");
 
         let validator_db = setup_test_db().unwrap();
-        let contracts = Arc::new(Mutex::new(load_contracts(&CONTRACTS_FILE)));
 
-        for block_num in 3780..3801 {
-            wait_and_validate(
-                client.clone(),
-                validator_db.clone(),
-                block_num,
-                5,
-                contracts.clone(),
-            )
+        // Test the new chain_sync architecture instead of manual validation
+        let worker_count = 4; // Number of parallel validation workers
+        let sync_interval = 1; // Sync interval in seconds for testing
+
+        chain_sync(client.clone(), validator_db, worker_count, sync_interval)
             .await
             .unwrap();
-        }
 
         handle.stop().unwrap();
         info!("Mock RPC server has been shut down.");
