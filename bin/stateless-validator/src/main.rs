@@ -11,8 +11,8 @@ use revm::{
     primitives::{B256, KECCAK_EMPTY},
     state::Bytecode,
 };
-use std::collections::HashMap;
 use salt::SaltWitness;
+use std::collections::HashMap;
 use std::{
     path::PathBuf,
     sync::Arc,
@@ -362,7 +362,10 @@ async fn wait_and_validate(
             contracts_guard.extend(new_contracts.clone());
 
             // Perform the actual block validation
-            let revm_contracts: revm::primitives::HashMap<B256, Bytecode> = contracts_guard.iter().map(|(k, v)| (*k, v.clone())).collect();
+            let revm_contracts: revm::primitives::HashMap<B256, Bytecode> = contracts_guard
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect();
             match validate_block(&block, salt_witness, old_state_root, &revm_contracts) {
                 Ok(()) => {
                     info!(
@@ -518,7 +521,10 @@ async fn validation_worker(
                 }
 
                 // Step 4: Perform validation using existing validate_block function
-                let revm_contracts: revm::primitives::HashMap<B256, Bytecode> = contracts_guard.iter().map(|(k, v)| (*k, v.clone())).collect();
+                let revm_contracts: revm::primitives::HashMap<B256, Bytecode> = contracts_guard
+                    .iter()
+                    .map(|(k, v)| (*k, v.clone()))
+                    .collect();
                 let validation_result =
                     match validate_block(&block, witness, old_state_root, &revm_contracts) {
                         Ok(()) => {

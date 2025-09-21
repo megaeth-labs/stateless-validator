@@ -12,22 +12,39 @@
 //!
 //! ## Database Schema
 //!
-//! The database consists of 7 specialized tables:
+//! The database consists of 8 specialized tables:
 //! - `CANONICAL_CHAIN`: Local view of the canonical blockchain (BlockNumber → BlockHash)
+//! - `REMOTE_CHAIN`: Remote chain used to guide chain advancement (BlockNumber → BlockHash)
 //! - `TASK_LIST`: Queue of pending validation tasks (BlockNumber, BlockHash) → ()
 //! - `ONGOING_TASKS`: Tasks currently being processed by workers
 //! - `BLOCK_DATA`: Complete block data required for validation (BlockHash → Block)
 //! - `WITNESSES`: Cryptographic witness data for stateless validation (BlockHash → SaltWitness)
 //! - `VALIDATION_RESULTS`: Outcomes with block identifiers and status (BlockHash → ValidationResult)
-//! - `BLOCK_RECORDS`: Complete history including forks for efficient pruning
+//! - `BLOCK_RECORDS`: Complete history including forks for efficient pruning (BlockNumber, BlockHash) → ()
 //! - `CONTRACTS`: On-demand contract bytecode cache (CodeHash → Bytecode)
+//!
+//! ## Chain Synchronization
+//!
+//! The system maintains two chains for efficient synchronization:
+//! - **CANONICAL_CHAIN**: The locally confirmed canonical chain (validated blocks only)
+//! - **REMOTE_CHAIN**: A lookahead chain with unvalidated blocks that stays ahead of CANONICAL_CHAIN
+//!
+//! **Workflow:**
+//! 1. New blocks are received and added to REMOTE_CHAIN via `grow_remote_chain()` (unvalidated)
+//! 2. Validation tasks are created for blocks in REMOTE_CHAIN
+//! 3. Once validated successfully, blocks move from REMOTE_CHAIN to CANONICAL_CHAIN via `grow_local_chain()`
+//! 4. Failed validations keep blocks in REMOTE_CHAIN until rollback or retry
+//!
+//! This architecture allows the chain synchronizer to receive and track new blocks while
+//! validation happens asynchronously in the background.
 //!
 //! ## Key Operations
 //!
 //! **For Chain Synchronizer:**
-//! - `add_validation_task()` - Add new blocks to validate with associated witness data
-//! - `chain_grow()` - Advance canonical chain by one block after successful validation
-//! - `chain_rollback()` - Handle chain reorganizations by rolling back to specified block
+//! - `grow_remote_chain()` - Add newly received unvalidated blocks to remote chain
+//! - `add_validation_task()` - Queue blocks from remote chain for validation with witness data
+//! - `grow_local_chain()` - Move successfully validated blocks from remote chain to canonical chain
+//! - `rollback_chain()` - Handle chain reorganizations by rolling back both chains
 //! - `get_validation_result()` - Retrieve validation outcomes for chain progression decisions
 //! - `get_canonical_tip()` - Get the current canonical chain head
 //! - `prune_history()` - Remove old block data to control storage usage
@@ -54,9 +71,21 @@ use serde::{Deserialize, Serialize};
 /// - Key: Block height as BlockNumber (u64)
 /// - Value: Hash of the canonical block at that height as BlockHash ([u8; 32])
 ///
-/// Updated by main orchestrator via chain_growth() and chain_rollback().
+/// Updated by main orchestrator via grow_local_chain() and rollback_chain().
 /// Only successfully validated blocks can be added to this chain.
 const CANONICAL_CHAIN: TableDefinition<u64, [u8; 32]> = TableDefinition::new("canonical_chain");
+
+/// Stores the remote chain with unvalidated blocks used to guide chain advancement.
+///
+/// **Schema:** Maps BlockNumber (u64) to BlockHash ([u8; 32])
+/// - Key: Block height as BlockNumber (u64)
+/// - Value: Hash of the remote block at that height as BlockHash ([u8; 32])
+///
+/// Contains newly received blocks that have not yet been validated. The chain synchronizer
+/// maintains this table to stay a few blocks ahead of CANONICAL_CHAIN. Once blocks in
+/// REMOTE_CHAIN are validated, they can be moved to CANONICAL_CHAIN via grow_local_chain().
+/// Updated via grow_remote_chain() (add unvalidated blocks) and rollback_chain().
+const REMOTE_CHAIN: TableDefinition<u64, [u8; 32]> = TableDefinition::new("remote_chain");
 
 /// Queue of validation tasks awaiting processing by workers.
 ///
@@ -177,6 +206,7 @@ impl ValidatorDB2 {
             // The table initialization process is safe for existing databases - it
             // ensures all required tables exist but does not overwrite existing data.
             let _canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
+            let _remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
             let _task_list = write_txn.open_table(TASK_LIST)?;
             let _ongoing_tasks = write_txn.open_table(ONGOING_TASKS)?;
             let _block_data = write_txn.open_table(BLOCK_DATA)?;
@@ -254,12 +284,13 @@ impl ValidatorDB2 {
     /// Adds a successfully validated block to the canonical chain. Verifies that
     /// the block's parent_hash matches the current canonical tip to ensure proper
     /// chain extension.
-    pub fn chain_grow(&self, header: &Header) -> Result<()> {
+    pub fn grow_local_chain(&self, header: &Header) -> Result<()> {
         let block_hash = BlockHash::from(header.hash);
 
         let write_txn = self.database.begin_write()?;
         {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
+            let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
             let validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
 
             // Ensure block is successfully validated
@@ -272,7 +303,28 @@ impl ValidatorDB2 {
                 return Err(anyhow!("Cannot grow chain with failed validation"));
             }
 
-            // Verify parent chain extension
+            // Verify the block is the first/oldest entry in remote chain
+            let (first_block_number, first_block_hash) = {
+                let first_remote_entry = remote_chain
+                    .first()?
+                    .ok_or_else(|| anyhow!("Remote chain is empty"))?;
+                (first_remote_entry.0.value(), first_remote_entry.1.value())
+            };
+
+            if header.number != first_block_number {
+                return Err(anyhow!(
+                    "Block number {number} is not the first entry in remote chain (expected {first_block_number})",
+                    number = header.number
+                ));
+            }
+
+            if block_hash.0 != first_block_hash {
+                return Err(anyhow!(
+                    "Block hash mismatch with first entry in remote chain"
+                ));
+            }
+
+            // Verify parent chain extension for canonical chain
             if header.number > 0 {
                 let parent_hash = canonical_chain
                     .get(header.number - 1)?
@@ -284,29 +336,80 @@ impl ValidatorDB2 {
                 }
             }
 
+            // Move block from remote chain to canonical chain
             canonical_chain.insert(header.number, block_hash.0)?;
+            remote_chain.remove(header.number)?;
         }
         write_txn.commit()?;
         Ok(())
     }
 
-    /// Rolls back the canonical chain in response to chain reorg
+    /// Grows the remote chain with an unvalidated block
     ///
-    /// Removes blocks from the canonical chain when a reorg occurs, reverting
-    /// to the specified block number.
-    pub fn chain_rollback(&self, to_block: BlockNumber) -> Result<()> {
+    /// Adds a newly received block to the remote chain for future validation.
+    /// The block does not need to be validated yet - validation happens later.
+    /// Verifies that the block's parent_hash matches the current remote chain tip
+    /// or canonical chain tip to ensure proper chain extension.
+    pub fn grow_remote_chain(&self, header: &Header) -> Result<()> {
+        let block_hash = BlockHash::from(header.hash);
+
+        let write_txn = self.database.begin_write()?;
+        {
+            let canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
+            let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
+
+            // Compute parent block (from remote chain if not empty, otherwise canonical chain)
+            let (parent_number, parent_hash) = if let Some(last_remote) = remote_chain.last()? {
+                (last_remote.0.value(), last_remote.1.value())
+            } else if let Some(last_canonical) = canonical_chain.last()? {
+                (last_canonical.0.value(), last_canonical.1.value())
+            } else {
+                return Err(anyhow!("Cannot extend from empty chains"));
+            };
+
+            // Validate extension
+            if header.number != parent_number + 1 || header.parent_hash != parent_hash {
+                return Err(anyhow!(
+                    "Block does not properly extend from parent (number: {number}, expected: {expected})",
+                    number = header.number,
+                    expected = parent_number + 1
+                ));
+            }
+
+            remote_chain.insert(header.number, block_hash.0)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Rolls back the local chain view in response to chain reorg
+    ///
+    /// Removes blocks from both the remote chain and canonical chain when a reorg
+    /// occurs, reverting to the specified block number.
+    pub fn rollback_chain(&self, to_block: BlockNumber) -> Result<()> {
         let write_txn = self.database.begin_write()?;
         {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
+            let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
 
-            // Collect block numbers to remove after to_block from canonical chain
-            let blocks_to_remove = canonical_chain
+            // Rollback canonical chain to specified block
+            let canonical_blocks_to_remove = canonical_chain
                 .range((to_block + 1)..)?
                 .map(|result| result.map(|(block_number, _)| block_number.value()))
                 .collect::<Result<Vec<_>, _>>()?;
 
-            for block_number in blocks_to_remove {
+            for block_number in canonical_blocks_to_remove {
                 canonical_chain.remove(block_number)?;
+            }
+
+            // Rollback remote chain to specified block
+            let remote_blocks_to_remove = remote_chain
+                .range((to_block + 1)..)?
+                .map(|result| result.map(|(block_number, _)| block_number.value()))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            for block_number in remote_blocks_to_remove {
+                remote_chain.remove(block_number)?;
             }
         }
         write_txn.commit()?;
@@ -445,7 +548,11 @@ impl ValidatorDB2 {
     ///
     /// This method allows setting the canonical chain tip to a specific block.
     /// Useful for initialization and testing scenarios.
-    pub fn set_canonical_tip(&self, block_number: BlockNumber, block_hash: BlockHash) -> Result<()> {
+    pub fn set_canonical_tip(
+        &self,
+        block_number: BlockNumber,
+        block_hash: BlockHash,
+    ) -> Result<()> {
         let write_txn = self.database.begin_write()?;
         {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
