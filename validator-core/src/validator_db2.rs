@@ -46,7 +46,7 @@
 //! - `grow_local_chain()` - Move successfully validated blocks from remote chain to canonical chain
 //! - `rollback_chain()` - Handle chain reorganizations by rolling back both chains
 //! - `get_validation_result()` - Retrieve validation outcomes for chain progression decisions
-//! - `get_canonical_tip()` - Get the current canonical chain head
+//! - `get_local_tip()` - Get the current local chain head
 //! - `prune_history()` - Remove old block data to control storage usage
 //! - `recover_interrupted_tasks()` - Move crashed worker tasks back to pending queue
 //!
@@ -528,11 +528,11 @@ impl ValidatorDB2 {
         }
     }
 
-    /// Gets the latest block in the canonical chain
+    /// Gets the latest block in the local chain
     ///
-    /// Returns the highest block number and hash currently considered canonical,
+    /// Returns the highest block number and hash currently considered local canonical,
     /// or None if the chain is empty.
-    pub fn get_canonical_tip(&self) -> Result<Option<(BlockNumber, BlockHash)>> {
+    pub fn get_local_tip(&self) -> Result<Option<(BlockNumber, BlockHash)>> {
         let read_txn = self.database.begin_read()?;
         let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
 
@@ -544,15 +544,27 @@ impl ValidatorDB2 {
         }
     }
 
-    /// Sets the canonical chain tip manually
+    /// Gets the latest block in the remote chain
     ///
-    /// This method allows setting the canonical chain tip to a specific block.
+    /// Returns the highest block number and hash currently in the remote chain,
+    /// or None if the remote chain is empty.
+    pub fn get_remote_tip(&self) -> Result<Option<(BlockNumber, BlockHash)>> {
+        let read_txn = self.database.begin_read()?;
+        let remote_chain = read_txn.open_table(REMOTE_CHAIN)?;
+
+        match remote_chain.last()? {
+            Some((block_number, block_hash)) => {
+                Ok(Some((block_number.value(), block_hash.value().into())))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Sets the local chain tip manually
+    ///
+    /// This method allows setting the local chain tip to a specific block.
     /// Useful for initialization and testing scenarios.
-    pub fn set_canonical_tip(
-        &self,
-        block_number: BlockNumber,
-        block_hash: BlockHash,
-    ) -> Result<()> {
+    pub fn set_local_tip(&self, block_number: BlockNumber, block_hash: BlockHash) -> Result<()> {
         let write_txn = self.database.begin_write()?;
         {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;

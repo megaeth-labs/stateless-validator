@@ -1,7 +1,10 @@
 use alloy_primitives::{Address, BlockHash, hex};
 use clap::Parser;
 use eyre::{Result, anyhow};
-use futures::stream::{self, StreamExt};
+use futures::{
+    future,
+    stream::{self, StreamExt},
+};
 use jsonrpsee::{
     RpcModule,
     server::{ServerBuilder, ServerConfigBuilder},
@@ -19,7 +22,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{signal, sync::Mutex, task};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use validator_core::{
     SaltWitnessState, ValidateStatus, ValidatorDB, ValidatorDB2, curent_time_to_u64,
     data_types::{PlainKey, PlainValue},
@@ -595,7 +598,7 @@ async fn chain_sync_iteration(_client: &RpcClient, validator_db2: &ValidatorDB2)
     // Remove old block data beyond retention policy
 
     // Placeholder implementation - just log that we're running
-    if let Some((tip_number, tip_hash)) = validator_db2.get_canonical_tip()? {
+    if let Some((tip_number, tip_hash)) = validator_db2.get_local_tip()? {
         info!(
             "Current canonical tip: block {} hash {}",
             tip_number, tip_hash
@@ -642,7 +645,17 @@ async fn chain_sync(
         .map_err(|e| anyhow!("Failed to recover interrupted tasks: {}", e))?;
     info!("Task recovery completed");
 
-    // Step 2: Spawn validation workers as tokio tasks
+    // Step 2: Spawn remote chain tracker
+    info!("Starting remote chain tracker...");
+    let _tracker_handle = {
+        let client_clone = Arc::clone(&client);
+        let validator_db2_clone = Arc::clone(&validator_db2);
+
+        task::spawn(async move { remote_chain_tracker(client_clone, validator_db2_clone).await })
+    };
+    info!("Remote chain tracker started");
+
+    // Step 3: Spawn validation workers as tokio tasks
     info!("Spawning {} validation workers...", concurrent_num);
     let mut worker_handles = Vec::new();
 
@@ -658,7 +671,7 @@ async fn chain_sync(
     }
     info!("All validation workers started");
 
-    // Step 3: Main chain synchronizer loop
+    // Step 4: Main chain synchronizer loop
     info!("Starting main chain synchronizer loop...");
 
     loop {
@@ -669,6 +682,170 @@ async fn chain_sync(
 
         // Wait before next sync cycle
         tokio::time::sleep(Duration::from_secs(sync_interval_secs)).await;
+    }
+}
+
+/// Remote chain tracker that maintains a lookahead of unvalidated blocks
+///
+/// This function runs an infinite loop that:
+/// 1. Monitors the gap between local canonical tip and local remote tip
+/// 2. Fetches new blocks from the remote RPC when the gap is too small
+/// 3. Validates that the remote tip is still valid (detects reorgs)
+/// 4. Maintains a sufficient number of unvalidated blocks for validation workers
+///
+/// # Arguments
+/// * `client` - RPC client for fetching blocks from remote blockchain
+/// * `validator_db2` - Database interface for chain management
+async fn remote_chain_tracker(
+    client: Arc<RpcClient>,
+    validator_db2: Arc<ValidatorDB2>,
+) -> Result<()> {
+    const LOOKAHEAD_BLOCKS: u64 = 10;
+    const POLLING_INTERVAL_SECS: u64 = 5;
+
+    info!(
+        "Starting remote chain tracker with {} block lookahead",
+        LOOKAHEAD_BLOCKS
+    );
+
+    loop {
+        // Perform one iteration of remote chain tracking
+        if let Err(e) = async {
+            // Step 1: Get current chain tips
+            let local_tip = validator_db2
+                .get_local_tip()?
+                .ok_or_else(|| anyhow!("Local chain is empty - cannot track remote chain"))?;
+
+            let remote_tip = validator_db2.get_remote_tip()?.unwrap_or(local_tip); // If no remote chain, start from local tip
+
+            // Step 2: Analyze gap between local and remote tips
+            let gap = remote_tip.0.saturating_sub(local_tip.0);
+            info!(
+                "Chain status: local_tip={}, remote_tip={}, gap={}",
+                local_tip.0, remote_tip.0, gap
+            );
+
+            // Step 3: Check if we are still on the right chain (detect reorgs)
+            match client.block_by_number(remote_tip.0, false).await {
+                Ok(block) => {
+                    if block.header.hash != remote_tip.1 {
+                        error!(
+                            "Remote tip hash mismatch! Expected: {}, got: {}. Triggering rollback.",
+                            remote_tip.1, block.header.hash
+                        );
+                        // FIXME: Find proper common ancestor between local and remote chains
+                        // For now, rollback to local tip as a simple approximation
+                        validator_db2.rollback_chain(local_tip.0)?;
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    // Network error - don't rollback eagerly, it may be just a network glitch
+                    warn!(
+                        "Failed to validate remote tip {} (network issue): {}. Continuing without rollback.",
+                        remote_tip.1, e
+                    );
+                }
+            }
+
+            if gap >= LOOKAHEAD_BLOCKS {
+                info!("Sufficient lookahead maintained (gap: {})", gap);
+                return Ok(());
+            }
+
+            // Step 4: Fetch more blocks to maintain lookahead
+            let blocks_to_fetch = (LOOKAHEAD_BLOCKS - gap).min(20); // Limit to 20 blocks per iteration
+            let start_block = remote_tip.0 + 1;
+            let end_block = start_block + blocks_to_fetch - 1;
+
+            info!(
+                "Fetching {} blocks (range: {} to {}) to maintain lookahead",
+                blocks_to_fetch, start_block, end_block
+            );
+
+            // Step 4.1: Fetch blocks in parallel
+            let fetch_tasks: Vec<_> = (start_block..=end_block)
+                .map(|block_number| {
+                    let client_clone = client.clone();
+                    tokio::spawn(async move {
+                        client_clone.block_by_number(block_number, false).await
+                    })
+                })
+                .collect();
+
+            // Step 4.2: Wait for all fetches to complete, handling individual failures
+            let fetch_results = future::join_all(fetch_tasks).await;
+
+            // Step 4.3: Process results and ensure contiguous blocks
+            let mut block_results = Vec::new();
+            for (i, task_result) in fetch_results.into_iter().enumerate() {
+                let block_number = start_block + i as u64;
+                match task_result {
+                    Ok(Ok(block)) => {
+                        block_results.push((block_number, Ok(block)));
+                    }
+                    Ok(Err(rpc_error)) => {
+                        error!("RPC error fetching block {}: {}", block_number, rpc_error);
+                        block_results.push((block_number, Err(rpc_error)));
+                    }
+                    Err(join_error) => {
+                        error!("Task join error for block {}: {}", block_number, join_error);
+                        block_results.push((block_number, Err(join_error.into())));
+                    }
+                }
+            }
+
+            // Step 4.4: Ensure contiguity - stop at first failure
+            let mut fetched_blocks = Vec::new();
+            for (block_number, result) in block_results {
+                match result {
+                    Ok(block) => {
+                        fetched_blocks.push((block_number, block));
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to fetch block {}: {}. Stopping to maintain contiguity.",
+                            block_number, e
+                        );
+                        // Stop at first gap to maintain contiguity
+                        break;
+                    }
+                }
+            }
+
+            if fetched_blocks.len() < blocks_to_fetch as usize {
+                info!(
+                    "Fetched {} out of {} requested blocks due to failures. Will retry missing blocks in next iteration.",
+                    fetched_blocks.len(),
+                    blocks_to_fetch
+                );
+            }
+
+            // Step 4.5: Add blocks to remote chain in order
+            for (block_number, block) in fetched_blocks {
+                match validator_db2.grow_remote_chain(&block.header) {
+                    Ok(()) => {
+                        info!("Added block {} to remote chain", block_number);
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to add block {} to remote chain: {}",
+                            block_number, e
+                        );
+                        // Stop processing to avoid gaps in the chain
+                        break;
+                    }
+                }
+            }
+
+            Ok::<(), eyre::Error>(())
+        }.await {
+            error!("Remote chain tracker iteration failed: {}", e);
+            // Continue running despite errors - individual iterations can fail
+        }
+
+        // Wait before next iteration
+        tokio::time::sleep(Duration::from_secs(POLLING_INTERVAL_SECS)).await;
     }
 }
 
@@ -733,18 +910,6 @@ mod tests {
         starting_block: (u64, BlockHash),
     }
 
-    /// Block identifier used to locate test block data files.
-    ///
-    /// This enum represents the two ways to identify a blockchain block:
-    /// by its unique hash or by its sequential number in the chain.
-    #[derive(Debug)]
-    enum BlockId {
-        /// Block identified by its hash (e.g., "0xabc123...")
-        Hash(String),
-        /// Block identified by its number (e.g., 280)
-        Number(u64),
-    }
-
     /// Parse block number and hash from string
     ///
     /// Parses strings in the format "{block_number}.{block_hash}" where
@@ -791,7 +956,7 @@ mod tests {
         let starting_block = context.starting_block;
 
         // Set the canonical chain tip to the starting block (parent of minimum test block)
-        validator_db.set_canonical_tip(starting_block.0, starting_block.1)?;
+        validator_db.set_local_tip(starting_block.0, starting_block.1)?;
 
         // Keep the temp dir alive by leaking it. OS will clean it when test process ends.
         std::mem::forget(temp_dir);
