@@ -1,4 +1,5 @@
 use alloy_primitives::{Address, BlockHash, hex};
+use alloy_rpc_types_eth::Header;
 use clap::Parser;
 use eyre::{Result, anyhow};
 use futures::{
@@ -763,12 +764,23 @@ async fn remote_chain_tracker(
                 blocks_to_fetch, start_block, end_block
             );
 
-            // Step 4.1: Fetch blocks in parallel
+            // Step 4.1: Fetch blocks and witnesses, queue for validation, return headers
             let fetch_tasks: Vec<_> = (start_block..=end_block)
                 .map(|block_number| {
                     let client_clone = client.clone();
+                    let validator_db2_clone = validator_db2.clone();
                     tokio::spawn(async move {
-                        client_clone.block_by_number(block_number, false).await
+                        // Fetch block first
+                        let block = client_clone.block_by_number(block_number, false).await?;
+                        // Then fetch witness using block hash
+                        let witness = client_clone.witness_by_block_hash(block.header.hash).await?;
+
+                        // Immediately queue for validation while we have both
+                        validator_db2_clone.add_validation_task(&block, &witness)?;
+                        info!("Queued block {} for validation", block.header.number);
+
+                        // Return only the header (has block number + hash for grow_remote_chain)
+                        Ok::<Header, eyre::Error>(block.header)
                     })
                 })
                 .collect();
@@ -776,36 +788,38 @@ async fn remote_chain_tracker(
             // Step 4.2: Wait for all fetches to complete, handling individual failures
             let fetch_results = future::join_all(fetch_tasks).await;
 
-            // Step 4.3: Process results and ensure contiguous blocks
-            let mut block_results = Vec::new();
+            // Step 4.3: Process results and ensure contiguous headers
+            let mut header_results = Vec::new();
             for (i, task_result) in fetch_results.into_iter().enumerate() {
-                let block_number = start_block + i as u64;
+                let expected_block_number = start_block + i as u64;
                 match task_result {
-                    Ok(Ok(block)) => {
-                        block_results.push((block_number, Ok(block)));
+                    Ok(Ok(header)) => {
+                        header_results.push(Ok(header));
                     }
                     Ok(Err(rpc_error)) => {
-                        error!("RPC error fetching block {}: {}", block_number, rpc_error);
-                        block_results.push((block_number, Err(rpc_error)));
+                        error!("RPC error fetching block/witness {}: {}", expected_block_number, rpc_error);
+                        header_results.push(Err(rpc_error));
                     }
                     Err(join_error) => {
-                        error!("Task join error for block {}: {}", block_number, join_error);
-                        block_results.push((block_number, Err(join_error.into())));
+                        error!("Task join error for block {}: {}", expected_block_number, join_error);
+                        header_results.push(Err(join_error.into()));
                     }
                 }
             }
 
             // Step 4.4: Ensure contiguity - stop at first failure
-            let mut fetched_blocks = Vec::new();
-            for (block_number, result) in block_results {
+            let mut fetched_headers = Vec::new();
+            for result in header_results {
                 match result {
-                    Ok(block) => {
-                        fetched_blocks.push((block_number, block));
+                    Ok(header) => {
+                        fetched_headers.push(header);
                     }
                     Err(e) => {
+                        // Can't get block number from failed header, use index instead
+                        let failed_block_number = start_block + fetched_headers.len() as u64;
                         error!(
                             "Failed to fetch block {}: {}. Stopping to maintain contiguity.",
-                            block_number, e
+                            failed_block_number, e
                         );
                         // Stop at first gap to maintain contiguity
                         break;
@@ -813,24 +827,24 @@ async fn remote_chain_tracker(
                 }
             }
 
-            if fetched_blocks.len() < blocks_to_fetch as usize {
+            if fetched_headers.len() < blocks_to_fetch as usize {
                 info!(
                     "Fetched {} out of {} requested blocks due to failures. Will retry missing blocks in next iteration.",
-                    fetched_blocks.len(),
+                    fetched_headers.len(),
                     blocks_to_fetch
                 );
             }
 
-            // Step 4.5: Add blocks to remote chain in order
-            for (block_number, block) in fetched_blocks {
-                match validator_db2.grow_remote_chain(&block.header) {
+            // Step 4.5: Add headers to remote chain
+            for header in fetched_headers {
+                match validator_db2.grow_remote_chain(&header) {
                     Ok(()) => {
-                        info!("Added block {} to remote chain", block_number);
+                        info!("Added block {} to remote chain", header.number);
                     }
                     Err(e) => {
                         error!(
                             "Failed to add block {} to remote chain: {}",
-                            block_number, e
+                            header.number, e
                         );
                         // Stop processing to avoid gaps in the chain
                         break;
@@ -896,18 +910,17 @@ mod tests {
         /// Ordered block number to hash mapping for number-based lookups
         block_hashes: BTreeMap<u64, BlockHash>,
 
-        /// Witness data indexed by (block_number, block_hash)
-        witness_data: HashMap<(u64, BlockHash), WitnessStatus>,
+        /// Witness data indexed by block hash
+        witness_data: HashMap<BlockHash, SaltWitness>,
 
         /// Contract bytecode cache
         contracts: HashMap<B256, Bytecode>,
 
-        /// Block range for quick lookups
-        min_block: u64,
-        max_block: u64,
+        /// Minimum block in the test data set (block number and hash)
+        min_block: (u64, BlockHash),
 
-        /// Starting block (parent of minimum block)
-        starting_block: (u64, BlockHash),
+        /// Maximum block in the test data set (block number and hash)
+        max_block: (u64, BlockHash),
     }
 
     /// Parse block number and hash from string
@@ -953,10 +966,10 @@ mod tests {
 
         // Initialize canonical chain tip using RpcModuleContext
         let context = create_rpc_module_context()?;
-        let starting_block = context.starting_block;
+        let local_tip = context.min_block;
 
         // Set the canonical chain tip to the starting block (parent of minimum test block)
-        validator_db.set_local_tip(starting_block.0, starting_block.1)?;
+        validator_db.set_local_tip(local_tip.0, local_tip.1)?;
 
         // Keep the temp dir alive by leaking it. OS will clean it when test process ends.
         std::mem::forget(temp_dir);
@@ -1012,7 +1025,7 @@ mod tests {
 
                 let block_number = if hex_number == "finalized" {
                     // Return the smallest block number for "finalized" tag
-                    context.min_block
+                    context.min_block.0
                 } else {
                     // Parse hex number as before
                     u64::from_str_radix(&hex_number[2..], 16).unwrap_or(0)
@@ -1050,7 +1063,46 @@ mod tests {
         module
             .register_method("eth_blockNumber", |_params, context, _| {
                 // Return the largest block number available in test data
-                Ok::<String, ErrorObjectOwned>(format!("0x{:x}", context.max_block))
+                Ok::<String, ErrorObjectOwned>(format!("0x{:x}", context.max_block.0))
+            })
+            .unwrap();
+
+        module
+            .register_method("eth_getWitness", |params, context, _| {
+                let (hash_str,): (String,) = params.parse().unwrap();
+
+                // Parse hash string to BlockHash
+                let block_hash = match parse_block_hash(&hash_str) {
+                    Ok(hash) => hash,
+                    Err(e) => {
+                        return Err(ErrorObject::owned(
+                            INVALID_PARAMS_CODE,
+                            format!("Invalid block hash: {}", e),
+                            None::<()>,
+                        ));
+                    }
+                };
+
+                // Look up witness data by block hash
+                match context.witness_data.get(&block_hash) {
+                    Some(salt_witness) => {
+                        // Serialize SaltWitness back to Vec<u8> for RPC response
+                        match bincode::serde::encode_to_vec(salt_witness, bincode::config::legacy())
+                        {
+                            Ok(witness_bytes) => Ok(witness_bytes),
+                            Err(e) => Err(ErrorObject::owned(
+                                CALL_EXECUTION_FAILED_CODE,
+                                format!("Failed to serialize SaltWitness: {}", e),
+                                None::<()>,
+                            )),
+                        }
+                    }
+                    None => Err(ErrorObject::owned(
+                        CALL_EXECUTION_FAILED_CODE,
+                        format!("Witness for block {} not found", hash_str),
+                        None::<()>,
+                    )),
+                }
             })
             .unwrap();
 
@@ -1169,27 +1221,20 @@ mod tests {
         }
 
         block_numbers.sort_unstable();
-        let min_block = *block_numbers.first().unwrap();
-        let max_block = *block_numbers.last().unwrap();
+        let min_block_num = *block_numbers.first().unwrap();
+        let max_block_num = *block_numbers.last().unwrap();
+
+        // Get the hashes for the minimum and maximum block numbers
+        let min_block_hash = *block_hashes.get(&min_block_num).unwrap();
+        let max_block_hash = *block_hashes.get(&max_block_num).unwrap();
+        let min_block = (min_block_num, min_block_hash);
+        let max_block = (max_block_num, max_block_hash);
 
         info!(
             "Loaded {} blocks (range: {} - {})",
             block_numbers.len(),
-            min_block,
-            max_block
-        );
-
-        // Calculate starting block (parent of minimum block)
-        let min_block_hash = block_hashes.get(&min_block).unwrap();
-        let min_block_data = blocks_by_hash.get(min_block_hash).unwrap();
-        let starting_block = (
-            min_block - 1,
-            BlockHash::from(min_block_data.header.parent_hash),
-        );
-
-        info!(
-            "Starting block: number={}, hash={}",
-            starting_block.0, starting_block.1
+            min_block.0,
+            max_block.0
         );
 
         // Load witness data from TEST_WITNESS_DIR
@@ -1206,7 +1251,7 @@ mod tests {
                 if file_path.extension().and_then(|s| s.to_str()) == Some("w") {
                     // Parse filename for block info
                     let block_num_and_hash = file_path.file_stem().unwrap().to_str().unwrap();
-                    let (block_number, block_hash) = parse_block_num_and_hash(block_num_and_hash)?;
+                    let (_, block_hash) = parse_block_num_and_hash(block_num_and_hash)?;
 
                     // Read and deserialize witness file
                     let file_data = std::fs::read(&file_path)?;
@@ -1231,7 +1276,21 @@ mod tests {
                             )
                         })?;
 
-                    witness_data.insert((block_number, block_hash), witness_status);
+                    // Extract and deserialize SaltWitness from WitnessStatus
+                    let (salt_witness, _): (SaltWitness, usize) =
+                        bincode::serde::decode_from_slice(
+                            &witness_status.witness_data,
+                            bincode::config::legacy(),
+                        )
+                        .map_err(|e| {
+                            anyhow!(
+                                "Failed to deserialize SaltWitness from WitnessStatus {}: {}",
+                                block_num_and_hash,
+                                e
+                            )
+                        })?;
+
+                    witness_data.insert(block_hash, salt_witness);
                     witness_count += 1;
                 }
             }
@@ -1255,7 +1314,6 @@ mod tests {
             contracts,
             min_block,
             max_block,
-            starting_block,
         })
     }
 
@@ -1272,8 +1330,10 @@ mod tests {
             context.witness_data.len(),
             context.contracts.len()
         );
-        info!("Block range: {} - {}", context.min_block, context.max_block);
-        info!("Starting block: {}", context.starting_block.1);
+        info!(
+            "Block range: {} - {}",
+            context.min_block.0, context.max_block.0
+        );
 
         let handle = setup_mock_rpc_server(context).await;
         let client = Arc::new(RpcClient::new("http://127.0.0.1:59545").unwrap());

@@ -64,6 +64,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use revm::state::Bytecode;
 use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
+use serde_json;
 
 /// Stores our local view of the canonical chain.
 ///
@@ -244,7 +245,7 @@ impl ValidatorDB2 {
 
             // Stores the complete block data for worker access (BLOCK_DATA)
             let mut block_data = write_txn.open_table(BLOCK_DATA)?;
-            let serialized_block = encode_to_vec(block)?;
+            let serialized_block = encode_block_to_vec(block)?;
             block_data.insert(block_hash, serialized_block)?;
 
             // ... and the cryptographic witness (WITNESSES)
@@ -491,7 +492,7 @@ impl ValidatorDB2 {
                     let block_data = write_txn.open_table(BLOCK_DATA)?;
                     let witnesses = write_txn.open_table(WITNESSES)?;
 
-                    let block = decode_from_slice(
+                    let block = decode_block_from_slice(
                         &block_data
                             .get(block_hash)?
                             .ok_or_else(|| anyhow!("Block data not found"))?
@@ -650,4 +651,14 @@ fn decode_from_slice<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> 
     bincode::serde::decode_from_slice(bytes, bincode::config::legacy())
         .map_err(|e| anyhow!("Failed to deserialize data: {e}"))
         .map(|(data, _)| data)
+}
+
+/// Helper method to serialize Block<Transaction> using JSON
+fn encode_block_to_vec(block: &Block<Transaction>) -> Result<Vec<u8>> {
+    serde_json::to_vec(block).map_err(|e| anyhow!("Failed to serialize block to JSON: {e}"))
+}
+
+/// Helper method to deserialize Block<Transaction> using JSON
+fn decode_block_from_slice(bytes: &[u8]) -> Result<Block<Transaction>> {
+    serde_json::from_slice(bytes).map_err(|e| anyhow!("Failed to deserialize block from JSON: {e}"))
 }
