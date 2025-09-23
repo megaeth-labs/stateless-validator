@@ -330,14 +330,6 @@ async fn wait_and_validate(
             let block = blocks_result?;
             let (salt_witness, _size): (SaltWitness, usize) = witness_decode_result??;
 
-            let old_state_root = get_root(
-                client.as_ref(),
-                &validator_db,
-                block_counter - 1,
-                block.header.parent_hash,
-            )
-            .await?;
-
             let contract_codes = extract_contract_codes(&salt_witness);
 
             let mut contracts_guard = contracts.lock().await;
@@ -366,11 +358,11 @@ async fn wait_and_validate(
             contracts_guard.extend(new_contracts.clone());
 
             // Perform the actual block validation
-            let revm_contracts: revm::primitives::HashMap<B256, Bytecode> = contracts_guard
+            let std_contracts: HashMap<B256, Bytecode> = contracts_guard
                 .iter()
                 .map(|(k, v)| (*k, v.clone()))
                 .collect();
-            match validate_block(&block, salt_witness, old_state_root, &revm_contracts) {
+            match validate_block(&block, salt_witness, &std_contracts) {
                 Ok(()) => {
                     info!(
                         "Validation SUCCESS for block {}. State root: 0x{}",
@@ -403,26 +395,6 @@ async fn wait_and_validate(
             drop(contracts_guard);
         }
     }
-}
-
-/// Retrieves the state root for a given block number.
-///
-/// It first attempts to find the state root from the local validation files. If not found, it
-/// falls back to fetching the block from the RPC endpoint.
-async fn get_root(
-    client: &RpcClient,
-    validator_db: &ValidatorDB,
-    block_number: u64,
-    block_hash: B256,
-) -> Result<B256> {
-    let validate_info = validator_db.load_validate_info(block_number, block_hash)?;
-    if validate_info.state_root.is_zero() {
-        // If state root is not in our validation records, fetch from RPC.
-        let block = client.block_by_number(block_number, false).await?;
-        return Ok(block.header.state_root);
-    }
-
-    Ok(validate_info.state_root)
 }
 
 /// Returns all contract addresses and their code hashes from the witness.
@@ -465,9 +437,6 @@ async fn validation_worker(
 ) -> Result<()> {
     info!("Validation worker {} started", worker_id);
 
-    // Contract cache shared by this worker (following current architecture)
-    let contracts = Arc::new(Mutex::new(HashMap::<B256, Bytecode>::default()));
-
     loop {
         // Step 1: Get next validation task atomically
         match validator_db2.get_next_task()? {
@@ -477,92 +446,86 @@ async fn validation_worker(
 
                 info!("Worker {} validating block {}", worker_id, block_number);
 
-                // Step 2: Get the previous state root for validation
-                // TODO: This logic should be improved to handle the parent block properly
-                let old_state_root = if block_number > 0 {
-                    // For now, use a placeholder - this needs proper implementation
-                    block.header.parent_hash
-                } else {
-                    B256::ZERO
-                };
-
-                // Step 3: Handle contract code fetching (following existing pattern)
+                // Step 2: Handle contract code fetching using database cache only
                 let contract_codes = extract_contract_codes(&witness);
-                let mut contracts_guard = contracts.lock().await;
 
-                let new_contracts_address = contract_codes
-                    .iter()
-                    .filter_map(|(address, code_hash)| {
-                        if !contracts_guard.contains_key(code_hash) {
-                            // Check if we have it in the database cache first
-                            match validator_db2.get_contract_code(*code_hash) {
-                                Ok(Some(bytecode)) => {
-                                    contracts_guard.insert(*code_hash, bytecode);
-                                    None
-                                }
-                                _ => Some(*address),
-                            }
-                        } else {
-                            None
+                // Find contracts that need to be fetched from RPC
+                let mut contracts_to_fetch = Vec::new();
+                for (address, code_hash) in &contract_codes {
+                    // Check if we have it in the database cache
+                    match validator_db2.get_contract_code(*code_hash) {
+                        Ok(Some(_)) => {
+                            // Already cached, no need to fetch
                         }
-                    })
-                    .collect::<Vec<_>>();
+                        _ => {
+                            // Not cached, need to fetch from RPC
+                            contracts_to_fetch.push(*address);
+                        }
+                    }
+                }
 
                 // Fetch any missing contract codes from RPC
-                if !new_contracts_address.is_empty() {
+                if !contracts_to_fetch.is_empty() {
                     let codes = client
-                        .codes_at(&new_contracts_address, (block_number - 1).into())
+                        .codes_at(&contracts_to_fetch, (block_number - 1).into())
                         .await?;
 
                     for bytes in &codes {
                         let bytecode = Bytecode::new_raw(bytes.clone());
-                        let code_hash = bytecode.hash_slow();
-                        contracts_guard.insert(code_hash, bytecode.clone());
-
                         // Cache the bytecode in the database for other workers
                         validator_db2.add_contract_code(&bytecode)?;
                     }
                 }
 
-                // Step 4: Perform validation using existing validate_block function
-                let revm_contracts: revm::primitives::HashMap<B256, Bytecode> = contracts_guard
+                // Step 3: Build contracts HashMap from database for validation
+                let contracts: HashMap<B256, Bytecode> = contract_codes
                     .iter()
-                    .map(|(k, v)| (*k, v.clone()))
+                    .filter_map(|(_, code_hash)| {
+                        validator_db2
+                            .get_contract_code(*code_hash)
+                            .ok()
+                            .flatten()
+                            .map(|bytecode| (*code_hash, bytecode))
+                    })
                     .collect();
-                let validation_result =
-                    match validate_block(&block, witness, old_state_root, &revm_contracts) {
-                        Ok(()) => {
-                            info!(
-                                "Worker {} successfully validated block {}",
-                                worker_id, block_number
-                            );
-                            ValidationResult {
-                                block_number,
-                                block_hash,
-                                success: true,
-                                error_message: None,
-                                completed_at: curent_time_to_u64(),
-                            }
-                        }
-                        Err(e) => {
-                            error!(
-                                "Worker {} failed to validate block {}: {}",
-                                worker_id, block_number, e
-                            );
-                            ValidationResult {
-                                block_number,
-                                block_hash,
-                                success: false,
-                                error_message: Some(e.to_string()),
-                                completed_at: curent_time_to_u64(),
-                            }
-                        }
-                    };
 
-                // Step 5: Record validation result
+                // Extract pre-state root from witness before validation
+                let pre_state_root = B256::from(witness.state_root()?);
+                let validation_result = match validate_block(&block, witness, &contracts) {
+                    Ok(()) => {
+                        info!(
+                            "Worker {} successfully validated block {}",
+                            worker_id, block_number
+                        );
+                        ValidationResult {
+                            pre_state_root,
+                            post_state_root: block.header.state_root,
+                            block_number,
+                            block_hash,
+                            success: true,
+                            error_message: None,
+                            completed_at: curent_time_to_u64(),
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            "Worker {} failed to validate block {}: {}",
+                            worker_id, block_number, e
+                        );
+                        ValidationResult {
+                            pre_state_root,
+                            post_state_root: block.header.state_root,
+                            block_number,
+                            block_hash,
+                            success: false,
+                            error_message: Some(e.to_string()),
+                            completed_at: curent_time_to_u64(),
+                        }
+                    }
+                };
+
+                // Step 4: Record validation result
                 validator_db2.complete_validation(validation_result)?;
-
-                drop(contracts_guard);
             }
             None => {
                 // No tasks available, wait a bit before checking again

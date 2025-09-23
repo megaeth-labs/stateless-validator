@@ -25,7 +25,7 @@ op-revm = { version = "8.1.0", default-features = false }
 revm = { version = "27.1.0", default-features = false }
 
 mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "5c7b39dfb5d7890cc5cbf1d1080af808ce2fd187" }
-salt = { git = "https://github.com/megaeth-labs/salt.git", branch = "main" }
+salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "bbc85449049c8e80a9ea4600b0a90f1143abed4b" }
 
 bincode = { version = "2.0", features = ["serde"] }
 blake3 = "1.8"

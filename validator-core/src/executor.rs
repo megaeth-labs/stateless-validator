@@ -38,10 +38,11 @@ use revm::{
     context::{BlockEnv, CfgEnv, ContextTr},
     database::states::StateBuilder,
     handler::EvmTr,
-    primitives::{B256, HashMap, KECCAK_EMPTY, U256},
+    primitives::{B256, KECCAK_EMPTY, U256},
     state::Bytecode,
 };
 use salt::{EphemeralSaltState, SaltWitness, StateRoot, Witness};
+use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::{
@@ -63,10 +64,10 @@ pub enum ValidationError {
     BlockReplayFailed(#[source] alloy_evm::block::BlockExecutionError),
 
     #[error("Failed to update salt state: {0}")]
-    StateUpdateFailed(&'static str),
+    StateUpdateFailed(#[source] salt::SaltError),
 
     #[error("Failed to update salt trie: {0}")]
-    TrieUpdateFailed(&'static str),
+    TrieUpdateFailed(#[source] salt::SaltError),
 
     #[error("State root mismatch: claimed {claimed}, got {actual}")]
     StateRootMismatch {
@@ -234,7 +235,7 @@ fn replay_block(
 ///
 /// This function performs the core validation logic:
 /// 1. Creates a Witness from the provided SaltWitness
-/// 2. Verifies the witness proof against the old state root
+/// 2. Verifies the witness proof
 /// 3. Replays the block transactions using the witness database
 /// 4. Computes the new state root and compares it with the expected one
 ///
@@ -242,7 +243,6 @@ fn replay_block(
 ///
 /// * `block` - The block to validate containing transactions and header information
 /// * `salt_witness` - The salt witness data needed for state reconstruction
-/// * `old_state_root` - The previous block's state root for proof verification
 /// * `contracts` - Contract bytecode cache for transaction execution
 ///
 /// # Returns
@@ -252,13 +252,12 @@ fn replay_block(
 pub fn validate_block(
     block: &Block<OpTransaction>,
     salt_witness: SaltWitness,
-    old_state_root: B256,
     contracts: &HashMap<B256, Bytecode>,
 ) -> Result<(), ValidationError> {
     // Verify witness proof against the current state root
     let witness = Witness::from(salt_witness);
     witness
-        .verify(*old_state_root)
+        .verify()
         .map_err(ValidationError::WitnessVerificationFailed)?;
 
     // Replay block transactions

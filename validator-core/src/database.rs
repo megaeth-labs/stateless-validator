@@ -11,10 +11,11 @@ use alloy_rpc_types_eth::Header;
 use revm::{
     DatabaseRef,
     database::DBErrorMarker,
-    primitives::{Bytes, HashMap, KECCAK_EMPTY, U256},
+    primitives::{Bytes, KECCAK_EMPTY, U256},
     state::{AccountInfo, Bytecode},
 };
 use salt::{EphemeralSaltState, Witness};
+use std::collections::HashMap;
 
 /// Error type for witness database operations
 #[derive(Debug, Clone)]

@@ -169,6 +169,10 @@ const CONTRACTS: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("cont
 /// Represents the result of a validation operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationResult {
+    /// The pre-state root from the witness before block execution
+    pub pre_state_root: B256,
+    /// The post-state root after block execution (from block header)
+    pub post_state_root: B256,
     /// The block number that was validated
     pub block_number: BlockNumber,
     /// The block hash that was validated
@@ -334,6 +338,22 @@ impl ValidatorDB2 {
 
                 if header.parent_hash != parent_hash {
                     return Err(anyhow!("Block parent_hash mismatch"));
+                }
+
+                // Verify pre-state root matches parent block's post-state root
+                let parent_result_data = validation_results
+                    .get(parent_hash)?
+                    .ok_or_else(|| anyhow!("Parent block validation result not found"))?;
+                let parent_result: ValidationResult =
+                    decode_from_slice(&parent_result_data.value())?;
+
+                // The parent's post-state root should match this block's pre-state root
+                if result.pre_state_root != parent_result.post_state_root {
+                    return Err(anyhow!(
+                        "State root continuity broken: block expects pre-state {}, parent computed {}",
+                        result.pre_state_root,
+                        parent_result.post_state_root
+                    ));
                 }
             }
 
