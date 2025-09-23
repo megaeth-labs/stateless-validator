@@ -420,16 +420,28 @@ fn extract_contract_codes(salt_witness: &SaltWitness) -> Vec<(Address, B256)> {
 
 /// Individual validation worker that processes blocks from the task queue
 ///
+/// This worker operates in a continuous loop with robust error handling to ensure
+/// operational resilience. Unlike the previous implementation, errors from infrastructure
+/// components (database, RPC) are contained and logged rather than terminating the worker.
+///
 /// Each worker continuously:
 /// 1. Claims the next validation task from ValidatorDB2
 /// 2. Performs block validation using the existing validate_block function
 /// 3. Handles contract code caching as needed
 /// 4. Records validation results back to ValidatorDB2
 ///
+/// # Error Handling Strategy
+/// - **Infrastructure errors** (database, RPC failures): Logged and contained, worker continues
+/// - **Validation errors** (state root mismatches): Recorded as failed ValidationResults
+/// - **Task processing errors**: Individual task failures don't affect subsequent tasks
+///
 /// # Arguments
 /// * `worker_id` - Unique identifier for this worker (for logging)
 /// * `client` - RPC client for fetching contract bytecode as needed
 /// * `validator_db2` - Database interface for task coordination
+///
+/// # Returns
+/// * `Result<()>` - Only returns on fatal errors that require worker restart
 async fn validation_worker(
     worker_id: usize,
     client: Arc<RpcClient>,
@@ -438,125 +450,154 @@ async fn validation_worker(
     info!("Validation worker {} started", worker_id);
 
     loop {
-        // Step 1: Get next validation task atomically
-        match validator_db2.get_next_task()? {
-            Some((block, witness)) => {
-                let block_number = block.header.number;
-                let block_hash = block.header.hash;
-
-                info!("Worker {} validating block {}", worker_id, block_number);
-
-                // Step 2: Handle contract code fetching using database cache only
-                let contract_codes = extract_contract_codes(&witness);
-
-                // Find contracts that need to be fetched from RPC
-                let mut contracts_to_fetch = Vec::new();
-                for (address, code_hash) in &contract_codes {
-                    // Check if we have it in the database cache
-                    match validator_db2.get_contract_code(*code_hash) {
-                        Ok(Some(_)) => {
-                            // Already cached, no need to fetch
-                        }
-                        _ => {
-                            // Not cached, need to fetch from RPC
-                            contracts_to_fetch.push(*address);
-                        }
-                    }
-                }
-
-                // Fetch any missing contract codes from RPC
-                if !contracts_to_fetch.is_empty() {
-                    let codes = client
-                        .codes_at(&contracts_to_fetch, (block_number - 1).into())
-                        .await?;
-
-                    for bytes in &codes {
-                        let bytecode = Bytecode::new_raw(bytes.clone());
-                        // Cache the bytecode in the database for other workers
-                        validator_db2.add_contract_code(&bytecode)?;
-                    }
-                }
-
-                // Step 3: Build contracts HashMap from database for validation
-                let contracts: HashMap<B256, Bytecode> = contract_codes
-                    .iter()
-                    .filter_map(|(_, code_hash)| {
-                        validator_db2
-                            .get_contract_code(*code_hash)
-                            .ok()
-                            .flatten()
-                            .map(|bytecode| (*code_hash, bytecode))
-                    })
-                    .collect();
-
-                // Extract pre-state root from witness before validation
-                let pre_state_root = B256::from(witness.state_root()?);
-                let validation_result = match validate_block(&block, witness, &contracts) {
-                    Ok(()) => {
-                        info!(
-                            "Worker {} successfully validated block {}",
-                            worker_id, block_number
-                        );
-                        ValidationResult {
-                            pre_state_root,
-                            post_state_root: block.header.state_root,
-                            block_number,
-                            block_hash,
-                            success: true,
-                            error_message: None,
-                            completed_at: curent_time_to_u64(),
-                        }
-                    }
-                    Err(e) => {
-                        error!(
-                            "Worker {} failed to validate block {}: {}",
-                            worker_id, block_number, e
-                        );
-                        ValidationResult {
-                            pre_state_root,
-                            post_state_root: block.header.state_root,
-                            block_number,
-                            block_hash,
-                            success: false,
-                            error_message: Some(e.to_string()),
-                            completed_at: curent_time_to_u64(),
-                        }
-                    }
-                };
-
-                // Step 4: Record validation result
-                validator_db2.complete_validation(validation_result)?;
-            }
-            None => {
-                // No tasks available, wait a bit before checking again
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
+        // Process individual task with error containment
+        if let Err(e) = process_single_task(worker_id, &client, &validator_db2).await {
+            error!(
+                "Worker {} encountered error during task processing: {}",
+                worker_id, e
+            );
+            // Continue to next iteration instead of terminating worker
         }
+
+        // Small delay to prevent tight error loops
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
-/// Single iteration of the chain synchronizer logic
+/// Processes a single validation task with comprehensive error handling
 ///
-/// Performs one cycle of chain synchronization:
-/// 1. Monitor chain head progression
-/// 2. Track block finality status
-/// 3. Detect and handle reorganizations
-/// 4. Fetch new blocks and witnesses
-/// 5. Create validation tasks
-/// 6. Process validation results and advance canonical chain
-/// 7. Prune old data
+/// This function encapsulates the complete workflow for processing one validation task,
+/// including task acquisition, contract code fetching, block validation, and result storage.
+/// All errors are propagated to the caller for centralized error handling.
+///
+/// # Workflow
+/// 1. **Task Acquisition**: Get next pending validation task from database
+/// 2. **Contract Fetching**: Retrieve required contract bytecode from cache or RPC
+/// 3. **Block Validation**: Execute block using validate_block with witness data
+/// 4. **Result Storage**: Record validation outcome in database
+///
+/// # Arguments
+/// * `worker_id` - Unique identifier for this worker (for logging)
+/// * `client` - RPC client for fetching contract bytecode from remote nodes
+/// * `validator_db2` - Database interface for task coordination and result storage
+///
+/// # Returns
+/// * `Ok(())` - Task processed successfully (validation may have succeeded or failed)
+/// * `Err(eyre::Error)` - Infrastructure error occurred (database, RPC, serialization)
+///
+/// # Error Categories
+/// - **No tasks available**: Returns Ok() after brief sleep
+/// - **Database errors**: Propagated to caller for retry logic
+/// - **RPC errors**: Propagated to caller for retry logic
+/// - **Validation errors**: Captured and stored as failed ValidationResult
+async fn process_single_task(
+    worker_id: usize,
+    client: &RpcClient,
+    validator_db2: &ValidatorDB2,
+) -> Result<()> {
+    // Step 1: Get next validation task atomically
+    match validator_db2.get_next_task()? {
+        Some((block, witness)) => {
+            let block_number = block.header.number;
+            let block_hash = block.header.hash;
+
+            info!("Worker {} validating block {}", worker_id, block_number);
+
+            // Step 2: Handle contract code fetching using database cache only
+            let contract_codes = extract_contract_codes(&witness);
+
+            // Find contracts that need to be fetched from RPC
+            let mut contracts_to_fetch = Vec::new();
+            for (address, code_hash) in &contract_codes {
+                // Check if we have it in the database cache
+                match validator_db2.get_contract_code(*code_hash) {
+                    Ok(Some(_)) => {
+                        // Already cached, no need to fetch
+                    }
+                    _ => {
+                        // Not cached or error accessing cache, need to fetch from RPC
+                        contracts_to_fetch.push(*address);
+                    }
+                }
+            }
+
+            // Fetch any missing contract codes from RPC
+            if !contracts_to_fetch.is_empty() {
+                let codes = client
+                    .codes_at(&contracts_to_fetch, (block_number - 1).into())
+                    .await?;
+
+                for bytes in &codes {
+                    let bytecode = Bytecode::new_raw(bytes.clone());
+                    // Cache the bytecode in the database for other workers
+                    // Ignore caching errors - validation can proceed without caching
+                    let _ = validator_db2.add_contract_code(&bytecode);
+                }
+            }
+
+            // Step 3: Build contracts HashMap from database for validation
+            let contracts: HashMap<B256, Bytecode> = contract_codes
+                .iter()
+                .filter_map(|(_, code_hash)| {
+                    validator_db2
+                        .get_contract_code(*code_hash)
+                        .ok()
+                        .flatten()
+                        .map(|bytecode| (*code_hash, bytecode))
+                })
+                .collect();
+
+            // Extract pre-state root from witness before validation
+            let pre_state_root = B256::from(witness.state_root()?);
+            let validation_result = match validate_block(&block, witness, &contracts) {
+                Ok(()) => {
+                    info!(
+                        "Worker {} successfully validated block {}",
+                        worker_id, block_number
+                    );
+                    ValidationResult {
+                        pre_state_root,
+                        post_state_root: block.header.state_root,
+                        block_number,
+                        block_hash,
+                        success: true,
+                        error_message: None,
+                        completed_at: curent_time_to_u64(),
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Worker {} failed to validate block {}: {}",
+                        worker_id, block_number, e
+                    );
+                    ValidationResult {
+                        pre_state_root,
+                        post_state_root: block.header.state_root,
+                        block_number,
+                        block_hash,
+                        success: false,
+                        error_message: Some(e.to_string()),
+                        completed_at: curent_time_to_u64(),
+                    }
+                }
+            };
+
+            // Step 4: Record validation result
+            validator_db2.complete_validation(validation_result)?;
+        }
+        None => {
+            // No tasks available, wait a bit before checking again
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    Ok(())
+}
+
+/// Single iteration of the chain synchronizer logic
 async fn chain_sync_iteration(_client: &RpcClient, validator_db2: &ValidatorDB2) -> Result<()> {
-    // TODO: Implement chain head monitoring
-    // Need to add RPC methods to get latest block number and finalized block number
-
-    // TODO: Implement block fetching and witness handling
-    // Need to determine source of witness data (not specified in current RPC client)
-
     // TODO: Implement result processing and chain growth
     // Process completed validation results and advance canonical chain
-
-    // TODO: Implement reorganization detection
-    // Compare local canonical tip with remote chain head
 
     // TODO: Implement data pruning
     // Remove old block data beyond retention policy
@@ -734,7 +775,7 @@ async fn remote_chain_tracker(
                     let validator_db2_clone = validator_db2.clone();
                     tokio::spawn(async move {
                         // Fetch block first
-                        let block = client_clone.block_by_number(block_number, false).await?;
+                        let block = client_clone.block_by_number(block_number, true).await?;
                         // Then fetch witness using block hash
                         let witness = client_clone.witness_by_block_hash(block.header.hash).await?;
 
@@ -905,19 +946,24 @@ mod tests {
         Ok((block_str.parse()?, parse_block_hash(hash_str)?))
     }
 
-    /// Creates a ValidatorDB populated with test witness data for integration testing.
+    /// Creates a ValidatorDB2 instance for integration testing with pre-populated test data.
     ///
-    /// Sets up a temporary database and loads witness files from `TEST_WITNESS_DIR`
-    /// (files with `.w` extension). The temporary directory will be cleaned up
-    /// automatically after the test ends.
+    /// Sets up a temporary database and initializes it with the necessary test data for
+    /// integration testing. The function performs the following setup steps:
+    /// 1. Creates a temporary directory and ValidatorDB2 instance
+    /// 2. Initializes the canonical chain tip using the minimum block from test data
+    /// 3. Populates the CONTRACTS table with test contract bytecode from `CONTRACTS_FILE`
+    ///
+    /// The temporary directory will be cleaned up automatically after the test ends.
     ///
     /// # Returns
     ///
-    /// `Arc<ValidatorDB>` - Database instance with loaded test data
+    /// `Arc<ValidatorDB2>` - Database instance with initialized chain tip and contract cache
     ///
     /// # Errors
     ///
-    /// Returns error if directory creation, file I/O, or witness deserialization fails.
+    /// Returns error if temporary directory creation, database initialization,
+    /// test data loading, or contract population fails.
     fn setup_test_db() -> Result<Arc<ValidatorDB2>> {
         let temp_dir = tempfile::tempdir()
             .map_err(|e| anyhow!("Failed to create temporary directory: {e}"))?;
@@ -933,6 +979,25 @@ mod tests {
 
         // Set the canonical chain tip to the starting block (parent of minimum test block)
         validator_db.set_local_tip(local_tip.0, local_tip.1)?;
+
+        // Populate CONTRACTS table with test contract bytecode
+        info!("Populating CONTRACTS table from test data...");
+        let contracts = load_contracts(CONTRACTS_FILE);
+        let mut contracts_added = 0;
+
+        for (code_hash, bytecode) in contracts {
+            match validator_db.add_contract_code(&bytecode) {
+                Ok(()) => {
+                    contracts_added += 1;
+                }
+                Err(e) => {
+                    error!("Failed to add contract {code_hash} to database: {e}");
+                    return Err(e);
+                }
+            }
+        }
+
+        info!("Successfully populated CONTRACTS table with {contracts_added} contracts");
 
         // Keep the temp dir alive by leaking it. OS will clean it when test process ends.
         std::mem::forget(temp_dir);
