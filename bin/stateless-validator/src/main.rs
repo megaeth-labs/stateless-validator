@@ -595,21 +595,99 @@ async fn process_single_task(
 }
 
 /// Single iteration of the chain synchronizer logic
+///
+/// Processes completed validation results and advances the canonical chain by moving
+/// successfully validated blocks from the remote chain to the canonical chain.
+/// Also performs basic data pruning to maintain storage efficiency.
 async fn chain_sync_iteration(_client: &RpcClient, validator_db2: &ValidatorDB2) -> Result<()> {
-    // TODO: Implement result processing and chain growth
-    // Process completed validation results and advance canonical chain
+    let mut blocks_advanced = 0;
 
-    // TODO: Implement data pruning
-    // Remove old block data beyond retention policy
+    // Continuously try to advance the canonical chain with newly validated blocks
+    loop {
+        match validator_db2.grow_local_chain() {
+            Ok(()) => {
+                blocks_advanced += 1;
+                // Continue to try advancing the next block
+            }
+            Err(e) => {
+                // Cannot advance further - this could be due to:
+                // - Remote chain is empty
+                // - Next block is not validated yet
+                // - Next block validation failed
+                // - Chain continuity issues
+                if blocks_advanced == 0 {
+                    // Only log if we haven't advanced any blocks in this iteration
+                    match e.to_string().as_str() {
+                        msg if msg.contains("Remote chain is empty") => {
+                            // This is normal when no blocks are queued
+                        }
+                        msg if msg.contains("not validated") => {
+                            // This is normal when validation is still in progress
+                        }
+                        msg if msg.contains("failed validation") => {
+                            warn!("Cannot advance chain due to failed validation: {}", e);
+                        }
+                        _ => {
+                            warn!("Cannot advance chain: {}", e);
+                        }
+                    }
+                }
+                break; // Stop trying to advance
+            }
+        }
+    }
 
-    // Placeholder implementation - just log that we're running
-    if let Some((tip_number, tip_hash)) = validator_db2.get_local_tip()? {
-        info!(
-            "Current canonical tip: block {} hash {}",
-            tip_number, tip_hash
-        );
-    } else {
-        info!("No canonical chain established yet");
+    // Log current chain status
+    match (
+        validator_db2.get_local_tip()?,
+        validator_db2.get_remote_tip()?,
+    ) {
+        (Some((local_number, local_hash)), Some((remote_number, remote_hash))) => {
+            info!(
+                "Chain status: local_tip=block {} ({}), remote_tip=block {} ({}), gap={}",
+                local_number,
+                local_hash,
+                remote_number,
+                remote_hash,
+                remote_number.saturating_sub(local_number)
+            );
+        }
+        (Some((local_number, local_hash)), None) => {
+            info!(
+                "Chain status: local_tip=block {} ({}), no remote chain",
+                local_number, local_hash
+            );
+        }
+        (None, Some((remote_number, remote_hash))) => {
+            info!(
+                "Chain status: no local chain, remote_tip=block {} ({})",
+                remote_number, remote_hash
+            );
+        }
+        (None, None) => {
+            info!("Chain status: no local or remote chain established");
+        }
+    }
+
+    // Report advancement progress
+    if blocks_advanced > 0 {
+        info!("Advanced canonical chain by {} blocks", blocks_advanced);
+    }
+
+    // Perform basic data pruning - keep last 1000 blocks
+    if let Some((current_tip, _)) = validator_db2.get_local_tip()? {
+        const BLOCKS_TO_KEEP: u64 = 1000;
+        if current_tip > BLOCKS_TO_KEEP {
+            let prune_before = current_tip - BLOCKS_TO_KEEP;
+            match validator_db2.prune_history(prune_before) {
+                Ok(()) => {
+                    info!("Pruned block data before block {}", prune_before);
+                }
+                Err(e) => {
+                    warn!("Failed to prune old block data: {}", e);
+                }
+            }
+        }
     }
 
     Ok(())

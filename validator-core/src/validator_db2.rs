@@ -284,19 +284,50 @@ impl ValidatorDB2 {
         Ok(())
     }
 
-    /// Extends the canonical chain with a validated block
+    /// Extends the canonical chain with the next validated block
     ///
-    /// Adds a successfully validated block to the canonical chain. Verifies that
-    /// the block's parent_hash matches the current canonical tip to ensure proper
-    /// chain extension.
-    pub fn grow_local_chain(&self, header: &Header) -> Result<()> {
-        let block_hash = BlockHash::from(header.hash);
-
+    /// Automatically gets the first block from the remote chain, verifies it has been
+    /// successfully validated, and moves it to the canonical chain. Performs all necessary
+    /// validations including parent hash matching and state root continuity.
+    pub fn grow_local_chain(&self) -> Result<()> {
         let write_txn = self.database.begin_write()?;
         {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
             let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
             let validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
+            let block_data = write_txn.open_table(BLOCK_DATA)?;
+
+            // Get the first block from remote chain (next block to advance)
+            let (first_block_number, first_block_hash) = {
+                let first_remote_entry = remote_chain
+                    .first()?
+                    .ok_or_else(|| anyhow!("Remote chain is empty"))?;
+                (first_remote_entry.0.value(), first_remote_entry.1.value())
+            };
+
+            let block_hash = BlockHash::from(first_block_hash);
+
+            // Load the block data to get the header
+            let serialized_block = block_data
+                .get(first_block_hash)?
+                .ok_or_else(|| anyhow!("Block data not found for hash {block_hash}"))?;
+            let block: Block<Transaction> = decode_block_from_slice(&serialized_block.value())?;
+            let header = block.header;
+
+            // Verify the header matches the remote chain entry
+            if header.number != first_block_number {
+                return Err(anyhow!(
+                    "Block number mismatch: header has {}, remote chain has {first_block_number}",
+                    header.number
+                ));
+            }
+
+            if header.hash != first_block_hash {
+                return Err(anyhow!(
+                    "Block hash mismatch: header has {}, remote chain has {block_hash}",
+                    header.hash
+                ));
+            }
 
             // Ensure block is successfully validated
             let serialized_result = validation_results
@@ -306,27 +337,6 @@ impl ValidatorDB2 {
 
             if !result.success {
                 return Err(anyhow!("Cannot grow chain with failed validation"));
-            }
-
-            // Verify the block is the first/oldest entry in remote chain
-            let (first_block_number, first_block_hash) = {
-                let first_remote_entry = remote_chain
-                    .first()?
-                    .ok_or_else(|| anyhow!("Remote chain is empty"))?;
-                (first_remote_entry.0.value(), first_remote_entry.1.value())
-            };
-
-            if header.number != first_block_number {
-                return Err(anyhow!(
-                    "Block number {number} is not the first entry in remote chain (expected {first_block_number})",
-                    number = header.number
-                ));
-            }
-
-            if block_hash.0 != first_block_hash {
-                return Err(anyhow!(
-                    "Block hash mismatch with first entry in remote chain"
-                ));
             }
 
             // Verify parent chain extension for canonical chain
