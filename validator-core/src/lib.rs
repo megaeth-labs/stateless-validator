@@ -18,9 +18,9 @@
 
 mod chain_spec;
 mod database;
-pub mod validator_db2;
-pub use validator_db2::{
-    StateData, ValidationResult, ValidatorDB2, curent_time_to_u64, deserialized_state_data,
+pub mod validator_db;
+pub use validator_db::{
+    StateData, ValidationResult, ValidatorDB, curent_time_to_u64, deserialized_state_data,
 };
 pub mod data_types;
 pub use data_types::{PlainKey, PlainValue};

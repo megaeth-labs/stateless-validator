@@ -1,4 +1,4 @@
-//! ValidatorDB2 - Central coordination database for stateless blockchain validation
+//! ValidatorDB - Central coordination database for stateless blockchain validation
 //!
 //! This module implements the core database layer that coordinates between the chain synchronizer
 //! and validation workers in the stateless validator architecture. It manages the complete
@@ -6,7 +6,7 @@
 //!
 //! ## Architecture Overview
 //!
-//! The ValidatorDB2 serves as the central workspace with two primary user types:
+//! The ValidatorDB serves as the central workspace with two primary user types:
 //! - **Chain Synchronizer**: Creates validation tasks, tracks chain progression, manages finality
 //! - **Validation Workers**: Pull tasks, perform validation, store results
 //!
@@ -187,17 +187,17 @@ pub struct ValidationResult {
     pub completed_at: u64,
 }
 
-/// ValidatorDB2 - The central workspace for coordination between components
+/// ValidatorDB - The central workspace for coordination between components
 ///
 /// Provides the database interface according to the design document for:
 /// - Main orchestrator to store validation tasks and retrieve results
 /// - Validation workers to pull tasks and store results
-pub struct ValidatorDB2 {
+pub struct ValidatorDB {
     /// The embedded redb database
     database: Database,
 }
 
-impl ValidatorDB2 {
+impl ValidatorDB {
     /// Create a new redb instance or open an existing one.
     ///
     /// Opens the database file at the given path. If the file already contains

@@ -22,10 +22,10 @@ use std::{
 use tokio::{signal, task};
 use tracing::{error, info, warn};
 use validator_core::{
-    ValidatorDB2, curent_time_to_u64,
+    ValidatorDB, curent_time_to_u64,
     data_types::{PlainKey, PlainValue},
     executor::validate_block,
-    validator_db2::ValidationResult,
+    validator_db::ValidationResult,
 };
 
 mod rpc;
@@ -93,20 +93,20 @@ async fn main() -> Result<()> {
     let work_dir = PathBuf::from(args.datadir);
 
     let client = Arc::new(RpcClient::new(&args.api)?);
-    let validator_db2 = setup_validator_db2(work_dir.join(VALIDATOR_DB_FILENAME)).await?;
+    let validator_db = setup_validator_db(work_dir.join(VALIDATOR_DB_FILENAME)).await?;
 
     let validator_logic = chain_sync(
         client.clone(),
-        validator_db2.clone(),
+        validator_db.clone(),
         concurrent_num,
         5,    // sync_interval_secs
         None, // sync_target (infinite sync)
     );
 
     if let Some(port) = args.port {
-        let mut module = RpcModule::new(validator_db2.clone());
+        let mut module = RpcModule::new(validator_db.clone());
 
-        module.register_method("stateless_getValidation", |params, validator_db2, _| {
+        module.register_method("stateless_getValidation", |params, validator_db, _| {
             // Helper function to create RPC errors
             let make_rpc_error = |code, msg: String| ErrorObject::owned(code, msg, None::<()>);
 
@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
                 make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid block hash: {e}"))
             })?;
 
-            match validator_db2.get_validation_result(block_hash) {
+            match validator_db.get_validation_result(block_hash) {
                 Ok(Some(result)) => Ok(result.success),
                 Ok(None) => Err(make_rpc_error(
                     INVALID_PARAMS_CODE,
@@ -175,13 +175,13 @@ fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
     Ok(BlockHash::from_slice(&hash_bytes))
 }
 
-/// Setup ValidatorDB2 instance for production use
+/// Setup ValidatorDB instance for production use
 ///
-/// Creates a new ValidatorDB2 instance at the specified path, initializing all required tables.
+/// Creates a new ValidatorDB instance at the specified path, initializing all required tables.
 /// This function is simpler than setup_test_db as it doesn't pre-populate test data.
-async fn setup_validator_db2(db_path: impl AsRef<std::path::Path>) -> Result<Arc<ValidatorDB2>> {
-    let validator_db2 = ValidatorDB2::new(db_path)?;
-    Ok(Arc::new(validator_db2))
+async fn setup_validator_db(db_path: impl AsRef<std::path::Path>) -> Result<Arc<ValidatorDB>> {
+    let validator_db = ValidatorDB::new(db_path)?;
+    Ok(Arc::new(validator_db))
 }
 
 /// Returns all contract addresses and their code hashes from the witness.
@@ -212,10 +212,10 @@ fn extract_contract_codes(salt_witness: &SaltWitness) -> Vec<(Address, B256)> {
 /// components (database, RPC) are contained and logged rather than terminating the worker.
 ///
 /// Each worker continuously:
-/// 1. Claims the next validation task from ValidatorDB2
+/// 1. Claims the next validation task from ValidatorDB
 /// 2. Performs block validation using the existing validate_block function
 /// 3. Handles contract code caching as needed
-/// 4. Records validation results back to ValidatorDB2
+/// 4. Records validation results back to ValidatorDB
 ///
 /// # Error Handling Strategy
 /// - **Infrastructure errors** (database, RPC failures): Logged and contained, worker continues
@@ -225,20 +225,20 @@ fn extract_contract_codes(salt_witness: &SaltWitness) -> Vec<(Address, B256)> {
 /// # Arguments
 /// * `worker_id` - Unique identifier for this worker (for logging)
 /// * `client` - RPC client for fetching contract bytecode as needed
-/// * `validator_db2` - Database interface for task coordination
+/// * `validator_db` - Database interface for task coordination
 ///
 /// # Returns
 /// * `Result<()>` - Only returns on fatal errors that require worker restart
 async fn validation_worker(
     worker_id: usize,
     client: Arc<RpcClient>,
-    validator_db2: Arc<ValidatorDB2>,
+    validator_db: Arc<ValidatorDB>,
 ) -> Result<()> {
     info!("Validation worker {} started", worker_id);
 
     loop {
         // Process individual task with error containment
-        if let Err(e) = process_single_task(worker_id, &client, &validator_db2).await {
+        if let Err(e) = process_single_task(worker_id, &client, &validator_db).await {
             error!(
                 "Worker {} encountered error during task processing: {}",
                 worker_id, e
@@ -266,7 +266,7 @@ async fn validation_worker(
 /// # Arguments
 /// * `worker_id` - Unique identifier for this worker (for logging)
 /// * `client` - RPC client for fetching contract bytecode from remote nodes
-/// * `validator_db2` - Database interface for task coordination and result storage
+/// * `validator_db` - Database interface for task coordination and result storage
 ///
 /// # Returns
 /// * `Ok(())` - Task processed successfully (validation may have succeeded or failed)
@@ -280,10 +280,10 @@ async fn validation_worker(
 async fn process_single_task(
     worker_id: usize,
     client: &RpcClient,
-    validator_db2: &ValidatorDB2,
+    validator_db: &ValidatorDB,
 ) -> Result<()> {
     // Step 1: Get next validation task atomically
-    match validator_db2.get_next_task()? {
+    match validator_db.get_next_task()? {
         Some((block, witness)) => {
             let block_number = block.header.number;
             let block_hash = block.header.hash;
@@ -297,7 +297,7 @@ async fn process_single_task(
             let mut contracts_to_fetch = Vec::new();
             for (address, code_hash) in &contract_codes {
                 // Check if we have it in the database cache
-                match validator_db2.get_contract_code(*code_hash) {
+                match validator_db.get_contract_code(*code_hash) {
                     Ok(Some(_)) => {
                         // Already cached, no need to fetch
                     }
@@ -318,7 +318,7 @@ async fn process_single_task(
                     let bytecode = Bytecode::new_raw(bytes.clone());
                     // Cache the bytecode in the database for other workers
                     // Ignore caching errors - validation can proceed without caching
-                    let _ = validator_db2.add_contract_code(&bytecode);
+                    let _ = validator_db.add_contract_code(&bytecode);
                 }
             }
 
@@ -326,7 +326,7 @@ async fn process_single_task(
             let contracts: HashMap<B256, Bytecode> = contract_codes
                 .iter()
                 .filter_map(|(_, code_hash)| {
-                    validator_db2
+                    validator_db
                         .get_contract_code(*code_hash)
                         .ok()
                         .flatten()
@@ -370,7 +370,7 @@ async fn process_single_task(
             };
 
             // Step 4: Record validation result
-            validator_db2.complete_validation(validation_result)?;
+            validator_db.complete_validation(validation_result)?;
         }
         None => {
             // No tasks available, wait a bit before checking again
@@ -386,12 +386,12 @@ async fn process_single_task(
 /// Processes completed validation results and advances the canonical chain by moving
 /// successfully validated blocks from the remote chain to the canonical chain.
 /// Also performs basic data pruning to maintain storage efficiency.
-async fn chain_sync_iteration(_client: &RpcClient, validator_db2: &ValidatorDB2) -> Result<()> {
+async fn chain_sync_iteration(_client: &RpcClient, validator_db: &ValidatorDB) -> Result<()> {
     let mut blocks_advanced = 0;
 
     // Continuously try to advance the canonical chain with newly validated blocks
     loop {
-        match validator_db2.grow_local_chain() {
+        match validator_db.grow_local_chain() {
             Ok(()) => {
                 blocks_advanced += 1;
                 // Continue to try advancing the next block
@@ -426,8 +426,8 @@ async fn chain_sync_iteration(_client: &RpcClient, validator_db2: &ValidatorDB2)
 
     // Log current chain status
     match (
-        validator_db2.get_local_tip()?,
-        validator_db2.get_remote_tip()?,
+        validator_db.get_local_tip()?,
+        validator_db.get_remote_tip()?,
     ) {
         (Some((local_number, local_hash)), Some((remote_number, remote_hash))) => {
             info!(
@@ -462,11 +462,11 @@ async fn chain_sync_iteration(_client: &RpcClient, validator_db2: &ValidatorDB2)
     }
 
     // Perform basic data pruning - keep last 1000 blocks
-    if let Some((current_tip, _)) = validator_db2.get_local_tip()? {
+    if let Some((current_tip, _)) = validator_db.get_local_tip()? {
         const BLOCKS_TO_KEEP: u64 = 1000;
         if current_tip > BLOCKS_TO_KEEP {
             let prune_before = current_tip - BLOCKS_TO_KEEP;
-            match validator_db2.prune_history(prune_before) {
+            match validator_db.prune_history(prune_before) {
                 Ok(()) => {
                     info!("Pruned block data before block {}", prune_before);
                 }
@@ -487,20 +487,20 @@ async fn chain_sync_iteration(_client: &RpcClient, validator_db2: &ValidatorDB2)
 /// - Tracks block finality status via remote RPC endpoint
 /// - Manages reorganization detection and recovery
 /// - Fetches block and witness data via remote RPC endpoint
-/// - Creates validation tasks and stores them in ValidatorDB2 for validation workers
+/// - Creates validation tasks and stores them in ValidatorDB for validation workers
 /// - Processes validation results to drive local chain tip progression
 /// - Prunes old block and witness data to maintain constant storage overhead
-/// - Coordinates with parallel validation workers via ValidatorDB2
+/// - Coordinates with parallel validation workers via ValidatorDB
 ///
 /// # Arguments
 /// * `client` - RPC client for communicating with remote blockchain node
-/// * `validator_db2` - Database interface for coordinating with validation workers
+/// * `validator_db` - Database interface for coordinating with validation workers
 /// * `concurrent_num` - Number of parallel validation workers to spawn
 /// * `sync_interval_secs` - Time to wait between sync cycles in seconds
 /// * `sync_target` - Optional block height to sync to; None for infinite sync
 async fn chain_sync(
     client: Arc<RpcClient>,
-    validator_db2: Arc<ValidatorDB2>,
+    validator_db: Arc<ValidatorDB>,
     concurrent_num: usize,
     sync_interval_secs: u64,
     sync_target: Option<u64>,
@@ -512,7 +512,7 @@ async fn chain_sync(
 
     // Step 1: Recover any interrupted tasks from previous crashes
     info!("Recovering interrupted validation tasks from previous runs...");
-    validator_db2
+    validator_db
         .recover_interrupted_tasks()
         .map_err(|e| anyhow!("Failed to recover interrupted tasks: {}", e))?;
     info!("Task recovery completed");
@@ -521,9 +521,9 @@ async fn chain_sync(
     info!("Starting remote chain tracker...");
     let _tracker_handle = {
         let client_clone = Arc::clone(&client);
-        let validator_db2_clone = Arc::clone(&validator_db2);
+        let validator_db_clone = Arc::clone(&validator_db);
 
-        task::spawn(async move { remote_chain_tracker(client_clone, validator_db2_clone).await })
+        task::spawn(async move { remote_chain_tracker(client_clone, validator_db_clone).await })
     };
     info!("Remote chain tracker started");
 
@@ -533,10 +533,10 @@ async fn chain_sync(
 
     for worker_id in 0..concurrent_num {
         let client_clone = Arc::clone(&client);
-        let validator_db2_clone = Arc::clone(&validator_db2);
+        let validator_db_clone = Arc::clone(&validator_db);
 
         let handle = task::spawn(async move {
-            validation_worker(worker_id, client_clone, validator_db2_clone).await
+            validation_worker(worker_id, client_clone, validator_db_clone).await
         });
 
         worker_handles.push(handle);
@@ -549,7 +549,7 @@ async fn chain_sync(
     loop {
         // Check if we've reached the sync target
         if let Some(target) = sync_target {
-            match validator_db2.get_local_tip() {
+            match validator_db.get_local_tip() {
                 Ok(Some((local_block_number, _))) => {
                     if local_block_number >= target {
                         info!(
@@ -569,7 +569,7 @@ async fn chain_sync(
             }
         }
 
-        if let Err(e) = chain_sync_iteration(&client, &validator_db2).await {
+        if let Err(e) = chain_sync_iteration(&client, &validator_db).await {
             error!("Chain sync iteration failed: {}", e);
             // Continue running despite errors - individual iterations can fail
         }
@@ -589,10 +589,10 @@ async fn chain_sync(
 ///
 /// # Arguments
 /// * `client` - RPC client for fetching blocks from remote blockchain
-/// * `validator_db2` - Database interface for chain management
+/// * `validator_db` - Database interface for chain management
 async fn remote_chain_tracker(
     client: Arc<RpcClient>,
-    validator_db2: Arc<ValidatorDB2>,
+    validator_db: Arc<ValidatorDB>,
 ) -> Result<()> {
     const LOOKAHEAD_BLOCKS: u64 = 10;
     const POLLING_INTERVAL_SECS: u64 = 5;
@@ -606,11 +606,11 @@ async fn remote_chain_tracker(
         // Perform one iteration of remote chain tracking
         if let Err(e) = async {
             // Step 1: Get current chain tips
-            let local_tip = validator_db2
+            let local_tip = validator_db
                 .get_local_tip()?
                 .ok_or_else(|| anyhow!("Local chain is empty - cannot track remote chain"))?;
 
-            let remote_tip = validator_db2.get_remote_tip()?.unwrap_or(local_tip); // If no remote chain, start from local tip
+            let remote_tip = validator_db.get_remote_tip()?.unwrap_or(local_tip); // If no remote chain, start from local tip
 
             // Step 2: Analyze gap between local and remote tips
             let gap = remote_tip.0.saturating_sub(local_tip.0);
@@ -629,7 +629,7 @@ async fn remote_chain_tracker(
                         );
                         // FIXME: Find proper common ancestor between local and remote chains
                         // For now, rollback to local tip as a simple approximation
-                        validator_db2.rollback_chain(local_tip.0)?;
+                        validator_db.rollback_chain(local_tip.0)?;
                         return Ok(());
                     }
                 }
@@ -661,7 +661,7 @@ async fn remote_chain_tracker(
             let fetch_tasks: Vec<_> = (start_block..=end_block)
                 .map(|block_number| {
                     let client_clone = client.clone();
-                    let validator_db2_clone = validator_db2.clone();
+                    let validator_db_clone = validator_db.clone();
                     tokio::spawn(async move {
                         // Fetch block first
                         let block = client_clone.block_by_number(block_number, true).await?;
@@ -669,7 +669,7 @@ async fn remote_chain_tracker(
                         let witness = client_clone.witness_by_block_hash(block.header.hash).await?;
 
                         // Immediately queue for validation while we have both
-                        validator_db2_clone.add_validation_task(&block, &witness)?;
+                        validator_db_clone.add_validation_task(&block, &witness)?;
                         info!("Queued block {} for validation", block.header.number);
 
                         // Return only the header (has block number + hash for grow_remote_chain)
@@ -730,7 +730,7 @@ async fn remote_chain_tracker(
 
             // Step 4.5: Add headers to remote chain
             for header in fetched_headers {
-                match validator_db2.grow_remote_chain(&header) {
+                match validator_db.grow_remote_chain(&header) {
                     Ok(()) => {
                         info!("Added block {} to remote chain", header.number);
                     }
@@ -836,11 +836,11 @@ mod tests {
         Ok((block_str.parse()?, parse_block_hash(hash_str)?))
     }
 
-    /// Creates a ValidatorDB2 instance for integration testing with pre-populated test data.
+    /// Creates a ValidatorDB instance for integration testing with pre-populated test data.
     ///
     /// Sets up a temporary database and initializes it with the necessary test data for
     /// integration testing. The function performs the following setup steps:
-    /// 1. Creates a temporary directory and ValidatorDB2 instance
+    /// 1. Creates a temporary directory and ValidatorDB instance
     /// 2. Initializes the canonical chain tip using the minimum block from test data
     /// 3. Populates the CONTRACTS table with test contract bytecode from `CONTRACTS_FILE`
     ///
@@ -848,20 +848,20 @@ mod tests {
     ///
     /// # Returns
     ///
-    /// `Arc<ValidatorDB2>` - Database instance with initialized chain tip and contract cache
+    /// `Arc<ValidatorDB>` - Database instance with initialized chain tip and contract cache
     ///
     /// # Errors
     ///
     /// Returns error if temporary directory creation, database initialization,
     /// test data loading, or contract population fails.
-    fn setup_test_db() -> Result<Arc<ValidatorDB2>> {
+    fn setup_test_db() -> Result<Arc<ValidatorDB>> {
         let temp_dir = tempfile::tempdir()
             .map_err(|e| anyhow!("Failed to create temporary directory: {e}"))?;
         let work_dir = temp_dir.path().to_path_buf();
 
-        // Create ValidatorDB2 with database
+        // Create ValidatorDB with database
         let db_path = work_dir.join(VALIDATOR_DB_FILENAME);
-        let validator_db = ValidatorDB2::new(&db_path)?;
+        let validator_db = ValidatorDB::new(&db_path)?;
 
         // Initialize canonical chain tip using RpcModuleContext
         let context = create_rpc_module_context()?;
