@@ -710,11 +710,13 @@ async fn chain_sync_iteration(_client: &RpcClient, validator_db2: &ValidatorDB2)
 /// * `validator_db2` - Database interface for coordinating with validation workers
 /// * `concurrent_num` - Number of parallel validation workers to spawn
 /// * `sync_interval_secs` - Time to wait between sync cycles in seconds
+/// * `sync_target` - Optional block height to sync to; None for infinite sync
 async fn chain_sync(
     client: Arc<RpcClient>,
     validator_db2: Arc<ValidatorDB2>,
     concurrent_num: usize,
     sync_interval_secs: u64,
+    sync_target: Option<u64>,
 ) -> Result<()> {
     info!(
         "Starting chain synchronizer with {} validation workers",
@@ -758,6 +760,28 @@ async fn chain_sync(
     info!("Starting main chain synchronizer loop...");
 
     loop {
+        // Check if we've reached the sync target
+        if let Some(target) = sync_target {
+            match validator_db2.get_local_tip() {
+                Ok(Some((local_block_number, _))) => {
+                    if local_block_number >= target {
+                        info!(
+                            "Reached sync target height {}, terminating chain sync",
+                            target
+                        );
+                        return Ok(());
+                    }
+                }
+                Ok(None) => {
+                    // No local tip yet, continue syncing
+                }
+                Err(e) => {
+                    warn!("Failed to check local tip for sync target: {}", e);
+                    // Continue running despite error
+                }
+            }
+        }
+
         if let Err(e) = chain_sync_iteration(&client, &validator_db2).await {
             error!("Chain sync iteration failed: {}", e);
             // Continue running despite errors - individual iterations can fail
@@ -1056,7 +1080,14 @@ mod tests {
         let local_tip = context.min_block;
 
         // Set the canonical chain tip to the starting block (parent of minimum test block)
-        validator_db.set_local_tip(local_tip.0, local_tip.1)?;
+        // For test setup, we need to get the state root from the block header
+        let local_tip_block = context.blocks_by_hash.get(&local_tip.1).ok_or_else(|| {
+            anyhow!(
+                "Local tip block hash {} not found in test context",
+                local_tip.1
+            )
+        })?;
+        validator_db.set_local_tip(local_tip.0, local_tip.1, local_tip_block.header.state_root)?;
 
         // Populate CONTRACTS table with test contract bytecode
         info!("Populating CONTRACTS table from test data...");
@@ -1441,6 +1472,7 @@ mod tests {
             context.min_block.0, context.max_block.0
         );
 
+        let max_block_number = context.max_block.0;
         let handle = setup_mock_rpc_server(context).await;
         let client = Arc::new(RpcClient::new("http://127.0.0.1:59545").unwrap());
 
@@ -1476,9 +1508,15 @@ mod tests {
         let worker_count = 4; // Number of parallel validation workers
         let sync_interval = 1; // Sync interval in seconds for testing
 
-        chain_sync(client.clone(), validator_db, worker_count, sync_interval)
-            .await
-            .unwrap();
+        chain_sync(
+            client.clone(),
+            validator_db,
+            worker_count,
+            sync_interval,
+            Some(max_block_number),
+        )
+        .await
+        .unwrap();
 
         handle.stop().unwrap();
         info!("Mock RPC server has been shut down.");

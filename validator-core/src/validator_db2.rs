@@ -68,13 +68,14 @@ use serde_json;
 
 /// Stores our local view of the canonical chain.
 ///
-/// **Schema:** Maps BlockNumber (u64) to BlockHash ([u8; 32])
-/// - Key: Block height as BlockNumber (u64)
-/// - Value: Hash of the canonical block at that height as BlockHash ([u8; 32])
+/// **Schema:** Maps (BlockNumber, BlockHash) as (u64, [u8; 32]) to post-state root ([u8; 32])
+/// - Key: (Block height as u64, Block hash as [u8; 32])
+/// - Value: Post-state root of the block as [u8; 32]
 ///
 /// Updated by main orchestrator via grow_local_chain() and rollback_chain().
 /// Only successfully validated blocks can be added to this chain.
-const CANONICAL_CHAIN: TableDefinition<u64, [u8; 32]> = TableDefinition::new("canonical_chain");
+const CANONICAL_CHAIN: TableDefinition<(u64, [u8; 32]), [u8; 32]> =
+    TableDefinition::new("canonical_chain");
 
 /// Stores the remote chain with unvalidated blocks used to guide chain advancement.
 ///
@@ -341,34 +342,26 @@ impl ValidatorDB2 {
 
             // Verify parent chain extension for canonical chain
             if header.number > 0 {
-                let parent_hash = canonical_chain
-                    .get(header.number - 1)?
+                // Look up parent block in canonical chain using the parent hash from header
+                let parent_post_state_root = canonical_chain
+                    .get((header.number - 1, header.parent_hash.0))?
                     .ok_or_else(|| anyhow!("Parent block not in canonical chain"))?
                     .value();
 
-                if header.parent_hash != parent_hash {
-                    return Err(anyhow!("Block parent_hash mismatch"));
-                }
+                let parent_post_state = B256::from(parent_post_state_root);
 
-                // Verify pre-state root matches parent block's post-state root
-                let parent_result_data = validation_results
-                    .get(parent_hash)?
-                    .ok_or_else(|| anyhow!("Parent block validation result not found"))?;
-                let parent_result: ValidationResult =
-                    decode_from_slice(&parent_result_data.value())?;
-
-                // The parent's post-state root should match this block's pre-state root
-                if result.pre_state_root != parent_result.post_state_root {
+                // Verify state root continuity: parent's post-state should match current block's pre-state
+                if result.pre_state_root != parent_post_state {
                     return Err(anyhow!(
-                        "State root continuity broken: block expects pre-state {}, parent computed {}",
+                        "State root continuity broken: block expects pre-state {}, parent has post-state {}",
                         result.pre_state_root,
-                        parent_result.post_state_root
+                        parent_post_state
                     ));
                 }
             }
 
             // Move block from remote chain to canonical chain
-            canonical_chain.insert(header.number, block_hash.0)?;
+            canonical_chain.insert((header.number, block_hash.0), result.post_state_root.0)?;
             remote_chain.remove(header.number)?;
         }
         write_txn.commit()?;
@@ -393,7 +386,9 @@ impl ValidatorDB2 {
             let (parent_number, parent_hash) = if let Some(last_remote) = remote_chain.last()? {
                 (last_remote.0.value(), last_remote.1.value())
             } else if let Some(last_canonical) = canonical_chain.last()? {
-                (last_canonical.0.value(), last_canonical.1.value())
+                let (canonical_key, _) = last_canonical;
+                let (canonical_number, canonical_hash) = canonical_key.value();
+                (canonical_number, canonical_hash)
             } else {
                 return Err(anyhow!("Cannot extend from empty chains"));
             };
@@ -425,12 +420,12 @@ impl ValidatorDB2 {
 
             // Rollback canonical chain to specified block
             let canonical_blocks_to_remove = canonical_chain
-                .range((to_block + 1)..)?
-                .map(|result| result.map(|(block_number, _)| block_number.value()))
+                .range((to_block + 1, [0u8; 32])..)?
+                .map(|result| result.map(|(key, _)| key.value()))
                 .collect::<Result<Vec<_>, _>>()?;
 
-            for block_number in canonical_blocks_to_remove {
-                canonical_chain.remove(block_number)?;
+            for (block_number, block_hash) in canonical_blocks_to_remove {
+                canonical_chain.remove((block_number, block_hash))?;
             }
 
             // Rollback remote chain to specified block
@@ -498,8 +493,11 @@ impl ValidatorDB2 {
             let canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
 
             // Get first task that's ahead of canonical tip using range query
-            let range_start = match canonical_chain.last()?.map(|(bn, _)| bn.value()) {
-                Some(tip_block) => (tip_block + 1, [0u8; 32]),
+            let range_start = match canonical_chain.last()? {
+                Some((canonical_key, _)) => {
+                    let (tip_block, _) = canonical_key.value();
+                    (tip_block + 1, [0u8; 32])
+                }
                 None => (0u64, [0u8; 32]),
             };
 
@@ -568,8 +566,9 @@ impl ValidatorDB2 {
         let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
 
         match canonical_chain.last()? {
-            Some((block_number, block_hash)) => {
-                Ok(Some((block_number.value(), block_hash.value().into())))
+            Some((canonical_key, _post_state_root)) => {
+                let (block_number, block_hash) = canonical_key.value();
+                Ok(Some((block_number, block_hash.into())))
             }
             None => Ok(None),
         }
@@ -595,11 +594,16 @@ impl ValidatorDB2 {
     ///
     /// This method allows setting the local chain tip to a specific block.
     /// Useful for initialization and testing scenarios.
-    pub fn set_local_tip(&self, block_number: BlockNumber, block_hash: BlockHash) -> Result<()> {
+    pub fn set_local_tip(
+        &self,
+        block_number: BlockNumber,
+        block_hash: BlockHash,
+        post_state_root: B256,
+    ) -> Result<()> {
         let write_txn = self.database.begin_write()?;
         {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
-            canonical_chain.insert(block_number, block_hash.0)?;
+            canonical_chain.insert((block_number, block_hash.0), post_state_root.0)?;
         }
         write_txn.commit()?;
         Ok(())
@@ -640,7 +644,7 @@ impl ValidatorDB2 {
 
             for (block_number, block_hash) in keys_to_remove {
                 // Remove from all relevant tables
-                canonical_chain.remove(block_number)?;
+                canonical_chain.remove((block_number, block_hash))?;
                 block_records.remove((block_number, block_hash))?;
                 block_data.remove(block_hash)?;
                 witnesses.remove(block_hash)?;
