@@ -30,6 +30,7 @@ use alloy_evm::{
 };
 use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
+use alloy_primitives::{BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
 use mega_evm::{BlockExecutionCtx, BlockExecutorFactory, EvmFactory, SpecId};
 use op_alloy_rpc_types::Transaction as OpTransaction;
@@ -42,7 +43,8 @@ use revm::{
     state::Bytecode,
 };
 use salt::{EphemeralSaltState, SaltWitness, StateRoot, Witness};
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, time::SystemTime};
 use thiserror::Error;
 
 use crate::{
@@ -76,6 +78,25 @@ pub enum ValidationError {
         /// The claimed state root from the block header
         claimed: B256,
     },
+}
+
+/// Represents the result of a validation operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationResult {
+    /// The pre-state root from the witness before block execution
+    pub pre_state_root: B256,
+    /// The post-state root after block execution (from block header)
+    pub post_state_root: B256,
+    /// The block number that was validated
+    pub block_number: BlockNumber,
+    /// The block hash that was validated
+    pub block_hash: BlockHash,
+    /// Whether the validation was successful
+    pub success: bool,
+    /// Any error message if validation failed
+    pub error_message: Option<String>,
+    /// Timestamp when validation completed
+    pub completed_at: SystemTime,
 }
 
 /// Creates an EVM execution environment from a block header and chain specification.

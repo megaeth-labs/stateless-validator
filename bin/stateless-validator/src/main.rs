@@ -24,8 +24,7 @@ use tracing::{error, info, warn};
 use validator_core::{
     ValidatorDB,
     data_types::{PlainKey, PlainValue},
-    executor::validate_block,
-    validator_db::ValidationResult,
+    executor::{ValidationResult, validate_block},
 };
 
 mod rpc;

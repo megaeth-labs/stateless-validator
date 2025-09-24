@@ -65,7 +65,8 @@ use revm::state::Bytecode;
 use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::time::SystemTime;
+
+use crate::executor::ValidationResult;
 
 /// Stores our local view of the canonical chain.
 ///
@@ -167,25 +168,6 @@ const BLOCK_RECORDS: TableDefinition<(u64, [u8; 32]), ()> = TableDefinition::new
 /// Populated by workers via add_contract_code() when new bytecode is needed
 /// and retrieved via get_contract_code().
 const CONTRACTS: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("contracts");
-
-/// Represents the result of a validation operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ValidationResult {
-    /// The pre-state root from the witness before block execution
-    pub pre_state_root: B256,
-    /// The post-state root after block execution (from block header)
-    pub post_state_root: B256,
-    /// The block number that was validated
-    pub block_number: BlockNumber,
-    /// The block hash that was validated
-    pub block_hash: BlockHash,
-    /// Whether the validation was successful
-    pub success: bool,
-    /// Any error message if validation failed
-    pub error_message: Option<String>,
-    /// Timestamp when validation completed
-    pub completed_at: SystemTime,
-}
 
 /// ValidatorDB - The central workspace for coordination between components
 ///

@@ -19,8 +19,8 @@
 mod chain_spec;
 mod database;
 pub mod validator_db;
-pub use validator_db::{StateData, ValidationResult, ValidatorDB, deserialized_state_data};
+pub use validator_db::{StateData, ValidatorDB, deserialized_state_data};
 pub mod data_types;
 pub use data_types::{PlainKey, PlainValue};
 pub mod executor;
-pub use executor::{ValidationError, validate_block};
+pub use executor::{ValidationError, ValidationResult, validate_block};
