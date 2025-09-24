@@ -19,6 +19,7 @@ revm = { workspace = true, features = ["serde"] }
 salt.workspace = true
 
 bincode.workspace = true
+blake3.workspace = true
 clap.workspace = true
 eyre.workspace = true
 futures.workspace = true

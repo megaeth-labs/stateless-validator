@@ -5,9 +5,7 @@
 //!
 //! ## Key Components
 //!
-//! - **StateData**: Wrapper for serialized data with BLAKE3 hash verification (in `storage` module)
 //! - **BlockFileManager**: Centralized file management for validation, witness, and backup operations
-//! - **Serialization**: Bincode-based serialization with integrity checking (in `storage` module)
 //! - **Validation Logic**: Core validation algorithms for stateless operation
 //!
 //! ## Modules
@@ -19,7 +17,7 @@
 mod chain_spec;
 mod database;
 pub mod validator_db;
-pub use validator_db::{StateData, ValidatorDB, deserialized_state_data};
+pub use validator_db::ValidatorDB;
 pub mod data_types;
 pub use data_types::{PlainKey, PlainValue};
 pub mod executor;

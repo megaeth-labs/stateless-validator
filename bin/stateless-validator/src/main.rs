@@ -30,7 +30,9 @@ use validator_core::{
 mod rpc;
 use rpc::RpcClient;
 
+mod checksum_data;
 mod witness_types;
+use checksum_data::deserialized_checksum_data;
 
 /// Maximum response body size for the RPC server.
 /// This is set to 100 MB to accommodate large block data and witness information.
@@ -771,7 +773,6 @@ mod tests {
         io::{BufRead, BufReader},
         path::Path,
     };
-    use validator_core::deserialized_state_data;
 
     /// Directory containing test block data files for mock RPC server.
     ///
@@ -1179,7 +1180,7 @@ mod tests {
 
                     // Read and deserialize witness file
                     let file_data = std::fs::read(&file_path)?;
-                    let state_data = deserialized_state_data(file_data).map_err(|e| {
+                    let state_data = deserialized_checksum_data(file_data).map_err(|e| {
                         anyhow!(
                             "Failed to deserialize state data from {}: {}",
                             block_num_and_hash,
