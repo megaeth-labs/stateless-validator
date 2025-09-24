@@ -184,7 +184,7 @@ pub struct ValidationResult {
     /// Any error message if validation failed
     pub error_message: Option<String>,
     /// Timestamp when validation completed
-    pub completed_at: u64,
+    pub completed_at: SystemTime,
 }
 
 /// ValidatorDB - The central workspace for coordination between components
@@ -752,14 +752,4 @@ pub fn deserialized_state_data(data: Vec<u8>) -> std::io::Result<StateData> {
     }
 
     Ok(state_data)
-}
-
-/// Convert current time to a u64 timestamp
-///
-/// Used for lock time management in witness and validation operations.
-pub fn curent_time_to_u64() -> u64 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("SystemTime before UNIX EPOCH!")
-        .as_secs()
 }

@@ -3,7 +3,7 @@
 //! This module contains types related to witness status tracking that are used
 //! by tests and utilities but are not part of the core validator library.
 
-use alloy_primitives::{BlockHash, BlockNumber, B256};
+use alloy_primitives::{B256, BlockHash, BlockNumber};
 use serde::{Deserialize, Serialize};
 
 /// Block witness Processing state

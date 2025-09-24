@@ -17,12 +17,12 @@ use std::collections::HashMap;
 use std::{
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::{signal, task};
 use tracing::{error, info, warn};
 use validator_core::{
-    ValidatorDB, curent_time_to_u64,
+    ValidatorDB,
     data_types::{PlainKey, PlainValue},
     executor::validate_block,
     validator_db::ValidationResult,
@@ -349,7 +349,7 @@ async fn process_single_task(
                         block_hash,
                         success: true,
                         error_message: None,
-                        completed_at: curent_time_to_u64(),
+                        completed_at: SystemTime::now(),
                     }
                 }
                 Err(e) => {
@@ -364,7 +364,7 @@ async fn process_single_task(
                         block_hash,
                         success: false,
                         error_message: Some(e.to_string()),
-                        completed_at: curent_time_to_u64(),
+                        completed_at: SystemTime::now(),
                     }
                 }
             };
@@ -759,6 +759,7 @@ async fn remote_chain_tracker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::witness_types::WitnessStatus;
     use alloy_primitives::BlockNumber;
     use alloy_rpc_types_eth::Block;
     use eyre::Context;
@@ -772,7 +773,6 @@ mod tests {
         path::Path,
     };
     use validator_core::deserialized_state_data;
-    use crate::witness_types::WitnessStatus;
 
     /// Directory containing test block data files for mock RPC server.
     ///
