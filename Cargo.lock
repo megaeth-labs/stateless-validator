@@ -5282,21 +5282,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c573471f125075647d03df72e026074b7203790d41351cd6edc96f46bcccd36"
 
 [[package]]
-name = "witness-decoder"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "bincode",
- "blake3",
- "clap",
- "eyre",
- "hex",
- "serde",
- "serde_json",
- "validator-core",
-]
-
-[[package]]
 name = "writeable"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

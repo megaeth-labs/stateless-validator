@@ -65,6 +65,7 @@ use revm::state::Bytecode;
 use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
 use serde_json;
+use std::time::SystemTime;
 
 /// Stores our local view of the canonical chain.
 ///
@@ -695,4 +696,70 @@ fn encode_block_to_vec(block: &Block<Transaction>) -> Result<Vec<u8>> {
 /// Helper method to deserialize Block<Transaction> using JSON
 fn decode_block_from_slice(bytes: &[u8]) -> Result<Block<Transaction>> {
     serde_json::from_slice(bytes).map_err(|e| anyhow!("Failed to deserialize block from JSON: {e}"))
+}
+
+/// Container for file storage content with BLAKE3 hash verification
+///
+/// This structure wraps raw data with a cryptographic hash to ensure data integrity
+/// during serialization, storage, and deserialization operations.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct StateData {
+    /// BLAKE3 hash for data integrity verification
+    pub hash: B256,
+    /// Raw data stored as byte vector
+    pub data: Vec<u8>,
+}
+
+/// Deserialize state data from a byte vector with hash verification
+///
+/// Deserializes a `StateData` structure and verifies the embedded BLAKE3 hash
+/// matches the actual data hash to ensure data integrity.
+///
+/// # Arguments
+/// * `data` - Serialized StateData bytes to deserialize and verify
+///
+/// # Returns
+/// * `Ok(StateData)` - Successfully deserialized and verified data
+/// * `Err(std::io::Error)` - If deserialization fails or hash verification fails
+///
+/// # Errors
+/// * `InvalidData` - If bincode deserialization fails
+/// * `InvalidData` - If hash verification fails (data corruption detected)
+///
+/// # Example
+/// ```rust,no_run
+/// use validator_core::{deserialized_state_data};
+///
+/// let serialized = vec![/* serialized data */];
+/// let state_data = deserialized_state_data(serialized)?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn deserialized_state_data(data: Vec<u8>) -> std::io::Result<StateData> {
+    let (state_data, _): (StateData, usize) =
+        bincode::serde::decode_from_slice(&data, bincode::config::legacy()).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to deserialize state data: {}", e),
+            )
+        })?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&state_data.data);
+    if state_data.hash != B256::from_slice(hasher.finalize().as_bytes()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Hash mismatch",
+        ));
+    }
+
+    Ok(state_data)
+}
+
+/// Convert current time to a u64 timestamp
+///
+/// Used for lock time management in witness and validation operations.
+pub fn curent_time_to_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("SystemTime before UNIX EPOCH!")
+        .as_secs()
 }

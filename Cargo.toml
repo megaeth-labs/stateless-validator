@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/stateless-validator", "bin/witness-decoder", "validator-core"]
+members = ["bin/stateless-validator", "validator-core"]
 resolver = "2"
 
 [workspace.dependencies]

@@ -2,10 +2,7 @@ use alloy_primitives::{Address, BlockHash, hex};
 use alloy_rpc_types_eth::Header;
 use clap::Parser;
 use eyre::{Result, anyhow};
-use futures::{
-    future,
-    stream::{self, StreamExt},
-};
+use futures::future;
 use jsonrpsee::{
     RpcModule,
     server::{ServerBuilder, ServerConfigBuilder},
@@ -22,10 +19,10 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{signal, sync::Mutex, task};
+use tokio::{signal, task};
 use tracing::{error, info, warn};
 use validator_core::{
-    SaltWitnessState, ValidateStatus, ValidatorDB, ValidatorDB2, curent_time_to_u64,
+    ValidatorDB2, curent_time_to_u64,
     data_types::{PlainKey, PlainValue},
     executor::validate_block,
     validator_db2::ValidationResult,
@@ -33,6 +30,8 @@ use validator_core::{
 
 mod rpc;
 use rpc::RpcClient;
+
+mod witness_types;
 
 /// Maximum response body size for the RPC server.
 /// This is set to 100 MB to accommodate large block data and witness information.
@@ -94,37 +93,36 @@ async fn main() -> Result<()> {
     let work_dir = PathBuf::from(args.datadir);
 
     let client = Arc::new(RpcClient::new(&args.api)?);
-    let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
+    let validator_db2 = setup_validator_db2(work_dir.join(VALIDATOR_DB_FILENAME)).await?;
 
-    // fetch the latest finalized block number.
-    let chain_status = validator_db.get_chain_status()?;
-    let finalized_num = chain_status.block_number;
-
-    // Start validating from the block after the last finalized one.
-    let block_counter = finalized_num + 1;
-    let validator_logic = scan_and_validate(
-        client,
-        validator_db.clone(),
-        block_counter,
-        args.lock_time,
+    let validator_logic = chain_sync(
+        client.clone(),
+        validator_db2.clone(),
         concurrent_num,
+        5,    // sync_interval_secs
+        None, // sync_target (infinite sync)
     );
 
     if let Some(port) = args.port {
-        let mut module = RpcModule::new(validator_db.clone());
+        let mut module = RpcModule::new(validator_db2.clone());
 
-        module.register_method("stateless_getValidation", |params, validator_db, _| {
+        module.register_method("stateless_getValidation", |params, validator_db2, _| {
             // Helper function to create RPC errors
             let make_rpc_error = |code, msg: String| ErrorObject::owned(code, msg, None::<()>);
 
-            let (block_number, block_hash): (u64, String) = params.parse()?;
+            let (_block_number, block_hash): (u64, String) = params.parse()?;
             let block_hash = parse_block_hash(&block_hash).map_err(|e| {
                 make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid block hash: {e}"))
             })?;
 
-            validator_db
-                .get_validation_result(block_number, block_hash)
-                .map_err(|e| make_rpc_error(CALL_EXECUTION_FAILED_CODE, e.to_string()))
+            match validator_db2.get_validation_result(block_hash) {
+                Ok(Some(result)) => Ok(result.success),
+                Ok(None) => Err(make_rpc_error(
+                    INVALID_PARAMS_CODE,
+                    "Validation result not found".to_string(),
+                )),
+                Err(e) => Err(make_rpc_error(CALL_EXECUTION_FAILED_CODE, e.to_string())),
+            }
         })?;
 
         let cfg = ServerConfigBuilder::default()
@@ -177,224 +175,13 @@ fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
     Ok(BlockHash::from_slice(&hash_bytes))
 }
 
-/// Scans for and validates block witnesses concurrently.
+/// Setup ValidatorDB2 instance for production use
 ///
-/// This function creates a stream of block numbers starting from `block_counter` and processes them
-/// concurrently.
-async fn scan_and_validate(
-    client: Arc<RpcClient>,
-    validator_db: Arc<ValidatorDB>,
-    block_counter: u64,
-    lock_time: u64,
-    concurrent_num: usize,
-) -> Result<()> {
-    // TODO: populate the initial contract cache from an external db instance
-    // Start with an empty contract cache.
-    let contracts = Arc::new(Mutex::new(HashMap::<B256, Bytecode>::default()));
-
-    // Create an infinite stream of block numbers to process.
-    stream::iter(block_counter..)
-        .for_each_concurrent(Some(concurrent_num), |block_counter| {
-            let client = Arc::clone(&client);
-            let validator_db = Arc::clone(&validator_db);
-            let contracts = Arc::clone(&contracts);
-
-            async move {
-                // Continuously validate blocks, retrying on failure until the block becomes stale.
-                // The loop breaks if validation succeeds or if the block is older than the
-                // latest finalized block.
-                while let Err(e) = wait_and_validate(
-                    client.clone(),
-                    validator_db.clone(),
-                    block_counter,
-                    lock_time,
-                    contracts.clone(),
-                )
-                .await
-                {
-                    error!(
-                        "Failed to validate block {}: {:?}, try block({}) again",
-                        block_counter, e, block_counter
-                    );
-                    let chain_status = validator_db.get_chain_status().unwrap_or_default();
-                    if block_counter <= chain_status.block_number {
-                        info!(
-                            "block({}) is less than finalized block({}), skipping",
-                            block_counter, chain_status.block_number
-                        );
-                        break;
-                    }
-                }
-            }
-        })
-        .await;
-
-    Ok(())
-}
-
-// FIXME: any code that can be reused by other stateless validator deployments?
-// if yes, they should be moved into the library.
-/// Performs the validation for a single block.
-///
-/// This function handles the entire lifecycle of validating a block:
-/// 1. Waits for the block's witness to become available.
-/// 2. Checks if the block needs validation and locks it.
-/// 3. Fetches block data and decodes the witness.
-/// 4. Verifies the witness proof.
-/// 5. Fetches any new contract bytecodes.
-/// 6. Replays the block transactions using an in-memory DB with the witness provider.
-/// 7. Computes the new state root and compares it with the one in the block header.
-/// 8. Updates the validation status of the block.
-async fn wait_and_validate(
-    client: Arc<RpcClient>,
-    validator_db: Arc<ValidatorDB>,
-    block_counter: u64,
-    lock_time: u64,
-    contracts: Arc<Mutex<HashMap<B256, Bytecode>>>,
-) -> Result<()> {
-    info!("Processing block: {}", block_counter);
-
-    // This loop waits for the witness for the block to be generated and available.
-    loop {
-        let block_hashes = match validator_db.find_block_hashes(block_counter) {
-            Ok(hashes) => hashes,
-            Err(_e) => {
-                // Witness for block_counter not found, waiting...
-                info!("Witness for block {} not found, waiting...", block_counter);
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                continue;
-            }
-        };
-
-        for block_hash in block_hashes {
-            let witness_status = validator_db.get_witness_state(&(block_counter, block_hash))?;
-            if matches!(
-                witness_status.status,
-                SaltWitnessState::Idle | SaltWitnessState::Processing
-            ) {
-                // Wait for the witness to be completed.
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                // start with while loop to handle this block hash again
-                break;
-            }
-
-            let validate_info = validator_db.load_validate_info(block_counter, block_hash)?;
-            // Check if the block has already been validated or is being processed by another validator.
-            match validate_info.status {
-                ValidateStatus::Success => {
-                    info!(
-                        "Block {} has already been validated with result: {:?}",
-                        block_counter, validate_info.status
-                    );
-                    return Ok(());
-                }
-                ValidateStatus::Processing if validate_info.lock_time >= curent_time_to_u64() => {
-                    info!(
-                        "Block {} is currently being processed by another validator.",
-                        block_counter
-                    );
-                    return Ok(());
-                }
-                ValidateStatus::Failed => {
-                    info!("Block {} validation failed, replay again...", block_counter);
-                    // Continue to retry this block hash
-                    break;
-                }
-                _ => {} // Continue with processing
-            }
-            // Lock the block for processing to prevent other validators from working on it.
-            validator_db.set_validate_status(
-                block_counter,
-                block_hash,
-                ValidateStatus::Processing,
-                None,
-                Some(lock_time),
-            )?;
-
-            // Fetch the full block details and decode the witness concurrently.
-            let witness_bytes = witness_status.witness_data;
-            let (blocks_result, witness_decode_result) = {
-                let witness_bytes_clone = witness_bytes.clone();
-                tokio::join!(
-                    client.block_by_hash(block_hash, true),
-                    tokio::task::spawn_blocking(move || {
-                        bincode::serde::decode_from_slice(
-                            &witness_bytes_clone,
-                            bincode::config::legacy(),
-                        )
-                        .map_err(|e| anyhow!("Failed to parse witness: {e}"))
-                    })
-                )
-            };
-
-            let block = blocks_result?;
-            let (salt_witness, _size): (SaltWitness, usize) = witness_decode_result??;
-
-            let contract_codes = extract_contract_codes(&salt_witness);
-
-            let mut contracts_guard = contracts.lock().await;
-
-            let new_contracts_address = contract_codes
-                .iter()
-                .filter_map(|(address, code_hash)| {
-                    if !contracts_guard.contains_key(code_hash) {
-                        Some(*address)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            let codes = client
-                .codes_at(&new_contracts_address, (block_counter - 1).into())
-                .await?;
-
-            let mut new_contracts = HashMap::new();
-            for bytes in &codes {
-                let bytecode = Bytecode::new_raw(bytes.clone());
-                new_contracts.insert(bytecode.hash_slow(), bytecode.clone());
-            }
-
-            contracts_guard.extend(new_contracts.clone());
-
-            // Perform the actual block validation
-            let std_contracts: HashMap<B256, Bytecode> = contracts_guard
-                .iter()
-                .map(|(k, v)| (*k, v.clone()))
-                .collect();
-            match validate_block(&block, salt_witness, &std_contracts) {
-                Ok(()) => {
-                    info!(
-                        "Validation SUCCESS for block {}. State root: 0x{}",
-                        block_counter,
-                        hex::encode(block.header.state_root)
-                    );
-                    validator_db.set_validate_status(
-                        block_counter,
-                        block_hash,
-                        ValidateStatus::Success,
-                        Some(block.header.state_root),
-                        None,
-                    )?;
-                    return Ok(());
-                }
-                Err(validation_error) => {
-                    error!(
-                        "Validation FAILED for block {}: {}",
-                        block_counter, validation_error
-                    );
-                    validator_db.set_validate_status(
-                        block_counter,
-                        block_hash,
-                        ValidateStatus::Failed,
-                        Some(block.header.state_root),
-                        None,
-                    )?;
-                }
-            }
-            drop(contracts_guard);
-        }
-    }
+/// Creates a new ValidatorDB2 instance at the specified path, initializing all required tables.
+/// This function is simpler than setup_test_db as it doesn't pre-populate test data.
+async fn setup_validator_db2(db_path: impl AsRef<std::path::Path>) -> Result<Arc<ValidatorDB2>> {
+    let validator_db2 = ValidatorDB2::new(db_path)?;
+    Ok(Arc::new(validator_db2))
 }
 
 /// Returns all contract addresses and their code hashes from the witness.
@@ -984,7 +771,8 @@ mod tests {
         io::{BufRead, BufReader},
         path::Path,
     };
-    use validator_core::{WitnessStatus, deserialized_state_data};
+    use validator_core::deserialized_state_data;
+    use crate::witness_types::WitnessStatus;
 
     /// Directory containing test block data files for mock RPC server.
     ///
