@@ -94,7 +94,7 @@ async fn main() -> Result<()> {
     let work_dir = PathBuf::from(args.datadir);
 
     let client = Arc::new(RpcClient::new(&args.api)?);
-    let validator_db = setup_validator_db(work_dir.join(VALIDATOR_DB_FILENAME)).await?;
+    let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
 
     let validator_logic = chain_sync(
         client.clone(),
@@ -174,15 +174,6 @@ fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
         ));
     }
     Ok(BlockHash::from_slice(&hash_bytes))
-}
-
-/// Setup ValidatorDB instance for production use
-///
-/// Creates a new ValidatorDB instance at the specified path, initializing all required tables.
-/// This function is simpler than setup_test_db as it doesn't pre-populate test data.
-async fn setup_validator_db(db_path: impl AsRef<std::path::Path>) -> Result<Arc<ValidatorDB>> {
-    let validator_db = ValidatorDB::new(db_path)?;
-    Ok(Arc::new(validator_db))
 }
 
 /// Returns all contract addresses and their code hashes from the witness.
@@ -382,105 +373,6 @@ async fn process_single_task(
     Ok(())
 }
 
-/// Single iteration of the chain synchronizer logic
-///
-/// Processes completed validation results and advances the canonical chain by moving
-/// successfully validated blocks from the remote chain to the canonical chain.
-/// Also performs basic data pruning to maintain storage efficiency.
-async fn chain_sync_iteration(_client: &RpcClient, validator_db: &ValidatorDB) -> Result<()> {
-    let mut blocks_advanced = 0;
-
-    // Continuously try to advance the canonical chain with newly validated blocks
-    loop {
-        match validator_db.grow_local_chain() {
-            Ok(()) => {
-                blocks_advanced += 1;
-                // Continue to try advancing the next block
-            }
-            Err(e) => {
-                // Cannot advance further - this could be due to:
-                // - Remote chain is empty
-                // - Next block is not validated yet
-                // - Next block validation failed
-                // - Chain continuity issues
-                if blocks_advanced == 0 {
-                    // Only log if we haven't advanced any blocks in this iteration
-                    match e.to_string().as_str() {
-                        msg if msg.contains("Remote chain is empty") => {
-                            // This is normal when no blocks are queued
-                        }
-                        msg if msg.contains("not validated") => {
-                            // This is normal when validation is still in progress
-                        }
-                        msg if msg.contains("failed validation") => {
-                            warn!("Cannot advance chain due to failed validation: {}", e);
-                        }
-                        _ => {
-                            warn!("Cannot advance chain: {}", e);
-                        }
-                    }
-                }
-                break; // Stop trying to advance
-            }
-        }
-    }
-
-    // Log current chain status
-    match (
-        validator_db.get_local_tip()?,
-        validator_db.get_remote_tip()?,
-    ) {
-        (Some((local_number, local_hash)), Some((remote_number, remote_hash))) => {
-            info!(
-                "Chain status: local_tip=block {} ({}), remote_tip=block {} ({}), gap={}",
-                local_number,
-                local_hash,
-                remote_number,
-                remote_hash,
-                remote_number.saturating_sub(local_number)
-            );
-        }
-        (Some((local_number, local_hash)), None) => {
-            info!(
-                "Chain status: local_tip=block {} ({}), no remote chain",
-                local_number, local_hash
-            );
-        }
-        (None, Some((remote_number, remote_hash))) => {
-            info!(
-                "Chain status: no local chain, remote_tip=block {} ({})",
-                remote_number, remote_hash
-            );
-        }
-        (None, None) => {
-            info!("Chain status: no local or remote chain established");
-        }
-    }
-
-    // Report advancement progress
-    if blocks_advanced > 0 {
-        info!("Advanced canonical chain by {} blocks", blocks_advanced);
-    }
-
-    // Perform basic data pruning - keep last 1000 blocks
-    if let Some((current_tip, _)) = validator_db.get_local_tip()? {
-        const BLOCKS_TO_KEEP: u64 = 1000;
-        if current_tip > BLOCKS_TO_KEEP {
-            let prune_before = current_tip - BLOCKS_TO_KEEP;
-            match validator_db.prune_history(prune_before) {
-                Ok(()) => {
-                    info!("Pruned block data before block {}", prune_before);
-                }
-                Err(e) => {
-                    warn!("Failed to prune old block data: {}", e);
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 /// Chain synchronizer entry point - implements the Chain Synchronizer component from the design document
 ///
 /// This function serves as the main orchestrator that:
@@ -549,28 +441,59 @@ async fn chain_sync(
 
     loop {
         // Check if we've reached the sync target
-        if let Some(target) = sync_target {
-            match validator_db.get_local_tip() {
-                Ok(Some((local_block_number, _))) => {
-                    if local_block_number >= target {
-                        info!(
-                            "Reached sync target height {}, terminating chain sync",
-                            target
-                        );
-                        return Ok(());
-                    }
-                }
-                Ok(None) => {
-                    // No local tip yet, continue syncing
-                }
-                Err(e) => {
-                    warn!("Failed to check local tip for sync target: {}", e);
-                    // Continue running despite error
-                }
-            }
+        if let Some(target) = sync_target
+            && let Ok(Some((local_block_number, _))) = validator_db.get_local_tip()
+            && local_block_number >= target
+        {
+            info!("Reached sync target height {target}, terminating chain sync");
+            return Ok(());
         }
 
-        if let Err(e) = chain_sync_iteration(&client, &validator_db).await {
+        // Chain sync iteration - advance canonical chain and perform pruning
+        if let Err(e) = async {
+            let mut blocks_advanced = 0;
+
+            // Advance the canonical chain with newly validated blocks
+            loop {
+                match validator_db.grow_local_chain() {
+                    Ok(()) => blocks_advanced += 1,
+                    Err(e) => {
+                        if blocks_advanced == 0 {
+                            let msg = e.to_string();
+                            if msg.contains("failed validation") {
+                                warn!("Cannot advance chain due to failed validation: {e}");
+                            } else if !msg.contains("Remote chain is empty")
+                                && !msg.contains("not validated")
+                            {
+                                warn!("Cannot advance chain: {e}");
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if blocks_advanced > 0 {
+                info!("Advanced canonical chain by {blocks_advanced} blocks");
+            }
+
+            // Prune old data - keep last 1000 blocks
+            if let Some((current_tip, _)) = validator_db.get_local_tip()? {
+                const BLOCKS_TO_KEEP: u64 = 1000;
+                if current_tip > BLOCKS_TO_KEEP {
+                    let prune_before = current_tip - BLOCKS_TO_KEEP;
+                    if let Err(e) = validator_db.prune_history(prune_before) {
+                        warn!("Failed to prune old block data: {e}");
+                    } else {
+                        info!("Pruned block data before block {prune_before}");
+                    }
+                }
+            }
+
+            Ok::<(), eyre::Error>(())
+        }
+        .await
+        {
             error!("Chain sync iteration failed: {}", e);
             // Continue running despite errors - individual iterations can fail
         }
