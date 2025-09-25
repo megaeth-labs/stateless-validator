@@ -58,12 +58,14 @@
 
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, Header};
-use eyre::{Result, anyhow};
 use op_alloy_rpc_types::Transaction;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use revm::state::Bytecode;
 use salt::SaltWitness;
 use serde_json;
+use thiserror::Error;
+
+use std::fmt;
 
 use crate::executor::ValidationResult;
 
@@ -178,6 +180,9 @@ pub struct ValidatorDB {
     database: Database,
 }
 
+type Result<T, E = ValidationDbError> = std::result::Result<T, E>;
+pub type ValidationDbResult<T> = Result<T>;
+
 impl ValidatorDB {
     /// Create a new redb instance or open an existing one.
     ///
@@ -185,7 +190,7 @@ impl ValidatorDB {
     /// a valid redb database, it will be opened preserving all existing data.
     /// If the file doesn't exist or is empty, a new database will be created
     /// and initialized with all required tables.
-    pub fn new(db_path: impl AsRef<std::path::Path>) -> Result<Self> {
+    pub fn new(db_path: impl AsRef<std::path::Path>) -> ValidationDbResult<Self> {
         let database = Database::create(db_path)?;
 
         // Initialize all tables in a single write transaction
@@ -220,7 +225,7 @@ impl ValidatorDB {
         &self,
         block: &Block<Transaction>,
         witness: &SaltWitness,
-    ) -> Result<()> {
+    ) -> ValidationDbResult<()> {
         let block_number = block.header.number;
         let block_hash = block.header.hash.0;
 
@@ -254,7 +259,7 @@ impl ValidatorDB {
     /// so future validations can retrieve it via get_contract_code() instead
     /// of fetching externally. The code hash is computed automatically from
     /// the bytecode to ensure data integrity.
-    pub fn add_contract_code(&self, bytecode: &Bytecode) -> Result<()> {
+    pub fn add_contract_code(&self, bytecode: &Bytecode) -> ValidationDbResult<()> {
         let code_hash = bytecode.hash_slow();
 
         let write_txn = self.database.begin_write()?;
@@ -272,7 +277,7 @@ impl ValidatorDB {
     /// Automatically gets the first block from the remote chain, verifies it has been
     /// successfully validated, and moves it to the canonical chain. Performs all necessary
     /// validations including parent hash matching and state root continuity.
-    pub fn grow_local_chain(&self) -> Result<()> {
+    pub fn grow_local_chain(&self) -> ValidationDbResult<()> {
         let write_txn = self.database.begin_write()?;
         {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
@@ -284,42 +289,50 @@ impl ValidatorDB {
             let (first_block_number, first_block_hash) = {
                 let first_remote_entry = remote_chain
                     .first()?
-                    .ok_or_else(|| anyhow!("Remote chain is empty"))?;
+                    .ok_or_else(|| ValidationDbError::RemoteChainEmpty)?;
                 (first_remote_entry.0.value(), first_remote_entry.1.value())
             };
 
             let block_hash = BlockHash::from(first_block_hash);
 
             // Load the block data to get the header
-            let serialized_block = block_data
-                .get(first_block_hash)?
-                .ok_or_else(|| anyhow!("Block data not found for hash {block_hash}"))?;
+            let serialized_block = block_data.get(first_block_hash)?.ok_or_else(|| {
+                ValidationDbError::MissingData {
+                    kind: MissingDataKind::BlockData,
+                    block_hash,
+                }
+            })?;
             let block: Block<Transaction> = decode_block_from_slice(&serialized_block.value())?;
             let header = block.header;
 
             // Verify the header matches the remote chain entry
             if header.number != first_block_number {
-                return Err(anyhow!(
-                    "Block number mismatch: header has {}, remote chain has {first_block_number}",
-                    header.number
-                ));
+                return Err(ValidationDbError::BlockNumberMismatch {
+                    header_number: header.number,
+                    expected_number: first_block_number,
+                });
             }
 
-            if header.hash != first_block_hash {
-                return Err(anyhow!(
-                    "Block hash mismatch: header has {}, remote chain has {block_hash}",
-                    header.hash
-                ));
+            let header_hash = BlockHash::from(header.hash);
+
+            if header_hash != block_hash {
+                return Err(ValidationDbError::BlockHashMismatch {
+                    header_hash,
+                    expected_hash: block_hash,
+                });
             }
 
             // Ensure block is successfully validated
-            let serialized_result = validation_results
-                .get(block_hash.0)?
-                .ok_or_else(|| anyhow!("Block {block_hash} not validated"))?;
+            let serialized_result = validation_results.get(block_hash.0)?.ok_or_else(|| {
+                ValidationDbError::MissingData {
+                    kind: MissingDataKind::ValidationResult,
+                    block_hash,
+                }
+            })?;
             let result: ValidationResult = decode_from_slice(&serialized_result.value())?;
 
             if !result.success {
-                return Err(anyhow!("Cannot grow chain with failed validation"));
+                return Err(ValidationDbError::FailedValidation { block_hash });
             }
 
             // Verify parent chain extension for canonical chain
@@ -327,18 +340,20 @@ impl ValidatorDB {
                 // Look up parent block in canonical chain using the parent hash from header
                 let parent_post_state_root = canonical_chain
                     .get((header.number - 1, header.parent_hash.0))?
-                    .ok_or_else(|| anyhow!("Parent block not in canonical chain"))?
+                    .ok_or_else(|| ValidationDbError::MissingData {
+                        kind: MissingDataKind::CanonicalParent,
+                        block_hash: BlockHash::from(header.parent_hash),
+                    })?
                     .value();
 
                 let parent_post_state = B256::from(parent_post_state_root);
 
                 // Verify state root continuity: parent's post-state should match current block's pre-state
                 if result.pre_state_root != parent_post_state {
-                    return Err(anyhow!(
-                        "State root continuity broken: block expects pre-state {}, parent has post-state {}",
-                        result.pre_state_root,
-                        parent_post_state
-                    ));
+                    return Err(ValidationDbError::StateRootMismatch {
+                        expected: result.pre_state_root,
+                        actual: parent_post_state,
+                    });
                 }
             }
 
@@ -356,7 +371,7 @@ impl ValidatorDB {
     /// The block does not need to be validated yet - validation happens later.
     /// Verifies that the block's parent_hash matches the current remote chain tip
     /// or canonical chain tip to ensure proper chain extension.
-    pub fn grow_remote_chain(&self, header: &Header) -> Result<()> {
+    pub fn grow_remote_chain(&self, header: &Header) -> ValidationDbResult<()> {
         let block_hash = BlockHash::from(header.hash);
 
         let write_txn = self.database.begin_write()?;
@@ -372,16 +387,17 @@ impl ValidatorDB {
                 let (canonical_number, canonical_hash) = canonical_key.value();
                 (canonical_number, canonical_hash)
             } else {
-                return Err(anyhow!("Cannot extend from empty chains"));
+                return Err(ValidationDbError::MissingChainAnchor);
             };
 
             // Validate extension
             if header.number != parent_number + 1 || header.parent_hash != parent_hash {
-                return Err(anyhow!(
-                    "Block does not properly extend from parent (number: {number}, expected: {expected})",
-                    number = header.number,
-                    expected = parent_number + 1
-                ));
+                return Err(ValidationDbError::InvalidChainExtension {
+                    block_number: header.number,
+                    expected_number: parent_number + 1,
+                    expected_parent_hash: BlockHash::from(parent_hash),
+                    found_parent_hash: BlockHash::from(header.parent_hash),
+                });
             }
 
             remote_chain.insert(header.number, block_hash.0)?;
@@ -394,7 +410,7 @@ impl ValidatorDB {
     ///
     /// Removes blocks from both the remote chain and canonical chain when a reorg
     /// occurs, reverting to the specified block number.
-    pub fn rollback_chain(&self, to_block: BlockNumber) -> Result<()> {
+    pub fn rollback_chain(&self, to_block: BlockNumber) -> ValidationDbResult<()> {
         let write_txn = self.database.begin_write()?;
         {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
@@ -428,7 +444,7 @@ impl ValidatorDB {
     ///
     /// Called by workers when they finish validating a block. Stores the validation
     /// result and marks the task as complete.
-    pub fn complete_validation(&self, result: ValidationResult) -> Result<()> {
+    pub fn complete_validation(&self, result: ValidationResult) -> ValidationDbResult<()> {
         let write_txn = self.database.begin_write()?;
         {
             // Store validation result
@@ -466,7 +482,7 @@ impl ValidatorDB {
     /// - `Ok(Some((block, witness)))` - Next task with all required validation data
     /// - `Ok(None)` - No tasks available, worker should wait or exit
     /// - `Err(...)` - Database error, serialization failure, or missing block/witness data
-    pub fn get_next_task(&self) -> Result<Option<(Block<Transaction>, SaltWitness)>> {
+    pub fn get_next_task(&self) -> ValidationDbResult<Option<(Block<Transaction>, SaltWitness)>> {
         let write_txn = self.database.begin_write()?;
 
         let result = {
@@ -492,7 +508,8 @@ impl ValidatorDB {
 
             match next_task {
                 Some(block_num_hash) => {
-                    let (_, block_hash) = block_num_hash;
+                    let (_, block_hash_bytes) = block_num_hash;
+                    let block_hash = BlockHash::from(block_hash_bytes);
 
                     // Move task to ongoing
                     task_list.remove(block_num_hash)?;
@@ -504,14 +521,20 @@ impl ValidatorDB {
 
                     let block = decode_block_from_slice(
                         &block_data
-                            .get(block_hash)?
-                            .ok_or_else(|| anyhow!("Block data not found"))?
+                            .get(block_hash_bytes)?
+                            .ok_or_else(|| ValidationDbError::MissingData {
+                                kind: MissingDataKind::BlockData,
+                                block_hash,
+                            })?
                             .value(),
                     )?;
                     let witness = decode_from_slice(
                         &witnesses
-                            .get(block_hash)?
-                            .ok_or_else(|| anyhow!("Witness not found"))?
+                            .get(block_hash_bytes)?
+                            .ok_or_else(|| ValidationDbError::MissingData {
+                                kind: MissingDataKind::Witness,
+                                block_hash,
+                            })?
                             .value(),
                     )?;
 
@@ -529,7 +552,10 @@ impl ValidatorDB {
     ///
     /// Returns the validation outcome if available, or None if the block
     /// hasn't been validated yet.
-    pub fn get_validation_result(&self, block_hash: BlockHash) -> Result<Option<ValidationResult>> {
+    pub fn get_validation_result(
+        &self,
+        block_hash: BlockHash,
+    ) -> ValidationDbResult<Option<ValidationResult>> {
         let read_txn = self.database.begin_read()?;
         let validation_results = read_txn.open_table(VALIDATION_RESULTS)?;
 
@@ -543,7 +569,7 @@ impl ValidatorDB {
     ///
     /// Returns the highest block number and hash currently considered local canonical,
     /// or None if the chain is empty.
-    pub fn get_local_tip(&self) -> Result<Option<(BlockNumber, BlockHash)>> {
+    pub fn get_local_tip(&self) -> ValidationDbResult<Option<(BlockNumber, BlockHash)>> {
         let read_txn = self.database.begin_read()?;
         let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
 
@@ -560,7 +586,7 @@ impl ValidatorDB {
     ///
     /// Returns the highest block number and hash currently in the remote chain,
     /// or None if the remote chain is empty.
-    pub fn get_remote_tip(&self) -> Result<Option<(BlockNumber, BlockHash)>> {
+    pub fn get_remote_tip(&self) -> ValidationDbResult<Option<(BlockNumber, BlockHash)>> {
         let read_txn = self.database.begin_read()?;
         let remote_chain = read_txn.open_table(REMOTE_CHAIN)?;
 
@@ -581,7 +607,7 @@ impl ValidatorDB {
         block_number: BlockNumber,
         block_hash: BlockHash,
         post_state_root: B256,
-    ) -> Result<()> {
+    ) -> ValidationDbResult<()> {
         let write_txn = self.database.begin_write()?;
         {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
@@ -595,7 +621,7 @@ impl ValidatorDB {
     ///
     /// Returns the bytecode for a contract if it's been cached, or None if not found.
     /// Used by validation workers to avoid repeatedly fetching the same contracts.
-    pub fn get_contract_code(&self, code_hash: B256) -> Result<Option<Bytecode>> {
+    pub fn get_contract_code(&self, code_hash: B256) -> ValidationDbResult<Option<Bytecode>> {
         let read_txn = self.database.begin_read()?;
         let contracts = read_txn.open_table(CONTRACTS)?;
 
@@ -609,7 +635,7 @@ impl ValidatorDB {
     ///
     /// Removes canonical chain entries, validation records, block data, and witnesses
     /// for blocks older than the specified block number.
-    pub fn prune_history(&self, before_block: BlockNumber) -> Result<()> {
+    pub fn prune_history(&self, before_block: BlockNumber) -> ValidationDbResult<()> {
         let write_txn = self.database.begin_write()?;
         {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
@@ -641,7 +667,7 @@ impl ValidatorDB {
     ///
     /// Moves any tasks that were being processed back to the queue so they can be
     /// retried. Use this during startup to handle unfinished work from crashes.
-    pub fn recover_interrupted_tasks(&self) -> Result<()> {
+    pub fn recover_interrupted_tasks(&self) -> ValidationDbResult<()> {
         let write_txn = self.database.begin_write()?;
         {
             let mut task_list = write_txn.open_table(TASK_LIST)?;
@@ -658,23 +684,120 @@ impl ValidatorDB {
 
 /// Helper method to serialize data using bincode with legacy config
 fn encode_to_vec<T: serde::Serialize>(data: &T) -> Result<Vec<u8>> {
-    bincode::serde::encode_to_vec(data, bincode::config::legacy())
-        .map_err(|e| anyhow!("Failed to serialize data: {e}"))
+    let encoded = bincode::serde::encode_to_vec(data, bincode::config::legacy())
+        .map_err(SerializationError::from)?;
+    Ok(encoded)
 }
 
 /// Helper method to deserialize data using bincode with legacy config
 fn decode_from_slice<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    bincode::serde::decode_from_slice(bytes, bincode::config::legacy())
-        .map_err(|e| anyhow!("Failed to deserialize data: {e}"))
-        .map(|(data, _)| data)
+    let (decoded, _) = bincode::serde::decode_from_slice(bytes, bincode::config::legacy())
+        .map_err(SerializationError::from)?;
+    Ok(decoded)
 }
 
 /// Helper method to serialize Block<Transaction> using JSON
 fn encode_block_to_vec(block: &Block<Transaction>) -> Result<Vec<u8>> {
-    serde_json::to_vec(block).map_err(|e| anyhow!("Failed to serialize block to JSON: {e}"))
+    let encoded = serde_json::to_vec(block).map_err(SerializationError::from)?;
+    Ok(encoded)
 }
 
 /// Helper method to deserialize Block<Transaction> using JSON
 fn decode_block_from_slice(bytes: &[u8]) -> Result<Block<Transaction>> {
-    serde_json::from_slice(bytes).map_err(|e| anyhow!("Failed to deserialize block from JSON: {e}"))
+    let block = serde_json::from_slice(bytes).map_err(SerializationError::from)?;
+    Ok(block)
+}
+
+#[derive(Debug, Error)]
+pub enum ValidationDbError {
+    #[error(transparent)]
+    Redb(#[from] redb::Error),
+
+    #[error(transparent)]
+    RedbDatabase(#[from] redb::DatabaseError),
+
+    #[error(transparent)]
+    RedbTransaction(#[from] redb::TransactionError),
+
+    #[error(transparent)]
+    RedbTable(#[from] redb::TableError),
+
+    #[error(transparent)]
+    RedbStorage(#[from] redb::StorageError),
+
+    #[error(transparent)]
+    RedbCommit(#[from] redb::CommitError),
+
+    #[error(transparent)]
+    Serialization(#[from] SerializationError),
+
+    #[error("missing {kind} for block {block_hash:?}")]
+    MissingData {
+        kind: MissingDataKind,
+        block_hash: BlockHash,
+    },
+
+    #[error("remote chain is empty")]
+    RemoteChainEmpty,
+
+    #[error("header number {header_number} does not match remote number {expected_number}")]
+    BlockNumberMismatch {
+        header_number: BlockNumber,
+        expected_number: BlockNumber,
+    },
+
+    #[error("header hash {header_hash:?} does not match remote hash {expected_hash:?}")]
+    BlockHashMismatch {
+        header_hash: BlockHash,
+        expected_hash: BlockHash,
+    },
+
+    #[error("block {block_hash:?} was recorded with a failed validation result")]
+    FailedValidation { block_hash: BlockHash },
+
+    #[error("state root mismatch: expected {expected:?}, parent has {actual:?}")]
+    StateRootMismatch { expected: B256, actual: B256 },
+
+    #[error("cannot extend remote chain without an anchor block")]
+    MissingChainAnchor,
+
+    #[error(
+        "block {block_number} must extend parent number {expected_number} with hash {expected_parent_hash:?}, found {found_parent_hash:?}"
+    )]
+    InvalidChainExtension {
+        block_number: BlockNumber,
+        expected_number: BlockNumber,
+        expected_parent_hash: BlockHash,
+        found_parent_hash: BlockHash,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum SerializationError {
+    #[error(transparent)]
+    BincodeEncode(#[from] bincode::error::EncodeError),
+    #[error(transparent)]
+    BincodeDecode(#[from] bincode::error::DecodeError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum MissingDataKind {
+    BlockData,
+    Witness,
+    ValidationResult,
+    CanonicalParent,
+}
+
+impl fmt::Display for MissingDataKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            MissingDataKind::BlockData => "block data",
+            MissingDataKind::Witness => "witness",
+            MissingDataKind::ValidationResult => "validation result",
+            MissingDataKind::CanonicalParent => "canonical parent",
+        };
+        f.write_str(label)
+    }
 }

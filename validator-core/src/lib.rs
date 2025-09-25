@@ -17,7 +17,7 @@
 mod chain_spec;
 mod database;
 pub mod validator_db;
-pub use validator_db::ValidatorDB;
+pub use validator_db::{ValidationDbError, ValidationDbResult, ValidatorDB};
 pub mod data_types;
 pub use data_types::{PlainKey, PlainValue};
 pub mod executor;

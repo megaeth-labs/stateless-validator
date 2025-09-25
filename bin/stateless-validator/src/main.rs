@@ -812,7 +812,7 @@ mod tests {
                 }
                 Err(e) => {
                     error!("Failed to add contract {code_hash} to database: {e}");
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
         }
