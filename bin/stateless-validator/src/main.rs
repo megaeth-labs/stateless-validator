@@ -105,8 +105,8 @@ async fn main() -> Result<()> {
         client.clone(),
         validator_db.clone(),
         concurrent_num,
-        5,    // sync_interval_secs
-        None, // sync_target (infinite sync)
+        Duration::from_secs(5), // poll_interval
+        None,                   // sync_target (infinite sync)
     );
 
     if let Some(port) = args.port {
@@ -232,7 +232,7 @@ async fn validation_worker(
 
     loop {
         // Process individual task with error containment
-        if let Err(e) = process_single_task(worker_id, &client, &validator_db).await {
+        if let Err(e) = validate_one_block(worker_id, &client, &validator_db).await {
             error!(
                 "Worker {} encountered error during task processing: {}",
                 worker_id, e
@@ -271,7 +271,7 @@ async fn validation_worker(
 /// - **Database errors**: Propagated to caller for retry logic
 /// - **RPC errors**: Propagated to caller for retry logic
 /// - **Validation errors**: Captured and stored as failed ValidationResult
-async fn process_single_task(
+async fn validate_one_block(
     worker_id: usize,
     client: &RpcClient,
     validator_db: &ValidatorDB,
@@ -391,13 +391,13 @@ async fn process_single_task(
 /// * `client` - RPC client for communicating with remote blockchain node
 /// * `validator_db` - Database interface for coordinating with validation workers
 /// * `concurrent_num` - Number of parallel validation workers to spawn
-/// * `sync_interval_secs` - Time to wait between sync cycles in seconds
+/// * `poll_interval` - Time to wait between sync cycles
 /// * `sync_target` - Optional block height to sync to; None for infinite sync
 async fn chain_sync(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
     concurrent_num: usize,
-    sync_interval_secs: u64,
+    poll_interval: Duration,
     sync_target: Option<u64>,
 ) -> Result<()> {
     info!(
@@ -501,7 +501,7 @@ async fn chain_sync(
         }
 
         // Wait before next sync cycle
-        tokio::time::sleep(Duration::from_secs(sync_interval_secs)).await;
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
@@ -521,12 +521,9 @@ async fn remote_chain_tracker(
     validator_db: Arc<ValidatorDB>,
 ) -> Result<()> {
     const LOOKAHEAD_BLOCKS: u64 = 10;
-    const POLLING_INTERVAL_SECS: u64 = 5;
+    const POLLING_INTERVAL_SECS: u64 = 2;
 
-    info!(
-        "Starting remote chain tracker with {} block lookahead",
-        LOOKAHEAD_BLOCKS
-    );
+    info!("Starting remote chain tracker with {LOOKAHEAD_BLOCKS} block lookahead");
 
     loop {
         // Perform one iteration of remote chain tracking
@@ -573,8 +570,19 @@ async fn remote_chain_tracker(
                 return Ok(());
             }
 
-            // Step 4: Fetch more blocks to maintain lookahead
-            let blocks_to_fetch = (LOOKAHEAD_BLOCKS - gap).min(20); // Limit to 20 blocks per iteration
+            // Step 4: Query latest block number from remote RPC to bound our fetch range
+            let latest_remote_block = client.block_number().await?;
+            info!("Latest block on remote chain: {}", latest_remote_block);
+
+            // Calculate how many blocks we can actually fetch without exceeding remote chain
+            let max_blocks_we_can_fetch = latest_remote_block.saturating_sub(remote_tip.0);
+            let blocks_to_fetch = (LOOKAHEAD_BLOCKS - gap).min(max_blocks_we_can_fetch);
+
+            if blocks_to_fetch == 0 {
+                info!("No new blocks available on remote chain (latest: {})", latest_remote_block);
+                return Ok(());
+            }
+
             let start_block = remote_tip.0 + 1;
             let end_block = start_block + blocks_to_fetch - 1;
 
@@ -1116,17 +1124,12 @@ mod tests {
         let handle = setup_mock_rpc_server(context).await;
         let client = Arc::new(RpcClient::new("http://127.0.0.1:59545").unwrap());
 
-
-        // Test the new chain_sync architecture instead of manual validation
-        let worker_count = 4; // Number of parallel validation workers
-        let sync_interval = 1; // Sync interval in seconds for testing
-
         chain_sync(
             client.clone(),
             validator_db,
-            worker_count,
-            sync_interval,
-            sync_target
+            4,
+            Duration::from_millis(100),
+            sync_target,
         )
         .await
         .unwrap();
