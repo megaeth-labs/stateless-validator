@@ -55,37 +55,11 @@ impl RpcClient {
         try_join_all(futures).await
     }
 
-    /// Fetches a full block by its hash.
-    pub async fn block_by_hash(&self, hash: B256, full_txs: bool) -> Result<Block<Transaction>> {
-        self.fetch_block(BlockId::Hash(hash.into()), full_txs)
-            .await
-            .map_err(|e| eyre!("get_block_by_hash at {hash} failed: {e}"))
-    }
-
     /// Fetches a full block by its number.
     pub async fn block_by_number(&self, number: u64, full_txs: bool) -> Result<Block<Transaction>> {
         self.fetch_block(BlockId::Number(number.into()), full_txs)
             .await
             .map_err(|e| eyre!("get_block_by_number at {number} failed: {e}"))
-    }
-
-    /// Fetches a full block by tag (e.g., "finalized", "latest").
-    pub async fn block_by_number_tag(
-        &self,
-        tag: &str,
-        full_txs: bool,
-    ) -> Result<Block<Transaction>> {
-        let block_number_or_tag = match tag {
-            "finalized" => BlockNumberOrTag::Finalized,
-            "latest" => BlockNumberOrTag::Latest,
-            "pending" => BlockNumberOrTag::Pending,
-            "earliest" => BlockNumberOrTag::Earliest,
-            _ => return Err(eyre!("Unsupported block tag: {}", tag)),
-        };
-
-        self.fetch_block(BlockId::Number(block_number_or_tag), full_txs)
-            .await
-            .map_err(|e| eyre!("get_block_by_number_tag '{}' failed: {e}", tag))
     }
 
     /// Fetches the latest block number from the blockchain.

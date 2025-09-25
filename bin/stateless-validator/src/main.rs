@@ -41,6 +41,11 @@ const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
 /// Database filename for the validator.
 const VALIDATOR_DB_FILENAME: &str = "validator.redb";
 
+/// Helper function to create RPC errors with consistent format
+fn make_rpc_error(code: i32, msg: String) -> ErrorObject<'static> {
+    ErrorObject::owned(code, msg, None::<()>)
+}
+
 // FIXME: not `rerun_block`!
 /// Command line arguments for the `rerun_block` executable.
 #[derive(Parser, Debug)]
@@ -108,9 +113,6 @@ async fn main() -> Result<()> {
         let mut module = RpcModule::new(validator_db.clone());
 
         module.register_method("stateless_getValidation", |params, validator_db, _| {
-            // Helper function to create RPC errors
-            let make_rpc_error = |code, msg: String| ErrorObject::owned(code, msg, None::<()>);
-
             let (_block_number, block_hash): (u64, String) = params.parse()?;
             let block_hash = parse_block_hash(&block_hash).map_err(|e| {
                 make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid block hash: {e}"))
@@ -687,7 +689,7 @@ mod tests {
     use alloy_primitives::BlockNumber;
     use alloy_rpc_types_eth::Block;
     use eyre::Context;
-    use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned};
+    use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObjectOwned};
     use op_alloy_rpc_types::Transaction;
     use serde::de::DeserializeOwned;
     use std::{
@@ -830,81 +832,32 @@ mod tests {
         let mut module = RpcModule::new(context);
 
         module
-            .register_method("eth_getBlockByHash", |params, context, _| {
-                let (hash_str, full_block): (String, bool) = params.parse().unwrap();
-
-                // Parse hash string to BlockHash
-                let block_hash = match parse_block_hash(&hash_str) {
-                    Ok(hash) => hash,
-                    Err(e) => {
-                        return Err(ErrorObject::owned(
-                            INVALID_PARAMS_CODE,
-                            format!("Invalid block hash: {}", e),
-                            None::<()>,
-                        ));
-                    }
-                };
-
-                // Look up block in context
-                match context.blocks_by_hash.get(&block_hash) {
-                    Some(block) => {
-                        let result_block = if full_block {
-                            block.clone()
-                        } else {
-                            Block {
-                                transactions: block.transactions.clone().into_hashes(),
-                                ..block.clone()
-                            }
-                        };
-                        Ok(result_block)
-                    }
-                    None => Err(ErrorObject::owned(
-                        CALL_EXECUTION_FAILED_CODE,
-                        format!("Block {} not found", hash_str),
-                        None::<()>,
-                    )),
-                }
-            })
-            .unwrap();
-
-        module
             .register_method("eth_getBlockByNumber", |params, context, _| {
                 let (hex_number, full_block): (String, bool) = params.parse().unwrap();
 
-                let block_number = if hex_number == "finalized" {
-                    // Return the smallest block number for "finalized" tag
-                    context.min_block.0
-                } else {
-                    // Parse hex number as before
-                    u64::from_str_radix(&hex_number[2..], 16).unwrap_or(0)
-                };
+                let block_number = u64::from_str_radix(&hex_number[2..], 16).unwrap_or(0);
 
-                // Look up block hash by number, then get block by hash
-                match context.block_hashes.get(&block_number) {
-                    Some(block_hash) => match context.blocks_by_hash.get(block_hash) {
-                        Some(block) => {
-                            let result_block = if full_block {
-                                block.clone()
-                            } else {
-                                Block {
-                                    transactions: block.transactions.clone().into_hashes(),
-                                    ..block.clone()
-                                }
-                            };
-                            Ok(result_block)
-                        }
-                        None => Err(ErrorObject::owned(
+                // Look up block by number
+                let block = context
+                    .block_hashes
+                    .get(&block_number)
+                    .and_then(|hash| context.blocks_by_hash.get(hash))
+                    .ok_or_else(|| {
+                        make_rpc_error(
                             CALL_EXECUTION_FAILED_CODE,
-                            format!("Block data not found for number {}", block_number),
-                            None::<()>,
-                        )),
-                    },
-                    None => Err(ErrorObject::owned(
-                        CALL_EXECUTION_FAILED_CODE,
-                        format!("Block {} not found", block_number),
-                        None::<()>,
-                    )),
-                }
+                            format!("Block {block_number} not found"),
+                        )
+                    })?;
+
+                let result_block = if full_block {
+                    block.clone()
+                } else {
+                    Block {
+                        transactions: block.transactions.clone().into_hashes(),
+                        ..block.clone()
+                    }
+                };
+                Ok::<_, ErrorObject<'static>>(result_block)
             })
             .unwrap();
 
@@ -920,16 +873,9 @@ mod tests {
                 let (hash_str,): (String,) = params.parse().unwrap();
 
                 // Parse hash string to BlockHash
-                let block_hash = match parse_block_hash(&hash_str) {
-                    Ok(hash) => hash,
-                    Err(e) => {
-                        return Err(ErrorObject::owned(
-                            INVALID_PARAMS_CODE,
-                            format!("Invalid block hash: {}", e),
-                            None::<()>,
-                        ));
-                    }
-                };
+                let block_hash = parse_block_hash(&hash_str).map_err(|e| {
+                    make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid block hash: {e}"))
+                })?;
 
                 // Look up witness data by block hash
                 match context.witness_data.get(&block_hash) {
@@ -938,17 +884,15 @@ mod tests {
                         match bincode::serde::encode_to_vec(salt_witness, bincode::config::legacy())
                         {
                             Ok(witness_bytes) => Ok(witness_bytes),
-                            Err(e) => Err(ErrorObject::owned(
+                            Err(e) => Err(make_rpc_error(
                                 CALL_EXECUTION_FAILED_CODE,
-                                format!("Failed to serialize SaltWitness: {}", e),
-                                None::<()>,
+                                format!("Failed to serialize SaltWitness: {e}"),
                             )),
                         }
                     }
-                    None => Err(ErrorObject::owned(
+                    None => Err(make_rpc_error(
                         CALL_EXECUTION_FAILED_CODE,
-                        format!("Witness for block {} not found", hash_str),
-                        None::<()>,
+                        format!("Witness for block {hash_str} not found"),
                     )),
                 }
             })
@@ -1194,17 +1138,7 @@ mod tests {
         let latest_block = client.block_number().await.unwrap();
         info!("Latest block number from RPC: {}", latest_block);
 
-        // Test eth_getBlockByNumber with "finalized" tag
-        let finalized_block = client
-            .block_by_number_tag("finalized", false)
-            .await
-            .unwrap();
-        info!(
-            "Finalized block: number={}, hash={}",
-            finalized_block.header.number, finalized_block.header.hash
-        );
-
-        // Test regular block number query for comparison
+        // Test regular block number query
         let regular_block = client.block_by_number(latest_block, false).await.unwrap();
         info!(
             "Latest block: number={}, hash={}",
