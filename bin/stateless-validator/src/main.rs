@@ -779,50 +779,34 @@ mod tests {
     ///
     /// Returns error if temporary directory creation, database initialization,
     /// test data loading, or contract population fails.
-    fn setup_test_db() -> Result<Arc<ValidatorDB>> {
+    fn setup_test_db(context: &RpcModuleContext) -> Result<Arc<ValidatorDB>> {
+        // Create a temporary directory and then keep it alive by leaking it.
+        // OS will clean it when test process ends.
         let temp_dir = tempfile::tempdir()
             .map_err(|e| anyhow!("Failed to create temporary directory: {e}"))?;
-        let work_dir = temp_dir.path().to_path_buf();
+        let validator_db = ValidatorDB::new(&temp_dir.path().join(VALIDATOR_DB_FILENAME))?;
+        std::mem::forget(temp_dir);
 
-        // Create ValidatorDB with database
-        let db_path = work_dir.join(VALIDATOR_DB_FILENAME);
-        let validator_db = ValidatorDB::new(&db_path)?;
-
-        // Initialize canonical chain tip using RpcModuleContext
-        let context = create_rpc_module_context()?;
-        let local_tip = context.min_block;
-
-        // Set the canonical chain tip to the starting block (parent of minimum test block)
-        // For test setup, we need to get the state root from the block header
-        let local_tip_block = context.blocks_by_hash.get(&local_tip.1).ok_or_else(|| {
-            anyhow!(
-                "Local tip block hash {} not found in test context",
-                local_tip.1
-            )
-        })?;
-        validator_db.set_local_tip(local_tip.0, local_tip.1, local_tip_block.header.state_root)?;
+        // Set the local chain tip to the first block in test data.
+        let (block_num, block_hash) = context.min_block;
+        let state_root = context
+            .blocks_by_hash
+            .get(&block_hash)
+            .ok_or_else(|| anyhow!("Local tip {block_hash} not found"))?
+            .header
+            .state_root;
+        validator_db.set_local_tip(block_num, block_hash, state_root)?;
 
         // Populate CONTRACTS table with test contract bytecode
-        info!("Populating CONTRACTS table from test data...");
         let contracts = load_contracts(CONTRACTS_FILE);
-        let mut contracts_added = 0;
-
-        for (code_hash, bytecode) in contracts {
-            match validator_db.add_contract_code(&bytecode) {
-                Ok(()) => {
-                    contracts_added += 1;
-                }
-                Err(e) => {
+        contracts.into_iter().for_each(|(code_hash, bytecode)| {
+            validator_db
+                .add_contract_code(&bytecode)
+                .unwrap_or_else(|e| {
                     error!("Failed to add contract {code_hash} to database: {e}");
-                    return Err(e.into());
-                }
-            }
-        }
-
-        info!("Successfully populated CONTRACTS table with {contracts_added} contracts");
-
-        // Keep the temp dir alive by leaking it. OS will clean it when test process ends.
-        std::mem::forget(temp_dir);
+                    Err(e).unwrap()
+                })
+        });
 
         Ok(Arc::new(validator_db))
     }
@@ -1127,27 +1111,11 @@ mod tests {
             context.min_block.0, context.max_block.0
         );
 
-        let max_block_number = context.max_block.0;
+        let sync_target = Some(context.max_block.0);
+        let validator_db = setup_test_db(&context).unwrap();
         let handle = setup_mock_rpc_server(context).await;
         let client = Arc::new(RpcClient::new("http://127.0.0.1:59545").unwrap());
 
-        // Verify new RPC methods work correctly
-        info!("=== Testing Enhanced RPC Methods ===");
-
-        // Test eth_blockNumber method
-        let latest_block = client.block_number().await.unwrap();
-        info!("Latest block number from RPC: {}", latest_block);
-
-        // Test regular block number query
-        let regular_block = client.block_by_number(latest_block, false).await.unwrap();
-        info!(
-            "Latest block: number={}, hash={}",
-            regular_block.header.number, regular_block.header.hash
-        );
-
-        info!("=== RPC Method Verification Complete ===");
-
-        let validator_db = setup_test_db().unwrap();
 
         // Test the new chain_sync architecture instead of manual validation
         let worker_count = 4; // Number of parallel validation workers
@@ -1158,7 +1126,7 @@ mod tests {
             validator_db,
             worker_count,
             sync_interval,
-            Some(max_block_number),
+            sync_target
         )
         .await
         .unwrap();
