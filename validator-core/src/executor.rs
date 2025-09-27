@@ -71,6 +71,14 @@ pub enum ValidationError {
     #[error("Failed to update salt trie: {0}")]
     TrieUpdateFailed(#[source] salt::SaltError),
 
+    #[error("Pre-state root mismatch: expecting {expected:?}, got {actual:?}")]
+    PreStateRootMismatch {
+        /// The post-state root of the parent block
+        expected: B256,
+        /// The pre-state root of the witness
+        actual: B256,
+    },
+
     #[error("State root mismatch: claimed {claimed}, got {actual}")]
     StateRootMismatch {
         /// The computed state root from transaction execution

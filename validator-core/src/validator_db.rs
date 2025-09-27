@@ -67,7 +67,7 @@ use thiserror::Error;
 
 use std::fmt;
 
-use crate::executor::ValidationResult;
+use crate::executor::{ValidationError, ValidationResult};
 
 /// Stores our local view of the canonical chain.
 ///
@@ -169,6 +169,84 @@ const BLOCK_RECORDS: TableDefinition<(u64, [u8; 32]), ()> = TableDefinition::new
 /// Populated by workers via add_contract_code() when new bytecode is needed
 /// and retrieved via get_contract_code().
 const CONTRACTS: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("contracts");
+
+
+#[derive(Debug, Error)]
+pub enum ValidationDbError {
+    #[error("Database error: {0}")]
+    Database(String),
+
+    #[error(transparent)]
+    Serialization(#[from] SerializationError),
+
+    #[error("missing {kind} for block {block_hash:?}")]
+    MissingData {
+        kind: MissingDataKind,
+        block_hash: BlockHash,
+    },
+
+    #[error("Block validation failed: {0}")]
+    FailedValidation(#[from] ValidationError),
+
+    #[error(
+        "block {block_number} must extend parent block with hash {expected_parent_hash:?}, found {actual_parent_hash:?}"
+    )]
+    InvalidChainExtension {
+        block_number: BlockNumber,
+        expected_parent_hash: BlockHash,
+        actual_parent_hash: BlockHash,
+    },
+}
+
+// Macro to generate From implementations for all redb error types
+macro_rules! impl_database_error_from {
+    ($($error_type:ty),*) => {
+        $(
+            impl From<$error_type> for ValidationDbError {
+                fn from(err: $error_type) -> Self {
+                    Self::Database(err.to_string())
+                }
+            }
+        )*
+    };
+}
+
+impl_database_error_from!(
+    redb::Error,
+    redb::DatabaseError,
+    redb::TransactionError,
+    redb::TableError,
+    redb::StorageError,
+    redb::CommitError
+);
+
+#[derive(Clone, Copy, Debug)]
+pub enum MissingDataKind {
+    BlockData,
+    Witness,
+    ValidationResult,
+}
+
+impl fmt::Display for MissingDataKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            MissingDataKind::BlockData => "block data",
+            MissingDataKind::Witness => "witness",
+            MissingDataKind::ValidationResult => "validation result",
+        };
+        f.write_str(label)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum SerializationError {
+    #[error(transparent)]
+    BincodeEncode(#[from] bincode::error::EncodeError),
+    #[error(transparent)]
+    BincodeDecode(#[from] bincode::error::DecodeError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+}
 
 /// ValidatorDB - The central workspace for coordination between components
 ///
@@ -277,7 +355,9 @@ impl ValidatorDB {
     /// Automatically gets the first block from the remote chain, verifies it has been
     /// successfully validated, and moves it to the canonical chain. Performs all necessary
     /// validations including parent hash matching and state root continuity.
-    pub fn grow_local_chain(&self) -> ValidationDbResult<()> {
+    ///
+    /// Returns `Ok(true)` if a block was advanced, `Ok(false)` if no work to do.
+    pub fn grow_local_chain(&self) -> ValidationDbResult<bool> {
         let write_txn = self.database.begin_write()?;
         {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
@@ -285,54 +365,44 @@ impl ValidatorDB {
             let validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
             let block_data = write_txn.open_table(BLOCK_DATA)?;
 
-            // Get the first block from remote chain (next block to advance)
-            let (first_block_number, first_block_hash) = {
-                let first_remote_entry = remote_chain
-                    .first()?
-                    .ok_or_else(|| ValidationDbError::RemoteChainEmpty)?;
-                (first_remote_entry.0.value(), first_remote_entry.1.value())
+            let (first_block_number, first_block_hash) = match remote_chain.first()? {
+                Some(entry) => (entry.0.value(), entry.1.value()),
+                None => return Ok(false),
             };
-
             let block_hash = BlockHash::from(first_block_hash);
 
             // Load the block data to get the header
-            let serialized_block = block_data.get(first_block_hash)?.ok_or_else(|| {
-                ValidationDbError::MissingData {
-                    kind: MissingDataKind::BlockData,
-                    block_hash,
-                }
-            })?;
-            let block: Block<Transaction> = decode_block_from_slice(&serialized_block.value())?;
+            let serialized_block = block_data.get(first_block_hash)?
+                .expect("block data must exist for blocks in remote chain - this indicates a serious database consistency bug");
+            let block: Block<Transaction> = decode_block_from_slice(&serialized_block.value());
             let header = block.header;
 
             // Verify the header matches the remote chain entry
-            if header.number != first_block_number {
-                return Err(ValidationDbError::BlockNumberMismatch {
-                    header_number: header.number,
-                    expected_number: first_block_number,
-                });
-            }
+            assert_eq!(
+                header.number, first_block_number,
+                "block header number {} does not match remote chain entry {} - this indicates a database consistency bug",
+                header.number, first_block_number
+            );
 
-            let header_hash = BlockHash::from(header.hash);
-
-            if header_hash != block_hash {
-                return Err(ValidationDbError::BlockHashMismatch {
-                    header_hash,
-                    expected_hash: block_hash,
-                });
-            }
+            assert_eq!(
+                header.hash, block_hash,
+                "block header hash {:?} does not match remote chain hash {:?} - this indicates a database consistency bug",
+                header.hash, block_hash
+            );
 
             // Ensure block is successfully validated
-            let serialized_result = validation_results.get(block_hash.0)?.ok_or_else(|| {
-                ValidationDbError::MissingData {
-                    kind: MissingDataKind::ValidationResult,
-                    block_hash,
-                }
-            })?;
-            let result: ValidationResult = decode_from_slice(&serialized_result.value())?;
+            let serialized_result = match validation_results.get(block_hash.0)? {
+                Some(result) => result,
+                None => return Ok(false), // Validation not complete yet, nothing to do
+            };
+            let result: ValidationResult = decode_from_slice(&serialized_result.value());
 
             if !result.success {
-                return Err(ValidationDbError::FailedValidation { block_hash });
+                return Err(ValidationError::StateRootMismatch {
+                    actual: result.post_state_root,
+                    claimed: result.post_state_root, // This is a validation failure
+                }
+                .into());
             }
 
             // Verify parent chain extension for canonical chain
@@ -340,20 +410,18 @@ impl ValidatorDB {
                 // Look up parent block in canonical chain using the parent hash from header
                 let parent_post_state_root = canonical_chain
                     .get((header.number - 1, header.parent_hash.0))?
-                    .ok_or_else(|| ValidationDbError::MissingData {
-                        kind: MissingDataKind::CanonicalParent,
-                        block_hash: BlockHash::from(header.parent_hash),
-                    })?
+                    .expect("parent block must exist in canonical chain")
                     .value();
 
                 let parent_post_state = B256::from(parent_post_state_root);
 
                 // Verify state root continuity: parent's post-state should match current block's pre-state
                 if result.pre_state_root != parent_post_state {
-                    return Err(ValidationDbError::StateRootMismatch {
-                        expected: result.pre_state_root,
-                        actual: parent_post_state,
-                    });
+                    return Err(ValidationError::PreStateRootMismatch {
+                        expected: parent_post_state,
+                        actual: result.pre_state_root,
+                    }
+                    .into());
                 }
             }
 
@@ -362,7 +430,7 @@ impl ValidatorDB {
             remote_chain.remove(header.number)?;
         }
         write_txn.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     /// Grows the remote chain with an unvalidated block
@@ -387,16 +455,15 @@ impl ValidatorDB {
                 let (canonical_number, canonical_hash) = canonical_key.value();
                 (canonical_number, canonical_hash)
             } else {
-                return Err(ValidationDbError::MissingChainAnchor);
+                (0, [0u8; 32])
             };
 
             // Validate extension
             if header.number != parent_number + 1 || header.parent_hash != parent_hash {
                 return Err(ValidationDbError::InvalidChainExtension {
                     block_number: header.number,
-                    expected_number: parent_number + 1,
-                    expected_parent_hash: BlockHash::from(parent_hash),
-                    found_parent_hash: BlockHash::from(header.parent_hash),
+                    expected_parent_hash: BlockHash::from(header.parent_hash),
+                    actual_parent_hash: BlockHash::from(parent_hash),
                 });
             }
 
@@ -527,7 +594,7 @@ impl ValidatorDB {
                                 block_hash,
                             })?
                             .value(),
-                    )?;
+                    );
                     let witness = decode_from_slice(
                         &witnesses
                             .get(block_hash_bytes)?
@@ -536,7 +603,7 @@ impl ValidatorDB {
                                 block_hash,
                             })?
                             .value(),
-                    )?;
+                    );
 
                     Some((block, witness))
                 }
@@ -560,7 +627,7 @@ impl ValidatorDB {
         let validation_results = read_txn.open_table(VALIDATION_RESULTS)?;
 
         match validation_results.get(block_hash.0)? {
-            Some(serialized_result) => Ok(Some(decode_from_slice(&serialized_result.value())?)),
+            Some(serialized_result) => Ok(Some(decode_from_slice(&serialized_result.value()))),
             None => Ok(None),
         }
     }
@@ -626,7 +693,7 @@ impl ValidatorDB {
         let contracts = read_txn.open_table(CONTRACTS)?;
 
         match contracts.get(code_hash.0)? {
-            Some(serialized_bytecode) => Ok(Some(decode_from_slice(&serialized_bytecode.value())?)),
+            Some(serialized_bytecode) => Ok(Some(decode_from_slice(&serialized_bytecode.value()))),
             None => Ok(None),
         }
     }
@@ -696,10 +763,10 @@ fn encode_to_vec<T: serde::Serialize>(data: &T) -> Result<Vec<u8>> {
 }
 
 /// Helper method to deserialize data using bincode with legacy config
-fn decode_from_slice<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+fn decode_from_slice<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
     let (decoded, _) = bincode::serde::decode_from_slice(bytes, bincode::config::legacy())
-        .map_err(SerializationError::from)?;
-    Ok(decoded)
+        .expect("serialization of previously stored data must succeed");
+    decoded
 }
 
 /// Helper method to serialize Block<Transaction> using JSON
@@ -709,101 +776,8 @@ fn encode_block_to_vec(block: &Block<Transaction>) -> Result<Vec<u8>> {
 }
 
 /// Helper method to deserialize Block<Transaction> using JSON
-fn decode_block_from_slice(bytes: &[u8]) -> Result<Block<Transaction>> {
-    let block = serde_json::from_slice(bytes).map_err(SerializationError::from)?;
-    Ok(block)
+fn decode_block_from_slice(bytes: &[u8]) -> Block<Transaction> {
+    serde_json::from_slice(bytes)
+        .expect("serialization of previously stored block data must succeed")
 }
 
-#[derive(Debug, Error)]
-pub enum ValidationDbError {
-    #[error(transparent)]
-    Redb(#[from] redb::Error),
-
-    #[error(transparent)]
-    RedbDatabase(#[from] redb::DatabaseError),
-
-    #[error(transparent)]
-    RedbTransaction(#[from] redb::TransactionError),
-
-    #[error(transparent)]
-    RedbTable(#[from] redb::TableError),
-
-    #[error(transparent)]
-    RedbStorage(#[from] redb::StorageError),
-
-    #[error(transparent)]
-    RedbCommit(#[from] redb::CommitError),
-
-    #[error(transparent)]
-    Serialization(#[from] SerializationError),
-
-    #[error("missing {kind} for block {block_hash:?}")]
-    MissingData {
-        kind: MissingDataKind,
-        block_hash: BlockHash,
-    },
-
-    #[error("remote chain is empty")]
-    RemoteChainEmpty,
-
-    #[error("header number {header_number} does not match remote number {expected_number}")]
-    BlockNumberMismatch {
-        header_number: BlockNumber,
-        expected_number: BlockNumber,
-    },
-
-    #[error("header hash {header_hash:?} does not match remote hash {expected_hash:?}")]
-    BlockHashMismatch {
-        header_hash: BlockHash,
-        expected_hash: BlockHash,
-    },
-
-    #[error("block {block_hash:?} was recorded with a failed validation result")]
-    FailedValidation { block_hash: BlockHash },
-
-    #[error("state root mismatch: expected {expected:?}, parent has {actual:?}")]
-    StateRootMismatch { expected: B256, actual: B256 },
-
-    #[error("cannot extend remote chain without an anchor block")]
-    MissingChainAnchor,
-
-    #[error(
-        "block {block_number} must extend parent number {expected_number} with hash {expected_parent_hash:?}, found {found_parent_hash:?}"
-    )]
-    InvalidChainExtension {
-        block_number: BlockNumber,
-        expected_number: BlockNumber,
-        expected_parent_hash: BlockHash,
-        found_parent_hash: BlockHash,
-    },
-}
-
-#[derive(Debug, Error)]
-pub enum SerializationError {
-    #[error(transparent)]
-    BincodeEncode(#[from] bincode::error::EncodeError),
-    #[error(transparent)]
-    BincodeDecode(#[from] bincode::error::DecodeError),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum MissingDataKind {
-    BlockData,
-    Witness,
-    ValidationResult,
-    CanonicalParent,
-}
-
-impl fmt::Display for MissingDataKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let label = match self {
-            MissingDataKind::BlockData => "block data",
-            MissingDataKind::Witness => "witness",
-            MissingDataKind::ValidationResult => "validation result",
-            MissingDataKind::CanonicalParent => "canonical parent",
-        };
-        f.write_str(label)
-    }
-}

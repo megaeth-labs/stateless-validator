@@ -459,26 +459,10 @@ async fn chain_sync(
 
         // Chain sync iteration - advance canonical chain
         if let Err(e) = async {
-            let mut blocks_advanced = 0;
-
             // Advance the canonical chain with newly validated blocks
-            loop {
-                match validator_db.grow_local_chain() {
-                    Ok(()) => blocks_advanced += 1,
-                    Err(e) => {
-                        if blocks_advanced == 0 {
-                            let msg = e.to_string();
-                            if msg.contains("failed validation") {
-                                warn!("Cannot advance chain due to failed validation: {e}");
-                            } else if !msg.contains("Remote chain is empty")
-                                && !msg.contains("not validated")
-                            {
-                                warn!("Cannot advance chain: {e}");
-                            }
-                        }
-                        break;
-                    }
-                }
+            let mut blocks_advanced = 0;
+            while validator_db.grow_local_chain()? {
+                blocks_advanced += 1;
             }
 
             if blocks_advanced > 0 {
@@ -490,7 +474,6 @@ async fn chain_sync(
         .await
         {
             error!("Chain sync iteration failed: {}", e);
-            // Continue running despite errors - individual iterations can fail
         }
 
         // Wait before next sync cycle
