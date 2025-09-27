@@ -635,9 +635,11 @@ impl ValidatorDB {
     ///
     /// Removes canonical chain entries, validation records, block data, and witnesses
     /// for blocks older than the specified block number.
-    pub fn prune_history(&self, before_block: BlockNumber) -> ValidationDbResult<()> {
+    ///
+    /// Returns the number of blocks that were actually pruned.
+    pub fn prune_history(&self, before_block: BlockNumber) -> ValidationDbResult<u64> {
         let write_txn = self.database.begin_write()?;
-        {
+        let blocks_pruned = {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
             let mut block_records = write_txn.open_table(BLOCK_RECORDS)?;
             let mut block_data = write_txn.open_table(BLOCK_DATA)?;
@@ -650,6 +652,8 @@ impl ValidatorDB {
                 .map(|result| result.map(|(key, _)| key.value()))
                 .collect::<Result<Vec<_>, _>>()?;
 
+            let pruned_count = keys_to_remove.len() as u64;
+
             for (block_number, block_hash) in keys_to_remove {
                 // Remove from all relevant tables
                 canonical_chain.remove((block_number, block_hash))?;
@@ -658,9 +662,11 @@ impl ValidatorDB {
                 witnesses.remove(block_hash)?;
                 validation_results.remove(block_hash)?;
             }
-        }
+
+            pruned_count
+        };
         write_txn.commit()?;
-        Ok(())
+        Ok(blocks_pruned)
     }
 
     /// Recovers tasks that were interrupted by a crash

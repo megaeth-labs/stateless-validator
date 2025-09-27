@@ -422,7 +422,13 @@ async fn chain_sync(
     };
     info!("Remote chain tracker started");
 
-    // Step 3: Spawn validation workers as tokio tasks
+    // Step 3: Spawn history pruner
+    let _pruner_handle = task::spawn({
+        let validator_db = Arc::clone(&validator_db);
+        async move { history_pruner(validator_db, Duration::from_secs(300), 1000).await }
+    });
+
+    // Step 4: Spawn validation workers as tokio tasks
     info!("Spawning {} validation workers...", concurrent_num);
     let mut worker_handles = Vec::new();
 
@@ -438,7 +444,7 @@ async fn chain_sync(
     }
     info!("All validation workers started");
 
-    // Step 4: Main chain synchronizer loop
+    // Step 5: Main chain synchronizer loop
     info!("Starting main chain synchronizer loop...");
 
     loop {
@@ -451,7 +457,7 @@ async fn chain_sync(
             return Ok(());
         }
 
-        // Chain sync iteration - advance canonical chain and perform pruning
+        // Chain sync iteration - advance canonical chain
         if let Err(e) = async {
             let mut blocks_advanced = 0;
 
@@ -477,19 +483,6 @@ async fn chain_sync(
 
             if blocks_advanced > 0 {
                 info!("Advanced canonical chain by {blocks_advanced} blocks");
-            }
-
-            // Prune old data - keep last 1000 blocks
-            if let Some((current_tip, _)) = validator_db.get_local_tip()? {
-                const BLOCKS_TO_KEEP: u64 = 1000;
-                if current_tip > BLOCKS_TO_KEEP {
-                    let prune_before = current_tip - BLOCKS_TO_KEEP;
-                    if let Err(e) = validator_db.prune_history(prune_before) {
-                        warn!("Failed to prune old block data: {e}");
-                    } else {
-                        info!("Pruned block data before block {prune_before}");
-                    }
-                }
             }
 
             Ok::<(), eyre::Error>(())
@@ -528,41 +521,24 @@ async fn remote_chain_tracker(
     loop {
         // Perform one iteration of remote chain tracking
         if let Err(e) = async {
-            // Step 1: Get current chain tips
+            // Get current chain tips and analyze gap
             let local_tip = validator_db
                 .get_local_tip()?
                 .ok_or_else(|| anyhow!("Local chain is empty - cannot track remote chain"))?;
-
-            let remote_tip = validator_db.get_remote_tip()?.unwrap_or(local_tip); // If no remote chain, start from local tip
-
-            // Step 2: Analyze gap between local and remote tips
+            let remote_tip = validator_db.get_remote_tip()?.unwrap_or(local_tip);
             let gap = remote_tip.0.saturating_sub(local_tip.0);
-            info!(
-                "Chain status: local_tip={}, remote_tip={}, gap={}",
-                local_tip.0, remote_tip.0, gap
-            );
+            info!("Chain status: local_tip={}, remote_tip={}, gap={}", local_tip.0, remote_tip.0, gap);
 
-            // Step 3: Check if we are still on the right chain (detect reorgs)
+            // Check if we are still on the right chain (detect reorgs)
             match client.block_by_number(remote_tip.0, false).await {
-                Ok(block) => {
-                    if block.header.hash != remote_tip.1 {
-                        error!(
-                            "Remote tip hash mismatch! Expected: {}, got: {}. Triggering rollback.",
-                            remote_tip.1, block.header.hash
-                        );
-                        // FIXME: Find proper common ancestor between local and remote chains
-                        // For now, rollback to local tip as a simple approximation
-                        validator_db.rollback_chain(local_tip.0)?;
-                        return Ok(());
-                    }
+                Ok(block) if block.header.hash != remote_tip.1 => {
+                    error!("Remote tip hash mismatch! Expected: {}, got: {}. Triggering rollback.", remote_tip.1, block.header.hash);
+                    // FIXME: Find proper common ancestor between local and remote chains
+                    validator_db.rollback_chain(local_tip.0)?;
+                    return Ok(());
                 }
-                Err(e) => {
-                    // Network error - don't rollback eagerly, it may be just a network glitch
-                    warn!(
-                        "Failed to validate remote tip {} (network issue): {}. Continuing without rollback.",
-                        remote_tip.1, e
-                    );
-                }
+                Err(e) => warn!("Failed to validate remote tip {} (network issue): {}. Continuing without rollback.", remote_tip.1, e),
+                _ => {} // Valid remote tip, continue
             }
 
             if gap >= LOOKAHEAD_BLOCKS {
@@ -570,13 +546,10 @@ async fn remote_chain_tracker(
                 return Ok(());
             }
 
-            // Step 4: Query latest block number from remote RPC to bound our fetch range
+            // Query latest block and calculate fetch range
             let latest_remote_block = client.block_number().await?;
-            info!("Latest block on remote chain: {}", latest_remote_block);
-
-            // Calculate how many blocks we can actually fetch without exceeding remote chain
-            let max_blocks_we_can_fetch = latest_remote_block.saturating_sub(remote_tip.0);
-            let blocks_to_fetch = (LOOKAHEAD_BLOCKS - gap).min(max_blocks_we_can_fetch);
+            let blocks_to_fetch = (LOOKAHEAD_BLOCKS - gap)
+                .min(latest_remote_block.saturating_sub(remote_tip.0));
 
             if blocks_to_fetch == 0 {
                 info!("No new blocks available on remote chain (latest: {})", latest_remote_block);
@@ -584,98 +557,52 @@ async fn remote_chain_tracker(
             }
 
             let start_block = remote_tip.0 + 1;
-            let end_block = start_block + blocks_to_fetch - 1;
+            info!("Fetching {} blocks (range: {} to {}) to maintain lookahead",
+                  blocks_to_fetch, start_block, start_block + blocks_to_fetch - 1);
 
-            info!(
-                "Fetching {} blocks (range: {} to {}) to maintain lookahead",
-                blocks_to_fetch, start_block, end_block
-            );
-
-            // Step 4.1: Fetch blocks and witnesses, queue for validation, return headers
-            let fetch_tasks: Vec<_> = (start_block..=end_block)
+            // Fetch blocks and witnesses, queue for validation, return headers
+            let fetch_tasks: Vec<_> = (start_block..start_block + blocks_to_fetch)
                 .map(|block_number| {
-                    let client_clone = client.clone();
-                    let validator_db_clone = validator_db.clone();
+                    let client = client.clone();
+                    let db = validator_db.clone();
                     tokio::spawn(async move {
-                        // Fetch block first
-                        let block = client_clone.block_by_number(block_number, true).await?;
-                        // Then fetch witness using block hash
-                        let witness = client_clone.witness_by_block_hash(block.header.hash).await?;
-
-                        // Immediately queue for validation while we have both
-                        validator_db_clone.add_validation_task(&block, &witness)?;
-                        info!("Queued block {} for validation", block.header.number);
-
-                        // Return only the header (has block number + hash for grow_remote_chain)
+                        let block = client.block_by_number(block_number, true).await?;
+                        let witness = client.witness_by_block_hash(block.header.hash).await?;
+                        db.add_validation_task(&block, &witness)?;
                         Ok::<Header, eyre::Error>(block.header)
                     })
                 })
                 .collect();
 
-            // Step 4.2: Wait for all fetches to complete, handling individual failures
+            // Wait for all fetches and process results, ensuring contiguity
             let fetch_results = future::join_all(fetch_tasks).await;
-
-            // Step 4.3: Process results and ensure contiguous headers
-            let mut header_results = Vec::new();
-            for (i, task_result) in fetch_results.into_iter().enumerate() {
-                let expected_block_number = start_block + i as u64;
-                match task_result {
-                    Ok(Ok(header)) => {
-                        header_results.push(Ok(header));
-                    }
-                    Ok(Err(rpc_error)) => {
-                        error!("RPC error fetching block/witness {}: {}", expected_block_number, rpc_error);
-                        header_results.push(Err(rpc_error));
-                    }
-                    Err(join_error) => {
-                        error!("Task join error for block {}: {}", expected_block_number, join_error);
-                        header_results.push(Err(join_error.into()));
-                    }
-                }
-            }
-
-            // Step 4.4: Ensure contiguity - stop at first failure
             let mut fetched_headers = Vec::new();
-            for result in header_results {
-                match result {
-                    Ok(header) => {
-                        fetched_headers.push(header);
+
+            for (i, task_result) in fetch_results.into_iter().enumerate() {
+                let block_number = start_block + i as u64;
+                match task_result {
+                    Ok(Ok(header)) => fetched_headers.push(header),
+                    Ok(Err(e)) => {
+                        error!("RPC error fetching block {}: {}. Stopping to maintain contiguity.", block_number, e);
+                        break;
                     }
                     Err(e) => {
-                        // Can't get block number from failed header, use index instead
-                        let failed_block_number = start_block + fetched_headers.len() as u64;
-                        error!(
-                            "Failed to fetch block {}: {}. Stopping to maintain contiguity.",
-                            failed_block_number, e
-                        );
-                        // Stop at first gap to maintain contiguity
+                        error!("Task join error for block {}: {}. Stopping to maintain contiguity.", block_number, e);
                         break;
                     }
                 }
             }
 
             if fetched_headers.len() < blocks_to_fetch as usize {
-                info!(
-                    "Fetched {} out of {} requested blocks due to failures. Will retry missing blocks in next iteration.",
-                    fetched_headers.len(),
-                    blocks_to_fetch
-                );
+                info!("Fetched {} out of {} requested blocks due to failures. Will retry missing blocks in next iteration.",
+                      fetched_headers.len(), blocks_to_fetch);
             }
 
-            // Step 4.5: Add headers to remote chain
+            // Add headers to remote chain
             for header in fetched_headers {
-                match validator_db.grow_remote_chain(&header) {
-                    Ok(()) => {
-                        info!("Added block {} to remote chain", header.number);
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to add block {} to remote chain: {}",
-                            header.number, e
-                        );
-                        // Stop processing to avoid gaps in the chain
-                        break;
-                    }
+                if let Err(e) = validator_db.grow_remote_chain(&header) {
+                    error!("Failed to add block {} to remote chain: {}. Stopping to avoid gaps.", header.number, e);
+                    break;
                 }
             }
 
@@ -687,6 +614,30 @@ async fn remote_chain_tracker(
 
         // Wait before next iteration
         tokio::time::sleep(Duration::from_secs(POLLING_INTERVAL_SECS)).await;
+    }
+}
+
+/// Periodically prunes old block data to manage storage
+async fn history_pruner(
+    validator_db: Arc<ValidatorDB>,
+    pruning_interval: Duration,
+    blocks_to_keep: u64,
+) -> Result<()> {
+    info!("Starting history pruner with interval {pruning_interval:?}");
+
+    loop {
+        if let Ok(Some((current_tip, _))) = validator_db.get_local_tip() {
+            let prune_before = current_tip.saturating_sub(blocks_to_keep);
+            match validator_db.prune_history(prune_before) {
+                Ok(blocks_pruned) if blocks_pruned > 0 => {
+                    info!("Pruned {blocks_pruned} blocks before block {prune_before}");
+                }
+                Err(e) => warn!("Failed to prune old block data: {e}"),
+                _ => {}
+            }
+        }
+
+        tokio::time::sleep(pruning_interval).await;
     }
 }
 
