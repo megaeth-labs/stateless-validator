@@ -170,7 +170,6 @@ const BLOCK_RECORDS: TableDefinition<(u64, [u8; 32]), ()> = TableDefinition::new
 /// and retrieved via get_contract_code().
 const CONTRACTS: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("contracts");
 
-
 #[derive(Debug, Error)]
 pub enum ValidationDbError {
     #[error("Database error: {0}")]
@@ -365,57 +364,44 @@ impl ValidatorDB {
             let validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
             let block_data = write_txn.open_table(BLOCK_DATA)?;
 
-            let (first_block_number, first_block_hash) = match remote_chain.first()? {
+            // Get and validate first remote block
+            let (block_number, block_hash_bytes) = match remote_chain.first()? {
                 Some(entry) => (entry.0.value(), entry.1.value()),
                 None => return Ok(false),
             };
-            let block_hash = BlockHash::from(first_block_hash);
 
-            // Load the block data to get the header
-            let serialized_block = block_data.get(first_block_hash)?
-                .expect("block data must exist for blocks in remote chain - this indicates a serious database consistency bug");
-            let block: Block<Transaction> = decode_block_from_slice(&serialized_block.value());
-            let header = block.header;
+            // Load block header and verify it matches remote chain entry
+            let serialized_block = block_data
+                .get(block_hash_bytes)?
+                .expect("block data must exist for blocks in remote chain");
+            let header = decode_block_from_slice(&serialized_block.value()).header;
 
-            // Verify the header matches the remote chain entry
-            assert_eq!(
-                header.number, first_block_number,
-                "block header number {} does not match remote chain entry {} - this indicates a database consistency bug",
-                header.number, first_block_number
-            );
+            assert_eq!(header.number, block_number);
+            assert_eq!(header.hash.0, block_hash_bytes);
 
-            assert_eq!(
-                header.hash, block_hash,
-                "block header hash {:?} does not match remote chain hash {:?} - this indicates a database consistency bug",
-                header.hash, block_hash
-            );
-
-            // Ensure block is successfully validated
-            let serialized_result = match validation_results.get(block_hash.0)? {
-                Some(result) => result,
-                None => return Ok(false), // Validation not complete yet, nothing to do
+            // Ensure block validation succeeded
+            let result: ValidationResult = match validation_results.get(block_hash_bytes)? {
+                Some(serialized) => decode_from_slice(&serialized.value()),
+                None => return Ok(false), // Validation not complete yet
             };
-            let result: ValidationResult = decode_from_slice(&serialized_result.value());
 
             if !result.success {
                 return Err(ValidationError::StateRootMismatch {
                     actual: result.post_state_root,
-                    claimed: result.post_state_root, // This is a validation failure
+                    claimed: result.post_state_root,
                 }
                 .into());
             }
 
-            // Verify parent chain extension for canonical chain
+            // Verify parent chain extension for non-genesis blocks
             if header.number > 0 {
-                // Look up parent block in canonical chain using the parent hash from header
-                let parent_post_state_root = canonical_chain
-                    .get((header.number - 1, header.parent_hash.0))?
-                    .expect("parent block must exist in canonical chain")
-                    .value();
+                let parent_post_state = B256::from(
+                    canonical_chain
+                        .get((header.number - 1, header.parent_hash.0))?
+                        .expect("parent block must exist in canonical chain")
+                        .value(),
+                );
 
-                let parent_post_state = B256::from(parent_post_state_root);
-
-                // Verify state root continuity: parent's post-state should match current block's pre-state
                 if result.pre_state_root != parent_post_state {
                     return Err(ValidationError::PreStateRootMismatch {
                         expected: parent_post_state,
@@ -425,8 +411,8 @@ impl ValidatorDB {
                 }
             }
 
-            // Move block from remote chain to canonical chain
-            canonical_chain.insert((header.number, block_hash.0), result.post_state_root.0)?;
+            // Move block from remote to canonical chain
+            canonical_chain.insert((header.number, header.hash.0), result.post_state_root.0)?;
             remote_chain.remove(header.number)?;
         }
         write_txn.commit()?;
@@ -780,4 +766,3 @@ fn decode_block_from_slice(bytes: &[u8]) -> Block<Transaction> {
     serde_json::from_slice(bytes)
         .expect("serialization of previously stored block data must succeed")
 }
-
