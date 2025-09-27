@@ -231,17 +231,11 @@ async fn validation_worker(
     info!("Validation worker {} started", worker_id);
 
     loop {
-        // Process individual task with error containment
         if let Err(e) = validate_one_block(worker_id, &client, &validator_db).await {
-            error!(
-                "Worker {} encountered error during task processing: {}",
-                worker_id, e
-            );
-            // Continue to next iteration instead of terminating worker
+            error!("Worker {worker_id} encountered error during task processing: {e}");
+            // Small delay to prevent tight error loops
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-
-        // Small delay to prevent tight error loops
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -276,17 +270,15 @@ async fn validate_one_block(
     client: &RpcClient,
     validator_db: &ValidatorDB,
 ) -> Result<()> {
-    // Step 1: Get next validation task atomically
     match validator_db.get_next_task()? {
         Some((block, witness)) => {
             let block_number = block.header.number;
-            let block_hash = block.header.hash;
-
             info!("Worker {} validating block {}", worker_id, block_number);
 
             // Step 2: Handle contract code fetching using database cache only
             let contract_codes = extract_contract_codes(&witness);
 
+            // FIXME: contract fetching logic is buggy and slow; must be rewritten
             // Find contracts that need to be fetched from RPC
             let mut contracts_to_fetch = Vec::new();
             for (address, code_hash) in &contract_codes {
@@ -328,47 +320,32 @@ async fn validate_one_block(
                 })
                 .collect();
 
-            // Extract pre-state root from witness before validation
+            // Step 4: validate the given block
             let pre_state_root = B256::from(witness.state_root()?);
-            let validation_result = match validate_block(&block, witness, &contracts) {
+            let (success, error_message) = match validate_block(&block, witness, &contracts) {
                 Ok(()) => {
-                    info!(
-                        "Worker {} successfully validated block {}",
-                        worker_id, block_number
-                    );
-                    ValidationResult {
-                        pre_state_root,
-                        post_state_root: block.header.state_root,
-                        block_number,
-                        block_hash,
-                        success: true,
-                        error_message: None,
-                        completed_at: SystemTime::now(),
-                    }
+                    info!("Worker {worker_id} successfully validated block {block_number}");
+                    (true, None)
                 }
                 Err(e) => {
-                    error!(
-                        "Worker {} failed to validate block {}: {}",
-                        worker_id, block_number, e
-                    );
-                    ValidationResult {
-                        pre_state_root,
-                        post_state_root: block.header.state_root,
-                        block_number,
-                        block_hash,
-                        success: false,
-                        error_message: Some(e.to_string()),
-                        completed_at: SystemTime::now(),
-                    }
+                    error!("Worker {worker_id} failed to validate block {block_number}: {e}");
+                    (false, Some(e.to_string()))
                 }
             };
 
-            // Step 4: Record validation result
-            validator_db.complete_validation(validation_result)?;
+            validator_db.complete_validation(ValidationResult {
+                pre_state_root,
+                post_state_root: block.header.state_root,
+                block_number,
+                block_hash: block.header.hash,
+                success,
+                error_message,
+                completed_at: SystemTime::now(),
+            })?;
         }
         None => {
             // No tasks available, wait a bit before checking again
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
@@ -1061,7 +1038,7 @@ mod tests {
         chain_sync(
             client.clone(),
             validator_db,
-            4,
+            1,
             Duration::from_millis(100),
             sync_target,
         )
