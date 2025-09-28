@@ -1,101 +1,130 @@
-//! RPC client for the stateless validator.
+//! RPC client for fetching missing data during stateless validation.
 //!
-//! The `RpcClient` is used to communicate with a full Ethereum node to fetch data
-//! required for validation that is not present in the `BlockWitness` (e.g., contract code,
-//! historical block).
+//! Fetches contract bytecode, blocks, and SALT witness data from OP Stack nodes
+//! when not present in witness files.
 use alloy_primitives::{Address, B256, Bytes, hex};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
-use eyre::{Result, eyre};
+use eyre::{Context, Result, eyre};
 use futures::future::try_join_all;
 use op_alloy_network::Optimism;
 use op_alloy_rpc_types::Transaction;
 use salt::SaltWitness;
 
-/// An RPC client for fetching data from a full Ethereum node.
+/// RPC client for OP Stack nodes.
+///
+/// Fetches missing contract bytecode, blocks, and witness data during stateless validation.
+/// Executes requests concurrently for performance.
 #[derive(Debug, Clone)]
 pub struct RpcClient {
-    /// The HTTP-based RPC provider.
+    /// OP Stack RPC provider.
     pub provider: RootProvider<Optimism>,
 }
 
 impl RpcClient {
-    /// Creates a new `RpcClient` connected to the given API endpoint.
+    /// Creates a new RPC client connected to an Ethereum node.
+    ///
+    /// # Arguments
+    /// * `api` - HTTP URL of the Ethereum RPC endpoint (e.g., "http://localhost:8545")
+    ///
+    /// # Returns
+    /// Configured RPC client ready to make requests to the Optimism network.
+    ///
+    /// # Errors
+    /// Returns error if the API URL is malformed or invalid.
     pub fn new(api: &str) -> Result<Self> {
-        let provider = ProviderBuilder::<_, _, Optimism>::default()
-            .connect_http(api.parse().map_err(|e| eyre!("parse api failed: {}", e))?);
-
-        Ok(Self { provider })
+        Ok(Self {
+            provider: ProviderBuilder::<_, _, Optimism>::default()
+                .connect_http(api.parse().context("Failed to parse API URL")?),
+        })
     }
 
-    /// Fetches the bytecode for multiple addresses at a specific block.
+    /// Gets contract bytecode for multiple addresses at a specific block height.
     ///
-    /// The requests are executed concurrently for efficiency.
-    pub async fn codes_at(
+    /// # Arguments
+    /// * `addresses` - Contract addresses to fetch bytecode for
+    /// * `block_number` - Block height to query (supports latest, earliest, pending)
+    ///
+    /// # Returns
+    /// Vector of bytecode in the same order as input addresses. Empty bytecode
+    /// is returned for addresses without deployed contracts.
+    ///
+    /// # Performance
+    /// Executes all requests concurrently for optimal performance.
+    pub async fn get_code(
         &self,
         addresses: &[Address],
         block_number: BlockNumberOrTag,
     ) -> Result<Vec<Bytes>> {
-        let futures = addresses.iter().map(|&addr| {
-            let provider = self.provider.clone();
-
-            async move {
-                provider
-                    .get_code_at(addr)
-                    .block_id(block_number.into())
-                    .await
-                    .map_err(|e| {
-                        eyre!(
-                            "get_code_at for address {addr:?} at block {block_number:?} failed: {e}"
-                        )
-                    })
-            }
-        });
-
-        try_join_all(futures).await
+        try_join_all(addresses.iter().map(|&addr| async move {
+            self.provider
+                .get_code_at(addr)
+                .block_id(block_number.into())
+                .await
+                .context(format!(
+                    "get_code_at for address {addr:?} at block {block_number:?}"
+                ))
+        }))
+        .await
     }
 
-    /// Fetches a full block by its number.
-    pub async fn block_by_number(&self, number: u64, full_txs: bool) -> Result<Block<Transaction>> {
-        self.fetch_block(BlockId::Number(number.into()), full_txs)
-            .await
-            .map_err(|e| eyre!("get_block_by_number at {number} failed: {e}"))
+    /// Gets a block by its number with optional transaction details.
+    ///
+    /// # Arguments
+    /// * `number` - Block number to fetch
+    /// * `full_txs` - If true, includes full transaction objects; if false, only transaction hashes
+    ///
+    /// # Returns
+    /// Complete block data including header, transactions, and metadata.
+    ///
+    /// # Errors
+    /// Returns error if block doesn't exist or RPC call fails.
+    pub async fn get_block(&self, number: u64, full_txs: bool) -> Result<Block<Transaction>> {
+        let block_id = BlockId::Number(number.into());
+        let block = if full_txs {
+            self.provider.get_block(block_id).full().await?
+        } else {
+            self.provider.get_block(block_id).await?
+        };
+        block.ok_or_else(|| eyre!("Block {number} not found"))
     }
 
-    /// Fetches the latest block number from the blockchain.
-    pub async fn block_number(&self) -> Result<u64> {
+    /// Gets the current latest block number from the blockchain.
+    ///
+    /// # Returns
+    /// The highest block number that has been mined.
+    ///
+    /// # Errors
+    /// Returns error if unable to connect to the blockchain or RPC fails.
+    pub async fn get_latest_block_number(&self) -> Result<u64> {
         self.provider
             .get_block_number()
             .await
-            .map_err(|e| eyre!("get_block_number failed: {e}"))
+            .context("Failed to get block number")
     }
 
-    /// Fetches a witness by its block hash.
-    pub async fn witness_by_block_hash(&self, hash: B256) -> Result<SaltWitness> {
-        let witness_data: Vec<u8> = self
-            .provider
+    /// Gets execution witness data for a specific block.
+    ///
+    /// # Arguments
+    /// * `hash` - Block hash to fetch witness data for
+    ///
+    /// # Returns
+    /// Decoded witness containing state access patterns and execution traces
+    /// required for stateless validation.
+    ///
+    /// # Errors
+    /// Returns error if block hash doesn't exist, witness unavailable, or
+    /// witness data is corrupted and cannot be decoded.
+    pub async fn get_witness(&self, hash: B256) -> Result<SaltWitness> {
+        self.provider
             .client()
             .request("eth_getWitness", (format!("0x{}", hex::encode(hash)),))
             .await
-            .map_err(|e| eyre!("get_witness for block {hash} failed: {e}"))?;
-
-        let (witness, _): (SaltWitness, usize) =
-            bincode::serde::decode_from_slice(&witness_data, bincode::config::legacy())
-                .map_err(|e| eyre!("Failed to decode witness for block {hash}: {e}"))?;
-
-        Ok(witness)
-    }
-
-    /// Generic helper to fetch a block by its ID (hash or number).
-    async fn fetch_block(&self, block_id: BlockId, full_txs: bool) -> Result<Block<Transaction>> {
-        let block_request = self.provider.get_block(block_id);
-
-        let block = if full_txs {
-            block_request.full().await?
-        } else {
-            block_request.await?
-        };
-
-        block.ok_or_else(|| eyre!("Block {:?} not found", block_id))
+            .context(format!("get_witness for block {hash}"))
+            .and_then(|data: Vec<u8>| {
+                bincode::serde::decode_from_slice(&data, bincode::config::legacy())
+                    .map(|(witness, _): (SaltWitness, usize)| witness)
+                    .context(format!("Failed to decode witness for block {hash}"))
+            })
     }
 }

@@ -259,7 +259,7 @@ async fn remote_chain_tracker(
             );
 
             // Detect chain reorgs by validating remote tip hash
-            match client.block_by_number(remote_tip.0, false).await {
+            match client.get_block(remote_tip.0, false).await {
                 Ok(block) if block.header.hash != remote_tip.1 => {
                     error!(
                         "[Tracker] Hash mismatch! Expected {}, got {}. Rolling back.",
@@ -281,8 +281,12 @@ async fn remote_chain_tracker(
             }
 
             // Calculate how many blocks to fetch (bounded by latest available)
-            let blocks_to_fetch = (config.tracker_lookahead_blocks - gap)
-                .min(client.block_number().await?.saturating_sub(remote_tip.0));
+            let blocks_to_fetch = (config.tracker_lookahead_blocks - gap).min(
+                client
+                    .get_latest_block_number()
+                    .await?
+                    .saturating_sub(remote_tip.0),
+            );
 
             if blocks_to_fetch == 0 {
                 return Ok(());
@@ -300,8 +304,8 @@ async fn remote_chain_tracker(
                     let client = client.clone();
                     let db = validator_db.clone();
                     tokio::spawn(async move {
-                        let block = client.block_by_number(block_number, true).await?;
-                        let witness = client.witness_by_block_hash(block.header.hash).await?;
+                        let block = client.get_block(block_number, true).await?;
+                        let witness = client.get_witness(block.header.hash).await?;
                         db.add_validation_task(&block, &witness)?;
                         Ok::<Header, eyre::Error>(block.header)
                     })
@@ -427,7 +431,7 @@ async fn validate_one(
 
             // Fetch missing contract codes via RPC and update the local DB
             let codes = client
-                .codes_at(&missing_contracts, (block_number - 1).into())
+                .get_code(&missing_contracts, (block_number - 1).into())
                 .await?;
 
             for (address, bytes) in missing_contracts.iter().zip(codes.iter()) {
