@@ -1,13 +1,8 @@
-use alloy_primitives::{Address, BlockHash, hex};
+use alloy_primitives::Address;
 use alloy_rpc_types_eth::Header;
 use clap::Parser;
 use eyre::{Result, anyhow};
 use futures::future;
-use jsonrpsee::{
-    RpcModule,
-    server::{ServerBuilder, ServerConfigBuilder},
-};
-use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, INVALID_PARAMS_CODE};
 use revm::{
     primitives::{B256, KECCAK_EMPTY},
     state::Bytecode,
@@ -32,11 +27,6 @@ use rpc::RpcClient;
 
 mod checksum_data;
 mod witness_types;
-use checksum_data::deserialized_checksum_data;
-
-/// Maximum response body size for the RPC server.
-/// This is set to 100 MB to accommodate large block data and witness information.
-const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
 
 /// Database filename for the validator.
 const VALIDATOR_DB_FILENAME: &str = "validator.redb";
@@ -91,10 +81,6 @@ struct CommandLineArgs {
     /// The URL of the Ethereum JSON-RPC API endpoint for fetching blockchain data.
     #[clap(short = 'r', long)]
     rpc_endpoint: String,
-
-    /// Optional port number to run the RPC server for validation queries.
-    #[clap(short = 's', long)]
-    server_port: Option<u16>,
 }
 
 #[tokio::main]
@@ -105,7 +91,6 @@ async fn main() -> Result<()> {
 
     info!("[Main] Data directory: {}", args.data_dir);
     info!("[Main] RPC endpoint: {}", args.rpc_endpoint);
-    info!("[Main] Server port: {:?}", args.server_port);
 
     let work_dir = PathBuf::from(args.data_dir);
 
@@ -113,13 +98,8 @@ async fn main() -> Result<()> {
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
 
     // Create chain sync configuration
-    // Reserve 2 CPUs for the server if it's running, otherwise use all available CPUs
     let config = Arc::new(ChainSyncConfig {
-        concurrent_workers: if args.server_port.is_some() {
-            (num_cpus::get() - 2).max(1)
-        } else {
-            num_cpus::get()
-        },
+        concurrent_workers: num_cpus::get(),
         ..ChainSyncConfig::default()
     });
     info!(
@@ -129,54 +109,10 @@ async fn main() -> Result<()> {
 
     let validator_logic = chain_sync(client.clone(), validator_db.clone(), config);
 
-    if let Some(port) = args.server_port {
-        let mut module = RpcModule::new(validator_db.clone());
-
-        module.register_method("stateless_getValidation", |params, validator_db, _| {
-            let (_block_number, block_hash): (u64, String) = params.parse()?;
-            let block_hash = parse_block_hash(&block_hash).map_err(|e| {
-                make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid block hash: {e}"))
-            })?;
-
-            match validator_db.get_validation_result(block_hash) {
-                Ok(Some(result)) => Ok(result.success),
-                Ok(None) => Err(make_rpc_error(
-                    INVALID_PARAMS_CODE,
-                    "Validation result not found".to_string(),
-                )),
-                Err(e) => Err(make_rpc_error(CALL_EXECUTION_FAILED_CODE, e.to_string())),
-            }
-        })?;
-
-        let cfg = ServerConfigBuilder::default()
-            .max_response_body_size(MAX_RESPONSE_BODY_SIZE)
-            .build();
-        let server = ServerBuilder::default()
-            .set_config(cfg)
-            .build(format!("0.0.0.0:{port}"))
-            .await?;
-
-        let addr = server.local_addr()?.to_string();
-        info!("[RPC Server] Listening on {}", addr);
-
-        let handle = server.start(module);
-
-        tokio::select! {
-            res = validator_logic => res?,
-            _ = handle.stopped() => {
-                info!("[RPC Server] Stopped");
-            },
-            _ = signal::ctrl_c() => {
-                info!("[Main] Ctrl-C received, shutting down.");
-            }
-        }
-    } else {
-        info!("[Main] Server not configured to start. Running validation logic only.");
-        tokio::select! {
-            res = validator_logic => res?,
-            _ = signal::ctrl_c() => {
-                info!("[Main] Ctrl-C received, shutting down.");
-            }
+    tokio::select! {
+        res = validator_logic => res?,
+        _ = signal::ctrl_c() => {
+            info!("[Main] Ctrl-C received, shutting down.");
         }
     }
 
@@ -401,7 +337,8 @@ async fn remote_chain_tracker(
             }
 
             Ok::<(), eyre::Error>(())
-        }.await
+        }
+        .await
         {
             error!("[Tracker] Iteration failed: {}", e);
         }
@@ -565,20 +502,6 @@ async fn history_pruner(
     }
 }
 
-/// Convert hex string to BlockHash
-///
-/// Accepts hex strings with or without "0x" prefix. Must be exactly 32 bytes when decoded.
-fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
-    let hash_bytes = hex::decode(hex_str)?;
-    if hash_bytes.len() != 32 {
-        return Err(anyhow!(
-            "Block hash must be 32 bytes, got {}",
-            hash_bytes.len()
-        ));
-    }
-    Ok(BlockHash::from_slice(&hash_bytes))
-}
-
 /// Returns all contract addresses and their code hashes from the witness.
 ///
 /// Filters witness data to find accounts with non-empty bytecode, which are
@@ -600,19 +523,21 @@ fn extract_contract_codes(salt_witness: &SaltWitness) -> HashMap<Address, B256> 
         .collect()
 }
 
-/// Helper function to create RPC errors with consistent format
-fn make_rpc_error(code: i32, msg: String) -> ErrorObject<'static> {
-    ErrorObject::owned(code, msg, None::<()>)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checksum_data::deserialized_checksum_data;
     use crate::witness_types::WitnessStatus;
-    use alloy_primitives::BlockNumber;
+    use alloy_primitives::{BlockHash, BlockNumber, hex};
     use alloy_rpc_types_eth::Block;
     use eyre::Context;
-    use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObjectOwned};
+    use jsonrpsee::{
+        RpcModule,
+        server::{ServerBuilder, ServerConfigBuilder},
+    };
+    use jsonrpsee_types::error::{
+        CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
+    };
     use op_alloy_rpc_types::Transaction;
     use serde::de::DeserializeOwned;
     use std::{
@@ -621,6 +546,29 @@ mod tests {
         io::{BufRead, BufReader},
         path::Path,
     };
+
+    /// Maximum response body size for the RPC server.
+    /// This is set to 100 MB to accommodate large block data and witness information.
+    const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
+
+    /// Convert hex string to BlockHash
+    ///
+    /// Accepts hex strings with or without "0x" prefix. Must be exactly 32 bytes when decoded.
+    fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
+        let hash_bytes = hex::decode(hex_str)?;
+        if hash_bytes.len() != 32 {
+            return Err(anyhow!(
+                "Block hash must be 32 bytes, got {}",
+                hash_bytes.len()
+            ));
+        }
+        Ok(BlockHash::from_slice(&hash_bytes))
+    }
+
+    /// Helper function to create RPC errors with consistent format
+    fn make_rpc_error(code: i32, msg: String) -> ErrorObject<'static> {
+        ErrorObject::owned(code, msg, None::<()>)
+    }
 
     /// Directory containing test block data files for mock RPC server.
     ///

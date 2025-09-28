@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Block witness Processing state
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub enum SaltWitnessState {
     /// Idle state, no processing
     Idle,
@@ -27,6 +28,7 @@ pub enum SaltWitnessState {
 
 /// WitnessStatus is used to store the status and state of a block witness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct WitnessStatus {
     /// restore the block witness status
     pub status: SaltWitnessState,

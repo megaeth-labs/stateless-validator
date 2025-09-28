@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 /// This structure wraps raw data with a cryptographic hash to ensure data integrity
 /// during serialization, storage, and deserialization operations.
 #[derive(Debug, Deserialize, Serialize)]
+#[allow(dead_code)]
 pub struct ChecksumData {
     /// BLAKE3 hash for data integrity verification
     pub hash: B256,
@@ -42,6 +43,7 @@ pub struct ChecksumData {
 /// let checksum_data = deserialized_checksum_data(serialized)?;
 /// # Ok::<(), std::io::Error>(())
 /// ```
+#[allow(dead_code)]
 pub fn deserialized_checksum_data(data: Vec<u8>) -> std::io::Result<ChecksumData> {
     let (checksum_data, _): (ChecksumData, usize) =
         bincode::serde::decode_from_slice(&data, bincode::config::legacy()).map_err(|e| {
