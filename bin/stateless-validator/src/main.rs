@@ -41,6 +41,45 @@ const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
 /// Database filename for the validator.
 const VALIDATOR_DB_FILENAME: &str = "validator.redb";
 
+/// Configuration for chain synchronization behavior
+#[derive(Debug, Clone)]
+pub struct ChainSyncConfig {
+    /// Number of parallel validation workers to spawn
+    pub concurrent_workers: usize,
+    /// Time to wait between main sync cycles
+    pub sync_poll_interval: Duration,
+    /// Optional block height to sync to; None for infinite sync
+    pub sync_target: Option<u64>,
+    /// Number of blocks to maintain as lookahead buffer
+    pub tracker_lookahead_blocks: u64,
+    /// Time to wait between remote chain tracker cycles
+    pub tracker_poll_interval: Duration,
+    /// Time to wait between history pruning cycles
+    pub pruner_interval: Duration,
+    /// Number of recent blocks to retain from current tip
+    pub pruner_blocks_to_keep: u64,
+    /// Time to wait when validation workers have no tasks
+    pub worker_idle_sleep: Duration,
+    /// Time to wait when validation workers encounter errors
+    pub worker_error_sleep: Duration,
+}
+
+impl Default for ChainSyncConfig {
+    fn default() -> Self {
+        Self {
+            concurrent_workers: num_cpus::get(),
+            sync_poll_interval: Duration::from_secs(1),
+            sync_target: None,
+            tracker_lookahead_blocks: 10,
+            tracker_poll_interval: Duration::from_secs(2),
+            pruner_interval: Duration::from_secs(300),
+            pruner_blocks_to_keep: 1000,
+            worker_idle_sleep: Duration::from_millis(500),
+            worker_error_sleep: Duration::from_millis(1000),
+        }
+    }
+}
+
 /// Helper function to create RPC errors with consistent format
 fn make_rpc_error(code: i32, msg: String) -> ErrorObject<'static> {
     ErrorObject::owned(code, msg, None::<()>)
@@ -88,26 +127,27 @@ async fn main() -> Result<()> {
     info!("[Main] API endpoint: {}", args.api);
     info!("[Main] Server port: {:?}", args.port);
 
-    // Reserve 2 CPUs for the server if it's running, otherwise use all available CPUs.
-    let concurrent_num = if args.port.is_some() {
-        (num_cpus::get() - 2).max(1)
-    } else {
-        num_cpus::get()
-    };
-    info!("[Main] Number of concurrent tasks: {}", concurrent_num);
-
     let work_dir = PathBuf::from(args.datadir);
 
     let client = Arc::new(RpcClient::new(&args.api)?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
 
-    let validator_logic = chain_sync(
-        client.clone(),
-        validator_db.clone(),
-        concurrent_num,
-        Duration::from_secs(5), // poll_interval
-        None,                   // sync_target (infinite sync)
+    // Create chain sync configuration
+    // Reserve 2 CPUs for the server if it's running, otherwise use all available CPUs
+    let config = Arc::new(ChainSyncConfig {
+        concurrent_workers: if args.port.is_some() {
+            (num_cpus::get() - 2).max(1)
+        } else {
+            num_cpus::get()
+        },
+        ..ChainSyncConfig::default()
+    });
+    info!(
+        "[Main] Number of concurrent tasks: {}",
+        config.concurrent_workers
     );
+
+    let validator_logic = chain_sync(client.clone(), validator_db.clone(), config);
 
     if let Some(port) = args.port {
         let mut module = RpcModule::new(validator_db.clone());
@@ -209,6 +249,7 @@ fn extract_contract_codes(salt_witness: &SaltWitness) -> HashMap<Address, B256> 
 /// * `worker_id` - Worker identifier for logging
 /// * `client` - RPC client for fetching data on demand
 /// * `validator_db` - Database interface for task coordination
+/// * `config` - Configuration for worker behavior
 ///
 /// # Returns
 /// * Never returns under normal operation - runs indefinitely until externally terminated
@@ -216,6 +257,7 @@ async fn validation_worker(
     worker_id: usize,
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
+    config: Arc<ChainSyncConfig>,
 ) -> Result<()> {
     info!("[Worker {}] Started", worker_id);
     loop {
@@ -223,13 +265,13 @@ async fn validation_worker(
             Ok(true) => {}
             Ok(false) => {
                 // No tasks available, wait before checking again
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                tokio::time::sleep(config.worker_idle_sleep).await;
             }
             Err(e) => {
                 // RPC/DB failures may get resolved over time, introduce a small
                 // delay to prevent tight error loops
                 error!("[Worker {worker_id}] Error during task processing: {e}");
-                tokio::time::sleep(Duration::from_millis(1000)).await;
+                tokio::time::sleep(config.worker_error_sleep).await;
             }
         }
     }
@@ -315,34 +357,34 @@ async fn validate_one(
     }
 }
 
-/// Chain synchronizer entry point - implements the Chain Synchronizer component from the design document
+/// Chain synchronizer entry point - orchestrates the complete chain synchronization pipeline
 ///
-/// This function serves as the main orchestrator that:
-/// - Monitors chain head progression via remote RPC endpoint
-/// - Tracks block finality status via remote RPC endpoint
-/// - Manages reorganization detection and recovery
-/// - Fetches block and witness data via remote RPC endpoint
-/// - Creates validation tasks and stores them in ValidatorDB for validation workers
-/// - Processes validation results to drive local chain tip progression
-/// - Prunes old block and witness data to maintain constant storage overhead
-/// - Coordinates with parallel validation workers via ValidatorDB
+/// Implements a five-phase startup process for stateless block validation:
+/// 1. **Task Recovery** - Recovers interrupted validation tasks from previous crashes
+/// 2. **Remote Chain Tracking** - Spawns background tracker to maintain block lookahead
+/// 3. **History Pruning** - Spawns background pruner to manage storage overhead
+/// 4. **Validation Workers** - Spawns configured number of parallel validation workers
+/// 5. **Main Sync Loop** - Continuously advances canonical chain as blocks are validated
+///
+/// Runs indefinitely unless a sync target is configured. Background components operate
+/// independently while the main thread advances the canonical chain.
 ///
 /// # Arguments
 /// * `client` - RPC client for communicating with remote blockchain node
-/// * `validator_db` - Database interface for coordinating with validation workers
-/// * `concurrent_num` - Number of parallel validation workers to spawn
-/// * `poll_interval` - Time to wait between sync cycles
-/// * `sync_target` - Optional block height to sync to; None for infinite sync
+/// * `validator_db` - Database interface for task coordination and chain state management
+/// * `config` - Configuration including worker count, polling intervals, and optional sync target
+///
+/// # Returns
+/// * `Ok(())` - When sync target is reached (if configured)
+/// * `Err(eyre::Error)` - On critical failures during task recovery
 async fn chain_sync(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
-    concurrent_num: usize,
-    poll_interval: Duration,
-    sync_target: Option<u64>,
+    config: Arc<ChainSyncConfig>,
 ) -> Result<()> {
     info!(
         "[Chain Sync] Starting with {} validation workers",
-        concurrent_num
+        config.concurrent_workers
     );
 
     // Step 1: Recover any interrupted tasks from previous crashes
@@ -354,36 +396,30 @@ async fn chain_sync(
 
     // Step 2: Spawn remote chain tracker
     info!("[Chain Sync] Starting remote chain tracker...");
-    let _tracker_handle = {
-        let client_clone = Arc::clone(&client);
-        let validator_db_clone = Arc::clone(&validator_db);
-
-        task::spawn(async move { remote_chain_tracker(client_clone, validator_db_clone).await })
-    };
-    info!("[Chain Sync] Remote chain tracker started");
+    task::spawn(remote_chain_tracker(
+        Arc::clone(&client),
+        Arc::clone(&validator_db),
+        Arc::clone(&config),
+    ));
 
     // Step 3: Spawn history pruner
-    task::spawn({
-        let validator_db = Arc::clone(&validator_db);
-        async move { history_pruner(validator_db, Duration::from_secs(300), 1000).await }
-    });
+    task::spawn(history_pruner(
+        Arc::clone(&validator_db),
+        Arc::clone(&config),
+    ));
 
     // Step 4: Spawn validation workers as tokio tasks
     info!(
         "[Chain Sync] Spawning {} validation workers...",
-        concurrent_num
+        config.concurrent_workers
     );
-    let mut worker_handles = Vec::new();
-
-    for worker_id in 0..concurrent_num {
-        let client_clone = Arc::clone(&client);
-        let validator_db_clone = Arc::clone(&validator_db);
-
-        let handle = task::spawn(async move {
-            validation_worker(worker_id, client_clone, validator_db_clone).await
-        });
-
-        worker_handles.push(handle);
+    for worker_id in 0..config.concurrent_workers {
+        task::spawn(validation_worker(
+            worker_id,
+            Arc::clone(&client),
+            Arc::clone(&validator_db),
+            Arc::clone(&config),
+        ));
     }
     info!("[Chain Sync] All validation workers started");
 
@@ -391,8 +427,7 @@ async fn chain_sync(
     info!("[Chain Sync] Starting main synchronizer loop...");
 
     loop {
-        // Check if we've reached the sync target
-        if let Some(target) = sync_target
+        if let Some(target) = config.sync_target
             && let Ok(Some((local_block_number, _))) = validator_db.get_local_tip()
             && local_block_number >= target
         {
@@ -400,7 +435,6 @@ async fn chain_sync(
             return Ok(());
         }
 
-        // Chain sync iteration - advance canonical chain
         if let Err(e) = async {
             // Advance the canonical chain with newly validated blocks
             let mut blocks_advanced = 0;
@@ -410,6 +444,9 @@ async fn chain_sync(
 
             if blocks_advanced > 0 {
                 info!("[Chain Sync] Advanced canonical chain by {blocks_advanced} blocks");
+            } else {
+                // No work to do, wait a bit before polling again
+                tokio::time::sleep(config.sync_poll_interval).await;
             }
 
             Ok::<(), eyre::Error>(())
@@ -418,31 +455,31 @@ async fn chain_sync(
         {
             error!("[Chain Sync] Iteration failed: {}", e);
         }
-
-        // Wait before next sync cycle
-        tokio::time::sleep(poll_interval).await;
     }
 }
 
 /// Remote chain tracker that maintains a lookahead of unvalidated blocks
 ///
-/// This function runs an infinite loop that:
-/// 1. Monitors the gap between local canonical tip and local remote tip
-/// 2. Fetches new blocks from the remote RPC when the gap is too small
-/// 3. Validates that the remote tip is still valid (detects reorgs)
-/// 4. Maintains a sufficient number of unvalidated blocks for validation workers
+/// Runs in an infinite loop, monitoring the gap between local canonical tip and remote
+/// tip to maintain a sufficient buffer of unvalidated blocks for validation workers.
+/// Infrastructure errors (RPC failures, network issues) are logged and contained.
 ///
 /// # Arguments
 /// * `client` - RPC client for fetching blocks from remote blockchain
 /// * `validator_db` - Database interface for chain management
+/// * `config` - Configuration for tracker behavior
+///
+/// # Returns
+/// * Never returns under normal operation - runs indefinitely until externally terminated
 async fn remote_chain_tracker(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
+    config: Arc<ChainSyncConfig>,
 ) -> Result<()> {
-    const LOOKAHEAD_BLOCKS: u64 = 10;
-    const POLLING_INTERVAL_SECS: u64 = 2;
-
-    info!("[Tracker] Starting with {LOOKAHEAD_BLOCKS} block lookahead");
+    info!(
+        "[Tracker] Starting with {} block lookahead",
+        config.tracker_lookahead_blocks
+    );
 
     loop {
         // Perform one iteration of remote chain tracking
@@ -467,14 +504,14 @@ async fn remote_chain_tracker(
                 _ => {} // Valid remote tip, continue
             }
 
-            if gap >= LOOKAHEAD_BLOCKS {
+            if gap >= config.tracker_lookahead_blocks {
                 info!("[Tracker] Sufficient lookahead maintained (gap: {})", gap);
                 return Ok(());
             }
 
             // Query latest block and calculate fetch range
             let latest_remote_block = client.block_number().await?;
-            let blocks_to_fetch = (LOOKAHEAD_BLOCKS - gap)
+            let blocks_to_fetch = (config.tracker_lookahead_blocks - gap)
                 .min(latest_remote_block.saturating_sub(remote_tip.0));
 
             if blocks_to_fetch == 0 {
@@ -535,25 +572,37 @@ async fn remote_chain_tracker(
             Ok::<(), eyre::Error>(())
         }.await {
             error!("[Tracker] Iteration failed: {}", e);
-            // Continue running despite errors - individual iterations can fail
         }
 
         // Wait before next iteration
-        tokio::time::sleep(Duration::from_secs(POLLING_INTERVAL_SECS)).await;
+        tokio::time::sleep(config.tracker_poll_interval).await;
     }
 }
 
-/// Periodically prunes old block data to manage storage
+/// Periodically prunes old block data to maintain constant storage overhead
+///
+/// Runs in an infinite loop, removing blocks older than `blocks_to_keep` from the
+/// local chain tip at regular intervals. Pruning errors are logged but don't stop
+/// the pruner from continuing.
+///
+/// # Arguments
+/// * `validator_db` - Database interface for pruning operations
+/// * `config` - Configuration for pruning behavior
+///
+/// # Returns
+/// * Never returns under normal operation - runs indefinitely until externally terminated
 async fn history_pruner(
     validator_db: Arc<ValidatorDB>,
-    pruning_interval: Duration,
-    blocks_to_keep: u64,
+    config: Arc<ChainSyncConfig>,
 ) -> Result<()> {
-    info!("[Pruner] Starting with interval {pruning_interval:?}");
+    info!(
+        "[Pruner] Starting with interval {:?}",
+        config.pruner_interval
+    );
 
     loop {
         if let Ok(Some((current_tip, _))) = validator_db.get_local_tip() {
-            let prune_before = current_tip.saturating_sub(blocks_to_keep);
+            let prune_before = current_tip.saturating_sub(config.pruner_blocks_to_keep);
             match validator_db.prune_history(prune_before) {
                 Ok(blocks_pruned) if blocks_pruned > 0 => {
                     info!("[Pruner] Pruned {blocks_pruned} blocks before block {prune_before}");
@@ -563,7 +612,7 @@ async fn history_pruner(
             }
         }
 
-        tokio::time::sleep(pruning_interval).await;
+        tokio::time::sleep(config.pruner_interval).await;
     }
 }
 
@@ -1001,15 +1050,16 @@ mod tests {
         let handle = setup_mock_rpc_server(context).await;
         let client = Arc::new(RpcClient::new("http://127.0.0.1:59545").unwrap());
 
-        chain_sync(
-            client.clone(),
-            validator_db,
-            1,
-            Duration::from_millis(100),
+        // Create test configuration with faster intervals for testing
+        let config = Arc::new(ChainSyncConfig {
+            concurrent_workers: 1,
             sync_target,
-        )
-        .await
-        .unwrap();
+            ..ChainSyncConfig::default()
+        });
+
+        chain_sync(client.clone(), validator_db, config)
+            .await
+            .unwrap();
 
         handle.stop().unwrap();
         info!("Mock RPC server has been shut down.");
