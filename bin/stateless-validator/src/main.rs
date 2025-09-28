@@ -111,11 +111,6 @@ struct Args {
     port: Option<u16>,
 }
 
-/// The main entry point for the stateless validator.
-///
-/// This executable is responsible for scanning for new block witnesses, validating them by
-/// replaying the block, and verifying the resulting state root. It can run in a standalone mode or
-/// expose an RPC server for querying validation status.
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -482,50 +477,58 @@ async fn remote_chain_tracker(
     );
 
     loop {
-        // Perform one iteration of remote chain tracking
         if let Err(e) = async {
-            // Get current chain tips and analyze gap
+            // Calculate how far behind our local chain is from remote
             let local_tip = validator_db
                 .get_local_tip()?
-                .ok_or_else(|| anyhow!("Local chain is empty - cannot track remote chain"))?;
+                .ok_or_else(|| anyhow!("Local chain is empty"))?;
             let remote_tip = validator_db.get_remote_tip()?.unwrap_or(local_tip);
             let gap = remote_tip.0.saturating_sub(local_tip.0);
-            info!("[Tracker] Chain status: local_tip={}, remote_tip={}, gap={}", local_tip.0, remote_tip.0, gap);
 
-            // Check if we are still on the right chain (detect reorgs)
+            info!(
+                "[Tracker] local={}, remote={}, gap={}",
+                local_tip.0, remote_tip.0, gap
+            );
+
+            // Detect chain reorgs by validating remote tip hash
             match client.block_by_number(remote_tip.0, false).await {
                 Ok(block) if block.header.hash != remote_tip.1 => {
-                    error!("[Tracker] Remote tip hash mismatch! Expected: {}, got: {}. Triggering rollback.", remote_tip.1, block.header.hash);
-                    // FIXME: Find proper common ancestor between local and remote chains
+                    error!(
+                        "[Tracker] Hash mismatch! Expected {}, got {}. Rolling back.",
+                        remote_tip.1, block.header.hash
+                    );
                     validator_db.rollback_chain(local_tip.0)?;
                     return Ok(());
                 }
-                Err(e) => warn!("[Tracker] Failed to validate remote tip {} (network issue): {}. Continuing without rollback.", remote_tip.1, e),
-                _ => {} // Valid remote tip, continue
+                Err(e) => warn!(
+                    "[Tracker] Network error validating tip {}: {}",
+                    remote_tip.1, e
+                ),
+                _ => {}
             }
 
+            // Stop if we already have sufficient lookahead
             if gap >= config.tracker_lookahead_blocks {
-                info!("[Tracker] Sufficient lookahead maintained (gap: {})", gap);
                 return Ok(());
             }
 
-            // Query latest block and calculate fetch range
-            let latest_remote_block = client.block_number().await?;
+            // Calculate how many blocks to fetch (bounded by latest available)
             let blocks_to_fetch = (config.tracker_lookahead_blocks - gap)
-                .min(latest_remote_block.saturating_sub(remote_tip.0));
+                .min(client.block_number().await?.saturating_sub(remote_tip.0));
 
             if blocks_to_fetch == 0 {
-                info!("[Tracker] No new blocks available on remote chain (latest: {})", latest_remote_block);
                 return Ok(());
             }
 
-            let start_block = remote_tip.0 + 1;
-            info!("[Tracker] Fetching {} blocks (range: {} to {}) to maintain lookahead",
-                  blocks_to_fetch, start_block, start_block + blocks_to_fetch - 1);
+            info!(
+                "[Tracker] Fetching {} blocks starting from {}",
+                blocks_to_fetch,
+                remote_tip.0 + 1
+            );
 
-            // Fetch blocks and witnesses, queue for validation, return headers
-            let fetch_tasks: Vec<_> = (start_block..start_block + blocks_to_fetch)
-                .map(|block_number| {
+            // Fetch blocks in parallel and queue validation tasks
+            let headers = future::join_all(
+                (remote_tip.0 + 1..remote_tip.0 + 1 + blocks_to_fetch).map(|block_number| {
                     let client = client.clone();
                     let db = validator_db.clone();
                     tokio::spawn(async move {
@@ -534,47 +537,43 @@ async fn remote_chain_tracker(
                         db.add_validation_task(&block, &witness)?;
                         Ok::<Header, eyre::Error>(block.header)
                     })
-                })
-                .collect();
-
-            // Wait for all fetches and process results, ensuring contiguity
-            let fetch_results = future::join_all(fetch_tasks).await;
-            let mut fetched_headers = Vec::new();
-
-            for (i, task_result) in fetch_results.into_iter().enumerate() {
-                let block_number = start_block + i as u64;
-                match task_result {
-                    Ok(Ok(header)) => fetched_headers.push(header),
-                    Ok(Err(e)) => {
-                        error!("[Tracker] RPC error fetching block {}: {}. Stopping to maintain contiguity.", block_number, e);
-                        break;
-                    }
-                    Err(e) => {
-                        error!("[Tracker] Task join error for block {}: {}. Stopping to maintain contiguity.", block_number, e);
-                        break;
-                    }
+                }),
+            )
+            .await
+            .into_iter()
+            .enumerate()
+            // Stop on first error to maintain block sequence contiguity
+            .take_while(|(i, result)| match result {
+                Ok(Ok(_)) => true,
+                Ok(Err(e)) => {
+                    error!(
+                        "[Tracker] DB or RPC error at block {}: {e}",
+                        remote_tip.0 + 1 + *i as u64
+                    );
+                    false
                 }
-            }
-
-            if fetched_headers.len() < blocks_to_fetch as usize {
-                info!("[Tracker] Fetched {} out of {} requested blocks due to failures. Will retry missing blocks in next iteration.",
-                      fetched_headers.len(), blocks_to_fetch);
-            }
-
-            // Add headers to remote chain
-            for header in fetched_headers {
-                if let Err(e) = validator_db.grow_remote_chain(&header) {
-                    error!("[Tracker] Failed to add block {} to remote chain: {}. Stopping to avoid gaps.", header.number, e);
-                    break;
+                Err(e) => {
+                    error!(
+                        "[Tracker] Task join error at block {}: {e}",
+                        remote_tip.0 + 1 + *i as u64
+                    );
+                    false
                 }
+            })
+            .filter_map(|(_, result)| result.ok().and_then(|r| r.ok()))
+            .collect::<Vec<_>>();
+
+            // Add successfully fetched headers to remote chain
+            for header in headers {
+                validator_db.grow_remote_chain(&header)?;
             }
 
             Ok::<(), eyre::Error>(())
-        }.await {
+        }.await
+        {
             error!("[Tracker] Iteration failed: {}", e);
         }
 
-        // Wait before next iteration
         tokio::time::sleep(config.tracker_poll_interval).await;
     }
 }
