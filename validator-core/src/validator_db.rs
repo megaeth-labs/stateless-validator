@@ -13,7 +13,7 @@
 //! ## Database Schema
 //!
 //! The database consists of 8 specialized tables:
-//! - `CANONICAL_CHAIN`: Local view of the canonical blockchain (BlockNumber → BlockHash)
+//! - `CANONICAL_CHAIN`: Local view of the canonical blockchain (BlockNumber → (BlockHash, PostStateRoot))
 //! - `REMOTE_CHAIN`: Remote chain used to guide chain advancement (BlockNumber → BlockHash)
 //! - `TASK_LIST`: Queue of pending validation tasks (BlockNumber, BlockHash) → ()
 //! - `ONGOING_TASKS`: Tasks currently being processed by workers
@@ -71,13 +71,13 @@ use crate::executor::{ValidationError, ValidationResult};
 
 /// Stores our local view of the canonical chain.
 ///
-/// **Schema:** Maps (BlockNumber, BlockHash) as (u64, [u8; 32]) to post-state root ([u8; 32])
-/// - Key: (Block height as u64, Block hash as [u8; 32])
-/// - Value: Post-state root of the block as [u8; 32]
+/// **Schema:** Maps BlockNumber (u64) to (BlockHash, PostStateRoot) as ([u8; 32], [u8; 32])
+/// - Key: Block height as BlockNumber (u64)
+/// - Value: (Block hash as [u8; 32], Post-state root as [u8; 32])
 ///
 /// Updated by main orchestrator via grow_local_chain() and rollback_chain().
 /// Only successfully validated blocks can be added to this chain.
-const CANONICAL_CHAIN: TableDefinition<(u64, [u8; 32]), [u8; 32]> =
+const CANONICAL_CHAIN: TableDefinition<u64, ([u8; 32], [u8; 32])> =
     TableDefinition::new("canonical_chain");
 
 /// Stores the remote chain with unvalidated blocks used to guide chain advancement.
@@ -397,9 +397,10 @@ impl ValidatorDB {
             if header.number > 0 {
                 let parent_post_state = B256::from(
                     canonical_chain
-                        .get((header.number - 1, header.parent_hash.0))?
+                        .get(header.number - 1)?
                         .expect("parent block must exist in canonical chain")
-                        .value(),
+                        .value()
+                        .1,
                 );
 
                 if result.pre_state_root != parent_post_state {
@@ -412,7 +413,7 @@ impl ValidatorDB {
             }
 
             // Move block from remote to canonical chain
-            canonical_chain.insert((header.number, header.hash.0), result.post_state_root.0)?;
+            canonical_chain.insert(header.number, (header.hash.0, result.post_state_root.0))?;
             remote_chain.remove(header.number)?;
         }
         write_txn.commit()?;
@@ -437,9 +438,9 @@ impl ValidatorDB {
             let (parent_number, parent_hash) = if let Some(last_remote) = remote_chain.last()? {
                 (last_remote.0.value(), last_remote.1.value())
             } else if let Some(last_canonical) = canonical_chain.last()? {
-                let (canonical_key, _) = last_canonical;
-                let (canonical_number, canonical_hash) = canonical_key.value();
-                (canonical_number, canonical_hash)
+                let (canonical_number, canonical_value) = last_canonical;
+                let (canonical_hash, _) = canonical_value.value();
+                (canonical_number.value(), canonical_hash)
             } else {
                 (0, [0u8; 32])
             };
@@ -471,12 +472,12 @@ impl ValidatorDB {
 
             // Rollback canonical chain to specified block
             let canonical_blocks_to_remove = canonical_chain
-                .range((to_block + 1, [0u8; 32])..)?
+                .range((to_block + 1)..)?
                 .map(|result| result.map(|(key, _)| key.value()))
                 .collect::<Result<Vec<_>, _>>()?;
 
-            for (block_number, block_hash) in canonical_blocks_to_remove {
-                canonical_chain.remove((block_number, block_hash))?;
+            for block_number in canonical_blocks_to_remove {
+                canonical_chain.remove(block_number)?;
             }
 
             // Rollback remote chain to specified block
@@ -546,7 +547,7 @@ impl ValidatorDB {
             // Get first task that's ahead of canonical tip using range query
             let range_start = match canonical_chain.last()? {
                 Some((canonical_key, _)) => {
-                    let (tip_block, _) = canonical_key.value();
+                    let tip_block = canonical_key.value();
                     (tip_block + 1, [0u8; 32])
                 }
                 None => (0u64, [0u8; 32]),
@@ -627,8 +628,9 @@ impl ValidatorDB {
         let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
 
         match canonical_chain.last()? {
-            Some((canonical_key, _post_state_root)) => {
-                let (block_number, block_hash) = canonical_key.value();
+            Some((canonical_key, canonical_value)) => {
+                let block_number = canonical_key.value();
+                let (block_hash, _) = canonical_value.value();
                 Ok(Some((block_number, block_hash.into())))
             }
             None => Ok(None),
@@ -664,7 +666,7 @@ impl ValidatorDB {
         let write_txn = self.database.begin_write()?;
         {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
-            canonical_chain.insert((block_number, block_hash.0), post_state_root.0)?;
+            canonical_chain.insert(block_number, (block_hash.0, post_state_root.0))?;
         }
         write_txn.commit()?;
         Ok(())
@@ -709,7 +711,7 @@ impl ValidatorDB {
 
             for (block_number, block_hash) in keys_to_remove {
                 // Remove from all relevant tables
-                canonical_chain.remove((block_number, block_hash))?;
+                canonical_chain.remove(block_number)?;
                 block_records.remove((block_number, block_hash))?;
                 block_data.remove(block_hash)?;
                 witnesses.remove(block_hash)?;
@@ -738,6 +740,56 @@ impl ValidatorDB {
         }
         write_txn.commit()?;
         Ok(())
+    }
+
+    /// Retrieves the block hash for a specific block number from the local view
+    ///
+    /// Searches the local view which consists of two sequential, non-overlapping chains:
+    /// - CANONICAL_CHAIN: Lower block numbers (validated blocks)
+    /// - REMOTE_CHAIN: Higher block numbers (unvalidated blocks extending canonical)
+    ///
+    /// # Parameters
+    /// * `block_number` - The block number to look up in the local view
+    ///
+    /// # Returns
+    /// * `Ok(Some(block_hash))` - Block found at the specified number
+    /// * `Ok(None)` - No block exists at this number in the local view
+    /// * `Err(...)` - Database error during lookup
+    pub fn get_block_hash(
+        &self,
+        block_number: BlockNumber,
+    ) -> ValidationDbResult<Option<BlockHash>> {
+        let read_txn = self.database.begin_read()?;
+        let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
+        let remote_chain = read_txn.open_table(REMOTE_CHAIN)?;
+
+        // Check canonical chain first, then remote chain (sequential, no overlap)
+        if let Some(value) = canonical_chain.get(block_number)? {
+            return Ok(Some(value.value().0.into()));
+        }
+
+        Ok(remote_chain.get(block_number)?.map(|v| v.value().into()))
+    }
+
+    /// Retrieves the earliest block in the canonical chain
+    ///
+    /// Returns the lowest block number and its hash currently stored in the canonical
+    /// chain. This is useful for reorg detection and determining the local chain's
+    /// starting point. Only includes blocks that have been successfully validated.
+    ///
+    /// # Returns
+    /// * `Ok(Some((block_number, block_hash)))` - Earliest block found with its number and hash
+    /// * `Ok(None)` - Canonical chain is empty (no validated blocks)
+    /// * `Err(...)` - Database error during lookup
+    pub fn get_earliest_local_block(&self) -> ValidationDbResult<Option<(BlockNumber, BlockHash)>> {
+        let read_txn = self.database.begin_read()?;
+        let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
+
+        Ok(canonical_chain.first()?.map(|(key, value)| {
+            let block_number = key.value();
+            let (block_hash, _post_state_root) = value.value();
+            (block_number, block_hash.into())
+        }))
     }
 }
 

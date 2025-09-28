@@ -1,4 +1,4 @@
-use alloy_primitives::Address;
+use alloy_primitives::{Address, BlockNumber};
 use alloy_rpc_types_eth::Header;
 use clap::Parser;
 use eyre::{Result, anyhow};
@@ -258,15 +258,24 @@ async fn remote_chain_tracker(
                 local_tip.0, remote_tip.0, gap
             );
 
-            // Detect chain reorgs by validating remote tip hash
+            // Detect and resolve chain reorgs
             match client.get_block(remote_tip.0, false).await {
                 Ok(block) if block.header.hash != remote_tip.1 => {
                     error!(
-                        "[Tracker] Hash mismatch! Expected {}, got {}. Rolling back.",
+                        "[Tracker] Hash mismatch! Expected {}, got {}. Resolving chain divergence.",
                         remote_tip.1, block.header.hash
                     );
-                    validator_db.rollback_chain(local_tip.0)?;
-                    return Ok(());
+                    match find_divergence_point(&client, &validator_db, remote_tip.0).await {
+                        Ok(rollback_to) => {
+                            info!("[Tracker] Rolling back to block {rollback_to}");
+                            validator_db.rollback_chain(rollback_to)?;
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            error!("[Tracker] Failed to find divergence point: {e}");
+                            return Err(e);
+                        }
+                    }
                 }
                 Err(e) => warn!(
                     "[Tracker] Network error validating tip {}: {}",
@@ -525,6 +534,64 @@ fn extract_contract_codes(salt_witness: &SaltWitness) -> HashMap<Address, B256> 
             },
         )
         .collect()
+}
+
+/// Finds where the local chain diverges from the remote RPC node using binary search
+///
+/// # Algorithm
+/// Uses binary search to efficiently locate where the local canonical chain diverges
+/// from the remote chain. The algorithm is guaranteed to terminate in O(log N) time
+/// and return a block number between the earliest local block and `mismatch_block`.
+///
+/// If the remote RPC node reorgs again during the binary search, the returned block
+/// number may not be the accurate divergence point; however, this is acceptable
+/// because `remote_chain_tracker` will retry and detect the reorg again anyway.
+///
+/// # Parameters
+/// * `client` - RPC client to fetch remote block hashes
+/// * `validator_db` - Database to query local blocks
+/// * `mismatch_block` - Block number where hash mismatch was detected
+///
+/// # Returns
+/// * `Ok(block_number)` - Block number to rollback to (last common block)
+/// * `Err(_)` - Network or database error during resolution
+///
+/// # Panics
+/// Panics if a catastrophic reorg is detected (earliest local block hash differs
+/// from remote chain), indicating the local chain has diverged beyond recovery.
+async fn find_divergence_point(
+    client: &RpcClient,
+    validator_db: &ValidatorDB,
+    mismatch_block: BlockNumber,
+) -> Result<BlockNumber> {
+    let earliest_local = validator_db
+        .get_earliest_local_block()?
+        .expect("Local chain cannot be empty");
+
+    // Safety check: verify earliest block matches remote chain
+    let earliest_remote = client.get_block(earliest_local.0, false).await?;
+    if earliest_remote.header.hash != earliest_local.1 {
+        panic!(
+            "Catastrophic reorg: earliest local block {} hash mismatch (local: {:?}, remote: {:?})",
+            earliest_local.0, earliest_local.1, earliest_remote.header.hash
+        );
+    }
+
+    // Binary search for divergence point
+    let (mut left, mut right, mut last_matching) =
+        (earliest_local.0, mismatch_block, earliest_local.0);
+    while left <= right {
+        let mid = left + (right - left) / 2;
+        let local_hash = validator_db.get_block_hash(mid)?.unwrap();
+        let remote_hash = client.get_block(mid, false).await?.header.hash;
+        if remote_hash == local_hash {
+            last_matching = mid;
+            left = mid + 1;
+        } else {
+            right = mid.saturating_sub(1);
+        }
+    }
+    Ok(last_matching)
 }
 
 #[cfg(test)]
