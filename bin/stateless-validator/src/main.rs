@@ -80,11 +80,6 @@ impl Default for ChainSyncConfig {
     }
 }
 
-/// Helper function to create RPC errors with consistent format
-fn make_rpc_error(code: i32, msg: String) -> ErrorObject<'static> {
-    ErrorObject::owned(code, msg, None::<()>)
-}
-
 // FIXME: not `rerun_block`!
 /// Command line arguments for the `rerun_block` executable.
 #[derive(Parser, Debug)]
@@ -197,159 +192,6 @@ async fn main() -> Result<()> {
 
     info!("[Main] Total execution time: {:?}", start.elapsed());
     Ok(())
-}
-
-/// Convert hex string to BlockHash
-///
-/// Accepts hex strings with or without "0x" prefix. Must be exactly 32 bytes when decoded.
-fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
-    let hash_bytes = hex::decode(hex_str)?;
-    if hash_bytes.len() != 32 {
-        return Err(anyhow!(
-            "Block hash must be 32 bytes, got {}",
-            hash_bytes.len()
-        ));
-    }
-    Ok(BlockHash::from_slice(&hash_bytes))
-}
-
-/// Returns all contract addresses and their code hashes from the witness.
-///
-/// Filters witness data to find accounts with non-empty bytecode, which are
-/// needed for contract code fetching during block execution.
-fn extract_contract_codes(salt_witness: &SaltWitness) -> HashMap<Address, B256> {
-    salt_witness
-        .kvs
-        .values()
-        .filter_map(|salt_val| salt_val.as_ref())
-        .filter_map(
-            |val| match (PlainKey::decode(val.key()), PlainValue::decode(val.value())) {
-                (PlainKey::Account(addr), PlainValue::Account(acc)) => acc
-                    .codehash
-                    .filter(|&codehash| codehash != KECCAK_EMPTY)
-                    .map(|codehash| (addr, codehash)),
-                _ => None,
-            },
-        )
-        .collect()
-}
-
-/// Validation worker that continuously processes blocks from the task queue
-///
-/// Runs in an infinite loop, claiming validation tasks from ValidatorDB and processing
-/// them via `validate_one()`. Infrastructure errors (database, RPC failures) are logged
-/// and contained.
-///
-/// # Arguments
-/// * `worker_id` - Worker identifier for logging
-/// * `client` - RPC client for fetching data on demand
-/// * `validator_db` - Database interface for task coordination
-/// * `config` - Configuration for worker behavior
-///
-/// # Returns
-/// * Never returns under normal operation - runs indefinitely until externally terminated
-async fn validation_worker(
-    worker_id: usize,
-    client: Arc<RpcClient>,
-    validator_db: Arc<ValidatorDB>,
-    config: Arc<ChainSyncConfig>,
-) -> Result<()> {
-    info!("[Worker {}] Started", worker_id);
-    loop {
-        match validate_one(worker_id, &client, &validator_db).await {
-            Ok(true) => {}
-            Ok(false) => {
-                // No tasks available, wait before checking again
-                tokio::time::sleep(config.worker_idle_sleep).await;
-            }
-            Err(e) => {
-                // RPC/DB failures may get resolved over time, introduce a small
-                // delay to prevent tight error loops
-                error!("[Worker {worker_id}] Error during task processing: {e}");
-                tokio::time::sleep(config.worker_error_sleep).await;
-            }
-        }
-    }
-}
-
-/// Processes a single validation task
-///
-/// This function encapsulates the workflow for processing one validation task,
-/// including task acquisition, contract code fetching, block validation, and
-/// result storage. All errors are propagated to the caller for centralized error
-/// handling.
-///
-/// # Arguments
-/// * `worker_id` - Worker identifier for logging
-/// * `client` - RPC client for fetching contract bytecode from remote nodes
-/// * `validator_db` - Database for tasks and data
-///
-/// # Returns
-/// * `Ok(true)` - Task was processed (validation success/failure stored in DB)
-/// * `Ok(false)` - No tasks available, no work performed
-/// * `Err(eyre::Error)` - Infrastructure error (DB/RPC failures)
-async fn validate_one(
-    worker_id: usize,
-    client: &RpcClient,
-    validator_db: &ValidatorDB,
-) -> Result<bool> {
-    match validator_db.get_next_task()? {
-        Some((block, witness)) => {
-            let block_number = block.header.number;
-            info!("[Worker {}] Validating block {}", worker_id, block_number);
-
-            // Prepare the contract map to be used by validation
-            let codehashes = extract_contract_codes(&witness);
-            let mut missing_contracts = Vec::new();
-            let mut contracts = HashMap::new();
-
-            for (address, code_hash) in &codehashes {
-                match validator_db.get_contract_code(*code_hash) {
-                    Ok(Some(bytecode)) => {
-                        contracts.insert(*code_hash, bytecode);
-                    }
-                    _ => missing_contracts.push(*address),
-                }
-            }
-
-            // Fetch missing contract codes via RPC and update the local DB
-            let codes = client
-                .codes_at(&missing_contracts, (block_number - 1).into())
-                .await?;
-
-            for (address, bytes) in missing_contracts.iter().zip(codes.iter()) {
-                let bytecode = Bytecode::new_raw(bytes.clone());
-                validator_db.add_contract_code(&bytecode)?;
-                contracts.insert(codehashes[address], bytecode);
-            }
-
-            // Validate the given block
-            let pre_state_root = B256::from(witness.state_root()?);
-            let (success, error_message) = match validate_block(&block, witness, &contracts) {
-                Ok(()) => {
-                    info!("[Worker {worker_id}] Successfully validated block {block_number}");
-                    (true, None)
-                }
-                Err(e) => {
-                    error!("[Worker {worker_id}] Failed to validate block {block_number}: {e}");
-                    (false, Some(e.to_string()))
-                }
-            };
-
-            validator_db.complete_validation(ValidationResult {
-                pre_state_root,
-                post_state_root: block.header.state_root,
-                block_number,
-                block_hash: block.header.hash,
-                success,
-                error_message,
-                completed_at: SystemTime::now(),
-            })?;
-
-            Ok(true)
-        }
-        None => Ok(false),
-    }
 }
 
 /// Chain synchronizer entry point - orchestrates the complete chain synchronization pipeline
@@ -578,6 +420,124 @@ async fn remote_chain_tracker(
     }
 }
 
+/// Validation worker that continuously processes blocks from the task queue
+///
+/// Runs in an infinite loop, claiming validation tasks from ValidatorDB and processing
+/// them via `validate_one()`. Infrastructure errors (database, RPC failures) are logged
+/// and contained.
+///
+/// # Arguments
+/// * `worker_id` - Worker identifier for logging
+/// * `client` - RPC client for fetching data on demand
+/// * `validator_db` - Database interface for task coordination
+/// * `config` - Configuration for worker behavior
+///
+/// # Returns
+/// * Never returns under normal operation - runs indefinitely until externally terminated
+async fn validation_worker(
+    worker_id: usize,
+    client: Arc<RpcClient>,
+    validator_db: Arc<ValidatorDB>,
+    config: Arc<ChainSyncConfig>,
+) -> Result<()> {
+    info!("[Worker {}] Started", worker_id);
+    loop {
+        match validate_one(worker_id, &client, &validator_db).await {
+            Ok(true) => {}
+            Ok(false) => {
+                // No tasks available, wait before checking again
+                tokio::time::sleep(config.worker_idle_sleep).await;
+            }
+            Err(e) => {
+                // RPC/DB failures may get resolved over time, introduce a small
+                // delay to prevent tight error loops
+                error!("[Worker {worker_id}] Error during task processing: {e}");
+                tokio::time::sleep(config.worker_error_sleep).await;
+            }
+        }
+    }
+}
+
+/// Processes a single validation task
+///
+/// This function encapsulates the workflow for processing one validation task,
+/// including task acquisition, contract code fetching, block validation, and
+/// result storage. All errors are propagated to the caller for centralized error
+/// handling.
+///
+/// # Arguments
+/// * `worker_id` - Worker identifier for logging
+/// * `client` - RPC client for fetching contract bytecode from remote nodes
+/// * `validator_db` - Database for tasks and data
+///
+/// # Returns
+/// * `Ok(true)` - Task was processed (validation success/failure stored in DB)
+/// * `Ok(false)` - No tasks available, no work performed
+/// * `Err(eyre::Error)` - Infrastructure error (DB/RPC failures)
+async fn validate_one(
+    worker_id: usize,
+    client: &RpcClient,
+    validator_db: &ValidatorDB,
+) -> Result<bool> {
+    match validator_db.get_next_task()? {
+        Some((block, witness)) => {
+            let block_number = block.header.number;
+            info!("[Worker {}] Validating block {}", worker_id, block_number);
+
+            // Prepare the contract map to be used by validation
+            let codehashes = extract_contract_codes(&witness);
+            let mut missing_contracts = Vec::new();
+            let mut contracts = HashMap::new();
+
+            for (address, code_hash) in &codehashes {
+                match validator_db.get_contract_code(*code_hash) {
+                    Ok(Some(bytecode)) => {
+                        contracts.insert(*code_hash, bytecode);
+                    }
+                    _ => missing_contracts.push(*address),
+                }
+            }
+
+            // Fetch missing contract codes via RPC and update the local DB
+            let codes = client
+                .codes_at(&missing_contracts, (block_number - 1).into())
+                .await?;
+
+            for (address, bytes) in missing_contracts.iter().zip(codes.iter()) {
+                let bytecode = Bytecode::new_raw(bytes.clone());
+                validator_db.add_contract_code(&bytecode)?;
+                contracts.insert(codehashes[address], bytecode);
+            }
+
+            // Validate the given block
+            let pre_state_root = B256::from(witness.state_root()?);
+            let (success, error_message) = match validate_block(&block, witness, &contracts) {
+                Ok(()) => {
+                    info!("[Worker {worker_id}] Successfully validated block {block_number}");
+                    (true, None)
+                }
+                Err(e) => {
+                    error!("[Worker {worker_id}] Failed to validate block {block_number}: {e}");
+                    (false, Some(e.to_string()))
+                }
+            };
+
+            validator_db.complete_validation(ValidationResult {
+                pre_state_root,
+                post_state_root: block.header.state_root,
+                block_number,
+                block_hash: block.header.hash,
+                success,
+                error_message,
+                completed_at: SystemTime::now(),
+            })?;
+
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
 /// Periodically prunes old block data to maintain constant storage overhead
 ///
 /// Runs in an infinite loop, removing blocks older than `blocks_to_keep` from the
@@ -613,6 +573,46 @@ async fn history_pruner(
 
         tokio::time::sleep(config.pruner_interval).await;
     }
+}
+
+/// Convert hex string to BlockHash
+///
+/// Accepts hex strings with or without "0x" prefix. Must be exactly 32 bytes when decoded.
+fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
+    let hash_bytes = hex::decode(hex_str)?;
+    if hash_bytes.len() != 32 {
+        return Err(anyhow!(
+            "Block hash must be 32 bytes, got {}",
+            hash_bytes.len()
+        ));
+    }
+    Ok(BlockHash::from_slice(&hash_bytes))
+}
+
+/// Returns all contract addresses and their code hashes from the witness.
+///
+/// Filters witness data to find accounts with non-empty bytecode, which are
+/// needed for contract code fetching during block execution.
+fn extract_contract_codes(salt_witness: &SaltWitness) -> HashMap<Address, B256> {
+    salt_witness
+        .kvs
+        .values()
+        .filter_map(|salt_val| salt_val.as_ref())
+        .filter_map(
+            |val| match (PlainKey::decode(val.key()), PlainValue::decode(val.value())) {
+                (PlainKey::Account(addr), PlainValue::Account(acc)) => acc
+                    .codehash
+                    .filter(|&codehash| codehash != KECCAK_EMPTY)
+                    .map(|codehash| (addr, codehash)),
+                _ => None,
+            },
+        )
+        .collect()
+}
+
+/// Helper function to create RPC errors with consistent format
+fn make_rpc_error(code: i32, msg: String) -> ErrorObject<'static> {
+    ErrorObject::owned(code, msg, None::<()>)
 }
 
 #[cfg(test)]
