@@ -682,8 +682,10 @@ mod tests {
         Ok(Arc::new(validator_db))
     }
 
-    /// Set up mock RPC server with pre-loaded context and return the handle.
-    async fn setup_mock_rpc_server(context: RpcModuleContext) -> jsonrpsee::server::ServerHandle {
+    /// Set up mock RPC server with pre-loaded context and return the handle and URL.
+    async fn setup_mock_rpc_server(
+        context: RpcModuleContext,
+    ) -> (jsonrpsee::server::ServerHandle, String) {
         let mut module = RpcModule::new(context);
 
         module
@@ -758,13 +760,12 @@ mod tests {
             .build();
         let server = ServerBuilder::default()
             .set_config(cfg)
-            .build("0.0.0.0:59545")
+            .build("0.0.0.0:0")
             .await
             .unwrap();
 
-        let handle = server.start(module);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        handle
+        let url = format!("http://{}", server.local_addr().unwrap());
+        (server.start(module), url)
     }
 
     /// Loads and deserializes JSON data from a file.
@@ -984,8 +985,8 @@ mod tests {
 
         let sync_target = Some(context.max_block.0);
         let validator_db = setup_test_db(&context).unwrap();
-        let handle = setup_mock_rpc_server(context).await;
-        let client = Arc::new(RpcClient::new("http://127.0.0.1:59545").unwrap());
+        let (handle, url) = setup_mock_rpc_server(context).await;
+        let client = Arc::new(RpcClient::new(&url).unwrap());
 
         // Create test configuration with faster intervals for testing
         let config = Arc::new(ChainSyncConfig {
