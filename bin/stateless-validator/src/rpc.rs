@@ -36,17 +36,17 @@ impl RpcClient {
         addresses: &[Address],
         block_number: BlockNumberOrTag,
     ) -> Result<Vec<Bytes>> {
-        let futures = addresses.iter().map(|&single_address| {
-            let provider_clone = self.provider.clone();
+        let futures = addresses.iter().map(|&addr| {
+            let provider = self.provider.clone();
 
             async move {
-                provider_clone
-                    .get_code_at(single_address)
+                provider
+                    .get_code_at(addr)
                     .block_id(block_number.into())
                     .await
                     .map_err(|e| {
                         eyre!(
-                            "get_code_at for address {single_address:?} at block {block_number:?} failed: {e}"
+                            "get_code_at for address {addr:?} at block {block_number:?} failed: {e}"
                         )
                     })
             }
