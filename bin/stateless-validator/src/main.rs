@@ -80,52 +80,42 @@ impl Default for ChainSyncConfig {
     }
 }
 
-// FIXME: not `rerun_block`!
-/// Command line arguments for the `rerun_block` executable.
+/// Command line arguments for the stateless validator.
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
-struct Args {
-    // FIXME: How is `datadir` the starting block number?
-    /// The starting block number from which to begin replaying.
-    #[clap(short, long)]
-    datadir: String,
+struct CommandLineArgs {
+    /// Directory path where validator data and database files will be stored.
+    #[clap(short = 'd', long)]
+    data_dir: String,
 
-    // FIXME: how is `lock_time` related to # consecutive blocks? what is the latter anyway?
-    /// The total number of consecutive blocks to replay.
-    #[clap(short, long, default_value_t = 5)]
-    lock_time: u64,
+    /// The URL of the Ethereum JSON-RPC API endpoint for fetching blockchain data.
+    #[clap(short = 'r', long)]
+    rpc_endpoint: String,
 
-    // FIXME: why do we need to fetch block data? what else needs to be fetched from rpc endpoint?
-    /// The URL of the Ethereum JSON-RPC API endpoint to use for fetching block data.
-    #[clap(short, long)]
-    api: String,
-
-    // FIXME: what is "stateless validator server"? is there a client?
-    /// The port of the stateless validator server.
-    #[clap(short, long)]
-    port: Option<u16>,
+    /// Optional port number to run the RPC server for validation queries.
+    #[clap(short = 's', long)]
+    server_port: Option<u16>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let start = Instant::now();
-    let args = Args::parse();
+    let args = CommandLineArgs::parse();
 
-    info!("[Main] Data directory: {}", args.datadir);
-    info!("[Main] Lock time: {} seconds", args.lock_time);
-    info!("[Main] API endpoint: {}", args.api);
-    info!("[Main] Server port: {:?}", args.port);
+    info!("[Main] Data directory: {}", args.data_dir);
+    info!("[Main] RPC endpoint: {}", args.rpc_endpoint);
+    info!("[Main] Server port: {:?}", args.server_port);
 
-    let work_dir = PathBuf::from(args.datadir);
+    let work_dir = PathBuf::from(args.data_dir);
 
-    let client = Arc::new(RpcClient::new(&args.api)?);
+    let client = Arc::new(RpcClient::new(&args.rpc_endpoint)?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
 
     // Create chain sync configuration
     // Reserve 2 CPUs for the server if it's running, otherwise use all available CPUs
     let config = Arc::new(ChainSyncConfig {
-        concurrent_workers: if args.port.is_some() {
+        concurrent_workers: if args.server_port.is_some() {
             (num_cpus::get() - 2).max(1)
         } else {
             num_cpus::get()
@@ -139,7 +129,7 @@ async fn main() -> Result<()> {
 
     let validator_logic = chain_sync(client.clone(), validator_db.clone(), config);
 
-    if let Some(port) = args.port {
+    if let Some(port) = args.server_port {
         let mut module = RpcModule::new(validator_db.clone());
 
         module.register_method("stateless_getValidation", |params, validator_db, _| {
