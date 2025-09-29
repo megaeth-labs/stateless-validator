@@ -22,9 +22,6 @@ use validator_core::{
 mod rpc;
 use rpc::RpcClient;
 
-mod checksum_data;
-mod witness_types;
-
 /// Database filename for the validator.
 const VALIDATOR_DB_FILENAME: &str = "validator.redb";
 
@@ -655,8 +652,6 @@ async fn find_divergence_point(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checksum_data::deserialized_checksum_data;
-    use crate::witness_types::WitnessStatus;
     use alloy_primitives::{BlockHash, BlockNumber};
     use alloy_rpc_types_eth::Block;
     use eyre::Context;
@@ -700,7 +695,7 @@ mod tests {
     /// Directory containing test witness data files for integration testing.
     ///
     /// Files in this directory should have `.w` extension and contain serialized
-    /// WitnessStatus data with BLAKE3 hash verification.
+    /// SaltWitness data.
     const TEST_WITNESS_DIR: &str = "../../test_data/stateless/witness";
 
     /// Context object containing pre-loaded test data for efficient RPC serving
@@ -1018,40 +1013,17 @@ mod tests {
 
                     // Read and deserialize witness file
                     let file_data = std::fs::read(&file_path)?;
-                    let state_data = deserialized_checksum_data(file_data).map_err(|e| {
-                        anyhow!(
-                            "Failed to deserialize state data from {}: {}",
-                            block_num_and_hash,
-                            e
-                        )
-                    })?;
 
-                    let (witness_status, _): (WitnessStatus, usize) =
-                        bincode::serde::decode_from_slice(
-                            &state_data.data,
-                            bincode::config::legacy(),
-                        )
-                        .map_err(|e| {
-                            anyhow!(
-                                "Failed to deserialize WitnessStatus from {}: {}",
-                                block_num_and_hash,
-                                e
-                            )
-                        })?;
-
-                    // Extract and deserialize SaltWitness from WitnessStatus
+                    // Extract and deserialize SaltWitness from file_data
                     let (salt_witness, _): (SaltWitness, usize) =
-                        bincode::serde::decode_from_slice(
-                            &witness_status.witness_data,
-                            bincode::config::legacy(),
-                        )
-                        .map_err(|e| {
-                            anyhow!(
-                                "Failed to deserialize SaltWitness from WitnessStatus {}: {}",
-                                block_num_and_hash,
-                                e
-                            )
-                        })?;
+                        bincode::serde::decode_from_slice(&file_data, bincode::config::legacy())
+                            .map_err(|e| {
+                                anyhow!(
+                                    "Failed to deserialize SaltWitness from file_data {}: {}",
+                                    block_num_and_hash,
+                                    e
+                                )
+                            })?;
 
                     witness_data.insert(block_hash, salt_witness);
                     witness_count += 1;

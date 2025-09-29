@@ -19,12 +19,9 @@ revm = { workspace = true, features = ["serde"] }
 salt.workspace = true
 
 bincode.workspace = true
-blake3.workspace = true
 clap.workspace = true
 eyre.workspace = true
 futures.workspace = true
-jsonrpsee.workspace = true
-jsonrpsee-types.workspace = true
 num_cpus.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -34,5 +31,6 @@ tracing-subscriber.workspace = true
 validator-core = { path = "../../validator-core" }
 
 [dev-dependencies]
-jsonrpsee-types.workspace = true
+jsonrpsee = { version = "0.26", features = ["server", "macros"] }
+jsonrpsee-types = { version = "0.26" }
 tempfile = "3.8"

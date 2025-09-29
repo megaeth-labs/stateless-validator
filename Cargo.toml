@@ -28,20 +28,13 @@ mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "5c7b39
 salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "bbc85449049c8e80a9ea4600b0a90f1143abed4b" }
 
 bincode = { version = "2.0", features = ["serde"] }
-blake3 = "1.8"
 clap = { version = "4.5", features = ["derive"] }
 eyre = "0.6"
-fs2 = "0.4"
 futures = "0.3"
-hex = "0.4"
-jsonrpsee = { version = "0.26", features = ["server", "macros"] }
-jsonrpsee-types = { version = "0.26" }
 num_cpus = "1.17"
-rand = "0.9"
 redb = "3.0.1"
 serde = { version = "1.0", default-features = false }
 serde_json = "1.0"
-simd-json = "0.15"
 thiserror = "2.0.16"
 tokio = { version = "1.46", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = "0.1"
