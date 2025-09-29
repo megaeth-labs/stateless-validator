@@ -3,12 +3,11 @@
 use alloy_genesis::Genesis;
 use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition, Hardfork};
 use alloy_op_hardforks::{OpHardfork, OpHardforks};
+use alloy_serde::OtherFields;
 use mega_evm::SpecId;
-use reth_ethereum_forks::ChainHardforks;
+use reth_ethereum_forks::{ChainHardforks, hardfork};
 use reth_optimism_chainspec::OpChainSpec;
 use std::sync::LazyLock;
-
-pub use megaeth_chainspec::*;
 
 /// Chain ID for the EVM configuration
 pub const MEGA_CHAIN_ID: u64 = 6342;
@@ -23,24 +22,24 @@ pub const BLOB_GASPRICE_UPDATE_FRACTION: u64 = 3338477;
 /// different block numbers or timestamps.
 #[derive(Default, Clone)]
 pub struct ChainSpec {
-    inner: ChainHardforks,
+    hardforks: ChainHardforks,
 }
 
 impl EthereumHardforks for ChainSpec {
     fn ethereum_fork_activation(&self, fork: EthereumHardfork) -> ForkCondition {
-        self.inner.fork(fork)
+        self.hardforks.fork(fork)
     }
 }
 
 impl OpHardforks for ChainSpec {
     fn op_fork_activation(&self, fork: OpHardfork) -> ForkCondition {
-        self.inner.fork(fork)
+        self.hardforks.fork(fork)
     }
 }
 
 impl MegaethHardforks for ChainSpec {
     fn megaeth_fork_activation(&self, fork: MegaethHardfork) -> ForkCondition {
-        self.inner.fork(fork)
+        self.hardforks.fork(fork)
     }
 }
 
@@ -65,7 +64,19 @@ impl ChainSpec {
         }
     }
 
-    /// Create a new [`MegaethChainSpec`] from a [`Genesis`].
+    /// Creates a new [`ChainSpec`] from a [`Genesis`].
+    ///
+    /// Ordering rules:
+    /// - [`OpChainSpec`] already yields Optimism/Ethereum hardforks in the correct order, so
+    ///   they do not require reordering.
+    /// - MegaETH hardforks are extracted from the genesis `extra_fields` and explicitly
+    ///   ordered to match the canonical sequence defined by [`MEGA_MAINNET_HARDFORKS`].
+    ///   Any remaining, unknown MegaETH hardforks are preserved and appended after the
+    ///   known ones so nothing is dropped.
+    /// - The MegaETH set is then merged with the Optimism/Ethereum set to build a single
+    ///   [`ChainHardforks`] that drives fork activation.
+    ///
+    /// This yields a deterministic activation order across all supported hardfork families.
     pub fn from_genesis(genesis: Genesis) -> Self {
         // extract megaeth hardforks from genesis
         let mut megaeth_hardforks =
@@ -83,8 +94,7 @@ impl ChainSpec {
             .map(|(f, b)| (dyn_clone::clone_box(f), b))
             .collect();
 
-        // we merge megaeth_hardforks with op_hardforks, and order them as hardfork_order
-        let hardfork_order = DEV_HARDFORKS.forks_iter();
+        let hardfork_order = MEGA_MAINNET_HARDFORKS.forks_iter();
         let mut all_hardforks = Vec::with_capacity(op_hardforks.len() + megaeth_hardforks.len());
         for (order, _) in hardfork_order {
             if let Some(mega_hardfork_index) = megaeth_hardforks
@@ -92,25 +102,76 @@ impl ChainSpec {
                 .position(|(hardfork, _)| **hardfork == *order)
             {
                 all_hardforks.push(megaeth_hardforks.remove(mega_hardfork_index));
-            } else if let Some(op_hardfork_index) = op_hardforks
-                .iter()
-                .position(|(hardfork, _)| **hardfork == *order)
-            {
-                all_hardforks.push(op_hardforks.remove(op_hardfork_index));
-            } else {
-                // hardfork unspecified in genesis, we add it as never
-                all_hardforks.push((order.boxed(), ForkCondition::Never));
             }
         }
-        // any remaining megaeth and op hardforks are unknown, so we add them to the end
+
+        // append the remaining unknown hardforks to ensure we don't filter any out
         all_hardforks.append(&mut megaeth_hardforks);
+
+        // we merge megaeth_hardforks with op_hardforks
         all_hardforks.append(&mut op_hardforks);
 
         Self {
-            inner: ChainHardforks::new(all_hardforks),
+            hardforks: ChainHardforks::new(all_hardforks),
         }
     }
 }
+
+hardfork! {
+    /// The name of MegaETH hardforks. It is expected to mix with [`EthereumHardfork`] and
+    /// [`OpHardfork`].
+    #[derive(serde::Serialize, serde::Deserialize)]
+    MegaethHardfork {
+        /// Tentative name for the first hardfork.
+        MiniRex,
+    }
+}
+
+/// Extends [`OpHardforks`] with MegaETH helper methods.
+pub trait MegaethHardforks {
+    /// Retrieves [`ForkCondition`] by a [`MegaethHardfork`]. If `fork` is not present, returns
+    /// [`ForkCondition::Never`].
+    fn megaeth_fork_activation(&self, fork: MegaethHardfork) -> ForkCondition;
+
+    /// Returns `true` if [`MegaethHardfork::MiniRex`] is active at given block timestamp.
+    fn is_mini_rex_active_at_timestamp(&self, timestamp: u64) -> bool {
+        self.megaeth_fork_activation(MegaethHardfork::MiniRex)
+            .active_at_timestamp(timestamp)
+    }
+}
+
+/// MegaETH hardfork configuration in genesis.
+#[derive(Default, Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MegaethGenesisHardforks {
+    /// MiniRex hardfork timestamp.
+    pub mini_rex_time: Option<u64>,
+}
+
+impl MegaethGenesisHardforks {
+    /// Extract the MegaETH genesis hardforks from a genesis file.
+    pub fn extract_from(others: &OtherFields) -> Option<Self> {
+        others.deserialize_as().ok()
+    }
+
+    /// Convert the MegaETH genesis hardforks into a vector of hardforks and their conditions.
+    pub fn into_vec(self) -> Vec<(Box<dyn Hardfork>, ForkCondition)> {
+        std::iter::once((
+            MegaethHardfork::MiniRex.boxed(),
+            self.mini_rex_time.map(ForkCondition::Timestamp),
+        ))
+        .filter_map(|(hardfork, condition)| condition.map(|c| (hardfork, c)))
+        .collect()
+    }
+}
+
+/// Hardforks configuration for MegaETH.
+pub static MEGA_MAINNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
+    ChainHardforks::new(vec![(
+        MegaethHardfork::MiniRex.boxed(),
+        ForkCondition::Timestamp(0),
+    )])
+});
 
 /// The ChainSpec for the MegaETH network .
 pub static CHAIN_SPEC: LazyLock<ChainSpec> = LazyLock::new(|| {
@@ -120,121 +181,6 @@ pub static CHAIN_SPEC: LazyLock<ChainSpec> = LazyLock::new(|| {
     let genesis: Genesis = serde_json::from_str(mainnet_genesis_json).unwrap();
     ChainSpec::from_genesis(genesis)
 });
-
-pub mod megaeth_chainspec {
-    use alloy_hardforks::{EthereumHardfork, ForkCondition, Hardfork, hardfork};
-    use alloy_op_hardforks::{OpHardfork, OpHardforks};
-    use alloy_primitives::U256;
-    use alloy_serde::OtherFields;
-    use reth_ethereum_forks::ChainHardforks;
-    use std::sync::LazyLock;
-
-    hardfork! {
-        /// The name of MegaETH hardforks. It is expected to mix with [`EthereumHardfork`] and
-        /// [`OpHardfork`].
-        #[derive(serde::Serialize, serde::Deserialize)]
-        MegaethHardfork {
-            /// Tentative name for the first hardfork.
-            MiniRex,
-        }
-    }
-
-    /// Extends [`OpHardforks`] with MegaETH helper methods.
-    pub trait MegaethHardforks: OpHardforks {
-        /// Retrieves [`ForkCondition`] by a [`MegaethHardfork`]. If `fork` is not present, returns
-        /// [`ForkCondition::Never`].
-        fn megaeth_fork_activation(&self, fork: MegaethHardfork) -> ForkCondition;
-
-        /// Returns `true` if [`MegaethHardfork::MiniRex`] is active at given block timestamp.
-        fn is_mini_rex_active_at_timestamp(&self, timestamp: u64) -> bool {
-            self.megaeth_fork_activation(MegaethHardfork::MiniRex)
-                .active_at_timestamp(timestamp)
-        }
-    }
-
-    /// MegaETH hardfork configuration in genesis.
-    #[derive(Default, Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    pub struct MegaethGenesisHardforks {
-        /// MiniRex hardfork timestamp.
-        pub mini_rex_time: Option<u64>,
-    }
-
-    impl MegaethGenesisHardforks {
-        /// Extract the MegaETH genesis hardforks from a genesis file.
-        pub fn extract_from(others: &OtherFields) -> Option<Self> {
-            others.deserialize_as().ok()
-        }
-
-        /// Convert the MegaETH genesis hardforks into a vector of hardforks and their conditions.
-        pub fn into_vec(self) -> Vec<(Box<dyn Hardfork>, ForkCondition)> {
-            std::iter::once((
-                MegaethHardfork::MiniRex.boxed(),
-                self.mini_rex_time.map(ForkCondition::Timestamp),
-            ))
-            .filter_map(|(hardfork, condition)| condition.map(|c| (hardfork, c)))
-            .collect()
-        }
-    }
-
-    /// Dev hardforks configuration for MegaETH.
-    pub static DEV_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
-        ChainHardforks::new(vec![
-            (EthereumHardfork::Frontier.boxed(), ForkCondition::Block(0)),
-            (EthereumHardfork::Homestead.boxed(), ForkCondition::Block(0)),
-            (EthereumHardfork::Dao.boxed(), ForkCondition::Block(0)),
-            (EthereumHardfork::Tangerine.boxed(), ForkCondition::Block(0)),
-            (
-                EthereumHardfork::SpuriousDragon.boxed(),
-                ForkCondition::Block(0),
-            ),
-            (EthereumHardfork::Byzantium.boxed(), ForkCondition::Block(0)),
-            (
-                EthereumHardfork::Constantinople.boxed(),
-                ForkCondition::Block(0),
-            ),
-            (
-                EthereumHardfork::Petersburg.boxed(),
-                ForkCondition::Block(0),
-            ),
-            (EthereumHardfork::Istanbul.boxed(), ForkCondition::Block(0)),
-            (EthereumHardfork::Berlin.boxed(), ForkCondition::Block(0)),
-            (EthereumHardfork::London.boxed(), ForkCondition::Block(0)),
-            (
-                EthereumHardfork::Paris.boxed(),
-                ForkCondition::TTD {
-                    activation_block_number: 0,
-                    fork_block: None,
-                    total_difficulty: U256::ZERO,
-                },
-            ),
-            (OpHardfork::Bedrock.boxed(), ForkCondition::Block(0)),
-            (OpHardfork::Regolith.boxed(), ForkCondition::Timestamp(0)),
-            (
-                EthereumHardfork::Shanghai.boxed(),
-                ForkCondition::Timestamp(0),
-            ),
-            (OpHardfork::Canyon.boxed(), ForkCondition::Timestamp(0)),
-            (
-                EthereumHardfork::Cancun.boxed(),
-                ForkCondition::Timestamp(0),
-            ),
-            (OpHardfork::Ecotone.boxed(), ForkCondition::Timestamp(0)),
-            (OpHardfork::Fjord.boxed(), ForkCondition::Timestamp(0)),
-            (OpHardfork::Granite.boxed(), ForkCondition::Timestamp(0)),
-            (OpHardfork::Holocene.boxed(), ForkCondition::Timestamp(0)),
-            (
-                EthereumHardfork::Prague.boxed(),
-                ForkCondition::Timestamp(0),
-            ),
-            (OpHardfork::Isthmus.boxed(), ForkCondition::Timestamp(0)),
-            (
-                MegaethHardfork::MiniRex.boxed(),
-                ForkCondition::Timestamp(0),
-            ),
-        ])
-    });
-}
 
 #[cfg(test)]
 mod tests {
@@ -246,7 +192,7 @@ mod tests {
         let genesis = Genesis::default();
         let spec = ChainSpec::from_genesis(genesis);
 
-        assert!(!spec.inner.is_empty());
+        assert!(!spec.hardforks.is_empty());
     }
 
     #[test]
@@ -280,27 +226,27 @@ mod tests {
         let spec = ChainSpec::from_genesis(genesis);
 
         assert_eq!(
-            spec.inner.fork(EthereumHardfork::Cancun), // equivalent to ecotoneTime
+            spec.hardforks.fork(EthereumHardfork::Cancun), // equivalent to ecotoneTime
             ForkCondition::Timestamp(1)
         );
         assert_eq!(
-            spec.inner.fork(EthereumHardfork::Prague), // equivalent to isthmusTime
+            spec.hardforks.fork(EthereumHardfork::Prague), // equivalent to isthmusTime
             ForkCondition::Timestamp(6)
         );
         assert_eq!(
-            spec.inner.fork(OpHardfork::Granite),
+            spec.hardforks.fork(OpHardfork::Granite),
             ForkCondition::Timestamp(2)
         );
         assert_eq!(
-            spec.inner.fork(OpHardfork::Holocene),
+            spec.hardforks.fork(OpHardfork::Holocene),
             ForkCondition::Timestamp(3)
         );
         assert_eq!(
-            spec.inner.fork(OpHardfork::Isthmus),
+            spec.hardforks.fork(OpHardfork::Isthmus),
             ForkCondition::Timestamp(6)
         );
         assert_eq!(
-            spec.inner.fork(MegaethHardfork::MiniRex),
+            spec.hardforks.fork(MegaethHardfork::MiniRex),
             ForkCondition::Timestamp(3)
         );
     }
