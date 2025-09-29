@@ -653,11 +653,12 @@ impl ValidatorDB {
         }
     }
 
-    /// Sets the local chain tip manually
+    /// Resets the chain anchor point and clears remote chain state
     ///
-    /// This method allows setting the local chain tip to a specific block.
-    /// Useful for initialization and testing scenarios.
-    pub fn set_local_tip(
+    /// This method resets the validator to start from a specific trusted block.
+    /// It sets the canonical chain tip and clears the remote chain to ensure
+    /// a clean slate. Useful for initialization from a trusted block.
+    pub fn reset_anchor_block(
         &self,
         block_number: BlockNumber,
         block_hash: BlockHash,
@@ -666,7 +667,10 @@ impl ValidatorDB {
         let write_txn = self.database.begin_write()?;
         {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
+            let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
+
             canonical_chain.insert(block_number, (block_hash.0, post_state_root.0))?;
+            remote_chain.retain(|_, _| false)?;
         }
         write_txn.commit()?;
         Ok(())

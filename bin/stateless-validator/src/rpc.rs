@@ -68,10 +68,10 @@ impl RpcClient {
         .await
     }
 
-    /// Gets a block by its number with optional transaction details.
+    /// Gets a block by its identifier with optional transaction details.
     ///
     /// # Arguments
-    /// * `number` - Block number to fetch
+    /// * `block_id` - Block identifier (number, hash, latest, etc.)
     /// * `full_txs` - If true, includes full transaction objects; if false, only transaction hashes
     ///
     /// # Returns
@@ -79,14 +79,13 @@ impl RpcClient {
     ///
     /// # Errors
     /// Returns error if block doesn't exist or RPC call fails.
-    pub async fn get_block(&self, number: u64, full_txs: bool) -> Result<Block<Transaction>> {
-        let block_id = BlockId::Number(number.into());
+    pub async fn get_block(&self, block_id: BlockId, full_txs: bool) -> Result<Block<Transaction>> {
         let block = if full_txs {
             self.provider.get_block(block_id).full().await?
         } else {
             self.provider.get_block(block_id).await?
         };
-        block.ok_or_else(|| eyre!("Block {number} not found"))
+        block.ok_or_else(|| eyre!("Block {:?} not found", block_id))
     }
 
     /// Gets the current latest block number from the blockchain.

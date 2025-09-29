@@ -36,12 +36,43 @@ cargo build --release
 ```bash
 cargo run --bin stateless-validator -- \
   --data-dir /path/to/validator/data \
-  --rpc-endpoint <public-rpc-endpoint>
+  --rpc-endpoint <public-rpc-endpoint> \
+  --start-block <trusted-block-hash>
 ```
 
 **Required Arguments:**
 - `--data-dir` / `-d`: Directory for validator database and data files
-- `--rpc-endpoint` / `-r`: JSON-RPC API endpoint URL for retrieve block and witness data
+- `--rpc-endpoint` / `-r`: JSON-RPC API endpoint URL to retrieve block and witness data
+
+**Optional Arguments:**
+- `--start-block`: Trusted block hash to initialize validation from (required for first-time setup)
+
+### Getting Started
+
+The stateless validator requires a trusted starting point for security. On first run, you must specify a trusted block hash:
+
+```bash
+# Initialize from a trusted block (e.g., genesis or recent finalized block)
+cargo run --bin stateless-validator -- \
+  --data-dir ./validator-data \
+  --rpc-endpoint https://your-rpc-endpoint.com \
+  --start-block 0x1234567890abcdef...
+```
+
+The validator will:
+1. Fetch the specified block from the RPC endpoint
+2. Initialize the canonical chain database with this trusted block
+3. Begin validation from this anchor point
+
+For subsequent runs, omit `--start-block` to resume from the existing database:
+
+```bash
+# Resume validation from existing database
+cargo run --bin stateless-validator -- \
+  --data-dir ./validator-data \
+  --rpc-endpoint https://your-rpc-endpoint.com
+```
+
 
 ## Architecture
 

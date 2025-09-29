@@ -1,12 +1,9 @@
-use alloy_primitives::{Address, BlockNumber};
-use alloy_rpc_types_eth::Header;
+use alloy_primitives::{Address, B256, BlockHash, BlockNumber, hex};
+use alloy_rpc_types_eth::{BlockId, Header};
 use clap::Parser;
 use eyre::{Result, anyhow};
 use futures::future;
-use revm::{
-    primitives::{B256, KECCAK_EMPTY},
-    state::Bytecode,
-};
+use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
 use salt::SaltWitness;
 use std::collections::HashMap;
 use std::{
@@ -30,6 +27,20 @@ mod witness_types;
 
 /// Database filename for the validator.
 const VALIDATOR_DB_FILENAME: &str = "validator.redb";
+
+/// Convert hex string to BlockHash
+///
+/// Accepts hex strings with or without "0x" prefix. Must be exactly 32 bytes when decoded.
+fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
+    let hash_bytes = hex::decode(hex_str)?;
+    if hash_bytes.len() != 32 {
+        return Err(anyhow!(
+            "Block hash must be 32 bytes, got {}",
+            hash_bytes.len()
+        ));
+    }
+    Ok(BlockHash::from_slice(&hash_bytes))
+}
 
 /// Configuration for chain synchronization behavior
 #[derive(Debug, Clone)]
@@ -81,6 +92,10 @@ struct CommandLineArgs {
     /// The URL of the Ethereum JSON-RPC API endpoint for fetching blockchain data.
     #[clap(short = 'r', long)]
     rpc_endpoint: String,
+
+    /// Optional trusted block hash to start validation from.
+    #[clap(long)]
+    start_block: Option<String>,
 }
 
 #[tokio::main]
@@ -96,6 +111,38 @@ async fn main() -> Result<()> {
 
     let client = Arc::new(RpcClient::new(&args.rpc_endpoint)?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
+
+    // Handle optional start block initialization
+    if let Some(start_block_str) = &args.start_block {
+        info!("[Main] Initializing from start block: {}", start_block_str);
+
+        let block_hash = parse_block_hash(start_block_str)?;
+        let block = client
+            .get_block(BlockId::Hash(block_hash.into()), false)
+            .await
+            .map_err(|e| anyhow!("Failed to fetch block {}: {}", block_hash, e))?;
+
+        validator_db
+            .reset_anchor_block(
+                block.header.number,
+                block.header.hash,
+                block.header.state_root,
+            )
+            .map_err(|e| anyhow!("Failed to reset anchor: {}", e))?;
+
+        info!(
+            "[Main] Successfully initialized from block {} (number: {})",
+            block.header.hash, block.header.number
+        );
+    } else {
+        // If no start block was provided, ensure we have an existing canonical chain
+        if validator_db.get_local_tip()?.is_none() {
+            return Err(anyhow!(
+                "No trusted starting point found. Specify a trusted block with --start-block <blockhash>"
+            ));
+        }
+        info!("[Main] Continuing from existing canonical chain");
+    }
 
     // Create chain sync configuration
     let config = Arc::new(ChainSyncConfig {
@@ -259,7 +306,10 @@ async fn remote_chain_tracker(
             );
 
             // Detect and resolve chain reorgs
-            match client.get_block(remote_tip.0, false).await {
+            match client
+                .get_block(BlockId::Number(remote_tip.0.into()), false)
+                .await
+            {
                 Ok(block) if block.header.hash != remote_tip.1 => {
                     error!(
                         "[Tracker] Hash mismatch! Expected {}, got {}. Resolving chain divergence.",
@@ -313,7 +363,9 @@ async fn remote_chain_tracker(
                     let client = client.clone();
                     let db = validator_db.clone();
                     tokio::spawn(async move {
-                        let block = client.get_block(block_number, true).await?;
+                        let block = client
+                            .get_block(BlockId::Number(block_number.into()), true)
+                            .await?;
                         let witness = client.get_witness(block.header.hash).await?;
                         db.add_validation_task(&block, &witness)?;
                         Ok::<Header, eyre::Error>(block.header)
@@ -569,7 +621,9 @@ async fn find_divergence_point(
         .expect("Local chain cannot be empty");
 
     // Safety check: verify earliest block matches remote chain
-    let earliest_remote = client.get_block(earliest_local.0, false).await?;
+    let earliest_remote = client
+        .get_block(BlockId::Number(earliest_local.0.into()), false)
+        .await?;
     if earliest_remote.header.hash != earliest_local.1 {
         panic!(
             "Catastrophic reorg: earliest local block {} hash mismatch (local: {:?}, remote: {:?})",
@@ -583,7 +637,11 @@ async fn find_divergence_point(
     while left <= right {
         let mid = left + (right - left) / 2;
         let local_hash = validator_db.get_block_hash(mid)?.unwrap();
-        let remote_hash = client.get_block(mid, false).await?.header.hash;
+        let remote_hash = client
+            .get_block(BlockId::Number(mid.into()), false)
+            .await?
+            .header
+            .hash;
         if remote_hash == local_hash {
             last_matching = mid;
             left = mid + 1;
@@ -599,7 +657,7 @@ mod tests {
     use super::*;
     use crate::checksum_data::deserialized_checksum_data;
     use crate::witness_types::WitnessStatus;
-    use alloy_primitives::{BlockHash, BlockNumber, hex};
+    use alloy_primitives::{BlockHash, BlockNumber};
     use alloy_rpc_types_eth::Block;
     use eyre::Context;
     use jsonrpsee::{
@@ -621,20 +679,6 @@ mod tests {
     /// Maximum response body size for the RPC server.
     /// This is set to 100 MB to accommodate large block data and witness information.
     const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
-
-    /// Convert hex string to BlockHash
-    ///
-    /// Accepts hex strings with or without "0x" prefix. Must be exactly 32 bytes when decoded.
-    fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
-        let hash_bytes = hex::decode(hex_str)?;
-        if hash_bytes.len() != 32 {
-            return Err(anyhow!(
-                "Block hash must be 32 bytes, got {}",
-                hash_bytes.len()
-            ));
-        }
-        Ok(BlockHash::from_slice(&hash_bytes))
-    }
 
     /// Helper function to create RPC errors with consistent format
     fn make_rpc_error(code: i32, msg: String) -> ErrorObject<'static> {
@@ -737,7 +781,7 @@ mod tests {
             .ok_or_else(|| anyhow!("Local tip {block_hash} not found"))?
             .header
             .state_root;
-        validator_db.set_local_tip(block_num, block_hash, state_root)?;
+        validator_db.reset_anchor_block(block_num, block_hash, state_root)?;
 
         // Populate CONTRACTS table with test contract bytecode
         let contracts = load_contracts(CONTRACTS_FILE);
