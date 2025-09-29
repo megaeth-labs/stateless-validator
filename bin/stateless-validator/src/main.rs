@@ -936,18 +936,13 @@ mod tests {
         // Load block data from TEST_BLOCK_DIR
         info!("Loading block data from {}", TEST_BLOCK_DIR);
         let test_block_dir = PathBuf::from(TEST_BLOCK_DIR);
-        let block_entries = std::fs::read_dir(&test_block_dir).map_err(|e| {
-            anyhow!(
-                "Failed to read test block directory {}: {}",
-                TEST_BLOCK_DIR,
-                e
-            )
-        })?;
+        let block_entries = std::fs::read_dir(&test_block_dir)
+            .map_err(|e| anyhow!("Failed to read test block directory {TEST_BLOCK_DIR}: {e}"))?;
 
         let mut block_numbers = Vec::new();
 
         for entry in block_entries {
-            let file = entry.map_err(|e| anyhow!("Failed to read directory entry: {}", e))?;
+            let file = entry.map_err(|e| anyhow!("Failed to read directory entry: {e}"))?;
             let file_name = file.file_name();
             let file_str = file_name.to_string_lossy();
 
@@ -962,7 +957,7 @@ mod tests {
                 if let Ok(block_number) = block_number_str.parse::<u64>() {
                     // Load the block data
                     let block: Block<Transaction> = load_json(file.path())
-                        .map_err(|e| anyhow!("Failed to load block file {}: {}", file_str, e))?;
+                        .map_err(|e| anyhow!("Failed to load block file {file_str}: {e}"))?;
 
                     let block_hash = BlockHash::from(block.header.hash);
 
@@ -975,7 +970,7 @@ mod tests {
         }
 
         if block_numbers.is_empty() {
-            return Err(anyhow!("No valid block files found in {}", TEST_BLOCK_DIR));
+            return Err(anyhow!("No valid block files found in {TEST_BLOCK_DIR}"));
         }
 
         block_numbers.sort_unstable();
@@ -1000,7 +995,7 @@ mod tests {
         let test_witness_dir = PathBuf::from(TEST_WITNESS_DIR);
         if test_witness_dir.exists() {
             let witness_entries = std::fs::read_dir(&test_witness_dir)
-                .map_err(|e| anyhow!("Failed to read test witness directory: {}", e))?;
+                .map_err(|e| anyhow!("Failed to read test witness directory: {e}"))?;
 
             let mut witness_count = 0;
             for entry in witness_entries {
@@ -1019,9 +1014,7 @@ mod tests {
                         bincode::serde::decode_from_slice(&file_data, bincode::config::legacy())
                             .map_err(|e| {
                                 anyhow!(
-                                    "Failed to deserialize SaltWitness from file_data {}: {}",
-                                    block_num_and_hash,
-                                    e
+                                    "Failed to deserialize SaltWitness from file_data {block_num_and_hash}: {e}"
                                 )
                             })?;
 
