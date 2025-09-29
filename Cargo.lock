@@ -1159,7 +1159,7 @@ dependencies = [
 [[package]]
 name = "banderwagon"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=bbc85449049c8e80a9ea4600b0a90f1143abed4b#bbc85449049c8e80a9ea4600b0a90f1143abed4b"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=f175203391f93331d92036d831cdbe18973bee2d#f175203391f93331d92036d831cdbe18973bee2d"
 dependencies = [
  "ark-ec 0.5.0 (git+https://github.com/arkworks-rs/algebra.git?rev=da450f98b9b4bf1b4c8eec8f96b4501f9705c517)",
  "ark-ed-on-bls12-381-bandersnatch",
@@ -2498,7 +2498,7 @@ dependencies = [
 [[package]]
 name = "ipa-multipoint"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=bbc85449049c8e80a9ea4600b0a90f1143abed4b#bbc85449049c8e80a9ea4600b0a90f1143abed4b"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=f175203391f93331d92036d831cdbe18973bee2d#f175203391f93331d92036d831cdbe18973bee2d"
 dependencies = [
  "banderwagon",
  "hex",
@@ -2831,7 +2831,7 @@ dependencies = [
 [[package]]
 name = "mega-evm"
 version = "0.0.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=5c7b39dfb5d7890cc5cbf1d1080af808ce2fd187#5c7b39dfb5d7890cc5cbf1d1080af808ce2fd187"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=1f8555f441a7939f3c0245a941eba6fdde3ba204#1f8555f441a7939f3c0245a941eba6fdde3ba204"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -2839,11 +2839,14 @@ dependencies = [
  "alloy-op-evm",
  "alloy-op-hardforks",
  "alloy-primitives",
+ "auto_impl",
+ "bitflags",
  "delegate",
  "derive_more",
  "op-alloy-consensus",
  "op-revm",
  "revm",
+ "salt",
  "serde",
 ]
 
@@ -3915,9 +3918,10 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 [[package]]
 name = "salt"
 version = "1.0.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=bbc85449049c8e80a9ea4600b0a90f1143abed4b#bbc85449049c8e80a9ea4600b0a90f1143abed4b"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=f175203391f93331d92036d831cdbe18973bee2d#f175203391f93331d92036d831cdbe18973bee2d"
 dependencies = [
  "ark-ff 0.5.0 (git+https://github.com/arkworks-rs/algebra.git?rev=da450f98b9b4bf1b4c8eec8f96b4501f9705c517)",
+ "auto_impl",
  "banderwagon",
  "blake3",
  "derive_more",

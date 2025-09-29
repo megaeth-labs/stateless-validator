@@ -304,7 +304,7 @@ pub fn validate_block(
 
     // Update the state root
     let (state_root, _) = StateRoot::new(&witness)
-        .update_fin(state_updates)
+        .update_fin(&state_updates)
         .map_err(ValidationError::TrieUpdateFailed)?;
 
     // Check if computed state root matches claimed state root
