@@ -15,6 +15,7 @@ use tokio::{signal, task};
 use tracing::{error, info, warn};
 use validator_core::{
     ValidatorDB,
+    chain_spec::CHAIN_SPEC,
     data_types::{PlainKey, PlainValue},
     executor::{ValidationResult, validate_block},
 };
@@ -500,16 +501,17 @@ async fn validate_one(
 
             // Validate the given block
             let pre_state_root = B256::from(witness.state_root()?);
-            let (success, error_message) = match validate_block(&block, witness, &contracts) {
-                Ok(()) => {
-                    info!("[Worker {worker_id}] Successfully validated block {block_number}");
-                    (true, None)
-                }
-                Err(e) => {
-                    error!("[Worker {worker_id}] Failed to validate block {block_number}: {e}");
-                    (false, Some(e.to_string()))
-                }
-            };
+            let (success, error_message) =
+                match validate_block(CHAIN_SPEC.clone(), &block, witness, &contracts) {
+                    Ok(()) => {
+                        info!("[Worker {worker_id}] Successfully validated block {block_number}");
+                        (true, None)
+                    }
+                    Err(e) => {
+                        error!("[Worker {worker_id}] Failed to validate block {block_number}: {e}");
+                        (false, Some(e.to_string()))
+                    }
+                };
 
             validator_db.complete_validation(ValidationResult {
                 pre_state_root,

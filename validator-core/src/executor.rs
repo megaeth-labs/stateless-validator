@@ -125,7 +125,7 @@ pub struct ValidationResult {
 /// - Block environment with gas limits, timestamps, and fee parameters
 /// - Blob gas pricing if excess blob gas is present in the header
 fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<SpecId> {
-    let cfg_env = CfgEnv::new_with_spec(chain_spec.spec_id_at_block(header.number))
+    let cfg_env = CfgEnv::new_with_spec(chain_spec.spec_id_at_timestamp(header.timestamp))
         .with_chain_id(MEGA_CHAIN_ID);
 
     let mut block_env = BlockEnv {
@@ -177,6 +177,7 @@ fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<SpecId> {
 /// 5. Applies post-execution changes
 /// 6. Flattens REVM's cache format into plain key-value pairs
 fn replay_block(
+    chain_spec: ChainSpec,
     block: &Block<OpTransaction>,
     db: &WitnessDatabase<'_>,
 ) -> Result<HashMap<Vec<u8>, Option<Vec<u8>>>, ValidationError> {
@@ -187,10 +188,10 @@ fn replay_block(
 
     // Setup execution environment
     let mut state = StateBuilder::new().with_database_ref(db).build();
-    let evm_env = create_evm_env(&block.header, &ChainSpec);
+    let evm_env = create_evm_env(&block.header, &chain_spec);
 
     let executor_factory = BlockExecutorFactory::new(
-        ChainSpec,
+        chain_spec,
         EvmFactory::default(),
         OpAlloyReceiptBuilder::default(),
     );
@@ -279,6 +280,7 @@ fn replay_block(
 /// Returns `Ok(())` if validation succeeds (computed state root matches expected).
 /// Returns `Err(ValidationError)` with the specific validation failure.
 pub fn validate_block(
+    chain_spec: ChainSpec,
     block: &Block<OpTransaction>,
     salt_witness: SaltWitness,
     contracts: &HashMap<B256, Bytecode>,
@@ -295,7 +297,7 @@ pub fn validate_block(
         witness: &witness,
         contracts,
     };
-    let kv_updates = replay_block(block, &witness_db)?;
+    let kv_updates = replay_block(chain_spec, block, &witness_db)?;
 
     // Update the SALT state
     let state_updates = EphemeralSaltState::new(&witness)

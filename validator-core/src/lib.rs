@@ -14,7 +14,7 @@
 //! - [`data_types`]: EVM-specific data types and encoding utilities
 //! - [`executor`]: Block execution logic for replaying transactions
 
-mod chain_spec;
+pub mod chain_spec;
 mod database;
 pub mod validator_db;
 pub use validator_db::{ValidationDbError, ValidationDbResult, ValidatorDB};
