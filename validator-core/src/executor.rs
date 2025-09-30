@@ -48,7 +48,7 @@ use std::{collections::HashMap, time::SystemTime};
 use thiserror::Error;
 
 use crate::{
-    chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec, MEGA_CHAIN_ID},
+    chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec},
     data_types::{Account, PlainKey, PlainValue},
     database::WitnessDatabase,
 };
@@ -126,7 +126,7 @@ pub struct ValidationResult {
 /// - Blob gas pricing if excess blob gas is present in the header
 fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<SpecId> {
     let cfg_env = CfgEnv::new_with_spec(chain_spec.spec_id_at_timestamp(header.timestamp))
-        .with_chain_id(MEGA_CHAIN_ID);
+        .with_chain_id(chain_spec.chain_id);
 
     let mut block_env = BlockEnv {
         number: U256::from(header.number),
@@ -154,6 +154,7 @@ fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<SpecId> {
 ///
 /// # Arguments
 ///
+/// * `chain_spec` - Chain specification defining the EVM rules and parameters
 /// * `block` - Block containing full transaction data to replay
 /// * `db` - Witness database providing the necessary state data for execution
 ///
@@ -177,7 +178,7 @@ fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<SpecId> {
 /// 5. Applies post-execution changes
 /// 6. Flattens REVM's cache format into plain key-value pairs
 fn replay_block(
-    chain_spec: ChainSpec,
+    chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
     db: &WitnessDatabase<'_>,
 ) -> Result<HashMap<Vec<u8>, Option<Vec<u8>>>, ValidationError> {
@@ -188,10 +189,10 @@ fn replay_block(
 
     // Setup execution environment
     let mut state = StateBuilder::new().with_database_ref(db).build();
-    let evm_env = create_evm_env(&block.header, &chain_spec);
+    let evm_env = create_evm_env(&block.header, chain_spec);
 
     let executor_factory = BlockExecutorFactory::new(
-        chain_spec,
+        chain_spec.clone(),
         EvmFactory::default(),
         OpAlloyReceiptBuilder::default(),
     );
@@ -271,6 +272,7 @@ fn replay_block(
 ///
 /// # Arguments
 ///
+/// * `chain_spec` - Chain specification defining the EVM rules and parameters
 /// * `block` - The block to validate containing transactions and header information
 /// * `salt_witness` - The salt witness data needed for state reconstruction
 /// * `contracts` - Contract bytecode cache for transaction execution
@@ -280,7 +282,7 @@ fn replay_block(
 /// Returns `Ok(())` if validation succeeds (computed state root matches expected).
 /// Returns `Err(ValidationError)` with the specific validation failure.
 pub fn validate_block(
-    chain_spec: ChainSpec,
+    chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
     salt_witness: SaltWitness,
     contracts: &HashMap<B256, Bytecode>,

@@ -1,3 +1,4 @@
+use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256, BlockHash, BlockNumber, hex};
 use alloy_rpc_types_eth::{BlockId, Header};
 use clap::Parser;
@@ -15,7 +16,7 @@ use tokio::{signal, task};
 use tracing::{error, info, warn};
 use validator_core::{
     ValidatorDB,
-    chain_spec::CHAIN_SPEC,
+    chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
     executor::{ValidationResult, validate_block},
 };
@@ -38,6 +39,42 @@ fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
         ));
     }
     Ok(BlockHash::from_slice(&hash_bytes))
+}
+
+/// Loads or creates a ChainSpec from either the database or a genesis file.
+///
+/// This function implements the following logic:
+/// 1. If `genesis_file` is provided: load from file, store in DB, return ChainSpec
+/// 2. If `genesis_file` is None: load from DB
+/// 3. If neither source available: return error
+///
+/// # Arguments
+/// * `validator_db` - Database to load/store genesis configuration
+/// * `genesis_file` - Optional path to genesis JSON file
+///
+/// # Returns
+/// * `Ok(ChainSpec)` - Successfully loaded chain specification
+/// * `Err(eyre::Error)` - Failed to load genesis from any source
+fn load_or_create_chain_spec(
+    validator_db: &ValidatorDB,
+    genesis_file: Option<&str>,
+) -> Result<ChainSpec> {
+    let genesis = match genesis_file {
+        Some(path) => {
+            info!("[ChainSpec] Loading genesis from file: {path}");
+            let genesis = serde_json::from_str::<Genesis>(&std::fs::read_to_string(path)?)?;
+            validator_db.store_genesis(&genesis)?;
+            genesis
+        }
+        None => {
+            info!("[ChainSpec] Loading genesis from database");
+            validator_db.load_genesis()?.ok_or_else(|| {
+                anyhow!("No genesis config found. Please provide --genesis-file on first run.")
+            })?
+        }
+    };
+
+    Ok(ChainSpec::from_genesis(genesis))
 }
 
 /// Configuration for chain synchronization behavior
@@ -84,16 +121,21 @@ impl Default for ChainSyncConfig {
 #[clap(author, version, about, long_about = None)]
 struct CommandLineArgs {
     /// Directory path where validator data and database files will be stored.
-    #[clap(short = 'd', long)]
+    #[clap(long)]
     data_dir: String,
 
     /// The URL of the Ethereum JSON-RPC API endpoint for fetching blockchain data.
-    #[clap(short = 'r', long)]
+    #[clap(long)]
     rpc_endpoint: String,
 
     /// Optional trusted block hash to start validation from.
     #[clap(long)]
     start_block: Option<String>,
+
+    /// Path to the genesis JSON file for chain configuration.
+    /// Required on first run, optional on subsequent runs (loads from database).
+    #[clap(long)]
+    genesis_file: Option<String>,
 }
 
 #[tokio::main]
@@ -104,11 +146,21 @@ async fn main() -> Result<()> {
 
     info!("[Main] Data directory: {}", args.data_dir);
     info!("[Main] RPC endpoint: {}", args.rpc_endpoint);
+    if let Some(ref genesis_file) = args.genesis_file {
+        info!("[Main] Genesis file: {}", genesis_file);
+    }
 
     let work_dir = PathBuf::from(args.data_dir);
 
     let client = Arc::new(RpcClient::new(&args.rpc_endpoint)?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
+
+    // Load chain spec from file (first run) or database (subsequent runs)
+    let chain_spec = Arc::new(load_or_create_chain_spec(
+        &validator_db,
+        args.genesis_file.as_deref(),
+    )?);
+    info!("[Main] Chain spec loaded successfully");
 
     // Handle optional start block initialization
     if let Some(start_block_str) = &args.start_block {
@@ -152,7 +204,7 @@ async fn main() -> Result<()> {
         config.concurrent_workers
     );
 
-    let validator_logic = chain_sync(client.clone(), validator_db.clone(), config);
+    let validator_logic = chain_sync(client.clone(), validator_db.clone(), config, chain_spec);
 
     tokio::select! {
         res = validator_logic => res?,
@@ -181,6 +233,7 @@ async fn main() -> Result<()> {
 /// * `client` - RPC client for communicating with remote blockchain node
 /// * `validator_db` - Database interface for task coordination and chain state management
 /// * `config` - Configuration including worker count, polling intervals, and optional sync target
+/// * `chain_spec` - Chain specification defining the EVM rules and parameters
 ///
 /// # Returns
 /// * `Ok(())` - When sync target is reached (if configured)
@@ -189,6 +242,7 @@ async fn chain_sync(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
     config: Arc<ChainSyncConfig>,
+    chain_spec: Arc<ChainSpec>,
 ) -> Result<()> {
     info!(
         "[Chain Sync] Starting with {} validation workers",
@@ -227,6 +281,7 @@ async fn chain_sync(
             Arc::clone(&client),
             Arc::clone(&validator_db),
             Arc::clone(&config),
+            Arc::clone(&chain_spec),
         ));
     }
     info!("[Chain Sync] All validation workers started");
@@ -421,6 +476,7 @@ async fn remote_chain_tracker(
 /// * `client` - RPC client for fetching data on demand
 /// * `validator_db` - Database interface for task coordination
 /// * `config` - Configuration for worker behavior
+/// * `chain_spec` - Chain specification defining the EVM rules and parameters
 ///
 /// # Returns
 /// * Never returns under normal operation - runs indefinitely until externally terminated
@@ -429,10 +485,11 @@ async fn validation_worker(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
     config: Arc<ChainSyncConfig>,
+    chain_spec: Arc<ChainSpec>,
 ) -> Result<()> {
     info!("[Worker {}] Started", worker_id);
     loop {
-        match validate_one(worker_id, &client, &validator_db).await {
+        match validate_one(worker_id, &client, &validator_db, &chain_spec).await {
             Ok(true) => {}
             Ok(false) => {
                 // No tasks available, wait before checking again
@@ -459,6 +516,7 @@ async fn validation_worker(
 /// * `worker_id` - Worker identifier for logging
 /// * `client` - RPC client for fetching contract bytecode from remote nodes
 /// * `validator_db` - Database for tasks and data
+/// * `chain_spec` - Chain specification defining the EVM rules and parameters
 ///
 /// # Returns
 /// * `Ok(true)` - Task was processed (validation success/failure stored in DB)
@@ -468,6 +526,7 @@ async fn validate_one(
     worker_id: usize,
     client: &RpcClient,
     validator_db: &ValidatorDB,
+    chain_spec: &ChainSpec,
 ) -> Result<bool> {
     match validator_db.get_next_task()? {
         Some((block, witness)) => {
@@ -502,7 +561,7 @@ async fn validate_one(
             // Validate the given block
             let pre_state_root = B256::from(witness.state_root()?);
             let (success, error_message) =
-                match validate_block(CHAIN_SPEC.clone(), &block, witness, &contracts) {
+                match validate_block(chain_spec, &block, witness, &contracts) {
                     Ok(()) => {
                         info!("[Worker {worker_id}] Successfully validated block {block_number}");
                         (true, None)
@@ -699,6 +758,9 @@ mod tests {
     /// Files in this directory should have `.w` extension and contain serialized
     /// SaltWitness data.
     const TEST_WITNESS_DIR: &str = "../../test_data/stateless/witness";
+
+    /// Path to the genesis configuration file for integration testing.
+    const TEST_GENESIS_FILE: &str = "../../genesis/genesis-6342.json";
 
     /// Context object containing pre-loaded test data for efficient RPC serving
     ///
@@ -1070,6 +1132,10 @@ mod tests {
         let (handle, url) = setup_mock_rpc_server(context).await;
         let client = Arc::new(RpcClient::new(&url).unwrap());
 
+        // Load chain spec using helper function
+        let chain_spec =
+            Arc::new(load_or_create_chain_spec(&validator_db, Some(TEST_GENESIS_FILE)).unwrap());
+
         // Create test configuration with faster intervals for testing
         let config = Arc::new(ChainSyncConfig {
             concurrent_workers: 1,
@@ -1077,7 +1143,7 @@ mod tests {
             ..ChainSyncConfig::default()
         });
 
-        chain_sync(client.clone(), validator_db, config)
+        chain_sync(client.clone(), validator_db, config, chain_spec)
             .await
             .unwrap();
 

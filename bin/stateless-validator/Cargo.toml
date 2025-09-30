@@ -8,6 +8,7 @@ name = "stateless-validator"
 path = "src/main.rs"
 
 [dependencies]
+alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-rpc-types-eth.workspace = true

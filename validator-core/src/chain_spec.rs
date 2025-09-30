@@ -7,10 +7,6 @@ use alloy_serde::OtherFields;
 use mega_evm::SpecId;
 use reth_ethereum_forks::{ChainHardforks, hardfork};
 use reth_optimism_chainspec::OpChainSpec;
-use std::sync::LazyLock;
-
-/// Chain ID for the EVM configuration
-pub const MEGA_CHAIN_ID: u64 = 6342;
 
 /// Default blob gas price update fraction for Cancun (from EIP-4844)
 pub const BLOB_GASPRICE_UPDATE_FRACTION: u64 = 3338477;
@@ -22,7 +18,8 @@ pub const BLOB_GASPRICE_UPDATE_FRACTION: u64 = 3338477;
 /// different block numbers or timestamps.
 #[derive(Default, Clone)]
 pub struct ChainSpec {
-    hardforks: ChainHardforks,
+    pub chain_id: u64,
+    pub hardforks: ChainHardforks,
 }
 
 impl EthereumHardforks for ChainSpec {
@@ -84,6 +81,7 @@ impl ChainSpec {
                 .unwrap_or_default()
                 .into_vec();
 
+        let chain_id = genesis.config.chain_id;
         let op_chain_spec = OpChainSpec::from_genesis(genesis);
 
         // extract op hardforks from parsed genesis
@@ -112,6 +110,7 @@ impl ChainSpec {
         all_hardforks.append(&mut op_hardforks);
 
         Self {
+            chain_id,
             hardforks: ChainHardforks::new(all_hardforks),
         }
     }
@@ -166,21 +165,13 @@ impl MegaethGenesisHardforks {
 }
 
 /// Hardforks configuration for MegaETH.
-pub static MEGA_MAINNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
-    ChainHardforks::new(vec![(
-        MegaethHardfork::MiniRex.boxed(),
-        ForkCondition::Timestamp(0),
-    )])
-});
-
-/// The ChainSpec for the MegaETH network .
-pub static CHAIN_SPEC: LazyLock<ChainSpec> = LazyLock::new(|| {
-    let mainnet_genesis_json = include_str!("../../genesis-6342.json");
-
-    // Parse the genesis JSON
-    let genesis: Genesis = serde_json::from_str(mainnet_genesis_json).unwrap();
-    ChainSpec::from_genesis(genesis)
-});
+pub static MEGA_MAINNET_HARDFORKS: std::sync::LazyLock<ChainHardforks> =
+    std::sync::LazyLock::new(|| {
+        ChainHardforks::new(vec![(
+            MegaethHardfork::MiniRex.boxed(),
+            ForkCondition::Timestamp(0),
+        )])
+    });
 
 #[cfg(test)]
 mod tests {

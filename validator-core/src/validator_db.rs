@@ -12,7 +12,7 @@
 //!
 //! ## Database Schema
 //!
-//! The database consists of 8 specialized tables:
+//! The database consists of 9 specialized tables:
 //! - `CANONICAL_CHAIN`: Local view of the canonical blockchain (BlockNumber → (BlockHash, PostStateRoot))
 //! - `REMOTE_CHAIN`: Remote chain used to guide chain advancement (BlockNumber → BlockHash)
 //! - `TASK_LIST`: Queue of pending validation tasks (BlockNumber, BlockHash) → ()
@@ -22,6 +22,7 @@
 //! - `VALIDATION_RESULTS`: Outcomes with block identifiers and status (BlockHash → ValidationResult)
 //! - `BLOCK_RECORDS`: Complete history including forks for efficient pruning (BlockNumber, BlockHash) → ()
 //! - `CONTRACTS`: On-demand contract bytecode cache (CodeHash → Bytecode)
+//! - `GENESIS_CONFIG`: Genesis configuration stored on first run (singleton key → Genesis JSON)
 //!
 //! ## Chain Synchronization
 //!
@@ -56,6 +57,7 @@
 //! - `add_contract_code()` - Cache contract bytecode needed during validation
 //! - `get_contract_code()` - Retrieve cached contract bytecode by code hash
 
+use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, Header};
 use op_alloy_rpc_types::Transaction;
@@ -169,6 +171,16 @@ const BLOCK_RECORDS: TableDefinition<(u64, [u8; 32]), ()> = TableDefinition::new
 /// Populated by workers via add_contract_code() when new bytecode is needed
 /// and retrieved via get_contract_code().
 const CONTRACTS: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("contracts");
+
+/// Genesis configuration for the chain.
+///
+/// **Schema:** Maps a singleton key (&str) to serialized Genesis (Vec<u8>)
+/// - Key: String "genesis" as &str
+/// - Value: Serialized Genesis JSON as Vec<u8>
+///
+/// Stores the genesis configuration on first run. Subsequent runs load from this table
+/// instead of requiring the genesis file again. Provides better UX and portability.
+const GENESIS_CONFIG: TableDefinition<&str, Vec<u8>> = TableDefinition::new("genesis_config");
 
 #[derive(Debug, Error)]
 pub enum ValidationDbError {
@@ -347,6 +359,49 @@ impl ValidatorDB {
         }
         write_txn.commit()?;
         Ok(())
+    }
+
+    /// Stores the genesis configuration in the database
+    ///
+    /// Serializes the Genesis object to JSON and stores it in the GENESIS_CONFIG table.
+    /// This is typically called on first run when --genesis-file is provided.
+    ///
+    /// # Arguments
+    /// * `genesis` - The Genesis configuration to store
+    ///
+    /// # Returns
+    /// * `Ok(())` - Genesis successfully stored
+    /// * `Err(ValidationDbError)` - Database or serialization error
+    pub fn store_genesis(&self, genesis: &Genesis) -> ValidationDbResult<()> {
+        let write_txn = self.database.begin_write()?;
+        {
+            let mut genesis_table = write_txn.open_table(GENESIS_CONFIG)?;
+            let serialized_genesis =
+                serde_json::to_vec(genesis).map_err(SerializationError::Json)?;
+            genesis_table.insert("genesis", serialized_genesis)?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Loads the genesis configuration from the database
+    ///
+    /// Retrieves and deserializes the Genesis object from the GENESIS_CONFIG table.
+    /// Returns None if no genesis has been stored yet.
+    ///
+    /// # Returns
+    /// * `Ok(Some(Genesis))` - Genesis successfully loaded
+    /// * `Ok(None)` - No genesis stored in database
+    /// * `Err(ValidationDbError)` - Database or deserialization error
+    pub fn load_genesis(&self) -> ValidationDbResult<Option<Genesis>> {
+        let read_txn = self.database.begin_read()?;
+        let genesis_table = read_txn.open_table(GENESIS_CONFIG)?;
+
+        genesis_table
+            .get("genesis")?
+            .map(|s| serde_json::from_slice(&s.value()).map_err(SerializationError::Json))
+            .transpose()
+            .map_err(Into::into)
     }
 
     /// Extends the canonical chain with the next validated block
