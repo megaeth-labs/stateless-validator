@@ -37,40 +37,60 @@ cargo build --release
 cargo run --bin stateless-validator -- \
   --data-dir /path/to/validator/data \
   --rpc-endpoint <public-rpc-endpoint> \
+  --genesis-file /path/to/genesis.json \
   --start-block <trusted-block-hash>
 ```
 
 **Required Arguments:**
-- `--data-dir` / `-d`: Directory for validator database and data files
-- `--rpc-endpoint` / `-r`: JSON-RPC API endpoint URL to retrieve block and witness data
+- `--data-dir`: Directory for validator database and data files
+- `--rpc-endpoint`: JSON-RPC API endpoint URL to retrieve block and witness data
 
 **Optional Arguments:**
+- `--genesis-file`: Path to genesis JSON file containing hardfork activation configuration (required on first run, stored in database for subsequent runs)
 - `--start-block`: Trusted block hash to initialize validation from (required for first-time setup)
 
 ### Getting Started
 
-The stateless validator requires a trusted starting point for security. On first run, you must specify a trusted block hash:
+The stateless validator requires a trusted starting point and hardfork configuration for security. On first run, you must specify both a genesis file and a trusted block hash:
 
 ```bash
-# Initialize from a trusted block (e.g., genesis or recent finalized block)
+# Initialize from genesis and a trusted block (e.g., genesis or recent finalized block)
 cargo run --bin stateless-validator -- \
   --data-dir ./validator-data \
   --rpc-endpoint https://your-rpc-endpoint.com \
+  --genesis-file ./genesis/genesis-6342.json \
   --start-block 0x1234567890abcdef...
 ```
 
 The validator will:
-1. Fetch the specified block from the RPC endpoint
-2. Initialize the canonical chain database with this trusted block
-3. Begin validation from this anchor point
+1. Load the genesis file and extract hardfork activation rules, then store this configuration in the database
+2. Fetch the specified block from the RPC endpoint
+3. Initialize the canonical chain database with this trusted block
+4. Begin validation from this anchor point, applying the appropriate EVM rules based on hardfork activation
 
-For subsequent runs, omit `--start-block` to resume from the existing database:
+For subsequent runs, you can omit both `--genesis-file` and `--start-block` to resume from the existing database:
 
 ```bash
 # Resume validation from existing database
 cargo run --bin stateless-validator -- \
   --data-dir ./validator-data \
   --rpc-endpoint https://your-rpc-endpoint.com
+```
+
+Alternatively, you can supply either or both flags again to reset the starting block or update the genesis configuration:
+
+```bash
+# Reset starting block while keeping existing genesis config
+cargo run --bin stateless-validator -- \
+  --data-dir ./validator-data \
+  --rpc-endpoint https://your-rpc-endpoint.com \
+  --start-block 0xnew_trusted_block_hash...
+
+# Update genesis config (e.g., after a hardfork)
+cargo run --bin stateless-validator -- \
+  --data-dir ./validator-data \
+  --rpc-endpoint https://your-rpc-endpoint.com \
+  --genesis-file ./genesis/updated-genesis.json
 ```
 
 
@@ -110,6 +130,7 @@ Data Storage:
 - `BLOCK_DATA`: Full block content and transactions (BlockHash → Block<Transaction>)
 - `WITNESSES`: SALT cryptographic witness data (BlockHash → SaltWitness)
 - `CONTRACTS`: On-demand contract bytecode cache (CodeHash → Bytecode)
+- `GENESIS_CONFIG`: Genesis configuration with hardfork activation rules (singleton key → Genesis JSON)
 
 
 ### Data Flow & Workflow
