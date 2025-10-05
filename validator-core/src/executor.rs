@@ -32,7 +32,7 @@ use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{Address, BlockHash, BlockNumber, keccak256, map::B256Map};
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
-use mega_evm::{BlockExecutionCtx, BlockExecutorFactory, EvmFactory, SpecId};
+use mega_evm::{BlockExecutionCtx, BlockExecutorFactory, EvmFactory, ExternalEnvOracle, SpecId};
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use op_revm::L1BlockInfo;
 use reth_trie_common::HashedStorage;
@@ -43,7 +43,9 @@ use revm::{
     primitives::{B256, KECCAK_EMPTY, U256},
     state::Bytecode,
 };
-use salt::{EphemeralSaltState, SaltWitness, StateRoot, Witness};
+use salt::{
+    BucketId, BucketMeta, EphemeralSaltState, SaltWitness, StateRoot, Witness, traits::StateReader,
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::SystemTime};
 use thiserror::Error;
@@ -51,7 +53,7 @@ use thiserror::Error;
 use crate::{
     chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec},
     data_types::{Account, PlainKey, PlainValue},
-    database::WitnessDatabase,
+    database::{WitnessDatabase, WitnessDatabaseError},
     mpt_witness::{self, ADDRESS_L2_TO_L1_MESSAGE_PASSER, MptWitness},
 };
 
@@ -114,6 +116,41 @@ pub struct ValidationResult {
     pub error_message: Option<String>,
     /// Timestamp when validation completed
     pub completed_at: SystemTime,
+}
+
+/// Oracle wrapper that owns the witness data so it satisfies the `'static` requirement
+/// imposed by the block executor factory.
+#[derive(Debug, Clone)]
+struct WitnessExternalEnvOracle {
+    block_number: BlockNumber,
+    witness: Witness,
+}
+
+impl WitnessExternalEnvOracle {
+    fn new(db: &WitnessDatabase<'_>) -> Self {
+        Self {
+            block_number: db.header.number,
+            witness: db.witness.clone(),
+        }
+    }
+}
+
+impl ExternalEnvOracle for WitnessExternalEnvOracle {
+    type Error = WitnessDatabaseError;
+
+    fn get_bucket_meta(
+        &self,
+        bucket_id: BucketId,
+        at_block: BlockNumber,
+    ) -> Result<BucketMeta, Self::Error> {
+        assert_eq!(
+            at_block, self.block_number,
+            "external env oracle queried for mismatched block"
+        );
+        self.witness
+            .metadata(bucket_id)
+            .map_err(|err| WitnessDatabaseError(err.to_string()))
+    }
 }
 
 /// Creates an EVM execution environment from a block header and chain specification.
@@ -202,7 +239,7 @@ fn replay_block(
 
     let executor_factory = BlockExecutorFactory::new(
         chain_spec.clone(),
-        EvmFactory::default(),
+        EvmFactory::new(WitnessExternalEnvOracle::new(db)),
         OpAlloyReceiptBuilder::default(),
     );
 
