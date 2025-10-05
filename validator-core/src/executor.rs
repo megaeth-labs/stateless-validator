@@ -30,14 +30,15 @@ use alloy_evm::{
 };
 use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
-use alloy_primitives::{BlockHash, BlockNumber};
+use alloy_primitives::{Address, BlockHash, BlockNumber, keccak256, map::B256Map};
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
 use mega_evm::{BlockExecutionCtx, BlockExecutorFactory, EvmFactory, SpecId};
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use op_revm::L1BlockInfo;
+use reth_trie_common::HashedStorage;
 use revm::{
     context::{BlockEnv, CfgEnv, ContextTr},
-    database::states::StateBuilder,
+    database::states::{CacheAccount, StateBuilder},
     handler::EvmTr,
     primitives::{B256, KECCAK_EMPTY, U256},
     state::Bytecode,
@@ -51,6 +52,7 @@ use crate::{
     chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec},
     data_types::{Account, PlainKey, PlainValue},
     database::WitnessDatabase,
+    mpt_witness::{self, ADDRESS_L2_TO_L1_MESSAGE_PASSER, MptWitness},
 };
 
 /// Errors that can occur during block validation.
@@ -58,6 +60,9 @@ use crate::{
 pub enum ValidationError {
     #[error("Witness proof verification failed: {0}")]
     WitnessVerificationFailed(#[source] salt::ProofError),
+
+    #[error("MPT witness verification failed: {0}")]
+    MptWitnessVerificationFailed(#[source] mpt_witness::MptWitnessError),
 
     #[error("Expecting full transaction data, only found hashes")]
     BlockIncomplete,
@@ -95,6 +100,10 @@ pub struct ValidationResult {
     pub pre_state_root: B256,
     /// The post-state root after block execution (from block header)
     pub post_state_root: B256,
+    /// The pre-withdrawl root from the mpt witness before block execution
+    pub pre_withdrawals_root: B256,
+    /// The post-withdrawal root after block execution (from block header)
+    pub post_withdrawals_root: B256,
     /// The block number that was validated
     pub block_number: BlockNumber,
     /// The block hash that was validated
@@ -181,7 +190,7 @@ fn replay_block(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
     db: &WitnessDatabase<'_>,
-) -> Result<HashMap<Vec<u8>, Option<Vec<u8>>>, ValidationError> {
+) -> Result<alloy_primitives::map::HashMap<Address, CacheAccount>, ValidationError> {
     // Extract full transaction data
     let BlockTransactions::Full(transactions) = &block.transactions else {
         return Err(ValidationError::BlockIncomplete);
@@ -233,33 +242,7 @@ fn replay_block(
         .apply_post_execution_changes()
         .map_err(ValidationError::BlockReplayFailed)?;
 
-    // Flatten Revm's CacheAccount format into plain key-value pairs
-    let mut state_updates = HashMap::default();
-    for (address, cached_account) in state.cache.accounts {
-        let (Some((account_info, storage)), _) = cached_account.into_components() else {
-            continue;
-        };
-
-        // Process account changes
-        let account = Account {
-            nonce: account_info.nonce,
-            balance: account_info.balance,
-            codehash: (account_info.code_hash != KECCAK_EMPTY).then_some(account_info.code_hash),
-        };
-
-        let account_key = PlainKey::Account(address).encode();
-        let account_value = (!account.is_empty()).then(|| PlainValue::Account(account).encode());
-        state_updates.insert(account_key, account_value);
-
-        // Process storage changes
-        for (slot, value) in storage {
-            let storage_key = PlainKey::Storage(address, B256::new(slot.to_be_bytes())).encode();
-            let storage_value = (!value.is_zero()).then(|| PlainValue::Storage(value).encode());
-            state_updates.insert(storage_key, storage_value);
-        }
-    }
-
-    Ok(state_updates)
+    Ok(state.cache.accounts.clone())
 }
 
 /// Validates a block by creating a witness, replaying transactions, and comparing state roots.
@@ -285,6 +268,7 @@ pub fn validate_block(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
     salt_witness: SaltWitness,
+    mpt_witness: MptWitness,
     contracts: &HashMap<B256, Bytecode>,
 ) -> Result<(), ValidationError> {
     // Verify witness proof against the current state root
@@ -299,7 +283,50 @@ pub fn validate_block(
         witness: &witness,
         contracts,
     };
-    let kv_updates = replay_block(chain_spec, block, &witness_db)?;
+    let accounts = replay_block(chain_spec, block, &witness_db)?;
+
+    let account = accounts.get(&ADDRESS_L2_TO_L1_MESSAGE_PASSER).cloned();
+    let maybe_storage_map = account.and_then(|a| a.account.map(|acc| acc.storage));
+
+    // Flatten Revm's CacheAccount format into plain key-value pairs
+    let mut kv_updates: HashMap<Vec<u8>, Option<Vec<u8>>> = HashMap::new();
+    for (address, cached_account) in accounts {
+        let (Some((account_info, storage)), _) = cached_account.into_components() else {
+            continue;
+        };
+
+        // Process account changes
+        let account = Account {
+            nonce: account_info.nonce,
+            balance: account_info.balance,
+            codehash: (account_info.code_hash != KECCAK_EMPTY).then_some(account_info.code_hash),
+        };
+
+        let account_key = PlainKey::Account(address).encode();
+        let account_value = (!account.is_empty()).then(|| PlainValue::Account(account).encode());
+        kv_updates.insert(account_key, account_value);
+
+        // Process storage changes
+        for (slot, value) in storage {
+            let storage_key = PlainKey::Storage(address, B256::new(slot.to_be_bytes())).encode();
+            let storage_value = (!value.is_zero()).then(|| PlainValue::Storage(value).encode());
+            kv_updates.insert(storage_key, storage_value);
+        }
+    }
+
+    let hashed_state = maybe_storage_map
+        .map(|storage_slots| HashedStorage {
+            wiped: false,
+            storage: storage_slots
+                .into_iter()
+                .map(|(k, v)| (keccak256(B256::from(k)), v))
+                .collect::<B256Map<_>>(),
+        })
+        .unwrap_or_default();
+
+    mpt_witness
+        .verify(block.header.withdrawals_root.unwrap(), hashed_state)
+        .map_err(ValidationError::MptWitnessVerificationFailed)?;
 
     // Update the SALT state
     let state_updates = EphemeralSaltState::new(&witness)

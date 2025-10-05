@@ -22,3 +22,4 @@ pub mod data_types;
 pub use data_types::{PlainKey, PlainValue};
 pub mod executor;
 pub use executor::{ValidationError, ValidationResult, validate_block};
+pub mod mpt_witness;

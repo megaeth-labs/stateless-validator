@@ -70,6 +70,7 @@ use thiserror::Error;
 use std::fmt;
 
 use crate::executor::{ValidationError, ValidationResult};
+use crate::mpt_witness::MptWitness;
 
 /// Stores our local view of the canonical chain.
 ///
@@ -137,6 +138,17 @@ const BLOCK_DATA: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("blo
 /// without full blockchain state. Retrieved alongside block data during
 /// get_next_task() for validation execution.
 const WITNESSES: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("witnesses");
+
+/// MPT witness data required for withdrawal validation.
+///
+/// **Schema:** Maps BlockHash ([u8; 32]) to serialized ExecutionWitness's state data (Vec<u8>)
+/// - Key: Block hash as BlockHash ([u8; 32])
+/// - Value: Serialized ExecutionWitness's state data as Vec<u8>
+///
+/// Contains cryptographic proofs and state information that enables withdrawal validation
+/// without full blockchain state. Retrieved alongside block data during
+/// get_next_task() for validation execution.
+const MPT_WITNESSES: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("mpt_witnesses");
 
 /// Outcomes of completed block validation attempts.
 ///
@@ -235,6 +247,7 @@ impl_database_error_from!(
 pub enum MissingDataKind {
     BlockData,
     Witness,
+    MPTWitness,
     ValidationResult,
 }
 
@@ -243,6 +256,7 @@ impl fmt::Display for MissingDataKind {
         let label = match self {
             MissingDataKind::BlockData => "block data",
             MissingDataKind::Witness => "witness",
+            MissingDataKind::MPTWitness => "mpt witness",
             MissingDataKind::ValidationResult => "validation result",
         };
         f.write_str(label)
@@ -293,6 +307,7 @@ impl ValidatorDB {
             let _ongoing_tasks = write_txn.open_table(ONGOING_TASKS)?;
             let _block_data = write_txn.open_table(BLOCK_DATA)?;
             let _witnesses = write_txn.open_table(WITNESSES)?;
+            let _mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
             let _validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
             let _block_records = write_txn.open_table(BLOCK_RECORDS)?;
             let _contracts = write_txn.open_table(CONTRACTS)?;
@@ -314,6 +329,7 @@ impl ValidatorDB {
         &self,
         block: &Block<Transaction>,
         witness: &SaltWitness,
+        mpt_witness: &MptWitness,
     ) -> ValidationDbResult<()> {
         let block_number = block.header.number;
         let block_hash = block.header.hash.0;
@@ -333,6 +349,11 @@ impl ValidatorDB {
             let mut witnesses = write_txn.open_table(WITNESSES)?;
             let serialized_witness = encode_to_vec(witness)?;
             witnesses.insert(block_hash, serialized_witness)?;
+
+            // ... and the mpt witness (MPT_WITNESSES)
+            let mut mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
+            let serialized_mpt_witness = encode_to_vec(mpt_witness)?;
+            mpt_witnesses.insert(block_hash, serialized_mpt_witness)?;
 
             // Records the block in the block registry (BLOCK_RECORDS)
             let mut block_records = write_txn.open_table(BLOCK_RECORDS)?;
@@ -591,7 +612,9 @@ impl ValidatorDB {
     /// - `Ok(Some((block, witness)))` - Next task with all required validation data
     /// - `Ok(None)` - No tasks available, worker should wait or exit
     /// - `Err(...)` - Database error, serialization failure, or missing block/witness data
-    pub fn get_next_task(&self) -> ValidationDbResult<Option<(Block<Transaction>, SaltWitness)>> {
+    pub fn get_next_task(
+        &self,
+    ) -> ValidationDbResult<Option<(Block<Transaction>, SaltWitness, MptWitness)>> {
         let write_txn = self.database.begin_write()?;
 
         let result = {
@@ -627,6 +650,7 @@ impl ValidatorDB {
                     // Load block data and witness
                     let block_data = write_txn.open_table(BLOCK_DATA)?;
                     let witnesses = write_txn.open_table(WITNESSES)?;
+                    let mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
 
                     let block = decode_block_from_slice(
                         &block_data
@@ -646,8 +670,17 @@ impl ValidatorDB {
                             })?
                             .value(),
                     );
+                    let mpt_witness = decode_from_slice(
+                        &mpt_witnesses
+                            .get(block_hash_bytes)?
+                            .ok_or_else(|| ValidationDbError::MissingData {
+                                kind: MissingDataKind::MPTWitness,
+                                block_hash,
+                            })?
+                            .value(),
+                    );
 
-                    Some((block, witness))
+                    Some((block, witness, mpt_witness))
                 }
                 None => None,
             }
@@ -758,6 +791,7 @@ impl ValidatorDB {
             let mut block_records = write_txn.open_table(BLOCK_RECORDS)?;
             let mut block_data = write_txn.open_table(BLOCK_DATA)?;
             let mut witnesses = write_txn.open_table(WITNESSES)?;
+            let mut mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
             let mut validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
 
             // Collect keys to remove (blocks older than before_block)
@@ -774,6 +808,7 @@ impl ValidatorDB {
                 block_records.remove((block_number, block_hash))?;
                 block_data.remove(block_hash)?;
                 witnesses.remove(block_hash)?;
+                mpt_witnesses.remove(block_hash)?;
                 validation_results.remove(block_hash)?;
             }
 

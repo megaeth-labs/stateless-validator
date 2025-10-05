@@ -10,6 +10,7 @@ use futures::future::try_join_all;
 use op_alloy_network::Optimism;
 use op_alloy_rpc_types::Transaction;
 use salt::SaltWitness;
+use validator_core::mpt_witness::MptWitness;
 
 /// RPC client for OP Stack nodes.
 ///
@@ -114,7 +115,7 @@ impl RpcClient {
     /// # Errors
     /// Returns error if block hash doesn't exist, witness unavailable, or
     /// witness data is corrupted and cannot be decoded.
-    pub async fn get_witness(&self, hash: B256) -> Result<SaltWitness> {
+    pub async fn get_witness(&self, hash: B256) -> Result<(SaltWitness, MptWitness)> {
         self.provider
             .client()
             .request("eth_getWitness", (format!("0x{}", hex::encode(hash)),))
@@ -122,7 +123,11 @@ impl RpcClient {
             .context(format!("get_witness for block {hash}"))
             .and_then(|data: Vec<u8>| {
                 bincode::serde::decode_from_slice(&data, bincode::config::legacy())
-                    .map(|(witness, _): (SaltWitness, usize)| witness)
+                    .map(
+                        |((salt_witness, mpt_witness), _): ((SaltWitness, MptWitness), usize)| {
+                            (salt_witness, mpt_witness)
+                        },
+                    )
                     .context(format!("Failed to decode witness for block {hash}"))
             })
     }

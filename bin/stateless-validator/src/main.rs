@@ -419,8 +419,9 @@ async fn remote_chain_tracker(
                         let block = client
                             .get_block(BlockId::Number(block_number.into()), true)
                             .await?;
-                        let witness = client.get_witness(block.header.hash).await?;
-                        db.add_validation_task(&block, &witness)?;
+                        let (salt_witness, mpt_witness) =
+                            client.get_witness(block.header.hash).await?;
+                        db.add_validation_task(&block, &salt_witness, &mpt_witness)?;
                         Ok::<Header, eyre::Error>(block.header)
                     })
                 }),
@@ -529,7 +530,7 @@ async fn validate_one(
     chain_spec: &ChainSpec,
 ) -> Result<bool> {
     match validator_db.get_next_task()? {
-        Some((block, witness)) => {
+        Some((block, witness, mpt_witness)) => {
             let block_number = block.header.number;
             info!("[Worker {}] Validating block {}", worker_id, block_number);
 
@@ -560,8 +561,9 @@ async fn validate_one(
 
             // Validate the given block
             let pre_state_root = B256::from(witness.state_root()?);
+            let pre_withdrawals_root = mpt_witness.withdrawals_root;
             let (success, error_message) =
-                match validate_block(chain_spec, &block, witness, &contracts) {
+                match validate_block(chain_spec, &block, witness, mpt_witness, &contracts) {
                     Ok(()) => {
                         info!("[Worker {worker_id}] Successfully validated block {block_number}");
                         (true, None)
@@ -572,11 +574,16 @@ async fn validate_one(
                     }
                 };
 
+            let block_hash = block.header.hash;
             validator_db.complete_validation(ValidationResult {
                 pre_state_root,
                 post_state_root: block.header.state_root,
+                pre_withdrawals_root,
+                post_withdrawals_root: block.header.withdrawals_root.ok_or(eyre::eyre!(
+                    "Withdrawals root not found in block {block_hash}"
+                ))?,
                 block_number,
-                block_hash: block.header.hash,
+                block_hash,
                 success,
                 error_message,
                 completed_at: SystemTime::now(),

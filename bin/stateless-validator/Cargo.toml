@@ -8,17 +8,23 @@ name = "stateless-validator"
 path = "src/main.rs"
 
 [dependencies]
+# alloy
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-rpc-types-eth.workspace = true
+
+# op
 op-alloy-network.workspace = true
 op-alloy-rpc-types.workspace = true
 
+# revm
 revm = { workspace = true, features = ["serde"] }
 
+# megaeth 
 salt.workspace = true
 
+# misc
 bincode.workspace = true
 clap.workspace = true
 eyre.workspace = true
