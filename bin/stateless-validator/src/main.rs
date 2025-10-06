@@ -177,6 +177,10 @@ async fn main() -> Result<()> {
                 block.header.number,
                 block.header.hash,
                 block.header.state_root,
+                block
+                    .header
+                    .withdrawals_root
+                    .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", block_hash))?,
             )
             .map_err(|e| anyhow!("Failed to reset anchor: {}", e))?;
 
@@ -841,13 +845,16 @@ mod tests {
 
         // Set the local chain tip to the first block in test data.
         let (block_num, block_hash) = context.min_block;
-        let state_root = context
+        let block = context
             .blocks_by_hash
             .get(&block_hash)
-            .ok_or_else(|| anyhow!("Local tip {block_hash} not found"))?
+            .ok_or_else(|| anyhow!("Local tip {block_hash} not found"))?;
+        let state_root = block.header.state_root;
+        let withdrawals_root = block
             .header
-            .state_root;
-        validator_db.reset_anchor_block(block_num, block_hash, state_root)?;
+            .withdrawals_root
+            .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", block_hash))?;
+        validator_db.reset_anchor_block(block_num, block_hash, state_root, withdrawals_root)?;
 
         // Populate CONTRACTS table with test contract bytecode
         let contracts = load_contracts(CONTRACTS_FILE);

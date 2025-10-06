@@ -86,6 +86,14 @@ pub enum ValidationError {
         actual: B256,
     },
 
+    #[error("Pre-withdrawals root mismatch: expecting {expected:?}, got {actual:?}")]
+    PreWithdrawalsRootMismatch {
+        /// The post-withdrawals root of the parent block
+        expected: B256,
+        /// The pre-withdrawals root of the witness
+        actual: B256,
+    },
+
     #[error("State root mismatch: claimed {claimed}, got {actual}")]
     StateRootMismatch {
         /// The computed state root from transaction execution
