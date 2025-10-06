@@ -24,10 +24,10 @@ const BRANCH_NODE_CHILDREN: usize = 16;
 pub const ADDRESS_L2_TO_L1_MESSAGE_PASSER: Address =
     address!("0x4200000000000000000000000000000000000016");
 
-/// Represents the execution witness of the withdrawal account
+/// Represents the execution witness of the withdrawal contract
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MptWitness {
-    /// The root hash of the withdrawal account storage trie
+    /// The root hash of the L2ToL1MessagePasser contract storage trie
     pub withdrawals_root: B256,
     /// The witness trie nodes of the withdrawal account storage trie
     pub state: Vec<Bytes>,

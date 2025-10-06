@@ -43,9 +43,7 @@ use revm::{
     primitives::{B256, KECCAK_EMPTY, U256},
     state::Bytecode,
 };
-use salt::{
-    BucketId, BucketMeta, EphemeralSaltState, SaltWitness, StateRoot, Witness, traits::StateReader,
-};
+use salt::{BucketId, EphemeralSaltState, SaltWitness, StateRoot, Witness, traits::StateReader};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::SystemTime};
 use thiserror::Error;
@@ -146,17 +144,18 @@ impl WitnessExternalEnvOracle {
 impl ExternalEnvOracle for WitnessExternalEnvOracle {
     type Error = WitnessDatabaseError;
 
-    fn get_bucket_meta(
+    fn get_bucket_capacity(
         &self,
         bucket_id: BucketId,
         at_block: BlockNumber,
-    ) -> Result<BucketMeta, Self::Error> {
+    ) -> Result<u64, Self::Error> {
         assert_eq!(
             at_block, self.block_number,
             "external env oracle queried for mismatched block"
         );
         self.witness
             .metadata(bucket_id)
+            .map(|meta| meta.capacity)
             .map_err(|err| WitnessDatabaseError(err.to_string()))
     }
 }
