@@ -565,7 +565,7 @@ async fn validate_one(
 
             // Validate the given block
             let pre_state_root = B256::from(witness.state_root()?);
-            let pre_withdrawals_root = mpt_witness.withdrawals_root;
+            let pre_withdrawals_root = mpt_witness.storage_root;
             let (success, error_message) =
                 match validate_block(chain_spec, &block, witness, mpt_witness, &contracts) {
                     Ok(()) => {

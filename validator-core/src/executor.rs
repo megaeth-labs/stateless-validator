@@ -30,12 +30,11 @@ use alloy_evm::{
 };
 use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
-use alloy_primitives::{Address, BlockHash, BlockNumber, keccak256, map::B256Map};
+use alloy_primitives::{Address, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
 use mega_evm::{BlockExecutionCtx, BlockExecutorFactory, EvmFactory, SpecId};
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use op_revm::L1BlockInfo;
-use reth_trie_common::HashedStorage;
 use revm::{
     context::{BlockEnv, CfgEnv, ContextTr},
     database::states::{CacheAccount, StateBuilder},
@@ -61,8 +60,8 @@ pub enum ValidationError {
     #[error("Witness proof verification failed: {0}")]
     WitnessVerificationFailed(#[source] salt::ProofError),
 
-    #[error("MPT witness verification failed: {0}")]
-    MptWitnessVerificationFailed(#[source] mpt_witness::MptWitnessError),
+    #[error("Failed to validate changes to the withdrawal contract: {0}")]
+    WithdrawalValidationFailed(#[source] mpt_witness::WithdrawalValidationError),
 
     #[error("Failed to construct mega-evm environment oracle: {0}")]
     EnvOracleConstructionFailed(#[source] WitnessDatabaseError),
@@ -301,8 +300,8 @@ pub fn validate_block(
     };
     let accounts = replay_block(chain_spec, block, &witness_db, env_oracle)?;
 
-    let account = accounts.get(&ADDRESS_L2_TO_L1_MESSAGE_PASSER).cloned();
-    let maybe_storage_map = account.and_then(|a| a.account.map(|acc| acc.storage));
+    // Filter out changes within the message passer contract
+    let withdrawal_contract = accounts.get(&ADDRESS_L2_TO_L1_MESSAGE_PASSER).cloned();
 
     // Flatten Revm's CacheAccount format into plain key-value pairs
     let mut kv_updates: HashMap<Vec<u8>, Option<Vec<u8>>> = HashMap::new();
@@ -330,20 +329,6 @@ pub fn validate_block(
         }
     }
 
-    let hashed_state = maybe_storage_map
-        .map(|storage_slots| HashedStorage {
-            wiped: false,
-            storage: storage_slots
-                .into_iter()
-                .map(|(k, v)| (keccak256(B256::from(k)), v))
-                .collect::<B256Map<_>>(),
-        })
-        .unwrap_or_default();
-
-    mpt_witness
-        .verify(block.header.withdrawals_root.unwrap(), hashed_state)
-        .map_err(ValidationError::MptWitnessVerificationFailed)?;
-
     // Update the SALT state
     let state_updates = EphemeralSaltState::new(&witness)
         .update(&kv_updates)
@@ -353,6 +338,11 @@ pub fn validate_block(
     let (state_root, _) = StateRoot::new(&witness)
         .update_fin(&state_updates)
         .map_err(ValidationError::TrieUpdateFailed)?;
+
+    // Check if computed withdrawals root matches the claimed one
+    mpt_witness
+        .verify(&block.header, withdrawal_contract)
+        .map_err(ValidationError::WithdrawalValidationFailed)?;
 
     // Check if computed state root matches claimed state root
     let state_root = B256::from(state_root);
