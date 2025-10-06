@@ -10,7 +10,7 @@ use futures::future::try_join_all;
 use op_alloy_network::Optimism;
 use op_alloy_rpc_types::Transaction;
 use salt::SaltWitness;
-use validator_core::mpt_witness::MptWitness;
+use validator_core::withdrawals::MptWitness;
 
 /// RPC client for OP Stack nodes.
 ///

@@ -51,7 +51,7 @@ use crate::{
     chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec},
     data_types::{Account, PlainKey, PlainValue},
     database::{WitnessDatabase, WitnessDatabaseError, WitnessEnvOracle},
-    mpt_witness::{self, ADDRESS_L2_TO_L1_MESSAGE_PASSER, MptWitness},
+    withdrawals::{self, ADDRESS_L2_TO_L1_MESSAGE_PASSER, MptWitness},
 };
 
 /// Errors that can occur during block validation.
@@ -61,7 +61,7 @@ pub enum ValidationError {
     WitnessVerificationFailed(#[source] salt::ProofError),
 
     #[error("Failed to validate changes to the withdrawal contract: {0}")]
-    WithdrawalValidationFailed(#[source] mpt_witness::WithdrawalValidationError),
+    WithdrawalValidationFailed(#[source] withdrawals::WithdrawalValidationError),
 
     #[error("Failed to construct mega-evm environment oracle: {0}")]
     EnvOracleConstructionFailed(#[source] WitnessDatabaseError),

@@ -70,7 +70,7 @@ use thiserror::Error;
 use std::fmt;
 
 use crate::executor::{ValidationError, ValidationResult};
-use crate::mpt_witness::MptWitness;
+use crate::withdrawals::MptWitness;
 
 /// Stores our local view of the canonical chain.
 ///
