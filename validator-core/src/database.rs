@@ -6,15 +6,19 @@
 
 use crate::data_types::{PlainKey, PlainValue};
 use alloy_eips::eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS};
-use alloy_primitives::{Address, B256};
+use alloy_primitives::{Address, B256, BlockNumber};
 use alloy_rpc_types_eth::Header;
+use mega_evm::ExternalEnvOracle;
 use revm::{
     DatabaseRef,
     database::DBErrorMarker,
     primitives::{Bytes, KECCAK_EMPTY, U256},
     state::{AccountInfo, Bytecode},
 };
-use salt::{EphemeralSaltState, Witness};
+use salt::{
+    BucketId, BucketMeta, EphemeralSaltState, METADATA_KEYS_RANGE, SaltKey, SaltValue, SaltWitness,
+    Witness, bucket_id_from_metadata_key,
+};
 use std::collections::HashMap;
 
 /// Error type for witness database operations
@@ -156,5 +160,138 @@ impl<'a> DatabaseRef for WitnessDatabase<'a> {
             U256::from(number % HISTORY_SERVE_WINDOW as u64),
         )
         .map(|res| res.into())
+    }
+}
+
+/// External environment oracle backed by witness data.
+///
+/// This oracle provides bucket capacity information for EVM execution
+/// by extracting metadata from the witness at construction time.
+#[derive(Debug, Clone)]
+pub struct WitnessEnvOracle {
+    block_number: BlockNumber,
+    bucket_capacities: HashMap<BucketId, u64>,
+}
+
+impl WitnessEnvOracle {
+    /// Creates a new environment oracle from a SALT witness.
+    ///
+    /// Extracts bucket capacity metadata from the witness to provide efficient
+    /// capacity lookups during EVM execution. Only metadata buckets are scanned
+    /// using a range query.
+    ///
+    /// # Arguments
+    ///
+    /// * `salt_witness` - The SALT witness containing bucket metadata
+    /// * `block_number` - The block number for validation checks
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(WitnessEnvOracle)` if all metadata is valid, or an error if:
+    /// - Any metadata key has a `None` value (malformed witness)
+    /// - Metadata cannot be parsed as `BucketMeta` (corrupt witness)
+    ///
+    /// # Errors
+    ///
+    /// This method enforces strict witness validation and will fail if:
+    /// - A metadata key is present but has no value
+    /// - A metadata value cannot be deserialized into valid `BucketMeta`
+    pub fn new(
+        salt_witness: &SaltWitness,
+        block_number: BlockNumber,
+    ) -> Result<Self, WitnessDatabaseError> {
+        let bucket_capacities = salt_witness
+            .kvs
+            .range(METADATA_KEYS_RANGE)
+            .map(|(key, value)| Self::parse_metadata_entry(key, value))
+            .collect::<Result<HashMap<_, _>, _>>()?;
+
+        Ok(Self {
+            block_number,
+            bucket_capacities,
+        })
+    }
+
+    /// Parses a single metadata entry from the witness.
+    fn parse_metadata_entry(
+        key: &SaltKey,
+        value: &Option<SaltValue>,
+    ) -> Result<(BucketId, u64), WitnessDatabaseError> {
+        let bucket_id = bucket_id_from_metadata_key(*key);
+
+        let salt_value = value.as_ref().ok_or_else(|| {
+            WitnessDatabaseError(format!("metadata is None for bucket {bucket_id}"))
+        })?;
+
+        let meta: BucketMeta = salt_value.try_into().map_err(|e| {
+            WitnessDatabaseError(format!("bad metadata for bucket {bucket_id}: {e}"))
+        })?;
+
+        Ok((bucket_id, meta.capacity))
+    }
+}
+
+impl ExternalEnvOracle for WitnessEnvOracle {
+    type Error = WitnessDatabaseError;
+
+    fn get_bucket_capacity(
+        &self,
+        bucket_id: BucketId,
+        at_block: BlockNumber,
+    ) -> Result<u64, Self::Error> {
+        if at_block != self.block_number {
+            return Err(WitnessDatabaseError(format!(
+                "block mismatch: expected {}, got {}",
+                self.block_number, at_block
+            )));
+        }
+
+        self.bucket_capacities
+            .get(&bucket_id)
+            .copied()
+            .ok_or_else(|| {
+                WitnessDatabaseError(format!("Capacity of bucket {bucket_id} not in witness"))
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies successful parsing of valid bucket metadata.
+    #[test]
+    fn test_parse_metadata_entry_valid() {
+        let meta = BucketMeta {
+            nonce: 42,
+            capacity: 1024,
+            used: None,
+        };
+        let key = SaltKey::from((256u32, 0u64));
+
+        let (bucket_id, capacity) =
+            WitnessEnvOracle::parse_metadata_entry(&key, &Some(meta.into())).unwrap();
+
+        assert_eq!(bucket_id, 65536);
+        assert_eq!(capacity, 1024);
+    }
+
+    /// Verifies error handling when metadata value is None.
+    #[test]
+    fn test_parse_metadata_entry_none_value() {
+        let key = SaltKey::from((256u32, 0u64));
+        let err = WitnessEnvOracle::parse_metadata_entry(&key, &None).unwrap_err();
+        assert!(err.0.contains("metadata is None for bucket 65536"));
+    }
+
+    /// Verifies error handling when metadata cannot be deserialized.
+    #[test]
+    fn test_parse_metadata_entry_invalid_metadata() {
+        let key = SaltKey::from((256u32, 0u64));
+        let invalid_value = SaltValue::new(&[1, 2, 3], &[]);
+
+        let err = WitnessEnvOracle::parse_metadata_entry(&key, &Some(invalid_value)).unwrap_err();
+
+        assert!(err.0.contains("bad metadata for bucket 65536"));
     }
 }

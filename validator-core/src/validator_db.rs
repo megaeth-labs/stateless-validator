@@ -80,6 +80,7 @@ use crate::mpt_witness::MptWitness;
 ///
 /// Updated by main orchestrator via grow_local_chain() and rollback_chain().
 /// Only successfully validated blocks can be added to this chain.
+#[allow(clippy::type_complexity)]
 const CANONICAL_CHAIN: TableDefinition<u64, ([u8; 32], [u8; 32], [u8; 32])> =
     TableDefinition::new("canonical_chain");
 

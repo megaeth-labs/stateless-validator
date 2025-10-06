@@ -32,7 +32,7 @@ use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{Address, BlockHash, BlockNumber, keccak256, map::B256Map};
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
-use mega_evm::{BlockExecutionCtx, BlockExecutorFactory, EvmFactory, ExternalEnvOracle, SpecId};
+use mega_evm::{BlockExecutionCtx, BlockExecutorFactory, EvmFactory, SpecId};
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use op_revm::L1BlockInfo;
 use reth_trie_common::HashedStorage;
@@ -43,7 +43,7 @@ use revm::{
     primitives::{B256, KECCAK_EMPTY, U256},
     state::Bytecode,
 };
-use salt::{BucketId, EphemeralSaltState, SaltWitness, StateRoot, Witness, traits::StateReader};
+use salt::{EphemeralSaltState, SaltWitness, StateRoot, Witness};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::SystemTime};
 use thiserror::Error;
@@ -51,7 +51,7 @@ use thiserror::Error;
 use crate::{
     chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec},
     data_types::{Account, PlainKey, PlainValue},
-    database::{WitnessDatabase, WitnessDatabaseError},
+    database::{WitnessDatabase, WitnessDatabaseError, WitnessEnvOracle},
     mpt_witness::{self, ADDRESS_L2_TO_L1_MESSAGE_PASSER, MptWitness},
 };
 
@@ -63,6 +63,9 @@ pub enum ValidationError {
 
     #[error("MPT witness verification failed: {0}")]
     MptWitnessVerificationFailed(#[source] mpt_witness::MptWitnessError),
+
+    #[error("Failed to construct mega-evm environment oracle: {0}")]
+    EnvOracleConstructionFailed(#[source] WitnessDatabaseError),
 
     #[error("Expecting full transaction data, only found hashes")]
     BlockIncomplete,
@@ -122,42 +125,6 @@ pub struct ValidationResult {
     pub error_message: Option<String>,
     /// Timestamp when validation completed
     pub completed_at: SystemTime,
-}
-
-/// Oracle wrapper that owns the witness data so it satisfies the `'static` requirement
-/// imposed by the block executor factory.
-#[derive(Debug, Clone)]
-struct WitnessExternalEnvOracle {
-    block_number: BlockNumber,
-    witness: Witness,
-}
-
-impl WitnessExternalEnvOracle {
-    fn new(db: &WitnessDatabase<'_>) -> Self {
-        Self {
-            block_number: db.header.number,
-            witness: db.witness.clone(),
-        }
-    }
-}
-
-impl ExternalEnvOracle for WitnessExternalEnvOracle {
-    type Error = WitnessDatabaseError;
-
-    fn get_bucket_capacity(
-        &self,
-        bucket_id: BucketId,
-        at_block: BlockNumber,
-    ) -> Result<u64, Self::Error> {
-        assert_eq!(
-            at_block, self.block_number,
-            "external env oracle queried for mismatched block"
-        );
-        self.witness
-            .metadata(bucket_id)
-            .map(|meta| meta.capacity)
-            .map_err(|err| WitnessDatabaseError(err.to_string()))
-    }
 }
 
 /// Creates an EVM execution environment from a block header and chain specification.
@@ -234,6 +201,7 @@ fn replay_block(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
     db: &WitnessDatabase<'_>,
+    env_oracle: WitnessEnvOracle,
 ) -> Result<alloy_primitives::map::HashMap<Address, CacheAccount>, ValidationError> {
     // Extract full transaction data
     let BlockTransactions::Full(transactions) = &block.transactions else {
@@ -246,7 +214,7 @@ fn replay_block(
 
     let executor_factory = BlockExecutorFactory::new(
         chain_spec.clone(),
-        EvmFactory::new(WitnessExternalEnvOracle::new(db)),
+        EvmFactory::new(env_oracle),
         OpAlloyReceiptBuilder::default(),
     );
 
@@ -315,6 +283,10 @@ pub fn validate_block(
     mpt_witness: MptWitness,
     contracts: &HashMap<B256, Bytecode>,
 ) -> Result<(), ValidationError> {
+    // Create external environment oracle from salt witness
+    let env_oracle = WitnessEnvOracle::new(&salt_witness, block.header.number)
+        .map_err(ValidationError::EnvOracleConstructionFailed)?;
+
     // Verify witness proof against the current state root
     let witness = Witness::from(salt_witness);
     witness
@@ -327,7 +299,7 @@ pub fn validate_block(
         witness: &witness,
         contracts,
     };
-    let accounts = replay_block(chain_spec, block, &witness_db)?;
+    let accounts = replay_block(chain_spec, block, &witness_db, env_oracle)?;
 
     let account = accounts.get(&ADDRESS_L2_TO_L1_MESSAGE_PASSER).cloned();
     let maybe_storage_map = account.and_then(|a| a.account.map(|acc| acc.storage));
