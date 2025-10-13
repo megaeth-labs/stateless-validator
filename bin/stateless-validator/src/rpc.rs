@@ -2,7 +2,7 @@
 //!
 //! Fetches contract bytecode, blocks, and SALT witness data from OP Stack nodes
 //! when not present in witness files.
-use alloy_primitives::{Address, B256, Bytes, hex};
+use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
 use eyre::{Context, Result, eyre};
@@ -118,19 +118,11 @@ impl RpcClient {
     /// # Errors
     /// Returns error if block hash doesn't exist, witness unavailable, or
     /// witness data is corrupted and cannot be decoded.
-    pub async fn get_witness(&self, hash: B256) -> Result<SaltWitness> {
+    pub async fn get_witness(&self, number: u64, hash: B256) -> Result<SaltWitness> {
         self.witness_provider
             .client()
-            .request(
-                "mega_getBlockWitness",
-                (format!("0x{}", hex::encode(hash)),),
-            )
+            .request("mega_getBlockWitness", (number.to_string(), hash))
             .await
-            .context(format!("get_witness for block {hash}"))
-            .and_then(|data: Vec<u8>| {
-                bincode::serde::decode_from_slice(&data, bincode::config::legacy())
-                    .map(|(witness, _): (SaltWitness, usize)| witness)
-                    .context(format!("Failed to decode witness for block {hash}"))
-            })
+            .map_err(|e| eyre!("Failed to get witness for block {hash}: {e}"))
     }
 }

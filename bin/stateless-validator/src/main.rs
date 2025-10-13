@@ -424,7 +424,9 @@ async fn remote_chain_tracker(
                         let block = client
                             .get_block(BlockId::Number(block_number.into()), true)
                             .await?;
-                        let witness = client.get_witness(block.header.hash).await?;
+                        let witness = client
+                            .get_witness(block.header.number, block.header.hash)
+                            .await?;
                         db.add_validation_task(&block, &witness)?;
                         Ok::<Header, eyre::Error>(block.header)
                     })
@@ -906,7 +908,7 @@ mod tests {
 
         module
             .register_method("mega_getBlockWitness", |params, context, _| {
-                let (hash_str,): (String,) = params.parse().unwrap();
+                let (_number_str, hash_str): (String, String) = params.parse().unwrap();
 
                 // Parse hash string to BlockHash
                 let block_hash = parse_block_hash(&hash_str).map_err(|e| {
@@ -914,23 +916,16 @@ mod tests {
                 })?;
 
                 // Look up witness data by block hash
-                match context.witness_data.get(&block_hash) {
-                    Some(salt_witness) => {
-                        // Serialize SaltWitness back to Vec<u8> for RPC response
-                        match bincode::serde::encode_to_vec(salt_witness, bincode::config::legacy())
-                        {
-                            Ok(witness_bytes) => Ok(witness_bytes),
-                            Err(e) => Err(make_rpc_error(
-                                CALL_EXECUTION_FAILED_CODE,
-                                format!("Failed to serialize SaltWitness: {e}"),
-                            )),
-                        }
-                    }
-                    None => Err(make_rpc_error(
-                        CALL_EXECUTION_FAILED_CODE,
-                        format!("Witness for block {hash_str} not found"),
-                    )),
-                }
+                context
+                    .witness_data
+                    .get(&block_hash)
+                    .cloned()
+                    .ok_or_else(|| {
+                        make_rpc_error(
+                            CALL_EXECUTION_FAILED_CODE,
+                            format!("Witness for block {hash_str} not found"),
+                        )
+                    })
             })
             .unwrap();
 
@@ -1135,6 +1130,7 @@ mod tests {
         let sync_target = Some(context.max_block.0);
         let validator_db = setup_test_db(&context).unwrap();
         let (handle, url) = setup_mock_rpc_server(context).await;
+        info!("url: {}", url);
         let client = Arc::new(RpcClient::new(&url, &url).unwrap());
 
         // Load chain spec using helper function
@@ -1147,6 +1143,7 @@ mod tests {
             sync_target,
             ..ChainSyncConfig::default()
         });
+        info!("=== start chain sync ===");
 
         chain_sync(client.clone(), validator_db, config, chain_spec)
             .await
