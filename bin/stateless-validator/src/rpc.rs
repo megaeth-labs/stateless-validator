@@ -19,6 +19,8 @@ use salt::SaltWitness;
 pub struct RpcClient {
     /// OP Stack RPC provider.
     pub provider: RootProvider<Optimism>,
+    /// MegaETH RPC provider.
+    pub witness_provider: RootProvider,
 }
 
 impl RpcClient {
@@ -32,10 +34,12 @@ impl RpcClient {
     ///
     /// # Errors
     /// Returns error if the API URL is malformed or invalid.
-    pub fn new(api: &str) -> Result<Self> {
+    pub fn new(rpc_api: &str, witness_api: &str) -> Result<Self> {
         Ok(Self {
             provider: ProviderBuilder::<_, _, Optimism>::default()
-                .connect_http(api.parse().context("Failed to parse API URL")?),
+                .connect_http(rpc_api.parse().context("Failed to parse API URL")?),
+            witness_provider: ProviderBuilder::default()
+                .connect_http(witness_api.parse().context("Failed to parse API URL")?),
         })
     }
 
@@ -115,9 +119,12 @@ impl RpcClient {
     /// Returns error if block hash doesn't exist, witness unavailable, or
     /// witness data is corrupted and cannot be decoded.
     pub async fn get_witness(&self, hash: B256) -> Result<SaltWitness> {
-        self.provider
+        self.witness_provider
             .client()
-            .request("eth_getWitness", (format!("0x{}", hex::encode(hash)),))
+            .request(
+                "mega_getBlockWitness",
+                (format!("0x{}", hex::encode(hash)),),
+            )
             .await
             .context(format!("get_witness for block {hash}"))
             .and_then(|data: Vec<u8>| {

@@ -128,6 +128,10 @@ struct CommandLineArgs {
     #[clap(long)]
     rpc_endpoint: String,
 
+    /// The URL of the MegaETH JSON-RPC API endpoint for fetching witness data.
+    #[clap(long)]
+    witness_endpoint: String,
+
     /// Optional trusted block hash to start validation from.
     #[clap(long)]
     start_block: Option<String>,
@@ -146,13 +150,14 @@ async fn main() -> Result<()> {
 
     info!("[Main] Data directory: {}", args.data_dir);
     info!("[Main] RPC endpoint: {}", args.rpc_endpoint);
+    info!("[Main] Witness endpoint: {}", args.witness_endpoint);
     if let Some(ref genesis_file) = args.genesis_file {
         info!("[Main] Genesis file: {}", genesis_file);
     }
 
     let work_dir = PathBuf::from(args.data_dir);
 
-    let client = Arc::new(RpcClient::new(&args.rpc_endpoint)?);
+    let client = Arc::new(RpcClient::new(&args.rpc_endpoint, &args.witness_endpoint)?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
 
     // Load chain spec from file (first run) or database (subsequent runs)
@@ -900,7 +905,7 @@ mod tests {
             .unwrap();
 
         module
-            .register_method("eth_getWitness", |params, context, _| {
+            .register_method("mega_getBlockWitness", |params, context, _| {
                 let (hash_str,): (String,) = params.parse().unwrap();
 
                 // Parse hash string to BlockHash
@@ -1130,7 +1135,7 @@ mod tests {
         let sync_target = Some(context.max_block.0);
         let validator_db = setup_test_db(&context).unwrap();
         let (handle, url) = setup_mock_rpc_server(context).await;
-        let client = Arc::new(RpcClient::new(&url).unwrap());
+        let client = Arc::new(RpcClient::new(&url, &url).unwrap());
 
         // Load chain spec using helper function
         let chain_spec =
