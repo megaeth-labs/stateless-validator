@@ -109,15 +109,15 @@ impl RpcClient {
     /// Gets execution witness data for a specific block.
     ///
     /// # Arguments
+    /// * `number` - Block number to fetch witness data for
     /// * `hash` - Block hash to fetch witness data for
     ///
     /// # Returns
-    /// Decoded witness containing state access patterns and execution traces
+    /// [`SaltWitness`] containing state access patterns and execution traces
     /// required for stateless validation.
     ///
     /// # Errors
-    /// Returns error if block hash doesn't exist, witness unavailable, or
-    /// witness data is corrupted and cannot be decoded.
+    /// Returns error if block hash doesn't exist, witness unavailable
     pub async fn get_witness(&self, number: u64, hash: B256) -> Result<SaltWitness> {
         self.witness_provider
             .client()
