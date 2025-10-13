@@ -1130,7 +1130,6 @@ mod tests {
         let sync_target = Some(context.max_block.0);
         let validator_db = setup_test_db(&context).unwrap();
         let (handle, url) = setup_mock_rpc_server(context).await;
-        info!("url: {}", url);
         let client = Arc::new(RpcClient::new(&url, &url).unwrap());
 
         // Load chain spec using helper function
@@ -1143,7 +1142,6 @@ mod tests {
             sync_target,
             ..ChainSyncConfig::default()
         });
-        info!("=== start chain sync ===");
 
         chain_sync(client.clone(), validator_db, config, chain_spec)
             .await
