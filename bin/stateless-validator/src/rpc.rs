@@ -1,7 +1,4 @@
 //! RPC client for fetching missing data during stateless validation.
-//!
-//! Fetches contract bytecode, blocks, and SALT witness data from OP Stack nodes
-//! when not present in witness files.
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
@@ -21,39 +18,35 @@ pub struct LastValidatedBlock {
     pub parent_hash: B256,
 }
 
-/// RPC client for OP Stack nodes.
+/// RPC client for MegaETH blockchain data.
 ///
-/// Fetches missing contract bytecode, blocks, and witness data during stateless validation.
-/// Executes requests concurrently for performance.
+/// Fetches contract bytecode, blocks, and witness data during stateless validation.
 #[derive(Debug, Clone)]
 pub struct RpcClient {
-    /// OP Stack RPC provider.
-    pub provider: RootProvider<Optimism>,
-    /// MegaETH RPC provider.
+    /// Upstream MegaETH node providing blocks and contract bytecode.
+    pub data_provider: RootProvider<Optimism>,
+    /// Witness provider for fetching SALT witness data.
     pub witness_provider: RootProvider,
-    /// coordinator RPC provider.
-    pub coordinator_provider: RootProvider,
 }
 
 impl RpcClient {
-    /// Creates a new RPC client connected to an Ethereum node.
+    /// Creates a new RPC client connected to MegaETH blockchain nodes.
     ///
     /// # Arguments
-    /// * `api` - HTTP URL of the Ethereum RPC endpoint (e.g., "http://localhost:8545")
+    /// * `data_api` - HTTP URL of the standard JSON-RPC endpoint for blocks and contract data
+    /// * `witness_api` - HTTP URL of the witness RPC endpoint for SALT witness data
     ///
     /// # Returns
-    /// Configured RPC client ready to make requests to the Optimism network.
+    /// Configured RPC client ready to make requests to the MegaETH blockchain.
     ///
     /// # Errors
-    /// Returns error if the API URL is malformed or invalid.
-    pub fn new(rpc_api: &str, witness_api: &str, coordinator_api: &str) -> Result<Self> {
+    /// Returns error if either API URL is malformed or invalid.
+    pub fn new(data_api: &str, witness_api: &str) -> Result<Self> {
         Ok(Self {
-            provider: ProviderBuilder::<_, _, Optimism>::default()
-                .connect_http(rpc_api.parse().context("Failed to parse API URL")?),
+            data_provider: ProviderBuilder::<_, _, Optimism>::default()
+                .connect_http(data_api.parse().context("Failed to parse API URL")?),
             witness_provider: ProviderBuilder::default()
                 .connect_http(witness_api.parse().context("Failed to parse API URL")?),
-            coordinator_provider: ProviderBuilder::default()
-                .connect_http(coordinator_api.parse().context("Failed to parse API URL")?),
         })
     }
 
@@ -75,7 +68,7 @@ impl RpcClient {
         block_number: BlockNumberOrTag,
     ) -> Result<Vec<Bytes>> {
         try_join_all(addresses.iter().map(|&addr| async move {
-            self.provider
+            self.data_provider
                 .get_code_at(addr)
                 .block_id(block_number.into())
                 .await
@@ -99,9 +92,9 @@ impl RpcClient {
     /// Returns error if block doesn't exist or RPC call fails.
     pub async fn get_block(&self, block_id: BlockId, full_txs: bool) -> Result<Block<Transaction>> {
         let block = if full_txs {
-            self.provider.get_block(block_id).full().await?
+            self.data_provider.get_block(block_id).full().await?
         } else {
-            self.provider.get_block(block_id).await?
+            self.data_provider.get_block(block_id).await?
         };
         block.ok_or_else(|| eyre!("Block {:?} not found", block_id))
     }
@@ -114,7 +107,7 @@ impl RpcClient {
     /// # Errors
     /// Returns error if unable to connect to the blockchain or RPC fails.
     pub async fn get_latest_block_number(&self) -> Result<u64> {
-        self.provider
+        self.data_provider
             .get_block_number()
             .await
             .context("Failed to get block number")
@@ -141,7 +134,7 @@ impl RpcClient {
     }
 
     pub async fn set_validated_block(&self, number: u64, hash: B256) -> Result<bool> {
-        self.coordinator_provider
+        self.data_provider
             .client()
             .request("mega_setValidatedBlock", (number, hash))
             .await
@@ -149,7 +142,7 @@ impl RpcClient {
     }
 
     pub async fn get_last_validated_block(&self) -> Result<Option<LastValidatedBlock>> {
-        self.coordinator_provider
+        self.data_provider
             .client()
             .request::<(), Option<LastValidatedBlock>>("mega_getLastValidatedBlock", ())
             .await
