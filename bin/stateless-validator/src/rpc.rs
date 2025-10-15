@@ -10,6 +10,16 @@ use futures::future::try_join_all;
 use op_alloy_network::Optimism;
 use op_alloy_rpc_types::Transaction;
 use salt::SaltWitness;
+use serde::{Deserialize, Serialize};
+
+/// Response from mega_getLastValidatedBlock RPC call
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastValidatedBlock {
+    pub block_number: u64,
+    pub block_hash: B256,
+    pub parent_hash: B256,
+}
 
 /// RPC client for OP Stack nodes.
 ///
@@ -21,6 +31,8 @@ pub struct RpcClient {
     pub provider: RootProvider<Optimism>,
     /// MegaETH RPC provider.
     pub witness_provider: RootProvider,
+    /// coordinator RPC provider.
+    pub coordinator_provider: RootProvider,
 }
 
 impl RpcClient {
@@ -34,12 +46,14 @@ impl RpcClient {
     ///
     /// # Errors
     /// Returns error if the API URL is malformed or invalid.
-    pub fn new(rpc_api: &str, witness_api: &str) -> Result<Self> {
+    pub fn new(rpc_api: &str, witness_api: &str, coordinator_api: &str) -> Result<Self> {
         Ok(Self {
             provider: ProviderBuilder::<_, _, Optimism>::default()
                 .connect_http(rpc_api.parse().context("Failed to parse API URL")?),
             witness_provider: ProviderBuilder::default()
                 .connect_http(witness_api.parse().context("Failed to parse API URL")?),
+            coordinator_provider: ProviderBuilder::default()
+                .connect_http(coordinator_api.parse().context("Failed to parse API URL")?),
         })
     }
 
@@ -124,5 +138,21 @@ impl RpcClient {
             .request("mega_getBlockWitness", (number.to_string(), hash))
             .await
             .map_err(|e| eyre!("Failed to get witness for block {hash}: {e}"))
+    }
+
+    pub async fn set_validated_block(&self, number: u64, hash: B256) -> Result<bool> {
+        self.coordinator_provider
+            .client()
+            .request("mega_setValidatedBlock", (number, hash))
+            .await
+            .map_err(|e| eyre!("Failed to set validated block {hash}: {e}"))
+    }
+
+    pub async fn get_last_validated_block(&self) -> Result<Option<LastValidatedBlock>> {
+        self.coordinator_provider
+            .client()
+            .request::<(), Option<LastValidatedBlock>>("mega_getLastValidatedBlock", ())
+            .await
+            .map_err(|e| eyre!("Failed to get last validated block: {e}"))
     }
 }

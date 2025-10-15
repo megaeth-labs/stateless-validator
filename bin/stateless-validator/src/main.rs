@@ -132,6 +132,10 @@ struct CommandLineArgs {
     #[clap(long)]
     witness_endpoint: String,
 
+    /// The URL of the coordinator JSON-RPC API endpoint for fetching coordinator data.
+    #[clap(long)]
+    coordinator_endpoint: String,
+
     /// Optional trusted block hash to start validation from.
     #[clap(long)]
     start_block: Option<String>,
@@ -151,13 +155,18 @@ async fn main() -> Result<()> {
     info!("[Main] Data directory: {}", args.data_dir);
     info!("[Main] RPC endpoint: {}", args.rpc_endpoint);
     info!("[Main] Witness endpoint: {}", args.witness_endpoint);
+    info!("[Main] Coordinator endpoint: {}", args.coordinator_endpoint);
     if let Some(ref genesis_file) = args.genesis_file {
         info!("[Main] Genesis file: {}", genesis_file);
     }
 
     let work_dir = PathBuf::from(args.data_dir);
 
-    let client = Arc::new(RpcClient::new(&args.rpc_endpoint, &args.witness_endpoint)?);
+    let client = Arc::new(RpcClient::new(
+        &args.rpc_endpoint,
+        &args.witness_endpoint,
+        &args.coordinator_endpoint,
+    )?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
 
     // Load chain spec from file (first run) or database (subsequent runs)
@@ -269,13 +278,21 @@ async fn chain_sync(
         Arc::clone(&config),
     ));
 
-    // Step 3: Spawn history pruner
+    // Step 3: Spawn validated block sender
+    info!("[Chain Sync] Starting validated block sender...");
+    task::spawn(validated_block_sender(
+        Arc::clone(&client),
+        Arc::clone(&validator_db),
+        Arc::clone(&config),
+    ));
+
+    // Step 4: Spawn history pruner
     task::spawn(history_pruner(
         Arc::clone(&validator_db),
         Arc::clone(&config),
     ));
 
-    // Step 4: Spawn validation workers as tokio tasks
+    // Step 5: Spawn validation workers as tokio tasks
     info!(
         "[Chain Sync] Spawning {} validation workers...",
         config.concurrent_workers
@@ -291,7 +308,7 @@ async fn chain_sync(
     }
     info!("[Chain Sync] All validation workers started");
 
-    // Step 5: Main chain synchronizer loop
+    // Step 6: Main chain synchronizer loop
     info!("[Chain Sync] Starting main synchronizer loop...");
 
     loop {
@@ -595,6 +612,119 @@ async fn validate_one(
     }
 }
 
+/// Sends validated blocks to the remote server
+///
+/// Runs in an infinite loop, monitoring the canonical chain for newly validated blocks
+/// and sending them to the remote server via set_validated_block RPC. This task is
+/// completely independent of the main validation flow, so failures won't affect chain
+/// synchronization.
+///
+/// # Retry Logic
+/// - If sending fails, waits 300ms before retrying
+/// - Before retry, queries the server for the last validated block number via mega_getLastValidatedBlock
+/// - Resumes from (server_block + 1) to avoid duplicate sends and ensure server only receives n+1 blocks
+///
+/// # Arguments
+/// * `client` - RPC client for communicating with remote server
+/// * `validator_db` - Database interface for reading canonical chain
+///
+/// # Returns
+/// * Never returns under normal operation - runs indefinitely until externally terminated
+async fn validated_block_sender(
+    client: Arc<RpcClient>,
+    validator_db: Arc<ValidatorDB>,
+    chain_spec: Arc<ChainSyncConfig>,
+) -> Result<()> {
+    info!("[Block Sender] Starting validated block sender");
+
+    // Initialize by getting the last validated block from server
+    let mut last_sent_block = match client.get_last_validated_block().await {
+        Ok(Some(last_validated)) => {
+            info!(
+                "[Block Sender] Server's last validated block: {}, {}, parent_hash: {}",
+                last_validated.block_number, last_validated.block_hash, last_validated.parent_hash
+            );
+
+            if Some(last_validated.block_hash)
+                != validator_db.get_block_hash(last_validated.block_number, true)?
+            {
+                error!("[Block Sender] Local chain is diverged from server's last validated block");
+                return Err(eyre::eyre!(
+                    "Local chain is diverged from server's last validated block"
+                ));
+            }
+            last_validated.block_number
+        }
+        Ok(None) => {
+            info!("[Block Sender] Server has no validated blocks yet, starting from 0");
+            0
+        }
+        Err(e) => {
+            warn!(
+                "[Block Sender] Failed to get last validated block from server, starting from 0: {}",
+                e
+            );
+            0
+        }
+    };
+
+    loop {
+        if let Err(e) = async {
+            // Get all validated blocks from canonical chain starting after last_sent_block
+            let  blocks_to_send = validator_db.get_canonical_blocks_from(last_sent_block + 1)?;
+            if blocks_to_send.is_empty() {
+                // No new blocks to send, wait a bit
+                tokio::time::sleep(chain_spec.sync_poll_interval).await;
+                return Ok::<(), eyre::Error>(());
+            }
+
+            // Send blocks sequentially
+            for (block_number, block_hash) in blocks_to_send {
+                match client.set_validated_block(block_number, B256::from(block_hash.0)).await {
+                    Ok(_) => {
+                        info!("[Block Sender] Successfully sent validated block {} ({})", block_number, block_hash);
+                        last_sent_block = block_number;
+                    }
+                    Err(e) => {
+                        error!("[Block Sender] Failed to send validated block {} ({}): {}", block_number, block_hash, e);
+                        // Wait before retrying
+                        tokio::time::sleep(chain_spec.worker_idle_sleep).await;
+                        // Query server for the last validated block to resume from the correct position
+                        match client.get_last_validated_block().await {
+                            Ok(Some(last_validated)) => {
+                                info!("[Block Sender] Server's last validated block: {}, hash: {}, resuming from {}", last_validated.block_number, last_validated.block_hash, last_validated.block_number + 1);
+                                let canonical_block = validator_db.get_block_hash(last_validated.block_number, true)?;
+                                if canonical_block != Some(last_validated.block_hash) {
+                                    error!("[Block Sender] Local chain is diverged from server's last validated block");
+                                    return Err(eyre::eyre!("Local chain is diverged from server's last validated block"));
+                                }
+                                last_sent_block = last_validated.block_number;
+                            }
+                            Ok(None) => {
+                                info!("[Block Sender] Server has no validated blocks yet, resuming from 0");
+                                last_sent_block = 0;
+                            }
+                            Err(query_err) => {
+                                warn!("[Block Sender] Failed to query server's last validated block: {}", query_err);
+                            }
+                        }
+
+                        // Break to restart the loop and fetch fresh blocks
+                        break;
+                    }
+                }
+            }
+
+            Ok::<(), eyre::Error>(())
+        }
+        .await
+        {
+            error!("[Block Sender] Iteration failed: {}", e);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+}
+
 /// Periodically prunes old block data to maintain constant storage overhead
 ///
 /// Runs in an infinite loop, removing blocks older than `blocks_to_keep` from the
@@ -701,7 +831,7 @@ async fn find_divergence_point(
         (earliest_local.0, mismatch_block, earliest_local.0);
     while left <= right {
         let mid = left + (right - left) / 2;
-        let local_hash = validator_db.get_block_hash(mid)?.unwrap();
+        let local_hash = validator_db.get_block_hash(mid, false)?.unwrap();
         let remote_hash = client
             .get_block(BlockId::Number(mid.into()), false)
             .await?
@@ -737,6 +867,7 @@ mod tests {
         fs::File,
         io::{BufRead, BufReader},
         path::Path,
+        sync::RwLock,
     };
 
     /// Maximum response body size for the RPC server.
@@ -792,6 +923,9 @@ mod tests {
 
         /// Maximum block in the test data set (block number and hash)
         max_block: (u64, BlockHash),
+
+        /// Last validated block in the test data set (block number and hash)
+        last_validated_block: Arc<RwLock<(u64, BlockHash)>>,
     }
 
     /// Parse block number and hash from string
@@ -926,6 +1060,46 @@ mod tests {
                             format!("Witness for block {hash_str} not found"),
                         )
                     })
+            })
+            .unwrap();
+
+        module
+            .register_method("mega_setValidatedBlock", |params, context, _| {
+                let (number, hash): (u64, String) = params.parse().unwrap();
+                let hash = parse_block_hash(&hash).unwrap();
+                let mut last_validated = context.last_validated_block.write().unwrap();
+                *last_validated = (number, hash);
+                // Return true
+                Ok::<bool, ErrorObjectOwned>(true)
+            })
+            .unwrap();
+
+        module
+            .register_method("mega_getLastValidatedBlock", |_params, context, _| {
+                // Return the last validated block
+                let last_validated = context.last_validated_block.read().unwrap();
+                let (block_number, block_hash) = *last_validated;
+
+                // If block_number is 0 and it's the initial min_block, return null
+                if block_number == context.min_block.0 && block_hash == context.min_block.1 {
+                    return Ok::<serde_json::Value, ErrorObjectOwned>(serde_json::Value::Null);
+                }
+
+                // Get the parent hash from the block
+                let block = context.blocks_by_hash.get(&block_hash).ok_or_else(|| {
+                    make_rpc_error(
+                        CALL_EXECUTION_FAILED_CODE,
+                        format!("Block {} not found", block_hash),
+                    )
+                })?;
+
+                let response = serde_json::json!({
+                    "blockNumber": block_number,
+                    "blockHash": block_hash,
+                    "parentHash": block.header.parent_hash
+                });
+
+                Ok::<serde_json::Value, ErrorObjectOwned>(response)
             })
             .unwrap();
 
@@ -1106,6 +1280,7 @@ mod tests {
             contracts,
             min_block,
             max_block,
+            last_validated_block: Arc::new(RwLock::new(min_block)),
         })
     }
 
@@ -1130,7 +1305,7 @@ mod tests {
         let sync_target = Some(context.max_block.0);
         let validator_db = setup_test_db(&context).unwrap();
         let (handle, url) = setup_mock_rpc_server(context).await;
-        let client = Arc::new(RpcClient::new(&url, &url).unwrap());
+        let client = Arc::new(RpcClient::new(&url, &url, &url).unwrap());
 
         // Load chain spec using helper function
         let chain_spec =

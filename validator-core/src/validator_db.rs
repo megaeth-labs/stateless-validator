@@ -807,16 +807,21 @@ impl ValidatorDB {
     /// - CANONICAL_CHAIN: Lower block numbers (validated blocks)
     /// - REMOTE_CHAIN: Higher block numbers (unvalidated blocks extending canonical)
     ///
+    /// The function first checks the canonical chain. If not found there, it will
+    /// check the remote chain unless `only_canonical` is set to true.
+    ///
     /// # Parameters
     /// * `block_number` - The block number to look up in the local view
+    /// * `only_canonical` - If true, only search in CANONICAL_CHAIN; if false, also search REMOTE_CHAIN
     ///
     /// # Returns
-    /// * `Ok(Some(block_hash))` - Block found at the specified number
-    /// * `Ok(None)` - No block exists at this number in the local view
+    /// * `Ok(Some(block_hash))` - Block found at the specified number in the searched chain(s)
+    /// * `Ok(None)` - No block exists at this number in the searched chain(s)
     /// * `Err(...)` - Database error during lookup
     pub fn get_block_hash(
         &self,
         block_number: BlockNumber,
+        only_canonical: bool,
     ) -> ValidationDbResult<Option<BlockHash>> {
         let read_txn = self.database.begin_read()?;
         let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
@@ -825,6 +830,8 @@ impl ValidatorDB {
         // Check canonical chain first, then remote chain (sequential, no overlap)
         if let Some(value) = canonical_chain.get(block_number)? {
             return Ok(Some(value.value().0.into()));
+        } else if only_canonical {
+            return Ok(None);
         }
 
         Ok(remote_chain.get(block_number)?.map(|v| v.value().into()))
@@ -849,6 +856,38 @@ impl ValidatorDB {
             let (block_hash, _post_state_root) = value.value();
             (block_number, block_hash.into())
         }))
+    }
+
+    /// Retrieves all blocks in the canonical chain from a specific block number onwards
+    ///
+    /// Returns a vector of (block_number, block_hash) tuples for all validated blocks
+    /// in the canonical chain starting from `from_block` (inclusive).
+    ///
+    /// # Parameters
+    /// * `from_block` - Starting block number (inclusive)
+    ///
+    /// # Returns
+    /// * `Ok(Vec<(BlockNumber, BlockHash)>)` - List of blocks from `from_block` onwards
+    /// * `Err(...)` - Database error during lookup
+    pub fn get_canonical_blocks_from(
+        &self,
+        from_block: BlockNumber,
+    ) -> ValidationDbResult<Vec<(BlockNumber, BlockHash)>> {
+        let read_txn = self.database.begin_read()?;
+        let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
+
+        let blocks = canonical_chain
+            .range(from_block..)?
+            .map(|result| {
+                result.map(|(key, value)| {
+                    let block_number = key.value();
+                    let (block_hash, _post_state_root) = value.value();
+                    (block_number, block_hash.into())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(blocks)
     }
 }
 
