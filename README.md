@@ -38,7 +38,6 @@ cargo run --bin stateless-validator -- \
   --data-dir /path/to/validator/data \
   --rpc-endpoint <public-rpc-endpoint> \
   --witness-endpoint <witness-rpc-endpoint> \
-  --coordinator-endpoint <coordinator-rpc-endpoint> \
   --genesis-file /path/to/genesis.json \
   --start-block <trusted-block-hash>
 ```
@@ -47,7 +46,6 @@ cargo run --bin stateless-validator -- \
 - `--data-dir`: Directory for validator database and data files
 - `--rpc-endpoint`: JSON-RPC API endpoint URL to retrieve block data
 - `--witness-endpoint`: MegaETH JSON-RPC API endpoint URL to retrieve witness data
-- `--coordinator-endpoint`: Coordinator JSON-RPC API endpoint URL to retrieve/send validated block info
 
 **Optional Arguments:**
 - `--genesis-file`: Path to genesis JSON file containing hardfork activation configuration (required on first run, stored in database for subsequent runs)
@@ -63,7 +61,6 @@ cargo run --bin stateless-validator -- \
   --data-dir ./validator-data \
   --rpc-endpoint https://your-rpc-endpoint.com \
   --witness-endpoint https://your-witness-endpoint.com \
-  --coordinator-endpoint https://your-coordinator-endpoint.com  \
   --genesis-file ./genesis/genesis-6342.json \
   --start-block 0x1234567890abcdef...
 ```
@@ -81,8 +78,7 @@ For subsequent runs, you can omit both `--genesis-file` and `--start-block` to r
 cargo run --bin stateless-validator -- \
   --data-dir ./validator-data \
   --rpc-endpoint https://your-rpc-endpoint.com \
-  --witness-endpoint https://your-witness-endpoint.com \
-  --coordinator-endpoint https://your-coordinator-endpoint.com
+  --witness-endpoint https://your-witness-endpoint.com
 ```
 
 Alternatively, you can supply either or both flags again to reset the starting block or update the genesis configuration:
@@ -93,7 +89,6 @@ cargo run --bin stateless-validator -- \
   --data-dir ./validator-data \
   --rpc-endpoint https://your-rpc-endpoint.com \
   --witness-endpoint https://your-witness-endpoint.com \
-  --coordinator-endpoint https://your-coordinator-endpoint.com  \
   --start-block 0xnew_trusted_block_hash...
 
 # Update genesis config (e.g., after a hardfork)
@@ -101,7 +96,6 @@ cargo run --bin stateless-validator -- \
   --data-dir ./validator-data \
   --rpc-endpoint https://your-rpc-endpoint.com \
   --witness-endpoint https://your-witness-endpoint.com \
-  --coordinator-endpoint https://your-coordinator-endpoint.com  \
   --genesis-file ./genesis/updated-genesis.json
 ```
 
