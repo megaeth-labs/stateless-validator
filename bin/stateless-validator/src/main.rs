@@ -98,6 +98,8 @@ pub struct ChainSyncConfig {
     pub worker_idle_sleep: Duration,
     /// Time to wait when validation workers encounter errors
     pub worker_error_sleep: Duration,
+    /// Enable reporting of validated blocks to upstream node
+    pub report_validation_results: bool,
 }
 
 impl Default for ChainSyncConfig {
@@ -112,6 +114,7 @@ impl Default for ChainSyncConfig {
             pruner_blocks_to_keep: 1000,
             worker_idle_sleep: Duration::from_millis(500),
             worker_error_sleep: Duration::from_millis(1000),
+            report_validation_results: false,
         }
     }
 }
@@ -140,6 +143,11 @@ struct CommandLineArgs {
     /// Required on first run, optional on subsequent runs (loads from database).
     #[clap(long)]
     genesis_file: Option<String>,
+
+    /// Enable reporting of validated blocks to the upstream node.
+    /// When enabled, the validator will send validation results via mega_setValidatedBlock RPC.
+    #[clap(long)]
+    report_validation_results: bool,
 }
 
 #[tokio::main]
@@ -202,11 +210,20 @@ async fn main() -> Result<()> {
     // Create chain sync configuration
     let config = Arc::new(ChainSyncConfig {
         concurrent_workers: num_cpus::get(),
+        report_validation_results: args.report_validation_results,
         ..ChainSyncConfig::default()
     });
     info!(
         "[Main] Number of concurrent tasks: {}",
         config.concurrent_workers
+    );
+    info!(
+        "[Main] Validation result reporting: {}",
+        if config.report_validation_results {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
 
     let validator_logic = chain_sync(client.clone(), validator_db.clone(), config, chain_spec);
@@ -224,12 +241,13 @@ async fn main() -> Result<()> {
 
 /// Chain synchronizer entry point - orchestrates the complete chain synchronization pipeline
 ///
-/// Implements a five-phase startup process for stateless block validation:
+/// Implements a multi-phase startup process for stateless block validation:
 /// 1. **Task Recovery** - Recovers interrupted validation tasks from previous crashes
 /// 2. **Remote Chain Tracking** - Spawns background tracker to maintain block lookahead
-/// 3. **History Pruning** - Spawns background pruner to manage storage overhead
-/// 4. **Validation Workers** - Spawns configured number of parallel validation workers
-/// 5. **Main Sync Loop** - Continuously advances canonical chain as blocks are validated
+/// 3. **Validation Reporter** - Optionally spawns background task to report validation results to upstream node (when enabled)
+/// 4. **History Pruning** - Spawns background pruner to manage storage overhead
+/// 5. **Validation Workers** - Spawns configured number of parallel validation workers
+/// 6. **Main Sync Loop** - Continuously advances canonical chain as blocks are validated
 ///
 /// Runs indefinitely unless a sync target is configured. Background components operate
 /// independently while the main thread advances the canonical chain.
@@ -237,7 +255,7 @@ async fn main() -> Result<()> {
 /// # Arguments
 /// * `client` - RPC client for communicating with remote blockchain node
 /// * `validator_db` - Database interface for task coordination and chain state management
-/// * `config` - Configuration including worker count, polling intervals, and optional sync target
+/// * `config` - Configuration including worker count, polling intervals, optional sync target, and validation reporting
 /// * `chain_spec` - Chain specification defining the EVM rules and parameters
 ///
 /// # Returns
@@ -269,13 +287,17 @@ async fn chain_sync(
         Arc::clone(&config),
     ));
 
-    // Step 3: Spawn validated block sender
-    info!("[Chain Sync] Starting validated block sender...");
-    task::spawn(validated_block_sender(
-        Arc::clone(&client),
-        Arc::clone(&validator_db),
-        Arc::clone(&config),
-    ));
+    // Step 3: Spawn validation reporter (optional, based on config)
+    if config.report_validation_results {
+        info!("[Chain Sync] Starting validation reporter...");
+        task::spawn(validation_reporter(
+            Arc::clone(&client),
+            Arc::clone(&validator_db),
+            Arc::clone(&config),
+        ));
+    } else {
+        info!("[Chain Sync] Validation reporter disabled (validation reporting not enabled)");
+    }
 
     // Step 4: Spawn history pruner
     task::spawn(history_pruner(
@@ -603,15 +625,14 @@ async fn validate_one(
     }
 }
 
-/// Sends validated blocks to the remote server
+/// Reports validated blocks to the remote server
 ///
 /// Runs in an infinite loop, monitoring the canonical chain for newly validated blocks
-/// and sending them to the remote server via set_validated_block RPC. This task is
-/// completely independent of the main validation flow, so failures won't affect chain
-/// synchronization.
+/// and sending them to the remote server. This task is completely independent of the
+/// main validation flow, so failures won't affect chain synchronization.
 ///
 /// # Initialization
-/// - Queries server for last validated block via mega_getLastValidatedBlock
+/// - Queries server for last validated block
 /// - Verifies local chain matches server's last validated block hash
 /// - Returns error if local chain has diverged from server
 ///
@@ -622,14 +643,14 @@ async fn validate_one(
 ///
 /// # Retry Logic on Send Failure
 /// - Waits for worker_idle_sleep duration before retrying
-/// - Queries server for the last validated block number via mega_getLastValidatedBlock
+/// - Queries server for the last validated block number
 /// - Verifies local chain still matches server's last validated block hash
 /// - Returns error if local chain has diverged from server
 /// - Resumes from (server_block + 1) to avoid duplicate sends and ensure server only receives n+1 blocks
 ///
 /// # Error Handling
 /// - If entire iteration fails, waits 300ms before retrying
-/// - All errors are logged but don't terminate the sender task
+/// - All errors are logged but don't terminate the reporter task
 ///
 /// # Arguments
 /// * `client` - RPC client for communicating with remote server
@@ -638,25 +659,25 @@ async fn validate_one(
 ///
 /// # Returns
 /// * Never returns under normal operation - runs indefinitely until externally terminated
-async fn validated_block_sender(
+async fn validation_reporter(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
     config: Arc<ChainSyncConfig>,
 ) -> Result<()> {
-    info!("[Block Sender] Starting validated block sender");
+    info!("[Reporter] Starting validation reporter");
 
     // Initialize by getting the last validated block from server
     let mut last_sent_block = match client.get_last_validated_block().await {
         Ok(Some(last_validated)) => {
             info!(
-                "[Block Sender] Server's last validated block: {}, {}, parent_hash: {}",
+                "[Reporter] Server's last validated block: {}, {}, parent_hash: {}",
                 last_validated.block_number, last_validated.block_hash, last_validated.parent_hash
             );
 
             if Some(last_validated.block_hash)
                 != validator_db.get_block_hash(last_validated.block_number, true)?
             {
-                error!("[Block Sender] Local chain is diverged from server's last validated block");
+                error!("[Reporter] Local chain is diverged from server's last validated block");
                 return Err(eyre::eyre!(
                     "Local chain is diverged from server's last validated block"
                 ));
@@ -664,12 +685,12 @@ async fn validated_block_sender(
             last_validated.block_number
         }
         Ok(None) => {
-            info!("[Block Sender] Server has no validated blocks yet, starting from 0");
+            info!("[Reporter] Server has no validated blocks yet, starting from 0");
             0
         }
         Err(e) => {
             warn!(
-                "[Block Sender] Failed to get last validated block from server, starting from 0: {}",
+                "[Reporter] Failed to get last validated block from server, starting from 0: {}",
                 e
             );
             0
@@ -690,30 +711,30 @@ async fn validated_block_sender(
             for (block_number, block_hash) in blocks_to_send {
                 match client.set_validated_block(block_number, B256::from(block_hash.0)).await {
                     Ok(_) => {
-                        info!("[Block Sender] Successfully sent validated block {} ({})", block_number, block_hash);
+                        info!("[Reporter] Successfully sent validated block {} ({})", block_number, block_hash);
                         last_sent_block = block_number;
                     }
                     Err(e) => {
-                        error!("[Block Sender] Failed to send validated block {} ({}): {}", block_number, block_hash, e);
+                        error!("[Reporter] Failed to send validated block {} ({}): {}", block_number, block_hash, e);
                         // Wait before retrying
                         tokio::time::sleep(config.worker_idle_sleep).await;
                         // Query server for the last validated block to resume from the correct position
                         match client.get_last_validated_block().await {
                             Ok(Some(last_validated)) => {
-                                info!("[Block Sender] Server's last validated block: {}, hash: {}, resuming from {}", last_validated.block_number, last_validated.block_hash, last_validated.block_number + 1);
+                                info!("[Reporter] Server's last validated block: {}, hash: {}, resuming from {}", last_validated.block_number, last_validated.block_hash, last_validated.block_number + 1);
                                 let canonical_block = validator_db.get_block_hash(last_validated.block_number, true)?;
                                 if canonical_block != Some(last_validated.block_hash) {
-                                    error!("[Block Sender] Local chain is diverged from server's last validated block");
+                                    error!("[Reporter] Local chain is diverged from server's last validated block");
                                     return Err(eyre::eyre!("Local chain is diverged from server's last validated block"));
                                 }
                                 last_sent_block = last_validated.block_number;
                             }
                             Ok(None) => {
-                                info!("[Block Sender] Server has no validated blocks yet, resuming from 0");
+                                info!("[Reporter] Server has no validated blocks yet, resuming from 0");
                                 last_sent_block = 0;
                             }
                             Err(query_err) => {
-                                warn!("[Block Sender] Failed to query server's last validated block: {}", query_err);
+                                warn!("[Reporter] Failed to query server's last validated block: {}", query_err);
                             }
                         }
 
@@ -727,7 +748,7 @@ async fn validated_block_sender(
         }
         .await
         {
-            error!("[Block Sender] Iteration failed: {}", e);
+            error!("[Reporter] Iteration failed: {}", e);
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
     }
