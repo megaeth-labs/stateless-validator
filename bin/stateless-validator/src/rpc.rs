@@ -9,13 +9,12 @@ use op_alloy_rpc_types::Transaction;
 use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
 
-/// Response from mega_getLastValidatedBlock RPC call
+/// Response from mega_setValidatedBlocks RPC call
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LastValidatedBlock {
-    pub block_number: u64,
-    pub block_hash: B256,
-    pub parent_hash: B256,
+pub struct SetValidatedBlocksResponse {
+    pub accepted: bool,
+    pub last_validated_block: (u64, B256),
 }
 
 /// RPC client for MegaETH blockchain data.
@@ -133,19 +132,31 @@ impl RpcClient {
             .map_err(|e| eyre!("Failed to get witness for block {hash}: {e}"))
     }
 
-    pub async fn set_validated_block(&self, number: u64, hash: B256) -> Result<bool> {
+    /// Reports a range of validated blocks to the upstream node.
+    ///
+    /// Notifies the upstream node that the validator has successfully validated
+    /// a contiguous range of blocks in its canonical chain.
+    ///
+    /// # Arguments
+    /// * `first_block` - Tuple of (block number, block hash) for the earliest validated block
+    /// * `last_block` - Tuple of (block number, block hash) for the latest validated block
+    ///
+    /// # Returns
+    /// [`SetValidatedBlocksResponse`] containing:
+    /// - `accepted`: Whether the upstream node accepted the report
+    /// - `last_validated_block`: The upstream's current last validated block (number, hash)
+    ///
+    /// # Errors
+    /// Returns error if the RPC call fails or connection is lost.
+    pub async fn set_validated_blocks(
+        &self,
+        first_block: (u64, B256),
+        last_block: (u64, B256),
+    ) -> Result<SetValidatedBlocksResponse> {
         self.data_provider
             .client()
-            .request("mega_setValidatedBlock", (number, hash))
+            .request("mega_setValidatedBlocks", (first_block, last_block))
             .await
-            .map_err(|e| eyre!("Failed to set validated block {hash}: {e}"))
-    }
-
-    pub async fn get_last_validated_block(&self) -> Result<Option<LastValidatedBlock>> {
-        self.data_provider
-            .client()
-            .request::<(), Option<LastValidatedBlock>>("mega_getLastValidatedBlock", ())
-            .await
-            .map_err(|e| eyre!("Failed to get last validated block: {e}"))
+            .map_err(|e| eyre!("Failed to set validated blocks: {e}"))
     }
 }

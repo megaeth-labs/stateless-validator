@@ -859,38 +859,6 @@ impl ValidatorDB {
             (block_number, block_hash.into())
         }))
     }
-
-    /// Retrieves all blocks in the canonical chain from a specific block number onwards
-    ///
-    /// Returns a vector of (block_number, block_hash) tuples for all validated blocks
-    /// in the canonical chain starting from `from_block` (inclusive).
-    ///
-    /// # Parameters
-    /// * `from_block` - Starting block number (inclusive)
-    ///
-    /// # Returns
-    /// * `Ok(Vec<(BlockNumber, BlockHash)>)` - List of blocks from `from_block` onwards
-    /// * `Err(...)` - Database error during lookup
-    pub fn get_canonical_blocks_from(
-        &self,
-        from_block: BlockNumber,
-    ) -> ValidationDbResult<Vec<(BlockNumber, BlockHash)>> {
-        let read_txn = self.database.begin_read()?;
-        let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
-
-        let blocks = canonical_chain
-            .range(from_block..)?
-            .map(|result| {
-                result.map(|(key, value)| {
-                    let block_number = key.value();
-                    let (block_hash, _post_state_root) = value.value();
-                    (block_number, block_hash.into())
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(blocks)
-    }
 }
 
 /// Helper method to serialize data using bincode with legacy config

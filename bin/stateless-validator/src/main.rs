@@ -625,131 +625,74 @@ async fn validate_one(
     }
 }
 
-/// Reports validated blocks to the remote server
+/// Reports validated blocks to the upstream node
 ///
-/// Runs in an infinite loop, monitoring the canonical chain for newly validated blocks
-/// and sending them to the remote server. This task is completely independent of the
-/// main validation flow, so failures won't affect chain synchronization.
-///
-/// # Initialization
-/// - Queries server for last validated block
-/// - Verifies local chain matches server's last validated block hash
-/// - Returns error if local chain has diverged from server
-///
-/// # Main Loop Behavior
-/// - Fetches canonical blocks starting from (last_sent_block + 1)
-/// - If no new blocks available, sleeps for sync_poll_interval
-/// - Sends blocks sequentially to server
-///
-/// # Retry Logic on Send Failure
-/// - Waits for worker_idle_sleep duration before retrying
-/// - Queries server for the last validated block number
-/// - Verifies local chain still matches server's last validated block hash
-/// - Returns error if local chain has diverged from server
-/// - Resumes from (server_block + 1) to avoid duplicate sends and ensure server only receives n+1 blocks
-///
-/// # Error Handling
-/// - If entire iteration fails, waits 300ms before retrying
-/// - All errors are logged but don't terminate the reporter task
+/// Periodically monitors the canonical chain and reports the complete validated range
+/// (first to last block) to the upstream node via `mega_setValidatedBlocks` RPC.
+/// Only reports when new blocks have been validated.
 ///
 /// # Arguments
-/// * `client` - RPC client for communicating with remote server
+/// * `client` - RPC client for communicating with upstream node
 /// * `validator_db` - Database interface for reading canonical chain
-/// * `config` - Configuration containing sync_poll_interval and worker_idle_sleep
+/// * `config` - Configuration containing sync_poll_interval
 ///
 /// # Returns
-/// * Never returns under normal operation - runs indefinitely until externally terminated
+/// * `Ok(())` - Never returns under normal operation
+/// * `Err(eyre::Error)` - Terminates if validation gap detected (upstream's last validated
+///   block < local chain start)
 async fn validation_reporter(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
     config: Arc<ChainSyncConfig>,
 ) -> Result<()> {
     info!("[Reporter] Starting validation reporter");
-
-    // Initialize by getting the last validated block from server
-    let mut last_sent_block = match client.get_last_validated_block().await {
-        Ok(Some(last_validated)) => {
-            info!(
-                "[Reporter] Server's last validated block: {}, {}, parent_hash: {}",
-                last_validated.block_number, last_validated.block_hash, last_validated.parent_hash
-            );
-
-            if Some(last_validated.block_hash)
-                != validator_db.get_block_hash(last_validated.block_number, true)?
-            {
-                error!("[Reporter] Local chain is diverged from server's last validated block");
-                return Err(eyre::eyre!(
-                    "Local chain is diverged from server's last validated block"
-                ));
-            }
-            last_validated.block_number
-        }
-        Ok(None) => {
-            info!("[Reporter] Server has no validated blocks yet, starting from 0");
-            0
-        }
-        Err(e) => {
-            warn!(
-                "[Reporter] Failed to get last validated block from server, starting from 0: {}",
-                e
-            );
-            0
-        }
-    };
+    let mut last_reported_block = (0u64, BlockHash::ZERO);
 
     loop {
-        if let Err(e) = async {
-            // Get all validated blocks from canonical chain starting after last_sent_block
-            let  blocks_to_send = validator_db.get_canonical_blocks_from(last_sent_block + 1)?;
-            if blocks_to_send.is_empty() {
-                // No new blocks to send, wait a bit
-                tokio::time::sleep(config.sync_poll_interval).await;
-                return Ok::<(), eyre::Error>(());
-            }
+        tokio::time::sleep(config.sync_poll_interval).await;
 
-            // Send blocks sequentially
-            for (block_number, block_hash) in blocks_to_send {
-                match client.set_validated_block(block_number, B256::from(block_hash.0)).await {
-                    Ok(_) => {
-                        info!("[Reporter] Successfully sent validated block {} ({})", block_number, block_hash);
-                        last_sent_block = block_number;
-                    }
-                    Err(e) => {
-                        error!("[Reporter] Failed to send validated block {} ({}): {}", block_number, block_hash, e);
-                        // Wait before retrying
-                        tokio::time::sleep(config.worker_idle_sleep).await;
-                        // Query server for the last validated block to resume from the correct position
-                        match client.get_last_validated_block().await {
-                            Ok(Some(last_validated)) => {
-                                info!("[Reporter] Server's last validated block: {}, hash: {}, resuming from {}", last_validated.block_number, last_validated.block_hash, last_validated.block_number + 1);
-                                let canonical_block = validator_db.get_block_hash(last_validated.block_number, true)?;
-                                if canonical_block != Some(last_validated.block_hash) {
-                                    error!("[Reporter] Local chain is diverged from server's last validated block");
-                                    return Err(eyre::eyre!("Local chain is diverged from server's last validated block"));
-                                }
-                                last_sent_block = last_validated.block_number;
-                            }
-                            Ok(None) => {
-                                info!("[Reporter] Server has no validated blocks yet, resuming from 0");
-                                last_sent_block = 0;
-                            }
-                            Err(query_err) => {
-                                warn!("[Reporter] Failed to query server's last validated block: {}", query_err);
-                            }
-                        }
+        // Get canonical chain bounds
+        let (first_block, last_block) = match (
+            validator_db.get_earliest_local_block(),
+            validator_db.get_local_tip(),
+        ) {
+            (Ok(Some(first)), Ok(Some(last))) => (first, last),
+            _ => continue,
+        };
 
-                        // Break to restart the loop and fetch fresh blocks
-                        break;
-                    }
-                }
-            }
-
-            Ok::<(), eyre::Error>(())
+        // Skip if no new blocks
+        if last_block == last_reported_block {
+            continue;
         }
-        .await
+
+        // Report validated range to upstream
+        match client
+            .set_validated_blocks(
+                (first_block.0, B256::from(first_block.1.0)),
+                (last_block.0, B256::from(last_block.1.0)),
+            )
+            .await
         {
-            error!("[Reporter] Iteration failed: {}", e);
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            Ok(response) if response.accepted => {
+                last_reported_block = last_block;
+            }
+            Ok(response) => {
+                // Check for validation gap
+                if response.last_validated_block.0 < first_block.0 {
+                    return Err(anyhow!(
+                        "Validation gap detected: upstream at block {}, but local chain starts at {}. Cannot advance validation.",
+                        response.last_validated_block.0,
+                        first_block.0
+                    ));
+                }
+                error!(
+                    "[Reporter] Report rejected for blocks {first_block:?}-{last_block:?}, upstream at {:?}",
+                    response.last_validated_block
+                );
+            }
+            Err(e) => {
+                error!("[Reporter] Failed to report blocks: {e}");
+            }
         }
     }
 }
@@ -999,7 +942,7 @@ mod tests {
         // OS will clean it when test process ends.
         let temp_dir = tempfile::tempdir()
             .map_err(|e| anyhow!("Failed to create temporary directory: {e}"))?;
-        let validator_db = ValidatorDB::new(&temp_dir.path().join(VALIDATOR_DB_FILENAME))?;
+        let validator_db = ValidatorDB::new(temp_dir.path().join(VALIDATOR_DB_FILENAME))?;
         std::mem::forget(temp_dir);
 
         // Set the local chain tip to the first block in test data.
@@ -1017,10 +960,7 @@ mod tests {
         contracts.into_iter().for_each(|(code_hash, bytecode)| {
             validator_db
                 .add_contract_code(&bytecode)
-                .unwrap_or_else(|e| {
-                    error!("Failed to add contract {code_hash} to database: {e}");
-                    Err(e).unwrap()
-                })
+                .unwrap_or_else(|e| panic!("Failed to add contract {code_hash} to database: {e}"))
         });
 
         Ok(Arc::new(validator_db))
@@ -1093,41 +1033,18 @@ mod tests {
             .unwrap();
 
         module
-            .register_method("mega_setValidatedBlock", |params, context, _| {
-                let (number, hash): (u64, String) = params.parse().unwrap();
-                let hash = parse_block_hash(&hash).unwrap();
+            .register_method("mega_setValidatedBlocks", |params, context, _| {
+                let (_first_block, last_block): ((u64, String), (u64, String)) =
+                    params.parse().unwrap();
+                let last_hash = parse_block_hash(&last_block.1).unwrap();
                 let mut last_validated = context.last_validated_block.write().unwrap();
-                *last_validated = (number, hash);
-                // Return true
-                Ok::<bool, ErrorObjectOwned>(true)
-            })
-            .unwrap();
+                *last_validated = (last_block.0, last_hash);
 
-        module
-            .register_method("mega_getLastValidatedBlock", |_params, context, _| {
-                // Return the last validated block
-                let last_validated = context.last_validated_block.read().unwrap();
-                let (block_number, block_hash) = *last_validated;
-
-                // If block_number is 0 and it's the initial min_block, return null
-                if block_number == context.min_block.0 && block_hash == context.min_block.1 {
-                    return Ok::<serde_json::Value, ErrorObjectOwned>(serde_json::Value::Null);
-                }
-
-                // Get the parent hash from the block
-                let block = context.blocks_by_hash.get(&block_hash).ok_or_else(|| {
-                    make_rpc_error(
-                        CALL_EXECUTION_FAILED_CODE,
-                        format!("Block {} not found", block_hash),
-                    )
-                })?;
-
+                // Return response with accepted=true and the last validated block
                 let response = serde_json::json!({
-                    "blockNumber": block_number,
-                    "blockHash": block_hash,
-                    "parentHash": block.header.parent_hash
+                    "accepted": true,
+                    "lastValidatedBlock": [last_block.0, last_hash]
                 });
-
                 Ok::<serde_json::Value, ErrorObjectOwned>(response)
             })
             .unwrap();
@@ -1180,7 +1097,7 @@ mod tests {
         let file = File::open(path).expect("Failed to open contracts file");
         BufReader::new(file)
             .lines()
-            .filter_map(|line| line.ok())
+            .map_while(Result::ok)
             .filter(|line| !line.trim().is_empty())
             .map(|line| serde_json::from_str(&line).expect("Failed to parse contract"))
             .collect()
