@@ -50,6 +50,7 @@ cargo run --bin stateless-validator -- \
 **Optional Arguments:**
 - `--genesis-file`: Path to genesis JSON file containing hardfork activation configuration (required on first run, stored in database for subsequent runs)
 - `--start-block`: Trusted block hash to initialize validation from (required for first-time setup)
+- `--report-validation-results`: Enable reporting of validated blocks to the upstream node (disabled by default)
 
 ### Getting Started
 
