@@ -619,21 +619,38 @@ async fn validate_one(
 /// completely independent of the main validation flow, so failures won't affect chain
 /// synchronization.
 ///
-/// # Retry Logic
-/// - If sending fails, waits 300ms before retrying
-/// - Before retry, queries the server for the last validated block number via mega_getLastValidatedBlock
+/// # Initialization
+/// - Queries server for last validated block via mega_getLastValidatedBlock
+/// - Verifies local chain matches server's last validated block hash
+/// - Returns error if local chain has diverged from server
+///
+/// # Main Loop Behavior
+/// - Fetches canonical blocks starting from (last_sent_block + 1)
+/// - If no new blocks available, sleeps for sync_poll_interval
+/// - Sends blocks sequentially to server
+///
+/// # Retry Logic on Send Failure
+/// - Waits for worker_idle_sleep duration before retrying
+/// - Queries server for the last validated block number via mega_getLastValidatedBlock
+/// - Verifies local chain still matches server's last validated block hash
+/// - Returns error if local chain has diverged from server
 /// - Resumes from (server_block + 1) to avoid duplicate sends and ensure server only receives n+1 blocks
+///
+/// # Error Handling
+/// - If entire iteration fails, waits 300ms before retrying
+/// - All errors are logged but don't terminate the sender task
 ///
 /// # Arguments
 /// * `client` - RPC client for communicating with remote server
 /// * `validator_db` - Database interface for reading canonical chain
+/// * `config` - Configuration containing sync_poll_interval and worker_idle_sleep
 ///
 /// # Returns
 /// * Never returns under normal operation - runs indefinitely until externally terminated
 async fn validated_block_sender(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
-    chain_spec: Arc<ChainSyncConfig>,
+    config: Arc<ChainSyncConfig>,
 ) -> Result<()> {
     info!("[Block Sender] Starting validated block sender");
 
@@ -674,7 +691,7 @@ async fn validated_block_sender(
             let  blocks_to_send = validator_db.get_canonical_blocks_from(last_sent_block + 1)?;
             if blocks_to_send.is_empty() {
                 // No new blocks to send, wait a bit
-                tokio::time::sleep(chain_spec.sync_poll_interval).await;
+                tokio::time::sleep(config.sync_poll_interval).await;
                 return Ok::<(), eyre::Error>(());
             }
 
@@ -688,7 +705,7 @@ async fn validated_block_sender(
                     Err(e) => {
                         error!("[Block Sender] Failed to send validated block {} ({}): {}", block_number, block_hash, e);
                         // Wait before retrying
-                        tokio::time::sleep(chain_spec.worker_idle_sleep).await;
+                        tokio::time::sleep(config.worker_idle_sleep).await;
                         // Query server for the last validated block to resume from the correct position
                         match client.get_last_validated_block().await {
                             Ok(Some(last_validated)) => {
