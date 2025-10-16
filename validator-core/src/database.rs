@@ -207,7 +207,7 @@ impl WitnessEnvOracle {
             .collect::<Result<HashMap<_, _>, _>>()?;
 
         Ok(Self {
-            block_number,
+            block_number: block_number - 1,
             bucket_capacities,
         })
     }
