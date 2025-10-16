@@ -98,6 +98,8 @@ pub struct ChainSyncConfig {
     pub worker_idle_sleep: Duration,
     /// Time to wait when validation workers encounter errors
     pub worker_error_sleep: Duration,
+    /// Enable reporting of validated blocks to upstream node
+    pub report_validation_results: bool,
 }
 
 impl Default for ChainSyncConfig {
@@ -112,6 +114,7 @@ impl Default for ChainSyncConfig {
             pruner_blocks_to_keep: 1000,
             worker_idle_sleep: Duration::from_millis(500),
             worker_error_sleep: Duration::from_millis(1000),
+            report_validation_results: false,
         }
     }
 }
@@ -128,6 +131,10 @@ struct CommandLineArgs {
     #[clap(long)]
     rpc_endpoint: String,
 
+    /// The URL of the MegaETH JSON-RPC API endpoint for fetching witness data.
+    #[clap(long)]
+    witness_endpoint: String,
+
     /// Optional trusted block hash to start validation from.
     #[clap(long)]
     start_block: Option<String>,
@@ -136,6 +143,11 @@ struct CommandLineArgs {
     /// Required on first run, optional on subsequent runs (loads from database).
     #[clap(long)]
     genesis_file: Option<String>,
+
+    /// Enable reporting of validated blocks to the upstream node.
+    /// When enabled, the validator will send validation results via mega_setValidatedBlock RPC.
+    #[clap(long)]
+    report_validation_results: bool,
 }
 
 #[tokio::main]
@@ -146,13 +158,14 @@ async fn main() -> Result<()> {
 
     info!("[Main] Data directory: {}", args.data_dir);
     info!("[Main] RPC endpoint: {}", args.rpc_endpoint);
+    info!("[Main] Witness endpoint: {}", args.witness_endpoint);
     if let Some(ref genesis_file) = args.genesis_file {
         info!("[Main] Genesis file: {}", genesis_file);
     }
 
     let work_dir = PathBuf::from(args.data_dir);
 
-    let client = Arc::new(RpcClient::new(&args.rpc_endpoint)?);
+    let client = Arc::new(RpcClient::new(&args.rpc_endpoint, &args.witness_endpoint)?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
 
     // Load chain spec from file (first run) or database (subsequent runs)
@@ -201,11 +214,20 @@ async fn main() -> Result<()> {
     // Create chain sync configuration
     let config = Arc::new(ChainSyncConfig {
         concurrent_workers: num_cpus::get(),
+        report_validation_results: args.report_validation_results,
         ..ChainSyncConfig::default()
     });
     info!(
         "[Main] Number of concurrent tasks: {}",
         config.concurrent_workers
+    );
+    info!(
+        "[Main] Validation result reporting: {}",
+        if config.report_validation_results {
+            "enabled"
+        } else {
+            "disabled"
+        }
     );
 
     let validator_logic = chain_sync(client.clone(), validator_db.clone(), config, chain_spec);
@@ -223,12 +245,13 @@ async fn main() -> Result<()> {
 
 /// Chain synchronizer entry point - orchestrates the complete chain synchronization pipeline
 ///
-/// Implements a five-phase startup process for stateless block validation:
+/// Implements a multi-phase startup process for stateless block validation:
 /// 1. **Task Recovery** - Recovers interrupted validation tasks from previous crashes
 /// 2. **Remote Chain Tracking** - Spawns background tracker to maintain block lookahead
-/// 3. **History Pruning** - Spawns background pruner to manage storage overhead
-/// 4. **Validation Workers** - Spawns configured number of parallel validation workers
-/// 5. **Main Sync Loop** - Continuously advances canonical chain as blocks are validated
+/// 3. **Validation Reporter** - Optionally spawns background task to report validation results to upstream node (when enabled)
+/// 4. **History Pruning** - Spawns background pruner to manage storage overhead
+/// 5. **Validation Workers** - Spawns configured number of parallel validation workers
+/// 6. **Main Sync Loop** - Continuously advances canonical chain as blocks are validated
 ///
 /// Runs indefinitely unless a sync target is configured. Background components operate
 /// independently while the main thread advances the canonical chain.
@@ -236,7 +259,7 @@ async fn main() -> Result<()> {
 /// # Arguments
 /// * `client` - RPC client for communicating with remote blockchain node
 /// * `validator_db` - Database interface for task coordination and chain state management
-/// * `config` - Configuration including worker count, polling intervals, and optional sync target
+/// * `config` - Configuration including worker count, polling intervals, optional sync target, and validation reporting
 /// * `chain_spec` - Chain specification defining the EVM rules and parameters
 ///
 /// # Returns
@@ -268,13 +291,25 @@ async fn chain_sync(
         Arc::clone(&config),
     ));
 
-    // Step 3: Spawn history pruner
+    // Step 3: Spawn validation reporter (optional, based on config)
+    if config.report_validation_results {
+        info!("[Chain Sync] Starting validation reporter...");
+        task::spawn(validation_reporter(
+            Arc::clone(&client),
+            Arc::clone(&validator_db),
+            Arc::clone(&config),
+        ));
+    } else {
+        info!("[Chain Sync] Validation reporter disabled (validation reporting not enabled)");
+    }
+
+    // Step 4: Spawn history pruner
     task::spawn(history_pruner(
         Arc::clone(&validator_db),
         Arc::clone(&config),
     ));
 
-    // Step 4: Spawn validation workers as tokio tasks
+    // Step 5: Spawn validation workers as tokio tasks
     info!(
         "[Chain Sync] Spawning {} validation workers...",
         config.concurrent_workers
@@ -290,7 +325,7 @@ async fn chain_sync(
     }
     info!("[Chain Sync] All validation workers started");
 
-    // Step 5: Main chain synchronizer loop
+    // Step 6: Main chain synchronizer loop
     info!("[Chain Sync] Starting main synchronizer loop...");
 
     loop {
@@ -423,9 +458,11 @@ async fn remote_chain_tracker(
                         let block = client
                             .get_block(BlockId::Number(block_number.into()), true)
                             .await?;
-                        let (salt_witness, mpt_witness) =
-                            client.get_witness(block.header.hash).await?;
+                        let (salt_witness, mpt_witness) = client
+                            .get_witness(block.header.number, block.header.hash)
+                            .await?;
                         db.add_validation_task(&block, &salt_witness, &mpt_witness)?;
+
                         Ok::<Header, eyre::Error>(block.header)
                     })
                 }),
@@ -596,6 +633,78 @@ async fn validate_one(
             Ok(true)
         }
         None => Ok(false),
+    }
+}
+
+/// Reports validated blocks to the upstream node
+///
+/// Periodically monitors the canonical chain and reports the complete validated range
+/// (first to last block) to the upstream node via `mega_setValidatedBlocks` RPC.
+/// Only reports when new blocks have been validated.
+///
+/// # Arguments
+/// * `client` - RPC client for communicating with upstream node
+/// * `validator_db` - Database interface for reading canonical chain
+/// * `config` - Configuration containing sync_poll_interval
+///
+/// # Returns
+/// * `Ok(())` - Never returns under normal operation
+/// * `Err(eyre::Error)` - Terminates if validation gap detected (upstream's last validated
+///   block < local chain start)
+async fn validation_reporter(
+    client: Arc<RpcClient>,
+    validator_db: Arc<ValidatorDB>,
+    config: Arc<ChainSyncConfig>,
+) -> Result<()> {
+    info!("[Reporter] Starting validation reporter");
+    let mut last_reported_block = (0u64, BlockHash::ZERO);
+
+    loop {
+        tokio::time::sleep(config.sync_poll_interval).await;
+
+        // Get canonical chain bounds
+        let (first_block, last_block) = match (
+            validator_db.get_earliest_local_block(),
+            validator_db.get_local_tip(),
+        ) {
+            (Ok(Some(first)), Ok(Some(last))) => (first, last),
+            _ => continue,
+        };
+
+        // Skip if no new blocks
+        if last_block == last_reported_block {
+            continue;
+        }
+
+        // Report validated range to upstream
+        match client
+            .set_validated_blocks(
+                (first_block.0, B256::from(first_block.1.0)),
+                (last_block.0, B256::from(last_block.1.0)),
+            )
+            .await
+        {
+            Ok(response) if response.accepted => {
+                last_reported_block = last_block;
+            }
+            Ok(response) => {
+                // Check for validation gap
+                if response.last_validated_block.0 < first_block.0 {
+                    return Err(anyhow!(
+                        "Validation gap detected: upstream at block {}, but local chain starts at {}. Cannot advance validation.",
+                        response.last_validated_block.0,
+                        first_block.0
+                    ));
+                }
+                error!(
+                    "[Reporter] Report rejected for blocks {first_block:?}-{last_block:?}, upstream at {:?}",
+                    response.last_validated_block
+                );
+            }
+            Err(e) => {
+                error!("[Reporter] Failed to report blocks: {e}");
+            }
+        }
     }
 }
 
@@ -840,7 +949,7 @@ mod tests {
         // OS will clean it when test process ends.
         let temp_dir = tempfile::tempdir()
             .map_err(|e| anyhow!("Failed to create temporary directory: {e}"))?;
-        let validator_db = ValidatorDB::new(&temp_dir.path().join(VALIDATOR_DB_FILENAME))?;
+        let validator_db = ValidatorDB::new(temp_dir.path().join(VALIDATOR_DB_FILENAME))?;
         std::mem::forget(temp_dir);
 
         // Set the local chain tip to the first block in test data.
@@ -861,10 +970,7 @@ mod tests {
         contracts.into_iter().for_each(|(code_hash, bytecode)| {
             validator_db
                 .add_contract_code(&bytecode)
-                .unwrap_or_else(|e| {
-                    error!("Failed to add contract {code_hash} to database: {e}");
-                    Err(e).unwrap()
-                })
+                .unwrap_or_else(|e| panic!("Failed to add contract {code_hash} to database: {e}"))
         });
 
         Ok(Arc::new(validator_db))
@@ -914,8 +1020,8 @@ mod tests {
             .unwrap();
 
         module
-            .register_method("eth_getWitness", |params, context, _| {
-                let (hash_str,): (String,) = params.parse().unwrap();
+            .register_method("mega_getBlockWitness", |params, context, _| {
+                let (_number_str, hash_str): (String, String) = params.parse().unwrap();
 
                 // Parse hash string to BlockHash
                 let block_hash = parse_block_hash(&hash_str).map_err(|e| {
@@ -923,23 +1029,31 @@ mod tests {
                 })?;
 
                 // Look up witness data by block hash
-                match context.witness_data.get(&block_hash) {
-                    Some(salt_witness) => {
-                        // Serialize SaltWitness back to Vec<u8> for RPC response
-                        match bincode::serde::encode_to_vec(salt_witness, bincode::config::legacy())
-                        {
-                            Ok(witness_bytes) => Ok(witness_bytes),
-                            Err(e) => Err(make_rpc_error(
-                                CALL_EXECUTION_FAILED_CODE,
-                                format!("Failed to serialize SaltWitness: {e}"),
-                            )),
-                        }
-                    }
-                    None => Err(make_rpc_error(
-                        CALL_EXECUTION_FAILED_CODE,
-                        format!("Witness for block {hash_str} not found"),
-                    )),
-                }
+                context
+                    .witness_data
+                    .get(&block_hash)
+                    .cloned()
+                    .ok_or_else(|| {
+                        make_rpc_error(
+                            CALL_EXECUTION_FAILED_CODE,
+                            format!("Witness for block {hash_str} not found"),
+                        )
+                    })
+            })
+            .unwrap();
+
+        module
+            .register_method("mega_setValidatedBlocks", |params, _context, _| {
+                let (_first_block, last_block): ((u64, String), (u64, String)) =
+                    params.parse().unwrap();
+                let last_hash = parse_block_hash(&last_block.1).unwrap();
+
+                // Return response with accepted=true and the last validated block
+                let response = serde_json::json!({
+                    "accepted": true,
+                    "lastValidatedBlock": [last_block.0, last_hash]
+                });
+                Ok::<serde_json::Value, ErrorObjectOwned>(response)
             })
             .unwrap();
 
@@ -991,7 +1105,7 @@ mod tests {
         let file = File::open(path).expect("Failed to open contracts file");
         BufReader::new(file)
             .lines()
-            .filter_map(|line| line.ok())
+            .map_while(Result::ok)
             .filter(|line| !line.trim().is_empty())
             .map(|line| serde_json::from_str(&line).expect("Failed to parse contract"))
             .collect()
@@ -1144,7 +1258,7 @@ mod tests {
         let sync_target = Some(context.max_block.0);
         let validator_db = setup_test_db(&context).unwrap();
         let (handle, url) = setup_mock_rpc_server(context).await;
-        let client = Arc::new(RpcClient::new(&url).unwrap());
+        let client = Arc::new(RpcClient::new(&url, &url).unwrap());
 
         // Load chain spec using helper function
         let chain_spec =

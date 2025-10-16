@@ -756,10 +756,11 @@ impl ValidatorDB {
         }
     }
 
-    /// Resets the chain anchor point and clears remote chain state
+    /// Resets the chain anchor point and clears all chain state
     ///
     /// This method resets the validator to start from a specific trusted block.
-    /// It sets the canonical chain tip and clears the remote chain to ensure
+    /// It clears both the canonical chain and remote chain, then sets the new
+    /// anchor block as the sole entry in the canonical chain. This ensures
     /// a clean slate. Useful for initialization from a trusted block.
     pub fn reset_anchor_block(
         &self,
@@ -773,6 +774,7 @@ impl ValidatorDB {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
             let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
 
+            canonical_chain.retain(|_, _| false)?;
             canonical_chain.insert(
                 block_number,
                 (block_hash.0, post_state_root.0, post_withdrawals_root.0),
