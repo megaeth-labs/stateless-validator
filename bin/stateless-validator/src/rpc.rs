@@ -1,8 +1,5 @@
 //! RPC client for fetching missing data during stateless validation.
-//!
-//! Fetches contract bytecode, blocks, and SALT witness data from OP Stack nodes
-//! when not present in witness files.
-use alloy_primitives::{Address, B256, Bytes, hex};
+use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
 use eyre::{Context, Result, eyre};
@@ -10,32 +7,45 @@ use futures::future::try_join_all;
 use op_alloy_network::Optimism;
 use op_alloy_rpc_types::Transaction;
 use salt::SaltWitness;
+use serde::{Deserialize, Serialize};
 
-/// RPC client for OP Stack nodes.
+/// Response from mega_setValidatedBlocks RPC call
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetValidatedBlocksResponse {
+    pub accepted: bool,
+    pub last_validated_block: (u64, B256),
+}
+
+/// RPC client for MegaETH blockchain data.
 ///
-/// Fetches missing contract bytecode, blocks, and witness data during stateless validation.
-/// Executes requests concurrently for performance.
+/// Fetches contract bytecode, blocks, and witness data during stateless validation.
 #[derive(Debug, Clone)]
 pub struct RpcClient {
-    /// OP Stack RPC provider.
-    pub provider: RootProvider<Optimism>,
+    /// Upstream MegaETH node providing blocks and contract bytecode.
+    pub data_provider: RootProvider<Optimism>,
+    /// Witness provider for fetching SALT witness data.
+    pub witness_provider: RootProvider,
 }
 
 impl RpcClient {
-    /// Creates a new RPC client connected to an Ethereum node.
+    /// Creates a new RPC client connected to MegaETH blockchain nodes.
     ///
     /// # Arguments
-    /// * `api` - HTTP URL of the Ethereum RPC endpoint (e.g., "http://localhost:8545")
+    /// * `data_api` - HTTP URL of the standard JSON-RPC endpoint for blocks and contract data
+    /// * `witness_api` - HTTP URL of the witness RPC endpoint for SALT witness data
     ///
     /// # Returns
-    /// Configured RPC client ready to make requests to the Optimism network.
+    /// Configured RPC client ready to make requests to the MegaETH blockchain.
     ///
     /// # Errors
-    /// Returns error if the API URL is malformed or invalid.
-    pub fn new(api: &str) -> Result<Self> {
+    /// Returns error if either API URL is malformed or invalid.
+    pub fn new(data_api: &str, witness_api: &str) -> Result<Self> {
         Ok(Self {
-            provider: ProviderBuilder::<_, _, Optimism>::default()
-                .connect_http(api.parse().context("Failed to parse API URL")?),
+            data_provider: ProviderBuilder::<_, _, Optimism>::default()
+                .connect_http(data_api.parse().context("Failed to parse API URL")?),
+            witness_provider: ProviderBuilder::default()
+                .connect_http(witness_api.parse().context("Failed to parse API URL")?),
         })
     }
 
@@ -57,7 +67,7 @@ impl RpcClient {
         block_number: BlockNumberOrTag,
     ) -> Result<Vec<Bytes>> {
         try_join_all(addresses.iter().map(|&addr| async move {
-            self.provider
+            self.data_provider
                 .get_code_at(addr)
                 .block_id(block_number.into())
                 .await
@@ -81,9 +91,9 @@ impl RpcClient {
     /// Returns error if block doesn't exist or RPC call fails.
     pub async fn get_block(&self, block_id: BlockId, full_txs: bool) -> Result<Block<Transaction>> {
         let block = if full_txs {
-            self.provider.get_block(block_id).full().await?
+            self.data_provider.get_block(block_id).full().await?
         } else {
-            self.provider.get_block(block_id).await?
+            self.data_provider.get_block(block_id).await?
         };
         block.ok_or_else(|| eyre!("Block {:?} not found", block_id))
     }
@@ -96,7 +106,7 @@ impl RpcClient {
     /// # Errors
     /// Returns error if unable to connect to the blockchain or RPC fails.
     pub async fn get_latest_block_number(&self) -> Result<u64> {
-        self.provider
+        self.data_provider
             .get_block_number()
             .await
             .context("Failed to get block number")
@@ -105,25 +115,48 @@ impl RpcClient {
     /// Gets execution witness data for a specific block.
     ///
     /// # Arguments
+    /// * `number` - Block number to fetch witness data for
     /// * `hash` - Block hash to fetch witness data for
     ///
     /// # Returns
-    /// Decoded witness containing state access patterns and execution traces
+    /// [`SaltWitness`] containing state access patterns and execution traces
     /// required for stateless validation.
     ///
     /// # Errors
-    /// Returns error if block hash doesn't exist, witness unavailable, or
-    /// witness data is corrupted and cannot be decoded.
-    pub async fn get_witness(&self, hash: B256) -> Result<SaltWitness> {
-        self.provider
+    /// Returns error if block hash doesn't exist, witness unavailable
+    pub async fn get_witness(&self, number: u64, hash: B256) -> Result<SaltWitness> {
+        self.witness_provider
             .client()
-            .request("eth_getWitness", (format!("0x{}", hex::encode(hash)),))
+            .request("mega_getBlockWitness", (number.to_string(), hash))
             .await
-            .context(format!("get_witness for block {hash}"))
-            .and_then(|data: Vec<u8>| {
-                bincode::serde::decode_from_slice(&data, bincode::config::legacy())
-                    .map(|(witness, _): (SaltWitness, usize)| witness)
-                    .context(format!("Failed to decode witness for block {hash}"))
-            })
+            .map_err(|e| eyre!("Failed to get witness for block {hash}: {e}"))
+    }
+
+    /// Reports a range of validated blocks to the upstream node.
+    ///
+    /// Notifies the upstream node that the validator has successfully validated
+    /// a contiguous range of blocks in its canonical chain.
+    ///
+    /// # Arguments
+    /// * `first_block` - Tuple of (block number, block hash) for the earliest validated block
+    /// * `last_block` - Tuple of (block number, block hash) for the latest validated block
+    ///
+    /// # Returns
+    /// [`SetValidatedBlocksResponse`] containing:
+    /// - `accepted`: Whether the upstream node accepted the report
+    /// - `last_validated_block`: The upstream's current last validated block (number, hash)
+    ///
+    /// # Errors
+    /// Returns error if the RPC call fails or connection is lost.
+    pub async fn set_validated_blocks(
+        &self,
+        first_block: (u64, B256),
+        last_block: (u64, B256),
+    ) -> Result<SetValidatedBlocksResponse> {
+        self.data_provider
+            .client()
+            .request("mega_setValidatedBlocks", (first_block, last_block))
+            .await
+            .map_err(|e| eyre!("Failed to set validated blocks: {e}"))
     }
 }
