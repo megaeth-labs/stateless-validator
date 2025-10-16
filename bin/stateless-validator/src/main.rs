@@ -803,7 +803,7 @@ async fn find_divergence_point(
         (earliest_local.0, mismatch_block, earliest_local.0);
     while left <= right {
         let mid = left + (right - left) / 2;
-        let local_hash = validator_db.get_block_hash(mid, false)?.unwrap();
+        let local_hash = validator_db.get_block_hash(mid)?.unwrap();
         let remote_hash = client
             .get_block(BlockId::Number(mid.into()), false)
             .await?
@@ -839,7 +839,6 @@ mod tests {
         fs::File,
         io::{BufRead, BufReader},
         path::Path,
-        sync::RwLock,
     };
 
     /// Maximum response body size for the RPC server.
@@ -895,9 +894,6 @@ mod tests {
 
         /// Maximum block in the test data set (block number and hash)
         max_block: (u64, BlockHash),
-
-        /// Last validated block in the test data set (block number and hash)
-        last_validated_block: Arc<RwLock<(u64, BlockHash)>>,
     }
 
     /// Parse block number and hash from string
@@ -1033,12 +1029,10 @@ mod tests {
             .unwrap();
 
         module
-            .register_method("mega_setValidatedBlocks", |params, context, _| {
+            .register_method("mega_setValidatedBlocks", |params, _context, _| {
                 let (_first_block, last_block): ((u64, String), (u64, String)) =
                     params.parse().unwrap();
                 let last_hash = parse_block_hash(&last_block.1).unwrap();
-                let mut last_validated = context.last_validated_block.write().unwrap();
-                *last_validated = (last_block.0, last_hash);
 
                 // Return response with accepted=true and the last validated block
                 let response = serde_json::json!({
@@ -1226,7 +1220,6 @@ mod tests {
             contracts,
             min_block,
             max_block,
-            last_validated_block: Arc::new(RwLock::new(min_block)),
         })
     }
 

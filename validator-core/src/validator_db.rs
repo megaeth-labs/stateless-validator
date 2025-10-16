@@ -809,21 +809,16 @@ impl ValidatorDB {
     /// - CANONICAL_CHAIN: Lower block numbers (validated blocks)
     /// - REMOTE_CHAIN: Higher block numbers (unvalidated blocks extending canonical)
     ///
-    /// The function first checks the canonical chain. If not found there, it will
-    /// check the remote chain unless `only_canonical` is set to true.
-    ///
     /// # Parameters
     /// * `block_number` - The block number to look up in the local view
-    /// * `only_canonical` - If true, only search in CANONICAL_CHAIN; if false, also search REMOTE_CHAIN
     ///
     /// # Returns
-    /// * `Ok(Some(block_hash))` - Block found at the specified number in the searched chain(s)
-    /// * `Ok(None)` - No block exists at this number in the searched chain(s)
+    /// * `Ok(Some(block_hash))` - Block found at the specified number
+    /// * `Ok(None)` - No block exists at this number in the local view
     /// * `Err(...)` - Database error during lookup
     pub fn get_block_hash(
         &self,
         block_number: BlockNumber,
-        only_canonical: bool,
     ) -> ValidationDbResult<Option<BlockHash>> {
         let read_txn = self.database.begin_read()?;
         let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
@@ -832,8 +827,6 @@ impl ValidatorDB {
         // Check canonical chain first, then remote chain (sequential, no overlap)
         if let Some(value) = canonical_chain.get(block_number)? {
             return Ok(Some(value.value().0.into()));
-        } else if only_canonical {
-            return Ok(None);
         }
 
         Ok(remote_chain.get(block_number)?.map(|v| v.value().into()))
