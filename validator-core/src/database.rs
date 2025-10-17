@@ -8,7 +8,7 @@ use crate::data_types::{PlainKey, PlainValue};
 use alloy_eips::eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS};
 use alloy_primitives::{Address, B256, BlockNumber};
 use alloy_rpc_types_eth::Header;
-use mega_evm::{ExternalEnvs, SaltEnv};
+use mega_evm::{ExternalEnvs, OracleEnv, SaltEnv};
 use revm::{
     DatabaseRef,
     database::DBErrorMarker,
@@ -255,10 +255,21 @@ impl SaltEnv for WitnessEnvOracle {
     }
 }
 
+impl OracleEnv for WitnessEnvOracle {
+    fn get_oracle_storage(&self, _slot: U256) -> Option<U256> {
+        None
+    }
+}
+
 impl ExternalEnvs for WitnessEnvOracle {
-    type SaltEnv = WitnessEnvOracle;
+    type SaltEnv = Self;
+    type OracleEnv = Self;
 
     fn salt_env(&self) -> Self::SaltEnv {
+        self.clone()
+    }
+
+    fn oracle_env(&self) -> Self::OracleEnv {
         self.clone()
     }
 }

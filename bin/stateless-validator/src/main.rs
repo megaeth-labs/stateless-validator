@@ -685,6 +685,7 @@ async fn validation_reporter(
             .await
         {
             Ok(response) if response.accepted => {
+                info!("[Reporter] Reported blocks successfully: {first_block:?} - {last_block:?}");
                 last_reported_block = last_block;
             }
             Ok(response) => {

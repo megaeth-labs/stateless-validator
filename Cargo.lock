@@ -1904,7 +1904,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "778e2ac28f6c47af28e4907f13ffd1e1ddbd400980a9abd7c8df189bf578a5ad"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2903,7 +2903,7 @@ dependencies = [
 [[package]]
 name = "mega-evm"
 version = "0.0.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=054ff850bcb9025d4306576866f1ca754b3b34ab#054ff850bcb9025d4306576866f1ca754b3b34ab"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=912761d3b54ac98600af2a1145c0e73889540e40#912761d3b54ac98600af2a1145c0e73889540e40"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -2916,6 +2916,7 @@ dependencies = [
  "clap",
  "delegate",
  "derive_more",
+ "once_cell",
  "op-alloy-consensus",
  "op-revm",
  "revm",
@@ -4339,7 +4340,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4907,7 +4908,7 @@ dependencies = [
  "getrandom 0.3.3",
  "once_cell",
  "rustix",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
