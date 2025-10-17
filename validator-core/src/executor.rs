@@ -26,13 +26,13 @@
 use alloy_consensus::transaction::Recovered;
 use alloy_evm::{
     EvmEnv, EvmFactory as AlloyEvmFactory,
-    block::{BlockExecutor, BlockExecutorFactory as AlloyBlockExecutorFactory},
+    block::{BlockExecutor, BlockExecutorFactory},
 };
 use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{Address, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
-use mega_evm::{BlockExecutionCtx, BlockExecutorFactory, EvmFactory, SpecId};
+use mega_evm::{BlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory, MegaSpecId};
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use op_revm::L1BlockInfo;
 use revm::{
@@ -143,7 +143,7 @@ pub struct ValidationResult {
 /// - Chain configuration with appropriate spec ID for the block number
 /// - Block environment with gas limits, timestamps, and fee parameters
 /// - Blob gas pricing if excess blob gas is present in the header
-fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<SpecId> {
+fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<MegaSpecId> {
     let cfg_env = CfgEnv::new_with_spec(chain_spec.spec_id_at_timestamp(header.timestamp))
         .with_chain_id(chain_spec.chain_id);
 
@@ -211,9 +211,9 @@ fn replay_block(
     let mut state = StateBuilder::new().with_database_ref(db).build();
     let evm_env = create_evm_env(&block.header, chain_spec);
 
-    let executor_factory = BlockExecutorFactory::new(
+    let executor_factory = MegaBlockExecutorFactory::new(
         chain_spec.clone(),
-        EvmFactory::new(env_oracle),
+        MegaEvmFactory::new(env_oracle),
         OpAlloyReceiptBuilder::default(),
     );
 

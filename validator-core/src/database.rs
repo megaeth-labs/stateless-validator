@@ -8,7 +8,7 @@ use crate::data_types::{PlainKey, PlainValue};
 use alloy_eips::eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS};
 use alloy_primitives::{Address, B256, BlockNumber};
 use alloy_rpc_types_eth::Header;
-use mega_evm::ExternalEnvOracle;
+use mega_evm::{ExternalEnvs, SaltEnv};
 use revm::{
     DatabaseRef,
     database::DBErrorMarker,
@@ -231,7 +231,7 @@ impl WitnessEnvOracle {
     }
 }
 
-impl ExternalEnvOracle for WitnessEnvOracle {
+impl SaltEnv for WitnessEnvOracle {
     type Error = WitnessDatabaseError;
 
     fn get_bucket_capacity(
@@ -252,6 +252,14 @@ impl ExternalEnvOracle for WitnessEnvOracle {
             .ok_or_else(|| {
                 WitnessDatabaseError(format!("Capacity of bucket {bucket_id} not in witness"))
             })
+    }
+}
+
+impl ExternalEnvs for WitnessEnvOracle {
+    type SaltEnv = WitnessEnvOracle;
+
+    fn salt_env(&self) -> Self::SaltEnv {
+        self.clone()
     }
 }
 
