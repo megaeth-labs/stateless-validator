@@ -1235,7 +1235,7 @@ mod tests {
                 let file_data = std::fs::read(&file_path)?;
 
                 match ext {
-                    "w" => {
+                    "salt" => {
                         let salt_witness: WitnessFileContent = bincode::serde::decode_from_slice(&file_data, bincode::config::legacy())
                             .map_err(|e| anyhow!("Failed to deserialize SaltWitness from file_data {block_num_and_hash}: {e}"))?.0;
                         witness_data.insert(block_hash, salt_witness.salt_witness);
