@@ -163,18 +163,20 @@ impl<'a> DatabaseRef for WitnessDatabase<'a> {
     }
 }
 
-/// External environment oracle backed by witness data.
+/// Witness-backed external environment provider for mega-evm execution.
 ///
-/// This oracle provides bucket capacity information for EVM execution
-/// by extracting metadata from the witness at construction time.
+/// Implements the `ExternalEnvs` trait required by mega-evm, providing both
+/// `SaltEnv` (for bucket capacity lookups) and `OracleEnv` (for oracle storage)
+/// implementations. The environment state is extracted from a SALT witness at
+/// construction time for efficient lookups during EVM execution.
 #[derive(Debug, Clone)]
-pub struct WitnessEnvOracle {
+pub struct WitnessExternalEnv {
     block_number: BlockNumber,
     bucket_capacities: HashMap<BucketId, u64>,
 }
 
-impl WitnessEnvOracle {
-    /// Creates a new environment oracle from a SALT witness.
+impl WitnessExternalEnv {
+    /// Creates a new external environment provider from a SALT witness.
     ///
     /// Extracts bucket capacity metadata from the witness to provide efficient
     /// capacity lookups during EVM execution. Only metadata buckets are scanned
@@ -187,7 +189,7 @@ impl WitnessEnvOracle {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(WitnessEnvOracle)` if all metadata is valid, or an error if:
+    /// Returns `Ok(WitnessExternalEnv)` if all metadata is valid, or an error if:
     /// - Any metadata key has a `None` value (malformed witness)
     /// - Metadata cannot be parsed as `BucketMeta` (corrupt witness)
     ///
@@ -231,7 +233,20 @@ impl WitnessEnvOracle {
     }
 }
 
-impl SaltEnv for WitnessEnvOracle {
+impl ExternalEnvs for WitnessExternalEnv {
+    type SaltEnv = Self;
+    type OracleEnv = Self;
+
+    fn salt_env(&self) -> Self::SaltEnv {
+        self.clone()
+    }
+
+    fn oracle_env(&self) -> Self::OracleEnv {
+        self.clone()
+    }
+}
+
+impl SaltEnv for WitnessExternalEnv {
     type Error = WitnessDatabaseError;
 
     fn get_bucket_capacity(
@@ -255,22 +270,9 @@ impl SaltEnv for WitnessEnvOracle {
     }
 }
 
-impl OracleEnv for WitnessEnvOracle {
+impl OracleEnv for WitnessExternalEnv {
     fn get_oracle_storage(&self, _slot: U256) -> Option<U256> {
         None
-    }
-}
-
-impl ExternalEnvs for WitnessEnvOracle {
-    type SaltEnv = Self;
-    type OracleEnv = Self;
-
-    fn salt_env(&self) -> Self::SaltEnv {
-        self.clone()
-    }
-
-    fn oracle_env(&self) -> Self::OracleEnv {
-        self.clone()
     }
 }
 
@@ -289,7 +291,7 @@ mod tests {
         let key = SaltKey::from((256u32, 0u64));
 
         let (bucket_id, capacity) =
-            WitnessEnvOracle::parse_metadata_entry(&key, &Some(meta.into())).unwrap();
+            WitnessExternalEnv::parse_metadata_entry(&key, &Some(meta.into())).unwrap();
 
         assert_eq!(bucket_id, 65536);
         assert_eq!(capacity, 1024);
@@ -299,7 +301,7 @@ mod tests {
     #[test]
     fn test_parse_metadata_entry_none_value() {
         let key = SaltKey::from((256u32, 0u64));
-        let err = WitnessEnvOracle::parse_metadata_entry(&key, &None).unwrap_err();
+        let err = WitnessExternalEnv::parse_metadata_entry(&key, &None).unwrap_err();
         assert!(err.0.contains("metadata is None for bucket 65536"));
     }
 
@@ -309,7 +311,7 @@ mod tests {
         let key = SaltKey::from((256u32, 0u64));
         let invalid_value = SaltValue::new(&[1, 2, 3], &[]);
 
-        let err = WitnessEnvOracle::parse_metadata_entry(&key, &Some(invalid_value)).unwrap_err();
+        let err = WitnessExternalEnv::parse_metadata_entry(&key, &Some(invalid_value)).unwrap_err();
 
         assert!(err.0.contains("bad metadata for bucket 65536"));
     }

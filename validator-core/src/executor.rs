@@ -50,7 +50,7 @@ use thiserror::Error;
 use crate::{
     chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec},
     data_types::{Account, PlainKey, PlainValue},
-    database::{WitnessDatabase, WitnessDatabaseError, WitnessEnvOracle},
+    database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv},
     withdrawals::{self, ADDRESS_L2_TO_L1_MESSAGE_PASSER, MptWitness},
 };
 
@@ -200,7 +200,7 @@ fn replay_block(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
     db: &WitnessDatabase<'_>,
-    env_oracle: WitnessEnvOracle,
+    env_oracle: WitnessExternalEnv,
 ) -> Result<alloy_primitives::map::HashMap<Address, CacheAccount>, ValidationError> {
     // Extract full transaction data
     let BlockTransactions::Full(transactions) = &block.transactions else {
@@ -283,7 +283,7 @@ pub fn validate_block(
     contracts: &HashMap<B256, Bytecode>,
 ) -> Result<(), ValidationError> {
     // Create external environment oracle from salt witness
-    let env_oracle = WitnessEnvOracle::new(&salt_witness, block.header.number)
+    let env_oracle = WitnessExternalEnv::new(&salt_witness, block.header.number)
         .map_err(ValidationError::EnvOracleConstructionFailed)?;
 
     // Verify witness proof against the current state root
