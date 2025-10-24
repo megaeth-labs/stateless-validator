@@ -56,7 +56,7 @@ pub enum WithdrawalValidationError {
 ///
 /// Contains the storage root and trie nodes needed to verify storage state
 /// transitions during withdrawal processing.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MptWitness {
     /// The pre-state storage root of the L2ToL1MessagePasser contract
     pub storage_root: B256,
