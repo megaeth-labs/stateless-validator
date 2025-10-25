@@ -30,7 +30,7 @@ revm = { version = "27.1.0", default-features = false }
 
 # megaeth 
 mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "912761d3b54ac98600af2a1145c0e73889540e40" }
-salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "fb0262b33a60e59aea4debfc97f51dbf7ea437f6" }
+salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "645dd2f46c0592e8162b5b3a7cdda517630a512c" }
 
 # reth
 reth-ethereum-forks = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0" }

@@ -330,17 +330,11 @@ pub fn validate_block(
     }
 
     // Update the SALT state
-    let mut state = EphemeralSaltState::new(&witness);
-    let mut state_updates = state
-        .update(&kv_updates)
+    let state_updates = EphemeralSaltState::new(&witness)
+        .update_fin(&kv_updates)
         .map_err(ValidationError::StateUpdateFailed)?;
 
-    state_updates.merge(
-        state
-            .canonicalize()
-            .map_err(ValidationError::StateUpdateFailed)?,
-    );
-
+    // Update the state root
     let (state_root, _) = StateRoot::new(&witness)
         .update_fin(&state_updates)
         .map_err(ValidationError::TrieUpdateFailed)?;
