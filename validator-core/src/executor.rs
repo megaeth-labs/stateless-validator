@@ -32,7 +32,7 @@ use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{Address, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
-use mega_evm::{BlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory, MegaSpecId};
+use mega_evm::{MegaBlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory, MegaSpecId};
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use op_revm::L1BlockInfo;
 use revm::{
@@ -217,7 +217,7 @@ fn replay_block(
         OpAlloyReceiptBuilder::default(),
     );
 
-    let execution_context = BlockExecutionCtx {
+    let execution_context = MegaBlockExecutionCtx {
         parent_hash: block.header.parent_hash,
         parent_beacon_block_root: block.header.parent_beacon_block_root,
         extra_data: block.header.extra_data.clone(),
