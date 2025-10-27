@@ -209,7 +209,7 @@ pub enum ValidationDbError {
     },
 
     #[error("Block validation failed: {0}")]
-    FailedValidation(#[from] ValidationError),
+    FailedValidation(String),
 
     #[error(
         "block {block_number} must extend parent block with hash {expected_parent_hash:?}, found {actual_parent_hash:?}"
@@ -462,11 +462,11 @@ impl ValidatorDB {
             };
 
             if !result.success {
-                return Err(ValidationError::StateRootMismatch {
-                    actual: result.post_state_root,
-                    claimed: result.post_state_root,
-                }
-                .into());
+                return Err(ValidationDbError::FailedValidation(
+                    result.error_message.unwrap_or_else(|| {
+                        "Validation failed but no error message was provided".to_string()
+                    }),
+                ));
             }
 
             // Verify parent chain extension for non-genesis blocks
@@ -480,19 +480,23 @@ impl ValidatorDB {
                 };
 
                 if result.pre_state_root != parent_post_state {
-                    return Err(ValidationError::PreStateRootMismatch {
-                        expected: parent_post_state,
-                        actual: result.pre_state_root,
-                    }
-                    .into());
+                    return Err(ValidationDbError::FailedValidation(
+                        ValidationError::PreStateRootMismatch {
+                            expected: parent_post_state,
+                            actual: result.pre_state_root,
+                        }
+                        .to_string(),
+                    ));
                 }
 
                 if result.pre_withdrawals_root != parent_post_withdrawals {
-                    return Err(ValidationError::PreWithdrawalsRootMismatch {
-                        expected: parent_post_withdrawals,
-                        actual: result.pre_withdrawals_root,
-                    }
-                    .into());
+                    return Err(ValidationDbError::FailedValidation(
+                        ValidationError::PreWithdrawalsRootMismatch {
+                            expected: parent_post_withdrawals,
+                            actual: result.pre_withdrawals_root,
+                        }
+                        .to_string(),
+                    ));
                 }
             }
 
@@ -670,7 +674,7 @@ impl ValidatorDB {
                     let block = decode_block_from_slice(
                         &block_data
                             .get(block_hash_bytes)?
-                            .ok_or_else(|| ValidationDbError::MissingData {
+                            .ok_or(ValidationDbError::MissingData {
                                 kind: MissingDataKind::BlockData,
                                 block_hash,
                             })?
@@ -679,7 +683,7 @@ impl ValidatorDB {
                     let witness = decode_from_slice(
                         &witnesses
                             .get(block_hash_bytes)?
-                            .ok_or_else(|| ValidationDbError::MissingData {
+                            .ok_or(ValidationDbError::MissingData {
                                 kind: MissingDataKind::Witness,
                                 block_hash,
                             })?
@@ -688,7 +692,7 @@ impl ValidatorDB {
                     let mpt_witness = decode_from_slice(
                         &mpt_witnesses
                             .get(block_hash_bytes)?
-                            .ok_or_else(|| ValidationDbError::MissingData {
+                            .ok_or(ValidationDbError::MissingData {
                                 kind: MissingDataKind::MptWitness,
                                 block_hash,
                             })?

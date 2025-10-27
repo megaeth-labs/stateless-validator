@@ -100,6 +100,8 @@ pub struct ChainSyncConfig {
     pub worker_error_sleep: Duration,
     /// Enable reporting of validated blocks to upstream node
     pub report_validation_results: bool,
+    /// Stop chain sync on first error (useful for integration tests)
+    pub stop_on_first_err: bool,
 }
 
 impl Default for ChainSyncConfig {
@@ -115,6 +117,7 @@ impl Default for ChainSyncConfig {
             worker_idle_sleep: Duration::from_millis(500),
             worker_error_sleep: Duration::from_millis(1000),
             report_validation_results: false,
+            stop_on_first_err: false,
         }
     }
 }
@@ -356,6 +359,9 @@ async fn chain_sync(
         .await
         {
             error!("[Chain Sync] Iteration failed: {}", e);
+            if config.stop_on_first_err {
+                return Err(e);
+            }
         }
     }
 }
@@ -1304,6 +1310,7 @@ mod tests {
         let config = Arc::new(ChainSyncConfig {
             concurrent_workers: 1,
             sync_target,
+            stop_on_first_err: true,
             ..ChainSyncConfig::default()
         });
 
