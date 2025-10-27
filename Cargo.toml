@@ -29,7 +29,7 @@ op-revm = { version = "8.1.0", default-features = false }
 revm = { version = "27.1.0", default-features = false }
 
 # megaeth 
-mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "912761d3b54ac98600af2a1145c0e73889540e40" }
+mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "31f8bf3139bf51fa9fbe0d939fcd55041a8396b2" }
 salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "32a2e0b9f8c426d530cd365c81bf40d86558a8a5" }
 
 # reth

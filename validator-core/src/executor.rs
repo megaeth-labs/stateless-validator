@@ -32,7 +32,7 @@ use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{Address, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
-use mega_evm::{BlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory, MegaSpecId};
+use mega_evm::{MegaBlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory, MegaSpecId};
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use op_revm::L1BlockInfo;
 use revm::{
@@ -48,7 +48,7 @@ use std::{collections::HashMap, time::SystemTime};
 use thiserror::Error;
 
 use crate::{
-    chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec},
+    chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec, MegaethHardforks},
     data_types::{Account, PlainKey, PlainValue},
     database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv},
     withdrawals::{self, ADDRESS_L2_TO_L1_MESSAGE_PASSER, MptWitness},
@@ -217,10 +217,14 @@ fn replay_block(
         OpAlloyReceiptBuilder::default(),
     );
 
-    let execution_context = BlockExecutionCtx {
+    let execution_context = MegaBlockExecutionCtx {
         parent_hash: block.header.parent_hash,
         parent_beacon_block_root: block.header.parent_beacon_block_root,
         extra_data: block.header.extra_data.clone(),
+        first_mini_rex_block: chain_spec.is_mini_rex_active_at_timestamp(block.header.timestamp)
+            && (block.header.number == 1
+                // assuming the parent block timestamp is just current block timestamp - 1
+                || !chain_spec.is_mini_rex_active_at_timestamp(block.header.timestamp - 1)),
     };
 
     // Create EVM with L1 block info configuration
