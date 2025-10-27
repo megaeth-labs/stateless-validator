@@ -52,6 +52,32 @@ cargo run --bin stateless-validator -- \
 - `--start-block`: Trusted block hash to initialize validation from (required for first-time setup)
 - `--report-validation-results`: Enable reporting of validated blocks to the upstream node (disabled by default)
 
+### Environment Variables
+
+Each command-line flag has an equivalent environment variable, which allows you to run the validator without passing long argument lists:
+
+- `STATELESS_VALIDATOR_DATA_DIR` → `--data-dir`
+- `STATELESS_VALIDATOR_RPC_ENDPOINT` → `--rpc-endpoint`
+- `STATELESS_VALIDATOR_WITNESS_ENDPOINT` → `--witness-endpoint`
+- `STATELESS_VALIDATOR_GENESIS_FILE` → `--genesis-file`
+- `STATELESS_VALIDATOR_START_BLOCK` → `--start-block`
+- `STATELESS_VALIDATOR_REPORT_VALIDATION_RESULTS` → `--report-validation-results` (set to `true` to enable)
+
+Example:
+
+```bash
+export STATELESS_VALIDATOR_DATA_DIR=/path/to/validator/data
+export STATELESS_VALIDATOR_RPC_ENDPOINT=<public-rpc-endpoint>
+export STATELESS_VALIDATOR_WITNESS_ENDPOINT=<witness-rpc-endpoint>
+export STATELESS_VALIDATOR_GENESIS_FILE=/path/to/genesis.json
+export STATELESS_VALIDATOR_START_BLOCK=<trusted-block-hash>
+export STATELESS_VALIDATOR_REPORT_VALIDATION_RESULTS=false
+
+cargo run --release --bin stateless-validator
+```
+
+**Note**: Command-line arguments take precedence over environment variables.
+
 ### Getting Started
 
 The stateless validator requires a trusted starting point and hardfork configuration for security. On first run, you must specify both a genesis file and a trusted block hash:

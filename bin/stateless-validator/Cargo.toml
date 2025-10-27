@@ -26,7 +26,7 @@ salt.workspace = true
 
 # misc
 bincode.workspace = true
-clap.workspace = true
+clap = { workspace = true, features = ["env"] }
 eyre.workspace = true
 futures.workspace = true
 num_cpus.workspace = true

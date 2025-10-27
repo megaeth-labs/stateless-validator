@@ -124,29 +124,29 @@ impl Default for ChainSyncConfig {
 #[clap(author, version, about, long_about = None)]
 struct CommandLineArgs {
     /// Directory path where validator data and database files will be stored.
-    #[clap(long)]
+    #[clap(long, env = "STATELESS_VALIDATOR_DATA_DIR")]
     data_dir: String,
 
     /// The URL of the Ethereum JSON-RPC API endpoint for fetching blockchain data.
-    #[clap(long)]
+    #[clap(long, env = "STATELESS_VALIDATOR_RPC_ENDPOINT")]
     rpc_endpoint: String,
 
     /// The URL of the MegaETH JSON-RPC API endpoint for fetching witness data.
-    #[clap(long)]
+    #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_ENDPOINT")]
     witness_endpoint: String,
 
     /// Optional trusted block hash to start validation from.
-    #[clap(long)]
+    #[clap(long, env = "STATELESS_VALIDATOR_START_BLOCK")]
     start_block: Option<String>,
 
     /// Path to the genesis JSON file for chain configuration.
     /// Required on first run, optional on subsequent runs (loads from database).
-    #[clap(long)]
+    #[clap(long, env = "STATELESS_VALIDATOR_GENESIS_FILE")]
     genesis_file: Option<String>,
 
     /// Enable reporting of validated blocks to the upstream node.
     /// When enabled, the validator will send validation results via mega_setValidatedBlock RPC.
-    #[clap(long)]
+    #[clap(long, env = "STATELESS_VALIDATOR_REPORT_VALIDATION_RESULTS")]
     report_validation_results: bool,
 }
 
