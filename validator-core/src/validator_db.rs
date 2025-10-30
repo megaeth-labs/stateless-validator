@@ -317,18 +317,16 @@ impl ValidatorDB {
         Ok(Self { database })
     }
 
-    /// Queues multiple blocks for validation using a single database transaction.
+    /// Queues blocks for validation by workers.
     ///
-    /// This batched variant minimizes transaction overhead when ingesting a burst of
-    /// remote blocks by reusing the same write transaction and table handles. For each
-    /// block, it stores the block data, both witness types, and updates the task queue
-    /// and block records in a single atomic transaction.
+    /// This method stores blocks and their witness data, making them available
+    /// for validation workers to process.
     ///
     /// # Arguments
     /// * `tasks` - A slice of tuples, each containing:
     ///   - `Block<Transaction>` - The complete block data including header and transactions
-    ///   - `SaltWitness` - The salt-based execution witness for stateless validation
-    ///   - `MptWitness` - The Merkle Patricia Trie witness for state proof verification
+    ///   - `SaltWitness` - The SALT-based execution witness required for stateless validation
+    ///   - `MptWitness` - The MPT-based witness required for withdrawal validation
     pub fn add_validation_tasks(
         &self,
         tasks: &[(Block<Transaction>, SaltWitness, MptWitness)],
@@ -349,9 +347,8 @@ impl ValidatorDB {
                 task_list.insert((block_number, block_hash), ())?;
                 // Stores the complete block data for worker access (BLOCK_DATA)
                 block_data.insert(block_hash, encode_block_to_vec(block)?)?;
-                // ... and the cryptographic witness (WITNESSES)
+                // ... and the witness data (WITNESSES and MPT_WITNESSES)
                 witnesses.insert(block_hash, encode_to_vec(salt_witness)?)?;
-                // ... and the mpt witness (MPT_WITNESSES)
                 mpt_witnesses.insert(block_hash, encode_to_vec(mpt_witness)?)?;
                 // Records the block in the block registry (BLOCK_RECORDS)
                 block_records.insert((block_number, block_hash), ())?;
@@ -513,15 +510,14 @@ impl ValidatorDB {
         Ok(true)
     }
 
-    /// Extends the remote chain with a sequence of unvalidated block headers.
+    /// Extends the remote chain with a sequence of unvalidated blocks.
     ///
-    /// This function appends newly received headers to the remote chain, which tracks
-    /// blocks that have been announced but not yet validated. The headers must form
-    /// a valid sequential chain extension (consecutive block numbers with matching
-    /// parent hashes), but their state transitions are not verified here.
+    /// Adds newly received blocks to the remote chain for future validation.
+    /// Verifies that each block's parent_hash matches the current remote chain
+    /// tip to ensure proper chain extension.
     ///
     /// # Arguments
-    /// * `headers` - An iterator of block headers to append. Must be in sequential order.
+    /// * `headers` - A consecutive sequence of blocks to append.
     pub fn grow_remote_chain<'a, I>(&self, headers: I) -> ValidationDbResult<()>
     where
         I: IntoIterator<Item = &'a Header>,
@@ -531,10 +527,7 @@ impl ValidatorDB {
             let canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
             let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
 
-            // Determine the parent block to extend from:
-            // 1. Last block in remote chain (ongoing remote sync)
-            // 2. Last block in canonical chain (starting new remote sync)
-            // 3. Genesis (starting from scratch)
+            // Compute parent block (from remote chain if not empty, otherwise canonical chain)
             let (mut parent_number, mut parent_hash) =
                 if let Some(last_remote) = remote_chain.last()? {
                     (last_remote.0.value(), last_remote.1.value())
@@ -558,10 +551,9 @@ impl ValidatorDB {
                 }
 
                 // Add header to remote chain and update parent for next iteration
-                let block_hash = BlockHash::from(header.hash);
-                remote_chain.insert(header.number, block_hash.0)?;
-                parent_number = header.number;
-                parent_hash = block_hash.0;
+                let block_hash = BlockHash::from(header.hash).0;
+                remote_chain.insert(header.number, block_hash)?;
+                (parent_number, parent_hash) = (header.number, block_hash);
             }
         }
         write_txn.commit()?;

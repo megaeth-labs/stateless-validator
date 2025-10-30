@@ -457,7 +457,8 @@ async fn remote_chain_tracker(
                 remote_tip.0 + 1
             );
 
-            let fetch_data = future::join_all(
+            // Fetch blocks in parallel
+            let tasks = future::join_all(
                 (remote_tip.0 + 1..remote_tip.0 + 1 + blocks_to_fetch).map(|block_number| {
                     let client = client.clone();
                     tokio::spawn(async move {
@@ -503,15 +504,11 @@ async fn remote_chain_tracker(
             .filter_map(|(_, result)| result.ok().and_then(|r| r.ok()))
             .collect::<Vec<_>>();
 
-            // Add successfully fetched data to remote chain
-            if fetch_data.is_empty() {
-                return Ok(());
-            }
+            // Add successfully fetched headers to remote chain
+            validator_db.add_validation_tasks(&tasks)?;
+            validator_db.grow_remote_chain(tasks.iter().map(|(block, _, _)| &block.header))?;
 
-            validator_db.add_validation_tasks(&fetch_data)?;
-            validator_db.grow_remote_chain(fetch_data.iter().map(|(block, _, _)| &block.header))?;
-
-            Ok::<(), eyre::Error>(())
+            Ok(())
         }
         .await
         {
