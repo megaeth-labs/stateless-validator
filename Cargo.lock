@@ -1170,7 +1170,7 @@ dependencies = [
 [[package]]
 name = "banderwagon"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=32a2e0b9f8c426d530cd365c81bf40d86558a8a5#32a2e0b9f8c426d530cd365c81bf40d86558a8a5"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=57fa05e716c680c129dc75712ec3ba9fec13901f#57fa05e716c680c129dc75712ec3ba9fec13901f"
 dependencies = [
  "ark-ec 0.5.0 (git+https://github.com/arkworks-rs/algebra.git?rev=da450f98b9b4bf1b4c8eec8f96b4501f9705c517)",
  "ark-ed-on-bls12-381-bandersnatch",
@@ -2490,9 +2490,9 @@ dependencies = [
 [[package]]
 name = "ipa-multipoint"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=32a2e0b9f8c426d530cd365c81bf40d86558a8a5#32a2e0b9f8c426d530cd365c81bf40d86558a8a5"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=57fa05e716c680c129dc75712ec3ba9fec13901f#57fa05e716c680c129dc75712ec3ba9fec13901f"
 dependencies = [
- "banderwagon 0.1.0 (git+https://github.com/megaeth-labs/salt.git?rev=32a2e0b9f8c426d530cd365c81bf40d86558a8a5)",
+ "banderwagon 0.1.0 (git+https://github.com/megaeth-labs/salt.git?rev=57fa05e716c680c129dc75712ec3ba9fec13901f)",
  "hex",
  "itertools 0.10.5",
  "rayon",
@@ -4309,15 +4309,15 @@ dependencies = [
 [[package]]
 name = "salt"
 version = "1.0.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=32a2e0b9f8c426d530cd365c81bf40d86558a8a5#32a2e0b9f8c426d530cd365c81bf40d86558a8a5"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=57fa05e716c680c129dc75712ec3ba9fec13901f#57fa05e716c680c129dc75712ec3ba9fec13901f"
 dependencies = [
  "ark-ff 0.5.0 (git+https://github.com/arkworks-rs/algebra.git?rev=da450f98b9b4bf1b4c8eec8f96b4501f9705c517)",
  "auto_impl",
- "banderwagon 0.1.0 (git+https://github.com/megaeth-labs/salt.git?rev=32a2e0b9f8c426d530cd365c81bf40d86558a8a5)",
+ "banderwagon 0.1.0 (git+https://github.com/megaeth-labs/salt.git?rev=57fa05e716c680c129dc75712ec3ba9fec13901f)",
  "blake3",
  "derive_more",
  "hex",
- "ipa-multipoint 0.1.0 (git+https://github.com/megaeth-labs/salt.git?rev=32a2e0b9f8c426d530cd365c81bf40d86558a8a5)",
+ "ipa-multipoint 0.1.0 (git+https://github.com/megaeth-labs/salt.git?rev=57fa05e716c680c129dc75712ec3ba9fec13901f)",
  "iter_tools",
  "once_cell",
  "rayon",
@@ -4715,7 +4715,7 @@ dependencies = [
  "op-alloy-network",
  "op-alloy-rpc-types",
  "revm",
- "salt 1.0.0 (git+https://github.com/megaeth-labs/salt.git?rev=32a2e0b9f8c426d530cd365c81bf40d86558a8a5)",
+ "salt 1.0.0 (git+https://github.com/megaeth-labs/salt.git?rev=57fa05e716c680c129dc75712ec3ba9fec13901f)",
  "serde",
  "serde_json",
  "tempfile",
@@ -5231,7 +5231,7 @@ dependencies = [
  "reth-trie-common",
  "reth-trie-sparse",
  "revm",
- "salt 1.0.0 (git+https://github.com/megaeth-labs/salt.git?rev=32a2e0b9f8c426d530cd365c81bf40d86558a8a5)",
+ "salt 1.0.0 (git+https://github.com/megaeth-labs/salt.git?rev=57fa05e716c680c129dc75712ec3ba9fec13901f)",
  "serde",
  "serde_json",
  "thiserror",

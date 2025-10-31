@@ -42,9 +42,12 @@ use revm::{
     primitives::{B256, KECCAK_EMPTY, U256},
     state::Bytecode,
 };
-use salt::{EphemeralSaltState, SaltWitness, StateRoot, Witness};
+use salt::{EphemeralSaltState, SaltValue, SaltWitness, StateRoot, StateUpdates, Witness};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, time::SystemTime};
+use std::{
+    collections::{BTreeMap, HashMap},
+    time::SystemTime,
+};
 use thiserror::Error;
 
 use crate::{
@@ -308,7 +311,7 @@ pub fn validate_block(
     let withdrawal_contract = accounts.get(&ADDRESS_L2_TO_L1_MESSAGE_PASSER).cloned();
 
     // Flatten Revm's CacheAccount format into plain key-value pairs
-    let mut kv_updates: HashMap<Vec<u8>, Option<Vec<u8>>> = HashMap::new();
+    let mut kv_updates: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
     for (address, cached_account) in accounts {
         let (Some((account_info, storage)), _) = cached_account.into_components() else {
             continue;
@@ -333,10 +336,33 @@ pub fn validate_block(
         }
     }
 
-    // Update the SALT state
-    let state_updates = EphemeralSaltState::new(&witness)
-        .update_fin(&kv_updates)
-        .map_err(ValidationError::StateUpdateFailed)?;
+    // Update the SALT state: Apply updates first, then inserts/deletes in deterministic key
+    // order (same as Witness::create). This ordering is critical: inserts/deletes may trigger
+    // key displacement or bucket expansion, invalidating the witness's direct lookup table.
+    let mut witness_state = EphemeralSaltState::new(&witness);
+    let mut state_updates = StateUpdates::default();
+    let mut inserts_or_deletes = BTreeMap::new();
+
+    for (plain_key, opt_plain_value) in kv_updates {
+        if let (Ok(Some((salt_key, old_value))), Some(new_value)) =
+            (witness_state.find(&plain_key), &opt_plain_value)
+        {
+            // Update operation: key exists and new value is not None
+            witness_state.update_value(
+                &mut state_updates,
+                salt_key,
+                Some(old_value),
+                Some(SaltValue::new(&plain_key, new_value)),
+            );
+        } else {
+            inserts_or_deletes.insert(plain_key, opt_plain_value);
+        }
+    }
+    state_updates.merge(
+        witness_state
+            .update_fin(&inserts_or_deletes)
+            .map_err(ValidationError::StateUpdateFailed)?,
+    );
 
     // Update the state root
     let (state_root, _) = StateRoot::new(&witness)
