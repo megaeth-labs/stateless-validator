@@ -2833,7 +2833,7 @@ dependencies = [
 [[package]]
 name = "mega-evm"
 version = "0.0.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=31f8bf3139bf51fa9fbe0d939fcd55041a8396b2#31f8bf3139bf51fa9fbe0d939fcd55041a8396b2"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=2a131b94350ee88985e78af35ed259f724264b2d#2a131b94350ee88985e78af35ed259f724264b2d"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -2853,6 +2853,7 @@ dependencies = [
  "revm",
  "salt 1.0.0 (git+https://github.com/megaeth-labs/salt.git?rev=10efc47cf172d69f47d72e4010bca2ec38efb7b8)",
  "serde",
+ "thiserror",
 ]
 
 [[package]]

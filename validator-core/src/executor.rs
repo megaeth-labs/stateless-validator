@@ -220,15 +220,15 @@ fn replay_block(
         OpAlloyReceiptBuilder::default(),
     );
 
-    let execution_context = MegaBlockExecutionCtx {
-        parent_hash: block.header.parent_hash,
-        parent_beacon_block_root: block.header.parent_beacon_block_root,
-        extra_data: block.header.extra_data.clone(),
-        first_mini_rex_block: chain_spec.is_mini_rex_active_at_timestamp(block.header.timestamp)
+    let execution_context = MegaBlockExecutionCtx::new(
+        block.header.parent_hash,
+        block.header.parent_beacon_block_root,
+        block.header.extra_data.clone(),
+        chain_spec.is_mini_rex_active_at_timestamp(block.header.timestamp)
             && (block.header.number == 1
                 // assuming the parent block timestamp is just current block timestamp - 1
                 || !chain_spec.is_mini_rex_active_at_timestamp(block.header.timestamp - 1)),
-    };
+    );
 
     // Create EVM with L1 block info configuration
     let mut evm = executor_factory
