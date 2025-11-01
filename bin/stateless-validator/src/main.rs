@@ -1,8 +1,8 @@
 use alloy_genesis::Genesis;
 use alloy_primitives::{Address, B256, BlockHash, BlockNumber, hex};
-use alloy_rpc_types_eth::{Block, BlockId};
+use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
 use clap::Parser;
-use eyre::{Result, anyhow};
+use eyre::{Result, anyhow, ensure};
 use futures::future;
 use op_alloy_rpc_types::Transaction;
 use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
@@ -34,12 +34,11 @@ const VALIDATOR_DB_FILENAME: &str = "validator.redb";
 /// Accepts hex strings with or without "0x" prefix. Must be exactly 32 bytes when decoded.
 fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
     let hash_bytes = hex::decode(hex_str)?;
-    if hash_bytes.len() != 32 {
-        return Err(anyhow!(
-            "Block hash must be 32 bytes, got {}",
-            hash_bytes.len()
-        ));
-    }
+    ensure!(
+        hash_bytes.len() == 32,
+        "Block hash must be 32 bytes, got {}",
+        hash_bytes.len()
+    );
     Ok(BlockHash::from_slice(&hash_bytes))
 }
 
@@ -208,11 +207,10 @@ async fn main() -> Result<()> {
         );
     } else {
         // If no start block was provided, ensure we have an existing canonical chain
-        if validator_db.get_local_tip()?.is_none() {
-            return Err(anyhow!(
-                "No trusted starting point found. Specify a trusted block with --start-block <blockhash>"
-            ));
-        }
+        ensure!(
+            validator_db.get_local_tip()?.is_some(),
+            "No trusted starting point found. Specify a trusted block with --start-block <blockhash>"
+        );
         info!("[Main] Continuing from existing canonical chain");
     }
 
@@ -603,11 +601,19 @@ async fn validate_one(
 
             // Fetch missing contract codes via RPC and update the local DB
             let codes = client
-                .get_code(&missing_contracts, (block_number - 1).into())
+                .get_code(&missing_contracts, BlockNumberOrTag::Latest)
                 .await?;
 
             for (address, bytes) in missing_contracts.iter().zip(codes.iter()) {
                 let bytecode = Bytecode::new_raw(bytes.clone());
+                let codehash = bytecode.hash_slow();
+
+                ensure!(
+                    codehash == codehashes[address],
+                    "RPC provider returned bytecode with unexpected codehash for {address}: expected {:?}, got {codehash:?}",
+                    codehashes[address]
+                );
+
                 validator_db.add_contract_code(&bytecode)?;
                 contracts.insert(codehashes[address], bytecode);
             }
@@ -928,8 +934,8 @@ mod tests {
         /// Mpt Witness data indexed by block hash
         mpt_witness_data: HashMap<BlockHash, MptWitness>,
 
-        /// Contract bytecode cache
-        contracts: HashMap<B256, Bytecode>,
+        /// Contract bytecode indexed by address for eth_getCode RPC
+        address_bytecodes: HashMap<Address, Bytecode>,
 
         /// Minimum block in the test data set (block number and hash)
         min_block: (u64, BlockHash),
@@ -996,14 +1002,6 @@ mod tests {
             .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", block_hash))?;
         validator_db.reset_anchor_block(block_num, block_hash, state_root, withdrawals_root)?;
 
-        // Populate CONTRACTS table with test contract bytecode
-        let contracts = load_contracts(CONTRACTS_FILE);
-        contracts.into_iter().for_each(|(code_hash, bytecode)| {
-            validator_db
-                .add_contract_code(&bytecode)
-                .unwrap_or_else(|e| panic!("Failed to add contract {code_hash} to database: {e}"))
-        });
-
         Ok(Arc::new(validator_db))
     }
 
@@ -1047,6 +1045,23 @@ mod tests {
             .register_method("eth_blockNumber", |_params, context, _| {
                 // Return the largest block number available in test data
                 Ok::<String, ErrorObjectOwned>(format!("0x{:x}", context.max_block.0))
+            })
+            .unwrap();
+
+        module
+            .register_method("eth_getCode", |params, context, _| {
+                let (address, _block_id): (Address, BlockNumberOrTag) =
+                    params.parse().map_err(|e| {
+                        make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
+                    })?;
+
+                let code = context
+                    .address_bytecodes
+                    .get(&address)
+                    .map(|bc| bc.original_bytes())
+                    .unwrap_or_default();
+
+                Ok::<_, ErrorObject<'static>>(code)
             })
             .unwrap();
 
@@ -1269,17 +1284,24 @@ mod tests {
             );
         }
 
-        // Load contract data
-        info!("Loading contract data from {}", CONTRACTS_FILE);
+        // Load contract data and build address-to-bytecode mapping from witness data
         let contracts = load_contracts(CONTRACTS_FILE);
-        info!("Loaded {} contracts", contracts.len());
+        info!("Loaded {} contracts from {CONTRACTS_FILE}", contracts.len());
+
+        let address_bytecodes: HashMap<Address, Bytecode> = witness_data
+            .values()
+            .flat_map(extract_contract_codes)
+            .filter_map(|(addr, codehash)| {
+                contracts.get(&codehash).map(|code| (addr, code.clone()))
+            })
+            .collect();
 
         Ok(RpcModuleContext {
             blocks_by_hash,
             block_hashes,
             witness_data,
             mpt_witness_data,
-            contracts,
+            address_bytecodes,
             min_block,
             max_block,
         })
@@ -1296,7 +1318,7 @@ mod tests {
             "Context created with {} blocks, {} witnesses, {} contracts",
             context.blocks_by_hash.len(),
             context.witness_data.len(),
-            context.contracts.len()
+            context.address_bytecodes.len()
         );
         info!(
             "Block range: {} - {}",
