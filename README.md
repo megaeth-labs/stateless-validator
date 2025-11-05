@@ -34,6 +34,9 @@ cargo build --release
 ### Running
 
 ```bash
+STATELESS_VALIDATOR_LOG_FILE_DIRECTORY=/path/to/log_dir \
+STATELESS_VALIDATOR_LOG_FILE_FILTER=debug \
+STATELESS_VALIDATOR_LOG_STDOUT_FILTER=info \
 cargo run --bin stateless-validator -- \
   --data-dir /path/to/validator/data \
   --rpc-endpoint <public-rpc-endpoint> \
@@ -63,6 +66,13 @@ Each command-line flag has an equivalent environment variable, which allows you 
 - `STATELESS_VALIDATOR_START_BLOCK` → `--start-block`
 - `STATELESS_VALIDATOR_REPORT_VALIDATION_RESULTS` → `--report-validation-results` (set to `true` to enable)
 
+**Logging Configuration:**
+- `STATELESS_VALIDATOR_LOG_FILE_DIRECTORY`: directory for log files; enables file logging when set. Files rotate daily as stateless-validator.log.YYYY-MM-DD
+- `STATELESS_VALIDATOR_LOG_FILE_FILTER`: debug|info|warn|error (default: debug)
+- `STATELESS_VALIDATOR_LOG_STDOUT_FILTER`: debug|info|warn|error (default: info)
+
+Log levels: **DEBUG** (detailed diagnostics), **INFO** (key operations), **WARN** (non-critical issues), **ERROR** (serious failures). For production, use `info` for terminal output and `debug` for file logging.
+
 Example:
 
 ```bash
@@ -72,6 +82,9 @@ export STATELESS_VALIDATOR_WITNESS_ENDPOINT=<witness-rpc-endpoint>
 export STATELESS_VALIDATOR_GENESIS_FILE=/path/to/genesis.json
 export STATELESS_VALIDATOR_START_BLOCK=<trusted-block-hash>
 export STATELESS_VALIDATOR_REPORT_VALIDATION_RESULTS=false
+export STATELESS_VALIDATOR_LOG_FILE_DIRECTORY=/path/to/log_dir
+export STATELESS_VALIDATOR_LOG_FILE_FILTER=debug
+export STATELESS_VALIDATOR_LOG_STDOUT_FILTER=info
 
 cargo run --release --bin stateless-validator
 ```
