@@ -33,80 +33,54 @@ const VALIDATOR_DB_FILENAME: &str = "validator.redb";
 /// Initialize logging system with environment variable configuration
 ///
 /// Supports the following environment variables:
-/// - STATELESS_VALIDATOR_LOG_STDOUT_FILTER: Log level for stdout (debug/info/warn/error), default: info
-/// - STATELESS_VALIDATOR_LOG_FILE_FILTER: Log level for file output (debug/info/warn/error), default: debug
 /// - STATELESS_VALIDATOR_LOG_FILE_DIRECTORY: Directory for log files (optional, file logging disabled if not set)
-/// - STATELESS_VALIDATOR_LOG_STDOUT_FORMAT: Format for stdout (terminal/json), default: terminal
-/// - STATELESS_VALIDATOR_LOG_FILE_FORMAT: Format for file output (terminal/json), default: terminal
+/// - STATELESS_VALIDATOR_LOG_FILE_FILTER: Log level for file output (debug/info/warn/error), default: debug
+/// - STATELESS_VALIDATOR_LOG_STDOUT_FILTER: Log level for stdout (debug/info/warn/error), default: info
 fn init_logging() -> Result<()> {
     use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
-    // Read environment variables with defaults
-    let stdout_filter = std::env::var("STATELESS_VALIDATOR_LOG_STDOUT_FILTER")
-        .unwrap_or_else(|_| "info".to_string());
+    // Load environment configuration with defaults
+    let file_directory = std::env::var("STATELESS_VALIDATOR_LOG_FILE_DIRECTORY").ok();
     let file_filter = std::env::var("STATELESS_VALIDATOR_LOG_FILE_FILTER")
         .unwrap_or_else(|_| "debug".to_string());
-    let file_directory = std::env::var("STATELESS_VALIDATOR_LOG_FILE_DIRECTORY").ok();
-    let stdout_format = std::env::var("STATELESS_VALIDATOR_LOG_STDOUT_FORMAT")
-        .unwrap_or_else(|_| "terminal".to_string());
-    let file_format = std::env::var("STATELESS_VALIDATOR_LOG_FILE_FORMAT")
-        .unwrap_or_else(|_| "terminal".to_string());
+    let stdout_filter = std::env::var("STATELESS_VALIDATOR_LOG_STDOUT_FILTER")
+        .unwrap_or_else(|_| "info".to_string());
 
-    // Create stdout layer with appropriate format and filter
-    let stdout_env_filter =
-        EnvFilter::try_new(&stdout_filter).unwrap_or_else(|_| EnvFilter::new("info"));
+    // Configure stdout layer
+    let stdout_layer = fmt::layer()
+        .with_writer(std::io::stdout)
+        .with_filter(EnvFilter::try_new(&stdout_filter).unwrap_or_else(|_| EnvFilter::new("info")))
+        .boxed();
 
-    let stdout_layer = if stdout_format == "json" {
-        fmt::layer()
-            .json()
-            .with_writer(std::io::stdout)
-            .with_filter(stdout_env_filter)
-            .boxed()
-    } else {
-        fmt::layer()
-            .with_writer(std::io::stdout)
-            .with_filter(stdout_env_filter)
-            .boxed()
-    };
-
-    // Initialize the subscriber with stdout layer
     let subscriber = tracing_subscriber::registry().with(stdout_layer);
 
-    // Add file layer if directory is configured
-    if let Some(log_dir) = file_directory {
-        let log_path = PathBuf::from(&log_dir);
+    // Optionally add file layer if directory is specified
+    if let Some(log_dir) = &file_directory {
+        let log_path = PathBuf::from(log_dir);
         std::fs::create_dir_all(&log_path)
             .map_err(|e| anyhow!("Failed to create log directory {}: {}", log_dir, e))?;
 
-        // Create rolling file appender (daily rotation)
-        let file_appender =
-            RollingFileAppender::new(Rotation::DAILY, log_path, "stateless-validator.log");
-
-        let file_env_filter =
-            EnvFilter::try_new(&file_filter).unwrap_or_else(|_| EnvFilter::new("debug"));
-
-        let file_layer = if file_format == "json" {
-            fmt::layer()
-                .json()
-                .with_writer(file_appender)
-                .with_filter(file_env_filter)
-                .boxed()
-        } else {
-            fmt::layer()
-                .with_writer(file_appender)
-                .with_filter(file_env_filter)
-                .boxed()
-        };
+        // Configure file layer with daily rotation and filter
+        let file_layer = fmt::layer()
+            .with_writer(RollingFileAppender::new(
+                Rotation::DAILY,
+                log_path,
+                "stateless-validator.log",
+            ))
+            .with_filter(
+                EnvFilter::try_new(&file_filter).unwrap_or_else(|_| EnvFilter::new("debug")),
+            )
+            .boxed();
 
         subscriber.with(file_layer).init();
         info!(
-            "[Logging] Initialized with stdout filter={}, file filter={}, file directory={}",
+            "[Logging] Initialized: stdout={}, file={} ({})",
             stdout_filter, file_filter, log_dir
         );
     } else {
         subscriber.init();
         info!(
-            "[Logging] Initialized with stdout filter={}, file logging disabled",
+            "[Logging] Initialized: stdout={}, file logging disabled",
             stdout_filter
         );
     }
@@ -184,6 +158,8 @@ pub struct ChainSyncConfig {
     pub worker_idle_sleep: Duration,
     /// Time to wait when validation workers encounter errors
     pub worker_error_sleep: Duration,
+    /// Maximum number of retries for each chain sync iteration`
+    pub chain_sync_error_max_retries: usize,
     /// Time to wait when remote tracker encounters RPC/DB errors
     pub tracker_error_sleep: Duration,
     /// Enable reporting of validated blocks to upstream node
@@ -202,6 +178,7 @@ impl Default for ChainSyncConfig {
             pruner_blocks_to_keep: 1000,
             worker_idle_sleep: Duration::from_millis(500),
             worker_error_sleep: Duration::from_millis(1000),
+            chain_sync_error_max_retries: 10,
             tracker_error_sleep: Duration::from_secs(1),
             report_validation_results: false,
         }
@@ -416,6 +393,8 @@ async fn chain_sync(
     // Step 6: Main chain synchronizer loop
     info!("[Chain Sync] Starting main synchronizer loop...");
 
+    let mut retry_count = 0;
+
     loop {
         if let Some(target) = config.sync_target
             && let Ok(Some((local_block_number, _))) = validator_db.get_local_tip()
@@ -436,7 +415,6 @@ async fn chain_sync(
                 debug!("[Chain Sync] Advanced canonical chain by {blocks_advanced} blocks");
             } else {
                 // No work to do, wait a bit before polling again
-                debug!("[Chain Sync] No blocks to advance, waiting");
                 tokio::time::sleep(config.sync_poll_interval).await;
             }
 
@@ -444,8 +422,15 @@ async fn chain_sync(
         }
         .await
         {
-            error!("[Chain Sync] Iteration failed: {}", e);
-            return Err(e);
+            retry_count += 1;
+            error!(
+                "[Chain Sync] Iteration failed (retry {}/{}): {}",
+                retry_count, config.chain_sync_error_max_retries, e
+            );
+
+            if retry_count >= config.chain_sync_error_max_retries {
+                return Err(e);
+            }
         }
     }
 }
@@ -540,7 +525,6 @@ async fn remote_chain_tracker(
             );
 
             // Fetch blocks in parallel
-            let mut had_rpc_error = false;
             let tasks = future::join_all(
                 (remote_tip.0 + 1..remote_tip.0 + 1 + blocks_to_fetch).map(|block_number| {
                     let client = client.clone();
@@ -574,7 +558,6 @@ async fn remote_chain_tracker(
                         "[Tracker] DB or RPC error at block {}: {e}",
                         remote_tip.0 + 1 + *i as u64
                     );
-                    had_rpc_error = true;
                     false
                 }
                 Err(e) => {
@@ -592,7 +575,8 @@ async fn remote_chain_tracker(
             validator_db.add_validation_tasks(&tasks)?;
             validator_db.grow_remote_chain(tasks.iter().map(|(block, _, _)| &block.header))?;
 
-            if had_rpc_error {
+            // Encountered an DB/RPC error, wait a bit before polling again
+            if tasks.len() < blocks_to_fetch as usize {
                 tokio::time::sleep(config.tracker_error_sleep).await;
             }
 
@@ -1400,10 +1384,9 @@ mod tests {
     #[tokio::test]
     async fn integration_test() {
         // Initialize logging for tests with debug level
-        unsafe {
-            std::env::set_var("STATELESS_VALIDATOR_LOG_STDOUT_FILTER", "debug");
-        }
-        let _ = init_logging();
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
 
         // Create RPC module context with pre-loaded test data
         debug!("=== Creating RPC Module Context ===");

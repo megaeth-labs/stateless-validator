@@ -4,11 +4,9 @@ Configure logging via environment variables. Output goes to terminal by default;
 
 ## Environment variables
 
-- STATELESS_VALIDATOR_LOG_STDOUT_FILTER: debug|info|warn|error (default: info)
-- STATELESS_VALIDATOR_LOG_FILE_FILTER: debug|info|warn|error (default: debug)
 - STATELESS_VALIDATOR_LOG_FILE_DIRECTORY: directory for log files; enables file logging when set. Files rotate daily as stateless-validator.log.YYYY-MM-DD
-- STATELESS_VALIDATOR_LOG_STDOUT_FORMAT: terminal|json (default: terminal)
-- STATELESS_VALIDATOR_LOG_FILE_FORMAT: terminal|json (default: terminal)
+- STATELESS_VALIDATOR_LOG_FILE_FILTER: debug|info|warn|error (default: debug)
+- STATELESS_VALIDATOR_LOG_STDOUT_FILTER: debug|info|warn|error (default: info)
 
 ## Examples
 
@@ -22,22 +20,20 @@ Default (info to terminal):
 
 Info to terminal + debug to file:
 ```bash
-STATELESS_VALIDATOR_LOG_STDOUT_FILTER=info \
-STATELESS_VALIDATOR_LOG_FILE_FILTER=debug \
 STATELESS_VALIDATOR_LOG_FILE_DIRECTORY=/var/log/stateless-validator \
+STATELESS_VALIDATOR_LOG_FILE_FILTER=debug \
+STATELESS_VALIDATOR_LOG_STDOUT_FILTER=info \
 ./stateless-validator \
   --data-dir /data \
   --rpc-endpoint http://localhost:8545 \
   --witness-endpoint http://localhost:8545
 ```
 
-JSON for production monitoring:
+Debug to file with info to terminal:
 ```bash
-STATELESS_VALIDATOR_LOG_STDOUT_FILTER=info \
-STATELESS_VALIDATOR_LOG_STDOUT_FORMAT=json \
-STATELESS_VALIDATOR_LOG_FILE_FILTER=debug \
-STATELESS_VALIDATOR_LOG_FILE_FORMAT=json \
 STATELESS_VALIDATOR_LOG_FILE_DIRECTORY=/var/log/stateless-validator \
+STATELESS_VALIDATOR_LOG_FILE_FILTER=debug \
+STATELESS_VALIDATOR_LOG_STDOUT_FILTER=info \
 ./stateless-validator \
   --data-dir /data \
   --rpc-endpoint http://localhost:8545 \
@@ -64,16 +60,14 @@ STATELESS_VALIDATOR_LOG_STDOUT_FILTER=debug
 
 Production (terminal + file):
 ```bash
-STATELESS_VALIDATOR_LOG_STDOUT_FILTER=info
-STATELESS_VALIDATOR_LOG_FILE_FILTER=debug
 STATELESS_VALIDATOR_LOG_FILE_DIRECTORY=/var/log/stateless-validator
+STATELESS_VALIDATOR_LOG_FILE_FILTER=debug
+STATELESS_VALIDATOR_LOG_STDOUT_FILTER=info
 ```
 
-Production with aggregation (ELK, Splunk):
+Production with file logging:
 ```bash
-STATELESS_VALIDATOR_LOG_STDOUT_FILTER=info
-STATELESS_VALIDATOR_LOG_STDOUT_FORMAT=json
-STATELESS_VALIDATOR_LOG_FILE_FILTER=debug
-STATELESS_VALIDATOR_LOG_FILE_FORMAT=json
 STATELESS_VALIDATOR_LOG_FILE_DIRECTORY=/var/log/stateless-validator
+STATELESS_VALIDATOR_LOG_FILE_FILTER=debug
+STATELESS_VALIDATOR_LOG_STDOUT_FILTER=info
 ```
