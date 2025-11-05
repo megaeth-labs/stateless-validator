@@ -58,7 +58,7 @@ fn init_logging() -> Result<()> {
     if let Some(log_dir) = &file_directory {
         let log_path = PathBuf::from(log_dir);
         std::fs::create_dir_all(&log_path)
-            .map_err(|e| anyhow!("Failed to create log directory {}: {}", log_dir, e))?;
+            .map_err(|e| anyhow!("Failed to create log directory {log_dir}: {e}"))?;
 
         // Configure file layer with daily rotation and filter
         let file_layer = fmt::layer()
@@ -73,16 +73,10 @@ fn init_logging() -> Result<()> {
             .boxed();
 
         subscriber.with(file_layer).init();
-        info!(
-            "[Logging] Initialized: stdout={}, file={} ({})",
-            stdout_filter, file_filter, log_dir
-        );
+        info!("[Logging] Initialized: stdout={stdout_filter}, file={file_filter} ({log_dir})");
     } else {
         subscriber.init();
-        info!(
-            "[Logging] Initialized: stdout={}, file logging disabled",
-            stdout_filter
-        );
+        info!("[Logging] Initialized: stdout={stdout_filter}, file logging disabled");
     }
 
     Ok(())
@@ -158,8 +152,6 @@ pub struct ChainSyncConfig {
     pub worker_idle_sleep: Duration,
     /// Time to wait when validation workers encounter errors
     pub worker_error_sleep: Duration,
-    /// Maximum number of retries for each chain sync iteration`
-    pub chain_sync_error_max_retries: usize,
     /// Time to wait when remote tracker encounters RPC/DB errors
     pub tracker_error_sleep: Duration,
     /// Enable reporting of validated blocks to upstream node
@@ -178,7 +170,6 @@ impl Default for ChainSyncConfig {
             pruner_blocks_to_keep: 1000,
             worker_idle_sleep: Duration::from_millis(500),
             worker_error_sleep: Duration::from_millis(1000),
-            chain_sync_error_max_retries: 10,
             tracker_error_sleep: Duration::from_secs(1),
             report_validation_results: false,
         }
@@ -393,8 +384,6 @@ async fn chain_sync(
     // Step 6: Main chain synchronizer loop
     info!("[Chain Sync] Starting main synchronizer loop...");
 
-    let mut retry_count = 0;
-
     loop {
         if let Some(target) = config.sync_target
             && let Ok(Some((local_block_number, _))) = validator_db.get_local_tip()
@@ -422,15 +411,30 @@ async fn chain_sync(
         }
         .await
         {
-            retry_count += 1;
-            error!(
-                "[Chain Sync] Iteration failed (retry {}/{}): {}",
-                retry_count, config.chain_sync_error_max_retries, e
-            );
+            // NOTE: We do NOT retry on errors here. All errors from grow_local_chain()
+            // represent non-retriable conditions:
+            //
+            // 1. ValidationDbError::FailedValidation
+            //    - Block validation failed, or state/withdrawals root mismatch
+            //    - These are deterministic failures; the block will never become valid on retry
+            //
+            // 2. ValidationDbError::Database
+            //    - Database I/O errors, corruption, disk full, permission denied
+            //    - These are persistent infrastructure issues requiring operator intervention
+            //    - Retrying won't help; the underlying issue must be fixed
+            //
+            // 3. ValidationDbError::MissingData
+            //    - Block data, witness, or validation result not found in database
+            //    - This should NEVER occur in normal operation because block data and witnesses
+            //      are written atomically during validation
+            //    - If this occurs, it indicates either a bug in the validation pipeline or
+            //      database corruption
+            //
+            // The chain sync process terminates immediately and returns the error to the caller.
+            // Operators should investigate the root cause.
 
-            if retry_count >= config.chain_sync_error_max_retries {
-                return Err(e);
-            }
+            error!("[Chain Sync] Failed to advance canonical chain: {}", e);
+            return Err(e);
         }
     }
 }
