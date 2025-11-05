@@ -14,7 +14,8 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tokio::{signal, task};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use validator_core::{
     ValidatorDB,
     chain_spec::ChainSpec,
@@ -28,6 +29,58 @@ use rpc::RpcClient;
 
 /// Database filename for the validator.
 const VALIDATOR_DB_FILENAME: &str = "validator.redb";
+
+/// Initialize logging system with environment variable configuration
+///
+/// Supports the following environment variables:
+/// - STATELESS_VALIDATOR_LOG_FILE_DIRECTORY: Directory for log files (optional, file logging disabled if not set)
+/// - STATELESS_VALIDATOR_LOG_FILE: Log level for file output (debug/info/warn/error), default: debug
+/// - STATELESS_VALIDATOR_LOG_STDOUT: Log level for stdout (debug/info/warn/error), default: info
+fn init_logging() -> Result<()> {
+    use tracing_appender::rolling::{RollingFileAppender, Rotation};
+
+    // Load environment configuration with defaults
+    let file_directory = std::env::var("STATELESS_VALIDATOR_LOG_FILE_DIRECTORY").ok();
+    let file_filter =
+        std::env::var("STATELESS_VALIDATOR_LOG_FILE").unwrap_or_else(|_| "debug".to_string());
+    let stdout_filter =
+        std::env::var("STATELESS_VALIDATOR_LOG_STDOUT").unwrap_or_else(|_| "info".to_string());
+
+    // Configure stdout layer
+    let stdout_layer = fmt::layer()
+        .with_writer(std::io::stdout)
+        .with_filter(EnvFilter::try_new(&stdout_filter).unwrap_or_else(|_| EnvFilter::new("info")))
+        .boxed();
+
+    let subscriber = tracing_subscriber::registry().with(stdout_layer);
+
+    // Optionally add file layer if directory is specified
+    if let Some(log_dir) = &file_directory {
+        let log_path = PathBuf::from(log_dir);
+        std::fs::create_dir_all(&log_path)
+            .map_err(|e| anyhow!("Failed to create log directory {log_dir}: {e}"))?;
+
+        // Configure file layer with daily rotation and filter
+        let file_layer = fmt::layer()
+            .with_writer(RollingFileAppender::new(
+                Rotation::DAILY,
+                log_path,
+                "stateless-validator.log",
+            ))
+            .with_filter(
+                EnvFilter::try_new(&file_filter).unwrap_or_else(|_| EnvFilter::new("debug")),
+            )
+            .boxed();
+
+        subscriber.with(file_layer).init();
+        info!("[Logging] Initialized: stdout={stdout_filter}, file={file_filter} ({log_dir})");
+    } else {
+        subscriber.init();
+        info!("[Logging] Initialized: stdout={stdout_filter}, file logging disabled");
+    }
+
+    Ok(())
+}
 
 /// Convert hex string to BlockHash
 ///
@@ -99,10 +152,10 @@ pub struct ChainSyncConfig {
     pub worker_idle_sleep: Duration,
     /// Time to wait when validation workers encounter errors
     pub worker_error_sleep: Duration,
+    /// Time to wait when remote tracker encounters RPC/DB errors
+    pub tracker_error_sleep: Duration,
     /// Enable reporting of validated blocks to upstream node
     pub report_validation_results: bool,
-    /// Stop chain sync on first error (useful for integration tests)
-    pub stop_on_first_err: bool,
 }
 
 impl Default for ChainSyncConfig {
@@ -117,8 +170,8 @@ impl Default for ChainSyncConfig {
             pruner_blocks_to_keep: 1000,
             worker_idle_sleep: Duration::from_millis(500),
             worker_error_sleep: Duration::from_millis(1000),
+            tracker_error_sleep: Duration::from_secs(1),
             report_validation_results: false,
-            stop_on_first_err: false,
         }
     }
 }
@@ -156,7 +209,7 @@ struct CommandLineArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    init_logging()?;
     let start = Instant::now();
     let args = CommandLineArgs::parse();
 
@@ -336,7 +389,7 @@ async fn chain_sync(
             && let Ok(Some((local_block_number, _))) = validator_db.get_local_tip()
             && local_block_number >= target
         {
-            info!("[Chain Sync] Reached sync target height {target}, terminating");
+            debug!("[Chain Sync] Reached sync target height {target}, terminating");
             return Ok(());
         }
 
@@ -348,7 +401,7 @@ async fn chain_sync(
             }
 
             if blocks_advanced > 0 {
-                info!("[Chain Sync] Advanced canonical chain by {blocks_advanced} blocks");
+                debug!("[Chain Sync] Advanced canonical chain by {blocks_advanced} blocks");
             } else {
                 // No work to do, wait a bit before polling again
                 tokio::time::sleep(config.sync_poll_interval).await;
@@ -358,10 +411,30 @@ async fn chain_sync(
         }
         .await
         {
-            error!("[Chain Sync] Iteration failed: {}", e);
-            if config.stop_on_first_err {
-                return Err(e);
-            }
+            // NOTE: We do NOT retry on errors here. All errors from grow_local_chain()
+            // represent non-retriable conditions:
+            //
+            // 1. ValidationDbError::FailedValidation
+            //    - Block validation failed, or state/withdrawals root mismatch
+            //    - These are deterministic failures; the block will never become valid on retry
+            //
+            // 2. ValidationDbError::Database
+            //    - Database I/O errors, corruption, disk full, permission denied
+            //    - These are persistent infrastructure issues requiring operator intervention
+            //    - Retrying won't help; the underlying issue must be fixed
+            //
+            // 3. ValidationDbError::MissingData
+            //    - Block data, witness, or validation result not found in database
+            //    - This should NEVER occur in normal operation because block data and witnesses
+            //      are written atomically during validation
+            //    - If this occurs, it indicates either a bug in the validation pipeline or
+            //      database corruption
+            //
+            // The chain sync process terminates immediately and returns the error to the caller.
+            // Operators should investigate the root cause.
+
+            error!("[Chain Sync] Failed to advance canonical chain: {}", e);
+            return Err(e);
         }
     }
 }
@@ -398,7 +471,7 @@ async fn remote_chain_tracker(
             let remote_tip = validator_db.get_remote_tip()?.unwrap_or(local_tip);
             let gap = remote_tip.0.saturating_sub(local_tip.0);
 
-            info!(
+            debug!(
                 "[Tracker] local={}, remote={}, gap={}",
                 local_tip.0, remote_tip.0, gap
             );
@@ -409,13 +482,13 @@ async fn remote_chain_tracker(
                 .await
             {
                 Ok(block) if block.header.hash != remote_tip.1 => {
-                    error!(
+                    warn!(
                         "[Tracker] Hash mismatch! Expected {}, got {}. Resolving chain divergence.",
                         remote_tip.1, block.header.hash
                     );
                     match find_divergence_point(&client, &validator_db, remote_tip.0).await {
                         Ok(rollback_to) => {
-                            info!("[Tracker] Rolling back to block {rollback_to}");
+                            warn!("[Tracker] Rolling back to block {rollback_to}");
                             validator_db.rollback_chain(rollback_to)?;
                             return Ok(());
                         }
@@ -449,7 +522,7 @@ async fn remote_chain_tracker(
                 return Ok(());
             }
 
-            info!(
+            debug!(
                 "[Tracker] Fetching {} blocks starting from {}",
                 blocks_to_fetch,
                 remote_tip.0 + 1
@@ -506,11 +579,16 @@ async fn remote_chain_tracker(
             validator_db.add_validation_tasks(&tasks)?;
             validator_db.grow_remote_chain(tasks.iter().map(|(block, _, _)| &block.header))?;
 
+            // Encountered an DB/RPC error, wait a bit before polling again
+            if tasks.len() < blocks_to_fetch as usize {
+                tokio::time::sleep(config.tracker_error_sleep).await;
+            }
+
             Ok(())
         }
         .await
         {
-            error!("[Tracker] Iteration failed: {}", e);
+            warn!("[Tracker] Iteration failed: {}", e);
         }
 
         tokio::time::sleep(config.tracker_poll_interval).await;
@@ -583,7 +661,7 @@ async fn validate_one(
     match validator_db.get_next_task()? {
         Some((block, witness, mpt_witness)) => {
             let block_number = block.header.number;
-            info!("[Worker {}] Validating block {}", worker_id, block_number);
+            debug!("[Worker {}] Validating block {}", worker_id, block_number);
 
             // Prepare the contract map to be used by validation
             let codehashes = extract_contract_codes(&witness);
@@ -703,7 +781,7 @@ async fn validation_reporter(
             .await
         {
             Ok(response) if response.accepted => {
-                info!("[Reporter] Reported blocks successfully: {first_block:?} - {last_block:?}");
+                debug!("[Reporter] Reported blocks successfully: {first_block:?} - {last_block:?}");
                 last_reported_block = last_block;
             }
             Ok(response) => {
@@ -753,7 +831,7 @@ async fn history_pruner(
             let prune_before = current_tip.saturating_sub(config.pruner_blocks_to_keep);
             match validator_db.prune_history(prune_before) {
                 Ok(blocks_pruned) if blocks_pruned > 0 => {
-                    info!("[Pruner] Pruned {blocks_pruned} blocks before block {prune_before}");
+                    debug!("[Pruner] Pruned {blocks_pruned} blocks before block {prune_before}");
                 }
                 Err(e) => warn!("[Pruner] Failed to prune old block data: {e}"),
                 _ => {}
@@ -1187,7 +1265,7 @@ mod tests {
         let mut mpt_witness_data = HashMap::new();
 
         // Load block data from TEST_BLOCK_DIR
-        info!("Loading block data from {}", TEST_BLOCK_DIR);
+        debug!("Loading block data from {}", TEST_BLOCK_DIR);
         let test_block_dir = PathBuf::from(TEST_BLOCK_DIR);
         let block_entries = std::fs::read_dir(&test_block_dir)
             .map_err(|e| anyhow!("Failed to read test block directory {TEST_BLOCK_DIR}: {e}"))?;
@@ -1236,7 +1314,7 @@ mod tests {
         let min_block = (min_block_num, min_block_hash);
         let max_block = (max_block_num, max_block_hash);
 
-        info!(
+        debug!(
             "Loaded {} blocks (range: {} - {})",
             block_numbers.len(),
             min_block.0,
@@ -1244,7 +1322,7 @@ mod tests {
         );
 
         // Load witness data from TEST_WITNESS_DIR
-        info!("Loading witness data from {}", TEST_WITNESS_DIR);
+        debug!("Loading witness data from {}", TEST_WITNESS_DIR);
         let test_witness_dir = PathBuf::from(TEST_WITNESS_DIR);
         if test_witness_dir.exists() {
             let witness_entries = std::fs::read_dir(&test_witness_dir)
@@ -1275,10 +1353,10 @@ mod tests {
                     _ => {}
                 }
             }
-            info!("Loaded {} salt witness files", witness_data.len());
-            info!("Loaded {} mpt witness files", mpt_witness_data.len());
+            debug!("Loaded {} salt witness files", witness_data.len());
+            debug!("Loaded {} mpt witness files", mpt_witness_data.len());
         } else {
-            info!(
+            debug!(
                 "Witness directory {} does not exist, skipping witness data",
                 TEST_WITNESS_DIR
             );
@@ -1286,7 +1364,7 @@ mod tests {
 
         // Load contract data and build address-to-bytecode mapping from witness data
         let contracts = load_contracts(CONTRACTS_FILE);
-        info!("Loaded {} contracts from {CONTRACTS_FILE}", contracts.len());
+        debug!("Loaded {} contracts from {CONTRACTS_FILE}", contracts.len());
 
         let address_bytecodes: HashMap<Address, Bytecode> = witness_data
             .values()
@@ -1309,18 +1387,21 @@ mod tests {
 
     #[tokio::test]
     async fn integration_test() {
-        tracing_subscriber::fmt::init();
+        // Initialize logging for tests with debug level
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
 
         // Create RPC module context with pre-loaded test data
-        info!("=== Creating RPC Module Context ===");
+        debug!("=== Creating RPC Module Context ===");
         let context = create_rpc_module_context().unwrap();
-        info!(
+        debug!(
             "Context created with {} blocks, {} witnesses, {} contracts",
             context.blocks_by_hash.len(),
             context.witness_data.len(),
             context.address_bytecodes.len()
         );
-        info!(
+        debug!(
             "Block range: {} - {}",
             context.min_block.0, context.max_block.0
         );
@@ -1338,7 +1419,6 @@ mod tests {
         let config = Arc::new(ChainSyncConfig {
             concurrent_workers: 1,
             sync_target,
-            stop_on_first_err: true,
             ..ChainSyncConfig::default()
         });
 
