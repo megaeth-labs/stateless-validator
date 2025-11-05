@@ -34,17 +34,17 @@ const VALIDATOR_DB_FILENAME: &str = "validator.redb";
 ///
 /// Supports the following environment variables:
 /// - STATELESS_VALIDATOR_LOG_FILE_DIRECTORY: Directory for log files (optional, file logging disabled if not set)
-/// - STATELESS_VALIDATOR_LOG_FILE_FILTER: Log level for file output (debug/info/warn/error), default: debug
-/// - STATELESS_VALIDATOR_LOG_STDOUT_FILTER: Log level for stdout (debug/info/warn/error), default: info
+/// - STATELESS_VALIDATOR_LOG_FILE: Log level for file output (debug/info/warn/error), default: debug
+/// - STATELESS_VALIDATOR_LOG_STDOUT: Log level for stdout (debug/info/warn/error), default: info
 fn init_logging() -> Result<()> {
     use tracing_appender::rolling::{RollingFileAppender, Rotation};
 
     // Load environment configuration with defaults
     let file_directory = std::env::var("STATELESS_VALIDATOR_LOG_FILE_DIRECTORY").ok();
-    let file_filter = std::env::var("STATELESS_VALIDATOR_LOG_FILE_FILTER")
-        .unwrap_or_else(|_| "debug".to_string());
-    let stdout_filter = std::env::var("STATELESS_VALIDATOR_LOG_STDOUT_FILTER")
-        .unwrap_or_else(|_| "info".to_string());
+    let file_filter =
+        std::env::var("STATELESS_VALIDATOR_LOG_FILE").unwrap_or_else(|_| "debug".to_string());
+    let stdout_filter =
+        std::env::var("STATELESS_VALIDATOR_LOG_STDOUT").unwrap_or_else(|_| "info".to_string());
 
     // Configure stdout layer
     let stdout_layer = fmt::layer()
