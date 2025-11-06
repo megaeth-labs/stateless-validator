@@ -24,21 +24,16 @@
 //! and uses Revm for transaction execution.
 
 use alloy_consensus::transaction::Recovered;
-use alloy_evm::{
-    EvmEnv, EvmFactory as AlloyEvmFactory,
-    block::{BlockExecutor, BlockExecutorFactory},
-};
+use alloy_evm::{EvmEnv, block::BlockExecutor};
 use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{Address, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
 use mega_evm::{MegaBlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory, MegaSpecId};
 use op_alloy_rpc_types::Transaction as OpTransaction;
-use op_revm::L1BlockInfo;
 use revm::{
-    context::{BlockEnv, CfgEnv, ContextTr},
+    context::{BlockEnv, CfgEnv},
     database::states::{CacheAccount, StateBuilder},
-    handler::EvmTr,
     primitives::{B256, KECCAK_EMPTY, U256},
     state::Bytecode,
 };
@@ -51,7 +46,7 @@ use std::{
 use thiserror::Error;
 
 use crate::{
-    chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec, MegaethHardforks},
+    chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec},
     data_types::{Account, PlainKey, PlainValue},
     database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv},
     withdrawals::{self, ADDRESS_L2_TO_L1_MESSAGE_PASSER, MptWitness},
@@ -220,28 +215,13 @@ fn replay_block(
         OpAlloyReceiptBuilder::default(),
     );
 
-    let execution_context = MegaBlockExecutionCtx {
-        parent_hash: block.header.parent_hash,
-        parent_beacon_block_root: block.header.parent_beacon_block_root,
-        extra_data: block.header.extra_data.clone(),
-        first_mini_rex_block: chain_spec.is_mini_rex_active_at_timestamp(block.header.timestamp)
-            && (block.header.number == 1
-                // assuming the parent block timestamp is just current block timestamp - 1
-                || !chain_spec.is_mini_rex_active_at_timestamp(block.header.timestamp - 1)),
-    };
+    let execution_context = MegaBlockExecutionCtx::new(
+        block.header.parent_hash,
+        block.header.parent_beacon_block_root,
+        block.header.extra_data.clone(),
+    );
 
-    // Create EVM with L1 block info configuration
-    let mut evm = executor_factory
-        .evm_factory()
-        .create_evm(&mut state, evm_env);
-
-    // Configure L1 block info to fix operator fee expectations
-    let mut l1_info = L1BlockInfo::default();
-    l1_info.operator_fee_scalar = Some(U256::ZERO);
-    l1_info.operator_fee_constant = Some(U256::ZERO);
-    *evm.ctx_mut().chain_mut() = l1_info;
-
-    let mut executor = executor_factory.create_executor(evm, execution_context);
+    let mut executor = executor_factory.create_executor(&mut state, evm_env, execution_context);
 
     // Execute block transactions
     executor
