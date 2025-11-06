@@ -1335,6 +1335,11 @@ mod tests {
                     continue;
                 };
 
+                // Skip mpt.json files
+                if ext != "salt" && ext != "mpt" {
+                    continue;
+                }
+
                 let block_num_and_hash = file_path.file_stem().unwrap().to_str().unwrap();
                 let (_, block_hash) = parse_block_num_and_hash(block_num_and_hash)?;
                 let file_data = std::fs::read(&file_path)?;
