@@ -29,8 +29,8 @@ op-revm = { version = "8.1.0", default-features = false }
 revm = { version = "27.1.0", default-features = false }
 
 # megaeth 
-mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "2a131b94350ee88985e78af35ed259f724264b2d" }
-salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "57fa05e716c680c129dc75712ec3ba9fec13901f" }
+mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "d0dc242160a946286cfa746036a88606e6f3378b" }
+salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "80a46f2cd4c24417ec7fa265015270c623ae5340" }
 
 # reth
 reth-ethereum-forks = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0" }
