@@ -46,10 +46,13 @@ fn init_logging() -> Result<()> {
     let stdout_filter =
         std::env::var("STATELESS_VALIDATOR_LOG_STDOUT").unwrap_or_else(|_| "info".to_string());
 
-    // Configure stdout layer
+    // Configure stdout layer with external crate filtering
     let stdout_layer = fmt::layer()
         .with_writer(std::io::stdout)
-        .with_filter(EnvFilter::try_new(&stdout_filter).unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_filter(
+            EnvFilter::new("warn")
+                .add_directive(format!("stateless_validator={}", stdout_filter).parse()?),
+        )
         .boxed();
 
     let subscriber = tracing_subscriber::registry().with(stdout_layer);
@@ -68,12 +71,8 @@ fn init_logging() -> Result<()> {
                 "stateless-validator.log",
             ))
             .with_filter(
-                EnvFilter::try_new(&file_filter)
-                    .unwrap_or_else(|_| EnvFilter::new("debug"))
-                    .add_directive("hyper_util=off".parse().unwrap())
-                    .add_directive("alloy_transport_http=off".parse().unwrap())
-                    .add_directive("hyper=off".parse().unwrap())
-                    .add_directive("reqwest=off".parse().unwrap()),
+                EnvFilter::new("warn")
+                    .add_directive(format!("stateless_validator={}", file_filter).parse()?),
             )
             .boxed();
 
@@ -1405,7 +1404,9 @@ mod tests {
     async fn integration_test() {
         // Initialize logging for tests with debug level
         let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
+            .with_env_filter(
+                EnvFilter::new("warn").add_directive("stateless_validator=debug".parse().unwrap()),
+            )
             .try_init();
 
         // Create RPC module context with pre-loaded test data
