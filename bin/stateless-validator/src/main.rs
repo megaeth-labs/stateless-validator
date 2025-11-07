@@ -68,7 +68,12 @@ fn init_logging() -> Result<()> {
                 "stateless-validator.log",
             ))
             .with_filter(
-                EnvFilter::try_new(&file_filter).unwrap_or_else(|_| EnvFilter::new("debug")),
+                EnvFilter::try_new(&file_filter)
+                    .unwrap_or_else(|_| EnvFilter::new("debug"))
+                    .add_directive("hyper_util=off".parse().unwrap())
+                    .add_directive("alloy_transport_http=off".parse().unwrap())
+                    .add_directive("hyper=off".parse().unwrap())
+                    .add_directive("reqwest=off".parse().unwrap()),
             )
             .boxed();
 
@@ -462,6 +467,9 @@ async fn remote_chain_tracker(
         config.tracker_lookahead_blocks
     );
 
+    // Track error counts for each block
+    let mut block_error_counts: HashMap<u64, usize> = HashMap::new();
+
     loop {
         if let Err(e) = async {
             // Calculate how far behind our local chain is from remote
@@ -556,12 +564,20 @@ async fn remote_chain_tracker(
             .enumerate()
             // Stop on first error to maintain block sequence contiguity
             .take_while(|(i, result)| match result {
-                Ok(Ok(_)) => true,
+                Ok(Ok(_)) => {
+                    block_error_counts.remove(&(remote_tip.0 + 1 + *i as u64));
+                    true
+                }
                 Ok(Err(e)) => {
-                    error!(
-                        "[Tracker] DB or RPC error at block {}: {e}",
-                        remote_tip.0 + 1 + *i as u64
-                    );
+                    let block_number = remote_tip.0 + 1 + *i as u64;
+                    let count = block_error_counts.entry(block_number).or_insert(0);
+                    *count += 1;
+
+                    if *count > 5 {
+                        error!("[Tracker] DB or RPC error at block {block_number} (attempt {count}): {e}");
+                    } else {
+                        debug!("[Tracker] DB or RPC error at block {block_number} (attempt {count}): {e}");
+                    }
                     false
                 }
                 Err(e) => {

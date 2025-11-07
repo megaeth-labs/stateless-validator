@@ -1,3 +1,9 @@
 /target
+
+# mcp
+.claude/
+.cursor/
 .mcp.json
+
+# database
 validator-data
