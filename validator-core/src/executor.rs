@@ -29,7 +29,8 @@ use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{Address, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
-use mega_evm::{MegaBlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory, MegaSpecId};
+use mega_evm::MegaEvmEnvAndSettings;
+use mega_evm::{MegaBlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory};
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use revm::{
     context::{BlockEnv, CfgEnv},
@@ -141,7 +142,7 @@ pub struct ValidationResult {
 /// - Chain configuration with appropriate spec ID for the block number
 /// - Block environment with gas limits, timestamps, and fee parameters
 /// - Blob gas pricing if excess blob gas is present in the header
-fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<MegaSpecId> {
+fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> MegaEvmEnvAndSettings {
     let cfg_env = CfgEnv::new_with_spec(chain_spec.spec_id_at_timestamp(header.timestamp))
         .with_chain_id(chain_spec.chain_id);
 
@@ -160,7 +161,10 @@ fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<MegaSpecId>
         block_env.set_blob_excess_gas_and_price(excess_blob_gas, BLOB_GASPRICE_UPDATE_FRACTION);
     }
 
-    EvmEnv::new(cfg_env, block_env)
+    MegaEvmEnvAndSettings {
+        evm_env: EvmEnv::new(cfg_env, block_env),
+        ..Default::default()
+    }
 }
 
 /// Replays all transactions in a block to compute state changes.
@@ -221,7 +225,8 @@ fn replay_block(
         block.header.extra_data.clone(),
     );
 
-    let mut executor = executor_factory.create_executor(&mut state, evm_env, execution_context);
+    let mut executor =
+        executor_factory.create_executor_with_config(&mut state, execution_context, evm_env);
 
     // Execute block transactions
     executor

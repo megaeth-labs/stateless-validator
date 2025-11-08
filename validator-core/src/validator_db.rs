@@ -13,7 +13,7 @@
 //! ## Database Schema
 //!
 //! The database consists of 9 specialized tables:
-//! - `CANONICAL_CHAIN`: Local view of the canonical blockchain (BlockNumber → (BlockHash, PostStateRoot))
+//! - `CANONICAL_CHAIN`: Local view of the canonical blockchain (BlockNumber → (BlockHash, PostStateRoot, PostWithdrawalsRoot))
 //! - `REMOTE_CHAIN`: Remote chain used to guide chain advancement (BlockNumber → BlockHash)
 //! - `TASK_LIST`: Queue of pending validation tasks (BlockNumber, BlockHash) → ()
 //! - `ONGOING_TASKS`: Tasks currently being processed by workers
