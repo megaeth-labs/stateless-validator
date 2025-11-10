@@ -126,6 +126,7 @@ impl RpcClient {
     /// # Errors
     /// Returns error if block hash doesn't exist, witness unavailable
     pub async fn get_witness(&self, number: u64, hash: B256) -> Result<(SaltWitness, MptWitness)> {
+        // todo可能拿不到分叉（较短的）的 hash 的 witness，需要处理
         self.witness_provider
             .client()
             .request("mega_getBlockWitness", (number.to_string(), hash))

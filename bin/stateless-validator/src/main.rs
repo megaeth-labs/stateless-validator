@@ -684,6 +684,7 @@ async fn validate_one(
             let mut contracts = HashMap::new();
 
             for (address, code_hash) in &codehashes {
+                // todo get code_hash batch from database
                 match validator_db.get_contract_code(*code_hash) {
                     Ok(Some(bytecode)) => {
                         contracts.insert(*code_hash, bytecode);
