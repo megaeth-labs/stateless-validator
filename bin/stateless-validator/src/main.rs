@@ -963,6 +963,7 @@ mod tests {
         fs::File,
         io::{BufRead, BufReader},
         path::Path,
+        sync::atomic::{AtomicBool, Ordering},
     };
     use validator_core::withdrawals::MptWitness;
 
@@ -1036,6 +1037,12 @@ mod tests {
 
         /// Maximum block in the test data set (block number and hash)
         max_block: (u64, BlockHash),
+
+        /// whether test the reorg
+        test_reorg: bool,
+
+        /// whether forked (using AtomicBool for interior mutability)
+        forked: Arc<AtomicBool>,
     }
 
     /// Parse block number and hash from string
@@ -1123,7 +1130,7 @@ mod tests {
                         )
                     })?;
 
-                let result_block = if full_block {
+                let mut result_block = if full_block {
                     block.clone()
                 } else {
                     Block {
@@ -1131,6 +1138,27 @@ mod tests {
                         ..block.clone()
                     }
                 };
+
+                if context.test_reorg
+                    && context.forked.load(Ordering::Relaxed)
+                    && block_number > context.min_block.0 + 6
+                {
+                    let salt = [0xffu8; 32];
+                    let salt_hash = B256::from(salt);
+
+                    println!("number: {:?}", block_number);
+                    result_block.header.hash ^= salt_hash;
+                    println!("hash: {:?}", result_block.header.hash);
+                    if block_number > context.min_block.0 + 7 {
+                        result_block.header.parent_hash ^= salt_hash;
+                        println!("parent_hash: {:?}", result_block.header.parent_hash);
+                    }
+                }
+
+                if context.test_reorg && block_number == context.min_block.0 + 16 {
+                    context.forked.store(true, Ordering::Relaxed);
+                }
+
                 Ok::<_, ErrorObject<'static>>(result_block)
             })
             .unwrap();
@@ -1164,9 +1192,16 @@ mod tests {
                 let (_number_str, hash_str): (String, String) = params.parse().unwrap();
 
                 // Parse hash string to BlockHash
-                let block_hash = parse_block_hash(&hash_str).map_err(|e| {
+                let mut block_hash = parse_block_hash(&hash_str).map_err(|e| {
                     make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid block hash: {e}"))
                 })?;
+
+                if context.test_reorg && context.forked.load(Ordering::Relaxed) {
+                    let salt = [0xffu8; 32];
+                    let salt_hash = B256::from(salt);
+
+                    block_hash ^= salt_hash;
+                }
 
                 // Look up witness data by block hash
                 let salt_witness =
@@ -1274,7 +1309,7 @@ mod tests {
     /// # Returns
     /// * `Ok(RpcModuleContext)` - Context with all test data loaded
     /// * `Err(eyre::Error)` - If directories cannot be read or data is malformed
-    fn create_rpc_module_context() -> Result<RpcModuleContext> {
+    fn create_rpc_module_context(test_reorg: bool) -> Result<RpcModuleContext> {
         let mut blocks_by_hash = HashMap::new();
         let mut block_hashes = BTreeMap::new();
         let mut witness_data = HashMap::new();
@@ -1398,6 +1433,8 @@ mod tests {
             address_bytecodes,
             min_block,
             max_block,
+            test_reorg,
+            forked: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -1412,7 +1449,7 @@ mod tests {
 
         // Create RPC module context with pre-loaded test data
         debug!("=== Creating RPC Module Context ===");
-        let context = create_rpc_module_context().unwrap();
+        let context = create_rpc_module_context(false).unwrap();
         debug!(
             "Context created with {} blocks, {} witnesses, {} contracts",
             context.blocks_by_hash.len(),
@@ -1437,6 +1474,54 @@ mod tests {
         let config = Arc::new(ChainSyncConfig {
             concurrent_workers: 1,
             sync_target,
+            ..ChainSyncConfig::default()
+        });
+
+        chain_sync(client.clone(), validator_db, config, chain_spec)
+            .await
+            .unwrap();
+
+        handle.stop().unwrap();
+        info!("Mock RPC server has been shut down.");
+    }
+
+    #[tokio::test]
+    async fn reorg_test() {
+        // Initialize logging for tests with debug level
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::new("warn").add_directive("stateless_validator=debug".parse().unwrap()),
+            )
+            .try_init();
+
+        // Create RPC module context with pre-loaded test data
+        debug!("=== Creating RPC Module Context ===");
+        let context = create_rpc_module_context(true).unwrap();
+        debug!(
+            "Context created with {} blocks, {} witnesses, {} contracts",
+            context.blocks_by_hash.len(),
+            context.witness_data.len(),
+            context.address_bytecodes.len()
+        );
+        debug!(
+            "Block range: {} - {}",
+            context.min_block.0, context.max_block.0
+        );
+
+        let sync_target = Some(context.max_block.0);
+        let validator_db = setup_test_db(&context).unwrap();
+        let (handle, url) = setup_mock_rpc_server(context).await;
+        let client = Arc::new(RpcClient::new(&url, &url).unwrap());
+
+        // Load chain spec using helper function
+        let chain_spec =
+            Arc::new(load_or_create_chain_spec(&validator_db, Some(TEST_GENESIS_FILE)).unwrap());
+
+        // Create test configuration with faster intervals for testing
+        let config = Arc::new(ChainSyncConfig {
+            concurrent_workers: 1,
+            sync_target,
+            tracker_lookahead_blocks: 5,
             ..ChainSyncConfig::default()
         });
 
