@@ -42,3 +42,6 @@ validator-core = { path = "../../validator-core" }
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }
 jsonrpsee-types = { version = "0.26" }
 tempfile = "3.8"
+
+[features]
+test-bucket-resize = ["salt/test-bucket-resize"]

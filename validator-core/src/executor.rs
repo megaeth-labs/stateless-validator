@@ -29,8 +29,9 @@ use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{Address, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
-use mega_evm::MegaEvmEnvAndSettings;
-use mega_evm::{MegaBlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory};
+use mega_evm::{
+    MegaBlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmEnvAndSettings, MegaEvmFactory,
+};
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use revm::{
     context::{BlockEnv, CfgEnv},
@@ -245,7 +246,7 @@ fn replay_block(
         .apply_post_execution_changes()
         .map_err(ValidationError::BlockReplayFailed)?;
 
-    Ok(state.cache.accounts.clone())
+    Ok(state.cache.accounts)
 }
 
 /// Validates a block by creating a witness, replaying transactions, and comparing state roots.

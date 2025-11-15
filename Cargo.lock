@@ -5404,7 +5404,6 @@ dependencies = [
  "dyn-clone",
  "mega-evm",
  "op-alloy-rpc-types",
- "op-revm",
  "redb",
  "reth-ethereum-forks",
  "reth-optimism-chainspec",

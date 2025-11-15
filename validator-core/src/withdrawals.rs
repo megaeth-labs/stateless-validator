@@ -9,11 +9,9 @@ use alloy_primitives::{Address, B256, Bytes, address, keccak256, map::B256Map};
 use alloy_rlp::Decodable;
 use alloy_rpc_types_eth::Header;
 use reth_trie::Nibbles;
-use reth_trie_common::HashedStorage;
-use reth_trie_common::{EMPTY_ROOT_HASH, TrieNode};
-use reth_trie_sparse::SparseTrieInterface;
+use reth_trie_common::{EMPTY_ROOT_HASH, HashedStorage, TrieNode};
 use reth_trie_sparse::{
-    SerialSparseTrie, SparseTrie, TrieMasks, provider::DefaultTrieNodeProvider,
+    SerialSparseTrie, SparseTrie, SparseTrieInterface, TrieMasks, provider::DefaultTrieNodeProvider,
 };
 use revm::database::states::CacheAccount;
 use serde::{Deserialize, Serialize};

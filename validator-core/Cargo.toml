@@ -20,7 +20,6 @@ alloy-serde.workspace = true
 alloy-op-evm.workspace = true
 alloy-op-hardforks.workspace = true
 op-alloy-rpc-types.workspace = true
-op-revm.workspace = true
 
 # revm
 revm.workspace = true
@@ -43,3 +42,6 @@ redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[features]
+test-bucket-resize = ["salt/test-bucket-resize"]
