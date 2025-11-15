@@ -44,4 +44,4 @@ jsonrpsee-types = { version = "0.26" }
 tempfile = "3.8"
 
 [features]
-test-bucket-resize = ["salt/test-bucket-resize"]
+test-bucket-resize = ["salt/test-bucket-resize", "validator-core/test-bucket-resize"]
