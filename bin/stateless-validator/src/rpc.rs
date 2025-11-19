@@ -86,7 +86,7 @@ impl RpcClient {
     /// Performs data integrity checks on the returned block:
     /// - Verifies block_id matches the returned block
     /// - Verifies block hash matches the computed hash from header
-    /// - If full transactions: verifies transaction hashes and roots
+    /// - If full transactions: verifies transaction hashes and roots, and signers
     ///
     /// # Arguments
     /// * `block_id` - Block identifier (number, hash, latest, etc.)
