@@ -4849,6 +4849,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-provider",
  "alloy-rpc-types-eth",
+ "alloy-trie",
  "bincode",
  "clap",
  "eyre",

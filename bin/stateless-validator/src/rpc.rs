@@ -1,10 +1,11 @@
 //! RPC client for fetching missing data during stateless validation.
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
-use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
-use eyre::{Context, Result, eyre};
+use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag, BlockTransactions};
+use alloy_trie::root::ordered_trie_root_with_encoder;
+use eyre::{Context, Result, ensure, eyre};
 use futures::future::try_join_all;
-use op_alloy_network::Optimism;
+use op_alloy_network::{Optimism, TransactionResponse, eip2718::Encodable2718};
 use op_alloy_rpc_types::Transaction;
 use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
@@ -81,6 +82,11 @@ impl RpcClient {
 
     /// Gets a block by its identifier with optional transaction details.
     ///
+    /// Performs data integrity checks on the returned block:
+    /// - Verifies block_id matches the returned block
+    /// - Verifies block hash matches the computed hash from header
+    /// - If full transactions: verifies transaction hashes and roots
+    ///
     /// # Arguments
     /// * `block_id` - Block identifier (number, hash, latest, etc.)
     /// * `full_txs` - If true, includes full transaction objects; if false, only transaction hashes
@@ -89,14 +95,67 @@ impl RpcClient {
     /// Complete block data including header, transactions, and metadata.
     ///
     /// # Errors
-    /// Returns error if block doesn't exist or RPC call fails.
+    /// Returns error if block doesn't exist, RPC call fails, or integrity checks fail.
     pub async fn get_block(&self, block_id: BlockId, full_txs: bool) -> Result<Block<Transaction>> {
         let block = if full_txs {
             self.data_provider.get_block(block_id).full().await?
         } else {
             self.data_provider.get_block(block_id).await?
         };
-        block.ok_or_else(|| eyre!("Block {:?} not found", block_id))
+        let block = block.ok_or_else(|| eyre!("Block {:?} not found", block_id))?;
+
+        // Verify block_id matches the returned block
+        match block_id {
+            BlockId::Number(BlockNumberOrTag::Number(num)) => {
+                ensure!(
+                    block.header.number == num,
+                    "Block number mismatch: requested {}, got {}",
+                    num,
+                    block.header.number
+                );
+            }
+            BlockId::Hash(hash) => {
+                ensure!(
+                    block.header.hash == hash.block_hash,
+                    "Block hash mismatch: requested {:?}, got {:?}",
+                    hash.block_hash,
+                    block.header.hash
+                );
+            }
+            _ => {} // Skip for latest, earliest, pending, etc.
+        }
+
+        // Verify block hash matches the computed hash from header
+        ensure!(
+            block.header.hash_slow() == block.header.hash,
+            "Block hash mismatch: expected {:?}, computed {:?}",
+            block.header.hash,
+            block.header.hash_slow()
+        );
+
+        // Verify transaction hashes and transactions root
+        if let BlockTransactions::Full(ref transactions) = block.transactions {
+            for tx in transactions {
+                let tx_envelope = tx.inner.clone().into_inner();
+                ensure!(
+                    tx_envelope.trie_hash() == tx.tx_hash(),
+                    "Transaction hash mismatch: expected {:?}, computed {:?}",
+                    tx.tx_hash(),
+                    tx_envelope.trie_hash()
+                );
+            }
+            let computed_tx_root = ordered_trie_root_with_encoder(transactions, |tx, buf| {
+                tx.inner.clone().into_inner().encode_2718(buf)
+            });
+            ensure!(
+                computed_tx_root == block.header.transactions_root,
+                "Transactions root mismatch: expected {:?}, computed {:?}",
+                block.header.transactions_root,
+                computed_tx_root
+            );
+        }
+
+        Ok(block)
     }
 
     /// Gets the current latest block number from the blockchain.

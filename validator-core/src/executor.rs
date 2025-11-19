@@ -23,7 +23,7 @@
 //! The module integrates with the Salt witness system for state reconstruction
 //! and uses Revm for transaction execution.
 
-use alloy_consensus::transaction::Recovered;
+use alloy_consensus::transaction::{Recovered, SignerRecoverable};
 use alloy_evm::{EvmEnv, block::BlockExecutor};
 use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
@@ -100,6 +100,14 @@ pub enum ValidationError {
         actual: B256,
         /// The claimed state root from the block header
         claimed: B256,
+    },
+
+    #[error("Transaction signature verification failed at index {index}: {reason}")]
+    TransactionSignatureInvalid {
+        /// Transaction index in block
+        index: usize,
+        /// Reason for failure
+        reason: String,
     },
 }
 
@@ -249,13 +257,57 @@ fn replay_block(
     Ok(state.cache.accounts)
 }
 
+/// Verifies transaction signature recovery.
+///
+/// This function performs expensive cryptographic operations to verify that all
+/// transactions in the block have valid signatures that can recover to the
+/// claimed sender address.
+///
+/// # Arguments
+///
+/// * `block` - Block containing transactions to verify
+///
+/// # Returns
+///
+/// Returns `Ok(())` if all transaction signatures are valid.
+/// Returns `Err(ValidationError)` if any signature verification fails.
+fn verify_transaction_signatures(block: &Block<OpTransaction>) -> Result<(), ValidationError> {
+    let BlockTransactions::Full(transactions) = &block.transactions else {
+        return Err(ValidationError::BlockIncomplete);
+    };
+
+    for (index, tx) in transactions.iter().enumerate() {
+        let tx_envelope = tx.inner.clone().into_inner();
+        let recovered = tx_envelope.recover_signer().map_err(|err| {
+            ValidationError::TransactionSignatureInvalid {
+                index,
+                reason: format!("Failed to recover signer: {}", err),
+            }
+        })?;
+
+        if recovered != tx.from() {
+            return Err(ValidationError::TransactionSignatureInvalid {
+                index,
+                reason: format!(
+                    "Signer mismatch: recovered {:?}, expected {:?}",
+                    recovered,
+                    tx.from()
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
 /// Validates a block by creating a witness, replaying transactions, and comparing state roots.
 ///
 /// This function performs the core validation logic:
-/// 1. Creates a Witness from the provided SaltWitness
-/// 2. Verifies the witness proof
-/// 3. Replays the block transactions using the witness database
-/// 4. Computes the new state root and compares it with the expected one
+/// 1. Verifies transaction signatures
+/// 2. Creates a Witness from the provided SaltWitness
+/// 3. Verifies the witness proof
+/// 4. Replays the block transactions using the witness database
+/// 5. Computes the new state root and compares it with the expected one
 ///
 /// # Arguments
 ///
@@ -275,6 +327,9 @@ pub fn validate_block(
     mpt_witness: MptWitness,
     contracts: &HashMap<B256, Bytecode>,
 ) -> Result<(), ValidationError> {
+    // Verify transaction signatures
+    verify_transaction_signatures(block)?;
+
     // Create external environment oracle from salt witness
     let env_oracle = WitnessExternalEnv::new(&salt_witness, block.header.number)
         .map_err(ValidationError::EnvOracleConstructionFailed)?;

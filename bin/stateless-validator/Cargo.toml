@@ -13,6 +13,7 @@ alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-rpc-types-eth.workspace = true
+alloy-trie.workspace = true
 
 # op
 op-alloy-network.workspace = true

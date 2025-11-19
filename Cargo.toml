@@ -17,6 +17,7 @@ alloy-provider = { version = "1.0.23", features = [
 alloy-rlp = { version = "0.3.10", default-features = false }
 alloy-rpc-types-eth = { version = "1.0.23", default-features = false }
 alloy-serde = { version = "1.0.23", default-features = false }
+alloy-trie = { version = "0.9.0", default-features = false }
 
 # op
 alloy-op-evm = { version = "0.15.0", default-features = false }
