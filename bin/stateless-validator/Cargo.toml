@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 # alloy
+alloy-consensus.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-provider.workspace = true

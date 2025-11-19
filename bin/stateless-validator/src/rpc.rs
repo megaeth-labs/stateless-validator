@@ -1,4 +1,5 @@
 //! RPC client for fetching missing data during stateless validation.
+use alloy_consensus::transaction::SignerRecoverable;
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag, BlockTransactions};
@@ -142,6 +143,17 @@ impl RpcClient {
                     "Transaction hash mismatch: expected {:?}, computed {:?}",
                     tx.tx_hash(),
                     tx_envelope.trie_hash()
+                );
+
+                let recovered = tx_envelope
+                    .recover_signer()
+                    .map_err(|err| eyre!("Failed to recover signer: {}", err))?;
+
+                ensure!(
+                    recovered == tx.from(),
+                    "Transaction signer mismatch: expected {:?}, got {:?}",
+                    tx.from(),
+                    recovered
                 );
             }
             let computed_tx_root = ordered_trie_root_with_encoder(transactions, |tx, buf| {
