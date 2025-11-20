@@ -140,6 +140,24 @@ cargo run --bin stateless-validator -- \
 ```
 
 
+## Scope and Trust Model
+
+The stateless validator acts as an **execution client**: it fetches block data from an RPC endpoint and re-executes each block to verify that the **state transition function (STF)** is correct. It ensures that the computed post-state matches the commitments included in the block, providing execution correctness without maintaining a local state database.
+
+However, the stateless validator **does not verify that the blocks it receives form the canonical chain**. It will validate whatever sequence of blocks is supplied, including forks, stale heads, or maliciously injected data. Determining canonicality requires a **consensus client**. For OP-Stack chains, this role is performed by `op-node`, which derives the canonical L2 chain from L1 and the chain’s data-availability (DA) layer and handles reorgs.
+
+
+### Trust-Minimized Deployment
+
+To avoid trusting a third-party RPC provider to serve you the correct blocks, the recommended setup is:
+
+* **Run `op-node`** to derive the canonical L2 chain from L1 + DA
+* **Run a MegaETH replica node** to efficiently syncs with the sequencer and serves the derived L2 blocks
+* **Run the stateless validator** to independently verify every block’s STF
+
+In this configuration, `op-node` ensures you see the correct canonical chain, the replica node provides local block data, and the stateless validator verifies correctness. This forms a **trust-minimized pipeline**: you rely only on L1 + DA (the rollup’s security assumptions) and your own local software, not an external RPC endpoint.
+
+
 ## Architecture
 
 The stateless validator employs a transactional database as its central coordination mechanism, enabling reliable state management and seamless communication between all system components. This database-centric architecture ensures data consistency through ACID transactions while providing a foundation that naturally scales from single-node deployments to distributed multi-node configurations.
