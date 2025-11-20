@@ -315,6 +315,18 @@ pub fn validate_block(
     let mut kv_updates: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
     for (address, cached_account) in accounts {
         let (Some((account_info, storage)), _) = cached_account.into_components() else {
+            // Skip cached accounts with no account info or storage changes.
+            //
+            // Revm creates these cache entries in two cases:
+            // 1. Read-only access to non-existent accounts (balance checks, code reads, etc.)
+            // 2. SELFDESTRUCT execution clearing an account from state
+            //
+            // Since mega-evm disables SELFDESTRUCT, case 2 would fail during transaction
+            // execution above, never reaching here. We only see case 1: read-only operations
+            // that don't generate state changes.
+            //
+            // Skipping these is correct - they represent cache entries without modifications.
+            // Only accounts with actual changes need to be written to the state trie.
             continue;
         };
 
