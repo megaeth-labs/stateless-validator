@@ -44,6 +44,8 @@ redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tracing = { workspace = true, optional = true }
 
 [features]
+debug-util = ["tracing"]
 test-bucket-resize = ["salt/test-bucket-resize"]
