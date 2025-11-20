@@ -9,7 +9,6 @@ alloy-eips = { version = "1.0.23", default-features = false }
 alloy-evm = { version = "0.15.0", default-features = false }
 alloy-genesis = { version = "1.0.23", default-features = false }
 alloy-hardforks = { version = "0.2.7" }
-alloy-network-primitives = { version = "1.0.23", default-features = false }
 alloy-primitives = { version = "1.3.0", default-features = false }
 alloy-provider = { version = "1.0.23", features = [
     "reqwest",

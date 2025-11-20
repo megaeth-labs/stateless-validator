@@ -23,15 +23,18 @@
 //! The module integrates with the Salt witness system for state reconstruction
 //! and uses Revm for transaction execution.
 
-use alloy_consensus::transaction::Recovered;
+use alloy_consensus::transaction::SignerRecoverable;
+use alloy_consensus::{proofs::calculate_receipt_root, transaction::Recovered};
 use alloy_evm::{EvmEnv, block::BlockExecutor};
-use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
-use alloy_primitives::{Address, BlockHash, BlockNumber};
+use alloy_primitives::{Address, BlockHash, BlockNumber, map::HashMap};
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
+use alloy_trie::root::ordered_trie_root_with_encoder;
+use eyre::{Result, ensure, eyre};
 use mega_evm::{
     MegaBlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmEnvAndSettings, MegaEvmFactory,
 };
+use op_alloy_network::{TransactionResponse, eip2718::Encodable2718};
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use revm::{
     context::{BlockEnv, CfgEnv},
@@ -41,10 +44,7 @@ use revm::{
 };
 use salt::{EphemeralSaltState, SaltValue, SaltWitness, StateRoot, StateUpdates, Witness};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, HashMap},
-    time::SystemTime,
-};
+use std::{collections::BTreeMap, time::SystemTime};
 use thiserror::Error;
 
 use crate::{
@@ -99,6 +99,14 @@ pub enum ValidationError {
         /// The computed state root from transaction execution
         actual: B256,
         /// The claimed state root from the block header
+        claimed: B256,
+    },
+
+    #[error("Receipts root mismatch: claimed {claimed}, got {actual}")]
+    ReceiptsRootMismatch {
+        /// The computed receipts root from transaction execution
+        actual: B256,
+        /// The claimed receipts root from the block header
         claimed: B256,
     },
 }
@@ -199,12 +207,13 @@ fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> MegaEvmEnvAndSetti
 /// 4. Executes each transaction in sequence
 /// 5. Applies post-execution changes
 /// 6. Flattens REVM's cache format into plain key-value pairs
+/// 7. Builds the receipts root from all transaction receipts
 fn replay_block(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
     db: &WitnessDatabase<'_>,
     env_oracle: WitnessExternalEnv,
-) -> Result<alloy_primitives::map::HashMap<Address, CacheAccount>, ValidationError> {
+) -> Result<(HashMap<Address, CacheAccount>, B256), ValidationError> {
     // Extract full transaction data
     let BlockTransactions::Full(transactions) = &block.transactions else {
         return Err(ValidationError::BlockIncomplete);
@@ -242,11 +251,15 @@ fn replay_block(
             .map_err(ValidationError::BlockReplayFailed)?;
     }
 
-    executor
+    // Get execution result with all receipts
+    let execution_result = executor
         .apply_post_execution_changes()
         .map_err(ValidationError::BlockReplayFailed)?;
 
-    Ok(state.cache.accounts)
+    // Build receipts root from all transaction receipts
+    let receipts_root = calculate_receipt_root(&execution_result.receipts);
+
+    Ok((state.cache.accounts, receipts_root))
 }
 
 /// Validates a block by creating a witness, replaying transactions, and comparing state roots.
@@ -255,7 +268,9 @@ fn replay_block(
 /// 1. Creates a Witness from the provided SaltWitness
 /// 2. Verifies the witness proof
 /// 3. Replays the block transactions using the witness database
-/// 4. Computes the new state root and compares it with the expected one
+/// 4. Check if computed withdrawals root matches the claimed one
+/// 5. Verify receipts root matches the block header
+/// 6. Computes the new state root and compares it with the expected one
 ///
 /// # Arguments
 ///
@@ -273,7 +288,7 @@ pub fn validate_block(
     block: &Block<OpTransaction>,
     salt_witness: SaltWitness,
     mpt_witness: MptWitness,
-    contracts: &HashMap<B256, Bytecode>,
+    contracts: &std::collections::HashMap<B256, Bytecode>,
 ) -> Result<(), ValidationError> {
     // Create external environment oracle from salt witness
     let env_oracle = WitnessExternalEnv::new(&salt_witness, block.header.number)
@@ -291,7 +306,7 @@ pub fn validate_block(
         witness: &witness,
         contracts,
     };
-    let accounts = replay_block(chain_spec, block, &witness_db, env_oracle)?;
+    let (accounts, receipts_root) = replay_block(chain_spec, block, &witness_db, env_oracle)?;
 
     // Filter out changes within the message passer contract
     let withdrawal_contract = accounts.get(&ADDRESS_L2_TO_L1_MESSAGE_PASSER).cloned();
@@ -360,6 +375,14 @@ pub fn validate_block(
         .verify(&block.header, withdrawal_contract)
         .map_err(ValidationError::WithdrawalValidationFailed)?;
 
+    // Verify receipts root matches the block header
+    if receipts_root != block.header.receipts_root {
+        return Err(ValidationError::ReceiptsRootMismatch {
+            actual: receipts_root,
+            claimed: block.header.receipts_root,
+        });
+    }
+
     // Check if computed state root matches claimed state root
     let state_root = B256::from(state_root);
     match state_root == block.header.state_root {
@@ -369,4 +392,71 @@ pub fn validate_block(
             claimed: block.header.state_root,
         }),
     }
+}
+
+/// Verifies the structural integrity and cryptographic consistency of a block.
+///
+/// # Arguments
+///
+/// * `block` - The block to verify, containing header and transaction data
+///
+/// # Returns
+///
+/// Returns `Ok(())` if all integrity checks pass, otherwise returns an error
+/// describing which check failed.
+///
+/// # Validation Checks
+///
+/// 1. **Block Hash**: Verifies that the block's header hash matches the computed
+///    hash from the header fields
+/// 2. **Transaction Hashes**: For each transaction, verifies that the transaction
+///    hash matches its computed trie hash
+/// 3. **Transaction Signers**: Recovers and verifies the signer for each transaction
+///    matches the claimed `from` address
+/// 4. **Transactions Root**: Computes the Merkle root of all transactions and
+///    verifies it matches the `transactions_root` in the block header
+pub fn verify_block_integrity(block: &Block<OpTransaction>) -> Result<()> {
+    // Verify block hash matches the computed hash from header
+    ensure!(
+        block.header.hash_slow() == block.header.hash,
+        "Block hash mismatch: expected {:?}, computed {:?}",
+        block.header.hash,
+        block.header.hash_slow()
+    );
+
+    // Verify transaction hashes and transactions root
+    if let BlockTransactions::Full(ref transactions) = block.transactions {
+        for tx in transactions {
+            let tx_envelope = tx.inner.clone().into_inner();
+            ensure!(
+                tx_envelope.trie_hash() == *tx_envelope.hash(),
+                "Transaction hash mismatch: expected {:?}, computed {:?}",
+                tx_envelope.hash(),
+                tx_envelope.trie_hash()
+            );
+
+            let recovered = tx_envelope
+                .recover_signer()
+                .map_err(|err| eyre!("Failed to recover signer: {}", err))?;
+
+            ensure!(
+                recovered == tx.from(),
+                "Transaction signer mismatch: expected {:?}, got {:?}",
+                tx.from(),
+                recovered
+            );
+        }
+
+        let computed_tx_root = ordered_trie_root_with_encoder(transactions, |tx, buf| {
+            tx.inner.clone().into_inner().encode_2718(buf)
+        });
+        ensure!(
+            computed_tx_root == block.header.transactions_root,
+            "Transactions root mismatch: expected {:?}, computed {:?}",
+            block.header.transactions_root,
+            computed_tx_root
+        );
+    }
+
+    Ok(())
 }
