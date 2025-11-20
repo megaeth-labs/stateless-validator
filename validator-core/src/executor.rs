@@ -410,7 +410,7 @@ pub fn validate_block(
 /// 1. **Block Hash**: Verifies that the block's header hash matches the computed
 ///    hash from the header fields
 /// 2. **Transaction Hashes**: For each transaction, verifies that the transaction
-///    hash matches its computed trie hash
+///    hash matches its computed hash
 /// 3. **Transaction Signers**: Recovers and verifies the signer for each transaction
 ///    matches the claimed `from` address
 /// 4. **Transactions Root**: Computes the Merkle root of all transactions and
