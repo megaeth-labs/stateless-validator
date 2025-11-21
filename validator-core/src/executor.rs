@@ -265,13 +265,13 @@ where
 /// Executes transactions using the given block executor.
 fn execute_transactions<E, T>(
     mut executor: E,
-    transactions: &[op_alloy_rpc_types::Transaction<T>],
+    transactions: &[OpTransaction<T>],
 ) -> Result<B256, ValidationError>
 where
     E: BlockExecutor<Transaction = T>,
     E::Receipt: Encodable2718,
     T: Clone,
-    op_alloy_rpc_types::Transaction<T>: TransactionResponse,
+    OpTransaction<T>: TransactionResponse,
     for<'a> Recovered<&'a T>: ExecutableTx<E>,
 {
     executor
@@ -307,8 +307,11 @@ where
 ///
 /// * `chain_spec` - Chain specification defining the EVM rules and parameters
 /// * `block` - The block to validate containing transactions and header information
-/// * `salt_witness` - The salt witness data needed for state reconstruction
+/// * `salt_witness` - The salt witness data needed for state validation
+/// * `mpt_witness` - The MPT witness data for withdrawal verification
 /// * `contracts` - Contract bytecode cache for transaction execution
+/// * `writer` - Optional writer for EIP-3155 trace output. When provided, enables
+///   step-by-step EVM execution tracing in EIP-3155 format.
 ///
 /// # Returns
 ///
