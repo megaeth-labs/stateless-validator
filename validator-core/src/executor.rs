@@ -25,26 +25,33 @@
 
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::{proofs::calculate_receipt_root, transaction::Recovered};
-use alloy_evm::{EvmEnv, block::BlockExecutor};
+use alloy_evm::{
+    EvmEnv,
+    block::{BlockExecutor, ExecutableTx},
+};
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{Address, BlockHash, BlockNumber, map::HashMap};
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
 use alloy_trie::root::ordered_trie_root_with_encoder;
 use eyre::{Result, ensure, eyre};
 use mega_evm::{
-    BlockLimits, MegaBlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory, MegaSpecId,
+    BlockLimits, ExternalEnvs, MegaBlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory,
+    MegaSpecId,
 };
 use op_alloy_network::{TransactionResponse, eip2718::Encodable2718};
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use revm::{
+    DatabaseRef,
     context::{BlockEnv, CfgEnv},
     database::states::{CacheAccount, StateBuilder},
+    inspector::inspectors::TracerEip3155,
     primitives::{B256, KECCAK_EMPTY, U256},
     state::Bytecode,
 };
 use salt::{EphemeralSaltState, SaltValue, SaltWitness, StateRoot, StateUpdates, Witness};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, time::SystemTime};
+use std::io::Write;
+use std::{collections::BTreeMap, fmt::Debug, time::SystemTime};
 use thiserror::Error;
 
 use crate::{
@@ -205,12 +212,18 @@ fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<MegaSpecId>
 /// 5. Applies post-execution changes
 /// 6. Flattens REVM's cache format into plain key-value pairs
 /// 7. Builds the receipts root from all transaction receipts
-fn replay_block(
+pub fn replay_block<DB, ENV, E>(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
-    db: &WitnessDatabase<'_>,
-    env_oracle: WitnessExternalEnv,
-) -> Result<(HashMap<Address, CacheAccount>, B256), ValidationError> {
+    db: &DB,
+    env_oracle: ENV,
+    trace_writer: Option<Box<dyn Write>>,
+) -> Result<(HashMap<Address, CacheAccount>, B256), ValidationError>
+where
+    DB: DatabaseRef<Error = E> + Debug,
+    ENV: ExternalEnvs + Clone,
+    E: std::error::Error + Send + Sync + 'static,
+{
     // Extract full transaction data
     let BlockTransactions::Full(transactions) = &block.transactions else {
         return Err(ValidationError::BlockIncomplete);
@@ -233,9 +246,34 @@ fn replay_block(
         BlockLimits::from_evm_env(&evm_env),
     );
 
-    let mut executor = executor_factory.create_executor(&mut state, execution_context, evm_env);
+    let receipts_root = if let Some(writer) = trace_writer {
+        let executor = executor_factory.create_executor_with_inspector(
+            &mut state,
+            execution_context,
+            evm_env,
+            TracerEip3155::new(writer),
+        );
+        execute_transactions(executor, transactions)?
+    } else {
+        let executor = executor_factory.create_executor(&mut state, execution_context, evm_env);
+        execute_transactions(executor, transactions)?
+    };
 
-    // Execute block transactions
+    Ok((state.cache.accounts, receipts_root))
+}
+
+/// Executes transactions using the given block executor.
+fn execute_transactions<E, T>(
+    mut executor: E,
+    transactions: &[op_alloy_rpc_types::Transaction<T>],
+) -> Result<B256, ValidationError>
+where
+    E: BlockExecutor<Transaction = T>,
+    E::Receipt: Encodable2718,
+    T: Clone,
+    op_alloy_rpc_types::Transaction<T>: TransactionResponse,
+    for<'a> Recovered<&'a T>: ExecutableTx<E>,
+{
     executor
         .apply_pre_execution_changes()
         .map_err(ValidationError::BlockReplayFailed)?;
@@ -248,15 +286,11 @@ fn replay_block(
             .map_err(ValidationError::BlockReplayFailed)?;
     }
 
-    // Get execution result with all receipts
     let execution_result = executor
         .apply_post_execution_changes()
         .map_err(ValidationError::BlockReplayFailed)?;
 
-    // Build receipts root from all transaction receipts
-    let receipts_root = calculate_receipt_root(&execution_result.receipts);
-
-    Ok((state.cache.accounts, receipts_root))
+    Ok(calculate_receipt_root(&execution_result.receipts))
 }
 
 /// Validates a block by creating a witness, replaying transactions, and comparing state roots.
@@ -286,9 +320,10 @@ pub fn validate_block(
     salt_witness: SaltWitness,
     mpt_witness: MptWitness,
     contracts: &std::collections::HashMap<B256, Bytecode>,
+    writer: Option<Box<dyn Write>>,
 ) -> Result<(), ValidationError> {
     // Create external environment oracle from salt witness
-    let env_oracle = WitnessExternalEnv::new(&salt_witness, block.header.number)
+    let ext_env = WitnessExternalEnv::new(&salt_witness, block.header.number)
         .map_err(ValidationError::EnvOracleConstructionFailed)?;
 
     // Verify witness proof against the current state root
@@ -303,7 +338,7 @@ pub fn validate_block(
         witness: &witness,
         contracts,
     };
-    let (accounts, receipts_root) = replay_block(chain_spec, block, &witness_db, env_oracle)?;
+    let (accounts, receipts_root) = replay_block(chain_spec, block, &witness_db, ext_env, writer)?;
 
     // Filter out changes within the message passer contract
     let withdrawal_contract = accounts.get(&ADDRESS_L2_TO_L1_MESSAGE_PASSER).cloned();

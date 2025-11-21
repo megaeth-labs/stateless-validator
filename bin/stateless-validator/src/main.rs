@@ -715,7 +715,7 @@ async fn validate_one(
             let pre_state_root = B256::from(witness.state_root()?);
             let pre_withdrawals_root = mpt_witness.storage_root;
             let (success, error_message) =
-                match validate_block(chain_spec, &block, witness, mpt_witness, &contracts) {
+                match validate_block(chain_spec, &block, witness, mpt_witness, &contracts, None) {
                     Ok(()) => {
                         info!("[Worker {worker_id}] Successfully validated block {block_number}");
                         (true, None)
