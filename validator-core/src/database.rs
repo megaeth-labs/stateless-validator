@@ -263,6 +263,8 @@ impl SaltEnv for WitnessExternalEnv {
         bucket_id: BucketId,
         at_block: BlockNumber,
     ) -> Result<u64, Self::Error> {
+        trace!(?bucket_id, at_block, "get_bucket_capacity");
+
         if at_block != self.block_number {
             return Err(WitnessDatabaseError(format!(
                 "block mismatch: expected {}, got {}",

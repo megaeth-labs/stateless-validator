@@ -54,8 +54,8 @@
 //! **For Validation Workers:**
 //! - `get_next_task()` - Claim next validation task atomically with block and witness data
 //! - `complete_validation()` - Store validation results and mark task as finished
-//! - `add_contract_code()` - Cache contract bytecode needed during validation
-//! - `get_contract_code()` - Retrieve cached contract bytecode by code hash
+//! - `add_contract_codes()` - Cache contract bytecodes needed during validation in batch
+//! - `get_contract_codes()` - Retrieve cached contract bytecodes by code hashes in batch
 
 use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
@@ -67,7 +67,7 @@ use salt::SaltWitness;
 use serde_json;
 use thiserror::Error;
 
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 use crate::executor::{ValidationError, ValidationResult};
 use crate::withdrawals::MptWitness;
@@ -180,8 +180,8 @@ const BLOCK_RECORDS: TableDefinition<(u64, [u8; 32]), ()> = TableDefinition::new
 /// - Value: Serialized contract Bytecode as Vec<u8>
 ///
 /// Improves performance by avoiding repeated fetches of the same contracts.
-/// Populated by workers via add_contract_code() when new bytecode is needed
-/// and retrieved via get_contract_code().
+/// Populated by workers via add_contract_codes() when new bytecode is needed
+/// and retrieved via get_contract_codes().
 const CONTRACTS: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("contracts");
 
 /// Genesis configuration for the chain.
@@ -358,20 +358,24 @@ impl ValidatorDB {
         Ok(())
     }
 
-    /// Stores contract bytecode in the cache
+    /// Stores multiple contract bytecodes in the cache
     ///
-    /// Workers call this to populate the cache when they fetch new bytecode,
-    /// so future validations can retrieve it via get_contract_code() instead
+    /// Workers call this to populate the cache when they fetch new bytecodes,
+    /// so future validations can retrieve it via get_contract_codes() instead
     /// of fetching externally. The code hash is computed automatically from
     /// the bytecode to ensure data integrity.
-    pub fn add_contract_code(&self, bytecode: &Bytecode) -> ValidationDbResult<()> {
-        let code_hash = bytecode.hash_slow();
-
+    pub fn add_contract_codes<'a>(
+        &self,
+        bytecodes: impl IntoIterator<Item = &'a Bytecode>,
+    ) -> ValidationDbResult<()> {
         let write_txn = self.database.begin_write()?;
         {
             let mut contracts = write_txn.open_table(CONTRACTS)?;
-            let serialized_bytecode = encode_to_vec(bytecode)?;
-            contracts.insert(code_hash.0, serialized_bytecode)?;
+            for bytecode in bytecodes {
+                let code_hash = bytecode.hash_slow();
+                let serialized_bytecode = encode_to_vec(bytecode)?;
+                contracts.insert(code_hash.0, serialized_bytecode)?;
+            }
         }
         write_txn.commit()?;
         Ok(())
@@ -794,18 +798,33 @@ impl ValidatorDB {
         Ok(())
     }
 
-    /// Retrieves cached contract bytecode
+    /// Retrieves multiple cached contract bytecodes
     ///
-    /// Returns the bytecode for a contract if it's been cached, or None if not found.
-    /// Used by validation workers to avoid repeatedly fetching the same contracts.
-    pub fn get_contract_code(&self, code_hash: B256) -> ValidationDbResult<Option<Bytecode>> {
+    /// Returns a tuple of (found_contracts, missing_hashes) where:
+    /// - `found_contracts`: HashMap mapping code hash to bytecode for all found contracts
+    /// - `missing_hashes`: Vec of code hashes that were not found in the cache
+    pub fn get_contract_codes(
+        &self,
+        code_hashes: impl IntoIterator<Item = B256>,
+    ) -> ValidationDbResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
         let read_txn = self.database.begin_read()?;
         let contracts = read_txn.open_table(CONTRACTS)?;
 
-        match contracts.get(code_hash.0)? {
-            Some(serialized_bytecode) => Ok(Some(decode_from_slice(&serialized_bytecode.value()))),
-            None => Ok(None),
+        let mut found = HashMap::new();
+        let mut missing = Vec::new();
+
+        for code_hash in code_hashes {
+            match contracts.get(code_hash.0)? {
+                Some(serialized_bytecode) => {
+                    found.insert(code_hash, decode_from_slice(&serialized_bytecode.value()));
+                }
+                None => {
+                    missing.push(code_hash);
+                }
+            }
         }
+
+        Ok((found, missing))
     }
 
     /// Cleans up old block data to save storage space

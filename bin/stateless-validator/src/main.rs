@@ -1,13 +1,13 @@
 use alloy_genesis::Genesis;
-use alloy_primitives::{Address, B256, BlockHash, BlockNumber, hex};
-use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
+use alloy_primitives::{B256, BlockHash, BlockNumber, hex};
+use alloy_rpc_types_eth::{Block, BlockId};
 use clap::Parser;
 use eyre::{Result, anyhow, ensure};
 use futures::future;
 use op_alloy_rpc_types::Transaction;
 use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
 use salt::SaltWitness;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::{
     path::PathBuf,
     sync::Arc,
@@ -680,36 +680,31 @@ async fn validate_one(
 
             // Prepare the contract map to be used by validation
             let codehashes = extract_contract_codes(&witness);
-            let mut missing_contracts = Vec::new();
-            let mut contracts = HashMap::new();
 
-            for (address, code_hash) in &codehashes {
-                match validator_db.get_contract_code(*code_hash) {
-                    Ok(Some(bytecode)) => {
-                        contracts.insert(*code_hash, bytecode);
-                    }
-                    _ => missing_contracts.push(*address),
-                }
-            }
+            let (mut contracts, missing_contracts) = validator_db.get_contract_codes(codehashes)?;
 
             // Fetch missing contract codes via RPC and update the local DB
-            let codes = client
-                .get_code(&missing_contracts, BlockNumberOrTag::Latest)
-                .await?;
+            let codes = client.get_code(&missing_contracts).await?;
 
-            for (address, bytes) in missing_contracts.iter().zip(codes.iter()) {
-                let bytecode = Bytecode::new_raw(bytes.clone());
-                let codehash = bytecode.hash_slow();
+            // Validate all fetched bytecodes match expected hashes
+            let new_bytecodes: Vec<_> = missing_contracts
+                .into_iter()
+                .zip(codes.iter())
+                .map(|(code_hash, bytes)| {
+                    let bytecode = Bytecode::new_raw(bytes.clone());
+                    let computed_hash = bytecode.hash_slow();
 
-                ensure!(
-                    codehash == codehashes[address],
-                    "RPC provider returned bytecode with unexpected codehash for {address}: expected {:?}, got {codehash:?}",
-                    codehashes[address]
-                );
+                    ensure!(
+                        computed_hash == code_hash,
+                        "RPC provider returned bytecode with unexpected codehash: expected {code_hash:?}, got {computed_hash:?}",
+                    );
 
-                validator_db.add_contract_code(&bytecode)?;
-                contracts.insert(codehashes[address], bytecode);
-            }
+                    Ok((computed_hash, bytecode))
+                })
+                .collect::<Result<_>>()?;
+
+            validator_db.add_contract_codes(new_bytecodes.iter().map(|(_, bytecode)| bytecode))?;
+            contracts.extend(new_bytecodes);
 
             // Validate the given block
             let pre_state_root = B256::from(witness.state_root()?);
@@ -861,17 +856,16 @@ async fn history_pruner(
 ///
 /// Filters witness data to find accounts with non-empty bytecode, which are
 /// needed for contract code fetching during block execution.
-fn extract_contract_codes(salt_witness: &SaltWitness) -> HashMap<Address, B256> {
+fn extract_contract_codes(salt_witness: &SaltWitness) -> HashSet<B256> {
     salt_witness
         .kvs
         .values()
         .filter_map(|salt_val| salt_val.as_ref())
         .filter_map(
             |val| match (PlainKey::decode(val.key()), PlainValue::decode(val.value())) {
-                (PlainKey::Account(addr), PlainValue::Account(acc)) => acc
-                    .codehash
-                    .filter(|&codehash| codehash != KECCAK_EMPTY)
-                    .map(|codehash| (addr, codehash)),
+                (PlainKey::Account(_), PlainValue::Account(acc)) => {
+                    acc.codehash.filter(|&codehash| codehash != KECCAK_EMPTY)
+                }
                 _ => None,
             },
         )
@@ -1027,8 +1021,8 @@ mod tests {
         /// Mpt Witness data indexed by block hash
         mpt_witness_data: HashMap<BlockHash, MptWitness>,
 
-        /// Contract bytecode indexed by address for eth_getCode RPC
-        address_bytecodes: HashMap<Address, Bytecode>,
+        /// Contract bytecode indexed by code hash for eth_getCodeByHash RPC
+        bytecodes: HashMap<B256, Bytecode>,
 
         /// Minimum block in the test data set (block number and hash)
         min_block: (u64, BlockHash),
@@ -1142,19 +1136,12 @@ mod tests {
             .unwrap();
 
         module
-            .register_method("eth_getCode", |params, context, _| {
-                let (address, _block_id): (Address, BlockNumberOrTag) =
-                    params.parse().map_err(|e| {
-                        make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
-                    })?;
+            .register_method("eth_getCodeByHash", |params, context, _| {
+                let (hash,): (B256,) = params.parse().unwrap();
 
-                let code = context
-                    .address_bytecodes
-                    .get(&address)
-                    .map(|bc| bc.original_bytes())
-                    .unwrap_or_default();
+                let code = context.bytecodes.get(&hash).cloned().unwrap_or_default();
 
-                Ok::<_, ErrorObject<'static>>(code)
+                Ok::<_, ErrorObject<'static>>(code.original_bytes())
             })
             .unwrap();
 
@@ -1378,23 +1365,15 @@ mod tests {
         }
 
         // Load contract data and build address-to-bytecode mapping from witness data
-        let contracts = load_contracts(CONTRACTS_FILE);
-        debug!("Loaded {} contracts from {CONTRACTS_FILE}", contracts.len());
-
-        let address_bytecodes: HashMap<Address, Bytecode> = witness_data
-            .values()
-            .flat_map(extract_contract_codes)
-            .filter_map(|(addr, codehash)| {
-                contracts.get(&codehash).map(|code| (addr, code.clone()))
-            })
-            .collect();
+        let bytecodes = load_contracts(CONTRACTS_FILE);
+        debug!("Loaded {} contracts from {CONTRACTS_FILE}", bytecodes.len());
 
         Ok(RpcModuleContext {
             blocks_by_hash,
             block_hashes,
             witness_data,
             mpt_witness_data,
-            address_bytecodes,
+            bytecodes,
             min_block,
             max_block,
         })
@@ -1416,7 +1395,7 @@ mod tests {
             "Context created with {} blocks, {} witnesses, {} contracts",
             context.blocks_by_hash.len(),
             context.witness_data.len(),
-            context.address_bytecodes.len()
+            context.bytecodes.len()
         );
         debug!(
             "Block range: {} - {}",

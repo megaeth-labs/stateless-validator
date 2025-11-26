@@ -1,5 +1,5 @@
 //! RPC client for fetching missing data during stateless validation.
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{B256, Bytes};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
 use eyre::{Context, Result, ensure, eyre};
@@ -50,31 +50,24 @@ impl RpcClient {
         })
     }
 
-    /// Gets contract bytecode for multiple addresses at a specific block height.
+    /// Gets contract bytecode for multiple code hashes.
     ///
     /// # Arguments
-    /// * `addresses` - Contract addresses to fetch bytecode for
-    /// * `block_number` - Block height to query (supports latest, earliest, pending)
+    /// * `hashes` - Contract code hashes to fetch bytecode for
     ///
     /// # Returns
-    /// Vector of bytecode in the same order as input addresses. Empty bytecode
-    /// is returned for addresses without deployed contracts.
+    /// Vector of bytecode in the same order as input hashes. Empty bytecode
+    /// is returned for hashes without corresponding contract code.
     ///
     /// # Performance
     /// Executes all requests concurrently for optimal performance.
-    pub async fn get_code(
-        &self,
-        addresses: &[Address],
-        block_number: BlockNumberOrTag,
-    ) -> Result<Vec<Bytes>> {
-        try_join_all(addresses.iter().map(|&addr| async move {
+    pub async fn get_code(&self, hashes: &[B256]) -> Result<Vec<Bytes>> {
+        try_join_all(hashes.iter().map(|&hash| async move {
             self.data_provider
-                .get_code_at(addr)
-                .block_id(block_number.into())
+                .client()
+                .request("eth_getCodeByHash", (hash,))
                 .await
-                .context(format!(
-                    "get_code_at for address {addr:?} at block {block_number:?}"
-                ))
+                .map_err(|e| eyre!("eth_getCodeByHash for hash {hash:?} failed: {e}"))
         }))
         .await
     }
