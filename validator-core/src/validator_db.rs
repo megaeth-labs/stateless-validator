@@ -810,21 +810,18 @@ impl ValidatorDB {
         let read_txn = self.database.begin_read()?;
         let contracts = read_txn.open_table(CONTRACTS)?;
 
-        let mut found = HashMap::new();
-        let mut missing = Vec::new();
-
-        for code_hash in code_hashes {
-            match contracts.get(code_hash.0)? {
-                Some(serialized_bytecode) => {
-                    found.insert(code_hash, decode_from_slice(&serialized_bytecode.value()));
+        code_hashes.into_iter().try_fold(
+            (HashMap::new(), Vec::new()),
+            |(mut found, mut missing), code_hash| {
+                match contracts.get(code_hash.0)? {
+                    Some(bytes) => {
+                        found.insert(code_hash, decode_from_slice(&bytes.value()));
+                    }
+                    None => missing.push(code_hash),
                 }
-                None => {
-                    missing.push(code_hash);
-                }
-            }
-        }
-
-        Ok((found, missing))
+                Ok::<_, ValidationDbError>((found, missing))
+            },
+        )
     }
 
     /// Cleans up old block data to save storage space

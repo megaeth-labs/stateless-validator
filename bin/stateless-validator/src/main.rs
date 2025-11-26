@@ -1137,7 +1137,9 @@ mod tests {
 
         module
             .register_method("eth_getCodeByHash", |params, context, _| {
-                let (hash,): (B256,) = params.parse().unwrap();
+                let (hash,): (B256,) = params.parse().map_err(|e| {
+                    make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
+                })?;
 
                 let code = context.bytecodes.get(&hash).cloned().unwrap_or_default();
 
