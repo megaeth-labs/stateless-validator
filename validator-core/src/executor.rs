@@ -35,8 +35,8 @@ use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
 use alloy_trie::root::ordered_trie_root_with_encoder;
 use eyre::{Result, ensure, eyre};
 use mega_evm::{
-    BlockLimits, ExternalEnvs, MegaBlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory,
-    MegaSpecId,
+    BlockLimits, ExternalEnvFactory, MegaBlockExecutionCtx, MegaBlockExecutorFactory,
+    MegaEvmFactory, MegaSpecId,
 };
 use op_alloy_network::{TransactionResponse, eip2718::Encodable2718};
 use op_alloy_rpc_types::Transaction as OpTransaction;
@@ -221,7 +221,7 @@ pub fn replay_block<DB, ENV, E>(
 ) -> Result<(HashMap<Address, CacheAccount>, B256), ValidationError>
 where
     DB: DatabaseRef<Error = E> + Debug,
-    ENV: ExternalEnvs + Clone,
+    ENV: ExternalEnvFactory + Clone,
     E: std::error::Error + Send + Sync + 'static,
 {
     // Extract full transaction data
@@ -235,7 +235,7 @@ where
 
     let executor_factory = MegaBlockExecutorFactory::new(
         chain_spec.clone(),
-        MegaEvmFactory::new(env_oracle),
+        MegaEvmFactory::new().with_external_env_factory(env_oracle),
         OpAlloyReceiptBuilder::default(),
     );
 
