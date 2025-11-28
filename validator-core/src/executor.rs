@@ -30,7 +30,8 @@ use alloy_evm::{
     block::{BlockExecutor, ExecutableTx},
 };
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
-use alloy_primitives::{Address, BlockHash, BlockNumber, map::HashMap};
+use alloy_consensus::TxReceipt;
+use alloy_primitives::{Address, BlockHash, BlockNumber, Bloom, map::HashMap};
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
 use alloy_trie::root::ordered_trie_root_with_encoder;
 use eyre::{Result, ensure, eyre};
@@ -116,6 +117,22 @@ pub enum ValidationError {
         /// The claimed receipts root from the block header
         claimed: B256,
     },
+
+    #[error("Logs bloom mismatch: claimed {claimed}, got {actual}")]
+    LogsBloomMismatch {
+        /// The computed logs bloom from transaction execution
+        actual: Bloom,
+        /// The claimed logs bloom from the block header
+        claimed: Bloom,
+    },
+
+    #[error("Gas used mismatch: claimed {claimed}, got {actual}")]
+    GasUsedMismatch {
+        /// The computed gas used from transaction execution
+        actual: u64,
+        /// The claimed gas used from the block header
+        claimed: u64,
+    },
 }
 
 /// Represents the result of a validation operation
@@ -139,6 +156,19 @@ pub struct ValidationResult {
     pub error_message: Option<String>,
     /// Timestamp when validation completed
     pub completed_at: SystemTime,
+}
+
+/// Results from executing block transactions.
+///
+/// Contains the computed values needed to verify block header fields.
+#[derive(Debug, Clone)]
+pub struct BlockExecutionOutput {
+    /// The computed receipts root from transaction execution
+    pub receipts_root: B256,
+    /// The aggregated logs bloom from all receipts
+    pub logs_bloom: Bloom,
+    /// The total gas used by all transactions
+    pub gas_used: u64,
 }
 
 /// Creates an EVM execution environment from a block header and chain specification.
@@ -194,9 +224,9 @@ fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<MegaSpecId>
 ///
 /// # Returns
 ///
-/// Returns a `HashMap` of state updates where:
-/// - Keys are encoded storage keys (accounts and storage slots)
-/// - Values are `Some(encoded_value)` for updates or `None` for deletions
+/// Returns a tuple containing:
+/// - A `HashMap` of cached account states from transaction execution
+/// - A `BlockExecutionOutput` with receipts root, logs bloom, and gas used
 ///
 /// # Errors
 ///
@@ -211,14 +241,14 @@ fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<MegaSpecId>
 /// 4. Executes each transaction in sequence
 /// 5. Applies post-execution changes
 /// 6. Flattens REVM's cache format into plain key-value pairs
-/// 7. Builds the receipts root from all transaction receipts
+/// 7. Builds the execution output (receipts root, logs bloom, gas used) from all transaction receipts
 pub fn replay_block<DB, ENV, E>(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
     db: &DB,
     env_oracle: ENV,
     trace_writer: Option<Box<dyn Write>>,
-) -> Result<(HashMap<Address, CacheAccount>, B256), ValidationError>
+) -> Result<(HashMap<Address, CacheAccount>, BlockExecutionOutput), ValidationError>
 where
     DB: DatabaseRef<Error = E> + Debug,
     ENV: ExternalEnvs + Clone,
@@ -246,7 +276,7 @@ where
         BlockLimits::from_evm_env(&evm_env),
     );
 
-    let receipts_root = if let Some(writer) = trace_writer {
+    let execution_output = if let Some(writer) = trace_writer {
         let executor = executor_factory.create_executor_with_inspector(
             &mut state,
             execution_context,
@@ -259,17 +289,17 @@ where
         execute_transactions(executor, transactions)?
     };
 
-    Ok((state.cache.accounts, receipts_root))
+    Ok((state.cache.accounts, execution_output))
 }
 
 /// Executes transactions using the given block executor.
 fn execute_transactions<E, T>(
     mut executor: E,
     transactions: &[OpTransaction<T>],
-) -> Result<B256, ValidationError>
+) -> Result<BlockExecutionOutput, ValidationError>
 where
     E: BlockExecutor<Transaction = T>,
-    E::Receipt: Encodable2718,
+    E::Receipt: Encodable2718 + TxReceipt,
     T: Clone,
     OpTransaction<T>: TransactionResponse,
     for<'a> Recovered<&'a T>: ExecutableTx<E>,
@@ -290,7 +320,26 @@ where
         .apply_post_execution_changes()
         .map_err(ValidationError::BlockReplayFailed)?;
 
-    Ok(calculate_receipt_root(&execution_result.receipts))
+    // Compute logs bloom by ORing all receipt blooms together
+    let logs_bloom = execution_result
+        .receipts
+        .iter()
+        .fold(Bloom::ZERO, |acc, receipt| acc | receipt.bloom());
+
+    // Gas used is the cumulative gas used of the last receipt
+    let gas_used = execution_result
+        .receipts
+        .last()
+        .map(|r| r.cumulative_gas_used())
+        .unwrap_or(0);
+
+    let receipts_root = calculate_receipt_root(&execution_result.receipts);
+
+    Ok(BlockExecutionOutput {
+        receipts_root,
+        logs_bloom,
+        gas_used,
+    })
 }
 
 /// Validates a block by creating a witness, replaying transactions, and comparing state roots.
@@ -341,7 +390,8 @@ pub fn validate_block(
         witness: &witness,
         contracts,
     };
-    let (accounts, receipts_root) = replay_block(chain_spec, block, &witness_db, ext_env, writer)?;
+    let (accounts, execution_output) =
+        replay_block(chain_spec, block, &witness_db, ext_env, writer)?;
 
     // Filter out changes within the message passer contract
     let withdrawal_contract = accounts.get(&ADDRESS_L2_TO_L1_MESSAGE_PASSER).cloned();
@@ -423,10 +473,26 @@ pub fn validate_block(
         .map_err(ValidationError::WithdrawalValidationFailed)?;
 
     // Verify receipts root matches the block header
-    if receipts_root != block.header.receipts_root {
+    if execution_output.receipts_root != block.header.receipts_root {
         return Err(ValidationError::ReceiptsRootMismatch {
-            actual: receipts_root,
+            actual: execution_output.receipts_root,
             claimed: block.header.receipts_root,
+        });
+    }
+
+    // Verify logs bloom matches the block header
+    if execution_output.logs_bloom != block.header.logs_bloom {
+        return Err(ValidationError::LogsBloomMismatch {
+            actual: execution_output.logs_bloom,
+            claimed: block.header.logs_bloom,
+        });
+    }
+
+    // Verify gas used matches the block header
+    if execution_output.gas_used != block.header.gas_used {
+        return Err(ValidationError::GasUsedMismatch {
+            actual: execution_output.gas_used,
+            claimed: block.header.gas_used,
         });
     }
 
