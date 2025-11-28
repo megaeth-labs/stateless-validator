@@ -7,8 +7,8 @@ use futures::future;
 use op_alloy_rpc_types::Transaction;
 use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
 use salt::SaltWitness;
-use std::collections::{HashMap, HashSet};
 use std::{
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime},

@@ -23,14 +23,16 @@
 //! The module integrates with the Salt witness system for state reconstruction
 //! and uses Revm for transaction execution.
 
-use alloy_consensus::transaction::SignerRecoverable;
-use alloy_consensus::{proofs::calculate_receipt_root, transaction::Recovered};
+use alloy_consensus::{
+    TxReceipt,
+    proofs::calculate_receipt_root,
+    transaction::{Recovered, SignerRecoverable},
+};
 use alloy_evm::{
     EvmEnv,
     block::{BlockExecutor, ExecutableTx},
 };
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
-use alloy_consensus::TxReceipt;
 use alloy_primitives::{Address, BlockHash, BlockNumber, Bloom, map::HashMap};
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
 use alloy_trie::root::ordered_trie_root_with_encoder;
@@ -51,8 +53,7 @@ use revm::{
 };
 use salt::{EphemeralSaltState, SaltValue, SaltWitness, StateRoot, StateUpdates, Witness};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
-use std::{collections::BTreeMap, fmt::Debug, time::SystemTime};
+use std::{collections::BTreeMap, fmt::Debug, io::Write, time::SystemTime};
 use thiserror::Error;
 
 use crate::{
@@ -121,9 +122,9 @@ pub enum ValidationError {
     #[error("Logs bloom mismatch: claimed {claimed}, got {actual}")]
     LogsBloomMismatch {
         /// The computed logs bloom from transaction execution
-        actual: Bloom,
+        actual: Box<Bloom>,
         /// The claimed logs bloom from the block header
-        claimed: Bloom,
+        claimed: Box<Bloom>,
     },
 
     #[error("Gas used mismatch: claimed {claimed}, got {actual}")]
@@ -483,8 +484,8 @@ pub fn validate_block(
     // Verify logs bloom matches the block header
     if execution_output.logs_bloom != block.header.logs_bloom {
         return Err(ValidationError::LogsBloomMismatch {
-            actual: execution_output.logs_bloom,
-            claimed: block.header.logs_bloom,
+            actual: Box::new(execution_output.logs_bloom),
+            claimed: Box::new(block.header.logs_bloom),
         });
     }
 
