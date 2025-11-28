@@ -17,7 +17,7 @@ use revm::{
 };
 use salt::{
     BucketId, BucketMeta, EphemeralSaltState, METADATA_KEYS_RANGE, SaltKey, SaltValue, SaltWitness,
-    Witness, bucket_id_from_metadata_key, hasher::bucket_id,
+    Witness, bucket_id_from_metadata_key, hasher,
 };
 use std::collections::HashMap;
 use tracing::trace;
@@ -273,21 +273,11 @@ impl SaltEnv for WitnessExternalEnv {
     }
 
     fn bucket_id_for_account(account: Address) -> BucketId {
-        bucket_id(account.as_slice())
+        hasher::bucket_id(&PlainKey::Account(account).encode())
     }
 
     fn bucket_id_for_slot(address: Address, key: U256) -> BucketId {
-        /// Length of a storage slot key in bytes (32 bytes for U256).
-        const SLOT_KEY_LEN: usize = B256::len_bytes();
-        /// Length of an account address in bytes (20 bytes).
-        const PLAIN_ACCOUNT_KEY_LEN: usize = Address::len_bytes();
-        /// Length of a combined address+slot key (52 bytes = 20 + 32).
-        const PLAIN_STORAGE_KEY_LEN: usize = PLAIN_ACCOUNT_KEY_LEN + SLOT_KEY_LEN;
-        bucket_id(
-            address
-                .concat_const::<SLOT_KEY_LEN, PLAIN_STORAGE_KEY_LEN>(key.into())
-                .as_slice(),
-        )
+        hasher::bucket_id(&PlainKey::Storage(address, key.into()).encode())
     }
 }
 
