@@ -218,7 +218,7 @@ impl WitnessExternalEnv {
             .collect::<Result<HashMap<_, _>, _>>()?;
 
         Ok(Self {
-            block_number: block_number - 1,
+            block_number,
             bucket_capacities,
         })
     }
