@@ -33,7 +33,10 @@ use alloy_evm::{
     block::{BlockExecutor, ExecutableTx},
 };
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
-use alloy_primitives::{Address, BlockHash, BlockNumber, Bloom, map::HashMap};
+use alloy_primitives::{
+    Address, BlockHash, BlockNumber, Bloom, keccak256,
+    map::{B256Map, HashMap},
+};
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
 use alloy_trie::root::ordered_trie_root_with_encoder;
 use eyre::{Result, ensure, eyre};
@@ -46,7 +49,7 @@ use op_alloy_rpc_types::Transaction as OpTransaction;
 use revm::{
     DatabaseRef,
     context::{BlockEnv, CfgEnv},
-    database::states::{CacheAccount, StateBuilder},
+    database::states::{BundleAccount, StateBuilder, bundle_state::BundleRetention},
     inspector::inspectors::TracerEip3155,
     primitives::{B256, KECCAK_EMPTY, U256},
     state::Bytecode,
@@ -249,7 +252,7 @@ pub fn replay_block<DB, ENV, E>(
     db: &DB,
     env_oracle: ENV,
     trace_writer: Option<Box<dyn Write>>,
-) -> Result<(HashMap<Address, CacheAccount>, BlockExecutionOutput), ValidationError>
+) -> Result<(HashMap<Address, BundleAccount>, BlockExecutionOutput), ValidationError>
 where
     DB: DatabaseRef<Error = E> + Debug,
     ENV: ExternalEnvFactory + Clone,
@@ -261,7 +264,10 @@ where
     };
 
     // Setup execution environment
-    let mut state = StateBuilder::new().with_database_ref(db).build();
+    let mut state = StateBuilder::new()
+        .with_database_ref(db)
+        .with_bundle_update()
+        .build();
     let evm_env = create_evm_env(&block.header, chain_spec);
 
     let executor_factory = MegaBlockExecutorFactory::new(
@@ -290,7 +296,10 @@ where
         execute_transactions(executor, transactions)?
     };
 
-    Ok((state.cache.accounts, execution_output))
+    // Merge transitions into bundle_state
+    state.merge_transitions(BundleRetention::PlainState);
+
+    Ok((state.bundle_state.state, execution_output))
 }
 
 /// Executes transactions using the given block executor.
@@ -394,44 +403,45 @@ pub fn validate_block(
     let (accounts, execution_output) =
         replay_block(chain_spec, block, &witness_db, ext_env, writer)?;
 
-    // Filter out changes within the message passer contract
-    let withdrawal_contract = accounts.get(&ADDRESS_L2_TO_L1_MESSAGE_PASSER).cloned();
+    // Extract and hash storage updates (only changed values)
+    let withdrawal_storage: B256Map<U256> = accounts
+        .get(&ADDRESS_L2_TO_L1_MESSAGE_PASSER)
+        .map(|a| {
+            a.storage
+                .iter()
+                .filter(|(_, v)| v.previous_or_original_value != v.present_value)
+                .map(|(&slot, v)| (keccak256(B256::from(slot)), v.present_value))
+                .collect()
+        })
+        .unwrap_or_default();
 
     // Flatten Revm's CacheAccount format into plain key-value pairs
     let mut kv_updates: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-    for (address, cached_account) in accounts {
-        let (Some((account_info, storage)), _) = cached_account.into_components() else {
-            // Skip cached accounts with no account info or storage changes.
-            //
-            // Revm creates these cache entries in two cases:
-            // 1. Read-only access to non-existent accounts (balance checks, code reads, etc.)
-            // 2. SELFDESTRUCT execution clearing an account from state
-            //
-            // Since mega-evm disables SELFDESTRUCT, case 2 would fail during transaction
-            // execution above, never reaching here. We only see case 1: read-only operations
-            // that don't generate state changes.
-            //
-            // Skipping these is correct - they represent cache entries without modifications.
-            // Only accounts with actual changes need to be written to the state trie.
-            continue;
-        };
+    for (address, bundle_account) in accounts {
+        if bundle_account.info != bundle_account.original_info {
+            // Process account changes
+            let account = bundle_account.info.map(|info| Account {
+                nonce: info.nonce,
+                balance: info.balance,
+                codehash: (info.code_hash != KECCAK_EMPTY).then_some(info.code_hash),
+            });
 
-        // Process account changes
-        let account = Account {
-            nonce: account_info.nonce,
-            balance: account_info.balance,
-            codehash: (account_info.code_hash != KECCAK_EMPTY).then_some(account_info.code_hash),
-        };
-
-        let account_key = PlainKey::Account(address).encode();
-        let account_value = (!account.is_empty()).then(|| PlainValue::Account(account).encode());
-        kv_updates.insert(account_key, account_value);
+            let account_key = PlainKey::Account(address).encode();
+            let account_value = account.and_then(|account| {
+                (!account.is_empty()).then(|| PlainValue::Account(account).encode())
+            });
+            kv_updates.insert(account_key, account_value);
+        }
 
         // Process storage changes
-        for (slot, value) in storage {
-            let storage_key = PlainKey::Storage(address, B256::new(slot.to_be_bytes())).encode();
-            let storage_value = (!value.is_zero()).then(|| PlainValue::Storage(value).encode());
-            kv_updates.insert(storage_key, storage_value);
+        for (slot, value) in bundle_account.storage {
+            if value.previous_or_original_value != value.present_value {
+                let storage_key =
+                    PlainKey::Storage(address, B256::new(slot.to_be_bytes())).encode();
+                let storage_value = (!value.present_value.is_zero())
+                    .then(|| PlainValue::Storage(value.present_value).encode());
+                kv_updates.insert(storage_key, storage_value);
+            }
         }
     }
 
@@ -470,7 +480,7 @@ pub fn validate_block(
 
     // Check if computed withdrawals root matches the claimed one
     mpt_witness
-        .verify(&block.header, withdrawal_contract)
+        .verify(&block.header, withdrawal_storage)
         .map_err(ValidationError::WithdrawalValidationFailed)?;
 
     // Verify receipts root matches the block header

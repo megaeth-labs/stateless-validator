@@ -5,15 +5,14 @@
 //! storage updates from block execution, it cryptographically proves the storage root
 //! transition is valid.
 
-use alloy_primitives::{Address, B256, Bytes, address, keccak256, map::B256Map};
+use alloy_primitives::{Address, B256, Bytes, U256, address, keccak256, map::B256Map};
 use alloy_rlp::Decodable;
 use alloy_rpc_types_eth::Header;
 use reth_trie::Nibbles;
-use reth_trie_common::{EMPTY_ROOT_HASH, HashedStorage, TrieNode};
+use reth_trie_common::{EMPTY_ROOT_HASH, TrieNode};
 use reth_trie_sparse::{
     SerialSparseTrie, SparseTrie, SparseTrieInterface, TrieMasks, provider::DefaultTrieNodeProvider,
 };
-use revm::database::states::CacheAccount;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
 use thiserror::Error;
@@ -91,23 +90,11 @@ impl MptWitness {
     pub fn verify(
         &self,
         header: &Header,
-        account: Option<CacheAccount>,
+        storage_updates: B256Map<U256>,
     ) -> Result<(), WithdrawalValidationError> {
         let expected_post_root = header
             .withdrawals_root
             .ok_or(WithdrawalValidationError::MissingWithdrawalsRoot)?;
-
-        // Extract and hash storage updates from the account
-        let storage_updates = account
-            .and_then(|a| a.account.map(|acc| acc.storage))
-            .map(|slots| HashedStorage {
-                wiped: false,
-                storage: slots
-                    .into_iter()
-                    .map(|(k, v)| (keccak256(B256::from(k)), v))
-                    .collect(),
-            })
-            .unwrap_or_default();
 
         // Build node lookup: hash → RLP bytes
         let nodes = self
@@ -129,10 +116,10 @@ impl MptWitness {
         }
 
         // Apply storage updates from block execution
-        for (slot, value) in storage_updates.storage.iter() {
-            let nibbles = Nibbles::unpack(*slot);
+        for (slot, value) in storage_updates {
+            let nibbles = Nibbles::unpack(slot);
             if !value.is_zero() {
-                let encoded = alloy_rlp::encode_fixed_size(value).to_vec();
+                let encoded = alloy_rlp::encode_fixed_size(&value).to_vec();
                 trie.update_leaf(nibbles, encoded, DefaultTrieNodeProvider)
                     .map_err(|e| WithdrawalValidationError::TrieOperationFailed(e.to_string()))?;
             } else {
