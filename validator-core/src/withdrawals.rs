@@ -76,7 +76,7 @@ impl MptWitness {
     /// # Arguments
     ///
     /// * `header` - Block header with expected `withdrawals_root` (post-state root)
-    /// * `account` - Storage updates from block execution, or `None` for no changes
+    /// * `storage_updates` - Hashed storage slot updates from block execution (slot hash → value)
     ///
     /// # Errors
     ///

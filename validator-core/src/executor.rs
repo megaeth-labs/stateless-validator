@@ -239,13 +239,13 @@ fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<MegaSpecId>
 ///
 /// # Process
 ///
-/// 1. Creates a state builder with the witness database
+/// 1. Creates a state builder with the witness database and bundle update tracking
 /// 2. Configures block executor with Optimism-specific parameters
 /// 3. Applies pre-execution changes (deposits, etc.)
 /// 4. Executes each transaction in sequence
 /// 5. Applies post-execution changes
-/// 6. Flattens REVM's cache format into plain key-value pairs
-/// 7. Builds the execution output (receipts root, logs bloom, gas used) from all transaction receipts
+/// 6. Merges state transitions into bundle state
+/// 7. Returns bundle accounts and execution output (receipts root, logs bloom, gas used)
 pub fn replay_block<DB, ENV, E>(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
@@ -415,7 +415,7 @@ pub fn validate_block(
         })
         .unwrap_or_default();
 
-    // Flatten Revm's CacheAccount format into plain key-value pairs
+    // Flatten Revm's BundleAccount format into plain key-value pairs
     let mut kv_updates: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
     for (address, bundle_account) in accounts {
         if bundle_account.info != bundle_account.original_info {
