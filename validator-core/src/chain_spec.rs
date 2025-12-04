@@ -16,7 +16,7 @@ pub const BLOB_GASPRICE_UPDATE_FRACTION: u64 = 3338477;
 /// Defines when various Ethereum and Optimism hardforks are activated.
 /// This configuration determines which EVM features are available at
 /// different block numbers or timestamps.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 pub struct ChainSpec {
     pub chain_id: u64,
     pub hardforks: ChainHardforks,
@@ -54,7 +54,9 @@ impl ChainSpec {
     ///
     /// The SpecId that should be used for EVM execution at the given timestamp.
     pub fn spec_id_at_timestamp(&self, timestamp: u64) -> SpecId {
-        if self.is_mini_rex_active_at_timestamp(timestamp) {
+        if self.is_rex_active_at_timestamp(timestamp) {
+            SpecId::REX
+        } else if self.is_mini_rex_active_at_timestamp(timestamp) {
             SpecId::MINI_REX
         } else {
             SpecId::EQUIVALENCE
@@ -123,6 +125,8 @@ hardfork! {
     MegaethHardfork {
         /// Tentative name for the first hardfork.
         MiniRex,
+        /// Tentative name for the second hardfork.
+        Rex,
     }
 }
 
@@ -137,6 +141,12 @@ pub trait MegaethHardforks {
         self.megaeth_fork_activation(MegaethHardfork::MiniRex)
             .active_at_timestamp(timestamp)
     }
+
+    /// Returns `true` if [`MegaethHardfork::Rex`] is active at given block timestamp.
+    fn is_rex_active_at_timestamp(&self, timestamp: u64) -> bool {
+        self.megaeth_fork_activation(MegaethHardfork::Rex)
+            .active_at_timestamp(timestamp)
+    }
 }
 
 /// MegaETH hardfork configuration in genesis.
@@ -145,6 +155,8 @@ pub trait MegaethHardforks {
 pub struct MegaethGenesisHardforks {
     /// MiniRex hardfork timestamp.
     pub mini_rex_time: Option<u64>,
+    /// Rex hardfork timestamp.
+    pub rex_time: Option<u64>,
 }
 
 impl MegaethGenesisHardforks {
@@ -155,10 +167,17 @@ impl MegaethGenesisHardforks {
 
     /// Convert the MegaETH genesis hardforks into a vector of hardforks and their conditions.
     pub fn into_vec(self) -> Vec<(Box<dyn Hardfork>, ForkCondition)> {
-        std::iter::once((
-            MegaethHardfork::MiniRex.boxed(),
-            self.mini_rex_time.map(ForkCondition::Timestamp),
-        ))
+        vec![
+            (
+                MegaethHardfork::MiniRex.boxed(),
+                self.mini_rex_time.map(ForkCondition::Timestamp),
+            ),
+            (
+                MegaethHardfork::Rex.boxed(),
+                self.rex_time.map(ForkCondition::Timestamp),
+            ),
+        ]
+        .into_iter()
         .filter_map(|(hardfork, condition)| condition.map(|c| (hardfork, c)))
         .collect()
     }
@@ -167,10 +186,13 @@ impl MegaethGenesisHardforks {
 /// Hardforks configuration for MegaETH.
 pub static MEGA_MAINNET_HARDFORKS: std::sync::LazyLock<ChainHardforks> =
     std::sync::LazyLock::new(|| {
-        ChainHardforks::new(vec![(
-            MegaethHardfork::MiniRex.boxed(),
-            ForkCondition::Timestamp(0),
-        )])
+        ChainHardforks::new(vec![
+            (
+                MegaethHardfork::MiniRex.boxed(),
+                ForkCondition::Timestamp(0),
+            ),
+            (MegaethHardfork::Rex.boxed(), ForkCondition::Timestamp(0)),
+        ])
     });
 
 #[cfg(test)]
@@ -246,11 +268,13 @@ mod tests {
     fn test_extract_from_json() {
         let genesis_info = r#"
         {
-          "miniRexTime": 1
+          "miniRexTime": 1,
+          "rexTime": 2
         }
         "#;
         let fields = serde_json::from_str::<OtherFields>(genesis_info).unwrap();
         let hardforks = MegaethGenesisHardforks::extract_from(&fields).unwrap();
         assert_eq!(hardforks.mini_rex_time, Some(1));
+        assert_eq!(hardforks.rex_time, Some(2));
     }
 }
