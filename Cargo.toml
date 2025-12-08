@@ -61,11 +61,10 @@ debug-assertions = true
 incremental = true
 
 [profile.release]
-opt-level = 3
-debug = true
+lto = "fat"
 debug-assertions = true
-incremental = true
-
+overflow-checks	= true
+strip = true
 
 [profile.test]
 opt-level = 3

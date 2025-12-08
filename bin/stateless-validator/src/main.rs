@@ -634,7 +634,7 @@ async fn validation_worker(
 ) -> Result<()> {
     info!("[Worker {}] Started", worker_id);
     loop {
-        match validate_one(worker_id, &client, &validator_db, &chain_spec).await {
+        match validate_one(worker_id, &client, &validator_db, chain_spec.clone()).await {
             Ok(true) => {}
             Ok(false) => {
                 // No tasks available, wait before checking again
@@ -671,7 +671,7 @@ async fn validate_one(
     worker_id: usize,
     client: &RpcClient,
     validator_db: &ValidatorDB,
-    chain_spec: &ChainSpec,
+    chain_spec: Arc<ChainSpec>,
 ) -> Result<bool> {
     match validator_db.get_next_task()? {
         Some((block, witness, mpt_witness)) => {
@@ -706,29 +706,37 @@ async fn validate_one(
             validator_db.add_contract_codes(new_bytecodes.iter().map(|(_, bytecode)| bytecode))?;
             contracts.extend(new_bytecodes);
 
-            // Validate the given block
             let pre_state_root = B256::from(witness.state_root()?);
+            let post_state_root = block.header.state_root;
             let pre_withdrawals_root = mpt_witness.storage_root;
-            let (success, error_message) =
-                match validate_block(chain_spec, &block, witness, mpt_witness, &contracts, None) {
-                    Ok(()) => {
-                        info!("[Worker {worker_id}] Successfully validated block {block_number}");
-                        (true, None)
-                    }
-                    Err(e) => {
-                        error!("[Worker {worker_id}] Failed to validate block {block_number}: {e}");
-                        (false, Some(e.to_string()))
-                    }
-                };
-
             let block_hash = block.header.hash;
+            let post_withdrawals_root = block.header.withdrawals_root.ok_or(eyre::eyre!(
+                "Withdrawals root not found in block {block_hash}"
+            ))?;
+
+            // Validate in a blocking thread so async tasks (reporter, tracker, etc.) stay responsive.
+            let validation_result = task::spawn_blocking(move || {
+                validate_block(&chain_spec, &block, witness, mpt_witness, &contracts, None)
+            })
+            .await
+            .map_err(|e| eyre::eyre!("Validation task panicked: {e}"))?;
+
+            let (success, error_message) = match validation_result {
+                Ok(()) => {
+                    info!("[Worker {worker_id}] Successfully validated block {block_number}");
+                    (true, None)
+                }
+                Err(e) => {
+                    error!("[Worker {worker_id}] Failed to validate block {block_number}: {e}");
+                    (false, Some(e.to_string()))
+                }
+            };
+
             validator_db.complete_validation(ValidationResult {
                 pre_state_root,
-                post_state_root: block.header.state_root,
+                post_state_root,
                 pre_withdrawals_root,
-                post_withdrawals_root: block.header.withdrawals_root.ok_or(eyre::eyre!(
-                    "Withdrawals root not found in block {block_hash}"
-                ))?,
+                post_withdrawals_root,
                 block_number,
                 block_hash,
                 success,
