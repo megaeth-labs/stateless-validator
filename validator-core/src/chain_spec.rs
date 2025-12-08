@@ -4,8 +4,8 @@ use alloy_genesis::Genesis;
 use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition, Hardfork};
 use alloy_op_hardforks::{OpHardfork, OpHardforks};
 use alloy_serde::OtherFields;
-use mega_evm::SpecId;
-use reth_ethereum_forks::{ChainHardforks, hardfork};
+use mega_evm::{MegaHardfork, MegaHardforks, SpecId};
+use reth_ethereum_forks::ChainHardforks;
 use reth_optimism_chainspec::OpChainSpec;
 
 /// Default blob gas price update fraction for Cancun (from EIP-4844)
@@ -34,8 +34,8 @@ impl OpHardforks for ChainSpec {
     }
 }
 
-impl MegaethHardforks for ChainSpec {
-    fn megaeth_fork_activation(&self, fork: MegaethHardfork) -> ForkCondition {
+impl MegaHardforks for ChainSpec {
+    fn mega_fork_activation(&self, fork: MegaHardfork) -> ForkCondition {
         self.hardforks.fork(fork)
     }
 }
@@ -118,37 +118,7 @@ impl ChainSpec {
     }
 }
 
-hardfork! {
-    /// The name of MegaETH hardforks. It is expected to mix with [`EthereumHardfork`] and
-    /// [`OpHardfork`].
-    #[derive(serde::Serialize, serde::Deserialize)]
-    MegaethHardfork {
-        /// Tentative name for the first hardfork.
-        MiniRex,
-        /// Tentative name for the second hardfork.
-        Rex,
-    }
-}
-
-/// Extends [`OpHardforks`] with MegaETH helper methods.
-pub trait MegaethHardforks {
-    /// Retrieves [`ForkCondition`] by a [`MegaethHardfork`]. If `fork` is not present, returns
-    /// [`ForkCondition::Never`].
-    fn megaeth_fork_activation(&self, fork: MegaethHardfork) -> ForkCondition;
-
-    /// Returns `true` if [`MegaethHardfork::MiniRex`] is active at given block timestamp.
-    fn is_mini_rex_active_at_timestamp(&self, timestamp: u64) -> bool {
-        self.megaeth_fork_activation(MegaethHardfork::MiniRex)
-            .active_at_timestamp(timestamp)
-    }
-
-    /// Returns `true` if [`MegaethHardfork::Rex`] is active at given block timestamp.
-    fn is_rex_active_at_timestamp(&self, timestamp: u64) -> bool {
-        self.megaeth_fork_activation(MegaethHardfork::Rex)
-            .active_at_timestamp(timestamp)
-    }
-}
-
+// copy from mega-reth/crates/megaeth/chainspec/src/genesis.rs
 /// MegaETH hardfork configuration in genesis.
 #[derive(Default, Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -169,11 +139,11 @@ impl MegaethGenesisHardforks {
     pub fn into_vec(self) -> Vec<(Box<dyn Hardfork>, ForkCondition)> {
         vec![
             (
-                MegaethHardfork::MiniRex.boxed(),
+                MegaHardfork::MiniRex.boxed(),
                 self.mini_rex_time.map(ForkCondition::Timestamp),
             ),
             (
-                MegaethHardfork::Rex.boxed(),
+                MegaHardfork::Rex.boxed(),
                 self.rex_time.map(ForkCondition::Timestamp),
             ),
         ]
@@ -187,11 +157,8 @@ impl MegaethGenesisHardforks {
 pub static MEGA_MAINNET_HARDFORKS: std::sync::LazyLock<ChainHardforks> =
     std::sync::LazyLock::new(|| {
         ChainHardforks::new(vec![
-            (
-                MegaethHardfork::MiniRex.boxed(),
-                ForkCondition::Timestamp(0),
-            ),
-            (MegaethHardfork::Rex.boxed(), ForkCondition::Timestamp(0)),
+            (MegaHardfork::MiniRex.boxed(), ForkCondition::Timestamp(0)),
+            (MegaHardfork::Rex.boxed(), ForkCondition::Timestamp(0)),
         ])
     });
 
@@ -259,7 +226,7 @@ mod tests {
             ForkCondition::Timestamp(6)
         );
         assert_eq!(
-            spec.hardforks.fork(MegaethHardfork::MiniRex),
+            spec.hardforks.fork(MegaHardfork::MiniRex),
             ForkCondition::Timestamp(3)
         );
     }

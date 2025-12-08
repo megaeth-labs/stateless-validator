@@ -2893,11 +2893,12 @@ dependencies = [
 [[package]]
 name = "mega-evm"
 version = "1.1.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=v1.1.1#1634b388e334c5aa9c0065469d7603ff21c3ea33"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=3b28c205c8c2f89730a4dd88abe47e1831c6fac9#3b28c205c8c2f89730a4dd88abe47e1831c6fac9"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
  "alloy-evm",
+ "alloy-hardforks",
  "alloy-op-evm",
  "alloy-op-hardforks",
  "alloy-primitives",
@@ -4212,11 +4213,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39a276ed142b4718dcf64bc9624f474373ed82ef20611025045c3fb23edbef9c"
 dependencies = [
  "alloy-eips",
+ "alloy-provider",
+ "alloy-transport",
  "revm-bytecode",
  "revm-database-interface",
  "revm-primitives",
  "revm-state",
  "serde",
+ "tokio",
 ]
 
 [[package]]
@@ -4230,6 +4234,7 @@ dependencies = [
  "revm-primitives",
  "revm-state",
  "serde",
+ "tokio",
 ]
 
 [[package]]
