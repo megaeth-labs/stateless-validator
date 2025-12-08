@@ -118,7 +118,6 @@ impl ChainSpec {
     }
 }
 
-// copy from mega-reth/crates/megaeth/chainspec/src/genesis.rs
 /// MegaETH hardfork configuration in genesis.
 #[derive(Default, Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
