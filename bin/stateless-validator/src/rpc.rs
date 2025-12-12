@@ -8,7 +8,10 @@ use op_alloy_network::Optimism;
 use op_alloy_rpc_types::Transaction;
 use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use validator_core::{executor::verify_block_integrity, withdrawals::MptWitness};
+
+use crate::metrics;
 
 /// Response from mega_setValidatedBlocks RPC call
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,14 +65,27 @@ impl RpcClient {
     /// # Performance
     /// Executes all requests concurrently for optimal performance.
     pub async fn get_code(&self, hashes: &[B256]) -> Result<Vec<Bytes>> {
-        try_join_all(hashes.iter().map(|&hash| async move {
-            self.data_provider
+        let start = Instant::now();
+        let result = try_join_all(hashes.iter().map(|&hash| async move {
+            let req_start = Instant::now();
+            let result = self
+                .data_provider
                 .client()
                 .request("eth_getCodeByHash", (hash,))
                 .await
-                .map_err(|e| eyre!("eth_getCodeByHash for hash {hash:?} failed: {e}"))
+                .map_err(|e| eyre!("eth_getCodeByHash for hash {hash:?} failed: {e}"));
+
+            metrics::record_rpc_request(
+                "eth_getCodeByHash",
+                req_start.elapsed().as_secs_f64(),
+                result.is_ok(),
+            );
+            result
         }))
-        .await
+        .await;
+
+        metrics::record_code_fetch(start.elapsed().as_secs_f64(), hashes.len());
+        result
     }
 
     /// Gets a block by its identifier with optional transaction details.
@@ -89,11 +105,24 @@ impl RpcClient {
     /// # Errors
     /// Returns error if block doesn't exist, RPC call fails, or integrity checks fail.
     pub async fn get_block(&self, block_id: BlockId, full_txs: bool) -> Result<Block<Transaction>> {
+        let start = Instant::now();
+        let method = if full_txs {
+            "eth_getBlockByNumber_full"
+        } else {
+            "eth_getBlockByNumber"
+        };
+
         let block = if full_txs {
             self.data_provider.get_block(block_id).full().await?
         } else {
             self.data_provider.get_block(block_id).await?
         };
+
+        let duration = start.elapsed().as_secs_f64();
+        let success = block.is_some();
+        metrics::record_rpc_request(method, duration, success);
+        metrics::record_block_fetch(duration);
+
         let block = block.ok_or_else(|| eyre!("Block {:?} not found", block_id))?;
 
         // Verify block_id matches the returned block
@@ -130,10 +159,19 @@ impl RpcClient {
     /// # Errors
     /// Returns error if unable to connect to the blockchain or RPC fails.
     pub async fn get_latest_block_number(&self) -> Result<u64> {
-        self.data_provider
+        let start = Instant::now();
+        let result = self
+            .data_provider
             .get_block_number()
             .await
-            .context("Failed to get block number")
+            .context("Failed to get block number");
+
+        metrics::record_rpc_request(
+            "eth_blockNumber",
+            start.elapsed().as_secs_f64(),
+            result.is_ok(),
+        );
+        result
     }
 
     /// Gets execution witness data for a specific block.
@@ -149,11 +187,18 @@ impl RpcClient {
     /// # Errors
     /// Returns error if block hash doesn't exist, witness unavailable
     pub async fn get_witness(&self, number: u64, hash: B256) -> Result<(SaltWitness, MptWitness)> {
-        self.witness_provider
+        let start = Instant::now();
+        let result = self
+            .witness_provider
             .client()
             .request("mega_getBlockWitness", (number.to_string(), hash))
             .await
-            .map_err(|e| eyre!("Failed to get witness for block {hash}: {e}"))
+            .map_err(|e| eyre!("Failed to get witness for block {hash}: {e}"));
+
+        let duration = start.elapsed().as_secs_f64();
+        metrics::record_rpc_request("mega_getBlockWitness", duration, result.is_ok());
+        metrics::record_witness_fetch(duration);
+        result
     }
 
     /// Reports a range of validated blocks to the upstream node.
@@ -177,10 +222,19 @@ impl RpcClient {
         first_block: (u64, B256),
         last_block: (u64, B256),
     ) -> Result<SetValidatedBlocksResponse> {
-        self.data_provider
+        let start = Instant::now();
+        let result = self
+            .data_provider
             .client()
             .request("mega_setValidatedBlocks", (first_block, last_block))
             .await
-            .map_err(|e| eyre!("Failed to set validated blocks: {e}"))
+            .map_err(|e| eyre!("Failed to set validated blocks: {e}"));
+
+        metrics::record_rpc_request(
+            "mega_setValidatedBlocks",
+            start.elapsed().as_secs_f64(),
+            result.is_ok(),
+        );
+        result
     }
 }

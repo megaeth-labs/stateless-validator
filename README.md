@@ -42,7 +42,10 @@ cargo run --bin stateless-validator -- \
   --rpc-endpoint <public-rpc-endpoint> \
   --witness-endpoint <witness-rpc-endpoint> \
   --genesis-file /path/to/genesis.json \
-  --start-block <trusted-block-hash>
+  --start-block <trusted-block-hash> \
+  --report-validation-results \
+  --metrics-enabled \
+  --metrics-port 9090
 ```
 
 **Required Arguments:**
@@ -54,6 +57,8 @@ cargo run --bin stateless-validator -- \
 - `--genesis-file`: Path to genesis JSON file containing hardfork activation configuration (required on first run, stored in database for subsequent runs)
 - `--start-block`: Trusted block hash to initialize validation from (required for first-time setup)
 - `--report-validation-results`: Enable reporting of validated blocks to the upstream node (disabled by default)
+- `--metrics-enabled`: Enable Prometheus metrics endpoint (disabled by default)
+- `--metrics-port`: Port for Prometheus metrics HTTP endpoint (default: 9090)
 
 ### Environment Variables
 
@@ -65,6 +70,8 @@ Each command-line flag has an equivalent environment variable, which allows you 
 - `STATELESS_VALIDATOR_GENESIS_FILE` → `--genesis-file`
 - `STATELESS_VALIDATOR_START_BLOCK` → `--start-block`
 - `STATELESS_VALIDATOR_REPORT_VALIDATION_RESULTS` → `--report-validation-results` (set to `true` to enable)
+- `STATELESS_VALIDATOR_METRICS_ENABLED` → `--metrics-enabled` (set to `true` to enable)
+- `STATELESS_VALIDATOR_METRICS_PORT` → `--metrics-port`
 
 **Logging Configuration:**
 - `STATELESS_VALIDATOR_LOG_FILE_DIRECTORY`: directory for log files; enables file logging when set. Files rotate daily as stateless-validator.log.YYYY-MM-DD
@@ -85,11 +92,54 @@ export STATELESS_VALIDATOR_REPORT_VALIDATION_RESULTS=false
 export STATELESS_VALIDATOR_LOG_FILE_DIRECTORY=/path/to/log_dir
 export STATELESS_VALIDATOR_LOG_FILE_FILTER=debug
 export STATELESS_VALIDATOR_LOG_STDOUT_FILTER=info
+export STATELESS_VALIDATOR_METRICS_ENABLED=true
+export STATELESS_VALIDATOR_METRICS_PORT=9090
 
 cargo run --release --bin stateless-validator
 ```
 
 **Note**: Command-line arguments take precedence over environment variables.
+
+**Available Metrics:**
+
+The validator exposes Prometheus-compatible metrics for monitoring performance, health, and resource utilization. Enable metrics with `--metrics-enabled`:
+
+Once enabled, metrics are available at `http://0.0.0.0:9090/metrics` for Prometheus scraping.
+
+| Metric                                                  | Type      | Description                                                          |
+| ------------------------------------------------------- | --------- | -------------------------------------------------------------------- |
+| `stateless_validator_blocks_validated_total`            | Counter   | Total blocks successfully validated                                  |
+| `stateless_validator_blocks_failed_total`               | Counter   | Total blocks that failed validation (with `error_type` label)        |
+| `stateless_validator_block_validation_duration_seconds` | Histogram | Block validation time                                                |
+| `stateless_validator_transactions_per_block`            | Histogram | Transactions per validated block                                     |
+| `stateless_validator_gas_used_per_block`                | Histogram | Gas used per validated block                                         |
+| `stateless_validator_worker_tasks_completed_total`      | Counter   | Tasks completed per worker (with `worker_id` label)                  |
+| `stateless_validator_worker_tasks_failed_total`         | Counter   | Tasks failed per worker (with `worker_id` label)                     |
+| `stateless_validator_canonical_chain_height`            | Gauge     | Current height of local canonical chain                              |
+| `stateless_validator_remote_chain_height`               | Gauge     | Current height of remote chain tracker                               |
+| `stateless_validator_chain_gap`                         | Gauge     | Gap between remote and canonical chains                              |
+| `stateless_validator_blocks_advanced_total`             | Counter   | Blocks advanced on canonical chain                                   |
+| `stateless_validator_reorgs_detected_total`             | Counter   | Chain reorganizations detected                                       |
+| `stateless_validator_reorg_depth`                       | Histogram | Depth of chain reorganizations                                       |
+| `stateless_validator_rpc_requests_total`                | Counter   | Total RPC requests (with `method` label)                             |
+| `stateless_validator_rpc_errors_total`                  | Counter   | RPC errors (with `method` label)                                     |
+| `stateless_validator_rpc_latency_seconds`               | Histogram | RPC request latency (with `method` label)                            |
+| `stateless_validator_block_fetch_duration_seconds`      | Histogram | Block fetch time                                                     |
+| `stateless_validator_witness_fetch_duration_seconds`    | Histogram | Witness fetch time                                                   |
+| `stateless_validator_code_fetch_duration_seconds`       | Histogram | Contract code fetch time (includes optional `type="per_code"` label) |
+| `stateless_validator_contract_cache_hits_total`         | Counter   | Contract cache hits                                                  |
+| `stateless_validator_contract_cache_misses_total`       | Counter   | Contract cache misses                                                |
+| `stateless_validator_blocks_pruned_total`               | Counter   | Blocks pruned from history                                           |
+
+**Example Prometheus configuration:**
+
+```yaml
+scrape_configs:
+  - job_name: 'stateless-validator'
+    static_configs:
+      - targets: ['localhost:9090']
+    scrape_interval: 15s
+```
 
 ### Getting Started
 

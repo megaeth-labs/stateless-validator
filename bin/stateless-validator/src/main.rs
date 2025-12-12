@@ -21,10 +21,11 @@ use validator_core::{
     ValidatorDB,
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
-    executor::{ValidationResult, validate_block},
+    executor::{ValidationError, ValidationResult, validate_block},
     withdrawals::MptWitness,
 };
 
+mod metrics;
 mod rpc;
 use rpc::RpcClient;
 
@@ -161,6 +162,10 @@ pub struct ChainSyncConfig {
     pub tracker_error_sleep: Duration,
     /// Enable reporting of validated blocks to upstream node
     pub report_validation_results: bool,
+    /// Enable Prometheus metrics endpoint
+    pub metrics_enabled: bool,
+    /// Port for Prometheus metrics HTTP endpoint
+    pub metrics_port: u16,
 }
 
 impl Default for ChainSyncConfig {
@@ -177,6 +182,8 @@ impl Default for ChainSyncConfig {
             worker_error_sleep: Duration::from_millis(1000),
             tracker_error_sleep: Duration::from_secs(1),
             report_validation_results: false,
+            metrics_enabled: false,
+            metrics_port: metrics::DEFAULT_METRICS_PORT,
         }
     }
 }
@@ -210,6 +217,15 @@ struct CommandLineArgs {
     /// When enabled, the validator will send validation results via mega_setValidatedBlock RPC.
     #[clap(long, env = "STATELESS_VALIDATOR_REPORT_VALIDATION_RESULTS")]
     report_validation_results: bool,
+
+    /// Enable Prometheus metrics endpoint.
+    /// When enabled, metrics are exposed at http://0.0.0.0:<metrics-port>/metrics
+    #[clap(long, env = "STATELESS_VALIDATOR_METRICS_ENABLED")]
+    metrics_enabled: bool,
+
+    /// Port for Prometheus metrics HTTP endpoint.
+    #[clap(long, env = "STATELESS_VALIDATOR_METRICS_PORT", default_value_t = metrics::DEFAULT_METRICS_PORT)]
+    metrics_port: u16,
 }
 
 #[tokio::main]
@@ -223,6 +239,15 @@ async fn main() -> Result<()> {
     info!("[Main] Witness endpoint: {}", args.witness_endpoint);
     if let Some(ref genesis_file) = args.genesis_file {
         info!("[Main] Genesis file: {}", genesis_file);
+    }
+
+    // Initialize metrics if enabled
+    if args.metrics_enabled {
+        let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
+        metrics::init_metrics(metrics_addr)?;
+        info!("[Main] Metrics enabled on port {}", args.metrics_port);
+    } else {
+        info!("[Main] Metrics disabled");
     }
 
     let work_dir = PathBuf::from(args.data_dir);
@@ -276,6 +301,8 @@ async fn main() -> Result<()> {
     let config = Arc::new(ChainSyncConfig {
         concurrent_workers: num_cpus::get(),
         report_validation_results: args.report_validation_results,
+        metrics_enabled: args.metrics_enabled,
+        metrics_port: args.metrics_port,
         ..ChainSyncConfig::default()
     });
     info!(
@@ -407,9 +434,18 @@ async fn chain_sync(
 
             if blocks_advanced > 0 {
                 debug!("[Chain Sync] Advanced canonical chain by {blocks_advanced} blocks");
+                metrics::record_blocks_advanced(blocks_advanced);
             } else {
                 // No work to do, wait a bit before polling again
                 tokio::time::sleep(config.sync_poll_interval).await;
+            }
+
+            // Update chain height metrics
+            if let (Ok(Some((local_tip, _))), Ok(remote_tip)) =
+                (validator_db.get_local_tip(), validator_db.get_remote_tip())
+            {
+                let remote_height = remote_tip.map(|(n, _)| n).unwrap_or(local_tip);
+                metrics::set_chain_heights(local_tip, remote_height);
             }
 
             Ok::<(), eyre::Error>(())
@@ -497,6 +533,8 @@ async fn remote_chain_tracker(
                     match find_divergence_point(&client, &validator_db, remote_tip.0).await {
                         Ok(rollback_to) => {
                             warn!("[Tracker] Rolling back to block {rollback_to}");
+                            let reorg_depth = remote_tip.0.saturating_sub(rollback_to);
+                            metrics::record_reorg(reorg_depth);
                             validator_db.rollback_chain(rollback_to)?;
                             return Ok(());
                         }
@@ -677,12 +715,22 @@ async fn validate_one(
     match validator_db.get_next_task()? {
         Some((block, witness, mpt_witness)) => {
             let block_number = block.header.number;
+            let tx_count = block.transactions.len() as u64;
+            let gas_used = block.header.gas_used;
             debug!("[Worker {}] Validating block {}", worker_id, block_number);
+
+            let validation_start = Instant::now();
 
             // Prepare the contract map to be used by validation
             let codehashes = extract_contract_codes(&witness);
 
             let (mut contracts, missing_contracts) = validator_db.get_contract_codes(codehashes)?;
+
+            // Track cache hits/misses
+            let cache_hits = contracts.len();
+            let cache_misses = missing_contracts.len();
+            metrics::record_contract_cache_hits(cache_hits as u64);
+            metrics::record_contract_cache_misses(cache_misses as u64);
 
             // Fetch missing contract codes via RPC and update the local DB
             let codes = client.get_code(&missing_contracts).await?;
@@ -722,13 +770,38 @@ async fn validate_one(
             .await
             .map_err(|e| eyre::eyre!("Validation task panicked: {e}"))?;
 
-            let (success, error_message) = match validation_result {
+            let validation_duration = validation_start.elapsed().as_secs_f64();
+
+            let (success, error_message) = match &validation_result {
                 Ok(()) => {
                     info!("[Worker {worker_id}] Successfully validated block {block_number}");
+                    metrics::record_block_validated(validation_duration, tx_count, gas_used);
+                    metrics::record_worker_task_completed(worker_id);
                     (true, None)
                 }
                 Err(e) => {
                     error!("[Worker {worker_id}] Failed to validate block {block_number}: {e}");
+                    let error_type = match e {
+                        ValidationError::WitnessVerificationFailed(_) => "witness_verification",
+                        ValidationError::WithdrawalValidationFailed(_) => "withdrawal_validation",
+                        ValidationError::EnvOracleConstructionFailed(_) => {
+                            "env_oracle_construction"
+                        }
+                        ValidationError::BlockIncomplete => "block_incomplete",
+                        ValidationError::BlockReplayFailed(_) => "block_replay",
+                        ValidationError::StateUpdateFailed(_) => "state_update",
+                        ValidationError::TrieUpdateFailed(_) => "trie_update",
+                        ValidationError::PreStateRootMismatch { .. } => "pre_state_root_mismatch",
+                        ValidationError::PreWithdrawalsRootMismatch { .. } => {
+                            "pre_withdrawals_root_mismatch"
+                        }
+                        ValidationError::StateRootMismatch { .. } => "state_root_mismatch",
+                        ValidationError::ReceiptsRootMismatch { .. } => "receipts_root_mismatch",
+                        ValidationError::LogsBloomMismatch { .. } => "logs_bloom_mismatch",
+                        ValidationError::GasUsedMismatch { .. } => "gas_used_mismatch",
+                    };
+                    metrics::record_block_failed(error_type);
+                    metrics::record_worker_task_failed(worker_id);
                     (false, Some(e.to_string()))
                 }
             };
@@ -851,6 +924,7 @@ async fn history_pruner(
             match validator_db.prune_history(prune_before) {
                 Ok(blocks_pruned) if blocks_pruned > 0 => {
                     debug!("[Pruner] Pruned {blocks_pruned} blocks before block {prune_before}");
+                    metrics::record_blocks_pruned(blocks_pruned);
                 }
                 Err(e) => warn!("[Pruner] Failed to prune old block data: {e}"),
                 _ => {}

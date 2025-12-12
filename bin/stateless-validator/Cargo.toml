@@ -29,6 +29,8 @@ bincode.workspace = true
 clap = { workspace = true, features = ["env"] }
 eyre.workspace = true
 futures.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
 num_cpus.workspace = true
 serde.workspace = true
 serde_json.workspace = true

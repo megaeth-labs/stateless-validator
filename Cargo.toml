@@ -44,6 +44,8 @@ clap = { version = "4.5", features = ["derive"] }
 dyn-clone = "1.0"
 eyre = "0.6"
 futures = "0.3"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"
 num_cpus = "1.17"
 redb = "3.0.1"
 serde = { version = "1.0", default-features = false }
