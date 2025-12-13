@@ -101,7 +101,7 @@ cargo run --bin stateless-validator -- \
   --data-dir ./validator-data \
   --rpc-endpoint https://your-rpc-endpoint.com \
   --witness-endpoint https://your-witness-endpoint.com \
-  --genesis-file ./genesis/genesis-6342.json \
+  --genesis-file ./genesis/genesis.json \
   --start-block 0x1234567890abcdef...
 ```
 

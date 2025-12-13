@@ -1009,7 +1009,7 @@ mod tests {
     const TEST_WITNESS_DIR: &str = "../../test_data/stateless/witness";
 
     /// Path to the genesis configuration file for integration testing.
-    const TEST_GENESIS_FILE: &str = "../../genesis/genesis-6342.json";
+    const TEST_GENESIS_FILE: &str = "../../genesis/genesis.json";
 
     /// Context object containing pre-loaded test data for efficient RPC serving
     ///

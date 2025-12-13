@@ -4,7 +4,7 @@ use alloy_genesis::Genesis;
 use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition, Hardfork};
 use alloy_op_hardforks::{OpHardfork, OpHardforks};
 use alloy_serde::OtherFields;
-use mega_evm::{MegaHardfork, MegaHardforks, SpecId};
+use mega_evm::{MegaHardfork, MegaHardforks};
 use reth_ethereum_forks::ChainHardforks;
 use reth_optimism_chainspec::OpChainSpec;
 
@@ -41,28 +41,6 @@ impl MegaHardforks for ChainSpec {
 }
 
 impl ChainSpec {
-    /// Returns the appropriate SpecId for the given timestamp.
-    ///
-    /// This method determines which EVM specification should be used based on
-    /// the timestamp and the configured hardfork activation rules.
-    ///
-    /// # Arguments
-    ///
-    /// * `timestamp` - The timestamp to get the SpecId for
-    ///
-    /// # Returns
-    ///
-    /// The SpecId that should be used for EVM execution at the given timestamp.
-    pub fn spec_id_at_timestamp(&self, timestamp: u64) -> SpecId {
-        if self.is_rex_active_at_timestamp(timestamp) {
-            SpecId::REX
-        } else if self.is_mini_rex_active_at_timestamp(timestamp) {
-            SpecId::MINI_REX
-        } else {
-            SpecId::EQUIVALENCE
-        }
-    }
-
     /// Creates a new [`ChainSpec`] from a [`Genesis`].
     ///
     /// Ordering rules:
@@ -124,6 +102,10 @@ impl ChainSpec {
 pub struct MegaethGenesisHardforks {
     /// MiniRex hardfork timestamp.
     pub mini_rex_time: Option<u64>,
+    /// MiniRex1 hardfork timestamp.
+    pub mini_rex_1_time: Option<u64>,
+    /// MiniRex2 hardfork timestamp.
+    pub mini_rex_2_time: Option<u64>,
     /// Rex hardfork timestamp.
     pub rex_time: Option<u64>,
 }
@@ -142,6 +124,14 @@ impl MegaethGenesisHardforks {
                 self.mini_rex_time.map(ForkCondition::Timestamp),
             ),
             (
+                MegaHardfork::MiniRex1.boxed(),
+                self.mini_rex_1_time.map(ForkCondition::Timestamp),
+            ),
+            (
+                MegaHardfork::MiniRex2.boxed(),
+                self.mini_rex_2_time.map(ForkCondition::Timestamp),
+            ),
+            (
                 MegaHardfork::Rex.boxed(),
                 self.rex_time.map(ForkCondition::Timestamp),
             ),
@@ -157,6 +147,8 @@ pub static MEGA_MAINNET_HARDFORKS: std::sync::LazyLock<ChainHardforks> =
     std::sync::LazyLock::new(|| {
         ChainHardforks::new(vec![
             (MegaHardfork::MiniRex.boxed(), ForkCondition::Timestamp(0)),
+            (MegaHardfork::MiniRex1.boxed(), ForkCondition::Timestamp(0)),
+            (MegaHardfork::MiniRex2.boxed(), ForkCondition::Timestamp(0)),
             (MegaHardfork::Rex.boxed(), ForkCondition::Timestamp(0)),
         ])
     });
@@ -235,12 +227,16 @@ mod tests {
         let genesis_info = r#"
         {
           "miniRexTime": 1,
+          "miniRex1Time": 2,
+          "miniRex2Time": 3,
           "rexTime": 2
         }
         "#;
         let fields = serde_json::from_str::<OtherFields>(genesis_info).unwrap();
         let hardforks = MegaethGenesisHardforks::extract_from(&fields).unwrap();
         assert_eq!(hardforks.mini_rex_time, Some(1));
+        assert_eq!(hardforks.mini_rex_1_time, Some(2));
+        assert_eq!(hardforks.mini_rex_2_time, Some(3));
         assert_eq!(hardforks.rex_time, Some(2));
     }
 }
