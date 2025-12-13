@@ -24,7 +24,7 @@
 //! and uses Revm for transaction execution.
 
 use alloy_consensus::{
-    BlockHeader, TxReceipt,
+    TxReceipt,
     proofs::calculate_receipt_root,
     transaction::{Recovered, SignerRecoverable},
 };
@@ -276,11 +276,11 @@ where
         OpAlloyReceiptBuilder::default(),
     );
 
-    let hardfork = chain_spec.hardfork(block.header.timestamp());
+    let hardfork = chain_spec.hardfork(block.header.timestamp);
     let block_limits = if let Some(hardfork) = hardfork {
-        BlockLimits::from_hardfork_and_block_gas_limit(hardfork, block.header.gas_limit())
+        BlockLimits::from_hardfork_and_block_gas_limit(hardfork, block.header.gas_limit)
     } else {
-        BlockLimits::no_limits().with_block_gas_limit(block.header.gas_limit())
+        BlockLimits::no_limits().with_block_gas_limit(block.header.gas_limit)
     };
 
     let execution_context = MegaBlockExecutionCtx::new(
