@@ -24,7 +24,7 @@
 //! and uses Revm for transaction execution.
 
 use alloy_consensus::{
-    TxReceipt,
+    BlockHeader, TxReceipt,
     proofs::calculate_receipt_root,
     transaction::{Recovered, SignerRecoverable},
 };
@@ -42,7 +42,7 @@ use alloy_trie::root::ordered_trie_root_with_encoder;
 use eyre::{Result, ensure, eyre};
 use mega_evm::{
     BlockLimits, ExternalEnvFactory, MegaBlockExecutionCtx, MegaBlockExecutorFactory,
-    MegaEvmFactory, MegaSpecId,
+    MegaEvmFactory, MegaHardforks, MegaSpecId,
 };
 use op_alloy_network::{TransactionResponse, eip2718::Encodable2718};
 use op_alloy_rpc_types::Transaction as OpTransaction;
@@ -193,7 +193,7 @@ pub struct BlockExecutionOutput {
 /// - Block environment with gas limits, timestamps, and fee parameters
 /// - Blob gas pricing if excess blob gas is present in the header
 fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<MegaSpecId> {
-    let cfg_env = CfgEnv::new_with_spec(chain_spec.spec_id_at_timestamp(header.timestamp))
+    let cfg_env = CfgEnv::new_with_spec(chain_spec.spec_id(header.timestamp))
         .with_chain_id(chain_spec.chain_id);
 
     let mut block_env = BlockEnv {
@@ -276,11 +276,18 @@ where
         OpAlloyReceiptBuilder::default(),
     );
 
+    let hardfork = chain_spec.hardfork(block.header.timestamp());
+    let block_limits = if let Some(hardfork) = hardfork {
+        BlockLimits::from_hardfork_and_block_gas_limit(hardfork, block.header.gas_limit())
+    } else {
+        BlockLimits::no_limits().with_block_gas_limit(block.header.gas_limit())
+    };
+
     let execution_context = MegaBlockExecutionCtx::new(
         block.header.parent_hash,
         block.header.parent_beacon_block_root,
         block.header.extra_data.clone(),
-        BlockLimits::from_evm_env(&evm_env),
+        block_limits,
     );
 
     let execution_output = if let Some(writer) = trace_writer {

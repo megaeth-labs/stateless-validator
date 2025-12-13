@@ -28,8 +28,8 @@ op-alloy-rpc-types = { version = "0.18.12", default-features = false }
 revm = { version = "27.1.0", default-features = false }
 
 # megaeth 
-mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "3b28c205c8c2f89730a4dd88abe47e1831c6fac9" }
-salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "7120f434bdb8a522ac9912044a07b721041e578c" }
+mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "8518b5febd1d825065d47e53f29c99952cdbafcf" }
+salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "affce3ecf3deb1791ea804fe5409c3e41b8d2883" }
 
 # reth
 reth-ethereum-forks = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0" }

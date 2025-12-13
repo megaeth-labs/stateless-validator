@@ -1171,7 +1171,7 @@ checksum = "7b7e4c2464d97fe331d41de9d5db0def0a96f4d823b8b32a2efd503578988973"
 [[package]]
 name = "banderwagon"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=7120f434bdb8a522ac9912044a07b721041e578c#7120f434bdb8a522ac9912044a07b721041e578c"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=affce3ecf3deb1791ea804fe5409c3e41b8d2883#affce3ecf3deb1791ea804fe5409c3e41b8d2883"
 dependencies = [
  "ark-ec 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
  "ark-ed-on-bls12-381-bandersnatch",
@@ -2537,7 +2537,7 @@ dependencies = [
 [[package]]
 name = "ipa-multipoint"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=7120f434bdb8a522ac9912044a07b721041e578c#7120f434bdb8a522ac9912044a07b721041e578c"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=affce3ecf3deb1791ea804fe5409c3e41b8d2883#affce3ecf3deb1791ea804fe5409c3e41b8d2883"
 dependencies = [
  "banderwagon",
  "hex",
@@ -2893,7 +2893,7 @@ dependencies = [
 [[package]]
 name = "mega-evm"
 version = "1.1.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=3b28c205c8c2f89730a4dd88abe47e1831c6fac9#3b28c205c8c2f89730a4dd88abe47e1831c6fac9"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=8518b5febd1d825065d47e53f29c99952cdbafcf#8518b5febd1d825065d47e53f29c99952cdbafcf"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -4489,7 +4489,7 @@ checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
 [[package]]
 name = "salt"
 version = "1.0.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=7120f434bdb8a522ac9912044a07b721041e578c#7120f434bdb8a522ac9912044a07b721041e578c"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=affce3ecf3deb1791ea804fe5409c3e41b8d2883#affce3ecf3deb1791ea804fe5409c3e41b8d2883"
 dependencies = [
  "auto_impl",
  "banderwagon",
