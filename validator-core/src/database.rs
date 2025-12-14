@@ -4,7 +4,6 @@
 //! a block witness rather than a full blockchain database, enabling stateless block
 //! validation.
 
-use crate::data_types::{PlainKey, PlainValue};
 use alloy_eips::eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS};
 use alloy_primitives::{Address, B256, BlockNumber};
 use alloy_rpc_types_eth::Header;
@@ -21,6 +20,8 @@ use salt::{
 };
 use std::collections::HashMap;
 use tracing::trace;
+
+use crate::data_types::{PlainKey, PlainValue};
 
 /// Error type for witness database operations
 #[derive(Debug, Clone)]

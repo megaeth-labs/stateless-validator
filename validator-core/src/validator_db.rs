@@ -65,12 +65,13 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use revm::state::Bytecode;
 use salt::SaltWitness;
 use serde_json;
+use std::{collections::HashMap, fmt};
 use thiserror::Error;
 
-use std::{collections::HashMap, fmt};
-
-use crate::executor::{ValidationError, ValidationResult};
-use crate::withdrawals::MptWitness;
+use crate::{
+    executor::{ValidationError, ValidationResult},
+    withdrawals::MptWitness,
+};
 
 /// Stores our local view of the canonical chain.
 ///
