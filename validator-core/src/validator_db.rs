@@ -57,6 +57,8 @@
 //! - `add_contract_codes()` - Cache contract bytecodes needed during validation in batch
 //! - `get_contract_codes()` - Retrieve cached contract bytecodes by code hashes in batch
 
+use std::{collections::HashMap, fmt};
+
 use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, Header};
@@ -65,7 +67,6 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use revm::state::Bytecode;
 use salt::SaltWitness;
 use serde_json;
-use std::{collections::HashMap, fmt};
 use thiserror::Error;
 
 use crate::{

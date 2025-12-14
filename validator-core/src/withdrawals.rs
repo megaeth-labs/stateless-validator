@@ -5,6 +5,8 @@
 //! storage updates from block execution, it cryptographically proves the storage root
 //! transition is valid.
 
+use std::collections::{HashSet, VecDeque};
+
 use alloy_primitives::{Address, B256, Bytes, U256, address, keccak256, map::B256Map};
 use alloy_rlp::Decodable;
 use alloy_rpc_types_eth::Header;
@@ -14,7 +16,6 @@ use reth_trie_sparse::{
     SerialSparseTrie, SparseTrie, SparseTrieInterface, TrieMasks, provider::DefaultTrieNodeProvider,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashSet, VecDeque};
 use thiserror::Error;
 
 /// Number of children in an MPT branch node (0-15, hex digits)

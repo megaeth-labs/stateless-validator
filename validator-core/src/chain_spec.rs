@@ -155,8 +155,9 @@ pub static MEGA_MAINNET_HARDFORKS: std::sync::LazyLock<ChainHardforks> =
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use alloy_serde::OtherFields;
+
+    use super::*;
 
     #[test]
     fn test_create_from_default_genesis() {

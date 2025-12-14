@@ -4,6 +4,8 @@
 //! a block witness rather than a full blockchain database, enabling stateless block
 //! validation.
 
+use std::collections::HashMap;
+
 use alloy_eips::eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS};
 use alloy_primitives::{Address, B256, BlockNumber};
 use alloy_rpc_types_eth::Header;
@@ -18,7 +20,6 @@ use salt::{
     BucketId, BucketMeta, EphemeralSaltState, METADATA_KEYS_RANGE, SaltKey, SaltValue, SaltWitness,
     Witness, bucket_id_from_metadata_key, hasher,
 };
-use std::collections::HashMap;
 use tracing::trace;
 
 use crate::data_types::{PlainKey, PlainValue};

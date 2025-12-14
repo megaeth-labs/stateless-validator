@@ -1,0 +1,5 @@
+# Import organization (requires nightly rustfmt with unstable features)
+# Merge imports from the same crate using {}
+imports_granularity = "Crate"
+# One/StdExternalCrate
+group_imports = "StdExternalCrate"

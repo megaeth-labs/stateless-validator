@@ -1,3 +1,10 @@
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
+
 use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber, hex};
 use alloy_rpc_types_eth::{Block, BlockId};
@@ -7,12 +14,6 @@ use futures::future;
 use op_alloy_rpc_types::Transaction;
 use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
 use salt::SaltWitness;
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, Instant, SystemTime},
-};
 use tokio::{signal, task};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -946,7 +947,13 @@ async fn find_divergence_point(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{
+        collections::BTreeMap,
+        fs::File,
+        io::{BufRead, BufReader},
+        path::Path,
+    };
+
     use alloy_primitives::{BlockHash, BlockNumber};
     use alloy_rpc_types_eth::Block;
     use eyre::Context;
@@ -959,13 +966,9 @@ mod tests {
     };
     use op_alloy_rpc_types::Transaction;
     use serde::{Deserialize, Serialize, de::DeserializeOwned};
-    use std::{
-        collections::BTreeMap,
-        fs::File,
-        io::{BufRead, BufReader},
-        path::Path,
-    };
     use validator_core::withdrawals::MptWitness;
+
+    use super::*;
 
     /// Serialized witness data for a blockchain block.
     ///

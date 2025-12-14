@@ -23,6 +23,8 @@
 //! The module integrates with the Salt witness system for state reconstruction
 //! and uses Revm for transaction execution.
 
+use std::{collections::BTreeMap, fmt::Debug, io::Write, time::SystemTime};
+
 use alloy_consensus::{
     TxReceipt,
     proofs::calculate_receipt_root,
@@ -56,7 +58,6 @@ use revm::{
 };
 use salt::{EphemeralSaltState, SaltValue, SaltWitness, StateRoot, StateUpdates, Witness};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt::Debug, io::Write, time::SystemTime};
 use thiserror::Error;
 
 use crate::{
