@@ -15,10 +15,11 @@
 //! Enable via `--metrics-enabled --metrics-port 9090` or environment variables.
 //! Metrics available at `http://0.0.0.0:<port>/metrics`
 
+use std::net::SocketAddr;
+
 use eyre::Result;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
-use std::net::SocketAddr;
 use tracing::info;
 
 /// Default port for Prometheus metrics HTTP endpoint
@@ -33,34 +34,27 @@ pub mod names {
     }
 
     // Validation
-    metric!(BLOCKS_VALIDATED_TOTAL, "blocks_validated_total");
-    metric!(BLOCKS_FAILED_TOTAL, "blocks_failed_total");
-    metric!(
-        BLOCK_VALIDATION_DURATION,
-        "block_validation_duration_seconds"
-    );
-    metric!(TRANSACTIONS_PER_BLOCK, "transactions_per_block");
-    metric!(GAS_USED_PER_BLOCK, "gas_used_per_block");
+    metric!(BLOCK_VALIDATION_TIME, "block_validation_time_seconds");
+    metric!(TRANSACTIONS_TOTAL, "transactions_total");
+    metric!(GAS_USED_TOTAL, "gas_used_total");
 
     // Worker
     metric!(WORKER_TASKS_COMPLETED, "worker_tasks_completed_total");
     metric!(WORKER_TASKS_FAILED, "worker_tasks_failed_total");
 
     // Chain
-    metric!(CANONICAL_CHAIN_HEIGHT, "canonical_chain_height");
+    metric!(LOCAL_CHAIN_HEIGHT, "local_chain_height");
     metric!(REMOTE_CHAIN_HEIGHT, "remote_chain_height");
-    metric!(CHAIN_GAP, "chain_gap");
-    metric!(BLOCKS_ADVANCED, "blocks_advanced_total");
+    metric!(VALIDATION_LAG, "validation_lag");
     metric!(REORGS_DETECTED, "reorgs_detected_total");
     metric!(REORG_DEPTH, "reorg_depth");
 
     // RPC
     metric!(RPC_REQUESTS_TOTAL, "rpc_requests_total");
     metric!(RPC_ERRORS_TOTAL, "rpc_errors_total");
-    metric!(RPC_LATENCY, "rpc_latency_seconds");
-    metric!(BLOCK_FETCH_DURATION, "block_fetch_duration_seconds");
-    metric!(WITNESS_FETCH_DURATION, "witness_fetch_duration_seconds");
-    metric!(CODE_FETCH_DURATION, "code_fetch_duration_seconds");
+    metric!(BLOCK_FETCH_TIME, "block_fetch_time_seconds");
+    metric!(WITNESS_FETCH_TIME, "witness_fetch_time_seconds");
+    metric!(CODE_FETCH_TIME, "code_fetch_time_seconds");
 
     // Database
     metric!(CONTRACT_CACHE_HITS, "contract_cache_hits_total");
@@ -90,40 +84,30 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
 /// and monitoring UIs.
 fn register_metric_descriptions() {
     // Validation
-    describe_counter!(
-        names::BLOCKS_VALIDATED_TOTAL,
-        "Blocks successfully validated"
-    );
-    describe_counter!(names::BLOCKS_FAILED_TOTAL, "Blocks that failed validation");
-    describe_histogram!(
-        names::BLOCK_VALIDATION_DURATION,
-        "Block validation time (s)"
-    );
-    describe_histogram!(names::TRANSACTIONS_PER_BLOCK, "Transactions per block");
-    describe_histogram!(names::GAS_USED_PER_BLOCK, "Gas used per block");
+    describe_histogram!(names::BLOCK_VALIDATION_TIME, "Block validation time (s)");
+    describe_counter!(names::TRANSACTIONS_TOTAL, "Total transactions validated");
+    describe_counter!(names::GAS_USED_TOTAL, "Total gas used in validated blocks");
 
     // Worker
     describe_counter!(names::WORKER_TASKS_COMPLETED, "Tasks completed by workers");
     describe_counter!(names::WORKER_TASKS_FAILED, "Tasks that failed");
 
     // Chain
-    describe_gauge!(
-        names::CANONICAL_CHAIN_HEIGHT,
-        "Local canonical chain height"
-    );
+    describe_gauge!(names::LOCAL_CHAIN_HEIGHT, "Local canonical chain height");
     describe_gauge!(names::REMOTE_CHAIN_HEIGHT, "Remote chain height");
-    describe_gauge!(names::CHAIN_GAP, "Gap between remote and canonical heights");
-    describe_counter!(names::BLOCKS_ADVANCED, "Blocks advanced on canonical chain");
+    describe_gauge!(
+        names::VALIDATION_LAG,
+        "Blocks pending validation (remote - local)"
+    );
     describe_counter!(names::REORGS_DETECTED, "Chain reorganizations detected");
     describe_histogram!(names::REORG_DEPTH, "Reorg depth");
 
     // RPC
     describe_counter!(names::RPC_REQUESTS_TOTAL, "RPC requests made");
     describe_counter!(names::RPC_ERRORS_TOTAL, "RPC errors encountered");
-    describe_histogram!(names::RPC_LATENCY, "RPC latency (s)");
-    describe_histogram!(names::BLOCK_FETCH_DURATION, "Block fetch time (s)");
-    describe_histogram!(names::WITNESS_FETCH_DURATION, "Witness fetch time (s)");
-    describe_histogram!(names::CODE_FETCH_DURATION, "Code fetch time (s)");
+    describe_histogram!(names::BLOCK_FETCH_TIME, "Block fetch time (s)");
+    describe_histogram!(names::WITNESS_FETCH_TIME, "Witness fetch time (s)");
+    describe_histogram!(names::CODE_FETCH_TIME, "Code fetch time (s)");
 
     // Database
     describe_counter!(names::CONTRACT_CACHE_HITS, "Contract cache hits");
@@ -132,35 +116,27 @@ fn register_metric_descriptions() {
 }
 
 // Validation metrics
-pub fn record_block_validated(duration_secs: f64, tx_count: u64, gas_used: u64) {
-    counter!(names::BLOCKS_VALIDATED_TOTAL).increment(1);
-    histogram!(names::BLOCK_VALIDATION_DURATION).record(duration_secs);
-    histogram!(names::TRANSACTIONS_PER_BLOCK).record(tx_count as f64);
-    histogram!(names::GAS_USED_PER_BLOCK).record(gas_used as f64);
-}
-
-pub fn record_block_failed(error_type: &str) {
-    counter!(names::BLOCKS_FAILED_TOTAL, "error_type" => error_type.to_string()).increment(1);
+pub fn on_block_validated(duration_secs: f64, tx_count: u64, gas_used: u64) {
+    histogram!(names::BLOCK_VALIDATION_TIME).record(duration_secs);
+    counter!(names::TRANSACTIONS_TOTAL).increment(tx_count);
+    counter!(names::GAS_USED_TOTAL).increment(gas_used);
 }
 
 // Worker metrics
-pub fn record_worker_task_completed(worker_id: usize) {
-    counter!(names::WORKER_TASKS_COMPLETED, "worker_id" => worker_id.to_string()).increment(1);
-}
-
-pub fn record_worker_task_failed(worker_id: usize) {
-    counter!(names::WORKER_TASKS_FAILED, "worker_id" => worker_id.to_string()).increment(1);
+pub fn record_worker_task(worker_id: usize, success: bool) {
+    let worker = worker_id.to_string();
+    if success {
+        counter!(names::WORKER_TASKS_COMPLETED, "worker_id" => worker).increment(1);
+    } else {
+        counter!(names::WORKER_TASKS_FAILED, "worker_id" => worker).increment(1);
+    }
 }
 
 // Chain metrics
 pub fn set_chain_heights(canonical: u64, remote: u64) {
-    gauge!(names::CANONICAL_CHAIN_HEIGHT).set(canonical as f64);
+    gauge!(names::LOCAL_CHAIN_HEIGHT).set(canonical as f64);
     gauge!(names::REMOTE_CHAIN_HEIGHT).set(remote as f64);
-    gauge!(names::CHAIN_GAP).set((remote.saturating_sub(canonical)) as f64);
-}
-
-pub fn record_blocks_advanced(count: u64) {
-    counter!(names::BLOCKS_ADVANCED).increment(count);
+    gauge!(names::VALIDATION_LAG).set((remote.saturating_sub(canonical)) as f64);
 }
 
 pub fn record_reorg(depth: u64) {
@@ -169,40 +145,36 @@ pub fn record_reorg(depth: u64) {
 }
 
 // RPC metrics
-pub fn record_rpc_request(method: &str, duration_secs: f64, success: bool) {
+pub fn record_rpc_request(method: &str, success: bool) {
     let method = method.to_string();
     counter!(names::RPC_REQUESTS_TOTAL, "method" => method.clone()).increment(1);
-    histogram!(names::RPC_LATENCY, "method" => method.clone()).record(duration_secs);
     if !success {
         counter!(names::RPC_ERRORS_TOTAL, "method" => method).increment(1);
     }
 }
 
 pub fn record_block_fetch(duration_secs: f64) {
-    histogram!(names::BLOCK_FETCH_DURATION).record(duration_secs);
+    histogram!(names::BLOCK_FETCH_TIME).record(duration_secs);
 }
 
 pub fn record_witness_fetch(duration_secs: f64) {
-    histogram!(names::WITNESS_FETCH_DURATION).record(duration_secs);
+    histogram!(names::WITNESS_FETCH_TIME).record(duration_secs);
 }
 
 pub fn record_code_fetch(duration_secs: f64, count: usize) {
-    histogram!(names::CODE_FETCH_DURATION).record(duration_secs);
+    histogram!(names::CODE_FETCH_TIME).record(duration_secs);
     if count > 1 {
-        histogram!(names::CODE_FETCH_DURATION, "type" => "per_code")
+        histogram!(names::CODE_FETCH_TIME, "type" => "per_code")
             .record(duration_secs / count as f64);
     }
 }
 
-pub fn record_contract_cache_hits(count: u64) {
-    if count > 0 {
-        counter!(names::CONTRACT_CACHE_HITS).increment(count);
+pub fn record_contract_cache(hits: u64, misses: u64) {
+    if hits > 0 {
+        counter!(names::CONTRACT_CACHE_HITS).increment(hits);
     }
-}
-
-pub fn record_contract_cache_misses(count: u64) {
-    if count > 0 {
-        counter!(names::CONTRACT_CACHE_MISSES).increment(count);
+    if misses > 0 {
+        counter!(names::CONTRACT_CACHE_MISSES).increment(misses);
     }
 }
 

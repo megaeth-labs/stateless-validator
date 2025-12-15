@@ -1,4 +1,6 @@
 //! RPC client for fetching missing data during stateless validation.
+use std::time::Instant;
+
 use alloy_primitives::{B256, Bytes};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
@@ -8,7 +10,6 @@ use op_alloy_network::Optimism;
 use op_alloy_rpc_types::Transaction;
 use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
 use validator_core::{executor::verify_block_integrity, withdrawals::MptWitness};
 
 use crate::metrics;
@@ -67,7 +68,6 @@ impl RpcClient {
     pub async fn get_code(&self, hashes: &[B256]) -> Result<Vec<Bytes>> {
         let start = Instant::now();
         let result = try_join_all(hashes.iter().map(|&hash| async move {
-            let req_start = Instant::now();
             let result = self
                 .data_provider
                 .client()
@@ -75,11 +75,7 @@ impl RpcClient {
                 .await
                 .map_err(|e| eyre!("eth_getCodeByHash for hash {hash:?} failed: {e}"));
 
-            metrics::record_rpc_request(
-                "eth_getCodeByHash",
-                req_start.elapsed().as_secs_f64(),
-                result.is_ok(),
-            );
+            metrics::record_rpc_request("eth_getCodeByHash", result.is_ok());
             result
         }))
         .await;
@@ -106,11 +102,6 @@ impl RpcClient {
     /// Returns error if block doesn't exist, RPC call fails, or integrity checks fail.
     pub async fn get_block(&self, block_id: BlockId, full_txs: bool) -> Result<Block<Transaction>> {
         let start = Instant::now();
-        let method = if full_txs {
-            "eth_getBlockByNumber_full"
-        } else {
-            "eth_getBlockByNumber"
-        };
 
         let block = if full_txs {
             self.data_provider.get_block(block_id).full().await?
@@ -120,7 +111,7 @@ impl RpcClient {
 
         let duration = start.elapsed().as_secs_f64();
         let success = block.is_some();
-        metrics::record_rpc_request(method, duration, success);
+        metrics::record_rpc_request("eth_getBlockByNumber", success);
         metrics::record_block_fetch(duration);
 
         let block = block.ok_or_else(|| eyre!("Block {:?} not found", block_id))?;
@@ -159,18 +150,13 @@ impl RpcClient {
     /// # Errors
     /// Returns error if unable to connect to the blockchain or RPC fails.
     pub async fn get_latest_block_number(&self) -> Result<u64> {
-        let start = Instant::now();
         let result = self
             .data_provider
             .get_block_number()
             .await
             .context("Failed to get block number");
 
-        metrics::record_rpc_request(
-            "eth_blockNumber",
-            start.elapsed().as_secs_f64(),
-            result.is_ok(),
-        );
+        metrics::record_rpc_request("eth_blockNumber", result.is_ok());
         result
     }
 
@@ -196,7 +182,7 @@ impl RpcClient {
             .map_err(|e| eyre!("Failed to get witness for block {hash}: {e}"));
 
         let duration = start.elapsed().as_secs_f64();
-        metrics::record_rpc_request("mega_getBlockWitness", duration, result.is_ok());
+        metrics::record_rpc_request("mega_getBlockWitness", result.is_ok());
         metrics::record_witness_fetch(duration);
         result
     }
@@ -222,7 +208,6 @@ impl RpcClient {
         first_block: (u64, B256),
         last_block: (u64, B256),
     ) -> Result<SetValidatedBlocksResponse> {
-        let start = Instant::now();
         let result = self
             .data_provider
             .client()
@@ -230,11 +215,7 @@ impl RpcClient {
             .await
             .map_err(|e| eyre!("Failed to set validated blocks: {e}"));
 
-        metrics::record_rpc_request(
-            "mega_setValidatedBlocks",
-            start.elapsed().as_secs_f64(),
-            result.is_ok(),
-        );
+        metrics::record_rpc_request("mega_setValidatedBlocks", result.is_ok());
         result
     }
 }

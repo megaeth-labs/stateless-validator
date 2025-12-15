@@ -21,7 +21,7 @@ use validator_core::{
     ValidatorDB,
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
-    executor::{ValidationError, ValidationResult, validate_block},
+    executor::{ValidationResult, validate_block},
     withdrawals::MptWitness,
 };
 
@@ -434,7 +434,6 @@ async fn chain_sync(
 
             if blocks_advanced > 0 {
                 debug!("[Chain Sync] Advanced canonical chain by {blocks_advanced} blocks");
-                metrics::record_blocks_advanced(blocks_advanced);
             } else {
                 // No work to do, wait a bit before polling again
                 tokio::time::sleep(config.sync_poll_interval).await;
@@ -726,11 +725,7 @@ async fn validate_one(
 
             let (mut contracts, missing_contracts) = validator_db.get_contract_codes(codehashes)?;
 
-            // Track cache hits/misses
-            let cache_hits = contracts.len();
-            let cache_misses = missing_contracts.len();
-            metrics::record_contract_cache_hits(cache_hits as u64);
-            metrics::record_contract_cache_misses(cache_misses as u64);
+            metrics::record_contract_cache(contracts.len() as u64, missing_contracts.len() as u64);
 
             // Fetch missing contract codes via RPC and update the local DB
             let codes = client.get_code(&missing_contracts).await?;
@@ -770,41 +765,20 @@ async fn validate_one(
             .await
             .map_err(|e| eyre::eyre!("Validation task panicked: {e}"))?;
 
-            let validation_duration = validation_start.elapsed().as_secs_f64();
+            let validation_time = validation_start.elapsed().as_secs_f64();
 
             let (success, error_message) = match &validation_result {
                 Ok(()) => {
                     info!("[Worker {worker_id}] Successfully validated block {block_number}");
-                    metrics::record_block_validated(validation_duration, tx_count, gas_used);
-                    metrics::record_worker_task_completed(worker_id);
+                    metrics::on_block_validated(validation_time, tx_count, gas_used);
                     (true, None)
                 }
                 Err(e) => {
                     error!("[Worker {worker_id}] Failed to validate block {block_number}: {e}");
-                    let error_type = match e {
-                        ValidationError::WitnessVerificationFailed(_) => "witness_verification",
-                        ValidationError::WithdrawalValidationFailed(_) => "withdrawal_validation",
-                        ValidationError::EnvOracleConstructionFailed(_) => {
-                            "env_oracle_construction"
-                        }
-                        ValidationError::BlockIncomplete => "block_incomplete",
-                        ValidationError::BlockReplayFailed(_) => "block_replay",
-                        ValidationError::StateUpdateFailed(_) => "state_update",
-                        ValidationError::TrieUpdateFailed(_) => "trie_update",
-                        ValidationError::PreStateRootMismatch { .. } => "pre_state_root_mismatch",
-                        ValidationError::PreWithdrawalsRootMismatch { .. } => {
-                            "pre_withdrawals_root_mismatch"
-                        }
-                        ValidationError::StateRootMismatch { .. } => "state_root_mismatch",
-                        ValidationError::ReceiptsRootMismatch { .. } => "receipts_root_mismatch",
-                        ValidationError::LogsBloomMismatch { .. } => "logs_bloom_mismatch",
-                        ValidationError::GasUsedMismatch { .. } => "gas_used_mismatch",
-                    };
-                    metrics::record_block_failed(error_type);
-                    metrics::record_worker_task_failed(worker_id);
                     (false, Some(e.to_string()))
                 }
             };
+            metrics::record_worker_task(worker_id, success);
 
             validator_db.complete_validation(ValidationResult {
                 pre_state_root,
