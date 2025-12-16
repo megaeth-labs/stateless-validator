@@ -534,7 +534,7 @@ async fn remote_chain_tracker(
                         Ok(rollback_to) => {
                             warn!("[Tracker] Rolling back to block {rollback_to}");
                             let reorg_depth = remote_tip.0.saturating_sub(rollback_to);
-                            metrics::record_reorg(reorg_depth);
+                            metrics::on_chain_reorg(reorg_depth);
                             validator_db.rollback_chain(rollback_to)?;
                             return Ok(());
                         }
@@ -722,7 +722,7 @@ async fn validate_one(
             let salt_size = encode_to_vec(&witness).map_or(0, |v| v.len());
             let salt_kvs_size = encode_to_vec(&witness.kvs).map_or(0, |v| v.len());
             let mpt_size = encode_to_vec(&mpt_witness).map_or(0, |v| v.len());
-            metrics::record_witness_stats(salt_size, witness.kvs.len(), salt_kvs_size, mpt_size);
+            metrics::on_witness_stats(salt_size, witness.kvs.len(), salt_kvs_size, mpt_size);
             let start = Instant::now();
 
             // Prepare the contract map to be used by validation
@@ -730,7 +730,7 @@ async fn validate_one(
 
             let (mut contracts, missing_contracts) = validator_db.get_contract_codes(codehashes)?;
 
-            metrics::record_contract_cache(contracts.len() as u64, missing_contracts.len() as u64);
+            metrics::on_contract_cache_read(contracts.len() as u64, missing_contracts.len() as u64);
 
             // Fetch missing contract codes via RPC and update the local DB
             let codes = client.get_code(&missing_contracts).await?;
@@ -792,7 +792,7 @@ async fn validate_one(
                     (false, Some(e.to_string()))
                 }
             };
-            metrics::record_worker_task(worker_id, success);
+            metrics::on_worker_task_done(worker_id, success);
 
             validator_db.complete_validation(ValidationResult {
                 pre_state_root,
@@ -912,7 +912,7 @@ async fn history_pruner(
             match validator_db.prune_history(prune_before) {
                 Ok(blocks_pruned) if blocks_pruned > 0 => {
                     debug!("[Pruner] Pruned {blocks_pruned} blocks before block {prune_before}");
-                    metrics::record_blocks_pruned(blocks_pruned);
+                    metrics::on_blocks_pruned(blocks_pruned);
                 }
                 Err(e) => warn!("[Pruner] Failed to prune old block data: {e}"),
                 _ => {}

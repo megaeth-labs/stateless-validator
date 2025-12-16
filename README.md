@@ -113,10 +113,10 @@ Once enabled, metrics are available at `http://0.0.0.0:9090/metrics` for Prometh
 | `stateless_validator_gas_used_per_block`            | Histogram | Gas used per validated block                                         |
 | `stateless_validator_worker_tasks_completed_total`  | Counter   | Tasks completed per worker (with `worker_id` label)                  |
 | `stateless_validator_worker_tasks_failed_total`     | Counter   | Tasks failed per worker (with `worker_id` label)                     |
-| `stateless_validator_local_chain_height`            | Gauge     | Current height of local canonical chain                              |
+| `stateless_validator_local_chain_height`            | Gauge     | Current height of local local chain                                  |
 | `stateless_validator_remote_chain_height`           | Gauge     | Current height of remote chain tracker                               |
 | `stateless_validator_validation_lag`                | Gauge     | Blocks pending validation (remote - local)                           |
-| `stateless_validator_reorgs_detected_total`         | Counter   | Chain reorganizations detected                                       |
+| `stateless_validator_reorgs_detected_total`         | Counter   | Chain reorgs detected                                                |
 | `stateless_validator_reorg_depth`                   | Histogram | Depth of chain reorganizations                                       |
 | `stateless_validator_rpc_requests_total`            | Counter   | Total RPC requests (with `method` label)                             |
 | `stateless_validator_rpc_errors_total`              | Counter   | RPC errors (with `method` label)                                     |

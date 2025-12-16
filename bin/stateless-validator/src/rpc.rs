@@ -68,19 +68,20 @@ impl RpcClient {
     pub async fn get_code(&self, hashes: &[B256]) -> Result<Vec<Bytes>> {
         let start = Instant::now();
         let result = try_join_all(hashes.iter().map(|&hash| async move {
-            let result = self
-                .data_provider
+            self.data_provider
                 .client()
                 .request("eth_getCodeByHash", (hash,))
                 .await
-                .map_err(|e| eyre!("eth_getCodeByHash for hash {hash:?} failed: {e}"));
-
-            metrics::record_rpc_request("eth_getCodeByHash", result.is_ok());
-            result
+                .map_err(|e| eyre!("eth_getCodeByHash for hash {hash:?} failed: {e}"))
         }))
         .await;
 
-        metrics::record_code_fetch(start.elapsed().as_secs_f64(), hashes.len());
+        metrics::on_rpc_complete(
+            metrics::RpcMethod::EthGetCodeByHash,
+            result.is_ok(),
+            Some(start.elapsed().as_secs_f64()),
+            Some(hashes.len()),
+        );
         result
     }
 
@@ -111,8 +112,12 @@ impl RpcClient {
 
         let duration = start.elapsed().as_secs_f64();
         let success = block.is_some();
-        metrics::record_rpc_request("eth_getBlockByNumber", success);
-        metrics::record_block_fetch(duration);
+        metrics::on_rpc_complete(
+            metrics::RpcMethod::EthGetBlockByNumber,
+            success,
+            Some(duration),
+            None,
+        );
 
         let block = block.ok_or_else(|| eyre!("Block {:?} not found", block_id))?;
 
@@ -156,7 +161,12 @@ impl RpcClient {
             .await
             .context("Failed to get block number");
 
-        metrics::record_rpc_request("eth_blockNumber", result.is_ok());
+        metrics::on_rpc_complete(
+            metrics::RpcMethod::EthBlockNumber,
+            result.is_ok(),
+            None,
+            None,
+        );
         result
     }
 
@@ -182,15 +192,19 @@ impl RpcClient {
             .map_err(|e| eyre!("Failed to get witness for block {hash}: {e}"));
 
         let duration = start.elapsed().as_secs_f64();
-        metrics::record_rpc_request("mega_getBlockWitness", result.is_ok());
-        metrics::record_witness_fetch(duration);
+        metrics::on_rpc_complete(
+            metrics::RpcMethod::MegaGetBlockWitness,
+            result.is_ok(),
+            Some(duration),
+            None,
+        );
         result
     }
 
     /// Reports a range of validated blocks to the upstream node.
     ///
     /// Notifies the upstream node that the validator has successfully validated
-    /// a contiguous range of blocks in its canonical chain.
+    /// a contiguous range of blocks in its local chain.
     ///
     /// # Arguments
     /// * `first_block` - Tuple of (block number, block hash) for the earliest validated block
@@ -215,7 +229,12 @@ impl RpcClient {
             .await
             .map_err(|e| eyre!("Failed to set validated blocks: {e}"));
 
-        metrics::record_rpc_request("mega_setValidatedBlocks", result.is_ok());
+        metrics::on_rpc_complete(
+            metrics::RpcMethod::MegaSetValidatedBlocks,
+            result.is_ok(),
+            None,
+            None,
+        );
         result
     }
 }

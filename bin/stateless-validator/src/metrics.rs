@@ -90,13 +90,13 @@ fn register_metric_descriptions() {
     describe_counter!(names::WORKER_TASKS_FAILED, "Tasks that failed");
 
     // Chain
-    describe_gauge!(names::LOCAL_CHAIN_HEIGHT, "Local canonical chain height");
+    describe_gauge!(names::LOCAL_CHAIN_HEIGHT, "Local local chain height");
     describe_gauge!(names::REMOTE_CHAIN_HEIGHT, "Remote chain height");
     describe_gauge!(
         names::VALIDATION_LAG,
         "Blocks pending validation (remote - local)"
     );
-    describe_counter!(names::REORGS_DETECTED, "Chain reorganizations detected");
+    describe_counter!(names::REORGS_DETECTED, "Chain reorgs detected");
     describe_histogram!(names::REORG_DEPTH, "Reorg depth");
 
     // RPC
@@ -137,7 +137,7 @@ pub fn on_block_validation(tx_count: u64, gas_used: u64, state_reads: usize, sta
 }
 
 // Worker metrics
-pub fn record_worker_task(worker_id: usize, success: bool) {
+pub fn on_worker_task_done(worker_id: usize, success: bool) {
     let worker = worker_id.to_string();
     if success {
         counter!(names::WORKER_TASKS_COMPLETED, "worker_id" => worker).increment(1);
@@ -147,43 +147,69 @@ pub fn record_worker_task(worker_id: usize, success: bool) {
 }
 
 // Chain metrics
-pub fn set_chain_heights(canonical: u64, remote: u64) {
-    gauge!(names::LOCAL_CHAIN_HEIGHT).set(canonical as f64);
+pub fn set_chain_heights(local: u64, remote: u64) {
+    gauge!(names::LOCAL_CHAIN_HEIGHT).set(local as f64);
     gauge!(names::REMOTE_CHAIN_HEIGHT).set(remote as f64);
-    gauge!(names::VALIDATION_LAG).set((remote.saturating_sub(canonical)) as f64);
+    gauge!(names::VALIDATION_LAG).set((remote.saturating_sub(local)) as f64);
 }
 
-pub fn record_reorg(depth: u64) {
+pub fn on_chain_reorg(depth: u64) {
     counter!(names::REORGS_DETECTED).increment(1);
     histogram!(names::REORG_DEPTH).record(depth as f64);
 }
 
+/// RPC method types for metrics tracking.
+#[derive(Debug, Clone, Copy)]
+pub enum RpcMethod {
+    EthGetCodeByHash,
+    EthGetBlockByNumber,
+    EthBlockNumber,
+    MegaGetBlockWitness,
+    MegaSetValidatedBlocks,
+}
+
 // RPC metrics
-pub fn record_rpc_request(method: &str, success: bool) {
-    let method = method.to_string();
-    counter!(names::RPC_REQUESTS_TOTAL, "method" => method.clone()).increment(1);
+pub fn on_rpc_complete(
+    method: RpcMethod,
+    success: bool,
+    duration_secs: Option<f64>,
+    count: Option<usize>,
+) {
+    let method_str = match method {
+        RpcMethod::EthGetCodeByHash => "eth_getCodeByHash",
+        RpcMethod::EthGetBlockByNumber => "eth_getBlockByNumber",
+        RpcMethod::EthBlockNumber => "eth_blockNumber",
+        RpcMethod::MegaGetBlockWitness => "mega_getBlockWitness",
+        RpcMethod::MegaSetValidatedBlocks => "mega_setValidatedBlocks",
+    };
+    counter!(names::RPC_REQUESTS_TOTAL, "method" => method_str).increment(1);
     if !success {
-        counter!(names::RPC_ERRORS_TOTAL, "method" => method).increment(1);
+        counter!(names::RPC_ERRORS_TOTAL, "method" => method_str).increment(1);
+    }
+
+    if let Some(duration) = duration_secs {
+        match method {
+            RpcMethod::EthGetCodeByHash => {
+                histogram!(names::CODE_FETCH_TIME).record(duration);
+                if let Some(c) = count
+                    && c > 1
+                {
+                    histogram!(names::CODE_FETCH_TIME, "type" => "per_code")
+                        .record(duration / c as f64);
+                }
+            }
+            RpcMethod::EthGetBlockByNumber => {
+                histogram!(names::BLOCK_FETCH_TIME).record(duration);
+            }
+            RpcMethod::MegaGetBlockWitness => {
+                histogram!(names::WITNESS_FETCH_TIME).record(duration);
+            }
+            _ => {}
+        }
     }
 }
 
-pub fn record_block_fetch(duration_secs: f64) {
-    histogram!(names::BLOCK_FETCH_TIME).record(duration_secs);
-}
-
-pub fn record_witness_fetch(duration_secs: f64) {
-    histogram!(names::WITNESS_FETCH_TIME).record(duration_secs);
-}
-
-pub fn record_code_fetch(duration_secs: f64, count: usize) {
-    histogram!(names::CODE_FETCH_TIME).record(duration_secs);
-    if count > 1 {
-        histogram!(names::CODE_FETCH_TIME, "type" => "per_code")
-            .record(duration_secs / count as f64);
-    }
-}
-
-pub fn record_contract_cache(hits: u64, misses: u64) {
+pub fn on_contract_cache_read(hits: u64, misses: u64) {
     if hits > 0 {
         counter!(names::CONTRACT_CACHE_HITS).increment(hits);
     }
@@ -192,12 +218,12 @@ pub fn record_contract_cache(hits: u64, misses: u64) {
     }
 }
 
-pub fn record_blocks_pruned(count: u64) {
+pub fn on_blocks_pruned(count: u64) {
     counter!(names::BLOCKS_PRUNED).increment(count);
 }
 
 // Witness metrics
-pub fn record_witness_stats(salt_size: usize, keys_count: usize, kvs_size: usize, mpt_size: usize) {
+pub fn on_witness_stats(salt_size: usize, keys_count: usize, kvs_size: usize, mpt_size: usize) {
     histogram!(names::WITNESS_SALT_SIZE).record(salt_size as f64);
     histogram!(names::WITNESS_SALT_KEYS).record(keys_count as f64);
     histogram!(names::WITNESS_SALT_KVS_SIZE).record(kvs_size as f64);

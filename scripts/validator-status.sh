@@ -26,14 +26,14 @@ echo "════════════════════════�
 echo "  URL: $METRICS_URL | $(date '+%Y-%m-%d %H:%M:%S')"
 
 # Chain Status
-CANONICAL=$(metric 'stateless_validator_local_chain_height')
+LOCAL=$(metric 'stateless_validator_local_chain_height')
 REMOTE=$(metric 'stateless_validator_remote_chain_height')
 GAP=$(metric 'stateless_validator_validation_lag')
 
 echo ""
 echo "  CHAIN"
 echo "───────────────────────────────────────────────────────────────"
-printf "   %-20s %-15s %-20s %s\n" "Local: $(fmt_num "$CANONICAL")" "Remote: $(fmt_num "$REMOTE")" \
+printf "   %-20s %-15s %-20s %s\n" "Local: $(fmt_num "$LOCAL")" "Remote: $(fmt_num "$REMOTE")" \
     "Gap: ${GAP:-0}$( [ "${GAP:-0}" -eq 0 ] && echo ' ✓' || echo ' blocks')" "Reorgs: $(metric 'stateless_validator_reorgs_detected_total' || echo 0)"
 
 # Performance
