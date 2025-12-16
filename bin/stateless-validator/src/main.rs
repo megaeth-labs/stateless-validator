@@ -534,8 +534,7 @@ async fn remote_chain_tracker(
                     match find_divergence_point(&client, &validator_db, remote_tip.0).await {
                         Ok(rollback_to) => {
                             warn!("[Tracker] Rolling back to block {rollback_to}");
-                            let reorg_depth = remote_tip.0.saturating_sub(rollback_to);
-                            metrics::on_chain_reorg(reorg_depth);
+                            metrics::on_chain_reorg(remote_tip.0.saturating_sub(rollback_to));
                             validator_db.rollback_chain(rollback_to)?;
                             return Ok(());
                         }
@@ -774,13 +773,13 @@ async fn validate_one(
             let (success, error_message) = match &validation_result {
                 Ok(stats) => {
                     info!("[Worker {worker_id}] Successfully validated block {block_number}");
-                    metrics::on_block_validation_time(
+                    metrics::on_validation_time(
                         start.elapsed().as_secs_f64(),
                         stats.witness_verify_time,
                         stats.block_replay_time,
                         stats.salt_update_time,
                     );
-                    metrics::on_block_validation(
+                    metrics::on_block_stats(
                         tx_count,
                         gas_used,
                         stats.state_reads,

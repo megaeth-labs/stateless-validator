@@ -121,15 +121,16 @@ fn register_metric_descriptions() {
     );
 }
 
-// Record all validation metrics for a block.
-pub fn on_block_validation_time(duration: f64, wit_verify: f64, replay: f64, salt_update: f64) {
+/// Record validation timing breakdown for a block.
+pub fn on_validation_time(duration: f64, wit_verify: f64, replay: f64, salt_update: f64) {
     histogram!(names::BLOCK_VALIDATION_TIME).record(duration);
     histogram!(names::WITNESS_VERIFY_TIME).record(wit_verify);
     histogram!(names::BLOCK_REPLAY_TIME).record(replay);
     histogram!(names::SALT_UPDATE_TIME).record(salt_update);
 }
 
-pub fn on_block_validation(tx_count: u64, gas_used: u64, state_reads: usize, state_writes: usize) {
+/// Record block statistics after successful validation.
+pub fn on_block_stats(tx_count: u64, gas_used: u64, state_reads: usize, state_writes: usize) {
     counter!(names::TRANSACTIONS_TOTAL).increment(tx_count);
     counter!(names::GAS_USED_TOTAL).increment(gas_used);
     histogram!(names::BLOCK_STATE_READS).record(state_reads as f64);
