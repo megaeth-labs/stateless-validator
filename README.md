@@ -109,7 +109,7 @@ Once enabled, metrics are available at `http://0.0.0.0:9090/metrics` for Prometh
 | Metric                                              | Type      | Description                                                          |
 | --------------------------------------------------- | --------- | -------------------------------------------------------------------- |
 | `stateless_validator_block_validation_time_seconds` | Histogram | Block validation time                                                |
-| `stateless_validator_witness_verify_time_seconds`   | Histogram | Witness verification time                                            |
+| `stateless_validator_witness_verification_time_seconds` | Histogram | Witness verification time                                            |
 | `stateless_validator_block_replay_time_seconds`     | Histogram | EVM execution time                                                   |
 | `stateless_validator_salt_update_time_seconds`      | Histogram | SALT update time                                                     |
 | `stateless_validator_transactions_total`            | Counter   | Total transactions validated                                         |
@@ -131,10 +131,7 @@ Once enabled, metrics are available at `http://0.0.0.0:9090/metrics` for Prometh
 | `stateless_validator_contract_cache_hits_total`     | Counter   | Contract cache hits                                                  |
 | `stateless_validator_contract_cache_misses_total`   | Counter   | Contract cache misses                                                |
 | `stateless_validator_blocks_pruned_total`           | Counter   | Blocks pruned from history                                           |
-| `stateless_validator_witness_salt_size_bytes`       | Histogram | Salt witness size in bytes                                           |
 | `stateless_validator_witness_salt_keys`             | Histogram | Salt witness key count                                               |
-| `stateless_validator_witness_salt_kvs_bytes`        | Histogram | Salt witness KVs size in bytes                                       |
-| `stateless_validator_witness_mpt_size_bytes`        | Histogram | MPT witness size in bytes                                            |
 
 **Example Prometheus configuration:**
 

@@ -22,7 +22,6 @@ use validator_core::{
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
     executor::{ValidationResult, validate_block},
-    validator_db::encode_to_vec,
     withdrawals::MptWitness,
 };
 
@@ -719,10 +718,6 @@ async fn validate_one(
             let gas_used = block.header.gas_used;
             debug!("[Worker {}] Validating block {}", worker_id, block_number);
 
-            let salt_size = encode_to_vec(&witness).map_or(0, |v| v.len());
-            let salt_kvs_size = encode_to_vec(&witness.kvs).map_or(0, |v| v.len());
-            let mpt_size = encode_to_vec(&mpt_witness).map_or(0, |v| v.len());
-            metrics::on_witness_stats(salt_size, witness.kvs.len(), salt_kvs_size, mpt_size);
             let start = Instant::now();
 
             // Prepare the contract map to be used by validation
@@ -732,8 +727,10 @@ async fn validate_one(
 
             metrics::on_contract_cache_read(contracts.len() as u64, missing_contracts.len() as u64);
 
-            // Fetch missing contract codes via RPC and update the local DB
-            let codes = client.get_code(&missing_contracts).await?;
+            // Fetch missing contract codes via RPC concurrently and update the local DB
+            let codes =
+                future::try_join_all(missing_contracts.iter().map(|&hash| client.get_code(hash)))
+                    .await?;
 
             // Validate all fetched bytecodes match expected hashes
             let new_bytecodes: Vec<_> = missing_contracts
@@ -773,13 +770,11 @@ async fn validate_one(
             let (success, error_message) = match &validation_result {
                 Ok(stats) => {
                     info!("[Worker {worker_id}] Successfully validated block {block_number}");
-                    metrics::on_validation_time(
+                    metrics::on_validation_success(
                         start.elapsed().as_secs_f64(),
-                        stats.witness_verify_time,
+                        stats.witness_verification_time,
                         stats.block_replay_time,
                         stats.salt_update_time,
-                    );
-                    metrics::on_block_stats(
                         tx_count,
                         gas_used,
                         stats.state_reads,

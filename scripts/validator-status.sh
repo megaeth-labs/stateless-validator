@@ -116,7 +116,7 @@ if [ -n "$VAL_COUNT" ] && [ "$VAL_COUNT" != "0" ]; then
     printf "   Throughput: %s blocks/sec\n" "$BPS"
 
     # Validation phase breakdown
-    WITNESS_VERIFY=$(hist_avg 'stateless_validator_witness_verify_time_seconds')
+    WITNESS_VERIFY=$(hist_avg 'stateless_validator_witness_verification_time_seconds')
     BLOCK_REPLAY=$(hist_avg 'stateless_validator_block_replay_time_seconds')
     SALT_UPDATE=$(hist_avg 'stateless_validator_salt_update_time_seconds')
     printf "   Phases (avg): Witness: %s ms | Replay: %s ms | Salt Update: %s ms\n" \
@@ -157,17 +157,12 @@ RATE=$( [ "$TOTAL" -gt 0 ] && echo "$(echo "scale=1; ${HITS:-0} * 100 / $TOTAL" 
 printf "   Hits: %s | Misses: %s | Rate: %s\n" "$(fmt_num "$HITS")" "${MISSES:-0}" "$RATE"
 
 # Witness Stats
-SALT_SIZE=$(hist_avg 'stateless_validator_witness_salt_size_bytes')
-MPT_SIZE=$(hist_avg 'stateless_validator_witness_mpt_size_bytes')
 SALT_KEYS=$(hist_avg 'stateless_validator_witness_salt_keys')
-SALT_KVS=$(hist_avg 'stateless_validator_witness_salt_kvs_bytes')
 
 echo ""
 echo "  WITNESS (avg per block)"
 echo "───────────────────────────────────────────────────────────────"
-printf "   Salt: %s | MPT: %s | Keys: %s | KVs: %s\n" \
-    "$(fmt_bytes "$SALT_SIZE")" "$(fmt_bytes "$MPT_SIZE")" \
-    "$(fmt_num "$SALT_KEYS")" "$(fmt_bytes "$SALT_KVS")"
+printf "   Keys: %s\n" "$(fmt_num "$SALT_KEYS")"
 
 # State Access
 STATE_READS=$(hist_avg 'stateless_validator_block_state_reads')

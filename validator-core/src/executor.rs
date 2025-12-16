@@ -193,7 +193,7 @@ pub struct ValidationStats {
     /// Number of accounts/storage slots changed
     pub state_writes: usize,
     /// Time spent verifying the witness proof (seconds)
-    pub witness_verify_time: f64,
+    pub witness_verification_time: f64,
     /// Time spent replaying block transactions (seconds)
     pub block_replay_time: f64,
     /// Time spent updating SALT state (seconds)
@@ -448,7 +448,7 @@ pub fn validate_block(
     witness
         .verify()
         .map_err(ValidationError::WitnessVerificationFailed)?;
-    let witness_verify_time = start.elapsed().as_secs_f64();
+    let witness_verification_time = start.elapsed().as_secs_f64();
 
     // Replay block transactions
     let witness_db = WitnessDatabase {
@@ -457,7 +457,7 @@ pub fn validate_block(
         contracts,
     };
     let (accounts, output) = replay_block(chain_spec, block, &witness_db, ext_env, writer)?;
-    let block_replay_time = start.elapsed().as_secs_f64() - witness_verify_time;
+    let block_replay_time = start.elapsed().as_secs_f64() - witness_verification_time;
 
     // Extract and hash storage updates (only changed values)
     let withdrawal_storage: B256Map<U256> = accounts
@@ -533,7 +533,8 @@ pub fn validate_block(
     let (state_root, _) = StateRoot::new(&witness)
         .update_fin(&state_updates)
         .map_err(ValidationError::TrieUpdateFailed)?;
-    let salt_update_time = start.elapsed().as_secs_f64() - witness_verify_time - block_replay_time;
+    let salt_update_time =
+        start.elapsed().as_secs_f64() - witness_verification_time - block_replay_time;
 
     // Check if computed withdrawals root matches the claimed one
     mpt_witness
@@ -576,7 +577,7 @@ pub fn validate_block(
     Ok(ValidationStats {
         state_reads: output.state_reads,
         state_writes: output.state_writes,
-        witness_verify_time,
+        witness_verification_time,
         block_replay_time,
         salt_update_time,
     })

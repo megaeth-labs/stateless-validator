@@ -23,7 +23,10 @@ pub mod names {
 
     // Validation
     metric!(BLOCK_VALIDATION_TIME, "block_validation_time_seconds");
-    metric!(WITNESS_VERIFY_TIME, "witness_verify_time_seconds");
+    metric!(
+        WITNESS_VERIFICATION_TIME,
+        "witness_verification_time_seconds"
+    );
     metric!(BLOCK_REPLAY_TIME, "block_replay_time_seconds");
     metric!(SALT_UPDATE_TIME, "salt_update_time_seconds");
     metric!(TRANSACTIONS_TOTAL, "transactions_total");
@@ -77,7 +80,10 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
 fn register_metric_descriptions() {
     // Validation
     describe_histogram!(names::BLOCK_VALIDATION_TIME, "Block validation time (s)");
-    describe_histogram!(names::WITNESS_VERIFY_TIME, "Witness verification time (s)");
+    describe_histogram!(
+        names::WITNESS_VERIFICATION_TIME,
+        "Witness verification time (s)"
+    );
     describe_histogram!(names::BLOCK_REPLAY_TIME, "EVM execution time (s)");
     describe_histogram!(names::SALT_UPDATE_TIME, "SALT update time (s)");
     describe_counter!(names::TRANSACTIONS_TOTAL, "Total transactions validated");
@@ -121,16 +127,22 @@ fn register_metric_descriptions() {
     );
 }
 
-/// Record validation timing breakdown for a block.
-pub fn on_validation_time(duration: f64, wit_verify: f64, replay: f64, salt_update: f64) {
+/// Record validation timing and block statistics after successful validation.
+#[allow(clippy::too_many_arguments)]
+pub fn on_validation_success(
+    duration: f64,
+    wit_verify: f64,
+    replay: f64,
+    salt_update: f64,
+    tx_count: u64,
+    gas_used: u64,
+    state_reads: usize,
+    state_writes: usize,
+) {
     histogram!(names::BLOCK_VALIDATION_TIME).record(duration);
-    histogram!(names::WITNESS_VERIFY_TIME).record(wit_verify);
+    histogram!(names::WITNESS_VERIFICATION_TIME).record(wit_verify);
     histogram!(names::BLOCK_REPLAY_TIME).record(replay);
     histogram!(names::SALT_UPDATE_TIME).record(salt_update);
-}
-
-/// Record block statistics after successful validation.
-pub fn on_block_stats(tx_count: u64, gas_used: u64, state_reads: usize, state_writes: usize) {
     counter!(names::TRANSACTIONS_TOTAL).increment(tx_count);
     counter!(names::GAS_USED_TOTAL).increment(gas_used);
     histogram!(names::BLOCK_STATE_READS).record(state_reads as f64);
@@ -170,12 +182,7 @@ pub enum RpcMethod {
 }
 
 // RPC metrics
-pub fn on_rpc_complete(
-    method: RpcMethod,
-    success: bool,
-    duration_secs: Option<f64>,
-    count: Option<usize>,
-) {
+pub fn on_rpc_complete(method: RpcMethod, success: bool, duration_secs: Option<f64>) {
     let method_str = match method {
         RpcMethod::EthGetCodeByHash => "eth_getCodeByHash",
         RpcMethod::EthGetBlockByNumber => "eth_getBlockByNumber",
@@ -192,12 +199,6 @@ pub fn on_rpc_complete(
         match method {
             RpcMethod::EthGetCodeByHash => {
                 histogram!(names::CODE_FETCH_TIME).record(duration);
-                if let Some(c) = count
-                    && c > 1
-                {
-                    histogram!(names::CODE_FETCH_TIME, "type" => "per_code")
-                        .record(duration / c as f64);
-                }
             }
             RpcMethod::EthGetBlockByNumber => {
                 histogram!(names::BLOCK_FETCH_TIME).record(duration);
