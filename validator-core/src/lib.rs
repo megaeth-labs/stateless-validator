@@ -21,5 +21,7 @@ pub use validator_db::{ValidationDbError, ValidationDbResult, ValidatorDB};
 pub mod data_types;
 pub use data_types::{PlainKey, PlainValue};
 pub mod executor;
-pub use executor::{ValidationError, ValidationResult, replay_block, validate_block};
+pub use executor::{
+    ValidationError, ValidationResult, ValidationStats, replay_block, validate_block,
+};
 pub mod withdrawals;

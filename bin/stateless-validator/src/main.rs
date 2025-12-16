@@ -22,6 +22,7 @@ use validator_core::{
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
     executor::{ValidationResult, validate_block},
+    validator_db::encode_to_vec,
     withdrawals::MptWitness,
 };
 
@@ -718,7 +719,11 @@ async fn validate_one(
             let gas_used = block.header.gas_used;
             debug!("[Worker {}] Validating block {}", worker_id, block_number);
 
-            let validation_start = Instant::now();
+            let salt_size = encode_to_vec(&witness).map_or(0, |v| v.len());
+            let salt_kvs_size = encode_to_vec(&witness.kvs).map_or(0, |v| v.len());
+            let mpt_size = encode_to_vec(&mpt_witness).map_or(0, |v| v.len());
+            metrics::record_witness_stats(salt_size, witness.kvs.len(), salt_kvs_size, mpt_size);
+            let start = Instant::now();
 
             // Prepare the contract map to be used by validation
             let codehashes = extract_contract_codes(&witness);
@@ -765,12 +770,21 @@ async fn validate_one(
             .await
             .map_err(|e| eyre::eyre!("Validation task panicked: {e}"))?;
 
-            let validation_time = validation_start.elapsed().as_secs_f64();
-
             let (success, error_message) = match &validation_result {
-                Ok(()) => {
+                Ok(stats) => {
                     info!("[Worker {worker_id}] Successfully validated block {block_number}");
-                    metrics::on_block_validated(validation_time, tx_count, gas_used);
+                    metrics::on_block_validation_time(
+                        start.elapsed().as_secs_f64(),
+                        stats.witness_verify_time,
+                        stats.block_replay_time,
+                        stats.salt_update_time,
+                    );
+                    metrics::on_block_validation(
+                        tx_count,
+                        gas_used,
+                        stats.state_reads,
+                        stats.state_writes,
+                    );
                     (true, None)
                 }
                 Err(e) => {

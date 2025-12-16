@@ -1,19 +1,7 @@
-//! Prometheus-compatible metrics for the stateless validator.
+//! Prometheus metrics for the stateless validator.
 //!
-//! This module provides Prometheus-compatible metrics for monitoring the validator's
-//! performance, health, and resource utilization. Metrics are exposed via an HTTP
-//! endpoint that can be scraped by Prometheus or compatible monitoring systems.
-//!
-//! ## Metric Categories
-//!
-//! - **Validation**: Block validation timing, success/failure rates, throughput
-//! - **Worker**: Task processing statistics
-//! - **Chain**: Chain progression, gaps, reorg tracking
-//! - **RPC**: Request latency, error rates, fetch timing
-//! - **Database**: Cache statistics
-//!
-//! Enable via `--metrics-enabled --metrics-port 9090` or environment variables.
-//! Metrics available at `http://0.0.0.0:<port>/metrics`
+//! Exposes metrics at `http://0.0.0.0:<port>/metrics` for Prometheus scraping.
+//! Enable via `--metrics-enabled --metrics-port 9090`.
 
 use std::net::SocketAddr;
 
@@ -22,10 +10,10 @@ use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gau
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tracing::info;
 
-/// Default port for Prometheus metrics HTTP endpoint
+/// Default metrics port.
 pub const DEFAULT_METRICS_PORT: u16 = 9090;
 
-/// Metric names as constants for consistency
+/// Metric name constants.
 pub mod names {
     macro_rules! metric {
         ($name:ident, $suffix:expr) => {
@@ -35,8 +23,13 @@ pub mod names {
 
     // Validation
     metric!(BLOCK_VALIDATION_TIME, "block_validation_time_seconds");
+    metric!(WITNESS_VERIFY_TIME, "witness_verify_time_seconds");
+    metric!(BLOCK_REPLAY_TIME, "block_replay_time_seconds");
+    metric!(SALT_UPDATE_TIME, "salt_update_time_seconds");
     metric!(TRANSACTIONS_TOTAL, "transactions_total");
     metric!(GAS_USED_TOTAL, "gas_used_total");
+    metric!(BLOCK_STATE_READS, "block_state_reads");
+    metric!(BLOCK_STATE_WRITES, "block_state_writes");
 
     // Worker
     metric!(WORKER_TASKS_COMPLETED, "worker_tasks_completed_total");
@@ -60,13 +53,15 @@ pub mod names {
     metric!(CONTRACT_CACHE_HITS, "contract_cache_hits_total");
     metric!(CONTRACT_CACHE_MISSES, "contract_cache_misses_total");
     metric!(BLOCKS_PRUNED, "blocks_pruned_total");
+
+    // Witness
+    metric!(WITNESS_SALT_SIZE, "witness_salt_size_bytes");
+    metric!(WITNESS_SALT_KEYS, "witness_salt_keys");
+    metric!(WITNESS_SALT_KVS_SIZE, "witness_salt_kvs_bytes");
+    metric!(WITNESS_MPT_SIZE, "witness_mpt_size_bytes");
 }
 
-/// Initialize the Prometheus metrics exporter.
-///
-/// Sets up an HTTP server that exposes metrics at `/metrics` endpoint.
-/// The server runs in the background and is automatically cleaned up
-/// when the process exits.
+/// Initialize the Prometheus metrics exporter at the given address.
 pub fn init_metrics(addr: SocketAddr) -> Result<()> {
     PrometheusBuilder::new()
         .with_http_listener(addr)
@@ -78,15 +73,17 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
     Ok(())
 }
 
-/// Register descriptions for all metrics.
-///
-/// This provides human-readable descriptions that appear in Prometheus
-/// and monitoring UIs.
+/// Register metric descriptions for Prometheus.
 fn register_metric_descriptions() {
     // Validation
     describe_histogram!(names::BLOCK_VALIDATION_TIME, "Block validation time (s)");
+    describe_histogram!(names::WITNESS_VERIFY_TIME, "Witness verification time (s)");
+    describe_histogram!(names::BLOCK_REPLAY_TIME, "EVM execution time (s)");
+    describe_histogram!(names::SALT_UPDATE_TIME, "SALT update time (s)");
     describe_counter!(names::TRANSACTIONS_TOTAL, "Total transactions validated");
     describe_counter!(names::GAS_USED_TOTAL, "Total gas used in validated blocks");
+    describe_histogram!(names::BLOCK_STATE_READS, "Plain kvs reads per block");
+    describe_histogram!(names::BLOCK_STATE_WRITES, "Plain kvs writes per block");
 
     // Worker
     describe_counter!(names::WORKER_TASKS_COMPLETED, "Tasks completed by workers");
@@ -113,13 +110,30 @@ fn register_metric_descriptions() {
     describe_counter!(names::CONTRACT_CACHE_HITS, "Contract cache hits");
     describe_counter!(names::CONTRACT_CACHE_MISSES, "Contract cache misses");
     describe_counter!(names::BLOCKS_PRUNED, "Blocks pruned from history");
+
+    // Witness
+    describe_histogram!(names::WITNESS_SALT_SIZE, "Salt witness size (bytes)");
+    describe_histogram!(names::WITNESS_MPT_SIZE, "MPT witness size (bytes)");
+    describe_histogram!(names::WITNESS_SALT_KEYS, "Salt witness key count");
+    describe_histogram!(
+        names::WITNESS_SALT_KVS_SIZE,
+        "Salt witness KVs size (bytes)"
+    );
 }
 
-// Validation metrics
-pub fn on_block_validated(duration_secs: f64, tx_count: u64, gas_used: u64) {
-    histogram!(names::BLOCK_VALIDATION_TIME).record(duration_secs);
+// Record all validation metrics for a block.
+pub fn on_block_validation_time(duration: f64, wit_verify: f64, replay: f64, salt_update: f64) {
+    histogram!(names::BLOCK_VALIDATION_TIME).record(duration);
+    histogram!(names::WITNESS_VERIFY_TIME).record(wit_verify);
+    histogram!(names::BLOCK_REPLAY_TIME).record(replay);
+    histogram!(names::SALT_UPDATE_TIME).record(salt_update);
+}
+
+pub fn on_block_validation(tx_count: u64, gas_used: u64, state_reads: usize, state_writes: usize) {
     counter!(names::TRANSACTIONS_TOTAL).increment(tx_count);
     counter!(names::GAS_USED_TOTAL).increment(gas_used);
+    histogram!(names::BLOCK_STATE_READS).record(state_reads as f64);
+    histogram!(names::BLOCK_STATE_WRITES).record(state_writes as f64);
 }
 
 // Worker metrics
@@ -180,4 +194,12 @@ pub fn record_contract_cache(hits: u64, misses: u64) {
 
 pub fn record_blocks_pruned(count: u64) {
     counter!(names::BLOCKS_PRUNED).increment(count);
+}
+
+// Witness metrics
+pub fn record_witness_stats(salt_size: usize, keys_count: usize, kvs_size: usize, mpt_size: usize) {
+    histogram!(names::WITNESS_SALT_SIZE).record(salt_size as f64);
+    histogram!(names::WITNESS_SALT_KEYS).record(keys_count as f64);
+    histogram!(names::WITNESS_SALT_KVS_SIZE).record(kvs_size as f64);
+    histogram!(names::WITNESS_MPT_SIZE).record(mpt_size as f64);
 }

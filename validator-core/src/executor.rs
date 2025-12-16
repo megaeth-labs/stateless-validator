@@ -23,7 +23,12 @@
 //! The module integrates with the Salt witness system for state reconstruction
 //! and uses Revm for transaction execution.
 
-use std::{collections::BTreeMap, fmt::Debug, io::Write, time::SystemTime};
+use std::{
+    collections::BTreeMap,
+    fmt::Debug,
+    io::Write,
+    time::{Instant, SystemTime},
+};
 
 use alloy_consensus::{
     TxReceipt,
@@ -174,6 +179,25 @@ pub struct BlockExecutionOutput {
     pub logs_bloom: Bloom,
     /// The total gas used by all transactions
     pub gas_used: u64,
+    /// Number of accounts/storage slots read during execution
+    pub state_reads: usize,
+    /// Number of accounts/storage slots changed
+    pub state_writes: usize,
+}
+
+/// Statistics collected during block validation for metrics.
+#[derive(Debug, Clone, Default)]
+pub struct ValidationStats {
+    /// Number of accounts/storage slots read during execution
+    pub state_reads: usize,
+    /// Number of accounts/storage slots changed
+    pub state_writes: usize,
+    /// Time spent verifying the witness proof (seconds)
+    pub witness_verify_time: f64,
+    /// Time spent replaying block transactions (seconds)
+    pub block_replay_time: f64,
+    /// Time spent updating SALT state (seconds)
+    pub salt_update_time: f64,
 }
 
 /// Creates an EVM execution environment from a block header and chain specification.
@@ -291,7 +315,7 @@ where
         block_limits,
     );
 
-    let execution_output = if let Some(writer) = trace_writer {
+    let (receipts_root, logs_bloom, gas_used) = if let Some(writer) = trace_writer {
         let executor = executor_factory.create_executor_with_inspector(
             &mut state,
             execution_context,
@@ -307,14 +331,40 @@ where
     // Merge transitions into bundle_state
     state.merge_transitions(BundleRetention::PlainState);
 
-    Ok((state.bundle_state.state, execution_output))
+    let total_accessed: usize = state
+        .cache
+        .accounts
+        .values()
+        .map(|a| 1 + a.account.as_ref().map_or(0, |a| a.storage.len()))
+        .sum();
+
+    let state_writes: usize = state
+        .bundle_state
+        .state
+        .values()
+        .map(|a| {
+            (a.info != a.original_info) as usize
+                + a.storage.values().filter(|s| s.is_changed()).count()
+        })
+        .sum();
+
+    Ok((
+        state.bundle_state.state,
+        BlockExecutionOutput {
+            receipts_root,
+            logs_bloom,
+            gas_used,
+            state_reads: total_accessed.saturating_sub(state_writes),
+            state_writes,
+        },
+    ))
 }
 
 /// Executes transactions using the given block executor.
 fn execute_transactions<E, T>(
     mut executor: E,
     transactions: &[OpTransaction<T>],
-) -> Result<BlockExecutionOutput, ValidationError>
+) -> Result<(B256, Bloom, u64), ValidationError>
 where
     E: BlockExecutor<Transaction = T>,
     E::Receipt: Encodable2718 + TxReceipt,
@@ -353,11 +403,7 @@ where
 
     let receipts_root = calculate_receipt_root(&execution_result.receipts);
 
-    Ok(BlockExecutionOutput {
-        receipts_root,
-        logs_bloom,
-        gas_used,
-    })
+    Ok((receipts_root, logs_bloom, gas_used))
 }
 
 /// Validates a block by creating a witness, replaying transactions, and comparing state roots.
@@ -382,7 +428,7 @@ where
 ///
 /// # Returns
 ///
-/// Returns `Ok(())` if validation succeeds (computed state root matches expected).
+/// Returns `Ok(ValidationStats)` if validation succeeds, containing state access metrics.
 /// Returns `Err(ValidationError)` with the specific validation failure.
 pub fn validate_block(
     chain_spec: &ChainSpec,
@@ -391,16 +437,18 @@ pub fn validate_block(
     mpt_witness: MptWitness,
     contracts: &std::collections::HashMap<B256, Bytecode>,
     writer: Option<Box<dyn Write>>,
-) -> Result<(), ValidationError> {
+) -> Result<ValidationStats, ValidationError> {
     // Create external environment oracle from salt witness
     let ext_env = WitnessExternalEnv::new(&salt_witness, block.header.number)
         .map_err(ValidationError::EnvOracleConstructionFailed)?;
 
     // Verify witness proof against the current state root
+    let start = Instant::now();
     let witness = Witness::from(salt_witness);
     witness
         .verify()
         .map_err(ValidationError::WitnessVerificationFailed)?;
+    let witness_verify_time = start.elapsed().as_secs_f64();
 
     // Replay block transactions
     let witness_db = WitnessDatabase {
@@ -408,8 +456,8 @@ pub fn validate_block(
         witness: &witness,
         contracts,
     };
-    let (accounts, execution_output) =
-        replay_block(chain_spec, block, &witness_db, ext_env, writer)?;
+    let (accounts, output) = replay_block(chain_spec, block, &witness_db, ext_env, writer)?;
+    let block_replay_time = start.elapsed().as_secs_f64() - witness_verify_time;
 
     // Extract and hash storage updates (only changed values)
     let withdrawal_storage: B256Map<U256> = accounts
@@ -485,6 +533,7 @@ pub fn validate_block(
     let (state_root, _) = StateRoot::new(&witness)
         .update_fin(&state_updates)
         .map_err(ValidationError::TrieUpdateFailed)?;
+    let salt_update_time = start.elapsed().as_secs_f64() - witness_verify_time - block_replay_time;
 
     // Check if computed withdrawals root matches the claimed one
     mpt_witness
@@ -492,38 +541,45 @@ pub fn validate_block(
         .map_err(ValidationError::WithdrawalValidationFailed)?;
 
     // Verify receipts root matches the block header
-    if execution_output.receipts_root != block.header.receipts_root {
+    if output.receipts_root != block.header.receipts_root {
         return Err(ValidationError::ReceiptsRootMismatch {
-            actual: execution_output.receipts_root,
+            actual: output.receipts_root,
             claimed: block.header.receipts_root,
         });
     }
 
     // Verify logs bloom matches the block header
-    if execution_output.logs_bloom != block.header.logs_bloom {
+    if output.logs_bloom != block.header.logs_bloom {
         return Err(ValidationError::LogsBloomMismatch {
-            actual: Box::new(execution_output.logs_bloom),
+            actual: Box::new(output.logs_bloom),
             claimed: Box::new(block.header.logs_bloom),
         });
     }
 
     // Verify gas used matches the block header
-    if execution_output.gas_used != block.header.gas_used {
+    if output.gas_used != block.header.gas_used {
         return Err(ValidationError::GasUsedMismatch {
-            actual: execution_output.gas_used,
+            actual: output.gas_used,
             claimed: block.header.gas_used,
         });
     }
 
     // Check if computed state root matches claimed state root
     let state_root = B256::from(state_root);
-    match state_root == block.header.state_root {
-        true => Ok(()),
-        false => Err(ValidationError::StateRootMismatch {
+    if state_root != block.header.state_root {
+        return Err(ValidationError::StateRootMismatch {
             actual: state_root,
             claimed: block.header.state_root,
-        }),
+        });
     }
+
+    Ok(ValidationStats {
+        state_reads: output.state_reads,
+        state_writes: output.state_writes,
+        witness_verify_time,
+        block_replay_time,
+        salt_update_time,
+    })
 }
 
 /// Verifies the structural integrity and cryptographic consistency of a block.
