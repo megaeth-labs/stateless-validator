@@ -90,7 +90,7 @@ fn register_metric_descriptions() {
     describe_counter!(names::WORKER_TASKS_FAILED, "Tasks that failed");
 
     // Chain
-    describe_gauge!(names::LOCAL_CHAIN_HEIGHT, "Local local chain height");
+    describe_gauge!(names::LOCAL_CHAIN_HEIGHT, "Local chain height");
     describe_gauge!(names::REMOTE_CHAIN_HEIGHT, "Remote chain height");
     describe_gauge!(
         names::VALIDATION_LAG,

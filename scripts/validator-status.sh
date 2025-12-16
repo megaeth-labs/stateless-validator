@@ -56,10 +56,9 @@ if [ -n "$VAL_COUNT" ] && [ "$VAL_COUNT" != "0" ]; then
     # Validation phase breakdown
     WITNESS_VERIFY=$(hist_avg 'stateless_validator_witness_verify_time_seconds')
     BLOCK_REPLAY=$(hist_avg 'stateless_validator_block_replay_time_seconds')
-    STATE_UPDATE=$(hist_avg 'stateless_validator_state_update_time_seconds')
-    STATE_ROOT=$(hist_avg 'stateless_validator_state_root_time_seconds')
-    printf "   Phases (avg): Witness: %s ms | Replay: %s ms | State: %s ms | Root: %s ms\n" \
-        "$(fmt_ms "$WITNESS_VERIFY")" "$(fmt_ms "$BLOCK_REPLAY")" "$(fmt_ms "$STATE_UPDATE")" "$(fmt_ms "$STATE_ROOT")"
+    SALT_UPDATE=$(hist_avg 'stateless_validator_salt_update_time_seconds')
+    printf "   Phases (avg): Witness: %s ms | Replay: %s ms | State: %s ms \n" \
+        "$(fmt_ms "$WITNESS_VERIFY")" "$(fmt_ms "$BLOCK_REPLAY")" "$(fmt_ms "$SALT_UPDATE")"
 else
     echo "   No data yet"
 fi
