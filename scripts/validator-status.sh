@@ -7,16 +7,77 @@ METRICS_URL="${1:-http://localhost:9090/metrics}"
 METRICS=$(curl -s "$METRICS_URL" 2>/dev/null) || { echo "Error: Could not fetch metrics from $METRICS_URL"; exit 1; }
 [ -z "$METRICS" ] && { echo "Error: Empty response from $METRICS_URL"; exit 1; }
 
-# Helpers
-metric()       { echo "$METRICS" | grep "^$1" | grep -v quantile | head -1 | awk '{print $2}' | cut -d'.' -f1; }
-metric_float() { echo "$METRICS" | grep "^$1" | grep -v quantile | head -1 | awk '{print $2}'; }
-quantile()     { echo "$METRICS" | grep "^$1{quantile=\"$2\"}" | head -1 | awk '{print $2}'; }
-hist_sum()     { echo "$METRICS" | grep "^${1}_sum" | grep -v "{" | head -1 | awk '{print $2}'; }
-hist_count()   { echo "$METRICS" | grep "^${1}_count" | grep -v "{" | head -1 | awk '{print $2}'; }
-hist_avg()     { S=$(hist_sum "$1"); C=$(hist_count "$1"); [ -n "$C" ] && [ "$C" != "0" ] && echo "scale=2; $S / $C" | bc 2>/dev/null || echo "0"; }
-fmt_ms()       { [ -n "$1" ] && [ "$1" != "0" ] && printf "%.2f" "$(echo "scale=6; $1 * 1000" | bc 2>/dev/null)" || echo "N/A"; }
-fmt_num()      { [ -n "$1" ] && printf "%'d" "${1%.*}" 2>/dev/null || echo "0"; }
-fmt_bytes()    { [ -n "$1" ] && [ "${1%.*}" -gt 0 ] && { B=${1%.*}; [ "$B" -ge 1048576 ] && printf "%.2f MB" "$(echo "scale=2; $B / 1048576" | bc)" || { [ "$B" -ge 1024 ] && printf "%.2f KB" "$(echo "scale=2; $B / 1024" | bc)" || printf "%d B" "$B"; }; } || echo "0 B"; }
+# Parse all metrics in single awk pass - outputs shell variable assignments
+eval "$(echo "$METRICS" | awk '
+/^#/ { next }
+# Handle quantile metrics: metric{quantile="0.5"} value
+/\{quantile=/ {
+    name = $1
+    sub(/\{.*/, "", name)
+    q = $1
+    sub(/.*quantile="/, "", q)
+    sub(/".*/, "", q)
+    gsub(/\./, "_", q)
+    if (!seen[name"_q"q]++) print "M_Q_"name"_"q"=\""$2"\""
+    next
+}
+# Handle histogram _sum (without labels) - use index() for BSD awk compatibility
+/_sum / {
+    if (index($0, "{") == 0) {
+        name = $1
+        sub(/_sum$/, "", name)
+        if (!seen[name"_sum"]++) print "M_S_"name"=\""$2"\""
+    }
+    next
+}
+# Handle histogram _count (without labels)
+/_count / {
+    if (index($0, "{") == 0) {
+        name = $1
+        sub(/_count$/, "", name)
+        if (!seen[name"_count"]++) print "M_C_"name"=\""$2"\""
+    }
+    next
+}
+# Handle plain metrics (no labels)
+/^[a-zA-Z_][a-zA-Z0-9_]* / {
+    if (index($0, "{") == 0 && index($0, "#") != 1) {
+        if (!seen[$1]++) print "M_V_"$1"=\""$2"\""
+    }
+}
+')"
+
+# Fast lookups using parsed variables
+metric()   { eval "v=\${M_V_$1:-}"; echo "${v%%.*}"; }
+quantile() { local q="$2"; q="${q//./_}"; eval "echo \${M_Q_${1}_$q:-}"; }
+hist_sum() { eval "echo \${M_S_$1:-}"; }
+hist_count() { eval "echo \${M_C_$1:-}"; }
+hist_avg() {
+    eval "s=\${M_S_$1:-0}; c=\${M_C_$1:-0}"
+    [ -n "$c" ] && [ "$c" != "0" ] && echo "scale=6; $s / $c" | bc 2>/dev/null || echo "0"
+}
+
+# Formatting helpers
+fmt_ms() {
+    [ -z "$1" ] || [ "$1" = "0" ] && { echo "N/A"; return; }
+    printf "%.2f" "$(echo "scale=6; $1 * 1000" | bc 2>/dev/null)"
+}
+fmt_num() {
+    [ -z "$1" ] && { echo "0"; return; }
+    printf "%'d" "${1%.*}" 2>/dev/null || echo "0"
+}
+fmt_bytes() {
+    [ -z "$1" ] && { echo "0 B"; return; }
+    b="${1%.*}"
+    [ "$b" -le 0 ] 2>/dev/null && { echo "0 B"; return; }
+    if [ "$b" -ge 1048576 ]; then
+        printf "%.2f MB" "$(echo "scale=2; $b / 1048576" | bc)"
+    elif [ "$b" -ge 1024 ]; then
+        printf "%.2f KB" "$(echo "scale=2; $b / 1024" | bc)"
+    else
+        printf "%d B" "$b"
+    fi
+}
 
 # Header
 echo ""
@@ -33,8 +94,9 @@ GAP=$(metric 'stateless_validator_validation_lag')
 echo ""
 echo "  CHAIN"
 echo "───────────────────────────────────────────────────────────────"
+REORGS=$(metric 'stateless_validator_reorgs_detected_total')
 printf "   %-20s %-15s %-20s %s\n" "Local: $(fmt_num "$LOCAL")" "Remote: $(fmt_num "$REMOTE")" \
-    "Gap: ${GAP:-0}$( [ "${GAP:-0}" -eq 0 ] && echo ' ✓' || echo ' blocks')" "Reorgs: $(metric 'stateless_validator_reorgs_detected_total' || echo 0)"
+    "Gap: ${GAP:-0}$( [ "${GAP:-0}" -eq 0 ] && echo ' ✓' || echo ' blocks')" "Reorgs: ${REORGS:-0}"
 
 # Performance
 VAL_SUM=$(hist_sum 'stateless_validator_block_validation_time_seconds')
@@ -57,7 +119,7 @@ if [ -n "$VAL_COUNT" ] && [ "$VAL_COUNT" != "0" ]; then
     WITNESS_VERIFY=$(hist_avg 'stateless_validator_witness_verify_time_seconds')
     BLOCK_REPLAY=$(hist_avg 'stateless_validator_block_replay_time_seconds')
     SALT_UPDATE=$(hist_avg 'stateless_validator_salt_update_time_seconds')
-    printf "   Phases (avg): Witness: %s ms | Replay: %s ms | State: %s ms \n" \
+    printf "   Phases (avg): Witness: %s ms | Replay: %s ms | Salt Update: %s ms\n" \
         "$(fmt_ms "$WITNESS_VERIFY")" "$(fmt_ms "$BLOCK_REPLAY")" "$(fmt_ms "$SALT_UPDATE")"
 else
     echo "   No data yet"
@@ -126,8 +188,21 @@ echo "$METRICS" | grep "^stateless_validator_rpc_requests_total{" | while read -
     printf "   %-28s %s\n" "$METHOD:" "$(fmt_num "$COUNT")"
 done
 
-ERRORS=$(echo "$METRICS" | grep "^stateless_validator_rpc_errors_total{" | awk '{sum += $2} END {print int(sum)}')
-[ "${ERRORS:-0}" -gt 0 ] && echo "   Errors: $ERRORS" || echo "   Errors: None ✓"
+# RPC Errors with detail by method
+ERROR_LINES=$(echo "$METRICS" | grep "^stateless_validator_rpc_errors_total{")
+TOTAL_ERRORS=$(echo "$ERROR_LINES" | awk '{sum += $2} END {print int(sum)}')
+if [ "${TOTAL_ERRORS:-0}" -gt 0 ]; then
+    echo ""
+    echo "  RPC ERRORS (Total: $TOTAL_ERRORS)"
+    echo "───────────────────────────────────────────────────────────────"
+    echo "$ERROR_LINES" | while read -r line; do
+        METHOD=$(echo "$line" | sed 's/.*method="\([^"]*\)".*/\1/')
+        COUNT=$(echo "$line" | awk '{print $2}' | cut -d'.' -f1)
+        [ "${COUNT:-0}" -gt 0 ] && printf "   %-28s %s\n" "$METHOD:" "$(fmt_num "$COUNT")"
+    done
+else
+    echo "   Errors: None ✓"
+fi
 
 # Workers
 echo ""
