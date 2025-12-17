@@ -444,7 +444,6 @@ async fn chain_sync(
                 (validator_db.get_local_tip(), validator_db.get_remote_tip())
             {
                 let remote_height = remote_tip.map(|(n, _)| n).unwrap_or(local_tip);
-                // The overhead is negligible when metrics are disabled
                 metrics::set_chain_heights(local_tip, remote_height);
             }
 

@@ -196,7 +196,7 @@ impl RpcClient {
         // MptWitness: storage_root (32 bytes) + sum of state bytes
         let mpt_size = 32 + mpt_witness.state.iter().map(|b| b.len()).sum::<usize>();
 
-        metrics::on_witness_stats(salt_size, kvs_count, salt_kvs_size, mpt_size);
+        metrics::on_witness_fetch(salt_size, kvs_count, salt_kvs_size, mpt_size);
 
         Ok((witness, mpt_witness))
     }

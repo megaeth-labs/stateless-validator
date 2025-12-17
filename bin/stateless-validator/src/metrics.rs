@@ -225,7 +225,7 @@ pub fn on_blocks_pruned(count: u64) {
 }
 
 // Witness metrics
-pub fn on_witness_stats(salt_size: usize, keys_count: usize, kvs_size: usize, mpt_size: usize) {
+pub fn on_witness_fetch(salt_size: usize, keys_count: usize, kvs_size: usize, mpt_size: usize) {
     histogram!(names::SALT_WITNESS_SIZE).record(salt_size as f64);
     histogram!(names::SALT_WITNESS_KEYS).record(keys_count as f64);
     histogram!(names::SALT_WITNESS_KVS_SIZE).record(kvs_size as f64);
