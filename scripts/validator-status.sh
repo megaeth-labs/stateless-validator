@@ -157,16 +157,16 @@ RATE=$( [ "$TOTAL" -gt 0 ] && echo "$(echo "scale=1; ${HITS:-0} * 100 / $TOTAL" 
 printf "   Hits: %s | Misses: %s | Rate: %s\n" "$(fmt_num "$HITS")" "${MISSES:-0}" "$RATE"
 
 # Witness Stats
-SALT_SIZE=$(hist_avg 'stateless_validator_witness_salt_size_bytes')
-SALT_KEYS=$(hist_avg 'stateless_validator_witness_salt_keys')
-SALT_KVS_SIZE=$(hist_avg 'stateless_validator_witness_salt_kvs_bytes')
-MPT_SIZE=$(hist_avg 'stateless_validator_witness_mpt_size_bytes')
+SALT_SIZE=$(hist_avg 'stateless_validator_salt_witness_size_bytes')
+SALT_KEYS=$(hist_avg 'stateless_validator_salt_witness_keys')
+SALT_KVS_SIZE=$(hist_avg 'stateless_validator_salt_witness_kvs_bytes')
+MPT_SIZE=$(hist_avg 'stateless_validator_mpt_witness_size_bytes')
 
 echo ""
 echo "  WITNESS (avg per block)"
 echo "───────────────────────────────────────────────────────────────"
-printf "   Keys: %s | Salt: %s | KVs: %s | MPT: %s\n" \
-    "$(fmt_num "$SALT_KEYS")" "$(fmt_bytes "$SALT_SIZE")" "$(fmt_bytes "$SALT_KVS_SIZE")" "$(fmt_bytes "$MPT_SIZE")"
+printf "   Salt: %s | Keys: %s | KVs: %s | MPT: %s\n" \
+    "$(fmt_bytes "$SALT_SIZE")" "$(fmt_num "$SALT_KEYS")" "$(fmt_bytes "$SALT_KVS_SIZE")" "$(fmt_bytes "$MPT_SIZE")"
 
 # State Access
 STATE_READS=$(hist_avg 'stateless_validator_block_state_reads')

@@ -106,32 +106,35 @@ The validator exposes Prometheus-compatible metrics for monitoring performance, 
 
 Once enabled, metrics are available at `http://0.0.0.0:9090/metrics` for Prometheus scraping.
 
-| Metric                                              | Type      | Description                                                          |
-| --------------------------------------------------- | --------- | -------------------------------------------------------------------- |
-| `stateless_validator_block_validation_time_seconds` | Histogram | Block validation time                                                |
+| Metric                                                  | Type      | Description                                                          |
+| ------------------------------------------------------- | --------- | -------------------------------------------------------------------- |
+| `stateless_validator_block_validation_time_seconds`     | Histogram | Block validation time                                                |
 | `stateless_validator_witness_verification_time_seconds` | Histogram | Witness verification time                                            |
-| `stateless_validator_block_replay_time_seconds`     | Histogram | EVM execution time                                                   |
-| `stateless_validator_salt_update_time_seconds`      | Histogram | SALT update time                                                     |
-| `stateless_validator_transactions_total`            | Counter   | Total transactions validated                                         |
-| `stateless_validator_gas_used_total`                | Counter   | Total gas used in validated blocks                                   |
-| `stateless_validator_block_state_reads`             | Histogram | State reads per block                                                |
-| `stateless_validator_block_state_writes`            | Histogram | State writes per block                                               |
-| `stateless_validator_worker_tasks_completed_total`  | Counter   | Tasks completed per worker (with `worker_id` label)                  |
-| `stateless_validator_worker_tasks_failed_total`     | Counter   | Tasks failed per worker (with `worker_id` label)                     |
-| `stateless_validator_local_chain_height`            | Gauge     | Current height of local chain                                        |
-| `stateless_validator_remote_chain_height`           | Gauge     | Current height of remote chain tracker                               |
-| `stateless_validator_validation_lag`                | Gauge     | Blocks pending validation (remote - local)                           |
-| `stateless_validator_reorgs_detected_total`         | Counter   | Chain reorgs detected                                                |
-| `stateless_validator_reorg_depth`                   | Histogram | Depth of chain reorganizations                                       |
-| `stateless_validator_rpc_requests_total`            | Counter   | Total RPC requests (with `method` label)                             |
-| `stateless_validator_rpc_errors_total`              | Counter   | RPC errors (with `method` label)                                     |
-| `stateless_validator_block_fetch_time_seconds`      | Histogram | Block fetch time                                                     |
-| `stateless_validator_witness_fetch_time_seconds`    | Histogram | Witness fetch time                                                   |
-| `stateless_validator_code_fetch_time_seconds`       | Histogram | Contract code fetch time (includes optional `type="per_code"` label) |
-| `stateless_validator_contract_cache_hits_total`     | Counter   | Contract cache hits                                                  |
-| `stateless_validator_contract_cache_misses_total`   | Counter   | Contract cache misses                                                |
-| `stateless_validator_blocks_pruned_total`           | Counter   | Blocks pruned from history                                           |
-| `stateless_validator_witness_salt_keys`             | Histogram | Salt witness key count                                               |
+| `stateless_validator_block_replay_time_seconds`         | Histogram | EVM execution time                                                   |
+| `stateless_validator_salt_update_time_seconds`          | Histogram | SALT update time                                                     |
+| `stateless_validator_transactions_total`                | Counter   | Total transactions validated                                         |
+| `stateless_validator_gas_used_total`                    | Counter   | Total gas used in validated blocks                                   |
+| `stateless_validator_block_state_reads`                 | Histogram | State reads per block                                                |
+| `stateless_validator_block_state_writes`                | Histogram | State writes per block                                               |
+| `stateless_validator_worker_tasks_completed_total`      | Counter   | Tasks completed per worker (with `worker_id` label)                  |
+| `stateless_validator_worker_tasks_failed_total`         | Counter   | Tasks failed per worker (with `worker_id` label)                     |
+| `stateless_validator_local_chain_height`                | Gauge     | Current height of local chain                                        |
+| `stateless_validator_remote_chain_height`               | Gauge     | Current height of remote chain tracker                               |
+| `stateless_validator_validation_lag`                    | Gauge     | Blocks pending validation (remote - local)                           |
+| `stateless_validator_reorgs_detected_total`             | Counter   | Chain reorgs detected                                                |
+| `stateless_validator_reorg_depth`                       | Histogram | Depth of chain reorganizations                                       |
+| `stateless_validator_rpc_requests_total`                | Counter   | Total RPC requests (with `method` label)                             |
+| `stateless_validator_rpc_errors_total`                  | Counter   | RPC errors (with `method` label)                                     |
+| `stateless_validator_block_fetch_time_seconds`          | Histogram | Block fetch time                                                     |
+| `stateless_validator_witness_fetch_time_seconds`        | Histogram | Witness fetch time                                                   |
+| `stateless_validator_code_fetch_time_seconds`           | Histogram | Contract code fetch time (includes optional `type="per_code"` label) |
+| `stateless_validator_contract_cache_hits_total`         | Counter   | Contract cache hits                                                  |
+| `stateless_validator_contract_cache_misses_total`       | Counter   | Contract cache misses                                                |
+| `stateless_validator_blocks_pruned_total`               | Counter   | Blocks pruned from history                                           |
+| `stateless_validator_salt_witness_keys`                 | Histogram | Salt witness key count                                               |
+| `stateless_validator_salt_witness_size_bytes`           | Histogram | Salt witness size (bytes)                                            |
+| `stateless_validator_salt_witness_kvs_bytes`            | Histogram | Salt witness KVs size (bytes)                                        |
+| `stateless_validator_mpt_witness_size_bytes`            | Histogram | MPT witness size (bytes)                                             |
 
 **Example Prometheus configuration:**
 

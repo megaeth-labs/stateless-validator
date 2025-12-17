@@ -936,14 +936,14 @@ impl ValidatorDB {
 }
 
 /// Helper method to serialize data using bincode with legacy config
-pub fn encode_to_vec<T: serde::Serialize>(data: &T) -> Result<Vec<u8>> {
+fn encode_to_vec<T: serde::Serialize>(data: &T) -> Result<Vec<u8>> {
     let encoded = bincode::serde::encode_to_vec(data, bincode::config::legacy())
         .map_err(SerializationError::from)?;
     Ok(encoded)
 }
 
 /// Helper method to deserialize data using bincode with legacy config
-pub fn decode_from_slice<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
+fn decode_from_slice<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
     let (decoded, _) = bincode::serde::decode_from_slice(bytes, bincode::config::legacy())
         .expect("serialization of previously stored data must succeed");
     decoded

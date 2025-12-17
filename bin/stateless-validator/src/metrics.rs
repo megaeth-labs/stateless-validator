@@ -58,10 +58,10 @@ pub mod names {
     metric!(BLOCKS_PRUNED, "blocks_pruned_total");
 
     // Witness
-    metric!(WITNESS_SALT_SIZE, "witness_salt_size_bytes");
-    metric!(WITNESS_SALT_KEYS, "witness_salt_keys");
-    metric!(WITNESS_SALT_KVS_SIZE, "witness_salt_kvs_bytes");
-    metric!(WITNESS_MPT_SIZE, "witness_mpt_size_bytes");
+    metric!(SALT_WITNESS_SIZE, "salt_witness_size_bytes");
+    metric!(SALT_WITNESS_KEYS, "salt_witness_keys");
+    metric!(SALT_WITNESS_KVS_SIZE, "salt_witness_kvs_bytes");
+    metric!(MPT_WITNESS_SIZE, "mpt_witness_size_bytes");
 }
 
 /// Initialize the Prometheus metrics exporter at the given address.
@@ -118,11 +118,11 @@ fn register_metric_descriptions() {
     describe_counter!(names::BLOCKS_PRUNED, "Blocks pruned from history");
 
     // Witness
-    describe_histogram!(names::WITNESS_SALT_SIZE, "Salt witness size (bytes)");
-    describe_histogram!(names::WITNESS_MPT_SIZE, "MPT witness size (bytes)");
-    describe_histogram!(names::WITNESS_SALT_KEYS, "Salt witness key count");
+    describe_histogram!(names::SALT_WITNESS_SIZE, "Salt witness size (bytes)");
+    describe_histogram!(names::MPT_WITNESS_SIZE, "MPT witness size (bytes)");
+    describe_histogram!(names::SALT_WITNESS_KEYS, "Salt witness key count");
     describe_histogram!(
-        names::WITNESS_SALT_KVS_SIZE,
+        names::SALT_WITNESS_KVS_SIZE,
         "Salt witness KVs size (bytes)"
     );
 }
@@ -226,8 +226,8 @@ pub fn on_blocks_pruned(count: u64) {
 
 // Witness metrics
 pub fn on_witness_stats(salt_size: usize, keys_count: usize, kvs_size: usize, mpt_size: usize) {
-    histogram!(names::WITNESS_SALT_SIZE).record(salt_size as f64);
-    histogram!(names::WITNESS_SALT_KEYS).record(keys_count as f64);
-    histogram!(names::WITNESS_SALT_KVS_SIZE).record(kvs_size as f64);
-    histogram!(names::WITNESS_MPT_SIZE).record(mpt_size as f64);
+    histogram!(names::SALT_WITNESS_SIZE).record(salt_size as f64);
+    histogram!(names::SALT_WITNESS_KEYS).record(keys_count as f64);
+    histogram!(names::SALT_WITNESS_KVS_SIZE).record(kvs_size as f64);
+    histogram!(names::MPT_WITNESS_SIZE).record(mpt_size as f64);
 }
