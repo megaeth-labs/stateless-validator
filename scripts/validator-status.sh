@@ -80,10 +80,12 @@ fmt_bytes() {
 }
 
 # Header
+LINE="═══════════════════════════════════════════════════════════════════════════════"
+THIN="───────────────────────────────────────────────────────────────────────────────"
 echo ""
-echo "═══════════════════════════════════════════════════════════════"
-echo "                  STATELESS VALIDATOR STATUS"
-echo "═══════════════════════════════════════════════════════════════"
+echo "$LINE"
+echo "                       STATELESS VALIDATOR STATUS"
+echo "$LINE"
 echo "  URL: $METRICS_URL | $(date '+%Y-%m-%d %H:%M:%S')"
 
 # Chain Status
@@ -93,10 +95,11 @@ GAP=$(metric 'stateless_validator_validation_lag')
 
 echo ""
 echo "  CHAIN"
-echo "───────────────────────────────────────────────────────────────"
+echo "$THIN"
 REORGS=$(metric 'stateless_validator_reorgs_detected_total')
-printf "   %-20s %-15s %-20s %s\n" "Local: $(fmt_num "$LOCAL")" "Remote: $(fmt_num "$REMOTE")" \
-    "Gap: ${GAP:-0}$( [ "${GAP:-0}" -eq 0 ] && echo ' ✓' || echo ' blocks')" "Reorgs: ${REORGS:-0}"
+printf "   Local: %s | Remote: %s | Gap: %s | Reorgs: %s\n" \
+    "$(fmt_num "$LOCAL")" "$(fmt_num "$REMOTE")" \
+    "${GAP:-0}$( [ "${GAP:-0}" -eq 0 ] && echo ' ✓' || echo ' blocks')" "${REORGS:-0}"
 
 # Performance
 VAL_SUM=$(hist_sum 'stateless_validator_block_validation_time_seconds')
@@ -104,16 +107,31 @@ VAL_COUNT=$(hist_count 'stateless_validator_block_validation_time_seconds')
 VAL_P50=$(quantile 'stateless_validator_block_validation_time_seconds' '0.5')
 VAL_P95=$(quantile 'stateless_validator_block_validation_time_seconds' '0.95')
 VAL_P99=$(quantile 'stateless_validator_block_validation_time_seconds' '0.99')
+TOTAL_TX=$(metric 'stateless_validator_transactions_total')
+TOTAL_GAS=$(metric 'stateless_validator_gas_used_total')
 
 echo ""
-echo "  PERFORMANCE (Block Validation)"
-echo "───────────────────────────────────────────────────────────────"
+echo "  PERFORMANCE"
+echo "$THIN"
 if [ -n "$VAL_COUNT" ] && [ "$VAL_COUNT" != "0" ]; then
     AVG=$(echo "scale=6; $VAL_SUM / $VAL_COUNT" | bc 2>/dev/null)
-    BPS=$(echo "scale=2; 1 / $AVG" | bc 2>/dev/null)
-    printf "   Avg: %s ms | P50: %s ms | P95: %s ms | P99: %s ms\n" \
+    WORKER_COUNT=$(echo "$METRICS" | grep -c "^stateless_validator_worker_tasks_completed_total{" || echo "1")
+    [ "$WORKER_COUNT" -eq 0 ] && WORKER_COUNT=1
+
+    # Calculate throughput metrics:
+    # - BPS (blocks per second) = WORKER_COUNT / AVG
+    #   Since workers run in parallel, multiply single-worker throughput by worker count
+    # - TX_PER_BLOCK = total transactions / total blocks validated
+    # - TPS (transactions per second) = BPS * TX_PER_BLOCK
+    #   This is the theoretical max TPS the validator can sustain
+    BPS=$(echo "scale=2; $WORKER_COUNT / $AVG" | bc 2>/dev/null)
+    B=${VAL_COUNT%.*}
+    TX_PER_BLOCK=$(echo "scale=2; ${TOTAL_TX:-0} / $B" | bc 2>/dev/null)
+    TPS=$(echo "scale=2; $BPS * $TX_PER_BLOCK" | bc 2>/dev/null)
+
+    printf "   Validation: Avg: %s ms | P50: %s ms | P95: %s ms | P99: %s ms\n" \
         "$(fmt_ms "$AVG")" "$(fmt_ms "$VAL_P50")" "$(fmt_ms "$VAL_P95")" "$(fmt_ms "$VAL_P99")"
-    printf "   Throughput: %s blocks/sec\n" "$BPS"
+    printf "   Throughput: %s blocks/sec | %s TPS (with %d workers, %.2f tx/block)\n" "$BPS" "$TPS" "$WORKER_COUNT" "$TX_PER_BLOCK"
 
     # Validation phase breakdown
     WITNESS_VERIFY=$(hist_avg 'stateless_validator_witness_verification_time_seconds')
@@ -125,62 +143,10 @@ else
     echo "   No data yet"
 fi
 
-# Throughput
-BLOCKS=$(hist_count 'stateless_validator_block_validation_time_seconds')
-TOTAL_TX=$(metric 'stateless_validator_transactions_total')
-TOTAL_GAS=$(metric 'stateless_validator_gas_used_total')
-
-echo ""
-echo "  THROUGHPUT"
-echo "───────────────────────────────────────────────────────────────"
-printf "   Blocks: %s | TX: %s | Gas: %s\n" "$(fmt_num "$BLOCKS")" "$(fmt_num "$TOTAL_TX")" "$(fmt_num "$TOTAL_GAS")"
-if [ -n "$BLOCKS" ] && [ "${BLOCKS%.*}" -gt 0 ]; then
-    B=${BLOCKS%.*}
-    [ "${TOTAL_TX:-0}" -gt 0 ] && printf "   Avg TX/Block: %.2f\n" "$(echo "scale=2; $TOTAL_TX / $B" | bc)"
-fi
-
-# Timing Breakdown
-echo ""
-echo "   Fetch Latency (P50): Witness: $(fmt_ms "$(quantile 'stateless_validator_witness_fetch_time_seconds' '0.5')") ms | " \
-    "Block: $(fmt_ms "$(quantile 'stateless_validator_block_fetch_time_seconds' '0.5')") ms | " \
-    "Code: $(fmt_ms "$(quantile 'stateless_validator_code_fetch_time_seconds' '0.5')") ms"
-
-# Cache
-HITS=$(metric 'stateless_validator_contract_cache_hits_total')
-MISSES=$(metric 'stateless_validator_contract_cache_misses_total')
-
-echo ""
-echo "  CONTRACT CACHE"
-echo "───────────────────────────────────────────────────────────────"
-TOTAL=$((${HITS:-0} + ${MISSES:-0}))
-RATE=$( [ "$TOTAL" -gt 0 ] && echo "$(echo "scale=1; ${HITS:-0} * 100 / $TOTAL" | bc)%" || echo "N/A" )
-printf "   Hits: %s | Misses: %s | Rate: %s\n" "$(fmt_num "$HITS")" "${MISSES:-0}" "$RATE"
-
-# Witness Stats
-SALT_SIZE=$(hist_avg 'stateless_validator_salt_witness_size_bytes')
-SALT_KEYS=$(hist_avg 'stateless_validator_salt_witness_keys')
-SALT_KVS_SIZE=$(hist_avg 'stateless_validator_salt_witness_kvs_bytes')
-MPT_SIZE=$(hist_avg 'stateless_validator_mpt_witness_size_bytes')
-
-echo ""
-echo "  WITNESS (avg per block)"
-echo "───────────────────────────────────────────────────────────────"
-printf "   Salt: %s | Keys: %s | KVs: %s | MPT: %s\n" \
-    "$(fmt_bytes "$SALT_SIZE")" "$(fmt_num "$SALT_KEYS")" "$(fmt_bytes "$SALT_KVS_SIZE")" "$(fmt_bytes "$MPT_SIZE")"
-
-# State Access
-STATE_READS=$(hist_avg 'stateless_validator_block_state_reads')
-STATE_WRITES=$(hist_avg 'stateless_validator_block_state_writes')
-
-echo ""
-echo "  STATE ACCESS (avg per block)"
-echo "───────────────────────────────────────────────────────────────"
-printf "   Reads: %s | Writes: %s\n" "$(fmt_num "$STATE_READS")" "$(fmt_num "$STATE_WRITES")"
-
 # RPC
 echo ""
-echo "  RPC REQUESTS"
-echo "───────────────────────────────────────────────────────────────"
+echo "  RPC"
+echo "$THIN"
 echo "$METRICS" | grep "^stateless_validator_rpc_requests_total{" | while read -r line; do
     METHOD=$(echo "$line" | sed 's/.*method="\([^"]*\)".*/\1/')
     COUNT=$(echo "$line" | awk '{print $2}' | cut -d'.' -f1)
@@ -192,21 +158,68 @@ ERROR_LINES=$(echo "$METRICS" | grep "^stateless_validator_rpc_errors_total{")
 TOTAL_ERRORS=$(echo "$ERROR_LINES" | awk '{sum += $2} END {print int(sum)}')
 if [ "${TOTAL_ERRORS:-0}" -gt 0 ]; then
     echo ""
-    echo "  RPC ERRORS (Total: $TOTAL_ERRORS)"
-    echo "───────────────────────────────────────────────────────────────"
+    printf "   Errors (Total: %s):\n" "$TOTAL_ERRORS"
     echo "$ERROR_LINES" | while read -r line; do
         METHOD=$(echo "$line" | sed 's/.*method="\([^"]*\)".*/\1/')
         COUNT=$(echo "$line" | awk '{print $2}' | cut -d'.' -f1)
-        [ "${COUNT:-0}" -gt 0 ] && printf "   %-28s %s\n" "$METHOD:" "$(fmt_num "$COUNT")"
+        [ "${COUNT:-0}" -gt 0 ] && printf "      %-25s %s\n" "$METHOD:" "$(fmt_num "$COUNT")"
     done
 else
+    echo ""
     echo "   Errors: None ✓"
 fi
+
+# Timing Breakdown
+# Helper: use P50 if available, fallback to average if P50 is 0 but data exists
+latency_ms() {
+    local p50=$(quantile "$1" '0.5')
+    if [ -n "$p50" ] && [ "$p50" != "0" ]; then
+        fmt_ms "$p50"
+    else
+        # P50 is 0 or empty, try using average instead
+        local avg=$(hist_avg "$1")
+        if [ -n "$avg" ] && [ "$avg" != "0" ]; then
+            fmt_ms "$avg"
+        else
+            echo "N/A"
+        fi
+    fi
+}
+echo ""
+echo "   Fetch Latency (P50): Witness: $(latency_ms 'stateless_validator_witness_fetch_time_seconds') ms | " \
+    "Block: $(latency_ms 'stateless_validator_block_fetch_time_seconds') ms | " \
+    "Code: $(latency_ms 'stateless_validator_code_fetch_time_seconds') ms"
+
+# Cache
+HITS=$(metric 'stateless_validator_contract_cache_hits_total')
+MISSES=$(metric 'stateless_validator_contract_cache_misses_total')
+
+echo ""
+echo "  CONTRACT CACHE"
+echo "$THIN"
+TOTAL=$((${HITS:-0} + ${MISSES:-0}))
+RATE=$( [ "$TOTAL" -gt 0 ] && echo "$(echo "scale=1; ${HITS:-0} * 100 / $TOTAL" | bc)%" || echo "N/A" )
+printf "   Hits: %s | Misses: %s | Rate: %s\n" "$(fmt_num "$HITS")" "${MISSES:-0}" "$RATE"
+
+# Witness Stats
+SALT_SIZE=$(hist_avg 'stateless_validator_salt_witness_size_bytes')
+SALT_KEYS=$(hist_avg 'stateless_validator_salt_witness_keys')
+SALT_KVS_SIZE=$(hist_avg 'stateless_validator_salt_witness_kvs_bytes')
+MPT_SIZE=$(hist_avg 'stateless_validator_mpt_witness_size_bytes')
+STATE_READS=$(hist_avg 'stateless_validator_block_state_reads')
+STATE_WRITES=$(hist_avg 'stateless_validator_block_state_writes')
+
+echo ""
+echo "  WITNESS (avg per block)"
+echo "$THIN"
+printf "   Salt: %s | Keys: %s | KVs: %s | MPT: %s\n" \
+    "$(fmt_bytes "$SALT_SIZE")" "$(fmt_num "$SALT_KEYS")" "$(fmt_bytes "$SALT_KVS_SIZE")" "$(fmt_bytes "$MPT_SIZE")"
+printf "   State Reads: %s | State Writes: %s\n" "$(fmt_num "$STATE_READS")" "$(fmt_num "$STATE_WRITES")"
 
 # Workers
 echo ""
 echo "  WORKERS"
-echo "───────────────────────────────────────────────────────────────"
+echo "$THIN"
 WORKER_DATA=$(echo "$METRICS" | grep "^stateless_validator_worker_tasks_completed_total{" | \
     sed 's/.*worker_id="\([^"]*\)".* \([0-9.]*\)/\1 \2/' | sort -n)
 
@@ -230,5 +243,5 @@ PRUNED=$(metric 'stateless_validator_blocks_pruned_total')
 [ -n "$PRUNED" ] && [ "$PRUNED" != "0" ] && echo "" && echo "   Blocks Pruned: $(fmt_num "$PRUNED")"
 
 echo ""
-echo "═══════════════════════════════════════════════════════════════"
+echo "$LINE"
 echo ""
