@@ -18,7 +18,7 @@ use tokio::{signal, task};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use validator_core::{
-    ValidatorDB,
+    BlockLimitsOverrides, ValidatorDB,
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
     executor::{ValidationResult, validate_block},
@@ -168,6 +168,8 @@ pub struct ChainSyncConfig {
     pub metrics_enabled: bool,
     /// Port for Prometheus metrics HTTP endpoint
     pub metrics_port: u16,
+    /// Block limits overrides for testing purposes only
+    pub block_limits_overrides: BlockLimitsOverrides,
 }
 
 impl Default for ChainSyncConfig {
@@ -186,6 +188,7 @@ impl Default for ChainSyncConfig {
             report_validation_results: false,
             metrics_enabled: false,
             metrics_port: metrics::DEFAULT_METRICS_PORT,
+            block_limits_overrides: BlockLimitsOverrides::default(),
         }
     }
 }
@@ -228,6 +231,33 @@ struct CommandLineArgs {
     /// Port for Prometheus metrics HTTP endpoint.
     #[clap(long, env = "STATELESS_VALIDATOR_METRICS_PORT", default_value_t = metrics::DEFAULT_METRICS_PORT)]
     metrics_port: u16,
+}
+
+/// Reads block limits overrides from environment variables.
+///
+/// These overrides allow testing with different block limit parameters without
+/// modifying the chain specification. DO NOT USE IN PRODUCTION.
+///
+/// Environment variables:
+/// - `STATELESS_VALIDATOR_BLOCK_TXS_DATA_LIMIT_ONLY_TESTING`: Override block transaction data size limit
+/// - `STATELESS_VALIDATOR_BLOCK_KV_UPDATE_LIMIT_ONLY_TESTING`: Override block KV update limit
+/// - `STATELESS_VALIDATOR_BLOCK_STATE_GROWTH_LIMIT_ONLY_TESTING`: Override block state growth limit
+fn read_block_limits_overrides_from_env() -> BlockLimitsOverrides {
+    fn parse_env_u64(var_name: &str) -> Option<u64> {
+        std::env::var(var_name).ok().and_then(|v| v.parse().ok())
+    }
+
+    BlockLimitsOverrides {
+        block_txs_data_limit: parse_env_u64(
+            "STATELESS_VALIDATOR_BLOCK_TXS_DATA_LIMIT_ONLY_TESTING",
+        ),
+        block_kv_update_limit: parse_env_u64(
+            "STATELESS_VALIDATOR_BLOCK_KV_UPDATE_LIMIT_ONLY_TESTING",
+        ),
+        block_state_growth_limit: parse_env_u64(
+            "STATELESS_VALIDATOR_BLOCK_STATE_GROWTH_LIMIT_ONLY_TESTING",
+        ),
+    }
 }
 
 fn main() -> Result<()> {
@@ -328,6 +358,7 @@ async fn run() -> Result<()> {
         report_validation_results: args.report_validation_results,
         metrics_enabled: args.metrics_enabled,
         metrics_port: args.metrics_port,
+        block_limits_overrides: read_block_limits_overrides_from_env(),
         ..ChainSyncConfig::default()
     });
     info!(
@@ -702,7 +733,15 @@ async fn validation_worker(
 ) -> Result<()> {
     info!("[Worker {}] Started", worker_id);
     loop {
-        match validate_one(worker_id, &client, &validator_db, chain_spec.clone()).await {
+        match validate_one(
+            worker_id,
+            &client,
+            &validator_db,
+            chain_spec.clone(),
+            &config.block_limits_overrides,
+        )
+        .await
+        {
             Ok(true) => {}
             Ok(false) => {
                 // No tasks available, wait before checking again
@@ -730,6 +769,7 @@ async fn validation_worker(
 /// * `client` - RPC client for fetching contract bytecode from remote nodes
 /// * `validator_db` - Database for tasks and data
 /// * `chain_spec` - Chain specification defining the EVM rules and parameters
+/// * `block_limits_overrides` - Block limits overrides for testing purposes only
 ///
 /// # Returns
 /// * `Ok(true)` - Task was processed (validation success/failure stored in DB)
@@ -740,6 +780,7 @@ async fn validate_one(
     client: &RpcClient,
     validator_db: &ValidatorDB,
     chain_spec: Arc<ChainSpec>,
+    block_limits_overrides: &BlockLimitsOverrides,
 ) -> Result<bool> {
     match validator_db.get_next_task()? {
         Some((block, witness, mpt_witness)) => {
@@ -790,9 +831,24 @@ async fn validate_one(
                 "Withdrawals root not found in block {block_hash}"
             ))?;
 
+            // Convert to core BlockLimitsOverrides for validate_block call
+            let core_overrides = BlockLimitsOverrides {
+                block_txs_data_limit: block_limits_overrides.block_txs_data_limit,
+                block_kv_update_limit: block_limits_overrides.block_kv_update_limit,
+                block_state_growth_limit: block_limits_overrides.block_state_growth_limit,
+            };
+
             // Validate in a blocking thread so async tasks (reporter, tracker, etc.) stay responsive.
             let validation_result = task::spawn_blocking(move || {
-                validate_block(&chain_spec, &block, witness, mpt_witness, &contracts, None)
+                validate_block(
+                    &chain_spec,
+                    &block,
+                    witness,
+                    mpt_witness,
+                    &contracts,
+                    None,
+                    &core_overrides,
+                )
             })
             .await
             .map_err(|e| eyre::eyre!("Validation task panicked: {e}"))?;

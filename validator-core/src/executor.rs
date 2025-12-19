@@ -73,6 +73,48 @@ use crate::{
     withdrawals::{self, ADDRESS_L2_TO_L1_MESSAGE_PASSER, MptWitness},
 };
 
+/// Block limits override configuration for testing purposes.
+///
+/// These overrides allow testing with different block limit parameters without
+/// modifying the chain specification. DO NOT USE IN PRODUCTION.
+#[derive(Debug, Clone, Default)]
+pub struct BlockLimitsOverrides {
+    /// Override block transaction data size limit
+    pub block_txs_data_limit: Option<u64>,
+    /// Override block KV update limit
+    pub block_kv_update_limit: Option<u64>,
+    /// Override block state growth limit
+    pub block_state_growth_limit: Option<u64>,
+}
+
+impl BlockLimitsOverrides {
+    /// Applies overrides to a `BlockLimits` instance, logging warnings for testing overrides.
+    pub fn apply(&self, mut limits: BlockLimits) -> BlockLimits {
+        if let Some(v) = self.block_txs_data_limit {
+            debug!(
+                "[BlockLimitsOverrides] Overriding block transaction data size limit to {}",
+                v
+            );
+            limits = limits.with_block_txs_data_limit(v);
+        }
+        if let Some(v) = self.block_kv_update_limit {
+            debug!(
+                "[BlockLimitsOverrides] Overriding block KV update limit to {}",
+                v
+            );
+            limits = limits.with_block_kv_update_limit(v);
+        }
+        if let Some(v) = self.block_state_growth_limit {
+            debug!(
+                "[BlockLimitsOverrides] Overriding block state growth limit to {}",
+                v
+            );
+            limits = limits.with_block_state_growth_limit(v);
+        }
+        limits
+    }
+}
+
 /// Errors that can occur during block validation.
 #[derive(Debug, Error)]
 pub enum ValidationError {
@@ -278,6 +320,7 @@ pub fn replay_block<DB, ENV, E>(
     db: &DB,
     env_oracle: ENV,
     trace_writer: Option<Box<dyn Write>>,
+    block_limits_overrides: &BlockLimitsOverrides,
 ) -> Result<(HashMap<Address, BundleAccount>, BlockExecutionOutput), ValidationError>
 where
     DB: DatabaseRef<Error = E> + Debug,
@@ -312,6 +355,9 @@ where
     } else {
         BlockLimits::no_limits().with_block_gas_limit(block.header.gas_limit)
     };
+
+    // Apply block limits overrides for testing purposes
+    let block_limits = block_limits_overrides.apply(block_limits);
 
     let execution_context = MegaBlockExecutionCtx::new(
         block.header.parent_hash,
@@ -430,6 +476,7 @@ where
 /// * `contracts` - Contract bytecode cache for transaction execution
 /// * `writer` - Optional writer for EIP-3155 trace output. When provided, enables
 ///   step-by-step EVM execution tracing in EIP-3155 format.
+/// * `block_limits_overrides` - Optional overrides for block limits (for testing only)
 ///
 /// # Returns
 ///
@@ -442,6 +489,7 @@ pub fn validate_block(
     mpt_witness: MptWitness,
     contracts: &std::collections::HashMap<B256, Bytecode>,
     writer: Option<Box<dyn Write>>,
+    block_limits_overrides: &BlockLimitsOverrides,
 ) -> Result<ValidationStats, ValidationError> {
     // Create external environment oracle from salt witness
     let ext_env = WitnessExternalEnv::new(&salt_witness, block.header.number)
@@ -461,7 +509,14 @@ pub fn validate_block(
         witness: &witness,
         contracts,
     };
-    let (accounts, output) = replay_block(chain_spec, block, &witness_db, ext_env, writer)?;
+    let (accounts, output) = replay_block(
+        chain_spec,
+        block,
+        &witness_db,
+        ext_env,
+        writer,
+        block_limits_overrides,
+    )?;
     let block_replay_time = start.elapsed().as_secs_f64() - witness_verification_time;
 
     // Extract and hash storage updates (only changed values)

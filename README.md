@@ -78,6 +78,14 @@ Each command-line flag has an equivalent environment variable, which allows you 
 - `STATELESS_VALIDATOR_LOG_FILE`: Log level for file output (debug|info|warn|error, default: debug)
 - `STATELESS_VALIDATOR_LOG_STDOUT`: Log level for console output (debug|info|warn|error, default: info)
 
+**Testing-Only Block Limits Overrides:**
+
+These environment variables override block execution limits for testing purposes. **DO NOT USE IN PRODUCTION.**
+
+- `STATELESS_VALIDATOR_BLOCK_TXS_DATA_LIMIT_ONLY_TESTING`: Override block transaction data size limit
+- `STATELESS_VALIDATOR_BLOCK_KV_UPDATE_LIMIT_ONLY_TESTING`: Override block KV update limit
+- `STATELESS_VALIDATOR_BLOCK_STATE_GROWTH_LIMIT_ONLY_TESTING`: Override block state growth limit
+
 Log levels: **DEBUG** (detailed diagnostics), **INFO** (key operations), **WARN** (non-critical issues), **ERROR** (serious failures). For production, use `info` for terminal output and `debug` for file logging.
 
 Example:

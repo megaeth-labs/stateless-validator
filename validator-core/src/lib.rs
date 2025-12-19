@@ -22,6 +22,7 @@ pub mod data_types;
 pub use data_types::{PlainKey, PlainValue};
 pub mod executor;
 pub use executor::{
-    ValidationError, ValidationResult, ValidationStats, replay_block, validate_block,
+    BlockLimitsOverrides, ValidationError, ValidationResult, ValidationStats, replay_block,
+    validate_block,
 };
 pub mod withdrawals;
