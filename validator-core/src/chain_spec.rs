@@ -108,6 +108,8 @@ pub struct MegaethGenesisHardforks {
     pub mini_rex_2_time: Option<u64>,
     /// Rex hardfork timestamp.
     pub rex_time: Option<u64>,
+    /// Rex1 hardfork timestamp.
+    pub rex_1_time: Option<u64>,
 }
 
 impl MegaethGenesisHardforks {
@@ -135,6 +137,10 @@ impl MegaethGenesisHardforks {
                 MegaHardfork::Rex.boxed(),
                 self.rex_time.map(ForkCondition::Timestamp),
             ),
+            (
+                MegaHardfork::Rex1.boxed(),
+                self.rex_1_time.map(ForkCondition::Timestamp),
+            ),
         ]
         .into_iter()
         .filter_map(|(hardfork, condition)| condition.map(|c| (hardfork, c)))
@@ -150,6 +156,7 @@ pub static MEGA_MAINNET_HARDFORKS: std::sync::LazyLock<ChainHardforks> =
             (MegaHardfork::MiniRex1.boxed(), ForkCondition::Timestamp(0)),
             (MegaHardfork::MiniRex2.boxed(), ForkCondition::Timestamp(0)),
             (MegaHardfork::Rex.boxed(), ForkCondition::Timestamp(0)),
+            (MegaHardfork::Rex1.boxed(), ForkCondition::Timestamp(0)),
         ])
     });
 
@@ -230,7 +237,8 @@ mod tests {
           "miniRexTime": 1,
           "miniRex1Time": 2,
           "miniRex2Time": 3,
-          "rexTime": 2
+          "rexTime": 4,
+          "rex1Time": 5
         }
         "#;
         let fields = serde_json::from_str::<OtherFields>(genesis_info).unwrap();
@@ -238,6 +246,7 @@ mod tests {
         assert_eq!(hardforks.mini_rex_time, Some(1));
         assert_eq!(hardforks.mini_rex_1_time, Some(2));
         assert_eq!(hardforks.mini_rex_2_time, Some(3));
-        assert_eq!(hardforks.rex_time, Some(2));
+        assert_eq!(hardforks.rex_time, Some(4));
+        assert_eq!(hardforks.rex_1_time, Some(5));
     }
 }
