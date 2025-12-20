@@ -53,6 +53,7 @@ fn init_logging() -> Result<()> {
         .with_writer(std::io::stdout)
         .with_filter(
             EnvFilter::new("warn")
+                .add_directive(format!("validator_core={}", stdout_filter).parse()?)
                 .add_directive(format!("stateless_validator={}", stdout_filter).parse()?),
         )
         .boxed();
@@ -74,6 +75,7 @@ fn init_logging() -> Result<()> {
             ))
             .with_filter(
                 EnvFilter::new("warn")
+                    .add_directive(format!("validator_core={}", file_filter).parse()?)
                     .add_directive(format!("stateless_validator={}", file_filter).parse()?),
             )
             .boxed();

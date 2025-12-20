@@ -64,6 +64,7 @@ use revm::{
 use salt::{EphemeralSaltState, SaltValue, SaltWitness, StateRoot, StateUpdates, Witness};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tracing::debug;
 
 use crate::{
     chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec},
@@ -302,6 +303,10 @@ where
     );
 
     let hardfork = chain_spec.hardfork(block.header.timestamp);
+    debug!(
+        "[Replay Block] block_number={}, block_hash={:?}, hardfork={:?}",
+        block.header.number, block.header.hash, hardfork
+    );
     let block_limits = if let Some(hardfork) = hardfork {
         BlockLimits::from_hardfork_and_block_gas_limit(hardfork, block.header.gas_limit)
     } else {
