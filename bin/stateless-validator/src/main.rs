@@ -14,7 +14,7 @@ use futures::future;
 use op_alloy_rpc_types::Transaction;
 use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
 use salt::SaltWitness;
-use tokio::{signal, task};
+use tokio::{runtime::Runtime, signal, task};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use validator_core::{
@@ -230,9 +230,19 @@ struct CommandLineArgs {
     metrics_port: u16,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     init_logging()?;
+
+    let rt = Runtime::new()?;
+    let result = rt.block_on(async_main());
+
+    // Force shutdown after 5 seconds to avoid hanging on spawn_blocking tasks
+    rt.shutdown_timeout(Duration::from_secs(5));
+
+    result
+}
+
+async fn async_main() -> Result<()> {
     let start = Instant::now();
     let args = CommandLineArgs::parse();
 
@@ -322,10 +332,15 @@ async fn main() -> Result<()> {
 
     let validator_logic = chain_sync(client.clone(), validator_db.clone(), config, chain_spec);
 
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .expect("Failed to register SIGTERM handler");
     tokio::select! {
         res = validator_logic => res?,
         _ = signal::ctrl_c() => {
-            info!("[Main] Ctrl-C received, shutting down.");
+            info!("[Main] SIGINT received, shutting down.");
+        }
+        _ = sigterm.recv() => {
+            info!("[Main] SIGTERM received, shutting down.");
         }
     }
 
