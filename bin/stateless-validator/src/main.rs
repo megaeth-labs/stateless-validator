@@ -290,6 +290,10 @@ async fn run() -> Result<()> {
             .map_err(|e| anyhow!("Failed to fetch block {}: {}", block_hash, e))?;
 
         validator_db
+            .set_start_block(block.header.number, block.header.hash)
+            .map_err(|e| anyhow!("Failed to set start block: {}", e))?;
+
+        validator_db
             .reset_anchor_block(
                 block.header.number,
                 block.header.hash,
@@ -856,13 +860,11 @@ async fn validation_reporter(
         tokio::time::sleep(config.sync_poll_interval).await;
 
         // Get canonical chain bounds
-        let (first_block, last_block) = match (
-            validator_db.get_earliest_local_block(),
-            validator_db.get_local_tip(),
-        ) {
-            (Ok(Some(first)), Ok(Some(last))) => (first, last),
-            _ => continue,
-        };
+        let (first_block, last_block) =
+            match (validator_db.get_start_block(), validator_db.get_local_tip()) {
+                (Ok(Some(first)), Ok(Some(last))) => (first, last),
+                _ => continue,
+            };
 
         // Skip if no new blocks
         if last_block == last_reported_block {
@@ -884,16 +886,16 @@ async fn validation_reporter(
             Ok(response) => {
                 // Check for validation gap
                 if response.last_validated_block.0 < first_block.0 {
+                    error!(
+                        "[Reporter] Report rejected for blocks {first_block:?}-{last_block:?}, upstream at {:?}",
+                        response.last_validated_block
+                    );
                     return Err(anyhow!(
                         "Validation gap detected: upstream at block {}, but local chain starts at {}. Cannot advance validation.",
                         response.last_validated_block.0,
                         first_block.0
                     ));
                 }
-                error!(
-                    "[Reporter] Report rejected for blocks {first_block:?}-{last_block:?}, upstream at {:?}",
-                    response.last_validated_block
-                );
             }
             Err(e) => {
                 error!("[Reporter] Failed to report blocks: {e}");
