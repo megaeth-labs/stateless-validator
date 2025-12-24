@@ -14,7 +14,7 @@ use futures::future;
 use op_alloy_rpc_types::Transaction;
 use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
 use salt::SaltWitness;
-use tokio::{runtime::Runtime, signal, task};
+use tokio::{signal, task};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use validator_core::{
@@ -232,16 +232,22 @@ struct CommandLineArgs {
 
 fn main() -> Result<()> {
     init_logging()?;
-
-    let rt = Runtime::new()?;
-    let result = rt.block_on(async_main());
-    // Force shutdown after 5 seconds to avoid hanging on spawn_blocking tasks
-    rt.shutdown_timeout(Duration::from_secs(5));
-
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| anyhow!("Failed to build Tokio runtime: {e}"))?;
+    let timeout = Duration::from_secs(1);
+    let result = runtime.block_on(run());
+    let shutdown_start = Instant::now();
+    runtime.shutdown_timeout(timeout);
+    if shutdown_start.elapsed() >= timeout {
+        warn!(
+            "[Main] Tokio runtime shutdown reached the {:?} timeout.",
+            timeout
+        );
+    }
     result
 }
 
-async fn async_main() -> Result<()> {
+async fn run() -> Result<()> {
     let start = Instant::now();
     let args = CommandLineArgs::parse();
 
@@ -332,7 +338,8 @@ async fn async_main() -> Result<()> {
     let validator_logic = chain_sync(client.clone(), validator_db.clone(), config, chain_spec);
 
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
-        .map_err(|e| anyhow!("[Main] Failed to register SIGTERM handler: {e}"))?;
+        .map_err(|e| anyhow!("Failed to register SIGTERM handler: {e}"))?;
+
     tokio::select! {
         res = validator_logic => res?,
         _ = signal::ctrl_c() => {
