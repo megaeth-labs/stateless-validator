@@ -884,16 +884,16 @@ async fn validation_reporter(
             Ok(response) => {
                 // Check for validation gap
                 if response.last_validated_block.0 < first_block.0 {
-                    error!(
-                        "[Reporter] Report rejected for blocks {first_block:?}-{last_block:?}, upstream at {:?}",
-                        response.last_validated_block
-                    );
                     return Err(anyhow!(
                         "Validation gap detected: upstream at block {}, but local chain starts at {}. Cannot advance validation.",
                         response.last_validated_block.0,
                         first_block.0
                     ));
                 }
+                error!(
+                    "[Reporter] Report rejected for blocks {first_block:?}-{last_block:?}, upstream at {:?}",
+                    response.last_validated_block
+                );
             }
             Err(e) => {
                 error!("[Reporter] Failed to report blocks: {e}");

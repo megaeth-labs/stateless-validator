@@ -196,14 +196,11 @@ const CONTRACTS: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("cont
 /// instead of requiring the genesis file again. Provides better UX and portability.
 const GENESIS_CONFIG: TableDefinition<&str, Vec<u8>> = TableDefinition::new("genesis_config");
 
-/// Stores the immutable starting block for validation reporting.
+/// Initial trusted block that validation started from.
 ///
 /// **Schema:** Maps a singleton key (&str) to (BlockNumber, BlockHash) as (u64, [u8; 32])
 /// - Key: String "anchor" as &str
 /// - Value: (Block number as u64, Block hash as [u8; 32])
-///
-/// This table stores the initial trusted block that validation started from.
-/// Used by the validation reporter to report a stable first block.
 const ANCHOR_BLOCK: TableDefinition<&str, (u64, [u8; 32])> = TableDefinition::new("anchor_block");
 
 #[derive(Debug, Error)]
@@ -437,13 +434,11 @@ impl ValidatorDB {
             .map_err(Into::into)
     }
 
-    /// Retrieves the immutable starting block for validation reporting
-    ///
-    /// Returns the trusted starting block.
+    /// Retrieves the initial trusted block.
     ///
     /// # Returns
-    /// * `Ok(Some((block_number, block_hash)))` - Start block found
-    /// * `Ok(None)` - No start block has been set
+    /// * `Ok(Some((block_number, block_hash)))` - Anchor block found
+    /// * `Ok(None)` - No anchor block has been set
     /// * `Err(ValidationDbError)` - Database error
     pub fn get_anchor_block(&self) -> ValidationDbResult<Option<(BlockNumber, BlockHash)>> {
         let read_txn = self.database.begin_read()?;
