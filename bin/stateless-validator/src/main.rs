@@ -235,7 +235,6 @@ fn main() -> Result<()> {
 
     let rt = Runtime::new()?;
     let result = rt.block_on(async_main());
-
     // Force shutdown after 5 seconds to avoid hanging on spawn_blocking tasks
     rt.shutdown_timeout(Duration::from_secs(5));
 
@@ -333,7 +332,7 @@ async fn async_main() -> Result<()> {
     let validator_logic = chain_sync(client.clone(), validator_db.clone(), config, chain_spec);
 
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
-        .expect("Failed to register SIGTERM handler");
+        .map_err(|e| anyhow!("[Main] Failed to register SIGTERM handler: {e}"))?;
     tokio::select! {
         res = validator_logic => res?,
         _ = signal::ctrl_c() => {
