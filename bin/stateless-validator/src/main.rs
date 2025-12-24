@@ -857,7 +857,7 @@ async fn validation_reporter(
 
         // Get canonical chain bounds
         let (first_block, last_block) = match (
-            validator_db.get_earliest_local_block(),
+            validator_db.get_anchor_block(),
             validator_db.get_local_tip(),
         ) {
             (Ok(Some(first)), Ok(Some(last))) => (first, last),

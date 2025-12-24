@@ -196,6 +196,13 @@ const CONTRACTS: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("cont
 /// instead of requiring the genesis file again. Provides better UX and portability.
 const GENESIS_CONFIG: TableDefinition<&str, Vec<u8>> = TableDefinition::new("genesis_config");
 
+/// Initial trusted block that validation started from.
+///
+/// **Schema:** Maps a singleton key (&str) to (BlockNumber, BlockHash) as (u64, [u8; 32])
+/// - Key: String "anchor" as &str
+/// - Value: (Block number as u64, Block hash as [u8; 32])
+const ANCHOR_BLOCK: TableDefinition<&str, (u64, [u8; 32])> = TableDefinition::new("anchor_block");
+
 #[derive(Debug, Error)]
 pub enum ValidationDbError {
     #[error("Database error: {0}")]
@@ -313,6 +320,7 @@ impl ValidatorDB {
             let _validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
             let _block_records = write_txn.open_table(BLOCK_RECORDS)?;
             let _contracts = write_txn.open_table(CONTRACTS)?;
+            let _anchor_block = write_txn.open_table(ANCHOR_BLOCK)?;
         }
         write_txn.commit()?;
 
@@ -424,6 +432,22 @@ impl ValidatorDB {
             .map(|s| serde_json::from_slice(&s.value()).map_err(SerializationError::Json))
             .transpose()
             .map_err(Into::into)
+    }
+
+    /// Retrieves the initial trusted block.
+    ///
+    /// # Returns
+    /// * `Ok(Some((block_number, block_hash)))` - Anchor block found
+    /// * `Ok(None)` - No anchor block has been set
+    /// * `Err(ValidationDbError)` - Database error
+    pub fn get_anchor_block(&self) -> ValidationDbResult<Option<(BlockNumber, BlockHash)>> {
+        let read_txn = self.database.begin_read()?;
+        let anchor_block_table = read_txn.open_table(ANCHOR_BLOCK)?;
+
+        Ok(anchor_block_table.get("anchor")?.map(|v| {
+            let (block_number, block_hash) = v.value();
+            (block_number, BlockHash::from(block_hash))
+        }))
     }
 
     /// Extends the canonical chain with the next validated block
@@ -786,9 +810,11 @@ impl ValidatorDB {
     ) -> ValidationDbResult<()> {
         let write_txn = self.database.begin_write()?;
         {
+            let mut anchor_block_table = write_txn.open_table(ANCHOR_BLOCK)?;
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
             let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
 
+            anchor_block_table.insert("anchor", (block_number, block_hash.0))?;
             canonical_chain.retain(|_, _| false)?;
             canonical_chain.insert(
                 block_number,
