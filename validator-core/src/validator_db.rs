@@ -199,12 +199,12 @@ const GENESIS_CONFIG: TableDefinition<&str, Vec<u8>> = TableDefinition::new("gen
 /// Stores the immutable starting block for validation reporting.
 ///
 /// **Schema:** Maps a singleton key (&str) to (BlockNumber, BlockHash) as (u64, [u8; 32])
-/// - Key: String "start_block" as &str
+/// - Key: String "anchor" as &str
 /// - Value: (Block number as u64, Block hash as [u8; 32])
 ///
 /// This table stores the initial trusted block that validation started from.
 /// Used by the validation reporter to report a stable first block.
-const START_BLOCK: TableDefinition<&str, (u64, [u8; 32])> = TableDefinition::new("start_block");
+const ANCHOR_BLOCK: TableDefinition<&str, (u64, [u8; 32])> = TableDefinition::new("anchor_block");
 
 #[derive(Debug, Error)]
 pub enum ValidationDbError {
@@ -323,7 +323,7 @@ impl ValidatorDB {
             let _validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
             let _block_records = write_txn.open_table(BLOCK_RECORDS)?;
             let _contracts = write_txn.open_table(CONTRACTS)?;
-            let _start_block = write_txn.open_table(START_BLOCK)?;
+            let _anchor_block = write_txn.open_table(ANCHOR_BLOCK)?;
         }
         write_txn.commit()?;
 
@@ -437,33 +437,6 @@ impl ValidatorDB {
             .map_err(Into::into)
     }
 
-    /// Stores the immutable starting block for validation reporting
-    ///
-    /// This method sets the trusted starting block that validation began from.
-    /// It should only be called when --start-block argument is provided during
-    /// initialization. Once set, this value should not be modified.
-    ///
-    /// # Arguments
-    /// * `block_number` - The block number of the starting block
-    /// * `block_hash` - The hash of the starting block
-    ///
-    /// # Returns
-    /// * `Ok(())` - Start block successfully stored
-    /// * `Err(ValidationDbError)` - Database error
-    pub fn set_start_block(
-        &self,
-        block_number: BlockNumber,
-        block_hash: BlockHash,
-    ) -> ValidationDbResult<()> {
-        let write_txn = self.database.begin_write()?;
-        {
-            let mut start_block_table = write_txn.open_table(START_BLOCK)?;
-            start_block_table.insert("start_block", (block_number, block_hash.0))?;
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
-
     /// Retrieves the immutable starting block for validation reporting
     ///
     /// Returns the trusted starting block.
@@ -472,11 +445,11 @@ impl ValidatorDB {
     /// * `Ok(Some((block_number, block_hash)))` - Start block found
     /// * `Ok(None)` - No start block has been set
     /// * `Err(ValidationDbError)` - Database error
-    pub fn get_start_block(&self) -> ValidationDbResult<Option<(BlockNumber, BlockHash)>> {
+    pub fn get_anchor_block(&self) -> ValidationDbResult<Option<(BlockNumber, BlockHash)>> {
         let read_txn = self.database.begin_read()?;
-        let start_block_table = read_txn.open_table(START_BLOCK)?;
+        let anchor_block_table = read_txn.open_table(ANCHOR_BLOCK)?;
 
-        Ok(start_block_table.get("start_block")?.map(|v| {
+        Ok(anchor_block_table.get("anchor")?.map(|v| {
             let (block_number, block_hash) = v.value();
             (block_number, BlockHash::from(block_hash))
         }))
@@ -842,9 +815,11 @@ impl ValidatorDB {
     ) -> ValidationDbResult<()> {
         let write_txn = self.database.begin_write()?;
         {
+            let mut anchor_block_table = write_txn.open_table(ANCHOR_BLOCK)?;
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
             let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
 
+            anchor_block_table.insert("anchor", (block_number, block_hash.0))?;
             canonical_chain.retain(|_, _| false)?;
             canonical_chain.insert(
                 block_number,
