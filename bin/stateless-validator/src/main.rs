@@ -230,9 +230,24 @@ struct CommandLineArgs {
     metrics_port: u16,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     init_logging()?;
+    let runtime = tokio::runtime::Runtime::new()
+        .map_err(|e| anyhow!("Failed to build Tokio runtime: {e}"))?;
+    let timeout = Duration::from_secs(1);
+    let result = runtime.block_on(run());
+    let shutdown_start = Instant::now();
+    runtime.shutdown_timeout(timeout);
+    if shutdown_start.elapsed() >= timeout {
+        warn!(
+            "[Main] Tokio runtime shutdown reached the {:?} timeout.",
+            timeout
+        );
+    }
+    result
+}
+
+async fn run() -> Result<()> {
     let start = Instant::now();
     let args = CommandLineArgs::parse();
 
@@ -322,10 +337,16 @@ async fn main() -> Result<()> {
 
     let validator_logic = chain_sync(client.clone(), validator_db.clone(), config, chain_spec);
 
+    let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+        .map_err(|e| anyhow!("Failed to register SIGTERM handler: {e}"))?;
+
     tokio::select! {
         res = validator_logic => res?,
         _ = signal::ctrl_c() => {
-            info!("[Main] Ctrl-C received, shutting down.");
+            info!("[Main] SIGINT received, shutting down.");
+        }
+        _ = sigterm.recv() => {
+            info!("[Main] SIGTERM received, shutting down.");
         }
     }
 
