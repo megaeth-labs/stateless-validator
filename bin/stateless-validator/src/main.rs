@@ -343,12 +343,9 @@ async fn main() -> Result<()> {
         handle.abort();
     }
     let timeout = Duration::from_secs(1);
-    if tokio::time::timeout(timeout, future::join_all(handles))
-        .await
-        .is_err()
-    {
+    if let Err(e) = tokio::time::timeout(timeout, future::join_all(handles)).await {
         warn!(
-            "[Main] Tokio runtime shutdown reached the {:?} timeout.",
+            "[Main] Tokio runtime shutdown reached the {:?} timeout, error: {e}.",
             timeout
         );
     }
