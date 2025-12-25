@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
@@ -14,7 +15,7 @@ use futures::future;
 use op_alloy_rpc_types::Transaction;
 use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
 use salt::SaltWitness;
-use tokio::{signal, task};
+use tokio::{signal, task, task::JoinHandle};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use validator_core::{
@@ -230,24 +231,9 @@ struct CommandLineArgs {
     metrics_port: u16,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     init_logging()?;
-    let runtime = tokio::runtime::Runtime::new()
-        .map_err(|e| anyhow!("Failed to build Tokio runtime: {e}"))?;
-    let timeout = Duration::from_secs(1);
-    let result = runtime.block_on(run());
-    let shutdown_start = Instant::now();
-    runtime.shutdown_timeout(timeout);
-    if shutdown_start.elapsed() >= timeout {
-        warn!(
-            "[Main] Tokio runtime shutdown reached the {:?} timeout.",
-            timeout
-        );
-    }
-    result
-}
-
-async fn run() -> Result<()> {
     let start = Instant::now();
     let args = CommandLineArgs::parse();
 
@@ -335,7 +321,7 @@ async fn run() -> Result<()> {
         }
     );
 
-    let validator_logic = chain_sync(client.clone(), validator_db.clone(), config, chain_spec);
+    let (validator_logic, handles) = chain_sync(client, &validator_db, config, chain_spec)?;
 
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .map_err(|e| anyhow!("Failed to register SIGTERM handler: {e}"))?;
@@ -351,6 +337,25 @@ async fn run() -> Result<()> {
     }
 
     info!("[Main] Total execution time: {:?}", start.elapsed());
+
+    // Abort all background tasks and wait for them to finish (with timeout)
+    for handle in &handles {
+        handle.abort();
+    }
+    let timeout = Duration::from_secs(1);
+    if tokio::time::timeout(timeout, future::join_all(handles))
+        .await
+        .is_err()
+    {
+        warn!(
+            "[Main] Tokio runtime shutdown reached the {:?} timeout.",
+            timeout
+        );
+    }
+
+    drop(validator_db);
+    info!("[Main] Database closed cleanly.");
+
     Ok(())
 }
 
@@ -376,12 +381,16 @@ async fn run() -> Result<()> {
 /// # Returns
 /// * `Ok(())` - When sync target is reached (if configured)
 /// * `Err(eyre::Error)` - On critical failures during task recovery
-async fn chain_sync(
+#[allow(clippy::type_complexity)]
+fn chain_sync(
     client: Arc<RpcClient>,
-    validator_db: Arc<ValidatorDB>,
+    validator_db: &Arc<ValidatorDB>,
     config: Arc<ChainSyncConfig>,
     chain_spec: Arc<ChainSpec>,
-) -> Result<()> {
+) -> Result<(
+    impl Future<Output = Result<()>>,
+    Vec<JoinHandle<Result<()>>>,
+)> {
     info!(
         "[Chain Sync] Starting with {} validation workers",
         config.concurrent_workers
@@ -394,31 +403,34 @@ async fn chain_sync(
         .map_err(|e| anyhow!("Failed to recover interrupted tasks: {}", e))?;
     info!("[Chain Sync] Task recovery completed");
 
+    // Spawn all background tasks
+    let mut handles = Vec::new();
+
     // Step 2: Spawn remote chain tracker
     info!("[Chain Sync] Starting remote chain tracker...");
-    task::spawn(remote_chain_tracker(
+    handles.push(task::spawn(remote_chain_tracker(
         Arc::clone(&client),
-        Arc::clone(&validator_db),
+        Arc::clone(validator_db),
         Arc::clone(&config),
-    ));
+    )));
 
     // Step 3: Spawn validation reporter (optional, based on config)
     if config.report_validation_results {
         info!("[Chain Sync] Starting validation reporter...");
-        task::spawn(validation_reporter(
+        handles.push(task::spawn(validation_reporter(
             Arc::clone(&client),
-            Arc::clone(&validator_db),
+            Arc::clone(validator_db),
             Arc::clone(&config),
-        ));
+        )));
     } else {
         info!("[Chain Sync] Validation reporter disabled (validation reporting not enabled)");
     }
 
     // Step 4: Spawn history pruner
-    task::spawn(history_pruner(
-        Arc::clone(&validator_db),
+    handles.push(task::spawn(history_pruner(
+        Arc::clone(validator_db),
         Arc::clone(&config),
-    ));
+    )));
 
     // Step 5: Spawn validation workers as tokio tasks
     info!(
@@ -426,80 +438,86 @@ async fn chain_sync(
         config.concurrent_workers
     );
     for worker_id in 0..config.concurrent_workers {
-        task::spawn(validation_worker(
+        handles.push(task::spawn(validation_worker(
             worker_id,
             Arc::clone(&client),
-            Arc::clone(&validator_db),
+            Arc::clone(validator_db),
             Arc::clone(&config),
             Arc::clone(&chain_spec),
-        ));
+        )));
     }
     info!("[Chain Sync] All validation workers started");
 
-    // Step 6: Main chain synchronizer loop
+    // Step 6: Return main chain synchronizer loop as a future
     info!("[Chain Sync] Starting main synchronizer loop...");
 
-    loop {
-        if let Some(target) = config.sync_target
-            && let Ok(Some((local_block_number, _))) = validator_db.get_local_tip()
-            && local_block_number >= target
-        {
-            debug!("[Chain Sync] Reached sync target height {target}, terminating");
-            return Ok(());
-        }
-
-        if let Err(e) = async {
-            // Advance the canonical chain with newly validated blocks
-            let mut blocks_advanced = 0;
-            while validator_db.grow_local_chain()? {
-                blocks_advanced += 1;
-            }
-
-            if blocks_advanced > 0 {
-                debug!("[Chain Sync] Advanced canonical chain by {blocks_advanced} blocks");
-            } else {
-                // No work to do, wait a bit before polling again
-                tokio::time::sleep(config.sync_poll_interval).await;
-            }
-
-            // Update chain height metrics
-            if let (Ok(Some((local_tip, _))), Ok(remote_tip)) =
-                (validator_db.get_local_tip(), validator_db.get_remote_tip())
+    let validator_db = Arc::clone(validator_db);
+    let config = Arc::clone(&config);
+    let main_loop = async move {
+        loop {
+            if let Some(target) = config.sync_target
+                && let Ok(Some((local_block_number, _))) = validator_db.get_local_tip()
+                && local_block_number >= target
             {
-                let remote_height = remote_tip.map(|(n, _)| n).unwrap_or(local_tip);
-                metrics::set_chain_heights(local_tip, remote_height);
+                debug!("[Chain Sync] Reached sync target height {target}, terminating");
+                return Ok(());
             }
 
-            Ok::<(), eyre::Error>(())
-        }
-        .await
-        {
-            // NOTE: We do NOT retry on errors here. All errors from grow_local_chain()
-            // represent non-retriable conditions:
-            //
-            // 1. ValidationDbError::FailedValidation
-            //    - Block validation failed, or state/withdrawals root mismatch
-            //    - These are deterministic failures; the block will never become valid on retry
-            //
-            // 2. ValidationDbError::Database
-            //    - Database I/O errors, corruption, disk full, permission denied
-            //    - These are persistent infrastructure issues requiring operator intervention
-            //    - Retrying won't help; the underlying issue must be fixed
-            //
-            // 3. ValidationDbError::MissingData
-            //    - Block data, witness, or validation result not found in database
-            //    - This should NEVER occur in normal operation because block data and witnesses
-            //      are written atomically during validation
-            //    - If this occurs, it indicates either a bug in the validation pipeline or
-            //      database corruption
-            //
-            // The chain sync process terminates immediately and returns the error to the caller.
-            // Operators should investigate the root cause.
+            if let Err(e) = async {
+                // Advance the canonical chain with newly validated blocks
+                let mut blocks_advanced = 0;
+                while validator_db.grow_local_chain()? {
+                    blocks_advanced += 1;
+                }
 
-            error!("[Chain Sync] Failed to advance canonical chain: {}", e);
-            return Err(e);
+                if blocks_advanced > 0 {
+                    debug!("[Chain Sync] Advanced canonical chain by {blocks_advanced} blocks");
+                } else {
+                    // No work to do, wait a bit before polling again
+                    tokio::time::sleep(config.sync_poll_interval).await;
+                }
+
+                // Update chain height metrics
+                if let (Ok(Some((local_tip, _))), Ok(remote_tip)) =
+                    (validator_db.get_local_tip(), validator_db.get_remote_tip())
+                {
+                    let remote_height = remote_tip.map(|(n, _)| n).unwrap_or(local_tip);
+                    metrics::set_chain_heights(local_tip, remote_height);
+                }
+
+                Ok::<(), eyre::Error>(())
+            }
+            .await
+            {
+                // NOTE: We do NOT retry on errors here. All errors from grow_local_chain()
+                // represent non-retriable conditions:
+                //
+                // 1. ValidationDbError::FailedValidation
+                //    - Block validation failed, or state/withdrawals root mismatch
+                //    - These are deterministic failures; the block will never become valid on retry
+                //
+                // 2. ValidationDbError::Database
+                //    - Database I/O errors, corruption, disk full, permission denied
+                //    - These are persistent infrastructure issues requiring operator intervention
+                //    - Retrying won't help; the underlying issue must be fixed
+                //
+                // 3. ValidationDbError::MissingData
+                //    - Block data, witness, or validation result not found in database
+                //    - This should NEVER occur in normal operation because block data and witnesses
+                //      are written atomically during validation
+                //    - If this occurs, it indicates either a bug in the validation pipeline or
+                //      database corruption
+                //
+                // The chain sync process terminates immediately and returns the error to the caller.
+                // Operators should investigate the root cause.
+
+                error!("[Chain Sync] Failed to advance canonical chain: {}", e);
+                return Err(e);
+            }
         }
-    }
+    };
+
+    Ok((main_loop, handles))
 }
 
 /// Remote chain tracker that maintains a lookahead of unvalidated blocks
@@ -1510,9 +1528,16 @@ mod tests {
             ..ChainSyncConfig::default()
         });
 
-        chain_sync(client.clone(), validator_db, config, chain_spec)
-            .await
-            .unwrap();
+        // Spawn background tasks and run chain sync
+        let (main_loop, handles) = chain_sync(client, &validator_db, config, chain_spec).unwrap();
+        main_loop.await.unwrap();
+
+        // Clean up background tasks
+        for h in &handles {
+            h.abort();
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(1), future::join_all(handles)).await;
+        drop(validator_db);
 
         handle.stop().unwrap();
         info!("Mock RPC server has been shut down.");

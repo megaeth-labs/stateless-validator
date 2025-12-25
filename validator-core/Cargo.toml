@@ -48,3 +48,4 @@ tracing.workspace = true
 
 [features]
 test-bucket-resize = ["salt/test-bucket-resize"]
+redb-logging = ["redb/logging"]
