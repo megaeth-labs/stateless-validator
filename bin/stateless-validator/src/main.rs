@@ -321,7 +321,7 @@ async fn main() -> Result<()> {
         }
     );
 
-    let (validator_logic, handles) = chain_sync(client, &validator_db, config, chain_spec)?;
+    let (validator_logic, bg_tasks) = chain_sync(client, &validator_db, config, chain_spec)?;
 
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .map_err(|e| anyhow!("Failed to register SIGTERM handler: {e}"))?;
@@ -339,15 +339,12 @@ async fn main() -> Result<()> {
     info!("[Main] Total execution time: {:?}", start.elapsed());
 
     // Abort all background tasks and wait for them to finish (with timeout)
-    for handle in &handles {
-        handle.abort();
+    for bg_task in &bg_tasks {
+        bg_task.abort();
     }
     let timeout = Duration::from_secs(1);
-    if let Err(e) = tokio::time::timeout(timeout, future::join_all(handles)).await {
-        warn!(
-            "[Main] Tokio runtime shutdown reached the {:?} timeout, error: {e}.",
-            timeout
-        );
+    if let Err(e) = tokio::time::timeout(timeout, future::join_all(bg_tasks)).await {
+        warn!("[Main] Tokio runtime shutdown reached the {timeout:?} timeout, error: {e}.",);
     }
 
     drop(validator_db);
@@ -401,11 +398,11 @@ fn chain_sync(
     info!("[Chain Sync] Task recovery completed");
 
     // Spawn all background tasks
-    let mut handles = Vec::new();
+    let mut bg_tasks = Vec::new();
 
     // Step 2: Spawn remote chain tracker
     info!("[Chain Sync] Starting remote chain tracker...");
-    handles.push(task::spawn(remote_chain_tracker(
+    bg_tasks.push(task::spawn(remote_chain_tracker(
         Arc::clone(&client),
         Arc::clone(validator_db),
         Arc::clone(&config),
@@ -414,7 +411,7 @@ fn chain_sync(
     // Step 3: Spawn validation reporter (optional, based on config)
     if config.report_validation_results {
         info!("[Chain Sync] Starting validation reporter...");
-        handles.push(task::spawn(validation_reporter(
+        bg_tasks.push(task::spawn(validation_reporter(
             Arc::clone(&client),
             Arc::clone(validator_db),
             Arc::clone(&config),
@@ -424,7 +421,7 @@ fn chain_sync(
     }
 
     // Step 4: Spawn history pruner
-    handles.push(task::spawn(history_pruner(
+    bg_tasks.push(task::spawn(history_pruner(
         Arc::clone(validator_db),
         Arc::clone(&config),
     )));
@@ -435,7 +432,7 @@ fn chain_sync(
         config.concurrent_workers
     );
     for worker_id in 0..config.concurrent_workers {
-        handles.push(task::spawn(validation_worker(
+        bg_tasks.push(task::spawn(validation_worker(
             worker_id,
             Arc::clone(&client),
             Arc::clone(validator_db),
@@ -514,7 +511,7 @@ fn chain_sync(
         }
     };
 
-    Ok((main_loop, handles))
+    Ok((main_loop, bg_tasks))
 }
 
 /// Remote chain tracker that maintains a lookahead of unvalidated blocks
@@ -1526,14 +1523,14 @@ mod tests {
         });
 
         // Spawn background tasks and run chain sync
-        let (main_loop, handles) = chain_sync(client, &validator_db, config, chain_spec).unwrap();
+        let (main_loop, bg_tasks) = chain_sync(client, &validator_db, config, chain_spec).unwrap();
         main_loop.await.unwrap();
 
         // Clean up background tasks
-        for h in &handles {
-            h.abort();
+        for bg_task in &bg_tasks {
+            bg_task.abort();
         }
-        let _ = tokio::time::timeout(Duration::from_secs(1), future::join_all(handles)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), future::join_all(bg_tasks)).await;
         drop(validator_db);
 
         handle.stop().unwrap();
