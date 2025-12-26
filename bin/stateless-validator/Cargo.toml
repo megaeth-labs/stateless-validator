@@ -47,4 +47,3 @@ tempfile = "3.8"
 
 [features]
 test-bucket-resize = ["salt/test-bucket-resize", "validator-core/test-bucket-resize"]
-redb-logging = ["validator-core/redb-logging"]

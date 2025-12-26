@@ -30,17 +30,17 @@ mega-evm.workspace = true
 salt.workspace = true
 
 # reth
-reth-ethereum-forks = { workspace = true }
-reth-optimism-chainspec = { workspace = true }
-reth-trie = { workspace = true }
-reth-trie-common = { workspace = true }
-reth-trie-sparse = { workspace = true }
+reth-ethereum-forks.workspace = true
+reth-optimism-chainspec.workspace = true
+reth-trie.workspace = true
+reth-trie-common.workspace = true
+reth-trie-sparse.workspace = true
 
 # misc
 bincode.workspace = true
 eyre.workspace = true
 dyn-clone.workspace = true
-redb.workspace = true
+redb = { workspace = true, features = ["logging"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -48,4 +48,3 @@ tracing.workspace = true
 
 [features]
 test-bucket-resize = ["salt/test-bucket-resize"]
-redb-logging = ["redb/logging"]
