@@ -284,18 +284,14 @@ async fn run() -> Result<()> {
         info!("[Main] Initializing from start block: {}", start_block_str);
 
         let block_hash = parse_block_hash(start_block_str)?;
-        let mut attempts = 0u32;
         let block = loop {
-            attempts += 1;
             match client
                 .get_block(BlockId::Hash(block_hash.into()), false)
                 .await
             {
                 Ok(block) => break block,
                 Err(e) => {
-                    warn!(
-                        "[Main] Attempt {attempts} failed to fetch block {block_hash}: {e}, retrying...",
-                    );
+                    warn!("[Main] Failed to fetch block {block_hash}: {e}, retrying...",);
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
