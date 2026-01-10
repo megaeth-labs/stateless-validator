@@ -2892,8 +2892,8 @@ dependencies = [
 
 [[package]]
 name = "mega-evm"
-version = "1.2.3"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=v1.2.3#21b313827348e7d1c579488d555a7a38521a1a46"
+version = "1.2.5"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=v1.2.5#969af22c5d38ee24ceccedad04468c1980156162"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
