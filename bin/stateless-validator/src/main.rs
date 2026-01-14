@@ -373,6 +373,10 @@ async fn run() -> Result<()> {
             "disabled"
         }
     );
+    info!(
+        "[Main] Block limits overrides: {:?}",
+        config.block_limits_overrides
+    );
 
     let validator_logic = chain_sync(client.clone(), validator_db.clone(), config, chain_spec);
 
