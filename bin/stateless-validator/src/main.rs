@@ -238,24 +238,42 @@ struct CommandLineArgs {
 /// These overrides allow testing with different block limit parameters without
 /// modifying the chain specification. DO NOT USE IN PRODUCTION.
 ///
+/// If environment variables are not set, the following default values will be used:
+/// - `block_txs_data_limit`: 101857600
+/// - `block_kv_update_limit`: 1000000
+/// - `block_state_growth_limit`: 1000000
+///
 /// Environment variables:
 /// - `STATELESS_VALIDATOR_BLOCK_TXS_DATA_LIMIT_ONLY_TESTING`: Override block transaction data size limit
 /// - `STATELESS_VALIDATOR_BLOCK_KV_UPDATE_LIMIT_ONLY_TESTING`: Override block KV update limit
 /// - `STATELESS_VALIDATOR_BLOCK_STATE_GROWTH_LIMIT_ONLY_TESTING`: Override block state growth limit
 fn read_block_limits_overrides_from_env() -> BlockLimitsOverrides {
-    fn parse_env_u64(var_name: &str) -> Option<u64> {
-        std::env::var(var_name).ok().and_then(|v| v.parse().ok())
+    // Default values when environment variables are not set
+    const DEFAULT_BLOCK_TXS_DATA_LIMIT: u64 = 101857600;
+    const DEFAULT_BLOCK_KV_UPDATE_LIMIT: u64 = 1000000;
+    const DEFAULT_BLOCK_STATE_GROWTH_LIMIT: u64 = 1000000;
+
+    fn parse_env_u64(var_name: &str, default: u64) -> Option<u64> {
+        Some(
+            std::env::var(var_name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default),
+        )
     }
 
     BlockLimitsOverrides {
         block_txs_data_limit: parse_env_u64(
             "STATELESS_VALIDATOR_BLOCK_TXS_DATA_LIMIT_ONLY_TESTING",
+            DEFAULT_BLOCK_TXS_DATA_LIMIT,
         ),
         block_kv_update_limit: parse_env_u64(
             "STATELESS_VALIDATOR_BLOCK_KV_UPDATE_LIMIT_ONLY_TESTING",
+            DEFAULT_BLOCK_KV_UPDATE_LIMIT,
         ),
         block_state_growth_limit: parse_env_u64(
             "STATELESS_VALIDATOR_BLOCK_STATE_GROWTH_LIMIT_ONLY_TESTING",
+            DEFAULT_BLOCK_STATE_GROWTH_LIMIT,
         ),
     }
 }
