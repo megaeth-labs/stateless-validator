@@ -755,6 +755,11 @@ async fn validation_worker(
 ) -> Result<()> {
     info!("[Worker {}] Started", worker_id);
     loop {
+        debug!(
+            "[Worker {}] Block limits overrides: {:?}",
+            worker_id, config.block_limits_overrides
+        );
+
         match validate_one(
             worker_id,
             &client,
