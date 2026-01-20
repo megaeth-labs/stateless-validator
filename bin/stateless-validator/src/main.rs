@@ -173,13 +173,13 @@ pub struct ChainSyncConfig {
 impl Default for ChainSyncConfig {
     fn default() -> Self {
         Self {
-            concurrent_workers: num_cpus::get().min(16),
+            concurrent_workers: num_cpus::get().min(8),
             sync_poll_interval: Duration::from_secs(1),
             sync_target: None,
             tracker_lookahead_blocks: 80,
             tracker_poll_interval: Duration::from_millis(100),
             pruner_interval: Duration::from_secs(300),
-            pruner_blocks_to_keep: 3600,
+            pruner_blocks_to_keep: 1000,
             worker_idle_sleep: Duration::from_millis(500),
             worker_error_sleep: Duration::from_millis(1000),
             tracker_error_sleep: Duration::from_secs(1),
@@ -324,7 +324,7 @@ async fn run() -> Result<()> {
 
     // Create chain sync configuration
     let config = Arc::new(ChainSyncConfig {
-        concurrent_workers: num_cpus::get().min(16),
+        concurrent_workers: num_cpus::get().min(8),
         report_validation_results: args.report_validation_results,
         metrics_enabled: args.metrics_enabled,
         metrics_port: args.metrics_port,
