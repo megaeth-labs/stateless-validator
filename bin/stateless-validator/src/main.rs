@@ -351,6 +351,10 @@ async fn run() -> Result<()> {
         )
     };
 
+    // Load all contracts from redb into memory before spawning writer
+    let preloaded_contracts = writer.db().get_all_contracts()?;
+    let preloaded_count = preloaded_contracts.len();
+
     // Now spawn the writer task after all initial database reads are done
     task::spawn(async move {
         writer.run().await;
@@ -358,6 +362,13 @@ async fn run() -> Result<()> {
 
     // Create in-memory db with writer handle for runtime operations
     let memory_db = Arc::new(InMemoryValidatorDB::with_writer(Some(writer_handle)));
+
+    // Preload contracts into memory cache
+    if preloaded_count > 0 {
+        memory_db.add_contract_codes(preloaded_contracts.iter());
+        info!("[Main] Preloaded {} contracts from database", preloaded_count);
+    }
+
     memory_db.reset_anchor_block(
         anchor_block.0,
         anchor_block.1,

@@ -546,6 +546,23 @@ impl ValidatorDB {
         )
     }
 
+    /// Retrieves all cached contract bytecodes from the database
+    ///
+    /// Returns a Vec of all bytecodes stored in the contracts table.
+    /// Used during initialization to preload contracts into memory cache.
+    pub fn get_all_contracts(&self) -> ValidationDbResult<Vec<Bytecode>> {
+        let read_txn = self.database.begin_read()?;
+        let contracts = read_txn.open_table(CONTRACTS)?;
+
+        contracts
+            .iter()?
+            .map(|result| {
+                let (_, value) = result?;
+                Ok(decode_from_slice(&value.value()))
+            })
+            .collect()
+    }
+
     /// Cleans up old block data to save storage space
     ///
     /// Removes canonical chain entries, validation records, block data, and witnesses

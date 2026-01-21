@@ -102,7 +102,7 @@ pub struct InMemoryValidatorDB {
     // Results & cache
     /// Outcomes of completed block validation attempts
     validation_results: DashMap<BlockHash, ValidationResult>,
-    /// LRU cache of contract bytecode (max 1000 entries)
+    /// LRU cache of contract bytecode (max 4000 entries)
     contracts: Cache<B256, Bytecode>,
 
     /// Optional handle for async background persistence
@@ -127,7 +127,7 @@ impl InMemoryValidatorDB {
             remote_chain: RwLock::new(BTreeMap::new()),
             block_records: DashMap::new(),
             validation_results: DashMap::new(),
-            contracts: Cache::new(1000),
+            contracts: Cache::new(4000),
             writer: None,
         }
     }
@@ -143,7 +143,7 @@ impl InMemoryValidatorDB {
             remote_chain: RwLock::new(BTreeMap::new()),
             block_records: DashMap::new(),
             validation_results: DashMap::new(),
-            contracts: Cache::new(1000),
+            contracts: Cache::new(4000),
             writer,
         }
     }
