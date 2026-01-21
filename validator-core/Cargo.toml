@@ -46,5 +46,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+# concurrent data structures for in-memory storage
+dashmap = "6.0"
+crossbeam-queue = "0.3"
+parking_lot = "0.12"
+quick_cache = "0.6"
+
 [features]
 test-bucket-resize = ["salt/test-bucket-resize"]

@@ -22,6 +22,7 @@ use validator_core::{
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
     executor::{ValidationResult, validate_block},
+    validator_db::in_memory_db::InMemoryValidatorDB,
     withdrawals::MptWitness,
 };
 
@@ -155,7 +156,9 @@ pub struct ChainSyncConfig {
     /// Time to wait between history pruning cycles
     pub pruner_interval: Duration,
     /// Number of recent blocks to retain from current tip
-    pub pruner_blocks_to_keep: u64,
+    pub pruner_db_blocks_to_keep: u64,
+    /// Number of recent blocks to retain from current tip
+    pub pruner_memory_blocks_to_keep: u64,
     /// Time to wait when validation workers have no tasks
     pub worker_idle_sleep: Duration,
     /// Time to wait when validation workers encounter errors
@@ -178,8 +181,9 @@ impl Default for ChainSyncConfig {
             sync_target: None,
             tracker_lookahead_blocks: 80,
             tracker_poll_interval: Duration::from_millis(100),
-            pruner_interval: Duration::from_secs(300),
-            pruner_blocks_to_keep: 1000,
+            pruner_interval: Duration::from_secs(120),
+            pruner_db_blocks_to_keep: 1000,
+            pruner_memory_blocks_to_keep: 80,
             worker_idle_sleep: Duration::from_millis(500),
             worker_error_sleep: Duration::from_millis(1000),
             tracker_error_sleep: Duration::from_secs(1),
@@ -271,6 +275,7 @@ async fn run() -> Result<()> {
 
     let client = Arc::new(RpcClient::new(&args.rpc_endpoint, &args.witness_endpoint)?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
+    let memory_db = Arc::new(InMemoryValidatorDB::new());
 
     // Load chain spec from file (first run) or database (subsequent runs)
     let chain_spec = Arc::new(load_or_create_chain_spec(
@@ -280,7 +285,7 @@ async fn run() -> Result<()> {
     info!("[Main] Chain spec loaded successfully");
 
     // Handle optional start block initialization
-    if let Some(start_block_str) = &args.start_block {
+    let anchor_block = if let Some(start_block_str) = &args.start_block {
         info!("[Main] Initializing from start block: {}", start_block_str);
 
         let block_hash = parse_block_hash(start_block_str)?;
@@ -296,35 +301,55 @@ async fn run() -> Result<()> {
                 }
             }
         };
+        let withdrawals_root = block
+            .header
+            .withdrawals_root
+            .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", block_hash))?;
 
         validator_db
             .reset_anchor_block(
                 block.header.number,
                 block.header.hash,
                 block.header.state_root,
-                block
-                    .header
-                    .withdrawals_root
-                    .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", block_hash))?,
+                withdrawals_root,
             )
             .map_err(|e| anyhow!("Failed to reset anchor: {}", e))?;
+
+        memory_db.reset_anchor_block(
+            block.header.number,
+            block.header.hash,
+            block.header.state_root,
+            withdrawals_root,
+        );
 
         info!(
             "[Main] Successfully initialized from block {} (number: {})",
             block.header.hash, block.header.number
         );
+        (block.header.number, block.header.hash)
     } else {
         // If no start block was provided, ensure we have an existing canonical chain
-        ensure!(
-            validator_db.get_local_tip()?.is_some(),
-            "No trusted starting point found. Specify a trusted block with --start-block <blockhash>"
+        let (block_number, block_hash) = validator_db
+            .get_local_tip()?
+            .ok_or_else(|| anyhow!("No trusted starting point found. Specify a trusted block with --start-block <blockhash>"))?;
+        let header = validator_db
+            .get_block_header(block_hash)?
+            .ok_or_else(|| anyhow!("Block {} not found", block_hash))?;
+        memory_db.reset_anchor_block(
+            header.number,
+            header.hash,
+            header.state_root,
+            header
+                .withdrawals_root
+                .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", block_hash))?,
         );
         info!("[Main] Continuing from existing canonical chain");
-    }
+        (block_number, block_hash)
+    };
 
     // Create chain sync configuration
     let config = Arc::new(ChainSyncConfig {
-        concurrent_workers: num_cpus::get(),
+        concurrent_workers: num_cpus::get().min(16),
         report_validation_results: args.report_validation_results,
         metrics_enabled: args.metrics_enabled,
         metrics_port: args.metrics_port,
@@ -343,7 +368,13 @@ async fn run() -> Result<()> {
         }
     );
 
-    let validator_logic = chain_sync(client.clone(), validator_db.clone(), config, chain_spec);
+    let validator_logic = chain_sync(
+        client.clone(),
+        memory_db.clone(),
+        config,
+        chain_spec,
+        anchor_block,
+    );
 
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .map_err(|e| anyhow!("Failed to register SIGTERM handler: {e}"))?;
@@ -386,49 +417,41 @@ async fn run() -> Result<()> {
 /// * `Err(eyre::Error)` - On critical failures during task recovery
 async fn chain_sync(
     client: Arc<RpcClient>,
-    validator_db: Arc<ValidatorDB>,
+    memory_db: Arc<InMemoryValidatorDB>,
     config: Arc<ChainSyncConfig>,
     chain_spec: Arc<ChainSpec>,
+    anchor_block: (BlockNumber, BlockHash),
 ) -> Result<()> {
     info!(
         "[Chain Sync] Starting with {} validation workers",
         config.concurrent_workers
     );
 
-    // Step 1: Recover any interrupted tasks from previous crashes
-    info!("[Chain Sync] Recovering interrupted validation tasks from previous runs...");
-    validator_db
-        .recover_interrupted_tasks()
-        .map_err(|e| anyhow!("Failed to recover interrupted tasks: {}", e))?;
-    info!("[Chain Sync] Task recovery completed");
-
-    // Step 2: Spawn remote chain tracker
+    // Step 1: Spawn remote chain tracker
     info!("[Chain Sync] Starting remote chain tracker...");
     task::spawn(remote_chain_tracker(
         Arc::clone(&client),
-        Arc::clone(&validator_db),
+        Arc::clone(&memory_db),
         Arc::clone(&config),
     ));
 
-    // Step 3: Spawn validation reporter (optional, based on config)
+    // Step 2: Spawn validation reporter (optional, based on config)
     if config.report_validation_results {
         info!("[Chain Sync] Starting validation reporter...");
         task::spawn(validation_reporter(
             Arc::clone(&client),
-            Arc::clone(&validator_db),
+            Arc::clone(&memory_db),
             Arc::clone(&config),
+            anchor_block,
         ));
     } else {
         info!("[Chain Sync] Validation reporter disabled (validation reporting not enabled)");
     }
 
-    // Step 4: Spawn history pruner
-    task::spawn(history_pruner(
-        Arc::clone(&validator_db),
-        Arc::clone(&config),
-    ));
+    // Step 3: Spawn history pruner
+    task::spawn(history_pruner(Arc::clone(&memory_db), Arc::clone(&config)));
 
-    // Step 5: Spawn validation workers as tokio tasks
+    // Step 4: Spawn validation workers as tokio tasks
     info!(
         "[Chain Sync] Spawning {} validation workers...",
         config.concurrent_workers
@@ -437,19 +460,19 @@ async fn chain_sync(
         task::spawn(validation_worker(
             worker_id,
             Arc::clone(&client),
-            Arc::clone(&validator_db),
+            Arc::clone(&memory_db),
             Arc::clone(&config),
             Arc::clone(&chain_spec),
         ));
     }
     info!("[Chain Sync] All validation workers started");
 
-    // Step 6: Main chain synchronizer loop
+    // Step 5: Main chain synchronizer loop
     info!("[Chain Sync] Starting main synchronizer loop...");
 
     loop {
         if let Some(target) = config.sync_target
-            && let Ok(Some((local_block_number, _))) = validator_db.get_local_tip()
+            && let Some((local_block_number, _)) = memory_db.get_local_tip()
             && local_block_number >= target
         {
             debug!("[Chain Sync] Reached sync target height {target}, terminating");
@@ -459,7 +482,7 @@ async fn chain_sync(
         if let Err(e) = async {
             // Advance the canonical chain with newly validated blocks
             let mut blocks_advanced = 0;
-            while validator_db.grow_local_chain()? {
+            while memory_db.grow_local_chain()? {
                 blocks_advanced += 1;
             }
 
@@ -471,8 +494,8 @@ async fn chain_sync(
             }
 
             // Update chain height metrics
-            if let (Ok(Some((local_tip, _))), Ok(remote_tip)) =
-                (validator_db.get_local_tip(), validator_db.get_remote_tip())
+            if let (Some((local_tip, _)), remote_tip) =
+                (memory_db.get_local_tip(), memory_db.get_remote_tip())
             {
                 let remote_height = remote_tip.map(|(n, _)| n).unwrap_or(local_tip);
                 metrics::set_chain_heights(local_tip, remote_height);
@@ -525,7 +548,7 @@ async fn chain_sync(
 /// * Never returns under normal operation - runs indefinitely until externally terminated
 async fn remote_chain_tracker(
     client: Arc<RpcClient>,
-    validator_db: Arc<ValidatorDB>,
+    memory_db: Arc<InMemoryValidatorDB>,
     config: Arc<ChainSyncConfig>,
 ) -> Result<()> {
     info!(
@@ -539,10 +562,10 @@ async fn remote_chain_tracker(
     loop {
         if let Err(e) = async {
             // Calculate how far behind our local chain is from remote
-            let local_tip = validator_db
-                .get_local_tip()?
+            let local_tip = memory_db
+                .get_local_tip()
                 .ok_or_else(|| anyhow!("Local chain is empty"))?;
-            let remote_tip = validator_db.get_remote_tip()?.unwrap_or(local_tip);
+            let remote_tip = memory_db.get_remote_tip().unwrap_or(local_tip);
             let gap = remote_tip.0.saturating_sub(local_tip.0);
 
             debug!(
@@ -560,11 +583,11 @@ async fn remote_chain_tracker(
                         "[Tracker] Hash mismatch! Expected {}, got {}. Resolving chain divergence.",
                         remote_tip.1, block.header.hash
                     );
-                    match find_divergence_point(&client, &validator_db, remote_tip.0).await {
+                    match find_divergence_point(&client, &memory_db, remote_tip.0).await {
                         Ok(rollback_to) => {
                             warn!("[Tracker] Rolling back to block {rollback_to}");
                             metrics::on_chain_reorg(remote_tip.0.saturating_sub(rollback_to));
-                            validator_db.rollback_chain(rollback_to)?;
+                            memory_db.rollback_chain(rollback_to);
                             return Ok(());
                         }
                         Err(e) => {
@@ -659,8 +682,8 @@ async fn remote_chain_tracker(
             .collect::<Vec<_>>();
 
             // Add successfully fetched headers to remote chain
-            validator_db.add_validation_tasks(&tasks)?;
-            validator_db.grow_remote_chain(tasks.iter().map(|(block, _, _)| &block.header))?;
+            memory_db.add_validation_tasks(&tasks);
+            memory_db.grow_remote_chain(tasks.iter().map(|(block, _, _)| &block.header))?;
 
             // Encountered an DB/RPC error, wait a bit before polling again
             if tasks.len() < blocks_to_fetch as usize {
@@ -696,13 +719,13 @@ async fn remote_chain_tracker(
 async fn validation_worker(
     worker_id: usize,
     client: Arc<RpcClient>,
-    validator_db: Arc<ValidatorDB>,
+    memory_db: Arc<InMemoryValidatorDB>,
     config: Arc<ChainSyncConfig>,
     chain_spec: Arc<ChainSpec>,
 ) -> Result<()> {
     info!("[Worker {}] Started", worker_id);
     loop {
-        match validate_one(worker_id, &client, &validator_db, chain_spec.clone()).await {
+        match validate_one(worker_id, &client, &memory_db, chain_spec.clone()).await {
             Ok(true) => {}
             Ok(false) => {
                 // No tasks available, wait before checking again
@@ -738,10 +761,10 @@ async fn validation_worker(
 async fn validate_one(
     worker_id: usize,
     client: &RpcClient,
-    validator_db: &ValidatorDB,
+    memory_db: &InMemoryValidatorDB,
     chain_spec: Arc<ChainSpec>,
 ) -> Result<bool> {
-    match validator_db.get_next_task()? {
+    match memory_db.get_next_task()? {
         Some((block, witness, mpt_witness)) => {
             let block_number = block.header.number;
             let tx_count = block.transactions.len() as u64;
@@ -753,7 +776,7 @@ async fn validate_one(
             // Prepare the contract map to be used by validation
             let codehashes = extract_contract_codes(&witness);
 
-            let (mut contracts, missing_contracts) = validator_db.get_contract_codes(codehashes)?;
+            let (mut contracts, missing_contracts) = memory_db.get_contract_codes(codehashes);
 
             metrics::on_contract_cache_read(contracts.len() as u64, missing_contracts.len() as u64);
 
@@ -779,8 +802,10 @@ async fn validate_one(
                 })
                 .collect::<Result<_>>()?;
 
-            validator_db.add_contract_codes(new_bytecodes.iter().map(|(_, bytecode)| bytecode))?;
-            contracts.extend(new_bytecodes);
+            if !new_bytecodes.is_empty() {
+                memory_db.add_contract_codes(new_bytecodes.iter().map(|(_, bytecode)| bytecode));
+                contracts.extend(new_bytecodes);
+            }
 
             let pre_state_root = B256::from(witness.state_root()?);
             let post_state_root = block.header.state_root;
@@ -819,7 +844,7 @@ async fn validate_one(
             };
             metrics::on_worker_task_done(worker_id, success);
 
-            validator_db.complete_validation(ValidationResult {
+            memory_db.complete_validation(ValidationResult {
                 pre_state_root,
                 post_state_root,
                 pre_withdrawals_root,
@@ -829,7 +854,7 @@ async fn validate_one(
                 success,
                 error_message,
                 completed_at: SystemTime::now(),
-            })?;
+            });
 
             Ok(true)
         }
@@ -854,8 +879,9 @@ async fn validate_one(
 ///   block < local chain start)
 async fn validation_reporter(
     client: Arc<RpcClient>,
-    validator_db: Arc<ValidatorDB>,
+    memory_db: Arc<InMemoryValidatorDB>,
     config: Arc<ChainSyncConfig>,
+    anchor_block: (BlockNumber, BlockHash),
 ) -> Result<()> {
     info!("[Reporter] Starting validation reporter");
     let mut last_reported_block = (0u64, BlockHash::ZERO);
@@ -864,11 +890,8 @@ async fn validation_reporter(
         tokio::time::sleep(config.sync_poll_interval).await;
 
         // Get canonical chain bounds
-        let (first_block, last_block) = match (
-            validator_db.get_anchor_block(),
-            validator_db.get_local_tip(),
-        ) {
-            (Ok(Some(first)), Ok(Some(last))) => (first, last),
+        let last_block = match memory_db.get_local_tip() {
+            Some(last) => last,
             _ => continue,
         };
 
@@ -880,26 +903,28 @@ async fn validation_reporter(
         // Report validated range to upstream
         match client
             .set_validated_blocks(
-                (first_block.0, B256::from(first_block.1.0)),
+                (anchor_block.0, B256::from(anchor_block.1.0)),
                 (last_block.0, B256::from(last_block.1.0)),
             )
             .await
         {
             Ok(response) if response.accepted => {
-                debug!("[Reporter] Reported blocks successfully: {first_block:?} - {last_block:?}");
+                debug!(
+                    "[Reporter] Reported blocks successfully: {anchor_block:?} - {last_block:?}"
+                );
                 last_reported_block = last_block;
             }
             Ok(response) => {
                 // Check for validation gap
-                if response.last_validated_block.0 < first_block.0 {
+                if response.last_validated_block.0 < anchor_block.0 {
                     return Err(anyhow!(
                         "Validation gap detected: upstream at block {}, but local chain starts at {}. Cannot advance validation.",
                         response.last_validated_block.0,
-                        first_block.0
+                        anchor_block.0
                     ));
                 }
                 error!(
-                    "[Reporter] Report rejected for blocks {first_block:?}-{last_block:?}, upstream at {:?}",
+                    "[Reporter] Report rejected for blocks {anchor_block:?}-{last_block:?}, upstream at {:?}",
                     response.last_validated_block
                 );
             }
@@ -923,7 +948,7 @@ async fn validation_reporter(
 /// # Returns
 /// * Never returns under normal operation - runs indefinitely until externally terminated
 async fn history_pruner(
-    validator_db: Arc<ValidatorDB>,
+    memory_db: Arc<InMemoryValidatorDB>,
     config: Arc<ChainSyncConfig>,
 ) -> Result<()> {
     info!(
@@ -932,9 +957,9 @@ async fn history_pruner(
     );
 
     loop {
-        if let Ok(Some((current_tip, _))) = validator_db.get_local_tip() {
-            let prune_before = current_tip.saturating_sub(config.pruner_blocks_to_keep);
-            match validator_db.prune_history(prune_before) {
+        if let Some((current_tip, _)) = memory_db.get_local_tip() {
+            let prune_before = current_tip.saturating_sub(config.pruner_memory_blocks_to_keep);
+            match memory_db.prune_history(prune_before) {
                 Ok(blocks_pruned) if blocks_pruned > 0 => {
                     debug!("[Pruner] Pruned {blocks_pruned} blocks before block {prune_before}");
                     metrics::on_blocks_pruned(blocks_pruned);
@@ -993,11 +1018,11 @@ fn extract_contract_codes(salt_witness: &SaltWitness) -> HashSet<B256> {
 /// from remote chain), indicating the local chain has diverged beyond recovery.
 async fn find_divergence_point(
     client: &RpcClient,
-    validator_db: &ValidatorDB,
+    memory_db: &InMemoryValidatorDB,
     mismatch_block: BlockNumber,
 ) -> Result<BlockNumber> {
-    let earliest_local = validator_db
-        .get_earliest_local_block()?
+    let earliest_local = memory_db
+        .get_earliest_local_block()
         .expect("Local chain cannot be empty");
 
     // Safety check: verify earliest block matches remote chain
@@ -1016,7 +1041,7 @@ async fn find_divergence_point(
         (earliest_local.0, mismatch_block, earliest_local.0);
     while left <= right {
         let mid = left + (right - left) / 2;
-        let local_hash = validator_db.get_block_hash(mid)?.unwrap();
+        let local_hash = memory_db.get_block_hash(mid).unwrap();
         let remote_hash = client
             .get_block(BlockId::Number(mid.into()), false)
             .await?
@@ -1166,12 +1191,12 @@ mod tests {
     ///
     /// Returns error if temporary directory creation, database initialization,
     /// test data loading, or contract population fails.
-    fn setup_test_db(context: &RpcModuleContext) -> Result<Arc<ValidatorDB>> {
+    fn setup_test_db(context: &RpcModuleContext) -> Result<Arc<InMemoryValidatorDB>> {
         // Create a temporary directory and then keep it alive by leaking it.
         // OS will clean it when test process ends.
         let temp_dir = tempfile::tempdir()
             .map_err(|e| anyhow!("Failed to create temporary directory: {e}"))?;
-        let validator_db = ValidatorDB::new(temp_dir.path().join(VALIDATOR_DB_FILENAME))?;
+        let memory_db = InMemoryValidatorDB::new();
         std::mem::forget(temp_dir);
 
         // Set the local chain tip to the first block in test data.
@@ -1185,9 +1210,9 @@ mod tests {
             .header
             .withdrawals_root
             .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", block_hash))?;
-        validator_db.reset_anchor_block(block_num, block_hash, state_root, withdrawals_root)?;
+        memory_db.reset_anchor_block(block_num, block_hash, state_root, withdrawals_root);
 
-        Ok(Arc::new(validator_db))
+        Ok(Arc::new(memory_db))
     }
 
     /// Set up mock RPC server with pre-loaded context and return the handle and URL.
@@ -1503,13 +1528,15 @@ mod tests {
         );
 
         let sync_target = Some(context.max_block.0);
-        let validator_db = setup_test_db(&context).unwrap();
+        let memory_db = setup_test_db(&context).unwrap();
         let (handle, url) = setup_mock_rpc_server(context).await;
         let client = Arc::new(RpcClient::new(&url, &url).unwrap());
 
         // Load chain spec using helper function
-        let chain_spec =
-            Arc::new(load_or_create_chain_spec(&validator_db, Some(TEST_GENESIS_FILE)).unwrap());
+        let chain_spec = Arc::new(ChainSpec::from_genesis(
+            serde_json::from_str::<Genesis>(&std::fs::read_to_string(TEST_GENESIS_FILE).unwrap())
+                .unwrap(),
+        ));
 
         // Create test configuration with faster intervals for testing
         let config = Arc::new(ChainSyncConfig {
@@ -1518,9 +1545,15 @@ mod tests {
             ..ChainSyncConfig::default()
         });
 
-        chain_sync(client.clone(), validator_db, config, chain_spec)
-            .await
-            .unwrap();
+        chain_sync(
+            client.clone(),
+            memory_db,
+            config,
+            chain_spec,
+            (0, B256::ZERO),
+        )
+        .await
+        .unwrap();
 
         handle.stop().unwrap();
         info!("Mock RPC server has been shut down.");

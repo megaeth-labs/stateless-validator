@@ -69,10 +69,9 @@ use salt::SaltWitness;
 use serde_json;
 use thiserror::Error;
 
-use crate::{
-    executor::{ValidationError, ValidationResult},
-    withdrawals::MptWitness,
-};
+pub mod in_memory_db;
+
+use crate::{executor::ValidationResult, withdrawals::MptWitness};
 
 /// Stores our local view of the canonical chain.
 ///
@@ -85,40 +84,6 @@ use crate::{
 #[allow(clippy::type_complexity)]
 const CANONICAL_CHAIN: TableDefinition<u64, ([u8; 32], [u8; 32], [u8; 32])> =
     TableDefinition::new("canonical_chain");
-
-/// Stores the remote chain with unvalidated blocks used to guide chain advancement.
-///
-/// **Schema:** Maps BlockNumber (u64) to BlockHash ([u8; 32])
-/// - Key: Block height as BlockNumber (u64)
-/// - Value: Hash of the remote block at that height as BlockHash ([u8; 32])
-///
-/// Contains newly received blocks that have not yet been validated. The chain synchronizer
-/// maintains this table to stay a few blocks ahead of CANONICAL_CHAIN. Once blocks in
-/// REMOTE_CHAIN are validated, they can be moved to CANONICAL_CHAIN via grow_local_chain().
-/// Updated via grow_remote_chain() (add unvalidated blocks) and rollback_chain().
-const REMOTE_CHAIN: TableDefinition<u64, [u8; 32]> = TableDefinition::new("remote_chain");
-
-/// Queue of validation tasks awaiting processing by workers.
-///
-/// **Schema:** Maps (BlockNumber, BlockHash) as (u64, [u8; 32]) to unit type (())
-/// - Key: (Block number, Block hash) as (BlockNumber as u64, BlockHash as [u8; 32])
-/// - Value: Unit type (()) - presence in table indicates pending task
-///
-/// Tasks are automatically ordered by block number. Workers call get_next_task()
-/// to atomically move tasks from here to ONGOING_TASKS. Added by main orchestrator
-/// via add_validation_task().
-const TASK_LIST: TableDefinition<(u64, [u8; 32]), ()> = TableDefinition::new("task_list");
-
-/// Tasks currently being processed by validation workers.
-///
-/// **Schema:** Maps (BlockNumber, BlockHash) as (u64, [u8; 32]) to unit type (())
-/// - Key: (Block number, Block hash) as (BlockNumber as u64, BlockHash as [u8; 32])
-/// - Value: Unit type (()) - presence in table indicates task in progress
-///
-/// Prevents duplicate work on the same block. Tasks moved here from TASK_LIST
-/// during get_next_task() and removed on completion. Moved back to TASK_LIST
-/// during crash recovery via recover_interrupted_tasks().
-const ONGOING_TASKS: TableDefinition<(u64, [u8; 32]), ()> = TableDefinition::new("ongoing_tasks");
 
 /// Complete block data required for validation execution.
 ///
@@ -151,18 +116,6 @@ const WITNESSES: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("witn
 /// Contains cryptographic proofs and state information that enables withdrawal validation
 /// without full blockchain state. Always used alongside with the [`WITNESSES`] table.
 const MPT_WITNESSES: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("mpt_witnesses");
-
-/// Outcomes of completed block validation attempts.
-///
-/// **Schema:** Maps BlockHash ([u8; 32]) to serialized ValidationResult (Vec<u8>)
-/// - Key: Block hash as BlockHash ([u8; 32])
-/// - Value: Serialized ValidationResult struct as Vec<u8>
-///
-/// Records success/failure, block identifiers, and error details. Written by
-/// workers via complete_validation() and read by orchestrator to make chain
-/// progression decisions.
-const VALIDATION_RESULTS: TableDefinition<[u8; 32], Vec<u8>> =
-    TableDefinition::new("validation_results");
 
 /// Complete record of all known blocks, including forks.
 ///
@@ -311,13 +264,9 @@ impl ValidatorDB {
             // The table initialization process is safe for existing databases - it
             // ensures all required tables exist but does not overwrite existing data.
             let _canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
-            let _remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
-            let _task_list = write_txn.open_table(TASK_LIST)?;
-            let _ongoing_tasks = write_txn.open_table(ONGOING_TASKS)?;
             let _block_data = write_txn.open_table(BLOCK_DATA)?;
             let _witnesses = write_txn.open_table(WITNESSES)?;
             let _mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
-            let _validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
             let _block_records = write_txn.open_table(BLOCK_RECORDS)?;
             let _contracts = write_txn.open_table(CONTRACTS)?;
             let _anchor_block = write_txn.open_table(ANCHOR_BLOCK)?;
@@ -343,7 +292,6 @@ impl ValidatorDB {
     ) -> ValidationDbResult<()> {
         let write_txn = self.database.begin_write()?;
         {
-            let mut task_list = write_txn.open_table(TASK_LIST)?;
             let mut block_data = write_txn.open_table(BLOCK_DATA)?;
             let mut witnesses = write_txn.open_table(WITNESSES)?;
             let mut mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
@@ -353,8 +301,6 @@ impl ValidatorDB {
                 let block_number = block.header.number;
                 let block_hash = block.header.hash.0;
 
-                // Adds the block to the validation task queue (TASK_LIST)
-                task_list.insert((block_number, block_hash), ())?;
                 // Stores the complete block data for worker access (BLOCK_DATA)
                 block_data.insert(block_hash, encode_block_to_vec(block)?)?;
                 // ... and the witness data (WITNESSES and MPT_WITNESSES)
@@ -457,137 +403,25 @@ impl ValidatorDB {
     /// validations including parent hash matching and state root continuity.
     ///
     /// Returns `Ok(true)` if a block was advanced, `Ok(false)` if no work to do.
-    pub fn grow_local_chain(&self) -> ValidationDbResult<bool> {
+    pub fn grow_local_chain(
+        &self,
+        block_number: BlockNumber,
+        block_hash: BlockHash,
+        post_state_root: B256,
+        post_withdrawals_root: B256,
+    ) -> ValidationDbResult<bool> {
         let write_txn = self.database.begin_write()?;
         {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
-            let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
-            let validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
-            let block_data = write_txn.open_table(BLOCK_DATA)?;
-
-            // Get and validate first remote block
-            let (block_number, block_hash_bytes) = match remote_chain.first()? {
-                Some(entry) => (entry.0.value(), entry.1.value()),
-                None => return Ok(false),
-            };
-
-            // Load block header and verify it matches remote chain entry
-            let serialized_block = block_data
-                .get(block_hash_bytes)?
-                .expect("block data must exist for blocks in remote chain");
-            let header = decode_block_from_slice(&serialized_block.value()).header;
-
-            assert_eq!(header.number, block_number);
-            assert_eq!(header.hash.0, block_hash_bytes);
-
-            // Ensure block validation succeeded
-            let result: ValidationResult = match validation_results.get(block_hash_bytes)? {
-                Some(serialized) => decode_from_slice(&serialized.value()),
-                None => return Ok(false), // Validation not complete yet
-            };
-
-            if !result.success {
-                return Err(ValidationDbError::FailedValidation(
-                    result.error_message.unwrap_or_else(|| {
-                        "Validation failed but no error message was provided".to_string()
-                    }),
-                ));
-            }
-
-            // Verify parent chain extension for non-genesis blocks
-            if header.number > 0 {
-                let (parent_post_state, parent_post_withdrawals) = {
-                    let parent_value = canonical_chain
-                        .get(header.number - 1)?
-                        .expect("parent block must exist in canonical chain")
-                        .value();
-                    (B256::from(parent_value.1), B256::from(parent_value.2))
-                };
-
-                if result.pre_state_root != parent_post_state {
-                    return Err(ValidationDbError::FailedValidation(
-                        ValidationError::PreStateRootMismatch {
-                            expected: parent_post_state,
-                            actual: result.pre_state_root,
-                        }
-                        .to_string(),
-                    ));
-                }
-
-                if result.pre_withdrawals_root != parent_post_withdrawals {
-                    return Err(ValidationDbError::FailedValidation(
-                        ValidationError::PreWithdrawalsRootMismatch {
-                            expected: parent_post_withdrawals,
-                            actual: result.pre_withdrawals_root,
-                        }
-                        .to_string(),
-                    ));
-                }
-            }
 
             // Move block from remote to canonical chain
             canonical_chain.insert(
-                header.number,
-                (
-                    header.hash.0,
-                    result.post_state_root.0,
-                    result.post_withdrawals_root.0,
-                ),
+                block_number,
+                (block_hash.0, post_state_root.0, post_withdrawals_root.0),
             )?;
-            remote_chain.remove(header.number)?;
         }
         write_txn.commit()?;
         Ok(true)
-    }
-
-    /// Extends the remote chain with a sequence of unvalidated blocks.
-    ///
-    /// Adds newly received blocks to the remote chain for future validation.
-    /// Verifies that each block's parent_hash matches the current remote chain
-    /// tip to ensure proper chain extension.
-    ///
-    /// # Arguments
-    /// * `headers` - A consecutive sequence of blocks to append.
-    pub fn grow_remote_chain<'a, I>(&self, headers: I) -> ValidationDbResult<()>
-    where
-        I: IntoIterator<Item = &'a Header>,
-    {
-        let write_txn = self.database.begin_write()?;
-        {
-            let canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
-            let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
-
-            // Compute parent block (from remote chain if not empty, otherwise canonical chain)
-            let (mut parent_number, mut parent_hash) =
-                if let Some(last_remote) = remote_chain.last()? {
-                    (last_remote.0.value(), last_remote.1.value())
-                } else if let Some(last_canonical) = canonical_chain.last()? {
-                    let (canonical_number, canonical_value) = last_canonical;
-                    let (canonical_hash, _, _) = canonical_value.value();
-                    (canonical_number.value(), canonical_hash)
-                } else {
-                    (0, [0u8; 32])
-                };
-
-            // Validate chain structure and insert each header sequentially
-            for header in headers {
-                // Ensure block number increments by exactly 1 and parent hash links correctly
-                if header.number != parent_number + 1 || header.parent_hash != parent_hash {
-                    return Err(ValidationDbError::InvalidChainExtension {
-                        block_number: header.number,
-                        expected_parent_hash: BlockHash::from(header.parent_hash),
-                        actual_parent_hash: BlockHash::from(parent_hash),
-                    });
-                }
-
-                // Add header to remote chain and update parent for next iteration
-                let block_hash = BlockHash::from(header.hash).0;
-                remote_chain.insert(header.number, block_hash)?;
-                (parent_number, parent_hash) = (header.number, block_hash);
-            }
-        }
-        write_txn.commit()?;
-        Ok(())
     }
 
     /// Rolls back the local chain view in response to chain reorg
@@ -598,7 +432,6 @@ impl ValidatorDB {
         let write_txn = self.database.begin_write()?;
         {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
-            let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
 
             // Rollback canonical chain to specified block
             let canonical_blocks_to_remove = canonical_chain
@@ -609,156 +442,9 @@ impl ValidatorDB {
             for block_number in canonical_blocks_to_remove {
                 canonical_chain.remove(block_number)?;
             }
-
-            // Rollback remote chain to specified block
-            let remote_blocks_to_remove = remote_chain
-                .range((to_block + 1)..)?
-                .map(|result| result.map(|(block_number, _)| block_number.value()))
-                .collect::<Result<Vec<_>, _>>()?;
-
-            for block_number in remote_blocks_to_remove {
-                remote_chain.remove(block_number)?;
-            }
         }
         write_txn.commit()?;
         Ok(())
-    }
-
-    /// Records the completion of a validation task
-    ///
-    /// Called by workers when they finish validating a block. Stores the validation
-    /// result and marks the task as complete.
-    pub fn complete_validation(&self, result: ValidationResult) -> ValidationDbResult<()> {
-        let write_txn = self.database.begin_write()?;
-        {
-            // Store validation result
-            let mut validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
-            validation_results.insert(result.block_hash.0, encode_to_vec(&result)?)?;
-
-            // Remove from ongoing tasks
-            let mut ongoing_tasks = write_txn.open_table(ONGOING_TASKS)?;
-            ongoing_tasks.remove((result.block_number, result.block_hash.0))?;
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
-
-    /// Claims the next validation task atomically
-    ///
-    /// Workers call this to get the next block that needs validation. The method
-    /// atomically moves the lowest block number task from the pending queue to the
-    /// in-progress state, preventing other workers from claiming the same task.
-    ///
-    /// # Behavior:
-    /// - Returns tasks in ascending block number order (lowest first)
-    /// - Skips tasks with block numbers ≤ current canonical chain tip (stale tasks)
-    /// - Stale tasks remain in TASK_LIST for potential reorg recovery
-    /// - Atomically moves task from TASK_LIST to ONGOING_TASKS
-    /// - Loads and deserializes the complete block data and witness
-    /// - Returns None if no suitable tasks are available
-    ///
-    /// # Workflow:
-    /// After claiming a task, workers should validate the block and call
-    /// `complete_validation()` to record the result and mark the task finished.
-    /// If a worker crashes, use `recover_interrupted_tasks()` to recover incomplete work.
-    ///
-    /// # Returns:
-    /// - `Ok(Some((block, witness)))` - Next task with all required validation data
-    /// - `Ok(None)` - No tasks available, worker should wait or exit
-    /// - `Err(...)` - Database error, serialization failure, or missing block/witness data
-    pub fn get_next_task(
-        &self,
-    ) -> ValidationDbResult<Option<(Block<Transaction>, SaltWitness, MptWitness)>> {
-        let write_txn = self.database.begin_write()?;
-
-        let result = {
-            let mut task_list = write_txn.open_table(TASK_LIST)?;
-            let mut ongoing_tasks = write_txn.open_table(ONGOING_TASKS)?;
-            let canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
-
-            // Get first task that's ahead of canonical tip using range query
-            let range_start = match canonical_chain.last()? {
-                Some((canonical_key, _)) => {
-                    let tip_block = canonical_key.value();
-                    (tip_block + 1, [0u8; 32])
-                }
-                None => (0u64, [0u8; 32]),
-            };
-
-            // Find first valid task
-            let next_task = task_list
-                .range(range_start..)?
-                .next()
-                .transpose()?
-                .map(|(task_key, _)| task_key.value());
-
-            match next_task {
-                Some(block_num_hash) => {
-                    let (_, block_hash_bytes) = block_num_hash;
-                    let block_hash = BlockHash::from(block_hash_bytes);
-
-                    // Move task to ongoing
-                    task_list.remove(block_num_hash)?;
-                    ongoing_tasks.insert(block_num_hash, ())?;
-
-                    // Load block data and witness
-                    let block_data = write_txn.open_table(BLOCK_DATA)?;
-                    let witnesses = write_txn.open_table(WITNESSES)?;
-                    let mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
-
-                    let block = decode_block_from_slice(
-                        &block_data
-                            .get(block_hash_bytes)?
-                            .ok_or(ValidationDbError::MissingData {
-                                kind: MissingDataKind::BlockData,
-                                block_hash,
-                            })?
-                            .value(),
-                    );
-                    let witness = decode_from_slice(
-                        &witnesses
-                            .get(block_hash_bytes)?
-                            .ok_or(ValidationDbError::MissingData {
-                                kind: MissingDataKind::Witness,
-                                block_hash,
-                            })?
-                            .value(),
-                    );
-                    let mpt_witness = decode_from_slice(
-                        &mpt_witnesses
-                            .get(block_hash_bytes)?
-                            .ok_or(ValidationDbError::MissingData {
-                                kind: MissingDataKind::MptWitness,
-                                block_hash,
-                            })?
-                            .value(),
-                    );
-
-                    Some((block, witness, mpt_witness))
-                }
-                None => None,
-            }
-        };
-
-        write_txn.commit()?;
-        Ok(result)
-    }
-
-    /// Retrieves the validation result for a block
-    ///
-    /// Returns the validation outcome if available, or None if the block
-    /// hasn't been validated yet.
-    pub fn get_validation_result(
-        &self,
-        block_hash: BlockHash,
-    ) -> ValidationDbResult<Option<ValidationResult>> {
-        let read_txn = self.database.begin_read()?;
-        let validation_results = read_txn.open_table(VALIDATION_RESULTS)?;
-
-        match validation_results.get(block_hash.0)? {
-            Some(serialized_result) => Ok(Some(decode_from_slice(&serialized_result.value()))),
-            None => Ok(None),
-        }
     }
 
     /// Gets the latest block in the local chain
@@ -774,22 +460,6 @@ impl ValidatorDB {
                 let block_number = canonical_key.value();
                 let (block_hash, _, _) = canonical_value.value();
                 Ok(Some((block_number, block_hash.into())))
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Gets the latest block in the remote chain
-    ///
-    /// Returns the highest block number and hash currently in the remote chain,
-    /// or None if the remote chain is empty.
-    pub fn get_remote_tip(&self) -> ValidationDbResult<Option<(BlockNumber, BlockHash)>> {
-        let read_txn = self.database.begin_read()?;
-        let remote_chain = read_txn.open_table(REMOTE_CHAIN)?;
-
-        match remote_chain.last()? {
-            Some((block_number, block_hash)) => {
-                Ok(Some((block_number.value(), block_hash.value().into())))
             }
             None => Ok(None),
         }
@@ -812,7 +482,6 @@ impl ValidatorDB {
         {
             let mut anchor_block_table = write_txn.open_table(ANCHOR_BLOCK)?;
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
-            let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
 
             anchor_block_table.insert("anchor", (block_number, block_hash.0))?;
             canonical_chain.retain(|_, _| false)?;
@@ -820,7 +489,6 @@ impl ValidatorDB {
                 block_number,
                 (block_hash.0, post_state_root.0, post_withdrawals_root.0),
             )?;
-            remote_chain.retain(|_, _| false)?;
         }
         write_txn.commit()?;
         Ok(())
@@ -866,7 +534,6 @@ impl ValidatorDB {
             let mut block_data = write_txn.open_table(BLOCK_DATA)?;
             let mut witnesses = write_txn.open_table(WITNESSES)?;
             let mut mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
-            let mut validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
 
             // Collect keys to remove (blocks older than before_block)
             let keys_to_remove = block_records
@@ -883,7 +550,6 @@ impl ValidatorDB {
                 block_data.remove(block_hash)?;
                 witnesses.remove(block_hash)?;
                 mpt_witnesses.remove(block_hash)?;
-                validation_results.remove(block_hash)?;
             }
 
             pruned_count
@@ -892,51 +558,40 @@ impl ValidatorDB {
         Ok(blocks_pruned)
     }
 
-    /// Recovers tasks that were interrupted by a crash
-    ///
-    /// Moves any tasks that were being processed back to the queue so they can be
-    /// retried. Use this during startup to handle unfinished work from crashes.
-    pub fn recover_interrupted_tasks(&self) -> ValidationDbResult<()> {
-        let write_txn = self.database.begin_write()?;
-        {
-            let mut task_list = write_txn.open_table(TASK_LIST)?;
-            let mut ongoing_tasks = write_txn.open_table(ONGOING_TASKS)?;
+    // /// Retrieves the block hash for a specific block number from the local view
+    // ///
+    // /// Searches the local view which consists of two sequential, non-overlapping chains:
+    // /// - CANONICAL_CHAIN: Lower block numbers (validated blocks)
+    // /// - REMOTE_CHAIN: Higher block numbers (unvalidated blocks extending canonical)
+    // ///
+    // /// # Parameters
+    // /// * `block_number` - The block number to look up in the local view
+    // ///
+    // /// # Returns
+    // /// * `Ok(Some(block_hash))` - Block found at the specified number
+    // /// * `Ok(None)` - No block exists at this number in the local view
+    // /// * `Err(...)` - Database error during lookup
+    // pub fn get_block_hash(
+    //     &self,
+    //     block_number: BlockNumber,
+    // ) -> ValidationDbResult<Option<BlockHash>> {
+    //     let read_txn = self.database.begin_read()?;
+    //     let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
 
-            while let Some((task, _)) = ongoing_tasks.pop_first()? {
-                task_list.insert(task.value(), ())?;
-            }
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
+    //     // Check canonical chain first, then remote chain (sequential, no overlap)
+    //     if let Some(value) = canonical_chain.get(block_number)? {
+    //         return Ok(Some(value.value().0.into()));
+    //     }
+    //     Ok(None)
+    // }
 
-    /// Retrieves the block hash for a specific block number from the local view
-    ///
-    /// Searches the local view which consists of two sequential, non-overlapping chains:
-    /// - CANONICAL_CHAIN: Lower block numbers (validated blocks)
-    /// - REMOTE_CHAIN: Higher block numbers (unvalidated blocks extending canonical)
-    ///
-    /// # Parameters
-    /// * `block_number` - The block number to look up in the local view
-    ///
-    /// # Returns
-    /// * `Ok(Some(block_hash))` - Block found at the specified number
-    /// * `Ok(None)` - No block exists at this number in the local view
-    /// * `Err(...)` - Database error during lookup
-    pub fn get_block_hash(
-        &self,
-        block_number: BlockNumber,
-    ) -> ValidationDbResult<Option<BlockHash>> {
+    pub fn get_block_header(&self, block_hash: BlockHash) -> ValidationDbResult<Option<Header>> {
         let read_txn = self.database.begin_read()?;
-        let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
-        let remote_chain = read_txn.open_table(REMOTE_CHAIN)?;
+        let block_data = read_txn.open_table(BLOCK_DATA)?;
 
-        // Check canonical chain first, then remote chain (sequential, no overlap)
-        if let Some(value) = canonical_chain.get(block_number)? {
-            return Ok(Some(value.value().0.into()));
-        }
-
-        Ok(remote_chain.get(block_number)?.map(|v| v.value().into()))
+        Ok(block_data
+            .get(block_hash.0)?
+            .map(|v| decode_block_from_slice(&v.value()).header))
     }
 
     /// Retrieves the earliest block in the canonical chain
