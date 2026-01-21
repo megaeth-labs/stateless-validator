@@ -96,40 +96,65 @@ impl Writer {
     /// Processes messages from the channel and writes to the database.
     /// Should be spawned as a background task.
     pub async fn run(mut self) {
+        use std::sync::Arc;
+
         info!("[Writer] Background writer started");
 
+        // Wrap db in Arc for sharing with spawn_blocking tasks
+        let db = Arc::new(self.db);
+
         while let Some(msg) = self.receiver.recv().await {
-            if let Err(e) = self.handle_message(msg) {
-                error!("[Writer] Failed to write debug data: {e}");
+            match msg {
+                WriteMsg::PruneHistory(before_block) => {
+                    // Spawn pruning in background thread to avoid blocking the writer loop
+                    let db_clone = Arc::clone(&db);
+                    tokio::task::spawn_blocking(move || {
+                        debug!("[Writer] Pruning history before block {}", before_block);
+                        match db_clone.prune_history(before_block) {
+                            Ok(pruned) if pruned > 0 => {
+                                info!("[Writer] Pruned {} blocks from debug database", pruned);
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                error!("[Writer] Failed to prune history: {e}");
+                            }
+                        }
+                    });
+                }
+                other => {
+                    if let Err(e) = Self::handle_message(&db, other) {
+                        error!("[Writer] Failed to write debug data: {e}");
+                    }
+                }
             }
         }
 
         info!("[Writer] Background writer shutting down");
     }
 
-    fn handle_message(&self, msg: WriteMsg) -> Result<(), crate::validator_db::ValidationDbError> {
+    fn handle_message(
+        db: &ValidatorDB,
+        msg: WriteMsg,
+    ) -> Result<(), crate::validator_db::ValidationDbError> {
         match msg {
             WriteMsg::ValidationData(data) => {
                 debug!("[Writer] Storing validation data for {} blocks", data.len());
-                self.db.store_validation_data(data)?;
+                db.store_validation_data(data)?;
             }
             WriteMsg::ContractCodes(bytecodes) => {
                 debug!("[Writer] Storing {} contract codes", bytecodes.len());
-                self.db.store_contract_codes(bytecodes)?;
+                db.store_contract_codes(bytecodes)?;
             }
             WriteMsg::CanonicalChainEntry(entries) => {
                 debug!(
                     "[Writer] Storing canonical chain entry for block {:?}",
                     entries.iter().map(|i| i.0).collect::<Vec<_>>()
                 );
-                self.db.store_canonical_entries(entries)?;
+                db.store_canonical_entries(entries)?;
             }
-            WriteMsg::PruneHistory(before_block) => {
-                debug!("[Writer] Pruning history before block {}", before_block);
-                let pruned = self.db.prune_history(before_block)?;
-                if pruned > 0 {
-                    info!("[Writer] Pruned {} blocks from debug database", pruned);
-                }
+            WriteMsg::PruneHistory(_) => {
+                // Handled in run() with spawn_blocking
+                unreachable!()
             }
         }
         Ok(())
