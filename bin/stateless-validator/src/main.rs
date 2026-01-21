@@ -22,7 +22,7 @@ use validator_core::{
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
     executor::{ValidationResult, validate_block},
-    validator_db::in_memory_db::InMemoryValidatorDB,
+    validator_db::{in_memory_db::InMemoryValidatorDB, writer::Writer},
     withdrawals::MptWitness,
 };
 
@@ -275,7 +275,13 @@ async fn run() -> Result<()> {
 
     let client = Arc::new(RpcClient::new(&args.rpc_endpoint, &args.witness_endpoint)?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
-    let memory_db = Arc::new(InMemoryValidatorDB::new());
+
+    // Create background writer for async persistence to redb
+    let (writer_handle, writer) = Writer::new(work_dir.join(VALIDATOR_DB_FILENAME))?;
+    task::spawn(async move {
+        writer.run().await;
+    });
+    let memory_db = Arc::new(InMemoryValidatorDB::with_writer(Some(writer_handle)));
 
     // Load chain spec from file (first run) or database (subsequent runs)
     let chain_spec = Arc::new(load_or_create_chain_spec(

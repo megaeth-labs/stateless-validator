@@ -69,7 +69,7 @@ use salt::SaltWitness;
 
 use crate::{
     executor::ValidationResult,
-    validator_db::{MissingDataKind, ValidationDbError, ValidationDbResult},
+    validator_db::{MissingDataKind, ValidationDbError, ValidationDbResult, writer::WriterHandle},
     withdrawals::MptWitness,
 };
 
@@ -104,6 +104,9 @@ pub struct InMemoryValidatorDB {
     validation_results: DashMap<BlockHash, ValidationResult>,
     /// LRU cache of contract bytecode (max 1000 entries)
     contracts: Cache<B256, Bytecode>,
+
+    /// Optional handle for async background persistence
+    writer: Option<WriterHandle>,
 }
 
 impl Default for InMemoryValidatorDB {
@@ -125,6 +128,23 @@ impl InMemoryValidatorDB {
             block_records: DashMap::new(),
             validation_results: DashMap::new(),
             contracts: Cache::new(1000),
+            writer: None,
+        }
+    }
+
+    /// Create a new in-memory database instance with an optional writer for async persistence.
+    pub fn with_writer(writer: Option<WriterHandle>) -> Self {
+        Self {
+            task_list: SegQueue::new(),
+            block_data: DashMap::new(),
+            witnesses: DashMap::new(),
+            mpt_witnesses: DashMap::new(),
+            canonical_chain: RwLock::new(BTreeMap::new()),
+            remote_chain: RwLock::new(BTreeMap::new()),
+            block_records: DashMap::new(),
+            validation_results: DashMap::new(),
+            contracts: Cache::new(1000),
+            writer,
         }
     }
 
@@ -152,6 +172,11 @@ impl InMemoryValidatorDB {
             self.block_records.insert((block_number, block_hash), ());
             self.task_list.push((block_number, block_hash));
         }
+
+        // Persist to writer if configured
+        if let Some(ref writer) = self.writer {
+            writer.store_validation_data(tasks.to_vec());
+        }
     }
 
     /// Stores multiple contract bytecodes in the cache
@@ -161,9 +186,18 @@ impl InMemoryValidatorDB {
     /// of fetching externally. The code hash is computed automatically from
     /// the bytecode to ensure data integrity.
     pub fn add_contract_codes<'a>(&self, bytecodes: impl IntoIterator<Item = &'a Bytecode>) {
-        for bytecode in bytecodes {
-            let code_hash = bytecode.hash_slow();
-            self.contracts.insert(code_hash, bytecode.clone());
+        let bytecodes_vec: Vec<Bytecode> = bytecodes
+            .into_iter()
+            .map(|b| {
+                let code_hash = b.hash_slow();
+                self.contracts.insert(code_hash, b.clone());
+                b.clone()
+            })
+            .collect();
+
+        // Persist to writer if configured
+        if let Some(ref writer) = self.writer {
+            writer.store_contract_codes(bytecodes_vec);
         }
     }
 
@@ -184,19 +218,6 @@ impl InMemoryValidatorDB {
             None => return Ok(false),
         };
 
-        // Load block header and verify
-        let block = self
-            .block_data
-            .get(&block_hash)
-            .ok_or(ValidationDbError::MissingData {
-                kind: MissingDataKind::BlockData,
-                block_hash,
-            })?;
-        let header = &block.header;
-
-        assert_eq!(header.number, block_number);
-        assert_eq!(header.hash, block_hash);
-
         // Ensure block validation succeeded
         let result = match self.validation_results.get(&block_hash) {
             Some(data) => data.clone(),
@@ -210,6 +231,19 @@ impl InMemoryValidatorDB {
                 }),
             ));
         }
+
+        // Load block header and verify
+        let block = self
+            .block_data
+            .get(&block_hash)
+            .ok_or(ValidationDbError::MissingData {
+                kind: MissingDataKind::BlockData,
+                block_hash,
+            })?;
+        let header = &block.header;
+
+        assert_eq!(header.number, block_number);
+        assert_eq!(header.hash, block_hash);
 
         // Verify parent chain extension for non-genesis blocks
         if header.number > 0 {
@@ -243,6 +277,16 @@ impl InMemoryValidatorDB {
             ),
         );
         remote_chain.remove(&header.number);
+
+        // Persist to writer if configured
+        if let Some(ref writer) = self.writer {
+            writer.store_canonical_chain_entry(vec![(
+                header.number,
+                header.hash,
+                result.post_state_root,
+                result.post_withdrawals_root,
+            )]);
+        }
 
         Ok(true)
     }
@@ -511,6 +555,11 @@ impl InMemoryValidatorDB {
             self.witnesses.remove(&block_hash);
             self.mpt_witnesses.remove(&block_hash);
             self.validation_results.remove(&block_hash);
+        }
+
+        // Persist prune request to writer if configured
+        if let Some(ref writer) = self.writer {
+            writer.prune_history(before_block);
         }
 
         Ok(pruned_count)

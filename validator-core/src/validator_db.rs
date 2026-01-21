@@ -63,6 +63,7 @@ use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, Header};
 use op_alloy_rpc_types::Transaction;
+use rayon::prelude::*;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use revm::state::Bytecode;
 use salt::SaltWitness;
@@ -70,8 +71,9 @@ use serde_json;
 use thiserror::Error;
 
 pub mod in_memory_db;
+pub mod writer;
 
-use crate::{executor::ValidationResult, withdrawals::MptWitness};
+use crate::withdrawals::MptWitness;
 
 /// Stores our local view of the canonical chain.
 ///
@@ -210,7 +212,6 @@ pub enum MissingDataKind {
     BlockData,
     Witness,
     MptWitness,
-    ValidationResult,
 }
 
 impl fmt::Display for MissingDataKind {
@@ -219,7 +220,6 @@ impl fmt::Display for MissingDataKind {
             MissingDataKind::BlockData => "block data",
             MissingDataKind::Witness => "witness",
             MissingDataKind::MptWitness => "mpt witness",
-            MissingDataKind::ValidationResult => "validation result",
         };
         f.write_str(label)
     }
@@ -286,10 +286,27 @@ impl ValidatorDB {
     ///   - `Block<Transaction>` - The complete block data including header and transactions
     ///   - `SaltWitness` - The SALT-based execution witness required for stateless validation
     ///   - `MptWitness` - The MPT-based witness required for withdrawal validation
-    pub fn add_validation_tasks(
+    pub fn store_validation_data(
         &self,
-        tasks: &[(Block<Transaction>, SaltWitness, MptWitness)],
+        tasks: Vec<(Block<Transaction>, SaltWitness, MptWitness)>,
     ) -> ValidationDbResult<()> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+
+        let tasks = tasks
+            .par_iter()
+            .map(|(block, salt_witness, mpt_witness)| {
+                Ok::<_, ValidationDbError>((
+                    block.header.number,
+                    block.header.hash.0,
+                    encode_block_to_vec(block)?,
+                    encode_to_vec(salt_witness)?,
+                    encode_to_vec(mpt_witness)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         let write_txn = self.database.begin_write()?;
         {
             let mut block_data = write_txn.open_table(BLOCK_DATA)?;
@@ -297,15 +314,12 @@ impl ValidatorDB {
             let mut mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
             let mut block_records = write_txn.open_table(BLOCK_RECORDS)?;
 
-            for (block, salt_witness, mpt_witness) in tasks {
-                let block_number = block.header.number;
-                let block_hash = block.header.hash.0;
-
+            for (block_number, block_hash, block, salt_witness, mpt_witness) in tasks {
                 // Stores the complete block data for worker access (BLOCK_DATA)
-                block_data.insert(block_hash, encode_block_to_vec(block)?)?;
+                block_data.insert(block_hash, block)?;
                 // ... and the witness data (WITNESSES and MPT_WITNESSES)
-                witnesses.insert(block_hash, encode_to_vec(salt_witness)?)?;
-                mpt_witnesses.insert(block_hash, encode_to_vec(mpt_witness)?)?;
+                witnesses.insert(block_hash, salt_witness)?;
+                mpt_witnesses.insert(block_hash, mpt_witness)?;
                 // Records the block in the block registry (BLOCK_RECORDS)
                 block_records.insert((block_number, block_hash), ())?;
             }
@@ -320,16 +334,22 @@ impl ValidatorDB {
     /// so future validations can retrieve it via get_contract_codes() instead
     /// of fetching externally. The code hash is computed automatically from
     /// the bytecode to ensure data integrity.
-    pub fn add_contract_codes<'a>(
-        &self,
-        bytecodes: impl IntoIterator<Item = &'a Bytecode>,
-    ) -> ValidationDbResult<()> {
+    pub fn store_contract_codes(&self, bytecodes: Vec<Bytecode>) -> ValidationDbResult<()> {
+        if bytecodes.is_empty() {
+            return Ok(());
+        }
+
+        let bytecodes = bytecodes
+            .par_iter()
+            .map(|bytecode| {
+                Ok::<_, ValidationDbError>((bytecode.hash_slow(), encode_to_vec(bytecode)?))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         let write_txn = self.database.begin_write()?;
         {
             let mut contracts = write_txn.open_table(CONTRACTS)?;
-            for bytecode in bytecodes {
-                let code_hash = bytecode.hash_slow();
-                let serialized_bytecode = encode_to_vec(bytecode)?;
+            for (code_hash, serialized_bytecode) in bytecodes {
                 contracts.insert(code_hash.0, serialized_bytecode)?;
             }
         }
@@ -349,11 +369,11 @@ impl ValidatorDB {
     /// * `Ok(())` - Genesis successfully stored
     /// * `Err(ValidationDbError)` - Database or serialization error
     pub fn store_genesis(&self, genesis: &Genesis) -> ValidationDbResult<()> {
+        let serialized_genesis = serde_json::to_vec(genesis).map_err(SerializationError::Json)?;
+
         let write_txn = self.database.begin_write()?;
         {
             let mut genesis_table = write_txn.open_table(GENESIS_CONFIG)?;
-            let serialized_genesis =
-                serde_json::to_vec(genesis).map_err(SerializationError::Json)?;
             genesis_table.insert("genesis", serialized_genesis)?;
         }
         write_txn.commit()?;
@@ -403,25 +423,28 @@ impl ValidatorDB {
     /// validations including parent hash matching and state root continuity.
     ///
     /// Returns `Ok(true)` if a block was advanced, `Ok(false)` if no work to do.
-    pub fn grow_local_chain(
+    pub fn store_canonical_entries(
         &self,
-        block_number: BlockNumber,
-        block_hash: BlockHash,
-        post_state_root: B256,
-        post_withdrawals_root: B256,
-    ) -> ValidationDbResult<bool> {
+        entries: Vec<(BlockNumber, BlockHash, B256, B256)>,
+    ) -> ValidationDbResult<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
         let write_txn = self.database.begin_write()?;
         {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
 
             // Move block from remote to canonical chain
-            canonical_chain.insert(
-                block_number,
-                (block_hash.0, post_state_root.0, post_withdrawals_root.0),
-            )?;
+            for (block_number, block_hash, post_state_root, post_withdrawals_root) in entries {
+                canonical_chain.insert(
+                    block_number,
+                    (block_hash.0, post_state_root.0, post_withdrawals_root.0),
+                )?;
+            }
         }
         write_txn.commit()?;
-        Ok(true)
+        Ok(())
     }
 
     /// Rolls back the local chain view in response to chain reorg
@@ -429,15 +452,18 @@ impl ValidatorDB {
     /// Removes blocks from both the remote chain and canonical chain when a reorg
     /// occurs, reverting to the specified block number.
     pub fn rollback_chain(&self, to_block: BlockNumber) -> ValidationDbResult<()> {
+        let read_txn = self.database.begin_read()?;
+        let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
+
+        // Rollback canonical chain to specified block
+        let canonical_blocks_to_remove = canonical_chain
+            .range((to_block + 1)..)?
+            .map(|result| result.map(|(key, _)| key.value()))
+            .collect::<Result<Vec<_>, _>>()?;
+
         let write_txn = self.database.begin_write()?;
         {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
-
-            // Rollback canonical chain to specified block
-            let canonical_blocks_to_remove = canonical_chain
-                .range((to_block + 1)..)?
-                .map(|result| result.map(|(key, _)| key.value()))
-                .collect::<Result<Vec<_>, _>>()?;
 
             for block_number in canonical_blocks_to_remove {
                 canonical_chain.remove(block_number)?;
@@ -527,6 +553,17 @@ impl ValidatorDB {
     ///
     /// Returns the number of blocks that were actually pruned.
     pub fn prune_history(&self, before_block: BlockNumber) -> ValidationDbResult<u64> {
+        let read_txn = self.database.begin_read()?;
+        let block_records = read_txn.open_table(BLOCK_RECORDS)?;
+
+        // Collect keys to remove (blocks older than before_block)
+        let keys_to_remove = block_records
+            .range(..(before_block, [0u8; 32]))?
+            .map(|result| result.map(|(key, _)| key.value()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let pruned_count = keys_to_remove.len() as u64;
+
         let write_txn = self.database.begin_write()?;
         let blocks_pruned = {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
@@ -534,14 +571,6 @@ impl ValidatorDB {
             let mut block_data = write_txn.open_table(BLOCK_DATA)?;
             let mut witnesses = write_txn.open_table(WITNESSES)?;
             let mut mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
-
-            // Collect keys to remove (blocks older than before_block)
-            let keys_to_remove = block_records
-                .range(..(before_block, [0u8; 32]))?
-                .map(|result| result.map(|(key, _)| key.value()))
-                .collect::<Result<Vec<_>, _>>()?;
-
-            let pruned_count = keys_to_remove.len() as u64;
 
             for (block_number, block_hash) in keys_to_remove {
                 // Remove from all relevant tables

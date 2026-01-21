@@ -5594,6 +5594,7 @@ dependencies = [
  "op-alloy-rpc-types",
  "parking_lot",
  "quick_cache",
+ "rayon",
  "redb",
  "reth-ethereum-forks",
  "reth-optimism-chainspec",
@@ -5605,6 +5606,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.17",
+ "tokio",
  "tracing",
 ]
 
