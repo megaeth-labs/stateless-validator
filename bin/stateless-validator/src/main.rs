@@ -274,18 +274,15 @@ async fn run() -> Result<()> {
     let work_dir = PathBuf::from(args.data_dir);
 
     let client = Arc::new(RpcClient::new(&args.rpc_endpoint, &args.witness_endpoint)?);
-    let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
 
     // Create background writer for async persistence to redb
+    // NOTE: Writer creates the only ValidatorDB instance to avoid lock conflicts
     let (writer_handle, writer) = Writer::new(work_dir.join(VALIDATOR_DB_FILENAME))?;
-    task::spawn(async move {
-        writer.run().await;
-    });
-    let memory_db = Arc::new(InMemoryValidatorDB::with_writer(Some(writer_handle)));
 
     // Load chain spec from file (first run) or database (subsequent runs)
+    // Use writer.db() for all initial database access before spawning the writer task
     let chain_spec = Arc::new(load_or_create_chain_spec(
-        &validator_db,
+        writer.db(),
         args.genesis_file.as_deref(),
     )?);
     info!("[Main] Chain spec loaded successfully");
@@ -312,7 +309,8 @@ async fn run() -> Result<()> {
             .withdrawals_root
             .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", block_hash))?;
 
-        validator_db
+        writer
+            .db()
             .reset_anchor_block(
                 block.header.number,
                 block.header.hash,
@@ -321,41 +319,55 @@ async fn run() -> Result<()> {
             )
             .map_err(|e| anyhow!("Failed to reset anchor: {}", e))?;
 
-        memory_db.reset_anchor_block(
-            block.header.number,
-            block.header.hash,
-            block.header.state_root,
-            withdrawals_root,
-        );
-
         info!(
             "[Main] Successfully initialized from block {} (number: {})",
             block.header.hash, block.header.number
         );
-        (block.header.number, block.header.hash)
+        (
+            block.header.number,
+            block.header.hash,
+            block.header.state_root,
+            withdrawals_root,
+        )
     } else {
         // If no start block was provided, ensure we have an existing canonical chain
-        let (block_number, block_hash) = validator_db
+        let (block_number, block_hash) = writer
+            .db()
             .get_local_tip()?
             .ok_or_else(|| anyhow!("No trusted starting point found. Specify a trusted block with --start-block <blockhash>"))?;
-        let header = validator_db
+        let header = writer
+            .db()
             .get_block_header(block_hash)?
             .ok_or_else(|| anyhow!("Block {} not found", block_hash))?;
-        memory_db.reset_anchor_block(
-            header.number,
-            header.hash,
-            header.state_root,
-            header
-                .withdrawals_root
-                .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", block_hash))?,
-        );
+        let withdrawals_root = header
+            .withdrawals_root
+            .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", block_hash))?;
         info!("[Main] Continuing from existing canonical chain");
-        (block_number, block_hash)
+        (
+            block_number,
+            block_hash,
+            header.state_root,
+            withdrawals_root,
+        )
     };
+
+    // Now spawn the writer task after all initial database reads are done
+    task::spawn(async move {
+        writer.run().await;
+    });
+
+    // Create in-memory db with writer handle for runtime operations
+    let memory_db = Arc::new(InMemoryValidatorDB::with_writer(Some(writer_handle)));
+    memory_db.reset_anchor_block(
+        anchor_block.0,
+        anchor_block.1,
+        anchor_block.2,
+        anchor_block.3,
+    );
 
     // Create chain sync configuration
     let config = Arc::new(ChainSyncConfig {
-        concurrent_workers: num_cpus::get().min(16),
+        concurrent_workers: num_cpus::get(),
         report_validation_results: args.report_validation_results,
         metrics_enabled: args.metrics_enabled,
         metrics_port: args.metrics_port,
@@ -379,7 +391,7 @@ async fn run() -> Result<()> {
         memory_db.clone(),
         config,
         chain_spec,
-        anchor_block,
+        (anchor_block.0, anchor_block.1),
     );
 
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
@@ -964,10 +976,13 @@ async fn history_pruner(
 
     loop {
         if let Some((current_tip, _)) = memory_db.get_local_tip() {
-            let prune_before = current_tip.saturating_sub(config.pruner_memory_blocks_to_keep);
-            match memory_db.prune_history(prune_before) {
+            let memory_before = current_tip.saturating_sub(config.pruner_memory_blocks_to_keep);
+            let db_before = current_tip.saturating_sub(config.pruner_db_blocks_to_keep);
+            match memory_db.prune_history(memory_before, db_before) {
                 Ok(blocks_pruned) if blocks_pruned > 0 => {
-                    debug!("[Pruner] Pruned {blocks_pruned} blocks before block {prune_before}");
+                    debug!(
+                        "[Pruner] Memory: Pruned {blocks_pruned} blocks before block {memory_before}, DB: Pruned {blocks_pruned} blocks before block {db_before}"
+                    );
                     metrics::on_blocks_pruned(blocks_pruned);
                 }
                 Err(e) => warn!("[Pruner] Failed to prune old block data: {e}"),

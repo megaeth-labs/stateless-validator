@@ -535,14 +535,18 @@ impl InMemoryValidatorDB {
     /// for blocks older than the specified block number.
     ///
     /// Returns the number of blocks that were actually pruned.
-    pub fn prune_history(&self, before_block: BlockNumber) -> ValidationDbResult<u64> {
+    pub fn prune_history(
+        &self,
+        memory_before_block: BlockNumber,
+        db_before_block: BlockNumber,
+    ) -> ValidationDbResult<u64> {
         let mut canonical_chain = self.canonical_chain.write();
 
         // Collect keys to remove
         let keys_to_remove: Vec<_> = self
             .block_records
             .iter()
-            .filter(|entry| entry.key().0 < before_block)
+            .filter(|entry| entry.key().0 < memory_before_block)
             .map(|entry| *entry.key())
             .collect();
 
@@ -559,7 +563,7 @@ impl InMemoryValidatorDB {
 
         // Persist prune request to writer if configured
         if let Some(ref writer) = self.writer {
-            writer.prune_history(before_block);
+            writer.prune_history(db_before_block);
         }
 
         Ok(pruned_count)
