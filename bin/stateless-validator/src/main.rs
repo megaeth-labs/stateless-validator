@@ -173,8 +173,8 @@ pub struct ChainSyncConfig {
 impl Default for ChainSyncConfig {
     fn default() -> Self {
         Self {
-            concurrent_workers: num_cpus::get(),
-            sync_poll_interval: Duration::from_secs(1),
+            concurrent_workers: num_cpus::get().min(16),
+            sync_poll_interval: Duration::from_secs(5),
             sync_target: None,
             tracker_lookahead_blocks: 80,
             tracker_poll_interval: Duration::from_millis(100),
@@ -284,26 +284,18 @@ async fn run() -> Result<()> {
         info!("[Main] Initializing from start block: {}", start_block_str);
 
         let block_hash = parse_block_hash(start_block_str)?;
-        let block = loop {
-            match client
-                .get_block(BlockId::Hash(block_hash.into()), false)
-                .await
-            {
-                Ok(block) => break block,
-                Err(e) => {
-                    warn!("[Main] Failed to fetch block {block_hash}: {e}, retrying...",);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-        };
+        let block_header = validator_db
+            .get_earliest_local_block_header()?
+            .ok_or_else(|| {
+                anyhow!("No local blocks found in database. Cannot initialize from start block.")
+            })?;
 
         validator_db
             .reset_anchor_block(
-                block.header.number,
-                block.header.hash,
-                block.header.state_root,
-                block
-                    .header
+                block_header.number,
+                block_header.hash,
+                block_header.state_root,
+                block_header
                     .withdrawals_root
                     .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", block_hash))?,
             )
@@ -311,7 +303,7 @@ async fn run() -> Result<()> {
 
         info!(
             "[Main] Successfully initialized from block {} (number: {})",
-            block.header.hash, block.header.number
+            block_header.hash, block_header.number
         );
     } else {
         // If no start block was provided, ensure we have an existing canonical chain
@@ -324,7 +316,7 @@ async fn run() -> Result<()> {
 
     // Create chain sync configuration
     let config = Arc::new(ChainSyncConfig {
-        concurrent_workers: num_cpus::get(),
+        concurrent_workers: num_cpus::get().min(16),
         report_validation_results: args.report_validation_results,
         metrics_enabled: args.metrics_enabled,
         metrics_port: args.metrics_port,
@@ -395,20 +387,20 @@ async fn chain_sync(
         config.concurrent_workers
     );
 
-    // Step 1: Recover any interrupted tasks from previous crashes
-    info!("[Chain Sync] Recovering interrupted validation tasks from previous runs...");
-    validator_db
-        .recover_interrupted_tasks()
-        .map_err(|e| anyhow!("Failed to recover interrupted tasks: {}", e))?;
-    info!("[Chain Sync] Task recovery completed");
+    // // Step 1: Recover any interrupted tasks from previous crashes
+    // info!("[Chain Sync] Recovering interrupted validation tasks from previous runs...");
+    // validator_db
+    //     .recover_interrupted_tasks()
+    //     .map_err(|e| anyhow!("Failed to recover interrupted tasks: {}", e))?;
+    // info!("[Chain Sync] Task recovery completed");
 
-    // Step 2: Spawn remote chain tracker
-    info!("[Chain Sync] Starting remote chain tracker...");
-    task::spawn(remote_chain_tracker(
-        Arc::clone(&client),
-        Arc::clone(&validator_db),
-        Arc::clone(&config),
-    ));
+    // // Step 2: Spawn remote chain tracker
+    // info!("[Chain Sync] Starting remote chain tracker...");
+    // task::spawn(remote_chain_tracker(
+    //     Arc::clone(&client),
+    //     Arc::clone(&validator_db),
+    //     Arc::clone(&config),
+    // ));
 
     // Step 3: Spawn validation reporter (optional, based on config)
     if config.report_validation_results {
@@ -422,11 +414,11 @@ async fn chain_sync(
         info!("[Chain Sync] Validation reporter disabled (validation reporting not enabled)");
     }
 
-    // Step 4: Spawn history pruner
-    task::spawn(history_pruner(
-        Arc::clone(&validator_db),
-        Arc::clone(&config),
-    ));
+    // // Step 4: Spawn history pruner
+    // task::spawn(history_pruner(
+    //     Arc::clone(&validator_db),
+    //     Arc::clone(&config),
+    // ));
 
     // Step 5: Spawn validation workers as tokio tasks
     info!(
@@ -467,6 +459,9 @@ async fn chain_sync(
                 debug!("[Chain Sync] Advanced canonical chain by {blocks_advanced} blocks");
             } else {
                 // No work to do, wait a bit before polling again
+                debug!(
+                    "[Chain Sync] Advanced canonical chain by {blocks_advanced} blocks, sleeping"
+                );
                 tokio::time::sleep(config.sync_poll_interval).await;
             }
 
@@ -741,8 +736,8 @@ async fn validate_one(
     validator_db: &ValidatorDB,
     chain_spec: Arc<ChainSpec>,
 ) -> Result<bool> {
-    match validator_db.get_next_task()? {
-        Some((block, witness, mpt_witness)) => {
+    match validator_db.get_next_task() {
+        Ok(Some((block, witness, mpt_witness))) => {
             let block_number = block.header.number;
             let tx_count = block.transactions.len() as u64;
             let gas_used = block.header.gas_used;
@@ -833,7 +828,24 @@ async fn validate_one(
 
             Ok(true)
         }
-        None => Ok(false),
+        Ok(None) => {
+            // Log queue status periodically for debugging
+            if worker_id == 0 {
+                if let Ok((task_count, canonical_tip, first_task)) =
+                    validator_db.get_task_queue_status()
+                {
+                    debug!(
+                        "[Worker 0] No task available. Queue status: tasks={}, canonical_tip={:?}, first_task={:?}",
+                        task_count, canonical_tip, first_task
+                    );
+                }
+            }
+            Ok(false)
+        }
+        Err(e) => {
+            error!("[Worker {worker_id}] Failed to get next task: {e}");
+            Err(e.into())
+        }
     }
 }
 

@@ -63,11 +63,12 @@ use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, Header};
 use op_alloy_rpc_types::Transaction;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use revm::state::Bytecode;
 use salt::SaltWitness;
 use serde_json;
 use thiserror::Error;
+use tracing::info;
 
 use crate::{
     executor::{ValidationError, ValidationResult},
@@ -813,6 +814,27 @@ impl ValidatorDB {
             let mut anchor_block_table = write_txn.open_table(ANCHOR_BLOCK)?;
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
             let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
+            let mut ongoing_tasks = write_txn.open_table(ONGOING_TASKS)?;
+            let mut task_list = write_txn.open_table(TASK_LIST)?;
+            let block_records = write_txn.open_table(BLOCK_RECORDS)?;
+
+            task_list.retain(|_, _| false)?;
+
+            // Add block_records entries from block_number onwards to task_list for re-validation
+            let mut tasks_added = 0u64;
+            for result in block_records.range((block_number + 1, [0u8; 32])..)? {
+                if tasks_added >= 600 {
+                    break;
+                }
+                let (key, _) = result?;
+                let (block_num, hash) = key.value();
+                task_list.insert((block_num, hash), ())?;
+                tasks_added += 1;
+            }
+            info!(
+                "[ValidatorDB] reset_anchor_block: anchor={}, tasks_added={}",
+                block_number, tasks_added
+            );
 
             anchor_block_table.insert("anchor", (block_number, block_hash.0))?;
             canonical_chain.retain(|_, _| false)?;
@@ -821,6 +843,7 @@ impl ValidatorDB {
                 (block_hash.0, post_state_root.0, post_withdrawals_root.0),
             )?;
             remote_chain.retain(|_, _| false)?;
+            ongoing_tasks.retain(|_, _| false)?;
         }
         write_txn.commit()?;
         Ok(())
@@ -910,6 +933,23 @@ impl ValidatorDB {
         Ok(())
     }
 
+    /// Returns debug info about task queue and chain state
+    ///
+    /// Returns (task_count, canonical_tip, first_task_block) for debugging
+    pub fn get_task_queue_status(
+        &self,
+    ) -> ValidationDbResult<(u64, Option<BlockNumber>, Option<BlockNumber>)> {
+        let read_txn = self.database.begin_read()?;
+        let task_list = read_txn.open_table(TASK_LIST)?;
+        let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
+
+        let task_count = task_list.len()?;
+        let canonical_tip = canonical_chain.last()?.map(|(k, _)| k.value());
+        let first_task = task_list.first()?.map(|(k, _)| k.value().0);
+
+        Ok((task_count, canonical_tip, first_task))
+    }
+
     /// Retrieves the block hash for a specific block number from the local view
     ///
     /// Searches the local view which consists of two sequential, non-overlapping chains:
@@ -958,6 +998,26 @@ impl ValidatorDB {
             let (block_hash, _, _) = value.value();
             (block_number, block_hash.into())
         }))
+    }
+
+    pub fn get_earliest_local_block_header(&self) -> ValidationDbResult<Option<Header>> {
+        let read_txn = self.database.begin_read()?;
+        let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
+        let block_data = read_txn.open_table(BLOCK_DATA)?;
+
+        let (_, (block_hash_bytes, _, _)) = match canonical_chain.first()? {
+            Some(entry) => (entry.0.value(), entry.1.value()),
+            None => return Ok(None),
+        };
+
+        // Load block header and verify it matches remote chain entry
+        let serialized_block = block_data
+            .get(block_hash_bytes)?
+            .expect("block data must exist for blocks in block data");
+
+        Ok(Some(
+            decode_block_from_slice(&serialized_block.value()).header,
+        ))
     }
 }
 
