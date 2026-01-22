@@ -488,106 +488,102 @@ impl ValidatorDB {
     ///
     /// Returns `Ok(true)` if a block was advanced, `Ok(false)` if no work to do.
     pub fn grow_local_chain(&self) -> ValidationDbResult<bool> {
-        let has_ready_block = {
+        // Read phase: gather all information and perform validations before acquiring write lock
+        let validated_block = {
             let read_txn = self.database.begin_read()?;
             let remote_chain = read_txn.open_table(REMOTE_CHAIN)?;
             let validation_results = read_txn.open_table(VALIDATION_RESULTS)?;
+            let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
 
-            match remote_chain.first()? {
-                Some(entry) => {
-                    let block_hash_bytes = entry.1.value();
-                    validation_results.get(block_hash_bytes)?.is_some()
-                }
-                None => false,
+            // Get first block from remote chain
+            let Some(first_entry) = remote_chain.first()? else {
+                return Ok(false);
+            };
+            let block_number = first_entry.0.value();
+            let block_hash_bytes = first_entry.1.value();
+
+            // Check if validation result exists
+            let Some(serialized) = validation_results.get(block_hash_bytes)? else {
+                return Ok(false);
+            };
+            let result: ValidationResult = decode_from_slice(&serialized.value());
+
+            // Verify validation result matches the remote block
+            if result.block_number != block_number || result.block_hash.0 != block_hash_bytes {
+                return Err(ValidationDbError::ValidationResultMismatch {
+                    expected_block_number: block_number,
+                    expected_block_hash: BlockHash::from(block_hash_bytes),
+                    actual_block_number: result.block_number,
+                    actual_block_hash: result.block_hash,
+                });
             }
+
+            // Ensure validation succeeded
+            if !result.success {
+                return Err(ValidationDbError::FailedValidation(
+                    result.error_message.unwrap_or_else(|| {
+                        "Validation failed but no error message was provided".to_string()
+                    }),
+                ));
+            }
+
+            // Verify parent chain extension for non-genesis blocks
+            if block_number > 0 {
+                let parent_value = canonical_chain
+                    .get(block_number - 1)?
+                    .expect("parent block must exist in canonical chain")
+                    .value();
+                let parent_post_state = B256::from(parent_value.1);
+                let parent_post_withdrawals = B256::from(parent_value.2);
+
+                if result.pre_state_root != parent_post_state {
+                    return Err(ValidationDbError::FailedValidation(
+                        ValidationError::PreStateRootMismatch {
+                            expected: parent_post_state,
+                            actual: result.pre_state_root,
+                        }
+                        .to_string(),
+                    ));
+                }
+
+                if result.pre_withdrawals_root != parent_post_withdrawals {
+                    return Err(ValidationDbError::FailedValidation(
+                        ValidationError::PreWithdrawalsRootMismatch {
+                            expected: parent_post_withdrawals,
+                            actual: result.pre_withdrawals_root,
+                        }
+                        .to_string(),
+                    ));
+                }
+            }
+
+            // All validations passed - return the data needed for the write phase
+            (
+                block_number,
+                block_hash_bytes,
+                result.post_state_root.0,
+                result.post_withdrawals_root.0,
+            )
         };
 
-        if !has_ready_block {
-            return Ok(false);
-        }
+        // Write phase: only acquire write lock after confirming growth is valid
+        let (block_number, block_hash_bytes, post_state_root, post_withdrawals_root) =
+            validated_block;
 
         let write_txn = self.database.begin_write()?;
-        let mut advanced = false;
         {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
             let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
-            let validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
 
-            // Get and validate first remote block
-            let first_entry = remote_chain
-                .first()?
-                .map(|entry| (entry.0.value(), entry.1.value()));
-            if let Some((block_number, block_hash_bytes)) = first_entry {
-                // Ensure block validation succeeded
-                if let Some(serialized) = validation_results.get(block_hash_bytes)? {
-                    let result: ValidationResult = decode_from_slice(&serialized.value());
-
-                    if result.block_number != block_number
-                        || result.block_hash.0 != block_hash_bytes
-                    {
-                        return Err(ValidationDbError::ValidationResultMismatch {
-                            expected_block_number: block_number,
-                            expected_block_hash: BlockHash::from(block_hash_bytes),
-                            actual_block_number: result.block_number,
-                            actual_block_hash: result.block_hash,
-                        });
-                    }
-
-                    if !result.success {
-                        return Err(ValidationDbError::FailedValidation(
-                            result.error_message.unwrap_or_else(|| {
-                                "Validation failed but no error message was provided".to_string()
-                            }),
-                        ));
-                    }
-
-                    // Verify parent chain extension for non-genesis blocks
-                    if block_number > 0 {
-                        let (parent_post_state, parent_post_withdrawals) = {
-                            let parent_value = canonical_chain
-                                .get(block_number - 1)?
-                                .expect("parent block must exist in canonical chain")
-                                .value();
-                            (B256::from(parent_value.1), B256::from(parent_value.2))
-                        };
-
-                        if result.pre_state_root != parent_post_state {
-                            return Err(ValidationDbError::FailedValidation(
-                                ValidationError::PreStateRootMismatch {
-                                    expected: parent_post_state,
-                                    actual: result.pre_state_root,
-                                }
-                                .to_string(),
-                            ));
-                        }
-
-                        if result.pre_withdrawals_root != parent_post_withdrawals {
-                            return Err(ValidationDbError::FailedValidation(
-                                ValidationError::PreWithdrawalsRootMismatch {
-                                    expected: parent_post_withdrawals,
-                                    actual: result.pre_withdrawals_root,
-                                }
-                                .to_string(),
-                            ));
-                        }
-                    }
-
-                    // Move block from remote to canonical chain
-                    canonical_chain.insert(
-                        block_number,
-                        (
-                            block_hash_bytes,
-                            result.post_state_root.0,
-                            result.post_withdrawals_root.0,
-                        ),
-                    )?;
-                    remote_chain.remove(block_number)?;
-                    advanced = true;
-                }
-            }
+            // Move block from remote to canonical chain
+            canonical_chain.insert(
+                block_number,
+                (block_hash_bytes, post_state_root, post_withdrawals_root),
+            )?;
+            remote_chain.remove(block_number)?;
         }
         write_txn.commit()?;
-        Ok(advanced)
+        Ok(true)
     }
 
     /// Extends the remote chain with a sequence of unvalidated blocks.
@@ -722,9 +718,8 @@ impl ValidatorDB {
     pub fn get_next_task(
         &self,
     ) -> ValidationDbResult<Option<(Block<Transaction>, SaltWitness, MptWitness)>> {
-        // Fast-path with a read transaction: if there is no task to claim, avoid taking the
-        // global single-writer lock at all.
-        let has_candidate = {
+        // Read phase: find the candidate task to claim and capture its key
+        let candidate_task = {
             let read_txn = self.database.begin_read()?;
             let task_list = read_txn.open_table(TASK_LIST)?;
             let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
@@ -741,56 +736,41 @@ impl ValidatorDB {
                 .range(range_start..)?
                 .next()
                 .transpose()?
-                .is_some()
+                .map(|(task_key, _)| task_key.value())
         };
 
-        if !has_candidate {
+        let Some(task_key) = candidate_task else {
+            return Ok(None);
+        };
+
+        // Write phase: atomically claim the task with minimal operations
+        let claimed = {
+            let write_txn = self.database.begin_write()?;
+            let claimed = {
+                let mut task_list = write_txn.open_table(TASK_LIST)?;
+                let mut ongoing_tasks = write_txn.open_table(ONGOING_TASKS)?;
+
+                // Atomically move task from pending to ongoing
+                // If task was already claimed by another worker, remove returns None
+                if task_list.remove(task_key)?.is_some() {
+                    ongoing_tasks.insert(task_key, ())?;
+                    true
+                } else {
+                    false
+                }
+            };
+            write_txn.commit()?;
+            claimed
+        };
+
+        if !claimed {
+            // Another worker claimed this task between read and write phase
             return Ok(None);
         }
 
-        let claimed_task = {
-            let write_txn = self.database.begin_write()?;
-            let claimed_task = {
-                let mut task_list = write_txn.open_table(TASK_LIST)?;
-                let mut ongoing_tasks = write_txn.open_table(ONGOING_TASKS)?;
-                let canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
+        let (block_number, block_hash_bytes) = task_key;
 
-                // Get first task that's ahead of canonical tip using range query
-                let range_start = match canonical_chain.last()? {
-                    Some((canonical_key, _)) => {
-                        let tip_block = canonical_key.value();
-                        (tip_block + 1, [0u8; 32])
-                    }
-                    None => (0u64, [0u8; 32]),
-                };
-
-                // Find first valid task
-                let next_task = task_list
-                    .range(range_start..)?
-                    .next()
-                    .transpose()?
-                    .map(|(task_key, _)| task_key.value());
-
-                match next_task {
-                    Some(block_num_hash) => {
-                        // Move task to ongoing
-                        task_list.remove(block_num_hash)?;
-                        ongoing_tasks.insert(block_num_hash, ())?;
-
-                        Some(block_num_hash)
-                    }
-                    None => None,
-                }
-            };
-
-            write_txn.commit()?;
-            claimed_task
-        };
-
-        let Some((block_number, block_hash_bytes)) = claimed_task else {
-            return Ok(None);
-        };
-
+        // Read phase: load all data outside of write lock
         let read_txn = self.database.begin_read()?;
         let block_data = read_txn.open_table(BLOCK_DATA)?;
         let witnesses = read_txn.open_table(WITNESSES)?;
@@ -832,6 +812,7 @@ impl ValidatorDB {
         match load_result {
             Ok(task) => Ok(task),
             Err(err) => {
+                // Error recovery: move task back to pending queue
                 let write_txn = self.database.begin_write()?;
                 {
                     let mut ongoing_tasks = write_txn.open_table(ONGOING_TASKS)?;
