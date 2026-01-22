@@ -506,7 +506,8 @@ impl ValidatorDB {
                 if let Some(serialized) = validation_results.get(block_hash_bytes)? {
                     let result: ValidationResult = decode_from_slice(&serialized.value());
 
-                    if result.block_number != block_number || result.block_hash.0 != block_hash_bytes
+                    if result.block_number != block_number
+                        || result.block_hash.0 != block_hash_bytes
                     {
                         return Err(ValidationDbError::ValidationResultMismatch {
                             expected_block_number: block_number,
@@ -720,7 +721,11 @@ impl ValidatorDB {
                 None => (0u64, [0u8; 32]),
             };
 
-            task_list.range(range_start..)?.next().transpose()?.is_some()
+            task_list
+                .range(range_start..)?
+                .next()
+                .transpose()?
+                .is_some()
         };
 
         if !has_candidate {
