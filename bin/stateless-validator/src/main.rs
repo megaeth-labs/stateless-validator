@@ -501,6 +501,10 @@ async fn chain_sync(
             //    - If this occurs, it indicates either a bug in the validation pipeline or
             //      database corruption
             //
+            // 4. ValidationDbError::ValidationResultMismatch
+            //    - Validation result does not match the first remote chain entry
+            //    - Indicates database inconsistency or logic error in the pipeline
+            //
             // The chain sync process terminates immediately and returns the error to the caller.
             // Operators should investigate the root cause.
 

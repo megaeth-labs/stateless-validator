@@ -221,6 +221,16 @@ pub enum ValidationDbError {
     FailedValidation(String),
 
     #[error(
+        "validation result mismatch: remote=({expected_block_number}, {expected_block_hash:?}) result=({actual_block_number}, {actual_block_hash:?})"
+    )]
+    ValidationResultMismatch {
+        expected_block_number: BlockNumber,
+        expected_block_hash: BlockHash,
+        actual_block_number: BlockNumber,
+        actual_block_hash: BlockHash,
+    },
+
+    #[error(
         "block {block_number} must extend parent block with hash {expected_parent_hash:?}, found {actual_parent_hash:?}"
     )]
     InvalidChainExtension {
@@ -486,25 +496,25 @@ impl ValidatorDB {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
             let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
             let validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
-            let block_data = write_txn.open_table(BLOCK_DATA)?;
 
             // Get and validate first remote block
             let first_entry = remote_chain
                 .first()?
                 .map(|entry| (entry.0.value(), entry.1.value()));
             if let Some((block_number, block_hash_bytes)) = first_entry {
-                // Load block header and verify it matches remote chain entry
-                let serialized_block = block_data
-                    .get(block_hash_bytes)?
-                    .expect("block data must exist for blocks in remote chain");
-                let header = decode_block_from_slice(&serialized_block.value()).header;
-
-                assert_eq!(header.number, block_number);
-                assert_eq!(header.hash.0, block_hash_bytes);
-
                 // Ensure block validation succeeded
                 if let Some(serialized) = validation_results.get(block_hash_bytes)? {
                     let result: ValidationResult = decode_from_slice(&serialized.value());
+
+                    if result.block_number != block_number || result.block_hash.0 != block_hash_bytes
+                    {
+                        return Err(ValidationDbError::ValidationResultMismatch {
+                            expected_block_number: block_number,
+                            expected_block_hash: BlockHash::from(block_hash_bytes),
+                            actual_block_number: result.block_number,
+                            actual_block_hash: result.block_hash,
+                        });
+                    }
 
                     if !result.success {
                         return Err(ValidationDbError::FailedValidation(
@@ -515,10 +525,10 @@ impl ValidatorDB {
                     }
 
                     // Verify parent chain extension for non-genesis blocks
-                    if header.number > 0 {
+                    if block_number > 0 {
                         let (parent_post_state, parent_post_withdrawals) = {
                             let parent_value = canonical_chain
-                                .get(header.number - 1)?
+                                .get(block_number - 1)?
                                 .expect("parent block must exist in canonical chain")
                                 .value();
                             (B256::from(parent_value.1), B256::from(parent_value.2))
@@ -547,14 +557,14 @@ impl ValidatorDB {
 
                     // Move block from remote to canonical chain
                     canonical_chain.insert(
-                        header.number,
+                        block_number,
                         (
-                            header.hash.0,
+                            block_hash_bytes,
                             result.post_state_root.0,
                             result.post_withdrawals_root.0,
                         ),
                     )?;
-                    remote_chain.remove(header.number)?;
+                    remote_chain.remove(block_number)?;
                     advanced = true;
                 }
             }
@@ -652,15 +662,18 @@ impl ValidatorDB {
     /// Called by workers when they finish validating a block. Stores the validation
     /// result and marks the task as complete.
     pub fn complete_validation(&self, result: ValidationResult) -> ValidationDbResult<()> {
+        let block_number = result.block_number;
+        let block_hash = result.block_hash.0;
+        let serialized_result = encode_to_vec(&result)?;
         let write_txn = self.database.begin_write()?;
         {
             // Store validation result
             let mut validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
-            validation_results.insert(result.block_hash.0, encode_to_vec(&result)?)?;
+            validation_results.insert(block_hash, serialized_result)?;
 
             // Remove from ongoing tasks
             let mut ongoing_tasks = write_txn.open_table(ONGOING_TASKS)?;
-            ongoing_tasks.remove((result.block_number, result.block_hash.0))?;
+            ongoing_tasks.remove((block_number, block_hash))?;
         }
         write_txn.commit()?;
         Ok(())
