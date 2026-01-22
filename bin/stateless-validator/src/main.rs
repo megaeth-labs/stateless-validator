@@ -783,7 +783,7 @@ async fn validate_one(
                 })
                 .collect::<Result<_>>()?;
 
-            validator_db.add_contract_codes(new_bytecodes.iter().map(|(_, bytecode)| bytecode))?;
+            validator_db.add_contract_codes(&new_bytecodes)?;
             contracts.extend(new_bytecodes);
 
             let pre_state_root = B256::from(witness.state_root()?);
