@@ -29,7 +29,7 @@ pub use executor::{
     ValidationError, ValidationResult, ValidationStats, replay_block, validate_block,
 };
 pub mod tracing_executor;
-pub use tracing_executor::{trace_block, trace_transaction, parity_trace_block, parity_trace_transaction};
+pub use tracing_executor::{trace_block, trace_transaction, parity_trace_block, parity_trace_transaction, trace_call, parity_trace_call, get_history_transaction_count};
 pub mod withdrawals;
 pub mod rpc_client;
 pub use rpc_client::{RpcClient, SetValidatedBlocksResponse};

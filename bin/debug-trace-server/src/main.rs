@@ -7,9 +7,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use alloy_genesis::Genesis;
-use alloy_primitives::B256;
-use alloy_rpc_types_eth::BlockNumberOrTag;
-use alloy_rpc_types_trace::geth::GethDebugTracingOptions;
+use alloy_primitives::{Address, B256};
+use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionRequest};
+use alloy_rpc_types_trace::geth::{
+    GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingCallOptions,
+    GethDebugTracingOptions,
+};
+use alloy_rpc_types_trace::parity::TraceType;
+use alloy_primitives::map::HashSet;
 use clap::Parser;
 use eyre::Result;
 use jsonrpsee::server::{RpcModule, Server};
@@ -32,10 +37,16 @@ const DEBUG_TRACE_BLOCK_BY_NUMBER: &str = "debug_traceBlockByNumber";
 const DEBUG_TRACE_BLOCK_BY_HASH: &str = "debug_traceBlockByHash";
 /// debug_traceTransaction method name.
 const DEBUG_TRACE_TRANSACTION: &str = "debug_traceTransaction";
+/// debug_traceCall method name.
+const DEBUG_TRACE_CALL: &str = "debug_traceCall";
+/// debug_getHistoryTransactionCount method name.
+const DEBUG_GET_HISTORY_TX_COUNT: &str = "debug_getHistoryTransactionCount";
 /// trace_block method name.
 const TRACE_BLOCK: &str = "trace_block";
 /// trace_transaction method name.
 const TRACE_TRANSACTION: &str = "trace_transaction";
+/// trace_call method name.
+const TRACE_CALL: &str = "trace_call";
 
 /// Command line arguments for the debug-trace-server.
 #[derive(Parser, Debug)]
@@ -291,6 +302,91 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
         },
     )?;
 
+    // debug_traceCall
+    module.register_async_method(
+        DEBUG_TRACE_CALL,
+        |params, ctx, _| async move {
+            let start = Instant::now();
+            let mut seq = params.sequence();
+            let call: TransactionRequest = seq.next()?;
+            let block_id: Option<BlockNumberOrTag> = seq.optional_next()?;
+            let opts: GethDebugTracingCallOptions = seq.optional_next()?.unwrap_or_default();
+
+            // Resolve block number (default to latest)
+            let block_tag = block_id.unwrap_or(BlockNumberOrTag::Latest);
+            let block_num = ctx
+                .cache
+                .resolve_block_number(block_tag)
+                .await
+                .map_err(|e| rpc_err(format!("Failed to resolve block number: {e}")))?;
+
+            let data = ctx
+                .cache
+                .get_block_data(block_num)
+                .await
+                .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
+
+            let result = validator_core::trace_call(
+                &ctx.chain_spec,
+                &data.block,
+                &data.salt_witness,
+                &data.contracts,
+                &call,
+                opts.tracing_options,
+            )
+            .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
+
+            metrics::record_rpc_request(
+                DEBUG_TRACE_CALL,
+                start.elapsed().as_secs_f64(),
+            );
+
+            serde_json::to_value(result)
+                .map_err(|e| rpc_err(format!("Serialization failed: {e}")))
+        },
+    )?;
+
+    // debug_getHistoryTransactionCount
+    module.register_async_method(
+        DEBUG_GET_HISTORY_TX_COUNT,
+        |params, ctx, _| async move {
+            let start = Instant::now();
+            let mut seq = params.sequence();
+            let address: Address = seq.next()?;
+            let block_id: Option<BlockNumberOrTag> = seq.optional_next()?;
+
+            // Resolve block number (default to latest)
+            let block_tag = block_id.unwrap_or(BlockNumberOrTag::Latest);
+            let block_num = ctx
+                .cache
+                .resolve_block_number(block_tag)
+                .await
+                .map_err(|e| rpc_err(format!("Failed to resolve block number: {e}")))?;
+
+            let data = ctx
+                .cache
+                .get_block_data(block_num)
+                .await
+                .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
+
+            let nonce = validator_core::get_history_transaction_count(
+                &data.block,
+                &data.salt_witness,
+                &data.contracts,
+                address,
+            )
+            .map_err(|e| rpc_err(format!("Failed to get transaction count: {e}")))?;
+
+            metrics::record_rpc_request(
+                DEBUG_GET_HISTORY_TX_COUNT,
+                start.elapsed().as_secs_f64(),
+            );
+
+            serde_json::to_value(nonce)
+                .map_err(|e| rpc_err(format!("Serialization failed: {e}")))
+        },
+    )?;
+
     Ok(())
 }
 
@@ -358,6 +454,47 @@ fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
 
             metrics::record_rpc_request(TRACE_TRANSACTION, start.elapsed().as_secs_f64());
+
+            serde_json::to_value(result)
+                .map_err(|e| rpc_err(format!("Serialization failed: {e}")))
+        },
+    )?;
+
+    // trace_call (Parity-style)
+    module.register_async_method(
+        TRACE_CALL,
+        |params, ctx, _| async move {
+            let start = Instant::now();
+            let mut seq = params.sequence();
+            let call: TransactionRequest = seq.next()?;
+            let trace_types: HashSet<TraceType> = seq.next()?;
+            let block_id: Option<BlockNumberOrTag> = seq.optional_next()?;
+
+            // Resolve block number (default to latest)
+            let block_tag = block_id.unwrap_or(BlockNumberOrTag::Latest);
+            let block_num = ctx
+                .cache
+                .resolve_block_number(block_tag)
+                .await
+                .map_err(|e| rpc_err(format!("Failed to resolve block number: {e}")))?;
+
+            let data = ctx
+                .cache
+                .get_block_data(block_num)
+                .await
+                .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
+
+            let result = validator_core::parity_trace_call(
+                &ctx.chain_spec,
+                &data.block,
+                &data.salt_witness,
+                &data.contracts,
+                &call,
+                trace_types,
+            )
+            .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
+
+            metrics::record_rpc_request(TRACE_CALL, start.elapsed().as_secs_f64());
 
             serde_json::to_value(result)
                 .map_err(|e| rpc_err(format!("Serialization failed: {e}")))

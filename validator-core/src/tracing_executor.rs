@@ -7,12 +7,14 @@ use std::collections::HashMap;
 
 use alloy_consensus::{Transaction, transaction::Recovered};
 use alloy_evm::Evm as EvmTrait;
-use alloy_primitives::{B256, Bytes};
-use alloy_rpc_types_eth::{Block, BlockTransactions, TransactionInfo};
+use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
+use alloy_rpc_types_eth::{Block, BlockTransactions, TransactionInfo, TransactionRequest};
 use alloy_rpc_types_trace::geth::{
     call::FlatCallFrame, FourByteFrame, GethDebugBuiltInTracerType, GethDebugTracerType,
     GethDebugTracingOptions, GethTrace, NoopFrame, TraceResult,
 };
+use alloy_rpc_types_trace::parity::{TraceResults, TraceType};
+use alloy_primitives::map::HashSet;
 use alloy_rpc_types_trace::parity::LocalizedTransactionTrace;
 use alloy_evm::block::BlockExecutor;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
@@ -37,10 +39,7 @@ use crate::{
     database::{WitnessDatabase, WitnessExternalEnv},
     executor::{ValidationError, create_evm_env},
 };
-use mega_evm::{
-    BlockLimits, MegaBlockExecutionCtx, MegaBlockExecutorFactory,
-    MegaEvmFactory, MegaHardforks,
-};
+use mega_evm::{BlockLimits, MegaBlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory, MegaHardforks, MegaTransaction};
 
 // ---------------------------------------------------------------------------
 // Common tracing environment setup
@@ -287,6 +286,294 @@ pub fn trace_transaction(
     trace_result.map_err(|e| ValidationError::BlockReplayFailed(
         alloy_evm::block::BlockExecutionError::msg(e)
     ))
+}
+
+/// Traces a call request (like eth_call) with debug tracing options.
+///
+/// This function executes a call against the state at the parent block (the block prior to
+/// the given block) and returns a Geth-style trace. It mirrors the `debug_traceCall` RPC method.
+///
+/// # Arguments
+/// * `chain_spec` - Chain specification
+/// * `block` - Block whose parent state we execute against
+/// * `witness` - SALT witness for state access
+/// * `contracts` - Contract bytecode cache
+/// * `call` - The call request to trace
+/// * `opts` - Debug tracing options
+///
+/// # Returns
+/// Returns the Geth trace result
+pub fn trace_call(
+    chain_spec: &ChainSpec,
+    block: &Block<OpTransaction>,
+    witness: &SaltWitness,
+    contracts: &HashMap<B256, Bytecode>,
+    call: &TransactionRequest,
+    opts: GethDebugTracingOptions,
+) -> Result<GethTrace, ValidationError> {
+    // Create external environment oracle from salt witness
+    let ext_env = WitnessExternalEnv::new(witness, block.header.number)
+        .map_err(ValidationError::EnvOracleConstructionFailed)?;
+
+    // Create witness database and State
+    let salt_witness_obj = salt::Witness::from(witness.clone());
+    let witness_db = WitnessDatabase {
+        header: &block.header,
+        witness: &salt_witness_obj,
+        contracts,
+    };
+    let mut state = State::builder()
+        .with_database_ref(&witness_db)
+        .build();
+
+    // Create EVM environment
+    let evm_env = create_evm_env(&block.header, chain_spec);
+
+    // Create block executor factory
+    let evm_factory = MegaEvmFactory::new().with_external_env_factory(ext_env);
+    let executor_factory = MegaBlockExecutorFactory::new(
+        chain_spec.clone(),
+        evm_factory,
+        OpAlloyReceiptBuilder::default(),
+    );
+
+    // Determine block limits based on hardfork
+    let hardfork = chain_spec.hardfork(block.header.timestamp);
+    let block_limits = if let Some(hardfork) = hardfork {
+        BlockLimits::from_hardfork_and_block_gas_limit(hardfork, block.header.gas_limit)
+    } else {
+        BlockLimits::no_limits()
+    };
+
+    // Create block context
+    let block_ctx = MegaBlockExecutionCtx::new(
+        block.header.parent_hash,
+        block.header.parent_beacon_block_root,
+        Bytes::new(),
+        block_limits,
+    );
+
+    // Build TxEnv from TransactionRequest
+    let tx_env = build_tx_env_from_request(call, &evm_env);
+    let tx_gas_limit = tx_env.gas_limit;
+
+    // Create TransactionInfo for the call (no real hash/index since it's a simulated call)
+    let tx_info = TransactionInfo {
+        hash: None,
+        index: None,
+        block_hash: Some(block.header.hash),
+        block_number: Some(block.header.number),
+        base_fee: block.header.base_fee_per_gas,
+    };
+
+    let (trace_result, _state_changes) = trace_call_inner(
+        &executor_factory,
+        &mut state,
+        block_ctx,
+        evm_env,
+        tx_env,
+        tx_gas_limit,
+        &opts,
+        tx_info,
+    );
+
+    trace_result.map_err(|e| ValidationError::BlockReplayFailed(
+        alloy_evm::block::BlockExecutionError::msg(e)
+    ))
+}
+
+/// Traces a call with Parity-style trace types.
+///
+/// This function executes a call against the state at the parent block and returns
+/// Parity-style traces (trace, vmTrace, stateDiff). It mirrors the `trace_call` RPC method.
+///
+/// # Arguments
+/// * `chain_spec` - Chain specification
+/// * `block` - Block whose parent state we execute against
+/// * `witness` - SALT witness for state access
+/// * `contracts` - Contract bytecode cache
+/// * `call` - The call request to trace
+/// * `trace_types` - Which trace types to include
+///
+/// # Returns
+/// Returns the Parity TraceResults
+pub fn parity_trace_call(
+    chain_spec: &ChainSpec,
+    block: &Block<OpTransaction>,
+    witness: &SaltWitness,
+    contracts: &HashMap<B256, Bytecode>,
+    call: &TransactionRequest,
+    trace_types: HashSet<TraceType>,
+) -> Result<TraceResults, ValidationError> {
+    // Create external environment oracle from salt witness
+    let ext_env = WitnessExternalEnv::new(witness, block.header.number)
+        .map_err(ValidationError::EnvOracleConstructionFailed)?;
+
+    // Create witness database and State
+    let salt_witness_obj = salt::Witness::from(witness.clone());
+    let witness_db = WitnessDatabase {
+        header: &block.header,
+        witness: &salt_witness_obj,
+        contracts,
+    };
+    let mut state = State::builder()
+        .with_database_ref(&witness_db)
+        .build();
+
+    // Create EVM environment
+    let evm_env = create_evm_env(&block.header, chain_spec);
+
+    // Create block executor factory
+    let evm_factory = MegaEvmFactory::new().with_external_env_factory(ext_env);
+    let executor_factory = MegaBlockExecutorFactory::new(
+        chain_spec.clone(),
+        evm_factory,
+        OpAlloyReceiptBuilder::default(),
+    );
+
+    // Determine block limits based on hardfork
+    let hardfork = chain_spec.hardfork(block.header.timestamp);
+    let block_limits = if let Some(hardfork) = hardfork {
+        BlockLimits::from_hardfork_and_block_gas_limit(hardfork, block.header.gas_limit)
+    } else {
+        BlockLimits::no_limits()
+    };
+
+    // Create block context
+    let block_ctx = MegaBlockExecutionCtx::new(
+        block.header.parent_hash,
+        block.header.parent_beacon_block_root,
+        Bytes::new(),
+        block_limits,
+    );
+
+    // Build TxEnv from TransactionRequest
+    let tx_env = build_tx_env_from_request(call, &evm_env);
+    let tx_gas_limit = tx_env.gas_limit;
+
+    // Create TransactionInfo for the call
+    let tx_info = TransactionInfo {
+        hash: None,
+        index: None,
+        block_hash: Some(block.header.hash),
+        block_number: Some(block.header.number),
+        base_fee: block.header.base_fee_per_gas,
+    };
+
+    let result = parity_trace_call_inner(
+        &executor_factory,
+        &mut state,
+        block_ctx,
+        evm_env,
+        tx_env,
+        tx_gas_limit,
+        &trace_types,
+        tx_info,
+    );
+
+    result.map_err(|e| ValidationError::BlockReplayFailed(
+        alloy_evm::block::BlockExecutionError::msg(e)
+    ))
+}
+
+/// Gets the nonce (transaction count) of an address at a specific block.
+///
+/// This function reads the account state from the witness and returns the nonce.
+/// It mirrors the `debug_getHistoryTransactionCount` method.
+///
+/// # Arguments
+/// * `block` - Block to query state at
+/// * `witness` - SALT witness for state access
+/// * `contracts` - Contract bytecode cache
+/// * `address` - The address to query
+///
+/// # Returns
+/// Returns the nonce (transaction count) for the address
+pub fn get_history_transaction_count(
+    block: &Block<OpTransaction>,
+    witness: &SaltWitness,
+    contracts: &HashMap<B256, Bytecode>,
+    address: Address,
+) -> Result<U256, ValidationError> {
+    // Create witness database
+    let salt_witness_obj = salt::Witness::from(witness.clone());
+    let witness_db = WitnessDatabase {
+        header: &block.header,
+        witness: &salt_witness_obj,
+        contracts,
+    };
+
+    // Read the account from the witness database
+    use revm::DatabaseRef;
+    match witness_db.basic_ref(address) {
+        Ok(Some(account)) => Ok(U256::from(account.nonce)),
+        Ok(None) => Ok(U256::ZERO), // Account doesn't exist, nonce is 0
+        Err(e) => Err(ValidationError::EnvOracleConstructionFailed(e)),
+    }
+}
+
+/// Builds a TxEnv from a TransactionRequest.
+fn build_tx_env_from_request(
+    call: &TransactionRequest,
+    evm_env: &alloy_evm::EvmEnv<mega_evm::MegaSpecId>,
+) -> TxEnv {
+    let mut tx_env = TxEnv::default();
+
+    // Set caller (from)
+    if let Some(from) = call.from {
+        tx_env.caller = from;
+    }
+
+    // Set kind (to) - call.to is already Option<TxKind>
+    if let Some(to) = call.to {
+        tx_env.kind = to;
+    } else {
+        tx_env.kind = TxKind::Create;
+    }
+
+    // Set value
+    if let Some(value) = call.value {
+        tx_env.value = value;
+    }
+
+    // Set data (input)
+    if let Some(ref input) = call.input.input {
+        tx_env.data = input.clone();
+    }
+
+    // Set gas limit
+    if let Some(gas) = call.gas {
+        tx_env.gas_limit = gas;
+    } else {
+        // Use block gas limit as default
+        tx_env.gas_limit = evm_env.block_env.gas_limit;
+    }
+
+    // Set gas price (convert from u128 to u128)
+    if let Some(gas_price) = call.gas_price {
+        tx_env.gas_price = gas_price;
+    } else if let Some(max_fee) = call.max_fee_per_gas {
+        tx_env.gas_price = max_fee;
+    } else {
+        tx_env.gas_price = evm_env.block_env.basefee as u128;
+    }
+
+    // Set priority fee
+    if let Some(priority_fee) = call.max_priority_fee_per_gas {
+        tx_env.gas_priority_fee = Some(priority_fee);
+    }
+
+    // Set nonce (nonce is u64, not Option<u64>)
+    if let Some(nonce) = call.nonce {
+        tx_env.nonce = nonce;
+    }
+
+    // Set access list
+    if let Some(ref access_list) = call.access_list {
+        tx_env.access_list = access_list.clone();
+    }
+
+    tx_env
 }
 
 /// Traces a block execution and returns Parity-style localized transaction traces.
@@ -755,6 +1042,361 @@ where
             (Ok(frame.into()), state_changes)
         }
         Err(e) => (Err(e.to_string()), Default::default()),
+    }
+}
+
+/// Internal helper function to trace a call request with TxEnv.
+///
+/// This is similar to `trace_transaction_inner` but takes a TxEnv directly
+/// instead of a recovered transaction.
+fn trace_call_inner<DB, ExtEnvFactory>(
+    executor_factory: &MegaBlockExecutorFactory<
+        ChainSpec,
+        MegaEvmFactory<ExtEnvFactory>,
+        OpAlloyReceiptBuilder,
+    >,
+    state: &mut State<DB>,
+    block_ctx: MegaBlockExecutionCtx,
+    evm_env: alloy_evm::EvmEnv<mega_evm::MegaSpecId>,
+    tx_env: TxEnv,
+    tx_gas_limit: u64,
+    opts: &GethDebugTracingOptions,
+    tx_info: TransactionInfo,
+) -> (Result<GethTrace, String>, EvmState)
+where
+    DB: alloy_evm::Database + revm::DatabaseRef<Error = <DB as revm::Database>::Error>,
+    ExtEnvFactory: mega_evm::ExternalEnvFactory + Clone,
+{
+    let GethDebugTracingOptions { config, tracer, tracer_config, .. } = opts;
+
+    // Handle different tracer types
+    if let Some(tracer) = tracer {
+        return match tracer {
+            GethDebugTracerType::BuiltInTracer(builtin) => match builtin {
+                GethDebugBuiltInTracerType::NoopTracer => {
+                    (Ok(GethTrace::NoopTracer(NoopFrame::default())), Default::default())
+                }
+
+                GethDebugBuiltInTracerType::FourByteTracer => {
+                    let inspector = FourByteInspector::default();
+                    let mut executor = executor_factory.create_executor_with_inspector(
+                        state,
+                        block_ctx,
+                        evm_env,
+                        inspector,
+                    );
+
+                    // Create MegaTransaction and execute
+                    let mut mega_tx = MegaTransaction::new(tx_env);
+                    mega_tx.enveloped_tx = Some(Bytes::new());
+                    match alloy_evm::Evm::transact_raw(&mut executor.evm, mega_tx) {
+                        Ok(outcome) => {
+                            let inspector = executor.inspector();
+                            let frame = FourByteFrame::from(inspector);
+                            let state_changes = outcome.state;
+                            (Ok(frame.into()), state_changes)
+                        }
+                        Err(e) => (Err(e.to_string()), Default::default()),
+                    }
+                }
+
+                GethDebugBuiltInTracerType::CallTracer => {
+                    let call_config = tracer_config
+                        .clone()
+                        .into_call_config()
+                        .unwrap_or_default();
+
+                    let inspector = TracingInspector::new(
+                        TracingInspectorConfig::from_geth_call_config(&call_config)
+                    );
+
+                    let mut executor = executor_factory.create_executor_with_inspector(
+                        state,
+                        block_ctx,
+                        evm_env,
+                        inspector,
+                    );
+
+                    // Create MegaTransaction and execute
+                    let mut mega_tx = MegaTransaction::new(tx_env);
+                    mega_tx.enveloped_tx = Some(Bytes::new());
+                    match alloy_evm::Evm::transact_raw(&mut executor.evm, mega_tx) {
+                        Ok(outcome) => {
+                            let gas_used = outcome.result.gas_used();
+                            let state_changes = outcome.state;
+
+                            let inspector = executor.inspector_mut();
+                            inspector.set_transaction_gas_limit(tx_gas_limit);
+                            let frame = inspector
+                                .geth_builder()
+                                .geth_call_traces(call_config, gas_used);
+
+                            (Ok(frame.into()), state_changes)
+                        }
+                        Err(e) => (Err(e.to_string()), Default::default()),
+                    }
+                }
+
+                GethDebugBuiltInTracerType::PreStateTracer => {
+                    let prestate_config = tracer_config
+                        .clone()
+                        .into_pre_state_config()
+                        .unwrap_or_default();
+
+                    let inspector = TracingInspector::new(
+                        TracingInspectorConfig::from_geth_prestate_config(&prestate_config)
+                    );
+
+                    let mut executor = executor_factory.create_executor_with_inspector(
+                        state,
+                        block_ctx,
+                        evm_env,
+                        inspector,
+                    );
+
+                    // Create MegaTransaction and execute
+                    let mut mega_tx = MegaTransaction::new(tx_env);
+                    mega_tx.enveloped_tx = Some(Bytes::new());
+                    match alloy_evm::Evm::transact_raw(&mut executor.evm, mega_tx) {
+                        Ok(outcome) => {
+                            let result = outcome.result;
+                            let state_changes = outcome.state.clone();
+
+                            let result_and_state = revm::context::result::ResultAndState {
+                                result,
+                                state: outcome.state,
+                            };
+
+                            executor.inspector_mut().set_transaction_gas_limit(tx_gas_limit);
+
+                            let frame_result = {
+                                let db = executor.evm.db();
+                                let inspector = executor.inspector();
+                                inspector.geth_builder().geth_prestate_traces(&result_and_state, &prestate_config, db)
+                            };
+
+                            match frame_result {
+                                Ok(frame) => (Ok(frame.into()), state_changes),
+                                Err(e) => (Err(format!("PreState trace failed: {:?}", e)), state_changes),
+                            }
+                        }
+                        Err(e) => (Err(e.to_string()), Default::default()),
+                    }
+                }
+
+                GethDebugBuiltInTracerType::MuxTracer => {
+                    let mux_config = match tracer_config.clone().into_mux_config() {
+                        Ok(cfg) => cfg,
+                        Err(_) => return (Err("Invalid mux tracer config".to_string()), Default::default()),
+                    };
+
+                    let inspector = match MuxInspector::try_from_config(mux_config) {
+                        Ok(insp) => insp,
+                        Err(e) => return (Err(format!("MuxInspector creation failed: {:?}", e)), Default::default()),
+                    };
+
+                    let mut executor = executor_factory.create_executor_with_inspector(
+                        state,
+                        block_ctx,
+                        evm_env,
+                        inspector,
+                    );
+
+                    // Create MegaTransaction and execute
+                    let mut mega_tx = MegaTransaction::new(tx_env);
+                    mega_tx.enveloped_tx = Some(Bytes::new());
+                    match alloy_evm::Evm::transact_raw(&mut executor.evm, mega_tx) {
+                        Ok(outcome) => {
+                            let result = outcome.result;
+                            let state_changes = outcome.state.clone();
+
+                            let result_and_state = revm::context::result::ResultAndState {
+                                result,
+                                state: outcome.state,
+                            };
+
+                            let db = executor.evm.db();
+                            let inspector = executor.inspector();
+
+                            match inspector.try_into_mux_frame(&result_and_state, db, tx_info) {
+                                Ok(frame) => (Ok(frame.into()), state_changes),
+                                Err(e) => (Err(format!("MuxFrame creation failed: {:?}", e)), state_changes),
+                            }
+                        }
+                        Err(e) => (Err(e.to_string()), Default::default()),
+                    }
+                }
+
+                GethDebugBuiltInTracerType::FlatCallTracer => {
+                    let flat_call_config = tracer_config
+                        .clone()
+                        .into_flat_call_config()
+                        .unwrap_or_default();
+
+                    let inspector = TracingInspector::new(
+                        TracingInspectorConfig::from_flat_call_config(&flat_call_config),
+                    );
+
+                    let mut executor = executor_factory.create_executor_with_inspector(
+                        state,
+                        block_ctx,
+                        evm_env,
+                        inspector,
+                    );
+
+                    // Create MegaTransaction and execute
+                    let mut mega_tx = MegaTransaction::new(tx_env);
+                    mega_tx.enveloped_tx = Some(Bytes::new());
+                    match alloy_evm::Evm::transact_raw(&mut executor.evm, mega_tx) {
+                        Ok(outcome) => {
+                            let state_changes = outcome.state;
+
+                            let inspector = executor.inspector();
+                            let frame: FlatCallFrame = inspector
+                                .clone()
+                                .with_transaction_gas_limit(tx_gas_limit)
+                                .into_parity_builder()
+                                .into_localized_transaction_traces(tx_info);
+
+                            (Ok(frame.into()), state_changes)
+                        }
+                        Err(e) => (Err(e.to_string()), Default::default()),
+                    }
+                }
+            },
+
+            GethDebugTracerType::JsTracer(code) => {
+                let config = tracer_config.clone().into_json();
+
+                let tx_context = TransactionContext {
+                    block_hash: tx_info.block_hash,
+                    tx_hash: tx_info.hash,
+                    tx_index: tx_info.index.map(|i| i as usize),
+                };
+
+                let inspector = match JsInspector::with_transaction_context(
+                    code.clone(),
+                    config,
+                    tx_context,
+                ) {
+                    Ok(insp) => insp,
+                    Err(e) => return (Err(format!("Failed to create JsInspector: {:?}", e)), Default::default()),
+                };
+
+                let mut executor = executor_factory.create_executor_with_inspector(
+                    state,
+                    block_ctx,
+                    evm_env.clone(),
+                    inspector,
+                );
+
+                // Create MegaTransaction and execute
+                let mut mega_tx = MegaTransaction::new(tx_env.clone());
+                mega_tx.enveloped_tx = Some(Bytes::new());
+                match alloy_evm::Evm::transact_raw(&mut executor.evm, mega_tx) {
+                    Ok(outcome) => {
+                        let result = outcome.result;
+                        let state_changes = outcome.state.clone();
+
+                        let result_and_state = revm::context::result::ResultAndState {
+                            result,
+                            state: outcome.state,
+                        };
+
+                        let (db, inspector, _) = EvmTrait::components_mut(&mut executor.evm);
+                        match inspector.json_result(result_and_state, &tx_env, &evm_env.block_env, &*db) {
+                            Ok(json_value) => (Ok(GethTrace::JS(json_value)), state_changes),
+                            Err(e) => (Err(format!("JS tracer execution failed: {:?}", e)), state_changes),
+                        }
+                    }
+                    Err(e) => (Err(e.to_string()), Default::default()),
+                }
+            }
+        };
+    }
+
+    // Default: struct logger tracer
+    let inspector_config = TracingInspectorConfig::from_geth_config(config);
+    let inspector = TracingInspector::new(inspector_config);
+
+    let mut executor = executor_factory.create_executor_with_inspector(
+        state,
+        block_ctx,
+        evm_env,
+        inspector,
+    );
+
+    // Create MegaTransaction and execute
+    let mut mega_tx = MegaTransaction::new(tx_env);
+    mega_tx.enveloped_tx = Some(Bytes::new());
+    match alloy_evm::Evm::transact_raw(&mut executor.evm, mega_tx) {
+        Ok(outcome) => {
+            let gas_used = outcome.result.gas_used();
+            let return_value = outcome.result.output().cloned().unwrap_or_default();
+            let state_changes = outcome.state;
+
+            let inspector = executor.inspector_mut();
+            inspector.set_transaction_gas_limit(tx_gas_limit);
+            let frame = inspector
+                .geth_builder()
+                .geth_traces(gas_used, return_value, *config);
+
+            (Ok(frame.into()), state_changes)
+        }
+        Err(e) => (Err(e.to_string()), Default::default()),
+    }
+}
+
+/// Internal helper function to trace a call with Parity-style trace types.
+fn parity_trace_call_inner<DB, ExtEnvFactory>(
+    executor_factory: &MegaBlockExecutorFactory<
+        ChainSpec,
+        MegaEvmFactory<ExtEnvFactory>,
+        OpAlloyReceiptBuilder,
+    >,
+    state: &mut State<DB>,
+    block_ctx: MegaBlockExecutionCtx,
+    evm_env: alloy_evm::EvmEnv<mega_evm::MegaSpecId>,
+    tx_env: TxEnv,
+    tx_gas_limit: u64,
+    trace_types: &HashSet<TraceType>,
+    _tx_info: TransactionInfo,
+) -> Result<TraceResults, String>
+where
+    DB: alloy_evm::Database + revm::DatabaseRef<Error = <DB as revm::Database>::Error>,
+    ExtEnvFactory: mega_evm::ExternalEnvFactory + Clone,
+{
+    let inspector_config = TracingInspectorConfig::from_parity_config(trace_types);
+    let inspector = TracingInspector::new(inspector_config);
+
+    let mut executor = executor_factory.create_executor_with_inspector(
+        state,
+        block_ctx,
+        evm_env,
+        inspector,
+    );
+
+    // Create MegaTransaction and execute
+    let mut mega_tx = MegaTransaction::new(tx_env);
+    mega_tx.enveloped_tx = Some(Bytes::new());
+    match alloy_evm::Evm::transact_raw(&mut executor.evm, mega_tx) {
+        Ok(outcome) => {
+            let result_and_state = revm::context::result::ResultAndState {
+                result: outcome.result,
+                state: outcome.state,
+            };
+
+            let db = executor.evm.db();
+            let inspector = executor.inspector();
+
+            inspector
+                .clone()
+                .with_transaction_gas_limit(tx_gas_limit)
+                .into_parity_builder()
+                .into_trace_results_with_state(&result_and_state, trace_types, db)
+                .map_err(|e| format!("Parity trace failed: {:?}", e))
+        }
+        Err(e) => Err(e.to_string()),
     }
 }
 
