@@ -30,6 +30,8 @@ jobs:
         # with:
         #   # default is -D warnings
         #   rustflags: "-A warnings"
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
       - run: cargo clippy
 
   fmt:

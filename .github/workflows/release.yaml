@@ -46,6 +46,8 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           cache: false
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
 
       - name: Build
         id: build_step
