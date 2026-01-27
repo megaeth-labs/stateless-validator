@@ -13,6 +13,7 @@ use alloy_rpc_types_trace::geth::{
     call::FlatCallFrame, FourByteFrame, GethDebugBuiltInTracerType, GethDebugTracerType,
     GethDebugTracingOptions, GethTrace, NoopFrame, TraceResult,
 };
+use alloy_rpc_types_trace::parity::LocalizedTransactionTrace;
 use alloy_evm::block::BlockExecutor;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use eyre::Result;
@@ -286,6 +287,172 @@ pub fn trace_transaction(
     trace_result.map_err(|e| ValidationError::BlockReplayFailed(
         alloy_evm::block::BlockExecutionError::msg(e)
     ))
+}
+
+/// Traces a block execution and returns Parity-style localized transaction traces.
+///
+/// This function is specifically for the `trace_block` RPC method which returns
+/// a flat list of `LocalizedTransactionTrace` objects, not wrapped in `TraceResult`.
+///
+/// # Arguments
+/// * `chain_spec` - Chain specification
+/// * `block` - Block to trace
+/// * `witness` - SALT witness for state access
+/// * `contracts` - Contract bytecode cache
+///
+/// # Returns
+/// Returns a flat vector of localized transaction traces for all transactions in the block
+pub fn parity_trace_block(
+    chain_spec: &ChainSpec,
+    block: &Block<OpTransaction>,
+    witness: &SaltWitness,
+    contracts: &HashMap<B256, Bytecode>,
+) -> Result<Vec<LocalizedTransactionTrace>, ValidationError> {
+    let env = TracingEnv::new(chain_spec, block, witness, contracts)?;
+
+    // Create witness database and State
+    let salt_witness_obj = salt::Witness::from(witness.clone());
+    let witness_db = WitnessDatabase {
+        header: &block.header,
+        witness: &salt_witness_obj,
+        contracts,
+    };
+    let mut state = State::builder()
+        .with_database_ref(&witness_db)
+        .build();
+
+    let mut all_traces = Vec::new();
+
+    for (index, tx) in env.transactions.iter().enumerate() {
+        let recovered_tx = &tx.inner.inner;
+        let info = tx_info_at(block, tx, index);
+
+        let inspector = TracingInspector::new(
+            TracingInspectorConfig::default_parity(),
+        );
+
+        let mut executor = env.executor_factory.create_executor_with_inspector(
+            &mut state,
+            env.block_ctx.clone(),
+            env.evm_env.clone(),
+            inspector,
+        );
+
+        match executor.run_transaction(recovered_tx) {
+            Ok(outcome) => {
+                let state_changes = outcome.inner.state;
+
+                // Get traces without setting transaction_gas_limit - the inspector
+                // already tracks the correct gas (after intrinsic gas deduction)
+                let inspector = executor.inspector();
+                let traces: Vec<LocalizedTransactionTrace> = inspector
+                    .clone()
+                    .into_parity_builder()
+                    .into_localized_transaction_traces(info);
+
+                all_traces.extend(traces);
+
+                // Commit state changes for subsequent transactions
+                if index < env.transactions.len() - 1 {
+                    state.commit(state_changes);
+                }
+            }
+            Err(e) => {
+                return Err(ValidationError::BlockReplayFailed(
+                    alloy_evm::block::BlockExecutionError::msg(e.to_string())
+                ));
+            }
+        }
+    }
+
+    Ok(all_traces)
+}
+
+/// Traces a single transaction and returns Parity-style localized transaction traces.
+///
+/// This function is specifically for the `trace_transaction` RPC method which returns
+/// a list of `LocalizedTransactionTrace` objects for a single transaction.
+///
+/// # Arguments
+/// * `chain_spec` - Chain specification
+/// * `block` - Block containing the transaction
+/// * `tx_index` - Index of the transaction in the block
+/// * `witness` - SALT witness for state access
+/// * `contracts` - Contract bytecode cache
+///
+/// # Returns
+/// Returns a vector of localized transaction traces for the specified transaction
+pub fn parity_trace_transaction(
+    chain_spec: &ChainSpec,
+    block: &Block<OpTransaction>,
+    tx_index: usize,
+    witness: &SaltWitness,
+    contracts: &HashMap<B256, Bytecode>,
+) -> Result<Vec<LocalizedTransactionTrace>, ValidationError> {
+    let env = TracingEnv::new(chain_spec, block, witness, contracts)?;
+
+    if tx_index >= env.transactions.len() {
+        return Err(ValidationError::BlockIncomplete);
+    }
+
+    // Create witness database and State
+    let salt_witness_obj = salt::Witness::from(witness.clone());
+    let witness_db = WitnessDatabase {
+        header: &block.header,
+        witness: &salt_witness_obj,
+        contracts,
+    };
+    let mut state = State::builder()
+        .with_database_ref(&witness_db)
+        .build();
+
+    // Replay preceding transactions without tracing
+    for tx in env.transactions.iter().take(tx_index) {
+        let mut executor = env.executor_factory.create_executor(
+            &mut state,
+            env.block_ctx.clone(),
+            env.evm_env.clone(),
+        );
+
+        let recovered_tx = &tx.inner.inner;
+        executor.execute_transaction(recovered_tx)
+            .map_err(ValidationError::BlockReplayFailed)?;
+    }
+
+    // Trace the target transaction
+    let target_tx = &env.transactions[tx_index];
+    let recovered_tx = &target_tx.inner.inner;
+    let info = tx_info_at(block, target_tx, tx_index);
+
+    let inspector = TracingInspector::new(
+        TracingInspectorConfig::default_parity(),
+    );
+
+    let mut executor = env.executor_factory.create_executor_with_inspector(
+        &mut state,
+        env.block_ctx.clone(),
+        env.evm_env.clone(),
+        inspector,
+    );
+
+    match executor.run_transaction(recovered_tx) {
+        Ok(_outcome) => {
+            // Get traces without setting transaction_gas_limit - the inspector
+            // already tracks the correct gas (after intrinsic gas deduction)
+            let inspector = executor.inspector();
+            let traces: Vec<LocalizedTransactionTrace> = inspector
+                .clone()
+                .into_parity_builder()
+                .into_localized_transaction_traces(info);
+
+            Ok(traces)
+        }
+        Err(e) => {
+            Err(ValidationError::BlockReplayFailed(
+                alloy_evm::block::BlockExecutionError::msg(e.to_string())
+            ))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

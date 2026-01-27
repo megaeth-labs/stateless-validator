@@ -6,11 +6,10 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use alloy_genesis::Genesis;
 use alloy_primitives::B256;
 use alloy_rpc_types_eth::BlockNumberOrTag;
-use alloy_rpc_types_trace::geth::{
-    GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions,
-};
+use alloy_rpc_types_trace::geth::GethDebugTracingOptions;
 use clap::Parser;
 use eyre::Result;
 use jsonrpsee::server::{RpcModule, Server};
@@ -81,6 +80,10 @@ struct Args {
     /// Maximum number of contracts to cache.
     #[clap(long, env = "DEBUG_TRACE_SERVER_CACHE_CONTRACTS", default_value_t = 10000)]
     cache_contracts: usize,
+
+    /// Path to genesis JSON file containing hardfork activation configuration.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_GENESIS_FILE")]
+    genesis_file: Option<String>,
 }
 
 /// Shared context for all RPC handlers.
@@ -136,7 +139,15 @@ async fn main() -> Result<()> {
         cache_config,
     )?);
 
-    let chain_spec = Arc::new(ChainSpec::default());
+    let chain_spec = if let Some(genesis_path) = &args.genesis_file {
+        info!("Loading genesis from: {}", genesis_path);
+        let genesis_content = std::fs::read_to_string(genesis_path)?;
+        let genesis: Genesis = serde_json::from_str(&genesis_content)?;
+        Arc::new(ChainSpec::from_genesis(genesis))
+    } else {
+        info!("Using default chain spec");
+        Arc::new(ChainSpec::default())
+    };
     let ctx = RpcContext {
         cache,
         chain_spec,
@@ -163,16 +174,6 @@ async fn main() -> Result<()> {
 /// Shorthand for creating a JSON-RPC internal error.
 fn rpc_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
     jsonrpsee::types::ErrorObjectOwned::owned(-32000, msg, None::<()>)
-}
-
-/// Creates tracing options for Parity-style flat call traces.
-fn parity_trace_opts() -> GethDebugTracingOptions {
-    GethDebugTracingOptions {
-        tracer: Some(GethDebugTracerType::BuiltInTracer(
-            GethDebugBuiltInTracerType::FlatCallTracer,
-        )),
-        ..Default::default()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -316,12 +317,12 @@ fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .await
             .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
 
-        let results = validator_core::trace_block(
+        // Use parity_trace_block for Parity-style flat trace output
+        let results = validator_core::parity_trace_block(
             &ctx.chain_spec,
             &data.block,
             &data.salt_witness,
             &data.contracts,
-            parity_trace_opts(),
         )
         .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
 
@@ -346,13 +347,13 @@ fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
                 .await
                 .map_err(|e| rpc_err(format!("Failed to get block data for tx {tx_hash:?}: {e}")))?;
 
-            let result = validator_core::trace_transaction(
+            // Use parity_trace_transaction for Parity-style flat trace output
+            let result = validator_core::parity_trace_transaction(
                 &ctx.chain_spec,
                 &data.block,
                 tx_index,
                 &data.salt_witness,
                 &data.contracts,
-                parity_trace_opts(),
             )
             .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
 
