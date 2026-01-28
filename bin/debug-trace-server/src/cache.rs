@@ -1,437 +1,186 @@
-//! Data cache with single-flight pattern for deduplicating concurrent requests.
+//! Data provider with LRU cache, local database, and remote RPC fallback.
 //!
-//! This module provides a caching layer over the RPC client that:
-//! - Caches blocks, witnesses, and contracts with configurable limits
-//! - Uses single-flight pattern to avoid duplicate concurrent requests
-//! - Tracks cache hit/miss metrics
+//! The data lookup order is:
+//! 1. In-memory LRU cache (fastest)
+//! 2. Local ValidatorDB database (if configured)
+//! 3. Remote RPC endpoints (slowest, always available)
+//!
+//! Features single-flight request coalescing to avoid duplicate RPC calls.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use alloy_primitives::B256;
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
+use dashmap::DashMap;
 use eyre::Result;
-use lru::LruCache;
+use mini_moka::sync::Cache;
 use op_alloy_rpc_types::Transaction;
-use parking_lot::Mutex;
 use revm::state::Bytecode;
 use salt::SaltWitness;
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
-use validator_core::RpcClient;
+use validator_core::{withdrawals::MptWitness, RpcClient, ValidatorDB};
 
-use crate::metrics;
-
-/// Configuration for the data cache.
-#[derive(Debug, Clone)]
-pub struct CacheConfig {
-    /// Maximum number of blocks to cache.
-    pub max_blocks: usize,
-    /// Maximum number of witnesses to cache (used together with blocks).
-    pub max_witnesses: usize,
-    /// Maximum number of contracts to cache.
-    pub max_contracts: usize,
-}
-
-impl Default for CacheConfig {
-    fn default() -> Self {
-        Self {
-            max_blocks: 100,
-            max_witnesses: 100,
-            max_contracts: 1000,
-        }
-    }
-}
-
-/// Cached block data including the block, witness, and contracts.
+/// Block data including the block, witness, and contracts.
 #[derive(Clone)]
-pub struct CachedBlockData {
+pub struct BlockData {
     pub block: Block<Transaction>,
     pub salt_witness: SaltWitness,
     pub contracts: HashMap<B256, Bytecode>,
 }
 
-impl CachedBlockData {
-    /// Returns an estimate of the memory size of this cached data in bytes.
-    #[allow(dead_code)]
-    pub fn estimated_size(&self) -> usize {
-        // Rough estimate: block header + transactions + witness + contracts
-        std::mem::size_of::<Block<Transaction>>()
-            + self.block.transactions.len() * 500 // ~500 bytes per transaction
-            + self.salt_witness.kvs.len() * 100 // ~100 bytes per witness entry
-            + self.contracts.values().map(|c| c.bytes().len()).sum::<usize>()
-    }
-}
+/// Default maximum number of blocks to cache in memory.
+pub const DEFAULT_CACHE_SIZE: u64 = 128;
+
+/// Default timeout for witness fetch retry in seconds.
+pub const DEFAULT_WITNESS_TIMEOUT_SECS: u64 = 8;
+
+/// Retry interval for witness fetch in milliseconds.
+const WITNESS_RETRY_INTERVAL_MS: u64 = 200;
 
 /// In-flight request state for single-flight pattern.
-type InFlightSender<T> = broadcast::Sender<Result<T, String>>;
+type InFlightSender = broadcast::Sender<Result<BlockData, String>>;
 
-/// Data provider with caching and single-flight deduplication.
-pub struct CachedDataProvider {
-    /// Underlying RPC client.
+/// Data provider with LRU cache, database, and RPC fallback.
+pub struct DataProvider {
     rpc_client: Arc<RpcClient>,
-
-    /// Block cache (by block number) - includes block, witness, and contracts.
-    block_cache: Mutex<LruCache<u64, CachedBlockData>>,
-
-    /// Block hash to block number mapping cache.
-    hash_to_number: Mutex<LruCache<B256, u64>>,
-
-    /// Transaction hash to (block_number, tx_index) mapping cache.
-    /// This allows us to skip the get_transaction_by_hash RPC call when we've
-    /// already seen this transaction in a block trace.
-    tx_to_location: Mutex<LruCache<B256, (u64, usize)>>,
-
-    /// Contract bytecode cache (by code hash).
-    contract_cache: Mutex<LruCache<B256, Bytecode>>,
-
-    /// In-flight block requests for single-flight pattern.
-    inflight_blocks: Mutex<HashMap<u64, InFlightSender<CachedBlockData>>>,
-
-    /// In-flight contract requests for single-flight pattern.
-    inflight_contracts: Mutex<HashMap<B256, InFlightSender<Bytecode>>>,
-
-    /// Maximum cache size configuration.
-    _config: CacheConfig,
+    validator_db: Option<Arc<ValidatorDB>>,
+    /// LRU cache keyed by block hash.
+    block_cache: tokio::sync::RwLock<Cache<B256, BlockData>>,
+    /// Current cache size limit.
+    cache_size: std::sync::atomic::AtomicU64,
+    /// Timeout for witness fetch retry.
+    witness_timeout: Duration,
+    /// In-flight requests for single-flight pattern (keyed by block hash).
+    in_flight: DashMap<B256, InFlightSender>,
 }
 
-impl CachedDataProvider {
-    /// Creates a new cached data provider.
+impl DataProvider {
+    /// Creates a new data provider.
     ///
-    /// Internally creates an `RpcClient` from the given endpoint URLs. All RPC
-    /// interaction is encapsulated here – callers only need to work with the
-    /// cache layer.
-    pub fn new(rpc_endpoint: &str, witness_endpoint: &str, config: CacheConfig) -> eyre::Result<Self> {
+    /// # Arguments
+    /// * `rpc_endpoint` - Upstream RPC endpoint for fetching blocks and contracts
+    /// * `witness_endpoint` - Upstream witness endpoint for fetching SALT witness data
+    /// * `validator_db` - Optional local database for cached block data
+    /// * `cache_size` - Maximum number of blocks to cache in memory
+    /// * `witness_timeout_secs` - Timeout in seconds for witness fetch retry
+    pub fn new(
+        rpc_endpoint: &str,
+        witness_endpoint: &str,
+        validator_db: Option<Arc<ValidatorDB>>,
+        cache_size: u64,
+        witness_timeout_secs: u64,
+    ) -> eyre::Result<Self> {
         let rpc_client = Arc::new(RpcClient::new(rpc_endpoint, witness_endpoint)?);
-
-        // Use min of max_blocks and max_witnesses for the block cache
-        let block_cache_size = config.max_blocks.min(config.max_witnesses);
-        // Assume ~100 transactions per block for tx mapping cache
-        let tx_cache_size = block_cache_size * 100;
-
+        let block_cache = tokio::sync::RwLock::new(Cache::new(cache_size));
         Ok(Self {
             rpc_client,
-            block_cache: Mutex::new(LruCache::new(
-                std::num::NonZeroUsize::new(block_cache_size).unwrap(),
-            )),
-            hash_to_number: Mutex::new(LruCache::new(
-                std::num::NonZeroUsize::new(block_cache_size).unwrap(),
-            )),
-            tx_to_location: Mutex::new(LruCache::new(
-                std::num::NonZeroUsize::new(tx_cache_size).unwrap(),
-            )),
-            contract_cache: Mutex::new(LruCache::new(
-                std::num::NonZeroUsize::new(config.max_contracts).unwrap(),
-            )),
-            inflight_blocks: Mutex::new(HashMap::new()),
-            inflight_contracts: Mutex::new(HashMap::new()),
-            _config: config,
+            validator_db,
+            block_cache,
+            cache_size: std::sync::atomic::AtomicU64::new(cache_size),
+            witness_timeout: Duration::from_secs(witness_timeout_secs),
+            in_flight: DashMap::new(),
         })
     }
 
-    /// Gets block data (block + witness + contracts) with caching.
+    /// Sets a new cache size limit.
     ///
-    /// Uses single-flight pattern: if multiple requests come in for the same block,
-    /// only one RPC call is made and all waiters receive the result.
-    pub async fn get_block_data(&self, block_num: u64) -> Result<CachedBlockData> {
-        // Check cache first
-        {
-            let mut cache = self.block_cache.lock();
-            if let Some(data) = cache.get(&block_num) {
-                metrics::record_cache_hit("block");
-                debug!("Cache hit for block {}", block_num);
-                return Ok(data.clone());
-            }
-        }
-        metrics::record_cache_miss("block");
-
-        // Check if there's an in-flight request
-        let receiver = {
-            let mut inflight = self.inflight_blocks.lock();
-            if let Some(sender) = inflight.get(&block_num) {
-                // Join existing request
-                debug!("Joining in-flight request for block {}", block_num);
-                Some(sender.subscribe())
-            } else {
-                // Start new request
-                let (tx, _) = broadcast::channel(1);
-                inflight.insert(block_num, tx);
-                None
-            }
-        };
-
-        if let Some(mut rx) = receiver {
-            // Wait for in-flight request
-            match rx.recv().await {
-                Ok(Ok(data)) => return Ok(data),
-                Ok(Err(e)) => return Err(eyre::eyre!("{}", e)),
-                Err(_) => return Err(eyre::eyre!("In-flight request dropped")),
-            }
-        }
-
-        // We're the leader - fetch the data
-        let result = self.fetch_block_data_internal(block_num).await;
-
-        // Notify waiters and cleanup
-        let notify_result = match &result {
-            Ok(data) => Ok(data.clone()),
-            Err(e) => Err(e.to_string()),
-        };
-        {
-            let mut inflight = self.inflight_blocks.lock();
-            if let Some(sender) = inflight.remove(&block_num) {
-                let _ = sender.send(notify_result);
-            }
-        }
-
-        // Cache the result on success
-        if let Ok(ref data) = result {
-            let mut cache = self.block_cache.lock();
-            cache.put(block_num, data.clone());
-            // Also update hash_to_number mapping
-            let mut h2n = self.hash_to_number.lock();
-            h2n.put(data.block.header.hash, block_num);
-            drop(h2n);
-            drop(cache);
-            // Index transaction locations
-            self.index_block_transactions(data);
-        }
-
-        result
+    /// This recreates the cache with the new size, clearing all existing entries.
+    pub async fn set_cache_size(&self, new_size: u64) {
+        self.cache_size
+            .store(new_size, std::sync::atomic::Ordering::Relaxed);
+        let mut cache = self.block_cache.write().await;
+        *cache = Cache::new(new_size);
+        debug!("Cache size updated to {} blocks", new_size);
     }
 
-    /// Internal method to fetch block data from RPC.
-    async fn fetch_block_data_internal(&self, block_num: u64) -> Result<CachedBlockData> {
-        debug!("Fetching block {} from RPC", block_num);
-
-        // Fetch block
-        let block = self
-            .rpc_client
-            .get_block(BlockId::Number(BlockNumberOrTag::Number(block_num)), true)
-            .await?;
-
-        // Fetch witness
-        let (salt_witness, _mpt_witness) = self
-            .rpc_client
-            .get_witness(block.header.number, block.header.hash)
-            .await?;
-
-        // Extract code hashes and fetch contracts (with caching)
-        let code_hashes = validator_core::extract_code_hashes(&salt_witness);
-        let contracts = self.get_contracts(&code_hashes).await?;
-
-        Ok(CachedBlockData {
-            block,
-            salt_witness,
-            contracts,
-        })
+    /// Returns the current cache size limit.
+    pub fn get_cache_size(&self) -> u64 {
+        self.cache_size.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Gets block data by hash.
+    /// Returns the current number of entries in the cache.
+    pub async fn get_cache_entry_count(&self) -> u64 {
+        self.block_cache.read().await.entry_count()
+    }
+
+    /// Gets block data by block number.
     ///
-    /// First checks the hash_to_number cache, then reuses get_block_data for the actual fetch.
-    /// This avoids fetching the block twice when we already have the mapping.
-    pub async fn get_block_data_by_hash(&self, block_hash: B256) -> Result<CachedBlockData> {
-        // Check if we have a cached hash -> number mapping
-        let cached_num = {
-            let mut h2n = self.hash_to_number.lock();
-            h2n.get(&block_hash).copied()
+    /// Lookup order: LRU cache -> local database -> RPC.
+    pub async fn get_block_data(&self, block_num: u64) -> Result<BlockData> {
+        // First resolve block number to hash for cache lookup
+        let block_hash = if let Some(db) = &self.validator_db {
+            db.get_block_hash(block_num)?
+        } else {
+            None
         };
 
-        if let Some(block_num) = cached_num {
-            debug!("Hash to number cache hit: {} -> {}", block_hash, block_num);
-            // Use get_block_data which handles caching and single-flight
-            return self.get_block_data(block_num).await;
+        // Check LRU cache if we have the hash
+        if let Some(hash) = block_hash {
+            if let Some(data) = self.block_cache.read().await.get(&hash) {
+                debug!("Block {} fetched from LRU cache", block_num);
+                return Ok(data);
+            }
         }
 
-        // No cached mapping, need to fetch the block to get its number
-        debug!("Hash to number cache miss for {}", block_hash);
-        let block = self
-            .rpc_client
-            .get_block(BlockId::Hash(block_hash.into()), true)
-            .await?;
-
-        let block_num = block.header.number;
-
-        // Update hash_to_number mapping
-        {
-            let mut h2n = self.hash_to_number.lock();
-            h2n.put(block_hash, block_num);
-        }
-
-        // Check if we already have this block cached by number
-        {
-            let mut cache = self.block_cache.lock();
-            if let Some(data) = cache.get(&block_num) {
-                if data.block.header.hash == block_hash {
-                    metrics::record_cache_hit("block");
-                    return Ok(data.clone());
+        // Try to get from local database
+        if let Some(db) = &self.validator_db {
+            if let Some(hash) = block_hash {
+                if let Ok(data) = self.get_block_data_from_db(db, hash).await {
+                    debug!("Block {} fetched from database", block_num);
+                    self.block_cache.read().await.insert(hash, data.clone());
+                    return Ok(data);
                 }
             }
         }
-        metrics::record_cache_miss("block");
 
-        // Fetch witness and contracts
-        let (salt_witness, _mpt_witness) = self
-            .rpc_client
-            .get_witness(block.header.number, block.header.hash)
-            .await?;
-
-        let code_hashes = validator_core::extract_code_hashes(&salt_witness);
-        let contracts = self.get_contracts(&code_hashes).await?;
-
-        let data = CachedBlockData {
-            block,
-            salt_witness,
-            contracts,
-        };
-
-        // Cache it and index transactions
-        {
-            let mut cache = self.block_cache.lock();
-            cache.put(block_num, data.clone());
-        }
-        self.index_block_transactions(&data);
-
+        // Fall back to RPC
+        debug!("Block {} fetched from RPC", block_num);
+        let data = self.fetch_block_data_from_rpc(block_num).await?;
+        self.block_cache
+            .read()
+            .await
+            .insert(data.block.header.hash, data.clone());
         Ok(data)
     }
 
-    /// Gets multiple contracts with caching and single-flight.
-    async fn get_contracts(&self, code_hashes: &[B256]) -> Result<HashMap<B256, Bytecode>> {
-        let mut result = HashMap::new();
-        let mut missing = Vec::new();
-
-        // Check cache for each contract
-        {
-            let mut cache = self.contract_cache.lock();
-            for &hash in code_hashes {
-                if let Some(bytecode) = cache.get(&hash) {
-                    metrics::record_cache_hit("contract");
-                    result.insert(hash, bytecode.clone());
-                } else {
-                    metrics::record_cache_miss("contract");
-                    missing.push(hash);
-                }
-            }
-        }
-
-        // Fetch missing contracts
-        for hash in missing {
-            match self.get_contract(hash).await {
-                Ok(bytecode) => {
-                    result.insert(hash, bytecode);
-                }
-                Err(e) => {
-                    warn!("Failed to fetch contract {}: {}", hash, e);
-                }
-            }
-        }
-
-        Ok(result)
-    }
-
-    /// Gets a single contract with caching and single-flight.
-    async fn get_contract(&self, hash: B256) -> Result<Bytecode> {
-        // Check cache
-        {
-            let mut cache = self.contract_cache.lock();
-            if let Some(bytecode) = cache.get(&hash) {
-                return Ok(bytecode.clone());
-            }
-        }
-
-        // Check for in-flight request
-        let receiver = {
-            let mut inflight = self.inflight_contracts.lock();
-            if let Some(sender) = inflight.get(&hash) {
-                Some(sender.subscribe())
-            } else {
-                let (tx, _) = broadcast::channel(1);
-                inflight.insert(hash, tx);
-                None
-            }
-        };
-
-        if let Some(mut rx) = receiver {
-            match rx.recv().await {
-                Ok(Ok(bytecode)) => return Ok(bytecode),
-                Ok(Err(e)) => return Err(eyre::eyre!("{}", e)),
-                Err(_) => return Err(eyre::eyre!("In-flight request dropped")),
-            }
-        }
-
-        // Fetch from RPC
-        let result = self.rpc_client.get_code(hash).await.map(Bytecode::new_raw);
-
-        // Notify waiters
-        let notify_result = match &result {
-            Ok(bytecode) => Ok(bytecode.clone()),
-            Err(e) => Err(e.to_string()),
-        };
-        {
-            let mut inflight = self.inflight_contracts.lock();
-            if let Some(sender) = inflight.remove(&hash) {
-                let _ = sender.send(notify_result);
-            }
-        }
-
-        // Cache on success
-        if let Ok(ref bytecode) = result {
-            let mut cache = self.contract_cache.lock();
-            cache.put(hash, bytecode.clone());
-        }
-
-        result
-    }
-
-    /// Resolves a block tag to a concrete block number.
-    pub async fn resolve_block_number(&self, tag: BlockNumberOrTag) -> Result<u64> {
-        match tag {
-            BlockNumberOrTag::Number(n) => Ok(n),
-            BlockNumberOrTag::Latest => self.rpc_client.get_latest_block_number().await,
-            other => Err(eyre::eyre!("Unsupported block tag: {:?}", other)),
-        }
-    }
-
-    /// Indexes transaction locations from a block into the tx_to_location cache.
-    fn index_block_transactions(&self, data: &CachedBlockData) {
-        use alloy_rpc_types_eth::BlockTransactions;
-
-        if let BlockTransactions::Full(txs) = &data.block.transactions {
-            let mut tx_cache = self.tx_to_location.lock();
-            for (idx, tx) in txs.iter().enumerate() {
-                // Access tx_hash through the inner envelope
-                let tx_hash = tx.inner.inner.tx_hash();
-                tx_cache.put(tx_hash, (data.block.header.number, idx));
-            }
-        }
-    }
-
-    /// Gets block data and transaction index for a transaction hash.
+    /// Gets block data by block hash.
     ///
-    /// This method is optimized to avoid extra RPC calls:
-    /// 1. First checks the tx_to_location cache for a known mapping
-    /// 2. If found, reuses get_block_data with the cached block number
-    /// 3. If not found, fetches the transaction to find its block, then gets block data
-    /// 4. Updates the tx_to_location cache from the block's transactions
-    ///
-    /// Returns (block_data, tx_index) tuple.
-    pub async fn get_block_data_for_tx(&self, tx_hash: B256) -> Result<(CachedBlockData, usize)> {
-        // Check if we have a cached tx -> (block_number, tx_index) mapping
-        let cached_location = {
-            let mut tx_cache = self.tx_to_location.lock();
-            tx_cache.get(&tx_hash).copied()
-        };
-
-        if let Some((block_num, tx_idx)) = cached_location {
-            debug!("Tx location cache hit: {} -> block {} idx {}", tx_hash, block_num, tx_idx);
-            let data = self.get_block_data(block_num).await?;
-            return Ok((data, tx_idx));
+    /// Lookup order: LRU cache -> local database -> RPC.
+    pub async fn get_block_data_by_hash(&self, block_hash: B256) -> Result<BlockData> {
+        // Check LRU cache first
+        if let Some(data) = self.block_cache.read().await.get(&block_hash) {
+            debug!("Block {} fetched from LRU cache", block_hash);
+            return Ok(data);
         }
 
-        debug!("Tx location cache miss for {}", tx_hash);
+        // Try to get from local database
+        if let Some(db) = &self.validator_db {
+            if let Ok(data) = self.get_block_data_from_db(db, block_hash.into()).await {
+                debug!("Block {} fetched from database", block_hash);
+                self.block_cache
+                    .read()
+                    .await
+                    .insert(block_hash, data.clone());
+                return Ok(data);
+            }
+        }
 
-        // No cached mapping, need to fetch the transaction to find its block
+        // Fall back to RPC
+        debug!("Block {} fetched from RPC", block_hash);
+        let data = self.fetch_block_data_by_hash_from_rpc(block_hash).await?;
+        self.block_cache
+            .read()
+            .await
+            .insert(block_hash, data.clone());
+        Ok(data)
+    }
+
+    /// Gets block data for a transaction by its hash.
+    pub async fn get_block_data_for_tx(&self, tx_hash: B256) -> Result<(BlockData, usize)> {
+        debug!("Fetching block data for tx {}", tx_hash);
+
+        // Fetch the transaction to find its block
         let (tx, block_hash) = self
             .rpc_client
             .get_transaction_by_hash(tx_hash)
@@ -443,12 +192,202 @@ impl CachedDataProvider {
             .ok_or_else(|| eyre::eyre!("Transaction {} is pending", tx_hash))?
             as usize;
 
-        // Get block data (this will cache the block)
+        // Get block data
         let data = self.get_block_data_by_hash(block_hash).await?;
 
-        // Index all transactions from this block into the cache
-        self.index_block_transactions(&data);
-
         Ok((data, tx_index))
+    }
+
+    /// Resolves a block tag to a concrete block number.
+    pub async fn resolve_block_number(&self, tag: BlockNumberOrTag) -> Result<u64> {
+        match tag {
+            BlockNumberOrTag::Number(n) => Ok(n),
+            BlockNumberOrTag::Latest => self.rpc_client.get_latest_block_number().await,
+            other => Err(eyre::eyre!("Unsupported block tag: {:?}", other)),
+        }
+    }
+
+    /// Gets block data from the local database.
+    async fn get_block_data_from_db(
+        &self,
+        db: &ValidatorDB,
+        block_hash: alloy_primitives::BlockHash,
+    ) -> Result<BlockData> {
+        // Get block data from database
+        let (block, salt_witness) = db.get_block_and_witness(block_hash)?;
+
+        // Extract code hashes and get contracts
+        let code_hashes = validator_core::extract_code_hashes(&salt_witness);
+        let contracts = self.get_contracts_with_db(db, &code_hashes).await?;
+
+        Ok(BlockData {
+            block,
+            salt_witness,
+            contracts,
+        })
+    }
+
+    /// Fetches block data from RPC by block number with single-flight.
+    async fn fetch_block_data_from_rpc(&self, block_num: u64) -> Result<BlockData> {
+        // First fetch block without transactions to get the hash
+        let block = self
+            .rpc_client
+            .get_block(BlockId::Number(BlockNumberOrTag::Number(block_num)), false)
+            .await?;
+
+        // Use single-flight for the actual data fetch
+        self.fetch_block_data_single_flight(block.header.hash).await
+    }
+
+    /// Fetches block data from RPC by block hash with single-flight.
+    async fn fetch_block_data_by_hash_from_rpc(&self, block_hash: B256) -> Result<BlockData> {
+        self.fetch_block_data_single_flight(block_hash).await
+    }
+
+    /// Single-flight fetch: ensures only one RPC call per block hash.
+    async fn fetch_block_data_single_flight(&self, block_hash: B256) -> Result<BlockData> {
+        // Check if there's already an in-flight request for this block
+        if let Some(sender) = self.in_flight.get(&block_hash) {
+            // Subscribe to the existing request
+            let mut receiver = sender.subscribe();
+            drop(sender); // Release the lock
+            debug!(
+                "Joining existing in-flight request for block {}",
+                block_hash
+            );
+            return receiver
+                .recv()
+                .await
+                .map_err(|e| eyre::eyre!("Failed to receive from in-flight request: {}", e))?
+                .map_err(|e| eyre::eyre!("{}", e));
+        }
+
+        // Create a new broadcast channel for this request
+        let (tx, _) = broadcast::channel(1);
+        self.in_flight.insert(block_hash, tx.clone());
+
+        // Perform the actual fetch
+        let result = self.do_fetch_block_data(block_hash).await;
+
+        // Convert result to string error for broadcast (eyre::Error is not Clone)
+        let broadcast_result = result
+            .as_ref()
+            .map(|data| data.clone())
+            .map_err(|e| e.to_string());
+
+        // Broadcast result to all waiters (ignore send errors - no receivers is ok)
+        let _ = tx.send(broadcast_result);
+
+        // Remove from in-flight map
+        self.in_flight.remove(&block_hash);
+
+        result
+    }
+
+    /// Actually fetches block data from RPC (called by single-flight).
+    async fn do_fetch_block_data(&self, block_hash: B256) -> Result<BlockData> {
+        // Fetch block without transactions first to get the number
+        let block = self
+            .rpc_client
+            .get_block(BlockId::Hash(block_hash.into()), false)
+            .await?;
+
+        // Fetch witness with retry
+        let (salt_witness, _mpt_witness) = self
+            .fetch_witness_with_retry(block.header.number, block.header.hash)
+            .await?;
+
+        // Fetch block with full transactions
+        let block = self
+            .rpc_client
+            .get_block(BlockId::Hash(block_hash.into()), true)
+            .await?;
+
+        // Extract code hashes and fetch contracts
+        let code_hashes = validator_core::extract_code_hashes(&salt_witness);
+        let contracts = self.get_contracts(&code_hashes).await?;
+
+        Ok(BlockData {
+            block,
+            salt_witness,
+            contracts,
+        })
+    }
+
+    /// Fetches witness data with retry logic.
+    ///
+    /// Retries fetching witness until success or timeout is reached.
+    async fn fetch_witness_with_retry(
+        &self,
+        block_number: u64,
+        block_hash: B256,
+    ) -> Result<(SaltWitness, MptWitness)> {
+        let start = std::time::Instant::now();
+        let retry_interval = Duration::from_millis(WITNESS_RETRY_INTERVAL_MS);
+        let mut last_error = None;
+
+        while start.elapsed() < self.witness_timeout {
+            match self.rpc_client.get_witness(block_number, block_hash).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    warn!(
+                        "Failed to fetch witness for block {}, retrying: {}",
+                        block_number, e
+                    );
+                    last_error = Some(e);
+                    tokio::time::sleep(retry_interval).await;
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            eyre::eyre!(
+                "Witness fetch timeout after {:?} for block {}",
+                self.witness_timeout,
+                block_number
+            )
+        }))
+    }
+
+    /// Gets contracts, first checking local database then falling back to RPC.
+    async fn get_contracts_with_db(
+        &self,
+        db: &ValidatorDB,
+        code_hashes: &[B256],
+    ) -> Result<HashMap<B256, Bytecode>> {
+        // First try to get from database
+        let (mut contracts, missing) = db.get_contract_codes(code_hashes.iter().copied())?;
+
+        // Fetch missing contracts from RPC
+        for hash in missing {
+            match self.rpc_client.get_code(hash).await {
+                Ok(code) => {
+                    contracts.insert(hash, Bytecode::new_raw(code));
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to fetch contract {}: {}", hash, e);
+                }
+            }
+        }
+
+        Ok(contracts)
+    }
+
+    /// Gets multiple contracts by their code hashes from RPC.
+    async fn get_contracts(&self, code_hashes: &[B256]) -> Result<HashMap<B256, Bytecode>> {
+        let mut result = HashMap::new();
+
+        for &hash in code_hashes {
+            match self.rpc_client.get_code(hash).await {
+                Ok(code) => {
+                    result.insert(hash, Bytecode::new_raw(code));
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to fetch contract {}: {}", hash, e);
+                }
+            }
+        }
+
+        Ok(result)
     }
 }

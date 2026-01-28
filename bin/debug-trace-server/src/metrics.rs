@@ -18,37 +18,16 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
 
     // Register metric descriptions
     describe_counter!(
-        "debug_trace_cache_hits_total",
-        "Total number of cache hits"
-    );
-    describe_counter!(
-        "debug_trace_cache_misses_total",
-        "Total number of cache misses"
-    );
-    describe_counter!(
         "debug_trace_rpc_requests_total",
         "Total number of RPC requests"
     );
-    describe_counter!(
-        "debug_trace_rpc_errors_total",
-        "Total number of RPC errors"
-    );
+    describe_counter!("debug_trace_rpc_errors_total", "Total number of RPC errors");
     describe_histogram!(
         "debug_trace_request_duration_seconds",
         "Duration of RPC method calls"
     );
 
     Ok(())
-}
-
-/// Record a cache hit.
-pub fn record_cache_hit(cache_type: &str) {
-    counter!("debug_trace_cache_hits_total", "type" => cache_type.to_string()).increment(1);
-}
-
-/// Record a cache miss.
-pub fn record_cache_miss(cache_type: &str) {
-    counter!("debug_trace_cache_misses_total", "type" => cache_type.to_string()).increment(1);
 }
 
 /// Record an RPC request.

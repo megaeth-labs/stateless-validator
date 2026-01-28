@@ -2,6 +2,8 @@
 //!
 //! Provides methods to fetch blocks, witnesses, and contract bytecode from MegaETH nodes.
 
+use std::collections::HashMap;
+
 use alloy_primitives::{B256, Bytes};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
@@ -11,7 +13,6 @@ use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 use crate::{executor::verify_block_integrity, withdrawals::MptWitness};
 
@@ -154,15 +155,17 @@ impl RpcClient {
         &self,
         tx_hash: B256,
     ) -> Result<Option<(Transaction, B256)>> {
-        let tx = self.data_provider
+        let tx = self
+            .data_provider
             .get_transaction_by_hash(tx_hash)
             .await
             .context("Failed to get transaction by hash")?;
 
         match tx {
             Some(tx) => {
-                let block_hash = tx.block_hash
-                    .ok_or_else(|| eyre!("Transaction {} is pending and has no block hash", tx_hash))?;
+                let block_hash = tx.block_hash.ok_or_else(|| {
+                    eyre!("Transaction {} is pending and has no block hash", tx_hash)
+                })?;
                 Ok(Some((tx, block_hash)))
             }
             None => Ok(None),

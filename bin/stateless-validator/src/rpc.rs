@@ -9,12 +9,11 @@ use alloy_rpc_types_eth::{Block, BlockId};
 use eyre::Result;
 use op_alloy_rpc_types::Transaction;
 use salt::SaltWitness;
+// Re-export types from validator-core
+pub use validator_core::rpc_client::{RpcClient as CoreRpcClient, SetValidatedBlocksResponse};
 use validator_core::withdrawals::MptWitness;
 
 use crate::metrics;
-
-// Re-export types from validator-core
-pub use validator_core::rpc_client::{RpcClient as CoreRpcClient, SetValidatedBlocksResponse};
 
 /// RPC client wrapper with metrics support
 #[derive(Debug, Clone)]
@@ -28,6 +27,11 @@ impl RpcClient {
         Ok(Self {
             inner: CoreRpcClient::new(data_api, witness_api)?,
         })
+    }
+
+    /// Returns a reference to the inner core RPC client
+    pub fn inner(&self) -> &CoreRpcClient {
+        &self.inner
     }
 
     /// Gets contract bytecode for a code hash (with metrics)
@@ -96,7 +100,10 @@ impl RpcClient {
         first_block: (u64, B256),
         last_block: (u64, B256),
     ) -> Result<SetValidatedBlocksResponse> {
-        let result = self.inner.set_validated_blocks(first_block, last_block).await;
+        let result = self
+            .inner
+            .set_validated_blocks(first_block, last_block)
+            .await;
 
         metrics::on_rpc_complete(
             metrics::RpcMethod::MegaSetValidatedBlocks,

@@ -35,10 +35,26 @@ eyre.workspace = true
 
 # Serialization
 serde_json.workspace = true
+serde.workspace = true
 
 # CLI
 clap.workspace = true
 
-# Caching
-lru = "0.12"
-parking_lot = "0.12"
+# LRU cache
+mini-moka = "0.10"
+
+# Concurrent map for single-flight
+dashmap = "5.5"
+
+[dev-dependencies]
+# HTTP client for integration tests
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+dotenvy = "0.15"
+
+# Transaction signing for integration tests
+alloy-signer = "1.0.23"
+alloy-signer-local = "1.0.23"
+alloy-consensus.workspace = true
+alloy-network = "1.0.23"
+alloy-rlp.workspace = true
+alloy-primitives.workspace = true

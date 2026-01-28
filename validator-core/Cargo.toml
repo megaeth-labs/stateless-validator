@@ -43,11 +43,14 @@ reth-trie-sparse.workspace = true
 bincode.workspace = true
 eyre.workspace = true
 dyn-clone.workspace = true
+futures.workspace = true
+num_cpus.workspace = true
 rayon.workspace = true
 redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [features]
