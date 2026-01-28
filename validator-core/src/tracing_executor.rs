@@ -1,7 +1,28 @@
-//! Tracing executor for debug and trace RPC methods.
+//! Tracing Executor for Debug and Trace RPC Methods
 //!
 //! This module provides tracing capabilities for block and transaction execution,
-//! matching the mega-reth debug.rs implementation pattern.
+//! enabling the `debug_*` and `trace_*` RPC methods in the debug-trace-server.
+//!
+//! # Architecture
+//! The tracing executor uses a witness-backed database to replay transactions
+//! without requiring access to the full state database. This enables:
+//! - Historical block tracing at any height
+//! - Stateless execution using SALT witness data
+//! - Support for multiple tracer types (Geth and Parity styles)
+//!
+//! # Supported Tracer Types
+//! ## Geth-style (debug_* methods)
+//! - `CallTracer` - Nested call frame traces
+//! - `PreStateTracer` - Pre/post state diff
+//! - `FourByteTracer` - Function selector statistics
+//! - `NoopTracer` - No-op for testing
+//! - `MuxTracer` - Multiple tracers combined
+//! - `FlatCallTracer` - Flat call traces
+//! - `JsTracer` - Custom JavaScript tracers
+//! - Default struct logger - Detailed opcode-level traces
+//!
+//! ## Parity-style (trace_* methods)
+//! - `LocalizedTransactionTrace` - Flat call traces with block/tx context
 
 use std::collections::HashMap;
 
@@ -43,31 +64,55 @@ use crate::{
 };
 
 // ---------------------------------------------------------------------------
-// Common tracing environment setup
+// Tracing Environment Setup
 // ---------------------------------------------------------------------------
 
 /// Pre-built execution environment for tracing operations.
 ///
 /// Encapsulates the common setup shared by both `trace_block` and `trace_transaction`,
-/// avoiding duplicated environment construction code.
+/// avoiding duplicated environment construction code. This includes:
+/// - Witness data conversion and ownership
+/// - EVM environment configuration
+/// - Block executor factory setup
+/// - Hardfork detection and block limits
 struct TracingEnv<'a> {
+    /// Transactions from the block (full transaction data required).
     transactions: &'a [OpTransaction],
+    /// Factory for creating block executors with optional inspectors.
     executor_factory: MegaBlockExecutorFactory<
         ChainSpec,
         MegaEvmFactory<WitnessExternalEnv>,
         OpAlloyReceiptBuilder,
     >,
+    /// Block execution context (parent hash, beacon root, limits).
     block_ctx: MegaBlockExecutionCtx,
+    /// EVM environment (block env, spec ID).
     evm_env: alloy_evm::EvmEnv<mega_evm::MegaSpecId>,
-    /// Owned witness data - kept alive for State's lifetime
+    /// Owned witness data - kept alive for State's lifetime.
+    /// Must outlive any WitnessDatabase created from it.
     salt_witness: salt::Witness,
 }
 
 impl<'a> TracingEnv<'a> {
     /// Creates a new tracing environment from block data.
     ///
-    /// Performs all common setup: witness conversion, database creation,
-    /// EVM environment setup, executor factory, hardfork detection, and block context.
+    /// Performs all common setup required for tracing:
+    /// 1. Validates block has full transaction data
+    /// 2. Creates external environment oracle from witness
+    /// 3. Converts witness to owned format
+    /// 4. Sets up EVM environment with correct hardfork rules
+    /// 5. Creates block executor factory
+    /// 6. Determines block limits based on hardfork
+    ///
+    /// # Arguments
+    /// * `chain_spec` - Chain specification with hardfork activation rules
+    /// * `block` - Block to trace (must have full transactions)
+    /// * `witness` - SALT witness containing state proofs
+    /// * `_contracts` - Contract bytecodes (currently unused in setup)
+    ///
+    /// # Returns
+    /// * `Ok(TracingEnv)` - Ready-to-use tracing environment
+    /// * `Err(ValidationError)` - If block is incomplete or setup fails
     fn new(
         chain_spec: &ChainSpec,
         block: &'a Block<OpTransaction>,
@@ -122,6 +167,9 @@ impl<'a> TracingEnv<'a> {
     }
 
     /// Creates a witness database that borrows from this environment.
+    ///
+    /// The returned database implements `DatabaseRef` and provides state access
+    /// backed by the witness data. It must not outlive this TracingEnv.
     fn create_witness_db<'b>(
         &'b self,
         header: &'b alloy_rpc_types_eth::Header,
@@ -137,6 +185,11 @@ impl<'a> TracingEnv<'a> {
     /// Replays transactions before the given index without tracing.
     ///
     /// This is used to build up the correct state before tracing a specific transaction.
+    /// Each transaction is executed and its state changes are committed to the database.
+    ///
+    /// # Arguments
+    /// * `state` - Mutable state database to execute against
+    /// * `tx_index` - Index of target transaction (transactions before this are replayed)
     fn replay_preceding_transactions<DB>(
         &self,
         state: &mut State<DB>,
@@ -160,10 +213,19 @@ impl<'a> TracingEnv<'a> {
         Ok(())
     }
 
-    /// Executes a transaction with Parity-style tracing and returns the traces and state changes.
+    /// Executes a transaction with Parity-style tracing.
     ///
-    /// This helper encapsulates the common pattern used by both `parity_trace_block` and
-    /// `parity_trace_transaction`.
+    /// Returns both the localized traces and state changes. The state changes
+    /// must be committed before tracing subsequent transactions.
+    ///
+    /// # Arguments
+    /// * `state` - Mutable state database
+    /// * `tx` - Recovered transaction to execute
+    /// * `info` - Transaction context (hash, index, block info)
+    ///
+    /// # Returns
+    /// * `Ok((traces, state_changes))` - Traces and state diff
+    /// * `Err` - If execution fails
     fn execute_with_parity_tracing<DB>(
         &self,
         state: &mut State<DB>,
@@ -204,6 +266,8 @@ impl<'a> TracingEnv<'a> {
 }
 
 /// Creates a `TransactionInfo` for a transaction at the given index within the block.
+///
+/// This info is used by tracers to include block/transaction context in their output.
 fn tx_info_at(block: &Block<OpTransaction>, tx: &OpTransaction, index: usize) -> TransactionInfo {
     TransactionInfo {
         hash: Some(tx.inner.tx_hash()),
@@ -215,7 +279,7 @@ fn tx_info_at(block: &Block<OpTransaction>, tx: &OpTransaction, index: usize) ->
 }
 
 // ---------------------------------------------------------------------------
-// Public API
+// Public API - Geth-style Tracing
 // ---------------------------------------------------------------------------
 
 /// Traces a block execution with detailed inspector data.
@@ -354,6 +418,10 @@ pub fn trace_transaction(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Public API - Parity-style Tracing
+// ---------------------------------------------------------------------------
+
 /// Traces a block execution and returns Parity-style localized transaction traces.
 ///
 /// This function is specifically for the `trace_block` RPC method which returns
@@ -445,20 +513,35 @@ pub fn parity_trace_transaction(
 }
 
 // ---------------------------------------------------------------------------
-// Internal tracer dispatch
+// Internal Tracer Dispatch
 // ---------------------------------------------------------------------------
 
 /// Context for tracing a single transaction.
 ///
-/// Groups transaction-related parameters to reduce function argument count.
+/// Groups transaction-related parameters to reduce function argument count
+/// and improve code readability.
 struct TxTracingContext<'a> {
+    /// The recovered (signature-verified) transaction to trace.
     tx: &'a Recovered<OpTxEnvelope>,
+    /// Gas limit from the transaction (used for gas accounting in traces).
     tx_gas_limit: u64,
+    /// Transaction context info (hash, index, block info) for trace output.
     tx_info: TransactionInfo,
 }
 
-/// Internal helper function to trace a transaction and return both the trace and state changes.
+/// Internal helper function to trace a transaction with the appropriate tracer.
 ///
+/// This function dispatches to the correct tracer based on the tracing options.
+/// It handles all built-in tracer types (CallTracer, PreStateTracer, etc.) as well
+/// as custom JavaScript tracers. Returns both the trace result and state changes
+/// so the caller can commit state for subsequent transactions.
+///
+/// # Tracer Selection
+/// - If `opts.tracer` is `Some`, uses the specified tracer type
+/// - If `opts.tracer` is `None`, uses the default struct logger tracer
+///
+/// # Returns
+/// Tuple of (trace_result, state_changes) where trace_result may be an error string
 /// This function matches the logic of mega-reth's trace_transaction helper function (debug.rs:717).
 /// It handles all tracer types.
 #[allow(clippy::too_many_arguments)]

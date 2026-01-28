@@ -1,7 +1,41 @@
 //! Debug/Trace RPC Server
 //!
+//! # Overview
 //! A standalone RPC server for `debug_*` and `trace_*` methods using stateless execution.
 //! Data can be fetched from upstream RPC endpoints or from a local database with chain sync.
+//!
+//! # Architecture
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                        RPC Server                               │
+//! │  Receives external requests, invokes executor, returns traces   │
+//! └─────────────────────────────────────────────────────────────────┘
+//!                              │
+//!                              ▼
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                    Stateless Executor                           │
+//! │  Replays blocks using witness data to generate transaction traces│
+//! └─────────────────────────────────────────────────────────────────┘
+//!                              │
+//!                              ▼
+//! ┌─────────────────────────────────────────────────────────────────┐
+//! │                      DataProvider                               │
+//! │  Multi-level lookup: LRU cache → Local DB → Remote RPC          │
+//! └─────────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! # Supported RPC Methods
+//! - `debug_traceBlockByNumber` - Trace block execution by block number
+//! - `debug_traceBlockByHash` - Trace block execution by block hash
+//! - `debug_traceTransaction` - Trace a single transaction execution
+//! - `trace_block` - Parity-style block tracing (flat call traces)
+//! - `trace_transaction` - Parity-style transaction tracing
+//! - `debug_setCacheSize` - Dynamically adjust LRU cache size
+//! - `debug_getCacheStatus` - Query current cache status
+//!
+//! # Operating Modes
+//! - **Stateless mode**: Without `data_dir`, all data is fetched from remote RPC
+//! - **Local cache mode**: With `data_dir`, enables chain sync to pre-fetch blocks into local DB
 
 use std::{path::PathBuf, sync::Arc, time::Instant};
 
@@ -25,41 +59,47 @@ mod metrics;
 use cache::DataProvider;
 
 // ---------------------------------------------------------------------------
-// RPC Method Names
+// RPC Method Name Constants
 // ---------------------------------------------------------------------------
 
-/// debug_traceBlockByNumber method name.
+/// RPC method name for debug_traceBlockByNumber - traces block execution by number.
 const DEBUG_TRACE_BLOCK_BY_NUMBER: &str = "debug_traceBlockByNumber";
-/// debug_traceBlockByHash method name.
+/// RPC method name for debug_traceBlockByHash - traces block execution by hash.
 const DEBUG_TRACE_BLOCK_BY_HASH: &str = "debug_traceBlockByHash";
-/// debug_traceTransaction method name.
+/// RPC method name for debug_traceTransaction - traces a single transaction.
 const DEBUG_TRACE_TRANSACTION: &str = "debug_traceTransaction";
-/// trace_block method name.
+/// RPC method name for trace_block - Parity-style block tracing (flat call traces).
 const TRACE_BLOCK: &str = "trace_block";
-/// trace_transaction method name.
+/// RPC method name for trace_transaction - Parity-style transaction tracing.
 const TRACE_TRANSACTION: &str = "trace_transaction";
-/// debug_setCacheSize method name.
+/// RPC method name for debug_setCacheSize - dynamically adjusts LRU cache size.
 const DEBUG_SET_CACHE_SIZE: &str = "debug_setCacheSize";
-/// debug_getCacheStatus method name.
+/// RPC method name for debug_getCacheStatus - queries current cache status.
 const DEBUG_GET_CACHE_STATUS: &str = "debug_getCacheStatus";
 
 /// Command line arguments for the debug-trace-server.
+///
+/// Configuration can be provided via command line arguments or environment variables.
+/// Environment variables take precedence over defaults; CLI arguments take highest precedence.
 #[derive(Parser, Debug)]
 #[clap(name = "debug-trace-server", about = "Debug/Trace RPC Server")]
 struct Args {
     /// RPC server listen address.
+    /// Format: `host:port`, e.g., `0.0.0.0:8545`
     #[clap(long, env = "DEBUG_TRACE_SERVER_ADDR", default_value = "0.0.0.0:8545")]
     addr: String,
 
-    /// Upstream RPC endpoint for fetching blocks and contract data.
+    /// Upstream RPC endpoint URL.
+    /// Used for fetching block data and contract bytecode.
     #[clap(long, env = "DEBUG_TRACE_SERVER_RPC_ENDPOINT")]
     rpc_endpoint: String,
 
-    /// Upstream witness endpoint for fetching SALT witness data.
+    /// Upstream witness endpoint URL.
+    /// Used for fetching SALT witness data (state proofs).
     #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_ENDPOINT")]
     witness_endpoint: String,
 
-    /// Enable Prometheus metrics endpoint.
+    /// Enable Prometheus metrics exporter.
     #[clap(long, env = "DEBUG_TRACE_SERVER_METRICS_ENABLED")]
     metrics_enabled: bool,
 
@@ -71,22 +111,24 @@ struct Args {
     )]
     metrics_port: u16,
 
-    /// Path to genesis JSON file containing hardfork activation configuration.
+    /// Path to genesis JSON file.
+    /// Contains hardfork activation configuration for determining EVM rules at different heights.
     #[clap(long, env = "DEBUG_TRACE_SERVER_GENESIS_FILE")]
     genesis_file: Option<String>,
 
-    /// Directory path where validator data and database files will be stored.
-    /// When provided, enables chain sync to pre-fetch blocks into local database.
+    /// Data directory path.
+    /// When specified, enables local database storage and chain sync for pre-fetching blocks.
+    /// Without this, the server runs in pure stateless mode (all data from remote RPC).
     #[clap(long, env = "DEBUG_TRACE_SERVER_DATA_DIR")]
     data_dir: Option<String>,
 
-    /// Optional trusted block hash to start chain sync from.
-    /// Required on first run when data_dir is provided.
+    /// Trusted starting block hash.
+    /// Required on first run when data_dir is specified, used to initialize the local chain.
     #[clap(long, env = "DEBUG_TRACE_SERVER_START_BLOCK")]
     start_block: Option<String>,
 
-    /// Maximum number of blocks to cache in memory.
-    /// Default is 128 blocks.
+    /// Maximum number of blocks in LRU cache.
+    /// Caches recently accessed block data to reduce redundant RPC calls.
     #[clap(
         long,
         env = "DEBUG_TRACE_SERVER_CACHE_SIZE",
@@ -94,8 +136,8 @@ struct Args {
     )]
     cache_size: u64,
 
-    /// Timeout in seconds for witness fetch retry.
-    /// Default is 8 seconds.
+    /// Witness fetch timeout in seconds.
+    /// Returns error after timeout to avoid long waits.
     #[clap(
         long,
         env = "DEBUG_TRACE_SERVER_WITNESS_TIMEOUT",
@@ -105,16 +147,28 @@ struct Args {
 }
 
 /// Shared context for all RPC handlers.
+///
+/// Contains the data provider (with caching) and chain specification,
+/// shared across all RPC method handlers via Arc.
 #[derive(Clone)]
 struct RpcContext {
+    /// Data provider with multi-level caching (LRU -> DB -> RPC).
     cache: Arc<DataProvider>,
+    /// Chain specification containing hardfork activation rules.
     chain_spec: Arc<ChainSpec>,
 }
 
-/// Database filename for the validator.
+/// Database filename for the validator's local storage.
 const VALIDATOR_DB_FILENAME: &str = "validator.redb";
 
-/// Convert hex string to BlockHash
+/// Parses a hex string into a BlockHash.
+///
+/// # Arguments
+/// * `hex_str` - Hex-encoded block hash (with or without 0x prefix)
+///
+/// # Returns
+/// * `Ok(BlockHash)` - Successfully parsed 32-byte block hash
+/// * `Err` - If hex decoding fails or length is not 32 bytes
 fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
     let hash_bytes = hex::decode(hex_str)?;
     ensure!(
@@ -259,20 +313,28 @@ async fn main() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Helper Functions
 // ---------------------------------------------------------------------------
 
-/// Shorthand for creating a JSON-RPC internal error.
+/// Creates a JSON-RPC internal error with the given message.
+///
+/// Uses error code -32000 which is the standard JSON-RPC server error code.
 fn rpc_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
     jsonrpsee::types::ErrorObjectOwned::owned(-32000, msg, None::<()>)
 }
 
 // ---------------------------------------------------------------------------
-// debug_* methods
+// debug_* RPC Methods (Geth-style)
 // ---------------------------------------------------------------------------
 
+/// Registers all debug_* RPC methods.
+///
+/// These methods follow the Geth debug API specification and support various
+/// tracer types including CallTracer, PreStateTracer, FourByteTracer, etc.
 fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
-    // debug_traceBlockByNumber
+    // debug_traceBlockByNumber - Traces all transactions in a block by block number.
+    // Params: [blockNumber, tracingOptions?]
+    // Returns: Array of TraceResult for each transaction
     module.register_async_method(DEBUG_TRACE_BLOCK_BY_NUMBER, |params, ctx, _| async move {
         let start = Instant::now();
         let mut seq = params.sequence();
@@ -305,7 +367,9 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
         serde_json::to_value(results).map_err(|e| rpc_err(format!("Serialization failed: {e}")))
     })?;
 
-    // debug_traceBlockByHash
+    // debug_traceBlockByHash - Traces all transactions in a block by block hash.
+    // Params: [blockHash, tracingOptions?]
+    // Returns: Array of TraceResult for each transaction
     module.register_async_method(DEBUG_TRACE_BLOCK_BY_HASH, |params, ctx, _| async move {
         let start = Instant::now();
         let mut seq = params.sequence();
@@ -332,7 +396,11 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
         serde_json::to_value(results).map_err(|e| rpc_err(format!("Serialization failed: {e}")))
     })?;
 
-    // debug_traceTransaction
+    // debug_traceTransaction - Traces a single transaction by its hash.
+    // Replays all preceding transactions in the block to build correct state,
+    // then traces the target transaction.
+    // Params: [txHash, tracingOptions?]
+    // Returns: GethTrace for the transaction
     module.register_async_method(DEBUG_TRACE_TRANSACTION, |params, ctx, _| async move {
         let start = Instant::now();
         let mut seq = params.sequence();
@@ -364,11 +432,17 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// trace_* methods (Parity-style, using FlatCallTracer)
+// trace_* RPC Methods (Parity/OpenEthereum-style)
 // ---------------------------------------------------------------------------
 
+/// Registers all trace_* RPC methods.
+///
+/// These methods follow the Parity/OpenEthereum trace API specification,
+/// returning flat call traces (LocalizedTransactionTrace) instead of nested call frames.
 fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
-    // trace_block
+    // trace_block - Returns flat call traces for all transactions in a block.
+    // Params: [blockNumber]
+    // Returns: Array of LocalizedTransactionTrace
     module.register_async_method(TRACE_BLOCK, |params, ctx, _| async move {
         let start = Instant::now();
         let mut seq = params.sequence();
@@ -400,7 +474,9 @@ fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
         serde_json::to_value(results).map_err(|e| rpc_err(format!("Serialization failed: {e}")))
     })?;
 
-    // trace_transaction
+    // trace_transaction - Returns flat call traces for a single transaction.
+    // Params: [txHash]
+    // Returns: Array of LocalizedTransactionTrace
     module.register_async_method(TRACE_TRANSACTION, |params, ctx, _| async move {
         let start = Instant::now();
         let mut seq = params.sequence();
@@ -431,11 +507,17 @@ fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Cache management methods
+// Cache Management RPC Methods
 // ---------------------------------------------------------------------------
 
+/// Registers cache management RPC methods.
+///
+/// These methods allow runtime inspection and configuration of the LRU cache.
 fn register_cache_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
-    // debug_setCacheSize - dynamically update cache size
+    // debug_setCacheSize - Dynamically updates the LRU cache size.
+    // Note: This clears all existing cache entries.
+    // Params: [newSize]
+    // Returns: { success: bool, newSize: u64 }
     module.register_async_method(DEBUG_SET_CACHE_SIZE, |params, ctx, _| async move {
         let mut seq = params.sequence();
         let new_size: u64 = seq.next()?;
@@ -448,7 +530,9 @@ fn register_cache_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
         }))
     })?;
 
-    // debug_getCacheStatus - get current cache status
+    // debug_getCacheStatus - Returns current cache configuration and usage.
+    // Params: none
+    // Returns: { maxSize: u64, entryCount: u64 }
     module.register_async_method(DEBUG_GET_CACHE_STATUS, |_params, ctx, _| async move {
         let size = ctx.cache.get_cache_size();
         let entry_count = ctx.cache.get_cache_entry_count().await;
