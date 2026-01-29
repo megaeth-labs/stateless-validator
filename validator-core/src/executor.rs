@@ -218,7 +218,11 @@ pub struct ValidationStats {
 /// - Chain configuration with appropriate spec ID for the block number
 /// - Block environment with gas limits, timestamps, and fee parameters
 /// - Blob gas pricing if excess blob gas is present in the header
-fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<MegaSpecId> {
+///
+/// Creates an EVM environment from a block header and chain specification.
+///
+/// This function sets up the configuration and block environment needed for EVM execution.
+pub fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<MegaSpecId> {
     let cfg_env = CfgEnv::new_with_spec(chain_spec.spec_id(header.timestamp))
         .with_chain_id(chain_spec.chain_id);
 

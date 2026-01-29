@@ -1,0 +1,60 @@
+[package]
+name = "debug-trace-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# RPC framework
+jsonrpsee = { version = "0.24", features = ["server", "macros"] }
+
+# Ethereum types
+alloy-genesis.workspace = true
+alloy-primitives.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-rpc-types-trace.workspace = true
+op-alloy-rpc-types.workspace = true
+
+# Execution
+revm.workspace = true
+salt.workspace = true
+
+# Reuse validator-core
+validator-core = { path = "../../validator-core" }
+
+# Async runtime
+tokio = { workspace = true, features = ["sync"] }
+
+# Logging and metrics
+tracing.workspace = true
+tracing-subscriber.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+
+# Error handling
+eyre.workspace = true
+
+# Serialization
+serde_json.workspace = true
+serde.workspace = true
+
+# CLI
+clap.workspace = true
+
+# LRU cache
+mini-moka = "0.10"
+
+# Concurrent map for single-flight
+dashmap = "5.5"
+
+[dev-dependencies]
+# HTTP client for integration tests
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+dotenvy = "0.15"
+
+# Transaction signing for integration tests
+alloy-signer = "1.0.23"
+alloy-signer-local = "1.0.23"
+alloy-consensus.workspace = true
+alloy-network = "1.0.23"
+alloy-rlp.workspace = true
+alloy-primitives.workspace = true

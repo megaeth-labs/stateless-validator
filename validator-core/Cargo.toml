@@ -11,8 +11,10 @@ alloy-evm.workspace = true
 alloy-genesis.workspace = true
 alloy-hardforks.workspace = true
 alloy-primitives.workspace = true
+alloy-provider.workspace = true
 alloy-rlp.workspace = true
 alloy-rpc-types-eth.workspace = true
+alloy-rpc-types-trace.workspace = true
 alloy-serde.workspace = true
 alloy-trie.workspace = true
 
@@ -24,6 +26,7 @@ op-alloy-rpc-types.workspace = true
 
 # revm
 revm.workspace = true
+revm-inspectors.workspace = true
 
 # megaeth 
 mega-evm.workspace = true
@@ -40,11 +43,14 @@ reth-trie-sparse.workspace = true
 bincode.workspace = true
 eyre.workspace = true
 dyn-clone.workspace = true
+futures.workspace = true
+num_cpus.workspace = true
 rayon.workspace = true
 redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [features]

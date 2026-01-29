@@ -1041,6 +1041,49 @@ impl ValidatorDB {
             (block_number, block_hash.into())
         }))
     }
+
+    /// Retrieves block data and witness for a specific block hash.
+    ///
+    /// This method is used by the debug-trace-server to fetch cached block data
+    /// from the local database.
+    ///
+    /// # Parameters
+    /// * `block_hash` - The hash of the block to retrieve
+    ///
+    /// # Returns
+    /// * `Ok((block, witness))` - Block and witness data found
+    /// * `Err(ValidationDbError::MissingData)` - Block or witness not found
+    /// * `Err(...)` - Database error during lookup
+    pub fn get_block_and_witness(
+        &self,
+        block_hash: BlockHash,
+    ) -> ValidationDbResult<(Block<Transaction>, SaltWitness)> {
+        let read_txn = self.database.begin_read()?;
+        let block_data = read_txn.open_table(BLOCK_DATA)?;
+        let witnesses = read_txn.open_table(WITNESSES)?;
+
+        let block = decode_block_from_slice(
+            &block_data
+                .get(block_hash.0)?
+                .ok_or(ValidationDbError::MissingData {
+                    kind: MissingDataKind::BlockData,
+                    block_hash,
+                })?
+                .value(),
+        );
+
+        let witness = decode_from_slice(
+            &witnesses
+                .get(block_hash.0)?
+                .ok_or(ValidationDbError::MissingData {
+                    kind: MissingDataKind::Witness,
+                    block_hash,
+                })?
+                .value(),
+        );
+
+        Ok((block, witness))
+    }
 }
 
 /// Helper method to serialize data using bincode with legacy config
