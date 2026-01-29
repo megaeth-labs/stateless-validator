@@ -17,7 +17,7 @@ use tokio::{signal, task};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use validator_core::{
-    ChainSyncConfig, ValidatorDB,
+    ChainSyncConfig, RpcClient, ValidatorDB,
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
     executor::{ValidationResult, validate_block},
@@ -25,8 +25,6 @@ use validator_core::{
 };
 
 mod metrics;
-mod rpc;
-use rpc::RpcClient;
 
 /// Database filename for the validator.
 const VALIDATOR_DB_FILENAME: &str = "validator.redb";
@@ -218,11 +216,6 @@ async fn run() -> Result<()> {
     let work_dir = PathBuf::from(args.data_dir);
 
     let client = Arc::new(RpcClient::new(&args.rpc_endpoint, &args.witness_endpoint)?);
-    // Create a separate Arc for the core client used by remote_chain_tracker
-    let core_client = Arc::new(validator_core::RpcClient::new(
-        &args.rpc_endpoint,
-        &args.witness_endpoint,
-    )?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
 
     // Load chain spec from file (first run) or database (subsequent runs)
@@ -238,12 +231,25 @@ async fn run() -> Result<()> {
 
         let block_hash = parse_block_hash(start_block_str)?;
         let block = loop {
+            let start = Instant::now();
             match client
                 .get_block(BlockId::Hash(block_hash.into()), false)
                 .await
             {
-                Ok(block) => break block,
+                Ok(block) => {
+                    metrics::on_rpc_complete(
+                        metrics::RpcMethod::EthGetBlockByNumber,
+                        true,
+                        Some(start.elapsed().as_secs_f64()),
+                    );
+                    break block;
+                }
                 Err(e) => {
+                    metrics::on_rpc_complete(
+                        metrics::RpcMethod::EthGetBlockByNumber,
+                        false,
+                        Some(start.elapsed().as_secs_f64()),
+                    );
                     warn!("[Main] Failed to fetch block {block_hash}: {e}, retrying...",);
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
@@ -296,13 +302,7 @@ async fn run() -> Result<()> {
         }
     );
 
-    let validator_logic = chain_sync(
-        client.clone(),
-        core_client.clone(),
-        validator_db.clone(),
-        config,
-        chain_spec,
-    );
+    let validator_logic = chain_sync(client.clone(), validator_db.clone(), config, chain_spec);
 
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .map_err(|e| anyhow!("Failed to register SIGTERM handler: {e}"))?;
@@ -345,7 +345,6 @@ async fn run() -> Result<()> {
 /// * `Err(eyre::Error)` - On critical failures during task recovery
 async fn chain_sync(
     client: Arc<RpcClient>,
-    core_client: Arc<validator_core::RpcClient>,
     validator_db: Arc<ValidatorDB>,
     config: Arc<ChainSyncConfig>,
     chain_spec: Arc<ChainSpec>,
@@ -365,7 +364,7 @@ async fn chain_sync(
     // Step 2: Spawn remote chain tracker
     info!("[Chain Sync] Starting remote chain tracker...");
     task::spawn(remote_chain_tracker(
-        Arc::clone(&core_client),
+        Arc::clone(&client),
         Arc::clone(&validator_db),
         Arc::clone(&config),
         Some(metrics::on_chain_reorg),
@@ -555,9 +554,17 @@ async fn validate_one(
             metrics::on_contract_cache_read(contracts.len() as u64, missing_contracts.len() as u64);
 
             // Fetch missing contract codes via RPC concurrently and update the local DB
-            let codes =
-                future::try_join_all(missing_contracts.iter().map(|&hash| client.get_code(hash)))
-                    .await?;
+            let codes = future::try_join_all(missing_contracts.iter().map(|&hash| async move {
+                let start = Instant::now();
+                let result = client.get_code(hash).await;
+                metrics::on_rpc_complete(
+                    metrics::RpcMethod::EthGetCodeByHash,
+                    result.is_ok(),
+                    Some(start.elapsed().as_secs_f64()),
+                );
+                result
+            }))
+            .await?;
 
             // Validate all fetched bytecodes match expected hashes
             let new_bytecodes: Vec<_> = missing_contracts
@@ -675,13 +682,20 @@ async fn validation_reporter(
         }
 
         // Report validated range to upstream
-        match client
+        let result = client
             .set_validated_blocks(
                 (first_block.0, B256::from(first_block.1.0)),
                 (last_block.0, B256::from(last_block.1.0)),
             )
-            .await
-        {
+            .await;
+
+        metrics::on_rpc_complete(
+            metrics::RpcMethod::MegaSetValidatedBlocks,
+            result.is_ok(),
+            None,
+        );
+
+        match result {
             Ok(response) if response.accepted => {
                 debug!("[Reporter] Reported blocks successfully: {first_block:?} - {last_block:?}");
                 last_reported_block = last_block;
@@ -1239,7 +1253,6 @@ mod tests {
         let validator_db = setup_test_db(&context).unwrap();
         let (handle, url) = setup_mock_rpc_server(context).await;
         let client = Arc::new(RpcClient::new(&url, &url).unwrap());
-        let core_client = Arc::new(validator_core::RpcClient::new(&url, &url).unwrap());
 
         // Load chain spec using helper function
         let chain_spec =
@@ -1252,15 +1265,9 @@ mod tests {
             ..ChainSyncConfig::default()
         });
 
-        chain_sync(
-            client.clone(),
-            core_client,
-            validator_db,
-            config,
-            chain_spec,
-        )
-        .await
-        .unwrap();
+        chain_sync(client.clone(), validator_db, config, chain_spec)
+            .await
+            .unwrap();
 
         handle.stop().unwrap();
         info!("Mock RPC server has been shut down.");
