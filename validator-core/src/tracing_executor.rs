@@ -34,7 +34,9 @@ use alloy_rpc_types_eth::{Block, BlockTransactions, TransactionInfo};
 use alloy_rpc_types_trace::{
     geth::{
         FourByteFrame, GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions,
-        GethTrace, NoopFrame, TraceResult, call::FlatCallFrame,
+        GethTrace, NoopFrame, TraceResult,
+        call::FlatCallFrame,
+        pre_state::{AccountState, PreStateFrame},
     },
     parity::LocalizedTransactionTrace,
 };
@@ -46,7 +48,7 @@ use mega_evm::{
 use op_alloy_network::TransactionResponse;
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use revm::{
-    DatabaseCommit,
+    DatabaseCommit, DatabaseRef,
     context::TxEnv,
     database::{CacheDB, State},
     state::{Bytecode, EvmState},
@@ -735,7 +737,18 @@ where
                             };
 
                             match frame_result {
-                                Ok(frame) => (Ok(frame.into()), state_changes),
+                                Ok(frame) => {
+                                    // For diff mode, add accounts that were accessed but not modified
+                                    // This matches mega-reth behavior where such accounts appear with
+                                    // pre state and empty post state {}
+                                    let final_frame = if prestate_config.is_diff_mode() {
+                                        let db = executor.evm.db();
+                                        add_accessed_unchanged_accounts(frame, &state_changes, db)
+                                    } else {
+                                        frame
+                                    };
+                                    (Ok(final_frame.into()), state_changes)
+                                }
                                 Err(e) => (
                                     Err(format!("PreState trace failed: {:?}", e)),
                                     state_changes,
@@ -913,9 +926,73 @@ where
                 .geth_builder()
                 .geth_traces(gas_used, return_value, *config);
 
-            (Ok(frame.into()), state_changes)
+            // Convert DefaultFrame to JSON and fix returnValue serialization.
+            // alloy-rpc-types-trace 1.1.2 serializes Bytes with "0x" prefix,
+            // but mega-reth uses v1.0.23 which serializes without prefix.
+            let mut frame_value = serde_json::to_value(frame).unwrap();
+            if let Some(rv) = frame_value.get_mut("returnValue")
+                && let Some(s) = rv.as_str()
+            {
+                *rv = serde_json::Value::String(s.strip_prefix("0x").unwrap_or(s).to_string());
+            }
+
+            (Ok(GethTrace::JS(frame_value)), state_changes)
         }
         Err(e) => (Err(e.to_string()), Default::default()),
+    }
+}
+
+/// Adds accounts that were accessed but not modified to the prestate diff trace.
+///
+/// In mega-reth, accounts that are accessed during transaction execution (e.g., fee recipients
+/// with zero balance increment) appear in the diff trace with their pre-state and an empty
+/// post-state `{}`. The `geth_prestate_diff_traces` function in revm-inspectors removes these
+/// accounts via `retain_changed()` because their pre and post states are identical.
+///
+/// This function restores those accounts to match mega-reth behavior:
+/// - For each account in `state_changes` that is not in the diff result
+/// - Only add accounts that were actually touched during execution
+/// - Add the account's pre-state from the database
+/// - Add an empty post-state `{}`
+fn add_accessed_unchanged_accounts<DB: DatabaseRef>(
+    frame: PreStateFrame,
+    state_changes: &EvmState,
+    db: &DB,
+) -> PreStateFrame {
+    match frame {
+        PreStateFrame::Diff(mut diff) => {
+            for (addr, account) in state_changes.iter() {
+                // Skip if already in the result
+                if diff.pre.contains_key(addr) || diff.post.contains_key(addr) {
+                    continue;
+                }
+
+                // Only add accounts that were actually touched during execution.
+                // Accounts that were only loaded but not touched (e.g., for reading code)
+                // should not appear in the prestate diff.
+                if !account.is_touched() {
+                    continue;
+                }
+
+                // Get the account's original state from the database
+                if let Ok(Some(account_info)) = db.basic_ref(*addr) {
+                    // Add pre-state with account info
+                    let code = account_info.code.as_ref().map(|c| c.original_bytes());
+                    let pre_state = AccountState::from_account_info(
+                        account_info.nonce,
+                        account_info.balance,
+                        code,
+                    );
+                    diff.pre.insert(*addr, pre_state);
+
+                    // Add empty post-state (account was accessed but not modified)
+                    diff.post.insert(*addr, AccountState::default());
+                }
+            }
+            PreStateFrame::Diff(diff)
+        }
+        // For non-diff mode, return as-is
+        other => other,
     }
 }
 

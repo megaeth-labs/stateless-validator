@@ -218,6 +218,7 @@ pub struct ValidationStats {
 /// - Chain configuration with appropriate spec ID for the block number
 /// - Block environment with gas limits, timestamps, and fee parameters
 /// - Blob gas pricing if excess blob gas is present in the header
+///
 /// Creates an EVM environment from a block header and chain specification.
 ///
 /// This function sets up the configuration and block environment needed for EVM execution.

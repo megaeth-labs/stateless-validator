@@ -76,7 +76,7 @@ impl TestConfig {
             tx_send_count: env::var("TX_SEND_COUNT")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(5),
+                .unwrap_or(6),
         }
     }
 }
@@ -771,7 +771,10 @@ fn get_tracer_configs() -> Vec<(&'static str, Value)> {
         ("4byteTracer", json!({"tracer": "4byteTracer"})),
         // Prestate tracer
         ("prestateTracer", json!({"tracer": "prestateTracer"})),
-        ("prestateTracer+diff", json!({"tracer": "prestateTracer", "tracerConfig": {"diffMode": true}})),
+        (
+            "prestateTracer+diff",
+            json!({"tracer": "prestateTracer", "tracerConfig": {"diffMode": true}}),
+        ),
         // Noop tracer
         ("noopTracer", json!({"tracer": "noopTracer"})),
         // Flat call tracer (used internally for trace_* methods)

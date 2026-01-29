@@ -295,10 +295,10 @@ where
         match fetch_blocks_batch(&client, &validator_db, &config, &mut block_error_counts).await {
             Ok(result) => {
                 // Call reorg callback if a reorg occurred
-                if result.reorg_depth > 0 {
-                    if let Some(ref callback) = on_reorg {
-                        callback(result.reorg_depth);
-                    }
+                if result.reorg_depth > 0
+                    && let Some(ref callback) = on_reorg
+                {
+                    callback(result.reorg_depth);
                 }
 
                 if result.had_error {

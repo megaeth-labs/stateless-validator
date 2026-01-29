@@ -198,7 +198,7 @@ impl DataProvider {
 
         // Try to get from local database
         if let Some(db) = &self.validator_db {
-            if let Ok(data) = self.get_block_data_from_db(db, block_hash.into()).await {
+            if let Ok(data) = self.get_block_data_from_db(db, block_hash).await {
                 debug!("Block {} fetched from database", block_hash);
                 self.block_cache
                     .read()
