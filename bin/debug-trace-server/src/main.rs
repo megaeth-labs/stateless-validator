@@ -302,7 +302,10 @@ async fn main() -> Result<()> {
     register_trace_methods(&mut module)?;
     register_cache_methods(&mut module)?;
 
-    let server = Server::builder().build(&args.addr).await?;
+    let server = Server::builder()
+        .max_response_body_size(u32::MAX)
+        .build(&args.addr)
+        .await?;
     let addr = server.local_addr()?;
     let handle = server.start(module);
 
