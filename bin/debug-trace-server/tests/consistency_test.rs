@@ -769,12 +769,9 @@ fn get_tracer_configs() -> Vec<(&'static str, Value)> {
         ),
         // Four byte tracer
         ("4byteTracer", json!({"tracer": "4byteTracer"})),
-        // Prestate tracer - disabled due to architectural differences in state access recording
-        // between mega-reth (uses db.cache.accounts) and our implementation (uses TracingInspector).
-        // mega-reth records all accessed accounts including empty objects {}, while our implementation
-        // only records accounts with actual state changes.
-        // ("prestateTracer", json!({"tracer": "prestateTracer"})),
-        // ("prestateTracer+diff", json!({"tracer": "prestateTracer", "tracerConfig": {"diffMode": true}})),
+        // Prestate tracer
+        ("prestateTracer", json!({"tracer": "prestateTracer"})),
+        ("prestateTracer+diff", json!({"tracer": "prestateTracer", "tracerConfig": {"diffMode": true}})),
         // Noop tracer
         ("noopTracer", json!({"tracer": "noopTracer"})),
         // Flat call tracer (used internally for trace_* methods)

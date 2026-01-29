@@ -27,10 +27,10 @@ op-alloy-rpc-types = { version = "0.18.12", default-features = false }
 
 # revm
 revm = { version = "27.1.0", default-features = false }
-revm-inspectors = { version = "0.27.0", features = ["std", "js-tracer"] }
+revm-inspectors = { version = "0.27.1", features = ["std", "js-tracer"] }
 
 # megaeth 
-mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "v1.2.5" }
+mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "v1.3.1" }
 salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "v1.0.1" }
 
 # reth

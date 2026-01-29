@@ -48,7 +48,7 @@ use op_alloy_rpc_types::Transaction as OpTransaction;
 use revm::{
     DatabaseCommit,
     context::TxEnv,
-    database::State,
+    database::{CacheDB, State},
     state::{Bytecode, EvmState},
 };
 use revm_inspectors::tracing::{
@@ -305,9 +305,27 @@ pub fn trace_block(
 ) -> Result<Vec<TraceResult>, ValidationError> {
     let env = TracingEnv::new(chain_spec, block, witness, contracts)?;
 
-    // Create witness database and State using the environment's owned witness
+    // Create witness database and wrap it with CacheDB, then State.
+    // CacheDB tracks all accessed accounts (not just modified), which is required
+    // for prestateTracer+diff to return consistent results with mega-reth.
+    // State wraps CacheDB to provide the interface expected by MegaBlockExecutor.
     let witness_db = env.create_witness_db(&block.header, contracts);
-    let mut state = State::builder().with_database_ref(&witness_db).build();
+    let cache_db = CacheDB::new(&witness_db);
+    let mut state = State::builder().with_database_ref(&cache_db).build();
+
+    // Apply pre-execution changes (system contract calls) before tracing transactions.
+    // This ensures system contracts are loaded into the cache, which is required
+    // for prestateTracer to return consistent results with mega-reth.
+    {
+        let mut executor = env.executor_factory.create_executor(
+            &mut state,
+            env.block_ctx.clone(),
+            env.evm_env.clone(),
+        );
+        executor
+            .apply_pre_execution_changes()
+            .map_err(ValidationError::BlockReplayFailed)?;
+    }
 
     let mut results = Vec::with_capacity(env.transactions.len());
 
@@ -386,9 +404,26 @@ pub fn trace_transaction(
         return Err(ValidationError::BlockIncomplete);
     }
 
-    // Create witness database and State using the environment's owned witness
+    // Create witness database and wrap it with CacheDB, then State.
+    // CacheDB tracks all accessed accounts (not just modified), which is required
+    // for prestateTracer+diff to return consistent results with mega-reth.
     let witness_db = env.create_witness_db(&block.header, contracts);
-    let mut state = State::builder().with_database_ref(&witness_db).build();
+    let cache_db = CacheDB::new(&witness_db);
+    let mut state = State::builder().with_database_ref(&cache_db).build();
+
+    // Apply pre-execution changes (system contract calls) before tracing transactions.
+    // This ensures system contracts are loaded into the cache, which is required
+    // for prestateTracer to return consistent results with mega-reth.
+    {
+        let mut executor = env.executor_factory.create_executor(
+            &mut state,
+            env.block_ctx.clone(),
+            env.evm_env.clone(),
+        );
+        executor
+            .apply_pre_execution_changes()
+            .map_err(ValidationError::BlockReplayFailed)?;
+    }
 
     // Replay preceding transactions without tracing
     env.replay_preceding_transactions(&mut state, tx_index)?;
@@ -443,9 +478,24 @@ pub fn parity_trace_block(
 ) -> Result<Vec<LocalizedTransactionTrace>, ValidationError> {
     let env = TracingEnv::new(chain_spec, block, witness, contracts)?;
 
-    // Create witness database and State using the environment's owned witness
+    // Create witness database and wrap it with CacheDB, then State.
+    // CacheDB tracks all accessed accounts (not just modified), which is required
+    // for prestateTracer+diff to return consistent results with mega-reth.
     let witness_db = env.create_witness_db(&block.header, contracts);
-    let mut state = State::builder().with_database_ref(&witness_db).build();
+    let cache_db = CacheDB::new(&witness_db);
+    let mut state = State::builder().with_database_ref(&cache_db).build();
+
+    // Apply pre-execution changes (system contract calls) before tracing transactions.
+    {
+        let mut executor = env.executor_factory.create_executor(
+            &mut state,
+            env.block_ctx.clone(),
+            env.evm_env.clone(),
+        );
+        executor
+            .apply_pre_execution_changes()
+            .map_err(ValidationError::BlockReplayFailed)?;
+    }
 
     let mut all_traces = Vec::new();
 
@@ -494,9 +544,24 @@ pub fn parity_trace_transaction(
         return Err(ValidationError::BlockIncomplete);
     }
 
-    // Create witness database and State using the environment's owned witness
+    // Create witness database and wrap it with CacheDB, then State.
+    // CacheDB tracks all accessed accounts (not just modified), which is required
+    // for prestateTracer+diff to return consistent results with mega-reth.
     let witness_db = env.create_witness_db(&block.header, contracts);
-    let mut state = State::builder().with_database_ref(&witness_db).build();
+    let cache_db = CacheDB::new(&witness_db);
+    let mut state = State::builder().with_database_ref(&cache_db).build();
+
+    // Apply pre-execution changes (system contract calls) before tracing transactions.
+    {
+        let mut executor = env.executor_factory.create_executor(
+            &mut state,
+            env.block_ctx.clone(),
+            env.evm_env.clone(),
+        );
+        executor
+            .apply_pre_execution_changes()
+            .map_err(ValidationError::BlockReplayFailed)?;
+    }
 
     // Replay preceding transactions without tracing
     env.replay_preceding_transactions(&mut state, tx_index)?;
