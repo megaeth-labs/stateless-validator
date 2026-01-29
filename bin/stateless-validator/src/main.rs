@@ -1,28 +1,27 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
 use alloy_genesis::Genesis;
-use alloy_primitives::{B256, BlockHash, BlockNumber, hex};
-use alloy_rpc_types_eth::{Block, BlockId};
+use alloy_primitives::{B256, BlockHash, hex};
+use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::{Result, anyhow, ensure};
 use futures::future;
-use op_alloy_rpc_types::Transaction;
 use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
 use salt::SaltWitness;
 use tokio::{signal, task};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use validator_core::{
-    ValidatorDB,
+    ChainSyncConfig, ValidatorDB,
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
     executor::{ValidationResult, validate_block},
-    withdrawals::MptWitness,
+    remote_chain_tracker,
 };
 
 mod metrics;
@@ -139,57 +138,6 @@ fn load_or_create_chain_spec(
     Ok(ChainSpec::from_genesis(genesis))
 }
 
-/// Configuration for chain synchronization behavior
-#[derive(Debug, Clone)]
-pub struct ChainSyncConfig {
-    /// Number of parallel validation workers to spawn
-    pub concurrent_workers: usize,
-    /// Time to wait between main sync cycles
-    pub sync_poll_interval: Duration,
-    /// Optional block height to sync to; None for infinite sync
-    pub sync_target: Option<u64>,
-    /// Number of blocks to maintain as lookahead buffer
-    pub tracker_lookahead_blocks: u64,
-    /// Time to wait between remote chain tracker cycles
-    pub tracker_poll_interval: Duration,
-    /// Time to wait between history pruning cycles
-    pub pruner_interval: Duration,
-    /// Number of recent blocks to retain from current tip
-    pub pruner_blocks_to_keep: u64,
-    /// Time to wait when validation workers have no tasks
-    pub worker_idle_sleep: Duration,
-    /// Time to wait when validation workers encounter errors
-    pub worker_error_sleep: Duration,
-    /// Time to wait when remote tracker encounters RPC/DB errors
-    pub tracker_error_sleep: Duration,
-    /// Enable reporting of validated blocks to upstream node
-    pub report_validation_results: bool,
-    /// Enable Prometheus metrics endpoint
-    pub metrics_enabled: bool,
-    /// Port for Prometheus metrics HTTP endpoint
-    pub metrics_port: u16,
-}
-
-impl Default for ChainSyncConfig {
-    fn default() -> Self {
-        Self {
-            concurrent_workers: num_cpus::get(),
-            sync_poll_interval: Duration::from_secs(1),
-            sync_target: None,
-            tracker_lookahead_blocks: 80,
-            tracker_poll_interval: Duration::from_millis(100),
-            pruner_interval: Duration::from_secs(300),
-            pruner_blocks_to_keep: 1000,
-            worker_idle_sleep: Duration::from_millis(500),
-            worker_error_sleep: Duration::from_millis(1000),
-            tracker_error_sleep: Duration::from_secs(1),
-            report_validation_results: false,
-            metrics_enabled: false,
-            metrics_port: metrics::DEFAULT_METRICS_PORT,
-        }
-    }
-}
-
 /// Command line arguments for the stateless validator.
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -270,6 +218,11 @@ async fn run() -> Result<()> {
     let work_dir = PathBuf::from(args.data_dir);
 
     let client = Arc::new(RpcClient::new(&args.rpc_endpoint, &args.witness_endpoint)?);
+    // Create a separate Arc for the core client used by remote_chain_tracker
+    let core_client = Arc::new(validator_core::RpcClient::new(
+        &args.rpc_endpoint,
+        &args.witness_endpoint,
+    )?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
 
     // Load chain spec from file (first run) or database (subsequent runs)
@@ -343,7 +296,13 @@ async fn run() -> Result<()> {
         }
     );
 
-    let validator_logic = chain_sync(client.clone(), validator_db.clone(), config, chain_spec);
+    let validator_logic = chain_sync(
+        client.clone(),
+        core_client.clone(),
+        validator_db.clone(),
+        config,
+        chain_spec,
+    );
 
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .map_err(|e| anyhow!("Failed to register SIGTERM handler: {e}"))?;
@@ -386,6 +345,7 @@ async fn run() -> Result<()> {
 /// * `Err(eyre::Error)` - On critical failures during task recovery
 async fn chain_sync(
     client: Arc<RpcClient>,
+    core_client: Arc<validator_core::RpcClient>,
     validator_db: Arc<ValidatorDB>,
     config: Arc<ChainSyncConfig>,
     chain_spec: Arc<ChainSpec>,
@@ -405,9 +365,10 @@ async fn chain_sync(
     // Step 2: Spawn remote chain tracker
     info!("[Chain Sync] Starting remote chain tracker...");
     task::spawn(remote_chain_tracker(
-        Arc::clone(&client),
+        Arc::clone(&core_client),
         Arc::clone(&validator_db),
         Arc::clone(&config),
+        Some(|reorg_depth| metrics::on_chain_reorg(reorg_depth)),
     ));
 
     // Step 3: Spawn validation reporter (optional, based on config)
@@ -511,174 +472,6 @@ async fn chain_sync(
             error!("[Chain Sync] Failed to advance canonical chain: {}", e);
             return Err(e);
         }
-    }
-}
-
-/// Remote chain tracker that maintains a lookahead of unvalidated blocks
-///
-/// Runs in an infinite loop, monitoring the gap between local canonical tip and remote
-/// tip to maintain a sufficient buffer of unvalidated blocks for validation workers.
-/// Infrastructure errors (RPC failures, network issues) are logged and contained.
-///
-/// # Arguments
-/// * `client` - RPC client for fetching blocks from remote blockchain
-/// * `validator_db` - Database interface for chain management
-/// * `config` - Configuration for tracker behavior
-///
-/// # Returns
-/// * Never returns under normal operation - runs indefinitely until externally terminated
-async fn remote_chain_tracker(
-    client: Arc<RpcClient>,
-    validator_db: Arc<ValidatorDB>,
-    config: Arc<ChainSyncConfig>,
-) -> Result<()> {
-    info!(
-        "[Tracker] Starting with {} block lookahead",
-        config.tracker_lookahead_blocks
-    );
-
-    // Track error counts for each block
-    let mut block_error_counts: HashMap<u64, usize> = HashMap::new();
-
-    loop {
-        if let Err(e) = async {
-            // Calculate how far behind our local chain is from remote
-            let local_tip = validator_db
-                .get_local_tip()?
-                .ok_or_else(|| anyhow!("Local chain is empty"))?;
-            let remote_tip = validator_db.get_remote_tip()?.unwrap_or(local_tip);
-            let gap = remote_tip.0.saturating_sub(local_tip.0);
-
-            debug!(
-                "[Tracker] local={}, remote={}, gap={}",
-                local_tip.0, remote_tip.0, gap
-            );
-
-            // Detect and resolve chain reorgs
-            match client
-                .get_block(BlockId::Number(remote_tip.0.into()), false)
-                .await
-            {
-                Ok(block) if block.header.hash != remote_tip.1 => {
-                    warn!(
-                        "[Tracker] Hash mismatch! Expected {}, got {}. Resolving chain divergence.",
-                        remote_tip.1, block.header.hash
-                    );
-                    match find_divergence_point(&client, &validator_db, remote_tip.0).await {
-                        Ok(rollback_to) => {
-                            warn!("[Tracker] Rolling back to block {rollback_to}");
-                            metrics::on_chain_reorg(remote_tip.0.saturating_sub(rollback_to));
-                            validator_db.rollback_chain(rollback_to)?;
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            error!("[Tracker] Failed to find divergence point: {e}");
-                            return Err(e);
-                        }
-                    }
-                }
-                Err(e) => warn!(
-                    "[Tracker] Network error validating tip {}: {}",
-                    remote_tip.1, e
-                ),
-                _ => {}
-            }
-
-            // Stop if we already have sufficient lookahead
-            if gap >= config.tracker_lookahead_blocks {
-                return Ok(());
-            }
-
-            // Calculate how many blocks to fetch (bounded by latest available)
-            let blocks_to_fetch = (config.tracker_lookahead_blocks - gap).min(
-                client
-                    .get_latest_block_number()
-                    .await?
-                    .saturating_sub(remote_tip.0),
-            );
-
-            if blocks_to_fetch == 0 {
-                return Ok(());
-            }
-
-            debug!(
-                "[Tracker] Fetching {} blocks starting from {}",
-                blocks_to_fetch,
-                remote_tip.0 + 1
-            );
-
-            // Fetch blocks in parallel
-            let tasks = future::join_all(
-                (remote_tip.0 + 1..remote_tip.0 + 1 + blocks_to_fetch).map(|block_number| {
-                    let client = client.clone();
-                    tokio::spawn(async move {
-                        let block = client
-                            .get_block(BlockId::Number(block_number.into()), false)
-                            .await?;
-                        let (salt_witness, mpt_witness) = client
-                            .get_witness(block.header.number, block.header.hash)
-                            .await?;
-                        let block = client
-                            .get_block(BlockId::Number(block_number.into()), true)
-                            .await?;
-
-                        Ok::<(Block<Transaction>, SaltWitness, MptWitness), eyre::Error>((
-                            block,
-                            salt_witness,
-                            mpt_witness,
-                        ))
-                    })
-                }),
-            )
-            .await
-            .into_iter()
-            .enumerate()
-            // Stop on first error to maintain block sequence contiguity
-            .take_while(|(i, result)| match result {
-                Ok(Ok(_)) => {
-                    block_error_counts.remove(&(remote_tip.0 + 1 + *i as u64));
-                    true
-                }
-                Ok(Err(e)) => {
-                    let block_number = remote_tip.0 + 1 + *i as u64;
-                    let count = block_error_counts.entry(block_number).or_insert(0);
-                    *count += 1;
-
-                    if *count > 5 {
-                        error!("[Tracker] DB or RPC error at block {block_number} (attempt {count}): {e}");
-                    } else {
-                        debug!("[Tracker] DB or RPC error at block {block_number} (attempt {count}): {e}");
-                    }
-                    false
-                }
-                Err(e) => {
-                    error!(
-                        "[Tracker] Task join error at block {}: {e}",
-                        remote_tip.0 + 1 + *i as u64
-                    );
-                    false
-                }
-            })
-            .filter_map(|(_, result)| result.ok().and_then(|r| r.ok()))
-            .collect::<Vec<_>>();
-
-            // Add successfully fetched headers to remote chain
-            validator_db.add_validation_tasks(&tasks)?;
-            validator_db.grow_remote_chain(tasks.iter().map(|(block, _, _)| &block.header))?;
-
-            // Encountered an DB/RPC error, wait a bit before polling again
-            if tasks.len() < blocks_to_fetch as usize {
-                tokio::time::sleep(config.tracker_error_sleep).await;
-            }
-
-            Ok(())
-        }
-        .await
-        {
-            warn!("[Tracker] Iteration failed: {}", e);
-        }
-
-        tokio::time::sleep(config.tracker_poll_interval).await;
     }
 }
 
@@ -972,74 +765,10 @@ fn extract_contract_codes(salt_witness: &SaltWitness) -> HashSet<B256> {
         .collect()
 }
 
-/// Finds where the local chain diverges from the remote RPC node using binary search
-///
-/// # Algorithm
-/// Uses binary search to efficiently locate where the local canonical chain diverges
-/// from the remote chain. The algorithm is guaranteed to terminate in O(log N) time
-/// and return a block number between the earliest local block and `mismatch_block`.
-///
-/// If the remote RPC node reorgs again during the binary search, the returned block
-/// number may not be the accurate divergence point; however, this is acceptable
-/// because `remote_chain_tracker` will retry and detect the reorg again anyway.
-///
-/// # Parameters
-/// * `client` - RPC client to fetch remote block hashes
-/// * `validator_db` - Database to query local blocks
-/// * `mismatch_block` - Block number where hash mismatch was detected
-///
-/// # Returns
-/// * `Ok(block_number)` - Block number to rollback to (last common block)
-/// * `Err(_)` - Network or database error during resolution
-///
-/// # Panics
-/// Panics if a catastrophic reorg is detected (earliest local block hash differs
-/// from remote chain), indicating the local chain has diverged beyond recovery.
-async fn find_divergence_point(
-    client: &RpcClient,
-    validator_db: &ValidatorDB,
-    mismatch_block: BlockNumber,
-) -> Result<BlockNumber> {
-    let earliest_local = validator_db
-        .get_earliest_local_block()?
-        .expect("Local chain cannot be empty");
-
-    // Safety check: verify earliest block matches remote chain
-    let earliest_remote = client
-        .get_block(BlockId::Number(earliest_local.0.into()), false)
-        .await?;
-    if earliest_remote.header.hash != earliest_local.1 {
-        panic!(
-            "Catastrophic reorg: earliest local block {} hash mismatch (local: {:?}, remote: {:?})",
-            earliest_local.0, earliest_local.1, earliest_remote.header.hash
-        );
-    }
-
-    // Binary search for divergence point
-    let (mut left, mut right, mut last_matching) =
-        (earliest_local.0, mismatch_block, earliest_local.0);
-    while left <= right {
-        let mid = left + (right - left) / 2;
-        let local_hash = validator_db.get_block_hash(mid)?.unwrap();
-        let remote_hash = client
-            .get_block(BlockId::Number(mid.into()), false)
-            .await?
-            .header
-            .hash;
-        if remote_hash == local_hash {
-            last_matching = mid;
-            left = mid + 1;
-        } else {
-            right = mid.saturating_sub(1);
-        }
-    }
-    Ok(last_matching)
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::BTreeMap,
+        collections::{BTreeMap, HashMap},
         fs::File,
         io::{BufRead, BufReader},
         path::Path,
@@ -1510,6 +1239,7 @@ mod tests {
         let validator_db = setup_test_db(&context).unwrap();
         let (handle, url) = setup_mock_rpc_server(context).await;
         let client = Arc::new(RpcClient::new(&url, &url).unwrap());
+        let core_client = Arc::new(validator_core::RpcClient::new(&url, &url).unwrap());
 
         // Load chain spec using helper function
         let chain_spec =
@@ -1522,9 +1252,15 @@ mod tests {
             ..ChainSyncConfig::default()
         });
 
-        chain_sync(client.clone(), validator_db, config, chain_spec)
-            .await
-            .unwrap();
+        chain_sync(
+            client.clone(),
+            core_client,
+            validator_db,
+            config,
+            chain_spec,
+        )
+        .await
+        .unwrap();
 
         handle.stop().unwrap();
         info!("Mock RPC server has been shut down.");
