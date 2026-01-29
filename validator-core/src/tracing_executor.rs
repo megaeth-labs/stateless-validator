@@ -51,6 +51,7 @@ use revm::{
     DatabaseCommit, DatabaseRef,
     context::TxEnv,
     database::{CacheDB, State},
+    primitives::KECCAK_EMPTY,
     state::{Bytecode, EvmState},
 };
 use revm_inspectors::tracing::{
@@ -61,9 +62,45 @@ use salt::SaltWitness;
 
 use crate::{
     chain_spec::ChainSpec,
+    data_types::{PlainKey, PlainValue},
     database::{WitnessDatabase, WitnessExternalEnv},
     executor::{ValidationError, create_evm_env},
 };
+
+// ---------------------------------------------------------------------------
+// Helper Functions
+// ---------------------------------------------------------------------------
+
+/// Extracts all contract code hashes from a SALT witness.
+///
+/// This function scans the witness for accounts with non-empty bytecode and returns
+/// their code hashes. These hashes can then be used to fetch the actual bytecode
+/// from an RPC provider.
+///
+/// # Arguments
+/// * `witness` - The SALT witness containing account state
+///
+/// # Returns
+/// A vector of unique code hashes (B256) that need to be fetched
+pub fn extract_code_hashes(witness: &SaltWitness) -> Vec<B256> {
+    let mut code_hashes: Vec<B256> = witness
+        .kvs
+        .values()
+        .filter_map(|salt_val| salt_val.as_ref())
+        .filter_map(
+            |val| match (PlainKey::decode(val.key()), PlainValue::decode(val.value())) {
+                (PlainKey::Account(_), PlainValue::Account(acc)) => {
+                    acc.codehash.filter(|&codehash| codehash != KECCAK_EMPTY)
+                }
+                _ => None,
+            },
+        )
+        .collect();
+
+    code_hashes.sort();
+    code_hashes.dedup();
+    code_hashes
+}
 
 // ---------------------------------------------------------------------------
 // Tracing Environment Setup

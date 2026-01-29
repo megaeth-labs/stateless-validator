@@ -49,19 +49,12 @@ pub mod names {
     metric!(RPC_REQUESTS_TOTAL, "rpc_requests_total");
     metric!(RPC_ERRORS_TOTAL, "rpc_errors_total");
     metric!(BLOCK_FETCH_TIME, "block_fetch_time_seconds");
-    metric!(WITNESS_FETCH_TIME, "witness_fetch_time_seconds");
     metric!(CODE_FETCH_TIME, "code_fetch_time_seconds");
 
     // Database
     metric!(CONTRACT_CACHE_HITS, "contract_cache_hits_total");
     metric!(CONTRACT_CACHE_MISSES, "contract_cache_misses_total");
     metric!(BLOCKS_PRUNED, "blocks_pruned_total");
-
-    // Witness
-    metric!(SALT_WITNESS_SIZE, "salt_witness_size_bytes");
-    metric!(SALT_WITNESS_KEYS, "salt_witness_keys");
-    metric!(SALT_WITNESS_KVS_SIZE, "salt_witness_kvs_bytes");
-    metric!(MPT_WITNESS_SIZE, "mpt_witness_size_bytes");
 }
 
 /// Initialize the Prometheus metrics exporter at the given address.
@@ -109,22 +102,12 @@ fn register_metric_descriptions() {
     describe_counter!(names::RPC_REQUESTS_TOTAL, "RPC requests made");
     describe_counter!(names::RPC_ERRORS_TOTAL, "RPC errors encountered");
     describe_histogram!(names::BLOCK_FETCH_TIME, "Block fetch time (s)");
-    describe_histogram!(names::WITNESS_FETCH_TIME, "Witness fetch time (s)");
     describe_histogram!(names::CODE_FETCH_TIME, "Code fetch time (s)");
 
     // Database
     describe_counter!(names::CONTRACT_CACHE_HITS, "Contract cache hits");
     describe_counter!(names::CONTRACT_CACHE_MISSES, "Contract cache misses");
     describe_counter!(names::BLOCKS_PRUNED, "Blocks pruned from history");
-
-    // Witness
-    describe_histogram!(names::SALT_WITNESS_SIZE, "Salt witness size (bytes)");
-    describe_histogram!(names::MPT_WITNESS_SIZE, "MPT witness size (bytes)");
-    describe_histogram!(names::SALT_WITNESS_KEYS, "Salt witness key count");
-    describe_histogram!(
-        names::SALT_WITNESS_KVS_SIZE,
-        "Salt witness KVs size (bytes)"
-    );
 }
 
 /// Record validation timing and block statistics after successful validation.
@@ -176,8 +159,6 @@ pub fn on_chain_reorg(depth: u64) {
 pub enum RpcMethod {
     EthGetCodeByHash,
     EthGetBlockByNumber,
-    EthBlockNumber,
-    MegaGetBlockWitness,
     MegaSetValidatedBlocks,
 }
 
@@ -186,8 +167,6 @@ pub fn on_rpc_complete(method: RpcMethod, success: bool, duration_secs: Option<f
     let method_str = match method {
         RpcMethod::EthGetCodeByHash => "eth_getCodeByHash",
         RpcMethod::EthGetBlockByNumber => "eth_getBlockByNumber",
-        RpcMethod::EthBlockNumber => "eth_blockNumber",
-        RpcMethod::MegaGetBlockWitness => "mega_getBlockWitness",
         RpcMethod::MegaSetValidatedBlocks => "mega_setValidatedBlocks",
     };
     counter!(names::RPC_REQUESTS_TOTAL, "method" => method_str).increment(1);
@@ -202,9 +181,6 @@ pub fn on_rpc_complete(method: RpcMethod, success: bool, duration_secs: Option<f
             }
             RpcMethod::EthGetBlockByNumber => {
                 histogram!(names::BLOCK_FETCH_TIME).record(duration);
-            }
-            RpcMethod::MegaGetBlockWitness => {
-                histogram!(names::WITNESS_FETCH_TIME).record(duration);
             }
             _ => {}
         }
@@ -222,12 +198,4 @@ pub fn on_contract_cache_read(hits: u64, misses: u64) {
 
 pub fn on_blocks_pruned(count: u64) {
     counter!(names::BLOCKS_PRUNED).increment(count);
-}
-
-// Witness metrics
-pub fn on_witness_fetch(salt_size: usize, keys_count: usize, kvs_size: usize, mpt_size: usize) {
-    histogram!(names::SALT_WITNESS_SIZE).record(salt_size as f64);
-    histogram!(names::SALT_WITNESS_KEYS).record(keys_count as f64);
-    histogram!(names::SALT_WITNESS_KVS_SIZE).record(kvs_size as f64);
-    histogram!(names::MPT_WITNESS_SIZE).record(mpt_size as f64);
 }

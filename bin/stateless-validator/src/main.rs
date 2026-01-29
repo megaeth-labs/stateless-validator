@@ -368,7 +368,7 @@ async fn chain_sync(
         Arc::clone(&core_client),
         Arc::clone(&validator_db),
         Arc::clone(&config),
-        Some(|reorg_depth| metrics::on_chain_reorg(reorg_depth)),
+        Some(metrics::on_chain_reorg),
     ));
 
     // Step 3: Spawn validation reporter (optional, based on config)

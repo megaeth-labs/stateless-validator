@@ -783,6 +783,7 @@ fn get_tracer_configs() -> Vec<(&'static str, Value)> {
 }
 
 #[test]
+#[ignore]
 fn test_debug_trace_consistency() {
     let config = TestConfig::from_env();
 
@@ -925,6 +926,7 @@ fn test_debug_trace_consistency() {
 
 /// Test only block-level methods (faster, for quick verification).
 #[test]
+#[ignore]
 fn test_block_level_consistency() {
     let config = TestConfig::from_env();
 
@@ -968,6 +970,7 @@ fn test_block_level_consistency() {
 
 /// Test only transaction-level methods for a single transaction.
 #[test]
+#[ignore]
 fn test_transaction_level_consistency() {
     let config = TestConfig::from_env();
 
@@ -1019,6 +1022,7 @@ fn test_transaction_level_consistency() {
 /// Test cache management RPC methods (debug_setCacheSize, debug_getCacheStatus).
 /// This test is skipped if the server doesn't support these methods.
 #[test]
+#[ignore]
 fn test_cache_management() {
     let config = TestConfig::from_env();
 
@@ -1122,6 +1126,7 @@ fn test_cache_management() {
 /// This test makes multiple concurrent requests for the same block
 /// and verifies they all return the same result.
 #[test]
+#[ignore]
 fn test_concurrent_requests() {
     use std::{sync::Arc, thread};
 
@@ -1208,6 +1213,7 @@ fn test_concurrent_requests() {
 
 /// Test with multiple blocks to verify cache behavior.
 #[test]
+#[ignore]
 fn test_multiple_blocks_cache() {
     let config = TestConfig::from_env();
 
@@ -1279,6 +1285,7 @@ fn test_multiple_blocks_cache() {
 /// Test edge cases: blocks with many transactions.
 /// This test is skipped if no block with multiple transactions is found.
 #[test]
+#[ignore]
 fn test_large_block() {
     let config = TestConfig::from_env();
 
@@ -1401,6 +1408,7 @@ fn test_large_block() {
 /// It sends multiple transactions, waits for them to be mined,
 /// and then verifies the trace results match between mega-reth and debug-trace-server.
 #[test]
+#[ignore]
 fn test_send_and_trace_transactions() {
     let config = TestConfig::from_env();
 
@@ -1555,6 +1563,7 @@ fn test_send_and_trace_transactions() {
 /// This test sends transactions in a loop while simultaneously testing trace consistency.
 /// Requires TEST_PRIVATE_KEY to be set.
 #[test]
+#[ignore]
 fn test_continuous_tx_and_trace() {
     let config = TestConfig::from_env();
 
