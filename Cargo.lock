@@ -5026,6 +5026,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-provider",
  "alloy-rpc-types-eth",
+ "alloy-serde",
  "bincode 2.0.1",
  "clap",
  "eyre",

@@ -1,7 +1,7 @@
 //! RPC client for fetching missing data during stateless validation.
 use std::time::Instant;
 
-use alloy_primitives::{B256, Bytes};
+use alloy_primitives::{B256, Bytes, U64};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
 use eyre::{Context, Result, ensure, eyre};
@@ -13,12 +13,14 @@ use validator_core::{executor::verify_block_integrity, withdrawals::MptWitness};
 
 use crate::metrics;
 
-/// Response from mega_setValidatedBlocks RPC call
+/// Response from `mega_setValidatedBlocks` RPC call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetValidatedBlocksResponse {
+    /// Whether the upstream node accepted the validation report.
     pub accepted: bool,
-    pub last_validated_block: (u64, B256),
+    /// Upstream's last validated block as `(number, hash)`.
+    pub last_validated_block: (U64, B256),
 }
 
 /// RPC client for MegaETH blockchain data.
@@ -225,7 +227,13 @@ impl RpcClient {
         let result = self
             .data_provider
             .client()
-            .request("mega_setValidatedBlocks", (first_block, last_block))
+            .request(
+                "mega_setValidatedBlocks",
+                (
+                    (U64::from(first_block.0), first_block.1),
+                    (U64::from(last_block.0), last_block.1),
+                ),
+            )
             .await
             .map_err(|e| eyre!("Failed to set validated blocks: {e}"));
 
