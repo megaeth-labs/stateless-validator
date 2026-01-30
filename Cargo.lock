@@ -1946,6 +1946,7 @@ dependencies = [
  "op-alloy-rpc-types",
  "reqwest",
  "revm",
+ "revm-inspectors",
  "salt",
  "serde",
  "serde_json",

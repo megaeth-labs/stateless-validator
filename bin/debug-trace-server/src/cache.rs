@@ -24,7 +24,7 @@ use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
 use tokio::sync::broadcast;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 use validator_core::{withdrawals::MptWitness, RpcClient, ValidatorDB};
 
 /// Block data bundle containing all information needed for stateless execution.
@@ -117,7 +117,7 @@ impl DataProvider {
             .store(new_size, std::sync::atomic::Ordering::Relaxed);
         let mut cache = self.block_cache.write().await;
         *cache = Cache::new(new_size);
-        debug!("Cache size updated to {} blocks", new_size);
+        debug!(new_cache_size = new_size, "Cache size updated");
     }
 
     /// Returns the current cache size limit.
@@ -152,7 +152,7 @@ impl DataProvider {
         // Check LRU cache if we have the hash
         if let Some(hash) = block_hash {
             if let Some(data) = self.block_cache.read().await.get(&hash) {
-                debug!("Block {} fetched from LRU cache", block_num);
+                trace!(block_number = block_num, source = "lru", "Cache hit");
                 return Ok(data);
             }
         }
@@ -161,7 +161,7 @@ impl DataProvider {
         if let Some(db) = &self.validator_db {
             if let Some(hash) = block_hash {
                 if let Ok(data) = self.get_block_data_from_db(db, hash).await {
-                    debug!("Block {} fetched from database", block_num);
+                    trace!(block_number = block_num, source = "database", "Cache hit");
                     self.block_cache.read().await.insert(hash, data.clone());
                     return Ok(data);
                 }
@@ -169,7 +169,11 @@ impl DataProvider {
         }
 
         // Fall back to RPC
-        debug!("Block {} fetched from RPC", block_num);
+        debug!(
+            block_number = block_num,
+            source = "rpc",
+            "Fetching from RPC"
+        );
         let data = self.fetch_block_data_from_rpc(block_num).await?;
         self.block_cache
             .read()
@@ -192,14 +196,14 @@ impl DataProvider {
     pub async fn get_block_data_by_hash(&self, block_hash: B256) -> Result<BlockData> {
         // Check LRU cache first
         if let Some(data) = self.block_cache.read().await.get(&block_hash) {
-            debug!("Block {} fetched from LRU cache", block_hash);
+            trace!(block_hash = %block_hash, source = "lru", "Cache hit");
             return Ok(data);
         }
 
         // Try to get from local database
         if let Some(db) = &self.validator_db {
             if let Ok(data) = self.get_block_data_from_db(db, block_hash).await {
-                debug!("Block {} fetched from database", block_hash);
+                trace!(block_hash = %block_hash, source = "database", "Cache hit");
                 self.block_cache
                     .read()
                     .await
@@ -209,7 +213,7 @@ impl DataProvider {
         }
 
         // Fall back to RPC
-        debug!("Block {} fetched from RPC", block_hash);
+        debug!(block_hash = %block_hash, source = "rpc", "Fetching from RPC");
         let data = self.fetch_block_data_by_hash_from_rpc(block_hash).await?;
         self.block_cache
             .read()
@@ -231,7 +235,7 @@ impl DataProvider {
     /// * `Ok((BlockData, usize))` - Block data and transaction index
     /// * `Err` - If transaction not found or is still pending
     pub async fn get_block_data_for_tx(&self, tx_hash: B256) -> Result<(BlockData, usize)> {
-        debug!("Fetching block data for tx {}", tx_hash);
+        trace!(tx_hash = %tx_hash, "Fetching block data for transaction");
 
         // Fetch the transaction to find its block
         let (tx, block_hash) = self
@@ -327,10 +331,7 @@ impl DataProvider {
             // Subscribe to the existing request
             let mut receiver = sender.subscribe();
             drop(sender); // Release the lock
-            debug!(
-                "Joining existing in-flight request for block {}",
-                block_hash
-            );
+            trace!(block_hash = %block_hash, "Joining existing in-flight request");
             return receiver
                 .recv()
                 .await
@@ -423,8 +424,9 @@ impl DataProvider {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     warn!(
-                        "Failed to fetch witness for block {}, retrying: {}",
-                        block_number, e
+                        block_number,
+                        %e,
+                        "Failed to fetch witness, retrying"
                     );
                     last_error = Some(e);
                     tokio::time::sleep(retry_interval).await;
@@ -460,7 +462,7 @@ impl DataProvider {
                     contracts.insert(hash, Bytecode::new_raw(code));
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to fetch contract {}: {}", hash, e);
+                    warn!(code_hash = %hash, %e, "Failed to fetch contract");
                 }
             }
         }
@@ -481,7 +483,7 @@ impl DataProvider {
                     result.insert(hash, Bytecode::new_raw(code));
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to fetch contract {}: {}", hash, e);
+                    warn!(code_hash = %hash, %e, "Failed to fetch contract");
                 }
             }
         }

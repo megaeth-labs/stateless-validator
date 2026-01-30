@@ -47,7 +47,7 @@ use clap::Parser;
 use eyre::{anyhow, ensure, Result};
 use jsonrpsee::server::{RpcModule, Server};
 use tokio::task;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use validator_core::{
     chain_spec::ChainSpec, remote_chain_tracker, ChainSyncConfig, RpcClient, ValidatorDB,
@@ -192,17 +192,20 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     info!("Starting debug-trace-server");
-    info!("RPC endpoint: {}", args.rpc_endpoint);
-    info!("Witness endpoint: {}", args.witness_endpoint);
-    info!("Listen address: {}", args.addr);
-    info!("Cache size: {} blocks", args.cache_size);
-    info!("Witness timeout: {} seconds", args.witness_timeout);
+    info!(
+        rpc_endpoint = %args.rpc_endpoint,
+        witness_endpoint = %args.witness_endpoint,
+        listen_addr = %args.addr,
+        cache_size = args.cache_size,
+        witness_timeout_secs = args.witness_timeout,
+        "Configuration loaded"
+    );
 
     // Initialize metrics
     if args.metrics_enabled {
         let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
         metrics::init_metrics(metrics_addr)?;
-        info!("Metrics enabled on port {}", args.metrics_port);
+        info!(metrics_port = args.metrics_port, "Metrics enabled");
     } else {
         info!("Metrics disabled");
     }
@@ -212,13 +215,13 @@ async fn main() -> Result<()> {
 
     // Initialize ValidatorDB if data_dir is provided
     let validator_db = if let Some(data_dir) = &args.data_dir {
-        info!("Data directory: {}", data_dir);
+        info!(data_dir = %data_dir, "Initializing local database");
         let work_dir = PathBuf::from(data_dir);
         let db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
 
         // Handle optional start block initialization
         if let Some(start_block_str) = &args.start_block {
-            info!("Initializing from start block: {}", start_block_str);
+            info!(start_block = %start_block_str, "Initializing from start block");
 
             let block_hash = parse_block_hash(start_block_str)?;
             let block = loop {
@@ -228,7 +231,7 @@ async fn main() -> Result<()> {
                 {
                     Ok(block) => break block,
                     Err(e) => {
-                        tracing::warn!("Failed to fetch block {block_hash}: {e}, retrying...");
+                        warn!(block_hash = %block_hash, %e, "Failed to fetch block, retrying");
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     }
                 }
@@ -246,8 +249,9 @@ async fn main() -> Result<()> {
             .map_err(|e| anyhow!("Failed to reset anchor: {}", e))?;
 
             info!(
-                "Successfully initialized from block {} (number: {})",
-                block.header.hash, block.header.number
+                block_hash = %block.header.hash,
+                block_number = block.header.number,
+                "Successfully initialized from start block"
             );
         } else {
             // If no start block was provided, ensure we have an existing canonical chain
@@ -261,8 +265,8 @@ async fn main() -> Result<()> {
         // Spawn background chain tracker
         let config = Arc::new(ChainSyncConfig::default());
         info!(
-            "Starting chain sync with {} block lookahead",
-            config.tracker_lookahead_blocks
+            lookahead_blocks = config.tracker_lookahead_blocks,
+            "Starting chain sync"
         );
         task::spawn(remote_chain_tracker(
             Arc::clone(&rpc_client),
@@ -273,7 +277,7 @@ async fn main() -> Result<()> {
 
         Some(db)
     } else {
-        info!("No data directory specified, running in stateless mode (all data fetched from RPC)");
+        info!("No data directory specified, running in stateless mode");
         None
     };
 
@@ -286,7 +290,7 @@ async fn main() -> Result<()> {
     )?);
 
     let chain_spec = if let Some(genesis_path) = &args.genesis_file {
-        info!("Loading genesis from: {}", genesis_path);
+        info!(genesis_file = %genesis_path, "Loading genesis");
         let genesis_content = std::fs::read_to_string(genesis_path)?;
         let genesis: Genesis = serde_json::from_str(&genesis_content)?;
         Arc::new(ChainSpec::from_genesis(genesis))
@@ -309,7 +313,7 @@ async fn main() -> Result<()> {
     let addr = server.local_addr()?;
     let handle = server.start(module);
 
-    info!("debug-trace-server listening on {}", addr);
+    info!(listen_addr = %addr, "Server started");
     handle.stopped().await;
 
     Ok(())

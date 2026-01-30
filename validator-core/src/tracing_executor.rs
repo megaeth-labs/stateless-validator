@@ -59,6 +59,7 @@ use revm_inspectors::tracing::{
     js::JsInspector,
 };
 use salt::SaltWitness;
+use tracing::{trace, warn};
 
 use crate::{
     chain_spec::ChainSpec,
@@ -344,6 +345,13 @@ pub fn trace_block(
 ) -> Result<Vec<TraceResult>, ValidationError> {
     let env = TracingEnv::new(chain_spec, block, witness, contracts)?;
 
+    trace!(
+        block_number = block.header.number,
+        block_hash = %block.header.hash,
+        tx_count = env.transactions.len(),
+        "Starting block trace"
+    );
+
     // Create witness database and wrap it with CacheDB, then State.
     // CacheDB tracks all accessed accounts (not just modified), which is required
     // for prestateTracer+diff to return consistent results with mega-reth.
@@ -379,6 +387,12 @@ pub fn trace_block(
             tx_info: info,
         };
 
+        trace!(
+            tx_index = index,
+            tx_hash = %tx_hash,
+            "Tracing transaction"
+        );
+
         let (trace_result, state_changes) = trace_transaction_inner(
             &env.executor_factory,
             &mut state,
@@ -396,6 +410,12 @@ pub fn trace_block(
                 });
             }
             Err(error) => {
+                warn!(
+                    tx_index = index,
+                    tx_hash = %tx_hash,
+                    %error,
+                    "Transaction trace failed"
+                );
                 results.push(TraceResult::Error {
                     error,
                     tx_hash: Some(tx_hash),
@@ -408,6 +428,12 @@ pub fn trace_block(
             state.commit(state_changes);
         }
     }
+
+    trace!(
+        block_number = block.header.number,
+        traced_count = results.len(),
+        "Block trace completed"
+    );
 
     Ok(results)
 }
@@ -443,6 +469,14 @@ pub fn trace_transaction(
         return Err(ValidationError::BlockIncomplete);
     }
 
+    let target_tx = &env.transactions[tx_index];
+    trace!(
+        block_number = block.header.number,
+        tx_index,
+        tx_hash = %target_tx.inner.tx_hash(),
+        "Starting transaction trace"
+    );
+
     // Create witness database and wrap it with CacheDB, then State.
     // CacheDB tracks all accessed accounts (not just modified), which is required
     // for prestateTracer+diff to return consistent results with mega-reth.
@@ -465,10 +499,15 @@ pub fn trace_transaction(
     }
 
     // Replay preceding transactions without tracing
+    if tx_index > 0 {
+        trace!(
+            preceding_tx_count = tx_index,
+            "Replaying preceding transactions"
+        );
+    }
     env.replay_preceding_transactions(&mut state, tx_index)?;
 
     // Trace the target transaction
-    let target_tx = &env.transactions[tx_index];
     let recovered_tx = &target_tx.inner.inner;
     let info = tx_info_at(block, target_tx, tx_index);
 
@@ -488,6 +527,12 @@ pub fn trace_transaction(
     );
 
     trace_result.map_err(|e| {
+        warn!(
+            tx_index,
+            tx_hash = %target_tx.inner.tx_hash(),
+            error = %e,
+            "Transaction trace failed"
+        );
         ValidationError::BlockReplayFailed(alloy_evm::block::BlockExecutionError::msg(e))
     })
 }
@@ -517,6 +562,13 @@ pub fn parity_trace_block(
 ) -> Result<Vec<LocalizedTransactionTrace>, ValidationError> {
     let env = TracingEnv::new(chain_spec, block, witness, contracts)?;
 
+    trace!(
+        block_number = block.header.number,
+        block_hash = %block.header.hash,
+        tx_count = env.transactions.len(),
+        "Starting Parity block trace"
+    );
+
     // Create witness database and wrap it with CacheDB, then State.
     // CacheDB tracks all accessed accounts (not just modified), which is required
     // for prestateTracer+diff to return consistent results with mega-reth.
@@ -542,6 +594,12 @@ pub fn parity_trace_block(
         let recovered_tx = &tx.inner.inner;
         let info = tx_info_at(block, tx, index);
 
+        trace!(
+            tx_index = index,
+            tx_hash = %tx.inner.tx_hash(),
+            "Tracing transaction (Parity)"
+        );
+
         let (traces, state_changes) =
             env.execute_with_parity_tracing(&mut state, recovered_tx, info)?;
 
@@ -552,6 +610,12 @@ pub fn parity_trace_block(
             state.commit(state_changes);
         }
     }
+
+    trace!(
+        block_number = block.header.number,
+        trace_count = all_traces.len(),
+        "Parity block trace completed"
+    );
 
     Ok(all_traces)
 }
@@ -583,6 +647,14 @@ pub fn parity_trace_transaction(
         return Err(ValidationError::BlockIncomplete);
     }
 
+    let target_tx = &env.transactions[tx_index];
+    trace!(
+        block_number = block.header.number,
+        tx_index,
+        tx_hash = %target_tx.inner.tx_hash(),
+        "Starting Parity transaction trace"
+    );
+
     // Create witness database and wrap it with CacheDB, then State.
     // CacheDB tracks all accessed accounts (not just modified), which is required
     // for prestateTracer+diff to return consistent results with mega-reth.
@@ -603,15 +675,26 @@ pub fn parity_trace_transaction(
     }
 
     // Replay preceding transactions without tracing
+    if tx_index > 0 {
+        trace!(
+            preceding_tx_count = tx_index,
+            "Replaying preceding transactions"
+        );
+    }
     env.replay_preceding_transactions(&mut state, tx_index)?;
 
     // Trace the target transaction
-    let target_tx = &env.transactions[tx_index];
     let recovered_tx = &target_tx.inner.inner;
     let info = tx_info_at(block, target_tx, tx_index);
 
     let (traces, _state_changes) =
         env.execute_with_parity_tracing(&mut state, recovered_tx, info)?;
+
+    trace!(
+        tx_index,
+        trace_count = traces.len(),
+        "Parity transaction trace completed"
+    );
 
     Ok(traces)
 }
