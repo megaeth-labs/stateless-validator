@@ -41,8 +41,8 @@ serde.workspace = true
 # CLI
 clap.workspace = true
 
-# LRU cache
-mini-moka = "0.10"
+# High-performance cache with S3-FIFO eviction
+quick_cache = "0.6"
 
 # Concurrent map for single-flight
 dashmap = "5.5"

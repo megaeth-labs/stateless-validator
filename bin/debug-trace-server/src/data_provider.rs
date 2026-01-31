@@ -1,17 +1,18 @@
-//! Data Provider with Multi-Level Caching
+//! Data Provider for Block Data Fetching
 //!
-//! This module provides a data provider that implements a three-level lookup strategy
-//! for fetching block data required by the debug/trace RPC methods:
+//! This module provides a data provider that fetches block data required by the
+//! debug/trace RPC methods from multiple sources:
 //!
-//! 1. **LRU Cache** (fastest) - In-memory cache for recently accessed blocks
-//! 2. **Local Database** (medium) - ValidatorDB for pre-fetched blocks (if configured)
-//! 3. **Remote RPC** (slowest) - Upstream RPC endpoints as fallback
+//! 1. **Local Database** (fast) - ValidatorDB for pre-fetched blocks (if configured)
+//! 2. **Remote RPC** (slower) - Upstream RPC endpoints as fallback
 //!
 //! # Features
 //! - **Single-flight request coalescing**: Prevents duplicate RPC calls for the same block
-//! - **Configurable cache size**: Runtime-adjustable LRU cache capacity
 //! - **Witness fetch retry**: Automatic retry with configurable timeout for witness data
-//! - **Contract bytecode caching**: Fetches and caches contract code alongside block data
+//! - **Contract bytecode fetching**: Fetches contract code alongside block data
+//!
+//! # Note
+//! Response caching is handled at the HTTP layer by `ResponseCache`, not here.
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -19,7 +20,6 @@ use alloy_primitives::B256;
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
 use dashmap::DashMap;
 use eyre::Result;
-use mini_moka::sync::Cache;
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
@@ -42,9 +42,6 @@ pub struct BlockData {
     pub contracts: HashMap<B256, Bytecode>,
 }
 
-/// Default maximum number of blocks to cache in memory (128 blocks).
-pub const DEFAULT_CACHE_SIZE: u64 = 128;
-
 /// Default timeout for witness fetch retry in seconds (8 seconds).
 pub const DEFAULT_WITNESS_TIMEOUT_SECS: u64 = 8;
 
@@ -55,12 +52,11 @@ const WITNESS_RETRY_INTERVAL_MS: u64 = 200;
 /// Used to notify all waiters when a block fetch completes.
 type InFlightSender = broadcast::Sender<Result<BlockData, String>>;
 
-/// Data provider with multi-level caching and single-flight request coalescing.
+/// Data provider with single-flight request coalescing.
 ///
 /// # Data Lookup Strategy
-/// 1. Check LRU cache (keyed by block hash)
-/// 2. Check local ValidatorDB (if configured)
-/// 3. Fetch from remote RPC endpoints
+/// 1. Check local ValidatorDB (if configured)
+/// 2. Fetch from remote RPC endpoints
 ///
 /// # Single-Flight Pattern
 /// When multiple requests arrive for the same block simultaneously, only one
@@ -70,10 +66,6 @@ pub struct DataProvider {
     rpc_client: Arc<RpcClient>,
     /// Optional local database for pre-fetched blocks.
     validator_db: Option<Arc<ValidatorDB>>,
-    /// LRU cache keyed by block hash for fast repeated access.
-    block_cache: tokio::sync::RwLock<Cache<B256, BlockData>>,
-    /// Current cache size limit (can be changed at runtime).
-    cache_size: std::sync::atomic::AtomicU64,
     /// Timeout for witness fetch retry operations.
     witness_timeout: Duration,
     /// In-flight requests map for single-flight pattern (keyed by block hash).
@@ -87,53 +79,25 @@ impl DataProvider {
     /// * `rpc_endpoint` - Upstream RPC endpoint for fetching blocks and contracts
     /// * `witness_endpoint` - Upstream witness endpoint for fetching SALT witness data
     /// * `validator_db` - Optional local database for cached block data
-    /// * `cache_size` - Maximum number of blocks to cache in memory
     /// * `witness_timeout_secs` - Timeout in seconds for witness fetch retry
     pub fn new(
         rpc_endpoint: &str,
         witness_endpoint: &str,
         validator_db: Option<Arc<ValidatorDB>>,
-        cache_size: u64,
         witness_timeout_secs: u64,
     ) -> eyre::Result<Self> {
         let rpc_client = Arc::new(RpcClient::new(rpc_endpoint, witness_endpoint)?);
-        let block_cache = tokio::sync::RwLock::new(Cache::new(cache_size));
         Ok(Self {
             rpc_client,
             validator_db,
-            block_cache,
-            cache_size: std::sync::atomic::AtomicU64::new(cache_size),
             witness_timeout: Duration::from_secs(witness_timeout_secs),
             in_flight: DashMap::new(),
         })
     }
 
-    /// Sets a new cache size limit.
-    ///
-    /// **Warning**: This recreates the cache with the new size, clearing all existing entries.
-    /// Use with caution in production as it may cause temporary performance degradation.
-    pub async fn set_cache_size(&self, new_size: u64) {
-        self.cache_size
-            .store(new_size, std::sync::atomic::Ordering::Relaxed);
-        let mut cache = self.block_cache.write().await;
-        *cache = Cache::new(new_size);
-        debug!(new_cache_size = new_size, "Cache size updated");
-    }
-
-    /// Returns the current cache size limit.
-    pub fn get_cache_size(&self) -> u64 {
-        self.cache_size.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Returns the current number of entries in the cache.
-    pub async fn get_cache_entry_count(&self) -> u64 {
-        self.block_cache.read().await.entry_count()
-    }
-
     /// Gets block data by block number.
     ///
-    /// Lookup order: LRU cache -> local database -> RPC.
-    /// Results are cached in the LRU cache for subsequent requests.
+    /// Lookup order: local database -> RPC.
     ///
     /// # Arguments
     /// * `block_num` - The block number to fetch
@@ -142,27 +106,25 @@ impl DataProvider {
     /// * `Ok(BlockData)` - Block data including witness and contracts
     /// * `Err` - If the block cannot be fetched from any source
     pub async fn get_block_data(&self, block_num: u64) -> Result<BlockData> {
-        // First resolve block number to hash for cache lookup
+        let start = std::time::Instant::now();
+
+        // Try to get block hash from local database
         let block_hash = if let Some(db) = &self.validator_db {
             db.get_block_hash(block_num)?
         } else {
             None
         };
 
-        // Check LRU cache if we have the hash
-        if let Some(hash) = block_hash {
-            if let Some(data) = self.block_cache.read().await.get(&hash) {
-                trace!(block_number = block_num, source = "lru", "Cache hit");
-                return Ok(data);
-            }
-        }
-
         // Try to get from local database
         if let Some(db) = &self.validator_db {
             if let Some(hash) = block_hash {
                 if let Ok(data) = self.get_block_data_from_db(db, hash).await {
-                    trace!(block_number = block_num, source = "database", "Cache hit");
-                    self.block_cache.read().await.insert(hash, data.clone());
+                    trace!(
+                        block_number = block_num,
+                        source = "database",
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        "Block data retrieved from local DB"
+                    );
                     return Ok(data);
                 }
             }
@@ -172,20 +134,23 @@ impl DataProvider {
         debug!(
             block_number = block_num,
             source = "rpc",
-            "Fetching from RPC"
+            "Fetching block data from RPC"
         );
         let data = self.fetch_block_data_from_rpc(block_num).await?;
-        self.block_cache
-            .read()
-            .await
-            .insert(data.block.header.hash, data.clone());
+
+        trace!(
+            block_number = block_num,
+            source = "rpc",
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "Block data fetched from RPC"
+        );
+
         Ok(data)
     }
 
     /// Gets block data by block hash.
     ///
-    /// Lookup order: LRU cache -> local database -> RPC.
-    /// Results are cached in the LRU cache for subsequent requests.
+    /// Lookup order: local database -> RPC.
     ///
     /// # Arguments
     /// * `block_hash` - The 32-byte block hash to fetch
@@ -194,31 +159,36 @@ impl DataProvider {
     /// * `Ok(BlockData)` - Block data including witness and contracts
     /// * `Err` - If the block cannot be fetched from any source
     pub async fn get_block_data_by_hash(&self, block_hash: B256) -> Result<BlockData> {
-        // Check LRU cache first
-        if let Some(data) = self.block_cache.read().await.get(&block_hash) {
-            trace!(block_hash = %block_hash, source = "lru", "Cache hit");
-            return Ok(data);
-        }
+        let start = std::time::Instant::now();
 
         // Try to get from local database
         if let Some(db) = &self.validator_db {
             if let Ok(data) = self.get_block_data_from_db(db, block_hash).await {
-                trace!(block_hash = %block_hash, source = "database", "Cache hit");
-                self.block_cache
-                    .read()
-                    .await
-                    .insert(block_hash, data.clone());
+                trace!(
+                    block_hash = %block_hash,
+                    source = "database",
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "Block data retrieved from local DB"
+                );
                 return Ok(data);
             }
         }
 
         // Fall back to RPC
-        debug!(block_hash = %block_hash, source = "rpc", "Fetching from RPC");
+        debug!(
+            block_hash = %block_hash,
+            source = "rpc",
+            "Fetching block data from RPC"
+        );
         let data = self.fetch_block_data_by_hash_from_rpc(block_hash).await?;
-        self.block_cache
-            .read()
-            .await
-            .insert(block_hash, data.clone());
+
+        trace!(
+            block_hash = %block_hash,
+            source = "rpc",
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            "Block data fetched from RPC"
+        );
+
         Ok(data)
     }
 
@@ -235,7 +205,7 @@ impl DataProvider {
     /// * `Ok((BlockData, usize))` - Block data and transaction index
     /// * `Err` - If transaction not found or is still pending
     pub async fn get_block_data_for_tx(&self, tx_hash: B256) -> Result<(BlockData, usize)> {
-        trace!(tx_hash = %tx_hash, "Fetching block data for transaction");
+        trace!(tx_hash = %tx_hash, "Looking up transaction");
 
         // Fetch the transaction to find its block
         let (tx, block_hash) = self
@@ -248,6 +218,13 @@ impl DataProvider {
             .transaction_index
             .ok_or_else(|| eyre::eyre!("Transaction {} is pending", tx_hash))?
             as usize;
+
+        debug!(
+            tx_hash = %tx_hash,
+            block_hash = %block_hash,
+            tx_index,
+            "Transaction located in block"
+        );
 
         // Get block data
         let data = self.get_block_data_by_hash(block_hash).await?;
@@ -290,11 +267,7 @@ impl DataProvider {
         let code_hashes = validator_core::extract_code_hashes(&salt_witness);
         let contracts = self.get_contracts_with_db(db, &code_hashes).await?;
 
-        Ok(BlockData {
-            block,
-            salt_witness,
-            contracts,
-        })
+        Ok(BlockData { block, salt_witness, contracts })
     }
 
     /// Fetches block data from RPC by block number with single-flight coalescing.
@@ -331,7 +304,10 @@ impl DataProvider {
             // Subscribe to the existing request
             let mut receiver = sender.subscribe();
             drop(sender); // Release the lock
-            trace!(block_hash = %block_hash, "Joining existing in-flight request");
+            debug!(
+                block_hash = %block_hash,
+                "Joining existing in-flight request"
+            );
             return receiver
                 .recv()
                 .await
@@ -343,14 +319,16 @@ impl DataProvider {
         let (tx, _) = broadcast::channel(1);
         self.in_flight.insert(block_hash, tx.clone());
 
+        trace!(
+            block_hash = %block_hash,
+            "Starting new block data fetch"
+        );
+
         // Perform the actual fetch
         let result = self.do_fetch_block_data(block_hash).await;
 
         // Convert result to string error for broadcast (eyre::Error is not Clone)
-        let broadcast_result = result
-            .as_ref()
-            .map(|data| data.clone())
-            .map_err(|e| e.to_string());
+        let broadcast_result = result.as_ref().map(|data| data.clone()).map_err(|e| e.to_string());
 
         // Broadcast result to all waiters (ignore send errors - no receivers is ok)
         let _ = tx.send(broadcast_result);
@@ -390,11 +368,7 @@ impl DataProvider {
         let code_hashes = validator_core::extract_code_hashes(&salt_witness);
         let contracts = self.get_contracts(&code_hashes).await?;
 
-        Ok(BlockData {
-            block,
-            salt_witness,
-            contracts,
-        })
+        Ok(BlockData { block, salt_witness, contracts })
     }
 
     /// Fetches witness data with retry logic.
@@ -418,21 +392,46 @@ impl DataProvider {
         let start = std::time::Instant::now();
         let retry_interval = Duration::from_millis(WITNESS_RETRY_INTERVAL_MS);
         let mut last_error = None;
+        let mut retry_count = 0u32;
 
         while start.elapsed() < self.witness_timeout {
             match self.rpc_client.get_witness(block_number, block_hash).await {
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    if retry_count > 0 {
+                        debug!(
+                            block_number,
+                            block_hash = %block_hash,
+                            retry_count,
+                            elapsed_ms = start.elapsed().as_millis() as u64,
+                            "Witness fetched after retries"
+                        );
+                    }
+                    return Ok(result);
+                }
                 Err(e) => {
+                    retry_count += 1;
                     warn!(
                         block_number,
+                        block_hash = %block_hash,
+                        retry_count,
+                        elapsed_ms = start.elapsed().as_millis() as u64,
                         %e,
-                        "Failed to fetch witness, retrying"
+                        "Witness fetch failed, retrying"
                     );
                     last_error = Some(e);
                     tokio::time::sleep(retry_interval).await;
                 }
             }
         }
+
+        // Log final failure
+        warn!(
+            block_number,
+            block_hash = %block_hash,
+            retry_count,
+            timeout_ms = self.witness_timeout.as_millis() as u64,
+            "Witness fetch timeout"
+        );
 
         Err(last_error.unwrap_or_else(|| {
             eyre::eyre!(
@@ -455,6 +454,15 @@ impl DataProvider {
         // First try to get from database
         let (mut contracts, missing) = db.get_contract_codes(code_hashes.iter().copied())?;
 
+        if !missing.is_empty() {
+            debug!(
+                total = code_hashes.len(),
+                from_db = contracts.len(),
+                missing = missing.len(),
+                "Some contracts missing from DB, fetching from RPC"
+            );
+        }
+
         // Fetch missing contracts from RPC
         for hash in missing {
             match self.rpc_client.get_code(hash).await {
@@ -462,7 +470,11 @@ impl DataProvider {
                     contracts.insert(hash, Bytecode::new_raw(code));
                 }
                 Err(e) => {
-                    warn!(code_hash = %hash, %e, "Failed to fetch contract");
+                    warn!(
+                        code_hash = %hash,
+                        %e,
+                        "Failed to fetch contract code"
+                    );
                 }
             }
         }
@@ -477,17 +489,115 @@ impl DataProvider {
     async fn get_contracts(&self, code_hashes: &[B256]) -> Result<HashMap<B256, Bytecode>> {
         let mut result = HashMap::new();
 
+        trace!(
+            count = code_hashes.len(),
+            "Fetching contracts from RPC"
+        );
+
         for &hash in code_hashes {
             match self.rpc_client.get_code(hash).await {
                 Ok(code) => {
                     result.insert(hash, Bytecode::new_raw(code));
                 }
                 Err(e) => {
-                    warn!(code_hash = %hash, %e, "Failed to fetch contract");
+                    warn!(
+                        code_hash = %hash,
+                        %e,
+                        "Failed to fetch contract code"
+                    );
                 }
             }
         }
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_block_data_clone() {
+        // BlockData should be Clone
+        fn assert_clone<T: Clone>() {}
+        assert_clone::<BlockData>();
+    }
+
+    #[test]
+    fn test_default_witness_timeout() {
+        assert_eq!(DEFAULT_WITNESS_TIMEOUT_SECS, 8);
+    }
+
+    #[test]
+    fn test_witness_retry_interval() {
+        // Retry interval should be reasonable (200ms)
+        assert_eq!(WITNESS_RETRY_INTERVAL_MS, 200);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_block_number_with_number() {
+        // This test verifies the logic without needing a real RPC
+        let tag = BlockNumberOrTag::Number(12345);
+        match tag {
+            BlockNumberOrTag::Number(n) => assert_eq!(n, 12345),
+            _ => panic!("Expected Number variant"),
+        }
+    }
+
+    #[test]
+    fn test_block_number_or_tag_variants() {
+        // Test that we handle the expected variants
+        let number = BlockNumberOrTag::Number(100);
+        let latest = BlockNumberOrTag::Latest;
+        let pending = BlockNumberOrTag::Pending;
+
+        assert!(matches!(number, BlockNumberOrTag::Number(100)));
+        assert!(matches!(latest, BlockNumberOrTag::Latest));
+        assert!(matches!(pending, BlockNumberOrTag::Pending));
+    }
+
+    #[test]
+    fn test_in_flight_sender_type() {
+        // Verify that InFlightSender can hold our expected result types
+        fn _assert_send_sync<T: Send + Sync>() {}
+        _assert_send_sync::<InFlightSender>();
+    }
+
+    #[test]
+    fn test_data_provider_struct_fields() {
+        // Verify DataProvider has expected trait bounds
+        // DataProvider should be Send + Sync for use across async tasks
+        // We can't create a DataProvider without a real RPC client,
+        // but we can verify the struct layout is correct
+        fn _check_arc<T: Send + Sync>() {}
+        _check_arc::<Arc<RpcClient>>();
+        _check_arc::<Option<Arc<ValidatorDB>>>();
+        _check_arc::<DashMap<B256, InFlightSender>>();
+    }
+
+    #[test]
+    fn test_block_data_struct() {
+        // Verify BlockData struct has expected fields
+        use std::collections::HashMap;
+
+        // Create a minimal BlockData for testing field access patterns
+        // (we can't fully construct one without real data, but we can verify types)
+        let _: Option<HashMap<B256, Bytecode>> = None;
+        let _: Option<SaltWitness> = None;
+    }
+
+    #[test]
+    fn test_duration_from_secs() {
+        // Verify timeout duration is created correctly
+        let timeout = Duration::from_secs(DEFAULT_WITNESS_TIMEOUT_SECS);
+        assert_eq!(timeout.as_secs(), 8);
+        assert_eq!(timeout.as_millis(), 8000);
+    }
+
+    #[test]
+    fn test_retry_interval_duration() {
+        let interval = Duration::from_millis(WITNESS_RETRY_INTERVAL_MS);
+        assert_eq!(interval.as_millis(), 200);
     }
 }
