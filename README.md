@@ -35,8 +35,8 @@ cargo build --release
 
 ```bash
 STATELESS_VALIDATOR_LOG_FILE_DIRECTORY=/path/to/log_dir \
-STATELESS_VALIDATOR_LOG_FILE_FILTER=debug \
-STATELESS_VALIDATOR_LOG_STDOUT_FILTER=info \
+STATELESS_VALIDATOR_LOG_FILE=debug \
+STATELESS_VALIDATOR_LOG_STDOUT=info \
 cargo run --bin stateless-validator -- \
   --data-dir /path/to/validator/data \
   --rpc-endpoint <public-rpc-endpoint> \
@@ -75,8 +75,8 @@ Each command-line flag has an equivalent environment variable, which allows you 
 
 **Logging Configuration:**
 - `STATELESS_VALIDATOR_LOG_FILE_DIRECTORY`: directory for log files; enables file logging when set. Files rotate daily as stateless-validator.log.YYYY-MM-DD
-- `STATELESS_VALIDATOR_LOG_FILE_FILTER`: Log level for file output (debug|info|warn|error, default: debug)
-- `STATELESS_VALIDATOR_LOG_STDOUT_FILTER`: Log level for console output (debug|info|warn|error, default: info)
+- `STATELESS_VALIDATOR_LOG_FILE`: Log level for file output (debug|info|warn|error, default: debug)
+- `STATELESS_VALIDATOR_LOG_STDOUT`: Log level for console output (debug|info|warn|error, default: info)
 
 Log levels: **DEBUG** (detailed diagnostics), **INFO** (key operations), **WARN** (non-critical issues), **ERROR** (serious failures). For production, use `info` for terminal output and `debug` for file logging.
 
