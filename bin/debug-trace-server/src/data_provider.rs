@@ -24,7 +24,7 @@ use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
 use tokio::sync::broadcast;
-use tracing::{debug, trace, warn};
+use tracing::{debug, instrument, trace, warn};
 use validator_core::{withdrawals::MptWitness, RpcClient, ValidatorDB};
 
 /// Block data bundle containing all information needed for stateless execution.
@@ -105,6 +105,7 @@ impl DataProvider {
     /// # Returns
     /// * `Ok(BlockData)` - Block data including witness and contracts
     /// * `Err` - If the block cannot be fetched from any source
+    #[instrument(skip(self), name = "get_block_data")]
     pub async fn get_block_data(&self, block_num: u64) -> Result<BlockData> {
         let start = std::time::Instant::now();
 
@@ -158,6 +159,7 @@ impl DataProvider {
     /// # Returns
     /// * `Ok(BlockData)` - Block data including witness and contracts
     /// * `Err` - If the block cannot be fetched from any source
+    #[instrument(skip(self), name = "get_block_data_by_hash", fields(block_hash = %block_hash))]
     pub async fn get_block_data_by_hash(&self, block_hash: B256) -> Result<BlockData> {
         let start = std::time::Instant::now();
 
@@ -204,6 +206,7 @@ impl DataProvider {
     /// # Returns
     /// * `Ok((BlockData, usize))` - Block data and transaction index
     /// * `Err` - If transaction not found or is still pending
+    #[instrument(skip(self), name = "get_block_data_for_tx", fields(tx_hash = %tx_hash))]
     pub async fn get_block_data_for_tx(&self, tx_hash: B256) -> Result<(BlockData, usize)> {
         trace!(tx_hash = %tx_hash, "Looking up transaction");
 
@@ -408,6 +411,7 @@ impl DataProvider {
     /// # Returns
     /// * `Ok((SaltWitness, MptWitness))` - Successfully fetched witness data
     /// * `Err` - If timeout reached without successful fetch
+    #[instrument(skip(self), name = "fetch_witness")]
     async fn fetch_witness_with_retry(
         &self,
         block_number: u64,

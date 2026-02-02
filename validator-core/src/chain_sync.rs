@@ -11,7 +11,7 @@ use eyre::{Result, anyhow};
 use futures::future;
 use op_alloy_rpc_types::Transaction;
 use salt::SaltWitness;
-use tracing::{debug, error, warn};
+use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 
 use crate::{RpcClient, ValidatorDB, withdrawals::MptWitness};
 
@@ -101,6 +101,7 @@ pub struct FetchResult {
 /// # Returns
 /// * `Ok(FetchResult)` - Result containing fetch statistics
 /// * `Err(eyre::Error)` - On critical failures
+#[instrument(skip_all, name = "chain_sync")]
 pub async fn fetch_blocks_batch(
     client: &RpcClient,
     validator_db: &ValidatorDB,
@@ -115,8 +116,10 @@ pub async fn fetch_blocks_batch(
     let gap = remote_tip.0.saturating_sub(local_tip.0);
 
     debug!(
-        "[ChainSync] local={}, remote={}, gap={}",
-        local_tip.0, remote_tip.0, gap
+        local_tip = local_tip.0,
+        remote_tip = remote_tip.0,
+        gap = gap,
+        "Chain status"
     );
 
     // Detect and resolve chain reorgs
@@ -126,14 +129,19 @@ pub async fn fetch_blocks_batch(
     {
         Ok(block) if block.header.hash != remote_tip.1 => {
             warn!(
-                "[ChainSync] Hash mismatch! Expected {}, got {}. Resolving chain divergence.",
-                remote_tip.1, block.header.hash
+                block_number = remote_tip.0,
+                expected_hash = %remote_tip.1,
+                actual_hash = %block.header.hash,
+                "Hash mismatch detected, resolving chain divergence"
             );
+
             match find_divergence_point(client, validator_db, remote_tip.0).await {
                 Ok(rollback_to) => {
                     let reorg_depth = remote_tip.0.saturating_sub(rollback_to);
                     warn!(
-                        "[ChainSync] Rolling back to block {rollback_to} (reorg depth: {reorg_depth})"
+                        rollback_to = rollback_to,
+                        reorg_depth = reorg_depth,
+                        "Rolling back chain"
                     );
 
                     // Collect block hashes before rollback for cache invalidation
@@ -154,15 +162,18 @@ pub async fn fetch_blocks_batch(
                     });
                 }
                 Err(e) => {
-                    error!("[ChainSync] Failed to find divergence point: {e}");
+                    error!(error = %e, "Failed to find divergence point");
                     return Err(e);
                 }
             }
         }
-        Err(e) => warn!(
-            "[ChainSync] Network error validating tip {}: {}",
-            remote_tip.1, e
-        ),
+        Err(e) => {
+            warn!(
+                block_hash = %remote_tip.1,
+                error = %e,
+                "Network error validating tip"
+            );
+        }
         _ => {}
     }
 
@@ -195,17 +206,18 @@ pub async fn fetch_blocks_batch(
         });
     }
 
+    let start_block = remote_tip.0 + 1;
     debug!(
-        "[ChainSync] Fetching {} blocks starting from {}",
-        blocks_to_fetch,
-        remote_tip.0 + 1
+        blocks_to_fetch = blocks_to_fetch,
+        start_block = start_block,
+        "Fetching blocks"
     );
 
     // Fetch blocks in parallel
-    let tasks = future::join_all((remote_tip.0 + 1..remote_tip.0 + 1 + blocks_to_fetch).map(
+    let tasks = future::join_all((start_block..start_block + blocks_to_fetch).map(
         |block_number| {
             let client = client.clone();
-            tokio::spawn(async move {
+            async move {
                 let block = client
                     .get_block(BlockId::Number(block_number.into()), false)
                     .await?;
@@ -221,7 +233,8 @@ pub async fn fetch_blocks_batch(
                     salt_witness,
                     mpt_witness,
                 ))
-            })
+            }
+            .instrument(info_span!("fetch_block", block_number = block_number))
         },
     ))
     .await
@@ -229,35 +242,34 @@ pub async fn fetch_blocks_batch(
     .enumerate()
     // Stop on first error to maintain block sequence contiguity
     .take_while(|(i, result)| match result {
-        Ok(Ok(_)) => {
-            block_error_counts.remove(&(remote_tip.0 + 1 + *i as u64));
+        Ok(_) => {
+            block_error_counts.remove(&(start_block + *i as u64));
             true
         }
-        Ok(Err(e)) => {
-            let block_number = remote_tip.0 + 1 + *i as u64;
+        Err(e) => {
+            let block_number = start_block + *i as u64;
             let count = block_error_counts.entry(block_number).or_insert(0);
             *count += 1;
 
             if *count > 5 {
                 error!(
-                    "[ChainSync] DB or RPC error at block {block_number} (attempt {count}): {e}"
+                    block_number = block_number,
+                    attempt = *count,
+                    error = %e,
+                    "Block fetch error (repeated)"
                 );
             } else {
                 debug!(
-                    "[ChainSync] DB or RPC error at block {block_number} (attempt {count}): {e}"
+                    block_number = block_number,
+                    attempt = *count,
+                    error = %e,
+                    "Block fetch error"
                 );
             }
             false
         }
-        Err(e) => {
-            error!(
-                "[ChainSync] Task join error at block {}: {e}",
-                remote_tip.0 + 1 + *i as u64
-            );
-            false
-        }
     })
-    .filter_map(|(_, result)| result.ok().and_then(|r| r.ok()))
+    .filter_map(|(_, result)| result.ok())
     .collect::<Vec<_>>();
 
     let fetched_count = tasks.len() as u64;
@@ -299,9 +311,9 @@ pub async fn remote_chain_tracker<F>(
 where
     F: Fn(&[B256]) + Send + Sync,
 {
-    tracing::info!(
-        "[ChainSync] Starting remote chain tracker with {} block lookahead",
-        config.tracker_lookahead_blocks
+    info!(
+        lookahead_blocks = config.tracker_lookahead_blocks,
+        "Starting remote chain tracker"
     );
 
     // Track error counts for each block
@@ -324,7 +336,7 @@ where
                 }
             }
             Err(e) => {
-                warn!("[ChainSync] Iteration failed: {}", e);
+                warn!(error = %e, "Sync iteration failed");
                 tokio::time::sleep(config.tracker_error_sleep).await;
             }
         }
@@ -336,6 +348,7 @@ where
 /// Uses binary search to efficiently locate where the local canonical chain diverges
 /// from the remote chain. The algorithm is guaranteed to terminate in O(log N) time
 /// and return a block number between the earliest local block and `mismatch_block`.
+#[instrument(skip(client, validator_db), name = "find_divergence")]
 async fn find_divergence_point(
     client: &RpcClient,
     validator_db: &ValidatorDB,
@@ -374,5 +387,12 @@ async fn find_divergence_point(
             right = mid.saturating_sub(1);
         }
     }
+
+    debug!(
+        divergence_point = last_matching,
+        mismatch_block = mismatch_block,
+        "Found divergence point"
+    );
+
     Ok(last_matching)
 }

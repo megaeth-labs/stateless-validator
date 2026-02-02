@@ -49,7 +49,7 @@ use clap::Parser;
 use eyre::{anyhow, ensure, Result};
 use jsonrpsee::server::{RpcModule, Server};
 use tokio::task;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use validator_core::{
     chain_spec::ChainSpec, remote_chain_tracker, ChainSyncConfig, RpcClient, ValidatorDB,
@@ -286,6 +286,7 @@ async fn main() -> Result<()> {
 /// Initializes the validator database if data_dir is provided.
 /// Returns the database if configured, None otherwise.
 /// Note: Chain tracker is spawned separately in main() to allow passing the response cache callback.
+#[instrument(skip_all, name = "init_db")]
 async fn init_validator_db(
     args: &Args,
     rpc_client: &Arc<RpcClient>,
@@ -361,6 +362,7 @@ async fn init_validator_db(
 }
 
 /// Loads the chain specification from genesis file or uses default.
+#[instrument(skip_all, name = "load_chain_spec")]
 fn load_chain_spec(args: &Args) -> Result<Arc<ChainSpec>> {
     if let Some(genesis_path) = &args.genesis_file {
         debug!(genesis_file = %genesis_path, "Loading genesis from file");
@@ -376,6 +378,7 @@ fn load_chain_spec(args: &Args) -> Result<Arc<ChainSpec>> {
 /// Background task that periodically prunes old block data to prevent unbounded database growth.
 ///
 /// Runs in an infinite loop, removing blocks older than `blocks_to_keep` from the current tip.
+#[instrument(skip_all, name = "history_pruner")]
 async fn history_pruner(
     validator_db: Arc<ValidatorDB>,
     blocks_to_keep: u64,

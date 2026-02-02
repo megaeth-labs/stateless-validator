@@ -59,7 +59,7 @@ use revm_inspectors::tracing::{
     js::JsInspector,
 };
 use salt::SaltWitness;
-use tracing::{trace, warn};
+use tracing::{instrument, trace, warn};
 
 use crate::{
     chain_spec::ChainSpec,
@@ -336,6 +336,7 @@ fn tx_info_at(block: &Block<OpTransaction>, tx: &OpTransaction, index: usize) ->
 ///
 /// # Returns
 /// Returns a vector of trace results for each transaction in the block
+#[instrument(skip_all, name = "trace_block", fields(block_number = block.header.number, block_hash = %block.header.hash))]
 pub fn trace_block(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
@@ -345,12 +346,7 @@ pub fn trace_block(
 ) -> Result<Vec<TraceResult>, ValidationError> {
     let env = TracingEnv::new(chain_spec, block, witness, contracts)?;
 
-    trace!(
-        block_number = block.header.number,
-        block_hash = %block.header.hash,
-        tx_count = env.transactions.len(),
-        "Starting block trace"
-    );
+    trace!(tx_count = env.transactions.len(), "Starting block trace");
 
     // Create witness database and wrap it with CacheDB, then State.
     // CacheDB tracks all accessed accounts (not just modified), which is required
@@ -429,11 +425,7 @@ pub fn trace_block(
         }
     }
 
-    trace!(
-        block_number = block.header.number,
-        traced_count = results.len(),
-        "Block trace completed"
-    );
+    trace!(traced_count = results.len(), "Block trace completed");
 
     Ok(results)
 }
@@ -455,6 +447,7 @@ pub fn trace_block(
 ///
 /// # Returns
 /// Returns the transaction trace data
+#[instrument(skip_all, name = "trace_tx", fields(block_number = block.header.number, tx_index))]
 pub fn trace_transaction(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
@@ -471,8 +464,6 @@ pub fn trace_transaction(
 
     let target_tx = &env.transactions[tx_index];
     trace!(
-        block_number = block.header.number,
-        tx_index,
         tx_hash = %target_tx.inner.tx_hash(),
         "Starting transaction trace"
     );
@@ -528,7 +519,6 @@ pub fn trace_transaction(
 
     trace_result.map_err(|e| {
         warn!(
-            tx_index,
             tx_hash = %target_tx.inner.tx_hash(),
             error = %e,
             "Transaction trace failed"
@@ -554,6 +544,7 @@ pub fn trace_transaction(
 ///
 /// # Returns
 /// Returns a flat vector of localized transaction traces for all transactions in the block
+#[instrument(skip_all, name = "parity_trace_block", fields(block_number = block.header.number, block_hash = %block.header.hash))]
 pub fn parity_trace_block(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
@@ -563,8 +554,6 @@ pub fn parity_trace_block(
     let env = TracingEnv::new(chain_spec, block, witness, contracts)?;
 
     trace!(
-        block_number = block.header.number,
-        block_hash = %block.header.hash,
         tx_count = env.transactions.len(),
         "Starting Parity block trace"
     );
@@ -612,7 +601,6 @@ pub fn parity_trace_block(
     }
 
     trace!(
-        block_number = block.header.number,
         trace_count = all_traces.len(),
         "Parity block trace completed"
     );
@@ -634,6 +622,7 @@ pub fn parity_trace_block(
 ///
 /// # Returns
 /// Returns a vector of localized transaction traces for the specified transaction
+#[instrument(skip_all, name = "parity_trace_tx", fields(block_number = block.header.number, tx_index))]
 pub fn parity_trace_transaction(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
@@ -649,8 +638,6 @@ pub fn parity_trace_transaction(
 
     let target_tx = &env.transactions[tx_index];
     trace!(
-        block_number = block.header.number,
-        tx_index,
         tx_hash = %target_tx.inner.tx_hash(),
         "Starting Parity transaction trace"
     );
@@ -691,7 +678,6 @@ pub fn parity_trace_transaction(
         env.execute_with_parity_tracing(&mut state, recovered_tx, info)?;
 
     trace!(
-        tx_index,
         trace_count = traces.len(),
         "Parity transaction trace completed"
     );
