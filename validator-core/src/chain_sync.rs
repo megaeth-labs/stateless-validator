@@ -118,6 +118,46 @@ pub async fn fetch_blocks_batch(
         .get_local_tip()?
         .ok_or_else(|| anyhow!("Local chain is empty"))?;
     let remote_tip = validator_db.get_remote_tip()?.unwrap_or(local_tip);
+
+    // Check if local data is too stale (chain has moved far ahead)
+    // This happens when service was stopped for a long time
+    // Only applies in auto_advance mode (debug-trace-server) to avoid affecting stateless-validator
+    if config.auto_advance_local_tip {
+        let chain_latest = client.get_latest_block_number().await?;
+        let stale_threshold = config.pruner_blocks_to_keep;
+        if chain_latest > remote_tip.0 + stale_threshold {
+            warn!(
+                local_remote_tip = remote_tip.0,
+                chain_latest = chain_latest,
+                stale_threshold = stale_threshold,
+                "Local data is too stale, resetting to latest block"
+            );
+
+            // Fetch latest block and reset anchor
+            let latest_block = client.get_block(BlockId::latest(), false).await?;
+            validator_db.reset_anchor_block(
+                latest_block.header.number,
+                latest_block.header.hash,
+                latest_block.header.state_root,
+                latest_block.header.withdrawals_root.unwrap_or_default(),
+            )?;
+
+            info!(
+                new_anchor = latest_block.header.number,
+                block_hash = %latest_block.header.hash,
+                "Reset to latest block due to stale data"
+            );
+
+            return Ok(FetchResult {
+                blocks_fetched: 0,
+                should_wait: false,
+                had_error: false,
+                reorg_depth: 0,
+                reverted_hashes: Vec::new(),
+            });
+        }
+    }
+
     let gap = remote_tip.0.saturating_sub(local_tip.0);
 
     debug!(
@@ -182,8 +222,25 @@ pub async fn fetch_blocks_batch(
         _ => {}
     }
 
-    // Stop if we already have sufficient lookahead
-    if gap >= config.tracker_lookahead_blocks {
+    // In auto-advance mode, promote existing remote chain blocks to canonical chain first
+    // This handles the case where we have pending blocks from a previous run
+    if config.auto_advance_local_tip && gap > 0 {
+        let promoted = gap.min(config.tracker_lookahead_blocks);
+        for _ in 0..promoted {
+            if !validator_db.promote_remote_to_canonical()? {
+                break;
+            }
+        }
+        debug!(
+            promoted_count = promoted,
+            "Promoted pending remote blocks to canonical"
+        );
+        // Don't return early - continue to fetch more blocks
+    }
+
+    // Stop if we already have sufficient lookahead (only for validation mode)
+    // In auto-advance mode, we always want to fetch more blocks
+    if !config.auto_advance_local_tip && gap >= config.tracker_lookahead_blocks {
         return Ok(FetchResult {
             blocks_fetched: 0,
             should_wait: true,
