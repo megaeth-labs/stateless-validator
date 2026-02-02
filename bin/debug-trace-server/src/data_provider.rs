@@ -107,46 +107,20 @@ impl DataProvider {
     /// * `Err` - If the block cannot be fetched from any source
     #[instrument(skip(self), name = "get_block_data")]
     pub async fn get_block_data(&self, block_num: u64) -> Result<BlockData> {
-        let start = std::time::Instant::now();
-
-        // Try to get block hash from local database
-        let block_hash = if let Some(db) = &self.validator_db {
-            db.get_block_hash(block_num)?
-        } else {
-            None
-        };
-
-        // Try to get from local database
+        // Try to get block hash from local database first
         if let Some(db) = &self.validator_db {
-            if let Some(hash) = block_hash {
-                if let Ok(data) = self.get_block_data_from_db(db, hash).await {
-                    trace!(
-                        block_number = block_num,
-                        source = "database",
-                        elapsed_ms = start.elapsed().as_millis() as u64,
-                        "Block data retrieved from local DB"
-                    );
-                    return Ok(data);
-                }
+            if let Ok(Some(hash)) = db.get_block_hash(block_num) {
+                return self.get_block_data_by_hash(hash).await;
             }
         }
 
-        // Fall back to RPC
-        trace!(
-            block_number = block_num,
-            source = "rpc",
-            "Fetching block data from RPC"
-        );
-        let data = self.fetch_block_data_from_rpc(block_num).await?;
+        // Fall back to RPC - fetch block to get hash, then delegate to get_block_data_by_hash
+        let block = self
+            .rpc_client
+            .get_block_unchecked(BlockId::Number(BlockNumberOrTag::Number(block_num)), false)
+            .await?;
 
-        trace!(
-            block_number = block_num,
-            source = "rpc",
-            elapsed_ms = start.elapsed().as_millis() as u64,
-            "Block data fetched from RPC"
-        );
-
-        Ok(data)
+        self.get_block_data_by_hash(block.header.hash).await
     }
 
     /// Gets block data by block hash.
@@ -260,7 +234,7 @@ impl DataProvider {
                 // Fetch the block from upstream RPC to resolve the tag
                 let block = self
                     .rpc_client
-                    .get_block(BlockId::Number(tag), false)
+                    .get_block_unchecked(BlockId::Number(tag), false)
                     .await?;
                 Ok(block.header.number)
             }
@@ -288,21 +262,6 @@ impl DataProvider {
             salt_witness,
             contracts,
         })
-    }
-
-    /// Fetches block data from RPC by block number with single-flight coalescing.
-    ///
-    /// First fetches the block header to get the hash, then delegates to
-    /// single-flight fetch to avoid duplicate requests.
-    async fn fetch_block_data_from_rpc(&self, block_num: u64) -> Result<BlockData> {
-        // First fetch block without transactions to get the hash
-        let block = self
-            .rpc_client
-            .get_block(BlockId::Number(BlockNumberOrTag::Number(block_num)), false)
-            .await?;
-
-        // Use single-flight for the actual data fetch
-        self.fetch_block_data_single_flight(block.header.hash).await
     }
 
     /// Fetches block data from RPC by block hash with single-flight coalescing.
@@ -373,7 +332,7 @@ impl DataProvider {
         // Fetch block without transactions first to get the number
         let block = self
             .rpc_client
-            .get_block(BlockId::Hash(block_hash.into()), false)
+            .get_block_unchecked(BlockId::Hash(block_hash.into()), false)
             .await?;
 
         // Fetch witness with retry
@@ -384,7 +343,7 @@ impl DataProvider {
         // Fetch block with full transactions
         let block = self
             .rpc_client
-            .get_block(BlockId::Hash(block_hash.into()), true)
+            .get_block_unchecked(BlockId::Hash(block_hash.into()), true)
             .await?;
 
         // Extract code hashes and fetch contracts

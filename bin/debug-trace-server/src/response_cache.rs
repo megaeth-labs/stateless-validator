@@ -10,7 +10,7 @@
 //! - **Eviction**: S3-FIFO algorithm via `quick_cache` with memory-based weighting
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     hash::RandomState,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -20,7 +20,6 @@ use std::{
 
 use alloy_primitives::B256;
 use alloy_rpc_types_trace::geth::GethDebugTracingOptions;
-use dashmap::DashMap;
 use quick_cache::{sync::Cache, Lifecycle, Weighter};
 use tracing::{debug, trace};
 
@@ -245,18 +244,63 @@ impl Weighter<ResponseCacheKey, CachedResponse> for ResponseCacheWeighter {
 // Secondary Indices for Reorg Handling
 // ---------------------------------------------------------------------------
 
+/// Secondary indices for block hash/number mapping and cache key tracking.
+/// Uses a single lock to ensure consistency across all three maps.
 struct SecondaryIndices {
-    hash_to_number: DashMap<B256, u64>,
-    number_to_hash: DashMap<u64, B256>,
-    number_to_keys: DashMap<u64, HashSet<ResponseCacheKey>>,
+    inner: std::sync::RwLock<SecondaryIndicesInner>,
+}
+
+struct SecondaryIndicesInner {
+    hash_to_number: HashMap<B256, u64>,
+    number_to_hash: HashMap<u64, B256>,
+    number_to_keys: HashMap<u64, HashSet<ResponseCacheKey>>,
 }
 
 impl SecondaryIndices {
     fn new() -> Self {
         Self {
-            hash_to_number: DashMap::new(),
-            number_to_hash: DashMap::new(),
-            number_to_keys: DashMap::new(),
+            inner: std::sync::RwLock::new(SecondaryIndicesInner {
+                hash_to_number: HashMap::new(),
+                number_to_hash: HashMap::new(),
+                number_to_keys: HashMap::new(),
+            }),
+        }
+    }
+
+    fn get_number_by_hash(&self, hash: &B256) -> Option<u64> {
+        self.inner.read().unwrap().hash_to_number.get(hash).copied()
+    }
+
+    fn insert(&self, block_hash: B256, block_number: u64, key: ResponseCacheKey) {
+        let mut inner = self.inner.write().unwrap();
+        inner.hash_to_number.insert(block_hash, block_number);
+        inner.number_to_hash.insert(block_number, block_hash);
+        inner
+            .number_to_keys
+            .entry(block_number)
+            .or_default()
+            .insert(key);
+    }
+
+    fn remove_block(&self, block_number: u64) -> Option<HashSet<ResponseCacheKey>> {
+        let mut inner = self.inner.write().unwrap();
+        if let Some(hash) = inner.number_to_hash.remove(&block_number) {
+            inner.hash_to_number.remove(&hash);
+        }
+        inner.number_to_keys.remove(&block_number)
+    }
+
+    fn remove_key(&self, key: &ResponseCacheKey) {
+        let mut inner = self.inner.write().unwrap();
+        let block_number = key.block_number;
+        if let Some(keys) = inner.number_to_keys.get_mut(&block_number) {
+            keys.remove(key);
+            if keys.is_empty() {
+                inner.number_to_keys.remove(&block_number);
+                if let Some(hash) = inner.number_to_hash.remove(&block_number) {
+                    inner.hash_to_number.remove(&hash);
+                }
+            }
         }
     }
 }
@@ -272,21 +316,7 @@ impl Lifecycle<ResponseCacheKey, CachedResponse> for EvictionCleanupLifecycle {
     fn begin_request(&self) -> Self::RequestState {}
 
     fn on_evict(&self, _state: &mut (), key: ResponseCacheKey, _val: CachedResponse) {
-        let block_number = key.block_number;
-
-        let removed = self
-            .indices
-            .number_to_keys
-            .remove_if_mut(&block_number, |_, keys| {
-                keys.remove(&key);
-                keys.is_empty()
-            });
-
-        if removed.is_some() {
-            if let Some((_, hash)) = self.indices.number_to_hash.remove(&block_number) {
-                self.indices.hash_to_number.remove(&hash);
-            }
-        }
+        self.indices.remove_key(&key);
     }
 }
 
@@ -383,8 +413,7 @@ impl ResponseCache {
         variant: ResponseVariant,
     ) -> Option<(serde_json::Value, u64)> {
         // Look up block number from hash
-        let block_number = self.inner.indices.hash_to_number.get(&block_hash)?;
-        let block_number = *block_number;
+        let block_number = self.inner.indices.get_number_by_hash(&block_hash)?;
 
         let key = ResponseCacheKey::new(resource, block_number, variant);
         let result = self.inner.cache.get(&key);
@@ -410,21 +439,7 @@ impl ResponseCache {
         let cached = CachedResponse::new(response);
 
         self.inner.cache.insert(key.clone(), cached);
-
-        self.inner
-            .indices
-            .hash_to_number
-            .insert(block_hash, block_number);
-        self.inner
-            .indices
-            .number_to_hash
-            .insert(block_number, block_hash);
-        self.inner
-            .indices
-            .number_to_keys
-            .entry(block_number)
-            .or_default()
-            .insert(key);
+        self.inner.indices.insert(block_hash, block_number, key);
     }
 
     /// Gets a cached response or computes it, coalescing concurrent requests for the same key.
@@ -463,20 +478,7 @@ impl ResponseCache {
                 let byte_len = cached.byte_len;
                 let _ = guard.insert(cached);
 
-                self.inner
-                    .indices
-                    .hash_to_number
-                    .insert(block_hash, block_number);
-                self.inner
-                    .indices
-                    .number_to_hash
-                    .insert(block_number, block_hash);
-                self.inner
-                    .indices
-                    .number_to_keys
-                    .entry(block_number)
-                    .or_default()
-                    .insert(key);
+                self.inner.indices.insert(block_hash, block_number, key);
 
                 self.inner.misses.fetch_add(1, Ordering::Relaxed);
 
@@ -497,9 +499,11 @@ impl ResponseCache {
         let mut invalidated_count = 0;
 
         for &block_hash in block_hashes {
-            if let Some((_, block_number)) = self.inner.indices.hash_to_number.remove(&block_hash) {
-                self.inner.indices.number_to_hash.remove(&block_number);
-                if let Some((_, keys)) = self.inner.indices.number_to_keys.remove(&block_number) {
+            // Get block number first (read lock)
+            let block_number = self.inner.indices.get_number_by_hash(&block_hash);
+            if let Some(block_number) = block_number {
+                // Remove the block and get its keys (write lock)
+                if let Some(keys) = self.inner.indices.remove_block(block_number) {
                     for key in keys {
                         self.inner.cache.remove(&key);
                         invalidated_count += 1;

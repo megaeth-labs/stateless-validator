@@ -148,7 +148,6 @@ impl<'a> TracingEnv<'a> {
     /// * `chain_spec` - Chain specification with hardfork activation rules
     /// * `block` - Block to trace (must have full transactions)
     /// * `witness` - SALT witness containing state proofs
-    /// * `_contracts` - Contract bytecodes (currently unused in setup)
     ///
     /// # Returns
     /// * `Ok(TracingEnv)` - Ready-to-use tracing environment
@@ -157,7 +156,6 @@ impl<'a> TracingEnv<'a> {
         chain_spec: &ChainSpec,
         block: &'a Block<OpTransaction>,
         witness: &SaltWitness,
-        _contracts: &'a HashMap<B256, Bytecode>,
     ) -> Result<Self, ValidationError> {
         let BlockTransactions::Full(transactions) = &block.transactions else {
             return Err(ValidationError::BlockIncomplete);
@@ -344,7 +342,7 @@ pub fn trace_block(
     contracts: &HashMap<B256, Bytecode>,
     opts: GethDebugTracingOptions,
 ) -> Result<Vec<TraceResult>, ValidationError> {
-    let env = TracingEnv::new(chain_spec, block, witness, contracts)?;
+    let env = TracingEnv::new(chain_spec, block, witness)?;
 
     trace!(tx_count = env.transactions.len(), "Starting block trace");
 
@@ -456,7 +454,7 @@ pub fn trace_transaction(
     contracts: &HashMap<B256, Bytecode>,
     opts: GethDebugTracingOptions,
 ) -> Result<GethTrace, ValidationError> {
-    let env = TracingEnv::new(chain_spec, block, witness, contracts)?;
+    let env = TracingEnv::new(chain_spec, block, witness)?;
 
     if tx_index >= env.transactions.len() {
         return Err(ValidationError::BlockIncomplete);
@@ -551,7 +549,7 @@ pub fn parity_trace_block(
     witness: &SaltWitness,
     contracts: &HashMap<B256, Bytecode>,
 ) -> Result<Vec<LocalizedTransactionTrace>, ValidationError> {
-    let env = TracingEnv::new(chain_spec, block, witness, contracts)?;
+    let env = TracingEnv::new(chain_spec, block, witness)?;
 
     trace!(
         tx_count = env.transactions.len(),
@@ -630,7 +628,7 @@ pub fn parity_trace_transaction(
     witness: &SaltWitness,
     contracts: &HashMap<B256, Bytecode>,
 ) -> Result<Vec<LocalizedTransactionTrace>, ValidationError> {
-    let env = TracingEnv::new(chain_spec, block, witness, contracts)?;
+    let env = TracingEnv::new(chain_spec, block, witness)?;
 
     if tx_index >= env.transactions.len() {
         return Err(ValidationError::BlockIncomplete);

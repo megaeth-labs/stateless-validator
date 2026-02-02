@@ -4,10 +4,11 @@
 
 use std::collections::HashMap;
 
-use alloy_primitives::{B256, Bytes};
+use alloy_primitives::{B256, Bytes, U64};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
 use eyre::{Context, Result, ensure, eyre};
+use futures::future;
 use op_alloy_network::Optimism;
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
@@ -21,7 +22,7 @@ use crate::{executor::verify_block_integrity, withdrawals::MptWitness};
 #[serde(rename_all = "camelCase")]
 pub struct SetValidatedBlocksResponse {
     pub accepted: bool,
-    pub last_validated_block: (u64, B256),
+    pub last_validated_block: (U64, B256),
 }
 
 /// RPC client for MegaETH blockchain data.
@@ -63,6 +64,20 @@ impl RpcClient {
     ///
     /// Performs data integrity checks on the returned block.
     pub async fn get_block(&self, block_id: BlockId, full_txs: bool) -> Result<Block<Transaction>> {
+        let block = self.get_block_unchecked(block_id, full_txs).await?;
+        verify_block_integrity(&block)?;
+        Ok(block)
+    }
+
+    /// Gets a block by its identifier without integrity checks.
+    ///
+    /// Use this for trusted data sources (e.g., debug-trace-server fetching from upstream RPC)
+    /// where integrity checks are unnecessary overhead.
+    pub async fn get_block_unchecked(
+        &self,
+        block_id: BlockId,
+        full_txs: bool,
+    ) -> Result<Block<Transaction>> {
         let block = if full_txs {
             self.data_provider.get_block(block_id).full().await?
         } else {
@@ -92,8 +107,6 @@ impl RpcClient {
             _ => {} // Skip for latest, earliest, pending, etc.
         }
 
-        verify_block_integrity(&block)?;
-
         Ok(block)
     }
 
@@ -103,6 +116,18 @@ impl RpcClient {
             .get_block_number()
             .await
             .context("Failed to get block number")
+    }
+
+    /// Gets just the block hash for a block number.
+    ///
+    /// More efficient than get_block when only the hash is needed (e.g., for divergence checking).
+    pub async fn get_block_hash(&self, block_number: u64) -> Result<B256> {
+        let block = self
+            .data_provider
+            .get_block(BlockId::Number(block_number.into()))
+            .await?
+            .ok_or_else(|| eyre!("Block {} not found", block_number))?;
+        Ok(block.header.hash)
     }
 
     /// Gets execution witness data for a specific block.
@@ -130,24 +155,22 @@ impl RpcClient {
             .map_err(|e| eyre!("Failed to set validated blocks: {e}"))
     }
 
-    /// Gets contract bytecode for multiple code hashes.
+    /// Gets contract bytecode for multiple code hashes concurrently.
     ///
-    /// Fetches bytecode for all the given hashes, filtering out any that fail to fetch.
+    /// Fetches bytecode for all the given hashes in parallel, filtering out any that fail to fetch.
     pub async fn get_codes(&self, hashes: &[B256]) -> Result<HashMap<B256, Bytecode>> {
-        let mut contracts = HashMap::new();
-
-        for &hash in hashes {
+        let results = future::join_all(hashes.iter().map(|&hash| async move {
             match self.get_code(hash).await {
-                Ok(bytes) => {
-                    contracts.insert(hash, Bytecode::new_raw(bytes));
-                }
+                Ok(bytes) => Some((hash, Bytecode::new_raw(bytes))),
                 Err(e) => {
                     tracing::warn!("Failed to fetch code for hash {:?}: {}", hash, e);
+                    None
                 }
             }
-        }
+        }))
+        .await;
 
-        Ok(contracts)
+        Ok(results.into_iter().flatten().collect())
     }
 
     /// Gets the transaction by hash and returns its containing block hash.

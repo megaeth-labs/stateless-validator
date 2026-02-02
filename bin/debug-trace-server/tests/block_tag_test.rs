@@ -620,6 +620,77 @@ fn test_parity_trace_transaction_consistency() {
 // Send Transaction and Trace Tests
 // ---------------------------------------------------------------------------
 
+/// Helper to send a transaction with retry on nonce conflicts.
+fn send_tx_with_retry(
+    mega_reth: &RpcClient,
+    signer: &PrivateKeySigner,
+    chain_id: u64,
+    max_retries: usize,
+) -> (String, u64) {
+    for attempt in 0..max_retries {
+        // Get fresh nonce for each attempt
+        let resp = mega_reth
+            .call(
+                "eth_getTransactionCount",
+                json!([format!("{:?}", signer.address()), "pending"]),
+            )
+            .unwrap();
+        let nonce_hex = resp.result.as_ref().unwrap().as_str().unwrap();
+        let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16).unwrap();
+
+        // Get gas price with bump for retries
+        let resp = mega_reth.call("eth_gasPrice", json!([])).unwrap();
+        let gas_hex = resp.result.as_ref().unwrap().as_str().unwrap();
+        let base_gas_price = u128::from_str_radix(gas_hex.trim_start_matches("0x"), 16).unwrap();
+        // Increase gas price on retries to avoid "replacement transaction underpriced"
+        let gas_price = base_gas_price + (base_gas_price * attempt as u128 / 10);
+
+        if attempt > 0 {
+            println!(
+                "    Retry {}: nonce={}, gas_price={}",
+                attempt, nonce, gas_price
+            );
+        }
+
+        let tx = TxLegacy {
+            chain_id: Some(chain_id),
+            nonce,
+            gas_price,
+            gas_limit: 100_000,
+            to: TxKind::Call(signer.address()),
+            value: U256::from(1),
+            input: Bytes::default(),
+        };
+
+        let signature = signer
+            .sign_transaction_sync(&mut tx.clone())
+            .expect("Failed to sign");
+
+        let signed_tx = tx.into_signed(signature);
+        let mut encoded = Vec::new();
+        signed_tx.rlp_encode(&mut encoded);
+        let raw_tx = format!("0x{}", hex::encode(&encoded));
+
+        let resp = mega_reth
+            .call("eth_sendRawTransaction", json!([raw_tx]))
+            .expect("send failed");
+
+        if let Some(error) = &resp.error {
+            let error_msg = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
+            if error_msg.contains("nonce") || error_msg.contains("underpriced") {
+                // Nonce conflict, wait and retry
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+            panic!("Send tx error: {:?}", resp.error);
+        }
+
+        let tx_hash = resp.result.as_ref().unwrap().as_str().unwrap().to_string();
+        return (tx_hash, nonce);
+    }
+    panic!("Failed to send transaction after {} retries", max_retries);
+}
+
 /// Send a transaction, wait for it to be mined, and verify tracing works.
 #[test]
 #[ignore]
@@ -651,51 +722,12 @@ fn test_send_tx_and_trace() {
     let chain_id_hex = resp.result.as_ref().unwrap().as_str().unwrap();
     let chain_id = u64::from_str_radix(chain_id_hex.trim_start_matches("0x"), 16).unwrap();
 
-    // Get nonce
-    let resp = mega_reth
-        .call(
-            "eth_getTransactionCount",
-            json!([format!("{:?}", signer.address()), "pending"]),
-        )
-        .unwrap();
-    let nonce_hex = resp.result.as_ref().unwrap().as_str().unwrap();
-    let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16).unwrap();
-
-    // Get gas price
-    let resp = mega_reth.call("eth_gasPrice", json!([])).unwrap();
-    let gas_hex = resp.result.as_ref().unwrap().as_str().unwrap();
-    let gas_price = u128::from_str_radix(gas_hex.trim_start_matches("0x"), 16).unwrap();
-
     println!("  Sender: {:?}", signer.address());
-    println!("  Nonce: {}", nonce);
     println!("  Chain ID: {}", chain_id);
 
-    // Send a simple transfer
-    let tx = TxLegacy {
-        chain_id: Some(chain_id),
-        nonce,
-        gas_price,
-        gas_limit: 100_000,
-        to: TxKind::Call(signer.address()),
-        value: U256::from(1),
-        input: Bytes::default(),
-    };
-
-    let signature = signer
-        .sign_transaction_sync(&mut tx.clone())
-        .expect("Failed to sign");
-
-    let signed_tx = tx.into_signed(signature);
-    let mut encoded = Vec::new();
-    signed_tx.rlp_encode(&mut encoded);
-    let raw_tx = format!("0x{}", hex::encode(&encoded));
-
-    let resp = mega_reth
-        .call("eth_sendRawTransaction", json!([raw_tx]))
-        .expect("send failed");
-    assert!(resp.error.is_none(), "Send tx error: {:?}", resp.error);
-
-    let tx_hash = resp.result.as_ref().unwrap().as_str().unwrap().to_string();
+    // Send transaction with retry logic
+    let (tx_hash, nonce) = send_tx_with_retry(&mega_reth, &signer, chain_id, 5);
+    println!("  Nonce: {}", nonce);
     println!("  Sent tx: {}", tx_hash);
 
     // Wait for mining
@@ -787,6 +819,75 @@ fn test_send_tx_and_trace() {
     println!("\n  PASS: send tx and trace verified");
 }
 
+/// Helper to deploy a contract with retry on nonce conflicts.
+fn deploy_contract_with_retry(
+    mega_reth: &RpcClient,
+    signer: &PrivateKeySigner,
+    chain_id: u64,
+    bytecode: Vec<u8>,
+    max_retries: usize,
+) -> String {
+    for attempt in 0..max_retries {
+        // Get fresh nonce for each attempt
+        let resp = mega_reth
+            .call(
+                "eth_getTransactionCount",
+                json!([format!("{:?}", signer.address()), "pending"]),
+            )
+            .unwrap();
+        let nonce_hex = resp.result.as_ref().unwrap().as_str().unwrap();
+        let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16).unwrap();
+
+        // Get gas price with bump for retries
+        let resp = mega_reth.call("eth_gasPrice", json!([])).unwrap();
+        let gas_hex = resp.result.as_ref().unwrap().as_str().unwrap();
+        let base_gas_price = u128::from_str_radix(gas_hex.trim_start_matches("0x"), 16).unwrap();
+        let gas_price = base_gas_price + (base_gas_price * attempt as u128 / 10);
+
+        if attempt > 0 {
+            println!(
+                "    Retry {}: nonce={}, gas_price={}",
+                attempt, nonce, gas_price
+            );
+        }
+
+        let tx = TxLegacy {
+            chain_id: Some(chain_id),
+            nonce,
+            gas_price,
+            gas_limit: 3_000_000,
+            to: TxKind::Create,
+            value: U256::ZERO,
+            input: Bytes::from(bytecode.clone()),
+        };
+
+        let signature = signer
+            .sign_transaction_sync(&mut tx.clone())
+            .expect("Failed to sign");
+
+        let signed_tx = tx.into_signed(signature);
+        let mut encoded = Vec::new();
+        signed_tx.rlp_encode(&mut encoded);
+        let raw_tx = format!("0x{}", hex::encode(&encoded));
+
+        let resp = mega_reth
+            .call("eth_sendRawTransaction", json!([raw_tx]))
+            .expect("send failed");
+
+        if let Some(error) = &resp.error {
+            let error_msg = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
+            if error_msg.contains("nonce") || error_msg.contains("underpriced") {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+            panic!("Deploy error: {:?}", resp.error);
+        }
+
+        return resp.result.as_ref().unwrap().as_str().unwrap().to_string();
+    }
+    panic!("Failed to deploy contract after {} retries", max_retries);
+}
+
 /// Deploy a contract, trace the deployment transaction.
 #[test]
 #[ignore]
@@ -816,49 +917,12 @@ fn test_deploy_contract_and_trace() {
     let chain_id_hex = resp.result.as_ref().unwrap().as_str().unwrap();
     let chain_id = u64::from_str_radix(chain_id_hex.trim_start_matches("0x"), 16).unwrap();
 
-    let resp = mega_reth
-        .call(
-            "eth_getTransactionCount",
-            json!([format!("{:?}", signer.address()), "pending"]),
-        )
-        .unwrap();
-    let nonce_hex = resp.result.as_ref().unwrap().as_str().unwrap();
-    let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16).unwrap();
-
-    let resp = mega_reth.call("eth_gasPrice", json!([])).unwrap();
-    let gas_hex = resp.result.as_ref().unwrap().as_str().unwrap();
-    let gas_price = u128::from_str_radix(gas_hex.trim_start_matches("0x"), 16).unwrap();
-
     // Simple storage contract bytecode
     let bytecode = hex::decode(
         "6080604052602a60005534801561001557600080fd5b5060b3806100246000396000f3fe6080604052348015600f57600080fd5b506004361060325760003560e01c80633fa4f2451460375780635524107714604f575b600080fd5b603d6061565b60405190815260200160405180910390f35b605f600480360381019060599190606a565b6067565b005b60005481565b600055565b600060208284031215607b57600080fd5b503591905056fea264697066735822122000000000000000000000000000000000000000000000000000000000000000000064736f6c63430008130033"
     ).expect("Invalid bytecode");
 
-    let tx = TxLegacy {
-        chain_id: Some(chain_id),
-        nonce,
-        gas_price,
-        gas_limit: 3_000_000,
-        to: TxKind::Create,
-        value: U256::ZERO,
-        input: Bytes::from(bytecode),
-    };
-
-    let signature = signer
-        .sign_transaction_sync(&mut tx.clone())
-        .expect("Failed to sign");
-
-    let signed_tx = tx.into_signed(signature);
-    let mut encoded = Vec::new();
-    signed_tx.rlp_encode(&mut encoded);
-    let raw_tx = format!("0x{}", hex::encode(&encoded));
-
-    let resp = mega_reth
-        .call("eth_sendRawTransaction", json!([raw_tx]))
-        .expect("send failed");
-    assert!(resp.error.is_none(), "Deploy error: {:?}", resp.error);
-
-    let tx_hash = resp.result.as_ref().unwrap().as_str().unwrap().to_string();
+    let tx_hash = deploy_contract_with_retry(&mega_reth, &signer, chain_id, bytecode, 5);
     println!("  Deploy tx: {}", tx_hash);
 
     // Wait for mining

@@ -83,8 +83,6 @@ pub struct FetchResult {
     pub should_wait: bool,
     /// Whether an error occurred during fetching.
     pub had_error: bool,
-    /// Number of blocks rolled back due to reorg (0 if no reorg).
-    pub reorg_depth: u64,
     /// Block hashes that were reverted due to reorg (empty if no reorg).
     pub reverted_hashes: Vec<B256>,
 }
@@ -99,7 +97,7 @@ pub struct FetchResult {
 ///
 /// # Arguments
 /// * `client` - RPC client for fetching blocks from remote blockchain
-/// * `validator_db` - Database interface for chain management
+/// * `db` - Database interface for chain management
 /// * `config` - Configuration for tracker behavior
 /// * `block_error_counts` - Mutable map tracking error counts per block
 ///
@@ -109,15 +107,15 @@ pub struct FetchResult {
 #[instrument(skip_all, name = "chain_sync")]
 pub async fn fetch_blocks_batch(
     client: &RpcClient,
-    validator_db: &ValidatorDB,
+    db: &ValidatorDB,
     config: &ChainSyncConfig,
     block_error_counts: &mut HashMap<u64, usize>,
 ) -> Result<FetchResult> {
     // Calculate how far behind our local chain is from remote
-    let local_tip = validator_db
+    let local_tip = db
         .get_local_tip()?
         .ok_or_else(|| anyhow!("Local chain is empty"))?;
-    let remote_tip = validator_db.get_remote_tip()?.unwrap_or(local_tip);
+    let remote_tip = db.get_remote_tip()?.unwrap_or(local_tip);
 
     // Check if local data is too stale (chain has moved far ahead)
     // This happens when service was stopped for a long time
@@ -135,7 +133,7 @@ pub async fn fetch_blocks_batch(
 
             // Fetch latest block and reset anchor
             let latest_block = client.get_block(BlockId::latest(), false).await?;
-            validator_db.reset_anchor_block(
+            db.reset_anchor_block(
                 latest_block.header.number,
                 latest_block.header.hash,
                 latest_block.header.state_root,
@@ -152,20 +150,12 @@ pub async fn fetch_blocks_batch(
                 blocks_fetched: 0,
                 should_wait: false,
                 had_error: false,
-                reorg_depth: 0,
                 reverted_hashes: Vec::new(),
             });
         }
     }
 
     let gap = remote_tip.0.saturating_sub(local_tip.0);
-
-    debug!(
-        local_tip = local_tip.0,
-        remote_tip = remote_tip.0,
-        gap = gap,
-        "Chain status"
-    );
 
     // Detect and resolve chain reorgs
     match client
@@ -180,7 +170,7 @@ pub async fn fetch_blocks_batch(
                 "Hash mismatch detected, resolving chain divergence"
             );
 
-            match find_divergence_point(client, validator_db, remote_tip.0).await {
+            match find_divergence_point(client, db, remote_tip.0).await {
                 Ok(rollback_to) => {
                     let reorg_depth = remote_tip.0.saturating_sub(rollback_to);
                     warn!(
@@ -192,17 +182,16 @@ pub async fn fetch_blocks_batch(
                     // Collect block hashes before rollback for cache invalidation
                     let mut reverted_hashes = Vec::with_capacity(reorg_depth as usize);
                     for block_num in (rollback_to + 1)..=remote_tip.0 {
-                        if let Ok(Some(hash)) = validator_db.get_block_hash(block_num) {
+                        if let Ok(Some(hash)) = db.get_block_hash(block_num) {
                             reverted_hashes.push(hash);
                         }
                     }
 
-                    validator_db.rollback_chain(rollback_to)?;
+                    db.rollback_chain(rollback_to)?;
                     return Ok(FetchResult {
                         blocks_fetched: 0,
                         should_wait: false,
                         had_error: false,
-                        reorg_depth,
                         reverted_hashes,
                     });
                 }
@@ -227,14 +216,10 @@ pub async fn fetch_blocks_batch(
     if config.auto_advance_local_tip && gap > 0 {
         let promoted = gap.min(config.tracker_lookahead_blocks);
         for _ in 0..promoted {
-            if !validator_db.promote_remote_to_canonical()? {
+            if !db.promote_remote_to_canonical()? {
                 break;
             }
         }
-        debug!(
-            promoted_count = promoted,
-            "Promoted pending remote blocks to canonical"
-        );
         // Don't return early - continue to fetch more blocks
     }
 
@@ -245,7 +230,6 @@ pub async fn fetch_blocks_batch(
             blocks_fetched: 0,
             should_wait: true,
             had_error: false,
-            reorg_depth: 0,
             reverted_hashes: Vec::new(),
         });
     }
@@ -263,17 +247,11 @@ pub async fn fetch_blocks_batch(
             blocks_fetched: 0,
             should_wait: true,
             had_error: false,
-            reorg_depth: 0,
             reverted_hashes: Vec::new(),
         });
     }
 
     let start_block = remote_tip.0 + 1;
-    debug!(
-        blocks_to_fetch = blocks_to_fetch,
-        start_block = start_block,
-        "Fetching blocks"
-    );
 
     // Fetch blocks in parallel
     let tasks = future::join_all((start_block..start_block + blocks_to_fetch).map(
@@ -313,19 +291,13 @@ pub async fn fetch_blocks_batch(
             let count = block_error_counts.entry(block_number).or_insert(0);
             *count += 1;
 
+            // Only log errors after repeated failures (witness delay is expected)
             if *count > 5 {
                 error!(
                     block_number = block_number,
                     attempt = *count,
                     error = %e,
                     "Block fetch error (repeated)"
-                );
-            } else {
-                debug!(
-                    block_number = block_number,
-                    attempt = *count,
-                    error = %e,
-                    "Block fetch error"
                 );
             }
             false
@@ -337,19 +309,28 @@ pub async fn fetch_blocks_batch(
     let fetched_count = tasks.len() as u64;
     let had_error = fetched_count < blocks_to_fetch;
 
-    // Add successfully fetched headers to remote chain
-    validator_db.add_validation_tasks(&tasks)?;
-    validator_db.grow_remote_chain(tasks.iter().map(|(block, _, _)| &block.header))?;
+    // Only add validation tasks in stateless-validator mode (not auto-advance)
+    // In debug-trace-server mode with auto_advance_local_tip, we don't need validation tasks
+    if !config.auto_advance_local_tip {
+        db.add_validation_tasks(&tasks)?;
+    }
+    db.grow_remote_chain(tasks.iter().map(|(block, _, _)| &block.header))?;
 
     // Auto-advance local tip if configured (for debug-trace-server mode)
     // This skips validation and trusts blocks from upstream RPC
     if config.auto_advance_local_tip && fetched_count > 0 {
+        let new_local_tip = start_block + fetched_count - 1;
         for _ in 0..fetched_count {
-            validator_db.promote_remote_to_canonical()?;
+            db.promote_remote_to_canonical()?;
         }
-        debug!(
-            new_local_tip = start_block + fetched_count - 1,
-            "Auto-advanced local tip"
+
+        // Get the earliest block in DB for logging
+        let earliest = db.get_earliest_local_block()?.map(|(n, _)| n).unwrap_or(0);
+        info!(
+            db_start = earliest,
+            db_end = new_local_tip,
+            synced_blocks = fetched_count,
+            "Chain synced"
         );
     }
 
@@ -357,7 +338,6 @@ pub async fn fetch_blocks_batch(
         blocks_fetched: fetched_count,
         should_wait: false,
         had_error,
-        reorg_depth: 0,
         reverted_hashes: Vec::new(),
     })
 }
@@ -417,43 +397,61 @@ where
     }
 }
 
-/// Finds where the local chain diverges from the remote RPC node using binary search.
+/// Finds where the local chain diverges from the remote RPC node using exponential search.
 ///
-/// Uses binary search to efficiently locate where the local canonical chain diverges
-/// from the remote chain. The algorithm is guaranteed to terminate in O(log N) time
-/// and return a block number between the earliest local block and `mismatch_block`.
-#[instrument(skip(client, validator_db), name = "find_divergence")]
+/// Uses exponential search to efficiently locate where the local canonical chain diverges
+/// from the remote chain. Exponential search is more efficient than binary search for reorgs
+/// since they typically occur near the chain tip (non-uniform distribution).
+/// The algorithm first exponentially expands backward to find a known-matching block,
+/// then binary searches in that range.
+#[instrument(skip(client, db), name = "find_divergence")]
 async fn find_divergence_point(
     client: &RpcClient,
-    validator_db: &ValidatorDB,
+    db: &ValidatorDB,
     mismatch_block: u64,
 ) -> Result<u64> {
-    let earliest_local = validator_db
+    let earliest_local = db
         .get_earliest_local_block()?
         .expect("Local chain cannot be empty");
 
     // Safety check: verify earliest block matches remote chain
-    let earliest_remote = client
-        .get_block(BlockId::Number(earliest_local.0.into()), false)
-        .await?;
-    if earliest_remote.header.hash != earliest_local.1 {
-        panic!(
+    let earliest_remote_hash = client.get_block_hash(earliest_local.0).await?;
+    if earliest_remote_hash != earliest_local.1 {
+        return Err(anyhow!(
             "Catastrophic reorg: earliest local block {} hash mismatch (local: {:?}, remote: {:?})",
-            earliest_local.0, earliest_local.1, earliest_remote.header.hash
-        );
+            earliest_local.0,
+            earliest_local.1,
+            earliest_remote_hash
+        ));
     }
 
-    // Binary search for divergence point
-    let (mut left, mut right, mut last_matching) =
-        (earliest_local.0, mismatch_block, earliest_local.0);
+    // Exponential search: find a matching block by exponentially increasing distance from tip
+    let mut step = 1u64;
+    let mut last_mismatch = mismatch_block;
+    let mut search_start = earliest_local.0;
+
+    while last_mismatch > earliest_local.0 {
+        let check_block = last_mismatch.saturating_sub(step).max(earliest_local.0);
+        let local_hash = db.get_block_hash(check_block)?.unwrap();
+        let remote_hash = client.get_block_hash(check_block).await?;
+
+        if remote_hash == local_hash {
+            // Found a matching block, search between here and last_mismatch
+            search_start = check_block;
+            break;
+        } else {
+            // Keep expanding backwards
+            last_mismatch = check_block;
+            step *= 2;
+        }
+    }
+
+    // Binary search between search_start and last_mismatch
+    let (mut left, mut right, mut last_matching) = (search_start, last_mismatch, search_start);
     while left <= right {
         let mid = left + (right - left) / 2;
-        let local_hash = validator_db.get_block_hash(mid)?.unwrap();
-        let remote_hash = client
-            .get_block(BlockId::Number(mid.into()), false)
-            .await?
-            .header
-            .hash;
+        let local_hash = db.get_block_hash(mid)?.unwrap();
+        let remote_hash = client.get_block_hash(mid).await?;
         if remote_hash == local_hash {
             last_matching = mid;
             left = mid + 1;
