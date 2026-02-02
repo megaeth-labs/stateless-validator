@@ -3,19 +3,24 @@
 //! Contains all RPC method registration and request handling logic.
 //! Separates RPC concerns from the main server initialization.
 
-use std::{sync::Arc, time::Duration, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy_primitives::B256;
 use alloy_rpc_types_eth::BlockNumberOrTag;
 use alloy_rpc_types_trace::geth::GethDebugTracingOptions;
 use eyre::Result;
 use jsonrpsee::server::RpcModule;
-use tracing::{debug, trace, warn};
+use tracing::{trace, warn};
 use validator_core::chain_spec::ChainSpec;
 
-use crate::data_provider::{BlockData, DataProvider};
-use crate::metrics;
-use crate::response_cache::{CachedResource, ResponseCache, ResponseVariant};
+use crate::{
+    data_provider::{BlockData, DataProvider},
+    metrics,
+    response_cache::{CachedResource, ResponseCache, ResponseVariant},
+};
 
 // ---------------------------------------------------------------------------
 // RPC Method Name Constants
@@ -109,6 +114,63 @@ async fn compute_parity_trace_block(
 }
 
 // ---------------------------------------------------------------------------
+// Cache Helper Functions
+// ---------------------------------------------------------------------------
+
+/// Checks cache by block number and returns cached value if found.
+/// Records metrics and logs cache hit on success.
+fn check_cache_by_number(
+    cache: &ResponseCache,
+    resource: CachedResource,
+    block_num: u64,
+    variant: &ResponseVariant,
+    method_name: &'static str,
+    start: Instant,
+) -> Option<serde_json::Value> {
+    let cached_value = cache.get(resource, block_num, variant.clone())?;
+
+    let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+    metrics::record_rpc_request(method_name, total_ms / 1000.0);
+
+    trace!(
+        method = method_name,
+        block = block_num,
+        total_ms = format!("{:.2}", total_ms),
+        cache_hit = true,
+        "Cache hit - returning cached result"
+    );
+
+    Some(cached_value)
+}
+
+/// Checks cache by block hash and returns cached value if found.
+/// Records metrics and logs cache hit on success.
+fn check_cache_by_hash(
+    cache: &ResponseCache,
+    resource: CachedResource,
+    block_hash: B256,
+    variant: &ResponseVariant,
+    method_name: &'static str,
+    start: Instant,
+) -> Option<serde_json::Value> {
+    let (cached_value, block_num) = cache.get_by_hash(resource, block_hash, variant.clone())?;
+
+    let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+    metrics::record_rpc_request(method_name, total_ms / 1000.0);
+
+    trace!(
+        method = method_name,
+        block = block_num,
+        block_hash = %block_hash,
+        total_ms = format!("{:.2}", total_ms),
+        cache_hit = true,
+        "Cache hit - returning cached result"
+    );
+
+    Some(cached_value)
+}
+
+// ---------------------------------------------------------------------------
 // Block-Level Cached Trace Helper
 // ---------------------------------------------------------------------------
 
@@ -120,16 +182,13 @@ struct CachedTraceParams {
     variant: ResponseVariant,
     method_name: &'static str,
     start: Instant,
+    tx_count: usize,
 }
 
-/// Executes a block-level trace with caching.
+/// Executes a block-level trace (cache miss case) and stores the result.
 ///
-/// This helper reduces code duplication for cached block traces by:
-/// - Looking up or computing the trace result
-/// - Handling cache hit/miss logic
-/// - Recording metrics
-/// - Logging slow requests
-#[allow(clippy::too_many_arguments)]
+/// This function is called only when cache has already been checked and missed.
+/// It computes the trace, stores it in cache, and records metrics.
 async fn execute_cached_block_trace<F, Fut>(
     ctx: &RpcContext,
     params: CachedTraceParams,
@@ -137,35 +196,49 @@ async fn execute_cached_block_trace<F, Fut>(
 ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>>,
+    Fut:
+        std::future::Future<Output = Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>>,
 {
-    let result = ctx
-        .response_cache
-        .get_or_compute(params.resource, params.block_num, params.block_hash, params.variant.clone(), compute)
-        .await?;
+    let value = compute().await?;
 
-    let elapsed = params.start.elapsed();
-    metrics::record_rpc_request(params.method_name, elapsed.as_secs_f64());
+    ctx.response_cache.insert(
+        params.resource,
+        params.block_num,
+        params.block_hash,
+        params.variant,
+        value.clone(),
+    );
 
-    // Slow request warning
-    if elapsed > SLOW_REQUEST_THRESHOLD {
+    let total_ms = params.start.elapsed().as_secs_f64() * 1000.0;
+    metrics::record_rpc_request(params.method_name, total_ms / 1000.0);
+
+    trace!(
+        method = params.method_name,
+        block = params.block_num,
+        tx_count = params.tx_count,
+        total_ms = format!("{:.2}", total_ms),
+        cache_hit = false,
+        "Cache miss - computed and stored result"
+    );
+
+    if params.start.elapsed() > SLOW_REQUEST_THRESHOLD {
         warn!(
             method = params.method_name,
             block_number = params.block_num,
-            elapsed_ms = elapsed.as_millis() as u64,
+            elapsed_ms = total_ms as u64,
             threshold_ms = SLOW_REQUEST_THRESHOLD.as_millis() as u64,
             "RPC request exceeded threshold"
         );
     }
 
-    debug!(
+    trace!(
         method = params.method_name,
         block_number = params.block_num,
-        elapsed_ms = elapsed.as_millis() as u64,
+        elapsed_ms = total_ms as u64,
         "Request completed"
     );
 
-    Ok(result)
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -201,24 +274,37 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             "Processing request"
         );
 
+        let variant = ResponseVariant::from_geth_options(&opts);
+
+        // Check cache before fetching block data
+        if let Some(cached) = check_cache_by_number(
+            &ctx.response_cache,
+            CachedResource::DebugTraceBlock,
+            block_num,
+            &variant,
+            DEBUG_TRACE_BLOCK_BY_NUMBER,
+            start,
+        ) {
+            return Ok(cached);
+        }
+
+        // Cache miss - fetch block data and compute trace
         let data = ctx
             .data_provider
             .get_block_data(block_num)
             .await
             .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
 
-        let block_hash = data.block.header.hash;
-        let variant = ResponseVariant::from_geth_options(&opts);
-
         execute_cached_block_trace(
             &ctx,
             CachedTraceParams {
                 resource: CachedResource::DebugTraceBlock,
                 block_num,
-                block_hash,
+                block_hash: data.block.header.hash,
                 variant,
                 method_name: DEBUG_TRACE_BLOCK_BY_NUMBER,
                 start,
+                tx_count: data.block.transactions.len(),
             },
             || compute_debug_trace_block(&ctx.chain_spec, &data, opts),
         )
@@ -238,24 +324,37 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             "Processing request"
         );
 
+        let variant = ResponseVariant::from_geth_options(&opts);
+
+        // Check cache before fetching block data
+        if let Some(cached) = check_cache_by_hash(
+            &ctx.response_cache,
+            CachedResource::DebugTraceBlock,
+            block_hash,
+            &variant,
+            DEBUG_TRACE_BLOCK_BY_HASH,
+            start,
+        ) {
+            return Ok(cached);
+        }
+
+        // Cache miss - fetch block data and compute trace
         let data = ctx
             .data_provider
             .get_block_data_by_hash(block_hash)
             .await
             .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
 
-        let block_num = data.block.header.number;
-        let variant = ResponseVariant::from_geth_options(&opts);
-
         execute_cached_block_trace(
             &ctx,
             CachedTraceParams {
                 resource: CachedResource::DebugTraceBlock,
-                block_num,
+                block_num: data.block.header.number,
                 block_hash,
                 variant,
                 method_name: DEBUG_TRACE_BLOCK_BY_HASH,
                 start,
+                tx_count: data.block.transactions.len(),
             },
             || compute_debug_trace_block(&ctx.chain_spec, &data, opts),
         )
@@ -294,7 +393,6 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
         let elapsed = start.elapsed();
         metrics::record_rpc_request(DEBUG_TRACE_TRANSACTION, elapsed.as_secs_f64());
 
-        // Slow request warning
         if elapsed > SLOW_REQUEST_THRESHOLD {
             warn!(
                 method = DEBUG_TRACE_TRANSACTION,
@@ -306,7 +404,7 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             );
         }
 
-        debug!(
+        trace!(
             method = DEBUG_TRACE_TRANSACTION,
             tx_hash = %tx_hash,
             block_number = data.block.header.number,
@@ -341,23 +439,35 @@ fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             "Processing request"
         );
 
+        // Check cache before fetching block data
+        if let Some(cached) = check_cache_by_number(
+            &ctx.response_cache,
+            CachedResource::TraceBlock,
+            block_num,
+            &ResponseVariant::Default,
+            TRACE_BLOCK,
+            start,
+        ) {
+            return Ok(cached);
+        }
+
+        // Cache miss - fetch block data and compute trace
         let data = ctx
             .data_provider
             .get_block_data(block_num)
             .await
             .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
 
-        let block_hash = data.block.header.hash;
-
         execute_cached_block_trace(
             &ctx,
             CachedTraceParams {
                 resource: CachedResource::TraceBlock,
                 block_num,
-                block_hash,
+                block_hash: data.block.header.hash,
                 variant: ResponseVariant::Default,
                 method_name: TRACE_BLOCK,
                 start,
+                tx_count: data.block.transactions.len(),
             },
             || compute_parity_trace_block(&ctx.chain_spec, &data),
         )
@@ -394,7 +504,6 @@ fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
         let elapsed = start.elapsed();
         metrics::record_rpc_request(TRACE_TRANSACTION, elapsed.as_secs_f64());
 
-        // Slow request warning
         if elapsed > SLOW_REQUEST_THRESHOLD {
             warn!(
                 method = TRACE_TRANSACTION,
@@ -406,7 +515,7 @@ fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             );
         }
 
-        debug!(
+        trace!(
             method = TRACE_TRANSACTION,
             tx_hash = %tx_hash,
             block_number = data.block.header.number,
@@ -423,7 +532,6 @@ fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
 
 /// Registers cache management RPC methods.
 fn register_cache_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
-    // debug_getCacheStatus
     module.register_async_method(DEBUG_GET_CACHE_STATUS, |_params, ctx, _| async move {
         let stats = ctx.response_cache.stats();
 
@@ -472,10 +580,12 @@ mod tests {
             variant: ResponseVariant::Default,
             method_name: DEBUG_TRACE_BLOCK_BY_NUMBER,
             start: Instant::now(),
+            tx_count: 5,
         };
 
         assert_eq!(params.block_num, 12345);
         assert_eq!(params.method_name, "debug_traceBlockByNumber");
+        assert_eq!(params.tx_count, 5);
     }
 
     #[test]
@@ -488,7 +598,6 @@ mod tests {
 
     #[test]
     fn test_cached_trace_params_variants() {
-        // Test different resource types
         let debug_params = CachedTraceParams {
             resource: CachedResource::DebugTraceBlock,
             block_num: 100,
@@ -496,6 +605,7 @@ mod tests {
             variant: ResponseVariant::Default,
             method_name: DEBUG_TRACE_BLOCK_BY_NUMBER,
             start: Instant::now(),
+            tx_count: 10,
         };
 
         let trace_params = CachedTraceParams {
@@ -505,9 +615,13 @@ mod tests {
             variant: ResponseVariant::Default,
             method_name: TRACE_BLOCK,
             start: Instant::now(),
+            tx_count: 3,
         };
 
-        assert!(matches!(debug_params.resource, CachedResource::DebugTraceBlock));
+        assert!(matches!(
+            debug_params.resource,
+            CachedResource::DebugTraceBlock
+        ));
         assert!(matches!(trace_params.resource, CachedResource::TraceBlock));
     }
 

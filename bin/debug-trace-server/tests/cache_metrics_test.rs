@@ -168,7 +168,9 @@ fn parse_metric(metrics_text: &str, metric_name: &str, labels: &str) -> Option<f
             format!("{}{{{}}} ", metric_name, labels)
         };
 
-        if line.starts_with(&search_pattern) || line.starts_with(&format!("{}{{{}", metric_name, labels)) {
+        if line.starts_with(&search_pattern)
+            || line.starts_with(&format!("{}{{{}", metric_name, labels))
+        {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 2 {
                 return parts.last()?.parse().ok();
@@ -242,21 +244,30 @@ fn test_cache_hit_miss_tracking() {
 
     // Get a block to test with
     println!("\nFinding a block with transactions...");
-    let (block_num, block_hash) = get_recent_block_with_txs(&mega_reth)
-        .expect("Failed to find block with transactions");
-    println!("  Found block {} (hash: {}...)", block_num, &block_hash[..18]);
+    let (block_num, block_hash) =
+        get_recent_block_with_txs(&mega_reth).expect("Failed to find block with transactions");
+    println!(
+        "  Found block {} (hash: {}...)",
+        block_num,
+        &block_hash[..18]
+    );
 
     // Get initial cache stats
     println!("\nGetting initial cache stats...");
     let initial_stats = get_cache_stats(&debug_server).expect("Failed to get initial cache stats");
-    println!("  Initial stats: hits={}, misses={}, entries={}",
-             initial_stats.hits, initial_stats.misses, initial_stats.entry_count);
+    println!(
+        "  Initial stats: hits={}, misses={}, entries={}",
+        initial_stats.hits, initial_stats.misses, initial_stats.entry_count
+    );
 
     // First request - should be a cache miss
     println!("\nMaking first request (should be cache miss)...");
     let block_hex = format!("0x{:x}", block_num);
     let resp1 = debug_server
-        .call("debug_traceBlockByNumber", json!([block_hex, {"tracer": "callTracer"}]))
+        .call(
+            "debug_traceBlockByNumber",
+            json!([block_hex, {"tracer": "callTracer"}]),
+        )
         .expect("First request failed");
 
     if resp1.error.is_some() {
@@ -266,21 +277,27 @@ fn test_cache_hit_miss_tracking() {
 
     // Check cache stats after first request
     let stats_after_miss = get_cache_stats(&debug_server).expect("Failed to get cache stats");
-    println!("  Stats after first request: hits={}, misses={}, entries={}",
-             stats_after_miss.hits, stats_after_miss.misses, stats_after_miss.entry_count);
+    println!(
+        "  Stats after first request: hits={}, misses={}, entries={}",
+        stats_after_miss.hits, stats_after_miss.misses, stats_after_miss.entry_count
+    );
 
     // Verify miss count increased
     assert!(
         stats_after_miss.misses > initial_stats.misses,
         "Miss count should have increased: {} -> {}",
-        initial_stats.misses, stats_after_miss.misses
+        initial_stats.misses,
+        stats_after_miss.misses
     );
     println!("  ✓ Miss count increased as expected");
 
     // Second request for same block - should be a cache hit
     println!("\nMaking second request for same block (should be cache hit)...");
     let resp2 = debug_server
-        .call("debug_traceBlockByNumber", json!([block_hex, {"tracer": "callTracer"}]))
+        .call(
+            "debug_traceBlockByNumber",
+            json!([block_hex, {"tracer": "callTracer"}]),
+        )
         .expect("Second request failed");
 
     if resp2.error.is_some() {
@@ -290,14 +307,17 @@ fn test_cache_hit_miss_tracking() {
 
     // Check cache stats after second request
     let stats_after_hit = get_cache_stats(&debug_server).expect("Failed to get cache stats");
-    println!("  Stats after second request: hits={}, misses={}, entries={}",
-             stats_after_hit.hits, stats_after_hit.misses, stats_after_hit.entry_count);
+    println!(
+        "  Stats after second request: hits={}, misses={}, entries={}",
+        stats_after_hit.hits, stats_after_hit.misses, stats_after_hit.entry_count
+    );
 
     // Verify hit count increased
     assert!(
         stats_after_hit.hits > stats_after_miss.hits,
         "Hit count should have increased: {} -> {}",
-        stats_after_miss.hits, stats_after_hit.hits
+        stats_after_miss.hits,
+        stats_after_hit.hits
     );
     println!("  ✓ Hit count increased as expected");
 
@@ -334,20 +354,26 @@ fn test_cache_variant_separation() {
 
     // Get a block to test with
     println!("\nFinding a block with transactions...");
-    let (block_num, _) = get_recent_block_with_txs(&mega_reth)
-        .expect("Failed to find block with transactions");
+    let (block_num, _) =
+        get_recent_block_with_txs(&mega_reth).expect("Failed to find block with transactions");
     println!("  Found block {}", block_num);
 
     let block_hex = format!("0x{:x}", block_num);
 
     // Get initial stats
     let initial_stats = get_cache_stats(&debug_server).expect("Failed to get initial cache stats");
-    println!("\nInitial stats: hits={}, misses={}", initial_stats.hits, initial_stats.misses);
+    println!(
+        "\nInitial stats: hits={}, misses={}",
+        initial_stats.hits, initial_stats.misses
+    );
 
     // Request with callTracer
     println!("\nRequesting with callTracer...");
     let _ = debug_server
-        .call("debug_traceBlockByNumber", json!([block_hex, {"tracer": "callTracer"}]))
+        .call(
+            "debug_traceBlockByNumber",
+            json!([block_hex, {"tracer": "callTracer"}]),
+        )
         .expect("callTracer request failed");
 
     let stats1 = get_cache_stats(&debug_server).expect("Failed to get cache stats");
@@ -356,7 +382,10 @@ fn test_cache_variant_separation() {
     // Request with prestateTracer (different variant, should be a miss)
     println!("\nRequesting with prestateTracer (should be new cache entry)...");
     let _ = debug_server
-        .call("debug_traceBlockByNumber", json!([block_hex, {"tracer": "prestateTracer"}]))
+        .call(
+            "debug_traceBlockByNumber",
+            json!([block_hex, {"tracer": "prestateTracer"}]),
+        )
         .expect("prestateTracer request failed");
 
     let stats2 = get_cache_stats(&debug_server).expect("Failed to get cache stats");
@@ -372,7 +401,10 @@ fn test_cache_variant_separation() {
     // Request callTracer again (should be a hit)
     println!("\nRequesting callTracer again (should be cache hit)...");
     let _ = debug_server
-        .call("debug_traceBlockByNumber", json!([block_hex, {"tracer": "callTracer"}]))
+        .call(
+            "debug_traceBlockByNumber",
+            json!([block_hex, {"tracer": "callTracer"}]),
+        )
         .expect("callTracer request failed");
 
     let stats3 = get_cache_stats(&debug_server).expect("Failed to get cache stats");
@@ -420,17 +452,17 @@ fn test_prometheus_metrics() {
     println!("  Metrics length: {} bytes", metrics_text.len());
 
     // Check for expected metrics
-    let expected_metrics = [
-        "rpc_request_duration_seconds",
-        "rpc_request_count",
-    ];
+    let expected_metrics = ["rpc_request_duration_seconds", "rpc_request_count"];
 
     println!("\nChecking for expected metrics...");
     for metric in expected_metrics {
         if metrics_text.contains(metric) {
             println!("  ✓ Found metric: {}", metric);
         } else {
-            println!("  ⚠ Metric not found: {} (may not have any requests yet)", metric);
+            println!(
+                "  ⚠ Metric not found: {} (may not have any requests yet)",
+                metric
+            );
         }
     }
 
@@ -483,9 +515,13 @@ fn test_cache_multiple_blocks() {
     println!("\nInitial cache entries: {}", initial_stats.entry_count);
 
     // Get latest block number
-    let resp = mega_reth.call("eth_blockNumber", json!([]))
+    let resp = mega_reth
+        .call("eth_blockNumber", json!([]))
         .expect("Failed to get block number");
-    let latest_hex = resp.result.as_ref().and_then(|v| v.as_str())
+    let latest_hex = resp
+        .result
+        .as_ref()
+        .and_then(|v| v.as_str())
         .expect("Failed to get block number");
     let latest = u64::from_str_radix(latest_hex.trim_start_matches("0x"), 16)
         .expect("Failed to parse block number");
@@ -503,7 +539,8 @@ fn test_cache_multiple_blocks() {
         let block_hex = format!("0x{:x}", block_num);
 
         // Check if block has transactions
-        let block_resp = mega_reth.call("eth_getBlockByNumber", json!([&block_hex, false]))
+        let block_resp = mega_reth
+            .call("eth_getBlockByNumber", json!([&block_hex, false]))
             .ok();
 
         if let Some(resp) = block_resp {
@@ -513,31 +550,35 @@ fn test_cache_multiple_blocks() {
                         println!("\n  Block {} ({} txs):", block_num, txs.len());
 
                         // First request (miss)
-                        let stats_before = get_cache_stats(&debug_server)
-                            .expect("Failed to get cache stats");
+                        let stats_before =
+                            get_cache_stats(&debug_server).expect("Failed to get cache stats");
 
                         let _ = debug_server.call(
                             "debug_traceBlockByNumber",
-                            json!([&block_hex, {"tracer": "callTracer"}])
+                            json!([&block_hex, {"tracer": "callTracer"}]),
                         );
 
-                        let stats_after = get_cache_stats(&debug_server)
-                            .expect("Failed to get cache stats");
+                        let stats_after =
+                            get_cache_stats(&debug_server).expect("Failed to get cache stats");
 
-                        println!("    First request: misses {} -> {}",
-                                 stats_before.misses, stats_after.misses);
+                        println!(
+                            "    First request: misses {} -> {}",
+                            stats_before.misses, stats_after.misses
+                        );
 
                         // Second request (hit)
                         let _ = debug_server.call(
                             "debug_traceBlockByNumber",
-                            json!([&block_hex, {"tracer": "callTracer"}])
+                            json!([&block_hex, {"tracer": "callTracer"}]),
                         );
 
-                        let stats_final = get_cache_stats(&debug_server)
-                            .expect("Failed to get cache stats");
+                        let stats_final =
+                            get_cache_stats(&debug_server).expect("Failed to get cache stats");
 
-                        println!("    Second request: hits {} -> {}",
-                                 stats_after.hits, stats_final.hits);
+                        println!(
+                            "    Second request: hits {} -> {}",
+                            stats_after.hits, stats_final.hits
+                        );
 
                         tested_blocks += 1;
                     }
@@ -553,7 +594,8 @@ fn test_cache_multiple_blocks() {
     println!("Total misses: {}", final_stats.misses);
 
     if final_stats.hits > 0 && final_stats.misses > 0 {
-        let hit_rate = final_stats.hits as f64 / (final_stats.hits + final_stats.misses) as f64 * 100.0;
+        let hit_rate =
+            final_stats.hits as f64 / (final_stats.hits + final_stats.misses) as f64 * 100.0;
         println!("Hit rate: {:.1}%", hit_rate);
     }
 
@@ -574,22 +616,29 @@ fn test_trace_block_cache() {
     let mega_reth = RpcClient::new(&config.mega_reth_url, config.request_timeout);
 
     // Get a block to test with
-    let (block_num, _) = get_recent_block_with_txs(&mega_reth)
-        .expect("Failed to find block with transactions");
+    let (block_num, _) =
+        get_recent_block_with_txs(&mega_reth).expect("Failed to find block with transactions");
     let block_hex = format!("0x{:x}", block_num);
     println!("\nTesting block {}", block_num);
 
     // Get initial stats
     let initial_stats = get_cache_stats(&debug_server).expect("Failed to get initial cache stats");
-    println!("\nInitial stats: hits={}, misses={}", initial_stats.hits, initial_stats.misses);
+    println!(
+        "\nInitial stats: hits={}, misses={}",
+        initial_stats.hits, initial_stats.misses
+    );
 
     // First trace_block request (miss)
     println!("\nFirst trace_block request (should be miss)...");
-    let _ = debug_server.call("trace_block", json!([&block_hex]))
+    let _ = debug_server
+        .call("trace_block", json!([&block_hex]))
         .expect("First trace_block request failed");
 
     let stats_after_miss = get_cache_stats(&debug_server).expect("Failed to get cache stats");
-    println!("  Stats: hits={}, misses={}", stats_after_miss.hits, stats_after_miss.misses);
+    println!(
+        "  Stats: hits={}, misses={}",
+        stats_after_miss.hits, stats_after_miss.misses
+    );
 
     assert!(
         stats_after_miss.misses > initial_stats.misses,
@@ -599,11 +648,15 @@ fn test_trace_block_cache() {
 
     // Second trace_block request (hit)
     println!("\nSecond trace_block request (should be hit)...");
-    let _ = debug_server.call("trace_block", json!([&block_hex]))
+    let _ = debug_server
+        .call("trace_block", json!([&block_hex]))
         .expect("Second trace_block request failed");
 
     let stats_after_hit = get_cache_stats(&debug_server).expect("Failed to get cache stats");
-    println!("  Stats: hits={}, misses={}", stats_after_hit.hits, stats_after_hit.misses);
+    println!(
+        "  Stats: hits={}, misses={}",
+        stats_after_hit.hits, stats_after_hit.misses
+    );
 
     assert!(
         stats_after_hit.hits > stats_after_miss.hits,
@@ -630,7 +683,11 @@ fn test_cache_stats_summary() {
 
     println!("\nCurrent cache statistics:");
     println!("  Entry count: {}", stats.entry_count);
-    println!("  Total bytes: {} ({:.2} MB)", stats.total_bytes, stats.total_bytes as f64 / 1024.0 / 1024.0);
+    println!(
+        "  Total bytes: {} ({:.2} MB)",
+        stats.total_bytes,
+        stats.total_bytes as f64 / 1024.0 / 1024.0
+    );
     println!("  Hits: {}", stats.hits);
     println!("  Misses: {}", stats.misses);
 

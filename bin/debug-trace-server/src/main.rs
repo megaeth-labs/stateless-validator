@@ -43,16 +43,16 @@
 use std::{path::PathBuf, sync::Arc};
 
 use alloy_genesis::Genesis;
-use alloy_primitives::{B256, BlockHash, hex};
+use alloy_primitives::{hex, BlockHash, B256};
 use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
-use eyre::{Result, anyhow, ensure};
+use eyre::{anyhow, ensure, Result};
 use jsonrpsee::server::{RpcModule, Server};
 use tokio::task;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use validator_core::{
-    ChainSyncConfig, RpcClient, ValidatorDB, chain_spec::ChainSpec, remote_chain_tracker,
+    chain_spec::ChainSpec, remote_chain_tracker, ChainSyncConfig, RpcClient, ValidatorDB,
 };
 
 mod data_provider;

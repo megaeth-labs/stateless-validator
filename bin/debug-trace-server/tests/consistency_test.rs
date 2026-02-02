@@ -1072,10 +1072,7 @@ fn test_cache_management() {
             cache.get("totalBytes").is_some(),
             "Cache status should have totalBytes"
         );
-        assert!(
-            cache.get("hits").is_some(),
-            "Cache status should have hits"
-        );
+        assert!(cache.get("hits").is_some(), "Cache status should have hits");
         assert!(
             cache.get("misses").is_some(),
             "Cache status should have misses"

@@ -131,7 +131,7 @@ impl DataProvider {
         }
 
         // Fall back to RPC
-        debug!(
+        trace!(
             block_number = block_num,
             source = "rpc",
             "Fetching block data from RPC"
@@ -175,7 +175,7 @@ impl DataProvider {
         }
 
         // Fall back to RPC
-        debug!(
+        trace!(
             block_hash = %block_hash,
             source = "rpc",
             "Fetching block data from RPC"
@@ -252,9 +252,7 @@ impl DataProvider {
             BlockNumberOrTag::Number(n) => Ok(n),
             BlockNumberOrTag::Latest => self.rpc_client.get_latest_block_number().await,
             BlockNumberOrTag::Earliest => Ok(0),
-            BlockNumberOrTag::Pending => {
-                Err(eyre::eyre!("Pending block not supported"))
-            }
+            BlockNumberOrTag::Pending => Err(eyre::eyre!("Pending block not supported")),
             BlockNumberOrTag::Finalized | BlockNumberOrTag::Safe => {
                 // Fetch the block from upstream RPC to resolve the tag
                 let block = self
@@ -282,7 +280,11 @@ impl DataProvider {
         let code_hashes = validator_core::extract_code_hashes(&salt_witness);
         let contracts = self.get_contracts_with_db(db, &code_hashes).await?;
 
-        Ok(BlockData { block, salt_witness, contracts })
+        Ok(BlockData {
+            block,
+            salt_witness,
+            contracts,
+        })
     }
 
     /// Fetches block data from RPC by block number with single-flight coalescing.
@@ -319,7 +321,7 @@ impl DataProvider {
             // Subscribe to the existing request
             let mut receiver = sender.subscribe();
             drop(sender); // Release the lock
-            debug!(
+            trace!(
                 block_hash = %block_hash,
                 "Joining existing in-flight request"
             );
@@ -343,7 +345,10 @@ impl DataProvider {
         let result = self.do_fetch_block_data(block_hash).await;
 
         // Convert result to string error for broadcast (eyre::Error is not Clone)
-        let broadcast_result = result.as_ref().map(|data| data.clone()).map_err(|e| e.to_string());
+        let broadcast_result = result
+            .as_ref()
+            .map(|data| data.clone())
+            .map_err(|e| e.to_string());
 
         // Broadcast result to all waiters (ignore send errors - no receivers is ok)
         let _ = tx.send(broadcast_result);
@@ -383,7 +388,11 @@ impl DataProvider {
         let code_hashes = validator_core::extract_code_hashes(&salt_witness);
         let contracts = self.get_contracts(&code_hashes).await?;
 
-        Ok(BlockData { block, salt_witness, contracts })
+        Ok(BlockData {
+            block,
+            salt_witness,
+            contracts,
+        })
     }
 
     /// Fetches witness data with retry logic.
@@ -413,7 +422,7 @@ impl DataProvider {
             match self.rpc_client.get_witness(block_number, block_hash).await {
                 Ok(result) => {
                     if retry_count > 0 {
-                        debug!(
+                        trace!(
                             block_number,
                             block_hash = %block_hash,
                             retry_count,
@@ -471,7 +480,7 @@ impl DataProvider {
         let (mut contracts, missing) = db.get_contract_codes(code_hashes.iter().copied())?;
 
         if !missing.is_empty() {
-            debug!(
+            trace!(
                 total = code_hashes.len(),
                 from_db = contracts.len(),
                 missing = missing.len(),
@@ -499,10 +508,7 @@ impl DataProvider {
     async fn get_contracts(&self, code_hashes: &[B256]) -> Result<HashMap<B256, Bytecode>> {
         let mut result = HashMap::new();
 
-        trace!(
-            count = code_hashes.len(),
-            "Fetching contracts from RPC"
-        );
+        trace!(count = code_hashes.len(), "Fetching contracts from RPC");
 
         for &hash in code_hashes {
             let code = self

@@ -176,7 +176,10 @@ fn normalize_json_inner(value: &Value, current_key: Option<&str>) -> Value {
             let mut keys: Vec<_> = map.keys().collect();
             keys.sort();
             for key in keys {
-                sorted.insert(key.clone(), normalize_json_inner(&map[key], Some(key.as_str())));
+                sorted.insert(
+                    key.clone(),
+                    normalize_json_inner(&map[key], Some(key.as_str())),
+                );
             }
             Value::Object(sorted)
         }
@@ -375,10 +378,7 @@ fn test_trace_block_by_finalized() {
     let dts = RpcClient::new(&config.debug_trace_server_url, config.request_timeout);
 
     // First check if finalized is supported by mega-reth
-    let check = mega_reth.call(
-        "eth_getBlockByNumber",
-        json!(["finalized", false]),
-    );
+    let check = mega_reth.call("eth_getBlockByNumber", json!(["finalized", false]));
 
     match check {
         Ok(resp) if resp.error.is_some() => {
@@ -489,7 +489,11 @@ fn test_trace_block_number_vs_hash_consistency() {
 
     let (block_num, block_hash) =
         find_block_with_txs(&mega_reth).expect("No blocks with txs found");
-    println!("  Testing block {} (hash: {}...)", block_num, &block_hash[..18]);
+    println!(
+        "  Testing block {} (hash: {}...)",
+        block_num,
+        &block_hash[..18]
+    );
 
     let tracers = vec![
         ("callTracer", json!({"tracer": "callTracer"})),
@@ -509,8 +513,16 @@ fn test_trace_block_number_vs_hash_consistency() {
             .call("debug_traceBlockByHash", json!([&block_hash, opts]))
             .expect("traceBlockByHash failed");
 
-        assert!(by_number.error.is_none(), "traceBlockByNumber error: {:?}", by_number.error);
-        assert!(by_hash.error.is_none(), "traceBlockByHash error: {:?}", by_hash.error);
+        assert!(
+            by_number.error.is_none(),
+            "traceBlockByNumber error: {:?}",
+            by_number.error
+        );
+        assert!(
+            by_hash.error.is_none(),
+            "traceBlockByHash error: {:?}",
+            by_hash.error
+        );
 
         let n1 = normalize_json(by_number.result.as_ref().unwrap());
         let n2 = normalize_json(by_hash.result.as_ref().unwrap());
@@ -630,15 +642,14 @@ fn test_send_tx_and_trace() {
     let dts = RpcClient::new(&config.debug_trace_server_url, config.request_timeout);
 
     // Create signer
-    let key_bytes = hex::decode(private_key.trim_start_matches("0x"))
-        .expect("Invalid private key hex");
+    let key_bytes =
+        hex::decode(private_key.trim_start_matches("0x")).expect("Invalid private key hex");
     let signer = PrivateKeySigner::from_slice(&key_bytes).expect("Invalid private key");
 
     // Get chain ID
     let resp = mega_reth.call("eth_chainId", json!([])).unwrap();
     let chain_id_hex = resp.result.as_ref().unwrap().as_str().unwrap();
-    let chain_id =
-        u64::from_str_radix(chain_id_hex.trim_start_matches("0x"), 16).unwrap();
+    let chain_id = u64::from_str_radix(chain_id_hex.trim_start_matches("0x"), 16).unwrap();
 
     // Get nonce
     let resp = mega_reth
@@ -682,11 +693,7 @@ fn test_send_tx_and_trace() {
     let resp = mega_reth
         .call("eth_sendRawTransaction", json!([raw_tx]))
         .expect("send failed");
-    assert!(
-        resp.error.is_none(),
-        "Send tx error: {:?}",
-        resp.error
-    );
+    assert!(resp.error.is_none(), "Send tx error: {:?}", resp.error);
 
     let tx_hash = resp.result.as_ref().unwrap().as_str().unwrap().to_string();
     println!("  Sent tx: {}", tx_hash);
@@ -702,9 +709,8 @@ fn test_send_tx_and_trace() {
         if let Some(receipt) = resp.result {
             if !receipt.is_null() {
                 if let Some(bn) = receipt.get("blockNumber").and_then(|v| v.as_str()) {
-                    block_number = Some(
-                        u64::from_str_radix(bn.trim_start_matches("0x"), 16).unwrap(),
-                    );
+                    block_number =
+                        Some(u64::from_str_radix(bn.trim_start_matches("0x"), 16).unwrap());
                     break;
                 }
             }
@@ -723,7 +729,10 @@ fn test_send_tx_and_trace() {
     let tracers = vec![
         ("default", json!({})),
         ("callTracer", json!({"tracer": "callTracer"})),
-        ("callTracer+logs", json!({"tracer": "callTracer", "tracerConfig": {"withLog": true}})),
+        (
+            "callTracer+logs",
+            json!({"tracer": "callTracer", "tracerConfig": {"withLog": true}}),
+        ),
         ("prestateTracer", json!({"tracer": "prestateTracer"})),
         ("4byteTracer", json!({"tracer": "4byteTracer"})),
         ("noopTracer", json!({"tracer": "noopTracer"})),
@@ -799,8 +808,8 @@ fn test_deploy_contract_and_trace() {
     let mega_reth = RpcClient::new(&config.mega_reth_url, config.request_timeout);
     let dts = RpcClient::new(&config.debug_trace_server_url, config.request_timeout);
 
-    let key_bytes = hex::decode(private_key.trim_start_matches("0x"))
-        .expect("Invalid private key hex");
+    let key_bytes =
+        hex::decode(private_key.trim_start_matches("0x")).expect("Invalid private key hex");
     let signer = PrivateKeySigner::from_slice(&key_bytes).expect("Invalid private key");
 
     let resp = mega_reth.call("eth_chainId", json!([])).unwrap();
@@ -862,9 +871,8 @@ fn test_deploy_contract_and_trace() {
         if let Some(receipt) = resp.result {
             if !receipt.is_null() {
                 if let Some(bn) = receipt.get("blockNumber").and_then(|v| v.as_str()) {
-                    block_number = Some(
-                        u64::from_str_radix(bn.trim_start_matches("0x"), 16).unwrap(),
-                    );
+                    block_number =
+                        Some(u64::from_str_radix(bn.trim_start_matches("0x"), 16).unwrap());
                     break;
                 }
             }
@@ -883,7 +891,10 @@ fn test_deploy_contract_and_trace() {
     let tracers = vec![
         ("callTracer", json!({"tracer": "callTracer"})),
         ("prestateTracer", json!({"tracer": "prestateTracer"})),
-        ("prestateTracer+diff", json!({"tracer": "prestateTracer", "tracerConfig": {"diffMode": true}})),
+        (
+            "prestateTracer+diff",
+            json!({"tracer": "prestateTracer", "tracerConfig": {"diffMode": true}}),
+        ),
     ];
 
     for (name, opts) in &tracers {

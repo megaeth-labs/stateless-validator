@@ -13,15 +13,15 @@ use std::{
     collections::HashSet,
     hash::RandomState,
     sync::{
-        Arc,
         atomic::{AtomicU64, Ordering},
+        Arc,
     },
 };
 
 use alloy_primitives::B256;
 use alloy_rpc_types_trace::geth::GethDebugTracingOptions;
 use dashmap::DashMap;
-use quick_cache::{Lifecycle, Weighter, sync::Cache};
+use quick_cache::{sync::Cache, Lifecycle, Weighter};
 use tracing::{debug, trace};
 
 // ---------------------------------------------------------------------------
@@ -372,6 +372,30 @@ impl ResponseCache {
         result.map(|r| r.as_value())
     }
 
+    /// Retrieves a cached response by block hash.
+    ///
+    /// First looks up the block number from the hash->number index,
+    /// then retrieves the cached response.
+    pub fn get_by_hash(
+        &self,
+        resource: CachedResource,
+        block_hash: B256,
+        variant: ResponseVariant,
+    ) -> Option<(serde_json::Value, u64)> {
+        // Look up block number from hash
+        let block_number = self.inner.indices.hash_to_number.get(&block_hash)?;
+        let block_number = *block_number;
+
+        let key = ResponseCacheKey::new(resource, block_number, variant);
+        let result = self.inner.cache.get(&key);
+        if result.is_some() {
+            self.inner.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.inner.misses.fetch_add(1, Ordering::Relaxed);
+        }
+        result.map(|r| (r.as_value(), block_number))
+    }
+
     /// Inserts a response into the cache and updates secondary indices.
     #[allow(dead_code)] // Used in tests
     pub fn insert(
@@ -408,6 +432,7 @@ impl ResponseCache {
     /// This is the primary entry point for cache usage. If a response is already cached,
     /// it returns immediately. Otherwise, it computes the response and caches it.
     /// Concurrent requests for the same key will wait for the first computation to complete.
+    #[allow(dead_code)] // May be used in future when timing isn't needed
     pub async fn get_or_compute<F, Fut, E>(
         &self,
         resource: CachedResource,
@@ -639,11 +664,9 @@ mod tests {
         cache.invalidate_blocks(&[block_hash]);
 
         assert_eq!(cache.len(), 0);
-        assert!(
-            cache
-                .get(CachedResource::DebugTraceBlock, 100, variant)
-                .is_none()
-        );
+        assert!(cache
+            .get(CachedResource::DebugTraceBlock, 100, variant)
+            .is_none());
     }
 
     #[tokio::test]
@@ -744,11 +767,7 @@ mod tests {
             100,
             ResponseVariant::Default,
         );
-        let key3 = ResponseCacheKey::new(
-            CachedResource::TraceBlock,
-            100,
-            ResponseVariant::Default,
-        );
+        let key3 = ResponseCacheKey::new(CachedResource::TraceBlock, 100, ResponseVariant::Default);
 
         let mut set = HashSet::new();
         set.insert(key1.clone());
@@ -795,11 +814,26 @@ mod tests {
 
     #[test]
     fn test_tracer_type_all_variants() {
-        assert_eq!(TracerType::parse("callTracer"), Some(TracerType::CallTracer));
-        assert_eq!(TracerType::parse("prestateTracer"), Some(TracerType::PrestateTracer));
-        assert_eq!(TracerType::parse("4byteTracer"), Some(TracerType::FourByteTracer));
-        assert_eq!(TracerType::parse("noopTracer"), Some(TracerType::NoopTracer));
-        assert_eq!(TracerType::parse("flatCallTracer"), Some(TracerType::FlatCallTracer));
+        assert_eq!(
+            TracerType::parse("callTracer"),
+            Some(TracerType::CallTracer)
+        );
+        assert_eq!(
+            TracerType::parse("prestateTracer"),
+            Some(TracerType::PrestateTracer)
+        );
+        assert_eq!(
+            TracerType::parse("4byteTracer"),
+            Some(TracerType::FourByteTracer)
+        );
+        assert_eq!(
+            TracerType::parse("noopTracer"),
+            Some(TracerType::NoopTracer)
+        );
+        assert_eq!(
+            TracerType::parse("flatCallTracer"),
+            Some(TracerType::FlatCallTracer)
+        );
         assert_eq!(TracerType::parse("unknown"), None);
     }
 
@@ -807,7 +841,10 @@ mod tests {
     fn test_response_cache_config_default() {
         let config = ResponseCacheConfig::default();
         assert_eq!(config.max_bytes, DEFAULT_RESPONSE_CACHE_MAX_BYTES);
-        assert_eq!(config.estimated_items, DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS);
+        assert_eq!(
+            config.estimated_items,
+            DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS
+        );
     }
 
     #[tokio::test]
