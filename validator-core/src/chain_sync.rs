@@ -3,7 +3,11 @@
 //! This module provides shared chain synchronization logic used by both
 //! stateless-validator and debug-trace-server.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::Duration,
+};
 
 use alloy_primitives::B256;
 use alloy_rpc_types_eth::{Block, BlockId};

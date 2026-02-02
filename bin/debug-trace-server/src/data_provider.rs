@@ -76,23 +76,20 @@ impl DataProvider {
     /// Creates a new data provider.
     ///
     /// # Arguments
-    /// * `rpc_endpoint` - Upstream RPC endpoint for fetching blocks and contracts
-    /// * `witness_endpoint` - Upstream witness endpoint for fetching SALT witness data
+    /// * `rpc_client` - RPC client for upstream data fetching
     /// * `validator_db` - Optional local database for cached block data
     /// * `witness_timeout_secs` - Timeout in seconds for witness fetch retry
     pub fn new(
-        rpc_endpoint: &str,
-        witness_endpoint: &str,
+        rpc_client: Arc<RpcClient>,
         validator_db: Option<Arc<ValidatorDB>>,
         witness_timeout_secs: u64,
-    ) -> eyre::Result<Self> {
-        let rpc_client = Arc::new(RpcClient::new(rpc_endpoint, witness_endpoint)?);
-        Ok(Self {
+    ) -> Self {
+        Self {
             rpc_client,
             validator_db,
             witness_timeout: Duration::from_secs(witness_timeout_secs),
             in_flight: DashMap::new(),
-        })
+        }
     }
 
     /// Gets block data by block number.
@@ -117,7 +114,7 @@ impl DataProvider {
         // Fall back to RPC - fetch block to get hash, then delegate to get_block_data_by_hash
         let block = self
             .rpc_client
-            .get_block_unchecked(BlockId::Number(BlockNumberOrTag::Number(block_num)), false)
+            .get_block(BlockId::Number(BlockNumberOrTag::Number(block_num)), false)
             .await?;
 
         self.get_block_data_by_hash(block.header.hash).await
@@ -234,7 +231,7 @@ impl DataProvider {
                 // Fetch the block from upstream RPC to resolve the tag
                 let block = self
                     .rpc_client
-                    .get_block_unchecked(BlockId::Number(tag), false)
+                    .get_block(BlockId::Number(tag), false)
                     .await?;
                 Ok(block.header.number)
             }
@@ -332,7 +329,7 @@ impl DataProvider {
         // Fetch block without transactions first to get the number
         let block = self
             .rpc_client
-            .get_block_unchecked(BlockId::Hash(block_hash.into()), false)
+            .get_block(BlockId::Hash(block_hash.into()), false)
             .await?;
 
         // Fetch witness with retry
@@ -343,7 +340,7 @@ impl DataProvider {
         // Fetch block with full transactions
         let block = self
             .rpc_client
-            .get_block_unchecked(BlockId::Hash(block_hash.into()), true)
+            .get_block(BlockId::Hash(block_hash.into()), true)
             .await?;
 
         // Extract code hashes and fetch contracts

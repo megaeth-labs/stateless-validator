@@ -52,7 +52,8 @@ use tokio::task;
 use tracing::{debug, error, info, instrument, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use validator_core::{
-    chain_spec::ChainSpec, remote_chain_tracker, ChainSyncConfig, RpcClient, ValidatorDB,
+    chain_spec::ChainSpec, remote_chain_tracker, ChainSyncConfig, RpcClient, RpcClientConfig,
+    ValidatorDB,
 };
 
 mod data_provider;
@@ -208,15 +209,18 @@ async fn main() -> Result<()> {
     }
 
     // Initialize components
-    let rpc_client = Arc::new(RpcClient::new(&args.rpc_endpoint, &args.witness_endpoint)?);
+    let rpc_client = Arc::new(RpcClient::new_with_config(
+        &args.rpc_endpoint,
+        &args.witness_endpoint,
+        RpcClientConfig::trace_server(),
+    )?);
     let validator_db = init_validator_db(&args, &rpc_client).await?;
 
     let data_provider = Arc::new(DataProvider::new(
-        &args.rpc_endpoint,
-        &args.witness_endpoint,
+        rpc_client.clone(),
         validator_db.clone(),
         args.witness_timeout,
-    )?);
+    ));
 
     let chain_spec = load_chain_spec(&args)?;
 

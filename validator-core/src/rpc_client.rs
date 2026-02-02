@@ -17,6 +17,31 @@ use serde::{Deserialize, Serialize};
 
 use crate::{executor::verify_block_integrity, withdrawals::MptWitness};
 
+/// Configuration for RPC client behavior.
+#[derive(Debug, Clone, Default)]
+pub struct RpcClientConfig {
+    /// Skip ECDSA signature verification and block hash verification.
+    /// Enable for trusted data sources (e.g., debug-trace-server fetching from upstream RPC)
+    /// where integrity checks are unnecessary overhead.
+    pub skip_block_verification: bool,
+}
+
+impl RpcClientConfig {
+    /// Creates a config for validation mode (full verification).
+    pub fn validator() -> Self {
+        Self {
+            skip_block_verification: false,
+        }
+    }
+
+    /// Creates a config for trace/debug mode (skip verification).
+    pub fn trace_server() -> Self {
+        Self {
+            skip_block_verification: true,
+        }
+    }
+}
+
 /// Response from mega_setValidatedBlocks RPC call
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,6 +59,8 @@ pub struct RpcClient {
     pub data_provider: RootProvider<Optimism>,
     /// Witness provider for fetching SALT witness data.
     pub witness_provider: RootProvider,
+    /// Configuration controlling verification behavior
+    config: RpcClientConfig,
 }
 
 impl RpcClient {
@@ -43,12 +70,32 @@ impl RpcClient {
     /// * `data_api` - HTTP URL of the standard JSON-RPC endpoint for blocks and contract data
     /// * `witness_api` - HTTP URL of the witness RPC endpoint for SALT witness data
     pub fn new(data_api: &str, witness_api: &str) -> Result<Self> {
+        Self::new_with_config(data_api, witness_api, RpcClientConfig::default())
+    }
+
+    /// Creates a new RPC client with custom configuration.
+    ///
+    /// # Arguments
+    /// * `data_api` - HTTP URL of the standard JSON-RPC endpoint for blocks and contract data
+    /// * `witness_api` - HTTP URL of the witness RPC endpoint for SALT witness data
+    /// * `config` - Configuration controlling verification and transport behavior
+    pub fn new_with_config(
+        data_api: &str,
+        witness_api: &str,
+        config: RpcClientConfig,
+    ) -> Result<Self> {
         Ok(Self {
             data_provider: ProviderBuilder::<_, _, Optimism>::default()
                 .connect_http(data_api.parse().context("Failed to parse API URL")?),
             witness_provider: ProviderBuilder::default()
                 .connect_http(witness_api.parse().context("Failed to parse API URL")?),
+            config,
         })
+    }
+
+    /// Returns whether block verification is skipped.
+    pub fn skip_block_verification(&self) -> bool {
+        self.config.skip_block_verification
     }
 
     /// Gets contract bytecode for a code hash.
@@ -62,10 +109,13 @@ impl RpcClient {
 
     /// Gets a block by its identifier with optional transaction details.
     ///
-    /// Performs data integrity checks on the returned block.
+    /// If `skip_block_verification` is enabled in config, skips integrity checks.
+    /// Otherwise performs ECDSA signature and block hash verification.
     pub async fn get_block(&self, block_id: BlockId, full_txs: bool) -> Result<Block<Transaction>> {
         let block = self.get_block_unchecked(block_id, full_txs).await?;
-        verify_block_integrity(&block)?;
+        if !self.config.skip_block_verification {
+            verify_block_integrity(&block)?;
+        }
         Ok(block)
     }
 
