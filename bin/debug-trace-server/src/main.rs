@@ -130,10 +130,32 @@ struct Args {
         default_value_t = DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS
     )]
     response_cache_estimated_items: usize,
+
+    /// Number of recent blocks to retain in database (older blocks are pruned).
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_BLOCKS_TO_KEEP",
+        default_value_t = DEFAULT_BLOCKS_TO_KEEP
+    )]
+    blocks_to_keep: u64,
+
+    /// Interval between database pruning cycles in seconds.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_PRUNER_INTERVAL_SECS",
+        default_value_t = DEFAULT_PRUNER_INTERVAL_SECS
+    )]
+    pruner_interval_secs: u64,
 }
 
 /// Database filename for the validator's local storage.
 const VALIDATOR_DB_FILENAME: &str = "validator.redb";
+
+/// Default number of blocks to keep in database.
+const DEFAULT_BLOCKS_TO_KEEP: u64 = 1000;
+
+/// Default pruner interval in seconds (5 minutes).
+const DEFAULT_PRUNER_INTERVAL_SECS: u64 = 300;
 
 /// Parses a hex string into a BlockHash.
 fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
@@ -233,6 +255,13 @@ async fn main() -> Result<()> {
                 }
             }),
         ));
+
+        // Spawn history pruner to prevent unbounded database growth
+        task::spawn(history_pruner(
+            Arc::clone(db),
+            args.blocks_to_keep,
+            args.pruner_interval_secs,
+        ));
     }
 
     // Create RPC context and module
@@ -270,12 +299,18 @@ async fn init_validator_db(
     let work_dir = PathBuf::from(data_dir);
     let db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
 
-    // Handle optional start block initialization
-    if let Some(start_block_str) = &args.start_block {
-        debug!(start_block = %start_block_str, "Initializing from start block");
+    // Check if we already have a local tip
+    if db.get_local_tip()?.is_some() {
+        debug!("Continuing from existing canonical chain");
+        return Ok(Some(db));
+    }
 
+    // No local tip - need to initialize anchor block
+    // Use explicit start_block if provided, otherwise fetch latest
+    let block = if let Some(start_block_str) = &args.start_block {
+        debug!(start_block = %start_block_str, "Initializing from specified start block");
         let block_hash = parse_block_hash(start_block_str)?;
-        let block = loop {
+        loop {
             match rpc_client
                 .get_block(BlockId::Hash(block_hash.into()), false)
                 .await
@@ -290,31 +325,37 @@ async fn init_validator_db(
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
-        };
-
-        db.reset_anchor_block(
-            block.header.number,
-            block.header.hash,
-            block.header.state_root,
-            block
-                .header
-                .withdrawals_root
-                .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", block_hash))?,
-        )
-        .map_err(|e| anyhow!("Failed to reset anchor: {}", e))?;
-
-        info!(
-            block_hash = %block.header.hash,
-            block_number = block.header.number,
-            "Anchor block initialized"
-        );
+        }
     } else {
-        ensure!(
-            db.get_local_tip()?.is_some(),
-            "No trusted starting point found. Specify a trusted block with --start-block <blockhash>"
-        );
-        debug!("Continuing from existing canonical chain");
-    }
+        // Auto-initialize from latest block
+        info!("No local tip found, fetching latest block as anchor");
+        loop {
+            match rpc_client.get_block(BlockId::latest(), false).await {
+                Ok(block) => break block,
+                Err(e) => {
+                    warn!(%e, "Failed to fetch latest block, retrying");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    };
+
+    db.reset_anchor_block(
+        block.header.number,
+        block.header.hash,
+        block.header.state_root,
+        block
+            .header
+            .withdrawals_root
+            .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", block.header.hash))?,
+    )
+    .map_err(|e| anyhow!("Failed to reset anchor: {}", e))?;
+
+    info!(
+        block_hash = %block.header.hash,
+        block_number = block.header.number,
+        "Anchor block initialized"
+    );
 
     Ok(Some(db))
 }
@@ -329,5 +370,40 @@ fn load_chain_spec(args: &Args) -> Result<Arc<ChainSpec>> {
     } else {
         debug!("Using default chain spec");
         Ok(Arc::new(ChainSpec::default()))
+    }
+}
+
+/// Background task that periodically prunes old block data to prevent unbounded database growth.
+///
+/// Runs in an infinite loop, removing blocks older than `blocks_to_keep` from the current tip.
+async fn history_pruner(
+    validator_db: Arc<ValidatorDB>,
+    blocks_to_keep: u64,
+    interval_secs: u64,
+) -> Result<()> {
+    let interval = std::time::Duration::from_secs(interval_secs);
+    info!(
+        blocks_to_keep = blocks_to_keep,
+        interval_secs = interval_secs,
+        "Starting history pruner"
+    );
+
+    loop {
+        if let Ok(Some((current_tip, _))) = validator_db.get_local_tip() {
+            let prune_before = current_tip.saturating_sub(blocks_to_keep);
+            match validator_db.prune_history(prune_before) {
+                Ok(blocks_pruned) if blocks_pruned > 0 => {
+                    debug!(
+                        blocks_pruned = blocks_pruned,
+                        prune_before = prune_before,
+                        "Pruned old blocks from database"
+                    );
+                }
+                Err(e) => warn!(%e, "Failed to prune old block data"),
+                _ => {}
+            }
+        }
+
+        tokio::time::sleep(interval).await;
     }
 }
