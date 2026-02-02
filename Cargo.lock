@@ -2892,8 +2892,8 @@ dependencies = [
 
 [[package]]
 name = "mega-evm"
-version = "1.3.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=v1.3.1#29051039e1b80a2cef0743fc8262b7aae66153ae"
+version = "1.3.2"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=v1.3.2#2178906e35b085ffd2e96aa9895a423c1ca57255"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -2919,8 +2919,8 @@ dependencies = [
 
 [[package]]
 name = "mega-system-contracts"
-version = "1.3.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=v1.3.1#29051039e1b80a2cef0743fc8262b7aae66153ae"
+version = "1.3.2"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=v1.3.2#2178906e35b085ffd2e96aa9895a423c1ca57255"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -5020,7 +5020,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stateless-validator"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "alloy-genesis",
  "alloy-primitives",
@@ -5566,7 +5566,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "validator-core"
-version = "2.0.5"
+version = "2.0.6"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
