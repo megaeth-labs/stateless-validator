@@ -43,7 +43,7 @@
 use std::{path::PathBuf, sync::Arc};
 
 use alloy_genesis::Genesis;
-use alloy_primitives::{BlockHash, hex};
+use alloy_primitives::{B256, BlockHash, hex};
 use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::{Result, anyhow, ensure};
@@ -192,7 +192,7 @@ async fn main() -> Result<()> {
     let data_provider = Arc::new(DataProvider::new(
         &args.rpc_endpoint,
         &args.witness_endpoint,
-        validator_db,
+        validator_db.clone(),
         args.witness_timeout,
     )?);
 
@@ -208,6 +208,32 @@ async fn main() -> Result<()> {
         estimated_items = args.response_cache_estimated_items,
         "Response cache initialized"
     );
+
+    // Spawn background chain tracker with reorg callback (if database is configured)
+    if let Some(db) = &validator_db {
+        let config = Arc::new(ChainSyncConfig::default());
+        debug!(
+            lookahead_blocks = config.tracker_lookahead_blocks,
+            "Starting chain sync tracker"
+        );
+
+        // Clone response_cache for the callback
+        let cache_for_reorg = response_cache.clone();
+        task::spawn(remote_chain_tracker(
+            Arc::clone(&rpc_client),
+            Arc::clone(db),
+            config,
+            Some(move |reverted_hashes: &[B256]| {
+                if !reverted_hashes.is_empty() {
+                    tracing::info!(
+                        count = reverted_hashes.len(),
+                        "Invalidating response cache for reorged blocks"
+                    );
+                    cache_for_reorg.invalidate_blocks(reverted_hashes);
+                }
+            }),
+        ));
+    }
 
     // Create RPC context and module
     let ctx = RpcContext::new(data_provider, chain_spec, response_cache);
@@ -229,6 +255,8 @@ async fn main() -> Result<()> {
 }
 
 /// Initializes the validator database if data_dir is provided.
+/// Returns the database if configured, None otherwise.
+/// Note: Chain tracker is spawned separately in main() to allow passing the response cache callback.
 async fn init_validator_db(
     args: &Args,
     rpc_client: &Arc<RpcClient>,
@@ -287,19 +315,6 @@ async fn init_validator_db(
         );
         debug!("Continuing from existing canonical chain");
     }
-
-    // Spawn background chain tracker
-    let config = Arc::new(ChainSyncConfig::default());
-    debug!(
-        lookahead_blocks = config.tracker_lookahead_blocks,
-        "Starting chain sync tracker"
-    );
-    task::spawn(remote_chain_tracker(
-        Arc::clone(rpc_client),
-        Arc::clone(&db),
-        config,
-        None::<fn(u64)>,
-    ));
 
     Ok(Some(db))
 }

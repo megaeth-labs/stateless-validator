@@ -468,7 +468,6 @@ impl ResponseCache {
     }
 
     /// Invalidates all cache entries for the given block hashes (used during reorgs).
-    #[allow(dead_code)] // Used in tests and for future reorg handling
     pub fn invalidate_blocks(&self, block_hashes: &[B256]) {
         let mut invalidated_count = 0;
 

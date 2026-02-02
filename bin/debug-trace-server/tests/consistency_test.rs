@@ -1019,8 +1019,8 @@ fn test_transaction_level_consistency() {
     );
 }
 
-/// Test cache management RPC methods (debug_setCacheSize, debug_getCacheStatus).
-/// This test is skipped if the server doesn't support these methods.
+/// Test cache management RPC methods (debug_getCacheStatus).
+/// This test verifies the cache status reporting works correctly.
 #[test]
 #[ignore]
 fn test_cache_management() {
@@ -1055,68 +1055,48 @@ fn test_cache_management() {
 
     if let Some(result) = &resp.result {
         println!("    Cache status: {}", result);
+
+        // Verify responseCache object exists and has expected fields
+        let cache = result.get("responseCache");
         assert!(
-            result.get("maxSize").is_some(),
-            "Cache status should have maxSize"
+            cache.is_some(),
+            "Cache status should have responseCache object"
         );
+
+        let cache = cache.unwrap();
         assert!(
-            result.get("entryCount").is_some(),
+            cache.get("entryCount").is_some(),
             "Cache status should have entryCount"
         );
+        assert!(
+            cache.get("totalBytes").is_some(),
+            "Cache status should have totalBytes"
+        );
+        assert!(
+            cache.get("hits").is_some(),
+            "Cache status should have hits"
+        );
+        assert!(
+            cache.get("misses").is_some(),
+            "Cache status should have misses"
+        );
+        assert!(
+            cache.get("hitRate").is_some(),
+            "Cache status should have hitRate"
+        );
+
         println!("    ✓ debug_getCacheStatus works correctly");
+        println!(
+            "    Entries: {}, Hits: {}, Misses: {}, Hit Rate: {}",
+            cache.get("entryCount").unwrap(),
+            cache.get("hits").unwrap(),
+            cache.get("misses").unwrap(),
+            cache.get("hitRate").unwrap()
+        );
     } else {
         println!("    ⚠ debug_getCacheStatus returned no result");
         println!("    Skipping cache management tests (server may not support these methods)");
         return;
-    }
-
-    // Test debug_setCacheSize
-    println!("\n  Testing debug_setCacheSize...");
-    let new_size = 256u64;
-    let resp = match debug_trace_server.call("debug_setCacheSize", json!([new_size])) {
-        Ok(r) => r,
-        Err(e) => {
-            println!("    ⚠ debug_setCacheSize failed: {}", e);
-            return;
-        }
-    };
-
-    if resp.error.is_some() {
-        println!("    ⚠ debug_setCacheSize returned error: {:?}", resp.error);
-        return;
-    }
-
-    if let Some(result) = &resp.result {
-        println!("    Set cache size response: {}", result);
-        assert!(
-            result.get("success").and_then(|v| v.as_bool()) == Some(true),
-            "debug_setCacheSize should return success: true"
-        );
-        assert!(
-            result.get("newSize").and_then(|v| v.as_u64()) == Some(new_size),
-            "debug_setCacheSize should return the new size"
-        );
-        println!("    ✓ debug_setCacheSize works correctly");
-    } else {
-        println!("    ⚠ debug_setCacheSize returned no result");
-        return;
-    }
-
-    // Verify the new size is applied
-    println!("\n  Verifying new cache size...");
-    let resp = debug_trace_server
-        .call("debug_getCacheStatus", json!([]))
-        .expect("debug_getCacheStatus failed");
-
-    if let Some(result) = &resp.result {
-        let max_size = result.get("maxSize").and_then(|v| v.as_u64());
-        assert_eq!(
-            max_size,
-            Some(new_size),
-            "Cache maxSize should be updated to {}",
-            new_size
-        );
-        println!("    ✓ Cache size updated correctly to {}", new_size);
     }
 
     println!("\n✓ All cache management tests passed!");

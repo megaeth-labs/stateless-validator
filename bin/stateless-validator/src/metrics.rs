@@ -5,6 +5,7 @@
 
 use std::net::SocketAddr;
 
+use alloy_primitives::B256;
 use eyre::Result;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -149,9 +150,9 @@ pub fn set_chain_heights(local: u64, remote: u64) {
     gauge!(names::VALIDATION_LAG).set((remote.saturating_sub(local)) as f64);
 }
 
-pub fn on_chain_reorg(depth: u64) {
+pub fn on_chain_reorg(reverted_hashes: &[B256]) {
     counter!(names::REORGS_DETECTED).increment(1);
-    histogram!(names::REORG_DEPTH).record(depth as f64);
+    histogram!(names::REORG_DEPTH).record(reverted_hashes.len() as f64);
 }
 
 /// RPC method types for metrics tracking.

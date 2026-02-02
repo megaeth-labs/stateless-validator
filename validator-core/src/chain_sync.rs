@@ -5,6 +5,7 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use alloy_primitives::B256;
 use alloy_rpc_types_eth::{Block, BlockId};
 use eyre::{Result, anyhow};
 use futures::future;
@@ -79,6 +80,8 @@ pub struct FetchResult {
     pub had_error: bool,
     /// Number of blocks rolled back due to reorg (0 if no reorg).
     pub reorg_depth: u64,
+    /// Block hashes that were reverted due to reorg (empty if no reorg).
+    pub reverted_hashes: Vec<B256>,
 }
 
 /// Fetches a batch of blocks from RPC and stores them in the database.
@@ -132,12 +135,22 @@ pub async fn fetch_blocks_batch(
                     warn!(
                         "[ChainSync] Rolling back to block {rollback_to} (reorg depth: {reorg_depth})"
                     );
+
+                    // Collect block hashes before rollback for cache invalidation
+                    let mut reverted_hashes = Vec::with_capacity(reorg_depth as usize);
+                    for block_num in (rollback_to + 1)..=remote_tip.0 {
+                        if let Ok(Some(hash)) = validator_db.get_block_hash(block_num) {
+                            reverted_hashes.push(hash);
+                        }
+                    }
+
                     validator_db.rollback_chain(rollback_to)?;
                     return Ok(FetchResult {
                         blocks_fetched: 0,
                         should_wait: false,
                         had_error: false,
                         reorg_depth,
+                        reverted_hashes,
                     });
                 }
                 Err(e) => {
@@ -160,6 +173,7 @@ pub async fn fetch_blocks_batch(
             should_wait: true,
             had_error: false,
             reorg_depth: 0,
+            reverted_hashes: Vec::new(),
         });
     }
 
@@ -177,6 +191,7 @@ pub async fn fetch_blocks_batch(
             should_wait: true,
             had_error: false,
             reorg_depth: 0,
+            reverted_hashes: Vec::new(),
         });
     }
 
@@ -257,6 +272,7 @@ pub async fn fetch_blocks_batch(
         should_wait: false,
         had_error,
         reorg_depth: 0,
+        reverted_hashes: Vec::new(),
     })
 }
 
@@ -270,7 +286,7 @@ pub async fn fetch_blocks_batch(
 /// * `client` - RPC client for fetching blocks from remote blockchain
 /// * `validator_db` - Database interface for chain management
 /// * `config` - Configuration for tracker behavior
-/// * `on_reorg` - Optional callback invoked when a chain reorg is detected, receives reorg depth
+/// * `on_reorg` - Optional callback invoked when a chain reorg is detected, receives reverted block hashes
 ///
 /// # Returns
 /// * Never returns under normal operation - runs indefinitely until externally terminated
@@ -281,7 +297,7 @@ pub async fn remote_chain_tracker<F>(
     on_reorg: Option<F>,
 ) -> Result<()>
 where
-    F: Fn(u64) + Send + Sync,
+    F: Fn(&[B256]) + Send + Sync,
 {
     tracing::info!(
         "[ChainSync] Starting remote chain tracker with {} block lookahead",
@@ -295,10 +311,10 @@ where
         match fetch_blocks_batch(&client, &validator_db, &config, &mut block_error_counts).await {
             Ok(result) => {
                 // Call reorg callback if a reorg occurred
-                if result.reorg_depth > 0
+                if !result.reverted_hashes.is_empty()
                     && let Some(ref callback) = on_reorg
                 {
-                    callback(result.reorg_depth);
+                    callback(&result.reverted_hashes);
                 }
 
                 if result.had_error {
