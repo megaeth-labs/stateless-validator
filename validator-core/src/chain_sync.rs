@@ -47,6 +47,10 @@ pub struct ChainSyncConfig {
     pub metrics_enabled: bool,
     /// Port for Prometheus metrics HTTP endpoint.
     pub metrics_port: u16,
+    /// Auto-advance local tip when fetching blocks (skip validation).
+    /// Enable for debug-trace-server where blocks are trusted from upstream RPC.
+    /// Disable for stateless-validator where validation workers advance the tip.
+    pub auto_advance_local_tip: bool,
 }
 
 impl Default for ChainSyncConfig {
@@ -65,6 +69,7 @@ impl Default for ChainSyncConfig {
             report_validation_results: false,
             metrics_enabled: false,
             metrics_port: DEFAULT_METRICS_PORT,
+            auto_advance_local_tip: false,
         }
     }
 }
@@ -278,6 +283,18 @@ pub async fn fetch_blocks_batch(
     // Add successfully fetched headers to remote chain
     validator_db.add_validation_tasks(&tasks)?;
     validator_db.grow_remote_chain(tasks.iter().map(|(block, _, _)| &block.header))?;
+
+    // Auto-advance local tip if configured (for debug-trace-server mode)
+    // This skips validation and trusts blocks from upstream RPC
+    if config.auto_advance_local_tip && fetched_count > 0 {
+        for _ in 0..fetched_count {
+            validator_db.promote_remote_to_canonical()?;
+        }
+        debug!(
+            new_local_tip = start_block + fetched_count - 1,
+            "Auto-advanced local tip"
+        );
+    }
 
     Ok(FetchResult {
         blocks_fetched: fetched_count,

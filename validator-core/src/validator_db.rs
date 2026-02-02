@@ -636,6 +636,60 @@ impl ValidatorDB {
         Ok(())
     }
 
+    /// Promotes the first block from the remote chain to the canonical chain without validation.
+    ///
+    /// This is used by debug-trace-server where blocks are trusted from the upstream RPC
+    /// and don't need local validation. Unlike `grow_local_chain`, this method doesn't
+    /// require validation results to exist.
+    ///
+    /// # Returns
+    /// * `Ok(true)` - Block was successfully promoted
+    /// * `Ok(false)` - Remote chain is empty, nothing to promote
+    pub fn promote_remote_to_canonical(&self) -> ValidationDbResult<bool> {
+        let write_txn = self.database.begin_write()?;
+        {
+            let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
+            let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
+            let block_data = write_txn.open_table(BLOCK_DATA)?;
+
+            // Get first block from remote chain
+            let Some(first_entry) = remote_chain.first()? else {
+                return Ok(false);
+            };
+            let block_number = first_entry.0.value();
+            let block_hash_bytes = first_entry.1.value();
+            // Drop the borrow before mutating
+            drop(first_entry);
+
+            // Get state roots from block data (if available)
+            let (post_state_root, post_withdrawals_root) =
+                if let Some(data) = block_data.get(block_hash_bytes)? {
+                    // Parse block to get state_root and withdrawals_root from header
+                    let block = decode_block_from_slice(&data.value());
+                    (
+                        block.header.state_root.0,
+                        block
+                            .header
+                            .withdrawals_root
+                            .map(|r| r.0)
+                            .unwrap_or([0u8; 32]),
+                    )
+                } else {
+                    // Fallback to zeros if block data doesn't exist
+                    ([0u8; 32], [0u8; 32])
+                };
+
+            // Move block from remote to canonical chain
+            canonical_chain.insert(
+                block_number,
+                (block_hash_bytes, post_state_root, post_withdrawals_root),
+            )?;
+            remote_chain.remove(block_number)?;
+        }
+        write_txn.commit()?;
+        Ok(true)
+    }
+
     /// Rolls back the local chain view in response to chain reorg
     ///
     /// Removes blocks from both the remote chain and canonical chain when a reorg

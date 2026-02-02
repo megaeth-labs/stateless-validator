@@ -233,9 +233,14 @@ async fn main() -> Result<()> {
 
     // Spawn background chain tracker with reorg callback (if database is configured)
     if let Some(db) = &validator_db {
-        let config = Arc::new(ChainSyncConfig::default());
+        let config = Arc::new(ChainSyncConfig {
+            // Auto-advance local tip since we don't run validation workers
+            auto_advance_local_tip: true,
+            ..ChainSyncConfig::default()
+        });
         debug!(
             lookahead_blocks = config.tracker_lookahead_blocks,
+            auto_advance = config.auto_advance_local_tip,
             "Starting chain sync tracker"
         );
 
