@@ -35,8 +35,10 @@ const VALIDATOR_DB_FILENAME: &str = "validator.redb";
 /// Initialize logging system with environment variable configuration
 ///
 /// Supports the following environment variables:
-/// - STATELESS_VALIDATOR_LOG_FILE_DIRECTORY: Directory for log files (optional, file logging disabled if not set)
-/// - STATELESS_VALIDATOR_LOG_FILE: Log level for file output (debug/info/warn/error), default: debug
+/// - STATELESS_VALIDATOR_LOG_FILE_DIRECTORY: Directory for log files (optional, file logging
+///   disabled if not set)
+/// - STATELESS_VALIDATOR_LOG_FILE: Log level for file output (debug/info/warn/error), default:
+///   debug
 /// - STATELESS_VALIDATOR_LOG_STDOUT: Log level for stdout (debug/info/warn/error), default: info
 fn init_logging() -> Result<()> {
     use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -367,7 +369,8 @@ async fn run() -> Result<()> {
 /// Implements a multi-phase startup process for stateless block validation:
 /// 1. **Task Recovery** - Recovers interrupted validation tasks from previous crashes
 /// 2. **Remote Chain Tracking** - Spawns background tracker to maintain block lookahead
-/// 3. **Validation Reporter** - Optionally spawns background task to report validation results to upstream node (when enabled)
+/// 3. **Validation Reporter** - Optionally spawns background task to report validation results to
+///    upstream node (when enabled)
 /// 4. **History Pruning** - Spawns background pruner to manage storage overhead
 /// 5. **Validation Workers** - Spawns configured number of parallel validation workers
 /// 6. **Main Sync Loop** - Continuously advances canonical chain as blocks are validated
@@ -378,7 +381,8 @@ async fn run() -> Result<()> {
 /// # Arguments
 /// * `client` - RPC client for communicating with remote blockchain node
 /// * `validator_db` - Database interface for task coordination and chain state management
-/// * `config` - Configuration including worker count, polling intervals, optional sync target, and validation reporting
+/// * `config` - Configuration including worker count, polling intervals, optional sync target, and
+///   validation reporting
 /// * `chain_spec` - Chain specification defining the EVM rules and parameters
 ///
 /// # Returns
@@ -496,10 +500,10 @@ async fn chain_sync(
             //
             // 3. ValidationDbError::MissingData
             //    - Block data, witness, or validation result not found in database
-            //    - This should NEVER occur in normal operation because block data and witnesses
-            //      are written atomically during validation
-            //    - If this occurs, it indicates either a bug in the validation pipeline or
-            //      database corruption
+            //    - This should NEVER occur in normal operation because block data and witnesses are
+            //      written atomically during validation
+            //    - If this occurs, it indicates either a bug in the validation pipeline or database
+            //      corruption
             //
             // 4. ValidationDbError::ValidationResultMismatch
             //    - Validation result does not match the first remote chain entry
@@ -794,7 +798,8 @@ async fn validate_one(
                 "Withdrawals root not found in block {block_hash}"
             ))?;
 
-            // Validate in a blocking thread so async tasks (reporter, tracker, etc.) stay responsive.
+            // Validate in a blocking thread so async tasks (reporter, tracker, etc.) stay
+            // responsive.
             let validation_result = task::spawn_blocking(move || {
                 validate_block(&chain_spec, &block, witness, mpt_witness, &contracts, None)
             })
@@ -854,8 +859,8 @@ async fn validate_one(
 ///
 /// # Returns
 /// * `Ok(())` - Never returns under normal operation
-/// * `Err(eyre::Error)` - Terminates if validation gap detected (upstream's last validated
-///   block < local chain start)
+/// * `Err(eyre::Error)` - Terminates if validation gap detected (upstream's last validated block <
+///   local chain start)
 async fn validation_reporter(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,

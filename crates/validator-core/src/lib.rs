@@ -5,7 +5,8 @@
 //!
 //! ## Key Components
 //!
-//! - **BlockFileManager**: Centralized file management for validation, witness, and backup operations
+//! - **BlockFileManager**: Centralized file management for validation, witness, and backup
+//!   operations
 //! - **Validation Logic**: Core validation algorithms for stateless operation
 //!
 //! ## Modules

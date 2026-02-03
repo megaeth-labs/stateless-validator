@@ -6,10 +6,10 @@
 //!
 //! ## Key Functions
 //!
-//! - [`validate_block`]: Main validation entry point that orchestrates witness
-//!   verification, transaction replay, and state root comparison
-//! - [`create_evm_env`]: Creates EVM execution environment from block header and
-//!   chain specification
+//! - [`validate_block`]: Main validation entry point that orchestrates witness verification,
+//!   transaction replay, and state root comparison
+//! - [`create_evm_env`]: Creates EVM execution environment from block header and chain
+//!   specification
 //! - [`replay_block`]: Replays block transactions to compute state changes
 //!
 //! ## Validation Process
@@ -428,8 +428,8 @@ where
 /// * `salt_witness` - The salt witness data needed for state validation
 /// * `mpt_witness` - The MPT witness data for withdrawal verification
 /// * `contracts` - Contract bytecode cache for transaction execution
-/// * `writer` - Optional writer for EIP-3155 trace output. When provided, enables
-///   step-by-step EVM execution tracing in EIP-3155 format.
+/// * `writer` - Optional writer for EIP-3155 trace output. When provided, enables step-by-step EVM
+///   execution tracing in EIP-3155 format.
 ///
 /// # Returns
 ///
@@ -601,14 +601,14 @@ pub fn validate_block(
 ///
 /// # Validation Checks
 ///
-/// 1. **Block Hash**: Verifies that the block's header hash matches the computed
-///    hash from the header fields
-/// 2. **Transaction Hashes**: For each transaction, verifies that the transaction
-///    hash matches its computed hash
-/// 3. **Transaction Signers**: Recovers and verifies the signer for each transaction
-///    matches the claimed `from` address
-/// 4. **Transactions Root**: Computes the Merkle root of all transactions and
-///    verifies it matches the `transactions_root` in the block header
+/// 1. **Block Hash**: Verifies that the block's header hash matches the computed hash from the
+///    header fields
+/// 2. **Transaction Hashes**: For each transaction, verifies that the transaction hash matches its
+///    computed hash
+/// 3. **Transaction Signers**: Recovers and verifies the signer for each transaction matches the
+///    claimed `from` address
+/// 4. **Transactions Root**: Computes the Merkle root of all transactions and verifies it matches
+///    the `transactions_root` in the block header
 pub fn verify_block_integrity(block: &Block<OpTransaction>) -> Result<()> {
     // Verify block hash matches the computed hash from header
     ensure!(

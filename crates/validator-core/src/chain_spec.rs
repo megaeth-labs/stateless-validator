@@ -44,12 +44,11 @@ impl ChainSpec {
     /// Creates a new [`ChainSpec`] from a [`Genesis`].
     ///
     /// Ordering rules:
-    /// - [`OpChainSpec`] already yields Optimism/Ethereum hardforks in the correct order, so
-    ///   they do not require reordering.
-    /// - MegaETH hardforks are extracted from the genesis `extra_fields` and explicitly
-    ///   ordered to match the canonical sequence defined by [`MEGA_MAINNET_HARDFORKS`].
-    ///   Any remaining, unknown MegaETH hardforks are preserved and appended after the
-    ///   known ones so nothing is dropped.
+    /// - [`OpChainSpec`] already yields Optimism/Ethereum hardforks in the correct order, so they
+    ///   do not require reordering.
+    /// - MegaETH hardforks are extracted from the genesis `extra_fields` and explicitly ordered to
+    ///   match the canonical sequence defined by [`MEGA_MAINNET_HARDFORKS`]. Any remaining, unknown
+    ///   MegaETH hardforks are preserved and appended after the known ones so nothing is dropped.
     /// - The MegaETH set is then merged with the Optimism/Ethereum set to build a single
     ///   [`ChainHardforks`] that drives fork activation.
     ///
