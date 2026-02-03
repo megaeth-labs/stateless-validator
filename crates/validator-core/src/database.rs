@@ -58,8 +58,8 @@ impl DBErrorMarker for WitnessDatabaseError {}
 /// cryptographic proofs in the witness.
 ///
 /// # Type Parameter
-/// * `W` - The witness type implementing `StateReader`. Can be `salt::Witness` for
-///   standard witnesses or `LightWitnessExecutor` for fast deserialized witnesses.
+/// * `W` - The witness type implementing `StateReader`. Can be `salt::Witness` for standard
+///   witnesses or `LightWitnessExecutor` for fast deserialized witnesses.
 #[derive(Debug)]
 pub struct WitnessDatabase<'a, W> {
     /// The block header containing number, parent hash, and other metadata
@@ -263,10 +263,7 @@ impl WitnessExternalEnv {
             .map(|(key, value)| Self::parse_metadata_entry(key, value))
             .collect::<Result<HashMap<_, _>, _>>()?;
 
-        Ok(Self {
-            block_number,
-            bucket_capacities,
-        })
+        Ok(Self { block_number, bucket_capacities })
     }
 }
 

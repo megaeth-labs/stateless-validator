@@ -67,16 +67,10 @@ impl TestConfig {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3),
             request_timeout: Duration::from_secs(
-                env::var("REQUEST_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(120),
+                env::var("REQUEST_TIMEOUT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(120),
             ),
             private_key: env::var("TEST_PRIVATE_KEY").ok(),
-            tx_send_count: env::var("TX_SEND_COUNT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(6),
+            tx_send_count: env::var("TX_SEND_COUNT").ok().and_then(|s| s.parse().ok()).unwrap_or(6),
         }
     }
 }
@@ -116,23 +110,13 @@ struct RpcClient {
 
 impl RpcClient {
     fn new(url: &str, timeout: Duration) -> Self {
-        let client = Client::builder()
-            .timeout(timeout)
-            .build()
-            .expect("Failed to create HTTP client");
-        Self {
-            client,
-            url: url.to_string(),
-        }
+        let client =
+            Client::builder().timeout(timeout).build().expect("Failed to create HTTP client");
+        Self { client, url: url.to_string() }
     }
 
     fn call(&self, method: &str, params: Value) -> Result<RpcResponse, String> {
-        let request = RpcRequest {
-            jsonrpc: "2.0",
-            method: method.to_string(),
-            params,
-            id: 1,
-        };
+        let request = RpcRequest { jsonrpc: "2.0", method: method.to_string(), params, id: 1 };
 
         self.client
             .post(&self.url)
@@ -162,19 +146,12 @@ impl TransactionSender {
 
         // Get chain ID
         let resp = client.call("eth_chainId", json!([]))?;
-        let chain_id_hex = resp
-            .result
-            .as_ref()
-            .and_then(|v| v.as_str())
-            .ok_or("Failed to get chain ID")?;
+        let chain_id_hex =
+            resp.result.as_ref().and_then(|v| v.as_str()).ok_or("Failed to get chain ID")?;
         let chain_id = u64::from_str_radix(chain_id_hex.trim_start_matches("0x"), 16)
             .map_err(|e| format!("Failed to parse chain ID: {}", e))?;
 
-        Ok(Self {
-            signer,
-            client,
-            chain_id,
-        })
+        Ok(Self { signer, client, chain_id })
     }
 
     /// Returns the sender address.
@@ -184,15 +161,11 @@ impl TransactionSender {
 
     /// Gets the current nonce for the sender address.
     fn get_nonce(&self) -> Result<u64, String> {
-        let resp = self.client.call(
-            "eth_getTransactionCount",
-            json!([format!("{:?}", self.address()), "pending"]),
-        )?;
-        let nonce_hex = resp
-            .result
-            .as_ref()
-            .and_then(|v| v.as_str())
-            .ok_or("Failed to get nonce")?;
+        let resp = self
+            .client
+            .call("eth_getTransactionCount", json!([format!("{:?}", self.address()), "pending"]))?;
+        let nonce_hex =
+            resp.result.as_ref().and_then(|v| v.as_str()).ok_or("Failed to get nonce")?;
         u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16)
             .map_err(|e| format!("Failed to parse nonce: {}", e))
     }
@@ -200,11 +173,8 @@ impl TransactionSender {
     /// Gets the current gas price.
     fn get_gas_price(&self) -> Result<u128, String> {
         let resp = self.client.call("eth_gasPrice", json!([]))?;
-        let gas_hex = resp
-            .result
-            .as_ref()
-            .and_then(|v| v.as_str())
-            .ok_or("Failed to get gas price")?;
+        let gas_hex =
+            resp.result.as_ref().and_then(|v| v.as_str()).ok_or("Failed to get gas price")?;
         u128::from_str_radix(gas_hex.trim_start_matches("0x"), 16)
             .map_err(|e| format!("Failed to parse gas price: {}", e))
     }
@@ -238,9 +208,7 @@ impl TransactionSender {
         let raw_tx = format!("0x{}", hex::encode(&encoded));
 
         // Send the transaction
-        let resp = self
-            .client
-            .call("eth_sendRawTransaction", json!([raw_tx]))?;
+        let resp = self.client.call("eth_sendRawTransaction", json!([raw_tx]))?;
 
         if let Some(error) = resp.error {
             return Err(format!("Transaction failed: {:?}", error));
@@ -297,9 +265,7 @@ impl TransactionSender {
         let raw_tx = format!("0x{}", hex::encode(&encoded));
 
         // Send the transaction
-        let resp = self
-            .client
-            .call("eth_sendRawTransaction", json!([raw_tx]))?;
+        let resp = self.client.call("eth_sendRawTransaction", json!([raw_tx]))?;
 
         if let Some(error) = resp.error {
             return Err(format!("Contract deployment failed: {:?}", error));
@@ -366,9 +332,7 @@ impl TransactionSender {
             let mut block_number = None;
 
             for hash in tx_hashes {
-                let resp = self
-                    .client
-                    .call("eth_getTransactionReceipt", json!([hash]))?;
+                let resp = self.client.call("eth_getTransactionReceipt", json!([hash]))?;
 
                 if let Some(receipt) = resp.result {
                     if !receipt.is_null() {
@@ -394,10 +358,7 @@ impl TransactionSender {
             std::thread::sleep(poll_interval);
         }
 
-        Err(format!(
-            "Timeout waiting for transactions after {:?}",
-            timeout
-        ))
+        Err(format!("Timeout waiting for transactions after {:?}", timeout))
     }
 }
 
@@ -475,14 +436,8 @@ fn compare_responses(resp1: &RpcResponse, resp2: &RpcResponse) -> Result<(), Str
         (None, None) => {}
     }
 
-    let result1 = resp1
-        .result
-        .as_ref()
-        .ok_or("mega-reth returned no result")?;
-    let result2 = resp2
-        .result
-        .as_ref()
-        .ok_or("debug-trace-server returned no result")?;
+    let result1 = resp1.result.as_ref().ok_or("mega-reth returned no result")?;
+    let result2 = resp2.result.as_ref().ok_or("debug-trace-server returned no result")?;
 
     let norm1 = normalize_json(result1);
     let norm2 = normalize_json(result2);
@@ -493,16 +448,10 @@ fn compare_responses(resp1: &RpcResponse, resp2: &RpcResponse) -> Result<(), Str
         // Generate a diff summary
         let str1 = serde_json::to_string_pretty(&norm1).unwrap_or_default();
         let str2 = serde_json::to_string_pretty(&norm2).unwrap_or_default();
-        let preview1 = if str1.len() > 2000 {
-            format!("{}...", &str1[..2000])
-        } else {
-            str1.clone()
-        };
-        let preview2 = if str2.len() > 2000 {
-            format!("{}...", &str2[..2000])
-        } else {
-            str2.clone()
-        };
+        let preview1 =
+            if str1.len() > 2000 { format!("{}...", &str1[..2000]) } else { str1.clone() };
+        let preview2 =
+            if str2.len() > 2000 { format!("{}...", &str2[..2000]) } else { str2.clone() };
 
         // Find the first difference
         let diff_pos = str1
@@ -538,11 +487,8 @@ fn get_blocks_with_transactions(
 ) -> Result<Vec<BlockInfo>, String> {
     // Get latest block number
     let resp = client.call("eth_blockNumber", json!([]))?;
-    let latest_hex = resp
-        .result
-        .as_ref()
-        .and_then(|v| v.as_str())
-        .ok_or("Failed to get block number")?;
+    let latest_hex =
+        resp.result.as_ref().and_then(|v| v.as_str()).ok_or("Failed to get block number")?;
     let latest = u64::from_str_radix(latest_hex.trim_start_matches("0x"), 16)
         .map_err(|e| format!("Failed to parse block number: {}", e))?;
 
@@ -554,19 +500,14 @@ fn get_blocks_with_transactions(
             break;
         }
 
-        let resp = client.call(
-            "eth_getBlockByNumber",
-            json!([format!("0x{:x}", block_num), true]),
-        )?;
+        let resp =
+            client.call("eth_getBlockByNumber", json!([format!("0x{:x}", block_num), true]))?;
 
         if let Some(block) = resp.result {
             if let Some(txs) = block.get("transactions").and_then(|t| t.as_array()) {
                 if !txs.is_empty() {
-                    let hash = block
-                        .get("hash")
-                        .and_then(|h| h.as_str())
-                        .unwrap_or_default()
-                        .to_string();
+                    let hash =
+                        block.get("hash").and_then(|h| h.as_str()).unwrap_or_default().to_string();
 
                     let tx_hashes: Vec<String> = txs
                         .iter()
@@ -574,11 +515,7 @@ fn get_blocks_with_transactions(
                         .collect();
 
                     if !tx_hashes.is_empty() {
-                        blocks.push(BlockInfo {
-                            number: block_num,
-                            hash,
-                            tx_hashes,
-                        });
+                        blocks.push(BlockInfo { number: block_num, hash, tx_hashes });
                     }
                 }
             }
@@ -597,11 +534,7 @@ struct TestResults {
 
 impl TestResults {
     fn new() -> Self {
-        Self {
-            passed: 0,
-            failed: 0,
-            errors: Vec::new(),
-        }
+        Self { passed: 0, failed: 0, errors: Vec::new() }
     }
 
     fn record(&mut self, test_name: &str, result: Result<(), String>) {
@@ -647,10 +580,9 @@ fn test_trace_block_by_number(
     match (resp1, resp2) {
         (Ok(r1), Ok(r2)) => results.record(&test_name, compare_responses(&r1, &r2)),
         (Err(e), _) => results.record(&test_name, Err(format!("mega-reth request failed: {}", e))),
-        (_, Err(e)) => results.record(
-            &test_name,
-            Err(format!("debug-trace-server request failed: {}", e)),
-        ),
+        (_, Err(e)) => {
+            results.record(&test_name, Err(format!("debug-trace-server request failed: {}", e)))
+        }
     }
 }
 
@@ -673,10 +605,9 @@ fn test_trace_block_by_hash(
     match (resp1, resp2) {
         (Ok(r1), Ok(r2)) => results.record(&test_name, compare_responses(&r1, &r2)),
         (Err(e), _) => results.record(&test_name, Err(format!("mega-reth request failed: {}", e))),
-        (_, Err(e)) => results.record(
-            &test_name,
-            Err(format!("debug-trace-server request failed: {}", e)),
-        ),
+        (_, Err(e)) => {
+            results.record(&test_name, Err(format!("debug-trace-server request failed: {}", e)))
+        }
     }
 }
 
@@ -699,10 +630,9 @@ fn test_trace_transaction(
     match (resp1, resp2) {
         (Ok(r1), Ok(r2)) => results.record(&test_name, compare_responses(&r1, &r2)),
         (Err(e), _) => results.record(&test_name, Err(format!("mega-reth request failed: {}", e))),
-        (_, Err(e)) => results.record(
-            &test_name,
-            Err(format!("debug-trace-server request failed: {}", e)),
-        ),
+        (_, Err(e)) => {
+            results.record(&test_name, Err(format!("debug-trace-server request failed: {}", e)))
+        }
     }
 }
 
@@ -724,10 +654,9 @@ fn test_parity_trace_block(
     match (resp1, resp2) {
         (Ok(r1), Ok(r2)) => results.record(test_name, compare_responses(&r1, &r2)),
         (Err(e), _) => results.record(test_name, Err(format!("mega-reth request failed: {}", e))),
-        (_, Err(e)) => results.record(
-            test_name,
-            Err(format!("debug-trace-server request failed: {}", e)),
-        ),
+        (_, Err(e)) => {
+            results.record(test_name, Err(format!("debug-trace-server request failed: {}", e)))
+        }
     }
 }
 
@@ -748,10 +677,9 @@ fn test_parity_trace_transaction(
     match (resp1, resp2) {
         (Ok(r1), Ok(r2)) => results.record(test_name, compare_responses(&r1, &r2)),
         (Err(e), _) => results.record(test_name, Err(format!("mega-reth request failed: {}", e))),
-        (_, Err(e)) => results.record(
-            test_name,
-            Err(format!("debug-trace-server request failed: {}", e)),
-        ),
+        (_, Err(e)) => {
+            results.record(test_name, Err(format!("debug-trace-server request failed: {}", e)))
+        }
     }
 }
 
@@ -763,10 +691,7 @@ fn get_tracer_configs() -> Vec<(&'static str, Value)> {
         // Call tracer
         ("callTracer", json!({"tracer": "callTracer"})),
         // Call tracer with logs
-        (
-            "callTracer+logs",
-            json!({"tracer": "callTracer", "tracerConfig": {"withLog": true}}),
-        ),
+        ("callTracer+logs", json!({"tracer": "callTracer", "tracerConfig": {"withLog": true}})),
         // Four byte tracer
         ("4byteTracer", json!({"tracer": "4byteTracer"})),
         // Prestate tracer
@@ -806,14 +731,8 @@ fn test_debug_trace_consistency() {
     }
     println!("  ✓ mega-reth is available");
 
-    if debug_trace_server
-        .call("eth_blockNumber", json!([]))
-        .is_err()
-    {
-        panic!(
-            "debug-trace-server is not available at {}",
-            config.debug_trace_server_url
-        );
+    if debug_trace_server.call("eth_blockNumber", json!([])).is_err() {
+        panic!("debug-trace-server is not available at {}", config.debug_trace_server_url);
     }
     println!("  ✓ debug-trace-server is available");
 
@@ -833,11 +752,7 @@ fn test_debug_trace_consistency() {
     // Test each block
     for block in &blocks {
         println!("\n{}", "=".repeat(70));
-        println!(
-            "Block {} (hash: {}...)",
-            block.number,
-            &block.hash[..18.min(block.hash.len())]
-        );
+        println!("Block {} (hash: {}...)", block.number, &block.hash[..18.min(block.hash.len())]);
         println!("{}", "=".repeat(70));
 
         // Test block-level methods with all tracers
@@ -871,18 +786,8 @@ fn test_debug_trace_consistency() {
         let tx_count = block.tx_hashes.len().min(config.max_tx_per_block);
         println!("\n  Transaction-level methods ({} transactions):", tx_count);
 
-        for (i, tx_hash) in block
-            .tx_hashes
-            .iter()
-            .take(config.max_tx_per_block)
-            .enumerate()
-        {
-            println!(
-                "\n    TX {}/{}: {}...",
-                i + 1,
-                tx_count,
-                &tx_hash[..18.min(tx_hash.len())]
-            );
+        for (i, tx_hash) in block.tx_hashes.iter().take(config.max_tx_per_block).enumerate() {
+            println!("\n    TX {}/{}: {}...", i + 1, tx_count, &tx_hash[..18.min(tx_hash.len())]);
 
             // Test with all tracers
             for (tracer_name, tracer_opts) in &tracer_configs {
@@ -915,10 +820,7 @@ fn test_debug_trace_consistency() {
         for error in &results.errors {
             println!("  - {}", error);
         }
-        panic!(
-            "Consistency tests failed: {} passed, {} failed",
-            results.passed, results.failed
-        );
+        panic!("Consistency tests failed: {} passed, {} failed", results.passed, results.failed);
     }
 
     println!("\n✓ All consistency tests passed!");
@@ -990,10 +892,7 @@ fn test_transaction_level_consistency() {
 
     let block = &blocks[0];
     let tx_hash = &block.tx_hashes[0];
-    println!(
-        "Testing transaction {}...",
-        &tx_hash[..18.min(tx_hash.len())]
-    );
+    println!("Testing transaction {}...", &tx_hash[..18.min(tx_hash.len())]);
 
     let tracer_configs = get_tracer_configs();
     let mut results = TestResults::new();
@@ -1013,10 +912,7 @@ fn test_transaction_level_consistency() {
 
     println!("\nPassed: {}, Failed: {}", results.passed, results.failed);
 
-    assert!(
-        results.is_success(),
-        "Transaction-level consistency tests failed"
-    );
+    assert!(results.is_success(), "Transaction-level consistency tests failed");
 }
 
 /// Test cache management RPC methods (debug_getCacheStatus).
@@ -1045,10 +941,7 @@ fn test_cache_management() {
 
     // Check if method returned an error (method not found)
     if resp.error.is_some() {
-        println!(
-            "    ⚠ debug_getCacheStatus returned error: {:?}",
-            resp.error
-        );
+        println!("    ⚠ debug_getCacheStatus returned error: {:?}", resp.error);
         println!("    Skipping cache management tests (server may not support these methods)");
         return;
     }
@@ -1058,29 +951,14 @@ fn test_cache_management() {
 
         // Verify responseCache object exists and has expected fields
         let cache = result.get("responseCache");
-        assert!(
-            cache.is_some(),
-            "Cache status should have responseCache object"
-        );
+        assert!(cache.is_some(), "Cache status should have responseCache object");
 
         let cache = cache.unwrap();
-        assert!(
-            cache.get("entryCount").is_some(),
-            "Cache status should have entryCount"
-        );
-        assert!(
-            cache.get("totalBytes").is_some(),
-            "Cache status should have totalBytes"
-        );
+        assert!(cache.get("entryCount").is_some(), "Cache status should have entryCount");
+        assert!(cache.get("totalBytes").is_some(), "Cache status should have totalBytes");
         assert!(cache.get("hits").is_some(), "Cache status should have hits");
-        assert!(
-            cache.get("misses").is_some(),
-            "Cache status should have misses"
-        );
-        assert!(
-            cache.get("hitRate").is_some(),
-            "Cache status should have hitRate"
-        );
+        assert!(cache.get("misses").is_some(), "Cache status should have misses");
+        assert!(cache.get("hitRate").is_some(), "Cache status should have hitRate");
 
         println!("    ✓ debug_getCacheStatus works correctly");
         println!(
@@ -1181,10 +1059,7 @@ fn test_concurrent_requests() {
         }
     }
 
-    assert!(
-        all_same,
-        "All concurrent requests should return the same result"
-    );
+    assert!(all_same, "All concurrent requests should return the same result");
     println!("\n✓ All concurrent requests returned identical results!");
 }
 
@@ -1250,10 +1125,7 @@ fn test_multiple_blocks_cache() {
         );
     }
 
-    println!(
-        "\n  Total: {} passed, {} failed",
-        results.passed, results.failed
-    );
+    println!("\n  Total: {} passed, {} failed", results.passed, results.failed);
 
     assert!(results.is_success(), "Multiple blocks cache tests failed");
     println!("\n✓ All multiple blocks cache tests passed!");
@@ -1276,14 +1148,9 @@ fn test_large_block() {
     // Find a block with multiple transactions (at least 3)
     println!("\n  Searching for a block with multiple transactions...");
 
-    let resp = mega_reth
-        .call("eth_blockNumber", json!([]))
-        .expect("Failed to get block number");
-    let latest_hex = resp
-        .result
-        .as_ref()
-        .and_then(|v| v.as_str())
-        .expect("Failed to get block number");
+    let resp = mega_reth.call("eth_blockNumber", json!([])).expect("Failed to get block number");
+    let latest_hex =
+        resp.result.as_ref().and_then(|v| v.as_str()).expect("Failed to get block number");
     let latest =
         u64::from_str_radix(latest_hex.trim_start_matches("0x"), 16).expect("Failed to parse");
 
@@ -1292,10 +1159,7 @@ fn test_large_block() {
 
     for block_num in (1..latest.saturating_sub(200)).rev() {
         let resp = mega_reth
-            .call(
-                "eth_getBlockByNumber",
-                json!([format!("0x{:x}", block_num), true]),
-            )
+            .call("eth_getBlockByNumber", json!([format!("0x{:x}", block_num), true]))
             .ok();
 
         if let Some(resp) = resp {
@@ -1319,11 +1183,7 @@ fn test_large_block() {
                             block_num,
                             tx_hashes.len()
                         );
-                        large_block = Some(BlockInfo {
-                            number: block_num,
-                            hash,
-                            tx_hashes,
-                        });
+                        large_block = Some(BlockInfo { number: block_num, hash, tx_hashes });
                         break;
                     }
                 }
@@ -1334,10 +1194,7 @@ fn test_large_block() {
     let block = match large_block {
         Some(b) => b,
         None => {
-            println!(
-                "  ⚠ No block with {}+ transactions found in recent history",
-                min_tx_count
-            );
+            println!("  ⚠ No block with {}+ transactions found in recent history", min_tx_count);
             println!("  Skipping large block tests");
             return;
         }
@@ -1371,10 +1228,7 @@ fn test_large_block() {
         );
     }
 
-    println!(
-        "\n  Total: {} passed, {} failed",
-        results.passed, results.failed
-    );
+    println!("\n  Total: {} passed, {} failed", results.passed, results.failed);
 
     assert!(results.is_success(), "Large block tests failed");
     println!("\n✓ All large block tests passed!");
@@ -1421,16 +1275,9 @@ fn test_send_and_trace_transactions() {
 
     // Check sender balance
     let balance_resp = mega_reth
-        .call(
-            "eth_getBalance",
-            json!([format!("{:?}", tx_sender.address()), "latest"]),
-        )
+        .call("eth_getBalance", json!([format!("{:?}", tx_sender.address()), "latest"]))
         .expect("Failed to get balance");
-    let balance_hex = balance_resp
-        .result
-        .as_ref()
-        .and_then(|v| v.as_str())
-        .unwrap_or("0x0");
+    let balance_hex = balance_resp.result.as_ref().and_then(|v| v.as_str()).unwrap_or("0x0");
     println!("  Sender balance: {}", balance_hex);
 
     // Send multiple transactions
@@ -1483,10 +1330,7 @@ fn test_send_and_trace_transactions() {
     test_parity_trace_block(&mega_reth, &debug_trace_server, block_number, &mut results);
 
     // Test each transaction
-    println!(
-        "\n  Testing transaction-level tracing ({} transactions):",
-        tx_hashes.len()
-    );
+    println!("\n  Testing transaction-level tracing ({} transactions):", tx_hashes.len());
 
     for (i, tx_hash) in tx_hashes.iter().enumerate() {
         println!(
@@ -1527,10 +1371,7 @@ fn test_send_and_trace_transactions() {
         for error in &results.errors {
             println!("  - {}", error);
         }
-        panic!(
-            "Send and trace tests failed: {} passed, {} failed",
-            results.passed, results.failed
-        );
+        panic!("Send and trace tests failed: {} passed, {} failed", results.passed, results.failed);
     }
 
     println!("\n✓ All send and trace tests passed!");
@@ -1630,10 +1471,7 @@ fn test_continuous_tx_and_trace() {
         }
     }
 
-    println!(
-        "\n  Total: {} passed, {} failed",
-        results.passed, results.failed
-    );
+    println!("\n  Total: {} passed, {} failed", results.passed, results.failed);
 
     assert!(results.is_success(), "Continuous tx and trace tests failed");
     println!("\n✓ All continuous tx and trace tests passed!");

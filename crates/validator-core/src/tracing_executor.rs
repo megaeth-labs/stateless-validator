@@ -88,14 +88,12 @@ pub fn extract_code_hashes(witness: &LightWitness) -> Vec<B256> {
         .kvs
         .values()
         .filter_map(|salt_val| salt_val.as_ref())
-        .filter_map(
-            |val| match (PlainKey::decode(val.key()), PlainValue::decode(val.value())) {
-                (PlainKey::Account(_), PlainValue::Account(acc)) => {
-                    acc.codehash.filter(|&codehash| codehash != KECCAK_EMPTY)
-                }
-                _ => None,
-            },
-        )
+        .filter_map(|val| match (PlainKey::decode(val.key()), PlainValue::decode(val.value())) {
+            (PlainKey::Account(_), PlainValue::Account(acc)) => {
+                acc.codehash.filter(|&codehash| codehash != KECCAK_EMPTY)
+            }
+            _ => None,
+        })
         .collect();
 
     code_hashes.sort();
@@ -173,13 +171,7 @@ impl<'a> TracingEnv<'a> {
             block_limits,
         );
 
-        Ok(Self {
-            transactions,
-            executor_factory,
-            block_ctx,
-            evm_env,
-            light_witness_executor,
-        })
+        Ok(Self { transactions, executor_factory, block_ctx, evm_env, light_witness_executor })
     }
 
     /// Creates a witness database that borrows from this environment.
@@ -188,11 +180,7 @@ impl<'a> TracingEnv<'a> {
         header: &'b alloy_rpc_types_eth::Header,
         contracts: &'b HashMap<B256, Bytecode>,
     ) -> WitnessDatabase<'b, LightWitnessExecutor> {
-        WitnessDatabase {
-            header,
-            witness: &self.light_witness_executor,
-            contracts,
-        }
+        WitnessDatabase { header, witness: &self.light_witness_executor, contracts }
     }
 
     /// Replays transactions before the target index without tracing.
@@ -315,9 +303,7 @@ pub fn trace_block(
             env.block_ctx.clone(),
             env.evm_env.clone(),
         );
-        executor
-            .apply_pre_execution_changes()
-            .map_err(ValidationError::BlockReplayFailed)?;
+        executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
     }
 
     let mut results = Vec::with_capacity(env.transactions.len());
@@ -350,10 +336,7 @@ pub fn trace_block(
 
         match trace_result {
             Ok(trace) => {
-                results.push(TraceResult::Success {
-                    result: trace,
-                    tx_hash: Some(tx_hash),
-                });
+                results.push(TraceResult::Success { result: trace, tx_hash: Some(tx_hash) });
             }
             Err(error) => {
                 warn!(
@@ -362,10 +345,7 @@ pub fn trace_block(
                     %error,
                     "Transaction trace failed"
                 );
-                results.push(TraceResult::Error {
-                    error,
-                    tx_hash: Some(tx_hash),
-                });
+                results.push(TraceResult::Error { error, tx_hash: Some(tx_hash) });
             }
         }
 
@@ -413,17 +393,12 @@ pub fn trace_transaction(
             env.block_ctx.clone(),
             env.evm_env.clone(),
         );
-        executor
-            .apply_pre_execution_changes()
-            .map_err(ValidationError::BlockReplayFailed)?;
+        executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
     }
 
     // Replay preceding transactions without tracing
     if tx_index > 0 {
-        trace!(
-            preceding_tx_count = tx_index,
-            "Replaying preceding transactions"
-        );
+        trace!(preceding_tx_count = tx_index, "Replaying preceding transactions");
     }
     env.replay_preceding_transactions(&mut state, tx_index)?;
 
@@ -472,9 +447,7 @@ pub fn parity_trace_block(
             env.block_ctx.clone(),
             env.evm_env.clone(),
         );
-        executor
-            .apply_pre_execution_changes()
-            .map_err(ValidationError::BlockReplayFailed)?;
+        executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
     }
 
     let mut all_traces = Vec::new();
@@ -522,9 +495,7 @@ pub fn parity_trace_transaction(
             env.block_ctx.clone(),
             env.evm_env.clone(),
         );
-        executor
-            .apply_pre_execution_changes()
-            .map_err(ValidationError::BlockReplayFailed)?;
+        executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
     }
 
     // Replay preceding transactions
@@ -591,27 +562,17 @@ where
     DB: alloy_evm::Database + revm::DatabaseRef<Error = <DB as revm::Database>::Error>,
     ExtEnvFactory: mega_evm::ExternalEnvFactory + Clone,
 {
-    let TxTracingContext {
-        tx,
-        tx_gas_limit,
-        tx_info,
-    } = tx_ctx;
-    let GethDebugTracingOptions {
-        config,
-        tracer,
-        tracer_config,
-        ..
-    } = opts;
+    let TxTracingContext { tx, tx_gas_limit, tx_info } = tx_ctx;
+    let GethDebugTracingOptions { config, tracer, tracer_config, .. } = opts;
 
     // Handle different tracer types
     if let Some(tracer) = tracer {
         return match tracer {
             GethDebugTracerType::BuiltInTracer(builtin) => match builtin {
                 // NoopTracer - doesn't need execution
-                GethDebugBuiltInTracerType::NoopTracer => (
-                    Ok(GethTrace::NoopTracer(NoopFrame::default())),
-                    Default::default(),
-                ),
+                GethDebugBuiltInTracerType::NoopTracer => {
+                    (Ok(GethTrace::NoopTracer(NoopFrame::default())), Default::default())
+                }
 
                 // FourByteTracer
                 GethDebugBuiltInTracerType::FourByteTracer => {
@@ -648,9 +609,8 @@ where
 
                             let inspector = executor.inspector_mut();
                             inspector.set_transaction_gas_limit(tx_gas_limit);
-                            let frame = inspector
-                                .geth_builder()
-                                .geth_call_traces(call_config, gas_used);
+                            let frame =
+                                inspector.geth_builder().geth_call_traces(call_config, gas_used);
 
                             (Ok(frame.into()), state_changes)
                         }
@@ -660,10 +620,8 @@ where
 
                 // PreStateTracer
                 GethDebugBuiltInTracerType::PreStateTracer => {
-                    let prestate_config = tracer_config
-                        .clone()
-                        .into_pre_state_config()
-                        .unwrap_or_default();
+                    let prestate_config =
+                        tracer_config.clone().into_pre_state_config().unwrap_or_default();
 
                     let inspector = TracingInspector::new(
                         TracingInspectorConfig::from_geth_prestate_config(&prestate_config),
@@ -684,9 +642,7 @@ where
                             };
 
                             // First set the gas limit on the inspector
-                            executor
-                                .inspector_mut()
-                                .set_transaction_gas_limit(tx_gas_limit);
+                            executor.inspector_mut().set_transaction_gas_limit(tx_gas_limit);
 
                             // Then get the builder and db separately
                             let frame_result = {
@@ -701,8 +657,9 @@ where
 
                             match frame_result {
                                 Ok(frame) => {
-                                    // For diff mode, add accounts that were accessed but not modified
-                                    // This matches mega-reth behavior where such accounts appear with
+                                    // For diff mode, add accounts that were accessed but not
+                                    // modified This matches
+                                    // mega-reth behavior where such accounts appear with
                                     // pre state and empty post state {}
                                     let final_frame = if prestate_config.is_diff_mode() {
                                         let db = executor.evm.db();
@@ -712,10 +669,9 @@ where
                                     };
                                     (Ok(final_frame.into()), state_changes)
                                 }
-                                Err(e) => (
-                                    Err(format!("PreState trace failed: {:?}", e)),
-                                    state_changes,
-                                ),
+                                Err(e) => {
+                                    (Err(format!("PreState trace failed: {:?}", e)), state_changes)
+                                }
                             }
                         }
                         Err(e) => (Err(e.to_string()), Default::default()),
@@ -776,10 +732,8 @@ where
 
                 // FlatCallTracer (Parity-style)
                 GethDebugBuiltInTracerType::FlatCallTracer => {
-                    let flat_call_config = tracer_config
-                        .clone()
-                        .into_flat_call_config()
-                        .unwrap_or_default();
+                    let flat_call_config =
+                        tracer_config.clone().into_flat_call_config().unwrap_or_default();
 
                     let inspector = TracingInspector::new(
                         TracingInspectorConfig::from_flat_call_config(&flat_call_config),
@@ -858,10 +812,9 @@ where
                             &*db,
                         ) {
                             Ok(json_value) => (Ok(GethTrace::JS(json_value)), state_changes),
-                            Err(e) => (
-                                Err(format!("JS tracer execution failed: {:?}", e)),
-                                state_changes,
-                            ),
+                            Err(e) => {
+                                (Err(format!("JS tracer execution failed: {:?}", e)), state_changes)
+                            }
                         }
                     }
                     Err(e) => (Err(e.to_string()), Default::default()),
@@ -885,16 +838,14 @@ where
 
             let inspector = executor.inspector_mut();
             inspector.set_transaction_gas_limit(tx_gas_limit);
-            let frame = inspector
-                .geth_builder()
-                .geth_traces(gas_used, return_value, *config);
+            let frame = inspector.geth_builder().geth_traces(gas_used, return_value, *config);
 
             // Convert DefaultFrame to JSON and fix returnValue serialization.
             // alloy-rpc-types-trace 1.1.2 serializes Bytes with "0x" prefix,
             // but mega-reth uses v1.0.23 which serializes without prefix.
             let mut frame_value = serde_json::to_value(frame).unwrap();
-            if let Some(rv) = frame_value.get_mut("returnValue")
-                && let Some(s) = rv.as_str()
+            if let Some(rv) = frame_value.get_mut("returnValue") &&
+                let Some(s) = rv.as_str()
             {
                 *rv = serde_json::Value::String(s.strip_prefix("0x").unwrap_or(s).to_string());
             }
@@ -1029,10 +980,7 @@ mod tests {
             )),
             ..Default::default()
         };
-        assert!(matches!(
-            opts.tracer,
-            Some(GethDebugTracerType::JsTracer(_))
-        ));
+        assert!(matches!(opts.tracer, Some(GethDebugTracerType::JsTracer(_))));
     }
 
     #[test]

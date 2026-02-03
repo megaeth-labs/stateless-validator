@@ -119,9 +119,7 @@ pub async fn fetch_blocks_batch(
 
     // Calculate how far behind our local chain is from remote
     let db_tip_start = Instant::now();
-    let local_tip = db
-        .get_local_tip()?
-        .ok_or_else(|| anyhow!("Local chain is empty"))?;
+    let local_tip = db.get_local_tip()?.ok_or_else(|| anyhow!("Local chain is empty"))?;
     let remote_tip = db.get_remote_tip()?.unwrap_or(local_tip);
     let db_tip_elapsed = db_tip_start.elapsed();
 
@@ -173,10 +171,7 @@ pub async fn fetch_blocks_batch(
     let gap = remote_tip.0.saturating_sub(local_tip.0);
 
     // Detect and resolve chain reorgs
-    match client
-        .get_block(BlockId::Number(remote_tip.0.into()), false)
-        .await
-    {
+    match client.get_block(BlockId::Number(remote_tip.0.into()), false).await {
         Ok(block) if block.header.hash != remote_tip.1 => {
             warn!(
                 block_number = remote_tip.0,
@@ -292,19 +287,14 @@ pub async fn fetch_blocks_batch(
 
     // Fetch blocks in parallel
     let fetch_start = Instant::now();
-    let tasks = future::join_all((start_block..start_block + blocks_to_fetch).map(
-        |block_number| {
+    let tasks =
+        future::join_all((start_block..start_block + blocks_to_fetch).map(|block_number| {
             let client = client.clone();
             async move {
-                let block = client
-                    .get_block(BlockId::Number(block_number.into()), false)
-                    .await?;
-                let (salt_witness, mpt_witness) = client
-                    .get_witness(block.header.number, block.header.hash)
-                    .await?;
-                let block = client
-                    .get_block(BlockId::Number(block_number.into()), true)
-                    .await?;
+                let block = client.get_block(BlockId::Number(block_number.into()), false).await?;
+                let (salt_witness, mpt_witness) =
+                    client.get_witness(block.header.number, block.header.hash).await?;
+                let block = client.get_block(BlockId::Number(block_number.into()), true).await?;
 
                 Ok::<(Block<Transaction>, SaltWitness, MptWitness), eyre::Error>((
                     block,
@@ -313,36 +303,35 @@ pub async fn fetch_blocks_batch(
                 ))
             }
             .instrument(info_span!("fetch_block", block_number = block_number))
-        },
-    ))
-    .await
-    .into_iter()
-    .enumerate()
-    // Stop on first error to maintain block sequence contiguity
-    .take_while(|(i, result)| match result {
-        Ok(_) => {
-            block_error_counts.remove(&(start_block + *i as u64));
-            true
-        }
-        Err(e) => {
-            let block_number = start_block + *i as u64;
-            let count = block_error_counts.entry(block_number).or_insert(0);
-            *count += 1;
-
-            // Only log errors after repeated failures (witness delay is expected)
-            if *count > 5 {
-                error!(
-                    block_number = block_number,
-                    attempt = *count,
-                    error = %e,
-                    "Block fetch error (repeated)"
-                );
+        }))
+        .await
+        .into_iter()
+        .enumerate()
+        // Stop on first error to maintain block sequence contiguity
+        .take_while(|(i, result)| match result {
+            Ok(_) => {
+                block_error_counts.remove(&(start_block + *i as u64));
+                true
             }
-            false
-        }
-    })
-    .filter_map(|(_, result)| result.ok())
-    .collect::<Vec<_>>();
+            Err(e) => {
+                let block_number = start_block + *i as u64;
+                let count = block_error_counts.entry(block_number).or_insert(0);
+                *count += 1;
+
+                // Only log errors after repeated failures (witness delay is expected)
+                if *count > 5 {
+                    error!(
+                        block_number = block_number,
+                        attempt = *count,
+                        error = %e,
+                        "Block fetch error (repeated)"
+                    );
+                }
+                false
+            }
+        })
+        .filter_map(|(_, result)| result.ok())
+        .collect::<Vec<_>>();
 
     let fetched_count = tasks.len() as u64;
     let had_error = fetched_count < blocks_to_fetch;
@@ -365,10 +354,7 @@ pub async fn fetch_blocks_batch(
         let light_tasks: Vec<_> = tasks
             .iter()
             .map(|(block, salt_witness, _)| {
-                (
-                    block.clone(),
-                    crate::LightWitness::from(salt_witness.clone()),
-                )
+                (block.clone(), crate::LightWitness::from(salt_witness.clone()))
             })
             .collect();
         db.store_block_data(&light_tasks)?;
@@ -403,11 +389,8 @@ pub async fn fetch_blocks_batch(
         // Calculate blocks per second using total batch time
         let total_elapsed = batch_start.elapsed();
         let total_ms = total_elapsed.as_millis() as f64;
-        let blocks_per_sec = if total_ms > 0.0 {
-            (fetched_count as f64 * 1000.0) / total_ms
-        } else {
-            0.0
-        };
+        let blocks_per_sec =
+            if total_ms > 0.0 { (fetched_count as f64 * 1000.0) / total_ms } else { 0.0 };
 
         info!(
             db_start = earliest,
@@ -440,7 +423,8 @@ pub async fn fetch_blocks_batch(
 /// * `client` - RPC client for fetching blocks from remote blockchain
 /// * `validator_db` - Database interface for chain management
 /// * `config` - Configuration for tracker behavior
-/// * `on_reorg` - Optional callback invoked when a chain reorg is detected, receives reverted block hashes
+/// * `on_reorg` - Optional callback invoked when a chain reorg is detected, receives reverted block
+///   hashes
 ///
 /// # Returns
 /// * Never returns under normal operation - runs indefinitely until externally terminated
@@ -453,10 +437,7 @@ pub async fn remote_chain_tracker<F>(
 where
     F: Fn(&[B256]) + Send + Sync,
 {
-    info!(
-        lookahead_blocks = config.tracker_lookahead_blocks,
-        "Starting remote chain tracker"
-    );
+    info!(lookahead_blocks = config.tracker_lookahead_blocks, "Starting remote chain tracker");
 
     // Track error counts for each block
     let mut block_error_counts: HashMap<u64, usize> = HashMap::new();
@@ -465,8 +446,8 @@ where
         match fetch_blocks_batch(&client, &validator_db, &config, &mut block_error_counts).await {
             Ok(result) => {
                 // Call reorg callback if a reorg occurred
-                if !result.reverted_hashes.is_empty()
-                    && let Some(ref callback) = on_reorg
+                if !result.reverted_hashes.is_empty() &&
+                    let Some(ref callback) = on_reorg
                 {
                     callback(&result.reverted_hashes);
                 }
@@ -498,9 +479,7 @@ async fn find_divergence_point(
     db: &ValidatorDB,
     mismatch_block: u64,
 ) -> Result<u64> {
-    let earliest_local = db
-        .get_earliest_local_block()?
-        .expect("Local chain cannot be empty");
+    let earliest_local = db.get_earliest_local_block()?.expect("Local chain cannot be empty");
 
     // Safety check: verify earliest block matches remote chain
     let earliest_remote_hash = client.get_block_hash(earliest_local.0).await?;

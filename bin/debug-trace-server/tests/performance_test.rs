@@ -47,10 +47,7 @@ impl TestConfig {
             debug_trace_server_url: env::var("DEBUG_TRACE_SERVER_URL")
                 .unwrap_or_else(|_| "http://localhost:18545".to_string()),
             request_timeout: Duration::from_secs(
-                env::var("REQUEST_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(120),
+                env::var("REQUEST_TIMEOUT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(120),
             ),
             private_key: env::var("TEST_PRIVATE_KEY").ok(),
         }
@@ -82,23 +79,13 @@ struct RpcClient {
 
 impl RpcClient {
     fn new(url: &str, timeout: Duration) -> Self {
-        let client = Client::builder()
-            .timeout(timeout)
-            .build()
-            .expect("Failed to create HTTP client");
-        Self {
-            client,
-            url: url.to_string(),
-        }
+        let client =
+            Client::builder().timeout(timeout).build().expect("Failed to create HTTP client");
+        Self { client, url: url.to_string() }
     }
 
     fn call(&self, method: &str, params: Value) -> Result<RpcResponse, String> {
-        let request = RpcRequest {
-            jsonrpc: "2.0",
-            method: method.to_string(),
-            params,
-            id: 1,
-        };
+        let request = RpcRequest { jsonrpc: "2.0", method: method.to_string(), params, id: 1 };
 
         self.client
             .post(&self.url)
@@ -179,10 +166,7 @@ fn get_tracers() -> Vec<(&'static str, Value)> {
     vec![
         ("default", json!({})),
         ("callTracer", json!({"tracer": "callTracer"})),
-        (
-            "callTracer+logs",
-            json!({"tracer": "callTracer", "tracerConfig": {"withLog": true}}),
-        ),
+        ("callTracer+logs", json!({"tracer": "callTracer", "tracerConfig": {"withLog": true}})),
         ("prestateTracer", json!({"tracer": "prestateTracer"})),
         (
             "prestateTracer+diff",
@@ -217,12 +201,8 @@ fn test_tracer_performance_cache_hit() {
     let mut test_block = latest.saturating_sub(10);
 
     for bn in (1..latest.saturating_sub(5)).rev() {
-        let resp = mega_reth
-            .call(
-                "eth_getBlockByNumber",
-                json!([format!("0x{:x}", bn), false]),
-            )
-            .ok();
+        let resp =
+            mega_reth.call("eth_getBlockByNumber", json!([format!("0x{:x}", bn), false])).ok();
         if let Some(resp) = resp {
             if let Some(block) = resp.result {
                 if let Some(txs) = block.get("transactions").and_then(|t| t.as_array()) {
@@ -276,10 +256,7 @@ fn test_tracer_performance_cache_hit() {
 
         // Print average
         let avg = times.iter().sum::<f64>() / times.len() as f64;
-        println!(
-            "{:<20} {:<15} {:>10} {:>12.2} {:>8}",
-            name, "AVERAGE", "", avg, ""
-        );
+        println!("{:<20} {:<15} {:>10} {:>12.2} {:>8}", name, "AVERAGE", "", avg, "");
         println!();
     }
 
@@ -292,18 +269,9 @@ fn test_tracer_performance_cache_hit() {
         let tracer_results: Vec<_> = results.iter().filter(|r| r.tracer == *name).collect();
         let avg =
             tracer_results.iter().map(|r| r.duration_ms).sum::<f64>() / tracer_results.len() as f64;
-        let min = tracer_results
-            .iter()
-            .map(|r| r.duration_ms)
-            .fold(f64::MAX, f64::min);
-        let max = tracer_results
-            .iter()
-            .map(|r| r.duration_ms)
-            .fold(f64::MIN, f64::max);
-        println!(
-            "{:<20}: avg={:>8.2}ms, min={:>8.2}ms, max={:>8.2}ms",
-            name, avg, min, max
-        );
+        let min = tracer_results.iter().map(|r| r.duration_ms).fold(f64::MAX, f64::min);
+        let max = tracer_results.iter().map(|r| r.duration_ms).fold(f64::MIN, f64::max);
+        println!("{:<20}: avg={:>8.2}ms, min={:>8.2}ms, max={:>8.2}ms", name, avg, min, max);
     }
 }
 
@@ -346,10 +314,7 @@ fn test_tracer_performance_fresh_block() {
     for (name, opts) in &tracers {
         // Get current nonce
         let resp = mega_reth
-            .call(
-                "eth_getTransactionCount",
-                json!([format!("{:?}", signer.address()), "pending"]),
-            )
+            .call("eth_getTransactionCount", json!([format!("{:?}", signer.address()), "pending"]))
             .unwrap();
         let nonce_hex = resp.result.as_ref().unwrap().as_str().unwrap();
         let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16).unwrap();
@@ -370,17 +335,13 @@ fn test_tracer_performance_fresh_block() {
             input: Bytes::default(),
         };
 
-        let signature = signer
-            .sign_transaction_sync(&mut tx.clone())
-            .expect("Sign failed");
+        let signature = signer.sign_transaction_sync(&mut tx.clone()).expect("Sign failed");
         let signed_tx = tx.into_signed(signature);
         let mut encoded = Vec::new();
         signed_tx.rlp_encode(&mut encoded);
         let raw_tx = format!("0x{}", hex::encode(&encoded));
 
-        let resp = mega_reth
-            .call("eth_sendRawTransaction", json!([raw_tx]))
-            .expect("Send failed");
+        let resp = mega_reth.call("eth_sendRawTransaction", json!([raw_tx])).expect("Send failed");
         if resp.error.is_some() {
             println!("  Failed to send tx for {}: {:?}", name, resp.error);
             continue;
@@ -392,9 +353,7 @@ fn test_tracer_performance_fresh_block() {
         let mut block_number = None;
         for _ in 0..60 {
             std::thread::sleep(Duration::from_millis(500));
-            let resp = mega_reth
-                .call("eth_getTransactionReceipt", json!([&tx_hash]))
-                .unwrap();
+            let resp = mega_reth.call("eth_getTransactionReceipt", json!([&tx_hash])).unwrap();
             if let Some(receipt) = resp.result {
                 if !receipt.is_null() {
                     if let Some(bn) = receipt.get("blockNumber").and_then(|v| v.as_str()) {
@@ -470,12 +429,8 @@ fn test_tracer_performance_cold_request() {
         if test_blocks.len() >= 8 {
             break;
         }
-        let resp = mega_reth
-            .call(
-                "eth_getBlockByNumber",
-                json!([format!("0x{:x}", bn), false]),
-            )
-            .ok();
+        let resp =
+            mega_reth.call("eth_getBlockByNumber", json!([format!("0x{:x}", bn), false])).ok();
         if let Some(resp) = resp {
             if let Some(block) = resp.result {
                 if let Some(txs) = block.get("transactions").and_then(|t| t.as_array()) {
@@ -576,10 +531,7 @@ fn test_tracer_performance_comparison() {
     for (name, opts) in &tracers {
         // Get nonce
         let resp = mega_reth
-            .call(
-                "eth_getTransactionCount",
-                json!([format!("{:?}", signer.address()), "pending"]),
-            )
+            .call("eth_getTransactionCount", json!([format!("{:?}", signer.address()), "pending"]))
             .unwrap();
         let nonce_hex = resp.result.as_ref().unwrap().as_str().unwrap();
         let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16).unwrap();
@@ -595,22 +547,15 @@ fn test_tracer_performance_comparison() {
             input: Bytes::default(),
         };
 
-        let signature = signer
-            .sign_transaction_sync(&mut tx.clone())
-            .expect("Sign failed");
+        let signature = signer.sign_transaction_sync(&mut tx.clone()).expect("Sign failed");
         let signed_tx = tx.into_signed(signature);
         let mut encoded = Vec::new();
         signed_tx.rlp_encode(&mut encoded);
         let raw_tx = format!("0x{}", hex::encode(&encoded));
 
-        let resp = mega_reth
-            .call("eth_sendRawTransaction", json!([raw_tx]))
-            .expect("Send failed");
+        let resp = mega_reth.call("eth_sendRawTransaction", json!([raw_tx])).expect("Send failed");
         if resp.error.is_some() {
-            println!(
-                "{:<20} {:>12} {:>12} {:>12} {:>12}",
-                name, "SEND_ERR", "-", "-", "-"
-            );
+            println!("{:<20} {:>12} {:>12} {:>12} {:>12}", name, "SEND_ERR", "-", "-", "-");
             continue;
         }
 
@@ -620,9 +565,7 @@ fn test_tracer_performance_comparison() {
         let mut block_number = None;
         for _ in 0..60 {
             std::thread::sleep(Duration::from_millis(500));
-            let resp = mega_reth
-                .call("eth_getTransactionReceipt", json!([&tx_hash]))
-                .unwrap();
+            let resp = mega_reth.call("eth_getTransactionReceipt", json!([&tx_hash])).unwrap();
             if let Some(receipt) = resp.result {
                 if !receipt.is_null() {
                     if let Some(bn) = receipt.get("blockNumber").and_then(|v| v.as_str()) {
@@ -637,10 +580,7 @@ fn test_tracer_performance_comparison() {
         let block_number = match block_number {
             Some(bn) => bn,
             None => {
-                println!(
-                    "{:<20} {:>12} {:>12} {:>12} {:>12}",
-                    name, "NOT_MINED", "-", "-", "-"
-                );
+                println!("{:<20} {:>12} {:>12} {:>12} {:>12}", name, "NOT_MINED", "-", "-", "-");
                 continue;
             }
         };
@@ -666,27 +606,21 @@ fn test_tracer_performance_comparison() {
             });
 
         if resp.error.is_some() {
-            println!(
-                "{:<20} {:>12} {:>12} {:>12} {:>12}",
-                name, "ERROR", "-", "-", "-"
-            );
+            println!("{:<20} {:>12} {:>12} {:>12} {:>12}", name, "ERROR", "-", "-", "-");
             continue;
         }
 
         // Cache hit 1
-        let (_, cache1_ms) = dts
-            .call_timed("debug_traceBlockByNumber", json!([&block_hex, opts]))
-            .unwrap();
+        let (_, cache1_ms) =
+            dts.call_timed("debug_traceBlockByNumber", json!([&block_hex, opts])).unwrap();
 
         // Cache hit 2
-        let (_, cache2_ms) = dts
-            .call_timed("debug_traceBlockByNumber", json!([&block_hex, opts]))
-            .unwrap();
+        let (_, cache2_ms) =
+            dts.call_timed("debug_traceBlockByNumber", json!([&block_hex, opts])).unwrap();
 
         // Cache hit 3
-        let (_, cache3_ms) = dts
-            .call_timed("debug_traceBlockByNumber", json!([&block_hex, opts]))
-            .unwrap();
+        let (_, cache3_ms) =
+            dts.call_timed("debug_traceBlockByNumber", json!([&block_hex, opts])).unwrap();
 
         println!(
             "{:<20} {:>12.2} {:>12.2} {:>12.2} {:>12.2}",
@@ -702,10 +636,7 @@ fn test_tracer_performance_comparison() {
     let resp = dts.call("debug_getCacheStatus", json!([])).unwrap();
     if let Some(result) = resp.result {
         if let Some(cache) = result.get("responseCache") {
-            println!(
-                "  Entries: {}",
-                cache.get("entryCount").unwrap_or(&json!("?"))
-            );
+            println!("  Entries: {}", cache.get("entryCount").unwrap_or(&json!("?")));
             println!(
                 "  Total Bytes: {} ({} MB)",
                 cache.get("totalBytes").unwrap_or(&json!("?")),
@@ -713,10 +644,7 @@ fn test_tracer_performance_comparison() {
             );
             println!("  Hits: {}", cache.get("hits").unwrap_or(&json!("?")));
             println!("  Misses: {}", cache.get("misses").unwrap_or(&json!("?")));
-            println!(
-                "  Hit Rate: {}",
-                cache.get("hitRate").unwrap_or(&json!("?"))
-            );
+            println!("  Hit Rate: {}", cache.get("hitRate").unwrap_or(&json!("?")));
         }
     }
 
@@ -759,10 +687,7 @@ fn test_trace_transaction_performance() {
 
     // Send a transaction
     let resp = mega_reth
-        .call(
-            "eth_getTransactionCount",
-            json!([format!("{:?}", signer.address()), "pending"]),
-        )
+        .call("eth_getTransactionCount", json!([format!("{:?}", signer.address()), "pending"]))
         .unwrap();
     let nonce_hex = resp.result.as_ref().unwrap().as_str().unwrap();
     let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16).unwrap();
@@ -777,26 +702,20 @@ fn test_trace_transaction_performance() {
         input: Bytes::default(),
     };
 
-    let signature = signer
-        .sign_transaction_sync(&mut tx.clone())
-        .expect("Sign failed");
+    let signature = signer.sign_transaction_sync(&mut tx.clone()).expect("Sign failed");
     let signed_tx = tx.into_signed(signature);
     let mut encoded = Vec::new();
     signed_tx.rlp_encode(&mut encoded);
     let raw_tx = format!("0x{}", hex::encode(&encoded));
 
-    let resp = mega_reth
-        .call("eth_sendRawTransaction", json!([raw_tx]))
-        .expect("Send failed");
+    let resp = mega_reth.call("eth_sendRawTransaction", json!([raw_tx])).expect("Send failed");
     let tx_hash = resp.result.as_ref().unwrap().as_str().unwrap().to_string();
     println!("\nSent tx: {}", tx_hash);
 
     // Wait for mining
     for _ in 0..60 {
         std::thread::sleep(Duration::from_millis(500));
-        let resp = mega_reth
-            .call("eth_getTransactionReceipt", json!([&tx_hash]))
-            .unwrap();
+        let resp = mega_reth.call("eth_getTransactionReceipt", json!([&tx_hash])).unwrap();
         if let Some(receipt) = resp.result {
             if !receipt.is_null() {
                 break;
@@ -808,26 +727,17 @@ fn test_trace_transaction_performance() {
 
     let tracers = get_tracers();
 
-    println!(
-        "\n{:<20} {:>12} {:>12} {:>12}",
-        "Tracer", "1st (ms)", "2nd (ms)", "3rd (ms)"
-    );
+    println!("\n{:<20} {:>12} {:>12} {:>12}", "Tracer", "1st (ms)", "2nd (ms)", "3rd (ms)");
     println!("{}", "-".repeat(60));
 
     for (name, opts) in &tracers {
-        let (resp, t1) = dts
-            .call_timed("debug_traceTransaction", json!([&tx_hash, opts]))
-            .unwrap();
+        let (resp, t1) = dts.call_timed("debug_traceTransaction", json!([&tx_hash, opts])).unwrap();
         if resp.error.is_some() {
             println!("{:<20} {:>12}", name, "ERROR");
             continue;
         }
-        let (_, t2) = dts
-            .call_timed("debug_traceTransaction", json!([&tx_hash, opts]))
-            .unwrap();
-        let (_, t3) = dts
-            .call_timed("debug_traceTransaction", json!([&tx_hash, opts]))
-            .unwrap();
+        let (_, t2) = dts.call_timed("debug_traceTransaction", json!([&tx_hash, opts])).unwrap();
+        let (_, t3) = dts.call_timed("debug_traceTransaction", json!([&tx_hash, opts])).unwrap();
 
         println!("{:<20} {:>12.2} {:>12.2} {:>12.2}", name, t1, t2, t3);
     }

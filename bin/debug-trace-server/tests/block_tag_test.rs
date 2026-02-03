@@ -52,10 +52,7 @@ impl TestConfig {
             debug_trace_server_url: env::var("DEBUG_TRACE_SERVER_URL")
                 .unwrap_or_else(|_| "http://localhost:18545".to_string()),
             request_timeout: Duration::from_secs(
-                env::var("REQUEST_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(120),
+                env::var("REQUEST_TIMEOUT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(120),
             ),
             private_key: env::var("TEST_PRIVATE_KEY").ok(),
         }
@@ -87,23 +84,13 @@ struct RpcClient {
 
 impl RpcClient {
     fn new(url: &str, timeout: Duration) -> Self {
-        let client = Client::builder()
-            .timeout(timeout)
-            .build()
-            .expect("Failed to create HTTP client");
-        Self {
-            client,
-            url: url.to_string(),
-        }
+        let client =
+            Client::builder().timeout(timeout).build().expect("Failed to create HTTP client");
+        Self { client, url: url.to_string() }
     }
 
     fn call(&self, method: &str, params: Value) -> Result<RpcResponse, String> {
-        let request = RpcRequest {
-            jsonrpc: "2.0",
-            method: method.to_string(),
-            params,
-            id: 1,
-        };
+        let request = RpcRequest { jsonrpc: "2.0", method: method.to_string(), params, id: 1 };
 
         self.client
             .post(&self.url)
@@ -143,19 +130,13 @@ fn find_block_with_txs(client: &RpcClient) -> Option<(u64, String)> {
     let latest = get_block_number(client);
     for block_num in (1..latest.saturating_sub(5)).rev() {
         let resp = client
-            .call(
-                "eth_getBlockByNumber",
-                json!([format!("0x{:x}", block_num), false]),
-            )
+            .call("eth_getBlockByNumber", json!([format!("0x{:x}", block_num), false]))
             .ok()?;
         if let Some(block) = resp.result {
             if let Some(txs) = block.get("transactions").and_then(|t| t.as_array()) {
                 if !txs.is_empty() {
-                    let hash = block
-                        .get("hash")
-                        .and_then(|h| h.as_str())
-                        .unwrap_or_default()
-                        .to_string();
+                    let hash =
+                        block.get("hash").and_then(|h| h.as_str()).unwrap_or_default().to_string();
                     return Some((block_num, hash));
                 }
             }
@@ -176,10 +157,7 @@ fn normalize_json_inner(value: &Value, current_key: Option<&str>) -> Value {
             let mut keys: Vec<_> = map.keys().collect();
             keys.sort();
             for key in keys {
-                sorted.insert(
-                    key.clone(),
-                    normalize_json_inner(&map[key], Some(key.as_str())),
-                );
+                sorted.insert(key.clone(), normalize_json_inner(&map[key], Some(key.as_str())));
             }
             Value::Object(sorted)
         }
@@ -251,9 +229,7 @@ fn test_trace_block_by_earliest() {
     let r1 = mega_reth
         .call("debug_traceBlockByNumber", params.clone())
         .expect("mega-reth request failed");
-    let r2 = dts
-        .call("debug_traceBlockByNumber", params)
-        .expect("dts request failed");
+    let r2 = dts.call("debug_traceBlockByNumber", params).expect("dts request failed");
 
     // Both should succeed (genesis block is valid) or both should error
     match (&r1.error, &r2.error) {
@@ -308,12 +284,9 @@ fn test_trace_block_by_latest() {
 
     for (name, opts) in &tracers {
         let params = json!([&block_hex, opts]);
-        let r1 = mega_reth
-            .call("debug_traceBlockByNumber", params.clone())
-            .expect("mega-reth failed");
-        let r2 = dts
-            .call("debug_traceBlockByNumber", params)
-            .expect("dts failed");
+        let r1 =
+            mega_reth.call("debug_traceBlockByNumber", params.clone()).expect("mega-reth failed");
+        let r2 = dts.call("debug_traceBlockByNumber", params).expect("dts failed");
 
         assert_responses_match(&format!("latest-3/{}", name), &r1, &r2);
     }
@@ -334,9 +307,7 @@ fn test_trace_block_by_pending_returns_error() {
     let dts = RpcClient::new(&config.debug_trace_server_url, config.request_timeout);
 
     let params = json!(["pending", {"tracer": "callTracer"}]);
-    let resp = dts
-        .call("debug_traceBlockByNumber", params)
-        .expect("request failed");
+    let resp = dts.call("debug_traceBlockByNumber", params).expect("request failed");
 
     // Should return an error since pending block is not supported for tracing
     assert!(
@@ -350,11 +321,8 @@ fn test_trace_block_by_pending_returns_error() {
     println!("  Error returned: {}", error_str);
 
     // Verify error mentions "pending" and "not supported"
-    let error_msg = error
-        .get("message")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&error_str)
-        .to_lowercase();
+    let error_msg =
+        error.get("message").and_then(|v| v.as_str()).unwrap_or(&error_str).to_lowercase();
     assert!(
         error_msg.contains("pending") || error_msg.contains("not supported"),
         "Error message should mention pending: {}",
@@ -393,12 +361,8 @@ fn test_trace_block_by_finalized() {
     }
 
     let params = json!(["finalized", {"tracer": "callTracer"}]);
-    let r1 = mega_reth
-        .call("debug_traceBlockByNumber", params.clone())
-        .expect("mega-reth failed");
-    let r2 = dts
-        .call("debug_traceBlockByNumber", params)
-        .expect("dts failed");
+    let r1 = mega_reth.call("debug_traceBlockByNumber", params.clone()).expect("mega-reth failed");
+    let r2 = dts.call("debug_traceBlockByNumber", params).expect("dts failed");
 
     match (&r1.error, &r2.error) {
         (Some(_), Some(_)) => {
@@ -446,12 +410,8 @@ fn test_trace_block_by_safe() {
     }
 
     let params = json!(["safe", {"tracer": "callTracer"}]);
-    let r1 = mega_reth
-        .call("debug_traceBlockByNumber", params.clone())
-        .expect("mega-reth failed");
-    let r2 = dts
-        .call("debug_traceBlockByNumber", params)
-        .expect("dts failed");
+    let r1 = mega_reth.call("debug_traceBlockByNumber", params.clone()).expect("mega-reth failed");
+    let r2 = dts.call("debug_traceBlockByNumber", params).expect("dts failed");
 
     match (&r1.error, &r2.error) {
         (Some(_), Some(_)) => {
@@ -489,16 +449,9 @@ fn test_trace_block_number_vs_hash_consistency() {
 
     let (block_num, block_hash) =
         find_block_with_txs(&mega_reth).expect("No blocks with txs found");
-    println!(
-        "  Testing block {} (hash: {}...)",
-        block_num,
-        &block_hash[..18]
-    );
+    println!("  Testing block {} (hash: {}...)", block_num, &block_hash[..18]);
 
-    let tracers = vec![
-        ("callTracer", json!({"tracer": "callTracer"})),
-        ("default", json!({})),
-    ];
+    let tracers = vec![("callTracer", json!({"tracer": "callTracer"})), ("default", json!({}))];
 
     for (name, opts) in &tracers {
         let block_hex = format!("0x{:x}", block_num);
@@ -513,16 +466,8 @@ fn test_trace_block_number_vs_hash_consistency() {
             .call("debug_traceBlockByHash", json!([&block_hash, opts]))
             .expect("traceBlockByHash failed");
 
-        assert!(
-            by_number.error.is_none(),
-            "traceBlockByNumber error: {:?}",
-            by_number.error
-        );
-        assert!(
-            by_hash.error.is_none(),
-            "traceBlockByHash error: {:?}",
-            by_hash.error
-        );
+        assert!(by_number.error.is_none(), "traceBlockByNumber error: {:?}", by_number.error);
+        assert!(by_hash.error.is_none(), "traceBlockByHash error: {:?}", by_hash.error);
 
         let n1 = normalize_json(by_number.result.as_ref().unwrap());
         let n2 = normalize_json(by_hash.result.as_ref().unwrap());
@@ -555,12 +500,8 @@ fn test_parity_trace_block_consistency() {
     let block_hex = format!("0x{:x}", block_num);
     println!("  Testing block {}", block_num);
 
-    let r1 = mega_reth
-        .call("trace_block", json!([&block_hex]))
-        .expect("mega-reth failed");
-    let r2 = dts
-        .call("trace_block", json!([&block_hex]))
-        .expect("dts failed");
+    let r1 = mega_reth.call("trace_block", json!([&block_hex])).expect("mega-reth failed");
+    let r2 = dts.call("trace_block", json!([&block_hex])).expect("dts failed");
 
     assert_responses_match("trace_block", &r1, &r2);
 
@@ -584,10 +525,7 @@ fn test_parity_trace_transaction_consistency() {
 
     // Get full block to find tx hashes
     let resp = mega_reth
-        .call(
-            "eth_getBlockByNumber",
-            json!([format!("0x{:x}", block_num), true]),
-        )
+        .call("eth_getBlockByNumber", json!([format!("0x{:x}", block_num), true]))
         .expect("Failed to get block");
 
     let txs = resp
@@ -597,19 +535,12 @@ fn test_parity_trace_transaction_consistency() {
         .and_then(|t| t.as_array())
         .expect("No transactions");
 
-    let tx_hash = txs[0]
-        .get("hash")
-        .and_then(|h| h.as_str())
-        .expect("No tx hash");
+    let tx_hash = txs[0].get("hash").and_then(|h| h.as_str()).expect("No tx hash");
 
     println!("  Testing tx {}...", &tx_hash[..18]);
 
-    let r1 = mega_reth
-        .call("trace_transaction", json!([tx_hash]))
-        .expect("mega-reth failed");
-    let r2 = dts
-        .call("trace_transaction", json!([tx_hash]))
-        .expect("dts failed");
+    let r1 = mega_reth.call("trace_transaction", json!([tx_hash])).expect("mega-reth failed");
+    let r2 = dts.call("trace_transaction", json!([tx_hash])).expect("dts failed");
 
     assert_responses_match("trace_transaction", &r1, &r2);
 
@@ -630,10 +561,7 @@ fn send_tx_with_retry(
     for attempt in 0..max_retries {
         // Get fresh nonce for each attempt
         let resp = mega_reth
-            .call(
-                "eth_getTransactionCount",
-                json!([format!("{:?}", signer.address()), "pending"]),
-            )
+            .call("eth_getTransactionCount", json!([format!("{:?}", signer.address()), "pending"]))
             .unwrap();
         let nonce_hex = resp.result.as_ref().unwrap().as_str().unwrap();
         let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16).unwrap();
@@ -646,10 +574,7 @@ fn send_tx_with_retry(
         let gas_price = base_gas_price + (base_gas_price * attempt as u128 / 10);
 
         if attempt > 0 {
-            println!(
-                "    Retry {}: nonce={}, gas_price={}",
-                attempt, nonce, gas_price
-            );
+            println!("    Retry {}: nonce={}, gas_price={}", attempt, nonce, gas_price);
         }
 
         let tx = TxLegacy {
@@ -662,18 +587,14 @@ fn send_tx_with_retry(
             input: Bytes::default(),
         };
 
-        let signature = signer
-            .sign_transaction_sync(&mut tx.clone())
-            .expect("Failed to sign");
+        let signature = signer.sign_transaction_sync(&mut tx.clone()).expect("Failed to sign");
 
         let signed_tx = tx.into_signed(signature);
         let mut encoded = Vec::new();
         signed_tx.rlp_encode(&mut encoded);
         let raw_tx = format!("0x{}", hex::encode(&encoded));
 
-        let resp = mega_reth
-            .call("eth_sendRawTransaction", json!([raw_tx]))
-            .expect("send failed");
+        let resp = mega_reth.call("eth_sendRawTransaction", json!([raw_tx])).expect("send failed");
 
         if let Some(error) = &resp.error {
             let error_msg = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
@@ -735,9 +656,7 @@ fn test_send_tx_and_trace() {
     let mut block_number = None;
     for _ in 0..120 {
         std::thread::sleep(Duration::from_millis(500));
-        let resp = mega_reth
-            .call("eth_getTransactionReceipt", json!([&tx_hash]))
-            .unwrap();
+        let resp = mega_reth.call("eth_getTransactionReceipt", json!([&tx_hash])).unwrap();
         if let Some(receipt) = resp.result {
             if !receipt.is_null() {
                 if let Some(bn) = receipt.get("blockNumber").and_then(|v| v.as_str()) {
@@ -761,10 +680,7 @@ fn test_send_tx_and_trace() {
     let tracers = vec![
         ("default", json!({})),
         ("callTracer", json!({"tracer": "callTracer"})),
-        (
-            "callTracer+logs",
-            json!({"tracer": "callTracer", "tracerConfig": {"withLog": true}}),
-        ),
+        ("callTracer+logs", json!({"tracer": "callTracer", "tracerConfig": {"withLog": true}})),
         ("prestateTracer", json!({"tracer": "prestateTracer"})),
         ("4byteTracer", json!({"tracer": "4byteTracer"})),
         ("noopTracer", json!({"tracer": "noopTracer"})),
@@ -774,12 +690,9 @@ fn test_send_tx_and_trace() {
     println!("\n  Testing debug_traceBlockByNumber:");
     for (name, opts) in &tracers {
         let params = json!([&block_hex, opts]);
-        let r1 = mega_reth
-            .call("debug_traceBlockByNumber", params.clone())
-            .expect("mega-reth failed");
-        let r2 = dts
-            .call("debug_traceBlockByNumber", params)
-            .expect("dts failed");
+        let r1 =
+            mega_reth.call("debug_traceBlockByNumber", params.clone()).expect("mega-reth failed");
+        let r2 = dts.call("debug_traceBlockByNumber", params).expect("dts failed");
         assert_responses_match(&format!("block/{}", name), &r1, &r2);
     }
 
@@ -787,33 +700,22 @@ fn test_send_tx_and_trace() {
     println!("\n  Testing debug_traceTransaction:");
     for (name, opts) in &tracers {
         let params = json!([&tx_hash, opts]);
-        let r1 = mega_reth
-            .call("debug_traceTransaction", params.clone())
-            .expect("mega-reth failed");
-        let r2 = dts
-            .call("debug_traceTransaction", params)
-            .expect("dts failed");
+        let r1 =
+            mega_reth.call("debug_traceTransaction", params.clone()).expect("mega-reth failed");
+        let r2 = dts.call("debug_traceTransaction", params).expect("dts failed");
         assert_responses_match(&format!("tx/{}", name), &r1, &r2);
     }
 
     // Test trace_block
     println!("\n  Testing trace_block:");
-    let r1 = mega_reth
-        .call("trace_block", json!([&block_hex]))
-        .expect("mega-reth failed");
-    let r2 = dts
-        .call("trace_block", json!([&block_hex]))
-        .expect("dts failed");
+    let r1 = mega_reth.call("trace_block", json!([&block_hex])).expect("mega-reth failed");
+    let r2 = dts.call("trace_block", json!([&block_hex])).expect("dts failed");
     assert_responses_match("trace_block", &r1, &r2);
 
     // Test trace_transaction
     println!("\n  Testing trace_transaction:");
-    let r1 = mega_reth
-        .call("trace_transaction", json!([&tx_hash]))
-        .expect("mega-reth failed");
-    let r2 = dts
-        .call("trace_transaction", json!([&tx_hash]))
-        .expect("dts failed");
+    let r1 = mega_reth.call("trace_transaction", json!([&tx_hash])).expect("mega-reth failed");
+    let r2 = dts.call("trace_transaction", json!([&tx_hash])).expect("dts failed");
     assert_responses_match("trace_transaction", &r1, &r2);
 
     println!("\n  PASS: send tx and trace verified");
@@ -830,10 +732,7 @@ fn deploy_contract_with_retry(
     for attempt in 0..max_retries {
         // Get fresh nonce for each attempt
         let resp = mega_reth
-            .call(
-                "eth_getTransactionCount",
-                json!([format!("{:?}", signer.address()), "pending"]),
-            )
+            .call("eth_getTransactionCount", json!([format!("{:?}", signer.address()), "pending"]))
             .unwrap();
         let nonce_hex = resp.result.as_ref().unwrap().as_str().unwrap();
         let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16).unwrap();
@@ -845,10 +744,7 @@ fn deploy_contract_with_retry(
         let gas_price = base_gas_price + (base_gas_price * attempt as u128 / 10);
 
         if attempt > 0 {
-            println!(
-                "    Retry {}: nonce={}, gas_price={}",
-                attempt, nonce, gas_price
-            );
+            println!("    Retry {}: nonce={}, gas_price={}", attempt, nonce, gas_price);
         }
 
         let tx = TxLegacy {
@@ -861,18 +757,14 @@ fn deploy_contract_with_retry(
             input: Bytes::from(bytecode.clone()),
         };
 
-        let signature = signer
-            .sign_transaction_sync(&mut tx.clone())
-            .expect("Failed to sign");
+        let signature = signer.sign_transaction_sync(&mut tx.clone()).expect("Failed to sign");
 
         let signed_tx = tx.into_signed(signature);
         let mut encoded = Vec::new();
         signed_tx.rlp_encode(&mut encoded);
         let raw_tx = format!("0x{}", hex::encode(&encoded));
 
-        let resp = mega_reth
-            .call("eth_sendRawTransaction", json!([raw_tx]))
-            .expect("send failed");
+        let resp = mega_reth.call("eth_sendRawTransaction", json!([raw_tx])).expect("send failed");
 
         if let Some(error) = &resp.error {
             let error_msg = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
@@ -929,9 +821,7 @@ fn test_deploy_contract_and_trace() {
     let mut block_number = None;
     for _ in 0..120 {
         std::thread::sleep(Duration::from_millis(500));
-        let resp = mega_reth
-            .call("eth_getTransactionReceipt", json!([&tx_hash]))
-            .unwrap();
+        let resp = mega_reth.call("eth_getTransactionReceipt", json!([&tx_hash])).unwrap();
         if let Some(receipt) = resp.result {
             if !receipt.is_null() {
                 if let Some(bn) = receipt.get("blockNumber").and_then(|v| v.as_str()) {
@@ -963,12 +853,9 @@ fn test_deploy_contract_and_trace() {
 
     for (name, opts) in &tracers {
         let params = json!([&block_hex, opts]);
-        let r1 = mega_reth
-            .call("debug_traceBlockByNumber", params.clone())
-            .expect("mega-reth failed");
-        let r2 = dts
-            .call("debug_traceBlockByNumber", params)
-            .expect("dts failed");
+        let r1 =
+            mega_reth.call("debug_traceBlockByNumber", params.clone()).expect("mega-reth failed");
+        let r2 = dts.call("debug_traceBlockByNumber", params).expect("dts failed");
         assert_responses_match(&format!("deploy/{}", name), &r1, &r2);
     }
 
@@ -976,12 +863,9 @@ fn test_deploy_contract_and_trace() {
     println!("\n  Tracing deployment transaction:");
     for (name, opts) in &tracers {
         let params = json!([&tx_hash, opts]);
-        let r1 = mega_reth
-            .call("debug_traceTransaction", params.clone())
-            .expect("mega-reth failed");
-        let r2 = dts
-            .call("debug_traceTransaction", params)
-            .expect("dts failed");
+        let r1 =
+            mega_reth.call("debug_traceTransaction", params.clone()).expect("mega-reth failed");
+        let r2 = dts.call("debug_traceTransaction", params).expect("dts failed");
         assert_responses_match(&format!("deploy-tx/{}", name), &r1, &r2);
     }
 
@@ -1019,21 +903,17 @@ fn test_cache_correctness() {
         let params = json!([&block_hex, opts]);
 
         // First request (may be cache miss)
-        let r1 = dts
-            .call("debug_traceBlockByNumber", params.clone())
-            .expect("first request failed");
+        let r1 =
+            dts.call("debug_traceBlockByNumber", params.clone()).expect("first request failed");
         assert!(r1.error.is_none(), "first request error: {:?}", r1.error);
 
         // Second request (should be cache hit)
-        let r2 = dts
-            .call("debug_traceBlockByNumber", params.clone())
-            .expect("second request failed");
+        let r2 =
+            dts.call("debug_traceBlockByNumber", params.clone()).expect("second request failed");
         assert!(r2.error.is_none(), "second request error: {:?}", r2.error);
 
         // Third request
-        let r3 = dts
-            .call("debug_traceBlockByNumber", params)
-            .expect("third request failed");
+        let r3 = dts.call("debug_traceBlockByNumber", params).expect("third request failed");
         assert!(r3.error.is_none(), "third request error: {:?}", r3.error);
 
         // All three must be identical

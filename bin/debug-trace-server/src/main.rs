@@ -161,11 +161,7 @@ const DEFAULT_PRUNER_INTERVAL_SECS: u64 = 300;
 /// Parses a hex string into a BlockHash.
 fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
     let hash_bytes = hex::decode(hex_str)?;
-    ensure!(
-        hash_bytes.len() == 32,
-        "Block hash must be 32 bytes, got {}",
-        hash_bytes.len()
-    );
+    ensure!(hash_bytes.len() == 32, "Block hash must be 32 bytes, got {}", hash_bytes.len());
     Ok(BlockHash::from_slice(&hash_bytes))
 }
 
@@ -216,11 +212,8 @@ async fn main() -> Result<()> {
     )?);
     let validator_db = init_validator_db(&args, &rpc_client).await?;
 
-    let data_provider = Arc::new(DataProvider::new(
-        rpc_client.clone(),
-        validator_db.clone(),
-        args.witness_timeout,
-    ));
+    let data_provider =
+        Arc::new(DataProvider::new(rpc_client.clone(), validator_db.clone(), args.witness_timeout));
 
     let chain_spec = load_chain_spec(&args)?;
 
@@ -266,11 +259,7 @@ async fn main() -> Result<()> {
         ));
 
         // Spawn history pruner to prevent unbounded database growth
-        task::spawn(history_pruner(
-            Arc::clone(db),
-            args.blocks_to_keep,
-            args.pruner_interval_secs,
-        ));
+        task::spawn(history_pruner(Arc::clone(db), args.blocks_to_keep, args.pruner_interval_secs));
     }
 
     // Create RPC context and module
@@ -279,10 +268,7 @@ async fn main() -> Result<()> {
     rpc_service::register_all_methods(&mut module)?;
 
     // Start server
-    let server = Server::builder()
-        .max_response_body_size(u32::MAX)
-        .build(&args.addr)
-        .await?;
+    let server = Server::builder().max_response_body_size(u32::MAX).build(&args.addr).await?;
     let addr = server.local_addr()?;
     let handle = server.start(module);
 
@@ -294,7 +280,8 @@ async fn main() -> Result<()> {
 
 /// Initializes the validator database if data_dir is provided.
 /// Returns the database if configured, None otherwise.
-/// Note: Chain tracker is spawned separately in main() to allow passing the response cache callback.
+/// Note: Chain tracker is spawned separately in main() to allow passing the response cache
+/// callback.
 #[instrument(skip_all, name = "init_db")]
 async fn init_validator_db(
     args: &Args,
@@ -321,10 +308,7 @@ async fn init_validator_db(
         debug!(start_block = %start_block_str, "Initializing from specified start block");
         let block_hash = parse_block_hash(start_block_str)?;
         loop {
-            match rpc_client
-                .get_block(BlockId::Hash(block_hash.into()), false)
-                .await
-            {
+            match rpc_client.get_block(BlockId::Hash(block_hash.into()), false).await {
                 Ok(block) => break block,
                 Err(e) => {
                     warn!(

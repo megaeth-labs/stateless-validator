@@ -225,10 +225,7 @@ async fn run() -> Result<()> {
         let block_hash = parse_block_hash(start_block_str)?;
         let block = loop {
             let start = Instant::now();
-            match client
-                .get_block(BlockId::Hash(block_hash.into()), false)
-                .await
-            {
+            match client.get_block(BlockId::Hash(block_hash.into()), false).await {
                 Ok(block) => {
                     metrics::on_rpc_complete(
                         metrics::RpcMethod::EthGetBlockByNumber,
@@ -668,11 +665,7 @@ async fn validation_reporter(
             )
             .await;
 
-        metrics::on_rpc_complete(
-            metrics::RpcMethod::MegaSetValidatedBlocks,
-            result.is_ok(),
-            None,
-        );
+        metrics::on_rpc_complete(metrics::RpcMethod::MegaSetValidatedBlocks, result.is_ok(), None);
 
         match result {
             Ok(response) if response.accepted => {

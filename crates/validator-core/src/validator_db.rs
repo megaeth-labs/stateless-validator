@@ -724,11 +724,7 @@ impl ValidatorDB {
                     let block = decode_block_from_slice(&data.value());
                     (
                         block.header.state_root.0,
-                        block
-                            .header
-                            .withdrawals_root
-                            .map(|r| r.0)
-                            .unwrap_or([0u8; 32]),
+                        block.header.withdrawals_root.map(|r| r.0).unwrap_or([0u8; 32]),
                     )
                 } else {
                     // Fallback to zeros if block data doesn't exist
@@ -736,10 +732,8 @@ impl ValidatorDB {
                 };
 
             // Move block from remote to canonical chain
-            canonical_chain.insert(
-                block_number,
-                (block_hash_bytes, post_state_root, post_withdrawals_root),
-            )?;
+            canonical_chain
+                .insert(block_number, (block_hash_bytes, post_state_root, post_withdrawals_root))?;
             remote_chain.remove(block_number)?;
         }
         write_txn.commit()?;
@@ -1174,12 +1168,10 @@ impl ValidatorDB {
         let witnesses = read_txn.open_table(WITNESSES)?;
         let txn_ms = start.elapsed().as_millis();
 
-        let block_bytes = block_data
-            .get(block_hash.0)?
-            .ok_or(ValidationDbError::MissingData {
-                kind: MissingDataKind::BlockData,
-                block_hash,
-            })?;
+        let block_bytes = block_data.get(block_hash.0)?.ok_or(ValidationDbError::MissingData {
+            kind: MissingDataKind::BlockData,
+            block_hash,
+        })?;
         let block_bytes_value = block_bytes.value();
         let block_bytes_len = block_bytes_value.len();
         let db_read_block_ms = start.elapsed().as_millis();
@@ -1189,10 +1181,7 @@ impl ValidatorDB {
 
         let witness_bytes = witnesses
             .get(block_hash.0)?
-            .ok_or(ValidationDbError::MissingData {
-                kind: MissingDataKind::Witness,
-                block_hash,
-            })?;
+            .ok_or(ValidationDbError::MissingData { kind: MissingDataKind::Witness, block_hash })?;
         let witness_bytes_value = witness_bytes.value();
         let witness_bytes_len = witness_bytes_value.len();
         let db_read_witness_ms = start.elapsed().as_millis();

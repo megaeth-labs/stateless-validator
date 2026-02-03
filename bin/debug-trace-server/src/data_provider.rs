@@ -192,10 +192,9 @@ impl DataProvider {
             .await?
             .ok_or_else(|| eyre::eyre!("Transaction {} not found", tx_hash))?;
 
-        let tx_index = tx
-            .transaction_index
-            .ok_or_else(|| eyre::eyre!("Transaction {} is pending", tx_hash))?
-            as usize;
+        let tx_index =
+            tx.transaction_index.ok_or_else(|| eyre::eyre!("Transaction {} is pending", tx_hash))?
+                as usize;
 
         debug!(
             tx_hash = %tx_hash,
@@ -233,10 +232,7 @@ impl DataProvider {
             BlockNumberOrTag::Pending => Err(eyre::eyre!("Pending block not supported")),
             BlockNumberOrTag::Finalized | BlockNumberOrTag::Safe => {
                 // Fetch the block from upstream RPC to resolve the tag
-                let block = self
-                    .rpc_client
-                    .get_block(BlockId::Number(tag), false)
-                    .await?;
+                let block = self.rpc_client.get_block(BlockId::Number(tag), false).await?;
                 Ok(block.header.number)
             }
         }
@@ -255,11 +251,7 @@ impl DataProvider {
         let code_hashes = validator_core::extract_code_hashes(&witness);
         let contracts = self.get_contracts_with_db(db, &code_hashes).await?;
 
-        Ok(BlockData {
-            block,
-            witness,
-            contracts,
-        })
+        Ok(BlockData { block, witness, contracts })
     }
 
     /// Fetches block data from RPC by block hash with single-flight coalescing.
@@ -305,10 +297,7 @@ impl DataProvider {
         let result = self.do_fetch_block_data(block_hash).await;
 
         // Convert result to string error for broadcast (eyre::Error is not Clone)
-        let broadcast_result = result
-            .as_ref()
-            .map(|data| data.clone())
-            .map_err(|e| e.to_string());
+        let broadcast_result = result.as_ref().map(|data| data.clone()).map_err(|e| e.to_string());
 
         // Broadcast result to all waiters (ignore send errors - no receivers is ok)
         let _ = tx.send(broadcast_result);
@@ -328,34 +317,23 @@ impl DataProvider {
     /// 4. Extract code hashes from witness and fetch contract bytecodes
     async fn do_fetch_block_data(&self, block_hash: B256) -> Result<BlockData> {
         // Fetch block without transactions first to get the number
-        let block = self
-            .rpc_client
-            .get_block(BlockId::Hash(block_hash.into()), false)
-            .await?;
+        let block = self.rpc_client.get_block(BlockId::Hash(block_hash.into()), false).await?;
 
         // Fetch witness with retry
-        let (salt_witness, _mpt_witness) = self
-            .fetch_witness_with_retry(block.header.number, block.header.hash)
-            .await?;
+        let (salt_witness, _mpt_witness) =
+            self.fetch_witness_with_retry(block.header.number, block.header.hash).await?;
 
         // Convert SaltWitness to LightWitness
         let witness = LightWitness::from(salt_witness);
 
         // Fetch block with full transactions
-        let block = self
-            .rpc_client
-            .get_block(BlockId::Hash(block_hash.into()), true)
-            .await?;
+        let block = self.rpc_client.get_block(BlockId::Hash(block_hash.into()), true).await?;
 
         // Extract code hashes and fetch contracts
         let code_hashes = validator_core::extract_code_hashes(&witness);
         let contracts = self.get_contracts(&code_hashes).await?;
 
-        Ok(BlockData {
-            block,
-            witness,
-            contracts,
-        })
+        Ok(BlockData { block, witness, contracts })
     }
 
     /// Fetches witness data with retry logic.
@@ -610,10 +588,7 @@ mod tests {
         // Test that BlockId can be constructed from BlockNumberOrTag
         let tag = BlockNumberOrTag::Finalized;
         let block_id = BlockId::Number(tag);
-        assert!(matches!(
-            block_id,
-            BlockId::Number(BlockNumberOrTag::Finalized)
-        ));
+        assert!(matches!(block_id, BlockId::Number(BlockNumberOrTag::Finalized)));
     }
 
     #[test]

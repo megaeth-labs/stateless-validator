@@ -35,10 +35,7 @@ fn test_prune_history_basic() {
 
     // Prune everything before block 50 (should prune nothing since anchor is at 100)
     let pruned = db.prune_history(50).expect("Failed to prune");
-    assert_eq!(
-        pruned, 0,
-        "Should not prune anything when no blocks are older"
-    );
+    assert_eq!(pruned, 0, "Should not prune anything when no blocks are older");
 
     println!("✓ Basic prune_history test passed");
 }
@@ -129,10 +126,7 @@ fn test_pruner_simulation() {
         interval_secs: u64,
     }
 
-    let pruner = PrunerState {
-        blocks_to_keep: 1000,
-        interval_secs: 300,
-    };
+    let pruner = PrunerState { blocks_to_keep: 1000, interval_secs: 300 };
 
     // Simulate different tip scenarios
     let test_cases: Vec<(u64, u64)> = vec![
@@ -152,14 +146,8 @@ fn test_pruner_simulation() {
     }
 
     // Verify interval is reasonable
-    assert!(
-        pruner.interval_secs >= 60,
-        "Pruner interval should be at least 1 minute"
-    );
-    assert!(
-        pruner.interval_secs <= 3600,
-        "Pruner interval should be at most 1 hour"
-    );
+    assert!(pruner.interval_secs >= 60, "Pruner interval should be at least 1 minute");
+    assert!(pruner.interval_secs <= 3600, "Pruner interval should be at most 1 hour");
 
     println!("✓ Pruner simulation test passed");
 }

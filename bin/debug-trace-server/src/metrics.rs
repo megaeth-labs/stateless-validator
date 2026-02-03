@@ -86,15 +86,9 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
     describe_gauge!(names::CACHE_SIZE, "Current cache size");
 
     // Upstream RPC metrics
-    describe_counter!(
-        names::UPSTREAM_REQUESTS_TOTAL,
-        "Total upstream RPC requests"
-    );
+    describe_counter!(names::UPSTREAM_REQUESTS_TOTAL, "Total upstream RPC requests");
     describe_counter!(names::UPSTREAM_ERRORS_TOTAL, "Total upstream RPC errors");
-    describe_histogram!(
-        names::UPSTREAM_DURATION,
-        "Duration of upstream RPC requests"
-    );
+    describe_histogram!(names::UPSTREAM_DURATION, "Duration of upstream RPC requests");
 
     // Tracing metrics
     describe_counter!(names::TRANSACTIONS_TRACED, "Total transactions traced");

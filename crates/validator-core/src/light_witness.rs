@@ -38,10 +38,7 @@ pub struct LightWitness {
 /// to convert to LightWitness for consistent handling.
 impl From<salt::SaltWitness> for LightWitness {
     fn from(witness: salt::SaltWitness) -> Self {
-        Self {
-            kvs: witness.kvs,
-            levels: witness.proof.levels.into_iter().collect(),
-        }
+        Self { kvs: witness.kvs, levels: witness.proof.levels.into_iter().collect() }
     }
 }
 
@@ -66,9 +63,7 @@ impl StateReader for LightWitness {
         match self.kvs.get(&key) {
             Some(Some(value)) => Ok(Some(value.clone())),
             Some(None) => Ok(None),
-            None => Err(LightWitnessError {
-                message: "Key not in witness",
-            }),
+            None => Err(LightWitnessError { message: "Key not in witness" }),
         }
     }
 
@@ -76,23 +71,16 @@ impl StateReader for LightWitness {
         &self,
         _range: RangeInclusive<SaltKey>,
     ) -> Result<Vec<(SaltKey, SaltValue)>, Self::Error> {
-        Err(LightWitnessError {
-            message: "Range queries not supported",
-        })
+        Err(LightWitnessError { message: "Range queries not supported" })
     }
 
     fn metadata(&self, bucket_id: BucketId) -> Result<BucketMeta, Self::Error> {
         let metadata_key = bucket_metadata_key(bucket_id);
         match self.kvs.get(&metadata_key) {
-            Some(Some(salt_value)) => {
-                BucketMeta::try_from(salt_value.clone()).map_err(|_| LightWitnessError {
-                    message: "Failed to decode metadata",
-                })
-            }
+            Some(Some(salt_value)) => BucketMeta::try_from(salt_value.clone())
+                .map_err(|_| LightWitnessError { message: "Failed to decode metadata" }),
             Some(None) => unreachable!("Metadata should never be stored as None in witness"),
-            None => Err(LightWitnessError {
-                message: "Metadata not in witness",
-            }),
+            None => Err(LightWitnessError { message: "Metadata not in witness" }),
         }
     }
 
@@ -118,18 +106,14 @@ impl StateReader for LightWitness {
     }
 
     fn plain_value_fast(&self, _plain_key: &[u8]) -> Result<SaltKey, Self::Error> {
-        Err(LightWitnessError {
-            message: "plain_value_fast not supported",
-        })
+        Err(LightWitnessError { message: "plain_value_fast not supported" })
     }
 
     fn get_subtree_levels(&self, bucket_id: BucketId) -> Result<usize, Self::Error> {
         self.levels
             .get(&bucket_id)
             .map(|&level| level as usize)
-            .ok_or(LightWitnessError {
-                message: "Bucket root not in witness",
-            })
+            .ok_or(LightWitnessError { message: "Bucket root not in witness" })
     }
 }
 
@@ -161,10 +145,7 @@ impl From<LightWitness> for LightWitnessExecutor {
             }
         }
 
-        Self {
-            direct_lookup_tbl,
-            light_witness,
-        }
+        Self { direct_lookup_tbl, light_witness }
     }
 }
 
@@ -193,9 +174,7 @@ impl StateReader for LightWitnessExecutor {
     fn plain_value_fast(&self, plain_key: &[u8]) -> Result<SaltKey, Self::Error> {
         match self.direct_lookup_tbl.get(plain_key) {
             Some(salt_key) => Ok(*salt_key),
-            None => Err(LightWitnessError {
-                message: "Plain key not in witness",
-            }),
+            None => Err(LightWitnessError { message: "Plain key not in witness" }),
         }
     }
 
@@ -217,10 +196,7 @@ mod tests {
 
     #[test]
     fn test_light_witness_empty() {
-        let fast = LightWitness {
-            kvs: BTreeMap::new(),
-            levels: FxHashMap::default(),
-        };
+        let fast = LightWitness { kvs: BTreeMap::new(), levels: FxHashMap::default() };
         assert!(fast.kvs.is_empty());
         assert!(fast.levels.is_empty());
     }

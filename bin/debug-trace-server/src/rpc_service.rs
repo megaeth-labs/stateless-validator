@@ -58,11 +58,7 @@ impl RpcContext {
         chain_spec: Arc<ChainSpec>,
         response_cache: ResponseCache,
     ) -> Self {
-        Self {
-            data_provider,
-            chain_spec,
-            response_cache,
-        }
+        Self { data_provider, chain_spec, response_cache }
     }
 }
 
@@ -70,9 +66,56 @@ impl RpcContext {
 // Error Helpers
 // ---------------------------------------------------------------------------
 
-/// Creates a JSON-RPC internal error with the given message.
+/// Error code for resource not found (matches mega-reth).
+const ERROR_CODE_RESOURCE_NOT_FOUND: i32 = -32001;
+
+/// Error code for internal errors.
+const ERROR_CODE_INTERNAL: i32 = -32000;
+
+/// Creates a JSON-RPC "resource not found" error (code -32001).
+/// Used for block not found, transaction not found, etc.
+fn rpc_err_not_found(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
+    jsonrpsee::types::ErrorObjectOwned::owned(ERROR_CODE_RESOURCE_NOT_FOUND, msg, None::<()>)
+}
+
+/// Creates a JSON-RPC internal error (code -32000).
+/// Used for execution failures, serialization errors, etc.
 fn rpc_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
-    jsonrpsee::types::ErrorObjectOwned::owned(-32000, msg, None::<()>)
+    jsonrpsee::types::ErrorObjectOwned::owned(ERROR_CODE_INTERNAL, msg, None::<()>)
+}
+
+/// Converts a block data fetch error to an appropriate RPC error.
+/// Returns "block not found" for missing blocks/witnesses, internal error otherwise.
+fn block_data_err(block_num: u64, e: eyre::Report) -> jsonrpsee::types::ErrorObjectOwned {
+    let err_str = e.to_string().to_lowercase();
+    // Check for "not found" or "timeout" patterns - treat as resource not found
+    if err_str.contains("not found") || err_str.contains("timeout") {
+        rpc_err_not_found(format!("block not found: {:#x}", block_num))
+    } else {
+        rpc_err(format!("internal error"))
+    }
+}
+
+/// Converts a block data fetch error (by hash) to an appropriate RPC error.
+fn block_data_err_by_hash(block_hash: B256, e: eyre::Report) -> jsonrpsee::types::ErrorObjectOwned {
+    let err_str = e.to_string().to_lowercase();
+    if err_str.contains("not found") || err_str.contains("timeout") {
+        rpc_err_not_found(format!("block not found: hash {}", block_hash))
+    } else {
+        rpc_err(format!("internal error"))
+    }
+}
+
+/// Converts a transaction lookup error to an appropriate RPC error.
+fn tx_data_err(e: eyre::Report) -> jsonrpsee::types::ErrorObjectOwned {
+    let err_str = e.to_string().to_lowercase();
+    if err_str.contains("not found") || err_str.contains("timeout") {
+        rpc_err_not_found("transaction not found".to_string())
+    } else if err_str.contains("pending") {
+        rpc_err_not_found("transaction not found".to_string())
+    } else {
+        rpc_err(format!("internal error"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -312,7 +355,7 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .data_provider
             .get_block_data(block_num)
             .await
-            .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
+            .map_err(|e| block_data_err(block_num, e))?;
         let block_hash = data.block.header.hash;
         let result = compute_debug_trace_block(&ctx.chain_spec, &data, opts.clone()).await?;
 
@@ -364,7 +407,7 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .data_provider
             .get_block_data_by_hash(block_hash)
             .await
-            .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
+            .map_err(|e| block_data_err_by_hash(block_hash, e))?;
         let block_num = data.block.header.number;
         let tx_count = data.block.transactions.len();
         let result = compute_debug_trace_block(&ctx.chain_spec, &data, opts.clone()).await?;
@@ -417,11 +460,8 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             "Processing request"
         );
 
-        let (data, tx_index) = ctx
-            .data_provider
-            .get_block_data_for_tx(tx_hash)
-            .await
-            .map_err(|e| rpc_err(format!("Failed to get block data for tx {tx_hash:?}: {e}")))?;
+        let (data, tx_index) =
+            ctx.data_provider.get_block_data_for_tx(tx_hash).await.map_err(|e| tx_data_err(e))?;
 
         let result = validator_core::trace_transaction(
             &ctx.chain_spec,
@@ -476,11 +516,7 @@ fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .await
             .map_err(|e| rpc_err(format!("Failed to resolve block number: {e}")))?;
 
-        trace!(
-            block_number = block_num,
-            method = TRACE_BLOCK,
-            "Processing request"
-        );
+        trace!(block_number = block_num, method = TRACE_BLOCK, "Processing request");
 
         // Check cache before fetching block data
         if let Some(cached) = check_cache_by_number(
@@ -499,7 +535,7 @@ fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .data_provider
             .get_block_data(block_num)
             .await
-            .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
+            .map_err(|e| block_data_err(block_num, e))?;
 
         execute_cached_block_trace(
             &ctx,
@@ -518,6 +554,7 @@ fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
     })?;
 
     // trace_transaction (not cached - depends on tx index)
+    // Note: Returns null (not error) when transaction is not found, matching mega-reth behavior
     module.register_async_method(TRACE_TRANSACTION, |params, ctx, _| async move {
         let start = Instant::now();
         let mut seq = params.sequence();
@@ -529,11 +566,21 @@ fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             "Processing request"
         );
 
-        let (data, tx_index) = ctx
-            .data_provider
-            .get_block_data_for_tx(tx_hash)
-            .await
-            .map_err(|e| rpc_err(format!("Failed to get block data for tx {tx_hash:?}: {e}")))?;
+        // For trace_transaction, return null instead of error when tx not found
+        let (data, tx_index) = match ctx.data_provider.get_block_data_for_tx(tx_hash).await {
+            Ok(result) => result,
+            Err(e) => {
+                let err_str = e.to_string().to_lowercase();
+                if err_str.contains("not found") ||
+                    err_str.contains("pending") ||
+                    err_str.contains("timeout")
+                {
+                    // Return null for not found, matching mega-reth behavior
+                    return Ok(serde_json::Value::Null);
+                }
+                return Err(rpc_err("internal error".to_string()));
+            }
+        };
 
         let result = validator_core::parity_trace_transaction(
             &ctx.chain_spec,
@@ -661,10 +708,7 @@ mod tests {
             tx_count: 3,
         };
 
-        assert!(matches!(
-            debug_params.resource,
-            CachedResource::DebugTraceBlock
-        ));
+        assert!(matches!(debug_params.resource, CachedResource::DebugTraceBlock));
         assert!(matches!(trace_params.resource, CachedResource::TraceBlock));
     }
 

@@ -29,16 +29,12 @@ pub struct RpcClientConfig {
 impl RpcClientConfig {
     /// Creates a config for validation mode (full verification).
     pub fn validator() -> Self {
-        Self {
-            skip_block_verification: false,
-        }
+        Self { skip_block_verification: false }
     }
 
     /// Creates a config for trace/debug mode (skip verification).
     pub fn trace_server() -> Self {
-        Self {
-            skip_block_verification: true,
-        }
+        Self { skip_block_verification: true }
     }
 }
 
@@ -162,10 +158,7 @@ impl RpcClient {
 
     /// Gets the current latest block number from the blockchain.
     pub async fn get_latest_block_number(&self) -> Result<u64> {
-        self.data_provider
-            .get_block_number()
-            .await
-            .context("Failed to get block number")
+        self.data_provider.get_block_number().await.context("Failed to get block number")
     }
 
     /// Gets just the block hash for a block number.

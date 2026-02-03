@@ -45,10 +45,7 @@ pub struct ResponseCacheConfig {
 impl ResponseCacheConfig {
     /// Creates a new configuration with the given parameters.
     pub const fn new(max_bytes: u64, estimated_items: usize) -> Self {
-        Self {
-            max_bytes,
-            estimated_items,
-        }
+        Self { max_bytes, estimated_items }
     }
 }
 
@@ -181,11 +178,7 @@ impl ResponseCacheKey {
         block_number: u64,
         variant: ResponseVariant,
     ) -> Self {
-        Self {
-            resource,
-            block_number,
-            variant,
-        }
+        Self { resource, block_number, variant }
     }
 }
 
@@ -207,10 +200,7 @@ impl CachedResponse {
     pub fn new(value: serde_json::Value) -> Self {
         let json = serde_json::to_string(&value).unwrap_or_default();
         let byte_len = json.len();
-        Self {
-            json: json.into(),
-            byte_len,
-        }
+        Self { json: json.into(), byte_len }
     }
 
     /// Returns the JSON value.
@@ -275,11 +265,7 @@ impl SecondaryIndices {
         let mut inner = self.inner.write().unwrap();
         inner.hash_to_number.insert(block_hash, block_number);
         inner.number_to_hash.insert(block_number, block_hash);
-        inner
-            .number_to_keys
-            .entry(block_number)
-            .or_default()
-            .insert(key);
+        inner.number_to_keys.entry(block_number).or_default().insert(key);
     }
 
     fn remove_block(&self, block_number: u64) -> Option<HashSet<ResponseCacheKey>> {
@@ -362,9 +348,7 @@ impl ResponseCache {
     /// Creates a new response cache with the given configuration.
     pub fn new(config: ResponseCacheConfig) -> Self {
         let indices = Arc::new(SecondaryIndices::new());
-        let lifecycle = EvictionCleanupLifecycle {
-            indices: indices.clone(),
-        };
+        let lifecycle = EvictionCleanupLifecycle { indices: indices.clone() };
 
         let cache = Cache::with(
             config.estimated_items,
@@ -581,18 +565,9 @@ mod tests {
 
     #[test]
     fn test_tracer_type_parse() {
-        assert_eq!(
-            TracerType::parse("callTracer"),
-            Some(TracerType::CallTracer)
-        );
-        assert_eq!(
-            TracerType::parse("prestateTracer"),
-            Some(TracerType::PrestateTracer)
-        );
-        assert_eq!(
-            TracerType::parse("4byteTracer"),
-            Some(TracerType::FourByteTracer)
-        );
+        assert_eq!(TracerType::parse("callTracer"), Some(TracerType::CallTracer));
+        assert_eq!(TracerType::parse("prestateTracer"), Some(TracerType::PrestateTracer));
+        assert_eq!(TracerType::parse("4byteTracer"), Some(TracerType::FourByteTracer));
         assert_eq!(TracerType::parse("unknown"), None);
     }
 
@@ -620,10 +595,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_insert_and_get() {
-        let config = ResponseCacheConfig {
-            max_bytes: 1_000_000,
-            estimated_items: 100,
-        };
+        let config = ResponseCacheConfig { max_bytes: 1_000_000, estimated_items: 100 };
         let cache = ResponseCache::new(config);
 
         let block_number = 100u64;
@@ -646,10 +618,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_invalidation() {
-        let config = ResponseCacheConfig {
-            max_bytes: 1_000_000,
-            estimated_items: 100,
-        };
+        let config = ResponseCacheConfig { max_bytes: 1_000_000, estimated_items: 100 };
         let cache = ResponseCache::new(config);
 
         let block_hash = B256::from([1u8; 32]);
@@ -668,17 +637,12 @@ mod tests {
         cache.invalidate_blocks(&[block_hash]);
 
         assert_eq!(cache.len(), 0);
-        assert!(cache
-            .get(CachedResource::DebugTraceBlock, 100, variant)
-            .is_none());
+        assert!(cache.get(CachedResource::DebugTraceBlock, 100, variant).is_none());
     }
 
     #[tokio::test]
     async fn test_get_or_compute() {
-        let config = ResponseCacheConfig {
-            max_bytes: 1_000_000,
-            estimated_items: 100,
-        };
+        let config = ResponseCacheConfig { max_bytes: 1_000_000, estimated_items: 100 };
         let cache = ResponseCache::new(config);
 
         let block_hash = B256::from([1u8; 32]);
@@ -702,13 +666,9 @@ mod tests {
 
         // Second call should hit cache
         let result2 = cache
-            .get_or_compute(
-                CachedResource::DebugTraceBlock,
-                100,
-                block_hash,
-                variant,
-                || async { Ok::<_, ()>(serde_json::json!({"should_not_see": true})) },
-            )
+            .get_or_compute(CachedResource::DebugTraceBlock, 100, block_hash, variant, || async {
+                Ok::<_, ()>(serde_json::json!({"should_not_see": true}))
+            })
             .await;
 
         assert!(result2.is_ok());
@@ -730,21 +690,11 @@ mod tests {
 
     #[test]
     fn test_cache_stats_hit_rate() {
-        let stats = CacheStats {
-            entry_count: 10,
-            total_bytes: 1000,
-            hits: 80,
-            misses: 20,
-        };
+        let stats = CacheStats { entry_count: 10, total_bytes: 1000, hits: 80, misses: 20 };
         assert!((stats.hit_rate() - 80.0).abs() < 0.01);
 
         // Test zero case
-        let empty_stats = CacheStats {
-            entry_count: 0,
-            total_bytes: 0,
-            hits: 0,
-            misses: 0,
-        };
+        let empty_stats = CacheStats { entry_count: 0, total_bytes: 0, hits: 0, misses: 0 };
         assert_eq!(empty_stats.hit_rate(), 0.0);
     }
 
@@ -761,16 +711,10 @@ mod tests {
     fn test_response_cache_key_hash() {
         use std::collections::HashSet;
 
-        let key1 = ResponseCacheKey::new(
-            CachedResource::DebugTraceBlock,
-            100,
-            ResponseVariant::Default,
-        );
-        let key2 = ResponseCacheKey::new(
-            CachedResource::DebugTraceBlock,
-            100,
-            ResponseVariant::Default,
-        );
+        let key1 =
+            ResponseCacheKey::new(CachedResource::DebugTraceBlock, 100, ResponseVariant::Default);
+        let key2 =
+            ResponseCacheKey::new(CachedResource::DebugTraceBlock, 100, ResponseVariant::Default);
         let key3 = ResponseCacheKey::new(CachedResource::TraceBlock, 100, ResponseVariant::Default);
 
         let mut set = HashSet::new();
@@ -781,10 +725,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_different_variants_same_block() {
-        let config = ResponseCacheConfig {
-            max_bytes: 1_000_000,
-            estimated_items: 100,
-        };
+        let config = ResponseCacheConfig { max_bytes: 1_000_000, estimated_items: 100 };
         let cache = ResponseCache::new(config);
 
         let block_hash = B256::from([1u8; 32]);
@@ -818,26 +759,11 @@ mod tests {
 
     #[test]
     fn test_tracer_type_all_variants() {
-        assert_eq!(
-            TracerType::parse("callTracer"),
-            Some(TracerType::CallTracer)
-        );
-        assert_eq!(
-            TracerType::parse("prestateTracer"),
-            Some(TracerType::PrestateTracer)
-        );
-        assert_eq!(
-            TracerType::parse("4byteTracer"),
-            Some(TracerType::FourByteTracer)
-        );
-        assert_eq!(
-            TracerType::parse("noopTracer"),
-            Some(TracerType::NoopTracer)
-        );
-        assert_eq!(
-            TracerType::parse("flatCallTracer"),
-            Some(TracerType::FlatCallTracer)
-        );
+        assert_eq!(TracerType::parse("callTracer"), Some(TracerType::CallTracer));
+        assert_eq!(TracerType::parse("prestateTracer"), Some(TracerType::PrestateTracer));
+        assert_eq!(TracerType::parse("4byteTracer"), Some(TracerType::FourByteTracer));
+        assert_eq!(TracerType::parse("noopTracer"), Some(TracerType::NoopTracer));
+        assert_eq!(TracerType::parse("flatCallTracer"), Some(TracerType::FlatCallTracer));
         assert_eq!(TracerType::parse("unknown"), None);
     }
 
@@ -845,18 +771,12 @@ mod tests {
     fn test_response_cache_config_default() {
         let config = ResponseCacheConfig::default();
         assert_eq!(config.max_bytes, DEFAULT_RESPONSE_CACHE_MAX_BYTES);
-        assert_eq!(
-            config.estimated_items,
-            DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS
-        );
+        assert_eq!(config.estimated_items, DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS);
     }
 
     #[tokio::test]
     async fn test_cache_empty_checks() {
-        let config = ResponseCacheConfig {
-            max_bytes: 1_000_000,
-            estimated_items: 100,
-        };
+        let config = ResponseCacheConfig { max_bytes: 1_000_000, estimated_items: 100 };
         let cache = ResponseCache::new(config);
 
         assert!(cache.is_empty());
