@@ -66,6 +66,7 @@ use crate::{
     data_types::{PlainKey, PlainValue},
     database::{WitnessDatabase, WitnessExternalEnv},
     executor::{ValidationError, create_evm_env},
+    fast_witness::{FastWitness, FastWitnessExecutor},
 };
 
 // ---------------------------------------------------------------------------
@@ -101,6 +102,124 @@ pub fn extract_code_hashes(witness: &SaltWitness) -> Vec<B256> {
     code_hashes.sort();
     code_hashes.dedup();
     code_hashes
+}
+
+/// Extracts all contract code hashes from a FastWitness.
+///
+/// This is the fast version of `extract_code_hashes` that works with `FastWitness`
+/// instead of `SaltWitness`. Use this when working with DB-sourced witnesses
+/// to avoid expensive EC point validation.
+pub fn extract_code_hashes_fast(witness: &FastWitness) -> Vec<B256> {
+    let mut code_hashes: Vec<B256> = witness
+        .kvs
+        .values()
+        .filter_map(|salt_val| salt_val.as_ref())
+        .filter_map(
+            |val| match (PlainKey::decode(val.key()), PlainValue::decode(val.value())) {
+                (PlainKey::Account(_), PlainValue::Account(acc)) => {
+                    acc.codehash.filter(|&codehash| codehash != KECCAK_EMPTY)
+                }
+                _ => None,
+            },
+        )
+        .collect();
+
+    code_hashes.sort();
+    code_hashes.dedup();
+    code_hashes
+}
+
+// ---------------------------------------------------------------------------
+// Fast Tracing Environment Setup (for FastWitness)
+// ---------------------------------------------------------------------------
+
+/// Pre-built execution environment for fast tracing operations.
+///
+/// This is the fast version of `TracingEnv` that uses `FastWitnessExecutor`
+/// instead of `salt::Witness` for improved deserialization performance.
+struct FastTracingEnv<'a> {
+    /// Transactions from the block (full transaction data required).
+    transactions: &'a [OpTransaction],
+    /// Factory for creating block executors with optional inspectors.
+    executor_factory: MegaBlockExecutorFactory<
+        ChainSpec,
+        MegaEvmFactory<WitnessExternalEnv>,
+        OpAlloyReceiptBuilder,
+    >,
+    /// Block execution context (parent hash, beacon root, limits).
+    block_ctx: MegaBlockExecutionCtx,
+    /// EVM environment (block env, spec ID).
+    evm_env: alloy_evm::EvmEnv<mega_evm::MegaSpecId>,
+    /// Owned fast witness data - kept alive for State's lifetime.
+    fast_witness_executor: FastWitnessExecutor,
+}
+
+impl<'a> FastTracingEnv<'a> {
+    /// Creates a new fast tracing environment from block data.
+    fn new(
+        chain_spec: &ChainSpec,
+        block: &'a Block<OpTransaction>,
+        fast_witness: FastWitness,
+    ) -> Result<Self, ValidationError> {
+        let BlockTransactions::Full(transactions) = &block.transactions else {
+            return Err(ValidationError::BlockIncomplete);
+        };
+
+        // Create external environment oracle from fast witness
+        let ext_env = WitnessExternalEnv::from_fast_witness(&fast_witness, block.header.number)
+            .map_err(ValidationError::EnvOracleConstructionFailed)?;
+
+        // Create fast witness executor
+        let fast_witness_executor = FastWitnessExecutor::from(fast_witness);
+
+        // Create EVM environment
+        let evm_env = create_evm_env(&block.header, chain_spec);
+
+        // Create block executor factory
+        let evm_factory = MegaEvmFactory::new().with_external_env_factory(ext_env);
+        let executor_factory = MegaBlockExecutorFactory::new(
+            chain_spec.clone(),
+            evm_factory,
+            OpAlloyReceiptBuilder::default(),
+        );
+
+        // Determine block limits based on hardfork
+        let hardfork = chain_spec.hardfork(block.header.timestamp);
+        let block_limits = if let Some(hardfork) = hardfork {
+            BlockLimits::from_hardfork_and_block_gas_limit(hardfork, block.header.gas_limit)
+        } else {
+            BlockLimits::no_limits()
+        };
+
+        // Create block context
+        let block_ctx = MegaBlockExecutionCtx::new(
+            block.header.parent_hash,
+            block.header.parent_beacon_block_root,
+            Bytes::new(),
+            block_limits,
+        );
+
+        Ok(Self {
+            transactions,
+            executor_factory,
+            block_ctx,
+            evm_env,
+            fast_witness_executor,
+        })
+    }
+
+    /// Creates a witness database that borrows from this environment.
+    fn create_witness_db<'b>(
+        &'b self,
+        header: &'b alloy_rpc_types_eth::Header,
+        contracts: &'b HashMap<B256, Bytecode>,
+    ) -> WitnessDatabase<'b, FastWitnessExecutor> {
+        WitnessDatabase {
+            header,
+            witness: &self.fast_witness_executor,
+            contracts,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +331,7 @@ impl<'a> TracingEnv<'a> {
         &'b self,
         header: &'b alloy_rpc_types_eth::Header,
         contracts: &'b HashMap<B256, Bytecode>,
-    ) -> WitnessDatabase<'b> {
+    ) -> WitnessDatabase<'b, salt::Witness> {
         WitnessDatabase {
             header,
             witness: &self.salt_witness,
@@ -424,6 +543,111 @@ pub fn trace_block(
     }
 
     trace!(traced_count = results.len(), "Block trace completed");
+
+    Ok(results)
+}
+
+/// Traces all transactions in a block using FastWitness (fast deserialization).
+///
+/// This is the fast version of `trace_block` that uses `FastWitness` instead of
+/// `SaltWitness` for improved deserialization performance. Use this when the witness
+/// data comes from a trusted source (like a local database).
+///
+/// # Performance
+/// - Standard `trace_block` with `SaltWitness`: ~240ms witness deserialization overhead
+/// - This `trace_block_fast` with `FastWitness`: ~10-20ms witness deserialization
+///
+/// # Arguments
+/// * `chain_spec` - Chain specification with hardfork activation rules
+/// * `block` - Block containing transactions to trace (must have full transactions)
+/// * `fast_witness` - Fast SALT witness containing state data (owned, will be consumed)
+/// * `contracts` - Pre-fetched contract bytecodes keyed by code hash
+/// * `opts` - Geth debug tracing options
+#[instrument(skip_all, name = "trace_block_fast", fields(block_number = block.header.number, block_hash = %block.header.hash))]
+pub fn trace_block_fast(
+    chain_spec: &ChainSpec,
+    block: &Block<OpTransaction>,
+    fast_witness: FastWitness,
+    contracts: &HashMap<B256, Bytecode>,
+    opts: GethDebugTracingOptions,
+) -> Result<Vec<TraceResult>, ValidationError> {
+    let env = FastTracingEnv::new(chain_spec, block, fast_witness)?;
+
+    trace!(tx_count = env.transactions.len(), "Starting fast block trace");
+
+    // Create witness database and wrap it with CacheDB, then State
+    let witness_db = env.create_witness_db(&block.header, contracts);
+    let cache_db = CacheDB::new(&witness_db);
+    let mut state = State::builder().with_database_ref(&cache_db).build();
+
+    // Apply pre-execution changes (system contract calls)
+    {
+        let mut executor = env.executor_factory.create_executor(
+            &mut state,
+            env.block_ctx.clone(),
+            env.evm_env.clone(),
+        );
+        executor
+            .apply_pre_execution_changes()
+            .map_err(ValidationError::BlockReplayFailed)?;
+    }
+
+    let mut results = Vec::with_capacity(env.transactions.len());
+
+    for (index, tx) in env.transactions.iter().enumerate() {
+        let tx_hash = tx.inner.tx_hash();
+        let recovered_tx = &tx.inner.inner;
+        let info = tx_info_at(block, tx, index);
+
+        let tx_ctx = TxTracingContext {
+            tx: recovered_tx,
+            tx_gas_limit: tx.inner.gas_limit(),
+            tx_info: info,
+        };
+
+        trace!(
+            tx_index = index,
+            tx_hash = %tx_hash,
+            "Tracing transaction"
+        );
+
+        let (trace_result, state_changes) = trace_transaction_inner(
+            &env.executor_factory,
+            &mut state,
+            env.block_ctx.clone(),
+            env.evm_env.clone(),
+            tx_ctx,
+            &opts,
+        );
+
+        match trace_result {
+            Ok(trace) => {
+                results.push(TraceResult::Success {
+                    result: trace,
+                    tx_hash: Some(tx_hash),
+                });
+            }
+            Err(error) => {
+                warn!(
+                    tx_index = index,
+                    tx_hash = %tx_hash,
+                    %error,
+                    "Transaction trace failed"
+                );
+                results.push(TraceResult::Error {
+                    error,
+                    tx_hash: Some(tx_hash),
+                });
+            }
+        }
+
+        // Commit state changes for subsequent transactions
+        if index < env.transactions.len() - 1 {
+            state.commit(state_changes);
+        }
+    }
+
+    trace!(traced_count = results.len(), "Fast block trace completed");
 
     Ok(results)
 }

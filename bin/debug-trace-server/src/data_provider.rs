@@ -25,7 +25,7 @@ use revm::state::Bytecode;
 use salt::SaltWitness;
 use tokio::sync::broadcast;
 use tracing::{debug, instrument, trace, warn};
-use validator_core::{withdrawals::MptWitness, RpcClient, ValidatorDB};
+use validator_core::{withdrawals::MptWitness, FastWitness, RpcClient, ValidatorDB};
 
 /// Block data bundle containing all information needed for stateless execution.
 ///
@@ -38,6 +38,21 @@ pub struct BlockData {
     pub block: Block<Transaction>,
     /// SALT witness containing state proofs for all accessed accounts and storage.
     pub salt_witness: SaltWitness,
+    /// Contract bytecodes keyed by code hash, required for EVM execution.
+    pub contracts: HashMap<B256, Bytecode>,
+}
+
+/// Fast block data bundle using FastWitness for improved deserialization.
+///
+/// This is the fast version of `BlockData` that uses `FastWitness` instead of
+/// `SaltWitness` for improved deserialization performance (~10x faster).
+/// Use this when the witness comes from a trusted source (like local DB).
+#[derive(Clone)]
+pub struct FastBlockData {
+    /// The block with full transaction data.
+    pub block: Block<Transaction>,
+    /// Fast SALT witness without expensive EC point validation.
+    pub fast_witness: FastWitness,
     /// Contract bytecodes keyed by code hash, required for EVM execution.
     pub contracts: HashMap<B256, Bytecode>,
 }
@@ -120,7 +135,7 @@ impl DataProvider {
         self.get_block_data_by_hash(block.header.hash).await
     }
 
-    /// Gets block data by block hash.
+    /// Gets block data by block hash with single-flight coalescing.
     ///
     /// Lookup order: local database -> RPC.
     ///
@@ -163,6 +178,55 @@ impl DataProvider {
         );
 
         Ok(data)
+    }
+
+    /// Gets block data by block hash, forcing DB-only fetch (for benchmarking).
+    ///
+    /// # Arguments
+    /// * `block_hash` - The 32-byte block hash to fetch
+    ///
+    /// # Returns
+    /// * `Ok(BlockData)` - Block data from DB
+    /// * `Err` - If DB is not configured or block not found
+    pub async fn get_block_data_by_hash_db_only(&self, block_hash: B256) -> Result<BlockData> {
+        let db = self
+            .validator_db
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("ValidatorDB not configured"))?;
+        self.get_block_data_from_db(db, block_hash).await
+    }
+
+    /// Gets fast block data by block hash, forcing DB-only fetch (for benchmarking).
+    ///
+    /// This is the fast version that uses `FastWitness` for improved deserialization.
+    ///
+    /// # Arguments
+    /// * `block_hash` - The 32-byte block hash to fetch
+    ///
+    /// # Returns
+    /// * `Ok(FastBlockData)` - Fast block data from DB
+    /// * `Err` - If DB is not configured or block not found
+    pub async fn get_fast_block_data_by_hash_db_only(
+        &self,
+        block_hash: B256,
+    ) -> Result<FastBlockData> {
+        let db = self
+            .validator_db
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("ValidatorDB not configured"))?;
+        self.get_fast_block_data_from_db(db, block_hash).await
+    }
+
+    /// Gets block data by block hash, forcing RPC-only fetch (for benchmarking).
+    ///
+    /// # Arguments
+    /// * `block_hash` - The 32-byte block hash to fetch
+    ///
+    /// # Returns
+    /// * `Ok(BlockData)` - Block data from RPC
+    /// * `Err` - If RPC fetch fails
+    pub async fn get_block_data_by_hash_rpc_only(&self, block_hash: B256) -> Result<BlockData> {
+        self.fetch_block_data_by_hash_from_rpc(block_hash).await
     }
 
     /// Gets block data for a transaction by its hash.
@@ -238,6 +302,30 @@ impl DataProvider {
         }
     }
 
+    /// Resolves a block number to its block hash.
+    ///
+    /// # Arguments
+    /// * `block_num` - The block number to resolve
+    ///
+    /// # Returns
+    /// * `Ok(B256)` - The block hash
+    /// * `Err` - If the block cannot be found
+    pub async fn resolve_block_hash(&self, block_num: u64) -> Result<B256> {
+        // Try to get from local database first
+        if let Some(db) = &self.validator_db {
+            if let Ok(Some(hash)) = db.get_block_hash(block_num) {
+                return Ok(hash);
+            }
+        }
+
+        // Fall back to RPC
+        let block = self
+            .rpc_client
+            .get_block(BlockId::Number(BlockNumberOrTag::Number(block_num)), false)
+            .await?;
+        Ok(block.header.hash)
+    }
+
     /// Gets block data from the local database.
     ///
     /// Retrieves block and witness from ValidatorDB, then fetches any missing
@@ -247,16 +335,75 @@ impl DataProvider {
         db: &ValidatorDB,
         block_hash: alloy_primitives::BlockHash,
     ) -> Result<BlockData> {
+        let start = std::time::Instant::now();
+
         // Get block data from database
         let (block, salt_witness) = db.get_block_and_witness(block_hash)?;
+        let db_read_ms = start.elapsed().as_millis();
 
         // Extract code hashes and get contracts
         let code_hashes = validator_core::extract_code_hashes(&salt_witness);
+        let extract_ms = start.elapsed().as_millis() - db_read_ms;
+
         let contracts = self.get_contracts_with_db(db, &code_hashes).await?;
+        let contracts_ms = start.elapsed().as_millis() - db_read_ms - extract_ms;
+
+        debug!(
+            block_hash = %block_hash,
+            block_number = block.header.number,
+            tx_count = block.transactions.len(),
+            code_hashes_count = code_hashes.len(),
+            db_read_ms,
+            extract_ms,
+            contracts_ms,
+            total_ms = start.elapsed().as_millis(),
+            "DB read timing breakdown"
+        );
 
         Ok(BlockData {
             block,
             salt_witness,
+            contracts,
+        })
+    }
+
+    /// Gets fast block data from the local database (using FastWitness).
+    ///
+    /// This is the fast version that skips expensive EC point validation during
+    /// witness deserialization. Use this when the data comes from a trusted source.
+    async fn get_fast_block_data_from_db(
+        &self,
+        db: &ValidatorDB,
+        block_hash: alloy_primitives::BlockHash,
+    ) -> Result<FastBlockData> {
+        let start = std::time::Instant::now();
+
+        // Get block data from database using fast witness
+        let (block, fast_witness) = db.get_block_and_fast_witness(block_hash)?;
+        let db_read_ms = start.elapsed().as_millis();
+
+        // Extract code hashes and get contracts
+        let code_hashes = validator_core::extract_code_hashes_fast(&fast_witness);
+        let extract_ms = start.elapsed().as_millis() - db_read_ms;
+
+        let contracts = self.get_contracts_with_db(db, &code_hashes).await?;
+        let contracts_ms = start.elapsed().as_millis() - db_read_ms - extract_ms;
+
+        debug!(
+            block_hash = %block_hash,
+            block_number = block.header.number,
+            tx_count = block.transactions.len(),
+            code_hashes_count = code_hashes.len(),
+            db_read_ms,
+            extract_ms,
+            contracts_ms,
+            total_ms = start.elapsed().as_millis(),
+            "Fast DB read timing breakdown"
+        );
+
+        Ok(FastBlockData {
+            block,
+            fast_witness,
             contracts,
         })
     }

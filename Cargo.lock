@@ -3414,6 +3414,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lz4_flex"
+version = "0.11.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08ab2867e3eeeca90e844d1940eab391c9dc5228783db2ed999acbc0a9ed375a"
+
+[[package]]
 name = "macro-string"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6460,6 +6466,7 @@ dependencies = [
  "dyn-clone",
  "eyre",
  "futures",
+ "lz4_flex",
  "mega-evm",
  "num_cpus",
  "op-alloy-network",
@@ -6473,6 +6480,7 @@ dependencies = [
  "reth-trie-sparse",
  "revm",
  "revm-inspectors",
+ "rustc-hash",
  "salt",
  "serde",
  "serde_json",

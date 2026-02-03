@@ -17,6 +17,8 @@
 
 pub mod chain_spec;
 pub mod chain_sync;
+pub mod fast_witness;
+pub use fast_witness::{FastWitness, FastWitnessExecutor};
 pub use chain_sync::{
     ChainSyncConfig, DEFAULT_METRICS_PORT, FetchResult, fetch_blocks_batch, remote_chain_tracker,
 };
@@ -31,8 +33,8 @@ pub use executor::{
 };
 pub mod tracing_executor;
 pub use tracing_executor::{
-    extract_code_hashes, parity_trace_block, parity_trace_transaction, trace_block,
-    trace_transaction,
+    extract_code_hashes, extract_code_hashes_fast, parity_trace_block, parity_trace_transaction,
+    trace_block, trace_block_fast, trace_transaction,
 };
 pub mod rpc_client;
 pub mod withdrawals;

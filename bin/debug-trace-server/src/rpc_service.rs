@@ -4,7 +4,7 @@
 //! Separates RPC concerns from the main server initialization.
 
 use std::{
-    sync::Arc,
+    sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
@@ -17,10 +17,31 @@ use tracing::{trace, warn};
 use validator_core::chain_spec::ChainSpec;
 
 use crate::{
-    data_provider::{BlockData, DataProvider},
+    data_provider::{BlockData, DataProvider, FastBlockData},
     metrics,
     response_cache::{CachedResource, ResponseCache, ResponseVariant},
 };
+
+// ---------------------------------------------------------------------------
+// Benchmark Mode
+// ---------------------------------------------------------------------------
+
+/// Benchmark mode for testing different data sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BenchMode {
+    /// Normal mode - check cache, then DB, then RPC.
+    Cache,
+    /// DB mode - skip cache, always fetch from DB (for benchmarking DB performance).
+    Db,
+    /// RPC mode - skip cache and DB, always fetch from RPC (for benchmarking RPC performance).
+    Rpc,
+}
+
+impl Default for BenchMode {
+    fn default() -> Self {
+        Self::Cache
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RPC Method Name Constants
@@ -32,6 +53,8 @@ const DEBUG_TRACE_TRANSACTION: &str = "debug_traceTransaction";
 const TRACE_BLOCK: &str = "trace_block";
 const TRACE_TRANSACTION: &str = "trace_transaction";
 const DEBUG_GET_CACHE_STATUS: &str = "debug_getCacheStatus";
+const BENCH_SET_DATA_SOURCE: &str = "bench_setDataSource";
+const BENCH_CLEAR_CACHE: &str = "bench_clearCache";
 
 /// Slow request threshold for logging warnings.
 const SLOW_REQUEST_THRESHOLD: Duration = Duration::from_secs(5);
@@ -49,6 +72,8 @@ pub struct RpcContext {
     chain_spec: Arc<ChainSpec>,
     /// Response cache for HTTP layer caching.
     response_cache: ResponseCache,
+    /// Benchmark mode for testing different data sources.
+    bench_mode: Arc<RwLock<BenchMode>>,
 }
 
 impl RpcContext {
@@ -62,6 +87,7 @@ impl RpcContext {
             data_provider,
             chain_spec,
             response_cache,
+            bench_mode: Arc::new(RwLock::new(BenchMode::default())),
         }
     }
 }
@@ -85,6 +111,8 @@ async fn compute_debug_trace_block(
     data: &BlockData,
     opts: GethDebugTracingOptions,
 ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
+    let start = Instant::now();
+
     let results = validator_core::trace_block(
         chain_spec,
         &data.block,
@@ -94,7 +122,63 @@ async fn compute_debug_trace_block(
     )
     .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
 
-    serde_json::to_value(results).map_err(|e| rpc_err(format!("Serialization failed: {e}")))
+    let trace_ms = start.elapsed().as_millis();
+
+    let value = serde_json::to_value(&results)
+        .map_err(|e| rpc_err(format!("Serialization failed: {e}")))?;
+
+    let serialize_ms = start.elapsed().as_millis() - trace_ms;
+    let response_size = value.to_string().len();
+
+    tracing::debug!(
+        block_number = data.block.header.number,
+        tx_count = data.block.transactions.len(),
+        trace_ms,
+        serialize_ms,
+        response_size_kb = response_size / 1024,
+        "Trace computation timing"
+    );
+
+    Ok(value)
+}
+
+/// Computes debug trace for a block using FastWitness (fast deserialization).
+///
+/// This is the fast version that uses `FastWitness` for improved performance.
+async fn compute_debug_trace_block_fast(
+    chain_spec: &ChainSpec,
+    data: FastBlockData,
+    opts: GethDebugTracingOptions,
+) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
+    let start = Instant::now();
+
+    let results = validator_core::trace_block_fast(
+        chain_spec,
+        &data.block,
+        data.fast_witness,
+        &data.contracts,
+        opts,
+    )
+    .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
+
+    let trace_ms = start.elapsed().as_millis();
+
+    let value = serde_json::to_value(&results)
+        .map_err(|e| rpc_err(format!("Serialization failed: {e}")))?;
+
+    let serialize_ms = start.elapsed().as_millis() - trace_ms;
+    let response_size = value.to_string().len();
+
+    tracing::debug!(
+        block_number = data.block.header.number,
+        tx_count = data.block.transactions.len(),
+        trace_ms,
+        serialize_ms,
+        response_size_kb = response_size / 1024,
+        "Fast trace computation timing"
+    );
+
+    Ok(value)
 }
 
 /// Computes parity trace for a block.
@@ -275,40 +359,66 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
         );
 
         let variant = ResponseVariant::from_geth_options(&opts);
+        let bench_mode = *ctx.bench_mode.read().unwrap();
 
-        // Check cache before fetching block data
-        if let Some(cached) = check_cache_by_number(
-            &ctx.response_cache,
-            CachedResource::DebugTraceBlock,
-            block_num,
-            &variant,
-            DEBUG_TRACE_BLOCK_BY_NUMBER,
-            start,
-        ) {
-            return Ok(cached);
+        // Check cache before fetching block data (only in Cache mode)
+        if bench_mode == BenchMode::Cache {
+            if let Some(cached) = check_cache_by_number(
+                &ctx.response_cache,
+                CachedResource::DebugTraceBlock,
+                block_num,
+                &variant,
+                DEBUG_TRACE_BLOCK_BY_NUMBER,
+                start,
+            ) {
+                return Ok::<_, jsonrpsee::types::ErrorObjectOwned>(cached);
+            }
         }
 
-        // Cache miss - fetch block data and compute trace
-        let data = ctx
-            .data_provider
-            .get_block_data(block_num)
-            .await
-            .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
+        // Fetch block data based on bench mode
+        let (result, block_hash) = match bench_mode {
+            BenchMode::Rpc => {
+                // Force RPC-only fetch
+                let hash = ctx.data_provider.resolve_block_hash(block_num).await
+                    .map_err(|e| rpc_err(format!("Failed to resolve block hash: {e}")))?;
+                let data = ctx.data_provider.get_block_data_by_hash_rpc_only(hash).await
+                    .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
+                let res = compute_debug_trace_block(&ctx.chain_spec, &data, opts.clone()).await?;
+                (res, data.block.header.hash)
+            }
+            BenchMode::Db => {
+                // Force DB-only fetch with FastWitness (fast deserialization)
+                let hash = ctx.data_provider.resolve_block_hash(block_num).await
+                    .map_err(|e| rpc_err(format!("Failed to resolve block hash: {e}")))?;
+                let data = ctx.data_provider.get_fast_block_data_by_hash_db_only(hash).await
+                    .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
+                let block_hash = data.block.header.hash;
+                let res = compute_debug_trace_block_fast(&ctx.chain_spec, data, opts.clone()).await?;
+                (res, block_hash)
+            }
+            BenchMode::Cache => {
+                // Normal mode: DB -> RPC fallback
+                let data = ctx.data_provider.get_block_data(block_num).await
+                    .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
+                let res = compute_debug_trace_block(&ctx.chain_spec, &data, opts.clone()).await?;
+                (res, data.block.header.hash)
+            }
+        };
 
-        execute_cached_block_trace(
-            &ctx,
-            CachedTraceParams {
-                resource: CachedResource::DebugTraceBlock,
-                block_num,
-                block_hash: data.block.header.hash,
-                variant,
-                method_name: DEBUG_TRACE_BLOCK_BY_NUMBER,
-                start,
-                tx_count: data.block.transactions.len(),
-            },
-            || compute_debug_trace_block(&ctx.chain_spec, &data, opts),
-        )
-        .await
+        // Store result in cache and return
+        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+        metrics::record_rpc_request(DEBUG_TRACE_BLOCK_BY_NUMBER, total_ms / 1000.0);
+
+        // Cache the result for future requests
+        ctx.response_cache.insert(
+            CachedResource::DebugTraceBlock,
+            block_num,
+            block_hash,
+            variant,
+            result.clone(),
+        );
+
+        Ok(result)
     })?;
 
     // debug_traceBlockByHash
@@ -325,40 +435,85 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
         );
 
         let variant = ResponseVariant::from_geth_options(&opts);
+        let bench_mode = *ctx.bench_mode.read().unwrap();
 
-        // Check cache before fetching block data
-        if let Some(cached) = check_cache_by_hash(
-            &ctx.response_cache,
-            CachedResource::DebugTraceBlock,
-            block_hash,
-            &variant,
-            DEBUG_TRACE_BLOCK_BY_HASH,
-            start,
-        ) {
-            return Ok(cached);
+        // Check cache before fetching block data (only in Cache mode)
+        if bench_mode == BenchMode::Cache {
+            if let Some(cached) = check_cache_by_hash(
+                &ctx.response_cache,
+                CachedResource::DebugTraceBlock,
+                block_hash,
+                &variant,
+                DEBUG_TRACE_BLOCK_BY_HASH,
+                start,
+            ) {
+                return Ok::<_, jsonrpsee::types::ErrorObjectOwned>(cached);
+            }
         }
 
-        // Cache miss - fetch block data and compute trace
-        let data = ctx
-            .data_provider
-            .get_block_data_by_hash(block_hash)
-            .await
-            .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
+        // Fetch block data based on bench mode
+        let (result, block_num, tx_count) = match bench_mode {
+            BenchMode::Rpc => {
+                let data = ctx.data_provider.get_block_data_by_hash_rpc_only(block_hash).await
+                    .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
+                let block_num = data.block.header.number;
+                let tx_count = data.block.transactions.len();
+                let res = compute_debug_trace_block(&ctx.chain_spec, &data, opts.clone()).await?;
+                (res, block_num, tx_count)
+            }
+            BenchMode::Db => {
+                // Force DB-only fetch with FastWitness (fast deserialization)
+                let data = ctx.data_provider.get_fast_block_data_by_hash_db_only(block_hash).await
+                    .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
+                let block_num = data.block.header.number;
+                let tx_count = data.block.transactions.len();
+                let res = compute_debug_trace_block_fast(&ctx.chain_spec, data, opts.clone()).await?;
+                (res, block_num, tx_count)
+            }
+            BenchMode::Cache => {
+                // Normal mode: DB -> RPC fallback
+                let data = ctx.data_provider.get_block_data_by_hash(block_hash).await
+                    .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
+                let block_num = data.block.header.number;
+                let tx_count = data.block.transactions.len();
+                let res = compute_debug_trace_block(&ctx.chain_spec, &data, opts.clone()).await?;
+                (res, block_num, tx_count)
+            }
+        };
 
-        execute_cached_block_trace(
-            &ctx,
-            CachedTraceParams {
-                resource: CachedResource::DebugTraceBlock,
-                block_num: data.block.header.number,
-                block_hash,
-                variant,
-                method_name: DEBUG_TRACE_BLOCK_BY_HASH,
-                start,
-                tx_count: data.block.transactions.len(),
-            },
-            || compute_debug_trace_block(&ctx.chain_spec, &data, opts),
-        )
-        .await
+        // Store result in cache and return
+        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+        metrics::record_rpc_request(DEBUG_TRACE_BLOCK_BY_HASH, total_ms / 1000.0);
+
+        // Cache the result for future requests
+        ctx.response_cache.insert(
+            CachedResource::DebugTraceBlock,
+            block_num,
+            block_hash,
+            variant,
+            result.clone(),
+        );
+
+        trace!(
+            method = DEBUG_TRACE_BLOCK_BY_HASH,
+            block = block_num,
+            tx_count,
+            total_ms = format!("{:.2}", total_ms),
+            cache_hit = false,
+            "Cache miss - computed and stored result"
+        );
+
+        if start.elapsed() > SLOW_REQUEST_THRESHOLD {
+            warn!(
+                method = DEBUG_TRACE_BLOCK_BY_HASH,
+                block_number = block_num,
+                elapsed_ms = total_ms as u64,
+                threshold_ms = SLOW_REQUEST_THRESHOLD.as_millis() as u64,
+                "RPC request exceeded threshold"
+            );
+        }
+
+        Ok(result)
     })?;
 
     // debug_traceTransaction (not cached - depends on tx index)
@@ -439,24 +594,36 @@ fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             "Processing request"
         );
 
-        // Check cache before fetching block data
-        if let Some(cached) = check_cache_by_number(
-            &ctx.response_cache,
-            CachedResource::TraceBlock,
-            block_num,
-            &ResponseVariant::Default,
-            TRACE_BLOCK,
-            start,
-        ) {
-            return Ok(cached);
+        let bench_mode = *ctx.bench_mode.read().unwrap();
+
+        // Check cache before fetching block data (only in Cache mode)
+        if bench_mode == BenchMode::Cache {
+            if let Some(cached) = check_cache_by_number(
+                &ctx.response_cache,
+                CachedResource::TraceBlock,
+                block_num,
+                &ResponseVariant::Default,
+                TRACE_BLOCK,
+                start,
+            ) {
+                return Ok(cached);
+            }
         }
 
-        // Cache miss - fetch block data and compute trace
-        let data = ctx
-            .data_provider
-            .get_block_data(block_num)
-            .await
-            .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
+        // Fetch block data based on bench mode
+        let data = match bench_mode {
+            BenchMode::Rpc => {
+                let block = ctx.data_provider.resolve_block_hash(block_num).await
+                    .map_err(|e| rpc_err(format!("Failed to resolve block hash: {e}")))?;
+                ctx.data_provider.get_block_data_by_hash_rpc_only(block).await
+            }
+            BenchMode::Db => {
+                let block = ctx.data_provider.resolve_block_hash(block_num).await
+                    .map_err(|e| rpc_err(format!("Failed to resolve block hash: {e}")))?;
+                ctx.data_provider.get_block_data_by_hash_db_only(block).await
+            }
+            BenchMode::Cache => ctx.data_provider.get_block_data(block_num).await,
+        }.map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
 
         execute_cached_block_trace(
             &ctx,
@@ -544,6 +711,51 @@ fn register_cache_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
                 "misses": stats.misses,
                 "hitRate": format!("{:.1}%", stats.hit_rate())
             }
+        }))
+    })?;
+
+    // Benchmark: set data source mode (cache, db, or rpc)
+    module.register_async_method(BENCH_SET_DATA_SOURCE, |params, ctx, _| async move {
+        let mut seq = params.sequence();
+        let mode: String = seq.next()?;
+
+        let bench_mode = match mode.as_str() {
+            "cache" => BenchMode::Cache,
+            "db" => BenchMode::Db,
+            "rpc" => BenchMode::Rpc,
+            _ => return Err(rpc_err(format!("Invalid mode '{}', expected 'cache', 'db', or 'rpc'", mode))),
+        };
+
+        // If setting to DB mode and a block number is provided, pre-warm DB by fetching it
+        if bench_mode == BenchMode::Db {
+            if let Ok(block_num_hex) = seq.optional_next::<String>() {
+                if let Some(block_hex) = block_num_hex {
+                    // Parse hex block number
+                    let block_num = u64::from_str_radix(block_hex.trim_start_matches("0x"), 16)
+                        .map_err(|e| rpc_err(format!("Invalid block number: {}", e)))?;
+
+                    // Fetch block data to ensure it's in DB
+                    let _ = ctx.data_provider.get_block_data(block_num).await
+                        .map_err(|e| rpc_err(format!("Failed to pre-warm DB for block {}: {}", block_num, e)))?;
+                }
+            }
+        }
+
+        *ctx.bench_mode.write().unwrap() = bench_mode;
+
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+            "result": "ok",
+            "mode": mode
+        }))
+    })?;
+
+    // Benchmark: clear response cache
+    module.register_async_method(BENCH_CLEAR_CACHE, |_params, ctx, _| async move {
+        ctx.response_cache.clear();
+
+        Ok::<_, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+            "result": "ok",
+            "message": "Response cache cleared"
         }))
     })?;
 

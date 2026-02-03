@@ -31,7 +31,9 @@ use tracing::{debug, trace};
 pub const DEFAULT_RESPONSE_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Default estimated number of cached responses.
-pub const DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS: usize = 10_000;
+/// Set low to allow large items (e.g., 60MB prestateTracer responses).
+/// With 1GB / 100 items = 10MB average, shards can handle items up to ~100MB.
+pub const DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS: usize = 100;
 
 /// Configuration for the response cache.
 #[derive(Debug, Clone, Copy)]
@@ -547,6 +549,19 @@ impl ResponseCache {
             hits: self.inner.hits.load(Ordering::Relaxed),
             misses: self.inner.misses.load(Ordering::Relaxed),
         }
+    }
+
+    /// Clears all entries from the cache and resets hit/miss counters.
+    pub fn clear(&self) {
+        self.inner.cache.clear();
+        let mut inner = self.inner.indices.inner.write().unwrap();
+        inner.hash_to_number.clear();
+        inner.number_to_hash.clear();
+        inner.number_to_keys.clear();
+        drop(inner);
+        self.inner.hits.store(0, Ordering::Relaxed);
+        self.inner.misses.store(0, Ordering::Relaxed);
+        debug!("Response cache cleared");
     }
 }
 

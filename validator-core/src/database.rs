@@ -18,11 +18,12 @@ use revm::{
 };
 use salt::{
     BucketId, BucketMeta, EphemeralSaltState, METADATA_KEYS_RANGE, SaltKey, SaltValue, SaltWitness,
-    Witness, bucket_id_from_metadata_key, hasher,
+    Witness, bucket_id_from_metadata_key, hasher, traits::StateReader,
 };
 use tracing::trace;
 
 use crate::data_types::{PlainKey, PlainValue};
+use crate::fast_witness::FastWitness;
 
 /// Error type for witness database operations
 #[derive(Debug, Clone)]
@@ -53,17 +54,25 @@ impl DBErrorMarker for WitnessDatabaseError {}
 /// This partial stateless approach dramatically reduces DA bandwidth compared to
 /// a pure stateless approach, while still enabling complete block validation through
 /// cryptographic proofs in the witness.
+///
+/// # Type Parameter
+/// * `W` - The witness type implementing `StateReader`. Can be `salt::Witness` for
+///   standard witnesses or `FastWitnessExecutor` for fast deserialized witnesses.
 #[derive(Debug)]
-pub struct WitnessDatabase<'a> {
+pub struct WitnessDatabase<'a, W> {
     /// The block header containing number, parent hash, and other metadata
     pub header: &'a Header,
     /// Compact witness containing state subset and cryptographic proofs
-    pub witness: &'a Witness,
+    pub witness: &'a W,
     /// Contract bytecode cache, pre-populated before execution starts
     pub contracts: &'a HashMap<B256, Bytecode>,
 }
 
-impl<'a> WitnessDatabase<'a> {
+impl<'a, W> WitnessDatabase<'a, W>
+where
+    W: StateReader,
+    W::Error: std::fmt::Display,
+{
     /// Get value from witness for the given plain key
     fn plain_value(&self, plain_key: &[u8]) -> Result<Option<Vec<u8>>, WitnessDatabaseError> {
         EphemeralSaltState::new(self.witness)
@@ -72,7 +81,11 @@ impl<'a> WitnessDatabase<'a> {
     }
 }
 
-impl<'a> DatabaseRef for WitnessDatabase<'a> {
+impl<'a, W> DatabaseRef for WitnessDatabase<'a, W>
+where
+    W: StateReader,
+    W::Error: std::fmt::Display,
+{
     type Error = WitnessDatabaseError;
 
     /// Provides basic account information from the witness
@@ -241,6 +254,26 @@ impl WitnessExternalEnv {
         })?;
 
         Ok((bucket_id, meta.capacity))
+    }
+
+    /// Creates a new external environment provider from a FastWitness.
+    ///
+    /// This is the fast version of `new()` that works with `FastWitness`
+    /// for improved deserialization performance.
+    pub fn from_fast_witness(
+        fast_witness: &FastWitness,
+        block_number: BlockNumber,
+    ) -> Result<Self, WitnessDatabaseError> {
+        let bucket_capacities = fast_witness
+            .kvs
+            .range(METADATA_KEYS_RANGE)
+            .map(|(key, value)| Self::parse_metadata_entry(key, value))
+            .collect::<Result<HashMap<_, _>, _>>()?;
+
+        Ok(Self {
+            block_number,
+            bucket_capacities,
+        })
     }
 }
 

@@ -72,6 +72,7 @@ use thiserror::Error;
 
 use crate::{
     executor::{ValidationError, ValidationResult},
+    fast_witness::FastWitness,
     withdrawals::MptWitness,
 };
 
@@ -381,6 +382,59 @@ impl ValidatorDB {
                 // Adds the block to the validation task queue (TASK_LIST)
                 task_list.insert((number, hash), ())?;
                 // Stores the complete block data for worker access (BLOCK_DATA)
+                block_data.insert(hash, block)?;
+                // ... and the witness data (WITNESSES and MPT_WITNESSES)
+                witnesses.insert(hash, salt_witness)?;
+                mpt_witnesses.insert(hash, mpt_witness)?;
+                // Records the block in the block registry (BLOCK_RECORDS)
+                block_records.insert((number, hash), ())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    /// Stores block data and witnesses without creating validation tasks.
+    ///
+    /// This is used by debug-trace-server to store block data for serving trace RPCs
+    /// without requiring validation. Unlike `add_validation_tasks`, this does NOT add
+    /// blocks to the TASK_LIST queue.
+    ///
+    /// # Arguments
+    /// * `tasks` - A slice of tuples, each containing:
+    ///   - `Block<Transaction>` - The complete block data including header and transactions
+    ///   - `SaltWitness` - The SALT-based execution witness required for stateless execution
+    ///   - `MptWitness` - The MPT-based witness for withdrawal validation
+    pub fn store_block_data(
+        &self,
+        tasks: &[(Block<Transaction>, SaltWitness, MptWitness)],
+    ) -> ValidationDbResult<()> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+
+        let tasks = tasks
+            .par_iter()
+            .map(|(block, salt_witness, mpt_witness)| {
+                Ok::<_, ValidationDbError>((
+                    block.header.number,
+                    block.header.hash.0,
+                    encode_block_to_vec(block)?,
+                    encode_to_vec(salt_witness)?,
+                    encode_to_vec(mpt_witness)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let write_txn = self.database.begin_write()?;
+        {
+            let mut block_data = write_txn.open_table(BLOCK_DATA)?;
+            let mut witnesses = write_txn.open_table(WITNESSES)?;
+            let mut mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
+            let mut block_records = write_txn.open_table(BLOCK_RECORDS)?;
+
+            for (number, hash, block, salt_witness, mpt_witness) in tasks {
+                // Stores the complete block data (BLOCK_DATA)
                 block_data.insert(hash, block)?;
                 // ... and the witness data (WITNESSES and MPT_WITNESSES)
                 witnesses.insert(hash, salt_witness)?;
@@ -1112,49 +1166,200 @@ impl ValidatorDB {
         &self,
         block_hash: BlockHash,
     ) -> ValidationDbResult<(Block<Transaction>, SaltWitness)> {
+        let start = std::time::Instant::now();
+
         let read_txn = self.database.begin_read()?;
         let block_data = read_txn.open_table(BLOCK_DATA)?;
         let witnesses = read_txn.open_table(WITNESSES)?;
+        let txn_ms = start.elapsed().as_millis();
 
-        let block = decode_block_from_slice(
-            &block_data
-                .get(block_hash.0)?
-                .ok_or(ValidationDbError::MissingData {
-                    kind: MissingDataKind::BlockData,
-                    block_hash,
-                })?
-                .value(),
+        let block_bytes = block_data
+            .get(block_hash.0)?
+            .ok_or(ValidationDbError::MissingData {
+                kind: MissingDataKind::BlockData,
+                block_hash,
+            })?;
+        let block_bytes_value = block_bytes.value();
+        let block_bytes_len = block_bytes_value.len();
+        let db_read_block_ms = start.elapsed().as_millis();
+
+        let block = decode_block_from_slice(&block_bytes_value);
+        let block_decode_ms = start.elapsed().as_millis();
+
+        let witness_bytes = witnesses
+            .get(block_hash.0)?
+            .ok_or(ValidationDbError::MissingData {
+                kind: MissingDataKind::Witness,
+                block_hash,
+            })?;
+        let witness_bytes_value = witness_bytes.value();
+        let witness_bytes_len = witness_bytes_value.len();
+        let db_read_witness_ms = start.elapsed().as_millis();
+
+        let witness: SaltWitness = decode_from_slice(&witness_bytes_value);
+        let witness_decode_ms = start.elapsed().as_millis();
+
+        tracing::debug!(
+            txn_ms = txn_ms,
+            db_read_block_ms = db_read_block_ms - txn_ms,
+            block_decode_ms = block_decode_ms - db_read_block_ms,
+            db_read_witness_ms = db_read_witness_ms - block_decode_ms,
+            witness_decode_ms = witness_decode_ms - db_read_witness_ms,
+            total_ms = witness_decode_ms,
+            block_bytes_len = block_bytes_len,
+            witness_bytes_len = witness_bytes_len,
+            "get_block_and_witness timing breakdown"
         );
 
-        let witness = decode_from_slice(
-            &witnesses
-                .get(block_hash.0)?
-                .ok_or(ValidationDbError::MissingData {
-                    kind: MissingDataKind::Witness,
-                    block_hash,
-                })?
-                .value(),
+        Ok((block, witness))
+    }
+
+    /// Gets block and witness data from the database (fast decoding).
+    ///
+    /// This method uses `FastWitness` for deserialization, which skips expensive
+    /// elliptic curve point validation. Use this when you don't need cryptographic
+    /// verification of the witness (e.g., for tracing/execution from trusted DB).
+    ///
+    /// # Performance
+    /// - Standard `SaltWitness` deserialization: ~240ms (EC point validation)
+    /// - `FastWitness` deserialization: ~10-20ms (skips EC validation)
+    pub fn get_block_and_fast_witness(
+        &self,
+        block_hash: BlockHash,
+    ) -> ValidationDbResult<(Block<Transaction>, FastWitness)> {
+        let start = std::time::Instant::now();
+
+        let read_txn = self.database.begin_read()?;
+        let block_data = read_txn.open_table(BLOCK_DATA)?;
+        let witnesses = read_txn.open_table(WITNESSES)?;
+        let txn_ms = start.elapsed().as_millis();
+
+        let block_bytes = block_data
+            .get(block_hash.0)?
+            .ok_or(ValidationDbError::MissingData {
+                kind: MissingDataKind::BlockData,
+                block_hash,
+            })?;
+        let block_bytes_value = block_bytes.value();
+        let block_bytes_len = block_bytes_value.len();
+        let db_read_block_ms = start.elapsed().as_millis();
+
+        let block = decode_block_from_slice(&block_bytes_value);
+        let block_decode_ms = start.elapsed().as_millis();
+
+        let witness_bytes = witnesses
+            .get(block_hash.0)?
+            .ok_or(ValidationDbError::MissingData {
+                kind: MissingDataKind::Witness,
+                block_hash,
+            })?;
+        let witness_bytes_value = witness_bytes.value();
+        let witness_bytes_len = witness_bytes_value.len();
+        let db_read_witness_ms = start.elapsed().as_millis();
+
+        let witness = decode_fast_witness_from_slice(&witness_bytes_value);
+        let witness_decode_ms = start.elapsed().as_millis();
+
+        tracing::debug!(
+            txn_ms = txn_ms,
+            db_read_block_ms = db_read_block_ms - txn_ms,
+            block_decode_ms = block_decode_ms - db_read_block_ms,
+            db_read_witness_ms = db_read_witness_ms - block_decode_ms,
+            witness_decode_ms = witness_decode_ms - db_read_witness_ms,
+            total_ms = witness_decode_ms,
+            block_bytes_len = block_bytes_len,
+            witness_bytes_len = witness_bytes_len,
+            "get_block_and_fast_witness timing breakdown"
         );
 
         Ok((block, witness))
     }
 }
 
-/// Helper method to serialize data using bincode with legacy config
+/// Version markers for serialization format
+const BINCODE_STANDARD_MARKER: u8 = 0x01;
+const BINCODE_LZ4_MARKER: u8 = 0x02;
+
+/// Helper method to serialize data using bincode + lz4 compression
+/// Format: [marker byte][lz4 compressed bincode data]
 fn encode_to_vec<T: serde::Serialize>(data: &T) -> Result<Vec<u8>> {
-    let encoded = bincode::serde::encode_to_vec(data, bincode::config::legacy())
+    let encoded = bincode::serde::encode_to_vec(data, bincode::config::standard())
         .map_err(SerializationError::from)?;
-    Ok(encoded)
+
+    // Compress with lz4
+    let compressed = lz4_flex::compress_prepend_size(&encoded);
+
+    // Prepend version marker
+    let mut result = Vec::with_capacity(1 + compressed.len());
+    result.push(BINCODE_LZ4_MARKER);
+    result.extend(compressed);
+    Ok(result)
 }
 
-/// Helper method to deserialize data using bincode with legacy config
+/// Helper method to deserialize data using bincode
+/// Supports lz4 compressed (new), standard (old), and legacy formats for backwards compatibility
 fn decode_from_slice<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
-    let (decoded, _) = bincode::serde::decode_from_slice(bytes, bincode::config::legacy())
-        .expect("serialization of previously stored data must succeed");
-    decoded
+    if bytes.is_empty() {
+        panic!("cannot deserialize empty data");
+    }
+
+    match bytes[0] {
+        BINCODE_LZ4_MARKER => {
+            // New format: lz4 compressed + standard config
+            let decompressed = lz4_flex::decompress_size_prepended(&bytes[1..])
+                .expect("lz4 decompression must succeed");
+            let (decoded, _) =
+                bincode::serde::decode_from_slice(&decompressed, bincode::config::standard())
+                    .expect("deserialization of lz4+standard format data must succeed");
+            decoded
+        }
+        BINCODE_STANDARD_MARKER => {
+            // Standard format (uncompressed)
+            let (decoded, _) =
+                bincode::serde::decode_from_slice(&bytes[1..], bincode::config::standard())
+                    .expect("deserialization of standard format data must succeed");
+            decoded
+        }
+        _ => {
+            // Legacy format: legacy config (no marker)
+            let (decoded, _) = bincode::serde::decode_from_slice(bytes, bincode::config::legacy())
+                .expect("deserialization of legacy format data must succeed");
+            decoded
+        }
+    }
+}
+
+/// Helper method to deserialize FastWitness using bincode (skipping EC point validation)
+/// Supports lz4 compressed (new), standard (old), and legacy formats for backwards compatibility
+fn decode_fast_witness_from_slice(bytes: &[u8]) -> FastWitness {
+    if bytes.is_empty() {
+        panic!("cannot deserialize empty data");
+    }
+
+    match bytes[0] {
+        BINCODE_LZ4_MARKER => {
+            // New format: lz4 compressed + standard config
+            let decompressed = lz4_flex::decompress_size_prepended(&bytes[1..])
+                .expect("lz4 decompression must succeed");
+            FastWitness::from_bincode_standard(&decompressed)
+                .expect("fast witness deserialization of lz4+standard format data must succeed")
+        }
+        BINCODE_STANDARD_MARKER => {
+            // Standard format (uncompressed)
+            FastWitness::from_bincode_standard(&bytes[1..])
+                .expect("fast witness deserialization of standard format data must succeed")
+        }
+        _ => {
+            // Legacy format: legacy config (no marker)
+            FastWitness::from_bincode_legacy(bytes)
+                .expect("fast witness deserialization of legacy format data must succeed")
+        }
+    }
 }
 
 /// Helper method to serialize Block<Transaction> using JSON
+/// Note: We use JSON instead of Bincode because Block<Transaction> has serde attributes
+/// (like #[serde(default)]) that are incompatible with bincode's legacy config.
 fn encode_block_to_vec(block: &Block<Transaction>) -> Result<Vec<u8>> {
     let encoded = serde_json::to_vec(block).map_err(SerializationError::from)?;
     Ok(encoded)
@@ -1163,5 +1368,5 @@ fn encode_block_to_vec(block: &Block<Transaction>) -> Result<Vec<u8>> {
 /// Helper method to deserialize Block<Transaction> using JSON
 fn decode_block_from_slice(bytes: &[u8]) -> Block<Transaction> {
     serde_json::from_slice(bytes)
-        .expect("serialization of previously stored block data must succeed")
+        .expect("deserialization of previously stored block data must succeed")
 }
