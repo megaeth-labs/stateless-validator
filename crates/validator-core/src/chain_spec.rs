@@ -74,9 +74,8 @@ impl ChainSpec {
         let hardfork_order = MEGA_MAINNET_HARDFORKS.forks_iter();
         let mut all_hardforks = Vec::with_capacity(op_hardforks.len() + megaeth_hardforks.len());
         for (order, _) in hardfork_order {
-            if let Some(mega_hardfork_index) = megaeth_hardforks
-                .iter()
-                .position(|(hardfork, _)| **hardfork == *order)
+            if let Some(mega_hardfork_index) =
+                megaeth_hardforks.iter().position(|(hardfork, _)| **hardfork == *order)
             {
                 all_hardforks.push(megaeth_hardforks.remove(mega_hardfork_index));
             }
@@ -88,10 +87,7 @@ impl ChainSpec {
         // we merge megaeth_hardforks with op_hardforks
         all_hardforks.append(&mut op_hardforks);
 
-        Self {
-            chain_id,
-            hardforks: ChainHardforks::new(all_hardforks),
-        }
+        Self { chain_id, hardforks: ChainHardforks::new(all_hardforks) }
     }
 }
 
@@ -122,30 +118,12 @@ impl MegaethGenesisHardforks {
     /// Convert the MegaETH genesis hardforks into a vector of hardforks and their conditions.
     pub fn into_vec(self) -> Vec<(Box<dyn Hardfork>, ForkCondition)> {
         vec![
-            (
-                MegaHardfork::MiniRex.boxed(),
-                self.mini_rex_time.map(ForkCondition::Timestamp),
-            ),
-            (
-                MegaHardfork::MiniRex1.boxed(),
-                self.mini_rex_1_time.map(ForkCondition::Timestamp),
-            ),
-            (
-                MegaHardfork::MiniRex2.boxed(),
-                self.mini_rex_2_time.map(ForkCondition::Timestamp),
-            ),
-            (
-                MegaHardfork::Rex.boxed(),
-                self.rex_time.map(ForkCondition::Timestamp),
-            ),
-            (
-                MegaHardfork::Rex1.boxed(),
-                self.rex_1_time.map(ForkCondition::Timestamp),
-            ),
-            (
-                MegaHardfork::Rex2.boxed(),
-                self.rex_2_time.map(ForkCondition::Timestamp),
-            ),
+            (MegaHardfork::MiniRex.boxed(), self.mini_rex_time.map(ForkCondition::Timestamp)),
+            (MegaHardfork::MiniRex1.boxed(), self.mini_rex_1_time.map(ForkCondition::Timestamp)),
+            (MegaHardfork::MiniRex2.boxed(), self.mini_rex_2_time.map(ForkCondition::Timestamp)),
+            (MegaHardfork::Rex.boxed(), self.rex_time.map(ForkCondition::Timestamp)),
+            (MegaHardfork::Rex1.boxed(), self.rex_1_time.map(ForkCondition::Timestamp)),
+            (MegaHardfork::Rex2.boxed(), self.rex_2_time.map(ForkCondition::Timestamp)),
         ]
         .into_iter()
         .filter_map(|(hardfork, condition)| condition.map(|c| (hardfork, c)))
@@ -183,31 +161,11 @@ mod tests {
     #[test]
     fn test_merge_mega_hardforks_in_op_hardforks() {
         let mut genesis = Genesis::default();
-        genesis
-            .config
-            .extra_fields
-            .insert_value("ecotoneTime".to_string(), 1)
-            .unwrap();
-        genesis
-            .config
-            .extra_fields
-            .insert_value("graniteTime".to_string(), 2)
-            .unwrap();
-        genesis
-            .config
-            .extra_fields
-            .insert_value("holoceneTime".to_string(), 3)
-            .unwrap();
-        genesis
-            .config
-            .extra_fields
-            .insert_value("miniRexTime".to_string(), 3)
-            .unwrap();
-        genesis
-            .config
-            .extra_fields
-            .insert_value("isthmusTime".to_string(), 6)
-            .unwrap();
+        genesis.config.extra_fields.insert_value("ecotoneTime".to_string(), 1).unwrap();
+        genesis.config.extra_fields.insert_value("graniteTime".to_string(), 2).unwrap();
+        genesis.config.extra_fields.insert_value("holoceneTime".to_string(), 3).unwrap();
+        genesis.config.extra_fields.insert_value("miniRexTime".to_string(), 3).unwrap();
+        genesis.config.extra_fields.insert_value("isthmusTime".to_string(), 6).unwrap();
         let spec = ChainSpec::from_genesis(genesis);
 
         assert_eq!(
@@ -218,22 +176,10 @@ mod tests {
             spec.hardforks.fork(EthereumHardfork::Prague), // equivalent to isthmusTime
             ForkCondition::Timestamp(6)
         );
-        assert_eq!(
-            spec.hardforks.fork(OpHardfork::Granite),
-            ForkCondition::Timestamp(2)
-        );
-        assert_eq!(
-            spec.hardforks.fork(OpHardfork::Holocene),
-            ForkCondition::Timestamp(3)
-        );
-        assert_eq!(
-            spec.hardforks.fork(OpHardfork::Isthmus),
-            ForkCondition::Timestamp(6)
-        );
-        assert_eq!(
-            spec.hardforks.fork(MegaHardfork::MiniRex),
-            ForkCondition::Timestamp(3)
-        );
+        assert_eq!(spec.hardforks.fork(OpHardfork::Granite), ForkCondition::Timestamp(2));
+        assert_eq!(spec.hardforks.fork(OpHardfork::Holocene), ForkCondition::Timestamp(3));
+        assert_eq!(spec.hardforks.fork(OpHardfork::Isthmus), ForkCondition::Timestamp(6));
+        assert_eq!(spec.hardforks.fork(MegaHardfork::MiniRex), ForkCondition::Timestamp(3));
     }
 
     #[test]

@@ -93,22 +93,16 @@ impl MptWitness {
         header: &Header,
         storage_updates: B256Map<U256>,
     ) -> Result<(), WithdrawalValidationError> {
-        let expected_post_root = header
-            .withdrawals_root
-            .ok_or(WithdrawalValidationError::MissingWithdrawalsRoot)?;
+        let expected_post_root =
+            header.withdrawals_root.ok_or(WithdrawalValidationError::MissingWithdrawalsRoot)?;
 
         // Build node lookup: hash → RLP bytes
-        let nodes = self
-            .state
-            .iter()
-            .map(|node| (keccak256(node), node.clone()))
-            .collect::<B256Map<_>>();
+        let nodes =
+            self.state.iter().map(|node| (keccak256(node), node.clone())).collect::<B256Map<_>>();
 
         // Reconstruct and verify pre-state
         let mut trie = rebuild_trie(self.storage_root, &nodes)?;
-        let root = trie
-            .root()
-            .ok_or(WithdrawalValidationError::TrieNotRevealed)?;
+        let root = trie.root().ok_or(WithdrawalValidationError::TrieNotRevealed)?;
         if root != self.storage_root {
             return Err(WithdrawalValidationError::PreStateRootMismatch {
                 expected: self.storage_root,
@@ -130,9 +124,7 @@ impl MptWitness {
         }
 
         // Verify post-state
-        let root = trie
-            .root()
-            .ok_or(WithdrawalValidationError::TrieNotRevealed)?;
+        let root = trie.root().ok_or(WithdrawalValidationError::TrieNotRevealed)?;
         if root != expected_post_root {
             return Err(WithdrawalValidationError::PostStateRootMismatch {
                 expected: expected_post_root,
@@ -179,9 +171,7 @@ fn rebuild_trie(
 
     while let Some((hash, path)) = queue.pop_front() {
         // Decode node from witness
-        let bytes = nodes
-            .get(&hash)
-            .ok_or(WithdrawalValidationError::WitnessNodeNotFound(hash))?;
+        let bytes = nodes.get(&hash).ok_or(WithdrawalValidationError::WitnessNodeNotFound(hash))?;
         let node = TrieNode::decode(&mut bytes.as_ref())
             .map_err(|e| WithdrawalValidationError::RlpDecodeFailed(e.to_string()))?;
 

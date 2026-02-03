@@ -86,10 +86,7 @@ impl<'a> DatabaseRef for WitnessDatabase<'a> {
             _ => None,
         }) {
             Some(acc) => {
-                let code = acc
-                    .codehash
-                    .and_then(|hash| self.contracts.get(&hash))
-                    .cloned();
+                let code = acc.codehash.and_then(|hash| self.contracts.get(&hash)).cloned();
                 Ok(Some(AccountInfo {
                     balance: acc.balance,
                     nonce: acc.nonce,
@@ -150,8 +147,8 @@ impl<'a> DatabaseRef for WitnessDatabase<'a> {
         trace!(number, "block_hash_ref");
 
         // Return error for blocks beyond EIP-2935 history window
-        if number >= self.header.number
-            || number + (HISTORY_SERVE_WINDOW as u64) < self.header.number
+        if number >= self.header.number ||
+            number + (HISTORY_SERVE_WINDOW as u64) < self.header.number
         {
             return Err(WitnessDatabaseError(format!(
                 "Block {} is outside the history serve window",
@@ -166,11 +163,8 @@ impl<'a> DatabaseRef for WitnessDatabase<'a> {
         }
 
         // Look up historical block hash in EIP-2935 storage
-        self.storage_ref(
-            HISTORY_STORAGE_ADDRESS,
-            U256::from(number % HISTORY_SERVE_WINDOW as u64),
-        )
-        .map(|res| res.into())
+        self.storage_ref(HISTORY_STORAGE_ADDRESS, U256::from(number % HISTORY_SERVE_WINDOW as u64))
+            .map(|res| res.into())
     }
 }
 
@@ -219,10 +213,7 @@ impl WitnessExternalEnv {
             .map(|(key, value)| Self::parse_metadata_entry(key, value))
             .collect::<Result<HashMap<_, _>, _>>()?;
 
-        Ok(Self {
-            block_number,
-            bucket_capacities,
-        })
+        Ok(Self { block_number, bucket_capacities })
     }
 
     /// Parses a single metadata entry from the witness.
@@ -253,10 +244,7 @@ impl ExternalEnvFactory for WitnessExternalEnv {
             "block mismatch: expected {}, got {}",
             self.block_number, block
         );
-        ExternalEnvs {
-            salt_env: self.clone(),
-            oracle_env: self.clone(),
-        }
+        ExternalEnvs { salt_env: self.clone(), oracle_env: self.clone() }
     }
 }
 
@@ -266,12 +254,9 @@ impl SaltEnv for WitnessExternalEnv {
     fn get_bucket_capacity(&self, bucket_id: BucketId) -> Result<u64, Self::Error> {
         trace!(?bucket_id, "get_bucket_capacity");
 
-        self.bucket_capacities
-            .get(&bucket_id)
-            .copied()
-            .ok_or_else(|| {
-                WitnessDatabaseError(format!("Capacity of bucket {bucket_id} not in witness"))
-            })
+        self.bucket_capacities.get(&bucket_id).copied().ok_or_else(|| {
+            WitnessDatabaseError(format!("Capacity of bucket {bucket_id} not in witness"))
+        })
     }
 
     fn bucket_id_for_account(account: Address) -> BucketId {
@@ -296,11 +281,7 @@ mod tests {
     /// Verifies successful parsing of valid bucket metadata.
     #[test]
     fn test_parse_metadata_entry_valid() {
-        let meta = BucketMeta {
-            nonce: 42,
-            capacity: 1024,
-            used: None,
-        };
+        let meta = BucketMeta { nonce: 42, capacity: 1024, used: None };
         let key = SaltKey::from((256u32, 0u64));
 
         let (bucket_id, capacity) =

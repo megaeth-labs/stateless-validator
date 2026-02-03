@@ -146,11 +146,8 @@ impl RpcClient {
     /// # Errors
     /// Returns error if unable to connect to the blockchain or RPC fails.
     pub async fn get_latest_block_number(&self) -> Result<u64> {
-        let result = self
-            .data_provider
-            .get_block_number()
-            .await
-            .context("Failed to get block number");
+        let result =
+            self.data_provider.get_block_number().await.context("Failed to get block number");
 
         metrics::on_rpc_complete(metrics::RpcMethod::EthBlockNumber, result.is_ok(), None);
         result
@@ -237,11 +234,7 @@ impl RpcClient {
             .await
             .map_err(|e| eyre!("Failed to set validated blocks: {e}"));
 
-        metrics::on_rpc_complete(
-            metrics::RpcMethod::MegaSetValidatedBlocks,
-            result.is_ok(),
-            None,
-        );
+        metrics::on_rpc_complete(metrics::RpcMethod::MegaSetValidatedBlocks, result.is_ok(), None);
         result
     }
 }

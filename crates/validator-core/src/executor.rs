@@ -290,10 +290,7 @@ where
     };
 
     // Setup execution environment
-    let mut state = StateBuilder::new()
-        .with_database_ref(db)
-        .with_bundle_update()
-        .build();
+    let mut state = StateBuilder::new().with_database_ref(db).with_bundle_update().build();
     let evm_env = create_evm_env(&block.header, chain_spec);
 
     let executor_factory = MegaBlockExecutorFactory::new(
@@ -348,8 +345,8 @@ where
         .state
         .values()
         .map(|a| {
-            (a.info != a.original_info) as usize
-                + a.storage.values().filter(|s| s.is_changed()).count()
+            (a.info != a.original_info) as usize +
+                a.storage.values().filter(|s| s.is_changed()).count()
         })
         .sum();
 
@@ -377,34 +374,23 @@ where
     OpTransaction<T>: TransactionResponse,
     for<'a> Recovered<&'a T>: ExecutableTx<E>,
 {
-    executor
-        .apply_pre_execution_changes()
-        .map_err(ValidationError::BlockReplayFailed)?;
+    executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
 
     for tx in transactions {
         let tx_envelope = tx.inner.clone().into_inner();
         let recovered_tx = Recovered::new_unchecked(&tx_envelope, tx.from());
-        executor
-            .execute_transaction(recovered_tx)
-            .map_err(ValidationError::BlockReplayFailed)?;
+        executor.execute_transaction(recovered_tx).map_err(ValidationError::BlockReplayFailed)?;
     }
 
-    let execution_result = executor
-        .apply_post_execution_changes()
-        .map_err(ValidationError::BlockReplayFailed)?;
+    let execution_result =
+        executor.apply_post_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
 
     // Compute logs bloom by ORing all receipt blooms together
-    let logs_bloom = execution_result
-        .receipts
-        .iter()
-        .fold(Bloom::ZERO, |acc, receipt| acc | receipt.bloom());
+    let logs_bloom =
+        execution_result.receipts.iter().fold(Bloom::ZERO, |acc, receipt| acc | receipt.bloom());
 
     // Gas used is the cumulative gas used of the last receipt
-    let gas_used = execution_result
-        .receipts
-        .last()
-        .map(|r| r.cumulative_gas_used())
-        .unwrap_or(0);
+    let gas_used = execution_result.receipts.last().map(|r| r.cumulative_gas_used()).unwrap_or(0);
 
     let receipts_root = calculate_receipt_root(&execution_result.receipts);
 
@@ -450,17 +436,11 @@ pub fn validate_block(
     // Verify witness proof against the current state root
     let start = Instant::now();
     let witness = Witness::from(salt_witness);
-    witness
-        .verify()
-        .map_err(ValidationError::WitnessVerificationFailed)?;
+    witness.verify().map_err(ValidationError::WitnessVerificationFailed)?;
     let witness_verification_time = start.elapsed().as_secs_f64();
 
     // Replay block transactions
-    let witness_db = WitnessDatabase {
-        header: &block.header,
-        witness: &witness,
-        contracts,
-    };
+    let witness_db = WitnessDatabase { header: &block.header, witness: &witness, contracts };
     let (accounts, output) = replay_block(chain_spec, block, &witness_db, ext_env, writer)?;
     let block_replay_time = start.elapsed().as_secs_f64() - witness_verification_time;
 

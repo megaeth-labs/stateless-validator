@@ -221,10 +221,7 @@ pub enum ValidationDbError {
     Serialization(#[from] SerializationError),
 
     #[error("missing {kind} for block {block_hash:?}")]
-    MissingData {
-        kind: MissingDataKind,
-        block_hash: BlockHash,
-    },
+    MissingData { kind: MissingDataKind, block_hash: BlockHash },
 
     #[error("Block validation failed: {0}")]
     FailedValidation(String),
@@ -584,10 +581,8 @@ impl ValidatorDB {
             let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
 
             // Move block from remote to canonical chain
-            canonical_chain.insert(
-                block_number,
-                (block_hash_bytes, post_state_root, post_withdrawals_root),
-            )?;
+            canonical_chain
+                .insert(block_number, (block_hash_bytes, post_state_root, post_withdrawals_root))?;
             remote_chain.remove(block_number)?;
         }
         write_txn.commit()?;
@@ -906,10 +901,8 @@ impl ValidatorDB {
 
             anchor_block_table.insert("anchor", (block_number, block_hash.0))?;
             canonical_chain.retain(|_, _| false)?;
-            canonical_chain.insert(
-                block_number,
-                (block_hash.0, post_state_root.0, post_withdrawals_root.0),
-            )?;
+            canonical_chain
+                .insert(block_number, (block_hash.0, post_state_root.0, post_withdrawals_root.0))?;
             remote_chain.retain(|_, _| false)?;
         }
         write_txn.commit()?;
