@@ -39,4 +39,6 @@ pub use tracing_executor::{
 };
 pub mod rpc_client;
 pub mod withdrawals;
-pub use rpc_client::{RpcClient, RpcClientConfig, SetValidatedBlocksResponse};
+pub use rpc_client::{
+    RpcClient, RpcClientConfig, RpcMethod, RpcMetrics, SetValidatedBlocksResponse,
+};

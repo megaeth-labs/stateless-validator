@@ -92,7 +92,7 @@ fn block_data_err(block_num: u64, e: eyre::Report) -> jsonrpsee::types::ErrorObj
     if err_str.contains("not found") || err_str.contains("timeout") {
         rpc_err_not_found(format!("block not found: {:#x}", block_num))
     } else {
-        rpc_err(format!("internal error"))
+        rpc_err("internal error".to_string())
     }
 }
 
@@ -102,19 +102,18 @@ fn block_data_err_by_hash(block_hash: B256, e: eyre::Report) -> jsonrpsee::types
     if err_str.contains("not found") || err_str.contains("timeout") {
         rpc_err_not_found(format!("block not found: hash {}", block_hash))
     } else {
-        rpc_err(format!("internal error"))
+        rpc_err("internal error".to_string())
     }
 }
 
 /// Converts a transaction lookup error to an appropriate RPC error.
 fn tx_data_err(e: eyre::Report) -> jsonrpsee::types::ErrorObjectOwned {
     let err_str = e.to_string().to_lowercase();
-    if err_str.contains("not found") || err_str.contains("timeout") {
-        rpc_err_not_found("transaction not found".to_string())
-    } else if err_str.contains("pending") {
+    if err_str.contains("not found") || err_str.contains("timeout") || err_str.contains("pending")
+    {
         rpc_err_not_found("transaction not found".to_string())
     } else {
-        rpc_err(format!("internal error"))
+        rpc_err("internal error".to_string())
     }
 }
 
@@ -461,7 +460,7 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
         );
 
         let (data, tx_index) =
-            ctx.data_provider.get_block_data_for_tx(tx_hash).await.map_err(|e| tx_data_err(e))?;
+            ctx.data_provider.get_block_data_for_tx(tx_hash).await.map_err(tx_data_err)?;
 
         let result = validator_core::trace_transaction(
             &ctx.chain_spec,

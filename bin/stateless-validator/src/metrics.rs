@@ -10,9 +10,34 @@ use eyre::Result;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tracing::info;
+pub use validator_core::RpcMethod;
+use validator_core::RpcMetrics;
 
 /// Default metrics port.
 pub const DEFAULT_METRICS_PORT: u16 = 9090;
+
+/// Metrics callback implementation for RPC client.
+///
+/// This struct implements the `RpcMetrics` trait from validator-core,
+/// allowing the RPC client to report metrics through the stateless validator's
+/// Prometheus metrics system.
+pub struct ValidatorMetrics;
+
+impl RpcMetrics for ValidatorMetrics {
+    fn on_rpc_complete(&self, method: RpcMethod, success: bool, duration_secs: Option<f64>) {
+        on_rpc_complete(method, success, duration_secs);
+    }
+
+    fn on_witness_fetch(
+        &self,
+        salt_size: usize,
+        kvs_count: usize,
+        salt_kvs_size: usize,
+        mpt_size: usize,
+    ) {
+        on_witness_fetch(salt_size, kvs_count, salt_kvs_size, mpt_size);
+    }
+}
 
 /// Metric name constants.
 pub mod names {
@@ -158,25 +183,9 @@ pub fn on_chain_reorg(reverted_hashes: &[B256]) {
     histogram!(names::REORG_DEPTH).record(reverted_hashes.len() as f64);
 }
 
-/// RPC method types for metrics tracking.
-#[derive(Debug, Clone, Copy)]
-pub enum RpcMethod {
-    EthGetCodeByHash,
-    EthGetBlockByNumber,
-    EthBlockNumber,
-    MegaGetBlockWitness,
-    MegaSetValidatedBlocks,
-}
-
 // RPC metrics
 pub fn on_rpc_complete(method: RpcMethod, success: bool, duration_secs: Option<f64>) {
-    let method_str = match method {
-        RpcMethod::EthGetCodeByHash => "eth_getCodeByHash",
-        RpcMethod::EthGetBlockByNumber => "eth_getBlockByNumber",
-        RpcMethod::EthBlockNumber => "eth_blockNumber",
-        RpcMethod::MegaGetBlockWitness => "mega_getBlockWitness",
-        RpcMethod::MegaSetValidatedBlocks => "mega_setValidatedBlocks",
-    };
+    let method_str = method.as_str();
     counter!(names::RPC_REQUESTS_TOTAL, "method" => method_str).increment(1);
     if !success {
         counter!(names::RPC_ERRORS_TOTAL, "method" => method_str).increment(1);

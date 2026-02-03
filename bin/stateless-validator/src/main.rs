@@ -17,7 +17,7 @@ use tokio::{signal, task};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use validator_core::{
-    ChainSyncConfig, RpcClient, ValidatorDB,
+    ChainSyncConfig, RpcClient, RpcClientConfig, ValidatorDB,
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
     executor::{ValidationResult, validate_block},
@@ -210,7 +210,12 @@ async fn run() -> Result<()> {
 
     let work_dir = PathBuf::from(args.data_dir);
 
-    let client = Arc::new(RpcClient::new(&args.rpc_endpoint, &args.witness_endpoint)?);
+    let rpc_config = RpcClientConfig::validator().with_metrics(Arc::new(metrics::ValidatorMetrics));
+    let client = Arc::new(RpcClient::new_with_config(
+        &args.rpc_endpoint,
+        &args.witness_endpoint,
+        rpc_config,
+    )?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
 
     // Load chain spec from file (first run) or database (subsequent runs)
@@ -224,22 +229,9 @@ async fn run() -> Result<()> {
 
         let block_hash = parse_block_hash(start_block_str)?;
         let block = loop {
-            let start = Instant::now();
             match client.get_block(BlockId::Hash(block_hash.into()), false).await {
-                Ok(block) => {
-                    metrics::on_rpc_complete(
-                        metrics::RpcMethod::EthGetBlockByNumber,
-                        true,
-                        Some(start.elapsed().as_secs_f64()),
-                    );
-                    break block;
-                }
+                Ok(block) => break block,
                 Err(e) => {
-                    metrics::on_rpc_complete(
-                        metrics::RpcMethod::EthGetBlockByNumber,
-                        false,
-                        Some(start.elapsed().as_secs_f64()),
-                    );
                     warn!("[Main] Failed to fetch block {block_hash}: {e}, retrying...",);
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
@@ -530,16 +522,9 @@ async fn validate_one(
             metrics::on_contract_cache_read(contracts.len() as u64, missing_contracts.len() as u64);
 
             // Fetch missing contract codes via RPC concurrently and update the local DB
-            let codes = future::try_join_all(missing_contracts.iter().map(|&hash| async move {
-                let start = Instant::now();
-                let result = client.get_code(hash).await;
-                metrics::on_rpc_complete(
-                    metrics::RpcMethod::EthGetCodeByHash,
-                    result.is_ok(),
-                    Some(start.elapsed().as_secs_f64()),
-                );
-                result
-            }))
+            let codes = future::try_join_all(
+                missing_contracts.iter().map(|&hash| async move { client.get_code(hash).await }),
+            )
             .await?;
 
             // Validate all fetched bytecodes match expected hashes
@@ -664,8 +649,6 @@ async fn validation_reporter(
                 (last_block.0, B256::from(last_block.1.0)),
             )
             .await;
-
-        metrics::on_rpc_complete(metrics::RpcMethod::MegaSetValidatedBlocks, result.is_ok(), None);
 
         match result {
             Ok(response) if response.accepted => {
