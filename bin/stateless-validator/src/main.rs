@@ -32,8 +32,10 @@ const VALIDATOR_DB_FILENAME: &str = "validator.redb";
 /// Initialize logging system with environment variable configuration
 ///
 /// Supports the following environment variables:
-/// - STATELESS_VALIDATOR_LOG_FILE_DIRECTORY: Directory for log files (optional, file logging disabled if not set)
-/// - STATELESS_VALIDATOR_LOG_FILE: Log level for file output (debug/info/warn/error), default: debug
+/// - STATELESS_VALIDATOR_LOG_FILE_DIRECTORY: Directory for log files (optional, file logging
+///   disabled if not set)
+/// - STATELESS_VALIDATOR_LOG_FILE: Log level for file output (debug/info/warn/error), default:
+///   debug
 /// - STATELESS_VALIDATOR_LOG_STDOUT: Log level for stdout (debug/info/warn/error), default: info
 fn init_logging() -> Result<()> {
     use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -92,11 +94,7 @@ fn init_logging() -> Result<()> {
 /// Accepts hex strings with or without "0x" prefix. Must be exactly 32 bytes when decoded.
 fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
     let hash_bytes = hex::decode(hex_str)?;
-    ensure!(
-        hash_bytes.len() == 32,
-        "Block hash must be 32 bytes, got {}",
-        hash_bytes.len()
-    );
+    ensure!(hash_bytes.len() == 32, "Block hash must be 32 bytes, got {}", hash_bytes.len());
     Ok(BlockHash::from_slice(&hash_bytes))
 }
 
@@ -185,10 +183,7 @@ fn main() -> Result<()> {
     let shutdown_start = Instant::now();
     runtime.shutdown_timeout(timeout);
     if shutdown_start.elapsed() >= timeout {
-        warn!(
-            "[Main] Tokio runtime shutdown reached the {:?} timeout.",
-            timeout
-        );
+        warn!("[Main] Tokio runtime shutdown reached the {:?} timeout.", timeout);
     }
     result
 }
@@ -219,10 +214,8 @@ async fn run() -> Result<()> {
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
 
     // Load chain spec from file (first run) or database (subsequent runs)
-    let chain_spec = Arc::new(load_or_create_chain_spec(
-        &validator_db,
-        args.genesis_file.as_deref(),
-    )?);
+    let chain_spec =
+        Arc::new(load_or_create_chain_spec(&validator_db, args.genesis_file.as_deref())?);
     info!("[Main] Chain spec loaded successfully");
 
     // Handle optional start block initialization
@@ -289,17 +282,10 @@ async fn run() -> Result<()> {
         metrics_port: args.metrics_port,
         ..ChainSyncConfig::default()
     });
-    info!(
-        "[Main] Number of concurrent tasks: {}",
-        config.concurrent_workers
-    );
+    info!("[Main] Number of concurrent tasks: {}", config.concurrent_workers);
     info!(
         "[Main] Validation result reporting: {}",
-        if config.report_validation_results {
-            "enabled"
-        } else {
-            "disabled"
-        }
+        if config.report_validation_results { "enabled" } else { "disabled" }
     );
 
     let validator_logic = chain_sync(client.clone(), validator_db.clone(), config, chain_spec);
@@ -326,7 +312,8 @@ async fn run() -> Result<()> {
 /// Implements a multi-phase startup process for stateless block validation:
 /// 1. **Task Recovery** - Recovers interrupted validation tasks from previous crashes
 /// 2. **Remote Chain Tracking** - Spawns background tracker to maintain block lookahead
-/// 3. **Validation Reporter** - Optionally spawns background task to report validation results to upstream node (when enabled)
+/// 3. **Validation Reporter** - Optionally spawns background task to report validation results to
+///    upstream node (when enabled)
 /// 4. **History Pruning** - Spawns background pruner to manage storage overhead
 /// 5. **Validation Workers** - Spawns configured number of parallel validation workers
 /// 6. **Main Sync Loop** - Continuously advances canonical chain as blocks are validated
@@ -337,7 +324,8 @@ async fn run() -> Result<()> {
 /// # Arguments
 /// * `client` - RPC client for communicating with remote blockchain node
 /// * `validator_db` - Database interface for task coordination and chain state management
-/// * `config` - Configuration including worker count, polling intervals, optional sync target, and validation reporting
+/// * `config` - Configuration including worker count, polling intervals, optional sync target, and
+///   validation reporting
 /// * `chain_spec` - Chain specification defining the EVM rules and parameters
 ///
 /// # Returns
@@ -349,10 +337,7 @@ async fn chain_sync(
     config: Arc<ChainSyncConfig>,
     chain_spec: Arc<ChainSpec>,
 ) -> Result<()> {
-    info!(
-        "[Chain Sync] Starting with {} validation workers",
-        config.concurrent_workers
-    );
+    info!("[Chain Sync] Starting with {} validation workers", config.concurrent_workers);
 
     // Step 1: Recover any interrupted tasks from previous crashes
     info!("[Chain Sync] Recovering interrupted validation tasks from previous runs...");
@@ -383,16 +368,10 @@ async fn chain_sync(
     }
 
     // Step 4: Spawn history pruner
-    task::spawn(history_pruner(
-        Arc::clone(&validator_db),
-        Arc::clone(&config),
-    ));
+    task::spawn(history_pruner(Arc::clone(&validator_db), Arc::clone(&config)));
 
     // Step 5: Spawn validation workers as tokio tasks
-    info!(
-        "[Chain Sync] Spawning {} validation workers...",
-        config.concurrent_workers
-    );
+    info!("[Chain Sync] Spawning {} validation workers...", config.concurrent_workers);
     for worker_id in 0..config.concurrent_workers {
         task::spawn(validation_worker(
             worker_id,
@@ -408,9 +387,9 @@ async fn chain_sync(
     info!("[Chain Sync] Starting main synchronizer loop...");
 
     loop {
-        if let Some(target) = config.sync_target
-            && let Ok(Some((local_block_number, _))) = validator_db.get_local_tip()
-            && local_block_number >= target
+        if let Some(target) = config.sync_target &&
+            let Ok(Some((local_block_number, _))) = validator_db.get_local_tip() &&
+            local_block_number >= target
         {
             debug!("[Chain Sync] Reached sync target height {target}, terminating");
             return Ok(());
@@ -456,10 +435,10 @@ async fn chain_sync(
             //
             // 3. ValidationDbError::MissingData
             //    - Block data, witness, or validation result not found in database
-            //    - This should NEVER occur in normal operation because block data and witnesses
-            //      are written atomically during validation
-            //    - If this occurs, it indicates either a bug in the validation pipeline or
-            //      database corruption
+            //    - This should NEVER occur in normal operation because block data and witnesses are
+            //      written atomically during validation
+            //    - If this occurs, it indicates either a bug in the validation pipeline or database
+            //      corruption
             //
             // 4. ValidationDbError::ValidationResultMismatch
             //    - Validation result does not match the first remote chain entry
@@ -590,11 +569,13 @@ async fn validate_one(
             let post_state_root = block.header.state_root;
             let pre_withdrawals_root = mpt_witness.storage_root;
             let block_hash = block.header.hash;
-            let post_withdrawals_root = block.header.withdrawals_root.ok_or(eyre::eyre!(
-                "Withdrawals root not found in block {block_hash}"
-            ))?;
+            let post_withdrawals_root = block
+                .header
+                .withdrawals_root
+                .ok_or(eyre::eyre!("Withdrawals root not found in block {block_hash}"))?;
 
-            // Validate in a blocking thread so async tasks (reporter, tracker, etc.) stay responsive.
+            // Validate in a blocking thread so async tasks (reporter, tracker, etc.) stay
+            // responsive.
             let validation_result = task::spawn_blocking(move || {
                 validate_block(&chain_spec, &block, witness, mpt_witness, &contracts, None)
             })
@@ -654,8 +635,8 @@ async fn validate_one(
 ///
 /// # Returns
 /// * `Ok(())` - Never returns under normal operation
-/// * `Err(eyre::Error)` - Terminates if validation gap detected (upstream's last validated
-///   block < local chain start)
+/// * `Err(eyre::Error)` - Terminates if validation gap detected (upstream's last validated block <
+///   local chain start)
 async fn validation_reporter(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
@@ -668,13 +649,11 @@ async fn validation_reporter(
         tokio::time::sleep(config.sync_poll_interval).await;
 
         // Get canonical chain bounds
-        let (first_block, last_block) = match (
-            validator_db.get_anchor_block(),
-            validator_db.get_local_tip(),
-        ) {
-            (Ok(Some(first)), Ok(Some(last))) => (first, last),
-            _ => continue,
-        };
+        let (first_block, last_block) =
+            match (validator_db.get_anchor_block(), validator_db.get_local_tip()) {
+                (Ok(Some(first)), Ok(Some(last))) => (first, last),
+                _ => continue,
+            };
 
         // Skip if no new blocks
         if last_block == last_reported_block {
@@ -737,10 +716,7 @@ async fn history_pruner(
     validator_db: Arc<ValidatorDB>,
     config: Arc<ChainSyncConfig>,
 ) -> Result<()> {
-    info!(
-        "[Pruner] Starting with interval {:?}",
-        config.pruner_interval
-    );
+    info!("[Pruner] Starting with interval {:?}", config.pruner_interval);
 
     loop {
         if let Ok(Some((current_tip, _))) = validator_db.get_local_tip() {
@@ -768,14 +744,12 @@ fn extract_contract_codes(salt_witness: &SaltWitness) -> HashSet<B256> {
         .kvs
         .values()
         .filter_map(|salt_val| salt_val.as_ref())
-        .filter_map(
-            |val| match (PlainKey::decode(val.key()), PlainValue::decode(val.value())) {
-                (PlainKey::Account(_), PlainValue::Account(acc)) => {
-                    acc.codehash.filter(|&codehash| codehash != KECCAK_EMPTY)
-                }
-                _ => None,
-            },
-        )
+        .filter_map(|val| match (PlainKey::decode(val.key()), PlainValue::decode(val.value())) {
+            (PlainKey::Account(_), PlainValue::Account(acc)) => {
+                acc.codehash.filter(|&codehash| codehash != KECCAK_EMPTY)
+            }
+            _ => None,
+        })
         .collect()
 }
 
@@ -888,9 +862,8 @@ mod tests {
     /// * `Ok((BlockNumber, BlockHash))` - Successfully parsed block identifiers
     /// * `Err(eyre::Error)` - Invalid format or malformed hash
     fn parse_block_num_and_hash(input: &str) -> Result<(BlockNumber, BlockHash)> {
-        let (block_str, hash_str) = input
-            .split_once('.')
-            .ok_or_else(|| anyhow!("Invalid format: {input}"))?;
+        let (block_str, hash_str) =
+            input.split_once('.').ok_or_else(|| anyhow!("Invalid format: {input}"))?;
 
         Ok((block_str.parse()?, parse_block_hash(hash_str)?))
     }
@@ -1003,22 +976,15 @@ mod tests {
 
                 // Look up witness data by block hash
                 let salt_witness =
-                    context
-                        .witness_data
-                        .get(&block_hash)
-                        .cloned()
-                        .ok_or_else(|| {
-                            make_rpc_error(
-                                CALL_EXECUTION_FAILED_CODE,
-                                format!("Witness for block {hash_str} not found"),
-                            )
-                        })?;
+                    context.witness_data.get(&block_hash).cloned().ok_or_else(|| {
+                        make_rpc_error(
+                            CALL_EXECUTION_FAILED_CODE,
+                            format!("Witness for block {hash_str} not found"),
+                        )
+                    })?;
 
-                let mpt_witness = context
-                    .mpt_witness_data
-                    .get(&block_hash)
-                    .cloned()
-                    .ok_or_else(|| {
+                let mpt_witness =
+                    context.mpt_witness_data.get(&block_hash).cloned().ok_or_else(|| {
                         make_rpc_error(
                             CALL_EXECUTION_FAILED_CODE,
                             format!("Witness for block {hash_str} not found"),
@@ -1044,14 +1010,9 @@ mod tests {
             })
             .unwrap();
 
-        let cfg = ServerConfigBuilder::default()
-            .max_response_body_size(MAX_RESPONSE_BODY_SIZE)
-            .build();
-        let server = ServerBuilder::default()
-            .set_config(cfg)
-            .build("0.0.0.0:0")
-            .await
-            .unwrap();
+        let cfg =
+            ServerConfigBuilder::default().max_response_body_size(MAX_RESPONSE_BODY_SIZE).build();
+        let server = ServerBuilder::default().set_config(cfg).build("0.0.0.0:0").await.unwrap();
 
         let url = format!("http://{}", server.local_addr().unwrap());
         (server.start(module), url)
@@ -1163,12 +1124,7 @@ mod tests {
         let min_block = (min_block_num, min_block_hash);
         let max_block = (max_block_num, max_block_hash);
 
-        debug!(
-            "Loaded {} blocks (range: {} - {})",
-            block_numbers.len(),
-            min_block.0,
-            max_block.0
-        );
+        debug!("Loaded {} blocks (range: {} - {})", block_numbers.len(), min_block.0, max_block.0);
 
         // Load witness data from TEST_WITNESS_DIR
         debug!("Loading witness data from {}", TEST_WITNESS_DIR);
@@ -1205,10 +1161,7 @@ mod tests {
             debug!("Loaded {} salt witness files", witness_data.len());
             debug!("Loaded {} mpt witness files", mpt_witness_data.len());
         } else {
-            debug!(
-                "Witness directory {} does not exist, skipping witness data",
-                TEST_WITNESS_DIR
-            );
+            debug!("Witness directory {} does not exist, skipping witness data", TEST_WITNESS_DIR);
         }
 
         // Load contract data and build address-to-bytecode mapping from witness data
@@ -1244,10 +1197,7 @@ mod tests {
             context.witness_data.len(),
             context.bytecodes.len()
         );
-        debug!(
-            "Block range: {} - {}",
-            context.min_block.0, context.max_block.0
-        );
+        debug!("Block range: {} - {}", context.min_block.0, context.max_block.0);
 
         let sync_target = Some(context.max_block.0);
         let validator_db = setup_test_db(&context).unwrap();
@@ -1265,9 +1215,7 @@ mod tests {
             ..ChainSyncConfig::default()
         });
 
-        chain_sync(client.clone(), validator_db, config, chain_spec)
-            .await
-            .unwrap();
+        chain_sync(client.clone(), validator_db, config, chain_spec).await.unwrap();
 
         handle.stop().unwrap();
         info!("Mock RPC server has been shut down.");

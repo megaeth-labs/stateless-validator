@@ -2,7 +2,8 @@
 //!
 //! This module implements the core database layer that coordinates between the chain synchronizer
 //! and validation workers in the stateless validator architecture. It manages the complete
-//! workflow from task creation to result storage, enabling parallel validation of blockchain blocks.
+//! workflow from task creation to result storage, enabling parallel validation of blockchain
+//! blocks.
 //!
 //! ## Architecture Overview
 //!
@@ -13,14 +14,17 @@
 //! ## Database Schema
 //!
 //! The database consists of 9 specialized tables:
-//! - `CANONICAL_CHAIN`: Local view of the canonical blockchain (BlockNumber → (BlockHash, PostStateRoot, PostWithdrawalsRoot))
+//! - `CANONICAL_CHAIN`: Local view of the canonical blockchain (BlockNumber → (BlockHash,
+//!   PostStateRoot, PostWithdrawalsRoot))
 //! - `REMOTE_CHAIN`: Remote chain used to guide chain advancement (BlockNumber → BlockHash)
 //! - `TASK_LIST`: Queue of pending validation tasks (BlockNumber, BlockHash) → ()
 //! - `ONGOING_TASKS`: Tasks currently being processed by workers
 //! - `BLOCK_DATA`: Complete block data required for validation (BlockHash → Block)
 //! - `WITNESSES`: Cryptographic witness data for stateless validation (BlockHash → SaltWitness)
-//! - `VALIDATION_RESULTS`: Outcomes with block identifiers and status (BlockHash → ValidationResult)
-//! - `BLOCK_RECORDS`: Complete history including forks for efficient pruning (BlockNumber, BlockHash) → ()
+//! - `VALIDATION_RESULTS`: Outcomes with block identifiers and status (BlockHash →
+//!   ValidationResult)
+//! - `BLOCK_RECORDS`: Complete history including forks for efficient pruning (BlockNumber,
+//!   BlockHash) → ()
 //! - `CONTRACTS`: On-demand contract bytecode cache (CodeHash → Bytecode)
 //! - `GENESIS_CONFIG`: Genesis configuration stored on first run (singleton key → Genesis JSON)
 //!
@@ -28,12 +32,14 @@
 //!
 //! The system maintains two chains for efficient synchronization:
 //! - **CANONICAL_CHAIN**: The locally confirmed canonical chain (validated blocks only)
-//! - **REMOTE_CHAIN**: A lookahead chain with unvalidated blocks that stays ahead of CANONICAL_CHAIN
+//! - **REMOTE_CHAIN**: A lookahead chain with unvalidated blocks that stays ahead of
+//!   CANONICAL_CHAIN
 //!
 //! **Workflow:**
 //! 1. New blocks are received and added to REMOTE_CHAIN via `grow_remote_chain()` (unvalidated)
 //! 2. Validation tasks are created for blocks in REMOTE_CHAIN
-//! 3. Once validated successfully, blocks move from REMOTE_CHAIN to CANONICAL_CHAIN via `grow_local_chain()`
+//! 3. Once validated successfully, blocks move from REMOTE_CHAIN to CANONICAL_CHAIN via
+//!    `grow_local_chain()`
 //! 4. Failed validations keep blocks in REMOTE_CHAIN until rollback or retry
 //!
 //! This architecture allows the chain synchronizer to receive and track new blocks while
@@ -78,9 +84,11 @@ use crate::{
 
 /// Stores our local view of the canonical chain.
 ///
-/// **Schema:** Maps BlockNumber (u64) to (BlockHash, PostStateRoot, PostWithdrawalsRoot) as ([u8; 32], [u8; 32], [u8; 32])
+/// **Schema:** Maps BlockNumber (u64) to (BlockHash, PostStateRoot, PostWithdrawalsRoot) as ([u8;
+/// 32], [u8; 32], [u8; 32])
 /// - Key: Block height as BlockNumber (u64)
-/// - Value: (Block hash as [u8; 32], Post-state root as [u8; 32], Post-withdrawals root as [u8; 32])
+/// - Value: (Block hash as [u8; 32], Post-state root as [u8; 32], Post-withdrawals root as [u8;
+///   32])
 ///
 /// Updated by main orchestrator via grow_local_chain() and rollback_chain().
 /// Only successfully validated blocks can be added to this chain.
@@ -214,10 +222,7 @@ pub enum ValidationDbError {
     Serialization(#[from] SerializationError),
 
     #[error("missing {kind} for block {block_hash:?}")]
-    MissingData {
-        kind: MissingDataKind,
-        block_hash: BlockHash,
-    },
+    MissingData { kind: MissingDataKind, block_hash: BlockHash },
 
     #[error("Block validation failed: {0}")]
     FailedValidation(String),
@@ -629,10 +634,8 @@ impl ValidatorDB {
             let mut remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
 
             // Move block from remote to canonical chain
-            canonical_chain.insert(
-                block_number,
-                (block_hash_bytes, post_state_root, post_withdrawals_root),
-            )?;
+            canonical_chain
+                .insert(block_number, (block_hash_bytes, post_state_root, post_withdrawals_root))?;
             remote_chain.remove(block_number)?;
         }
         write_txn.commit()?;
@@ -1005,10 +1008,8 @@ impl ValidatorDB {
 
             anchor_block_table.insert("anchor", (block_number, block_hash.0))?;
             canonical_chain.retain(|_, _| false)?;
-            canonical_chain.insert(
-                block_number,
-                (block_hash.0, post_state_root.0, post_withdrawals_root.0),
-            )?;
+            canonical_chain
+                .insert(block_number, (block_hash.0, post_state_root.0, post_withdrawals_root.0))?;
             remote_chain.retain(|_, _| false)?;
         }
         write_txn.commit()?;

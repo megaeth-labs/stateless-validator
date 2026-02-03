@@ -64,10 +64,9 @@ impl PlainKey {
     pub fn encode(&self) -> Vec<u8> {
         match self {
             PlainKey::Account(addr) => addr.as_slice().to_vec(),
-            PlainKey::Storage(addr, slot) => addr
-                .concat_const::<SLOT_KEY_LEN, STORAGE_SLOT_KEY_LEN>(*slot)
-                .as_slice()
-                .to_vec(),
+            PlainKey::Storage(addr, slot) => {
+                addr.concat_const::<SLOT_KEY_LEN, STORAGE_SLOT_KEY_LEN>(*slot).as_slice().to_vec()
+            }
             PlainKey::Unknown(data) => data.clone(),
         }
     }
@@ -147,20 +146,12 @@ impl PlainValue {
         match buf.len() {
             EOA_ACCOUNT_LEN => {
                 let (nonce, balance) = Self::decode_account_fields(buf);
-                PlainValue::Account(Account {
-                    nonce,
-                    balance,
-                    codehash: None,
-                })
+                PlainValue::Account(Account { nonce, balance, codehash: None })
             }
             CONTRACT_ACCOUNT_LEN => {
                 let (nonce, balance) = Self::decode_account_fields(buf);
                 let bytecode_hash = B256::from_slice(&buf[EOA_ACCOUNT_LEN..]);
-                PlainValue::Account(Account {
-                    nonce,
-                    balance,
-                    codehash: Some(bytecode_hash),
-                })
+                PlainValue::Account(Account { nonce, balance, codehash: Some(bytecode_hash) })
             }
             STORAGE_VALUE_LEN => PlainValue::Storage(U256::from_be_slice(buf)),
             _ => PlainValue::Unknown(buf.to_vec()),

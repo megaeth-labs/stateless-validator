@@ -1,6 +1,15 @@
+
 [workspace]
-members = ["bin/stateless-validator", "bin/debug-trace-server", "validator-core"]
+members = ["bin/stateless-validator", "bin/debug-trace-server", "crates/validator-core"]
 resolver = "2"
+
+[workspace.package]
+version = "2.0.6"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/megaeth-labs/stateless-validator"
+exclude = [".github/"]
 
 [workspace.dependencies]
 # alloy
@@ -30,7 +39,7 @@ revm = { version = "27.1.0", default-features = false }
 revm-inspectors = { version = "0.27.1", features = ["std", "js-tracer"] }
 
 # megaeth 
-mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "v1.3.1" }
+mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "v1.3.2" }
 salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "v1.0.1" }
 
 # reth
@@ -58,8 +67,8 @@ serde_json = "1.0"
 thiserror = "2.0.16"
 tokio = { version = "1.46", features = ["rt-multi-thread", "signal"] }
 tracing = "0.1"
-tracing-subscriber = { version = "=0.3.20", features = ["fmt", "env-filter"] }
 tracing-appender = "0.2"
+tracing-subscriber = { version = "=0.3.20", features = ["fmt", "env-filter"] }
 
 [profile.release]
 opt-level = 3

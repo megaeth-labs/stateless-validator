@@ -20,7 +20,7 @@ revm-inspectors.workspace = true
 salt.workspace = true
 
 # Reuse validator-core
-validator-core = { path = "../../validator-core" }
+validator-core = { path = "../../crates/validator-core" }
 
 # Async runtime
 tokio = { workspace = true, features = ["sync"] }

@@ -1,7 +1,11 @@
 [package]
 name = "validator-core"
-version = "2.0.5"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+exclude.workspace = true
 
 [dependencies]
 # alloy
@@ -41,10 +45,10 @@ reth-trie-sparse.workspace = true
 
 # misc
 bincode.workspace = true
-lz4_flex.workspace = true
-eyre.workspace = true
 dyn-clone.workspace = true
+eyre.workspace = true
 futures.workspace = true
+lz4_flex.workspace = true
 num_cpus.workspace = true
 rayon.workspace = true
 redb.workspace = true

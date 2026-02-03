@@ -24,10 +24,7 @@ pub mod names {
 
     // Validation
     metric!(BLOCK_VALIDATION_TIME, "block_validation_time_seconds");
-    metric!(
-        WITNESS_VERIFICATION_TIME,
-        "witness_verification_time_seconds"
-    );
+    metric!(WITNESS_VERIFICATION_TIME, "witness_verification_time_seconds");
     metric!(BLOCK_REPLAY_TIME, "block_replay_time_seconds");
     metric!(SALT_UPDATE_TIME, "salt_update_time_seconds");
     metric!(TRANSACTIONS_TOTAL, "transactions_total");
@@ -56,6 +53,12 @@ pub mod names {
     metric!(CONTRACT_CACHE_HITS, "contract_cache_hits_total");
     metric!(CONTRACT_CACHE_MISSES, "contract_cache_misses_total");
     metric!(BLOCKS_PRUNED, "blocks_pruned_total");
+
+    // Witness
+    metric!(SALT_WITNESS_SIZE, "salt_witness_size_bytes");
+    metric!(MPT_WITNESS_SIZE, "mpt_witness_size_bytes");
+    metric!(SALT_WITNESS_KEYS, "salt_witness_keys");
+    metric!(SALT_WITNESS_KVS_SIZE, "salt_witness_kvs_size_bytes");
 }
 
 /// Initialize the Prometheus metrics exporter at the given address.
@@ -74,10 +77,7 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
 fn register_metric_descriptions() {
     // Validation
     describe_histogram!(names::BLOCK_VALIDATION_TIME, "Block validation time (s)");
-    describe_histogram!(
-        names::WITNESS_VERIFICATION_TIME,
-        "Witness verification time (s)"
-    );
+    describe_histogram!(names::WITNESS_VERIFICATION_TIME, "Witness verification time (s)");
     describe_histogram!(names::BLOCK_REPLAY_TIME, "EVM execution time (s)");
     describe_histogram!(names::SALT_UPDATE_TIME, "SALT update time (s)");
     describe_counter!(names::TRANSACTIONS_TOTAL, "Total transactions validated");
@@ -92,10 +92,7 @@ fn register_metric_descriptions() {
     // Chain
     describe_gauge!(names::LOCAL_CHAIN_HEIGHT, "Local chain height");
     describe_gauge!(names::REMOTE_CHAIN_HEIGHT, "Remote chain height");
-    describe_gauge!(
-        names::VALIDATION_LAG,
-        "Blocks pending validation (remote - local)"
-    );
+    describe_gauge!(names::VALIDATION_LAG, "Blocks pending validation (remote - local)");
     describe_counter!(names::REORGS_DETECTED, "Chain reorgs detected");
     describe_histogram!(names::REORG_DEPTH, "Reorg depth");
 
@@ -109,6 +106,12 @@ fn register_metric_descriptions() {
     describe_counter!(names::CONTRACT_CACHE_HITS, "Contract cache hits");
     describe_counter!(names::CONTRACT_CACHE_MISSES, "Contract cache misses");
     describe_counter!(names::BLOCKS_PRUNED, "Blocks pruned from history");
+
+    // Witness
+    describe_histogram!(names::SALT_WITNESS_SIZE, "Salt witness size (bytes)");
+    describe_histogram!(names::MPT_WITNESS_SIZE, "MPT witness size (bytes)");
+    describe_histogram!(names::SALT_WITNESS_KEYS, "Salt witness key count");
+    describe_histogram!(names::SALT_WITNESS_KVS_SIZE, "Salt witness KVs size (bytes)");
 }
 
 /// Record validation timing and block statistics after successful validation.
@@ -160,6 +163,8 @@ pub fn on_chain_reorg(reverted_hashes: &[B256]) {
 pub enum RpcMethod {
     EthGetCodeByHash,
     EthGetBlockByNumber,
+    EthBlockNumber,
+    MegaGetBlockWitness,
     MegaSetValidatedBlocks,
 }
 
@@ -168,6 +173,8 @@ pub fn on_rpc_complete(method: RpcMethod, success: bool, duration_secs: Option<f
     let method_str = match method {
         RpcMethod::EthGetCodeByHash => "eth_getCodeByHash",
         RpcMethod::EthGetBlockByNumber => "eth_getBlockByNumber",
+        RpcMethod::EthBlockNumber => "eth_blockNumber",
+        RpcMethod::MegaGetBlockWitness => "mega_getBlockWitness",
         RpcMethod::MegaSetValidatedBlocks => "mega_setValidatedBlocks",
     };
     counter!(names::RPC_REQUESTS_TOTAL, "method" => method_str).increment(1);
@@ -199,4 +206,12 @@ pub fn on_contract_cache_read(hits: u64, misses: u64) {
 
 pub fn on_blocks_pruned(count: u64) {
     counter!(names::BLOCKS_PRUNED).increment(count);
+}
+
+/// Record witness fetch metrics.
+pub fn on_witness_fetch(salt_size: usize, kvs_count: usize, salt_kvs_size: usize, mpt_size: usize) {
+    histogram!(names::SALT_WITNESS_SIZE).record(salt_size as f64);
+    histogram!(names::SALT_WITNESS_KEYS).record(kvs_count as f64);
+    histogram!(names::SALT_WITNESS_KVS_SIZE).record(salt_kvs_size as f64);
+    histogram!(names::MPT_WITNESS_SIZE).record(mpt_size as f64);
 }
