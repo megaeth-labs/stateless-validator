@@ -34,6 +34,11 @@ jobs:
         uses: foundry-rs/foundry-toolchain@v1
       - run: cargo clippy
 
+      - name: Run cargo-sort
+        run: |
+          cargo install cargo-sort
+          cargo sort --check --workspace --grouped --order package,workspace,lints,profile,bin,benches,dependencies,dev-dependencies,features
+
   fmt:
     name: fmt
     runs-on: ubuntu-24.04
