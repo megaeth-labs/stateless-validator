@@ -25,19 +25,23 @@ use revm::state::Bytecode;
 use salt::SaltWitness;
 use tokio::sync::broadcast;
 use tracing::{debug, instrument, trace, warn};
-use validator_core::{withdrawals::MptWitness, RpcClient, ValidatorDB};
+use validator_core::{withdrawals::MptWitness, LightWitness, RpcClient, ValidatorDB};
 
 /// Block data bundle containing all information needed for stateless execution.
 ///
-/// This struct aggregates the block, its SALT witness (state proof), and all
+/// This struct aggregates the block, its witness (state proof), and all
 /// contract bytecodes referenced in the witness. Together, these enable
 /// complete block re-execution without access to the full state database.
+///
+/// Uses `LightWitness` for improved deserialization performance (~10x faster than
+/// `SaltWitness`) since we trust our local database and don't need cryptographic
+/// proof verification.
 #[derive(Clone)]
 pub struct BlockData {
     /// The block with full transaction data.
     pub block: Block<Transaction>,
-    /// SALT witness containing state proofs for all accessed accounts and storage.
-    pub salt_witness: SaltWitness,
+    /// Light witness without expensive EC point validation.
+    pub witness: LightWitness,
     /// Contract bytecodes keyed by code hash, required for EVM execution.
     pub contracts: HashMap<B256, Bytecode>,
 }
@@ -120,7 +124,7 @@ impl DataProvider {
         self.get_block_data_by_hash(block.header.hash).await
     }
 
-    /// Gets block data by block hash.
+    /// Gets block data by block hash with single-flight coalescing.
     ///
     /// Lookup order: local database -> RPC.
     ///
@@ -238,25 +242,22 @@ impl DataProvider {
         }
     }
 
-    /// Gets block data from the local database.
-    ///
-    /// Retrieves block and witness from ValidatorDB, then fetches any missing
-    /// contract bytecodes (checking DB first, then falling back to RPC).
+    /// Gets block data from the local database using LightWitness.
     async fn get_block_data_from_db(
         &self,
         db: &ValidatorDB,
         block_hash: alloy_primitives::BlockHash,
     ) -> Result<BlockData> {
-        // Get block data from database
-        let (block, salt_witness) = db.get_block_and_witness(block_hash)?;
+        // Get block data from database using light witness (fast deserialization)
+        let (block, witness) = db.get_block_and_witness(block_hash)?;
 
         // Extract code hashes and get contracts
-        let code_hashes = validator_core::extract_code_hashes(&salt_witness);
+        let code_hashes = validator_core::extract_code_hashes(&witness);
         let contracts = self.get_contracts_with_db(db, &code_hashes).await?;
 
         Ok(BlockData {
             block,
-            salt_witness,
+            witness,
             contracts,
         })
     }
@@ -337,6 +338,9 @@ impl DataProvider {
             .fetch_witness_with_retry(block.header.number, block.header.hash)
             .await?;
 
+        // Convert SaltWitness to LightWitness
+        let witness = LightWitness::from(salt_witness);
+
         // Fetch block with full transactions
         let block = self
             .rpc_client
@@ -344,12 +348,12 @@ impl DataProvider {
             .await?;
 
         // Extract code hashes and fetch contracts
-        let code_hashes = validator_core::extract_code_hashes(&salt_witness);
+        let code_hashes = validator_core::extract_code_hashes(&witness);
         let contracts = self.get_contracts(&code_hashes).await?;
 
         Ok(BlockData {
             block,
-            salt_witness,
+            witness,
             contracts,
         })
     }

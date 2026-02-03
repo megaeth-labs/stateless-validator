@@ -41,12 +41,14 @@ reth-trie-sparse.workspace = true
 
 # misc
 bincode.workspace = true
+lz4_flex.workspace = true
 eyre.workspace = true
 dyn-clone.workspace = true
 futures.workspace = true
 num_cpus.workspace = true
 rayon.workspace = true
 redb.workspace = true
+rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

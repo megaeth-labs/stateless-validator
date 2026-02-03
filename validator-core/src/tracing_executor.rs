@@ -58,7 +58,6 @@ use revm_inspectors::tracing::{
     FourByteInspector, MuxInspector, TracingInspector, TracingInspectorConfig, TransactionContext,
     js::JsInspector,
 };
-use salt::SaltWitness;
 use tracing::{instrument, trace, warn};
 
 use crate::{
@@ -66,6 +65,7 @@ use crate::{
     data_types::{PlainKey, PlainValue},
     database::{WitnessDatabase, WitnessExternalEnv},
     executor::{ValidationError, create_evm_env},
+    light_witness::{LightWitness, LightWitnessExecutor},
 };
 
 // ---------------------------------------------------------------------------
@@ -83,7 +83,7 @@ use crate::{
 ///
 /// # Returns
 /// A vector of unique code hashes (B256) that need to be fetched
-pub fn extract_code_hashes(witness: &SaltWitness) -> Vec<B256> {
+pub fn extract_code_hashes(witness: &LightWitness) -> Vec<B256> {
     let mut code_hashes: Vec<B256> = witness
         .kvs
         .values()
@@ -104,17 +104,13 @@ pub fn extract_code_hashes(witness: &SaltWitness) -> Vec<B256> {
 }
 
 // ---------------------------------------------------------------------------
-// Tracing Environment Setup
+// Fast Tracing Environment Setup (for LightWitness)
 // ---------------------------------------------------------------------------
 
-/// Pre-built execution environment for tracing operations.
+/// Pre-built execution environment for fast tracing operations.
 ///
-/// Encapsulates the common setup shared by both `trace_block` and `trace_transaction`,
-/// avoiding duplicated environment construction code. This includes:
-/// - Witness data conversion and ownership
-/// - EVM environment configuration
-/// - Block executor factory setup
-/// - Hardfork detection and block limits
+/// This is the fast version of `TracingEnv` that uses `LightWitnessExecutor`
+/// instead of `salt::Witness` for improved deserialization performance.
 struct TracingEnv<'a> {
     /// Transactions from the block (full transaction data required).
     transactions: &'a [OpTransaction],
@@ -128,45 +124,27 @@ struct TracingEnv<'a> {
     block_ctx: MegaBlockExecutionCtx,
     /// EVM environment (block env, spec ID).
     evm_env: alloy_evm::EvmEnv<mega_evm::MegaSpecId>,
-    /// Owned witness data - kept alive for State's lifetime.
-    /// Must outlive any WitnessDatabase created from it.
-    salt_witness: salt::Witness,
+    /// Owned fast witness data - kept alive for State's lifetime.
+    light_witness_executor: LightWitnessExecutor,
 }
 
 impl<'a> TracingEnv<'a> {
-    /// Creates a new tracing environment from block data.
-    ///
-    /// Performs all common setup required for tracing:
-    /// 1. Validates block has full transaction data
-    /// 2. Creates external environment oracle from witness
-    /// 3. Converts witness to owned format
-    /// 4. Sets up EVM environment with correct hardfork rules
-    /// 5. Creates block executor factory
-    /// 6. Determines block limits based on hardfork
-    ///
-    /// # Arguments
-    /// * `chain_spec` - Chain specification with hardfork activation rules
-    /// * `block` - Block to trace (must have full transactions)
-    /// * `witness` - SALT witness containing state proofs
-    ///
-    /// # Returns
-    /// * `Ok(TracingEnv)` - Ready-to-use tracing environment
-    /// * `Err(ValidationError)` - If block is incomplete or setup fails
+    /// Creates a new fast tracing environment from block data.
     fn new(
         chain_spec: &ChainSpec,
         block: &'a Block<OpTransaction>,
-        witness: &SaltWitness,
+        light_witness: LightWitness,
     ) -> Result<Self, ValidationError> {
         let BlockTransactions::Full(transactions) = &block.transactions else {
             return Err(ValidationError::BlockIncomplete);
         };
 
-        // Create external environment oracle from salt witness
-        let ext_env = WitnessExternalEnv::new(witness, block.header.number)
+        // Create external environment oracle from fast witness
+        let ext_env = WitnessExternalEnv::from_light_witness(&light_witness, block.header.number)
             .map_err(ValidationError::EnvOracleConstructionFailed)?;
 
-        // Create witness (owned, kept alive for State's lifetime)
-        let salt_witness = salt::Witness::from(witness.clone());
+        // Create fast witness executor
+        let light_witness_executor = LightWitnessExecutor::from(light_witness);
 
         // Create EVM environment
         let evm_env = create_evm_env(&block.header, chain_spec);
@@ -200,34 +178,24 @@ impl<'a> TracingEnv<'a> {
             executor_factory,
             block_ctx,
             evm_env,
-            salt_witness,
+            light_witness_executor,
         })
     }
 
     /// Creates a witness database that borrows from this environment.
-    ///
-    /// The returned database implements `DatabaseRef` and provides state access
-    /// backed by the witness data. It must not outlive this TracingEnv.
     fn create_witness_db<'b>(
         &'b self,
         header: &'b alloy_rpc_types_eth::Header,
         contracts: &'b HashMap<B256, Bytecode>,
-    ) -> WitnessDatabase<'b> {
+    ) -> WitnessDatabase<'b, LightWitnessExecutor> {
         WitnessDatabase {
             header,
-            witness: &self.salt_witness,
+            witness: &self.light_witness_executor,
             contracts,
         }
     }
 
-    /// Replays transactions before the given index without tracing.
-    ///
-    /// This is used to build up the correct state before tracing a specific transaction.
-    /// Each transaction is executed and its state changes are committed to the database.
-    ///
-    /// # Arguments
-    /// * `state` - Mutable state database to execute against
-    /// * `tx_index` - Index of target transaction (transactions before this are replayed)
+    /// Replays transactions before the target index without tracing.
     fn replay_preceding_transactions<DB>(
         &self,
         state: &mut State<DB>,
@@ -252,18 +220,6 @@ impl<'a> TracingEnv<'a> {
     }
 
     /// Executes a transaction with Parity-style tracing.
-    ///
-    /// Returns both the localized traces and state changes. The state changes
-    /// must be committed before tracing subsequent transactions.
-    ///
-    /// # Arguments
-    /// * `state` - Mutable state database
-    /// * `tx` - Recovered transaction to execute
-    /// * `info` - Transaction context (hash, index, block info)
-    ///
-    /// # Returns
-    /// * `Ok((traces, state_changes))` - Traces and state diff
-    /// * `Err` - If execution fails
     fn execute_with_parity_tracing<DB>(
         &self,
         state: &mut State<DB>,
@@ -285,15 +241,11 @@ impl<'a> TracingEnv<'a> {
         match executor.run_transaction(tx) {
             Ok(outcome) => {
                 let state_changes = outcome.inner.state;
-
-                // Get traces without setting transaction_gas_limit - the inspector
-                // already tracks the correct gas (after intrinsic gas deduction)
                 let traces = executor
                     .inspector()
                     .clone()
                     .into_parity_builder()
                     .into_localized_transaction_traces(info);
-
                 Ok((traces, state_changes))
             }
             Err(e) => Err(ValidationError::BlockReplayFailed(
@@ -338,7 +290,7 @@ fn tx_info_at(block: &Block<OpTransaction>, tx: &OpTransaction, index: usize) ->
 pub fn trace_block(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
-    witness: &SaltWitness,
+    witness: LightWitness,
     contracts: &HashMap<B256, Bytecode>,
     opts: GethDebugTracingOptions,
 ) -> Result<Vec<TraceResult>, ValidationError> {
@@ -428,33 +380,17 @@ pub fn trace_block(
     Ok(results)
 }
 
-/// Traces a single transaction execution.
-///
-/// Replays all transactions before the target index (without tracing), then traces
-/// the target transaction with the configured inspector. This mirrors the pattern
-/// in `crates/rpc/rpc/src/debug.rs:202` where block data is fetched once and the
-/// target transaction is traced in-place.
-///
-/// # Arguments
-/// * `chain_spec` - Chain specification
-/// * `block` - Block containing the transaction
-/// * `tx_index` - Index of the transaction in the block
-/// * `witness` - SALT witness for state access
-/// * `contracts` - Contract bytecode cache
-/// * `opts` - Tracing options
-///
-/// # Returns
-/// Returns the transaction trace data
+/// Traces a single transaction execution using LightWitness.
 #[instrument(skip_all, name = "trace_tx", fields(block_number = block.header.number, tx_index))]
 pub fn trace_transaction(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
     tx_index: usize,
-    witness: &SaltWitness,
+    light_witness: LightWitness,
     contracts: &HashMap<B256, Bytecode>,
     opts: GethDebugTracingOptions,
 ) -> Result<GethTrace, ValidationError> {
-    let env = TracingEnv::new(chain_spec, block, witness)?;
+    let env = TracingEnv::new(chain_spec, block, light_witness)?;
 
     if tx_index >= env.transactions.len() {
         return Err(ValidationError::BlockIncomplete);
@@ -466,16 +402,11 @@ pub fn trace_transaction(
         "Starting transaction trace"
     );
 
-    // Create witness database and wrap it with CacheDB, then State.
-    // CacheDB tracks all accessed accounts (not just modified), which is required
-    // for prestateTracer+diff to return consistent results with mega-reth.
     let witness_db = env.create_witness_db(&block.header, contracts);
     let cache_db = CacheDB::new(&witness_db);
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
-    // Apply pre-execution changes (system contract calls) before tracing transactions.
-    // This ensures system contracts are loaded into the cache, which is required
-    // for prestateTracer to return consistent results with mega-reth.
+    // Apply pre-execution changes
     {
         let mut executor = env.executor_factory.create_executor(
             &mut state,
@@ -506,7 +437,7 @@ pub fn trace_transaction(
         tx_info: info,
     };
 
-    let (trace_result, _state_changes) = trace_transaction_inner(
+    let (trace_result, _) = trace_transaction_inner(
         &env.executor_factory,
         &mut state,
         env.block_ctx.clone(),
@@ -516,54 +447,25 @@ pub fn trace_transaction(
     );
 
     trace_result.map_err(|e| {
-        warn!(
-            tx_hash = %target_tx.inner.tx_hash(),
-            error = %e,
-            "Transaction trace failed"
-        );
         ValidationError::BlockReplayFailed(alloy_evm::block::BlockExecutionError::msg(e))
     })
 }
 
-// ---------------------------------------------------------------------------
-// Public API - Parity-style Tracing
-// ---------------------------------------------------------------------------
-
-/// Traces a block execution and returns Parity-style localized transaction traces.
-///
-/// This function is specifically for the `trace_block` RPC method which returns
-/// a flat list of `LocalizedTransactionTrace` objects, not wrapped in `TraceResult`.
-///
-/// # Arguments
-/// * `chain_spec` - Chain specification
-/// * `block` - Block to trace
-/// * `witness` - SALT witness for state access
-/// * `contracts` - Contract bytecode cache
-///
-/// # Returns
-/// Returns a flat vector of localized transaction traces for all transactions in the block
-#[instrument(skip_all, name = "parity_trace_block", fields(block_number = block.header.number, block_hash = %block.header.hash))]
+/// Computes Parity-style traces for all transactions in a block using LightWitness.
+#[instrument(skip_all, name = "parity_trace_block_light", fields(block_number = block.header.number))]
 pub fn parity_trace_block(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
-    witness: &SaltWitness,
+    light_witness: LightWitness,
     contracts: &HashMap<B256, Bytecode>,
 ) -> Result<Vec<LocalizedTransactionTrace>, ValidationError> {
-    let env = TracingEnv::new(chain_spec, block, witness)?;
+    let env = TracingEnv::new(chain_spec, block, light_witness)?;
 
-    trace!(
-        tx_count = env.transactions.len(),
-        "Starting Parity block trace"
-    );
-
-    // Create witness database and wrap it with CacheDB, then State.
-    // CacheDB tracks all accessed accounts (not just modified), which is required
-    // for prestateTracer+diff to return consistent results with mega-reth.
     let witness_db = env.create_witness_db(&block.header, contracts);
     let cache_db = CacheDB::new(&witness_db);
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
-    // Apply pre-execution changes (system contract calls) before tracing transactions.
+    // Apply pre-execution changes
     {
         let mut executor = env.executor_factory.create_executor(
             &mut state,
@@ -581,73 +483,39 @@ pub fn parity_trace_block(
         let recovered_tx = &tx.inner.inner;
         let info = tx_info_at(block, tx, index);
 
-        trace!(
-            tx_index = index,
-            tx_hash = %tx.inner.tx_hash(),
-            "Tracing transaction (Parity)"
-        );
-
         let (traces, state_changes) =
             env.execute_with_parity_tracing(&mut state, recovered_tx, info)?;
 
         all_traces.extend(traces);
 
-        // Commit state changes for subsequent transactions
         if index < env.transactions.len() - 1 {
             state.commit(state_changes);
         }
     }
 
-    trace!(
-        trace_count = all_traces.len(),
-        "Parity block trace completed"
-    );
-
     Ok(all_traces)
 }
 
-/// Traces a single transaction and returns Parity-style localized transaction traces.
-///
-/// This function is specifically for the `trace_transaction` RPC method which returns
-/// a list of `LocalizedTransactionTrace` objects for a single transaction.
-///
-/// # Arguments
-/// * `chain_spec` - Chain specification
-/// * `block` - Block containing the transaction
-/// * `tx_index` - Index of the transaction in the block
-/// * `witness` - SALT witness for state access
-/// * `contracts` - Contract bytecode cache
-///
-/// # Returns
-/// Returns a vector of localized transaction traces for the specified transaction
-#[instrument(skip_all, name = "parity_trace_tx", fields(block_number = block.header.number, tx_index))]
+/// Traces a single transaction with Parity-style tracing using LightWitness.
+#[instrument(skip_all, name = "parity_trace_tx_light", fields(block_number = block.header.number, tx_index))]
 pub fn parity_trace_transaction(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
     tx_index: usize,
-    witness: &SaltWitness,
+    light_witness: LightWitness,
     contracts: &HashMap<B256, Bytecode>,
 ) -> Result<Vec<LocalizedTransactionTrace>, ValidationError> {
-    let env = TracingEnv::new(chain_spec, block, witness)?;
+    let env = TracingEnv::new(chain_spec, block, light_witness)?;
 
     if tx_index >= env.transactions.len() {
         return Err(ValidationError::BlockIncomplete);
     }
 
-    let target_tx = &env.transactions[tx_index];
-    trace!(
-        tx_hash = %target_tx.inner.tx_hash(),
-        "Starting Parity transaction trace"
-    );
-
-    // Create witness database and wrap it with CacheDB, then State.
-    // CacheDB tracks all accessed accounts (not just modified), which is required
-    // for prestateTracer+diff to return consistent results with mega-reth.
     let witness_db = env.create_witness_db(&block.header, contracts);
     let cache_db = CacheDB::new(&witness_db);
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
-    // Apply pre-execution changes (system contract calls) before tracing transactions.
+    // Apply pre-execution changes
     {
         let mut executor = env.executor_factory.create_executor(
             &mut state,
@@ -659,26 +527,17 @@ pub fn parity_trace_transaction(
             .map_err(ValidationError::BlockReplayFailed)?;
     }
 
-    // Replay preceding transactions without tracing
+    // Replay preceding transactions
     if tx_index > 0 {
-        trace!(
-            preceding_tx_count = tx_index,
-            "Replaying preceding transactions"
-        );
+        env.replay_preceding_transactions(&mut state, tx_index)?;
     }
-    env.replay_preceding_transactions(&mut state, tx_index)?;
 
     // Trace the target transaction
+    let target_tx = &env.transactions[tx_index];
     let recovered_tx = &target_tx.inner.inner;
     let info = tx_info_at(block, target_tx, tx_index);
 
-    let (traces, _state_changes) =
-        env.execute_with_parity_tracing(&mut state, recovered_tx, info)?;
-
-    trace!(
-        trace_count = traces.len(),
-        "Parity transaction trace completed"
-    );
+    let (traces, _) = env.execute_with_parity_tracing(&mut state, recovered_tx, info)?;
 
     Ok(traces)
 }

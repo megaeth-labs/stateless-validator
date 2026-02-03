@@ -31,7 +31,7 @@ use tracing::{debug, trace};
 pub const DEFAULT_RESPONSE_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Default estimated number of cached responses.
-pub const DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS: usize = 10_000;
+pub const DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS: usize = 1_000;
 
 /// Configuration for the response cache.
 #[derive(Debug, Clone, Copy)]

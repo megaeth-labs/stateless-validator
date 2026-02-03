@@ -6,7 +6,7 @@
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use alloy_primitives::B256;
@@ -115,11 +115,22 @@ pub async fn fetch_blocks_batch(
     config: &ChainSyncConfig,
     block_error_counts: &mut HashMap<u64, usize>,
 ) -> Result<FetchResult> {
+    let batch_start = Instant::now();
+
     // Calculate how far behind our local chain is from remote
+    let db_tip_start = Instant::now();
     let local_tip = db
         .get_local_tip()?
         .ok_or_else(|| anyhow!("Local chain is empty"))?;
     let remote_tip = db.get_remote_tip()?.unwrap_or(local_tip);
+    let db_tip_elapsed = db_tip_start.elapsed();
+
+    debug!(
+        local_tip = local_tip.0,
+        remote_tip = remote_tip.0,
+        db_tip_ms = db_tip_elapsed.as_millis() as u64,
+        "Got tips from DB"
+    );
 
     // Check if local data is too stale (chain has moved far ahead)
     // This happens when service was stopped for a long time
@@ -239,14 +250,27 @@ pub async fn fetch_blocks_batch(
     }
 
     // Calculate how many blocks to fetch (bounded by latest available)
-    let blocks_to_fetch = (config.tracker_lookahead_blocks - gap).min(
-        client
-            .get_latest_block_number()
-            .await?
-            .saturating_sub(remote_tip.0),
+    let latest_start = Instant::now();
+    let chain_latest = client.get_latest_block_number().await?;
+    let latest_elapsed = latest_start.elapsed();
+
+    debug!(
+        chain_latest = chain_latest,
+        remote_tip = remote_tip.0,
+        latest_fetch_ms = latest_elapsed.as_millis() as u64,
+        "Got chain latest"
     );
 
+    let blocks_to_fetch =
+        (config.tracker_lookahead_blocks - gap).min(chain_latest.saturating_sub(remote_tip.0));
+
     if blocks_to_fetch == 0 {
+        debug!(
+            chain_latest = chain_latest,
+            remote_tip = remote_tip.0,
+            gap = gap,
+            "No blocks to fetch - at chain tip"
+        );
         return Ok(FetchResult {
             blocks_fetched: 0,
             should_wait: true,
@@ -257,7 +281,17 @@ pub async fn fetch_blocks_batch(
 
     let start_block = remote_tip.0 + 1;
 
+    info!(
+        start_block = start_block,
+        end_block = start_block + blocks_to_fetch - 1,
+        blocks_to_fetch = blocks_to_fetch,
+        chain_latest = chain_latest,
+        gap_behind = chain_latest.saturating_sub(start_block),
+        "Starting block fetch batch"
+    );
+
     // Fetch blocks in parallel
+    let fetch_start = Instant::now();
     let tasks = future::join_all((start_block..start_block + blocks_to_fetch).map(
         |block_number| {
             let client = client.clone();
@@ -312,28 +346,78 @@ pub async fn fetch_blocks_batch(
 
     let fetched_count = tasks.len() as u64;
     let had_error = fetched_count < blocks_to_fetch;
+    let fetch_elapsed = fetch_start.elapsed();
 
-    // Only add validation tasks in stateless-validator mode (not auto-advance)
-    // In debug-trace-server mode with auto_advance_local_tip, we don't need validation tasks
-    if !config.auto_advance_local_tip {
+    info!(
+        blocks_fetched = fetched_count,
+        blocks_requested = blocks_to_fetch,
+        fetch_ms = fetch_elapsed.as_millis() as u64,
+        had_error = had_error,
+        "Parallel fetch completed"
+    );
+
+    // Store block data and witnesses
+    // In stateless-validator mode: add to validation task queue
+    // In debug-trace-server mode: only store data for trace RPCs (no validation)
+    let db_start = Instant::now();
+    if config.auto_advance_local_tip {
+        // Convert SaltWitness to LightWitness for efficient storage
+        let light_tasks: Vec<_> = tasks
+            .iter()
+            .map(|(block, salt_witness, _)| {
+                (
+                    block.clone(),
+                    crate::LightWitness::from(salt_witness.clone()),
+                )
+            })
+            .collect();
+        db.store_block_data(&light_tasks)?;
+    } else {
         db.add_validation_tasks(&tasks)?;
     }
+    let add_tasks_elapsed = db_start.elapsed();
+
+    let grow_chain_start = Instant::now();
     db.grow_remote_chain(tasks.iter().map(|(block, _, _)| &block.header))?;
+    let grow_chain_elapsed = grow_chain_start.elapsed();
+
+    info!(
+        add_tasks_ms = add_tasks_elapsed.as_millis() as u64,
+        grow_chain_ms = grow_chain_elapsed.as_millis() as u64,
+        "DB operations completed"
+    );
 
     // Auto-advance local tip if configured (for debug-trace-server mode)
     // This skips validation and trusts blocks from upstream RPC
     if config.auto_advance_local_tip && fetched_count > 0 {
         let new_local_tip = start_block + fetched_count - 1;
+        let promote_start = Instant::now();
         for _ in 0..fetched_count {
             db.promote_remote_to_canonical()?;
         }
+        let promote_elapsed = promote_start.elapsed();
 
         // Get the earliest block in DB for logging
         let earliest = db.get_earliest_local_block()?.map(|(n, _)| n).unwrap_or(0);
+
+        // Calculate blocks per second using total batch time
+        let total_elapsed = batch_start.elapsed();
+        let total_ms = total_elapsed.as_millis() as f64;
+        let blocks_per_sec = if total_ms > 0.0 {
+            (fetched_count as f64 * 1000.0) / total_ms
+        } else {
+            0.0
+        };
+
         info!(
             db_start = earliest,
             db_end = new_local_tip,
             synced_blocks = fetched_count,
+            total_ms = total_ms as u64,
+            fetch_ms = fetch_elapsed.as_millis() as u64,
+            db_write_ms = (add_tasks_elapsed.as_millis() + grow_chain_elapsed.as_millis()) as u64,
+            promote_ms = promote_elapsed.as_millis() as u64,
+            blocks_per_sec = format!("{:.2}", blocks_per_sec),
             "Chain synced"
         );
     }

@@ -17,9 +17,11 @@
 
 pub mod chain_spec;
 pub mod chain_sync;
+pub mod light_witness;
 pub use chain_sync::{
     ChainSyncConfig, DEFAULT_METRICS_PORT, FetchResult, fetch_blocks_batch, remote_chain_tracker,
 };
+pub use light_witness::{LightWitness, LightWitnessExecutor};
 mod database;
 pub mod validator_db;
 pub use validator_db::{ValidationDbError, ValidationDbResult, ValidatorDB};

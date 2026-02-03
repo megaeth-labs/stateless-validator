@@ -85,16 +85,35 @@ async fn compute_debug_trace_block(
     data: &BlockData,
     opts: GethDebugTracingOptions,
 ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
+    let start = Instant::now();
+
     let results = validator_core::trace_block(
         chain_spec,
         &data.block,
-        &data.salt_witness,
+        data.witness.clone(),
         &data.contracts,
         opts,
     )
     .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
 
-    serde_json::to_value(results).map_err(|e| rpc_err(format!("Serialization failed: {e}")))
+    let trace_ms = start.elapsed().as_millis();
+
+    let value = serde_json::to_value(&results)
+        .map_err(|e| rpc_err(format!("Serialization failed: {e}")))?;
+
+    let serialize_ms = start.elapsed().as_millis() - trace_ms;
+    let response_size = value.to_string().len();
+
+    tracing::debug!(
+        block_number = data.block.header.number,
+        tx_count = data.block.transactions.len(),
+        trace_ms,
+        serialize_ms,
+        response_size_kb = response_size / 1024,
+        "Trace computation timing"
+    );
+
+    Ok(value)
 }
 
 /// Computes parity trace for a block.
@@ -105,7 +124,7 @@ async fn compute_parity_trace_block(
     let results = validator_core::parity_trace_block(
         chain_spec,
         &data.block,
-        &data.salt_witness,
+        data.witness.clone(),
         &data.contracts,
     )
     .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
@@ -285,30 +304,32 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             DEBUG_TRACE_BLOCK_BY_NUMBER,
             start,
         ) {
-            return Ok(cached);
+            return Ok::<_, jsonrpsee::types::ErrorObjectOwned>(cached);
         }
 
-        // Cache miss - fetch block data and compute trace
+        // Fetch block data (DB -> RPC fallback)
         let data = ctx
             .data_provider
             .get_block_data(block_num)
             .await
             .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
+        let block_hash = data.block.header.hash;
+        let result = compute_debug_trace_block(&ctx.chain_spec, &data, opts.clone()).await?;
 
-        execute_cached_block_trace(
-            &ctx,
-            CachedTraceParams {
-                resource: CachedResource::DebugTraceBlock,
-                block_num,
-                block_hash: data.block.header.hash,
-                variant,
-                method_name: DEBUG_TRACE_BLOCK_BY_NUMBER,
-                start,
-                tx_count: data.block.transactions.len(),
-            },
-            || compute_debug_trace_block(&ctx.chain_spec, &data, opts),
-        )
-        .await
+        // Store result in cache and return
+        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+        metrics::record_rpc_request(DEBUG_TRACE_BLOCK_BY_NUMBER, total_ms / 1000.0);
+
+        // Cache the result for future requests
+        ctx.response_cache.insert(
+            CachedResource::DebugTraceBlock,
+            block_num,
+            block_hash,
+            variant,
+            result.clone(),
+        );
+
+        Ok(result)
     })?;
 
     // debug_traceBlockByHash
@@ -335,30 +356,52 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             DEBUG_TRACE_BLOCK_BY_HASH,
             start,
         ) {
-            return Ok(cached);
+            return Ok::<_, jsonrpsee::types::ErrorObjectOwned>(cached);
         }
 
-        // Cache miss - fetch block data and compute trace
+        // Fetch block data (DB -> RPC fallback)
         let data = ctx
             .data_provider
             .get_block_data_by_hash(block_hash)
             .await
             .map_err(|e| rpc_err(format!("Failed to fetch block data: {e}")))?;
+        let block_num = data.block.header.number;
+        let tx_count = data.block.transactions.len();
+        let result = compute_debug_trace_block(&ctx.chain_spec, &data, opts.clone()).await?;
 
-        execute_cached_block_trace(
-            &ctx,
-            CachedTraceParams {
-                resource: CachedResource::DebugTraceBlock,
-                block_num: data.block.header.number,
-                block_hash,
-                variant,
-                method_name: DEBUG_TRACE_BLOCK_BY_HASH,
-                start,
-                tx_count: data.block.transactions.len(),
-            },
-            || compute_debug_trace_block(&ctx.chain_spec, &data, opts),
-        )
-        .await
+        // Store result in cache and return
+        let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+        metrics::record_rpc_request(DEBUG_TRACE_BLOCK_BY_HASH, total_ms / 1000.0);
+
+        // Cache the result for future requests
+        ctx.response_cache.insert(
+            CachedResource::DebugTraceBlock,
+            block_num,
+            block_hash,
+            variant,
+            result.clone(),
+        );
+
+        trace!(
+            method = DEBUG_TRACE_BLOCK_BY_HASH,
+            block = block_num,
+            tx_count,
+            total_ms = format!("{:.2}", total_ms),
+            cache_hit = false,
+            "Cache miss - computed and stored result"
+        );
+
+        if start.elapsed() > SLOW_REQUEST_THRESHOLD {
+            warn!(
+                method = DEBUG_TRACE_BLOCK_BY_HASH,
+                block_number = block_num,
+                elapsed_ms = total_ms as u64,
+                threshold_ms = SLOW_REQUEST_THRESHOLD.as_millis() as u64,
+                "RPC request exceeded threshold"
+            );
+        }
+
+        Ok(result)
     })?;
 
     // debug_traceTransaction (not cached - depends on tx index)
@@ -384,7 +427,7 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             &ctx.chain_spec,
             &data.block,
             tx_index,
-            &data.salt_witness,
+            data.witness.clone(),
             &data.contracts,
             opts,
         )
@@ -451,7 +494,7 @@ fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             return Ok(cached);
         }
 
-        // Cache miss - fetch block data and compute trace
+        // Fetch block data (DB -> RPC fallback)
         let data = ctx
             .data_provider
             .get_block_data(block_num)
@@ -496,7 +539,7 @@ fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             &ctx.chain_spec,
             &data.block,
             tx_index,
-            &data.salt_witness,
+            data.witness.clone(),
             &data.contracts,
         )
         .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
