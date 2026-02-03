@@ -109,8 +109,7 @@ fn block_data_err_by_hash(block_hash: B256, e: eyre::Report) -> jsonrpsee::types
 /// Converts a transaction lookup error to an appropriate RPC error.
 fn tx_data_err(e: eyre::Report) -> jsonrpsee::types::ErrorObjectOwned {
     let err_str = e.to_string().to_lowercase();
-    if err_str.contains("not found") || err_str.contains("timeout") || err_str.contains("pending")
-    {
+    if err_str.contains("not found") || err_str.contains("timeout") || err_str.contains("pending") {
         rpc_err_not_found("transaction not found".to_string())
     } else {
         rpc_err("internal error".to_string())

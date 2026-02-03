@@ -287,8 +287,8 @@ impl RpcClient {
             Some(start.elapsed().as_secs_f64()),
         );
 
-        if let Ok((ref witness, ref mpt_witness)) = result
-            && let Some(ref metrics) = self.config.metrics
+        if let Ok((ref witness, ref mpt_witness)) = result &&
+            let Some(ref metrics) = self.config.metrics
         {
             // Estimate sizes without full serialization (approximate but efficient)
             // SaltKey (8 bytes) + Option<SaltValue> (1 + 94 bytes) ≈ 103 bytes per entry
@@ -297,9 +297,8 @@ impl RpcClient {
 
             // Proof: commitments (64 bytes each) + IPA proof (~576 bytes) + levels (5 bytes
             // each)
-            let proof_size = witness.proof.parents_commitments.len() * 64 +
-                576 +
-                witness.proof.levels.len() * 5;
+            let proof_size =
+                witness.proof.parents_commitments.len() * 64 + 576 + witness.proof.levels.len() * 5;
             let salt_size = salt_kvs_size + proof_size;
 
             // MptWitness: storage_root (32 bytes) + sum of state bytes
