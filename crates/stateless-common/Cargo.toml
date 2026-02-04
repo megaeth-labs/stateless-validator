@@ -1,0 +1,16 @@
+[package]
+name = "stateless-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[dependencies]
+clap.workspace = true
+eyre.workspace = true
+rolling-file.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true

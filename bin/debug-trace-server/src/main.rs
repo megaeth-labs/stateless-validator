@@ -48,9 +48,9 @@ use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::{anyhow, ensure, Result};
 use jsonrpsee::server::{RpcModule, Server};
+use stateless_common::logging::LogArgs;
 use tokio::task;
 use tracing::{debug, error, info, instrument, warn};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use validator_core::{
     chain_spec::ChainSpec, remote_chain_tracker, ChainSyncConfig, RpcClient, RpcClientConfig,
     ValidatorDB,
@@ -147,6 +147,10 @@ struct Args {
         default_value_t = DEFAULT_PRUNER_INTERVAL_SECS
     )]
     pruner_interval_secs: u64,
+
+    /// Logging configuration.
+    #[command(flatten)]
+    log: LogArgs,
 }
 
 /// Database filename for the validator's local storage.
@@ -167,15 +171,8 @@ fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "debug_trace_server=info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
     let args = Args::parse();
+    let _log_guard = args.log.init_tracing()?;
 
     info!(
         listen_addr = %args.addr,

@@ -42,9 +42,9 @@ tokio = { workspace = true, features = ["sync"] }
 
 # Logging and metrics
 tracing.workspace = true
-tracing-subscriber.workspace = true
 
 # Reuse validator-core
+stateless-common = { path = "../../crates/stateless-common" }
 validator-core = { path = "../../crates/validator-core" }
 
 [dev-dependencies]

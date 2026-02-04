@@ -13,9 +13,9 @@ use eyre::{Result, anyhow, ensure};
 use futures::future;
 use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
 use salt::SaltWitness;
+use stateless_common::logging::{LogArgs, migrate_legacy_env_vars};
 use tokio::{signal, task};
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 use validator_core::{
     ChainSyncConfig, RpcClient, RpcClientConfig, ValidatorDB,
     chain_spec::ChainSpec,
@@ -28,66 +28,6 @@ mod metrics;
 
 /// Database filename for the validator.
 const VALIDATOR_DB_FILENAME: &str = "validator.redb";
-
-/// Initialize logging system with environment variable configuration
-///
-/// Supports the following environment variables:
-/// - STATELESS_VALIDATOR_LOG_FILE_DIRECTORY: Directory for log files (optional, file logging
-///   disabled if not set)
-/// - STATELESS_VALIDATOR_LOG_FILE: Log level for file output (debug/info/warn/error), default:
-///   debug
-/// - STATELESS_VALIDATOR_LOG_STDOUT: Log level for stdout (debug/info/warn/error), default: info
-fn init_logging() -> Result<()> {
-    use tracing_appender::rolling::{RollingFileAppender, Rotation};
-
-    // Load environment configuration with defaults
-    let file_directory = std::env::var("STATELESS_VALIDATOR_LOG_FILE_DIRECTORY").ok();
-    let file_filter =
-        std::env::var("STATELESS_VALIDATOR_LOG_FILE").unwrap_or_else(|_| "debug".to_string());
-    let stdout_filter =
-        std::env::var("STATELESS_VALIDATOR_LOG_STDOUT").unwrap_or_else(|_| "info".to_string());
-
-    // Configure stdout layer with external crate filtering
-    let stdout_layer = fmt::layer()
-        .with_writer(std::io::stdout)
-        .with_filter(
-            EnvFilter::new("warn")
-                .add_directive(format!("validator_core={}", stdout_filter).parse()?)
-                .add_directive(format!("stateless_validator={}", stdout_filter).parse()?),
-        )
-        .boxed();
-
-    let subscriber = tracing_subscriber::registry().with(stdout_layer);
-
-    // Optionally add file layer if directory is specified
-    if let Some(log_dir) = &file_directory {
-        let log_path = PathBuf::from(log_dir);
-        std::fs::create_dir_all(&log_path)
-            .map_err(|e| anyhow!("Failed to create log directory {log_dir}: {e}"))?;
-
-        // Configure file layer with daily rotation and filter
-        let file_layer = fmt::layer()
-            .with_writer(RollingFileAppender::new(
-                Rotation::DAILY,
-                log_path,
-                "stateless-validator.log",
-            ))
-            .with_filter(
-                EnvFilter::new("warn")
-                    .add_directive(format!("validator_core={}", file_filter).parse()?)
-                    .add_directive(format!("stateless_validator={}", file_filter).parse()?),
-            )
-            .boxed();
-
-        subscriber.with(file_layer).init();
-        info!("[Logging] Initialized: stdout={stdout_filter}, file={file_filter} ({log_dir})");
-    } else {
-        subscriber.init();
-        info!("[Logging] Initialized: stdout={stdout_filter}, file logging disabled");
-    }
-
-    Ok(())
-}
 
 /// Convert hex string to BlockHash
 ///
@@ -172,14 +112,21 @@ struct CommandLineArgs {
     /// Port for Prometheus metrics HTTP endpoint.
     #[clap(long, env = "STATELESS_VALIDATOR_METRICS_PORT", default_value_t = metrics::DEFAULT_METRICS_PORT)]
     metrics_port: u16,
+
+    /// Logging configuration.
+    #[command(flatten)]
+    log: LogArgs,
 }
 
 fn main() -> Result<()> {
-    init_logging()?;
+    migrate_legacy_env_vars();
+    let args = CommandLineArgs::parse();
+    let _log_guard = args.log.init_tracing()?;
+
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| anyhow!("Failed to build Tokio runtime: {e}"))?;
     let timeout = Duration::from_secs(1);
-    let result = runtime.block_on(run());
+    let result = runtime.block_on(run(args));
     let shutdown_start = Instant::now();
     runtime.shutdown_timeout(timeout);
     if shutdown_start.elapsed() >= timeout {
@@ -188,9 +135,8 @@ fn main() -> Result<()> {
     result
 }
 
-async fn run() -> Result<()> {
+async fn run(args: CommandLineArgs) -> Result<()> {
     let start = Instant::now();
-    let args = CommandLineArgs::parse();
 
     info!("[Main] Data directory: {}", args.data_dir);
     info!("[Main] RPC endpoint: {}", args.rpc_endpoint);
@@ -750,6 +696,7 @@ mod tests {
     };
     use op_alloy_rpc_types::Transaction;
     use serde::{Deserialize, Serialize, de::DeserializeOwned};
+    use tracing_subscriber::EnvFilter;
     use validator_core::withdrawals::MptWitness;
 
     use super::*;

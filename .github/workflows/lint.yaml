@@ -32,7 +32,7 @@ jobs:
         #   rustflags: "-A warnings"
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
-      - run: cargo clippy
+      - run: cargo clippy --workspace --all-targets --all-features
 
       - name: Run cargo-sort
         run: |
