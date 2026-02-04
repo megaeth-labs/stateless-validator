@@ -92,6 +92,14 @@ pub struct LogArgs {
     #[arg(long = "log.file-directory", env = "STATELESS_LOG_FILE_DIRECTORY")]
     pub log_file_directory: Option<PathBuf>,
 
+    /// Log file name.
+    #[arg(
+        long = "log.file-name",
+        env = "STATELESS_LOG_FILE_NAME",
+        default_value = "stateless-validator.log"
+    )]
+    pub log_file_name: String,
+
     /// File log filter directives.
     #[arg(long = "log.file-filter", env = "STATELESS_LOG_FILE", default_value = "debug")]
     pub log_file_filter: String,
@@ -125,13 +133,14 @@ fn build_env_filter(filter: &str) -> Result<EnvFilter> {
 /// alive for the lifetime of the program to guarantee log flushing on exit.
 fn build_file_writer(
     dir: &PathBuf,
+    file_name: &str,
     max_size_mb: u64,
     max_files: usize,
 ) -> Result<(tracing_appender::non_blocking::NonBlocking, WorkerGuard)> {
     std::fs::create_dir_all(dir)
         .map_err(|e| anyhow!("Failed to create log directory {}: {e}", dir.display()))?;
 
-    let file_path = dir.join("stateless-validator.log");
+    let file_path = dir.join(file_name);
     let condition = RollingConditionBasic::new().max_size(max_size_mb * 1024 * 1024);
     let appender = BasicRollingFileAppender::new(file_path, condition, max_files)
         .map_err(|e| anyhow!("Failed to create rolling file appender: {e}"))?;
@@ -198,8 +207,12 @@ impl LogArgs {
 
         // --- optional file layer ---
         let (file_layer, guard) = if let Some(ref dir) = self.log_file_directory {
-            let (non_blocking, guard) =
-                build_file_writer(dir, self.log_file_max_size, self.log_file_max_files)?;
+            let (non_blocking, guard) = build_file_writer(
+                dir,
+                &self.log_file_name,
+                self.log_file_max_size,
+                self.log_file_max_files,
+            )?;
             let file_filter = build_env_filter(&self.log_file_filter)?;
 
             let layer: Box<dyn Layer<_> + Send + Sync> = match self.log_file_format {
