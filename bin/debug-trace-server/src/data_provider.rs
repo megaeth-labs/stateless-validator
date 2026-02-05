@@ -24,7 +24,7 @@ use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
 use tokio::sync::broadcast;
-use tracing::{debug, instrument, trace, warn};
+use tracing::{instrument, trace, warn};
 use validator_core::{withdrawals::MptWitness, LightWitness, RpcClient, ValidatorDB};
 
 /// Block data bundle containing all information needed for stateless execution.
@@ -106,7 +106,6 @@ impl DataProvider {
     /// # Returns
     /// * `Ok(BlockData)` - Block data including witness and contracts
     /// * `Err` - If the block cannot be fetched from any source
-    #[instrument(skip(self), name = "get_block_data")]
     pub async fn get_block_data(&self, block_num: u64) -> Result<BlockData> {
         // Try to get block hash from local database first
         if let Some(db) = &self.validator_db {
@@ -134,7 +133,6 @@ impl DataProvider {
     /// # Returns
     /// * `Ok(BlockData)` - Block data including witness and contracts
     /// * `Err` - If the block cannot be fetched from any source
-    #[instrument(skip(self), name = "get_block_data_by_hash", fields(block_hash = %block_hash))]
     pub async fn get_block_data_by_hash(&self, block_hash: B256) -> Result<BlockData> {
         let start = std::time::Instant::now();
 
@@ -181,7 +179,6 @@ impl DataProvider {
     /// # Returns
     /// * `Ok((BlockData, usize))` - Block data and transaction index
     /// * `Err` - If transaction not found or is still pending
-    #[instrument(skip(self), name = "get_block_data_for_tx", fields(tx_hash = %tx_hash))]
     pub async fn get_block_data_for_tx(&self, tx_hash: B256) -> Result<(BlockData, usize)> {
         trace!(tx_hash = %tx_hash, "Looking up transaction");
 
@@ -196,7 +193,7 @@ impl DataProvider {
             tx.transaction_index.ok_or_else(|| eyre::eyre!("Transaction {} is pending", tx_hash))?
                 as usize;
 
-        debug!(
+        trace!(
             tx_hash = %tx_hash,
             block_hash = %block_hash,
             tx_index,
@@ -381,7 +378,7 @@ impl DataProvider {
                         block_hash = %block_hash,
                         retry_count,
                         elapsed_ms = start.elapsed().as_millis() as u64,
-                        %e,
+                        error = %e,
                         "Witness fetch failed, retrying"
                     );
                     last_error = Some(e);

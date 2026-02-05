@@ -171,12 +171,13 @@ pub async fn fetch_blocks_batch(
     let gap = remote_tip.0.saturating_sub(local_tip.0);
 
     // Detect and resolve chain reorgs
-    match client.get_block(BlockId::Number(remote_tip.0.into()), false).await {
-        Ok(block) if block.header.hash != remote_tip.1 => {
+    // Use get_block_hash for efficiency - we only need the hash for comparison
+    match client.get_block_hash(remote_tip.0).await {
+        Ok(remote_hash) if remote_hash != remote_tip.1 => {
             warn!(
                 block_number = remote_tip.0,
                 expected_hash = %remote_tip.1,
-                actual_hash = %block.header.hash,
+                actual_hash = %remote_hash,
                 "Hash mismatch detected, resolving chain divergence"
             );
 
@@ -291,9 +292,11 @@ pub async fn fetch_blocks_batch(
         future::join_all((start_block..start_block + blocks_to_fetch).map(|block_number| {
             let client = client.clone();
             async move {
-                let block = client.get_block(BlockId::Number(block_number.into()), false).await?;
+                // First get just the hash (more efficient than full block header)
+                let block_hash = client.get_block_hash(block_number).await?;
                 let (salt_witness, mpt_witness) =
-                    client.get_witness(block.header.number, block.header.hash).await?;
+                    client.get_witness(block_number, block_hash).await?;
+                // Then get full block with transactions
                 let block = client.get_block(BlockId::Number(block_number.into()), true).await?;
 
                 Ok::<(Block<Transaction>, SaltWitness, MptWitness), eyre::Error>((
@@ -428,6 +431,7 @@ pub async fn fetch_blocks_batch(
 ///
 /// # Returns
 /// * Never returns under normal operation - runs indefinitely until externally terminated
+#[instrument(skip_all, name = "remote_chain_tracker")]
 pub async fn remote_chain_tracker<F>(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
@@ -473,7 +477,6 @@ where
 /// since they typically occur near the chain tip (non-uniform distribution).
 /// The algorithm first exponentially expands backward to find a known-matching block,
 /// then binary searches in that range.
-#[instrument(skip(client, db), name = "find_divergence")]
 async fn find_divergence_point(
     client: &RpcClient,
     db: &ValidatorDB,

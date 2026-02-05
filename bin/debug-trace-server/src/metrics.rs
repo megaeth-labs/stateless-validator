@@ -40,11 +40,13 @@ pub mod names {
     pub const RPC_REQUESTS_TOTAL: &str = "debug_trace_rpc_requests_total";
     pub const RPC_ERRORS_TOTAL: &str = "debug_trace_rpc_errors_total";
     pub const REQUEST_DURATION: &str = "debug_trace_request_duration_seconds";
+    pub const INFLIGHT_RPC_REQUESTS: &str = "debug_trace_inflight_rpc_requests";
 
     // Cache metrics
     pub const CACHE_HITS_TOTAL: &str = "debug_trace_cache_hits_total";
     pub const CACHE_MISSES_TOTAL: &str = "debug_trace_cache_misses_total";
     pub const CACHE_SIZE: &str = "debug_trace_cache_size";
+    pub const CACHE_SIZE_BYTES: &str = "debug_trace_cache_size_bytes";
 
     // Upstream RPC metrics
     pub const UPSTREAM_REQUESTS_TOTAL: &str = "debug_trace_upstream_requests_total";
@@ -55,6 +57,16 @@ pub mod names {
     pub const TRANSACTIONS_TRACED: &str = "debug_trace_transactions_traced_total";
     pub const BLOCKS_TRACED: &str = "debug_trace_blocks_traced_total";
     pub const TRACING_DURATION: &str = "debug_trace_tracing_duration_seconds";
+
+    // Chain sync metrics
+    pub const REORG_DEPTH: &str = "debug_trace_reorg_depth";
+    pub const REMOTE_CHAIN_HEIGHT: &str = "debug_trace_remote_chain_height";
+
+    // Block distance metrics
+    pub const BLOCK_DISTANCE_FROM_LATEST: &str = "debug_trace_block_distance_from_latest";
+
+    // DB metrics
+    pub const DB_READ_DURATION: &str = "debug_trace_db_read_duration_seconds";
 }
 
 /// Initializes the Prometheus metrics exporter.
@@ -79,11 +91,13 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
     describe_counter!(names::RPC_REQUESTS_TOTAL, "Total number of RPC requests");
     describe_counter!(names::RPC_ERRORS_TOTAL, "Total number of RPC errors");
     describe_histogram!(names::REQUEST_DURATION, "Duration of RPC method calls");
+    describe_gauge!(names::INFLIGHT_RPC_REQUESTS, "Number of in-flight RPC requests");
 
     // Cache metrics
     describe_counter!(names::CACHE_HITS_TOTAL, "Total cache hits");
     describe_counter!(names::CACHE_MISSES_TOTAL, "Total cache misses");
-    describe_gauge!(names::CACHE_SIZE, "Current cache size");
+    describe_gauge!(names::CACHE_SIZE, "Current cache entry count");
+    describe_gauge!(names::CACHE_SIZE_BYTES, "Current cache size in bytes");
 
     // Upstream RPC metrics
     describe_counter!(names::UPSTREAM_REQUESTS_TOTAL, "Total upstream RPC requests");
@@ -93,7 +107,20 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
     // Tracing metrics
     describe_counter!(names::TRANSACTIONS_TRACED, "Total transactions traced");
     describe_counter!(names::BLOCKS_TRACED, "Total blocks traced");
-    describe_histogram!(names::TRACING_DURATION, "Duration of tracing execution");
+    describe_histogram!(names::TRACING_DURATION, "Duration of tracing execution by tracer type");
+
+    // Chain sync metrics
+    describe_gauge!(names::REORG_DEPTH, "Depth of the last detected chain reorganization");
+    describe_gauge!(names::REMOTE_CHAIN_HEIGHT, "Current height of the remote chain");
+
+    // Block distance metrics
+    describe_histogram!(
+        names::BLOCK_DISTANCE_FROM_LATEST,
+        "Distance of requested block from latest block"
+    );
+
+    // DB metrics
+    describe_histogram!(names::DB_READ_DURATION, "Duration of database read operations");
 
     Ok(())
 }
@@ -225,4 +252,72 @@ pub fn record_block_traced(tx_count: usize, duration_secs: f64) {
 pub fn record_transaction_traced(duration_secs: f64) {
     counter!(names::TRANSACTIONS_TRACED).increment(1);
     histogram!(names::TRACING_DURATION, "type" => "transaction").record(duration_secs);
+}
+
+/// Records tracing duration with a specific tracer type label.
+#[allow(dead_code)]
+pub fn record_tracing_duration(tracer_type: &str, duration_secs: f64) {
+    histogram!(names::TRACING_DURATION, "tracer" => tracer_type.to_string()).record(duration_secs);
+}
+
+// ---------------------------------------------------------------------------
+// In-Flight Request Metrics
+// ---------------------------------------------------------------------------
+
+/// Sets the number of in-flight RPC requests.
+#[allow(dead_code)]
+pub fn set_inflight_requests(count: usize) {
+    gauge!(names::INFLIGHT_RPC_REQUESTS).set(count as f64);
+}
+
+// ---------------------------------------------------------------------------
+// Chain Sync Metrics
+// ---------------------------------------------------------------------------
+
+/// Records a chain reorganization depth.
+#[allow(dead_code)]
+pub fn record_reorg_depth(depth: u64) {
+    gauge!(names::REORG_DEPTH).set(depth as f64);
+}
+
+/// Sets the current remote chain height.
+#[allow(dead_code)]
+pub fn set_remote_chain_height(height: u64) {
+    gauge!(names::REMOTE_CHAIN_HEIGHT).set(height as f64);
+}
+
+// ---------------------------------------------------------------------------
+// Block Distance Metrics
+// ---------------------------------------------------------------------------
+
+/// Records the distance of a requested block from the latest block.
+#[allow(dead_code)]
+pub fn record_block_distance(distance: u64) {
+    histogram!(names::BLOCK_DISTANCE_FROM_LATEST).record(distance as f64);
+}
+
+// ---------------------------------------------------------------------------
+// Cache Size Metrics
+// ---------------------------------------------------------------------------
+
+/// Sets the cache size (entry count) with a tracer/type label.
+#[allow(dead_code)]
+pub fn set_cache_size_with_label(label: &str, count: usize) {
+    gauge!(names::CACHE_SIZE, "type" => label.to_string()).set(count as f64);
+}
+
+/// Sets the cache size in bytes with a tracer/type label.
+#[allow(dead_code)]
+pub fn set_cache_size_bytes_with_label(label: &str, bytes: usize) {
+    gauge!(names::CACHE_SIZE_BYTES, "type" => label.to_string()).set(bytes as f64);
+}
+
+// ---------------------------------------------------------------------------
+// DB Read Metrics
+// ---------------------------------------------------------------------------
+
+/// Records the duration of a database read operation.
+#[allow(dead_code)]
+pub fn record_db_read_duration(operation: &str, duration_secs: f64) {
+    histogram!(names::DB_READ_DURATION, "operation" => operation.to_string()).record(duration_secs);
 }

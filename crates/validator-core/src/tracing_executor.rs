@@ -184,6 +184,8 @@ impl<'a> TracingEnv<'a> {
     }
 
     /// Replays transactions before the target index without tracing.
+    ///
+    /// Uses a single executor for all preceding transactions to avoid redundant setup overhead.
     fn replay_preceding_transactions<DB>(
         &self,
         state: &mut State<DB>,
@@ -192,13 +194,17 @@ impl<'a> TracingEnv<'a> {
     where
         DB: alloy_evm::Database + revm::DatabaseRef<Error = <DB as revm::Database>::Error>,
     {
-        for tx in self.transactions.iter().take(tx_index) {
-            let mut executor = self.executor_factory.create_executor(
-                state,
-                self.block_ctx.clone(),
-                self.evm_env.clone(),
-            );
+        if tx_index == 0 {
+            return Ok(());
+        }
 
+        let mut executor = self.executor_factory.create_executor(
+            state,
+            self.block_ctx.clone(),
+            self.evm_env.clone(),
+        );
+
+        for tx in self.transactions.iter().take(tx_index) {
             let recovered_tx = &tx.inner.inner;
             executor
                 .execute_transaction(recovered_tx)

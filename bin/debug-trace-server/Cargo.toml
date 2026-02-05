@@ -41,8 +41,10 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 
 # Logging and metrics
+atty = "0.2"
 tracing.workspace = true
-tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber = { workspace = true, features = ["json"] }
 
 # Reuse validator-core
 validator-core = { path = "../../crates/validator-core" }

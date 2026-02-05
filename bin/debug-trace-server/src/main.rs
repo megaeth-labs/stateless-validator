@@ -50,18 +50,20 @@ use eyre::{anyhow, ensure, Result};
 use jsonrpsee::server::{RpcModule, Server};
 use tokio::task;
 use tracing::{debug, error, info, instrument, warn};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use validator_core::{
     chain_spec::ChainSpec, remote_chain_tracker, ChainSyncConfig, RpcClient, RpcClientConfig,
     ValidatorDB,
 };
 
 mod data_provider;
+mod logging;
 mod metrics;
 mod response_cache;
 mod rpc_service;
+mod watchdog;
 
 use data_provider::DataProvider;
+use logging::LogArgs;
 use response_cache::{
     ResponseCache, ResponseCacheConfig, DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS,
     DEFAULT_RESPONSE_CACHE_MAX_BYTES,
@@ -147,6 +149,10 @@ struct Args {
         default_value_t = DEFAULT_PRUNER_INTERVAL_SECS
     )]
     pruner_interval_secs: u64,
+
+    /// Logging configuration.
+    #[clap(flatten)]
+    log: LogArgs,
 }
 
 /// Database filename for the validator's local storage.
@@ -167,15 +173,10 @@ fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "debug_trace_server=info".into()),
-        )
-        .with(tracing_subscriber::fmt::layer())
-        .init();
-
     let args = Args::parse();
+
+    // Initialize logging subsystem
+    logging::init_logging(&args.log)?;
 
     info!(
         listen_addr = %args.addr,
@@ -196,7 +197,7 @@ async fn main() -> Result<()> {
         match metrics::init_metrics(metrics_addr) {
             Ok(_) => info!(metrics_port = args.metrics_port, "Metrics enabled"),
             Err(e) => {
-                error!(%e, metrics_port = args.metrics_port, "Failed to initialize metrics");
+                error!(error = %e, metrics_port = args.metrics_port, "Failed to initialize metrics");
                 return Err(e);
             }
         }
@@ -249,7 +250,7 @@ async fn main() -> Result<()> {
             config,
             Some(move |reverted_hashes: &[B256]| {
                 if !reverted_hashes.is_empty() {
-                    tracing::info!(
+                    warn!(
                         count = reverted_hashes.len(),
                         "Invalidating response cache for reorged blocks"
                     );
@@ -262,8 +263,12 @@ async fn main() -> Result<()> {
         task::spawn(history_pruner(Arc::clone(db), args.blocks_to_keep, args.pruner_interval_secs));
     }
 
+    // Create WatchDog for monitoring slow RPC requests
+    let watchdog = watchdog::WatchDog::default_new();
+    watchdog.clone().spawn_checker();
+
     // Create RPC context and module
-    let ctx = RpcContext::new(data_provider, chain_spec, response_cache);
+    let ctx = RpcContext::new(data_provider, chain_spec, response_cache, watchdog);
     let mut module = RpcModule::new(ctx);
     rpc_service::register_all_methods(&mut module)?;
 
@@ -313,7 +318,7 @@ async fn init_validator_db(
                 Err(e) => {
                     warn!(
                         block_hash = %block_hash,
-                        %e,
+                        error = %e,
                         "Failed to fetch start block, retrying"
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -327,7 +332,7 @@ async fn init_validator_db(
             match rpc_client.get_block(BlockId::latest(), false).await {
                 Ok(block) => break block,
                 Err(e) => {
-                    warn!(%e, "Failed to fetch latest block, retrying");
+                    warn!(error = %e, "Failed to fetch latest block, retrying");
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             }
@@ -355,7 +360,6 @@ async fn init_validator_db(
 }
 
 /// Loads the chain specification from genesis file or uses default.
-#[instrument(skip_all, name = "load_chain_spec")]
 fn load_chain_spec(args: &Args) -> Result<Arc<ChainSpec>> {
     if let Some(genesis_path) = &args.genesis_file {
         debug!(genesis_file = %genesis_path, "Loading genesis from file");
@@ -395,7 +399,7 @@ async fn history_pruner(
                         "Pruned old blocks from database"
                     );
                 }
-                Err(e) => warn!(%e, "Failed to prune old block data"),
+                Err(e) => warn!(error = %e, "Failed to prune old block data"),
                 _ => {}
             }
         }

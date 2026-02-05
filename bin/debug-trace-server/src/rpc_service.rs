@@ -20,6 +20,7 @@ use crate::{
     data_provider::{BlockData, DataProvider},
     metrics,
     response_cache::{CachedResource, ResponseCache, ResponseVariant},
+    watchdog::WatchDog,
 };
 
 // ---------------------------------------------------------------------------
@@ -49,6 +50,8 @@ pub struct RpcContext {
     chain_spec: Arc<ChainSpec>,
     /// Response cache for HTTP layer caching.
     response_cache: ResponseCache,
+    /// WatchDog for monitoring slow RPC requests.
+    watchdog: WatchDog,
 }
 
 impl RpcContext {
@@ -57,8 +60,9 @@ impl RpcContext {
         data_provider: Arc<DataProvider>,
         chain_spec: Arc<ChainSpec>,
         response_cache: ResponseCache,
+        watchdog: WatchDog,
     ) -> Self {
-        Self { data_provider, chain_spec, response_cache }
+        Self { data_provider, chain_spec, response_cache, watchdog }
     }
 }
 
@@ -328,6 +332,9 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .await
             .map_err(|e| rpc_err(format!("Failed to resolve block number: {e}")))?;
 
+        // Register with watchdog for slow request monitoring
+        let _guard = ctx.watchdog.register(DEBUG_TRACE_BLOCK_BY_NUMBER, Some(block_num)).await;
+
         trace!(
             block_number = block_num,
             method = DEBUG_TRACE_BLOCK_BY_NUMBER,
@@ -379,6 +386,9 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
         let mut seq = params.sequence();
         let block_hash: B256 = seq.next()?;
         let opts: GethDebugTracingOptions = seq.optional_next()?.unwrap_or_default();
+
+        // Register with watchdog for slow request monitoring (block_number unknown yet)
+        let _guard = ctx.watchdog.register(DEBUG_TRACE_BLOCK_BY_HASH, None).await;
 
         trace!(
             block_hash = %block_hash,
@@ -452,6 +462,9 @@ fn register_debug_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
         let tx_hash: B256 = seq.next()?;
         let opts: GethDebugTracingOptions = seq.optional_next()?.unwrap_or_default();
 
+        // Register with watchdog for slow request monitoring
+        let _guard = ctx.watchdog.register(DEBUG_TRACE_TRANSACTION, None).await;
+
         trace!(
             tx_hash = %tx_hash,
             method = DEBUG_TRACE_TRANSACTION,
@@ -514,6 +527,9 @@ fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
             .await
             .map_err(|e| rpc_err(format!("Failed to resolve block number: {e}")))?;
 
+        // Register with watchdog for slow request monitoring
+        let _guard = ctx.watchdog.register(TRACE_BLOCK, Some(block_num)).await;
+
         trace!(block_number = block_num, method = TRACE_BLOCK, "Processing request");
 
         // Check cache before fetching block data
@@ -557,6 +573,9 @@ fn register_trace_methods(module: &mut RpcModule<RpcContext>) -> Result<()> {
         let start = Instant::now();
         let mut seq = params.sequence();
         let tx_hash: B256 = seq.next()?;
+
+        // Register with watchdog for slow request monitoring
+        let _guard = ctx.watchdog.register(TRACE_TRANSACTION, None).await;
 
         trace!(
             tx_hash = %tx_hash,
