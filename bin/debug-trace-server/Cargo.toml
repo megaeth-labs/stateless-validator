@@ -32,7 +32,6 @@ quick_cache = "0.6"
 
 # Execution
 revm.workspace = true
-revm-inspectors.workspace = true
 salt.workspace = true
 serde.workspace = true
 
@@ -52,10 +51,8 @@ validator-core = { path = "../../crates/validator-core" }
 alloy-consensus.workspace = true
 alloy-network = "1.0.23"
 alloy-primitives.workspace = true
-alloy-rlp.workspace = true
 
 # Transaction signing for integration tests
-alloy-signer = "1.0.23"
 alloy-signer-local = "1.0.23"
 dotenvy = "0.15"
 # HTTP client for integration tests

@@ -142,6 +142,8 @@ pub struct RpcClient {
     pub witness_provider: RootProvider,
     /// Optional Cloudflare witness provider for pruned/archived blocks.
     cloudflare_witness_provider: Option<RootProvider>,
+    /// Optional dedicated provider for reporting validated blocks.
+    report_provider: Option<RootProvider<Optimism>>,
     /// Configuration controlling verification behavior
     config: RpcClientConfig,
 }
@@ -153,7 +155,7 @@ impl RpcClient {
     /// * `data_api` - HTTP URL of the standard JSON-RPC endpoint for blocks and contract data
     /// * `witness_api` - HTTP URL of the witness RPC endpoint for SALT witness data
     pub fn new(data_api: &str, witness_api: &str) -> Result<Self> {
-        Self::new_with_config(data_api, witness_api, RpcClientConfig::default(), None)
+        Self::new_with_config(data_api, witness_api, RpcClientConfig::default(), None, None)
     }
 
     /// Creates a new RPC client with custom configuration.
@@ -163,11 +165,13 @@ impl RpcClient {
     /// * `witness_api` - HTTP URL of the witness RPC endpoint for SALT witness data
     /// * `config` - Configuration controlling verification and transport behavior
     /// * `cloudflare_witness_api` - Optional HTTP URL of the Cloudflare witness endpoint
+    /// * `report_api` - Optional HTTP URL of the endpoint for reporting validated blocks
     pub fn new_with_config(
         data_api: &str,
         witness_api: &str,
         config: RpcClientConfig,
         cloudflare_witness_api: Option<&str>,
+        report_api: Option<&str>,
     ) -> Result<Self> {
         let cloudflare_witness_provider = cloudflare_witness_api
             .map(|url| -> Result<RootProvider> {
@@ -177,12 +181,20 @@ impl RpcClient {
             })
             .transpose()?;
 
+        let report_provider = report_api
+            .map(|url| -> Result<RootProvider<Optimism>> {
+                Ok(ProviderBuilder::<_, _, Optimism>::default()
+                    .connect_http(url.parse().context("Failed to parse report API URL")?))
+            })
+            .transpose()?;
+
         Ok(Self {
             data_provider: ProviderBuilder::<_, _, Optimism>::default()
                 .connect_http(data_api.parse().context("Failed to parse API URL")?),
             witness_provider: ProviderBuilder::default()
                 .connect_http(witness_api.parse().context("Failed to parse API URL")?),
             cloudflare_witness_provider,
+            report_provider,
             config,
         })
     }
@@ -293,15 +305,75 @@ impl RpcClient {
         result
     }
 
+    /// Gets the block header by block ID.
+    ///
+    /// Uses `eth_getHeaderByNumber` / `eth_getHeaderByHash` instead of `eth_getBlockByNumber`
+    /// to avoid transferring the transaction hash list. Even without full transaction objects,
+    /// `eth_getBlockByNumber` still returns all transaction hashes, which is significant
+    /// at high TPS.
+    pub async fn get_header(&self, block_id: BlockId) -> Result<Header> {
+        let header = match block_id {
+            BlockId::Hash(hash) => {
+                let header: Header = self
+                    .data_provider
+                    .client()
+                    .request("eth_getHeaderByHash", (hash.block_hash,))
+                    .await
+                    .map_err(|e| {
+                        eyre!("eth_getHeaderByHash for {} failed: {e}", hash.block_hash)
+                    })?;
+                header
+            }
+            BlockId::Number(tag) => {
+                let header: Header = self
+                    .data_provider
+                    .client()
+                    .request("eth_getHeaderByNumber", (tag,))
+                    .await
+                    .map_err(|e| eyre!("eth_getHeaderByNumber for {:?} failed: {e}", tag))?;
+                header
+            }
+        };
+
+        // Verify block_id matches the returned header
+        match block_id {
+            BlockId::Number(BlockNumberOrTag::Number(num)) => {
+                ensure!(
+                    header.number == num,
+                    "Header number mismatch: requested {}, got {}",
+                    num,
+                    header.number
+                );
+            }
+            BlockId::Hash(hash) => {
+                ensure!(
+                    header.hash == hash.block_hash,
+                    "Header hash mismatch: requested {:?}, got {:?}",
+                    hash.block_hash,
+                    header.hash
+                );
+            }
+            _ => {}
+        }
+
+        // Verify header hash matches the computed hash
+        ensure!(
+            header.hash_slow() == header.hash,
+            "Header hash mismatch: expected {:?}, computed {:?}",
+            header.hash,
+            header.hash_slow()
+        );
+
+        Ok(header)
+    }
+
     /// Gets just the block hash for a block number.
     ///
-    /// Uses `eth_getHeaderByNumber` which is more efficient than fetching the full block
-    /// when only the hash is needed (e.g., for divergence checking).
+    /// Uses `eth_getHeaderByNumber` to avoid transferring the large transaction hash list
+    /// that `eth_getBlockByNumber` would include (e.g., for divergence checking).
     pub async fn get_block_hash(&self, block_number: u64) -> Result<B256> {
-        let header: Header = self
-            .data_provider
-            .client()
-            .request("eth_getHeaderByNumber", (BlockNumberOrTag::Number(block_number),))
+        let header = self
+            .get_header(BlockId::Number(BlockNumberOrTag::Number(block_number)))
             .await
             .map_err(|e| {
                 let err = eyre!("eth_getHeaderByNumber for block {} failed: {e}", block_number);
@@ -397,14 +469,15 @@ impl RpcClient {
         result
     }
 
-    /// Reports a range of validated blocks to the upstream node.
+    /// Reports a range of validated blocks via the dedicated report endpoint.
     pub async fn set_validated_blocks(
         &self,
         first_block: (u64, B256),
         last_block: (u64, B256),
     ) -> Result<SetValidatedBlocksResponse> {
-        let result = self
-            .data_provider
+        let provider =
+            self.report_provider.as_ref().ok_or_else(|| eyre!("Report provider not configured"))?;
+        let result = provider
             .client()
             .request("mega_setValidatedBlocks", (first_block, last_block))
             .await
@@ -528,6 +601,7 @@ mod tests {
             "http://localhost:8546",
             RpcClientConfig::default(),
             Some("http://localhost:9546"),
+            None,
         );
         assert!(result.is_ok());
         let client = result.unwrap();
@@ -541,6 +615,7 @@ mod tests {
             "http://localhost:8546",
             RpcClientConfig::default(),
             Some("not a url"),
+            None,
         );
         assert!(result.is_err());
     }
@@ -552,6 +627,7 @@ mod tests {
             "http://localhost:8546",
             RpcClientConfig::validator(),
             None,
+            None,
         )
         .unwrap();
         assert!(!client.skip_block_verification());
@@ -560,6 +636,7 @@ mod tests {
             "http://localhost:8545",
             "http://localhost:8546",
             RpcClientConfig::trace_server(),
+            None,
             None,
         )
         .unwrap();

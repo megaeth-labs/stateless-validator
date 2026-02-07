@@ -99,10 +99,10 @@ struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_GENESIS_FILE")]
     genesis_file: Option<String>,
 
-    /// Enable reporting of validated blocks to the upstream node.
-    /// When enabled, the validator will send validation results via mega_setValidatedBlock RPC.
-    #[clap(long, env = "STATELESS_VALIDATOR_REPORT_VALIDATION_RESULTS")]
-    report_validation_results: bool,
+    /// Endpoint for reporting validated blocks via mega_setValidatedBlocks RPC.
+    /// If not provided, validation reporting is disabled.
+    #[clap(long, env = "STATELESS_VALIDATOR_REPORT_VALIDATION_ENDPOINT")]
+    report_validation_endpoint: Option<String>,
 
     /// Enable Prometheus metrics endpoint.
     /// When enabled, metrics are exposed at http://0.0.0.0:<metrics-port>/metrics
@@ -162,6 +162,7 @@ async fn run(args: CommandLineArgs) -> Result<()> {
         &args.witness_endpoint,
         rpc_config,
         None, // No Cloudflare fallback for validator
+        args.report_validation_endpoint.as_deref(),
     )?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
 
@@ -175,9 +176,9 @@ async fn run(args: CommandLineArgs) -> Result<()> {
         info!("[Main] Initializing from start block: {}", start_block_str);
 
         let block_hash = parse_block_hash(start_block_str)?;
-        let block = loop {
-            match client.get_block(BlockId::Hash(block_hash.into()), false).await {
-                Ok(block) => break block,
+        let header = loop {
+            match client.get_header(BlockId::Hash(block_hash.into())).await {
+                Ok(header) => break header,
                 Err(e) => {
                     warn!("[Main] Failed to fetch block {block_hash}: {e}, retrying...",);
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -187,11 +188,10 @@ async fn run(args: CommandLineArgs) -> Result<()> {
 
         validator_db
             .reset_anchor_block(
-                block.header.number,
-                block.header.hash,
-                block.header.state_root,
-                block
-                    .header
+                header.number,
+                header.hash,
+                header.state_root,
+                header
                     .withdrawals_root
                     .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", block_hash))?,
             )
@@ -199,7 +199,7 @@ async fn run(args: CommandLineArgs) -> Result<()> {
 
         info!(
             "[Main] Successfully initialized from block {} (number: {})",
-            block.header.hash, block.header.number
+            header.hash, header.number
         );
     } else {
         // If no start block was provided, ensure we have an existing canonical chain
@@ -213,7 +213,7 @@ async fn run(args: CommandLineArgs) -> Result<()> {
     // Create chain sync configuration
     let config = Arc::new(ChainSyncConfig {
         concurrent_workers: num_cpus::get(),
-        report_validation_results: args.report_validation_results,
+        report_validation_endpoint: args.report_validation_endpoint.clone(),
         metrics_enabled: args.metrics_enabled,
         metrics_port: args.metrics_port,
         ..ChainSyncConfig::default()
@@ -221,7 +221,7 @@ async fn run(args: CommandLineArgs) -> Result<()> {
     info!("[Main] Number of concurrent tasks: {}", config.concurrent_workers);
     info!(
         "[Main] Validation result reporting: {}",
-        if config.report_validation_results { "enabled" } else { "disabled" }
+        if config.report_validation_endpoint.is_some() { "enabled" } else { "disabled" }
     );
 
     let validator_logic = chain_sync(client.clone(), validator_db.clone(), config, chain_spec);
@@ -248,8 +248,8 @@ async fn run(args: CommandLineArgs) -> Result<()> {
 /// Implements a multi-phase startup process for stateless block validation:
 /// 1. **Task Recovery** - Recovers interrupted validation tasks from previous crashes
 /// 2. **Remote Chain Tracking** - Spawns background tracker to maintain block lookahead
-/// 3. **Validation Reporter** - Optionally spawns background task to report validation results to
-///    upstream node (when enabled)
+/// 3. **Validation Reporter** - Optionally spawns background task to report validated blocks to a
+///    dedicated report endpoint (when `report_validation_endpoint` is provided)
 /// 4. **History Pruning** - Spawns background pruner to manage storage overhead
 /// 5. **Validation Workers** - Spawns configured number of parallel validation workers
 /// 6. **Main Sync Loop** - Continuously advances canonical chain as blocks are validated
@@ -292,7 +292,7 @@ async fn chain_sync(
     ));
 
     // Step 3: Spawn validation reporter (optional, based on config)
-    if config.report_validation_results {
+    if config.report_validation_endpoint.is_some() {
         info!("[Chain Sync] Starting validation reporter...");
         task::spawn(validation_reporter(
             Arc::clone(&client),
@@ -551,14 +551,14 @@ async fn validate_one(
     }
 }
 
-/// Reports validated blocks to the upstream node
+/// Reports validated blocks to the dedicated report endpoint
 ///
 /// Periodically monitors the canonical chain and reports the complete validated range
-/// (first to last block) to the upstream node via `mega_setValidatedBlocks` RPC.
+/// (first to last block) to the report endpoint via `mega_setValidatedBlocks` RPC.
 /// Only reports when new blocks have been validated.
 ///
 /// # Arguments
-/// * `client` - RPC client for communicating with upstream node
+/// * `client` - RPC client with a configured report provider
 /// * `validator_db` - Database interface for reading canonical chain
 /// * `config` - Configuration containing sync_poll_interval
 ///
@@ -874,6 +874,41 @@ mod tests {
             .register_method("eth_blockNumber", |_params, context, _| {
                 // Return the largest block number available in test data
                 Ok::<String, ErrorObjectOwned>(format!("0x{:x}", context.max_block.0))
+            })
+            .unwrap();
+
+        module
+            .register_method("eth_getHeaderByNumber", |params, context, _| {
+                let (hex_number,): (String,) = params.parse().unwrap();
+                let block_number = u64::from_str_radix(&hex_number[2..], 16).unwrap_or(0);
+
+                let block = context
+                    .block_hashes
+                    .get(&block_number)
+                    .and_then(|hash| context.blocks_by_hash.get(hash))
+                    .ok_or_else(|| {
+                        make_rpc_error(
+                            CALL_EXECUTION_FAILED_CODE,
+                            format!("Block {block_number} not found"),
+                        )
+                    })?;
+
+                Ok::<_, ErrorObject<'static>>(block.header.clone())
+            })
+            .unwrap();
+
+        module
+            .register_method("eth_getHeaderByHash", |params, context, _| {
+                let (hash,): (B256,) = params.parse().map_err(|e| {
+                    make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
+                })?;
+
+                let block_hash = BlockHash::from(hash.0);
+                let block = context.blocks_by_hash.get(&block_hash).ok_or_else(|| {
+                    make_rpc_error(CALL_EXECUTION_FAILED_CODE, format!("Block {hash} not found"))
+                })?;
+
+                Ok::<_, ErrorObject<'static>>(block.header.clone())
             })
             .unwrap();
 
