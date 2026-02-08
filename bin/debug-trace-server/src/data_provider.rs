@@ -375,7 +375,7 @@ impl DataProvider {
                 Ok(result)
             }
             Err(e) => {
-                debug!(
+                warn!(
                     block_number,
                     block_hash = %block_hash,
                     error = %e,
