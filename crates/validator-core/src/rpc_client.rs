@@ -38,6 +38,8 @@ pub enum RpcMethod {
     EthGetBlockByNumber,
     /// eth_blockNumber
     EthBlockNumber,
+    /// eth_getHeaderByNumber / eth_getHeaderByHash
+    EthGetHeader,
     /// mega_getBlockWitness
     MegaGetBlockWitness,
     /// mega_setValidatedBlocks
@@ -50,6 +52,7 @@ impl RpcMethod {
         match self {
             RpcMethod::EthGetCodeByHash => "eth_getCodeByHash",
             RpcMethod::EthGetBlockByNumber => "eth_getBlockByNumber",
+            RpcMethod::EthGetHeader => "eth_getHeader",
             RpcMethod::EthBlockNumber => "eth_blockNumber",
             RpcMethod::MegaGetBlockWitness => "mega_getBlockWitness",
             RpcMethod::MegaSetValidatedBlocks => "mega_setValidatedBlocks",
@@ -311,29 +314,33 @@ impl RpcClient {
     /// to avoid transferring the transaction hash list. Even without full transaction objects,
     /// `eth_getBlockByNumber` still returns all transaction hashes, which is significant
     /// at high TPS.
-    pub async fn get_header(&self, block_id: BlockId) -> Result<Header> {
-        let header = match block_id {
-            BlockId::Hash(hash) => {
-                let header: Header = self
-                    .data_provider
-                    .client()
-                    .request("eth_getHeaderByHash", (hash.block_hash,))
-                    .await
-                    .map_err(|e| {
-                        eyre!("eth_getHeaderByHash for {} failed: {e}", hash.block_hash)
-                    })?;
-                header
-            }
-            BlockId::Number(tag) => {
-                let header: Header = self
-                    .data_provider
-                    .client()
-                    .request("eth_getHeaderByNumber", (tag,))
-                    .await
-                    .map_err(|e| eyre!("eth_getHeaderByNumber for {:?} failed: {e}", tag))?;
-                header
-            }
+    ///
+    /// When `verify_hash` is true, computes `hash_slow()` to verify the header hash matches
+    /// the RPC-provided hash. This is important when initializing from a trusted start block
+    /// hash, but can be skipped when the header will be verified downstream (e.g., via
+    /// `verify_block_integrity`) or when running in a trusted context like the trace server.
+    pub async fn get_header(&self, block_id: BlockId, verify_hash: bool) -> Result<Header> {
+        let start = Instant::now();
+        let result = match block_id {
+            BlockId::Hash(hash) => self
+                .data_provider
+                .client()
+                .request::<_, Header>("eth_getHeaderByHash", (hash.block_hash,))
+                .await
+                .map_err(|e| eyre!("eth_getHeaderByHash for {} failed: {e}", hash.block_hash)),
+            BlockId::Number(tag) => self
+                .data_provider
+                .client()
+                .request::<_, Header>("eth_getHeaderByNumber", (tag,))
+                .await
+                .map_err(|e| eyre!("eth_getHeaderByNumber for {:?} failed: {e}", tag)),
         };
+        self.record_rpc(
+            RpcMethod::EthGetHeader,
+            result.is_ok(),
+            Some(start.elapsed().as_secs_f64()),
+        );
+        let header = result?;
 
         // Verify block_id matches the returned header
         match block_id {
@@ -356,13 +363,15 @@ impl RpcClient {
             _ => {}
         }
 
-        // Verify header hash matches the computed hash
-        ensure!(
-            header.hash_slow() == header.hash,
-            "Header hash mismatch: expected {:?}, computed {:?}",
-            header.hash,
-            header.hash_slow()
-        );
+        if verify_hash {
+            // Verify header hash matches the computed hash
+            ensure!(
+                header.hash_slow() == header.hash,
+                "Header hash mismatch: expected {:?}, computed {:?}",
+                header.hash,
+                header.hash_slow()
+            );
+        }
 
         Ok(header)
     }
@@ -372,15 +381,14 @@ impl RpcClient {
     /// Uses `eth_getHeaderByNumber` to avoid transferring the large transaction hash list
     /// that `eth_getBlockByNumber` would include (e.g., for divergence checking).
     pub async fn get_block_hash(&self, block_number: u64) -> Result<B256> {
-        let header = self
-            .get_header(BlockId::Number(BlockNumberOrTag::Number(block_number)))
+        self.get_header(BlockId::Number(BlockNumberOrTag::Number(block_number)), false)
             .await
             .map_err(|e| {
                 let err = eyre!("eth_getHeaderByNumber for block {} failed: {e}", block_number);
                 trace!(block_number, error = %e, "eth_getHeaderByNumber failed");
                 err
-            })?;
-        Ok(header.hash)
+            })
+            .map(|h| h.hash)
     }
 
     /// Gets execution witness data for a specific block.

@@ -145,7 +145,7 @@ pub async fn fetch_blocks_batch(
             );
 
             // Fetch latest block header and reset anchor
-            let latest_header = client.get_header(BlockId::latest()).await?;
+            let latest_header = client.get_header(BlockId::latest(), false).await?;
             db.reset_anchor_block(
                 latest_header.number,
                 latest_header.hash,

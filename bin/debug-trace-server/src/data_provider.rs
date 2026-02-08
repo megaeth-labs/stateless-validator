@@ -236,7 +236,7 @@ impl DataProvider {
             BlockNumberOrTag::Pending => Err(eyre::eyre!("Pending block not supported")),
             BlockNumberOrTag::Finalized | BlockNumberOrTag::Safe => {
                 // Fetch the header from upstream RPC to resolve the tag
-                let header = self.rpc_client.get_header(BlockId::Number(tag)).await?;
+                let header = self.rpc_client.get_header(BlockId::Number(tag), false).await?;
                 Ok(header.number)
             }
         }
@@ -321,12 +321,12 @@ impl DataProvider {
     /// 4. Fetch block with full transactions
     /// 5. Extract code hashes from witness and fetch contract bytecodes
     async fn do_fetch_block_data(&self, block_hash: B256) -> Result<BlockData> {
-        let upstream_block = UpstreamMetrics::new_for_method("eth_getBlockByHash");
+        let upstream_block = UpstreamMetrics::new_for_method("eth_getHeaderByHash");
         let upstream_witness = UpstreamMetrics::new_for_method("mega_getWitness");
 
         // Fetch header first to get the block number
         let start = std::time::Instant::now();
-        let header = self.rpc_client.get_header(BlockId::Hash(block_hash.into())).await;
+        let header = self.rpc_client.get_header(BlockId::Hash(block_hash.into()), false).await;
         upstream_block.record_request(header.is_ok(), start.elapsed().as_secs_f64());
         let header = header?;
         let block_number = header.number;

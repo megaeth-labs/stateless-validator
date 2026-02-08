@@ -177,7 +177,7 @@ async fn run(args: CommandLineArgs) -> Result<()> {
 
         let block_hash = parse_block_hash(start_block_str)?;
         let header = loop {
-            match client.get_header(BlockId::Hash(block_hash.into())).await {
+            match client.get_header(BlockId::Hash(block_hash.into()), true).await {
                 Ok(header) => break header,
                 Err(e) => {
                     warn!("[Main] Failed to fetch block {block_hash}: {e}, retrying...",);
@@ -605,18 +605,27 @@ async fn validation_reporter(
             Ok(response) => {
                 // Check for validation gap
                 if response.last_validated_block.0 < first_block.0 {
+                    debug!(
+                        "[Reporter] Validation gap detected: upstream at block {}, but local chain starts at {}. Cannot advance validation.",
+                        response.last_validated_block.0, first_block.0
+                    );
                     return Err(anyhow!(
                         "Validation gap detected: upstream at block {}, but local chain starts at {}. Cannot advance validation.",
                         response.last_validated_block.0,
                         first_block.0
                     ));
                 }
+                debug!(
+                    "[Reporter] Report rejected for blocks {first_block:?}-{last_block:?}, upstream at {:?}",
+                    response.last_validated_block
+                );
                 error!(
                     "[Reporter] Report rejected for blocks {first_block:?}-{last_block:?}, upstream at {:?}",
                     response.last_validated_block
                 );
             }
             Err(e) => {
+                debug!("[Reporter] Failed to report blocks: {e}");
                 error!("[Reporter] Failed to report blocks: {e}");
             }
         }
