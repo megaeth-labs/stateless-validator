@@ -1041,6 +1041,9 @@ impl ValidatorDB {
     /// Removes canonical chain entries, validation records, block data, and witnesses
     /// for blocks older than the specified block number.
     ///
+    /// Also cleans up orphaned CANONICAL_CHAIN entries (e.g., anchor blocks) that
+    /// may not have corresponding BLOCK_RECORDS entries.
+    ///
     /// Returns the number of blocks that were actually pruned.
     pub fn prune_history(&self, before_block: BlockNumber) -> ValidationDbResult<u64> {
         let read_txn = self.database.begin_read()?;
@@ -1070,6 +1073,22 @@ impl ValidatorDB {
                 witnesses.remove(block_hash)?;
                 mpt_witnesses.remove(block_hash)?;
                 validation_results.remove(block_hash)?;
+            }
+
+            // Clean up orphaned CANONICAL_CHAIN entries not tracked in BLOCK_RECORDS
+            // (e.g., anchor blocks inserted by reset_anchor_block)
+            loop {
+                let block_number = match canonical_chain.first()? {
+                    Some(entry) => {
+                        let n = entry.0.value();
+                        if n >= before_block {
+                            break;
+                        }
+                        n
+                    }
+                    None => break,
+                };
+                canonical_chain.remove(block_number)?;
             }
         }
         write_txn.commit()?;
