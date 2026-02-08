@@ -73,6 +73,7 @@ pub mod names {
     metric!(RPC_ERRORS_TOTAL, "rpc_errors_total");
     metric!(BLOCK_FETCH_TIME, "block_fetch_time_seconds");
     metric!(CODE_FETCH_TIME, "code_fetch_time_seconds");
+    metric!(WITNESS_FETCH_RPC_TIME, "witness_fetch_rpc_time_seconds");
 
     // Database
     metric!(CONTRACT_CACHE_HITS, "contract_cache_hits_total");
@@ -126,6 +127,7 @@ fn register_metric_descriptions() {
     describe_counter!(names::RPC_ERRORS_TOTAL, "RPC errors encountered");
     describe_histogram!(names::BLOCK_FETCH_TIME, "Block fetch time (s)");
     describe_histogram!(names::CODE_FETCH_TIME, "Code fetch time (s)");
+    describe_histogram!(names::WITNESS_FETCH_RPC_TIME, "Witness RPC fetch time (s)");
 
     // Database
     describe_counter!(names::CONTRACT_CACHE_HITS, "Contract cache hits");
@@ -198,6 +200,9 @@ pub fn on_rpc_complete(method: RpcMethod, success: bool, duration_secs: Option<f
             }
             RpcMethod::EthGetBlockByNumber => {
                 histogram!(names::BLOCK_FETCH_TIME).record(duration);
+            }
+            RpcMethod::MegaGetBlockWitness => {
+                histogram!(names::WITNESS_FETCH_RPC_TIME).record(duration);
             }
             _ => {}
         }
