@@ -14,6 +14,7 @@ use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::{executor::verify_block_integrity, withdrawals::MptWitness};
 
@@ -212,6 +213,9 @@ impl RpcClient {
             result.is_ok(),
             Some(start.elapsed().as_secs_f64()),
         );
+        if let Err(ref e) = result {
+            warn!(target: "rpc_client", %hash, %e, "RPC endpoint eth_getCodeByHash failed");
+        }
         result
     }
 
@@ -227,6 +231,9 @@ impl RpcClient {
             block.is_ok(),
             Some(start.elapsed().as_secs_f64()),
         );
+        if let Err(ref e) = block {
+            warn!(target: "rpc_client", ?block_id, %e, "RPC endpoint get_block failed");
+        }
         let block = block?;
         if !self.config.skip_block_verification {
             verify_block_integrity(&block)?;
@@ -280,6 +287,9 @@ impl RpcClient {
         let result =
             self.data_provider.get_block_number().await.context("Failed to get block number");
         self.record_rpc(RpcMethod::EthBlockNumber, result.is_ok(), None);
+        if let Err(ref e) = result {
+            warn!(target: "rpc_client", %e, "RPC endpoint eth_blockNumber failed");
+        }
         result
     }
 
@@ -293,7 +303,11 @@ impl RpcClient {
             .client()
             .request("eth_getHeaderByNumber", (BlockNumberOrTag::Number(block_number),))
             .await
-            .map_err(|e| eyre!("eth_getHeaderByNumber for block {} failed: {e}", block_number))?;
+            .map_err(|e| {
+                let err = eyre!("eth_getHeaderByNumber for block {} failed: {e}", block_number);
+                warn!(target: "rpc_client", block_number, %e, "RPC endpoint eth_getHeaderByNumber failed");
+                err
+            })?;
         Ok(header.hash)
     }
 
@@ -315,6 +329,10 @@ impl RpcClient {
             result.is_ok(),
             Some(start.elapsed().as_secs_f64()),
         );
+
+        if let Err(ref e) = result {
+            warn!(target: "rpc_client", block_number = number, %hash, %e, "Witness generator mega_getBlockWitness failed");
+        }
 
         if let Ok((ref witness, ref mpt_witness)) = result &&
             let Some(ref metrics) = self.config.metrics
@@ -361,6 +379,7 @@ impl RpcClient {
         let keys = WitnessRequestKeys { block_number: U64::from(number), block_hash: hash };
         let result: (SaltWitness, MptWitness) =
             provider.client().request("mega_getBlockWitness", (keys,)).await.map_err(|e| {
+                warn!(target: "rpc_client", block_number = number, %hash, %e, "Cloudflare worker mega_getBlockWitness failed");
                 eyre!("Cloudflare witness fetch failed for block {}: {}", number, e)
             })?;
 
@@ -380,6 +399,9 @@ impl RpcClient {
             .await
             .map_err(|e| eyre!("Failed to set validated blocks: {e}"));
         self.record_rpc(RpcMethod::MegaSetValidatedBlocks, result.is_ok(), None);
+        if let Err(ref e) = result {
+            warn!(target: "rpc_client", %e, "RPC endpoint mega_setValidatedBlocks failed");
+        }
         result
     }
 
@@ -410,6 +432,10 @@ impl RpcClient {
             .data_provider
             .get_transaction_by_hash(tx_hash)
             .await
+            .map_err(|e| {
+                warn!(target: "rpc_client", %tx_hash, %e, "RPC endpoint get_transaction_by_hash failed");
+                e
+            })
             .context("Failed to get transaction by hash")?;
 
         match tx {

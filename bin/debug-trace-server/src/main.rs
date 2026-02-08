@@ -60,6 +60,7 @@ mod data_provider;
 mod metrics;
 mod response_cache;
 mod rpc_service;
+mod timing;
 
 use data_provider::DataProvider;
 use response_cache::{
@@ -283,7 +284,11 @@ async fn main() -> Result<()> {
     let module = ctx.into_rpc_module()?;
 
     // Start server
-    let server = Server::builder().max_response_body_size(u32::MAX).build(&args.addr).await?;
+    let server = Server::builder()
+        .max_response_body_size(u32::MAX)
+        .set_http_middleware(tower::ServiceBuilder::new().layer(timing::TimingHeaderLayer))
+        .build(&args.addr)
+        .await?;
     let addr = server.local_addr()?;
     let handle = server.start(module);
 

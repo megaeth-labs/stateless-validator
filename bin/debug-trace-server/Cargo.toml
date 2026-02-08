@@ -41,6 +41,12 @@ serde_json.workspace = true
 # Async runtime
 tokio = { workspace = true, features = ["sync"] }
 
+# HTTP middleware
+tower = "0.4"
+http.workspace = true
+libc = "0.2"
+pin-project-lite = "0.2"
+
 # Logging and metrics
 tracing.workspace = true
 
