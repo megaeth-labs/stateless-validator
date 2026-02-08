@@ -45,8 +45,7 @@ pub struct ChainSyncConfig {
     pub worker_error_sleep: Duration,
     /// Time to wait when remote tracker encounters RPC/DB errors.
     pub tracker_error_sleep: Duration,
-    /// Endpoint for reporting validated blocks to upstream node.
-    /// If None, validation reporting is disabled.
+    /// Enable reporting of validated blocks to upstream node.
     pub report_validation_results: bool,
     /// Enable Prometheus metrics endpoint.
     pub metrics_enabled: bool,
