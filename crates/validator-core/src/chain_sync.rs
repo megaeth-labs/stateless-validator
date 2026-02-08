@@ -47,7 +47,7 @@ pub struct ChainSyncConfig {
     pub tracker_error_sleep: Duration,
     /// Endpoint for reporting validated blocks to upstream node.
     /// If None, validation reporting is disabled.
-    pub report_validation_endpoint: Option<String>,
+    pub report_validation_results: bool,
     /// Enable Prometheus metrics endpoint.
     pub metrics_enabled: bool,
     /// Port for Prometheus metrics HTTP endpoint.
@@ -71,7 +71,7 @@ impl Default for ChainSyncConfig {
             worker_idle_sleep: Duration::from_millis(500),
             worker_error_sleep: Duration::from_millis(1000),
             tracker_error_sleep: Duration::from_secs(1),
-            report_validation_endpoint: None,
+            report_validation_results: false,
             metrics_enabled: false,
             metrics_port: DEFAULT_METRICS_PORT,
             auto_advance_local_tip: false,

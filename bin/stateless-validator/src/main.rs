@@ -213,7 +213,7 @@ async fn run(args: CommandLineArgs) -> Result<()> {
     // Create chain sync configuration
     let config = Arc::new(ChainSyncConfig {
         concurrent_workers: num_cpus::get(),
-        report_validation_endpoint: args.report_validation_endpoint.clone(),
+        report_validation_results: args.report_validation_endpoint.is_some(),
         metrics_enabled: args.metrics_enabled,
         metrics_port: args.metrics_port,
         ..ChainSyncConfig::default()
@@ -221,7 +221,7 @@ async fn run(args: CommandLineArgs) -> Result<()> {
     info!("[Main] Number of concurrent tasks: {}", config.concurrent_workers);
     info!(
         "[Main] Validation result reporting: {}",
-        if config.report_validation_endpoint.is_some() { "enabled" } else { "disabled" }
+        if config.report_validation_results { "enabled" } else { "disabled" }
     );
 
     let validator_logic = chain_sync(client.clone(), validator_db.clone(), config, chain_spec);
@@ -292,7 +292,7 @@ async fn chain_sync(
     ));
 
     // Step 3: Spawn validation reporter (optional, based on config)
-    if config.report_validation_endpoint.is_some() {
+    if config.report_validation_results {
         info!("[Chain Sync] Starting validation reporter...");
         task::spawn(validation_reporter(
             Arc::clone(&client),
