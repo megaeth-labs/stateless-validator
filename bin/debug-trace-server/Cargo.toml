@@ -19,14 +19,15 @@ dashmap = "5.5"
 
 # Error handling
 eyre.workspace = true
+http.workspace = true
 # RPC framework
 jsonrpsee = { version = "0.24", features = ["server", "macros"] }
+libc = "0.2"
 metrics.workspace = true
 metrics-derive.workspace = true
 metrics-exporter-prometheus.workspace = true
 op-alloy-rpc-types.workspace = true
-
-# High-performance cache with S3-FIFO eviction
+pin-project-lite = "0.2"
 quick_cache = "0.6"
 
 # Execution
@@ -37,9 +38,6 @@ serde.workspace = true
 
 # Serialization
 serde_json.workspace = true
-http.workspace = true
-libc = "0.2"
-pin-project-lite = "0.2"
 tokio = { workspace = true, features = ["sync"] }
 tower = "0.4"
 
