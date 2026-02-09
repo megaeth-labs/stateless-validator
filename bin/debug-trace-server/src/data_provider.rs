@@ -56,6 +56,9 @@ pub const DEFAULT_WITNESS_TIMEOUT_SECS: u64 = 8;
 /// Retry interval for witness fetch in milliseconds (200ms).
 const WITNESS_RETRY_INTERVAL_MS: u64 = 200;
 
+/// Slow stage threshold: any individual stage exceeding this triggers a warn log.
+const SLOW_STAGE_THRESHOLD_MS: u128 = 1000;
+
 /// Broadcast sender type for single-flight request pattern.
 /// Used to notify all waiters when a block fetch completes.
 type InFlightSender = broadcast::Sender<Result<BlockData, String>>;
@@ -251,12 +254,34 @@ impl DataProvider {
         db: &ValidatorDB,
         block_hash: alloy_primitives::BlockHash,
     ) -> Result<BlockData> {
+        let overall_start = std::time::Instant::now();
+
         // Get block data from database using light witness (fast deserialization)
+        let start = std::time::Instant::now();
         let (block, witness) = db.get_block_and_witness(block_hash)?;
+        let db_read_ms = start.elapsed().as_millis();
 
         // Extract code hashes and get contracts
+        let start = std::time::Instant::now();
         let code_hashes = validator_core::extract_code_hashes(&witness);
+        let num_contracts = code_hashes.len();
         let contracts = self.get_contracts_with_db(db, &code_hashes).await?;
+        let fetch_contracts_ms = start.elapsed().as_millis();
+
+        let total_ms = overall_start.elapsed().as_millis();
+
+        if db_read_ms >= SLOW_STAGE_THRESHOLD_MS || fetch_contracts_ms >= SLOW_STAGE_THRESHOLD_MS {
+            warn!(
+                block_number = block.header.number,
+                block_hash = %block_hash,
+                tx_count = block.transactions.len(),
+                num_contracts,
+                db_read_ms = db_read_ms as u64,
+                fetch_contracts_ms = fetch_contracts_ms as u64,
+                total_ms = total_ms as u64,
+                "get_block_data_from_db slow stages detected"
+            );
+        }
 
         Ok(BlockData { block, witness, contracts })
     }
@@ -319,40 +344,77 @@ impl DataProvider {
     ///
     /// Performs the complete fetch sequence:
     /// 1. Fetch block header (without transactions) to get block number
-    /// 2. Determine witness source based on block height relative to DB range
-    /// 3. Fetch witness with appropriate routing (retry for new blocks, immediate fallback for old)
-    /// 4. Fetch block with full transactions
-    /// 5. Extract code hashes from witness and fetch contract bytecodes
+    /// 2. Fetch witness and full block in parallel
+    /// 3. Convert SaltWitness to LightWitness
+    /// 4. Extract code hashes from witness and fetch contract bytecodes
     async fn do_fetch_block_data(&self, block_hash: B256) -> Result<BlockData> {
+        let overall_start = std::time::Instant::now();
         let upstream_block = UpstreamMetrics::new_for_method("eth_getBlockByHash");
         let upstream_witness = UpstreamMetrics::new_for_method("mega_getWitness");
 
-        // Fetch block without transactions first to get the number
+        // Step 1: Fetch block without transactions first to get the number
         let start = std::time::Instant::now();
-        let block = self.rpc_client.get_block(BlockId::Hash(block_hash.into()), false).await;
-        upstream_block.record_request(block.is_ok(), start.elapsed().as_secs_f64());
-        let block = block?;
-        let block_number = block.header.number;
+        let header_block =
+            self.rpc_client.get_block(BlockId::Hash(block_hash.into()), false).await;
+        upstream_block.record_request(header_block.is_ok(), start.elapsed().as_secs_f64());
+        let header_block = header_block?;
+        let block_number = header_block.header.number;
+        let fetch_header_ms = start.elapsed().as_millis();
 
-        // Fetch witness with fallback routing
-        let start = std::time::Instant::now();
-        let witness_result =
-            self.fetch_witness_with_fallback(block_number, block.header.hash).await;
-        upstream_witness.record_request(witness_result.is_ok(), start.elapsed().as_secs_f64());
+        // Step 2: Fetch witness and full block in parallel
+        let witness_start = std::time::Instant::now();
+        let full_block_start = std::time::Instant::now();
+
+        let (witness_result, full_block_result) = tokio::join!(
+            self.fetch_witness_with_fallback(block_number, header_block.header.hash),
+            self.rpc_client.get_block(BlockId::Hash(block_hash.into()), true),
+        );
+
+        let fetch_witness_ms = witness_start.elapsed().as_millis();
+        upstream_witness.record_request(witness_result.is_ok(), fetch_witness_ms as f64 / 1000.0);
         let (salt_witness, _mpt_witness) = witness_result?;
 
-        // Convert SaltWitness to LightWitness
-        let witness = LightWitness::from(salt_witness);
+        let fetch_full_block_ms = full_block_start.elapsed().as_millis();
+        upstream_block.record_request(
+            full_block_result.is_ok(),
+            fetch_full_block_ms as f64 / 1000.0,
+        );
+        let block = full_block_result?;
 
-        // Fetch block with full transactions
+        // Step 3: Convert SaltWitness to LightWitness
         let start = std::time::Instant::now();
-        let block = self.rpc_client.get_block(BlockId::Hash(block_hash.into()), true).await;
-        upstream_block.record_request(block.is_ok(), start.elapsed().as_secs_f64());
-        let block = block?;
+        let witness = LightWitness::from(salt_witness);
+        let convert_witness_ms = start.elapsed().as_millis();
 
-        // Extract code hashes and fetch contracts
+        // Step 4: Extract code hashes and fetch contracts
+        let start = std::time::Instant::now();
         let code_hashes = validator_core::extract_code_hashes(&witness);
+        let num_contracts = code_hashes.len();
         let contracts = self.get_contracts(&code_hashes).await?;
+        let fetch_contracts_ms = start.elapsed().as_millis();
+
+        let total_ms = overall_start.elapsed().as_millis();
+
+        if fetch_header_ms >= SLOW_STAGE_THRESHOLD_MS
+            || fetch_witness_ms >= SLOW_STAGE_THRESHOLD_MS
+            || convert_witness_ms >= SLOW_STAGE_THRESHOLD_MS
+            || fetch_full_block_ms >= SLOW_STAGE_THRESHOLD_MS
+            || fetch_contracts_ms >= SLOW_STAGE_THRESHOLD_MS
+        {
+            warn!(
+                block_number,
+                block_hash = %block_hash,
+                tx_count = block.transactions.len(),
+                num_contracts,
+                fetch_header_ms = fetch_header_ms as u64,
+                fetch_witness_ms = fetch_witness_ms as u64,
+                convert_witness_ms = convert_witness_ms as u64,
+                fetch_full_block_ms = fetch_full_block_ms as u64,
+                fetch_contracts_ms = fetch_contracts_ms as u64,
+                total_ms = total_ms as u64,
+                "do_fetch_block_data slow stages detected"
+            );
+        }
 
         Ok(BlockData { block, witness, contracts })
     }

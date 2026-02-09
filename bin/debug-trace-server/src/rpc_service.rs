@@ -32,6 +32,9 @@ use crate::{
 /// Slow request threshold for logging warnings.
 const SLOW_REQUEST_THRESHOLD: Duration = Duration::from_secs(5);
 
+/// Slow stage threshold: any individual stage exceeding this triggers a warn log.
+const SLOW_STAGE_THRESHOLD_MS: u128 = 1000;
+
 // ---------------------------------------------------------------------------
 // RPC Trait Definitions (proc-macro)
 // ---------------------------------------------------------------------------
@@ -288,14 +291,16 @@ async fn compute_debug_trace_block(
     let serialize_ms = start.elapsed().as_millis() - trace_ms;
     let response_size = value.to_string().len();
 
-    tracing::debug!(
-        block_number = data.block.header.number,
-        tx_count = data.block.transactions.len(),
-        trace_ms,
-        serialize_ms,
-        response_size_kb = response_size / 1024,
-        "Trace computation timing"
-    );
+    if trace_ms >= SLOW_STAGE_THRESHOLD_MS || serialize_ms >= SLOW_STAGE_THRESHOLD_MS {
+        warn!(
+            block_number = data.block.header.number,
+            tx_count = data.block.transactions.len(),
+            trace_ms = trace_ms as u64,
+            serialize_ms = serialize_ms as u64,
+            response_size_kb = response_size / 1024,
+            "compute_debug_trace_block slow stages detected"
+        );
+    }
 
     Ok(value)
 }
@@ -410,15 +415,18 @@ impl DebugTraceRpcServer for RpcContext {
         let start = Instant::now();
         let opts = opts.unwrap_or_default();
 
+        // Stage 1: Resolve block number
+        let t0 = Instant::now();
         let block_num = self
             .data_provider
             .resolve_block_number(block_number)
             .await
             .map_err(|e| rpc_err(format!("Failed to resolve block number: {e}")))?;
+        let resolve_ms = t0.elapsed().as_millis();
 
         let variant = ResponseVariant::from_geth_options(&opts);
 
-        // Check cache
+        // Stage 2: Check cache
         if let Some(cached) = check_cache_by_number(
             &self.response_cache,
             CachedResource::DebugTraceBlock,
@@ -430,16 +438,24 @@ impl DebugTraceRpcServer for RpcContext {
             return Ok(cached);
         }
 
-        // Fetch block data (DB -> RPC fallback)
+        // Stage 3: Fetch block data (DB -> RPC fallback)
+        let t2 = Instant::now();
         let data = self
             .data_provider
             .get_block_data(block_num)
             .await
             .map_err(|e| block_data_err(block_num, e))?;
+        let fetch_ms = t2.elapsed().as_millis();
         let block_hash = data.block.header.hash;
-        let result = compute_debug_trace_block(&self.chain_spec, &data, opts).await?;
+        let tx_count = data.block.transactions.len();
 
-        // Cache and record metrics
+        // Stage 4: Execute trace
+        let t3 = Instant::now();
+        let result = compute_debug_trace_block(&self.chain_spec, &data, opts).await?;
+        let trace_ms = t3.elapsed().as_millis();
+
+        // Stage 5: Cache result
+        let t4 = Instant::now();
         self.response_cache.insert(
             CachedResource::DebugTraceBlock,
             block_num,
@@ -447,7 +463,27 @@ impl DebugTraceRpcServer for RpcContext {
             variant,
             result.clone(),
         );
+        let cache_insert_ms = t4.elapsed().as_millis();
+
+        let total_ms = start.elapsed().as_millis();
         record_request_completion(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, block_num, start);
+
+        if resolve_ms >= SLOW_STAGE_THRESHOLD_MS
+            || fetch_ms >= SLOW_STAGE_THRESHOLD_MS
+            || trace_ms >= SLOW_STAGE_THRESHOLD_MS
+            || cache_insert_ms >= SLOW_STAGE_THRESHOLD_MS
+        {
+            warn!(
+                block_number = block_num,
+                tx_count,
+                resolve_ms = resolve_ms as u64,
+                fetch_data_ms = fetch_ms as u64,
+                trace_ms = trace_ms as u64,
+                cache_insert_ms = cache_insert_ms as u64,
+                total_ms = total_ms as u64,
+                "debug_traceBlockByNumber slow stages detected"
+            );
+        }
 
         Ok(result)
     }

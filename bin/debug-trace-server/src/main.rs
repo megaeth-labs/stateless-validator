@@ -63,10 +63,7 @@ mod rpc_service;
 mod timing;
 
 use data_provider::DataProvider;
-use response_cache::{
-    ResponseCache, ResponseCacheConfig, DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS,
-    DEFAULT_RESPONSE_CACHE_MAX_BYTES,
-};
+use response_cache::{ResponseCache, ResponseCacheConfig, DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS};
 use rpc_service::RpcContext;
 
 /// Command line arguments for the debug-trace-server.
@@ -121,13 +118,14 @@ struct Args {
     )]
     witness_timeout: u64,
 
-    /// Maximum memory for response cache in bytes.
+    /// Maximum memory for response cache (e.g., "1GB", "512MB", "1024").
     #[clap(
         long,
-        env = "DEBUG_TRACE_SERVER_RESPONSE_CACHE_MAX_BYTES",
-        default_value_t = DEFAULT_RESPONSE_CACHE_MAX_BYTES
+        env = "DEBUG_TRACE_SERVER_RESPONSE_CACHE_MAX_SIZE",
+        default_value = "1GB",
+        value_parser = parse_size,
     )]
-    response_cache_max_bytes: u64,
+    response_cache_max_size: u64,
 
     /// Estimated number of items in response cache (for initial capacity).
     #[clap(
@@ -144,6 +142,16 @@ struct Args {
         default_value_t = DEFAULT_BLOCKS_TO_KEEP
     )]
     blocks_to_keep: u64,
+
+    /// Maximum database file size before additional pruning triggers (e.g., "10GB", "512MB").
+    /// Set to "0" to disable size-based pruning (only block-count pruning applies).
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_DB_MAX_SIZE",
+        default_value = "0",
+        value_parser = parse_size,
+    )]
+    db_max_size: u64,
 
     /// Interval between database pruning cycles in seconds.
     #[clap(
@@ -167,6 +175,38 @@ const DEFAULT_BLOCKS_TO_KEEP: u64 = 1000;
 /// Default pruner interval in seconds (5 minutes).
 const DEFAULT_PRUNER_INTERVAL_SECS: u64 = 300;
 
+/// Parses a human-readable size string into bytes.
+///
+/// Accepts suffixes: `KB` (1024), `MB` (1024²), `GB` (1024³). Case-insensitive.
+/// Plain numbers are treated as raw bytes.
+///
+/// # Examples
+/// ```text
+/// "1GB"   -> 1_073_741_824
+/// "512MB" -> 536_870_912
+/// "100KB" -> 102_400
+/// "1024"  -> 1_024
+/// ```
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let upper = s.to_uppercase();
+
+    let (num_str, multiplier) = if let Some(n) = upper.strip_suffix("GB") {
+        (n, 1024u64 * 1024 * 1024)
+    } else if let Some(n) = upper.strip_suffix("MB") {
+        (n, 1024u64 * 1024)
+    } else if let Some(n) = upper.strip_suffix("KB") {
+        (n, 1024u64)
+    } else {
+        (upper.as_str(), 1u64)
+    };
+
+    let value: u64 =
+        num_str.trim().parse().map_err(|e| format!("invalid size '{}': {}", s, e))?;
+
+    value.checked_mul(multiplier).ok_or_else(|| format!("size overflow: '{}'", s))
+}
+
 /// Parses a hex string into a BlockHash.
 fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
     let hash_bytes = hex::decode(hex_str)?;
@@ -187,7 +227,7 @@ async fn main() -> Result<()> {
         rpc_endpoint = %args.rpc_endpoint,
         witness_endpoint = %args.witness_endpoint,
         witness_timeout_secs = args.witness_timeout,
-        response_cache_max_bytes = args.response_cache_max_bytes,
+        response_cache_max_size = args.response_cache_max_size,
         response_cache_estimated_items = args.response_cache_estimated_items,
         "Server configuration"
     );
@@ -221,12 +261,12 @@ async fn main() -> Result<()> {
     let chain_spec = load_chain_spec(&args)?;
 
     let response_cache = ResponseCache::new(ResponseCacheConfig::new(
-        args.response_cache_max_bytes,
+        args.response_cache_max_size,
         args.response_cache_estimated_items,
     ));
 
     debug!(
-        max_bytes = args.response_cache_max_bytes,
+        max_bytes = args.response_cache_max_size,
         estimated_items = args.response_cache_estimated_items,
         "Response cache initialized"
     );
@@ -264,7 +304,14 @@ async fn main() -> Result<()> {
         ));
 
         // Spawn history pruner to prevent unbounded database growth
-        task::spawn(history_pruner(Arc::clone(db), args.blocks_to_keep, args.pruner_interval_secs));
+        let db_path = PathBuf::from(args.data_dir.as_deref().unwrap()).join(VALIDATOR_DB_FILENAME);
+        task::spawn(history_pruner(
+            Arc::clone(db),
+            args.blocks_to_keep,
+            args.pruner_interval_secs,
+            args.db_max_size,
+            db_path,
+        ));
     }
 
     // Create RPC context and module
@@ -391,22 +438,29 @@ fn load_chain_spec(args: &Args) -> Result<Arc<ChainSpec>> {
 /// Background task that periodically prunes old block data to prevent unbounded database growth.
 ///
 /// Runs in an infinite loop, removing blocks older than `blocks_to_keep` from the current tip.
+/// If `db_max_size > 0`, also prunes additional blocks when the DB file exceeds that size.
 #[instrument(skip_all, name = "history_pruner")]
 async fn history_pruner(
     validator_db: Arc<ValidatorDB>,
     blocks_to_keep: u64,
     interval_secs: u64,
+    db_max_size: u64,
+    db_path: PathBuf,
 ) -> Result<()> {
     let interval = std::time::Duration::from_secs(interval_secs);
     info!(
         blocks_to_keep = blocks_to_keep,
         interval_secs = interval_secs,
+        db_max_size = db_max_size,
         "Starting history pruner"
     );
 
+    /// Number of extra blocks to prune per iteration when DB file is over size limit.
+    const SIZE_PRUNE_BATCH: u64 = 100;
+
     loop {
         if let Ok(Some((current_tip, _))) = validator_db.get_local_tip() {
-            let prune_before = current_tip.saturating_sub(blocks_to_keep);
+            let mut prune_before = current_tip.saturating_sub(blocks_to_keep);
             match validator_db.prune_history(prune_before) {
                 Ok(blocks_pruned) if blocks_pruned > 0 => {
                     debug!(
@@ -417,6 +471,56 @@ async fn history_pruner(
                 }
                 Err(e) => warn!(error = %e, "Failed to prune old block data"),
                 _ => {}
+            }
+
+            // Size-based pruning: keep removing blocks until DB is under the limit
+            if db_max_size > 0 {
+                loop {
+                    let file_size = match std::fs::metadata(&db_path) {
+                        Ok(m) => m.len(),
+                        Err(e) => {
+                            warn!(error = %e, "Failed to read DB file size");
+                            break;
+                        }
+                    };
+
+                    if file_size <= db_max_size {
+                        break;
+                    }
+
+                    prune_before = prune_before.saturating_add(SIZE_PRUNE_BATCH);
+                    // Don't prune beyond the current tip
+                    if prune_before >= current_tip {
+                        info!(
+                            file_size = file_size,
+                            db_max_size = db_max_size,
+                            "DB still over size limit but no more blocks to prune"
+                        );
+                        break;
+                    }
+
+                    info!(
+                        file_size = file_size,
+                        db_max_size = db_max_size,
+                        prune_before = prune_before,
+                        "DB over size limit, pruning additional blocks"
+                    );
+
+                    match validator_db.prune_history(prune_before) {
+                        Ok(blocks_pruned) if blocks_pruned > 0 => {
+                            debug!(
+                                blocks_pruned = blocks_pruned,
+                                prune_before = prune_before,
+                                "Size-based prune completed"
+                            );
+                        }
+                        Ok(_) => break, // No more blocks to prune
+                        Err(e) => {
+                            warn!(error = %e, "Failed to prune during size-based pruning");
+                            break;
+                        }
+                    }
+                }
             }
         }
 
