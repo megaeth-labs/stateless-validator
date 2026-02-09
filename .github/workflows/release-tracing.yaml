@@ -1,0 +1,80 @@
+# This is a basic workflow to help you get started with Actions
+# this name should be the same with file name
+name: release-tracing
+
+# Controls when the workflow will run
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    tags:
+      - v*
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  compile:
+    # The type of runner that the job will run on
+    runs-on: ubuntu-24.04
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_GAO_CI }}
+      # check out chain-ops to get archive_pkg action
+      - uses: actions/checkout@v4
+        name: Checkout Chain Ops
+        with:
+          repository: megaeth-labs/chain-ops
+          token: ${{ secrets.PAT_GAO_CI }}
+          path: .chain-ops
+          sparse-checkout: .github/actions
+      - name: Configure Git Credentials
+        uses: ./.chain-ops/.github/actions/git_config
+        with:
+          github_pat: ${{ secrets.PAT_GAO_CI }}
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+
+      - name: Build
+        id: build_step
+        run: |
+          cargo build --release --bin debug-trace-server
+      - name: Generate Package Info
+        id: package_info
+        run: |
+          COMMIT_ID=$(git rev-parse HEAD)
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="latest"
+          fi
+          BINARY_PATH="$GITHUB_WORKSPACE/target/release/debug-trace-server"
+          echo "Binary path : $BINARY_PATH"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "binary_path=${BINARY_PATH}" >> $GITHUB_OUTPUT
+          echo "version=${COMMIT_ID}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+      # upload when tagging or trigger in web ui
+      - name: Archive Binary to GCP
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+        uses: ./.chain-ops/.github/actions/pkg_upload_gcp
+        with:
+          auth_key: ${{ secrets.GCP_AUTH_KEY }}
+          package: debug-trace-server
+          path: release/${{ steps.package_info.outputs.tag }}
+          version: ${{ steps.package_info.outputs.version }}
+          source_path: ${{ steps.package_info.outputs.binary_path }}
