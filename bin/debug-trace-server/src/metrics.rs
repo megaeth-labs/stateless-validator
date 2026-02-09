@@ -208,6 +208,10 @@ pub struct ChainSyncMetrics {
     db_read_duration_seconds: Histogram,
     /// Distance of requested block from chain tip
     block_distance_from_tip: Histogram,
+    /// Earliest block number in validator DB
+    db_earliest_block: Gauge,
+    /// Latest block number in validator DB
+    db_latest_block: Gauge,
 }
 
 impl ChainSyncMetrics {
@@ -237,6 +241,12 @@ impl ChainSyncMetrics {
     #[allow(dead_code)]
     pub fn record_block_distance(&self, distance: u64) {
         self.block_distance_from_tip.record(distance as f64);
+    }
+
+    /// Sets the earliest and latest block numbers in the validator DB.
+    pub fn set_db_block_range(&self, earliest: u64, latest: u64) {
+        self.db_earliest_block.set(earliest as f64);
+        self.db_latest_block.set(latest as f64);
     }
 }
 

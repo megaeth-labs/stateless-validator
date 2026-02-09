@@ -79,6 +79,8 @@ pub mod names {
     metric!(CONTRACT_CACHE_HITS, "contract_cache_hits_total");
     metric!(CONTRACT_CACHE_MISSES, "contract_cache_misses_total");
     metric!(BLOCKS_PRUNED, "blocks_pruned_total");
+    metric!(DB_EARLIEST_BLOCK, "db_earliest_block");
+    metric!(DB_LATEST_BLOCK, "db_latest_block");
 
     // Witness
     metric!(SALT_WITNESS_SIZE, "salt_witness_size_bytes");
@@ -133,6 +135,8 @@ fn register_metric_descriptions() {
     describe_counter!(names::CONTRACT_CACHE_HITS, "Contract cache hits");
     describe_counter!(names::CONTRACT_CACHE_MISSES, "Contract cache misses");
     describe_counter!(names::BLOCKS_PRUNED, "Blocks pruned from history");
+    describe_gauge!(names::DB_EARLIEST_BLOCK, "Earliest block number in validator DB");
+    describe_gauge!(names::DB_LATEST_BLOCK, "Latest block number in validator DB");
 
     // Witness
     describe_histogram!(names::SALT_WITNESS_SIZE, "Salt witness size (bytes)");
@@ -220,6 +224,11 @@ pub fn on_contract_cache_read(hits: u64, misses: u64) {
 
 pub fn on_blocks_pruned(count: u64) {
     counter!(names::BLOCKS_PRUNED).increment(count);
+}
+
+pub fn set_db_block_range(earliest: u64, latest: u64) {
+    gauge!(names::DB_EARLIEST_BLOCK).set(earliest as f64);
+    gauge!(names::DB_LATEST_BLOCK).set(latest as f64);
 }
 
 /// Record witness fetch metrics.

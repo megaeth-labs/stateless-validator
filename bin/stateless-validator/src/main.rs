@@ -351,6 +351,14 @@ async fn chain_sync(
             {
                 let remote_height = remote_tip.map(|(n, _)| n).unwrap_or(local_tip);
                 metrics::set_chain_heights(local_tip, remote_height);
+
+                let earliest = validator_db
+                    .get_earliest_local_block()
+                    .ok()
+                    .flatten()
+                    .map(|(n, _)| n)
+                    .unwrap_or(0);
+                metrics::set_db_block_range(earliest, local_tip);
             }
 
             Ok::<(), eyre::Error>(())
@@ -661,6 +669,11 @@ async fn history_pruner(
                 Err(e) => warn!("[Pruner] Failed to prune old block data: {e}"),
                 _ => {}
             }
+
+            // Update DB block range metrics
+            let earliest =
+                validator_db.get_earliest_local_block().ok().flatten().map(|(n, _)| n).unwrap_or(0);
+            metrics::set_db_block_range(earliest, current_tip);
         }
 
         tokio::time::sleep(config.pruner_interval).await;

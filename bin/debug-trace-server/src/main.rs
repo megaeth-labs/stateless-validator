@@ -305,12 +305,14 @@ async fn main() -> Result<()> {
 
         // Spawn history pruner to prevent unbounded database growth
         let db_path = PathBuf::from(args.data_dir.as_deref().unwrap()).join(VALIDATOR_DB_FILENAME);
+        let pruner_metrics = metrics::ChainSyncMetrics::create();
         task::spawn(history_pruner(
             Arc::clone(db),
             args.blocks_to_keep,
             args.pruner_interval_secs,
             args.db_max_size,
             db_path,
+            pruner_metrics,
         ));
     }
 
@@ -445,6 +447,7 @@ async fn history_pruner(
     interval_secs: u64,
     db_max_size: u64,
     db_path: PathBuf,
+    chain_sync_metrics: metrics::ChainSyncMetrics,
 ) -> Result<()> {
     let interval = std::time::Duration::from_secs(interval_secs);
     info!(
@@ -521,6 +524,11 @@ async fn history_pruner(
                     }
                 }
             }
+
+            // Update DB block range metrics
+            let earliest =
+                validator_db.get_earliest_local_block().ok().flatten().map(|(n, _)| n).unwrap_or(0);
+            chain_sync_metrics.set_db_block_range(earliest, current_tip);
         }
 
         tokio::time::sleep(interval).await;
