@@ -251,6 +251,7 @@ async fn main() -> Result<()> {
         &args.witness_endpoint,
         RpcClientConfig::trace_server(),
         args.cloudflare_witness_endpoint.as_deref(),
+        None,
     )?);
     let validator_db = init_validator_db(&args, &rpc_client).await?;
 
@@ -370,12 +371,12 @@ async fn init_validator_db(
 
     // No local tip - need to initialize anchor block
     // Use explicit start_block if provided, otherwise fetch latest
-    let block = if let Some(start_block_str) = &args.start_block {
+    let header = if let Some(start_block_str) = &args.start_block {
         debug!(start_block = %start_block_str, "Initializing from specified start block");
         let block_hash = parse_block_hash(start_block_str)?;
         loop {
-            match rpc_client.get_block(BlockId::Hash(block_hash.into()), false).await {
-                Ok(block) => break block,
+            match rpc_client.get_header(BlockId::Hash(block_hash.into()), false).await {
+                Ok(header) => break header,
                 Err(e) => {
                     warn!(
                         block_hash = %block_hash,
@@ -390,8 +391,8 @@ async fn init_validator_db(
         // Auto-initialize from latest block
         info!("No local tip found, fetching latest block as anchor");
         loop {
-            match rpc_client.get_block(BlockId::latest(), false).await {
-                Ok(block) => break block,
+            match rpc_client.get_header(BlockId::latest(), false).await {
+                Ok(header) => break header,
                 Err(e) => {
                     warn!(error = %e, "Failed to fetch latest block, retrying");
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -401,19 +402,18 @@ async fn init_validator_db(
     };
 
     db.reset_anchor_block(
-        block.header.number,
-        block.header.hash,
-        block.header.state_root,
-        block
-            .header
+        header.number,
+        header.hash,
+        header.state_root,
+        header
             .withdrawals_root
-            .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", block.header.hash))?,
+            .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", header.hash))?,
     )
     .map_err(|e| anyhow!("Failed to reset anchor: {}", e))?;
 
     info!(
-        block_hash = %block.header.hash,
-        block_number = block.header.number,
+        block_hash = %header.hash,
+        block_number = header.number,
         "Anchor block initialized"
     );
 

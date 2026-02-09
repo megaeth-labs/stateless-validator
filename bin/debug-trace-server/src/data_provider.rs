@@ -126,13 +126,10 @@ impl DataProvider {
             }
         }
 
-        // Fall back to RPC - fetch block to get hash, then delegate to get_block_data_by_hash
-        let block = self
-            .rpc_client
-            .get_block(BlockId::Number(BlockNumberOrTag::Number(block_num)), false)
-            .await?;
+        // Fall back to RPC - fetch header to get hash, then delegate to get_block_data_by_hash
+        let block_hash = self.rpc_client.get_block_hash(block_num).await?;
 
-        self.get_block_data_by_hash(block.header.hash).await
+        self.get_block_data_by_hash(block_hash).await
     }
 
     /// Gets block data by block hash with single-flight coalescing.
@@ -241,9 +238,9 @@ impl DataProvider {
             BlockNumberOrTag::Earliest => Ok(0),
             BlockNumberOrTag::Pending => Err(eyre::eyre!("Pending block not supported")),
             BlockNumberOrTag::Finalized | BlockNumberOrTag::Safe => {
-                // Fetch the block from upstream RPC to resolve the tag
-                let block = self.rpc_client.get_block(BlockId::Number(tag), false).await?;
-                Ok(block.header.number)
+                // Fetch the header from upstream RPC to resolve the tag
+                let header = self.rpc_client.get_header(BlockId::Number(tag), false).await?;
+                Ok(header.number)
             }
         }
     }
@@ -349,15 +346,16 @@ impl DataProvider {
     /// 4. Extract code hashes from witness and fetch contract bytecodes
     async fn do_fetch_block_data(&self, block_hash: B256) -> Result<BlockData> {
         let overall_start = std::time::Instant::now();
+        let upstream_header = UpstreamMetrics::new_for_method("eth_getHeaderByHash");
         let upstream_block = UpstreamMetrics::new_for_method("eth_getBlockByHash");
         let upstream_witness = UpstreamMetrics::new_for_method("mega_getWitness");
 
-        // Step 1: Fetch block without transactions first to get the number
+        // Step 1: Fetch header first to get the block number
         let start = std::time::Instant::now();
-        let header_block = self.rpc_client.get_block(BlockId::Hash(block_hash.into()), false).await;
-        upstream_block.record_request(header_block.is_ok(), start.elapsed().as_secs_f64());
-        let header_block = header_block?;
-        let block_number = header_block.header.number;
+        let header = self.rpc_client.get_header(BlockId::Hash(block_hash.into()), false).await;
+        upstream_header.record_request(header.is_ok(), start.elapsed().as_secs_f64());
+        let header = header?;
+        let block_number = header.number;
         let fetch_header_ms = start.elapsed().as_millis();
 
         // Step 2: Fetch witness and full block in parallel
@@ -365,7 +363,7 @@ impl DataProvider {
         let full_block_start = std::time::Instant::now();
 
         let (witness_result, full_block_result) = tokio::join!(
-            self.fetch_witness_with_fallback(block_number, header_block.header.hash),
+            self.fetch_witness_with_fallback(block_number, header.hash),
             self.rpc_client.get_block(BlockId::Hash(block_hash.into()), true),
         );
 

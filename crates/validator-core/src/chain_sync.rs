@@ -144,18 +144,18 @@ pub async fn fetch_blocks_batch(
                 "Local data is too stale, resetting to latest block"
             );
 
-            // Fetch latest block and reset anchor
-            let latest_block = client.get_block(BlockId::latest(), false).await?;
+            // Fetch latest block header and reset anchor
+            let latest_header = client.get_header(BlockId::latest(), false).await?;
             db.reset_anchor_block(
-                latest_block.header.number,
-                latest_block.header.hash,
-                latest_block.header.state_root,
-                latest_block.header.withdrawals_root.unwrap_or_default(),
+                latest_header.number,
+                latest_header.hash,
+                latest_header.state_root,
+                latest_header.withdrawals_root.unwrap_or_default(),
             )?;
 
             info!(
-                new_anchor = latest_block.header.number,
-                block_hash = %latest_block.header.hash,
+                new_anchor = latest_header.number,
+                block_hash = %latest_header.hash,
                 "Reset to latest block due to stale data"
             );
 
@@ -291,9 +291,9 @@ pub async fn fetch_blocks_batch(
         future::join_all((start_block..start_block + blocks_to_fetch).map(|block_number| {
             let client = client.clone();
             async move {
-                let block = client.get_block(BlockId::Number(block_number.into()), false).await?;
+                let block_hash = client.get_block_hash(block_number).await?;
                 let (salt_witness, mpt_witness) =
-                    client.get_witness(block.header.number, block.header.hash).await?;
+                    client.get_witness(block_number, block_hash).await?;
                 let block = client.get_block(BlockId::Number(block_number.into()), true).await?;
 
                 Ok::<(Block<Transaction>, SaltWitness, MptWitness), eyre::Error>((

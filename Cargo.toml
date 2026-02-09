@@ -39,6 +39,7 @@ alloy-serde = { version = "1.0.23", default-features = false }
 alloy-trie = { version = "0.9.0", default-features = false }
 
 # misc
+base64 = "0.22"
 bincode = { version = "2.0", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 dyn-clone = "1.0"
@@ -78,6 +79,7 @@ tokio = { version = "1.46", features = ["rt-multi-thread", "signal"] }
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "=0.3.20", features = ["fmt", "env-filter", "json"] }
+zstd = "0.13"
 
 [profile.release]
 opt-level = 3

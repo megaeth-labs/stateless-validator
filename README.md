@@ -43,7 +43,7 @@ cargo run --bin stateless-validator -- \
   --witness-endpoint <witness-rpc-endpoint> \
   --genesis-file /path/to/genesis.json \
   --start-block <trusted-block-hash> \
-  --report-validation-results \
+  --report-validation-endpoint <report-rpc-endpoint> \
   --metrics-enabled \
   --metrics-port 9090
 ```
@@ -56,7 +56,7 @@ cargo run --bin stateless-validator -- \
 **Optional Arguments:**
 - `--genesis-file`: Path to genesis JSON file containing hardfork activation configuration (required on first run, stored in database for subsequent runs)
 - `--start-block`: Trusted block hash to initialize validation from (required for first-time setup)
-- `--report-validation-results`: Enable reporting of validated blocks to the upstream node (disabled by default)
+- `--report-validation-endpoint`: RPC endpoint URL for reporting validated blocks via `mega_setValidatedBlocks` (disabled if not provided)
 - `--metrics-enabled`: Enable Prometheus metrics endpoint (disabled by default)
 - `--metrics-port`: Port for Prometheus metrics HTTP endpoint (default: 9090)
 
@@ -69,7 +69,7 @@ Each command-line flag has an equivalent environment variable, which allows you 
 - `STATELESS_VALIDATOR_WITNESS_ENDPOINT` → `--witness-endpoint`
 - `STATELESS_VALIDATOR_GENESIS_FILE` → `--genesis-file`
 - `STATELESS_VALIDATOR_START_BLOCK` → `--start-block`
-- `STATELESS_VALIDATOR_REPORT_VALIDATION_RESULTS` → `--report-validation-results` (set to `true` to enable)
+- `STATELESS_VALIDATOR_REPORT_VALIDATION_ENDPOINT` → `--report-validation-endpoint`
 - `STATELESS_VALIDATOR_METRICS_ENABLED` → `--metrics-enabled` (set to `true` to enable)
 - `STATELESS_VALIDATOR_METRICS_PORT` → `--metrics-port`
 
@@ -88,7 +88,7 @@ export STATELESS_VALIDATOR_RPC_ENDPOINT=<public-rpc-endpoint>
 export STATELESS_VALIDATOR_WITNESS_ENDPOINT=<witness-rpc-endpoint>
 export STATELESS_VALIDATOR_GENESIS_FILE=/path/to/genesis.json
 export STATELESS_VALIDATOR_START_BLOCK=<trusted-block-hash>
-export STATELESS_VALIDATOR_REPORT_VALIDATION_RESULTS=false
+export STATELESS_VALIDATOR_REPORT_VALIDATION_ENDPOINT=<report-rpc-endpoint>
 export STATELESS_VALIDATOR_LOG_FILE_DIRECTORY=/path/to/log_dir
 export STATELESS_VALIDATOR_LOG_FILE_FILTER=debug
 export STATELESS_VALIDATOR_LOG_STDOUT_FILTER=info

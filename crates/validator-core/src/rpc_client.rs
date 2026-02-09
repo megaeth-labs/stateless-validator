@@ -7,6 +7,7 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 use alloy_primitives::{B256, Bytes, U64};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag, Header};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use eyre::{Context, Result, ensure, eyre};
 use futures::future;
 use op_alloy_network::Optimism;
@@ -38,6 +39,8 @@ pub enum RpcMethod {
     EthGetBlockByNumber,
     /// eth_blockNumber
     EthBlockNumber,
+    /// eth_getHeaderByNumber / eth_getHeaderByHash
+    EthGetHeader,
     /// mega_getBlockWitness
     MegaGetBlockWitness,
     /// mega_setValidatedBlocks
@@ -50,6 +53,7 @@ impl RpcMethod {
         match self {
             RpcMethod::EthGetCodeByHash => "eth_getCodeByHash",
             RpcMethod::EthGetBlockByNumber => "eth_getBlockByNumber",
+            RpcMethod::EthGetHeader => "eth_getHeader",
             RpcMethod::EthBlockNumber => "eth_blockNumber",
             RpcMethod::MegaGetBlockWitness => "mega_getBlockWitness",
             RpcMethod::MegaSetValidatedBlocks => "mega_setValidatedBlocks",
@@ -142,6 +146,8 @@ pub struct RpcClient {
     pub witness_provider: RootProvider,
     /// Optional Cloudflare witness provider for pruned/archived blocks.
     cloudflare_witness_provider: Option<RootProvider>,
+    /// Optional dedicated provider for reporting validated blocks.
+    report_provider: Option<RootProvider<Optimism>>,
     /// Configuration controlling verification behavior
     config: RpcClientConfig,
 }
@@ -153,7 +159,7 @@ impl RpcClient {
     /// * `data_api` - HTTP URL of the standard JSON-RPC endpoint for blocks and contract data
     /// * `witness_api` - HTTP URL of the witness RPC endpoint for SALT witness data
     pub fn new(data_api: &str, witness_api: &str) -> Result<Self> {
-        Self::new_with_config(data_api, witness_api, RpcClientConfig::default(), None)
+        Self::new_with_config(data_api, witness_api, RpcClientConfig::default(), None, None)
     }
 
     /// Creates a new RPC client with custom configuration.
@@ -163,11 +169,13 @@ impl RpcClient {
     /// * `witness_api` - HTTP URL of the witness RPC endpoint for SALT witness data
     /// * `config` - Configuration controlling verification and transport behavior
     /// * `cloudflare_witness_api` - Optional HTTP URL of the Cloudflare witness endpoint
+    /// * `report_api` - Optional HTTP URL of the endpoint for reporting validated blocks
     pub fn new_with_config(
         data_api: &str,
         witness_api: &str,
         config: RpcClientConfig,
         cloudflare_witness_api: Option<&str>,
+        report_api: Option<&str>,
     ) -> Result<Self> {
         let cloudflare_witness_provider = cloudflare_witness_api
             .map(|url| -> Result<RootProvider> {
@@ -177,12 +185,20 @@ impl RpcClient {
             })
             .transpose()?;
 
+        let report_provider = report_api
+            .map(|url| -> Result<RootProvider<Optimism>> {
+                Ok(ProviderBuilder::<_, _, Optimism>::default()
+                    .connect_http(url.parse().context("Failed to parse report API URL")?))
+            })
+            .transpose()?;
+
         Ok(Self {
             data_provider: ProviderBuilder::<_, _, Optimism>::default()
                 .connect_http(data_api.parse().context("Failed to parse API URL")?),
             witness_provider: ProviderBuilder::default()
                 .connect_http(witness_api.parse().context("Failed to parse API URL")?),
             cloudflare_witness_provider,
+            report_provider,
             config,
         })
     }
@@ -293,22 +309,87 @@ impl RpcClient {
         result
     }
 
+    /// Gets the block header by block ID.
+    ///
+    /// Uses `eth_getHeaderByNumber` / `eth_getHeaderByHash` instead of `eth_getBlockByNumber`
+    /// to avoid transferring the transaction hash list. Even without full transaction objects,
+    /// `eth_getBlockByNumber` still returns all transaction hashes, which is significant
+    /// at high TPS.
+    ///
+    /// When `verify_hash` is true, computes `hash_slow()` to verify the header hash matches
+    /// the RPC-provided hash. This is important when initializing from a trusted start block
+    /// hash, but can be skipped when the header will be verified downstream (e.g., via
+    /// `verify_block_integrity`) or when running in a trusted context like the trace server.
+    pub async fn get_header(&self, block_id: BlockId, verify_hash: bool) -> Result<Header> {
+        let start = Instant::now();
+        let result = match block_id {
+            BlockId::Hash(hash) => self
+                .data_provider
+                .client()
+                .request::<_, Header>("eth_getHeaderByHash", (hash.block_hash,))
+                .await
+                .map_err(|e| eyre!("eth_getHeaderByHash for {} failed: {e}", hash.block_hash)),
+            BlockId::Number(tag) => self
+                .data_provider
+                .client()
+                .request::<_, Header>("eth_getHeaderByNumber", (tag,))
+                .await
+                .map_err(|e| eyre!("eth_getHeaderByNumber for {:?} failed: {e}", tag)),
+        };
+        self.record_rpc(
+            RpcMethod::EthGetHeader,
+            result.is_ok(),
+            Some(start.elapsed().as_secs_f64()),
+        );
+        let header = result?;
+
+        // Verify block_id matches the returned header
+        match block_id {
+            BlockId::Number(BlockNumberOrTag::Number(num)) => {
+                ensure!(
+                    header.number == num,
+                    "Header number mismatch: requested {}, got {}",
+                    num,
+                    header.number
+                );
+            }
+            BlockId::Hash(hash) => {
+                ensure!(
+                    header.hash == hash.block_hash,
+                    "Header hash mismatch: requested {:?}, got {:?}",
+                    hash.block_hash,
+                    header.hash
+                );
+            }
+            _ => {}
+        }
+
+        if verify_hash {
+            // Verify header hash matches the computed hash
+            ensure!(
+                header.hash_slow() == header.hash,
+                "Header hash mismatch: expected {:?}, computed {:?}",
+                header.hash,
+                header.hash_slow()
+            );
+        }
+
+        Ok(header)
+    }
+
     /// Gets just the block hash for a block number.
     ///
-    /// Uses `eth_getHeaderByNumber` which is more efficient than fetching the full block
-    /// when only the hash is needed (e.g., for divergence checking).
+    /// Uses `eth_getHeaderByNumber` to avoid transferring the large transaction hash list
+    /// that `eth_getBlockByNumber` would include (e.g., for divergence checking).
     pub async fn get_block_hash(&self, block_number: u64) -> Result<B256> {
-        let header: Header = self
-            .data_provider
-            .client()
-            .request("eth_getHeaderByNumber", (BlockNumberOrTag::Number(block_number),))
+        self.get_header(BlockId::Number(BlockNumberOrTag::Number(block_number)), false)
             .await
             .map_err(|e| {
                 let err = eyre!("eth_getHeaderByNumber for block {} failed: {e}", block_number);
                 trace!(block_number, error = %e, "eth_getHeaderByNumber failed");
                 err
-            })?;
-        Ok(header.hash)
+            })
+            .map(|h| h.hash)
     }
 
     /// Gets execution witness data for a specific block.
@@ -366,6 +447,9 @@ impl RpcClient {
     ///
     /// Single attempt, no retry (it's a KV lookup, either it exists or it doesn't).
     /// Returns error if Cloudflare provider is not configured.
+    ///
+    /// The Cloudflare KV endpoint returns a `"v0:<base64_encoded_data>"` string.
+    /// The base64 payload is zstd-compressed, bincode-serialized `(SaltWitness, MptWitness)`.
     pub async fn get_witness_from_cloudflare(
         &self,
         number: u64,
@@ -378,7 +462,7 @@ impl RpcClient {
 
         let start = Instant::now();
         let keys = WitnessRequestKeys { block_number: U64::from(number), block_hash: hash };
-        let result: Result<(SaltWitness, MptWitness)> = provider
+        let result: Result<String> = provider
             .client()
             .request("mega_getBlockWitness", (keys,))
             .await
@@ -394,17 +478,38 @@ impl RpcClient {
             trace!(block_number = number, %hash, error = %e, "Cloudflare worker mega_getBlockWitness failed");
         }
 
-        result
+        let encoded = result?;
+
+        let decode_start = Instant::now();
+        let (salt_witness, mpt_witness) =
+            tokio::task::spawn_blocking(move || -> Result<(SaltWitness, MptWitness)> {
+                let b64_data = encoded
+                    .strip_prefix("v0:")
+                    .ok_or_else(|| eyre!("Cloudflare witness missing 'v0:' prefix"))?;
+                let compressed = BASE64.decode(b64_data).context("base64 decode failed")?;
+                let decompressed =
+                    zstd::decode_all(compressed.as_slice()).context("zstd decompress failed")?;
+                let (witness, _): ((SaltWitness, MptWitness), _) =
+                    bincode::serde::decode_from_slice(&decompressed, bincode::config::legacy())
+                        .context("bincode deserialize failed")?;
+                Ok(witness)
+            })
+            .await
+            .context("decode task panicked")??;
+        trace!(block_number = number, %hash, decode_ms = decode_start.elapsed().as_millis(), "Cloudflare witness decoded");
+
+        Ok((salt_witness, mpt_witness))
     }
 
-    /// Reports a range of validated blocks to the upstream node.
+    /// Reports a range of validated blocks via the dedicated report endpoint.
     pub async fn set_validated_blocks(
         &self,
         first_block: (u64, B256),
         last_block: (u64, B256),
     ) -> Result<SetValidatedBlocksResponse> {
-        let result = self
-            .data_provider
+        let provider =
+            self.report_provider.as_ref().ok_or_else(|| eyre!("Report provider not configured"))?;
+        let result = provider
             .client()
             .request("mega_setValidatedBlocks", (first_block, last_block))
             .await
@@ -528,6 +633,7 @@ mod tests {
             "http://localhost:8546",
             RpcClientConfig::default(),
             Some("http://localhost:9546"),
+            None,
         );
         assert!(result.is_ok());
         let client = result.unwrap();
@@ -541,6 +647,7 @@ mod tests {
             "http://localhost:8546",
             RpcClientConfig::default(),
             Some("not a url"),
+            None,
         );
         assert!(result.is_err());
     }
@@ -552,6 +659,7 @@ mod tests {
             "http://localhost:8546",
             RpcClientConfig::validator(),
             None,
+            None,
         )
         .unwrap();
         assert!(!client.skip_block_verification());
@@ -560,6 +668,7 @@ mod tests {
             "http://localhost:8545",
             "http://localhost:8546",
             RpcClientConfig::trace_server(),
+            None,
             None,
         )
         .unwrap();

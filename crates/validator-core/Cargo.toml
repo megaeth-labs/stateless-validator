@@ -27,6 +27,7 @@ alloy-serde.workspace = true
 alloy-trie.workspace = true
 
 # misc
+base64.workspace = true
 bincode.workspace = true
 dyn-clone.workspace = true
 eyre.workspace = true
@@ -58,6 +59,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zstd.workspace = true
 
 [features]
 test-bucket-resize = ["salt/test-bucket-resize"]
