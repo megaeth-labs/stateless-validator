@@ -192,10 +192,20 @@ impl RpcContext {
     }
 
     /// Creates the merged RPC module containing all methods.
+    ///
+    /// Also registers `timed_` prefixed aliases for every method, so that
+    /// e.g. `timed_debug_traceBlockByNumber` routes to the same handler as
+    /// `debug_traceBlockByNumber`.
     pub fn into_rpc_module(self) -> eyre::Result<jsonrpsee::server::RpcModule<()>> {
         let mut module = jsonrpsee::server::RpcModule::new(());
         module.merge(DebugTraceRpcServer::into_rpc(self.clone()))?;
         module.merge(TraceRpcServer::into_rpc(self))?;
+
+        // Register timed_ aliases for all methods
+        for &(alias, existing) in metrics::TIMED_METHOD_ALIASES {
+            module.register_alias(alias, existing)?;
+        }
+
         Ok(module)
     }
 }
@@ -744,5 +754,61 @@ mod tests {
     #[test]
     fn test_slow_request_threshold() {
         assert_eq!(SLOW_REQUEST_THRESHOLD.as_secs(), 5);
+    }
+
+    #[test]
+    fn test_timed_alias_registration() {
+        // Create a module and register dummy methods matching the real method names,
+        // then register timed_ aliases the same way into_rpc_module does.
+        let mut module = jsonrpsee::server::RpcModule::new(());
+
+        // Register dummy methods for all known RPC methods
+        let methods = [
+            metrics::METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+            metrics::METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
+            metrics::METHOD_DEBUG_TRACE_TRANSACTION,
+            metrics::METHOD_DEBUG_GET_CACHE_STATUS,
+            metrics::METHOD_TRACE_BLOCK,
+            metrics::METHOD_TRACE_TRANSACTION,
+        ];
+        for method in methods {
+            module
+                .register_method(method, |_, _, _| serde_json::Value::Null)
+                .expect("failed to register method");
+        }
+
+        // Register timed_ aliases
+        for &(alias, existing) in metrics::TIMED_METHOD_ALIASES {
+            module.register_alias(alias, existing).expect("failed to register alias");
+        }
+
+        let names: Vec<&str> = module.method_names().collect();
+
+        // Verify all original methods are present
+        for method in methods {
+            assert!(names.contains(&method), "Missing original method: {}", method);
+        }
+
+        // Verify all timed_ aliases are present
+        for &(alias, _) in metrics::TIMED_METHOD_ALIASES {
+            assert!(names.contains(&alias), "Missing timed alias: {}", alias);
+        }
+    }
+
+    #[test]
+    fn test_timed_alias_duplicate_rejected() {
+        // Registering the same alias twice should fail
+        let mut module = jsonrpsee::server::RpcModule::new(());
+        module
+            .register_method(metrics::METHOD_TRACE_BLOCK, |_, _, _| serde_json::Value::Null)
+            .unwrap();
+        module
+            .register_alias(metrics::TIMED_METHOD_TRACE_BLOCK, metrics::METHOD_TRACE_BLOCK)
+            .unwrap();
+
+        // Second registration of the same alias should error
+        let result =
+            module.register_alias(metrics::TIMED_METHOD_TRACE_BLOCK, metrics::METHOD_TRACE_BLOCK);
+        assert!(result.is_err(), "Duplicate alias registration should fail");
     }
 }

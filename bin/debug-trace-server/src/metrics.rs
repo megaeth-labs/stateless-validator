@@ -19,16 +19,44 @@ pub const DEFAULT_METRICS_PORT: u16 = 9090;
 // RPC Method Name Constants
 // ---------------------------------------------------------------------------
 
+/// Prefix for timed RPC method aliases.
+pub const TIMED_PREFIX: &str = "timed_";
+
 /// RPC method name for debug_traceBlockByNumber.
 pub const METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER: &str = "debug_traceBlockByNumber";
 /// RPC method name for debug_traceBlockByHash.
 pub const METHOD_DEBUG_TRACE_BLOCK_BY_HASH: &str = "debug_traceBlockByHash";
 /// RPC method name for debug_traceTransaction.
 pub const METHOD_DEBUG_TRACE_TRANSACTION: &str = "debug_traceTransaction";
+/// RPC method name for debug_getCacheStatus.
+pub const METHOD_DEBUG_GET_CACHE_STATUS: &str = "debug_getCacheStatus";
 /// RPC method name for trace_block.
 pub const METHOD_TRACE_BLOCK: &str = "trace_block";
 /// RPC method name for trace_transaction.
 pub const METHOD_TRACE_TRANSACTION: &str = "trace_transaction";
+
+/// Timed alias for debug_traceBlockByNumber.
+pub const TIMED_METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER: &str = "timed_debug_traceBlockByNumber";
+/// Timed alias for debug_traceBlockByHash.
+pub const TIMED_METHOD_DEBUG_TRACE_BLOCK_BY_HASH: &str = "timed_debug_traceBlockByHash";
+/// Timed alias for debug_traceTransaction.
+pub const TIMED_METHOD_DEBUG_TRACE_TRANSACTION: &str = "timed_debug_traceTransaction";
+/// Timed alias for debug_getCacheStatus.
+pub const TIMED_METHOD_DEBUG_GET_CACHE_STATUS: &str = "timed_debug_getCacheStatus";
+/// Timed alias for trace_block.
+pub const TIMED_METHOD_TRACE_BLOCK: &str = "timed_trace_block";
+/// Timed alias for trace_transaction.
+pub const TIMED_METHOD_TRACE_TRANSACTION: &str = "timed_trace_transaction";
+
+/// All (timed_alias, original_method) pairs for registering aliases.
+pub const TIMED_METHOD_ALIASES: &[(&str, &str)] = &[
+    (TIMED_METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER),
+    (TIMED_METHOD_DEBUG_TRACE_BLOCK_BY_HASH, METHOD_DEBUG_TRACE_BLOCK_BY_HASH),
+    (TIMED_METHOD_DEBUG_TRACE_TRANSACTION, METHOD_DEBUG_TRACE_TRANSACTION),
+    (TIMED_METHOD_DEBUG_GET_CACHE_STATUS, METHOD_DEBUG_GET_CACHE_STATUS),
+    (TIMED_METHOD_TRACE_BLOCK, METHOD_TRACE_BLOCK),
+    (TIMED_METHOD_TRACE_TRANSACTION, METHOD_TRACE_TRANSACTION),
+];
 
 // ---------------------------------------------------------------------------
 // Cache Type Constants
@@ -320,11 +348,18 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
 // Backward-compatible helper functions
 // ---------------------------------------------------------------------------
 
+/// Strips the `timed_` prefix from a method name if present.
+/// Returns the original method name (without prefix) for metrics recording.
+pub fn strip_timed_prefix(method: &str) -> &str {
+    method.strip_prefix(TIMED_PREFIX).unwrap_or(method)
+}
+
 /// Records a successful RPC request (backward-compatible helper).
 ///
-/// Uses pre-defined method metrics to avoid hardcoded strings at call sites.
+/// Handles both original and `timed_`-prefixed method names by stripping the
+/// prefix before recording metrics, so timed variants share the same counters.
 pub fn record_rpc_request(method: &str, duration_secs: f64) {
-    // Match known methods to use pre-instantiated metrics (same instance = same metric)
+    let method = strip_timed_prefix(method);
     match method {
         METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER => {
             RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER)
@@ -345,15 +380,16 @@ pub fn record_rpc_request(method: &str, duration_secs: f64) {
             RpcMethodMetrics::new_for_method(METHOD_TRACE_TRANSACTION).record_request(duration_secs)
         }
         _ => {
-            // Unknown method - this shouldn't happen with current code
-            // Log warning but don't panic
             tracing::warn!(method = method, "Unknown RPC method in metrics");
         }
     }
 }
 
 /// Records an RPC error for a specific method (backward-compatible helper).
+///
+/// Handles both original and `timed_`-prefixed method names.
 pub fn record_rpc_error(method: &str) {
+    let method = strip_timed_prefix(method);
     match method {
         METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER => {
             RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER).record_error()
@@ -369,5 +405,91 @@ pub fn record_rpc_error(method: &str) {
             RpcMethodMetrics::new_for_method(METHOD_TRACE_TRANSACTION).record_error()
         }
         _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_timed_prefix_with_prefix() {
+        assert_eq!(
+            strip_timed_prefix("timed_debug_traceBlockByNumber"),
+            "debug_traceBlockByNumber"
+        );
+        assert_eq!(strip_timed_prefix("timed_trace_block"), "trace_block");
+        assert_eq!(strip_timed_prefix("timed_trace_transaction"), "trace_transaction");
+    }
+
+    #[test]
+    fn test_strip_timed_prefix_without_prefix() {
+        assert_eq!(strip_timed_prefix("debug_traceBlockByNumber"), "debug_traceBlockByNumber");
+        assert_eq!(strip_timed_prefix("trace_block"), "trace_block");
+        assert_eq!(strip_timed_prefix("unknown_method"), "unknown_method");
+    }
+
+    #[test]
+    fn test_strip_timed_prefix_edge_cases() {
+        assert_eq!(strip_timed_prefix("timed_"), "");
+        assert_eq!(strip_timed_prefix(""), "");
+        assert_eq!(
+            strip_timed_prefix("TIMED_debug_traceBlockByNumber"),
+            "TIMED_debug_traceBlockByNumber"
+        );
+        // Only strips once
+        assert_eq!(strip_timed_prefix("timed_timed_trace_block"), "timed_trace_block");
+    }
+
+    #[test]
+    fn test_timed_aliases_consistency() {
+        // Every alias must start with the TIMED_PREFIX
+        for &(alias, _original) in TIMED_METHOD_ALIASES {
+            assert!(
+                alias.starts_with(TIMED_PREFIX),
+                "Alias '{}' does not start with '{}'",
+                alias,
+                TIMED_PREFIX
+            );
+        }
+    }
+
+    #[test]
+    fn test_timed_aliases_match_originals() {
+        // Stripping the prefix from each alias must yield the original method name
+        for &(alias, original) in TIMED_METHOD_ALIASES {
+            assert_eq!(
+                strip_timed_prefix(alias),
+                original,
+                "Alias '{}' does not map back to '{}'",
+                alias,
+                original
+            );
+        }
+    }
+
+    #[test]
+    fn test_timed_aliases_cover_all_methods() {
+        let all_methods = [
+            METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+            METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
+            METHOD_DEBUG_TRACE_TRANSACTION,
+            METHOD_DEBUG_GET_CACHE_STATUS,
+            METHOD_TRACE_BLOCK,
+            METHOD_TRACE_TRANSACTION,
+        ];
+        let aliased_originals: Vec<&str> =
+            TIMED_METHOD_ALIASES.iter().map(|&(_, orig)| orig).collect();
+        for method in all_methods {
+            assert!(
+                aliased_originals.contains(&method),
+                "Method '{}' has no timed_ alias in TIMED_METHOD_ALIASES",
+                method
+            );
+        }
     }
 }
