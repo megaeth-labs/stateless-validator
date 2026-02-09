@@ -20,6 +20,7 @@ dashmap = "5.5"
 # Error handling
 eyre.workspace = true
 http.workspace = true
+http-body.workspace = true
 # RPC framework
 jsonrpsee = { version = "0.24", features = ["server", "macros"] }
 libc = "0.2"
@@ -51,6 +52,8 @@ validator-core = { path = "../../crates/validator-core" }
 alloy-consensus.workspace = true
 alloy-network = "1.0.23"
 alloy-primitives.workspace = true
+bytes = "1"
+http-body-util = "0.1"
 
 # Transaction signing for integration tests
 alloy-signer-local = "1.0.23"

@@ -68,6 +68,7 @@ reth-trie-sparse = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0"
 
 # revm
 http = "1"
+http-body = "1"
 revm = { version = "27.1.0", default-features = false }
 revm-inspectors = { version = "0.27.1", features = ["std", "js-tracer"] }
 rustc-hash = "2.0"

@@ -59,6 +59,7 @@ use validator_core::{
 mod data_provider;
 mod metrics;
 mod response_cache;
+mod response_size;
 mod rpc_service;
 mod timing;
 
@@ -341,7 +342,11 @@ async fn main() -> Result<()> {
     // Start server
     let server = Server::builder()
         .max_response_body_size(u32::MAX)
-        .set_http_middleware(tower::ServiceBuilder::new().layer(timing::TimingHeaderLayer))
+        .set_http_middleware(
+            tower::ServiceBuilder::new()
+                .layer(response_size::ResponseSizeLayer)
+                .layer(timing::TimingHeaderLayer),
+        )
         .build(&args.addr)
         .await?;
     let addr = server.local_addr()?;
