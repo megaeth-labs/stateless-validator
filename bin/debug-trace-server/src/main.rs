@@ -287,6 +287,7 @@ async fn main() -> Result<()> {
         // Clone response_cache for the callback
         let cache_for_reorg = response_cache.clone();
         let chain_sync_metrics = metrics::ChainSyncMetrics::create();
+        let fetch_metrics = metrics::ChainSyncMetrics::create();
         task::spawn(remote_chain_tracker(
             Arc::clone(&rpc_client),
             Arc::clone(db),
@@ -299,6 +300,11 @@ async fn main() -> Result<()> {
                     );
                     chain_sync_metrics.record_reorg(reverted_hashes.len() as u64);
                     cache_for_reorg.invalidate_blocks(reverted_hashes);
+                }
+            }),
+            Some(move |result: &validator_core::FetchResult| {
+                if let Some(height) = result.remote_chain_height {
+                    fetch_metrics.set_remote_height(height);
                 }
             }),
         ));
