@@ -37,12 +37,10 @@ serde.workspace = true
 
 # Serialization
 serde_json.workspace = true
-
-# Async runtime
-tokio = { workspace = true, features = ["sync"] }
 http.workspace = true
 libc = "0.2"
 pin-project-lite = "0.2"
+tokio = { workspace = true, features = ["sync"] }
 tower = "0.4"
 
 # Logging and metrics
