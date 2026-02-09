@@ -17,7 +17,7 @@ use stateless_common::logging::{LogArgs, migrate_legacy_env_vars};
 use tokio::{signal, task};
 use tracing::{debug, error, info, warn};
 use validator_core::{
-    ChainSyncConfig, RpcClient, RpcClientConfig, ValidatorDB,
+    ChainSyncConfig, FetchResult, RpcClient, RpcClientConfig, ValidatorDB,
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
     executor::{ValidationResult, validate_block},
@@ -289,6 +289,7 @@ async fn chain_sync(
         Arc::clone(&validator_db),
         Arc::clone(&config),
         Some(metrics::on_chain_reorg),
+        None::<fn(&FetchResult)>,
     ));
 
     // Step 3: Spawn validation reporter (optional, based on config)

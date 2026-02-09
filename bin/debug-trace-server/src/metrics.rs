@@ -68,7 +68,6 @@ impl RpcMethodMetrics {
     }
 
     /// Records an RPC error.
-    #[allow(dead_code)]
     pub fn record_error(&self) {
         self.rpc_errors_total.increment(1);
     }
@@ -226,19 +225,16 @@ impl ChainSyncMetrics {
     }
 
     /// Sets the remote chain height.
-    #[allow(dead_code)]
     pub fn set_remote_height(&self, height: u64) {
         self.remote_chain_height.set(height as f64);
     }
 
     /// Records a DB read duration.
-    #[allow(dead_code)]
     pub fn record_db_read(&self, duration_secs: f64) {
         self.db_read_duration_seconds.record(duration_secs);
     }
 
     /// Records block distance from tip.
-    #[allow(dead_code)]
     pub fn record_block_distance(&self, distance: u64) {
         self.block_distance_from_tip.record(distance as f64);
     }
@@ -353,5 +349,25 @@ pub fn record_rpc_request(method: &str, duration_secs: f64) {
             // Log warning but don't panic
             tracing::warn!(method = method, "Unknown RPC method in metrics");
         }
+    }
+}
+
+/// Records an RPC error for a specific method (backward-compatible helper).
+pub fn record_rpc_error(method: &str) {
+    match method {
+        METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER => {
+            RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER).record_error()
+        }
+        METHOD_DEBUG_TRACE_BLOCK_BY_HASH => {
+            RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_HASH).record_error()
+        }
+        METHOD_DEBUG_TRACE_TRANSACTION => {
+            RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION).record_error()
+        }
+        METHOD_TRACE_BLOCK => RpcMethodMetrics::new_for_method(METHOD_TRACE_BLOCK).record_error(),
+        METHOD_TRACE_TRANSACTION => {
+            RpcMethodMetrics::new_for_method(METHOD_TRACE_TRANSACTION).record_error()
+        }
+        _ => {}
     }
 }

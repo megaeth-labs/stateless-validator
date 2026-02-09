@@ -89,6 +89,8 @@ pub struct FetchResult {
     pub had_error: bool,
     /// Block hashes that were reverted due to reorg (empty if no reorg).
     pub reverted_hashes: Vec<B256>,
+    /// Latest block number on the remote chain (if fetched).
+    pub remote_chain_height: Option<u64>,
 }
 
 /// Fetches a batch of blocks from RPC and stores them in the database.
@@ -164,6 +166,7 @@ pub async fn fetch_blocks_batch(
                 should_wait: false,
                 had_error: false,
                 reverted_hashes: Vec::new(),
+                remote_chain_height: Some(chain_latest),
             });
         }
     }
@@ -203,6 +206,7 @@ pub async fn fetch_blocks_batch(
                         should_wait: false,
                         had_error: false,
                         reverted_hashes,
+                        remote_chain_height: None,
                     });
                 }
                 Err(e) => {
@@ -241,6 +245,7 @@ pub async fn fetch_blocks_batch(
             should_wait: true,
             had_error: false,
             reverted_hashes: Vec::new(),
+            remote_chain_height: None,
         });
     }
 
@@ -271,6 +276,7 @@ pub async fn fetch_blocks_batch(
             should_wait: true,
             had_error: false,
             reverted_hashes: Vec::new(),
+            remote_chain_height: Some(chain_latest),
         });
     }
 
@@ -410,6 +416,7 @@ pub async fn fetch_blocks_batch(
         should_wait: false,
         had_error,
         reverted_hashes: Vec::new(),
+        remote_chain_height: Some(chain_latest),
     })
 }
 
@@ -425,17 +432,20 @@ pub async fn fetch_blocks_batch(
 /// * `config` - Configuration for tracker behavior
 /// * `on_reorg` - Optional callback invoked when a chain reorg is detected, receives reverted block
 ///   hashes
+/// * `on_fetch` - Optional callback invoked after each successful fetch batch with the result
 ///
 /// # Returns
 /// * Never returns under normal operation - runs indefinitely until externally terminated
-pub async fn remote_chain_tracker<F>(
+pub async fn remote_chain_tracker<F, G>(
     client: Arc<RpcClient>,
     db: Arc<ValidatorDB>,
     config: Arc<ChainSyncConfig>,
     on_reorg: Option<F>,
+    on_fetch: Option<G>,
 ) -> Result<()>
 where
     F: Fn(&[B256]) + Send + Sync,
+    G: Fn(&FetchResult) + Send + Sync,
 {
     info!(lookahead_blocks = config.tracker_lookahead_blocks, "Starting remote chain tracker");
 
@@ -450,6 +460,11 @@ where
                     let Some(ref callback) = on_reorg
                 {
                     callback(&result.reverted_hashes);
+                }
+
+                // Call fetch callback with the result
+                if let Some(ref callback) = on_fetch {
+                    callback(&result);
                 }
 
                 if result.had_error {

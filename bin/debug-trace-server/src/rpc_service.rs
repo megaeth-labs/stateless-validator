@@ -417,11 +417,11 @@ impl DebugTraceRpcServer for RpcContext {
 
         // Stage 1: Resolve block number
         let t0 = Instant::now();
-        let block_num = self
-            .data_provider
-            .resolve_block_number(block_number)
-            .await
-            .map_err(|e| rpc_err(format!("Failed to resolve block number: {e}")))?;
+        let block_num =
+            self.data_provider.resolve_block_number(block_number).await.map_err(|e| {
+                metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
+                rpc_err(format!("Failed to resolve block number: {e}"))
+            })?;
         let resolve_ms = t0.elapsed().as_millis();
 
         let variant = ResponseVariant::from_geth_options(&opts);
@@ -440,18 +440,20 @@ impl DebugTraceRpcServer for RpcContext {
 
         // Stage 3: Fetch block data (DB -> RPC fallback)
         let t2 = Instant::now();
-        let data = self
-            .data_provider
-            .get_block_data(block_num)
-            .await
-            .map_err(|e| block_data_err(block_num, e))?;
+        let data = self.data_provider.get_block_data(block_num).await.map_err(|e| {
+            metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
+            block_data_err(block_num, e)
+        })?;
         let fetch_ms = t2.elapsed().as_millis();
         let block_hash = data.block.header.hash;
         let tx_count = data.block.transactions.len();
 
         // Stage 4: Execute trace
         let t3 = Instant::now();
-        let result = compute_debug_trace_block(&self.chain_spec, &data, opts).await?;
+        let result =
+            compute_debug_trace_block(&self.chain_spec, &data, opts).await.inspect_err(|_| {
+                metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
+            })?;
         let trace_ms = t3.elapsed().as_millis();
 
         // Stage 5: Cache result
@@ -514,13 +516,15 @@ impl DebugTraceRpcServer for RpcContext {
         }
 
         // Fetch block data (DB -> RPC fallback)
-        let data = self
-            .data_provider
-            .get_block_data_by_hash(block_hash)
-            .await
-            .map_err(|e| block_data_err_by_hash(block_hash, e))?;
+        let data = self.data_provider.get_block_data_by_hash(block_hash).await.map_err(|e| {
+            metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
+            block_data_err_by_hash(block_hash, e)
+        })?;
         let block_num = data.block.header.number;
-        let result = compute_debug_trace_block(&self.chain_spec, &data, opts).await?;
+        let result =
+            compute_debug_trace_block(&self.chain_spec, &data, opts).await.inspect_err(|_| {
+                metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
+            })?;
 
         // Cache and record metrics
         self.response_cache.insert(
@@ -547,7 +551,10 @@ impl DebugTraceRpcServer for RpcContext {
         let opts = opts.unwrap_or_default();
 
         let (data, tx_index) =
-            self.data_provider.get_block_data_for_tx(tx_hash).await.map_err(tx_data_err)?;
+            self.data_provider.get_block_data_for_tx(tx_hash).await.map_err(|e| {
+                metrics::record_rpc_error(METHOD_DEBUG_TRACE_TRANSACTION);
+                tx_data_err(e)
+            })?;
 
         let result = validator_core::trace_transaction(
             &self.chain_spec,
@@ -557,7 +564,10 @@ impl DebugTraceRpcServer for RpcContext {
             &data.contracts,
             opts,
         )
-        .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
+        .map_err(|e| {
+            metrics::record_rpc_error(METHOD_DEBUG_TRACE_TRANSACTION);
+            rpc_err(format!("Trace execution failed: {e}"))
+        })?;
 
         let elapsed = start.elapsed();
         metrics::record_rpc_request(METHOD_DEBUG_TRACE_TRANSACTION, elapsed.as_secs_f64());
@@ -604,11 +614,11 @@ impl TraceRpcServer for RpcContext {
         let _guard = self.watch_dog.start_request(METHOD_TRACE_BLOCK, format!("{block_number}"));
         let start = Instant::now();
 
-        let block_num = self
-            .data_provider
-            .resolve_block_number(block_number)
-            .await
-            .map_err(|e| rpc_err(format!("Failed to resolve block number: {e}")))?;
+        let block_num =
+            self.data_provider.resolve_block_number(block_number).await.map_err(|e| {
+                metrics::record_rpc_error(METHOD_TRACE_BLOCK);
+                rpc_err(format!("Failed to resolve block number: {e}"))
+            })?;
 
         tracing::Span::current().record("block_number", block_num);
 
@@ -625,14 +635,16 @@ impl TraceRpcServer for RpcContext {
         }
 
         // Fetch block data (DB -> RPC fallback)
-        let data = self
-            .data_provider
-            .get_block_data(block_num)
-            .await
-            .map_err(|e| block_data_err(block_num, e))?;
+        let data = self.data_provider.get_block_data(block_num).await.map_err(|e| {
+            metrics::record_rpc_error(METHOD_TRACE_BLOCK);
+            block_data_err(block_num, e)
+        })?;
 
         let block_hash = data.block.header.hash;
-        let result = compute_parity_trace_block(&self.chain_spec, &data).await?;
+        let result =
+            compute_parity_trace_block(&self.chain_spec, &data).await.inspect_err(|_| {
+                metrics::record_rpc_error(METHOD_TRACE_BLOCK);
+            })?;
 
         // Cache and record metrics
         self.response_cache.insert(
@@ -663,6 +675,7 @@ impl TraceRpcServer for RpcContext {
                 {
                     return Ok(serde_json::Value::Null);
                 }
+                metrics::record_rpc_error(METHOD_TRACE_TRANSACTION);
                 return Err(rpc_err("internal error".to_string()));
             }
         };
@@ -674,7 +687,10 @@ impl TraceRpcServer for RpcContext {
             data.witness.clone(),
             &data.contracts,
         )
-        .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
+        .map_err(|e| {
+            metrics::record_rpc_error(METHOD_TRACE_TRANSACTION);
+            rpc_err(format!("Trace execution failed: {e}"))
+        })?;
 
         let elapsed = start.elapsed();
         metrics::record_rpc_request(METHOD_TRACE_TRANSACTION, elapsed.as_secs_f64());

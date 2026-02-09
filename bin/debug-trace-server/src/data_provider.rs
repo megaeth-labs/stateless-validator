@@ -29,7 +29,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, instrument, trace, warn};
 use validator_core::{withdrawals::MptWitness, LightWitness, RpcClient, ValidatorDB};
 
-use crate::metrics::UpstreamMetrics;
+use crate::metrics::{ChainSyncMetrics, UpstreamMetrics};
 
 /// Block data bundle containing all information needed for stateless execution.
 ///
@@ -154,6 +154,7 @@ impl DataProvider {
                     elapsed_ms = start.elapsed().as_millis() as u64,
                     "Block data retrieved from local DB"
                 );
+                self.record_block_distance(data.block.header.number);
                 return Ok(data);
             }
         }
@@ -173,6 +174,7 @@ impl DataProvider {
             "Block data fetched from RPC"
         );
 
+        self.record_block_distance(data.block.header.number);
         Ok(data)
     }
 
@@ -245,6 +247,16 @@ impl DataProvider {
         }
     }
 
+    /// Records the distance of a requested block from the local chain tip.
+    fn record_block_distance(&self, block_number: u64) {
+        if let Some(db) = &self.validator_db {
+            if let Ok(Some((tip, _))) = db.get_local_tip() {
+                let distance = tip.saturating_sub(block_number);
+                ChainSyncMetrics::create().record_block_distance(distance);
+            }
+        }
+    }
+
     /// Gets block data from the local database using LightWitness.
     async fn get_block_data_from_db(
         &self,
@@ -256,7 +268,11 @@ impl DataProvider {
         // Get block data from database using light witness (fast deserialization)
         let start = std::time::Instant::now();
         let (block, witness) = db.get_block_and_witness(block_hash)?;
+        let db_read_secs = start.elapsed().as_secs_f64();
         let db_read_ms = start.elapsed().as_millis();
+
+        // Record DB read duration metric
+        ChainSyncMetrics::create().record_db_read(db_read_secs);
 
         // Extract code hashes and get contracts
         let start = std::time::Instant::now();
