@@ -66,6 +66,7 @@ reth-trie-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0"
 reth-trie-sparse = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0" }
 
 # revm
+http = "1"
 revm = { version = "27.1.0", default-features = false }
 revm-inspectors = { version = "0.27.1", features = ["std", "js-tracer"] }
 rustc-hash = "2.0"
@@ -74,7 +75,6 @@ serde = { version = "1.0", default-features = false }
 serde_json = "1.0"
 thiserror = "2.0.16"
 tokio = { version = "1.46", features = ["rt-multi-thread", "signal"] }
-http = "1"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "=0.3.20", features = ["fmt", "env-filter", "json"] }
