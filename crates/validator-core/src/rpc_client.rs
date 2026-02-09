@@ -7,6 +7,7 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 use alloy_primitives::{B256, Bytes, U64};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag, Header};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use eyre::{Context, Result, ensure, eyre};
 use futures::future;
 use op_alloy_network::Optimism;
@@ -446,6 +447,9 @@ impl RpcClient {
     ///
     /// Single attempt, no retry (it's a KV lookup, either it exists or it doesn't).
     /// Returns error if Cloudflare provider is not configured.
+    ///
+    /// The Cloudflare KV endpoint returns a `"v0:<base64_encoded_data>"` string.
+    /// The base64 payload is zstd-compressed, bincode-serialized `(SaltWitness, MptWitness)`.
     pub async fn get_witness_from_cloudflare(
         &self,
         number: u64,
@@ -458,7 +462,7 @@ impl RpcClient {
 
         let start = Instant::now();
         let keys = WitnessRequestKeys { block_number: U64::from(number), block_hash: hash };
-        let result: Result<(SaltWitness, MptWitness)> = provider
+        let result: Result<String> = provider
             .client()
             .request("mega_getBlockWitness", (keys,))
             .await
@@ -474,7 +478,27 @@ impl RpcClient {
             trace!(block_number = number, %hash, error = %e, "Cloudflare worker mega_getBlockWitness failed");
         }
 
-        result
+        let encoded = result?;
+
+        let decode_start = Instant::now();
+        let (salt_witness, mpt_witness) =
+            tokio::task::spawn_blocking(move || -> Result<(SaltWitness, MptWitness)> {
+                let b64_data = encoded
+                    .strip_prefix("v0:")
+                    .ok_or_else(|| eyre!("Cloudflare witness missing 'v0:' prefix"))?;
+                let compressed = BASE64.decode(b64_data).context("base64 decode failed")?;
+                let decompressed =
+                    zstd::decode_all(compressed.as_slice()).context("zstd decompress failed")?;
+                let (witness, _): ((SaltWitness, MptWitness), _) =
+                    bincode::serde::decode_from_slice(&decompressed, bincode::config::legacy())
+                        .context("bincode deserialize failed")?;
+                Ok(witness)
+            })
+            .await
+            .context("decode task panicked")??;
+        trace!(block_number = number, %hash, decode_ms = decode_start.elapsed().as_millis(), "Cloudflare witness decoded");
+
+        Ok((salt_witness, mpt_witness))
     }
 
     /// Reports a range of validated blocks via the dedicated report endpoint.
