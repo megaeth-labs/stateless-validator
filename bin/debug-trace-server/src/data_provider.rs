@@ -354,8 +354,7 @@ impl DataProvider {
 
         // Step 1: Fetch block without transactions first to get the number
         let start = std::time::Instant::now();
-        let header_block =
-            self.rpc_client.get_block(BlockId::Hash(block_hash.into()), false).await;
+        let header_block = self.rpc_client.get_block(BlockId::Hash(block_hash.into()), false).await;
         upstream_block.record_request(header_block.is_ok(), start.elapsed().as_secs_f64());
         let header_block = header_block?;
         let block_number = header_block.header.number;
@@ -375,10 +374,8 @@ impl DataProvider {
         let (salt_witness, _mpt_witness) = witness_result?;
 
         let fetch_full_block_ms = full_block_start.elapsed().as_millis();
-        upstream_block.record_request(
-            full_block_result.is_ok(),
-            fetch_full_block_ms as f64 / 1000.0,
-        );
+        upstream_block
+            .record_request(full_block_result.is_ok(), fetch_full_block_ms as f64 / 1000.0);
         let block = full_block_result?;
 
         // Step 3: Convert SaltWitness to LightWitness
@@ -395,11 +392,11 @@ impl DataProvider {
 
         let total_ms = overall_start.elapsed().as_millis();
 
-        if fetch_header_ms >= SLOW_STAGE_THRESHOLD_MS
-            || fetch_witness_ms >= SLOW_STAGE_THRESHOLD_MS
-            || convert_witness_ms >= SLOW_STAGE_THRESHOLD_MS
-            || fetch_full_block_ms >= SLOW_STAGE_THRESHOLD_MS
-            || fetch_contracts_ms >= SLOW_STAGE_THRESHOLD_MS
+        if fetch_header_ms >= SLOW_STAGE_THRESHOLD_MS ||
+            fetch_witness_ms >= SLOW_STAGE_THRESHOLD_MS ||
+            convert_witness_ms >= SLOW_STAGE_THRESHOLD_MS ||
+            fetch_full_block_ms >= SLOW_STAGE_THRESHOLD_MS ||
+            fetch_contracts_ms >= SLOW_STAGE_THRESHOLD_MS
         {
             warn!(
                 block_number,

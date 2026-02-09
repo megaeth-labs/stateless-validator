@@ -201,8 +201,7 @@ fn parse_size(s: &str) -> Result<u64, String> {
         (upper.as_str(), 1u64)
     };
 
-    let value: u64 =
-        num_str.trim().parse().map_err(|e| format!("invalid size '{}': {}", s, e))?;
+    let value: u64 = num_str.trim().parse().map_err(|e| format!("invalid size '{}': {}", s, e))?;
 
     value.checked_mul(multiplier).ok_or_else(|| format!("size overflow: '{}'", s))
 }

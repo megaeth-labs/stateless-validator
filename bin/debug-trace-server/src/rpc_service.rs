@@ -468,10 +468,10 @@ impl DebugTraceRpcServer for RpcContext {
         let total_ms = start.elapsed().as_millis();
         record_request_completion(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, block_num, start);
 
-        if resolve_ms >= SLOW_STAGE_THRESHOLD_MS
-            || fetch_ms >= SLOW_STAGE_THRESHOLD_MS
-            || trace_ms >= SLOW_STAGE_THRESHOLD_MS
-            || cache_insert_ms >= SLOW_STAGE_THRESHOLD_MS
+        if resolve_ms >= SLOW_STAGE_THRESHOLD_MS ||
+            fetch_ms >= SLOW_STAGE_THRESHOLD_MS ||
+            trace_ms >= SLOW_STAGE_THRESHOLD_MS ||
+            cache_insert_ms >= SLOW_STAGE_THRESHOLD_MS
         {
             warn!(
                 block_number = block_num,
