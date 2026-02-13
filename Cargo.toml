@@ -48,7 +48,7 @@ futures = "0.3"
 lz4_flex = { version = "0.11", default-features = false }
 
 # megaeth 
-mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "v1.3.2" }
+mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "v1.4.0" }
 metrics = "0.24"
 metrics-derive = "0.1"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
