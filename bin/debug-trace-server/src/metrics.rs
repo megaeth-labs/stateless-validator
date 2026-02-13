@@ -417,10 +417,15 @@ fn pre_register_all_metrics() {
     let _ = RpcMethodMetrics::new_for_method(METHOD_TRACE_BLOCK);
     let _ = RpcMethodMetrics::new_for_method(METHOD_TRACE_TRANSACTION);
 
-    // Request Layer: global + response size
+    // Request Layer: global
     let _ = RpcGlobalMetrics::create();
-    let _ = ResponseSizeMetrics::new_for_method("debug_traceBlock");
-    let _ = ResponseSizeMetrics::new_for_method("trace_block");
+
+    // Request Layer: response size (per method)
+    let _ = ResponseSizeMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
+    let _ = ResponseSizeMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
+    let _ = ResponseSizeMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION);
+    let _ = ResponseSizeMetrics::new_for_method(METHOD_TRACE_BLOCK);
+    let _ = ResponseSizeMetrics::new_for_method(METHOD_TRACE_TRANSACTION);
 
     // Cache Layer
     let _ = CacheMetrics::new_for_cache(CACHE_TYPE_DEBUG_TRACE);
@@ -446,9 +451,12 @@ fn pre_register_all_metrics() {
     let _ = WitnessSourceMetrics::new_for_source("witness_generator");
     let _ = WitnessSourceMetrics::new_for_source("cloudflare");
 
-    // Execution Layer
-    let _ = EvmExecutionMetrics::new_for_method("debug_traceBlock");
-    let _ = EvmExecutionMetrics::new_for_method("trace_block");
+    // Execution Layer (per method)
+    let _ = EvmExecutionMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
+    let _ = EvmExecutionMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
+    let _ = EvmExecutionMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION);
+    let _ = EvmExecutionMetrics::new_for_method(METHOD_TRACE_BLOCK);
+    let _ = EvmExecutionMetrics::new_for_method(METHOD_TRACE_TRANSACTION);
 
     // Infrastructure
     let _ = ChainSyncMetrics::create();
