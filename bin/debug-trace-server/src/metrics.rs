@@ -68,7 +68,24 @@ pub const CACHE_TYPE_DEBUG_TRACE: &str = "debug_trace_block";
 pub const CACHE_TYPE_TRACE: &str = "trace_block";
 
 // ---------------------------------------------------------------------------
-// Metric Structs (using metrics-derive)
+// All known RPC methods (for resolving &str → &'static str)
+// ---------------------------------------------------------------------------
+
+const ALL_METHODS: &[&str] = &[
+    METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+    METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
+    METHOD_DEBUG_TRACE_TRANSACTION,
+    METHOD_DEBUG_GET_CACHE_STATUS,
+    METHOD_TRACE_BLOCK,
+    METHOD_TRACE_TRANSACTION,
+];
+
+fn resolve_method(method: &str) -> &'static str {
+    ALL_METHODS.iter().find(|&&m| m == method).copied().unwrap_or("unknown")
+}
+
+// ---------------------------------------------------------------------------
+// ── Request Layer ──────────────────────────────
 // ---------------------------------------------------------------------------
 
 /// RPC method metrics with method label.
@@ -101,7 +118,7 @@ impl RpcMethodMetrics {
     }
 }
 
-/// Global RPC metrics (uses "global" label to distinguish from per-method).
+/// Global RPC metrics (singleton).
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
 pub struct RpcGlobalMetrics {
@@ -126,6 +143,30 @@ impl RpcGlobalMetrics {
     }
 }
 
+/// Response size metrics with method label.
+#[derive(Clone, Metrics)]
+#[metrics(scope = "debug_trace")]
+pub struct ResponseSizeMetrics {
+    /// Response size in bytes
+    response_size_bytes: Histogram,
+}
+
+impl ResponseSizeMetrics {
+    /// Creates metrics for a specific method.
+    pub fn new_for_method(method: &'static str) -> Self {
+        Self::new_with_labels(&[("method", method)])
+    }
+
+    /// Records a response size.
+    pub fn record(&self, size: usize) {
+        self.response_size_bytes.record(size as f64);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ── Cache Layer ────────────────────────────────
+// ---------------------------------------------------------------------------
+
 /// Response cache metrics with cache type label.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
@@ -141,7 +182,7 @@ pub struct CacheMetrics {
 }
 
 impl CacheMetrics {
-    /// Creates metrics for a specific cache type (e.g., "debug_trace_block", "trace_block").
+    /// Creates metrics for a specific cache type.
     pub fn new_for_cache(cache_type: &'static str) -> Self {
         Self::new_with_labels(&[("type", cache_type)])
     }
@@ -160,6 +201,50 @@ impl CacheMetrics {
     pub fn set_size(&self, entry_count: usize, data_bytes: usize) {
         self.cache_entries.set(entry_count as f64);
         self.cache_bytes.set(data_bytes as f64);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ── Data Fetch Layer ───────────────────────────
+// ---------------------------------------------------------------------------
+
+/// Tracks which source provided block data (cache/db/witness_generator/cloudflare).
+#[derive(Clone, Metrics)]
+#[metrics(scope = "debug_trace")]
+pub struct DataSourceMetrics {
+    /// Total block data fetches by source
+    block_data_fetches_total: Counter,
+}
+
+impl DataSourceMetrics {
+    /// Creates metrics for a specific data source.
+    pub fn new_for_source(source: &'static str) -> Self {
+        Self::new_with_labels(&[("source", source)])
+    }
+
+    /// Records a block data fetch from this source.
+    pub fn record(&self) {
+        self.block_data_fetches_total.increment(1);
+    }
+}
+
+/// Single-flight coalescing metrics (new/coalesced/bypassed).
+#[derive(Clone, Metrics)]
+#[metrics(scope = "debug_trace")]
+pub struct SingleFlightMetrics {
+    /// Total single-flight events by type
+    single_flight_total: Counter,
+}
+
+impl SingleFlightMetrics {
+    /// Creates metrics for a specific single-flight event type.
+    pub fn new_for_type(event_type: &'static str) -> Self {
+        Self::new_with_labels(&[("type", event_type)])
+    }
+
+    /// Records a single-flight event.
+    pub fn record(&self) {
+        self.single_flight_total.increment(1);
     }
 }
 
@@ -191,39 +276,77 @@ impl UpstreamMetrics {
     }
 }
 
-/// Tracing execution metrics with tracer type label.
+// ---------------------------------------------------------------------------
+// ── Witness Layer ──────────────────────────────
+// ---------------------------------------------------------------------------
+
+/// Witness fetch metrics by source (witness_generator / cloudflare).
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
-pub struct TracingMetrics {
-    /// Total transactions traced
-    transactions_traced_total: Counter,
-    /// Total blocks traced
-    blocks_traced_total: Counter,
-    /// Duration of tracing execution in seconds
-    tracing_duration_seconds: Histogram,
+pub struct WitnessSourceMetrics {
+    /// Total witness fetch requests
+    witness_requests_total: Counter,
+    /// Total witness fetch errors
+    witness_errors_total: Counter,
+    /// Duration of witness fetch in seconds
+    witness_duration_seconds: Histogram,
+    /// Witness response size in bytes
+    witness_bytes: Histogram,
 }
 
-impl TracingMetrics {
-    /// Creates metrics for a specific tracer type (e.g., "geth", "parity").
-    pub fn new_for_tracer(tracer: &'static str) -> Self {
-        Self::new_with_labels(&[("tracer", tracer)])
+impl WitnessSourceMetrics {
+    /// Creates metrics for a specific witness source.
+    pub fn new_for_source(source: &'static str) -> Self {
+        Self::new_with_labels(&[("source", source)])
     }
 
-    /// Records a block trace completion.
-    pub fn record_block(&self, tx_count: usize, duration_secs: f64) {
-        self.blocks_traced_total.increment(1);
-        self.transactions_traced_total.increment(tx_count as u64);
-        self.tracing_duration_seconds.record(duration_secs);
+    /// Records a witness fetch request.
+    pub fn record_request(&self, success: bool, duration_secs: f64) {
+        self.witness_requests_total.increment(1);
+        if !success {
+            self.witness_errors_total.increment(1);
+        }
+        self.witness_duration_seconds.record(duration_secs);
     }
 
-    /// Records a single transaction trace.
-    pub fn record_transaction(&self, duration_secs: f64) {
-        self.transactions_traced_total.increment(1);
-        self.tracing_duration_seconds.record(duration_secs);
+    /// Records witness response size.
+    pub fn record_size(&self, bytes: usize) {
+        self.witness_bytes.record(bytes as f64);
     }
 }
 
-/// Chain sync metrics.
+// ---------------------------------------------------------------------------
+// ── Execution Layer ────────────────────────────
+// ---------------------------------------------------------------------------
+
+/// EVM execution metrics with method label.
+#[derive(Clone, Metrics)]
+#[metrics(scope = "debug_trace")]
+pub struct EvmExecutionMetrics {
+    /// EVM execution duration in seconds
+    evm_execution_seconds: Histogram,
+    /// Number of transactions per traced block
+    evm_block_tx_count: Histogram,
+}
+
+impl EvmExecutionMetrics {
+    /// Creates metrics for a specific method.
+    pub fn new_for_method(method: &'static str) -> Self {
+        Self::new_with_labels(&[("method", method)])
+    }
+
+    /// Records an EVM execution.
+    pub fn record(&self, duration_secs: f64, tx_count: usize) {
+        self.evm_execution_seconds.record(duration_secs);
+        self.evm_block_tx_count.record(tx_count as f64);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ── Infrastructure ─────────────────────────────
+// ---------------------------------------------------------------------------
+
+/// Chain sync metrics (singleton).
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
 pub struct ChainSyncMetrics {
@@ -239,6 +362,8 @@ pub struct ChainSyncMetrics {
     db_earliest_block: Gauge,
     /// Latest block number in validator DB
     db_latest_block: Gauge,
+    /// Database file size in bytes
+    db_size_bytes: Gauge,
 }
 
 impl ChainSyncMetrics {
@@ -272,55 +397,61 @@ impl ChainSyncMetrics {
         self.db_earliest_block.set(earliest as f64);
         self.db_latest_block.set(latest as f64);
     }
+
+    /// Sets the database file size in bytes.
+    pub fn set_db_size(&self, bytes: u64) {
+        self.db_size_bytes.set(bytes as f64);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Pre-initialized Metric Instances
 // ---------------------------------------------------------------------------
 
-/// Collection of all debug-trace-server metrics.
-/// Used for pre-registration to ensure metrics are visible before first use.
-#[derive(Clone)]
-#[allow(dead_code)]
-pub struct DebugTraceMetrics {
-    // RPC method metrics
-    pub debug_trace_block_by_number: RpcMethodMetrics,
-    pub debug_trace_block_by_hash: RpcMethodMetrics,
-    pub debug_trace_transaction: RpcMethodMetrics,
-    pub trace_block: RpcMethodMetrics,
-    pub trace_transaction: RpcMethodMetrics,
+/// Pre-registers all metrics so they appear in Prometheus from startup (with zero values).
+fn pre_register_all_metrics() {
+    // Request Layer: RPC method metrics
+    let _ = RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
+    let _ = RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
+    let _ = RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION);
+    let _ = RpcMethodMetrics::new_for_method(METHOD_TRACE_BLOCK);
+    let _ = RpcMethodMetrics::new_for_method(METHOD_TRACE_TRANSACTION);
 
-    // Global RPC metrics
-    pub rpc_global: RpcGlobalMetrics,
+    // Request Layer: global + response size
+    let _ = RpcGlobalMetrics::create();
+    let _ = ResponseSizeMetrics::new_for_method("debug_traceBlock");
+    let _ = ResponseSizeMetrics::new_for_method("trace_block");
 
-    // Cache metrics by type
-    pub cache_debug_trace: CacheMetrics,
-    pub cache_trace: CacheMetrics,
+    // Cache Layer
+    let _ = CacheMetrics::new_for_cache(CACHE_TYPE_DEBUG_TRACE);
+    let _ = CacheMetrics::new_for_cache(CACHE_TYPE_TRACE);
 
-    // Chain sync metrics
-    pub chain_sync: ChainSyncMetrics,
-}
+    // Data Fetch Layer: data source
+    let _ = DataSourceMetrics::new_for_source("cache");
+    let _ = DataSourceMetrics::new_for_source("db");
+    let _ = DataSourceMetrics::new_for_source("witness_generator");
+    let _ = DataSourceMetrics::new_for_source("cloudflare");
 
-impl Default for DebugTraceMetrics {
-    fn default() -> Self {
-        Self {
-            debug_trace_block_by_number: RpcMethodMetrics::new_for_method(
-                METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
-            ),
-            debug_trace_block_by_hash: RpcMethodMetrics::new_for_method(
-                METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
-            ),
-            debug_trace_transaction: RpcMethodMetrics::new_for_method(
-                METHOD_DEBUG_TRACE_TRANSACTION,
-            ),
-            trace_block: RpcMethodMetrics::new_for_method(METHOD_TRACE_BLOCK),
-            trace_transaction: RpcMethodMetrics::new_for_method(METHOD_TRACE_TRANSACTION),
-            rpc_global: RpcGlobalMetrics::create(),
-            cache_debug_trace: CacheMetrics::new_for_cache(CACHE_TYPE_DEBUG_TRACE),
-            cache_trace: CacheMetrics::new_for_cache(CACHE_TYPE_TRACE),
-            chain_sync: ChainSyncMetrics::create(),
-        }
-    }
+    // Data Fetch Layer: single-flight
+    let _ = SingleFlightMetrics::new_for_type("new");
+    let _ = SingleFlightMetrics::new_for_type("coalesced");
+    let _ = SingleFlightMetrics::new_for_type("bypassed");
+
+    // Data Fetch Layer: upstream RPC
+    let _ = UpstreamMetrics::new_for_method("eth_getHeaderByHash");
+    let _ = UpstreamMetrics::new_for_method("eth_getBlockByHash");
+    let _ = UpstreamMetrics::new_for_method("mega_getWitness");
+
+    // Witness Layer
+    let _ = WitnessSourceMetrics::new_for_source("witness_generator");
+    let _ = WitnessSourceMetrics::new_for_source("cloudflare");
+
+    // Execution Layer
+    let _ = EvmExecutionMetrics::new_for_method("debug_traceBlock");
+    let _ = EvmExecutionMetrics::new_for_method("trace_block");
+
+    // Infrastructure
+    let _ = ChainSyncMetrics::create();
 }
 
 // ---------------------------------------------------------------------------
@@ -328,18 +459,14 @@ impl Default for DebugTraceMetrics {
 // ---------------------------------------------------------------------------
 
 /// Initializes the Prometheus metrics exporter.
-///
-/// Starts an HTTP server on the specified address that exposes metrics
-/// in Prometheus text format at the `/metrics` endpoint.
 pub fn init_metrics(addr: SocketAddr) -> Result<()> {
     PrometheusBuilder::new()
         .with_http_listener(addr)
         .install()
         .map_err(|e| eyre::eyre!("Failed to install metrics exporter: {}", e))?;
 
-    // Pre-register all metrics by creating default instances
-    // This ensures metrics are visible even before first use
-    let _ = DebugTraceMetrics::default();
+    // Pre-register all metrics
+    pre_register_all_metrics();
 
     Ok(())
 }
@@ -349,63 +476,20 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Strips the `timed_` prefix from a method name if present.
-/// Returns the original method name (without prefix) for metrics recording.
 pub fn strip_timed_prefix(method: &str) -> &str {
     method.strip_prefix(TIMED_PREFIX).unwrap_or(method)
 }
 
-/// Records a successful RPC request (backward-compatible helper).
-///
-/// Handles both original and `timed_`-prefixed method names by stripping the
-/// prefix before recording metrics, so timed variants share the same counters.
+/// Records a successful RPC request.
 pub fn record_rpc_request(method: &str, duration_secs: f64) {
-    let method = strip_timed_prefix(method);
-    match method {
-        METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER => {
-            RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER)
-                .record_request(duration_secs)
-        }
-        METHOD_DEBUG_TRACE_BLOCK_BY_HASH => {
-            RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_HASH)
-                .record_request(duration_secs)
-        }
-        METHOD_DEBUG_TRACE_TRANSACTION => {
-            RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION)
-                .record_request(duration_secs)
-        }
-        METHOD_TRACE_BLOCK => {
-            RpcMethodMetrics::new_for_method(METHOD_TRACE_BLOCK).record_request(duration_secs)
-        }
-        METHOD_TRACE_TRANSACTION => {
-            RpcMethodMetrics::new_for_method(METHOD_TRACE_TRANSACTION).record_request(duration_secs)
-        }
-        _ => {
-            tracing::warn!(method = method, "Unknown RPC method in metrics");
-        }
-    }
+    let method = resolve_method(strip_timed_prefix(method));
+    RpcMethodMetrics::new_for_method(method).record_request(duration_secs);
 }
 
-/// Records an RPC error for a specific method (backward-compatible helper).
-///
-/// Handles both original and `timed_`-prefixed method names.
+/// Records an RPC error for a specific method.
 pub fn record_rpc_error(method: &str) {
-    let method = strip_timed_prefix(method);
-    match method {
-        METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER => {
-            RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER).record_error()
-        }
-        METHOD_DEBUG_TRACE_BLOCK_BY_HASH => {
-            RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_HASH).record_error()
-        }
-        METHOD_DEBUG_TRACE_TRANSACTION => {
-            RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION).record_error()
-        }
-        METHOD_TRACE_BLOCK => RpcMethodMetrics::new_for_method(METHOD_TRACE_BLOCK).record_error(),
-        METHOD_TRACE_TRANSACTION => {
-            RpcMethodMetrics::new_for_method(METHOD_TRACE_TRANSACTION).record_error()
-        }
-        _ => {}
-    }
+    let method = resolve_method(strip_timed_prefix(method));
+    RpcMethodMetrics::new_for_method(method).record_error();
 }
 
 // ---------------------------------------------------------------------------
@@ -423,73 +507,36 @@ mod tests {
             "debug_traceBlockByNumber"
         );
         assert_eq!(strip_timed_prefix("timed_trace_block"), "trace_block");
-        assert_eq!(strip_timed_prefix("timed_trace_transaction"), "trace_transaction");
     }
 
     #[test]
     fn test_strip_timed_prefix_without_prefix() {
         assert_eq!(strip_timed_prefix("debug_traceBlockByNumber"), "debug_traceBlockByNumber");
-        assert_eq!(strip_timed_prefix("trace_block"), "trace_block");
         assert_eq!(strip_timed_prefix("unknown_method"), "unknown_method");
     }
 
     #[test]
-    fn test_strip_timed_prefix_edge_cases() {
-        assert_eq!(strip_timed_prefix("timed_"), "");
-        assert_eq!(strip_timed_prefix(""), "");
-        assert_eq!(
-            strip_timed_prefix("TIMED_debug_traceBlockByNumber"),
-            "TIMED_debug_traceBlockByNumber"
-        );
-        // Only strips once
-        assert_eq!(strip_timed_prefix("timed_timed_trace_block"), "timed_trace_block");
+    fn test_resolve_method_known() {
+        assert_eq!(resolve_method("debug_traceBlockByNumber"), "debug_traceBlockByNumber");
+        assert_eq!(resolve_method("trace_block"), "trace_block");
+    }
+
+    #[test]
+    fn test_resolve_method_unknown() {
+        assert_eq!(resolve_method("nonexistent"), "unknown");
     }
 
     #[test]
     fn test_timed_aliases_consistency() {
-        // Every alias must start with the TIMED_PREFIX
         for &(alias, _original) in TIMED_METHOD_ALIASES {
-            assert!(
-                alias.starts_with(TIMED_PREFIX),
-                "Alias '{}' does not start with '{}'",
-                alias,
-                TIMED_PREFIX
-            );
+            assert!(alias.starts_with(TIMED_PREFIX));
         }
     }
 
     #[test]
     fn test_timed_aliases_match_originals() {
-        // Stripping the prefix from each alias must yield the original method name
         for &(alias, original) in TIMED_METHOD_ALIASES {
-            assert_eq!(
-                strip_timed_prefix(alias),
-                original,
-                "Alias '{}' does not map back to '{}'",
-                alias,
-                original
-            );
-        }
-    }
-
-    #[test]
-    fn test_timed_aliases_cover_all_methods() {
-        let all_methods = [
-            METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
-            METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
-            METHOD_DEBUG_TRACE_TRANSACTION,
-            METHOD_DEBUG_GET_CACHE_STATUS,
-            METHOD_TRACE_BLOCK,
-            METHOD_TRACE_TRANSACTION,
-        ];
-        let aliased_originals: Vec<&str> =
-            TIMED_METHOD_ALIASES.iter().map(|&(_, orig)| orig).collect();
-        for method in all_methods {
-            assert!(
-                aliased_originals.contains(&method),
-                "Method '{}' has no timed_ alias in TIMED_METHOD_ALIASES",
-                method
-            );
+            assert_eq!(strip_timed_prefix(alias), original);
         }
     }
 }

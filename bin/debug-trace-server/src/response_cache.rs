@@ -446,6 +446,7 @@ impl ResponseCache {
 
         self.inner.cache.insert(key.clone(), cached);
         self.inner.indices.insert(block_hash, block_number, key);
+        self.update_size_metrics();
     }
 
     /// Gets a cached response or computes it, coalescing concurrent requests for the same key.
@@ -487,6 +488,7 @@ impl ResponseCache {
                 let _ = guard.insert(cached);
 
                 self.inner.indices.insert(block_hash, block_number, key);
+                self.update_size_metrics();
 
                 self.inner.misses.fetch_add(1, Ordering::Relaxed);
                 metrics.record_miss();
@@ -546,6 +548,14 @@ impl ResponseCache {
     #[allow(dead_code)] // Used in tests
     pub fn weight(&self) -> u64 {
         self.inner.cache.weight()
+    }
+
+    /// Updates prometheus cache size gauges with current cache state.
+    fn update_size_metrics(&self) {
+        let entry_count = self.inner.cache.len();
+        let total_bytes = self.inner.cache.weight() as usize;
+        self.inner.metrics_debug_trace.set_size(entry_count, total_bytes);
+        self.inner.metrics_trace.set_size(entry_count, total_bytes);
     }
 
     /// Returns cache statistics and updates prometheus metrics.

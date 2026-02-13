@@ -540,6 +540,11 @@ async fn history_pruner(
             let earliest =
                 validator_db.get_earliest_local_block().ok().flatten().map(|(n, _)| n).unwrap_or(0);
             chain_sync_metrics.set_db_block_range(earliest, current_tip);
+
+            // Update DB file size metric
+            if let Ok(m) = std::fs::metadata(&db_path) {
+                chain_sync_metrics.set_db_size(m.len());
+            }
         }
 
         tokio::time::sleep(interval).await;

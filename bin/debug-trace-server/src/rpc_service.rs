@@ -22,9 +22,9 @@ use validator_core::chain_spec::ChainSpec;
 use crate::{
     data_provider::{BlockData, DataProvider},
     metrics::{
-        self, RpcGlobalMetrics, TracingMetrics, METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
-        METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, METHOD_DEBUG_TRACE_TRANSACTION, METHOD_TRACE_BLOCK,
-        METHOD_TRACE_TRANSACTION,
+        self, DataSourceMetrics, EvmExecutionMetrics, ResponseSizeMetrics, RpcGlobalMetrics,
+        SingleFlightMetrics, METHOD_DEBUG_TRACE_BLOCK_BY_HASH, METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+        METHOD_DEBUG_TRACE_TRANSACTION, METHOD_TRACE_BLOCK, METHOD_TRACE_TRANSACTION,
     },
     response_cache::{CachedResource, ResponseCache, ResponseVariant},
 };
@@ -281,7 +281,6 @@ async fn compute_debug_trace_block(
     opts: GethDebugTracingOptions,
 ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
     let start = Instant::now();
-    let tracing_metrics = TracingMetrics::new_for_tracer("geth");
 
     let results = validator_core::trace_block(
         chain_spec,
@@ -293,13 +292,15 @@ async fn compute_debug_trace_block(
     .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
 
     let trace_ms = start.elapsed().as_millis();
-    tracing_metrics.record_block(data.block.transactions.len(), start.elapsed().as_secs_f64());
+    EvmExecutionMetrics::new_for_method("debug_traceBlock")
+        .record(start.elapsed().as_secs_f64(), data.block.transactions.len());
 
     let value = serde_json::to_value(&results)
         .map_err(|e| rpc_err(format!("Serialization failed: {e}")))?;
 
     let serialize_ms = start.elapsed().as_millis() - trace_ms;
     let response_size = value.to_string().len();
+    ResponseSizeMetrics::new_for_method("debug_traceBlock").record(response_size);
 
     if trace_ms >= SLOW_STAGE_THRESHOLD_MS || serialize_ms >= SLOW_STAGE_THRESHOLD_MS {
         warn!(
@@ -321,7 +322,6 @@ async fn compute_parity_trace_block(
     data: &BlockData,
 ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
     let start = Instant::now();
-    let tracing_metrics = TracingMetrics::new_for_tracer("parity");
 
     let results = validator_core::parity_trace_block(
         chain_spec,
@@ -331,9 +331,14 @@ async fn compute_parity_trace_block(
     )
     .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
 
-    tracing_metrics.record_block(data.block.transactions.len(), start.elapsed().as_secs_f64());
+    EvmExecutionMetrics::new_for_method("trace_block")
+        .record(start.elapsed().as_secs_f64(), data.block.transactions.len());
 
-    serde_json::to_value(results).map_err(|e| rpc_err(format!("Serialization failed: {e}")))
+    let value =
+        serde_json::to_value(results).map_err(|e| rpc_err(format!("Serialization failed: {e}")))?;
+    ResponseSizeMetrics::new_for_method("trace_block").record(value.to_string().len());
+
+    Ok(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +358,8 @@ fn check_cache_by_number(
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
     metrics::record_rpc_request(method_name, total_ms / 1000.0);
+    DataSourceMetrics::new_for_source("cache").record();
+    SingleFlightMetrics::new_for_type("bypassed").record();
 
     trace!(
         method = method_name,
@@ -378,6 +385,8 @@ fn check_cache_by_hash(
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
     metrics::record_rpc_request(method_name, total_ms / 1000.0);
+    DataSourceMetrics::new_for_source("cache").record();
+    SingleFlightMetrics::new_for_type("bypassed").record();
 
     trace!(
         method = method_name,
@@ -581,7 +590,6 @@ impl DebugTraceRpcServer for RpcContext {
 
         let elapsed = start.elapsed();
         metrics::record_rpc_request(METHOD_DEBUG_TRACE_TRANSACTION, elapsed.as_secs_f64());
-        TracingMetrics::new_for_tracer("geth").record_transaction(elapsed.as_secs_f64());
 
         if elapsed > SLOW_REQUEST_THRESHOLD {
             warn!(
@@ -704,7 +712,6 @@ impl TraceRpcServer for RpcContext {
 
         let elapsed = start.elapsed();
         metrics::record_rpc_request(METHOD_TRACE_TRANSACTION, elapsed.as_secs_f64());
-        TracingMetrics::new_for_tracer("parity").record_transaction(elapsed.as_secs_f64());
 
         if elapsed > SLOW_REQUEST_THRESHOLD {
             warn!(
