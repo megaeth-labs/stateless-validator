@@ -471,10 +471,16 @@ impl DebugTraceRpcServer for RpcContext {
 
         // Stage 4: Execute trace
         let t3 = Instant::now();
-        let result =
-            compute_debug_trace_block(&self.chain_spec, &data, opts, METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER).await.inspect_err(|_| {
-                metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
-            })?;
+        let result = compute_debug_trace_block(
+            &self.chain_spec,
+            &data,
+            opts,
+            METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+        )
+        .await
+        .inspect_err(|_| {
+            metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
+        })?;
         let trace_ms = t3.elapsed().as_millis();
 
         // Stage 5: Cache result
@@ -542,10 +548,16 @@ impl DebugTraceRpcServer for RpcContext {
             block_data_err_by_hash(block_hash, e)
         })?;
         let block_num = data.block.header.number;
-        let result =
-            compute_debug_trace_block(&self.chain_spec, &data, opts, METHOD_DEBUG_TRACE_BLOCK_BY_HASH).await.inspect_err(|_| {
-                metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
-            })?;
+        let result = compute_debug_trace_block(
+            &self.chain_spec,
+            &data,
+            opts,
+            METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
+        )
+        .await
+        .inspect_err(|_| {
+            metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
+        })?;
 
         // Cache and record metrics
         self.response_cache.insert(
@@ -668,8 +680,9 @@ impl TraceRpcServer for RpcContext {
         })?;
 
         let block_hash = data.block.header.hash;
-        let result =
-            compute_parity_trace_block(&self.chain_spec, &data, METHOD_TRACE_BLOCK).await.inspect_err(|_| {
+        let result = compute_parity_trace_block(&self.chain_spec, &data, METHOD_TRACE_BLOCK)
+            .await
+            .inspect_err(|_| {
                 metrics::record_rpc_error(METHOD_TRACE_BLOCK);
             })?;
 
