@@ -24,6 +24,7 @@ pub use chain_sync::{
 };
 pub use light_witness::{LightWitness, LightWitnessExecutor};
 pub mod database;
+pub use database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv};
 pub mod validator_db;
 pub use validator_db::{ValidationDbError, ValidationDbResult, ValidatorDB};
 pub mod data_types;
