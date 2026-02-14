@@ -23,7 +23,7 @@ pub use chain_sync::{
     ChainSyncConfig, DEFAULT_METRICS_PORT, FetchResult, fetch_blocks_batch, remote_chain_tracker,
 };
 pub use light_witness::{LightWitness, LightWitnessExecutor};
-mod database;
+pub mod database;
 pub mod validator_db;
 pub use validator_db::{ValidationDbError, ValidationDbResult, ValidatorDB};
 pub mod data_types;
