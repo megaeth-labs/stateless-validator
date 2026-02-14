@@ -18,18 +18,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.PAT_GAO_CI }}
-      - name: Configure Git credentials
-        uses: ./.github/actions/git_config
-        with:
-          github_pat: ${{ secrets.PAT_GAO_CI }}
       # parse tool chain file to get version, and integrate rust cache action
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
-        # with:
-        #   # default is -D warnings
-        #   rustflags: "-A warnings"
+
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
       - run: cargo clippy --workspace --all-targets --all-features
@@ -46,10 +38,6 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Configure Git credentials
-        uses: ./.github/actions/git_config
-        with:
-          github_pat: ${{ secrets.PAT_GAO_CI }}
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
