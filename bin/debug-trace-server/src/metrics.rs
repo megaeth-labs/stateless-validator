@@ -163,6 +163,26 @@ impl ResponseSizeMetrics {
     }
 }
 
+/// CPU execution time per request (global, no method label).
+#[derive(Clone, Metrics)]
+#[metrics(scope = "debug_trace")]
+pub struct CpuTimeMetrics {
+    /// CPU execution time per request in seconds
+    cpu_time_seconds: Histogram,
+}
+
+impl CpuTimeMetrics {
+    /// Creates global CPU time metrics.
+    pub fn create() -> Self {
+        Self::new_with_labels(&[] as &[(&str, &str)])
+    }
+
+    /// Records a CPU time measurement.
+    pub fn record(&self, seconds: f64) {
+        self.cpu_time_seconds.record(seconds);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ── Cache Layer ────────────────────────────────
 // ---------------------------------------------------------------------------
@@ -426,6 +446,9 @@ fn pre_register_all_metrics() {
     let _ = ResponseSizeMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION);
     let _ = ResponseSizeMetrics::new_for_method(METHOD_TRACE_BLOCK);
     let _ = ResponseSizeMetrics::new_for_method(METHOD_TRACE_TRANSACTION);
+
+    // Request Layer: CPU time (global)
+    let _ = CpuTimeMetrics::create();
 
     // Cache Layer
     let _ = CacheMetrics::new_for_cache(CACHE_TYPE_DEBUG_TRACE);
