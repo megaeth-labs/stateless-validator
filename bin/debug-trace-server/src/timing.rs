@@ -17,6 +17,8 @@ use http::{HeaderName, HeaderValue};
 use pin_project_lite::pin_project;
 use tower::{Layer, Service};
 
+use crate::metrics::CpuTimeMetrics;
+
 /// Header name for execution time in nanoseconds.
 pub const TIMING_HEADER_NAME: &str = "x-execution-time-ns";
 
@@ -111,6 +113,8 @@ where
                         response.headers_mut().insert(header_name, header_value);
                     }
                 }
+                // Record as Prometheus metric
+                CpuTimeMetrics::create().record(Duration::from_nanos(cpu_ns).as_secs_f64());
                 Poll::Ready(Ok(response))
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
