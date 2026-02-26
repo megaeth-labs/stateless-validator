@@ -49,7 +49,7 @@ use clap::Parser;
 use eyre::{anyhow, ensure, Result};
 use jsonrpsee::server::Server;
 use stateless_common::logging::LogArgs;
-use tokio::task;
+use tokio::{signal, signal::unix::{SignalKind, signal as unix_signal}, task};
 use tracing::{debug, error, info, instrument, warn};
 use validator_core::{
     chain_spec::ChainSpec, remote_chain_tracker, ChainSyncConfig, RpcClient, RpcClientConfig,
@@ -353,7 +353,23 @@ async fn main() -> Result<()> {
     let handle = server.start(module);
 
     info!(listen_addr = %addr, "Server started");
-    handle.stopped().await;
+
+    // Wait for shutdown signal (SIGTERM from systemd or SIGINT from Ctrl+C),
+    // then flush allocator state for fast next startup.
+    let mut sigterm = unix_signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+    tokio::select! {
+        _ = signal::ctrl_c() => {},
+        _ = sigterm.recv() => {},
+    }
+    info!("Shutdown signal received");
+
+    if let Some(db) = &validator_db {
+        if let Err(e) = task::block_in_place(|| db.flush_allocator_state()) {
+            error!(error = %e, "Failed to flush allocator state on shutdown");
+        }
+    }
+
+    handle.stop().ok();
 
     Ok(())
 }
@@ -372,9 +388,12 @@ async fn init_validator_db(
         return Ok(None);
     };
 
-    debug!(data_dir = %data_dir, "Initializing local database");
     let work_dir = PathBuf::from(data_dir);
-    let db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
+    let db_path = work_dir.join(VALIDATOR_DB_FILENAME);
+    let db = task::spawn_blocking(move || ValidatorDB::new(db_path))
+        .await
+        .map_err(|e| anyhow!("Database open task panicked: {}", e))??;
+    let db = Arc::new(db);
 
     // Check if we already have a local tip
     if db.get_local_tip()?.is_some() {

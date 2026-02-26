@@ -132,45 +132,6 @@ pub async fn fetch_blocks_batch(
         "Got tips from DB"
     );
 
-    // Check if local data is too stale (chain has moved far ahead)
-    // This happens when service was stopped for a long time
-    // Only applies in auto_advance mode (debug-trace-server) to avoid affecting stateless-validator
-    if config.auto_advance_local_tip {
-        let chain_latest = client.get_latest_block_number().await?;
-        let stale_threshold = config.pruner_blocks_to_keep;
-        if chain_latest > remote_tip.0 + stale_threshold {
-            warn!(
-                local_remote_tip = remote_tip.0,
-                chain_latest = chain_latest,
-                stale_threshold = stale_threshold,
-                "Local data is too stale, resetting to latest block"
-            );
-
-            // Fetch latest block header and reset anchor
-            let latest_header = client.get_header(BlockId::latest(), false).await?;
-            db.reset_anchor_block(
-                latest_header.number,
-                latest_header.hash,
-                latest_header.state_root,
-                latest_header.withdrawals_root.unwrap_or_default(),
-            )?;
-
-            info!(
-                new_anchor = latest_header.number,
-                block_hash = %latest_header.hash,
-                "Reset to latest block due to stale data"
-            );
-
-            return Ok(FetchResult {
-                blocks_fetched: 0,
-                should_wait: false,
-                had_error: false,
-                reverted_hashes: Vec::new(),
-                remote_chain_height: Some(chain_latest),
-            });
-        }
-    }
-
     let gap = remote_tip.0.saturating_sub(local_tip.0);
 
     // Detect and resolve chain reorgs (uses header-only RPC for efficiency)

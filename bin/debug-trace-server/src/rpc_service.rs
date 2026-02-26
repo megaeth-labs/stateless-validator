@@ -16,6 +16,7 @@ use alloy_rpc_types_eth::BlockNumberOrTag;
 use alloy_rpc_types_trace::geth::GethDebugTracingOptions;
 use dashmap::DashMap;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
+use tokio::task;
 use tracing::{trace, warn};
 use validator_core::chain_spec::ChainSpec;
 
@@ -283,13 +284,18 @@ async fn compute_debug_trace_block(
 ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
     let start = Instant::now();
 
-    let results = validator_core::trace_block(
-        chain_spec,
-        &data.block,
-        data.witness.clone(),
-        &data.contracts,
-        opts,
-    )
+    let chain_spec = chain_spec.clone();
+    let block = data.block.clone();
+    let witness = data.witness.clone();
+    let contracts = data.contracts.clone();
+    let results = task::spawn_blocking(move || {
+        validator_core::trace_block(&chain_spec, &block, witness, &contracts, opts)
+    })
+    .await
+    .map_err(|e| {
+        let msg = if e.is_panic() { "EVM panicked during trace execution" } else { "Trace task was cancelled" };
+        rpc_err(msg.to_string())
+    })?
     .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
 
     let trace_ms = start.elapsed().as_millis();
@@ -325,12 +331,18 @@ async fn compute_parity_trace_block(
 ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
     let start = Instant::now();
 
-    let results = validator_core::parity_trace_block(
-        chain_spec,
-        &data.block,
-        data.witness.clone(),
-        &data.contracts,
-    )
+    let chain_spec = chain_spec.clone();
+    let block = data.block.clone();
+    let witness = data.witness.clone();
+    let contracts = data.contracts.clone();
+    let results = task::spawn_blocking(move || {
+        validator_core::parity_trace_block(&chain_spec, &block, witness, &contracts)
+    })
+    .await
+    .map_err(|e| {
+        let msg = if e.is_panic() { "EVM panicked during trace execution" } else { "Trace task was cancelled" };
+        rpc_err(msg.to_string())
+    })?
     .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
 
     EvmExecutionMetrics::new_for_method(method_name)

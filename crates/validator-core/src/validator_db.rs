@@ -63,7 +63,7 @@
 //! - `add_contract_codes()` - Cache contract bytecodes needed during validation in batch
 //! - `get_contract_codes()` - Retrieve cached contract bytecodes by code hashes in batch
 
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, time::Instant};
 
 use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
@@ -320,28 +320,67 @@ impl ValidatorDB {
     /// If the file doesn't exist or is empty, a new database will be created
     /// and initialized with all required tables.
     pub fn new(db_path: impl AsRef<std::path::Path>) -> ValidationDbResult<Self> {
+        let db_path = db_path.as_ref();
+        let file_size = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+        tracing::info!(
+            path = %db_path.display(),
+            file_size_gb = format!("{:.2}", file_size as f64 / 1024.0 / 1024.0 / 1024.0),
+            "Opening database"
+        );
+
+        let t0 = Instant::now();
         let database = Database::create(db_path)?;
+        tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "Database file opened");
 
-        // Initialize all tables in a single write transaction
-        let write_txn = database.begin_write()?;
-        {
-            // The table initialization process is safe for existing databases - it
-            // ensures all required tables exist but does not overwrite existing data.
-            let _canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
-            let _remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
-            let _task_list = write_txn.open_table(TASK_LIST)?;
-            let _ongoing_tasks = write_txn.open_table(ONGOING_TASKS)?;
-            let _block_data = write_txn.open_table(BLOCK_DATA)?;
-            let _witnesses = write_txn.open_table(WITNESSES)?;
-            let _mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
-            let _validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
-            let _block_records = write_txn.open_table(BLOCK_RECORDS)?;
-            let _contracts = write_txn.open_table(CONTRACTS)?;
-            let _anchor_block = write_txn.open_table(ANCHOR_BLOCK)?;
+        // Check if tables need to be created (new database) or already exist (existing database).
+        // We must avoid the write transaction on existing databases: even a no-op commit is
+        // expensive on large files because redb must update its allocator B-tree, which is
+        // proportional to the database size and requires significant I/O.
+        let is_new = {
+            let read_txn = database.begin_read()?;
+            read_txn.open_table(CANONICAL_CHAIN).is_err()
+        };
+
+        if is_new {
+            tracing::info!("New database detected, initializing tables");
+            let t1 = Instant::now();
+            let write_txn = database.begin_write()?;
+            {
+                let _canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
+                let _remote_chain = write_txn.open_table(REMOTE_CHAIN)?;
+                let _task_list = write_txn.open_table(TASK_LIST)?;
+                let _ongoing_tasks = write_txn.open_table(ONGOING_TASKS)?;
+                let _block_data = write_txn.open_table(BLOCK_DATA)?;
+                let _witnesses = write_txn.open_table(WITNESSES)?;
+                let _mpt_witnesses = write_txn.open_table(MPT_WITNESSES)?;
+                let _validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
+                let _block_records = write_txn.open_table(BLOCK_RECORDS)?;
+                let _contracts = write_txn.open_table(CONTRACTS)?;
+                let _anchor_block = write_txn.open_table(ANCHOR_BLOCK)?;
+            }
+            write_txn.commit()?;
+            tracing::info!(elapsed_ms = t1.elapsed().as_millis(), "Tables initialized");
+        } else {
+            tracing::info!("Existing database, skipping table initialization");
         }
-        write_txn.commit()?;
 
+        tracing::info!(total_elapsed_ms = t0.elapsed().as_millis(), "Database ready");
         Ok(Self { database })
+    }
+
+    /// Commits a no-op write transaction with 2-phase commit to persist the allocator state.
+    ///
+    /// Call this before process shutdown. redb's regular commits are 1-phase and do not save
+    /// the allocator state; on the next open redb must do a full repair (3 full file scans)
+    /// which takes O(file_size) time — several minutes for large databases. A 2-phase commit
+    /// saves the allocator state so the next open can skip the repair entirely.
+    pub fn flush_allocator_state(&self) -> ValidationDbResult<()> {
+        let t0 = Instant::now();
+        let mut txn = self.database.begin_write()?;
+        txn.set_two_phase_commit(true);
+        txn.commit()?;
+        tracing::info!(elapsed_ms = t0.elapsed().as_millis(), "Allocator state flushed for fast restart");
+        Ok(())
     }
 
     /// Queues blocks for validation by workers.
