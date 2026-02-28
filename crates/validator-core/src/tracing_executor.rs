@@ -197,6 +197,40 @@ fn tx_info_at(block: &Block<OpTransaction>, tx: &OpTransaction, index: usize) ->
     }
 }
 
+fn replay_error(msg: impl std::fmt::Display) -> ValidationError {
+    ValidationError::BlockReplayFailed(alloy_evm::block::BlockExecutionError::msg(msg))
+}
+
+fn make_tx_ctx(info: &TransactionInfo) -> TransactionContext {
+    TransactionContext {
+        block_hash: info.block_hash,
+        tx_hash: info.hash,
+        tx_index: info.index.map(|i| i as usize),
+    }
+}
+
+macro_rules! setup_executor {
+    ($env:expr, $state:expr, $inspector:expr => $executor:ident) => {
+        let mut $executor = $env.executor_factory.create_executor_with_inspector(
+            $state,
+            $env.block_ctx.clone(),
+            $env.evm_env.clone(),
+            $inspector,
+        );
+        $executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
+    };
+}
+
+macro_rules! replay_preceding_txs {
+    ($executor:expr, $env:expr, $tx_index:expr) => {
+        for tx in $env.transactions.iter().take($tx_index) {
+            $executor
+                .execute_transaction(&tx.inner.inner)
+                .map_err(ValidationError::BlockReplayFailed)?;
+        }
+    };
+}
+
 // ---------------------------------------------------------------------------
 // TracingInspector-based helpers (shared by Call, PreState, FlatCall, Default)
 // ---------------------------------------------------------------------------
@@ -213,13 +247,7 @@ fn trace_block_with_tracing_inspector(
     >,
     tracer: &TracerKind,
 ) -> Result<Vec<TraceResult>, ValidationError> {
-    let mut executor = env.executor_factory.create_executor_with_inspector(
-        state,
-        env.block_ctx.clone(),
-        env.evm_env.clone(),
-        tracer.create_inspector(),
-    );
-    executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
+    setup_executor!(env, state, tracer.create_inspector() => executor);
 
     let mut results = Vec::with_capacity(env.transactions.len());
     for (index, tx) in env.transactions.iter().enumerate() {
@@ -342,19 +370,8 @@ fn trace_tx_with_tracing_inspector(
     tx_index: usize,
     tracer: &TracerKind,
 ) -> Result<GethTrace, ValidationError> {
-    let mut executor = env.executor_factory.create_executor_with_inspector(
-        state,
-        env.block_ctx.clone(),
-        env.evm_env.clone(),
-        tracer.create_inspector(),
-    );
-    executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
-
-    for tx in env.transactions.iter().take(tx_index) {
-        executor
-            .execute_transaction(&tx.inner.inner)
-            .map_err(ValidationError::BlockReplayFailed)?;
-    }
+    setup_executor!(env, state, tracer.create_inspector() => executor);
+    replay_preceding_txs!(executor, env, tx_index);
 
     *executor.inspector_mut() = tracer.create_inspector();
 
@@ -401,12 +418,7 @@ fn trace_tx_with_tracing_inspector(
                     };
                     Ok(final_frame.into())
                 }
-                Err(e) => Err(ValidationError::BlockReplayFailed(
-                    alloy_evm::block::BlockExecutionError::msg(format!(
-                        "PreState trace failed: {:?}",
-                        e
-                    )),
-                )),
+                Err(e) => Err(replay_error(format!("PreState trace failed: {:?}", e))),
             }
         }
         TracerKind::FlatCall(_) => {
@@ -510,16 +522,7 @@ pub fn trace_block(
                 }
 
                 GethDebugBuiltInTracerType::FourByteTracer => {
-                    let inspector = FourByteInspector::default();
-                    let mut executor = env.executor_factory.create_executor_with_inspector(
-                        &mut state,
-                        env.block_ctx.clone(),
-                        env.evm_env.clone(),
-                        inspector,
-                    );
-                    executor
-                        .apply_pre_execution_changes()
-                        .map_err(ValidationError::BlockReplayFailed)?;
+                    setup_executor!(&env, &mut state, FourByteInspector::default() => executor);
 
                     let mut results = Vec::with_capacity(env.transactions.len());
                     for (index, tx) in env.transactions.iter().enumerate() {
@@ -550,36 +553,16 @@ pub fn trace_block(
                 }
 
                 GethDebugBuiltInTracerType::MuxTracer => {
-                    let mux_config = match tracer_config.clone().into_mux_config() {
-                        Ok(cfg) => cfg,
-                        Err(_) => {
-                            return Err(ValidationError::BlockReplayFailed(
-                                alloy_evm::block::BlockExecutionError::msg(
-                                    "Invalid mux tracer config",
-                                ),
-                            ));
-                        }
-                    };
-                    let inspector = match MuxInspector::try_from_config(mux_config.clone()) {
-                        Ok(insp) => insp,
-                        Err(e) => {
-                            return Err(ValidationError::BlockReplayFailed(
-                                alloy_evm::block::BlockExecutionError::msg(format!(
-                                    "MuxInspector creation failed: {:?}",
-                                    e
-                                )),
-                            ));
-                        }
-                    };
-                    let mut executor = env.executor_factory.create_executor_with_inspector(
-                        &mut state,
-                        env.block_ctx.clone(),
-                        env.evm_env.clone(),
-                        inspector,
-                    );
-                    executor
-                        .apply_pre_execution_changes()
-                        .map_err(ValidationError::BlockReplayFailed)?;
+                    let mux_config = tracer_config
+                        .clone()
+                        .into_mux_config()
+                        .map_err(|_| replay_error("Invalid mux tracer config"))?;
+                    let inspector =
+                        MuxInspector::try_from_config(mux_config.clone()).map_err(|e| {
+                            replay_error(format!("MuxInspector creation failed: {:?}", e))
+                        })?;
+
+                    setup_executor!(&env, &mut state, inspector => executor);
 
                     let mut results = Vec::with_capacity(env.transactions.len());
                     for (index, tx) in env.transactions.iter().enumerate() {
@@ -643,31 +626,14 @@ pub fn trace_block(
                 }
 
                 let first_info = tx_info_at(block, &env.transactions[0], 0);
-                let first_ctx = TransactionContext {
-                    block_hash: first_info.block_hash,
-                    tx_hash: first_info.hash,
-                    tx_index: first_info.index.map(|i| i as usize),
-                };
                 let inspector = JsInspector::with_transaction_context(
                     code.clone(),
                     config_json.clone(),
-                    first_ctx,
+                    make_tx_ctx(&first_info),
                 )
-                .map_err(|e| {
-                    ValidationError::BlockReplayFailed(alloy_evm::block::BlockExecutionError::msg(
-                        format!("Failed to create JsInspector: {:?}", e),
-                    ))
-                })?;
+                .map_err(|e| replay_error(format!("Failed to create JsInspector: {:?}", e)))?;
 
-                let mut executor = env.executor_factory.create_executor_with_inspector(
-                    &mut state,
-                    env.block_ctx.clone(),
-                    env.evm_env.clone(),
-                    inspector,
-                );
-                executor
-                    .apply_pre_execution_changes()
-                    .map_err(ValidationError::BlockReplayFailed)?;
+                setup_executor!(&env, &mut state, inspector => executor);
 
                 let mut results = Vec::with_capacity(env.transactions.len());
                 for (index, tx) in env.transactions.iter().enumerate() {
@@ -677,15 +643,10 @@ pub fn trace_block(
 
                     if index > 0 {
                         let info = tx_info_at(block, tx, index);
-                        let tx_ctx = TransactionContext {
-                            block_hash: info.block_hash,
-                            tx_hash: info.hash,
-                            tx_index: info.index.map(|i| i as usize),
-                        };
                         match JsInspector::with_transaction_context(
                             code.clone(),
                             config_json.clone(),
-                            tx_ctx,
+                            make_tx_ctx(&info),
                         ) {
                             Ok(insp) => *executor.inspector_mut() = insp,
                             Err(e) => {
@@ -836,22 +797,8 @@ pub fn trace_transaction(
                 }
 
                 GethDebugBuiltInTracerType::FourByteTracer => {
-                    let inspector = FourByteInspector::default();
-                    let mut executor = env.executor_factory.create_executor_with_inspector(
-                        &mut state,
-                        env.block_ctx.clone(),
-                        env.evm_env.clone(),
-                        inspector,
-                    );
-                    executor
-                        .apply_pre_execution_changes()
-                        .map_err(ValidationError::BlockReplayFailed)?;
-
-                    for tx in env.transactions.iter().take(tx_index) {
-                        executor
-                            .execute_transaction(&tx.inner.inner)
-                            .map_err(ValidationError::BlockReplayFailed)?;
-                    }
+                    setup_executor!(&env, &mut state, FourByteInspector::default() => executor);
+                    replay_preceding_txs!(executor, &env, tx_index);
 
                     *executor.inspector_mut() = FourByteInspector::default();
 
@@ -863,44 +810,21 @@ pub fn trace_transaction(
                 }
 
                 GethDebugBuiltInTracerType::MuxTracer => {
-                    let mux_config = tracer_config.clone().into_mux_config().map_err(|_| {
-                        ValidationError::BlockReplayFailed(
-                            alloy_evm::block::BlockExecutionError::msg("Invalid mux tracer config"),
-                        )
-                    })?;
+                    let mux_config = tracer_config
+                        .clone()
+                        .into_mux_config()
+                        .map_err(|_| replay_error("Invalid mux tracer config"))?;
                     let inspector =
                         MuxInspector::try_from_config(mux_config.clone()).map_err(|e| {
-                            ValidationError::BlockReplayFailed(
-                                alloy_evm::block::BlockExecutionError::msg(format!(
-                                    "MuxInspector creation failed: {:?}",
-                                    e
-                                )),
-                            )
+                            replay_error(format!("MuxInspector creation failed: {:?}", e))
                         })?;
-                    let mut executor = env.executor_factory.create_executor_with_inspector(
-                        &mut state,
-                        env.block_ctx.clone(),
-                        env.evm_env.clone(),
-                        inspector,
-                    );
-                    executor
-                        .apply_pre_execution_changes()
-                        .map_err(ValidationError::BlockReplayFailed)?;
 
-                    for tx in env.transactions.iter().take(tx_index) {
-                        executor
-                            .execute_transaction(&tx.inner.inner)
-                            .map_err(ValidationError::BlockReplayFailed)?;
-                    }
+                    setup_executor!(&env, &mut state, inspector => executor);
+                    replay_preceding_txs!(executor, &env, tx_index);
 
                     *executor.inspector_mut() =
                         MuxInspector::try_from_config(mux_config).map_err(|e| {
-                            ValidationError::BlockReplayFailed(
-                                alloy_evm::block::BlockExecutionError::msg(format!(
-                                    "MuxInspector creation failed: {:?}",
-                                    e
-                                )),
-                            )
+                            replay_error(format!("MuxInspector creation failed: {:?}", e))
                         })?;
 
                     let outcome = executor
@@ -917,65 +841,29 @@ pub fn trace_transaction(
                     inspector
                         .try_into_mux_frame(&result_and_state, db, info)
                         .map(|frame| frame.into())
-                        .map_err(|e| {
-                            ValidationError::BlockReplayFailed(
-                                alloy_evm::block::BlockExecutionError::msg(format!(
-                                    "MuxFrame creation failed: {:?}",
-                                    e
-                                )),
-                            )
-                        })
+                        .map_err(|e| replay_error(format!("MuxFrame creation failed: {:?}", e)))
                 }
             },
 
             GethDebugTracerType::JsTracer(code) => {
                 let config_json = tracer_config.clone().into_json();
-                let tx_ctx = TransactionContext {
-                    block_hash: info.block_hash,
-                    tx_hash: info.hash,
-                    tx_index: info.index.map(|i| i as usize),
-                };
+                let tx_ctx = make_tx_ctx(&info);
                 let inspector = JsInspector::with_transaction_context(
                     code.clone(),
                     config_json.clone(),
                     tx_ctx,
                 )
-                .map_err(|e| {
-                    ValidationError::BlockReplayFailed(alloy_evm::block::BlockExecutionError::msg(
-                        format!("Failed to create JsInspector: {:?}", e),
-                    ))
-                })?;
+                .map_err(|e| replay_error(format!("Failed to create JsInspector: {:?}", e)))?;
 
-                let mut executor = env.executor_factory.create_executor_with_inspector(
-                    &mut state,
-                    env.block_ctx.clone(),
-                    env.evm_env.clone(),
-                    inspector,
-                );
-                executor
-                    .apply_pre_execution_changes()
-                    .map_err(ValidationError::BlockReplayFailed)?;
-
-                for tx in env.transactions.iter().take(tx_index) {
-                    executor
-                        .execute_transaction(&tx.inner.inner)
-                        .map_err(ValidationError::BlockReplayFailed)?;
-                }
+                setup_executor!(&env, &mut state, inspector => executor);
+                replay_preceding_txs!(executor, &env, tx_index);
 
                 *executor.inspector_mut() = JsInspector::with_transaction_context(
                     code.clone(),
                     config_json,
-                    TransactionContext {
-                        block_hash: info.block_hash,
-                        tx_hash: info.hash,
-                        tx_index: info.index.map(|i| i as usize),
-                    },
+                    make_tx_ctx(&info),
                 )
-                .map_err(|e| {
-                    ValidationError::BlockReplayFailed(alloy_evm::block::BlockExecutionError::msg(
-                        format!("Failed to create JsInspector: {:?}", e),
-                    ))
-                })?;
+                .map_err(|e| replay_error(format!("Failed to create JsInspector: {:?}", e)))?;
 
                 let outcome = executor
                     .run_transaction(recovered_target)
@@ -990,14 +878,7 @@ pub fn trace_transaction(
                 js_inspector
                     .json_result(result_and_state, &tx_env, &evm_env_ref.block_env, &*db)
                     .map(GethTrace::JS)
-                    .map_err(|e| {
-                        ValidationError::BlockReplayFailed(
-                            alloy_evm::block::BlockExecutionError::msg(format!(
-                                "JS tracer execution failed: {:?}",
-                                e
-                            )),
-                        )
-                    })
+                    .map_err(|e| replay_error(format!("JS tracer execution failed: {:?}", e)))
             }
         };
     }
@@ -1028,13 +909,7 @@ pub fn parity_trace_block(
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
     let inspector = TracingInspector::new(TracingInspectorConfig::default_parity());
-    let mut executor = env.executor_factory.create_executor_with_inspector(
-        &mut state,
-        env.block_ctx.clone(),
-        env.evm_env.clone(),
-        inspector,
-    );
-    executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
+    setup_executor!(&env, &mut state, inspector => executor);
 
     let mut all_traces = Vec::new();
 
@@ -1088,19 +963,8 @@ pub fn parity_trace_transaction(
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
     let inspector = TracingInspector::new(TracingInspectorConfig::default_parity());
-    let mut executor = env.executor_factory.create_executor_with_inspector(
-        &mut state,
-        env.block_ctx.clone(),
-        env.evm_env.clone(),
-        inspector,
-    );
-    executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
-
-    for tx in env.transactions.iter().take(tx_index) {
-        executor
-            .execute_transaction(&tx.inner.inner)
-            .map_err(ValidationError::BlockReplayFailed)?;
-    }
+    setup_executor!(&env, &mut state, inspector => executor);
+    replay_preceding_txs!(executor, &env, tx_index);
 
     *executor.inspector_mut() = TracingInspector::new(TracingInspectorConfig::default_parity());
 
