@@ -388,8 +388,8 @@ async fn init_validator_db(
         debug!(start_block = %start_block_str, "Initializing from specified start block");
         let block_hash = parse_block_hash(start_block_str)?;
         loop {
-            match rpc_client.get_block(BlockId::Hash(block_hash.into()), false).await {
-                Ok(block) => break block.header,
+            match rpc_client.get_header(BlockId::Hash(block_hash.into()), false).await {
+                Ok(header) => break header,
                 Err(e) => {
                     warn!(
                         block_hash = %block_hash,
@@ -404,8 +404,8 @@ async fn init_validator_db(
         // Auto-initialize from latest block
         info!("No local tip found, fetching latest block as anchor");
         loop {
-            match rpc_client.get_block(BlockId::latest(), false).await {
-                Ok(block) => break block.header,
+            match rpc_client.get_header(BlockId::latest(), false).await {
+                Ok(header) => break header,
                 Err(e) => {
                     warn!(error = %e, "Failed to fetch latest block, retrying");
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;

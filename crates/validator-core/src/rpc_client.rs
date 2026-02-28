@@ -39,7 +39,7 @@ pub enum RpcMethod {
     EthGetBlockByNumber,
     /// eth_blockNumber
     EthBlockNumber,
-    /// Header fetch (via eth_getBlockByNumber / eth_getBlockByHash without full txs)
+    /// eth_getHeaderByNumber / eth_getHeaderByHash
     EthGetHeader,
     /// mega_getBlockWitness
     MegaGetBlockWitness,
@@ -311,9 +311,10 @@ impl RpcClient {
 
     /// Gets the block header by block ID.
     ///
-    /// Internally uses `eth_getBlockByNumber` / `eth_getBlockByHash` (without full transactions)
-    /// and extracts the header. This is compatible with all RPC endpoints, including those that
-    /// do not support `eth_getHeaderByNumber` / `eth_getHeaderByHash`.
+    /// Uses `eth_getHeaderByNumber` / `eth_getHeaderByHash` instead of `eth_getBlockByNumber`
+    /// to avoid transferring the transaction hash list. Even without full transaction objects,
+    /// `eth_getBlockByNumber` still returns all transaction hashes, which is significant
+    /// at high TPS.
     ///
     /// When `verify_hash` is true, computes `hash_slow()` to verify the header hash matches
     /// the RPC-provided hash. This is important when initializing from a trusted start block
@@ -321,16 +322,47 @@ impl RpcClient {
     /// `verify_block_integrity`) or when running in a trusted context like the trace server.
     pub async fn get_header(&self, block_id: BlockId, verify_hash: bool) -> Result<Header> {
         let start = Instant::now();
-        // Use get_block_unchecked (without full txs) instead of eth_getHeaderBy* RPCs,
-        // as some endpoints don't support the header-only methods.
-        // get_block_unchecked already verifies block_id matches the returned block.
-        let result = self.get_block_unchecked(block_id, false).await.map(|block| block.header);
+        let result = match block_id {
+            BlockId::Hash(hash) => self
+                .data_provider
+                .client()
+                .request::<_, Header>("eth_getHeaderByHash", (hash.block_hash,))
+                .await
+                .map_err(|e| eyre!("eth_getHeaderByHash for {} failed: {e}", hash.block_hash)),
+            BlockId::Number(tag) => self
+                .data_provider
+                .client()
+                .request::<_, Header>("eth_getHeaderByNumber", (tag,))
+                .await
+                .map_err(|e| eyre!("eth_getHeaderByNumber for {:?} failed: {e}", tag)),
+        };
         self.record_rpc(
             RpcMethod::EthGetHeader,
             result.is_ok(),
             Some(start.elapsed().as_secs_f64()),
         );
         let header = result?;
+
+        // Verify block_id matches the returned header
+        match block_id {
+            BlockId::Number(BlockNumberOrTag::Number(num)) => {
+                ensure!(
+                    header.number == num,
+                    "Header number mismatch: requested {}, got {}",
+                    num,
+                    header.number
+                );
+            }
+            BlockId::Hash(hash) => {
+                ensure!(
+                    header.hash == hash.block_hash,
+                    "Header hash mismatch: requested {:?}, got {:?}",
+                    hash.block_hash,
+                    header.hash
+                );
+            }
+            _ => {}
+        }
 
         if verify_hash {
             // Verify header hash matches the computed hash
@@ -346,12 +378,15 @@ impl RpcClient {
     }
 
     /// Gets just the block hash for a block number.
+    ///
+    /// Uses `eth_getHeaderByNumber` to avoid transferring the large transaction hash list
+    /// that `eth_getBlockByNumber` would include (e.g., for divergence checking).
     pub async fn get_block_hash(&self, block_number: u64) -> Result<B256> {
         self.get_header(BlockId::Number(BlockNumberOrTag::Number(block_number)), false)
             .await
             .map_err(|e| {
-                let err = eyre!("get_block_hash for block {} failed: {e}", block_number);
-                trace!(block_number, error = %e, "get_block_hash failed");
+                let err = eyre!("eth_getHeaderByNumber for block {} failed: {e}", block_number);
+                trace!(block_number, error = %e, "eth_getHeaderByNumber failed");
                 err
             })
             .map(|h| h.hash)
