@@ -170,8 +170,8 @@ pub struct RpcContext {
     data_provider: Arc<DataProvider>,
     /// Chain specification containing hardfork activation rules.
     chain_spec: Arc<ChainSpec>,
-    /// Response cache for HTTP layer caching.
-    response_cache: ResponseCache,
+    /// Response cache for HTTP layer caching (None = disabled).
+    response_cache: Option<ResponseCache>,
     /// Watch dog for tracking in-flight requests.
     watch_dog: RpcWatchDog,
 }
@@ -181,7 +181,7 @@ impl RpcContext {
     pub fn new(
         data_provider: Arc<DataProvider>,
         chain_spec: Arc<ChainSpec>,
-        response_cache: ResponseCache,
+        response_cache: Option<ResponseCache>,
     ) -> Self {
         Self { data_provider, chain_spec, response_cache, watch_dog: RpcWatchDog::new() }
     }
@@ -349,14 +349,14 @@ async fn compute_parity_trace_block(
 
 /// Checks cache by block number and returns cached value if found.
 fn check_cache_by_number(
-    cache: &ResponseCache,
+    cache: &Option<ResponseCache>,
     resource: CachedResource,
     block_num: u64,
     variant: &ResponseVariant,
     method_name: &'static str,
     start: Instant,
 ) -> Option<serde_json::Value> {
-    let cached_value = cache.get(resource, block_num, variant.clone())?;
+    let cached_value = cache.as_ref()?.get(resource, block_num, variant.clone())?;
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
     metrics::record_rpc_request(method_name, total_ms / 1000.0);
@@ -376,14 +376,15 @@ fn check_cache_by_number(
 
 /// Checks cache by block hash and returns cached value if found.
 fn check_cache_by_hash(
-    cache: &ResponseCache,
+    cache: &Option<ResponseCache>,
     resource: CachedResource,
     block_hash: B256,
     variant: &ResponseVariant,
     method_name: &'static str,
     start: Instant,
 ) -> Option<serde_json::Value> {
-    let (cached_value, block_num) = cache.get_by_hash(resource, block_hash, variant.clone())?;
+    let (cached_value, block_num) =
+        cache.as_ref()?.get_by_hash(resource, block_hash, variant.clone())?;
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
     metrics::record_rpc_request(method_name, total_ms / 1000.0);
@@ -485,13 +486,15 @@ impl DebugTraceRpcServer for RpcContext {
 
         // Stage 5: Cache result
         let t4 = Instant::now();
-        self.response_cache.insert(
-            CachedResource::DebugTraceBlock,
-            block_num,
-            block_hash,
-            variant,
-            result.clone(),
-        );
+        if let Some(cache) = &self.response_cache {
+            cache.insert(
+                CachedResource::DebugTraceBlock,
+                block_num,
+                block_hash,
+                variant,
+                result.clone(),
+            );
+        }
         let cache_insert_ms = t4.elapsed().as_millis();
 
         let total_ms = start.elapsed().as_millis();
@@ -560,13 +563,15 @@ impl DebugTraceRpcServer for RpcContext {
         })?;
 
         // Cache and record metrics
-        self.response_cache.insert(
-            CachedResource::DebugTraceBlock,
-            block_num,
-            block_hash,
-            variant,
-            result.clone(),
-        );
+        if let Some(cache) = &self.response_cache {
+            cache.insert(
+                CachedResource::DebugTraceBlock,
+                block_num,
+                block_hash,
+                variant,
+                result.clone(),
+            );
+        }
         record_request_completion(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, block_num, start);
 
         Ok(result)
@@ -627,8 +632,15 @@ impl DebugTraceRpcServer for RpcContext {
     }
 
     async fn get_cache_status(&self) -> RpcResult<serde_json::Value> {
-        let stats = self.response_cache.stats();
+        let Some(cache) = &self.response_cache else {
+            return Ok(serde_json::json!({
+                "responseCache": {
+                    "status": "disabled"
+                }
+            }));
+        };
 
+        let stats = cache.stats();
         Ok(serde_json::json!({
             "responseCache": {
                 "entryCount": stats.entry_count,
@@ -687,13 +699,15 @@ impl TraceRpcServer for RpcContext {
             })?;
 
         // Cache and record metrics
-        self.response_cache.insert(
-            CachedResource::TraceBlock,
-            block_num,
-            block_hash,
-            ResponseVariant::Default,
-            result.clone(),
-        );
+        if let Some(cache) = &self.response_cache {
+            cache.insert(
+                CachedResource::TraceBlock,
+                block_num,
+                block_hash,
+                ResponseVariant::Default,
+                result.clone(),
+            );
+        }
         record_request_completion(METHOD_TRACE_BLOCK, block_num, start);
 
         Ok(result)
