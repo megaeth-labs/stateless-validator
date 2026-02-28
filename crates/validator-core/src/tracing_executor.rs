@@ -42,8 +42,7 @@ use alloy_rpc_types_trace::{
 };
 use eyre::Result;
 use mega_evm::{
-    BlockLimits, MegaBlockExecutionCtx,
-    MegaBlockExecutorFactory, MegaEvmFactory, MegaHardforks,
+    BlockLimits, MegaBlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory, MegaHardforks,
 };
 use op_alloy_network::TransactionResponse;
 use op_alloy_rpc_types::Transaction as OpTransaction;
@@ -209,7 +208,9 @@ fn tx_info_at(block: &Block<OpTransaction>, tx: &OpTransaction, index: usize) ->
 fn trace_block_with_tracing_inspector(
     env: &TracingEnv<'_>,
     block: &Block<OpTransaction>,
-    state: &mut State<revm::database::WrapDatabaseRef<&CacheDB<&WitnessDatabase<'_, LightWitnessExecutor>>>>,
+    state: &mut State<
+        revm::database::WrapDatabaseRef<&CacheDB<&WitnessDatabase<'_, LightWitnessExecutor>>>,
+    >,
     tracer: &TracerKind,
 ) -> Result<Vec<TraceResult>, ValidationError> {
     let mut executor = env.executor_factory.create_executor_with_inspector(
@@ -218,9 +219,7 @@ fn trace_block_with_tracing_inspector(
         env.evm_env.clone(),
         tracer.create_inspector(),
     );
-    executor
-        .apply_pre_execution_changes()
-        .map_err(ValidationError::BlockReplayFailed)?;
+    executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
 
     let mut results = Vec::with_capacity(env.transactions.len());
     for (index, tx) in env.transactions.iter().enumerate() {
@@ -239,7 +238,7 @@ fn trace_block_with_tracing_inspector(
                         inspector.set_transaction_gas_limit(tx.inner.gas_limit());
                         let frame = inspector
                             .geth_builder()
-                            .geth_call_traces(call_config.clone(), gas_used);
+                            .geth_call_traces(*call_config, gas_used);
                         Ok(GethTrace::from(frame))
                     }
                     TracerKind::PreState(prestate_config) => {
@@ -247,9 +246,7 @@ fn trace_block_with_tracing_inspector(
                             result: outcome.inner.result,
                             state: outcome.inner.state,
                         };
-                        executor
-                            .inspector_mut()
-                            .set_transaction_gas_limit(tx.inner.gas_limit());
+                        executor.inspector_mut().set_transaction_gas_limit(tx.inner.gas_limit());
                         let frame_result = {
                             let db = executor.evm.db();
                             let inspector = executor.inspector();
@@ -263,11 +260,7 @@ fn trace_block_with_tracing_inspector(
                             Ok(frame) => {
                                 let final_frame = if prestate_config.is_diff_mode() {
                                     let db = executor.evm.db();
-                                    add_accessed_unchanged_accounts(
-                                        frame,
-                                        &state_changes,
-                                        db,
-                                    )
+                                    add_accessed_unchanged_accounts(frame, &state_changes, db)
                                 } else {
                                     frame
                                 };
@@ -292,9 +285,11 @@ fn trace_block_with_tracing_inspector(
                             outcome.inner.result.output().cloned().unwrap_or_default();
                         let inspector = executor.inspector_mut();
                         inspector.set_transaction_gas_limit(tx.inner.gas_limit());
-                        let frame = inspector
-                            .geth_builder()
-                            .geth_traces(gas_used, return_value, opts.config);
+                        let frame = inspector.geth_builder().geth_traces(
+                            gas_used,
+                            return_value,
+                            opts.config,
+                        );
 
                         // Convert DefaultFrame to JSON and fix returnValue serialization.
                         // alloy-rpc-types-trace 1.1.2 serializes Bytes with "0x" prefix,
@@ -319,10 +314,7 @@ fn trace_block_with_tracing_inspector(
                         });
                     }
                     Err(e) => {
-                        results.push(TraceResult::Error {
-                            error: e,
-                            tx_hash: Some(tx_hash),
-                        });
+                        results.push(TraceResult::Error { error: e, tx_hash: Some(tx_hash) });
                     }
                 }
 
@@ -331,10 +323,7 @@ fn trace_block_with_tracing_inspector(
             }
             Err(e) => {
                 warn!(tx_index = index, tx_hash = %tx_hash, %e, "Transaction trace failed");
-                results.push(TraceResult::Error {
-                    error: e.to_string(),
-                    tx_hash: Some(tx_hash),
-                });
+                results.push(TraceResult::Error { error: e.to_string(), tx_hash: Some(tx_hash) });
             }
         }
     }
@@ -348,7 +337,9 @@ fn trace_block_with_tracing_inspector(
 fn trace_tx_with_tracing_inspector(
     env: &TracingEnv<'_>,
     block: &Block<OpTransaction>,
-    state: &mut State<revm::database::WrapDatabaseRef<&CacheDB<&WitnessDatabase<'_, LightWitnessExecutor>>>>,
+    state: &mut State<
+        revm::database::WrapDatabaseRef<&CacheDB<&WitnessDatabase<'_, LightWitnessExecutor>>>,
+    >,
     tx_index: usize,
     tracer: &TracerKind,
 ) -> Result<GethTrace, ValidationError> {
@@ -358,9 +349,7 @@ fn trace_tx_with_tracing_inspector(
         env.evm_env.clone(),
         tracer.create_inspector(),
     );
-    executor
-        .apply_pre_execution_changes()
-        .map_err(ValidationError::BlockReplayFailed)?;
+    executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
 
     for tx in env.transactions.iter().take(tx_index) {
         executor
@@ -374,16 +363,15 @@ fn trace_tx_with_tracing_inspector(
     let recovered_target = &target_tx.inner.inner;
     let tx_gas_limit = target_tx.inner.gas_limit();
 
-    let outcome = executor
-        .run_transaction(recovered_target)
-        .map_err(ValidationError::BlockReplayFailed)?;
+    let outcome =
+        executor.run_transaction(recovered_target).map_err(ValidationError::BlockReplayFailed)?;
 
     match tracer {
         TracerKind::Call(call_config) => {
             let gas_used = outcome.inner.result.gas_used();
             let inspector = executor.inspector_mut();
             inspector.set_transaction_gas_limit(tx_gas_limit);
-            let frame = inspector.geth_builder().geth_call_traces(call_config.clone(), gas_used);
+            let frame = inspector.geth_builder().geth_call_traces(*call_config, gas_used);
             Ok(frame.into())
         }
         TracerKind::PreState(prestate_config) => {
@@ -438,16 +426,13 @@ fn trace_tx_with_tracing_inspector(
 
             let inspector = executor.inspector_mut();
             inspector.set_transaction_gas_limit(tx_gas_limit);
-            let frame =
-                inspector.geth_builder().geth_traces(gas_used, return_value, opts.config);
+            let frame = inspector.geth_builder().geth_traces(gas_used, return_value, opts.config);
 
             let mut frame_value = serde_json::to_value(frame).unwrap();
             if let Some(rv) = frame_value.get_mut("returnValue") &&
                 let Some(s) = rv.as_str()
             {
-                *rv = serde_json::Value::String(
-                    s.strip_prefix("0x").unwrap_or(s).to_string(),
-                );
+                *rv = serde_json::Value::String(s.strip_prefix("0x").unwrap_or(s).to_string());
             }
             Ok(GethTrace::JS(frame_value))
         }
@@ -496,7 +481,10 @@ pub fn trace_block(
                 GethDebugBuiltInTracerType::CallTracer => {
                     let call_config = tracer_config.clone().into_call_config().unwrap_or_default();
                     trace_block_with_tracing_inspector(
-                        &env, block, &mut state, &TracerKind::Call(call_config),
+                        &env,
+                        block,
+                        &mut state,
+                        &TracerKind::Call(call_config),
                     )?
                 }
 
@@ -504,7 +492,10 @@ pub fn trace_block(
                     let prestate_config =
                         tracer_config.clone().into_pre_state_config().unwrap_or_default();
                     trace_block_with_tracing_inspector(
-                        &env, block, &mut state, &TracerKind::PreState(prestate_config),
+                        &env,
+                        block,
+                        &mut state,
+                        &TracerKind::PreState(prestate_config),
                     )?
                 }
 
@@ -512,7 +503,10 @@ pub fn trace_block(
                     let flat_call_config =
                         tracer_config.clone().into_flat_call_config().unwrap_or_default();
                     trace_block_with_tracing_inspector(
-                        &env, block, &mut state, &TracerKind::FlatCall(flat_call_config),
+                        &env,
+                        block,
+                        &mut state,
+                        &TracerKind::FlatCall(flat_call_config),
                     )?
                 }
 
@@ -623,10 +617,7 @@ pub fn trace_block(
                                     }
                                     Err(e) => {
                                         results.push(TraceResult::Error {
-                                            error: format!(
-                                                "MuxFrame creation failed: {:?}",
-                                                e
-                                            ),
+                                            error: format!("MuxFrame creation failed: {:?}", e),
                                             tx_hash: Some(tx_hash),
                                         });
                                     }
@@ -760,9 +751,7 @@ pub fn trace_block(
             }
         }
     } else {
-        trace_block_with_tracing_inspector(
-            &env, block, &mut state, &TracerKind::Default(opts),
-        )?
+        trace_block_with_tracing_inspector(&env, block, &mut state, &TracerKind::Default(opts))?
     };
 
     trace!(traced_count = results.len(), "Block trace completed");
@@ -815,7 +804,11 @@ pub fn trace_transaction(
                 GethDebugBuiltInTracerType::CallTracer => {
                     let call_config = tracer_config.clone().into_call_config().unwrap_or_default();
                     trace_tx_with_tracing_inspector(
-                        &env, block, &mut state, tx_index, &TracerKind::Call(call_config),
+                        &env,
+                        block,
+                        &mut state,
+                        tx_index,
+                        &TracerKind::Call(call_config),
                     )
                 }
 
@@ -823,7 +816,11 @@ pub fn trace_transaction(
                     let prestate_config =
                         tracer_config.clone().into_pre_state_config().unwrap_or_default();
                     trace_tx_with_tracing_inspector(
-                        &env, block, &mut state, tx_index, &TracerKind::PreState(prestate_config),
+                        &env,
+                        block,
+                        &mut state,
+                        tx_index,
+                        &TracerKind::PreState(prestate_config),
                     )
                 }
 
@@ -831,7 +828,11 @@ pub fn trace_transaction(
                     let flat_call_config =
                         tracer_config.clone().into_flat_call_config().unwrap_or_default();
                     trace_tx_with_tracing_inspector(
-                        &env, block, &mut state, tx_index, &TracerKind::FlatCall(flat_call_config),
+                        &env,
+                        block,
+                        &mut state,
+                        tx_index,
+                        &TracerKind::FlatCall(flat_call_config),
                     )
                 }
 
@@ -865,9 +866,7 @@ pub fn trace_transaction(
                 GethDebugBuiltInTracerType::MuxTracer => {
                     let mux_config = tracer_config.clone().into_mux_config().map_err(|_| {
                         ValidationError::BlockReplayFailed(
-                            alloy_evm::block::BlockExecutionError::msg(
-                                "Invalid mux tracer config",
-                            ),
+                            alloy_evm::block::BlockExecutionError::msg("Invalid mux tracer config"),
                         )
                     })?;
                     let inspector =
@@ -983,10 +982,8 @@ pub fn trace_transaction(
                     .run_transaction(recovered_target)
                     .map_err(ValidationError::BlockReplayFailed)?;
                 let result = outcome.inner.result;
-                let result_and_state = revm::context::result::ResultAndState {
-                    result,
-                    state: outcome.inner.state,
-                };
+                let result_and_state =
+                    revm::context::result::ResultAndState { result, state: outcome.inner.state };
 
                 let evm_env_ref = env.evm_env.clone();
                 let tx_env = TxEnv::default();
@@ -1007,9 +1004,7 @@ pub fn trace_transaction(
     }
 
     // Default: struct logger tracer
-    trace_tx_with_tracing_inspector(
-        &env, block, &mut state, tx_index, &TracerKind::Default(opts),
-    )
+    trace_tx_with_tracing_inspector(&env, block, &mut state, tx_index, &TracerKind::Default(opts))
 }
 
 // ---------------------------------------------------------------------------
@@ -1040,9 +1035,7 @@ pub fn parity_trace_block(
         env.evm_env.clone(),
         inspector,
     );
-    executor
-        .apply_pre_execution_changes()
-        .map_err(ValidationError::BlockReplayFailed)?;
+    executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
 
     let mut all_traces = Vec::new();
 
@@ -1102,9 +1095,7 @@ pub fn parity_trace_transaction(
         env.evm_env.clone(),
         inspector,
     );
-    executor
-        .apply_pre_execution_changes()
-        .map_err(ValidationError::BlockReplayFailed)?;
+    executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
 
     for tx in env.transactions.iter().take(tx_index) {
         executor
