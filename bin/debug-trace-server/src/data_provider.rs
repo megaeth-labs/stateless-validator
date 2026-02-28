@@ -245,8 +245,8 @@ impl DataProvider {
             BlockNumberOrTag::Pending => Err(eyre::eyre!("Pending block not supported")),
             BlockNumberOrTag::Finalized | BlockNumberOrTag::Safe => {
                 // Fetch the header from upstream RPC to resolve the tag
-                let header = self.rpc_client.get_header(BlockId::Number(tag), false).await?;
-                Ok(header.number)
+                let block = self.rpc_client.get_block(BlockId::Number(tag), false).await?;
+                Ok(block.header.number)
             }
         }
     }
@@ -374,9 +374,9 @@ impl DataProvider {
 
         // Step 1: Fetch header first to get the block number
         let start = std::time::Instant::now();
-        let header = self.rpc_client.get_header(BlockId::Hash(block_hash.into()), false).await;
-        upstream_header.record_request(header.is_ok(), start.elapsed().as_secs_f64());
-        let header = header?;
+        let block_res = self.rpc_client.get_block(BlockId::Hash(block_hash.into()), false).await;
+        upstream_header.record_request(block_res.is_ok(), start.elapsed().as_secs_f64());
+        let header = block_res?.header;
         let block_number = header.number;
         let fetch_header_ms = start.elapsed().as_millis();
 

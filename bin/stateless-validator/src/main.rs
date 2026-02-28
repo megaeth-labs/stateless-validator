@@ -161,7 +161,7 @@ async fn run(args: CommandLineArgs) -> Result<()> {
         &args.rpc_endpoint,
         &args.witness_endpoint,
         rpc_config,
-        None, // No Cloudflare fallback for validator
+        Some(&args.witness_endpoint), // No Cloudflare fallback for validator
         args.report_validation_endpoint.as_deref(),
     )?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);

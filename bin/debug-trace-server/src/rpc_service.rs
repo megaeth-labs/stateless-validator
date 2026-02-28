@@ -16,7 +16,7 @@ use alloy_rpc_types_eth::BlockNumberOrTag;
 use alloy_rpc_types_trace::geth::GethDebugTracingOptions;
 use dashmap::DashMap;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
-use tracing::{trace, warn};
+use tracing::{error, trace, warn};
 use validator_core::chain_spec::ChainSpec;
 
 use crate::{
@@ -239,6 +239,7 @@ fn block_data_err(block_num: u64, e: eyre::Report) -> jsonrpsee::types::ErrorObj
     if err_str.contains("not found") || err_str.contains("timeout") || err_str.contains("witness") {
         rpc_err_not_found(format!("block not found: {:#x}", block_num))
     } else {
+        error!(block_number = block_num, err = %e, "Internal error fetching block data");
         rpc_err("internal error".to_string())
     }
 }
@@ -252,6 +253,7 @@ fn block_data_err_by_hash(block_hash: B256, e: eyre::Report) -> jsonrpsee::types
     {
         rpc_err_not_found(format!("block not found: hash {}", block_hash))
     } else {
+        error!(block_hash = %block_hash, err = %e, "Internal error fetching block data by hash");
         rpc_err("internal error".to_string())
     }
 }
@@ -266,6 +268,7 @@ fn tx_data_err(e: eyre::Report) -> jsonrpsee::types::ErrorObjectOwned {
     {
         rpc_err_not_found("transaction not found".to_string())
     } else {
+        error!(err = %e, "Internal error fetching transaction data");
         rpc_err("internal error".to_string())
     }
 }
@@ -716,6 +719,7 @@ impl TraceRpcServer for RpcContext {
                     return Ok(serde_json::Value::Null);
                 }
                 metrics::record_rpc_error(METHOD_TRACE_TRANSACTION);
+                error!(err = %e, "Internal error fetching transaction data (parity)");
                 return Err(rpc_err("internal error".to_string()));
             }
         };
