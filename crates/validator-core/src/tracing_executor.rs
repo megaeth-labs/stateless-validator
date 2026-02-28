@@ -236,9 +236,8 @@ fn trace_block_with_tracing_inspector(
                         let gas_used = outcome.inner.result.gas_used();
                         let inspector = executor.inspector_mut();
                         inspector.set_transaction_gas_limit(tx.inner.gas_limit());
-                        let frame = inspector
-                            .geth_builder()
-                            .geth_call_traces(*call_config, gas_used);
+                        let frame =
+                            inspector.geth_builder().geth_call_traces(*call_config, gas_used);
                         Ok(GethTrace::from(frame))
                     }
                     TracerKind::PreState(prestate_config) => {
