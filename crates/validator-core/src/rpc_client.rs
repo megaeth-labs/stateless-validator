@@ -144,8 +144,6 @@ pub struct RpcClient {
     pub data_provider: RootProvider<Optimism>,
     /// Witness provider for fetching SALT witness data.
     pub witness_provider: RootProvider,
-    /// Optional Cloudflare witness provider for pruned/archived blocks.
-    cloudflare_witness_provider: Option<RootProvider>,
     /// Optional dedicated provider for reporting validated blocks.
     report_provider: Option<RootProvider<Optimism>>,
     /// Configuration controlling verification behavior
@@ -159,7 +157,7 @@ impl RpcClient {
     /// * `data_api` - HTTP URL of the standard JSON-RPC endpoint for blocks and contract data
     /// * `witness_api` - HTTP URL of the witness RPC endpoint for SALT witness data
     pub fn new(data_api: &str, witness_api: &str) -> Result<Self> {
-        Self::new_with_config(data_api, witness_api, RpcClientConfig::default(), None, None)
+        Self::new_with_config(data_api, witness_api, RpcClientConfig::default(), None)
     }
 
     /// Creates a new RPC client with custom configuration.
@@ -174,17 +172,8 @@ impl RpcClient {
         data_api: &str,
         witness_api: &str,
         config: RpcClientConfig,
-        cloudflare_witness_api: Option<&str>,
         report_api: Option<&str>,
     ) -> Result<Self> {
-        let cloudflare_witness_provider = cloudflare_witness_api
-            .map(|url| -> Result<RootProvider> {
-                Ok(ProviderBuilder::default().connect_http(
-                    url.parse().context("Failed to parse Cloudflare witness API URL")?,
-                ))
-            })
-            .transpose()?;
-
         let report_provider = report_api
             .map(|url| -> Result<RootProvider<Optimism>> {
                 Ok(ProviderBuilder::<_, _, Optimism>::default()
@@ -197,7 +186,6 @@ impl RpcClient {
                 .connect_http(data_api.parse().context("Failed to parse API URL")?),
             witness_provider: ProviderBuilder::default()
                 .connect_http(witness_api.parse().context("Failed to parse API URL")?),
-            cloudflare_witness_provider,
             report_provider,
             config,
         })
@@ -395,78 +383,13 @@ impl RpcClient {
     /// Gets execution witness data for a specific block.
     pub async fn get_witness(&self, number: u64, hash: B256) -> Result<(SaltWitness, MptWitness)> {
         let start = Instant::now();
-        // Format as hex strings - witness endpoint expects two string parameters
-        let block_number_hex = format!("0x{:x}", number);
-        let block_hash_hex = format!("{}", hash);
-        let result: Result<(SaltWitness, MptWitness)> = self
-            .witness_provider
-            .client()
-            .request("mega_getBlockWitness", (block_number_hex, block_hash_hex))
-            .await
-            .map_err(|e| eyre!("Failed to get witness for block {hash}: {e}"));
-
-        self.record_rpc(
-            RpcMethod::MegaGetBlockWitness,
-            result.is_ok(),
-            Some(start.elapsed().as_secs_f64()),
-        );
-
-        if let Err(ref e) = result {
-            trace!(block_number = number, %hash, error = %e, "Witness generator mega_getBlockWitness failed");
-        }
-
-        if let Ok((ref witness, ref mpt_witness)) = result &&
-            let Some(ref metrics) = self.config.metrics
-        {
-            // Estimate sizes without full serialization (approximate but efficient)
-            // SaltKey (8 bytes) + Option<SaltValue> (1 + 94 bytes) ≈ 103 bytes per entry
-            let kvs_count = witness.kvs.len();
-            let salt_kvs_size = kvs_count * 103;
-
-            // Proof: commitments (64 bytes each) + IPA proof (~576 bytes) + levels (5 bytes
-            // each)
-            let proof_size =
-                witness.proof.parents_commitments.len() * 64 + 576 + witness.proof.levels.len() * 5;
-            let salt_size = salt_kvs_size + proof_size;
-
-            // MptWitness: storage_root (32 bytes) + sum of state bytes
-            let mpt_size = 32 + mpt_witness.state.iter().map(|b| b.len()).sum::<usize>();
-
-            metrics.on_witness_fetch(salt_size, kvs_count, salt_kvs_size, mpt_size);
-        }
-
-        result
-    }
-
-    /// Returns whether a Cloudflare witness provider is configured.
-    pub fn has_cloudflare_provider(&self) -> bool {
-        self.cloudflare_witness_provider.is_some()
-    }
-
-    /// Gets execution witness data from the Cloudflare fallback endpoint.
-    ///
-    /// Single attempt, no retry (it's a KV lookup, either it exists or it doesn't).
-    /// Returns error if Cloudflare provider is not configured.
-    ///
-    /// The Cloudflare KV endpoint returns a `"v0:<base64_encoded_data>"` string.
-    /// The base64 payload is zstd-compressed, bincode-serialized `(SaltWitness, MptWitness)`.
-    pub async fn get_witness_from_cloudflare(
-        &self,
-        number: u64,
-        hash: B256,
-    ) -> Result<(SaltWitness, MptWitness)> {
-        let provider = self
-            .cloudflare_witness_provider
-            .as_ref()
-            .ok_or_else(|| eyre!("Cloudflare witness provider not configured"))?;
-
-        let start = Instant::now();
         let keys = WitnessRequestKeys { block_number: U64::from(number), block_hash: hash };
-        let result: Result<String> = provider
+        let result: Result<String> = self
+            .witness_provider
             .client()
             .request("mega_getBlockWitness", (keys,))
             .await
-            .map_err(|e| eyre!("Cloudflare witness fetch failed for block {}: {}", number, e));
+            .map_err(|e| eyre!("Witness fetch failed for block {}: {}", number, e));
 
         self.record_rpc(
             RpcMethod::MegaGetBlockWitness,
@@ -475,7 +398,7 @@ impl RpcClient {
         );
 
         if let Err(ref e) = result {
-            trace!(block_number = number, %hash, error = %e, "Cloudflare worker mega_getBlockWitness failed");
+            trace!(block_number = number, %hash, error = %e, "Worker mega_getBlockWitness failed");
         }
 
         let encoded = result?;
@@ -485,7 +408,7 @@ impl RpcClient {
             tokio::task::spawn_blocking(move || -> Result<(SaltWitness, MptWitness)> {
                 let b64_data = encoded
                     .strip_prefix("v0:")
-                    .ok_or_else(|| eyre!("Cloudflare witness missing 'v0:' prefix"))?;
+                    .ok_or_else(|| eyre!("Witness missing 'v0:' prefix"))?;
                 let compressed = BASE64.decode(b64_data).context("base64 decode failed")?;
                 let decompressed =
                     zstd::decode_all(compressed.as_slice()).context("zstd decompress failed")?;
@@ -619,46 +542,11 @@ mod tests {
     }
 
     #[test]
-    fn test_new_with_valid_url() {
-        let result = RpcClient::new("http://localhost:8545", "http://localhost:8546");
-        assert!(result.is_ok());
-        let client = result.unwrap();
-        assert!(!client.has_cloudflare_provider());
-    }
-
-    #[test]
-    fn test_new_with_cloudflare_provider() {
-        let result = RpcClient::new_with_config(
-            "http://localhost:8545",
-            "http://localhost:8546",
-            RpcClientConfig::default(),
-            Some("http://localhost:9546"),
-            None,
-        );
-        assert!(result.is_ok());
-        let client = result.unwrap();
-        assert!(client.has_cloudflare_provider());
-    }
-
-    #[test]
-    fn test_new_with_invalid_cloudflare_url() {
-        let result = RpcClient::new_with_config(
-            "http://localhost:8545",
-            "http://localhost:8546",
-            RpcClientConfig::default(),
-            Some("not a url"),
-            None,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_skip_block_verification() {
         let client = RpcClient::new_with_config(
             "http://localhost:8545",
             "http://localhost:8546",
             RpcClientConfig::validator(),
-            None,
             None,
         )
         .unwrap();
@@ -668,7 +556,6 @@ mod tests {
             "http://localhost:8545",
             "http://localhost:8546",
             RpcClientConfig::trace_server(),
-            None,
             None,
         )
         .unwrap();

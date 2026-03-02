@@ -253,7 +253,6 @@ async fn main() -> Result<()> {
         &args.rpc_endpoint,
         &args.witness_endpoint,
         RpcClientConfig::trace_server(),
-        args.cloudflare_witness_endpoint.as_deref(),
         None,
     )?);
     let validator_db = init_validator_db(&args, &rpc_client).await?;
