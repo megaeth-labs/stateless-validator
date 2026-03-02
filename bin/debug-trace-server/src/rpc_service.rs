@@ -846,6 +846,32 @@ mod tests {
     }
 
     #[test]
+    fn test_check_cache_by_number_disabled() {
+        let result = check_cache_by_number(
+            &None,
+            CachedResource::DebugTraceBlock,
+            100,
+            &ResponseVariant::Default,
+            "test_method",
+            Instant::now(),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_check_cache_by_hash_disabled() {
+        let result = check_cache_by_hash(
+            &None,
+            CachedResource::DebugTraceBlock,
+            B256::ZERO,
+            &ResponseVariant::Default,
+            "test_method",
+            Instant::now(),
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
     fn test_timed_alias_duplicate_rejected() {
         // Registering the same alias twice should fail
         let mut module = jsonrpsee::server::RpcModule::new(());

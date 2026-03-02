@@ -136,10 +136,6 @@ struct Args {
     )]
     response_cache_estimated_items: usize,
 
-    /// Disable the HTTP response cache entirely.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_DISABLE_RESPONSE_CACHE")]
-    disable_response_cache: bool,
-
     /// Number of recent blocks to retain in database (older blocks are pruned).
     #[clap(
         long,
@@ -227,10 +223,12 @@ async fn main() -> Result<()> {
         listen_addr = %args.addr,
         "Debug-trace-server starting"
     );
+    let response_cache_disabled = args.response_cache_estimated_items == 0;
     debug!(
         rpc_endpoint = %args.rpc_endpoint,
         witness_endpoint = %args.witness_endpoint,
         witness_timeout_secs = args.witness_timeout,
+        response_cache_disabled,
         response_cache_max_size = args.response_cache_max_size,
         response_cache_estimated_items = args.response_cache_estimated_items,
         "Server configuration"
@@ -265,8 +263,8 @@ async fn main() -> Result<()> {
 
     let chain_spec = load_chain_spec(&args)?;
 
-    let response_cache = if args.disable_response_cache {
-        info!("Response cache disabled");
+    let response_cache = if response_cache_disabled {
+        info!("Response cache disabled (estimated_items = 0)");
         None
     } else {
         let cache = ResponseCache::new(ResponseCacheConfig::new(
@@ -311,6 +309,11 @@ async fn main() -> Result<()> {
                             "Invalidating response cache for reorged blocks"
                         );
                         cache.invalidate_blocks(reverted_hashes);
+                    } else {
+                        tracing::debug!(
+                            count = reverted_hashes.len(),
+                            "Reorg detected (response cache disabled)"
+                        );
                     }
                 }
             }),
