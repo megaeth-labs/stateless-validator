@@ -42,10 +42,12 @@ tracing.workspace = true
 validator-core = { path = "../../crates/validator-core" }
 
 [dev-dependencies]
+base64.workspace = true
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }
 jsonrpsee-types = { version = "0.26" }
 tempfile = "3.8"
 tracing-subscriber.workspace = true
+zstd.workspace = true
 
 [features]
 test-bucket-resize = ["salt/test-bucket-resize", "validator-core/test-bucket-resize"]

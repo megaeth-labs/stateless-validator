@@ -5918,6 +5918,7 @@ dependencies = [
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rpc-types-eth",
+ "base64",
  "bincode 2.0.1",
  "clap",
  "eyre",
@@ -5938,6 +5939,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.20",
  "validator-core",
+ "zstd",
 ]
 
 [[package]]
