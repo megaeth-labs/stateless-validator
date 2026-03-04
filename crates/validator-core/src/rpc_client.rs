@@ -419,7 +419,26 @@ impl RpcClient {
             })
             .await
             .context("decode task panicked")??;
-        trace!(block_number = number, %hash, decode_ms = decode_start.elapsed().as_millis(), "Cloudflare witness decoded");
+        trace!(block_number = number, %hash, decode_ms = decode_start.elapsed().as_millis(), "Witness decoded");
+
+        if let Some(ref metrics) = self.config.metrics {
+            // Estimate sizes without full serialization (approximate but efficient)
+            // SaltKey (8 bytes) + Option<SaltValue> (1 + 94 bytes) ≈ 103 bytes per entry
+            let kvs_count = salt_witness.kvs.len();
+            let salt_kvs_size = kvs_count * 103;
+
+            // Proof: commitments (64 bytes each) + IPA proof (~576 bytes) + levels (5 bytes
+            // each)
+            let proof_size = salt_witness.proof.parents_commitments.len() * 64 +
+                576 +
+                salt_witness.proof.levels.len() * 5;
+            let salt_size = salt_kvs_size + proof_size;
+
+            // MptWitness: storage_root (32 bytes) + sum of state bytes
+            let mpt_size = 32 + mpt_witness.state.iter().map(|b| b.len()).sum::<usize>();
+
+            metrics.on_witness_fetch(salt_size, kvs_count, salt_kvs_size, mpt_size);
+        }
 
         Ok((salt_witness, mpt_witness))
     }
