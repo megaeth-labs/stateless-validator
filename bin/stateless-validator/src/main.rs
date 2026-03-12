@@ -28,6 +28,9 @@ use validator_core::{
 
 mod metrics;
 
+/// Handles to all spawned background tasks, awaited during shutdown.
+type BackgroundTasks = Vec<JoinHandle<Result<()>>>;
+
 /// Database filename for the validator.
 const VALIDATOR_DB_FILENAME: &str = "validator.redb";
 
@@ -234,8 +237,17 @@ async fn main() -> Result<()> {
 
     // Wait for background tasks to acknowledge cancellation and finish cleanly
     let timeout = Duration::from_secs(1);
-    if tokio::time::timeout(timeout, future::join_all(bg_tasks)).await.is_err() {
-        warn!("[Main] Background tasks did not finish within {timeout:?}");
+    match tokio::time::timeout(timeout, future::join_all(bg_tasks)).await {
+        Ok(results) => {
+            for (i, result) in results.into_iter().enumerate() {
+                match result {
+                    Ok(Err(e)) => warn!("[Main] Background task {i} finished with error: {e}"),
+                    Err(e) => warn!("[Main] Background task {i} panicked: {e}"),
+                    Ok(Ok(())) => {}
+                }
+            }
+        }
+        Err(_) => warn!("[Main] Background tasks did not finish within {timeout:?}"),
     }
 
     // Explicitly drop the DB so redb flushes and closes cleanly
@@ -270,14 +282,13 @@ async fn main() -> Result<()> {
 /// # Returns
 /// * `Ok((main_loop, bg_tasks))` - Main sync loop future and handles to all background tasks
 /// * `Err(eyre::Error)` - On critical failures during task recovery
-#[allow(clippy::type_complexity)]
 fn chain_sync(
     client: Arc<RpcClient>,
     validator_db: &Arc<ValidatorDB>,
     config: Arc<ChainSyncConfig>,
     chain_spec: Arc<ChainSpec>,
     shutdown: CancellationToken,
-) -> Result<(impl Future<Output = Result<()>>, Vec<JoinHandle<Result<()>>>)> {
+) -> Result<(impl Future<Output = Result<()>>, BackgroundTasks)> {
     info!("[Chain Sync] Starting with {} validation workers", config.concurrent_workers);
 
     // Step 1: Recover any interrupted tasks from previous crashes
@@ -287,7 +298,7 @@ fn chain_sync(
         .map_err(|e| anyhow!("Failed to recover interrupted tasks: {}", e))?;
     info!("[Chain Sync] Task recovery completed");
 
-    let mut bg_tasks: Vec<JoinHandle<Result<()>>> = Vec::new();
+    let mut bg_tasks: BackgroundTasks = Vec::new();
 
     // Step 2: Spawn remote chain tracker
     info!("[Chain Sync] Starting remote chain tracker...");
@@ -471,7 +482,7 @@ async fn validation_worker(
             },
             Err(e) => {
                 if shutdown.is_cancelled() {
-                    info!("[Worker {worker_id}] Stopped mid-task due to shutdown: {e}");
+                    warn!("[Worker {worker_id}] Error during shutdown, stopping: {e}");
                     break;
                 }
                 error!("[Worker {worker_id}] Error during task processing: {e}");
@@ -1285,14 +1296,13 @@ mod tests {
             ..ChainSyncConfig::default()
         });
 
+        let shutdown = CancellationToken::new();
         let (main_loop, bg_tasks) =
-            chain_sync(client.clone(), &validator_db, config, chain_spec, CancellationToken::new())
+            chain_sync(client.clone(), &validator_db, config, chain_spec, shutdown.clone())
                 .unwrap();
         main_loop.await.unwrap();
 
-        for bg_task in &bg_tasks {
-            bg_task.abort();
-        }
+        shutdown.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(1), future::join_all(bg_tasks)).await;
         drop(validator_db);
 
