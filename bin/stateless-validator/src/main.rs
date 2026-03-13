@@ -161,6 +161,7 @@ async fn run(args: CommandLineArgs) -> Result<()> {
         &args.rpc_endpoint,
         &args.witness_endpoint,
         rpc_config,
+        None, // No Cloudflare fallback for validator
         args.report_validation_endpoint.as_deref(),
     )?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
@@ -709,7 +710,6 @@ mod tests {
 
     use alloy_primitives::{BlockHash, BlockNumber};
     use alloy_rpc_types_eth::Block;
-    use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
     use eyre::Context;
     use jsonrpsee::{
         RpcModule,
@@ -721,7 +721,7 @@ mod tests {
     use op_alloy_rpc_types::Transaction;
     use serde::{Deserialize, Serialize, de::DeserializeOwned};
     use tracing_subscriber::EnvFilter;
-    use validator_core::{rpc_client::WitnessRequestKeys, withdrawals::MptWitness};
+    use validator_core::withdrawals::MptWitness;
 
     use super::*;
 
@@ -949,11 +949,15 @@ mod tests {
 
         module
             .register_method("mega_getBlockWitness", |params, context, _| {
-                // Parse the worker-compatible request object.
-                let (keys,): (WitnessRequestKeys,) = params.parse().map_err(|e| {
-                    make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
+                // Parse two string parameters: block number (hex) and block hash
+                let (_block_number_hex, block_hash_hex): (String, String) =
+                    params.parse().map_err(|e| {
+                        make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
+                    })?;
+
+                let block_hash = parse_block_hash(&block_hash_hex).map_err(|e| {
+                    make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid block hash: {e}"))
                 })?;
-                let block_hash = BlockHash::from(keys.block_hash.0);
 
                 // Look up witness data by block hash
                 let salt_witness =
@@ -972,27 +976,7 @@ mod tests {
                         )
                     })?;
 
-                let encoded = bincode::serde::encode_to_vec(
-                    &(salt_witness, mpt_witness),
-                    bincode::config::legacy(),
-                )
-                .map_err(|e| {
-                    make_rpc_error(
-                        CALL_EXECUTION_FAILED_CODE,
-                        format!("Failed to serialize witness for block {block_hash}: {e}"),
-                    )
-                })
-                .and_then(|raw| {
-                    zstd::encode_all(raw.as_slice(), 9).map_err(|e| {
-                        make_rpc_error(
-                            CALL_EXECUTION_FAILED_CODE,
-                            format!("Failed to compress witness for block {block_hash}: {e}"),
-                        )
-                    })
-                })
-                .map(|compressed| format!("v0:{}", BASE64.encode(compressed)))?;
-
-                Ok::<_, ErrorObject<'static>>(encoded)
+                Ok::<_, ErrorObject<'static>>((salt_witness, mpt_witness))
             })
             .unwrap();
 

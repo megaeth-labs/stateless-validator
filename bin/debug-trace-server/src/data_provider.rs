@@ -98,6 +98,10 @@ impl DataProvider {
         validator_db: Option<Arc<ValidatorDB>>,
         witness_timeout_secs: u64,
     ) -> Self {
+        if rpc_client.has_cloudflare_provider() {
+            debug!("Cloudflare witness fallback enabled via RpcClient");
+        }
+
         Self {
             rpc_client,
             validator_db,
@@ -440,6 +444,40 @@ impl DataProvider {
         Ok(BlockData { block, witness, contracts })
     }
 
+    /// Fetches witness data from Cloudflare KV via RpcClient.
+    ///
+    /// Single attempt, no retry (it's a KV lookup, either it exists or it doesn't).
+    async fn get_witness_from_cloudflare(
+        &self,
+        block_number: u64,
+        block_hash: B256,
+    ) -> Result<(SaltWitness, MptWitness)> {
+        let cf_metrics = WitnessSourceMetrics::new_for_source("cloudflare");
+        let start = std::time::Instant::now();
+        match self.rpc_client.get_witness_from_cloudflare(block_number, block_hash).await {
+            Ok(result) => {
+                cf_metrics.record_request(true, start.elapsed().as_secs_f64());
+                cf_metrics.record_size(estimate_witness_size(&result.0, &result.1));
+                trace!(
+                    block_number,
+                    block_hash = %block_hash,
+                    "Witness fetched from Cloudflare"
+                );
+                Ok(result)
+            }
+            Err(e) => {
+                cf_metrics.record_request(false, start.elapsed().as_secs_f64());
+                warn!(
+                    block_number,
+                    block_hash = %block_hash,
+                    error = %e,
+                    "Cloudflare witness fetch failed"
+                );
+                Err(e)
+            }
+        }
+    }
+
     /// Fetches witness data with height-based routing and fallback.
     ///
     /// Routing logic:
@@ -483,7 +521,20 @@ impl DataProvider {
                 }
                 Err(e) => {
                     wg_metrics.record_request(false, start.elapsed().as_secs_f64());
-                    Err(e)
+                    // Timeout reached, try Cloudflare fallback
+                    if self.rpc_client.has_cloudflare_provider() {
+                        trace!(
+                            block_number,
+                            %e,
+                            "Witness endpoint timeout, falling back to Cloudflare"
+                        );
+                        let result =
+                            self.get_witness_from_cloudflare(block_number, block_hash).await?;
+                        DataSourceMetrics::new_for_source("cloudflare").record();
+                        Ok(result)
+                    } else {
+                        Err(e)
+                    }
                 }
             }
         } else {
@@ -502,9 +553,23 @@ impl DataProvider {
                     DataSourceMetrics::new_for_source("witness_generator").record();
                     Ok(result)
                 }
-                Err(_) => {
+                Err(e) => {
                     wg_metrics.record_request(false, start.elapsed().as_secs_f64());
-                    Err(eyre::eyre!("Block witness not found for block {}", block_number))
+                    // Single attempt failed, try Cloudflare fallback
+                    if self.rpc_client.has_cloudflare_provider() {
+                        trace!(
+                            block_number,
+                            %e,
+                            "Witness endpoint failed, falling back to Cloudflare"
+                        );
+                        let result =
+                            self.get_witness_from_cloudflare(block_number, block_hash).await?;
+                        DataSourceMetrics::new_for_source("cloudflare").record();
+                        Ok(result)
+                    } else {
+                        // No Cloudflare configured and witness fetch failed
+                        Err(eyre::eyre!("Block witness not found for block {}", block_number))
+                    }
                 }
             }
         }
