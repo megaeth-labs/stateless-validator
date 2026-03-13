@@ -41,8 +41,10 @@ pub enum RpcMethod {
     EthBlockNumber,
     /// eth_getHeaderByNumber / eth_getHeaderByHash
     EthGetHeader,
-    /// mega_getBlockWitness
+    /// mega_getBlockWitness (primary witness generator)
     MegaGetBlockWitness,
+    /// mega_getBlockWitness (Cloudflare fallback)
+    MegaGetBlockWitnessCloudflare,
     /// mega_setValidatedBlocks
     MegaSetValidatedBlocks,
 }
@@ -56,6 +58,7 @@ impl RpcMethod {
             RpcMethod::EthGetHeader => "eth_getHeader",
             RpcMethod::EthBlockNumber => "eth_blockNumber",
             RpcMethod::MegaGetBlockWitness => "mega_getBlockWitness",
+            RpcMethod::MegaGetBlockWitnessCloudflare => "mega_getBlockWitness_cloudflare",
             RpcMethod::MegaSetValidatedBlocks => "mega_setValidatedBlocks",
         }
     }
@@ -394,31 +397,14 @@ impl RpcClient {
 
     /// Gets execution witness data for a specific block.
     pub async fn get_witness(&self, number: u64, hash: B256) -> Result<(SaltWitness, MptWitness)> {
-        let result = self
-            .fetch_witness_from_provider(&self.witness_provider, number, hash, "witness_generator")
-            .await;
-
-        if let Ok((ref witness, ref mpt_witness)) = result &&
-            let Some(ref metrics) = self.config.metrics
-        {
-            // Estimate sizes without full serialization (approximate but efficient)
-            // SaltKey (8 bytes) + Option<SaltValue> (1 + 94 bytes) ≈ 103 bytes per entry
-            let kvs_count = witness.kvs.len();
-            let salt_kvs_size = kvs_count * 103;
-
-            // Proof: commitments (64 bytes each) + IPA proof (~576 bytes) + levels (5 bytes
-            // each)
-            let proof_size =
-                witness.proof.parents_commitments.len() * 64 + 576 + witness.proof.levels.len() * 5;
-            let salt_size = salt_kvs_size + proof_size;
-
-            // MptWitness: storage_root (32 bytes) + sum of state bytes
-            let mpt_size = 32 + mpt_witness.state.iter().map(|b| b.len()).sum::<usize>();
-
-            metrics.on_witness_fetch(salt_size, kvs_count, salt_kvs_size, mpt_size);
-        }
-
-        result
+        self.fetch_witness_from_provider(
+            &self.witness_provider,
+            number,
+            hash,
+            "witness_generator",
+            RpcMethod::MegaGetBlockWitness,
+        )
+        .await
     }
 
     /// Returns whether a Cloudflare witness provider is configured.
@@ -440,7 +426,14 @@ impl RpcClient {
             .as_ref()
             .ok_or_else(|| eyre!("Cloudflare witness provider not configured"))?;
 
-        self.fetch_witness_from_provider(provider, number, hash, "cloudflare_worker").await
+        self.fetch_witness_from_provider(
+            provider,
+            number,
+            hash,
+            "cloudflare_worker",
+            RpcMethod::MegaGetBlockWitnessCloudflare,
+        )
+        .await
     }
 
     /// Fetches and decodes witness data from a given provider.
@@ -454,6 +447,7 @@ impl RpcClient {
         number: u64,
         hash: B256,
         source: &str,
+        rpc_method: RpcMethod,
     ) -> Result<(SaltWitness, MptWitness)> {
         let start = Instant::now();
         let keys = WitnessRequestKeys { block_number: U64::from(number), block_hash: hash };
@@ -463,11 +457,7 @@ impl RpcClient {
             .await
             .map_err(|e| eyre!("{} witness fetch failed for block {}: {}", source, number, e));
 
-        self.record_rpc(
-            RpcMethod::MegaGetBlockWitness,
-            result.is_ok(),
-            Some(start.elapsed().as_secs_f64()),
-        );
+        self.record_rpc(rpc_method, result.is_ok(), Some(start.elapsed().as_secs_f64()));
 
         if let Err(ref e) = result {
             trace!(block_number = number, %hash, error = %e, "{source} mega_getBlockWitness failed");
@@ -492,6 +482,25 @@ impl RpcClient {
             .await
             .context("decode task panicked")??;
         trace!(block_number = number, %hash, decode_ms = decode_start.elapsed().as_millis(), "{source} witness decoded");
+
+        if let Some(ref metrics) = self.config.metrics {
+            // Estimate sizes without full serialization (approximate but efficient)
+            // SaltKey (8 bytes) + Option<SaltValue> (1 + 94 bytes) ≈ 103 bytes per entry
+            let kvs_count = salt_witness.kvs.len();
+            let salt_kvs_size = kvs_count * 103;
+
+            // Proof: commitments (64 bytes each) + IPA proof (~576 bytes) + levels (5 bytes
+            // each)
+            let proof_size = salt_witness.proof.parents_commitments.len() * 64 +
+                576 +
+                salt_witness.proof.levels.len() * 5;
+            let salt_size = salt_kvs_size + proof_size;
+
+            // MptWitness: storage_root (32 bytes) + sum of state bytes
+            let mpt_size = 32 + mpt_witness.state.iter().map(|b| b.len()).sum::<usize>();
+
+            metrics.on_witness_fetch(salt_size, kvs_count, salt_kvs_size, mpt_size);
+        }
 
         Ok((salt_witness, mpt_witness))
     }
@@ -604,6 +613,10 @@ mod tests {
         assert_eq!(RpcMethod::EthGetBlockByNumber.as_str(), "eth_getBlockByNumber");
         assert_eq!(RpcMethod::EthBlockNumber.as_str(), "eth_blockNumber");
         assert_eq!(RpcMethod::MegaGetBlockWitness.as_str(), "mega_getBlockWitness");
+        assert_eq!(
+            RpcMethod::MegaGetBlockWitnessCloudflare.as_str(),
+            "mega_getBlockWitness_cloudflare"
+        );
         assert_eq!(RpcMethod::MegaSetValidatedBlocks.as_str(), "mega_setValidatedBlocks");
     }
 
