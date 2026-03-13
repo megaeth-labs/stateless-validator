@@ -394,26 +394,9 @@ impl RpcClient {
 
     /// Gets execution witness data for a specific block.
     pub async fn get_witness(&self, number: u64, hash: B256) -> Result<(SaltWitness, MptWitness)> {
-        let start = Instant::now();
-        // Format as hex strings - witness endpoint expects two string parameters
-        let block_number_hex = format!("0x{:x}", number);
-        let block_hash_hex = format!("{}", hash);
-        let result: Result<(SaltWitness, MptWitness)> = self
-            .witness_provider
-            .client()
-            .request("mega_getBlockWitness", (block_number_hex, block_hash_hex))
-            .await
-            .map_err(|e| eyre!("Failed to get witness for block {hash}: {e}"));
-
-        self.record_rpc(
-            RpcMethod::MegaGetBlockWitness,
-            result.is_ok(),
-            Some(start.elapsed().as_secs_f64()),
-        );
-
-        if let Err(ref e) = result {
-            trace!(block_number = number, %hash, error = %e, "Witness generator mega_getBlockWitness failed");
-        }
+        let result = self
+            .fetch_witness_from_provider(&self.witness_provider, number, hash, "witness_generator")
+            .await;
 
         if let Ok((ref witness, ref mpt_witness)) = result &&
             let Some(ref metrics) = self.config.metrics
@@ -447,9 +430,6 @@ impl RpcClient {
     ///
     /// Single attempt, no retry (it's a KV lookup, either it exists or it doesn't).
     /// Returns error if Cloudflare provider is not configured.
-    ///
-    /// The Cloudflare KV endpoint returns a `"v0:<base64_encoded_data>"` string.
-    /// The base64 payload is zstd-compressed, bincode-serialized `(SaltWitness, MptWitness)`.
     pub async fn get_witness_from_cloudflare(
         &self,
         number: u64,
@@ -460,13 +440,28 @@ impl RpcClient {
             .as_ref()
             .ok_or_else(|| eyre!("Cloudflare witness provider not configured"))?;
 
+        self.fetch_witness_from_provider(provider, number, hash, "cloudflare_worker").await
+    }
+
+    /// Fetches and decodes witness data from a given provider.
+    ///
+    /// Both the upstream witness endpoint and the Cloudflare KV endpoint use the same
+    /// unified RPC interface: `mega_getBlockWitness` with a `WitnessRequestKeys` parameter,
+    /// returning a `"v0:<base64_encoded_data>"` string (zstd-compressed, bincode-serialized).
+    async fn fetch_witness_from_provider(
+        &self,
+        provider: &RootProvider,
+        number: u64,
+        hash: B256,
+        source: &str,
+    ) -> Result<(SaltWitness, MptWitness)> {
         let start = Instant::now();
         let keys = WitnessRequestKeys { block_number: U64::from(number), block_hash: hash };
         let result: Result<String> = provider
             .client()
             .request("mega_getBlockWitness", (keys,))
             .await
-            .map_err(|e| eyre!("Cloudflare witness fetch failed for block {}: {}", number, e));
+            .map_err(|e| eyre!("{} witness fetch failed for block {}: {}", source, number, e));
 
         self.record_rpc(
             RpcMethod::MegaGetBlockWitness,
@@ -475,7 +470,7 @@ impl RpcClient {
         );
 
         if let Err(ref e) = result {
-            trace!(block_number = number, %hash, error = %e, "Cloudflare worker mega_getBlockWitness failed");
+            trace!(block_number = number, %hash, error = %e, "{source} mega_getBlockWitness failed");
         }
 
         let encoded = result?;
@@ -485,7 +480,7 @@ impl RpcClient {
             tokio::task::spawn_blocking(move || -> Result<(SaltWitness, MptWitness)> {
                 let b64_data = encoded
                     .strip_prefix("v0:")
-                    .ok_or_else(|| eyre!("Cloudflare witness missing 'v0:' prefix"))?;
+                    .ok_or_else(|| eyre!("Witness response missing 'v0:' prefix"))?;
                 let compressed = BASE64.decode(b64_data).context("base64 decode failed")?;
                 let decompressed =
                     zstd::decode_all(compressed.as_slice()).context("zstd decompress failed")?;
@@ -496,7 +491,7 @@ impl RpcClient {
             })
             .await
             .context("decode task panicked")??;
-        trace!(block_number = number, %hash, decode_ms = decode_start.elapsed().as_millis(), "Cloudflare witness decoded");
+        trace!(block_number = number, %hash, decode_ms = decode_start.elapsed().as_millis(), "{source} witness decoded");
 
         Ok((salt_witness, mpt_witness))
     }
