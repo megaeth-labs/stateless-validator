@@ -250,9 +250,7 @@ async fn main() -> Result<()> {
         Err(_) => warn!("[Main] Background tasks did not finish within {timeout:?}"),
     }
 
-    // Explicitly drop the DB so redb flushes and closes cleanly
-    drop(validator_db);
-    info!("[Main] Database closed cleanly.");
+    info!("[Main] Shutdown complete.");
 
     info!("[Main] Total execution time: {:?}", start.elapsed());
     Ok(())
@@ -301,6 +299,8 @@ fn chain_sync(
     let mut bg_tasks: BackgroundTasks = Vec::new();
 
     // Step 2: Spawn remote chain tracker
+    // Safe to cancel externally: all DB writes in remote_chain_tracker are
+    // atomic transactions, and in-flight RPC data can be re-fetched on restart.
     info!("[Chain Sync] Starting remote chain tracker...");
     bg_tasks.push(task::spawn({
         let (client, db, config, shutdown) = (
