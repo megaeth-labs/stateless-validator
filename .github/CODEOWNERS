@@ -1,0 +1,14 @@
+# Default: repo owner owns everything
+* @Troublor
+
+# validator-core
+/crates/validator-core/ @flyq
+
+# stateless-common (shared by both)
+/crates/stateless-common/ @flyq @krabat-l
+
+# stateless-validator binary
+/bin/stateless-validator/ @flyq
+
+# debug-trace-server binary
+/bin/debug-trace-server/ @krabat-I
