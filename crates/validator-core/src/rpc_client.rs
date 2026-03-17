@@ -41,8 +41,10 @@ pub enum RpcMethod {
     EthBlockNumber,
     /// eth_getHeaderByNumber / eth_getHeaderByHash
     EthGetHeader,
-    /// mega_getBlockWitness
+    /// mega_getBlockWitness (primary witness generator)
     MegaGetBlockWitness,
+    /// mega_getBlockWitness (Cloudflare fallback)
+    MegaGetBlockWitnessCloudflare,
     /// mega_setValidatedBlocks
     MegaSetValidatedBlocks,
 }
@@ -56,6 +58,7 @@ impl RpcMethod {
             RpcMethod::EthGetHeader => "eth_getHeader",
             RpcMethod::EthBlockNumber => "eth_blockNumber",
             RpcMethod::MegaGetBlockWitness => "mega_getBlockWitness",
+            RpcMethod::MegaGetBlockWitnessCloudflare => "mega_getBlockWitness_cloudflare",
             RpcMethod::MegaSetValidatedBlocks => "mega_setValidatedBlocks",
         }
     }
@@ -144,6 +147,8 @@ pub struct RpcClient {
     pub data_provider: RootProvider<Optimism>,
     /// Witness provider for fetching SALT witness data.
     pub witness_provider: RootProvider,
+    /// Optional Cloudflare witness provider for pruned/archived blocks.
+    cloudflare_witness_provider: Option<RootProvider>,
     /// Optional dedicated provider for reporting validated blocks.
     report_provider: Option<RootProvider<Optimism>>,
     /// Configuration controlling verification behavior
@@ -157,7 +162,7 @@ impl RpcClient {
     /// * `data_api` - HTTP URL of the standard JSON-RPC endpoint for blocks and contract data
     /// * `witness_api` - HTTP URL of the witness RPC endpoint for SALT witness data
     pub fn new(data_api: &str, witness_api: &str) -> Result<Self> {
-        Self::new_with_config(data_api, witness_api, RpcClientConfig::default(), None)
+        Self::new_with_config(data_api, witness_api, RpcClientConfig::default(), None, None)
     }
 
     /// Creates a new RPC client with custom configuration.
@@ -172,8 +177,17 @@ impl RpcClient {
         data_api: &str,
         witness_api: &str,
         config: RpcClientConfig,
+        cloudflare_witness_api: Option<&str>,
         report_api: Option<&str>,
     ) -> Result<Self> {
+        let cloudflare_witness_provider = cloudflare_witness_api
+            .map(|url| -> Result<RootProvider> {
+                Ok(ProviderBuilder::default().connect_http(
+                    url.parse().context("Failed to parse Cloudflare witness API URL")?,
+                ))
+            })
+            .transpose()?;
+
         let report_provider = report_api
             .map(|url| -> Result<RootProvider<Optimism>> {
                 Ok(ProviderBuilder::<_, _, Optimism>::default()
@@ -186,6 +200,7 @@ impl RpcClient {
                 .connect_http(data_api.parse().context("Failed to parse API URL")?),
             witness_provider: ProviderBuilder::default()
                 .connect_http(witness_api.parse().context("Failed to parse API URL")?),
+            cloudflare_witness_provider,
             report_provider,
             config,
         })
@@ -382,23 +397,70 @@ impl RpcClient {
 
     /// Gets execution witness data for a specific block.
     pub async fn get_witness(&self, number: u64, hash: B256) -> Result<(SaltWitness, MptWitness)> {
+        self.fetch_witness_from_provider(
+            &self.witness_provider,
+            number,
+            hash,
+            "witness_generator",
+            RpcMethod::MegaGetBlockWitness,
+        )
+        .await
+    }
+
+    /// Returns whether a Cloudflare witness provider is configured.
+    pub fn has_cloudflare_provider(&self) -> bool {
+        self.cloudflare_witness_provider.is_some()
+    }
+
+    /// Gets execution witness data from the Cloudflare fallback endpoint.
+    ///
+    /// Single attempt, no retry (it's a KV lookup, either it exists or it doesn't).
+    /// Returns error if Cloudflare provider is not configured.
+    pub async fn get_witness_from_cloudflare(
+        &self,
+        number: u64,
+        hash: B256,
+    ) -> Result<(SaltWitness, MptWitness)> {
+        let provider = self
+            .cloudflare_witness_provider
+            .as_ref()
+            .ok_or_else(|| eyre!("Cloudflare witness provider not configured"))?;
+
+        self.fetch_witness_from_provider(
+            provider,
+            number,
+            hash,
+            "cloudflare_worker",
+            RpcMethod::MegaGetBlockWitnessCloudflare,
+        )
+        .await
+    }
+
+    /// Fetches and decodes witness data from a given provider.
+    ///
+    /// Both the upstream witness endpoint and the Cloudflare KV endpoint use the same
+    /// unified RPC interface: `mega_getBlockWitness` with a `WitnessRequestKeys` parameter,
+    /// returning a `"v0:<base64_encoded_data>"` string (zstd-compressed, bincode-serialized).
+    async fn fetch_witness_from_provider(
+        &self,
+        provider: &RootProvider,
+        number: u64,
+        hash: B256,
+        source: &str,
+        rpc_method: RpcMethod,
+    ) -> Result<(SaltWitness, MptWitness)> {
         let start = Instant::now();
         let keys = WitnessRequestKeys { block_number: U64::from(number), block_hash: hash };
-        let result: Result<String> = self
-            .witness_provider
+        let result: Result<String> = provider
             .client()
             .request("mega_getBlockWitness", (keys,))
             .await
-            .map_err(|e| eyre!("Witness fetch failed for block {}: {}", number, e));
+            .map_err(|e| eyre!("{} witness fetch failed for block {}: {}", source, number, e));
 
-        self.record_rpc(
-            RpcMethod::MegaGetBlockWitness,
-            result.is_ok(),
-            Some(start.elapsed().as_secs_f64()),
-        );
+        self.record_rpc(rpc_method, result.is_ok(), Some(start.elapsed().as_secs_f64()));
 
         if let Err(ref e) = result {
-            trace!(block_number = number, %hash, error = %e, "Worker mega_getBlockWitness failed");
+            trace!(block_number = number, %hash, error = %e, "{source} mega_getBlockWitness failed");
         }
 
         let encoded = result?;
@@ -408,7 +470,7 @@ impl RpcClient {
             tokio::task::spawn_blocking(move || -> Result<(SaltWitness, MptWitness)> {
                 let b64_data = encoded
                     .strip_prefix("v0:")
-                    .ok_or_else(|| eyre!("Witness missing 'v0:' prefix"))?;
+                    .ok_or_else(|| eyre!("Witness response missing 'v0:' prefix"))?;
                 let compressed = BASE64.decode(b64_data).context("base64 decode failed")?;
                 let decompressed =
                     zstd::decode_all(compressed.as_slice()).context("zstd decompress failed")?;
@@ -419,7 +481,7 @@ impl RpcClient {
             })
             .await
             .context("decode task panicked")??;
-        trace!(block_number = number, %hash, decode_ms = decode_start.elapsed().as_millis(), "Witness decoded");
+        trace!(block_number = number, %hash, decode_ms = decode_start.elapsed().as_millis(), "{source} witness decoded");
 
         if let Some(ref metrics) = self.config.metrics {
             // Estimate sizes without full serialization (approximate but efficient)
@@ -551,6 +613,10 @@ mod tests {
         assert_eq!(RpcMethod::EthGetBlockByNumber.as_str(), "eth_getBlockByNumber");
         assert_eq!(RpcMethod::EthBlockNumber.as_str(), "eth_blockNumber");
         assert_eq!(RpcMethod::MegaGetBlockWitness.as_str(), "mega_getBlockWitness");
+        assert_eq!(
+            RpcMethod::MegaGetBlockWitnessCloudflare.as_str(),
+            "mega_getBlockWitness_cloudflare"
+        );
         assert_eq!(RpcMethod::MegaSetValidatedBlocks.as_str(), "mega_setValidatedBlocks");
     }
 
@@ -561,11 +627,46 @@ mod tests {
     }
 
     #[test]
+    fn test_new_with_valid_url() {
+        let result = RpcClient::new("http://localhost:8545", "http://localhost:8546");
+        assert!(result.is_ok());
+        let client = result.unwrap();
+        assert!(!client.has_cloudflare_provider());
+    }
+
+    #[test]
+    fn test_new_with_cloudflare_provider() {
+        let result = RpcClient::new_with_config(
+            "http://localhost:8545",
+            "http://localhost:8546",
+            RpcClientConfig::default(),
+            Some("http://localhost:9546"),
+            None,
+        );
+        assert!(result.is_ok());
+        let client = result.unwrap();
+        assert!(client.has_cloudflare_provider());
+    }
+
+    #[test]
+    fn test_new_with_invalid_cloudflare_url() {
+        let result = RpcClient::new_with_config(
+            "http://localhost:8545",
+            "http://localhost:8546",
+            RpcClientConfig::default(),
+            Some("not a url"),
+            None,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_skip_block_verification() {
         let client = RpcClient::new_with_config(
             "http://localhost:8545",
             "http://localhost:8546",
             RpcClientConfig::validator(),
+            None,
             None,
         )
         .unwrap();
@@ -575,6 +676,7 @@ mod tests {
             "http://localhost:8545",
             "http://localhost:8546",
             RpcClientConfig::trace_server(),
+            None,
             None,
         )
         .unwrap();

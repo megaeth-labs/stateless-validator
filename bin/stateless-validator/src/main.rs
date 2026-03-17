@@ -153,6 +153,7 @@ async fn main() -> Result<()> {
         &args.rpc_endpoint,
         &args.witness_endpoint,
         rpc_config,
+        None, // No Cloudflare fallback for validator
         args.report_validation_endpoint.as_deref(),
     )?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
@@ -1029,7 +1030,7 @@ mod tests {
 
         module
             .register_method("mega_getBlockWitness", |params, context, _| {
-                // Parse the worker-compatible request object.
+                // Parse the unified request object
                 let (keys,): (WitnessRequestKeys,) = params.parse().map_err(|e| {
                     make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
                 })?;
@@ -1052,6 +1053,7 @@ mod tests {
                         )
                     })?;
 
+                // Encode as v0:<base64(zstd(bincode))> to match the unified RPC format
                 let encoded = bincode::serde::encode_to_vec(
                     &(salt_witness, mpt_witness),
                     bincode::config::legacy(),
