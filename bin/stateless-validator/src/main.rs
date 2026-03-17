@@ -223,38 +223,53 @@ async fn main() -> Result<()> {
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .map_err(|e| anyhow!("Failed to register SIGTERM handler: {e}"))?;
 
-    tokio::select! {
-        res = validator_logic => res?,
+    let validator_result = tokio::select! {
+        res = validator_logic => {
+            if let Err(ref e) = res {
+                error!(error = %e, "[Main] Validator exited with error");
+            }
+            Some(res)
+        }
         _ = signal::ctrl_c() => {
             info!("[Main] SIGINT received, shutting down.");
+            None
         }
         _ = sigterm.recv() => {
             info!("[Main] SIGTERM received, shutting down.");
+            None
         }
-    }
+    };
 
     // Signal all workers to stop cooperatively
     shutdown_token.cancel();
 
     // Wait for background tasks to acknowledge cancellation and finish cleanly
     let timeout = Duration::from_secs(1);
+    let bg_tasks_len = bg_tasks.len();
     match tokio::time::timeout(timeout, future::join_all(bg_tasks)).await {
         Ok(results) => {
             for (i, result) in results.into_iter().enumerate() {
                 match result {
-                    Ok(Err(e)) => warn!("[Main] Background task {i} finished with error: {e}"),
-                    Err(e) => warn!("[Main] Background task {i} panicked: {e}"),
+                    Ok(Err(e)) => {
+                        warn!(task_idx = i, error = %e, "[Main] Background task finished with error")
+                    }
+                    Err(e) => warn!(task_idx = i, error = %e, "[Main] Background task panicked"),
                     Ok(Ok(())) => {}
                 }
             }
         }
-        Err(_) => warn!("[Main] Background tasks did not finish within {timeout:?}"),
+        Err(_) => {
+            warn!(timeout = ?timeout, task_count = bg_tasks_len, "[Main] Background tasks did not finish within timeout")
+        }
     }
 
     info!("[Main] Shutdown complete.");
 
     info!("[Main] Total execution time: {:?}", start.elapsed());
-    Ok(())
+
+    // Propagate the validator error (if any) after shutdown completes,
+    // so background tasks are always cleaned up before exiting.
+    if let Some(res) = validator_result { res } else { Ok(()) }
 }
 
 /// Chain synchronizer entry point - orchestrates the complete chain synchronization pipeline
@@ -483,7 +498,7 @@ async fn validation_worker(
             },
             Err(e) => {
                 if shutdown.is_cancelled() {
-                    warn!("[Worker {worker_id}] Error during shutdown, stopping: {e}");
+                    warn!(worker_id, error = %e, "[Worker] Error during shutdown, stopping");
                     break;
                 }
                 error!("[Worker {worker_id}] Error during task processing: {e}");
@@ -578,13 +593,7 @@ async fn validate_one(
                 validate_block(&chain_spec, &block, witness, mpt_witness, &contracts, None)
             })
             .await
-            .map_err(|e| {
-                if e.is_cancelled() {
-                    eyre::eyre!("Validation task was cancelled during shutdown")
-                } else {
-                    eyre::eyre!("Validation task panicked: {e}")
-                }
-            })?;
+            .map_err(|e| eyre::eyre!("Validation task panicked: {e}"))?;
 
             let (success, error_message) = match &validation_result {
                 Ok(stats) => {
