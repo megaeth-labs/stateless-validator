@@ -4,7 +4,7 @@ members = [
     "bin/debug-trace-server",
     "bin/stateless-validator",
     "crates/stateless-common",
-    "crates/validator-core",
+    "crates/stateless-core",
 ]
 resolver = "2"
 

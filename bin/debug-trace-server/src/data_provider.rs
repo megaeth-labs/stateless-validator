@@ -25,9 +25,9 @@ use eyre::Result;
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
+use stateless_core::{LightWitness, RpcClient, ValidatorDB, withdrawals::MptWitness};
 use tokio::sync::broadcast;
 use tracing::{debug, instrument, trace, warn};
-use validator_core::{withdrawals::MptWitness, LightWitness, RpcClient, ValidatorDB};
 
 use crate::metrics::{
     ChainSyncMetrics, DataSourceMetrics, SingleFlightMetrics, UpstreamMetrics, WitnessSourceMetrics,
@@ -59,7 +59,7 @@ pub const DEFAULT_WITNESS_TIMEOUT_SECS: u64 = 8;
 const WITNESS_RETRY_INTERVAL_MS: u64 = 200;
 
 /// Slow stage threshold: any individual stage exceeding this triggers a warn log.
-const SLOW_STAGE_THRESHOLD_MS: u128 = 1000;
+pub(crate) const SLOW_STAGE_THRESHOLD_MS: u128 = 1000;
 
 /// Broadcast sender type for single-flight request pattern.
 /// Used to notify all waiters when a block fetch completes.
@@ -122,10 +122,10 @@ impl DataProvider {
     /// * `Err` - If the block cannot be fetched from any source
     pub async fn get_block_data(&self, block_num: u64) -> Result<BlockData> {
         // Try to get block hash from local database first
-        if let Some(db) = &self.validator_db {
-            if let Ok(Some(hash)) = db.get_block_hash(block_num) {
-                return self.get_block_data_by_hash(hash).await;
-            }
+        if let Some(db) = &self.validator_db &&
+            let Ok(Some(hash)) = db.get_block_hash(block_num)
+        {
+            return self.get_block_data_by_hash(hash).await;
         }
 
         // Fall back to RPC - fetch header to get hash, then delegate to get_block_data_by_hash
@@ -148,19 +148,19 @@ impl DataProvider {
         let start = std::time::Instant::now();
 
         // Try to get from local database
-        if let Some(db) = &self.validator_db {
-            if let Ok(data) = self.get_block_data_from_db(db, block_hash).await {
-                trace!(
-                    block_hash = %block_hash,
-                    source = "database",
-                    elapsed_ms = start.elapsed().as_millis() as u64,
-                    "Block data retrieved from local DB"
-                );
-                DataSourceMetrics::new_for_source("db").record();
-                SingleFlightMetrics::new_for_type("bypassed").record();
-                self.record_block_distance(data.block.header.number);
-                return Ok(data);
-            }
+        if let Some(db) = &self.validator_db &&
+            let Ok(data) = self.get_block_data_from_db(db, block_hash).await
+        {
+            trace!(
+                block_hash = %block_hash,
+                source = "database",
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "Block data retrieved from local DB"
+            );
+            DataSourceMetrics::new_for_source("db").record();
+            SingleFlightMetrics::new_for_type("bypassed").record();
+            self.record_block_distance(data.block.header.number);
+            return Ok(data);
         }
 
         // Fall back to RPC
@@ -253,11 +253,11 @@ impl DataProvider {
 
     /// Records the distance of a requested block from the local chain tip.
     fn record_block_distance(&self, block_number: u64) {
-        if let Some(db) = &self.validator_db {
-            if let Ok(Some((tip, _))) = db.get_local_tip() {
-                let distance = tip.saturating_sub(block_number);
-                ChainSyncMetrics::create().record_block_distance(distance);
-            }
+        if let Some(db) = &self.validator_db &&
+            let Ok(Some((tip, _))) = db.get_local_tip()
+        {
+            let distance = tip.saturating_sub(block_number);
+            ChainSyncMetrics::create().record_block_distance(distance);
         }
     }
 
@@ -280,7 +280,7 @@ impl DataProvider {
 
         // Extract code hashes and get contracts
         let start = std::time::Instant::now();
-        let code_hashes = validator_core::extract_code_hashes(&witness);
+        let code_hashes = stateless_core::extract_code_hashes(&witness);
         let num_contracts = code_hashes.len();
         let contracts = self.get_contracts_with_db(db, &code_hashes).await?;
         let fetch_contracts_ms = start.elapsed().as_millis();
@@ -413,7 +413,7 @@ impl DataProvider {
 
         // Step 4: Extract code hashes and fetch contracts
         let start = std::time::Instant::now();
-        let code_hashes = validator_core::extract_code_hashes(&witness);
+        let code_hashes = stateless_core::extract_code_hashes(&witness);
         let num_contracts = code_hashes.len();
         let contracts = self.get_contracts(&code_hashes).await?;
         let fetch_contracts_ms = start.elapsed().as_millis();
@@ -507,8 +507,7 @@ impl DataProvider {
             // Block is newer than DB max: retry witness endpoint until timeout
             trace!(
                 block_number,
-                db_max_height,
-                "Block is new, using retry loop for witness endpoint"
+                db_max_height, "Block is new, using retry loop for witness endpoint"
             );
 
             let start = std::time::Instant::now();
@@ -541,8 +540,7 @@ impl DataProvider {
             // Block is older/pruned: single attempt on witness endpoint, then immediate Cloudflare
             trace!(
                 block_number,
-                db_max_height,
-                "Block is old/pruned, single attempt then Cloudflare fallback"
+                db_max_height, "Block is old/pruned, single attempt then Cloudflare fallback"
             );
 
             let start = std::time::Instant::now();

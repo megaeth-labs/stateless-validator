@@ -19,7 +19,7 @@ use std::{env, time::Duration};
 
 use reqwest::blocking::Client;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// JSON-RPC request structure.
 #[derive(Serialize)]

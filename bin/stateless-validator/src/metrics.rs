@@ -9,16 +9,14 @@ use alloy_primitives::B256;
 use eyre::Result;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
+pub use stateless_common::DEFAULT_METRICS_PORT;
+pub use stateless_core::RpcMethod;
+use stateless_core::RpcMetrics;
 use tracing::info;
-pub use validator_core::RpcMethod;
-use validator_core::RpcMetrics;
-
-/// Default metrics port.
-pub const DEFAULT_METRICS_PORT: u16 = 9090;
 
 /// Metrics callback implementation for RPC client.
 ///
-/// This struct implements the `RpcMetrics` trait from validator-core,
+/// This struct implements the `RpcMetrics` trait from stateless-core,
 /// allowing the RPC client to report metrics through the stateless validator's
 /// Prometheus metrics system.
 pub struct ValidatorMetrics;

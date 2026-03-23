@@ -11,9 +11,7 @@ use eyre::Result;
 use metrics::{Counter, Gauge, Histogram};
 use metrics_derive::Metrics;
 use metrics_exporter_prometheus::PrometheusBuilder;
-
-/// Default port for Prometheus metrics HTTP endpoint.
-pub const DEFAULT_METRICS_PORT: u16 = 9090;
+pub use stateless_common::DEFAULT_METRICS_PORT;
 
 // ---------------------------------------------------------------------------
 // RPC Method Name Constants

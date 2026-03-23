@@ -15,16 +15,16 @@ use futures::future;
 use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
 use salt::SaltWitness;
 use stateless_common::logging::{LogArgs, migrate_legacy_env_vars};
-use tokio::{signal, task, task::JoinHandle};
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
-use validator_core::{
+use stateless_core::{
     ChainSyncConfig, FetchResult, RpcClient, RpcClientConfig, ValidatorDB,
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
     executor::{ValidationResult, validate_block},
     remote_chain_tracker,
 };
+use tokio::{signal, task, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 mod metrics;
 
@@ -810,8 +810,8 @@ mod tests {
     };
     use op_alloy_rpc_types::Transaction;
     use serde::{Deserialize, Serialize, de::DeserializeOwned};
+    use stateless_core::{rpc_client::WitnessRequestKeys, withdrawals::MptWitness};
     use tracing_subscriber::EnvFilter;
-    use validator_core::{rpc_client::WitnessRequestKeys, withdrawals::MptWitness};
 
     use super::*;
 

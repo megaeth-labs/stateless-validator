@@ -13,17 +13,17 @@ use std::{
     collections::{HashMap, HashSet},
     hash::RandomState,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
 };
 
 use alloy_primitives::B256;
 use alloy_rpc_types_trace::geth::GethDebugTracingOptions;
-use quick_cache::{sync::Cache, Lifecycle, Weighter};
+use quick_cache::{Lifecycle, Weighter, sync::Cache};
 use tracing::{debug, trace};
 
-use crate::metrics::{CacheMetrics, CACHE_TYPE_DEBUG_TRACE, CACHE_TYPE_TRACE};
+use crate::metrics::{CACHE_TYPE_DEBUG_TRACE, CACHE_TYPE_TRACE, CacheMetrics};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -593,11 +593,7 @@ impl CacheStats {
     /// Returns the cache hit rate as a percentage.
     pub fn hit_rate(&self) -> f64 {
         let total = self.hits + self.misses;
-        if total == 0 {
-            0.0
-        } else {
-            (self.hits as f64 / total as f64) * 100.0
-        }
+        if total == 0 { 0.0 } else { (self.hits as f64 / total as f64) * 100.0 }
     }
 }
 

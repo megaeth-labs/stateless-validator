@@ -20,7 +20,7 @@ This validator enables efficient block verification using cryptographic witness 
 ## Project Structure
 
 - **`bin/stateless-validator`**: Main validator binary that coordinates chain synchronization and manages validation workers
-- **`crates/validator-core`**: Core library providing validation logic, database operations, and EVM execution
+- **`crates/stateless-core`**: Core library providing validation logic, database operations, and EVM execution
 - **`test_data/`**: Integration test data including blocks, witnesses, and contract bytecode
 
 ## Quick Start

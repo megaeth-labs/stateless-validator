@@ -37,10 +37,10 @@ salt.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 stateless-common = { path = "../../crates/stateless-common" }
+stateless-core = { path = "../../crates/stateless-core" }
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
-validator-core = { path = "../../crates/validator-core" }
 
 [dev-dependencies]
 base64.workspace = true
@@ -51,4 +51,4 @@ tracing-subscriber.workspace = true
 zstd.workspace = true
 
 [features]
-test-bucket-resize = ["salt/test-bucket-resize", "validator-core/test-bucket-resize"]
+test-bucket-resize = ["salt/test-bucket-resize", "stateless-core/test-bucket-resize"]

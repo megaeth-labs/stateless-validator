@@ -30,7 +30,7 @@ use alloy_primitives::{Bytes, TxKind, U256};
 use alloy_signer_local::PrivateKeySigner;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ---------------------------------------------------------------------------
 // Test Infrastructure

@@ -5,8 +5,8 @@
 
 use std::{
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -16,24 +16,21 @@ use alloy_rpc_types_eth::BlockNumberOrTag;
 use alloy_rpc_types_trace::geth::GethDebugTracingOptions;
 use dashmap::DashMap;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
+use stateless_core::chain_spec::ChainSpec;
 use tracing::{trace, warn};
-use validator_core::chain_spec::ChainSpec;
 
 use crate::{
-    data_provider::{BlockData, DataProvider},
+    data_provider::{BlockData, DataProvider, SLOW_STAGE_THRESHOLD_MS},
     metrics::{
-        self, DataSourceMetrics, EvmExecutionMetrics, ResponseSizeMetrics, RpcGlobalMetrics,
-        SingleFlightMetrics, METHOD_DEBUG_TRACE_BLOCK_BY_HASH, METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
-        METHOD_DEBUG_TRACE_TRANSACTION, METHOD_TRACE_BLOCK, METHOD_TRACE_TRANSACTION,
+        self, DataSourceMetrics, EvmExecutionMetrics, METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
+        METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, METHOD_DEBUG_TRACE_TRANSACTION, METHOD_TRACE_BLOCK,
+        METHOD_TRACE_TRANSACTION, ResponseSizeMetrics, RpcGlobalMetrics, SingleFlightMetrics,
     },
     response_cache::{CachedResource, ResponseCache, ResponseVariant},
 };
 
 /// Slow request threshold for logging warnings.
 const SLOW_REQUEST_THRESHOLD: Duration = Duration::from_secs(5);
-
-/// Slow stage threshold: any individual stage exceeding this triggers a warn log.
-const SLOW_STAGE_THRESHOLD_MS: u128 = 1000;
 
 // ---------------------------------------------------------------------------
 // RPC Trait Definitions (proc-macro)
@@ -283,7 +280,7 @@ async fn compute_debug_trace_block(
 ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
     let start = Instant::now();
 
-    let results = validator_core::trace_block(
+    let results = stateless_core::trace_block(
         chain_spec,
         &data.block,
         data.witness.clone(),
@@ -325,7 +322,7 @@ async fn compute_parity_trace_block(
 ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
     let start = Instant::now();
 
-    let results = validator_core::parity_trace_block(
+    let results = stateless_core::parity_trace_block(
         chain_spec,
         &data.block,
         data.witness.clone(),
@@ -595,7 +592,7 @@ impl DebugTraceRpcServer for RpcContext {
             })?;
 
         let evm_start = Instant::now();
-        let result = validator_core::trace_transaction(
+        let result = stateless_core::trace_transaction(
             &self.chain_spec,
             &data.block,
             tx_index,
@@ -735,7 +732,7 @@ impl TraceRpcServer for RpcContext {
         };
 
         let evm_start = Instant::now();
-        let result = validator_core::parity_trace_transaction(
+        let result = stateless_core::parity_trace_transaction(
             &self.chain_spec,
             &data.block,
             tx_index,

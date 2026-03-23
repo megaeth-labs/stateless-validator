@@ -17,12 +17,12 @@ cargo build --release
 
 # Test
 cargo test                                    # all tests
-cargo test -p validator-core                  # core crate only
-cargo test -p validator-core -- test_name     # single test
+cargo test -p stateless-core                  # core crate only
+cargo test -p stateless-core -- test_name     # single test
 
 # Check compiler errors (preferred over clippy for quick checks)
 cargo check
-cargo check -p validator-core
+cargo check -p stateless-core
 
 # Lint (CI runs all of these)
 cargo fmt --all --check
@@ -36,7 +36,7 @@ The project uses nightly `2026-02-03` toolchain (edition 2024, rust-version 1.95
 
 | Crate                | Path                       | Purpose                                                    |
 | -------------------- | -------------------------- | ---------------------------------------------------------- |
-| `validator-core`     | `crates/validator-core`    | Core validation logic, database, EVM execution, RPC client |
+| `stateless-core`     | `crates/stateless-core`    | Core validation logic, database, EVM execution, RPC client |
 | `stateless-common`   | `crates/stateless-common`  | Common utilities including logging configuration           |
 | `stateless-validator`| `bin/stateless-validator`  | Main binary: chain sync, parallel validation workers       |
 | `debug-trace-server` | `bin/debug-trace-server`   | Standalone RPC server for debug/trace methods              |
@@ -103,13 +103,13 @@ The server includes an HTTP response cache (`quick_cache`) for pre-serialized JS
 
 | File                                               | Purpose                                           |
 | -------------------------------------------------- | ------------------------------------------------- |
-| `crates/validator-core/src/validator_db.rs`        | Central database with 10 redb tables              |
-| `crates/validator-core/src/executor.rs`            | Block validation and EVM replay                   |
-| `crates/validator-core/src/tracing_executor.rs`    | Block tracing with TracerKind deduplication        |
-| `crates/validator-core/src/database.rs`            | WitnessDatabase implementing `revm::DatabaseRef`  |
-| `crates/validator-core/src/rpc_client.rs`          | RPC client for blocks, witnesses, and bytecode    |
-| `crates/validator-core/src/chain_sync.rs`          | Chain synchronization and remote chain tracking   |
-| `crates/validator-core/src/withdrawals.rs`         | Withdrawal validation and MPT witness handling    |
+| `crates/stateless-core/src/validator_db.rs`        | Central database with 10 redb tables              |
+| `crates/stateless-core/src/executor.rs`            | Block validation and EVM replay                   |
+| `crates/stateless-core/src/tracing_executor.rs`    | Block tracing with TracerKind deduplication        |
+| `crates/stateless-core/src/database.rs`            | WitnessDatabase implementing `revm::DatabaseRef`  |
+| `crates/stateless-core/src/rpc_client.rs`          | RPC client for blocks, witnesses, and bytecode    |
+| `crates/stateless-core/src/chain_sync.rs`          | Chain synchronization and remote chain tracking   |
+| `crates/stateless-core/src/withdrawals.rs`         | Withdrawal validation and MPT witness handling    |
 | `bin/stateless-validator/src/main.rs`              | CLI, chain sync loop, parallel validation workers |
 | `bin/debug-trace-server/src/rpc_service.rs`        | RPC method definitions and handlers               |
 | `bin/debug-trace-server/src/data_provider.rs`      | Block data fetching with single-flight coalescing |

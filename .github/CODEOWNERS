@@ -1,8 +1,8 @@
 # Default: repo owner owns everything
 * @Troublor
 
-# validator-core
-/crates/validator-core/ @flyq
+# stateless-core
+/crates/stateless-core/ @flyq
 
 # stateless-common (shared by both)
 /crates/stateless-common/ @flyq @krabat-l

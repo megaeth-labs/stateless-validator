@@ -1,7 +1,11 @@
 [package]
 name = "debug-trace-server"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+exclude.workspace = true
 
 [dependencies]
 
@@ -46,7 +50,7 @@ tracing.workspace = true
 
 # Reuse validator-core
 stateless-common = { path = "../../crates/stateless-common" }
-validator-core = { path = "../../crates/validator-core" }
+stateless-core = { path = "../../crates/stateless-core" }
 
 [dev-dependencies]
 alloy-consensus.workspace = true

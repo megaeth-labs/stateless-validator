@@ -10,8 +10,8 @@
 //! ```
 
 use alloy_primitives::B256;
+use stateless_core::ValidatorDB;
 use tempfile::TempDir;
-use validator_core::ValidatorDB;
 
 /// Test that prune_history removes blocks older than the specified block number.
 #[test]

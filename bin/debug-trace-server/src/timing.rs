@@ -128,7 +128,7 @@ where
 /// CPU time, which excludes time spent sleeping or waiting for I/O.
 /// Returns [`Duration::ZERO`] if the system call fails.
 fn thread_cpu_time() -> Duration {
-    use libc::{clock_gettime, timespec, CLOCK_THREAD_CPUTIME_ID};
+    use libc::{CLOCK_THREAD_CPUTIME_ID, clock_gettime, timespec};
     unsafe {
         let mut ts = timespec { tv_sec: 0, tv_nsec: 0 };
         if clock_gettime(CLOCK_THREAD_CPUTIME_ID, std::ptr::addr_of_mut!(ts)) != 0 {

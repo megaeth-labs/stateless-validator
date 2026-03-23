@@ -121,7 +121,7 @@ pub struct LogArgs {
 /// workspace crates while defaulting everything else to `warn`.
 fn build_env_filter(filter: &str) -> Result<EnvFilter> {
     Ok(EnvFilter::new("warn")
-        .add_directive(format!("validator_core={filter}").parse()?)
+        .add_directive(format!("stateless_core={filter}").parse()?)
         .add_directive(format!("stateless_validator={filter}").parse()?)
         .add_directive(format!("stateless_common={filter}").parse()?)
         .add_directive(format!("debug_trace_server={filter}").parse()?))

@@ -43,18 +43,18 @@
 use std::{path::PathBuf, sync::Arc};
 
 use alloy_genesis::Genesis;
-use alloy_primitives::{hex, BlockHash, B256};
+use alloy_primitives::{B256, BlockHash, hex};
 use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
-use eyre::{anyhow, ensure, Result};
+use eyre::{Result, anyhow, ensure};
 use jsonrpsee::server::Server;
 use stateless_common::logging::LogArgs;
+use stateless_core::{
+    ChainSyncConfig, RpcClient, RpcClientConfig, ValidatorDB, chain_spec::ChainSpec,
+    remote_chain_tracker,
+};
 use tokio::task;
 use tracing::{debug, error, info, instrument, warn};
-use validator_core::{
-    chain_spec::ChainSpec, remote_chain_tracker, ChainSyncConfig, RpcClient, RpcClientConfig,
-    ValidatorDB,
-};
 
 mod data_provider;
 mod metrics;
@@ -64,7 +64,7 @@ mod rpc_service;
 mod timing;
 
 use data_provider::DataProvider;
-use response_cache::{ResponseCache, ResponseCacheConfig, DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS};
+use response_cache::{DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS, ResponseCache, ResponseCacheConfig};
 use rpc_service::RpcContext;
 
 /// Command line arguments for the debug-trace-server.
@@ -317,7 +317,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }),
-            Some(move |result: &validator_core::FetchResult| {
+            Some(move |result: &stateless_core::FetchResult| {
                 if let Some(height) = result.remote_chain_height {
                     fetch_metrics.set_remote_height(height);
                 }
