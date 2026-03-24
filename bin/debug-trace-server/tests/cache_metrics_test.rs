@@ -181,14 +181,12 @@ fn get_recent_block_with_txs(client: &RpcClient) -> Result<(u64, String), String
         let resp =
             client.call("eth_getBlockByNumber", json!([format!("0x{:x}", block_num), false]))?;
 
-        if let Some(block) = resp.result {
-            if let Some(txs) = block.get("transactions").and_then(|t| t.as_array()) {
-                if !txs.is_empty() {
-                    let hash =
-                        block.get("hash").and_then(|h| h.as_str()).unwrap_or_default().to_string();
-                    return Ok((block_num, hash));
-                }
-            }
+        if let Some(block) = resp.result &&
+            let Some(txs) = block.get("transactions").and_then(|t| t.as_array()) &&
+            !txs.is_empty()
+        {
+            let hash = block.get("hash").and_then(|h| h.as_str()).unwrap_or_default().to_string();
+            return Ok((block_num, hash));
         }
     }
 
@@ -478,47 +476,32 @@ fn test_cache_multiple_blocks() {
         // Check if block has transactions
         let block_resp = mega_reth.call("eth_getBlockByNumber", json!([&block_hex, false])).ok();
 
-        if let Some(resp) = block_resp {
-            if let Some(block) = resp.result {
-                if let Some(txs) = block.get("transactions").and_then(|t| t.as_array()) {
-                    if !txs.is_empty() {
-                        println!("\n  Block {} ({} txs):", block_num, txs.len());
+        if let Some(resp) = block_resp &&
+            let Some(block) = resp.result &&
+            let Some(txs) = block.get("transactions").and_then(|t| t.as_array()) &&
+            !txs.is_empty()
+        {
+            println!("\n  Block {} ({} txs):", block_num, txs.len());
 
-                        // First request (miss)
-                        let stats_before =
-                            get_cache_stats(&debug_server).expect("Failed to get cache stats");
+            // First request (miss)
+            let stats_before = get_cache_stats(&debug_server).expect("Failed to get cache stats");
 
-                        let _ = debug_server.call(
-                            "debug_traceBlockByNumber",
-                            json!([&block_hex, {"tracer": "callTracer"}]),
-                        );
+            let _ = debug_server
+                .call("debug_traceBlockByNumber", json!([&block_hex, {"tracer": "callTracer"}]));
 
-                        let stats_after =
-                            get_cache_stats(&debug_server).expect("Failed to get cache stats");
+            let stats_after = get_cache_stats(&debug_server).expect("Failed to get cache stats");
 
-                        println!(
-                            "    First request: misses {} -> {}",
-                            stats_before.misses, stats_after.misses
-                        );
+            println!("    First request: misses {} -> {}", stats_before.misses, stats_after.misses);
 
-                        // Second request (hit)
-                        let _ = debug_server.call(
-                            "debug_traceBlockByNumber",
-                            json!([&block_hex, {"tracer": "callTracer"}]),
-                        );
+            // Second request (hit)
+            let _ = debug_server
+                .call("debug_traceBlockByNumber", json!([&block_hex, {"tracer": "callTracer"}]));
 
-                        let stats_final =
-                            get_cache_stats(&debug_server).expect("Failed to get cache stats");
+            let stats_final = get_cache_stats(&debug_server).expect("Failed to get cache stats");
 
-                        println!(
-                            "    Second request: hits {} -> {}",
-                            stats_after.hits, stats_final.hits
-                        );
+            println!("    Second request: hits {} -> {}", stats_after.hits, stats_final.hits);
 
-                        tested_blocks += 1;
-                    }
-                }
-            }
+            tested_blocks += 1;
         }
     }
 

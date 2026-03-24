@@ -132,14 +132,12 @@ fn find_block_with_txs(client: &RpcClient) -> Option<(u64, String)> {
         let resp = client
             .call("eth_getBlockByNumber", json!([format!("0x{:x}", block_num), false]))
             .ok()?;
-        if let Some(block) = resp.result {
-            if let Some(txs) = block.get("transactions").and_then(|t| t.as_array()) {
-                if !txs.is_empty() {
-                    let hash =
-                        block.get("hash").and_then(|h| h.as_str()).unwrap_or_default().to_string();
-                    return Some((block_num, hash));
-                }
-            }
+        if let Some(block) = resp.result &&
+            let Some(txs) = block.get("transactions").and_then(|t| t.as_array()) &&
+            !txs.is_empty()
+        {
+            let hash = block.get("hash").and_then(|h| h.as_str()).unwrap_or_default().to_string();
+            return Some((block_num, hash));
         }
     }
     None
@@ -657,14 +655,12 @@ fn test_send_tx_and_trace() {
     for _ in 0..120 {
         std::thread::sleep(Duration::from_millis(500));
         let resp = mega_reth.call("eth_getTransactionReceipt", json!([&tx_hash])).unwrap();
-        if let Some(receipt) = resp.result {
-            if !receipt.is_null() {
-                if let Some(bn) = receipt.get("blockNumber").and_then(|v| v.as_str()) {
-                    block_number =
-                        Some(u64::from_str_radix(bn.trim_start_matches("0x"), 16).unwrap());
-                    break;
-                }
-            }
+        if let Some(receipt) = resp.result &&
+            !receipt.is_null() &&
+            let Some(bn) = receipt.get("blockNumber").and_then(|v| v.as_str())
+        {
+            block_number = Some(u64::from_str_radix(bn.trim_start_matches("0x"), 16).unwrap());
+            break;
         }
     }
 
@@ -822,14 +818,12 @@ fn test_deploy_contract_and_trace() {
     for _ in 0..120 {
         std::thread::sleep(Duration::from_millis(500));
         let resp = mega_reth.call("eth_getTransactionReceipt", json!([&tx_hash])).unwrap();
-        if let Some(receipt) = resp.result {
-            if !receipt.is_null() {
-                if let Some(bn) = receipt.get("blockNumber").and_then(|v| v.as_str()) {
-                    block_number =
-                        Some(u64::from_str_radix(bn.trim_start_matches("0x"), 16).unwrap());
-                    break;
-                }
-            }
+        if let Some(receipt) = resp.result &&
+            !receipt.is_null() &&
+            let Some(bn) = receipt.get("blockNumber").and_then(|v| v.as_str())
+        {
+            block_number = Some(u64::from_str_radix(bn.trim_start_matches("0x"), 16).unwrap());
+            break;
         }
     }
 

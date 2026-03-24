@@ -503,21 +503,19 @@ fn get_blocks_with_transactions(
         let resp =
             client.call("eth_getBlockByNumber", json!([format!("0x{:x}", block_num), true]))?;
 
-        if let Some(block) = resp.result {
-            if let Some(txs) = block.get("transactions").and_then(|t| t.as_array()) {
-                if !txs.is_empty() {
-                    let hash =
-                        block.get("hash").and_then(|h| h.as_str()).unwrap_or_default().to_string();
+        if let Some(block) = resp.result &&
+            let Some(txs) = block.get("transactions").and_then(|t| t.as_array()) &&
+            !txs.is_empty()
+        {
+            let hash = block.get("hash").and_then(|h| h.as_str()).unwrap_or_default().to_string();
 
-                    let tx_hashes: Vec<String> = txs
-                        .iter()
-                        .filter_map(|tx| tx.get("hash").and_then(|h| h.as_str()).map(String::from))
-                        .collect();
+            let tx_hashes: Vec<String> = txs
+                .iter()
+                .filter_map(|tx| tx.get("hash").and_then(|h| h.as_str()).map(String::from))
+                .collect();
 
-                    if !tx_hashes.is_empty() {
-                        blocks.push(BlockInfo { number: block_num, hash, tx_hashes });
-                    }
-                }
+            if !tx_hashes.is_empty() {
+                blocks.push(BlockInfo { number: block_num, hash, tx_hashes });
             }
         }
     }
@@ -1162,32 +1160,20 @@ fn test_large_block() {
             .call("eth_getBlockByNumber", json!([format!("0x{:x}", block_num), true]))
             .ok();
 
-        if let Some(resp) = resp {
-            if let Some(block) = resp.result {
-                if let Some(txs) = block.get("transactions").and_then(|t| t.as_array()) {
-                    if txs.len() >= min_tx_count {
-                        let hash = block
-                            .get("hash")
-                            .and_then(|h| h.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        let tx_hashes: Vec<String> = txs
-                            .iter()
-                            .filter_map(|tx| {
-                                tx.get("hash").and_then(|h| h.as_str()).map(String::from)
-                            })
-                            .collect();
+        if let Some(resp) = resp &&
+            let Some(block) = resp.result &&
+            let Some(txs) = block.get("transactions").and_then(|t| t.as_array()) &&
+            txs.len() >= min_tx_count
+        {
+            let hash = block.get("hash").and_then(|h| h.as_str()).unwrap_or_default().to_string();
+            let tx_hashes: Vec<String> = txs
+                .iter()
+                .filter_map(|tx| tx.get("hash").and_then(|h| h.as_str()).map(String::from))
+                .collect();
 
-                        println!(
-                            "  Found block {} with {} transactions",
-                            block_num,
-                            tx_hashes.len()
-                        );
-                        large_block = Some(BlockInfo { number: block_num, hash, tx_hashes });
-                        break;
-                    }
-                }
-            }
+            println!("  Found block {} with {} transactions", block_num, tx_hashes.len());
+            large_block = Some(BlockInfo { number: block_num, hash, tx_hashes });
+            break;
         }
     }
 

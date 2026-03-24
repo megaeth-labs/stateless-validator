@@ -203,15 +203,13 @@ fn test_tracer_performance_cache_hit() {
     for bn in (1..latest.saturating_sub(5)).rev() {
         let resp =
             mega_reth.call("eth_getBlockByNumber", json!([format!("0x{:x}", bn), false])).ok();
-        if let Some(resp) = resp {
-            if let Some(block) = resp.result {
-                if let Some(txs) = block.get("transactions").and_then(|t| t.as_array()) {
-                    if !txs.is_empty() {
-                        test_block = bn;
-                        break;
-                    }
-                }
-            }
+        if let Some(resp) = resp &&
+            let Some(block) = resp.result &&
+            let Some(txs) = block.get("transactions").and_then(|t| t.as_array()) &&
+            !txs.is_empty()
+        {
+            test_block = bn;
+            break;
         }
     }
 
@@ -354,14 +352,12 @@ fn test_tracer_performance_fresh_block() {
         for _ in 0..60 {
             std::thread::sleep(Duration::from_millis(500));
             let resp = mega_reth.call("eth_getTransactionReceipt", json!([&tx_hash])).unwrap();
-            if let Some(receipt) = resp.result {
-                if !receipt.is_null() {
-                    if let Some(bn) = receipt.get("blockNumber").and_then(|v| v.as_str()) {
-                        block_number =
-                            Some(u64::from_str_radix(bn.trim_start_matches("0x"), 16).unwrap());
-                        break;
-                    }
-                }
+            if let Some(receipt) = resp.result &&
+                !receipt.is_null() &&
+                let Some(bn) = receipt.get("blockNumber").and_then(|v| v.as_str())
+            {
+                block_number = Some(u64::from_str_radix(bn.trim_start_matches("0x"), 16).unwrap());
+                break;
             }
         }
 
@@ -431,14 +427,12 @@ fn test_tracer_performance_cold_request() {
         }
         let resp =
             mega_reth.call("eth_getBlockByNumber", json!([format!("0x{:x}", bn), false])).ok();
-        if let Some(resp) = resp {
-            if let Some(block) = resp.result {
-                if let Some(txs) = block.get("transactions").and_then(|t| t.as_array()) {
-                    if !txs.is_empty() {
-                        test_blocks.push(bn);
-                    }
-                }
-            }
+        if let Some(resp) = resp &&
+            let Some(block) = resp.result &&
+            let Some(txs) = block.get("transactions").and_then(|t| t.as_array()) &&
+            !txs.is_empty()
+        {
+            test_blocks.push(bn);
         }
     }
 
@@ -566,14 +560,12 @@ fn test_tracer_performance_comparison() {
         for _ in 0..60 {
             std::thread::sleep(Duration::from_millis(500));
             let resp = mega_reth.call("eth_getTransactionReceipt", json!([&tx_hash])).unwrap();
-            if let Some(receipt) = resp.result {
-                if !receipt.is_null() {
-                    if let Some(bn) = receipt.get("blockNumber").and_then(|v| v.as_str()) {
-                        block_number =
-                            Some(u64::from_str_radix(bn.trim_start_matches("0x"), 16).unwrap());
-                        break;
-                    }
-                }
+            if let Some(receipt) = resp.result &&
+                !receipt.is_null() &&
+                let Some(bn) = receipt.get("blockNumber").and_then(|v| v.as_str())
+            {
+                block_number = Some(u64::from_str_radix(bn.trim_start_matches("0x"), 16).unwrap());
+                break;
             }
         }
 
@@ -634,18 +626,18 @@ fn test_tracer_performance_comparison() {
     println!("{}", "=".repeat(80));
 
     let resp = dts.call("debug_getCacheStatus", json!([])).unwrap();
-    if let Some(result) = resp.result {
-        if let Some(cache) = result.get("responseCache") {
-            println!("  Entries: {}", cache.get("entryCount").unwrap_or(&json!("?")));
-            println!(
-                "  Total Bytes: {} ({} MB)",
-                cache.get("totalBytes").unwrap_or(&json!("?")),
-                cache.get("totalBytesMB").unwrap_or(&json!("?"))
-            );
-            println!("  Hits: {}", cache.get("hits").unwrap_or(&json!("?")));
-            println!("  Misses: {}", cache.get("misses").unwrap_or(&json!("?")));
-            println!("  Hit Rate: {}", cache.get("hitRate").unwrap_or(&json!("?")));
-        }
+    if let Some(result) = resp.result &&
+        let Some(cache) = result.get("responseCache")
+    {
+        println!("  Entries: {}", cache.get("entryCount").unwrap_or(&json!("?")));
+        println!(
+            "  Total Bytes: {} ({} MB)",
+            cache.get("totalBytes").unwrap_or(&json!("?")),
+            cache.get("totalBytesMB").unwrap_or(&json!("?"))
+        );
+        println!("  Hits: {}", cache.get("hits").unwrap_or(&json!("?")));
+        println!("  Misses: {}", cache.get("misses").unwrap_or(&json!("?")));
+        println!("  Hit Rate: {}", cache.get("hitRate").unwrap_or(&json!("?")));
     }
 
     println!("\n{}", "=".repeat(80));
@@ -716,10 +708,10 @@ fn test_trace_transaction_performance() {
     for _ in 0..60 {
         std::thread::sleep(Duration::from_millis(500));
         let resp = mega_reth.call("eth_getTransactionReceipt", json!([&tx_hash])).unwrap();
-        if let Some(receipt) = resp.result {
-            if !receipt.is_null() {
-                break;
-            }
+        if let Some(receipt) = resp.result &&
+            !receipt.is_null()
+        {
+            break;
         }
     }
 
