@@ -97,6 +97,7 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
         .map_err(|e| eyre::eyre!("Failed to install Prometheus exporter: {}", e))?;
 
     register_metric_descriptions();
+    init_rpc_method_counters();
     info!("[Metrics] Prometheus exporter listening on {}", addr);
     Ok(())
 }
@@ -143,6 +144,24 @@ fn register_metric_descriptions() {
     describe_histogram!(names::MPT_WITNESS_SIZE, "MPT witness size (bytes)");
     describe_histogram!(names::SALT_WITNESS_KEYS, "Salt witness key count");
     describe_histogram!(names::SALT_WITNESS_KVS_SIZE, "Salt witness KVs size (bytes)");
+}
+
+/// Pre-register RPC method counters used by the validator so they appear in Prometheus output from
+/// startup.
+fn init_rpc_method_counters() {
+    let methods = [
+        RpcMethod::EthGetCodeByHash,
+        RpcMethod::EthGetBlockByNumber,
+        RpcMethod::EthBlockNumber,
+        RpcMethod::EthGetHeader,
+        RpcMethod::MegaGetBlockWitness,
+        RpcMethod::MegaSetValidatedBlocks,
+    ];
+    for method in methods {
+        let method_str = method.as_str();
+        counter!(names::RPC_REQUESTS_TOTAL, "method" => method_str).increment(0);
+        counter!(names::RPC_ERRORS_TOTAL, "method" => method_str).increment(0);
+    }
 }
 
 /// Record validation timing and block statistics after successful validation.
