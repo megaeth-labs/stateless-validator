@@ -48,7 +48,7 @@ tower = "0.4"
 # Logging and metrics
 tracing.workspace = true
 
-# Reuse validator-core
+# Reuse stateless-core
 stateless-common = { path = "../../crates/stateless-common" }
 stateless-core = { path = "../../crates/stateless-core" }
 
