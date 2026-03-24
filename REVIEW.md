@@ -19,6 +19,15 @@
 - No high-cardinality labels (no tx hashes or addresses as label values)
 - Prometheus naming conventions: `snake_case` with unit suffixes (`_seconds`, `_bytes`, `_total`)
 
+## Previous comments
+
+- Before writing new comments, check all previous review threads on this PR
+- If a previous comment has been addressed by the latest changes, resolve that thread using:
+  `gh api graphql -f query='mutation { resolveReviewThread(input:{threadId:"THREAD_ID"}) { thread { id } } }'`
+- To find thread IDs, query:
+  `gh api graphql -f query='{ repository(owner:"OWNER", name:"REPO") { pullRequest(number:NUMBER) { reviewThreads(first:50) { nodes { id isResolved comments(first:1) { nodes { body path } } } } } } }'`
+- Do not repeat feedback that has already been addressed
+
 ## Skip
 
 - Formatting-only changes already enforced by `cargo fmt`
