@@ -41,7 +41,7 @@ The project uses nightly `2026-02-03` toolchain (edition 2024, rust-version 1.95
 | `stateless-validator`| `bin/stateless-validator`  | Main binary: chain sync, parallel validation workers       |
 | `debug-trace-server` | `bin/debug-trace-server`   | Standalone RPC server for debug/trace methods              |
 
-Additional directories: `genesis/` (genesis config), `test_data/` (integration test fixtures), `audits/` (security audit reports).
+Additional directories: `test_data/` (integration test fixtures including genesis config), `audits/` (security audit reports).
 
 ## Architecture
 
