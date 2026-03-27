@@ -480,7 +480,7 @@ impl RpcClient {
                 Ok(witness)
             })
             .await
-            .context("decode task panicked")??;
+            .context("decode task failed")??;
         trace!(block_number = number, %hash, decode_ms = decode_start.elapsed().as_millis(), "{source} witness decoded");
 
         if let Some(ref metrics) = self.config.metrics {

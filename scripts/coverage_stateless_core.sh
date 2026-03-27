@@ -22,7 +22,7 @@ cargo llvm-cov clean --workspace
 cargo llvm-cov \
     --locked \
     --package stateless-core \
-    --all-features \
+    --no-default-features \
     --lib \
     --tests \
     --no-fail-fast \

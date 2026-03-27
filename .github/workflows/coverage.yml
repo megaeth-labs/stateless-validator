@@ -29,9 +29,6 @@ jobs:
         with:
           components: llvm-tools-preview
 
-      - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
-
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
