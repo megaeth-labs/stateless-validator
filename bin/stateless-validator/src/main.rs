@@ -820,10 +820,11 @@ mod tests {
 
     use super::*;
 
-    /// Serialized witness data for a blockchain block.
-    ///
-    /// Contains all necessary information to verify the state transition
-    /// and execution of a block without requiring the full state.
+    const SYNTHETIC_DATA_DIR: &str = "../../test_data/synthetic";
+    const MAINNET_DATA_DIR: &str = "../../test_data/mainnet";
+    const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
+
+    /// Witness file envelope containing the SALT witness and metadata.
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub(crate) struct WitnessFileContent {
         /// Hash of operation attributes for execution verification
@@ -834,141 +835,192 @@ mod tests {
         pub salt_witness: SaltWitness,
     }
 
-    /// Maximum response body size for the RPC server.
-    /// This is set to 100 MB to accommodate large block data and witness information.
-    const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
+    /// Pre-loaded test data: blocks, witnesses, and contract bytecodes.
+    #[derive(Debug, Clone)]
+    struct TestData {
+        blocks_by_hash: HashMap<BlockHash, Block<Transaction>>,
+        block_hashes: BTreeMap<u64, BlockHash>,
+        salt_witnesses: HashMap<BlockHash, SaltWitness>,
+        mpt_witnesses: HashMap<BlockHash, MptWitness>,
+        bytecodes: HashMap<B256, Bytecode>,
+    }
 
-    /// Helper function to create RPC errors with consistent format
+    impl TestData {
+        /// Load all test data (blocks, witnesses, contracts) from `data_dir`.
+        fn load(data_dir: &str) -> Self {
+            let block_dir = format!("{data_dir}/blocks");
+            let witness_dir = format!("{data_dir}/stateless/witness");
+            let contracts_file = format!("{data_dir}/contracts.txt");
+
+            // Load blocks
+            debug!("Loading block data from {block_dir}");
+            let mut blocks_by_hash = HashMap::new();
+            let mut block_hashes = BTreeMap::new();
+
+            for entry in std::fs::read_dir(&block_dir)
+                .unwrap_or_else(|e| panic!("Failed to read block directory {block_dir}: {e}"))
+            {
+                let file = entry.unwrap();
+                let file_name = file.file_name();
+                let file_str = file_name.to_string_lossy();
+                if !file_str.ends_with(".json") {
+                    continue;
+                }
+                if let Some(dot_pos) = file_str.find('.') &&
+                    let Ok(block_number) = file_str[..dot_pos].parse::<u64>()
+                {
+                    let block: Block<Transaction> = load_json(file.path()).unwrap();
+                    let block_hash = BlockHash::from(block.header.hash);
+                    blocks_by_hash.insert(block_hash, block);
+                    block_hashes.insert(block_number, block_hash);
+                }
+            }
+
+            let (&min, &max) = (
+                block_hashes.keys().next().expect("No blocks found"),
+                block_hashes.keys().next_back().unwrap(),
+            );
+            debug!("Loaded {} blocks (range: {} - {})", blocks_by_hash.len(), min, max);
+
+            // Load witnesses
+            debug!("Loading witness data from {witness_dir}");
+            let mut salt_witnesses = HashMap::new();
+            let mut mpt_witnesses = HashMap::new();
+
+            for entry in std::fs::read_dir(&witness_dir)
+                .unwrap_or_else(|e| panic!("Failed to read witness directory {witness_dir}: {e}"))
+            {
+                let entry = entry.unwrap();
+                let file_path = entry.path();
+                let Some(ext) = file_path.extension().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+
+                let stem = file_path.file_stem().unwrap().to_str().unwrap();
+                let (_, block_hash) = parse_block_num_and_hash(stem).unwrap();
+                let file_data = std::fs::read(&file_path).unwrap();
+
+                match ext {
+                    "salt" => {
+                        let (content, _): (WitnessFileContent, usize) =
+                            bincode::serde::decode_from_slice(
+                                &file_data,
+                                bincode::config::legacy(),
+                            )
+                            .unwrap_or_else(|e| {
+                                panic!("Failed to deserialize SaltWitness {stem}: {e}")
+                            });
+                        salt_witnesses.insert(block_hash, content.salt_witness);
+                    }
+                    "mpt" => {
+                        let (mpt_witness, _): (MptWitness, usize) =
+                            bincode::serde::decode_from_slice(
+                                &file_data,
+                                bincode::config::legacy(),
+                            )
+                            .unwrap_or_else(|e| {
+                                panic!("Failed to deserialize MptWitness {stem}: {e}")
+                            });
+                        mpt_witnesses.insert(block_hash, mpt_witness);
+                    }
+                    _ => {}
+                }
+            }
+
+            debug!("Loaded {} salt witness files", salt_witnesses.len());
+            debug!("Loaded {} mpt witness files", mpt_witnesses.len());
+
+            // Load contracts
+            let bytecodes = load_contracts(&contracts_file);
+            debug!("Loaded {} contracts from {contracts_file}", bytecodes.len());
+
+            Self { blocks_by_hash, block_hashes, salt_witnesses, mpt_witnesses, bytecodes }
+        }
+
+        fn min_block(&self) -> (u64, BlockHash) {
+            let (&num, &hash) = self.block_hashes.first_key_value().unwrap();
+            (num, hash)
+        }
+
+        fn max_block(&self) -> (u64, BlockHash) {
+            let (&num, &hash) = self.block_hashes.last_key_value().unwrap();
+            (num, hash)
+        }
+    }
+
+    fn init_test_logging() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::new("warn").add_directive("stateless_validator=debug".parse().unwrap()),
+            )
+            .try_init();
+    }
+
     fn make_rpc_error(code: i32, msg: String) -> ErrorObject<'static> {
         ErrorObject::owned(code, msg, None::<()>)
     }
 
-    /// Directory containing test block data files for mock RPC server.
-    ///
-    /// Files in this directory should be named with block numbers and hashes,
-    /// e.g., "280.0xabc123.json" for block 280 with hash 0xabc123.
-    const TEST_BLOCK_DIR: &str = "../../test_data/blocks";
-
-    /// Path to the test contracts data file.
-    ///
-    /// This file contains contract bytecode data with one JSON array per line
-    /// in the format `[hash, bytecode]` for use in integration tests.
-    const CONTRACTS_FILE: &str = "../../test_data/contracts.txt";
-
-    /// Directory containing test witness data files for integration testing.
-    ///
-    /// Files in this directory should have `.w` extension and contain serialized
-    /// SaltWitness data.
-    const TEST_WITNESS_DIR: &str = "../../test_data/stateless/witness";
-
-    /// Path to the genesis configuration file for integration testing.
-    const TEST_GENESIS_FILE: &str = "../../test_data/genesis.json";
-
-    /// Context object containing pre-loaded test data for efficient RPC serving
-    ///
-    /// This struct holds all test data (blocks, witnesses, contracts) loaded once during
-    /// setup to eliminate file system access during RPC calls.
-    #[derive(Debug, Clone)]
-    struct RpcModuleContext {
-        /// Block data indexed by block hash (single storage)
-        blocks_by_hash: HashMap<BlockHash, Block<Transaction>>,
-
-        /// Ordered block number to hash mapping for number-based lookups
-        block_hashes: BTreeMap<u64, BlockHash>,
-
-        /// Salt Witness data indexed by block hash
-        witness_data: HashMap<BlockHash, SaltWitness>,
-
-        /// Mpt Witness data indexed by block hash
-        mpt_witness_data: HashMap<BlockHash, MptWitness>,
-
-        /// Contract bytecode indexed by code hash for eth_getCodeByHash RPC
-        bytecodes: HashMap<B256, Bytecode>,
-
-        /// Minimum block in the test data set (block number and hash)
-        min_block: (u64, BlockHash),
-
-        /// Maximum block in the test data set (block number and hash)
-        max_block: (u64, BlockHash),
-    }
-
-    /// Parse block number and hash from string
-    ///
-    /// Parses strings in the format "{block_number}.{block_hash}" where
-    /// the block hash can optionally have a "0x" prefix.
-    ///
-    /// # Arguments
-    /// * `input` - String in format "280.0xabc123def456"
-    ///
-    /// # Returns
-    /// * `Ok((BlockNumber, BlockHash))` - Successfully parsed block identifiers
-    /// * `Err(eyre::Error)` - Invalid format or malformed hash
+    /// Parse "{block_number}.{block_hash}" from a filename stem.
     fn parse_block_num_and_hash(input: &str) -> Result<(BlockNumber, BlockHash)> {
         let (block_str, hash_str) =
             input.split_once('.').ok_or_else(|| anyhow!("Invalid format: {input}"))?;
-
         Ok((block_str.parse()?, parse_block_hash(hash_str)?))
     }
 
-    /// Creates a ValidatorDB instance for integration testing with pre-populated test data.
-    ///
-    /// Sets up a temporary database and initializes it with the necessary test data for
-    /// integration testing. The function performs the following setup steps:
-    /// 1. Creates a temporary directory and ValidatorDB instance
-    /// 2. Initializes the canonical chain tip using the minimum block from test data
-    /// 3. Populates the CONTRACTS table with test contract bytecode from `CONTRACTS_FILE`
-    ///
-    /// The temporary directory will be cleaned up automatically after the test ends.
-    ///
-    /// # Returns
-    ///
-    /// `Arc<ValidatorDB>` - Database instance with initialized chain tip and contract cache
-    ///
-    /// # Errors
-    ///
-    /// Returns error if temporary directory creation, database initialization,
-    /// test data loading, or contract population fails.
-    fn setup_test_db(context: &RpcModuleContext) -> Result<Arc<ValidatorDB>> {
-        // Create a temporary directory and then keep it alive by leaking it.
-        // OS will clean it when test process ends.
-        let temp_dir = tempfile::tempdir()
-            .map_err(|e| anyhow!("Failed to create temporary directory: {e}"))?;
+    fn load_json<T: DeserializeOwned>(file_path: impl AsRef<Path>) -> Result<T> {
+        let path = file_path.as_ref();
+        let contents = std::fs::read(path)
+            .with_context(|| format!("Failed to read file {}", path.display()))?;
+        serde_json::from_slice(&contents)
+            .with_context(|| format!("Failed to parse JSON from {}", path.display()))
+    }
+
+    /// Load contract bytecodes from a file (one `[hash, bytecode]` JSON per line).
+    fn load_contracts(path: impl AsRef<Path>) -> HashMap<B256, Bytecode> {
+        let file = File::open(path).expect("Failed to open contracts file");
+        BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(&line).expect("Failed to parse contract"))
+            .collect()
+    }
+
+    /// Create a temporary ValidatorDB with the anchor set to the first block in test data.
+    fn setup_test_db(data: &TestData) -> Result<Arc<ValidatorDB>> {
+        let temp_dir = tempfile::tempdir()?;
         let validator_db = ValidatorDB::new(temp_dir.path().join(VALIDATOR_DB_FILENAME))?;
         std::mem::forget(temp_dir);
 
-        // Set the local chain tip to the first block in test data.
-        let (block_num, block_hash) = context.min_block;
-        let block = context
-            .blocks_by_hash
-            .get(&block_hash)
-            .ok_or_else(|| anyhow!("Local tip {block_hash} not found"))?;
-        let state_root = block.header.state_root;
+        let (block_num, block_hash) = data.min_block();
+        let block = &data.blocks_by_hash[&block_hash];
         let withdrawals_root = block
             .header
             .withdrawals_root
-            .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", block_hash))?;
-        validator_db.reset_anchor_block(block_num, block_hash, state_root, withdrawals_root)?;
+            .ok_or_else(|| anyhow!("Block {block_hash} missing withdrawals_root"))?;
+        validator_db.reset_anchor_block(
+            block_num,
+            block_hash,
+            block.header.state_root,
+            withdrawals_root,
+        )?;
 
         Ok(Arc::new(validator_db))
     }
 
-    /// Set up mock RPC server with pre-loaded context and return the handle and URL.
-    async fn setup_mock_rpc_server(
-        context: RpcModuleContext,
-    ) -> (jsonrpsee::server::ServerHandle, String) {
-        let mut module = RpcModule::new(context);
+    /// Start a mock RPC server backed by pre-loaded test data.
+    async fn setup_mock_rpc_server(data: TestData) -> (jsonrpsee::server::ServerHandle, String) {
+        let mut module = RpcModule::new(data);
 
         module
-            .register_method("eth_getBlockByNumber", |params, context, _| {
+            .register_method("eth_getBlockByNumber", |params, ctx, _| {
                 let (hex_number, full_block): (String, bool) = params.parse().unwrap();
-
                 let block_number = u64::from_str_radix(&hex_number[2..], 16).unwrap_or(0);
 
-                // Look up block by number
-                let block = context
+                let block = ctx
                     .block_hashes
                     .get(&block_number)
-                    .and_then(|hash| context.blocks_by_hash.get(hash))
+                    .and_then(|hash| ctx.blocks_by_hash.get(hash))
                     .ok_or_else(|| {
                         make_rpc_error(
                             CALL_EXECUTION_FAILED_CODE,
@@ -989,21 +1041,21 @@ mod tests {
             .unwrap();
 
         module
-            .register_method("eth_blockNumber", |_params, context, _| {
-                // Return the largest block number available in test data
-                Ok::<String, ErrorObjectOwned>(format!("0x{:x}", context.max_block.0))
+            .register_method("eth_blockNumber", |_params, ctx, _| {
+                let (&max_num, _) = ctx.block_hashes.last_key_value().unwrap();
+                Ok::<String, ErrorObjectOwned>(format!("0x{max_num:x}"))
             })
             .unwrap();
 
         module
-            .register_method("eth_getHeaderByNumber", |params, context, _| {
+            .register_method("eth_getHeaderByNumber", |params, ctx, _| {
                 let (hex_number,): (String,) = params.parse().unwrap();
                 let block_number = u64::from_str_radix(&hex_number[2..], 16).unwrap_or(0);
 
-                let block = context
+                let block = ctx
                     .block_hashes
                     .get(&block_number)
-                    .and_then(|hash| context.blocks_by_hash.get(hash))
+                    .and_then(|hash| ctx.blocks_by_hash.get(hash))
                     .ok_or_else(|| {
                         make_rpc_error(
                             CALL_EXECUTION_FAILED_CODE,
@@ -1016,13 +1068,13 @@ mod tests {
             .unwrap();
 
         module
-            .register_method("eth_getHeaderByHash", |params, context, _| {
+            .register_method("eth_getHeaderByHash", |params, ctx, _| {
                 let (hash,): (B256,) = params.parse().map_err(|e| {
                     make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
                 })?;
 
                 let block_hash = BlockHash::from(hash.0);
-                let block = context.blocks_by_hash.get(&block_hash).ok_or_else(|| {
+                let block = ctx.blocks_by_hash.get(&block_hash).ok_or_else(|| {
                     make_rpc_error(CALL_EXECUTION_FAILED_CODE, format!("Block {hash} not found"))
                 })?;
 
@@ -1031,43 +1083,38 @@ mod tests {
             .unwrap();
 
         module
-            .register_method("eth_getCodeByHash", |params, context, _| {
+            .register_method("eth_getCodeByHash", |params, ctx, _| {
                 let (hash,): (B256,) = params.parse().map_err(|e| {
                     make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
                 })?;
 
-                let code = context.bytecodes.get(&hash).cloned().unwrap_or_default();
-
+                let code = ctx.bytecodes.get(&hash).cloned().unwrap_or_default();
                 Ok::<_, ErrorObject<'static>>(code.original_bytes())
             })
             .unwrap();
 
         module
-            .register_method("mega_getBlockWitness", |params, context, _| {
-                // Parse the unified request object
+            .register_method("mega_getBlockWitness", |params, ctx, _| {
                 let (keys,): (WitnessRequestKeys,) = params.parse().map_err(|e| {
                     make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
                 })?;
                 let block_hash = BlockHash::from(keys.block_hash.0);
 
-                // Look up witness data by block hash
                 let salt_witness =
-                    context.witness_data.get(&block_hash).cloned().ok_or_else(|| {
+                    ctx.salt_witnesses.get(&block_hash).cloned().ok_or_else(|| {
                         make_rpc_error(
                             CALL_EXECUTION_FAILED_CODE,
                             format!("Witness for block {block_hash} not found"),
                         )
                     })?;
 
-                let mpt_witness =
-                    context.mpt_witness_data.get(&block_hash).cloned().ok_or_else(|| {
-                        make_rpc_error(
-                            CALL_EXECUTION_FAILED_CODE,
-                            format!("Witness for block {block_hash} not found"),
-                        )
-                    })?;
+                let mpt_witness = ctx.mpt_witnesses.get(&block_hash).cloned().ok_or_else(|| {
+                    make_rpc_error(
+                        CALL_EXECUTION_FAILED_CODE,
+                        format!("Witness for block {block_hash} not found"),
+                    )
+                })?;
 
-                // Encode as v0:<base64(zstd(bincode))> to match the unified RPC format
                 let encoded = bincode::serde::encode_to_vec(
                     &(salt_witness, mpt_witness),
                     bincode::config::legacy(),
@@ -1075,14 +1122,14 @@ mod tests {
                 .map_err(|e| {
                     make_rpc_error(
                         CALL_EXECUTION_FAILED_CODE,
-                        format!("Failed to serialize witness for block {block_hash}: {e}"),
+                        format!("Failed to serialize witness: {e}"),
                     )
                 })
                 .and_then(|raw| {
                     zstd::encode_all(raw.as_slice(), 9).map_err(|e| {
                         make_rpc_error(
                             CALL_EXECUTION_FAILED_CODE,
-                            format!("Failed to compress witness for block {block_hash}: {e}"),
+                            format!("Failed to compress witness: {e}"),
                         )
                     })
                 })
@@ -1093,219 +1140,40 @@ mod tests {
             .unwrap();
 
         module
-            .register_method("mega_setValidatedBlocks", |params, _context, _| {
+            .register_method("mega_setValidatedBlocks", |params, _ctx, _| {
                 let (_first_block, last_block): ((u64, String), (u64, String)) =
                     params.parse().unwrap();
                 let last_hash = parse_block_hash(&last_block.1).unwrap();
-
-                // Return response with accepted=true and the last validated block
-                let response = serde_json::json!({
+                Ok::<serde_json::Value, ErrorObjectOwned>(serde_json::json!({
                     "accepted": true,
                     "lastValidatedBlock": [last_block.0, last_hash]
-                });
-                Ok::<serde_json::Value, ErrorObjectOwned>(response)
+                }))
             })
             .unwrap();
 
         let cfg =
             ServerConfigBuilder::default().max_response_body_size(MAX_RESPONSE_BODY_SIZE).build();
         let server = ServerBuilder::default().set_config(cfg).build("0.0.0.0:0").await.unwrap();
-
         let url = format!("http://{}", server.local_addr().unwrap());
         (server.start(module), url)
     }
 
-    /// Loads and deserializes JSON data from a file.
-    ///
-    /// This generic function reads a JSON file and deserializes it into any type
-    /// that implements `serde::de::DeserializeOwned`.
-    ///
-    /// # Arguments
-    ///
-    /// * `file_path`: The path to the JSON file to load.
-    ///
-    /// # Returns
-    ///
-    /// Returns `Ok(T)` containing the deserialized data if successful.
-    /// Returns an `Err` if any step (file opening, reading, or deserialization) fails.
-    fn load_json<T: DeserializeOwned>(file_path: impl AsRef<Path>) -> Result<T> {
-        let path = file_path.as_ref();
-        let contents = std::fs::read(path)
-            .with_context(|| format!("Failed to read file {path}", path = path.display()))?;
-        serde_json::from_slice(&contents)
-            .with_context(|| format!("Failed to parse JSON from {path}", path = path.display()))
-    }
-
-    /// Loads contract bytecode from a test data file.
-    ///
-    /// Reads a file where each line contains a JSON array with contract hash and bytecode:
-    /// `[hash, bytecode]`. Empty lines are ignored.
-    ///
-    /// # Arguments
-    /// * `path` - Path to the contracts file
-    ///
-    /// # Returns
-    /// A HashMap mapping contract hashes (B256) to bytecode (Bytecode)
-    fn load_contracts(path: impl AsRef<Path>) -> HashMap<B256, Bytecode> {
-        let file = File::open(path).expect("Failed to open contracts file");
-        BufReader::new(file)
-            .lines()
-            .map_while(Result::ok)
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str(&line).expect("Failed to parse contract"))
-            .collect()
-    }
-
-    /// Creates RPC module context by pre-loading all test data
-    ///
-    /// This function scans the test directories and loads all block data, witness data,
-    /// and contracts into memory for efficient RPC serving. It eliminates file system
-    /// access during RPC calls by pre-loading everything into HashMap/BTreeMap structures.
-    ///
-    /// # Returns
-    /// * `Ok(RpcModuleContext)` - Context with all test data loaded
-    /// * `Err(eyre::Error)` - If directories cannot be read or data is malformed
-    fn create_rpc_module_context() -> Result<RpcModuleContext> {
-        let mut blocks_by_hash = HashMap::new();
-        let mut block_hashes = BTreeMap::new();
-        let mut witness_data = HashMap::new();
-        let mut mpt_witness_data = HashMap::new();
-
-        // Load block data from TEST_BLOCK_DIR
-        debug!("Loading block data from {}", TEST_BLOCK_DIR);
-        let test_block_dir = PathBuf::from(TEST_BLOCK_DIR);
-        let block_entries = std::fs::read_dir(&test_block_dir)
-            .map_err(|e| anyhow!("Failed to read test block directory {TEST_BLOCK_DIR}: {e}"))?;
-
-        let mut block_numbers = Vec::new();
-
-        for entry in block_entries {
-            let file = entry.map_err(|e| anyhow!("Failed to read directory entry: {e}"))?;
-            let file_name = file.file_name();
-            let file_str = file_name.to_string_lossy();
-
-            // Skip non-JSON files
-            if !file_str.ends_with(".json") {
-                continue;
-            }
-
-            // Parse filename in format "{block_number}.{block_hash}.json"
-            if let Some(dot_pos) = file_str.find('.') {
-                let block_number_str = &file_str[..dot_pos];
-                if let Ok(block_number) = block_number_str.parse::<u64>() {
-                    // Load the block data
-                    let block: Block<Transaction> = load_json(file.path())
-                        .map_err(|e| anyhow!("Failed to load block file {file_str}: {e}"))?;
-
-                    let block_hash = BlockHash::from(block.header.hash);
-
-                    // Store block by hash and create number->hash mapping
-                    blocks_by_hash.insert(block_hash, block);
-                    block_hashes.insert(block_number, block_hash);
-                    block_numbers.push(block_number);
-                }
-            }
-        }
-
-        if block_numbers.is_empty() {
-            return Err(anyhow!("No valid block files found in {TEST_BLOCK_DIR}"));
-        }
-
-        block_numbers.sort_unstable();
-        let min_block_num = *block_numbers.first().unwrap();
-        let max_block_num = *block_numbers.last().unwrap();
-
-        // Get the hashes for the minimum and maximum block numbers
-        let min_block_hash = *block_hashes.get(&min_block_num).unwrap();
-        let max_block_hash = *block_hashes.get(&max_block_num).unwrap();
-        let min_block = (min_block_num, min_block_hash);
-        let max_block = (max_block_num, max_block_hash);
-
-        debug!("Loaded {} blocks (range: {} - {})", block_numbers.len(), min_block.0, max_block.0);
-
-        // Load witness data from TEST_WITNESS_DIR
-        debug!("Loading witness data from {}", TEST_WITNESS_DIR);
-        let test_witness_dir = PathBuf::from(TEST_WITNESS_DIR);
-        if test_witness_dir.exists() {
-            let witness_entries = std::fs::read_dir(&test_witness_dir)
-                .map_err(|e| anyhow!("Failed to read test witness directory: {e}"))?;
-
-            for entry in witness_entries {
-                let entry = entry?;
-                let file_path = entry.path();
-                let Some(ext) = file_path.extension().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-
-                let block_num_and_hash = file_path.file_stem().unwrap().to_str().unwrap();
-                let (_, block_hash) = parse_block_num_and_hash(block_num_and_hash)?;
-                let file_data = std::fs::read(&file_path)?;
-
-                match ext {
-                    "salt" => {
-                        let salt_witness: WitnessFileContent = bincode::serde::decode_from_slice(&file_data, bincode::config::legacy())
-                            .map_err(|e| anyhow!("Failed to deserialize SaltWitness from file_data {block_num_and_hash}: {e}"))?.0;
-                        witness_data.insert(block_hash, salt_witness.salt_witness);
-                    }
-                    "mpt" => {
-                        let (mpt_witness, _): (MptWitness, usize) = bincode::serde::decode_from_slice(&file_data, bincode::config::legacy())
-                            .map_err(|e| anyhow!("Failed to deserialize MptWitness from file_data {block_num_and_hash}: {e}"))?;
-                        mpt_witness_data.insert(block_hash, mpt_witness);
-                    }
-                    _ => {}
-                }
-            }
-            debug!("Loaded {} salt witness files", witness_data.len());
-            debug!("Loaded {} mpt witness files", mpt_witness_data.len());
-        } else {
-            debug!("Witness directory {} does not exist, skipping witness data", TEST_WITNESS_DIR);
-        }
-
-        // Load contract data and build address-to-bytecode mapping from witness data
-        let bytecodes = load_contracts(CONTRACTS_FILE);
-        debug!("Loaded {} contracts from {CONTRACTS_FILE}", bytecodes.len());
-
-        Ok(RpcModuleContext {
-            blocks_by_hash,
-            block_hashes,
-            witness_data,
-            mpt_witness_data,
-            bytecodes,
-            min_block,
-            max_block,
-        })
-    }
-
+    /// Synthetic data integration test: validates consecutive blocks via chain_sync.
     #[tokio::test]
     async fn integration_test() {
-        // Initialize logging for tests with debug level
-        let _ = tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::new("warn").add_directive("stateless_validator=debug".parse().unwrap()),
-            )
-            .try_init();
+        init_test_logging();
+        debug!("=== Loading Synthetic Test Data ===");
+        let data = TestData::load(SYNTHETIC_DATA_DIR);
 
-        // Create RPC module context with pre-loaded test data
-        debug!("=== Creating RPC Module Context ===");
-        let context = create_rpc_module_context().unwrap();
-        debug!(
-            "Context created with {} blocks, {} witnesses, {} contracts",
-            context.blocks_by_hash.len(),
-            context.witness_data.len(),
-            context.bytecodes.len()
-        );
-        debug!("Block range: {} - {}", context.min_block.0, context.max_block.0);
-
-        let sync_target = Some(context.max_block.0);
-        let validator_db = setup_test_db(&context).unwrap();
-        let (handle, url) = setup_mock_rpc_server(context).await;
+        let genesis_file = format!("{SYNTHETIC_DATA_DIR}/genesis.json");
+        let sync_target = Some(data.max_block().0);
+        let validator_db = setup_test_db(&data).unwrap();
+        let (handle, url) = setup_mock_rpc_server(data).await;
         let client = Arc::new(RpcClient::new(&url, &url).unwrap());
 
-        // Load chain spec using helper function
         let chain_spec =
-            Arc::new(load_or_create_chain_spec(&validator_db, Some(TEST_GENESIS_FILE)).unwrap());
+            Arc::new(load_or_create_chain_spec(&validator_db, Some(&genesis_file)).unwrap());
 
-        // Create test configuration with faster intervals for testing
         let config = Arc::new(ChainSyncConfig {
             concurrent_workers: 1,
             sync_target,
@@ -1324,5 +1192,53 @@ mod tests {
 
         handle.stop().unwrap();
         info!("Mock RPC server has been shut down.");
+    }
+
+    /// Mainnet integration test: validates non-contiguous blocks individually.
+    #[test]
+    fn mainnet_integration_test() {
+        init_test_logging();
+        debug!("=== Loading Mainnet Test Data ===");
+        let mut data = TestData::load(MAINNET_DATA_DIR);
+
+        let genesis_file = format!("{MAINNET_DATA_DIR}/genesis.json");
+        let genesis: Genesis = load_json(&genesis_file).unwrap();
+        let chain_spec = ChainSpec::from_genesis(genesis);
+
+        // Target blocks are those with witness data
+        let target_blocks: Vec<u64> = data
+            .block_hashes
+            .keys()
+            .filter(|num| {
+                let hash = data.block_hashes[num];
+                data.salt_witnesses.contains_key(&hash)
+            })
+            .copied()
+            .collect();
+
+        info!("Validating {} mainnet blocks: {:?}", target_blocks.len(), target_blocks);
+
+        for block_number in &target_blocks {
+            let block_hash = data.block_hashes[block_number];
+            let block = &data.blocks_by_hash[&block_hash];
+            let salt_witness = data.salt_witnesses.remove(&block_hash).unwrap();
+            let mpt_witness = data.mpt_witnesses.remove(&block_hash).unwrap();
+
+            debug!("Validating mainnet block {block_number}");
+
+            match validate_block(
+                &chain_spec,
+                block,
+                salt_witness,
+                mpt_witness,
+                &data.bytecodes,
+                None,
+            ) {
+                Ok(_) => info!("Successfully validated mainnet block {block_number}"),
+                Err(e) => panic!("Block {block_number} validation failed: {e}"),
+            }
+        }
+
+        info!("All {} mainnet blocks validated successfully", target_blocks.len());
     }
 }
