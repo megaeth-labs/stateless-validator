@@ -12,3 +12,6 @@
 
 # debug-trace-server binary
 /bin/debug-trace-server/ @krabat-I
+
+# ci configs
+.github/ @Troublor @flyq @krabat-l @yunlonggao-mega
