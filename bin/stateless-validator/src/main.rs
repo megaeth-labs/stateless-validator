@@ -990,6 +990,8 @@ mod tests {
     fn setup_test_db(data: &TestData) -> Result<Arc<ValidatorDB>> {
         let temp_dir = tempfile::tempdir()?;
         let validator_db = ValidatorDB::new(temp_dir.path().join(VALIDATOR_DB_FILENAME))?;
+        // Intentionally leak the temp dir — ValidatorDB holds a path into it.
+        // The OS will clean it up when the test process exits.
         std::mem::forget(temp_dir);
 
         let (block_num, block_hash) = data.min_block();
