@@ -337,6 +337,7 @@ impl ValidatorDB {
             let _validation_results = write_txn.open_table(VALIDATION_RESULTS)?;
             let _block_records = write_txn.open_table(BLOCK_RECORDS)?;
             let _contracts = write_txn.open_table(CONTRACTS)?;
+            let _genesis_config = write_txn.open_table(GENESIS_CONFIG)?;
             let _anchor_block = write_txn.open_table(ANCHOR_BLOCK)?;
         }
         write_txn.commit()?;
@@ -1325,4 +1326,360 @@ fn encode_block_to_vec(block: &Block<Transaction>) -> Result<Vec<u8>> {
 fn decode_block_from_slice(bytes: &[u8]) -> Block<Transaction> {
     serde_json::from_slice(bytes)
         .expect("deserialization of previously stored block data must succeed")
+}
+
+// ---------------------------------------------------------------------------
+// Storage trait implementations
+// ---------------------------------------------------------------------------
+
+use crate::storage_traits::{BlockDataStore, ChainState, TaskQueue, ValidationResultStore};
+
+impl ChainState for ValidatorDB {
+    fn get_local_tip(&self) -> ValidationDbResult<Option<(BlockNumber, BlockHash)>> {
+        self.get_local_tip()
+    }
+
+    fn get_remote_tip(&self) -> ValidationDbResult<Option<(BlockNumber, BlockHash)>> {
+        self.get_remote_tip()
+    }
+
+    fn grow_remote_chain(&self, headers: &[Header]) -> ValidationDbResult<()> {
+        self.grow_remote_chain(headers)
+    }
+
+    fn grow_local_chain(&self) -> ValidationDbResult<bool> {
+        self.grow_local_chain()
+    }
+
+    fn promote_remote_to_canonical(&self) -> ValidationDbResult<bool> {
+        self.promote_remote_to_canonical()
+    }
+
+    fn rollback_chain(&self, to_block: BlockNumber) -> ValidationDbResult<()> {
+        self.rollback_chain(to_block)
+    }
+
+    fn get_block_hash(&self, block_number: BlockNumber) -> ValidationDbResult<Option<BlockHash>> {
+        self.get_block_hash(block_number)
+    }
+
+    fn get_earliest_local_block(&self) -> ValidationDbResult<Option<(BlockNumber, BlockHash)>> {
+        self.get_earliest_local_block()
+    }
+
+    fn reset_anchor_block(
+        &self,
+        block_number: BlockNumber,
+        block_hash: BlockHash,
+        post_state_root: B256,
+        post_withdrawals_root: B256,
+    ) -> ValidationDbResult<()> {
+        self.reset_anchor_block(block_number, block_hash, post_state_root, post_withdrawals_root)
+    }
+
+    fn get_anchor_block(&self) -> ValidationDbResult<Option<(BlockNumber, BlockHash)>> {
+        self.get_anchor_block()
+    }
+
+    fn store_genesis(&self, genesis: &Genesis) -> ValidationDbResult<()> {
+        self.store_genesis(genesis)
+    }
+
+    fn load_genesis(&self) -> ValidationDbResult<Option<Genesis>> {
+        self.load_genesis()
+    }
+
+    fn prune_history(&self, before_block: BlockNumber) -> ValidationDbResult<u64> {
+        self.prune_history(before_block)
+    }
+}
+
+impl TaskQueue for ValidatorDB {
+    fn add_validation_tasks(
+        &self,
+        tasks: &[(Block<Transaction>, SaltWitness, MptWitness)],
+    ) -> ValidationDbResult<()> {
+        self.add_validation_tasks(tasks)
+    }
+
+    fn store_block_data(
+        &self,
+        tasks: &[(Block<Transaction>, LightWitness)],
+    ) -> ValidationDbResult<()> {
+        self.store_block_data(tasks)
+    }
+
+    fn get_next_task(
+        &self,
+    ) -> ValidationDbResult<Option<(Block<Transaction>, SaltWitness, MptWitness)>> {
+        self.get_next_task()
+    }
+
+    fn recover_interrupted_tasks(&self) -> ValidationDbResult<()> {
+        self.recover_interrupted_tasks()
+    }
+}
+
+impl BlockDataStore for ValidatorDB {
+    fn get_block_and_witness(
+        &self,
+        block_hash: BlockHash,
+    ) -> ValidationDbResult<(Block<Transaction>, LightWitness)> {
+        self.get_block_and_witness(block_hash)
+    }
+
+    fn get_contract_codes(
+        &self,
+        code_hashes: &[B256],
+    ) -> ValidationDbResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
+        self.get_contract_codes(code_hashes.iter().copied())
+    }
+
+    fn add_contract_codes(&self, bytecodes: &[(B256, Bytecode)]) -> ValidationDbResult<()> {
+        self.add_contract_codes(bytecodes)
+    }
+}
+
+impl ValidationResultStore for ValidatorDB {
+    fn complete_validation(&self, result: ValidationResult) -> ValidationDbResult<()> {
+        self.complete_validation(result)
+    }
+
+    fn get_validation_result(
+        &self,
+        block_hash: BlockHash,
+    ) -> ValidationDbResult<Option<ValidationResult>> {
+        self.get_validation_result(block_hash)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::B256;
+    use alloy_rpc_types_eth::Header;
+    use revm::state::Bytecode;
+
+    use super::*;
+
+    /// Creates a ValidatorDB backed by a temporary directory.
+    fn temp_db() -> ValidatorDB {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ValidatorDB::new(dir.path().join("test.redb")).unwrap();
+        std::mem::forget(dir); // OS cleans up when process exits
+        db
+    }
+
+    /// Builds a test header with the given number, hash, and parent hash.
+    fn make_header(number: u64, hash: B256, parent_hash: B256) -> Header {
+        Header {
+            hash,
+            inner: alloy_consensus::Header {
+                number,
+                parent_hash,
+                state_root: B256::with_last_byte(number as u8),
+                withdrawals_root: Some(B256::with_last_byte(number as u8 + 100)),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Deterministic hash for a block number (for tests only).
+    fn block_hash(n: u64) -> B256 {
+        B256::with_last_byte(n as u8)
+    }
+
+    #[test]
+    fn chain_growth_and_promotion() {
+        let db = temp_db();
+
+        // Anchor at block 50
+        let anchor_hash = block_hash(50);
+        db.reset_anchor_block(50, anchor_hash, B256::ZERO, B256::ZERO).unwrap();
+
+        // Build headers 51, 52 with proper parent linkage
+        let h51 = make_header(51, block_hash(51), anchor_hash);
+        let h52 = make_header(52, block_hash(52), block_hash(51));
+        db.grow_remote_chain(&[h51, h52]).unwrap();
+
+        // Remote tip should be at 52
+        let remote_tip = db.get_remote_tip().unwrap().unwrap();
+        assert_eq!(remote_tip.0, 52);
+
+        // Promote one block
+        assert!(db.promote_remote_to_canonical().unwrap());
+        let local_tip = db.get_local_tip().unwrap().unwrap();
+        assert_eq!(local_tip.0, 51);
+
+        // Promote second block
+        assert!(db.promote_remote_to_canonical().unwrap());
+        let local_tip = db.get_local_tip().unwrap().unwrap();
+        assert_eq!(local_tip.0, 52);
+
+        // No more to promote
+        assert!(!db.promote_remote_to_canonical().unwrap());
+    }
+
+    #[test]
+    fn rollback() {
+        let db = temp_db();
+
+        // Anchor at block 50
+        let anchor_hash = block_hash(50);
+        db.reset_anchor_block(50, anchor_hash, B256::ZERO, B256::ZERO).unwrap();
+
+        // Grow remote chain to block 55
+        let headers: Vec<_> =
+            (51..=55).map(|n| make_header(n, block_hash(n), block_hash(n - 1))).collect();
+        db.grow_remote_chain(&headers).unwrap();
+
+        // Promote all to canonical
+        for _ in 0..5 {
+            assert!(db.promote_remote_to_canonical().unwrap());
+        }
+        assert_eq!(db.get_local_tip().unwrap().unwrap().0, 55);
+
+        // Rollback to block 52
+        db.rollback_chain(52).unwrap();
+        assert_eq!(db.get_local_tip().unwrap().unwrap().0, 52);
+        // Remote chain should also be rolled back
+        assert!(db.get_remote_tip().unwrap().is_none());
+    }
+
+    #[test]
+    fn genesis_round_trip() {
+        let db = temp_db();
+
+        // No genesis initially
+        assert!(db.load_genesis().unwrap().is_none());
+
+        // Store a minimal genesis
+        let genesis = Genesis::default();
+        db.store_genesis(&genesis).unwrap();
+
+        // Load it back
+        let loaded = db.load_genesis().unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_string(&loaded).unwrap(),
+            serde_json::to_string(&genesis).unwrap()
+        );
+    }
+
+    #[test]
+    fn anchor_block_round_trip() {
+        let db = temp_db();
+
+        // No anchor initially
+        assert!(db.get_anchor_block().unwrap().is_none());
+
+        let hash = block_hash(100);
+        let state_root = B256::with_last_byte(0xAA);
+        let withdrawals_root = B256::with_last_byte(0xBB);
+        db.reset_anchor_block(100, hash, state_root, withdrawals_root).unwrap();
+
+        // Anchor block stored
+        let (num, stored_hash) = db.get_anchor_block().unwrap().unwrap();
+        assert_eq!(num, 100);
+        assert_eq!(stored_hash, hash);
+
+        // Local tip matches anchor
+        let (tip_num, tip_hash) = db.get_local_tip().unwrap().unwrap();
+        assert_eq!(tip_num, 100);
+        assert_eq!(tip_hash, hash);
+    }
+
+    #[test]
+    fn contract_code_cache() {
+        let db = temp_db();
+
+        // Create two test bytecodes
+        let code1 = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
+        let hash1 = code1.hash_slow();
+        let code2 = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x01]));
+        let hash2 = code2.hash_slow();
+        let unknown_hash = B256::with_last_byte(0xFF);
+
+        // Store first code
+        db.add_contract_codes(&[(hash1, code1.clone())]).unwrap();
+
+        // Query: hash1 found, hash2 and unknown missing
+        let (found, missing) = db.get_contract_codes([hash1, hash2, unknown_hash]).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(found.contains_key(&hash1));
+        assert_eq!(missing.len(), 2);
+
+        // Store second code
+        db.add_contract_codes(&[(hash2, code2)]).unwrap();
+
+        // Now both found, only unknown missing
+        let (found, missing) = db.get_contract_codes([hash1, hash2, unknown_hash]).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(missing, vec![unknown_hash]);
+    }
+
+    #[test]
+    fn get_block_hash_canonical_and_remote() {
+        let db = temp_db();
+
+        let anchor_hash = block_hash(10);
+        db.reset_anchor_block(10, anchor_hash, B256::ZERO, B256::ZERO).unwrap();
+
+        // Block 10 is in canonical chain
+        assert_eq!(db.get_block_hash(10).unwrap(), Some(anchor_hash));
+
+        // Build remote blocks 11, 12
+        let h11 = make_header(11, block_hash(11), anchor_hash);
+        let h12 = make_header(12, block_hash(12), block_hash(11));
+        db.grow_remote_chain(&[h11, h12]).unwrap();
+
+        // Block 11 found in remote chain
+        assert_eq!(db.get_block_hash(11).unwrap(), Some(block_hash(11)));
+        // Block 99 not found anywhere
+        assert!(db.get_block_hash(99).unwrap().is_none());
+    }
+
+    #[test]
+    fn earliest_local_block() {
+        let db = temp_db();
+
+        // Empty chain
+        assert!(db.get_earliest_local_block().unwrap().is_none());
+
+        let anchor_hash = block_hash(50);
+        db.reset_anchor_block(50, anchor_hash, B256::ZERO, B256::ZERO).unwrap();
+
+        let (num, _) = db.get_earliest_local_block().unwrap().unwrap();
+        assert_eq!(num, 50);
+    }
+
+    #[test]
+    fn prune_history() {
+        let db = temp_db();
+
+        // Anchor at block 100
+        let anchor_hash = block_hash(100);
+        db.reset_anchor_block(100, anchor_hash, B256::ZERO, B256::ZERO).unwrap();
+
+        // Grow and promote 10 blocks (101..=110)
+        let headers: Vec<_> =
+            (101..=110).map(|n| make_header(n, block_hash(n), block_hash(n - 1))).collect();
+        db.grow_remote_chain(&headers).unwrap();
+        for _ in 0..10 {
+            db.promote_remote_to_canonical().unwrap();
+        }
+        assert_eq!(db.get_local_tip().unwrap().unwrap().0, 110);
+
+        // Verify earliest block before pruning
+        let (earliest_before, _) = db.get_earliest_local_block().unwrap().unwrap();
+        assert_eq!(earliest_before, 100);
+
+        // Prune blocks before 105.
+        // Note: pruned count reflects BLOCK_RECORDS entries (populated by add_validation_tasks,
+        // not promote_remote_to_canonical). The canonical chain orphan cleanup still runs.
+        db.prune_history(105).unwrap();
+
+        // Earliest block should now be >= 105 (orphaned canonical entries removed)
+        let (earliest, _) = db.get_earliest_local_block().unwrap().unwrap();
+        assert!(earliest >= 105, "Expected earliest >= 105, got {earliest}");
+    }
 }

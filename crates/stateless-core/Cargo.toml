@@ -61,5 +61,8 @@ tokio.workspace = true
 tracing.workspace = true
 zstd.workspace = true
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 test-bucket-resize = ["salt/test-bucket-resize"]

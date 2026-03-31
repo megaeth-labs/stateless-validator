@@ -17,7 +17,11 @@ use op_alloy_rpc_types::Transaction;
 use salt::SaltWitness;
 use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 
-use crate::{RpcClient, ValidatorDB, withdrawals::MptWitness};
+use crate::{
+    RpcClient,
+    storage_traits::{ChainState, TaskQueue},
+    withdrawals::MptWitness,
+};
 
 /// Default metrics port for Prometheus endpoint.
 pub const DEFAULT_METRICS_PORT: u16 = 9090;
@@ -111,12 +115,15 @@ pub struct FetchResult {
 /// * `Ok(FetchResult)` - Result containing fetch statistics
 /// * `Err(eyre::Error)` - On critical failures
 #[instrument(skip_all, name = "chain_sync")]
-pub async fn fetch_blocks_batch(
+pub async fn fetch_blocks_batch<DB>(
     client: &RpcClient,
-    db: &ValidatorDB,
+    db: &DB,
     config: &ChainSyncConfig,
     block_error_counts: &mut HashMap<u64, usize>,
-) -> Result<FetchResult> {
+) -> Result<FetchResult>
+where
+    DB: ChainState + TaskQueue,
+{
     let batch_start = Instant::now();
 
     // Calculate how far behind our local chain is from remote
@@ -370,7 +377,8 @@ pub async fn fetch_blocks_batch(
     let add_tasks_elapsed = db_start.elapsed();
 
     let grow_chain_start = Instant::now();
-    db.grow_remote_chain(tasks.iter().map(|(block, _, _)| &block.header))?;
+    let headers: Vec<_> = tasks.iter().map(|(block, _, _)| block.header.clone()).collect();
+    db.grow_remote_chain(&headers)?;
     let grow_chain_elapsed = grow_chain_start.elapsed();
 
     info!(
@@ -436,14 +444,15 @@ pub async fn fetch_blocks_batch(
 ///
 /// # Returns
 /// * Never returns under normal operation - runs indefinitely until externally terminated
-pub async fn remote_chain_tracker<F, G>(
+pub async fn remote_chain_tracker<DB, F, G>(
     client: Arc<RpcClient>,
-    db: Arc<ValidatorDB>,
+    db: Arc<DB>,
     config: Arc<ChainSyncConfig>,
     on_reorg: Option<F>,
     on_fetch: Option<G>,
 ) -> Result<()>
 where
+    DB: ChainState + TaskQueue + Send + Sync + 'static,
     F: Fn(&[B256]) + Send + Sync,
     G: Fn(&FetchResult) + Send + Sync,
 {
@@ -453,7 +462,7 @@ where
     let mut block_error_counts: HashMap<u64, usize> = HashMap::new();
 
     loop {
-        match fetch_blocks_batch(&client, &db, &config, &mut block_error_counts).await {
+        match fetch_blocks_batch(&client, &*db, &config, &mut block_error_counts).await {
             Ok(result) => {
                 // Call reorg callback if a reorg occurred
                 if !result.reverted_hashes.is_empty() &&
@@ -489,9 +498,9 @@ where
 /// The algorithm first exponentially expands backward to find a known-matching block,
 /// then binary searches in that range.
 #[instrument(skip(client, db), name = "find_divergence")]
-async fn find_divergence_point(
+async fn find_divergence_point<DB: ChainState>(
     client: &RpcClient,
-    db: &ValidatorDB,
+    db: &DB,
     mismatch_block: u64,
 ) -> Result<u64> {
     let earliest_local = db.get_earliest_local_block()?.expect("Local chain cannot be empty");
