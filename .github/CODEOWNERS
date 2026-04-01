@@ -11,7 +11,7 @@
 /bin/stateless-validator/ @flyq
 
 # debug-trace-server binary
-/bin/debug-trace-server/ @krabat-I
+/bin/debug-trace-server/ @krabat-l
 
 # ci configs
 .github/ @Troublor @flyq @krabat-l @yunlonggao-mega @mingy-mega @hongbo-trey
