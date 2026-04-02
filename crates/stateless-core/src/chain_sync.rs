@@ -10,18 +10,12 @@ use std::{
 };
 
 use alloy_primitives::B256;
-use alloy_rpc_types_eth::{Block, BlockId};
-use eyre::{Result, anyhow};
+use alloy_rpc_types_eth::BlockId;
+use eyre::Result;
 use futures::future;
-use op_alloy_rpc_types::Transaction;
-use salt::SaltWitness;
-use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
-use crate::{
-    RpcClient,
-    storage_traits::{ChainState, TaskQueue},
-    withdrawals::MptWitness,
-};
+use crate::RpcClient;
 
 /// Default metrics port for Prometheus endpoint.
 pub const DEFAULT_METRICS_PORT: u16 = 9090;
@@ -59,12 +53,23 @@ pub struct ChainSyncConfig {
     /// Enable for debug-trace-server where blocks are trusted from upstream RPC.
     /// Disable for stateless-validator where validation workers advance the tip.
     pub auto_advance_local_tip: bool,
+
+    // --- Streaming pipeline settings (used by block_fetcher / chain_advancer) ---
+    /// Channel capacity for the fetch→worker pipeline.
+    pub fetch_channel_capacity: usize,
+    /// Channel capacity for the worker→advancer pipeline.
+    pub result_channel_capacity: usize,
+    /// Number of blocks to fetch in parallel per batch.
+    pub fetcher_batch_size: usize,
+    /// Maximum RPC retry backoff for the fetcher.
+    pub fetcher_max_backoff: Duration,
 }
 
 impl Default for ChainSyncConfig {
     fn default() -> Self {
+        let workers = num_cpus::get();
         Self {
-            concurrent_workers: num_cpus::get(),
+            concurrent_workers: workers,
             sync_poll_interval: Duration::from_secs(1),
             sync_target: None,
             tracker_lookahead_blocks: 80,
@@ -78,6 +83,10 @@ impl Default for ChainSyncConfig {
             metrics_enabled: false,
             metrics_port: DEFAULT_METRICS_PORT,
             auto_advance_local_tip: false,
+            fetch_channel_capacity: 2 * workers,
+            result_channel_capacity: 2 * workers,
+            fetcher_batch_size: workers,
+            fetcher_max_backoff: Duration::from_secs(30),
         }
     }
 }
@@ -97,465 +106,258 @@ pub struct FetchResult {
     pub remote_chain_height: Option<u64>,
 }
 
-/// Fetches a batch of blocks from RPC and stores them in the database.
+// ===========================================================================
+// Streaming pipeline functions (used by stateless-validator memory-based mode)
+// ===========================================================================
+
+use std::collections::BTreeMap;
+
+use tokio_util::sync::CancellationToken;
+
+use crate::memory_db::{
+    ChainTip, PersistentStore, ValidatedBlock, ValidationFailure, ValidationTask,
+};
+
+/// Continuously fetches blocks from RPC and sends them through a channel.
 ///
-/// This function encapsulates the core logic from remote_chain_tracker:
-/// - Calculate gap between local tip and remote tip
-/// - Stop if gap >= tracker_lookahead_blocks
-/// - Fetch blocks in parallel with witness data
-/// - Store in ValidatorDB via add_validation_tasks() and grow_remote_chain()
+/// Fetches blocks sequentially starting from `start_block`, sending each
+/// `ValidationTask` to the channel. Backpressure is provided by the bounded channel.
 ///
-/// # Arguments
-/// * `client` - RPC client for fetching blocks from remote blockchain
-/// * `db` - Database interface for chain management
-/// * `config` - Configuration for tracker behavior
-/// * `block_error_counts` - Mutable map tracking error counts per block
-///
-/// # Returns
-/// * `Ok(FetchResult)` - Result containing fetch statistics
-/// * `Err(eyre::Error)` - On critical failures
-#[instrument(skip_all, name = "chain_sync")]
-pub async fn fetch_blocks_batch<DB>(
-    client: &RpcClient,
-    db: &DB,
-    config: &ChainSyncConfig,
-    block_error_counts: &mut HashMap<u64, usize>,
-) -> Result<FetchResult>
-where
-    DB: ChainState + TaskQueue,
-{
-    let batch_start = Instant::now();
-
-    // Calculate how far behind our local chain is from remote
-    let db_tip_start = Instant::now();
-    let local_tip = db.get_local_tip()?.ok_or_else(|| anyhow!("Local chain is empty"))?;
-    let remote_tip = db.get_remote_tip()?.unwrap_or(local_tip);
-    let db_tip_elapsed = db_tip_start.elapsed();
-
-    debug!(
-        local_tip = local_tip.0,
-        remote_tip = remote_tip.0,
-        db_tip_ms = db_tip_elapsed.as_millis() as u64,
-        "Got tips from DB"
-    );
-
-    // Check if local data is too stale (chain has moved far ahead)
-    // This happens when service was stopped for a long time
-    // Only applies in auto_advance mode (debug-trace-server) to avoid affecting stateless-validator
-    if config.auto_advance_local_tip {
-        let chain_latest = client.get_latest_block_number().await?;
-        let stale_threshold = config.pruner_blocks_to_keep;
-        if chain_latest > remote_tip.0 + stale_threshold {
-            warn!(
-                local_remote_tip = remote_tip.0,
-                chain_latest = chain_latest,
-                stale_threshold = stale_threshold,
-                "Local data is too stale, resetting to latest block"
-            );
-
-            // Fetch latest block header and reset anchor
-            let latest_header = client.get_header(BlockId::latest(), false).await?;
-            db.reset_anchor_block(
-                latest_header.number,
-                latest_header.hash,
-                latest_header.state_root,
-                latest_header.withdrawals_root.unwrap_or_default(),
-            )?;
-
-            info!(
-                new_anchor = latest_header.number,
-                block_hash = %latest_header.hash,
-                "Reset to latest block due to stale data"
-            );
-
-            return Ok(FetchResult {
-                blocks_fetched: 0,
-                should_wait: false,
-                had_error: false,
-                reverted_hashes: Vec::new(),
-                remote_chain_height: Some(chain_latest),
-            });
-        }
-    }
-
-    let gap = remote_tip.0.saturating_sub(local_tip.0);
-
-    // Detect and resolve chain reorgs (uses header-only RPC for efficiency)
-    match client.get_block_hash(remote_tip.0).await {
-        Ok(hash) if hash != remote_tip.1 => {
-            warn!(
-                block_number = remote_tip.0,
-                expected_hash = %remote_tip.1,
-                actual_hash = %hash,
-                "Hash mismatch detected, resolving chain divergence"
-            );
-
-            match find_divergence_point(client, db, remote_tip.0).await {
-                Ok(rollback_to) => {
-                    let reorg_depth = remote_tip.0.saturating_sub(rollback_to);
-                    warn!(
-                        rollback_to = rollback_to,
-                        reorg_depth = reorg_depth,
-                        "Rolling back chain"
-                    );
-
-                    // Collect block hashes before rollback for cache invalidation
-                    let mut reverted_hashes = Vec::with_capacity(reorg_depth as usize);
-                    for block_num in (rollback_to + 1)..=remote_tip.0 {
-                        if let Ok(Some(hash)) = db.get_block_hash(block_num) {
-                            reverted_hashes.push(hash);
-                        }
-                    }
-
-                    db.rollback_chain(rollback_to)?;
-                    return Ok(FetchResult {
-                        blocks_fetched: 0,
-                        should_wait: false,
-                        had_error: false,
-                        reverted_hashes,
-                        remote_chain_height: None,
-                    });
-                }
-                Err(e) => {
-                    error!(error = %e, "Failed to find divergence point");
-                    return Err(e);
-                }
-            }
-        }
-        Err(e) => {
-            warn!(
-                block_hash = %remote_tip.1,
-                error = %e,
-                "Network error validating tip"
-            );
-        }
-        _ => {}
-    }
-
-    // In auto-advance mode, promote existing remote chain blocks to canonical chain first
-    // This handles the case where we have pending blocks from a previous run
-    if config.auto_advance_local_tip && gap > 0 {
-        let promoted = gap.min(config.tracker_lookahead_blocks);
-        for _ in 0..promoted {
-            if !db.promote_remote_to_canonical()? {
-                break;
-            }
-        }
-        // Don't return early - continue to fetch more blocks
-    }
-
-    // Stop if we already have sufficient lookahead (only for validation mode)
-    // In auto-advance mode, we always want to fetch more blocks
-    if !config.auto_advance_local_tip && gap >= config.tracker_lookahead_blocks {
-        return Ok(FetchResult {
-            blocks_fetched: 0,
-            should_wait: true,
-            had_error: false,
-            reverted_hashes: Vec::new(),
-            remote_chain_height: None,
-        });
-    }
-
-    // Calculate how many blocks to fetch (bounded by latest available)
-    let latest_start = Instant::now();
-    let chain_latest = client.get_latest_block_number().await?;
-    let latest_elapsed = latest_start.elapsed();
-
-    debug!(
-        chain_latest = chain_latest,
-        remote_tip = remote_tip.0,
-        latest_fetch_ms = latest_elapsed.as_millis() as u64,
-        "Got chain latest"
-    );
-
-    let blocks_to_fetch =
-        (config.tracker_lookahead_blocks - gap).min(chain_latest.saturating_sub(remote_tip.0));
-
-    if blocks_to_fetch == 0 {
-        debug!(
-            chain_latest = chain_latest,
-            remote_tip = remote_tip.0,
-            gap = gap,
-            "No blocks to fetch - at chain tip"
-        );
-        return Ok(FetchResult {
-            blocks_fetched: 0,
-            should_wait: true,
-            had_error: false,
-            reverted_hashes: Vec::new(),
-            remote_chain_height: Some(chain_latest),
-        });
-    }
-
-    let start_block = remote_tip.0 + 1;
-
+/// On RPC error, retries with exponential backoff. On channel closure or shutdown, returns.
+pub async fn block_fetcher(
+    client: Arc<RpcClient>,
+    tx: kanal::Sender<ValidationTask>,
+    start_block: u64,
+    config: Arc<ChainSyncConfig>,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let tx = tx.to_async();
     info!(
         start_block = start_block,
-        end_block = start_block + blocks_to_fetch - 1,
-        blocks_to_fetch = blocks_to_fetch,
-        chain_latest = chain_latest,
-        gap_behind = chain_latest.saturating_sub(start_block),
-        "Starting block fetch batch"
+        batch_size = config.fetcher_batch_size,
+        "Starting block fetcher"
     );
 
-    // Fetch blocks in parallel
-    let fetch_start = Instant::now();
-    let tasks =
-        future::join_all((start_block..start_block + blocks_to_fetch).map(|block_number| {
+    let mut next_block = start_block;
+    let mut backoff = Duration::from_secs(1);
+    let mut block_error_counts: HashMap<u64, usize> = HashMap::new();
+
+    loop {
+        if shutdown.is_cancelled() {
+            info!("[Fetcher] Shutting down gracefully");
+            return Ok(());
+        }
+
+        // Check sync target
+        if let Some(target) = config.sync_target &&
+            next_block > target
+        {
+            info!(target = target, "[Fetcher] Reached sync target, stopping");
+            return Ok(());
+        }
+
+        // Wait until there's data to fetch (check chain latest)
+        let chain_latest = match client.get_latest_block_number().await {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(error = %e, "[Fetcher] Failed to get chain latest, retrying");
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = shutdown.cancelled() => return Ok(()),
+                }
+                backoff = (backoff * 2).min(config.fetcher_max_backoff);
+                continue;
+            }
+        };
+
+        if next_block > chain_latest {
+            // At chain tip, wait for new blocks
+            tokio::select! {
+                _ = tokio::time::sleep(config.tracker_poll_interval) => {}
+                _ = shutdown.cancelled() => return Ok(()),
+            }
+            continue;
+        }
+
+        // Calculate batch size
+        let blocks_available = chain_latest - next_block + 1;
+        let batch_size = (config.fetcher_batch_size as u64).min(blocks_available);
+
+        debug!(
+            next_block = next_block,
+            batch_size = batch_size,
+            chain_latest = chain_latest,
+            "[Fetcher] Fetching batch"
+        );
+
+        // Fetch blocks in parallel
+        let fetch_start = Instant::now();
+        let results = future::join_all((next_block..next_block + batch_size).map(|block_number| {
             let client = client.clone();
             async move {
                 let block_hash = client.get_block_hash(block_number).await?;
                 let (salt_witness, mpt_witness) =
                     client.get_witness(block_number, block_hash).await?;
                 let block = client.get_block(BlockId::Number(block_number.into()), true).await?;
-
-                Ok::<(Block<Transaction>, SaltWitness, MptWitness), eyre::Error>((
-                    block,
-                    salt_witness,
-                    mpt_witness,
-                ))
+                Ok::<_, eyre::Error>(ValidationTask { block, salt_witness, mpt_witness })
             }
             .instrument(info_span!("fetch_block", block_number = block_number))
         }))
-        .await
-        .into_iter()
-        .enumerate()
-        // Stop on first error to maintain block sequence contiguity
-        .take_while(|(i, result)| match result {
-            Ok(_) => {
-                block_error_counts.remove(&(start_block + *i as u64));
-                true
-            }
-            Err(e) => {
-                let block_number = start_block + *i as u64;
-                let count = block_error_counts.entry(block_number).or_insert(0);
-                *count += 1;
+        .await;
 
-                // Only log errors after repeated failures (witness delay is expected)
-                if *count > 5 {
-                    error!(
-                        block_number = block_number,
-                        attempt = *count,
-                        error = %e,
-                        "Block fetch error (repeated)"
-                    );
+        // Process results in order, stop on first error
+        let mut fetched = 0u64;
+        for (i, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(task) => {
+                    block_error_counts.remove(&(next_block + i as u64));
+
+                    // Send to channel (blocks if full — backpressure)
+                    if tx.send(task).await.is_err() {
+                        info!("[Fetcher] Channel closed, stopping");
+                        return Ok(());
+                    }
+                    fetched += 1;
                 }
-                false
+                Err(e) => {
+                    let block_number = next_block + i as u64;
+                    let count = block_error_counts.entry(block_number).or_insert(0);
+                    *count += 1;
+                    if *count > 5 {
+                        error!(
+                            block_number = block_number,
+                            attempt = *count,
+                            error = %e,
+                            "[Fetcher] Block fetch error (repeated)"
+                        );
+                    }
+                    break;
+                }
             }
-        })
-        .filter_map(|(_, result)| result.ok())
-        .collect::<Vec<_>>();
-
-    let fetched_count = tasks.len() as u64;
-    let had_error = fetched_count < blocks_to_fetch;
-    let fetch_elapsed = fetch_start.elapsed();
-
-    info!(
-        blocks_fetched = fetched_count,
-        blocks_requested = blocks_to_fetch,
-        fetch_ms = fetch_elapsed.as_millis() as u64,
-        had_error = had_error,
-        "Parallel fetch completed"
-    );
-
-    // Store block data and witnesses
-    // In stateless-validator mode: add to validation task queue
-    // In debug-trace-server mode: only store data for trace RPCs (no validation)
-    let db_start = Instant::now();
-    if config.auto_advance_local_tip {
-        // Convert SaltWitness to LightWitness for efficient storage
-        let light_tasks: Vec<_> = tasks
-            .iter()
-            .map(|(block, salt_witness, _)| {
-                (block.clone(), crate::LightWitness::from(salt_witness.clone()))
-            })
-            .collect();
-        db.store_block_data(&light_tasks)?;
-    } else {
-        db.add_validation_tasks(&tasks)?;
-    }
-    let add_tasks_elapsed = db_start.elapsed();
-
-    let grow_chain_start = Instant::now();
-    let headers: Vec<_> = tasks.iter().map(|(block, _, _)| block.header.clone()).collect();
-    db.grow_remote_chain(&headers)?;
-    let grow_chain_elapsed = grow_chain_start.elapsed();
-
-    info!(
-        add_tasks_ms = add_tasks_elapsed.as_millis() as u64,
-        grow_chain_ms = grow_chain_elapsed.as_millis() as u64,
-        "DB operations completed"
-    );
-
-    // Auto-advance local tip if configured (for debug-trace-server mode)
-    // This skips validation and trusts blocks from upstream RPC
-    if config.auto_advance_local_tip && fetched_count > 0 {
-        let new_local_tip = start_block + fetched_count - 1;
-        let promote_start = Instant::now();
-        for _ in 0..fetched_count {
-            db.promote_remote_to_canonical()?;
         }
-        let promote_elapsed = promote_start.elapsed();
 
-        // Get the earliest block in DB for logging
-        let earliest = db.get_earliest_local_block()?.map(|(n, _)| n).unwrap_or(0);
-
-        // Calculate blocks per second using total batch time
-        let total_elapsed = batch_start.elapsed();
-        let total_ms = total_elapsed.as_millis() as f64;
-        let blocks_per_sec =
-            if total_ms > 0.0 { (fetched_count as f64 * 1000.0) / total_ms } else { 0.0 };
-
-        info!(
-            db_start = earliest,
-            db_end = new_local_tip,
-            synced_blocks = fetched_count,
-            total_ms = total_ms as u64,
-            fetch_ms = fetch_elapsed.as_millis() as u64,
-            db_write_ms = (add_tasks_elapsed.as_millis() + grow_chain_elapsed.as_millis()) as u64,
-            promote_ms = promote_elapsed.as_millis() as u64,
-            blocks_per_sec = format!("{:.2}", blocks_per_sec),
-            "Chain synced"
-        );
+        if fetched > 0 {
+            let elapsed = fetch_start.elapsed();
+            info!(
+                blocks = fetched,
+                start = next_block,
+                end = next_block + fetched - 1,
+                ms = elapsed.as_millis() as u64,
+                "[Fetcher] Batch sent to pipeline"
+            );
+            next_block += fetched;
+            backoff = Duration::from_secs(1); // reset backoff on success
+        } else {
+            // All blocks in batch failed, backoff
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = shutdown.cancelled() => return Ok(()),
+            }
+            backoff = (backoff * 2).min(config.fetcher_max_backoff);
+        }
     }
-
-    Ok(FetchResult {
-        blocks_fetched: fetched_count,
-        should_wait: false,
-        had_error,
-        reverted_hashes: Vec::new(),
-        remote_chain_height: Some(chain_latest),
-    })
 }
 
-/// Remote chain tracker that maintains a lookahead of unvalidated blocks.
+/// Collects validation results and advances the canonical chain in block-number order.
 ///
-/// Runs in an infinite loop, monitoring the gap between local canonical tip and remote
-/// tip to maintain a sufficient buffer of unvalidated blocks for validation workers.
-/// Infrastructure errors (RPC failures, network issues) are logged and contained.
+/// Receives results from workers (potentially out of order), buffers them,
+/// and advances the canonical tip in strict sequence. Batches multiple consecutive
+/// blocks into a single persistence write.
 ///
-/// # Arguments
-/// * `client` - RPC client for fetching blocks from remote blockchain
-/// * `validator_db` - Database interface for chain management
-/// * `config` - Configuration for tracker behavior
-/// * `on_reorg` - Optional callback invoked when a chain reorg is detected, receives reverted block
-///   hashes
-/// * `on_fetch` - Optional callback invoked after each successful fetch batch with the result
-///
-/// # Returns
-/// * Never returns under normal operation - runs indefinitely until externally terminated
-pub async fn remote_chain_tracker<DB, F, G>(
-    client: Arc<RpcClient>,
-    db: Arc<DB>,
-    config: Arc<ChainSyncConfig>,
-    on_reorg: Option<F>,
-    on_fetch: Option<G>,
-) -> Result<()>
-where
-    DB: ChainState + TaskQueue + Send + Sync + 'static,
-    F: Fn(&[B256]) + Send + Sync,
-    G: Fn(&FetchResult) + Send + Sync,
-{
-    info!(lookahead_blocks = config.tracker_lookahead_blocks, "Starting remote chain tracker");
+/// If any validation fails, returns `Err` immediately (process should exit).
+pub async fn chain_advancer(
+    rx: kanal::Receiver<std::result::Result<ValidatedBlock, ValidationFailure>>,
+    store: Arc<PersistentStore>,
+    initial_tip: ChainTip,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    let rx = rx.to_async();
+    let mut next_expected = initial_tip.block_number + 1;
+    let mut current_tip = initial_tip;
+    let mut buffer: BTreeMap<u64, ValidatedBlock> = BTreeMap::new();
 
-    // Track error counts for each block
-    let mut block_error_counts: HashMap<u64, usize> = HashMap::new();
+    info!(start_block = next_expected, "[Advancer] Starting chain advancer");
 
     loop {
-        match fetch_blocks_batch(&client, &*db, &config, &mut block_error_counts).await {
-            Ok(result) => {
-                // Call reorg callback if a reorg occurred
-                if !result.reverted_hashes.is_empty() &&
-                    let Some(ref callback) = on_reorg
-                {
-                    callback(&result.reverted_hashes);
+        // Receive next result
+        let result = tokio::select! {
+            r = rx.recv() => match r {
+                Ok(r) => r,
+                Err(_) => {
+                    info!("[Advancer] Channel closed, stopping");
+                    return Ok(());
                 }
-
-                // Call fetch callback with the result
-                if let Some(ref callback) = on_fetch {
-                    callback(&result);
-                }
-
-                if result.had_error {
-                    tokio::time::sleep(config.tracker_error_sleep).await;
-                } else if result.should_wait || result.blocks_fetched == 0 {
-                    tokio::time::sleep(config.tracker_poll_interval).await;
-                }
+            },
+            _ = shutdown.cancelled() => {
+                info!("[Advancer] Shutting down gracefully");
+                return Ok(());
             }
-            Err(e) => {
-                warn!(error = %e, "Sync iteration failed");
-                tokio::time::sleep(config.tracker_error_sleep).await;
+        };
+
+        match result {
+            Err(failure) => {
+                error!(
+                    block_number = failure.block_number,
+                    block_hash = %failure.block_hash,
+                    error = %failure.error,
+                    "[Advancer] Validation failed, terminating"
+                );
+                return Err(eyre::eyre!(
+                    "Block {} ({}) validation failed: {}",
+                    failure.block_number,
+                    failure.block_hash,
+                    failure.error
+                ));
+            }
+            Ok(validated) => {
+                debug!(
+                    block_number = validated.block_number,
+                    "[Advancer] Received validated block"
+                );
+                buffer.insert(validated.block_number, validated);
             }
         }
-    }
-}
 
-/// Finds where the local chain diverges from the remote RPC node using exponential search.
-///
-/// Uses exponential search to efficiently locate where the local canonical chain diverges
-/// from the remote chain. Exponential search is more efficient than binary search for reorgs
-/// since they typically occur near the chain tip (non-uniform distribution).
-/// The algorithm first exponentially expands backward to find a known-matching block,
-/// then binary searches in that range.
-#[instrument(skip(client, db), name = "find_divergence")]
-async fn find_divergence_point<DB: ChainState>(
-    client: &RpcClient,
-    db: &DB,
-    mismatch_block: u64,
-) -> Result<u64> {
-    let earliest_local = db.get_earliest_local_block()?.expect("Local chain cannot be empty");
+        // Drain consecutive blocks from buffer
+        let mut advanced = 0u64;
+        while let Some(validated) = buffer.remove(&next_expected) {
+            // Verify state root continuity
+            if validated.pre_state_root != current_tip.post_state_root {
+                return Err(eyre::eyre!(
+                    "Block {} pre_state_root mismatch: expected {:?}, got {:?}",
+                    validated.block_number,
+                    current_tip.post_state_root,
+                    validated.pre_state_root
+                ));
+            }
+            if validated.pre_withdrawals_root != current_tip.post_withdrawals_root {
+                return Err(eyre::eyre!(
+                    "Block {} pre_withdrawals_root mismatch: expected {:?}, got {:?}",
+                    validated.block_number,
+                    current_tip.post_withdrawals_root,
+                    validated.pre_withdrawals_root
+                ));
+            }
 
-    // Safety check: verify earliest block matches remote chain
-    let earliest_remote_hash = client.get_block_hash(earliest_local.0).await?;
-    if earliest_remote_hash != earliest_local.1 {
-        return Err(anyhow!(
-            "Catastrophic reorg: earliest local block {} hash mismatch (local: {:?}, remote: {:?})",
-            earliest_local.0,
-            earliest_local.1,
-            earliest_remote_hash
-        ));
-    }
+            current_tip = ChainTip {
+                block_number: validated.block_number,
+                block_hash: validated.block_hash,
+                post_state_root: validated.post_state_root,
+                post_withdrawals_root: validated.post_withdrawals_root,
+            };
+            next_expected += 1;
+            advanced += 1;
+        }
 
-    // Exponential search: find a matching block by exponentially increasing distance from tip
-    let mut step = 1u64;
-    let mut last_mismatch = mismatch_block;
-    let mut search_start = earliest_local.0;
-
-    while last_mismatch > earliest_local.0 {
-        let check_block = last_mismatch.saturating_sub(step).max(earliest_local.0);
-        let local_hash = db.get_block_hash(check_block)?.unwrap();
-        let remote_hash = client.get_block_hash(check_block).await?;
-
-        if remote_hash == local_hash {
-            // Found a matching block, search between here and last_mismatch
-            search_start = check_block;
-            break;
-        } else {
-            // Keep expanding backwards
-            last_mismatch = check_block;
-            step *= 2;
+        // Batch-persist the new tip if any blocks were advanced
+        if advanced > 0 {
+            store.set_canonical_tip(&current_tip)?;
+            info!(
+                tip = current_tip.block_number,
+                advanced = advanced,
+                buffered = buffer.len(),
+                "[Advancer] Chain advanced"
+            );
         }
     }
-
-    // Binary search between search_start and last_mismatch
-    let (mut left, mut right, mut last_matching) = (search_start, last_mismatch, search_start);
-    while left <= right {
-        let mid = left + (right - left) / 2;
-        let local_hash = db.get_block_hash(mid)?.unwrap();
-        let remote_hash = client.get_block_hash(mid).await?;
-        if remote_hash == local_hash {
-            last_matching = mid;
-            left = mid + 1;
-        } else {
-            right = mid.saturating_sub(1);
-        }
-    }
-
-    debug!(
-        divergence_point = last_matching,
-        mismatch_block = mismatch_block,
-        "Found divergence point"
-    );
-
-    Ok(last_matching)
 }

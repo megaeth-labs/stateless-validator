@@ -22,16 +22,17 @@ alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-rlp.workspace = true
 alloy-rpc-types-eth.workspace = true
-alloy-rpc-types-trace.workspace = true
 alloy-serde.workspace = true
 alloy-trie.workspace = true
 
 # misc
 base64.workspace = true
 bincode.workspace = true
+dashmap.workspace = true
 dyn-clone.workspace = true
 eyre.workspace = true
 futures.workspace = true
+kanal.workspace = true
 lz4_flex.workspace = true
 
 # megaeth 
@@ -39,7 +40,6 @@ mega-evm.workspace = true
 num_cpus.workspace = true
 op-alloy-network.workspace = true
 op-alloy-rpc-types.workspace = true
-rayon.workspace = true
 redb.workspace = true
 
 # reth
@@ -51,13 +51,12 @@ reth-trie-sparse.workspace = true
 
 # revm
 revm.workspace = true
-revm-inspectors.workspace = true
-rustc-hash.workspace = true
 salt.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
 zstd.workspace = true
 

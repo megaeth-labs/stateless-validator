@@ -22,10 +22,7 @@ use salt::{
 };
 use tracing::trace;
 
-use crate::{
-    data_types::{PlainKey, PlainValue},
-    light_witness::LightWitness,
-};
+use crate::data_types::{PlainKey, PlainValue};
 
 /// Error type for witness database operations
 #[derive(Debug, Clone)]
@@ -247,23 +244,6 @@ impl WitnessExternalEnv {
         })?;
 
         Ok((bucket_id, meta.capacity))
-    }
-
-    /// Creates a new external environment provider from a LightWitness.
-    ///
-    /// This is the fast version of `new()` that works with `LightWitness`
-    /// for improved deserialization performance.
-    pub fn from_light_witness(
-        light_witness: &LightWitness,
-        block_number: BlockNumber,
-    ) -> Result<Self, WitnessDatabaseError> {
-        let bucket_capacities = light_witness
-            .kvs
-            .range(METADATA_KEYS_RANGE)
-            .map(|(key, value)| Self::parse_metadata_entry(key, value))
-            .collect::<Result<HashMap<_, _>, _>>()?;
-
-        Ok(Self { block_number, bucket_capacities })
     }
 }
 
