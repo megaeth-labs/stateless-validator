@@ -109,6 +109,8 @@ pub struct MegaethGenesisHardforks {
     pub rex_2_time: Option<u64>,
     /// Rex3 hardfork timestamp.
     pub rex_3_time: Option<u64>,
+    /// Rex4 hardfork timestamp.
+    pub rex_4_time: Option<u64>,
 }
 
 impl MegaethGenesisHardforks {
@@ -127,6 +129,7 @@ impl MegaethGenesisHardforks {
             (MegaHardfork::Rex1.boxed(), self.rex_1_time.map(ForkCondition::Timestamp)),
             (MegaHardfork::Rex2.boxed(), self.rex_2_time.map(ForkCondition::Timestamp)),
             (MegaHardfork::Rex3.boxed(), self.rex_3_time.map(ForkCondition::Timestamp)),
+            (MegaHardfork::Rex4.boxed(), self.rex_4_time.map(ForkCondition::Timestamp)),
         ]
         .into_iter()
         .filter_map(|(hardfork, condition)| condition.map(|c| (hardfork, c)))
@@ -145,6 +148,7 @@ pub static MEGA_MAINNET_HARDFORKS: std::sync::LazyLock<ChainHardforks> =
             (MegaHardfork::Rex1.boxed(), ForkCondition::Timestamp(0)),
             (MegaHardfork::Rex2.boxed(), ForkCondition::Timestamp(0)),
             (MegaHardfork::Rex3.boxed(), ForkCondition::Timestamp(0)),
+            (MegaHardfork::Rex4.boxed(), ForkCondition::Timestamp(0)),
         ])
     });
 
@@ -196,7 +200,8 @@ mod tests {
           "rexTime": 4,
           "rex1Time": 5,
           "rex2Time": 6,
-          "rex3Time": 7
+          "rex3Time": 7,
+          "rex4Time": 8
         }
         "#;
         let fields = serde_json::from_str::<OtherFields>(genesis_info).unwrap();
@@ -208,5 +213,6 @@ mod tests {
         assert_eq!(hardforks.rex_1_time, Some(5));
         assert_eq!(hardforks.rex_2_time, Some(6));
         assert_eq!(hardforks.rex_3_time, Some(7));
+        assert_eq!(hardforks.rex_4_time, Some(8));
     }
 }
