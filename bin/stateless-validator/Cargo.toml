@@ -11,9 +11,6 @@ exclude.workspace = true
 name = "stateless-validator"
 path = "src/main.rs"
 
-[features]
-test-bucket-resize = ["salt/test-bucket-resize", "stateless-core/test-bucket-resize"]
-
 [dependencies]
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
@@ -44,3 +41,6 @@ jsonrpsee-types = { version = "0.26" }
 tempfile = "3.8"
 tracing-subscriber.workspace = true
 zstd.workspace = true
+
+[features]
+test-bucket-resize = ["salt/test-bucket-resize", "stateless-core/test-bucket-resize"]

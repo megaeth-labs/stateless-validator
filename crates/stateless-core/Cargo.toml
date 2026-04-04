@@ -7,9 +7,6 @@ license.workspace = true
 repository.workspace = true
 exclude.workspace = true
 
-[features]
-test-bucket-resize = ["salt/test-bucket-resize"]
-
 [dependencies]
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
@@ -58,3 +55,6 @@ zstd.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+test-bucket-resize = ["salt/test-bucket-resize"]
