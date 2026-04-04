@@ -1532,9 +1532,9 @@ checksum = "7575182f7272186991736b70173b0ea045398f984bf5ebbb3804736ce1330c9d"
 
 [[package]]
 name = "bytemuck"
-version = "1.24.0"
+version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fbdf580320f38b612e485521afda1ee26d10cc9884efaaa750d383e13e3c5f4"
+checksum = "c8efb64bd706a16a1bdde310ae86b351e4d21550d98d056f22f8a7f7a2183fec"
 dependencies = [
  "bytemuck_derive",
 ]
@@ -1908,6 +1908,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "jsonrpsee 0.24.10",
+ "kanal",
  "libc",
  "metrics",
  "metrics-derive",
@@ -1924,6 +1925,7 @@ dependencies = [
  "stateless-core",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tower 0.4.13",
  "tracing",
 ]
@@ -3284,6 +3286,16 @@ dependencies = [
  "once_cell",
  "serdect",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "kanal"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e3953adf0cd667798b396c2fa13552d6d9b3269d7dd1154c4c416442d1ff574"
+dependencies = [
+ "futures-core",
+ "lock_api",
 ]
 
 [[package]]
@@ -5931,9 +5943,11 @@ dependencies = [
  "alloy-trie",
  "base64",
  "bincode 2.0.1",
+ "dashmap 6.1.0",
  "dyn-clone",
  "eyre",
  "futures",
+ "kanal",
  "lz4_flex",
  "mega-evm",
  "num_cpus",
@@ -5952,8 +5966,10 @@ dependencies = [
  "salt",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.17",
  "tokio",
+ "tokio-util",
  "tracing",
  "zstd",
 ]
@@ -5972,6 +5988,7 @@ dependencies = [
  "futures",
  "jsonrpsee 0.26.0",
  "jsonrpsee-types 0.26.0",
+ "kanal",
  "metrics",
  "metrics-exporter-prometheus",
  "num_cpus",

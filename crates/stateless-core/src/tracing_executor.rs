@@ -62,7 +62,7 @@ use tracing::{instrument, trace, warn};
 use crate::{
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
-    database::{WitnessDatabase, WitnessExternalEnv},
+    evm_database::{WitnessDatabase, WitnessExternalEnv},
     executor::{ValidationError, create_evm_env},
     light_witness::{LightWitness, LightWitnessExecutor},
 };

@@ -69,7 +69,7 @@ use tracing::debug;
 use crate::{
     chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec},
     data_types::{Account, PlainKey, PlainValue},
-    database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv},
+    evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv},
     withdrawals::{self, ADDRESS_L2_TO_L1_MESSAGE_PASSER, MptWitness},
 };
 

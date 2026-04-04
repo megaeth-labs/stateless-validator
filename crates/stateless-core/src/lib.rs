@@ -11,7 +11,7 @@
 //!
 //! ## Modules
 //!
-//! - [`database`]: Witness-backed database for REVM
+//! - [`evm_database`]: Witness-backed database for REVM
 //! - [`data_types`]: EVM-specific data types and encoding utilities
 //! - [`executor`]: Block execution logic for replaying transactions
 //! - [`chain_sync`]: Chain synchronization utilities
@@ -20,13 +20,19 @@ pub mod chain_spec;
 pub mod chain_sync;
 pub mod light_witness;
 pub use chain_sync::{
-    ChainSyncConfig, DEFAULT_METRICS_PORT, FetchResult, fetch_blocks_batch, remote_chain_tracker,
+    ChainSyncConfig, ChainSyncEvent, DEFAULT_METRICS_PORT, ReorgEvent, block_fetcher,
+    chain_advancer, chain_monitor, find_divergence_point, trace_chain_advancer,
+    validator_reorg_monitor,
 };
 pub use light_witness::{LightWitness, LightWitnessExecutor};
-pub mod database;
-pub use database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv};
-pub mod validator_db;
-pub use validator_db::{ValidationDbError, ValidationDbResult, ValidatorDB};
+pub mod evm_database;
+pub use evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv};
+pub mod db;
+pub use db::{
+    BlockMeta, BlockStore, ChainStore, ContractCache, ContractStore, GenesisStore, ServerDB,
+    ValidatedBlock, ValidationDbError, ValidationDbResult, ValidationFailure, ValidationTask,
+    ValidatorDB,
+};
 pub mod data_types;
 pub use data_types::{PlainKey, PlainValue};
 pub mod executor;

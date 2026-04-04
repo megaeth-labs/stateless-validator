@@ -370,8 +370,6 @@ impl EvmExecutionMetrics {
 pub struct ChainSyncMetrics {
     /// Depth of chain reorgs
     reorg_depth: Histogram,
-    /// Current remote chain height
-    remote_chain_height: Gauge,
     /// Duration of DB read operations in seconds
     db_read_duration_seconds: Histogram,
     /// Distance of requested block from chain tip
@@ -393,11 +391,6 @@ impl ChainSyncMetrics {
     /// Records a reorg event.
     pub fn record_reorg(&self, depth: u64) {
         self.reorg_depth.record(depth as f64);
-    }
-
-    /// Sets the remote chain height.
-    pub fn set_remote_height(&self, height: u64) {
-        self.remote_chain_height.set(height as f64);
     }
 
     /// Records a DB read duration.

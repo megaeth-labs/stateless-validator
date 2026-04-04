@@ -3,7 +3,7 @@
 //! This module provides a data provider that fetches block data required by the
 //! debug/trace RPC methods from multiple sources:
 //!
-//! 1. **Local Database** (fast) - ValidatorDB for pre-fetched blocks (if configured)
+//! 1. **Local Database** (fast) - Local DB for pre-fetched blocks (if configured)
 //! 2. **Remote RPC** (slower) - Upstream RPC endpoints as fallback
 //! 3. **Cloudflare KV** (archive) - Optional fallback for pruned/old blocks (via RpcClient)
 //!
@@ -25,7 +25,7 @@ use eyre::Result;
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
-use stateless_core::{LightWitness, RpcClient, ValidatorDB, withdrawals::MptWitness};
+use stateless_core::{BlockStore, LightWitness, RpcClient, withdrawals::MptWitness};
 use tokio::sync::broadcast;
 use tracing::{debug, instrument, trace, warn};
 
@@ -68,7 +68,7 @@ type InFlightSender = broadcast::Sender<Result<BlockData, String>>;
 /// Data provider with single-flight request coalescing.
 ///
 /// # Data Lookup Strategy
-/// 1. Check local ValidatorDB (if configured)
+/// 1. Check local database (if configured)
 /// 2. Fetch from remote RPC endpoints
 /// 3. Fall back to Cloudflare KV (if configured in RpcClient) for pruned blocks
 ///
@@ -78,8 +78,8 @@ type InFlightSender = broadcast::Sender<Result<BlockData, String>>;
 pub struct DataProvider {
     /// RPC client for upstream data fetching (includes optional Cloudflare fallback).
     rpc_client: Arc<RpcClient>,
-    /// Optional local database for pre-fetched blocks.
-    validator_db: Option<Arc<ValidatorDB>>,
+    /// Optional local database for pre-fetched blocks (trait object).
+    db: Option<Arc<dyn BlockStore>>,
     /// Timeout for witness fetch retry operations.
     witness_timeout: Duration,
     /// In-flight requests map for single-flight pattern (keyed by block hash).
@@ -95,7 +95,7 @@ impl DataProvider {
     /// * `witness_timeout_secs` - Timeout in seconds for witness fetch retry
     pub fn new(
         rpc_client: Arc<RpcClient>,
-        validator_db: Option<Arc<ValidatorDB>>,
+        db: Option<Arc<dyn BlockStore>>,
         witness_timeout_secs: u64,
     ) -> Self {
         if rpc_client.has_cloudflare_provider() {
@@ -104,7 +104,7 @@ impl DataProvider {
 
         Self {
             rpc_client,
-            validator_db,
+            db,
             witness_timeout: Duration::from_secs(witness_timeout_secs),
             in_flight: DashMap::new(),
         }
@@ -122,7 +122,7 @@ impl DataProvider {
     /// * `Err` - If the block cannot be fetched from any source
     pub async fn get_block_data(&self, block_num: u64) -> Result<BlockData> {
         // Try to get block hash from local database first
-        if let Some(db) = &self.validator_db &&
+        if let Some(db) = &self.db &&
             let Ok(Some(hash)) = db.get_block_hash(block_num)
         {
             return self.get_block_data_by_hash(hash).await;
@@ -148,8 +148,8 @@ impl DataProvider {
         let start = std::time::Instant::now();
 
         // Try to get from local database
-        if let Some(db) = &self.validator_db &&
-            let Ok(data) = self.get_block_data_from_db(db, block_hash).await
+        if let Some(db) = &self.db &&
+            let Ok(data) = self.get_block_data_from_db(&**db, block_hash).await
         {
             trace!(
                 block_hash = %block_hash,
@@ -253,10 +253,10 @@ impl DataProvider {
 
     /// Records the distance of a requested block from the local chain tip.
     fn record_block_distance(&self, block_number: u64) {
-        if let Some(db) = &self.validator_db &&
-            let Ok(Some((tip, _))) = db.get_local_tip()
+        if let Some(db) = &self.db &&
+            let Ok(Some(tip)) = db.get_canonical_tip()
         {
-            let distance = tip.saturating_sub(block_number);
+            let distance = tip.block_number.saturating_sub(block_number);
             ChainSyncMetrics::create().record_block_distance(distance);
         }
     }
@@ -264,7 +264,7 @@ impl DataProvider {
     /// Gets block data from the local database using LightWitness.
     async fn get_block_data_from_db(
         &self,
-        db: &ValidatorDB,
+        db: &dyn BlockStore,
         block_hash: alloy_primitives::BlockHash,
     ) -> Result<BlockData> {
         let overall_start = std::time::Instant::now();
@@ -492,9 +492,9 @@ impl DataProvider {
     ) -> Result<(SaltWitness, MptWitness)> {
         // Determine db_max_height if we have a database
         let db_max_height = self
-            .validator_db
+            .db
             .as_ref()
-            .and_then(|db| db.get_local_tip().ok().flatten().map(|(height, _)| height));
+            .and_then(|db| db.get_canonical_tip().ok().flatten().map(|tip| tip.block_number));
 
         let is_new_block = match db_max_height {
             Some(max) => block_number > max,
@@ -652,11 +652,11 @@ impl DataProvider {
     /// Returns an error if any contract cannot be fetched.
     async fn get_contracts_with_db(
         &self,
-        db: &ValidatorDB,
+        db: &dyn BlockStore,
         code_hashes: &[B256],
     ) -> Result<HashMap<B256, Bytecode>> {
         // First try to get from database
-        let (mut contracts, missing) = db.get_contract_codes(code_hashes.iter().copied())?;
+        let (mut contracts, missing) = db.get_contracts(code_hashes)?;
 
         if !missing.is_empty() {
             trace!(
@@ -778,7 +778,7 @@ mod tests {
         // but we can verify the struct layout is correct
         fn _check_arc<T: Send + Sync>() {}
         _check_arc::<Arc<RpcClient>>();
-        _check_arc::<Option<Arc<ValidatorDB>>>();
+        _check_arc::<Option<Arc<dyn BlockStore>>>();
         _check_arc::<DashMap<B256, InFlightSender>>();
     }
 

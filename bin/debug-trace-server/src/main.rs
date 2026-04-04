@@ -50,10 +50,11 @@ use eyre::{Result, anyhow, ensure};
 use jsonrpsee::server::Server;
 use stateless_common::logging::LogArgs;
 use stateless_core::{
-    ChainSyncConfig, RpcClient, RpcClientConfig, ValidatorDB, chain_spec::ChainSpec,
-    remote_chain_tracker,
+    BlockStore, ChainStore, ChainSyncConfig, RpcClient, RpcClientConfig, ServerDB, chain_monitor,
+    chain_spec::ChainSpec, trace_chain_advancer,
 };
 use tokio::task;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 mod data_provider;
@@ -167,8 +168,8 @@ struct Args {
     log: LogArgs,
 }
 
-/// Database filename for the validator's local storage.
-const VALIDATOR_DB_FILENAME: &str = "validator.redb";
+/// Database filename for the trace server's local storage.
+const TRACE_SERVER_DB_FILENAME: &str = "trace_server.redb";
 
 /// Default number of blocks to keep in database.
 const DEFAULT_BLOCKS_TO_KEEP: u64 = 1000;
@@ -258,8 +259,10 @@ async fn main() -> Result<()> {
     )?);
     let validator_db = init_validator_db(&args, &rpc_client).await?;
 
+    let db_reader: Option<Arc<dyn BlockStore>> =
+        validator_db.clone().map(|db| db as Arc<dyn BlockStore>);
     let data_provider =
-        Arc::new(DataProvider::new(rpc_client.clone(), validator_db.clone(), args.witness_timeout));
+        Arc::new(DataProvider::new(rpc_client.clone(), db_reader, args.witness_timeout));
 
     let chain_spec = load_chain_spec(&args)?;
 
@@ -279,27 +282,33 @@ async fn main() -> Result<()> {
         Some(cache)
     };
 
-    // Spawn background chain tracker with reorg callback (if database is configured)
+    // Spawn background chain sync pipeline (if database is configured)
     if let Some(db) = &validator_db {
-        let config = Arc::new(ChainSyncConfig {
-            // Auto-advance local tip since we don't run validation workers
-            auto_advance_local_tip: true,
-            ..ChainSyncConfig::default()
-        });
-        debug!(
-            lookahead_blocks = config.tracker_lookahead_blocks,
-            auto_advance = config.auto_advance_local_tip,
-            "Starting chain sync tracker"
-        );
+        let config = Arc::new(ChainSyncConfig::default());
+        let shutdown = CancellationToken::new();
 
-        // Clone response_cache for the callback
+        debug!("Starting chain sync pipeline");
+
+        // Channel connecting fetcher → advancer
+        let (event_tx, event_rx) = kanal::bounded(config.fetch_channel_capacity);
+
+        // Spawn chain monitor (manages fetcher lifecycle + reorg detection)
+        let db_store: Arc<dyn ChainStore> = Arc::clone(db) as Arc<dyn ChainStore>;
+        task::spawn(chain_monitor(
+            Arc::clone(&rpc_client),
+            db_store,
+            event_tx,
+            Arc::clone(&config),
+            shutdown.clone(),
+        ));
+
+        // Spawn chain advancer (DB writes, reorg callback)
         let cache_for_reorg = response_cache.clone();
         let chain_sync_metrics = metrics::ChainSyncMetrics::create();
-        let fetch_metrics = metrics::ChainSyncMetrics::create();
-        task::spawn(remote_chain_tracker(
-            Arc::clone(&rpc_client),
-            Arc::clone(db),
-            config,
+        let db_block_store: Arc<dyn BlockStore> = Arc::clone(db) as Arc<dyn BlockStore>;
+        task::spawn(trace_chain_advancer(
+            db_block_store,
+            event_rx,
             Some(move |reverted_hashes: &[B256]| {
                 if !reverted_hashes.is_empty() {
                     chain_sync_metrics.record_reorg(reverted_hashes.len() as u64);
@@ -317,18 +326,16 @@ async fn main() -> Result<()> {
                     }
                 }
             }),
-            Some(move |result: &stateless_core::FetchResult| {
-                if let Some(height) = result.remote_chain_height {
-                    fetch_metrics.set_remote_height(height);
-                }
-            }),
+            shutdown,
         ));
 
         // Spawn history pruner to prevent unbounded database growth
-        let db_path = PathBuf::from(args.data_dir.as_deref().unwrap()).join(VALIDATOR_DB_FILENAME);
+        let db_path =
+            PathBuf::from(args.data_dir.as_deref().unwrap()).join(TRACE_SERVER_DB_FILENAME);
         let pruner_metrics = metrics::ChainSyncMetrics::create();
+        let db_pruner: Arc<dyn BlockStore> = Arc::clone(db) as Arc<dyn BlockStore>;
         task::spawn(history_pruner(
-            Arc::clone(db),
+            db_pruner,
             args.blocks_to_keep,
             args.pruner_interval_secs,
             args.db_max_size,
@@ -380,7 +387,7 @@ async fn main() -> Result<()> {
 async fn init_validator_db(
     args: &Args,
     rpc_client: &Arc<RpcClient>,
-) -> Result<Option<Arc<ValidatorDB>>> {
+) -> Result<Option<Arc<ServerDB>>> {
     let Some(data_dir) = &args.data_dir else {
         debug!("Running in stateless mode, no local database");
         return Ok(None);
@@ -388,7 +395,7 @@ async fn init_validator_db(
 
     debug!(data_dir = %data_dir, "Initializing local database");
     let work_dir = PathBuf::from(data_dir);
-    let db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
+    let db = Arc::new(ServerDB::new(work_dir.join(TRACE_SERVER_DB_FILENAME))?);
 
     // Check if we already have a local tip
     if db.get_local_tip()?.is_some() {
@@ -467,7 +474,7 @@ fn load_chain_spec(args: &Args) -> Result<Arc<ChainSpec>> {
 /// If `db_max_size > 0`, also prunes additional blocks when the DB file exceeds that size.
 #[instrument(skip_all, name = "history_pruner")]
 async fn history_pruner(
-    validator_db: Arc<ValidatorDB>,
+    validator_db: Arc<dyn BlockStore>,
     blocks_to_keep: u64,
     interval_secs: u64,
     db_max_size: u64,
@@ -486,9 +493,10 @@ async fn history_pruner(
     const SIZE_PRUNE_BATCH: u64 = 100;
 
     loop {
-        if let Ok(Some((current_tip, _))) = validator_db.get_local_tip() {
+        if let Ok(Some(tip)) = validator_db.get_canonical_tip() {
+            let current_tip = tip.block_number;
             let mut prune_before = current_tip.saturating_sub(blocks_to_keep);
-            match validator_db.prune_history(prune_before) {
+            match validator_db.prune_chain(prune_before) {
                 Ok(blocks_pruned) if blocks_pruned > 0 => {
                     debug!(
                         blocks_pruned = blocks_pruned,
@@ -533,7 +541,7 @@ async fn history_pruner(
                         "DB over size limit, pruning additional blocks"
                     );
 
-                    match validator_db.prune_history(prune_before) {
+                    match validator_db.prune_chain(prune_before) {
                         Ok(blocks_pruned) if blocks_pruned > 0 => {
                             debug!(
                                 blocks_pruned = blocks_pruned,
@@ -552,7 +560,7 @@ async fn history_pruner(
 
             // Update DB block range metrics
             let earliest =
-                validator_db.get_earliest_local_block().ok().flatten().map(|(n, _)| n).unwrap_or(0);
+                validator_db.get_earliest_block().ok().flatten().map(|(n, _)| n).unwrap_or(0);
             chain_sync_metrics.set_db_block_range(earliest, current_tip);
 
             // Update DB file size metric

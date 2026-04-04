@@ -27,6 +27,7 @@ http.workspace = true
 http-body.workspace = true
 # RPC framework
 jsonrpsee = { version = "0.24", features = ["server", "macros"] }
+kanal.workspace = true
 libc = "0.2"
 metrics.workspace = true
 metrics-derive.workspace = true
@@ -42,26 +43,27 @@ serde.workspace = true
 
 # Serialization
 serde_json.workspace = true
+
+# Reuse stateless-core
+stateless-common = { path = "../../crates/stateless-common" }
+stateless-core = { path = "../../crates/stateless-core" }
 tokio = { workspace = true, features = ["sync"] }
+tokio-util.workspace = true
 tower = "0.4"
 
 # Logging and metrics
 tracing.workspace = true
 
-# Reuse stateless-core
-stateless-common = { path = "../../crates/stateless-common" }
-stateless-core = { path = "../../crates/stateless-core" }
-
 [dev-dependencies]
 alloy-consensus.workspace = true
 alloy-network = "1.0.23"
 alloy-primitives.workspace = true
-bytes = "1"
-http-body-util = "0.1"
 
 # Transaction signing for integration tests
 alloy-signer-local = "1.0.23"
+bytes = "1"
 dotenvy = "0.15"
+http-body-util = "0.1"
 # HTTP client for integration tests
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 tempfile = "3.10"

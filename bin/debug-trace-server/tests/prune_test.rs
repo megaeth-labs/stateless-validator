@@ -10,7 +10,7 @@
 //! ```
 
 use alloy_primitives::B256;
-use stateless_core::ValidatorDB;
+use stateless_core::ServerDB;
 use tempfile::TempDir;
 
 /// Test that prune_history removes blocks older than the specified block number.
@@ -19,7 +19,7 @@ fn test_prune_history_basic() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let db_path = temp_dir.path().join("test_prune.redb");
 
-    let db = ValidatorDB::new(db_path).expect("Failed to create database");
+    let db = ServerDB::new(db_path).expect("Failed to create database");
 
     // Set up an anchor block at height 100
     let anchor_hash = B256::from([100u8; 32]);
@@ -46,7 +46,7 @@ fn test_prune_history_empty_db() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let db_path = temp_dir.path().join("test_prune_empty.redb");
 
-    let db = ValidatorDB::new(db_path).expect("Failed to create database");
+    let db = ServerDB::new(db_path).expect("Failed to create database");
 
     // Prune on empty database should succeed with 0 pruned
     let pruned = db.prune_history(1000).expect("Failed to prune empty db");
@@ -92,7 +92,7 @@ fn test_prune_history_api() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let db_path = temp_dir.path().join("test_prune_api.redb");
 
-    let db = ValidatorDB::new(db_path).expect("Failed to create database");
+    let db = ServerDB::new(db_path).expect("Failed to create database");
 
     // Set up anchor at block 1000
     let anchor_hash = B256::from([10u8; 32]);
