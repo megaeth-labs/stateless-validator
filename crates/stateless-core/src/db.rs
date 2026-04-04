@@ -32,23 +32,23 @@ use crate::{LightWitness, withdrawals::MptWitness};
 
 /// Trusted anchor block. Singleton key "anchor".
 /// Value: (block_number, block_hash, post_state_root, post_withdrawals_root).
-/// Used by both [`ServerDB`] and [`ServerDB`].
+/// Used by both [`ValidatorDB`] and [`ServerDB`].
 #[allow(clippy::type_complexity)]
 const ANCHOR_BLOCK: TableDefinition<&str, (u64, [u8; 32], [u8; 32], [u8; 32])> =
     TableDefinition::new("anchor_block");
 
 /// Canonical chain. Maps BlockNumber → (BlockHash, PostStateRoot, PostWithdrawalsRoot).
-/// Used by both [`ServerDB`] and [`ServerDB`].
+/// Used by both [`ValidatorDB`] and [`ServerDB`].
 #[allow(clippy::type_complexity)]
 const CANONICAL_CHAIN: TableDefinition<u64, ([u8; 32], [u8; 32], [u8; 32])> =
     TableDefinition::new("canonical_chain");
 
 /// Contract bytecode cache. Key: code_hash, Value: bincode+lz4 serialized Bytecode.
-/// Used by both [`ServerDB`] and [`ServerDB`].
+/// Used by both [`ValidatorDB`] and [`ServerDB`].
 const CONTRACTS: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("contracts");
 
 /// Genesis configuration (write-once). Singleton key "genesis", Value: JSON bytes.
-/// Used by [`ServerDB`] only.
+/// Used by [`ValidatorDB`] only.
 const GENESIS_CONFIG: TableDefinition<&str, Vec<u8>> = TableDefinition::new("genesis_config");
 
 // ===========================================================================
@@ -1268,5 +1268,292 @@ mod tests {
         // Second lookup should hit memory
         let (found2, _) = cache.get(&[hash]).unwrap();
         assert_eq!(found2.len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // ValidatorDB ChainStore trait tests
+    // -----------------------------------------------------------------------
+
+    fn make_block_meta(number: u64) -> BlockMeta {
+        BlockMeta {
+            block_number: number,
+            block_hash: BlockHash::from([number as u8; 32]),
+            post_state_root: B256::from([(number + 100) as u8; 32]),
+            post_withdrawals_root: B256::from([(number + 200) as u8; 32]),
+        }
+    }
+
+    #[test]
+    fn test_get_block_hash() {
+        let (_dir, store) = temp_store();
+
+        let blocks: Vec<BlockMeta> = (10..=13).map(make_block_meta).collect();
+        ChainStore::advance_chain(&store, &blocks).unwrap();
+
+        // Existing blocks
+        for b in &blocks {
+            let hash = ChainStore::get_block_hash(&store, b.block_number).unwrap();
+            assert_eq!(hash, Some(b.block_hash));
+        }
+
+        // Non-existent block
+        assert!(ChainStore::get_block_hash(&store, 99).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_get_earliest_block() {
+        let (_dir, store) = temp_store();
+
+        // Empty chain
+        assert!(ChainStore::get_earliest_block(&store).unwrap().is_none());
+
+        let blocks: Vec<BlockMeta> = (5..=8).map(make_block_meta).collect();
+        ChainStore::advance_chain(&store, &blocks).unwrap();
+
+        let (number, hash) = ChainStore::get_earliest_block(&store).unwrap().unwrap();
+        assert_eq!(number, 5);
+        assert_eq!(hash, blocks[0].block_hash);
+    }
+
+    #[test]
+    fn test_rollback_chain() {
+        let (_dir, store) = temp_store();
+
+        let blocks: Vec<BlockMeta> = (10..=15).map(make_block_meta).collect();
+        ChainStore::advance_chain(&store, &blocks).unwrap();
+
+        // Rollback to block 12 (should remove 13, 14, 15)
+        ChainStore::rollback_chain(&store, 12).unwrap();
+
+        let tip = store.get_canonical_tip().unwrap().unwrap();
+        assert_eq!(tip.block_number, 12);
+
+        // Block 13+ should be gone
+        assert!(ChainStore::get_block_hash(&store, 13).unwrap().is_none());
+        assert!(ChainStore::get_block_hash(&store, 14).unwrap().is_none());
+        assert!(ChainStore::get_block_hash(&store, 15).unwrap().is_none());
+
+        // Block 10-12 should still exist
+        assert!(ChainStore::get_block_hash(&store, 10).unwrap().is_some());
+        assert!(ChainStore::get_block_hash(&store, 12).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_prune_chain() {
+        let (_dir, store) = temp_store();
+
+        let blocks: Vec<BlockMeta> = (1..=10).map(make_block_meta).collect();
+        ChainStore::advance_chain(&store, &blocks).unwrap();
+
+        // Prune blocks before block 6 (should remove 1-5)
+        let pruned = ChainStore::prune_chain(&store, 6).unwrap();
+        assert_eq!(pruned, 5);
+
+        // Blocks 1-5 should be gone
+        for n in 1..=5 {
+            assert!(ChainStore::get_block_hash(&store, n).unwrap().is_none());
+        }
+        // Blocks 6-10 should remain
+        for n in 6..=10 {
+            assert!(ChainStore::get_block_hash(&store, n).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn test_advance_chain_empty_is_noop() {
+        let (_dir, store) = temp_store();
+
+        // Advancing with empty slice should not error
+        ChainStore::advance_chain(&store, &[]).unwrap();
+        assert!(store.get_canonical_tip().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_reset_to_anchor_clears_chain() {
+        let (_dir, store) = temp_store();
+
+        // Build a chain 1..=10
+        let blocks: Vec<BlockMeta> = (1..=10).map(make_block_meta).collect();
+        ChainStore::advance_chain(&store, &blocks).unwrap();
+
+        // Reset to a new anchor at block 50
+        let anchor = make_block_meta(50);
+        ChainStore::reset_to_anchor(&store, &anchor).unwrap();
+
+        // Old blocks should be gone
+        for n in 1..=10 {
+            assert!(ChainStore::get_block_hash(&store, n).unwrap().is_none());
+        }
+
+        // Only the anchor block should exist
+        let tip = store.get_canonical_tip().unwrap().unwrap();
+        assert_eq!(tip, anchor);
+        let stored_anchor = ChainStore::get_anchor(&store).unwrap().unwrap();
+        assert_eq!(stored_anchor, anchor);
+    }
+
+    // -----------------------------------------------------------------------
+    // ServerDB tests
+    // -----------------------------------------------------------------------
+
+    fn temp_server_db() -> (tempfile::TempDir, ServerDB) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ServerDB::new(dir.path().join("server.redb")).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn test_server_db_local_tip() {
+        let (_dir, db) = temp_server_db();
+
+        // Empty chain
+        assert!(db.get_local_tip().unwrap().is_none());
+
+        // Advance chain through ChainStore trait
+        let blocks: Vec<BlockMeta> = (1..=3).map(make_block_meta).collect();
+        ChainStore::advance_chain(&db, &blocks).unwrap();
+
+        let (number, hash) = db.get_local_tip().unwrap().unwrap();
+        assert_eq!(number, 3);
+        assert_eq!(hash, blocks[2].block_hash);
+    }
+
+    #[test]
+    fn test_server_db_rollback() {
+        let (_dir, db) = temp_server_db();
+
+        let blocks: Vec<BlockMeta> = (1..=5).map(make_block_meta).collect();
+        ChainStore::advance_chain(&db, &blocks).unwrap();
+
+        db.rollback_chain(3).unwrap();
+        let (number, _) = db.get_local_tip().unwrap().unwrap();
+        assert_eq!(number, 3);
+
+        // Block 4 and 5 should be gone
+        assert!(db.get_block_hash(4).unwrap().is_none());
+        assert!(db.get_block_hash(5).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_server_db_reset_anchor_block() {
+        let (_dir, db) = temp_server_db();
+
+        let blocks: Vec<BlockMeta> = (1..=5).map(make_block_meta).collect();
+        ChainStore::advance_chain(&db, &blocks).unwrap();
+
+        let anchor = make_block_meta(100);
+        db.reset_anchor_block(
+            anchor.block_number,
+            anchor.block_hash,
+            anchor.post_state_root,
+            anchor.post_withdrawals_root,
+        )
+        .unwrap();
+
+        // Old blocks gone
+        assert!(db.get_block_hash(1).unwrap().is_none());
+
+        // Anchor is the sole entry
+        let (number, hash) = db.get_local_tip().unwrap().unwrap();
+        assert_eq!(number, 100);
+        assert_eq!(hash, anchor.block_hash);
+    }
+
+    #[test]
+    fn test_server_db_contract_codes() {
+        let (_dir, db) = temp_server_db();
+
+        let hash1 = B256::from([1u8; 32]);
+        let hash2 = B256::from([2u8; 32]);
+        let bytecode = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
+
+        // Add via ContractStore trait
+        ContractStore::add_contracts(&db, &[(hash1, bytecode.clone())]).unwrap();
+
+        let (found, missing) = db.get_contract_codes([hash1, hash2]).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(missing, vec![hash2]);
+        assert_eq!(found[&hash1].bytes_slice(), bytecode.bytes_slice());
+    }
+
+    #[test]
+    fn test_server_db_chain_store_trait() {
+        let (_dir, db) = temp_server_db();
+
+        // Test through ChainStore trait
+        assert!(ChainStore::get_canonical_tip(&db).unwrap().is_none());
+        assert!(ChainStore::get_anchor(&db).unwrap().is_none());
+
+        let blocks: Vec<BlockMeta> = (10..=12).map(make_block_meta).collect();
+        ChainStore::advance_chain(&db, &blocks).unwrap();
+
+        let tip = ChainStore::get_canonical_tip(&db).unwrap().unwrap();
+        assert_eq!(tip.block_number, 12);
+
+        let earliest = ChainStore::get_earliest_block(&db).unwrap().unwrap();
+        assert_eq!(earliest.0, 10);
+
+        let hash = ChainStore::get_block_hash(&db, 11).unwrap().unwrap();
+        assert_eq!(hash, blocks[1].block_hash);
+
+        // Rollback via trait
+        ChainStore::rollback_chain(&db, 10).unwrap();
+        let tip = ChainStore::get_canonical_tip(&db).unwrap().unwrap();
+        assert_eq!(tip.block_number, 10);
+
+        // Reset via trait
+        let anchor = make_block_meta(50);
+        ChainStore::reset_to_anchor(&db, &anchor).unwrap();
+        let tip = ChainStore::get_canonical_tip(&db).unwrap().unwrap();
+        assert_eq!(tip, anchor);
+    }
+
+    #[test]
+    fn test_server_db_prune_history() {
+        let (_dir, db) = temp_server_db();
+
+        // Use store_block_data to populate BLOCK_RECORDS along with block data
+        // We need real-ish blocks for this, so let's test via the chain store prune
+        let blocks: Vec<BlockMeta> = (1..=5).map(make_block_meta).collect();
+        ChainStore::advance_chain(&db, &blocks).unwrap();
+
+        // prune_history prunes via BLOCK_RECORDS, but we haven't populated those.
+        // However, it also cleans orphaned CANONICAL_CHAIN entries.
+        let pruned = db.prune_history(3).unwrap();
+        // No BLOCK_RECORDS entries, so pruned count is 0 from that path
+        assert_eq!(pruned, 0);
+
+        // But the orphaned canonical chain cleanup should have removed blocks 1, 2
+        assert!(db.get_block_hash(1).unwrap().is_none());
+        assert!(db.get_block_hash(2).unwrap().is_none());
+        // Block 3+ should remain
+        assert!(db.get_block_hash(3).unwrap().is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Serialization roundtrip tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_encode_decode_roundtrip() {
+        // Test with a simple Bytecode value
+        let bytecode = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[
+            0x60, 0x00, 0x60, 0x01, 0x01,
+        ]));
+        let encoded = encode_to_vec(&bytecode).unwrap();
+
+        // Verify marker byte
+        assert_eq!(encoded[0], BINCODE_LZ4_MARKER);
+
+        let decoded: Bytecode = decode_from_slice(&encoded);
+        assert_eq!(decoded.bytes_slice(), bytecode.bytes_slice());
+    }
+
+    #[test]
+    fn test_block_meta_tuple_roundtrip() {
+        let meta = make_block_meta(42);
+        let tuple = meta.to_tuple();
+        let roundtripped = BlockMeta::from_tuple(tuple);
+        assert_eq!(meta, roundtripped);
     }
 }

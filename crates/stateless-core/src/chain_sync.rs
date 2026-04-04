@@ -69,7 +69,7 @@ impl Default for ChainSyncConfig {
     fn default() -> Self {
         let workers = num_cpus::get();
         Self {
-            concurrent_workers: num_cpus::get(),
+            concurrent_workers: workers,
             sync_poll_interval: Duration::from_secs(1),
             sync_target: None,
             tracker_poll_interval: Duration::from_millis(100),
@@ -748,5 +748,511 @@ pub async fn chain_advancer(
                 "[Advancer] Chain advanced"
             );
         }
+    }
+}
+
+// ===========================================================================
+// Unit tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::db::{
+        BlockMeta, BlockStore, ChainStore, ContractStore, ValidatedBlock, ValidationFailure,
+    };
+
+    // -----------------------------------------------------------------------
+    // In-memory mock ChainStore for testing pipeline logic without redb
+    // -----------------------------------------------------------------------
+
+    #[derive(Default)]
+    struct MockChainStoreInner {
+        chain: BTreeMap<u64, BlockMeta>,
+        anchor: Option<BlockMeta>,
+        blocks:
+            Vec<(alloy_rpc_types_eth::Block<op_alloy_rpc_types::Transaction>, crate::LightWitness)>,
+    }
+
+    struct MockChainStore {
+        inner: Mutex<MockChainStoreInner>,
+    }
+
+    impl MockChainStore {
+        fn with_anchor(anchor: BlockMeta) -> Self {
+            let mut inner = MockChainStoreInner::default();
+            inner.chain.insert(anchor.block_number, anchor.clone());
+            inner.anchor = Some(anchor);
+            Self { inner: Mutex::new(inner) }
+        }
+
+        fn tip(&self) -> Option<BlockMeta> {
+            let inner = self.inner.lock().unwrap();
+            inner.chain.values().last().cloned()
+        }
+
+        fn chain_len(&self) -> usize {
+            self.inner.lock().unwrap().chain.len()
+        }
+
+        fn stored_blocks_count(&self) -> usize {
+            self.inner.lock().unwrap().blocks.len()
+        }
+    }
+
+    impl ContractStore for MockChainStore {
+        fn get_contracts(
+            &self,
+            _hashes: &[B256],
+        ) -> eyre::Result<(HashMap<B256, revm::state::Bytecode>, Vec<B256>)> {
+            Ok((HashMap::new(), vec![]))
+        }
+
+        fn add_contracts(&self, _codes: &[(B256, revm::state::Bytecode)]) -> eyre::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ChainStore for MockChainStore {
+        fn get_canonical_tip(&self) -> eyre::Result<Option<BlockMeta>> {
+            Ok(self.tip())
+        }
+
+        fn get_anchor(&self) -> eyre::Result<Option<BlockMeta>> {
+            Ok(self.inner.lock().unwrap().anchor.clone())
+        }
+
+        fn advance_chain(&self, blocks: &[BlockMeta]) -> eyre::Result<()> {
+            let mut inner = self.inner.lock().unwrap();
+            for block in blocks {
+                inner.chain.insert(block.block_number, block.clone());
+            }
+            Ok(())
+        }
+
+        fn get_block_hash(&self, block_number: BlockNumber) -> eyre::Result<Option<BlockHash>> {
+            Ok(self.inner.lock().unwrap().chain.get(&block_number).map(|b| b.block_hash))
+        }
+
+        fn get_earliest_block(&self) -> eyre::Result<Option<(BlockNumber, BlockHash)>> {
+            Ok(self
+                .inner
+                .lock()
+                .unwrap()
+                .chain
+                .values()
+                .next()
+                .map(|b| (b.block_number, b.block_hash)))
+        }
+
+        fn rollback_chain(&self, to_block: BlockNumber) -> eyre::Result<()> {
+            let mut inner = self.inner.lock().unwrap();
+            inner.chain.retain(|&n, _| n <= to_block);
+            Ok(())
+        }
+
+        fn reset_to_anchor(&self, anchor: &BlockMeta) -> eyre::Result<()> {
+            let mut inner = self.inner.lock().unwrap();
+            inner.chain.clear();
+            inner.chain.insert(anchor.block_number, anchor.clone());
+            inner.anchor = Some(anchor.clone());
+            Ok(())
+        }
+
+        fn prune_chain(&self, before_block: BlockNumber) -> eyre::Result<u64> {
+            let mut inner = self.inner.lock().unwrap();
+            let before: Vec<u64> =
+                inner.chain.keys().filter(|&&n| n < before_block).copied().collect();
+            let count = before.len() as u64;
+            for n in before {
+                inner.chain.remove(&n);
+            }
+            Ok(count)
+        }
+    }
+
+    impl BlockStore for MockChainStore {
+        fn store_block_data(
+            &self,
+            blocks: &[(
+                alloy_rpc_types_eth::Block<op_alloy_rpc_types::Transaction>,
+                crate::LightWitness,
+            )],
+        ) -> eyre::Result<()> {
+            let mut inner = self.inner.lock().unwrap();
+            for b in blocks {
+                inner.blocks.push(b.clone());
+            }
+            Ok(())
+        }
+
+        fn get_block_and_witness(
+            &self,
+            _block_hash: BlockHash,
+        ) -> eyre::Result<(
+            alloy_rpc_types_eth::Block<op_alloy_rpc_types::Transaction>,
+            crate::LightWitness,
+        )> {
+            Err(eyre::eyre!("not implemented in mock"))
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper to build ValidatedBlock with state-root continuity
+    // -----------------------------------------------------------------------
+
+    fn make_validated_block(number: u64, pre_state: B256, pre_withdrawals: B256) -> ValidatedBlock {
+        ValidatedBlock {
+            block_number: number,
+            block_hash: BlockHash::from([number as u8; 32]),
+            post_state_root: B256::from([(number + 100) as u8; 32]),
+            post_withdrawals_root: B256::from([(number + 200) as u8; 32]),
+            pre_state_root: pre_state,
+            pre_withdrawals_root: pre_withdrawals,
+        }
+    }
+
+    fn make_initial_tip(number: u64) -> BlockMeta {
+        BlockMeta {
+            block_number: number,
+            block_hash: BlockHash::from([number as u8; 32]),
+            post_state_root: B256::from([(number + 100) as u8; 32]),
+            post_withdrawals_root: B256::from([(number + 200) as u8; 32]),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // chain_advancer tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_chain_advancer_sequential_delivery() {
+        let initial_tip = make_initial_tip(10);
+        let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
+        let shutdown = CancellationToken::new();
+
+        let (tx, rx) = kanal::bounded(16);
+
+        let store_clone = Arc::clone(&store);
+        let shutdown_clone = shutdown.clone();
+        let handle =
+            tokio::spawn(chain_advancer(rx, store_clone, initial_tip.clone(), shutdown_clone));
+
+        // Send blocks 11, 12, 13 in order
+        let block11 = make_validated_block(
+            11,
+            initial_tip.post_state_root,
+            initial_tip.post_withdrawals_root,
+        );
+        let block12 =
+            make_validated_block(12, block11.post_state_root, block11.post_withdrawals_root);
+        let block13 =
+            make_validated_block(13, block12.post_state_root, block12.post_withdrawals_root);
+
+        tx.send(Ok(block11)).unwrap();
+        tx.send(Ok(block12)).unwrap();
+        tx.send(Ok(block13)).unwrap();
+
+        // Close channel to let advancer finish
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        let tip = store.tip().unwrap();
+        assert_eq!(tip.block_number, 13);
+    }
+
+    #[tokio::test]
+    async fn test_chain_advancer_out_of_order_delivery() {
+        let initial_tip = make_initial_tip(10);
+        let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
+        let shutdown = CancellationToken::new();
+
+        let (tx, rx) = kanal::bounded(16);
+
+        let store_clone = Arc::clone(&store);
+        let shutdown_clone = shutdown.clone();
+        let handle =
+            tokio::spawn(chain_advancer(rx, store_clone, initial_tip.clone(), shutdown_clone));
+
+        // Build a chain: 11 -> 12 -> 13
+        let block11 = make_validated_block(
+            11,
+            initial_tip.post_state_root,
+            initial_tip.post_withdrawals_root,
+        );
+        let block12 =
+            make_validated_block(12, block11.post_state_root, block11.post_withdrawals_root);
+        let block13 =
+            make_validated_block(13, block12.post_state_root, block12.post_withdrawals_root);
+
+        // Send out of order: 13, 12, 11
+        tx.send(Ok(block13)).unwrap();
+        tx.send(Ok(block12)).unwrap();
+
+        // After sending 13, 12 — neither should be advanced yet (missing 11)
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let tip = store.tip().unwrap();
+        assert_eq!(tip.block_number, 10, "tip should still be 10 until block 11 arrives");
+
+        // Now send 11 — all three should drain
+        tx.send(Ok(block11)).unwrap();
+        drop(tx);
+        handle.await.unwrap().unwrap();
+
+        let tip = store.tip().unwrap();
+        assert_eq!(tip.block_number, 13);
+    }
+
+    #[tokio::test]
+    async fn test_chain_advancer_state_root_mismatch() {
+        let initial_tip = make_initial_tip(10);
+        let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
+        let shutdown = CancellationToken::new();
+
+        let (tx, rx) = kanal::bounded(16);
+
+        let store_clone = Arc::clone(&store);
+        let shutdown_clone = shutdown.clone();
+        let handle =
+            tokio::spawn(chain_advancer(rx, store_clone, initial_tip.clone(), shutdown_clone));
+
+        // Send block 11 with wrong pre_state_root
+        let bad_block = ValidatedBlock {
+            block_number: 11,
+            block_hash: BlockHash::from([11u8; 32]),
+            post_state_root: B256::from([0xAAu8; 32]),
+            post_withdrawals_root: B256::from([0xBBu8; 32]),
+            pre_state_root: B256::from([0xFFu8; 32]), // wrong!
+            pre_withdrawals_root: initial_tip.post_withdrawals_root,
+        };
+
+        tx.send(Ok(bad_block)).unwrap();
+        drop(tx);
+
+        let result = handle.await.unwrap();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("pre_state_root mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_chain_advancer_validation_failure_propagation() {
+        let initial_tip = make_initial_tip(10);
+        let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
+        let shutdown = CancellationToken::new();
+
+        let (tx, rx) = kanal::bounded(16);
+
+        let store_clone = Arc::clone(&store);
+        let shutdown_clone = shutdown.clone();
+        let handle =
+            tokio::spawn(chain_advancer(rx, store_clone, initial_tip.clone(), shutdown_clone));
+
+        // Send a validation failure
+        tx.send(Err(ValidationFailure {
+            block_number: 11,
+            block_hash: BlockHash::from([11u8; 32]),
+            error: "execution reverted".to_string(),
+        }))
+        .unwrap();
+        drop(tx);
+
+        let result = handle.await.unwrap();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("execution reverted"));
+    }
+
+    #[tokio::test]
+    async fn test_chain_advancer_shutdown() {
+        let initial_tip = make_initial_tip(10);
+        let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
+        let shutdown = CancellationToken::new();
+
+        let (_tx, rx) =
+            kanal::bounded::<std::result::Result<ValidatedBlock, ValidationFailure>>(16);
+
+        let store_clone = Arc::clone(&store);
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(chain_advancer(rx, store_clone, initial_tip, shutdown_clone));
+
+        // Cancel shutdown — advancer should exit cleanly
+        shutdown.cancel();
+        let result = handle.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // trace_chain_advancer tests
+    // -----------------------------------------------------------------------
+
+    /// Helper to create a minimal Block with the given number and hash.
+    fn make_test_block(
+        number: u64,
+        hash: B256,
+        state_root: B256,
+        withdrawals_root: B256,
+    ) -> alloy_rpc_types_eth::Block<op_alloy_rpc_types::Transaction> {
+        let mut header = alloy_rpc_types_eth::Header::<alloy_consensus::Header>::default();
+        header.inner.number = number;
+        header.hash = hash;
+        header.inner.state_root = state_root;
+        header.inner.withdrawals_root = Some(withdrawals_root);
+        alloy_rpc_types_eth::Block { header, ..Default::default() }
+    }
+
+    /// Helper to create an empty LightWitness.
+    fn empty_light_witness() -> crate::LightWitness {
+        crate::LightWitness {
+            kvs: std::collections::BTreeMap::new(),
+            levels: rustc_hash::FxHashMap::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trace_chain_advancer_new_blocks() {
+        let anchor = BlockMeta {
+            block_number: 10,
+            block_hash: BlockHash::from([10u8; 32]),
+            post_state_root: B256::from([110u8; 32]),
+            post_withdrawals_root: B256::from([210u8; 32]),
+        };
+        let store = Arc::new(MockChainStore::with_anchor(anchor));
+        let shutdown = CancellationToken::new();
+
+        let (tx, rx) = kanal::bounded(16);
+
+        let store_clone = Arc::clone(&store) as Arc<dyn BlockStore>;
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(trace_chain_advancer::<fn(&[B256])>(
+            store_clone,
+            rx,
+            None,
+            shutdown_clone,
+        ));
+
+        let block = make_test_block(
+            11,
+            B256::from([11u8; 32]),
+            B256::from([111u8; 32]),
+            B256::from([211u8; 32]),
+        );
+        let witness = empty_light_witness();
+
+        tx.send(ChainSyncEvent::NewBlocks(vec![(block, witness)])).unwrap();
+        drop(tx);
+
+        handle.await.unwrap().unwrap();
+
+        // Chain should have advanced to block 11
+        let tip = store.tip().unwrap();
+        assert_eq!(tip.block_number, 11);
+        assert_eq!(store.stored_blocks_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_trace_chain_advancer_reorg() {
+        let anchor = BlockMeta {
+            block_number: 5,
+            block_hash: BlockHash::from([5u8; 32]),
+            post_state_root: B256::from([105u8; 32]),
+            post_withdrawals_root: B256::from([205u8; 32]),
+        };
+        let store = Arc::new(MockChainStore::with_anchor(anchor));
+
+        // Advance chain to block 10
+        let blocks: Vec<BlockMeta> = (6..=10)
+            .map(|n| BlockMeta {
+                block_number: n,
+                block_hash: BlockHash::from([n as u8; 32]),
+                post_state_root: B256::from([(n + 100) as u8; 32]),
+                post_withdrawals_root: B256::from([(n + 200) as u8; 32]),
+            })
+            .collect();
+        store.advance_chain(&blocks).unwrap();
+
+        let shutdown = CancellationToken::new();
+        let (tx, rx) = kanal::bounded(16);
+
+        let reorged = Arc::new(Mutex::new(Vec::<B256>::new()));
+        let reorged_clone = Arc::clone(&reorged);
+        let on_reorg = move |hashes: &[B256]| {
+            reorged_clone.lock().unwrap().extend_from_slice(hashes);
+        };
+
+        let store_clone = Arc::clone(&store) as Arc<dyn BlockStore>;
+        let shutdown_clone = shutdown.clone();
+        let handle =
+            tokio::spawn(trace_chain_advancer(store_clone, rx, Some(on_reorg), shutdown_clone));
+
+        // Send reorg event: rollback to block 7, reverting blocks 8, 9, 10
+        let reverted_hashes: Vec<B256> = (8..=10).map(|n| B256::from([n as u8; 32])).collect();
+        tx.send(ChainSyncEvent::Reorg { rollback_to: 7, reverted_hashes: reverted_hashes.clone() })
+            .unwrap();
+        drop(tx);
+
+        handle.await.unwrap().unwrap();
+
+        // Chain should be rolled back to block 7
+        let tip = store.tip().unwrap();
+        assert_eq!(tip.block_number, 7);
+
+        // Callback should have been invoked with reverted hashes
+        let reorged = reorged.lock().unwrap();
+        assert_eq!(reorged.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_trace_chain_advancer_reset_anchor() {
+        let anchor = BlockMeta {
+            block_number: 5,
+            block_hash: BlockHash::from([5u8; 32]),
+            post_state_root: B256::from([105u8; 32]),
+            post_withdrawals_root: B256::from([205u8; 32]),
+        };
+        let store = Arc::new(MockChainStore::with_anchor(anchor));
+        let shutdown = CancellationToken::new();
+
+        let (tx, rx) = kanal::bounded(16);
+
+        let store_clone = Arc::clone(&store) as Arc<dyn BlockStore>;
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(trace_chain_advancer::<fn(&[B256])>(
+            store_clone,
+            rx,
+            None,
+            shutdown_clone,
+        ));
+
+        // Send reset anchor event
+        tx.send(ChainSyncEvent::ResetAnchor {
+            block_number: 100,
+            block_hash: B256::from([100u8; 32]),
+            state_root: B256::from([200u8; 32]),
+            withdrawals_root: B256::from([201u8; 32]),
+        })
+        .unwrap();
+        drop(tx);
+
+        handle.await.unwrap().unwrap();
+
+        // Chain should be reset to the new anchor
+        let tip = store.tip().unwrap();
+        assert_eq!(tip.block_number, 100);
+        assert_eq!(store.chain_len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // ChainSyncConfig tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_chain_sync_config_default_uses_cpu_count() {
+        let config = ChainSyncConfig::default();
+        let cpus = num_cpus::get();
+        assert_eq!(config.concurrent_workers, cpus);
+        assert_eq!(config.fetch_channel_capacity, 2 * cpus);
+        assert_eq!(config.result_channel_capacity, 2 * cpus);
+        assert_eq!(config.fetcher_batch_size, cpus);
     }
 }
