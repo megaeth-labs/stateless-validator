@@ -262,6 +262,7 @@ async fn run_with_reorg_restart(
                     depth = reorg.depth,
                     "[Main] Reorg detected, restarting pipeline"
                 );
+                metrics::on_reorg(reorg.depth);
                 true
             }
             _ = signal::ctrl_c() => {
@@ -349,11 +350,12 @@ fn chain_sync(
                 start_block,
                 config,
                 shutdown,
-                Arc::new(|block, salt_witness, mpt_witness| ValidationTask {
+                |block, salt_witness, mpt_witness| ValidationTask {
                     block,
                     salt_witness,
                     mpt_witness,
-                }),
+                },
+                Some(metrics::set_remote_chain_height),
             )
             .await
         }
@@ -395,20 +397,13 @@ fn chain_sync(
         info!("[Pipeline] Validation reporter disabled");
     }
 
-    // Task 5: History pruner
-    bg_tasks.push(task::spawn({
-        let validator_db = Arc::clone(&validator_db) as Arc<dyn ChainStore>;
-        let config = Arc::clone(&config);
-        let shutdown = shutdown.clone();
-        async move { history_pruner(validator_db, config, shutdown).await }
-    }));
-
     // Main loop = chain advancer
     let main_loop = stateless_core::chain_advancer(
         result_rx,
         validator_db as Arc<dyn ChainStore>,
         initial_tip,
         shutdown,
+        Some(metrics::set_chain_height),
     );
 
     Ok((main_loop, bg_tasks))
@@ -622,57 +617,6 @@ async fn validation_reporter(
             Err(e) => {
                 error!("[Reporter] Failed to report blocks: {e}");
             }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// History pruner
-// ---------------------------------------------------------------------------
-
-/// Periodically prunes old CANONICAL_CHAIN entries to prevent unbounded database growth.
-///
-/// Keeps the last `pruner_blocks_to_keep` blocks, removing older entries at each interval.
-async fn history_pruner(
-    db: Arc<dyn ChainStore>,
-    config: Arc<ChainSyncConfig>,
-    shutdown: CancellationToken,
-) -> Result<()> {
-    info!(
-        interval_secs = config.pruner_interval.as_secs(),
-        blocks_to_keep = config.pruner_blocks_to_keep,
-        "[Pruner] Starting"
-    );
-
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep(config.pruner_interval) => {}
-            _ = shutdown.cancelled() => {
-                info!("[Pruner] Shutting down gracefully");
-                return Ok(());
-            }
-        }
-
-        let Some(tip) = db.get_canonical_tip()? else {
-            continue;
-        };
-
-        let prune_before = tip.block_number.saturating_sub(config.pruner_blocks_to_keep);
-        if prune_before == 0 {
-            continue;
-        }
-
-        match db.prune_chain(prune_before) {
-            Ok(pruned) if pruned > 0 => {
-                debug!(
-                    pruned,
-                    prune_before,
-                    tip = tip.block_number,
-                    "[Pruner] Pruned old chain entries"
-                );
-            }
-            Err(e) => warn!(error = %e, "[Pruner] Failed to prune"),
-            _ => {}
         }
     }
 }

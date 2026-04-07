@@ -8,6 +8,7 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
+# alloy
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-evm.workspace = true
@@ -22,6 +23,27 @@ alloy-rpc-types-eth.workspace = true
 alloy-rpc-types-trace.workspace = true
 alloy-serde.workspace = true
 alloy-trie.workspace = true
+
+# mega
+mega-evm.workspace = true
+salt.workspace = true
+
+# op
+op-alloy-network.workspace = true
+op-alloy-rpc-types.workspace = true
+
+# reth
+reth-ethereum-forks.workspace = true
+reth-optimism-chainspec.workspace = true
+reth-trie.workspace = true
+reth-trie-common.workspace = true
+reth-trie-sparse.workspace = true
+
+# revm
+revm.workspace = true
+revm-inspectors.workspace = true
+
+# misc
 base64.workspace = true
 bincode.workspace = true
 dashmap.workspace = true
@@ -30,21 +52,10 @@ eyre.workspace = true
 futures.workspace = true
 kanal.workspace = true
 lz4_flex.workspace = true
-mega-evm.workspace = true
 num_cpus.workspace = true
-op-alloy-network.workspace = true
-op-alloy-rpc-types.workspace = true
 rayon.workspace = true
 redb.workspace = true
-reth-ethereum-forks.workspace = true
-reth-optimism-chainspec.workspace = true
-reth-trie.workspace = true
-reth-trie-common.workspace = true
-reth-trie-sparse.workspace = true
-revm.workspace = true
-revm-inspectors.workspace = true
 rustc-hash.workspace = true
-salt.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

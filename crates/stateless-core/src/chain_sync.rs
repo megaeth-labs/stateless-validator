@@ -41,9 +41,8 @@ pub struct ChainSyncConfig {
     pub sync_target: Option<u64>,
     /// Time to wait between remote chain tracker cycles.
     pub tracker_poll_interval: Duration,
-    /// Time to wait between history pruning cycles.
-    pub pruner_interval: Duration,
     /// Number of recent blocks to retain from current tip.
+    /// Used by `chain_monitor` for stale data detection.
     pub pruner_blocks_to_keep: u64,
     /// Time to wait when remote tracker encounters RPC/DB errors.
     pub tracker_error_sleep: Duration,
@@ -73,7 +72,6 @@ impl Default for ChainSyncConfig {
             sync_poll_interval: Duration::from_secs(1),
             sync_target: None,
             tracker_poll_interval: Duration::from_millis(100),
-            pruner_interval: Duration::from_secs(300),
             pruner_blocks_to_keep: 1000,
             tracker_error_sleep: Duration::from_secs(1),
             report_validation_results: false,
@@ -143,7 +141,8 @@ pub async fn chain_monitor(
             start_block,
             Arc::clone(&config),
             fetcher_shutdown.clone(),
-            Arc::new(|block, salt_witness, _mpt_witness| (block, LightWitness::from(salt_witness))),
+            |block, salt_witness, _mpt_witness| (block, LightWitness::from(salt_witness)),
+            None::<fn(u64)>,
         ));
 
         info!(start_block, "[Monitor] Fetcher spawned");
@@ -519,14 +518,20 @@ pub async fn validator_reorg_monitor(
 /// Backpressure is provided by the bounded channel.
 ///
 /// On RPC error, retries with exponential backoff. On channel closure or shutdown, returns.
-pub async fn block_fetcher<T: Send + 'static>(
+pub async fn block_fetcher<T: Send + 'static, F, G>(
     client: Arc<RpcClient>,
     tx: kanal::Sender<T>,
     start_block: u64,
     config: Arc<ChainSyncConfig>,
     shutdown: CancellationToken,
-    transform: Arc<dyn Fn(Block<Transaction>, SaltWitness, MptWitness) -> T + Send + Sync>,
-) -> Result<()> {
+    transform: F,
+    on_remote_height: Option<G>,
+) -> Result<()>
+where
+    F: Fn(Block<Transaction>, SaltWitness, MptWitness) -> T + Send + Sync + 'static,
+    G: Fn(u64) + Send + Sync,
+{
+    let transform = Arc::new(transform);
     let tx = tx.to_async();
     info!(start_block = start_block, batch_size = config.fetcher_batch_size, "[Fetcher] Starting");
 
@@ -550,7 +555,12 @@ pub async fn block_fetcher<T: Send + 'static>(
 
         // Wait until there's data to fetch (check chain latest)
         let chain_latest = match client.get_latest_block_number().await {
-            Ok(n) => n,
+            Ok(n) => {
+                if let Some(ref cb) = on_remote_height {
+                    cb(n);
+                }
+                n
+            }
             Err(e) => {
                 warn!(error = %e, "[Fetcher] Failed to get chain latest, retrying");
                 tokio::select! {
@@ -652,13 +662,21 @@ pub async fn block_fetcher<T: Send + 'static>(
 /// and advances the canonical tip in strict sequence. Batches multiple consecutive
 /// blocks into a single persistence write.
 ///
+/// The optional `on_advance` callback is invoked after each batch of blocks is
+/// persisted, receiving the new tip block number. Use this to update metrics or
+/// notify external systems.
+///
 /// If any validation fails, returns `Err` immediately (process should exit).
-pub async fn chain_advancer(
+pub async fn chain_advancer<F>(
     rx: kanal::Receiver<std::result::Result<ValidatedBlock, ValidationFailure>>,
     store: Arc<dyn ChainStore>,
     initial_tip: BlockMeta,
     shutdown: CancellationToken,
-) -> Result<()> {
+    on_advance: Option<F>,
+) -> Result<()>
+where
+    F: Fn(u64) + Send + Sync,
+{
     let rx = rx.to_async();
     let mut next_expected = initial_tip.block_number + 1;
     let mut current_tip = initial_tip;
@@ -741,6 +759,9 @@ pub async fn chain_advancer(
         if !new_blocks.is_empty() {
             let advanced = new_blocks.len();
             store.advance_chain(&new_blocks)?;
+            if let Some(ref callback) = on_advance {
+                callback(current_tip.block_number);
+            }
             info!(
                 tip = current_tip.block_number,
                 advanced = advanced,
@@ -937,8 +958,13 @@ mod tests {
 
         let store_clone = Arc::clone(&store);
         let shutdown_clone = shutdown.clone();
-        let handle =
-            tokio::spawn(chain_advancer(rx, store_clone, initial_tip.clone(), shutdown_clone));
+        let handle = tokio::spawn(chain_advancer(
+            rx,
+            store_clone,
+            initial_tip.clone(),
+            shutdown_clone,
+            None::<fn(u64)>,
+        ));
 
         // Send blocks 11, 12, 13 in order
         let block11 = make_validated_block(
@@ -973,8 +999,13 @@ mod tests {
 
         let store_clone = Arc::clone(&store);
         let shutdown_clone = shutdown.clone();
-        let handle =
-            tokio::spawn(chain_advancer(rx, store_clone, initial_tip.clone(), shutdown_clone));
+        let handle = tokio::spawn(chain_advancer(
+            rx,
+            store_clone,
+            initial_tip.clone(),
+            shutdown_clone,
+            None::<fn(u64)>,
+        ));
 
         // Build a chain: 11 -> 12 -> 13
         let block11 = make_validated_block(
@@ -1015,8 +1046,13 @@ mod tests {
 
         let store_clone = Arc::clone(&store);
         let shutdown_clone = shutdown.clone();
-        let handle =
-            tokio::spawn(chain_advancer(rx, store_clone, initial_tip.clone(), shutdown_clone));
+        let handle = tokio::spawn(chain_advancer(
+            rx,
+            store_clone,
+            initial_tip.clone(),
+            shutdown_clone,
+            None::<fn(u64)>,
+        ));
 
         // Send block 11 with wrong pre_state_root
         let bad_block = ValidatedBlock {
@@ -1046,8 +1082,13 @@ mod tests {
 
         let store_clone = Arc::clone(&store);
         let shutdown_clone = shutdown.clone();
-        let handle =
-            tokio::spawn(chain_advancer(rx, store_clone, initial_tip.clone(), shutdown_clone));
+        let handle = tokio::spawn(chain_advancer(
+            rx,
+            store_clone,
+            initial_tip.clone(),
+            shutdown_clone,
+            None::<fn(u64)>,
+        ));
 
         // Send a validation failure
         tx.send(Err(ValidationFailure {
@@ -1074,7 +1115,13 @@ mod tests {
 
         let store_clone = Arc::clone(&store);
         let shutdown_clone = shutdown.clone();
-        let handle = tokio::spawn(chain_advancer(rx, store_clone, initial_tip, shutdown_clone));
+        let handle = tokio::spawn(chain_advancer(
+            rx,
+            store_clone,
+            initial_tip,
+            shutdown_clone,
+            None::<fn(u64)>,
+        ));
 
         // Cancel shutdown — advancer should exit cleanly
         shutdown.cancel();

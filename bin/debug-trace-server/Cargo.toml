@@ -8,50 +8,44 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
-
-# Ethereum types
+# alloy
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-rpc-types-trace.workspace = true
 
-# CLI
+# op
+op-alloy-rpc-types.workspace = true
+
+# revm
+revm.workspace = true
+
+# mega
+salt.workspace = true
+
+# stateless
+stateless-common = { path = "../../crates/stateless-common" }
+stateless-core = { path = "../../crates/stateless-core" }
+
+# misc
 clap.workspace = true
-
-# Concurrent map for single-flight
-dashmap = "5.5"
-
-# Error handling
+dashmap.workspace = true
 eyre.workspace = true
 http.workspace = true
 http-body.workspace = true
-# RPC framework
 jsonrpsee = { version = "0.24", features = ["server", "macros"] }
 kanal.workspace = true
 libc = "0.2"
 metrics.workspace = true
 metrics-derive.workspace = true
 metrics-exporter-prometheus.workspace = true
-op-alloy-rpc-types.workspace = true
 pin-project-lite = "0.2"
 quick_cache = "0.6"
-
-# Execution
-revm.workspace = true
-salt.workspace = true
 serde.workspace = true
-
-# Serialization
 serde_json.workspace = true
-
-# Reuse stateless-core
-stateless-common = { path = "../../crates/stateless-common" }
-stateless-core = { path = "../../crates/stateless-core" }
 tokio = { workspace = true, features = ["sync"] }
 tokio-util.workspace = true
 tower = "0.4"
-
-# Logging and metrics
 tracing.workspace = true
 
 [dev-dependencies]

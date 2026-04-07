@@ -12,9 +12,25 @@ name = "stateless-validator"
 path = "src/main.rs"
 
 [dependencies]
+# alloy
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-eth.workspace = true
+
+# op
+op-alloy-rpc-types.workspace = true
+
+# revm
+revm = { workspace = true, features = ["serde"] }
+
+# mega
+salt.workspace = true
+
+# stateless
+stateless-common = { path = "../../crates/stateless-common" }
+stateless-core = { path = "../../crates/stateless-core" }
+
+# misc
 bincode.workspace = true
 clap = { workspace = true, features = ["env"] }
 eyre.workspace = true
@@ -23,13 +39,8 @@ kanal.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 num_cpus.workspace = true
-op-alloy-rpc-types.workspace = true
-revm = { workspace = true, features = ["serde"] }
-salt.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-stateless-common = { path = "../../crates/stateless-common" }
-stateless-core = { path = "../../crates/stateless-core" }
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true

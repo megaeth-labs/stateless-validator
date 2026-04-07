@@ -11,7 +11,12 @@
 //! - [`ChainStore`]: Core chain state management (shared by both binaries)
 //! - [`BlockStore`]: Block/witness storage extension (debug-trace-server only)
 
-use std::{collections::HashMap, fmt, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    path::Path,
+    sync::{Arc, atomic::AtomicU64},
+};
 
 use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
@@ -19,7 +24,7 @@ use alloy_rpc_types_eth::Block;
 use dashmap::DashMap;
 use op_alloy_rpc_types::Transaction;
 use rayon::prelude::*;
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use revm::state::Bytecode;
 use salt::SaltWitness;
 use thiserror::Error;
@@ -95,6 +100,7 @@ impl BlockMeta {
 }
 
 /// Block with all data needed for validation, flowing through the fetch→worker channel.
+#[derive(Clone, Debug)]
 pub struct ValidationTask {
     pub block: Block<Transaction>,
     pub salt_witness: SaltWitness,
@@ -191,6 +197,8 @@ pub enum SerializationError {
     BincodeDecode(#[from] bincode::error::DecodeError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error("lz4 decompression failed: {0}")]
+    Lz4(#[from] lz4_flex::block::DecompressError),
 }
 
 type Result<T, E = ValidationDbError> = std::result::Result<T, E>;
@@ -237,9 +245,8 @@ pub trait BlockStore: ChainStore {
 // Shared serialization helpers
 // ===========================================================================
 
-/// Version markers for serialization format
-const BINCODE_STANDARD_MARKER: u8 = 0x01;
-const BINCODE_LZ4_MARKER: u8 = 0x02;
+/// Marker byte prepended to lz4-compressed bincode data.
+const BINCODE_LZ4_MARKER: u8 = 0x01;
 
 /// Helper method to serialize data using bincode + lz4 compression
 /// Format: [marker byte][lz4 compressed bincode data]
@@ -257,73 +264,23 @@ fn encode_to_vec<T: serde::Serialize>(data: &T) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-/// Helper method to deserialize data using bincode
-/// Supports lz4 compressed (new), standard (old), and legacy formats for backwards compatibility
-fn decode_from_slice<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> T {
+/// Deserializes lz4-compressed bincode data written by [`encode_to_vec`].
+fn decode_from_slice<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     if bytes.is_empty() {
-        panic!("cannot deserialize empty data");
+        return Err(ValidationDbError::Database("cannot deserialize empty data".into()));
     }
-
-    match bytes[0] {
-        BINCODE_LZ4_MARKER => {
-            // New format: lz4 compressed + standard config
-            let decompressed = lz4_flex::decompress_size_prepended(&bytes[1..])
-                .expect("lz4 decompression must succeed");
-            let (decoded, _) =
-                bincode::serde::decode_from_slice(&decompressed, bincode::config::standard())
-                    .expect("deserialization of lz4+standard format data must succeed");
-            decoded
-        }
-        BINCODE_STANDARD_MARKER => {
-            // Standard format (uncompressed)
-            let (decoded, _) =
-                bincode::serde::decode_from_slice(&bytes[1..], bincode::config::standard())
-                    .expect("deserialization of standard format data must succeed");
-            decoded
-        }
-        _ => {
-            // Legacy format: legacy config (no marker)
-            let (decoded, _) = bincode::serde::decode_from_slice(bytes, bincode::config::legacy())
-                .expect("deserialization of legacy format data must succeed");
-            decoded
-        }
+    if bytes[0] != BINCODE_LZ4_MARKER {
+        return Err(ValidationDbError::Database(format!(
+            "unknown serialization marker: {:#04x}",
+            bytes[0]
+        )));
     }
-}
-
-/// Helper method to deserialize LightWitness using bincode
-/// Supports lz4 compressed format (the only format used for LightWitness storage)
-fn decode_light_witness_from_slice(bytes: &[u8]) -> LightWitness {
-    if bytes.is_empty() {
-        panic!("cannot deserialize empty data");
-    }
-
-    match bytes[0] {
-        BINCODE_LZ4_MARKER => {
-            // lz4 compressed + standard config
-            let decompressed = lz4_flex::decompress_size_prepended(&bytes[1..])
-                .expect("lz4 decompression must succeed");
-            let (decoded, _): (LightWitness, _) =
-                bincode::serde::decode_from_slice(&decompressed, bincode::config::standard())
-                    .expect(
-                        "LightWitness deserialization of lz4+standard format data must succeed",
-                    );
-            decoded
-        }
-        BINCODE_STANDARD_MARKER => {
-            // Standard format (uncompressed)
-            let (decoded, _): (LightWitness, _) =
-                bincode::serde::decode_from_slice(&bytes[1..], bincode::config::standard())
-                    .expect("LightWitness deserialization of standard format data must succeed");
-            decoded
-        }
-        _ => {
-            // Legacy format: legacy config (no marker)
-            let (decoded, _): (LightWitness, _) =
-                bincode::serde::decode_from_slice(bytes, bincode::config::legacy())
-                    .expect("LightWitness deserialization of legacy format data must succeed");
-            decoded
-        }
-    }
+    let decompressed =
+        lz4_flex::decompress_size_prepended(&bytes[1..]).map_err(SerializationError::from)?;
+    let (decoded, _) =
+        bincode::serde::decode_from_slice(&decompressed, bincode::config::standard())
+            .map_err(SerializationError::from)?;
+    Ok(decoded)
 }
 
 /// Helper method to serialize Block<Transaction> using JSON
@@ -341,15 +298,184 @@ fn decode_block_from_slice(bytes: &[u8]) -> Block<Transaction> {
 }
 
 // ===========================================================================
+// Shared database helpers (operate on raw `&Database`)
+// ===========================================================================
+
+/// Reads the canonical tip (highest block) from CANONICAL_CHAIN.
+fn db_get_canonical_tip(database: &Database) -> eyre::Result<Option<BlockMeta>> {
+    let read_txn = database.begin_read()?;
+    let chain = read_txn.open_table(CANONICAL_CHAIN)?;
+    Ok(chain.last()?.map(|(k, v)| {
+        let (hash, state_root, withdrawals_root) = v.value();
+        BlockMeta {
+            block_number: k.value(),
+            block_hash: BlockHash::from(hash),
+            post_state_root: B256::from(state_root),
+            post_withdrawals_root: B256::from(withdrawals_root),
+        }
+    }))
+}
+
+/// Reads the anchor block from ANCHOR_BLOCK.
+fn db_get_anchor(database: &Database) -> eyre::Result<Option<BlockMeta>> {
+    let read_txn = database.begin_read()?;
+    let table = read_txn.open_table(ANCHOR_BLOCK)?;
+    Ok(table.get("anchor")?.map(|v| BlockMeta::from_tuple(v.value())))
+}
+
+/// Looks up a single block hash from CANONICAL_CHAIN.
+fn db_get_block_hash(
+    database: &Database,
+    block_number: BlockNumber,
+) -> eyre::Result<Option<BlockHash>> {
+    let read_txn = database.begin_read()?;
+    let chain = read_txn.open_table(CANONICAL_CHAIN)?;
+    Ok(chain.get(block_number)?.map(|v| BlockHash::from(v.value().0)))
+}
+
+/// Returns the earliest (lowest block number) entry in CANONICAL_CHAIN.
+fn db_get_earliest_block(database: &Database) -> eyre::Result<Option<(BlockNumber, BlockHash)>> {
+    let read_txn = database.begin_read()?;
+    let chain = read_txn.open_table(CANONICAL_CHAIN)?;
+    Ok(chain.first()?.map(|(k, v)| (k.value(), BlockHash::from(v.value().0))))
+}
+
+/// Appends blocks to CANONICAL_CHAIN in a single write transaction.
+fn db_advance_chain(database: &Database, blocks: &[BlockMeta]) -> eyre::Result<()> {
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    let write_txn = database.begin_write()?;
+    {
+        let mut chain = write_txn.open_table(CANONICAL_CHAIN)?;
+        for block in blocks {
+            chain.insert(
+                block.block_number,
+                (block.block_hash.0, block.post_state_root.0, block.post_withdrawals_root.0),
+            )?;
+        }
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+/// Removes all CANONICAL_CHAIN entries above `to_block`.
+fn db_rollback_chain(database: &Database, to_block: BlockNumber) -> eyre::Result<()> {
+    let write_txn = database.begin_write()?;
+    {
+        let mut chain = write_txn.open_table(CANONICAL_CHAIN)?;
+        let to_remove: Vec<u64> = chain
+            .range((to_block + 1)..)?
+            .map(|r| r.map(|(k, _)| k.value()))
+            .collect::<std::result::Result<_, _>>()?;
+        for n in to_remove {
+            chain.remove(n)?;
+        }
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+/// Clears the canonical chain and sets anchor as the sole entry.
+fn db_reset_to_anchor(database: &Database, anchor: &BlockMeta) -> eyre::Result<()> {
+    let write_txn = database.begin_write()?;
+    {
+        let mut anchor_table = write_txn.open_table(ANCHOR_BLOCK)?;
+        anchor_table.insert("anchor", anchor.to_tuple())?;
+
+        let mut chain = write_txn.open_table(CANONICAL_CHAIN)?;
+        chain.retain(|_, _| false)?;
+        chain.insert(
+            anchor.block_number,
+            (anchor.block_hash.0, anchor.post_state_root.0, anchor.post_withdrawals_root.0),
+        )?;
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+/// Removes CANONICAL_CHAIN entries before `before_block`. Returns the count removed.
+fn db_prune_chain(database: &Database, before_block: BlockNumber) -> eyre::Result<u64> {
+    let read_txn = database.begin_read()?;
+    let chain = read_txn.open_table(CANONICAL_CHAIN)?;
+    let to_remove: Vec<u64> = chain
+        .range(..before_block)?
+        .map(|r| r.map(|(k, _)| k.value()))
+        .collect::<std::result::Result<_, _>>()?;
+    let count = to_remove.len() as u64;
+    drop(chain);
+    drop(read_txn);
+
+    if count > 0 {
+        let write_txn = database.begin_write()?;
+        {
+            let mut chain = write_txn.open_table(CANONICAL_CHAIN)?;
+            for n in &to_remove {
+                chain.remove(*n)?;
+            }
+        }
+        write_txn.commit()?;
+    }
+    Ok(count)
+}
+
+/// Retrieves cached contract bytecodes. Returns `(found, missing)`.
+fn db_get_contracts(
+    database: &Database,
+    hashes: &[B256],
+) -> eyre::Result<(HashMap<B256, Bytecode>, Vec<B256>)> {
+    let read_txn = database.begin_read()?;
+    let table = read_txn.open_table(CONTRACTS)?;
+
+    let mut found = HashMap::new();
+    let mut missing = Vec::new();
+
+    for &hash in hashes {
+        match table.get(hash.0)? {
+            Some(data) => {
+                found.insert(hash, decode_from_slice(data.value().as_slice())?);
+            }
+            None => missing.push(hash),
+        }
+    }
+
+    Ok((found, missing))
+}
+
+/// Stores contract bytecodes in the CONTRACTS table.
+fn db_add_contracts(database: &Database, codes: &[(B256, Bytecode)]) -> eyre::Result<()> {
+    if codes.is_empty() {
+        return Ok(());
+    }
+    let write_txn = database.begin_write()?;
+    {
+        let mut table = write_txn.open_table(CONTRACTS)?;
+        for (hash, bytecode) in codes {
+            let encoded = encode_to_vec(bytecode)?;
+            table.insert(hash.0, encoded)?;
+        }
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
+// ===========================================================================
 // ValidatorDB
 // ===========================================================================
+
+/// Default maximum number of entries to retain in CANONICAL_CHAIN.
+const DEFAULT_MAX_CHAIN_LENGTH: u64 = 1000;
 
 /// Minimal persistent storage backed by redb.
 ///
 /// Only stores data that must survive restarts: anchor block, canonical tip,
 /// contract bytecodes, and genesis configuration.
+///
+/// CANONICAL_CHAIN is bounded to `max_chain_length` entries; older entries are
+/// pruned inline during [`ChainStore::advance_chain`].
 pub struct ValidatorDB {
     database: Database,
+    max_chain_length: AtomicU64,
 }
 
 impl ValidatorDB {
@@ -367,16 +493,19 @@ impl ValidatorDB {
         }
         write_txn.commit()?;
 
-        Ok(Self { database })
+        Ok(Self { database, max_chain_length: AtomicU64::new(DEFAULT_MAX_CHAIN_LENGTH) })
+    }
+
+    /// Sets the maximum number of entries to retain in CANONICAL_CHAIN.
+    pub fn set_max_chain_length(&self, max: u64) {
+        self.max_chain_length.store(max, std::sync::atomic::Ordering::Relaxed);
     }
 
     // -- Anchor block --
 
     /// Returns the stored anchor block, or `None` if not set.
     pub fn get_anchor_block(&self) -> eyre::Result<Option<BlockMeta>> {
-        let read_txn = self.database.begin_read()?;
-        let table = read_txn.open_table(ANCHOR_BLOCK)?;
-        Ok(table.get("anchor")?.map(|v| BlockMeta::from_tuple(v.value())))
+        db_get_anchor(&self.database)
     }
 
     /// Stores the anchor block.
@@ -394,17 +523,7 @@ impl ValidatorDB {
 
     /// Returns the last validated canonical tip (highest block in the chain), or `None` if empty.
     pub fn get_canonical_tip(&self) -> eyre::Result<Option<BlockMeta>> {
-        let read_txn = self.database.begin_read()?;
-        let chain = read_txn.open_table(CANONICAL_CHAIN)?;
-        Ok(chain.last()?.map(|(k, v)| {
-            let (hash, state_root, withdrawals_root) = v.value();
-            BlockMeta {
-                block_number: k.value(),
-                block_hash: BlockHash::from(hash),
-                post_state_root: B256::from(state_root),
-                post_withdrawals_root: B256::from(withdrawals_root),
-            }
-        }))
+        db_get_canonical_tip(&self.database)
     }
 
     // -- Contracts --
@@ -417,39 +536,12 @@ impl ValidatorDB {
         &self,
         hashes: &[B256],
     ) -> eyre::Result<(HashMap<B256, Bytecode>, Vec<B256>)> {
-        let read_txn = self.database.begin_read()?;
-        let table = read_txn.open_table(CONTRACTS)?;
-
-        let mut found = HashMap::new();
-        let mut missing = Vec::new();
-
-        for &hash in hashes {
-            match table.get(hash.0)? {
-                Some(data) => {
-                    found.insert(hash, decode_from_slice(data.value().as_slice()));
-                }
-                None => missing.push(hash),
-            }
-        }
-
-        Ok((found, missing))
+        db_get_contracts(&self.database, hashes)
     }
 
     /// Stores contract bytecodes in the cache.
     pub fn add_contracts(&self, codes: &[(B256, Bytecode)]) -> eyre::Result<()> {
-        if codes.is_empty() {
-            return Ok(());
-        }
-        let write_txn = self.database.begin_write()?;
-        {
-            let mut table = write_txn.open_table(CONTRACTS)?;
-            for (hash, bytecode) in codes {
-                let encoded = encode_to_vec(bytecode)?;
-                table.insert(hash.0, encoded)?;
-            }
-        }
-        write_txn.commit()?;
-        Ok(())
+        db_add_contracts(&self.database, codes)
     }
 
     // -- Genesis --
@@ -484,20 +576,7 @@ impl ValidatorDB {
     /// Resets the store to a new anchor, setting the canonical tip to match the anchor.
     /// Clears the canonical chain history and writes the anchor as the sole entry.
     pub fn reset_to_anchor(&self, anchor: &BlockMeta) -> eyre::Result<()> {
-        let write_txn = self.database.begin_write()?;
-        {
-            let mut anchor_table = write_txn.open_table(ANCHOR_BLOCK)?;
-            anchor_table.insert("anchor", anchor.to_tuple())?;
-
-            let mut chain = write_txn.open_table(CANONICAL_CHAIN)?;
-            chain.retain(|_, _| false)?;
-            chain.insert(
-                anchor.block_number,
-                (anchor.block_hash.0, anchor.post_state_root.0, anchor.post_withdrawals_root.0),
-            )?;
-        }
-        write_txn.commit()?;
-        Ok(())
+        db_reset_to_anchor(&self.database, anchor)
     }
 }
 
@@ -507,11 +586,11 @@ impl ValidatorDB {
 
 impl ContractStore for ValidatorDB {
     fn get_contracts(&self, hashes: &[B256]) -> eyre::Result<(HashMap<B256, Bytecode>, Vec<B256>)> {
-        ValidatorDB::get_contracts(self, hashes)
+        db_get_contracts(&self.database, hashes)
     }
 
     fn add_contracts(&self, codes: &[(B256, Bytecode)]) -> eyre::Result<()> {
-        ValidatorDB::add_contracts(self, codes)
+        db_add_contracts(&self.database, codes)
     }
 }
 
@@ -535,17 +614,18 @@ impl GenesisStore for ValidatorDB {
 
 impl ChainStore for ValidatorDB {
     fn get_canonical_tip(&self) -> eyre::Result<Option<BlockMeta>> {
-        ValidatorDB::get_canonical_tip(self)
+        db_get_canonical_tip(&self.database)
     }
 
     fn get_anchor(&self) -> eyre::Result<Option<BlockMeta>> {
-        self.get_anchor_block()
+        db_get_anchor(&self.database)
     }
 
     fn advance_chain(&self, blocks: &[BlockMeta]) -> eyre::Result<()> {
         if blocks.is_empty() {
             return Ok(());
         }
+        let max_len = self.max_chain_length.load(std::sync::atomic::Ordering::Relaxed);
         let write_txn = self.database.begin_write()?;
         {
             let mut chain = write_txn.open_table(CANONICAL_CHAIN)?;
@@ -555,67 +635,43 @@ impl ChainStore for ValidatorDB {
                     (block.block_hash.0, block.post_state_root.0, block.post_withdrawals_root.0),
                 )?;
             }
+
+            // Inline pruning: remove oldest entries that exceed the max chain length
+            let len = chain.len()?;
+            if len > max_len {
+                let excess = len - max_len;
+                let to_remove: Vec<u64> = chain
+                    .iter()?
+                    .take(excess as usize)
+                    .map(|r| r.map(|(k, _)| k.value()))
+                    .collect::<std::result::Result<_, _>>()?;
+                for n in to_remove {
+                    chain.remove(n)?;
+                }
+            }
         }
         write_txn.commit()?;
         Ok(())
     }
 
     fn get_block_hash(&self, block_number: BlockNumber) -> eyre::Result<Option<BlockHash>> {
-        let read_txn = self.database.begin_read()?;
-        let chain = read_txn.open_table(CANONICAL_CHAIN)?;
-        Ok(chain.get(block_number)?.map(|v| BlockHash::from(v.value().0)))
+        db_get_block_hash(&self.database, block_number)
     }
 
     fn get_earliest_block(&self) -> eyre::Result<Option<(BlockNumber, BlockHash)>> {
-        let read_txn = self.database.begin_read()?;
-        let chain = read_txn.open_table(CANONICAL_CHAIN)?;
-        Ok(chain.first()?.map(|(k, v)| (k.value(), BlockHash::from(v.value().0))))
+        db_get_earliest_block(&self.database)
     }
 
     fn rollback_chain(&self, to_block: BlockNumber) -> eyre::Result<()> {
-        let write_txn = self.database.begin_write()?;
-        {
-            let mut chain = write_txn.open_table(CANONICAL_CHAIN)?;
-
-            let to_remove: Vec<u64> = chain
-                .range((to_block + 1)..)?
-                .map(|r| r.map(|(k, _)| k.value()))
-                .collect::<std::result::Result<_, _>>()?;
-
-            for n in to_remove {
-                chain.remove(n)?;
-            }
-        }
-        write_txn.commit()?;
-        Ok(())
+        db_rollback_chain(&self.database, to_block)
     }
 
     fn reset_to_anchor(&self, anchor: &BlockMeta) -> eyre::Result<()> {
-        ValidatorDB::reset_to_anchor(self, anchor)
+        db_reset_to_anchor(&self.database, anchor)
     }
 
     fn prune_chain(&self, before_block: BlockNumber) -> eyre::Result<u64> {
-        let read_txn = self.database.begin_read()?;
-        let chain = read_txn.open_table(CANONICAL_CHAIN)?;
-        let to_remove: Vec<u64> = chain
-            .range(..before_block)?
-            .map(|r| r.map(|(k, _)| k.value()))
-            .collect::<std::result::Result<_, _>>()?;
-        let count = to_remove.len() as u64;
-        drop(chain);
-        drop(read_txn);
-
-        if count > 0 {
-            let write_txn = self.database.begin_write()?;
-            {
-                let mut chain = write_txn.open_table(CANONICAL_CHAIN)?;
-                for n in &to_remove {
-                    chain.remove(*n)?;
-                }
-            }
-            write_txn.commit()?;
-        }
-        Ok(count)
+        db_prune_chain(&self.database, before_block)
     }
 }
 
@@ -707,51 +763,20 @@ impl ServerDB {
         Ok(())
     }
 
-    /// Rolls back the local canonical chain to the specified block number.
-    ///
-    /// Removes blocks from the canonical chain when a reorg occurs,
-    /// reverting to the specified block number.
-    pub fn rollback_chain(&self, to_block: BlockNumber) -> ValidationDbResult<()> {
-        let write_txn = self.database.begin_write()?;
-        {
-            let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
-
-            let canonical_blocks_to_remove = canonical_chain
-                .range((to_block + 1)..)?
-                .map(|result| result.map(|(key, _)| key.value()))
-                .collect::<Result<Vec<_>, _>>()?;
-
-            for block_number in canonical_blocks_to_remove {
-                canonical_chain.remove(block_number)?;
-            }
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
-
     /// Gets the latest block in the local chain.
     ///
     /// Returns the highest block number and hash currently considered local canonical,
     /// or None if the chain is empty.
     pub fn get_local_tip(&self) -> ValidationDbResult<Option<(BlockNumber, BlockHash)>> {
         let read_txn = self.database.begin_read()?;
-        let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
-
-        match canonical_chain.last()? {
-            Some((canonical_key, canonical_value)) => {
-                let block_number = canonical_key.value();
-                let (block_hash, _, _) = canonical_value.value();
-                Ok(Some((block_number, block_hash.into())))
-            }
-            None => Ok(None),
-        }
+        let chain = read_txn.open_table(CANONICAL_CHAIN)?;
+        Ok(chain.last()?.map(|(k, v)| {
+            let (hash, _, _) = v.value();
+            (k.value(), BlockHash::from(hash))
+        }))
     }
 
     /// Resets the chain anchor point and clears all chain state.
-    ///
-    /// This method resets the validator to start from a specific trusted block.
-    /// It clears the canonical chain, then sets the new anchor block as the sole
-    /// entry in the canonical chain.
     pub fn reset_anchor_block(
         &self,
         block_number: BlockNumber,
@@ -761,43 +786,18 @@ impl ServerDB {
     ) -> ValidationDbResult<()> {
         let write_txn = self.database.begin_write()?;
         {
-            let mut anchor_block_table = write_txn.open_table(ANCHOR_BLOCK)?;
-            let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
-
-            anchor_block_table.insert(
+            let mut anchor_table = write_txn.open_table(ANCHOR_BLOCK)?;
+            anchor_table.insert(
                 "anchor",
                 (block_number, block_hash.0, post_state_root.0, post_withdrawals_root.0),
             )?;
-            canonical_chain.retain(|_, _| false)?;
-            canonical_chain
+            let mut chain = write_txn.open_table(CANONICAL_CHAIN)?;
+            chain.retain(|_, _| false)?;
+            chain
                 .insert(block_number, (block_hash.0, post_state_root.0, post_withdrawals_root.0))?;
         }
         write_txn.commit()?;
         Ok(())
-    }
-
-    /// Retrieves multiple cached contract bytecodes.
-    ///
-    /// Returns a tuple of (found_contracts, missing_hashes).
-    pub fn get_contract_codes(
-        &self,
-        code_hashes: impl IntoIterator<Item = B256>,
-    ) -> ValidationDbResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
-        let read_txn = self.database.begin_read()?;
-        let contracts = read_txn.open_table(CONTRACTS)?;
-
-        code_hashes.into_iter().try_fold(
-            (HashMap::new(), Vec::new()),
-            |(mut found, mut missing), code_hash| {
-                match contracts.get(code_hash.0)? {
-                    Some(bytes) => {
-                        found.insert(code_hash, decode_from_slice(&bytes.value()));
-                    }
-                    None => missing.push(code_hash),
-                }
-                Ok::<_, ValidationDbError>((found, missing))
-            },
-        )
     }
 
     /// Cleans up old block data to save storage space.
@@ -856,21 +856,15 @@ impl ServerDB {
         block_number: BlockNumber,
     ) -> ValidationDbResult<Option<BlockHash>> {
         let read_txn = self.database.begin_read()?;
-        let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
-
-        Ok(canonical_chain.get(block_number)?.map(|value| value.value().0.into()))
+        let chain = read_txn.open_table(CANONICAL_CHAIN)?;
+        Ok(chain.get(block_number)?.map(|v| BlockHash::from(v.value().0)))
     }
 
     /// Retrieves the earliest block in the canonical chain.
     pub fn get_earliest_local_block(&self) -> ValidationDbResult<Option<(BlockNumber, BlockHash)>> {
         let read_txn = self.database.begin_read()?;
-        let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
-
-        Ok(canonical_chain.first()?.map(|(key, value)| {
-            let block_number = key.value();
-            let (block_hash, _, _) = value.value();
-            (block_number, block_hash.into())
-        }))
+        let chain = read_txn.open_table(CANONICAL_CHAIN)?;
+        Ok(chain.first()?.map(|(k, v)| (k.value(), BlockHash::from(v.value().0))))
     }
 
     /// Retrieves block data and witness for a specific block hash.
@@ -907,7 +901,7 @@ impl ServerDB {
         let witness_bytes_len = witness_bytes_value.len();
         let db_read_witness_ms = start.elapsed().as_millis();
 
-        let witness = decode_light_witness_from_slice(&witness_bytes_value);
+        let witness: LightWitness = decode_from_slice(&witness_bytes_value)?;
         let witness_decode_ms = start.elapsed().as_millis();
 
         tracing::debug!(
@@ -932,23 +926,11 @@ impl ServerDB {
 
 impl ContractStore for ServerDB {
     fn get_contracts(&self, hashes: &[B256]) -> eyre::Result<(HashMap<B256, Bytecode>, Vec<B256>)> {
-        Ok(ServerDB::get_contract_codes(self, hashes.iter().copied())?)
+        db_get_contracts(&self.database, hashes)
     }
 
     fn add_contracts(&self, codes: &[(B256, Bytecode)]) -> eyre::Result<()> {
-        if codes.is_empty() {
-            return Ok(());
-        }
-        let write_txn = self.database.begin_write()?;
-        {
-            let mut table = write_txn.open_table(CONTRACTS)?;
-            for (hash, bytecode) in codes {
-                let encoded = encode_to_vec(bytecode)?;
-                table.insert(hash.0, encoded)?;
-            }
-        }
-        write_txn.commit()?;
-        Ok(())
+        db_add_contracts(&self.database, codes)
     }
 }
 
@@ -958,68 +940,31 @@ impl ContractStore for ServerDB {
 
 impl ChainStore for ServerDB {
     fn get_canonical_tip(&self) -> eyre::Result<Option<BlockMeta>> {
-        let read_txn = self.database.begin_read()?;
-        let canonical_chain = read_txn.open_table(CANONICAL_CHAIN)?;
-
-        match canonical_chain.last()? {
-            Some((key, value)) => {
-                let block_number = key.value();
-                let (block_hash, state_root, withdrawals_root) = value.value();
-                Ok(Some(BlockMeta {
-                    block_number,
-                    block_hash: BlockHash::from(block_hash),
-                    post_state_root: B256::from(state_root),
-                    post_withdrawals_root: B256::from(withdrawals_root),
-                }))
-            }
-            None => Ok(None),
-        }
+        db_get_canonical_tip(&self.database)
     }
 
     fn get_anchor(&self) -> eyre::Result<Option<BlockMeta>> {
-        let read_txn = self.database.begin_read()?;
-        let table = read_txn.open_table(ANCHOR_BLOCK)?;
-        Ok(table.get("anchor")?.map(|v| BlockMeta::from_tuple(v.value())))
+        db_get_anchor(&self.database)
     }
 
     fn advance_chain(&self, blocks: &[BlockMeta]) -> eyre::Result<()> {
-        if blocks.is_empty() {
-            return Ok(());
-        }
-        let write_txn = self.database.begin_write()?;
-        {
-            let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN)?;
-            for block in blocks {
-                canonical_chain.insert(
-                    block.block_number,
-                    (block.block_hash.0, block.post_state_root.0, block.post_withdrawals_root.0),
-                )?;
-            }
-        }
-        write_txn.commit()?;
-        Ok(())
+        db_advance_chain(&self.database, blocks)
     }
 
     fn get_block_hash(&self, block_number: BlockNumber) -> eyre::Result<Option<BlockHash>> {
-        Ok(ServerDB::get_block_hash(self, block_number)?)
+        db_get_block_hash(&self.database, block_number)
     }
 
     fn get_earliest_block(&self) -> eyre::Result<Option<(BlockNumber, BlockHash)>> {
-        Ok(ServerDB::get_earliest_local_block(self)?)
+        db_get_earliest_block(&self.database)
     }
 
     fn rollback_chain(&self, to_block: BlockNumber) -> eyre::Result<()> {
-        Ok(ServerDB::rollback_chain(self, to_block)?)
+        db_rollback_chain(&self.database, to_block)
     }
 
     fn reset_to_anchor(&self, anchor: &BlockMeta) -> eyre::Result<()> {
-        Ok(ServerDB::reset_anchor_block(
-            self,
-            anchor.block_number,
-            anchor.block_hash,
-            anchor.post_state_root,
-            anchor.post_withdrawals_root,
-        )?)
+        db_reset_to_anchor(&self.database, anchor)
     }
 
     fn prune_chain(&self, before_block: BlockNumber) -> eyre::Result<u64> {
@@ -1360,6 +1305,38 @@ mod tests {
     }
 
     #[test]
+    fn test_advance_chain_inline_pruning() {
+        let (_dir, store) = temp_store();
+        store.set_max_chain_length(5);
+
+        // Insert 5 blocks — no pruning yet
+        let blocks: Vec<BlockMeta> = (1..=5).map(make_block_meta).collect();
+        ChainStore::advance_chain(&store, &blocks).unwrap();
+        assert!(ChainStore::get_block_hash(&store, 1).unwrap().is_some());
+
+        // Insert 3 more — should prune oldest to keep 5
+        let blocks: Vec<BlockMeta> = (6..=8).map(make_block_meta).collect();
+        ChainStore::advance_chain(&store, &blocks).unwrap();
+
+        // Blocks 1-3 should be pruned, 4-8 should remain
+        for n in 1..=3 {
+            assert!(
+                ChainStore::get_block_hash(&store, n).unwrap().is_none(),
+                "block {n} should be pruned"
+            );
+        }
+        for n in 4..=8 {
+            assert!(
+                ChainStore::get_block_hash(&store, n).unwrap().is_some(),
+                "block {n} should exist"
+            );
+        }
+
+        let tip = store.get_canonical_tip().unwrap().unwrap();
+        assert_eq!(tip.block_number, 8);
+    }
+
+    #[test]
     fn test_advance_chain_empty_is_noop() {
         let (_dir, store) = temp_store();
 
@@ -1442,13 +1419,7 @@ mod tests {
         ChainStore::advance_chain(&db, &blocks).unwrap();
 
         let anchor = make_block_meta(100);
-        db.reset_anchor_block(
-            anchor.block_number,
-            anchor.block_hash,
-            anchor.post_state_root,
-            anchor.post_withdrawals_root,
-        )
-        .unwrap();
+        ChainStore::reset_to_anchor(&db, &anchor).unwrap();
 
         // Old blocks gone
         assert!(db.get_block_hash(1).unwrap().is_none());
@@ -1470,7 +1441,7 @@ mod tests {
         // Add via ContractStore trait
         ContractStore::add_contracts(&db, &[(hash1, bytecode.clone())]).unwrap();
 
-        let (found, missing) = db.get_contract_codes([hash1, hash2]).unwrap();
+        let (found, missing) = ContractStore::get_contracts(&db, &[hash1, hash2]).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(missing, vec![hash2]);
         assert_eq!(found[&hash1].bytes_slice(), bytecode.bytes_slice());
@@ -1545,7 +1516,7 @@ mod tests {
         // Verify marker byte
         assert_eq!(encoded[0], BINCODE_LZ4_MARKER);
 
-        let decoded: Bytecode = decode_from_slice(&encoded);
+        let decoded: Bytecode = decode_from_slice(&encoded).unwrap();
         assert_eq!(decoded.bytes_slice(), bytecode.bytes_slice());
     }
 

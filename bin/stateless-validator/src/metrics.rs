@@ -3,7 +3,10 @@
 //! Exposes metrics at `http://0.0.0.0:<port>/metrics` for Prometheus scraping.
 //! Enable via `--metrics-enabled --metrics-port 9090`.
 
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use eyre::Result;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
@@ -60,6 +63,10 @@ pub mod names {
 
     // Chain
     metric!(LOCAL_CHAIN_HEIGHT, "local_chain_height");
+    metric!(REMOTE_CHAIN_HEIGHT, "remote_chain_height");
+    metric!(VALIDATION_LAG, "validation_lag");
+    metric!(REORGS_DETECTED, "reorgs_detected_total");
+    metric!(REORG_DEPTH, "reorg_depth");
 
     // RPC
     metric!(RPC_REQUESTS_TOTAL, "rpc_requests_total");
@@ -110,6 +117,10 @@ fn register_metric_descriptions() {
 
     // Chain
     describe_gauge!(names::LOCAL_CHAIN_HEIGHT, "Local chain height");
+    describe_gauge!(names::REMOTE_CHAIN_HEIGHT, "Remote chain height");
+    describe_gauge!(names::VALIDATION_LAG, "Blocks pending validation (remote - local)");
+    describe_counter!(names::REORGS_DETECTED, "Chain reorgs detected");
+    describe_histogram!(names::REORG_DEPTH, "Reorg depth");
 
     // RPC
     describe_counter!(names::RPC_REQUESTS_TOTAL, "RPC requests made");
@@ -180,9 +191,32 @@ pub fn on_worker_task_done(worker_id: usize, success: bool) {
 }
 
 // Chain metrics
-#[allow(dead_code)]
+
+/// Tracks the latest known local and remote heights for lag computation.
+static LOCAL_HEIGHT: AtomicU64 = AtomicU64::new(0);
+static REMOTE_HEIGHT: AtomicU64 = AtomicU64::new(0);
+
+fn update_lag() {
+    let local = LOCAL_HEIGHT.load(Ordering::Relaxed);
+    let remote = REMOTE_HEIGHT.load(Ordering::Relaxed);
+    gauge!(names::VALIDATION_LAG).set(remote.saturating_sub(local) as f64);
+}
+
 pub fn set_chain_height(local: u64) {
     gauge!(names::LOCAL_CHAIN_HEIGHT).set(local as f64);
+    LOCAL_HEIGHT.store(local, Ordering::Relaxed);
+    update_lag();
+}
+
+pub fn set_remote_chain_height(remote: u64) {
+    gauge!(names::REMOTE_CHAIN_HEIGHT).set(remote as f64);
+    REMOTE_HEIGHT.store(remote, Ordering::Relaxed);
+    update_lag();
+}
+
+pub fn on_reorg(depth: u64) {
+    counter!(names::REORGS_DETECTED).increment(1);
+    histogram!(names::REORG_DEPTH).record(depth as f64);
 }
 
 // RPC metrics

@@ -259,10 +259,9 @@ async fn main() -> Result<()> {
     )?);
     let validator_db = init_validator_db(&args, &rpc_client).await?;
 
-    let db_reader: Option<Arc<dyn BlockStore>> =
-        validator_db.clone().map(|db| db as Arc<dyn BlockStore>);
+    let block_store: Option<Arc<dyn BlockStore>> = validator_db.map(|db| db as Arc<dyn BlockStore>);
     let data_provider =
-        Arc::new(DataProvider::new(rpc_client.clone(), db_reader, args.witness_timeout));
+        Arc::new(DataProvider::new(rpc_client.clone(), block_store.clone(), args.witness_timeout));
 
     let chain_spec = load_chain_spec(&args)?;
 
@@ -283,7 +282,7 @@ async fn main() -> Result<()> {
     };
 
     // Spawn background chain sync pipeline (if database is configured)
-    if let Some(db) = &validator_db {
+    if let Some(db) = &block_store {
         let config = Arc::new(ChainSyncConfig::default());
         let shutdown = CancellationToken::new();
 
@@ -293,10 +292,9 @@ async fn main() -> Result<()> {
         let (event_tx, event_rx) = kanal::bounded(config.fetch_channel_capacity);
 
         // Spawn chain monitor (manages fetcher lifecycle + reorg detection)
-        let db_store: Arc<dyn ChainStore> = Arc::clone(db) as Arc<dyn ChainStore>;
         task::spawn(chain_monitor(
             Arc::clone(&rpc_client),
-            db_store,
+            Arc::clone(db) as Arc<dyn ChainStore>,
             event_tx,
             Arc::clone(&config),
             shutdown.clone(),
@@ -305,9 +303,8 @@ async fn main() -> Result<()> {
         // Spawn chain advancer (DB writes, reorg callback)
         let cache_for_reorg = response_cache.clone();
         let chain_sync_metrics = metrics::ChainSyncMetrics::create();
-        let db_block_store: Arc<dyn BlockStore> = Arc::clone(db) as Arc<dyn BlockStore>;
         task::spawn(trace_chain_advancer(
-            db_block_store,
+            Arc::clone(db),
             event_rx,
             Some(move |reverted_hashes: &[B256]| {
                 if !reverted_hashes.is_empty() {
@@ -333,9 +330,8 @@ async fn main() -> Result<()> {
         let db_path =
             PathBuf::from(args.data_dir.as_deref().unwrap()).join(TRACE_SERVER_DB_FILENAME);
         let pruner_metrics = metrics::ChainSyncMetrics::create();
-        let db_pruner: Arc<dyn BlockStore> = Arc::clone(db) as Arc<dyn BlockStore>;
         task::spawn(history_pruner(
-            db_pruner,
+            Arc::clone(db),
             args.blocks_to_keep,
             args.pruner_interval_secs,
             args.db_max_size,
