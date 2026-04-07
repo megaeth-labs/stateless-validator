@@ -224,8 +224,17 @@ pub async fn chain_monitor(
                     tip_number,
                     chain_latest, "[Monitor] Local data is too stale, resetting anchor"
                 );
+                let header = match client.get_header(BlockId::latest(), false).await {
+                    Ok(header) => header,
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "[Monitor] Failed to fetch latest header for anchor reset, retrying"
+                        );
+                        continue;
+                    }
+                };
                 fetcher_shutdown.cancel();
-                let header = client.get_header(BlockId::latest(), false).await?;
                 advancer_tx
                     .send(ChainSyncEvent::ResetAnchor {
                         block_number: header.number,
@@ -249,13 +258,25 @@ pub async fn chain_monitor(
                         "[Monitor] Hash mismatch, resolving reorg"
                     );
                     fetcher_shutdown.cancel();
-                    let rollback_to = find_divergence_point(
+                    let rollback_to = match find_divergence_point(
                         &client,
                         &|n| db.get_block_hash(n),
                         &|| db.get_earliest_block(),
                         tip_number,
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(rollback_to) => rollback_to,
+                        Err(e) => {
+                            warn!(
+                                block_number = tip_number,
+                                error = %e,
+                                "[Monitor] Failed to resolve reorg, restarting fetcher"
+                            );
+                            restart = true;
+                            break;
+                        }
+                    };
 
                     let mut reverted_hashes = Vec::new();
                     for n in (rollback_to + 1)..=tip_number {

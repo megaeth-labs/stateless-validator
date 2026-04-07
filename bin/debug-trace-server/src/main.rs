@@ -292,52 +292,74 @@ async fn main() -> Result<()> {
         let (event_tx, event_rx) = kanal::bounded(config.fetch_channel_capacity);
 
         // Spawn chain monitor (manages fetcher lifecycle + reorg detection)
-        task::spawn(chain_monitor(
-            Arc::clone(&rpc_client),
-            Arc::clone(db) as Arc<dyn ChainStore>,
-            event_tx,
-            Arc::clone(&config),
-            shutdown.clone(),
-        ));
+        task::spawn({
+            let rpc_client = Arc::clone(&rpc_client);
+            let db = Arc::clone(db) as Arc<dyn ChainStore>;
+            let config = Arc::clone(&config);
+            let shutdown = shutdown.clone();
+            async move {
+                if let Err(e) = chain_monitor(rpc_client, db, event_tx, config, shutdown).await {
+                    error!(error = %e, "Chain monitor exited with error");
+                }
+            }
+        });
 
         // Spawn chain advancer (DB writes, reorg callback)
         let cache_for_reorg = response_cache.clone();
         let chain_sync_metrics = metrics::ChainSyncMetrics::create();
-        task::spawn(trace_chain_advancer(
-            Arc::clone(db),
-            event_rx,
-            Some(move |reverted_hashes: &[B256]| {
-                if !reverted_hashes.is_empty() {
-                    chain_sync_metrics.record_reorg(reverted_hashes.len() as u64);
-                    if let Some(cache) = &cache_for_reorg {
-                        tracing::info!(
-                            count = reverted_hashes.len(),
-                            "Invalidating response cache for reorged blocks"
-                        );
-                        cache.invalidate_blocks(reverted_hashes);
-                    } else {
-                        tracing::debug!(
-                            count = reverted_hashes.len(),
-                            "Reorg detected (response cache disabled)"
-                        );
-                    }
+        task::spawn({
+            let db = Arc::clone(db);
+            async move {
+                if let Err(e) = trace_chain_advancer(
+                    db,
+                    event_rx,
+                    Some(move |reverted_hashes: &[B256]| {
+                        if !reverted_hashes.is_empty() {
+                            chain_sync_metrics.record_reorg(reverted_hashes.len() as u64);
+                            if let Some(cache) = &cache_for_reorg {
+                                tracing::info!(
+                                    count = reverted_hashes.len(),
+                                    "Invalidating response cache for reorged blocks"
+                                );
+                                cache.invalidate_blocks(reverted_hashes);
+                            } else {
+                                tracing::debug!(
+                                    count = reverted_hashes.len(),
+                                    "Reorg detected (response cache disabled)"
+                                );
+                            }
+                        }
+                    }),
+                    shutdown,
+                )
+                .await
+                {
+                    error!(error = %e, "Chain advancer exited with error");
                 }
-            }),
-            shutdown,
-        ));
+            }
+        });
 
         // Spawn history pruner to prevent unbounded database growth
         let db_path =
             PathBuf::from(args.data_dir.as_deref().unwrap()).join(TRACE_SERVER_DB_FILENAME);
         let pruner_metrics = metrics::ChainSyncMetrics::create();
-        task::spawn(history_pruner(
-            Arc::clone(db),
-            args.blocks_to_keep,
-            args.pruner_interval_secs,
-            args.db_max_size,
-            db_path,
-            pruner_metrics,
-        ));
+        task::spawn({
+            let db = Arc::clone(db);
+            async move {
+                if let Err(e) = history_pruner(
+                    db,
+                    args.blocks_to_keep,
+                    args.pruner_interval_secs,
+                    args.db_max_size,
+                    db_path,
+                    pruner_metrics,
+                )
+                .await
+                {
+                    error!(error = %e, "History pruner exited with error");
+                }
+            }
+        });
     }
 
     // Create RPC context and module

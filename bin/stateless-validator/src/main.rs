@@ -16,8 +16,8 @@ use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
 use salt::SaltWitness;
 use stateless_common::logging::{LogArgs, migrate_legacy_env_vars};
 use stateless_core::{
-    ChainStore, ChainSyncConfig, ContractCache, ContractStore, RpcClient, RpcClientConfig,
-    ValidatorDB,
+    ChainStore, ChainSyncConfig, ContractCache, ContractStore, ReorgEvent, RpcClient,
+    RpcClientConfig, ValidatorDB,
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
     db::{BlockMeta, ValidatedBlock, ValidationFailure, ValidationTask},
@@ -31,6 +31,11 @@ mod metrics;
 
 /// Handles to all spawned background tasks, awaited during shutdown.
 type BackgroundTasks = Vec<JoinHandle<Result<()>>>;
+
+enum RunLoopAction {
+    Restart(ReorgEvent),
+    Shutdown,
+}
 
 /// Database filename for the validator.
 const VALIDATOR_DB_FILENAME: &str = "validator.redb";
@@ -247,7 +252,7 @@ async fn run_with_reorg_restart(
             shutdown.clone(),
         );
 
-        let restarting = tokio::select! {
+        let action = tokio::select! {
             res = validator_logic => {
                 if let Err(ref e) = res {
                     error!(error = %e, "[Main] Validator exited with error");
@@ -256,30 +261,40 @@ async fn run_with_reorg_restart(
                 await_bg_tasks(bg_tasks).await;
                 return res;
             }
-            Ok(reorg) = reorg_monitor => {
-                warn!(
-                    rollback_to = reorg.rollback_to,
-                    depth = reorg.depth,
-                    "[Main] Reorg detected, restarting pipeline"
-                );
-                metrics::on_reorg(reorg.depth);
-                true
+            res = reorg_monitor => {
+                match res {
+                    Ok(reorg) => RunLoopAction::Restart(reorg),
+                    Err(e) => {
+                        error!(error = %e, "[Main] Reorg monitor exited with error");
+                        shutdown.cancel();
+                        await_bg_tasks(bg_tasks).await;
+                        return Err(e);
+                    }
+                }
             }
             _ = signal::ctrl_c() => {
                 info!("[Main] SIGINT received, shutting down.");
-                false
+                RunLoopAction::Shutdown
             }
             _ = sigterm.recv() => {
                 info!("[Main] SIGTERM received, shutting down.");
-                false
+                RunLoopAction::Shutdown
             }
         };
 
         shutdown.cancel();
         await_bg_tasks(bg_tasks).await;
 
-        if !restarting {
-            return Ok(());
+        match action {
+            RunLoopAction::Restart(reorg) => {
+                warn!(
+                    rollback_to = reorg.rollback_to,
+                    depth = reorg.depth,
+                    "[Main] Reorg detected, restarting pipeline"
+                );
+                metrics::on_reorg(reorg.depth);
+            }
+            RunLoopAction::Shutdown => return Ok(()),
         }
 
         info!("[Main] Restarting pipeline...");
