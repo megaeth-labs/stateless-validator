@@ -5934,6 +5934,7 @@ dependencies = [
  "dyn-clone",
  "eyre",
  "futures",
+ "jsonrpsee 0.26.0",
  "kanal",
  "lz4_flex",
  "mega-evm",

@@ -308,7 +308,10 @@ pub async fn chain_monitor(
         }
 
         // Brief pause before restarting to let advancer process events
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            _ = shutdown.cancelled() => return Ok(()),
+        }
     }
 }
 
@@ -783,7 +786,7 @@ where
             if let Some(ref callback) = on_advance {
                 callback(current_tip.block_number);
             }
-            info!(
+            debug!(
                 tip = current_tip.block_number,
                 advanced = advanced,
                 buffered = buffer.len(),
@@ -1322,5 +1325,214 @@ mod tests {
         assert_eq!(config.fetch_channel_capacity, 2 * cpus);
         assert_eq!(config.result_channel_capacity, 2 * cpus);
         assert_eq!(config.fetcher_batch_size, cpus);
+    }
+
+    // -----------------------------------------------------------------------
+    // chain_advancer callback test
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_chain_advancer_invokes_callback() {
+        let initial_tip = make_initial_tip(10);
+        let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
+        let shutdown = CancellationToken::new();
+
+        let (tx, rx) = kanal::bounded(16);
+
+        let callback_values = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let cb = {
+            let values = Arc::clone(&callback_values);
+            move |block_number: u64| {
+                values.lock().unwrap().push(block_number);
+            }
+        };
+
+        let store_clone = Arc::clone(&store);
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(chain_advancer(
+            rx,
+            store_clone,
+            initial_tip.clone(),
+            shutdown_clone,
+            Some(cb),
+        ));
+
+        let block11 = make_validated_block(
+            11,
+            initial_tip.post_state_root,
+            initial_tip.post_withdrawals_root,
+        );
+        let block12 =
+            make_validated_block(12, block11.post_state_root, block11.post_withdrawals_root);
+
+        tx.send(Ok(block11)).unwrap();
+        tx.send(Ok(block12)).unwrap();
+        drop(tx);
+
+        handle.await.unwrap().unwrap();
+
+        let values = callback_values.lock().unwrap();
+        // Callback should have been invoked with the tip block numbers after each advance
+        assert!(values.contains(&11) || values.contains(&12));
+        // The last call should be for block 12
+        assert_eq!(*values.last().unwrap(), 12);
+    }
+
+    // -----------------------------------------------------------------------
+    // find_divergence_point tests
+    // -----------------------------------------------------------------------
+
+    /// Starts a minimal mock RPC server that responds to `eth_getHeaderByNumber`
+    /// with headers whose hash is derived from `remote_hashes`.
+    async fn start_mock_rpc(
+        remote_hashes: HashMap<u64, BlockHash>,
+    ) -> (jsonrpsee::server::ServerHandle, String) {
+        use jsonrpsee::{RpcModule, server::ServerBuilder};
+
+        let mut module = RpcModule::new(remote_hashes);
+        module
+            .register_method("eth_getHeaderByNumber", |params, ctx, _| {
+                let (hex_number,): (String,) = params.parse().unwrap();
+                let block_number =
+                    u64::from_str_radix(hex_number.strip_prefix("0x").unwrap_or(&hex_number), 16)
+                        .unwrap();
+                let hash = ctx.get(&block_number).copied().unwrap_or_default();
+                Ok::<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+                    "hash": hash,
+                    "number": format!("0x{block_number:x}"),
+                    "parentHash": B256::ZERO,
+                    "timestamp": "0x0",
+                    "stateRoot": B256::ZERO,
+                    "transactionsRoot": B256::ZERO,
+                    "receiptsRoot": B256::ZERO,
+                    "logsBloom": alloy_primitives::Bloom::ZERO,
+                    "gasUsed": "0x0",
+                    "gasLimit": "0x0",
+                    "mixHash": B256::ZERO,
+                    "nonce": "0x0000000000000000",
+                    "extraData": "0x",
+                    "difficulty": "0x0",
+                    "sha3Uncles": B256::ZERO,
+                    "miner": alloy_primitives::Address::ZERO,
+                    "baseFeePerGas": "0x0"
+                }))
+            })
+            .unwrap();
+
+        let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        let handle = server.start(module);
+        (handle, url)
+    }
+
+    /// Helper to create local and remote hash maps for divergence tests.
+    /// Blocks `earliest..=diverge_at` have matching hashes, blocks
+    /// `(diverge_at+1)..=tip` differ.
+    fn make_divergence_chains(
+        earliest: u64,
+        tip: u64,
+        diverge_at: u64,
+    ) -> (HashMap<u64, BlockHash>, HashMap<u64, BlockHash>) {
+        let mut local = HashMap::new();
+        let mut remote = HashMap::new();
+        for n in earliest..=tip {
+            if n <= diverge_at {
+                // Matching hashes
+                let hash = BlockHash::from([n as u8; 32]);
+                local.insert(n, hash);
+                remote.insert(n, hash);
+            } else {
+                // Divergent hashes
+                local.insert(n, BlockHash::from([n as u8; 32]));
+                remote.insert(n, BlockHash::from([(n + 128) as u8; 32]));
+            }
+        }
+        (local, remote)
+    }
+
+    #[tokio::test]
+    async fn test_find_divergence_single_block_reorg() {
+        // Blocks 1..=10 match, block 10 is tip but remote disagrees on block 10
+        let (local, remote) = make_divergence_chains(1, 10, 9);
+        let (handle, url) = start_mock_rpc(remote).await;
+        let client = crate::RpcClient::new(&url, &url).unwrap();
+
+        let result = find_divergence_point(
+            &client,
+            &|n| Ok(local.get(&n).copied()),
+            &|| Ok(Some((1, *local.get(&1).unwrap()))),
+            10, // mismatch at tip
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, 9);
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_find_divergence_multi_block_reorg() {
+        // Blocks 1..=10, divergence at block 5 (blocks 6-10 differ)
+        let (local, remote) = make_divergence_chains(1, 10, 5);
+        let (handle, url) = start_mock_rpc(remote).await;
+        let client = crate::RpcClient::new(&url, &url).unwrap();
+
+        let result = find_divergence_point(
+            &client,
+            &|n| Ok(local.get(&n).copied()),
+            &|| Ok(Some((1, *local.get(&1).unwrap()))),
+            10,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, 5);
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_find_divergence_to_earliest() {
+        // Blocks 5..=10, divergence right at earliest (block 5 matches, 6+ differ)
+        let (local, remote) = make_divergence_chains(5, 10, 5);
+        let (handle, url) = start_mock_rpc(remote).await;
+        let client = crate::RpcClient::new(&url, &url).unwrap();
+
+        let result = find_divergence_point(
+            &client,
+            &|n| Ok(local.get(&n).copied()),
+            &|| Ok(Some((5, *local.get(&5).unwrap()))),
+            10,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, 5);
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_find_divergence_catastrophic_reorg() {
+        // Even the earliest block differs — should return error
+        let mut local = HashMap::new();
+        let mut remote = HashMap::new();
+        for n in 1..=5 {
+            local.insert(n, BlockHash::from([n as u8; 32]));
+            remote.insert(n, BlockHash::from([(n + 128) as u8; 32]));
+        }
+
+        let (handle, url) = start_mock_rpc(remote).await;
+        let client = crate::RpcClient::new(&url, &url).unwrap();
+
+        let result = find_divergence_point(
+            &client,
+            &|n| Ok(local.get(&n).copied()),
+            &|| Ok(Some((1, *local.get(&1).unwrap()))),
+            5,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Catastrophic reorg"));
+        handle.stop().unwrap();
     }
 }

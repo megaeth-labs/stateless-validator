@@ -65,6 +65,7 @@ tracing.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
+jsonrpsee = { version = "0.26", features = ["server"] }
 tempfile = "3"
 
 [features]

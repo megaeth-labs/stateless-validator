@@ -1527,4 +1527,87 @@ mod tests {
         let roundtripped = BlockMeta::from_tuple(tuple);
         assert_eq!(meta, roundtripped);
     }
+
+    // -----------------------------------------------------------------------
+    // decode_from_slice error path tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_from_slice_empty_data() {
+        let result = decode_from_slice::<Bytecode>(&[]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty data"));
+    }
+
+    #[test]
+    fn test_decode_from_slice_wrong_marker() {
+        let result = decode_from_slice::<Bytecode>(&[0xFF, 0x00]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unknown serialization marker"));
+    }
+
+    #[test]
+    fn test_decode_from_slice_corrupted_lz4() {
+        // Correct marker byte but garbage lz4 payload
+        let result = decode_from_slice::<Bytecode>(&[BINCODE_LZ4_MARKER, 0xFF, 0xFF, 0xFF]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("lz4"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ServerDB BlockStore roundtrip tests
+    // -----------------------------------------------------------------------
+
+    fn make_test_block(
+        number: u64,
+        hash: B256,
+    ) -> alloy_rpc_types_eth::Block<op_alloy_rpc_types::Transaction> {
+        let mut header = alloy_rpc_types_eth::Header::<alloy_consensus::Header>::default();
+        header.inner.number = number;
+        header.hash = hash;
+        header.inner.withdrawals_root = Some(B256::ZERO);
+        alloy_rpc_types_eth::Block { header, ..Default::default() }
+    }
+
+    fn empty_light_witness() -> crate::LightWitness {
+        crate::LightWitness {
+            kvs: std::collections::BTreeMap::new(),
+            levels: rustc_hash::FxHashMap::default(),
+        }
+    }
+
+    #[test]
+    fn test_server_db_store_and_get_block_and_witness() {
+        let (_dir, db) = temp_server_db();
+
+        let block_hash = B256::from([42u8; 32]);
+        let block = make_test_block(10, block_hash);
+        let witness = empty_light_witness();
+
+        // Store block + witness
+        db.store_block_data(&[(block.clone(), witness)]).unwrap();
+
+        // Retrieve and verify
+        let (retrieved_block, _retrieved_witness) =
+            db.get_block_and_witness(BlockHash::from(block_hash)).unwrap();
+        assert_eq!(retrieved_block.header.number, 10);
+        assert_eq!(retrieved_block.header.hash, block_hash);
+    }
+
+    #[test]
+    fn test_server_db_get_block_and_witness_missing() {
+        let (_dir, db) = temp_server_db();
+
+        let missing_hash = BlockHash::from([0xFFu8; 32]);
+        let result = db.get_block_and_witness(missing_hash);
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        match err {
+            ValidationDbError::MissingData { kind: MissingDataKind::BlockData, block_hash } => {
+                assert_eq!(block_hash, missing_hash);
+            }
+            other => panic!("expected MissingData error, got: {other}"),
+        }
+    }
 }

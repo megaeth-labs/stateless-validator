@@ -167,7 +167,7 @@ async fn main() -> Result<()> {
             match client.get_header(BlockId::Hash(block_hash.into()), true).await {
                 Ok(header) => break header,
                 Err(e) => {
-                    warn!("[Main] Failed to fetch block {block_hash}: {e}, retrying...",);
+                    warn!(block_hash = %block_hash, error = %e, "[Main] Failed to fetch block, retrying");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
@@ -343,8 +343,9 @@ fn chain_sync(
 
     let start_block = initial_tip.block_number + 1;
     info!(
-        "[Pipeline] Starting from block {start_block} with {} workers",
-        config.concurrent_workers
+        start_block,
+        workers = config.concurrent_workers,
+        "[Pipeline] Starting validation pipeline"
     );
 
     // Create kanal channels
@@ -439,7 +440,7 @@ async fn validation_worker(
     result_tx: kanal::Sender<std::result::Result<ValidatedBlock, ValidationFailure>>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    info!("[Worker {worker_id}] Started");
+    info!(worker_id, "[Worker] Started");
     let fetch_rx = fetch_rx.to_async();
     let result_tx = result_tx.to_async();
 
@@ -449,12 +450,12 @@ async fn validation_worker(
             r = fetch_rx.recv() => match r {
                 Ok(task) => task,
                 Err(_) => {
-                    info!("[Worker {worker_id}] Fetch channel closed, stopping");
+                    info!(worker_id, "[Worker] Fetch channel closed, stopping");
                     break;
                 }
             },
             _ = shutdown.cancelled() => {
-                info!("[Worker {worker_id}] Shutting down gracefully");
+                info!(worker_id, "[Worker] Shutting down gracefully");
                 break;
             }
         };
@@ -463,8 +464,7 @@ async fn validation_worker(
         let block_hash = task.block.header.hash;
         let tx_count = task.block.transactions.len() as u64;
         let gas_used = task.block.header.gas_used;
-        debug!("[Worker {worker_id}] Validating block {block_number}");
-
+        debug!(worker_id, block_number, "[Worker] Validating block");
         let start = Instant::now();
 
         // Resolve contract codes
@@ -526,7 +526,7 @@ async fn validation_worker(
 
         let result = match &validation_result {
             Ok(stats) => {
-                info!("[Worker {worker_id}] Successfully validated block {block_number}");
+                info!(worker_id, block_number, "[Worker] Successfully validated block");
                 metrics::on_validation_success(
                     start.elapsed().as_secs_f64(),
                     stats.witness_verification_time,
@@ -548,14 +548,14 @@ async fn validation_worker(
                 })
             }
             Err(e) => {
-                error!("[Worker {worker_id}] Failed to validate block {block_number}: {e}");
+                error!(worker_id, block_number, error = %e, "[Worker] Failed to validate block");
                 metrics::on_worker_task_done(worker_id, false);
                 Err(ValidationFailure { block_number, block_hash, error: e.to_string() })
             }
         };
 
         if result_tx.send(result).await.is_err() {
-            info!("[Worker {worker_id}] Result channel closed, stopping");
+            info!(worker_id, "[Worker] Result channel closed, stopping");
             break;
         }
     }
@@ -630,7 +630,7 @@ async fn validation_reporter(
                 );
             }
             Err(e) => {
-                error!("[Reporter] Failed to report blocks: {e}");
+                error!(error = %e, "[Reporter] Failed to report blocks");
             }
         }
     }
