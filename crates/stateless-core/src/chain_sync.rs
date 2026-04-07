@@ -1535,4 +1535,202 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("Catastrophic reorg"));
         handle.stop().unwrap();
     }
+
+    // -----------------------------------------------------------------------
+    // block_fetcher tests
+    // -----------------------------------------------------------------------
+
+    /// Starts a mock RPC that serves `eth_blockNumber` (with configurable latest).
+    async fn start_block_number_rpc(latest: u64) -> (jsonrpsee::server::ServerHandle, String) {
+        use jsonrpsee::{RpcModule, server::ServerBuilder};
+
+        let mut module = RpcModule::new(latest);
+        module
+            .register_method("eth_blockNumber", |_params, ctx, _| {
+                Ok::<String, jsonrpsee::types::ErrorObjectOwned>(format!("0x{:x}", *ctx))
+            })
+            .unwrap();
+
+        let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        let handle = server.start(module);
+        (handle, url)
+    }
+
+    #[tokio::test]
+    async fn test_block_fetcher_sync_target_already_reached() {
+        // sync_target=5, start_block=6 → fetcher should exit immediately
+        let (handle, url) = start_block_number_rpc(100).await;
+        let client = Arc::new(crate::RpcClient::new(&url, &url).unwrap());
+
+        let (tx, _rx) = kanal::bounded::<u64>(16);
+        let config =
+            Arc::new(ChainSyncConfig { sync_target: Some(5), ..ChainSyncConfig::default() });
+        let shutdown = CancellationToken::new();
+
+        let result = block_fetcher(
+            client,
+            tx,
+            6, // already past target
+            config,
+            shutdown,
+            |_block, _salt, _mpt| unreachable!("should not fetch any blocks"),
+            None::<fn(u64)>,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_block_fetcher_shutdown_immediate() {
+        let (handle, url) = start_block_number_rpc(100).await;
+        let client = Arc::new(crate::RpcClient::new(&url, &url).unwrap());
+
+        let (tx, _rx) = kanal::bounded::<u64>(16);
+        let config = Arc::new(ChainSyncConfig::default());
+        let shutdown = CancellationToken::new();
+
+        // Cancel before starting
+        shutdown.cancel();
+
+        let result = block_fetcher(
+            client,
+            tx,
+            1,
+            config,
+            shutdown,
+            |_block, _salt, _mpt| unreachable!("should not fetch any blocks"),
+            None::<fn(u64)>,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_block_fetcher_invokes_on_remote_height() {
+        // Remote reports latest=42, start_block=100 (ahead of chain) so fetcher
+        // enters the "wait for new blocks" path. We cancel shutdown after it has
+        // called eth_blockNumber and invoked the callback.
+        let (handle, url) = start_block_number_rpc(42).await;
+        let client = Arc::new(crate::RpcClient::new(&url, &url).unwrap());
+
+        let (tx, _rx) = kanal::bounded::<u64>(16);
+        let config = Arc::new(ChainSyncConfig {
+            tracker_poll_interval: Duration::from_secs(60), // long sleep so shutdown fires first
+            ..ChainSyncConfig::default()
+        });
+        let shutdown = CancellationToken::new();
+
+        let remote_height = Arc::new(Mutex::new(0u64));
+        let cb = {
+            let h = Arc::clone(&remote_height);
+            move |n: u64| {
+                *h.lock().unwrap() = n;
+            }
+        };
+
+        // Cancel after a short delay to let the fetcher call eth_blockNumber
+        let shutdown_clone = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            shutdown_clone.cancel();
+        });
+
+        let result = block_fetcher(
+            client,
+            tx,
+            100, // ahead of chain_latest(42) → enters wait loop → shutdown fires
+            config,
+            shutdown,
+            |_block, _salt, _mpt| unreachable!(),
+            Some(cb),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(*remote_height.lock().unwrap(), 42);
+        handle.stop().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // validator_reorg_monitor tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_validator_reorg_monitor_detects_reorg() {
+        // Local chain: blocks 1..=10, all with hash [n; 32]
+        let anchor = make_initial_tip(1);
+        let store = Arc::new(MockChainStore::with_anchor(anchor));
+        let blocks: Vec<BlockMeta> = (2..=10)
+            .map(|n| BlockMeta {
+                block_number: n,
+                block_hash: BlockHash::from([n as u8; 32]),
+                post_state_root: B256::from([(n + 100) as u8; 32]),
+                post_withdrawals_root: B256::from([(n + 200) as u8; 32]),
+            })
+            .collect();
+        store.advance_chain(&blocks).unwrap();
+
+        // Remote: blocks 1..=8 match, 9 and 10 diverge
+        let mut remote = HashMap::new();
+        for n in 1..=8 {
+            remote.insert(n, B256::from([n as u8; 32]));
+        }
+        remote.insert(9, B256::from([0xA9u8; 32]));
+        remote.insert(10, B256::from([0xAAu8; 32]));
+
+        let (handle, url) = start_mock_rpc(remote).await;
+        let client = Arc::new(crate::RpcClient::new(&url, &url).unwrap());
+
+        let shutdown = CancellationToken::new();
+        let event = validator_reorg_monitor(
+            client,
+            store.clone() as Arc<dyn ChainStore>,
+            Duration::from_millis(10),
+            shutdown,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(event.rollback_to, 8);
+        assert_eq!(event.depth, 2);
+
+        // Chain should be rolled back
+        let tip = store.tip().unwrap();
+        assert_eq!(tip.block_number, 8);
+
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_validator_reorg_monitor_shutdown() {
+        let anchor = make_initial_tip(1);
+        let store = Arc::new(MockChainStore::with_anchor(anchor));
+
+        // Remote matches local — no reorg
+        let mut remote = HashMap::new();
+        remote.insert(1, B256::from([1u8; 32]));
+
+        let (handle, url) = start_mock_rpc(remote).await;
+        let client = Arc::new(crate::RpcClient::new(&url, &url).unwrap());
+
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        let result = validator_reorg_monitor(
+            client,
+            store as Arc<dyn ChainStore>,
+            Duration::from_millis(10),
+            shutdown,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Shutdown"));
+        handle.stop().unwrap();
+    }
 }

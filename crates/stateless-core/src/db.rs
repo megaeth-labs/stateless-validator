@@ -1610,4 +1610,83 @@ mod tests {
             other => panic!("expected MissingData error, got: {other}"),
         }
     }
+
+    #[test]
+    fn test_server_db_prune_history_with_block_records() {
+        let (_dir, db) = temp_server_db();
+
+        // Store blocks via store_block_data which populates BLOCK_RECORDS
+        let blocks_data: Vec<_> = (1..=5)
+            .map(|n| {
+                let block = make_test_block(n, B256::from([n as u8; 32]));
+                let witness = empty_light_witness();
+                (block, witness)
+            })
+            .collect();
+        db.store_block_data(&blocks_data).unwrap();
+
+        // Also advance canonical chain so prune_history can clean those entries
+        let metas: Vec<BlockMeta> = (1..=5).map(make_block_meta).collect();
+        ChainStore::advance_chain(&db, &metas).unwrap();
+
+        // Prune blocks before block 3 (should remove blocks 1 and 2)
+        let pruned = db.prune_history(3).unwrap();
+        assert_eq!(pruned, 2);
+
+        // Blocks 1 and 2 should be gone from block data
+        let result = db.get_block_and_witness(BlockHash::from(B256::from([1u8; 32])));
+        assert!(result.is_err());
+        let result = db.get_block_and_witness(BlockHash::from(B256::from([2u8; 32])));
+        assert!(result.is_err());
+
+        // Block 3 and beyond should still be accessible
+        let (block, _witness) =
+            db.get_block_and_witness(BlockHash::from(B256::from([3u8; 32]))).unwrap();
+        assert_eq!(block.header.number, 3);
+    }
+
+    #[test]
+    fn test_server_db_store_empty_blocks() {
+        let (_dir, db) = temp_server_db();
+
+        // Storing empty slice should be a no-op
+        db.store_block_data(&[]).unwrap();
+    }
+
+    #[test]
+    fn test_server_db_rollback_chain_via_trait() {
+        let (_dir, db) = temp_server_db();
+
+        // Store blocks via store_block_data to populate BLOCK_DATA
+        let blocks_data: Vec<_> = (1..=5)
+            .map(|n| {
+                let block = make_test_block(n, B256::from([n as u8; 32]));
+                let witness = empty_light_witness();
+                (block, witness)
+            })
+            .collect();
+        db.store_block_data(&blocks_data).unwrap();
+
+        let metas: Vec<BlockMeta> = (1..=5).map(make_block_meta).collect();
+        ChainStore::advance_chain(&db, &metas).unwrap();
+
+        // Rollback to block 3
+        ChainStore::rollback_chain(&db, 3).unwrap();
+
+        // Tip should be 3
+        let (number, _) = db.get_local_tip().unwrap().unwrap();
+        assert_eq!(number, 3);
+
+        // Blocks 4, 5 should still exist in BLOCK_DATA (rollback only affects canonical chain)
+        // but canonical chain entries are gone
+        assert!(db.get_block_hash(4).unwrap().is_none());
+        assert!(db.get_block_hash(5).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_genesis_load_when_none_stored() {
+        let (_dir, store) = temp_store();
+        // No genesis stored — should return None
+        assert!(store.load_genesis().unwrap().is_none());
+    }
 }
