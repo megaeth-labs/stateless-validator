@@ -149,7 +149,7 @@ impl DataProvider {
 
         // Try to get from local database
         if let Some(db) = &self.db &&
-            let Ok(data) = self.get_block_data_from_db(&**db, block_hash).await
+            let Ok(data) = self.get_block_data_from_db(db.as_ref(), block_hash).await
         {
             trace!(
                 block_hash = %block_hash,

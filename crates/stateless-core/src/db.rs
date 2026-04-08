@@ -229,11 +229,18 @@ pub trait ChainStore: ContractStore {
     fn get_earliest_block(&self) -> eyre::Result<Option<(BlockNumber, BlockHash)>>;
     fn rollback_chain(&self, to_block: BlockNumber) -> eyre::Result<()>;
     fn reset_to_anchor(&self, anchor: &BlockMeta) -> eyre::Result<()>;
+}
+
+/// History pruning (debug-trace-server only, where explicit pruning is needed).
+///
+/// `ValidatorDB` does not implement this because it uses inline pruning
+/// in [`ChainStore::advance_chain`] instead.
+pub trait PrunableChainStore: ChainStore {
     fn prune_chain(&self, before_block: BlockNumber) -> eyre::Result<u64>;
 }
 
 /// Block/witness storage extension (debug-trace-server only).
-pub trait BlockStore: ChainStore {
+pub trait BlockStore: PrunableChainStore {
     fn store_block_data(&self, blocks: &[(Block<Transaction>, LightWitness)]) -> eyre::Result<()>;
     fn get_block_and_witness(
         &self,
@@ -392,31 +399,6 @@ fn db_reset_to_anchor(database: &Database, anchor: &BlockMeta) -> eyre::Result<(
     }
     write_txn.commit()?;
     Ok(())
-}
-
-/// Removes CANONICAL_CHAIN entries before `before_block`. Returns the count removed.
-fn db_prune_chain(database: &Database, before_block: BlockNumber) -> eyre::Result<u64> {
-    let read_txn = database.begin_read()?;
-    let chain = read_txn.open_table(CANONICAL_CHAIN)?;
-    let to_remove: Vec<u64> = chain
-        .range(..before_block)?
-        .map(|r| r.map(|(k, _)| k.value()))
-        .collect::<std::result::Result<_, _>>()?;
-    let count = to_remove.len() as u64;
-    drop(chain);
-    drop(read_txn);
-
-    if count > 0 {
-        let write_txn = database.begin_write()?;
-        {
-            let mut chain = write_txn.open_table(CANONICAL_CHAIN)?;
-            for n in &to_remove {
-                chain.remove(*n)?;
-            }
-        }
-        write_txn.commit()?;
-    }
-    Ok(count)
 }
 
 /// Retrieves cached contract bytecodes. Returns `(found, missing)`.
@@ -668,10 +650,6 @@ impl ChainStore for ValidatorDB {
 
     fn reset_to_anchor(&self, anchor: &BlockMeta) -> eyre::Result<()> {
         db_reset_to_anchor(&self.database, anchor)
-    }
-
-    fn prune_chain(&self, before_block: BlockNumber) -> eyre::Result<u64> {
-        db_prune_chain(&self.database, before_block)
     }
 }
 
@@ -966,7 +944,13 @@ impl ChainStore for ServerDB {
     fn reset_to_anchor(&self, anchor: &BlockMeta) -> eyre::Result<()> {
         db_reset_to_anchor(&self.database, anchor)
     }
+}
 
+// ---------------------------------------------------------------------------
+// PrunableChainStore impl for ServerDB
+// ---------------------------------------------------------------------------
+
+impl PrunableChainStore for ServerDB {
     fn prune_chain(&self, before_block: BlockNumber) -> eyre::Result<u64> {
         Ok(ServerDB::prune_history(self, before_block)?)
     }
@@ -1285,22 +1269,32 @@ mod tests {
 
     #[test]
     fn test_prune_chain() {
-        let (_dir, store) = temp_store();
+        let (_dir, db) = temp_server_db();
 
-        let blocks: Vec<BlockMeta> = (1..=10).map(make_block_meta).collect();
-        ChainStore::advance_chain(&store, &blocks).unwrap();
+        // Populate via store_block_data so BLOCK_RECORDS is populated
+        let blocks_data: Vec<_> = (1..=10)
+            .map(|n| {
+                let block = make_test_block(n, B256::from([n as u8; 32]));
+                let witness = empty_light_witness();
+                (block, witness)
+            })
+            .collect();
+        db.store_block_data(&blocks_data).unwrap();
+
+        let metas: Vec<BlockMeta> = (1..=10).map(make_block_meta).collect();
+        ChainStore::advance_chain(&db, &metas).unwrap();
 
         // Prune blocks before block 6 (should remove 1-5)
-        let pruned = ChainStore::prune_chain(&store, 6).unwrap();
+        let pruned = PrunableChainStore::prune_chain(&db, 6).unwrap();
         assert_eq!(pruned, 5);
 
         // Blocks 1-5 should be gone
         for n in 1..=5 {
-            assert!(ChainStore::get_block_hash(&store, n).unwrap().is_none());
+            assert!(ChainStore::get_block_hash(&db, n).unwrap().is_none());
         }
         // Blocks 6-10 should remain
         for n in 6..=10 {
-            assert!(ChainStore::get_block_hash(&store, n).unwrap().is_some());
+            assert!(ChainStore::get_block_hash(&db, n).unwrap().is_some());
         }
     }
 

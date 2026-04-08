@@ -905,7 +905,9 @@ mod tests {
             inner.anchor = Some(anchor.clone());
             Ok(())
         }
+    }
 
+    impl crate::db::PrunableChainStore for MockChainStore {
         fn prune_chain(&self, before_block: BlockNumber) -> eyre::Result<u64> {
             let mut inner = self.inner.lock().unwrap();
             let before: Vec<u64> =

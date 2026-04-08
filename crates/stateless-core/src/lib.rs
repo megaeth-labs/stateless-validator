@@ -29,9 +29,9 @@ pub mod evm_database;
 pub use evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv};
 pub mod db;
 pub use db::{
-    BlockMeta, BlockStore, ChainStore, ContractCache, ContractStore, GenesisStore, ServerDB,
-    ValidatedBlock, ValidationDbError, ValidationDbResult, ValidationFailure, ValidationTask,
-    ValidatorDB,
+    BlockMeta, BlockStore, ChainStore, ContractCache, ContractStore, GenesisStore,
+    PrunableChainStore, ServerDB, ValidatedBlock, ValidationDbError, ValidationDbResult,
+    ValidationFailure, ValidationTask, ValidatorDB,
 };
 pub mod data_types;
 pub use data_types::{PlainKey, PlainValue};
