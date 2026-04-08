@@ -207,7 +207,7 @@ async fn main() -> Result<()> {
         metrics_port: args.metrics_port,
         ..ChainSyncConfig::default()
     });
-    info!("[Main] Number of concurrent workers: {}", config.concurrent_workers);
+    info!(concurrent_workers = config.concurrent_workers, "[Main] Starting pipeline");
     info!(
         "[Main] Validation result reporting: {}",
         if config.report_validation_results { "enabled" } else { "disabled" }
@@ -216,7 +216,7 @@ async fn main() -> Result<()> {
     let result =
         run_with_reorg_restart(client, validator_db, contract_cache, config, chain_spec).await;
 
-    info!("[Main] Shutdown complete. Total execution time: {:?}", start.elapsed());
+    info!(elapsed = ?start.elapsed(), "[Main] Shutdown complete");
     result
 }
 

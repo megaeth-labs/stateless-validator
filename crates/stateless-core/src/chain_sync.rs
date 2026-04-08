@@ -141,7 +141,7 @@ pub async fn chain_monitor(
             start_block,
             Arc::clone(&config),
             fetcher_shutdown.clone(),
-            |block, salt_witness, _mpt_witness| (block, LightWitness::from(salt_witness)),
+            |block, salt_witness, _mpt_witness| (block, LightWitness::from(&salt_witness)),
             None::<fn(u64)>,
         ));
 

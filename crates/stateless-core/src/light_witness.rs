@@ -32,13 +32,14 @@ pub struct LightWitness {
     pub levels: FxHashMap<BucketId, u8>,
 }
 
-/// Convert from SaltWitness to LightWitness.
+/// Convert from &SaltWitness to LightWitness.
 ///
-/// Used when fetching witness data from RPC (which returns SaltWitness)
-/// to convert to LightWitness for consistent handling.
-impl From<salt::SaltWitness> for LightWitness {
-    fn from(witness: salt::SaltWitness) -> Self {
-        Self { kvs: witness.kvs, levels: witness.proof.levels.into_iter().collect() }
+/// Clones only `kvs` and `levels` — the two fields needed for execution —
+/// without cloning the heavy cryptographic proof data (`parents_commitments`,
+/// IPA proof).
+impl From<&salt::SaltWitness> for LightWitness {
+    fn from(witness: &salt::SaltWitness) -> Self {
+        Self { kvs: witness.kvs.clone(), levels: witness.proof.levels.clone() }
     }
 }
 

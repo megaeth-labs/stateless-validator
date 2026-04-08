@@ -408,7 +408,7 @@ impl DataProvider {
 
         // Step 3: Convert SaltWitness to LightWitness
         let start = std::time::Instant::now();
-        let witness = LightWitness::from(salt_witness);
+        let witness = LightWitness::from(&salt_witness);
         let convert_witness_ms = start.elapsed().as_millis();
 
         // Step 4: Extract code hashes and fetch contracts
