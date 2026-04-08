@@ -118,6 +118,21 @@ struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_METRICS_PORT", default_value_t = metrics::DEFAULT_METRICS_PORT)]
     metrics_port: u16,
 
+    /// Timeout in seconds for block and header RPC fetches (eth_getBlockByNumber, etc.).
+    /// Defaults to no timeout.
+    #[clap(long, env = "STATELESS_VALIDATOR_BLOCK_TIMEOUT_SECS")]
+    block_timeout_secs: Option<u64>,
+
+    /// Timeout in seconds for witness RPC fetches (mega_getBlockWitness).
+    /// Defaults to no timeout.
+    #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_TIMEOUT_SECS")]
+    witness_timeout_secs: Option<u64>,
+
+    /// Timeout in seconds for contract code RPC fetches (eth_getCodeByHash).
+    /// Defaults to no timeout.
+    #[clap(long, env = "STATELESS_VALIDATOR_CODE_TIMEOUT_SECS")]
+    code_timeout_secs: Option<u64>,
+
     /// Logging configuration.
     #[command(flatten)]
     log: LogArgs,
@@ -148,7 +163,17 @@ async fn main() -> Result<()> {
 
     let work_dir = PathBuf::from(args.data_dir);
 
-    let rpc_config = RpcClientConfig::validator().with_metrics(Arc::new(metrics::ValidatorMetrics));
+    let mut rpc_config =
+        RpcClientConfig::validator().with_metrics(Arc::new(metrics::ValidatorMetrics));
+    if let Some(secs) = args.block_timeout_secs {
+        rpc_config = rpc_config.with_block_timeout(Duration::from_secs(secs));
+    }
+    if let Some(secs) = args.witness_timeout_secs {
+        rpc_config = rpc_config.with_witness_timeout(Duration::from_secs(secs));
+    }
+    if let Some(secs) = args.code_timeout_secs {
+        rpc_config = rpc_config.with_code_timeout(Duration::from_secs(secs));
+    }
     let client = Arc::new(RpcClient::new_with_config(
         &args.rpc_endpoint,
         &args.witness_endpoint,
