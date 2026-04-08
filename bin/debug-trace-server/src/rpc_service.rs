@@ -280,7 +280,7 @@ async fn compute_debug_trace_block(
 ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
     let start = Instant::now();
 
-    let results = stateless_core::trace_block(
+    let results = crate::tracing_executor::trace_block(
         chain_spec,
         &data.block,
         data.witness.clone(),
@@ -322,7 +322,7 @@ async fn compute_parity_trace_block(
 ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
     let start = Instant::now();
 
-    let results = stateless_core::parity_trace_block(
+    let results = crate::tracing_executor::parity_trace_block(
         chain_spec,
         &data.block,
         data.witness.clone(),
@@ -592,7 +592,7 @@ impl DebugTraceRpcServer for RpcContext {
             })?;
 
         let evm_start = Instant::now();
-        let result = stateless_core::trace_transaction(
+        let result = crate::tracing_executor::trace_transaction(
             &self.chain_spec,
             &data.block,
             tx_index,
@@ -732,7 +732,7 @@ impl TraceRpcServer for RpcContext {
         };
 
         let evm_start = Instant::now();
-        let result = stateless_core::parity_trace_transaction(
+        let result = crate::tracing_executor::parity_trace_transaction(
             &self.chain_spec,
             &data.block,
             tx_index,

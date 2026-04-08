@@ -57,15 +57,14 @@ use revm_inspectors::tracing::{
     FourByteInspector, MuxInspector, TracingInspector, TracingInspectorConfig, TransactionContext,
     js::JsInspector,
 };
-use tracing::{instrument, trace, warn};
-
-use crate::{
+use stateless_core::{
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
     evm_database::{WitnessDatabase, WitnessExternalEnv},
     executor::{ValidationError, create_evm_env},
     light_witness::{LightWitness, LightWitnessExecutor},
 };
+use tracing::{instrument, trace, warn};
 
 // ---------------------------------------------------------------------------
 // Helper Functions

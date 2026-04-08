@@ -5,9 +5,8 @@
 //!
 //! ## Key Components
 //!
-//! - **BlockFileManager**: Centralized file management for validation, witness, and backup
-//!   operations
 //! - **Validation Logic**: Core validation algorithms for stateless operation
+//! - **Persistence Traits**: Abstract storage interfaces (`ContractStore`, `ChainStore`, etc.)
 //!
 //! ## Modules
 //!
@@ -19,30 +18,20 @@
 pub mod chain_spec;
 pub mod chain_sync;
 pub mod light_witness;
-pub use chain_sync::{
-    ChainSyncConfig, ChainSyncEvent, DEFAULT_METRICS_PORT, ReorgEvent, block_fetcher,
-    chain_advancer, chain_monitor, find_divergence_point, trace_chain_advancer,
-    validator_reorg_monitor,
-};
+pub use chain_sync::{ChainSyncConfig, block_fetcher, find_divergence_point};
 pub use light_witness::{LightWitness, LightWitnessExecutor};
 pub mod evm_database;
 pub use evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv};
 pub mod db;
 pub use db::{
-    BlockMeta, BlockStore, ChainStore, ContractCache, ContractStore, GenesisStore,
-    PrunableChainStore, ServerDB, ValidatedBlock, ValidationDbError, ValidationDbResult,
-    ValidationFailure, ValidationTask, ValidatorDB,
+    BlockMeta, BlockStore, ChainStore, ContractStore, GenesisStore, PrunableChainStore,
+    ValidatedBlock, ValidationFailure, ValidationTask,
 };
 pub mod data_types;
 pub use data_types::{PlainKey, PlainValue};
 pub mod executor;
 pub use executor::{
     ValidationError, ValidationResult, ValidationStats, replay_block, validate_block,
-};
-pub mod tracing_executor;
-pub use tracing_executor::{
-    extract_code_hashes, parity_trace_block, parity_trace_transaction, trace_block,
-    trace_transaction,
 };
 pub mod rpc_client;
 pub mod withdrawals;

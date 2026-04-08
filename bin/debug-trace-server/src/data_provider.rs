@@ -280,7 +280,7 @@ impl DataProvider {
 
         // Extract code hashes and get contracts
         let start = std::time::Instant::now();
-        let code_hashes = stateless_core::extract_code_hashes(&witness);
+        let code_hashes = crate::tracing_executor::extract_code_hashes(&witness);
         let num_contracts = code_hashes.len();
         let contracts = self.get_contracts_with_db(db, &code_hashes).await?;
         let fetch_contracts_ms = start.elapsed().as_millis();
@@ -413,7 +413,7 @@ impl DataProvider {
 
         // Step 4: Extract code hashes and fetch contracts
         let start = std::time::Instant::now();
-        let code_hashes = stateless_core::extract_code_hashes(&witness);
+        let code_hashes = crate::tracing_executor::extract_code_hashes(&witness);
         let num_contracts = code_hashes.len();
         let contracts = self.get_contracts(&code_hashes).await?;
         let fetch_contracts_ms = start.elapsed().as_millis();

@@ -9,27 +9,38 @@ exclude.workspace = true
 
 [dependencies]
 # alloy
+alloy-consensus.workspace = true
+alloy-evm.workspace = true
 alloy-genesis.workspace = true
+alloy-hardforks.workspace = true
+alloy-op-evm.workspace = true
+alloy-op-hardforks.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-rpc-types-trace.workspace = true
+alloy-serde.workspace = true
+
+# mega
+mega-evm.workspace = true
+salt.workspace = true
 
 # op
+op-alloy-network.workspace = true
 op-alloy-rpc-types.workspace = true
 
 # revm
 revm.workspace = true
-
-# mega
-salt.workspace = true
+revm-inspectors.workspace = true
 
 # stateless
 stateless-common = { path = "../../crates/stateless-common" }
 stateless-core = { path = "../../crates/stateless-core" }
+stateless-db = { path = "../../crates/stateless-db" }
 
 # misc
 clap.workspace = true
 dashmap.workspace = true
+dyn-clone.workspace = true
 eyre.workspace = true
 http.workspace = true
 http-body.workspace = true
@@ -41,6 +52,9 @@ metrics-derive.workspace = true
 metrics-exporter-prometheus.workspace = true
 pin-project-lite = "0.2"
 quick_cache = "0.6"
+rayon.workspace = true
+redb.workspace = true
+rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync"] }
@@ -49,7 +63,6 @@ tower = "0.4"
 tracing.workspace = true
 
 [dev-dependencies]
-alloy-consensus.workspace = true
 alloy-network = "1.0.23"
 alloy-primitives.workspace = true
 

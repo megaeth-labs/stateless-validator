@@ -16,18 +16,24 @@ use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
 use salt::SaltWitness;
 use stateless_common::logging::{LogArgs, migrate_legacy_env_vars};
 use stateless_core::{
-    ChainStore, ChainSyncConfig, ContractCache, ContractStore, ReorgEvent, RpcClient,
-    RpcClientConfig, ValidatorDB,
+    ChainStore, ChainSyncConfig, ContractStore, RpcClient, RpcClientConfig,
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
     db::{BlockMeta, ValidatedBlock, ValidationFailure, ValidationTask},
     executor::validate_block,
 };
+use stateless_db::ContractCache;
 use tokio::{signal, task, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+mod chain_sync;
 mod metrics;
+mod validator_db;
+
+use validator_db::ValidatorDB;
+
+use crate::chain_sync::{ReorgEvent, chain_advancer, validator_reorg_monitor};
 
 /// Handles to all spawned background tasks, awaited during shutdown.
 type BackgroundTasks = Vec<JoinHandle<Result<()>>>;
@@ -245,7 +251,7 @@ async fn run_with_reorg_restart(
             shutdown.clone(),
         )?;
 
-        let reorg_monitor = stateless_core::validator_reorg_monitor(
+        let reorg_monitor = validator_reorg_monitor(
             Arc::clone(&client),
             Arc::clone(&validator_db) as Arc<dyn ChainStore>,
             config.tracker_poll_interval,
@@ -360,7 +366,7 @@ fn chain_sync(
         let config = Arc::clone(&config);
         let shutdown = shutdown.clone();
         async move {
-            stateless_core::block_fetcher(
+            stateless_core::chain_sync::block_fetcher(
                 client,
                 fetch_tx,
                 start_block,
@@ -414,7 +420,7 @@ fn chain_sync(
     }
 
     // Main loop = chain advancer
-    let main_loop = stateless_core::chain_advancer(
+    let main_loop = chain_advancer(
         result_rx,
         validator_db as Arc<dyn ChainStore>,
         initial_tip,

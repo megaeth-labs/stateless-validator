@@ -20,7 +20,6 @@ alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-rlp.workspace = true
 alloy-rpc-types-eth.workspace = true
-alloy-rpc-types-trace.workspace = true
 alloy-serde.workspace = true
 alloy-trie.workspace = true
 
@@ -41,20 +40,15 @@ reth-trie-sparse.workspace = true
 
 # revm
 revm.workspace = true
-revm-inspectors.workspace = true
 
 # misc
 base64.workspace = true
 bincode.workspace = true
-dashmap.workspace = true
 dyn-clone.workspace = true
 eyre.workspace = true
 futures.workspace = true
 kanal.workspace = true
-lz4_flex.workspace = true
 num_cpus.workspace = true
-rayon.workspace = true
-redb.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true

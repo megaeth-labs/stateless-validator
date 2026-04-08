@@ -50,23 +50,28 @@ use eyre::{Result, anyhow, ensure};
 use jsonrpsee::server::Server;
 use stateless_common::logging::LogArgs;
 use stateless_core::{
-    BlockStore, ChainStore, ChainSyncConfig, RpcClient, RpcClientConfig, ServerDB, chain_monitor,
-    chain_spec::ChainSpec, trace_chain_advancer,
+    BlockStore, ChainStore, ChainSyncConfig, RpcClient, RpcClientConfig, chain_spec::ChainSpec,
 };
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
+mod chain_sync;
 mod data_provider;
 mod metrics;
 mod response_cache;
 mod response_size;
 mod rpc_service;
+mod server_db;
 mod timing;
+mod tracing_executor;
 
 use data_provider::DataProvider;
 use response_cache::{DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS, ResponseCache, ResponseCacheConfig};
 use rpc_service::RpcContext;
+use server_db::ServerDB;
+
+use crate::chain_sync::{chain_monitor, trace_chain_advancer};
 
 /// Command line arguments for the debug-trace-server.
 #[derive(Parser, Debug)]
