@@ -33,8 +33,9 @@ pub mod executor;
 pub use executor::{
     ValidationError, ValidationResult, ValidationStats, replay_block, validate_block,
 };
-pub mod rpc_client;
+pub mod rpc;
 pub mod withdrawals;
-pub use rpc_client::{
-    RpcClient, RpcClientConfig, RpcMethod, RpcMetrics, SetValidatedBlocksResponse,
+pub use rpc::{
+    ChainDataProvider, RpcClientConfig, RpcMethod, RpcMetrics, SetValidatedBlocksResponse,
+    WitnessRequestKeys,
 };

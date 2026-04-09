@@ -8,9 +8,44 @@ repository.workspace = true
 exclude.workspace = true
 
 [dependencies]
+# alloy
+alloy-primitives.workspace = true
+alloy-provider.workspace = true
+alloy-rpc-types-eth.workspace = true
+
+# mega
+salt.workspace = true
+
+# op
+op-alloy-network.workspace = true
+op-alloy-rpc-types.workspace = true
+
+# revm
+revm.workspace = true
+
+# stateless
+stateless-core = { path = "../stateless-core" }
+
+# misc
+base64.workspace = true
+bincode.workspace = true
 clap.workspace = true
+dashmap.workspace = true
 eyre.workspace = true
+futures.workspace = true
+lz4_flex.workspace = true
+redb.workspace = true
 rolling-file.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+jsonrpsee.workspace = true
+kanal.workspace = true
+tokio-util.workspace = true

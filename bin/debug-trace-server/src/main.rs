@@ -47,10 +47,10 @@ use alloy_primitives::{B256, BlockHash, hex};
 use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::{Result, anyhow, ensure};
-use jsonrpsee::server::Server;
-use stateless_common::logging::LogArgs;
+use jsonrpsee::server::{Server, ServerConfig};
+use stateless_common::{RpcClient, logging::LogArgs};
 use stateless_core::{
-    BlockStore, ChainStore, ChainSyncConfig, RpcClient, RpcClientConfig, chain_spec::ChainSpec,
+    BlockStore, ChainStore, ChainSyncConfig, RpcClientConfig, chain_spec::ChainSpec,
 };
 use tokio::task;
 use tokio_util::sync::CancellationToken;
@@ -384,8 +384,9 @@ async fn main() -> Result<()> {
     let module = ctx.into_rpc_module()?;
 
     // Start server
+    let config = ServerConfig::builder().max_response_body_size(u32::MAX).build();
     let server = Server::builder()
-        .max_response_body_size(u32::MAX)
+        .set_config(config)
         .set_http_middleware(
             tower::ServiceBuilder::new()
                 .layer(response_size::ResponseSizeLayer)

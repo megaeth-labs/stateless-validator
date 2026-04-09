@@ -14,15 +14,18 @@ use eyre::{Result, anyhow, ensure};
 use futures::future;
 use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
 use salt::SaltWitness;
-use stateless_common::logging::{LogArgs, migrate_legacy_env_vars};
+use stateless_common::{
+    RpcClient,
+    db::ContractCache,
+    logging::{LogArgs, migrate_legacy_env_vars},
+};
 use stateless_core::{
-    ChainStore, ChainSyncConfig, ContractStore, RpcClient, RpcClientConfig,
+    ChainStore, ChainSyncConfig, ContractStore, RpcClientConfig,
     chain_spec::ChainSpec,
     data_types::{PlainKey, PlainValue},
     db::{BlockMeta, ValidatedBlock, ValidationFailure, ValidationTask},
     executor::validate_block,
 };
-use stateless_db::ContractCache;
 use tokio::{signal, task, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -33,15 +36,10 @@ mod validator_db;
 
 use validator_db::ValidatorDB;
 
-use crate::chain_sync::{ReorgEvent, chain_advancer, validator_reorg_monitor};
+use crate::chain_sync::{ReorgEvent, chain_advancer};
 
 /// Handles to all spawned background tasks, awaited during shutdown.
 type BackgroundTasks = Vec<JoinHandle<Result<()>>>;
-
-enum RunLoopAction {
-    Restart(ReorgEvent),
-    Shutdown,
-}
 
 /// Database filename for the validator.
 const VALIDATOR_DB_FILENAME: &str = "validator.redb";
@@ -251,40 +249,20 @@ async fn run_with_reorg_restart(
             shutdown.clone(),
         )?;
 
-        let reorg_monitor = validator_reorg_monitor(
-            Arc::clone(&client),
-            Arc::clone(&validator_db) as Arc<dyn ChainStore>,
-            config.tracker_poll_interval,
-            shutdown.clone(),
-        );
+        enum Action {
+            Result(Result<Option<ReorgEvent>>),
+            Shutdown,
+        }
 
         let action = tokio::select! {
-            res = validator_logic => {
-                if let Err(ref e) = res {
-                    error!(error = %e, "[Main] Validator exited with error");
-                }
-                shutdown.cancel();
-                await_bg_tasks(bg_tasks).await;
-                return res;
-            }
-            res = reorg_monitor => {
-                match res {
-                    Ok(reorg) => RunLoopAction::Restart(reorg),
-                    Err(e) => {
-                        error!(error = %e, "[Main] Reorg monitor exited with error");
-                        shutdown.cancel();
-                        await_bg_tasks(bg_tasks).await;
-                        return Err(e);
-                    }
-                }
-            }
+            res = validator_logic => Action::Result(res),
             _ = signal::ctrl_c() => {
                 info!("[Main] SIGINT received, shutting down.");
-                RunLoopAction::Shutdown
+                Action::Shutdown
             }
             _ = sigterm.recv() => {
                 info!("[Main] SIGTERM received, shutting down.");
-                RunLoopAction::Shutdown
+                Action::Shutdown
             }
         };
 
@@ -292,7 +270,7 @@ async fn run_with_reorg_restart(
         await_bg_tasks(bg_tasks).await;
 
         match action {
-            RunLoopAction::Restart(reorg) => {
+            Action::Result(Ok(Some(reorg))) => {
                 warn!(
                     rollback_to = reorg.rollback_to,
                     depth = reorg.depth,
@@ -300,7 +278,12 @@ async fn run_with_reorg_restart(
                 );
                 metrics::on_reorg(reorg.depth);
             }
-            RunLoopAction::Shutdown => return Ok(()),
+            Action::Result(Ok(None)) => return Ok(()),
+            Action::Result(Err(e)) => {
+                error!(error = %e, "[Main] Validator exited with error");
+                return Err(e);
+            }
+            Action::Shutdown => return Ok(()),
         }
 
         info!("[Main] Restarting pipeline...");
@@ -342,7 +325,7 @@ fn chain_sync(
     config: Arc<ChainSyncConfig>,
     chain_spec: Arc<ChainSpec>,
     shutdown: CancellationToken,
-) -> Result<(impl Future<Output = Result<()>>, BackgroundTasks)> {
+) -> Result<(impl Future<Output = Result<Option<ReorgEvent>>>, BackgroundTasks)> {
     let initial_tip = validator_db
         .get_canonical_tip()?
         .ok_or_else(|| anyhow!("No canonical tip found — run with --start-block first"))?;
@@ -422,6 +405,7 @@ fn chain_sync(
     // Main loop = chain advancer
     let main_loop = chain_advancer(
         result_rx,
+        client,
         validator_db as Arc<dyn ChainStore>,
         initial_tip,
         shutdown,
@@ -505,7 +489,8 @@ async fn validation_worker(
             contracts.extend(new_bytecodes);
         }
 
-        // Extract state roots before moving data into spawn_blocking
+        // Extract fields before moving data into spawn_blocking
+        let parent_hash = task.block.header.parent_hash;
         let pre_state_root = B256::from(task.salt_witness.state_root()?);
         let post_state_root = task.block.header.state_root;
         let pre_withdrawals_root = task.mpt_witness.storage_root;
@@ -547,6 +532,7 @@ async fn validation_worker(
                 Ok(ValidatedBlock {
                     block_number,
                     block_hash,
+                    parent_hash,
                     post_state_root,
                     post_withdrawals_root,
                     pre_state_root,
@@ -690,7 +676,7 @@ mod tests {
     };
     use op_alloy_rpc_types::Transaction;
     use serde::{Deserialize, Serialize, de::DeserializeOwned};
-    use stateless_core::{rpc_client::WitnessRequestKeys, withdrawals::MptWitness};
+    use stateless_core::{WitnessRequestKeys, withdrawals::MptWitness};
     use tracing_subscriber::EnvFilter;
 
     use super::*;

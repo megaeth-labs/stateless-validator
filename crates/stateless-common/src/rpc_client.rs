@@ -1,8 +1,10 @@
-//! RPC client for fetching blockchain data.
+//! Concrete RPC client for fetching blockchain data.
 //!
-//! Provides methods to fetch blocks, witnesses, and contract bytecode from MegaETH nodes.
+//! Provides [`RpcClient`] — the HTTP-based implementation of
+//! [`stateless_core::ChainDataProvider`] — for fetching blocks, witnesses, and
+//! contract bytecode from MegaETH nodes.
 
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{collections::HashMap, time::Instant};
 
 use alloy_primitives::{B256, Bytes, U64};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
@@ -14,129 +16,11 @@ use op_alloy_network::Optimism;
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
-use serde::{Deserialize, Serialize};
+use stateless_core::{
+    ChainDataProvider, RpcClientConfig, RpcMethod, WitnessRequestKeys,
+    executor::verify_block_integrity, withdrawals::MptWitness,
+};
 use tracing::trace;
-
-use crate::{executor::verify_block_integrity, withdrawals::MptWitness};
-
-/// Request keys for fetching block witness data.
-/// Format compatible with both upstream witness endpoint and worker-kv-demo Cloudflare RPC.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WitnessRequestKeys {
-    /// Block number as U64.
-    pub block_number: U64,
-    /// Block hash.
-    pub block_hash: B256,
-}
-
-/// RPC method identifiers for metrics tracking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RpcMethod {
-    /// eth_getCodeByHash
-    EthGetCodeByHash,
-    /// eth_getBlockByNumber / eth_getBlockByHash
-    EthGetBlockByNumber,
-    /// eth_blockNumber
-    EthBlockNumber,
-    /// eth_getHeaderByNumber / eth_getHeaderByHash
-    EthGetHeader,
-    /// mega_getBlockWitness (primary witness generator)
-    MegaGetBlockWitness,
-    /// mega_getBlockWitness (Cloudflare fallback)
-    MegaGetBlockWitnessCloudflare,
-    /// mega_setValidatedBlocks
-    MegaSetValidatedBlocks,
-}
-
-impl RpcMethod {
-    /// Returns the method name as a string.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            RpcMethod::EthGetCodeByHash => "eth_getCodeByHash",
-            RpcMethod::EthGetBlockByNumber => "eth_getBlockByNumber",
-            RpcMethod::EthGetHeader => "eth_getHeader",
-            RpcMethod::EthBlockNumber => "eth_blockNumber",
-            RpcMethod::MegaGetBlockWitness => "mega_getBlockWitness",
-            RpcMethod::MegaGetBlockWitnessCloudflare => "mega_getBlockWitness_cloudflare",
-            RpcMethod::MegaSetValidatedBlocks => "mega_setValidatedBlocks",
-        }
-    }
-}
-
-/// Trait for RPC metrics callbacks.
-///
-/// Implement this trait to receive metrics events from the RPC client.
-pub trait RpcMetrics: Send + Sync {
-    /// Called when an RPC request completes.
-    ///
-    /// # Arguments
-    /// * `method` - The RPC method that was called
-    /// * `success` - Whether the call succeeded
-    /// * `duration_secs` - Optional duration of the call in seconds
-    fn on_rpc_complete(&self, method: RpcMethod, success: bool, duration_secs: Option<f64>);
-
-    /// Called when witness data is successfully fetched.
-    ///
-    /// # Arguments
-    /// * `salt_size` - Estimated size of the salt witness in bytes
-    /// * `kvs_count` - Number of key-value pairs in the witness
-    /// * `salt_kvs_size` - Size of the key-value data in bytes
-    /// * `mpt_size` - Size of the MPT witness in bytes
-    fn on_witness_fetch(
-        &self,
-        salt_size: usize,
-        kvs_count: usize,
-        salt_kvs_size: usize,
-        mpt_size: usize,
-    );
-}
-
-/// Configuration for RPC client behavior.
-#[derive(Clone, Default)]
-pub struct RpcClientConfig {
-    /// Skip ECDSA signature verification and block hash verification.
-    /// Enable for trusted data sources (e.g., debug-trace-server fetching from upstream RPC)
-    /// where integrity checks are unnecessary overhead.
-    pub skip_block_verification: bool,
-    /// Optional metrics callbacks for tracking RPC performance.
-    pub metrics: Option<Arc<dyn RpcMetrics>>,
-}
-
-impl std::fmt::Debug for RpcClientConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RpcClientConfig")
-            .field("skip_block_verification", &self.skip_block_verification)
-            .field("metrics", &self.metrics.is_some())
-            .finish()
-    }
-}
-
-impl RpcClientConfig {
-    /// Creates a config for validation mode (full verification).
-    pub fn validator() -> Self {
-        Self { skip_block_verification: false, metrics: None }
-    }
-
-    /// Creates a config for trace/debug mode (skip verification).
-    pub fn trace_server() -> Self {
-        Self { skip_block_verification: true, metrics: None }
-    }
-
-    /// Sets the metrics callbacks.
-    pub fn with_metrics(mut self, metrics: Arc<dyn RpcMetrics>) -> Self {
-        self.metrics = Some(metrics);
-        self
-    }
-}
-
-/// Response from mega_setValidatedBlocks RPC call
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetValidatedBlocksResponse {
-    pub accepted: bool,
-    pub last_validated_block: (U64, B256),
-}
 
 /// RPC client for MegaETH blockchain data.
 ///
@@ -510,7 +394,7 @@ impl RpcClient {
         &self,
         first_block: (u64, B256),
         last_block: (u64, B256),
-    ) -> Result<SetValidatedBlocksResponse> {
+    ) -> Result<stateless_core::SetValidatedBlocksResponse> {
         let provider =
             self.report_provider.as_ref().ok_or_else(|| eyre!("Report provider not configured"))?;
         let result = provider
@@ -570,55 +454,49 @@ impl RpcClient {
     }
 }
 
+// ===========================================================================
+// ChainDataProvider implementation
+// ===========================================================================
+
+impl ChainDataProvider for RpcClient {
+    async fn get_latest_block_number(&self) -> Result<u64> {
+        self.get_latest_block_number().await
+    }
+
+    async fn get_block_hash(&self, block_number: u64) -> Result<B256> {
+        self.get_block_hash(block_number).await
+    }
+
+    async fn get_witness(&self, number: u64, hash: B256) -> Result<(SaltWitness, MptWitness)> {
+        self.get_witness(number, hash).await
+    }
+
+    async fn get_block(&self, block_id: BlockId, full_txs: bool) -> Result<Block<Transaction>> {
+        self.get_block(block_id, full_txs).await
+    }
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use alloy_primitives::{B256, BlockHash};
+    use stateless_core::{ChainSyncConfig, block_fetcher, find_divergence_point};
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
 
-    #[test]
-    fn test_witness_request_keys_serialization() {
-        let keys = WitnessRequestKeys { block_number: U64::from(12345), block_hash: B256::ZERO };
-
-        let json = serde_json::to_string(&keys).unwrap();
-        // Should use camelCase
-        assert!(json.contains("blockNumber"));
-        assert!(json.contains("blockHash"));
-        assert!(!json.contains("block_number"));
-        assert!(!json.contains("block_hash"));
-    }
-
-    #[test]
-    fn test_rpc_client_config_default() {
-        let config = RpcClientConfig::default();
-        assert!(!config.skip_block_verification);
-        assert!(config.metrics.is_none());
-    }
-
-    #[test]
-    fn test_rpc_client_config_validator() {
-        let config = RpcClientConfig::validator();
-        assert!(!config.skip_block_verification);
-        assert!(config.metrics.is_none());
-    }
-
-    #[test]
-    fn test_rpc_client_config_trace_server() {
-        let config = RpcClientConfig::trace_server();
-        assert!(config.skip_block_verification);
-        assert!(config.metrics.is_none());
-    }
-
-    #[test]
-    fn test_rpc_method_as_str() {
-        assert_eq!(RpcMethod::EthGetCodeByHash.as_str(), "eth_getCodeByHash");
-        assert_eq!(RpcMethod::EthGetBlockByNumber.as_str(), "eth_getBlockByNumber");
-        assert_eq!(RpcMethod::EthBlockNumber.as_str(), "eth_blockNumber");
-        assert_eq!(RpcMethod::MegaGetBlockWitness.as_str(), "mega_getBlockWitness");
-        assert_eq!(
-            RpcMethod::MegaGetBlockWitnessCloudflare.as_str(),
-            "mega_getBlockWitness_cloudflare"
-        );
-        assert_eq!(RpcMethod::MegaSetValidatedBlocks.as_str(), "mega_setValidatedBlocks");
-    }
+    // -----------------------------------------------------------------------
+    // RpcClient unit tests
+    // -----------------------------------------------------------------------
 
     #[test]
     fn test_new_with_invalid_url() {
@@ -681,5 +559,277 @@ mod tests {
         )
         .unwrap();
         assert!(client.skip_block_verification());
+    }
+
+    // -----------------------------------------------------------------------
+    // Mock RPC helpers (relocated from stateless-core chain_sync tests)
+    // -----------------------------------------------------------------------
+
+    /// Starts a minimal mock RPC server that responds to `eth_getHeaderByNumber`
+    /// with headers whose hash is derived from `remote_hashes`.
+    async fn start_mock_rpc(
+        remote_hashes: HashMap<u64, BlockHash>,
+    ) -> (jsonrpsee::server::ServerHandle, String) {
+        use jsonrpsee::{RpcModule, server::ServerBuilder};
+
+        let mut module = RpcModule::new(remote_hashes);
+        module
+            .register_method("eth_getHeaderByNumber", |params, ctx, _| {
+                let (hex_number,): (String,) = params.parse().unwrap();
+                let block_number =
+                    u64::from_str_radix(hex_number.strip_prefix("0x").unwrap_or(&hex_number), 16)
+                        .unwrap();
+                let hash = ctx.get(&block_number).copied().unwrap_or_default();
+                Ok::<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
+                    "hash": hash,
+                    "number": format!("0x{block_number:x}"),
+                    "parentHash": B256::ZERO,
+                    "timestamp": "0x0",
+                    "stateRoot": B256::ZERO,
+                    "transactionsRoot": B256::ZERO,
+                    "receiptsRoot": B256::ZERO,
+                    "logsBloom": alloy_primitives::Bloom::ZERO,
+                    "gasUsed": "0x0",
+                    "gasLimit": "0x0",
+                    "mixHash": B256::ZERO,
+                    "nonce": "0x0000000000000000",
+                    "extraData": "0x",
+                    "difficulty": "0x0",
+                    "sha3Uncles": B256::ZERO,
+                    "miner": alloy_primitives::Address::ZERO,
+                    "baseFeePerGas": "0x0"
+                }))
+            })
+            .unwrap();
+
+        let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        let handle = server.start(module);
+        (handle, url)
+    }
+
+    /// Helper to create local and remote hash maps for divergence tests.
+    /// Blocks `earliest..=diverge_at` have matching hashes, blocks
+    /// `(diverge_at+1)..=tip` differ.
+    fn make_divergence_chains(
+        earliest: u64,
+        tip: u64,
+        diverge_at: u64,
+    ) -> (HashMap<u64, BlockHash>, HashMap<u64, BlockHash>) {
+        let mut local = HashMap::new();
+        let mut remote = HashMap::new();
+        for n in earliest..=tip {
+            if n <= diverge_at {
+                // Matching hashes
+                let hash = BlockHash::from([n as u8; 32]);
+                local.insert(n, hash);
+                remote.insert(n, hash);
+            } else {
+                // Divergent hashes
+                local.insert(n, BlockHash::from([n as u8; 32]));
+                remote.insert(n, BlockHash::from([(n + 128) as u8; 32]));
+            }
+        }
+        (local, remote)
+    }
+
+    // -----------------------------------------------------------------------
+    // find_divergence_point tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_find_divergence_single_block_reorg() {
+        let (local, remote) = make_divergence_chains(1, 10, 9);
+        let (handle, url) = start_mock_rpc(remote).await;
+        let client = RpcClient::new(&url, &url).unwrap();
+
+        let result = find_divergence_point(
+            &client,
+            &|n| Ok(local.get(&n).copied()),
+            &|| Ok(Some((1, *local.get(&1).unwrap()))),
+            10,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, 9);
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_find_divergence_multi_block_reorg() {
+        let (local, remote) = make_divergence_chains(1, 10, 5);
+        let (handle, url) = start_mock_rpc(remote).await;
+        let client = RpcClient::new(&url, &url).unwrap();
+
+        let result = find_divergence_point(
+            &client,
+            &|n| Ok(local.get(&n).copied()),
+            &|| Ok(Some((1, *local.get(&1).unwrap()))),
+            10,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, 5);
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_find_divergence_to_earliest() {
+        let (local, remote) = make_divergence_chains(5, 10, 5);
+        let (handle, url) = start_mock_rpc(remote).await;
+        let client = RpcClient::new(&url, &url).unwrap();
+
+        let result = find_divergence_point(
+            &client,
+            &|n| Ok(local.get(&n).copied()),
+            &|| Ok(Some((5, *local.get(&5).unwrap()))),
+            10,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, 5);
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_find_divergence_catastrophic_reorg() {
+        let mut local = HashMap::new();
+        let mut remote = HashMap::new();
+        for n in 1..=5 {
+            local.insert(n, BlockHash::from([n as u8; 32]));
+            remote.insert(n, BlockHash::from([(n + 128) as u8; 32]));
+        }
+
+        let (handle, url) = start_mock_rpc(remote).await;
+        let client = RpcClient::new(&url, &url).unwrap();
+
+        let result = find_divergence_point(
+            &client,
+            &|n| Ok(local.get(&n).copied()),
+            &|| Ok(Some((1, *local.get(&1).unwrap()))),
+            5,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Catastrophic reorg"));
+        handle.stop().unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // block_fetcher tests
+    // -----------------------------------------------------------------------
+
+    /// Starts a mock RPC that serves `eth_blockNumber` (with configurable latest).
+    async fn start_block_number_rpc(latest: u64) -> (jsonrpsee::server::ServerHandle, String) {
+        use jsonrpsee::{RpcModule, server::ServerBuilder};
+
+        let mut module = RpcModule::new(latest);
+        module
+            .register_method("eth_blockNumber", |_params, ctx, _| {
+                Ok::<String, jsonrpsee::types::ErrorObjectOwned>(format!("0x{:x}", *ctx))
+            })
+            .unwrap();
+
+        let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        let handle = server.start(module);
+        (handle, url)
+    }
+
+    #[tokio::test]
+    async fn test_block_fetcher_sync_target_already_reached() {
+        let (handle, url) = start_block_number_rpc(100).await;
+        let client = Arc::new(RpcClient::new(&url, &url).unwrap());
+
+        let (tx, _rx) = kanal::bounded::<u64>(16);
+        let config =
+            Arc::new(ChainSyncConfig { sync_target: Some(5), ..ChainSyncConfig::default() });
+        let shutdown = CancellationToken::new();
+
+        let result = block_fetcher(
+            client,
+            tx,
+            6,
+            config,
+            shutdown,
+            |_block, _salt, _mpt| unreachable!("should not fetch any blocks"),
+            None::<fn(u64)>,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_block_fetcher_shutdown_immediate() {
+        let (handle, url) = start_block_number_rpc(100).await;
+        let client = Arc::new(RpcClient::new(&url, &url).unwrap());
+
+        let (tx, _rx) = kanal::bounded::<u64>(16);
+        let config = Arc::new(ChainSyncConfig::default());
+        let shutdown = CancellationToken::new();
+
+        shutdown.cancel();
+
+        let result = block_fetcher(
+            client,
+            tx,
+            1,
+            config,
+            shutdown,
+            |_block, _salt, _mpt| unreachable!("should not fetch any blocks"),
+            None::<fn(u64)>,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_block_fetcher_invokes_on_remote_height() {
+        let (handle, url) = start_block_number_rpc(42).await;
+        let client = Arc::new(RpcClient::new(&url, &url).unwrap());
+
+        let (tx, _rx) = kanal::bounded::<u64>(16);
+        let config = Arc::new(ChainSyncConfig {
+            tracker_poll_interval: Duration::from_secs(60),
+            ..ChainSyncConfig::default()
+        });
+        let shutdown = CancellationToken::new();
+
+        let remote_height = Arc::new(Mutex::new(0u64));
+        let cb = {
+            let h = Arc::clone(&remote_height);
+            move |n: u64| {
+                *h.lock().unwrap() = n;
+            }
+        };
+
+        let shutdown_clone = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            shutdown_clone.cancel();
+        });
+
+        let result = block_fetcher(
+            client,
+            tx,
+            100,
+            config,
+            shutdown,
+            |_block, _salt, _mpt| unreachable!(),
+            Some(cb),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(*remote_height.lock().unwrap(), 42);
+        handle.stop().unwrap();
     }
 }

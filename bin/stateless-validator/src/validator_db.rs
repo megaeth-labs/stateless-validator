@@ -12,12 +12,12 @@ use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 use revm::state::Bytecode;
-use stateless_core::db::{BlockMeta, ChainStore, ContractStore, GenesisStore};
-use stateless_db::{
+use stateless_common::db::{
     ANCHOR_BLOCK, CANONICAL_CHAIN, CONTRACTS, DEFAULT_MAX_CHAIN_LENGTH, Database, GENESIS_CONFIG,
     db_add_contracts, db_get_anchor, db_get_block_hash, db_get_canonical_tip, db_get_contracts,
     db_get_earliest_block, db_reset_to_anchor, db_rollback_chain,
 };
+use stateless_core::db::{BlockMeta, ChainStore, ContractStore, GenesisStore};
 
 /// Minimal persistent storage backed by redb.
 pub struct ValidatorDB {
@@ -205,7 +205,7 @@ impl ChainStore for ValidatorDB {
 mod tests {
     use std::sync::Arc;
 
-    use stateless_db::ContractCache;
+    use stateless_common::db::ContractCache;
 
     use super::*;
 

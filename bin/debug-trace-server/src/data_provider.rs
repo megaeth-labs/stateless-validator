@@ -25,7 +25,8 @@ use eyre::Result;
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
-use stateless_core::{BlockStore, LightWitness, RpcClient, withdrawals::MptWitness};
+use stateless_common::RpcClient;
+use stateless_core::{BlockStore, LightWitness, withdrawals::MptWitness};
 use tokio::sync::broadcast;
 use tracing::{debug, instrument, trace, warn};
 

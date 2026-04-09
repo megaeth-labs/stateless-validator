@@ -9,8 +9,9 @@ use alloy_primitives::{B256, BlockNumber};
 use alloy_rpc_types_eth::{Block, BlockId};
 use eyre::{Result, anyhow};
 use op_alloy_rpc_types::Transaction;
+use stateless_common::RpcClient;
 use stateless_core::{
-    LightWitness, RpcClient,
+    LightWitness,
     chain_sync::{ChainSyncConfig, block_fetcher, find_divergence_point},
     db::{BlockMeta, BlockStore, ChainStore},
 };

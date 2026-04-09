@@ -7,7 +7,7 @@
 //! - [`BlockStore`]: Block/witness storage extension (debug-trace-server only)
 //!
 //! Concrete implementations live in their respective binaries;
-//! shared redb helpers live in the `stateless-db` crate.
+//! shared redb helpers live in the `stateless-common::db` module.
 
 use std::collections::HashMap;
 
@@ -65,6 +65,7 @@ pub struct ValidationTask {
 pub struct ValidatedBlock {
     pub block_number: BlockNumber,
     pub block_hash: BlockHash,
+    pub parent_hash: BlockHash,
     pub post_state_root: B256,
     pub post_withdrawals_root: B256,
     pub pre_state_root: B256,

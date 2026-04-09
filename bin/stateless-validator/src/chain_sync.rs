@@ -1,14 +1,16 @@
 //! Chain synchronization for the stateless validator binary.
 //!
-//! Contains the validation-specific [`chain_advancer`] (ordering + persistence) and
-//! [`validator_reorg_monitor`] (reorg detection + rollback).
+//! Contains the validation-specific [`chain_advancer`] (ordering + persistence)
+//! with inline parent-hash, state-root, and withdrawals-root continuity checks.
+//! On parent-hash mismatch (reorg), the advancer locates the divergence point,
+//! rolls back the chain, and returns a [`ReorgEvent`] so the caller can restart.
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc};
 
 use alloy_primitives::BlockNumber;
-use eyre::{Result, anyhow};
+use eyre::Result;
+use stateless_common::RpcClient;
 use stateless_core::{
-    RpcClient,
     chain_sync::find_divergence_point,
     db::{BlockMeta, ChainStore, ValidatedBlock, ValidationFailure},
 };
@@ -24,68 +26,6 @@ pub struct ReorgEvent {
     pub depth: u64,
 }
 
-/// Monitors the validator's canonical chain for reorgs.
-///
-/// Periodically compares the local canonical tip hash with the remote RPC.
-/// On mismatch, finds the divergence point, rolls back the chain, and returns
-/// a [`ReorgEvent`] signaling the caller to restart the pipeline.
-pub async fn validator_reorg_monitor(
-    client: Arc<RpcClient>,
-    store: Arc<dyn ChainStore>,
-    check_interval: Duration,
-    shutdown: CancellationToken,
-) -> Result<ReorgEvent> {
-    info!("[ReorgMonitor] Starting");
-
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep(check_interval) => {}
-            _ = shutdown.cancelled() => {
-                return Err(anyhow!("Shutdown requested"));
-            }
-        }
-
-        let Some(tip) = store.get_canonical_tip()? else {
-            continue;
-        };
-
-        // Compare local tip hash with RPC
-        let remote_hash = match client.get_block_hash(tip.block_number).await {
-            Ok(h) => h,
-            Err(e) => {
-                warn!(error = %e, "[ReorgMonitor] Failed to get remote hash, retrying");
-                continue;
-            }
-        };
-
-        if remote_hash == tip.block_hash {
-            continue; // chain is consistent
-        }
-
-        warn!(
-            block_number = tip.block_number,
-            local_hash = %tip.block_hash,
-            remote_hash = %remote_hash,
-            "[ReorgMonitor] Hash mismatch detected, resolving reorg"
-        );
-
-        let rollback_to = find_divergence_point(
-            &client,
-            &|n| store.get_block_hash(n),
-            &|| store.get_earliest_block(),
-            tip.block_number,
-        )
-        .await?;
-
-        let depth = tip.block_number.saturating_sub(rollback_to);
-        warn!(rollback_to, depth, "[ReorgMonitor] Rolling back chain");
-
-        store.rollback_chain(rollback_to)?;
-
-        return Ok(ReorgEvent { rollback_to, depth });
-    }
-}
-
 /// Collects validation results and advances the canonical chain in block-number order.
 ///
 /// Receives results from workers (potentially out of order), buffers them,
@@ -99,11 +39,12 @@ pub async fn validator_reorg_monitor(
 /// If any validation fails, returns `Err` immediately (process should exit).
 pub async fn chain_advancer<F>(
     rx: kanal::Receiver<std::result::Result<ValidatedBlock, ValidationFailure>>,
+    client: Arc<RpcClient>,
     store: Arc<dyn ChainStore>,
     initial_tip: BlockMeta,
     shutdown: CancellationToken,
     on_advance: Option<F>,
-) -> Result<()>
+) -> Result<Option<ReorgEvent>>
 where
     F: Fn(u64) + Send + Sync,
 {
@@ -121,12 +62,12 @@ where
                 Ok(r) => r,
                 Err(_) => {
                     info!("[Advancer] Channel closed, stopping");
-                    return Ok(());
+                    return Ok(None);
                 }
             },
             _ = shutdown.cancelled() => {
                 info!("[Advancer] Shutting down gracefully");
-                return Ok(());
+                return Ok(None);
             }
         };
 
@@ -174,6 +115,28 @@ where
                     validated.pre_withdrawals_root
                 ));
             }
+            if validated.parent_hash != current_tip.block_hash {
+                warn!(
+                    block_number = validated.block_number,
+                    expected = %current_tip.block_hash,
+                    got = %validated.parent_hash,
+                    "[Advancer] Parent hash mismatch detected, resolving reorg"
+                );
+
+                let rollback_to = find_divergence_point(
+                    &client,
+                    &|n| store.get_block_hash(n),
+                    &|| store.get_earliest_block(),
+                    current_tip.block_number,
+                )
+                .await?;
+
+                let depth = current_tip.block_number.saturating_sub(rollback_to);
+                warn!(rollback_to, depth, "[Advancer] Rolling back chain");
+                store.rollback_chain(rollback_to)?;
+
+                return Ok(Some(ReorgEvent { rollback_to, depth }));
+            }
 
             current_tip = BlockMeta {
                 block_number: validated.block_number,
@@ -211,6 +174,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, HashMap},
         sync::Mutex,
+        time::Duration,
     };
 
     use alloy_primitives::{B256, BlockHash, BlockNumber};
@@ -306,36 +270,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Helper to build ValidatedBlock with state-root continuity
-    // -----------------------------------------------------------------------
-
-    fn make_validated_block(number: u64, pre_state: B256, pre_withdrawals: B256) -> ValidatedBlock {
-        ValidatedBlock {
-            block_number: number,
-            block_hash: BlockHash::from([number as u8; 32]),
-            post_state_root: B256::from([(number + 100) as u8; 32]),
-            post_withdrawals_root: B256::from([(number + 200) as u8; 32]),
-            pre_state_root: pre_state,
-            pre_withdrawals_root: pre_withdrawals,
-        }
-    }
-
-    fn make_initial_tip(number: u64) -> BlockMeta {
-        BlockMeta {
-            block_number: number,
-            block_hash: BlockHash::from([number as u8; 32]),
-            post_state_root: B256::from([(number + 100) as u8; 32]),
-            post_withdrawals_root: B256::from([(number + 200) as u8; 32]),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Mock RPC server for reorg monitor tests
+    // Mock RPC server for tests requiring an RpcClient
     // -----------------------------------------------------------------------
 
     async fn start_mock_rpc(
         remote_hashes: HashMap<u64, BlockHash>,
-    ) -> (jsonrpsee::server::ServerHandle, String) {
+    ) -> (jsonrpsee::server::ServerHandle, Arc<RpcClient>) {
         use jsonrpsee::{RpcModule, server::ServerBuilder};
 
         let mut module = RpcModule::new(remote_hashes);
@@ -371,7 +311,38 @@ mod tests {
         let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", server.local_addr().unwrap());
         let handle = server.start(module);
-        (handle, url)
+        let client = Arc::new(RpcClient::new(&url, &url).unwrap());
+        (handle, client)
+    }
+
+    /// Starts a mock RPC with empty hashes (for tests that don't trigger reorg).
+    async fn mock_client() -> (jsonrpsee::server::ServerHandle, Arc<RpcClient>) {
+        start_mock_rpc(HashMap::new()).await
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper to build ValidatedBlock with state-root continuity
+    // -----------------------------------------------------------------------
+
+    fn make_validated_block(number: u64, pre_state: B256, pre_withdrawals: B256) -> ValidatedBlock {
+        ValidatedBlock {
+            block_number: number,
+            block_hash: BlockHash::from([number as u8; 32]),
+            parent_hash: BlockHash::from([(number - 1) as u8; 32]),
+            post_state_root: B256::from([(number + 100) as u8; 32]),
+            post_withdrawals_root: B256::from([(number + 200) as u8; 32]),
+            pre_state_root: pre_state,
+            pre_withdrawals_root: pre_withdrawals,
+        }
+    }
+
+    fn make_initial_tip(number: u64) -> BlockMeta {
+        BlockMeta {
+            block_number: number,
+            block_hash: BlockHash::from([number as u8; 32]),
+            post_state_root: B256::from([(number + 100) as u8; 32]),
+            post_withdrawals_root: B256::from([(number + 200) as u8; 32]),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -380,6 +351,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_chain_advancer_sequential_delivery() {
+        let (_rpc_handle, client) = mock_client().await;
         let initial_tip = make_initial_tip(10);
         let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
         let shutdown = CancellationToken::new();
@@ -390,6 +362,7 @@ mod tests {
         let shutdown_clone = shutdown.clone();
         let handle = tokio::spawn(chain_advancer(
             rx,
+            client,
             store_clone,
             initial_tip.clone(),
             shutdown_clone,
@@ -421,6 +394,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_chain_advancer_out_of_order_delivery() {
+        let (_rpc_handle, client) = mock_client().await;
         let initial_tip = make_initial_tip(10);
         let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
         let shutdown = CancellationToken::new();
@@ -431,6 +405,7 @@ mod tests {
         let shutdown_clone = shutdown.clone();
         let handle = tokio::spawn(chain_advancer(
             rx,
+            client,
             store_clone,
             initial_tip.clone(),
             shutdown_clone,
@@ -468,6 +443,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_chain_advancer_state_root_mismatch() {
+        let (_rpc_handle, client) = mock_client().await;
         let initial_tip = make_initial_tip(10);
         let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
         let shutdown = CancellationToken::new();
@@ -478,6 +454,7 @@ mod tests {
         let shutdown_clone = shutdown.clone();
         let handle = tokio::spawn(chain_advancer(
             rx,
+            client,
             store_clone,
             initial_tip.clone(),
             shutdown_clone,
@@ -488,6 +465,7 @@ mod tests {
         let bad_block = ValidatedBlock {
             block_number: 11,
             block_hash: BlockHash::from([11u8; 32]),
+            parent_hash: initial_tip.block_hash,
             post_state_root: B256::from([0xAAu8; 32]),
             post_withdrawals_root: B256::from([0xBBu8; 32]),
             pre_state_root: B256::from([0xFFu8; 32]), // wrong!
@@ -504,6 +482,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_chain_advancer_validation_failure_propagation() {
+        let (_rpc_handle, client) = mock_client().await;
         let initial_tip = make_initial_tip(10);
         let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
         let shutdown = CancellationToken::new();
@@ -514,6 +493,7 @@ mod tests {
         let shutdown_clone = shutdown.clone();
         let handle = tokio::spawn(chain_advancer(
             rx,
+            client,
             store_clone,
             initial_tip.clone(),
             shutdown_clone,
@@ -536,6 +516,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_chain_advancer_shutdown() {
+        let (_rpc_handle, client) = mock_client().await;
         let initial_tip = make_initial_tip(10);
         let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
         let shutdown = CancellationToken::new();
@@ -547,6 +528,7 @@ mod tests {
         let shutdown_clone = shutdown.clone();
         let handle = tokio::spawn(chain_advancer(
             rx,
+            client,
             store_clone,
             initial_tip,
             shutdown_clone,
@@ -565,6 +547,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_chain_advancer_invokes_callback() {
+        let (_rpc_handle, client) = mock_client().await;
         let initial_tip = make_initial_tip(10);
         let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
         let shutdown = CancellationToken::new();
@@ -583,6 +566,7 @@ mod tests {
         let shutdown_clone = shutdown.clone();
         let handle = tokio::spawn(chain_advancer(
             rx,
+            client,
             store_clone,
             initial_tip.clone(),
             shutdown_clone,
@@ -611,80 +595,50 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // validator_reorg_monitor tests
+    // parent_hash mismatch (reorg) test
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_validator_reorg_monitor_detects_reorg() {
-        // Local chain: blocks 1..=10, all with hash [n; 32]
-        let anchor = make_initial_tip(1);
-        let store = Arc::new(MockChainStore::with_anchor(anchor));
-        let blocks: Vec<BlockMeta> = (2..=10)
-            .map(|n| BlockMeta {
-                block_number: n,
-                block_hash: BlockHash::from([n as u8; 32]),
-                post_state_root: B256::from([(n + 100) as u8; 32]),
-                post_withdrawals_root: B256::from([(n + 200) as u8; 32]),
-            })
-            .collect();
-        store.advance_chain(&blocks).unwrap();
-
-        // Remote: blocks 1..=8 match, 9 and 10 diverge
+    async fn test_chain_advancer_parent_hash_mismatch_triggers_reorg() {
+        // Remote RPC: block 10 matches local hash — divergence point is 10
         let mut remote = HashMap::new();
-        for n in 1..=8 {
-            remote.insert(n, B256::from([n as u8; 32]));
-        }
-        remote.insert(9, B256::from([0xA9u8; 32]));
-        remote.insert(10, B256::from([0xAAu8; 32]));
+        remote.insert(10, BlockHash::from([10u8; 32]));
+        let (_rpc_handle, client) = start_mock_rpc(remote).await;
 
-        let (handle, url) = start_mock_rpc(remote).await;
-        let client = Arc::new(stateless_core::RpcClient::new(&url, &url).unwrap());
-
+        let initial_tip = make_initial_tip(10);
+        let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
         let shutdown = CancellationToken::new();
-        let event = validator_reorg_monitor(
+
+        let (tx, rx) = kanal::bounded(16);
+
+        let store_clone = Arc::clone(&store);
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(chain_advancer(
+            rx,
             client,
-            store.clone() as Arc<dyn ChainStore>,
-            Duration::from_millis(10),
-            shutdown,
-        )
-        .await
-        .unwrap();
+            store_clone,
+            initial_tip.clone(),
+            shutdown_clone,
+            None::<fn(u64)>,
+        ));
 
-        assert_eq!(event.rollback_to, 8);
-        assert_eq!(event.depth, 2);
+        // Send block 11 with wrong parent_hash (simulating a reorg)
+        let bad_block = ValidatedBlock {
+            block_number: 11,
+            block_hash: BlockHash::from([11u8; 32]),
+            parent_hash: BlockHash::from([0xFFu8; 32]), // wrong!
+            post_state_root: B256::from([0xAAu8; 32]),
+            post_withdrawals_root: B256::from([0xBBu8; 32]),
+            pre_state_root: initial_tip.post_state_root,
+            pre_withdrawals_root: initial_tip.post_withdrawals_root,
+        };
 
-        // Chain should be rolled back
-        let tip = store.tip().unwrap();
-        assert_eq!(tip.block_number, 8);
+        tx.send(Ok(bad_block)).unwrap();
+        drop(tx);
 
-        handle.stop().unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_validator_reorg_monitor_shutdown() {
-        let anchor = make_initial_tip(1);
-        let store = Arc::new(MockChainStore::with_anchor(anchor));
-
-        // Remote matches local — no reorg
-        let mut remote = HashMap::new();
-        remote.insert(1, B256::from([1u8; 32]));
-
-        let (handle, url) = start_mock_rpc(remote).await;
-        let client = Arc::new(stateless_core::RpcClient::new(&url, &url).unwrap());
-
-        let shutdown = CancellationToken::new();
-        shutdown.cancel();
-
-        let result = validator_reorg_monitor(
-            client,
-            store as Arc<dyn ChainStore>,
-            Duration::from_millis(10),
-            shutdown,
-        )
-        .await;
-
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Shutdown"));
-        handle.stop().unwrap();
+        let result = handle.await.unwrap().unwrap();
+        let reorg = result.expect("should return ReorgEvent");
+        assert_eq!(reorg.rollback_to, 10);
+        assert_eq!(reorg.depth, 0); // tip was 10, rollback to 10
     }
 }

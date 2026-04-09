@@ -11,16 +11,16 @@ use op_alloy_rpc_types::Transaction;
 use rayon::prelude::*;
 use redb::{ReadableDatabase, ReadableTable};
 use revm::state::Bytecode;
-use stateless_core::{
-    LightWitness,
-    db::{BlockMeta, BlockStore, ChainStore, ContractStore, PrunableChainStore},
-};
-use stateless_db::{
+use stateless_common::db::{
     ANCHOR_BLOCK, BLOCK_DATA, BLOCK_RECORDS, CANONICAL_CHAIN, CONTRACTS, Database, MissingDataKind,
     ValidationDbError, ValidationDbResult, WITNESSES, db_add_contracts, db_advance_chain,
     db_get_anchor, db_get_block_hash, db_get_canonical_tip, db_get_contracts,
     db_get_earliest_block, db_reset_to_anchor, db_rollback_chain, decode_block_from_slice,
     decode_from_slice, encode_block_to_vec, encode_to_vec,
+};
+use stateless_core::{
+    LightWitness,
+    db::{BlockMeta, BlockStore, ChainStore, ContractStore, PrunableChainStore},
 };
 
 /// Block storage and chain tracking database for debug-trace-server.
