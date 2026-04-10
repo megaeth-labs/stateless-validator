@@ -1,644 +1,290 @@
-//! Chain synchronization for the stateless validator binary.
+//! Validator-specific pipeline components.
 //!
-//! Contains the validation-specific [`chain_advancer`] (ordering + persistence)
-//! with inline parent-hash, state-root, and withdrawals-root continuity checks.
-//! On parent-hash mismatch (reorg), the advancer locates the divergence point,
-//! rolls back the chain, and returns a [`ReorgEvent`] so the caller can restart.
+//! Provides [`ValidatorProcessor`] (block validation via [`validate_block`]) and
+//! [`ValidatorHooks`] (metrics integration) for the shared pipeline in
+//! [`stateless_core::pipeline::run_pipeline`].
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::HashSet, sync::Arc};
 
-use alloy_primitives::BlockNumber;
-use eyre::Result;
-use stateless_common::RpcClient;
+use alloy_primitives::{B256, BlockHash, BlockNumber};
+use alloy_rpc_types_eth::Block;
+use eyre::ensure;
+use futures::future;
+use op_alloy_rpc_types::Transaction;
+use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
+use salt::SaltWitness;
+use stateless_common::{RpcClient, db::ContractCache};
 use stateless_core::{
-    chain_sync::find_divergence_point,
-    db::{BlockMeta, ChainStore, ValidatedBlock, ValidationFailure},
+    chain_spec::ChainSpec,
+    data_types::{PlainKey, PlainValue},
+    db::BlockMeta,
+    executor::validate_block,
+    pipeline::{BlockProcessor, PipelineHooks, ProcessedBlock},
+    withdrawals::MptWitness,
 };
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tokio::task;
+use tracing::{error, info};
 
-/// Result of reorg detection — signals the validator to restart its pipeline.
-#[derive(Debug)]
-pub struct ReorgEvent {
-    /// Block number to roll back to (inclusive).
-    pub rollback_to: BlockNumber,
-    /// Depth of the reorg (number of reverted blocks).
-    pub depth: u64,
+use crate::metrics;
+
+/// Block with all data needed for validation, flowing through the fetch→worker channel.
+#[derive(Clone, Debug)]
+pub struct ValidationTask {
+    pub block: Block<Transaction>,
+    pub salt_witness: SaltWitness,
+    pub mpt_witness: MptWitness,
 }
 
-/// Collects validation results and advances the canonical chain in block-number order.
-///
-/// Receives results from workers (potentially out of order), buffers them,
-/// and advances the canonical tip in strict sequence. Batches multiple consecutive
-/// blocks into a single persistence write.
-///
-/// The optional `on_advance` callback is invoked after each batch of blocks is
-/// persisted, receiving the new tip block number. Use this to update metrics or
-/// notify external systems.
-///
-/// If any validation fails, returns `Err` immediately (process should exit).
-pub async fn chain_advancer<F>(
-    rx: kanal::Receiver<std::result::Result<ValidatedBlock, ValidationFailure>>,
-    client: Arc<RpcClient>,
-    store: Arc<dyn ChainStore>,
-    initial_tip: BlockMeta,
-    shutdown: CancellationToken,
-    on_advance: Option<F>,
-) -> Result<Option<ReorgEvent>>
-where
-    F: Fn(u64) + Send + Sync,
-{
-    let rx = rx.to_async();
-    let mut next_expected = initial_tip.block_number + 1;
-    let mut current_tip = initial_tip;
-    let mut buffer: BTreeMap<u64, ValidatedBlock> = BTreeMap::new();
-
-    info!(start_block = next_expected, "[Advancer] Starting chain advancer");
-
-    loop {
-        // Receive next result
-        let result = tokio::select! {
-            r = rx.recv() => match r {
-                Ok(r) => r,
-                Err(_) => {
-                    info!("[Advancer] Channel closed, stopping");
-                    return Ok(None);
-                }
-            },
-            _ = shutdown.cancelled() => {
-                info!("[Advancer] Shutting down gracefully");
-                return Ok(None);
-            }
-        };
-
-        match result {
-            Err(failure) => {
-                error!(
-                    block_number = failure.block_number,
-                    block_hash = %failure.block_hash,
-                    error = %failure.error,
-                    "[Advancer] Validation failed, terminating"
-                );
-                return Err(eyre::eyre!(
-                    "Block {} ({}) validation failed: {}",
-                    failure.block_number,
-                    failure.block_hash,
-                    failure.error
-                ));
-            }
-            Ok(validated) => {
-                debug!(
-                    block_number = validated.block_number,
-                    "[Advancer] Received validated block"
-                );
-                buffer.insert(validated.block_number, validated);
-            }
-        }
-
-        // Drain consecutive blocks from buffer
-        let mut new_blocks = Vec::new();
-        while let Some(validated) = buffer.remove(&next_expected) {
-            // Verify state root continuity
-            if validated.pre_state_root != current_tip.post_state_root {
-                return Err(eyre::eyre!(
-                    "Block {} pre_state_root mismatch: expected {:?}, got {:?}",
-                    validated.block_number,
-                    current_tip.post_state_root,
-                    validated.pre_state_root
-                ));
-            }
-            if validated.pre_withdrawals_root != current_tip.post_withdrawals_root {
-                return Err(eyre::eyre!(
-                    "Block {} pre_withdrawals_root mismatch: expected {:?}, got {:?}",
-                    validated.block_number,
-                    current_tip.post_withdrawals_root,
-                    validated.pre_withdrawals_root
-                ));
-            }
-            if validated.parent_hash != current_tip.block_hash {
-                warn!(
-                    block_number = validated.block_number,
-                    expected = %current_tip.block_hash,
-                    got = %validated.parent_hash,
-                    "[Advancer] Parent hash mismatch detected, resolving reorg"
-                );
-
-                let rollback_to = find_divergence_point(
-                    &client,
-                    &|n| store.get_block_hash(n),
-                    &|| store.get_earliest_block(),
-                    current_tip.block_number,
-                )
-                .await?;
-
-                let depth = current_tip.block_number.saturating_sub(rollback_to);
-                warn!(rollback_to, depth, "[Advancer] Rolling back chain");
-                store.rollback_chain(rollback_to)?;
-
-                return Ok(Some(ReorgEvent { rollback_to, depth }));
-            }
-
-            current_tip = BlockMeta {
-                block_number: validated.block_number,
-                block_hash: validated.block_hash,
-                post_state_root: validated.post_state_root,
-                post_withdrawals_root: validated.post_withdrawals_root,
-            };
-            new_blocks.push(current_tip.clone());
-            next_expected += 1;
-        }
-
-        // Batch-persist new blocks and update tip
-        if !new_blocks.is_empty() {
-            let advanced = new_blocks.len();
-            store.advance_chain(&new_blocks)?;
-            if let Some(ref callback) = on_advance {
-                callback(current_tip.block_number);
-            }
-            debug!(
-                tip = current_tip.block_number,
-                advanced = advanced,
-                buffered = buffer.len(),
-                "[Advancer] Chain advanced"
-            );
-        }
-    }
+/// Result of successfully validating a block, flowing through the worker→advancer channel.
+#[derive(Debug, Clone)]
+pub struct ValidatedBlock {
+    pub block_number: BlockNumber,
+    pub block_hash: BlockHash,
+    pub parent_hash: BlockHash,
+    pub post_state_root: B256,
+    pub post_withdrawals_root: B256,
+    pub pre_state_root: B256,
+    pub pre_withdrawals_root: B256,
 }
 
-// ===========================================================================
-// Unit tests
-// ===========================================================================
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        collections::{BTreeMap, HashMap},
-        sync::Mutex,
-        time::Duration,
-    };
-
-    use alloy_primitives::{B256, BlockHash, BlockNumber};
-
-    use super::*;
-
-    // -----------------------------------------------------------------------
-    // In-memory mock ChainStore for testing pipeline logic without redb
-    // -----------------------------------------------------------------------
-
-    #[derive(Default)]
-    struct MockChainStoreInner {
-        chain: BTreeMap<u64, BlockMeta>,
-        anchor: Option<BlockMeta>,
+impl ProcessedBlock for ValidatedBlock {
+    fn block_number(&self) -> BlockNumber {
+        self.block_number
     }
 
-    struct MockChainStore {
-        inner: Mutex<MockChainStoreInner>,
+    fn block_hash(&self) -> BlockHash {
+        self.block_hash
     }
 
-    impl MockChainStore {
-        fn with_anchor(anchor: BlockMeta) -> Self {
-            let mut inner = MockChainStoreInner::default();
-            inner.chain.insert(anchor.block_number, anchor.clone());
-            inner.anchor = Some(anchor);
-            Self { inner: Mutex::new(inner) }
-        }
-
-        fn tip(&self) -> Option<BlockMeta> {
-            let inner = self.inner.lock().unwrap();
-            inner.chain.values().last().cloned()
-        }
+    fn parent_hash(&self) -> BlockHash {
+        self.parent_hash
     }
 
-    impl stateless_core::db::ContractStore for MockChainStore {
-        fn get_contracts(
-            &self,
-            _hashes: &[B256],
-        ) -> eyre::Result<(HashMap<B256, revm::state::Bytecode>, Vec<B256>)> {
-            Ok((HashMap::new(), vec![]))
-        }
-
-        fn add_contracts(&self, _codes: &[(B256, revm::state::Bytecode)]) -> eyre::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl ChainStore for MockChainStore {
-        fn get_canonical_tip(&self) -> eyre::Result<Option<BlockMeta>> {
-            Ok(self.tip())
-        }
-
-        fn get_anchor(&self) -> eyre::Result<Option<BlockMeta>> {
-            Ok(self.inner.lock().unwrap().anchor.clone())
-        }
-
-        fn advance_chain(&self, blocks: &[BlockMeta]) -> eyre::Result<()> {
-            let mut inner = self.inner.lock().unwrap();
-            for block in blocks {
-                inner.chain.insert(block.block_number, block.clone());
-            }
-            Ok(())
-        }
-
-        fn get_block_hash(&self, block_number: BlockNumber) -> eyre::Result<Option<BlockHash>> {
-            Ok(self.inner.lock().unwrap().chain.get(&block_number).map(|b| b.block_hash))
-        }
-
-        fn get_earliest_block(&self) -> eyre::Result<Option<(BlockNumber, BlockHash)>> {
-            Ok(self
-                .inner
-                .lock()
-                .unwrap()
-                .chain
-                .values()
-                .next()
-                .map(|b| (b.block_number, b.block_hash)))
-        }
-
-        fn rollback_chain(&self, to_block: BlockNumber) -> eyre::Result<()> {
-            let mut inner = self.inner.lock().unwrap();
-            inner.chain.retain(|&n, _| n <= to_block);
-            Ok(())
-        }
-
-        fn reset_to_anchor(&self, anchor: &BlockMeta) -> eyre::Result<()> {
-            let mut inner = self.inner.lock().unwrap();
-            inner.chain.clear();
-            inner.chain.insert(anchor.block_number, anchor.clone());
-            inner.anchor = Some(anchor.clone());
-            Ok(())
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Mock RPC server for tests requiring an RpcClient
-    // -----------------------------------------------------------------------
-
-    async fn start_mock_rpc(
-        remote_hashes: HashMap<u64, BlockHash>,
-    ) -> (jsonrpsee::server::ServerHandle, Arc<RpcClient>) {
-        use jsonrpsee::{RpcModule, server::ServerBuilder};
-
-        let mut module = RpcModule::new(remote_hashes);
-        module
-            .register_method("eth_getHeaderByNumber", |params, ctx, _| {
-                let (hex_number,): (String,) = params.parse().unwrap();
-                let block_number =
-                    u64::from_str_radix(hex_number.strip_prefix("0x").unwrap_or(&hex_number), 16)
-                        .unwrap();
-                let hash = ctx.get(&block_number).copied().unwrap_or_default();
-                Ok::<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
-                    "hash": hash,
-                    "number": format!("0x{block_number:x}"),
-                    "parentHash": B256::ZERO,
-                    "timestamp": "0x0",
-                    "stateRoot": B256::ZERO,
-                    "transactionsRoot": B256::ZERO,
-                    "receiptsRoot": B256::ZERO,
-                    "logsBloom": alloy_primitives::Bloom::ZERO,
-                    "gasUsed": "0x0",
-                    "gasLimit": "0x0",
-                    "mixHash": B256::ZERO,
-                    "nonce": "0x0000000000000000",
-                    "extraData": "0x",
-                    "difficulty": "0x0",
-                    "sha3Uncles": B256::ZERO,
-                    "miner": alloy_primitives::Address::ZERO,
-                    "baseFeePerGas": "0x0"
-                }))
-            })
-            .unwrap();
-
-        let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", server.local_addr().unwrap());
-        let handle = server.start(module);
-        let client = Arc::new(RpcClient::new(&url, &url).unwrap());
-        (handle, client)
-    }
-
-    /// Starts a mock RPC with empty hashes (for tests that don't trigger reorg).
-    async fn mock_client() -> (jsonrpsee::server::ServerHandle, Arc<RpcClient>) {
-        start_mock_rpc(HashMap::new()).await
-    }
-
-    // -----------------------------------------------------------------------
-    // Helper to build ValidatedBlock with state-root continuity
-    // -----------------------------------------------------------------------
-
-    fn make_validated_block(number: u64, pre_state: B256, pre_withdrawals: B256) -> ValidatedBlock {
-        ValidatedBlock {
-            block_number: number,
-            block_hash: BlockHash::from([number as u8; 32]),
-            parent_hash: BlockHash::from([(number - 1) as u8; 32]),
-            post_state_root: B256::from([(number + 100) as u8; 32]),
-            post_withdrawals_root: B256::from([(number + 200) as u8; 32]),
-            pre_state_root: pre_state,
-            pre_withdrawals_root: pre_withdrawals,
-        }
-    }
-
-    fn make_initial_tip(number: u64) -> BlockMeta {
+    fn to_block_meta(&self) -> BlockMeta {
         BlockMeta {
-            block_number: number,
-            block_hash: BlockHash::from([number as u8; 32]),
-            post_state_root: B256::from([(number + 100) as u8; 32]),
-            post_withdrawals_root: B256::from([(number + 200) as u8; 32]),
+            block_number: self.block_number,
+            block_hash: self.block_hash,
+            post_state_root: self.post_state_root,
+            post_withdrawals_root: self.post_withdrawals_root,
         }
     }
 
-    // -----------------------------------------------------------------------
-    // chain_advancer tests
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_chain_advancer_sequential_delivery() {
-        let (_rpc_handle, client) = mock_client().await;
-        let initial_tip = make_initial_tip(10);
-        let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
-        let shutdown = CancellationToken::new();
-
-        let (tx, rx) = kanal::bounded(16);
-
-        let store_clone = Arc::clone(&store);
-        let shutdown_clone = shutdown.clone();
-        let handle = tokio::spawn(chain_advancer(
-            rx,
-            client,
-            store_clone,
-            initial_tip.clone(),
-            shutdown_clone,
-            None::<fn(u64)>,
-        ));
-
-        // Send blocks 11, 12, 13 in order
-        let block11 = make_validated_block(
-            11,
-            initial_tip.post_state_root,
-            initial_tip.post_withdrawals_root,
+    fn verify_continuity(&self, previous_tip: &BlockMeta) -> eyre::Result<()> {
+        ensure!(
+            self.pre_state_root == previous_tip.post_state_root,
+            "State root mismatch at block {}: expected {:?}, got {:?}",
+            self.block_number,
+            previous_tip.post_state_root,
+            self.pre_state_root,
         );
-        let block12 =
-            make_validated_block(12, block11.post_state_root, block11.post_withdrawals_root);
-        let block13 =
-            make_validated_block(13, block12.post_state_root, block12.post_withdrawals_root);
-
-        tx.send(Ok(block11)).unwrap();
-        tx.send(Ok(block12)).unwrap();
-        tx.send(Ok(block13)).unwrap();
-
-        // Close channel to let advancer finish
-        drop(tx);
-        handle.await.unwrap().unwrap();
-
-        let tip = store.tip().unwrap();
-        assert_eq!(tip.block_number, 13);
-    }
-
-    #[tokio::test]
-    async fn test_chain_advancer_out_of_order_delivery() {
-        let (_rpc_handle, client) = mock_client().await;
-        let initial_tip = make_initial_tip(10);
-        let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
-        let shutdown = CancellationToken::new();
-
-        let (tx, rx) = kanal::bounded(16);
-
-        let store_clone = Arc::clone(&store);
-        let shutdown_clone = shutdown.clone();
-        let handle = tokio::spawn(chain_advancer(
-            rx,
-            client,
-            store_clone,
-            initial_tip.clone(),
-            shutdown_clone,
-            None::<fn(u64)>,
-        ));
-
-        // Build a chain: 11 -> 12 -> 13
-        let block11 = make_validated_block(
-            11,
-            initial_tip.post_state_root,
-            initial_tip.post_withdrawals_root,
+        ensure!(
+            self.pre_withdrawals_root == previous_tip.post_withdrawals_root,
+            "Withdrawals root mismatch at block {}: expected {:?}, got {:?}",
+            self.block_number,
+            previous_tip.post_withdrawals_root,
+            self.pre_withdrawals_root,
         );
-        let block12 =
-            make_validated_block(12, block11.post_state_root, block11.post_withdrawals_root);
-        let block13 =
-            make_validated_block(13, block12.post_state_root, block12.post_withdrawals_root);
-
-        // Send out of order: 13, 12, 11
-        tx.send(Ok(block13)).unwrap();
-        tx.send(Ok(block12)).unwrap();
-
-        // After sending 13, 12 — neither should be advanced yet (missing 11)
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let tip = store.tip().unwrap();
-        assert_eq!(tip.block_number, 10, "tip should still be 10 until block 11 arrives");
-
-        // Now send 11 — all three should drain
-        tx.send(Ok(block11)).unwrap();
-        drop(tx);
-        handle.await.unwrap().unwrap();
-
-        let tip = store.tip().unwrap();
-        assert_eq!(tip.block_number, 13);
+        Ok(())
     }
+}
 
-    #[tokio::test]
-    async fn test_chain_advancer_state_root_mismatch() {
-        let (_rpc_handle, client) = mock_client().await;
-        let initial_tip = make_initial_tip(10);
-        let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
-        let shutdown = CancellationToken::new();
+/// Validation failure sent from worker to advancer.
+#[derive(Debug)]
+pub struct ValidationFailure {
+    pub block_number: BlockNumber,
+    pub block_hash: BlockHash,
+    pub error: String,
+}
 
-        let (tx, rx) = kanal::bounded(16);
-
-        let store_clone = Arc::clone(&store);
-        let shutdown_clone = shutdown.clone();
-        let handle = tokio::spawn(chain_advancer(
-            rx,
-            client,
-            store_clone,
-            initial_tip.clone(),
-            shutdown_clone,
-            None::<fn(u64)>,
-        ));
-
-        // Send block 11 with wrong pre_state_root
-        let bad_block = ValidatedBlock {
-            block_number: 11,
-            block_hash: BlockHash::from([11u8; 32]),
-            parent_hash: initial_tip.block_hash,
-            post_state_root: B256::from([0xAAu8; 32]),
-            post_withdrawals_root: B256::from([0xBBu8; 32]),
-            pre_state_root: B256::from([0xFFu8; 32]), // wrong!
-            pre_withdrawals_root: initial_tip.post_withdrawals_root,
-        };
-
-        tx.send(Ok(bad_block)).unwrap();
-        drop(tx);
-
-        let result = handle.await.unwrap();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("pre_state_root mismatch"));
+impl std::fmt::Display for ValidationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Block {} ({}) validation failed: {}",
+            self.block_number, self.block_hash, self.error
+        )
     }
+}
 
-    #[tokio::test]
-    async fn test_chain_advancer_validation_failure_propagation() {
-        let (_rpc_handle, client) = mock_client().await;
-        let initial_tip = make_initial_tip(10);
-        let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
-        let shutdown = CancellationToken::new();
+/// Block processor for the validator: validates blocks using EVM execution.
+pub struct ValidatorProcessor {
+    pub chain_spec: Arc<ChainSpec>,
+    pub contract_cache: Arc<ContractCache>,
+    pub rpc_client: Arc<RpcClient>,
+}
 
-        let (tx, rx) = kanal::bounded(16);
+impl BlockProcessor for ValidatorProcessor {
+    type Input = ValidationTask;
+    type Output = ValidatedBlock;
+    type Error = ValidationFailure;
 
-        let store_clone = Arc::clone(&store);
-        let shutdown_clone = shutdown.clone();
-        let handle = tokio::spawn(chain_advancer(
-            rx,
-            client,
-            store_clone,
-            initial_tip.clone(),
-            shutdown_clone,
-            None::<fn(u64)>,
-        ));
+    async fn process(
+        &self,
+        task: ValidationTask,
+    ) -> std::result::Result<ValidatedBlock, ValidationFailure> {
+        let block_number = task.block.header.number;
+        let block_hash = task.block.header.hash;
+        let tx_count = task.block.transactions.len() as u64;
+        let gas_used = task.block.header.gas_used;
+        let start = std::time::Instant::now();
 
-        // Send a validation failure
-        tx.send(Err(ValidationFailure {
-            block_number: 11,
-            block_hash: BlockHash::from([11u8; 32]),
-            error: "execution reverted".to_string(),
-        }))
-        .unwrap();
-        drop(tx);
+        // Resolve contract codes
+        let codehashes = extract_contract_codes(&task.salt_witness);
+        let (mut contracts, missing_contracts) = self
+            .contract_cache
+            .get(&codehashes.iter().copied().collect::<Vec<_>>())
+            .map_err(|e| ValidationFailure {
+                block_number,
+                block_hash,
+                error: format!("Failed to get contracts: {e}"),
+            })?;
 
-        let result = handle.await.unwrap();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("execution reverted"));
-    }
+        metrics::on_contract_cache_read(contracts.len() as u64, missing_contracts.len() as u64);
 
-    #[tokio::test]
-    async fn test_chain_advancer_shutdown() {
-        let (_rpc_handle, client) = mock_client().await;
-        let initial_tip = make_initial_tip(10);
-        let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
-        let shutdown = CancellationToken::new();
+        if !missing_contracts.is_empty() {
+            let client = self.rpc_client.clone();
+            let codes = future::try_join_all(missing_contracts.iter().map(|&hash| {
+                let client = client.clone();
+                async move { client.get_code(hash).await }
+            }))
+            .await
+            .map_err(|e| ValidationFailure {
+                block_number,
+                block_hash,
+                error: format!("Failed to fetch contracts: {e}"),
+            })?;
 
-        let (_tx, rx) =
-            kanal::bounded::<std::result::Result<ValidatedBlock, ValidationFailure>>(16);
+            let new_bytecodes: Vec<_> = missing_contracts
+                .into_iter()
+                .zip(codes.iter())
+                .map(|(code_hash, bytes)| {
+                    let bytecode = Bytecode::new_raw(bytes.clone());
+                    let computed_hash = bytecode.hash_slow();
+                    ensure!(
+                        computed_hash == code_hash,
+                        "RPC provider returned bytecode with unexpected codehash: expected {code_hash:?}, got {computed_hash:?}",
+                    );
+                    Ok((computed_hash, bytecode))
+                })
+                .collect::<eyre::Result<_>>()
+                .map_err(|e| ValidationFailure {
+                    block_number,
+                    block_hash,
+                    error: format!("Contract hash mismatch: {e}"),
+                })?;
 
-        let store_clone = Arc::clone(&store);
-        let shutdown_clone = shutdown.clone();
-        let handle = tokio::spawn(chain_advancer(
-            rx,
-            client,
-            store_clone,
-            initial_tip,
-            shutdown_clone,
-            None::<fn(u64)>,
-        ));
+            self.contract_cache.insert(&new_bytecodes).map_err(|e| ValidationFailure {
+                block_number,
+                block_hash,
+                error: format!("Failed to cache contracts: {e}"),
+            })?;
+            contracts.extend(new_bytecodes);
+        }
 
-        // Cancel shutdown — advancer should exit cleanly
-        shutdown.cancel();
-        let result = handle.await.unwrap();
-        assert!(result.is_ok());
-    }
+        // Extract fields before moving data into spawn_blocking
+        let parent_hash = task.block.header.parent_hash;
+        let pre_state_root =
+            B256::from(task.salt_witness.state_root().map_err(|e| ValidationFailure {
+                block_number,
+                block_hash,
+                error: format!("Failed to compute state root: {e}"),
+            })?);
+        let post_state_root = task.block.header.state_root;
+        let pre_withdrawals_root = task.mpt_witness.storage_root;
+        let post_withdrawals_root =
+            task.block.header.withdrawals_root.ok_or(ValidationFailure {
+                block_number,
+                block_hash,
+                error: "Withdrawals root not found in block".to_string(),
+            })?;
 
-    // -----------------------------------------------------------------------
-    // chain_advancer callback test
-    // -----------------------------------------------------------------------
+        // Validate in a blocking thread
+        let chain_spec = self.chain_spec.clone();
+        let validation_result = task::spawn_blocking(move || {
+            validate_block(
+                &chain_spec,
+                &task.block,
+                task.salt_witness,
+                task.mpt_witness,
+                &contracts,
+                None,
+            )
+        })
+        .await
+        .map_err(|e| ValidationFailure {
+            block_number,
+            block_hash,
+            error: format!("Validation task panicked: {e}"),
+        })?;
 
-    #[tokio::test]
-    async fn test_chain_advancer_invokes_callback() {
-        let (_rpc_handle, client) = mock_client().await;
-        let initial_tip = make_initial_tip(10);
-        let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
-        let shutdown = CancellationToken::new();
-
-        let (tx, rx) = kanal::bounded(16);
-
-        let callback_values = Arc::new(Mutex::new(Vec::<u64>::new()));
-        let cb = {
-            let values = Arc::clone(&callback_values);
-            move |block_number: u64| {
-                values.lock().unwrap().push(block_number);
+        match &validation_result {
+            Ok(stats) => {
+                info!(block_number, "[Worker] Successfully validated block");
+                metrics::on_validation_success(
+                    start.elapsed().as_secs_f64(),
+                    stats.witness_verification_time,
+                    stats.block_replay_time,
+                    stats.salt_update_time,
+                    tx_count,
+                    gas_used,
+                    stats.state_reads,
+                    stats.state_writes,
+                );
+                Ok(ValidatedBlock {
+                    block_number,
+                    block_hash,
+                    parent_hash,
+                    post_state_root,
+                    post_withdrawals_root,
+                    pre_state_root,
+                    pre_withdrawals_root,
+                })
             }
-        };
-
-        let store_clone = Arc::clone(&store);
-        let shutdown_clone = shutdown.clone();
-        let handle = tokio::spawn(chain_advancer(
-            rx,
-            client,
-            store_clone,
-            initial_tip.clone(),
-            shutdown_clone,
-            Some(cb),
-        ));
-
-        let block11 = make_validated_block(
-            11,
-            initial_tip.post_state_root,
-            initial_tip.post_withdrawals_root,
-        );
-        let block12 =
-            make_validated_block(12, block11.post_state_root, block11.post_withdrawals_root);
-
-        tx.send(Ok(block11)).unwrap();
-        tx.send(Ok(block12)).unwrap();
-        drop(tx);
-
-        handle.await.unwrap().unwrap();
-
-        let values = callback_values.lock().unwrap();
-        // Callback should have been invoked with the tip block numbers after each advance
-        assert!(values.contains(&11) || values.contains(&12));
-        // The last call should be for block 12
-        assert_eq!(*values.last().unwrap(), 12);
+            Err(e) => {
+                error!(block_number, error = %e, "[Worker] Failed to validate block");
+                Err(ValidationFailure { block_number, block_hash, error: e.to_string() })
+            }
+        }
     }
 
-    // -----------------------------------------------------------------------
-    // parent_hash mismatch (reorg) test
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_chain_advancer_parent_hash_mismatch_triggers_reorg() {
-        // Remote RPC: block 10 matches local hash — divergence point is 10
-        let mut remote = HashMap::new();
-        remote.insert(10, BlockHash::from([10u8; 32]));
-        let (_rpc_handle, client) = start_mock_rpc(remote).await;
-
-        let initial_tip = make_initial_tip(10);
-        let store = Arc::new(MockChainStore::with_anchor(initial_tip.clone()));
-        let shutdown = CancellationToken::new();
-
-        let (tx, rx) = kanal::bounded(16);
-
-        let store_clone = Arc::clone(&store);
-        let shutdown_clone = shutdown.clone();
-        let handle = tokio::spawn(chain_advancer(
-            rx,
-            client,
-            store_clone,
-            initial_tip.clone(),
-            shutdown_clone,
-            None::<fn(u64)>,
-        ));
-
-        // Send block 11 with wrong parent_hash (simulating a reorg)
-        let bad_block = ValidatedBlock {
-            block_number: 11,
-            block_hash: BlockHash::from([11u8; 32]),
-            parent_hash: BlockHash::from([0xFFu8; 32]), // wrong!
-            post_state_root: B256::from([0xAAu8; 32]),
-            post_withdrawals_root: B256::from([0xBBu8; 32]),
-            pre_state_root: initial_tip.post_state_root,
-            pre_withdrawals_root: initial_tip.post_withdrawals_root,
-        };
-
-        tx.send(Ok(bad_block)).unwrap();
-        drop(tx);
-
-        let result = handle.await.unwrap().unwrap();
-        let reorg = result.expect("should return ReorgEvent");
-        assert_eq!(reorg.rollback_to, 10);
-        assert_eq!(reorg.depth, 0); // tip was 10, rollback to 10
+    fn on_task_done(&self, worker_id: usize, success: bool) {
+        metrics::on_worker_task_done(worker_id, success);
     }
+}
+
+/// Pipeline hooks for the validator: metrics updates on advance/reorg.
+pub struct ValidatorHooks;
+
+impl PipelineHooks for ValidatorHooks {
+    type Output = ValidatedBlock;
+
+    fn post_advance(&self, new_tip: &BlockMeta) -> eyre::Result<()> {
+        metrics::set_chain_height(new_tip.block_number);
+        Ok(())
+    }
+
+    fn on_reorg(
+        &self,
+        _rollback_to: alloy_primitives::BlockNumber,
+        depth: u64,
+        _reverted_hashes: &[alloy_primitives::BlockHash],
+    ) -> eyre::Result<()> {
+        metrics::on_reorg(depth);
+        Ok(())
+    }
+}
+
+/// Returns all contract code hashes from the witness.
+fn extract_contract_codes(salt_witness: &SaltWitness) -> HashSet<B256> {
+    salt_witness
+        .kvs
+        .values()
+        .filter_map(|salt_val| salt_val.as_ref())
+        .filter_map(|val| match (PlainKey::decode(val.key()), PlainValue::decode(val.value())) {
+            (PlainKey::Account(_), PlainValue::Account(acc)) => {
+                acc.codehash.filter(|&codehash| codehash != KECCAK_EMPTY)
+            }
+            _ => None,
+        })
+        .collect()
 }

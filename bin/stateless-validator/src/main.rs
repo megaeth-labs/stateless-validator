@@ -1,6 +1,4 @@
 use std::{
-    collections::HashSet,
-    future::Future,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -11,22 +9,16 @@ use alloy_primitives::{B256, BlockHash, hex};
 use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::{Result, anyhow, ensure};
-use futures::future;
-use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
-use salt::SaltWitness;
 use stateless_common::{
     RpcClient,
     db::ContractCache,
     logging::{LogArgs, migrate_legacy_env_vars},
 };
 use stateless_core::{
-    ChainStore, ChainSyncConfig, ContractStore, RpcClientConfig,
-    chain_spec::ChainSpec,
-    data_types::{PlainKey, PlainValue},
-    db::{BlockMeta, ValidatedBlock, ValidationFailure, ValidationTask},
-    executor::validate_block,
+    ContractStore, PipelineConfig, RpcClientConfig, chain_spec::ChainSpec, db::BlockMeta,
+    pipeline::run_pipeline,
 };
-use tokio::{signal, task, task::JoinHandle};
+use tokio::{signal, task};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -36,10 +28,7 @@ mod validator_db;
 
 use validator_db::ValidatorDB;
 
-use crate::chain_sync::{ReorgEvent, chain_advancer};
-
-/// Handles to all spawned background tasks, awaited during shutdown.
-type BackgroundTasks = Vec<JoinHandle<Result<()>>>;
+use crate::chain_sync::{ValidationTask, ValidatorHooks, ValidatorProcessor};
 
 /// Database filename for the validator.
 const VALIDATOR_DB_FILENAME: &str = "validator.redb";
@@ -203,355 +192,74 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Create chain sync configuration
-    let config = Arc::new(ChainSyncConfig {
+    // Create pipeline configuration
+    let report_validation = args.report_validation_endpoint.is_some();
+    let config = Arc::new(PipelineConfig {
         concurrent_workers: num_cpus::get(),
-        report_validation_results: args.report_validation_endpoint.is_some(),
-        metrics_enabled: args.metrics_enabled,
-        metrics_port: args.metrics_port,
-        ..ChainSyncConfig::default()
+        ..PipelineConfig::default()
     });
     info!(concurrent_workers = config.concurrent_workers, "[Main] Starting pipeline");
     info!(
         "[Main] Validation result reporting: {}",
-        if config.report_validation_results { "enabled" } else { "disabled" }
+        if report_validation { "enabled" } else { "disabled" }
     );
 
-    let result =
-        run_with_reorg_restart(client, validator_db, contract_cache, config, chain_spec).await;
-
-    info!(elapsed = ?start.elapsed(), "[Main] Shutdown complete");
-    result
-}
-
-/// Runs the validation pipeline in a loop, restarting on reorg detection.
-///
-/// Returns when the pipeline completes normally, encounters a fatal error,
-/// or receives a shutdown signal (SIGINT/SIGTERM).
-async fn run_with_reorg_restart(
-    client: Arc<RpcClient>,
-    validator_db: Arc<ValidatorDB>,
-    contract_cache: Arc<ContractCache>,
-    config: Arc<ChainSyncConfig>,
-    chain_spec: Arc<ChainSpec>,
-) -> Result<()> {
+    // Run the pipeline with optional reporter in parallel
+    let shutdown = CancellationToken::new();
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .map_err(|e| anyhow!("Failed to register SIGTERM handler: {e}"))?;
 
-    loop {
-        let shutdown = CancellationToken::new();
-        let (validator_logic, bg_tasks) = chain_sync(
+    let processor =
+        Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client.clone() });
+    let hooks = Arc::new(ValidatorHooks);
+
+    // Spawn optional validation reporter
+    let reporter = if report_validation {
+        info!("[Main] Starting validation reporter");
+        Some(task::spawn(validation_reporter(
             client.clone(),
             Arc::clone(&validator_db),
-            Arc::clone(&contract_cache),
-            Arc::clone(&config),
-            Arc::clone(&chain_spec),
+            Duration::from_secs(1),
             shutdown.clone(),
-        )?;
-
-        enum Action {
-            Result(Result<Option<ReorgEvent>>),
-            Shutdown,
-        }
-
-        let action = tokio::select! {
-            res = validator_logic => Action::Result(res),
-            _ = signal::ctrl_c() => {
-                info!("[Main] SIGINT received, shutting down.");
-                Action::Shutdown
-            }
-            _ = sigterm.recv() => {
-                info!("[Main] SIGTERM received, shutting down.");
-                Action::Shutdown
-            }
-        };
-
-        shutdown.cancel();
-        await_bg_tasks(bg_tasks).await;
-
-        match action {
-            Action::Result(Ok(Some(reorg))) => {
-                warn!(
-                    rollback_to = reorg.rollback_to,
-                    depth = reorg.depth,
-                    "[Main] Reorg detected, restarting pipeline"
-                );
-                metrics::on_reorg(reorg.depth);
-            }
-            Action::Result(Ok(None)) => return Ok(()),
-            Action::Result(Err(e)) => {
-                error!(error = %e, "[Main] Validator exited with error");
-                return Err(e);
-            }
-            Action::Shutdown => return Ok(()),
-        }
-
-        info!("[Main] Restarting pipeline...");
-    }
-}
-
-/// Waits for background tasks to finish with a timeout.
-async fn await_bg_tasks(bg_tasks: BackgroundTasks) {
-    let timeout = Duration::from_secs(3);
-    match tokio::time::timeout(timeout, future::join_all(bg_tasks)).await {
-        Ok(results) => {
-            for (i, result) in results.into_iter().enumerate() {
-                match result {
-                    Ok(Err(e)) => warn!(task_idx = i, error = %e, "[Main] Background task error"),
-                    Err(e) if e.is_cancelled() => {}
-                    Err(e) => error!(task_idx = i, error = %e, "[Main] Background task panic"),
-                    Ok(Ok(())) => {}
-                }
-            }
-        }
-        Err(_) => warn!(timeout = ?timeout, "[Main] Background tasks did not finish in time"),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Pipeline orchestration
-// ---------------------------------------------------------------------------
-
-/// Sets up the streaming validation pipeline:
-/// 1. Fetcher task: fetches blocks from RPC, sends to channel
-/// 2. N worker tasks: validate blocks, send results to channel
-/// 3. Advancer task (main loop): collects results in order, advances canonical chain
-/// 4. Optional reporter task: reports validated blocks upstream
-/// 5. History pruner: periodically removes old CANONICAL_CHAIN entries
-fn chain_sync(
-    client: Arc<RpcClient>,
-    validator_db: Arc<ValidatorDB>,
-    contract_cache: Arc<ContractCache>,
-    config: Arc<ChainSyncConfig>,
-    chain_spec: Arc<ChainSpec>,
-    shutdown: CancellationToken,
-) -> Result<(impl Future<Output = Result<Option<ReorgEvent>>>, BackgroundTasks)> {
-    let initial_tip = validator_db
-        .get_canonical_tip()?
-        .ok_or_else(|| anyhow!("No canonical tip found — run with --start-block first"))?;
-
-    let start_block = initial_tip.block_number + 1;
-    info!(
-        start_block,
-        workers = config.concurrent_workers,
-        "[Pipeline] Starting validation pipeline"
-    );
-
-    // Create kanal channels
-    let (fetch_tx, fetch_rx) = kanal::bounded(config.fetch_channel_capacity);
-    let (result_tx, result_rx) = kanal::bounded(config.result_channel_capacity);
-
-    let mut bg_tasks: BackgroundTasks = Vec::new();
-
-    // Task 1: Block fetcher
-    bg_tasks.push(task::spawn({
-        let client = Arc::clone(&client);
-        let config = Arc::clone(&config);
-        let shutdown = shutdown.clone();
-        async move {
-            stateless_core::chain_sync::block_fetcher(
-                client,
-                fetch_tx,
-                start_block,
-                config,
-                shutdown,
-                |block, salt_witness, mpt_witness| ValidationTask {
-                    block,
-                    salt_witness,
-                    mpt_witness,
-                },
-                Some(metrics::set_remote_chain_height),
-            )
-            .await
-        }
-    }));
-
-    // Task 2: N validation workers
-    for worker_id in 0..config.concurrent_workers {
-        let fetch_rx = fetch_rx.clone();
-        let result_tx = result_tx.clone();
-        let client = Arc::clone(&client);
-        let contract_cache = Arc::clone(&contract_cache);
-        let chain_spec = Arc::clone(&chain_spec);
-        let shutdown = shutdown.clone();
-
-        bg_tasks.push(task::spawn(validation_worker(
-            worker_id,
-            client,
-            contract_cache,
-            chain_spec,
-            fetch_rx,
-            result_tx,
-            shutdown,
-        )));
-    }
-    // Drop the original sender/receiver so channel closes when all workers finish
-    drop(fetch_rx);
-    drop(result_tx);
-
-    // Task 3: Optional validation reporter
-    if config.report_validation_results {
-        info!("[Pipeline] Starting validation reporter...");
-        bg_tasks.push(task::spawn(validation_reporter(
-            Arc::clone(&client),
-            Arc::clone(&validator_db),
-            Arc::clone(&config),
-            shutdown.clone(),
-        )));
+        )))
     } else {
-        info!("[Pipeline] Validation reporter disabled");
-    }
+        info!("[Main] Validation reporter disabled");
+        None
+    };
 
-    // Main loop = chain advancer
-    let main_loop = chain_advancer(
-        result_rx,
+    // Run pipeline with signal handling
+    let pipeline = run_pipeline(
         client,
-        validator_db as Arc<dyn ChainStore>,
-        initial_tip,
-        shutdown,
-        Some(metrics::set_chain_height),
+        validator_db.clone(),
+        processor,
+        hooks,
+        config,
+        shutdown.clone(),
+        |block, salt_witness, mpt_witness| ValidationTask { block, salt_witness, mpt_witness },
+        Some(metrics::set_remote_chain_height),
     );
 
-    Ok((main_loop, bg_tasks))
-}
-
-// ---------------------------------------------------------------------------
-// Validation worker
-// ---------------------------------------------------------------------------
-
-/// Validation worker that receives blocks from the fetch channel, validates them,
-/// and sends results to the advancer channel.
-async fn validation_worker(
-    worker_id: usize,
-    client: Arc<RpcClient>,
-    contract_cache: Arc<ContractCache>,
-    chain_spec: Arc<ChainSpec>,
-    fetch_rx: kanal::Receiver<stateless_core::ValidationTask>,
-    result_tx: kanal::Sender<std::result::Result<ValidatedBlock, ValidationFailure>>,
-    shutdown: CancellationToken,
-) -> Result<()> {
-    info!(worker_id, "[Worker] Started");
-    let fetch_rx = fetch_rx.to_async();
-    let result_tx = result_tx.to_async();
-
-    loop {
-        // Receive next task from shared fetch channel
-        let task = tokio::select! {
-            r = fetch_rx.recv() => match r {
-                Ok(task) => task,
-                Err(_) => {
-                    info!(worker_id, "[Worker] Fetch channel closed, stopping");
-                    break;
-                }
-            },
-            _ = shutdown.cancelled() => {
-                info!(worker_id, "[Worker] Shutting down gracefully");
-                break;
-            }
-        };
-
-        let block_number = task.block.header.number;
-        let block_hash = task.block.header.hash;
-        let tx_count = task.block.transactions.len() as u64;
-        let gas_used = task.block.header.gas_used;
-        debug!(worker_id, block_number, "[Worker] Validating block");
-        let start = Instant::now();
-
-        // Resolve contract codes
-        let codehashes = extract_contract_codes(&task.salt_witness);
-        let (mut contracts, missing_contracts) =
-            contract_cache.get(&codehashes.iter().copied().collect::<Vec<_>>())?;
-
-        metrics::on_contract_cache_read(contracts.len() as u64, missing_contracts.len() as u64);
-
-        if !missing_contracts.is_empty() {
-            let codes = future::try_join_all(missing_contracts.iter().map(|&hash| {
-                let client = Arc::clone(&client);
-                async move { client.get_code(hash).await }
-            }))
-            .await?;
-
-            let new_bytecodes: Vec<_> = missing_contracts
-                .into_iter()
-                .zip(codes.iter())
-                .map(|(code_hash, bytes)| {
-                    let bytecode = Bytecode::new_raw(bytes.clone());
-                    let computed_hash = bytecode.hash_slow();
-                    ensure!(
-                        computed_hash == code_hash,
-                        "RPC provider returned bytecode with unexpected codehash: expected {code_hash:?}, got {computed_hash:?}",
-                    );
-                    Ok((computed_hash, bytecode))
-                })
-                .collect::<Result<_>>()?;
-
-            contract_cache.insert(&new_bytecodes)?;
-            contracts.extend(new_bytecodes);
+    let result = tokio::select! {
+        res = pipeline => res,
+        _ = signal::ctrl_c() => {
+            info!("[Main] SIGINT received, shutting down.");
+            Ok(())
         }
-
-        // Extract fields before moving data into spawn_blocking
-        let parent_hash = task.block.header.parent_hash;
-        let pre_state_root = B256::from(task.salt_witness.state_root()?);
-        let post_state_root = task.block.header.state_root;
-        let pre_withdrawals_root = task.mpt_witness.storage_root;
-        let post_withdrawals_root = task
-            .block
-            .header
-            .withdrawals_root
-            .ok_or(eyre::eyre!("Withdrawals root not found in block {block_hash}"))?;
-
-        // Validate in a blocking thread
-        let chain_spec_clone = Arc::clone(&chain_spec);
-        let validation_result = task::spawn_blocking(move || {
-            validate_block(
-                &chain_spec_clone,
-                &task.block,
-                task.salt_witness,
-                task.mpt_witness,
-                &contracts,
-                None,
-            )
-        })
-        .await
-        .map_err(|e| eyre::eyre!("Validation task panicked: {e}"))?;
-
-        let result = match &validation_result {
-            Ok(stats) => {
-                info!(worker_id, block_number, "[Worker] Successfully validated block");
-                metrics::on_validation_success(
-                    start.elapsed().as_secs_f64(),
-                    stats.witness_verification_time,
-                    stats.block_replay_time,
-                    stats.salt_update_time,
-                    tx_count,
-                    gas_used,
-                    stats.state_reads,
-                    stats.state_writes,
-                );
-                metrics::on_worker_task_done(worker_id, true);
-                Ok(ValidatedBlock {
-                    block_number,
-                    block_hash,
-                    parent_hash,
-                    post_state_root,
-                    post_withdrawals_root,
-                    pre_state_root,
-                    pre_withdrawals_root,
-                })
-            }
-            Err(e) => {
-                error!(worker_id, block_number, error = %e, "[Worker] Failed to validate block");
-                metrics::on_worker_task_done(worker_id, false);
-                Err(ValidationFailure { block_number, block_hash, error: e.to_string() })
-            }
-        };
-
-        if result_tx.send(result).await.is_err() {
-            info!(worker_id, "[Worker] Result channel closed, stopping");
-            break;
+        _ = sigterm.recv() => {
+            info!("[Main] SIGTERM received, shutting down.");
+            Ok(())
         }
+    };
+
+    shutdown.cancel();
+
+    // Wait for reporter to finish
+    if let Some(reporter) = reporter {
+        let _ = tokio::time::timeout(Duration::from_secs(3), reporter).await;
     }
-    Ok(())
+
+    info!(elapsed = ?start.elapsed(), "[Main] Shutdown complete");
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -565,7 +273,7 @@ async fn validation_worker(
 async fn validation_reporter(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
-    config: Arc<ChainSyncConfig>,
+    report_interval: Duration,
     shutdown: CancellationToken,
 ) -> Result<()> {
     info!("[Reporter] Starting validation reporter");
@@ -573,7 +281,7 @@ async fn validation_reporter(
 
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(config.sync_poll_interval) => {}
+            _ = tokio::time::sleep(report_interval) => {}
             _ = shutdown.cancelled() => {
                 info!("[Reporter] Shutting down gracefully");
                 return Ok(());
@@ -629,28 +337,6 @@ async fn validation_reporter(
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Returns all contract code hashes from the witness.
-///
-/// Filters witness data to find accounts with non-empty bytecode, which are
-/// needed for contract code fetching during block execution.
-fn extract_contract_codes(salt_witness: &SaltWitness) -> HashSet<B256> {
-    salt_witness
-        .kvs
-        .values()
-        .filter_map(|salt_val| salt_val.as_ref())
-        .filter_map(|val| match (PlainKey::decode(val.key()), PlainValue::decode(val.value())) {
-            (PlainKey::Account(_), PlainValue::Account(acc)) => {
-                acc.codehash.filter(|&codehash| codehash != KECCAK_EMPTY)
-            }
-            _ => None,
-        })
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -675,8 +361,13 @@ mod tests {
         CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
     };
     use op_alloy_rpc_types::Transaction;
+    use revm::state::Bytecode;
+    use salt::SaltWitness;
     use serde::{Deserialize, Serialize, de::DeserializeOwned};
-    use stateless_core::{WitnessRequestKeys, withdrawals::MptWitness};
+    use stateless_core::{
+        WitnessRequestKeys, executor::validate_block, pipeline::run_pipeline,
+        withdrawals::MptWitness,
+    };
     use tracing_subscriber::EnvFilter;
 
     use super::*;
@@ -1041,26 +732,29 @@ mod tests {
         let chain_spec =
             Arc::new(load_or_create_chain_spec(&validator_db, Some(&genesis_file)).unwrap());
 
-        let config = Arc::new(ChainSyncConfig {
+        let config = Arc::new(PipelineConfig {
             concurrent_workers: 1,
             sync_target,
-            ..ChainSyncConfig::default()
+            ..PipelineConfig::default()
         });
 
         let shutdown = CancellationToken::new();
-        let (main_loop, bg_tasks) = chain_sync(
-            client.clone(),
-            validator_db,
-            contract_cache,
-            config,
-            chain_spec,
-            shutdown.clone(),
-        )
-        .unwrap();
-        main_loop.await.unwrap();
+        let processor =
+            Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client.clone() });
+        let hooks = Arc::new(ValidatorHooks);
 
-        shutdown.cancel();
-        let _ = tokio::time::timeout(Duration::from_secs(1), future::join_all(bg_tasks)).await;
+        run_pipeline(
+            client,
+            validator_db,
+            processor,
+            hooks,
+            config,
+            shutdown,
+            |block, salt_witness, mpt_witness| ValidationTask { block, salt_witness, mpt_witness },
+            Some(|_: u64| {}),
+        )
+        .await
+        .unwrap();
 
         handle.stop().unwrap();
         info!("Mock RPC server has been shut down.");

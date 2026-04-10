@@ -40,7 +40,6 @@ eyre.workspace = true
 http.workspace = true
 http-body.workspace = true
 jsonrpsee.workspace = true
-kanal.workspace = true
 libc.workspace = true
 metrics.workspace = true
 metrics-derive.workspace = true

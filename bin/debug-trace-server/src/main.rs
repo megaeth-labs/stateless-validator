@@ -43,14 +43,15 @@
 use std::{path::PathBuf, sync::Arc};
 
 use alloy_genesis::Genesis;
-use alloy_primitives::{B256, BlockHash, hex};
+use alloy_primitives::{BlockHash, hex};
 use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::{Result, anyhow, ensure};
 use jsonrpsee::server::{Server, ServerConfig};
 use stateless_common::{RpcClient, logging::LogArgs};
 use stateless_core::{
-    BlockStore, ChainStore, ChainSyncConfig, RpcClientConfig, chain_spec::ChainSpec,
+    BlockStore, LightWitness, PipelineConfig, RpcClientConfig, chain_spec::ChainSpec,
+    pipeline::run_pipeline,
 };
 use tokio::task;
 use tokio_util::sync::CancellationToken;
@@ -71,7 +72,7 @@ use response_cache::{DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS, ResponseCache, Resp
 use rpc_service::RpcContext;
 use server_db::ServerDB;
 
-use crate::chain_sync::{chain_monitor, trace_chain_advancer};
+use crate::chain_sync::{TraceHooks, TraceProcessor};
 
 /// Command line arguments for the debug-trace-server.
 #[derive(Parser, Debug)]
@@ -264,7 +265,10 @@ async fn main() -> Result<()> {
     )?);
     let validator_db = init_validator_db(&args, &rpc_client).await?;
 
-    let block_store: Option<Arc<dyn BlockStore>> = validator_db.map(|db| db as Arc<dyn BlockStore>);
+    // Keep concrete ServerDB for pipeline (needs Sized), and dyn BlockStore for data_provider
+    let server_db: Option<Arc<ServerDB>> = validator_db;
+    let block_store: Option<Arc<dyn BlockStore>> =
+        server_db.as_ref().map(|db| Arc::clone(db) as Arc<dyn BlockStore>);
     let data_provider =
         Arc::new(DataProvider::new(rpc_client.clone(), block_store.clone(), args.witness_timeout));
 
@@ -287,59 +291,39 @@ async fn main() -> Result<()> {
     };
 
     // Spawn background chain sync pipeline (if database is configured)
-    if let Some(db) = &block_store {
-        let config = Arc::new(ChainSyncConfig::default());
+    if let Some(db) = &server_db {
         let shutdown = CancellationToken::new();
-
         debug!("Starting chain sync pipeline");
 
-        // Channel connecting fetcher → advancer
-        let (event_tx, event_rx) = kanal::bounded(config.fetch_channel_capacity);
-
-        // Spawn chain monitor (manages fetcher lifecycle + reorg detection)
+        // Spawn unified pipeline (fetch → process → advance with reorg restart)
+        let config = Arc::new(PipelineConfig {
+            concurrent_workers: 1,
+            stale_reset_threshold: Some(args.blocks_to_keep),
+            ..PipelineConfig::default()
+        });
+        let processor = Arc::new(TraceProcessor);
+        let hooks = Arc::new(TraceHooks {
+            db: Arc::clone(db) as Arc<dyn BlockStore>,
+            response_cache: response_cache.clone(),
+        });
         task::spawn({
             let rpc_client = Arc::clone(&rpc_client);
-            let db = Arc::clone(db) as Arc<dyn ChainStore>;
-            let config = Arc::clone(&config);
+            let db = Arc::clone(db);
             let shutdown = shutdown.clone();
             async move {
-                if let Err(e) = chain_monitor(rpc_client, db, event_tx, config, shutdown).await {
-                    error!(error = %e, "Chain monitor exited with error");
-                }
-            }
-        });
-
-        // Spawn chain advancer (DB writes, reorg callback)
-        let cache_for_reorg = response_cache.clone();
-        let chain_sync_metrics = metrics::ChainSyncMetrics::create();
-        task::spawn({
-            let db = Arc::clone(db);
-            async move {
-                if let Err(e) = trace_chain_advancer(
+                if let Err(e) = run_pipeline(
+                    rpc_client,
                     db,
-                    event_rx,
-                    Some(move |reverted_hashes: &[B256]| {
-                        if !reverted_hashes.is_empty() {
-                            chain_sync_metrics.record_reorg(reverted_hashes.len() as u64);
-                            if let Some(cache) = &cache_for_reorg {
-                                tracing::info!(
-                                    count = reverted_hashes.len(),
-                                    "Invalidating response cache for reorged blocks"
-                                );
-                                cache.invalidate_blocks(reverted_hashes);
-                            } else {
-                                tracing::debug!(
-                                    count = reverted_hashes.len(),
-                                    "Reorg detected (response cache disabled)"
-                                );
-                            }
-                        }
-                    }),
+                    processor,
+                    hooks,
+                    config,
                     shutdown,
+                    |block, salt, _mpt| (block, LightWitness::from(&salt)),
+                    None::<fn(u64)>,
                 )
                 .await
                 {
-                    error!(error = %e, "Chain advancer exited with error");
+                    error!(error = %e, "Chain sync pipeline exited with error");
                 }
             }
         });

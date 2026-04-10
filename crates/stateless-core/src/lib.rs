@@ -16,22 +16,22 @@
 //! - [`chain_sync`]: Chain synchronization utilities
 
 pub mod chain_spec;
-pub mod chain_sync;
 pub mod light_witness;
-pub use chain_sync::{ChainSyncConfig, block_fetcher, find_divergence_point};
 pub use light_witness::{LightWitness, LightWitnessExecutor};
 pub mod evm_database;
 pub use evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv};
 pub mod db;
-pub use db::{
-    BlockMeta, BlockStore, ChainStore, ContractStore, GenesisStore, PrunableChainStore,
-    ValidatedBlock, ValidationFailure, ValidationTask,
-};
+pub use db::{BlockMeta, BlockStore, ChainStore, ContractStore, GenesisStore, PrunableChainStore};
 pub mod data_types;
 pub use data_types::{PlainKey, PlainValue};
 pub mod executor;
 pub use executor::{
     ValidationError, ValidationResult, ValidationStats, replay_block, validate_block,
+};
+pub mod pipeline;
+pub use pipeline::{
+    BlockProcessor, PipelineConfig, PipelineHooks, PipelineOutcome, ProcessedBlock, ReorgEvent,
+    block_fetcher, find_divergence_point, run_pipeline,
 };
 pub mod rpc;
 pub mod withdrawals;

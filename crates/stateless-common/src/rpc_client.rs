@@ -489,7 +489,7 @@ mod tests {
     };
 
     use alloy_primitives::{B256, BlockHash};
-    use stateless_core::{ChainSyncConfig, block_fetcher, find_divergence_point};
+    use stateless_core::{PipelineConfig, block_fetcher, find_divergence_point};
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -746,8 +746,7 @@ mod tests {
         let client = Arc::new(RpcClient::new(&url, &url).unwrap());
 
         let (tx, _rx) = kanal::bounded::<u64>(16);
-        let config =
-            Arc::new(ChainSyncConfig { sync_target: Some(5), ..ChainSyncConfig::default() });
+        let config = Arc::new(PipelineConfig { sync_target: Some(5), ..PipelineConfig::default() });
         let shutdown = CancellationToken::new();
 
         let result = block_fetcher(
@@ -771,7 +770,7 @@ mod tests {
         let client = Arc::new(RpcClient::new(&url, &url).unwrap());
 
         let (tx, _rx) = kanal::bounded::<u64>(16);
-        let config = Arc::new(ChainSyncConfig::default());
+        let config = Arc::new(PipelineConfig::default());
         let shutdown = CancellationToken::new();
 
         shutdown.cancel();
@@ -797,9 +796,9 @@ mod tests {
         let client = Arc::new(RpcClient::new(&url, &url).unwrap());
 
         let (tx, _rx) = kanal::bounded::<u64>(16);
-        let config = Arc::new(ChainSyncConfig {
-            tracker_poll_interval: Duration::from_secs(60),
-            ..ChainSyncConfig::default()
+        let config = Arc::new(PipelineConfig {
+            poll_interval: Duration::from_secs(60),
+            ..PipelineConfig::default()
         });
         let shutdown = CancellationToken::new();
 

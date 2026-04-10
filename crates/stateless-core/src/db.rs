@@ -16,9 +16,8 @@ use alloy_primitives::{B256, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::Block;
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
-use salt::SaltWitness;
 
-use crate::{LightWitness, withdrawals::MptWitness};
+use crate::LightWitness;
 
 // ===========================================================================
 // Data types
@@ -50,34 +49,6 @@ impl BlockMeta {
             post_withdrawals_root: B256::from(t.3),
         }
     }
-}
-
-/// Block with all data needed for validation, flowing through the fetch→worker channel.
-#[derive(Clone, Debug)]
-pub struct ValidationTask {
-    pub block: Block<Transaction>,
-    pub salt_witness: SaltWitness,
-    pub mpt_witness: MptWitness,
-}
-
-/// Result of successfully validating a block, flowing through the worker→advancer channel.
-#[derive(Debug, Clone)]
-pub struct ValidatedBlock {
-    pub block_number: BlockNumber,
-    pub block_hash: BlockHash,
-    pub parent_hash: BlockHash,
-    pub post_state_root: B256,
-    pub post_withdrawals_root: B256,
-    pub pre_state_root: B256,
-    pub pre_withdrawals_root: B256,
-}
-
-/// Validation failure sent from worker to advancer.
-#[derive(Debug)]
-pub struct ValidationFailure {
-    pub block_number: BlockNumber,
-    pub block_hash: BlockHash,
-    pub error: String,
 }
 
 // ===========================================================================
