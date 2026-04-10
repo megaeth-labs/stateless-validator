@@ -66,10 +66,7 @@ use stateless_core::{
 };
 use tracing::{instrument, trace, warn};
 
-// ---------------------------------------------------------------------------
 // Helper Functions
-// ---------------------------------------------------------------------------
-
 /// Extracts all contract code hashes from a SALT witness.
 pub fn extract_code_hashes(witness: &LightWitness) -> Vec<B256> {
     let mut code_hashes: Vec<B256> = witness
@@ -89,10 +86,7 @@ pub fn extract_code_hashes(witness: &LightWitness) -> Vec<B256> {
     code_hashes
 }
 
-// ---------------------------------------------------------------------------
 // TracerKind - Unified enum for TracingInspector-based tracers
-// ---------------------------------------------------------------------------
-
 /// Represents a tracer variant that uses `TracingInspector` under the hood.
 ///
 /// Unifies CallTracer, PreStateTracer, FlatCallTracer, and the default struct logger
@@ -119,10 +113,7 @@ impl TracerKind {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Fast Tracing Environment Setup (for LightWitness)
-// ---------------------------------------------------------------------------
-
 /// Pre-built execution environment for fast tracing operations.
 struct TracingEnv<'a> {
     transactions: &'a [OpTransaction],
@@ -230,10 +221,7 @@ macro_rules! replay_preceding_txs {
     };
 }
 
-// ---------------------------------------------------------------------------
 // TracingInspector-based helpers (shared by Call, PreState, FlatCall, Default)
-// ---------------------------------------------------------------------------
-
 /// Traces all transactions in a block using a `TracingInspector`-based tracer.
 ///
 /// Handles executor creation, pre-execution, tx loop, trace extraction, inspector
@@ -449,10 +437,7 @@ fn trace_tx_with_tracing_inspector(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Public API - Geth-style Tracing
-// ---------------------------------------------------------------------------
-
 /// Traces a block execution with detailed inspector data.
 ///
 /// Uses a **single executor** for all transactions to preserve the DynamicGasCost
@@ -886,10 +871,7 @@ pub fn trace_transaction(
     trace_tx_with_tracing_inspector(&env, block, &mut state, tx_index, &TracerKind::Default(opts))
 }
 
-// ---------------------------------------------------------------------------
 // Public API - Parity-style Tracing
-// ---------------------------------------------------------------------------
-
 /// Computes Parity-style traces for all transactions in a block using LightWitness.
 ///
 /// Uses a **single executor** for all transactions to preserve the DynamicGasCost
@@ -984,10 +966,7 @@ pub fn parity_trace_transaction(
     }
 }
 
-// ---------------------------------------------------------------------------
 // Internal Helper
-// ---------------------------------------------------------------------------
-
 /// Adds accounts that were accessed but not modified to the prestate diff trace.
 ///
 /// In mega-reth, accounts that are accessed during transaction execution (e.g., fee recipients

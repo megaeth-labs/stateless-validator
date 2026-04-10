@@ -19,10 +19,6 @@ use revm::state::Bytecode;
 
 use crate::LightWitness;
 
-// ===========================================================================
-// Data types
-// ===========================================================================
-
 /// Represents a point on the chain with its state roots.
 ///
 /// Used for both the trusted anchor block and the canonical chain tip.
@@ -50,10 +46,6 @@ impl BlockMeta {
         }
     }
 }
-
-// ===========================================================================
-// Traits
-// ===========================================================================
 
 /// Contract bytecode persistence.
 pub trait ContractStore: Send + Sync {
@@ -93,4 +85,53 @@ pub trait BlockStore: PrunableChainStore {
         &self,
         block_hash: BlockHash,
     ) -> eyre::Result<(Block<Transaction>, LightWitness)>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_block_meta(n: u64) -> BlockMeta {
+        BlockMeta {
+            block_number: n,
+            block_hash: BlockHash::from([n as u8; 32]),
+            post_state_root: B256::from([n as u8 + 1; 32]),
+            post_withdrawals_root: B256::from([n as u8 + 2; 32]),
+        }
+    }
+
+    #[test]
+    fn test_block_meta_tuple_round_trip() {
+        let meta = make_block_meta(42);
+        let tuple = meta.to_tuple();
+        let restored = BlockMeta::from_tuple(tuple);
+        assert_eq!(meta, restored);
+    }
+
+    #[test]
+    fn test_block_meta_tuple_round_trip_zero() {
+        let meta = BlockMeta {
+            block_number: 0,
+            block_hash: BlockHash::ZERO,
+            post_state_root: B256::ZERO,
+            post_withdrawals_root: B256::ZERO,
+        };
+        assert_eq!(meta, BlockMeta::from_tuple(meta.to_tuple()));
+    }
+
+    #[test]
+    fn test_block_meta_equality() {
+        let a = make_block_meta(10);
+        let b = make_block_meta(10);
+        let c = make_block_meta(11);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_block_meta_clone() {
+        let meta = make_block_meta(5);
+        let cloned = meta.clone();
+        assert_eq!(meta, cloned);
+    }
 }

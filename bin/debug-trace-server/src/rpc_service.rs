@@ -32,10 +32,7 @@ use crate::{
 /// Slow request threshold for logging warnings.
 const SLOW_REQUEST_THRESHOLD: Duration = Duration::from_secs(5);
 
-// ---------------------------------------------------------------------------
 // RPC Trait Definitions (proc-macro)
-// ---------------------------------------------------------------------------
-
 /// Geth-style debug tracing RPC methods.
 #[rpc(server, namespace = "debug")]
 pub trait DebugTraceRpc {
@@ -81,10 +78,7 @@ pub trait TraceRpc {
     async fn trace_parity_transaction(&self, tx_hash: B256) -> RpcResult<serde_json::Value>;
 }
 
-// ---------------------------------------------------------------------------
 // RPC Watch Dog
-// ---------------------------------------------------------------------------
-
 /// Tracks in-flight RPC requests and logs warnings for long-running ones.
 #[derive(Clone)]
 pub struct RpcWatchDog {
@@ -156,10 +150,7 @@ impl Drop for WatchDogGuard {
     }
 }
 
-// ---------------------------------------------------------------------------
 // RPC Context
-// ---------------------------------------------------------------------------
-
 /// Shared context for all RPC handlers.
 #[derive(Clone)]
 pub struct RpcContext {
@@ -207,10 +198,7 @@ impl RpcContext {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Error Helpers
-// ---------------------------------------------------------------------------
-
 /// Error code for resource not found (matches mega-reth).
 const ERROR_CODE_RESOURCE_NOT_FOUND: i32 = -32001;
 
@@ -267,10 +255,7 @@ fn tx_data_err(e: eyre::Report) -> jsonrpsee::types::ErrorObjectOwned {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Trace Computation Helpers
-// ---------------------------------------------------------------------------
-
 /// Computes debug trace for a block (Geth-style).
 async fn compute_debug_trace_block(
     chain_spec: &ChainSpec,
@@ -340,10 +325,7 @@ async fn compute_parity_trace_block(
     Ok(value)
 }
 
-// ---------------------------------------------------------------------------
 // Cache Helper Functions
-// ---------------------------------------------------------------------------
-
 /// Checks cache by block number and returns cached value if found.
 fn check_cache_by_number(
     cache: &Option<ResponseCache>,
@@ -416,10 +398,7 @@ fn record_request_completion(method_name: &'static str, block_num: u64, start: I
     }
 }
 
-// ---------------------------------------------------------------------------
 // DebugTraceRpc Implementation
-// ---------------------------------------------------------------------------
-
 #[jsonrpsee::core::async_trait]
 impl DebugTraceRpcServer for RpcContext {
     #[tracing::instrument(level = "trace", skip(self, opts), fields(block_number))]
@@ -651,10 +630,7 @@ impl DebugTraceRpcServer for RpcContext {
     }
 }
 
-// ---------------------------------------------------------------------------
 // TraceRpc Implementation
-// ---------------------------------------------------------------------------
-
 #[jsonrpsee::core::async_trait]
 impl TraceRpcServer for RpcContext {
     #[tracing::instrument(level = "trace", skip(self), fields(block_number))]
@@ -767,10 +743,6 @@ impl TraceRpcServer for RpcContext {
         Ok(value)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

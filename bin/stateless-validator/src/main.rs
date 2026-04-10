@@ -261,10 +261,6 @@ async fn main() -> Result<()> {
     result
 }
 
-// ---------------------------------------------------------------------------
-// Validation reporter (reads from ValidatorDB)
-// ---------------------------------------------------------------------------
-
 /// Reports validated blocks to the dedicated report endpoint.
 ///
 /// Periodically reads the canonical tip from ValidatorDB and reports the
@@ -334,10 +330,6 @@ async fn validation_reporter(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

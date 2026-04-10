@@ -98,17 +98,11 @@ impl ValidatorDB {
         }
     }
 
-    // -- Reset --
-
     /// Resets the store to a new anchor, setting the canonical tip to match the anchor.
     pub fn reset_to_anchor(&self, anchor: &BlockMeta) -> eyre::Result<()> {
         db_reset_to_anchor(&self.database, anchor)
     }
 }
-
-// ---------------------------------------------------------------------------
-// ContractStore impl
-// ---------------------------------------------------------------------------
 
 impl ContractStore for ValidatorDB {
     fn get_contracts(&self, hashes: &[B256]) -> eyre::Result<(HashMap<B256, Bytecode>, Vec<B256>)> {
@@ -120,10 +114,6 @@ impl ContractStore for ValidatorDB {
     }
 }
 
-// ---------------------------------------------------------------------------
-// GenesisStore impl
-// ---------------------------------------------------------------------------
-
 impl GenesisStore for ValidatorDB {
     fn store_genesis(&self, genesis: &Genesis) -> eyre::Result<()> {
         ValidatorDB::store_genesis(self, genesis)
@@ -133,10 +123,6 @@ impl GenesisStore for ValidatorDB {
         ValidatorDB::load_genesis(self)
     }
 }
-
-// ---------------------------------------------------------------------------
-// ChainStore impl
-// ---------------------------------------------------------------------------
 
 impl ChainStore for ValidatorDB {
     fn get_canonical_tip(&self) -> eyre::Result<Option<BlockMeta>> {
@@ -196,10 +182,6 @@ impl ChainStore for ValidatorDB {
         db_reset_to_anchor(&self.database, anchor)
     }
 }
-
-// ===========================================================================
-// Unit tests
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {

@@ -27,10 +27,7 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-// ---------------------------------------------------------------------------
 // Test Infrastructure
-// ---------------------------------------------------------------------------
-
 struct TestConfig {
     mega_reth_url: String,
     debug_trace_server_url: String,
@@ -158,10 +155,7 @@ impl PerfResult {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Tracer Configurations
-// ---------------------------------------------------------------------------
-
 fn get_tracers() -> Vec<(&'static str, Value)> {
     vec![
         ("default", json!({})),
@@ -178,10 +172,7 @@ fn get_tracers() -> Vec<(&'static str, Value)> {
     ]
 }
 
-// ---------------------------------------------------------------------------
 // Performance Tests
-// ---------------------------------------------------------------------------
-
 /// Test tracer performance with cache hits (repeated requests for same block)
 #[test]
 #[ignore]

@@ -185,3 +185,137 @@ impl Account {
         self.balance.is_zero() && self.nonce == 0 && self.codehash.is_none()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // PlainKey tests
+    #[test]
+    fn test_plain_key_account_round_trip() {
+        let addr = Address::from([0xAB; 20]);
+        let key = PlainKey::Account(addr);
+        let encoded = key.encode();
+        assert_eq!(encoded.len(), 20);
+        assert_eq!(PlainKey::decode(&encoded), key);
+    }
+
+    #[test]
+    fn test_plain_key_storage_round_trip() {
+        let addr = Address::from([0x01; 20]);
+        let slot = B256::from([0xFF; 32]);
+        let key = PlainKey::Storage(addr, slot);
+        let encoded = key.encode();
+        assert_eq!(encoded.len(), 52);
+        let decoded = PlainKey::decode(&encoded);
+        assert_eq!(decoded, key);
+        if let PlainKey::Storage(decoded_addr, decoded_slot) = decoded {
+            assert_eq!(decoded_addr, addr);
+            assert_eq!(decoded_slot, slot);
+        } else {
+            panic!("Expected PlainKey::Storage");
+        }
+    }
+
+    #[test]
+    fn test_plain_key_unknown_for_invalid_length() {
+        let buf = vec![0u8; 10]; // neither 20 nor 52
+        let key = PlainKey::decode(&buf);
+        assert!(matches!(key, PlainKey::Unknown(_)));
+        assert_eq!(key.encode(), buf);
+    }
+
+    #[test]
+    fn test_plain_key_zero_address() {
+        let key = PlainKey::Account(Address::ZERO);
+        assert_eq!(PlainKey::decode(&key.encode()), key);
+    }
+
+    // PlainValue tests
+    #[test]
+    fn test_plain_value_eoa_round_trip() {
+        let account = Account { nonce: 42, balance: U256::from(1_000_000u64), codehash: None };
+        let value = PlainValue::Account(account);
+        let encoded = value.encode();
+        assert_eq!(encoded.len(), 40); // EOA = 8 + 32
+        assert_eq!(PlainValue::decode(&encoded), value);
+    }
+
+    #[test]
+    fn test_plain_value_contract_round_trip() {
+        let account = Account {
+            nonce: 1,
+            balance: U256::from(500u64),
+            codehash: Some(B256::from([0xCC; 32])),
+        };
+        let value = PlainValue::Account(account);
+        let encoded = value.encode();
+        assert_eq!(encoded.len(), 72); // Contract = 8 + 32 + 32
+        let decoded = PlainValue::decode(&encoded);
+        assert_eq!(decoded, value);
+    }
+
+    #[test]
+    fn test_plain_value_storage_round_trip() {
+        let value = PlainValue::Storage(U256::from(0xDEADBEEFu64));
+        let encoded = value.encode();
+        assert_eq!(encoded.len(), 32);
+        assert_eq!(PlainValue::decode(&encoded), value);
+    }
+
+    #[test]
+    fn test_plain_value_storage_max() {
+        let value = PlainValue::Storage(U256::MAX);
+        assert_eq!(PlainValue::decode(&value.encode()), value);
+    }
+
+    #[test]
+    fn test_plain_value_storage_zero() {
+        let value = PlainValue::Storage(U256::ZERO);
+        assert_eq!(PlainValue::decode(&value.encode()), value);
+    }
+
+    #[test]
+    fn test_plain_value_unknown_for_invalid_length() {
+        let buf = vec![0u8; 15]; // not 32, 40, or 72
+        let value = PlainValue::decode(&buf);
+        assert!(matches!(value, PlainValue::Unknown(_)));
+        assert_eq!(value.encode(), buf);
+    }
+
+    #[test]
+    fn test_plain_value_eoa_nonce_zero_balance_max() {
+        let account = Account { nonce: 0, balance: U256::MAX, codehash: None };
+        let value = PlainValue::Account(account);
+        assert_eq!(PlainValue::decode(&value.encode()), value);
+    }
+
+    #[test]
+    fn test_plain_value_nonce_max() {
+        let account = Account { nonce: u64::MAX, balance: U256::ZERO, codehash: None };
+        let value = PlainValue::Account(account);
+        assert_eq!(PlainValue::decode(&value.encode()), value);
+    }
+
+    // Account tests
+    #[test]
+    fn test_account_is_empty() {
+        assert!(Account::default().is_empty());
+        assert!(Account { nonce: 0, balance: U256::ZERO, codehash: None }.is_empty());
+    }
+
+    #[test]
+    fn test_account_not_empty_with_nonce() {
+        assert!(!Account { nonce: 1, balance: U256::ZERO, codehash: None }.is_empty());
+    }
+
+    #[test]
+    fn test_account_not_empty_with_balance() {
+        assert!(!Account { nonce: 0, balance: U256::from(1u64), codehash: None }.is_empty());
+    }
+
+    #[test]
+    fn test_account_not_empty_with_codehash() {
+        assert!(!Account { nonce: 0, balance: U256::ZERO, codehash: Some(B256::ZERO) }.is_empty());
+    }
+}

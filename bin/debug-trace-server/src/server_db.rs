@@ -211,10 +211,6 @@ impl ServerDB {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ContractStore impl
-// ---------------------------------------------------------------------------
-
 impl ContractStore for ServerDB {
     fn get_contracts(&self, hashes: &[B256]) -> eyre::Result<(HashMap<B256, Bytecode>, Vec<B256>)> {
         db_get_contracts(&self.database, hashes)
@@ -224,10 +220,6 @@ impl ContractStore for ServerDB {
         db_add_contracts(&self.database, codes)
     }
 }
-
-// ---------------------------------------------------------------------------
-// ChainStore impl
-// ---------------------------------------------------------------------------
 
 impl ChainStore for ServerDB {
     fn get_canonical_tip(&self) -> eyre::Result<Option<BlockMeta>> {
@@ -259,19 +251,11 @@ impl ChainStore for ServerDB {
     }
 }
 
-// ---------------------------------------------------------------------------
-// PrunableChainStore impl
-// ---------------------------------------------------------------------------
-
 impl PrunableChainStore for ServerDB {
     fn prune_chain(&self, before_block: BlockNumber) -> eyre::Result<u64> {
         Ok(ServerDB::prune_history(self, before_block)?)
     }
 }
-
-// ---------------------------------------------------------------------------
-// BlockStore impl
-// ---------------------------------------------------------------------------
 
 impl BlockStore for ServerDB {
     fn store_block_data(&self, blocks: &[(Block<Transaction>, LightWitness)]) -> eyre::Result<()> {
@@ -285,10 +269,6 @@ impl BlockStore for ServerDB {
         Ok(ServerDB::get_block_and_witness(self, block_hash)?)
     }
 }
-
-// ===========================================================================
-// Unit tests
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {

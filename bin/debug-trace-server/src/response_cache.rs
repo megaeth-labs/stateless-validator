@@ -25,10 +25,7 @@ use tracing::{debug, trace};
 
 use crate::metrics::{CACHE_TYPE_DEBUG_TRACE, CACHE_TYPE_TRACE, CacheMetrics};
 
-// ---------------------------------------------------------------------------
 // Configuration
-// ---------------------------------------------------------------------------
-
 /// Default maximum memory for the response cache (1 GB).
 pub const DEFAULT_RESPONSE_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
@@ -60,10 +57,7 @@ impl Default for ResponseCacheConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Cache Key Types
-// ---------------------------------------------------------------------------
-
 /// Cached resource types for RPC response caching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CachedResource {
@@ -184,10 +178,7 @@ impl ResponseCacheKey {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Cached Response
-// ---------------------------------------------------------------------------
-
 /// A cached JSON response entry.
 #[derive(Debug, Clone)]
 pub struct CachedResponse {
@@ -217,10 +208,7 @@ impl CachedResponse {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Cache Weighter
-// ---------------------------------------------------------------------------
-
 /// Weighter for response cache entries based on memory usage.
 #[derive(Debug, Clone, Default)]
 pub struct ResponseCacheWeighter;
@@ -232,10 +220,7 @@ impl Weighter<ResponseCacheKey, CachedResponse> for ResponseCacheWeighter {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Secondary Indices for Reorg Handling
-// ---------------------------------------------------------------------------
-
 /// Secondary indices for block hash/number mapping and cache key tracking.
 /// Uses a single lock to ensure consistency across all three maps.
 struct SecondaryIndices {
@@ -308,10 +293,7 @@ impl Lifecycle<ResponseCacheKey, CachedResponse> for EvictionCleanupLifecycle {
     }
 }
 
-// ---------------------------------------------------------------------------
 // Response Cache
-// ---------------------------------------------------------------------------
-
 /// Thread-safe response cache for RPC responses.
 ///
 /// Caches pre-serialized JSON responses to avoid redundant trace computation

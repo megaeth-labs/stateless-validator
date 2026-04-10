@@ -473,10 +473,6 @@ impl RpcClient {
     }
 }
 
-// ===========================================================================
-// ChainDataProvider implementation
-// ===========================================================================
-
 impl ChainDataProvider for RpcClient {
     async fn get_latest_block_number(&self) -> Result<u64> {
         self.get_latest_block_number().await
@@ -494,10 +490,6 @@ impl ChainDataProvider for RpcClient {
         self.get_block(block_id, full_txs).await
     }
 }
-
-// ===========================================================================
-// Block integrity verification
-// ===========================================================================
 
 /// Verifies structural integrity of a block fetched from RPC.
 ///
@@ -560,10 +552,6 @@ fn verify_block_integrity(block: &Block<Transaction>) -> Result<()> {
     Ok(())
 }
 
-// ===========================================================================
-// Tests
-// ===========================================================================
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -578,10 +566,7 @@ mod tests {
 
     use super::*;
 
-    // -----------------------------------------------------------------------
     // RpcClient unit tests
-    // -----------------------------------------------------------------------
-
     #[test]
     fn test_new_with_invalid_url() {
         let result = RpcClient::new("not a url", "http://localhost:8545");
@@ -645,10 +630,7 @@ mod tests {
         assert!(client.skip_block_verification());
     }
 
-    // -----------------------------------------------------------------------
     // Mock RPC helpers (relocated from stateless-core chain_sync tests)
-    // -----------------------------------------------------------------------
-
     /// Starts a minimal mock RPC server that responds to `eth_getHeaderByNumber`
     /// with headers whose hash is derived from `remote_hashes`.
     async fn start_mock_rpc(
@@ -717,9 +699,7 @@ mod tests {
         (local, remote)
     }
 
-    // -----------------------------------------------------------------------
     // find_divergence_point tests
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_find_divergence_single_block_reorg() {
@@ -803,9 +783,7 @@ mod tests {
         handle.stop().unwrap();
     }
 
-    // -----------------------------------------------------------------------
     // block_fetcher tests
-    // -----------------------------------------------------------------------
 
     /// Starts a mock RPC that serves `eth_blockNumber` (with configurable latest).
     async fn start_block_number_rpc(latest: u64) -> (jsonrpsee::server::ServerHandle, String) {

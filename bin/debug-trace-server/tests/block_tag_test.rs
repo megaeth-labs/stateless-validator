@@ -32,10 +32,7 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-// ---------------------------------------------------------------------------
 // Test Infrastructure
-// ---------------------------------------------------------------------------
-
 struct TestConfig {
     mega_reth_url: String,
     debug_trace_server_url: String,
@@ -203,10 +200,7 @@ fn assert_responses_match(label: &str, resp1: &RpcResponse, resp2: &RpcResponse)
     println!("    {} - PASS", label);
 }
 
-// ---------------------------------------------------------------------------
 // Block Tag Tests
-// ---------------------------------------------------------------------------
-
 /// Test that "earliest" block tag (block 0) works.
 /// Should return the genesis block trace or an appropriate response.
 #[test]
@@ -428,10 +422,7 @@ fn test_trace_block_by_safe() {
     println!("\n  PASS: safe tag handled");
 }
 
-// ---------------------------------------------------------------------------
 // Block Number vs Tag Consistency
-// ---------------------------------------------------------------------------
-
 /// Test that tracing by number and by hash for the same block produce identical results.
 #[test]
 #[ignore]
@@ -477,10 +468,7 @@ fn test_trace_block_number_vs_hash_consistency() {
     println!("\n  PASS: number vs hash consistency verified");
 }
 
-// ---------------------------------------------------------------------------
 // Parity Trace with Block Tags
-// ---------------------------------------------------------------------------
-
 /// Test that trace_block works with block numbers.
 #[test]
 #[ignore]
@@ -545,10 +533,7 @@ fn test_parity_trace_transaction_consistency() {
     println!("\n  PASS: trace_transaction consistency verified");
 }
 
-// ---------------------------------------------------------------------------
 // Send Transaction and Trace Tests
-// ---------------------------------------------------------------------------
-
 /// Helper to send a transaction with retry on nonce conflicts.
 fn send_tx_with_retry(
     mega_reth: &RpcClient,
@@ -866,10 +851,7 @@ fn test_deploy_contract_and_trace() {
     println!("\n  PASS: contract deploy and trace verified");
 }
 
-// ---------------------------------------------------------------------------
 // Cache Verification
-// ---------------------------------------------------------------------------
-
 /// Test that repeated requests for the same block return identical results (cache correctness).
 #[test]
 #[ignore]

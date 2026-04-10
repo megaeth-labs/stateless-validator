@@ -19,10 +19,6 @@ use revm::state::Bytecode;
 use stateless_core::db::{BlockMeta, ContractStore};
 use thiserror::Error;
 
-// ===========================================================================
-// Error types
-// ===========================================================================
-
 #[derive(Debug, Error)]
 pub enum ValidationDbError {
     #[error("Database error: {0}")]
@@ -96,10 +92,6 @@ pub enum SerializationError {
 
 pub type ValidationDbResult<T> = std::result::Result<T, ValidationDbError>;
 
-// ===========================================================================
-// Table definitions
-// ===========================================================================
-
 /// Trusted anchor block. Singleton key "anchor".
 /// Value: (block_number, block_hash, post_state_root, post_withdrawals_root).
 /// Used by both `ValidatorDB` and `ServerDB`.
@@ -136,10 +128,6 @@ pub const BLOCK_RECORDS: TableDefinition<(u64, [u8; 32]), ()> =
 
 /// Default maximum number of entries to retain in CANONICAL_CHAIN.
 pub const DEFAULT_MAX_CHAIN_LENGTH: u64 = 1000;
-
-// ===========================================================================
-// Serialization helpers
-// ===========================================================================
 
 /// Marker byte prepended to lz4-compressed bincode data.
 pub const BINCODE_LZ4_MARKER: u8 = 0x01;
@@ -187,10 +175,6 @@ pub fn encode_block_to_vec(block: &Block<Transaction>) -> ValidationDbResult<Vec
 pub fn decode_block_from_slice(bytes: &[u8]) -> Result<Block<Transaction>, SerializationError> {
     serde_json::from_slice(bytes).map_err(SerializationError::Json)
 }
-
-// ===========================================================================
-// Shared database helpers (operate on raw `&Database`)
-// ===========================================================================
 
 /// Reads the canonical tip (highest block) from CANONICAL_CHAIN.
 pub fn db_get_canonical_tip(database: &Database) -> eyre::Result<Option<BlockMeta>> {
@@ -327,10 +311,6 @@ pub fn db_add_contracts(database: &Database, codes: &[(B256, Bytecode)]) -> eyre
     Ok(())
 }
 
-// ===========================================================================
-// ContractCache — DashMap with persistent write-through
-// ===========================================================================
-
 /// In-memory contract bytecode cache backed by persistent storage.
 ///
 /// Reads check the in-memory `DashMap` first, falling back to the persistent store.
@@ -390,10 +370,6 @@ impl ContractCache {
         Ok(())
     }
 }
-
-// ===========================================================================
-// Unit tests
-// ===========================================================================
 
 #[cfg(test)]
 mod tests {

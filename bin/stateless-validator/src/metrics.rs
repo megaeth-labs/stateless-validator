@@ -192,7 +192,6 @@ pub fn on_worker_task_done(worker_id: usize, success: bool) {
 }
 
 // Chain metrics
-
 /// Tracks the latest known local and remote heights for lag computation.
 static LOCAL_HEIGHT: AtomicU64 = AtomicU64::new(0);
 static REMOTE_HEIGHT: AtomicU64 = AtomicU64::new(0);
