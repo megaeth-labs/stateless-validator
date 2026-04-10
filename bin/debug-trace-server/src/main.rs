@@ -48,10 +48,9 @@ use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::{Result, anyhow, ensure};
 use jsonrpsee::server::{Server, ServerConfig};
-use stateless_common::{RpcClient, logging::LogArgs};
+use stateless_common::{RpcClient, RpcClientConfig, logging::LogArgs};
 use stateless_core::{
-    BlockStore, LightWitness, PipelineConfig, RpcClientConfig, chain_spec::ChainSpec,
-    pipeline::run_pipeline,
+    BlockStore, LightWitness, PipelineConfig, chain_spec::ChainSpec, pipeline::run_pipeline,
 };
 use tokio::task;
 use tokio_util::sync::CancellationToken;

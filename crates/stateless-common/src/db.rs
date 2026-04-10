@@ -184,9 +184,8 @@ pub fn encode_block_to_vec(block: &Block<Transaction>) -> ValidationDbResult<Vec
 }
 
 /// Deserializes Block<Transaction> from JSON bytes.
-pub fn decode_block_from_slice(bytes: &[u8]) -> Block<Transaction> {
-    serde_json::from_slice(bytes)
-        .expect("deserialization of previously stored block data must succeed")
+pub fn decode_block_from_slice(bytes: &[u8]) -> Result<Block<Transaction>, SerializationError> {
+    serde_json::from_slice(bytes).map_err(SerializationError::Json)
 }
 
 // ===========================================================================

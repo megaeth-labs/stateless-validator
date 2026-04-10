@@ -5565,9 +5565,11 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 name = "stateless-common"
 version = "2.0.10"
 dependencies = [
+ "alloy-consensus",
  "alloy-primitives",
  "alloy-provider",
  "alloy-rpc-types-eth",
+ "alloy-trie",
  "base64",
  "bincode 2.0.1",
  "clap",
@@ -5610,7 +5612,6 @@ dependencies = [
  "alloy-rlp",
  "alloy-rpc-types-eth",
  "alloy-serde",
- "alloy-trie",
  "dyn-clone",
  "eyre",
  "futures",

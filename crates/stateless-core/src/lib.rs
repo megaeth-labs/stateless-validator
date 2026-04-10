@@ -13,7 +13,7 @@
 //! - [`evm_database`]: Witness-backed database for REVM
 //! - [`data_types`]: EVM-specific data types and encoding utilities
 //! - [`executor`]: Block execution logic for replaying transactions
-//! - [`chain_sync`]: Chain synchronization utilities
+//! - [`pipeline`]: Generic chain sync pipeline
 
 pub mod chain_spec;
 pub mod light_witness;
@@ -35,7 +35,4 @@ pub use pipeline::{
 };
 pub mod rpc;
 pub mod withdrawals;
-pub use rpc::{
-    ChainDataProvider, RpcClientConfig, RpcMethod, RpcMetrics, SetValidatedBlocksResponse,
-    WitnessRequestKeys,
-};
+pub use rpc::ChainDataProvider;

@@ -16,11 +16,30 @@ use op_alloy_network::Optimism;
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
-use stateless_core::{
-    ChainDataProvider, RpcClientConfig, RpcMethod, WitnessRequestKeys,
-    executor::verify_block_integrity, withdrawals::MptWitness,
-};
+use serde::{Deserialize, Serialize};
+use stateless_core::{ChainDataProvider, withdrawals::MptWitness};
 use tracing::trace;
+
+use crate::metrics::{RpcClientConfig, RpcMethod};
+
+/// Request keys for fetching block witness data.
+/// Format compatible with both upstream witness endpoint and worker-kv-demo Cloudflare RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WitnessRequestKeys {
+    /// Block number as U64.
+    pub block_number: U64,
+    /// Block hash.
+    pub block_hash: B256,
+}
+
+/// Response from mega_setValidatedBlocks RPC call
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetValidatedBlocksResponse {
+    pub accepted: bool,
+    pub last_validated_block: (U64, B256),
+}
 
 /// RPC client for MegaETH blockchain data.
 ///
@@ -394,7 +413,7 @@ impl RpcClient {
         &self,
         first_block: (u64, B256),
         last_block: (u64, B256),
-    ) -> Result<stateless_core::SetValidatedBlocksResponse> {
+    ) -> Result<SetValidatedBlocksResponse> {
         let provider =
             self.report_provider.as_ref().ok_or_else(|| eyre!("Report provider not configured"))?;
         let result = provider
@@ -474,6 +493,71 @@ impl ChainDataProvider for RpcClient {
     async fn get_block(&self, block_id: BlockId, full_txs: bool) -> Result<Block<Transaction>> {
         self.get_block(block_id, full_txs).await
     }
+}
+
+// ===========================================================================
+// Block integrity verification
+// ===========================================================================
+
+/// Verifies structural integrity of a block fetched from RPC.
+///
+/// Checks:
+/// 1. **Block Hash**: Verifies the block hash matches the computed hash from the header
+/// 2. **Transaction Hashes**: For each transaction, verifies that the transaction hash matches its
+///    computed hash
+/// 3. **Transaction Signers**: Recovers and verifies the signer for each transaction matches the
+///    claimed `from` address
+/// 4. **Transactions Root**: Computes the Merkle root of all transactions and verifies it matches
+///    the `transactions_root` in the block header
+fn verify_block_integrity(block: &Block<Transaction>) -> Result<()> {
+    use alloy_consensus::transaction::SignerRecoverable;
+    use alloy_rpc_types_eth::BlockTransactions;
+    use alloy_trie::root::ordered_trie_root_with_encoder;
+    use op_alloy_network::{TransactionResponse, eip2718::Encodable2718};
+
+    // Verify block hash matches the computed hash from header
+    ensure!(
+        block.header.hash_slow() == block.header.hash,
+        "Block hash mismatch: expected {:?}, computed {:?}",
+        block.header.hash,
+        block.header.hash_slow()
+    );
+
+    // Verify transaction hashes and transactions root
+    if let BlockTransactions::Full(ref transactions) = block.transactions {
+        for tx in transactions {
+            let tx_envelope = tx.inner.clone().into_inner();
+            ensure!(
+                tx_envelope.trie_hash() == *tx_envelope.hash(),
+                "Transaction hash mismatch: expected {:?}, computed {:?}",
+                tx_envelope.hash(),
+                tx_envelope.trie_hash()
+            );
+
+            let recovered = tx_envelope
+                .recover_signer()
+                .map_err(|err| eyre!("Failed to recover signer: {}", err))?;
+
+            ensure!(
+                recovered == tx.from(),
+                "Transaction signer mismatch: expected {:?}, got {:?}",
+                tx.from(),
+                recovered
+            );
+        }
+
+        let computed_tx_root = ordered_trie_root_with_encoder(transactions, |tx, buf| {
+            tx.inner.clone().into_inner().encode_2718(buf)
+        });
+        ensure!(
+            computed_tx_root == block.header.transactions_root,
+            "Transactions root mismatch: expected {:?}, computed {:?}",
+            block.header.transactions_root,
+            computed_tx_root
+        );
+    }
+
+    Ok(())
 }
 
 // ===========================================================================

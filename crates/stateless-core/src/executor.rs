@@ -30,11 +30,7 @@ use std::{
     time::{Instant, SystemTime},
 };
 
-use alloy_consensus::{
-    TxReceipt,
-    proofs::calculate_receipt_root,
-    transaction::{Recovered, SignerRecoverable},
-};
+use alloy_consensus::{TxReceipt, proofs::calculate_receipt_root, transaction::Recovered};
 use alloy_evm::{
     EvmEnv,
     block::{BlockExecutor, ExecutableTx},
@@ -45,8 +41,7 @@ use alloy_primitives::{
     map::{B256Map, HashMap},
 };
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
-use alloy_trie::root::ordered_trie_root_with_encoder;
-use eyre::{Result, ensure, eyre};
+use eyre::Result;
 use mega_evm::{
     BlockLimits, ExternalEnvFactory, MegaBlockExecutionCtx, MegaBlockExecutorFactory,
     MegaEvmFactory, MegaHardforks, MegaSpecId,
@@ -570,71 +565,4 @@ pub fn validate_block(
         block_replay_time,
         salt_update_time,
     })
-}
-
-/// Verifies the structural integrity and cryptographic consistency of a block.
-///
-/// # Arguments
-///
-/// * `block` - The block to verify, containing header and transaction data
-///
-/// # Returns
-///
-/// Returns `Ok(())` if all integrity checks pass, otherwise returns an error
-/// describing which check failed.
-///
-/// # Validation Checks
-///
-/// 1. **Block Hash**: Verifies that the block's header hash matches the computed hash from the
-///    header fields
-/// 2. **Transaction Hashes**: For each transaction, verifies that the transaction hash matches its
-///    computed hash
-/// 3. **Transaction Signers**: Recovers and verifies the signer for each transaction matches the
-///    claimed `from` address
-/// 4. **Transactions Root**: Computes the Merkle root of all transactions and verifies it matches
-///    the `transactions_root` in the block header
-pub fn verify_block_integrity(block: &Block<OpTransaction>) -> Result<()> {
-    // Verify block hash matches the computed hash from header
-    ensure!(
-        block.header.hash_slow() == block.header.hash,
-        "Block hash mismatch: expected {:?}, computed {:?}",
-        block.header.hash,
-        block.header.hash_slow()
-    );
-
-    // Verify transaction hashes and transactions root
-    if let BlockTransactions::Full(ref transactions) = block.transactions {
-        for tx in transactions {
-            let tx_envelope = tx.inner.clone().into_inner();
-            ensure!(
-                tx_envelope.trie_hash() == *tx_envelope.hash(),
-                "Transaction hash mismatch: expected {:?}, computed {:?}",
-                tx_envelope.hash(),
-                tx_envelope.trie_hash()
-            );
-
-            let recovered = tx_envelope
-                .recover_signer()
-                .map_err(|err| eyre!("Failed to recover signer: {}", err))?;
-
-            ensure!(
-                recovered == tx.from(),
-                "Transaction signer mismatch: expected {:?}, got {:?}",
-                tx.from(),
-                recovered
-            );
-        }
-
-        let computed_tx_root = ordered_trie_root_with_encoder(transactions, |tx, buf| {
-            tx.inner.clone().into_inner().encode_2718(buf)
-        });
-        ensure!(
-            computed_tx_root == block.header.transactions_root,
-            "Transactions root mismatch: expected {:?}, computed {:?}",
-            block.header.transactions_root,
-            computed_tx_root
-        );
-    }
-
-    Ok(())
 }

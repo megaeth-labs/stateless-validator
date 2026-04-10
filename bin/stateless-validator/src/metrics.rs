@@ -11,9 +11,10 @@ use std::{
 use eyre::Result;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
-pub use stateless_common::DEFAULT_METRICS_PORT;
-pub use stateless_core::RpcMethod;
-use stateless_core::RpcMetrics;
+pub use stateless_common::{
+    DEFAULT_METRICS_PORT,
+    metrics::{RpcMethod, RpcMetrics},
+};
 use tracing::info;
 
 /// Metrics callback implementation for RPC client.

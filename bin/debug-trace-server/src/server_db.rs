@@ -182,7 +182,7 @@ impl ServerDB {
         let block_bytes_len = block_bytes_value.len();
         let db_read_block_ms = start.elapsed().as_millis();
 
-        let block = decode_block_from_slice(&block_bytes_value);
+        let block = decode_block_from_slice(&block_bytes_value)?;
         let block_decode_ms = start.elapsed().as_millis();
 
         let witness_bytes = witnesses

@@ -10,13 +10,12 @@ use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::{Result, anyhow, ensure};
 use stateless_common::{
-    RpcClient,
+    RpcClient, RpcClientConfig,
     db::ContractCache,
     logging::{LogArgs, migrate_legacy_env_vars},
 };
 use stateless_core::{
-    ContractStore, PipelineConfig, RpcClientConfig, chain_spec::ChainSpec, db::BlockMeta,
-    pipeline::run_pipeline,
+    ContractStore, PipelineConfig, chain_spec::ChainSpec, db::BlockMeta, pipeline::run_pipeline,
 };
 use tokio::{signal, task};
 use tokio_util::sync::CancellationToken;
@@ -364,9 +363,9 @@ mod tests {
     use revm::state::Bytecode;
     use salt::SaltWitness;
     use serde::{Deserialize, Serialize, de::DeserializeOwned};
+    use stateless_common::WitnessRequestKeys;
     use stateless_core::{
-        WitnessRequestKeys, executor::validate_block, pipeline::run_pipeline,
-        withdrawals::MptWitness,
+        executor::validate_block, pipeline::run_pipeline, withdrawals::MptWitness,
     };
     use tracing_subscriber::EnvFilter;
 

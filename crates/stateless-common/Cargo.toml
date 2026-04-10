@@ -9,9 +9,11 @@ exclude.workspace = true
 
 [dependencies]
 # alloy
+alloy-consensus.workspace = true
 alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-rpc-types-eth.workspace = true
+alloy-trie.workspace = true
 
 # mega
 salt.workspace = true
