@@ -301,8 +301,9 @@ async fn validation_reporter(
         match result {
             Ok(response) if response.accepted => {
                 debug!(
-                    "[Reporter] Reported blocks: anchor={} tip={}",
-                    anchor.block_number, tip.block_number
+                    anchor = anchor.block_number,
+                    tip = tip.block_number,
+                    "[Reporter] Reported blocks"
                 );
                 last_reported_block = tip.block_number;
             }
