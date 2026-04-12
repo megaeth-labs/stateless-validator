@@ -34,37 +34,39 @@ The project uses nightly `2026-02-03` toolchain (edition 2024, rust-version 1.95
 
 ## Workspace Structure
 
-| Crate                | Path                       | Purpose                                                    |
-| -------------------- | -------------------------- | ---------------------------------------------------------- |
-| `stateless-core`     | `crates/stateless-core`    | Core validation logic, database, EVM execution, RPC client |
-| `stateless-common`   | `crates/stateless-common`  | Common utilities including logging configuration           |
-| `stateless-validator`| `bin/stateless-validator`  | Main binary: chain sync, parallel validation workers       |
-| `debug-trace-server` | `bin/debug-trace-server`   | Standalone RPC server for debug/trace methods              |
+| Crate                 | Path                      | Purpose                                                    |
+| --------------------- | ------------------------- | ---------------------------------------------------------- |
+| `stateless-core`      | `crates/stateless-core`   | Core validation logic, database, EVM execution, RPC client |
+| `stateless-common`    | `crates/stateless-common` | Common utilities including logging configuration           |
+| `stateless-validator` | `bin/stateless-validator` | Main binary: chain sync, parallel validation workers       |
+| `debug-trace-server`  | `bin/debug-trace-server`  | Standalone RPC server for debug/trace methods              |
 
 Additional directories: `test_data/` (integration test fixtures including genesis config), `audits/` (security audit reports).
 
 ## Architecture
 
-### Validation Pipeline
+### Pipeline
 
-The stateless validator follows a five-step pipeline:
+Both binaries share a generic three-stage pipeline defined in `stateless-core::pipeline`:
 
-1. **Remote Chain Tracker** — Polls the remote RPC for new blocks and extends `REMOTE_CHAIN` in the database.
-2. **Task Creation** — Fetches block data and SALT witnesses for new blocks, then inserts tasks into `TASK_LIST`.
-3. **Parallel Workers** — Multiple worker threads pick tasks from the queue and validate blocks using `WitnessDatabase`.
-4. **Chain Advancement** — The orchestrator reads validation results and advances `CANONICAL_CHAIN` for successful blocks.
-5. **History Pruning** — Old block data, witnesses, and validation results are pruned beyond a configurable history depth.
+1. **Fetch** — `block_fetcher` pulls blocks + witnesses from a `BlockFetcher` in parallel batches.
+2. **Process** — N workers run `BlockProcessor::process` (validator: EVM execution; trace server: pass-through).
+3. **Advance** — `chain_advancer` reorders out-of-order results, verifies parent-hash continuity, detects reorgs, and persists via `ChainStore::advance_chain`.
 
-### ValidatorDB
+The outer loop (`run_pipeline`) handles reorg rollback + restart, stale-data anchor reset, and transient vs fatal error classification.
 
-`ValidatorDB` is the central coordination database built on `redb` (embedded transactional key-value store).
-It manages 10 tables organized into three categories:
+### Database
 
-- **Chain state** (3 tables): `CANONICAL_CHAIN` (validated chain), `REMOTE_CHAIN` (lookahead), `BLOCK_RECORDS` (fork-aware history).
-- **Task coordination** (3 tables): `TASK_LIST` (pending work), `ONGOING_TASKS` (in-progress), `VALIDATION_RESULTS` (outcomes).
-- **Data storage** (4 tables): `BLOCK_DATA`, `WITNESSES` (SALT), `MPT_WITNESSES` (withdrawal proofs), `CONTRACTS` (bytecode cache).
+The validator and trace server each have their own `redb`-backed database.
+Shared table definitions live in `stateless-common::db`:
 
-Two additional single-key tables store `GENESIS_CONFIG` and `ANCHOR_BLOCK`.
+- **`ANCHOR_BLOCK`** — Trusted starting point (block number, hash, state root, withdrawals root).
+- **`CANONICAL_CHAIN`** — Validated chain progression (block number → hash, state root, withdrawals root).
+- **`CONTRACTS`** — On-demand contract bytecode cache (code hash → bincode+lz4 bytecode).
+- **`GENESIS_CONFIG`** — Hardfork activation rules (validator only).
+- **`BLOCK_DATA`** — Full block content (trace server only).
+- **`WITNESSES`** — Light witness data (trace server only).
+- **`BLOCK_RECORDS`** — Pruning index mapping (block number, hash) → () (trace server only).
 
 ### WitnessDatabase
 
@@ -101,18 +103,21 @@ The server includes an HTTP response cache (`quick_cache`) for pre-serialized JS
 
 ### Key Source Files
 
-| File                                               | Purpose                                           |
-| -------------------------------------------------- | ------------------------------------------------- |
-| `crates/stateless-core/src/validator_db.rs`        | Central database with 10 redb tables              |
-| `crates/stateless-core/src/executor.rs`            | Block validation and EVM replay                   |
-| `crates/stateless-core/src/tracing_executor.rs`    | Block tracing with TracerKind deduplication        |
-| `crates/stateless-core/src/database.rs`            | WitnessDatabase implementing `revm::DatabaseRef`  |
-| `crates/stateless-core/src/rpc_client.rs`          | RPC client for blocks, witnesses, and bytecode    |
-| `crates/stateless-core/src/chain_sync.rs`          | Chain synchronization and remote chain tracking   |
-| `crates/stateless-core/src/withdrawals.rs`         | Withdrawal validation and MPT witness handling    |
-| `bin/stateless-validator/src/main.rs`              | CLI, chain sync loop, parallel validation workers |
-| `bin/debug-trace-server/src/rpc_service.rs`        | RPC method definitions and handlers               |
-| `bin/debug-trace-server/src/data_provider.rs`      | Block data fetching with single-flight coalescing |
+| File                                          | Purpose                                                                             |
+| --------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `crates/stateless-core/src/pipeline.rs`       | Generic pipeline: BlockFetcher, run_pipeline, chain_advancer, find_divergence_point |
+| `crates/stateless-core/src/executor.rs`       | Block validation and EVM replay                                                     |
+| `crates/stateless-core/src/evm_database.rs`   | WitnessDatabase implementing `revm::DatabaseRef`                                    |
+| `crates/stateless-core/src/db.rs`             | Abstract storage traits (ChainStore, BlockStore, etc.)                              |
+| `crates/stateless-core/src/withdrawals.rs`    | Withdrawal validation and MPT witness handling                                      |
+| `crates/stateless-common/src/rpc_client.rs`   | RPC client for blocks, witnesses, and bytecode                                      |
+| `crates/stateless-common/src/db.rs`           | Shared redb table definitions and serialization helpers                             |
+| `crates/stateless-common/src/metrics.rs`      | RpcMethod, RpcMetrics, RpcClientConfig                                              |
+| `bin/stateless-validator/src/chain_sync.rs`   | ValidatorFetcher, ValidatorProcessor, ValidatorHooks                                |
+| `bin/stateless-validator/src/main.rs`         | CLI, pipeline startup, validation reporter                                          |
+| `bin/debug-trace-server/src/chain_sync.rs`    | TraceFetcher, TraceProcessor, TraceHooks                                            |
+| `bin/debug-trace-server/src/rpc_service.rs`   | RPC method definitions and handlers                                                 |
+| `bin/debug-trace-server/src/data_provider.rs` | Block data fetching with single-flight coalescing                                   |
 
 ## Test Organization
 
@@ -182,9 +187,13 @@ When implementing a new feature or bug fix, consider these additional aspects:
   Use `cargo clippy` only when specifically checking lint warnings.
 - **Respect `rustfmt.toml` configuration.**
   Key settings: `imports_granularity = "Crate"` (merge imports from same crate) and `group_imports = "StdExternalCrate"` (std, then external, then crate-local).
-- **`bincode` v2 with `bincode::config::legacy()`.**
+- **`bincode` v2 with two configs — do not mix them up.**
   This project uses bincode v2; do not use v1-style APIs (e.g., `bincode::serialize`).
-  Use `bincode::serde::decode_from_slice` / `bincode::serde::encode_to_vec` with `bincode::config::legacy()`.
+  Always use `bincode::serde::decode_from_slice` / `bincode::serde::encode_to_vec`.
+  - **RPC witness data** uses `bincode::config::legacy()` (fixed-int encoding, compatible with upstream witness generator which uses bincode 1.x).
+    The upstream witness generator serializes `(SaltWitness, MptWitness)` with bincode legacy, then zstd-compresses, then base64-encodes, and sends as a `"v0:<base64>"` JSON-RPC string.
+  - **Local DB storage** (contracts, light witnesses) uses `bincode::config::standard()` (varint encoding, more compact) with lz4 compression.
+  - These two formats are **not interchangeable**. `legacy()` and `standard()` produce different binary layouts.
 - **All persistent state goes through `ValidatorDB`.**
   Do not create separate database files or ad-hoc persistence; use the existing redb tables.
 - **Keep documentation up to date.**

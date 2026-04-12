@@ -263,6 +263,14 @@ impl SecondaryIndices {
         inner.number_to_keys.remove(&block_number)
     }
 
+    fn clear(&self) -> Vec<ResponseCacheKey> {
+        let mut inner = self.inner.write().unwrap();
+        let keys: Vec<_> = inner.number_to_keys.drain().flat_map(|(_, keys)| keys).collect();
+        inner.hash_to_number.clear();
+        inner.number_to_hash.clear();
+        keys
+    }
+
     fn remove_key(&self, key: &ResponseCacheKey) {
         let mut inner = self.inner.write().unwrap();
         let block_number = key.block_number;
@@ -511,6 +519,17 @@ impl ResponseCache {
                 entries = invalidated_count,
                 "Cache entries invalidated"
             );
+        }
+    }
+
+    /// Invalidates all cache entries (used during stale anchor reset).
+    pub fn invalidate_all(&self) {
+        let keys = self.inner.indices.clear();
+        for key in &keys {
+            self.inner.cache.remove(key);
+        }
+        if !keys.is_empty() {
+            debug!(entries = keys.len(), "Cache fully invalidated");
         }
     }
 

@@ -7,15 +7,53 @@
 use std::sync::Arc;
 
 use alloy_primitives::{BlockHash, BlockNumber};
-use alloy_rpc_types_eth::Block;
+use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
+use eyre::Result;
 use op_alloy_rpc_types::Transaction;
+use stateless_common::RpcClient;
 use stateless_core::{
     BlockStore, LightWitness,
     db::BlockMeta,
-    pipeline::{BlockProcessor, PipelineHooks},
+    pipeline::{BlockFetcher, BlockProcessor, ErrorAction, PipelineHooks},
 };
 
 use crate::{metrics, response_cache::ResponseCache};
+
+/// Fetcher for the trace server: fetches blocks + witnesses, discards MPT witness,
+/// converts SALT witness to [`LightWitness`].
+pub struct TraceFetcher {
+    pub rpc_client: Arc<RpcClient>,
+}
+
+impl BlockFetcher for TraceFetcher {
+    type Output = (Block<Transaction>, LightWitness);
+
+    async fn fetch(&self, block_number: u64) -> Result<(Block<Transaction>, LightWitness)> {
+        let block_hash = self.rpc_client.get_block_hash(block_number).await?;
+        let (salt, _mpt) = self.rpc_client.get_witness(block_number, block_hash).await?;
+        let block = self.rpc_client.get_block(BlockId::Number(block_number.into()), true).await?;
+        Ok((block, LightWitness::from(&salt)))
+    }
+
+    async fn latest_block_number(&self) -> Result<u64> {
+        self.rpc_client.get_latest_block_number().await
+    }
+
+    async fn block_hash(&self, block_number: u64) -> Result<BlockHash> {
+        self.rpc_client.get_block_hash(block_number).await
+    }
+
+    async fn latest_block_meta(&self) -> Result<BlockMeta> {
+        let header =
+            self.rpc_client.get_header(BlockId::Number(BlockNumberOrTag::Latest), false).await?;
+        Ok(BlockMeta {
+            block_number: header.number,
+            block_hash: header.hash,
+            post_state_root: header.state_root,
+            post_withdrawals_root: header.withdrawals_root.unwrap_or_default(),
+        })
+    }
+}
 
 /// Block data after "processing" — just metadata + carried data for storage.
 pub struct TraceProcessedBlock {
@@ -62,6 +100,11 @@ impl BlockProcessor for TraceProcessor {
         };
         Ok(TraceProcessedBlock { block, witness, meta })
     }
+
+    fn error_action(&self, _: &eyre::Report) -> ErrorAction {
+        // TraceProcessor doesn't validate — errors are IO/transient, worth retrying
+        ErrorAction::Retry
+    }
 }
 
 /// Pipeline hooks for the trace server: store block data before advancing,
@@ -100,7 +143,9 @@ impl PipelineHooks for TraceHooks {
     }
 
     fn on_stale_reset(&self, _new_anchor: &BlockMeta) -> eyre::Result<()> {
-        // Cache cleared implicitly by reset_to_anchor removing all data
+        if let Some(cache) = &self.response_cache {
+            cache.invalidate_all();
+        }
         Ok(())
     }
 }

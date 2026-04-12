@@ -27,7 +27,7 @@ mod validator_db;
 
 use validator_db::ValidatorDB;
 
-use crate::chain_sync::{ValidationTask, ValidatorHooks, ValidatorProcessor};
+use crate::chain_sync::{ValidatorFetcher, ValidatorHooks, ValidatorProcessor};
 
 /// Database filename for the validator.
 const VALIDATOR_DB_FILENAME: &str = "validator.redb";
@@ -208,6 +208,10 @@ async fn main() -> Result<()> {
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .map_err(|e| anyhow!("Failed to register SIGTERM handler: {e}"))?;
 
+    let fetcher = Arc::new(ValidatorFetcher {
+        rpc_client: client.clone(),
+        on_remote_height: metrics::set_remote_chain_height,
+    });
     let processor =
         Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client.clone() });
     let hooks = Arc::new(ValidatorHooks);
@@ -216,7 +220,7 @@ async fn main() -> Result<()> {
     let reporter = if report_validation {
         info!("[Main] Starting validation reporter");
         Some(task::spawn(validation_reporter(
-            client.clone(),
+            client,
             Arc::clone(&validator_db),
             Duration::from_secs(1),
             shutdown.clone(),
@@ -226,17 +230,8 @@ async fn main() -> Result<()> {
         None
     };
 
-    // Run pipeline with signal handling
-    let pipeline = run_pipeline(
-        client,
-        validator_db.clone(),
-        processor,
-        hooks,
-        config,
-        shutdown.clone(),
-        |block, salt_witness, mpt_witness| ValidationTask { block, salt_witness, mpt_witness },
-        Some(metrics::set_remote_chain_height),
-    );
+    let pipeline =
+        run_pipeline(fetcher, validator_db.clone(), processor, hooks, config, shutdown.clone());
 
     let result = tokio::select! {
         res = pipeline => res,
@@ -730,22 +725,13 @@ mod tests {
         });
 
         let shutdown = CancellationToken::new();
+        let fetcher =
+            Arc::new(ValidatorFetcher { rpc_client: client.clone(), on_remote_height: |_| {} });
         let processor =
-            Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client.clone() });
+            Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
         let hooks = Arc::new(ValidatorHooks);
 
-        run_pipeline(
-            client,
-            validator_db,
-            processor,
-            hooks,
-            config,
-            shutdown,
-            |block, salt_witness, mpt_witness| ValidationTask { block, salt_witness, mpt_witness },
-            Some(|_: u64| {}),
-        )
-        .await
-        .unwrap();
+        run_pipeline(fetcher, validator_db, processor, hooks, config, shutdown).await.unwrap();
 
         handle.stop().unwrap();
         info!("Mock RPC server has been shut down.");

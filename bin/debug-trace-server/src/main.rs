@@ -49,9 +49,7 @@ use clap::Parser;
 use eyre::{Result, anyhow, ensure};
 use jsonrpsee::server::{Server, ServerConfig};
 use stateless_common::{RpcClient, RpcClientConfig, logging::LogArgs};
-use stateless_core::{
-    BlockStore, LightWitness, PipelineConfig, chain_spec::ChainSpec, pipeline::run_pipeline,
-};
+use stateless_core::{BlockStore, PipelineConfig, chain_spec::ChainSpec, pipeline::run_pipeline};
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
@@ -71,7 +69,7 @@ use response_cache::{DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS, ResponseCache, Resp
 use rpc_service::RpcContext;
 use server_db::ServerDB;
 
-use crate::chain_sync::{TraceHooks, TraceProcessor};
+use crate::chain_sync::{TraceFetcher, TraceHooks, TraceProcessor};
 
 /// Command line arguments for the debug-trace-server.
 #[derive(Parser, Debug)]
@@ -305,22 +303,12 @@ async fn main() -> Result<()> {
             db: Arc::clone(db) as Arc<dyn BlockStore>,
             response_cache: response_cache.clone(),
         });
+        let fetcher = Arc::new(TraceFetcher { rpc_client: Arc::clone(&rpc_client) });
         task::spawn({
-            let rpc_client = Arc::clone(&rpc_client);
             let db = Arc::clone(db);
             let shutdown = shutdown.clone();
             async move {
-                if let Err(e) = run_pipeline(
-                    rpc_client,
-                    db,
-                    processor,
-                    hooks,
-                    config,
-                    shutdown,
-                    |block, salt, _mpt| (block, LightWitness::from(&salt)),
-                    None::<fn(u64)>,
-                )
-                .await
+                if let Err(e) = run_pipeline(fetcher, db, processor, hooks, config, shutdown).await
                 {
                     error!(error = %e, "Chain sync pipeline exited with error");
                 }

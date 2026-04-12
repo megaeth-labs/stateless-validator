@@ -7,8 +7,8 @@
 use std::{collections::HashSet, sync::Arc};
 
 use alloy_primitives::{B256, BlockHash, BlockNumber};
-use alloy_rpc_types_eth::Block;
-use eyre::ensure;
+use alloy_rpc_types_eth::{Block, BlockId};
+use eyre::{Result, ensure};
 use futures::future;
 use op_alloy_rpc_types::Transaction;
 use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
@@ -19,13 +19,52 @@ use stateless_core::{
     data_types::{PlainKey, PlainValue},
     db::BlockMeta,
     executor::validate_block,
-    pipeline::{BlockProcessor, PipelineHooks, ProcessedBlock},
+    pipeline::{BlockFetcher, BlockProcessor, ErrorAction, PipelineHooks, ProcessedBlock},
     withdrawals::MptWitness,
 };
 use tokio::task;
 use tracing::{error, info};
 
 use crate::metrics;
+
+/// Fetcher for the validator: fetches blocks + witnesses from RPC,
+/// wraps in [`ValidationTask`], and records remote chain height for metrics.
+pub struct ValidatorFetcher {
+    pub rpc_client: Arc<RpcClient>,
+    pub on_remote_height: fn(u64),
+}
+
+impl BlockFetcher for ValidatorFetcher {
+    type Output = ValidationTask;
+
+    async fn fetch(&self, block_number: u64) -> Result<ValidationTask> {
+        let block_hash = self.rpc_client.get_block_hash(block_number).await?;
+        let (salt_witness, mpt_witness) =
+            self.rpc_client.get_witness(block_number, block_hash).await?;
+        let block = self.rpc_client.get_block(BlockId::Number(block_number.into()), true).await?;
+        Ok(ValidationTask { block, salt_witness, mpt_witness })
+    }
+
+    async fn latest_block_number(&self) -> Result<u64> {
+        let n = self.rpc_client.get_latest_block_number().await?;
+        (self.on_remote_height)(n);
+        Ok(n)
+    }
+
+    async fn block_hash(&self, block_number: u64) -> Result<BlockHash> {
+        self.rpc_client.get_block_hash(block_number).await
+    }
+
+    async fn latest_block_meta(&self) -> Result<BlockMeta> {
+        let header = self.rpc_client.get_header(BlockId::latest(), false).await?;
+        Ok(BlockMeta {
+            block_number: header.number,
+            block_hash: header.hash,
+            post_state_root: header.state_root,
+            post_withdrawals_root: header.withdrawals_root.unwrap_or_default(),
+        })
+    }
+}
 
 /// Block with all data needed for validation, flowing through the fetch→worker channel.
 #[derive(Clone, Debug)]
@@ -94,6 +133,9 @@ pub struct ValidationFailure {
     pub block_number: BlockNumber,
     pub block_hash: BlockHash,
     pub error: String,
+    /// `true` for transient errors (RPC timeout) that are worth retrying.
+    /// `false` for deterministic failures (validation mismatch) that should halt.
+    pub transient: bool,
 }
 
 impl std::fmt::Display for ValidationFailure {
@@ -137,6 +179,7 @@ impl BlockProcessor for ValidatorProcessor {
                 block_number,
                 block_hash,
                 error: format!("Failed to get contracts: {e}"),
+                transient: true,
             })?;
 
         metrics::on_contract_cache_read(contracts.len() as u64, missing_contracts.len() as u64);
@@ -152,6 +195,7 @@ impl BlockProcessor for ValidatorProcessor {
                 block_number,
                 block_hash,
                 error: format!("Failed to fetch contracts: {e}"),
+                transient: true,
             })?;
 
             let new_bytecodes: Vec<_> = missing_contracts
@@ -171,12 +215,14 @@ impl BlockProcessor for ValidatorProcessor {
                     block_number,
                     block_hash,
                     error: format!("Contract hash mismatch: {e}"),
+                    transient: false,
                 })?;
 
             self.contract_cache.insert(&new_bytecodes).map_err(|e| ValidationFailure {
                 block_number,
                 block_hash,
                 error: format!("Failed to cache contracts: {e}"),
+                transient: true,
             })?;
             contracts.extend(new_bytecodes);
         }
@@ -188,6 +234,7 @@ impl BlockProcessor for ValidatorProcessor {
                 block_number,
                 block_hash,
                 error: format!("Failed to compute state root: {e}"),
+                transient: false,
             })?);
         let post_state_root = task.block.header.state_root;
         let pre_withdrawals_root = task.mpt_witness.storage_root;
@@ -196,6 +243,7 @@ impl BlockProcessor for ValidatorProcessor {
                 block_number,
                 block_hash,
                 error: "Withdrawals root not found in block".to_string(),
+                transient: false,
             })?;
 
         // Validate in a blocking thread
@@ -215,6 +263,7 @@ impl BlockProcessor for ValidatorProcessor {
             block_number,
             block_hash,
             error: format!("Validation task panicked: {e}"),
+            transient: false,
         })?;
 
         match &validation_result {
@@ -242,9 +291,18 @@ impl BlockProcessor for ValidatorProcessor {
             }
             Err(e) => {
                 error!(block_number, error = %e, "[Worker] Failed to validate block");
-                Err(ValidationFailure { block_number, block_hash, error: e.to_string() })
+                Err(ValidationFailure {
+                    block_number,
+                    block_hash,
+                    error: e.to_string(),
+                    transient: false,
+                })
             }
         }
+    }
+
+    fn error_action(&self, error: &ValidationFailure) -> ErrorAction {
+        if error.transient { ErrorAction::Retry } else { ErrorAction::Halt }
     }
 
     fn on_task_done(&self, worker_id: usize, success: bool) {

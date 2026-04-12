@@ -1,15 +1,18 @@
-//! Generic chain sync pipeline shared by both binaries.
+//! Generic chain sync pipeline.
 //!
-//! Provides:
-//! - [`PipelineConfig`]: Configuration for pipeline behavior.
-//! - [`block_fetcher`]: Generic RPC block fetcher.
-//! - [`find_divergence_point`]: Finds where the local chain diverges from the remote.
-//! - [`run_pipeline`]: Outer loop: fetch → process → advance, with reorg restart + stale detection.
+//! Three-stage pipeline: fetch → process → advance, with automatic reorg restart
+//! and optional stale-data detection.
 //!
-//! Binary-specific logic is plugged in via traits:
+//! ## Traits
+//!
+//! - [`BlockFetcher`]: Pluggable data source (replaces hardcoded RPC sequence).
 //! - [`BlockProcessor`]: Processing stage (validation or pass-through).
 //! - [`PipelineHooks`]: Callbacks for advance/reorg/stale events.
 //! - [`ProcessedBlock`]: Output of the processing stage.
+//!
+//! ## Entry Point
+//!
+//! [`run_pipeline`] orchestrates the full lifecycle.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -20,20 +23,16 @@ use std::{
 };
 
 use alloy_primitives::{BlockHash, BlockNumber};
-use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
 use eyre::{Result, anyhow};
 use futures::future;
-use op_alloy_rpc_types::Transaction;
-use salt::SaltWitness;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 
-use crate::{ChainDataProvider, ChainStore, db::BlockMeta, withdrawals::MptWitness};
+use crate::{ChainStore, db::BlockMeta};
 
 /// Configuration for the chain sync pipeline.
 ///
-/// Contains only the fields used by the pipeline itself (within `stateless-core`).
 /// Binary-specific settings (metrics, reporting, pruner) live in binary CLI args.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
@@ -45,8 +44,6 @@ pub struct PipelineConfig {
     pub poll_interval: Duration,
     /// Time to wait when pipeline encounters errors before restarting.
     pub error_restart_delay: Duration,
-
-    // --- Channel / fetcher settings ---
     /// Channel capacity for the fetch→worker pipeline.
     pub fetch_channel_capacity: usize,
     /// Channel capacity for the worker→advancer pipeline.
@@ -55,8 +52,6 @@ pub struct PipelineConfig {
     pub fetcher_batch_size: usize,
     /// Maximum RPC retry backoff for the fetcher.
     pub fetcher_max_backoff: Duration,
-
-    // --- Stale detection ---
     /// If local tip falls behind remote by more than this, reset anchor.
     /// `None` = disabled (validator). `Some(N)` = enabled (trace server).
     pub stale_reset_threshold: Option<u64>,
@@ -79,13 +74,24 @@ impl Default for PipelineConfig {
     }
 }
 
-/// Outcome of a single pipeline cycle (returned by [`chain_advancer`]).
+/// Outcome of a single pipeline cycle.
 #[derive(Debug)]
 pub enum PipelineOutcome {
-    /// Clean shutdown (cancellation token fired or channel closed normally).
+    /// Clean shutdown (cancellation token fired or channel closed).
     Shutdown,
     /// Reorg detected — caller should rollback and restart.
     Reorg(ReorgEvent),
+    /// Deterministic failure (e.g., validation mismatch) — halt, no point retrying.
+    Fatal(String),
+}
+
+/// Whether a processing error is worth retrying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorAction {
+    /// Transient error (RPC timeout, network issue) — restart pipeline, retry later.
+    Retry,
+    /// Deterministic failure (validation mismatch) — halt immediately.
+    Halt,
 }
 
 /// Details of a detected chain reorganization.
@@ -99,14 +105,48 @@ pub struct ReorgEvent {
     pub reverted_hashes: Vec<BlockHash>,
 }
 
-/// A block that has been processed and is ready for chain advancement.
+/// Pluggable data source for the pipeline.
 ///
-/// Both `ValidatedBlock` (validator) and pass-through types (trace server)
-/// implement this trait.
+/// Each binary provides its own implementation that decides *how* to fetch a block
+/// (which RPC calls, what transformations, what metrics to record).
+/// The pipeline only calls these four methods — it never touches network types directly.
+pub trait BlockFetcher: Send + Sync + 'static {
+    /// Data produced per block, fed into [`BlockProcessor::process`].
+    type Output: Send + 'static;
+
+    /// Fetch a complete block at the given number.
+    fn fetch(&self, block_number: u64) -> impl Future<Output = Result<Self::Output>> + Send;
+
+    /// Current chain tip height (used by the fetcher poll loop).
+    fn latest_block_number(&self) -> impl Future<Output = Result<u64>> + Send;
+
+    /// Hash for a given block number (used by [`find_divergence_point`]).
+    fn block_hash(&self, block_number: u64) -> impl Future<Output = Result<BlockHash>> + Send;
+
+    /// Metadata of the latest block (used by stale anchor reset).
+    fn latest_block_meta(&self) -> impl Future<Output = Result<BlockMeta>> + Send;
+}
+
+/// Blanket implementation so `Arc<F>` also implements `BlockFetcher`.
+impl<F: BlockFetcher> BlockFetcher for Arc<F> {
+    type Output = F::Output;
+    fn fetch(&self, block_number: u64) -> impl Future<Output = Result<Self::Output>> + Send {
+        (**self).fetch(block_number)
+    }
+    fn latest_block_number(&self) -> impl Future<Output = Result<u64>> + Send {
+        (**self).latest_block_number()
+    }
+    fn block_hash(&self, block_number: u64) -> impl Future<Output = Result<BlockHash>> + Send {
+        (**self).block_hash(block_number)
+    }
+    fn latest_block_meta(&self) -> impl Future<Output = Result<BlockMeta>> + Send {
+        (**self).latest_block_meta()
+    }
+}
+
+/// A block that has been processed and is ready for chain advancement.
 pub trait ProcessedBlock: Send + 'static {
-    /// Block number.
     fn block_number(&self) -> BlockNumber;
-    /// Block hash.
     fn block_hash(&self) -> BlockHash;
     /// Parent block hash (used for reorg detection).
     fn parent_hash(&self) -> BlockHash;
@@ -114,49 +154,43 @@ pub trait ProcessedBlock: Send + 'static {
     fn to_block_meta(&self) -> BlockMeta;
 
     /// Optional continuity check against the previous chain tip.
-    ///
-    /// The validator overrides this to verify that `pre_state_root` matches
-    /// the previous tip's `post_state_root`. Default: no-op.
+    /// The validator overrides this to verify state root continuity. Default: no-op.
     fn verify_continuity(&self, _previous_tip: &BlockMeta) -> Result<()> {
         Ok(())
     }
 }
 
 /// Processing stage of the pipeline.
-///
-/// For the validator: validates blocks with EVM execution.
-/// For the trace server: passes through block metadata (no processing).
 pub trait BlockProcessor: Send + Sync + 'static {
-    /// Input type received from the fetcher (after transform).
+    /// Input type from the fetcher.
     type Input: Send + 'static;
     /// Output type sent to the chain advancer.
     type Output: ProcessedBlock;
     /// Error type for processing failures.
     type Error: Display + Send + 'static;
 
-    /// Process a single block.
-    /// Called from N worker tasks in parallel.
+    /// Process a single block (called from N worker tasks in parallel).
     fn process(
         &self,
         input: Self::Input,
     ) -> impl Future<Output = std::result::Result<Self::Output, Self::Error>> + Send;
 
-    /// Called after each task completes in a worker.
-    /// Use this for per-worker metrics (e.g., task success/failure counters).
-    /// Default: no-op.
+    /// Classify whether an error is transient (worth retrying) or fatal (should halt).
+    /// Default: all errors are fatal (conservative — unknown errors don't silently loop).
+    fn error_action(&self, _error: &Self::Error) -> ErrorAction {
+        ErrorAction::Halt
+    }
+
+    /// Called after each task completes. Use for per-worker metrics. Default: no-op.
     fn on_task_done(&self, _worker_id: usize, _success: bool) {}
 }
 
 /// Hooks for binary-specific behavior during chain advancement.
-///
 /// All methods have default no-op implementations.
 pub trait PipelineHooks: Send + Sync + 'static {
-    /// The processed block type (must match the processor's output).
     type Output: ProcessedBlock;
 
     /// Called with a batch of processed blocks *before* `advance_chain()`.
-    ///
-    /// Use this to persist additional data (e.g., `store_block_data` for trace server).
     fn pre_advance(&self, _items: &[Self::Output]) -> Result<()> {
         Ok(())
     }
@@ -186,63 +220,56 @@ pub trait PipelineHooks: Send + Sync + 'static {
 ///
 /// Handles reorg restart and optional stale-data detection in the outer loop.
 /// Returns when `shutdown` is cancelled, `sync_target` is reached, or a fatal error occurs.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_pipeline<C, S, P, H, F, G>(
-    client: Arc<C>,
+pub async fn run_pipeline<F, S, P, H>(
+    fetcher: Arc<F>,
     store: Arc<S>,
     processor: Arc<P>,
     hooks: Arc<H>,
     config: Arc<PipelineConfig>,
     shutdown: CancellationToken,
-    transform: F,
-    on_remote_height: Option<G>,
 ) -> Result<()>
 where
-    C: ChainDataProvider + 'static,
+    F: BlockFetcher<Output = P::Input>,
     S: ChainStore + 'static,
     P: BlockProcessor,
     H: PipelineHooks<Output = P::Output>,
-    F: Fn(Block<Transaction>, SaltWitness, MptWitness) -> P::Input + Send + Sync + Clone + 'static,
-    G: Fn(u64) + Send + Sync + Clone + 'static,
 {
     loop {
         if shutdown.is_cancelled() {
             return Ok(());
         }
 
-        // Determine start block from current chain state
         let initial_tip = match store.get_canonical_tip()? {
             Some(tip) => tip,
             None => store.get_anchor()?.ok_or_else(|| anyhow!("No anchor or tip in database"))?,
         };
         let start_block = initial_tip.block_number + 1;
-
         info!(start_block, "[Pipeline] Starting cycle");
 
-        // --- Stage 1: Fetch ---
+        // Stage 1: Fetch
         let (fetch_tx, fetch_rx) = kanal::bounded(config.fetch_channel_capacity);
         let fetcher_shutdown = CancellationToken::new();
         let fetcher_handle = tokio::spawn(block_fetcher(
-            client.clone(),
+            fetcher.clone(),
             fetch_tx,
             start_block,
             config.clone(),
             fetcher_shutdown.clone(),
-            transform.clone(),
-            on_remote_height.clone(),
         ));
 
-        // --- Stage 2: Process (N workers) ---
-        let (result_tx, result_rx) = kanal::bounded(config.result_channel_capacity);
+        // Stage 2: Process (N workers)
+        let (result_tx, result_rx) = kanal::bounded::<
+            std::result::Result<P::Output, (String, ErrorAction)>,
+        >(config.result_channel_capacity);
         let worker_handles =
             spawn_workers(processor.clone(), fetch_rx, result_tx, config.concurrent_workers);
 
-        // --- Stage 3: Advance ---
+        // Stage 3: Advance
         let outcome =
-            chain_advancer(&*client, &*store, &*hooks, result_rx, initial_tip, shutdown.clone())
+            chain_advancer(&*fetcher, &*store, &*hooks, result_rx, initial_tip, shutdown.clone())
                 .await;
 
-        // --- Teardown ---
+        // Teardown
         fetcher_shutdown.cancel();
         await_handles(fetcher_handle, worker_handles).await;
 
@@ -251,7 +278,10 @@ where
                 info!("[Pipeline] Shutting down");
                 return Ok(());
             }
-
+            Ok(PipelineOutcome::Fatal(msg)) => {
+                error!(error = %msg, "[Pipeline] Fatal error, halting");
+                return Err(anyhow!("Pipeline halted: {msg}"));
+            }
             Ok(PipelineOutcome::Reorg(event)) => {
                 warn!(
                     rollback_to = event.rollback_to,
@@ -260,20 +290,18 @@ where
                 );
                 hooks.on_reorg(event.rollback_to, event.depth, &event.reverted_hashes)?;
                 store.rollback_chain(event.rollback_to)?;
-                // Brief pause before restart
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_millis(100)) => {}
                     _ = shutdown.cancelled() => return Ok(()),
                 }
                 continue;
             }
-
             Err(e) => {
                 error!(error = %e, "[Pipeline] Cycle ended with error");
 
-                // --- Stale detection (optional) ---
+                // Stale detection (optional)
                 if let Some(threshold) = config.stale_reset_threshold &&
-                    let Ok(chain_latest) = client.get_latest_block_number().await &&
+                    let Ok(chain_latest) = fetcher.latest_block_number().await &&
                     let Ok(Some(tip)) = store.get_canonical_tip() &&
                     chain_latest > tip.block_number + threshold
                 {
@@ -281,32 +309,18 @@ where
                         tip = tip.block_number,
                         chain_latest, threshold, "[Pipeline] Local data is stale, resetting anchor"
                     );
-                    // Fetch latest block to get state roots
-                    match client.get_block(BlockId::Number(BlockNumberOrTag::Latest), false).await {
-                        Ok(block) => {
-                            let new_anchor = BlockMeta {
-                                block_number: block.header.number,
-                                block_hash: block.header.hash,
-                                post_state_root: block.header.state_root,
-                                post_withdrawals_root: block
-                                    .header
-                                    .withdrawals_root
-                                    .unwrap_or_default(),
-                            };
+                    match fetcher.latest_block_meta().await {
+                        Ok(new_anchor) => {
                             hooks.on_stale_reset(&new_anchor)?;
                             store.reset_to_anchor(&new_anchor)?;
-                            continue; // restart from new anchor
+                            continue;
                         }
                         Err(e) => {
-                            warn!(
-                                error = %e,
-                                "[Pipeline] Failed to fetch latest block for anchor reset"
-                            );
+                            warn!(error = %e, "[Pipeline] Failed to fetch latest block for anchor reset");
                         }
                     }
                 }
 
-                // Wait before restarting
                 tokio::select! {
                     _ = tokio::time::sleep(config.error_restart_delay) => {}
                     _ = shutdown.cancelled() => return Ok(()),
@@ -317,29 +331,19 @@ where
     }
 }
 
-/// Continuously fetches blocks from RPC and sends them through a channel.
+/// Continuously fetches blocks and sends them through a channel.
 ///
-/// Generic over the output type `T` — the `transform` function converts raw RPC
-/// data `(Block, SaltWitness, MptWitness)` into whatever the consumer needs.
-/// Backpressure is provided by the bounded channel.
-///
-/// On RPC error, retries with exponential backoff. On channel closure or shutdown, returns.
-pub async fn block_fetcher<T: Send + 'static, C: ChainDataProvider + 'static, F, G>(
-    client: Arc<C>,
-    tx: kanal::Sender<T>,
+/// Calls [`BlockFetcher::fetch`] in parallel batches. Provides backpressure via
+/// bounded channel. On error, retries with exponential backoff.
+pub async fn block_fetcher<F: BlockFetcher>(
+    fetcher: Arc<F>,
+    tx: kanal::Sender<F::Output>,
     start_block: u64,
     config: Arc<PipelineConfig>,
     shutdown: CancellationToken,
-    transform: F,
-    on_remote_height: Option<G>,
-) -> Result<()>
-where
-    F: Fn(Block<Transaction>, SaltWitness, MptWitness) -> T + Send + Sync + 'static,
-    G: Fn(u64) + Send + Sync,
-{
-    let transform = Arc::new(transform);
+) -> Result<()> {
     let tx = tx.to_async();
-    info!(start_block = start_block, batch_size = config.fetcher_batch_size, "[Fetcher] Starting");
+    info!(start_block, batch_size = config.fetcher_batch_size, "[Fetcher] Starting");
 
     let mut next_block = start_block;
     let mut backoff = Duration::from_secs(1);
@@ -351,22 +355,15 @@ where
             return Ok(());
         }
 
-        // Check sync target
         if let Some(target) = config.sync_target &&
             next_block > target
         {
-            info!(target = target, "[Fetcher] Reached sync target, stopping");
+            info!(target, "[Fetcher] Reached sync target, stopping");
             return Ok(());
         }
 
-        // Wait until there's data to fetch (check chain latest)
-        let chain_latest = match client.get_latest_block_number().await {
-            Ok(n) => {
-                if let Some(ref cb) = on_remote_height {
-                    cb(n);
-                }
-                n
-            }
+        let chain_latest = match fetcher.latest_block_number().await {
+            Ok(n) => n,
             Err(e) => {
                 warn!(error = %e, "[Fetcher] Failed to get chain latest, retrying");
                 tokio::select! {
@@ -386,34 +383,20 @@ where
             continue;
         }
 
-        // Calculate batch size
         let blocks_available = chain_latest - next_block + 1;
         let batch_size = (config.fetcher_batch_size as u64).min(blocks_available);
 
-        debug!(
-            next_block = next_block,
-            batch_size = batch_size,
-            chain_latest = chain_latest,
-            "[Fetcher] Fetching batch"
-        );
+        debug!(next_block, batch_size, chain_latest, "[Fetcher] Fetching batch");
 
-        // Fetch blocks in parallel
         let fetch_start = Instant::now();
         let results = future::join_all((next_block..next_block + batch_size).map(|block_number| {
-            let client = client.clone();
-            let transform = Arc::clone(&transform);
-            async move {
-                let block_hash = client.get_block_hash(block_number).await?;
-                let (salt_witness, mpt_witness) =
-                    client.get_witness(block_number, block_hash).await?;
-                let block = client.get_block(BlockId::Number(block_number.into()), true).await?;
-                Ok::<_, eyre::Error>(transform(block, salt_witness, mpt_witness))
-            }
-            .instrument(info_span!("fetch_block", block_number = block_number))
+            let fetcher = fetcher.clone();
+            async move { fetcher.fetch(block_number).await }
+                .instrument(info_span!("fetch_block", block_number))
         }))
         .await;
 
-        // Process results in order, stop on first error
+        // Send results in order, stop on first error
         let mut fetched = 0u64;
         for (i, result) in results.into_iter().enumerate() {
             match result {
@@ -430,12 +413,7 @@ where
                     let count = block_error_counts.entry(block_number).or_insert(0);
                     *count += 1;
                     if *count > 5 {
-                        error!(
-                            block_number = block_number,
-                            attempt = *count,
-                            error = %e,
-                            "[Fetcher] Block fetch error (repeated)"
-                        );
+                        error!(block_number, attempt = *count, error = %e, "[Fetcher] Block fetch error (repeated)");
                     }
                     break;
                 }
@@ -443,7 +421,7 @@ where
         }
 
         if fetched > 0 {
-            info!(
+            debug!(
                 blocks = fetched,
                 start = next_block,
                 end = next_block + fetched - 1,
@@ -462,31 +440,57 @@ where
     }
 }
 
-/// Finds where the local chain diverges from the remote RPC node.
+/// Errors from [`find_divergence_point`], classified for the pipeline.
+#[derive(Debug, thiserror::Error)]
+pub enum DivergenceError {
+    /// Earliest local block doesn't match remote — reorg deeper than our history.
+    /// Requires manual restart with a new `--start-block`.
+    #[error(
+        "Catastrophic reorg: earliest local block {block_number} hash mismatch \
+         (local: {local_hash:?}, remote: {remote_hash:?}). Manual restart required."
+    )]
+    CatastrophicReorg { block_number: BlockNumber, local_hash: BlockHash, remote_hash: BlockHash },
+
+    /// A block that should exist locally is missing — database is inconsistent.
+    /// Requires manual restart with a new `--start-block`.
+    #[error(
+        "Local chain corrupt: block {block_number} missing during reorg resolution. \
+         Manual restart required."
+    )]
+    LocalChainCorrupt { block_number: BlockNumber },
+
+    /// Transient error during divergence search (e.g., RPC timeout).
+    #[error(transparent)]
+    Transient(#[from] eyre::Error),
+}
+
+impl DivergenceError {
+    /// Whether this error is fatal (no point retrying).
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, Self::CatastrophicReorg { .. } | Self::LocalChainCorrupt { .. })
+    }
+}
+
+/// Finds where the local chain diverges from the remote.
 ///
-/// Uses exponential search (efficient for near-tip reorgs) followed by binary search
-/// to locate the exact divergence point.
-///
-/// Backend-agnostic: takes closures for local chain lookups so it works with
-/// any `dyn ChainStore` implementation (both `ValidatorDB` and `ServerDB`).
+/// Uses exponential search (efficient for near-tip reorgs) followed by binary search.
+/// Backend-agnostic: takes closures for local chain lookups.
 #[instrument(skip_all, name = "find_divergence")]
-pub async fn find_divergence_point<C: ChainDataProvider>(
-    client: &C,
+pub async fn find_divergence_point<F: BlockFetcher>(
+    fetcher: &F,
     get_hash: &(dyn Fn(u64) -> eyre::Result<Option<BlockHash>> + Send + Sync),
     get_earliest: &(dyn Fn() -> eyre::Result<Option<(BlockNumber, BlockHash)>> + Send + Sync),
     mismatch_block: u64,
-) -> Result<u64> {
+) -> std::result::Result<u64, DivergenceError> {
     let earliest_local = get_earliest()?.expect("Local chain cannot be empty");
 
-    // Safety check: verify earliest block matches remote chain
-    let earliest_remote_hash = client.get_block_hash(earliest_local.0).await?;
+    let earliest_remote_hash = fetcher.block_hash(earliest_local.0).await?;
     if earliest_remote_hash != earliest_local.1 {
-        return Err(anyhow!(
-            "Catastrophic reorg: earliest local block {} hash mismatch (local: {:?}, remote: {:?})",
-            earliest_local.0,
-            earliest_local.1,
-            earliest_remote_hash
-        ));
+        return Err(DivergenceError::CatastrophicReorg {
+            block_number: earliest_local.0,
+            local_hash: earliest_local.1,
+            remote_hash: earliest_remote_hash,
+        });
     }
 
     // Exponential search backward from mismatch point
@@ -496,8 +500,9 @@ pub async fn find_divergence_point<C: ChainDataProvider>(
 
     while last_mismatch > earliest_local.0 {
         let check_block = last_mismatch.saturating_sub(step).max(earliest_local.0);
-        let local_hash = get_hash(check_block)?.unwrap();
-        let remote_hash = client.get_block_hash(check_block).await?;
+        let local_hash = get_hash(check_block)?
+            .ok_or(DivergenceError::LocalChainCorrupt { block_number: check_block })?;
+        let remote_hash = fetcher.block_hash(check_block).await?;
 
         if remote_hash == local_hash {
             search_start = check_block;
@@ -512,8 +517,9 @@ pub async fn find_divergence_point<C: ChainDataProvider>(
     let (mut left, mut right, mut last_matching) = (search_start, last_mismatch, search_start);
     while left <= right {
         let mid = left + (right - left) / 2;
-        let local_hash = get_hash(mid)?.unwrap();
-        let remote_hash = client.get_block_hash(mid).await?;
+        let local_hash =
+            get_hash(mid)?.ok_or(DivergenceError::LocalChainCorrupt { block_number: mid })?;
+        let remote_hash = fetcher.block_hash(mid).await?;
         if remote_hash == local_hash {
             last_matching = mid;
             left = mid + 1;
@@ -526,21 +532,18 @@ pub async fn find_divergence_point<C: ChainDataProvider>(
     Ok(last_matching)
 }
 
-/// Receives processed blocks, reorders them, verifies parent-hash continuity,
+/// Receives processed blocks, reorders, verifies parent-hash continuity,
 /// and advances the canonical chain.
-///
-/// Returns [`PipelineOutcome::Reorg`] when a parent-hash mismatch is detected,
-/// or [`PipelineOutcome::Shutdown`] on clean shutdown / channel closure.
-async fn chain_advancer<C, S, H>(
-    client: &C,
+async fn chain_advancer<F, S, H>(
+    fetcher: &F,
     store: &S,
     hooks: &H,
-    result_rx: kanal::Receiver<std::result::Result<H::Output, String>>,
+    result_rx: kanal::Receiver<std::result::Result<H::Output, (String, ErrorAction)>>,
     initial_tip: BlockMeta,
     shutdown: CancellationToken,
 ) -> Result<PipelineOutcome>
 where
-    C: ChainDataProvider,
+    F: BlockFetcher,
     S: ChainStore,
     H: PipelineHooks,
 {
@@ -550,27 +553,27 @@ where
     let mut buffer: BTreeMap<u64, H::Output> = BTreeMap::new();
 
     loop {
-        // Receive next result (or shutdown)
         let item = tokio::select! {
             r = rx.recv() => match r {
                 Ok(Ok(item)) => item,
-                Ok(Err(e)) => {
-                    return Err(anyhow!("Block processing failed: {e}"));
+                Ok(Err((msg, ErrorAction::Halt))) => {
+                    error!(error = %msg, "[Advancer] Fatal processing error, halting");
+                    return Ok(PipelineOutcome::Fatal(msg));
                 }
-                Err(_) => {
-                    // Channel closed — fetcher finished (sync target reached or error)
-                    return Ok(PipelineOutcome::Shutdown);
+                Ok(Err((msg, ErrorAction::Retry))) => {
+                    warn!(error = %msg, "[Advancer] Transient processing error, restarting cycle");
+                    return Err(anyhow!("{msg}"));
                 }
+                Err(_) => return Ok(PipelineOutcome::Shutdown),
             },
             _ = shutdown.cancelled() => return Ok(PipelineOutcome::Shutdown),
         };
 
         buffer.insert(item.block_number(), item);
 
-        // Drain consecutive blocks from buffer
+        // Drain consecutive blocks
         let mut batch = Vec::new();
         while let Some(item) = buffer.remove(&next_expected) {
-            // Verify parent hash continuity
             if item.parent_hash() != current_tip.block_hash {
                 debug!(
                     block = next_expected,
@@ -579,17 +582,22 @@ where
                     "[Advancer] Parent hash mismatch — reorg detected"
                 );
 
-                let rollback_to = find_divergence_point(
-                    client,
+                let rollback_to = match find_divergence_point(
+                    fetcher,
                     &|n| store.get_block_hash(n),
                     &|| store.get_earliest_block(),
                     current_tip.block_number,
                 )
-                .await?;
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) if e.is_fatal() => {
+                        return Ok(PipelineOutcome::Fatal(e.to_string()));
+                    }
+                    Err(e) => return Err(e.into()),
+                };
 
                 let depth = current_tip.block_number.saturating_sub(rollback_to);
-
-                // Collect reverted block hashes for hooks
                 let mut reverted_hashes = Vec::new();
                 for n in (rollback_to + 1)..=current_tip.block_number {
                     if let Ok(Some(hash)) = store.get_block_hash(n) {
@@ -604,42 +612,39 @@ where
                 }));
             }
 
-            // Optional continuity check (validator checks state roots)
-            item.verify_continuity(&current_tip)?;
-
-            // Update tip tracking
+            if let Err(e) = item.verify_continuity(&current_tip) {
+                error!(
+                    block = next_expected,
+                    error = %e,
+                    "[Advancer] State continuity check failed, halting"
+                );
+                return Ok(PipelineOutcome::Fatal(e.to_string()));
+            }
             current_tip = item.to_block_meta();
             next_expected += 1;
             batch.push(item);
         }
 
         if !batch.is_empty() {
-            // Pre-advance hook (e.g., store_block_data for trace server)
             hooks.pre_advance(&batch)?;
-
-            // Persist chain advancement
             let metas: Vec<BlockMeta> = batch.iter().map(|b| b.to_block_meta()).collect();
             store.advance_chain(&metas)?;
-
             debug!(
                 tip = current_tip.block_number,
                 advanced = metas.len(),
                 buffered = buffer.len(),
                 "[Advancer] Chain advanced"
             );
-
-            // Post-advance hook (e.g., update metrics)
             hooks.post_advance(&current_tip)?;
         }
     }
 }
 
-/// Spawns N worker tasks that consume from `fetch_rx`, process via `processor`,
-/// and send results to `result_tx`.
+/// Spawns N worker tasks: fetch_rx → processor.process() → result_tx.
 fn spawn_workers<P: BlockProcessor>(
     processor: Arc<P>,
     fetch_rx: kanal::Receiver<P::Input>,
-    result_tx: kanal::Sender<std::result::Result<P::Output, String>>,
+    result_tx: kanal::Sender<std::result::Result<P::Output, (String, ErrorAction)>>,
     count: usize,
 ) -> Vec<JoinHandle<()>> {
     (0..count)
@@ -666,7 +671,8 @@ fn spawn_workers<P: BlockProcessor>(
                         }
                         Err(e) => {
                             processor.on_task_done(worker_id, false);
-                            Err(e.to_string())
+                            let action = processor.error_action(&e);
+                            Err((e.to_string(), action))
                         }
                     };
 
@@ -683,7 +689,6 @@ fn spawn_workers<P: BlockProcessor>(
 /// Waits for the fetcher and all workers to finish (with timeout).
 async fn await_handles(fetcher: JoinHandle<Result<()>>, workers: Vec<JoinHandle<()>>) {
     let timeout = Duration::from_secs(3);
-
     tokio::select! {
         _ = async {
             if let Err(e) = fetcher.await {
@@ -709,7 +714,6 @@ mod tests {
 
     use super::*;
 
-    // PipelineConfig tests
     #[test]
     fn test_pipeline_config_default_uses_cpu_count() {
         let config = PipelineConfig::default();
@@ -725,8 +729,7 @@ mod tests {
         assert!(PipelineConfig::default().stale_reset_threshold.is_none());
     }
 
-    // Mock types for chain_advancer / find_divergence tests
-    /// Simple processed block for tests.
+    // Mock types for tests
     #[derive(Clone, Debug)]
     struct MockBlock {
         number: u64,
@@ -755,13 +758,11 @@ mod tests {
         }
     }
 
-    /// No-op hooks.
     struct NoopHooks;
     impl PipelineHooks for NoopHooks {
         type Output = MockBlock;
     }
 
-    /// Mock ChainStore backed by a BTreeMap.
     struct MockStore {
         chain: std::sync::Mutex<BTreeMap<u64, BlockMeta>>,
         anchor: BlockMeta,
@@ -819,23 +820,25 @@ mod tests {
         }
     }
 
-    /// Mock ChainDataProvider backed by a HashMap of block hashes.
-    struct MockRpc {
+    /// Mock fetcher that only provides block hashes (for advancer/divergence tests).
+    struct MockFetcher {
         hashes: HashMap<u64, BlockHash>,
     }
 
-    impl ChainDataProvider for MockRpc {
-        async fn get_latest_block_number(&self) -> Result<u64> {
+    impl BlockFetcher for MockFetcher {
+        type Output = ();
+
+        async fn fetch(&self, _: u64) -> Result<()> {
+            unimplemented!("not used in advancer/divergence tests")
+        }
+        async fn latest_block_number(&self) -> Result<u64> {
             Ok(*self.hashes.keys().max().unwrap_or(&0))
         }
-        async fn get_block_hash(&self, n: u64) -> Result<B256> {
+        async fn block_hash(&self, n: u64) -> Result<BlockHash> {
             self.hashes.get(&n).copied().ok_or_else(|| anyhow!("Block {n} not found"))
         }
-        async fn get_witness(&self, _: u64, _: B256) -> Result<(SaltWitness, MptWitness)> {
-            unimplemented!()
-        }
-        async fn get_block(&self, _: BlockId, _: bool) -> Result<Block<Transaction>> {
-            unimplemented!()
+        async fn latest_block_meta(&self) -> Result<BlockMeta> {
+            unimplemented!("not used in advancer/divergence tests")
         }
     }
 
@@ -863,18 +866,16 @@ mod tests {
 
     // chain_advancer tests
 
-    /// Helper: sends blocks then drops sender, calls chain_advancer directly.
     async fn run_advancer(
         tip: BlockMeta,
         rpc_hashes: HashMap<u64, BlockHash>,
-        blocks: Vec<std::result::Result<MockBlock, String>>,
+        blocks: Vec<std::result::Result<MockBlock, (String, ErrorAction)>>,
     ) -> (Result<PipelineOutcome>, MockStore) {
         let store = MockStore::new(tip.clone());
-        let rpc = MockRpc { hashes: rpc_hashes };
+        let fetcher = MockFetcher { hashes: rpc_hashes };
         let hooks = NoopHooks;
         let (tx, rx) = kanal::bounded(16);
 
-        // Pre-fill channel
         {
             let tx_async = tx.to_async();
             for b in blocks {
@@ -882,7 +883,8 @@ mod tests {
             }
         }
 
-        let result = chain_advancer(&rpc, &store, &hooks, rx, tip, CancellationToken::new()).await;
+        let result =
+            chain_advancer(&fetcher, &store, &hooks, rx, tip, CancellationToken::new()).await;
         (result, store)
     }
 
@@ -902,7 +904,6 @@ mod tests {
     #[tokio::test]
     async fn test_chain_advancer_out_of_order() {
         let tip = make_tip(10);
-        // Send out of order: 13, 12, 11
         let blocks = vec![
             Ok(make_block(13, make_hash(12))),
             Ok(make_block(12, make_hash(11))),
@@ -914,25 +915,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_chain_advancer_processing_error() {
+    async fn test_chain_advancer_fatal_error_halts() {
         let tip = make_tip(10);
-        let blocks = vec![Err("validation failed".to_string())];
+        let blocks = vec![Err(("state root mismatch".to_string(), ErrorAction::Halt))];
         let (result, _) = run_advancer(tip, HashMap::new(), blocks).await;
+        match result.unwrap() {
+            PipelineOutcome::Fatal(msg) => assert!(msg.contains("state root mismatch")),
+            other => panic!("Expected Fatal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_chain_advancer_transient_error_returns_err() {
+        let tip = make_tip(10);
+        let blocks = vec![Err(("RPC timeout".to_string(), ErrorAction::Retry))];
+        let (result, _) = run_advancer(tip, HashMap::new(), blocks).await;
+        // Retry errors are returned as Err (not PipelineOutcome), triggering restart
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("validation failed"));
+        assert!(result.unwrap_err().to_string().contains("RPC timeout"));
     }
 
     #[tokio::test]
     async fn test_chain_advancer_shutdown() {
         let tip = make_tip(10);
         let store = MockStore::new(tip.clone());
-        let rpc = MockRpc { hashes: HashMap::new() };
+        let fetcher = MockFetcher { hashes: HashMap::new() };
         let hooks = NoopHooks;
-        let (_tx, rx) = kanal::bounded::<std::result::Result<MockBlock, String>>(16);
+        let (_tx, rx) = kanal::bounded::<std::result::Result<MockBlock, (String, ErrorAction)>>(16);
         let shutdown = CancellationToken::new();
         shutdown.cancel();
 
-        let outcome = chain_advancer(&rpc, &store, &hooks, rx, tip, shutdown).await.unwrap();
+        let outcome = chain_advancer(&fetcher, &store, &hooks, rx, tip, shutdown).await.unwrap();
         assert!(matches!(outcome, PipelineOutcome::Shutdown));
     }
 
@@ -940,12 +953,12 @@ mod tests {
     async fn test_chain_advancer_reorg_detected() {
         let tip = make_tip(10);
         let mut rpc_hashes = HashMap::new();
-        rpc_hashes.insert(10, make_hash(10)); // RPC agrees on block 10
+        rpc_hashes.insert(10, make_hash(10));
 
         let bad_block = MockBlock {
             number: 11,
             hash: make_hash(11),
-            parent: BlockHash::from([0xFF; 32]), // doesn't match tip
+            parent: BlockHash::from([0xFF; 32]),
             state_root: B256::ZERO,
         };
         let (result, _) = run_advancer(tip, rpc_hashes, vec![Ok(bad_block)]).await;
@@ -961,7 +974,6 @@ mod tests {
     async fn test_find_divergence_single_block_reorg() {
         let mut local = HashMap::new();
         let mut remote = HashMap::new();
-        // Blocks 1..=9 match, block 10 differs
         for n in 1..=10 {
             local.insert(n, make_hash(n));
             if n <= 9 {
@@ -971,9 +983,9 @@ mod tests {
             }
         }
 
-        let rpc = MockRpc { hashes: remote };
+        let fetcher = MockFetcher { hashes: remote };
         let result = find_divergence_point(
-            &rpc,
+            &fetcher,
             &|n| Ok(local.get(&n).copied()),
             &|| Ok(Some((1, *local.get(&1).unwrap()))),
             10,
@@ -999,9 +1011,9 @@ mod tests {
             }
         }
 
-        let rpc = MockRpc { hashes: remote };
+        let fetcher = MockFetcher { hashes: remote };
         let result = find_divergence_point(
-            &rpc,
+            &fetcher,
             &|n| Ok(local.get(&n).copied()),
             &|| Ok(Some((1, *local.get(&1).unwrap()))),
             10,
@@ -1021,9 +1033,9 @@ mod tests {
             remote.insert(n, BlockHash::from([(n + 128) as u8; 32]));
         }
 
-        let rpc = MockRpc { hashes: remote };
+        let fetcher = MockFetcher { hashes: remote };
         let result = find_divergence_point(
-            &rpc,
+            &fetcher,
             &|n| Ok(local.get(&n).copied()),
             &|| Ok(Some((1, *local.get(&1).unwrap()))),
             5,
@@ -1066,7 +1078,6 @@ mod tests {
         }
         drop(fetch_tx);
 
-        // Collect results
         let result_rx = result_rx.to_async();
         let mut results = Vec::new();
         while let Ok(r) = result_rx.recv().await {
@@ -1107,6 +1118,9 @@ mod tests {
         let result_rx = result_rx.to_async();
         let result = result_rx.recv().await.unwrap();
         assert!(result.is_err());
-        assert_eq!(result.unwrap_err(), "boom");
+        let (msg, action) = result.unwrap_err();
+        assert_eq!(msg, "boom");
+        // Default error_action is Halt
+        assert_eq!(action, ErrorAction::Halt);
     }
 }
