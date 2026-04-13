@@ -129,6 +129,21 @@ pub const BLOCK_RECORDS: TableDefinition<(u64, [u8; 32]), ()> =
 /// Default maximum number of entries to retain in CANONICAL_CHAIN.
 pub const DEFAULT_MAX_CHAIN_LENGTH: u64 = 1000;
 
+/// Converts a [`BlockMeta`] to a raw tuple for redb storage.
+pub fn block_meta_to_tuple(meta: &BlockMeta) -> (u64, [u8; 32], [u8; 32], [u8; 32]) {
+    (meta.block_number, meta.block_hash.0, meta.post_state_root.0, meta.post_withdrawals_root.0)
+}
+
+/// Reconstructs a [`BlockMeta`] from a raw redb tuple.
+pub fn block_meta_from_tuple(t: (u64, [u8; 32], [u8; 32], [u8; 32])) -> BlockMeta {
+    BlockMeta {
+        block_number: t.0,
+        block_hash: BlockHash::from(t.1),
+        post_state_root: B256::from(t.2),
+        post_withdrawals_root: B256::from(t.3),
+    }
+}
+
 /// Marker byte prepended to lz4-compressed bincode data.
 pub const BINCODE_LZ4_MARKER: u8 = 0x01;
 
@@ -195,7 +210,7 @@ pub fn db_get_canonical_tip(database: &Database) -> eyre::Result<Option<BlockMet
 pub fn db_get_anchor(database: &Database) -> eyre::Result<Option<BlockMeta>> {
     let read_txn = database.begin_read()?;
     let table = read_txn.open_table(ANCHOR_BLOCK)?;
-    Ok(table.get("anchor")?.map(|v| BlockMeta::from_tuple(v.value())))
+    Ok(table.get("anchor")?.map(|v| block_meta_from_tuple(v.value())))
 }
 
 /// Looks up a single block hash from CANONICAL_CHAIN.
@@ -258,7 +273,7 @@ pub fn db_reset_to_anchor(database: &Database, anchor: &BlockMeta) -> eyre::Resu
     let write_txn = database.begin_write()?;
     {
         let mut anchor_table = write_txn.open_table(ANCHOR_BLOCK)?;
-        anchor_table.insert("anchor", anchor.to_tuple())?;
+        anchor_table.insert("anchor", block_meta_to_tuple(anchor))?;
 
         let mut chain = write_txn.open_table(CANONICAL_CHAIN)?;
         chain.retain(|_, _| false)?;
@@ -396,8 +411,8 @@ mod tests {
             post_state_root: B256::from([142u8; 32]),
             post_withdrawals_root: B256::from([242u8; 32]),
         };
-        let tuple = meta.to_tuple();
-        let roundtripped = BlockMeta::from_tuple(tuple);
+        let tuple = block_meta_to_tuple(&meta);
+        let roundtripped = block_meta_from_tuple(tuple);
         assert_eq!(meta, roundtripped);
     }
 

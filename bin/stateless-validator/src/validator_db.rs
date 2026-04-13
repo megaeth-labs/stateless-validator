@@ -43,11 +43,6 @@ impl ValidatorDB {
         Ok(Self { database, max_chain_length: AtomicU64::new(DEFAULT_MAX_CHAIN_LENGTH) })
     }
 
-    /// Returns the stored anchor block, or `None` if not set.
-    pub fn get_anchor_block(&self) -> eyre::Result<Option<BlockMeta>> {
-        db_get_anchor(&self.database)
-    }
-
     #[cfg(test)]
     fn set_max_chain_length(&self, max: u64) {
         self.max_chain_length.store(max, std::sync::atomic::Ordering::Relaxed);
@@ -55,52 +50,14 @@ impl ValidatorDB {
 
     #[cfg(test)]
     fn set_anchor_block(&self, tip: &BlockMeta) -> eyre::Result<()> {
+        use stateless_common::db::block_meta_to_tuple;
         let write_txn = self.database.begin_write()?;
         {
             let mut table = write_txn.open_table(ANCHOR_BLOCK)?;
-            table.insert("anchor", tip.to_tuple())?;
+            table.insert("anchor", block_meta_to_tuple(tip))?;
         }
         write_txn.commit()?;
         Ok(())
-    }
-
-    // -- Canonical tip --
-
-    /// Returns the last validated canonical tip (highest block in the chain), or `None` if empty.
-    pub fn get_canonical_tip(&self) -> eyre::Result<Option<BlockMeta>> {
-        db_get_canonical_tip(&self.database)
-    }
-
-    // -- Genesis --
-
-    /// Persists the genesis configuration as JSON.
-    pub fn store_genesis(&self, genesis: &Genesis) -> eyre::Result<()> {
-        let json_bytes = serde_json::to_vec(genesis)?;
-        let write_txn = self.database.begin_write()?;
-        {
-            let mut table = write_txn.open_table(GENESIS_CONFIG)?;
-            table.insert("genesis", json_bytes)?;
-        }
-        write_txn.commit()?;
-        Ok(())
-    }
-
-    /// Loads the genesis configuration, or `None` if not stored yet.
-    pub fn load_genesis(&self) -> eyre::Result<Option<Genesis>> {
-        let read_txn = self.database.begin_read()?;
-        let table = read_txn.open_table(GENESIS_CONFIG)?;
-        match table.get("genesis")? {
-            Some(data) => {
-                let genesis: Genesis = serde_json::from_slice(data.value().as_slice())?;
-                Ok(Some(genesis))
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// Resets the store to a new anchor, setting the canonical tip to match the anchor.
-    pub fn reset_to_anchor(&self, anchor: &BlockMeta) -> eyre::Result<()> {
-        db_reset_to_anchor(&self.database, anchor)
     }
 }
 
@@ -116,11 +73,26 @@ impl ContractStore for ValidatorDB {
 
 impl GenesisStore for ValidatorDB {
     fn store_genesis(&self, genesis: &Genesis) -> eyre::Result<()> {
-        ValidatorDB::store_genesis(self, genesis)
+        let json_bytes = serde_json::to_vec(genesis)?;
+        let write_txn = self.database.begin_write()?;
+        {
+            let mut table = write_txn.open_table(GENESIS_CONFIG)?;
+            table.insert("genesis", json_bytes)?;
+        }
+        write_txn.commit()?;
+        Ok(())
     }
 
     fn load_genesis(&self) -> eyre::Result<Option<Genesis>> {
-        ValidatorDB::load_genesis(self)
+        let read_txn = self.database.begin_read()?;
+        let table = read_txn.open_table(GENESIS_CONFIG)?;
+        match table.get("genesis")? {
+            Some(data) => {
+                let genesis: Genesis = serde_json::from_slice(data.value().as_slice())?;
+                Ok(Some(genesis))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -210,7 +182,7 @@ mod tests {
     fn test_anchor_block_roundtrip() {
         let (_dir, store) = temp_store();
 
-        assert!(store.get_anchor_block().unwrap().is_none());
+        assert!(ChainStore::get_anchor(&store).unwrap().is_none());
 
         let tip = BlockMeta {
             block_number: 42,
@@ -220,7 +192,7 @@ mod tests {
         };
         store.set_anchor_block(&tip).unwrap();
 
-        let loaded = store.get_anchor_block().unwrap().unwrap();
+        let loaded = ChainStore::get_anchor(&store).unwrap().unwrap();
         assert_eq!(loaded, tip);
     }
 
@@ -297,7 +269,7 @@ mod tests {
 
         store.reset_to_anchor(&anchor).unwrap();
 
-        let loaded_anchor = store.get_anchor_block().unwrap().unwrap();
+        let loaded_anchor = ChainStore::get_anchor(&store).unwrap().unwrap();
         let loaded_tip = store.get_canonical_tip().unwrap().unwrap();
         assert_eq!(loaded_anchor, anchor);
         assert_eq!(loaded_tip, anchor);

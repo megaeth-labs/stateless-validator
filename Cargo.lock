@@ -5652,7 +5652,6 @@ dependencies = [
  "jsonrpsee-types",
  "metrics",
  "metrics-exporter-prometheus",
- "num_cpus",
  "op-alloy-rpc-types",
  "redb",
  "revm",

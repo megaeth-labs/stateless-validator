@@ -170,17 +170,19 @@ impl BlockProcessor for ValidatorProcessor {
         let gas_used = task.block.header.gas_used;
         let start = std::time::Instant::now();
 
+        let fail = |error: String, transient: bool| ValidationFailure {
+            block_number,
+            block_hash,
+            error,
+            transient,
+        };
+
         // Resolve contract codes
         let codehashes = extract_contract_codes(&task.salt_witness);
         let (mut contracts, missing_contracts) = self
             .contract_cache
             .get(&codehashes.iter().copied().collect::<Vec<_>>())
-            .map_err(|e| ValidationFailure {
-                block_number,
-                block_hash,
-                error: format!("Failed to get contracts: {e}"),
-                transient: true,
-            })?;
+            .map_err(|e| fail(format!("Failed to get contracts: {e}"), true))?;
 
         metrics::on_contract_cache_read(contracts.len() as u64, missing_contracts.len() as u64);
 
@@ -191,12 +193,7 @@ impl BlockProcessor for ValidatorProcessor {
                 async move { client.get_code(hash).await }
             }))
             .await
-            .map_err(|e| ValidationFailure {
-                block_number,
-                block_hash,
-                error: format!("Failed to fetch contracts: {e}"),
-                transient: true,
-            })?;
+            .map_err(|e| fail(format!("Failed to fetch contracts: {e}"), true))?;
 
             let new_bytecodes: Vec<_> = missing_contracts
                 .into_iter()
@@ -211,40 +208,28 @@ impl BlockProcessor for ValidatorProcessor {
                     Ok((computed_hash, bytecode))
                 })
                 .collect::<eyre::Result<_>>()
-                .map_err(|e| ValidationFailure {
-                    block_number,
-                    block_hash,
-                    error: format!("Contract hash mismatch: {e}"),
-                    transient: false,
-                })?;
+                .map_err(|e| fail(format!("Contract hash mismatch: {e}"), false))?;
 
-            self.contract_cache.insert(&new_bytecodes).map_err(|e| ValidationFailure {
-                block_number,
-                block_hash,
-                error: format!("Failed to cache contracts: {e}"),
-                transient: true,
-            })?;
+            self.contract_cache
+                .insert(&new_bytecodes)
+                .map_err(|e| fail(format!("Failed to cache contracts: {e}"), true))?;
             contracts.extend(new_bytecodes);
         }
 
         // Extract fields before moving data into spawn_blocking
         let parent_hash = task.block.header.parent_hash;
-        let pre_state_root =
-            B256::from(task.salt_witness.state_root().map_err(|e| ValidationFailure {
-                block_number,
-                block_hash,
-                error: format!("Failed to compute state root: {e}"),
-                transient: false,
-            })?);
+        let pre_state_root = B256::from(
+            task.salt_witness
+                .state_root()
+                .map_err(|e| fail(format!("Failed to compute state root: {e}"), false))?,
+        );
         let post_state_root = task.block.header.state_root;
         let pre_withdrawals_root = task.mpt_witness.storage_root;
-        let post_withdrawals_root =
-            task.block.header.withdrawals_root.ok_or(ValidationFailure {
-                block_number,
-                block_hash,
-                error: "Withdrawals root not found in block".to_string(),
-                transient: false,
-            })?;
+        let post_withdrawals_root = task
+            .block
+            .header
+            .withdrawals_root
+            .ok_or_else(|| fail("Withdrawals root not found in block".to_string(), false))?;
 
         // Validate in a blocking thread
         let chain_spec = self.chain_spec.clone();
@@ -259,12 +244,7 @@ impl BlockProcessor for ValidatorProcessor {
             )
         })
         .await
-        .map_err(|e| ValidationFailure {
-            block_number,
-            block_hash,
-            error: format!("Validation task panicked: {e}"),
-            transient: false,
-        })?;
+        .map_err(|e| fail(format!("Validation task panicked: {e}"), false))?;
 
         match &validation_result {
             Ok(stats) => {
@@ -291,12 +271,7 @@ impl BlockProcessor for ValidatorProcessor {
             }
             Err(e) => {
                 error!(block_number, error = %e, "[Worker] Failed to validate block");
-                Err(ValidationFailure {
-                    block_number,
-                    block_hash,
-                    error: e.to_string(),
-                    transient: false,
-                })
+                Err(fail(e.to_string(), false))
             }
         }
     }

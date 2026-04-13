@@ -5,17 +5,19 @@ use std::{
 };
 
 use alloy_genesis::Genesis;
-use alloy_primitives::{B256, BlockHash, hex};
+use alloy_primitives::B256;
 use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
-use eyre::{Result, anyhow, ensure};
+use eyre::{Result, anyhow};
 use stateless_common::{
     RpcClient, RpcClientConfig,
     db::ContractCache,
     logging::{LogArgs, migrate_legacy_env_vars},
+    parse_block_hash,
 };
 use stateless_core::{
-    ContractStore, PipelineConfig, chain_spec::ChainSpec, db::BlockMeta, pipeline::run_pipeline,
+    ChainStore, ContractStore, GenesisStore, PipelineConfig, chain_spec::ChainSpec, db::BlockMeta,
+    pipeline::run_pipeline,
 };
 use tokio::{signal, task};
 use tokio_util::sync::CancellationToken;
@@ -31,15 +33,6 @@ use crate::chain_sync::{ValidatorFetcher, ValidatorHooks, ValidatorProcessor};
 
 /// Database filename for the validator.
 const VALIDATOR_DB_FILENAME: &str = "validator.redb";
-
-/// Convert hex string to BlockHash
-///
-/// Accepts hex strings with or without "0x" prefix. Must be exactly 32 bytes when decoded.
-fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
-    let hash_bytes = hex::decode(hex_str)?;
-    ensure!(hash_bytes.len() == 32, "Block hash must be 32 bytes, got {}", hash_bytes.len());
-    Ok(BlockHash::from_slice(&hash_bytes))
-}
 
 /// Loads or creates a ChainSpec from the database or a genesis file.
 fn load_or_create_chain_spec(
@@ -193,10 +186,7 @@ async fn main() -> Result<()> {
 
     // Create pipeline configuration
     let report_validation = args.report_validation_endpoint.is_some();
-    let config = Arc::new(PipelineConfig {
-        concurrent_workers: num_cpus::get(),
-        ..PipelineConfig::default()
-    });
+    let config = Arc::new(PipelineConfig::default());
     info!(concurrent_workers = config.concurrent_workers, "[Main] Starting pipeline");
     info!(
         "[Main] Validation result reporting: {}",
@@ -279,11 +269,10 @@ async fn validation_reporter(
         }
 
         // Get anchor and canonical tip
-        let (anchor, tip) =
-            match (validator_db.get_anchor_block(), validator_db.get_canonical_tip()) {
-                (Ok(Some(a)), Ok(Some(t))) => (a, t),
-                _ => continue,
-            };
+        let (anchor, tip) = match (validator_db.get_anchor(), validator_db.get_canonical_tip()) {
+            (Ok(Some(a)), Ok(Some(t))) => (a, t),
+            _ => continue,
+        };
 
         // Skip if no new blocks
         if tip.block_number == last_reported_block {

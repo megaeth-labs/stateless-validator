@@ -573,6 +573,7 @@ where
 
         // Drain consecutive blocks
         let mut batch = Vec::new();
+        let mut metas = Vec::new();
         while let Some(item) = buffer.remove(&next_expected) {
             if item.parent_hash() != current_tip.block_hash {
                 debug!(
@@ -622,12 +623,12 @@ where
             }
             current_tip = item.to_block_meta();
             next_expected += 1;
+            metas.push(current_tip.clone());
             batch.push(item);
         }
 
         if !batch.is_empty() {
             hooks.pre_advance(&batch)?;
-            let metas: Vec<BlockMeta> = batch.iter().map(|b| b.to_block_meta()).collect();
             store.advance_chain(&metas)?;
             debug!(
                 tip = current_tip.block_number,

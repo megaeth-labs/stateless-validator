@@ -30,23 +30,6 @@ pub struct BlockMeta {
     pub post_withdrawals_root: B256,
 }
 
-impl BlockMeta {
-    /// Converts to a raw tuple for redb storage.
-    pub fn to_tuple(&self) -> (u64, [u8; 32], [u8; 32], [u8; 32]) {
-        (self.block_number, self.block_hash.0, self.post_state_root.0, self.post_withdrawals_root.0)
-    }
-
-    /// Reconstructs from a raw redb tuple.
-    pub fn from_tuple(t: (u64, [u8; 32], [u8; 32], [u8; 32])) -> Self {
-        Self {
-            block_number: t.0,
-            block_hash: BlockHash::from(t.1),
-            post_state_root: B256::from(t.2),
-            post_withdrawals_root: B256::from(t.3),
-        }
-    }
-}
-
 /// Contract bytecode persistence.
 pub trait ContractStore: Send + Sync {
     fn get_contracts(&self, hashes: &[B256]) -> eyre::Result<(HashMap<B256, Bytecode>, Vec<B256>)>;
@@ -91,47 +74,28 @@ pub trait BlockStore: PrunableChainStore {
 mod tests {
     use super::*;
 
-    fn make_block_meta(n: u64) -> BlockMeta {
-        BlockMeta {
-            block_number: n,
-            block_hash: BlockHash::from([n as u8; 32]),
-            post_state_root: B256::from([n as u8 + 1; 32]),
-            post_withdrawals_root: B256::from([n as u8 + 2; 32]),
-        }
-    }
-
-    #[test]
-    fn test_block_meta_tuple_round_trip() {
-        let meta = make_block_meta(42);
-        let tuple = meta.to_tuple();
-        let restored = BlockMeta::from_tuple(tuple);
-        assert_eq!(meta, restored);
-    }
-
-    #[test]
-    fn test_block_meta_tuple_round_trip_zero() {
-        let meta = BlockMeta {
-            block_number: 0,
-            block_hash: BlockHash::ZERO,
-            post_state_root: B256::ZERO,
-            post_withdrawals_root: B256::ZERO,
-        };
-        assert_eq!(meta, BlockMeta::from_tuple(meta.to_tuple()));
-    }
-
     #[test]
     fn test_block_meta_equality() {
-        let a = make_block_meta(10);
-        let b = make_block_meta(10);
-        let c = make_block_meta(11);
+        let a = BlockMeta {
+            block_number: 10,
+            block_hash: BlockHash::from([10u8; 32]),
+            post_state_root: B256::from([11u8; 32]),
+            post_withdrawals_root: B256::from([12u8; 32]),
+        };
+        let b = a.clone();
+        let c = BlockMeta { block_number: 11, ..a.clone() };
         assert_eq!(a, b);
         assert_ne!(a, c);
     }
 
     #[test]
     fn test_block_meta_clone() {
-        let meta = make_block_meta(5);
-        let cloned = meta.clone();
-        assert_eq!(meta, cloned);
+        let meta = BlockMeta {
+            block_number: 5,
+            block_hash: BlockHash::from([5u8; 32]),
+            post_state_root: B256::from([6u8; 32]),
+            post_withdrawals_root: B256::from([7u8; 32]),
+        };
+        assert_eq!(meta, meta.clone());
     }
 }

@@ -43,12 +43,11 @@
 use std::{path::PathBuf, sync::Arc};
 
 use alloy_genesis::Genesis;
-use alloy_primitives::{BlockHash, hex};
 use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
-use eyre::{Result, anyhow, ensure};
+use eyre::{Result, anyhow};
 use jsonrpsee::server::{Server, ServerConfig};
-use stateless_common::{RpcClient, RpcClientConfig, logging::LogArgs};
+use stateless_common::{RpcClient, RpcClientConfig, logging::LogArgs, parse_block_hash};
 use stateless_core::{BlockStore, PipelineConfig, chain_spec::ChainSpec, pipeline::run_pipeline};
 use tokio::task;
 use tokio_util::sync::CancellationToken;
@@ -209,13 +208,6 @@ fn parse_size(s: &str) -> Result<u64, String> {
     let value: u64 = num_str.trim().parse().map_err(|e| format!("invalid size '{}': {}", s, e))?;
 
     value.checked_mul(multiplier).ok_or_else(|| format!("size overflow: '{}'", s))
-}
-
-/// Parses a hex string into a BlockHash.
-fn parse_block_hash(hex_str: &str) -> Result<BlockHash> {
-    let hash_bytes = hex::decode(hex_str)?;
-    ensure!(hash_bytes.len() == 32, "Block hash must be 32 bytes, got {}", hash_bytes.len());
-    Ok(BlockHash::from_slice(&hash_bytes))
 }
 
 #[tokio::main]
