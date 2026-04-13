@@ -4,7 +4,10 @@
 //! [`ValidatorHooks`] (metrics integration) for the shared pipeline in
 //! [`stateless_core::pipeline::run_pipeline`].
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    sync::Arc,
+};
 
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, BlockId};
@@ -12,7 +15,7 @@ use eyre::{Result, ensure};
 use futures::future;
 use op_alloy_rpc_types::Transaction;
 use revm::{primitives::KECCAK_EMPTY, state::Bytecode};
-use salt::SaltWitness;
+use salt::{SaltKey, SaltValue, SaltWitness};
 use stateless_common::{RpcClient, db::ContractCache};
 use stateless_core::{
     chain_spec::ChainSpec,
@@ -178,7 +181,7 @@ impl BlockProcessor for ValidatorProcessor {
         };
 
         // Resolve contract codes
-        let codehashes = extract_contract_codes(&task.salt_witness);
+        let codehashes = extract_contract_codes(&task.salt_witness.kvs);
         let (mut contracts, missing_contracts) = self
             .contract_cache
             .get(&codehashes.iter().copied().collect::<Vec<_>>())
@@ -307,11 +310,9 @@ impl PipelineHooks for ValidatorHooks {
     }
 }
 
-/// Returns all contract code hashes from the witness.
-fn extract_contract_codes(salt_witness: &SaltWitness) -> HashSet<B256> {
-    salt_witness
-        .kvs
-        .values()
+/// Returns all contract code hashes from the witness key-value pairs.
+fn extract_contract_codes(kvs: &BTreeMap<SaltKey, Option<SaltValue>>) -> HashSet<B256> {
+    kvs.values()
         .filter_map(|salt_val| salt_val.as_ref())
         .filter_map(|val| match (PlainKey::decode(val.key()), PlainValue::decode(val.value())) {
             (PlainKey::Account(_), PlainValue::Account(acc)) => {
@@ -320,4 +321,165 @@ fn extract_contract_codes(salt_witness: &SaltWitness) -> HashSet<B256> {
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::{Address, U256};
+    use stateless_core::{
+        data_types::{Account, PlainKey, PlainValue},
+        pipeline::ProcessedBlock,
+    };
+
+    use super::*;
+
+    /// Helper: build a SaltValue encoding an account with the given codehash.
+    fn make_account_value(
+        address: Address,
+        nonce: u64,
+        balance: U256,
+        codehash: Option<B256>,
+    ) -> SaltValue {
+        let key_bytes = PlainKey::Account(address).encode();
+        let value_bytes = PlainValue::Account(Account { nonce, balance, codehash }).encode();
+        SaltValue::new(&key_bytes, &value_bytes)
+    }
+
+    /// Helper: build a SaltValue encoding a storage slot.
+    fn make_storage_value(address: Address, slot: B256, value: U256) -> SaltValue {
+        let key_bytes = PlainKey::Storage(address, slot).encode();
+        let value_bytes = PlainValue::Storage(value).encode();
+        SaltValue::new(&key_bytes, &value_bytes)
+    }
+
+    fn make_block_meta(num: u64) -> BlockMeta {
+        BlockMeta {
+            block_number: num,
+            block_hash: BlockHash::from([num as u8; 32]),
+            post_state_root: B256::from([(num.wrapping_add(100)) as u8; 32]),
+            post_withdrawals_root: B256::from([(num.wrapping_add(200)) as u8; 32]),
+        }
+    }
+
+    // -- extract_contract_codes tests --
+
+    #[test]
+    fn test_extract_contract_codes_empty() {
+        assert!(extract_contract_codes(&BTreeMap::new()).is_empty());
+    }
+
+    #[test]
+    fn test_extract_contract_codes_finds_contracts() {
+        let code_hash = B256::from([0xAB; 32]);
+        let val = make_account_value(Address::from([1u8; 20]), 1, U256::ZERO, Some(code_hash));
+
+        let mut kvs = BTreeMap::new();
+        kvs.insert(SaltKey::from((0u32, 0u64)), Some(val));
+
+        let result = extract_contract_codes(&kvs);
+        assert_eq!(result, HashSet::from([code_hash]));
+    }
+
+    #[test]
+    fn test_extract_contract_codes_filters_eoas() {
+        let val = make_account_value(Address::from([2u8; 20]), 5, U256::from(1000u64), None);
+
+        let mut kvs = BTreeMap::new();
+        kvs.insert(SaltKey::from((0u32, 0u64)), Some(val));
+
+        assert!(extract_contract_codes(&kvs).is_empty());
+    }
+
+    #[test]
+    fn test_extract_contract_codes_filters_keccak_empty() {
+        let val = make_account_value(Address::from([3u8; 20]), 0, U256::ZERO, Some(KECCAK_EMPTY));
+
+        let mut kvs = BTreeMap::new();
+        kvs.insert(SaltKey::from((0u32, 0u64)), Some(val));
+
+        assert!(extract_contract_codes(&kvs).is_empty());
+    }
+
+    #[test]
+    fn test_extract_contract_codes_skips_storage_entries() {
+        let val =
+            make_storage_value(Address::from([4u8; 20]), B256::from([5u8; 32]), U256::from(42u64));
+
+        let mut kvs = BTreeMap::new();
+        kvs.insert(SaltKey::from((0u32, 0u64)), Some(val));
+
+        assert!(extract_contract_codes(&kvs).is_empty());
+    }
+
+    #[test]
+    fn test_extract_contract_codes_skips_none_values() {
+        let mut kvs = BTreeMap::new();
+        kvs.insert(SaltKey::from((0u32, 0u64)), None);
+
+        assert!(extract_contract_codes(&kvs).is_empty());
+    }
+
+    #[test]
+    fn test_extract_contract_codes_deduplicates() {
+        let code_hash = B256::from([0xCC; 32]);
+        let val1 = make_account_value(Address::from([1u8; 20]), 1, U256::ZERO, Some(code_hash));
+        let val2 = make_account_value(Address::from([2u8; 20]), 1, U256::ZERO, Some(code_hash));
+
+        let mut kvs = BTreeMap::new();
+        kvs.insert(SaltKey::from((0u32, 0u64)), Some(val1));
+        kvs.insert(SaltKey::from((0u32, 1u64)), Some(val2));
+
+        let result = extract_contract_codes(&kvs);
+        assert_eq!(result.len(), 1);
+        assert!(result.contains(&code_hash));
+    }
+
+    // -- verify_continuity tests --
+
+    #[test]
+    fn test_verify_continuity_success() {
+        let tip = make_block_meta(10);
+        let validated = ValidatedBlock {
+            block_number: 11,
+            block_hash: BlockHash::from([11u8; 32]),
+            parent_hash: tip.block_hash,
+            post_state_root: B256::from([3u8; 32]),
+            post_withdrawals_root: B256::from([4u8; 32]),
+            pre_state_root: tip.post_state_root,
+            pre_withdrawals_root: tip.post_withdrawals_root,
+        };
+        validated.verify_continuity(&tip).unwrap();
+    }
+
+    #[test]
+    fn test_verify_continuity_state_root_mismatch() {
+        let tip = make_block_meta(10);
+        let validated = ValidatedBlock {
+            block_number: 11,
+            block_hash: BlockHash::from([11u8; 32]),
+            parent_hash: tip.block_hash,
+            post_state_root: B256::from([3u8; 32]),
+            post_withdrawals_root: B256::from([4u8; 32]),
+            pre_state_root: B256::from([99u8; 32]), // mismatch
+            pre_withdrawals_root: tip.post_withdrawals_root,
+        };
+        let err = validated.verify_continuity(&tip).unwrap_err();
+        assert!(err.to_string().contains("State root mismatch"));
+    }
+
+    #[test]
+    fn test_verify_continuity_withdrawals_root_mismatch() {
+        let tip = make_block_meta(10);
+        let validated = ValidatedBlock {
+            block_number: 11,
+            block_hash: BlockHash::from([11u8; 32]),
+            parent_hash: tip.block_hash,
+            post_state_root: B256::from([3u8; 32]),
+            post_withdrawals_root: B256::from([4u8; 32]),
+            pre_state_root: tip.post_state_root,
+            pre_withdrawals_root: B256::from([99u8; 32]), // mismatch
+        };
+        let err = validated.verify_continuity(&tip).unwrap_err();
+        assert!(err.to_string().contains("Withdrawals root mismatch"));
+    }
 }

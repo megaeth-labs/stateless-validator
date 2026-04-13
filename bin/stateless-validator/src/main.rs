@@ -41,7 +41,7 @@ fn load_or_create_chain_spec(
 ) -> Result<ChainSpec> {
     let genesis = match genesis_file {
         Some(path) => {
-            info!("[ChainSpec] Loading genesis from file: {path}");
+            info!(path, "[ChainSpec] Loading genesis from file");
             let genesis = serde_json::from_str::<Genesis>(&std::fs::read_to_string(path)?)?;
             validator_db.store_genesis(&genesis)?;
             genesis
@@ -108,18 +108,18 @@ async fn main() -> Result<()> {
     let _log_guard = args.log.init_tracing()?;
     let start = Instant::now();
 
-    info!("[Main] Data directory: {}", args.data_dir);
-    info!("[Main] RPC endpoint: {}", args.rpc_endpoint);
-    info!("[Main] Witness endpoint: {}", args.witness_endpoint);
+    info!(data_dir = %args.data_dir, "[Main] Data directory");
+    info!(rpc_endpoint = %args.rpc_endpoint, "[Main] RPC endpoint");
+    info!(witness_endpoint = %args.witness_endpoint, "[Main] Witness endpoint");
     if let Some(ref genesis_file) = args.genesis_file {
-        info!("[Main] Genesis file: {}", genesis_file);
+        info!(genesis_file, "[Main] Genesis file");
     }
 
     // Initialize metrics if enabled
     if args.metrics_enabled {
         let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
         metrics::init_metrics(metrics_addr)?;
-        info!("[Main] Metrics enabled on port {}", args.metrics_port);
+        info!(port = args.metrics_port, "[Main] Metrics enabled");
     } else {
         info!("[Main] Metrics disabled");
     }
@@ -145,7 +145,7 @@ async fn main() -> Result<()> {
 
     // Handle optional start block initialization
     if let Some(start_block_str) = &args.start_block {
-        info!("[Main] Initializing from start block: {}", start_block_str);
+        info!(start_block = %start_block_str, "[Main] Initializing from start block");
 
         let block_hash = parse_block_hash(start_block_str)?;
         let header = loop {
@@ -169,8 +169,9 @@ async fn main() -> Result<()> {
         validator_db.reset_to_anchor(&anchor)?;
 
         info!(
-            "[Main] Successfully initialized from block {} (number: {})",
-            header.hash, header.number
+            block_hash = %header.hash,
+            block_number = header.number,
+            "[Main] Successfully initialized from start block"
         );
     } else {
         // If no start block was provided, ensure we have an existing canonical tip
@@ -188,10 +189,7 @@ async fn main() -> Result<()> {
     let report_validation = args.report_validation_endpoint.is_some();
     let config = Arc::new(PipelineConfig::default());
     info!(concurrent_workers = config.concurrent_workers, "[Main] Starting pipeline");
-    info!(
-        "[Main] Validation result reporting: {}",
-        if report_validation { "enabled" } else { "disabled" }
-    );
+    info!(enabled = report_validation, "[Main] Validation result reporting");
 
     // Run the pipeline with optional reporter in parallel
     let shutdown = CancellationToken::new();
@@ -305,8 +303,8 @@ async fn validation_reporter(
                     ));
                 }
                 error!(
-                    "[Reporter] Report rejected, upstream at {:?}",
-                    response.last_validated_block
+                    upstream_block = ?response.last_validated_block,
+                    "[Reporter] Report rejected"
                 );
             }
             Err(e) => {
