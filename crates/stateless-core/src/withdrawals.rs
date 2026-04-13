@@ -5,21 +5,17 @@
 //! storage updates from block execution, it cryptographically proves the storage root
 //! transition is valid.
 
-use std::collections::{HashSet, VecDeque};
-
+use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::{Address, B256, Bytes, U256, address, keccak256, map::B256Map};
-use alloy_rlp::Decodable;
+use alloy_rlp::Encodable;
 use alloy_rpc_types_eth::Header;
 use reth_trie::Nibbles;
-use reth_trie_common::{EMPTY_ROOT_HASH, TrieNode};
+use reth_trie_common::{EMPTY_ROOT_HASH, LeafNode, TrieAccount, TrieNode};
 use reth_trie_sparse::{
-    SerialSparseTrie, SparseTrie, SparseTrieInterface, TrieMasks, provider::DefaultTrieNodeProvider,
+    SerialSparseTrie, SparseStateTrie, provider::DefaultTrieNodeProviderFactory,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-/// Number of children in an MPT branch node (0-15, hex digits)
-const BRANCH_NODE_CHILDREN: u8 = 16;
 
 /// L2 contract `L2ToL1MessagePasser`, storing commitments to withdrawal transactions.
 pub const ADDRESS_L2_TO_L1_MESSAGE_PASSER: Address =
@@ -31,17 +27,8 @@ pub enum WithdrawalValidationError {
     #[error("Missing withdrawals_root in block header")]
     MissingWithdrawalsRoot,
 
-    #[error("Witness node not found: {0:?}")]
-    WitnessNodeNotFound(B256),
-
-    #[error("RLP decode failed: {0}")]
-    RlpDecodeFailed(String),
-
     #[error("Trie operation failed: {0}")]
     TrieOperationFailed(String),
-
-    #[error("Trie not revealed")]
-    TrieNotRevealed,
 
     #[error("Pre-state root mismatch: expected {expected:?}, got {actual:?}")]
     PreStateRootMismatch { expected: B256, actual: B256 },
@@ -70,9 +57,10 @@ impl MptWitness {
     ///
     /// # Process
     ///
-    /// 1. Reconstructs pre-state trie from witness, verifies against `storage_root`
-    /// 2. Applies storage updates (inserts non-zero, removes zero values)
-    /// 3. Computes post-state root, verifies against `header.withdrawals_root`
+    /// 1. Synthesizes an account-level state witness wrapping the storage witness
+    /// 2. Reveals the trie via BFS, verifies pre-state root against `storage_root`
+    /// 3. Applies storage updates (inserts non-zero, removes zero values)
+    /// 4. Computes post-state root, verifies against `header.withdrawals_root`
     ///
     /// # Arguments
     ///
@@ -84,10 +72,7 @@ impl MptWitness {
     /// * `MissingWithdrawalsRoot` - Header lacks `withdrawals_root` field
     /// * `PreStateRootMismatch` - Witness doesn't match expected pre-state root
     /// * `PostStateRootMismatch` - Computed post-state doesn't match header
-    /// * `WitnessNodeNotFound` - Required trie node missing from witness
-    /// * `RlpDecodeFailed` - Invalid RLP encoding in witness node
-    /// * `TrieOperationFailed` - Trie update/removal failed
-    /// * `TrieNotRevealed` - Trie not revealed before root computation
+    /// * `TrieOperationFailed` - Trie reveal/update/removal failed
     pub fn verify(
         &self,
         header: &Header,
@@ -96,17 +81,20 @@ impl MptWitness {
         let expected_post_root =
             header.withdrawals_root.ok_or(WithdrawalValidationError::MissingWithdrawalsRoot)?;
 
-        // Build node lookup: hash → RLP bytes
-        let nodes =
-            self.state.iter().map(|node| (keccak256(node), node.clone())).collect::<B256Map<_>>();
+        // Synthesize account-level witness and reveal via BFS
+        let (synthesized_state_root, witness_map, hashed_address) = synthesize_state_witness(self);
 
-        // Reconstruct and verify pre-state
-        let mut trie = rebuild_trie(self.storage_root, &nodes)?;
-        let root = trie.root().ok_or(WithdrawalValidationError::TrieNotRevealed)?;
-        if root != self.storage_root {
+        let mut state_trie = SparseStateTrie::<SerialSparseTrie>::default();
+        state_trie
+            .reveal_witness(synthesized_state_root, &witness_map)
+            .map_err(|e| WithdrawalValidationError::TrieOperationFailed(e.to_string()))?;
+
+        // Verify pre-state root
+        let pre_root = state_trie.storage_root(hashed_address).unwrap_or(EMPTY_ROOT_HASH);
+        if pre_root != self.storage_root {
             return Err(WithdrawalValidationError::PreStateRootMismatch {
                 expected: self.storage_root,
-                actual: root,
+                actual: pre_root,
             });
         }
 
@@ -115,20 +103,27 @@ impl MptWitness {
             let nibbles = Nibbles::unpack(slot);
             if !value.is_zero() {
                 let encoded = alloy_rlp::encode_fixed_size(&value).to_vec();
-                trie.update_leaf(nibbles, encoded, DefaultTrieNodeProvider)
+                state_trie
+                    .update_storage_leaf(
+                        hashed_address,
+                        nibbles,
+                        encoded,
+                        DefaultTrieNodeProviderFactory,
+                    )
                     .map_err(|e| WithdrawalValidationError::TrieOperationFailed(e.to_string()))?;
             } else {
-                trie.remove_leaf(&nibbles, DefaultTrieNodeProvider)
+                state_trie
+                    .remove_storage_leaf(hashed_address, &nibbles, DefaultTrieNodeProviderFactory)
                     .map_err(|e| WithdrawalValidationError::TrieOperationFailed(e.to_string()))?;
             }
         }
 
-        // Verify post-state
-        let root = trie.root().ok_or(WithdrawalValidationError::TrieNotRevealed)?;
-        if root != expected_post_root {
+        // Verify post-state root
+        let post_root = state_trie.storage_root(hashed_address).unwrap_or(EMPTY_ROOT_HASH);
+        if post_root != expected_post_root {
             return Err(WithdrawalValidationError::PostStateRootMismatch {
                 expected: expected_post_root,
-                actual: root,
+                actual: post_root,
             });
         }
 
@@ -136,88 +131,34 @@ impl MptWitness {
     }
 }
 
-/// Reconstructs a sparse trie from witness nodes using breadth-first traversal.
+/// Wraps a storage-only `MptWitness` as a single-account state witness so that
+/// `SparseStateTrie::reveal_witness` can BFS-reveal the storage nodes automatically.
 ///
-/// Reveals nodes from the witness in BFS order, ensuring parents are revealed
-/// before children (required by sparse trie API). "Revealing" decodes the RLP
-/// node and registers it in the trie structure.
+/// `reveal_witness` expects an account-level state trie, but `MptWitness` only contains
+/// storage nodes for the L2ToL1MessagePasser contract. This helper synthesizes a one-leaf
+/// account trie whose `TrieAccount.storage_root` points to the real storage witness,
+/// allowing the existing BFS traversal to discover and reveal all storage nodes.
 ///
-/// # Arguments
-///
-/// * `root_hash` - Storage root to reconstruct (returns empty trie if `EMPTY_ROOT_HASH`)
-/// * `nodes` - Map of node hashes to RLP-encoded trie node data
-///
-/// # Returns
-///
-/// Sparse trie with all witness nodes revealed, ready for updates or root computation
-///
-/// # Errors
-///
-/// * `WitnessNodeNotFound` - Node hash not found in `nodes` map
-/// * `RlpDecodeFailed` - Node data failed RLP decoding
-/// * `TrieOperationFailed` - Sparse trie rejected node reveal
-/// * `TrieNotRevealed` - Child reveal attempted before parent revealed
-fn rebuild_trie(
-    root_hash: B256,
-    nodes: &B256Map<Bytes>,
-) -> Result<SparseTrie<SerialSparseTrie>, WithdrawalValidationError> {
-    if root_hash == EMPTY_ROOT_HASH {
-        return Ok(SparseTrie::revealed_empty());
-    }
+/// Returns `(synthesized_state_root, witness_map, hashed_address)`.
+fn synthesize_state_witness(witness: &MptWitness) -> (B256, B256Map<Bytes>, B256) {
+    let mut witness_map: B256Map<Bytes> =
+        witness.state.iter().map(|node| (keccak256(node), node.clone())).collect();
 
-    let mut trie = SparseTrie::<SerialSparseTrie>::default();
-    let mut queue = VecDeque::from([(root_hash, Nibbles::default())]);
-    let mut visited = HashSet::from([root_hash]);
+    let hashed_address = keccak256(ADDRESS_L2_TO_L1_MESSAGE_PASSER);
+    let trie_account = TrieAccount {
+        nonce: 0,
+        balance: U256::ZERO,
+        storage_root: witness.storage_root,
+        code_hash: KECCAK_EMPTY,
+    };
+    let mut account_rlp = Vec::new();
+    trie_account.encode(&mut account_rlp);
+    let account_leaf = TrieNode::Leaf(LeafNode::new(Nibbles::unpack(hashed_address), account_rlp));
+    let mut leaf_rlp = Vec::new();
+    account_leaf.encode(&mut leaf_rlp);
+    let leaf_bytes = Bytes::from(leaf_rlp);
+    let synthesized_state_root = keccak256(&leaf_bytes);
+    witness_map.insert(synthesized_state_root, leaf_bytes);
 
-    while let Some((hash, path)) = queue.pop_front() {
-        // Decode node from witness
-        let bytes = nodes.get(&hash).ok_or(WithdrawalValidationError::WitnessNodeNotFound(hash))?;
-        let node = TrieNode::decode(&mut bytes.as_ref())
-            .map_err(|e| WithdrawalValidationError::RlpDecodeFailed(e.to_string()))?;
-
-        // Reveal node in trie
-        if path.is_empty() {
-            trie.reveal_root(node.clone(), TrieMasks::none(), false)
-                .map_err(|e| WithdrawalValidationError::TrieOperationFailed(e.to_string()))?;
-        } else {
-            trie.as_revealed_mut()
-                .ok_or(WithdrawalValidationError::TrieNotRevealed)?
-                .reveal_node(path, node.clone(), TrieMasks::none())
-                .map_err(|e| WithdrawalValidationError::TrieOperationFailed(e.to_string()))?;
-        }
-
-        // Helper to enqueue unvisited child nodes
-        let mut enqueue = |child_hash: B256, child_path: Nibbles| {
-            if nodes.contains_key(&child_hash) && visited.insert(child_hash) {
-                queue.push_back((child_hash, child_path));
-            }
-        };
-
-        // Enqueue child nodes for BFS traversal
-        match node {
-            TrieNode::Branch(branch) => {
-                let mut stack_ptr = 0;
-                for idx in 0..BRANCH_NODE_CHILDREN {
-                    if branch.state_mask.is_bit_set(idx) {
-                        if let Some(child_hash) = branch.stack[stack_ptr].as_hash() {
-                            let mut child_path = path;
-                            child_path.push_unchecked(idx);
-                            enqueue(child_hash, child_path);
-                        }
-                        stack_ptr += 1;
-                    }
-                }
-            }
-            TrieNode::Extension(ext) => {
-                if let Some(child_hash) = ext.child.as_hash() {
-                    let mut child_path = path;
-                    child_path.extend(&ext.key);
-                    enqueue(child_hash, child_path);
-                }
-            }
-            TrieNode::Leaf(_) | TrieNode::EmptyRoot => {}
-        }
-    }
-
-    Ok(trie)
+    (synthesized_state_root, witness_map, hashed_address)
 }
