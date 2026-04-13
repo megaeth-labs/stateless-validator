@@ -1,2 +1,5 @@
 # Default: global code owners
 * @abelmega @vincent-k2026 @flyq @Troublor
+
+# ci configs
+.github/ @Troublor @flyq @krabat-l @yunlonggao-mega @mingy-mega @hongbo-trey
