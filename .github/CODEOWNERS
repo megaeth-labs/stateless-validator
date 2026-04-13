@@ -1,17 +1,2 @@
-# Default: repo owner owns everything
-* @Troublor
-
-# stateless-core
-/crates/stateless-core/ @flyq
-
-# stateless-common (shared by both)
-/crates/stateless-common/ @flyq @krabat-l
-
-# stateless-validator binary
-/bin/stateless-validator/ @flyq
-
-# debug-trace-server binary
-/bin/debug-trace-server/ @krabat-l
-
-# ci configs
-.github/ @Troublor @flyq @krabat-l @yunlonggao-mega @mingy-mega @hongbo-trey
+# Default: global code owners
+* @abelmega @vincent-k2026 @flyq
