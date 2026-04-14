@@ -24,7 +24,7 @@ pub use evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv
 pub mod db;
 pub use db::{BlockMeta, BlockStore, ChainStore, ContractStore, GenesisStore, PrunableChainStore};
 pub mod data_types;
-pub use data_types::{PlainKey, PlainValue};
+pub use data_types::{PlainKey, PlainValue, iter_code_hashes};
 pub mod executor;
 pub use executor::{
     ValidationError, ValidationResult, ValidationStats, replay_block, validate_block,

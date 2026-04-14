@@ -412,11 +412,11 @@ pub async fn block_fetcher<F: BlockFetcher>(
                     let block_number = next_block + i as u64;
                     let count = block_error_counts.entry(block_number).or_insert(0);
                     *count += 1;
-                    // The first failure is expected for near-tip blocks whose
-                    // witness has not been generated yet; only warn after a
-                    // second attempt, and escalate to error after repeated failures.
-                    if *count == 2 {
-                        warn!(block_number, error = %e, "[Fetcher] Block fetch error");
+                    // Near-tip blocks routinely fail for the first few attempts while
+                    // the witness is being generated; stay silent until attempt 4,
+                    // then warn, and escalate to error after repeated failures.
+                    if (4..=5).contains(count) {
+                        warn!(block_number, attempt = *count, error = %e, "[Fetcher] Block fetch error");
                     } else if *count > 5 {
                         error!(block_number, attempt = *count, error = %e, "[Fetcher] Block fetch error (repeated)");
                     }

@@ -267,7 +267,7 @@ mod tests {
         let tip = BlockMeta { block_number: 100, ..anchor.clone() };
         ChainStore::advance_chain(&store, &[tip]).unwrap();
 
-        store.reset_to_anchor(&anchor).unwrap();
+        ChainStore::reset_to_anchor(&store, &anchor).unwrap();
 
         let loaded_anchor = ChainStore::get_anchor(&store).unwrap().unwrap();
         let loaded_tip = store.get_canonical_tip().unwrap().unwrap();

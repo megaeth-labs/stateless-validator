@@ -43,11 +43,12 @@
 use std::{path::PathBuf, sync::Arc};
 
 use alloy_genesis::Genesis;
+use alloy_primitives::BlockHash;
 use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::{Result, anyhow};
 use jsonrpsee::server::{Server, ServerConfig};
-use stateless_common::{RpcClient, RpcClientConfig, logging::LogArgs, parse_block_hash};
+use stateless_common::{RpcClient, RpcClientConfig, logging::LogArgs};
 use stateless_core::{BlockStore, PipelineConfig, chain_spec::ChainSpec, pipeline::run_pipeline};
 use tokio::task;
 use tokio_util::sync::CancellationToken;
@@ -394,7 +395,7 @@ async fn init_validator_db(
     // Use explicit start_block if provided, otherwise fetch latest
     let header = if let Some(start_block_str) = &args.start_block {
         debug!(start_block = %start_block_str, "Initializing from specified start block");
-        let block_hash = parse_block_hash(start_block_str)?;
+        let block_hash: BlockHash = start_block_str.parse()?;
         loop {
             match rpc_client.get_header(BlockId::Hash(block_hash.into()), false).await {
                 Ok(header) => break header,

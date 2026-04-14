@@ -23,8 +23,12 @@
 //! - Contract accounts: 72 bytes (8-byte nonce + 32-byte balance + 32-byte bytecode hash)
 //! - Storage values: 32 bytes (U256 value)
 
+use std::collections::BTreeMap;
+
 pub use alloy_primitives::Bytes;
 use alloy_primitives::{Address, B256, U256};
+use revm::primitives::KECCAK_EMPTY;
+use salt::{SaltKey, SaltValue};
 
 /// Length of a storage slot key in bytes (32)
 const SLOT_KEY_LEN: usize = B256::len_bytes();
@@ -186,136 +190,125 @@ impl Account {
     }
 }
 
+/// Returns an iterator over distinct contract code hashes referenced by the witness kvs.
+///
+/// Yields each account's `codehash` (filtering out EOAs and [`KECCAK_EMPTY`]). The iterator
+/// may yield duplicates when the same codehash appears in multiple accounts — callers that
+/// need uniqueness should collect into a `HashSet` or sort-and-dedup.
+pub fn iter_code_hashes(
+    kvs: &BTreeMap<SaltKey, Option<SaltValue>>,
+) -> impl Iterator<Item = B256> + '_ {
+    kvs.values().filter_map(|salt_val| salt_val.as_ref()).filter_map(|val| {
+        match (PlainKey::decode(val.key()), PlainValue::decode(val.value())) {
+            (PlainKey::Account(_), PlainValue::Account(acc)) => {
+                acc.codehash.filter(|&codehash| codehash != KECCAK_EMPTY)
+            }
+            _ => None,
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // PlainKey tests
-    #[test]
-    fn test_plain_key_account_round_trip() {
-        let addr = Address::from([0xAB; 20]);
-        let key = PlainKey::Account(addr);
-        let encoded = key.encode();
-        assert_eq!(encoded.len(), 20);
-        assert_eq!(PlainKey::decode(&encoded), key);
+    fn account_kv(addr: u8, codehash: Option<B256>) -> SaltValue {
+        let k = PlainKey::Account(Address::from([addr; 20])).encode();
+        let v = PlainValue::Account(Account { nonce: 1, balance: U256::ZERO, codehash }).encode();
+        SaltValue::new(&k, &v)
+    }
+
+    fn storage_kv(addr: u8, slot: u8, value: u64) -> SaltValue {
+        let k = PlainKey::Storage(Address::from([addr; 20]), B256::from([slot; 32])).encode();
+        let v = PlainValue::Storage(U256::from(value)).encode();
+        SaltValue::new(&k, &v)
+    }
+
+    fn kvs(entries: Vec<Option<SaltValue>>) -> BTreeMap<SaltKey, Option<SaltValue>> {
+        entries.into_iter().enumerate().map(|(i, v)| (SaltKey::from((0u32, i as u64)), v)).collect()
     }
 
     #[test]
-    fn test_plain_key_storage_round_trip() {
-        let addr = Address::from([0x01; 20]);
+    fn test_plain_key_round_trip() {
+        let addr = Address::from([0xAB; 20]);
         let slot = B256::from([0xFF; 32]);
-        let key = PlainKey::Storage(addr, slot);
-        let encoded = key.encode();
-        assert_eq!(encoded.len(), 52);
-        let decoded = PlainKey::decode(&encoded);
-        assert_eq!(decoded, key);
-        if let PlainKey::Storage(decoded_addr, decoded_slot) = decoded {
-            assert_eq!(decoded_addr, addr);
-            assert_eq!(decoded_slot, slot);
-        } else {
-            panic!("Expected PlainKey::Storage");
+        for (key, len) in [
+            (PlainKey::Account(addr), 20),
+            (PlainKey::Account(Address::ZERO), 20),
+            (PlainKey::Storage(addr, slot), 52),
+        ] {
+            let encoded = key.encode();
+            assert_eq!(encoded.len(), len);
+            assert_eq!(PlainKey::decode(&encoded), key);
         }
     }
 
     #[test]
     fn test_plain_key_unknown_for_invalid_length() {
-        let buf = vec![0u8; 10]; // neither 20 nor 52
+        let buf = vec![0u8; 10];
         let key = PlainKey::decode(&buf);
         assert!(matches!(key, PlainKey::Unknown(_)));
         assert_eq!(key.encode(), buf);
     }
 
     #[test]
-    fn test_plain_key_zero_address() {
-        let key = PlainKey::Account(Address::ZERO);
-        assert_eq!(PlainKey::decode(&key.encode()), key);
-    }
-
-    // PlainValue tests
-    #[test]
-    fn test_plain_value_eoa_round_trip() {
-        let account = Account { nonce: 42, balance: U256::from(1_000_000u64), codehash: None };
-        let value = PlainValue::Account(account);
-        let encoded = value.encode();
-        assert_eq!(encoded.len(), 40); // EOA = 8 + 32
-        assert_eq!(PlainValue::decode(&encoded), value);
-    }
-
-    #[test]
-    fn test_plain_value_contract_round_trip() {
-        let account = Account {
-            nonce: 1,
-            balance: U256::from(500u64),
-            codehash: Some(B256::from([0xCC; 32])),
-        };
-        let value = PlainValue::Account(account);
-        let encoded = value.encode();
-        assert_eq!(encoded.len(), 72); // Contract = 8 + 32 + 32
-        let decoded = PlainValue::decode(&encoded);
-        assert_eq!(decoded, value);
-    }
-
-    #[test]
-    fn test_plain_value_storage_round_trip() {
-        let value = PlainValue::Storage(U256::from(0xDEADBEEFu64));
-        let encoded = value.encode();
-        assert_eq!(encoded.len(), 32);
-        assert_eq!(PlainValue::decode(&encoded), value);
-    }
-
-    #[test]
-    fn test_plain_value_storage_max() {
-        let value = PlainValue::Storage(U256::MAX);
-        assert_eq!(PlainValue::decode(&value.encode()), value);
-    }
-
-    #[test]
-    fn test_plain_value_storage_zero() {
-        let value = PlainValue::Storage(U256::ZERO);
-        assert_eq!(PlainValue::decode(&value.encode()), value);
+    fn test_plain_value_round_trip() {
+        let ch = Some(B256::from([0xCC; 32]));
+        let acct =
+            |nonce, balance, codehash| PlainValue::Account(Account { nonce, balance, codehash });
+        for (value, len) in [
+            (acct(42, U256::from(1_000_000u64), None), 40),
+            (acct(0, U256::MAX, None), 40),
+            (acct(u64::MAX, U256::ZERO, None), 40),
+            (acct(1, U256::from(500u64), ch), 72),
+            (PlainValue::Storage(U256::from(0xDEADBEEFu64)), 32),
+            (PlainValue::Storage(U256::MAX), 32),
+            (PlainValue::Storage(U256::ZERO), 32),
+        ] {
+            let encoded = value.encode();
+            assert_eq!(encoded.len(), len);
+            assert_eq!(PlainValue::decode(&encoded), value);
+        }
     }
 
     #[test]
     fn test_plain_value_unknown_for_invalid_length() {
-        let buf = vec![0u8; 15]; // not 32, 40, or 72
+        let buf = vec![0u8; 15];
         let value = PlainValue::decode(&buf);
         assert!(matches!(value, PlainValue::Unknown(_)));
         assert_eq!(value.encode(), buf);
     }
 
     #[test]
-    fn test_plain_value_eoa_nonce_zero_balance_max() {
-        let account = Account { nonce: 0, balance: U256::MAX, codehash: None };
-        let value = PlainValue::Account(account);
-        assert_eq!(PlainValue::decode(&value.encode()), value);
-    }
-
-    #[test]
-    fn test_plain_value_nonce_max() {
-        let account = Account { nonce: u64::MAX, balance: U256::ZERO, codehash: None };
-        let value = PlainValue::Account(account);
-        assert_eq!(PlainValue::decode(&value.encode()), value);
-    }
-
-    // Account tests
-    #[test]
     fn test_account_is_empty() {
         assert!(Account::default().is_empty());
-        assert!(Account { nonce: 0, balance: U256::ZERO, codehash: None }.is_empty());
+        assert!(!Account { nonce: 1, ..Account::default() }.is_empty());
+        assert!(!Account { balance: U256::from(1u64), ..Account::default() }.is_empty());
+        assert!(!Account { codehash: Some(B256::ZERO), ..Account::default() }.is_empty());
     }
 
     #[test]
-    fn test_account_not_empty_with_nonce() {
-        assert!(!Account { nonce: 1, balance: U256::ZERO, codehash: None }.is_empty());
+    fn test_iter_code_hashes_filters_correctly() {
+        let ch = B256::from([0xAB; 32]);
+        let map = kvs(vec![
+            Some(account_kv(1, Some(ch))),
+            Some(account_kv(2, None)),               // EOA
+            Some(account_kv(3, Some(KECCAK_EMPTY))), // empty codehash
+            Some(storage_kv(4, 5, 42)),              // storage entry
+            None,                                    // tombstone
+        ]);
+        assert_eq!(iter_code_hashes(&map).collect::<Vec<_>>(), vec![ch]);
     }
 
     #[test]
-    fn test_account_not_empty_with_balance() {
-        assert!(!Account { nonce: 0, balance: U256::from(1u64), codehash: None }.is_empty());
+    fn test_iter_code_hashes_yields_duplicates() {
+        let ch = B256::from([0xCC; 32]);
+        let map = kvs(vec![Some(account_kv(1, Some(ch))), Some(account_kv(2, Some(ch)))]);
+        assert_eq!(iter_code_hashes(&map).collect::<Vec<_>>(), vec![ch, ch]);
     }
 
     #[test]
-    fn test_account_not_empty_with_codehash() {
-        assert!(!Account { nonce: 0, balance: U256::ZERO, codehash: Some(B256::ZERO) }.is_empty());
+    fn test_iter_code_hashes_empty() {
+        assert_eq!(iter_code_hashes(&BTreeMap::new()).count(), 0);
     }
 }

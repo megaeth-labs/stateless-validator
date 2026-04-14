@@ -5,7 +5,7 @@ use std::{
 };
 
 use alloy_genesis::Genesis;
-use alloy_primitives::B256;
+use alloy_primitives::{B256, BlockHash};
 use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::{Result, anyhow};
@@ -13,7 +13,6 @@ use stateless_common::{
     RpcClient, RpcClientConfig,
     db::ContractCache,
     logging::{LogArgs, migrate_legacy_env_vars},
-    parse_block_hash,
 };
 use stateless_core::{
     ChainStore, ContractStore, GenesisStore, PipelineConfig, chain_spec::ChainSpec, db::BlockMeta,
@@ -147,7 +146,7 @@ async fn main() -> Result<()> {
     if let Some(start_block_str) = &args.start_block {
         info!(start_block = %start_block_str, "[Main] Initializing from start block");
 
-        let block_hash = parse_block_hash(start_block_str)?;
+        let block_hash: BlockHash = start_block_str.parse()?;
         let header = loop {
             match client.get_header(BlockId::Hash(block_hash.into()), true).await {
                 Ok(header) => break header,
@@ -490,7 +489,7 @@ mod tests {
     fn parse_block_num_and_hash(input: &str) -> Result<(BlockNumber, BlockHash)> {
         let (block_str, hash_str) =
             input.split_once('.').ok_or_else(|| anyhow!("Invalid format: {input}"))?;
-        Ok((block_str.parse()?, parse_block_hash(hash_str)?))
+        Ok((block_str.parse()?, hash_str.parse()?))
     }
 
     fn load_json<T: DeserializeOwned>(file_path: impl AsRef<Path>) -> Result<T> {
@@ -673,7 +672,7 @@ mod tests {
             .register_method("mega_setValidatedBlocks", |params, _ctx, _| {
                 let (_first_block, last_block): ((u64, String), (u64, String)) =
                     params.parse().unwrap();
-                let last_hash = parse_block_hash(&last_block.1).unwrap();
+                let last_hash: BlockHash = last_block.1.parse().unwrap();
                 Ok::<serde_json::Value, ErrorObjectOwned>(serde_json::json!({
                     "accepted": true,
                     "lastValidatedBlock": [last_block.0, last_hash]

@@ -50,7 +50,6 @@ use revm::{
     DatabaseCommit, DatabaseRef,
     context::TxEnv,
     database::{CacheDB, State},
-    primitives::KECCAK_EMPTY,
     state::{Bytecode, EvmState},
 };
 use revm_inspectors::tracing::{
@@ -59,28 +58,16 @@ use revm_inspectors::tracing::{
 };
 use stateless_core::{
     chain_spec::ChainSpec,
-    data_types::{PlainKey, PlainValue},
+    data_types::iter_code_hashes,
     evm_database::{WitnessDatabase, WitnessExternalEnv},
     executor::{ValidationError, create_evm_env},
     light_witness::{LightWitness, LightWitnessExecutor},
 };
 use tracing::{instrument, trace, warn};
 
-// Helper Functions
-/// Extracts all contract code hashes from a SALT witness.
+/// Returns distinct contract code hashes referenced by the witness, sorted for stable ordering.
 pub fn extract_code_hashes(witness: &LightWitness) -> Vec<B256> {
-    let mut code_hashes: Vec<B256> = witness
-        .kvs
-        .values()
-        .filter_map(|salt_val| salt_val.as_ref())
-        .filter_map(|val| match (PlainKey::decode(val.key()), PlainValue::decode(val.value())) {
-            (PlainKey::Account(_), PlainValue::Account(acc)) => {
-                acc.codehash.filter(|&codehash| codehash != KECCAK_EMPTY)
-            }
-            _ => None,
-        })
-        .collect();
-
+    let mut code_hashes: Vec<B256> = iter_code_hashes(&witness.kvs).collect();
     code_hashes.sort();
     code_hashes.dedup();
     code_hashes
