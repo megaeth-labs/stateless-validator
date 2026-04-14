@@ -217,24 +217,39 @@ async fn main() -> Result<()> {
         None
     };
 
-    let pipeline =
-        run_pipeline(fetcher, validator_db.clone(), processor, hooks, config, shutdown.clone());
+    let mut pipeline_handle = tokio::spawn(run_pipeline(
+        fetcher,
+        validator_db.clone(),
+        processor,
+        hooks,
+        config,
+        shutdown.clone(),
+    ));
 
-    let result = tokio::select! {
-        res = pipeline => res,
+    // Signal wins → drain; pipeline wins → already done.
+    let (result, needs_drain): (Result<()>, bool) = tokio::select! {
+        res = &mut pipeline_handle => {
+            let r = res.unwrap_or_else(|e| Err(anyhow!("Pipeline task panicked: {e}")));
+            (r, false)
+        }
         _ = signal::ctrl_c() => {
             info!("[Main] SIGINT received, shutting down.");
-            Ok(())
+            (Ok(()), true)
         }
         _ = sigterm.recv() => {
             info!("[Main] SIGTERM received, shutting down.");
-            Ok(())
+            (Ok(()), true)
         }
     };
 
     shutdown.cancel();
 
-    // Wait for reporter to finish
+    // Let in-flight block validation and DB commits complete before the runtime drops.
+    let drain_timeout = Duration::from_secs(2);
+    if needs_drain && tokio::time::timeout(drain_timeout, &mut pipeline_handle).await.is_err() {
+        warn!(timeout = ?drain_timeout, "[Main] Pipeline did not drain within timeout");
+    }
+
     if let Some(reporter) = reporter {
         let _ = tokio::time::timeout(Duration::from_secs(3), reporter).await;
     }
@@ -288,7 +303,9 @@ async fn validation_reporter(
             Ok(response) if response.accepted => {
                 debug!(
                     anchor = anchor.block_number,
+                    anchor_hash = %anchor.block_hash,
                     tip = tip.block_number,
+                    tip_hash = %tip.block_hash,
                     "[Reporter] Reported blocks"
                 );
                 last_reported_block = tip.block_number;
