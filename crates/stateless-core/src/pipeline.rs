@@ -480,7 +480,7 @@ impl DivergenceError {
 ///
 /// Uses exponential search (efficient for near-tip reorgs) followed by binary search.
 /// Backend-agnostic: takes closures for local chain lookups.
-#[instrument(skip_all, name = "find_divergence")]
+#[instrument(skip_all, fields(mismatch_block), name = "find_divergence")]
 pub async fn find_divergence_point<F: BlockFetcher>(
     fetcher: &F,
     get_hash: &(dyn Fn(u64) -> eyre::Result<Option<BlockHash>> + Send + Sync),

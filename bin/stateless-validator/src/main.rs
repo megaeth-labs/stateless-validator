@@ -283,7 +283,11 @@ async fn validation_reporter(
         // Get anchor and canonical tip
         let (anchor, tip) = match (validator_db.get_anchor(), validator_db.get_canonical_tip()) {
             (Ok(Some(a)), Ok(Some(t))) => (a, t),
-            _ => continue,
+            (Ok(None), _) | (_, Ok(None)) => continue,
+            (Err(e), _) | (_, Err(e)) => {
+                warn!(error = %e, "[Reporter] Failed to read anchor/tip, retrying");
+                continue;
+            }
         };
 
         // Skip if no new blocks
