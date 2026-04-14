@@ -148,6 +148,11 @@ fn synthesize_state_witness(witness: &MptWitness) -> (B256, B256Map<Bytes>, B256
         witness.state.iter().map(|node| (keccak256(node), node.clone())).collect();
 
     let hashed_address = keccak256(ADDRESS_L2_TO_L1_MESSAGE_PASSER);
+    // `nonce`, `balance`, and `code_hash` are intentionally dummy values — they
+    // do not reflect the real L2ToL1MessagePasser account state. `reveal_witness`
+    // only reads `storage_root` from this leaf to navigate into the storage trie;
+    // the other fields are never inspected or validated. Do not change them
+    // thinking it makes verification more correct.
     let trie_account = TrieAccount {
         nonce: 0,
         balance: U256::ZERO,
@@ -238,6 +243,13 @@ mod tests {
             verify(root, state, Some(EMPTY_ROOT_HASH)),
             Err(PostStateRootMismatch { .. })
         ));
+    }
+
+    /// Happy path: non-empty trie, no updates, post-root equals pre-root.
+    #[test]
+    fn non_empty_trie_no_updates_verifies() {
+        let (root, state) = single_leaf();
+        verify(root, state, Some(root)).unwrap();
     }
 
     /// Attack: claimed pre-state root non-empty, witness nodes omitted.
