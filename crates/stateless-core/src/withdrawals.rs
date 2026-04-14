@@ -183,105 +183,96 @@ mod tests {
     const SLOT: B256 = b256!("0x1111111111111111111111111111111111111111111111111111111111111111");
     const BOGUS: B256 = b256!("0xdeadbeef00000000000000000000000000000000000000000000000000000000");
 
-    fn header(root: Option<B256>) -> Header {
-        let inner = alloy_consensus::Header { withdrawals_root: root, ..Default::default() };
-        Header::from_consensus(inner.seal_slow(), None, None)
-    }
-
-    /// One-leaf storage trie: root = keccak(leaf_rlp). Returns (root, [leaf_bytes]).
-    fn single_leaf() -> (B256, Vec<Bytes>) {
-        let value_rlp = alloy_rlp::encode_fixed_size(&U256::from(42u64)).to_vec();
-        let leaf = TrieNode::Leaf(LeafNode::new(Nibbles::unpack(SLOT), value_rlp));
+    /// One-leaf storage trie for `SLOT → value`: returns (root, [leaf_bytes]).
+    fn leaf(value: u64) -> (B256, Vec<Bytes>) {
+        let value_rlp = alloy_rlp::encode_fixed_size(&U256::from(value)).to_vec();
         let mut rlp = Vec::new();
-        leaf.encode(&mut rlp);
+        TrieNode::Leaf(LeafNode::new(Nibbles::unpack(SLOT), value_rlp)).encode(&mut rlp);
         let bytes = Bytes::from(rlp);
         (keccak256(&bytes), vec![bytes])
     }
 
-    fn verify(
+    fn run(
         storage_root: B256,
         state: Vec<Bytes>,
         expected: Option<B256>,
+        updates: &[(B256, U256)],
     ) -> Result<(), WithdrawalValidationError> {
-        MptWitness { storage_root, state }.verify(&header(expected), B256Map::default())
-    }
-
-    fn verify_with(
-        storage_root: B256,
-        state: Vec<Bytes>,
-        expected: B256,
-        slot: B256,
-        value: U256,
-    ) -> Result<(), WithdrawalValidationError> {
-        let mut updates = B256Map::default();
-        updates.insert(slot, value);
-        MptWitness { storage_root, state }.verify(&header(Some(expected)), updates)
+        let inner = alloy_consensus::Header { withdrawals_root: expected, ..Default::default() };
+        let header = Header::from_consensus(inner.seal_slow(), None, None);
+        MptWitness { storage_root, state }.verify(&header, updates.iter().copied().collect())
     }
 
     #[test]
     fn missing_withdrawals_root() {
-        assert_eq!(verify(EMPTY_ROOT_HASH, vec![], None), Err(MissingWithdrawalsRoot));
+        assert_eq!(run(EMPTY_ROOT_HASH, vec![], None, &[]), Err(MissingWithdrawalsRoot));
     }
 
     #[test]
     fn empty_trie_verifies() {
-        verify(EMPTY_ROOT_HASH, vec![], Some(EMPTY_ROOT_HASH)).unwrap();
+        run(EMPTY_ROOT_HASH, vec![], Some(EMPTY_ROOT_HASH), &[]).unwrap();
+    }
+
+    #[test]
+    fn non_empty_trie_no_updates_verifies() {
+        let (root, state) = leaf(42);
+        run(root, state, Some(root), &[]).unwrap();
+    }
+
+    #[test]
+    fn leaf_update_changes_root() {
+        let (pre, state) = leaf(42);
+        let (post, _) = leaf(99);
+        run(pre, state, Some(post), &[(SLOT, U256::from(99u64))]).unwrap();
+    }
+
+    #[test]
+    fn leaf_removal_collapses_to_empty() {
+        let (root, state) = leaf(42);
+        run(root, state, Some(EMPTY_ROOT_HASH), &[(SLOT, U256::ZERO)]).unwrap();
     }
 
     #[test]
     fn pre_state_mismatch() {
         assert!(matches!(
-            verify(BOGUS, vec![], Some(EMPTY_ROOT_HASH)),
+            run(BOGUS, vec![], Some(EMPTY_ROOT_HASH), &[]),
             Err(PreStateRootMismatch { .. })
         ));
     }
 
     #[test]
     fn post_state_mismatch() {
-        let (root, state) = single_leaf();
+        let (root, state) = leaf(42);
         assert!(matches!(
-            verify(root, state, Some(EMPTY_ROOT_HASH)),
+            run(root, state, Some(EMPTY_ROOT_HASH), &[]),
             Err(PostStateRootMismatch { .. })
         ));
-    }
-
-    /// Happy path: non-empty trie, no updates, post-root equals pre-root.
-    #[test]
-    fn non_empty_trie_no_updates_verifies() {
-        let (root, state) = single_leaf();
-        verify(root, state, Some(root)).unwrap();
     }
 
     /// Attack: claimed pre-state root non-empty, witness nodes omitted.
     #[test]
     fn missing_nodes() {
-        let (root, _) = single_leaf();
-        assert!(matches!(verify(root, vec![], Some(root)), Err(PreStateRootMismatch { .. })));
+        let (root, _) = leaf(42);
+        assert!(matches!(run(root, vec![], Some(root), &[]), Err(PreStateRootMismatch { .. })));
     }
 
     /// Attack: tampered node bytes → hash mismatch → treated as missing.
     #[test]
     fn tampered_node() {
-        let (root, mut state) = single_leaf();
+        let (root, mut state) = leaf(42);
         let mut bytes = state[0].to_vec();
         *bytes.last_mut().unwrap() ^= 0x01;
         state[0] = Bytes::from(bytes);
-        assert!(matches!(verify(root, state, Some(root)), Err(PreStateRootMismatch { .. })));
+        assert!(matches!(run(root, state, Some(root), &[]), Err(PreStateRootMismatch { .. })));
     }
 
     /// Attack: update targets a slot whose subtree is missing.
     #[test]
     fn update_on_missing_subtree() {
-        let (root, _) = single_leaf();
+        let (root, _) = leaf(42);
         assert!(matches!(
-            verify_with(root, vec![], root, SLOT, U256::from(99u64)),
+            run(root, vec![], Some(root), &[(SLOT, U256::from(99u64))]),
             Err(PreStateRootMismatch { .. } | TrieOperationFailed(_))
         ));
-    }
-
-    #[test]
-    fn leaf_removal_collapses_to_empty() {
-        let (root, state) = single_leaf();
-        verify_with(root, state, EMPTY_ROOT_HASH, SLOT, U256::ZERO).unwrap();
     }
 }
