@@ -89,7 +89,10 @@ impl MptWitness {
             .reveal_witness(synthesized_state_root, &witness_map)
             .map_err(|e| WithdrawalValidationError::TrieOperationFailed(e.to_string()))?;
 
-        // Verify pre-state root
+        // Verify pre-state root. `storage_root` returns `None` when the storage
+        // trie wasn't revealed (reveal_witness skips storage subtrees whose
+        // root is EMPTY_ROOT_HASH), so fall back to EMPTY_ROOT_HASH for the
+        // empty-withdrawals case.
         let pre_root = state_trie.storage_root(hashed_address).unwrap_or(EMPTY_ROOT_HASH);
         if pre_root != self.storage_root {
             return Err(WithdrawalValidationError::PreStateRootMismatch {
@@ -118,7 +121,7 @@ impl MptWitness {
             }
         }
 
-        // Verify post-state root
+        // Verify post-state root (same empty-trie caveat as pre-state).
         let post_root = state_trie.storage_root(hashed_address).unwrap_or(EMPTY_ROOT_HASH);
         if post_root != expected_post_root {
             return Err(WithdrawalValidationError::PostStateRootMismatch {
@@ -158,7 +161,115 @@ fn synthesize_state_witness(witness: &MptWitness) -> (B256, B256Map<Bytes>, B256
     account_leaf.encode(&mut leaf_rlp);
     let leaf_bytes = Bytes::from(leaf_rlp);
     let synthesized_state_root = keccak256(&leaf_bytes);
+    // Synthesized leaf shares witness_map keyspace with real storage nodes;
+    // keccak-256 collision resistance makes a clash cryptographically negligible.
     witness_map.insert(synthesized_state_root, leaf_bytes);
 
     (synthesized_state_root, witness_map, hashed_address)
+}
+
+#[cfg(test)]
+mod tests {
+    use WithdrawalValidationError::*;
+    use alloy_primitives::{Sealable, b256};
+
+    use super::*;
+
+    const SLOT: B256 = b256!("0x1111111111111111111111111111111111111111111111111111111111111111");
+    const BOGUS: B256 = b256!("0xdeadbeef00000000000000000000000000000000000000000000000000000000");
+
+    fn header(root: Option<B256>) -> Header {
+        let inner = alloy_consensus::Header { withdrawals_root: root, ..Default::default() };
+        Header::from_consensus(inner.seal_slow(), None, None)
+    }
+
+    /// One-leaf storage trie: root = keccak(leaf_rlp). Returns (root, [leaf_bytes]).
+    fn single_leaf() -> (B256, Vec<Bytes>) {
+        let value_rlp = alloy_rlp::encode_fixed_size(&U256::from(42u64)).to_vec();
+        let leaf = TrieNode::Leaf(LeafNode::new(Nibbles::unpack(SLOT), value_rlp));
+        let mut rlp = Vec::new();
+        leaf.encode(&mut rlp);
+        let bytes = Bytes::from(rlp);
+        (keccak256(&bytes), vec![bytes])
+    }
+
+    fn verify(
+        storage_root: B256,
+        state: Vec<Bytes>,
+        expected: Option<B256>,
+    ) -> Result<(), WithdrawalValidationError> {
+        MptWitness { storage_root, state }.verify(&header(expected), B256Map::default())
+    }
+
+    fn verify_with(
+        storage_root: B256,
+        state: Vec<Bytes>,
+        expected: B256,
+        slot: B256,
+        value: U256,
+    ) -> Result<(), WithdrawalValidationError> {
+        let mut updates = B256Map::default();
+        updates.insert(slot, value);
+        MptWitness { storage_root, state }.verify(&header(Some(expected)), updates)
+    }
+
+    #[test]
+    fn missing_withdrawals_root() {
+        assert_eq!(verify(EMPTY_ROOT_HASH, vec![], None), Err(MissingWithdrawalsRoot));
+    }
+
+    #[test]
+    fn empty_trie_verifies() {
+        verify(EMPTY_ROOT_HASH, vec![], Some(EMPTY_ROOT_HASH)).unwrap();
+    }
+
+    #[test]
+    fn pre_state_mismatch() {
+        assert!(matches!(
+            verify(BOGUS, vec![], Some(EMPTY_ROOT_HASH)),
+            Err(PreStateRootMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn post_state_mismatch() {
+        let (root, state) = single_leaf();
+        assert!(matches!(
+            verify(root, state, Some(EMPTY_ROOT_HASH)),
+            Err(PostStateRootMismatch { .. })
+        ));
+    }
+
+    /// Attack: claimed pre-state root non-empty, witness nodes omitted.
+    #[test]
+    fn missing_nodes() {
+        let (root, _) = single_leaf();
+        assert!(matches!(verify(root, vec![], Some(root)), Err(PreStateRootMismatch { .. })));
+    }
+
+    /// Attack: tampered node bytes → hash mismatch → treated as missing.
+    #[test]
+    fn tampered_node() {
+        let (root, mut state) = single_leaf();
+        let mut bytes = state[0].to_vec();
+        *bytes.last_mut().unwrap() ^= 0x01;
+        state[0] = Bytes::from(bytes);
+        assert!(matches!(verify(root, state, Some(root)), Err(PreStateRootMismatch { .. })));
+    }
+
+    /// Attack: update targets a slot whose subtree is missing.
+    #[test]
+    fn update_on_missing_subtree() {
+        let (root, _) = single_leaf();
+        assert!(matches!(
+            verify_with(root, vec![], root, SLOT, U256::from(99u64)),
+            Err(PreStateRootMismatch { .. } | TrieOperationFailed(_))
+        ));
+    }
+
+    #[test]
+    fn leaf_removal_collapses_to_empty() {
+        let (root, state) = single_leaf();
+        verify_with(root, state, EMPTY_ROOT_HASH, SLOT, U256::ZERO).unwrap();
+    }
 }
