@@ -84,7 +84,15 @@ struct Args {
     rpc_endpoint: String,
 
     /// One or more upstream witness endpoint URLs for fetching witness data (tried in order).
-    #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_ENDPOINT", required = true, action = clap::ArgAction::Append)]
+    /// Accepts repeated flags (`--witness-endpoint a --witness-endpoint b`) or a comma-separated
+    /// list (`--witness-endpoint a,b`, also via the env var).
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_WITNESS_ENDPOINT",
+        required = true,
+        value_delimiter = ',',
+        action = clap::ArgAction::Append,
+    )]
     witness_endpoint: Vec<String>,
 
     /// Enable Prometheus metrics exporter.
@@ -554,5 +562,29 @@ async fn history_pruner(
         }
 
         tokio::time::sleep(interval).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--witness-endpoint` / `DEBUG_TRACE_SERVER_WITNESS_ENDPOINT` must accept multiple
+    /// endpoints both via repeated flags and a single comma-separated value (including via the
+    /// env var), so container deployments that can only set env vars are not silently limited
+    /// to one endpoint.
+    #[test]
+    fn witness_endpoint_accepts_multiple_forms() {
+        let args = Args::try_parse_from([
+            "debug-trace-server",
+            "--rpc-endpoint",
+            "http://rpc",
+            "--witness-endpoint",
+            "http://a:8545,http://b:8545",
+            "--witness-endpoint",
+            "http://c:8545",
+        ])
+        .unwrap();
+        assert_eq!(args.witness_endpoint, ["http://a:8545", "http://b:8545", "http://c:8545"],);
     }
 }

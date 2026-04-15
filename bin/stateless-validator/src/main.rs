@@ -69,7 +69,15 @@ struct CommandLineArgs {
     rpc_endpoint: String,
 
     /// One or more MegaETH JSON-RPC API endpoints for fetching witness data (tried in order).
-    #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_ENDPOINT", required = true, action = clap::ArgAction::Append)]
+    /// Accepts repeated flags (`--witness-endpoint a --witness-endpoint b`) or a comma-separated
+    /// list (`--witness-endpoint a,b`, also via the env var).
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_WITNESS_ENDPOINT",
+        required = true,
+        value_delimiter = ',',
+        action = clap::ArgAction::Append,
+    )]
     witness_endpoint: Vec<String>,
 
     /// Optional trusted block hash to start validation from.
@@ -363,6 +371,27 @@ mod tests {
         executor::validate_block, pipeline::run_pipeline, withdrawals::MptWitness,
     };
     use tracing_subscriber::EnvFilter;
+
+    /// `--witness-endpoint` / `STATELESS_VALIDATOR_WITNESS_ENDPOINT` must accept multiple
+    /// endpoints both via repeated flags and a single comma-separated value (including via the
+    /// env var), so container deployments that can only set env vars are not silently limited
+    /// to one endpoint.
+    #[test]
+    fn witness_endpoint_accepts_multiple_forms() {
+        let args = CommandLineArgs::try_parse_from([
+            "stateless-validator",
+            "--data-dir",
+            "/tmp/x",
+            "--rpc-endpoint",
+            "http://rpc",
+            "--witness-endpoint",
+            "http://a:8545,http://b:8545",
+            "--witness-endpoint",
+            "http://c:8545",
+        ])
+        .unwrap();
+        assert_eq!(args.witness_endpoint, ["http://a:8545", "http://b:8545", "http://c:8545"],);
+    }
 
     use super::*;
 
