@@ -160,10 +160,15 @@ impl RpcClient {
     ///
     /// - Acquires a semaphore permit before each attempt (released during sleep between retries).
     /// - Retries up to `config.max_retries` times on any error.
-    /// - Backoff doubles each attempt, with 25 % deterministic jitter; capped at `max_backoff_ms`.
-    /// - Records `method` metrics on every attempt (success and failure).
+    /// - Backoff doubles each attempt; deterministic jitter adds 25–100 % of `backoff_ms` cycling
+    ///   by `attempt % 4`; the summed sleep is capped at `max_backoff_ms`.
+    /// - Records one final-outcome metric per logical call (`record_rpc` on success or after the
+    ///   last failure); each non-final failure is recorded via `record_rpc_retry`.
     ///
     /// Does **not** apply to `get_witness` — that method manages fallback across providers itself.
+    ///
+    /// Note: the success-path duration measures only the winning attempt, not the sum of
+    /// prior failed attempts and their backoff sleeps.
     async fn call<T: Send + 'static>(
         &self,
         method: RpcMethod,
@@ -188,15 +193,15 @@ impl RpcClient {
                     self.record_rpc_retry(method);
                     drop(_permit); // release permit while sleeping
                     let jitter_ms = backoff_ms / 4 * ((attempt as u64 % 4) + 1);
+                    let sleep_ms = (backoff_ms + jitter_ms).min(self.config.max_backoff_ms);
                     tracing::warn!(
                         method = method.as_str(),
                         attempt,
                         error = %e,
-                        sleep_ms = backoff_ms + jitter_ms,
+                        sleep_ms,
                         "RPC call failed, retrying",
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms + jitter_ms))
-                        .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
                     backoff_ms = (backoff_ms * 2).min(self.config.max_backoff_ms);
                 }
                 Err(e) => {

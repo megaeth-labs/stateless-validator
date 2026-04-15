@@ -13,10 +13,12 @@ exclude.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-eth.workspace = true
-op-alloy-rpc-types.workspace = true
 
 # mega
 salt.workspace = true
+
+# op
+op-alloy-rpc-types.workspace = true
 
 # misc
 bincode.workspace = true
