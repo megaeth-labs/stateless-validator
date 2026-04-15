@@ -681,75 +681,36 @@ mod tests {
     // RpcClient unit tests
 
     #[test]
-    fn test_new_with_invalid_url() {
-        let result = RpcClient::new("not a url", &["http://localhost:8545"]);
-        assert!(result.is_err());
-    }
+    fn test_new_validates_urls_and_counts_witnesses() {
+        assert!(RpcClient::new("not a url", &["http://localhost:8545"]).is_err());
+        assert!(RpcClient::new("http://localhost:8545", &["not a url"]).is_err());
+        let err = RpcClient::new("http://localhost:8545", &[]).unwrap_err().to_string();
+        assert!(err.contains("At least one witness API"));
 
-    #[test]
-    fn test_new_with_empty_witness_apis() {
-        let result = RpcClient::new("http://localhost:8545", &[]);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("At least one witness API"));
-    }
-
-    #[test]
-    fn test_new_with_valid_url() {
-        let result = RpcClient::new("http://localhost:8545", &["http://localhost:8546"]);
-        assert!(result.is_ok());
-        let client = result.unwrap();
-        assert_eq!(client.witness_provider_count(), 1);
-    }
-
-    #[test]
-    fn test_new_with_multiple_witness_endpoints() {
-        let result = RpcClient::new(
-            "http://localhost:8545",
+        for endpoints in [
+            &["http://localhost:8546"][..],
             &["http://localhost:8546", "http://localhost:8547", "http://localhost:8548"],
-        );
-        assert!(result.is_ok());
-        let client = result.unwrap();
-        assert_eq!(client.witness_provider_count(), 3);
+        ] {
+            let client = RpcClient::new("http://localhost:8545", endpoints).unwrap();
+            assert_eq!(client.witness_provider_count(), endpoints.len());
+        }
     }
 
     #[test]
-    fn test_new_with_invalid_witness_url() {
-        let result = RpcClient::new("http://localhost:8545", &["not a url"]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_skip_block_verification() {
-        let client = RpcClient::new_with_config(
-            "http://localhost:8545",
-            &["http://localhost:8546"],
-            RpcClientConfig::validator(),
-            None,
-        )
-        .unwrap();
-        assert!(!client.skip_block_verification());
-
-        let client = RpcClient::new_with_config(
-            "http://localhost:8545",
-            &["http://localhost:8546"],
-            RpcClientConfig::trace_server(),
-            None,
-        )
-        .unwrap();
-        assert!(client.skip_block_verification());
-    }
-
-    #[test]
-    fn test_concurrency_config() {
-        let config = RpcClientConfig { max_concurrent_requests: Some(4), ..Default::default() };
-        let client = RpcClient::new_with_config(
-            "http://localhost:8545",
-            &["http://localhost:8546"],
-            config,
-            None,
-        )
-        .unwrap();
-        // The semaphore was created with 4 permits.
+    fn test_config_propagates_to_client() {
+        let make = |config| {
+            RpcClient::new_with_config(
+                "http://localhost:8545",
+                &["http://localhost:8546"],
+                config,
+                None,
+            )
+            .unwrap()
+        };
+        assert!(!make(RpcClientConfig::validator()).skip_block_verification());
+        assert!(make(RpcClientConfig::trace_server()).skip_block_verification());
+        let client =
+            make(RpcClientConfig { max_concurrent_requests: Some(4), ..Default::default() });
         assert_eq!(client.concurrency.available_permits(), 4);
     }
 

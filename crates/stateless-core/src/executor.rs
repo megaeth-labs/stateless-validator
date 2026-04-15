@@ -573,35 +573,25 @@ mod tests {
 
     use super::*;
 
-    /// Validates every mainnet block that has a paired SALT+MPT witness in `test_data/`.
-    ///
-    /// Exercises the full `validate_block` path: witness verify → EVM replay →
-    /// SALT trie update → state/receipts/gas root checks.
     #[test]
     fn validate_block_mainnet_fixtures() {
         let fixtures = TestFixtures::mainnet();
         let chain_spec = ChainSpec::from_genesis(fixtures.load_genesis().unwrap());
-        for (block_number, block_hash) in fixtures.paired_blocks() {
-            let block = &fixtures.blocks[&block_hash];
-            let salt_witness = fixtures.salt_witnesses[&block_hash].clone();
-            let (mpt_witness, _): (MptWitness, usize) = bincode::serde::decode_from_slice(
-                &fixtures.mpt_witness_bytes[&block_hash],
+        for (number, hash) in fixtures.paired_blocks() {
+            let (mpt, _): (MptWitness, usize) = bincode::serde::decode_from_slice(
+                &fixtures.mpt_witness_bytes[&hash],
                 bincode::config::legacy(),
             )
-            .unwrap_or_else(|e| panic!("Failed to decode MptWitness for {block_hash}: {e}"));
-            let result = validate_block(
+            .unwrap_or_else(|e| panic!("decode MptWitness for {hash}: {e}"));
+            validate_block(
                 &chain_spec,
-                block,
-                salt_witness,
-                mpt_witness,
+                &fixtures.blocks[&hash],
+                fixtures.salt_witnesses[&hash].clone(),
+                mpt,
                 &fixtures.contracts,
                 None,
-            );
-            assert!(
-                result.is_ok(),
-                "validate_block failed for block {block_number} ({block_hash}): {:?}",
-                result.unwrap_err()
-            );
+            )
+            .unwrap_or_else(|e| panic!("validate_block failed for block {number} ({hash}): {e:?}"));
         }
     }
 }

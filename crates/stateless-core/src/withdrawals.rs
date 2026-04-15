@@ -231,30 +231,24 @@ mod tests {
 
     use super::*;
 
-    fn header_with_withdrawals_root(root: B256) -> Header {
+    fn header(withdrawals_root: Option<B256>) -> Header {
         Header {
-            inner: ConsensusHeader { withdrawals_root: Some(root), ..Default::default() },
+            inner: ConsensusHeader { withdrawals_root, ..Default::default() },
             ..Default::default()
         }
     }
 
-    /// Empty witness + no storage updates should pass when pre-state root matches
-    /// `EMPTY_ROOT_HASH` (keccak of the empty RLP trie).
     #[test]
-    fn empty_witness_empty_storage_passes() {
-        let witness = MptWitness { storage_root: EMPTY_ROOT_HASH, state: vec![] };
-        let header = header_with_withdrawals_root(EMPTY_ROOT_HASH);
-        assert!(witness.verify(&header, Default::default()).is_ok());
-    }
+    fn verify_handles_empty_mismatch_and_missing_root() {
+        let empty = MptWitness { storage_root: EMPTY_ROOT_HASH, state: vec![] };
 
-    /// A storage root that doesn't equal `EMPTY_ROOT_HASH` should trigger
-    /// `PreStateRootMismatch` when the trie can't be reconstructed to that root.
-    #[test]
-    fn pre_state_root_mismatch_is_detected() {
-        // B256::ZERO ≠ EMPTY_ROOT_HASH and has no witness nodes, so rebuild_trie will fail.
-        let witness = MptWitness { storage_root: B256::ZERO, state: vec![] };
-        let header = header_with_withdrawals_root(EMPTY_ROOT_HASH);
-        let err = witness.verify(&header, Default::default()).unwrap_err();
+        // Empty witness + empty storage passes when the header's root is EMPTY_ROOT_HASH.
+        assert!(empty.verify(&header(Some(EMPTY_ROOT_HASH)), Default::default()).is_ok());
+
+        // Non-empty storage root with no witness nodes triggers a reconstruction failure.
+        let mismatched = MptWitness { storage_root: B256::ZERO, state: vec![] };
+        let err =
+            mismatched.verify(&header(Some(EMPTY_ROOT_HASH)), Default::default()).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -264,17 +258,9 @@ mod tests {
             ),
             "unexpected error variant: {err:?}"
         );
-    }
 
-    /// A header with no `withdrawals_root` field should return `MissingWithdrawalsRoot`.
-    #[test]
-    fn missing_withdrawals_root_in_header_is_error() {
-        let witness = MptWitness { storage_root: EMPTY_ROOT_HASH, state: vec![] };
-        let header = Header::default(); // withdrawals_root: None
-        let err = witness.verify(&header, Default::default()).unwrap_err();
-        assert!(
-            matches!(err, WithdrawalValidationError::MissingWithdrawalsRoot),
-            "unexpected error variant: {err:?}"
-        );
+        // Missing withdrawals_root in the header returns MissingWithdrawalsRoot.
+        let err = empty.verify(&header(None), Default::default()).unwrap_err();
+        assert!(matches!(err, WithdrawalValidationError::MissingWithdrawalsRoot));
     }
 }
