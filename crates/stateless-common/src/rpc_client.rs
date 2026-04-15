@@ -347,8 +347,11 @@ impl RpcClient {
                 }
                 Err(e) => {
                     last_elapsed = Some(start.elapsed().as_secs_f64());
-                    // Non-final provider failure: count as a retry attempt, not a logical error.
-                    self.record_rpc_retry(RpcMethod::MegaGetBlockWitness);
+                    // Only count as a retry if we'll try another provider; otherwise this
+                    // failure is the final outcome recorded after the loop.
+                    if idx + 1 < self.witness_providers.len() {
+                        self.record_rpc_retry(RpcMethod::MegaGetBlockWitness);
+                    }
                     tracing::warn!(
                         block_number = number,
                         %hash,
