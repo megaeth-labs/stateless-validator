@@ -16,10 +16,8 @@ pub enum RpcMethod {
     EthBlockNumber,
     /// eth_getHeaderByNumber / eth_getHeaderByHash
     EthGetHeader,
-    /// mega_getBlockWitness (primary witness generator)
+    /// mega_getBlockWitness (any witness provider)
     MegaGetBlockWitness,
-    /// mega_getBlockWitness (Cloudflare fallback)
-    MegaGetBlockWitnessCloudflare,
     /// mega_setValidatedBlocks
     MegaSetValidatedBlocks,
 }
@@ -33,7 +31,6 @@ impl RpcMethod {
             RpcMethod::EthGetHeader => "eth_getHeader",
             RpcMethod::EthBlockNumber => "eth_blockNumber",
             RpcMethod::MegaGetBlockWitness => "mega_getBlockWitness",
-            RpcMethod::MegaGetBlockWitnessCloudflare => "mega_getBlockWitness_cloudflare",
             RpcMethod::MegaSetValidatedBlocks => "mega_setValidatedBlocks",
         }
     }
@@ -43,8 +40,13 @@ impl RpcMethod {
 ///
 /// Implement this trait to receive metrics events from the RPC client.
 pub trait RpcMetrics: Send + Sync {
-    /// Called when an RPC request completes.
+    /// Called when an RPC request completes (final outcome — success or permanent failure).
     fn on_rpc_complete(&self, method: RpcMethod, success: bool, duration_secs: Option<f64>);
+
+    /// Called on each transient failure that will be retried (not on the final outcome).
+    ///
+    /// Default: no-op. Implement to track retry volume separately from logical errors.
+    fn on_rpc_retry(&self, _method: RpcMethod) {}
 
     /// Called when witness data is successfully fetched.
     fn on_witness_fetch(
@@ -57,7 +59,7 @@ pub trait RpcMetrics: Send + Sync {
 }
 
 /// Configuration for RPC client behavior.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RpcClientConfig {
     /// Skip ECDSA signature verification and block hash verification.
     /// Enable for trusted data sources (e.g., debug-trace-server fetching from upstream RPC)
@@ -65,6 +67,30 @@ pub struct RpcClientConfig {
     pub skip_block_verification: bool,
     /// Optional metrics callbacks for tracking RPC performance.
     pub metrics: Option<Arc<dyn RpcMetrics>>,
+    /// Maximum number of concurrent in-flight RPC requests across all methods.
+    /// Implemented as a semaphore to prevent thundering herd under many parallel workers.
+    /// `None` means unlimited concurrency.
+    pub max_concurrent_requests: Option<usize>,
+    /// Maximum number of per-call retry attempts before propagating the error.
+    /// Does not apply to `get_witness` (which falls back across providers instead).
+    pub max_retries: u32,
+    /// Initial backoff duration before the first retry (milliseconds).
+    pub initial_backoff_ms: u64,
+    /// Upper cap on per-call backoff (milliseconds; backoff doubles each retry).
+    pub max_backoff_ms: u64,
+}
+
+impl Default for RpcClientConfig {
+    fn default() -> Self {
+        Self {
+            skip_block_verification: false,
+            metrics: None,
+            max_concurrent_requests: None,
+            max_retries: 3,
+            initial_backoff_ms: 100,
+            max_backoff_ms: 10_000,
+        }
+    }
 }
 
 impl std::fmt::Debug for RpcClientConfig {
@@ -79,12 +105,12 @@ impl std::fmt::Debug for RpcClientConfig {
 impl RpcClientConfig {
     /// Creates a config for validation mode (full verification).
     pub fn validator() -> Self {
-        Self { skip_block_verification: false, metrics: None }
+        Self { skip_block_verification: false, ..Default::default() }
     }
 
     /// Creates a config for trace/debug mode (skip verification).
     pub fn trace_server() -> Self {
-        Self { skip_block_verification: true, metrics: None }
+        Self { skip_block_verification: true, ..Default::default() }
     }
 
     /// Sets the metrics callbacks.
@@ -125,10 +151,6 @@ mod tests {
         assert_eq!(RpcMethod::EthGetBlockByNumber.as_str(), "eth_getBlockByNumber");
         assert_eq!(RpcMethod::EthBlockNumber.as_str(), "eth_blockNumber");
         assert_eq!(RpcMethod::MegaGetBlockWitness.as_str(), "mega_getBlockWitness");
-        assert_eq!(
-            RpcMethod::MegaGetBlockWitnessCloudflare.as_str(),
-            "mega_getBlockWitness_cloudflare"
-        );
         assert_eq!(RpcMethod::MegaSetValidatedBlocks.as_str(), "mega_setValidatedBlocks");
     }
 }

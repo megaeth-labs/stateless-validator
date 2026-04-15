@@ -83,13 +83,9 @@ struct Args {
     #[clap(long, env = "DEBUG_TRACE_SERVER_RPC_ENDPOINT")]
     rpc_endpoint: String,
 
-    /// Upstream witness endpoint URL.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_ENDPOINT")]
-    witness_endpoint: String,
-
-    /// Optional Cloudflare witness endpoint URL for pruned/archived blocks.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_CLOUDFLARE_WITNESS_ENDPOINT")]
-    cloudflare_witness_endpoint: Option<String>,
+    /// One or more upstream witness endpoint URLs for fetching witness data (tried in order).
+    #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_ENDPOINT", required = true, action = clap::ArgAction::Append)]
+    witness_endpoint: Vec<String>,
 
     /// Enable Prometheus metrics exporter.
     #[clap(long, env = "DEBUG_TRACE_SERVER_METRICS_ENABLED")]
@@ -223,7 +219,7 @@ async fn main() -> Result<()> {
     let response_cache_disabled = args.response_cache_estimated_items == 0;
     debug!(
         rpc_endpoint = %args.rpc_endpoint,
-        witness_endpoint = %args.witness_endpoint,
+        witness_endpoints = ?args.witness_endpoint,
         witness_timeout_secs = args.witness_timeout,
         response_cache_disabled,
         response_cache_max_size = args.response_cache_max_size,
@@ -246,11 +242,11 @@ async fn main() -> Result<()> {
     }
 
     // Initialize components
+    let witness_apis: Vec<&str> = args.witness_endpoint.iter().map(String::as_str).collect();
     let rpc_client = Arc::new(RpcClient::new_with_config(
         &args.rpc_endpoint,
-        &args.witness_endpoint,
+        &witness_apis,
         RpcClientConfig::trace_server(),
-        args.cloudflare_witness_endpoint.as_deref(),
         None,
     )?);
     let validator_db = init_validator_db(&args, &rpc_client).await?;

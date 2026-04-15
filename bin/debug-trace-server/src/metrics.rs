@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use eyre::Result;
 use metrics::{Counter, Gauge, Histogram};
 use metrics_derive::Metrics;
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 pub use stateless_common::DEFAULT_METRICS_PORT;
 
 /// Prefix for timed RPC method aliases.
@@ -203,7 +203,7 @@ impl CacheMetrics {
     }
 }
 
-/// Tracks which source provided block data (cache/db/witness_generator/cloudflare).
+/// Tracks which source provided block data (cache/db/witness_generator).
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
 pub struct DataSourceMetrics {
@@ -271,7 +271,7 @@ impl UpstreamMetrics {
     }
 }
 
-/// Witness fetch metrics by source (witness_generator / cloudflare).
+/// Witness fetch metrics by source.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
 pub struct WitnessSourceMetrics {
@@ -345,6 +345,8 @@ pub struct ChainSyncMetrics {
     db_latest_block: Gauge,
     /// Database file size in bytes
     db_size_bytes: Gauge,
+    /// Local chain tip block number (updated on every advance)
+    local_chain_height: Gauge,
 }
 
 impl ChainSyncMetrics {
@@ -378,6 +380,11 @@ impl ChainSyncMetrics {
     pub fn set_db_size(&self, bytes: u64) {
         self.db_size_bytes.set(bytes as f64);
     }
+
+    /// Updates the local chain height gauge.
+    pub fn set_chain_height(&self, height: u64) {
+        self.local_chain_height.set(height as f64);
+    }
 }
 
 /// Pre-registers all metrics so they appear in Prometheus from startup (with zero values).
@@ -410,7 +417,6 @@ fn pre_register_all_metrics() {
     let _ = DataSourceMetrics::new_for_source("cache");
     let _ = DataSourceMetrics::new_for_source("db");
     let _ = DataSourceMetrics::new_for_source("witness_generator");
-    let _ = DataSourceMetrics::new_for_source("cloudflare");
 
     // Data Fetch Layer: single-flight
     let _ = SingleFlightMetrics::new_for_type("new");
@@ -421,10 +427,10 @@ fn pre_register_all_metrics() {
     let _ = UpstreamMetrics::new_for_method("eth_getHeaderByHash");
     let _ = UpstreamMetrics::new_for_method("eth_getBlockByHash");
     let _ = UpstreamMetrics::new_for_method("mega_getWitness");
+    let _ = UpstreamMetrics::new_for_method("eth_getCodeByHash");
 
     // Witness Layer
     let _ = WitnessSourceMetrics::new_for_source("witness_generator");
-    let _ = WitnessSourceMetrics::new_for_source("cloudflare");
 
     // Execution Layer (per method)
     let _ = EvmExecutionMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
@@ -437,9 +443,34 @@ fn pre_register_all_metrics() {
     let _ = ChainSyncMetrics::create();
 }
 
+/// Byte-size histogram buckets: 1 KB, 10 KB, 50 KB, 200 KB, 1 MB, 5 MB, 20 MB.
+const BYTE_BUCKETS: &[f64] =
+    &[1_024.0, 10_240.0, 51_200.0, 204_800.0, 1_048_576.0, 5_242_880.0, 20_971_520.0];
+
 /// Initializes the Prometheus metrics exporter.
 pub fn init_metrics(addr: SocketAddr) -> Result<()> {
     PrometheusBuilder::new()
+        // Count-based: transaction count per traced block (~ 1–500)
+        .set_buckets_for_metric(
+            Matcher::Full("debug_trace_evm_block_tx_count".to_owned()),
+            &[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0],
+        )
+        .expect("valid bucket config")
+        // Count-based: block distance from chain tip (~ 0–1000 blocks)
+        .set_buckets_for_metric(
+            Matcher::Full("debug_trace_block_distance_from_tip".to_owned()),
+            &[0.0, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0],
+        )
+        .expect("valid bucket config")
+        // Count-based: reorg depth (~ 1–50 blocks)
+        .set_buckets_for_metric(
+            Matcher::Full("debug_trace_reorg_depth".to_owned()),
+            &[1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0],
+        )
+        .expect("valid bucket config")
+        // Byte-size: witness response size
+        .set_buckets_for_metric(Matcher::Full("debug_trace_witness_bytes".to_owned()), BYTE_BUCKETS)
+        .expect("valid bucket config")
         .with_http_listener(addr)
         .install()
         .map_err(|e| eyre::eyre!("Failed to install metrics exporter: {}", e))?;

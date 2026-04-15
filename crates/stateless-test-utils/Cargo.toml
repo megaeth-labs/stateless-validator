@@ -1,0 +1,25 @@
+[package]
+name = "stateless-test-utils"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[dependencies]
+# alloy
+alloy-genesis.workspace = true
+alloy-primitives.workspace = true
+alloy-rpc-types-eth.workspace = true
+op-alloy-rpc-types.workspace = true
+
+# mega
+salt.workspace = true
+
+# misc
+bincode.workspace = true
+eyre.workspace = true
+revm.workspace = true
+serde.workspace = true
+serde_json.workspace = true

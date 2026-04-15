@@ -122,6 +122,11 @@ impl PipelineHooks for TraceHooks {
         self.db.store_block_data(&pairs)
     }
 
+    fn post_advance(&self, new_tip: &BlockMeta) -> eyre::Result<()> {
+        metrics::ChainSyncMetrics::create().set_chain_height(new_tip.block_number);
+        Ok(())
+    }
+
     fn on_reorg(
         &self,
         _rollback_to: BlockNumber,

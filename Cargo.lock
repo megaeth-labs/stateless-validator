@@ -5612,6 +5612,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-rpc-types-eth",
  "alloy-serde",
+ "bincode 2.0.1",
  "dyn-clone",
  "eyre",
  "futures",
@@ -5630,10 +5631,27 @@ dependencies = [
  "salt",
  "serde",
  "serde_json",
+ "stateless-test-utils",
  "thiserror 2.0.17",
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "stateless-test-utils"
+version = "2.0.10"
+dependencies = [
+ "alloy-genesis",
+ "alloy-primitives",
+ "alloy-rpc-types-eth",
+ "bincode 2.0.1",
+ "eyre",
+ "op-alloy-rpc-types",
+ "revm",
+ "salt",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -68,9 +68,9 @@ struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_RPC_ENDPOINT")]
     rpc_endpoint: String,
 
-    /// The URL of the MegaETH JSON-RPC API endpoint for fetching witness data.
-    #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_ENDPOINT")]
-    witness_endpoint: String,
+    /// One or more MegaETH JSON-RPC API endpoints for fetching witness data (tried in order).
+    #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_ENDPOINT", required = true, action = clap::ArgAction::Append)]
+    witness_endpoint: Vec<String>,
 
     /// Optional trusted block hash to start validation from.
     #[clap(long, env = "STATELESS_VALIDATOR_START_BLOCK")]
@@ -109,7 +109,7 @@ async fn main() -> Result<()> {
 
     info!(data_dir = %args.data_dir, "[Main] Data directory");
     info!(rpc_endpoint = %args.rpc_endpoint, "[Main] RPC endpoint");
-    info!(witness_endpoint = %args.witness_endpoint, "[Main] Witness endpoint");
+    info!(witness_endpoints = ?args.witness_endpoint, "[Main] Witness endpoints");
     if let Some(ref genesis_file) = args.genesis_file {
         info!(genesis_file, "[Main] Genesis file");
     }
@@ -126,11 +126,11 @@ async fn main() -> Result<()> {
     let work_dir = PathBuf::from(args.data_dir);
 
     let rpc_config = RpcClientConfig::validator().with_metrics(Arc::new(metrics::ValidatorMetrics));
+    let witness_apis: Vec<&str> = args.witness_endpoint.iter().map(String::as_str).collect();
     let client = Arc::new(RpcClient::new_with_config(
         &args.rpc_endpoint,
-        &args.witness_endpoint,
+        &witness_apis,
         rpc_config,
-        None, // No Cloudflare fallback for validator
         args.report_validation_endpoint.as_deref(),
     )?);
     let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
@@ -721,7 +721,7 @@ mod tests {
         let contract_cache =
             Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
         let (handle, url) = setup_mock_rpc_server(data).await;
-        let client = Arc::new(RpcClient::new(&url, &url).unwrap());
+        let client = Arc::new(RpcClient::new(&url, &[url.as_str()]).unwrap());
 
         let chain_spec =
             Arc::new(load_or_create_chain_spec(&validator_db, Some(&genesis_file)).unwrap());
