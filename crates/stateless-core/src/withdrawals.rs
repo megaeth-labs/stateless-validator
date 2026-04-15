@@ -12,7 +12,7 @@ use alloy_rpc_types_eth::Header;
 use reth_trie::Nibbles;
 use reth_trie_common::{EMPTY_ROOT_HASH, LeafNode, TrieAccount, TrieNode};
 use reth_trie_sparse::{
-    SerialSparseTrie, SparseStateTrie, provider::DefaultTrieNodeProviderFactory,
+    SerialSparseTrie, SparseStateTrie, SparseTrie, provider::DefaultTrieNodeProviderFactory,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -89,10 +89,20 @@ impl MptWitness {
             .reveal_witness(synthesized_state_root, &witness_map)
             .map_err(|e| WithdrawalValidationError::TrieOperationFailed(e.to_string()))?;
 
+        // `reveal_witness` skips storage subtrees whose root is `EMPTY_ROOT_HASH`,
+        // leaving the per-address storage trie blind. That's fine for pre-state
+        // verification, but if the block writes any non-zero slot to an
+        // empty-pre-state trie (e.g. the first-ever withdrawal), the subsequent
+        // `update_storage_leaf` call would fail with "sparse trie is blind".
+        // Insert a revealed-empty storage trie so writes can proceed.
+        if self.storage_root == EMPTY_ROOT_HASH {
+            state_trie.insert_storage_trie(hashed_address, SparseTrie::revealed_empty());
+        }
+
         // Verify pre-state root. `storage_root` returns `None` when the storage
-        // trie wasn't revealed (reveal_witness skips storage subtrees whose
-        // root is EMPTY_ROOT_HASH), so fall back to EMPTY_ROOT_HASH for the
-        // empty-withdrawals case.
+        // trie wasn't revealed; that only happens when `self.storage_root` was
+        // non-empty and reveal_witness failed to populate it, which the check
+        // below will catch as a mismatch.
         let pre_root = state_trie.storage_root(hashed_address).unwrap_or(EMPTY_ROOT_HASH);
         if pre_root != self.storage_root {
             return Err(WithdrawalValidationError::PreStateRootMismatch {
@@ -274,5 +284,15 @@ mod tests {
             run(root, vec![], Some(root), &[(SLOT, U256::from(99u64))]),
             Err(PreStateRootMismatch { .. } | TrieOperationFailed(_))
         ));
+    }
+
+    /// First-ever withdrawal: empty pre-state storage trie, one new non-zero slot.
+    /// Exercises the `EMPTY_ROOT_HASH` pre-state path where `reveal_witness` skips
+    /// the storage subtree, so `update_storage_leaf` must still initialize and
+    /// write into the trie correctly.
+    #[test]
+    fn empty_pre_state_with_new_leaf() {
+        let (post, _) = leaf(42);
+        run(EMPTY_ROOT_HASH, vec![], Some(post), &[(SLOT, U256::from(42u64))]).unwrap();
     }
 }
