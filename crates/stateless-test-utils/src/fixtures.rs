@@ -153,19 +153,12 @@ impl TestFixtures {
     /// Uses `CARGO_MANIFEST_DIR` at compile time to locate the workspace root from any
     /// working directory.
     pub fn mainnet() -> Self {
-        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap() // crates/
-            .parent()
-            .unwrap(); // workspace root
-        Self::load(&workspace_root.join("test_data/mainnet"))
+        Self::load(&workspace_root().join("test_data/mainnet"))
     }
 
     /// Load synthetic fixtures from `test_data/synthetic/` relative to the workspace root.
     pub fn synthetic() -> Self {
-        let workspace_root =
-            Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
-        Self::load(&workspace_root.join("test_data/synthetic"))
+        Self::load(&workspace_root().join("test_data/synthetic"))
     }
 
     /// Returns blocks that have both a SALT witness and an MPT witness, in block-number order.
@@ -196,6 +189,12 @@ impl TestFixtures {
         let (&num, &hash) = self.block_numbers.last_key_value().expect("no blocks loaded");
         (num, hash)
     }
+}
+
+/// Absolute path to the workspace root, derived from `CARGO_MANIFEST_DIR`
+/// (`<root>/crates/stateless-test-utils`).
+fn workspace_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap()
 }
 
 /// Parses `"{block_number}.{block_hash}"` from a filename stem.

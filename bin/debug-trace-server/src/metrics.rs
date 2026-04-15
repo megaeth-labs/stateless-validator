@@ -447,30 +447,31 @@ fn pre_register_all_metrics() {
 const BYTE_BUCKETS: &[f64] =
     &[1_024.0, 10_240.0, 51_200.0, 204_800.0, 1_048_576.0, 5_242_880.0, 20_971_520.0];
 
+/// Transaction count per traced block (~ 1–500).
+const TX_COUNT_BUCKETS: &[f64] = &[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0];
+
+/// Block distance from chain tip (~ 0–1000 blocks).
+const BLOCK_DISTANCE_BUCKETS: &[f64] = &[0.0, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0];
+
+/// Reorg depth (~ 1–50 blocks).
+const REORG_DEPTH_BUCKETS: &[f64] = &[1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0];
+
+/// (metric_name, buckets) pairs applied via `set_buckets_for_metric` at startup.
+const BUCKET_SPECS: &[(&str, &[f64])] = &[
+    ("debug_trace_evm_block_tx_count", TX_COUNT_BUCKETS),
+    ("debug_trace_block_distance_from_tip", BLOCK_DISTANCE_BUCKETS),
+    ("debug_trace_reorg_depth", REORG_DEPTH_BUCKETS),
+    ("debug_trace_witness_bytes", BYTE_BUCKETS),
+];
+
 /// Initializes the Prometheus metrics exporter.
 pub fn init_metrics(addr: SocketAddr) -> Result<()> {
-    PrometheusBuilder::new()
-        // Count-based: transaction count per traced block (~ 1–500)
-        .set_buckets_for_metric(
-            Matcher::Full("debug_trace_evm_block_tx_count".to_owned()),
-            &[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0],
-        )
-        .expect("valid bucket config")
-        // Count-based: block distance from chain tip (~ 0–1000 blocks)
-        .set_buckets_for_metric(
-            Matcher::Full("debug_trace_block_distance_from_tip".to_owned()),
-            &[0.0, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0],
-        )
-        .expect("valid bucket config")
-        // Count-based: reorg depth (~ 1–50 blocks)
-        .set_buckets_for_metric(
-            Matcher::Full("debug_trace_reorg_depth".to_owned()),
-            &[1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0],
-        )
-        .expect("valid bucket config")
-        // Byte-size: witness response size
-        .set_buckets_for_metric(Matcher::Full("debug_trace_witness_bytes".to_owned()), BYTE_BUCKETS)
-        .expect("valid bucket config")
+    let builder = BUCKET_SPECS.iter().fold(PrometheusBuilder::new(), |b, &(name, buckets)| {
+        b.set_buckets_for_metric(Matcher::Full(name.to_owned()), buckets)
+            .expect("valid bucket config")
+    });
+
+    builder
         .with_http_listener(addr)
         .install()
         .map_err(|e| eyre::eyre!("Failed to install metrics exporter: {}", e))?;

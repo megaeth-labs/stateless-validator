@@ -24,7 +24,7 @@ use eyre::Result;
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
-use stateless_common::RpcClient;
+use stateless_common::{RpcClient, estimate_witness_size};
 use stateless_core::{BlockStore, LightWitness, withdrawals::MptWitness};
 use tokio::sync::broadcast;
 use tracing::{debug, instrument, trace, warn};
@@ -578,13 +578,7 @@ impl DataProvider {
 
         // Fetch missing contracts from RPC
         for hash in missing {
-            let upstream = UpstreamMetrics::new_for_method("eth_getCodeByHash");
-            let start = std::time::Instant::now();
-            let result = self.rpc_client.get_code(hash).await;
-            upstream.record_request(result.is_ok(), start.elapsed().as_secs_f64());
-            let code =
-                result.map_err(|e| eyre::eyre!("Failed to fetch contract code {}: {}", hash, e))?;
-            contracts.insert(hash, Bytecode::new_raw(code));
+            contracts.insert(hash, self.fetch_contract_code(hash).await?);
         }
 
         Ok(contracts)
@@ -600,28 +594,22 @@ impl DataProvider {
         trace!(count = code_hashes.len(), "Fetching contracts from RPC");
 
         for &hash in code_hashes {
-            let upstream = UpstreamMetrics::new_for_method("eth_getCodeByHash");
-            let start = std::time::Instant::now();
-            let fetch_result = self.rpc_client.get_code(hash).await;
-            upstream.record_request(fetch_result.is_ok(), start.elapsed().as_secs_f64());
-            let code = fetch_result
-                .map_err(|e| eyre::eyre!("Failed to fetch contract code {}: {}", hash, e))?;
-            result.insert(hash, Bytecode::new_raw(code));
+            result.insert(hash, self.fetch_contract_code(hash).await?);
         }
 
         Ok(result)
     }
-}
 
-/// Estimates the total size of witness data in bytes (approximate, avoids serialization).
-fn estimate_witness_size(salt: &SaltWitness, mpt: &MptWitness) -> usize {
-    // SaltKey (8 bytes) + Option<SaltValue> (~95 bytes) ≈ 103 bytes per entry
-    let salt_kvs_size = salt.kvs.len() * 103;
-    // Proof: commitments (64 bytes each) + IPA proof (~576 bytes) + levels (5 bytes each)
-    let proof_size = salt.proof.parents_commitments.len() * 64 + 576 + salt.proof.levels.len() * 5;
-    // MptWitness: storage_root (32 bytes) + sum of state bytes
-    let mpt_size = 32 + mpt.state.iter().map(|b| b.len()).sum::<usize>();
-    salt_kvs_size + proof_size + mpt_size
+    /// Fetches a single contract bytecode from upstream RPC and records upstream metrics.
+    async fn fetch_contract_code(&self, hash: B256) -> Result<Bytecode> {
+        let upstream = UpstreamMetrics::new_for_method("eth_getCodeByHash");
+        let start = std::time::Instant::now();
+        let result = self.rpc_client.get_code(hash).await;
+        upstream.record_request(result.is_ok(), start.elapsed().as_secs_f64());
+        result
+            .map(Bytecode::new_raw)
+            .map_err(|e| eyre::eyre!("Failed to fetch contract code {}: {}", hash, e))
+    }
 }
 
 #[cfg(test)]

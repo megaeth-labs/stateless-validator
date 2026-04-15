@@ -30,7 +30,10 @@ use stateless_core::withdrawals::MptWitness;
 use tokio::sync::Semaphore;
 use tracing::trace;
 
-use crate::metrics::{RpcClientConfig, RpcMethod};
+use crate::{
+    metrics::{RpcClientConfig, RpcMethod},
+    witness_size::WitnessSizeBreakdown,
+};
 
 /// Boxed, `'static` future returned by `call()` closures.
 type BoxFuture<T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'static>>;
@@ -315,6 +318,7 @@ impl RpcClient {
     /// If all providers fail, returns the error from the last provider attempted.
     pub async fn get_witness(&self, number: u64, hash: B256) -> Result<(SaltWitness, MptWitness)> {
         let mut last_err = eyre!("no witness providers configured");
+        let mut last_elapsed: Option<f64> = None;
 
         for (idx, provider) in self.witness_providers.iter().enumerate() {
             let provider = provider.clone();
@@ -335,21 +339,16 @@ impl RpcClient {
                         "Witness fetched successfully",
                     );
                     if let Some(ref metrics) = self.config.metrics {
-                        let kvs_count = salt_witness.kvs.len();
-                        let salt_kvs_size = kvs_count * 103;
-                        let proof_size = salt_witness.proof.parents_commitments.len() * 64 +
-                            576 +
-                            salt_witness.proof.levels.len() * 5;
-                        let salt_size = salt_kvs_size + proof_size;
-                        let mpt_size =
-                            32 + mpt_witness.state.iter().map(|b| b.len()).sum::<usize>();
+                        let WitnessSizeBreakdown { salt_size, kvs_count, salt_kvs_size, mpt_size } =
+                            WitnessSizeBreakdown::new(&salt_witness, &mpt_witness);
                         metrics.on_witness_fetch(salt_size, kvs_count, salt_kvs_size, mpt_size);
                     }
                     return Ok((salt_witness, mpt_witness));
                 }
                 Err(e) => {
-                    let elapsed = start.elapsed().as_secs_f64();
-                    self.record_rpc(RpcMethod::MegaGetBlockWitness, false, Some(elapsed));
+                    last_elapsed = Some(start.elapsed().as_secs_f64());
+                    // Non-final provider failure: count as a retry attempt, not a logical error.
+                    self.record_rpc_retry(RpcMethod::MegaGetBlockWitness);
                     tracing::warn!(
                         block_number = number,
                         %hash,
@@ -362,6 +361,8 @@ impl RpcClient {
             }
         }
 
+        // All providers exhausted: record the single final failure outcome.
+        self.record_rpc(RpcMethod::MegaGetBlockWitness, false, last_elapsed);
         Err(last_err)
     }
 
@@ -415,7 +416,7 @@ impl RpcClient {
     ) -> Result<Option<(Transaction, B256)>> {
         let provider = self.data_provider.clone();
         let tx = self
-            .call(RpcMethod::EthGetBlockByNumber, move || {
+            .call(RpcMethod::EthGetTransactionByHash, move || {
                 let p = provider.clone();
                 Box::pin(async move {
                     p.get_transaction_by_hash(tx_hash).await.map_err(|e| {

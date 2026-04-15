@@ -96,42 +96,35 @@ pub mod names {
 const BYTE_BUCKETS: &[f64] =
     &[1_024.0, 10_240.0, 51_200.0, 204_800.0, 1_048_576.0, 5_242_880.0, 20_971_520.0];
 
+/// State reads/writes per block (~ 10–5000 KV accesses).
+const COUNT_BUCKETS_5K: &[f64] =
+    &[1.0, 5.0, 10.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0];
+
+/// SALT witness key count (~ 10–500 keys).
+const COUNT_BUCKETS_500: &[f64] = &[1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0];
+
+/// Reorg depth (~ 1–50 blocks).
+const REORG_DEPTH_BUCKETS: &[f64] = &[1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0];
+
+/// (metric_name, buckets) pairs applied via `set_buckets_for_metric` at startup.
+const BUCKET_SPECS: &[(&str, &[f64])] = &[
+    (names::BLOCK_STATE_READS, COUNT_BUCKETS_5K),
+    (names::BLOCK_STATE_WRITES, COUNT_BUCKETS_5K),
+    (names::SALT_WITNESS_KEYS, COUNT_BUCKETS_500),
+    (names::SALT_WITNESS_SIZE, BYTE_BUCKETS),
+    (names::SALT_WITNESS_KVS_SIZE, BYTE_BUCKETS),
+    (names::MPT_WITNESS_SIZE, BYTE_BUCKETS),
+    (names::REORG_DEPTH, REORG_DEPTH_BUCKETS),
+];
+
 /// Initialize the Prometheus metrics exporter at the given address.
 pub fn init_metrics(addr: SocketAddr) -> Result<()> {
-    PrometheusBuilder::new()
-        // Count-based histograms: state reads/writes (~ 10–5000 KV accesses per block)
-        .set_buckets_for_metric(
-            Matcher::Full(names::BLOCK_STATE_READS.to_owned()),
-            &[1.0, 5.0, 10.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0],
-        )
-        .expect("valid bucket config")
-        .set_buckets_for_metric(
-            Matcher::Full(names::BLOCK_STATE_WRITES.to_owned()),
-            &[1.0, 5.0, 10.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0],
-        )
-        .expect("valid bucket config")
-        // Count-based: SALT witness key count (~ 10–500 keys)
-        .set_buckets_for_metric(
-            Matcher::Full(names::SALT_WITNESS_KEYS.to_owned()),
-            &[1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0],
-        )
-        .expect("valid bucket config")
-        // Byte-size histograms: witness sizes
-        .set_buckets_for_metric(Matcher::Full(names::SALT_WITNESS_SIZE.to_owned()), BYTE_BUCKETS)
-        .expect("valid bucket config")
-        .set_buckets_for_metric(
-            Matcher::Full(names::SALT_WITNESS_KVS_SIZE.to_owned()),
-            BYTE_BUCKETS,
-        )
-        .expect("valid bucket config")
-        .set_buckets_for_metric(Matcher::Full(names::MPT_WITNESS_SIZE.to_owned()), BYTE_BUCKETS)
-        .expect("valid bucket config")
-        // Count-based: reorg depth (~ 1–50 blocks)
-        .set_buckets_for_metric(
-            Matcher::Full(names::REORG_DEPTH.to_owned()),
-            &[1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0],
-        )
-        .expect("valid bucket config")
+    let builder = BUCKET_SPECS.iter().fold(PrometheusBuilder::new(), |b, &(name, buckets)| {
+        b.set_buckets_for_metric(Matcher::Full(name.to_owned()), buckets)
+            .expect("valid bucket config")
+    });
+
+    builder
         .with_http_listener(addr)
         .install()
         .map_err(|e| eyre::eyre!("Failed to install Prometheus exporter: {}", e))?;

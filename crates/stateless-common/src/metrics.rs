@@ -16,6 +16,8 @@ pub enum RpcMethod {
     EthBlockNumber,
     /// eth_getHeaderByNumber / eth_getHeaderByHash
     EthGetHeader,
+    /// eth_getTransactionByHash
+    EthGetTransactionByHash,
     /// mega_getBlockWitness (any witness provider)
     MegaGetBlockWitness,
     /// mega_setValidatedBlocks
@@ -30,6 +32,7 @@ impl RpcMethod {
             RpcMethod::EthGetBlockByNumber => "eth_getBlockByNumber",
             RpcMethod::EthGetHeader => "eth_getHeader",
             RpcMethod::EthBlockNumber => "eth_blockNumber",
+            RpcMethod::EthGetTransactionByHash => "eth_getTransactionByHash",
             RpcMethod::MegaGetBlockWitness => "mega_getBlockWitness",
             RpcMethod::MegaSetValidatedBlocks => "mega_setValidatedBlocks",
         }
