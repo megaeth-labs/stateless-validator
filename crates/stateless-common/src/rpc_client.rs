@@ -7,8 +7,9 @@
 //!
 //! - **Multi-endpoint witness support**: accepts an ordered list of witness endpoints;
 //!   `get_witness` tries them front-to-back and returns on the first success.
-//! - **Concurrency limiting**: a [`tokio::sync::Semaphore`] caps the number of concurrent in-flight
-//!   requests, preventing thundering herd under many parallel workers.
+//! - **Concurrency limiting**: two independent [`tokio::sync::Semaphore`]s cap in-flight requests —
+//!   one for data-endpoint calls (blocks/headers/code/tx), one for witness fetches — so a burst on
+//!   one path cannot starve the other. `set_validated_blocks` is unthrottled.
 //! - **Per-call retry with backoff**: all single-endpoint methods (`get_block`, `get_header`,
 //!   `get_code`, etc.) automatically retry transient RPC errors with exponential backoff;
 //!   `get_witness` does not retry per-provider but falls back to the next provider instead.
@@ -72,8 +73,11 @@ pub struct RpcClient {
     report_provider: Option<RootProvider<Optimism>>,
     /// Configuration controlling verification, retry, and concurrency behavior.
     config: RpcClientConfig,
-    /// Semaphore capping concurrent in-flight requests.
-    concurrency: Arc<Semaphore>,
+    /// Semaphore capping concurrent in-flight data-endpoint requests
+    /// (blocks, headers, contract bytecode, transactions).
+    data_concurrency: Arc<Semaphore>,
+    /// Semaphore capping concurrent in-flight witness fetches, independent of the data cap.
+    witness_concurrency: Arc<Semaphore>,
 }
 
 impl RpcClient {
@@ -118,8 +122,11 @@ impl RpcClient {
             })
             .transpose()?;
 
-        let concurrency = Arc::new(Semaphore::new(
-            config.max_concurrent_requests.unwrap_or(Semaphore::MAX_PERMITS),
+        let data_concurrency = Arc::new(Semaphore::new(
+            config.data_max_concurrent_requests.unwrap_or(Semaphore::MAX_PERMITS),
+        ));
+        let witness_concurrency = Arc::new(Semaphore::new(
+            config.witness_max_concurrent_requests.unwrap_or(Semaphore::MAX_PERMITS),
         ));
 
         Ok(Self {
@@ -128,7 +135,8 @@ impl RpcClient {
             witness_providers,
             report_provider,
             config,
-            concurrency,
+            data_concurrency,
+            witness_concurrency,
         })
     }
 
@@ -174,10 +182,10 @@ impl RpcClient {
 
         for attempt in 0..=max_retries {
             let _permit = self
-                .concurrency
+                .data_concurrency
                 .acquire()
                 .await
-                .expect("concurrency semaphore closed unexpectedly");
+                .expect("data concurrency semaphore closed unexpectedly");
 
             match f().await {
                 Ok(v) => {
@@ -322,10 +330,10 @@ impl RpcClient {
 
         for (idx, provider) in self.witness_providers.iter().enumerate() {
             let _permit = self
-                .concurrency
+                .witness_concurrency
                 .acquire()
                 .await
-                .expect("concurrency semaphore closed unexpectedly");
+                .expect("witness concurrency semaphore closed unexpectedly");
 
             let start = Instant::now();
             match fetch_witness_raw(provider, number, hash).await {
@@ -378,9 +386,6 @@ impl RpcClient {
     ) -> Result<SetValidatedBlocksResponse> {
         let provider =
             self.report_provider.as_ref().ok_or_else(|| eyre!("Report provider not configured"))?;
-        // Write operation: acquire semaphore but no retry.
-        let _permit =
-            self.concurrency.acquire().await.expect("concurrency semaphore closed unexpectedly");
         let result = provider
             .client()
             .request("mega_setValidatedBlocks", (first_block, last_block))
@@ -703,9 +708,13 @@ mod tests {
         };
         assert!(!make(RpcClientConfig::validator()).skip_block_verification());
         assert!(make(RpcClientConfig::trace_server()).skip_block_verification());
-        let client =
-            make(RpcClientConfig { max_concurrent_requests: Some(4), ..Default::default() });
-        assert_eq!(client.concurrency.available_permits(), 4);
+        let client = make(RpcClientConfig {
+            data_max_concurrent_requests: Some(10),
+            witness_max_concurrent_requests: Some(2),
+            ..Default::default()
+        });
+        assert_eq!(client.data_concurrency.available_permits(), 10);
+        assert_eq!(client.witness_concurrency.available_permits(), 2);
     }
 
     // Mock RPC helpers

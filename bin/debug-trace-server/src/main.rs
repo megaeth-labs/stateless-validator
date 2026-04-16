@@ -170,6 +170,16 @@ struct Args {
     )]
     pruner_interval_secs: u64,
 
+    /// Maximum concurrent in-flight data-endpoint requests (blocks, headers, code, tx).
+    /// Omit for unlimited.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_DATA_MAX_CONCURRENT_REQUESTS")]
+    data_max_concurrent_requests: Option<usize>,
+
+    /// Maximum concurrent in-flight witness fetches, independent of the data cap.
+    /// Omit for unlimited.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_MAX_CONCURRENT_REQUESTS")]
+    witness_max_concurrent_requests: Option<usize>,
+
     /// Logging configuration.
     #[command(flatten)]
     log: LogArgs,
@@ -251,12 +261,13 @@ async fn main() -> Result<()> {
 
     // Initialize components
     let witness_apis: Vec<&str> = args.witness_endpoint.iter().map(String::as_str).collect();
-    let rpc_client = Arc::new(RpcClient::new_with_config(
-        &args.rpc_endpoint,
-        &witness_apis,
-        RpcClientConfig::trace_server(),
-        None,
-    )?);
+    let rpc_config = RpcClientConfig {
+        data_max_concurrent_requests: args.data_max_concurrent_requests,
+        witness_max_concurrent_requests: args.witness_max_concurrent_requests,
+        ..RpcClientConfig::trace_server()
+    };
+    let rpc_client =
+        Arc::new(RpcClient::new_with_config(&args.rpc_endpoint, &witness_apis, rpc_config, None)?);
     let validator_db = init_validator_db(&args, &rpc_client).await?;
 
     // Keep concrete ServerDB for pipeline (needs Sized), and dyn BlockStore for data_provider

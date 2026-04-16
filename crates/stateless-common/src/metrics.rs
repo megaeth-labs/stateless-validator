@@ -73,10 +73,13 @@ pub struct RpcClientConfig {
     pub skip_block_verification: bool,
     /// Optional metrics callbacks for tracking RPC performance.
     pub metrics: Option<Arc<dyn RpcMetrics>>,
-    /// Maximum number of concurrent in-flight RPC requests across all methods.
-    /// Implemented as a semaphore to prevent thundering herd under many parallel workers.
-    /// `None` means unlimited concurrency.
-    pub max_concurrent_requests: Option<usize>,
+    /// Maximum number of concurrent in-flight data-endpoint requests
+    /// (blocks, headers, contract bytecode, transactions). `None` means unlimited.
+    pub data_max_concurrent_requests: Option<usize>,
+    /// Maximum number of concurrent in-flight witness fetches. Independent from the data cap so
+    /// a burst of block fetches cannot starve witness retrieval (and vice versa). `None` means
+    /// unlimited.
+    pub witness_max_concurrent_requests: Option<usize>,
     /// Maximum number of per-call retry attempts before propagating the error.
     /// Does not apply to `get_witness` (which falls back across providers instead).
     pub max_retries: u32,
@@ -91,7 +94,8 @@ impl Default for RpcClientConfig {
         Self {
             skip_block_verification: false,
             metrics: None,
-            max_concurrent_requests: None,
+            data_max_concurrent_requests: None,
+            witness_max_concurrent_requests: None,
             max_retries: 3,
             initial_backoff_ms: 100,
             max_backoff_ms: 10_000,

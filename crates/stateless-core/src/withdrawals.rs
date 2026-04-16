@@ -245,17 +245,13 @@ mod tests {
         // Empty witness + empty storage passes when the header's root is EMPTY_ROOT_HASH.
         assert!(empty.verify(&header(Some(EMPTY_ROOT_HASH)), Default::default()).is_ok());
 
-        // Non-empty storage root with no witness nodes triggers a reconstruction failure.
+        // Non-empty storage root with no witness nodes triggers a reconstruction failure:
+        // rebuild_trie looks up B256::ZERO in the (empty) nodes map and fails.
         let mismatched = MptWitness { storage_root: B256::ZERO, state: vec![] };
         let err =
             mismatched.verify(&header(Some(EMPTY_ROOT_HASH)), Default::default()).unwrap_err();
         assert!(
-            matches!(
-                err,
-                WithdrawalValidationError::PreStateRootMismatch { .. } |
-                    WithdrawalValidationError::WitnessNodeNotFound(_) |
-                    WithdrawalValidationError::TrieNotRevealed
-            ),
+            matches!(err, WithdrawalValidationError::WitnessNodeNotFound(_)),
             "unexpected error variant: {err:?}"
         );
 

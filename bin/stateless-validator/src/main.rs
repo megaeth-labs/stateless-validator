@@ -103,6 +103,16 @@ struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_METRICS_PORT", default_value_t = metrics::DEFAULT_METRICS_PORT)]
     metrics_port: u16,
 
+    /// Maximum concurrent in-flight data-endpoint requests (blocks, headers, code, tx).
+    /// Omit for unlimited.
+    #[clap(long, env = "STATELESS_VALIDATOR_DATA_MAX_CONCURRENT_REQUESTS")]
+    data_max_concurrent_requests: Option<usize>,
+
+    /// Maximum concurrent in-flight witness fetches, independent of the data cap.
+    /// Omit for unlimited.
+    #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_MAX_CONCURRENT_REQUESTS")]
+    witness_max_concurrent_requests: Option<usize>,
+
     /// Logging configuration.
     #[command(flatten)]
     log: LogArgs,
@@ -133,7 +143,12 @@ async fn main() -> Result<()> {
 
     let work_dir = PathBuf::from(args.data_dir);
 
-    let rpc_config = RpcClientConfig::validator().with_metrics(Arc::new(metrics::ValidatorMetrics));
+    let rpc_config = RpcClientConfig {
+        data_max_concurrent_requests: args.data_max_concurrent_requests,
+        witness_max_concurrent_requests: args.witness_max_concurrent_requests,
+        ..RpcClientConfig::validator()
+    }
+    .with_metrics(Arc::new(metrics::ValidatorMetrics));
     let witness_apis: Vec<&str> = args.witness_endpoint.iter().map(String::as_str).collect();
     let client = Arc::new(RpcClient::new_with_config(
         &args.rpc_endpoint,
