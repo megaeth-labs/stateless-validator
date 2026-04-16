@@ -66,6 +66,7 @@ dashmap = { version = "6.1", default-features = false }
 dotenvy = "0.15"
 dyn-clone = "1.0"
 eyre = { version = "0.6", features = ["auto-install"], default-features = false }
+fastrand = { version = "2.4", default-features = false }
 futures = { version = "0.3", default-features = false }
 http = "1.4"
 http-body = "1.0"

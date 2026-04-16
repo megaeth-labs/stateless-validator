@@ -59,7 +59,9 @@ cargo run --release --bin stateless-validator -- \
 
 **Required Arguments:**
 - `--data-dir`: Directory for validator database and data files
-- `--rpc-endpoint`: JSON-RPC API endpoint URL to retrieve block data
+- `--rpc-endpoint`: JSON-RPC API endpoint URL(s) to retrieve block data.
+  Multiple endpoints can be provided via repeated flags or as a comma-separated list (tried in order on failure, with retry-with-backoff per provider).
+  The env var `STATELESS_VALIDATOR_RPC_ENDPOINT` accepts the same comma-separated form (e.g. `http://a:8545,http://b:8545`).
 - `--witness-endpoint`: MegaETH JSON-RPC API endpoint URL(s) to retrieve witness data.
   Multiple endpoints can be provided via repeated flags or as a comma-separated list (tried in order on failure).
   The env var `STATELESS_VALIDATOR_WITNESS_ENDPOINT` accepts the same comma-separated form (e.g. `http://a:8545,http://b:8545`).

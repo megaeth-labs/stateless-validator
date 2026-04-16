@@ -42,7 +42,6 @@ revm.workspace = true
 # misc
 dyn-clone.workspace = true
 eyre.workspace = true
-futures.workspace = true
 kanal.workspace = true
 num_cpus.workspace = true
 rustc-hash.workspace = true

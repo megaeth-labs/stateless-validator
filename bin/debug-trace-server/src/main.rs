@@ -79,9 +79,17 @@ struct Args {
     #[clap(long, env = "DEBUG_TRACE_SERVER_ADDR", default_value = "0.0.0.0:8545")]
     addr: String,
 
-    /// Upstream RPC endpoint URL.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_RPC_ENDPOINT")]
-    rpc_endpoint: String,
+    /// One or more upstream RPC endpoint URLs for fetching blockchain data (tried in order).
+    /// Accepts repeated flags (`--rpc-endpoint a --rpc-endpoint b`) or a comma-separated
+    /// list (`--rpc-endpoint a,b`, also via the env var).
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_RPC_ENDPOINT",
+        required = true,
+        value_delimiter = ',',
+        action = clap::ArgAction::Append,
+    )]
+    rpc_endpoint: Vec<String>,
 
     /// One or more upstream witness endpoint URLs for fetching witness data (tried in order).
     /// Accepts repeated flags (`--witness-endpoint a --witness-endpoint b`) or a comma-separated
@@ -236,7 +244,7 @@ async fn main() -> Result<()> {
     );
     let response_cache_disabled = args.response_cache_estimated_items == 0;
     debug!(
-        rpc_endpoint = %args.rpc_endpoint,
+        rpc_endpoints = ?args.rpc_endpoint,
         witness_endpoints = ?args.witness_endpoint,
         witness_timeout_secs = args.witness_timeout,
         response_cache_disabled,
@@ -260,6 +268,7 @@ async fn main() -> Result<()> {
     }
 
     // Initialize components
+    let data_apis: Vec<&str> = args.rpc_endpoint.iter().map(String::as_str).collect();
     let witness_apis: Vec<&str> = args.witness_endpoint.iter().map(String::as_str).collect();
     let rpc_config = RpcClientConfig {
         data_max_concurrent_requests: args.data_max_concurrent_requests,
@@ -267,7 +276,7 @@ async fn main() -> Result<()> {
         ..RpcClientConfig::trace_server()
     };
     let rpc_client =
-        Arc::new(RpcClient::new_with_config(&args.rpc_endpoint, &witness_apis, rpc_config, None)?);
+        Arc::new(RpcClient::new_with_config(&data_apis, &witness_apis, rpc_config, None)?);
     let validator_db = init_validator_db(&args, &rpc_client).await?;
 
     // Keep concrete ServerDB for pipeline (needs Sized), and dyn BlockStore for data_provider
@@ -594,6 +603,29 @@ mod tests {
         assert_eq!(parse(&["--witness-endpoint", "http://a,http://b"]), ["http://a", "http://b"]);
         assert_eq!(
             parse(&["--witness-endpoint", "http://a,http://b", "--witness-endpoint", "http://c"]),
+            ["http://a", "http://b", "http://c"],
+        );
+
+        // SAFETY: edition 2024 requires no concurrent env access; this var is unique to this
+        // binary's clap arg and is unread by any sibling test, so no parallel test can race.
+        unsafe { std::env::set_var(ENV, "http://a,http://b") };
+        let from_env = parse(&[]);
+        unsafe { std::env::remove_var(ENV) };
+        assert_eq!(from_env, ["http://a", "http://b"]);
+    }
+
+    /// `--rpc-endpoint` accepts repeated flags and CSV values, both on the CLI and via env var,
+    /// mirroring `--witness-endpoint` behavior for multi-endpoint data RPC support.
+    #[test]
+    fn rpc_endpoint_accepts_multiple_forms() {
+        const ENV: &str = "DEBUG_TRACE_SERVER_RPC_ENDPOINT";
+        let base = ["debug-trace-server", "--witness-endpoint", "http://w"];
+        let parse =
+            |extra: &[&str]| Args::try_parse_from(base.iter().chain(extra)).unwrap().rpc_endpoint;
+
+        assert_eq!(parse(&["--rpc-endpoint", "http://a,http://b"]), ["http://a", "http://b"]);
+        assert_eq!(
+            parse(&["--rpc-endpoint", "http://a,http://b", "--rpc-endpoint", "http://c"]),
             ["http://a", "http://b", "http://c"],
         );
 

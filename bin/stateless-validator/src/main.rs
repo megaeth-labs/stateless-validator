@@ -64,9 +64,17 @@ struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_DATA_DIR")]
     data_dir: String,
 
-    /// The URL of the Ethereum JSON-RPC API endpoint for fetching blockchain data.
-    #[clap(long, env = "STATELESS_VALIDATOR_RPC_ENDPOINT")]
-    rpc_endpoint: String,
+    /// One or more JSON-RPC API endpoints for fetching blockchain data (tried in order).
+    /// Accepts repeated flags (`--rpc-endpoint a --rpc-endpoint b`) or a comma-separated
+    /// list (`--rpc-endpoint a,b`, also via the env var).
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_RPC_ENDPOINT",
+        required = true,
+        value_delimiter = ',',
+        action = clap::ArgAction::Append,
+    )]
+    rpc_endpoint: Vec<String>,
 
     /// One or more MegaETH JSON-RPC API endpoints for fetching witness data (tried in order).
     /// Accepts repeated flags (`--witness-endpoint a --witness-endpoint b`) or a comma-separated
@@ -126,7 +134,7 @@ async fn main() -> Result<()> {
     let start = Instant::now();
 
     info!(data_dir = %args.data_dir, "[Main] Data directory");
-    info!(rpc_endpoint = %args.rpc_endpoint, "[Main] RPC endpoint");
+    info!(rpc_endpoints = ?args.rpc_endpoint, "[Main] RPC endpoints");
     info!(witness_endpoints = ?args.witness_endpoint, "[Main] Witness endpoints");
     if let Some(ref genesis_file) = args.genesis_file {
         info!(genesis_file, "[Main] Genesis file");
@@ -149,9 +157,10 @@ async fn main() -> Result<()> {
         ..RpcClientConfig::validator()
     }
     .with_metrics(Arc::new(metrics::ValidatorMetrics));
+    let data_apis: Vec<&str> = args.rpc_endpoint.iter().map(String::as_str).collect();
     let witness_apis: Vec<&str> = args.witness_endpoint.iter().map(String::as_str).collect();
     let client = Arc::new(RpcClient::new_with_config(
-        &args.rpc_endpoint,
+        &data_apis,
         &witness_apis,
         rpc_config,
         args.report_validation_endpoint.as_deref(),
@@ -401,6 +410,31 @@ mod tests {
         assert_eq!(parse(&["--witness-endpoint", "http://a,http://b"]), ["http://a", "http://b"]);
         assert_eq!(
             parse(&["--witness-endpoint", "http://a,http://b", "--witness-endpoint", "http://c"]),
+            ["http://a", "http://b", "http://c"],
+        );
+
+        // SAFETY: edition 2024 requires no concurrent env access; this var is unique to this
+        // binary's clap arg and is unread by any sibling test, so no parallel test can race.
+        unsafe { std::env::set_var(ENV, "http://a,http://b") };
+        let from_env = parse(&[]);
+        unsafe { std::env::remove_var(ENV) };
+        assert_eq!(from_env, ["http://a", "http://b"]);
+    }
+
+    /// `--rpc-endpoint` accepts repeated flags and CSV values, both on the CLI and via env var,
+    /// mirroring `--witness-endpoint` behavior for multi-endpoint data RPC support.
+    #[test]
+    fn rpc_endpoint_accepts_multiple_forms() {
+        const ENV: &str = "STATELESS_VALIDATOR_RPC_ENDPOINT";
+        let base =
+            ["stateless-validator", "--data-dir", "/tmp/x", "--witness-endpoint", "http://w"];
+        let parse = |extra: &[&str]| {
+            CommandLineArgs::try_parse_from(base.iter().chain(extra)).unwrap().rpc_endpoint
+        };
+
+        assert_eq!(parse(&["--rpc-endpoint", "http://a,http://b"]), ["http://a", "http://b"]);
+        assert_eq!(
+            parse(&["--rpc-endpoint", "http://a,http://b", "--rpc-endpoint", "http://c"]),
             ["http://a", "http://b", "http://c"],
         );
 
@@ -769,7 +803,7 @@ mod tests {
         let contract_cache =
             Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
         let (handle, url) = setup_mock_rpc_server(data).await;
-        let client = Arc::new(RpcClient::new(&url, &[url.as_str()]).unwrap());
+        let client = Arc::new(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap());
 
         let chain_spec =
             Arc::new(load_or_create_chain_spec(&validator_db, Some(&genesis_file)).unwrap());

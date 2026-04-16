@@ -5,16 +5,28 @@
 //!
 //! ## Network resilience
 //!
+//! - **Multi-endpoint data support**: accepts an ordered list of data endpoints; data methods pick
+//!   a starting provider via round-robin and, on failure, retry with backoff on that provider
+//!   before cycling to the next.
 //! - **Multi-endpoint witness support**: accepts an ordered list of witness endpoints;
 //!   `get_witness` tries them front-to-back and returns on the first success.
 //! - **Concurrency limiting**: two independent [`tokio::sync::Semaphore`]s cap in-flight requests —
 //!   one for data-endpoint calls (blocks/headers/code/tx), one for witness fetches — so a burst on
 //!   one path cannot starve the other. `set_validated_blocks` is unthrottled.
-//! - **Per-call retry with backoff**: all single-endpoint methods (`get_block`, `get_header`,
-//!   `get_code`, etc.) automatically retry transient RPC errors with exponential backoff;
-//!   `get_witness` does not retry per-provider but falls back to the next provider instead.
+//! - **Per-call retry with backoff**: data methods automatically retry transient RPC errors with
+//!   exponential backoff per provider, cycling through providers in round-robin order after
+//!   exhausting retries; `get_witness` does not retry per-provider but falls back to the next
+//!   provider instead.
 
-use std::{collections::HashMap, pin::Pin, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
 
 use alloy_primitives::{B256, Bytes, U64};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
@@ -65,8 +77,12 @@ pub struct SetValidatedBlocksResponse {
 /// Cloning is cheap — all providers are `Arc`-backed internally.
 #[derive(Debug, Clone)]
 pub struct RpcClient {
-    /// Upstream MegaETH node providing blocks and contract bytecode.
-    pub data_provider: RootProvider<Optimism>,
+    /// Ordered list of data providers. Data methods pick a starting provider via round-robin and
+    /// cycle forward on failure (each with its own retry-with-backoff budget).
+    data_providers: Vec<RootProvider<Optimism>>,
+    /// Round-robin counter for selecting the starting data provider on each call.
+    /// Shared across clones so load balancing is global per logical client.
+    data_rr_counter: Arc<AtomicUsize>,
     /// Ordered list of witness providers. `get_witness` tries them front-to-back.
     witness_providers: Vec<RootProvider>,
     /// Optional dedicated provider for reporting validated blocks.
@@ -84,28 +100,41 @@ impl RpcClient {
     /// Creates a new RPC client connected to MegaETH blockchain nodes.
     ///
     /// # Arguments
-    /// * `data_api` - HTTP URL of the standard JSON-RPC endpoint for blocks and contract data
+    /// * `data_apis` - HTTP URLs of the standard JSON-RPC endpoints for blocks and contract data
+    ///   (tried in order)
     /// * `witness_apis` - HTTP URLs of the witness RPC endpoints (tried in order)
-    pub fn new(data_api: &str, witness_apis: &[&str]) -> Result<Self> {
-        Self::new_with_config(data_api, witness_apis, RpcClientConfig::default(), None)
+    pub fn new(data_apis: &[&str], witness_apis: &[&str]) -> Result<Self> {
+        Self::new_with_config(data_apis, witness_apis, RpcClientConfig::default(), None)
     }
 
     /// Creates a new RPC client with custom configuration.
     ///
     /// # Arguments
-    /// * `data_api` - HTTP URL of the standard JSON-RPC endpoint for blocks and contract data
+    /// * `data_apis` - HTTP URLs of the standard JSON-RPC endpoints for blocks and contract data
+    ///   (tried in order, non-empty)
     /// * `witness_apis` - HTTP URLs of the witness RPC endpoints (tried in order, non-empty)
     /// * `config` - Configuration controlling verification, retry, and concurrency behavior
     /// * `report_api` - Optional HTTP URL of the endpoint for reporting validated blocks
     pub fn new_with_config(
-        data_api: &str,
+        data_apis: &[&str],
         witness_apis: &[&str],
         config: RpcClientConfig,
         report_api: Option<&str>,
     ) -> Result<Self> {
+        if data_apis.is_empty() {
+            return Err(eyre!("At least one data API URL must be provided"));
+        }
         if witness_apis.is_empty() {
             return Err(eyre!("At least one witness API URL must be provided"));
         }
+
+        let data_providers = data_apis
+            .iter()
+            .map(|url| -> Result<RootProvider<Optimism>> {
+                Ok(ProviderBuilder::<_, _, Optimism>::default()
+                    .connect_http(url.parse().context("Failed to parse data API URL")?))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let witness_providers = witness_apis
             .iter()
@@ -130,8 +159,8 @@ impl RpcClient {
         ));
 
         Ok(Self {
-            data_provider: ProviderBuilder::<_, _, Optimism>::default()
-                .connect_http(data_api.parse().context("Failed to parse API URL")?),
+            data_providers,
+            data_rr_counter: Arc::new(AtomicUsize::new(0)),
             witness_providers,
             report_provider,
             config,
@@ -143,6 +172,11 @@ impl RpcClient {
     /// Returns whether block verification is skipped.
     pub fn skip_block_verification(&self) -> bool {
         self.config.skip_block_verification
+    }
+
+    /// Returns the number of configured data endpoints.
+    pub fn data_provider_count(&self) -> usize {
+        self.data_providers.len()
     }
 
     /// Returns the number of configured witness endpoints.
@@ -164,7 +198,11 @@ impl RpcClient {
         }
     }
 
-    /// Wraps a single-endpoint RPC call with concurrency limiting and exponential-backoff retry.
+    /// Wraps a multi-endpoint RPC call with concurrency limiting and exponential-backoff retry.
+    ///
+    /// Picks a starting data provider via round-robin to spread load across endpoints. For the
+    /// selected provider, retries up to `max_retries` with exponential backoff. If all retries
+    /// fail, cycles forward in round-robin order to the next provider with a fresh retry budget.
     ///
     /// Records one `record_rpc` per logical call (final outcome); each non-final failure is
     /// recorded via `record_rpc_retry`. The reported duration covers the full call including
@@ -174,55 +212,76 @@ impl RpcClient {
     async fn call<T: Send + 'static>(
         &self,
         method: RpcMethod,
-        f: impl Fn() -> BoxFuture<Result<T>>,
+        f: impl Fn(RootProvider<Optimism>) -> BoxFuture<Result<T>>,
     ) -> Result<T> {
-        let mut backoff_ms = self.config.initial_backoff_ms;
         let max_retries = self.config.max_retries;
         let start = Instant::now();
+        // Safety: constructor guarantees at least one data provider.
+        let n = self.data_providers.len();
+        // Skip the atomic op when there's a single provider — avoids pointless contention.
+        let rr_start =
+            if n > 1 { self.data_rr_counter.fetch_add(1, Ordering::Relaxed) % n } else { 0 };
+        let mut last_err = None;
 
-        for attempt in 0..=max_retries {
-            let _permit = self
-                .data_concurrency
-                .acquire()
-                .await
-                .expect("data concurrency semaphore closed unexpectedly");
+        for offset in 0..n {
+            let provider_idx = (rr_start + offset) % n;
+            let provider = &self.data_providers[provider_idx];
+            let mut backoff_ms = self.config.initial_backoff_ms;
 
-            match f().await {
-                Ok(v) => {
-                    self.record_rpc(method, true, Some(start.elapsed().as_secs_f64()));
-                    return Ok(v);
-                }
-                Err(e) if attempt < max_retries => {
-                    self.record_rpc_retry(method);
-                    drop(_permit); // release permit while sleeping
-                    let jitter_ms = backoff_ms / 4 * ((attempt as u64 % 4) + 1);
-                    let sleep_ms = (backoff_ms + jitter_ms).min(self.config.max_backoff_ms);
-                    tracing::warn!(
-                        method = method.as_str(),
-                        attempt,
-                        error = %e,
-                        sleep_ms,
-                        "RPC call failed, retrying",
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-                    backoff_ms = (backoff_ms * 2).min(self.config.max_backoff_ms);
-                }
-                Err(e) => {
-                    self.record_rpc(method, false, Some(start.elapsed().as_secs_f64()));
-                    return Err(e);
+            for attempt in 0..=max_retries {
+                let _permit = self
+                    .data_concurrency
+                    .acquire()
+                    .await
+                    .expect("data concurrency semaphore closed unexpectedly");
+
+                match f(provider.clone()).await {
+                    Ok(v) => {
+                        self.record_rpc(method, true, Some(start.elapsed().as_secs_f64()));
+                        return Ok(v);
+                    }
+                    Err(e) if attempt < max_retries => {
+                        self.record_rpc_retry(method);
+                        drop(_permit); // release permit before sleeping
+                        let jitter_ms = fastrand::u64(0..=backoff_ms / 2);
+                        let sleep_ms = (backoff_ms + jitter_ms).min(self.config.max_backoff_ms);
+                        tracing::warn!(
+                            method = method.as_str(),
+                            attempt,
+                            provider_idx,
+                            error = %e,
+                            sleep_ms,
+                            "RPC call failed, retrying",
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(self.config.max_backoff_ms);
+                    }
+                    Err(e) => {
+                        if offset + 1 < n {
+                            self.record_rpc_retry(method);
+                            tracing::warn!(
+                                method = method.as_str(),
+                                provider_idx,
+                                error = %e,
+                                "All retries exhausted for data provider, trying next",
+                            );
+                        }
+                        last_err = Some(e);
+                        break;
+                    }
                 }
             }
         }
-        unreachable!()
+
+        self.record_rpc(method, false, Some(start.elapsed().as_secs_f64()));
+        Err(last_err.expect("data_providers is non-empty"))
     }
 
     /// Gets contract bytecode for a code hash.
     pub async fn get_code(&self, hash: B256) -> Result<Bytes> {
-        let provider = self.data_provider.clone();
-        self.call(RpcMethod::EthGetCodeByHash, move || {
-            let p = provider.clone();
+        self.call(RpcMethod::EthGetCodeByHash, move |provider| {
             Box::pin(async move {
-                p.client().request("eth_getCodeByHash", (hash,)).await.map_err(|e| {
+                provider.client().request("eth_getCodeByHash", (hash,)).await.map_err(|e| {
                     trace!(%hash, error = %e, "eth_getCodeByHash failed");
                     eyre!("eth_getCodeByHash for hash {hash:?} failed: {e}")
                 })
@@ -236,11 +295,9 @@ impl RpcClient {
     /// If `skip_block_verification` is enabled in config, skips integrity checks.
     /// Otherwise performs ECDSA signature and block hash verification.
     pub async fn get_block(&self, block_id: BlockId, full_txs: bool) -> Result<Block<Transaction>> {
-        let provider = self.data_provider.clone();
         let block = self
-            .call(RpcMethod::EthGetBlockByNumber, move || {
-                let p = provider.clone();
-                Box::pin(async move { do_get_block_unchecked(&p, block_id, full_txs).await })
+            .call(RpcMethod::EthGetBlockByNumber, move |provider| {
+                Box::pin(async move { do_get_block_unchecked(&provider, block_id, full_txs).await })
             })
             .await?;
 
@@ -259,24 +316,22 @@ impl RpcClient {
         block_id: BlockId,
         full_txs: bool,
     ) -> Result<Block<Transaction>> {
-        let provider = self.data_provider.clone();
-        self.call(RpcMethod::EthGetBlockByNumber, move || {
-            let p = provider.clone();
-            Box::pin(async move { do_get_block_unchecked(&p, block_id, full_txs).await })
+        self.call(RpcMethod::EthGetBlockByNumber, move |provider| {
+            Box::pin(async move { do_get_block_unchecked(&provider, block_id, full_txs).await })
         })
         .await
     }
 
     /// Gets the current latest block number from the blockchain.
     pub async fn get_latest_block_number(&self) -> Result<u64> {
-        let provider = self.data_provider.clone();
-        self.call(RpcMethod::EthBlockNumber, move || {
-            let p = provider.clone();
+        self.call(RpcMethod::EthBlockNumber, move |provider| {
             Box::pin(async move {
-                p.get_block_number().await.context("Failed to get block number").map_err(|e| {
-                    trace!(error = %e, "eth_blockNumber failed");
-                    e
-                })
+                provider.get_block_number().await.context("Failed to get block number").map_err(
+                    |e| {
+                        trace!(error = %e, "eth_blockNumber failed");
+                        e
+                    },
+                )
             })
         })
         .await
@@ -294,11 +349,9 @@ impl RpcClient {
     /// hash, but can be skipped when the header will be verified downstream (e.g., via
     /// `verify_block_integrity`) or when running in a trusted context like the trace server.
     pub async fn get_header(&self, block_id: BlockId, verify_hash: bool) -> Result<Header> {
-        let provider = self.data_provider.clone();
-        self.call(RpcMethod::EthGetHeader, move || {
-            let p = provider.clone();
+        self.call(RpcMethod::EthGetHeader, move |provider| {
             Box::pin(async move {
-                do_get_header(&p, block_id, verify_hash).await.map_err(|e| {
+                do_get_header(&provider, block_id, verify_hash).await.map_err(|e| {
                     trace!(?block_id, error = %e, "get_header failed");
                     e
                 })
@@ -356,18 +409,24 @@ impl RpcClient {
                 }
                 Err(e) => {
                     last_elapsed = Some(start.elapsed().as_secs_f64());
-                    // Only count as a retry if we'll try another provider; otherwise this
-                    // failure is the final outcome recorded after the loop.
                     if idx + 1 < self.witness_providers.len() {
                         self.record_rpc_retry(RpcMethod::MegaGetBlockWitness);
+                        tracing::warn!(
+                            block_number = number,
+                            %hash,
+                            provider_idx = idx,
+                            error = %e,
+                            "Witness provider failed, trying next",
+                        );
+                    } else {
+                        tracing::warn!(
+                            block_number = number,
+                            %hash,
+                            provider_idx = idx,
+                            error = %e,
+                            "Witness provider failed",
+                        );
                     }
-                    tracing::warn!(
-                        block_number = number,
-                        %hash,
-                        provider_idx = idx,
-                        error = %e,
-                        "Witness provider failed, trying next",
-                    );
                     last_err = e;
                 }
             }
@@ -421,12 +480,10 @@ impl RpcClient {
         &self,
         tx_hash: B256,
     ) -> Result<Option<(Transaction, B256)>> {
-        let provider = self.data_provider.clone();
         let tx = self
-            .call(RpcMethod::EthGetTransactionByHash, move || {
-                let p = provider.clone();
+            .call(RpcMethod::EthGetTransactionByHash, move |provider| {
                 Box::pin(async move {
-                    p.get_transaction_by_hash(tx_hash).await.map_err(|e| {
+                    provider.get_transaction_by_hash(tx_hash).await.map_err(|e| {
                         trace!(%tx_hash, error = %e, "get_transaction_by_hash failed");
                         eyre::Error::from(e)
                     })
@@ -680,18 +737,28 @@ mod tests {
     // RpcClient unit tests
 
     #[test]
-    fn test_new_validates_urls_and_counts_witnesses() {
-        assert!(RpcClient::new("not a url", &["http://localhost:8545"]).is_err());
-        assert!(RpcClient::new("http://localhost:8545", &["not a url"]).is_err());
-        let err = RpcClient::new("http://localhost:8545", &[]).unwrap_err().to_string();
+    fn test_new_validates_urls_and_counts_providers() {
+        assert!(RpcClient::new(&["not a url"], &["http://localhost:8545"]).is_err());
+        assert!(RpcClient::new(&["http://localhost:8545"], &["not a url"]).is_err());
+        let err = RpcClient::new(&[], &["http://localhost:8545"]).unwrap_err().to_string();
+        assert!(err.contains("At least one data API"));
+        let err = RpcClient::new(&["http://localhost:8545"], &[]).unwrap_err().to_string();
         assert!(err.contains("At least one witness API"));
 
         for endpoints in [
             &["http://localhost:8546"][..],
             &["http://localhost:8546", "http://localhost:8547", "http://localhost:8548"],
         ] {
-            let client = RpcClient::new("http://localhost:8545", endpoints).unwrap();
+            let client = RpcClient::new(&["http://localhost:8545"], endpoints).unwrap();
             assert_eq!(client.witness_provider_count(), endpoints.len());
+        }
+
+        for endpoints in [
+            &["http://localhost:8545"][..],
+            &["http://localhost:8545", "http://localhost:8546", "http://localhost:8547"],
+        ] {
+            let client = RpcClient::new(endpoints, &["http://localhost:8546"]).unwrap();
+            assert_eq!(client.data_provider_count(), endpoints.len());
         }
     }
 
@@ -699,7 +766,7 @@ mod tests {
     fn test_config_propagates_to_client() {
         let make = |config| {
             RpcClient::new_with_config(
-                "http://localhost:8545",
+                &["http://localhost:8545"],
                 &["http://localhost:8546"],
                 config,
                 None,
@@ -789,7 +856,7 @@ mod tests {
     async fn test_find_divergence_single_block_reorg() {
         let (local, remote) = make_divergence_chains(1, 10, 9);
         let (handle, url) = start_mock_rpc(remote).await;
-        let fetcher = TestFetcher(RpcClient::new(&url, &[&url]).unwrap());
+        let fetcher = TestFetcher(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap());
 
         let result = find_divergence_point(
             &fetcher,
@@ -808,7 +875,7 @@ mod tests {
     async fn test_find_divergence_multi_block_reorg() {
         let (local, remote) = make_divergence_chains(1, 10, 5);
         let (handle, url) = start_mock_rpc(remote).await;
-        let fetcher = TestFetcher(RpcClient::new(&url, &[&url]).unwrap());
+        let fetcher = TestFetcher(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap());
 
         let result = find_divergence_point(
             &fetcher,
@@ -827,7 +894,7 @@ mod tests {
     async fn test_find_divergence_to_earliest() {
         let (local, remote) = make_divergence_chains(5, 10, 5);
         let (handle, url) = start_mock_rpc(remote).await;
-        let fetcher = TestFetcher(RpcClient::new(&url, &[&url]).unwrap());
+        let fetcher = TestFetcher(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap());
 
         let result = find_divergence_point(
             &fetcher,
@@ -852,7 +919,7 @@ mod tests {
         }
 
         let (handle, url) = start_mock_rpc(remote).await;
-        let fetcher = TestFetcher(RpcClient::new(&url, &[&url]).unwrap());
+        let fetcher = TestFetcher(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap());
 
         let result = find_divergence_point(
             &fetcher,
@@ -888,7 +955,8 @@ mod tests {
     #[tokio::test]
     async fn test_block_fetcher_sync_target_already_reached() {
         let (handle, url) = start_block_number_rpc(100).await;
-        let fetcher = Arc::new(TestFetcher(RpcClient::new(&url, &[&url]).unwrap()));
+        let fetcher =
+            Arc::new(TestFetcher(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap()));
 
         let (tx, _rx) = kanal::bounded::<()>(16);
         let config = Arc::new(PipelineConfig { sync_target: Some(5), ..PipelineConfig::default() });
@@ -903,7 +971,8 @@ mod tests {
     #[tokio::test]
     async fn test_block_fetcher_shutdown_immediate() {
         let (handle, url) = start_block_number_rpc(100).await;
-        let fetcher = Arc::new(TestFetcher(RpcClient::new(&url, &[&url]).unwrap()));
+        let fetcher =
+            Arc::new(TestFetcher(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap()));
 
         let (tx, _rx) = kanal::bounded::<()>(16);
         let config = Arc::new(PipelineConfig::default());
@@ -919,7 +988,8 @@ mod tests {
     #[tokio::test]
     async fn test_block_fetcher_invokes_latest_block_number() {
         let (handle, url) = start_block_number_rpc(42).await;
-        let fetcher = Arc::new(TestFetcher(RpcClient::new(&url, &[&url]).unwrap()));
+        let fetcher =
+            Arc::new(TestFetcher(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap()));
 
         let (tx, _rx) = kanal::bounded::<()>(16);
         let config = Arc::new(PipelineConfig {
