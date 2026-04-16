@@ -296,10 +296,10 @@ async fn main() -> Result<()> {
             ..PipelineConfig::default()
         });
         let processor = Arc::new(TraceProcessor);
-        let hooks = Arc::new(TraceHooks {
-            db: Arc::clone(db) as Arc<dyn BlockStore>,
-            response_cache: response_cache.clone(),
-        });
+        let hooks = Arc::new(TraceHooks::new(
+            Arc::clone(db) as Arc<dyn BlockStore>,
+            response_cache.clone(),
+        ));
         let fetcher = Arc::new(TraceFetcher { rpc_client: Arc::clone(&rpc_client) });
         task::spawn({
             let db = Arc::clone(db);
@@ -569,22 +569,28 @@ async fn history_pruner(
 mod tests {
     use super::*;
 
-    /// `--witness-endpoint` / `DEBUG_TRACE_SERVER_WITNESS_ENDPOINT` must accept multiple
-    /// endpoints both via repeated flags and a single comma-separated value (including via the
-    /// env var), so container deployments that can only set env vars are not silently limited
-    /// to one endpoint.
+    /// `--witness-endpoint` accepts repeated flags and CSV values, both on the CLI and via env
+    /// var (clap's `value_delimiter` applies to env-var values too), so container deployments
+    /// configured purely via env are not silently limited to one endpoint.
     #[test]
     fn witness_endpoint_accepts_multiple_forms() {
-        let args = Args::try_parse_from([
-            "debug-trace-server",
-            "--rpc-endpoint",
-            "http://rpc",
-            "--witness-endpoint",
-            "http://a:8545,http://b:8545",
-            "--witness-endpoint",
-            "http://c:8545",
-        ])
-        .unwrap();
-        assert_eq!(args.witness_endpoint, ["http://a:8545", "http://b:8545", "http://c:8545"],);
+        const ENV: &str = "DEBUG_TRACE_SERVER_WITNESS_ENDPOINT";
+        let base = ["debug-trace-server", "--rpc-endpoint", "http://rpc"];
+        let parse = |extra: &[&str]| {
+            Args::try_parse_from(base.iter().chain(extra)).unwrap().witness_endpoint
+        };
+
+        assert_eq!(parse(&["--witness-endpoint", "http://a,http://b"]), ["http://a", "http://b"]);
+        assert_eq!(
+            parse(&["--witness-endpoint", "http://a,http://b", "--witness-endpoint", "http://c"]),
+            ["http://a", "http://b", "http://c"],
+        );
+
+        // SAFETY: edition 2024 requires no concurrent env access; this var is unique to this
+        // binary's clap arg and is unread by any sibling test, so no parallel test can race.
+        unsafe { std::env::set_var(ENV, "http://a,http://b") };
+        let from_env = parse(&[]);
+        unsafe { std::env::remove_var(ENV) };
+        assert_eq!(from_env, ["http://a", "http://b"]);
     }
 }

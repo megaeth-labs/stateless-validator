@@ -5,6 +5,15 @@
 
 use std::sync::Arc;
 
+use crate::witness_size::WitnessSizeBreakdown;
+
+/// Byte-size histogram buckets: 1 KB, 10 KB, 50 KB, 200 KB, 1 MB, 5 MB, 20 MB.
+pub const BYTE_BUCKETS: &[f64] =
+    &[1_024.0, 10_240.0, 51_200.0, 204_800.0, 1_048_576.0, 5_242_880.0, 20_971_520.0];
+
+/// Reorg depth (~ 1–50 blocks).
+pub const REORG_DEPTH_BUCKETS: &[f64] = &[1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0];
+
 /// RPC method identifiers for metrics tracking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcMethod {
@@ -52,13 +61,7 @@ pub trait RpcMetrics: Send + Sync {
     fn on_rpc_retry(&self, _method: RpcMethod) {}
 
     /// Called when witness data is successfully fetched.
-    fn on_witness_fetch(
-        &self,
-        salt_size: usize,
-        kvs_count: usize,
-        salt_kvs_size: usize,
-        mpt_size: usize,
-    );
+    fn on_witness_fetch(&self, breakdown: WitnessSizeBreakdown);
 }
 
 /// Configuration for RPC client behavior.

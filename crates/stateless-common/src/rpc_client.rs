@@ -158,17 +158,11 @@ impl RpcClient {
 
     /// Wraps a single-endpoint RPC call with concurrency limiting and exponential-backoff retry.
     ///
-    /// - Acquires a semaphore permit before each attempt (released during sleep between retries).
-    /// - Retries up to `config.max_retries` times on any error.
-    /// - Backoff doubles each attempt; deterministic jitter adds 25–100 % of `backoff_ms` cycling
-    ///   by `attempt % 4`; the summed sleep is capped at `max_backoff_ms`.
-    /// - Records one final-outcome metric per logical call (`record_rpc` on success or after the
-    ///   last failure); each non-final failure is recorded via `record_rpc_retry`.
+    /// Records one `record_rpc` per logical call (final outcome); each non-final failure is
+    /// recorded via `record_rpc_retry`. The reported duration covers the full call including
+    /// prior failed attempts and backoff sleeps, so retry latency is visible in dashboards.
     ///
-    /// Does **not** apply to `get_witness` — that method manages fallback across providers itself.
-    ///
-    /// Note: the success-path duration measures only the winning attempt, not the sum of
-    /// prior failed attempts and their backoff sleeps.
+    /// Does not apply to `get_witness` — that method falls back across providers instead.
     async fn call<T: Send + 'static>(
         &self,
         method: RpcMethod,
@@ -176,14 +170,15 @@ impl RpcClient {
     ) -> Result<T> {
         let mut backoff_ms = self.config.initial_backoff_ms;
         let max_retries = self.config.max_retries;
+        let start = Instant::now();
 
         for attempt in 0..=max_retries {
-            let _permit = Arc::clone(&self.concurrency)
-                .acquire_owned()
+            let _permit = self
+                .concurrency
+                .acquire()
                 .await
                 .expect("concurrency semaphore closed unexpectedly");
 
-            let start = Instant::now();
             match f().await {
                 Ok(v) => {
                     self.record_rpc(method, true, Some(start.elapsed().as_secs_f64()));
@@ -326,14 +321,14 @@ impl RpcClient {
         let mut last_elapsed: Option<f64> = None;
 
         for (idx, provider) in self.witness_providers.iter().enumerate() {
-            let provider = provider.clone();
-            let _permit = Arc::clone(&self.concurrency)
-                .acquire_owned()
+            let _permit = self
+                .concurrency
+                .acquire()
                 .await
                 .expect("concurrency semaphore closed unexpectedly");
 
             let start = Instant::now();
-            match fetch_witness_raw(&provider, number, hash).await {
+            match fetch_witness_raw(provider, number, hash).await {
                 Ok((salt_witness, mpt_witness)) => {
                     let elapsed = start.elapsed().as_secs_f64();
                     self.record_rpc(RpcMethod::MegaGetBlockWitness, true, Some(elapsed));
@@ -344,9 +339,10 @@ impl RpcClient {
                         "Witness fetched successfully",
                     );
                     if let Some(ref metrics) = self.config.metrics {
-                        let WitnessSizeBreakdown { salt_size, kvs_count, salt_kvs_size, mpt_size } =
-                            WitnessSizeBreakdown::new(&salt_witness, &mpt_witness);
-                        metrics.on_witness_fetch(salt_size, kvs_count, salt_kvs_size, mpt_size);
+                        metrics.on_witness_fetch(WitnessSizeBreakdown::new(
+                            &salt_witness,
+                            &mpt_witness,
+                        ));
                     }
                     return Ok((salt_witness, mpt_witness));
                 }
@@ -383,10 +379,8 @@ impl RpcClient {
         let provider =
             self.report_provider.as_ref().ok_or_else(|| eyre!("Report provider not configured"))?;
         // Write operation: acquire semaphore but no retry.
-        let _permit = Arc::clone(&self.concurrency)
-            .acquire_owned()
-            .await
-            .expect("concurrency semaphore closed unexpectedly");
+        let _permit =
+            self.concurrency.acquire().await.expect("concurrency semaphore closed unexpectedly");
         let result = provider
             .client()
             .request("mega_setValidatedBlocks", (first_block, last_block))

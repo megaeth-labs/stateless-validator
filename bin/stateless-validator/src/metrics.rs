@@ -12,8 +12,8 @@ use eyre::Result;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 pub use stateless_common::{
-    DEFAULT_METRICS_PORT,
-    metrics::{RpcMethod, RpcMetrics},
+    DEFAULT_METRICS_PORT, WitnessSizeBreakdown,
+    metrics::{BYTE_BUCKETS, REORG_DEPTH_BUCKETS, RpcMethod, RpcMetrics},
 };
 use tracing::info;
 
@@ -33,14 +33,8 @@ impl RpcMetrics for ValidatorMetrics {
         on_rpc_retry(method);
     }
 
-    fn on_witness_fetch(
-        &self,
-        salt_size: usize,
-        kvs_count: usize,
-        salt_kvs_size: usize,
-        mpt_size: usize,
-    ) {
-        on_witness_fetch(salt_size, kvs_count, salt_kvs_size, mpt_size);
+    fn on_witness_fetch(&self, breakdown: WitnessSizeBreakdown) {
+        on_witness_fetch(breakdown);
     }
 }
 
@@ -92,19 +86,12 @@ pub mod names {
     metric!(SALT_WITNESS_KVS_SIZE, "salt_witness_kvs_size_bytes");
 }
 
-/// Byte-size histogram buckets: 1 KB, 10 KB, 50 KB, 200 KB, 1 MB, 5 MB, 20 MB.
-const BYTE_BUCKETS: &[f64] =
-    &[1_024.0, 10_240.0, 51_200.0, 204_800.0, 1_048_576.0, 5_242_880.0, 20_971_520.0];
-
 /// State reads/writes per block (~ 10–5000 KV accesses).
 const COUNT_BUCKETS_5K: &[f64] =
     &[1.0, 5.0, 10.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0];
 
 /// SALT witness key count (~ 10–500 keys).
 const COUNT_BUCKETS_500: &[f64] = &[1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0];
-
-/// Reorg depth (~ 1–50 blocks).
-const REORG_DEPTH_BUCKETS: &[f64] = &[1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0];
 
 /// (metric_name, buckets) pairs applied via `set_buckets_for_metric` at startup.
 const BUCKET_SPECS: &[(&str, &[f64])] = &[
@@ -300,9 +287,9 @@ pub fn on_contract_cache_read(hits: u64, misses: u64) {
 }
 
 /// Record witness fetch metrics.
-pub fn on_witness_fetch(salt_size: usize, kvs_count: usize, salt_kvs_size: usize, mpt_size: usize) {
-    histogram!(names::SALT_WITNESS_SIZE).record(salt_size as f64);
-    histogram!(names::SALT_WITNESS_KEYS).record(kvs_count as f64);
-    histogram!(names::SALT_WITNESS_KVS_SIZE).record(salt_kvs_size as f64);
-    histogram!(names::MPT_WITNESS_SIZE).record(mpt_size as f64);
+pub fn on_witness_fetch(b: WitnessSizeBreakdown) {
+    histogram!(names::SALT_WITNESS_SIZE).record(b.salt_size as f64);
+    histogram!(names::SALT_WITNESS_KEYS).record(b.kvs_count as f64);
+    histogram!(names::SALT_WITNESS_KVS_SIZE).record(b.salt_kvs_size as f64);
+    histogram!(names::MPT_WITNESS_SIZE).record(b.mpt_size as f64);
 }

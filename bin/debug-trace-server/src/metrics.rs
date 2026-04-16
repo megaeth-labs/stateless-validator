@@ -11,7 +11,10 @@ use eyre::Result;
 use metrics::{Counter, Gauge, Histogram};
 use metrics_derive::Metrics;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
-pub use stateless_common::DEFAULT_METRICS_PORT;
+pub use stateless_common::{
+    DEFAULT_METRICS_PORT,
+    metrics::{BYTE_BUCKETS, REORG_DEPTH_BUCKETS},
+};
 
 /// Prefix for timed RPC method aliases.
 pub const TIMED_PREFIX: &str = "timed_";
@@ -443,18 +446,11 @@ fn pre_register_all_metrics() {
     let _ = ChainSyncMetrics::create();
 }
 
-/// Byte-size histogram buckets: 1 KB, 10 KB, 50 KB, 200 KB, 1 MB, 5 MB, 20 MB.
-const BYTE_BUCKETS: &[f64] =
-    &[1_024.0, 10_240.0, 51_200.0, 204_800.0, 1_048_576.0, 5_242_880.0, 20_971_520.0];
-
 /// Transaction count per traced block (~ 1–500).
 const TX_COUNT_BUCKETS: &[f64] = &[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0, 500.0];
 
 /// Block distance from chain tip (~ 0–1000 blocks).
 const BLOCK_DISTANCE_BUCKETS: &[f64] = &[0.0, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0];
-
-/// Reorg depth (~ 1–50 blocks).
-const REORG_DEPTH_BUCKETS: &[f64] = &[1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0];
 
 /// (metric_name, buckets) pairs applied via `set_buckets_for_metric` at startup.
 const BUCKET_SPECS: &[(&str, &[f64])] = &[
