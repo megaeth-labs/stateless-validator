@@ -1009,4 +1009,107 @@ mod tests {
         assert!(result.is_ok());
         handle.stop().unwrap();
     }
+
+    // call() provider-selection tests
+
+    /// Starts a counting mock that serves `eth_blockNumber` with a configurable latest,
+    /// returning an error on the first `fail_first` requests. Exposes the hit counter.
+    async fn start_counting_block_number_rpc(
+        latest: u64,
+        fail_first: usize,
+    ) -> (jsonrpsee::server::ServerHandle, String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use jsonrpsee::{RpcModule, server::ServerBuilder};
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let ctx = (latest, fail_first, hits.clone());
+        let mut module = RpcModule::new(ctx);
+        module
+            .register_method("eth_blockNumber", |_params, ctx, _| {
+                let (latest, fail_first, hits) = ctx;
+                let n = hits.fetch_add(1, Ordering::Relaxed);
+                if n < *fail_first {
+                    Err::<String, _>(jsonrpsee::types::ErrorObjectOwned::owned::<()>(
+                        -32000,
+                        "synthetic failure",
+                        None,
+                    ))
+                } else {
+                    Ok(format!("0x{:x}", *latest))
+                }
+            })
+            .unwrap();
+
+        let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        let handle = server.start(module);
+        (handle, url, hits)
+    }
+
+    /// Asserts that `call()` spreads load across data providers via round-robin.
+    ///
+    /// Starts two healthy mocks, makes 10 calls, and expects both to receive ≥ 3 hits
+    /// (with perfect distribution each should see 5). This proves the counter cycles
+    /// the starting provider instead of always hitting `data_providers[0]`.
+    #[tokio::test]
+    async fn test_call_round_robins_across_healthy_providers() {
+        let (h1, url1, hits1) = start_counting_block_number_rpc(10, 0).await;
+        let (h2, url2, hits2) = start_counting_block_number_rpc(10, 0).await;
+
+        let client = RpcClient::new(&[url1.as_str(), url2.as_str()], &[url1.as_str()]).unwrap();
+        for _ in 0..10 {
+            client.get_latest_block_number().await.unwrap();
+        }
+
+        let h1_count = hits1.load(std::sync::atomic::Ordering::Relaxed);
+        let h2_count = hits2.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(h1_count + h2_count, 10, "all calls should have succeeded");
+        assert!(
+            h1_count >= 3 && h2_count >= 3,
+            "round-robin should distribute load: got {h1_count} / {h2_count}"
+        );
+
+        h1.stop().unwrap();
+        h2.stop().unwrap();
+    }
+
+    /// Asserts that `call()` retries exhaust on a failing provider, then falls
+    /// back to the next provider in round-robin order.
+    ///
+    /// Provider A is configured to fail the first `max_retries + 1` attempts;
+    /// provider B is healthy. Whichever provider is picked first, the call must
+    /// succeed by cycling to the other.
+    #[tokio::test]
+    async fn test_call_falls_back_across_providers_on_exhausted_retries() {
+        let config = RpcClientConfig {
+            max_retries: 1, // 2 attempts per provider (attempt 0 + retry 1)
+            initial_backoff_ms: 1,
+            max_backoff_ms: 2,
+            ..Default::default()
+        };
+        // Server A rejects its first 2 requests (covering both attempts on one provider).
+        let (ha, url_a, hits_a) = start_counting_block_number_rpc(42, 2).await;
+        let (hb, url_b, hits_b) = start_counting_block_number_rpc(42, 0).await;
+
+        let client = RpcClient::new_with_config(
+            &[url_a.as_str(), url_b.as_str()],
+            &[url_a.as_str()],
+            config,
+            None,
+        )
+        .unwrap();
+
+        let latest = client.get_latest_block_number().await.unwrap();
+        assert_eq!(latest, 42, "fallback provider should have returned 42");
+
+        let a = hits_a.load(std::sync::atomic::Ordering::Relaxed);
+        let b = hits_b.load(std::sync::atomic::Ordering::Relaxed);
+        // One provider exhausted retries (2 hits), the other served the final success (≥ 1).
+        assert_eq!(a + b, 3, "expected 2 retries on one + 1 success on the other, got {a}/{b}");
+        assert!(a >= 1 && b >= 1, "both providers should have been tried: got {a}/{b}");
+
+        ha.stop().unwrap();
+        hb.stop().unwrap();
+    }
 }

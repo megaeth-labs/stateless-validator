@@ -350,13 +350,15 @@ pub async fn block_fetcher<F: BlockFetcher>(
 
     let mut next_block: u64 = start_block;
     let mut base_block: u64 = start_block;
-    // `chain_latest_cached = 0` means "unknown, fetch on first iteration". Since `start_block`
-    // is always >= 1 in practice, `next_block > 0` triggers a refresh below.
-    let mut chain_latest_cached: u64 = 0;
+    // `None` = unknown tip, force a refresh. Using `Option` (instead of the sentinel `0`)
+    // makes the `start_block == 0` path correct: we always refresh at least once at startup.
+    let mut chain_latest_cached: Option<u64> = None;
     let mut in_flight: JoinSet<(u64, Result<F::Output>)> = JoinSet::new();
     let mut in_flight_set: HashSet<u64> = HashSet::new();
     let mut sent: HashSet<u64> = HashSet::new();
-    let mut failed: Vec<u64> = Vec::new();
+    // `HashSet` (not `Vec`) for O(1) `contains` in the gap-recovery loop below.
+    // Pop order doesn't matter — blocks are reordered downstream in `chain_advancer`.
+    let mut failed: HashSet<u64> = HashSet::new();
     let mut block_error_counts: HashMap<u64, usize> = HashMap::new();
     let mut backoff = Duration::from_secs(1);
 
@@ -375,10 +377,10 @@ pub async fn block_fetcher<F: BlockFetcher>(
 
         // Refresh chain tip only when we've exhausted the previously-known window.
         // With streaming, polling every iteration would flood `eth_blockNumber`.
-        if next_block > chain_latest_cached {
+        if chain_latest_cached.is_none_or(|cached| next_block > cached) {
             match fetcher.latest_block_number().await {
                 Ok(n) => {
-                    chain_latest_cached = n;
+                    chain_latest_cached = Some(n);
                     backoff = Duration::from_secs(1);
                 }
                 Err(e) => {
@@ -392,16 +394,19 @@ pub async fn block_fetcher<F: BlockFetcher>(
                 }
             }
         }
+        // Safety: the block above sets `chain_latest_cached` to `Some` or `continue`s.
+        let chain_latest = chain_latest_cached.expect("chain_latest_cached set above");
 
         // Priority 1: re-enqueue failed blocks before pulling new ones.
-        while in_flight.len() < max_in_flight &&
-            let Some(bn) = failed.pop()
-        {
+        while in_flight.len() < max_in_flight {
+            // Pop any element from `failed` (order doesn't matter — advancer reorders).
+            let Some(&bn) = failed.iter().next() else { break };
+            failed.remove(&bn);
             spawn_fetch(&mut in_flight, &mut in_flight_set, &fetcher, bn);
         }
 
         // Priority 2: enqueue fresh blocks within the window.
-        while in_flight.len() < max_in_flight && next_block <= chain_latest_cached {
+        while in_flight.len() < max_in_flight && next_block <= chain_latest {
             if let Some(target) = config.sync_target &&
                 next_block > target
             {
@@ -450,7 +455,7 @@ pub async fn block_fetcher<F: BlockFetcher>(
                 } else if *count > 5 {
                     error!(block_number = bn, attempt = *count, error = %e, "[Fetcher] Block fetch error (repeated)");
                 }
-                failed.push(bn);
+                failed.insert(bn);
             }
             Some(Err(join_err)) => {
                 // Task panicked (extremely rare for async I/O). The block is not in
@@ -470,9 +475,10 @@ pub async fn block_fetcher<F: BlockFetcher>(
 
         // Gap recovery: any block in [base_block, next_block) not in sent, not in flight,
         // and not already queued for retry needs to be re-enqueued. This covers task panics.
+        // All three membership checks are O(1) since all three collections are HashSets.
         for bn in base_block..next_block {
             if !sent.contains(&bn) && !in_flight_set.contains(&bn) && !failed.contains(&bn) {
-                failed.push(bn);
+                failed.insert(bn);
             }
         }
     }
