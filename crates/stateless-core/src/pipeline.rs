@@ -19,12 +19,12 @@ use std::{
     fmt::Display,
     future::Future,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use alloy_primitives::{BlockHash, BlockNumber};
 use eyre::{Result, anyhow};
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{Id, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, instrument, warn};
 
@@ -353,8 +353,16 @@ pub async fn block_fetcher<F: BlockFetcher>(
     // `None` = unknown tip, force a refresh. Using `Option` (instead of the sentinel `0`)
     // makes the `start_block == 0` path correct: we always refresh at least once at startup.
     let mut chain_latest_cached: Option<u64> = None;
+    // Rate-limits `latest_block_number()` refreshes. Initialized so the first refresh fires
+    // immediately. Without this, a near-tip validator with failing retries (in_flight non-empty
+    // bypasses the poll_interval sleep below) would call `eth_blockNumber` once per task
+    // completion — 10+ RPS under retry-heavy conditions.
+    let mut last_refresh = Instant::now() - config.poll_interval;
     let mut in_flight: JoinSet<(u64, Result<F::Output>)> = JoinSet::new();
     let mut in_flight_set: HashSet<u64> = HashSet::new();
+    // Maps spawned task id to block number so that `JoinError` (task panic) can identify
+    // which block panicked — `JoinError` carries no access to the task's return value.
+    let mut task_to_block: HashMap<Id, u64> = HashMap::new();
     let mut sent: HashSet<u64> = HashSet::new();
     // `HashSet` (not `Vec`) for O(1) `contains` in the gap-recovery loop below.
     // Pop order doesn't matter — blocks are reordered downstream in `chain_advancer`.
@@ -375,12 +383,17 @@ pub async fn block_fetcher<F: BlockFetcher>(
             return Ok(());
         }
 
-        // Refresh chain tip only when we've exhausted the previously-known window.
-        // With streaming, polling every iteration would flood `eth_blockNumber`.
-        if chain_latest_cached.is_none_or(|cached| next_block > cached) {
+        // Refresh chain tip only when (a) we've exhausted the previously-known window AND
+        // (b) at least `poll_interval` has elapsed since the last refresh. The position gate
+        // alone isn't enough: at tip with failing retries, `next_block > cached` stays true
+        // every iteration because a successful refresh returns the same cached value, and
+        // the `poll_interval` sleep below is skipped whenever `in_flight` is non-empty.
+        let window_exhausted = chain_latest_cached.is_none_or(|cached| next_block > cached);
+        if window_exhausted && last_refresh.elapsed() >= config.poll_interval {
             match fetcher.latest_block_number().await {
                 Ok(n) => {
                     chain_latest_cached = Some(n);
+                    last_refresh = Instant::now();
                     backoff = Duration::from_secs(1);
                 }
                 Err(e) => {
@@ -394,15 +407,22 @@ pub async fn block_fetcher<F: BlockFetcher>(
                 }
             }
         }
-        // Safety: the block above sets `chain_latest_cached` to `Some` or `continue`s.
-        let chain_latest = chain_latest_cached.expect("chain_latest_cached set above");
+        // If we've never successfully fetched the tip yet, sleep and retry — can't proceed
+        // without a cached value.
+        let Some(chain_latest) = chain_latest_cached else {
+            tokio::select! {
+                _ = tokio::time::sleep(config.poll_interval) => {}
+                _ = shutdown.cancelled() => return Ok(()),
+            }
+            continue;
+        };
 
         // Priority 1: re-enqueue failed blocks before pulling new ones.
         while in_flight.len() < max_in_flight {
             // Pop any element from `failed` (order doesn't matter — advancer reorders).
             let Some(&bn) = failed.iter().next() else { break };
             failed.remove(&bn);
-            spawn_fetch(&mut in_flight, &mut in_flight_set, &fetcher, bn);
+            spawn_fetch(&mut in_flight, &mut in_flight_set, &mut task_to_block, &fetcher, bn);
         }
 
         // Priority 2: enqueue fresh blocks within the window.
@@ -412,7 +432,13 @@ pub async fn block_fetcher<F: BlockFetcher>(
             {
                 break;
             }
-            spawn_fetch(&mut in_flight, &mut in_flight_set, &fetcher, next_block);
+            spawn_fetch(
+                &mut in_flight,
+                &mut in_flight_set,
+                &mut task_to_block,
+                &fetcher,
+                next_block,
+            );
             next_block += 1;
         }
 
@@ -426,14 +452,16 @@ pub async fn block_fetcher<F: BlockFetcher>(
         }
 
         // Wait for either a completion or shutdown. `in_flight` is dropped on shutdown,
-        // which aborts any outstanding fetch tasks.
+        // which aborts any outstanding fetch tasks. Using `join_next_with_id` so that a
+        // panicked task's `JoinError` can be mapped back to a block number.
         let joined = tokio::select! {
-            r = in_flight.join_next() => r,
+            r = in_flight.join_next_with_id() => r,
             _ = shutdown.cancelled() => return Ok(()),
         };
 
         match joined {
-            Some(Ok((bn, Ok(item)))) => {
+            Some(Ok((id, (bn, Ok(item))))) => {
+                task_to_block.remove(&id);
                 in_flight_set.remove(&bn);
                 block_error_counts.remove(&bn);
                 if tx.send(item).await.is_err() {
@@ -443,7 +471,8 @@ pub async fn block_fetcher<F: BlockFetcher>(
                 debug!(block_number = bn, "[Fetcher] Block sent to pipeline");
                 sent.insert(bn);
             }
-            Some(Ok((bn, Err(e)))) => {
+            Some(Ok((id, (bn, Err(e))))) => {
+                task_to_block.remove(&id);
                 in_flight_set.remove(&bn);
                 let count = block_error_counts.entry(bn).or_insert(0);
                 *count += 1;
@@ -458,10 +487,18 @@ pub async fn block_fetcher<F: BlockFetcher>(
                 failed.insert(bn);
             }
             Some(Err(join_err)) => {
-                // Task panicked (extremely rare for async I/O). The block is not in
-                // `sent`, not in `failed`, and removed from `in_flight_set` by JoinSet.
-                // Gap-detection below re-enqueues it.
-                warn!(error = %join_err, "[Fetcher] Fetch task panicked");
+                // Task panicked (extremely rare for async I/O). Recover the block number
+                // from `task_to_block` and re-enqueue it; otherwise a panicked fetch would
+                // silently stall `base_block` forever (gap recovery can't see it because
+                // `in_flight_set` still contains it).
+                let id = join_err.id();
+                if let Some(bn) = task_to_block.remove(&id) {
+                    in_flight_set.remove(&bn);
+                    error!(block_number = bn, error = %join_err, "[Fetcher] Fetch task panicked, re-enqueueing");
+                    failed.insert(bn);
+                } else {
+                    error!(error = %join_err, "[Fetcher] Fetch task panicked with unknown task id");
+                }
             }
             None => {
                 // JoinSet drained unexpectedly — tolerable; loop will refill.
@@ -474,7 +511,8 @@ pub async fn block_fetcher<F: BlockFetcher>(
         }
 
         // Gap recovery: any block in [base_block, next_block) not in sent, not in flight,
-        // and not already queued for retry needs to be re-enqueued. This covers task panics.
+        // and not already queued for retry needs to be re-enqueued. Defense in depth against
+        // any state-tracking bug (panic recovery above is the primary path).
         // All three membership checks are O(1) since all three collections are HashSets.
         for bn in base_block..next_block {
             if !sent.contains(&bn) && !in_flight_set.contains(&bn) && !failed.contains(&bn) {
@@ -484,17 +522,22 @@ pub async fn block_fetcher<F: BlockFetcher>(
     }
 }
 
-/// Spawns a single fetch task into the JoinSet and records it in `in_flight_set`.
+/// Spawns a single fetch task into the JoinSet and records it in `in_flight_set` +
+/// `task_to_block`. The `task_to_block` entry is what lets us recover from task panics:
+/// `JoinError` only carries a task id, not the task's return value.
 fn spawn_fetch<F: BlockFetcher>(
     set: &mut JoinSet<(u64, Result<F::Output>)>,
     in_flight_set: &mut HashSet<u64>,
+    task_to_block: &mut HashMap<Id, u64>,
     fetcher: &Arc<F>,
     block_number: u64,
 ) {
     let fetcher = fetcher.clone();
     let span = info_span!("fetch_block", block_number);
-    set.spawn(async move { (block_number, fetcher.fetch(block_number).await) }.instrument(span));
+    let handle = set
+        .spawn(async move { (block_number, fetcher.fetch(block_number).await) }.instrument(span));
     in_flight_set.insert(block_number);
+    task_to_block.insert(handle.id(), block_number);
 }
 
 /// Errors from [`find_divergence_point`], classified for the pipeline.

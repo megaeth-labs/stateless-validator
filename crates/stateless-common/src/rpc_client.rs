@@ -51,8 +51,8 @@ use crate::{
 /// Boxed, `'static` future returned by `call()` closures.
 type BoxFuture<T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'static>>;
 
-/// Request keys for fetching block witness data.
-/// Format compatible with both upstream witness endpoint and worker-kv-demo Cloudflare RPC.
+/// Request parameters for `mega_getBlockWitness`, sent to every provider in
+/// [`RpcClient::witness_providers`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WitnessRequestKeys {
@@ -378,8 +378,11 @@ impl RpcClient {
     /// Tries each configured witness provider in order; returns on the first success.
     /// If all providers fail, returns the error from the last provider attempted.
     pub async fn get_witness(&self, number: u64, hash: B256) -> Result<(SaltWitness, MptWitness)> {
+        // Hoisted above the provider loop so the recorded duration covers the full
+        // end-to-end fetch including any failed fallback attempts — matches `call()`'s
+        // documented "full call including prior failed attempts" semantics.
+        let start = Instant::now();
         let mut last_err = eyre!("no witness providers configured");
-        let mut last_elapsed: Option<f64> = None;
 
         for (idx, provider) in self.witness_providers.iter().enumerate() {
             let _permit = self
@@ -388,11 +391,13 @@ impl RpcClient {
                 .await
                 .expect("witness concurrency semaphore closed unexpectedly");
 
-            let start = Instant::now();
             match fetch_witness_raw(provider, number, hash).await {
                 Ok((salt_witness, mpt_witness)) => {
-                    let elapsed = start.elapsed().as_secs_f64();
-                    self.record_rpc(RpcMethod::MegaGetBlockWitness, true, Some(elapsed));
+                    self.record_rpc(
+                        RpcMethod::MegaGetBlockWitness,
+                        true,
+                        Some(start.elapsed().as_secs_f64()),
+                    );
                     trace!(
                         block_number = number,
                         %hash,
@@ -408,7 +413,6 @@ impl RpcClient {
                     return Ok((salt_witness, mpt_witness));
                 }
                 Err(e) => {
-                    last_elapsed = Some(start.elapsed().as_secs_f64());
                     if idx + 1 < self.witness_providers.len() {
                         self.record_rpc_retry(RpcMethod::MegaGetBlockWitness);
                         tracing::warn!(
@@ -433,7 +437,7 @@ impl RpcClient {
         }
 
         // All providers exhausted: record the single final failure outcome.
-        self.record_rpc(RpcMethod::MegaGetBlockWitness, false, last_elapsed);
+        self.record_rpc(RpcMethod::MegaGetBlockWitness, false, Some(start.elapsed().as_secs_f64()));
         Err(last_err)
     }
 

@@ -577,7 +577,12 @@ mod tests {
     fn validate_block_mainnet_fixtures() {
         let fixtures = TestFixtures::mainnet();
         let chain_spec = ChainSpec::from_genesis(fixtures.load_genesis().unwrap());
-        for (number, hash) in fixtures.paired_blocks() {
+        let paired = fixtures.paired_blocks();
+        assert!(
+            !paired.is_empty(),
+            "no paired mainnet fixtures (blocks with both SALT and MPT witnesses) found in test_data/mainnet"
+        );
+        for (number, hash) in paired {
             let (mpt, _): (MptWitness, usize) = bincode::serde::decode_from_slice(
                 &fixtures.mpt_witness_bytes[&hash],
                 bincode::config::legacy(),
