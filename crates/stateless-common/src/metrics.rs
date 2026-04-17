@@ -108,6 +108,11 @@ impl std::fmt::Debug for RpcClientConfig {
         f.debug_struct("RpcClientConfig")
             .field("skip_block_verification", &self.skip_block_verification)
             .field("metrics", &self.metrics.is_some())
+            .field("data_max_concurrent_requests", &self.data_max_concurrent_requests)
+            .field("witness_max_concurrent_requests", &self.witness_max_concurrent_requests)
+            .field("max_retries", &self.max_retries)
+            .field("initial_backoff_ms", &self.initial_backoff_ms)
+            .field("max_backoff_ms", &self.max_backoff_ms)
             .finish()
     }
 }
