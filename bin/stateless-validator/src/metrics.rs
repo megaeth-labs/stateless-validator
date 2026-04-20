@@ -178,6 +178,7 @@ fn init_rpc_method_counters() {
         RpcMethod::EthGetBlockByNumber,
         RpcMethod::EthBlockNumber,
         RpcMethod::EthGetHeader,
+        RpcMethod::EthGetTransactionByHash,
         RpcMethod::MegaGetBlockWitness,
         RpcMethod::MegaSetValidatedBlocks,
     ];
