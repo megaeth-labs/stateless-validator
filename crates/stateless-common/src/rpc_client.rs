@@ -508,8 +508,6 @@ impl RpcClient {
     }
 }
 
-// ── Free functions used by the `call()` closures ──────────────────────────────
-
 /// Fetches a block by ID without integrity verification.
 async fn do_get_block_unchecked(
     provider: &RootProvider<Optimism>,
@@ -996,8 +994,6 @@ mod tests {
         assert!(block_fetcher(h.fetcher, h.tx, 100, h.config, h.shutdown).await.is_ok());
         h.handle.stop().unwrap();
     }
-
-    // ── call() provider-selection tests ─────────────────────────────────────
 
     /// Asserts that `call()` spreads load across data providers via round-robin.
     ///
