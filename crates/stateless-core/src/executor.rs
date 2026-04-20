@@ -575,28 +575,25 @@ mod tests {
 
     #[test]
     fn validate_block_mainnet_fixtures() {
-        let fixtures = TestFixtures::mainnet();
-        let chain_spec = ChainSpec::from_genesis(fixtures.load_genesis().unwrap());
-        let paired = fixtures.paired_blocks();
-        assert!(
-            !paired.is_empty(),
-            "no paired mainnet fixtures (blocks with both SALT and MPT witnesses) found in test_data/mainnet"
-        );
+        let fx = TestFixtures::mainnet();
+        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
+        let paired = fx.paired_blocks();
+        assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
         for (number, hash) in paired {
-            let (mpt, _): (MptWitness, usize) = bincode::serde::decode_from_slice(
-                &fixtures.mpt_witness_bytes[&hash],
+            let (mpt, _): (MptWitness, _) = bincode::serde::decode_from_slice(
+                &fx.mpt_witness_bytes[&hash],
                 bincode::config::legacy(),
             )
             .unwrap_or_else(|e| panic!("decode MptWitness for {hash}: {e}"));
             validate_block(
                 &chain_spec,
-                &fixtures.blocks[&hash],
-                fixtures.salt_witnesses[&hash].clone(),
+                &fx.blocks[&hash],
+                fx.salt_witnesses[&hash].clone(),
                 mpt,
-                &fixtures.contracts,
+                &fx.contracts,
                 None,
             )
-            .unwrap_or_else(|e| panic!("validate_block failed for block {number} ({hash}): {e:?}"));
+            .unwrap_or_else(|e| panic!("validate_block failed for {number} ({hash}): {e:?}"));
         }
     }
 }

@@ -708,9 +708,21 @@ fn verify_block_integrity(block: &Block<Transaction>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc, time::Duration};
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
-    use alloy_primitives::{B256, BlockHash};
+    use alloy_primitives::BlockHash;
+    use jsonrpsee::{
+        RpcModule,
+        server::{ServerBuilder, ServerHandle},
+        types::ErrorObjectOwned,
+    };
     use stateless_core::{
         PipelineConfig, block_fetcher, db::BlockMeta, find_divergence_point, pipeline::BlockFetcher,
     };
@@ -718,14 +730,16 @@ mod tests {
 
     use super::*;
 
+    const LOCALHOST_A: &str = "http://localhost:8545";
+    const LOCALHOST_B: &str = "http://localhost:8546";
+
     /// Test wrapper that implements BlockFetcher by delegating to RpcClient.
     struct TestFetcher(RpcClient);
 
     impl BlockFetcher for TestFetcher {
         type Output = ();
-
         async fn fetch(&self, _: u64) -> eyre::Result<()> {
-            unimplemented!("not used in these tests")
+            unimplemented!("not used")
         }
         async fn latest_block_number(&self) -> eyre::Result<u64> {
             self.0.get_latest_block_number().await
@@ -734,48 +748,154 @@ mod tests {
             self.0.get_block_hash(n).await
         }
         async fn latest_block_meta(&self) -> eyre::Result<BlockMeta> {
-            unimplemented!("not used in these tests")
+            unimplemented!("not used")
         }
     }
 
-    // RpcClient unit tests
+    fn client_at(url: &str) -> RpcClient {
+        RpcClient::new(&[url], &[url]).unwrap()
+    }
+
+    fn fetcher_at(url: &str) -> Arc<TestFetcher> {
+        Arc::new(TestFetcher(client_at(url)))
+    }
+
+    fn err_obj(msg: &'static str) -> ErrorObjectOwned {
+        ErrorObjectOwned::owned::<()>(-32000, msg, None)
+    }
+
+    fn parse_hex_u64(s: &str) -> u64 {
+        u64::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16).unwrap()
+    }
+
+    /// Minimal valid [`Header`] with `hash`/`number` populated; all other fields default.
+    fn header_stub(number: u64, hash: BlockHash) -> Header {
+        Header {
+            hash,
+            inner: alloy_consensus::Header { number, ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    /// Starts a jsonrpsee server bound to a random port and registers methods via `register`.
+    async fn serve<Ctx: Send + Sync + 'static>(
+        ctx: Ctx,
+        register: impl FnOnce(&mut RpcModule<Ctx>),
+    ) -> (ServerHandle, String) {
+        let mut module = RpcModule::new(ctx);
+        register(&mut module);
+        let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        (server.start(module), url)
+    }
+
+    /// Serves `eth_getHeaderByNumber` with headers derived from `hashes`.
+    async fn start_mock_rpc(hashes: HashMap<u64, BlockHash>) -> (ServerHandle, String) {
+        serve(hashes, |m| {
+            m.register_method("eth_getHeaderByNumber", |params, ctx, _| {
+                let (hex,): (String,) = params.parse().unwrap();
+                let n = parse_hex_u64(&hex);
+                Ok::<_, ErrorObjectOwned>(header_stub(n, ctx.get(&n).copied().unwrap_or_default()))
+            })
+            .unwrap();
+        })
+        .await
+    }
+
+    /// Serves `eth_blockNumber` returning `latest`; fails the first `fail_first` calls.
+    /// Returns the hit counter so tests can inspect per-endpoint call counts.
+    async fn start_counting_block_number_rpc(
+        latest: u64,
+        fail_first: usize,
+    ) -> (ServerHandle, String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (handle, url) = serve((latest, fail_first, hits.clone()), |m| {
+            m.register_method("eth_blockNumber", |_p, (latest, fail_first, hits), _| {
+                if hits.fetch_add(1, Ordering::Relaxed) < *fail_first {
+                    Err::<String, _>(err_obj("synthetic failure"))
+                } else {
+                    Ok(format!("0x{:x}", *latest))
+                }
+            })
+            .unwrap();
+        })
+        .await;
+        (handle, url, hits)
+    }
+
+    /// Shortcut for tests that don't care about per-endpoint hit counts.
+    async fn start_block_number_rpc(latest: u64) -> (ServerHandle, String) {
+        let (h, u, _) = start_counting_block_number_rpc(latest, 0).await;
+        (h, u)
+    }
+
+    /// Builds paired local/remote hash maps that agree on `earliest..=diverge_at` and diverge
+    /// on `(diverge_at+1)..=tip`.
+    fn make_divergence_chains(
+        earliest: u64,
+        tip: u64,
+        diverge_at: u64,
+    ) -> (HashMap<u64, BlockHash>, HashMap<u64, BlockHash>) {
+        let mut local = HashMap::new();
+        let mut remote = HashMap::new();
+        for n in earliest..=tip {
+            local.insert(n, BlockHash::from([n as u8; 32]));
+            let remote_hash = if n <= diverge_at { [n as u8; 32] } else { [(n + 128) as u8; 32] };
+            remote.insert(n, BlockHash::from(remote_hash));
+        }
+        (local, remote)
+    }
+
+    /// Runs `find_divergence_point` against a mock server and asserts the expected split.
+    async fn assert_divergence(earliest: u64, tip: u64, diverge_at: u64, expected: u64) {
+        let (local, remote) = make_divergence_chains(earliest, tip, diverge_at);
+        let (handle, url) = start_mock_rpc(remote).await;
+        let fetcher = TestFetcher(client_at(&url));
+        let result = find_divergence_point(
+            &fetcher,
+            &|n| Ok(local.get(&n).copied()),
+            &|| Ok(Some((earliest, *local.get(&earliest).unwrap()))),
+            tip,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, expected);
+        handle.stop().unwrap();
+    }
 
     #[test]
     fn test_new_validates_urls_and_counts_providers() {
-        assert!(RpcClient::new(&["not a url"], &["http://localhost:8545"]).is_err());
-        assert!(RpcClient::new(&["http://localhost:8545"], &["not a url"]).is_err());
-        let err = RpcClient::new(&[], &["http://localhost:8545"]).unwrap_err().to_string();
-        assert!(err.contains("At least one data API"));
-        let err = RpcClient::new(&["http://localhost:8545"], &[]).unwrap_err().to_string();
-        assert!(err.contains("At least one witness API"));
+        assert!(RpcClient::new(&["not a url"], &[LOCALHOST_A]).is_err());
+        assert!(RpcClient::new(&[LOCALHOST_A], &["not a url"]).is_err());
+        assert!(
+            RpcClient::new(&[], &[LOCALHOST_A])
+                .unwrap_err()
+                .to_string()
+                .contains("At least one data API")
+        );
+        assert!(
+            RpcClient::new(&[LOCALHOST_A], &[])
+                .unwrap_err()
+                .to_string()
+                .contains("At least one witness API")
+        );
 
-        for endpoints in [
-            &["http://localhost:8546"][..],
-            &["http://localhost:8546", "http://localhost:8547", "http://localhost:8548"],
-        ] {
-            let client = RpcClient::new(&["http://localhost:8545"], endpoints).unwrap();
-            assert_eq!(client.witness_provider_count(), endpoints.len());
-        }
-
-        for endpoints in [
-            &["http://localhost:8545"][..],
-            &["http://localhost:8545", "http://localhost:8546", "http://localhost:8547"],
-        ] {
-            let client = RpcClient::new(endpoints, &["http://localhost:8546"]).unwrap();
-            assert_eq!(client.data_provider_count(), endpoints.len());
+        for endpoints in [&[LOCALHOST_B][..], &[LOCALHOST_B, "http://localhost:8547"]] {
+            assert_eq!(
+                RpcClient::new(&[LOCALHOST_A], endpoints).unwrap().witness_provider_count(),
+                endpoints.len()
+            );
+            assert_eq!(
+                RpcClient::new(endpoints, &[LOCALHOST_A]).unwrap().data_provider_count(),
+                endpoints.len()
+            );
         }
     }
 
     #[test]
     fn test_config_propagates_to_client() {
         let make = |config| {
-            RpcClient::new_with_config(
-                &["http://localhost:8545"],
-                &["http://localhost:8546"],
-                config,
-                None,
-            )
-            .unwrap()
+            RpcClient::new_with_config(&[LOCALHOST_A], &[LOCALHOST_B], config, None).unwrap()
         };
         assert!(!make(RpcClientConfig::validator()).skip_block_verification());
         assert!(make(RpcClientConfig::trace_server()).skip_block_verification());
@@ -788,142 +908,26 @@ mod tests {
         assert_eq!(client.witness_concurrency.available_permits(), 2);
     }
 
-    // Mock RPC helpers
-
-    /// Starts a minimal mock RPC server that responds to `eth_getHeaderByNumber`
-    /// with headers whose hash is derived from `remote_hashes`.
-    async fn start_mock_rpc(
-        remote_hashes: HashMap<u64, BlockHash>,
-    ) -> (jsonrpsee::server::ServerHandle, String) {
-        use jsonrpsee::{RpcModule, server::ServerBuilder};
-
-        let mut module = RpcModule::new(remote_hashes);
-        module
-            .register_method("eth_getHeaderByNumber", |params, ctx, _| {
-                let (hex_number,): (String,) = params.parse().unwrap();
-                let block_number =
-                    u64::from_str_radix(hex_number.strip_prefix("0x").unwrap_or(&hex_number), 16)
-                        .unwrap();
-                let hash = ctx.get(&block_number).copied().unwrap_or_default();
-                Ok::<serde_json::Value, jsonrpsee::types::ErrorObjectOwned>(serde_json::json!({
-                    "hash": hash,
-                    "number": format!("0x{block_number:x}"),
-                    "parentHash": B256::ZERO,
-                    "timestamp": "0x0",
-                    "stateRoot": B256::ZERO,
-                    "transactionsRoot": B256::ZERO,
-                    "receiptsRoot": B256::ZERO,
-                    "logsBloom": alloy_primitives::Bloom::ZERO,
-                    "gasUsed": "0x0",
-                    "gasLimit": "0x0",
-                    "mixHash": B256::ZERO,
-                    "nonce": "0x0000000000000000",
-                    "extraData": "0x",
-                    "difficulty": "0x0",
-                    "sha3Uncles": B256::ZERO,
-                    "miner": alloy_primitives::Address::ZERO,
-                    "baseFeePerGas": "0x0"
-                }))
-            })
-            .unwrap();
-
-        let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", server.local_addr().unwrap());
-        let handle = server.start(module);
-        (handle, url)
-    }
-
-    /// Helper to create local and remote hash maps for divergence tests.
-    fn make_divergence_chains(
-        earliest: u64,
-        tip: u64,
-        diverge_at: u64,
-    ) -> (HashMap<u64, BlockHash>, HashMap<u64, BlockHash>) {
-        let mut local = HashMap::new();
-        let mut remote = HashMap::new();
-        for n in earliest..=tip {
-            if n <= diverge_at {
-                let hash = BlockHash::from([n as u8; 32]);
-                local.insert(n, hash);
-                remote.insert(n, hash);
-            } else {
-                local.insert(n, BlockHash::from([n as u8; 32]));
-                remote.insert(n, BlockHash::from([(n + 128) as u8; 32]));
-            }
-        }
-        (local, remote)
-    }
-
-    // find_divergence_point tests
-
     #[tokio::test]
     async fn test_find_divergence_single_block_reorg() {
-        let (local, remote) = make_divergence_chains(1, 10, 9);
-        let (handle, url) = start_mock_rpc(remote).await;
-        let fetcher = TestFetcher(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap());
-
-        let result = find_divergence_point(
-            &fetcher,
-            &|n| Ok(local.get(&n).copied()),
-            &|| Ok(Some((1, *local.get(&1).unwrap()))),
-            10,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result, 9);
-        handle.stop().unwrap();
+        assert_divergence(1, 10, 9, 9).await;
     }
 
     #[tokio::test]
     async fn test_find_divergence_multi_block_reorg() {
-        let (local, remote) = make_divergence_chains(1, 10, 5);
-        let (handle, url) = start_mock_rpc(remote).await;
-        let fetcher = TestFetcher(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap());
-
-        let result = find_divergence_point(
-            &fetcher,
-            &|n| Ok(local.get(&n).copied()),
-            &|| Ok(Some((1, *local.get(&1).unwrap()))),
-            10,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result, 5);
-        handle.stop().unwrap();
+        assert_divergence(1, 10, 5, 5).await;
     }
 
     #[tokio::test]
     async fn test_find_divergence_to_earliest() {
-        let (local, remote) = make_divergence_chains(5, 10, 5);
-        let (handle, url) = start_mock_rpc(remote).await;
-        let fetcher = TestFetcher(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap());
-
-        let result = find_divergence_point(
-            &fetcher,
-            &|n| Ok(local.get(&n).copied()),
-            &|| Ok(Some((5, *local.get(&5).unwrap()))),
-            10,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(result, 5);
-        handle.stop().unwrap();
+        assert_divergence(5, 10, 5, 5).await;
     }
 
     #[tokio::test]
     async fn test_find_divergence_catastrophic_reorg() {
-        let mut local = HashMap::new();
-        let mut remote = HashMap::new();
-        for n in 1..=5 {
-            local.insert(n, BlockHash::from([n as u8; 32]));
-            remote.insert(n, BlockHash::from([(n + 128) as u8; 32]));
-        }
-
+        let (local, remote) = make_divergence_chains(1, 5, 0); // no agreement at all
         let (handle, url) = start_mock_rpc(remote).await;
-        let fetcher = TestFetcher(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap());
+        let fetcher = TestFetcher(client_at(&url));
 
         let result = find_divergence_point(
             &fetcher,
@@ -933,129 +937,72 @@ mod tests {
         )
         .await;
 
-        assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Catastrophic reorg"));
         handle.stop().unwrap();
     }
 
-    // block_fetcher tests
+    /// Holds references that must outlive the fetcher under test (server handle, rx).
+    struct FetcherHarness {
+        handle: ServerHandle,
+        fetcher: Arc<TestFetcher>,
+        tx: kanal::Sender<()>,
+        _rx: kanal::Receiver<()>,
+        config: Arc<PipelineConfig>,
+        shutdown: CancellationToken,
+    }
 
-    async fn start_block_number_rpc(latest: u64) -> (jsonrpsee::server::ServerHandle, String) {
-        use jsonrpsee::{RpcModule, server::ServerBuilder};
-
-        let mut module = RpcModule::new(latest);
-        module
-            .register_method("eth_blockNumber", |_params, ctx, _| {
-                Ok::<String, jsonrpsee::types::ErrorObjectOwned>(format!("0x{:x}", *ctx))
-            })
-            .unwrap();
-
-        let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", server.local_addr().unwrap());
-        let handle = server.start(module);
-        (handle, url)
+    /// Common setup for block_fetcher tests. `config_fn` mutates the default `PipelineConfig`.
+    async fn fetcher_harness(
+        latest: u64,
+        config_fn: impl FnOnce(&mut PipelineConfig),
+    ) -> FetcherHarness {
+        let (handle, url) = start_block_number_rpc(latest).await;
+        let (tx, _rx) = kanal::bounded::<()>(16);
+        let mut config = PipelineConfig::default();
+        config_fn(&mut config);
+        FetcherHarness {
+            handle,
+            fetcher: fetcher_at(&url),
+            tx,
+            _rx,
+            config: Arc::new(config),
+            shutdown: CancellationToken::new(),
+        }
     }
 
     #[tokio::test]
     async fn test_block_fetcher_sync_target_already_reached() {
-        let (handle, url) = start_block_number_rpc(100).await;
-        let fetcher =
-            Arc::new(TestFetcher(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap()));
-
-        let (tx, _rx) = kanal::bounded::<()>(16);
-        let config = Arc::new(PipelineConfig { sync_target: Some(5), ..PipelineConfig::default() });
-        let shutdown = CancellationToken::new();
-
-        let result = block_fetcher(fetcher, tx, 6, config, shutdown).await;
-
-        assert!(result.is_ok());
-        handle.stop().unwrap();
+        let h = fetcher_harness(100, |c| c.sync_target = Some(5)).await;
+        assert!(block_fetcher(h.fetcher, h.tx, 6, h.config, h.shutdown).await.is_ok());
+        h.handle.stop().unwrap();
     }
 
     #[tokio::test]
     async fn test_block_fetcher_shutdown_immediate() {
-        let (handle, url) = start_block_number_rpc(100).await;
-        let fetcher =
-            Arc::new(TestFetcher(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap()));
-
-        let (tx, _rx) = kanal::bounded::<()>(16);
-        let config = Arc::new(PipelineConfig::default());
-        let shutdown = CancellationToken::new();
-        shutdown.cancel();
-
-        let result = block_fetcher(fetcher, tx, 1, config, shutdown).await;
-
-        assert!(result.is_ok());
-        handle.stop().unwrap();
+        let h = fetcher_harness(100, |_| {}).await;
+        h.shutdown.cancel();
+        assert!(block_fetcher(h.fetcher, h.tx, 1, h.config, h.shutdown).await.is_ok());
+        h.handle.stop().unwrap();
     }
 
     #[tokio::test]
     async fn test_block_fetcher_invokes_latest_block_number() {
-        let (handle, url) = start_block_number_rpc(42).await;
-        let fetcher =
-            Arc::new(TestFetcher(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap()));
-
-        let (tx, _rx) = kanal::bounded::<()>(16);
-        let config = Arc::new(PipelineConfig {
-            poll_interval: Duration::from_secs(60),
-            ..PipelineConfig::default()
-        });
-        let shutdown = CancellationToken::new();
-
-        let shutdown_clone = shutdown.clone();
+        let h = fetcher_harness(42, |c| c.poll_interval = Duration::from_secs(60)).await;
+        let canceller = h.shutdown.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
-            shutdown_clone.cancel();
+            canceller.cancel();
         });
-
-        let result = block_fetcher(fetcher, tx, 100, config, shutdown).await;
-
-        assert!(result.is_ok());
-        handle.stop().unwrap();
+        assert!(block_fetcher(h.fetcher, h.tx, 100, h.config, h.shutdown).await.is_ok());
+        h.handle.stop().unwrap();
     }
 
-    // call() provider-selection tests
-
-    /// Starts a counting mock that serves `eth_blockNumber` with a configurable latest,
-    /// returning an error on the first `fail_first` requests. Exposes the hit counter.
-    async fn start_counting_block_number_rpc(
-        latest: u64,
-        fail_first: usize,
-    ) -> (jsonrpsee::server::ServerHandle, String, Arc<std::sync::atomic::AtomicUsize>) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        use jsonrpsee::{RpcModule, server::ServerBuilder};
-
-        let hits = Arc::new(AtomicUsize::new(0));
-        let ctx = (latest, fail_first, hits.clone());
-        let mut module = RpcModule::new(ctx);
-        module
-            .register_method("eth_blockNumber", |_params, ctx, _| {
-                let (latest, fail_first, hits) = ctx;
-                let n = hits.fetch_add(1, Ordering::Relaxed);
-                if n < *fail_first {
-                    Err::<String, _>(jsonrpsee::types::ErrorObjectOwned::owned::<()>(
-                        -32000,
-                        "synthetic failure",
-                        None,
-                    ))
-                } else {
-                    Ok(format!("0x{:x}", *latest))
-                }
-            })
-            .unwrap();
-
-        let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", server.local_addr().unwrap());
-        let handle = server.start(module);
-        (handle, url, hits)
-    }
+    // ── call() provider-selection tests ─────────────────────────────────────
 
     /// Asserts that `call()` spreads load across data providers via round-robin.
     ///
-    /// Starts two healthy mocks, makes 10 calls, and expects both to receive ≥ 3 hits
-    /// (with perfect distribution each should see 5). This proves the counter cycles
-    /// the starting provider instead of always hitting `data_providers[0]`.
+    /// Two healthy mocks, 10 calls, both must receive ≥ 3 hits (perfect distribution = 5/5).
+    /// Proves the counter cycles the starting provider instead of always hitting `[0]`.
     #[tokio::test]
     async fn test_call_round_robins_across_healthy_providers() {
         let (h1, url1, hits1) = start_counting_block_number_rpc(10, 0).await;
@@ -1066,13 +1013,9 @@ mod tests {
             client.get_latest_block_number().await.unwrap();
         }
 
-        let h1_count = hits1.load(std::sync::atomic::Ordering::Relaxed);
-        let h2_count = hits2.load(std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(h1_count + h2_count, 10, "all calls should have succeeded");
-        assert!(
-            h1_count >= 3 && h2_count >= 3,
-            "round-robin should distribute load: got {h1_count} / {h2_count}"
-        );
+        let (a, b) = (hits1.load(Ordering::Relaxed), hits2.load(Ordering::Relaxed));
+        assert_eq!(a + b, 10, "all calls should have succeeded");
+        assert!(a >= 3 && b >= 3, "round-robin should distribute load: got {a}/{b}");
 
         h1.stop().unwrap();
         h2.stop().unwrap();
@@ -1080,19 +1023,19 @@ mod tests {
 
     /// Asserts that `call()` retries exhaust on a failing provider, then falls
     /// back to the next provider in round-robin order.
-    ///
-    /// Provider A is configured to fail the first `max_retries + 1` attempts;
-    /// provider B is healthy. Whichever provider is picked first, the call must
-    /// succeed by cycling to the other.
     #[tokio::test]
     async fn test_call_falls_back_across_providers_on_exhausted_retries() {
+        // Invariant: attempts per provider = max_retries + 1. Here max_retries=1 → 2 attempts
+        // per provider, so `fail_first` must equal 2 to fully exhaust one provider's budget
+        // before fallback. If either number changes, update the other accordingly — the
+        // `a + b == 3` assertion below is 2 failed attempts on one provider + 1 successful
+        // attempt on the other.
         let config = RpcClientConfig {
-            max_retries: 1, // 2 attempts per provider (attempt 0 + retry 1)
+            max_retries: 1,
             initial_backoff_ms: 1,
             max_backoff_ms: 2,
             ..Default::default()
         };
-        // Server A rejects its first 2 requests (covering both attempts on one provider).
         let (ha, url_a, hits_a) = start_counting_block_number_rpc(42, 2).await;
         let (hb, url_b, hits_b) = start_counting_block_number_rpc(42, 0).await;
 
@@ -1104,12 +1047,11 @@ mod tests {
         )
         .unwrap();
 
-        let latest = client.get_latest_block_number().await.unwrap();
-        assert_eq!(latest, 42, "fallback provider should have returned 42");
+        assert_eq!(client.get_latest_block_number().await.unwrap(), 42);
 
-        let a = hits_a.load(std::sync::atomic::Ordering::Relaxed);
-        let b = hits_b.load(std::sync::atomic::Ordering::Relaxed);
-        // One provider exhausted retries (2 hits), the other served the final success (≥ 1).
+        let (a, b) = (hits_a.load(Ordering::Relaxed), hits_b.load(Ordering::Relaxed));
+        // One provider exhausted (max_retries + 1 = 2) attempts, the other served the final
+        // success (≥ 1) → total 3 hits.
         assert_eq!(a + b, 3, "expected 2 retries on one + 1 success on the other, got {a}/{b}");
         assert!(a >= 1 && b >= 1, "both providers should have been tried: got {a}/{b}");
 

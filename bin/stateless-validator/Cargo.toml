@@ -45,12 +45,16 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# misc
 base64.workspace = true
 jsonrpsee.workspace = true
 jsonrpsee-types.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 zstd.workspace = true
+
+# stateless
+stateless-test-utils = { path = "../../crates/stateless-test-utils" }
 
 [features]
 test-bucket-resize = ["salt/test-bucket-resize", "stateless-core/test-bucket-resize"]

@@ -69,3 +69,6 @@ http-body-util.workspace = true
 # HTTP client for integration tests
 reqwest.workspace = true
 tempfile.workspace = true
+
+# stateless
+stateless-test-utils = { path = "../../crates/stateless-test-utils" }

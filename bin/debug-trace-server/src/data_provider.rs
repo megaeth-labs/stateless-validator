@@ -443,8 +443,8 @@ impl DataProvider {
     ///
     /// Routing logic:
     /// - `block > db_max` → Retry with timeout (block is new, witness may be delayed)
-    /// - `block <= db_max` (or no DB) → Single attempt through all configured providers (block is
-    ///   old/pruned, no point waiting for a new witness)
+    /// - `block <= db_max` (or no DB) → Single attempt per provider through all configured witness
+    ///   providers in order (block is old/pruned, no point waiting for a new witness)
     async fn fetch_witness_with_fallback(
         &self,
         block_number: u64,

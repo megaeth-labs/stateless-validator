@@ -589,62 +589,53 @@ async fn history_pruner(
 mod tests {
     use super::*;
 
-    /// Serializes any test that mutates or reads process-wide env (including clap's
-    /// `try_parse_from`, which calls `std::env::var` for every `#[clap(env = ...)]` field).
-    /// Rust 2024's `unsafe { set_var }` precondition is "no other thread touches the environment"
-    /// — process-wide, not per-variable — because glibc/musl/Darwin `setenv` may realloc the
-    /// `environ` array while another thread's `getenv` reads it.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Verifies that an endpoint flag accepts repeated flags, CSV values, and env var —
+    /// ensuring container deployments configured purely via env are not silently limited
+    /// to one endpoint (clap's `value_delimiter` applies to env-var values too).
+    fn assert_endpoint_accepts_multiple_forms(
+        flag: &str,
+        env: &str,
+        base: &[&str],
+        extract: impl Fn(Args) -> Vec<String>,
+    ) {
+        let guard = stateless_test_utils::env::env_lock();
+        let parse =
+            |extra: &[&str]| extract(Args::try_parse_from(base.iter().chain(extra)).unwrap());
 
-    /// `--witness-endpoint` accepts repeated flags and CSV values, both on the CLI and via env
-    /// var (clap's `value_delimiter` applies to env-var values too), so container deployments
-    /// configured purely via env are not silently limited to one endpoint.
-    #[test]
-    fn witness_endpoint_accepts_multiple_forms() {
-        const ENV: &str = "DEBUG_TRACE_SERVER_WITNESS_ENDPOINT";
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let base = ["debug-trace-server", "--rpc-endpoint", "http://rpc"];
-        let parse = |extra: &[&str]| {
-            Args::try_parse_from(base.iter().chain(extra)).unwrap().witness_endpoint
-        };
-
-        assert_eq!(parse(&["--witness-endpoint", "http://a,http://b"]), ["http://a", "http://b"]);
+        assert_eq!(parse(&[flag, "http://a,http://b"]), ["http://a", "http://b"]);
         assert_eq!(
-            parse(&["--witness-endpoint", "http://a,http://b", "--witness-endpoint", "http://c"]),
+            parse(&[flag, "http://a,http://b", flag, "http://c"]),
             ["http://a", "http://b", "http://c"],
         );
 
-        // SAFETY: `ENV_LOCK` serializes this test against every other env-touching test
-        // in this module (including sibling tests whose clap-derived `try_parse_from` calls
-        // `std::env::var`), satisfying Rust 2024's process-wide no-concurrent-env-access rule.
-        unsafe { std::env::set_var(ENV, "http://a,http://b") };
-        let from_env = parse(&[]);
-        unsafe { std::env::remove_var(ENV) };
+        let from_env = stateless_test_utils::env::with_env_var(
+            &guard,
+            env,
+            "http://a,http://b",
+            || parse(&[]),
+        );
         assert_eq!(from_env, ["http://a", "http://b"]);
     }
 
     /// `--rpc-endpoint` accepts repeated flags and CSV values, both on the CLI and via env var,
     /// mirroring `--witness-endpoint` behavior for multi-endpoint data RPC support.
     #[test]
-    fn rpc_endpoint_accepts_multiple_forms() {
-        const ENV: &str = "DEBUG_TRACE_SERVER_RPC_ENDPOINT";
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let base = ["debug-trace-server", "--witness-endpoint", "http://w"];
-        let parse =
-            |extra: &[&str]| Args::try_parse_from(base.iter().chain(extra)).unwrap().rpc_endpoint;
-
-        assert_eq!(parse(&["--rpc-endpoint", "http://a,http://b"]), ["http://a", "http://b"]);
-        assert_eq!(
-            parse(&["--rpc-endpoint", "http://a,http://b", "--rpc-endpoint", "http://c"]),
-            ["http://a", "http://b", "http://c"],
+    fn witness_endpoint_accepts_multiple_forms() {
+        assert_endpoint_accepts_multiple_forms(
+            "--witness-endpoint",
+            "DEBUG_TRACE_SERVER_WITNESS_ENDPOINT",
+            &["debug-trace-server", "--rpc-endpoint", "http://rpc"],
+            |a| a.witness_endpoint,
         );
+    }
 
-        // SAFETY: `ENV_LOCK` serializes this test against every other env-touching test
-        // in this module (including sibling tests whose clap-derived `try_parse_from` calls
-        // `std::env::var`), satisfying Rust 2024's process-wide no-concurrent-env-access rule.
-        unsafe { std::env::set_var(ENV, "http://a,http://b") };
-        let from_env = parse(&[]);
-        unsafe { std::env::remove_var(ENV) };
-        assert_eq!(from_env, ["http://a", "http://b"]);
+    #[test]
+    fn rpc_endpoint_accepts_multiple_forms() {
+        assert_endpoint_accepts_multiple_forms(
+            "--rpc-endpoint",
+            "DEBUG_TRACE_SERVER_RPC_ENDPOINT",
+            &["debug-trace-server", "--witness-endpoint", "http://w"],
+            |a| a.rpc_endpoint,
+        );
     }
 }

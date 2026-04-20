@@ -330,6 +330,196 @@ where
     }
 }
 
+/// Fetcher-internal state: block progression, running tasks, and completion buffers.
+///
+/// Maintains the invariant that every block number in `[base_block, next_block)` is in
+/// exactly one of `in_flight_blocks`, `sent`, or `failed` (possibly also `error_counts`).
+/// All state transitions happen through the methods below so the invariant is preserved
+/// by construction rather than scattered across the fetcher loop.
+struct FetcherState<F: BlockFetcher> {
+    /// Lowest block not yet sent downstream. Advances through `sent` as contiguous
+    /// blocks arrive. `[0, base_block)` is owned by the downstream advancer.
+    base_block: u64,
+    /// Next block to spawn a fresh fetch for.
+    next_block: u64,
+    /// Running fetch tasks.
+    tasks: JoinSet<(u64, Result<F::Output>)>,
+    /// Maps spawned task id to block number so that `JoinError` (task panic) can
+    /// identify which block panicked — `JoinError` carries no access to the task's
+    /// return value.
+    task_to_block: HashMap<Id, u64>,
+    /// O(1) "is block N in flight?" lookup, used by gap recovery. Kept in sync with
+    /// `task_to_block` by every method that mutates tasks.
+    in_flight_blocks: HashSet<u64>,
+    /// Blocks completed successfully, waiting for `base_block` to advance past them.
+    sent: HashSet<u64>,
+    /// Blocks that failed (or panicked); waiting to be respawned. `HashSet` (not `Vec`)
+    /// for O(1) `contains` in gap recovery — pop order doesn't matter since the
+    /// advancer reorders results.
+    failed: HashSet<u64>,
+    /// Retry count per block for log escalation. Near-tip blocks routinely fail for the
+    /// first few attempts while the witness is being generated; we stay silent until
+    /// attempt 4 and escalate to `error` past 5.
+    error_counts: HashMap<u64, usize>,
+}
+
+impl<F: BlockFetcher> FetcherState<F> {
+    fn new(start_block: u64) -> Self {
+        Self {
+            base_block: start_block,
+            next_block: start_block,
+            tasks: JoinSet::new(),
+            task_to_block: HashMap::new(),
+            in_flight_blocks: HashSet::new(),
+            sent: HashSet::new(),
+            failed: HashSet::new(),
+            error_counts: HashMap::new(),
+        }
+    }
+
+    fn in_flight_len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    fn window_exhausted(&self, tip: u64) -> bool {
+        self.next_block > tip
+    }
+
+    /// True when there is nothing left to fetch given an optional sync target.
+    fn target_reached(&self, target: Option<u64>) -> bool {
+        target.is_some_and(|t| self.base_block > t)
+    }
+
+    /// Whether spawning the current `next_block` would exceed the sync target.
+    fn next_past_target(&self, target: Option<u64>) -> bool {
+        target.is_some_and(|t| self.next_block > t)
+    }
+
+    /// Spawns a fetch task for `bn` and records it in the task maps.
+    fn spawn(&mut self, fetcher: &Arc<F>, bn: u64) {
+        let fetcher = fetcher.clone();
+        let span = info_span!("fetch_block", block_number = bn);
+        let handle =
+            self.tasks.spawn(async move { (bn, fetcher.fetch(bn).await) }.instrument(span));
+        self.task_to_block.insert(handle.id(), bn);
+        self.in_flight_blocks.insert(bn);
+    }
+
+    /// Spawns the next fresh block and bumps `next_block`.
+    fn spawn_next(&mut self, fetcher: &Arc<F>) {
+        let bn = self.next_block;
+        self.spawn(fetcher, bn);
+        self.next_block += 1;
+    }
+
+    /// Pops an arbitrary failed block for retry. Order is unspecified (the advancer
+    /// reorders results downstream).
+    fn pop_failed(&mut self) -> Option<u64> {
+        let bn = *self.failed.iter().next()?;
+        self.failed.remove(&bn);
+        Some(bn)
+    }
+
+    /// Records a successful fetch: removes task tracking, marks as sent, clears error count.
+    fn on_success(&mut self, id: Id, bn: u64) {
+        self.task_to_block.remove(&id);
+        self.in_flight_blocks.remove(&bn);
+        self.error_counts.remove(&bn);
+        self.sent.insert(bn);
+    }
+
+    /// Records a failed fetch and returns the attempt count (for log escalation).
+    fn on_failure(&mut self, id: Id, bn: u64) -> usize {
+        self.task_to_block.remove(&id);
+        self.in_flight_blocks.remove(&bn);
+        self.failed.insert(bn);
+        let count = self.error_counts.entry(bn).or_insert(0);
+        *count += 1;
+        *count
+    }
+
+    /// Records a task panic. Maps the task id back to the block number (if known) and
+    /// re-enqueues it; returns the block number for logging, or `None` if the id is
+    /// unknown (should never happen under correct bookkeeping).
+    fn on_panic(&mut self, id: Id) -> Option<u64> {
+        let bn = self.task_to_block.remove(&id)?;
+        self.in_flight_blocks.remove(&bn);
+        self.failed.insert(bn);
+        Some(bn)
+    }
+
+    /// Advances `base_block` past every contiguous sent block. Bounds `sent` memory.
+    fn advance_base(&mut self) {
+        while self.sent.remove(&self.base_block) {
+            self.base_block += 1;
+        }
+    }
+
+    /// Defense in depth: any block in `[base_block, next_block)` that somehow escaped
+    /// all three tracking sets gets moved to `failed`. Under correct bookkeeping this
+    /// is a no-op; it exists to prevent a silent stall if the invariant is ever violated.
+    fn recover_gaps(&mut self) {
+        for bn in self.base_block..self.next_block {
+            if !self.sent.contains(&bn) &&
+                !self.in_flight_blocks.contains(&bn) &&
+                !self.failed.contains(&bn)
+            {
+                self.failed.insert(bn);
+            }
+        }
+    }
+}
+
+/// Tip-tracking state: cached chain-latest value, last-refresh timestamp for rate
+/// limiting, and backoff for retry-on-failure. All three variables travel together.
+struct TipTracker {
+    /// `None` = unknown, forces a refresh. Using `Option` (instead of sentinel `0`)
+    /// keeps the `start_block == 0` path correct: we always refresh at least once
+    /// at startup.
+    latest: Option<u64>,
+    /// When the last successful refresh completed. Initialized so the first refresh
+    /// fires immediately. Rate-limiting `latest_block_number()` prevents a near-tip
+    /// validator with failing retries from calling `eth_blockNumber` once per task
+    /// completion (10+ RPS under retry-heavy conditions).
+    last_refresh: Instant,
+    /// Backoff applied after a failed tip lookup (not a per-call retry — tip lookup
+    /// happens in the fetcher loop, so backoff lives on the loop state).
+    backoff: Duration,
+}
+
+impl TipTracker {
+    fn new(poll_interval: Duration) -> Self {
+        Self {
+            latest: None,
+            last_refresh: Instant::now() - poll_interval,
+            backoff: Duration::from_secs(1),
+        }
+    }
+
+    fn value(&self) -> Option<u64> {
+        self.latest
+    }
+
+    fn refresh_due(&self, poll_interval: Duration) -> bool {
+        self.last_refresh.elapsed() >= poll_interval
+    }
+
+    /// Records a successful refresh: updates the cached value, resets backoff.
+    fn set(&mut self, value: u64) {
+        self.latest = Some(value);
+        self.last_refresh = Instant::now();
+        self.backoff = Duration::from_secs(1);
+    }
+
+    fn backoff(&self) -> Duration {
+        self.backoff
+    }
+
+    fn inflate_backoff(&mut self, max: Duration) {
+        self.backoff = (self.backoff * 2).min(max);
+    }
+}
+
 /// Continuously fetches blocks and streams them through a channel.
 ///
 /// Spawns [`BlockFetcher::fetch`] calls onto a bounded [`JoinSet`] and forwards each result
@@ -348,27 +538,8 @@ pub async fn block_fetcher<F: BlockFetcher>(
     let max_in_flight = config.fetcher_batch_size;
     info!(start_block, max_in_flight, "[Fetcher] Starting");
 
-    let mut next_block: u64 = start_block;
-    let mut base_block: u64 = start_block;
-    // `None` = unknown tip, force a refresh. Using `Option` (instead of the sentinel `0`)
-    // makes the `start_block == 0` path correct: we always refresh at least once at startup.
-    let mut chain_latest_cached: Option<u64> = None;
-    // Rate-limits `latest_block_number()` refreshes. Initialized so the first refresh fires
-    // immediately. Without this, a near-tip validator with failing retries (in_flight non-empty
-    // bypasses the poll_interval sleep below) would call `eth_blockNumber` once per task
-    // completion — 10+ RPS under retry-heavy conditions.
-    let mut last_refresh = Instant::now() - config.poll_interval;
-    let mut in_flight: JoinSet<(u64, Result<F::Output>)> = JoinSet::new();
-    let mut in_flight_set: HashSet<u64> = HashSet::new();
-    // Maps spawned task id to block number so that `JoinError` (task panic) can identify
-    // which block panicked — `JoinError` carries no access to the task's return value.
-    let mut task_to_block: HashMap<Id, u64> = HashMap::new();
-    let mut sent: HashSet<u64> = HashSet::new();
-    // `HashSet` (not `Vec`) for O(1) `contains` in the gap-recovery loop below.
-    // Pop order doesn't matter — blocks are reordered downstream in `chain_advancer`.
-    let mut failed: HashSet<u64> = HashSet::new();
-    let mut block_error_counts: HashMap<u64, usize> = HashMap::new();
-    let mut backoff = Duration::from_secs(1);
+    let mut state = FetcherState::<F>::new(start_block);
+    let mut tip = TipTracker::new(config.poll_interval);
 
     loop {
         if shutdown.is_cancelled() {
@@ -376,10 +547,8 @@ pub async fn block_fetcher<F: BlockFetcher>(
             return Ok(());
         }
 
-        if let Some(target) = config.sync_target &&
-            base_block > target
-        {
-            info!(target, "[Fetcher] Reached sync target, stopping");
+        if state.target_reached(config.sync_target) {
+            info!(target = ?config.sync_target, "[Fetcher] Reached sync target, stopping");
             return Ok(());
         }
 
@@ -387,29 +556,25 @@ pub async fn block_fetcher<F: BlockFetcher>(
         // (b) at least `poll_interval` has elapsed since the last refresh. The position gate
         // alone isn't enough: at tip with failing retries, `next_block > cached` stays true
         // every iteration because a successful refresh returns the same cached value, and
-        // the `poll_interval` sleep below is skipped whenever `in_flight` is non-empty.
-        let window_exhausted = chain_latest_cached.is_none_or(|cached| next_block > cached);
-        if window_exhausted && last_refresh.elapsed() >= config.poll_interval {
+        // the `poll_interval` sleep below is skipped whenever tasks are in flight.
+        let window_exhausted = tip.value().is_none_or(|c| state.window_exhausted(c));
+        if window_exhausted && tip.refresh_due(config.poll_interval) {
             match fetcher.latest_block_number().await {
-                Ok(n) => {
-                    chain_latest_cached = Some(n);
-                    last_refresh = Instant::now();
-                    backoff = Duration::from_secs(1);
-                }
+                Ok(n) => tip.set(n),
                 Err(e) => {
                     warn!(error = %e, "[Fetcher] Failed to get chain latest, retrying");
                     tokio::select! {
-                        _ = tokio::time::sleep(backoff) => {}
+                        _ = tokio::time::sleep(tip.backoff()) => {}
                         _ = shutdown.cancelled() => return Ok(()),
                     }
-                    backoff = (backoff * 2).min(config.fetcher_max_backoff);
+                    tip.inflate_backoff(config.fetcher_max_backoff);
                     continue;
                 }
             }
         }
         // If we've never successfully fetched the tip yet, sleep and retry — can't proceed
         // without a cached value.
-        let Some(chain_latest) = chain_latest_cached else {
+        let Some(chain_latest) = tip.value() else {
             tokio::select! {
                 _ = tokio::time::sleep(config.poll_interval) => {}
                 _ = shutdown.cancelled() => return Ok(()),
@@ -418,31 +583,21 @@ pub async fn block_fetcher<F: BlockFetcher>(
         };
 
         // Priority 1: re-enqueue failed blocks before pulling new ones.
-        while in_flight.len() < max_in_flight {
-            // Pop any element from `failed` (order doesn't matter — advancer reorders).
-            let Some(&bn) = failed.iter().next() else { break };
-            failed.remove(&bn);
-            spawn_fetch(&mut in_flight, &mut in_flight_set, &mut task_to_block, &fetcher, bn);
+        while state.in_flight_len() < max_in_flight &&
+            let Some(bn) = state.pop_failed()
+        {
+            state.spawn(&fetcher, bn);
         }
 
-        // Priority 2: enqueue fresh blocks within the window.
-        while in_flight.len() < max_in_flight && next_block <= chain_latest {
-            if let Some(target) = config.sync_target &&
-                next_block > target
-            {
-                break;
-            }
-            spawn_fetch(
-                &mut in_flight,
-                &mut in_flight_set,
-                &mut task_to_block,
-                &fetcher,
-                next_block,
-            );
-            next_block += 1;
+        // Priority 2: enqueue fresh blocks within the window and below the sync target.
+        while state.in_flight_len() < max_in_flight &&
+            state.next_block <= chain_latest &&
+            !state.next_past_target(config.sync_target)
+        {
+            state.spawn_next(&fetcher);
         }
 
-        if in_flight.is_empty() {
+        if state.in_flight_len() == 0 {
             // Nothing to do — caught up to chain tip. Sleep a bit, then refresh.
             tokio::select! {
                 _ = tokio::time::sleep(config.poll_interval) => {}
@@ -451,51 +606,39 @@ pub async fn block_fetcher<F: BlockFetcher>(
             continue;
         }
 
-        // Wait for either a completion or shutdown. `in_flight` is dropped on shutdown,
+        // Wait for either a completion or shutdown. The JoinSet is dropped on shutdown,
         // which aborts any outstanding fetch tasks. Using `join_next_with_id` so that a
         // panicked task's `JoinError` can be mapped back to a block number.
         let joined = tokio::select! {
-            r = in_flight.join_next_with_id() => r,
+            r = state.tasks.join_next_with_id() => r,
             _ = shutdown.cancelled() => return Ok(()),
         };
 
         match joined {
             Some(Ok((id, (bn, Ok(item))))) => {
-                task_to_block.remove(&id);
-                in_flight_set.remove(&bn);
-                block_error_counts.remove(&bn);
+                state.on_success(id, bn);
                 if tx.send(item).await.is_err() {
                     info!("[Fetcher] Channel closed, stopping");
                     return Ok(());
                 }
                 debug!(block_number = bn, "[Fetcher] Block sent to pipeline");
-                sent.insert(bn);
             }
             Some(Ok((id, (bn, Err(e))))) => {
-                task_to_block.remove(&id);
-                in_flight_set.remove(&bn);
-                let count = block_error_counts.entry(bn).or_insert(0);
-                *count += 1;
-                // Near-tip blocks routinely fail for the first few attempts while
-                // the witness is being generated; stay silent until attempt 4,
-                // then warn, and escalate to error after repeated failures.
-                if (4..=5).contains(count) {
-                    warn!(block_number = bn, attempt = *count, error = %e, "[Fetcher] Block fetch error");
-                } else if *count > 5 {
-                    error!(block_number = bn, attempt = *count, error = %e, "[Fetcher] Block fetch error (repeated)");
+                let attempt = state.on_failure(id, bn);
+                if (4..=5).contains(&attempt) {
+                    warn!(block_number = bn, attempt, error = %e, "[Fetcher] Block fetch error");
+                } else if attempt > 5 {
+                    error!(block_number = bn, attempt, error = %e, "[Fetcher] Block fetch error (repeated)");
                 }
-                failed.insert(bn);
             }
             Some(Err(join_err)) => {
-                // Task panicked (extremely rare for async I/O). Recover the block number
-                // from `task_to_block` and re-enqueue it; otherwise a panicked fetch would
-                // silently stall `base_block` forever (gap recovery can't see it because
-                // `in_flight_set` still contains it).
+                // Task panicked (extremely rare for async I/O). If the id maps back to a
+                // block, re-enqueue it; otherwise a panicked fetch would silently stall
+                // `base_block` forever (gap recovery can't see it because it's still
+                // tracked as in-flight until the id lookup clears it).
                 let id = join_err.id();
-                if let Some(bn) = task_to_block.remove(&id) {
-                    in_flight_set.remove(&bn);
+                if let Some(bn) = state.on_panic(id) {
                     error!(block_number = bn, error = %join_err, "[Fetcher] Fetch task panicked, re-enqueueing");
-                    failed.insert(bn);
                 } else {
                     error!(error = %join_err, "[Fetcher] Fetch task panicked with unknown task id");
                 }
@@ -505,39 +648,9 @@ pub async fn block_fetcher<F: BlockFetcher>(
             }
         }
 
-        // Advance `base_block` past every contiguous sent block. Bounds `sent` memory.
-        while sent.remove(&base_block) {
-            base_block += 1;
-        }
-
-        // Gap recovery: any block in [base_block, next_block) not in sent, not in flight,
-        // and not already queued for retry needs to be re-enqueued. Defense in depth against
-        // any state-tracking bug (panic recovery above is the primary path).
-        // All three membership checks are O(1) since all three collections are HashSets.
-        for bn in base_block..next_block {
-            if !sent.contains(&bn) && !in_flight_set.contains(&bn) && !failed.contains(&bn) {
-                failed.insert(bn);
-            }
-        }
+        state.advance_base();
+        state.recover_gaps();
     }
-}
-
-/// Spawns a single fetch task into the JoinSet and records it in `in_flight_set` +
-/// `task_to_block`. The `task_to_block` entry is what lets us recover from task panics:
-/// `JoinError` only carries a task id, not the task's return value.
-fn spawn_fetch<F: BlockFetcher>(
-    set: &mut JoinSet<(u64, Result<F::Output>)>,
-    in_flight_set: &mut HashSet<u64>,
-    task_to_block: &mut HashMap<Id, u64>,
-    fetcher: &Arc<F>,
-    block_number: u64,
-) {
-    let fetcher = fetcher.clone();
-    let span = info_span!("fetch_block", block_number);
-    let handle = set
-        .spawn(async move { (block_number, fetcher.fetch(block_number).await) }.instrument(span));
-    in_flight_set.insert(block_number);
-    task_to_block.insert(handle.id(), block_number);
 }
 
 /// Errors from [`find_divergence_point`], classified for the pipeline.
@@ -1225,17 +1338,12 @@ mod tests {
         assert_eq!(action, ErrorAction::Halt);
     }
 
-    // Streaming regression: a slow fetch for one block must not delay
-    // the fast blocks in the same in-flight window.
-    //
-    // Under the previous `join_all` batching, all 4 blocks in a batch would complete
-    // together — so the slow block held everyone back. With `JoinSet` streaming,
-    // the 3 fast blocks should be sent downstream before the slow one.
+    /// Streaming regression: with the previous `join_all` batching all 4 blocks in a batch
+    /// completed together, so a slow block held everyone back. With `JoinSet` streaming, the
+    /// 3 fast blocks must be sent downstream before the slow one.
     #[tokio::test]
     async fn test_block_fetcher_streams_out_of_order() {
-        use std::time::Duration;
-
-        /// Fetcher that returns `block_number` as its Output, delaying one configured block.
+        /// Returns `block_number` as Output; delays exactly `slow_block` by `slow_delay`.
         struct SlowFetcher {
             latest: u64,
             slow_block: u64,
@@ -1244,69 +1352,54 @@ mod tests {
 
         impl BlockFetcher for SlowFetcher {
             type Output = u64;
-
-            async fn fetch(&self, block_number: u64) -> eyre::Result<u64> {
-                if block_number == self.slow_block {
+            async fn fetch(&self, bn: u64) -> eyre::Result<u64> {
+                if bn == self.slow_block {
                     tokio::time::sleep(self.slow_delay).await;
                 }
-                Ok(block_number)
+                Ok(bn)
             }
             async fn latest_block_number(&self) -> eyre::Result<u64> {
                 Ok(self.latest)
             }
             async fn block_hash(&self, _: u64) -> eyre::Result<BlockHash> {
-                unimplemented!("not used in this test")
+                unreachable!()
             }
             async fn latest_block_meta(&self) -> eyre::Result<BlockMeta> {
-                unimplemented!("not used in this test")
+                unreachable!()
             }
         }
 
-        let start = 100u64;
-        let slow_block = start + 2;
+        let (start, slow) = (100u64, 102u64);
         let fetcher = Arc::new(SlowFetcher {
             latest: start + 3,
-            slow_block,
+            slow_block: slow,
             slow_delay: Duration::from_millis(200),
         });
-
         let (tx, rx) = kanal::bounded::<u64>(8);
         let config = Arc::new(PipelineConfig {
-            fetcher_batch_size: 4, // window large enough to hold all 4 blocks
-            // Set sync_target so fetcher stops after block 103 and we can assert it exits cleanly.
-            sync_target: Some(start + 3),
+            fetcher_batch_size: 4,        // window holds all 4 blocks
+            sync_target: Some(start + 3), // fetcher exits cleanly after block 103
             poll_interval: Duration::from_millis(10),
             ..PipelineConfig::default()
         });
-        let shutdown = CancellationToken::new();
+        let handle =
+            tokio::spawn(block_fetcher(fetcher, tx, start, config, CancellationToken::new()));
 
-        let fetcher_handle =
-            tokio::spawn(block_fetcher(fetcher, tx, start, config, shutdown.clone()));
-
+        // First 3 results must be the fast blocks (slow block must NOT be among them).
         let rx = rx.to_async();
-        // Collect the first 3 results; each should land before the slow block.
-        let mut first_three = Vec::new();
-        for _ in 0..3 {
-            let item =
-                tokio::time::timeout(Duration::from_millis(150), rx.recv()).await.unwrap().unwrap();
-            first_three.push(item);
-        }
-        // The slow block must NOT be among the first three.
-        assert!(
-            !first_three.contains(&slow_block),
-            "Slow block {slow_block} arrived in first 3 results {first_three:?} — streaming broken"
-        );
-        // The 3 fast blocks must be exactly {start, start+1, start+3}.
+        let recv = async || {
+            tokio::time::timeout(Duration::from_millis(150), rx.recv()).await.unwrap().unwrap()
+        };
+        let mut first_three = [recv().await, recv().await, recv().await];
         first_three.sort();
-        assert_eq!(first_three, vec![start, start + 1, start + 3]);
+        assert_eq!(first_three, [start, start + 1, start + 3], "streaming broken: {first_three:?}");
 
-        // The 4th result is the slow block.
+        // The 4th (final) result is the slow block.
         let last =
             tokio::time::timeout(Duration::from_millis(500), rx.recv()).await.unwrap().unwrap();
-        assert_eq!(last, slow_block);
+        assert_eq!(last, slow);
 
-        // Fetcher should exit cleanly now that sync_target is reached.
-        let result = tokio::time::timeout(Duration::from_secs(1), fetcher_handle).await;
-        assert!(result.is_ok(), "block_fetcher did not exit after sync_target reached");
+        // Fetcher exits cleanly after sync_target.
+        assert!(tokio::time::timeout(Duration::from_secs(1), handle).await.is_ok());
     }
 }
