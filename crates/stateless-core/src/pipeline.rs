@@ -433,7 +433,10 @@ impl<F: BlockFetcher> FetcherState<F> {
         Some(bn)
     }
 
-    /// Drains the contiguous-sent prefix starting at `base_block`.
+    /// Drains the contiguous-sent prefix starting at `base_block`. In steady state this
+    /// keeps `sent` around `max_in_flight`; if `base_block` stalls on a persistently-
+    /// failing block, `sent` grows until the spawn-window cap (see `block_fetcher`) stops
+    /// further enqueues.
     fn advance_base(&mut self) {
         while self.sent.remove(&self.base_block) {
             self.base_block += 1;

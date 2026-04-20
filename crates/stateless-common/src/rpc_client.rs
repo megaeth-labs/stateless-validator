@@ -151,11 +151,14 @@ impl RpcClient {
             })
             .transpose()?;
 
+        // `.max(1)` guards against `--data-max-concurrent-requests 0` (or the witness
+        // equivalent) silently wedging every RPC call — `Semaphore::new(0)` blocks
+        // `.acquire()` forever.
         let data_concurrency = Arc::new(Semaphore::new(
-            config.data_max_concurrent_requests.unwrap_or(Semaphore::MAX_PERMITS),
+            config.data_max_concurrent_requests.unwrap_or(Semaphore::MAX_PERMITS).max(1),
         ));
         let witness_concurrency = Arc::new(Semaphore::new(
-            config.witness_max_concurrent_requests.unwrap_or(Semaphore::MAX_PERMITS),
+            config.witness_max_concurrent_requests.unwrap_or(Semaphore::MAX_PERMITS).max(1),
         ));
 
         Ok(Self {
@@ -242,7 +245,11 @@ impl RpcClient {
                     }
                     Err(e) if attempt < max_retries => {
                         self.record_rpc_retry(method);
-                        drop(_permit); // release permit before sleeping
+                        // `_permit` is bound in the `for attempt` loop body, so its
+                        // implicit drop is at end-of-iteration — i.e. *after* the sleep
+                        // below. Explicit drop here releases the slot for other callers
+                        // during backoff.
+                        drop(_permit);
                         let jitter_ms = fastrand::u64(0..=backoff_ms / 2);
                         let sleep_ms = (backoff_ms + jitter_ms).min(self.config.max_backoff_ms);
                         tracing::warn!(
@@ -897,6 +904,14 @@ mod tests {
         };
         assert!(!make(RpcClientConfig::validator()).skip_block_verification());
         assert!(make(RpcClientConfig::trace_server()).skip_block_verification());
+        // `Some(0)` must not produce a permanently-blocked semaphore.
+        let zero = make(RpcClientConfig {
+            data_max_concurrent_requests: Some(0),
+            witness_max_concurrent_requests: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(zero.data_concurrency.available_permits(), 1);
+        assert_eq!(zero.witness_concurrency.available_permits(), 1);
         let client = make(RpcClientConfig {
             data_max_concurrent_requests: Some(10),
             witness_max_concurrent_requests: Some(2),
