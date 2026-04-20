@@ -638,4 +638,54 @@ mod tests {
             |a| a.rpc_endpoint,
         );
     }
+
+    /// Verifies a concurrency cap flag parses via CLI and env var, and defaults to `None`.
+    fn assert_concurrency_flag(
+        flag: &str,
+        env: &str,
+        base: &[&str],
+        extract: impl Fn(Args) -> Option<usize>,
+    ) {
+        let guard = stateless_test_utils::env::env_lock();
+        let parse =
+            |extra: &[&str]| extract(Args::try_parse_from(base.iter().chain(extra)).unwrap());
+
+        assert_eq!(parse(&[]), None);
+        assert_eq!(parse(&[flag, "7"]), Some(7));
+
+        let from_env = stateless_test_utils::env::with_env_var(&guard, env, "12", || parse(&[]));
+        assert_eq!(from_env, Some(12));
+    }
+
+    #[test]
+    fn data_max_concurrent_requests_flag_and_env() {
+        assert_concurrency_flag(
+            "--data-max-concurrent-requests",
+            "DEBUG_TRACE_SERVER_DATA_MAX_CONCURRENT_REQUESTS",
+            &[
+                "debug-trace-server",
+                "--rpc-endpoint",
+                "http://rpc",
+                "--witness-endpoint",
+                "http://w",
+            ],
+            |a| a.data_max_concurrent_requests,
+        );
+    }
+
+    #[test]
+    fn witness_max_concurrent_requests_flag_and_env() {
+        assert_concurrency_flag(
+            "--witness-max-concurrent-requests",
+            "DEBUG_TRACE_SERVER_WITNESS_MAX_CONCURRENT_REQUESTS",
+            &[
+                "debug-trace-server",
+                "--rpc-endpoint",
+                "http://rpc",
+                "--witness-endpoint",
+                "http://w",
+            ],
+            |a| a.witness_max_concurrent_requests,
+        );
+    }
 }
