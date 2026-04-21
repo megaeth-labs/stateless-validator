@@ -34,12 +34,13 @@ The project uses nightly `2026-02-03` toolchain (edition 2024, rust-version 1.95
 
 ## Workspace Structure
 
-| Crate                 | Path                      | Purpose                                                    |
-| --------------------- | ------------------------- | ---------------------------------------------------------- |
-| `stateless-core`      | `crates/stateless-core`   | Core validation logic, database, EVM execution, RPC client |
-| `stateless-common`    | `crates/stateless-common` | Common utilities including logging configuration           |
-| `stateless-validator` | `bin/stateless-validator` | Main binary: chain sync, parallel validation workers       |
-| `debug-trace-server`  | `bin/debug-trace-server`  | Standalone RPC server for debug/trace methods              |
+| Crate                  | Path                          | Purpose                                                    |
+| ---------------------- | ----------------------------- | ---------------------------------------------------------- |
+| `stateless-core`       | `crates/stateless-core`       | Core validation logic, database, EVM execution, RPC client |
+| `stateless-common`     | `crates/stateless-common`     | Shared infra: RpcClient, metrics, logging, redb table defs |
+| `stateless-test-utils` | `crates/stateless-test-utils` | Test fixtures (blocks, witnesses, contracts) + env lock    |
+| `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers       |
+| `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods              |
 
 Additional directories: `test_data/` (integration test fixtures including genesis config), `audits/` (security audit reports).
 
@@ -49,7 +50,7 @@ Additional directories: `test_data/` (integration test fixtures including genesi
 
 Both binaries share a generic three-stage pipeline defined in `stateless-core::pipeline`:
 
-1. **Fetch** — `block_fetcher` pulls blocks + witnesses from a `BlockFetcher` in parallel batches.
+1. **Fetch** — `block_fetcher` streams blocks + witnesses from a `BlockFetcher` via a bounded in-flight window (concurrency capped by `fetcher_max_in_flight`).
 2. **Process** — N workers run `BlockProcessor::process` (validator: EVM execution; trace server: pass-through).
 3. **Advance** — `chain_advancer` reorders out-of-order results, verifies parent-hash continuity, detects reorgs, and persists via `ChainStore::advance_chain`.
 
@@ -113,6 +114,8 @@ The server includes an HTTP response cache (`quick_cache`) for pre-serialized JS
 | `crates/stateless-common/src/rpc_client.rs`   | RPC client for blocks, witnesses, and bytecode                                      |
 | `crates/stateless-common/src/db.rs`           | Shared redb table definitions and serialization helpers                             |
 | `crates/stateless-common/src/metrics.rs`      | RpcMethod, RpcMetrics, RpcClientConfig                                              |
+| `crates/stateless-common/src/witness_size.rs` | `WitnessSizeBreakdown` + `estimate_witness_size` for RPC and trace-server metrics   |
+| `crates/stateless-test-utils/src/fixtures.rs` | `TestFixtures` loader (blocks, SALT/MPT witnesses, contracts, genesis)              |
 | `bin/stateless-validator/src/chain_sync.rs`   | ValidatorFetcher, ValidatorProcessor, ValidatorHooks                                |
 | `bin/stateless-validator/src/main.rs`         | CLI, pipeline startup, validation reporter                                          |
 | `bin/debug-trace-server/src/chain_sync.rs`    | TraceFetcher, TraceProcessor, TraceHooks                                            |

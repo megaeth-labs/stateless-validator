@@ -48,7 +48,7 @@ pub struct PipelineConfig {
     /// Channel capacity for the worker→advancer pipeline.
     pub result_channel_capacity: usize,
     /// Maximum number of in-flight block fetches.
-    pub fetcher_batch_size: usize,
+    pub fetcher_max_in_flight: usize,
     /// Maximum RPC retry backoff for the fetcher.
     pub fetcher_max_backoff: Duration,
     /// If local tip falls behind remote by more than this, reset anchor.
@@ -67,7 +67,7 @@ impl Default for PipelineConfig {
             error_restart_delay: Duration::from_secs(1),
             fetch_channel_capacity: 2 * workers,
             result_channel_capacity: 2 * workers,
-            fetcher_batch_size: workers,
+            fetcher_max_in_flight: workers,
             fetcher_max_backoff: Duration::from_secs(30),
             stale_reset_threshold: None,
         }
@@ -518,7 +518,7 @@ pub async fn block_fetcher<F: BlockFetcher>(
     const FETCH_WINDOW_MULTIPLIER: u64 = 4;
 
     let tx = tx.to_async();
-    let max_in_flight = config.fetcher_batch_size;
+    let max_in_flight = config.fetcher_max_in_flight;
     let max_window = (max_in_flight as u64) * FETCH_WINDOW_MULTIPLIER;
     info!(start_block, max_in_flight, max_window, "[Fetcher] Starting");
 
@@ -911,7 +911,7 @@ mod tests {
         assert_eq!(config.concurrent_workers, cpus);
         assert_eq!(config.fetch_channel_capacity, 2 * cpus);
         assert_eq!(config.result_channel_capacity, 2 * cpus);
-        assert_eq!(config.fetcher_batch_size, cpus);
+        assert_eq!(config.fetcher_max_in_flight, cpus);
     }
 
     #[test]
@@ -1353,7 +1353,7 @@ mod tests {
         });
         let (tx, rx) = kanal::bounded::<u64>(8);
         let config = Arc::new(PipelineConfig {
-            fetcher_batch_size: 4,        // window holds all 4 blocks
+            fetcher_max_in_flight: 4,     // window holds all 4 blocks
             sync_target: Some(start + 3), // fetcher exits cleanly after block 103
             poll_interval: Duration::from_millis(10),
             ..PipelineConfig::default()
@@ -1414,7 +1414,7 @@ mod tests {
 
         let (tx, rx) = kanal::bounded::<u64>(1024);
         let config = Arc::new(PipelineConfig {
-            fetcher_batch_size: max_in_flight,
+            fetcher_max_in_flight: max_in_flight,
             poll_interval: Duration::from_millis(10),
             ..PipelineConfig::default()
         });
