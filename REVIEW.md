@@ -68,7 +68,7 @@ Automate everything below the line.
 - Respect reth's design patterns and framework conventions — stateless-validator uses reth as a library and should not replace its abstractions
 - PR must not patch upstream dependencies unless there is a strong justification in the PR description
 - Any change to a public API or interface must have a clear reason documented in an inline comment or the PR description
-- `eyre` errors are only acceptable in top-level binary modules — libraries must use typed errors (`thiserror` or manual enums) so callers can match on variants
+- Prefer typed errors (`thiserror` or manual enums) for new library code so callers can match on variants; `eyre` is fine in top-level binary modules and in existing library APIs that already use it
 - Behaviors that depend on external environment (network, disk, time) must be abstracted behind traits so that unit testing is possible
 
 ### Observability
@@ -150,7 +150,7 @@ Automate everything below the line.
 
 - Formatting-only changes already enforced by `cargo fmt`
 - Lint issues already caught by `cargo clippy`
-- `result_large_err` — explicitly allowed in this project
+- `result_large_err` — not enforced (allow-by-default in clippy)
 - Redundant guards that aid readability (e.g., explicit `is_some()` check before unwrap even when the branch guarantees it)
 - Threshold/constant values that are tuned empirically — comments on these rot
 - Issues already addressed in the diff being reviewed — read the FULL diff before commenting
