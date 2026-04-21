@@ -1,0 +1,125 @@
+//! Advancer stage: reorders processed blocks, detects reorgs, persists progress.
+
+use std::collections::BTreeMap;
+
+use eyre::{Result, anyhow};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, warn};
+
+use crate::{
+    ChainStore,
+    db::BlockMeta,
+    pipeline::{
+        config::{ErrorAction, PipelineOutcome, ReorgEvent},
+        divergence::find_divergence_point,
+        traits::{BlockFetcher, PipelineHooks, ProcessedBlock},
+    },
+};
+
+/// Receives processed blocks, reorders, verifies parent-hash continuity,
+/// and advances the canonical chain.
+pub(crate) async fn chain_advancer<F, S, H>(
+    fetcher: &F,
+    store: &S,
+    hooks: &H,
+    result_rx: kanal::Receiver<std::result::Result<H::Output, (String, ErrorAction)>>,
+    initial_tip: BlockMeta,
+    shutdown: CancellationToken,
+) -> Result<PipelineOutcome>
+where
+    F: BlockFetcher,
+    S: ChainStore,
+    H: PipelineHooks,
+{
+    let rx = result_rx.to_async();
+    let mut next_expected = initial_tip.block_number + 1;
+    let mut current_tip = initial_tip;
+    let mut buffer: BTreeMap<u64, H::Output> = BTreeMap::new();
+
+    loop {
+        let item = tokio::select! {
+            r = rx.recv() => match r {
+                Ok(Ok(item)) => item,
+                Ok(Err((msg, ErrorAction::Halt))) => {
+                    error!(error = %msg, "[Advancer] Fatal processing error, halting");
+                    return Ok(PipelineOutcome::Fatal(msg));
+                }
+                Ok(Err((msg, ErrorAction::Retry))) => {
+                    warn!(error = %msg, "[Advancer] Transient processing error, restarting cycle");
+                    return Err(anyhow!("{msg}"));
+                }
+                Err(_) => return Ok(PipelineOutcome::Shutdown),
+            },
+            _ = shutdown.cancelled() => return Ok(PipelineOutcome::Shutdown),
+        };
+
+        buffer.insert(item.block_number(), item);
+
+        let mut batch = Vec::new();
+        let mut metas = Vec::new();
+        while let Some(item) = buffer.remove(&next_expected) {
+            if item.parent_hash() != current_tip.block_hash {
+                debug!(
+                    block = next_expected,
+                    expected_parent = ?current_tip.block_hash,
+                    actual_parent = ?item.parent_hash(),
+                    "[Advancer] Parent hash mismatch — reorg detected"
+                );
+
+                let rollback_to = match find_divergence_point(
+                    fetcher,
+                    &|n| store.get_block_hash(n).map_err(eyre::Report::from),
+                    &|| store.get_earliest_block().map_err(eyre::Report::from),
+                    current_tip.block_number,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) if e.is_fatal() => {
+                        return Ok(PipelineOutcome::Fatal(e.to_string()));
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+
+                let depth = current_tip.block_number.saturating_sub(rollback_to);
+                let mut reverted_hashes = Vec::new();
+                for n in (rollback_to + 1)..=current_tip.block_number {
+                    if let Ok(Some(hash)) = store.get_block_hash(n) {
+                        reverted_hashes.push(hash);
+                    }
+                }
+
+                return Ok(PipelineOutcome::Reorg(ReorgEvent {
+                    rollback_to,
+                    depth,
+                    reverted_hashes,
+                }));
+            }
+
+            if let Err(e) = item.verify_continuity(&current_tip) {
+                error!(
+                    block = next_expected,
+                    error = %e,
+                    "[Advancer] State continuity check failed, halting"
+                );
+                return Ok(PipelineOutcome::Fatal(e.to_string()));
+            }
+            current_tip = item.to_block_meta();
+            next_expected += 1;
+            metas.push(current_tip.clone());
+            batch.push(item);
+        }
+
+        if !batch.is_empty() {
+            hooks.pre_advance(&batch)?;
+            store.advance_chain(&metas)?;
+            debug!(
+                tip = current_tip.block_number,
+                advanced = metas.len(),
+                buffered = buffer.len(),
+                "[Advancer] Chain advanced"
+            );
+            hooks.post_advance(&current_tip)?;
+        }
+    }
+}

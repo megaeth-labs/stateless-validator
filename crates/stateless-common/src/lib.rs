@@ -1,4 +1,3 @@
-pub mod db;
 pub mod logging;
 pub mod metrics;
 pub use metrics::{RpcClientConfig, RpcMethod, RpcMetrics};

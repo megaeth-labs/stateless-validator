@@ -12,12 +12,12 @@ use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 use revm::state::Bytecode;
-use stateless_common::db::{
+use stateless_core::db::{BlockMeta, ChainStore, ContractStore, GenesisStore, StoreResult};
+use stateless_db::{
     ANCHOR_BLOCK, CANONICAL_CHAIN, CONTRACTS, DEFAULT_MAX_CHAIN_LENGTH, Database, GENESIS_CONFIG,
     db_add_contracts, db_get_anchor, db_get_block_hash, db_get_canonical_tip, db_get_contracts,
     db_get_earliest_block, db_reset_to_anchor, db_rollback_chain,
 };
-use stateless_core::db::{BlockMeta, ChainStore, ContractStore, GenesisStore};
 
 /// Minimal persistent storage backed by redb.
 pub struct ValidatorDB {
@@ -50,7 +50,7 @@ impl ValidatorDB {
 
     #[cfg(test)]
     fn set_anchor_block(&self, tip: &BlockMeta) -> eyre::Result<()> {
-        use stateless_common::db::block_meta_to_tuple;
+        use stateless_db::block_meta_to_tuple;
         let write_txn = self.database.begin_write()?;
         {
             let mut table = write_txn.open_table(ANCHOR_BLOCK)?;
@@ -62,17 +62,17 @@ impl ValidatorDB {
 }
 
 impl ContractStore for ValidatorDB {
-    fn get_contracts(&self, hashes: &[B256]) -> eyre::Result<(HashMap<B256, Bytecode>, Vec<B256>)> {
+    fn get_contracts(&self, hashes: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
         db_get_contracts(&self.database, hashes)
     }
 
-    fn add_contracts(&self, codes: &[(B256, Bytecode)]) -> eyre::Result<()> {
+    fn add_contracts(&self, codes: &[(B256, Bytecode)]) -> StoreResult<()> {
         db_add_contracts(&self.database, codes)
     }
 }
 
 impl GenesisStore for ValidatorDB {
-    fn store_genesis(&self, genesis: &Genesis) -> eyre::Result<()> {
+    fn store_genesis(&self, genesis: &Genesis) -> StoreResult<()> {
         let json_bytes = serde_json::to_vec(genesis)?;
         let write_txn = self.database.begin_write()?;
         {
@@ -83,7 +83,7 @@ impl GenesisStore for ValidatorDB {
         Ok(())
     }
 
-    fn load_genesis(&self) -> eyre::Result<Option<Genesis>> {
+    fn load_genesis(&self) -> StoreResult<Option<Genesis>> {
         let read_txn = self.database.begin_read()?;
         let table = read_txn.open_table(GENESIS_CONFIG)?;
         match table.get("genesis")? {
@@ -97,15 +97,15 @@ impl GenesisStore for ValidatorDB {
 }
 
 impl ChainStore for ValidatorDB {
-    fn get_canonical_tip(&self) -> eyre::Result<Option<BlockMeta>> {
+    fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>> {
         db_get_canonical_tip(&self.database)
     }
 
-    fn get_anchor(&self) -> eyre::Result<Option<BlockMeta>> {
+    fn get_anchor(&self) -> StoreResult<Option<BlockMeta>> {
         db_get_anchor(&self.database)
     }
 
-    fn advance_chain(&self, blocks: &[BlockMeta]) -> eyre::Result<()> {
+    fn advance_chain(&self, blocks: &[BlockMeta]) -> StoreResult<()> {
         if blocks.is_empty() {
             return Ok(());
         }
@@ -138,19 +138,19 @@ impl ChainStore for ValidatorDB {
         Ok(())
     }
 
-    fn get_block_hash(&self, block_number: BlockNumber) -> eyre::Result<Option<BlockHash>> {
+    fn get_block_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>> {
         db_get_block_hash(&self.database, block_number)
     }
 
-    fn get_earliest_block(&self) -> eyre::Result<Option<(BlockNumber, BlockHash)>> {
+    fn get_earliest_block(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
         db_get_earliest_block(&self.database)
     }
 
-    fn rollback_chain(&self, to_block: BlockNumber) -> eyre::Result<()> {
+    fn rollback_chain(&self, to_block: BlockNumber) -> StoreResult<()> {
         db_rollback_chain(&self.database, to_block)
     }
 
-    fn reset_to_anchor(&self, anchor: &BlockMeta) -> eyre::Result<()> {
+    fn reset_to_anchor(&self, anchor: &BlockMeta) -> StoreResult<()> {
         db_reset_to_anchor(&self.database, anchor)
     }
 }
@@ -159,7 +159,7 @@ impl ChainStore for ValidatorDB {
 mod tests {
     use std::sync::Arc;
 
-    use stateless_common::db::ContractCache;
+    use stateless_db::ContractCache;
 
     use super::*;
 

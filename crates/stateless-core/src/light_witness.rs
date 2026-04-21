@@ -44,18 +44,11 @@ impl From<&salt::SaltWitness> for LightWitness {
 }
 
 /// Error type for LightWitness StateReader operations
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{message}")]
 pub struct LightWitnessError {
     pub message: &'static str,
 }
-
-impl std::fmt::Display for LightWitnessError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for LightWitnessError {}
 
 impl StateReader for LightWitness {
     type Error = LightWitnessError;

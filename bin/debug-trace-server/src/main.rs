@@ -46,7 +46,7 @@ use alloy_genesis::Genesis;
 use alloy_primitives::BlockHash;
 use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
-use eyre::{Result, anyhow};
+use eyre::Result;
 use jsonrpsee::server::{Server, ServerConfig};
 use stateless_common::{RpcClient, RpcClientConfig, logging::LogArgs};
 use stateless_core::{BlockStore, PipelineConfig, chain_spec::ChainSpec, pipeline::run_pipeline};
@@ -453,9 +453,9 @@ async fn init_validator_db(
         header.state_root,
         header
             .withdrawals_root
-            .ok_or_else(|| anyhow!("Block {} is missing withdrawals_root", header.hash))?,
+            .ok_or_else(|| eyre::eyre!("Block {} is missing withdrawals_root", header.hash))?,
     )
-    .map_err(|e| anyhow!("Failed to reset anchor: {}", e))?;
+    .map_err(|e| eyre::eyre!("Failed to reset anchor: {}", e))?;
 
     info!(
         block_hash = %header.hash,

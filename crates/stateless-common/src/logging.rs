@@ -1,7 +1,7 @@
 use std::{fmt, path::PathBuf};
 
 use clap::{Args, ValueEnum};
-use eyre::{Result, anyhow};
+use eyre::{Result, eyre};
 use rolling_file::{BasicRollingFileAppender, RollingConditionBasic};
 use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -138,12 +138,12 @@ fn build_file_writer(
     max_files: usize,
 ) -> Result<(tracing_appender::non_blocking::NonBlocking, WorkerGuard)> {
     std::fs::create_dir_all(dir)
-        .map_err(|e| anyhow!("Failed to create log directory {}: {e}", dir.display()))?;
+        .map_err(|e| eyre!("Failed to create log directory {}: {e}", dir.display()))?;
 
     let file_path = dir.join(file_name);
     let condition = RollingConditionBasic::new().max_size(max_size_mb * 1024 * 1024);
     let appender = BasicRollingFileAppender::new(file_path, condition, max_files)
-        .map_err(|e| anyhow!("Failed to create rolling file appender: {e}"))?;
+        .map_err(|e| eyre!("Failed to create rolling file appender: {e}"))?;
 
     let (non_blocking, guard) = tracing_appender::non_blocking(appender);
     Ok((non_blocking, guard))

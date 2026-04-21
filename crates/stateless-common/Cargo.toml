@@ -32,16 +32,12 @@ stateless-core = { path = "../stateless-core" }
 base64.workspace = true
 bincode.workspace = true
 clap.workspace = true
-dashmap.workspace = true
 eyre.workspace = true
 fastrand = { workspace = true, features = ["std"] }
 futures.workspace = true
-lz4_flex.workspace = true
-redb.workspace = true
 rolling-file.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true

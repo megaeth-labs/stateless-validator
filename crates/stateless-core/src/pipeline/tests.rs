@@ -1,0 +1,548 @@
+use std::{collections::HashMap, sync::Arc, time::Duration};
+
+use alloy_primitives::{B256, BlockHash, BlockNumber};
+use eyre::{Result, anyhow};
+use tokio_util::sync::CancellationToken;
+
+use super::{
+    BlockFetcher, BlockProcessor, ErrorAction, PipelineConfig, PipelineHooks, PipelineOutcome,
+    ProcessedBlock, advancer::chain_advancer, block_fetcher, find_divergence_point,
+    worker::spawn_workers,
+};
+use crate::{ChainStore, StoreResult, db::BlockMeta};
+
+#[test]
+fn test_pipeline_config_default_uses_cpu_count() {
+    let config = PipelineConfig::default();
+    let cpus = num_cpus::get_physical();
+    assert_eq!(config.concurrent_workers, cpus);
+    assert_eq!(config.fetch_channel_capacity, 2 * cpus);
+    assert_eq!(config.result_channel_capacity, 2 * cpus);
+    assert_eq!(config.fetcher_max_in_flight, cpus);
+}
+
+#[test]
+fn test_pipeline_config_default_stale_disabled() {
+    assert!(PipelineConfig::default().stale_reset_threshold.is_none());
+}
+
+// Mock types for tests
+#[derive(Clone, Debug)]
+struct MockBlock {
+    number: u64,
+    hash: BlockHash,
+    parent: BlockHash,
+    state_root: B256,
+}
+
+impl ProcessedBlock for MockBlock {
+    fn block_number(&self) -> BlockNumber {
+        self.number
+    }
+    fn block_hash(&self) -> BlockHash {
+        self.hash
+    }
+    fn parent_hash(&self) -> BlockHash {
+        self.parent
+    }
+    fn to_block_meta(&self) -> BlockMeta {
+        BlockMeta {
+            block_number: self.number,
+            block_hash: self.hash,
+            post_state_root: self.state_root,
+            post_withdrawals_root: B256::ZERO,
+        }
+    }
+}
+
+struct NoopHooks;
+impl PipelineHooks for NoopHooks {
+    type Output = MockBlock;
+}
+
+struct MockStore {
+    chain: std::sync::Mutex<std::collections::BTreeMap<u64, BlockMeta>>,
+    anchor: BlockMeta,
+}
+
+impl MockStore {
+    fn new(anchor: BlockMeta) -> Self {
+        let mut chain = std::collections::BTreeMap::new();
+        chain.insert(anchor.block_number, anchor.clone());
+        Self { chain: std::sync::Mutex::new(chain), anchor }
+    }
+}
+
+impl crate::ContractStore for MockStore {
+    fn get_contracts(
+        &self,
+        _: &[B256],
+    ) -> StoreResult<(HashMap<B256, revm::state::Bytecode>, Vec<B256>)> {
+        Ok((HashMap::new(), vec![]))
+    }
+    fn add_contracts(&self, _: &[(B256, revm::state::Bytecode)]) -> StoreResult<()> {
+        Ok(())
+    }
+}
+
+impl ChainStore for MockStore {
+    fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>> {
+        Ok(self.chain.lock().unwrap().values().next_back().cloned())
+    }
+    fn get_anchor(&self) -> StoreResult<Option<BlockMeta>> {
+        Ok(Some(self.anchor.clone()))
+    }
+    fn advance_chain(&self, blocks: &[BlockMeta]) -> StoreResult<()> {
+        let mut chain = self.chain.lock().unwrap();
+        for b in blocks {
+            chain.insert(b.block_number, b.clone());
+        }
+        Ok(())
+    }
+    fn get_block_hash(&self, n: BlockNumber) -> StoreResult<Option<BlockHash>> {
+        Ok(self.chain.lock().unwrap().get(&n).map(|m| m.block_hash))
+    }
+    fn get_earliest_block(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
+        Ok(self.chain.lock().unwrap().first_key_value().map(|(&n, m)| (n, m.block_hash)))
+    }
+    fn rollback_chain(&self, to_block: BlockNumber) -> StoreResult<()> {
+        self.chain.lock().unwrap().retain(|&n, _| n <= to_block);
+        Ok(())
+    }
+    fn reset_to_anchor(&self, anchor: &BlockMeta) -> StoreResult<()> {
+        let mut chain = self.chain.lock().unwrap();
+        chain.clear();
+        chain.insert(anchor.block_number, anchor.clone());
+        Ok(())
+    }
+}
+
+/// Mock fetcher that only provides block hashes (for advancer/divergence tests).
+struct MockFetcher {
+    hashes: HashMap<u64, BlockHash>,
+}
+
+impl BlockFetcher for MockFetcher {
+    type Output = ();
+
+    async fn fetch(&self, _: u64) -> Result<()> {
+        unimplemented!("not used in advancer/divergence tests")
+    }
+    async fn latest_block_number(&self) -> Result<u64> {
+        Ok(*self.hashes.keys().max().unwrap_or(&0))
+    }
+    async fn block_hash(&self, n: u64) -> Result<BlockHash> {
+        self.hashes.get(&n).copied().ok_or_else(|| anyhow!("Block {n} not found"))
+    }
+    async fn latest_block_meta(&self) -> Result<BlockMeta> {
+        unimplemented!("not used in advancer/divergence tests")
+    }
+}
+
+fn make_hash(n: u64) -> BlockHash {
+    BlockHash::from([n as u8; 32])
+}
+
+fn make_block(number: u64, parent: BlockHash) -> MockBlock {
+    MockBlock {
+        number,
+        hash: make_hash(number),
+        parent,
+        state_root: B256::from([number as u8 + 1; 32]),
+    }
+}
+
+fn make_tip(n: u64) -> BlockMeta {
+    BlockMeta {
+        block_number: n,
+        block_hash: make_hash(n),
+        post_state_root: B256::from([n as u8 + 1; 32]),
+        post_withdrawals_root: B256::ZERO,
+    }
+}
+
+// chain_advancer tests
+
+async fn run_advancer(
+    tip: BlockMeta,
+    rpc_hashes: HashMap<u64, BlockHash>,
+    blocks: Vec<std::result::Result<MockBlock, (String, ErrorAction)>>,
+) -> (Result<PipelineOutcome>, MockStore) {
+    let store = MockStore::new(tip.clone());
+    let fetcher = MockFetcher { hashes: rpc_hashes };
+    let hooks = NoopHooks;
+    let (tx, rx) = kanal::bounded(16);
+
+    {
+        let tx_async = tx.to_async();
+        for b in blocks {
+            tx_async.send(b).await.unwrap();
+        }
+    }
+
+    let result = chain_advancer(&fetcher, &store, &hooks, rx, tip, CancellationToken::new()).await;
+    (result, store)
+}
+
+#[tokio::test]
+async fn test_chain_advancer_sequential() {
+    let tip = make_tip(10);
+    let blocks = vec![
+        Ok(make_block(11, make_hash(10))),
+        Ok(make_block(12, make_hash(11))),
+        Ok(make_block(13, make_hash(12))),
+    ];
+    let (result, store) = run_advancer(tip, HashMap::new(), blocks).await;
+    assert!(matches!(result.unwrap(), PipelineOutcome::Shutdown));
+    assert_eq!(store.get_canonical_tip().unwrap().unwrap().block_number, 13);
+}
+
+#[tokio::test]
+async fn test_chain_advancer_out_of_order() {
+    let tip = make_tip(10);
+    let blocks = vec![
+        Ok(make_block(13, make_hash(12))),
+        Ok(make_block(12, make_hash(11))),
+        Ok(make_block(11, make_hash(10))),
+    ];
+    let (result, store) = run_advancer(tip, HashMap::new(), blocks).await;
+    assert!(matches!(result.unwrap(), PipelineOutcome::Shutdown));
+    assert_eq!(store.get_canonical_tip().unwrap().unwrap().block_number, 13);
+}
+
+#[tokio::test]
+async fn test_chain_advancer_fatal_error_halts() {
+    let tip = make_tip(10);
+    let blocks = vec![Err(("state root mismatch".to_string(), ErrorAction::Halt))];
+    let (result, _) = run_advancer(tip, HashMap::new(), blocks).await;
+    match result.unwrap() {
+        PipelineOutcome::Fatal(msg) => assert!(msg.contains("state root mismatch")),
+        other => panic!("Expected Fatal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_chain_advancer_transient_error_returns_err() {
+    let tip = make_tip(10);
+    let blocks = vec![Err(("RPC timeout".to_string(), ErrorAction::Retry))];
+    let (result, _) = run_advancer(tip, HashMap::new(), blocks).await;
+    // Retry errors are returned as Err (not PipelineOutcome), triggering restart
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("RPC timeout"));
+}
+
+#[tokio::test]
+async fn test_chain_advancer_shutdown() {
+    let tip = make_tip(10);
+    let store = MockStore::new(tip.clone());
+    let fetcher = MockFetcher { hashes: HashMap::new() };
+    let hooks = NoopHooks;
+    let (_tx, rx) = kanal::bounded::<std::result::Result<MockBlock, (String, ErrorAction)>>(16);
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+
+    let outcome = chain_advancer(&fetcher, &store, &hooks, rx, tip, shutdown).await.unwrap();
+    assert!(matches!(outcome, PipelineOutcome::Shutdown));
+}
+
+#[tokio::test]
+async fn test_chain_advancer_reorg_detected() {
+    let tip = make_tip(10);
+    let mut rpc_hashes = HashMap::new();
+    rpc_hashes.insert(10, make_hash(10));
+
+    let bad_block = MockBlock {
+        number: 11,
+        hash: make_hash(11),
+        parent: BlockHash::from([0xFF; 32]),
+        state_root: B256::ZERO,
+    };
+    let (result, _) = run_advancer(tip, rpc_hashes, vec![Ok(bad_block)]).await;
+    match result.unwrap() {
+        PipelineOutcome::Reorg(event) => assert_eq!(event.rollback_to, 10),
+        other => panic!("Expected Reorg, got {other:?}"),
+    }
+}
+
+// find_divergence_point tests
+
+#[tokio::test]
+async fn test_find_divergence_single_block_reorg() {
+    let mut local = HashMap::new();
+    let mut remote = HashMap::new();
+    for n in 1..=10 {
+        local.insert(n, make_hash(n));
+        if n <= 9 {
+            remote.insert(n, make_hash(n));
+        } else {
+            remote.insert(n, BlockHash::from([0xFF; 32]));
+        }
+    }
+
+    let fetcher = MockFetcher { hashes: remote };
+    let result = find_divergence_point(
+        &fetcher,
+        &|n| Ok(local.get(&n).copied()),
+        &|| Ok(Some((1, *local.get(&1).unwrap()))),
+        10,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result, 9);
+}
+
+#[tokio::test]
+async fn test_find_divergence_multi_block_reorg() {
+    let mut local = HashMap::new();
+    let mut remote = HashMap::new();
+    for n in 1..=10 {
+        if n <= 5 {
+            let hash = make_hash(n);
+            local.insert(n, hash);
+            remote.insert(n, hash);
+        } else {
+            local.insert(n, make_hash(n));
+            remote.insert(n, BlockHash::from([(n + 128) as u8; 32]));
+        }
+    }
+
+    let fetcher = MockFetcher { hashes: remote };
+    let result = find_divergence_point(
+        &fetcher,
+        &|n| Ok(local.get(&n).copied()),
+        &|| Ok(Some((1, *local.get(&1).unwrap()))),
+        10,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result, 5);
+}
+
+#[tokio::test]
+async fn test_find_divergence_catastrophic() {
+    let mut local = HashMap::new();
+    let mut remote = HashMap::new();
+    for n in 1..=5 {
+        local.insert(n, make_hash(n));
+        remote.insert(n, BlockHash::from([(n + 128) as u8; 32]));
+    }
+
+    let fetcher = MockFetcher { hashes: remote };
+    let result = find_divergence_point(
+        &fetcher,
+        &|n| Ok(local.get(&n).copied()),
+        &|| Ok(Some((1, *local.get(&1).unwrap()))),
+        5,
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("Catastrophic reorg"));
+}
+
+// spawn_workers tests
+
+struct DoubleProcessor;
+impl BlockProcessor for DoubleProcessor {
+    type Input = u64;
+    type Output = MockBlock;
+    type Error = String;
+
+    async fn process(&self, input: u64) -> std::result::Result<MockBlock, String> {
+        Ok(MockBlock {
+            number: input,
+            hash: make_hash(input),
+            parent: make_hash(input - 1),
+            state_root: B256::ZERO,
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_spawn_workers_processes_all() {
+    let processor = Arc::new(DoubleProcessor);
+    let (fetch_tx, fetch_rx) = kanal::bounded::<u64>(16);
+    let (result_tx, result_rx) = kanal::bounded(16);
+
+    let handles = spawn_workers(processor, fetch_rx, result_tx, 2);
+
+    let fetch_tx = fetch_tx.to_async();
+    for i in 1..=5 {
+        fetch_tx.send(i).await.unwrap();
+    }
+    drop(fetch_tx);
+
+    let result_rx = result_rx.to_async();
+    let mut results = Vec::new();
+    while let Ok(r) = result_rx.recv().await {
+        results.push(r.unwrap().number);
+    }
+
+    results.sort();
+    assert_eq!(results, vec![1, 2, 3, 4, 5]);
+
+    for h in handles {
+        h.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn test_spawn_workers_propagates_error() {
+    struct FailProcessor;
+    impl BlockProcessor for FailProcessor {
+        type Input = u64;
+        type Output = MockBlock;
+        type Error = String;
+
+        async fn process(&self, _: u64) -> std::result::Result<MockBlock, String> {
+            Err("boom".to_string())
+        }
+    }
+
+    let processor = Arc::new(FailProcessor);
+    let (fetch_tx, fetch_rx) = kanal::bounded::<u64>(16);
+    let (result_tx, result_rx) = kanal::bounded(16);
+
+    let _handles = spawn_workers(processor, fetch_rx, result_tx, 1);
+
+    let fetch_tx = fetch_tx.to_async();
+    fetch_tx.send(1).await.unwrap();
+    drop(fetch_tx);
+
+    let result_rx = result_rx.to_async();
+    let result = result_rx.recv().await.unwrap();
+    assert!(result.is_err());
+    let (msg, action) = result.unwrap_err();
+    assert_eq!(msg, "boom");
+    // Default error_action is Halt
+    assert_eq!(action, ErrorAction::Halt);
+}
+
+/// Streaming regression: with the previous `join_all` batching all 4 blocks in a batch
+/// completed together, so a slow block held everyone back. With `JoinSet` streaming, the
+/// 3 fast blocks must be sent downstream before the slow one.
+#[tokio::test]
+async fn test_block_fetcher_streams_out_of_order() {
+    /// Returns `block_number` as Output; delays exactly `slow_block` by `slow_delay`.
+    struct SlowFetcher {
+        latest: u64,
+        slow_block: u64,
+        slow_delay: Duration,
+    }
+
+    impl BlockFetcher for SlowFetcher {
+        type Output = u64;
+        async fn fetch(&self, bn: u64) -> eyre::Result<u64> {
+            if bn == self.slow_block {
+                tokio::time::sleep(self.slow_delay).await;
+            }
+            Ok(bn)
+        }
+        async fn latest_block_number(&self) -> eyre::Result<u64> {
+            Ok(self.latest)
+        }
+        async fn block_hash(&self, _: u64) -> eyre::Result<BlockHash> {
+            unreachable!()
+        }
+        async fn latest_block_meta(&self) -> eyre::Result<BlockMeta> {
+            unreachable!()
+        }
+    }
+
+    let (start, slow) = (100u64, 102u64);
+    let fetcher = Arc::new(SlowFetcher {
+        latest: start + 3,
+        slow_block: slow,
+        slow_delay: Duration::from_millis(200),
+    });
+    let (tx, rx) = kanal::bounded::<u64>(8);
+    let config = Arc::new(PipelineConfig {
+        fetcher_max_in_flight: 4,        // window holds all 4 blocks
+        sync_target: Some(start + 3), // fetcher exits cleanly after block 103
+        poll_interval: Duration::from_millis(10),
+        ..PipelineConfig::default()
+    });
+    let handle = tokio::spawn(block_fetcher(fetcher, tx, start, config, CancellationToken::new()));
+
+    // First 3 results must be the fast blocks (slow block must NOT be among them).
+    let rx = rx.to_async();
+    let recv = async || {
+        tokio::time::timeout(Duration::from_millis(150), rx.recv()).await.unwrap().unwrap()
+    };
+    let mut first_three = [recv().await, recv().await, recv().await];
+    first_three.sort();
+    assert_eq!(first_three, [start, start + 1, start + 3], "streaming broken: {first_three:?}");
+
+    // The 4th (final) result is the slow block.
+    let last = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await.unwrap().unwrap();
+    assert_eq!(last, slow);
+
+    // Fetcher exits cleanly after sync_target.
+    assert!(tokio::time::timeout(Duration::from_secs(1), handle).await.is_ok());
+}
+
+/// Regression: a persistently-failing block must not let the fetch window grow
+/// unboundedly while the chain advances. The spawn-window cap bounds the highest
+/// block we ever attempt to `stuck + max_window - 1` (since `base_block` can reach
+/// `stuck` itself via contiguous-sent drain below it).
+#[tokio::test]
+async fn test_block_fetcher_bounded_window_under_stall() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Fails block `stuck`; records the highest `bn` ever requested.
+    struct StallFetcher(u64, u64, Arc<AtomicU64>); // (latest, stuck, highest)
+
+    impl BlockFetcher for StallFetcher {
+        type Output = u64;
+        async fn fetch(&self, bn: u64) -> eyre::Result<u64> {
+            self.2.fetch_max(bn, Ordering::Relaxed);
+            if bn == self.1 { Err(eyre::eyre!("stuck")) } else { Ok(bn) }
+        }
+        async fn latest_block_number(&self) -> eyre::Result<u64> {
+            Ok(self.0)
+        }
+        async fn block_hash(&self, _: u64) -> eyre::Result<BlockHash> {
+            unreachable!()
+        }
+        async fn latest_block_meta(&self) -> eyre::Result<BlockMeta> {
+            unreachable!()
+        }
+    }
+
+    let (start, stuck, latest) = (100u64, 105u64, 10_100u64);
+    let max_in_flight = 4;
+    let max_window = 4 * max_in_flight as u64; // matches FETCH_WINDOW_MULTIPLIER
+    let highest = Arc::new(AtomicU64::new(0));
+
+    let (tx, rx) = kanal::bounded::<u64>(1024);
+    let config = Arc::new(PipelineConfig {
+        fetcher_max_in_flight: max_in_flight,
+        poll_interval: Duration::from_millis(10),
+        ..PipelineConfig::default()
+    });
+    let shutdown = CancellationToken::new();
+
+    // Drain so `tx.send` never blocks — isolate the window cap as the sole limiter.
+    let drain = tokio::spawn(async move {
+        let rx = rx.to_async();
+        while rx.recv().await.is_ok() {}
+    });
+    let fetcher = tokio::spawn(block_fetcher(
+        Arc::new(StallFetcher(latest, stuck, highest.clone())),
+        tx,
+        start,
+        config,
+        shutdown.clone(),
+    ));
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(1), fetcher).await;
+    drain.abort();
+
+    let h = highest.load(Ordering::Relaxed);
+    let ceiling = stuck + max_window;
+    assert!(h < ceiling, "attempted {h}, expected < {ceiling}; without cap would reach ~{latest}");
+}
