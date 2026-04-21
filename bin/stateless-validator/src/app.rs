@@ -142,6 +142,8 @@ pub async fn run() -> Result<()> {
     }
 
     let work_dir = PathBuf::from(args.data_dir);
+    std::fs::create_dir_all(&work_dir)
+        .map_err(|e| eyre::eyre!("Failed to create data dir {}: {e}", work_dir.display()))?;
 
     let rpc_config = RpcClientConfig {
         data_max_concurrent_requests: args.data_max_concurrent_requests,

@@ -407,6 +407,8 @@ async fn init_validator_db(
 
     debug!(data_dir = %data_dir, "Initializing local database");
     let work_dir = PathBuf::from(data_dir);
+    std::fs::create_dir_all(&work_dir)
+        .map_err(|e| eyre::eyre!("Failed to create data dir {}: {e}", work_dir.display()))?;
     let db = Arc::new(ServerDB::new(work_dir.join(TRACE_SERVER_DB_FILENAME))?);
 
     // Check if we already have a local tip

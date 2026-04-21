@@ -97,7 +97,7 @@ tokio-util = { version = "0.7", default-features = false }
 tower = "0.5"
 tracing = { version = "0.1", default-features = false }
 tracing-appender = "0.2"
-tracing-subscriber = { version = "=0.3.23", features = ["fmt", "env-filter", "json"], default-features = false }
+tracing-subscriber = { version = "=0.3.23", features = ["ansi", "env-filter", "fmt", "json"], default-features = false }
 zstd = { version = "0.13", default-features = false }
 
 [profile.release]
