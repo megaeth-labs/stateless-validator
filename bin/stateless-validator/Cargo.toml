@@ -17,18 +17,19 @@ alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-eth.workspace = true
 
+# mega
+salt.workspace = true
+
 # op
 op-alloy-rpc-types.workspace = true
 
 # revm
 revm = { workspace = true, features = ["serde"] }
 
-# mega
-salt.workspace = true
-
 # stateless
 stateless-common = { path = "../../crates/stateless-common" }
 stateless-core = { path = "../../crates/stateless-core" }
+stateless-db = { path = "../../crates/stateless-db" }
 
 # misc
 bincode.workspace = true
@@ -58,3 +59,7 @@ stateless-test-utils = { path = "../../crates/stateless-test-utils" }
 
 [features]
 test-bucket-resize = ["salt/test-bucket-resize", "stateless-core/test-bucket-resize"]
+
+[lib]
+name = "stateless_validator"
+path = "src/lib.rs"

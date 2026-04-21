@@ -22,7 +22,10 @@ pub use light_witness::{LightWitness, LightWitnessExecutor};
 pub mod evm_database;
 pub use evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv};
 pub mod db;
-pub use db::{BlockMeta, BlockStore, ChainStore, ContractStore, GenesisStore, PrunableChainStore};
+pub use db::{
+    BlockMeta, BlockStore, ChainStore, ContractStore, GenesisStore, MissingDataKind,
+    PrunableChainStore, StoreError, StoreResult,
+};
 pub mod data_types;
 pub use data_types::{PlainKey, PlainValue, iter_code_hashes};
 pub mod executor;

@@ -1,0 +1,221 @@
+//! App lifecycle: CLI parsing, tracing/metrics setup, DB construction, and handoff to workers.
+
+use std::{path::PathBuf, sync::Arc, time::Duration};
+
+use alloy_genesis::Genesis;
+use alloy_primitives::BlockHash;
+use alloy_rpc_types_eth::BlockId;
+use clap::Parser;
+use eyre::Result;
+use stateless_common::{
+    RpcClient, RpcClientConfig,
+    logging::{LogArgs, migrate_legacy_env_vars},
+};
+use stateless_core::{
+    ChainStore, ContractStore, GenesisStore, chain_spec::ChainSpec, db::BlockMeta,
+};
+use stateless_db::ContractCache;
+use tracing::{info, warn};
+
+use crate::{metrics, validator_db::ValidatorDB, workers};
+
+/// Database filename for the validator.
+pub const VALIDATOR_DB_FILENAME: &str = "validator.redb";
+
+/// Loads or creates a ChainSpec from the database or a genesis file.
+pub fn load_or_create_chain_spec(
+    validator_db: &ValidatorDB,
+    genesis_file: Option<&str>,
+) -> Result<ChainSpec> {
+    let genesis = match genesis_file {
+        Some(path) => {
+            info!(path, "[ChainSpec] Loading genesis from file");
+            let genesis = serde_json::from_str::<Genesis>(&std::fs::read_to_string(path)?)?;
+            validator_db.store_genesis(&genesis)?;
+            genesis
+        }
+        None => {
+            info!("[ChainSpec] Loading genesis from database");
+            validator_db.load_genesis()?.ok_or_else(|| {
+                eyre::eyre!("No genesis config found. Please provide --genesis-file on first run.")
+            })?
+        }
+    };
+
+    Ok(ChainSpec::from_genesis(genesis))
+}
+
+/// Command line arguments for the stateless validator.
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+pub struct CommandLineArgs {
+    /// Directory path where validator data and database files will be stored.
+    #[clap(long, env = "STATELESS_VALIDATOR_DATA_DIR")]
+    pub data_dir: String,
+
+    /// One or more JSON-RPC API endpoints for fetching blockchain data (tried in order).
+    /// Accepts repeated flags (`--rpc-endpoint a --rpc-endpoint b`) or a comma-separated
+    /// list (`--rpc-endpoint a,b`, also via the env var).
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_RPC_ENDPOINT",
+        required = true,
+        value_delimiter = ',',
+        action = clap::ArgAction::Append,
+    )]
+    pub rpc_endpoint: Vec<String>,
+
+    /// One or more MegaETH JSON-RPC API endpoints for fetching witness data (tried in order).
+    /// Accepts repeated flags (`--witness-endpoint a --witness-endpoint b`) or a comma-separated
+    /// list (`--witness-endpoint a,b`, also via the env var).
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_WITNESS_ENDPOINT",
+        required = true,
+        value_delimiter = ',',
+        action = clap::ArgAction::Append,
+    )]
+    pub witness_endpoint: Vec<String>,
+
+    /// Optional trusted block hash to start validation from.
+    #[clap(long, env = "STATELESS_VALIDATOR_START_BLOCK")]
+    pub start_block: Option<String>,
+
+    /// Path to the genesis JSON file for chain configuration.
+    /// Required on first run, optional on subsequent runs (loads from database).
+    #[clap(long, env = "STATELESS_VALIDATOR_GENESIS_FILE")]
+    pub genesis_file: Option<String>,
+
+    /// Endpoint for reporting validated blocks via mega_setValidatedBlocks RPC.
+    /// If not provided, validation reporting is disabled.
+    #[clap(long, env = "STATELESS_VALIDATOR_REPORT_VALIDATION_ENDPOINT")]
+    pub report_validation_endpoint: Option<String>,
+
+    /// Enable Prometheus metrics endpoint.
+    /// When enabled, metrics are exposed at http://0.0.0.0:<metrics-port>/metrics
+    #[clap(long, env = "STATELESS_VALIDATOR_METRICS_ENABLED")]
+    pub metrics_enabled: bool,
+
+    /// Port for Prometheus metrics HTTP endpoint.
+    #[clap(long, env = "STATELESS_VALIDATOR_METRICS_PORT", default_value_t = metrics::DEFAULT_METRICS_PORT)]
+    pub metrics_port: u16,
+
+    /// Maximum concurrent in-flight data-endpoint requests (blocks, headers, code, tx).
+    /// Omit for unlimited.
+    #[clap(long, env = "STATELESS_VALIDATOR_DATA_MAX_CONCURRENT_REQUESTS")]
+    pub data_max_concurrent_requests: Option<usize>,
+
+    /// Maximum concurrent in-flight witness fetches, independent of the data cap.
+    /// Omit for unlimited.
+    #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_MAX_CONCURRENT_REQUESTS")]
+    pub witness_max_concurrent_requests: Option<usize>,
+
+    /// Logging configuration.
+    #[command(flatten)]
+    pub log: LogArgs,
+}
+
+/// Entry point for the validator binary.
+///
+/// Parses CLI args, initializes tracing and metrics, constructs the RPC client and
+/// validator DB, loads or initializes the chain spec + anchor, then hands off to
+/// [`workers::run_with_signals`].
+pub async fn run() -> Result<()> {
+    migrate_legacy_env_vars();
+    let args = CommandLineArgs::parse();
+    let _log_guard = args.log.init_tracing()?;
+    let start = std::time::Instant::now();
+
+    info!(data_dir = %args.data_dir, "[Main] Data directory");
+    info!(rpc_endpoints = ?args.rpc_endpoint, "[Main] RPC endpoints");
+    info!(witness_endpoints = ?args.witness_endpoint, "[Main] Witness endpoints");
+    if let Some(ref genesis_file) = args.genesis_file {
+        info!(genesis_file, "[Main] Genesis file");
+    }
+
+    if args.metrics_enabled {
+        let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
+        metrics::init_metrics(metrics_addr)?;
+        info!(port = args.metrics_port, "[Main] Metrics enabled");
+    } else {
+        info!("[Main] Metrics disabled");
+    }
+
+    let work_dir = PathBuf::from(args.data_dir);
+
+    let rpc_config = RpcClientConfig {
+        data_max_concurrent_requests: args.data_max_concurrent_requests,
+        witness_max_concurrent_requests: args.witness_max_concurrent_requests,
+        ..RpcClientConfig::validator()
+    }
+    .with_metrics(Arc::new(metrics::ValidatorMetrics));
+    let data_apis: Vec<&str> = args.rpc_endpoint.iter().map(String::as_str).collect();
+    let witness_apis: Vec<&str> = args.witness_endpoint.iter().map(String::as_str).collect();
+    let client = Arc::new(RpcClient::new_with_config(
+        &data_apis,
+        &witness_apis,
+        rpc_config,
+        args.report_validation_endpoint.as_deref(),
+    )?);
+    let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
+    let contract_cache =
+        Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
+
+    let chain_spec =
+        Arc::new(load_or_create_chain_spec(&validator_db, args.genesis_file.as_deref())?);
+    info!("[Main] Chain spec loaded successfully");
+
+    if let Some(start_block_str) = &args.start_block {
+        info!(start_block = %start_block_str, "[Main] Initializing from start block");
+
+        let block_hash: BlockHash = start_block_str.parse()?;
+        let header = loop {
+            match client.get_header(BlockId::Hash(block_hash.into()), true).await {
+                Ok(header) => break header,
+                Err(e) => {
+                    warn!(block_hash = %block_hash, error = %e, "[Main] Failed to fetch block, retrying");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        };
+
+        let anchor = BlockMeta {
+            block_number: header.number,
+            block_hash: header.hash,
+            post_state_root: header.state_root,
+            post_withdrawals_root: header
+                .withdrawals_root
+                .ok_or_else(|| eyre::eyre!("Block {} is missing withdrawals_root", block_hash))?,
+        };
+        validator_db.reset_to_anchor(&anchor)?;
+
+        info!(
+            block_hash = %header.hash,
+            block_number = header.number,
+            "[Main] Successfully initialized from start block"
+        );
+    } else {
+        let tip = validator_db.get_canonical_tip()?.ok_or_else(|| {
+            eyre::eyre!(
+                "No trusted starting point found. Specify a trusted block with --start-block <blockhash>"
+            )
+        })?;
+        info!(
+            block_number = tip.block_number,
+            block_hash = %tip.block_hash,
+            "[Main] Continuing from existing canonical chain"
+        );
+    }
+
+    let result = workers::run_with_signals(
+        client,
+        validator_db,
+        contract_cache,
+        chain_spec,
+        args.report_validation_endpoint,
+    )
+    .await;
+
+    info!(elapsed = ?start.elapsed(), "[Main] Shutdown complete");
+    result
+}

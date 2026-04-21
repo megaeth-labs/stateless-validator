@@ -13,7 +13,7 @@ use futures::future;
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
-use stateless_common::{RpcClient, db::ContractCache};
+use stateless_common::RpcClient;
 use stateless_core::{
     chain_spec::ChainSpec,
     data_types::iter_code_hashes,
@@ -22,6 +22,7 @@ use stateless_core::{
     pipeline::{BlockFetcher, BlockProcessor, ErrorAction, PipelineHooks, ProcessedBlock},
     withdrawals::MptWitness,
 };
+use stateless_db::ContractCache;
 use tokio::task;
 use tracing::{debug, error};
 

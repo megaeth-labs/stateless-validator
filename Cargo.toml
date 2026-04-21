@@ -4,6 +4,7 @@ members = [
     "bin/stateless-validator",
     "crates/stateless-common",
     "crates/stateless-core",
+    "crates/stateless-db",
     "crates/stateless-test-utils",
 ]
 resolver = "2"

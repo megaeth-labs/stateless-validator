@@ -11,16 +11,18 @@ use op_alloy_rpc_types::Transaction;
 use rayon::prelude::*;
 use redb::{ReadableDatabase, ReadableTable};
 use revm::state::Bytecode;
-use stateless_common::db::{
-    ANCHOR_BLOCK, BLOCK_DATA, BLOCK_RECORDS, CANONICAL_CHAIN, CONTRACTS, Database, MissingDataKind,
-    ValidationDbError, ValidationDbResult, WITNESSES, db_add_contracts, db_advance_chain,
-    db_get_anchor, db_get_block_hash, db_get_canonical_tip, db_get_contracts,
-    db_get_earliest_block, db_reset_to_anchor, db_rollback_chain, decode_block_from_slice,
-    decode_from_slice, encode_block_to_vec, encode_to_vec,
-};
 use stateless_core::{
     LightWitness,
-    db::{BlockMeta, BlockStore, ChainStore, ContractStore, PrunableChainStore},
+    db::{
+        BlockMeta, BlockStore, ChainStore, ContractStore, MissingDataKind, PrunableChainStore,
+        StoreError, StoreResult,
+    },
+};
+use stateless_db::{
+    ANCHOR_BLOCK, BLOCK_DATA, BLOCK_RECORDS, CANONICAL_CHAIN, CONTRACTS, Database, WITNESSES,
+    db_add_contracts, db_advance_chain, db_get_anchor, db_get_block_hash, db_get_canonical_tip,
+    db_get_contracts, db_get_earliest_block, db_reset_to_anchor, db_rollback_chain,
+    decode_block_from_slice, decode_from_slice, encode_block_to_vec, encode_to_vec,
 };
 
 /// Block storage and chain tracking database for debug-trace-server.
@@ -30,7 +32,7 @@ pub struct ServerDB {
 
 impl ServerDB {
     /// Create a new redb instance or open an existing one.
-    pub fn new(db_path: impl AsRef<Path>) -> ValidationDbResult<Self> {
+    pub fn new(db_path: impl AsRef<Path>) -> StoreResult<Self> {
         let database = Database::create(db_path)?;
 
         let write_txn = database.begin_write()?;
@@ -51,7 +53,7 @@ impl ServerDB {
     pub fn store_block_data(
         &self,
         tasks: &[(Block<Transaction>, LightWitness)],
-    ) -> ValidationDbResult<()> {
+    ) -> StoreResult<()> {
         if tasks.is_empty() {
             return Ok(());
         }
@@ -59,7 +61,7 @@ impl ServerDB {
         let tasks = tasks
             .par_iter()
             .map(|(block, light_witness)| {
-                Ok::<_, ValidationDbError>((
+                Ok::<_, StoreError>((
                     block.header.number,
                     block.header.hash.0,
                     encode_block_to_vec(block)?,
@@ -85,7 +87,7 @@ impl ServerDB {
     }
 
     /// Gets the latest block in the local chain.
-    pub fn get_local_tip(&self) -> ValidationDbResult<Option<(BlockNumber, BlockHash)>> {
+    pub fn get_local_tip(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
         let read_txn = self.database.begin_read()?;
         let chain = read_txn.open_table(CANONICAL_CHAIN)?;
         Ok(chain.last()?.map(|(k, v)| {
@@ -101,7 +103,7 @@ impl ServerDB {
         block_hash: BlockHash,
         post_state_root: B256,
         post_withdrawals_root: B256,
-    ) -> ValidationDbResult<()> {
+    ) -> StoreResult<()> {
         let write_txn = self.database.begin_write()?;
         {
             let mut anchor_table = write_txn.open_table(ANCHOR_BLOCK)?;
@@ -119,7 +121,7 @@ impl ServerDB {
     }
 
     /// Cleans up old block data to save storage space.
-    pub fn prune_history(&self, before_block: BlockNumber) -> ValidationDbResult<u64> {
+    pub fn prune_history(&self, before_block: BlockNumber) -> StoreResult<u64> {
         let read_txn = self.database.begin_read()?;
         let block_records = read_txn.open_table(BLOCK_RECORDS)?;
 
@@ -166,7 +168,7 @@ impl ServerDB {
     pub fn get_block_and_witness(
         &self,
         block_hash: BlockHash,
-    ) -> ValidationDbResult<(Block<Transaction>, LightWitness)> {
+    ) -> StoreResult<(Block<Transaction>, LightWitness)> {
         let start = std::time::Instant::now();
 
         let read_txn = self.database.begin_read()?;
@@ -174,10 +176,9 @@ impl ServerDB {
         let witnesses = read_txn.open_table(WITNESSES)?;
         let txn_ms = start.elapsed().as_millis();
 
-        let block_bytes = block_data.get(block_hash.0)?.ok_or(ValidationDbError::MissingData {
-            kind: MissingDataKind::BlockData,
-            block_hash,
-        })?;
+        let block_bytes = block_data
+            .get(block_hash.0)?
+            .ok_or(StoreError::MissingData { kind: MissingDataKind::BlockData, block_hash })?;
         let block_bytes_value = block_bytes.value();
         let block_bytes_len = block_bytes_value.len();
         let db_read_block_ms = start.elapsed().as_millis();
@@ -187,7 +188,7 @@ impl ServerDB {
 
         let witness_bytes = witnesses
             .get(block_hash.0)?
-            .ok_or(ValidationDbError::MissingData { kind: MissingDataKind::Witness, block_hash })?;
+            .ok_or(StoreError::MissingData { kind: MissingDataKind::Witness, block_hash })?;
         let witness_bytes_value = witness_bytes.value();
         let witness_bytes_len = witness_bytes_value.len();
         let db_read_witness_ms = start.elapsed().as_millis();
@@ -212,61 +213,61 @@ impl ServerDB {
 }
 
 impl ContractStore for ServerDB {
-    fn get_contracts(&self, hashes: &[B256]) -> eyre::Result<(HashMap<B256, Bytecode>, Vec<B256>)> {
+    fn get_contracts(&self, hashes: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
         db_get_contracts(&self.database, hashes)
     }
 
-    fn add_contracts(&self, codes: &[(B256, Bytecode)]) -> eyre::Result<()> {
+    fn add_contracts(&self, codes: &[(B256, Bytecode)]) -> StoreResult<()> {
         db_add_contracts(&self.database, codes)
     }
 }
 
 impl ChainStore for ServerDB {
-    fn get_canonical_tip(&self) -> eyre::Result<Option<BlockMeta>> {
+    fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>> {
         db_get_canonical_tip(&self.database)
     }
 
-    fn get_anchor(&self) -> eyre::Result<Option<BlockMeta>> {
+    fn get_anchor(&self) -> StoreResult<Option<BlockMeta>> {
         db_get_anchor(&self.database)
     }
 
-    fn advance_chain(&self, blocks: &[BlockMeta]) -> eyre::Result<()> {
+    fn advance_chain(&self, blocks: &[BlockMeta]) -> StoreResult<()> {
         db_advance_chain(&self.database, blocks)
     }
 
-    fn get_block_hash(&self, block_number: BlockNumber) -> eyre::Result<Option<BlockHash>> {
+    fn get_block_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>> {
         db_get_block_hash(&self.database, block_number)
     }
 
-    fn get_earliest_block(&self) -> eyre::Result<Option<(BlockNumber, BlockHash)>> {
+    fn get_earliest_block(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
         db_get_earliest_block(&self.database)
     }
 
-    fn rollback_chain(&self, to_block: BlockNumber) -> eyre::Result<()> {
+    fn rollback_chain(&self, to_block: BlockNumber) -> StoreResult<()> {
         db_rollback_chain(&self.database, to_block)
     }
 
-    fn reset_to_anchor(&self, anchor: &BlockMeta) -> eyre::Result<()> {
+    fn reset_to_anchor(&self, anchor: &BlockMeta) -> StoreResult<()> {
         db_reset_to_anchor(&self.database, anchor)
     }
 }
 
 impl PrunableChainStore for ServerDB {
-    fn prune_chain(&self, before_block: BlockNumber) -> eyre::Result<u64> {
-        Ok(ServerDB::prune_history(self, before_block)?)
+    fn prune_chain(&self, before_block: BlockNumber) -> StoreResult<u64> {
+        ServerDB::prune_history(self, before_block)
     }
 }
 
 impl BlockStore for ServerDB {
-    fn store_block_data(&self, blocks: &[(Block<Transaction>, LightWitness)]) -> eyre::Result<()> {
-        Ok(ServerDB::store_block_data(self, blocks)?)
+    fn store_block_data(&self, blocks: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
+        ServerDB::store_block_data(self, blocks)
     }
 
     fn get_block_and_witness(
         &self,
         block_hash: BlockHash,
-    ) -> eyre::Result<(Block<Transaction>, LightWitness)> {
-        Ok(ServerDB::get_block_and_witness(self, block_hash)?)
+    ) -> StoreResult<(Block<Transaction>, LightWitness)> {
+        ServerDB::get_block_and_witness(self, block_hash)
     }
 }
 
@@ -463,7 +464,7 @@ mod tests {
 
         let err = result.unwrap_err();
         match err {
-            ValidationDbError::MissingData { kind: MissingDataKind::BlockData, block_hash } => {
+            StoreError::MissingData { kind: MissingDataKind::BlockData, block_hash } => {
                 assert_eq!(block_hash, missing_hash);
             }
             other => panic!("expected MissingData error, got: {other}"),

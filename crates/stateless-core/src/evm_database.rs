@@ -28,14 +28,9 @@ use crate::{
 };
 
 /// Error type for witness database operations
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{0}")]
 pub struct WitnessDatabaseError(pub String);
-impl std::fmt::Display for WitnessDatabaseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-impl std::error::Error for WitnessDatabaseError {}
 impl DBErrorMarker for WitnessDatabaseError {}
 
 /// REVM database backed by witness data for partial stateless execution.

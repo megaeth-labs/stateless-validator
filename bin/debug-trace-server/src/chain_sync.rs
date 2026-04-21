@@ -126,7 +126,7 @@ impl PipelineHooks for TraceHooks {
 
     fn pre_advance(&self, items: &[TraceProcessedBlock]) -> eyre::Result<()> {
         let pairs: Vec<_> = items.iter().map(|i| (i.block.clone(), i.witness.clone())).collect();
-        self.db.store_block_data(&pairs)
+        Ok(self.db.store_block_data(&pairs)?)
     }
 
     fn post_advance(&self, new_tip: &BlockMeta) -> eyre::Result<()> {
@@ -177,15 +177,6 @@ mod tests {
     }
 
     #[test]
-    fn test_trace_processed_block_implements_trait() {
-        let meta = make_block_meta(42);
-        assert_eq!(meta.block_number, 42);
-
-        // verify_continuity should be no-op for TraceProcessedBlock
-        // (tested indirectly via ProcessedBlock default impl)
-    }
-
-    #[test]
     fn test_trace_hooks_reorg_without_cache() {
         let hooks = TraceHooks::new(Arc::new(MockBlockStore), None);
         hooks.on_reorg(10, 2, &[Default::default()]).unwrap();
@@ -203,7 +194,7 @@ mod tests {
         fn get_contracts(
             &self,
             _: &[alloy_primitives::B256],
-        ) -> eyre::Result<(
+        ) -> stateless_core::StoreResult<(
             std::collections::HashMap<alloy_primitives::B256, revm::state::Bytecode>,
             Vec<alloy_primitives::B256>,
         )> {
@@ -212,47 +203,52 @@ mod tests {
         fn add_contracts(
             &self,
             _: &[(alloy_primitives::B256, revm::state::Bytecode)],
-        ) -> eyre::Result<()> {
+        ) -> stateless_core::StoreResult<()> {
             Ok(())
         }
     }
     impl stateless_core::ChainStore for MockBlockStore {
-        fn get_canonical_tip(&self) -> eyre::Result<Option<BlockMeta>> {
+        fn get_canonical_tip(&self) -> stateless_core::StoreResult<Option<BlockMeta>> {
             Ok(None)
         }
-        fn get_anchor(&self) -> eyre::Result<Option<BlockMeta>> {
+        fn get_anchor(&self) -> stateless_core::StoreResult<Option<BlockMeta>> {
             Ok(None)
         }
-        fn advance_chain(&self, _: &[BlockMeta]) -> eyre::Result<()> {
+        fn advance_chain(&self, _: &[BlockMeta]) -> stateless_core::StoreResult<()> {
             Ok(())
         }
-        fn get_block_hash(&self, _: BlockNumber) -> eyre::Result<Option<BlockHash>> {
+        fn get_block_hash(&self, _: BlockNumber) -> stateless_core::StoreResult<Option<BlockHash>> {
             Ok(None)
         }
-        fn get_earliest_block(&self) -> eyre::Result<Option<(BlockNumber, BlockHash)>> {
+        fn get_earliest_block(
+            &self,
+        ) -> stateless_core::StoreResult<Option<(BlockNumber, BlockHash)>> {
             Ok(None)
         }
-        fn rollback_chain(&self, _: BlockNumber) -> eyre::Result<()> {
+        fn rollback_chain(&self, _: BlockNumber) -> stateless_core::StoreResult<()> {
             Ok(())
         }
-        fn reset_to_anchor(&self, _: &BlockMeta) -> eyre::Result<()> {
+        fn reset_to_anchor(&self, _: &BlockMeta) -> stateless_core::StoreResult<()> {
             Ok(())
         }
     }
     impl stateless_core::PrunableChainStore for MockBlockStore {
-        fn prune_chain(&self, _: BlockNumber) -> eyre::Result<u64> {
+        fn prune_chain(&self, _: BlockNumber) -> stateless_core::StoreResult<u64> {
             Ok(0)
         }
     }
     impl stateless_core::BlockStore for MockBlockStore {
-        fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> eyre::Result<()> {
+        fn store_block_data(
+            &self,
+            _: &[(Block<Transaction>, LightWitness)],
+        ) -> stateless_core::StoreResult<()> {
             Ok(())
         }
         fn get_block_and_witness(
             &self,
             _: BlockHash,
-        ) -> eyre::Result<(Block<Transaction>, LightWitness)> {
-            Err(eyre::eyre!("not implemented"))
+        ) -> stateless_core::StoreResult<(Block<Transaction>, LightWitness)> {
+            Err(stateless_core::StoreError::Corrupt("not implemented".into()))
         }
     }
 }

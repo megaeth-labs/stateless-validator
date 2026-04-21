@@ -1,0 +1,54 @@
+//! Worker stage: processor pool that consumes fetched blocks and emits results.
+
+use std::sync::Arc;
+
+use tokio::task::JoinHandle;
+use tracing::debug;
+
+use crate::pipeline::{config::ErrorAction, traits::BlockProcessor};
+
+/// Spawns N worker tasks: `fetch_rx` → `processor.process()` → `result_tx`.
+pub(crate) fn spawn_workers<P: BlockProcessor>(
+    processor: Arc<P>,
+    fetch_rx: kanal::Receiver<P::Input>,
+    result_tx: kanal::Sender<std::result::Result<P::Output, (String, ErrorAction)>>,
+    count: usize,
+) -> Vec<JoinHandle<()>> {
+    (0..count)
+        .map(|worker_id| {
+            let processor = processor.clone();
+            let fetch_rx = fetch_rx.clone();
+            let result_tx = result_tx.clone();
+            tokio::spawn(async move {
+                let fetch_rx = fetch_rx.to_async();
+                let result_tx = result_tx.to_async();
+                loop {
+                    let input = match fetch_rx.recv().await {
+                        Ok(input) => input,
+                        Err(_) => {
+                            debug!(worker_id, "[Worker] Fetch channel closed, stopping");
+                            return;
+                        }
+                    };
+
+                    let result = match processor.process(input).await {
+                        Ok(output) => {
+                            processor.on_task_done(worker_id, true);
+                            Ok(output)
+                        }
+                        Err(e) => {
+                            processor.on_task_done(worker_id, false);
+                            let action = processor.error_action(&e);
+                            Err((e.to_string(), action))
+                        }
+                    };
+
+                    if result_tx.send(result).await.is_err() {
+                        debug!(worker_id, "[Worker] Result channel closed, stopping");
+                        return;
+                    }
+                }
+            })
+        })
+        .collect()
+}
