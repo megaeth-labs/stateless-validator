@@ -18,7 +18,7 @@ fn test_pipeline_config_default_uses_cpu_count() {
     assert_eq!(config.concurrent_workers, cpus);
     assert_eq!(config.fetch_channel_capacity, 2 * cpus);
     assert_eq!(config.result_channel_capacity, 2 * cpus);
-    assert_eq!(config.fetcher_max_in_flight, cpus);
+    assert_eq!(config.fetcher_max_in_flight, 2 * cpus);
 }
 
 #[test]
@@ -459,7 +459,7 @@ async fn test_block_fetcher_streams_out_of_order() {
     });
     let (tx, rx) = kanal::bounded::<u64>(8);
     let config = Arc::new(PipelineConfig {
-        fetcher_max_in_flight: 4,        // window holds all 4 blocks
+        fetcher_max_in_flight: 4,     // window holds all 4 blocks
         sync_target: Some(start + 3), // fetcher exits cleanly after block 103
         poll_interval: Duration::from_millis(10),
         ..PipelineConfig::default()

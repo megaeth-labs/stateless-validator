@@ -24,7 +24,7 @@ use stateless_core::{
 };
 use stateless_db::ContractCache;
 use tokio::task;
-use tracing::{debug, error};
+use tracing::{error, info};
 
 use crate::metrics;
 
@@ -249,7 +249,7 @@ impl BlockProcessor for ValidatorProcessor {
 
         match &validation_result {
             Ok(stats) => {
-                debug!(block_number, "[Worker] Successfully validated block");
+                info!(block_number, "[Worker] Successfully validated block");
                 metrics::on_validation_success(
                     start.elapsed().as_secs_f64(),
                     stats.witness_verification_time,

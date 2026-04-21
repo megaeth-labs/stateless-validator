@@ -41,7 +41,10 @@ impl Default for PipelineConfig {
             error_restart_delay: Duration::from_secs(1),
             fetch_channel_capacity: 2 * workers,
             result_channel_capacity: 2 * workers,
-            fetcher_max_in_flight: workers,
+            // 2× workers: fetchers are I/O-bound (RPC round-trips), so their concurrency
+            // should exceed the CPU-bound worker count to keep workers fed. Bound a run-away
+            // provider with `--data-max-concurrent-requests` / `--witness-max-concurrent-requests`.
+            fetcher_max_in_flight: 2 * workers,
             fetcher_max_backoff: Duration::from_secs(30),
             stale_reset_threshold: None,
         }

@@ -58,9 +58,13 @@ pub async fn run_with_signals(
         None
     };
 
+    // Snapshot the canonical tip before the pipeline runs so we can report
+    // `first_validated = initial_tip + 1 .. final_tip` at shutdown.
+    let initial_tip = validator_db.get_canonical_tip()?.map(|t| t.block_number);
+
     let mut pipeline_handle = tokio::spawn(run_pipeline(
         fetcher,
-        validator_db,
+        Arc::clone(&validator_db),
         processor,
         hooks,
         config,
@@ -93,6 +97,20 @@ pub async fn run_with_signals(
 
     if let Some(reporter) = reporter {
         let _ = tokio::time::timeout(Duration::from_secs(3), reporter).await;
+    }
+
+    // Canonical chain advances strictly +1 (advancer enforces parent-hash continuity and
+    // rolls back on reorg), so the final tip bounds the validated range exactly.
+    match (initial_tip, validator_db.get_canonical_tip()?.map(|t| t.block_number)) {
+        (Some(before), Some(after)) if after > before => {
+            info!(
+                start = before + 1,
+                end = after,
+                count = after - before,
+                "[Main] Validated blocks this session",
+            );
+        }
+        _ => info!("[Main] No blocks validated this session"),
     }
 
     result
