@@ -528,8 +528,7 @@ async fn test_block_fetcher_respects_tip_buffer() {
     let highest = Arc::new(AtomicU64::new(0));
 
     let (tx, rx) = kanal::bounded::<u64>(64);
-    let mut near_tip = super::NearTipConfig::default();
-    near_tip.tip_buffer = buffer;
+    let near_tip = super::NearTipConfig { tip_buffer: buffer, ..Default::default() };
     let config = Arc::new(PipelineConfig {
         concurrent_workers: 2,
         poll_interval: Duration::from_millis(10),
