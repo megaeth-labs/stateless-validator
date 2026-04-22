@@ -118,7 +118,7 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
 
     register_metric_descriptions();
     init_rpc_method_counters();
-    info!("[Metrics] Prometheus exporter listening on {}", addr);
+    info!("Prometheus exporter listening on {}", addr);
     Ok(())
 }
 

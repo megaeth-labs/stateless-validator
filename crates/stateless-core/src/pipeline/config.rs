@@ -4,12 +4,33 @@ use std::time::Duration;
 
 use alloy_primitives::{BlockHash, BlockNumber};
 
+use crate::BackoffPolicy;
+
+/// Near-tip mode parameters. When the fetcher's lag vs remote tip is below `lag_threshold`,
+/// failed block fetches are delayed by `retry_delay` before re-spawn. This avoids hammering
+/// the endpoint while it's still generating the very witness we're asking for.
+#[derive(Debug, Clone)]
+pub struct NearTipConfig {
+    /// Lag threshold (in blocks) below which near-tip mode activates.
+    pub lag_threshold: u64,
+    /// Delay before re-spawning a failed fetch while in near-tip mode.
+    /// Witness generation upstream lags block production by ~1-2s.
+    pub retry_delay: Duration,
+}
+
+impl Default for NearTipConfig {
+    fn default() -> Self {
+        Self { lag_threshold: 10, retry_delay: Duration::from_millis(500) }
+    }
+}
+
 /// Configuration for the chain sync pipeline.
 ///
 /// Binary-specific settings (metrics, reporting, pruner) live in binary CLI args.
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
-    /// Number of parallel processing workers.
+    /// Number of parallel processing workers. Also derives the fetcher's in-flight window
+    /// and both channel capacities (each set to `2 * concurrent_workers`).
     pub concurrent_workers: usize,
     /// Optional block height to sync to; `None` for infinite sync.
     pub sync_target: Option<u64>,
@@ -17,35 +38,49 @@ pub struct PipelineConfig {
     pub poll_interval: Duration,
     /// Time to wait when pipeline encounters errors before restarting.
     pub error_restart_delay: Duration,
-    /// Channel capacity for the fetch→worker pipeline.
-    pub fetch_channel_capacity: usize,
-    /// Channel capacity for the worker→advancer pipeline.
-    pub result_channel_capacity: usize,
-    /// Maximum number of in-flight block fetches.
-    pub fetcher_max_in_flight: usize,
-    /// Maximum RPC retry backoff for the fetcher.
-    pub fetcher_max_backoff: Duration,
+    /// Exponential-backoff policy for the fetcher's chain-tip lookup failures.
+    /// Unbounded: the polling loop retries forever.
+    pub fetcher_tip_backoff: BackoffPolicy,
+    /// Near-tip mode parameters. `None` disables near-tip mode (always catch-up semantics:
+    /// immediate retry, standard log escalation).
+    pub near_tip: Option<NearTipConfig>,
+    /// Per-cycle shutdown timeout for fetcher + workers (`await_handles`).
+    /// Heavy-block validation can take >1s; tight values cause spurious "did not drain" warnings.
+    pub await_handles_timeout: Duration,
     /// If local tip falls behind remote by more than this, reset anchor.
     /// `None` = disabled (validator). `Some(N)` = enabled (trace server).
     pub stale_reset_threshold: Option<u64>,
 }
 
+impl PipelineConfig {
+    /// Fetcher in-flight window and both channel capacities are all sized to `2 × workers`.
+    /// Fetchers are I/O-bound so their concurrency exceeds the CPU-bound worker count;
+    /// bound a run-away provider with `--data-max-concurrent-requests` /
+    /// `--witness-max-concurrent-requests` instead.
+    pub fn fetcher_max_in_flight(&self) -> usize {
+        2 * self.concurrent_workers
+    }
+
+    /// Capacity of both the fetch→worker and worker→advancer channels.
+    pub fn channel_capacity(&self) -> usize {
+        2 * self.concurrent_workers
+    }
+}
+
 impl Default for PipelineConfig {
     fn default() -> Self {
         // Physical cores: workers are CPU-bound (EVM + IPA), hyperthreads don't help.
-        let workers = num_cpus::get_physical();
         Self {
-            concurrent_workers: workers,
+            concurrent_workers: num_cpus::get_physical(),
             sync_target: None,
             poll_interval: Duration::from_millis(100),
             error_restart_delay: Duration::from_secs(1),
-            fetch_channel_capacity: 2 * workers,
-            result_channel_capacity: 2 * workers,
-            // 2× workers: fetchers are I/O-bound (RPC round-trips), so their concurrency
-            // should exceed the CPU-bound worker count to keep workers fed. Bound a run-away
-            // provider with `--data-max-concurrent-requests` / `--witness-max-concurrent-requests`.
-            fetcher_max_in_flight: 2 * workers,
-            fetcher_max_backoff: Duration::from_secs(30),
+            fetcher_tip_backoff: BackoffPolicy::unbounded(
+                Duration::from_millis(200),
+                Duration::from_secs(30),
+            ),
+            near_tip: Some(NearTipConfig::default()),
+            await_handles_timeout: Duration::from_secs(30),
             stale_reset_threshold: None,
         }
     }

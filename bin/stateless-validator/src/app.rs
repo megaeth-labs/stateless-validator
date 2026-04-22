@@ -12,7 +12,7 @@ use stateless_common::{
     logging::{LogArgs, migrate_legacy_env_vars},
 };
 use stateless_core::{
-    ChainStore, ContractStore, GenesisStore, chain_spec::ChainSpec, db::BlockMeta,
+    BackoffPolicy, ChainStore, ContractStore, GenesisStore, chain_spec::ChainSpec, db::BlockMeta,
 };
 use stateless_db::ContractCache;
 use tracing::{info, warn};
@@ -29,13 +29,13 @@ pub fn load_or_create_chain_spec(
 ) -> Result<ChainSpec> {
     let genesis = match genesis_file {
         Some(path) => {
-            info!(path, "[ChainSpec] Loading genesis from file");
+            info!(path, "Loading genesis from file");
             let genesis = serde_json::from_str::<Genesis>(&std::fs::read_to_string(path)?)?;
             validator_db.store_genesis(&genesis)?;
             genesis
         }
         None => {
-            info!("[ChainSpec] Loading genesis from database");
+            info!("Loading genesis from database");
             validator_db.load_genesis()?.ok_or_else(|| {
                 eyre::eyre!("No genesis config found. Please provide --genesis-file on first run.")
             })?
@@ -110,6 +110,31 @@ pub struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_MAX_CONCURRENT_REQUESTS")]
     pub witness_max_concurrent_requests: Option<usize>,
 
+    /// Fetcher caught-up poll interval (milliseconds). Also rate-limits `eth_blockNumber`.
+    /// Lower values reduce tip-following lag at the cost of more RPC traffic when caught up.
+    #[clap(long, env = "STATELESS_VALIDATOR_POLL_INTERVAL_MS")]
+    pub poll_interval_ms: Option<u64>,
+
+    /// Pipeline restart delay after a transient cycle error (milliseconds).
+    #[clap(long, env = "STATELESS_VALIDATOR_ERROR_RESTART_DELAY_MS")]
+    pub error_restart_delay_ms: Option<u64>,
+
+    /// Cap on exponential backoff after `latest_block_number()` failures (milliseconds).
+    #[clap(long, env = "STATELESS_VALIDATOR_FETCHER_MAX_BACKOFF_MS")]
+    pub fetcher_max_backoff_ms: Option<u64>,
+
+    /// Maximum per-call RPC retry attempts before falling over to the next endpoint.
+    #[clap(long, env = "STATELESS_VALIDATOR_RPC_MAX_RETRIES")]
+    pub rpc_max_retries: Option<u32>,
+
+    /// Initial RPC retry backoff (milliseconds). Doubles each retry up to `--rpc-max-backoff-ms`.
+    #[clap(long, env = "STATELESS_VALIDATOR_RPC_INITIAL_BACKOFF_MS")]
+    pub rpc_initial_backoff_ms: Option<u64>,
+
+    /// Cap on per-call RPC retry backoff (milliseconds).
+    #[clap(long, env = "STATELESS_VALIDATOR_RPC_MAX_BACKOFF_MS")]
+    pub rpc_max_backoff_ms: Option<u64>,
+
     /// Logging configuration.
     #[command(flatten)]
     pub log: LogArgs,
@@ -126,29 +151,42 @@ pub async fn run() -> Result<()> {
     let _log_guard = args.log.init_tracing()?;
     let start = std::time::Instant::now();
 
-    info!(data_dir = %args.data_dir, "[Main] Data directory");
-    info!(rpc_endpoints = ?args.rpc_endpoint, "[Main] RPC endpoints");
-    info!(witness_endpoints = ?args.witness_endpoint, "[Main] Witness endpoints");
+    info!(data_dir = %args.data_dir, "Data directory");
+    info!(rpc_endpoints = ?args.rpc_endpoint, "RPC endpoints");
+    info!(witness_endpoints = ?args.witness_endpoint, "Witness endpoints");
     if let Some(ref genesis_file) = args.genesis_file {
-        info!(genesis_file, "[Main] Genesis file");
+        info!(genesis_file, "Genesis file");
     }
 
     if args.metrics_enabled {
         let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
         metrics::init_metrics(metrics_addr)?;
-        info!(port = args.metrics_port, "[Main] Metrics enabled");
+        info!(port = args.metrics_port, "Metrics enabled");
     } else {
-        info!("[Main] Metrics disabled");
+        info!("Metrics disabled");
     }
 
     let work_dir = PathBuf::from(args.data_dir);
     std::fs::create_dir_all(&work_dir)
         .map_err(|e| eyre::eyre!("Failed to create data dir {}: {e}", work_dir.display()))?;
 
+    let rpc_defaults = RpcClientConfig::validator();
+    let rpc_retry = BackoffPolicy {
+        initial: args
+            .rpc_initial_backoff_ms
+            .map(Duration::from_millis)
+            .unwrap_or(rpc_defaults.rpc_retry.initial),
+        max: args
+            .rpc_max_backoff_ms
+            .map(Duration::from_millis)
+            .unwrap_or(rpc_defaults.rpc_retry.max),
+        max_retries: args.rpc_max_retries.map(Some).unwrap_or(rpc_defaults.rpc_retry.max_retries),
+    };
     let rpc_config = RpcClientConfig {
         data_max_concurrent_requests: args.data_max_concurrent_requests,
         witness_max_concurrent_requests: args.witness_max_concurrent_requests,
-        ..RpcClientConfig::validator()
+        rpc_retry,
+        ..rpc_defaults
     }
     .with_metrics(Arc::new(metrics::ValidatorMetrics));
     let data_apis: Vec<&str> = args.rpc_endpoint.iter().map(String::as_str).collect();
@@ -165,21 +203,44 @@ pub async fn run() -> Result<()> {
 
     let chain_spec =
         Arc::new(load_or_create_chain_spec(&validator_db, args.genesis_file.as_deref())?);
-    info!("[Main] Chain spec loaded successfully");
+    info!("Chain spec loaded successfully");
 
     if let Some(start_block_str) = &args.start_block {
-        info!(start_block = %start_block_str, "[Main] Initializing from start block");
+        info!(start_block = %start_block_str, "Initializing from start block");
 
         let block_hash: BlockHash = start_block_str.parse()?;
-        let header = loop {
+        // Bounded exponential backoff (1s → 30s, ~5 minutes total). The inner RPC client
+        // already retries per-call; this outer loop tolerates an endpoint that's still
+        // coming up at boot, but fails fast on a permanent misconfiguration.
+        const MAX_ATTEMPTS: u32 = 30;
+        let mut backoff = Duration::from_secs(1);
+        let max_backoff = Duration::from_secs(30);
+        let mut header = None;
+        for attempt in 1..=MAX_ATTEMPTS {
             match client.get_header(BlockId::Hash(block_hash.into()), true).await {
-                Ok(header) => break header,
+                Ok(h) => {
+                    header = Some(h);
+                    break;
+                }
                 Err(e) => {
-                    warn!(block_hash = %block_hash, error = %e, "[Main] Failed to fetch block, retrying");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    warn!(
+                        block_hash = %block_hash,
+                        attempt,
+                        max_attempts = MAX_ATTEMPTS,
+                        error = %e,
+                        backoff = ?backoff,
+                        "Failed to fetch start block, retrying",
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(max_backoff);
+                    }
                 }
             }
-        };
+        }
+        let header = header.ok_or_else(|| {
+            eyre::eyre!("Failed to fetch start block {block_hash} after {MAX_ATTEMPTS} attempts",)
+        })?;
 
         let anchor = BlockMeta {
             block_number: header.number,
@@ -194,7 +255,7 @@ pub async fn run() -> Result<()> {
         info!(
             block_hash = %header.hash,
             block_number = header.number,
-            "[Main] Successfully initialized from start block"
+            "Successfully initialized from start block"
         );
     } else {
         let tip = validator_db.get_canonical_tip()?.ok_or_else(|| {
@@ -205,9 +266,30 @@ pub async fn run() -> Result<()> {
         info!(
             block_number = tip.block_number,
             block_hash = %tip.block_hash,
-            "[Main] Continuing from existing canonical chain"
+            "Continuing from existing canonical chain"
         );
     }
+
+    let pipeline_defaults = stateless_core::PipelineConfig::default();
+    let fetcher_tip_backoff = BackoffPolicy {
+        max: args
+            .fetcher_max_backoff_ms
+            .map(Duration::from_millis)
+            .unwrap_or(pipeline_defaults.fetcher_tip_backoff.max),
+        ..pipeline_defaults.fetcher_tip_backoff.clone()
+    };
+    let pipeline_config = stateless_core::PipelineConfig {
+        poll_interval: args
+            .poll_interval_ms
+            .map(Duration::from_millis)
+            .unwrap_or(pipeline_defaults.poll_interval),
+        error_restart_delay: args
+            .error_restart_delay_ms
+            .map(Duration::from_millis)
+            .unwrap_or(pipeline_defaults.error_restart_delay),
+        fetcher_tip_backoff,
+        ..pipeline_defaults
+    };
 
     let result = workers::run_with_signals(
         client,
@@ -215,9 +297,10 @@ pub async fn run() -> Result<()> {
         contract_cache,
         chain_spec,
         args.report_validation_endpoint,
+        pipeline_config,
     )
     .await;
 
-    info!(elapsed = ?start.elapsed(), "[Main] Shutdown complete");
+    info!(elapsed = ?start.elapsed(), "Shutdown complete");
     result
 }

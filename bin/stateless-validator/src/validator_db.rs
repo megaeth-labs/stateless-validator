@@ -12,11 +12,13 @@ use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 use revm::state::Bytecode;
-use stateless_core::db::{BlockMeta, ChainStore, ContractStore, GenesisStore, StoreResult};
+use stateless_core::db::{
+    BlockMeta, ChainStore, ContractStore, GenesisStore, StoreResult, StoreResultExt,
+};
 use stateless_db::{
     ANCHOR_BLOCK, CANONICAL_CHAIN, CONTRACTS, DEFAULT_MAX_CHAIN_LENGTH, Database, GENESIS_CONFIG,
-    db_add_contracts, db_get_anchor, db_get_block_hash, db_get_canonical_tip, db_get_contracts,
-    db_get_earliest_block, db_reset_to_anchor, db_rollback_chain,
+    read_anchor, read_block_hash, read_canonical_tip, read_contracts, read_earliest_block,
+    write_add_contracts, write_reset_to_anchor, write_rollback_chain,
 };
 
 /// Minimal persistent storage backed by redb.
@@ -27,18 +29,18 @@ pub struct ValidatorDB {
 
 impl ValidatorDB {
     /// Creates or opens a persistent store at the given path.
-    pub fn new(db_path: impl AsRef<Path>) -> eyre::Result<Self> {
-        let database = Database::create(db_path)?;
+    pub fn new(db_path: impl AsRef<Path>) -> StoreResult<Self> {
+        let database = Database::create(db_path).store_err()?;
 
         // Initialize all tables
-        let write_txn = database.begin_write()?;
+        let write_txn = database.begin_write().store_err()?;
         {
-            let _ = write_txn.open_table(ANCHOR_BLOCK)?;
-            let _ = write_txn.open_table(CONTRACTS)?;
-            let _ = write_txn.open_table(GENESIS_CONFIG)?;
-            let _ = write_txn.open_table(CANONICAL_CHAIN)?;
+            let _ = write_txn.open_table(ANCHOR_BLOCK).store_err()?;
+            let _ = write_txn.open_table(CONTRACTS).store_err()?;
+            let _ = write_txn.open_table(GENESIS_CONFIG).store_err()?;
+            let _ = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
         }
-        write_txn.commit()?;
+        write_txn.commit().store_err()?;
 
         Ok(Self { database, max_chain_length: AtomicU64::new(DEFAULT_MAX_CHAIN_LENGTH) })
     }
@@ -49,46 +51,47 @@ impl ValidatorDB {
     }
 
     #[cfg(test)]
-    fn set_anchor_block(&self, tip: &BlockMeta) -> eyre::Result<()> {
+    fn set_anchor_block(&self, tip: &BlockMeta) -> StoreResult<()> {
         use stateless_db::block_meta_to_tuple;
-        let write_txn = self.database.begin_write()?;
+        let write_txn = self.database.begin_write().store_err()?;
         {
-            let mut table = write_txn.open_table(ANCHOR_BLOCK)?;
-            table.insert("anchor", block_meta_to_tuple(tip))?;
+            let mut table = write_txn.open_table(ANCHOR_BLOCK).store_err()?;
+            table.insert("anchor", block_meta_to_tuple(tip)).store_err()?;
         }
-        write_txn.commit()?;
+        write_txn.commit().store_err()?;
         Ok(())
     }
 }
 
 impl ContractStore for ValidatorDB {
     fn get_contracts(&self, hashes: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
-        db_get_contracts(&self.database, hashes)
+        read_contracts(&self.database, hashes)
     }
 
     fn add_contracts(&self, codes: &[(B256, Bytecode)]) -> StoreResult<()> {
-        db_add_contracts(&self.database, codes)
+        write_add_contracts(&self.database, codes)
     }
 }
 
 impl GenesisStore for ValidatorDB {
     fn store_genesis(&self, genesis: &Genesis) -> StoreResult<()> {
-        let json_bytes = serde_json::to_vec(genesis)?;
-        let write_txn = self.database.begin_write()?;
+        let json_bytes = serde_json::to_vec(genesis).store_err()?;
+        let write_txn = self.database.begin_write().store_err()?;
         {
-            let mut table = write_txn.open_table(GENESIS_CONFIG)?;
-            table.insert("genesis", json_bytes)?;
+            let mut table = write_txn.open_table(GENESIS_CONFIG).store_err()?;
+            table.insert("genesis", json_bytes).store_err()?;
         }
-        write_txn.commit()?;
+        write_txn.commit().store_err()?;
         Ok(())
     }
 
     fn load_genesis(&self) -> StoreResult<Option<Genesis>> {
-        let read_txn = self.database.begin_read()?;
-        let table = read_txn.open_table(GENESIS_CONFIG)?;
-        match table.get("genesis")? {
+        let read_txn = self.database.begin_read().store_err()?;
+        let table = read_txn.open_table(GENESIS_CONFIG).store_err()?;
+        match table.get("genesis").store_err()? {
             Some(data) => {
-                let genesis: Genesis = serde_json::from_slice(data.value().as_slice())?;
+                let genesis: Genesis =
+                    serde_json::from_slice(data.value().as_slice()).store_err()?;
                 Ok(Some(genesis))
             }
             None => Ok(None),
@@ -98,11 +101,11 @@ impl GenesisStore for ValidatorDB {
 
 impl ChainStore for ValidatorDB {
     fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>> {
-        db_get_canonical_tip(&self.database)
+        read_canonical_tip(&self.database)
     }
 
     fn get_anchor(&self) -> StoreResult<Option<BlockMeta>> {
-        db_get_anchor(&self.database)
+        read_anchor(&self.database)
     }
 
     fn advance_chain(&self, blocks: &[BlockMeta]) -> StoreResult<()> {
@@ -110,48 +113,56 @@ impl ChainStore for ValidatorDB {
             return Ok(());
         }
         let max_len = self.max_chain_length.load(std::sync::atomic::Ordering::Relaxed);
-        let write_txn = self.database.begin_write()?;
+        let write_txn = self.database.begin_write().store_err()?;
         {
-            let mut chain = write_txn.open_table(CANONICAL_CHAIN)?;
+            let mut chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
             for block in blocks {
-                chain.insert(
-                    block.block_number,
-                    (block.block_hash.0, block.post_state_root.0, block.post_withdrawals_root.0),
-                )?;
+                chain
+                    .insert(
+                        block.block_number,
+                        (
+                            block.block_hash.0,
+                            block.post_state_root.0,
+                            block.post_withdrawals_root.0,
+                        ),
+                    )
+                    .store_err()?;
             }
 
             // Inline pruning: remove oldest entries that exceed the max chain length
-            let len = chain.len()?;
+            let len = chain.len().store_err()?;
             if len > max_len {
                 let excess = len - max_len;
                 let to_remove: Vec<u64> = chain
-                    .iter()?
+                    .iter()
+                    .store_err()?
                     .take(excess as usize)
                     .map(|r| r.map(|(k, _)| k.value()))
-                    .collect::<std::result::Result<_, _>>()?;
+                    .collect::<std::result::Result<_, _>>()
+                    .store_err()?;
                 for n in to_remove {
-                    chain.remove(n)?;
+                    chain.remove(n).store_err()?;
                 }
             }
         }
-        write_txn.commit()?;
+        write_txn.commit().store_err()?;
         Ok(())
     }
 
     fn get_block_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>> {
-        db_get_block_hash(&self.database, block_number)
+        read_block_hash(&self.database, block_number)
     }
 
     fn get_earliest_block(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
-        db_get_earliest_block(&self.database)
+        read_earliest_block(&self.database)
     }
 
     fn rollback_chain(&self, to_block: BlockNumber) -> StoreResult<()> {
-        db_rollback_chain(&self.database, to_block)
+        write_rollback_chain(&self.database, to_block)
     }
 
     fn reset_to_anchor(&self, anchor: &BlockMeta) -> StoreResult<()> {
-        db_reset_to_anchor(&self.database, anchor)
+        write_reset_to_anchor(&self.database, anchor)
     }
 }
 

@@ -25,7 +25,10 @@ use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
 use stateless_common::{RpcClient, estimate_witness_size};
-use stateless_core::{BlockStore, LightWitness, withdrawals::MptWitness};
+use stateless_core::{
+    BlockStore, ContractStore, LightWitness, StoreResult, db::StoreError, withdrawals::MptWitness,
+};
+use stateless_db::ContractCache;
 use tokio::sync::broadcast;
 use tracing::{debug, instrument, trace, warn};
 
@@ -79,6 +82,12 @@ pub struct DataProvider {
     rpc_client: Arc<RpcClient>,
     /// Optional local database for pre-fetched blocks (trait object).
     db: Option<Arc<dyn BlockStore>>,
+    /// In-memory contract bytecode cache backed by either `ServerDB` (local-cache mode)
+    /// or [`NoopContractStore`] (stateless mode).
+    /// Every contract read and every RPC-fetched contract goes through here, so
+    /// repeated trace requests for the same contract hit memory instead of
+    /// redb (slow) or RPC (slowest).
+    contract_cache: Arc<ContractCache>,
     /// Timeout for witness fetch retry operations.
     witness_timeout: Duration,
     /// In-flight requests map for single-flight pattern (keyed by block hash).
@@ -90,16 +99,20 @@ impl DataProvider {
     ///
     /// # Arguments
     /// * `rpc_client` - RPC client for upstream data fetching
-    /// * `validator_db` - Optional local database for cached block data
+    /// * `db` - Optional local database for cached block data
+    /// * `contract_cache` - Shared in-memory contract cache (backed by the DB when present, or an
+    ///   in-memory-only noop store in stateless mode)
     /// * `witness_timeout_secs` - Timeout in seconds for witness fetch retry
     pub fn new(
         rpc_client: Arc<RpcClient>,
         db: Option<Arc<dyn BlockStore>>,
+        contract_cache: Arc<ContractCache>,
         witness_timeout_secs: u64,
     ) -> Self {
         Self {
             rpc_client,
             db,
+            contract_cache,
             witness_timeout: Duration::from_secs(witness_timeout_secs),
             in_flight: DashMap::new(),
         }
@@ -142,20 +155,36 @@ impl DataProvider {
     pub async fn get_block_data_by_hash(&self, block_hash: B256) -> Result<BlockData> {
         let start = std::time::Instant::now();
 
-        // Try to get from local database
-        if let Some(db) = &self.db &&
-            let Ok(data) = self.get_block_data_from_db(db.as_ref(), block_hash).await
-        {
-            trace!(
-                block_hash = %block_hash,
-                source = "database",
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "Block data retrieved from local DB"
-            );
-            DataSourceMetrics::new_for_source("db").record();
-            SingleFlightMetrics::new_for_type("bypassed").record();
-            self.record_block_distance(data.block.header.number);
-            return Ok(data);
+        // Try the local DB first. Only `MissingData` falls through to RPC silently —
+        // real backend errors (redb I/O, decode corruption) must surface in the log,
+        // even though we still fall through so the request isn't lost.
+        if let Some(db) = &self.db {
+            match self.get_block_data_from_db(db.as_ref(), block_hash).await {
+                Ok(data) => {
+                    trace!(
+                        block_hash = %block_hash,
+                        source = "database",
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        "Block data retrieved from local DB"
+                    );
+                    DataSourceMetrics::new_for_source("db").record();
+                    SingleFlightMetrics::new_for_type("bypassed").record();
+                    self.record_block_distance(data.block.header.number);
+                    return Ok(data);
+                }
+                Err(e) => match e.downcast_ref::<StoreError>() {
+                    Some(StoreError::MissingData { .. }) => {
+                        // expected cache miss; fall through to RPC
+                    }
+                    _ => {
+                        warn!(
+                            block_hash = %block_hash,
+                            error = %e,
+                            "Local DB read failed; falling back to RPC",
+                        );
+                    }
+                },
+            }
         }
 
         // Fall back to RPC
@@ -277,7 +306,7 @@ impl DataProvider {
         let start = std::time::Instant::now();
         let code_hashes = crate::tracing_executor::extract_code_hashes(&witness);
         let num_contracts = code_hashes.len();
-        let contracts = self.get_contracts_with_db(db, &code_hashes).await?;
+        let contracts = self.resolve_contracts(&code_hashes).await?;
         let fetch_contracts_ms = start.elapsed().as_millis();
 
         let total_ms = overall_start.elapsed().as_millis();
@@ -410,7 +439,7 @@ impl DataProvider {
         let start = std::time::Instant::now();
         let code_hashes = crate::tracing_executor::extract_code_hashes(&witness);
         let num_contracts = code_hashes.len();
-        let contracts = self.get_contracts(&code_hashes).await?;
+        let contracts = self.resolve_contracts(&code_hashes).await?;
         let fetch_contracts_ms = start.elapsed().as_millis();
 
         let total_ms = overall_start.elapsed().as_millis();
@@ -554,50 +583,41 @@ impl DataProvider {
         }))
     }
 
-    /// Gets contracts from local database with RPC fallback.
+    /// Resolves contract bytecodes via the three-tier cache chain:
+    /// memory (`ContractCache`) → persistent store (`ServerDB` in local-cache mode,
+    /// [`NoopContractStore`] in stateless mode) → upstream RPC.
     ///
-    /// First attempts to retrieve all contracts from the local database.
-    /// Any missing contracts are then fetched from the upstream RPC.
-    /// Returns an error if any contract cannot be fetched.
-    async fn get_contracts_with_db(
-        &self,
-        db: &dyn BlockStore,
-        code_hashes: &[B256],
-    ) -> Result<HashMap<B256, Bytecode>> {
-        // First try to get from database
-        let (mut contracts, missing) = db.get_contracts(code_hashes)?;
+    /// Every contract fetched from RPC is written back through the cache
+    /// (memory always, disk in local-cache mode), so subsequent trace
+    /// requests for the same bytecode skip the RPC round-trip.
+    async fn resolve_contracts(&self, code_hashes: &[B256]) -> Result<HashMap<B256, Bytecode>> {
+        let (mut contracts, missing) = self.contract_cache.get(code_hashes)?;
 
-        if !missing.is_empty() {
-            trace!(
-                total = code_hashes.len(),
-                from_db = contracts.len(),
-                missing = missing.len(),
-                "Some contracts missing from DB, fetching from RPC"
-            );
+        if missing.is_empty() {
+            return Ok(contracts);
         }
 
-        // Fetch missing contracts from RPC
+        trace!(
+            total = code_hashes.len(),
+            from_cache = contracts.len(),
+            missing = missing.len(),
+            "Cache miss — fetching contracts from RPC"
+        );
+
+        let mut new_contracts = Vec::with_capacity(missing.len());
         for hash in missing {
-            contracts.insert(hash, self.fetch_contract_code(hash).await?);
+            let bytecode = self.fetch_contract_code(hash).await?;
+            new_contracts.push((hash, bytecode.clone()));
+            contracts.insert(hash, bytecode);
+        }
+
+        // Write-through: memory always, disk in local-cache mode.
+        // We don't fail the trace on cache-insert errors; the request has already been served.
+        if let Err(e) = self.contract_cache.insert(&new_contracts) {
+            warn!(error = %e, count = new_contracts.len(), "Failed to persist fetched contracts to cache");
         }
 
         Ok(contracts)
-    }
-
-    /// Gets multiple contracts by their code hashes from RPC.
-    ///
-    /// Fetches each contract individually. Returns an error if any contract
-    /// cannot be fetched.
-    async fn get_contracts(&self, code_hashes: &[B256]) -> Result<HashMap<B256, Bytecode>> {
-        let mut result = HashMap::new();
-
-        trace!(count = code_hashes.len(), "Fetching contracts from RPC");
-
-        for &hash in code_hashes {
-            result.insert(hash, self.fetch_contract_code(hash).await?);
-        }
-
-        Ok(result)
     }
 
     /// Fetches a single contract bytecode from upstream RPC and records upstream metrics.
@@ -609,6 +629,23 @@ impl DataProvider {
         result
             .map(Bytecode::new_raw)
             .map_err(|e| eyre::eyre!("Failed to fetch contract code {}: {}", hash, e))
+    }
+}
+
+/// In-memory-only [`ContractStore`] used as [`ContractCache`]'s backing store in
+/// stateless mode (no `--data-dir`).
+///
+/// Reads always return "everything missing" so the cache falls back to RPC; writes
+/// silently drop — the cache's own DashMap is the only persistence layer in this mode.
+pub struct NoopContractStore;
+
+impl ContractStore for NoopContractStore {
+    fn get_contracts(&self, hashes: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
+        Ok((HashMap::new(), hashes.to_vec()))
+    }
+
+    fn add_contracts(&self, _codes: &[(B256, Bytecode)]) -> StoreResult<()> {
+        Ok(())
     }
 }
 

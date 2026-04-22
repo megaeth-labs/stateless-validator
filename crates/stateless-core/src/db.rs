@@ -36,25 +36,15 @@ pub struct BlockMeta {
 /// This is the single typed error at the library/binary boundary: every
 /// [`ChainStore`] / [`BlockStore`] / … method returns `Result<_, StoreError>`.
 /// Binary code converts to `eyre::Report` automatically via `?`.
+///
+/// Backend errors (redb, bincode, serde_json, lz4, …) are wrapped as an opaque
+/// [`StoreError::Backend`] — the source chain is preserved via
+/// [`std::error::Error::source`], so `%err` / `{:#}` logs show the root cause
+/// without the trait layer needing to know the concrete backend type.
 #[derive(Debug, Error)]
 pub enum StoreError {
-    #[error("redb database: {0}")]
-    Database(#[from] redb::DatabaseError),
-    #[error("redb transaction: {0}")]
-    Transaction(#[from] redb::TransactionError),
-    #[error("redb table: {0}")]
-    Table(#[from] redb::TableError),
-    #[error("redb storage: {0}")]
-    Storage(#[from] redb::StorageError),
-    #[error("redb commit: {0}")]
-    Commit(#[from] redb::CommitError),
-
-    #[error("bincode decode: {0}")]
-    BincodeDecode(#[from] bincode::error::DecodeError),
-    #[error("bincode encode: {0}")]
-    BincodeEncode(#[from] bincode::error::EncodeError),
-    #[error("serde_json: {0}")]
-    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Backend(Box<dyn std::error::Error + Send + Sync + 'static>),
 
     #[error("missing {kind} for block {block_hash}")]
     MissingData { kind: MissingDataKind, block_hash: BlockHash },
@@ -65,17 +55,33 @@ pub enum StoreError {
 
 pub type StoreResult<T> = std::result::Result<T, StoreError>;
 
+/// Adapter for turning any concrete backend error into [`StoreError::Backend`].
+///
+/// Use at boundary call sites that previously relied on `?` via a `#[from]` impl,
+/// e.g. `database.begin_read().store_err()?`.
+pub trait StoreResultExt<T> {
+    fn store_err(self) -> StoreResult<T>;
+}
+
+impl<T, E: std::error::Error + Send + Sync + 'static> StoreResultExt<T>
+    for std::result::Result<T, E>
+{
+    fn store_err(self) -> StoreResult<T> {
+        self.map_err(|e| StoreError::Backend(Box::new(e)))
+    }
+}
+
 /// Tag for [`StoreError::MissingData`] identifying which record is absent.
 #[derive(Clone, Copy, Debug)]
 pub enum MissingDataKind {
-    BlockData,
+    Block,
     Witness,
 }
 
 impl fmt::Display for MissingDataKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            MissingDataKind::BlockData => "block data",
+            MissingDataKind::Block => "block",
             MissingDataKind::Witness => "witness",
         })
     }

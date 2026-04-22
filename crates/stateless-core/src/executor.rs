@@ -300,7 +300,7 @@ where
 
     let hardfork = chain_spec.hardfork(block.header.timestamp);
     debug!(
-        "[Replay Block] block_number={}, block_hash={:?}, hardfork={:?}",
+        "Replay block: block_number={}, block_hash={:?}, hardfork={:?}",
         block.header.number, block.header.hash, hardfork
     );
     let block_limits = if let Some(hardfork) = hardfork {

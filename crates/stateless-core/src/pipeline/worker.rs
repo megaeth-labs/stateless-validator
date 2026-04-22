@@ -26,7 +26,7 @@ pub(crate) fn spawn_workers<P: BlockProcessor>(
                     let input = match fetch_rx.recv().await {
                         Ok(input) => input,
                         Err(_) => {
-                            debug!(worker_id, "[Worker] Fetch channel closed, stopping");
+                            debug!(worker_id, "Fetch channel closed, stopping");
                             return;
                         }
                     };
@@ -44,7 +44,7 @@ pub(crate) fn spawn_workers<P: BlockProcessor>(
                     };
 
                     if result_tx.send(result).await.is_err() {
-                        debug!(worker_id, "[Worker] Result channel closed, stopping");
+                        debug!(worker_id, "Result channel closed, stopping");
                         return;
                     }
                 }

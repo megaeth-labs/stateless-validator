@@ -27,11 +27,17 @@ pub async fn run_with_signals(
     contract_cache: Arc<ContractCache>,
     chain_spec: Arc<ChainSpec>,
     report_validation_endpoint: Option<String>,
+    pipeline_config: PipelineConfig,
 ) -> Result<()> {
     let report_validation = report_validation_endpoint.is_some();
-    let config = Arc::new(PipelineConfig::default());
-    info!(concurrent_workers = config.concurrent_workers, "[Main] Starting pipeline");
-    info!(enabled = report_validation, "[Main] Validation result reporting");
+    let config = Arc::new(pipeline_config);
+    info!(
+        concurrent_workers = config.concurrent_workers,
+        poll_interval = ?config.poll_interval,
+        error_restart_delay = ?config.error_restart_delay,
+        "Starting pipeline",
+    );
+    info!(enabled = report_validation, "Validation result reporting");
 
     let shutdown = CancellationToken::new();
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
@@ -46,7 +52,7 @@ pub async fn run_with_signals(
     let hooks = Arc::new(ValidatorHooks);
 
     let reporter = if report_validation {
-        info!("[Main] Starting validation reporter");
+        info!("Starting validation reporter");
         Some(task::spawn(validation_reporter(
             client,
             Arc::clone(&validator_db),
@@ -54,7 +60,7 @@ pub async fn run_with_signals(
             shutdown.clone(),
         )))
     } else {
-        info!("[Main] Validation reporter disabled");
+        info!("Validation reporter disabled");
         None
     };
 
@@ -78,11 +84,11 @@ pub async fn run_with_signals(
             (r, false)
         }
         _ = signal::ctrl_c() => {
-            info!("[Main] SIGINT received, shutting down.");
+            info!("SIGINT received, shutting down.");
             (Ok(()), true)
         }
         _ = sigterm.recv() => {
-            info!("[Main] SIGTERM received, shutting down.");
+            info!("SIGTERM received, shutting down.");
             (Ok(()), true)
         }
     };
@@ -90,9 +96,11 @@ pub async fn run_with_signals(
     shutdown.cancel();
 
     // Let in-flight block validation and DB commits complete before the runtime drops.
-    let drain_timeout = Duration::from_secs(2);
+    // Bound generously: a worker mid-validation on a heavy block can take >1s, the advancer
+    // still has to commit to redb, and `await_handles` waits up to its own configured cap.
+    let drain_timeout = Duration::from_secs(60);
     if needs_drain && tokio::time::timeout(drain_timeout, &mut pipeline_handle).await.is_err() {
-        warn!(timeout = ?drain_timeout, "[Main] Pipeline did not drain within timeout");
+        warn!(timeout = ?drain_timeout, "Pipeline did not drain within timeout");
     }
 
     if let Some(reporter) = reporter {
@@ -107,10 +115,10 @@ pub async fn run_with_signals(
                 start = before + 1,
                 end = after,
                 count = after - before,
-                "[Main] Validated blocks this session",
+                "Validated blocks this session",
             );
         }
-        _ => info!("[Main] No blocks validated this session"),
+        _ => info!("No blocks validated this session"),
     }
 
     result
@@ -126,14 +134,14 @@ async fn validation_reporter(
     report_interval: Duration,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    info!("[Reporter] Starting validation reporter");
+    info!("Starting validation reporter");
     let mut last_reported_block = 0u64;
 
     loop {
         tokio::select! {
             _ = tokio::time::sleep(report_interval) => {}
             _ = shutdown.cancelled() => {
-                info!("[Reporter] Shutting down gracefully");
+                info!("Shutting down gracefully");
                 return Ok(());
             }
         }
@@ -142,7 +150,7 @@ async fn validation_reporter(
             (Ok(Some(a)), Ok(Some(t))) => (a, t),
             (Ok(None), _) | (_, Ok(None)) => continue,
             (Err(e), _) | (_, Err(e)) => {
-                warn!(error = %e, "[Reporter] Failed to read anchor/tip, retrying");
+                warn!(error = %e, "Failed to read anchor/tip, retrying");
                 continue;
             }
         };
@@ -165,7 +173,7 @@ async fn validation_reporter(
                     anchor_hash = %anchor.block_hash,
                     tip = tip.block_number,
                     tip_hash = %tip.block_hash,
-                    "[Reporter] Reported blocks"
+                    "Reported blocks"
                 );
                 last_reported_block = tip.block_number;
             }
@@ -179,11 +187,11 @@ async fn validation_reporter(
                 }
                 error!(
                     upstream_block = ?response.last_validated_block,
-                    "[Reporter] Report rejected"
+                    "Report rejected"
                 );
             }
             Err(e) => {
-                error!(error = %e, "[Reporter] Failed to report blocks");
+                error!(error = %e, "Failed to report blocks");
             }
         }
     }

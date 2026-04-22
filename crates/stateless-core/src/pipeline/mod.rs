@@ -24,7 +24,7 @@ mod worker;
 use std::{sync::Arc, time::Duration};
 
 use advancer::chain_advancer;
-pub use config::{ErrorAction, PipelineConfig, PipelineOutcome, ReorgEvent};
+pub use config::{ErrorAction, NearTipConfig, PipelineConfig, PipelineOutcome, ReorgEvent};
 pub use divergence::{DivergenceError, find_divergence_point};
 use eyre::{Result, anyhow};
 pub use fetcher::block_fetcher;
@@ -64,9 +64,10 @@ where
             None => store.get_anchor()?.ok_or_else(|| anyhow!("No anchor or tip in database"))?,
         };
         let start_block = initial_tip.block_number + 1;
-        info!(start_block, "[Pipeline] Starting cycle");
+        info!(start_block, "Starting cycle");
 
-        let (fetch_tx, fetch_rx) = kanal::bounded(config.fetch_channel_capacity);
+        let channel_capacity = config.channel_capacity();
+        let (fetch_tx, fetch_rx) = kanal::bounded(channel_capacity);
         let fetcher_shutdown = CancellationToken::new();
         let fetcher_handle = tokio::spawn(block_fetcher(
             fetcher.clone(),
@@ -78,7 +79,7 @@ where
 
         let (result_tx, result_rx) = kanal::bounded::<
             std::result::Result<P::Output, (String, ErrorAction)>,
-        >(config.result_channel_capacity);
+        >(channel_capacity);
         let worker_handles =
             spawn_workers(processor.clone(), fetch_rx, result_tx, config.concurrent_workers);
 
@@ -87,33 +88,32 @@ where
                 .await;
 
         fetcher_shutdown.cancel();
-        await_handles(fetcher_handle, worker_handles).await;
+        await_handles(fetcher_handle, worker_handles, config.await_handles_timeout).await;
 
         match outcome {
             Ok(PipelineOutcome::Shutdown) => {
-                info!("[Pipeline] Shutting down");
+                info!("Shutting down");
                 return Ok(());
             }
             Ok(PipelineOutcome::Fatal(msg)) => {
-                error!(error = %msg, "[Pipeline] Fatal error, halting");
+                error!(error = %msg, "Fatal error, halting");
                 return Err(anyhow!("Pipeline halted: {msg}"));
             }
             Ok(PipelineOutcome::Reorg(event)) => {
                 warn!(
                     rollback_to = event.rollback_to,
                     depth = event.depth,
-                    "[Pipeline] Reorg detected, restarting"
+                    "Reorg detected, restarting"
                 );
                 hooks.on_reorg(event.rollback_to, event.depth, &event.reverted_hashes)?;
                 store.rollback_chain(event.rollback_to)?;
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-                    _ = shutdown.cancelled() => return Ok(()),
-                }
+                // Restart immediately. The fresh fetcher's tip refresh is gated by
+                // `poll_interval`, and a recurring reorg requires another full
+                // chain_advancer round-trip — neither path can spin tight here.
                 continue;
             }
             Err(e) => {
-                error!(error = %e, "[Pipeline] Cycle ended with error");
+                error!(error = %e, "Cycle ended with error");
 
                 // Stale detection (optional)
                 if let Some(threshold) = config.stale_reset_threshold &&
@@ -123,7 +123,7 @@ where
                 {
                     warn!(
                         tip = tip.block_number,
-                        chain_latest, threshold, "[Pipeline] Local data is stale, resetting anchor"
+                        chain_latest, threshold, "Local data is stale, resetting anchor"
                     );
                     match fetcher.latest_block_meta().await {
                         Ok(new_anchor) => {
@@ -132,7 +132,7 @@ where
                             continue;
                         }
                         Err(e) => {
-                            warn!(error = %e, "[Pipeline] Failed to fetch latest block for anchor reset");
+                            warn!(error = %e, "Failed to fetch latest block for anchor reset");
                         }
                     }
                 }
@@ -148,21 +148,24 @@ where
 }
 
 /// Waits for the fetcher and all workers to finish (with timeout).
-async fn await_handles(fetcher: JoinHandle<Result<()>>, workers: Vec<JoinHandle<()>>) {
-    let timeout = Duration::from_secs(3);
+async fn await_handles(
+    fetcher: JoinHandle<Result<()>>,
+    workers: Vec<JoinHandle<()>>,
+    timeout: Duration,
+) {
     tokio::select! {
         _ = async {
             if let Err(e) = fetcher.await {
-                warn!(error = %e, "[Pipeline] Fetcher task panicked");
+                warn!(error = %e, "Fetcher task panicked");
             }
             for handle in workers {
                 if let Err(e) = handle.await {
-                    warn!(error = %e, "[Pipeline] Worker task panicked");
+                    warn!(error = %e, "Worker task panicked");
                 }
             }
         } => {}
         _ = tokio::time::sleep(timeout) => {
-            warn!("[Pipeline] Timed out waiting for background tasks");
+            warn!(?timeout, "Timed out waiting for background tasks");
         }
     }
 }
