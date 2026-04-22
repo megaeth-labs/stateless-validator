@@ -163,7 +163,10 @@ impl PipelineHooks for TraceHooks {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
+
+    use alloy_primitives::B256;
+    use revm::state::Bytecode;
 
     use super::*;
 
@@ -193,20 +196,11 @@ mod tests {
     impl stateless_core::ContractStore for MockBlockStore {
         fn get_contracts(
             &self,
-            _: &[alloy_primitives::B256],
-        ) -> stateless_core::StoreResult<(
-            std::collections::HashMap<
-                alloy_primitives::B256,
-                std::sync::Arc<revm::state::Bytecode>,
-            >,
-            Vec<alloy_primitives::B256>,
-        )> {
+            _: &[B256],
+        ) -> stateless_core::StoreResult<(HashMap<B256, Arc<Bytecode>>, Vec<B256>)> {
             Ok((Default::default(), vec![]))
         }
-        fn add_contracts(
-            &self,
-            _: &[(alloy_primitives::B256, std::sync::Arc<revm::state::Bytecode>)],
-        ) -> stateless_core::StoreResult<()> {
+        fn add_contracts(&self, _: &[(B256, Arc<Bytecode>)]) -> stateless_core::StoreResult<()> {
             Ok(())
         }
     }
