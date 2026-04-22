@@ -55,11 +55,12 @@ pub struct BlockData {
     pub contracts: HashMap<B256, Bytecode>,
 }
 
-/// Default timeout for witness fetch retry in seconds (8 seconds).
+/// Default timeout for a user-facing witness fetch in seconds (8 seconds).
+///
+/// Caps how long `fetch_witness_with_fallback` will wait for the RPC client's internal
+/// round-level retry loop to produce a witness. A user's trace/debug RPC request times out
+/// with an error if this elapses.
 pub const DEFAULT_WITNESS_TIMEOUT_SECS: u64 = 8;
-
-/// Retry interval for witness fetch in milliseconds (200ms).
-const WITNESS_RETRY_INTERVAL_MS: u64 = 200;
 
 /// Slow stage threshold: any individual stage exceeding this triggers a warn log.
 pub(crate) const SLOW_STAGE_THRESHOLD_MS: u128 = 1000;
@@ -137,7 +138,7 @@ impl DataProvider {
         }
 
         // Fall back to RPC - fetch header to get hash, then delegate to get_block_data_by_hash
-        let block_hash = self.rpc_client.get_block_hash(block_num).await?;
+        let block_hash = self.rpc_client.get_block_hash(block_num).await;
 
         self.get_block_data_by_hash(block_hash).await
     }
@@ -264,12 +265,12 @@ impl DataProvider {
     pub async fn resolve_block_number(&self, tag: BlockNumberOrTag) -> Result<u64> {
         match tag {
             BlockNumberOrTag::Number(n) => Ok(n),
-            BlockNumberOrTag::Latest => self.rpc_client.get_latest_block_number().await,
+            BlockNumberOrTag::Latest => Ok(self.rpc_client.get_latest_block_number().await),
             BlockNumberOrTag::Earliest => Ok(0),
             BlockNumberOrTag::Pending => Err(eyre::eyre!("Pending block not supported")),
             BlockNumberOrTag::Finalized | BlockNumberOrTag::Safe => {
                 // Fetch the header from upstream RPC to resolve the tag
-                let header = self.rpc_client.get_header(BlockId::Number(tag), false).await?;
+                let header = self.rpc_client.get_header(BlockId::Number(tag), false).await;
                 Ok(header.number)
             }
         }
@@ -399,8 +400,7 @@ impl DataProvider {
         // Step 1: Fetch header first to get the block number
         let start = std::time::Instant::now();
         let header = self.rpc_client.get_header(BlockId::Hash(block_hash.into()), false).await;
-        upstream_header.record_request(header.is_ok(), start.elapsed().as_secs_f64());
-        let header = header?;
+        upstream_header.record_request(true, start.elapsed().as_secs_f64());
         let block_number = header.number;
         let fetch_header_ms = start.elapsed().as_millis();
 
@@ -420,15 +420,14 @@ impl DataProvider {
         );
 
         let (witness_result, witness_elapsed) = witness_timed;
-        let (full_block_result, block_elapsed) = block_timed;
+        let (block, block_elapsed) = block_timed;
 
         let fetch_witness_ms = witness_elapsed.as_millis();
         upstream_witness.record_request(witness_result.is_ok(), witness_elapsed.as_secs_f64());
         let (salt_witness, _mpt_witness) = witness_result?;
 
         let fetch_full_block_ms = block_elapsed.as_millis();
-        upstream_block.record_request(full_block_result.is_ok(), block_elapsed.as_secs_f64());
-        let block = full_block_result?;
+        upstream_block.record_request(true, block_elapsed.as_secs_f64());
 
         // Step 3: Convert SaltWitness to LightWitness
         let start = std::time::Instant::now();
@@ -468,12 +467,13 @@ impl DataProvider {
         Ok(BlockData { block, witness, contracts })
     }
 
-    /// Fetches witness data with height-based routing.
+    /// Fetches witness data with a user-facing timeout.
     ///
-    /// Routing logic:
-    /// - `block > db_max` → Retry with timeout (block is new, witness may be delayed)
-    /// - `block <= db_max` (or no DB) → Single attempt per provider through all configured witness
-    ///   providers in order (block is old/pruned, no point waiting for a new witness)
+    /// The underlying `RpcClient::get_witness` retries transient failures forever internally;
+    /// this wrapper imposes a time bound so a user-facing RPC request never hangs. On timeout
+    /// the caller surfaces an error back to the RPC client. `witness_timeout` covers the "block
+    /// is fresh and the witness is still being generated upstream" case for new blocks; for old
+    /// blocks the RPC layer's round-robin + backoff reaches an upstream conclusion quickly.
     async fn fetch_witness_with_fallback(
         &self,
         block_number: u64,
@@ -483,19 +483,17 @@ impl DataProvider {
             .db
             .as_ref()
             .and_then(|db| db.get_canonical_tip().ok().flatten().map(|tip| tip.block_number));
-
         let is_new_block = db_max_height.is_none_or(|max| block_number > max);
+        trace!(block_number, db_max_height, is_new_block, "Fetching witness");
 
         let wg_metrics = WitnessSourceMetrics::new_for_source("witness_generator");
         let start = std::time::Instant::now();
 
-        let result = if is_new_block {
-            trace!(block_number, db_max_height, "Block is new, using retry loop for witness");
-            self.fetch_witness_with_retry(block_number, block_hash).await
-        } else {
-            trace!(block_number, db_max_height, "Block is old/pruned, single attempt");
-            self.rpc_client.get_witness(block_number, block_hash).await
-        };
+        let result = tokio::time::timeout(
+            self.witness_timeout,
+            self.rpc_client.get_witness(block_number, block_hash),
+        )
+        .await;
 
         match result {
             Ok(w) => {
@@ -504,83 +502,21 @@ impl DataProvider {
                 DataSourceMetrics::new_for_source("witness_generator").record();
                 Ok(w)
             }
-            Err(e) => {
+            Err(_) => {
                 wg_metrics.record_request(false, start.elapsed().as_secs_f64());
-                Err(e)
+                warn!(
+                    block_number,
+                    block_hash = %block_hash,
+                    timeout_ms = self.witness_timeout.as_millis() as u64,
+                    "Witness fetch timeout",
+                );
+                Err(eyre::eyre!(
+                    "Witness fetch timeout after {:?} for block {}",
+                    self.witness_timeout,
+                    block_number
+                ))
             }
         }
-    }
-
-    /// Fetches witness data with retry logic.
-    ///
-    /// Retries fetching witness until success or timeout is reached.
-    /// This handles the case where witness data may not be immediately available
-    /// for very recent blocks.
-    ///
-    /// # Arguments
-    /// * `block_number` - Block number for logging
-    /// * `block_hash` - Block hash to fetch witness for
-    ///
-    /// # Returns
-    /// * `Ok((SaltWitness, MptWitness))` - Successfully fetched witness data
-    /// * `Err` - If timeout reached without successful fetch
-    #[instrument(skip(self), name = "fetch_witness")]
-    async fn fetch_witness_with_retry(
-        &self,
-        block_number: u64,
-        block_hash: B256,
-    ) -> Result<(SaltWitness, MptWitness)> {
-        let start = std::time::Instant::now();
-        let retry_interval = Duration::from_millis(WITNESS_RETRY_INTERVAL_MS);
-        let mut last_error = None;
-        let mut retry_count = 0u32;
-
-        while start.elapsed() < self.witness_timeout {
-            match self.rpc_client.get_witness(block_number, block_hash).await {
-                Ok(result) => {
-                    if retry_count > 0 {
-                        trace!(
-                            block_number,
-                            block_hash = %block_hash,
-                            retry_count,
-                            elapsed_ms = start.elapsed().as_millis() as u64,
-                            "Witness fetched after retries"
-                        );
-                    }
-                    return Ok(result);
-                }
-                Err(e) => {
-                    retry_count += 1;
-                    warn!(
-                        block_number,
-                        block_hash = %block_hash,
-                        retry_count,
-                        elapsed_ms = start.elapsed().as_millis() as u64,
-                        error = %e,
-                        "Witness fetch failed, retrying"
-                    );
-                    last_error = Some(e);
-                    tokio::time::sleep(retry_interval).await;
-                }
-            }
-        }
-
-        // Log final failure
-        warn!(
-            block_number,
-            block_hash = %block_hash,
-            retry_count,
-            timeout_ms = self.witness_timeout.as_millis() as u64,
-            "Witness fetch timeout"
-        );
-
-        Err(last_error.unwrap_or_else(|| {
-            eyre::eyre!(
-                "Witness fetch timeout after {:?} for block {}",
-                self.witness_timeout,
-                block_number
-            )
-        }))
     }
 
     /// Resolves contract bytecodes via the three-tier cache chain:
@@ -606,7 +542,7 @@ impl DataProvider {
 
         let mut new_contracts = Vec::with_capacity(missing.len());
         for hash in missing {
-            let bytecode = self.fetch_contract_code(hash).await?;
+            let bytecode = self.fetch_contract_code(hash).await;
             new_contracts.push((hash, bytecode.clone()));
             contracts.insert(hash, bytecode);
         }
@@ -621,14 +557,12 @@ impl DataProvider {
     }
 
     /// Fetches a single contract bytecode from upstream RPC and records upstream metrics.
-    async fn fetch_contract_code(&self, hash: B256) -> Result<Bytecode> {
+    async fn fetch_contract_code(&self, hash: B256) -> Bytecode {
         let upstream = UpstreamMetrics::new_for_method("eth_getCodeByHash");
         let start = std::time::Instant::now();
-        let result = self.rpc_client.get_code(hash).await;
-        upstream.record_request(result.is_ok(), start.elapsed().as_secs_f64());
-        result
-            .map(Bytecode::new_raw)
-            .map_err(|e| eyre::eyre!("Failed to fetch contract code {}: {}", hash, e))
+        let bytes = self.rpc_client.get_code(hash).await;
+        upstream.record_request(true, start.elapsed().as_secs_f64());
+        Bytecode::new_raw(bytes)
     }
 }
 
@@ -663,12 +597,6 @@ mod tests {
     #[test]
     fn test_default_witness_timeout() {
         assert_eq!(DEFAULT_WITNESS_TIMEOUT_SECS, 8);
-    }
-
-    #[test]
-    fn test_witness_retry_interval() {
-        // Retry interval should be reasonable (200ms)
-        assert_eq!(WITNESS_RETRY_INTERVAL_MS, 200);
     }
 
     #[tokio::test]
@@ -735,12 +663,6 @@ mod tests {
         let timeout = Duration::from_secs(DEFAULT_WITNESS_TIMEOUT_SECS);
         assert_eq!(timeout.as_secs(), 8);
         assert_eq!(timeout.as_millis(), 8000);
-    }
-
-    #[test]
-    fn test_retry_interval_duration() {
-        let interval = Duration::from_millis(WITNESS_RETRY_INTERVAL_MS);
-        assert_eq!(interval.as_millis(), 200);
     }
 
     // Tests for resolve_block_number logic (block tag handling)

@@ -39,25 +39,25 @@ impl BlockFetcher for ValidatorFetcher {
     type Output = ValidationTask;
 
     async fn fetch(&self, block_number: u64) -> Result<ValidationTask> {
-        let block_hash = self.rpc_client.get_block_hash(block_number).await?;
+        let block_hash = self.rpc_client.get_block_hash(block_number).await;
         let (salt_witness, mpt_witness) =
-            self.rpc_client.get_witness(block_number, block_hash).await?;
-        let block = self.rpc_client.get_block(BlockId::Number(block_number.into()), true).await?;
+            self.rpc_client.get_witness(block_number, block_hash).await;
+        let block = self.rpc_client.get_block(BlockId::Number(block_number.into()), true).await;
         Ok(ValidationTask { block, salt_witness, mpt_witness })
     }
 
     async fn latest_block_number(&self) -> Result<u64> {
-        let n = self.rpc_client.get_latest_block_number().await?;
+        let n = self.rpc_client.get_latest_block_number().await;
         (self.on_remote_height)(n);
         Ok(n)
     }
 
     async fn block_hash(&self, block_number: u64) -> Result<BlockHash> {
-        self.rpc_client.get_block_hash(block_number).await
+        Ok(self.rpc_client.get_block_hash(block_number).await)
     }
 
     async fn latest_block_meta(&self) -> Result<BlockMeta> {
-        let header = self.rpc_client.get_header(BlockId::latest(), false).await?;
+        let header = self.rpc_client.get_header(BlockId::latest(), false).await;
         Ok(BlockMeta {
             block_number: header.number,
             block_hash: header.hash,
@@ -189,12 +189,11 @@ impl BlockProcessor for ValidatorProcessor {
 
         if !missing_contracts.is_empty() {
             let client = self.rpc_client.clone();
-            let codes = future::try_join_all(missing_contracts.iter().map(|&hash| {
+            let codes = future::join_all(missing_contracts.iter().map(|&hash| {
                 let client = client.clone();
                 async move { client.get_code(hash).await }
             }))
-            .await
-            .map_err(|e| fail(format!("Failed to fetch contracts: {e}"), true))?;
+            .await;
 
             let new_bytecodes: Vec<_> = missing_contracts
                 .into_iter()

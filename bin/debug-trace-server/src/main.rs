@@ -44,7 +44,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use alloy_genesis::Genesis;
 use alloy_primitives::BlockHash;
-use alloy_rpc_types_eth::{BlockId, Header};
+use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::Result;
 use jsonrpsee::server::{Server, ServerConfig};
@@ -408,40 +408,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Fetches a block header with bounded exponential backoff (1s → 30s, ~5 minutes total).
-/// `label` is the human-readable subject used in both the "retrying" warn log and the
-/// eventual error message — e.g. "start block" or "latest block".
-async fn retry_get_header(
-    rpc_client: &Arc<RpcClient>,
-    block_id: BlockId,
-    label: &str,
-) -> Result<Header> {
-    const MAX_ATTEMPTS: u32 = 30;
-    let max_backoff = std::time::Duration::from_secs(30);
-    let mut backoff = std::time::Duration::from_secs(1);
-    for attempt in 1..=MAX_ATTEMPTS {
-        match rpc_client.get_header(block_id, false).await {
-            Ok(h) => return Ok(h),
-            Err(e) => {
-                warn!(
-                    label,
-                    ?block_id,
-                    attempt,
-                    max_attempts = MAX_ATTEMPTS,
-                    error = %e,
-                    backoff = ?backoff,
-                    "Failed to fetch header, retrying",
-                );
-                if attempt < MAX_ATTEMPTS {
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(max_backoff);
-                }
-            }
-        }
-    }
-    Err(eyre::eyre!("Failed to fetch {label} after {MAX_ATTEMPTS} attempts"))
-}
-
 /// Initializes the validator database if data_dir is provided.
 /// Returns the database if configured, None otherwise.
 /// Note: Chain tracker is spawned separately in main() to allow passing the response cache
@@ -471,16 +437,16 @@ async fn init_validator_db(
     // No local tip - need to initialize anchor block
     // Use explicit start_block if provided, otherwise fetch latest.
     //
-    // Bounded exponential backoff (1s → 30s, ~5 minutes total). The inner RPC client
-    // already retries per-call; this outer loop tolerates an endpoint still coming up
-    // at boot, but fails fast on a permanent misconfiguration.
+    // `get_header` retries transient failures forever at the RPC layer; the binary stays
+    // stuck here until the endpoint is reachable — a permanent misconfiguration surfaces via
+    // the "no forward progress" signal rather than a bounded-retry error.
     let header = if let Some(start_block_str) = &args.start_block {
         debug!(start_block = %start_block_str, "Initializing from specified start block");
         let block_hash: BlockHash = start_block_str.parse()?;
-        retry_get_header(rpc_client, BlockId::Hash(block_hash.into()), "start block").await?
+        rpc_client.get_header(BlockId::Hash(block_hash.into()), false).await
     } else {
         info!("No local tip found, fetching latest block as anchor");
-        retry_get_header(rpc_client, BlockId::latest(), "latest block").await?
+        rpc_client.get_header(BlockId::latest(), false).await
     };
 
     db.reset_anchor_block(

@@ -29,23 +29,23 @@ impl BlockFetcher for TraceFetcher {
     type Output = (Block<Transaction>, LightWitness);
 
     async fn fetch(&self, block_number: u64) -> Result<(Block<Transaction>, LightWitness)> {
-        let block_hash = self.rpc_client.get_block_hash(block_number).await?;
-        let (salt, _mpt) = self.rpc_client.get_witness(block_number, block_hash).await?;
-        let block = self.rpc_client.get_block(BlockId::Number(block_number.into()), true).await?;
+        let block_hash = self.rpc_client.get_block_hash(block_number).await;
+        let (salt, _mpt) = self.rpc_client.get_witness(block_number, block_hash).await;
+        let block = self.rpc_client.get_block(BlockId::Number(block_number.into()), true).await;
         Ok((block, LightWitness::from(&salt)))
     }
 
     async fn latest_block_number(&self) -> Result<u64> {
-        self.rpc_client.get_latest_block_number().await
+        Ok(self.rpc_client.get_latest_block_number().await)
     }
 
     async fn block_hash(&self, block_number: u64) -> Result<BlockHash> {
-        self.rpc_client.get_block_hash(block_number).await
+        Ok(self.rpc_client.get_block_hash(block_number).await)
     }
 
     async fn latest_block_meta(&self) -> Result<BlockMeta> {
         let header =
-            self.rpc_client.get_header(BlockId::Number(BlockNumberOrTag::Latest), false).await?;
+            self.rpc_client.get_header(BlockId::Number(BlockNumberOrTag::Latest), false).await;
         Ok(BlockMeta {
             block_number: header.number,
             block_hash: header.hash,

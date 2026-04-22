@@ -15,7 +15,7 @@ use stateless_core::{
     BackoffPolicy, ChainStore, ContractStore, GenesisStore, chain_spec::ChainSpec, db::BlockMeta,
 };
 use stateless_db::ContractCache;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::{metrics, validator_db::ValidatorDB, workers};
 
@@ -119,19 +119,12 @@ pub struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_ERROR_RESTART_DELAY_MS")]
     pub error_restart_delay_ms: Option<u64>,
 
-    /// Cap on exponential backoff after `latest_block_number()` failures (milliseconds).
-    #[clap(long, env = "STATELESS_VALIDATOR_FETCHER_MAX_BACKOFF_MS")]
-    pub fetcher_max_backoff_ms: Option<u64>,
-
-    /// Maximum per-call RPC retry attempts before falling over to the next endpoint.
-    #[clap(long, env = "STATELESS_VALIDATOR_RPC_MAX_RETRIES")]
-    pub rpc_max_retries: Option<u32>,
-
-    /// Initial RPC retry backoff (milliseconds). Doubles each retry up to `--rpc-max-backoff-ms`.
+    /// Initial round-level RPC retry backoff (milliseconds). Applied after every provider in a
+    /// round has failed; doubles each round up to `--rpc-max-backoff-ms`.
     #[clap(long, env = "STATELESS_VALIDATOR_RPC_INITIAL_BACKOFF_MS")]
     pub rpc_initial_backoff_ms: Option<u64>,
 
-    /// Cap on per-call RPC retry backoff (milliseconds).
+    /// Cap on round-level RPC retry backoff (milliseconds).
     #[clap(long, env = "STATELESS_VALIDATOR_RPC_MAX_BACKOFF_MS")]
     pub rpc_max_backoff_ms: Option<u64>,
 
@@ -180,7 +173,6 @@ pub async fn run() -> Result<()> {
             .rpc_max_backoff_ms
             .map(Duration::from_millis)
             .unwrap_or(rpc_defaults.rpc_retry.max),
-        max_retries: args.rpc_max_retries.map(Some).unwrap_or(rpc_defaults.rpc_retry.max_retries),
     };
     let rpc_config = RpcClientConfig {
         data_max_concurrent_requests: args.data_max_concurrent_requests,
@@ -209,38 +201,10 @@ pub async fn run() -> Result<()> {
         info!(start_block = %start_block_str, "Initializing from start block");
 
         let block_hash: BlockHash = start_block_str.parse()?;
-        // Bounded exponential backoff (1s → 30s, ~5 minutes total). The inner RPC client
-        // already retries per-call; this outer loop tolerates an endpoint that's still
-        // coming up at boot, but fails fast on a permanent misconfiguration.
-        const MAX_ATTEMPTS: u32 = 30;
-        let mut backoff = Duration::from_secs(1);
-        let max_backoff = Duration::from_secs(30);
-        let mut header = None;
-        for attempt in 1..=MAX_ATTEMPTS {
-            match client.get_header(BlockId::Hash(block_hash.into()), true).await {
-                Ok(h) => {
-                    header = Some(h);
-                    break;
-                }
-                Err(e) => {
-                    warn!(
-                        block_hash = %block_hash,
-                        attempt,
-                        max_attempts = MAX_ATTEMPTS,
-                        error = %e,
-                        backoff = ?backoff,
-                        "Failed to fetch start block, retrying",
-                    );
-                    if attempt < MAX_ATTEMPTS {
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(max_backoff);
-                    }
-                }
-            }
-        }
-        let header = header.ok_or_else(|| {
-            eyre::eyre!("Failed to fetch start block {block_hash} after {MAX_ATTEMPTS} attempts",)
-        })?;
+        // `get_header` retries transient failures forever at the RPC layer, so the binary
+        // stays stuck here until the endpoint is reachable — a permanent misconfiguration
+        // surfaces as "no forward progress" rather than an arbitrarily bounded retry error.
+        let header = client.get_header(BlockId::Hash(block_hash.into()), true).await;
 
         let anchor = BlockMeta {
             block_number: header.number,
@@ -271,13 +235,6 @@ pub async fn run() -> Result<()> {
     }
 
     let pipeline_defaults = stateless_core::PipelineConfig::default();
-    let fetcher_tip_backoff = BackoffPolicy {
-        max: args
-            .fetcher_max_backoff_ms
-            .map(Duration::from_millis)
-            .unwrap_or(pipeline_defaults.fetcher_tip_backoff.max),
-        ..pipeline_defaults.fetcher_tip_backoff.clone()
-    };
     let pipeline_config = stateless_core::PipelineConfig {
         poll_interval: args
             .poll_interval_ms
@@ -287,7 +244,9 @@ pub async fn run() -> Result<()> {
             .error_restart_delay_ms
             .map(Duration::from_millis)
             .unwrap_or(pipeline_defaults.error_restart_delay),
-        fetcher_tip_backoff,
+        // Stay 3 blocks behind the remote tip so the upstream witness generator has headroom
+        // to finish the block we'd otherwise race it for.
+        tip_buffer: 3,
         ..pipeline_defaults
     };
 

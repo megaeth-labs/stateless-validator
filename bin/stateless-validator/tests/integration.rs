@@ -370,11 +370,6 @@ async fn integration_test() {
     let config = Arc::new(PipelineConfig {
         concurrent_workers: 1,
         sync_target,
-        // Disable near-tip mode entirely for the synthetic test. The mock RPC's
-        // `eth_blockNumber` returns the max fixture block, so with the default `tip_buffer = 1`
-        // the fetcher would stop one block short of `sync_target` and the pipeline would
-        // never complete.
-        near_tip: None,
         ..PipelineConfig::default()
     });
 

@@ -4,30 +4,6 @@ use std::time::Duration;
 
 use alloy_primitives::{BlockHash, BlockNumber};
 
-use crate::BackoffPolicy;
-
-/// Near-tip mode parameters. When the fetcher's lag vs remote tip is below `lag_threshold`,
-/// failed block fetches are delayed by `retry_delay` before re-spawn. This avoids hammering
-/// the endpoint while it's still generating the very witness we're asking for.
-#[derive(Debug, Clone)]
-pub struct NearTipConfig {
-    /// Lag threshold (in blocks) below which near-tip mode activates.
-    pub lag_threshold: u64,
-    /// Delay before re-spawning a failed fetch while in near-tip mode.
-    /// Witness generation upstream lags block production by ~1-2s.
-    pub retry_delay: Duration,
-    /// Safety margin below the remote tip: the fetcher will not spawn fetches for blocks
-    /// `> chain_latest - tip_buffer`. Gives the upstream witness generator headroom to finish
-    /// the very block we'd otherwise race it for. `0` disables the buffer.
-    pub tip_buffer: u64,
-}
-
-impl Default for NearTipConfig {
-    fn default() -> Self {
-        Self { lag_threshold: 10, retry_delay: Duration::from_millis(500), tip_buffer: 3 }
-    }
-}
-
 /// Configuration for the chain sync pipeline.
 ///
 /// Binary-specific settings (metrics, reporting, pruner) live in binary CLI args.
@@ -42,12 +18,10 @@ pub struct PipelineConfig {
     pub poll_interval: Duration,
     /// Time to wait when pipeline encounters errors before restarting.
     pub error_restart_delay: Duration,
-    /// Exponential-backoff policy for the fetcher's chain-tip lookup failures.
-    /// Unbounded: the polling loop retries forever.
-    pub fetcher_tip_backoff: BackoffPolicy,
-    /// Near-tip mode parameters. `None` disables near-tip mode (always catch-up semantics:
-    /// immediate retry, standard log escalation).
-    pub near_tip: Option<NearTipConfig>,
+    /// Safety margin below the remote tip: the fetcher will not spawn fetches for blocks
+    /// `> chain_latest - tip_buffer`. Gives the upstream witness generator headroom to finish
+    /// the very block we'd otherwise race it for. `0` disables the buffer.
+    pub tip_buffer: u64,
     /// Per-cycle shutdown timeout for fetcher + workers (`await_handles`).
     /// Heavy-block validation can take >1s; tight values cause spurious "did not drain" warnings.
     pub await_handles_timeout: Duration,
@@ -79,11 +53,10 @@ impl Default for PipelineConfig {
             sync_target: None,
             poll_interval: Duration::from_millis(100),
             error_restart_delay: Duration::from_secs(1),
-            fetcher_tip_backoff: BackoffPolicy::unbounded(
-                Duration::from_millis(200),
-                Duration::from_secs(30),
-            ),
-            near_tip: Some(NearTipConfig::default()),
+            // Disabled by default. Callers that race the upstream witness generator (the
+            // validator and the trace server's chain sync) should set this to the number of
+            // blocks they want to stay behind the remote tip.
+            tip_buffer: 0,
             await_handles_timeout: Duration::from_secs(30),
             stale_reset_threshold: None,
         }

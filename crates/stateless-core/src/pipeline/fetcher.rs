@@ -1,9 +1,9 @@
-//! Fetcher stage: parallel block fetching with bounded windowing and retry.
+//! Fetcher stage: parallel block fetching with bounded windowing.
 
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use eyre::Result;
@@ -11,10 +11,7 @@ use tokio::task::{Id, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
-use crate::{
-    BackoffPolicy,
-    pipeline::{config::PipelineConfig, traits::BlockFetcher},
-};
+use crate::pipeline::{config::PipelineConfig, traits::BlockFetcher};
 
 /// Invariant: every block in `[base_block, next_block)` is in exactly one of
 /// `in_flight_blocks`, `sent`, or `failed`. All mutations go through the methods below.
@@ -30,14 +27,10 @@ struct FetcherState<F: BlockFetcher> {
     in_flight_blocks: HashSet<u64>,
     /// Successful blocks, waiting for `base_block` to catch up.
     sent: HashSet<u64>,
-    /// Blocks awaiting retry.
+    /// Blocks awaiting retry. The RPC client retries transient errors internally, so failures
+    /// bubbling up here are rare (integrity-check failures from corrupt providers). Re-enqueue
+    /// without delay — a retry that rotates round-robin to a different provider will succeed.
     failed: HashSet<u64>,
-    /// Earliest `Instant` at which a failed block may be re-spawned. Missing entries
-    /// mean "retry now". Populated only when `on_failure` is called with a delay
-    /// (near-tip mode); catch-up mode leaves this empty for immediate retry.
-    retry_at: HashMap<u64, Instant>,
-    /// Per-block attempt count for log escalation (near-tip blocks often fail a few times).
-    error_counts: HashMap<u64, usize>,
 }
 
 impl<F: BlockFetcher> FetcherState<F> {
@@ -50,8 +43,6 @@ impl<F: BlockFetcher> FetcherState<F> {
             in_flight_blocks: HashSet::new(),
             sent: HashSet::new(),
             failed: HashSet::new(),
-            retry_at: HashMap::new(),
-            error_counts: HashMap::new(),
         }
     }
 
@@ -91,37 +82,23 @@ impl<F: BlockFetcher> FetcherState<F> {
         self.next_block += 1;
     }
 
-    /// Returns a failed block whose retry delay (if any) has elapsed. Blocks with
-    /// a pending `retry_at` in the future are skipped and stay in `failed`.
-    fn pop_ready_failed(&mut self, now: Instant) -> Option<u64> {
-        let bn = *self.failed.iter().find(|bn| self.retry_at.get(bn).is_none_or(|t| *t <= now))?;
+    /// Pops a failed block for immediate re-spawn.
+    fn pop_failed(&mut self) -> Option<u64> {
+        let bn = *self.failed.iter().next()?;
         self.failed.remove(&bn);
-        self.retry_at.remove(&bn);
         Some(bn)
     }
 
     fn on_success(&mut self, id: Id, bn: u64) {
         self.task_to_block.remove(&id);
         self.in_flight_blocks.remove(&bn);
-        self.error_counts.remove(&bn);
         self.sent.insert(bn);
     }
 
-    /// Records a failed fetch attempt and returns the cumulative attempt count
-    /// (for log escalation). If `retry_delay` is `Some`, the block cannot be
-    /// re-spawned until `now + retry_delay` has elapsed.
-    fn on_failure(&mut self, id: Id, bn: u64, retry_delay: Option<Duration>) -> usize {
+    fn on_failure(&mut self, id: Id, bn: u64) {
         self.task_to_block.remove(&id);
         self.in_flight_blocks.remove(&bn);
         self.failed.insert(bn);
-        if let Some(d) = retry_delay {
-            self.retry_at.insert(bn, Instant::now() + d);
-        } else {
-            self.retry_at.remove(&bn);
-        }
-        let count = self.error_counts.entry(bn).or_insert(0);
-        *count += 1;
-        *count
     }
 
     /// Re-enqueues the panicked task's block. Returns `None` if the id is unknown
@@ -161,47 +138,34 @@ impl<F: BlockFetcher> FetcherState<F> {
     }
 }
 
-/// Cached chain tip with rate-limited refresh and failure backoff.
-struct TipTracker<'a> {
+/// Cached chain tip with rate-limited refresh.
+///
+/// The RPC client retries `latest_block_number()` internally on failure, so this tracker
+/// only caches the result and rate-limits the refresh cadence.
+struct TipTracker {
     /// `None` forces a refresh (also keeps `start_block == 0` correct vs. a `0` sentinel).
     latest: Option<u64>,
-    /// Rate-limits `latest_block_number()` calls (otherwise near-tip retries hammer
-    /// `eth_blockNumber` at 10+ RPS).
+    /// Rate-limits `latest_block_number()` calls (otherwise every fetcher iteration would
+    /// trigger one when caught up).
     last_refresh: Instant,
-    backoff: Duration,
-    policy: &'a BackoffPolicy,
 }
 
-impl<'a> TipTracker<'a> {
-    fn new(poll_interval: Duration, policy: &'a BackoffPolicy) -> Self {
-        Self {
-            latest: None,
-            last_refresh: Instant::now() - poll_interval,
-            backoff: policy.initial,
-            policy,
-        }
+impl TipTracker {
+    fn new(poll_interval: std::time::Duration) -> Self {
+        Self { latest: None, last_refresh: Instant::now() - poll_interval }
     }
 
     fn value(&self) -> Option<u64> {
         self.latest
     }
 
-    fn refresh_due(&self, poll_interval: Duration) -> bool {
+    fn refresh_due(&self, poll_interval: std::time::Duration) -> bool {
         self.last_refresh.elapsed() >= poll_interval
     }
 
     fn set(&mut self, value: u64) {
         self.latest = Some(value);
         self.last_refresh = Instant::now();
-        self.backoff = self.policy.initial;
-    }
-
-    fn backoff(&self) -> Duration {
-        self.backoff
-    }
-
-    fn inflate_backoff(&mut self) {
-        self.backoff = (self.backoff * 2).min(self.policy.max);
     }
 }
 
@@ -210,8 +174,13 @@ impl<'a> TipTracker<'a> {
 /// Spawns [`BlockFetcher::fetch`] calls onto a bounded [`JoinSet`] and forwards each result
 /// downstream as it completes — so a slow fetch does not delay faster ones in the same window.
 /// Results arrive out-of-order; the chain advancer reorders them via its `BTreeMap` buffer.
-/// Provides backpressure via the bounded output channel. On error, the block is re-enqueued;
-/// on repeated chain-tip lookup failure, backs off exponentially.
+/// Provides backpressure via the bounded output channel.
+///
+/// Transient RPC errors are absorbed inside the RPC client (it retries rounds of
+/// all providers indefinitely with round-level exponential backoff). The only errors that
+/// surface here are deterministic ones — integrity-check failures from a corrupt provider
+/// response. The fetcher re-enqueues those; the retry goes through the same round-robin and
+/// normally picks up from a healthy provider on the next attempt.
 pub async fn block_fetcher<F: BlockFetcher>(
     fetcher: Arc<F>,
     tx: kanal::Sender<F::Output>,
@@ -226,13 +195,11 @@ pub async fn block_fetcher<F: BlockFetcher>(
     let tx = tx.to_async();
     let max_in_flight = config.fetcher_max_in_flight();
     let max_window = (max_in_flight as u64) * FETCH_WINDOW_MULTIPLIER;
-    // Safety margin below the remote tip: never spawn fetches within `tip_buffer` of the tip.
-    // `None` (near-tip mode disabled) means no buffer.
-    let tip_buffer = config.near_tip.as_ref().map(|nt| nt.tip_buffer).unwrap_or(0);
+    let tip_buffer = config.tip_buffer;
     info!(start_block, max_in_flight, max_window, tip_buffer, "Starting");
 
     let mut state = FetcherState::<F>::new(start_block);
-    let mut tip = TipTracker::new(config.poll_interval, &config.fetcher_tip_backoff);
+    let mut tip = TipTracker::new(config.poll_interval);
 
     loop {
         if shutdown.is_cancelled() {
@@ -246,21 +213,20 @@ pub async fn block_fetcher<F: BlockFetcher>(
         }
 
         // Refresh tip only when we've run past the usable ceiling AND `poll_interval` has
-        // elapsed — the time gate alone would let retry-heavy loops hammer `eth_blockNumber`.
-        // The usable ceiling is `tip - tip_buffer`; otherwise a fresh tip that's still within
-        // the buffer would stall refresh forever.
+        // elapsed. The usable ceiling is `tip - tip_buffer`; otherwise a fresh tip that's
+        // still within the buffer would stall refresh forever.
         let window_exhausted =
             tip.value().is_none_or(|c| state.window_exhausted(c.saturating_sub(tip_buffer)));
         if window_exhausted && tip.refresh_due(config.poll_interval) {
+            // RPC client retries internally; this call only fails on a cancelled shutdown.
             match fetcher.latest_block_number().await {
                 Ok(n) => tip.set(n),
                 Err(e) => {
-                    warn!(error = %e, "Failed to get chain latest, retrying");
+                    warn!(error = %e, "latest_block_number failed (aborted/shutdown?)");
                     tokio::select! {
-                        _ = tokio::time::sleep(tip.backoff()) => {}
+                        _ = tokio::time::sleep(config.poll_interval) => {}
                         _ = shutdown.cancelled() => return Ok(()),
                     }
-                    tip.inflate_backoff();
                     continue;
                 }
             }
@@ -277,12 +243,8 @@ pub async fn block_fetcher<F: BlockFetcher>(
 
         // Retry failed blocks first, then fill remaining slots with fresh ones (bounded
         // by window cap so a stalled block can't grow the collections indefinitely).
-        // `pop_ready_failed` skips blocks whose near-tip retry delay hasn't elapsed yet —
-        // they stay in `failed` and will be picked up on a subsequent iteration (after the
-        // next task completion, or after the idle-loop `poll_interval` expires).
-        let now = Instant::now();
         while state.in_flight_len() < max_in_flight &&
-            let Some(bn) = state.pop_ready_failed(now)
+            let Some(bn) = state.pop_failed()
         {
             state.spawn(&fetcher, bn);
         }
@@ -319,27 +281,11 @@ pub async fn block_fetcher<F: BlockFetcher>(
                 debug!(block_number = bn, "Block sent to pipeline");
             }
             Some(Ok((id, (bn, Err(e))))) => {
-                // Two modes: catch-up (lag >= threshold) retries immediately and follows the
-                // standard 4/6 escalation; near-tip (lag < threshold) delays retries so we
-                // don't hammer the endpoint while the upstream witness is still being
-                // generated, and stays quiet at DEBUG for the first few attempts.
-                // `config.near_tip = None` disables near-tip mode entirely.
-                let lag = chain_latest.saturating_sub(state.base_block);
-                let (near_tip, retry_delay) = match &config.near_tip {
-                    Some(nt) if lag < nt.lag_threshold => (true, Some(nt.retry_delay)),
-                    _ => (false, None),
-                };
-                let attempt = state.on_failure(id, bn, retry_delay);
-                // Both modes share the 4/6 WARN/ERROR escalation. They differ only in
-                // the sub-4 band: catch-up is silent (failures there are unusual), near-tip
-                // is DEBUG (failures are expected while the upstream witness is being built).
-                if near_tip && attempt <= 3 {
-                    debug!(block_number = bn, attempt, error = %e, "Near-tip fetch failed, will retry");
-                } else if (4..=5).contains(&attempt) {
-                    warn!(block_number = bn, attempt, error = %e, "Block fetch error");
-                } else if attempt > 5 {
-                    error!(block_number = bn, attempt, error = %e, "Block fetch error (repeated)");
-                }
+                // RPC client handles transient errors; anything here is deterministic
+                // (integrity check fails, etc.). Re-enqueue — next attempt rotates
+                // round-robin to a different provider.
+                state.on_failure(id, bn);
+                warn!(block_number = bn, error = %e, "Block fetch failed, re-enqueueing");
             }
             Some(Err(join_err)) => {
                 let id = join_err.id();
@@ -397,53 +343,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn on_failure_without_delay_retries_immediately() {
+    async fn on_failure_re_enqueues_for_immediate_retry() {
         let mut state = FetcherState::<StubFetcher>::new(100);
         let id = fresh_task_id(&mut state.tasks, 100).await;
         state.in_flight_blocks.insert(100);
         state.task_to_block.insert(id, 100);
 
-        let attempt = state.on_failure(id, 100, None);
-        assert_eq!(attempt, 1);
+        state.on_failure(id, 100);
         assert!(state.failed.contains(&100));
-        assert!(!state.retry_at.contains_key(&100), "catch-up mode: no retry delay");
+        assert!(!state.in_flight_blocks.contains(&100));
 
-        let popped = state.pop_ready_failed(Instant::now());
-        assert_eq!(popped, Some(100), "immediate retry when no delay set");
-    }
-
-    #[tokio::test]
-    async fn on_failure_with_delay_defers_retry() {
-        let mut state = FetcherState::<StubFetcher>::new(100);
-        let id = fresh_task_id(&mut state.tasks, 100).await;
-        state.in_flight_blocks.insert(100);
-        state.task_to_block.insert(id, 100);
-
-        let before = Instant::now();
-        state.on_failure(id, 100, Some(Duration::from_millis(500)));
-
-        // retry_at is in the future: pop_ready_failed refuses.
-        assert_eq!(state.pop_ready_failed(before), None);
-        assert!(state.failed.contains(&100), "stays in failed until delay elapses");
-
-        // Past the deadline: pop_ready_failed releases it and clears retry_at.
-        let after = before + Duration::from_millis(600);
-        assert_eq!(state.pop_ready_failed(after), Some(100));
-        assert!(!state.retry_at.contains_key(&100));
+        assert_eq!(state.pop_failed(), Some(100));
         assert!(!state.failed.contains(&100));
-    }
-
-    #[tokio::test]
-    async fn on_failure_accumulates_attempt_count() {
-        let mut state = FetcherState::<StubFetcher>::new(100);
-
-        for expected in 1..=4 {
-            let id = fresh_task_id(&mut state.tasks, 100).await;
-            state.in_flight_blocks.insert(100);
-            state.task_to_block.insert(id, 100);
-            let attempt = state.on_failure(id, 100, None);
-            assert_eq!(attempt, expected);
-        }
     }
 
     /// `recover_gaps` must re-enqueue any block in `[base_block, next_block)` that
