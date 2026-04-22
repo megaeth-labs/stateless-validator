@@ -12,9 +12,8 @@
 //!   one path cannot starve the other. `set_validated_blocks` is unthrottled.
 //! - **Retry model**: within a single logical call, each provider is attempted once per round. If
 //!   all providers in a round fail, the client sleeps for round-level exponential backoff (capped
-//!   at [`BackoffPolicy::max`](stateless_core::BackoffPolicy)) and starts a new round. Retry is
-//!   unbounded — transient failures never surface to callers. Load distribution differs by method
-//!   type:
+//!   at [`BackoffPolicy::max`](crate::BackoffPolicy)) and starts a new round. Retry is unbounded —
+//!   transient failures never surface to callers. Load distribution differs by method type:
 //!   - **Data** (blocks/headers/code/tx): round-robin starting provider rotates per call, so
 //!     healthy endpoints share load evenly.
 //!   - **Witness**: round always starts from provider 0 — the first witness endpoint is the
@@ -41,7 +40,7 @@ use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
-use stateless_core::{BackoffPolicy, withdrawals::MptWitness};
+use stateless_core::withdrawals::MptWitness;
 use tokio::sync::Semaphore;
 use tracing::trace;
 
@@ -49,6 +48,26 @@ use crate::{
     metrics::{RpcMethod, RpcMetrics},
     witness_size::WitnessSizeBreakdown,
 };
+
+/// Exponential-backoff policy used by [`RpcClient`]'s round-level retry loop.
+///
+/// `initial` is the first sleep duration; each round doubles it up to `max`.
+/// The loop itself lives in [`round_robin_with_backoff`]; this type only describes
+/// the sleep schedule.
+#[derive(Debug, Clone)]
+pub struct BackoffPolicy {
+    /// First retry sleep. Each subsequent retry doubles up to `max`.
+    pub initial: Duration,
+    /// Upper bound on any single retry sleep.
+    pub max: Duration,
+}
+
+impl BackoffPolicy {
+    /// Creates a new policy with the given `initial` and `max` sleep durations.
+    pub const fn new(initial: Duration, max: Duration) -> Self {
+        Self { initial, max }
+    }
+}
 
 /// Configuration for [`RpcClient`] behavior.
 #[derive(Clone)]
@@ -157,7 +176,7 @@ pub struct RpcClient {
     /// later entries are failover-only.
     witness_providers: Vec<RootProvider>,
     /// Optional dedicated provider for reporting validated blocks.
-    report_provider: Option<RootProvider<Optimism>>,
+    report_provider: Option<RootProvider>,
     /// Configuration controlling verification, retry, and concurrency behavior.
     config: RpcClientConfig,
     /// Semaphore capping concurrent in-flight data-endpoint requests
@@ -216,8 +235,8 @@ impl RpcClient {
             .collect::<Result<Vec<_>>>()?;
 
         let report_provider = report_api
-            .map(|url| -> Result<RootProvider<Optimism>> {
-                Ok(ProviderBuilder::<_, _, Optimism>::default()
+            .map(|url| -> Result<RootProvider> {
+                Ok(ProviderBuilder::default()
                     .connect_http(url.parse().context("Failed to parse report API URL")?))
             })
             .transpose()?;
@@ -514,7 +533,7 @@ impl RpcClient {
 async fn round_robin_with_backoff<N, T>(
     providers: &[RootProvider<N>],
     semaphore: &Semaphore,
-    policy: &stateless_core::BackoffPolicy,
+    policy: &BackoffPolicy,
     rr_start: usize,
     method: RpcMethod,
     metrics: Option<&Arc<dyn RpcMetrics>>,
@@ -838,8 +857,7 @@ mod tests {
         types::ErrorObjectOwned,
     };
     use stateless_core::{
-        BackoffPolicy, PipelineConfig, block_fetcher, db::BlockMeta, find_divergence_point,
-        pipeline::BlockFetcher,
+        PipelineConfig, block_fetcher, db::BlockMeta, find_divergence_point, pipeline::BlockFetcher,
     };
     use tokio_util::sync::CancellationToken;
 

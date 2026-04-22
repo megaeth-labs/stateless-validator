@@ -5689,7 +5689,6 @@ dependencies = [
  "bincode 2.0.1",
  "clap",
  "eyre",
- "futures",
  "jsonrpsee",
  "jsonrpsee-types",
  "metrics",

@@ -27,14 +27,16 @@ The stateless approach eliminates the need for validators to run on high-end har
 
 ## Project Structure
 
-The workspace contains two binaries and two library crates:
+The workspace contains two binaries and four library crates:
 
-| Crate                 | Path                      | Purpose                                                          |
-| --------------------- | ------------------------- | ---------------------------------------------------------------- |
-| `stateless-core`      | `crates/stateless-core`   | Core validation logic, abstract traits, generic pipeline         |
-| `stateless-common`    | `crates/stateless-common` | Shared utilities: RPC client, database helpers, logging, metrics |
-| `stateless-validator` | `bin/stateless-validator` | Main binary: chain sync, parallel validation workers             |
-| `debug-trace-server`  | `bin/debug-trace-server`  | Standalone RPC server for debug/trace methods                    |
+| Crate                  | Path                          | Purpose                                                                             |
+| ---------------------- | ----------------------------- | ----------------------------------------------------------------------------------- |
+| `stateless-core`       | `crates/stateless-core`       | Core validation logic, abstract storage traits, generic pipeline, EVM execution     |
+| `stateless-db`         | `crates/stateless-db`         | redb-backed persistence: table definitions, read/write helpers, bounded `ContractCache` |
+| `stateless-common`     | `crates/stateless-common`     | Shared utilities: RPC client, logging, metrics                                      |
+| `stateless-test-utils` | `crates/stateless-test-utils` | Test fixtures (blocks, witnesses, contracts) and env-var lock for integration tests |
+| `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers                                |
+| `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                       |
 
 Additional directories: `test_data/` (integration test fixtures including genesis config), `audits/` (security audit reports).
 
@@ -194,26 +196,27 @@ The pipeline is configured via `PipelineConfig` and customized through trait imp
 
 ### Key Source Files
 
-| File                                          | Purpose                                                                             |
-| --------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `crates/stateless-core/src/pipeline.rs`       | Generic pipeline: BlockFetcher, run_pipeline, chain_advancer, find_divergence_point |
-| `crates/stateless-core/src/executor.rs`       | Block validation and EVM replay                                                     |
-| `crates/stateless-core/src/db.rs`             | Storage traits: ChainStore, BlockStore, ContractStore                               |
-| `crates/stateless-core/src/evm_database.rs`   | WitnessDatabase implementing `revm::DatabaseRef`                                    |
-| `crates/stateless-core/src/withdrawals.rs`    | Withdrawal validation and MPT witness handling                                      |
-| `crates/stateless-common/src/rpc_client.rs`   | RpcClient: HTTP-based block/witness/contract fetching                               |
-| `crates/stateless-common/src/db.rs`           | Shared redb table definitions and helpers                                           |
-| `crates/stateless-common/src/metrics.rs`      | RpcMethod, RpcMetrics, RpcClientConfig                                              |
-| `crates/stateless-common/src/witness_size.rs` | `WitnessSizeBreakdown` + `estimate_witness_size` for RPC and trace-server metrics   |
-| `crates/stateless-test-utils/src/fixtures.rs` | `TestFixtures` loader (blocks, SALT/MPT witnesses, contracts, genesis)              |
-| `bin/stateless-validator/src/chain_sync.rs`   | ValidatorFetcher, ValidatorProcessor, ValidatorHooks                                |
-| `bin/debug-trace-server/src/chain_sync.rs`    | TraceFetcher, TraceProcessor, TraceHooks                                            |
-| `bin/debug-trace-server/src/rpc_service.rs`   | RPC method definitions and handlers                                                 |
-| `bin/debug-trace-server/src/data_provider.rs` | Block data fetching with single-flight coalescing                                   |
+| File                                                                                           | Purpose                                                                             |
+| ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| `crates/stateless-core/src/pipeline/{mod,config,traits,fetcher,divergence,advancer,worker}.rs` | Generic three-stage pipeline split by responsibility                                |
+| `crates/stateless-core/src/executor.rs`                                                        | Block validation and EVM replay                                                     |
+| `crates/stateless-core/src/db.rs`                                                              | Abstract storage traits: `ChainStore`, `BlockStore`, `ContractStore`, `StoreError`  |
+| `crates/stateless-core/src/evm_database.rs`                                                    | `WitnessDatabase` implementing `revm::DatabaseRef`                                  |
+| `crates/stateless-core/src/withdrawals.rs`                                                     | Withdrawal validation and MPT witness handling                                      |
+| `crates/stateless-db/src/{lib,tables,helpers,serialize,cache}.rs`                              | Shared redb tables, helpers, serialization, and bounded `ContractCache`             |
+| `crates/stateless-common/src/rpc_client.rs`                                                    | `RpcClient`: multi-endpoint HTTP client for blocks, witnesses, and bytecode         |
+| `crates/stateless-common/src/metrics.rs`                                                       | `RpcMethod`, `RpcMetrics`, `RpcClientConfig`                                        |
+| `crates/stateless-common/src/witness_size.rs`                                                  | `WitnessSizeBreakdown` + `estimate_witness_size` for RPC and trace-server metrics   |
+| `crates/stateless-test-utils/src/fixtures.rs`                                                  | `TestFixtures` loader (blocks, SALT/MPT witnesses, contracts, genesis)              |
+| `bin/stateless-validator/src/{main,app,workers,chain_sync,validator_db,metrics}.rs`            | Thin entry, CLI/startup wiring, pipeline+reporter, fetcher/processor, DB            |
+| `bin/debug-trace-server/src/chain_sync.rs`                                                     | `TraceFetcher`, `TraceProcessor`, `TraceHooks`                                      |
+| `bin/debug-trace-server/src/rpc_service.rs`                                                    | RPC method definitions and handlers                                                 |
+| `bin/debug-trace-server/src/data_provider.rs`                                                  | Block data fetching with single-flight coalescing                                   |
+| `bin/debug-trace-server/src/server_db.rs`                                                      | Concrete `BlockStore` implementation backed by `stateless-db`                       |
 
 ### Database
 
-The validator and trace server each have their own `redb`-backed database, sharing common table definitions from `stateless-common::db`:
+The validator and trace server each have their own `redb`-backed database, sharing common table definitions and helpers from the `stateless-db` crate:
 
 | Table             | Key                        | Value                                                  | Used By                      |
 | ----------------- | -------------------------- | ------------------------------------------------------ | ---------------------------- |

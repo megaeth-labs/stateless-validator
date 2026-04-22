@@ -6,18 +6,15 @@
 //!
 //! ## Modules
 //!
-//! - [`pipeline`]: Generic three-stage chain sync pipeline (fetch → process → advance)
-//! - [`executor`]: Block validation via EVM replay
+//! - [`chain_spec`]: Chain specification and hardfork activation
+//! - [`light_witness`]: Fast witness deserialization (skips proof validation)
 //! - [`evm_database`]: Witness-backed `DatabaseRef` for REVM
 //! - [`db`]: Abstract storage traits (`ChainStore`, `ContractStore`, etc.)
-//! - [`rpc`]: `ChainDataProvider` trait for abstracting RPC access
-//! - [`chain_spec`]: Chain specification and hardfork activation
 //! - [`data_types`]: SALT key/value encoding utilities
-//! - [`light_witness`]: Fast witness deserialization (skips proof validation)
+//! - [`executor`]: Block validation via EVM replay
+//! - [`pipeline`]: Generic three-stage chain sync pipeline (fetch → process → advance)
 //! - [`withdrawals`]: MPT witness verification for L2→L1 withdrawals
 
-pub mod backoff;
-pub use backoff::BackoffPolicy;
 pub mod chain_spec;
 pub mod light_witness;
 pub use light_witness::{LightWitness, LightWitnessExecutor};

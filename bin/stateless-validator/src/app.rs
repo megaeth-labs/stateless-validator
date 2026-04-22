@@ -8,11 +8,11 @@ use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::Result;
 use stateless_common::{
-    RpcClient, RpcClientConfig,
+    BackoffPolicy, RpcClient, RpcClientConfig,
     logging::{LogArgs, migrate_legacy_env_vars},
 };
 use stateless_core::{
-    BackoffPolicy, ChainStore, ContractStore, GenesisStore, chain_spec::ChainSpec, db::BlockMeta,
+    ChainStore, ContractStore, GenesisStore, chain_spec::ChainSpec, db::BlockMeta,
 };
 use stateless_db::ContractCache;
 use tracing::info;

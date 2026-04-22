@@ -65,7 +65,7 @@ The shared persistence layer — table definitions, read/write helpers, serializ
 
 - **`ANCHOR_BLOCK`** — Trusted starting point (block number, hash, state root, withdrawals root).
 - **`CANONICAL_CHAIN`** — Validated chain progression (block number → hash, state root, withdrawals root).
-- **`CONTRACTS`** — On-demand contract bytecode cache (code hash → bincode+lz4 bytecode).
+- **`CONTRACTS`** — Persistent tier of the contract bytecode cache (code hash → bincode+lz4 bytecode). The in-memory tier is the bounded `ContractCache` on top.
 - **`GENESIS_CONFIG`** — Hardfork activation rules (validator only).
 - **`BLOCK_DATA`** — Full block content (trace server only).
 - **`WITNESSES`** — Light witness data (trace server only).
