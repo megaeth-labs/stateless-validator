@@ -354,7 +354,8 @@ async fn integration_test() {
     let fx = TestFixtures::synthetic();
     let genesis_file = fx.data_dir.join("genesis.json");
 
-    let sync_target = Some(fx.max_block().0);
+    let max_block_number = fx.max_block().0;
+    let sync_target = Some(max_block_number);
     let validator_db = setup_test_db(&fx).unwrap();
     let contract_cache =
         Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
@@ -383,8 +384,18 @@ async fn integration_test() {
     let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
     let hooks = Arc::new(ValidatorHooks);
 
-    run_pipeline(fetcher, validator_db, processor, hooks, config, shutdown).await.unwrap();
+    run_pipeline(fetcher, Arc::clone(&validator_db), processor, hooks, config, shutdown)
+        .await
+        .unwrap();
+
+    // Verify all fixture blocks were validated and persisted — guards against silent
+    // partial-advance failures where the pipeline returns Ok but the DB is short.
+    assert_eq!(
+        validator_db.get_canonical_tip().unwrap().unwrap().block_number,
+        max_block_number,
+        "expected validator DB tip to reach max fixture block",
+    );
 
     handle.stop().unwrap();
-    info!("Mock RPC server has been shut down.");
+    info!("Mock RPC server has been shut down");
 }

@@ -24,7 +24,7 @@ pub struct NearTipConfig {
 
 impl Default for NearTipConfig {
     fn default() -> Self {
-        Self { lag_threshold: 10, retry_delay: Duration::from_millis(500), tip_buffer: 1 }
+        Self { lag_threshold: 10, retry_delay: Duration::from_millis(500), tip_buffer: 3 }
     }
 }
 

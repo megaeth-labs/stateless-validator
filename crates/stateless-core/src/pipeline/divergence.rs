@@ -55,7 +55,11 @@ pub async fn find_divergence_point<F: BlockFetcher>(
      ),
     mismatch_block: u64,
 ) -> std::result::Result<u64, DivergenceError> {
-    let earliest_local = get_earliest()?.expect("Local chain cannot be empty");
+    // Empty-chain is not reachable when the advancer calls us (it only triggers a reorg
+    // after `current_tip` is set), but returning a typed fatal error keeps a future caller
+    // from panicking the pipeline task.
+    let earliest_local = get_earliest()?
+        .ok_or(DivergenceError::LocalChainCorrupt { block_number: mismatch_block })?;
 
     let earliest_remote_hash = fetcher.block_hash(earliest_local.0).await?;
     if earliest_remote_hash != earliest_local.1 {

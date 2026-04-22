@@ -44,7 +44,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use alloy_genesis::Genesis;
 use alloy_primitives::BlockHash;
-use alloy_rpc_types_eth::BlockId;
+use alloy_rpc_types_eth::{BlockId, Header};
 use clap::Parser;
 use eyre::Result;
 use jsonrpsee::server::{Server, ServerConfig};
@@ -408,6 +408,40 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Fetches a block header with bounded exponential backoff (1s → 30s, ~5 minutes total).
+/// `label` is the human-readable subject used in both the "retrying" warn log and the
+/// eventual error message — e.g. "start block" or "latest block".
+async fn retry_get_header(
+    rpc_client: &Arc<RpcClient>,
+    block_id: BlockId,
+    label: &str,
+) -> Result<Header> {
+    const MAX_ATTEMPTS: u32 = 30;
+    let max_backoff = std::time::Duration::from_secs(30);
+    let mut backoff = std::time::Duration::from_secs(1);
+    for attempt in 1..=MAX_ATTEMPTS {
+        match rpc_client.get_header(block_id, false).await {
+            Ok(h) => return Ok(h),
+            Err(e) => {
+                warn!(
+                    label,
+                    ?block_id,
+                    attempt,
+                    max_attempts = MAX_ATTEMPTS,
+                    error = %e,
+                    backoff = ?backoff,
+                    "Failed to fetch header, retrying",
+                );
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(max_backoff);
+                }
+            }
+        }
+    }
+    Err(eyre::eyre!("Failed to fetch {label} after {MAX_ATTEMPTS} attempts"))
+}
+
 /// Initializes the validator database if data_dir is provided.
 /// Returns the database if configured, None otherwise.
 /// Note: Chain tracker is spawned separately in main() to allow passing the response cache
@@ -440,66 +474,13 @@ async fn init_validator_db(
     // Bounded exponential backoff (1s → 30s, ~5 minutes total). The inner RPC client
     // already retries per-call; this outer loop tolerates an endpoint still coming up
     // at boot, but fails fast on a permanent misconfiguration.
-    const MAX_ATTEMPTS: u32 = 30;
-    let max_backoff = std::time::Duration::from_secs(30);
     let header = if let Some(start_block_str) = &args.start_block {
         debug!(start_block = %start_block_str, "Initializing from specified start block");
         let block_hash: BlockHash = start_block_str.parse()?;
-        let mut backoff = std::time::Duration::from_secs(1);
-        let mut header = None;
-        for attempt in 1..=MAX_ATTEMPTS {
-            match rpc_client.get_header(BlockId::Hash(block_hash.into()), false).await {
-                Ok(h) => {
-                    header = Some(h);
-                    break;
-                }
-                Err(e) => {
-                    warn!(
-                        block_hash = %block_hash,
-                        attempt,
-                        max_attempts = MAX_ATTEMPTS,
-                        error = %e,
-                        backoff = ?backoff,
-                        "Failed to fetch start block, retrying",
-                    );
-                    if attempt < MAX_ATTEMPTS {
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(max_backoff);
-                    }
-                }
-            }
-        }
-        header.ok_or_else(|| {
-            eyre::eyre!("Failed to fetch start block {block_hash} after {MAX_ATTEMPTS} attempts")
-        })?
+        retry_get_header(rpc_client, BlockId::Hash(block_hash.into()), "start block").await?
     } else {
         info!("No local tip found, fetching latest block as anchor");
-        let mut backoff = std::time::Duration::from_secs(1);
-        let mut header = None;
-        for attempt in 1..=MAX_ATTEMPTS {
-            match rpc_client.get_header(BlockId::latest(), false).await {
-                Ok(h) => {
-                    header = Some(h);
-                    break;
-                }
-                Err(e) => {
-                    warn!(
-                        attempt,
-                        max_attempts = MAX_ATTEMPTS,
-                        error = %e,
-                        backoff = ?backoff,
-                        "Failed to fetch latest block, retrying",
-                    );
-                    if attempt < MAX_ATTEMPTS {
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(max_backoff);
-                    }
-                }
-            }
-        }
-        header.ok_or_else(|| {
-            eyre::eyre!("Failed to fetch latest block after {MAX_ATTEMPTS} attempts")
-        })?
+        retry_get_header(rpc_client, BlockId::latest(), "latest block").await?
     };
 
     db.reset_anchor_block(
