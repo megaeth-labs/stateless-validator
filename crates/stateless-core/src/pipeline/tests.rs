@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     BlockFetcher, BlockProcessor, ErrorAction, PipelineConfig, PipelineHooks, PipelineOutcome,
-    ProcessedBlock, advancer::chain_advancer, block_fetcher, find_divergence_point,
+    ProcessedBlock, advancer::chain_advancer, block_fetcher, find_divergence_point, run_pipeline,
     worker::spawn_workers,
 };
 use crate::{ChainStore, StoreResult, db::BlockMeta};
@@ -23,6 +23,12 @@ fn test_pipeline_config_default_uses_cpu_count() {
 #[test]
 fn test_pipeline_config_default_stale_disabled() {
     assert!(PipelineConfig::default().stale_reset_threshold.is_none());
+}
+
+#[test]
+fn test_pipeline_config_default_tip_buffer_is_one() {
+    let near_tip = PipelineConfig::default().near_tip.expect("near_tip enabled by default");
+    assert_eq!(near_tip.tip_buffer, 1);
 }
 
 // Mock types for tests
@@ -469,6 +475,7 @@ async fn test_block_fetcher_streams_out_of_order() {
         concurrent_workers: 2, // → fetcher_max_in_flight() = 4, window holds all 4 blocks
         sync_target: Some(start + 3), // fetcher exits cleanly after block 103
         poll_interval: Duration::from_millis(10),
+        near_tip: None, // disable tip_buffer: test asserts fetching through to the exact tip
         ..PipelineConfig::default()
     });
     let handle = tokio::spawn(block_fetcher(fetcher, tx, start, config, CancellationToken::new()));
@@ -490,6 +497,78 @@ async fn test_block_fetcher_streams_out_of_order() {
 
     // Fetcher exits cleanly after sync_target.
     assert!(tokio::time::timeout(Duration::from_secs(5), handle).await.is_ok());
+}
+
+/// The `NearTipConfig.tip_buffer` field must keep the fetcher from spawning any fetch
+/// within `tip_buffer` of the remote tip, so the upstream witness generator has headroom.
+#[tokio::test]
+async fn test_block_fetcher_respects_tip_buffer() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Records the highest block number ever passed to `fetch()`.
+    struct TrackingFetcher(u64, Arc<AtomicU64>);
+    impl BlockFetcher for TrackingFetcher {
+        type Output = u64;
+        async fn fetch(&self, bn: u64) -> eyre::Result<u64> {
+            self.1.fetch_max(bn, Ordering::Relaxed);
+            Ok(bn)
+        }
+        async fn latest_block_number(&self) -> eyre::Result<u64> {
+            Ok(self.0)
+        }
+        async fn block_hash(&self, _: u64) -> eyre::Result<BlockHash> {
+            unreachable!()
+        }
+        async fn latest_block_meta(&self) -> eyre::Result<BlockMeta> {
+            unreachable!()
+        }
+    }
+
+    let (start, latest, buffer) = (100u64, 110u64, 3u64);
+    let highest = Arc::new(AtomicU64::new(0));
+
+    let (tx, rx) = kanal::bounded::<u64>(64);
+    let mut near_tip = super::NearTipConfig::default();
+    near_tip.tip_buffer = buffer;
+    let config = Arc::new(PipelineConfig {
+        concurrent_workers: 2,
+        poll_interval: Duration::from_millis(10),
+        near_tip: Some(near_tip),
+        ..PipelineConfig::default()
+    });
+    let shutdown = CancellationToken::new();
+
+    // Drain so tx.send never blocks.
+    let drain = tokio::spawn(async move {
+        let rx = rx.to_async();
+        while rx.recv().await.is_ok() {}
+    });
+    let fetcher_handle = tokio::spawn(block_fetcher(
+        Arc::new(TrackingFetcher(latest, highest.clone())),
+        tx,
+        start,
+        config,
+        shutdown.clone(),
+    ));
+
+    // Poll until the ceiling is visibly pinned — two consecutive samples equal AND at the
+    // expected ceiling. No wall-clock dependence on a fixed settle duration.
+    let expected_ceiling = latest - buffer;
+    let mut prev = 0u64;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let cur = highest.load(Ordering::Relaxed);
+        if cur == prev && cur == expected_ceiling {
+            break;
+        }
+        prev = cur;
+    }
+    shutdown.cancel();
+    let _ = tokio::time::timeout(Duration::from_secs(5), fetcher_handle).await;
+    drain.abort();
+
+    let h = highest.load(Ordering::Relaxed);
+    assert_eq!(h, expected_ceiling, "fetcher respected tip_buffer={buffer} below tip={latest}");
 }
 
 /// Regression: a persistently-failing block must not let the fetch window grow
@@ -566,4 +645,161 @@ async fn test_block_fetcher_bounded_window_under_stall() {
     let h = highest.load(Ordering::Relaxed);
     let ceiling = stuck + max_window;
     assert!(h < ceiling, "attempted {h}, expected < {ceiling}; without cap would reach ~{latest}");
+}
+
+#[test]
+fn processed_block_verify_continuity_default_ok() {
+    let prev = make_tip(9);
+    let block = make_block(10, make_hash(9));
+    block.verify_continuity(&prev).unwrap();
+}
+
+#[test]
+fn block_processor_defaults() {
+    struct P;
+    impl BlockProcessor for P {
+        type Input = u64;
+        type Output = MockBlock;
+        type Error = String;
+
+        async fn process(&self, _: u64) -> std::result::Result<MockBlock, String> {
+            unreachable!()
+        }
+    }
+    let p = P;
+    assert_eq!(p.error_action(&"any".to_string()), ErrorAction::Halt);
+    p.on_task_done(0, true);
+    p.on_task_done(1, false);
+}
+
+#[test]
+fn pipeline_hooks_defaults_are_noop() {
+    let hooks = NoopHooks;
+    let tip = make_tip(10);
+    hooks.pre_advance(&[]).unwrap();
+    hooks.post_advance(&tip).unwrap();
+    hooks.on_reorg(5, 2, &[make_hash(11), make_hash(12)]).unwrap();
+    hooks.on_stale_reset(&tip).unwrap();
+}
+
+#[tokio::test]
+async fn block_fetcher_arc_blanket_forwards_all_methods() {
+    struct FullFetcher;
+    impl BlockFetcher for FullFetcher {
+        type Output = u64;
+        async fn fetch(&self, bn: u64) -> Result<u64> {
+            Ok(bn)
+        }
+        async fn latest_block_number(&self) -> Result<u64> {
+            Ok(7)
+        }
+        async fn block_hash(&self, _: u64) -> Result<BlockHash> {
+            Ok(make_hash(7))
+        }
+        async fn latest_block_meta(&self) -> Result<BlockMeta> {
+            Ok(make_tip(7))
+        }
+    }
+    let full: Arc<FullFetcher> = Arc::new(FullFetcher);
+    assert_eq!(full.fetch(3).await.unwrap(), 3);
+    assert_eq!(full.latest_block_number().await.unwrap(), 7);
+    assert_eq!(full.block_hash(0).await.unwrap(), make_hash(7));
+    assert_eq!(full.latest_block_meta().await.unwrap().block_number, 7);
+}
+
+/// Pass-through processor shared by the `run_pipeline_*` tests.
+struct PassThrough;
+impl BlockProcessor for PassThrough {
+    type Input = MockBlock;
+    type Output = MockBlock;
+    type Error = String;
+    async fn process(&self, b: MockBlock) -> std::result::Result<MockBlock, String> {
+        Ok(b)
+    }
+}
+
+#[tokio::test]
+async fn run_pipeline_reaches_sync_target() {
+    struct TargetFetcher {
+        latest: u64,
+    }
+    impl BlockFetcher for TargetFetcher {
+        type Output = MockBlock;
+        async fn fetch(&self, bn: u64) -> Result<MockBlock> {
+            Ok(make_block(bn, make_hash(bn - 1)))
+        }
+        async fn latest_block_number(&self) -> Result<u64> {
+            Ok(self.latest)
+        }
+        async fn block_hash(&self, bn: u64) -> Result<BlockHash> {
+            Ok(make_hash(bn))
+        }
+        async fn latest_block_meta(&self) -> Result<BlockMeta> {
+            Ok(make_tip(self.latest))
+        }
+    }
+
+    let store = Arc::new(MockStore::new(make_tip(10)));
+    let config = Arc::new(PipelineConfig {
+        concurrent_workers: 1,
+        sync_target: Some(13),
+        poll_interval: Duration::from_millis(10),
+        near_tip: None, // disable tip_buffer: sync_target sits at the mock's latest tip
+        ..PipelineConfig::default()
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_pipeline(
+            Arc::new(TargetFetcher { latest: 13 }),
+            Arc::clone(&store),
+            Arc::new(PassThrough),
+            Arc::new(NoopHooks),
+            config,
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("run_pipeline did not finish within timeout")
+    .expect("run_pipeline returned error");
+
+    assert_eq!(store.get_canonical_tip().unwrap().unwrap().block_number, 13);
+}
+
+#[tokio::test]
+async fn run_pipeline_returns_on_pre_cancelled_shutdown() {
+    struct NoopFetcher;
+    impl BlockFetcher for NoopFetcher {
+        type Output = MockBlock;
+        async fn fetch(&self, _: u64) -> Result<MockBlock> {
+            unreachable!("shutdown cancels before fetch")
+        }
+        async fn latest_block_number(&self) -> Result<u64> {
+            Ok(0)
+        }
+        async fn block_hash(&self, _: u64) -> Result<BlockHash> {
+            unreachable!()
+        }
+        async fn latest_block_meta(&self) -> Result<BlockMeta> {
+            Ok(make_tip(0))
+        }
+    }
+
+    let shutdown = CancellationToken::new();
+    shutdown.cancel();
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        run_pipeline(
+            Arc::new(NoopFetcher),
+            Arc::new(MockStore::new(make_tip(0))),
+            Arc::new(PassThrough),
+            Arc::new(NoopHooks),
+            Arc::new(PipelineConfig::default()),
+            shutdown,
+        ),
+    )
+    .await
+    .expect("pre-cancelled shutdown did not return within timeout")
+    .unwrap();
 }

@@ -155,4 +155,41 @@ mod tests {
         };
         assert_eq!(meta, meta.clone());
     }
+
+    #[test]
+    fn missing_data_kind_display() {
+        assert_eq!(MissingDataKind::Block.to_string(), "block");
+        assert_eq!(MissingDataKind::Witness.to_string(), "witness");
+    }
+
+    #[test]
+    fn store_error_missing_data_display_includes_kind_and_hash() {
+        let hash = BlockHash::from([0xAB; 32]);
+        let err = StoreError::MissingData { kind: MissingDataKind::Witness, block_hash: hash };
+        let s = err.to_string();
+        assert!(s.contains("witness"), "missing kind tag: {s}");
+        assert!(s.contains("0xab"), "missing hash hex: {s}");
+    }
+
+    #[test]
+    fn store_error_corrupt_display() {
+        let err = StoreError::Corrupt("bad bytes".into());
+        assert_eq!(err.to_string(), "corrupt data: bad bytes");
+    }
+
+    #[test]
+    fn store_error_backend_display_forwards_transparently() {
+        // `#[error(transparent)]` makes Backend's Display delegate to the wrapped error —
+        // no prefix, just the inner message.
+        let io = std::io::Error::other("disk full");
+        let err: StoreError = Err::<(), _>(io).store_err().unwrap_err();
+        assert_eq!(err.to_string(), "disk full");
+        assert!(matches!(err, StoreError::Backend(_)));
+    }
+
+    #[test]
+    fn store_result_ext_passes_through_ok() {
+        let r: StoreResult<u32> = Ok::<_, std::io::Error>(42).store_err();
+        assert_eq!(r.unwrap(), 42);
+    }
 }
