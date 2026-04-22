@@ -3,10 +3,6 @@
 //! Provides [`RpcMethod`] for identifying RPC calls and [`RpcMetrics`] as a
 //! callback trait for tracking RPC performance.
 
-use std::{sync::Arc, time::Duration};
-
-use stateless_core::BackoffPolicy;
-
 use crate::witness_size::WitnessSizeBreakdown;
 
 /// Byte-size histogram buckets: 1 KB, 10 KB, 50 KB, 200 KB, 1 MB, 5 MB, 20 MB.
@@ -66,99 +62,9 @@ pub trait RpcMetrics: Send + Sync {
     fn on_witness_fetch(&self, breakdown: WitnessSizeBreakdown);
 }
 
-/// Configuration for RPC client behavior.
-#[derive(Clone)]
-pub struct RpcClientConfig {
-    /// Skip ECDSA signature verification and block hash verification.
-    /// Enable for trusted data sources (e.g., debug-trace-server fetching from upstream RPC)
-    /// where integrity checks are unnecessary overhead.
-    pub skip_block_verification: bool,
-    /// Optional metrics callbacks for tracking RPC performance.
-    pub metrics: Option<Arc<dyn RpcMetrics>>,
-    /// Maximum number of concurrent in-flight data-endpoint requests
-    /// (blocks, headers, contract bytecode, transactions). `None` means unlimited.
-    pub data_max_concurrent_requests: Option<usize>,
-    /// Maximum number of concurrent in-flight witness fetches. Independent from the data cap so
-    /// a burst of block fetches cannot starve witness retrieval (and vice versa). `None` means
-    /// unlimited.
-    pub witness_max_concurrent_requests: Option<usize>,
-    /// Per-call retry policy: initial/max backoff and the retry-count bound.
-    /// `max_retries` must be `Some(_)`; unbounded retry is not meaningful for a single RPC call
-    /// (fall-through to the next provider handles permanent failures).
-    /// Does not apply to `get_witness` — that method falls back across providers instead.
-    pub rpc_retry: BackoffPolicy,
-}
-
-impl Default for RpcClientConfig {
-    fn default() -> Self {
-        Self {
-            skip_block_verification: false,
-            metrics: None,
-            data_max_concurrent_requests: None,
-            witness_max_concurrent_requests: None,
-            rpc_retry: BackoffPolicy::bounded(
-                Duration::from_millis(100),
-                Duration::from_secs(10),
-                3,
-            ),
-        }
-    }
-}
-
-impl std::fmt::Debug for RpcClientConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RpcClientConfig")
-            .field("skip_block_verification", &self.skip_block_verification)
-            .field("metrics", &self.metrics.is_some())
-            .field("data_max_concurrent_requests", &self.data_max_concurrent_requests)
-            .field("witness_max_concurrent_requests", &self.witness_max_concurrent_requests)
-            .field("rpc_retry", &self.rpc_retry)
-            .finish()
-    }
-}
-
-impl RpcClientConfig {
-    /// Creates a config for validation mode (full verification).
-    pub fn validator() -> Self {
-        Self { skip_block_verification: false, ..Default::default() }
-    }
-
-    /// Creates a config for trace/debug mode (skip verification).
-    pub fn trace_server() -> Self {
-        Self { skip_block_verification: true, ..Default::default() }
-    }
-
-    /// Sets the metrics callbacks.
-    pub fn with_metrics(mut self, metrics: Arc<dyn RpcMetrics>) -> Self {
-        self.metrics = Some(metrics);
-        self
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_rpc_client_config_default() {
-        let config = RpcClientConfig::default();
-        assert!(!config.skip_block_verification);
-        assert!(config.metrics.is_none());
-    }
-
-    #[test]
-    fn test_rpc_client_config_validator() {
-        let config = RpcClientConfig::validator();
-        assert!(!config.skip_block_verification);
-        assert!(config.metrics.is_none());
-    }
-
-    #[test]
-    fn test_rpc_client_config_trace_server() {
-        let config = RpcClientConfig::trace_server();
-        assert!(config.skip_block_verification);
-        assert!(config.metrics.is_none());
-    }
 
     #[test]
     fn test_rpc_method_as_str() {

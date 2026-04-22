@@ -5,18 +5,20 @@
 //!
 //! ## Network resilience
 //!
-//! - **Multi-endpoint data support**: accepts an ordered list of data endpoints; data methods pick
-//!   a starting provider via round-robin and, on failure, retry with backoff on that provider
-//!   before cycling to the next.
-//! - **Multi-endpoint witness support**: accepts an ordered list of witness endpoints;
-//!   `get_witness` tries them front-to-back and returns on the first success.
+//! - **Multi-endpoint data support**: accepts an ordered list of data endpoints.
+//! - **Multi-endpoint witness support**: accepts an ordered list of witness endpoints.
 //! - **Concurrency limiting**: two independent [`tokio::sync::Semaphore`]s cap in-flight requests —
 //!   one for data-endpoint calls (blocks/headers/code/tx), one for witness fetches — so a burst on
 //!   one path cannot starve the other. `set_validated_blocks` is unthrottled.
-//! - **Per-call retry with backoff**: data methods automatically retry transient RPC errors with
-//!   exponential backoff per provider, cycling through providers in round-robin order after
-//!   exhausting retries; `get_witness` does not retry per-provider but falls back to the next
-//!   provider instead.
+//! - **Retry model**: within a single logical call, each provider is attempted once per round. If
+//!   all providers in a round fail, the client sleeps for round-level exponential backoff (capped
+//!   at [`BackoffPolicy::max`](stateless_core::BackoffPolicy)) and starts a new round. Retry is
+//!   unbounded — transient failures never surface to callers. Load distribution differs by method
+//!   type:
+//!   - **Data** (blocks/headers/code/tx): round-robin starting provider rotates per call, so
+//!     healthy endpoints share load evenly.
+//!   - **Witness**: round always starts from provider 0 — the first witness endpoint is the
+//!     primary, others are failover-only.
 
 use std::{
     collections::HashMap,
@@ -25,7 +27,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use alloy_primitives::{B256, Bytes, U64};
@@ -39,14 +41,82 @@ use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
-use stateless_core::withdrawals::MptWitness;
+use stateless_core::{BackoffPolicy, withdrawals::MptWitness};
 use tokio::sync::Semaphore;
 use tracing::trace;
 
 use crate::{
-    metrics::{RpcClientConfig, RpcMethod},
+    metrics::{RpcMethod, RpcMetrics},
     witness_size::WitnessSizeBreakdown,
 };
+
+/// Configuration for [`RpcClient`] behavior.
+#[derive(Clone)]
+pub struct RpcClientConfig {
+    /// Skip ECDSA signature verification and block hash verification.
+    /// Enable for trusted data sources (e.g., debug-trace-server fetching from upstream RPC)
+    /// where integrity checks are unnecessary overhead.
+    pub skip_block_verification: bool,
+    /// Optional metrics callbacks for tracking RPC performance.
+    pub metrics: Option<Arc<dyn RpcMetrics>>,
+    /// Maximum number of concurrent in-flight data-endpoint requests
+    /// (blocks, headers, contract bytecode, transactions). `None` means unlimited.
+    pub data_max_concurrent_requests: Option<usize>,
+    /// Maximum number of concurrent in-flight witness fetches. Independent from the data cap so
+    /// a burst of block fetches cannot starve witness retrieval (and vice versa). `None` means
+    /// unlimited.
+    pub witness_max_concurrent_requests: Option<usize>,
+    /// Round-level exponential backoff policy for retrying RPC calls. When a call fails on
+    /// every configured provider in a single round, the client sleeps for `initial` (with
+    /// jitter) before the next round and doubles the sleep each round up to `max`. Retry is
+    /// unbounded — caller-visible failures don't occur.
+    pub rpc_retry: BackoffPolicy,
+}
+
+impl Default for RpcClientConfig {
+    fn default() -> Self {
+        Self {
+            skip_block_verification: false,
+            metrics: None,
+            data_max_concurrent_requests: None,
+            witness_max_concurrent_requests: None,
+            // Round-level backoff: first cross-provider retry sleeps ~500ms, doubling up to
+            // 30s. That's gentle enough to ride out near-tip witness generation latency (a
+            // few seconds) without hammering upstream when something is genuinely broken.
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(500), Duration::from_secs(30)),
+        }
+    }
+}
+
+impl std::fmt::Debug for RpcClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcClientConfig")
+            .field("skip_block_verification", &self.skip_block_verification)
+            .field("metrics", &self.metrics.is_some())
+            .field("data_max_concurrent_requests", &self.data_max_concurrent_requests)
+            .field("witness_max_concurrent_requests", &self.witness_max_concurrent_requests)
+            .field("rpc_retry", &self.rpc_retry)
+            .finish()
+    }
+}
+
+impl RpcClientConfig {
+    /// Creates a config for validation mode (full verification).
+    pub fn validator() -> Self {
+        Self { skip_block_verification: false, ..Default::default() }
+    }
+
+    /// Creates a config for trace/debug mode (skip verification).
+    pub fn trace_server() -> Self {
+        Self { skip_block_verification: true, ..Default::default() }
+    }
+
+    /// Sets the metrics callbacks.
+    pub fn with_metrics(mut self, metrics: Arc<dyn RpcMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+}
 
 /// Boxed, `'static` future returned by `call()` closures.
 type BoxFuture<T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'static>>;
@@ -77,13 +147,14 @@ pub struct SetValidatedBlocksResponse {
 /// Cloning is cheap — all providers are `Arc`-backed internally.
 #[derive(Debug, Clone)]
 pub struct RpcClient {
-    /// Ordered list of data providers. Data methods pick a starting provider via round-robin and
-    /// cycle forward on failure (each with its own retry-with-backoff budget).
+    /// Ordered list of data providers. Data methods use round-robin load balancing: each call
+    /// picks a starting provider via an atomic counter and cycles forward on failure.
     data_providers: Vec<RootProvider<Optimism>>,
     /// Round-robin counter for selecting the starting data provider on each call.
     /// Shared across clones so load balancing is global per logical client.
     data_rr_counter: Arc<AtomicUsize>,
-    /// Ordered list of witness providers. `get_witness` tries them front-to-back.
+    /// Ordered list of witness providers. `get_witness` always starts from index 0 (primary);
+    /// later entries are failover-only.
     witness_providers: Vec<RootProvider>,
     /// Optional dedicated provider for reporting validated blocks.
     report_provider: Option<RootProvider<Optimism>>,
@@ -127,11 +198,6 @@ impl RpcClient {
         if witness_apis.is_empty() {
             return Err(eyre!("At least one witness API URL must be provided"));
         }
-        ensure!(
-            config.rpc_retry.max_retries.is_some(),
-            "RpcClientConfig::rpc_retry must be bounded (max_retries = Some(_)); \
-             unbounded retry is not meaningful for per-call RPC retry",
-        );
 
         let data_providers = data_apis
             .iter()
@@ -199,101 +265,39 @@ impl RpcClient {
         }
     }
 
-    /// Records a transient retry attempt (not the final outcome) if metrics are configured.
-    fn record_rpc_retry(&self, method: RpcMethod) {
-        if let Some(ref metrics) = self.config.metrics {
-            metrics.on_rpc_retry(method);
-        }
-    }
-
-    /// Wraps a multi-endpoint RPC call with concurrency limiting and exponential-backoff retry.
+    /// Wraps a data-method RPC call with round-robin load balancing and round-level backoff.
     ///
-    /// Picks a starting data provider via round-robin to spread load across endpoints. For the
-    /// selected provider, retries per `rpc_retry` policy with exponential backoff. If all retries
-    /// fail, cycles forward in round-robin order to the next provider with a fresh retry budget.
+    /// Each call performs rounds of "try every data provider once in round-robin order". If a
+    /// round has a success, returns immediately. If every provider in a round fails, sleeps for
+    /// round-level exponential backoff (with jitter, capped at `rpc_retry.max`) and starts
+    /// another round. Retry is unbounded: failures never surface to callers.
     ///
-    /// Records one `record_rpc` per logical call (final outcome); each non-final failure is
-    /// recorded via `record_rpc_retry`. The reported duration covers the full call including
-    /// prior failed attempts and backoff sleeps, so retry latency is visible in dashboards.
-    ///
-    /// Does not apply to `get_witness` — that method falls back across providers instead.
+    /// The starting provider rotates per call via an atomic counter so healthy endpoints share
+    /// load evenly; within a round the order is fixed (start → start+1 → …).
     async fn call<T: Send + 'static>(
         &self,
         method: RpcMethod,
         f: impl Fn(RootProvider<Optimism>) -> BoxFuture<Result<T>>,
-    ) -> Result<T> {
-        let policy = &self.config.rpc_retry;
-        // `new_with_config` rejects unbounded policies, so `max_retries` is always `Some` here.
-        let max_retries = policy.max_retries.unwrap_or(0);
-        let max_backoff_ms = policy.max.as_millis() as u64;
-        let start = Instant::now();
+    ) -> T {
         // Safety: constructor guarantees at least one data provider.
         let n = self.data_providers.len();
         // Skip the atomic op when there's a single provider — avoids pointless contention.
         let rr_start =
             if n > 1 { self.data_rr_counter.fetch_add(1, Ordering::Relaxed) % n } else { 0 };
-        let mut last_err = None;
-
-        for offset in 0..n {
-            let provider_idx = (rr_start + offset) % n;
-            let provider = &self.data_providers[provider_idx];
-            let mut backoff_ms = policy.initial.as_millis() as u64;
-
-            for attempt in 0..=max_retries {
-                let _permit = self
-                    .data_concurrency
-                    .acquire()
-                    .await
-                    .expect("data concurrency semaphore closed unexpectedly");
-
-                match f(provider.clone()).await {
-                    Ok(v) => {
-                        self.record_rpc(method, true, Some(start.elapsed().as_secs_f64()));
-                        return Ok(v);
-                    }
-                    Err(e) if attempt < max_retries => {
-                        self.record_rpc_retry(method);
-                        // `_permit` is bound in the `for attempt` loop body, so its
-                        // implicit drop is at end-of-iteration — i.e. *after* the sleep
-                        // below. Explicit drop here releases the slot for other callers
-                        // during backoff.
-                        drop(_permit);
-                        let jitter_ms = fastrand::u64(0..=backoff_ms / 2);
-                        let sleep_ms = (backoff_ms + jitter_ms).min(max_backoff_ms);
-                        tracing::warn!(
-                            method = method.as_str(),
-                            attempt,
-                            provider_idx,
-                            error = %e,
-                            sleep_ms,
-                            "RPC call failed, retrying",
-                        );
-                        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-                        backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
-                    }
-                    Err(e) => {
-                        if offset + 1 < n {
-                            self.record_rpc_retry(method);
-                            tracing::warn!(
-                                method = method.as_str(),
-                                provider_idx,
-                                error = %e,
-                                "All retries exhausted for data provider, trying next",
-                            );
-                        }
-                        last_err = Some(e);
-                        break;
-                    }
-                }
-            }
-        }
-
-        self.record_rpc(method, false, Some(start.elapsed().as_secs_f64()));
-        Err(last_err.expect("data_providers is non-empty"))
+        round_robin_with_backoff(
+            &self.data_providers,
+            &self.data_concurrency,
+            &self.config.rpc_retry,
+            rr_start,
+            method,
+            self.config.metrics.as_ref(),
+            |provider| f(provider.clone()),
+        )
+        .await
     }
 
     /// Gets contract bytecode for a code hash.
-    pub async fn get_code(&self, hash: B256) -> Result<Bytes> {
+    pub async fn get_code(&self, hash: B256) -> Bytes {
         self.call(RpcMethod::EthGetCodeByHash, move |provider| {
             Box::pin(async move {
                 provider.client().request("eth_getCodeByHash", (hash,)).await.map_err(|e| {
@@ -308,18 +312,20 @@ impl RpcClient {
     /// Gets a block by its identifier with optional transaction details.
     ///
     /// If `skip_block_verification` is enabled in config, skips integrity checks.
-    /// Otherwise performs ECDSA signature and block hash verification.
-    pub async fn get_block(&self, block_id: BlockId, full_txs: bool) -> Result<Block<Transaction>> {
-        let block = self
-            .call(RpcMethod::EthGetBlockByNumber, move |provider| {
-                Box::pin(async move { do_get_block_unchecked(&provider, block_id, full_txs).await })
+    /// Otherwise performs ECDSA signature and block hash verification — an integrity failure
+    /// is treated as a retriable error (round-robin rotates to the next provider).
+    pub async fn get_block(&self, block_id: BlockId, full_txs: bool) -> Block<Transaction> {
+        let verify = !self.config.skip_block_verification;
+        self.call(RpcMethod::EthGetBlockByNumber, move |provider| {
+            Box::pin(async move {
+                let block = do_get_block_unchecked(&provider, block_id, full_txs).await?;
+                if verify {
+                    verify_block_integrity(&block)?;
+                }
+                Ok(block)
             })
-            .await?;
-
-        if !self.config.skip_block_verification {
-            verify_block_integrity(&block)?;
-        }
-        Ok(block)
+        })
+        .await
     }
 
     /// Gets a block by its identifier without integrity checks.
@@ -330,7 +336,7 @@ impl RpcClient {
         &self,
         block_id: BlockId,
         full_txs: bool,
-    ) -> Result<Block<Transaction>> {
+    ) -> Block<Transaction> {
         self.call(RpcMethod::EthGetBlockByNumber, move |provider| {
             Box::pin(async move { do_get_block_unchecked(&provider, block_id, full_txs).await })
         })
@@ -338,7 +344,7 @@ impl RpcClient {
     }
 
     /// Gets the current latest block number from the blockchain.
-    pub async fn get_latest_block_number(&self) -> Result<u64> {
+    pub async fn get_latest_block_number(&self) -> u64 {
         self.call(RpcMethod::EthBlockNumber, move |provider| {
             Box::pin(async move {
                 provider.get_block_number().await.context("Failed to get block number").map_err(
@@ -363,7 +369,7 @@ impl RpcClient {
     /// the RPC-provided hash. This is important when initializing from a trusted start block
     /// hash, but can be skipped when the header will be verified downstream (e.g., via
     /// `verify_block_integrity`) or when running in a trusted context like the trace server.
-    pub async fn get_header(&self, block_id: BlockId, verify_hash: bool) -> Result<Header> {
+    pub async fn get_header(&self, block_id: BlockId, verify_hash: bool) -> Header {
         self.call(RpcMethod::EthGetHeader, move |provider| {
             Box::pin(async move {
                 do_get_header(&provider, block_id, verify_hash).await.map_err(|e| {
@@ -378,77 +384,35 @@ impl RpcClient {
     /// Gets just the block hash for a block number.
     ///
     /// Delegates to `get_header` (which handles retry and concurrency limiting).
-    pub async fn get_block_hash(&self, block_number: u64) -> Result<B256> {
-        self.get_header(BlockId::Number(BlockNumberOrTag::Number(block_number)), false)
-            .await
-            .map_err(|e| {
-                trace!(block_number, error = %e, "eth_getHeaderByNumber failed");
-                eyre!("eth_getHeaderByNumber for block {} failed: {e}", block_number)
-            })
-            .map(|h| h.hash)
+    pub async fn get_block_hash(&self, block_number: u64) -> B256 {
+        self.get_header(BlockId::Number(BlockNumberOrTag::Number(block_number)), false).await.hash
     }
 
     /// Gets execution witness data for a specific block.
     ///
-    /// Tries each configured witness provider in order; returns on the first success.
-    /// If all providers fail, returns the error from the last provider attempted.
-    pub async fn get_witness(&self, number: u64, hash: B256) -> Result<(SaltWitness, MptWitness)> {
-        // Hoisted above the provider loop so the recorded duration covers the full
-        // end-to-end fetch including any failed fallback attempts — matches `call()`'s
-        // documented "full call including prior failed attempts" semantics.
-        let start = Instant::now();
-        let mut last_err = eyre!("no witness providers configured");
+    /// Uses primary-failover rather than round-robin: each round starts from provider 0
+    /// (the primary), falling through to later providers only on failure. If every provider
+    /// fails in a round, sleeps for round-level exponential backoff and starts another round —
+    /// retry is unbounded. This keeps the primary endpoint as the hot path (cache-friendly)
+    /// while still tolerating its temporary outages.
+    pub async fn get_witness(&self, number: u64, hash: B256) -> (SaltWitness, MptWitness) {
+        let witness = round_robin_with_backoff(
+            &self.witness_providers,
+            &self.witness_concurrency,
+            &self.config.rpc_retry,
+            // Primary-failover: always start from provider 0 so the primary takes all traffic
+            // while healthy. Backup endpoints are touched only while the primary is failing.
+            0,
+            RpcMethod::MegaGetBlockWitness,
+            self.config.metrics.as_ref(),
+            |provider| Box::pin(async move { fetch_witness_raw(&provider, number, hash).await }),
+        )
+        .await;
 
-        for (idx, provider) in self.witness_providers.iter().enumerate() {
-            let _permit = self
-                .witness_concurrency
-                .acquire()
-                .await
-                .expect("witness concurrency semaphore closed unexpectedly");
-
-            match fetch_witness_raw(provider, number, hash).await {
-                Ok((salt_witness, mpt_witness)) => {
-                    self.record_rpc(
-                        RpcMethod::MegaGetBlockWitness,
-                        true,
-                        Some(start.elapsed().as_secs_f64()),
-                    );
-                    trace!(
-                        block_number = number,
-                        %hash,
-                        provider_idx = idx,
-                        "Witness fetched successfully",
-                    );
-                    if let Some(ref metrics) = self.config.metrics {
-                        metrics.on_witness_fetch(WitnessSizeBreakdown::new(
-                            &salt_witness,
-                            &mpt_witness,
-                        ));
-                    }
-                    return Ok((salt_witness, mpt_witness));
-                }
-                Err(e) => {
-                    // The caller (fetcher) logs the terminal failure with full context
-                    // (attempt count, near-tip vs catch-up mode). Here we only surface the
-                    // single signal the caller doesn't have: per-provider fallback.
-                    if idx + 1 < self.witness_providers.len() {
-                        self.record_rpc_retry(RpcMethod::MegaGetBlockWitness);
-                        tracing::trace!(
-                            block_number = number,
-                            %hash,
-                            provider_idx = idx,
-                            error = %e,
-                            "Witness provider failed, trying next",
-                        );
-                    }
-                    last_err = e;
-                }
-            }
+        if let Some(ref metrics) = self.config.metrics {
+            metrics.on_witness_fetch(WitnessSizeBreakdown::new(&witness.0, &witness.1));
         }
-
-        // All providers exhausted: record the single final failure outcome.
-        self.record_rpc(RpcMethod::MegaGetBlockWitness, false, Some(start.elapsed().as_secs_f64()));
-        Err(last_err)
+        witness
     }
 
     /// Reports a range of validated blocks via the dedicated report endpoint.
@@ -472,24 +436,22 @@ impl RpcClient {
     }
 
     /// Gets contract bytecode for multiple code hashes concurrently.
-    ///
-    /// Fetches bytecode for all the given hashes in parallel, filtering out any that fail to fetch.
-    pub async fn get_codes(&self, hashes: &[B256]) -> Result<HashMap<B256, Bytecode>> {
-        let results = future::join_all(hashes.iter().map(|&hash| async move {
-            match self.get_code(hash).await {
-                Ok(bytes) => Some((hash, Bytecode::new_raw(bytes))),
-                Err(e) => {
-                    tracing::trace!("Failed to fetch code for hash {:?}: {}", hash, e);
-                    None
-                }
-            }
-        }))
-        .await;
-
-        Ok(results.into_iter().flatten().collect())
+    pub async fn get_codes(&self, hashes: &[B256]) -> HashMap<B256, Bytecode> {
+        future::join_all(
+            hashes
+                .iter()
+                .map(|&hash| async move { (hash, Bytecode::new_raw(self.get_code(hash).await)) }),
+        )
+        .await
+        .into_iter()
+        .collect()
     }
 
     /// Gets the transaction by hash and returns its containing block hash.
+    ///
+    /// Returns `Ok(None)` when the tx is not found, `Err` when the tx is pending (no
+    /// block hash yet — a semantic error the caller must handle). Transient RPC failures
+    /// are retried inside `call()`.
     pub async fn get_transaction_by_hash(
         &self,
         tx_hash: B256,
@@ -503,8 +465,7 @@ impl RpcClient {
                     })
                 })
             })
-            .await
-            .context("Failed to get transaction by hash")?;
+            .await;
 
         match tx {
             Some(tx) => {
@@ -515,6 +476,129 @@ impl RpcClient {
             }
             None => Ok(None),
         }
+    }
+}
+
+/// Runs a round-robin RPC call with round-level exponential backoff.
+///
+/// Each round attempts every provider once in round-robin starting at `rr_start`. If any
+/// provider succeeds, returns the result. If every provider in a round fails, sleeps for
+/// round-level exponential backoff (capped at `policy.max`, with jitter up to 50%) and starts
+/// a new round with `backoff` doubled. Retry is unbounded — the function never returns an
+/// error.
+///
+/// Used by both the data-method `call()` (rotates `rr_start` per call for load balancing) and
+/// `get_witness()` (pins `rr_start=0` for primary-failover).
+async fn round_robin_with_backoff<N, T>(
+    providers: &[RootProvider<N>],
+    semaphore: &Semaphore,
+    policy: &stateless_core::BackoffPolicy,
+    rr_start: usize,
+    method: RpcMethod,
+    metrics: Option<&Arc<dyn RpcMetrics>>,
+    f: impl Fn(RootProvider<N>) -> BoxFuture<Result<T>>,
+) -> T
+where
+    N: alloy_provider::Network,
+    T: Send + 'static,
+{
+    /// Round index from which retry logs escalate DEBUG → WARN. Short blips typically resolve
+    /// within the first few rounds (with `initial=500ms, max=30s` defaults that's ~4s of
+    /// cumulative backoff); only sustained failures past that reach operator-visible WARN.
+    const WARN_AT_ROUND: u32 = 3;
+
+    let start = Instant::now();
+    let n = providers.len();
+    let max_backoff_ms = policy.max.as_millis() as u64;
+    let initial_backoff_ms = policy.initial.as_millis() as u64;
+    let mut round_backoff_ms = initial_backoff_ms;
+    let mut round = 0u32;
+
+    loop {
+        // Last error observed in this round. Used for the round-summary log at the bottom so
+        // the per-provider error detail is not lost when we skip the "trying next" log for the
+        // final provider (see below).
+        let mut last_err: Option<eyre::Error> = None;
+        // First few rounds are DEBUG — a transient blip shouldn't page anyone. After the
+        // threshold the same logs escalate to WARN so sustained failures surface to ops.
+        let warn_level = round >= WARN_AT_ROUND;
+
+        for offset in 0..n {
+            let provider_idx = (rr_start + offset) % n;
+            let permit = semaphore.acquire().await.expect("semaphore closed unexpectedly");
+            let result = f(providers[provider_idx].clone()).await;
+            drop(permit);
+
+            match result {
+                Ok(v) => {
+                    if let Some(m) = metrics {
+                        m.on_rpc_complete(method, true, Some(start.elapsed().as_secs_f64()));
+                    }
+                    return v;
+                }
+                Err(e) => {
+                    if let Some(m) = metrics {
+                        m.on_rpc_retry(method);
+                    }
+                    // Log "trying next" only when there really is a next provider in this
+                    // round. Suppresses two kinds of noise:
+                    //   - Single-provider config (n=1): no per-provider log at all; the
+                    //     round-summary log below is the whole story.
+                    //   - Multi-provider, last provider in a round: no "trying next" lie; the error
+                    //     is carried into the round-summary log instead.
+                    let has_next = offset + 1 < n;
+                    if has_next {
+                        if warn_level {
+                            tracing::warn!(
+                                method = method.as_str(),
+                                provider_idx,
+                                round,
+                                error = %e,
+                                "RPC provider failed, trying next",
+                            );
+                        } else {
+                            tracing::debug!(
+                                method = method.as_str(),
+                                provider_idx,
+                                round,
+                                error = %e,
+                                "RPC provider failed, trying next",
+                            );
+                        }
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        // Every provider in this round failed — summarize with the last error + sleep.
+        // `last_err` is always `Some` here: `n >= 1` is enforced by the `RpcClient`
+        // constructor and we only reach this point after `n` iterations that each set it.
+        let last_err = last_err.expect("last_err set when every provider failed this round");
+        let jitter_ms = fastrand::u64(0..=round_backoff_ms / 2);
+        let sleep_ms = (round_backoff_ms + jitter_ms).min(max_backoff_ms);
+        if warn_level {
+            tracing::warn!(
+                method = method.as_str(),
+                round,
+                providers = n,
+                sleep_ms,
+                error = %last_err,
+                "All providers failed this round, backing off",
+            );
+        } else {
+            tracing::debug!(
+                method = method.as_str(),
+                round,
+                providers = n,
+                sleep_ms,
+                error = %last_err,
+                "All providers failed this round, backing off",
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+        round_backoff_ms = (round_backoff_ms * 2).min(max_backoff_ms);
+        round += 1;
     }
 }
 
@@ -751,10 +835,10 @@ mod tests {
             unimplemented!("not used")
         }
         async fn latest_block_number(&self) -> eyre::Result<u64> {
-            self.0.get_latest_block_number().await
+            Ok(self.0.get_latest_block_number().await)
         }
         async fn block_hash(&self, n: u64) -> eyre::Result<BlockHash> {
-            self.0.get_block_hash(n).await
+            Ok(self.0.get_block_hash(n).await)
         }
         async fn latest_block_meta(&self) -> eyre::Result<BlockMeta> {
             unimplemented!("not used")
@@ -1025,7 +1109,7 @@ mod tests {
 
         let client = RpcClient::new(&[url1.as_str(), url2.as_str()], &[url1.as_str()]).unwrap();
         for _ in 0..10 {
-            client.get_latest_block_number().await.unwrap();
+            client.get_latest_block_number().await;
         }
 
         let (a, b) = (hits1.load(Ordering::Relaxed), hits2.load(Ordering::Relaxed));
@@ -1036,24 +1120,17 @@ mod tests {
         h2.stop().unwrap();
     }
 
-    /// Asserts that `call()` retries exhaust on a failing provider, then falls
-    /// back to the next provider in round-robin order.
+    /// Asserts the round-level retry model: one failing provider + one healthy provider in
+    /// the same pool means the first round has 1 failure + 1 success (no sleep, no second
+    /// round). Total hits = 2.
     #[tokio::test]
-    async fn test_call_falls_back_across_providers_on_exhausted_retries() {
-        // Invariant: attempts per provider = max_retries + 1. Here max_retries=1 → 2 attempts
-        // per provider, so `fail_first` must equal 2 to fully exhaust one provider's budget
-        // before fallback. If either number changes, update the other accordingly — the
-        // `a + b == 3` assertion below is 2 failed attempts on one provider + 1 successful
-        // attempt on the other.
+    async fn test_call_falls_back_to_next_provider_same_round() {
         let config = RpcClientConfig {
-            rpc_retry: BackoffPolicy::bounded(
-                Duration::from_millis(1),
-                Duration::from_millis(2),
-                1,
-            ),
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
             ..Default::default()
         };
-        let (ha, url_a, hits_a) = start_counting_block_number_rpc(42, 2).await;
+        // Provider A fails its single attempt (`fail_first = 1`), B serves success.
+        let (ha, url_a, hits_a) = start_counting_block_number_rpc(42, 1).await;
         let (hb, url_b, hits_b) = start_counting_block_number_rpc(42, 0).await;
 
         let client = RpcClient::new_with_config(
@@ -1064,15 +1141,97 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(client.get_latest_block_number().await.unwrap(), 42);
+        assert_eq!(client.get_latest_block_number().await, 42);
 
         let (a, b) = (hits_a.load(Ordering::Relaxed), hits_b.load(Ordering::Relaxed));
-        // One provider exhausted (max_retries + 1 = 2) attempts, the other served the final
-        // success (≥ 1) → total 3 hits.
-        assert_eq!(a + b, 3, "expected 2 retries on one + 1 success on the other, got {a}/{b}");
+        assert_eq!(a + b, 2, "1 failed attempt on A + 1 successful attempt on B, got {a}/{b}");
         assert!(a >= 1 && b >= 1, "both providers should have been tried: got {a}/{b}");
 
         ha.stop().unwrap();
         hb.stop().unwrap();
+    }
+
+    /// After every provider in a round fails, the helper sleeps and starts a new round.
+    /// Observable via two providers that each fail one request then recover: the call must
+    /// succeed after at least one full round of failures.
+    #[tokio::test]
+    async fn test_call_starts_new_round_after_all_providers_fail() {
+        // Both providers fail their first request, then serve success.
+        let (ha, url_a, hits_a) = start_counting_block_number_rpc(99, 1).await;
+        let (hb, url_b, hits_b) = start_counting_block_number_rpc(99, 1).await;
+
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
+            ..Default::default()
+        };
+        let client = RpcClient::new_with_config(
+            &[url_a.as_str(), url_b.as_str()],
+            &[url_a.as_str()],
+            config,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(client.get_latest_block_number().await, 99);
+
+        // Round 1: both fail → total 2 hits, helper sleeps.
+        // Round 2: first provider tried now succeeds → 1 more hit, total = 3.
+        let total = hits_a.load(Ordering::Relaxed) + hits_b.load(Ordering::Relaxed);
+        assert_eq!(total, 3, "round 1 fails both (2 hits), round 2 succeeds on first try (1 more)");
+
+        ha.stop().unwrap();
+        hb.stop().unwrap();
+    }
+
+    /// `get_witness` pins `rr_start = 0`, so successive calls to a healthy pool always hit
+    /// provider 0 first — the secondary is untouched while primary is up.
+    #[tokio::test]
+    async fn test_get_witness_always_starts_from_primary() {
+        // Provider A always fails `mega_getBlockWitness` so we can count hits; provider B
+        // responds identically. We only care about which one is hit first — primary-failover
+        // means A (index 0) is always tried first, then B if A fails.
+        let (ha, url_a, hits_a) = start_counting_witness_rpc(1).await;
+        let (hb, url_b, hits_b) = start_counting_witness_rpc(0).await;
+
+        let client = RpcClient::new(&[url_a.as_str()], &[url_a.as_str(), url_b.as_str()]).unwrap();
+
+        // Each get_witness attempt: A fails once, B succeeds → total hits A=1, B=1 per call.
+        for _ in 0..5 {
+            // Swallow the witness decode error — we only care about call routing, not payload.
+            let _ = tokio::time::timeout(
+                Duration::from_millis(500),
+                client.get_witness(1, BlockHash::ZERO),
+            )
+            .await;
+        }
+
+        let (a, b) = (hits_a.load(Ordering::Relaxed), hits_b.load(Ordering::Relaxed));
+        assert!(a >= 5, "primary (index 0) must be tried every call: got {a}");
+        // Backup should only be hit as fallback.
+        assert!(b <= a, "backup must not outpace primary: a={a}, b={b}");
+
+        ha.stop().unwrap();
+        hb.stop().unwrap();
+    }
+
+    /// Serves `mega_getBlockWitness` returning a fixed dummy response; fails the first
+    /// `fail_first` calls. Used to verify call routing independent of witness decode.
+    async fn start_counting_witness_rpc(
+        fail_first: usize,
+    ) -> (ServerHandle, String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (handle, url) = serve((fail_first, hits.clone()), |m| {
+            m.register_method("mega_getBlockWitness", |_p, (fail_first, hits), _| {
+                if hits.fetch_add(1, Ordering::Relaxed) < *fail_first {
+                    Err::<String, _>(err_obj("synthetic failure"))
+                } else {
+                    // Return a stub that will fail base64/zstd decode — but count the hit.
+                    Ok("v0:AAAA".to_string())
+                }
+            })
+            .unwrap();
+        })
+        .await;
+        (handle, url, hits)
     }
 }

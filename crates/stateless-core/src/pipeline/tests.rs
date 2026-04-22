@@ -26,9 +26,10 @@ fn test_pipeline_config_default_stale_disabled() {
 }
 
 #[test]
-fn test_pipeline_config_default_tip_buffer() {
-    let near_tip = PipelineConfig::default().near_tip.expect("near_tip enabled by default");
-    assert_eq!(near_tip.tip_buffer, 3);
+fn test_pipeline_config_default_tip_buffer_disabled() {
+    // Default is 0 (disabled). Binaries that race the upstream witness generator opt into a
+    // nonzero buffer at construction time.
+    assert_eq!(PipelineConfig::default().tip_buffer, 0);
 }
 
 // Mock types for tests
@@ -474,7 +475,6 @@ async fn test_block_fetcher_streams_out_of_order() {
         concurrent_workers: 2, // → fetcher_max_in_flight() = 4, window holds all 4 blocks
         sync_target: Some(start + 3), // fetcher exits cleanly after block 103
         poll_interval: Duration::from_millis(10),
-        near_tip: None, // disable tip_buffer: test asserts fetching through to the exact tip
         ..PipelineConfig::default()
     });
     let handle = tokio::spawn(block_fetcher(fetcher, tx, start, config, CancellationToken::new()));
@@ -498,8 +498,8 @@ async fn test_block_fetcher_streams_out_of_order() {
     assert!(tokio::time::timeout(Duration::from_secs(5), handle).await.is_ok());
 }
 
-/// The `NearTipConfig.tip_buffer` field must keep the fetcher from spawning any fetch
-/// within `tip_buffer` of the remote tip, so the upstream witness generator has headroom.
+/// `tip_buffer` must keep the fetcher from spawning any fetch within that distance of the
+/// remote tip, so the upstream witness generator has headroom.
 #[tokio::test]
 async fn test_block_fetcher_respects_tip_buffer() {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -527,11 +527,10 @@ async fn test_block_fetcher_respects_tip_buffer() {
     let highest = Arc::new(AtomicU64::new(0));
 
     let (tx, rx) = kanal::bounded::<u64>(64);
-    let near_tip = super::NearTipConfig { tip_buffer: buffer, ..Default::default() };
     let config = Arc::new(PipelineConfig {
         concurrent_workers: 2,
         poll_interval: Duration::from_millis(10),
-        near_tip: Some(near_tip),
+        tip_buffer: buffer,
         ..PipelineConfig::default()
     });
     let shutdown = CancellationToken::new();
@@ -742,7 +741,6 @@ async fn run_pipeline_reaches_sync_target() {
         concurrent_workers: 1,
         sync_target: Some(13),
         poll_interval: Duration::from_millis(10),
-        near_tip: None, // disable tip_buffer: sync_target sits at the mock's latest tip
         ..PipelineConfig::default()
     });
 
