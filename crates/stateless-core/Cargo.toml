@@ -40,7 +40,6 @@ reth-trie-sparse.workspace = true
 revm.workspace = true
 
 # misc
-bincode.workspace = true
 dyn-clone.workspace = true
 eyre.workspace = true
 kanal.workspace = true
@@ -56,6 +55,9 @@ tracing.workspace = true
 [dev-dependencies]
 # stateless
 stateless-test-utils = { path = "../stateless-test-utils" }
+
+# misc
+bincode.workspace = true
 
 [features]
 test-bucket-resize = ["salt/test-bucket-resize"]

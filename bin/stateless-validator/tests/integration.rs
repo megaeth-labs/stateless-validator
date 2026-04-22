@@ -32,8 +32,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
-// ---- CLI argument-parsing tests ----
-
 /// Verifies that an endpoint flag accepts repeated flags, CSV values, and env var —
 /// ensuring container deployments configured purely via env are not silently limited
 /// to one endpoint (clap's `value_delimiter` applies to env-var values too).
@@ -134,8 +132,6 @@ fn witness_max_concurrent_requests_flag_and_env() {
         |a| a.witness_max_concurrent_requests,
     );
 }
-
-// ---- Synthetic-data pipeline integration test ----
 
 const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
 
@@ -373,6 +369,11 @@ async fn integration_test() {
     let config = Arc::new(PipelineConfig {
         concurrent_workers: 1,
         sync_target,
+        // Disable near-tip mode entirely for the synthetic test. The mock RPC's
+        // `eth_blockNumber` returns the max fixture block, so with the default `tip_buffer = 1`
+        // the fetcher would stop one block short of `sync_target` and the pipeline would
+        // never complete.
+        near_tip: None,
         ..PipelineConfig::default()
     });
 

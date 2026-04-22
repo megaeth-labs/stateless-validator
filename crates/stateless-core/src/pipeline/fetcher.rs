@@ -226,7 +226,10 @@ pub async fn block_fetcher<F: BlockFetcher>(
     let tx = tx.to_async();
     let max_in_flight = config.fetcher_max_in_flight();
     let max_window = (max_in_flight as u64) * FETCH_WINDOW_MULTIPLIER;
-    info!(start_block, max_in_flight, max_window, "Starting");
+    // Safety margin below the remote tip: never spawn fetches within `tip_buffer` of the tip.
+    // `None` (near-tip mode disabled) means no buffer.
+    let tip_buffer = config.near_tip.as_ref().map(|nt| nt.tip_buffer).unwrap_or(0);
+    info!(start_block, max_in_flight, max_window, tip_buffer, "Starting");
 
     let mut state = FetcherState::<F>::new(start_block);
     let mut tip = TipTracker::new(config.poll_interval, &config.fetcher_tip_backoff);
@@ -242,9 +245,12 @@ pub async fn block_fetcher<F: BlockFetcher>(
             return Ok(());
         }
 
-        // Refresh tip only when we've run past the cached value AND `poll_interval` has
+        // Refresh tip only when we've run past the usable ceiling AND `poll_interval` has
         // elapsed — the time gate alone would let retry-heavy loops hammer `eth_blockNumber`.
-        let window_exhausted = tip.value().is_none_or(|c| state.window_exhausted(c));
+        // The usable ceiling is `tip - tip_buffer`; otherwise a fresh tip that's still within
+        // the buffer would stall refresh forever.
+        let window_exhausted =
+            tip.value().is_none_or(|c| state.window_exhausted(c.saturating_sub(tip_buffer)));
         if window_exhausted && tip.refresh_due(config.poll_interval) {
             match fetcher.latest_block_number().await {
                 Ok(n) => tip.set(n),
@@ -267,6 +273,7 @@ pub async fn block_fetcher<F: BlockFetcher>(
             }
             continue;
         };
+        let spawn_ceiling = chain_latest.saturating_sub(tip_buffer);
 
         // Retry failed blocks first, then fill remaining slots with fresh ones (bounded
         // by window cap so a stalled block can't grow the collections indefinitely).
@@ -280,7 +287,7 @@ pub async fn block_fetcher<F: BlockFetcher>(
             state.spawn(&fetcher, bn);
         }
         while state.in_flight_len() < max_in_flight &&
-            state.next_block <= chain_latest &&
+            state.next_block <= spawn_ceiling &&
             state.window_width() < max_window &&
             !state.next_past_target(config.sync_target)
         {

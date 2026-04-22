@@ -31,3 +31,33 @@ impl BackoffPolicy {
         Self { initial, max, max_retries: None }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_sets_max_retries() {
+        let p = BackoffPolicy::bounded(Duration::from_millis(100), Duration::from_secs(1), 5);
+        assert_eq!(p.initial, Duration::from_millis(100));
+        assert_eq!(p.max, Duration::from_secs(1));
+        assert_eq!(p.max_retries, Some(5));
+    }
+
+    #[test]
+    fn unbounded_has_none_max_retries() {
+        let p = BackoffPolicy::unbounded(Duration::from_millis(200), Duration::from_secs(30));
+        assert_eq!(p.initial, Duration::from_millis(200));
+        assert_eq!(p.max, Duration::from_secs(30));
+        assert!(p.max_retries.is_none());
+    }
+
+    #[test]
+    fn clone_preserves_fields() {
+        let p = BackoffPolicy::bounded(Duration::from_millis(1), Duration::from_millis(2), 3);
+        let q = p.clone();
+        assert_eq!(q.initial, p.initial);
+        assert_eq!(q.max, p.max);
+        assert_eq!(q.max_retries, p.max_retries);
+    }
+}

@@ -16,11 +16,15 @@ pub struct NearTipConfig {
     /// Delay before re-spawning a failed fetch while in near-tip mode.
     /// Witness generation upstream lags block production by ~1-2s.
     pub retry_delay: Duration,
+    /// Safety margin below the remote tip: the fetcher will not spawn fetches for blocks
+    /// `> chain_latest - tip_buffer`. Gives the upstream witness generator headroom to finish
+    /// the very block we'd otherwise race it for. `0` disables the buffer.
+    pub tip_buffer: u64,
 }
 
 impl Default for NearTipConfig {
     fn default() -> Self {
-        Self { lag_threshold: 10, retry_delay: Duration::from_millis(500) }
+        Self { lag_threshold: 10, retry_delay: Duration::from_millis(500), tip_buffer: 1 }
     }
 }
 

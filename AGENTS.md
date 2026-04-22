@@ -34,13 +34,14 @@ The project uses nightly `2026-02-03` toolchain (edition 2024, rust-version 1.95
 
 ## Workspace Structure
 
-| Crate                 | Path                      | Purpose                                                                                    |
-| --------------------- | ------------------------- | ------------------------------------------------------------------------------------------ |
-| `stateless-core`      | `crates/stateless-core`   | Storage traits, pipeline, EVM execution, SALT witness handling, chain spec, error types    |
-| `stateless-db`        | `crates/stateless-db`     | redb-backed persistence: table definitions, read/write helpers, `ContractCache`            |
-| `stateless-common`    | `crates/stateless-common` | RPC client, metrics/logging utilities, witness size estimation                             |
-| `stateless-validator` | `bin/stateless-validator` | Main binary: chain sync, parallel validation workers (`app.rs` / `workers.rs` / `main.rs`) |
-| `debug-trace-server`  | `bin/debug-trace-server`  | Standalone RPC server for debug/trace methods                                              |
+| Crate                  | Path                          | Purpose                                                                                    |
+| ---------------------- | ----------------------------- | ------------------------------------------------------------------------------------------ |
+| `stateless-core`       | `crates/stateless-core`       | Storage traits, pipeline, EVM execution, SALT witness handling, chain spec, error types    |
+| `stateless-db`         | `crates/stateless-db`         | redb-backed persistence: table definitions, read/write helpers, `ContractCache`            |
+| `stateless-common`     | `crates/stateless-common`     | RPC client, metrics/logging utilities, witness size estimation                             |
+| `stateless-test-utils` | `crates/stateless-test-utils` | Test fixtures (blocks, witnesses, contracts) and env-var lock for integration tests        |
+| `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers (`app.rs` / `workers.rs` / `main.rs`) |
+| `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                              |
 
 Additional directories: `test_data/` (integration test fixtures including genesis config), `audits/` (security audit reports).
 
