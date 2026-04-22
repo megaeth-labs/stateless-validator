@@ -428,25 +428,17 @@ impl RpcClient {
                     return Ok((salt_witness, mpt_witness));
                 }
                 Err(e) => {
-                    // Logged at DEBUG so near-tip retry storms don't spam WARN; the fetcher
-                    // is the authority on escalation (it has the lag/attempt context and
-                    // decides DEBUG vs WARN vs ERROR based on mode and attempt count).
+                    // The caller (fetcher) logs the terminal failure with full context
+                    // (attempt count, near-tip vs catch-up mode). Here we only surface the
+                    // single signal the caller doesn't have: per-provider fallback.
                     if idx + 1 < self.witness_providers.len() {
                         self.record_rpc_retry(RpcMethod::MegaGetBlockWitness);
-                        tracing::debug!(
+                        tracing::trace!(
                             block_number = number,
                             %hash,
                             provider_idx = idx,
                             error = %e,
                             "Witness provider failed, trying next",
-                        );
-                    } else {
-                        tracing::debug!(
-                            block_number = number,
-                            %hash,
-                            provider_idx = idx,
-                            error = %e,
-                            "Witness provider failed",
                         );
                     }
                     last_err = e;

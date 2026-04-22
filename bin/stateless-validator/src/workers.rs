@@ -52,7 +52,6 @@ pub async fn run_with_signals(
     let hooks = Arc::new(ValidatorHooks);
 
     let reporter = if report_validation {
-        info!("Starting validation reporter");
         Some(task::spawn(validation_reporter(
             client,
             Arc::clone(&validator_db),
@@ -84,11 +83,11 @@ pub async fn run_with_signals(
             (r, false)
         }
         _ = signal::ctrl_c() => {
-            info!("SIGINT received, shutting down.");
+            info!("SIGINT received, shutting down");
             (Ok(()), true)
         }
         _ = sigterm.recv() => {
-            info!("SIGTERM received, shutting down.");
+            info!("SIGTERM received, shutting down");
             (Ok(()), true)
         }
     };

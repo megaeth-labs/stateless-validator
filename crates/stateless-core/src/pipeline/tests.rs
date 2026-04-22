@@ -5,9 +5,9 @@ use eyre::{Result, anyhow};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    BlockFetcher, BlockProcessor, ErrorAction, PipelineConfig, PipelineHooks, PipelineOutcome,
-    ProcessedBlock, advancer::chain_advancer, block_fetcher, find_divergence_point, run_pipeline,
-    worker::spawn_workers,
+    BlockFetcher, BlockProcessor, DivergenceError, ErrorAction, PipelineConfig, PipelineHooks,
+    PipelineOutcome, ProcessedBlock, advancer::chain_advancer, block_fetcher,
+    find_divergence_point, run_pipeline, worker::spawn_workers,
 };
 use crate::{ChainStore, StoreResult, db::BlockMeta};
 
@@ -26,9 +26,9 @@ fn test_pipeline_config_default_stale_disabled() {
 }
 
 #[test]
-fn test_pipeline_config_default_tip_buffer_is_one() {
+fn test_pipeline_config_default_tip_buffer() {
     let near_tip = PipelineConfig::default().near_tip.expect("near_tip enabled by default");
-    assert_eq!(near_tip.tip_buffer, 1);
+    assert_eq!(near_tip.tip_buffer, 3);
 }
 
 // Mock types for tests
@@ -343,8 +343,7 @@ async fn test_find_divergence_catastrophic() {
     )
     .await;
 
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Catastrophic reorg"));
+    assert!(matches!(result, Err(DivergenceError::CatastrophicReorg { .. })));
 }
 
 // spawn_workers tests
