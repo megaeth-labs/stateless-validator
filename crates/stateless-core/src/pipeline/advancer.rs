@@ -35,6 +35,10 @@ where
     let mut next_expected = initial_tip.block_number + 1;
     let mut current_tip = initial_tip;
     let mut buffer: BTreeMap<u64, H::Output> = BTreeMap::new();
+    // Reused across iterations to avoid per-iteration allocations; typical batch
+    // size is small (<= `concurrent_workers`) and stable.
+    let mut batch: Vec<H::Output> = Vec::new();
+    let mut metas: Vec<BlockMeta> = Vec::new();
 
     loop {
         let item = tokio::select! {
@@ -55,8 +59,8 @@ where
 
         buffer.insert(item.block_number(), item);
 
-        let mut batch = Vec::new();
-        let mut metas = Vec::new();
+        batch.clear();
+        metas.clear();
         while let Some(item) = buffer.remove(&next_expected) {
             if item.parent_hash() != current_tip.block_hash {
                 debug!(

@@ -1,11 +1,11 @@
 //! Shared redb read/write helpers used by both concrete database implementations.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use redb::{ReadableDatabase, ReadableTable};
 use revm::state::Bytecode;
-use stateless_core::db::{BlockMeta, StoreResult, StoreResultExt};
+use stateless_core::db::{BlockMeta, ContractLookup, StoreResult, StoreResultExt};
 
 use crate::{
     serialize::{decode_from_slice, encode_to_vec},
@@ -115,10 +115,7 @@ pub fn write_reset_to_anchor(database: &Database, anchor: &BlockMeta) -> StoreRe
 }
 
 /// Retrieves cached contract bytecodes. Returns `(found, missing)`.
-pub fn read_contracts(
-    database: &Database,
-    hashes: &[B256],
-) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
+pub fn read_contracts(database: &Database, hashes: &[B256]) -> StoreResult<ContractLookup> {
     let read_txn = database.begin_read().store_err()?;
     let table = read_txn.open_table(CONTRACTS).store_err()?;
 
@@ -128,7 +125,8 @@ pub fn read_contracts(
     for &hash in hashes {
         match table.get(hash.0).store_err()? {
             Some(data) => {
-                found.insert(hash, decode_from_slice(data.value().as_slice())?);
+                let bytecode: Bytecode = decode_from_slice(data.value().as_slice())?;
+                found.insert(hash, Arc::new(bytecode));
             }
             None => missing.push(hash),
         }
@@ -138,7 +136,10 @@ pub fn read_contracts(
 }
 
 /// Stores contract bytecodes in the CONTRACTS table.
-pub fn write_add_contracts(database: &Database, codes: &[(B256, Bytecode)]) -> StoreResult<()> {
+pub fn write_add_contracts(
+    database: &Database,
+    codes: &[(B256, Arc<Bytecode>)],
+) -> StoreResult<()> {
     if codes.is_empty() {
         return Ok(());
     }
@@ -146,7 +147,7 @@ pub fn write_add_contracts(database: &Database, codes: &[(B256, Bytecode)]) -> S
     {
         let mut table = write_txn.open_table(CONTRACTS).store_err()?;
         for (hash, bytecode) in codes {
-            let encoded = encode_to_vec(bytecode)?;
+            let encoded = encode_to_vec(bytecode.as_ref())?;
             table.insert(hash.0, encoded).store_err()?;
         }
     }

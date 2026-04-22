@@ -6,7 +6,11 @@
 //! CANONICAL_CHAIN is bounded to `max_chain_length` entries; older entries are
 //! pruned inline during [`ChainStore::advance_chain`].
 
-use std::{collections::HashMap, path::Path, sync::atomic::AtomicU64};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, atomic::AtomicU64},
+};
 
 use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
@@ -64,11 +68,14 @@ impl ValidatorDB {
 }
 
 impl ContractStore for ValidatorDB {
-    fn get_contracts(&self, hashes: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
+    fn get_contracts(
+        &self,
+        hashes: &[B256],
+    ) -> StoreResult<(HashMap<B256, Arc<Bytecode>>, Vec<B256>)> {
         read_contracts(&self.database, hashes)
     }
 
-    fn add_contracts(&self, codes: &[(B256, Bytecode)]) -> StoreResult<()> {
+    fn add_contracts(&self, codes: &[(B256, Arc<Bytecode>)]) -> StoreResult<()> {
         write_add_contracts(&self.database, codes)
     }
 }
@@ -239,8 +246,10 @@ mod tests {
         let hash2 = B256::from([2u8; 32]);
         let hash3 = B256::from([3u8; 32]);
 
-        let bytecode1 = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
-        let bytecode2 = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x01]));
+        let bytecode1 =
+            Arc::new(Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00])));
+        let bytecode2 =
+            Arc::new(Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x01])));
 
         store.add_contracts(&[(hash1, bytecode1.clone()), (hash2, bytecode2.clone())]).unwrap();
 
@@ -292,7 +301,8 @@ mod tests {
         let cache = ContractCache::new(Arc::new(store));
 
         let hash = B256::from([1u8; 32]);
-        let bytecode = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
+        let bytecode =
+            Arc::new(Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00])));
 
         cache.insert(&[(hash, bytecode.clone())]).unwrap();
 
@@ -308,7 +318,8 @@ mod tests {
         let db_path = dir.path().join("test.redb");
 
         let hash = B256::from([1u8; 32]);
-        let bytecode = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
+        let bytecode =
+            Arc::new(Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00])));
 
         {
             let store = ValidatorDB::new(&db_path).unwrap();

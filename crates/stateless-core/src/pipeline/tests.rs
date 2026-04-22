@@ -83,10 +83,13 @@ impl crate::ContractStore for MockStore {
     fn get_contracts(
         &self,
         _: &[B256],
-    ) -> StoreResult<(HashMap<B256, revm::state::Bytecode>, Vec<B256>)> {
+    ) -> StoreResult<(HashMap<B256, std::sync::Arc<revm::state::Bytecode>>, Vec<B256>)> {
         Ok((HashMap::new(), vec![]))
     }
-    fn add_contracts(&self, _: &[(B256, revm::state::Bytecode)]) -> StoreResult<()> {
+    fn add_contracts(
+        &self,
+        _: &[(B256, std::sync::Arc<revm::state::Bytecode>)],
+    ) -> StoreResult<()> {
         Ok(())
     }
 }

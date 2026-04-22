@@ -5654,6 +5654,7 @@ dependencies = [
  "dashmap",
  "lz4_flex",
  "op-alloy-rpc-types",
+ "quick_cache",
  "redb",
  "revm",
  "serde",

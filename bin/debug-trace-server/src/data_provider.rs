@@ -52,7 +52,8 @@ pub struct BlockData {
     /// Light witness without expensive EC point validation.
     pub witness: LightWitness,
     /// Contract bytecodes keyed by code hash, required for EVM execution.
-    pub contracts: HashMap<B256, Bytecode>,
+    /// Values share allocations with the `ContractCache`.
+    pub contracts: HashMap<B256, Arc<Bytecode>>,
 }
 
 /// Default timeout for a user-facing witness fetch in seconds (8 seconds).
@@ -67,7 +68,10 @@ pub(crate) const SLOW_STAGE_THRESHOLD_MS: u128 = 1000;
 
 /// Broadcast sender type for single-flight request pattern.
 /// Used to notify all waiters when a block fetch completes.
-type InFlightSender = broadcast::Sender<Result<BlockData, String>>;
+///
+/// `Arc<BlockData>` rather than `BlockData` so coalesced waiters share one allocation
+/// — the value carries a full block, witness, and contract map.
+type InFlightSender = broadcast::Sender<Result<Arc<BlockData>, String>>;
 
 /// Data provider with single-flight request coalescing.
 ///
@@ -127,9 +131,9 @@ impl DataProvider {
     /// * `block_num` - The block number to fetch
     ///
     /// # Returns
-    /// * `Ok(BlockData)` - Block data including witness and contracts
+    /// * `Ok(Arc<BlockData>)` - Block data including witness and contracts
     /// * `Err` - If the block cannot be fetched from any source
-    pub async fn get_block_data(&self, block_num: u64) -> Result<BlockData> {
+    pub async fn get_block_data(&self, block_num: u64) -> Result<Arc<BlockData>> {
         // Try to get block hash from local database first
         if let Some(db) = &self.db &&
             let Ok(Some(hash)) = db.get_block_hash(block_num)
@@ -151,9 +155,9 @@ impl DataProvider {
     /// * `block_hash` - The 32-byte block hash to fetch
     ///
     /// # Returns
-    /// * `Ok(BlockData)` - Block data including witness and contracts
+    /// * `Ok(Arc<BlockData>)` - Block data including witness and contracts
     /// * `Err` - If the block cannot be fetched from any source
-    pub async fn get_block_data_by_hash(&self, block_hash: B256) -> Result<BlockData> {
+    pub async fn get_block_data_by_hash(&self, block_hash: B256) -> Result<Arc<BlockData>> {
         let start = std::time::Instant::now();
 
         // Try the local DB first. Only `MissingData` falls through to RPC silently —
@@ -171,7 +175,7 @@ impl DataProvider {
                     DataSourceMetrics::new_for_source("db").record();
                     SingleFlightMetrics::new_for_type("bypassed").record();
                     self.record_block_distance(data.block.header.number);
-                    return Ok(data);
+                    return Ok(Arc::new(data));
                 }
                 Err(e) => match e.downcast_ref::<StoreError>() {
                     Some(StoreError::MissingData { .. }) => {
@@ -217,10 +221,10 @@ impl DataProvider {
     /// * `tx_hash` - The transaction hash to look up
     ///
     /// # Returns
-    /// * `Ok((BlockData, usize))` - Block data and transaction index
+    /// * `Ok((Arc<BlockData>, usize))` - Block data and transaction index
     /// * `Err` - If transaction not found or is still pending
     #[instrument(skip(self), name = "get_block_data_for_tx", fields(tx_hash = %tx_hash))]
-    pub async fn get_block_data_for_tx(&self, tx_hash: B256) -> Result<(BlockData, usize)> {
+    pub async fn get_block_data_for_tx(&self, tx_hash: B256) -> Result<(Arc<BlockData>, usize)> {
         trace!(tx_hash = %tx_hash, "Looking up transaction");
 
         // Fetch the transaction to find its block
@@ -329,7 +333,7 @@ impl DataProvider {
     }
 
     /// Fetches block data from RPC by block hash with single-flight coalescing.
-    async fn fetch_block_data_by_hash_from_rpc(&self, block_hash: B256) -> Result<BlockData> {
+    async fn fetch_block_data_by_hash_from_rpc(&self, block_hash: B256) -> Result<Arc<BlockData>> {
         self.fetch_block_data_single_flight(block_hash).await
     }
 
@@ -341,7 +345,7 @@ impl DataProvider {
     /// 3. When fetch completes, result is broadcast to all waiters
     ///
     /// This prevents redundant RPC calls and reduces upstream load.
-    async fn fetch_block_data_single_flight(&self, block_hash: B256) -> Result<BlockData> {
+    async fn fetch_block_data_single_flight(&self, block_hash: B256) -> Result<Arc<BlockData>> {
         // Check if there's already an in-flight request for this block
         if let Some(sender) = self.in_flight.get(&block_hash) {
             // Subscribe to the existing request
@@ -370,10 +374,10 @@ impl DataProvider {
         );
 
         // Perform the actual fetch
-        let result = self.do_fetch_block_data(block_hash).await;
+        let result = self.do_fetch_block_data(block_hash).await.map(Arc::new);
 
-        // Convert result to string error for broadcast (eyre::Error is not Clone)
-        let broadcast_result = result.as_ref().map(|data| data.clone()).map_err(|e| e.to_string());
+        // Clone is an Arc refcount bump; eyre::Error is not Clone so errors are stringified.
+        let broadcast_result = result.as_ref().map(Arc::clone).map_err(|e| e.to_string());
 
         // Broadcast result to all waiters (ignore send errors - no receivers is ok)
         let _ = tx.send(broadcast_result);
@@ -523,10 +527,13 @@ impl DataProvider {
     /// memory (`ContractCache`) → persistent store (`ServerDB` in local-cache mode,
     /// [`NoopContractStore`] in stateless mode) → upstream RPC.
     ///
-    /// Every contract fetched from RPC is written back through the cache
-    /// (memory always, disk in local-cache mode), so subsequent trace
-    /// requests for the same bytecode skip the RPC round-trip.
-    async fn resolve_contracts(&self, code_hashes: &[B256]) -> Result<HashMap<B256, Bytecode>> {
+    /// The RPC tier goes through `RpcClient::get_codes(..., verify=true)` — parallel
+    /// fetch plus hash verification in one place. Entries promoted through the cache
+    /// are trusted on subsequent hits (no re-verification).
+    async fn resolve_contracts(
+        &self,
+        code_hashes: &[B256],
+    ) -> Result<HashMap<B256, Arc<Bytecode>>> {
         let (mut contracts, missing) = self.contract_cache.get(code_hashes)?;
 
         if missing.is_empty() {
@@ -540,12 +547,13 @@ impl DataProvider {
             "Cache miss — fetching contracts from RPC"
         );
 
-        let mut new_contracts = Vec::with_capacity(missing.len());
-        for hash in missing {
-            let bytecode = self.fetch_contract_code(hash).await;
-            new_contracts.push((hash, bytecode.clone()));
-            contracts.insert(hash, bytecode);
-        }
+        let upstream = UpstreamMetrics::new_for_method("eth_getCodeByHash");
+        let start = std::time::Instant::now();
+        let fetched = self.rpc_client.get_codes(&missing, true).await?;
+        upstream.record_request(true, start.elapsed().as_secs_f64());
+
+        let new_contracts: Vec<(B256, Arc<Bytecode>)> =
+            fetched.into_iter().map(|(h, b)| (h, Arc::new(b))).collect();
 
         // Write-through: memory always, disk in local-cache mode.
         // We don't fail the trace on cache-insert errors; the request has already been served.
@@ -553,16 +561,8 @@ impl DataProvider {
             warn!(error = %e, count = new_contracts.len(), "Failed to persist fetched contracts to cache");
         }
 
+        contracts.extend(new_contracts);
         Ok(contracts)
-    }
-
-    /// Fetches a single contract bytecode from upstream RPC and records upstream metrics.
-    async fn fetch_contract_code(&self, hash: B256) -> Bytecode {
-        let upstream = UpstreamMetrics::new_for_method("eth_getCodeByHash");
-        let start = std::time::Instant::now();
-        let bytes = self.rpc_client.get_code(hash).await;
-        upstream.record_request(true, start.elapsed().as_secs_f64());
-        Bytecode::new_raw(bytes)
     }
 }
 
@@ -574,11 +574,14 @@ impl DataProvider {
 pub struct NoopContractStore;
 
 impl ContractStore for NoopContractStore {
-    fn get_contracts(&self, hashes: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
+    fn get_contracts(
+        &self,
+        hashes: &[B256],
+    ) -> StoreResult<(HashMap<B256, Arc<Bytecode>>, Vec<B256>)> {
         Ok((HashMap::new(), hashes.to_vec()))
     }
 
-    fn add_contracts(&self, _codes: &[(B256, Bytecode)]) -> StoreResult<()> {
+    fn add_contracts(&self, _codes: &[(B256, Arc<Bytecode>)]) -> StoreResult<()> {
         Ok(())
     }
 }

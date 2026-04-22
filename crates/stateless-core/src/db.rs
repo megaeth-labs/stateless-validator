@@ -9,7 +9,7 @@
 //! Concrete implementations live in their respective binaries;
 //! shared redb helpers live in the `stateless-db` crate.
 
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
@@ -87,10 +87,17 @@ impl fmt::Display for MissingDataKind {
     }
 }
 
+/// Result of a contract bytecode lookup: `(found, missing)`.
+pub type ContractLookup = (HashMap<B256, Arc<Bytecode>>, Vec<B256>);
+
 /// Contract bytecode persistence.
+///
+/// Values are exchanged as `Arc<Bytecode>` so the in-memory `ContractCache` and
+/// downstream consumers (e.g. revm execution via `WitnessDatabase`) can share a
+/// single allocation instead of deep-cloning bytecode on every cache hit.
 pub trait ContractStore: Send + Sync {
-    fn get_contracts(&self, hashes: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)>;
-    fn add_contracts(&self, codes: &[(B256, Bytecode)]) -> StoreResult<()>;
+    fn get_contracts(&self, hashes: &[B256]) -> StoreResult<ContractLookup>;
+    fn add_contracts(&self, codes: &[(B256, Arc<Bytecode>)]) -> StoreResult<()>;
 }
 
 /// Genesis configuration persistence.

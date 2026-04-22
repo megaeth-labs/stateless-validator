@@ -195,14 +195,17 @@ mod tests {
             &self,
             _: &[alloy_primitives::B256],
         ) -> stateless_core::StoreResult<(
-            std::collections::HashMap<alloy_primitives::B256, revm::state::Bytecode>,
+            std::collections::HashMap<
+                alloy_primitives::B256,
+                std::sync::Arc<revm::state::Bytecode>,
+            >,
             Vec<alloy_primitives::B256>,
         )> {
             Ok((Default::default(), vec![]))
         }
         fn add_contracts(
             &self,
-            _: &[(alloy_primitives::B256, revm::state::Bytecode)],
+            _: &[(alloy_primitives::B256, std::sync::Arc<revm::state::Bytecode>)],
         ) -> stateless_core::StoreResult<()> {
             Ok(())
         }
