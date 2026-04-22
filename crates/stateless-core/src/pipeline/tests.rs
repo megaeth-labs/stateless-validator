@@ -16,9 +16,8 @@ fn test_pipeline_config_default_uses_cpu_count() {
     let config = PipelineConfig::default();
     let cpus = num_cpus::get_physical();
     assert_eq!(config.concurrent_workers, cpus);
-    assert_eq!(config.fetch_channel_capacity, 2 * cpus);
-    assert_eq!(config.result_channel_capacity, 2 * cpus);
-    assert_eq!(config.fetcher_max_in_flight, 2 * cpus);
+    assert_eq!(config.channel_capacity(), 2 * cpus);
+    assert_eq!(config.fetcher_max_in_flight(), 2 * cpus);
 }
 
 #[test]
@@ -423,20 +422,27 @@ async fn test_spawn_workers_propagates_error() {
 /// Streaming regression: with the previous `join_all` batching all 4 blocks in a batch
 /// completed together, so a slow block held everyone back. With `JoinSet` streaming, the
 /// 3 fast blocks must be sent downstream before the slow one.
+///
+/// Uses an explicit oneshot gate (not a sleep) to hold the slow block until the test has
+/// observed the 3 fast blocks — the ordering invariant is independent of wall-clock timing.
 #[tokio::test]
 async fn test_block_fetcher_streams_out_of_order() {
-    /// Returns `block_number` as Output; delays exactly `slow_block` by `slow_delay`.
+    use tokio::sync::{Mutex, oneshot};
+
+    /// Holds `slow_block` on a oneshot gate; all other blocks return immediately.
     struct SlowFetcher {
         latest: u64,
         slow_block: u64,
-        slow_delay: Duration,
+        gate: Mutex<Option<oneshot::Receiver<()>>>,
     }
 
     impl BlockFetcher for SlowFetcher {
         type Output = u64;
         async fn fetch(&self, bn: u64) -> eyre::Result<u64> {
-            if bn == self.slow_block {
-                tokio::time::sleep(self.slow_delay).await;
+            if bn == self.slow_block &&
+                let Some(rx) = self.gate.lock().await.take()
+            {
+                let _ = rx.await;
             }
             Ok(bn)
         }
@@ -452,35 +458,38 @@ async fn test_block_fetcher_streams_out_of_order() {
     }
 
     let (start, slow) = (100u64, 102u64);
+    let (gate_tx, gate_rx) = oneshot::channel::<()>();
     let fetcher = Arc::new(SlowFetcher {
         latest: start + 3,
         slow_block: slow,
-        slow_delay: Duration::from_millis(200),
+        gate: Mutex::new(Some(gate_rx)),
     });
     let (tx, rx) = kanal::bounded::<u64>(8);
     let config = Arc::new(PipelineConfig {
-        fetcher_max_in_flight: 4,     // window holds all 4 blocks
+        concurrent_workers: 2, // → fetcher_max_in_flight() = 4, window holds all 4 blocks
         sync_target: Some(start + 3), // fetcher exits cleanly after block 103
         poll_interval: Duration::from_millis(10),
         ..PipelineConfig::default()
     });
     let handle = tokio::spawn(block_fetcher(fetcher, tx, start, config, CancellationToken::new()));
 
-    // First 3 results must be the fast blocks (slow block must NOT be among them).
+    // Slow block is gated — the first 3 results must be the fast blocks, regardless of
+    // scheduling or CI load.
     let rx = rx.to_async();
-    let recv = async || {
-        tokio::time::timeout(Duration::from_millis(150), rx.recv()).await.unwrap().unwrap()
-    };
-    let mut first_three = [recv().await, recv().await, recv().await];
+    let recv_with_timeout =
+        async || tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+    let mut first_three =
+        [recv_with_timeout().await, recv_with_timeout().await, recv_with_timeout().await];
     first_three.sort();
     assert_eq!(first_three, [start, start + 1, start + 3], "streaming broken: {first_three:?}");
 
-    // The 4th (final) result is the slow block.
-    let last = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await.unwrap().unwrap();
+    // Release the slow block — the 4th (final) result must be it.
+    gate_tx.send(()).unwrap();
+    let last = recv_with_timeout().await;
     assert_eq!(last, slow);
 
     // Fetcher exits cleanly after sync_target.
-    assert!(tokio::time::timeout(Duration::from_secs(1), handle).await.is_ok());
+    assert!(tokio::time::timeout(Duration::from_secs(5), handle).await.is_ok());
 }
 
 /// Regression: a persistently-failing block must not let the fetch window grow
@@ -512,13 +521,14 @@ async fn test_block_fetcher_bounded_window_under_stall() {
     }
 
     let (start, stuck, latest) = (100u64, 105u64, 10_100u64);
-    let max_in_flight = 4;
+    let workers = 2;
+    let max_in_flight = 2 * workers; // matches PipelineConfig::fetcher_max_in_flight()
     let max_window = 4 * max_in_flight as u64; // matches FETCH_WINDOW_MULTIPLIER
     let highest = Arc::new(AtomicU64::new(0));
 
     let (tx, rx) = kanal::bounded::<u64>(1024);
     let config = Arc::new(PipelineConfig {
-        fetcher_max_in_flight: max_in_flight,
+        concurrent_workers: workers,
         poll_interval: Duration::from_millis(10),
         ..PipelineConfig::default()
     });
@@ -537,9 +547,20 @@ async fn test_block_fetcher_bounded_window_under_stall() {
         shutdown.clone(),
     ));
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Poll until the spawn-window cap has visibly pinned `highest` (two consecutive samples
+    // match AND the cap has been reached). Terminates as soon as the invariant is exercised,
+    // regardless of scheduler speed — no wall-clock dependence on a fixed settle duration.
+    let mut prev = 0u64;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let cur = highest.load(Ordering::Relaxed);
+        if cur == prev && cur >= stuck {
+            break;
+        }
+        prev = cur;
+    }
     shutdown.cancel();
-    let _ = tokio::time::timeout(Duration::from_secs(1), fetcher).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), fetcher).await;
     drain.abort();
 
     let h = highest.load(Ordering::Relaxed);

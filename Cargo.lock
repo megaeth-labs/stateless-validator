@@ -5627,7 +5627,6 @@ dependencies = [
  "num_cpus",
  "op-alloy-network",
  "op-alloy-rpc-types",
- "redb",
  "reth-ethereum-forks",
  "reth-optimism-chainspec",
  "reth-trie",

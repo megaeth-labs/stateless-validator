@@ -3,7 +3,9 @@
 //! Provides [`RpcMethod`] for identifying RPC calls and [`RpcMetrics`] as a
 //! callback trait for tracking RPC performance.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
+
+use stateless_core::BackoffPolicy;
 
 use crate::witness_size::WitnessSizeBreakdown;
 
@@ -80,13 +82,11 @@ pub struct RpcClientConfig {
     /// a burst of block fetches cannot starve witness retrieval (and vice versa). `None` means
     /// unlimited.
     pub witness_max_concurrent_requests: Option<usize>,
-    /// Maximum number of per-call retry attempts before propagating the error.
-    /// Does not apply to `get_witness` (which falls back across providers instead).
-    pub max_retries: u32,
-    /// Initial backoff duration before the first retry (milliseconds).
-    pub initial_backoff_ms: u64,
-    /// Upper cap on per-call backoff (milliseconds; backoff doubles each retry).
-    pub max_backoff_ms: u64,
+    /// Per-call retry policy: initial/max backoff and the retry-count bound.
+    /// `max_retries` must be `Some(_)`; unbounded retry is not meaningful for a single RPC call
+    /// (fall-through to the next provider handles permanent failures).
+    /// Does not apply to `get_witness` — that method falls back across providers instead.
+    pub rpc_retry: BackoffPolicy,
 }
 
 impl Default for RpcClientConfig {
@@ -96,9 +96,11 @@ impl Default for RpcClientConfig {
             metrics: None,
             data_max_concurrent_requests: None,
             witness_max_concurrent_requests: None,
-            max_retries: 3,
-            initial_backoff_ms: 100,
-            max_backoff_ms: 10_000,
+            rpc_retry: BackoffPolicy::bounded(
+                Duration::from_millis(100),
+                Duration::from_secs(10),
+                3,
+            ),
         }
     }
 }
@@ -110,9 +112,7 @@ impl std::fmt::Debug for RpcClientConfig {
             .field("metrics", &self.metrics.is_some())
             .field("data_max_concurrent_requests", &self.data_max_concurrent_requests)
             .field("witness_max_concurrent_requests", &self.witness_max_concurrent_requests)
-            .field("max_retries", &self.max_retries)
-            .field("initial_backoff_ms", &self.initial_backoff_ms)
-            .field("max_backoff_ms", &self.max_backoff_ms)
+            .field("rpc_retry", &self.rpc_retry)
             .finish()
     }
 }

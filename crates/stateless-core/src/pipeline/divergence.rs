@@ -3,7 +3,7 @@
 use alloy_primitives::{BlockHash, BlockNumber};
 use tracing::{debug, instrument};
 
-use crate::pipeline::traits::BlockFetcher;
+use crate::{db::StoreError, pipeline::traits::BlockFetcher};
 
 /// Errors from [`find_divergence_point`], classified for the pipeline.
 #[derive(Debug, thiserror::Error)]
@@ -24,9 +24,13 @@ pub enum DivergenceError {
     )]
     LocalChainCorrupt { block_number: BlockNumber },
 
-    /// Transient error during divergence search (e.g., RPC timeout).
+    /// Transient RPC error during divergence search (e.g., timeout).
     #[error(transparent)]
-    Transient(#[from] eyre::Error),
+    Rpc(#[from] eyre::Error),
+
+    /// Transient local-store error during divergence search.
+    #[error(transparent)]
+    Store(#[from] StoreError),
 }
 
 impl DivergenceError {
@@ -39,12 +43,16 @@ impl DivergenceError {
 /// Finds where the local chain diverges from the remote.
 ///
 /// Uses exponential search (efficient for near-tip reorgs) followed by binary search.
-/// Backend-agnostic: takes closures for local chain lookups.
+/// Backend-agnostic: takes closures for local chain lookups that return [`StoreResult`],
+/// while remote lookups use the `BlockFetcher`'s `eyre::Result`.
+/// [`DivergenceError`] converts from both via `#[from]`.
 #[instrument(skip_all, fields(mismatch_block), name = "find_divergence")]
 pub async fn find_divergence_point<F: BlockFetcher>(
     fetcher: &F,
-    get_hash: &(dyn Fn(u64) -> eyre::Result<Option<BlockHash>> + Send + Sync),
-    get_earliest: &(dyn Fn() -> eyre::Result<Option<(BlockNumber, BlockHash)>> + Send + Sync),
+    get_hash: &(dyn Fn(u64) -> crate::db::StoreResult<Option<BlockHash>> + Send + Sync),
+    get_earliest: &(
+         dyn Fn() -> crate::db::StoreResult<Option<(BlockNumber, BlockHash)>> + Send + Sync
+     ),
     mismatch_block: u64,
 ) -> std::result::Result<u64, DivergenceError> {
     let earliest_local = get_earliest()?.expect("Local chain cannot be empty");

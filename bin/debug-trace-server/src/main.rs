@@ -49,7 +49,10 @@ use clap::Parser;
 use eyre::Result;
 use jsonrpsee::server::{Server, ServerConfig};
 use stateless_common::{RpcClient, RpcClientConfig, logging::LogArgs};
-use stateless_core::{BlockStore, PipelineConfig, chain_spec::ChainSpec, pipeline::run_pipeline};
+use stateless_core::{
+    BlockStore, ContractStore, PipelineConfig, chain_spec::ChainSpec, pipeline::run_pipeline,
+};
+use stateless_db::ContractCache;
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
@@ -64,7 +67,7 @@ mod server_db;
 mod timing;
 mod tracing_executor;
 
-use data_provider::DataProvider;
+use data_provider::{DataProvider, NoopContractStore};
 use response_cache::{DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS, ResponseCache, ResponseCacheConfig};
 use rpc_service::RpcContext;
 use server_db::ServerDB;
@@ -283,8 +286,22 @@ async fn main() -> Result<()> {
     let server_db: Option<Arc<ServerDB>> = validator_db;
     let block_store: Option<Arc<dyn BlockStore>> =
         server_db.as_ref().map(|db| Arc::clone(db) as Arc<dyn BlockStore>);
-    let data_provider =
-        Arc::new(DataProvider::new(rpc_client.clone(), block_store.clone(), args.witness_timeout));
+
+    // Contract cache: local-cache mode writes through to ServerDB, stateless mode is
+    // memory-only via `NoopContractStore`. Either way every RPC-fetched contract is
+    // cached for the lifetime of the process, so repeated trace requests skip RPC.
+    let contract_store: Arc<dyn ContractStore> = match server_db.as_ref() {
+        Some(db) => Arc::clone(db) as Arc<dyn ContractStore>,
+        None => Arc::new(NoopContractStore),
+    };
+    let contract_cache = Arc::new(ContractCache::new(contract_store));
+
+    let data_provider = Arc::new(DataProvider::new(
+        rpc_client.clone(),
+        block_store.clone(),
+        contract_cache,
+        args.witness_timeout,
+    ));
 
     let chain_spec = load_chain_spec(&args)?;
 
@@ -418,35 +435,71 @@ async fn init_validator_db(
     }
 
     // No local tip - need to initialize anchor block
-    // Use explicit start_block if provided, otherwise fetch latest
+    // Use explicit start_block if provided, otherwise fetch latest.
+    //
+    // Bounded exponential backoff (1s → 30s, ~5 minutes total). The inner RPC client
+    // already retries per-call; this outer loop tolerates an endpoint still coming up
+    // at boot, but fails fast on a permanent misconfiguration.
+    const MAX_ATTEMPTS: u32 = 30;
+    let max_backoff = std::time::Duration::from_secs(30);
     let header = if let Some(start_block_str) = &args.start_block {
         debug!(start_block = %start_block_str, "Initializing from specified start block");
         let block_hash: BlockHash = start_block_str.parse()?;
-        loop {
+        let mut backoff = std::time::Duration::from_secs(1);
+        let mut header = None;
+        for attempt in 1..=MAX_ATTEMPTS {
             match rpc_client.get_header(BlockId::Hash(block_hash.into()), false).await {
-                Ok(header) => break header,
+                Ok(h) => {
+                    header = Some(h);
+                    break;
+                }
                 Err(e) => {
                     warn!(
                         block_hash = %block_hash,
+                        attempt,
+                        max_attempts = MAX_ATTEMPTS,
                         error = %e,
-                        "Failed to fetch start block, retrying"
+                        backoff = ?backoff,
+                        "Failed to fetch start block, retrying",
                     );
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(max_backoff);
+                    }
                 }
             }
         }
+        header.ok_or_else(|| {
+            eyre::eyre!("Failed to fetch start block {block_hash} after {MAX_ATTEMPTS} attempts")
+        })?
     } else {
-        // Auto-initialize from latest block
         info!("No local tip found, fetching latest block as anchor");
-        loop {
+        let mut backoff = std::time::Duration::from_secs(1);
+        let mut header = None;
+        for attempt in 1..=MAX_ATTEMPTS {
             match rpc_client.get_header(BlockId::latest(), false).await {
-                Ok(header) => break header,
+                Ok(h) => {
+                    header = Some(h);
+                    break;
+                }
                 Err(e) => {
-                    warn!(error = %e, "Failed to fetch latest block, retrying");
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    warn!(
+                        attempt,
+                        max_attempts = MAX_ATTEMPTS,
+                        error = %e,
+                        backoff = ?backoff,
+                        "Failed to fetch latest block, retrying",
+                    );
+                    if attempt < MAX_ATTEMPTS {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(max_backoff);
+                    }
                 }
             }
         }
+        header.ok_or_else(|| {
+            eyre::eyre!("Failed to fetch latest block after {MAX_ATTEMPTS} attempts")
+        })?
     };
 
     db.reset_anchor_block(

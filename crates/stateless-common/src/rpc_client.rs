@@ -127,6 +127,11 @@ impl RpcClient {
         if witness_apis.is_empty() {
             return Err(eyre!("At least one witness API URL must be provided"));
         }
+        ensure!(
+            config.rpc_retry.max_retries.is_some(),
+            "RpcClientConfig::rpc_retry must be bounded (max_retries = Some(_)); \
+             unbounded retry is not meaningful for per-call RPC retry",
+        );
 
         let data_providers = data_apis
             .iter()
@@ -204,7 +209,7 @@ impl RpcClient {
     /// Wraps a multi-endpoint RPC call with concurrency limiting and exponential-backoff retry.
     ///
     /// Picks a starting data provider via round-robin to spread load across endpoints. For the
-    /// selected provider, retries up to `max_retries` with exponential backoff. If all retries
+    /// selected provider, retries per `rpc_retry` policy with exponential backoff. If all retries
     /// fail, cycles forward in round-robin order to the next provider with a fresh retry budget.
     ///
     /// Records one `record_rpc` per logical call (final outcome); each non-final failure is
@@ -217,7 +222,10 @@ impl RpcClient {
         method: RpcMethod,
         f: impl Fn(RootProvider<Optimism>) -> BoxFuture<Result<T>>,
     ) -> Result<T> {
-        let max_retries = self.config.max_retries;
+        let policy = &self.config.rpc_retry;
+        // `new_with_config` rejects unbounded policies, so `max_retries` is always `Some` here.
+        let max_retries = policy.max_retries.unwrap_or(0);
+        let max_backoff_ms = policy.max.as_millis() as u64;
         let start = Instant::now();
         // Safety: constructor guarantees at least one data provider.
         let n = self.data_providers.len();
@@ -229,7 +237,7 @@ impl RpcClient {
         for offset in 0..n {
             let provider_idx = (rr_start + offset) % n;
             let provider = &self.data_providers[provider_idx];
-            let mut backoff_ms = self.config.initial_backoff_ms;
+            let mut backoff_ms = policy.initial.as_millis() as u64;
 
             for attempt in 0..=max_retries {
                 let _permit = self
@@ -251,7 +259,7 @@ impl RpcClient {
                         // during backoff.
                         drop(_permit);
                         let jitter_ms = fastrand::u64(0..=backoff_ms / 2);
-                        let sleep_ms = (backoff_ms + jitter_ms).min(self.config.max_backoff_ms);
+                        let sleep_ms = (backoff_ms + jitter_ms).min(max_backoff_ms);
                         tracing::warn!(
                             method = method.as_str(),
                             attempt,
@@ -261,7 +269,7 @@ impl RpcClient {
                             "RPC call failed, retrying",
                         );
                         tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-                        backoff_ms = (backoff_ms * 2).min(self.config.max_backoff_ms);
+                        backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
                     }
                     Err(e) => {
                         if offset + 1 < n {
@@ -420,9 +428,12 @@ impl RpcClient {
                     return Ok((salt_witness, mpt_witness));
                 }
                 Err(e) => {
+                    // Logged at DEBUG so near-tip retry storms don't spam WARN; the fetcher
+                    // is the authority on escalation (it has the lag/attempt context and
+                    // decides DEBUG vs WARN vs ERROR based on mode and attempt count).
                     if idx + 1 < self.witness_providers.len() {
                         self.record_rpc_retry(RpcMethod::MegaGetBlockWitness);
-                        tracing::warn!(
+                        tracing::debug!(
                             block_number = number,
                             %hash,
                             provider_idx = idx,
@@ -430,7 +441,7 @@ impl RpcClient {
                             "Witness provider failed, trying next",
                         );
                     } else {
-                        tracing::warn!(
+                        tracing::debug!(
                             block_number = number,
                             %hash,
                             provider_idx = idx,
@@ -729,7 +740,8 @@ mod tests {
         types::ErrorObjectOwned,
     };
     use stateless_core::{
-        PipelineConfig, block_fetcher, db::BlockMeta, find_divergence_point, pipeline::BlockFetcher,
+        BackoffPolicy, PipelineConfig, block_fetcher, db::BlockMeta, find_divergence_point,
+        pipeline::BlockFetcher,
     };
     use tokio_util::sync::CancellationToken;
 
@@ -1042,9 +1054,11 @@ mod tests {
         // `a + b == 3` assertion below is 2 failed attempts on one provider + 1 successful
         // attempt on the other.
         let config = RpcClientConfig {
-            max_retries: 1,
-            initial_backoff_ms: 1,
-            max_backoff_ms: 2,
+            rpc_retry: BackoffPolicy::bounded(
+                Duration::from_millis(1),
+                Duration::from_millis(2),
+                1,
+            ),
             ..Default::default()
         };
         let (ha, url_a, hits_a) = start_counting_block_number_rpc(42, 2).await;

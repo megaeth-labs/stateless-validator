@@ -16,6 +16,8 @@
 //! - [`light_witness`]: Fast witness deserialization (skips proof validation)
 //! - [`withdrawals`]: MPT witness verification for L2→L1 withdrawals
 
+pub mod backoff;
+pub use backoff::BackoffPolicy;
 pub mod chain_spec;
 pub mod light_witness;
 pub use light_witness::{LightWitness, LightWitnessExecutor};
@@ -24,7 +26,7 @@ pub use evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv
 pub mod db;
 pub use db::{
     BlockMeta, BlockStore, ChainStore, ContractStore, GenesisStore, MissingDataKind,
-    PrunableChainStore, StoreError, StoreResult,
+    PrunableChainStore, StoreError, StoreResult, StoreResultExt,
 };
 pub mod data_types;
 pub use data_types::{PlainKey, PlainValue, iter_code_hashes};

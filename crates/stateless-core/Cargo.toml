@@ -45,7 +45,6 @@ dyn-clone.workspace = true
 eyre.workspace = true
 kanal.workspace = true
 num_cpus.workspace = true
-redb.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true

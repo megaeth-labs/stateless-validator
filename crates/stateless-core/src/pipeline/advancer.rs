@@ -41,11 +41,11 @@ where
             r = rx.recv() => match r {
                 Ok(Ok(item)) => item,
                 Ok(Err((msg, ErrorAction::Halt))) => {
-                    error!(error = %msg, "[Advancer] Fatal processing error, halting");
+                    error!(error = %msg, "Fatal processing error, halting");
                     return Ok(PipelineOutcome::Fatal(msg));
                 }
                 Ok(Err((msg, ErrorAction::Retry))) => {
-                    warn!(error = %msg, "[Advancer] Transient processing error, restarting cycle");
+                    warn!(error = %msg, "Transient processing error, restarting cycle");
                     return Err(anyhow!("{msg}"));
                 }
                 Err(_) => return Ok(PipelineOutcome::Shutdown),
@@ -63,13 +63,13 @@ where
                     block = next_expected,
                     expected_parent = ?current_tip.block_hash,
                     actual_parent = ?item.parent_hash(),
-                    "[Advancer] Parent hash mismatch — reorg detected"
+                    "Parent hash mismatch — reorg detected"
                 );
 
                 let rollback_to = match find_divergence_point(
                     fetcher,
-                    &|n| store.get_block_hash(n).map_err(eyre::Report::from),
-                    &|| store.get_earliest_block().map_err(eyre::Report::from),
+                    &|n| store.get_block_hash(n),
+                    &|| store.get_earliest_block(),
                     current_tip.block_number,
                 )
                 .await
@@ -100,7 +100,7 @@ where
                 error!(
                     block = next_expected,
                     error = %e,
-                    "[Advancer] State continuity check failed, halting"
+                    "State continuity check failed, halting"
                 );
                 return Ok(PipelineOutcome::Fatal(e.to_string()));
             }
@@ -117,7 +117,7 @@ where
                 tip = current_tip.block_number,
                 advanced = metas.len(),
                 buffered = buffer.len(),
-                "[Advancer] Chain advanced"
+                "Chain advanced"
             );
             hooks.post_advance(&current_tip)?;
         }

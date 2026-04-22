@@ -7,7 +7,7 @@
 
 use alloy_rpc_types_eth::Block;
 use op_alloy_rpc_types::Transaction;
-use stateless_core::db::{StoreError, StoreResult};
+use stateless_core::db::{StoreError, StoreResult, StoreResultExt};
 
 /// Marker byte prepended to lz4-compressed bincode data.
 pub const BINCODE_LZ4_MARKER: u8 = 0x01;
@@ -15,7 +15,7 @@ pub const BINCODE_LZ4_MARKER: u8 = 0x01;
 /// Serializes data using bincode + lz4 compression.
 /// Format: [marker byte][lz4 compressed bincode data]
 pub fn encode_to_vec<T: serde::Serialize>(data: &T) -> StoreResult<Vec<u8>> {
-    let encoded = bincode::serde::encode_to_vec(data, bincode::config::standard())?;
+    let encoded = bincode::serde::encode_to_vec(data, bincode::config::standard()).store_err()?;
     let compressed = lz4_flex::compress_prepend_size(&encoded);
 
     let mut result = Vec::with_capacity(1 + compressed.len());
@@ -34,19 +34,23 @@ pub fn decode_from_slice<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> StoreR
     }
     let decompressed = lz4_flex::decompress_size_prepended(&bytes[1..])
         .map_err(|e| StoreError::Corrupt(format!("lz4 decompress: {e}")))?;
+    // Bincode failure on already-decompressed bytes is corruption (or a schema drift),
+    // not a backend I/O error — classify accordingly so operators can triage from the log.
     let (decoded, _) =
-        bincode::serde::decode_from_slice(&decompressed, bincode::config::standard())?;
+        bincode::serde::decode_from_slice(&decompressed, bincode::config::standard())
+            .map_err(|e| StoreError::Corrupt(format!("bincode decode: {e}")))?;
     Ok(decoded)
 }
 
 /// Serializes Block<Transaction> using JSON.
 pub fn encode_block_to_vec(block: &Block<Transaction>) -> StoreResult<Vec<u8>> {
-    Ok(serde_json::to_vec(block)?)
+    serde_json::to_vec(block).store_err()
 }
 
 /// Deserializes Block<Transaction> from JSON bytes.
 pub fn decode_block_from_slice(bytes: &[u8]) -> StoreResult<Block<Transaction>> {
-    Ok(serde_json::from_slice(bytes)?)
+    serde_json::from_slice(bytes)
+        .map_err(|e| StoreError::Corrupt(format!("block json decode: {e}")))
 }
 
 #[cfg(test)]
