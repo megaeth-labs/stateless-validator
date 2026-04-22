@@ -4,7 +4,7 @@
 //! a block witness rather than a full blockchain database, enabling stateless block
 //! validation.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use alloy_eips::eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS};
 use alloy_primitives::{Address, B256, BlockNumber};
@@ -61,8 +61,11 @@ pub struct WitnessDatabase<'a, W> {
     pub header: &'a Header,
     /// Compact witness containing state subset and cryptographic proofs
     pub witness: &'a W,
-    /// Contract bytecode cache, pre-populated before execution starts
-    pub contracts: &'a HashMap<B256, Bytecode>,
+    /// Contract bytecode cache, pre-populated before execution starts.
+    /// Values are `Arc<Bytecode>` so the cache/provider chain above can share a
+    /// single allocation; revm's trait still demands an owned `Bytecode`, so
+    /// we deref-clone at the two read sites below.
+    pub contracts: &'a HashMap<B256, Arc<Bytecode>>,
 }
 
 impl<'a, W> WitnessDatabase<'a, W>
@@ -96,7 +99,10 @@ where
             _ => None,
         }) {
             Some(acc) => {
-                let code = acc.codehash.and_then(|hash| self.contracts.get(&hash)).cloned();
+                let code = acc
+                    .codehash
+                    .and_then(|hash| self.contracts.get(&hash))
+                    .map(|arc| (**arc).clone());
                 Ok(Some(AccountInfo {
                     balance: acc.balance,
                     nonce: acc.nonce,
@@ -117,7 +123,7 @@ where
         }
         self.contracts
             .get(&code_hash)
-            .cloned()
+            .map(|arc| (**arc).clone())
             .ok_or_else(|| WitnessDatabaseError("Code not found".to_string()))
     }
 

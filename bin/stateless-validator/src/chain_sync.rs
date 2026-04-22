@@ -9,9 +9,7 @@ use std::{collections::HashSet, sync::Arc};
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, BlockId};
 use eyre::{Result, ensure};
-use futures::future;
 use op_alloy_rpc_types::Transaction;
-use revm::state::Bytecode;
 use salt::SaltWitness;
 use stateless_common::RpcClient;
 use stateless_core::{
@@ -178,37 +176,26 @@ impl BlockProcessor for ValidatorProcessor {
             transient,
         };
 
-        // Resolve contract codes
-        let codehashes: HashSet<B256> = iter_code_hashes(&task.salt_witness.kvs).collect();
+        // Resolve contract codes via the shared three-tier chain. Memory/disk hits
+        // are trusted; the RPC tier verifies each bytecode's hash inside `get_codes`.
+        let codehashes: Vec<B256> =
+            iter_code_hashes(&task.salt_witness.kvs).collect::<HashSet<_>>().into_iter().collect();
         let (mut contracts, missing_contracts) = self
             .contract_cache
-            .get(&codehashes.iter().copied().collect::<Vec<_>>())
+            .get(&codehashes)
             .map_err(|e| fail(format!("Failed to get contracts: {e}"), true))?;
 
         metrics::on_contract_cache_read(contracts.len() as u64, missing_contracts.len() as u64);
 
         if !missing_contracts.is_empty() {
-            let client = self.rpc_client.clone();
-            let codes = future::join_all(missing_contracts.iter().map(|&hash| {
-                let client = client.clone();
-                async move { client.get_code(hash).await }
-            }))
-            .await;
+            let fetched = self
+                .rpc_client
+                .get_codes(&missing_contracts, true)
+                .await
+                .map_err(|e| fail(format!("Contract fetch/verify failed: {e}"), false))?;
 
-            let new_bytecodes: Vec<_> = missing_contracts
-                .into_iter()
-                .zip(codes.iter())
-                .map(|(code_hash, bytes)| {
-                    let bytecode = Bytecode::new_raw(bytes.clone());
-                    let computed_hash = bytecode.hash_slow();
-                    ensure!(
-                        computed_hash == code_hash,
-                        "RPC provider returned bytecode with unexpected codehash: expected {code_hash:?}, got {computed_hash:?}",
-                    );
-                    Ok((computed_hash, bytecode))
-                })
-                .collect::<eyre::Result<_>>()
-                .map_err(|e| fail(format!("Contract hash mismatch: {e}"), false))?;
+            let new_bytecodes: Vec<(B256, Arc<revm::state::Bytecode>)> =
+                fetched.into_iter().map(|(h, b)| (h, Arc::new(b))).collect();
 
             self.contract_cache
                 .insert(&new_bytecodes)

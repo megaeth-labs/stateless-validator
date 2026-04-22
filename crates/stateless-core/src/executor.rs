@@ -425,7 +425,7 @@ pub fn validate_block(
     block: &Block<OpTransaction>,
     salt_witness: SaltWitness,
     mpt_witness: MptWitness,
-    contracts: &std::collections::HashMap<B256, Bytecode>,
+    contracts: &std::collections::HashMap<B256, std::sync::Arc<Bytecode>>,
     writer: Option<Box<dyn Write>>,
 ) -> Result<ValidationStats, ValidationError> {
     // Create external environment oracle from salt witness

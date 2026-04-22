@@ -1,38 +1,139 @@
 //! In-memory write-through cache for contract bytecodes.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    hash::RandomState,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use alloy_primitives::B256;
-use dashmap::DashMap;
+use quick_cache::{
+    Weighter,
+    sync::{Cache, DefaultLifecycle},
+};
 use revm::state::Bytecode;
-use stateless_core::db::{ContractStore, StoreResult};
+use stateless_core::db::{ContractLookup, ContractStore, StoreResult};
+
+/// Default memory budget for the contract cache (512 MiB).
+pub const DEFAULT_CONTRACT_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Default estimated entry count for initial sizing.
+pub const DEFAULT_CONTRACT_CACHE_ESTIMATED_ITEMS: usize = 8192;
+
+/// Configuration for the contract cache.
+#[derive(Debug, Clone, Copy)]
+pub struct ContractCacheConfig {
+    /// Maximum memory-tier bytes before eviction (S3-FIFO).
+    pub max_bytes: u64,
+    /// Initial capacity hint; not a cap.
+    pub estimated_items: usize,
+}
+
+impl ContractCacheConfig {
+    /// Creates a new configuration with the given parameters.
+    pub const fn new(max_bytes: u64, estimated_items: usize) -> Self {
+        Self { max_bytes, estimated_items }
+    }
+}
+
+impl Default for ContractCacheConfig {
+    fn default() -> Self {
+        Self {
+            max_bytes: DEFAULT_CONTRACT_CACHE_MAX_BYTES,
+            estimated_items: DEFAULT_CONTRACT_CACHE_ESTIMATED_ITEMS,
+        }
+    }
+}
+
+/// Weighter that charges a fixed entry overhead plus the bytecode length.
+#[derive(Debug, Clone, Default)]
+pub struct BytecodeWeighter;
+
+impl Weighter<B256, Arc<Bytecode>> for BytecodeWeighter {
+    fn weight(&self, _key: &B256, val: &Arc<Bytecode>) -> u64 {
+        const ENTRY_OVERHEAD: u64 = 128;
+        ENTRY_OVERHEAD + val.bytes_slice().len() as u64
+    }
+}
+
+/// Snapshot of cache counters.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ContractCacheStats {
+    /// Memory-tier hits.
+    pub hits: u64,
+    /// Memory-tier misses (fell through to persistent store).
+    pub misses: u64,
+    /// Successful `insert` calls (batches, not individual entries).
+    pub inserts: u64,
+    /// Current entry count in memory.
+    pub len: usize,
+    /// Current weight (bytes) in memory.
+    pub weight: u64,
+}
 
 /// In-memory contract bytecode cache backed by persistent storage.
 ///
-/// Reads check the in-memory `DashMap` first, falling back to the persistent store.
-/// Writes go to both memory and disk (write-through).
+/// Reads check the in-memory cache first, falling back to the persistent store.
+/// Writes go to both disk and memory (write-through; disk first so a failed store
+/// write never leaves memory hotter than disk).
+///
+/// Values are stored as `Arc<Bytecode>` so that hits — the hot path — return by
+/// reference-count bump instead of deep-copying the bytecode.
 pub struct ContractCache {
-    memory: DashMap<B256, Bytecode>,
+    memory: Cache<
+        B256,
+        Arc<Bytecode>,
+        BytecodeWeighter,
+        RandomState,
+        DefaultLifecycle<B256, Arc<Bytecode>>,
+    >,
     store: Arc<dyn ContractStore>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    inserts: AtomicU64,
 }
 
 impl ContractCache {
-    /// Creates a new contract cache backed by the given persistent store.
+    /// Creates a new contract cache with default configuration.
     pub fn new(store: Arc<dyn ContractStore>) -> Self {
-        Self { memory: DashMap::new(), store }
+        Self::with_config(store, ContractCacheConfig::default())
+    }
+
+    /// Creates a new contract cache with the given configuration.
+    pub fn with_config(store: Arc<dyn ContractStore>, config: ContractCacheConfig) -> Self {
+        let memory = Cache::with(
+            config.estimated_items,
+            config.max_bytes,
+            BytecodeWeighter,
+            RandomState::default(),
+            DefaultLifecycle::default(),
+        );
+        Self {
+            memory,
+            store,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            inserts: AtomicU64::new(0),
+        }
     }
 
     /// Retrieves contract bytecodes, checking memory first then persistent store.
     ///
-    /// Returns `(found, missing)`.
-    pub fn get(&self, hashes: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
-        let mut found = HashMap::new();
+    /// Returns `(found, missing)`. Memory hits are trusted and not re-verified; the
+    /// caller should use a verified RPC fetch (`RpcClient::get_codes(.., verify=true)`)
+    /// to populate the cache so all entries arrive pre-verified.
+    pub fn get(&self, hashes: &[B256]) -> StoreResult<ContractLookup> {
+        let mut found = std::collections::HashMap::new();
         let mut not_in_memory = Vec::new();
 
         for &hash in hashes {
-            if let Some(entry) = self.memory.get(&hash) {
-                found.insert(hash, entry.value().clone());
+            if let Some(arc) = self.memory.get(&hash) {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                found.insert(hash, arc);
             } else {
+                self.misses.fetch_add(1, Ordering::Relaxed);
                 not_in_memory.push(hash);
             }
         }
@@ -43,41 +144,60 @@ impl ContractCache {
 
         let (from_disk, missing) = self.store.get_contracts(&not_in_memory)?;
 
-        for (hash, bytecode) in &from_disk {
-            self.memory.insert(*hash, bytecode.clone());
+        for (hash, arc) in &from_disk {
+            self.memory.insert(*hash, arc.clone());
         }
         found.extend(from_disk);
 
         Ok((found, missing))
     }
 
-    /// Adds contract bytecodes to both memory cache and persistent store (write-through).
-    pub fn insert(&self, codes: &[(B256, Bytecode)]) -> StoreResult<()> {
+    /// Adds contract bytecodes to both disk and memory (write-through).
+    pub fn insert(&self, codes: &[(B256, Arc<Bytecode>)]) -> StoreResult<()> {
         if codes.is_empty() {
             return Ok(());
         }
 
         self.store.add_contracts(codes)?;
 
-        for (hash, bytecode) in codes {
-            self.memory.insert(*hash, bytecode.clone());
+        for (hash, arc) in codes {
+            self.memory.insert(*hash, arc.clone());
         }
+        self.inserts.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
+    }
+
+    /// Returns a snapshot of the cache counters.
+    pub fn stats(&self) -> ContractCacheStats {
+        ContractCacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            inserts: self.inserts.load(Ordering::Relaxed),
+            len: self.memory.len(),
+            weight: self.memory.weight(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        collections::HashMap,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use alloy_primitives::Bytes;
     use stateless_core::db::StoreError;
 
     use super::*;
 
-    fn bc(b: u8) -> Bytecode {
-        Bytecode::new_raw(Bytes::from(vec![b]))
+    fn bc(b: u8) -> Arc<Bytecode> {
+        Arc::new(Bytecode::new_raw(Bytes::from(vec![b])))
+    }
+
+    fn bc_sized(len: usize, fill: u8) -> Arc<Bytecode> {
+        Arc::new(Bytecode::new_raw(Bytes::from(vec![fill; len])))
     }
 
     fn h(n: u8) -> B256 {
@@ -87,7 +207,7 @@ mod tests {
     /// In-memory `ContractStore` that tracks hit counts and can be toggled to fail on writes.
     #[derive(Default)]
     struct FakeStore {
-        data: dashmap::DashMap<B256, Bytecode>,
+        data: dashmap::DashMap<B256, Arc<Bytecode>>,
         get_calls: AtomicUsize,
         add_calls: AtomicUsize,
         fail_add: std::sync::atomic::AtomicBool,
@@ -106,7 +226,7 @@ mod tests {
         fn get_contracts(
             &self,
             hashes: &[B256],
-        ) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
+        ) -> StoreResult<(HashMap<B256, Arc<Bytecode>>, Vec<B256>)> {
             self.get_calls.fetch_add(1, Ordering::Relaxed);
             let mut found = HashMap::new();
             let mut missing = Vec::new();
@@ -121,7 +241,7 @@ mod tests {
             Ok((found, missing))
         }
 
-        fn add_contracts(&self, codes: &[(B256, Bytecode)]) -> StoreResult<()> {
+        fn add_contracts(&self, codes: &[(B256, Arc<Bytecode>)]) -> StoreResult<()> {
             self.add_calls.fetch_add(1, Ordering::Relaxed);
             if self.fail_add.load(Ordering::Relaxed) {
                 return Err(StoreError::Corrupt("fake add failure".into()));
@@ -137,10 +257,12 @@ mod tests {
     fn get_returns_from_memory_without_hitting_store() {
         let store = Arc::new(FakeStore::default());
         let cache = ContractCache::new(store.clone());
-        cache.memory.insert(h(1), bc(0xAA));
+        let original = bc(0xAA);
+        cache.memory.insert(h(1), original.clone());
 
         let (found, missing) = cache.get(&[h(1)]).unwrap();
-        assert_eq!(found[&h(1)].bytes_slice(), bc(0xAA).bytes_slice());
+        let returned = found.get(&h(1)).unwrap();
+        assert!(Arc::ptr_eq(returned, &original), "memory hit must share the same Arc allocation");
         assert!(missing.is_empty());
         assert_eq!(store.get_calls(), 0, "memory hit must not hit store");
     }
@@ -148,11 +270,12 @@ mod tests {
     #[test]
     fn get_populates_memory_on_store_hit() {
         let store = Arc::new(FakeStore::default());
-        store.data.insert(h(2), bc(0xBB));
+        let original = bc(0xBB);
+        store.data.insert(h(2), original.clone());
         let cache = ContractCache::new(store.clone());
 
         let (found, missing) = cache.get(&[h(2)]).unwrap();
-        assert_eq!(found[&h(2)].bytes_slice(), bc(0xBB).bytes_slice());
+        assert_eq!(found[&h(2)].bytes_slice(), original.bytes_slice());
         assert!(missing.is_empty());
         assert_eq!(store.get_calls(), 1);
 
@@ -174,11 +297,12 @@ mod tests {
     fn insert_writes_through_to_store_and_memory() {
         let store = Arc::new(FakeStore::default());
         let cache = ContractCache::new(store.clone());
-        cache.insert(&[(h(3), bc(0xCC))]).unwrap();
+        let original = bc(0xCC);
+        cache.insert(&[(h(3), original.clone())]).unwrap();
 
         assert_eq!(store.add_calls(), 1, "insert must write through to store");
-        assert_eq!(store.data.get(&h(3)).unwrap().value().bytes_slice(), bc(0xCC).bytes_slice());
-        assert_eq!(cache.memory.get(&h(3)).unwrap().value().bytes_slice(), bc(0xCC).bytes_slice());
+        assert_eq!(store.data.get(&h(3)).unwrap().value().bytes_slice(), original.bytes_slice(),);
+        assert_eq!(cache.memory.get(&h(3)).unwrap().bytes_slice(), original.bytes_slice());
     }
 
     #[test]
@@ -198,5 +322,40 @@ mod tests {
         let cache = ContractCache::new(store.clone());
         cache.insert(&[]).unwrap();
         assert_eq!(store.add_calls(), 0);
+    }
+
+    #[test]
+    fn stats_track_hits_misses_and_inserts() {
+        let store = Arc::new(FakeStore::default());
+        let cache = ContractCache::new(store.clone());
+        cache.insert(&[(h(5), bc(0xEE))]).unwrap();
+
+        let _ = cache.get(&[h(5), h(5), h(99)]).unwrap();
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 2);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.inserts, 1);
+    }
+
+    #[test]
+    fn eviction_respects_byte_budget() {
+        // Budget fits ~2 of these entries (each ~1 KiB + 128 B overhead).
+        let store = Arc::new(FakeStore::default());
+        let cache = ContractCache::with_config(
+            store.clone(),
+            ContractCacheConfig { max_bytes: 3 * 1024, estimated_items: 8 },
+        );
+
+        for i in 0..10u8 {
+            cache.insert(&[(h(i), bc_sized(1024, i))]).unwrap();
+        }
+
+        let stats = cache.stats();
+        assert!(
+            stats.weight <= 3 * 1024,
+            "memory weight {} must be bounded by max_bytes",
+            stats.weight,
+        );
+        assert!(stats.len < 10, "eviction must have removed entries; len={}", stats.len);
     }
 }

@@ -25,6 +25,7 @@ stateless-core = { path = "../stateless-core" }
 bincode.workspace = true
 dashmap.workspace = true
 lz4_flex.workspace = true
+quick_cache.workspace = true
 redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
