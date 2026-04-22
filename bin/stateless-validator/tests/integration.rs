@@ -171,12 +171,12 @@ fn make_rpc_error(code: i32, msg: String) -> ErrorObject<'static> {
 }
 
 /// Create a temporary ValidatorDB with the anchor set to the first block in test data.
-fn setup_test_db(fx: &TestFixtures) -> eyre::Result<Arc<ValidatorDB>> {
+///
+/// The returned `TempDir` must be held by the caller for the test's lifetime —
+/// dropping it removes the directory, including any redb journal/lock files.
+fn setup_test_db(fx: &TestFixtures) -> eyre::Result<(Arc<ValidatorDB>, tempfile::TempDir)> {
     let temp_dir = tempfile::tempdir()?;
     let db = ValidatorDB::new(temp_dir.path().join(VALIDATOR_DB_FILENAME))?;
-    // Intentionally leak the temp dir — ValidatorDB holds a path into it.
-    // The OS will clean it up when the test process exits.
-    std::mem::forget(temp_dir);
 
     let (block_num, block_hash) = fx.min_block();
     let block = &fx.blocks[&block_hash];
@@ -193,7 +193,7 @@ fn setup_test_db(fx: &TestFixtures) -> eyre::Result<Arc<ValidatorDB>> {
     };
     db.reset_to_anchor(&anchor)?;
 
-    Ok(Arc::new(db))
+    Ok((Arc::new(db), temp_dir))
 }
 
 /// Start a mock RPC server backed by pre-loaded test fixtures.
@@ -356,7 +356,7 @@ async fn integration_test() {
 
     let max_block_number = fx.max_block().0;
     let sync_target = Some(max_block_number);
-    let validator_db = setup_test_db(&fx).unwrap();
+    let (validator_db, _tmp) = setup_test_db(&fx).unwrap();
     let contract_cache =
         Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
     let state = MockServerState::new(fx);

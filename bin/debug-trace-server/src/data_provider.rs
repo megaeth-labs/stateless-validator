@@ -7,10 +7,13 @@
 //! 2. **Remote RPC** (slower) - Upstream RPC endpoints as fallback
 //!
 //! # Features
-//! - **Single-flight request coalescing**: Prevents duplicate RPC calls for the same block
-//! - **Witness fetch retry**: Automatic retry with configurable timeout for witness data
-//! - **Height-based witness routing**: Routes to appropriate source based on block height
-//! - **Contract bytecode fetching**: Fetches contract code alongside block data
+//! - **Single-flight request coalescing**: Multiple callers for the same block hash share one
+//!   fetch; the result is handed out as `Arc<BlockData>` so the hot path is a refcount bump, not a
+//!   deep clone.
+//! - **Witness fetch timeout**: caps the user-facing wait on the RPC client's internal retry loop
+//!   so an RPC request never hangs indefinitely.
+//! - **Contract bytecode resolution**: checks [`ContractCache`] (memory → redb), falls back to a
+//!   parallel + verified `RpcClient::get_codes` fetch on miss.
 //!
 //! # Note
 //! Response caching is handled at the HTTP layer by `ResponseCache`, not here.
@@ -93,7 +96,7 @@ pub struct DataProvider {
     /// repeated trace requests for the same contract hit memory instead of
     /// redb (slow) or RPC (slowest).
     contract_cache: Arc<ContractCache>,
-    /// Timeout for witness fetch retry operations.
+    /// User-facing cap on witness fetches (the RPC client retries internally).
     witness_timeout: Duration,
     /// In-flight requests map for single-flight pattern (keyed by block hash).
     in_flight: DashMap<B256, InFlightSender>,
@@ -107,7 +110,7 @@ impl DataProvider {
     /// * `db` - Optional local database for cached block data
     /// * `contract_cache` - Shared in-memory contract cache (backed by the DB when present, or an
     ///   in-memory-only noop store in stateless mode)
-    /// * `witness_timeout_secs` - Timeout in seconds for witness fetch retry
+    /// * `witness_timeout_secs` - User-facing cap on a single witness fetch, in seconds
     pub fn new(
         rpc_client: Arc<RpcClient>,
         db: Option<Arc<dyn BlockStore>>,
@@ -571,7 +574,7 @@ impl DataProvider {
 /// stateless mode (no `--data-dir`).
 ///
 /// Reads always return "everything missing" so the cache falls back to RPC; writes
-/// silently drop — the cache's own DashMap is the only persistence layer in this mode.
+/// silently drop — the cache's own in-memory layer is the only persistence in this mode.
 pub struct NoopContractStore;
 
 impl ContractStore for NoopContractStore {

@@ -35,7 +35,6 @@ stateless-db = { path = "../../crates/stateless-db" }
 bincode.workspace = true
 clap = { workspace = true, features = ["env"] }
 eyre.workspace = true
-futures.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 redb.workspace = true
