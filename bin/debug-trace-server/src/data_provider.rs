@@ -549,8 +549,9 @@ impl DataProvider {
 
         let upstream = UpstreamMetrics::new_for_method("eth_getCodeByHash");
         let start = std::time::Instant::now();
-        let fetched = self.rpc_client.get_codes(&missing, true).await?;
-        upstream.record_request(true, start.elapsed().as_secs_f64());
+        let result = self.rpc_client.get_codes(&missing, true).await;
+        upstream.record_request(result.is_ok(), start.elapsed().as_secs_f64());
+        let fetched = result?;
 
         let new_contracts: Vec<(B256, Arc<Bytecode>)> =
             fetched.into_iter().map(|(h, b)| (h, Arc::new(b))).collect();

@@ -62,9 +62,9 @@ pub struct WitnessDatabase<'a, W> {
     /// Compact witness containing state subset and cryptographic proofs
     pub witness: &'a W,
     /// Contract bytecode cache, pre-populated before execution starts.
-    /// Values are `Arc<Bytecode>` so the cache/provider chain above can share a
-    /// single allocation; revm's trait still demands an owned `Bytecode`, so
-    /// we deref-clone at the two read sites below.
+    /// Values are `Arc<Bytecode>` so the cache and any cloned `BlockData` share a
+    /// single allocation; revm's trait still demands an owned `Bytecode`, so the
+    /// `DatabaseRef` impls deref-clone at the read boundary.
     pub contracts: &'a HashMap<B256, Arc<Bytecode>>,
 }
 

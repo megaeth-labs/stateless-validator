@@ -438,31 +438,35 @@ impl RpcClient {
     /// Gets contract bytecode for multiple code hashes concurrently.
     ///
     /// When `verify` is `true`, each returned bytecode's keccak hash is checked against its
-    /// requested code hash and a provider mismatch fails the whole batch. Callers that feed
-    /// into the verified `ContractCache` tiers should pass `true`; the cache itself trusts
-    /// memory/disk hits and does not re-verify.
+    /// requested code hash inside the same per-hash future, so hashing runs concurrently
+    /// with the remaining fetches. A provider mismatch fails the whole batch. Callers that
+    /// feed into the verified `ContractCache` tiers should pass `true`; the cache itself
+    /// trusts memory/disk hits and does not re-verify.
     pub async fn get_codes(
         &self,
         hashes: &[B256],
         verify: bool,
     ) -> Result<HashMap<B256, Bytecode>> {
-        let results: Vec<(B256, Bytecode)> = future::join_all(
-            hashes
-                .iter()
-                .map(|&hash| async move { (hash, Bytecode::new_raw(self.get_code(hash).await)) }),
-        )
-        .await;
+        let results: Vec<Result<(B256, Bytecode)>> =
+            future::join_all(hashes.iter().map(|&hash| async move {
+                let code = Bytecode::new_raw(self.get_code(hash).await);
+                if verify {
+                    let got = code.hash_slow();
+                    ensure!(
+                        got == hash,
+                        "RPC provider returned bytecode with unexpected codehash: expected {hash:?}, got {got:?}",
+                    );
+                }
+                Ok((hash, code))
+            }))
+            .await;
 
-        if verify {
-            for (expected, code) in &results {
-                let got = code.hash_slow();
-                ensure!(
-                    got == *expected,
-                    "RPC provider returned bytecode with unexpected codehash: expected {expected:?}, got {got:?}",
-                );
-            }
+        let mut out = HashMap::with_capacity(hashes.len());
+        for r in results {
+            let (h, code) = r?;
+            out.insert(h, code);
         }
-        Ok(results.into_iter().collect())
+        Ok(out)
     }
 
     /// Gets the transaction by hash and returns its containing block hash.

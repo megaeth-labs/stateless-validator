@@ -10,6 +10,7 @@ use alloy_primitives::{B256, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, BlockId};
 use eyre::{Result, ensure};
 use op_alloy_rpc_types::Transaction;
+use revm::state::Bytecode;
 use salt::SaltWitness;
 use stateless_common::RpcClient;
 use stateless_core::{
@@ -194,7 +195,7 @@ impl BlockProcessor for ValidatorProcessor {
                 .await
                 .map_err(|e| fail(format!("Contract fetch/verify failed: {e}"), false))?;
 
-            let new_bytecodes: Vec<(B256, Arc<revm::state::Bytecode>)> =
+            let new_bytecodes: Vec<(B256, Arc<Bytecode>)> =
                 fetched.into_iter().map(|(h, b)| (h, Arc::new(b))).collect();
 
             self.contract_cache

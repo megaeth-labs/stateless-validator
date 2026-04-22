@@ -1,6 +1,7 @@
 //! In-memory write-through cache for contract bytecodes.
 
 use std::{
+    collections::HashMap,
     hash::RandomState,
     sync::{
         Arc,
@@ -31,13 +32,6 @@ pub struct ContractCacheConfig {
     pub estimated_items: usize,
 }
 
-impl ContractCacheConfig {
-    /// Creates a new configuration with the given parameters.
-    pub const fn new(max_bytes: u64, estimated_items: usize) -> Self {
-        Self { max_bytes, estimated_items }
-    }
-}
-
 impl Default for ContractCacheConfig {
     fn default() -> Self {
         Self {
@@ -49,7 +43,7 @@ impl Default for ContractCacheConfig {
 
 /// Weighter that charges a fixed entry overhead plus the bytecode length.
 #[derive(Debug, Clone, Default)]
-pub struct BytecodeWeighter;
+pub(crate) struct BytecodeWeighter;
 
 impl Weighter<B256, Arc<Bytecode>> for BytecodeWeighter {
     fn weight(&self, _key: &B256, val: &Arc<Bytecode>) -> u64 {
@@ -57,6 +51,14 @@ impl Weighter<B256, Arc<Bytecode>> for BytecodeWeighter {
         ENTRY_OVERHEAD + val.bytes_slice().len() as u64
     }
 }
+
+type MemoryCache = Cache<
+    B256,
+    Arc<Bytecode>,
+    BytecodeWeighter,
+    RandomState,
+    DefaultLifecycle<B256, Arc<Bytecode>>,
+>;
 
 /// Snapshot of cache counters.
 #[derive(Debug, Clone, Copy, Default)]
@@ -82,13 +84,7 @@ pub struct ContractCacheStats {
 /// Values are stored as `Arc<Bytecode>` so that hits — the hot path — return by
 /// reference-count bump instead of deep-copying the bytecode.
 pub struct ContractCache {
-    memory: Cache<
-        B256,
-        Arc<Bytecode>,
-        BytecodeWeighter,
-        RandomState,
-        DefaultLifecycle<B256, Arc<Bytecode>>,
-    >,
+    memory: MemoryCache,
     store: Arc<dyn ContractStore>,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -125,8 +121,8 @@ impl ContractCache {
     /// caller should use a verified RPC fetch (`RpcClient::get_codes(.., verify=true)`)
     /// to populate the cache so all entries arrive pre-verified.
     pub fn get(&self, hashes: &[B256]) -> StoreResult<ContractLookup> {
-        let mut found = std::collections::HashMap::new();
-        let mut not_in_memory = Vec::new();
+        let mut found = HashMap::with_capacity(hashes.len());
+        let mut not_in_memory = Vec::with_capacity(hashes.len());
 
         for &hash in hashes {
             if let Some(arc) = self.memory.get(&hash) {
@@ -182,10 +178,7 @@ impl ContractCache {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::HashMap,
-        sync::atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use alloy_primitives::Bytes;
     use stateless_core::db::StoreError;
@@ -301,7 +294,7 @@ mod tests {
         cache.insert(&[(h(3), original.clone())]).unwrap();
 
         assert_eq!(store.add_calls(), 1, "insert must write through to store");
-        assert_eq!(store.data.get(&h(3)).unwrap().value().bytes_slice(), original.bytes_slice(),);
+        assert_eq!(store.data.get(&h(3)).unwrap().value().bytes_slice(), original.bytes_slice());
         assert_eq!(cache.memory.get(&h(3)).unwrap().bytes_slice(), original.bytes_slice());
     }
 
@@ -339,7 +332,7 @@ mod tests {
 
     #[test]
     fn eviction_respects_byte_budget() {
-        // Budget fits ~2 of these entries (each ~1 KiB + 128 B overhead).
+        // Each entry weighs 128 (overhead) + 1024 (bytes) = 1152; budget 3072 fits 2.
         let store = Arc::new(FakeStore::default());
         let cache = ContractCache::with_config(
             store.clone(),
@@ -356,6 +349,6 @@ mod tests {
             "memory weight {} must be bounded by max_bytes",
             stats.weight,
         );
-        assert!(stats.len < 10, "eviction must have removed entries; len={}", stats.len);
+        assert!(stats.len <= 2, "weight budget fits at most 2 entries; len={}", stats.len);
     }
 }

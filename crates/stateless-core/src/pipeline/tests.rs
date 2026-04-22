@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use eyre::{Result, anyhow};
+use revm::state::Bytecode;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -80,16 +81,10 @@ impl MockStore {
 }
 
 impl crate::ContractStore for MockStore {
-    fn get_contracts(
-        &self,
-        _: &[B256],
-    ) -> StoreResult<(HashMap<B256, std::sync::Arc<revm::state::Bytecode>>, Vec<B256>)> {
+    fn get_contracts(&self, _: &[B256]) -> StoreResult<(HashMap<B256, Arc<Bytecode>>, Vec<B256>)> {
         Ok((HashMap::new(), vec![]))
     }
-    fn add_contracts(
-        &self,
-        _: &[(B256, std::sync::Arc<revm::state::Bytecode>)],
-    ) -> StoreResult<()> {
+    fn add_contracts(&self, _: &[(B256, Arc<Bytecode>)]) -> StoreResult<()> {
         Ok(())
     }
 }
