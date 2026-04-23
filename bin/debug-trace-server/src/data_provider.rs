@@ -610,8 +610,7 @@ impl DataProvider {
         upstream.record_request(result.is_ok(), start.elapsed().as_secs_f64());
         let fetched = result?;
 
-        let new_contracts: Vec<(B256, Arc<Bytecode>)> =
-            fetched.into_iter().map(|(h, b)| (h, Arc::new(b))).collect();
+        let new_contracts: Vec<(B256, Arc<Bytecode>)> = fetched.into_iter().collect();
 
         // Write-through: memory always, disk in local-cache mode.
         // We don't fail the trace on cache-insert errors; the request has already been served.
