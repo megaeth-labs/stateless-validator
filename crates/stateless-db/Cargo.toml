@@ -29,3 +29,7 @@ quick_cache.workspace = true
 redb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# misc
+tempfile.workspace = true

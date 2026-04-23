@@ -175,7 +175,7 @@ fn register_metric_descriptions() {
 fn init_rpc_method_counters() {
     let methods = [
         RpcMethod::EthGetCodeByHash,
-        RpcMethod::EthGetBlockByNumber,
+        RpcMethod::EthGetBlock,
         RpcMethod::EthBlockNumber,
         RpcMethod::EthGetHeader,
         RpcMethod::EthGetTransactionByHash,
@@ -267,7 +267,7 @@ pub fn on_rpc_complete(method: RpcMethod, success: bool, duration_secs: Option<f
             RpcMethod::EthGetCodeByHash => {
                 histogram!(names::CODE_FETCH_TIME).record(duration);
             }
-            RpcMethod::EthGetBlockByNumber => {
+            RpcMethod::EthGetBlock => {
                 histogram!(names::BLOCK_FETCH_TIME).record(duration);
             }
             RpcMethod::MegaGetBlockWitness => {
