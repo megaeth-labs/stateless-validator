@@ -24,6 +24,7 @@ mod worker;
 use std::{sync::Arc, time::Duration};
 
 use advancer::chain_advancer;
+use config::WorkerResult;
 pub use config::{ErrorAction, PipelineConfig, PipelineOutcome, ReorgEvent};
 pub use divergence::{DivergenceError, find_divergence_point};
 use eyre::{Result, anyhow};
@@ -77,9 +78,7 @@ where
             fetcher_shutdown.clone(),
         ));
 
-        let (result_tx, result_rx) = kanal::bounded::<
-            std::result::Result<P::Output, (String, ErrorAction)>,
-        >(channel_capacity);
+        let (result_tx, result_rx) = kanal::bounded::<WorkerResult<P::Output>>(channel_capacity);
         let worker_handles =
             spawn_workers(processor.clone(), fetch_rx, result_tx, config.concurrent_workers);
 

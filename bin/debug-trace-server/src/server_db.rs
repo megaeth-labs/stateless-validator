@@ -96,33 +96,6 @@ impl ServerDB {
         }))
     }
 
-    /// Resets the chain anchor point and clears all chain state.
-    pub fn reset_anchor_block(
-        &self,
-        block_number: BlockNumber,
-        block_hash: BlockHash,
-        post_state_root: B256,
-        post_withdrawals_root: B256,
-    ) -> StoreResult<()> {
-        let write_txn = self.database.begin_write().store_err()?;
-        {
-            let mut anchor_table = write_txn.open_table(ANCHOR_BLOCK).store_err()?;
-            anchor_table
-                .insert(
-                    "anchor",
-                    (block_number, block_hash.0, post_state_root.0, post_withdrawals_root.0),
-                )
-                .store_err()?;
-            let mut chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
-            chain.retain(|_, _| false).store_err()?;
-            chain
-                .insert(block_number, (block_hash.0, post_state_root.0, post_withdrawals_root.0))
-                .store_err()?;
-        }
-        write_txn.commit().store_err()?;
-        Ok(())
-    }
-
     /// Cleans up old block data to save storage space.
     ///
     /// The returned count is the number of BLOCK_RECORDS entries removed (and, by
@@ -348,23 +321,6 @@ mod tests {
 
         assert!(ChainStore::get_block_hash(&db, 4).unwrap().is_none());
         assert!(ChainStore::get_block_hash(&db, 5).unwrap().is_none());
-    }
-
-    #[test]
-    fn test_server_db_reset_anchor_block() {
-        let (_dir, db) = temp_server_db();
-
-        let blocks: Vec<BlockMeta> = (1..=5).map(make_block_meta).collect();
-        ChainStore::advance_chain(&db, &blocks).unwrap();
-
-        let anchor = make_block_meta(100);
-        ChainStore::reset_to_anchor(&db, &anchor).unwrap();
-
-        assert!(ChainStore::get_block_hash(&db, 1).unwrap().is_none());
-
-        let (number, hash) = db.get_local_tip().unwrap().unwrap();
-        assert_eq!(number, 100);
-        assert_eq!(hash, anchor.block_hash);
     }
 
     #[test]

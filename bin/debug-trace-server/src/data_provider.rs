@@ -349,26 +349,26 @@ impl DataProvider {
     ///
     /// This prevents redundant RPC calls and reduces upstream load.
     async fn fetch_block_data_single_flight(&self, block_hash: B256) -> Result<Arc<BlockData>> {
-        // Check if there's already an in-flight request for this block
-        if let Some(sender) = self.in_flight.get(&block_hash) {
-            // Subscribe to the existing request
-            let mut receiver = sender.subscribe();
-            drop(sender); // Release the lock
-            SingleFlightMetrics::new_for_type("coalesced").record();
-            trace!(
-                block_hash = %block_hash,
-                "Joining existing in-flight request"
-            );
-            return receiver
-                .recv()
-                .await
-                .map_err(|e| eyre::eyre!("Failed to receive from in-flight request: {}", e))?
-                .map_err(|e| eyre::eyre!("{}", e));
-        }
-
-        // Create a new broadcast channel for this request
-        let (tx, _) = broadcast::channel(1);
-        self.in_flight.insert(block_hash, tx.clone());
+        // Atomic check-and-insert via `entry()` — a plain `get` + `insert` sequence would
+        // let two callers both observe "vacant" and each kick off their own RPC fetch.
+        let tx = match self.in_flight.entry(block_hash) {
+            dashmap::Entry::Occupied(occupied) => {
+                let mut receiver = occupied.get().subscribe();
+                drop(occupied);
+                SingleFlightMetrics::new_for_type("coalesced").record();
+                trace!(block_hash = %block_hash, "Joining existing in-flight request");
+                return receiver
+                    .recv()
+                    .await
+                    .map_err(|e| eyre::eyre!("Failed to receive from in-flight request: {}", e))?
+                    .map_err(|e| eyre::eyre!("{}", e));
+            }
+            dashmap::Entry::Vacant(vacant) => {
+                let (tx, _) = broadcast::channel(1);
+                vacant.insert(tx.clone());
+                tx
+            }
+        };
         SingleFlightMetrics::new_for_type("new").record();
 
         trace!(
