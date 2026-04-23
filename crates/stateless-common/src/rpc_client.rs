@@ -1289,4 +1289,78 @@ mod tests {
         .await;
         (handle, url)
     }
+
+    /// Serves `eth_getCodeByHash` returning `codes[hash]` verbatim (so the server can return
+    /// bytes whose keccak256 does NOT match the requested hash, exercising the verify path).
+    async fn start_code_rpc(codes: HashMap<B256, Bytes>) -> (ServerHandle, String) {
+        serve(codes, |m| {
+            m.register_method("eth_getCodeByHash", |params, ctx, _| {
+                let (hash,): (B256,) = params.parse().unwrap();
+                Ok::<_, ErrorObjectOwned>(
+                    ctx.get(&hash).cloned().unwrap_or_else(|| Bytes::from_static(&[])),
+                )
+            })
+            .unwrap();
+        })
+        .await
+    }
+
+    /// `get_codes(verify=true)` must abort the batch with an `Err` when the returned bytecode's
+    /// keccak256 doesn't match the requested hash. Documents the security contract: unverified
+    /// bytes never reach the cache.
+    #[tokio::test]
+    async fn test_get_codes_verify_rejects_hash_mismatch() {
+        // Good entry: the "requested" hash equals keccak256 of [0x60, 0x00].
+        let good_code = Bytes::from_static(&[0x60, 0x00]);
+        let good_hash = Bytecode::new_raw(good_code.clone()).hash_slow();
+        // Bad entry: request a hash whose keccak the server won't produce (it returns different
+        // bytes). `[0xAA; 32]` is arbitrary — the server returns `[0xDE, 0xAD]` instead.
+        let bad_hash = B256::from([0xAA; 32]);
+        let bad_code = Bytes::from_static(&[0xDE, 0xAD]);
+
+        let codes = HashMap::from([(good_hash, good_code.clone()), (bad_hash, bad_code)]);
+        let (handle, url) = start_code_rpc(codes).await;
+        let client = client_at(&url);
+
+        // `verify=true` on just the bad hash → Err with the mismatch message.
+        let err = client.get_codes(&[bad_hash], true).await.expect_err("mismatch must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("unexpected codehash"), "got: {msg}");
+        assert!(msg.contains(&format!("{bad_hash:?}")), "error must name the bad hash: {msg}");
+
+        // Mixed batch with one bad hash → whole batch fails (security contract: discard all).
+        let err = client
+            .get_codes(&[good_hash, bad_hash], true)
+            .await
+            .expect_err("any mismatch must abort the batch");
+        assert!(err.to_string().contains("unexpected codehash"));
+
+        // `verify=false` → both entries returned (caller opted out of verification).
+        let ok = client.get_codes(&[good_hash, bad_hash], false).await.unwrap();
+        assert_eq!(ok.len(), 2, "verify=false must return every requested entry");
+        // Compare against the canonical analyzed form (revm appends a trailing 0 byte).
+        assert_eq!(ok[&good_hash].bytes_slice(), Bytecode::new_raw(good_code).bytes_slice(),);
+
+        handle.stop().unwrap();
+    }
+
+    /// All-good batch: verified entries are returned wrapped in `Arc<Bytecode>` (the type
+    /// change that lets `ContractCache::insert` avoid a second allocation at each call site).
+    #[tokio::test]
+    async fn test_get_codes_verify_ok_returns_arc_bytecode() {
+        let good_code = Bytes::from_static(&[0x60, 0x00, 0x60, 0x01]);
+        let good_hash = Bytecode::new_raw(good_code.clone()).hash_slow();
+
+        let (handle, url) = start_code_rpc(HashMap::from([(good_hash, good_code.clone())])).await;
+        let client = client_at(&url);
+
+        let ok = client.get_codes(&[good_hash], true).await.unwrap();
+        assert_eq!(ok.len(), 1);
+        let arc = ok.get(&good_hash).expect("good hash present");
+        assert_eq!(arc.bytes_slice(), Bytecode::new_raw(good_code).bytes_slice());
+        // Compile-time check that the return type is `Arc<Bytecode>` (refcount share with cache).
+        let _arc_clone: Arc<Bytecode> = Arc::clone(arc);
+
+        handle.stop().unwrap();
+    }
 }
