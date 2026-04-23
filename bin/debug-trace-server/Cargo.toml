@@ -38,6 +38,7 @@ stateless-db = { path = "../../crates/stateless-db" }
 clap.workspace = true
 dashmap.workspace = true
 eyre.workspace = true
+futures.workspace = true
 http.workspace = true
 http-body.workspace = true
 jsonrpsee.workspace = true

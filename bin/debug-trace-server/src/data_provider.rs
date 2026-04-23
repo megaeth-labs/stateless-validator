@@ -7,32 +7,42 @@
 //! 2. **Remote RPC** (slower) - Upstream RPC endpoints as fallback
 //!
 //! # Features
-//! - **Single-flight request coalescing**: Multiple callers for the same block hash share one
-//!   fetch; the result is handed out as `Arc<BlockData>` so the hot path is a refcount bump, not a
-//!   deep clone.
-//! - **Witness fetch timeout**: caps the user-facing wait on the RPC client's internal retry loop
-//!   so an RPC request never hangs indefinitely.
+//! - **Single-flight request coalescing**: concurrent callers for the same block hash share one
+//!   in-flight fetch via [`futures::future::Shared`]; the result is handed out as `Arc<BlockData>`
+//!   so the hot path is a refcount bump, not a deep clone.
+//! - **Single deadline per call**: every public entry point computes one wall-clock deadline from
+//!   `block_fetch_timeout` and threads it through the full pipeline (hash resolution, header,
+//!   witness, block, contracts). The witness stage gets a tighter sub-deadline for blocks at or
+//!   below the local tip. No more nested `tokio::time::timeout` wrappers.
 //! - **Contract bytecode resolution**: checks [`ContractCache`] (memory → redb), falls back to a
-//!   parallel + verified `RpcClient::get_codes` fetch on miss.
+//!   parallel + verified `RpcClient::get_codes_with_deadline` fetch on miss.
 //!
 //! # Note
 //! Response caching is handled at the HTTP layer by `ResponseCache`, not here.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy_primitives::B256;
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
 use dashmap::DashMap;
 use eyre::Result;
+use futures::{FutureExt, future::Shared};
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
-use stateless_common::{RpcClient, estimate_witness_size};
+use stateless_common::{
+    CodeFetchError, GetTxByHashError, RpcClient, RpcDeadlineExceeded, estimate_witness_size,
+};
 use stateless_core::{
     BlockStore, ContractStore, LightWitness, StoreResult, db::StoreError, withdrawals::MptWitness,
 };
 use stateless_db::ContractCache;
-use tokio::sync::broadcast;
 use tracing::{debug, instrument, trace, warn};
 
 use crate::metrics::{
@@ -64,123 +74,118 @@ pub struct BlockData {
 
 /// Default timeout for a user-facing witness fetch in seconds (8 seconds).
 ///
-/// Caps how long `fetch_witness_with_fallback` will wait for the RPC client's internal
-/// round-level retry loop to produce a witness. A user's trace/debug RPC request times out
-/// with an error if this elapses.
+/// Applied as a sub-deadline on top of the outer block-fetch deadline: the witness stage
+/// gets `min(block_deadline, now + witness_timeout)`. Covers the "block is near the tip and
+/// the witness is still being generated upstream" case where a few seconds of waiting is
+/// normal.
 pub const DEFAULT_WITNESS_TIMEOUT_SECS: u64 = 8;
 
-/// Default timeout for the full block-fetch pipeline (header + witness + block + contracts)
+/// Default deadline for the full block-fetch pipeline (header + witness + block + contracts)
 /// in seconds (13 seconds).
 ///
-/// Caps how long a user-facing trace/debug request waits on `RpcClient`'s unbounded
-/// round-robin + exponential backoff retry loop. Without this, a request for a block that
-/// doesn't exist upstream (e.g. a future block number, or a mistyped hash) would hang
-/// indefinitely, holding a concurrency permit. Sits between the 4th retry's max-jitter
-/// sleep completion (~11.25 s — cumulative 500 ms → 1 s → 2 s → 4 s with jitter) and the
-/// 5th retry's min-jitter sleep completion (~15.5 s), so ~4 backoff rounds run before the
-/// timeout fires. Stays above `DEFAULT_WITNESS_TIMEOUT_SECS` so the inner witness timeout
-/// still fires first for legitimate near-tip witness-generation waits.
-///
-/// **Note on the number-lookup path.** [`DataProvider::get_block_data`] (by number) applies
-/// this timeout twice on the RPC path: once around `get_block_hash(num)` to resolve the
-/// hash, then again around the full pipeline inside `get_block_data_by_hash`. Worst-case
-/// wall-clock budget there is `2 × block_fetch_timeout`. The hash-keyed entry point
-/// [`DataProvider::get_block_data_by_hash`] applies it once.
+/// The RPC client's retry loop is deadline-aware: `RpcClient::*_with_deadline` methods return
+/// [`RpcDeadlineExceeded`] once the deadline fires, so a request for a nonexistent block
+/// surfaces quickly instead of hanging. This is the full budget for one user-facing RPC
+/// request — every upstream fetch on the way to serving the response shares it.
 pub const DEFAULT_BLOCK_FETCH_TIMEOUT_SECS: u64 = 13;
 
 /// Slow stage threshold: any individual stage exceeding this triggers a warn log.
 pub(crate) const SLOW_STAGE_THRESHOLD_MS: u128 = 1000;
 
+/// Stage that ran out of time. Used only to label the typed `Timeout` error below.
+#[derive(Debug, Clone, Copy)]
+pub enum TimeoutStage {
+    /// A witness fetch (`mega_getBlockWitness`) exceeded its stage or call deadline.
+    Witness,
+    /// The block-fetch pipeline as a whole exceeded its deadline.
+    Block,
+}
+
+impl std::fmt::Display for TimeoutStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            TimeoutStage::Witness => "witness",
+            TimeoutStage::Block => "block",
+        })
+    }
+}
+
 /// Errors returned by [`DataProvider`]'s user-facing fetch methods.
 ///
 /// The enum classifies up-front so the RPC layer can map variants to JSON-RPC error codes
 /// without string-matching. `Internal` is the catch-all for transport / decode / DB errors;
-/// everything else is a deterministic "not found" or a timeout caused by `RpcClient`'s
-/// unbounded retry loop.
+/// everything else is a deterministic "not found" or a deadline-exceeded signal caused by
+/// `RpcClient`'s retry loop running out of time.
 #[derive(Debug, thiserror::Error)]
 pub enum DataProviderError {
     #[error("transaction {0} not found")]
     TransactionNotFound(B256),
     #[error("transaction {0} is pending")]
     TransactionPending(B256),
-    #[error("witness fetch timed out after {0:?}")]
-    WitnessTimeout(Duration),
-    #[error("block fetch timed out after {0:?}")]
-    BlockFetchTimeout(Duration),
+    #[error("{stage} fetch exceeded deadline after {elapsed:?}")]
+    Timeout { stage: TimeoutStage, elapsed: Duration },
     #[error(transparent)]
     Internal(#[from] eyre::Error),
 }
 
-impl DataProviderError {
-    /// Converts into a JSON-RPC error. Everything that could plausibly be a client mistake
-    /// (tx / pending / timeouts while `RpcClient`'s unbounded retry loop can't satisfy the
-    /// request) maps to `-32001 resource not found` so operators see a consistent response
-    /// for the hot-path "block doesn't exist upstream" and "upstream is slow" cases.
-    /// Genuine internal failures fall through to `-32000`.
-    pub fn to_rpc_error(&self) -> jsonrpsee::types::ErrorObjectOwned {
-        use jsonrpsee::types::ErrorObjectOwned;
-        const NOT_FOUND: i32 = -32001;
-        const INTERNAL: i32 = -32000;
-        match self {
-            DataProviderError::TransactionNotFound(_) |
-            DataProviderError::TransactionPending(_) |
-            DataProviderError::WitnessTimeout(_) |
-            DataProviderError::BlockFetchTimeout(_) => {
-                ErrorObjectOwned::owned(NOT_FOUND, self.to_string(), None::<()>)
-            }
-            DataProviderError::Internal(_) => {
-                ErrorObjectOwned::owned(INTERNAL, "internal error".to_string(), None::<()>)
+impl From<RpcDeadlineExceeded> for DataProviderError {
+    fn from(e: RpcDeadlineExceeded) -> Self {
+        // Choose a stage label based on the RPC method: witness fetches produce a Witness
+        // timeout, everything else (header/block/code) falls under the block-pipeline bucket.
+        let stage = match e.method {
+            stateless_common::RpcMethod::MegaGetBlockWitness => TimeoutStage::Witness,
+            _ => TimeoutStage::Block,
+        };
+        DataProviderError::Timeout { stage, elapsed: e.elapsed }
+    }
+}
+
+impl From<CodeFetchError> for DataProviderError {
+    fn from(e: CodeFetchError) -> Self {
+        match e {
+            CodeFetchError::Deadline(d) => d.into(),
+            CodeFetchError::VerificationFailure { .. } => {
+                DataProviderError::Internal(eyre::eyre!("{e}"))
             }
         }
+    }
+}
+
+impl From<GetTxByHashError> for DataProviderError {
+    fn from(e: GetTxByHashError) -> Self {
+        match e {
+            GetTxByHashError::Deadline(d) => d.into(),
+        }
+    }
+}
+
+impl From<StoreError> for DataProviderError {
+    fn from(e: StoreError) -> Self {
+        // Any `StoreError` surfacing at this layer is an internal persistence issue, not a
+        // user-facing "not found" — the `MissingData` fall-through happens upstream of here.
+        DataProviderError::Internal(eyre::eyre!(e))
     }
 }
 
 /// Result alias for [`DataProvider`] fetch methods.
 pub type DataProviderResult<T> = std::result::Result<T, DataProviderError>;
 
-/// Broadcast sender type for single-flight request pattern.
-/// Used to notify all waiters when a block fetch completes.
+/// Outcome of the shared block-data fetch. `Arc` on both sides makes the result `Clone`
+/// so `Shared` can hand a copy to every coalesced waiter.
+type BlockDataOutcome = std::result::Result<Arc<BlockData>, Arc<DataProviderError>>;
+
+/// The fetch future as a `'static + Send` trait object — required to store it in
+/// [`futures::future::Shared`], which can't work with borrowed futures.
+type BlockDataFetchFuture = Pin<Box<dyn Future<Output = BlockDataOutcome> + Send>>;
+
+/// Shared in-flight future for the single-flight pattern.
 ///
-/// `Arc<BlockData>` rather than `BlockData` so coalesced waiters share one allocation
-/// — the value carries a full block, witness, and contract map.
-type InFlightSender = broadcast::Sender<Result<Arc<BlockData>, String>>;
-
-/// RAII cleanup guard for the single-flight `in_flight` map.
-///
-/// On a normal path, [`fetch_block_data_single_flight`] does an explicit
-/// `remove-before-send` (see the block comment there for why order matters) and
-/// calls [`Self::disarm`] so this guard becomes a no-op. On any early exit —
-/// panic in the fetch future, `.await` cancellation, etc. — the guard fires and
-/// removes the stale entry so future callers for the same block hash don't
-/// subscribe to a dead broadcast sender.
-///
-/// [`fetch_block_data_single_flight`]: DataProvider::fetch_block_data_single_flight
-struct InFlightGuard<'a> {
-    map: &'a DashMap<B256, InFlightSender>,
-    key: B256,
-    armed: bool,
-}
-
-impl<'a> InFlightGuard<'a> {
-    fn new(map: &'a DashMap<B256, InFlightSender>, key: B256) -> Self {
-        Self { map, key, armed: true }
-    }
-
-    /// Consumes the guard without removing the entry. Call after an explicit
-    /// `map.remove(&key)` on the happy path.
-    fn disarm(mut self) {
-        self.armed = false;
-        // `self` drops here; `Drop::drop` sees `armed = false` and is a no-op.
-    }
-}
-
-impl Drop for InFlightGuard<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.map.remove(&self.key);
-        }
-    }
-}
+/// Stored in the `in_flight` map so concurrent callers for the same block hash share one
+/// fetch. [`Shared`] hands each waker a clone of the outcome — we use `Arc<BlockData>` for
+/// success (refcount bump, not deep clone) and `Arc<DataProviderError>` for failure (errors
+/// aren't `Clone`). Only the primary task drives the inner future; waiters are parked on its
+/// waker. If the primary is cancelled, any remaining waiter keeps polling it to completion.
+type BlockDataFuture = Shared<BlockDataFetchFuture>;
 
 /// Data provider with single-flight request coalescing.
 ///
@@ -202,14 +207,20 @@ pub(crate) struct DataProvider {
     /// repeated trace requests for the same contract hit memory instead of
     /// redb (slow) or RPC (slowest).
     contract_cache: Arc<ContractCache>,
-    /// User-facing cap on witness fetches (the RPC client retries internally).
+    /// Sub-deadline applied to the witness stage only. The full-call deadline still
+    /// dominates; this caps how long the witness fetch can burn out of that budget.
     witness_timeout: Duration,
-    /// User-facing cap on the full block-fetch pipeline (including witness, block, contracts).
-    /// Bounds `RpcClient`'s unbounded retry loop so deterministic "not found" errors surface
-    /// instead of hanging the caller and holding a concurrency permit.
+    /// Wall-clock budget for one user-facing block-data call, from entry through
+    /// header + witness + block + contract resolution. The retry loop in `RpcClient`
+    /// checks this before each round and clamps its sleep accordingly, so a missing
+    /// block surfaces as a typed [`DataProviderError::Timeout`] rather than hanging.
     block_fetch_timeout: Duration,
-    /// In-flight requests map for single-flight pattern (keyed by block hash).
-    in_flight: DashMap<B256, InFlightSender>,
+    /// Single-flight coalescing map keyed by block hash.
+    ///
+    /// Concurrent RPC fetches for the same block share one [`Shared`] future, so the
+    /// hot path is a refcount bump. The map holds the shared future's handle for the
+    /// duration of the fetch; the primary task removes it after `.await` completes.
+    in_flight: DashMap<B256, BlockDataFuture>,
 }
 
 impl DataProvider {
@@ -242,56 +253,48 @@ impl DataProvider {
 
     /// Gets block data by block number.
     ///
-    /// Lookup order: local database -> RPC.
-    ///
-    /// # Arguments
-    /// * `block_num` - The block number to fetch
-    ///
-    /// # Returns
-    /// * `Ok(Arc<BlockData>)` - Block data including witness and contracts
-    /// * `Err(DataProviderError)` - Typed error variant describing the failure mode
+    /// Lookup order: local database -> RPC. A single wall-clock deadline (computed from
+    /// `block_fetch_timeout`) covers the entire call — resolving the hash from RPC, fetching
+    /// the block + witness, and resolving contract bytecodes all share this one budget.
     pub async fn get_block_data(&self, block_num: u64) -> DataProviderResult<Arc<BlockData>> {
-        // Try to get block hash from local database first
+        let deadline = Instant::now() + self.block_fetch_timeout;
+
+        // Try to get block hash from local database first.
         if let Some(db) = &self.db &&
             let Ok(Some(hash)) = db.get_block_hash(block_num)
         {
-            return self.get_block_data_by_hash(hash).await;
+            return self.get_block_data_by_hash_inner(hash, deadline).await;
         }
 
-        // Fall back to RPC. The underlying `get_block_hash` retries unbounded; bound it with
-        // `block_fetch_timeout` so a future/invalid block number surfaces as a typed timeout
-        // rather than hanging the caller.
-        let block_hash = tokio::time::timeout(
-            self.block_fetch_timeout,
-            self.rpc_client.get_block_hash(block_num),
-        )
-        .await
-        .map_err(|_| DataProviderError::BlockFetchTimeout(self.block_fetch_timeout))?;
-
-        self.get_block_data_by_hash(block_hash).await
+        // Fall back to RPC. The deadline carries through to `get_block_data_by_hash_inner` so
+        // there is only ONE budget shared across hash resolution + the full pipeline.
+        let block_hash =
+            self.rpc_client.get_block_hash_with_deadline(block_num, Some(deadline)).await?;
+        self.get_block_data_by_hash_inner(block_hash, deadline).await
     }
 
-    /// Gets block data by block hash with single-flight coalescing.
-    ///
-    /// Lookup order: local database -> RPC.
-    ///
-    /// # Arguments
-    /// * `block_hash` - The 32-byte block hash to fetch
-    ///
-    /// # Returns
-    /// * `Ok(Arc<BlockData>)` - Block data including witness and contracts
-    /// * `Err` - If the block cannot be fetched from any source
+    /// Gets block data by block hash with single-flight coalescing. One deadline for the
+    /// whole call; see [`Self::get_block_data`] for the semantics.
     pub async fn get_block_data_by_hash(
         &self,
         block_hash: B256,
     ) -> DataProviderResult<Arc<BlockData>> {
-        let start = std::time::Instant::now();
+        let deadline = Instant::now() + self.block_fetch_timeout;
+        self.get_block_data_by_hash_inner(block_hash, deadline).await
+    }
+
+    async fn get_block_data_by_hash_inner(
+        &self,
+        block_hash: B256,
+        deadline: Instant,
+    ) -> DataProviderResult<Arc<BlockData>> {
+        let start = Instant::now();
 
         // Try the local DB first. Only `MissingData` falls through to RPC silently —
         // real backend errors (redb I/O, decode corruption) must surface in the log,
         // even though we still fall through so the request isn't lost.
         if let Some(db) = &self.db {
-            match self.get_block_data_from_db(db.as_ref(), block_hash).await {
+            match self.get_block_data_from_db(db.as_ref(), block_hash, deadline).await {
                 Ok(data) => {
                     trace!(
                         block_hash = %block_hash,
@@ -325,7 +328,7 @@ impl DataProvider {
             source = "rpc",
             "Fetching block data from RPC"
         );
-        let data = self.fetch_block_data_by_hash_from_rpc(block_hash).await?;
+        let data = self.fetch_block_data_single_flight(block_hash, deadline).await?;
 
         trace!(
             block_hash = %block_hash,
@@ -338,33 +341,23 @@ impl DataProvider {
         Ok(data)
     }
 
-    /// Gets block data for a transaction by its hash.
-    ///
-    /// First fetches the transaction to find its containing block, then retrieves
-    /// the full block data. Returns both the block data and the transaction's index
-    /// within the block (needed for replaying preceding transactions).
-    ///
-    /// # Arguments
-    /// * `tx_hash` - The transaction hash to look up
-    ///
-    /// # Returns
-    /// * `Ok((Arc<BlockData>, usize))` - Block data and transaction index
-    /// * `Err` - If transaction not found or is still pending
+    /// Gets block data for a transaction by its hash. A single deadline covers the transaction
+    /// lookup and the subsequent block-data fetch.
     #[instrument(skip(self), name = "get_block_data_for_tx", fields(tx_hash = %tx_hash))]
     pub async fn get_block_data_for_tx(
         &self,
         tx_hash: B256,
     ) -> DataProviderResult<(Arc<BlockData>, usize)> {
         trace!(tx_hash = %tx_hash, "Looking up transaction");
+        let deadline = Instant::now() + self.block_fetch_timeout;
 
-        // Fetch the transaction to find its block. `RpcClient::call` is infallible (retries
-        // forever on transport errors), so the only way `get_transaction_by_hash` returns `Err`
-        // is the "tx exists but has no block_hash" pending path — classify it explicitly so
-        // `trace_parity_transaction` returns `null` instead of `-32000 internal error`.
+        // Fetch the transaction to find its block. The outer result is `Err(Deadline)`; the
+        // inner is `Err` for "tx exists but has no block_hash" (pending) — classify explicitly
+        // so `trace_parity_transaction` returns `null` instead of `-32000 internal error`.
         let (tx, block_hash) = self
             .rpc_client
-            .get_transaction_by_hash(tx_hash)
-            .await
+            .get_transaction_by_hash_with_deadline(tx_hash, Some(deadline))
+            .await?
             .map_err(|_| DataProviderError::TransactionPending(tx_hash))?
             .ok_or(DataProviderError::TransactionNotFound(tx_hash))?;
 
@@ -378,27 +371,14 @@ impl DataProvider {
             "Transaction located in block"
         );
 
-        // Get block data
-        let data = self.get_block_data_by_hash(block_hash).await?;
-
+        let data = self.get_block_data_by_hash_inner(block_hash, deadline).await?;
         Ok((data, tx_index))
     }
 
-    /// Resolves a block tag to a concrete block number.
-    ///
-    /// Supports all standard block tags:
-    /// - `Number(n)` - Returns the number directly
-    /// - `Latest` - Returns the latest block number
-    /// - `Earliest` - Returns 0 (genesis block)
-    /// - `Pending` - Returns error "Pending block not supported" (consistent with mega-reth)
-    /// - `Finalized` / `Safe` - Fetches the block from upstream RPC and extracts the number
-    ///
-    /// # Arguments
-    /// * `tag` - Block number or tag (e.g., "latest", specific number)
-    ///
-    /// # Returns
-    /// * `Ok(u64)` - The resolved block number
-    /// * `Err` - If the tag is unsupported or RPC call fails
+    /// Resolves a block tag to a concrete block number. Not bounded by the pipeline deadline
+    /// since the RPC handler calls this before deciding whether to hit the cache or fall
+    /// through to `get_block_data` — doing cache lookups under a shared deadline would make
+    /// cache hits fail when upstream is down, which is the opposite of what we want.
     pub async fn resolve_block_number(&self, tag: BlockNumberOrTag) -> Result<u64> {
         match tag {
             BlockNumberOrTag::Number(n) => Ok(n),
@@ -424,27 +404,30 @@ impl DataProvider {
     }
 
     /// Gets block data from the local database using LightWitness.
+    ///
+    /// Takes the shared `deadline` so contract resolution (which can hit RPC on cache miss)
+    /// respects the same budget as the rest of the call.
     async fn get_block_data_from_db(
         &self,
         db: &dyn BlockStore,
         block_hash: alloy_primitives::BlockHash,
+        deadline: Instant,
     ) -> Result<BlockData> {
-        let overall_start = std::time::Instant::now();
+        let overall_start = Instant::now();
 
-        // Get block data from database using light witness (fast deserialization)
-        let start = std::time::Instant::now();
+        // Get block data from database using light witness (fast deserialization).
+        let start = Instant::now();
         let (block, witness) = db.get_block_and_witness(block_hash)?;
         let db_read_secs = start.elapsed().as_secs_f64();
         let db_read_ms = start.elapsed().as_millis();
 
-        // Record DB read duration metric
         ChainSyncMetrics::create().record_db_read(db_read_secs);
 
-        // Extract code hashes and get contracts
-        let start = std::time::Instant::now();
+        // Extract code hashes and get contracts.
+        let start = Instant::now();
         let code_hashes = crate::tracing_executor::extract_code_hashes(&witness);
         let num_contracts = code_hashes.len();
-        let contracts = self.resolve_contracts(&code_hashes).await?;
+        let contracts = self.resolve_contracts(&code_hashes, deadline).await?;
         let fetch_contracts_ms = start.elapsed().as_millis();
 
         let total_ms = overall_start.elapsed().as_millis();
@@ -465,307 +448,290 @@ impl DataProvider {
         Ok(BlockData { block, witness, contracts })
     }
 
-    /// Fetches block data from RPC by block hash with single-flight coalescing.
-    async fn fetch_block_data_by_hash_from_rpc(
-        &self,
-        block_hash: B256,
-    ) -> DataProviderResult<Arc<BlockData>> {
-        self.fetch_block_data_single_flight(block_hash).await
-    }
-
-    /// Single-flight fetch: ensures only one RPC call per block hash.
-    ///
-    /// When multiple requests arrive for the same block simultaneously:
-    /// 1. First request creates a broadcast channel and starts the fetch
-    /// 2. Subsequent requests subscribe to the channel and wait
-    /// 3. When fetch completes, result is broadcast to all waiters
-    ///
-    /// This prevents redundant RPC calls and reduces upstream load.
+    /// Single-flight fetch via [`futures::future::Shared`]: concurrent callers for the same
+    /// block hash subscribe to one in-flight future. On completion the primary removes the
+    /// map entry; late arrivals racing the removal simply start a fresh fetch (rare, benign).
     async fn fetch_block_data_single_flight(
         &self,
         block_hash: B256,
+        deadline: Instant,
     ) -> DataProviderResult<Arc<BlockData>> {
-        // Atomic check-and-insert via `entry()` — a plain `get` + `insert` sequence would
-        // let two callers both observe "vacant" and each kick off their own RPC fetch.
-        // Coalesced waiters receive the outcome as a `String` (errors aren't Clone) and
-        // are mapped back to `DataProviderError::Internal` — the primary fetcher's
-        // variant-level classification still lands on its direct caller.
-        let tx = match self.in_flight.entry(block_hash) {
+        let shared = match self.in_flight.entry(block_hash) {
             dashmap::Entry::Occupied(occupied) => {
-                let mut receiver = occupied.get().subscribe();
+                let fut = occupied.get().clone();
                 drop(occupied);
                 SingleFlightMetrics::new_for_type("coalesced").record();
                 trace!(block_hash = %block_hash, "Joining existing in-flight request");
-                return receiver
-                    .recv()
-                    .await
-                    .map_err(|e| {
-                        DataProviderError::Internal(eyre::eyre!(
-                            "Failed to receive from in-flight request: {}",
-                            e
-                        ))
-                    })?
-                    .map_err(|e| DataProviderError::Internal(eyre::eyre!("{}", e)));
+                return shared_to_result(fut.await);
             }
             dashmap::Entry::Vacant(vacant) => {
-                let (tx, _) = broadcast::channel(1);
-                vacant.insert(tx.clone());
-                tx
+                // Build the owned future. `Arc::clone` the client so the future is `'static`
+                // (doesn't borrow `self`) — `Shared` requires `'static` futures.
+                let rpc_client = Arc::clone(&self.rpc_client);
+                let db = self.db.clone();
+                let contract_cache = Arc::clone(&self.contract_cache);
+                let witness_timeout = self.witness_timeout;
+                let fut: BlockDataFetchFuture = Box::pin(async move {
+                    do_fetch_block_data(
+                        rpc_client,
+                        db,
+                        contract_cache,
+                        witness_timeout,
+                        block_hash,
+                        deadline,
+                    )
+                    .await
+                    .map(Arc::new)
+                    .map_err(Arc::new)
+                });
+                let shared = fut.shared();
+                vacant.insert(shared.clone());
+                shared
             }
         };
         SingleFlightMetrics::new_for_type("new").record();
 
-        // RAII cleanup: if the fetch panics or is cancelled mid-flight, the guard
-        // removes the stale entry so future callers don't subscribe to a dead
-        // sender forever. On the normal path we disarm the guard after the
-        // explicit `remove-before-send` below.
-        let cleanup = InFlightGuard::new(&self.in_flight, block_hash);
+        trace!(block_hash = %block_hash, "Starting new block data fetch");
+        let result = shared.await;
 
-        trace!(
-            block_hash = %block_hash,
-            "Starting new block data fetch"
-        );
-
-        // Perform the actual fetch. Cap the whole pipeline (header + witness + block + contracts)
-        // with `block_fetch_timeout` so a deterministic upstream "not found" can't hang forever in
-        // `RpcClient`'s unbounded round-robin retry loop. The inner `witness_timeout` still
-        // applies to the witness stage specifically; this outer bound covers the header/block/
-        // contract stages which have no inner timeout of their own.
-        let result: DataProviderResult<Arc<BlockData>> = match tokio::time::timeout(
-            self.block_fetch_timeout,
-            self.do_fetch_block_data(block_hash),
-        )
-        .await
-        {
-            Ok(r) => r.map(Arc::new),
-            Err(_) => Err(DataProviderError::BlockFetchTimeout(self.block_fetch_timeout)),
-        };
-
-        // Clone is an Arc refcount bump; `DataProviderError` is not Clone so errors
-        // are stringified for coalesced waiters (they'll see `Internal(eyre::Error)`).
-        let broadcast_result = result.as_ref().map(Arc::clone).map_err(|e| e.to_string());
-
-        // Remove BEFORE send. `broadcast::Receiver` cursors set in `subscribe()` are
-        // positioned at the channel's current tail — a subscriber that calls `subscribe()`
-        // after `send()` misses the value and receives `RecvError::Closed` when the last
-        // sender drops. Removing first means any late arrival in the tiny `[remove, send]`
-        // window sees `Vacant` and starts its own fetch (acceptable duplicate; window is
-        // a few instructions). Prior subscribers (captured before `remove`) still receive
-        // the value because their cursors were established before the send.
+        // Primary cleans up after the fetch resolves. Late arrivals in the tiny window between
+        // our `.await` returning and `.remove(&block_hash)` will start their own fetch — that's
+        // a benign duplicate, same acceptable-race semantics as the prior broadcast design.
         self.in_flight.remove(&block_hash);
-        cleanup.disarm();
-        let _ = tx.send(broadcast_result);
 
-        result
-    }
-
-    /// Actually fetches block data from RPC (called by single-flight).
-    ///
-    /// Performs the complete fetch sequence:
-    /// 1. Fetch block header (without transactions) to get block number
-    /// 2. Fetch witness and full block in parallel
-    /// 3. Convert SaltWitness to LightWitness
-    /// 4. Extract code hashes from witness and fetch contract bytecodes
-    async fn do_fetch_block_data(&self, block_hash: B256) -> DataProviderResult<BlockData> {
-        let overall_start = std::time::Instant::now();
-        // Per-attempt upstream RPC metrics (requests_total / errors_total / duration) are
-        // now recorded inside `RpcClient::round_robin_with_backoff` via the
-        // `TraceRpcMetrics` adapter wired at startup. The outer callers here used to record
-        // one-shot "(true, cumulative_time)" entries which were always success under the
-        // unbounded-retry design — see data_provider.rs history prior to the RpcMetrics
-        // wiring for context.
-
-        // Step 1: Fetch header first to get the block number
-        let start = std::time::Instant::now();
-        let header = self.rpc_client.get_header(BlockId::Hash(block_hash.into()), false).await;
-        let block_number = header.number;
-        let fetch_header_ms = start.elapsed().as_millis();
-
-        // Step 2: Fetch witness and full block in parallel, timing each independently
-        let (witness_timed, block_timed) = tokio::join!(
-            async {
-                let start = std::time::Instant::now();
-                let result = self.fetch_witness_with_timeout(block_number, header.hash).await;
-                (result, start.elapsed())
-            },
-            async {
-                let start = std::time::Instant::now();
-                let result =
-                    self.rpc_client.get_block(BlockId::Hash(block_hash.into()), true).await;
-                (result, start.elapsed())
-            },
-        );
-
-        let (witness_result, witness_elapsed) = witness_timed;
-        let (block, block_elapsed) = block_timed;
-
-        let fetch_witness_ms = witness_elapsed.as_millis();
-        let (salt_witness, _mpt_witness) = witness_result?;
-
-        let fetch_full_block_ms = block_elapsed.as_millis();
-
-        // Step 3: Convert SaltWitness to LightWitness
-        let start = std::time::Instant::now();
-        let witness = LightWitness::from(&salt_witness);
-        let convert_witness_ms = start.elapsed().as_millis();
-
-        // Step 4: Extract code hashes and fetch contracts
-        let start = std::time::Instant::now();
-        let code_hashes = crate::tracing_executor::extract_code_hashes(&witness);
-        let num_contracts = code_hashes.len();
-        let contracts = self.resolve_contracts(&code_hashes).await?;
-        let fetch_contracts_ms = start.elapsed().as_millis();
-
-        let total_ms = overall_start.elapsed().as_millis();
-
-        if fetch_header_ms >= SLOW_STAGE_THRESHOLD_MS ||
-            fetch_witness_ms >= SLOW_STAGE_THRESHOLD_MS ||
-            convert_witness_ms >= SLOW_STAGE_THRESHOLD_MS ||
-            fetch_full_block_ms >= SLOW_STAGE_THRESHOLD_MS ||
-            fetch_contracts_ms >= SLOW_STAGE_THRESHOLD_MS
-        {
-            warn!(
-                block_number,
-                block_hash = %block_hash,
-                tx_count = block.transactions.len(),
-                num_contracts,
-                fetch_header_ms = fetch_header_ms as u64,
-                fetch_witness_ms = fetch_witness_ms as u64,
-                convert_witness_ms = convert_witness_ms as u64,
-                fetch_full_block_ms = fetch_full_block_ms as u64,
-                fetch_contracts_ms = fetch_contracts_ms as u64,
-                total_ms = total_ms as u64,
-                "do_fetch_block_data slow stages detected"
-            );
-        }
-
-        Ok(BlockData { block, witness, contracts })
-    }
-
-    /// Fetches witness data with a user-facing timeout.
-    ///
-    /// The underlying `RpcClient::get_witness` retries transient failures forever internally;
-    /// this wrapper imposes a time bound so a user-facing RPC request never hangs. On timeout
-    /// the caller receives a typed [`DataProviderError::WitnessTimeout`].
-    ///
-    /// The timeout is selected based on whether the block is ahead of the local tip:
-    ///
-    /// - **New block** (above local tip or no local DB): full [`Self::witness_timeout`] applies.
-    ///   This covers the "block is fresh and the witness is still being generated upstream" case
-    ///   where a few seconds of waiting is normal.
-    /// - **Old / pruned block** (at or below local tip): the shorter `OLD_BLOCK_WITNESS_TIMEOUT`
-    ///   caps the wait. Witness data for such blocks is either available immediately or not at all;
-    ///   because `get_witness` retries transient errors forever, the tight cap ensures a
-    ///   pruned-block `debug_traceBlock*` returns quickly instead of burning the full
-    ///   `witness_timeout`.
-    async fn fetch_witness_with_timeout(
-        &self,
-        block_number: u64,
-        block_hash: B256,
-    ) -> DataProviderResult<(SaltWitness, MptWitness)> {
-        /// Cap on witness fetches for blocks at or below the local tip (pruned / old
-        /// upstream blocks). Tighter than [`Self::witness_timeout`] because the upstream
-        /// retry loop never terminates on errors — without this bound a pruned-block
-        /// trace request would wait the full `witness_timeout` before returning.
-        ///
-        /// Sized against the default [`BackoffPolicy`](stateless_common::BackoffPolicy)
-        /// (`initial = 500 ms`, 2× doubling): 500 ms + 1 s + 2 s ≈ 3.5 s, so 3 s lets
-        /// every provider be probed across ~2–3 rounds before we fail. If the policy
-        /// defaults change, revisit this value so the cap still allows at least one
-        /// full round of probes.
-        const OLD_BLOCK_WITNESS_TIMEOUT: Duration = Duration::from_secs(3);
-
-        let db_max_height = self
-            .db
-            .as_ref()
-            .and_then(|db| db.get_canonical_tip().ok().flatten().map(|tip| tip.block_number));
-        let is_new_block = db_max_height.is_none_or(|max| block_number > max);
-        let effective_timeout = if is_new_block {
-            self.witness_timeout
-        } else {
-            self.witness_timeout.min(OLD_BLOCK_WITNESS_TIMEOUT)
-        };
-        trace!(
-            block_number,
-            db_max_height,
-            is_new_block,
-            timeout_ms = effective_timeout.as_millis() as u64,
-            "Fetching witness",
-        );
-
-        let wg_metrics = WitnessSourceMetrics::new_for_source("witness_generator");
-        let start = std::time::Instant::now();
-
-        let result = tokio::time::timeout(
-            effective_timeout,
-            self.rpc_client.get_witness(block_number, block_hash),
-        )
-        .await;
-
-        match result {
-            Ok(w) => {
-                wg_metrics.record_request(true, start.elapsed().as_secs_f64());
-                wg_metrics.record_size(estimate_witness_size(&w.0, &w.1));
-                DataSourceMetrics::new_for_source("witness_generator").record();
-                Ok(w)
-            }
-            Err(_) => {
-                wg_metrics.record_request(false, start.elapsed().as_secs_f64());
-                warn!(
-                    block_number,
-                    block_hash = %block_hash,
-                    timeout_ms = effective_timeout.as_millis() as u64,
-                    is_new_block,
-                    "Witness fetch timeout",
-                );
-                Err(DataProviderError::WitnessTimeout(effective_timeout))
-            }
-        }
+        shared_to_result(result)
     }
 
     /// Resolves contract bytecodes via the three-tier cache chain:
     /// memory (`ContractCache`) → persistent store (`ServerDB` in local-cache mode,
     /// [`NoopContractStore`] in stateless mode) → upstream RPC.
     ///
-    /// The RPC tier goes through `RpcClient::get_codes(..., verify=true)` — parallel
-    /// fetch plus hash verification in one place. Entries promoted through the cache
-    /// are trusted on subsequent hits (no re-verification).
+    /// The RPC tier goes through `RpcClient::get_codes_with_deadline(.., verify=true, deadline)`
+    /// — parallel fetch plus hash verification sharing the caller's deadline. Entries promoted
+    /// through the cache are trusted on subsequent hits (no re-verification).
     async fn resolve_contracts(
         &self,
         code_hashes: &[B256],
-    ) -> Result<HashMap<B256, Arc<Bytecode>>> {
-        let (mut contracts, missing) = self.contract_cache.get(code_hashes)?;
-
-        if missing.is_empty() {
-            return Ok(contracts);
-        }
-
-        trace!(
-            total = code_hashes.len(),
-            from_cache = contracts.len(),
-            missing = missing.len(),
-            "Cache miss — fetching contracts from RPC"
-        );
-
-        // Per-attempt `eth_getCodeByHash` metrics land on `UpstreamMetrics` via the
-        // `TraceRpcMetrics` adapter inside `round_robin_with_backoff`. Recording
-        // another `(result.is_ok(), ...)` here on the same label would double-count the
-        // per-hash attempts. A batch-level `CodeFetchError::VerificationFailure` is
-        // rare (signals a bad upstream / bad witness); if we need a dedicated metric
-        // for it, add a new counter rather than reusing the per-attempt histogram.
-        let fetched = self.rpc_client.get_codes(&missing, true).await?;
-
-        let new_contracts: Vec<(B256, Arc<Bytecode>)> = fetched.into_iter().collect();
-
-        // Write-through: memory always, disk in local-cache mode.
-        // We don't fail the trace on cache-insert errors; the request has already been served.
-        if let Err(e) = self.contract_cache.insert(&new_contracts) {
-            warn!(error = %e, count = new_contracts.len(), "Failed to persist fetched contracts to cache");
-        }
-
-        contracts.extend(new_contracts);
-        Ok(contracts)
+        deadline: Instant,
+    ) -> DataProviderResult<HashMap<B256, Arc<Bytecode>>> {
+        resolve_contracts_inner(&self.rpc_client, &self.contract_cache, code_hashes, deadline).await
     }
+}
+
+/// Unwraps a `Result<Arc<BlockData>, Arc<DataProviderError>>` (the output type of the shared
+/// future) into the owned `DataProviderResult<Arc<BlockData>>` callers expect.
+///
+/// The inner `Arc<DataProviderError>` would block `?` at the call site because `DataProviderError`
+/// isn't `Clone`; we repackage as `Internal(eyre::Error)` carrying the same display text. The
+/// primary caller that owns the fetch sees the original error directly — only coalesced waiters
+/// hit this fallback. This is the only per-call-cost of switching from per-variant broadcast
+/// to `Shared`, and keeps the existing "coalesced waiter sees Internal" contract.
+fn shared_to_result(
+    r: std::result::Result<Arc<BlockData>, Arc<DataProviderError>>,
+) -> DataProviderResult<Arc<BlockData>> {
+    match r {
+        Ok(data) => Ok(data),
+        Err(e) => Err(DataProviderError::Internal(eyre::eyre!("{e}"))),
+    }
+}
+
+/// Free function version of the fetch pipeline so it can be `.shared()` without borrowing `self`.
+///
+/// Performs the complete RPC fetch sequence:
+/// 1. Fetch block header (without transactions) to get the block number.
+/// 2. Fetch witness and full block in parallel, each subject to the shared `deadline`. The witness
+///    stage also gets a sub-deadline: `min(deadline, now + witness_timeout)`, tightened further for
+///    old blocks (see `witness_deadline_for`).
+/// 3. Convert SaltWitness to LightWitness.
+/// 4. Extract code hashes from witness and fetch contract bytecodes (shares `deadline`).
+async fn do_fetch_block_data(
+    rpc_client: Arc<RpcClient>,
+    db: Option<Arc<dyn BlockStore>>,
+    contract_cache: Arc<ContractCache>,
+    witness_timeout: Duration,
+    block_hash: B256,
+    deadline: Instant,
+) -> DataProviderResult<BlockData> {
+    let overall_start = Instant::now();
+
+    // Step 1: Fetch header first to get the block number.
+    let start = Instant::now();
+    let header = rpc_client
+        .get_header_with_deadline(BlockId::Hash(block_hash.into()), false, Some(deadline))
+        .await?;
+    let block_number = header.number;
+    let fetch_header_ms = start.elapsed().as_millis();
+
+    // Step 2: Pick the witness deadline based on "new vs old" heuristic, then run witness
+    // and full-block fetches in parallel.
+    let witness_deadline =
+        witness_deadline_for(db.as_deref(), block_number, witness_timeout, deadline);
+    let (witness_timed, block_timed) = tokio::join!(
+        async {
+            let start = Instant::now();
+            let result =
+                fetch_witness(&rpc_client, block_number, header.hash, witness_deadline).await;
+            (result, start.elapsed())
+        },
+        async {
+            let start = Instant::now();
+            let result = rpc_client
+                .get_block_with_deadline(BlockId::Hash(block_hash.into()), true, Some(deadline))
+                .await
+                .map_err(DataProviderError::from);
+            (result, start.elapsed())
+        },
+    );
+
+    let (witness_result, witness_elapsed) = witness_timed;
+    let (block_result, block_elapsed) = block_timed;
+
+    let fetch_witness_ms = witness_elapsed.as_millis();
+    let (salt_witness, _mpt_witness) = witness_result?;
+    let block = block_result?;
+    let fetch_full_block_ms = block_elapsed.as_millis();
+
+    // Step 3: Convert SaltWitness to LightWitness.
+    let start = Instant::now();
+    let witness = LightWitness::from(&salt_witness);
+    let convert_witness_ms = start.elapsed().as_millis();
+
+    // Step 4: Extract code hashes and fetch contracts.
+    let start = Instant::now();
+    let code_hashes = crate::tracing_executor::extract_code_hashes(&witness);
+    let num_contracts = code_hashes.len();
+    let contracts =
+        resolve_contracts_inner(&rpc_client, &contract_cache, &code_hashes, deadline).await?;
+    let fetch_contracts_ms = start.elapsed().as_millis();
+
+    let total_ms = overall_start.elapsed().as_millis();
+
+    if fetch_header_ms >= SLOW_STAGE_THRESHOLD_MS ||
+        fetch_witness_ms >= SLOW_STAGE_THRESHOLD_MS ||
+        convert_witness_ms >= SLOW_STAGE_THRESHOLD_MS ||
+        fetch_full_block_ms >= SLOW_STAGE_THRESHOLD_MS ||
+        fetch_contracts_ms >= SLOW_STAGE_THRESHOLD_MS
+    {
+        warn!(
+            block_number,
+            block_hash = %block_hash,
+            tx_count = block.transactions.len(),
+            num_contracts,
+            fetch_header_ms = fetch_header_ms as u64,
+            fetch_witness_ms = fetch_witness_ms as u64,
+            convert_witness_ms = convert_witness_ms as u64,
+            fetch_full_block_ms = fetch_full_block_ms as u64,
+            fetch_contracts_ms = fetch_contracts_ms as u64,
+            total_ms = total_ms as u64,
+            "do_fetch_block_data slow stages detected"
+        );
+    }
+
+    Ok(BlockData { block, witness, contracts })
+}
+
+/// Picks the effective deadline for a witness fetch.
+///
+/// - **New block** (above local tip or no local DB): full `witness_timeout` sub-deadline, clamped
+///   by the outer call deadline. Covers "witness still being generated upstream".
+/// - **Old / pruned block** (at or below local tip): tightened to `OLD_BLOCK_WITNESS_TIMEOUT` (≤
+///   witness_timeout) because witness data for such blocks is either available immediately or not
+///   at all; burning the full witness_timeout on a pruned block is a bad tradeoff.
+fn witness_deadline_for(
+    db: Option<&dyn BlockStore>,
+    block_number: u64,
+    witness_timeout: Duration,
+    outer_deadline: Instant,
+) -> Instant {
+    /// Cap on witness fetches for blocks at or below the local tip.
+    ///
+    /// Sized against the default [`BackoffPolicy`](stateless_common::BackoffPolicy)
+    /// (`initial = 500 ms`, 2× doubling): 500 ms + 1 s + 2 s ≈ 3.5 s, so 3 s lets
+    /// every provider be probed across ~2–3 rounds before we fail.
+    const OLD_BLOCK_WITNESS_TIMEOUT: Duration = Duration::from_secs(3);
+
+    let db_max_height =
+        db.and_then(|db| db.get_canonical_tip().ok().flatten().map(|tip| tip.block_number));
+    let is_new_block = db_max_height.is_none_or(|max| block_number > max);
+    let budget =
+        if is_new_block { witness_timeout } else { witness_timeout.min(OLD_BLOCK_WITNESS_TIMEOUT) };
+    let stage_deadline = Instant::now() + budget;
+    trace!(
+        block_number,
+        db_max_height,
+        is_new_block,
+        budget_ms = budget.as_millis() as u64,
+        "Computed witness stage deadline",
+    );
+    stage_deadline.min(outer_deadline)
+}
+
+/// Fetches witness data via the deadline-aware `RpcClient` API. The `deadline` is the
+/// witness stage's effective deadline (see [`witness_deadline_for`]).
+async fn fetch_witness(
+    rpc_client: &RpcClient,
+    block_number: u64,
+    block_hash: B256,
+    deadline: Instant,
+) -> DataProviderResult<(SaltWitness, MptWitness)> {
+    let wg_metrics = WitnessSourceMetrics::new_for_source("witness_generator");
+    let start = Instant::now();
+
+    match rpc_client.get_witness_with_deadline(block_number, block_hash, Some(deadline)).await {
+        Ok(w) => {
+            wg_metrics.record_request(true, start.elapsed().as_secs_f64());
+            wg_metrics.record_size(estimate_witness_size(&w.0, &w.1));
+            DataSourceMetrics::new_for_source("witness_generator").record();
+            Ok(w)
+        }
+        Err(e) => {
+            wg_metrics.record_request(false, start.elapsed().as_secs_f64());
+            warn!(
+                block_number,
+                block_hash = %block_hash,
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "Witness fetch deadline exceeded",
+            );
+            Err(e.into())
+        }
+    }
+}
+
+/// Free-function version of contract resolution so it can be called from the shared-future
+/// pipeline without borrowing `DataProvider`.
+async fn resolve_contracts_inner(
+    rpc_client: &RpcClient,
+    contract_cache: &ContractCache,
+    code_hashes: &[B256],
+    deadline: Instant,
+) -> DataProviderResult<HashMap<B256, Arc<Bytecode>>> {
+    let (mut contracts, missing) = contract_cache.get(code_hashes)?;
+
+    if missing.is_empty() {
+        return Ok(contracts);
+    }
+
+    trace!(
+        total = code_hashes.len(),
+        from_cache = contracts.len(),
+        missing = missing.len(),
+        "Cache miss — fetching contracts from RPC"
+    );
+
+    // Per-attempt `eth_getCodeByHash` metrics land on `UpstreamMetrics` via the
+    // `TraceRpcMetrics` adapter inside `round_robin_with_backoff`.
+    let fetched = rpc_client.get_codes_with_deadline(&missing, true, Some(deadline)).await?;
+
+    let new_contracts: Vec<(B256, Arc<Bytecode>)> = fetched.into_iter().collect();
+
+    // Write-through: memory always, disk in local-cache mode. We don't fail the trace on
+    // cache-insert errors; the request has already been served.
+    if let Err(e) = contract_cache.insert(&new_contracts) {
+        warn!(error = %e, count = new_contracts.len(), "Failed to persist fetched contracts to cache");
+    }
+
+    contracts.extend(new_contracts);
+    Ok(contracts)
 }
 
 /// In-memory-only [`ContractStore`] used as [`ContractCache`]'s backing store in
@@ -796,51 +762,20 @@ mod tests {
 
     use super::*;
 
-    /// Compile-time trait bounds + timeout constants. Collapses the former
-    /// `test_block_data_clone`, `test_in_flight_sender_type`, `test_data_provider_struct_fields`,
-    /// `test_default_witness_timeout`, and `test_duration_from_secs` into one test.
+    /// Compile-time trait bounds + timeout constants.
     #[test]
     fn type_bounds_and_timeout_constants() {
         fn _assert_clone<T: Clone + Send + Sync>() {}
         fn _assert_sync<T: Send + Sync>() {}
         // BlockData is intentionally not Clone — callers share it via `Arc<BlockData>`.
         _assert_sync::<BlockData>();
-        _assert_clone::<InFlightSender>();
         _assert_clone::<Arc<RpcClient>>();
         _assert_clone::<Option<Arc<dyn BlockStore>>>();
-        _assert_clone::<DashMap<B256, InFlightSender>>();
+        // `Shared` is `Clone` by design — that's the whole reason we use it here.
+        _assert_clone::<BlockDataFuture>();
 
         assert_eq!(DEFAULT_WITNESS_TIMEOUT_SECS, 8);
         assert_eq!(Duration::from_secs(DEFAULT_WITNESS_TIMEOUT_SECS).as_millis(), 8000);
-    }
-
-    /// Dropping an armed `InFlightGuard` removes the entry — the panic/cancellation path.
-    #[test]
-    fn inflight_guard_removes_entry_on_drop() {
-        let map: DashMap<B256, InFlightSender> = DashMap::new();
-        let key = B256::from([0x42; 32]);
-        let (tx, _) = broadcast::channel::<Result<Arc<BlockData>, String>>(1);
-        map.insert(key, tx);
-
-        {
-            let _guard = InFlightGuard::new(&map, key);
-            assert!(map.contains_key(&key), "entry present while guard is armed");
-        }
-        assert!(!map.contains_key(&key), "Drop must clear the entry on armed guard");
-    }
-
-    /// Disarming leaves the entry intact — the happy-path `remove-before-send` leaves the
-    /// caller responsible for the removal, and the guard becomes a no-op.
-    #[test]
-    fn inflight_guard_disarm_leaves_entry() {
-        let map: DashMap<B256, InFlightSender> = DashMap::new();
-        let key = B256::from([0x99; 32]);
-        let (tx, _) = broadcast::channel::<Result<Arc<BlockData>, String>>(1);
-        map.insert(key, tx);
-
-        let guard = InFlightGuard::new(&map, key);
-        guard.disarm();
-        assert!(map.contains_key(&key), "disarmed guard must not touch the map");
     }
 
     /// `BlockNumberOrTag` / `BlockId` variants that `resolve_block_number` matches on.
@@ -912,8 +847,8 @@ mod tests {
             Err(e) => e,
         };
         assert!(
-            matches!(err, DataProviderError::BlockFetchTimeout(_)),
-            "expected BlockFetchTimeout, got: {err:?}",
+            matches!(err, DataProviderError::Timeout { stage: TimeoutStage::Block, .. }),
+            "expected Timeout{{Block}}, got: {err:?}",
         );
         // Allow generous headroom for retry backoff + scheduling; ≤5s proves the unbounded loop
         // is actually bounded.
@@ -921,34 +856,6 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "timeout must fire quickly; elapsed: {elapsed:?}"
         );
-    }
-
-    /// Each `DataProviderError` variant maps to a specific JSON-RPC error code. Missing /
-    /// timeout cases must surface as `-32001` (resource not found); `Internal` falls through
-    /// to `-32000`. Replaces the ad-hoc string-matching classifiers in `rpc_service.rs`.
-    #[test]
-    fn data_provider_error_to_rpc_error_code_mapping() {
-        let tx_hash = B256::from([0x11; 32]);
-
-        let not_found_variants: [DataProviderError; 4] = [
-            DataProviderError::TransactionNotFound(tx_hash),
-            DataProviderError::TransactionPending(tx_hash),
-            DataProviderError::WitnessTimeout(Duration::from_secs(8)),
-            DataProviderError::BlockFetchTimeout(Duration::from_secs(13)),
-        ];
-
-        for variant in not_found_variants {
-            let err = variant.to_rpc_error();
-            assert_eq!(err.code(), -32001, "variant {variant:?} must map to resource-not-found");
-            // Display text surfaces in the RPC message — confirm it's non-empty and matches the
-            // variant's `#[error(..)]` string so operators see the same wording in both places.
-            assert_eq!(err.message(), variant.to_string().as_str());
-        }
-
-        let internal = DataProviderError::Internal(eyre::eyre!("boom"));
-        let err = internal.to_rpc_error();
-        assert_eq!(err.code(), -32000);
-        assert_eq!(err.message(), "internal error");
     }
 
     /// `eyre::Error` auto-converts into `DataProviderError::Internal` via `#[from]` so call
@@ -960,5 +867,29 @@ mod tests {
         }
         let err = boundary().unwrap_err();
         assert!(matches!(err, DataProviderError::Internal(_)));
+    }
+
+    /// `RpcDeadlineExceeded` from the witness stage lands on `Timeout { Witness, .. }`; any
+    /// other RPC method on `Timeout { Block, .. }`. Keeps the "witness vs block stage"
+    /// distinction that drove the old `WitnessTimeout`/`BlockFetchTimeout` split without
+    /// needing separate enum variants.
+    #[test]
+    fn rpc_deadline_maps_to_correct_stage() {
+        let witness_err: DataProviderError = RpcDeadlineExceeded {
+            method: stateless_common::RpcMethod::MegaGetBlockWitness,
+            elapsed: Duration::from_secs(3),
+        }
+        .into();
+        assert!(matches!(
+            witness_err,
+            DataProviderError::Timeout { stage: TimeoutStage::Witness, .. }
+        ));
+
+        let block_err: DataProviderError = RpcDeadlineExceeded {
+            method: stateless_common::RpcMethod::EthGetBlock,
+            elapsed: Duration::from_secs(13),
+        }
+        .into();
+        assert!(matches!(block_err, DataProviderError::Timeout { stage: TimeoutStage::Block, .. }));
     }
 }

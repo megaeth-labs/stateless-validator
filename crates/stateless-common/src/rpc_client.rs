@@ -12,12 +12,17 @@
 //!   one path cannot starve the other. `set_validated_blocks` is unthrottled.
 //! - **Retry model**: within a single logical call, each provider is attempted once per round. If
 //!   all providers in a round fail, the client sleeps for round-level exponential backoff (capped
-//!   at [`BackoffPolicy::max`](crate::BackoffPolicy)) and starts a new round. Retry is unbounded —
-//!   transient failures never surface to callers. Load distribution differs by method type:
+//!   at [`BackoffPolicy::max`](crate::BackoffPolicy)) and starts a new round. Load distribution
+//!   differs by method type:
 //!   - **Data** (blocks/headers/code/tx): round-robin starting provider rotates per call, so
 //!     healthy endpoints share load evenly.
 //!   - **Witness**: round always starts from provider 0 — the first witness endpoint is the
 //!     primary, others are failover-only.
+//! - **Deadlines**: every public method has a `_with_deadline` variant that takes an
+//!   `Option<Instant>`. With `Some(deadline)` the retry loop returns [`RpcDeadlineExceeded`] once
+//!   the wall-clock deadline passes (and clamps each inter-round sleep so it doesn't overshoot).
+//!   With `None` the loop retries forever — this is the validator's background-sync contract. The
+//!   non-`_with_deadline` methods delegate to the deadline version with `None`.
 
 use std::{
     collections::HashMap,
@@ -66,6 +71,31 @@ impl BackoffPolicy {
     /// Creates a new policy with the given `initial` and `max` sleep durations.
     pub const fn new(initial: Duration, max: Duration) -> Self {
         Self { initial, max }
+    }
+}
+
+/// Error returned by the `_with_deadline` RPC methods when a caller-supplied
+/// deadline elapses before any provider succeeds.
+///
+/// The retry loop checks the deadline before each round and clamps inter-round
+/// sleeps to not overshoot it, so the observed wall-clock of this error stays
+/// within a small jitter of the requested deadline.
+#[derive(Debug, thiserror::Error)]
+pub struct RpcDeadlineExceeded {
+    /// The RPC method whose retry loop was aborted.
+    pub method: RpcMethod,
+    /// Wall-clock time from the first attempt to the deadline firing.
+    pub elapsed: Duration,
+}
+
+impl std::fmt::Display for RpcDeadlineExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "RPC call for {} exceeded deadline after {:?}",
+            self.method.as_str(),
+            self.elapsed
+        )
     }
 }
 
@@ -159,27 +189,21 @@ pub struct SetValidatedBlocksResponse {
     pub last_validated_block: (U64, B256),
 }
 
-/// Errors returned by [`RpcClient::get_codes`].
+/// Errors returned by [`RpcClient::get_codes`] / [`RpcClient::get_codes_with_deadline`].
 ///
-/// `VerificationFailure` is the one error [`RpcClient::get_codes`] constructs: the upstream
-/// returned bytecode whose keccak does not match the requested hash. That is deterministic
-/// (the provider is lying or the witness is wrong), so validators should halt rather than
-/// retry.
-///
-/// `Other` is **unreachable from `get_codes` itself** — the underlying `get_code` call
-/// returns `Bytes` directly (its retry loop is unbounded). The variant exists for API
-/// ergonomics via the `#[from] eyre::Error` impl, so external callers can wrap arbitrary
-/// `eyre::Error` values into a `CodeFetchError` with `?`.
+/// - `VerificationFailure` is deterministic (upstream returned bytecode whose keccak does not match
+///   the requested hash): validators should halt rather than retry.
+/// - `Deadline` only surfaces from [`RpcClient::get_codes_with_deadline`] when the caller- supplied
+///   deadline elapsed before every per-hash fetch completed. The unbounded [`RpcClient::get_codes`]
+///   never produces this variant.
 #[derive(Debug, thiserror::Error)]
 pub enum CodeFetchError {
     #[error(
         "RPC provider returned bytecode with unexpected codehash: expected {requested:?}, got {actual:?}"
     )]
     VerificationFailure { requested: B256, actual: B256 },
-    /// Unreachable from `get_codes`; present so external callers can lift `eyre::Error`
-    /// into this enum via `?` at their own call sites.
     #[error(transparent)]
-    Other(#[from] eyre::Error),
+    Deadline(#[from] RpcDeadlineExceeded),
 }
 
 /// RPC client for MegaETH blockchain data.
@@ -302,18 +326,34 @@ impl RpcClient {
 
     /// Wraps a data-method RPC call with round-robin load balancing and round-level backoff.
     ///
-    /// Each call performs rounds of "try every data provider once in round-robin order". If a
-    /// round has a success, returns immediately. If every provider in a round fails, sleeps for
-    /// round-level exponential backoff (with jitter, capped at `rpc_retry.max`) and starts
-    /// another round. Retry is unbounded: failures never surface to callers.
-    ///
-    /// The starting provider rotates per call via an atomic counter so healthy endpoints share
-    /// load evenly; within a round the order is fixed (start → start+1 → …).
+    /// Retries forever — transient failures never surface to callers. Use
+    /// [`Self::call_with_deadline`] when the caller needs a bounded wait.
     async fn call<T: Send + 'static>(
         &self,
         method: RpcMethod,
         f: impl Fn(RootProvider<Optimism>) -> BoxFuture<Result<T>>,
     ) -> T {
+        self.call_with_deadline(method, None, f).await.unwrap_or_else(|e| {
+            // `None` deadline ⇒ retry loop is truly unbounded and this branch is unreachable.
+            unreachable!("call() with None deadline cannot return RpcDeadlineExceeded: {e}")
+        })
+    }
+
+    /// Deadline-aware counterpart of [`Self::call`].
+    ///
+    /// With `deadline = Some(..)` the retry loop returns [`RpcDeadlineExceeded`] once the
+    /// deadline passes, clamping each inter-round sleep so it doesn't overshoot. With
+    /// `None` this is equivalent to [`Self::call`] and never returns `Err`.
+    ///
+    /// Each call performs rounds of "try every data provider once in round-robin order".
+    /// The starting provider rotates per call via an atomic counter so healthy endpoints
+    /// share load evenly; within a round the order is fixed (start → start+1 → …).
+    async fn call_with_deadline<T: Send + 'static>(
+        &self,
+        method: RpcMethod,
+        deadline: Option<Instant>,
+        f: impl Fn(RootProvider<Optimism>) -> BoxFuture<Result<T>>,
+    ) -> std::result::Result<T, RpcDeadlineExceeded> {
         // Safety: constructor guarantees at least one data provider.
         let n = self.data_providers.len();
         // Skip the atomic op when there's a single provider — avoids pointless contention.
@@ -326,14 +366,24 @@ impl RpcClient {
             rr_start,
             method,
             self.config.metrics.as_ref(),
+            deadline,
             |provider| f(provider.clone()),
         )
         .await
     }
 
-    /// Gets contract bytecode for a code hash.
+    /// Gets contract bytecode for a code hash. Retries forever.
     pub async fn get_code(&self, hash: B256) -> Bytes {
-        self.call(RpcMethod::EthGetCodeByHash, move |provider| {
+        self.get_code_with_deadline(hash, None).await.expect("None deadline cannot time out")
+    }
+
+    /// Deadline-aware counterpart of [`Self::get_code`].
+    pub async fn get_code_with_deadline(
+        &self,
+        hash: B256,
+        deadline: Option<Instant>,
+    ) -> std::result::Result<Bytes, RpcDeadlineExceeded> {
+        self.call_with_deadline(RpcMethod::EthGetCodeByHash, deadline, move |provider| {
             Box::pin(async move {
                 provider.client().request("eth_getCodeByHash", (hash,)).await.map_err(|e| {
                     trace!(%hash, error = %e, "eth_getCodeByHash failed");
@@ -344,14 +394,26 @@ impl RpcClient {
         .await
     }
 
-    /// Gets a block by its identifier with optional transaction details.
+    /// Gets a block by its identifier with optional transaction details. Retries forever.
     ///
     /// If `skip_block_verification` is enabled in config, skips integrity checks.
     /// Otherwise performs ECDSA signature and block hash verification — an integrity failure
     /// is treated as a retriable error (round-robin rotates to the next provider).
     pub async fn get_block(&self, block_id: BlockId, full_txs: bool) -> Block<Transaction> {
+        self.get_block_with_deadline(block_id, full_txs, None)
+            .await
+            .expect("None deadline cannot time out")
+    }
+
+    /// Deadline-aware counterpart of [`Self::get_block`].
+    pub async fn get_block_with_deadline(
+        &self,
+        block_id: BlockId,
+        full_txs: bool,
+        deadline: Option<Instant>,
+    ) -> std::result::Result<Block<Transaction>, RpcDeadlineExceeded> {
         let verify = !self.config.skip_block_verification;
-        self.call(RpcMethod::EthGetBlock, move |provider| {
+        self.call_with_deadline(RpcMethod::EthGetBlock, deadline, move |provider| {
             Box::pin(async move {
                 let block = do_get_block_unchecked(&provider, block_id, full_txs).await?;
                 if verify {
@@ -363,7 +425,7 @@ impl RpcClient {
         .await
     }
 
-    /// Gets a block by its identifier without integrity checks.
+    /// Gets a block by its identifier without integrity checks. Retries forever.
     ///
     /// Use this for trusted data sources (e.g., debug-trace-server fetching from upstream RPC)
     /// where integrity checks are unnecessary overhead.
@@ -378,9 +440,19 @@ impl RpcClient {
         .await
     }
 
-    /// Gets the current latest block number from the blockchain.
+    /// Gets the current latest block number from the blockchain. Retries forever.
     pub async fn get_latest_block_number(&self) -> u64 {
-        self.call(RpcMethod::EthBlockNumber, move |provider| {
+        self.get_latest_block_number_with_deadline(None)
+            .await
+            .expect("None deadline cannot time out")
+    }
+
+    /// Deadline-aware counterpart of [`Self::get_latest_block_number`].
+    pub async fn get_latest_block_number_with_deadline(
+        &self,
+        deadline: Option<Instant>,
+    ) -> std::result::Result<u64, RpcDeadlineExceeded> {
+        self.call_with_deadline(RpcMethod::EthBlockNumber, deadline, move |provider| {
             Box::pin(async move {
                 provider.get_block_number().await.context("Failed to get block number").map_err(
                     |e| {
@@ -393,7 +465,7 @@ impl RpcClient {
         .await
     }
 
-    /// Gets the block header by block ID.
+    /// Gets the block header by block ID. Retries forever.
     ///
     /// Uses `eth_getHeaderByNumber` / `eth_getHeaderByHash` instead of `eth_getBlockByNumber`
     /// to avoid transferring the transaction hash list. Even without full transaction objects,
@@ -405,7 +477,19 @@ impl RpcClient {
     /// hash, but can be skipped when the header will be verified downstream (e.g., via
     /// `verify_block_integrity`) or when running in a trusted context like the trace server.
     pub async fn get_header(&self, block_id: BlockId, verify_hash: bool) -> Header {
-        self.call(RpcMethod::EthGetHeader, move |provider| {
+        self.get_header_with_deadline(block_id, verify_hash, None)
+            .await
+            .expect("None deadline cannot time out")
+    }
+
+    /// Deadline-aware counterpart of [`Self::get_header`].
+    pub async fn get_header_with_deadline(
+        &self,
+        block_id: BlockId,
+        verify_hash: bool,
+        deadline: Option<Instant>,
+    ) -> std::result::Result<Header, RpcDeadlineExceeded> {
+        self.call_with_deadline(RpcMethod::EthGetHeader, deadline, move |provider| {
             Box::pin(async move {
                 do_get_header(&provider, block_id, verify_hash).await.map_err(|e| {
                     trace!(?block_id, error = %e, "get_header failed");
@@ -416,21 +500,46 @@ impl RpcClient {
         .await
     }
 
-    /// Gets just the block hash for a block number.
-    ///
-    /// Delegates to `get_header` (which handles retry and concurrency limiting).
+    /// Gets just the block hash for a block number. Retries forever.
     pub async fn get_block_hash(&self, block_number: u64) -> B256 {
         self.get_header(BlockId::Number(BlockNumberOrTag::Number(block_number)), false).await.hash
     }
 
-    /// Gets execution witness data for a specific block.
+    /// Deadline-aware counterpart of [`Self::get_block_hash`].
+    pub async fn get_block_hash_with_deadline(
+        &self,
+        block_number: u64,
+        deadline: Option<Instant>,
+    ) -> std::result::Result<B256, RpcDeadlineExceeded> {
+        self.get_header_with_deadline(
+            BlockId::Number(BlockNumberOrTag::Number(block_number)),
+            false,
+            deadline,
+        )
+        .await
+        .map(|h| h.hash)
+    }
+
+    /// Gets execution witness data for a specific block. Retries forever.
     ///
     /// Uses primary-failover rather than round-robin: each round starts from provider 0
     /// (the primary), falling through to later providers only on failure. If every provider
-    /// fails in a round, sleeps for round-level exponential backoff and starts another round —
-    /// retry is unbounded. This keeps the primary endpoint as the hot path (cache-friendly)
-    /// while still tolerating its temporary outages.
+    /// fails in a round, sleeps for round-level exponential backoff and starts another round.
+    /// This keeps the primary endpoint as the hot path (cache-friendly) while still
+    /// tolerating its temporary outages.
     pub async fn get_witness(&self, number: u64, hash: B256) -> (SaltWitness, MptWitness) {
+        self.get_witness_with_deadline(number, hash, None)
+            .await
+            .expect("None deadline cannot time out")
+    }
+
+    /// Deadline-aware counterpart of [`Self::get_witness`].
+    pub async fn get_witness_with_deadline(
+        &self,
+        number: u64,
+        hash: B256,
+        deadline: Option<Instant>,
+    ) -> std::result::Result<(SaltWitness, MptWitness), RpcDeadlineExceeded> {
         let witness = round_robin_with_backoff(
             &self.witness_providers,
             &self.witness_concurrency,
@@ -440,14 +549,15 @@ impl RpcClient {
             0,
             RpcMethod::MegaGetBlockWitness,
             self.config.metrics.as_ref(),
+            deadline,
             |provider| Box::pin(async move { fetch_witness_raw(&provider, number, hash).await }),
         )
-        .await;
+        .await?;
 
         if let Some(ref metrics) = self.config.metrics {
             metrics.on_witness_fetch(WitnessSizeBreakdown::new(&witness.0, &witness.1));
         }
-        witness
+        Ok(witness)
     }
 
     /// Reports a range of validated blocks via the dedicated report endpoint.
@@ -500,9 +610,25 @@ impl RpcClient {
         hashes: &[B256],
         verify: bool,
     ) -> std::result::Result<HashMap<B256, Arc<Bytecode>>, CodeFetchError> {
+        self.get_codes_with_deadline(hashes, verify, None).await
+    }
+
+    /// Deadline-aware counterpart of [`Self::get_codes`].
+    ///
+    /// The same deadline is applied to every per-hash fetch; if it fires during any fetch
+    /// the whole batch aborts with `Err(CodeFetchError::Deadline(..))`. With `deadline = None`
+    /// the per-hash retries are unbounded and this function can only fail with
+    /// `VerificationFailure`.
+    pub async fn get_codes_with_deadline(
+        &self,
+        hashes: &[B256],
+        verify: bool,
+        deadline: Option<Instant>,
+    ) -> std::result::Result<HashMap<B256, Arc<Bytecode>>, CodeFetchError> {
         let results: Vec<std::result::Result<(B256, Arc<Bytecode>), CodeFetchError>> =
             future::join_all(hashes.iter().map(|&hash| async move {
-                let code = Bytecode::new_raw(self.get_code(hash).await);
+                let bytes = self.get_code_with_deadline(hash, deadline).await?;
+                let code = Bytecode::new_raw(bytes);
                 if verify {
                     let actual = code.hash_slow();
                     if actual != hash {
@@ -521,7 +647,7 @@ impl RpcClient {
         Ok(out)
     }
 
-    /// Gets the transaction by hash and returns its containing block hash.
+    /// Gets the transaction by hash and returns its containing block hash. Retries forever.
     ///
     /// Returns `Ok(None)` when the tx is not found, `Err` when the tx is pending (no
     /// block hash yet — a semantic error the caller must handle). Transient RPC failures
@@ -530,8 +656,26 @@ impl RpcClient {
         &self,
         tx_hash: B256,
     ) -> Result<Option<(Transaction, B256)>> {
+        match self.get_transaction_by_hash_with_deadline(tx_hash, None).await {
+            Ok(ok) => ok,
+            // `None` deadline ⇒ retry loop is truly unbounded and this branch is unreachable.
+            Err(GetTxByHashError::Deadline(e)) => {
+                unreachable!("None deadline cannot time out: {e}")
+            }
+        }
+    }
+
+    /// Deadline-aware counterpart of [`Self::get_transaction_by_hash`].
+    ///
+    /// On deadline: returns `Err(GetTxByHashError::Deadline)`. On a pending tx (no
+    /// block hash): returns `Ok(Err(..))`. On tx-not-found: returns `Ok(Ok(None))`.
+    pub async fn get_transaction_by_hash_with_deadline(
+        &self,
+        tx_hash: B256,
+        deadline: Option<Instant>,
+    ) -> std::result::Result<Result<Option<(Transaction, B256)>>, GetTxByHashError> {
         let tx = self
-            .call(RpcMethod::EthGetTransactionByHash, move |provider| {
+            .call_with_deadline(RpcMethod::EthGetTransactionByHash, deadline, move |provider| {
                 Box::pin(async move {
                     provider.get_transaction_by_hash(tx_hash).await.map_err(|e| {
                         trace!(%tx_hash, error = %e, "get_transaction_by_hash failed");
@@ -539,18 +683,25 @@ impl RpcClient {
                     })
                 })
             })
-            .await;
+            .await?;
 
-        match tx {
-            Some(tx) => {
-                let block_hash = tx.block_hash.ok_or_else(|| {
-                    eyre!("Transaction {} is pending and has no block hash", tx_hash)
-                })?;
-                Ok(Some((tx, block_hash)))
-            }
+        Ok(match tx {
+            Some(tx) => match tx.block_hash {
+                Some(h) => Ok(Some((tx, h))),
+                None => Err(eyre!("Transaction {} is pending and has no block hash", tx_hash)),
+            },
             None => Ok(None),
-        }
+        })
     }
+}
+
+/// Error for [`RpcClient::get_transaction_by_hash_with_deadline`]: the deadline fired
+/// before the upstream responded. (The pending-tx case is returned in the inner `Result`,
+/// not here.)
+#[derive(Debug, thiserror::Error)]
+pub enum GetTxByHashError {
+    #[error(transparent)]
+    Deadline(#[from] RpcDeadlineExceeded),
 }
 
 /// Emits a tracing event at `warn!` or `debug!` depending on a runtime flag.
@@ -569,16 +720,24 @@ macro_rules! log_at {
     };
 }
 
-/// Runs a round-robin RPC call with round-level exponential backoff.
+/// Runs a round-robin RPC call with round-level exponential backoff and an optional deadline.
 ///
 /// Each round attempts every provider once in round-robin starting at `rr_start`. If any
 /// provider succeeds, returns the result. If every provider in a round fails, sleeps for
 /// round-level exponential backoff (capped at `policy.max`, with jitter up to 50%) and starts
-/// a new round with `backoff` doubled. Retry is unbounded — the function never returns an
-/// error.
+/// a new round with the backoff doubled.
+///
+/// When `deadline` is `Some`, the loop returns [`RpcDeadlineExceeded`] once the deadline
+/// elapses, and clamps each inter-round sleep so it does not overshoot. When `deadline` is
+/// `None`, retry is unbounded — the function never returns an error.
 ///
 /// Used by both the data-method `call()` (rotates `rr_start` per call for load balancing) and
 /// `get_witness()` (pins `rr_start=0` for primary-failover).
+// 8-argument retry primitive. Each field plays a distinct role (providers, concurrency,
+// backoff policy, starting provider, method label, metrics sink, deadline, per-attempt closure)
+// and bundling them into a struct would be ceremony without encapsulation — there are exactly
+// two call sites in this crate. Prefer clarity at the definition over fewer commas at the call.
+#[allow(clippy::too_many_arguments)]
 async fn round_robin_with_backoff<N, T>(
     providers: &[RootProvider<N>],
     semaphore: &Semaphore,
@@ -586,8 +745,9 @@ async fn round_robin_with_backoff<N, T>(
     rr_start: usize,
     method: RpcMethod,
     metrics: Option<&Arc<dyn RpcMetrics>>,
+    deadline: Option<Instant>,
     f: impl Fn(RootProvider<N>) -> BoxFuture<Result<T>>,
-) -> T
+) -> std::result::Result<T, RpcDeadlineExceeded>
 where
     N: alloy_provider::Network,
     T: Send + 'static,
@@ -603,6 +763,7 @@ where
     let initial_backoff_ms = policy.initial.as_millis() as u64;
     let mut round_backoff_ms = initial_backoff_ms;
     let mut round = 0u32;
+    let call_start = Instant::now();
 
     loop {
         // Last error observed in this round. Used for the round-summary log at the bottom so
@@ -614,13 +775,49 @@ where
         let warn_level = round >= WARN_AT_ROUND;
 
         for offset in 0..n {
+            // Bail before eating the next permit if the deadline already fired — avoids
+            // queueing behind the semaphore just to immediately bail.
+            if let Some(d) = deadline &&
+                Instant::now() >= d
+            {
+                return Err(RpcDeadlineExceeded { method, elapsed: call_start.elapsed() });
+            }
             let provider_idx = (rr_start + offset) % n;
             let permit = semaphore.acquire().await.expect("semaphore closed unexpectedly");
             // Per-attempt timing: record each provider call individually so histograms
             // and success/error counters reflect what actually happened in the retry loop
             // rather than always showing "success" with the cumulative logical-call time.
             let attempt_start = Instant::now();
-            let result = f(providers[provider_idx].clone()).await;
+            // Bound the attempt by the remaining deadline when set — without this, a
+            // provider that accepts the TCP connection but never replies would block the
+            // retry loop forever even though the deadline has already passed. With no
+            // deadline the attempt runs unbounded, as before.
+            let result = match deadline {
+                Some(d) => {
+                    let remaining = d.saturating_duration_since(Instant::now());
+                    match tokio::time::timeout(remaining, f(providers[provider_idx].clone())).await
+                    {
+                        Ok(r) => r,
+                        Err(_) => {
+                            // Per-attempt timeout == call deadline hit; bail with the
+                            // typed error so the caller sees one consistent failure mode.
+                            drop(permit);
+                            if let Some(m) = metrics {
+                                m.on_rpc_complete(
+                                    method,
+                                    false,
+                                    Some(attempt_start.elapsed().as_secs_f64()),
+                                );
+                            }
+                            return Err(RpcDeadlineExceeded {
+                                method,
+                                elapsed: call_start.elapsed(),
+                            });
+                        }
+                    }
+                }
+                None => f(providers[provider_idx].clone()).await,
+            };
             let attempt_duration = attempt_start.elapsed().as_secs_f64();
             drop(permit);
 
@@ -629,7 +826,7 @@ where
                     if let Some(m) = metrics {
                         m.on_rpc_complete(method, true, Some(attempt_duration));
                     }
-                    return v;
+                    return Ok(v);
                 }
                 Err(e) => {
                     if let Some(m) = metrics {
@@ -666,7 +863,16 @@ where
         // `.max(1)` prevents a hot-spin loop if a caller constructs a zero-backoff policy
         // (`BackoffPolicy::new(Duration::ZERO, Duration::ZERO)`): the computed sleep would
         // otherwise be `0` and the retry loop would busy-wait on every round.
-        let sleep_ms = (round_backoff_ms + jitter_ms).min(max_backoff_ms).max(1);
+        let mut sleep_ms = (round_backoff_ms + jitter_ms).min(max_backoff_ms).max(1);
+        // Clamp the sleep so it doesn't overshoot the caller's deadline — if no time is
+        // left we bail immediately rather than sleeping past the deadline and then bailing.
+        if let Some(d) = deadline {
+            let remaining_ms = d.saturating_duration_since(Instant::now()).as_millis() as u64;
+            if remaining_ms == 0 {
+                return Err(RpcDeadlineExceeded { method, elapsed: call_start.elapsed() });
+            }
+            sleep_ms = sleep_ms.min(remaining_ms);
+        }
         log_at!(
             warn_level,
             method = method.as_str(),

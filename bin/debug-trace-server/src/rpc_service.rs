@@ -201,11 +201,32 @@ impl RpcContext {
 // Error Helpers
 /// Error code for internal errors.
 const ERROR_CODE_INTERNAL: i32 = -32000;
+/// Error code for "resource not found" (used for missing blocks / pending txs / deadline).
+const ERROR_CODE_NOT_FOUND: i32 = -32001;
 
 /// Creates a JSON-RPC internal error (code -32000).
 /// Used for execution failures, serialization errors, etc.
 fn rpc_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
     jsonrpsee::types::ErrorObjectOwned::owned(ERROR_CODE_INTERNAL, msg, None::<()>)
+}
+
+/// Maps a [`DataProviderError`] to a JSON-RPC error object.
+///
+/// Classification strategy: anything that could plausibly be a client mistake ("block doesn't
+/// exist upstream", "tx pending", "upstream too slow") surfaces as `-32001 resource not found`.
+/// Genuine internal failures (transport decode, DB corruption) fall through to `-32000`.
+fn data_provider_error_to_rpc_error(e: &DataProviderError) -> jsonrpsee::types::ErrorObjectOwned {
+    use jsonrpsee::types::ErrorObjectOwned;
+    match e {
+        DataProviderError::TransactionNotFound(_) |
+        DataProviderError::TransactionPending(_) |
+        DataProviderError::Timeout { .. } => {
+            ErrorObjectOwned::owned(ERROR_CODE_NOT_FOUND, e.to_string(), None::<()>)
+        }
+        DataProviderError::Internal(_) => {
+            ErrorObjectOwned::owned(ERROR_CODE_INTERNAL, "internal error".to_string(), None::<()>)
+        }
+    }
 }
 
 // Trace Computation Helpers
@@ -393,7 +414,7 @@ impl DebugTraceRpcServer for RpcContext {
         let t2 = Instant::now();
         let data = self.data_provider.get_block_data(block_num).await.map_err(|e| {
             metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
-            e.to_rpc_error()
+            data_provider_error_to_rpc_error(&e)
         })?;
         let fetch_ms = t2.elapsed().as_millis();
         let block_hash = data.block.header.hash;
@@ -477,7 +498,7 @@ impl DebugTraceRpcServer for RpcContext {
         // Fetch block data (DB -> RPC fallback)
         let data = self.data_provider.get_block_data_by_hash(block_hash).await.map_err(|e| {
             metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
-            e.to_rpc_error()
+            data_provider_error_to_rpc_error(&e)
         })?;
         let block_num = data.block.header.number;
         let result = compute_debug_trace_block(
@@ -520,7 +541,7 @@ impl DebugTraceRpcServer for RpcContext {
         let (data, tx_index) =
             self.data_provider.get_block_data_for_tx(tx_hash).await.map_err(|e| {
                 metrics::record_rpc_error(METHOD_DEBUG_TRACE_TRANSACTION);
-                e.to_rpc_error()
+                data_provider_error_to_rpc_error(&e)
             })?;
 
         let evm_start = Instant::now();
@@ -614,7 +635,7 @@ impl TraceRpcServer for RpcContext {
         // Fetch block data (DB -> RPC fallback)
         let data = self.data_provider.get_block_data(block_num).await.map_err(|e| {
             metrics::record_rpc_error(METHOD_TRACE_BLOCK);
-            e.to_rpc_error()
+            data_provider_error_to_rpc_error(&e)
         })?;
 
         let block_hash = data.block.header.hash;
@@ -652,8 +673,7 @@ impl TraceRpcServer for RpcContext {
             Err(
                 DataProviderError::TransactionNotFound(_) |
                 DataProviderError::TransactionPending(_) |
-                DataProviderError::WitnessTimeout(_) |
-                DataProviderError::BlockFetchTimeout(_),
+                DataProviderError::Timeout { .. },
             ) => return Ok(serde_json::Value::Null),
             Err(DataProviderError::Internal(_)) => {
                 metrics::record_rpc_error(METHOD_TRACE_TRANSACTION);
@@ -720,6 +740,41 @@ mod tests {
     #[test]
     fn test_slow_request_threshold() {
         assert_eq!(SLOW_REQUEST_THRESHOLD.as_secs(), 5);
+    }
+
+    /// Each `DataProviderError` variant maps to a specific JSON-RPC error code. Missing /
+    /// timeout cases must surface as `-32001` (resource not found); `Internal` falls through
+    /// to `-32000`. Lives here rather than in `data_provider.rs` because the data layer
+    /// shouldn't import `jsonrpsee` types.
+    #[test]
+    fn data_provider_error_to_rpc_error_code_mapping() {
+        use crate::data_provider::TimeoutStage;
+
+        let tx_hash = B256::from([0x11; 32]);
+
+        let not_found_variants: [DataProviderError; 4] = [
+            DataProviderError::TransactionNotFound(tx_hash),
+            DataProviderError::TransactionPending(tx_hash),
+            DataProviderError::Timeout {
+                stage: TimeoutStage::Witness,
+                elapsed: Duration::from_secs(8),
+            },
+            DataProviderError::Timeout {
+                stage: TimeoutStage::Block,
+                elapsed: Duration::from_secs(13),
+            },
+        ];
+
+        for variant in not_found_variants {
+            let err = data_provider_error_to_rpc_error(&variant);
+            assert_eq!(err.code(), -32001, "variant {variant:?} must map to resource-not-found");
+            assert_eq!(err.message(), variant.to_string().as_str());
+        }
+
+        let internal = DataProviderError::Internal(eyre::eyre!("boom"));
+        let err = data_provider_error_to_rpc_error(&internal);
+        assert_eq!(err.code(), -32000);
+        assert_eq!(err.message(), "internal error");
     }
 
     #[test]

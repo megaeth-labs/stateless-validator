@@ -29,10 +29,17 @@ impl BlockFetcher for TraceFetcher {
     type Output = (Block<Transaction>, LightWitness);
 
     async fn fetch(&self, block_number: u64) -> Result<(Block<Transaction>, LightWitness)> {
+        // Fetch header first to pin the block hash, then witness + full block in parallel.
+        // Matches the shape used by `DataProvider::do_fetch_block_data` — ~halves the wall
+        // clock under chain-sync load by overlapping the witness fetch with the full-block
+        // fetch instead of serializing all three round trips.
         let block_hash = self.rpc_client.get_block_hash(block_number).await;
-        let (salt, _mpt) = self.rpc_client.get_witness(block_number, block_hash).await;
-        let block = self.rpc_client.get_block(BlockId::Number(block_number.into()), true).await;
-        Ok((block, LightWitness::from(&salt)))
+        let (witness_res, block_res) = tokio::join!(
+            self.rpc_client.get_witness(block_number, block_hash),
+            self.rpc_client.get_block(BlockId::Number(block_number.into()), true),
+        );
+        let (salt, _mpt) = witness_res;
+        Ok((block_res, LightWitness::from(&salt)))
     }
 
     async fn latest_block_number(&self) -> Result<u64> {
