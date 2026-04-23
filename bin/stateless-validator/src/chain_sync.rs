@@ -200,8 +200,7 @@ impl BlockProcessor for ValidatorProcessor {
                 .await
                 .map_err(|e| fail(format!("Contract fetch/verify failed: {e}"), false))?;
 
-            let new_bytecodes: Vec<(B256, Arc<Bytecode>)> =
-                fetched.into_iter().map(|(h, b)| (h, Arc::new(b))).collect();
+            let new_bytecodes: Vec<(B256, Arc<Bytecode>)> = fetched.into_iter().collect();
 
             self.contract_cache
                 .insert(&new_bytecodes)

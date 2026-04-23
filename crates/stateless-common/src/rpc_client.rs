@@ -453,15 +453,31 @@ impl RpcClient {
     ///
     /// When `verify` is `true`, each returned bytecode's keccak hash is checked against its
     /// requested code hash inside the same per-hash future, so hashing runs concurrently
-    /// with the remaining fetches. A provider mismatch fails the whole batch. Callers that
-    /// feed into the verified `ContractCache` tiers should pass `true`; the cache itself
-    /// trusts memory/disk hits and does not re-verify.
+    /// with the remaining fetches.
+    ///
+    /// # Fail-fast on mismatch
+    ///
+    /// A single hash mismatch aborts the whole batch with an `Err`, and the bytecodes for the
+    /// other (concurrently-fetched and verified) hashes in the same batch are **discarded** —
+    /// they are not returned and not cached. This is an intentional security tradeoff: a
+    /// misbehaving or malicious upstream in the batch taints the entire fetch, and we would
+    /// rather re-do the round-trip than risk priming the cache with any byte from a provider
+    /// that has demonstrated bad data in this batch. A persistently-misbehaving upstream will
+    /// cause repeated failures for any block touching the offending contract until the
+    /// operator intervenes — failure is the intended signal, not silent skipping.
+    ///
+    /// # Return type
+    ///
+    /// Returns `Arc<Bytecode>` so the value shares one allocation with the
+    /// [`crate::ContractCache`] end-to-end. Callers that feed into the verified
+    /// `ContractCache` tiers should pass `verify = true`; the cache itself trusts memory/disk
+    /// hits and does not re-verify.
     pub async fn get_codes(
         &self,
         hashes: &[B256],
         verify: bool,
-    ) -> Result<HashMap<B256, Bytecode>> {
-        let results: Vec<Result<(B256, Bytecode)>> =
+    ) -> Result<HashMap<B256, Arc<Bytecode>>> {
+        let results: Vec<Result<(B256, Arc<Bytecode>)>> =
             future::join_all(hashes.iter().map(|&hash| async move {
                 let code = Bytecode::new_raw(self.get_code(hash).await);
                 if verify {
@@ -471,7 +487,7 @@ impl RpcClient {
                         "RPC provider returned bytecode with unexpected codehash: expected {hash:?}, got {got:?}",
                     );
                 }
-                Ok((hash, code))
+                Ok((hash, Arc::new(code)))
             }))
             .await;
 
