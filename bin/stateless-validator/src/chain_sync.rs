@@ -185,18 +185,16 @@ impl BlockProcessor for ValidatorProcessor {
         metrics::on_contract_cache_read(contracts.len() as u64, missing_contracts.len() as u64);
 
         if !missing_contracts.is_empty() {
-            // `VerificationFailure` is deterministic (a bad upstream or a bad witness) — halt.
-            // `Other` is unreachable from `get_codes` itself: `get_code` retries internally via
-            // `round_robin_with_backoff` and never surfaces a transport/decode error to callers.
-            // The variant exists for API ergonomics (external callers can use `?` with
-            // eyre::Error).
+            // The unbounded `get_codes` retries transport errors forever, so the only way this
+            // errors is `VerificationFailure` — a deterministic bad upstream / bad witness.
+            // The `Deadline` variant can't surface here because no deadline is passed.
             let fetched =
                 self.rpc_client.get_codes(&missing_contracts, true).await.map_err(|e| match e {
                     stateless_common::CodeFetchError::VerificationFailure { .. } => {
                         fail(format!("Contract verification failed: {e}"), false)
                     }
-                    stateless_common::CodeFetchError::Other(_) => {
-                        fail(format!("Contract fetch failed: {e}"), true)
+                    stateless_common::CodeFetchError::Deadline(_) => {
+                        unreachable!("unbounded get_codes cannot produce a deadline error: {e}")
                     }
                 })?;
 
