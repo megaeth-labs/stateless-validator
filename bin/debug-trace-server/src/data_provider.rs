@@ -191,7 +191,7 @@ impl Drop for InFlightGuard<'_> {
 /// # Single-Flight Pattern
 /// When multiple requests arrive for the same block simultaneously, only one
 /// RPC call is made. Other requests subscribe to the result via broadcast channel.
-pub struct DataProvider {
+pub(crate) struct DataProvider {
     /// RPC client for upstream data fetching (handles multi-endpoint fallback internally).
     rpc_client: Arc<RpcClient>,
     /// Optional local database for pre-fetched blocks (trait object).

@@ -88,8 +88,14 @@ where
                 let depth = persisted_tip.saturating_sub(rollback_to);
                 let mut reverted_hashes = Vec::new();
                 for n in (rollback_to + 1)..=persisted_tip {
-                    if let Ok(Some(hash)) = store.get_block_hash(n) {
-                        reverted_hashes.push(hash);
+                    match store.get_block_hash(n) {
+                        Ok(Some(hash)) => reverted_hashes.push(hash),
+                        Ok(None) => {}
+                        Err(e) => warn!(
+                            block_number = n,
+                            error = %e,
+                            "Failed to read block hash for reorg event",
+                        ),
                     }
                 }
 
