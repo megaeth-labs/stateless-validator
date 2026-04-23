@@ -625,26 +625,23 @@ impl RpcClient {
         verify: bool,
         deadline: Option<Instant>,
     ) -> std::result::Result<HashMap<B256, Arc<Bytecode>>, CodeFetchError> {
-        let results: Vec<std::result::Result<(B256, Arc<Bytecode>), CodeFetchError>> =
-            future::join_all(hashes.iter().map(|&hash| async move {
-                let bytes = self.get_code_with_deadline(hash, deadline).await?;
-                let code = Bytecode::new_raw(bytes);
-                if verify {
-                    let actual = code.hash_slow();
-                    if actual != hash {
-                        return Err(CodeFetchError::VerificationFailure { requested: hash, actual });
-                    }
+        // `try_join_all` cancels the remaining per-hash futures on the first error — a
+        // `VerificationFailure` or `Deadline` on one hash stops the rest of the batch
+        // immediately and releases their concurrency permits, so a slow straggler can't
+        // hold permits until its own per-attempt timeout fires.
+        future::try_join_all(hashes.iter().map(|&hash| async move {
+            let bytes = self.get_code_with_deadline(hash, deadline).await?;
+            let code = Bytecode::new_raw(bytes);
+            if verify {
+                let actual = code.hash_slow();
+                if actual != hash {
+                    return Err(CodeFetchError::VerificationFailure { requested: hash, actual });
                 }
-                Ok((hash, Arc::new(code)))
-            }))
-            .await;
-
-        let mut out = HashMap::with_capacity(hashes.len());
-        for r in results {
-            let (h, code) = r?;
-            out.insert(h, code);
-        }
-        Ok(out)
+            }
+            Ok::<_, CodeFetchError>((hash, Arc::new(code)))
+        }))
+        .await
+        .map(|pairs| pairs.into_iter().collect())
     }
 
     /// Gets the transaction by hash and returns its containing block hash. Retries forever.

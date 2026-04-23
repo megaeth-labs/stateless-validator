@@ -521,18 +521,19 @@ impl DataProvider {
 /// Unwraps a `Result<Arc<BlockData>, Arc<DataProviderError>>` (the output type of the shared
 /// future) into the owned `DataProviderResult<Arc<BlockData>>` callers expect.
 ///
-/// The inner `Arc<DataProviderError>` would block `?` at the call site because `DataProviderError`
-/// isn't `Clone`; we repackage as `Internal(eyre::Error)` carrying the same display text. The
-/// primary caller that owns the fetch sees the original error directly — only coalesced waiters
-/// hit this fallback. This is the only per-call-cost of switching from per-variant broadcast
-/// to `Shared`, and keeps the existing "coalesced waiter sees Internal" contract.
+/// `DataProviderError` isn't `Clone`, so `Shared` hands every caller an `Arc<_>`. To preserve
+/// the typed variant (so e.g. a `Timeout` still maps to `-32001` at the RPC layer instead of
+/// `-32000`), we try to move the error out of the `Arc`. `try_unwrap` succeeds whenever this
+/// caller is the last ref-holder — the common case once the primary has removed the map entry,
+/// and the only case when there is no coalescing at all. The rare race where primary and
+/// waiter both hold live refs falls through to `Internal`, preserving the display text.
 fn shared_to_result(
     r: std::result::Result<Arc<BlockData>, Arc<DataProviderError>>,
 ) -> DataProviderResult<Arc<BlockData>> {
-    match r {
-        Ok(data) => Ok(data),
-        Err(e) => Err(DataProviderError::Internal(eyre::eyre!("{e}"))),
-    }
+    r.map_err(|e| match Arc::try_unwrap(e) {
+        Ok(owned) => owned,
+        Err(arc) => DataProviderError::Internal(eyre::eyre!("{arc}")),
+    })
 }
 
 /// Free function version of the fetch pipeline so it can be `.shared()` without borrowing `self`.
