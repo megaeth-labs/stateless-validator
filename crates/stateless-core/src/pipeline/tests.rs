@@ -268,6 +268,47 @@ async fn test_chain_advancer_reorg_detected() {
     }
 }
 
+/// Reorg detected mid-batch: block 11 threads through, block 12 has a bad parent. Before the
+/// fix, the advancer called `find_divergence_point` with the *in-memory* tip (11), which
+/// drove the binary search into `get_hash(11)` — returning `None` because 11 was never
+/// persisted — and raised `DivergenceError::LocalChainCorrupt`, masking a legitimate reorg
+/// as a fatal error. With the fix, divergence search uses the persisted tip (10), and the
+/// reported `depth` / `reverted_hashes` agree.
+#[tokio::test]
+async fn test_chain_advancer_reorg_mid_batch_uses_persisted_tip() {
+    let tip = make_tip(10);
+    let mut rpc_hashes = HashMap::new();
+    rpc_hashes.insert(10, make_hash(10));
+
+    // Send block 12 before block 11 so they sit in the buffer together: the first recv only
+    // buffers 12 (no advance, since `next_expected=11`), the second recv brings in 11, and the
+    // inner while-let drains both in one pass — 11 passes parent-hash (`current_tip` advances
+    // in memory to 11), then 12 fails parent-hash → reorg detected with the store still at 10.
+    let block_11 = make_block(11, make_hash(10));
+    let block_12 = MockBlock {
+        number: 12,
+        hash: make_hash(12),
+        parent: BlockHash::from([0xFF; 32]), // wrong parent → reorg
+        state_root: B256::ZERO,
+    };
+    let (result, _) = run_advancer(tip, rpc_hashes, vec![Ok(block_12), Ok(block_11)]).await;
+
+    match result.unwrap() {
+        PipelineOutcome::Reorg(event) => {
+            assert_eq!(event.rollback_to, 10, "divergence resolves to the persisted tip");
+            assert_eq!(
+                event.depth, 0,
+                "depth must be computed against persisted tip (10), not in-memory (11)"
+            );
+            assert!(
+                event.reverted_hashes.is_empty(),
+                "no hashes in (rollback_to..=persisted_tip] to revert"
+            );
+        }
+        other => panic!("Expected Reorg, got {other:?}"),
+    }
+}
+
 // find_divergence_point tests
 
 #[tokio::test]

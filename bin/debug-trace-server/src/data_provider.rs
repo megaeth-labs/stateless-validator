@@ -66,6 +66,19 @@ pub struct BlockData {
 /// with an error if this elapses.
 pub const DEFAULT_WITNESS_TIMEOUT_SECS: u64 = 8;
 
+/// Default timeout for the full block-fetch pipeline (header + witness + block + contracts)
+/// in seconds (13 seconds).
+///
+/// Caps how long a user-facing trace/debug request waits on `RpcClient`'s unbounded
+/// round-robin + exponential backoff retry loop. Without this, a request for a block that
+/// doesn't exist upstream (e.g. a future block number, or a mistyped hash) would hang
+/// indefinitely, holding a concurrency permit. Sits between the 4th retry's max-jitter
+/// sleep completion (~11.25 s — cumulative 500 ms → 1 s → 2 s → 4 s with jitter) and the
+/// 5th retry's min-jitter sleep completion (~15.5 s), so ~4 backoff rounds run before the
+/// timeout fires. Stays above `DEFAULT_WITNESS_TIMEOUT_SECS` so the inner witness timeout
+/// still fires first for legitimate near-tip witness-generation waits.
+pub const DEFAULT_BLOCK_FETCH_TIMEOUT_SECS: u64 = 13;
+
 /// Slow stage threshold: any individual stage exceeding this triggers a warn log.
 pub(crate) const SLOW_STAGE_THRESHOLD_MS: u128 = 1000;
 
@@ -98,6 +111,10 @@ pub struct DataProvider {
     contract_cache: Arc<ContractCache>,
     /// User-facing cap on witness fetches (the RPC client retries internally).
     witness_timeout: Duration,
+    /// User-facing cap on the full block-fetch pipeline (including witness, block, contracts).
+    /// Bounds `RpcClient`'s unbounded retry loop so deterministic "not found" errors surface
+    /// instead of hanging the caller and holding a concurrency permit.
+    block_fetch_timeout: Duration,
     /// In-flight requests map for single-flight pattern (keyed by block hash).
     in_flight: DashMap<B256, InFlightSender>,
 }
@@ -111,17 +128,21 @@ impl DataProvider {
     /// * `contract_cache` - Shared in-memory contract cache (backed by the DB when present, or an
     ///   in-memory-only noop store in stateless mode)
     /// * `witness_timeout_secs` - User-facing cap on a single witness fetch, in seconds
+    /// * `block_fetch_timeout_secs` - User-facing cap on the full block-fetch pipeline (header +
+    ///   witness + block + contracts), in seconds
     pub fn new(
         rpc_client: Arc<RpcClient>,
         db: Option<Arc<dyn BlockStore>>,
         contract_cache: Arc<ContractCache>,
         witness_timeout_secs: u64,
+        block_fetch_timeout_secs: u64,
     ) -> Self {
         Self {
             rpc_client,
             db,
             contract_cache,
             witness_timeout: Duration::from_secs(witness_timeout_secs),
+            block_fetch_timeout: Duration::from_secs(block_fetch_timeout_secs),
             in_flight: DashMap::new(),
         }
     }
@@ -144,8 +165,21 @@ impl DataProvider {
             return self.get_block_data_by_hash(hash).await;
         }
 
-        // Fall back to RPC - fetch header to get hash, then delegate to get_block_data_by_hash
-        let block_hash = self.rpc_client.get_block_hash(block_num).await;
+        // Fall back to RPC. The underlying `get_block_hash` retries unbounded; bound it with
+        // `block_fetch_timeout` so a future/invalid block number surfaces as an error instead
+        // of hanging the caller.
+        let block_hash = tokio::time::timeout(
+            self.block_fetch_timeout,
+            self.rpc_client.get_block_hash(block_num),
+        )
+        .await
+        .map_err(|_| {
+            eyre::eyre!(
+                "Block hash lookup for block {} timed out after {}s",
+                block_num,
+                self.block_fetch_timeout.as_secs(),
+            )
+        })?;
 
         self.get_block_data_by_hash(block_hash).await
     }
@@ -376,17 +410,37 @@ impl DataProvider {
             "Starting new block data fetch"
         );
 
-        // Perform the actual fetch
-        let result = self.do_fetch_block_data(block_hash).await.map(Arc::new);
+        // Perform the actual fetch. Cap the whole pipeline (header + witness + block + contracts)
+        // with `block_fetch_timeout` so a deterministic upstream "not found" can't hang forever in
+        // `RpcClient`'s unbounded round-robin retry loop. The inner `witness_timeout` still
+        // applies to the witness stage specifically; this outer bound covers the header/block/
+        // contract stages which have no inner timeout of their own.
+        let result = match tokio::time::timeout(
+            self.block_fetch_timeout,
+            self.do_fetch_block_data(block_hash),
+        )
+        .await
+        {
+            Ok(r) => r.map(Arc::new),
+            Err(_) => Err(eyre::eyre!(
+                "Block fetch for {} timed out after {}s",
+                block_hash,
+                self.block_fetch_timeout.as_secs(),
+            )),
+        };
 
         // Clone is an Arc refcount bump; eyre::Error is not Clone so errors are stringified.
         let broadcast_result = result.as_ref().map(Arc::clone).map_err(|e| e.to_string());
 
-        // Broadcast result to all waiters (ignore send errors - no receivers is ok)
-        let _ = tx.send(broadcast_result);
-
-        // Remove from in-flight map
+        // Remove BEFORE send. `broadcast::Receiver` cursors set in `subscribe()` are
+        // positioned at the channel's current tail — a subscriber that calls `subscribe()`
+        // after `send()` misses the value and receives `RecvError::Closed` when the last
+        // sender drops. Removing first means any late arrival in the tiny `[remove, send]`
+        // window sees `Vacant` and starts its own fetch (acceptable duplicate; window is
+        // a few instructions). Prior subscribers (captured before `remove`) still receive
+        // the value because their cursors were established before the send.
         self.in_flight.remove(&block_hash);
+        let _ = tx.send(broadcast_result);
 
         result
     }
@@ -592,143 +646,102 @@ impl ContractStore for NoopContractStore {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+
+    use stateless_common::RpcClientConfig;
+
     use super::*;
 
+    /// Compile-time trait bounds + timeout constants. Collapses the former
+    /// `test_block_data_clone`, `test_in_flight_sender_type`, `test_data_provider_struct_fields`,
+    /// `test_default_witness_timeout`, and `test_duration_from_secs` into one test.
     #[test]
-    fn test_block_data_clone() {
-        // BlockData should be Clone
-        fn assert_clone<T: Clone>() {}
-        assert_clone::<BlockData>();
-    }
+    fn type_bounds_and_timeout_constants() {
+        fn _assert<T: Clone + Send + Sync>() {}
+        _assert::<BlockData>();
+        _assert::<InFlightSender>();
+        _assert::<Arc<RpcClient>>();
+        _assert::<Option<Arc<dyn BlockStore>>>();
+        _assert::<DashMap<B256, InFlightSender>>();
 
-    #[test]
-    fn test_default_witness_timeout() {
         assert_eq!(DEFAULT_WITNESS_TIMEOUT_SECS, 8);
+        assert_eq!(Duration::from_secs(DEFAULT_WITNESS_TIMEOUT_SECS).as_millis(), 8000);
     }
 
-    #[tokio::test]
-    async fn test_resolve_block_number_with_number() {
-        // This test verifies the logic without needing a real RPC
-        let tag = BlockNumberOrTag::Number(12345);
-        match tag {
-            BlockNumberOrTag::Number(n) => assert_eq!(n, 12345),
-            _ => panic!("Expected Number variant"),
+    /// `BlockNumberOrTag` / `BlockId` variants that `resolve_block_number` matches on.
+    /// Collapses `test_resolve_block_number_with_number`, `test_block_number_or_tag_variants`,
+    /// `test_earliest_tag_returns_zero`, `test_block_id_from_tag`, and
+    /// `test_block_id_from_safe_tag`.
+    #[test]
+    fn block_tag_and_id_variants() {
+        assert!(matches!(BlockNumberOrTag::Number(12345), BlockNumberOrTag::Number(12345)));
+        for tag in [
+            BlockNumberOrTag::Number(100),
+            BlockNumberOrTag::Latest,
+            BlockNumberOrTag::Pending,
+            BlockNumberOrTag::Earliest,
+            BlockNumberOrTag::Finalized,
+            BlockNumberOrTag::Safe,
+        ] {
+            assert!(matches!(BlockId::Number(tag), BlockId::Number(_)));
         }
     }
 
+    /// Error-message + hash-display formatting used in log and RPC error strings.
+    /// Collapses `test_pending_tag_error_message`, `test_eyre_error_creation`, and
+    /// `test_contract_hash_display`.
     #[test]
-    fn test_block_number_or_tag_variants() {
-        // Test that we handle the expected variants
-        let number = BlockNumberOrTag::Number(100);
-        let latest = BlockNumberOrTag::Latest;
-        let pending = BlockNumberOrTag::Pending;
-        let earliest = BlockNumberOrTag::Earliest;
-        let finalized = BlockNumberOrTag::Finalized;
-        let safe = BlockNumberOrTag::Safe;
+    fn error_and_hash_formatting() {
+        let pending = "Pending block not supported";
+        assert!(pending.contains("Pending") && pending.contains("not supported"));
 
-        assert!(matches!(number, BlockNumberOrTag::Number(100)));
-        assert!(matches!(latest, BlockNumberOrTag::Latest));
-        assert!(matches!(pending, BlockNumberOrTag::Pending));
-        assert!(matches!(earliest, BlockNumberOrTag::Earliest));
-        assert!(matches!(finalized, BlockNumberOrTag::Finalized));
-        assert!(matches!(safe, BlockNumberOrTag::Safe));
-    }
-
-    #[test]
-    fn test_in_flight_sender_type() {
-        // Verify that InFlightSender can hold our expected result types
-        fn _assert_send_sync<T: Send + Sync>() {}
-        _assert_send_sync::<InFlightSender>();
-    }
-
-    #[test]
-    fn test_data_provider_struct_fields() {
-        // Verify DataProvider has expected trait bounds
-        // DataProvider should be Send + Sync for use across async tasks
-        // We can't create a DataProvider without a real RPC client,
-        // but we can verify the struct layout is correct
-        fn _check_arc<T: Send + Sync>() {}
-        _check_arc::<Arc<RpcClient>>();
-        _check_arc::<Option<Arc<dyn BlockStore>>>();
-        _check_arc::<DashMap<B256, InFlightSender>>();
-    }
-
-    #[test]
-    fn test_block_data_struct() {
-        // Verify BlockData struct has expected fields
-        use std::collections::HashMap;
-
-        // Create a minimal BlockData for testing field access patterns
-        // (we can't fully construct one without real data, but we can verify types)
-        let _: Option<HashMap<B256, Bytecode>> = None;
-        let _: Option<SaltWitness> = None;
-    }
-
-    #[test]
-    fn test_duration_from_secs() {
-        // Verify timeout duration is created correctly
-        let timeout = Duration::from_secs(DEFAULT_WITNESS_TIMEOUT_SECS);
-        assert_eq!(timeout.as_secs(), 8);
-        assert_eq!(timeout.as_millis(), 8000);
-    }
-
-    // Tests for resolve_block_number logic (block tag handling)
-
-    #[test]
-    fn test_earliest_tag_returns_zero() {
-        // Earliest block should always be 0 (genesis)
-        let tag = BlockNumberOrTag::Earliest;
-        match tag {
-            BlockNumberOrTag::Earliest => {
-                // Our implementation returns Ok(0) for Earliest
-                assert_eq!(0u64, 0u64); // Placeholder for the actual logic
-            }
-            _ => panic!("Expected Earliest variant"),
-        }
-    }
-
-    #[test]
-    fn test_pending_tag_error_message() {
-        // Verify the error message for pending tag matches mega-reth
-        let expected_error = "Pending block not supported";
-        // This tests that our error message is consistent with mega-reth
-        assert!(expected_error.contains("Pending"));
-        assert!(expected_error.contains("not supported"));
-    }
-
-    #[test]
-    fn test_block_id_from_tag() {
-        // Test that BlockId can be constructed from BlockNumberOrTag
-        let tag = BlockNumberOrTag::Finalized;
-        let block_id = BlockId::Number(tag);
-        assert!(matches!(block_id, BlockId::Number(BlockNumberOrTag::Finalized)));
-    }
-
-    #[test]
-    fn test_block_id_from_safe_tag() {
-        let tag = BlockNumberOrTag::Safe;
-        let block_id = BlockId::Number(tag);
-        assert!(matches!(block_id, BlockId::Number(BlockNumberOrTag::Safe)));
-    }
-
-    // Tests for error handling
-
-    #[test]
-    fn test_eyre_error_creation() {
-        // Test that we can create eyre errors with proper messages
         let hash = B256::ZERO;
-        let error = eyre::eyre!("Failed to fetch contract code {}: test error", hash);
-        let error_string = error.to_string();
-        assert!(error_string.contains("Failed to fetch contract code"));
-        assert!(error_string.contains("test error"));
+        let err = eyre::eyre!("Failed to fetch contract code {}: test error", hash).to_string();
+        assert!(err.contains("Failed to fetch contract code") && err.contains("test error"));
+
+        let display = format!("{hash}");
+        assert!(display.starts_with("0x") && display.len() == 66);
     }
 
-    #[test]
-    fn test_contract_hash_display() {
-        // Test B256 display for error messages
-        let hash = B256::ZERO;
-        let display = format!("{}", hash);
-        assert!(display.contains("0x"));
-        assert_eq!(display.len(), 66); // 0x + 64 hex chars
+    /// `block_fetch_timeout` must bound the caller when the upstream hangs. We simulate a hang
+    /// by pointing the `RpcClient` at a TCP listener that accepts connections but never replies
+    /// — so `RpcClient`'s unbounded retry loop would otherwise loop forever. The timeout surfaces
+    /// as a user-facing error within a small multiple of `block_fetch_timeout`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_block_data_surfaces_timeout_when_upstream_hangs() {
+        // Bind to a real port that accepts but never responds — forces the RPC call to hang.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/");
+
+        let rpc_client = Arc::new(
+            RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
+                .unwrap(),
+        );
+        let contract_cache =
+            Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
+        let provider = DataProvider::new(
+            rpc_client,
+            None,
+            contract_cache,
+            DEFAULT_WITNESS_TIMEOUT_SECS,
+            1, // 1-second block fetch timeout
+        );
+
+        let start = std::time::Instant::now();
+        let result = provider.get_block_data(42).await;
+        let elapsed = start.elapsed();
+
+        let err = match result {
+            Ok(_) => panic!("hanging upstream must surface as an error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("timed out"), "expected timeout error, got: {err}");
+        // Allow generous headroom for retry backoff + scheduling; ≤5s proves the unbounded loop
+        // is actually bounded.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "timeout must fire quickly; elapsed: {elapsed:?}"
+        );
     }
 }

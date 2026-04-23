@@ -104,23 +104,23 @@ impl ServerDB {
     /// that had no matching BLOCK_RECORDS row — those are a side-effect and are NOT
     /// reflected in the returned count.
     pub fn prune_history(&self, before_block: BlockNumber) -> StoreResult<u64> {
-        let read_txn = self.database.begin_read().store_err()?;
-        let block_records = read_txn.open_table(BLOCK_RECORDS).store_err()?;
-
-        let keys_to_remove = block_records
-            .range(..(before_block, [0u8; 32]))
-            .store_err()?
-            .map(|result| result.map(|(key, _)| key.value()))
-            .collect::<Result<Vec<_>, _>>()
-            .store_err()?;
-        let pruned_count = keys_to_remove.len() as u64;
-
+        // Single write txn: scan + delete under one snapshot so a concurrently-committed
+        // row below `before_block` can't slip past the scan and leak as an orphan.
+        // Same pattern as `write_rollback_chain` in stateless-db's helpers.
         let write_txn = self.database.begin_write().store_err()?;
-        {
+        let pruned_count = {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
             let mut block_records = write_txn.open_table(BLOCK_RECORDS).store_err()?;
             let mut block_data = write_txn.open_table(BLOCK_DATA).store_err()?;
             let mut witnesses = write_txn.open_table(WITNESSES).store_err()?;
+
+            let keys_to_remove: Vec<(BlockNumber, [u8; 32])> = block_records
+                .range(..(before_block, [0u8; 32]))
+                .store_err()?
+                .map(|result| result.map(|(key, _)| key.value()))
+                .collect::<Result<Vec<_>, _>>()
+                .store_err()?;
+            let pruned_count = keys_to_remove.len() as u64;
 
             for (block_number, block_hash) in keys_to_remove {
                 canonical_chain.remove(block_number).store_err()?;
@@ -143,7 +143,9 @@ impl ServerDB {
                 };
                 canonical_chain.remove(block_number).store_err()?;
             }
-        }
+
+            pruned_count
+        };
         write_txn.commit().store_err()?;
         Ok(pruned_count)
     }
