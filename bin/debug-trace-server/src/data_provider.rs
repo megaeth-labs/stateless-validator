@@ -357,11 +357,15 @@ impl DataProvider {
     ) -> DataProviderResult<(Arc<BlockData>, usize)> {
         trace!(tx_hash = %tx_hash, "Looking up transaction");
 
-        // Fetch the transaction to find its block
+        // Fetch the transaction to find its block. `RpcClient::call` is infallible (retries
+        // forever on transport errors), so the only way `get_transaction_by_hash` returns `Err`
+        // is the "tx exists but has no block_hash" pending path — classify it explicitly so
+        // `trace_parity_transaction` returns `null` instead of `-32000 internal error`.
         let (tx, block_hash) = self
             .rpc_client
             .get_transaction_by_hash(tx_hash)
-            .await?
+            .await
+            .map_err(|_| DataProviderError::TransactionPending(tx_hash))?
             .ok_or(DataProviderError::TransactionNotFound(tx_hash))?;
 
         let tx_index =
