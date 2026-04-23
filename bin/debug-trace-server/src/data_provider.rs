@@ -48,7 +48,10 @@ use crate::metrics::{
 /// Uses `LightWitness` for improved deserialization performance (~10x faster than
 /// `SaltWitness`) since we trust our local database and don't need cryptographic
 /// proof verification.
-#[derive(Clone)]
+///
+/// Not `Clone`: all callers hold `Arc<BlockData>` and clone the `Arc`, not the inner
+/// struct. The full block + witness + contract map is megabytes, so deep-cloning was
+/// never cheap and is never needed.
 pub struct BlockData {
     /// The block with full transaction data.
     pub block: Block<Transaction>,
@@ -77,6 +80,12 @@ pub const DEFAULT_WITNESS_TIMEOUT_SECS: u64 = 8;
 /// 5th retry's min-jitter sleep completion (~15.5 s), so ~4 backoff rounds run before the
 /// timeout fires. Stays above `DEFAULT_WITNESS_TIMEOUT_SECS` so the inner witness timeout
 /// still fires first for legitimate near-tip witness-generation waits.
+///
+/// **Note on the number-lookup path.** [`DataProvider::get_block_data`] (by number) applies
+/// this timeout twice on the RPC path: once around `get_block_hash(num)` to resolve the
+/// hash, then again around the full pipeline inside `get_block_data_by_hash`. Worst-case
+/// wall-clock budget there is `2 × block_fetch_timeout`. The hash-keyed entry point
+/// [`DataProvider::get_block_data_by_hash`] applies it once.
 pub const DEFAULT_BLOCK_FETCH_TIMEOUT_SECS: u64 = 13;
 
 /// Slow stage threshold: any individual stage exceeding this triggers a warn log.
@@ -135,6 +144,43 @@ pub type DataProviderResult<T> = std::result::Result<T, DataProviderError>;
 /// `Arc<BlockData>` rather than `BlockData` so coalesced waiters share one allocation
 /// — the value carries a full block, witness, and contract map.
 type InFlightSender = broadcast::Sender<Result<Arc<BlockData>, String>>;
+
+/// RAII cleanup guard for the single-flight `in_flight` map.
+///
+/// On a normal path, [`fetch_block_data_single_flight`] does an explicit
+/// `remove-before-send` (see the block comment there for why order matters) and
+/// calls [`Self::disarm`] so this guard becomes a no-op. On any early exit —
+/// panic in the fetch future, `.await` cancellation, etc. — the guard fires and
+/// removes the stale entry so future callers for the same block hash don't
+/// subscribe to a dead broadcast sender.
+///
+/// [`fetch_block_data_single_flight`]: DataProvider::fetch_block_data_single_flight
+struct InFlightGuard<'a> {
+    map: &'a DashMap<B256, InFlightSender>,
+    key: B256,
+    armed: bool,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn new(map: &'a DashMap<B256, InFlightSender>, key: B256) -> Self {
+        Self { map, key, armed: true }
+    }
+
+    /// Consumes the guard without removing the entry. Call after an explicit
+    /// `map.remove(&key)` on the happy path.
+    fn disarm(mut self) {
+        self.armed = false;
+        // `self` drops here; `Drop::drop` sees `armed = false` and is a no-op.
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.map.remove(&self.key);
+        }
+    }
+}
 
 /// Data provider with single-flight request coalescing.
 ///
@@ -465,6 +511,12 @@ impl DataProvider {
         };
         SingleFlightMetrics::new_for_type("new").record();
 
+        // RAII cleanup: if the fetch panics or is cancelled mid-flight, the guard
+        // removes the stale entry so future callers don't subscribe to a dead
+        // sender forever. On the normal path we disarm the guard after the
+        // explicit `remove-before-send` below.
+        let cleanup = InFlightGuard::new(&self.in_flight, block_hash);
+
         trace!(
             block_hash = %block_hash,
             "Starting new block data fetch"
@@ -497,6 +549,7 @@ impl DataProvider {
         // a few instructions). Prior subscribers (captured before `remove`) still receive
         // the value because their cursors were established before the send.
         self.in_flight.remove(&block_hash);
+        cleanup.disarm();
         let _ = tx.send(broadcast_result);
 
         result
@@ -710,15 +763,46 @@ mod tests {
     /// `test_default_witness_timeout`, and `test_duration_from_secs` into one test.
     #[test]
     fn type_bounds_and_timeout_constants() {
-        fn _assert<T: Clone + Send + Sync>() {}
-        _assert::<BlockData>();
-        _assert::<InFlightSender>();
-        _assert::<Arc<RpcClient>>();
-        _assert::<Option<Arc<dyn BlockStore>>>();
-        _assert::<DashMap<B256, InFlightSender>>();
+        fn _assert_clone<T: Clone + Send + Sync>() {}
+        fn _assert_sync<T: Send + Sync>() {}
+        // BlockData is intentionally not Clone — callers share it via `Arc<BlockData>`.
+        _assert_sync::<BlockData>();
+        _assert_clone::<InFlightSender>();
+        _assert_clone::<Arc<RpcClient>>();
+        _assert_clone::<Option<Arc<dyn BlockStore>>>();
+        _assert_clone::<DashMap<B256, InFlightSender>>();
 
         assert_eq!(DEFAULT_WITNESS_TIMEOUT_SECS, 8);
         assert_eq!(Duration::from_secs(DEFAULT_WITNESS_TIMEOUT_SECS).as_millis(), 8000);
+    }
+
+    /// Dropping an armed `InFlightGuard` removes the entry — the panic/cancellation path.
+    #[test]
+    fn inflight_guard_removes_entry_on_drop() {
+        let map: DashMap<B256, InFlightSender> = DashMap::new();
+        let key = B256::from([0x42; 32]);
+        let (tx, _) = broadcast::channel::<Result<Arc<BlockData>, String>>(1);
+        map.insert(key, tx);
+
+        {
+            let _guard = InFlightGuard::new(&map, key);
+            assert!(map.contains_key(&key), "entry present while guard is armed");
+        }
+        assert!(!map.contains_key(&key), "Drop must clear the entry on armed guard");
+    }
+
+    /// Disarming leaves the entry intact — the happy-path `remove-before-send` leaves the
+    /// caller responsible for the removal, and the guard becomes a no-op.
+    #[test]
+    fn inflight_guard_disarm_leaves_entry() {
+        let map: DashMap<B256, InFlightSender> = DashMap::new();
+        let key = B256::from([0x99; 32]);
+        let (tx, _) = broadcast::channel::<Result<Arc<BlockData>, String>>(1);
+        map.insert(key, tx);
+
+        let guard = InFlightGuard::new(&map, key);
+        guard.disarm();
+        assert!(map.contains_key(&key), "disarmed guard must not touch the map");
     }
 
     /// `BlockNumberOrTag` / `BlockId` variants that `resolve_block_number` matches on.

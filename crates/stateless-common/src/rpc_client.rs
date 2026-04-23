@@ -161,17 +161,23 @@ pub struct SetValidatedBlocksResponse {
 
 /// Errors returned by [`RpcClient::get_codes`].
 ///
-/// `VerificationFailure` is the one error worth distinguishing at call sites: the upstream
+/// `VerificationFailure` is the one error [`RpcClient::get_codes`] constructs: the upstream
 /// returned bytecode whose keccak does not match the requested hash. That is deterministic
 /// (the provider is lying or the witness is wrong), so validators should halt rather than
-/// retry. All other errors (transport, decode, provider non-2xx) are transient and bubble
-/// up through the `Other` variant.
+/// retry.
+///
+/// `Other` is **unreachable from `get_codes` itself** — the underlying `get_code` call
+/// returns `Bytes` directly (its retry loop is unbounded). The variant exists for API
+/// ergonomics via the `#[from] eyre::Error` impl, so external callers can wrap arbitrary
+/// `eyre::Error` values into a `CodeFetchError` with `?`.
 #[derive(Debug, thiserror::Error)]
 pub enum CodeFetchError {
     #[error(
         "RPC provider returned bytecode with unexpected codehash: expected {requested:?}, got {actual:?}"
     )]
     VerificationFailure { requested: B256, actual: B256 },
+    /// Unreachable from `get_codes`; present so external callers can lift `eyre::Error`
+    /// into this enum via `?` at their own call sites.
     #[error(transparent)]
     Other(#[from] eyre::Error),
 }
@@ -547,6 +553,22 @@ impl RpcClient {
     }
 }
 
+/// Emits a tracing event at `warn!` or `debug!` depending on a runtime flag.
+///
+/// Used by the retry loop to escalate DEBUG → WARN after `WARN_AT_ROUND` without
+/// duplicating every log call. The level ends up baked into a static `Metadata`
+/// inside the expanded `tracing::warn!` / `tracing::debug!` calls, so the filter
+/// short-circuit still works per-branch.
+macro_rules! log_at {
+    ($warn_level:expr, $($args:tt)*) => {
+        if $warn_level {
+            ::tracing::warn!($($args)*);
+        } else {
+            ::tracing::debug!($($args)*);
+        }
+    };
+}
+
 /// Runs a round-robin RPC call with round-level exponential backoff.
 ///
 /// Each round attempts every provider once in round-robin starting at `rr_start`. If any
@@ -571,8 +593,9 @@ where
     T: Send + 'static,
 {
     /// Round index from which retry logs escalate DEBUG → WARN. Short blips typically resolve
-    /// within the first few rounds (with `initial=500ms, max=30s` defaults that's ~4s of
-    /// cumulative backoff); only sustained failures past that reach operator-visible WARN.
+    /// within the first few rounds (with `initial=500ms, max=30s` defaults that's rounds 0/1/2
+    /// sleeping 500/1000/2000 ms + jitter, so cumulative 3.5–5.25 s before a round-3 WARN).
+    /// Only sustained failures past that reach operator-visible WARN.
     const WARN_AT_ROUND: u32 = 3;
 
     let start = Instant::now();
@@ -616,23 +639,14 @@ where
                     //     is carried into the round-summary log instead.
                     let has_next = offset + 1 < n;
                     if has_next {
-                        if warn_level {
-                            tracing::warn!(
-                                method = method.as_str(),
-                                provider_idx,
-                                round,
-                                error = %e,
-                                "RPC provider failed, trying next",
-                            );
-                        } else {
-                            tracing::debug!(
-                                method = method.as_str(),
-                                provider_idx,
-                                round,
-                                error = %e,
-                                "RPC provider failed, trying next",
-                            );
-                        }
+                        log_at!(
+                            warn_level,
+                            method = method.as_str(),
+                            provider_idx,
+                            round,
+                            error = %e,
+                            "RPC provider failed, trying next",
+                        );
                     }
                     last_err = Some(e);
                 }
@@ -644,26 +658,19 @@ where
         // constructor and we only reach this point after `n` iterations that each set it.
         let last_err = last_err.expect("last_err set when every provider failed this round");
         let jitter_ms = fastrand::u64(0..=round_backoff_ms / 2);
-        let sleep_ms = (round_backoff_ms + jitter_ms).min(max_backoff_ms);
-        if warn_level {
-            tracing::warn!(
-                method = method.as_str(),
-                round,
-                providers = n,
-                sleep_ms,
-                error = %last_err,
-                "All providers failed this round, backing off",
-            );
-        } else {
-            tracing::debug!(
-                method = method.as_str(),
-                round,
-                providers = n,
-                sleep_ms,
-                error = %last_err,
-                "All providers failed this round, backing off",
-            );
-        }
+        // `.max(1)` prevents a hot-spin loop if a caller constructs a zero-backoff policy
+        // (`BackoffPolicy::new(Duration::ZERO, Duration::ZERO)`): the computed sleep would
+        // otherwise be `0` and the retry loop would busy-wait on every round.
+        let sleep_ms = (round_backoff_ms + jitter_ms).min(max_backoff_ms).max(1);
+        log_at!(
+            warn_level,
+            method = method.as_str(),
+            round,
+            providers = n,
+            sleep_ms,
+            error = %last_err,
+            "All providers failed this round, backing off",
+        );
         tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
         round_backoff_ms = (round_backoff_ms * 2).min(max_backoff_ms);
         round += 1;
