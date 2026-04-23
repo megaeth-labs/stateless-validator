@@ -663,6 +663,12 @@ impl DataProvider {
         /// upstream blocks). Tighter than [`Self::witness_timeout`] because the upstream
         /// retry loop never terminates on errors — without this bound a pruned-block
         /// trace request would wait the full `witness_timeout` before returning.
+        ///
+        /// Sized against the default [`BackoffPolicy`](stateless_common::BackoffPolicy)
+        /// (`initial = 500 ms`, 2× doubling): 500 ms + 1 s + 2 s ≈ 3.5 s, so 3 s lets
+        /// every provider be probed across ~2–3 rounds before we fail. If the policy
+        /// defaults change, revisit this value so the cap still allows at least one
+        /// full round of probes.
         const OLD_BLOCK_WITNESS_TIMEOUT: Duration = Duration::from_secs(3);
 
         let db_max_height = self

@@ -349,6 +349,10 @@ mod tests {
             "memory weight {} must be bounded by max_bytes",
             stats.weight,
         );
-        assert!(stats.len <= 2, "weight budget fits at most 2 entries; len={}", stats.len);
+        assert!(
+            stats.len >= 1 && stats.len <= 2,
+            "weight budget fits at most 2 entries; len={}",
+            stats.len,
+        );
     }
 }
