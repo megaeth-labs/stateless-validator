@@ -39,9 +39,14 @@ impl BlockFetcher for ValidatorFetcher {
 
     async fn fetch(&self, block_number: u64) -> Result<ValidationTask> {
         let block_hash = self.rpc_client.get_block_hash(block_number).await;
-        let (salt_witness, mpt_witness) =
-            self.rpc_client.get_witness(block_number, block_hash).await;
-        let block = self.rpc_client.get_block(BlockId::Number(block_number.into()), true).await;
+        // Once we have the hash, fetch the witness and the full block concurrently — they
+        // hit independent upstreams (witness providers vs. data providers) and both retry
+        // internally, so `tokio::join!` just overlaps the two round-trips. Matches the
+        // pattern used by `DataProvider::do_fetch_block_data` in the trace server.
+        let ((salt_witness, mpt_witness), block) = tokio::join!(
+            self.rpc_client.get_witness(block_number, block_hash),
+            self.rpc_client.get_block(BlockId::Number(block_number.into()), true),
+        );
         Ok(ValidationTask { block, salt_witness, mpt_witness })
     }
 
