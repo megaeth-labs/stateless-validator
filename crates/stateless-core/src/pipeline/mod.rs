@@ -158,24 +158,34 @@ where
     S: ChainStore,
     H: PipelineHooks,
 {
-    // Stale detection (optional)
-    if let Some(threshold) = config.stale_reset_threshold &&
-        let Ok(chain_latest) = fetcher.latest_block_number().await &&
-        let Ok(Some(tip)) = store.get_canonical_tip() &&
-        chain_latest > tip.block_number + threshold
-    {
-        warn!(
-            tip = tip.block_number,
-            chain_latest, threshold, "Local data is stale, resetting anchor"
-        );
-        match fetcher.latest_block_meta().await {
-            Ok(new_anchor) => {
-                hooks.on_stale_reset(&new_anchor)?;
-                store.reset_to_anchor(&new_anchor)?;
-                return Ok(false);
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to fetch latest block for anchor reset");
+    // Stale detection (optional). Both `latest_block_number` and `latest_block_meta` delegate
+    // to the RPC client's unbounded retry loop, so without a shutdown select they'd hang
+    // graceful shutdown whenever upstream is down at the moment the stale check runs.
+    if let Some(threshold) = config.stale_reset_threshold {
+        let chain_latest = tokio::select! {
+            r = fetcher.latest_block_number() => r,
+            _ = shutdown.cancelled() => return Ok(true),
+        };
+        if let (Ok(chain_latest), Ok(Some(tip))) = (chain_latest, store.get_canonical_tip()) &&
+            chain_latest > tip.block_number + threshold
+        {
+            warn!(
+                tip = tip.block_number,
+                chain_latest, threshold, "Local data is stale, resetting anchor"
+            );
+            let meta = tokio::select! {
+                r = fetcher.latest_block_meta() => r,
+                _ = shutdown.cancelled() => return Ok(true),
+            };
+            match meta {
+                Ok(new_anchor) => {
+                    hooks.on_stale_reset(&new_anchor)?;
+                    store.reset_to_anchor(&new_anchor)?;
+                    return Ok(false);
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to fetch latest block for anchor reset");
+                }
             }
         }
     }

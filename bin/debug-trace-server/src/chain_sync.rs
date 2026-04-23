@@ -173,6 +173,7 @@ mod tests {
 
     use alloy_primitives::B256;
     use revm::state::Bytecode;
+    use stateless_core::StoreResult;
 
     use super::*;
 
@@ -203,54 +204,49 @@ mod tests {
         fn get_contracts(
             &self,
             _: &[B256],
-        ) -> stateless_core::StoreResult<(HashMap<B256, Arc<Bytecode>>, Vec<B256>)> {
+        ) -> StoreResult<(HashMap<B256, Arc<Bytecode>>, Vec<B256>)> {
             Ok((Default::default(), vec![]))
         }
-        fn add_contracts(&self, _: &[(B256, Arc<Bytecode>)]) -> stateless_core::StoreResult<()> {
+        fn add_contracts(&self, _: &[(B256, Arc<Bytecode>)]) -> StoreResult<()> {
             Ok(())
         }
     }
     impl stateless_core::ChainStore for MockBlockStore {
-        fn get_canonical_tip(&self) -> stateless_core::StoreResult<Option<BlockMeta>> {
+        fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>> {
             Ok(None)
         }
-        fn get_anchor(&self) -> stateless_core::StoreResult<Option<BlockMeta>> {
+        fn get_anchor(&self) -> StoreResult<Option<BlockMeta>> {
             Ok(None)
         }
-        fn advance_chain(&self, _: &[BlockMeta]) -> stateless_core::StoreResult<()> {
+        fn advance_chain(&self, _: &[BlockMeta]) -> StoreResult<()> {
             Ok(())
         }
-        fn get_block_hash(&self, _: BlockNumber) -> stateless_core::StoreResult<Option<BlockHash>> {
+        fn get_block_hash(&self, _: BlockNumber) -> StoreResult<Option<BlockHash>> {
             Ok(None)
         }
-        fn get_earliest_block(
-            &self,
-        ) -> stateless_core::StoreResult<Option<(BlockNumber, BlockHash)>> {
+        fn get_earliest_block(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
             Ok(None)
         }
-        fn rollback_chain(&self, _: BlockNumber) -> stateless_core::StoreResult<()> {
+        fn rollback_chain(&self, _: BlockNumber) -> StoreResult<()> {
             Ok(())
         }
-        fn reset_to_anchor(&self, _: &BlockMeta) -> stateless_core::StoreResult<()> {
+        fn reset_to_anchor(&self, _: &BlockMeta) -> StoreResult<()> {
             Ok(())
         }
     }
     impl stateless_core::PrunableChainStore for MockBlockStore {
-        fn prune_chain(&self, _: BlockNumber) -> stateless_core::StoreResult<u64> {
+        fn prune_chain(&self, _: BlockNumber) -> StoreResult<u64> {
             Ok(0)
         }
     }
     impl stateless_core::BlockStore for MockBlockStore {
-        fn store_block_data(
-            &self,
-            _: &[(Block<Transaction>, LightWitness)],
-        ) -> stateless_core::StoreResult<()> {
+        fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
             Ok(())
         }
         fn get_block_and_witness(
             &self,
             _: BlockHash,
-        ) -> stateless_core::StoreResult<(Block<Transaction>, LightWitness)> {
+        ) -> StoreResult<(Block<Transaction>, LightWitness)> {
             Err(stateless_core::StoreError::Corrupt("not implemented".into()))
         }
     }
