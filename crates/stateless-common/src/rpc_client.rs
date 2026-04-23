@@ -351,7 +351,7 @@ impl RpcClient {
     /// is treated as a retriable error (round-robin rotates to the next provider).
     pub async fn get_block(&self, block_id: BlockId, full_txs: bool) -> Block<Transaction> {
         let verify = !self.config.skip_block_verification;
-        self.call(RpcMethod::EthGetBlockByNumber, move |provider| {
+        self.call(RpcMethod::EthGetBlock, move |provider| {
             Box::pin(async move {
                 let block = do_get_block_unchecked(&provider, block_id, full_txs).await?;
                 if verify {
@@ -372,7 +372,7 @@ impl RpcClient {
         block_id: BlockId,
         full_txs: bool,
     ) -> Block<Transaction> {
-        self.call(RpcMethod::EthGetBlockByNumber, move |provider| {
+        self.call(RpcMethod::EthGetBlock, move |provider| {
             Box::pin(async move { do_get_block_unchecked(&provider, block_id, full_txs).await })
         })
         .await

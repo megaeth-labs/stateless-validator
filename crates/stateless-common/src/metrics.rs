@@ -13,12 +13,16 @@ pub const BYTE_BUCKETS: &[f64] =
 pub const REORG_DEPTH_BUCKETS: &[f64] = &[1.0, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0];
 
 /// RPC method identifiers for metrics tracking.
+///
+/// `EthGetBlock` and `EthGetHeader` each cover both the by-number and by-hash call
+/// flavors; [`as_str`] returns the by-number label (validator default) and binaries
+/// whose hot path is by-hash remap via their own [`RpcMetrics`] adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpcMethod {
     /// eth_getCodeByHash
     EthGetCodeByHash,
     /// eth_getBlockByNumber / eth_getBlockByHash
-    EthGetBlockByNumber,
+    EthGetBlock,
     /// eth_blockNumber
     EthBlockNumber,
     /// eth_getHeaderByNumber / eth_getHeaderByHash
@@ -32,11 +36,11 @@ pub enum RpcMethod {
 }
 
 impl RpcMethod {
-    /// Returns the method name as a string.
+    /// Returns the default dashboard label for this method.
     pub fn as_str(&self) -> &'static str {
         match self {
             RpcMethod::EthGetCodeByHash => "eth_getCodeByHash",
-            RpcMethod::EthGetBlockByNumber => "eth_getBlockByNumber",
+            RpcMethod::EthGetBlock => "eth_getBlockByNumber",
             RpcMethod::EthGetHeader => "eth_getHeader",
             RpcMethod::EthBlockNumber => "eth_blockNumber",
             RpcMethod::EthGetTransactionByHash => "eth_getTransactionByHash",
@@ -69,7 +73,7 @@ mod tests {
     #[test]
     fn test_rpc_method_as_str() {
         assert_eq!(RpcMethod::EthGetCodeByHash.as_str(), "eth_getCodeByHash");
-        assert_eq!(RpcMethod::EthGetBlockByNumber.as_str(), "eth_getBlockByNumber");
+        assert_eq!(RpcMethod::EthGetBlock.as_str(), "eth_getBlockByNumber");
         assert_eq!(RpcMethod::EthBlockNumber.as_str(), "eth_blockNumber");
         assert_eq!(RpcMethod::MegaGetBlockWitness.as_str(), "mega_getBlockWitness");
         assert_eq!(RpcMethod::MegaSetValidatedBlocks.as_str(), "mega_setValidatedBlocks");

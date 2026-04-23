@@ -505,7 +505,7 @@ fn upstream_label_for(method: stateless_common::metrics::RpcMethod) -> &'static 
     use stateless_common::metrics::RpcMethod;
     match method {
         RpcMethod::EthGetHeader => "eth_getHeaderByHash",
-        RpcMethod::EthGetBlockByNumber => "eth_getBlockByHash",
+        RpcMethod::EthGetBlock => "eth_getBlockByHash",
         RpcMethod::MegaGetBlockWitness => "mega_getWitness",
         RpcMethod::EthGetCodeByHash => "eth_getCodeByHash",
         other => other.as_str(),

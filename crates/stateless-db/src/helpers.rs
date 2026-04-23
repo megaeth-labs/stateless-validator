@@ -185,3 +185,96 @@ pub fn write_add_contracts(
     write_txn.commit().store_err()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use alloy_primitives::Bytes;
+
+    use super::*;
+
+    fn temp_db() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let database = Database::create(dir.path().join("test.redb")).unwrap();
+        (dir, database)
+    }
+
+    fn meta(number: u64) -> BlockMeta {
+        let byte = number as u8;
+        BlockMeta {
+            block_number: number,
+            block_hash: BlockHash::from([byte; 32]),
+            post_state_root: B256::from([byte.wrapping_add(100); 32]),
+            post_withdrawals_root: B256::from([byte.wrapping_add(200); 32]),
+        }
+    }
+
+    #[test]
+    fn reset_to_anchor_clears_chain_and_installs_anchor() {
+        let (_dir, db) = temp_db();
+
+        write_advance_chain(&db, &[meta(10), meta(11), meta(12)], None).unwrap();
+        write_reset_to_anchor(&db, &meta(5)).unwrap();
+
+        let new_anchor = meta(42);
+        write_reset_to_anchor(&db, &new_anchor).unwrap();
+
+        assert_eq!(read_anchor(&db).unwrap().as_ref(), Some(&new_anchor));
+        assert_eq!(read_canonical_tip(&db).unwrap().as_ref(), Some(&new_anchor));
+        assert_eq!(read_earliest_block(&db).unwrap(), Some((42, new_anchor.block_hash)));
+        for removed in [5u64, 10, 11, 12] {
+            assert_eq!(read_block_hash(&db, removed).unwrap(), None, "stale block {removed}");
+        }
+    }
+
+    #[test]
+    fn advance_chain_inserts_and_enforces_max_len() {
+        let (_dir, db) = temp_db();
+
+        let blocks: Vec<_> = (1..=5).map(meta).collect();
+        write_advance_chain(&db, &blocks, None).unwrap();
+        assert_eq!(read_canonical_tip(&db).unwrap().unwrap().block_number, 5);
+        assert_eq!(read_earliest_block(&db).unwrap(), Some((1, blocks[0].block_hash)));
+        assert_eq!(read_block_hash(&db, 3).unwrap(), Some(blocks[2].block_hash));
+
+        write_advance_chain(&db, &[], None).unwrap();
+        assert_eq!(read_canonical_tip(&db).unwrap().unwrap().block_number, 5);
+
+        write_advance_chain(&db, &[meta(6), meta(7)], Some(3)).unwrap();
+        assert_eq!(read_earliest_block(&db).unwrap().unwrap().0, 5);
+        assert_eq!(read_canonical_tip(&db).unwrap().unwrap().block_number, 7);
+        assert_eq!(read_block_hash(&db, 1).unwrap(), None);
+        assert_eq!(read_block_hash(&db, 4).unwrap(), None);
+    }
+
+    #[test]
+    fn rollback_chain_removes_blocks_above_threshold() {
+        let (_dir, db) = temp_db();
+        write_advance_chain(&db, &(1..=5).map(meta).collect::<Vec<_>>(), None).unwrap();
+
+        write_rollback_chain(&db, 3).unwrap();
+
+        // `to_block` itself is retained; strictly higher numbers are dropped.
+        assert_eq!(read_canonical_tip(&db).unwrap().unwrap().block_number, 3);
+        assert!(read_block_hash(&db, 3).unwrap().is_some());
+        assert_eq!(read_block_hash(&db, 4).unwrap(), None);
+        assert_eq!(read_block_hash(&db, 5).unwrap(), None);
+    }
+
+    #[test]
+    fn contracts_roundtrip_and_missing_report() {
+        let (_dir, db) = temp_db();
+
+        let a = (B256::from([1u8; 32]), Arc::new(Bytecode::new_raw(Bytes::from_static(&[0x60]))));
+        let b = (B256::from([2u8; 32]), Arc::new(Bytecode::new_raw(Bytes::from_static(&[0x61]))));
+        let missing_hash = B256::from([3u8; 32]);
+
+        write_add_contracts(&db, &[]).unwrap();
+        write_add_contracts(&db, &[a.clone(), b.clone()]).unwrap();
+
+        let (found, missing) = read_contracts(&db, &[a.0, b.0, missing_hash]).unwrap();
+        assert_eq!(missing, vec![missing_hash]);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[&a.0].bytes_slice(), a.1.bytes_slice());
+        assert_eq!(found[&b.0].bytes_slice(), b.1.bytes_slice());
+    }
+}

@@ -649,6 +649,11 @@ impl DataProvider {
     /// - **New block** (above local tip or no local DB): full [`Self::witness_timeout`] applies.
     ///   This covers the "block is fresh and the witness is still being generated upstream" case
     ///   where a few seconds of waiting is normal.
+    /// - **Old / pruned block** (at or below local tip): the shorter `OLD_BLOCK_WITNESS_TIMEOUT`
+    ///   caps the wait. Witness data for such blocks is either available immediately or not at all;
+    ///   because `get_witness` retries transient errors forever, the tight cap ensures a
+    ///   pruned-block `debug_traceBlock*` returns quickly instead of burning the full
+    ///   `witness_timeout`.
     async fn fetch_witness_with_timeout(
         &self,
         block_number: u64,
@@ -758,7 +763,7 @@ impl DataProvider {
 ///
 /// Reads always return "everything missing" so the cache falls back to RPC; writes
 /// silently drop — the cache's own in-memory layer is the only persistence in this mode.
-pub struct NoopContractStore;
+pub(crate) struct NoopContractStore;
 
 impl ContractStore for NoopContractStore {
     fn get_contracts(
