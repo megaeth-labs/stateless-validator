@@ -3,8 +3,8 @@ pub mod metrics;
 pub use metrics::{RpcMethod, RpcMetrics};
 pub mod rpc_client;
 pub use rpc_client::{
-    BackoffPolicy, CodeFetchError, GetTxByHashError, RpcClient, RpcClientConfig,
-    RpcDeadlineExceeded, SetValidatedBlocksResponse, WitnessRequestKeys,
+    BackoffPolicy, CodeFetchError, RpcClient, RpcClientConfig, RpcDeadlineExceeded,
+    SetValidatedBlocksResponse, WitnessRequestKeys,
 };
 pub mod witness_size;
 pub use witness_size::{WitnessSizeBreakdown, estimate_witness_size};

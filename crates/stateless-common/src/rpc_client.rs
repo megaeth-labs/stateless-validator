@@ -656,21 +656,19 @@ impl RpcClient {
         match self.get_transaction_by_hash_with_deadline(tx_hash, None).await {
             Ok(ok) => ok,
             // `None` deadline ⇒ retry loop is truly unbounded and this branch is unreachable.
-            Err(GetTxByHashError::Deadline(e)) => {
-                unreachable!("None deadline cannot time out: {e}")
-            }
+            Err(e) => unreachable!("None deadline cannot time out: {e}"),
         }
     }
 
     /// Deadline-aware counterpart of [`Self::get_transaction_by_hash`].
     ///
-    /// On deadline: returns `Err(GetTxByHashError::Deadline)`. On a pending tx (no
-    /// block hash): returns `Ok(Err(..))`. On tx-not-found: returns `Ok(Ok(None))`.
+    /// On deadline: returns `Err(RpcDeadlineExceeded)`. On a pending tx (no block hash):
+    /// returns `Ok(Err(..))`. On tx-not-found: returns `Ok(Ok(None))`.
     pub async fn get_transaction_by_hash_with_deadline(
         &self,
         tx_hash: B256,
         deadline: Option<Instant>,
-    ) -> std::result::Result<Result<Option<(Transaction, B256)>>, GetTxByHashError> {
+    ) -> std::result::Result<Result<Option<(Transaction, B256)>>, RpcDeadlineExceeded> {
         let tx = self
             .call_with_deadline(RpcMethod::EthGetTransactionByHash, deadline, move |provider| {
                 Box::pin(async move {
@@ -690,15 +688,6 @@ impl RpcClient {
             None => Ok(None),
         })
     }
-}
-
-/// Error for [`RpcClient::get_transaction_by_hash_with_deadline`]: the deadline fired
-/// before the upstream responded. (The pending-tx case is returned in the inner `Result`,
-/// not here.)
-#[derive(Debug, thiserror::Error)]
-pub enum GetTxByHashError {
-    #[error(transparent)]
-    Deadline(#[from] RpcDeadlineExceeded),
 }
 
 /// Emits a tracing event at `warn!` or `debug!` depending on a runtime flag.
@@ -805,6 +794,11 @@ where
                                     false,
                                     Some(attempt_start.elapsed().as_secs_f64()),
                                 );
+                                // Match the invariant held by the non-timeout failure arm
+                                // below: every transient failure records both `on_rpc_complete`
+                                // and `on_rpc_retry`, so the retry counter can be reconciled
+                                // against the error counter.
+                                m.on_rpc_retry(method);
                             }
                             return Err(RpcDeadlineExceeded {
                                 method,
