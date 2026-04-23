@@ -83,6 +83,11 @@ pub enum ErrorAction {
     Halt,
 }
 
+/// Per-item result flowing from worker → advancer. The error carries a stringified
+/// message plus an `ErrorAction` (`Err` isn't `eyre::Error` because it must cross the
+/// channel as `Send + 'static` without a concrete error-type bound on `BlockProcessor`).
+pub(crate) type WorkerResult<T> = std::result::Result<T, (String, ErrorAction)>;
+
 /// Details of a detected chain reorganization.
 #[derive(Debug)]
 pub struct ReorgEvent {

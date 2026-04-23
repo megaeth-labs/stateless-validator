@@ -5,13 +5,13 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tracing::debug;
 
-use crate::pipeline::{config::ErrorAction, traits::BlockProcessor};
+use crate::pipeline::{config::WorkerResult, traits::BlockProcessor};
 
 /// Spawns N worker tasks: `fetch_rx` → `processor.process()` → `result_tx`.
 pub(crate) fn spawn_workers<P: BlockProcessor>(
     processor: Arc<P>,
     fetch_rx: kanal::Receiver<P::Input>,
-    result_tx: kanal::Sender<std::result::Result<P::Output, (String, ErrorAction)>>,
+    result_tx: kanal::Sender<WorkerResult<P::Output>>,
     count: usize,
 ) -> Vec<JoinHandle<()>> {
     (0..count)

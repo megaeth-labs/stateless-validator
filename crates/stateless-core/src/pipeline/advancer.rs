@@ -10,7 +10,7 @@ use crate::{
     ChainStore,
     db::BlockMeta,
     pipeline::{
-        config::{ErrorAction, PipelineOutcome, ReorgEvent},
+        config::{ErrorAction, PipelineOutcome, ReorgEvent, WorkerResult},
         divergence::find_divergence_point,
         traits::{BlockFetcher, PipelineHooks, ProcessedBlock},
     },
@@ -22,7 +22,7 @@ pub(crate) async fn chain_advancer<F, S, H>(
     fetcher: &F,
     store: &S,
     hooks: &H,
-    result_rx: kanal::Receiver<std::result::Result<H::Output, (String, ErrorAction)>>,
+    result_rx: kanal::Receiver<WorkerResult<H::Output>>,
     initial_tip: BlockMeta,
     shutdown: CancellationToken,
 ) -> Result<PipelineOutcome>

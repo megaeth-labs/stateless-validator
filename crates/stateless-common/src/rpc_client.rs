@@ -277,13 +277,6 @@ impl RpcClient {
         self.witness_providers.len()
     }
 
-    /// Records an RPC metrics event (final outcome) if metrics are configured.
-    fn record_rpc(&self, method: RpcMethod, success: bool, duration_secs: Option<f64>) {
-        if let Some(ref metrics) = self.config.metrics {
-            metrics.on_rpc_complete(method, success, duration_secs);
-        }
-    }
-
     /// Wraps a data-method RPC call with round-robin load balancing and round-level backoff.
     ///
     /// Each call performs rounds of "try every data provider once in round-robin order". If a
@@ -450,7 +443,9 @@ impl RpcClient {
                 trace!(error = %e, "mega_setValidatedBlocks failed");
                 eyre!("Failed to set validated blocks: {e}")
             });
-        self.record_rpc(RpcMethod::MegaSetValidatedBlocks, result.is_ok(), None);
+        if let Some(ref metrics) = self.config.metrics {
+            metrics.on_rpc_complete(RpcMethod::MegaSetValidatedBlocks, result.is_ok(), None);
+        }
         result
     }
 

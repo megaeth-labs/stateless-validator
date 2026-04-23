@@ -50,7 +50,8 @@ use eyre::Result;
 use jsonrpsee::server::{Server, ServerConfig};
 use stateless_common::{RpcClient, RpcClientConfig, logging::LogArgs};
 use stateless_core::{
-    BlockStore, ContractStore, PipelineConfig, chain_spec::ChainSpec, pipeline::run_pipeline,
+    BlockStore, ChainStore, ContractStore, PipelineConfig, chain_spec::ChainSpec, db::BlockMeta,
+    pipeline::run_pipeline,
 };
 use stateless_db::ContractCache;
 use tokio::task;
@@ -449,15 +450,16 @@ async fn init_validator_db(
         rpc_client.get_header(BlockId::latest(), false).await
     };
 
-    db.reset_anchor_block(
-        header.number,
-        header.hash,
-        header.state_root,
-        header
+    let anchor = BlockMeta {
+        block_number: header.number,
+        block_hash: header.hash,
+        post_state_root: header.state_root,
+        post_withdrawals_root: header
             .withdrawals_root
             .ok_or_else(|| eyre::eyre!("Block {} is missing withdrawals_root", header.hash))?,
-    )
-    .map_err(|e| eyre::eyre!("Failed to reset anchor: {}", e))?;
+    };
+    ChainStore::reset_to_anchor(&*db, &anchor)
+        .map_err(|e| eyre::eyre!("Failed to reset anchor: {}", e))?;
 
     info!(
         block_hash = %header.hash,
