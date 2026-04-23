@@ -290,36 +290,23 @@ impl DataProvider {
     ) -> DataProviderResult<Arc<BlockData>> {
         let start = Instant::now();
 
-        // Try the local DB first. Only `MissingData` falls through to RPC silently —
-        // real backend errors (redb I/O, decode corruption) must surface in the log,
-        // even though we still fall through so the request isn't lost.
-        if let Some(db) = &self.db {
-            match self.get_block_data_from_db(db.as_ref(), block_hash, deadline).await {
-                Ok(data) => {
-                    trace!(
-                        block_hash = %block_hash,
-                        source = "database",
-                        elapsed_ms = start.elapsed().as_millis() as u64,
-                        "Block data retrieved from local DB"
-                    );
-                    DataSourceMetrics::new_for_source("db").record();
-                    SingleFlightMetrics::new_for_type("bypassed").record();
-                    self.record_block_distance(data.block.header.number);
-                    return Ok(Arc::new(data));
-                }
-                Err(e) => match e.downcast_ref::<StoreError>() {
-                    Some(StoreError::MissingData { .. }) => {
-                        // expected cache miss; fall through to RPC
-                    }
-                    _ => {
-                        warn!(
-                            block_hash = %block_hash,
-                            error = %e,
-                            "Local DB read failed; falling back to RPC",
-                        );
-                    }
-                },
-            }
+        // Try the local DB first. `Ok(None)` = "not in DB, fall through"; `Err(..)` surfaces
+        // typed errors (e.g. a `Timeout` from contract resolution) so we don't then burn the
+        // remaining deadline on an RPC call that is guaranteed to hit the same timeout.
+        if let Some(db) = &self.db &&
+            let Some(data) =
+                self.get_block_data_from_db(db.as_ref(), block_hash, deadline).await?
+        {
+            trace!(
+                block_hash = %block_hash,
+                source = "database",
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "Block data retrieved from local DB"
+            );
+            DataSourceMetrics::new_for_source("db").record();
+            SingleFlightMetrics::new_for_type("bypassed").record();
+            self.record_block_distance(data.block.header.number);
+            return Ok(Arc::new(data));
         }
 
         // Fall back to RPC
@@ -407,23 +394,47 @@ impl DataProvider {
     ///
     /// Takes the shared `deadline` so contract resolution (which can hit RPC on cache miss)
     /// respects the same budget as the rest of the call.
+    ///
+    /// Returns:
+    /// - `Ok(Some(data))` — block found and fully resolved.
+    /// - `Ok(None)` — block not in DB (expected cache miss) OR backend read error (logged and
+    ///   treated as a miss so the caller falls through to RPC).
+    /// - `Err(..)` — typed `DataProviderError` from contract resolution (e.g. `Timeout`). These
+    ///   must surface immediately; falling through to RPC would just time out again on the shared
+    ///   deadline with confusing double-wait behavior.
     async fn get_block_data_from_db(
         &self,
         db: &dyn BlockStore,
         block_hash: alloy_primitives::BlockHash,
         deadline: Instant,
-    ) -> Result<BlockData> {
+    ) -> DataProviderResult<Option<BlockData>> {
         let overall_start = Instant::now();
 
         // Get block data from database using light witness (fast deserialization).
         let start = Instant::now();
-        let (block, witness) = db.get_block_and_witness(block_hash)?;
+        let (block, witness) = match db.get_block_and_witness(block_hash) {
+            Ok(v) => v,
+            Err(StoreError::MissingData { .. }) => return Ok(None),
+            Err(e) => {
+                // Real backend error (redb I/O, decode corruption). Log it — but still fall
+                // through to RPC so the request isn't lost. `Ok(None)` signals that to the
+                // caller, and the warn preserves the operator signal.
+                warn!(
+                    block_hash = %block_hash,
+                    error = %e,
+                    "Local DB read failed; falling back to RPC",
+                );
+                return Ok(None);
+            }
+        };
         let db_read_secs = start.elapsed().as_secs_f64();
         let db_read_ms = start.elapsed().as_millis();
 
         ChainSyncMetrics::create().record_db_read(db_read_secs);
 
-        // Extract code hashes and get contracts.
+        // Extract code hashes and get contracts. Contract resolution can time out; that typed
+        // error propagates through `?` without being wrapped in `eyre::Error`, so the caller
+        // surfaces it directly instead of misinterpreting it as a DB miss.
         let start = Instant::now();
         let code_hashes = crate::tracing_executor::extract_code_hashes(&witness);
         let num_contracts = code_hashes.len();
@@ -445,7 +456,7 @@ impl DataProvider {
             );
         }
 
-        Ok(BlockData { block, witness, contracts })
+        Ok(Some(BlockData { block, witness, contracts }))
     }
 
     /// Single-flight fetch via [`futures::future::Shared`]: concurrent callers for the same
@@ -521,18 +532,23 @@ impl DataProvider {
 /// Unwraps a `Result<Arc<BlockData>, Arc<DataProviderError>>` (the output type of the shared
 /// future) into the owned `DataProviderResult<Arc<BlockData>>` callers expect.
 ///
-/// `DataProviderError` isn't `Clone`, so `Shared` hands every caller an `Arc<_>`. To preserve
-/// the typed variant (so e.g. a `Timeout` still maps to `-32001` at the RPC layer instead of
-/// `-32000`), we try to move the error out of the `Arc`. `try_unwrap` succeeds whenever this
-/// caller is the last ref-holder — the common case once the primary has removed the map entry,
-/// and the only case when there is no coalescing at all. The rare race where primary and
-/// waiter both hold live refs falls through to `Internal`, preserving the display text.
+/// `DataProviderError` isn't `Clone`, so `Shared` hands every caller an `Arc<_>`. `Arc::try_unwrap`
+/// isn't a viable extraction path here: `Shared`'s internal `Inner` holds its own clone of the
+/// result for as long as the local `shared` binding lives at the call site, so the refcount is
+/// always ≥ 2 when this function runs. Instead, we reconstruct the typed variant from a shared
+/// reference — every variant except `Internal` carries only `Copy` fields, and `Internal`'s
+/// `eyre::Error` is rebuilt via its display text. The RPC layer thus keeps seeing `-32001` for
+/// `Timeout` etc. regardless of how many callers coalesced on the same fetch.
 fn shared_to_result(
     r: std::result::Result<Arc<BlockData>, Arc<DataProviderError>>,
 ) -> DataProviderResult<Arc<BlockData>> {
-    r.map_err(|e| match Arc::try_unwrap(e) {
-        Ok(owned) => owned,
-        Err(arc) => DataProviderError::Internal(eyre::eyre!("{arc}")),
+    r.map_err(|arc| match arc.as_ref() {
+        DataProviderError::Timeout { stage, elapsed } => {
+            DataProviderError::Timeout { stage: *stage, elapsed: *elapsed }
+        }
+        DataProviderError::TransactionNotFound(h) => DataProviderError::TransactionNotFound(*h),
+        DataProviderError::TransactionPending(h) => DataProviderError::TransactionPending(*h),
+        DataProviderError::Internal(e) => DataProviderError::Internal(eyre::eyre!("{e}")),
     })
 }
 
