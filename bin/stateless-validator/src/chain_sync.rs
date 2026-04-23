@@ -186,8 +186,9 @@ impl BlockProcessor for ValidatorProcessor {
 
         if !missing_contracts.is_empty() {
             // `VerificationFailure` is deterministic (a bad upstream or a bad witness) — halt.
-            // Everything else in `CodeFetchError::Other` is a transient RPC / transport /
-            // decode error from below `round_robin_with_backoff` that's worth retrying.
+            // `Other` is unreachable from `get_codes` itself: `get_code` retries internally via
+            // `round_robin_with_backoff` and never surfaces a transport/decode error to callers.
+            // The variant exists for API ergonomics (external callers can use `?` with eyre::Error).
             let fetched =
                 self.rpc_client.get_codes(&missing_contracts, true).await.map_err(|e| match e {
                     stateless_common::CodeFetchError::VerificationFailure { .. } => {
