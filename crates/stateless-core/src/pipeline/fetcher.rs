@@ -188,13 +188,9 @@ pub async fn block_fetcher<F: BlockFetcher>(
     config: Arc<PipelineConfig>,
     shutdown: CancellationToken,
 ) -> Result<()> {
-    /// Cap on `next_block - base_block`, as a multiple of `max_in_flight`. Bounds memory
-    /// when a persistently-failing block stalls `base_block` while the chain advances.
-    const FETCH_WINDOW_MULTIPLIER: u64 = 4;
-
     let tx = tx.to_async();
     let max_in_flight = config.fetcher_max_in_flight();
-    let max_window = (max_in_flight as u64) * FETCH_WINDOW_MULTIPLIER;
+    let max_window = config.fetch_window();
     let tip_buffer = config.tip_buffer;
     info!(start_block, max_in_flight, max_window, tip_buffer, "Starting");
 

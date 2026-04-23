@@ -39,7 +39,10 @@ pub(crate) fn spawn_workers<P: BlockProcessor>(
                         Err(e) => {
                             processor.on_task_done(worker_id, false);
                             let action = processor.error_action(&e);
-                            Err((e.to_string(), action))
+                            // Erase to `Arc<dyn Error + ..>` so the advancer can log the
+                            // source chain via `%err` without knowing the concrete type,
+                            // and without paying a `String` allocation per failure.
+                            Err((Arc::new(e) as Arc<dyn std::error::Error + Send + Sync>, action))
                         }
                     };
 

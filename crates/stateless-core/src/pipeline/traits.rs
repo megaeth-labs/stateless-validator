@@ -1,6 +1,6 @@
 //! Pluggable traits that customize pipeline behavior per binary.
 
-use std::{fmt::Display, future::Future, sync::Arc};
+use std::{future::Future, sync::Arc};
 
 use alloy_primitives::{BlockHash, BlockNumber};
 use eyre::Result;
@@ -68,8 +68,10 @@ pub trait BlockProcessor: Send + Sync + 'static {
     type Input: Send + 'static;
     /// Output type sent to the chain advancer.
     type Output: ProcessedBlock;
-    /// Error type for processing failures.
-    type Error: Display + Send + 'static;
+    /// Error type for processing failures. Must implement `std::error::Error` so the
+    /// advancer can log the chained source while the channel carries it as
+    /// `Arc<dyn Error + Send + Sync>` (see [`crate::pipeline::WorkerResult`]).
+    type Error: std::error::Error + Send + Sync + 'static;
 
     /// Process a single block (called from N worker tasks in parallel).
     fn process(

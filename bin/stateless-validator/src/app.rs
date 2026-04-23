@@ -128,6 +128,13 @@ pub struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_RPC_MAX_BACKOFF_MS")]
     pub rpc_max_backoff_ms: Option<u64>,
 
+    /// Soft cap on rows retained in the canonical-chain table. Old rows are pruned inline
+    /// when `advance_chain` exceeds this. Larger values bound the reorg-lookup window;
+    /// smaller values reduce redb file growth. Defaults to `DEFAULT_MAX_CHAIN_LENGTH`
+    /// (see `stateless_db::DEFAULT_MAX_CHAIN_LENGTH`).
+    #[clap(long, env = "STATELESS_VALIDATOR_CANONICAL_CHAIN_MAX_LENGTH")]
+    pub canonical_chain_max_length: Option<u64>,
+
     /// Logging configuration.
     #[command(flatten)]
     pub log: LogArgs,
@@ -165,14 +172,8 @@ pub async fn run() -> Result<()> {
 
     let rpc_defaults = RpcClientConfig::validator();
     let rpc_retry = BackoffPolicy {
-        initial: args
-            .rpc_initial_backoff_ms
-            .map(Duration::from_millis)
-            .unwrap_or(rpc_defaults.rpc_retry.initial),
-        max: args
-            .rpc_max_backoff_ms
-            .map(Duration::from_millis)
-            .unwrap_or(rpc_defaults.rpc_retry.max),
+        initial: override_ms(args.rpc_initial_backoff_ms, rpc_defaults.rpc_retry.initial),
+        max: override_ms(args.rpc_max_backoff_ms, rpc_defaults.rpc_retry.max),
     };
     let rpc_config = RpcClientConfig {
         data_max_concurrent_requests: args.data_max_concurrent_requests,
@@ -189,7 +190,10 @@ pub async fn run() -> Result<()> {
         rpc_config,
         args.report_validation_endpoint.as_deref(),
     )?);
-    let validator_db = Arc::new(ValidatorDB::new(work_dir.join(VALIDATOR_DB_FILENAME))?);
+    let validator_db = Arc::new(ValidatorDB::with_max_chain_length(
+        work_dir.join(VALIDATOR_DB_FILENAME),
+        args.canonical_chain_max_length.unwrap_or(stateless_db::DEFAULT_MAX_CHAIN_LENGTH),
+    )?);
     let contract_cache =
         Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
 
@@ -234,21 +238,17 @@ pub async fn run() -> Result<()> {
         );
     }
 
-    let pipeline_defaults = stateless_core::PipelineConfig::default();
-    let pipeline_config = stateless_core::PipelineConfig {
-        poll_interval: args
-            .poll_interval_ms
-            .map(Duration::from_millis)
-            .unwrap_or(pipeline_defaults.poll_interval),
-        error_restart_delay: args
-            .error_restart_delay_ms
-            .map(Duration::from_millis)
-            .unwrap_or(pipeline_defaults.error_restart_delay),
-        // Stay 3 blocks behind the remote tip so the upstream witness generator has headroom
-        // to finish the block we'd otherwise race it for.
-        tip_buffer: 3,
-        ..pipeline_defaults
-    };
+    // `#[non_exhaustive]` on `PipelineConfig` rules out the struct-update shorthand at the
+    // crate boundary — mutate a default instance instead, which is the pattern the attribute
+    // is designed around.
+    let mut pipeline_config = stateless_core::PipelineConfig::default();
+    pipeline_config.poll_interval =
+        override_ms(args.poll_interval_ms, pipeline_config.poll_interval);
+    pipeline_config.error_restart_delay =
+        override_ms(args.error_restart_delay_ms, pipeline_config.error_restart_delay);
+    // Stay 3 blocks behind the remote tip so the upstream witness generator has headroom
+    // to finish the block we'd otherwise race it for.
+    pipeline_config.tip_buffer = 3;
 
     let result = workers::run_with_signals(
         client,
@@ -262,4 +262,12 @@ pub async fn run() -> Result<()> {
 
     info!(elapsed = ?start.elapsed(), "Shutdown complete");
     result
+}
+
+/// Returns `ms.map(Duration::from_millis)` if `ms` is `Some`, else `default`.
+///
+/// Collapses the four `.map(Duration::from_millis).unwrap_or(default)` chains that
+/// otherwise spread across the backoff + pipeline-config overrides.
+fn override_ms(ms: Option<u64>, default: Duration) -> Duration {
+    ms.map(Duration::from_millis).unwrap_or(default)
 }

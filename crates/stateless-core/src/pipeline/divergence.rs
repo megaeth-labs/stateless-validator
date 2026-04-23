@@ -3,9 +3,40 @@
 use alloy_primitives::{BlockHash, BlockNumber};
 use tracing::{debug, instrument};
 
-use crate::{db::StoreError, pipeline::traits::BlockFetcher};
+use crate::{
+    ChainStore,
+    db::{StoreError, StoreResult},
+    pipeline::traits::BlockFetcher,
+};
+
+/// Minimal lookup surface that [`find_divergence_point`] needs from the local chain store.
+///
+/// Extracted from `ChainStore` so tests can implement a lightweight in-memory backend
+/// without having to stub every `ChainStore` method. Every `ChainStore` blanket-implements
+/// this trait automatically.
+pub trait DivergenceLookups {
+    /// Hash for the block at `block_number`, or `None` if it's not in local history.
+    fn get_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>>;
+    /// The oldest (lowest-number, highest-depth) block still in local history.
+    fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>>;
+}
+
+impl<S: ChainStore + ?Sized> DivergenceLookups for S {
+    fn get_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>> {
+        ChainStore::get_block_hash(self, block_number)
+    }
+    fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
+        ChainStore::get_earliest_block(self)
+    }
+}
 
 /// Errors from [`find_divergence_point`], classified for the pipeline.
+///
+/// Two categories: the structured `CatastrophicReorg` / `LocalChainCorrupt` variants are
+/// fatal (operator must intervene); `Transient` wraps everything else (RPC timeout, store
+/// error, etc.). The previous split of `Rpc` vs `Store` was dropped — the advancer's only
+/// distinction was `is_fatal()`, and it was round-tripping both back through `eyre::Error`
+/// anyway, so the extra variant didn't earn its keep.
 #[derive(Debug, thiserror::Error)]
 pub enum DivergenceError {
     /// Earliest local block doesn't match remote — reorg deeper than our history.
@@ -24,13 +55,16 @@ pub enum DivergenceError {
     )]
     LocalChainCorrupt { block_number: BlockNumber },
 
-    /// Transient RPC error during divergence search (e.g., timeout).
+    /// Transient error during divergence search — RPC timeout, store I/O, etc. Caller
+    /// retries the cycle.
     #[error(transparent)]
-    Rpc(#[from] eyre::Error),
+    Transient(#[from] eyre::Error),
+}
 
-    /// Transient local-store error during divergence search.
-    #[error(transparent)]
-    Store(#[from] StoreError),
+impl From<StoreError> for DivergenceError {
+    fn from(e: StoreError) -> Self {
+        DivergenceError::Transient(e.into())
+    }
 }
 
 impl DivergenceError {
@@ -43,22 +77,24 @@ impl DivergenceError {
 /// Finds where the local chain diverges from the remote.
 ///
 /// Uses exponential search (efficient for near-tip reorgs) followed by binary search.
-/// Backend-agnostic: takes closures for local chain lookups that return [`StoreResult`],
-/// while remote lookups use the `BlockFetcher`'s `eyre::Result`.
-/// [`DivergenceError`] converts from both via `#[from]`.
+/// Backend-agnostic: takes a [`DivergenceLookups`] for local chain reads (implemented
+/// automatically for every [`ChainStore`]); remote reads go through the
+/// `BlockFetcher`'s `eyre::Result`. [`DivergenceError`] wraps both.
 #[instrument(skip_all, fields(mismatch_block), name = "find_divergence")]
-pub async fn find_divergence_point<F: BlockFetcher>(
+pub async fn find_divergence_point<F, L>(
     fetcher: &F,
-    get_hash: &(dyn Fn(u64) -> crate::db::StoreResult<Option<BlockHash>> + Send + Sync),
-    get_earliest: &(
-         dyn Fn() -> crate::db::StoreResult<Option<(BlockNumber, BlockHash)>> + Send + Sync
-     ),
+    lookups: &L,
     mismatch_block: u64,
-) -> std::result::Result<u64, DivergenceError> {
+) -> std::result::Result<u64, DivergenceError>
+where
+    F: BlockFetcher,
+    L: DivergenceLookups + ?Sized,
+{
     // Empty-chain is not reachable when the advancer calls us (it only triggers a reorg
     // after `current_tip` is set), but returning a typed fatal error keeps a future caller
     // from panicking the pipeline task.
-    let earliest_local = get_earliest()?
+    let earliest_local = lookups
+        .get_earliest()?
         .ok_or(DivergenceError::LocalChainCorrupt { block_number: mismatch_block })?;
 
     let earliest_remote_hash = fetcher.block_hash(earliest_local.0).await?;
@@ -77,7 +113,8 @@ pub async fn find_divergence_point<F: BlockFetcher>(
 
     while last_mismatch > earliest_local.0 {
         let check_block = last_mismatch.saturating_sub(step).max(earliest_local.0);
-        let local_hash = get_hash(check_block)?
+        let local_hash = lookups
+            .get_hash(check_block)?
             .ok_or(DivergenceError::LocalChainCorrupt { block_number: check_block })?;
         let remote_hash = fetcher.block_hash(check_block).await?;
 
@@ -94,8 +131,9 @@ pub async fn find_divergence_point<F: BlockFetcher>(
     let (mut left, mut right, mut last_matching) = (search_start, last_mismatch, search_start);
     while left <= right {
         let mid = left + (right - left) / 2;
-        let local_hash =
-            get_hash(mid)?.ok_or(DivergenceError::LocalChainCorrupt { block_number: mid })?;
+        let local_hash = lookups
+            .get_hash(mid)?
+            .ok_or(DivergenceError::LocalChainCorrupt { block_number: mid })?;
         let remote_hash = fetcher.block_hash(mid).await?;
         if remote_hash == local_hash {
             last_matching = mid;

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use eyre::{Result, anyhow};
+use eyre::Result;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
@@ -49,13 +49,15 @@ where
         let item = tokio::select! {
             r = rx.recv() => match r {
                 Ok(Ok(item)) => item,
-                Ok(Err((msg, ErrorAction::Halt))) => {
-                    error!(error = %msg, "Fatal processing error, halting");
-                    return Ok(PipelineOutcome::Fatal(msg));
+                Ok(Err((err, ErrorAction::Halt))) => {
+                    // `%err` via the `Error` trait prints the full cause chain so operators
+                    // see the root cause, not just the top-level message.
+                    error!(error = %err, "Fatal processing error, halting");
+                    return Ok(PipelineOutcome::Fatal(err.to_string()));
                 }
-                Ok(Err((msg, ErrorAction::Retry))) => {
-                    warn!(error = %msg, "Transient processing error, restarting cycle");
-                    return Err(anyhow!("{msg}"));
+                Ok(Err((err, ErrorAction::Retry))) => {
+                    warn!(error = %err, "Transient processing error, restarting cycle");
+                    return Ok(PipelineOutcome::Retry(err.to_string()));
                 }
                 Err(_) => return Ok(PipelineOutcome::Shutdown),
             },
@@ -75,14 +77,7 @@ where
                     "Parent hash mismatch — reorg detected"
                 );
 
-                let rollback_to = match find_divergence_point(
-                    fetcher,
-                    &|n| store.get_block_hash(n),
-                    &|| store.get_earliest_block(),
-                    persisted_tip,
-                )
-                .await
-                {
+                let rollback_to = match find_divergence_point(fetcher, store, persisted_tip).await {
                     Ok(v) => v,
                     Err(e) if e.is_fatal() => {
                         return Ok(PipelineOutcome::Fatal(e.to_string()));

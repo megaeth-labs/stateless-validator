@@ -338,12 +338,13 @@ async fn main() -> Result<()> {
         let shutdown = CancellationToken::new();
         debug!("Starting chain sync pipeline");
 
-        // Spawn unified pipeline (fetch → process → advance with reorg restart)
-        let config = Arc::new(PipelineConfig {
-            concurrent_workers: 1,
-            stale_reset_threshold: Some(args.blocks_to_keep),
-            ..PipelineConfig::default()
-        });
+        // Spawn unified pipeline (fetch → process → advance with reorg restart).
+        // `#[non_exhaustive]` on `PipelineConfig` rules out struct-update syntax across
+        // the crate boundary; mutate a default instance instead.
+        let mut pipeline_cfg = PipelineConfig::default();
+        pipeline_cfg.concurrent_workers = 1;
+        pipeline_cfg.stale_reset_threshold = Some(args.blocks_to_keep);
+        let config = Arc::new(pipeline_cfg);
         let processor = Arc::new(TraceProcessor);
         let hooks = Arc::new(TraceHooks::new(
             Arc::clone(db) as Arc<dyn BlockStore>,

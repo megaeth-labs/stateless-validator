@@ -82,6 +82,53 @@ pub const DEFAULT_BLOCK_FETCH_TIMEOUT_SECS: u64 = 13;
 /// Slow stage threshold: any individual stage exceeding this triggers a warn log.
 pub(crate) const SLOW_STAGE_THRESHOLD_MS: u128 = 1000;
 
+/// Errors returned by [`DataProvider`]'s user-facing fetch methods.
+///
+/// The enum classifies up-front so the RPC layer can map variants to JSON-RPC error codes
+/// without string-matching. `Internal` is the catch-all for transport / decode / DB errors;
+/// everything else is a deterministic "not found" or a timeout caused by `RpcClient`'s
+/// unbounded retry loop.
+#[derive(Debug, thiserror::Error)]
+pub enum DataProviderError {
+    #[error("transaction {0} not found")]
+    TransactionNotFound(B256),
+    #[error("transaction {0} is pending")]
+    TransactionPending(B256),
+    #[error("witness fetch timed out after {0:?}")]
+    WitnessTimeout(Duration),
+    #[error("block fetch timed out after {0:?}")]
+    BlockFetchTimeout(Duration),
+    #[error(transparent)]
+    Internal(#[from] eyre::Error),
+}
+
+impl DataProviderError {
+    /// Converts into a JSON-RPC error. Everything that could plausibly be a client mistake
+    /// (tx / pending / timeouts while `RpcClient`'s unbounded retry loop can't satisfy the
+    /// request) maps to `-32001 resource not found` so operators see a consistent response
+    /// for the hot-path "block doesn't exist upstream" and "upstream is slow" cases.
+    /// Genuine internal failures fall through to `-32000`.
+    pub fn to_rpc_error(&self) -> jsonrpsee::types::ErrorObjectOwned {
+        use jsonrpsee::types::ErrorObjectOwned;
+        const NOT_FOUND: i32 = -32001;
+        const INTERNAL: i32 = -32000;
+        match self {
+            DataProviderError::TransactionNotFound(_) |
+            DataProviderError::TransactionPending(_) |
+            DataProviderError::WitnessTimeout(_) |
+            DataProviderError::BlockFetchTimeout(_) => {
+                ErrorObjectOwned::owned(NOT_FOUND, self.to_string(), None::<()>)
+            }
+            DataProviderError::Internal(_) => {
+                ErrorObjectOwned::owned(INTERNAL, "internal error".to_string(), None::<()>)
+            }
+        }
+    }
+}
+
+/// Result alias for [`DataProvider`] fetch methods.
+pub type DataProviderResult<T> = std::result::Result<T, DataProviderError>;
+
 /// Broadcast sender type for single-flight request pattern.
 /// Used to notify all waiters when a block fetch completes.
 ///
@@ -156,8 +203,8 @@ impl DataProvider {
     ///
     /// # Returns
     /// * `Ok(Arc<BlockData>)` - Block data including witness and contracts
-    /// * `Err` - If the block cannot be fetched from any source
-    pub async fn get_block_data(&self, block_num: u64) -> Result<Arc<BlockData>> {
+    /// * `Err(DataProviderError)` - Typed error variant describing the failure mode
+    pub async fn get_block_data(&self, block_num: u64) -> DataProviderResult<Arc<BlockData>> {
         // Try to get block hash from local database first
         if let Some(db) = &self.db &&
             let Ok(Some(hash)) = db.get_block_hash(block_num)
@@ -166,20 +213,14 @@ impl DataProvider {
         }
 
         // Fall back to RPC. The underlying `get_block_hash` retries unbounded; bound it with
-        // `block_fetch_timeout` so a future/invalid block number surfaces as an error instead
-        // of hanging the caller.
+        // `block_fetch_timeout` so a future/invalid block number surfaces as a typed timeout
+        // rather than hanging the caller.
         let block_hash = tokio::time::timeout(
             self.block_fetch_timeout,
             self.rpc_client.get_block_hash(block_num),
         )
         .await
-        .map_err(|_| {
-            eyre::eyre!(
-                "Block hash lookup for block {} timed out after {}s",
-                block_num,
-                self.block_fetch_timeout.as_secs(),
-            )
-        })?;
+        .map_err(|_| DataProviderError::BlockFetchTimeout(self.block_fetch_timeout))?;
 
         self.get_block_data_by_hash(block_hash).await
     }
@@ -194,7 +235,10 @@ impl DataProvider {
     /// # Returns
     /// * `Ok(Arc<BlockData>)` - Block data including witness and contracts
     /// * `Err` - If the block cannot be fetched from any source
-    pub async fn get_block_data_by_hash(&self, block_hash: B256) -> Result<Arc<BlockData>> {
+    pub async fn get_block_data_by_hash(
+        &self,
+        block_hash: B256,
+    ) -> DataProviderResult<Arc<BlockData>> {
         let start = std::time::Instant::now();
 
         // Try the local DB first. Only `MissingData` falls through to RPC silently —
@@ -261,7 +305,10 @@ impl DataProvider {
     /// * `Ok((Arc<BlockData>, usize))` - Block data and transaction index
     /// * `Err` - If transaction not found or is still pending
     #[instrument(skip(self), name = "get_block_data_for_tx", fields(tx_hash = %tx_hash))]
-    pub async fn get_block_data_for_tx(&self, tx_hash: B256) -> Result<(Arc<BlockData>, usize)> {
+    pub async fn get_block_data_for_tx(
+        &self,
+        tx_hash: B256,
+    ) -> DataProviderResult<(Arc<BlockData>, usize)> {
         trace!(tx_hash = %tx_hash, "Looking up transaction");
 
         // Fetch the transaction to find its block
@@ -269,11 +316,10 @@ impl DataProvider {
             .rpc_client
             .get_transaction_by_hash(tx_hash)
             .await?
-            .ok_or_else(|| eyre::eyre!("Transaction {} not found", tx_hash))?;
+            .ok_or(DataProviderError::TransactionNotFound(tx_hash))?;
 
         let tx_index =
-            tx.transaction_index.ok_or_else(|| eyre::eyre!("Transaction {} is pending", tx_hash))?
-                as usize;
+            tx.transaction_index.ok_or(DataProviderError::TransactionPending(tx_hash))? as usize;
 
         debug!(
             tx_hash = %tx_hash,
@@ -370,7 +416,10 @@ impl DataProvider {
     }
 
     /// Fetches block data from RPC by block hash with single-flight coalescing.
-    async fn fetch_block_data_by_hash_from_rpc(&self, block_hash: B256) -> Result<Arc<BlockData>> {
+    async fn fetch_block_data_by_hash_from_rpc(
+        &self,
+        block_hash: B256,
+    ) -> DataProviderResult<Arc<BlockData>> {
         self.fetch_block_data_single_flight(block_hash).await
     }
 
@@ -382,9 +431,15 @@ impl DataProvider {
     /// 3. When fetch completes, result is broadcast to all waiters
     ///
     /// This prevents redundant RPC calls and reduces upstream load.
-    async fn fetch_block_data_single_flight(&self, block_hash: B256) -> Result<Arc<BlockData>> {
+    async fn fetch_block_data_single_flight(
+        &self,
+        block_hash: B256,
+    ) -> DataProviderResult<Arc<BlockData>> {
         // Atomic check-and-insert via `entry()` — a plain `get` + `insert` sequence would
         // let two callers both observe "vacant" and each kick off their own RPC fetch.
+        // Coalesced waiters receive the outcome as a `String` (errors aren't Clone) and
+        // are mapped back to `DataProviderError::Internal` — the primary fetcher's
+        // variant-level classification still lands on its direct caller.
         let tx = match self.in_flight.entry(block_hash) {
             dashmap::Entry::Occupied(occupied) => {
                 let mut receiver = occupied.get().subscribe();
@@ -394,8 +449,13 @@ impl DataProvider {
                 return receiver
                     .recv()
                     .await
-                    .map_err(|e| eyre::eyre!("Failed to receive from in-flight request: {}", e))?
-                    .map_err(|e| eyre::eyre!("{}", e));
+                    .map_err(|e| {
+                        DataProviderError::Internal(eyre::eyre!(
+                            "Failed to receive from in-flight request: {}",
+                            e
+                        ))
+                    })?
+                    .map_err(|e| DataProviderError::Internal(eyre::eyre!("{}", e)));
             }
             dashmap::Entry::Vacant(vacant) => {
                 let (tx, _) = broadcast::channel(1);
@@ -415,21 +475,18 @@ impl DataProvider {
         // `RpcClient`'s unbounded round-robin retry loop. The inner `witness_timeout` still
         // applies to the witness stage specifically; this outer bound covers the header/block/
         // contract stages which have no inner timeout of their own.
-        let result = match tokio::time::timeout(
+        let result: DataProviderResult<Arc<BlockData>> = match tokio::time::timeout(
             self.block_fetch_timeout,
             self.do_fetch_block_data(block_hash),
         )
         .await
         {
             Ok(r) => r.map(Arc::new),
-            Err(_) => Err(eyre::eyre!(
-                "Block fetch for {} timed out after {}s",
-                block_hash,
-                self.block_fetch_timeout.as_secs(),
-            )),
+            Err(_) => Err(DataProviderError::BlockFetchTimeout(self.block_fetch_timeout)),
         };
 
-        // Clone is an Arc refcount bump; eyre::Error is not Clone so errors are stringified.
+        // Clone is an Arc refcount bump; `DataProviderError` is not Clone so errors
+        // are stringified for coalesced waiters (they'll see `Internal(eyre::Error)`).
         let broadcast_result = result.as_ref().map(Arc::clone).map_err(|e| e.to_string());
 
         // Remove BEFORE send. `broadcast::Receiver` cursors set in `subscribe()` are
@@ -452,7 +509,7 @@ impl DataProvider {
     /// 2. Fetch witness and full block in parallel
     /// 3. Convert SaltWitness to LightWitness
     /// 4. Extract code hashes from witness and fetch contract bytecodes
-    async fn do_fetch_block_data(&self, block_hash: B256) -> Result<BlockData> {
+    async fn do_fetch_block_data(&self, block_hash: B256) -> DataProviderResult<BlockData> {
         let overall_start = std::time::Instant::now();
         let upstream_header = UpstreamMetrics::new_for_method("eth_getHeaderByHash");
         let upstream_block = UpstreamMetrics::new_for_method("eth_getBlockByHash");
@@ -469,7 +526,7 @@ impl DataProvider {
         let (witness_timed, block_timed) = tokio::join!(
             async {
                 let start = std::time::Instant::now();
-                let result = self.fetch_witness_with_fallback(block_number, header.hash).await;
+                let result = self.fetch_witness_with_timeout(block_number, header.hash).await;
                 (result, start.elapsed())
             },
             async {
@@ -532,14 +589,15 @@ impl DataProvider {
     ///
     /// The underlying `RpcClient::get_witness` retries transient failures forever internally;
     /// this wrapper imposes a time bound so a user-facing RPC request never hangs. On timeout
-    /// the caller surfaces an error back to the RPC client. `witness_timeout` covers the "block
-    /// is fresh and the witness is still being generated upstream" case for new blocks; for old
-    /// blocks the RPC layer's round-robin + backoff reaches an upstream conclusion quickly.
-    async fn fetch_witness_with_fallback(
+    /// the caller receives a typed [`DataProviderError::WitnessTimeout`]. `witness_timeout`
+    /// covers the "block is fresh and the witness is still being generated upstream" case for
+    /// new blocks; for old blocks the RPC layer's round-robin + backoff reaches an upstream
+    /// conclusion quickly.
+    async fn fetch_witness_with_timeout(
         &self,
         block_number: u64,
         block_hash: B256,
-    ) -> Result<(SaltWitness, MptWitness)> {
+    ) -> DataProviderResult<(SaltWitness, MptWitness)> {
         let db_max_height = self
             .db
             .as_ref()
@@ -571,11 +629,7 @@ impl DataProvider {
                     timeout_ms = self.witness_timeout.as_millis() as u64,
                     "Witness fetch timeout",
                 );
-                Err(eyre::eyre!(
-                    "Witness fetch timeout after {:?} for block {}",
-                    self.witness_timeout,
-                    block_number
-                ))
+                Err(DataProviderError::WitnessTimeout(self.witness_timeout))
             }
         }
     }
@@ -735,12 +789,54 @@ mod tests {
             Ok(_) => panic!("hanging upstream must surface as an error"),
             Err(e) => e,
         };
-        assert!(err.to_string().contains("timed out"), "expected timeout error, got: {err}");
+        assert!(
+            matches!(err, DataProviderError::BlockFetchTimeout(_)),
+            "expected BlockFetchTimeout, got: {err:?}",
+        );
         // Allow generous headroom for retry backoff + scheduling; ≤5s proves the unbounded loop
         // is actually bounded.
         assert!(
             elapsed < Duration::from_secs(5),
             "timeout must fire quickly; elapsed: {elapsed:?}"
         );
+    }
+
+    /// Each `DataProviderError` variant maps to a specific JSON-RPC error code. Missing /
+    /// timeout cases must surface as `-32001` (resource not found); `Internal` falls through
+    /// to `-32000`. Replaces the ad-hoc string-matching classifiers in `rpc_service.rs`.
+    #[test]
+    fn data_provider_error_to_rpc_error_code_mapping() {
+        let tx_hash = B256::from([0x11; 32]);
+
+        let not_found_variants: [DataProviderError; 4] = [
+            DataProviderError::TransactionNotFound(tx_hash),
+            DataProviderError::TransactionPending(tx_hash),
+            DataProviderError::WitnessTimeout(Duration::from_secs(8)),
+            DataProviderError::BlockFetchTimeout(Duration::from_secs(13)),
+        ];
+
+        for variant in not_found_variants {
+            let err = variant.to_rpc_error();
+            assert_eq!(err.code(), -32001, "variant {variant:?} must map to resource-not-found");
+            // Display text surfaces in the RPC message — confirm it's non-empty and matches the
+            // variant's `#[error(..)]` string so operators see the same wording in both places.
+            assert_eq!(err.message(), variant.to_string().as_str());
+        }
+
+        let internal = DataProviderError::Internal(eyre::eyre!("boom"));
+        let err = internal.to_rpc_error();
+        assert_eq!(err.code(), -32000);
+        assert_eq!(err.message(), "internal error");
+    }
+
+    /// `eyre::Error` auto-converts into `DataProviderError::Internal` via `#[from]` so call
+    /// sites can keep using `?` for transport / decode errors without explicit wrapping.
+    #[test]
+    fn internal_from_eyre_conversion() {
+        fn boundary() -> DataProviderResult<()> {
+            Err(eyre::eyre!("downstream error"))?
+        }
+        let err = boundary().unwrap_err();
+        assert!(matches!(err, DataProviderError::Internal(_)));
     }
 }

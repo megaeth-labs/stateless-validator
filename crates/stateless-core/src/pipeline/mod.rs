@@ -26,7 +26,7 @@ use std::{sync::Arc, time::Duration};
 use advancer::chain_advancer;
 use config::WorkerResult;
 pub use config::{ErrorAction, PipelineConfig, PipelineOutcome, ReorgEvent};
-pub use divergence::{DivergenceError, find_divergence_point};
+pub use divergence::{DivergenceError, DivergenceLookups, find_divergence_point};
 use eyre::{Result, anyhow};
 pub use fetcher::block_fetcher;
 use tokio::task::JoinHandle;
@@ -89,7 +89,7 @@ where
         fetcher_shutdown.cancel();
         await_handles(fetcher_handle, worker_handles, config.await_handles_timeout).await;
 
-        match outcome {
+        let transient_reason: String = match outcome {
             Ok(PipelineOutcome::Shutdown) => {
                 info!("Shutting down");
                 return Ok(());
@@ -111,38 +111,78 @@ where
                 // chain_advancer round-trip — neither path can spin tight here.
                 continue;
             }
+            Ok(PipelineOutcome::Retry(msg)) => {
+                warn!(reason = %msg, "Cycle ended with retry signal");
+                msg
+            }
             Err(e) => {
-                error!(error = %e, "Cycle ended with error");
+                // Any `Err` at this level is unexpected (every intentional transient/fatal
+                // case returns `Ok(PipelineOutcome::..)`). Log and fall into the same
+                // stale-detect + sleep + continue recovery path as `Retry`.
+                error!(error = %e, "Cycle ended with unexpected error");
+                e.to_string()
+            }
+        };
 
-                // Stale detection (optional)
-                if let Some(threshold) = config.stale_reset_threshold &&
-                    let Ok(chain_latest) = fetcher.latest_block_number().await &&
-                    let Ok(Some(tip)) = store.get_canonical_tip() &&
-                    chain_latest > tip.block_number + threshold
-                {
-                    warn!(
-                        tip = tip.block_number,
-                        chain_latest, threshold, "Local data is stale, resetting anchor"
-                    );
-                    match fetcher.latest_block_meta().await {
-                        Ok(new_anchor) => {
-                            hooks.on_stale_reset(&new_anchor)?;
-                            store.reset_to_anchor(&new_anchor)?;
-                            continue;
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "Failed to fetch latest block for anchor reset");
-                        }
-                    }
-                }
+        if handle_transient_restart(
+            transient_reason,
+            &*fetcher,
+            &*store,
+            &*hooks,
+            &config,
+            &shutdown,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+    }
+}
 
-                tokio::select! {
-                    _ = tokio::time::sleep(config.error_restart_delay) => {}
-                    _ = shutdown.cancelled() => return Ok(()),
-                }
-                continue;
+/// Runs the common recovery path for transient cycle endings (`PipelineOutcome::Retry` or
+/// an unexpected `Err`): optional stale-anchor reset, then sleep + restart.
+///
+/// Returns `Ok(true)` if the outer caller should return `Ok(())` (shutdown fired); otherwise
+/// returns `Ok(false)` so the outer loop `continue`s. Propagates `Err` only for store /
+/// hook failures the caller can't meaningfully recover from.
+async fn handle_transient_restart<F, S, H>(
+    _reason: String,
+    fetcher: &F,
+    store: &S,
+    hooks: &H,
+    config: &PipelineConfig,
+    shutdown: &CancellationToken,
+) -> Result<bool>
+where
+    F: BlockFetcher,
+    S: ChainStore,
+    H: PipelineHooks,
+{
+    // Stale detection (optional)
+    if let Some(threshold) = config.stale_reset_threshold &&
+        let Ok(chain_latest) = fetcher.latest_block_number().await &&
+        let Ok(Some(tip)) = store.get_canonical_tip() &&
+        chain_latest > tip.block_number + threshold
+    {
+        warn!(
+            tip = tip.block_number,
+            chain_latest, threshold, "Local data is stale, resetting anchor"
+        );
+        match fetcher.latest_block_meta().await {
+            Ok(new_anchor) => {
+                hooks.on_stale_reset(&new_anchor)?;
+                store.reset_to_anchor(&new_anchor)?;
+                return Ok(false);
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to fetch latest block for anchor reset");
             }
         }
+    }
+
+    tokio::select! {
+        _ = tokio::time::sleep(config.error_restart_delay) => Ok(false),
+        _ = shutdown.cancelled() => Ok(true),
     }
 }
 
