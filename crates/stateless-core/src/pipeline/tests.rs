@@ -231,6 +231,76 @@ async fn test_chain_advancer_out_of_order() {
     assert_eq!(store.get_canonical_tip().unwrap().unwrap().block_number, 13);
 }
 
+/// `MockBlock` that fails `verify_continuity`. Used only by the companion test below —
+/// `MockBlock`'s default `verify_continuity` returns `Ok`, so it can't exercise the
+/// `advancer.rs:109` branch that treats a continuity failure as Fatal.
+#[derive(Clone, Debug)]
+struct BadBlock(MockBlock);
+impl ProcessedBlock for BadBlock {
+    fn block_number(&self) -> BlockNumber {
+        self.0.block_number()
+    }
+    fn block_hash(&self) -> BlockHash {
+        self.0.block_hash()
+    }
+    fn parent_hash(&self) -> BlockHash {
+        self.0.parent_hash()
+    }
+    fn to_block_meta(&self) -> BlockMeta {
+        self.0.to_block_meta()
+    }
+    fn verify_continuity(&self, _previous_tip: &BlockMeta) -> Result<()> {
+        Err(eyre::eyre!("state root mismatch"))
+    }
+}
+
+/// `NoopHooks` is locked to `Output = MockBlock`; the verify_continuity test needs
+/// `Output = BadBlock`.
+struct BadBlockHooks;
+impl PipelineHooks for BadBlockHooks {
+    type Output = BadBlock;
+}
+
+/// Run `chain_advancer` against a stream of `BadBlock` inputs. Modelled on `run_advancer`
+/// but specialized — generalizing the original would cascade through ~6 helper types for
+/// a single test case.
+async fn run_bad_block_advancer(tip: BlockMeta, blocks: Vec<BadBlock>) -> Result<PipelineOutcome> {
+    let store = MockStore::new(tip.clone());
+    let fetcher = MockFetcher { hashes: HashMap::new() };
+    let hooks = BadBlockHooks;
+    let (tx, rx) = kanal::bounded::<
+        std::result::Result<BadBlock, (Arc<dyn std::error::Error + Send + Sync>, ErrorAction)>,
+    >(16);
+
+    {
+        let tx_async = tx.to_async();
+        for b in blocks {
+            tx_async.send(Ok(b)).await.unwrap();
+        }
+    }
+
+    chain_advancer(&fetcher, &store, &hooks, rx, tip, CancellationToken::new()).await
+}
+
+/// Covers the `verify_continuity` → Fatal branch in `chain_advancer` (`advancer.rs:109`).
+/// The existing `test_chain_advancer_fatal_error_halts` exercises the worker-error Fatal
+/// branch instead — they're separate paths.
+#[tokio::test]
+async fn test_chain_advancer_verify_continuity_failure_halts() {
+    let tip = make_tip(10);
+    let blocks = vec![BadBlock(make_block(11, make_hash(10)))];
+    let result = run_bad_block_advancer(tip, blocks).await;
+    match result.unwrap() {
+        PipelineOutcome::Fatal(msg) => {
+            assert!(
+                msg.contains("state root mismatch"),
+                "Fatal message must carry the verify_continuity error: {msg}"
+            );
+        }
+        other => panic!("expected Fatal, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn test_chain_advancer_fatal_error_halts() {
     let tip = make_tip(10);

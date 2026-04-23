@@ -36,9 +36,7 @@ use futures::{FutureExt, future::Shared};
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
-use stateless_common::{
-    CodeFetchError, GetTxByHashError, RpcClient, RpcDeadlineExceeded, estimate_witness_size,
-};
+use stateless_common::{CodeFetchError, RpcClient, RpcDeadlineExceeded, estimate_witness_size};
 use stateless_core::{
     BlockStore, ContractStore, LightWitness, StoreResult, db::StoreError, withdrawals::MptWitness,
 };
@@ -151,14 +149,6 @@ impl From<CodeFetchError> for DataProviderError {
     }
 }
 
-impl From<GetTxByHashError> for DataProviderError {
-    fn from(e: GetTxByHashError) -> Self {
-        match e {
-            GetTxByHashError::Deadline(d) => d.into(),
-        }
-    }
-}
-
 impl From<StoreError> for DataProviderError {
     fn from(e: StoreError) -> Self {
         // Any `StoreError` surfacing at this layer is an internal persistence issue, not a
@@ -186,6 +176,24 @@ type BlockDataFetchFuture = Pin<Box<dyn Future<Output = BlockDataOutcome> + Send
 /// aren't `Clone`). Only the primary task drives the inner future; waiters are parked on its
 /// waker. If the primary is cancelled, any remaining waiter keeps polling it to completion.
 type BlockDataFuture = Shared<BlockDataFetchFuture>;
+
+/// RAII cleanup for the `in_flight` map. The primary inserts into the map and then holds
+/// this guard for the duration of its fetch; `Drop` removes the entry unconditionally on
+/// **any** exit — normal return, `?`, panic unwind, or task cancellation while
+/// `shared.await` is parked. Without this, a cancelled primary would leave the
+/// `Shared<_>` — and with it, the `Arc<BlockData>` (megabytes) it caches — pinned in the
+/// map until the process exits, and later callers for the same hash would subscribe to a
+/// stalled future.
+struct InFlightGuard<'a> {
+    map: &'a DashMap<B256, BlockDataFuture>,
+    key: B256,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.map.remove(&self.key);
+    }
+}
 
 /// Data provider with single-flight request coalescing.
 ///
@@ -460,14 +468,17 @@ impl DataProvider {
     }
 
     /// Single-flight fetch via [`futures::future::Shared`]: concurrent callers for the same
-    /// block hash subscribe to one in-flight future. On completion the primary removes the
-    /// map entry; late arrivals racing the removal simply start a fresh fetch (rare, benign).
+    /// block hash subscribe to one in-flight future. The primary holds an [`InFlightGuard`]
+    /// for the duration of its fetch, so the map entry is cleaned up on every exit path —
+    /// including task cancellation at `shared.await`. Coalesced waiters don't own the entry
+    /// and can drop freely; they just hold their own `Shared` clone.
     async fn fetch_block_data_single_flight(
         &self,
         block_hash: B256,
         deadline: Instant,
     ) -> DataProviderResult<Arc<BlockData>> {
-        let shared = match self.in_flight.entry(block_hash) {
+        // `_guard` is only set on the primary path; coalesced waiters leave it `None`.
+        let (shared, _guard) = match self.in_flight.entry(block_hash) {
             dashmap::Entry::Occupied(occupied) => {
                 let fut = occupied.get().clone();
                 drop(occupied);
@@ -497,7 +508,10 @@ impl DataProvider {
                 });
                 let shared = fut.shared();
                 vacant.insert(shared.clone());
-                shared
+                // Guard must be constructed *after* the insert so cancellation before the
+                // insert doesn't try to remove an entry that was never added.
+                let guard = InFlightGuard { map: &self.in_flight, key: block_hash };
+                (shared, Some(guard))
             }
         };
         SingleFlightMetrics::new_for_type("new").record();
@@ -505,11 +519,11 @@ impl DataProvider {
         trace!(block_hash = %block_hash, "Starting new block data fetch");
         let result = shared.await;
 
-        // Primary cleans up after the fetch resolves. Late arrivals in the tiny window between
-        // our `.await` returning and `.remove(&block_hash)` will start their own fetch — that's
-        // a benign duplicate, same acceptable-race semantics as the prior broadcast design.
-        self.in_flight.remove(&block_hash);
-
+        // `_guard` drops here, unconditionally removing the map entry. On cancellation at
+        // `shared.await` it drops via unwind; on panic likewise. A late arrival in the
+        // tiny window between `shared.await` returning and the guard actually dropping
+        // may subscribe to a Shared whose inner future has already resolved — that's fine,
+        // they get the cached result.
         shared_to_result(result)
     }
 
@@ -872,6 +886,60 @@ mod tests {
         assert!(
             elapsed < Duration::from_secs(5),
             "timeout must fire quickly; elapsed: {elapsed:?}"
+        );
+    }
+
+    /// Cancellation of the primary fetch task (e.g. client disconnect) must not leak an
+    /// entry in `in_flight` — the `InFlightGuard` removes it via `Drop` on unwind. Without
+    /// the guard the `Shared<_>` stays pinned in the map and its cached `Arc<BlockData>`
+    /// leaks until the process exits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_flight_entry_cleaned_up_on_task_cancellation() {
+        // Hanging upstream: TCP connections accepted but never replied to, so the primary
+        // parks at `shared.await` inside `fetch_block_data_single_flight`.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/");
+
+        let rpc_client = Arc::new(
+            RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
+                .unwrap(),
+        );
+        let contract_cache =
+            Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
+        // Generous deadline so the task is cancelled *by us*, not by the deadline firing.
+        let provider = Arc::new(DataProvider::new(
+            rpc_client,
+            None,
+            contract_cache,
+            DEFAULT_WITNESS_TIMEOUT_SECS,
+            60,
+        ));
+
+        let block_hash = B256::from([0xAB; 32]);
+        let handle = {
+            let provider = Arc::clone(&provider);
+            tokio::spawn(async move { provider.get_block_data_by_hash(block_hash).await })
+        };
+
+        // Give the spawned task enough scheduling turns to reach `shared.await` and register
+        // the `in_flight` entry. 200 ms is generous vs the ~10 µs it takes to reach the park.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            provider.in_flight.len(),
+            1,
+            "primary should have registered itself in in_flight"
+        );
+
+        // Cancel the task. `.await` on the handle returns once the task is fully dropped,
+        // by which point our `InFlightGuard::drop` has run.
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(
+            provider.in_flight.is_empty(),
+            "InFlightGuard must remove the entry on cancellation; map={:?}",
+            provider.in_flight.len(),
         );
     }
 
