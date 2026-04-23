@@ -1223,55 +1223,59 @@ mod tests {
         hb.stop().unwrap();
     }
 
-    /// `get_witness` pins `rr_start = 0`, so successive calls to a healthy pool always hit
-    /// provider 0 first — the secondary is untouched while primary is up.
+    /// `get_witness` pins `rr_start = 0`, so every round visits the primary first and only
+    /// falls through to the backup on failure. We can't easily make the primary succeed in
+    /// a unit test (a valid witness payload needs real cryptographic proof material), but
+    /// we can still verify the ordering invariant — primary is always tried *before* the
+    /// backup in every round.
     #[tokio::test]
     async fn test_get_witness_always_starts_from_primary() {
-        // Provider A always fails `mega_getBlockWitness` so we can count hits; provider B
-        // responds identically. We only care about which one is hit first — primary-failover
-        // means A (index 0) is always tried first, then B if A fails.
-        let (ha, url_a, hits_a) = start_counting_witness_rpc(1).await;
-        let (hb, url_b, hits_b) = start_counting_witness_rpc(0).await;
+        // Shared log records which provider was hit, in order. Both providers return a stub
+        // that fails decode downstream, so every round runs to completion and all providers
+        // in the pool get hit — the order is what we assert on.
+        let order = Arc::new(std::sync::Mutex::new(Vec::<char>::new()));
+        let (ha, url_a) = start_ordered_witness_rpc('A', order.clone()).await;
+        let (hb, url_b) = start_ordered_witness_rpc('B', order.clone()).await;
 
         let client = RpcClient::new(&[url_a.as_str()], &[url_a.as_str(), url_b.as_str()]).unwrap();
 
-        // Each get_witness attempt: A fails once, B succeeds → total hits A=1, B=1 per call.
-        for _ in 0..5 {
-            // Swallow the witness decode error — we only care about call routing, not payload.
+        // Short-timeout each call so backoff doesn't stretch them into multiple rounds.
+        const CALLS: usize = 5;
+        for _ in 0..CALLS {
             let _ = tokio::time::timeout(
-                Duration::from_millis(500),
+                Duration::from_millis(100),
                 client.get_witness(1, BlockHash::ZERO),
             )
             .await;
         }
 
-        let (a, b) = (hits_a.load(Ordering::Relaxed), hits_b.load(Ordering::Relaxed));
-        assert!(a >= 5, "primary (index 0) must be tried every call: got {a}");
-        // Backup should only be hit as fallback.
-        assert!(b <= a, "backup must not outpace primary: a={a}, b={b}");
+        let log = order.lock().unwrap();
+        assert_eq!(log.len(), 2 * CALLS, "each call runs one full round hitting both: {log:?}");
+        // A at every even index, B at every odd index — primary strictly precedes backup.
+        for chunk in log.chunks_exact(2) {
+            assert_eq!(chunk, &['A', 'B'], "primary must be hit before backup each round");
+        }
 
         ha.stop().unwrap();
         hb.stop().unwrap();
     }
 
-    /// Serves `mega_getBlockWitness` returning a fixed dummy response; fails the first
-    /// `fail_first` calls. Used to verify call routing independent of witness decode.
-    async fn start_counting_witness_rpc(
-        fail_first: usize,
-    ) -> (ServerHandle, String, Arc<AtomicUsize>) {
-        let hits = Arc::new(AtomicUsize::new(0));
-        let (handle, url) = serve((fail_first, hits.clone()), |m| {
-            m.register_method("mega_getBlockWitness", |_p, (fail_first, hits), _| {
-                if hits.fetch_add(1, Ordering::Relaxed) < *fail_first {
-                    Err::<String, _>(err_obj("synthetic failure"))
-                } else {
-                    // Return a stub that will fail base64/zstd decode — but count the hit.
-                    Ok("v0:AAAA".to_string())
-                }
+    /// Serves `mega_getBlockWitness` returning a stub that decodes-fails, while recording
+    /// the provider's label to a shared `order` log on each hit. Used to verify call routing.
+    async fn start_ordered_witness_rpc(
+        label: char,
+        order: Arc<std::sync::Mutex<Vec<char>>>,
+    ) -> (ServerHandle, String) {
+        let (handle, url) = serve((label, order), |m| {
+            m.register_method("mega_getBlockWitness", |_p, (label, order), _| {
+                order.lock().unwrap().push(*label);
+                // Stub that fails base64/zstd decode, so the round continues to the next
+                // provider and we see the full routing order.
+                Ok::<_, ErrorObjectOwned>("v0:AAAA".to_string())
             })
             .unwrap();
         })
         .await;
-        (handle, url, hits)
+        (handle, url)
     }
 }
