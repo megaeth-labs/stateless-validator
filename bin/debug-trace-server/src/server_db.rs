@@ -223,7 +223,9 @@ impl ChainStore for ServerDB {
     }
 
     fn advance_chain(&self, blocks: &[BlockMeta]) -> StoreResult<()> {
-        write_advance_chain(&self.database, blocks)
+        // `None`: trace server's retention is handled by the background `history_pruner`
+        // task, not inline. See `bin/debug-trace-server/src/main.rs::history_pruner`.
+        write_advance_chain(&self.database, blocks, None)
     }
 
     fn get_block_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>> {

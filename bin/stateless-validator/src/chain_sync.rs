@@ -133,7 +133,8 @@ impl ProcessedBlock for ValidatedBlock {
 }
 
 /// Validation failure sent from worker to advancer.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("Block {block_number} ({block_hash}) validation failed: {error}")]
 pub struct ValidationFailure {
     pub block_number: BlockNumber,
     pub block_hash: BlockHash,
@@ -141,16 +142,6 @@ pub struct ValidationFailure {
     /// `true` for transient errors (RPC timeout) that are worth retrying.
     /// `false` for deterministic failures (validation mismatch) that should halt.
     pub transient: bool,
-}
-
-impl std::fmt::Display for ValidationFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Block {} ({}) validation failed: {}",
-            self.block_number, self.block_hash, self.error
-        )
-    }
 }
 
 /// Block processor for the validator: validates blocks using EVM execution.
@@ -194,11 +185,18 @@ impl BlockProcessor for ValidatorProcessor {
         metrics::on_contract_cache_read(contracts.len() as u64, missing_contracts.len() as u64);
 
         if !missing_contracts.is_empty() {
-            let fetched = self
-                .rpc_client
-                .get_codes(&missing_contracts, true)
-                .await
-                .map_err(|e| fail(format!("Contract fetch/verify failed: {e}"), false))?;
+            // `VerificationFailure` is deterministic (a bad upstream or a bad witness) — halt.
+            // Everything else in `CodeFetchError::Other` is a transient RPC / transport /
+            // decode error from below `round_robin_with_backoff` that's worth retrying.
+            let fetched =
+                self.rpc_client.get_codes(&missing_contracts, true).await.map_err(|e| match e {
+                    stateless_common::CodeFetchError::VerificationFailure { .. } => {
+                        fail(format!("Contract verification failed: {e}"), false)
+                    }
+                    stateless_common::CodeFetchError::Other(_) => {
+                        fail(format!("Contract fetch failed: {e}"), true)
+                    }
+                })?;
 
             let new_bytecodes: Vec<(B256, Arc<Bytecode>)> = fetched.into_iter().collect();
 

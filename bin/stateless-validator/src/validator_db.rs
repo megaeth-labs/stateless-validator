@@ -6,15 +6,11 @@
 //! CANONICAL_CHAIN is bounded to `max_chain_length` entries; older entries are
 //! pruned inline during [`ChainStore::advance_chain`].
 
-use std::{
-    collections::HashMap,
-    path::Path,
-    sync::{Arc, atomic::AtomicU64},
-};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
-use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
+use redb::ReadableDatabase;
 use revm::state::Bytecode;
 use stateless_core::db::{
     BlockMeta, ChainStore, ContractStore, GenesisStore, StoreResult, StoreResultExt,
@@ -22,18 +18,31 @@ use stateless_core::db::{
 use stateless_db::{
     ANCHOR_BLOCK, CANONICAL_CHAIN, CONTRACTS, DEFAULT_MAX_CHAIN_LENGTH, Database, GENESIS_CONFIG,
     read_anchor, read_block_hash, read_canonical_tip, read_contracts, read_earliest_block,
-    write_add_contracts, write_reset_to_anchor, write_rollback_chain,
+    write_add_contracts, write_advance_chain, write_reset_to_anchor, write_rollback_chain,
 };
 
 /// Minimal persistent storage backed by redb.
 pub struct ValidatorDB {
     database: Database,
-    max_chain_length: AtomicU64,
+    /// Soft cap on the number of rows retained in `CANONICAL_CHAIN`. Oldest rows are pruned
+    /// inline during `advance_chain` when the table exceeds this.
+    max_chain_length: u64,
 }
 
 impl ValidatorDB {
-    /// Creates or opens a persistent store at the given path.
+    /// Creates or opens a persistent store at the given path, using [`DEFAULT_MAX_CHAIN_LENGTH`]
+    /// as the canonical-chain retention cap. Use [`ValidatorDB::with_max_chain_length`] to
+    /// override the cap.
     pub fn new(db_path: impl AsRef<Path>) -> StoreResult<Self> {
+        Self::with_max_chain_length(db_path, DEFAULT_MAX_CHAIN_LENGTH)
+    }
+
+    /// Creates or opens a persistent store at the given path with an explicit
+    /// canonical-chain retention cap.
+    pub fn with_max_chain_length(
+        db_path: impl AsRef<Path>,
+        max_chain_length: u64,
+    ) -> StoreResult<Self> {
         let database = Database::create(db_path).store_err()?;
 
         // Initialize all tables
@@ -46,12 +55,7 @@ impl ValidatorDB {
         }
         write_txn.commit().store_err()?;
 
-        Ok(Self { database, max_chain_length: AtomicU64::new(DEFAULT_MAX_CHAIN_LENGTH) })
-    }
-
-    #[cfg(test)]
-    fn set_max_chain_length(&self, max: u64) {
-        self.max_chain_length.store(max, std::sync::atomic::Ordering::Relaxed);
+        Ok(Self { database, max_chain_length })
     }
 
     #[cfg(test)]
@@ -116,44 +120,9 @@ impl ChainStore for ValidatorDB {
     }
 
     fn advance_chain(&self, blocks: &[BlockMeta]) -> StoreResult<()> {
-        if blocks.is_empty() {
-            return Ok(());
-        }
-        let max_len = self.max_chain_length.load(std::sync::atomic::Ordering::Relaxed);
-        let write_txn = self.database.begin_write().store_err()?;
-        {
-            let mut chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
-            for block in blocks {
-                chain
-                    .insert(
-                        block.block_number,
-                        (
-                            block.block_hash.0,
-                            block.post_state_root.0,
-                            block.post_withdrawals_root.0,
-                        ),
-                    )
-                    .store_err()?;
-            }
-
-            // Inline pruning: remove oldest entries that exceed the max chain length
-            let len = chain.len().store_err()?;
-            if len > max_len {
-                let excess = len - max_len;
-                let to_remove: Vec<u64> = chain
-                    .iter()
-                    .store_err()?
-                    .take(excess as usize)
-                    .map(|r| r.map(|(k, _)| k.value()))
-                    .collect::<std::result::Result<_, _>>()
-                    .store_err()?;
-                for n in to_remove {
-                    chain.remove(n).store_err()?;
-                }
-            }
-        }
-        write_txn.commit().store_err()?;
-        Ok(())
+        // Delegate to the shared helper; validator applies its retention cap inline,
+        // so the helper does the pruning in the same write transaction as the insert.
+        write_advance_chain(&self.database, blocks, Some(self.max_chain_length))
     }
 
     fn get_block_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>> {
@@ -388,8 +357,8 @@ mod tests {
 
     #[test]
     fn test_advance_chain_inline_pruning() {
-        let (_dir, store) = temp_store();
-        store.set_max_chain_length(5);
+        let dir = tempfile::tempdir().unwrap();
+        let store = ValidatorDB::with_max_chain_length(dir.path().join("test.redb"), 5).unwrap();
 
         let blocks: Vec<BlockMeta> = (1..=5).map(make_block_meta).collect();
         ChainStore::advance_chain(&store, &blocks).unwrap();

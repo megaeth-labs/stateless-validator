@@ -14,7 +14,7 @@ use stateless_common::RpcClient;
 use stateless_core::{
     BlockStore, LightWitness,
     db::BlockMeta,
-    pipeline::{BlockFetcher, BlockProcessor, ErrorAction, PipelineHooks},
+    pipeline::{BlockFetcher, BlockProcessor, PipelineHooks},
 };
 
 use crate::{metrics, response_cache::ResponseCache};
@@ -86,12 +86,16 @@ pub struct TraceProcessor;
 impl BlockProcessor for TraceProcessor {
     type Input = (Block<Transaction>, LightWitness);
     type Output = TraceProcessedBlock;
-    type Error = eyre::Report;
+    // Infallible: `process` below only rehydrates `BlockMeta` from fields the fetcher
+    // already validated. If a future edit introduces a fallible step, the compiler will
+    // force the author to pick a real error type rather than silently classifying every
+    // failure as retry-able.
+    type Error = std::convert::Infallible;
 
     async fn process(
         &self,
         (block, witness): Self::Input,
-    ) -> std::result::Result<TraceProcessedBlock, eyre::Report> {
+    ) -> std::result::Result<TraceProcessedBlock, Self::Error> {
         let meta = BlockMeta {
             block_number: block.header.number,
             block_hash: block.header.hash,
@@ -99,11 +103,6 @@ impl BlockProcessor for TraceProcessor {
             post_withdrawals_root: block.header.withdrawals_root.unwrap_or_default(),
         };
         Ok(TraceProcessedBlock { block, witness, meta })
-    }
-
-    fn error_action(&self, _: &eyre::Report) -> ErrorAction {
-        // TraceProcessor doesn't validate — errors are IO/transient, worth retrying
-        ErrorAction::Retry
     }
 }
 

@@ -37,6 +37,7 @@ fastrand = { workspace = true, features = ["std"] }
 futures.workspace = true
 rolling-file.workspace = true
 serde.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-appender.workspace = true

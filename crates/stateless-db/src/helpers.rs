@@ -55,7 +55,18 @@ pub fn read_earliest_block(database: &Database) -> StoreResult<Option<(BlockNumb
 }
 
 /// Appends blocks to CANONICAL_CHAIN in a single write transaction.
-pub fn write_advance_chain(database: &Database, blocks: &[BlockMeta]) -> StoreResult<()> {
+///
+/// If `max_len` is `Some(n)`, the CANONICAL_CHAIN table is bounded to `n` rows after the
+/// insert — the oldest entries exceeding that cap are pruned inline in the same write
+/// transaction. Callers that manage retention separately (e.g. `ServerDB`'s background
+/// pruner) pass `None`.
+pub fn write_advance_chain(
+    database: &Database,
+    blocks: &[BlockMeta],
+    max_len: Option<u64>,
+) -> StoreResult<()> {
+    use redb::ReadableTableMetadata;
+
     if blocks.is_empty() {
         return Ok(());
     }
@@ -69,6 +80,26 @@ pub fn write_advance_chain(database: &Database, blocks: &[BlockMeta]) -> StoreRe
                     (block.block_hash.0, block.post_state_root.0, block.post_withdrawals_root.0),
                 )
                 .store_err()?;
+        }
+
+        // Inline pruning: remove oldest entries that exceed the max chain length.
+        // Shared by both binaries — the validator passes `Some(cap)` and the trace
+        // server passes `None` (a background task prunes there).
+        if let Some(max_len) = max_len {
+            let len = chain.len().store_err()?;
+            if len > max_len {
+                let excess = len - max_len;
+                let to_remove: Vec<u64> = chain
+                    .iter()
+                    .store_err()?
+                    .take(excess as usize)
+                    .map(|r| r.map(|(k, _)| k.value()))
+                    .collect::<std::result::Result<_, _>>()
+                    .store_err()?;
+                for n in to_remove {
+                    chain.remove(n).store_err()?;
+                }
+            }
         }
     }
     write_txn.commit().store_err()?;

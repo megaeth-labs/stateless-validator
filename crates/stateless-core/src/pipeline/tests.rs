@@ -167,10 +167,15 @@ fn make_tip(n: u64) -> BlockMeta {
 
 // chain_advancer tests
 
+/// Test-only input to `run_advancer`: either a `MockBlock` or a synthetic failure whose
+/// message is stringified. `run_advancer` lifts the latter to the typed `Arc<dyn Error>`
+/// that workers emit in production.
+type AdvancerStep = std::result::Result<MockBlock, (String, ErrorAction)>;
+
 async fn run_advancer(
     tip: BlockMeta,
     rpc_hashes: HashMap<u64, BlockHash>,
-    blocks: Vec<std::result::Result<MockBlock, (String, ErrorAction)>>,
+    blocks: Vec<AdvancerStep>,
 ) -> (Result<PipelineOutcome>, MockStore) {
     let store = MockStore::new(tip.clone());
     let fetcher = MockFetcher { hashes: rpc_hashes };
@@ -180,7 +185,19 @@ async fn run_advancer(
     {
         let tx_async = tx.to_async();
         for b in blocks {
-            tx_async.send(b).await.unwrap();
+            // Workers erase per-processor error types to `Arc<dyn Error + Send + Sync>` —
+            // tests wrap their synthetic message into `TestError` to match that shape.
+            let msg: std::result::Result<
+                MockBlock,
+                (Arc<dyn std::error::Error + Send + Sync>, ErrorAction),
+            > = match b {
+                Ok(v) => Ok(v),
+                Err((msg, action)) => Err((
+                    Arc::new(TestError(msg)) as Arc<dyn std::error::Error + Send + Sync>,
+                    action,
+                )),
+            };
+            tx_async.send(msg).await.unwrap();
         }
     }
 
@@ -226,13 +243,22 @@ async fn test_chain_advancer_fatal_error_halts() {
 }
 
 #[tokio::test]
-async fn test_chain_advancer_transient_error_returns_err() {
+async fn test_chain_advancer_transient_error_returns_retry_outcome() {
     let tip = make_tip(10);
     let blocks = vec![Err(("RPC timeout".to_string(), ErrorAction::Retry))];
     let (result, _) = run_advancer(tip, HashMap::new(), blocks).await;
-    // Retry errors are returned as Err (not PipelineOutcome), triggering restart
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("RPC timeout"));
+    // Retry errors are surfaced as `PipelineOutcome::Retry`, not `Err`. The outer
+    // `run_pipeline` loop matches on the variant explicitly and runs the common
+    // transient-restart recovery path.
+    match result.unwrap() {
+        PipelineOutcome::Retry(msg) => {
+            assert!(
+                msg.contains("RPC timeout"),
+                "retry reason must carry the worker message: {msg}"
+            );
+        }
+        other => panic!("expected Retry outcome, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -241,7 +267,9 @@ async fn test_chain_advancer_shutdown() {
     let store = MockStore::new(tip.clone());
     let fetcher = MockFetcher { hashes: HashMap::new() };
     let hooks = NoopHooks;
-    let (_tx, rx) = kanal::bounded::<std::result::Result<MockBlock, (String, ErrorAction)>>(16);
+    let (_tx, rx) = kanal::bounded::<
+        std::result::Result<MockBlock, (Arc<dyn std::error::Error + Send + Sync>, ErrorAction)>,
+    >(16);
     let shutdown = CancellationToken::new();
     shutdown.cancel();
 
@@ -311,6 +339,22 @@ async fn test_chain_advancer_reorg_mid_batch_uses_persisted_tip() {
 
 // find_divergence_point tests
 
+/// Minimal `DivergenceLookups` impl backed by a HashMap of block-number → hash for
+/// the `find_divergence_point` tests. Replaces the earlier pair of closures.
+struct MapLookups {
+    hashes: HashMap<u64, BlockHash>,
+    earliest: u64,
+}
+
+impl crate::pipeline::DivergenceLookups for MapLookups {
+    fn get_hash(&self, n: BlockNumber) -> StoreResult<Option<BlockHash>> {
+        Ok(self.hashes.get(&n).copied())
+    }
+    fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
+        Ok(self.hashes.get(&self.earliest).map(|&h| (self.earliest, h)))
+    }
+}
+
 #[tokio::test]
 async fn test_find_divergence_single_block_reorg() {
     let mut local = HashMap::new();
@@ -325,14 +369,8 @@ async fn test_find_divergence_single_block_reorg() {
     }
 
     let fetcher = MockFetcher { hashes: remote };
-    let result = find_divergence_point(
-        &fetcher,
-        &|n| Ok(local.get(&n).copied()),
-        &|| Ok(Some((1, *local.get(&1).unwrap()))),
-        10,
-    )
-    .await
-    .unwrap();
+    let lookups = MapLookups { hashes: local, earliest: 1 };
+    let result = find_divergence_point(&fetcher, &lookups, 10).await.unwrap();
 
     assert_eq!(result, 9);
 }
@@ -353,14 +391,8 @@ async fn test_find_divergence_multi_block_reorg() {
     }
 
     let fetcher = MockFetcher { hashes: remote };
-    let result = find_divergence_point(
-        &fetcher,
-        &|n| Ok(local.get(&n).copied()),
-        &|| Ok(Some((1, *local.get(&1).unwrap()))),
-        10,
-    )
-    .await
-    .unwrap();
+    let lookups = MapLookups { hashes: local, earliest: 1 };
+    let result = find_divergence_point(&fetcher, &lookups, 10).await.unwrap();
 
     assert_eq!(result, 5);
 }
@@ -375,26 +407,28 @@ async fn test_find_divergence_catastrophic() {
     }
 
     let fetcher = MockFetcher { hashes: remote };
-    let result = find_divergence_point(
-        &fetcher,
-        &|n| Ok(local.get(&n).copied()),
-        &|| Ok(Some((1, *local.get(&1).unwrap()))),
-        5,
-    )
-    .await;
+    let lookups = MapLookups { hashes: local, earliest: 1 };
+    let result = find_divergence_point(&fetcher, &lookups, 5).await;
 
     assert!(matches!(result, Err(DivergenceError::CatastrophicReorg { .. })));
 }
 
 // spawn_workers tests
 
+/// Minimal `std::error::Error` for the mock processors — `BlockProcessor::Error` now
+/// requires `Error + Send + Sync`, and bare `String` doesn't satisfy that. Single
+/// `#[error("{0}")]` constructor keeps the tests readable.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct TestError(String);
+
 struct DoubleProcessor;
 impl BlockProcessor for DoubleProcessor {
     type Input = u64;
     type Output = MockBlock;
-    type Error = String;
+    type Error = TestError;
 
-    async fn process(&self, input: u64) -> std::result::Result<MockBlock, String> {
+    async fn process(&self, input: u64) -> std::result::Result<MockBlock, TestError> {
         Ok(MockBlock {
             number: input,
             hash: make_hash(input),
@@ -438,10 +472,10 @@ async fn test_spawn_workers_propagates_error() {
     impl BlockProcessor for FailProcessor {
         type Input = u64;
         type Output = MockBlock;
-        type Error = String;
+        type Error = TestError;
 
-        async fn process(&self, _: u64) -> std::result::Result<MockBlock, String> {
-            Err("boom".to_string())
+        async fn process(&self, _: u64) -> std::result::Result<MockBlock, TestError> {
+            Err(TestError("boom".to_string()))
         }
     }
 
@@ -458,8 +492,9 @@ async fn test_spawn_workers_propagates_error() {
     let result_rx = result_rx.to_async();
     let result = result_rx.recv().await.unwrap();
     assert!(result.is_err());
-    let (msg, action) = result.unwrap_err();
-    assert_eq!(msg, "boom");
+    let (err, action) = result.unwrap_err();
+    // Display round-trips the original message via `TestError`'s `#[error("{0}")]`.
+    assert_eq!(err.to_string(), "boom");
     // Default error_action is Halt
     assert_eq!(action, ErrorAction::Halt);
 }
@@ -696,14 +731,14 @@ fn block_processor_defaults() {
     impl BlockProcessor for P {
         type Input = u64;
         type Output = MockBlock;
-        type Error = String;
+        type Error = TestError;
 
-        async fn process(&self, _: u64) -> std::result::Result<MockBlock, String> {
+        async fn process(&self, _: u64) -> std::result::Result<MockBlock, TestError> {
             unreachable!()
         }
     }
     let p = P;
-    assert_eq!(p.error_action(&"any".to_string()), ErrorAction::Halt);
+    assert_eq!(p.error_action(&TestError("any".to_string())), ErrorAction::Halt);
     p.on_task_done(0, true);
     p.on_task_done(1, false);
 }
@@ -748,8 +783,8 @@ struct PassThrough;
 impl BlockProcessor for PassThrough {
     type Input = MockBlock;
     type Output = MockBlock;
-    type Error = String;
-    async fn process(&self, b: MockBlock) -> std::result::Result<MockBlock, String> {
+    type Error = TestError;
+    async fn process(&self, b: MockBlock) -> std::result::Result<MockBlock, TestError> {
         Ok(b)
     }
 }

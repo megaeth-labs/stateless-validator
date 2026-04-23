@@ -159,6 +159,23 @@ pub struct SetValidatedBlocksResponse {
     pub last_validated_block: (U64, B256),
 }
 
+/// Errors returned by [`RpcClient::get_codes`].
+///
+/// `VerificationFailure` is the one error worth distinguishing at call sites: the upstream
+/// returned bytecode whose keccak does not match the requested hash. That is deterministic
+/// (the provider is lying or the witness is wrong), so validators should halt rather than
+/// retry. All other errors (transport, decode, provider non-2xx) are transient and bubble
+/// up through the `Other` variant.
+#[derive(Debug, thiserror::Error)]
+pub enum CodeFetchError {
+    #[error(
+        "RPC provider returned bytecode with unexpected codehash: expected {requested:?}, got {actual:?}"
+    )]
+    VerificationFailure { requested: B256, actual: B256 },
+    #[error(transparent)]
+    Other(#[from] eyre::Error),
+}
+
 /// RPC client for MegaETH blockchain data.
 ///
 /// Fetches contract bytecode, blocks, and witness data during stateless validation.
@@ -476,16 +493,15 @@ impl RpcClient {
         &self,
         hashes: &[B256],
         verify: bool,
-    ) -> Result<HashMap<B256, Arc<Bytecode>>> {
-        let results: Vec<Result<(B256, Arc<Bytecode>)>> =
+    ) -> std::result::Result<HashMap<B256, Arc<Bytecode>>, CodeFetchError> {
+        let results: Vec<std::result::Result<(B256, Arc<Bytecode>), CodeFetchError>> =
             future::join_all(hashes.iter().map(|&hash| async move {
                 let code = Bytecode::new_raw(self.get_code(hash).await);
                 if verify {
-                    let got = code.hash_slow();
-                    ensure!(
-                        got == hash,
-                        "RPC provider returned bytecode with unexpected codehash: expected {hash:?}, got {got:?}",
-                    );
+                    let actual = code.hash_slow();
+                    if actual != hash {
+                        return Err(CodeFetchError::VerificationFailure { requested: hash, actual });
+                    }
                 }
                 Ok((hash, Arc::new(code)))
             }))
@@ -868,7 +884,10 @@ mod tests {
         types::ErrorObjectOwned,
     };
     use stateless_core::{
-        PipelineConfig, block_fetcher, db::BlockMeta, find_divergence_point, pipeline::BlockFetcher,
+        PipelineConfig, block_fetcher,
+        db::{BlockMeta, StoreResult},
+        find_divergence_point,
+        pipeline::{BlockFetcher, DivergenceLookups},
     };
     use tokio_util::sync::CancellationToken;
 
@@ -990,19 +1009,28 @@ mod tests {
         (local, remote)
     }
 
+    /// Minimal `DivergenceLookups` impl for these tests (replaces the two-closure pattern).
+    struct MapLookups {
+        hashes: HashMap<u64, BlockHash>,
+        earliest: u64,
+    }
+
+    impl DivergenceLookups for MapLookups {
+        fn get_hash(&self, n: u64) -> StoreResult<Option<BlockHash>> {
+            Ok(self.hashes.get(&n).copied())
+        }
+        fn get_earliest(&self) -> StoreResult<Option<(u64, BlockHash)>> {
+            Ok(self.hashes.get(&self.earliest).map(|&h| (self.earliest, h)))
+        }
+    }
+
     /// Runs `find_divergence_point` against a mock server and asserts the expected split.
     async fn assert_divergence(earliest: u64, tip: u64, diverge_at: u64, expected: u64) {
         let (local, remote) = make_divergence_chains(earliest, tip, diverge_at);
         let (handle, url) = start_mock_rpc(remote).await;
         let fetcher = TestFetcher(client_at(&url));
-        let result = find_divergence_point(
-            &fetcher,
-            &|n| Ok(local.get(&n).copied()),
-            &|| Ok(Some((earliest, *local.get(&earliest).unwrap()))),
-            tip,
-        )
-        .await
-        .unwrap();
+        let lookups = MapLookups { hashes: local, earliest };
+        let result = find_divergence_point(&fetcher, &lookups, tip).await.unwrap();
         assert_eq!(result, expected);
         handle.stop().unwrap();
     }
@@ -1080,14 +1108,9 @@ mod tests {
         let (local, remote) = make_divergence_chains(1, 5, 0); // no agreement at all
         let (handle, url) = start_mock_rpc(remote).await;
         let fetcher = TestFetcher(client_at(&url));
+        let lookups = MapLookups { hashes: local, earliest: 1 };
 
-        let result = find_divergence_point(
-            &fetcher,
-            &|n| Ok(local.get(&n).copied()),
-            &|| Ok(Some((1, *local.get(&1).unwrap()))),
-            5,
-        )
-        .await;
+        let result = find_divergence_point(&fetcher, &lookups, 5).await;
 
         assert!(result.unwrap_err().to_string().contains("Catastrophic reorg"));
         handle.stop().unwrap();
@@ -1322,18 +1345,25 @@ mod tests {
         let (handle, url) = start_code_rpc(codes).await;
         let client = client_at(&url);
 
-        // `verify=true` on just the bad hash → Err with the mismatch message.
+        // `verify=true` on just the bad hash → typed `VerificationFailure` naming that hash.
         let err = client.get_codes(&[bad_hash], true).await.expect_err("mismatch must fail");
-        let msg = err.to_string();
-        assert!(msg.contains("unexpected codehash"), "got: {msg}");
-        assert!(msg.contains(&format!("{bad_hash:?}")), "error must name the bad hash: {msg}");
+        match err {
+            CodeFetchError::VerificationFailure { requested, actual } => {
+                assert_eq!(requested, bad_hash);
+                assert_ne!(actual, bad_hash, "actual must reflect what the server returned");
+            }
+            other => panic!("expected VerificationFailure, got {other:?}"),
+        }
 
         // Mixed batch with one bad hash → whole batch fails (security contract: discard all).
         let err = client
             .get_codes(&[good_hash, bad_hash], true)
             .await
             .expect_err("any mismatch must abort the batch");
-        assert!(err.to_string().contains("unexpected codehash"));
+        assert!(
+            matches!(err, CodeFetchError::VerificationFailure { requested, .. } if requested == bad_hash),
+            "expected VerificationFailure for bad_hash",
+        );
 
         // `verify=false` → both entries returned (caller opted out of verification).
         let ok = client.get_codes(&[good_hash, bad_hash], false).await.unwrap();

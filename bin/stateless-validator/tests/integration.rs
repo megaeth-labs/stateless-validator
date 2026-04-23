@@ -24,9 +24,8 @@ use stateless_core::{
 use stateless_db::ContractCache;
 use stateless_test_utils::fixtures::TestFixtures;
 use stateless_validator::{
-    app::{CommandLineArgs, VALIDATOR_DB_FILENAME, load_or_create_chain_spec},
-    chain_sync::{ValidatorFetcher, ValidatorHooks, ValidatorProcessor},
-    validator_db::ValidatorDB,
+    CommandLineArgs, VALIDATOR_DB_FILENAME, ValidatorDB, ValidatorFetcher, ValidatorHooks,
+    ValidatorProcessor, load_or_create_chain_spec,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -367,11 +366,11 @@ async fn integration_test() {
         load_or_create_chain_spec(&validator_db, Some(genesis_file.to_str().unwrap())).unwrap(),
     );
 
-    let config = Arc::new(PipelineConfig {
-        concurrent_workers: 1,
-        sync_target,
-        ..PipelineConfig::default()
-    });
+    // `#[non_exhaustive]` rules out struct-update syntax here; mutate a default.
+    let mut cfg = PipelineConfig::default();
+    cfg.concurrent_workers = 1;
+    cfg.sync_target = sync_target;
+    let config = Arc::new(cfg);
 
     let shutdown = CancellationToken::new();
     let fetcher =
