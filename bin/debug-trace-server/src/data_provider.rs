@@ -36,7 +36,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, instrument, trace, warn};
 
 use crate::metrics::{
-    ChainSyncMetrics, DataSourceMetrics, SingleFlightMetrics, UpstreamMetrics, WitnessSourceMetrics,
+    ChainSyncMetrics, DataSourceMetrics, SingleFlightMetrics, WitnessSourceMetrics,
 };
 
 /// Block data bundle containing all information needed for stateless execution.
@@ -564,14 +564,16 @@ impl DataProvider {
     /// 4. Extract code hashes from witness and fetch contract bytecodes
     async fn do_fetch_block_data(&self, block_hash: B256) -> DataProviderResult<BlockData> {
         let overall_start = std::time::Instant::now();
-        let upstream_header = UpstreamMetrics::new_for_method("eth_getHeaderByHash");
-        let upstream_block = UpstreamMetrics::new_for_method("eth_getBlockByHash");
-        let upstream_witness = UpstreamMetrics::new_for_method("mega_getWitness");
+        // Per-attempt upstream RPC metrics (requests_total / errors_total / duration) are
+        // now recorded inside `RpcClient::round_robin_with_backoff` via the
+        // `TraceRpcMetrics` adapter wired at startup. The outer callers here used to record
+        // one-shot "(true, cumulative_time)" entries which were always success under the
+        // unbounded-retry design — see data_provider.rs history prior to the RpcMetrics
+        // wiring for context.
 
         // Step 1: Fetch header first to get the block number
         let start = std::time::Instant::now();
         let header = self.rpc_client.get_header(BlockId::Hash(block_hash.into()), false).await;
-        upstream_header.record_request(true, start.elapsed().as_secs_f64());
         let block_number = header.number;
         let fetch_header_ms = start.elapsed().as_millis();
 
@@ -594,11 +596,9 @@ impl DataProvider {
         let (block, block_elapsed) = block_timed;
 
         let fetch_witness_ms = witness_elapsed.as_millis();
-        upstream_witness.record_request(witness_result.is_ok(), witness_elapsed.as_secs_f64());
         let (salt_witness, _mpt_witness) = witness_result?;
 
         let fetch_full_block_ms = block_elapsed.as_millis();
-        upstream_block.record_request(true, block_elapsed.as_secs_f64());
 
         // Step 3: Convert SaltWitness to LightWitness
         let start = std::time::Instant::now();
@@ -642,27 +642,47 @@ impl DataProvider {
     ///
     /// The underlying `RpcClient::get_witness` retries transient failures forever internally;
     /// this wrapper imposes a time bound so a user-facing RPC request never hangs. On timeout
-    /// the caller receives a typed [`DataProviderError::WitnessTimeout`]. `witness_timeout`
-    /// covers the "block is fresh and the witness is still being generated upstream" case for
-    /// new blocks; for old blocks the RPC layer's round-robin + backoff reaches an upstream
-    /// conclusion quickly.
+    /// the caller receives a typed [`DataProviderError::WitnessTimeout`].
+    ///
+    /// The timeout is selected based on whether the block is ahead of the local tip:
+    ///
+    /// - **New block** (above local tip or no local DB): full [`Self::witness_timeout`] applies.
+    ///   This covers the "block is fresh and the witness is still being generated upstream" case
+    ///   where a few seconds of waiting is normal.
     async fn fetch_witness_with_timeout(
         &self,
         block_number: u64,
         block_hash: B256,
     ) -> DataProviderResult<(SaltWitness, MptWitness)> {
+        /// Cap on witness fetches for blocks at or below the local tip (pruned / old
+        /// upstream blocks). Tighter than [`Self::witness_timeout`] because the upstream
+        /// retry loop never terminates on errors — without this bound a pruned-block
+        /// trace request would wait the full `witness_timeout` before returning.
+        const OLD_BLOCK_WITNESS_TIMEOUT: Duration = Duration::from_secs(3);
+
         let db_max_height = self
             .db
             .as_ref()
             .and_then(|db| db.get_canonical_tip().ok().flatten().map(|tip| tip.block_number));
         let is_new_block = db_max_height.is_none_or(|max| block_number > max);
-        trace!(block_number, db_max_height, is_new_block, "Fetching witness");
+        let effective_timeout = if is_new_block {
+            self.witness_timeout
+        } else {
+            self.witness_timeout.min(OLD_BLOCK_WITNESS_TIMEOUT)
+        };
+        trace!(
+            block_number,
+            db_max_height,
+            is_new_block,
+            timeout_ms = effective_timeout.as_millis() as u64,
+            "Fetching witness",
+        );
 
         let wg_metrics = WitnessSourceMetrics::new_for_source("witness_generator");
         let start = std::time::Instant::now();
 
         let result = tokio::time::timeout(
-            self.witness_timeout,
+            effective_timeout,
             self.rpc_client.get_witness(block_number, block_hash),
         )
         .await;
@@ -679,10 +699,11 @@ impl DataProvider {
                 warn!(
                     block_number,
                     block_hash = %block_hash,
-                    timeout_ms = self.witness_timeout.as_millis() as u64,
+                    timeout_ms = effective_timeout.as_millis() as u64,
+                    is_new_block,
                     "Witness fetch timeout",
                 );
-                Err(DataProviderError::WitnessTimeout(self.witness_timeout))
+                Err(DataProviderError::WitnessTimeout(effective_timeout))
             }
         }
     }
@@ -711,11 +732,13 @@ impl DataProvider {
             "Cache miss — fetching contracts from RPC"
         );
 
-        let upstream = UpstreamMetrics::new_for_method("eth_getCodeByHash");
-        let start = std::time::Instant::now();
-        let result = self.rpc_client.get_codes(&missing, true).await;
-        upstream.record_request(result.is_ok(), start.elapsed().as_secs_f64());
-        let fetched = result?;
+        // Per-attempt `eth_getCodeByHash` metrics land on `UpstreamMetrics` via the
+        // `TraceRpcMetrics` adapter inside `round_robin_with_backoff`. Recording
+        // another `(result.is_ok(), ...)` here on the same label would double-count the
+        // per-hash attempts. A batch-level `CodeFetchError::VerificationFailure` is
+        // rare (signals a bad upstream / bad witness); if we need a dedicated metric
+        // for it, add a new counter rather than reusing the per-attempt histogram.
+        let fetched = self.rpc_client.get_codes(&missing, true).await?;
 
         let new_contracts: Vec<(B256, Arc<Bytecode>)> = fetched.into_iter().collect();
 

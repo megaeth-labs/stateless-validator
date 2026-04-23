@@ -288,7 +288,8 @@ async fn main() -> Result<()> {
         data_max_concurrent_requests: args.data_max_concurrent_requests,
         witness_max_concurrent_requests: args.witness_max_concurrent_requests,
         ..RpcClientConfig::trace_server()
-    };
+    }
+    .with_metrics(Arc::new(metrics::TraceRpcMetrics));
     let rpc_client =
         Arc::new(RpcClient::new_with_config(&data_apis, &witness_apis, rpc_config, None)?);
     let validator_db = init_validator_db(&args, &rpc_client).await?;

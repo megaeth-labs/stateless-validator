@@ -495,6 +495,59 @@ pub fn record_rpc_error(method: &str) {
     RpcMethodMetrics::new_for_method(method).record_error();
 }
 
+/// Maps an [`RpcMethod`] to the `method` label used by [`UpstreamMetrics`].
+///
+/// The existing dashboard labels (`eth_getHeaderByHash`, `eth_getBlockByHash`, etc.)
+/// encode the trace-server-specific call flavor. Since [`RpcMethod`] is coarser
+/// (no ByHash/ByNumber split), we keep the existing labels for the hot-path
+/// methods and fall back to [`RpcMethod::as_str`] for the others.
+fn upstream_label_for(method: stateless_common::metrics::RpcMethod) -> &'static str {
+    use stateless_common::metrics::RpcMethod;
+    match method {
+        RpcMethod::EthGetHeader => "eth_getHeaderByHash",
+        RpcMethod::EthGetBlockByNumber => "eth_getBlockByHash",
+        RpcMethod::MegaGetBlockWitness => "mega_getWitness",
+        RpcMethod::EthGetCodeByHash => "eth_getCodeByHash",
+        other => other.as_str(),
+    }
+}
+
+/// [`stateless_common::RpcMetrics`] adapter that forwards every per-attempt RPC
+/// event to [`UpstreamMetrics`], keyed by method label.
+///
+/// Wired via [`stateless_common::RpcClientConfig::with_metrics`] so that the
+/// per-attempt duration and success/failure counters recorded inside
+/// `round_robin_with_backoff` land on the same dashboards the trace server has
+/// always exposed — even though `get_block` / `get_header` / `get_witness` no
+/// longer surface their per-call success status at the caller level.
+#[derive(Default)]
+pub struct TraceRpcMetrics;
+
+impl stateless_common::RpcMetrics for TraceRpcMetrics {
+    fn on_rpc_complete(
+        &self,
+        method: stateless_common::metrics::RpcMethod,
+        success: bool,
+        duration_secs: Option<f64>,
+    ) {
+        let label = upstream_label_for(method);
+        // `new_for_method` is just a label binding — no allocation beyond what
+        // the metrics crate deduplicates internally.
+        UpstreamMetrics::new_for_method(label)
+            .record_request(success, duration_secs.unwrap_or(0.0));
+    }
+
+    fn on_rpc_retry(&self, _method: stateless_common::metrics::RpcMethod) {
+        // `on_rpc_complete(_, false, _)` fires alongside `on_rpc_retry` in the
+        // retry loop, so the error/request counters already capture retries.
+    }
+
+    fn on_witness_fetch(&self, _breakdown: stateless_common::witness_size::WitnessSizeBreakdown) {
+        // Witness size/source metrics are recorded by `fetch_witness_with_timeout`
+        // at the outer timeout boundary (distinct semantics from per-attempt).
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
