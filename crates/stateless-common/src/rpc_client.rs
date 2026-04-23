@@ -598,7 +598,6 @@ where
     /// Only sustained failures past that reach operator-visible WARN.
     const WARN_AT_ROUND: u32 = 3;
 
-    let start = Instant::now();
     let n = providers.len();
     let max_backoff_ms = policy.max.as_millis() as u64;
     let initial_backoff_ms = policy.initial.as_millis() as u64;
@@ -617,18 +616,24 @@ where
         for offset in 0..n {
             let provider_idx = (rr_start + offset) % n;
             let permit = semaphore.acquire().await.expect("semaphore closed unexpectedly");
+            // Per-attempt timing: record each provider call individually so histograms
+            // and success/error counters reflect what actually happened in the retry loop
+            // rather than always showing "success" with the cumulative logical-call time.
+            let attempt_start = Instant::now();
             let result = f(providers[provider_idx].clone()).await;
+            let attempt_duration = attempt_start.elapsed().as_secs_f64();
             drop(permit);
 
             match result {
                 Ok(v) => {
                     if let Some(m) = metrics {
-                        m.on_rpc_complete(method, true, Some(start.elapsed().as_secs_f64()));
+                        m.on_rpc_complete(method, true, Some(attempt_duration));
                     }
                     return v;
                 }
                 Err(e) => {
                     if let Some(m) = metrics {
+                        m.on_rpc_complete(method, false, Some(attempt_duration));
                         m.on_rpc_retry(method);
                     }
                     // Log "trying next" only when there really is a next provider in this
