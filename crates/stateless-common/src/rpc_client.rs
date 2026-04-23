@@ -789,16 +789,16 @@ where
                             // typed error so the caller sees one consistent failure mode.
                             drop(permit);
                             if let Some(m) = metrics {
+                                // Only record `on_rpc_complete(false)` here — NOT `on_rpc_retry`.
+                                // The non-timeout failure arm fires `on_rpc_retry` because
+                                // it's about to loop and try another provider; this arm
+                                // gives up, so counting it as a retry would inflate the
+                                // retry metric above the actual number of attempts made.
                                 m.on_rpc_complete(
                                     method,
                                     false,
                                     Some(attempt_start.elapsed().as_secs_f64()),
                                 );
-                                // Match the invariant held by the non-timeout failure arm
-                                // below: every transient failure records both `on_rpc_complete`
-                                // and `on_rpc_retry`, so the retry counter can be reconciled
-                                // against the error counter.
-                                m.on_rpc_retry(method);
                             }
                             return Err(RpcDeadlineExceeded {
                                 method,

@@ -122,8 +122,18 @@ pub enum DataProviderError {
     TransactionPending(B256),
     #[error("{stage} fetch exceeded deadline after {elapsed:?}")]
     Timeout { stage: TimeoutStage, elapsed: Duration },
+    /// Wrapped in `Arc` so [`shared_to_result`] can clone the pointer across coalesced
+    /// callers without losing the `eyre::Error` cause chain (which is the operational
+    /// signal for redb / bincode / transport decode errors). `eyre::Error` itself isn't
+    /// `Clone`; stringifying it would drop the "caused by" trail.
     #[error(transparent)]
-    Internal(#[from] eyre::Error),
+    Internal(Arc<eyre::Error>),
+}
+
+impl From<eyre::Error> for DataProviderError {
+    fn from(e: eyre::Error) -> Self {
+        DataProviderError::Internal(Arc::new(e))
+    }
 }
 
 impl From<RpcDeadlineExceeded> for DataProviderError {
@@ -142,9 +152,7 @@ impl From<CodeFetchError> for DataProviderError {
     fn from(e: CodeFetchError) -> Self {
         match e {
             CodeFetchError::Deadline(d) => d.into(),
-            CodeFetchError::VerificationFailure { .. } => {
-                DataProviderError::Internal(eyre::eyre!("{e}"))
-            }
+            CodeFetchError::VerificationFailure { .. } => eyre::eyre!("{e}").into(),
         }
     }
 }
@@ -153,7 +161,7 @@ impl From<StoreError> for DataProviderError {
     fn from(e: StoreError) -> Self {
         // Any `StoreError` surfacing at this layer is an internal persistence issue, not a
         // user-facing "not found" — the `MissingData` fall-through happens upstream of here.
-        DataProviderError::Internal(eyre::eyre!(e))
+        eyre::eyre!(e).into()
     }
 }
 
@@ -550,9 +558,11 @@ impl DataProvider {
 /// isn't a viable extraction path here: `Shared`'s internal `Inner` holds its own clone of the
 /// result for as long as the local `shared` binding lives at the call site, so the refcount is
 /// always ≥ 2 when this function runs. Instead, we reconstruct the typed variant from a shared
-/// reference — every variant except `Internal` carries only `Copy` fields, and `Internal`'s
-/// `eyre::Error` is rebuilt via its display text. The RPC layer thus keeps seeing `-32001` for
-/// `Timeout` etc. regardless of how many callers coalesced on the same fetch.
+/// reference — the `Timeout`/`NotFound`/`Pending` variants carry only `Copy` fields, and
+/// `Internal` holds an `Arc<eyre::Error>` so we share the same pointer (and the full cause
+/// chain) across coalesced waiters. The RPC layer keeps seeing `-32001` for `Timeout` etc.
+/// regardless of how many callers coalesced on the same fetch, and operators still see the
+/// full "caused by" trail for redb / bincode / transport decode errors.
 fn shared_to_result(
     r: std::result::Result<Arc<BlockData>, Arc<DataProviderError>>,
 ) -> DataProviderResult<Arc<BlockData>> {
@@ -562,7 +572,7 @@ fn shared_to_result(
         }
         DataProviderError::TransactionNotFound(h) => DataProviderError::TransactionNotFound(*h),
         DataProviderError::TransactionPending(h) => DataProviderError::TransactionPending(*h),
-        DataProviderError::Internal(e) => DataProviderError::Internal(eyre::eyre!("{e}")),
+        DataProviderError::Internal(e) => DataProviderError::Internal(Arc::clone(e)),
     })
 }
 

@@ -771,7 +771,7 @@ mod tests {
             assert_eq!(err.message(), variant.to_string().as_str());
         }
 
-        let internal = DataProviderError::Internal(eyre::eyre!("boom"));
+        let internal: DataProviderError = eyre::eyre!("boom").into();
         let err = data_provider_error_to_rpc_error(&internal);
         assert_eq!(err.code(), -32000);
         assert_eq!(err.message(), "internal error");
