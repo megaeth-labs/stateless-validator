@@ -139,6 +139,16 @@ struct Args {
     )]
     witness_timeout: u64,
 
+    /// Total block-fetch timeout in seconds (header + witness + block + contracts).
+    /// Bounds `RpcClient`'s unbounded retry loop so deterministic upstream errors
+    /// (e.g. requesting a nonexistent block) surface instead of hanging the client.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_BLOCK_FETCH_TIMEOUT_SECS",
+        default_value_t = data_provider::DEFAULT_BLOCK_FETCH_TIMEOUT_SECS
+    )]
+    block_fetch_timeout: u64,
+
     /// Maximum memory for response cache (e.g., "1GB", "512MB", "1024").
     #[clap(
         long,
@@ -302,6 +312,7 @@ async fn main() -> Result<()> {
         block_store.clone(),
         contract_cache,
         args.witness_timeout,
+        args.block_fetch_timeout,
     ));
 
     let chain_spec = load_chain_spec(&args)?;

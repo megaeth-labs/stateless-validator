@@ -33,6 +33,11 @@ where
 {
     let rx = result_rx.to_async();
     let mut next_expected = initial_tip.block_number + 1;
+    // `current_tip` is the projected head while we thread intra-batch parent-hash checks;
+    // `persisted_tip` trails it and only advances after a successful `store.advance_chain`.
+    // The divergence search and reorg reporting must use `persisted_tip` — querying
+    // `store.get_block_hash` past that returns `None` and raises `LocalChainCorrupt`.
+    let mut persisted_tip = initial_tip.block_number;
     let mut current_tip = initial_tip;
     let mut buffer: BTreeMap<u64, H::Output> = BTreeMap::new();
     // Reused across iterations to avoid per-iteration allocations; typical batch
@@ -74,7 +79,7 @@ where
                     fetcher,
                     &|n| store.get_block_hash(n),
                     &|| store.get_earliest_block(),
-                    current_tip.block_number,
+                    persisted_tip,
                 )
                 .await
                 {
@@ -85,9 +90,9 @@ where
                     Err(e) => return Err(e.into()),
                 };
 
-                let depth = current_tip.block_number.saturating_sub(rollback_to);
+                let depth = persisted_tip.saturating_sub(rollback_to);
                 let mut reverted_hashes = Vec::new();
-                for n in (rollback_to + 1)..=current_tip.block_number {
+                for n in (rollback_to + 1)..=persisted_tip {
                     if let Ok(Some(hash)) = store.get_block_hash(n) {
                         reverted_hashes.push(hash);
                     }
@@ -117,6 +122,7 @@ where
         if !batch.is_empty() {
             hooks.pre_advance(&batch)?;
             store.advance_chain(&metas)?;
+            persisted_tip = current_tip.block_number;
             debug!(
                 tip = current_tip.block_number,
                 advanced = metas.len(),
