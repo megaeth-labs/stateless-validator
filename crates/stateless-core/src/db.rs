@@ -136,6 +136,8 @@ pub trait BlockStore: PrunableChainStore {
 
 #[cfg(test)]
 mod tests {
+    use std::string::ToString;
+
     use super::*;
 
     /// Minimal `core::error::Error` impl for tests that exercise `Backend` wrapping
