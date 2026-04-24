@@ -132,7 +132,14 @@ pub struct CommandLineArgs {
     /// when `advance_chain` exceeds this. Larger values bound the reorg-lookup window;
     /// smaller values reduce redb file growth. Defaults to `DEFAULT_MAX_CHAIN_LENGTH`
     /// (see `stateless_db::DEFAULT_MAX_CHAIN_LENGTH`).
-    #[clap(long, env = "STATELESS_VALIDATOR_CANONICAL_CHAIN_MAX_LENGTH")]
+    ///
+    /// Must be ≥ 1: a value of 0 would wipe the canonical chain on every advance, forcing
+    /// the pipeline to roll back to the anchor each round and loop forever.
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_CANONICAL_CHAIN_MAX_LENGTH",
+        value_parser = clap::value_parser!(u64).range(1..),
+    )]
     pub canonical_chain_max_length: Option<u64>,
 
     /// Logging configuration.

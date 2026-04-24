@@ -31,7 +31,6 @@ use std::{
 use alloy_primitives::B256;
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
 use dashmap::DashMap;
-use eyre::Result;
 use futures::{FutureExt, future::Shared};
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
@@ -378,19 +377,28 @@ impl DataProvider {
         Ok((data, tx_index))
     }
 
-    /// Resolves a block tag to a concrete block number. Not bounded by the pipeline deadline
-    /// since the RPC handler calls this before deciding whether to hit the cache or fall
-    /// through to `get_block_data` — doing cache lookups under a shared deadline would make
-    /// cache hits fail when upstream is down, which is the opposite of what we want.
-    pub async fn resolve_block_number(&self, tag: BlockNumberOrTag) -> Result<u64> {
+    /// Resolves a block tag to a concrete block number.
+    ///
+    /// Numeric tags are a pure local no-op. `Latest`, `Finalized`, and `Safe` must hit
+    /// upstream to learn the tip — there is no cache key until we have a concrete number,
+    /// so falling back to the cache on upstream failure is not an option. These branches
+    /// are bounded by `block_fetch_timeout` so a stuck upstream surfaces as a typed
+    /// [`DataProviderError::Timeout`] rather than hanging the RPC caller forever.
+    pub async fn resolve_block_number(&self, tag: BlockNumberOrTag) -> DataProviderResult<u64> {
         match tag {
             BlockNumberOrTag::Number(n) => Ok(n),
-            BlockNumberOrTag::Latest => Ok(self.rpc_client.get_latest_block_number().await),
             BlockNumberOrTag::Earliest => Ok(0),
-            BlockNumberOrTag::Pending => Err(eyre::eyre!("Pending block not supported")),
+            BlockNumberOrTag::Pending => Err(eyre::eyre!("Pending block not supported").into()),
+            BlockNumberOrTag::Latest => {
+                let deadline = Instant::now() + self.block_fetch_timeout;
+                Ok(self.rpc_client.get_latest_block_number_with_deadline(Some(deadline)).await?)
+            }
             BlockNumberOrTag::Finalized | BlockNumberOrTag::Safe => {
-                // Fetch the header from upstream RPC to resolve the tag
-                let header = self.rpc_client.get_header(BlockId::Number(tag), false).await;
+                let deadline = Instant::now() + self.block_fetch_timeout;
+                let header = self
+                    .rpc_client
+                    .get_header_with_deadline(BlockId::Number(tag), false, Some(deadline))
+                    .await?;
                 Ok(header.number)
             }
         }
@@ -897,6 +905,50 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "timeout must fire quickly; elapsed: {elapsed:?}"
         );
+    }
+
+    /// Tag-resolution branches (`Latest`/`Finalized`/`Safe`) must be deadline-bounded.
+    /// Before this was wired, `resolve_block_number("latest")` would call the non-deadline
+    /// `get_latest_block_number` / `get_header` helpers and retry the upstream forever,
+    /// hanging the RPC caller on a stuck endpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_block_number_surfaces_timeout_when_upstream_hangs() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/");
+
+        let rpc_client = Arc::new(
+            RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
+                .unwrap(),
+        );
+        let contract_cache =
+            Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
+        let provider = DataProvider::new(
+            rpc_client,
+            None,
+            contract_cache,
+            DEFAULT_WITNESS_TIMEOUT_SECS,
+            1, // 1-second block fetch timeout
+        );
+
+        for tag in [BlockNumberOrTag::Latest, BlockNumberOrTag::Finalized, BlockNumberOrTag::Safe] {
+            let start = std::time::Instant::now();
+            let result = provider.resolve_block_number(tag).await;
+            let elapsed = start.elapsed();
+
+            let err = match result {
+                Ok(n) => panic!("hanging upstream must surface as an error for {tag:?}, got {n}"),
+                Err(e) => e,
+            };
+            assert!(
+                matches!(err, DataProviderError::Timeout { stage: TimeoutStage::Block, .. }),
+                "expected Timeout{{Block}} for {tag:?}, got: {err:?}",
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "timeout must fire quickly for {tag:?}; elapsed: {elapsed:?}"
+            );
+        }
     }
 
     /// Cancellation of the primary fetch task (e.g. client disconnect) must not leak an

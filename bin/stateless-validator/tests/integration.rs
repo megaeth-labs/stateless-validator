@@ -132,6 +132,39 @@ fn witness_max_concurrent_requests_flag_and_env() {
     );
 }
 
+/// `canonical_chain_max_length` must reject 0 at parse time. A value of 0 would make
+/// `advance_chain` prune the entire canonical chain on every successful advance,
+/// rolling the pipeline back to the anchor each round and looping forever.
+#[test]
+fn canonical_chain_max_length_rejects_zero() {
+    let base = [
+        "stateless-validator",
+        "--data-dir",
+        "/tmp/x",
+        "--rpc-endpoint",
+        "http://rpc",
+        "--witness-endpoint",
+        "http://w",
+    ];
+    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(base.iter().chain(extra));
+
+    assert_eq!(parse(&[]).unwrap().canonical_chain_max_length, None);
+    assert_eq!(
+        parse(&["--canonical-chain-max-length", "1"]).unwrap().canonical_chain_max_length,
+        Some(1),
+    );
+    assert!(parse(&["--canonical-chain-max-length", "0"]).is_err());
+
+    let guard = stateless_test_utils::env::env_lock();
+    let from_env_zero = stateless_test_utils::env::with_env_var(
+        &guard,
+        "STATELESS_VALIDATOR_CANONICAL_CHAIN_MAX_LENGTH",
+        "0",
+        || parse(&[]),
+    );
+    assert!(from_env_zero.is_err(), "env-var 0 must also be rejected");
+}
+
 const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
 
 /// Mock RPC server backing state: all fields pre-decoded so the RPC handlers can respond
