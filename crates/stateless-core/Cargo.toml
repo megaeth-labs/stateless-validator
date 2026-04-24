@@ -42,14 +42,14 @@ revm.workspace = true
 # misc
 dyn-clone.workspace = true
 eyre.workspace = true
-kanal.workspace = true
-num_cpus.workspace = true
+kanal = { workspace = true, optional = true }
+num_cpus = { workspace = true, optional = true }
 rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
-tokio-util.workspace = true
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
 tracing.workspace = true
 
 [dev-dependencies]
@@ -60,4 +60,6 @@ stateless-test-utils = { path = "../stateless-test-utils" }
 bincode.workspace = true
 
 [features]
+default = ["std"]
+std = ["dep:kanal", "dep:num_cpus", "dep:tokio", "dep:tokio-util"]
 test-bucket-resize = ["salt/test-bucket-resize"]
