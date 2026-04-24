@@ -318,6 +318,14 @@ where
         block_limits,
     );
 
+    // Plain execution path, shared by the non-tracer std branch and the no_std build.
+    // Extracted as a closure so the body lives in one place — any future change to the
+    // non-tracer path only needs to be made here.
+    let run_plain = |state: &mut _, ctx, env| {
+        let executor = executor_factory.create_executor(state, ctx, env);
+        execute_transactions(executor, transactions)
+    };
+
     #[cfg(feature = "std")]
     let (receipts_root, logs_bloom, gas_used) = if let Some(writer) = trace_writer {
         let executor = executor_factory.create_executor_with_inspector(
@@ -328,14 +336,10 @@ where
         );
         execute_transactions(executor, transactions)?
     } else {
-        let executor = executor_factory.create_executor(&mut state, execution_context, evm_env);
-        execute_transactions(executor, transactions)?
+        run_plain(&mut state, execution_context, evm_env)?
     };
     #[cfg(not(feature = "std"))]
-    let (receipts_root, logs_bloom, gas_used) = {
-        let executor = executor_factory.create_executor(&mut state, execution_context, evm_env);
-        execute_transactions(executor, transactions)?
-    };
+    let (receipts_root, logs_bloom, gas_used) = run_plain(&mut state, execution_context, evm_env)?;
 
     // Merge transitions into bundle_state
     state.merge_transitions(BundleRetention::PlainState);
