@@ -616,6 +616,7 @@ mod tests {
                 fx.salt_witnesses[&hash].clone(),
                 mpt,
                 &fx.contracts,
+                #[cfg(feature = "std")]
                 None,
             )
             .unwrap_or_else(|e| panic!("validate_block failed for {number} ({hash}): {e:?}"));

@@ -189,6 +189,8 @@ fn synthesize_state_witness(witness: &MptWitness) -> (B256, B256Map<Bytes>, B256
 
 #[cfg(test)]
 mod tests {
+    use std::vec;
+
     use WithdrawalValidationError::*;
     use alloy_primitives::{Sealable, b256};
 

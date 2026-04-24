@@ -160,6 +160,8 @@ pub fn mega_mainnet_hardforks() -> ChainHardforks {
 
 #[cfg(test)]
 mod tests {
+    use std::string::ToString;
+
     use alloy_serde::OtherFields;
 
     use super::*;

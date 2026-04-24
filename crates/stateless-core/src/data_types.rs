@@ -210,6 +210,8 @@ pub fn iter_code_hashes(
 
 #[cfg(test)]
 mod tests {
+    use std::vec;
+
     use super::*;
 
     fn account_kv(addr: u8, codehash: Option<B256>) -> SaltValue {
