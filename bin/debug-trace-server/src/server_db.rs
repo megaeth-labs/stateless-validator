@@ -292,10 +292,7 @@ mod tests {
     }
 
     fn empty_light_witness() -> LightWitness {
-        LightWitness {
-            kvs: std::collections::BTreeMap::new(),
-            levels: rustc_hash::FxHashMap::default(),
-        }
+        LightWitness { kvs: std::collections::BTreeMap::new(), levels: Default::default() }
     }
 
     #[test]

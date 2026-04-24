@@ -23,7 +23,7 @@
 //! - Contract accounts: 72 bytes (8-byte nonce + 32-byte balance + 32-byte bytecode hash)
 //! - Storage values: 32 bytes (U256 value)
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, vec::Vec};
 
 pub use alloy_primitives::Bytes;
 use alloy_primitives::{Address, B256, U256};

@@ -14,11 +14,15 @@
 //! - Standard `SaltWitness` deserialization: ~240ms (due to EC point validation)
 //! - `LightWitness` deserialization: ~10-20ms (skips EC point validation)
 
-use std::{collections::BTreeMap, ops::RangeInclusive};
+use core::ops::RangeInclusive;
+use std::{collections::BTreeMap, vec::Vec};
 
-use rustc_hash::FxHashMap;
+use hashbrown::HashMap;
+use rustc_hash::FxBuildHasher;
 use salt::{BucketId, BucketMeta, SaltKey, SaltValue, bucket_metadata_key, traits::StateReader};
 use serde::{Deserialize, Serialize};
+
+type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
 
 /// Light witness that only contains data needed for execution.
 ///
@@ -120,14 +124,14 @@ impl StateReader for LightWitness {
 pub struct LightWitnessExecutor {
     /// Direct mapping from plain keys to their salt key locations.
     /// Only contains keys that exist.
-    direct_lookup_tbl: std::collections::HashMap<Vec<u8>, SaltKey>,
+    direct_lookup_tbl: HashMap<Vec<u8>, SaltKey>,
     /// The underlying fast witness
     light_witness: LightWitness,
 }
 
 impl From<LightWitness> for LightWitnessExecutor {
     fn from(light_witness: LightWitness) -> Self {
-        let mut direct_lookup_tbl = std::collections::HashMap::new();
+        let mut direct_lookup_tbl = HashMap::default();
         for (salt_key, value) in &light_witness.kvs {
             if salt_key.is_in_meta_bucket() {
                 continue;
