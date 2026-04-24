@@ -18,7 +18,7 @@ use std::{
 };
 
 use alloy_genesis::Genesis;
-use alloy_primitives::{B256, BlockHash, BlockNumber};
+use alloy_primitives::{B256, BlockHash, BlockNumber, map::HashMap as AlloyHashMap};
 use alloy_rpc_types_eth::Block;
 use eyre::{Context, Result};
 use op_alloy_rpc_types::Transaction;
@@ -49,7 +49,7 @@ pub struct TestFixtures {
     pub block_numbers: BTreeMap<u64, BlockHash>,
     pub salt_witnesses: HashMap<BlockHash, SaltWitness>,
     pub mpt_witness_bytes: HashMap<BlockHash, Vec<u8>>,
-    pub contracts: HashMap<B256, Arc<Bytecode>>,
+    pub contracts: AlloyHashMap<B256, Arc<Bytecode>>,
 }
 
 impl TestFixtures {
@@ -167,7 +167,7 @@ pub fn load_json<T: DeserializeOwned>(path: impl AsRef<Path>) -> Result<T> {
 }
 
 /// Loads contract bytecodes from a file (one `[hash, bytecode]` JSON per line).
-pub fn load_contracts(path: impl AsRef<Path>) -> HashMap<B256, Arc<Bytecode>> {
+pub fn load_contracts(path: impl AsRef<Path>) -> AlloyHashMap<B256, Arc<Bytecode>> {
     let path = path.as_ref();
     let file = File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     BufReader::new(file)

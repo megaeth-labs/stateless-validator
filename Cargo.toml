@@ -25,6 +25,7 @@ alloy-evm = { version = "0.15.0", default-features = false }
 alloy-genesis = { version = "1.0.23", default-features = false }
 alloy-hardforks = { version = "0.2.7", default-features = false }
 alloy-network = "1.0.23"
+alloy-network-primitives = { version = "1.0.23", default-features = false }
 alloy-op-evm = { version = "0.15.0", default-features = false }
 alloy-op-hardforks = { version = "0.2.7", default-features = false }
 alloy-primitives = { version = "1.3.0", default-features = false }
@@ -41,7 +42,7 @@ alloy-trie = { version = "0.9.0", default-features = false }
 
 # mega
 mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "4e4d85cc8202ec4980ec4fa0b6f50666c9d7e92e", default-features = false }
-salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "c8a3289bd3564018c831c062e761df04e512c2a4", default-features = false }
+salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "v1.0.2", default-features = false }
 
 # op
 op-alloy-network = { version = "0.18.12", default-features = false }

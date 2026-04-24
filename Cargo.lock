@@ -1157,7 +1157,7 @@ checksum = "7b7e4c2464d97fe331d41de9d5db0def0a96f4d823b8b32a2efd503578988973"
 [[package]]
 name = "banderwagon"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=c8a3289bd3564018c831c062e761df04e512c2a4#c8a3289bd3564018c831c062e761df04e512c2a4"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.2#2bb00254bbe9fd6671afac8a1bf3464614638b1c"
 dependencies = [
  "ark-ec 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
  "ark-ed-on-bls12-381-bandersnatch",
@@ -2877,7 +2877,7 @@ dependencies = [
 [[package]]
 name = "ipa-multipoint"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=c8a3289bd3564018c831c062e761df04e512c2a4#c8a3289bd3564018c831c062e761df04e512c2a4"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.2#2bb00254bbe9fd6671afac8a1bf3464614638b1c"
 dependencies = [
  "banderwagon",
  "hashbrown 0.16.1",
@@ -5117,8 +5117,8 @@ checksum = "dd29631678d6fb0903b69223673e122c32e9ae559d0960a38d574695ebc0ea15"
 
 [[package]]
 name = "salt"
-version = "1.0.1"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=c8a3289bd3564018c831c062e761df04e512c2a4#c8a3289bd3564018c831c062e761df04e512c2a4"
+version = "1.0.2"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.2#2bb00254bbe9fd6671afac8a1bf3464614638b1c"
 dependencies = [
  "auto_impl",
  "banderwagon",
@@ -5140,7 +5140,7 @@ dependencies = [
 [[package]]
 name = "salt-macros"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=c8a3289bd3564018c831c062e761df04e512c2a4#c8a3289bd3564018c831c062e761df04e512c2a4"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.2#2bb00254bbe9fd6671afac8a1bf3464614638b1c"
 dependencies = [
  "rayon",
 ]
@@ -5629,6 +5629,7 @@ dependencies = [
  "alloy-evm",
  "alloy-genesis",
  "alloy-hardforks",
+ "alloy-network-primitives",
  "alloy-op-evm",
  "alloy-op-hardforks",
  "alloy-primitives",
@@ -5642,7 +5643,6 @@ dependencies = [
  "kanal",
  "mega-evm",
  "num_cpus",
- "op-alloy-network",
  "op-alloy-rpc-types",
  "reth-ethereum-forks",
  "reth-optimism-chainspec",

@@ -6,10 +6,10 @@
 //! CANONICAL_CHAIN is bounded to `max_chain_length` entries; older entries are
 //! pruned inline during [`ChainStore::advance_chain`].
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
 use alloy_genesis::Genesis;
-use alloy_primitives::{B256, BlockHash, BlockNumber};
+use alloy_primitives::{B256, BlockHash, BlockNumber, map::HashMap};
 use redb::ReadableDatabase;
 use revm::state::Bytecode;
 use stateless_core::db::{

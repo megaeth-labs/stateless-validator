@@ -1,8 +1,8 @@
 //! Shared redb read/write helpers used by both concrete database implementations.
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
-use alloy_primitives::{B256, BlockHash, BlockNumber};
+use alloy_primitives::{B256, BlockHash, BlockNumber, map::HashMap};
 use redb::{ReadableDatabase, ReadableTable};
 use revm::state::Bytecode;
 use stateless_core::db::{BlockMeta, ContractLookup, StoreResult, StoreResultExt};
@@ -150,7 +150,7 @@ pub fn read_contracts(database: &Database, hashes: &[B256]) -> StoreResult<Contr
     let read_txn = database.begin_read().store_err()?;
     let table = read_txn.open_table(CONTRACTS).store_err()?;
 
-    let mut found = HashMap::new();
+    let mut found: HashMap<B256, Arc<Bytecode>> = HashMap::default();
     let mut missing = Vec::new();
 
     for &hash in hashes {
