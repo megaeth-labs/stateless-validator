@@ -23,37 +23,37 @@
 //! The module integrates with the Salt witness system for state reconstruction
 //! and uses Revm for transaction execution.
 
+use std::{boxed::Box, collections::BTreeMap, fmt::Debug, string::String, sync::Arc, vec::Vec};
+#[cfg(feature = "std")]
 use std::{
-    collections::BTreeMap,
-    fmt::Debug,
     io::Write,
-    sync::Arc,
     time::{Instant, SystemTime},
 };
 
 use alloy_consensus::{TxReceipt, proofs::calculate_receipt_root, transaction::Recovered};
+use alloy_eips::eip2718::Encodable2718;
 use alloy_evm::{
     EvmEnv,
     block::{BlockExecutor, ExecutableTx},
 };
+use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{
     Address, BlockHash, BlockNumber, Bloom, keccak256,
     map::{B256Map, HashMap},
 };
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
-use eyre::Result;
 use mega_evm::{
     BlockLimits, ExternalEnvFactory, MegaBlockExecutionCtx, MegaBlockExecutorFactory,
     MegaEvmFactory, MegaHardforks, MegaSpecId,
 };
-use op_alloy_network::{TransactionResponse, eip2718::Encodable2718};
 use op_alloy_rpc_types::Transaction as OpTransaction;
+#[cfg(feature = "std")]
+use revm::inspector::inspectors::TracerEip3155;
 use revm::{
     DatabaseRef,
     context::{BlockEnv, CfgEnv},
     database::states::{BundleAccount, StateBuilder, bundle_state::BundleRetention},
-    inspector::inspectors::TracerEip3155,
     primitives::{B256, KECCAK_EMPTY, U256},
     state::Bytecode,
 };
@@ -161,7 +161,8 @@ pub struct ValidationResult {
     pub success: bool,
     /// Any error message if validation failed
     pub error_message: Option<String>,
-    /// Timestamp when validation completed
+    /// Timestamp when validation completed (only available with the `std` feature).
+    #[cfg(feature = "std")]
     pub completed_at: SystemTime,
 }
 
@@ -277,12 +278,12 @@ pub fn replay_block<DB, ENV, E>(
     block: &Block<OpTransaction>,
     db: &DB,
     env_oracle: ENV,
-    trace_writer: Option<Box<dyn Write>>,
+    #[cfg(feature = "std")] trace_writer: Option<Box<dyn Write>>,
 ) -> Result<(HashMap<Address, BundleAccount>, BlockExecutionOutput), ValidationError>
 where
     DB: DatabaseRef<Error = E> + Debug,
     ENV: ExternalEnvFactory + Clone,
-    E: std::error::Error + Send + Sync + 'static,
+    E: core::error::Error + Send + Sync + 'static,
 {
     // Extract full transaction data
     let BlockTransactions::Full(transactions) = &block.transactions else {
@@ -317,6 +318,7 @@ where
         block_limits,
     );
 
+    #[cfg(feature = "std")]
     let (receipts_root, logs_bloom, gas_used) = if let Some(writer) = trace_writer {
         let executor = executor_factory.create_executor_with_inspector(
             &mut state,
@@ -326,6 +328,11 @@ where
         );
         execute_transactions(executor, transactions)?
     } else {
+        let executor = executor_factory.create_executor(&mut state, execution_context, evm_env);
+        execute_transactions(executor, transactions)?
+    };
+    #[cfg(not(feature = "std"))]
+    let (receipts_root, logs_bloom, gas_used) = {
         let executor = executor_factory.create_executor(&mut state, execution_context, evm_env);
         execute_transactions(executor, transactions)?
     };
@@ -426,23 +433,37 @@ pub fn validate_block(
     block: &Block<OpTransaction>,
     salt_witness: SaltWitness,
     mpt_witness: MptWitness,
-    contracts: &std::collections::HashMap<B256, Arc<Bytecode>>,
-    writer: Option<Box<dyn Write>>,
+    contracts: &HashMap<B256, Arc<Bytecode>>,
+    #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
 ) -> Result<ValidationStats, ValidationError> {
     // Create external environment oracle from salt witness
     let ext_env = WitnessExternalEnv::new(&salt_witness, block.header.number)
         .map_err(ValidationError::EnvOracleConstructionFailed)?;
 
     // Verify witness proof against the current state root
+    #[cfg(feature = "std")]
     let start = Instant::now();
     let witness = Witness::from(salt_witness);
     witness.verify().map_err(ValidationError::WitnessVerificationFailed)?;
+    #[cfg(feature = "std")]
     let witness_verification_time = start.elapsed().as_secs_f64();
+    #[cfg(not(feature = "std"))]
+    let witness_verification_time = 0.0_f64;
 
     // Replay block transactions
     let witness_db = WitnessDatabase { header: &block.header, witness: &witness, contracts };
-    let (accounts, output) = replay_block(chain_spec, block, &witness_db, ext_env, writer)?;
+    let (accounts, output) = replay_block(
+        chain_spec,
+        block,
+        &witness_db,
+        ext_env,
+        #[cfg(feature = "std")]
+        writer,
+    )?;
+    #[cfg(feature = "std")]
     let block_replay_time = start.elapsed().as_secs_f64() - witness_verification_time;
+    #[cfg(not(feature = "std"))]
+    let block_replay_time = 0.0_f64;
 
     // Extract and hash storage updates (only changed values)
     let withdrawal_storage: B256Map<U256> = accounts
@@ -518,8 +539,11 @@ pub fn validate_block(
     let (state_root, _) = StateRoot::new(&witness)
         .update_fin(&state_updates)
         .map_err(ValidationError::TrieUpdateFailed)?;
+    #[cfg(feature = "std")]
     let salt_update_time =
         start.elapsed().as_secs_f64() - witness_verification_time - block_replay_time;
+    #[cfg(not(feature = "std"))]
+    let salt_update_time = 0.0_f64;
 
     // Check if computed withdrawals root matches the claimed one
     mpt_witness

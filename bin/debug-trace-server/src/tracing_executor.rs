@@ -24,12 +24,12 @@
 //! ## Parity-style (trace_* methods)
 //! - `LocalizedTransactionTrace` - Flat call traces with block/tx context
 
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use alloy_consensus::Transaction;
 use alloy_evm::{Evm as EvmTrait, block::BlockExecutor};
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
-use alloy_primitives::B256;
+use alloy_primitives::{B256, map::HashMap};
 use alloy_rpc_types_eth::{Block, BlockTransactions, TransactionInfo};
 use alloy_rpc_types_trace::{
     geth::{

@@ -169,9 +169,9 @@ impl PipelineHooks for TraceHooks {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::sync::Arc;
 
-    use alloy_primitives::B256;
+    use alloy_primitives::{B256, map::HashMap};
     use revm::state::Bytecode;
     use stateless_core::StoreResult;
 

@@ -1,6 +1,6 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
-use alloy_primitives::{B256, BlockHash, BlockNumber};
+use alloy_primitives::{B256, BlockHash, BlockNumber, map::HashMap};
 use eyre::{Result, anyhow};
 use revm::state::Bytecode;
 use tokio_util::sync::CancellationToken;
@@ -82,7 +82,7 @@ impl MockStore {
 
 impl crate::ContractStore for MockStore {
     fn get_contracts(&self, _: &[B256]) -> StoreResult<(HashMap<B256, Arc<Bytecode>>, Vec<B256>)> {
-        Ok((HashMap::new(), vec![]))
+        Ok((HashMap::default(), vec![]))
     }
     fn add_contracts(&self, _: &[(B256, Arc<Bytecode>)]) -> StoreResult<()> {
         Ok(())
@@ -213,7 +213,7 @@ async fn test_chain_advancer_sequential() {
         Ok(make_block(12, make_hash(11))),
         Ok(make_block(13, make_hash(12))),
     ];
-    let (result, store) = run_advancer(tip, HashMap::new(), blocks).await;
+    let (result, store) = run_advancer(tip, HashMap::default(), blocks).await;
     assert!(matches!(result.unwrap(), PipelineOutcome::Shutdown));
     assert_eq!(store.get_canonical_tip().unwrap().unwrap().block_number, 13);
 }
@@ -226,7 +226,7 @@ async fn test_chain_advancer_out_of_order() {
         Ok(make_block(12, make_hash(11))),
         Ok(make_block(11, make_hash(10))),
     ];
-    let (result, store) = run_advancer(tip, HashMap::new(), blocks).await;
+    let (result, store) = run_advancer(tip, HashMap::default(), blocks).await;
     assert!(matches!(result.unwrap(), PipelineOutcome::Shutdown));
     assert_eq!(store.get_canonical_tip().unwrap().unwrap().block_number, 13);
 }
@@ -266,7 +266,7 @@ impl PipelineHooks for BadBlockHooks {
 /// a single test case.
 async fn run_bad_block_advancer(tip: BlockMeta, blocks: Vec<BadBlock>) -> Result<PipelineOutcome> {
     let store = MockStore::new(tip.clone());
-    let fetcher = MockFetcher { hashes: HashMap::new() };
+    let fetcher = MockFetcher { hashes: HashMap::default() };
     let hooks = BadBlockHooks;
     let (tx, rx) = kanal::bounded::<
         std::result::Result<BadBlock, (Arc<dyn std::error::Error + Send + Sync>, ErrorAction)>,
@@ -305,7 +305,7 @@ async fn test_chain_advancer_verify_continuity_failure_halts() {
 async fn test_chain_advancer_fatal_error_halts() {
     let tip = make_tip(10);
     let blocks = vec![Err(("state root mismatch".to_string(), ErrorAction::Halt))];
-    let (result, _) = run_advancer(tip, HashMap::new(), blocks).await;
+    let (result, _) = run_advancer(tip, HashMap::default(), blocks).await;
     match result.unwrap() {
         PipelineOutcome::Fatal(msg) => assert!(msg.contains("state root mismatch")),
         other => panic!("Expected Fatal, got {other:?}"),
@@ -316,7 +316,7 @@ async fn test_chain_advancer_fatal_error_halts() {
 async fn test_chain_advancer_transient_error_returns_retry_outcome() {
     let tip = make_tip(10);
     let blocks = vec![Err(("RPC timeout".to_string(), ErrorAction::Retry))];
-    let (result, _) = run_advancer(tip, HashMap::new(), blocks).await;
+    let (result, _) = run_advancer(tip, HashMap::default(), blocks).await;
     // Retry errors are surfaced as `PipelineOutcome::Retry`, not `Err`. The outer
     // `run_pipeline` loop matches on the variant explicitly and runs the common
     // transient-restart recovery path.
@@ -335,7 +335,7 @@ async fn test_chain_advancer_transient_error_returns_retry_outcome() {
 async fn test_chain_advancer_shutdown() {
     let tip = make_tip(10);
     let store = MockStore::new(tip.clone());
-    let fetcher = MockFetcher { hashes: HashMap::new() };
+    let fetcher = MockFetcher { hashes: HashMap::default() };
     let hooks = NoopHooks;
     let (_tx, rx) = kanal::bounded::<
         std::result::Result<MockBlock, (Arc<dyn std::error::Error + Send + Sync>, ErrorAction)>,
@@ -350,7 +350,7 @@ async fn test_chain_advancer_shutdown() {
 #[tokio::test]
 async fn test_chain_advancer_reorg_detected() {
     let tip = make_tip(10);
-    let mut rpc_hashes = HashMap::new();
+    let mut rpc_hashes = HashMap::default();
     rpc_hashes.insert(10, make_hash(10));
 
     let bad_block = MockBlock {
@@ -375,7 +375,7 @@ async fn test_chain_advancer_reorg_detected() {
 #[tokio::test]
 async fn test_chain_advancer_reorg_mid_batch_uses_persisted_tip() {
     let tip = make_tip(10);
-    let mut rpc_hashes = HashMap::new();
+    let mut rpc_hashes = HashMap::default();
     rpc_hashes.insert(10, make_hash(10));
 
     // Send block 12 before block 11 so they sit in the buffer together: the first recv only
@@ -427,8 +427,8 @@ impl crate::pipeline::DivergenceLookups for MapLookups {
 
 #[tokio::test]
 async fn test_find_divergence_single_block_reorg() {
-    let mut local = HashMap::new();
-    let mut remote = HashMap::new();
+    let mut local = HashMap::default();
+    let mut remote = HashMap::default();
     for n in 1..=10 {
         local.insert(n, make_hash(n));
         if n <= 9 {
@@ -447,8 +447,8 @@ async fn test_find_divergence_single_block_reorg() {
 
 #[tokio::test]
 async fn test_find_divergence_multi_block_reorg() {
-    let mut local = HashMap::new();
-    let mut remote = HashMap::new();
+    let mut local = HashMap::default();
+    let mut remote = HashMap::default();
     for n in 1..=10 {
         if n <= 5 {
             let hash = make_hash(n);
@@ -469,8 +469,8 @@ async fn test_find_divergence_multi_block_reorg() {
 
 #[tokio::test]
 async fn test_find_divergence_catastrophic() {
-    let mut local = HashMap::new();
-    let mut remote = HashMap::new();
+    let mut local = HashMap::default();
+    let mut remote = HashMap::default();
     for n in 1..=5 {
         local.insert(n, make_hash(n));
         remote.insert(n, BlockHash::from([(n + 128) as u8; 32]));
