@@ -184,17 +184,21 @@ pub struct BlockExecutionOutput {
 }
 
 /// Statistics collected during block validation for metrics.
+///
+/// The `*_time` fields are measured with `std::time::Instant` and are always `0.0` in
+/// `no_std` builds (no monotonic clock available). Consumers that meter or log these
+/// values should treat `0.0` as "not measured" when running without the `std` feature.
 #[derive(Debug, Clone, Default)]
 pub struct ValidationStats {
     /// Number of accounts/storage slots read during execution
     pub state_reads: usize,
     /// Number of accounts/storage slots changed
     pub state_writes: usize,
-    /// Time spent verifying the witness proof (seconds)
+    /// Time spent verifying the witness proof (seconds; `0.0` in `no_std` builds)
     pub witness_verification_time: f64,
-    /// Time spent replaying block transactions (seconds)
+    /// Time spent replaying block transactions (seconds; `0.0` in `no_std` builds)
     pub block_replay_time: f64,
-    /// Time spent updating SALT state (seconds)
+    /// Time spent updating SALT state (seconds; `0.0` in `no_std` builds)
     pub salt_update_time: f64,
 }
 
@@ -452,7 +456,7 @@ pub fn validate_block(
     #[cfg(feature = "std")]
     let witness_verification_time = start.elapsed().as_secs_f64();
     #[cfg(not(feature = "std"))]
-    let witness_verification_time = 0.0_f64;
+    let witness_verification_time = 0.0_f64; // no_std: timing unavailable
 
     // Replay block transactions
     let witness_db = WitnessDatabase { header: &block.header, witness: &witness, contracts };
@@ -467,7 +471,7 @@ pub fn validate_block(
     #[cfg(feature = "std")]
     let block_replay_time = start.elapsed().as_secs_f64() - witness_verification_time;
     #[cfg(not(feature = "std"))]
-    let block_replay_time = 0.0_f64;
+    let block_replay_time = 0.0_f64; // no_std: timing unavailable
 
     // Extract and hash storage updates (only changed values)
     let withdrawal_storage: B256Map<U256> = accounts
@@ -547,7 +551,7 @@ pub fn validate_block(
     let salt_update_time =
         start.elapsed().as_secs_f64() - witness_verification_time - block_replay_time;
     #[cfg(not(feature = "std"))]
-    let salt_update_time = 0.0_f64;
+    let salt_update_time = 0.0_f64; // no_std: timing unavailable
 
     // Check if computed withdrawals root matches the claimed one
     mpt_witness
