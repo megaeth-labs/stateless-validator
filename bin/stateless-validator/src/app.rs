@@ -7,10 +7,7 @@ use alloy_primitives::BlockHash;
 use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::Result;
-use stateless_common::{
-    BackoffPolicy, RpcClient, RpcClientConfig,
-    logging::{LogArgs, migrate_legacy_env_vars},
-};
+use stateless_common::{BackoffPolicy, RpcClient, RpcClientConfig, logging::LogArgs};
 use stateless_core::{
     ChainStore, ContractStore, GenesisStore, chain_spec::ChainSpec, db::BlockMeta,
 };
@@ -153,7 +150,6 @@ pub struct CommandLineArgs {
 /// validator DB, loads or initializes the chain spec + anchor, then hands off to
 /// [`workers::run_with_signals`].
 pub async fn run() -> Result<()> {
-    migrate_legacy_env_vars();
     let args = CommandLineArgs::parse();
     let _log_guard = args.log.init_tracing()?;
     let start = std::time::Instant::now();
