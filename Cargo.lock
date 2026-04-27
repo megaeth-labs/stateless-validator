@@ -1844,7 +1844,6 @@ dependencies = [
  "reqwest 0.13.2",
  "revm",
  "revm-inspectors",
- "rustc-hash",
  "salt",
  "serde",
  "serde_json",

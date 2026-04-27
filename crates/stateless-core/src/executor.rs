@@ -23,12 +23,9 @@
 //! The module integrates with the Salt witness system for state reconstruction
 //! and uses Revm for transaction execution.
 
-use std::{boxed::Box, collections::BTreeMap, fmt::Debug, string::String, sync::Arc, vec::Vec};
+use std::{boxed::Box, collections::BTreeMap, fmt::Debug, sync::Arc, vec::Vec};
 #[cfg(feature = "std")]
-use std::{
-    io::Write,
-    time::{Instant, SystemTime},
-};
+use std::{io::Write, time::Instant};
 
 use alloy_consensus::{TxReceipt, proofs::calculate_receipt_root, transaction::Recovered};
 use alloy_eips::eip2718::Encodable2718;
@@ -39,7 +36,7 @@ use alloy_evm::{
 use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{
-    Address, BlockHash, BlockNumber, Bloom, keccak256,
+    Address, Bloom, keccak256,
     map::{B256Map, HashMap},
 };
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
@@ -58,7 +55,6 @@ use revm::{
     state::Bytecode,
 };
 use salt::{EphemeralSaltState, SaltValue, SaltWitness, StateRoot, StateUpdates, Witness};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::debug;
 
@@ -140,30 +136,6 @@ pub enum ValidationError {
         /// The claimed gas used from the block header
         claimed: u64,
     },
-}
-
-/// Represents the result of a validation operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ValidationResult {
-    /// The pre-state root from the witness before block execution
-    pub pre_state_root: B256,
-    /// The post-state root after block execution (from block header)
-    pub post_state_root: B256,
-    /// The pre-withdrawl root from the mpt witness before block execution
-    pub pre_withdrawals_root: B256,
-    /// The post-withdrawal root after block execution (from block header)
-    pub post_withdrawals_root: B256,
-    /// The block number that was validated
-    pub block_number: BlockNumber,
-    /// The block hash that was validated
-    pub block_hash: BlockHash,
-    /// Whether the validation was successful
-    pub success: bool,
-    /// Any error message if validation failed
-    pub error_message: Option<String>,
-    /// Timestamp when validation completed (only available with the `std` feature).
-    #[cfg(feature = "std")]
-    pub completed_at: SystemTime,
 }
 
 /// Results from executing block transactions.

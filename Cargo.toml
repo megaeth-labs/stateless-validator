@@ -51,7 +51,6 @@ op-alloy-rpc-types = { version = "0.18.12", default-features = false }
 # reth
 reth-ethereum-forks = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
 reth-optimism-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-trie = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0" }
 reth-trie-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
 reth-trie-sparse = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
 
