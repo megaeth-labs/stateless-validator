@@ -10,7 +10,7 @@
 //! `ChainSpec::from_genesis(fixtures.load_genesis().unwrap())`.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     fs::File,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -18,7 +18,7 @@ use std::{
 };
 
 use alloy_genesis::Genesis;
-use alloy_primitives::{B256, BlockHash, BlockNumber};
+use alloy_primitives::{B256, BlockHash, BlockNumber, map::HashMap};
 use alloy_rpc_types_eth::Block;
 use eyre::{Context, Result};
 use op_alloy_rpc_types::Transaction;
@@ -55,7 +55,7 @@ pub struct TestFixtures {
 impl TestFixtures {
     /// Load fixtures from a directory following the `test_data/` layout.
     pub fn load(data_dir: &Path) -> Self {
-        let mut blocks = HashMap::new();
+        let mut blocks = HashMap::default();
         let mut block_numbers = BTreeMap::new();
         for path in read_dir_paths(&data_dir.join("blocks")) {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
@@ -75,8 +75,8 @@ impl TestFixtures {
             block_numbers.insert(number, hash);
         }
 
-        let mut salt_witnesses = HashMap::new();
-        let mut mpt_witness_bytes = HashMap::new();
+        let mut salt_witnesses = HashMap::default();
+        let mut mpt_witness_bytes = HashMap::default();
         for path in read_dir_paths(&data_dir.join("stateless/witness")) {
             let Some(ext) = path.extension().and_then(|s| s.to_str()) else { continue };
             let stem = path.file_stem().unwrap().to_str().unwrap();

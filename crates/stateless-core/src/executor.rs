@@ -23,42 +23,38 @@
 //! The module integrates with the Salt witness system for state reconstruction
 //! and uses Revm for transaction execution.
 
-use std::{
-    collections::BTreeMap,
-    fmt::Debug,
-    io::Write,
-    sync::Arc,
-    time::{Instant, SystemTime},
-};
+use std::{boxed::Box, collections::BTreeMap, fmt::Debug, sync::Arc, vec::Vec};
+#[cfg(feature = "std")]
+use std::{io::Write, time::Instant};
 
 use alloy_consensus::{TxReceipt, proofs::calculate_receipt_root, transaction::Recovered};
+use alloy_eips::eip2718::Encodable2718;
 use alloy_evm::{
     EvmEnv,
     block::{BlockExecutor, ExecutableTx},
 };
+use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{
-    Address, BlockHash, BlockNumber, Bloom, keccak256,
+    Address, Bloom, keccak256,
     map::{B256Map, HashMap},
 };
 use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
-use eyre::Result;
 use mega_evm::{
     BlockLimits, ExternalEnvFactory, MegaBlockExecutionCtx, MegaBlockExecutorFactory,
     MegaEvmFactory, MegaHardforks, MegaSpecId,
 };
-use op_alloy_network::{TransactionResponse, eip2718::Encodable2718};
 use op_alloy_rpc_types::Transaction as OpTransaction;
+#[cfg(feature = "std")]
+use revm::inspector::inspectors::TracerEip3155;
 use revm::{
     DatabaseRef,
     context::{BlockEnv, CfgEnv},
     database::states::{BundleAccount, StateBuilder, bundle_state::BundleRetention},
-    inspector::inspectors::TracerEip3155,
     primitives::{B256, KECCAK_EMPTY, U256},
     state::Bytecode,
 };
 use salt::{EphemeralSaltState, SaltValue, SaltWitness, StateRoot, StateUpdates, Witness};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::debug;
 
@@ -142,29 +138,6 @@ pub enum ValidationError {
     },
 }
 
-/// Represents the result of a validation operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ValidationResult {
-    /// The pre-state root from the witness before block execution
-    pub pre_state_root: B256,
-    /// The post-state root after block execution (from block header)
-    pub post_state_root: B256,
-    /// The pre-withdrawl root from the mpt witness before block execution
-    pub pre_withdrawals_root: B256,
-    /// The post-withdrawal root after block execution (from block header)
-    pub post_withdrawals_root: B256,
-    /// The block number that was validated
-    pub block_number: BlockNumber,
-    /// The block hash that was validated
-    pub block_hash: BlockHash,
-    /// Whether the validation was successful
-    pub success: bool,
-    /// Any error message if validation failed
-    pub error_message: Option<String>,
-    /// Timestamp when validation completed
-    pub completed_at: SystemTime,
-}
-
 /// Results from executing block transactions.
 ///
 /// Contains the computed values needed to verify block header fields.
@@ -183,17 +156,21 @@ pub struct BlockExecutionOutput {
 }
 
 /// Statistics collected during block validation for metrics.
+///
+/// The `*_time` fields are measured with `std::time::Instant` and are always `0.0` in
+/// `no_std` builds (no monotonic clock available). Consumers that meter or log these
+/// values should treat `0.0` as "not measured" when running without the `std` feature.
 #[derive(Debug, Clone, Default)]
 pub struct ValidationStats {
     /// Number of accounts/storage slots read during execution
     pub state_reads: usize,
     /// Number of accounts/storage slots changed
     pub state_writes: usize,
-    /// Time spent verifying the witness proof (seconds)
+    /// Time spent verifying the witness proof (seconds; `0.0` in `no_std` builds)
     pub witness_verification_time: f64,
-    /// Time spent replaying block transactions (seconds)
+    /// Time spent replaying block transactions (seconds; `0.0` in `no_std` builds)
     pub block_replay_time: f64,
-    /// Time spent updating SALT state (seconds)
+    /// Time spent updating SALT state (seconds; `0.0` in `no_std` builds)
     pub salt_update_time: f64,
 }
 
@@ -277,12 +254,12 @@ pub fn replay_block<DB, ENV, E>(
     block: &Block<OpTransaction>,
     db: &DB,
     env_oracle: ENV,
-    trace_writer: Option<Box<dyn Write>>,
+    #[cfg(feature = "std")] trace_writer: Option<Box<dyn Write>>,
 ) -> Result<(HashMap<Address, BundleAccount>, BlockExecutionOutput), ValidationError>
 where
     DB: DatabaseRef<Error = E> + Debug,
     ENV: ExternalEnvFactory + Clone,
-    E: std::error::Error + Send + Sync + 'static,
+    E: core::error::Error + Send + Sync + 'static,
 {
     // Extract full transaction data
     let BlockTransactions::Full(transactions) = &block.transactions else {
@@ -317,6 +294,15 @@ where
         block_limits,
     );
 
+    // Plain execution path, shared by the non-tracer std branch and the no_std build.
+    // Extracted as a closure so the body lives in one place — any future change to the
+    // non-tracer path only needs to be made here.
+    let run_plain = |state: &mut _, ctx, env| {
+        let executor = executor_factory.create_executor(state, ctx, env);
+        execute_transactions(executor, transactions)
+    };
+
+    #[cfg(feature = "std")]
     let (receipts_root, logs_bloom, gas_used) = if let Some(writer) = trace_writer {
         let executor = executor_factory.create_executor_with_inspector(
             &mut state,
@@ -326,9 +312,10 @@ where
         );
         execute_transactions(executor, transactions)?
     } else {
-        let executor = executor_factory.create_executor(&mut state, execution_context, evm_env);
-        execute_transactions(executor, transactions)?
+        run_plain(&mut state, execution_context, evm_env)?
     };
+    #[cfg(not(feature = "std"))]
+    let (receipts_root, logs_bloom, gas_used) = run_plain(&mut state, execution_context, evm_env)?;
 
     // Merge transitions into bundle_state
     state.merge_transitions(BundleRetention::PlainState);
@@ -426,23 +413,37 @@ pub fn validate_block(
     block: &Block<OpTransaction>,
     salt_witness: SaltWitness,
     mpt_witness: MptWitness,
-    contracts: &std::collections::HashMap<B256, Arc<Bytecode>>,
-    writer: Option<Box<dyn Write>>,
+    contracts: &HashMap<B256, Arc<Bytecode>>,
+    #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
 ) -> Result<ValidationStats, ValidationError> {
     // Create external environment oracle from salt witness
     let ext_env = WitnessExternalEnv::new(&salt_witness, block.header.number)
         .map_err(ValidationError::EnvOracleConstructionFailed)?;
 
     // Verify witness proof against the current state root
+    #[cfg(feature = "std")]
     let start = Instant::now();
     let witness = Witness::from(salt_witness);
     witness.verify().map_err(ValidationError::WitnessVerificationFailed)?;
+    #[cfg(feature = "std")]
     let witness_verification_time = start.elapsed().as_secs_f64();
+    #[cfg(not(feature = "std"))]
+    let witness_verification_time = 0.0_f64; // no_std: timing unavailable
 
     // Replay block transactions
     let witness_db = WitnessDatabase { header: &block.header, witness: &witness, contracts };
-    let (accounts, output) = replay_block(chain_spec, block, &witness_db, ext_env, writer)?;
+    let (accounts, output) = replay_block(
+        chain_spec,
+        block,
+        &witness_db,
+        ext_env,
+        #[cfg(feature = "std")]
+        writer,
+    )?;
+    #[cfg(feature = "std")]
     let block_replay_time = start.elapsed().as_secs_f64() - witness_verification_time;
+    #[cfg(not(feature = "std"))]
+    let block_replay_time = 0.0_f64; // no_std: timing unavailable
 
     // Extract and hash storage updates (only changed values)
     let withdrawal_storage: B256Map<U256> = accounts
@@ -518,8 +519,11 @@ pub fn validate_block(
     let (state_root, _) = StateRoot::new(&witness)
         .update_fin(&state_updates)
         .map_err(ValidationError::TrieUpdateFailed)?;
+    #[cfg(feature = "std")]
     let salt_update_time =
         start.elapsed().as_secs_f64() - witness_verification_time - block_replay_time;
+    #[cfg(not(feature = "std"))]
+    let salt_update_time = 0.0_f64; // no_std: timing unavailable
 
     // Check if computed withdrawals root matches the claimed one
     mpt_witness
@@ -592,6 +596,7 @@ mod tests {
                 fx.salt_witnesses[&hash].clone(),
                 mpt,
                 &fx.contracts,
+                #[cfg(feature = "std")]
                 None,
             )
             .unwrap_or_else(|e| panic!("validate_block failed for {number} ({hash}): {e:?}"));

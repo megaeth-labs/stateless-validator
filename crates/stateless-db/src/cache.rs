@@ -1,7 +1,6 @@
 //! In-memory write-through cache for contract bytecodes.
 
 use std::{
-    collections::HashMap,
     hash::RandomState,
     sync::{
         Arc,
@@ -9,7 +8,7 @@ use std::{
     },
 };
 
-use alloy_primitives::B256;
+use alloy_primitives::{B256, map::HashMap};
 use quick_cache::{
     Weighter,
     sync::{Cache, DefaultLifecycle},
@@ -121,7 +120,8 @@ impl ContractCache {
     /// caller should use a verified RPC fetch (`RpcClient::get_codes(.., verify=true)`)
     /// to populate the cache so all entries arrive pre-verified.
     pub fn get(&self, hashes: &[B256]) -> StoreResult<ContractLookup> {
-        let mut found = HashMap::with_capacity(hashes.len());
+        let mut found: HashMap<B256, Arc<Bytecode>> = HashMap::default();
+        found.reserve(hashes.len());
         let mut not_in_memory = Vec::with_capacity(hashes.len());
 
         for &hash in hashes {
@@ -221,7 +221,7 @@ mod tests {
             hashes: &[B256],
         ) -> StoreResult<(HashMap<B256, Arc<Bytecode>>, Vec<B256>)> {
             self.get_calls.fetch_add(1, Ordering::Relaxed);
-            let mut found = HashMap::new();
+            let mut found: HashMap<B256, Arc<Bytecode>> = HashMap::default();
             let mut missing = Vec::new();
             for &h in hashes {
                 match self.data.get(&h) {

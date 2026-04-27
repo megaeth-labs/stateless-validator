@@ -23,7 +23,7 @@
 //! - Contract accounts: 72 bytes (8-byte nonce + 32-byte balance + 32-byte bytecode hash)
 //! - Storage values: 32 bytes (U256 value)
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, vec::Vec};
 
 pub use alloy_primitives::Bytes;
 use alloy_primitives::{Address, B256, U256};
@@ -210,6 +210,8 @@ pub fn iter_code_hashes(
 
 #[cfg(test)]
 mod tests {
+    use std::vec;
+
     use super::*;
 
     fn account_kv(addr: u8, codehash: Option<B256>) -> SaltValue {

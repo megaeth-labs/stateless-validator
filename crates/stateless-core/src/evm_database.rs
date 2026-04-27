@@ -4,10 +4,15 @@
 //! a block witness rather than a full blockchain database, enabling stateless block
 //! validation.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    format,
+    string::{String, ToString},
+    sync::Arc,
+    vec::Vec,
+};
 
 use alloy_eips::eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS};
-use alloy_primitives::{Address, B256, BlockNumber};
+use alloy_primitives::{Address, B256, BlockNumber, map::HashMap};
 use alloy_rpc_types_eth::Header;
 use mega_evm::{ExternalEnvFactory, ExternalEnvs, OracleEnv, SaltEnv};
 use revm::{
@@ -71,7 +76,7 @@ pub struct WitnessDatabase<'a, W> {
 impl<'a, W> WitnessDatabase<'a, W>
 where
     W: StateReader,
-    W::Error: std::fmt::Display,
+    W::Error: core::fmt::Display,
 {
     /// Get value from witness for the given plain key
     fn plain_value(&self, plain_key: &[u8]) -> Result<Option<Vec<u8>>, WitnessDatabaseError> {
@@ -84,7 +89,7 @@ where
 impl<'a, W> DatabaseRef for WitnessDatabase<'a, W>
 where
     W: StateReader,
-    W::Error: std::fmt::Display,
+    W::Error: core::fmt::Display,
 {
     type Error = WitnessDatabaseError;
 

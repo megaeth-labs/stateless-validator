@@ -1,5 +1,7 @@
 //! Chain specification and hardfork activation logic.
 
+use std::{boxed::Box, vec, vec::Vec};
+
 use alloy_genesis::Genesis;
 use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition, Hardfork};
 use alloy_op_hardforks::{OpHardfork, OpHardforks};
@@ -47,8 +49,9 @@ impl ChainSpec {
     /// - [`OpChainSpec`] already yields Optimism/Ethereum hardforks in the correct order, so they
     ///   do not require reordering.
     /// - MegaETH hardforks are extracted from the genesis `extra_fields` and explicitly ordered to
-    ///   match the canonical sequence defined by [`MEGA_MAINNET_HARDFORKS`]. Any remaining, unknown
-    ///   MegaETH hardforks are preserved and appended after the known ones so nothing is dropped.
+    ///   match the canonical sequence defined by [`mega_mainnet_hardforks()`]. Any remaining,
+    ///   unknown MegaETH hardforks are preserved and appended after the known ones so nothing is
+    ///   dropped.
     /// - The MegaETH set is then merged with the Optimism/Ethereum set to build a single
     ///   [`ChainHardforks`] that drives fork activation.
     ///
@@ -71,9 +74,9 @@ impl ChainSpec {
             .map(|(f, b)| (dyn_clone::clone_box(f), b))
             .collect();
 
-        let hardfork_order = MEGA_MAINNET_HARDFORKS.forks_iter();
+        let hardfork_order = mega_mainnet_hardforks();
         let mut all_hardforks = Vec::with_capacity(op_hardforks.len() + megaeth_hardforks.len());
-        for (order, _) in hardfork_order {
+        for (order, _) in hardfork_order.forks_iter() {
             if let Some(mega_hardfork_index) =
                 megaeth_hardforks.iter().position(|(hardfork, _)| **hardfork == *order)
             {
@@ -140,24 +143,25 @@ impl MegaethGenesisHardforks {
     }
 }
 
-/// Hardforks configuration for MegaETH.
-pub static MEGA_MAINNET_HARDFORKS: std::sync::LazyLock<ChainHardforks> =
-    std::sync::LazyLock::new(|| {
-        ChainHardforks::new(vec![
-            (MegaHardfork::MiniRex.boxed(), ForkCondition::Timestamp(0)),
-            (MegaHardfork::MiniRex1.boxed(), ForkCondition::Timestamp(0)),
-            (MegaHardfork::MiniRex2.boxed(), ForkCondition::Timestamp(0)),
-            (MegaHardfork::Rex.boxed(), ForkCondition::Timestamp(0)),
-            (MegaHardfork::Rex1.boxed(), ForkCondition::Timestamp(0)),
-            (MegaHardfork::Rex2.boxed(), ForkCondition::Timestamp(0)),
-            (MegaHardfork::Rex3.boxed(), ForkCondition::Timestamp(0)),
-            (MegaHardfork::Rex4.boxed(), ForkCondition::Timestamp(0)),
-            (MegaHardfork::Rex5.boxed(), ForkCondition::Timestamp(0)),
-        ])
-    });
+/// Build a fresh `ChainHardforks` describing MegaETH's canonical hardfork sequence.
+pub fn mega_mainnet_hardforks() -> ChainHardforks {
+    ChainHardforks::new(vec![
+        (MegaHardfork::MiniRex.boxed(), ForkCondition::Timestamp(0)),
+        (MegaHardfork::MiniRex1.boxed(), ForkCondition::Timestamp(0)),
+        (MegaHardfork::MiniRex2.boxed(), ForkCondition::Timestamp(0)),
+        (MegaHardfork::Rex.boxed(), ForkCondition::Timestamp(0)),
+        (MegaHardfork::Rex1.boxed(), ForkCondition::Timestamp(0)),
+        (MegaHardfork::Rex2.boxed(), ForkCondition::Timestamp(0)),
+        (MegaHardfork::Rex3.boxed(), ForkCondition::Timestamp(0)),
+        (MegaHardfork::Rex4.boxed(), ForkCondition::Timestamp(0)),
+        (MegaHardfork::Rex5.boxed(), ForkCondition::Timestamp(0)),
+    ])
+}
 
 #[cfg(test)]
 mod tests {
+    use std::string::ToString;
+
     use alloy_serde::OtherFields;
 
     use super::*;

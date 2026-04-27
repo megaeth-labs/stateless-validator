@@ -3,9 +3,9 @@
 //! Provides persistent storage of block data, witnesses, and canonical chain state
 //! for serving `debug_*` and `trace_*` RPC methods.
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{path::Path, sync::Arc};
 
-use alloy_primitives::{B256, BlockHash, BlockNumber};
+use alloy_primitives::{B256, BlockHash, BlockNumber, map::HashMap};
 use alloy_rpc_types_eth::Block;
 use op_alloy_rpc_types::Transaction;
 use rayon::prelude::*;
@@ -292,10 +292,7 @@ mod tests {
     }
 
     fn empty_light_witness() -> LightWitness {
-        LightWitness {
-            kvs: std::collections::BTreeMap::new(),
-            levels: rustc_hash::FxHashMap::default(),
-        }
+        LightWitness { kvs: std::collections::BTreeMap::new(), levels: Default::default() }
     }
 
     #[test]

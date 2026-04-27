@@ -5,12 +5,16 @@
 //! storage updates from block execution, it cryptographically proves the storage root
 //! transition is valid.
 
+use std::{
+    string::{String, ToString},
+    vec::Vec,
+};
+
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_primitives::{Address, B256, Bytes, U256, address, keccak256, map::B256Map};
 use alloy_rlp::Encodable;
 use alloy_rpc_types_eth::Header;
-use reth_trie::Nibbles;
-use reth_trie_common::{EMPTY_ROOT_HASH, LeafNode, TrieAccount, TrieNode};
+use reth_trie_common::{EMPTY_ROOT_HASH, LeafNode, Nibbles, TrieAccount, TrieNode};
 use reth_trie_sparse::{
     SerialSparseTrie, SparseStateTrie, SparseTrie, provider::DefaultTrieNodeProviderFactory,
 };
@@ -155,7 +159,7 @@ impl MptWitness {
 /// Returns `(synthesized_state_root, witness_map, hashed_address)`.
 fn synthesize_state_witness(witness: &MptWitness) -> (B256, B256Map<Bytes>, B256) {
     let mut witness_map: B256Map<Bytes> =
-        witness.state.iter().map(|node| (keccak256(node), node.clone())).collect();
+        witness.state.iter().map(|node: &Bytes| (keccak256(node.as_ref()), node.clone())).collect();
 
     let hashed_address = keccak256(ADDRESS_L2_TO_L1_MESSAGE_PASSER);
     // `nonce`, `balance`, and `code_hash` are intentionally dummy values — they
@@ -185,6 +189,8 @@ fn synthesize_state_witness(witness: &MptWitness) -> (B256, B256Map<Bytes>, B256
 
 #[cfg(test)]
 mod tests {
+    use std::vec;
+
     use WithdrawalValidationError::*;
     use alloy_primitives::{Sealable, b256};
 

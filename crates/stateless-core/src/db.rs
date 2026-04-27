@@ -9,10 +9,10 @@
 //! Concrete implementations live in their respective binaries;
 //! shared redb helpers live in the `stateless-db` crate.
 
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{boxed::Box, fmt, string::String, sync::Arc, vec::Vec};
 
 use alloy_genesis::Genesis;
-use alloy_primitives::{B256, BlockHash, BlockNumber};
+use alloy_primitives::{B256, BlockHash, BlockNumber, map::HashMap};
 use alloy_rpc_types_eth::Block;
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
@@ -39,12 +39,12 @@ pub struct BlockMeta {
 ///
 /// Backend errors (redb, bincode, serde_json, lz4, …) are wrapped as an opaque
 /// [`StoreError::Backend`] — the source chain is preserved via
-/// [`std::error::Error::source`], so `%err` / `{:#}` logs show the root cause
+/// [`core::error::Error::source`], so `%err` / `{:#}` logs show the root cause
 /// without the trait layer needing to know the concrete backend type.
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error(transparent)]
-    Backend(Box<dyn std::error::Error + Send + Sync + 'static>),
+    Backend(Box<dyn core::error::Error + Send + Sync + 'static>),
 
     #[error("missing {kind} for block {block_hash}")]
     MissingData { kind: MissingDataKind, block_hash: BlockHash },
@@ -53,7 +53,7 @@ pub enum StoreError {
     Corrupt(String),
 }
 
-pub type StoreResult<T> = std::result::Result<T, StoreError>;
+pub type StoreResult<T> = core::result::Result<T, StoreError>;
 
 /// Adapter for turning any concrete backend error into [`StoreError::Backend`].
 ///
@@ -63,8 +63,8 @@ pub trait StoreResultExt<T> {
     fn store_err(self) -> StoreResult<T>;
 }
 
-impl<T, E: std::error::Error + Send + Sync + 'static> StoreResultExt<T>
-    for std::result::Result<T, E>
+impl<T, E: core::error::Error + Send + Sync + 'static> StoreResultExt<T>
+    for core::result::Result<T, E>
 {
     fn store_err(self) -> StoreResult<T> {
         self.map_err(|e| StoreError::Backend(Box::new(e)))
@@ -136,7 +136,20 @@ pub trait BlockStore: PrunableChainStore {
 
 #[cfg(test)]
 mod tests {
+    use std::string::ToString;
+
     use super::*;
+
+    /// Minimal `core::error::Error` impl for tests that exercise `Backend` wrapping
+    /// without pulling `std::io::Error` (which doesn't exist under no_std).
+    #[derive(Debug)]
+    struct TestErr(&'static str);
+    impl fmt::Display for TestErr {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl core::error::Error for TestErr {}
 
     #[test]
     fn test_block_meta_equality() {
@@ -188,15 +201,15 @@ mod tests {
     fn store_error_backend_display_forwards_transparently() {
         // `#[error(transparent)]` makes Backend's Display delegate to the wrapped error —
         // no prefix, just the inner message.
-        let io = std::io::Error::other("disk full");
-        let err: StoreError = Err::<(), _>(io).store_err().unwrap_err();
+        let inner = TestErr("disk full");
+        let err: StoreError = Err::<(), _>(inner).store_err().unwrap_err();
         assert_eq!(err.to_string(), "disk full");
         assert!(matches!(err, StoreError::Backend(_)));
     }
 
     #[test]
     fn store_result_ext_passes_through_ok() {
-        let r: StoreResult<u32> = Ok::<_, std::io::Error>(42).store_err();
+        let r: StoreResult<u32> = Ok::<_, TestErr>(42).store_err();
         assert_eq!(r.unwrap(), 42);
     }
 }

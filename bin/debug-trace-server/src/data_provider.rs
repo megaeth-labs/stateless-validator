@@ -21,14 +21,13 @@
 //! Response caching is handled at the HTTP layer by `ResponseCache`, not here.
 
 use std::{
-    collections::HashMap,
     future::Future,
     pin::Pin,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use alloy_primitives::B256;
+use alloy_primitives::{B256, map::HashMap};
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
 use dashmap::DashMap;
 use futures::{FutureExt, future::Shared};
@@ -795,7 +794,7 @@ impl ContractStore for NoopContractStore {
         &self,
         hashes: &[B256],
     ) -> StoreResult<(HashMap<B256, Arc<Bytecode>>, Vec<B256>)> {
-        Ok((HashMap::new(), hashes.to_vec()))
+        Ok((HashMap::default(), hashes.to_vec()))
     }
 
     fn add_contracts(&self, _codes: &[(B256, Arc<Bytecode>)]) -> StoreResult<()> {

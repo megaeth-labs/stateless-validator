@@ -12,8 +12,14 @@
 //! - [`db`]: Abstract storage traits (`ChainStore`, `ContractStore`, etc.)
 //! - [`data_types`]: SALT key/value encoding utilities
 //! - [`executor`]: Block validation via EVM replay
-//! - [`pipeline`]: Generic three-stage chain sync pipeline (fetch → process → advance)
+//! - [`pipeline`]: Generic three-stage chain sync pipeline (fetch → process → advance) — requires
+//!   `std` feature
 //! - [`withdrawals`]: MPT witness verification for L2→L1 withdrawals
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[cfg(not(feature = "std"))]
+extern crate alloc as std;
 
 pub mod chain_spec;
 pub mod light_witness;
@@ -28,10 +34,10 @@ pub use db::{
 pub mod data_types;
 pub use data_types::{PlainKey, PlainValue, iter_code_hashes};
 pub mod executor;
-pub use executor::{
-    ValidationError, ValidationResult, ValidationStats, replay_block, validate_block,
-};
+pub use executor::{ValidationError, ValidationStats, replay_block, validate_block};
+#[cfg(feature = "std")]
 pub mod pipeline;
+#[cfg(feature = "std")]
 pub use pipeline::{
     BlockFetcher, BlockProcessor, ErrorAction, PipelineConfig, PipelineHooks, PipelineOutcome,
     ProcessedBlock, ReorgEvent, block_fetcher, find_divergence_point, run_pipeline,

@@ -14,6 +14,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -166,6 +172,7 @@ dependencies = [
  "alloy-eips",
  "alloy-hardforks",
  "alloy-primitives",
+ "alloy-rpc-types-eth",
  "alloy-sol-types",
  "auto_impl",
  "derive_more",
@@ -1150,14 +1157,14 @@ checksum = "7b7e4c2464d97fe331d41de9d5db0def0a96f4d823b8b32a2efd503578988973"
 [[package]]
 name = "banderwagon"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.1#f15f1b2cac046c874656f16af10b00db3174e733"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.2#2bb00254bbe9fd6671afac8a1bf3464614638b1c"
 dependencies = [
  "ark-ec 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
  "ark-ed-on-bls12-381-bandersnatch",
  "ark-ff 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
  "ark-serialize 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
- "hugepage-rs",
  "rayon",
+ "salt-macros",
 ]
 
 [[package]]
@@ -1837,7 +1844,6 @@ dependencies = [
  "reqwest 0.13.2",
  "revm",
  "revm-inspectors",
- "rustc-hash",
  "salt",
  "serde",
  "serde_json",
@@ -2409,6 +2415,7 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.2.0",
+ "rayon",
  "serde",
  "serde_core",
 ]
@@ -2493,16 +2500,6 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
-
-[[package]]
-name = "hugepage-rs"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "beb5004049783b438b3559de8e1bf8c0739a4d61e0d91d78c97db31abb90a505"
-dependencies = [
- "lazy_static",
- "libc",
-]
 
 [[package]]
 name = "hyper"
@@ -2879,13 +2876,15 @@ dependencies = [
 [[package]]
 name = "ipa-multipoint"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.1#f15f1b2cac046c874656f16af10b00db3174e733"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.2#2bb00254bbe9fd6671afac8a1bf3464614638b1c"
 dependencies = [
  "banderwagon",
+ "hashbrown 0.16.1",
  "hex",
  "itertools 0.10.5",
  "rayon",
  "rustc-hash",
+ "salt-macros",
  "sha2 0.9.9",
  "thiserror 2.0.17",
 ]
@@ -3113,7 +3112,7 @@ dependencies = [
  "serde_arrays",
  "sha2 0.10.9",
  "sp1_bls12_381",
- "spin",
+ "spin 0.9.8",
 ]
 
 [[package]]
@@ -3364,6 +3363,15 @@ dependencies = [
  "rand 0.9.2",
  "rand_xoshiro",
  "sketches-ddsketch",
+]
+
+[[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
 ]
 
 [[package]]
@@ -4485,6 +4493,7 @@ dependencies = [
  "alloy-primitives",
  "auto_impl",
  "once_cell",
+ "rustc-hash",
 ]
 
 [[package]]
@@ -4507,6 +4516,7 @@ source = "git+https://github.com/paradigmxyz/reth?tag=v1.6.0#d8451e54e7267f9f163
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
+ "secp256k1 0.30.0",
  "serde_with",
  "thiserror 2.0.17",
  "url",
@@ -4524,6 +4534,7 @@ dependencies = [
  "alloy-hardforks",
  "alloy-primitives",
  "derive_more",
+ "miniz_oxide",
  "op-alloy-consensus",
  "op-alloy-rpc-types",
  "reth-chainspec",
@@ -4532,7 +4543,9 @@ dependencies = [
  "reth-optimism-forks",
  "reth-optimism-primitives",
  "reth-primitives-traits",
+ "serde",
  "serde_json",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
@@ -4555,8 +4568,13 @@ dependencies = [
  "alloy-eips",
  "alloy-primitives",
  "alloy-rlp",
+ "bytes",
  "op-alloy-consensus",
+ "reth-codecs",
  "reth-primitives-traits",
+ "reth-zstd-compressors",
+ "serde",
+ "serde_with",
 ]
 
 [[package]]
@@ -4569,6 +4587,7 @@ dependencies = [
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rlp",
+ "alloy-rpc-types-eth",
  "alloy-trie",
  "auto_impl",
  "bytes",
@@ -4579,6 +4598,9 @@ dependencies = [
  "revm-bytecode",
  "revm-primitives",
  "revm-state",
+ "secp256k1 0.30.0",
+ "serde",
+ "serde_with",
  "thiserror 2.0.17",
 ]
 
@@ -4589,16 +4611,8 @@ source = "git+https://github.com/paradigmxyz/reth?tag=v1.6.0#d8451e54e7267f9f163
 dependencies = [
  "alloy-primitives",
  "derive_more",
+ "serde",
  "thiserror 2.0.17",
-]
-
-[[package]]
-name = "reth-stages-types"
-version = "1.6.0"
-source = "git+https://github.com/paradigmxyz/reth?tag=v1.6.0#d8451e54e7267f9f1634118d6d279b2216f7e2bb"
-dependencies = [
- "alloy-primitives",
- "reth-trie-common",
 ]
 
 [[package]]
@@ -4629,28 +4643,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reth-trie"
-version = "1.6.0"
-source = "git+https://github.com/paradigmxyz/reth?tag=v1.6.0#d8451e54e7267f9f1634118d6d279b2216f7e2bb"
-dependencies = [
- "alloy-consensus",
- "alloy-eips",
- "alloy-primitives",
- "alloy-rlp",
- "alloy-trie",
- "auto_impl",
- "itertools 0.14.0",
- "reth-execution-errors",
- "reth-primitives-traits",
- "reth-stages-types",
- "reth-storage-errors",
- "reth-trie-common",
- "reth-trie-sparse",
- "revm-database",
- "tracing",
-]
-
-[[package]]
 name = "reth-trie-common"
 version = "1.6.0"
 source = "git+https://github.com/paradigmxyz/reth?tag=v1.6.0#d8451e54e7267f9f1634118d6d279b2216f7e2bb"
@@ -4658,13 +4650,17 @@ dependencies = [
  "alloy-consensus",
  "alloy-primitives",
  "alloy-rlp",
+ "alloy-rpc-types-eth",
+ "alloy-serde",
  "alloy-trie",
+ "bytes",
  "derive_more",
  "itertools 0.14.0",
  "nybbles",
- "rayon",
  "reth-primitives-traits",
  "revm-database",
+ "serde",
+ "serde_with",
 ]
 
 [[package]]
@@ -5120,22 +5116,32 @@ checksum = "dd29631678d6fb0903b69223673e122c32e9ae559d0960a38d574695ebc0ea15"
 
 [[package]]
 name = "salt"
-version = "1.0.1"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.1#f15f1b2cac046c874656f16af10b00db3174e733"
+version = "1.0.2"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.2#2bb00254bbe9fd6671afac8a1bf3464614638b1c"
 dependencies = [
  "auto_impl",
  "banderwagon",
  "blake3",
  "derive_more",
+ "hashbrown 0.16.1",
  "hex",
  "ipa-multipoint",
- "once_cell",
  "rayon",
  "rustc-hash",
+ "salt-macros",
  "serde",
  "serde_arrays",
+ "spin 0.10.0",
  "thiserror 2.0.17",
  "zerocopy 0.7.35",
+]
+
+[[package]]
+name = "salt-macros"
+version = "0.1.0"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.2#2bb00254bbe9fd6671afac8a1bf3464614638b1c"
+dependencies = [
+ "rayon",
 ]
 
 [[package]]
@@ -5553,6 +5559,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 
 [[package]]
+name = "spin"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
+
+[[package]]
 name = "spki"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5616,6 +5628,7 @@ dependencies = [
  "alloy-evm",
  "alloy-genesis",
  "alloy-hardforks",
+ "alloy-network-primitives",
  "alloy-op-evm",
  "alloy-op-hardforks",
  "alloy-primitives",
@@ -5625,14 +5638,13 @@ dependencies = [
  "bincode 2.0.1",
  "dyn-clone",
  "eyre",
+ "hashbrown 0.16.1",
  "kanal",
  "mega-evm",
  "num_cpus",
- "op-alloy-network",
  "op-alloy-rpc-types",
  "reth-ethereum-forks",
  "reth-optimism-chainspec",
- "reth-trie",
  "reth-trie-common",
  "reth-trie-sparse",
  "revm",
@@ -6757,7 +6769,6 @@ version = "0.7.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b9b4fd18abc82b8136838da5d50bae7bdea537c574d8dc1a34ed098d6c166f0"
 dependencies = [
- "byteorder",
  "zerocopy-derive 0.7.35",
 ]
 

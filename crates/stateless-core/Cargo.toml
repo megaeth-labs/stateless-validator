@@ -13,26 +13,25 @@ alloy-consensus.workspace = true
 alloy-eips.workspace = true
 alloy-evm.workspace = true
 alloy-genesis.workspace = true
-alloy-hardforks.workspace = true
+alloy-hardforks = { workspace = true, default-features = false }
+alloy-network-primitives.workspace = true
 alloy-op-evm.workspace = true
-alloy-op-hardforks.workspace = true
+alloy-op-hardforks = { workspace = true, default-features = false }
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-serde.workspace = true
 
 # mega
-mega-evm.workspace = true
-salt.workspace = true
+mega-evm = { workspace = true, default-features = false }
+salt = { workspace = true, default-features = false }
 
 # op
-op-alloy-network.workspace = true
 op-alloy-rpc-types.workspace = true
 
 # reth
 reth-ethereum-forks.workspace = true
 reth-optimism-chainspec.workspace = true
-reth-trie.workspace = true
 reth-trie-common.workspace = true
 reth-trie-sparse.workspace = true
 
@@ -41,15 +40,16 @@ revm.workspace = true
 
 # misc
 dyn-clone.workspace = true
-eyre.workspace = true
-kanal.workspace = true
-num_cpus.workspace = true
-rustc-hash.workspace = true
+eyre = { workspace = true, optional = true }
+hashbrown.workspace = true
+kanal = { workspace = true, optional = true }
+num_cpus = { workspace = true, optional = true }
+rustc-hash = { workspace = true, default-features = false }
 serde.workspace = true
 serde_json.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
-tokio-util.workspace = true
+thiserror = { workspace = true, default-features = false }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
 tracing.workspace = true
 
 [dev-dependencies]
@@ -60,4 +60,35 @@ stateless-test-utils = { path = "../stateless-test-utils" }
 bincode.workspace = true
 
 [features]
+default = ["std"]
+std = [
+    "dep:eyre",
+    "dep:kanal",
+    "dep:num_cpus",
+    "dep:tokio",
+    "dep:tokio-util",
+    "alloy-consensus/std",
+    "alloy-eips/std",
+    "alloy-evm/std",
+    "alloy-genesis/std",
+    "alloy-network-primitives/std",
+    "alloy-op-evm/std",
+    "alloy-primitives/std",
+    "alloy-rlp/std",
+    "alloy-rpc-types-eth/std",
+    "alloy-serde/std",
+    "mega-evm/default",
+    "op-alloy-rpc-types/std",
+    "reth-ethereum-forks/std",
+    "reth-optimism-chainspec/std",
+    "reth-trie-common/std",
+    "reth-trie-sparse/std",
+    "revm/default",
+    "rustc-hash/std",
+    "salt/default",
+    "serde/std",
+    "serde_json/std",
+    "thiserror/std",
+    "tracing/std",
+]
 test-bucket-resize = ["salt/test-bucket-resize"]
