@@ -1157,14 +1157,14 @@ checksum = "7b7e4c2464d97fe331d41de9d5db0def0a96f4d823b8b32a2efd503578988973"
 [[package]]
 name = "banderwagon"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.2#2bb00254bbe9fd6671afac8a1bf3464614638b1c"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=2395aa1db435d41229b4d280cb49c1f8c82bb3a4#2395aa1db435d41229b4d280cb49c1f8c82bb3a4"
 dependencies = [
  "ark-ec 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
  "ark-ed-on-bls12-381-bandersnatch",
  "ark-ff 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
  "ark-serialize 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
+ "hugepage-rs",
  "rayon",
- "salt-macros",
 ]
 
 [[package]]
@@ -2415,7 +2415,6 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.2.0",
- "rayon",
  "serde",
  "serde_core",
 ]
@@ -2500,6 +2499,16 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
+name = "hugepage-rs"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "beb5004049783b438b3559de8e1bf8c0739a4d61e0d91d78c97db31abb90a505"
+dependencies = [
+ "lazy_static",
+ "libc",
+]
 
 [[package]]
 name = "hyper"
@@ -2876,15 +2885,13 @@ dependencies = [
 [[package]]
 name = "ipa-multipoint"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.2#2bb00254bbe9fd6671afac8a1bf3464614638b1c"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=2395aa1db435d41229b4d280cb49c1f8c82bb3a4#2395aa1db435d41229b4d280cb49c1f8c82bb3a4"
 dependencies = [
  "banderwagon",
- "hashbrown 0.16.1",
  "hex",
  "itertools 0.10.5",
  "rayon",
  "rustc-hash",
- "salt-macros",
  "sha2 0.9.9",
  "thiserror 2.0.17",
 ]
@@ -3112,7 +3119,7 @@ dependencies = [
  "serde_arrays",
  "sha2 0.10.9",
  "sp1_bls12_381",
- "spin 0.9.8",
+ "spin",
 ]
 
 [[package]]
@@ -5116,32 +5123,22 @@ checksum = "dd29631678d6fb0903b69223673e122c32e9ae559d0960a38d574695ebc0ea15"
 
 [[package]]
 name = "salt"
-version = "1.0.2"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.2#2bb00254bbe9fd6671afac8a1bf3464614638b1c"
+version = "1.0.1"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=2395aa1db435d41229b4d280cb49c1f8c82bb3a4#2395aa1db435d41229b4d280cb49c1f8c82bb3a4"
 dependencies = [
  "auto_impl",
  "banderwagon",
  "blake3",
  "derive_more",
- "hashbrown 0.16.1",
  "hex",
  "ipa-multipoint",
+ "once_cell",
  "rayon",
  "rustc-hash",
- "salt-macros",
  "serde",
  "serde_arrays",
- "spin 0.10.0",
  "thiserror 2.0.17",
  "zerocopy 0.7.35",
-]
-
-[[package]]
-name = "salt-macros"
-version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.2#2bb00254bbe9fd6671afac8a1bf3464614638b1c"
-dependencies = [
- "rayon",
 ]
 
 [[package]]
@@ -5557,12 +5554,6 @@ name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
-
-[[package]]
-name = "spin"
-version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
 
 [[package]]
 name = "spki"
@@ -6769,6 +6760,7 @@ version = "0.7.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1b9b4fd18abc82b8136838da5d50bae7bdea537c574d8dc1a34ed098d6c166f0"
 dependencies = [
+ "byteorder",
  "zerocopy-derive 0.7.35",
 ]
 

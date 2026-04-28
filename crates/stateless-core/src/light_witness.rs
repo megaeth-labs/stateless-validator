@@ -18,11 +18,9 @@ use core::ops::RangeInclusive;
 use std::{collections::BTreeMap, vec::Vec};
 
 use hashbrown::HashMap;
-use rustc_hash::FxBuildHasher;
+use rustc_hash::FxHashMap;
 use salt::{BucketId, BucketMeta, SaltKey, SaltValue, bucket_metadata_key, traits::StateReader};
 use serde::{Deserialize, Serialize};
-
-type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
 
 /// Light witness that only contains data needed for execution.
 ///

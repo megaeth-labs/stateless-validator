@@ -42,7 +42,7 @@ alloy-trie = { version = "0.9.0", default-features = false }
 
 # mega
 mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "4e4d85cc8202ec4980ec4fa0b6f50666c9d7e92e", default-features = false }
-salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "v1.0.2", default-features = false }
+salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "2395aa1db435d41229b4d280cb49c1f8c82bb3a4", default-features = false }
 
 # op
 op-alloy-network = { version = "0.18.12", default-features = false }
