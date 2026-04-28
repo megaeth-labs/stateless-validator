@@ -41,7 +41,6 @@ revm.workspace = true
 # misc
 dyn-clone.workspace = true
 eyre = { workspace = true, optional = true }
-hashbrown.workspace = true
 kanal = { workspace = true, optional = true }
 num_cpus = { workspace = true, optional = true }
 rustc-hash = { workspace = true, default-features = false }

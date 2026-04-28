@@ -1,3 +1,5 @@
 [toolchain]
-channel = "nightly-2026-02-03"
+# Aligned with mega-reth's `rust-toolchain.toml` so anything that compiles here also compiles
+# when consumed by mega-reth via path / git dep. Bump both together.
+channel = "nightly-2025-08-18"
 components = ["rustfmt", "clippy", "rust-src", "miri", "rust-analyzer"]

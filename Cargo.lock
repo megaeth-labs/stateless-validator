@@ -5629,7 +5629,6 @@ dependencies = [
  "bincode 2.0.1",
  "dyn-clone",
  "eyre",
- "hashbrown 0.16.1",
  "kanal",
  "mega-evm",
  "num_cpus",
