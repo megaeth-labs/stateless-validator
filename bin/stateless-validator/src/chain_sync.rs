@@ -185,11 +185,21 @@ impl BlockProcessor for ValidatorProcessor {
         metrics::on_contract_cache_read(contracts.len() as u64, missing_contracts.len() as u64);
 
         if !missing_contracts.is_empty() {
-            // The unbounded `get_codes` retries transport errors forever, so the only way this
-            // errors is `VerificationFailure` — a deterministic bad upstream / bad witness.
-            // The `Deadline` variant can't surface here because no deadline is passed.
+            // The unbounded `get_codes` retries transport errors forever, so only the
+            // verification variants surface here. The `Deadline` variant can't surface
+            // because no deadline is passed.
+            //
+            // - `BytecodeUnavailable` — upstream returned empty bytes for a non-empty hash
+            //   (mega-reth's `unwrap_or_default()` on a missing-from-state lookup, e.g. during
+            //   rpc-node restart). Transient: the cycle restarts and the next fetch will probably
+            //   succeed once upstream has the code.
+            // - `VerificationFailure` — non-empty bytes whose keccak doesn't match. Deterministic
+            //   bad upstream / bad witness; halt rather than retry.
             let fetched =
                 self.rpc_client.get_codes(&missing_contracts, true).await.map_err(|e| match e {
+                    stateless_common::CodeFetchError::BytecodeUnavailable { .. } => {
+                        fail(format!("Contract bytecode unavailable: {e}"), true)
+                    }
                     stateless_common::CodeFetchError::VerificationFailure { .. } => {
                         fail(format!("Contract verification failed: {e}"), false)
                     }

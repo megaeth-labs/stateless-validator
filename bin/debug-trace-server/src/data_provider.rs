@@ -150,6 +150,7 @@ impl From<CodeFetchError> for DataProviderError {
     fn from(e: CodeFetchError) -> Self {
         match e {
             CodeFetchError::Deadline(d) => d.into(),
+            CodeFetchError::BytecodeUnavailable { .. } |
             CodeFetchError::VerificationFailure { .. } => eyre::eyre!("{e}").into(),
         }
     }

@@ -191,13 +191,22 @@ pub struct SetValidatedBlocksResponse {
 
 /// Errors returned by [`RpcClient::get_codes`] / [`RpcClient::get_codes_with_deadline`].
 ///
-/// - `VerificationFailure` is deterministic (upstream returned bytecode whose keccak does not match
-///   the requested hash): validators should halt rather than retry.
-/// - `Deadline` only surfaces from [`RpcClient::get_codes_with_deadline`] when the caller- supplied
+/// - `BytecodeUnavailable` is transient: upstream returned **empty** bytecode for a non-empty
+///   codehash. mega-reth's `eth_getCodeByHash` does `unwrap_or_default()` and silently returns `0x`
+///   when its state DB doesn't have the code yet (cold start, mid-restart, sync gap). Callers
+///   should retry rather than halt.
+/// - `VerificationFailure` is deterministic: upstream returned **non-empty** bytecode whose keccak
+///   does not match the requested hash — a real divergence (bad upstream / bad witness) that
+///   validators should halt on.
+/// - `Deadline` only surfaces from [`RpcClient::get_codes_with_deadline`] when the caller-supplied
 ///   deadline elapsed before every per-hash fetch completed. The unbounded [`RpcClient::get_codes`]
 ///   never produces this variant.
 #[derive(Debug, thiserror::Error)]
 pub enum CodeFetchError {
+    #[error(
+        "RPC provider returned empty bytecode for non-empty codehash {requested:?} (upstream likely not synced)"
+    )]
+    BytecodeUnavailable { requested: B256 },
     #[error(
         "RPC provider returned bytecode with unexpected codehash: expected {requested:?}, got {actual:?}"
     )]
@@ -618,7 +627,7 @@ impl RpcClient {
     /// The same deadline is applied to every per-hash fetch; if it fires during any fetch
     /// the whole batch aborts with `Err(CodeFetchError::Deadline(..))`. With `deadline = None`
     /// the per-hash retries are unbounded and this function can only fail with
-    /// `VerificationFailure`.
+    /// `BytecodeUnavailable` or `VerificationFailure`.
     pub async fn get_codes_with_deadline(
         &self,
         hashes: &[B256],
@@ -626,15 +635,21 @@ impl RpcClient {
         deadline: Option<Instant>,
     ) -> std::result::Result<HashMap<B256, Arc<Bytecode>>, CodeFetchError> {
         // `try_join_all` cancels the remaining per-hash futures on the first error — a
-        // `VerificationFailure` or `Deadline` on one hash stops the rest of the batch
-        // immediately and releases their concurrency permits, so a slow straggler can't
-        // hold permits until its own per-attempt timeout fires.
+        // `BytecodeUnavailable` / `VerificationFailure` / `Deadline` on one hash stops the
+        // rest of the batch immediately and releases their concurrency permits, so a slow
+        // straggler can't hold permits until its own per-attempt timeout fires.
         future::try_join_all(hashes.iter().map(|&hash| async move {
             let bytes = self.get_code_with_deadline(hash, deadline).await?;
-            let code = Bytecode::new_raw(bytes);
+            let code = Bytecode::new_raw(bytes.clone());
             if verify {
                 let actual = code.hash_slow();
                 if actual != hash {
+                    // Empty bytes for a non-empty hash = upstream `unwrap_or_default()` on a
+                    // missing-from-state-DB lookup. Treated as transient so the validator
+                    // retries instead of halting (e.g., during rpc-node restart / sync gap).
+                    if bytes.is_empty() {
+                        return Err(CodeFetchError::BytecodeUnavailable { requested: hash });
+                    }
                     return Err(CodeFetchError::VerificationFailure { requested: hash, actual });
                 }
             }
@@ -1579,6 +1594,33 @@ mod tests {
         assert_eq!(ok.len(), 2, "verify=false must return every requested entry");
         // Compare against the canonical analyzed form (revm appends a trailing 0 byte).
         assert_eq!(ok[&good_hash].bytes_slice(), Bytecode::new_raw(good_code).bytes_slice(),);
+
+        handle.stop().unwrap();
+    }
+
+    /// `get_codes(verify=true)` must distinguish "upstream returned empty bytes" (transient,
+    /// e.g. mega-reth's `unwrap_or_default()` after rpc-node restart) from "upstream returned
+    /// non-empty wrong bytes" (deterministic). Both currently fail hash verification, but only
+    /// the latter is a real divergence — empty must surface as `BytecodeUnavailable` so the
+    /// validator retries instead of halting.
+    #[tokio::test]
+    async fn test_get_codes_verify_empty_bytecode_signals_unavailable() {
+        // Empty `codes` map → `start_code_rpc` falls back to `Bytes::from_static(&[])` for any
+        // hash, mimicking mega-reth's `eth_getCodeByHash` behavior when the code isn't in state.
+        let (handle, url) = start_code_rpc(HashMap::new()).await;
+        let client = client_at(&url);
+
+        let some_hash = B256::from([0xAA; 32]);
+        let err = client
+            .get_codes(&[some_hash], true)
+            .await
+            .expect_err("empty bytes for non-empty hash must fail");
+        match err {
+            CodeFetchError::BytecodeUnavailable { requested } => {
+                assert_eq!(requested, some_hash);
+            }
+            other => panic!("expected BytecodeUnavailable, got {other:?}"),
+        }
 
         handle.stop().unwrap();
     }
