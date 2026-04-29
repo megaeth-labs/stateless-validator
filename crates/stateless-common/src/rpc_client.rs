@@ -120,6 +120,12 @@ pub struct RpcClientConfig {
     /// jitter) before the next round and doubles the sleep each round up to `max`. Retry is
     /// unbounded — caller-visible failures don't occur.
     pub rpc_retry: BackoffPolicy,
+    /// Total time budget for retrying [`CodeFetchError::BytecodeUnavailable`] inside
+    /// [`RpcClient::get_codes_with_deadline`]. Empty bytecode for a non-empty codehash
+    /// (mega-reth's `unwrap_or_default()` on a missing-from-state lookup) is retried with the
+    /// `rpc_retry` schedule until this budget elapses, then surfaces as a fatal error so the
+    /// validator halts instead of looping forever.
+    pub bytecode_unavailable_retry_budget: Duration,
 }
 
 impl Default for RpcClientConfig {
@@ -133,6 +139,10 @@ impl Default for RpcClientConfig {
             // 30s. That's gentle enough to ride out near-tip witness generation latency (a
             // few seconds) without hammering upstream when something is genuinely broken.
             rpc_retry: BackoffPolicy::new(Duration::from_millis(500), Duration::from_secs(30)),
+            // 5 minutes covers a typical rpc-node restart / cold-start window. Beyond that,
+            // halt rather than spin — a longer outage is operator-visible and shouldn't be
+            // hidden behind silent retries.
+            bytecode_unavailable_retry_budget: Duration::from_secs(300),
         }
     }
 }
@@ -145,6 +155,7 @@ impl std::fmt::Debug for RpcClientConfig {
             .field("data_max_concurrent_requests", &self.data_max_concurrent_requests)
             .field("witness_max_concurrent_requests", &self.witness_max_concurrent_requests)
             .field("rpc_retry", &self.rpc_retry)
+            .field("bytecode_unavailable_retry_budget", &self.bytecode_unavailable_retry_budget)
             .finish()
     }
 }
@@ -191,13 +202,17 @@ pub struct SetValidatedBlocksResponse {
 
 /// Errors returned by [`RpcClient::get_codes`] / [`RpcClient::get_codes_with_deadline`].
 ///
-/// - `BytecodeUnavailable` is transient: upstream returned **empty** bytecode for a non-empty
-///   codehash. mega-reth's `eth_getCodeByHash` does `unwrap_or_default()` and silently returns `0x`
-///   when its state DB doesn't have the code yet (cold start, mid-restart, sync gap). Callers
-///   should retry rather than halt.
-/// - `VerificationFailure` is deterministic: upstream returned **non-empty** bytecode whose keccak
-///   does not match the requested hash — a real divergence (bad upstream / bad witness) that
-///   validators should halt on.
+/// All variants are caller-visible failures the validator should halt on. The transient
+/// "upstream not synced yet" condition is absorbed inside `get_codes_with_deadline` by an
+/// internal retry loop bounded by `RpcClientConfig::bytecode_unavailable_retry_budget`; only
+/// when that budget is exhausted does it escalate to `BytecodeUnavailable`.
+///
+/// - `BytecodeUnavailable` — upstream returned **empty** bytecode for a non-empty codehash
+///   (mega-reth's `eth_getCodeByHash` does `unwrap_or_default()` when its state DB doesn't have the
+///   code yet, e.g. during rpc-node restart) and the retry budget elapsed without recovery. Halt: a
+///   longer outage is operator-visible.
+/// - `VerificationFailure` — upstream returned **non-empty** bytecode whose keccak does not match
+///   the requested hash. Deterministic divergence (bad upstream / bad witness); halt.
 /// - `Deadline` only surfaces from [`RpcClient::get_codes_with_deadline`] when the caller-supplied
 ///   deadline elapsed before every per-hash fetch completed. The unbounded [`RpcClient::get_codes`]
 ///   never produces this variant.
@@ -624,36 +639,65 @@ impl RpcClient {
 
     /// Deadline-aware counterpart of [`Self::get_codes`].
     ///
-    /// The same deadline is applied to every per-hash fetch; if it fires during any fetch
-    /// the whole batch aborts with `Err(CodeFetchError::Deadline(..))`. With `deadline = None`
-    /// the per-hash retries are unbounded and this function can only fail with
-    /// `BytecodeUnavailable` or `VerificationFailure`.
+    /// Transport errors are retried unboundedly inside `get_code_with_deadline` (or until the
+    /// caller-supplied `deadline` fires, surfacing `CodeFetchError::Deadline`). Empty-bytecode
+    /// responses (upstream not synced yet) are retried in-place with the `rpc_retry` backoff
+    /// schedule, capped by `RpcClientConfig::bytecode_unavailable_retry_budget`; once the
+    /// budget elapses the call returns `BytecodeUnavailable` and the validator halts.
+    /// `VerificationFailure` is never retried — non-empty wrong bytes is a real divergence.
     pub async fn get_codes_with_deadline(
         &self,
         hashes: &[B256],
         verify: bool,
         deadline: Option<Instant>,
     ) -> std::result::Result<HashMap<B256, Arc<Bytecode>>, CodeFetchError> {
+        let backoff = self.config.rpc_retry.clone();
+        let unavailable_budget = self.config.bytecode_unavailable_retry_budget;
+
         // `try_join_all` cancels the remaining per-hash futures on the first error — a
         // `BytecodeUnavailable` / `VerificationFailure` / `Deadline` on one hash stops the
         // rest of the batch immediately and releases their concurrency permits, so a slow
         // straggler can't hold permits until its own per-attempt timeout fires.
-        future::try_join_all(hashes.iter().map(|&hash| async move {
-            let bytes = self.get_code_with_deadline(hash, deadline).await?;
-            let code = Bytecode::new_raw(bytes.clone());
-            if verify {
-                let actual = code.hash_slow();
-                if actual != hash {
-                    // Empty bytes for a non-empty hash = upstream `unwrap_or_default()` on a
-                    // missing-from-state-DB lookup. Treated as transient so the validator
-                    // retries instead of halting (e.g., during rpc-node restart / sync gap).
-                    if bytes.is_empty() {
+        future::try_join_all(hashes.iter().map(|&hash| {
+            let backoff = backoff.clone();
+            async move {
+                // Per-hash budget for the empty-bytes retry loop. Honor the tighter of the
+                // caller-supplied deadline (if any) and the configured budget.
+                let unavailable_deadline = {
+                    let budget_end = Instant::now() + unavailable_budget;
+                    match deadline {
+                        Some(d) => d.min(budget_end),
+                        None => budget_end,
+                    }
+                };
+                let mut sleep = backoff.initial;
+
+                loop {
+                    let bytes = self.get_code_with_deadline(hash, deadline).await?;
+                    let code = Bytecode::new_raw(bytes.clone());
+                    if !verify {
+                        return Ok::<_, CodeFetchError>((hash, Arc::new(code)));
+                    }
+                    let actual = code.hash_slow();
+                    if actual == hash {
+                        return Ok((hash, Arc::new(code)));
+                    }
+                    if !bytes.is_empty() {
+                        // Non-empty wrong bytes = real divergence; halt without retry.
+                        return Err(CodeFetchError::VerificationFailure { requested: hash, actual });
+                    }
+                    // Empty bytes for a non-empty hash = mega-reth's `unwrap_or_default()` on a
+                    // missing-from-state-DB lookup. Retry with backoff until the budget is up,
+                    // then surface as a fatal error so the validator halts rather than spins.
+                    let now = Instant::now();
+                    if now >= unavailable_deadline {
                         return Err(CodeFetchError::BytecodeUnavailable { requested: hash });
                     }
-                    return Err(CodeFetchError::VerificationFailure { requested: hash, actual });
+                    let wait = sleep.min(unavailable_deadline.saturating_duration_since(now));
+                    tokio::time::sleep(wait).await;
+                    sleep = sleep.saturating_mul(2).min(backoff.max);
                 }
             }
-            Ok::<_, CodeFetchError>((hash, Arc::new(code)))
         }))
         .await
         .map(|pairs| pairs.into_iter().collect())
@@ -1598,23 +1642,28 @@ mod tests {
         handle.stop().unwrap();
     }
 
-    /// `get_codes(verify=true)` must distinguish "upstream returned empty bytes" (transient,
-    /// e.g. mega-reth's `unwrap_or_default()` after rpc-node restart) from "upstream returned
-    /// non-empty wrong bytes" (deterministic). Both currently fail hash verification, but only
-    /// the latter is a real divergence — empty must surface as `BytecodeUnavailable` so the
-    /// validator retries instead of halting.
+    /// `get_codes(verify=true)` retries empty-bytecode responses (upstream not synced yet) with
+    /// the `rpc_retry` schedule and surfaces `BytecodeUnavailable` once the configured budget is
+    /// exhausted. Non-empty wrong bytes is a separate `VerificationFailure` covered elsewhere.
+    /// Here we shrink the budget to a few milliseconds so the assertion fires quickly.
     #[tokio::test]
     async fn test_get_codes_verify_empty_bytecode_signals_unavailable() {
         // Empty `codes` map → `start_code_rpc` falls back to `Bytes::from_static(&[])` for any
         // hash, mimicking mega-reth's `eth_getCodeByHash` behavior when the code isn't in state.
         let (handle, url) = start_code_rpc(HashMap::new()).await;
-        let client = client_at(&url);
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
+            bytecode_unavailable_retry_budget: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let client =
+            RpcClient::new_with_config(&[url.as_str()], &[url.as_str()], config, None).unwrap();
 
         let some_hash = B256::from([0xAA; 32]);
         let err = client
             .get_codes(&[some_hash], true)
             .await
-            .expect_err("empty bytes for non-empty hash must fail");
+            .expect_err("empty bytes for non-empty hash must fail after retry budget");
         match err {
             CodeFetchError::BytecodeUnavailable { requested } => {
                 assert_eq!(requested, some_hash);

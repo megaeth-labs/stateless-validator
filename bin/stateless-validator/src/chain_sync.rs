@@ -185,20 +185,20 @@ impl BlockProcessor for ValidatorProcessor {
         metrics::on_contract_cache_read(contracts.len() as u64, missing_contracts.len() as u64);
 
         if !missing_contracts.is_empty() {
-            // The unbounded `get_codes` retries transport errors forever, so only the
-            // verification variants surface here. The `Deadline` variant can't surface
-            // because no deadline is passed.
+            // `get_codes` absorbs both transport errors (unbounded RPC retry) and the transient
+            // "upstream returned empty bytes for a non-empty hash" condition (in-place retry up
+            // to `bytecode_unavailable_retry_budget`). Anything that surfaces here is fatal:
             //
-            // - `BytecodeUnavailable` — upstream returned empty bytes for a non-empty hash
-            //   (mega-reth's `unwrap_or_default()` on a missing-from-state lookup, e.g. during
-            //   rpc-node restart). Transient: the cycle restarts and the next fetch will probably
-            //   succeed once upstream has the code.
+            // - `BytecodeUnavailable` — the retry budget elapsed without upstream catching up.
+            //   Halt: a longer outage is operator-visible and shouldn't be hidden behind silent
+            //   cycle restarts.
             // - `VerificationFailure` — non-empty bytes whose keccak doesn't match. Deterministic
-            //   bad upstream / bad witness; halt rather than retry.
+            //   bad upstream / bad witness; halt.
+            // - `Deadline` can't surface because no deadline is passed to `get_codes`.
             let fetched =
                 self.rpc_client.get_codes(&missing_contracts, true).await.map_err(|e| match e {
                     stateless_common::CodeFetchError::BytecodeUnavailable { .. } => {
-                        fail(format!("Contract bytecode unavailable: {e}"), true)
+                        fail(format!("Contract bytecode unavailable: {e}"), false)
                     }
                     stateless_common::CodeFetchError::VerificationFailure { .. } => {
                         fail(format!("Contract verification failed: {e}"), false)
