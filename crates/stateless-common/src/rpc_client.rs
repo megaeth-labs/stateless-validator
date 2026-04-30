@@ -1654,13 +1654,10 @@ mod tests {
     #[tokio::test]
     async fn test_get_code_retries_empty_response_until_deadline() {
         let arbitrary_hash = B256::from([0xCC; 32]);
-        // Server always returns "0x" for any hash. The retry loop should rotate per round
-        // and back off; with a short deadline we expect `RpcDeadlineExceeded` plus a hit
-        // count > 1 proving the call was actually retried (not accepted on first try).
-        let (handle, url) = start_code_rpc(HashMap::new()).await;
-        // Fresh counter wrapper so we can prove > 1 attempt landed at the server.
+        // Server always returns "0x" for any hash and bumps `hits` so the test can prove
+        // the call was actually retried (not accepted on first try).
         let hits = Arc::new(AtomicUsize::new(0));
-        let (handle2, url2) = serve(hits.clone(), |m| {
+        let (handle, url) = serve(hits.clone(), |m| {
             m.register_method("eth_getCodeByHash", |_p, hits, _| {
                 hits.fetch_add(1, Ordering::Relaxed);
                 Ok::<Bytes, ErrorObjectOwned>(Bytes::from_static(&[]))
@@ -1668,9 +1665,6 @@ mod tests {
             .unwrap();
         })
         .await;
-        // First handle isn't used; we route everything through `url2` to count hits.
-        handle.stop().unwrap();
-        let _ = url;
 
         // Tight retry config so the test wraps in well under a second.
         let config = RpcClientConfig {
@@ -1678,7 +1672,7 @@ mod tests {
             per_attempt_timeout: Duration::from_millis(500),
             ..Default::default()
         };
-        let client = RpcClient::new_with_config(&[&url2], &[&url2], config, None).unwrap();
+        let client = RpcClient::new_with_config(&[&url], &[&url], config, None).unwrap();
 
         let deadline = Instant::now() + Duration::from_millis(300);
         let err = client
@@ -1692,7 +1686,7 @@ mod tests {
             hits.load(Ordering::Relaxed)
         );
 
-        handle2.stop().unwrap();
+        handle.stop().unwrap();
     }
 
     /// The `KECCAK_EMPTY` codehash is the legitimate "empty bytecode" case: `"0x"` is the
@@ -1718,9 +1712,9 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let stalled_addr = listener.local_addr().unwrap();
         let stalled_url = format!("http://{stalled_addr}/");
-        // Keep the listener alive so the OS doesn't refuse the connection — we want
-        // accept + never-reply, not refused.
-        std::mem::forget(listener);
+        // Keep the listener alive (in scope) so the OS doesn't refuse the connection — we
+        // want accept + never-reply, not refused. Drops cleanly at end of test.
+        let _listener = listener;
 
         // Healthy provider as the second endpoint. Round-robin starts at index 0 so the
         // call hits the stalled provider first, has to time out the attempt, then rotates.
