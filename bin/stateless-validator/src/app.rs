@@ -125,6 +125,12 @@ pub struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_RPC_MAX_BACKOFF_MS")]
     pub rpc_max_backoff_ms: Option<u64>,
 
+    /// Per-attempt RPC timeout (milliseconds). Bounds every individual provider attempt
+    /// even when the chain-sync caller passes no overall deadline, so a provider that
+    /// accepts the TCP connection but never replies is detected and rotated past.
+    #[clap(long, env = "STATELESS_VALIDATOR_RPC_PER_ATTEMPT_TIMEOUT_MS")]
+    pub rpc_per_attempt_timeout_ms: Option<u64>,
+
     /// Soft cap on rows retained in the canonical-chain table. Old rows are pruned inline
     /// when `advance_chain` exceeds this. Larger values bound the reorg-lookup window;
     /// smaller values reduce redb file growth. Defaults to `DEFAULT_MAX_CHAIN_LENGTH`
@@ -178,10 +184,13 @@ pub async fn run() -> Result<()> {
         initial: override_ms(args.rpc_initial_backoff_ms, rpc_defaults.rpc_retry.initial),
         max: override_ms(args.rpc_max_backoff_ms, rpc_defaults.rpc_retry.max),
     };
+    let per_attempt_timeout =
+        override_ms(args.rpc_per_attempt_timeout_ms, rpc_defaults.per_attempt_timeout);
     let rpc_config = RpcClientConfig {
         data_max_concurrent_requests: args.data_max_concurrent_requests,
         witness_max_concurrent_requests: args.witness_max_concurrent_requests,
         rpc_retry,
+        per_attempt_timeout,
         ..rpc_defaults
     }
     .with_metrics(Arc::new(metrics::ValidatorMetrics));
