@@ -1691,12 +1691,22 @@ mod tests {
 
     /// The `KECCAK_EMPTY` codehash is the legitimate "empty bytecode" case: `"0x"` is the
     /// correct answer and must be returned, not retried (otherwise the call would loop forever).
+    ///
+    /// `client.get_code` uses `deadline = None` (unbounded retry); the outer
+    /// `tokio::time::timeout` is a regression guard — if the `!= KECCAK_EMPTY` check is ever
+    /// flipped or removed, the call would hang instead of returning, and CI would hang with
+    /// it. The timeout converts that failure mode into an explicit test failure.
     #[tokio::test]
     async fn test_get_code_accepts_empty_response_for_keccak_empty() {
         let (handle, url) = start_code_rpc(HashMap::new()).await; // server returns "0x" for everything
         let client = client_at(&url);
 
-        let bytes = client.get_code(revm::primitives::KECCAK_EMPTY).await;
+        let bytes = tokio::time::timeout(
+            Duration::from_millis(500),
+            client.get_code(revm::primitives::KECCAK_EMPTY),
+        )
+        .await
+        .expect("KECCAK_EMPTY guard must short-circuit without retrying");
         assert!(bytes.is_empty(), "KECCAK_EMPTY hash must accept empty bytecode");
 
         handle.stop().unwrap();
