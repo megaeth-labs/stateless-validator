@@ -216,7 +216,10 @@ pub async fn block_fetcher<F: BlockFetcher>(
         if window_exhausted && tip.refresh_due(config.poll_interval) {
             // RPC client retries internally; this call only fails on a cancelled shutdown.
             match fetcher.latest_block_number().await {
-                Ok(n) => tip.set(n),
+                Ok(n) => {
+                    debug!(remote = n, base = state.base_block, gap = n.saturating_sub(state.base_block), "Remote tip refreshed");
+                    tip.set(n);
+                }
                 Err(e) => {
                     warn!(error = %e, "latest_block_number failed (aborted/shutdown?)");
                     tokio::select! {
