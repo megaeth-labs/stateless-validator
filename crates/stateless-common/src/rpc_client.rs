@@ -47,7 +47,7 @@ use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
 use stateless_core::withdrawals::MptWitness;
 use tokio::sync::Semaphore;
-use tracing::trace;
+use tracing::{trace, warn};
 
 use crate::{
     metrics::{RpcMethod, RpcMetrics},
@@ -138,10 +138,10 @@ impl Default for RpcClientConfig {
             // 30s. That's gentle enough to ride out near-tip witness generation latency (a
             // few seconds) without hammering upstream when something is genuinely broken.
             rpc_retry: BackoffPolicy::new(Duration::from_millis(500), Duration::from_secs(30)),
-            // 30s is well above any healthy single-attempt latency (witness near-tip can take
+            // 20s is well above any healthy single-attempt latency (witness near-tip can take
             // several seconds; everything else is sub-second), but bounded enough that a
             // stalled (TCP-accept-no-reply) provider is detected within reasonable time.
-            per_attempt_timeout: Duration::from_secs(30),
+            per_attempt_timeout: Duration::from_secs(20),
         }
     }
 }
@@ -845,6 +845,17 @@ where
                         }
                         return Err(RpcDeadlineExceeded { method, elapsed: call_start.elapsed() });
                     }
+                    // Always WARN, regardless of round — a stalled provider (TCP-accept-
+                    // no-reply) is the failure mode this guard exists to catch, and ops
+                    // need to see it on round 0 instead of waiting for the round-3
+                    // escalation that the returned-Err path goes through.
+                    warn!(
+                        method = method.as_str(),
+                        provider_idx,
+                        round,
+                        attempt_timeout_ms = attempt_timeout.as_millis() as u64,
+                        "RPC provider stalled past per-attempt timeout, rotating",
+                    );
                     Err(eyre!(
                         "{} attempt against provider {} timed out after {:?} (per_attempt_timeout)",
                         method.as_str(),

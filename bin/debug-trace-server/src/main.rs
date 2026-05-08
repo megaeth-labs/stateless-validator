@@ -202,11 +202,12 @@ struct Args {
     #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_MAX_CONCURRENT_REQUESTS")]
     witness_max_concurrent_requests: Option<usize>,
 
-    /// Per-attempt RPC timeout (milliseconds). Bounds every individual provider attempt
-    /// even when the caller passes no overall deadline (e.g. background chain sync), so
-    /// a provider that accepts the TCP connection but never replies is detected and
-    /// rotated past instead of wedging the retry loop.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_RPC_PER_ATTEMPT_TIMEOUT_MS")]
+    /// Per-attempt RPC timeout (milliseconds). Must be ≥ 100ms.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_RPC_PER_ATTEMPT_TIMEOUT_MS",
+        value_parser = clap::value_parser!(u64).range(100..),
+    )]
     rpc_per_attempt_timeout_ms: Option<u64>,
 
     /// Logging configuration.
