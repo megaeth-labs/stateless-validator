@@ -25,7 +25,7 @@ use std::{sync::Arc, time::Duration};
 
 use advancer::chain_advancer;
 use config::WorkerResult;
-pub use config::{ErrorAction, PipelineConfig, PipelineOutcome, ReorgEvent};
+pub use config::{DEFAULT_TIP_BUFFER, ErrorAction, PipelineConfig, PipelineOutcome, ReorgEvent};
 pub use divergence::{DivergenceError, DivergenceLookups, find_divergence_point};
 use eyre::{Result, anyhow};
 pub use fetcher::block_fetcher;
