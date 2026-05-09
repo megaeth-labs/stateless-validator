@@ -39,8 +39,7 @@ pub use executor::{ValidationError, ValidationStats, replay_block, validate_bloc
 pub mod pipeline;
 #[cfg(feature = "std")]
 pub use pipeline::{
-    BlockFetcher, BlockProcessor, DEFAULT_TIP_BUFFER, ErrorAction, PipelineConfig, PipelineHooks,
-    PipelineOutcome, ProcessedBlock, ReorgEvent, block_fetcher, find_divergence_point,
-    run_pipeline,
+    BlockFetcher, BlockProcessor, ErrorAction, PipelineConfig, PipelineHooks, PipelineOutcome,
+    ProcessedBlock, ReorgEvent, block_fetcher, find_divergence_point, run_pipeline,
 };
 pub mod withdrawals;

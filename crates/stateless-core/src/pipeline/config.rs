@@ -4,10 +4,6 @@ use std::time::Duration;
 
 use alloy_primitives::{BlockHash, BlockNumber};
 
-/// Default `tip_buffer` for callers that race the upstream witness generator. See the
-/// field comment on [`PipelineConfig::tip_buffer`].
-pub const DEFAULT_TIP_BUFFER: u64 = 3;
-
 /// Configuration for the chain sync pipeline.
 ///
 /// Binary-specific settings (metrics, reporting, pruner) live in binary CLI args.
