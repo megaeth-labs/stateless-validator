@@ -3256,7 +3256,7 @@ dependencies = [
 [[package]]
 name = "mega-evm"
 version = "1.5.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=915f71e324141140c7f08687fc23db63402e06e0#915f71e324141140c7f08687fc23db63402e06e0"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=09ceb5d3f91fcec61d4f40fa2a67d13d7c1ab245#09ceb5d3f91fcec61d4f40fa2a67d13d7c1ab245"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3283,7 +3283,7 @@ dependencies = [
 [[package]]
 name = "mega-system-contracts"
 version = "1.5.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=915f71e324141140c7f08687fc23db63402e06e0#915f71e324141140c7f08687fc23db63402e06e0"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=09ceb5d3f91fcec61d4f40fa2a67d13d7c1ab245#09ceb5d3f91fcec61d4f40fa2a67d13d7c1ab245"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -3412,7 +3412,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

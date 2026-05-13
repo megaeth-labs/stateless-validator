@@ -1,12 +1,13 @@
 //! Chain specification and hardfork activation logic.
 
-use std::{boxed::Box, vec, vec::Vec};
+use std::{any::Any, boxed::Box, sync::Arc, vec, vec::Vec};
 
 use alloy_genesis::Genesis;
 use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition, Hardfork};
 use alloy_op_hardforks::{OpHardfork, OpHardforks};
+use alloy_primitives::Address;
 use alloy_serde::OtherFields;
-use mega_evm::{MegaHardfork, MegaHardforks};
+use mega_evm::{HardforkParams, MegaHardfork, MegaHardforks, SequencerRegistryConfig};
 use reth_ethereum_forks::ChainHardforks;
 use reth_optimism_chainspec::OpChainSpec;
 
@@ -22,6 +23,11 @@ pub const BLOB_GASPRICE_UPDATE_FRACTION: u64 = 3338477;
 pub struct ChainSpec {
     pub chain_id: u64,
     pub hardforks: ChainHardforks,
+    /// Rex5 `SequencerRegistry` bootstrap, parsed from genesis `config` extra fields.
+    ///
+    /// `None` for pre-Rex5 chains; `Some(...)` when `rex5Time` is configured. Held as
+    /// `Arc` so `Clone` is cheap (the executor clones `ChainSpec` per block).
+    pub sequencer_registry_config: Option<Arc<SequencerRegistryConfig>>,
 }
 
 impl EthereumHardforks for ChainSpec {
@@ -40,6 +46,15 @@ impl MegaHardforks for ChainSpec {
     fn mega_fork_activation(&self, fork: MegaHardfork) -> ForkCondition {
         self.hardforks.fork(fork)
     }
+
+    fn fork_params_any(&self, fork: MegaHardfork) -> Option<&(dyn Any + Send + Sync)> {
+        match fork {
+            MegaHardfork::Rex5 => {
+                self.sequencer_registry_config.as_deref().map(|c| c as &(dyn Any + Send + Sync))
+            }
+            _ => None,
+        }
+    }
 }
 
 impl ChainSpec {
@@ -55,13 +70,33 @@ impl ChainSpec {
     /// - The MegaETH set is then merged with the Optimism/Ethereum set to build a single
     ///   [`ChainHardforks`] that drives fork activation.
     ///
-    /// This yields a deterministic activation order across all supported hardfork families.
+    /// When `rex5Time` is configured, the genesis `config` extra fields must also carry the flat
+    /// `rex5InitialSequencer` / `rex5InitialAdmin` addresses; both are validated immediately so a
+    /// misconfigured genesis fails at load rather than at the first Rex5 block.
     pub fn from_genesis(genesis: Genesis) -> Self {
         // extract megaeth hardforks from genesis
-        let mut megaeth_hardforks =
-            MegaethGenesisHardforks::extract_from(&genesis.config.extra_fields)
-                .unwrap_or_default()
-                .into_vec();
+        let megaeth_hardforks =
+            MegaethGenesisHardforks::extract_from(&genesis.config.extra_fields).unwrap_or_default();
+        let rex5_scheduled = megaeth_hardforks.rex_5_time.is_some();
+        let mut megaeth_hardforks = megaeth_hardforks.into_vec();
+
+        // Rex5 SequencerRegistry bootstrap, required iff `rex5Time` is scheduled. Parsed from
+        // the same flat schema mega-reth uses (`rex5InitialSequencer` / `rex5InitialAdmin` as
+        // top-level `config` fields), so a single genesis.json works for both binaries.
+        let sequencer_registry_config = if rex5_scheduled {
+            let parsed = MegaethGenesisSequencerRegistryConfig::parse_required_from(
+                &genesis.config.extra_fields,
+            )
+            .unwrap_or_else(|err| {
+                panic!("malformed or missing SequencerRegistryConfig in genesis: {err}")
+            });
+            let cfg = parsed.into_config();
+            cfg.validate()
+                .unwrap_or_else(|err| panic!("invalid SequencerRegistryConfig: {}", err.message));
+            Some(Arc::new(cfg))
+        } else {
+            None
+        };
 
         let chain_id = genesis.config.chain_id;
         let op_chain_spec = OpChainSpec::from_genesis(genesis);
@@ -90,7 +125,7 @@ impl ChainSpec {
         // we merge megaeth_hardforks with op_hardforks
         all_hardforks.append(&mut op_hardforks);
 
-        Self { chain_id, hardforks: ChainHardforks::new(all_hardforks) }
+        Self { chain_id, hardforks: ChainHardforks::new(all_hardforks), sequencer_registry_config }
     }
 }
 
@@ -140,6 +175,50 @@ impl MegaethGenesisHardforks {
         .into_iter()
         .filter_map(|(hardfork, condition)| condition.map(|c| (hardfork, c)))
         .collect()
+    }
+}
+
+/// Rex5 `SequencerRegistry` bootstrap configuration in genesis.
+///
+/// Read as top-level `config` extra fields (flat schema; matches mega-reth):
+/// ```json
+/// "config": {
+///   "rex5Time": 0,
+///   "rex5InitialSequencer": "0x...",
+///   "rex5InitialAdmin": "0x..."
+/// }
+/// ```
+///
+/// The initial system address is intentionally absent — it is hardcoded to
+/// `mega_evm::MEGA_SYSTEM_ADDRESS` at genesis because every pre-Rex5 component
+/// (payload executor, txpool, replay) assumes that constant.
+///
+/// Both addresses must be non-zero or [`SequencerRegistryConfig::validate`] rejects them.
+#[derive(Default, Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MegaethGenesisSequencerRegistryConfig {
+    /// Initial sequencer (mini-block signing key) seeded at Rex5 activation.
+    pub rex5_initial_sequencer: Address,
+    /// Initial admin (can schedule future role changes) seeded at Rex5 activation.
+    pub rex5_initial_admin: Address,
+}
+
+impl MegaethGenesisSequencerRegistryConfig {
+    /// Parse the required SequencerRegistry bootstrap from genesis extra fields.
+    ///
+    /// Returns a serde error if either address field is missing or malformed. Callers should
+    /// only invoke it once they have decided the bootstrap is required, i.e. when `rex5Time`
+    /// is configured.
+    pub fn parse_required_from(others: &OtherFields) -> serde_json::Result<Self> {
+        others.deserialize_as()
+    }
+
+    /// Convert to the canonical mega-evm [`SequencerRegistryConfig`].
+    pub fn into_config(self) -> SequencerRegistryConfig {
+        SequencerRegistryConfig {
+            rex5_initial_sequencer: self.rex5_initial_sequencer,
+            rex5_initial_admin: self.rex5_initial_admin,
+        }
     }
 }
 
@@ -224,5 +303,86 @@ mod tests {
         assert_eq!(hardforks.rex_3_time, Some(7));
         assert_eq!(hardforks.rex_4_time, Some(8));
         assert_eq!(hardforks.rex_5_time, Some(9));
+    }
+
+    #[test]
+    fn test_parse_sequencer_registry_from_flat_json() {
+        let genesis_info = r#"
+        {
+          "rex5Time": 0,
+          "rex5InitialSequencer": "0x0000000000000000000000000000000000000001",
+          "rex5InitialAdmin": "0x0000000000000000000000000000000000000002"
+        }
+        "#;
+        let fields = serde_json::from_str::<OtherFields>(genesis_info).unwrap();
+        let parsed = MegaethGenesisSequencerRegistryConfig::parse_required_from(&fields).unwrap();
+        assert_eq!(parsed.rex5_initial_sequencer, Address::with_last_byte(1));
+        assert_eq!(parsed.rex5_initial_admin, Address::with_last_byte(2));
+    }
+
+    #[test]
+    fn test_chain_spec_carries_sequencer_registry_as_fork_params() {
+        let mut genesis = Genesis::default();
+        genesis.config.extra_fields.insert_value("rex5Time".to_string(), 0).unwrap();
+        genesis
+            .config
+            .extra_fields
+            .insert_value(
+                "rex5InitialSequencer".to_string(),
+                "0x0000000000000000000000000000000000000001",
+            )
+            .unwrap();
+        genesis
+            .config
+            .extra_fields
+            .insert_value(
+                "rex5InitialAdmin".to_string(),
+                "0x0000000000000000000000000000000000000002",
+            )
+            .unwrap();
+        let spec = ChainSpec::from_genesis(genesis);
+        let params = spec.fork_params::<SequencerRegistryConfig>().expect("Rex5 params present");
+        assert_eq!(params.rex5_initial_sequencer, Address::with_last_byte(1));
+        assert_eq!(params.rex5_initial_admin, Address::with_last_byte(2));
+    }
+
+    #[test]
+    fn test_chain_spec_no_rex5_returns_none() {
+        let genesis = Genesis::default();
+        let spec = ChainSpec::from_genesis(genesis);
+        assert!(spec.fork_params::<SequencerRegistryConfig>().is_none());
+        assert!(spec.sequencer_registry_config.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed or missing SequencerRegistryConfig in genesis")]
+    fn test_chain_spec_rex5_without_bootstrap_panics() {
+        let mut genesis = Genesis::default();
+        genesis.config.extra_fields.insert_value("rex5Time".to_string(), 0).unwrap();
+        let _ = ChainSpec::from_genesis(genesis);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid SequencerRegistryConfig")]
+    fn test_chain_spec_zero_sequencer_panics() {
+        let mut genesis = Genesis::default();
+        genesis.config.extra_fields.insert_value("rex5Time".to_string(), 0).unwrap();
+        genesis
+            .config
+            .extra_fields
+            .insert_value(
+                "rex5InitialSequencer".to_string(),
+                "0x0000000000000000000000000000000000000000",
+            )
+            .unwrap();
+        genesis
+            .config
+            .extra_fields
+            .insert_value(
+                "rex5InitialAdmin".to_string(),
+                "0x0000000000000000000000000000000000000002",
+            )
+            .unwrap();
+        let _ = ChainSpec::from_genesis(genesis);
     }
 }
