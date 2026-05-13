@@ -195,7 +195,7 @@ impl MegaethGenesisHardforks {
 /// (payload executor, txpool, replay) assumes that constant.
 ///
 /// Both addresses must be non-zero or [`SequencerRegistryConfig::validate`] rejects them.
-#[derive(Default, Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MegaethGenesisSequencerRegistryConfig {
     /// Initial sequencer (mini-block signing key) seeded at Rex5 activation.
@@ -382,6 +382,30 @@ mod tests {
             .insert_value(
                 "rex5InitialAdmin".to_string(),
                 "0x0000000000000000000000000000000000000002",
+            )
+            .unwrap();
+        let _ = ChainSpec::from_genesis(genesis);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid SequencerRegistryConfig")]
+    fn test_chain_spec_zero_admin_panics() {
+        let mut genesis = Genesis::default();
+        genesis.config.extra_fields.insert_value("rex5Time".to_string(), 0).unwrap();
+        genesis
+            .config
+            .extra_fields
+            .insert_value(
+                "rex5InitialSequencer".to_string(),
+                "0x0000000000000000000000000000000000000001",
+            )
+            .unwrap();
+        genesis
+            .config
+            .extra_fields
+            .insert_value(
+                "rex5InitialAdmin".to_string(),
+                "0x0000000000000000000000000000000000000000",
             )
             .unwrap();
         let _ = ChainSpec::from_genesis(genesis);
