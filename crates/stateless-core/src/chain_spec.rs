@@ -1,6 +1,7 @@
 //! Chain specification and hardfork activation logic.
 
-use std::{any::Any, boxed::Box, sync::Arc, vec, vec::Vec};
+use core::any::Any;
+use std::{boxed::Box, sync::Arc, vec, vec::Vec};
 
 use alloy_genesis::Genesis;
 use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition, Hardfork};
