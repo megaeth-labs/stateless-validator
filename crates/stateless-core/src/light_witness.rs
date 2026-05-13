@@ -216,9 +216,9 @@ mod tests {
         }
         let original = LightWitness { kvs: BTreeMap::new(), levels };
 
-        let bytes = bincode::serde::encode_to_vec(&original, bincode::config::legacy()).unwrap();
+        let bytes = bincode::serde::encode_to_vec(&original, bincode::config::standard()).unwrap();
         let (decoded, _): (LightWitness, _) =
-            bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).unwrap();
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
 
         assert_eq!(original.kvs, decoded.kvs);
         assert_eq!(original.levels.len(), decoded.levels.len());
