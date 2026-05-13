@@ -1,7 +1,7 @@
 //! Chain specification and hardfork activation logic.
 
 use core::any::Any;
-use std::{boxed::Box, sync::Arc, vec, vec::Vec};
+use std::{boxed::Box, vec, vec::Vec};
 
 use alloy_genesis::Genesis;
 use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition, Hardfork};
@@ -26,9 +26,8 @@ pub struct ChainSpec {
     pub hardforks: ChainHardforks,
     /// Rex5 `SequencerRegistry` bootstrap, parsed from genesis `config` extra fields.
     ///
-    /// `None` for pre-Rex5 chains; `Some(...)` when `rex5Time` is configured. Held as
-    /// `Arc` so `Clone` is cheap (the executor clones `ChainSpec` per block).
-    pub sequencer_registry_config: Option<Arc<SequencerRegistryConfig>>,
+    /// `None` for pre-Rex5 chains; `Some(...)` when `rex5Time` is configured.
+    pub sequencer_registry_config: Option<SequencerRegistryConfig>,
 }
 
 impl EthereumHardforks for ChainSpec {
@@ -51,7 +50,7 @@ impl MegaHardforks for ChainSpec {
     fn fork_params_any(&self, fork: MegaHardfork) -> Option<&(dyn Any + Send + Sync)> {
         match fork {
             MegaHardfork::Rex5 => {
-                self.sequencer_registry_config.as_deref().map(|c| c as &(dyn Any + Send + Sync))
+                self.sequencer_registry_config.as_ref().map(|c| c as &(dyn Any + Send + Sync))
             }
             _ => None,
         }
@@ -94,7 +93,7 @@ impl ChainSpec {
             let cfg = parsed.into_config();
             cfg.validate()
                 .unwrap_or_else(|err| panic!("invalid SequencerRegistryConfig: {}", err.message));
-            Some(Arc::new(cfg))
+            Some(cfg)
         } else {
             None
         };
@@ -179,21 +178,9 @@ impl MegaethGenesisHardforks {
     }
 }
 
-/// Rex5 `SequencerRegistry` bootstrap configuration in genesis.
+/// Rex5 `SequencerRegistry` bootstrap, parsed from genesis `config` extra fields.
 ///
-/// Read as top-level `config` extra fields (flat schema; matches mega-reth):
-/// ```json
-/// "config": {
-///   "rex5Time": 0,
-///   "rex5InitialSequencer": "0x...",
-///   "rex5InitialAdmin": "0x..."
-/// }
-/// ```
-///
-/// The initial system address is intentionally absent — it is hardcoded to
-/// `mega_evm::MEGA_SYSTEM_ADDRESS` at genesis because every pre-Rex5 component
-/// (payload executor, txpool, replay) assumes that constant.
-///
+/// Flat schema (matches mega-reth) so a single genesis.json works for both binaries.
 /// Both addresses must be non-zero or [`SequencerRegistryConfig::validate`] rejects them.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
