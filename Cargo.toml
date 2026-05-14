@@ -63,6 +63,7 @@ revm = { version = "27.1.0", default-features = false }
 revm-inspectors = { version = "0.27.3", features = ["std", "js-tracer"], default-features = false }
 
 # misc
+async-trait = "0.1"
 base64 = { version = "0.22", default-features = false }
 bincode = { version = "2.0", features = ["serde", "alloc"], default-features = false }
 bytes = "1.11"

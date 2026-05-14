@@ -16,7 +16,7 @@ use jsonrpsee::{
 use jsonrpsee_types::error::{
     CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
 };
-use stateless_common::{RpcClient, WitnessRequestKeys};
+use stateless_common::{LocalDataSource, RpcClient, WitnessRequestKeys};
 use stateless_core::{
     ChainStore, ContractStore, PipelineConfig, db::BlockMeta, pipeline::run_pipeline,
     withdrawals::MptWitness,
@@ -202,6 +202,17 @@ fn make_rpc_error(code: i32, msg: String) -> ErrorObject<'static> {
     ErrorObject::owned(code, msg, None::<()>)
 }
 
+fn shape_block(
+    block: &Block<op_alloy_rpc_types::Transaction>,
+    full_block: bool,
+) -> Block<op_alloy_rpc_types::Transaction> {
+    if full_block {
+        block.clone()
+    } else {
+        Block { transactions: block.transactions.clone().into_hashes(), ..block.clone() }
+    }
+}
+
 /// Create a temporary ValidatorDB with the anchor set to the first block in test data.
 ///
 /// The returned `TempDir` must be held by the caller for the test's lifetime —
@@ -251,12 +262,22 @@ async fn setup_mock_rpc_server(
                     )
                 })?;
 
-            let result_block = if full_block {
-                block.clone()
-            } else {
-                Block { transactions: block.transactions.clone().into_hashes(), ..block.clone() }
-            };
-            Ok::<_, ErrorObject<'static>>(result_block)
+            Ok::<_, ErrorObject<'static>>(shape_block(block, full_block))
+        })
+        .unwrap();
+
+    module
+        .register_method("eth_getBlockByHash", |params, ctx, _| {
+            let (hash, full_block): (B256, bool) = params
+                .parse()
+                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
+
+            let block_hash = BlockHash::from(hash.0);
+            let block = ctx.fixtures.blocks.get(&block_hash).ok_or_else(|| {
+                make_rpc_error(CALL_EXECUTION_FAILED_CODE, format!("Block {hash} not found"))
+            })?;
+
+            Ok::<_, ErrorObject<'static>>(shape_block(block, full_block))
         })
         .unwrap();
 
@@ -406,9 +427,13 @@ async fn integration_test() {
     let config = Arc::new(cfg);
 
     let shutdown = CancellationToken::new();
-    let fetcher =
-        Arc::new(ValidatorFetcher { rpc_client: client.clone(), on_remote_height: |_| {} });
-    let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
+    let local: Arc<dyn LocalDataSource> = client.clone();
+    let fetcher = Arc::new(ValidatorFetcher {
+        rpc_client: client.clone(),
+        local: local.clone(),
+        on_remote_height: |_| {},
+    });
+    let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, local });
     let hooks = Arc::new(ValidatorHooks);
 
     run_pipeline(fetcher, Arc::clone(&validator_db), processor, hooks, config, shutdown)

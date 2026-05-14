@@ -29,6 +29,7 @@ revm.workspace = true
 stateless-core = { path = "../stateless-core" }
 
 # misc
+async-trait.workspace = true
 base64.workspace = true
 bincode.workspace = true
 clap.workspace = true

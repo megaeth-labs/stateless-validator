@@ -1,3 +1,5 @@
+pub mod local_source;
+pub use local_source::{LocalDataError, LocalDataSource};
 pub mod logging;
 pub mod metrics;
 pub use metrics::{RpcMethod, RpcMetrics};

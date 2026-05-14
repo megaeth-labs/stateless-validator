@@ -12,7 +12,7 @@ use eyre::{Result, ensure};
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
-use stateless_common::RpcClient;
+use stateless_common::{LocalDataError, LocalDataSource, RpcClient};
 use stateless_core::{
     chain_spec::ChainSpec,
     data_types::iter_code_hashes,
@@ -27,10 +27,11 @@ use tracing::{debug, error};
 
 use crate::metrics;
 
-/// Fetcher for the validator: fetches blocks + witnesses from RPC,
-/// wraps in [`ValidationTask`], and records remote chain height for metrics.
+/// Fetcher for the validator: pulls the witness from a remote RPC and the block from a
+/// [`LocalDataSource`]. Records the upstream chain height for metrics.
 pub struct ValidatorFetcher {
     pub rpc_client: Arc<RpcClient>,
+    pub local: Arc<dyn LocalDataSource>,
     pub on_remote_height: fn(u64),
 }
 
@@ -39,14 +40,13 @@ impl BlockFetcher for ValidatorFetcher {
 
     async fn fetch(&self, block_number: u64) -> Result<ValidationTask> {
         let block_hash = self.rpc_client.get_block_hash(block_number).await;
-        // Once we have the hash, fetch the witness and the full block concurrently — they
-        // hit independent upstreams (witness providers vs. data providers) and both retry
-        // internally, so `tokio::join!` just overlaps the two round-trips. Matches the
-        // pattern used by `DataProvider::do_fetch_block_data` in the trace server.
+        // Fetch by hash (not number) so a reorg between the hash lookup and the block fetch
+        // surfaces as a hash mismatch rather than silently swapping the block under us.
         let ((salt_witness, mpt_witness), block) = tokio::join!(
             self.rpc_client.get_witness(block_number, block_hash),
-            self.rpc_client.get_block(BlockId::Number(block_number.into()), true),
+            self.local.block_by_hash(block_number, block_hash, None),
         );
+        let block = block.map_err(eyre::Report::from)?;
         Ok(ValidationTask { block, salt_witness, mpt_witness })
     }
 
@@ -148,7 +148,7 @@ pub struct ValidationFailure {
 pub struct ValidatorProcessor {
     pub chain_spec: Arc<ChainSpec>,
     pub contract_cache: Arc<ContractCache>,
-    pub rpc_client: Arc<RpcClient>,
+    pub local: Arc<dyn LocalDataSource>,
 }
 
 impl BlockProcessor for ValidatorProcessor {
@@ -185,18 +185,18 @@ impl BlockProcessor for ValidatorProcessor {
         metrics::on_contract_cache_read(contracts.len() as u64, missing_contracts.len() as u64);
 
         if !missing_contracts.is_empty() {
-            // The unbounded `get_codes` retries transport errors forever, so the only way this
-            // errors is `VerificationFailure` — a deterministic bad upstream / bad witness.
-            // The `Deadline` variant can't surface here because no deadline is passed.
-            let fetched =
-                self.rpc_client.get_codes(&missing_contracts, true).await.map_err(|e| match e {
-                    stateless_common::CodeFetchError::VerificationFailure { .. } => {
+            let fetched = self.local.codes_by_hashes(&missing_contracts, None).await.map_err(
+                |e| match e {
+                    LocalDataError::CodeVerification(_) => {
                         fail(format!("Contract verification failed: {e}"), false)
                     }
-                    stateless_common::CodeFetchError::Deadline(_) => {
-                        unreachable!("unbounded get_codes cannot produce a deadline error: {e}")
+                    // `deadline=None` is unbounded, so the deadline path is unreachable here.
+                    LocalDataError::Deadline(_) => unreachable!("{e}"),
+                    LocalDataError::BlockMissing { .. } | LocalDataError::Provider(_) => {
+                        fail(format!("Contract fetch failed: {e}"), true)
                     }
-                })?;
+                },
+            )?;
 
             let new_bytecodes: Vec<(B256, Arc<Bytecode>)> = fetched.into_iter().collect();
 

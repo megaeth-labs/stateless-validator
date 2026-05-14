@@ -5586,6 +5586,7 @@ dependencies = [
  "alloy-provider",
  "alloy-rpc-types-eth",
  "alloy-trie",
+ "async-trait",
  "base64",
  "bincode 2.0.1",
  "clap",
