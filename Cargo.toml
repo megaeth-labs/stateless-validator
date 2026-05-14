@@ -12,11 +12,7 @@ resolver = "2"
 [workspace.package]
 version = "2.0.10"
 edition = "2024"
-# Bumped from 1.95 to 1.88 (the actual lower bound implied by `let-chains`, which is the
-# newest language feature used in this workspace). 1.95 was reflexive — no 1.95-only stdlib
-# API is referenced. Lowering it lets consumers on slightly older toolchains (notably
-# mega-reth's pinned nightly-2025-08-18 ≈ 1.91-nightly) compile this crate.
-rust-version = "1.88"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/megaeth-labs/stateless-validator"
 exclude = [".github/"]
@@ -74,6 +70,7 @@ dyn-clone = "1.0"
 eyre = { version = "0.6", features = ["auto-install"], default-features = false }
 fastrand = { version = "2.4", default-features = false }
 futures = { version = "0.3", default-features = false }
+hashbrown = { version = "0.16", default-features = false }
 http = "1.4"
 http-body = "1.0"
 http-body-util = "0.1"
