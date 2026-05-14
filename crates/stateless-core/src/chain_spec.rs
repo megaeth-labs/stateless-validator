@@ -92,8 +92,7 @@ impl ChainSpec {
                 panic!("malformed or missing SequencerRegistryConfig in genesis: {err}")
             });
             let cfg = parsed.into_config();
-            cfg.validate()
-                .unwrap_or_else(|err| panic!("invalid SequencerRegistryConfig: {err}"));
+            cfg.validate().unwrap_or_else(|err| panic!("invalid SequencerRegistryConfig: {err}"));
             Some(cfg)
         } else {
             None
