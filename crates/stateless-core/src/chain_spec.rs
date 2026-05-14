@@ -93,7 +93,7 @@ impl ChainSpec {
             });
             let cfg = parsed.into_config();
             cfg.validate()
-                .unwrap_or_else(|err| panic!("invalid SequencerRegistryConfig: {}", err.message));
+                .unwrap_or_else(|err| panic!("invalid SequencerRegistryConfig: {err}"));
             Some(cfg)
         } else {
             None
