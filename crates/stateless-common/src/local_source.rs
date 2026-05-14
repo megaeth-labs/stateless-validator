@@ -59,6 +59,11 @@ pub trait LocalDataSource: Send + Sync + 'static {
 
     /// Fetch contract bytecode for a deduplicated list of codehashes. Each returned
     /// bytecode's keccak must match the requested hash.
+    ///
+    /// All-or-nothing: returns a complete map (one entry per requested hash) on success,
+    /// or `Err` on any miss. Partial results are forbidden — they would silently feed
+    /// missing bytecode into the EVM. Implementations should report missing hashes as
+    /// `LocalDataError::Provider`.
     async fn codes_by_hashes(
         &self,
         hashes: &[B256],
@@ -122,7 +127,16 @@ mod tests {
             _deadline: Option<Instant>,
         ) -> Result<HashMap<B256, Arc<Bytecode>>, LocalDataError> {
             let guard = self.codes.lock().unwrap();
-            Ok(hashes.iter().filter_map(|h| guard.get(h).map(|bc| (*h, bc.clone()))).collect())
+            let mut out = HashMap::with_capacity(hashes.len());
+            for &h in hashes {
+                let bc = guard.get(&h).cloned().ok_or_else(|| {
+                    LocalDataError::Provider(
+                        format!("bytecode not found locally: codehash={h:?}").into(),
+                    )
+                })?;
+                out.insert(h, bc);
+            }
+            Ok(out)
         }
     }
 
@@ -135,18 +149,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_memory_codes_returns_known_only() {
+    async fn in_memory_codes_all_present_returns_full_map() {
         let src = InMemorySource::default();
         let h1 = B256::from([1u8; 32]);
         let h2 = B256::from([2u8; 32]);
-        let h3_unknown = B256::from([3u8; 32]);
         src.codes.lock().unwrap().insert(h1, Arc::new(Bytecode::new_raw(vec![0x60].into())));
         src.codes.lock().unwrap().insert(h2, Arc::new(Bytecode::new_raw(vec![0x61].into())));
 
-        let got = src.codes_by_hashes(&[h1, h2, h3_unknown], None).await.unwrap();
+        let got = src.codes_by_hashes(&[h1, h2], None).await.unwrap();
         assert_eq!(got.len(), 2);
         assert!(got.contains_key(&h1));
         assert!(got.contains_key(&h2));
-        assert!(!got.contains_key(&h3_unknown));
+    }
+
+    #[tokio::test]
+    async fn in_memory_codes_errors_on_missing() {
+        let src = InMemorySource::default();
+        let h1 = B256::from([1u8; 32]);
+        let h_unknown = B256::from([3u8; 32]);
+        src.codes.lock().unwrap().insert(h1, Arc::new(Bytecode::new_raw(vec![0x60].into())));
+
+        let err = src.codes_by_hashes(&[h1, h_unknown], None).await.unwrap_err();
+        assert!(matches!(err, LocalDataError::Provider(_)), "expected Provider error, got {err:?}");
     }
 }
