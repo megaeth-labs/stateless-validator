@@ -24,7 +24,7 @@ pub enum LocalDataError {
     Deadline(#[from] RpcDeadlineExceeded),
 
     #[error(transparent)]
-    CodeVerification(CodeFetchError),
+    CodeFetch(CodeFetchError),
 
     #[error("block not found locally: number={number} hash={hash:?}")]
     BlockMissing { number: BlockNumber, hash: BlockHash },
@@ -36,12 +36,12 @@ pub enum LocalDataError {
 // Split `CodeFetchError::Deadline` into `LocalDataError::Deadline` so the deadline condition
 // has exactly one path through the error type — otherwise callers must match both
 // `LocalDataError::Deadline(_)` and
-// `LocalDataError::CodeVerification(CodeFetchError::Deadline(_))`.
+// `LocalDataError::CodeFetch(CodeFetchError::Deadline(_))`.
 impl From<CodeFetchError> for LocalDataError {
     fn from(e: CodeFetchError) -> Self {
         match e {
             CodeFetchError::Deadline(d) => Self::Deadline(d),
-            other => Self::CodeVerification(other),
+            other => Self::CodeFetch(other),
         }
     }
 }

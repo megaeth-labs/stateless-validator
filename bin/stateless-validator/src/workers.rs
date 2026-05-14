@@ -4,7 +4,7 @@ use std::{sync::Arc, time::Duration};
 
 use alloy_primitives::B256;
 use eyre::Result;
-use stateless_common::{LocalDataSource, RpcClient};
+use stateless_common::RpcClient;
 use stateless_core::{ChainStore, PipelineConfig, chain_spec::ChainSpec, pipeline::run_pipeline};
 use stateless_db::ContractCache;
 use tokio::{signal, task};
@@ -43,13 +43,12 @@ pub async fn run_with_signals(
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .map_err(|e| eyre::eyre!("Failed to register SIGTERM handler: {e}"))?;
 
-    let local: Arc<dyn LocalDataSource> = client.clone();
     let fetcher = Arc::new(ValidatorFetcher {
         rpc_client: client.clone(),
-        local: local.clone(),
         on_remote_height: metrics::set_remote_chain_height,
     });
-    let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, local });
+    let processor =
+        Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client.clone() });
     let hooks = Arc::new(ValidatorHooks);
 
     let reporter = if report_validation {

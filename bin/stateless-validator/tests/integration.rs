@@ -16,7 +16,7 @@ use jsonrpsee::{
 use jsonrpsee_types::error::{
     CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
 };
-use stateless_common::{LocalDataSource, RpcClient, WitnessRequestKeys};
+use stateless_common::{RpcClient, WitnessRequestKeys};
 use stateless_core::{
     ChainStore, ContractStore, PipelineConfig, db::BlockMeta, pipeline::run_pipeline,
     withdrawals::MptWitness,
@@ -200,11 +200,11 @@ fn shape_block(
     block: &Block<op_alloy_rpc_types::Transaction>,
     full_block: bool,
 ) -> Block<op_alloy_rpc_types::Transaction> {
-    if full_block {
-        block.clone()
-    } else {
-        Block { transactions: block.transactions.clone().into_hashes(), ..block.clone() }
+    let mut out = block.clone();
+    if !full_block {
+        out.transactions = out.transactions.into_hashes();
     }
+    out
 }
 
 /// Create a temporary ValidatorDB with the anchor set to the first block in test data.
@@ -421,13 +421,9 @@ async fn integration_test() {
     let config = Arc::new(cfg);
 
     let shutdown = CancellationToken::new();
-    let local: Arc<dyn LocalDataSource> = client.clone();
-    let fetcher = Arc::new(ValidatorFetcher {
-        rpc_client: client.clone(),
-        local: local.clone(),
-        on_remote_height: |_| {},
-    });
-    let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, local });
+    let fetcher =
+        Arc::new(ValidatorFetcher { rpc_client: client.clone(), on_remote_height: |_| {} });
+    let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
     let hooks = Arc::new(ValidatorHooks);
 
     run_pipeline(fetcher, Arc::clone(&validator_db), processor, hooks, config, shutdown)
