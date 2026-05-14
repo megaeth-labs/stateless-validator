@@ -29,7 +29,12 @@ use serde::{Deserialize, Serialize};
 pub struct LightWitness {
     /// All witnessed key-value pairs (same as SaltWitness.kvs)
     pub kvs: BTreeMap<SaltKey, Option<SaltValue>>,
-    /// Bucket subtree levels (same as SaltProof.levels)
+    /// Bucket subtree levels (same as SaltProof.levels).
+    ///
+    /// Routed through [`salt::fx_hashmap_serde`] so we don't have to enable
+    /// `hashbrown/serde` (which transitively pulls in `serde_core 1.0.221+`
+    /// and breaks downstream `alloy-tx-macros 1.0.23`).
+    #[serde(with = "salt::fx_hashmap_serde")]
     pub levels: FxHashMap<BucketId, u8>,
 }
 
@@ -194,5 +199,28 @@ mod tests {
         let fast = LightWitness { kvs: BTreeMap::new(), levels: FxHashMap::default() };
         assert!(fast.kvs.is_empty());
         assert!(fast.levels.is_empty());
+    }
+
+    /// Round-trip a populated `LightWitness` through bincode to confirm the
+    /// `#[serde(with = "salt::fx_hashmap_serde")]` wiring on the `levels`
+    /// field actually works end-to-end. The adapter itself is covered by
+    /// salt's own tests; this test just guards the integration.
+    #[test]
+    fn round_trip_through_bincode() {
+        let mut levels: FxHashMap<BucketId, u8> = HashMap::with_hasher(FxBuildHasher);
+        for (k, v) in [(0u32, 0u8), (42, 3), (1_000_000, 7), (BucketId::MAX, 255)] {
+            levels.insert(k, v);
+        }
+        let original = LightWitness { kvs: BTreeMap::new(), levels };
+
+        let bytes = bincode::serde::encode_to_vec(&original, bincode::config::standard()).unwrap();
+        let (decoded, _): (LightWitness, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+
+        assert_eq!(original.kvs, decoded.kvs);
+        assert_eq!(original.levels.len(), decoded.levels.len());
+        for (k, v) in &original.levels {
+            assert_eq!(decoded.levels.get(k), Some(v));
+        }
     }
 }

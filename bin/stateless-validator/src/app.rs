@@ -7,10 +7,7 @@ use alloy_primitives::BlockHash;
 use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::Result;
-use stateless_common::{
-    BackoffPolicy, RpcClient, RpcClientConfig,
-    logging::{LogArgs, migrate_legacy_env_vars},
-};
+use stateless_common::{BackoffPolicy, RpcClient, RpcClientConfig, logging::LogArgs};
 use stateless_core::{
     ChainStore, ContractStore, GenesisStore, chain_spec::ChainSpec, db::BlockMeta,
 };
@@ -21,6 +18,11 @@ use crate::{metrics, validator_db::ValidatorDB, workers};
 
 /// Database filename for the validator.
 pub const VALIDATOR_DB_FILENAME: &str = "validator.redb";
+
+/// Default `--tip-buffer`. The validator races the upstream witness generator, so it stays
+/// 3 blocks behind by default. Core's `PipelineConfig::tip_buffer` defaults to `0` because
+/// the buffer is opt-in per binary; the validator opts in here.
+const DEFAULT_TIP_BUFFER: u64 = 3;
 
 /// Loads or creates a ChainSpec from the database or a genesis file.
 pub fn load_or_create_chain_spec(
@@ -119,6 +121,13 @@ pub struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_ERROR_RESTART_DELAY_MS")]
     pub error_restart_delay_ms: Option<u64>,
 
+    /// Safety margin below the remote tip: the fetcher will not spawn fetches for blocks
+    /// `> chain_latest - tip_buffer`. Gives the upstream witness generator headroom to
+    /// finish the very block we'd otherwise race it for. `0` disables the buffer. Defaults
+    /// to `DEFAULT_TIP_BUFFER`.
+    #[clap(long, env = "STATELESS_VALIDATOR_TIP_BUFFER")]
+    pub tip_buffer: Option<u64>,
+
     /// Initial round-level RPC retry backoff (milliseconds). Applied after every provider in a
     /// round has failed; doubles each round up to `--rpc-max-backoff-ms`.
     #[clap(long, env = "STATELESS_VALIDATOR_RPC_INITIAL_BACKOFF_MS")]
@@ -127,6 +136,14 @@ pub struct CommandLineArgs {
     /// Cap on round-level RPC retry backoff (milliseconds).
     #[clap(long, env = "STATELESS_VALIDATOR_RPC_MAX_BACKOFF_MS")]
     pub rpc_max_backoff_ms: Option<u64>,
+
+    /// Per-attempt RPC timeout (milliseconds). Must be ≥ 100ms.
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_RPC_PER_ATTEMPT_TIMEOUT_MS",
+        value_parser = clap::value_parser!(u64).range(100..),
+    )]
+    pub rpc_per_attempt_timeout_ms: Option<u64>,
 
     /// Soft cap on rows retained in the canonical-chain table. Old rows are pruned inline
     /// when `advance_chain` exceeds this. Larger values bound the reorg-lookup window;
@@ -153,7 +170,6 @@ pub struct CommandLineArgs {
 /// validator DB, loads or initializes the chain spec + anchor, then hands off to
 /// [`workers::run_with_signals`].
 pub async fn run() -> Result<()> {
-    migrate_legacy_env_vars();
     let args = CommandLineArgs::parse();
     let _log_guard = args.log.init_tracing()?;
     let start = std::time::Instant::now();
@@ -182,10 +198,13 @@ pub async fn run() -> Result<()> {
         initial: override_ms(args.rpc_initial_backoff_ms, rpc_defaults.rpc_retry.initial),
         max: override_ms(args.rpc_max_backoff_ms, rpc_defaults.rpc_retry.max),
     };
+    let per_attempt_timeout =
+        override_ms(args.rpc_per_attempt_timeout_ms, rpc_defaults.per_attempt_timeout);
     let rpc_config = RpcClientConfig {
         data_max_concurrent_requests: args.data_max_concurrent_requests,
         witness_max_concurrent_requests: args.witness_max_concurrent_requests,
         rpc_retry,
+        per_attempt_timeout,
         ..rpc_defaults
     }
     .with_metrics(Arc::new(metrics::ValidatorMetrics));
@@ -253,9 +272,7 @@ pub async fn run() -> Result<()> {
         override_ms(args.poll_interval_ms, pipeline_config.poll_interval);
     pipeline_config.error_restart_delay =
         override_ms(args.error_restart_delay_ms, pipeline_config.error_restart_delay);
-    // Stay 3 blocks behind the remote tip so the upstream witness generator has headroom
-    // to finish the block we'd otherwise race it for.
-    pipeline_config.tip_buffer = 3;
+    pipeline_config.tip_buffer = args.tip_buffer.unwrap_or(DEFAULT_TIP_BUFFER);
 
     let result = workers::run_with_signals(
         client,

@@ -31,6 +31,18 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
+/// Argv prefix for tests that exercise an *optional* flag — both required endpoints are
+/// already supplied so the parse only depends on the flag under test.
+const BASE_ARGS: &[&str] = &[
+    "stateless-validator",
+    "--data-dir",
+    "/tmp/x",
+    "--rpc-endpoint",
+    "http://rpc",
+    "--witness-endpoint",
+    "http://w",
+];
+
 /// Verifies that an endpoint flag accepts repeated flags, CSV values, and env var —
 /// ensuring container deployments configured purely via env are not silently limited
 /// to one endpoint (clap's `value_delimiter` applies to env-var values too).
@@ -76,60 +88,51 @@ fn rpc_endpoint_accepts_multiple_forms() {
     );
 }
 
-/// Verifies that a concurrency cap flag parses as `Some(n)` via CLI and env var,
-/// and omission leaves the value `None` (unbounded).
-fn assert_concurrency_flag(
+/// Verifies that an optional numeric flag parses as `Some(n)` via CLI and env var,
+/// and omission leaves the value `None`.
+fn assert_optional_numeric_flag<T>(
     flag: &str,
     env: &str,
-    base: &[&str],
-    extract: impl Fn(CommandLineArgs) -> Option<usize>,
-) {
+    extract: impl Fn(CommandLineArgs) -> Option<T>,
+) where
+    T: std::str::FromStr + std::fmt::Debug + PartialEq,
+    T::Err: std::fmt::Debug,
+{
     let guard = stateless_test_utils::env::env_lock();
     let parse = |extra: &[&str]| {
-        extract(CommandLineArgs::try_parse_from(base.iter().chain(extra)).unwrap())
+        extract(CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra)).unwrap())
     };
 
     assert_eq!(parse(&[]), None);
-    assert_eq!(parse(&[flag, "7"]), Some(7));
+    assert_eq!(parse(&[flag, "7"]), Some("7".parse().unwrap()));
 
     let from_env = stateless_test_utils::env::with_env_var(&guard, env, "12", || parse(&[]));
-    assert_eq!(from_env, Some(12));
+    assert_eq!(from_env, Some("12".parse().unwrap()));
 }
 
 #[test]
 fn data_max_concurrent_requests_flag_and_env() {
-    assert_concurrency_flag(
+    assert_optional_numeric_flag::<usize>(
         "--data-max-concurrent-requests",
         "STATELESS_VALIDATOR_DATA_MAX_CONCURRENT_REQUESTS",
-        &[
-            "stateless-validator",
-            "--data-dir",
-            "/tmp/x",
-            "--rpc-endpoint",
-            "http://rpc",
-            "--witness-endpoint",
-            "http://w",
-        ],
         |a| a.data_max_concurrent_requests,
     );
 }
 
 #[test]
 fn witness_max_concurrent_requests_flag_and_env() {
-    assert_concurrency_flag(
+    assert_optional_numeric_flag::<usize>(
         "--witness-max-concurrent-requests",
         "STATELESS_VALIDATOR_WITNESS_MAX_CONCURRENT_REQUESTS",
-        &[
-            "stateless-validator",
-            "--data-dir",
-            "/tmp/x",
-            "--rpc-endpoint",
-            "http://rpc",
-            "--witness-endpoint",
-            "http://w",
-        ],
         |a| a.witness_max_concurrent_requests,
     );
+}
+
+#[test]
+fn tip_buffer_flag_and_env() {
+    assert_optional_numeric_flag::<u64>("--tip-buffer", "STATELESS_VALIDATOR_TIP_BUFFER", |a| {
+        a.tip_buffer
+    });
 }
 
 /// `canonical_chain_max_length` must reject 0 at parse time. A value of 0 would make
@@ -137,16 +140,7 @@ fn witness_max_concurrent_requests_flag_and_env() {
 /// rolling the pipeline back to the anchor each round and looping forever.
 #[test]
 fn canonical_chain_max_length_rejects_zero() {
-    let base = [
-        "stateless-validator",
-        "--data-dir",
-        "/tmp/x",
-        "--rpc-endpoint",
-        "http://rpc",
-        "--witness-endpoint",
-        "http://w",
-    ];
-    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(base.iter().chain(extra));
+    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
 
     assert_eq!(parse(&[]).unwrap().canonical_chain_max_length, None);
     assert_eq!(

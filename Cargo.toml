@@ -45,8 +45,8 @@ alloy-signer-local = "1.0.23"
 alloy-trie = { version = "0.9.0", default-features = false }
 
 # mega
-mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "4e4d85cc8202ec4980ec4fa0b6f50666c9d7e92e", default-features = false }
-salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "2395aa1db435d41229b4d280cb49c1f8c82bb3a4", default-features = false }
+mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "09ceb5d3f91fcec61d4f40fa2a67d13d7c1ab245", default-features = false }
+salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "a04647065f12dbd8461dc40569731656d160d694", default-features = false }
 
 # op
 op-alloy-network = { version = "0.18.12", default-features = false }

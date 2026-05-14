@@ -107,10 +107,10 @@ Each command-line flag has an equivalent environment variable:
 - `STATELESS_VALIDATOR_METRICS_PORT` → `--metrics-port`
 
 **Logging Configuration:**
-- `STATELESS_VALIDATOR_LOG_FILE_DIRECTORY`: Directory for log files; enables file logging when set.
+- `STATELESS_LOG_FILE_DIRECTORY`: Directory for log files; enables file logging when set.
   Files rotate daily as `stateless-validator.log.YYYY-MM-DD`.
-- `STATELESS_VALIDATOR_LOG_FILE`: Log level for file output (debug|info|warn|error, default: debug)
-- `STATELESS_VALIDATOR_LOG_STDOUT`: Log level for console output (debug|info|warn|error, default: info)
+- `STATELESS_LOG_FILE`: Log level for file output (debug|info|warn|error, default: debug)
+- `STATELESS_LOG_STDOUT`: Log level for console output (debug|info|warn|error, default: info)
 
 Command-line arguments take precedence over environment variables.
 

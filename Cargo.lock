@@ -1157,7 +1157,7 @@ checksum = "7b7e4c2464d97fe331d41de9d5db0def0a96f4d823b8b32a2efd503578988973"
 [[package]]
 name = "banderwagon"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=2395aa1db435d41229b4d280cb49c1f8c82bb3a4#2395aa1db435d41229b4d280cb49c1f8c82bb3a4"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=a04647065f12dbd8461dc40569731656d160d694#a04647065f12dbd8461dc40569731656d160d694"
 dependencies = [
  "ark-ec 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
  "ark-ed-on-bls12-381-bandersnatch",
@@ -2885,7 +2885,11 @@ dependencies = [
 [[package]]
 name = "ipa-multipoint"
 version = "0.1.0"
+<<<<<<< HEAD
 source = "git+https://github.com/megaeth-labs/salt.git?rev=2395aa1db435d41229b4d280cb49c1f8c82bb3a4#2395aa1db435d41229b4d280cb49c1f8c82bb3a4"
+=======
+source = "git+https://github.com/megaeth-labs/salt.git?rev=a04647065f12dbd8461dc40569731656d160d694#a04647065f12dbd8461dc40569731656d160d694"
+>>>>>>> main
 dependencies = [
  "banderwagon",
  "hex",
@@ -3263,7 +3267,7 @@ dependencies = [
 [[package]]
 name = "mega-evm"
 version = "1.5.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=4e4d85cc8202ec4980ec4fa0b6f50666c9d7e92e#4e4d85cc8202ec4980ec4fa0b6f50666c9d7e92e"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=09ceb5d3f91fcec61d4f40fa2a67d13d7c1ab245#09ceb5d3f91fcec61d4f40fa2a67d13d7c1ab245"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3290,7 +3294,7 @@ dependencies = [
 [[package]]
 name = "mega-system-contracts"
 version = "1.5.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=4e4d85cc8202ec4980ec4fa0b6f50666c9d7e92e#4e4d85cc8202ec4980ec4fa0b6f50666c9d7e92e"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=09ceb5d3f91fcec61d4f40fa2a67d13d7c1ab245#09ceb5d3f91fcec61d4f40fa2a67d13d7c1ab245"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -3419,7 +3423,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5123,8 +5127,8 @@ checksum = "dd29631678d6fb0903b69223673e122c32e9ae559d0960a38d574695ebc0ea15"
 
 [[package]]
 name = "salt"
-version = "1.0.1"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=2395aa1db435d41229b4d280cb49c1f8c82bb3a4#2395aa1db435d41229b4d280cb49c1f8c82bb3a4"
+version = "1.0.3"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=a04647065f12dbd8461dc40569731656d160d694#a04647065f12dbd8461dc40569731656d160d694"
 dependencies = [
  "auto_impl",
  "banderwagon",
@@ -5139,6 +5143,14 @@ dependencies = [
  "serde_arrays",
  "thiserror 2.0.17",
  "zerocopy 0.7.35",
+]
+
+[[package]]
+name = "salt-macros"
+version = "0.1.0"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=a04647065f12dbd8461dc40569731656d160d694#a04647065f12dbd8461dc40569731656d160d694"
+dependencies = [
+ "rayon",
 ]
 
 [[package]]

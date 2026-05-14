@@ -149,31 +149,6 @@ fn build_file_writer(
     Ok((non_blocking, guard))
 }
 
-/// Migrate legacy `STATELESS_VALIDATOR_LOG_*` env vars to the new `STATELESS_LOG_*` names.
-/// Only copies when the new var is not already set, so the new name always takes precedence.
-///
-/// Must be called **before** `clap::Parser::parse()` so that clap sees the migrated values.
-///
-/// # Safety
-///
-/// This mutates process-global environment state. Call it early in `main()` before
-/// spawning any threads or starting async runtimes.
-pub fn migrate_legacy_env_vars() {
-    const LEGACY_MAP: &[(&str, &str)] = &[
-        ("STATELESS_VALIDATOR_LOG_STDOUT", "STATELESS_LOG_STDOUT"),
-        ("STATELESS_VALIDATOR_LOG_FILE", "STATELESS_LOG_FILE"),
-        ("STATELESS_VALIDATOR_LOG_FILE_DIRECTORY", "STATELESS_LOG_FILE_DIRECTORY"),
-    ];
-    for &(old, new) in LEGACY_MAP {
-        if std::env::var(new).is_err() &&
-            let Ok(val) = std::env::var(old)
-        {
-            // SAFETY: called before any multithreaded runtime is started.
-            unsafe { std::env::set_var(new, val) };
-        }
-    }
-}
-
 impl LogArgs {
     /// Initialize the global tracing subscriber based on the current configuration.
     ///

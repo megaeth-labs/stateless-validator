@@ -202,6 +202,14 @@ struct Args {
     #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_MAX_CONCURRENT_REQUESTS")]
     witness_max_concurrent_requests: Option<usize>,
 
+    /// Per-attempt RPC timeout (milliseconds). Must be ≥ 100ms.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_RPC_PER_ATTEMPT_TIMEOUT_MS",
+        value_parser = clap::value_parser!(u64).range(100..),
+    )]
+    rpc_per_attempt_timeout_ms: Option<u64>,
+
     /// Logging configuration.
     #[command(flatten)]
     log: LogArgs,
@@ -284,10 +292,16 @@ async fn main() -> Result<()> {
     // Initialize components
     let data_apis: Vec<&str> = args.rpc_endpoint.iter().map(String::as_str).collect();
     let witness_apis: Vec<&str> = args.witness_endpoint.iter().map(String::as_str).collect();
+    let rpc_defaults = RpcClientConfig::trace_server();
+    let per_attempt_timeout = args
+        .rpc_per_attempt_timeout_ms
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(rpc_defaults.per_attempt_timeout);
     let rpc_config = RpcClientConfig {
         data_max_concurrent_requests: args.data_max_concurrent_requests,
         witness_max_concurrent_requests: args.witness_max_concurrent_requests,
-        ..RpcClientConfig::trace_server()
+        per_attempt_timeout,
+        ..rpc_defaults
     }
     .with_metrics(Arc::new(metrics::TraceRpcMetrics));
     let rpc_client =
