@@ -74,9 +74,10 @@ impl ChainSpec {
     /// `rex5InitialSequencer` / `rex5InitialAdmin` addresses; both are validated immediately so a
     /// misconfigured genesis fails at load rather than at the first Rex5 block.
     pub fn from_genesis(genesis: Genesis) -> Self {
-        // extract megaeth hardforks from genesis
-        let megaeth_hardforks =
-            MegaethGenesisHardforks::extract_from(&genesis.config.extra_fields).unwrap_or_default();
+        // A malformed `rex5Time` treated as "Rex5 absent" would skip the bootstrap-required
+        // check and diverge from mega-reth at the activation timestamp, so surface parse errors.
+        let megaeth_hardforks = MegaethGenesisHardforks::extract_from(&genesis.config.extra_fields)
+            .unwrap_or_else(|err| panic!("malformed MegaETH hardforks in genesis: {err}"));
         let rex5_scheduled = megaeth_hardforks.rex_5_time.is_some();
         let mut megaeth_hardforks = megaeth_hardforks.into_vec();
 
@@ -155,8 +156,10 @@ pub struct MegaethGenesisHardforks {
 
 impl MegaethGenesisHardforks {
     /// Extract the MegaETH genesis hardforks from a genesis file.
-    pub fn extract_from(others: &OtherFields) -> Option<Self> {
-        others.deserialize_as().ok()
+    ///
+    /// Absent fields deserialize to `None`; present-but-malformed fields return an error.
+    pub fn extract_from(others: &OtherFields) -> serde_json::Result<Self> {
+        others.deserialize_as()
     }
 
     /// Convert the MegaETH genesis hardforks into a vector of hardforks and their conditions.
@@ -281,7 +284,7 @@ mod tests {
         }
         "#;
         let fields = serde_json::from_str::<OtherFields>(genesis_info).unwrap();
-        let hardforks = MegaethGenesisHardforks::extract_from(&fields).unwrap();
+        let hardforks = MegaethGenesisHardforks::extract_from(&fields).expect("well-formed");
         assert_eq!(hardforks.mini_rex_time, Some(1));
         assert_eq!(hardforks.mini_rex_1_time, Some(2));
         assert_eq!(hardforks.mini_rex_2_time, Some(3));
@@ -291,6 +294,14 @@ mod tests {
         assert_eq!(hardforks.rex_3_time, Some(7));
         assert_eq!(hardforks.rex_4_time, Some(8));
         assert_eq!(hardforks.rex_5_time, Some(9));
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed MegaETH hardforks in genesis")]
+    fn test_chain_spec_malformed_rex5_time_panics() {
+        let mut genesis = Genesis::default();
+        genesis.config.extra_fields.insert_value("rex5Time".to_string(), "not-a-number").unwrap();
+        let _ = ChainSpec::from_genesis(genesis);
     }
 
     #[test]
