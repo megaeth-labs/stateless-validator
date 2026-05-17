@@ -11,22 +11,10 @@ use crate::{db::BlockMeta, pipeline::config::ErrorAction};
 ///
 /// Each binary provides its own implementation that decides *how* to fetch a block
 /// (which RPC calls, what transformations, what metrics to record).
-/// The pipeline only calls these methods — it never touches network types directly.
+/// The pipeline only calls these four methods — it never touches network types directly.
 pub trait BlockFetcher: Send + Sync + 'static {
     /// Data produced per block, fed into [`BlockProcessor::process`].
     type Output: Send + 'static;
-
-    /// Optional pre-flight: block until the data needed to satisfy `fetch(block_number)` is
-    /// available upstream, or return `Err` to fail-fast. Default: no-op.
-    ///
-    /// Pipelines whose upstream produces data lazily (e.g. a witness server that emits
-    /// witnesses after blocks are committed) implement this to retry-poll until the
-    /// underlying record exists, so `fetch` itself can be a single transport call.
-    /// The pipeline calls this inside the per-block spawned task, so a wait on one block
-    /// does not stall fetches for other in-flight blocks.
-    fn wait_until_available(&self, _block_number: u64) -> impl Future<Output = Result<()>> + Send {
-        async { Ok(()) }
-    }
 
     /// Fetch a complete block at the given number.
     fn fetch(&self, block_number: u64) -> impl Future<Output = Result<Self::Output>> + Send;
@@ -44,9 +32,6 @@ pub trait BlockFetcher: Send + Sync + 'static {
 /// Blanket implementation so `Arc<F>` also implements `BlockFetcher`.
 impl<F: BlockFetcher> BlockFetcher for Arc<F> {
     type Output = F::Output;
-    fn wait_until_available(&self, block_number: u64) -> impl Future<Output = Result<()>> + Send {
-        (**self).wait_until_available(block_number)
-    }
     fn fetch(&self, block_number: u64) -> impl Future<Output = Result<Self::Output>> + Send {
         (**self).fetch(block_number)
     }

@@ -70,17 +70,8 @@ impl<F: BlockFetcher> FetcherState<F> {
     fn spawn(&mut self, fetcher: &Arc<F>, bn: u64) {
         let fetcher = fetcher.clone();
         let span = info_span!("fetch_block", block_number = bn);
-        let handle = self.tasks.spawn(
-            async move {
-                // Pre-flight wait — default no-op; full-node pipelines use it to retry-poll
-                // for data that's produced lazily upstream (e.g. witness availability).
-                if let Err(e) = fetcher.wait_until_available(bn).await {
-                    return (bn, Err(e));
-                }
-                (bn, fetcher.fetch(bn).await)
-            }
-            .instrument(span),
-        );
+        let handle =
+            self.tasks.spawn(async move { (bn, fetcher.fetch(bn).await) }.instrument(span));
         self.task_to_block.insert(handle.id(), bn);
         self.in_flight_blocks.insert(bn);
     }
