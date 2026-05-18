@@ -241,7 +241,9 @@ async fn setup_mock_rpc_server(
 
     module
         .register_method("eth_getBlockByNumber", |params, ctx, _| {
-            let (hex_number, full_block): (String, bool) = params.parse().unwrap();
+            let (hex_number, full_block): (String, bool) = params
+                .parse()
+                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
             let block_number = u64::from_str_radix(&hex_number[2..], 16).unwrap_or(0);
 
             let block = ctx
