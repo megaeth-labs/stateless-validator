@@ -3256,7 +3256,7 @@ dependencies = [
 [[package]]
 name = "mega-evm"
 version = "1.5.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=09ceb5d3f91fcec61d4f40fa2a67d13d7c1ab245#09ceb5d3f91fcec61d4f40fa2a67d13d7c1ab245"
+source = "git+https://github.com/megaeth-labs/mega-evm-internal.git?rev=89f2127046ae7709f0b6ce33bddca0e4da388f55#89f2127046ae7709f0b6ce33bddca0e4da388f55"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3278,12 +3278,13 @@ dependencies = [
  "revm",
  "serde",
  "thiserror 2.0.17",
+ "tracing",
 ]
 
 [[package]]
 name = "mega-system-contracts"
 version = "1.5.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=09ceb5d3f91fcec61d4f40fa2a67d13d7c1ab245#09ceb5d3f91fcec61d4f40fa2a67d13d7c1ab245"
+source = "git+https://github.com/megaeth-labs/mega-evm-internal.git?rev=89f2127046ae7709f0b6ce33bddca0e4da388f55#89f2127046ae7709f0b6ce33bddca0e4da388f55"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
