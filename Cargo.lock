@@ -5610,6 +5610,7 @@ dependencies = [
  "salt",
  "serde",
  "stateless-core",
+ "stateless-test-utils",
  "thiserror 2.0.17",
  "tokio",
  "tokio-util",

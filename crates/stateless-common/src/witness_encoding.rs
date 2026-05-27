@@ -1,0 +1,142 @@
+//! Shared witness wire-format helpers for RPC producers and consumers.
+//!
+//! This module encodes and decodes the temporary compatibility contract used by
+//! `mega_getBlockWitness`:
+//! `v0:base64(zstd(level=9, bincode-legacy((SaltWitness, MptWitness))))`.
+
+use std::io;
+
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use salt::SaltWitness;
+use stateless_core::withdrawals::MptWitness;
+
+/// Version prefix for the RPC response format:
+/// `"v0:" + base64(zstd(level=9, bincode-legacy((SaltWitness, MptWitness))))`.
+pub const WITNESS_RESPONSE_VERSION_PREFIX: &str = "v0:";
+
+/// Errors produced while serializing or compressing a witness payload.
+#[derive(Debug, thiserror::Error)]
+pub enum WitnessEncodingError {
+    #[error("failed to serialize witness: {0}")]
+    Serialize(#[source] bincode::error::EncodeError),
+    #[error("failed to compress witness payload: {0}")]
+    Compress(#[from] io::Error),
+}
+
+/// Errors produced while decoding a witness payload or RPC response.
+#[derive(Debug, thiserror::Error)]
+pub enum WitnessDecodingError {
+    #[error("witness response missing '{WITNESS_RESPONSE_VERSION_PREFIX}' prefix")]
+    MissingPrefix,
+    #[error("failed to decode witness base64 payload: {0}")]
+    Base64(#[from] base64::DecodeError),
+    #[error("failed to decompress witness payload: {0}")]
+    Decompress(#[from] io::Error),
+    #[error("failed to deserialize witness: {0}")]
+    Deserialize(#[source] bincode::error::DecodeError),
+}
+
+/// Serializes and compresses the witness tuple into the binary payload carried by
+/// the versioned RPC response.
+pub fn compress_witness_payload(
+    salt_witness: &SaltWitness,
+    withdrawal_witness: &MptWitness,
+) -> Result<(usize, Vec<u8>), WitnessEncodingError> {
+    let original_data = bincode::serde::encode_to_vec(
+        (salt_witness, withdrawal_witness),
+        bincode::config::legacy(),
+    )
+    .map_err(WitnessEncodingError::Serialize)?;
+    let original_size = original_data.len();
+    let compressed = zstd::encode_all(original_data.as_slice(), 9)?;
+    Ok((original_size, compressed))
+}
+
+/// Decompresses and deserializes the binary payload carried by the versioned RPC
+/// response.
+pub fn decompress_witness_payload(
+    compressed: &[u8],
+) -> Result<(SaltWitness, MptWitness), WitnessDecodingError> {
+    let decompressed = zstd::decode_all(compressed)?;
+    let (witness, _) = bincode::serde::decode_from_slice(&decompressed, bincode::config::legacy())
+        .map_err(WitnessDecodingError::Deserialize)?;
+    Ok(witness)
+}
+
+/// Encodes the witness tuple as a versioned RPC response string.
+pub fn encode_witness_response(
+    salt_witness: &SaltWitness,
+    withdrawal_witness: &MptWitness,
+) -> Result<String, WitnessEncodingError> {
+    let (_, compressed) = compress_witness_payload(salt_witness, withdrawal_witness)?;
+    Ok(format!("{WITNESS_RESPONSE_VERSION_PREFIX}{}", BASE64.encode(compressed)))
+}
+
+/// Decodes a versioned RPC response string into the witness tuple.
+pub fn decode_witness_response(
+    response: &str,
+) -> Result<(SaltWitness, MptWitness), WitnessDecodingError> {
+    let payload = response
+        .strip_prefix(WITNESS_RESPONSE_VERSION_PREFIX)
+        .ok_or(WitnessDecodingError::MissingPrefix)?;
+    let compressed = BASE64.decode(payload)?;
+    decompress_witness_payload(&compressed)
+}
+
+#[cfg(test)]
+mod tests {
+    use stateless_test_utils::fixtures::TestFixtures;
+
+    use super::*;
+
+    fn first_fixture_witness() -> (SaltWitness, MptWitness) {
+        let fixtures = TestFixtures::mainnet();
+        let (_, hash) = fixtures
+            .paired_blocks()
+            .into_iter()
+            .next()
+            .expect("mainnet fixtures should contain paired witnesses");
+        let salt_witness = fixtures.salt_witnesses[&hash].clone();
+        let (mpt_witness, _): (MptWitness, usize) = bincode::serde::decode_from_slice(
+            &fixtures.mpt_witness_bytes[&hash],
+            bincode::config::legacy(),
+        )
+        .expect("fixture MPT witness should decode");
+        (salt_witness, mpt_witness)
+    }
+
+    #[test]
+    fn compress_witness_payload_roundtrip() {
+        let (salt_witness, mpt_witness) = first_fixture_witness();
+
+        let (original_size, compressed) = compress_witness_payload(&salt_witness, &mpt_witness)
+            .expect("compression should succeed");
+        let decompressed =
+            zstd::decode_all(compressed.as_slice()).expect("decompression should succeed");
+        let (decoded, _): ((SaltWitness, MptWitness), usize) =
+            bincode::serde::decode_from_slice(&decompressed, bincode::config::legacy())
+                .expect("deserialization should succeed");
+
+        assert_eq!(original_size, decompressed.len());
+        assert_eq!(decoded.0, salt_witness);
+        assert_eq!(decoded.1, mpt_witness);
+    }
+
+    #[test]
+    fn encode_witness_response_roundtrip() {
+        let (salt_witness, mpt_witness) = first_fixture_witness();
+
+        let encoded =
+            encode_witness_response(&salt_witness, &mpt_witness).expect("encoding should succeed");
+        let decoded = decode_witness_response(&encoded).expect("decoding should succeed");
+
+        assert_eq!(decoded.0, salt_witness);
+        assert_eq!(decoded.1, mpt_witness);
+    }
+
+    #[test]
+    fn decode_witness_response_requires_prefix() {
+        let err = decode_witness_response("not-versioned").expect_err("missing prefix should fail");
+        assert!(matches!(err, WitnessDecodingError::MissingPrefix));
+    }
+}

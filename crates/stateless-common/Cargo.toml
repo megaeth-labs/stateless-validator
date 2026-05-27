@@ -47,4 +47,5 @@ zstd.workspace = true
 [dev-dependencies]
 jsonrpsee.workspace = true
 kanal.workspace = true
+stateless-test-utils = { path = "../stateless-test-utils" }
 tokio-util.workspace = true

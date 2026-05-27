@@ -37,7 +37,6 @@ use std::{
 use alloy_primitives::{B256, Bytes, U64};
 use alloy_provider::{Provider, ProviderBuilder, RootProvider};
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag, Header};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use eyre::{Context, Result, ensure, eyre};
 use futures::future;
 use op_alloy_network::Optimism;
@@ -51,6 +50,7 @@ use tracing::{trace, warn};
 
 use crate::{
     metrics::{RpcMethod, RpcMetrics},
+    witness_encoding::decode_witness_response,
     witness_size::WitnessSizeBreakdown,
 };
 
@@ -1028,8 +1028,8 @@ async fn do_get_header(
 
 /// Fetches and decodes witness data from a single RPC provider (one attempt, no retry).
 ///
-/// Format: `"v0:<base64>"` string → base64-decode → zstd-decompress → bincode-legacy-decode
-/// into `(SaltWitness, MptWitness)`.
+/// Decodes the versioned `mega_getBlockWitness` response with
+/// [`decode_witness_response`](crate::decode_witness_response).
 async fn fetch_witness_raw(
     provider: &RootProvider,
     number: u64,
@@ -1045,16 +1045,8 @@ async fn fetch_witness_raw(
     let decode_start = Instant::now();
     let (salt_witness, mpt_witness) =
         tokio::task::spawn_blocking(move || -> Result<(SaltWitness, MptWitness)> {
-            let b64_data = encoded
-                .strip_prefix("v0:")
-                .ok_or_else(|| eyre!("Witness response missing 'v0:' prefix"))?;
-            let compressed = BASE64.decode(b64_data).context("base64 decode failed")?;
-            let decompressed =
-                zstd::decode_all(compressed.as_slice()).context("zstd decompress failed")?;
-            let (witness, _): ((SaltWitness, MptWitness), _) =
-                bincode::serde::decode_from_slice(&decompressed, bincode::config::legacy())
-                    .context("bincode deserialize failed")?;
-            Ok(witness)
+            decode_witness_response(&encoded)
+                .map_err(|e| eyre!("failed to decode witness response: {e}"))
         })
         .await
         .context("decode task panicked")??;
@@ -1156,6 +1148,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::witness_encoding::WITNESS_RESPONSE_VERSION_PREFIX;
 
     const LOCALHOST_A: &str = "http://localhost:8545";
     const LOCALHOST_B: &str = "http://localhost:8546";
@@ -1569,7 +1562,7 @@ mod tests {
                 order.lock().unwrap().push(*label);
                 // Stub that fails base64/zstd decode, so the round continues to the next
                 // provider and we see the full routing order.
-                Ok::<_, ErrorObjectOwned>("v0:AAAA".to_string())
+                Ok::<_, ErrorObjectOwned>(format!("{WITNESS_RESPONSE_VERSION_PREFIX}AAAA"))
             })
             .unwrap();
         })
