@@ -18,7 +18,7 @@ pub const WITNESS_RESPONSE_VERSION_PREFIX: &str = "v0:";
 #[derive(Debug, thiserror::Error)]
 pub enum WitnessEncodingError {
     #[error("failed to serialize witness: {0}")]
-    Serialize(#[source] bincode::error::EncodeError),
+    Serialize(#[from] bincode::error::EncodeError),
     #[error("failed to compress witness payload: {0}")]
     Compress(#[from] io::Error),
 }
@@ -45,8 +45,7 @@ pub fn compress_witness_payload(
     let original_data = bincode::serde::encode_to_vec(
         (salt_witness, withdrawal_witness),
         bincode::config::legacy(),
-    )
-    .map_err(WitnessEncodingError::Serialize)?;
+    )?;
     let original_size = original_data.len();
     let compressed = zstd::encode_all(original_data.as_slice(), 9)?;
     Ok((original_size, compressed))
@@ -138,5 +137,17 @@ mod tests {
     fn decode_witness_response_requires_prefix() {
         let err = decode_witness_response("not-versioned").expect_err("missing prefix should fail");
         assert!(matches!(err, WitnessDecodingError::MissingPrefix));
+    }
+
+    #[test]
+    fn decode_witness_response_invalid_base64() {
+        let err = decode_witness_response("v0:!!!").expect_err("invalid base64 should fail");
+        assert!(matches!(err, WitnessDecodingError::Base64(_)));
+    }
+
+    #[test]
+    fn decode_witness_response_invalid_payload() {
+        let err = decode_witness_response("v0:AAAA").expect_err("corrupt payload should fail");
+        assert!(matches!(err, WitnessDecodingError::Decompress(_)));
     }
 }
