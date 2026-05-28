@@ -115,6 +115,28 @@ pub trait ChainStore: ContractStore {
     fn get_earliest_block(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>>;
     fn rollback_chain(&self, to_block: BlockNumber) -> StoreResult<()>;
     fn reset_to_anchor(&self, anchor: &BlockMeta) -> StoreResult<()>;
+
+    /// Hook for embedders that resolve the rollback floor externally.
+    ///
+    /// Called by the advancer when a parent-hash mismatch is detected, before
+    /// it falls back to [`find_divergence_point`](crate::pipeline::find_divergence_point).
+    ///
+    /// - **Default `Ok(None)`** — used by the standalone validator binary. The advancer runs
+    ///   `find_divergence_point` to locate the floor by walking backward against the remote
+    ///   fetcher.
+    /// - **`Ok(Some(floor))`** — used by embedders that already know the correct floor (e.g. the
+    ///   mega-reth FullNode, where state-sync's `Recovery::unwind` rewinds the validated cursor
+    ///   authoritatively before the pipeline observes the mismatch). The advancer skips the
+    ///   divergence search and rolls back to `floor` directly.
+    ///
+    /// `_mismatch_block` is the block number whose parent hash disagrees with
+    /// the in-memory tip. Implementations are free to ignore it.
+    fn resolve_reorg_floor(
+        &self,
+        _mismatch_block: BlockNumber,
+    ) -> StoreResult<Option<BlockNumber>> {
+        Ok(None)
+    }
 }
 
 /// History pruning (debug-trace-server only, where explicit pruning is needed).
