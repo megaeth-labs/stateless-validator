@@ -407,6 +407,90 @@ async fn test_chain_advancer_reorg_mid_batch_uses_persisted_tip() {
     }
 }
 
+/// Store wrapper that returns a pre-resolved rollback floor from `resolve_reorg_floor`,
+/// mirroring the mega-reth embedder where state-sync owns the canonical-chain rewind.
+struct PreResolvedFloorStore {
+    inner: MockStore,
+    floor: BlockNumber,
+}
+
+impl PreResolvedFloorStore {
+    fn new(anchor: BlockMeta, floor: BlockNumber) -> Self {
+        Self { inner: MockStore::new(anchor), floor }
+    }
+}
+
+impl crate::ContractStore for PreResolvedFloorStore {
+    fn get_contracts(&self, h: &[B256]) -> StoreResult<(HashMap<B256, Arc<Bytecode>>, Vec<B256>)> {
+        self.inner.get_contracts(h)
+    }
+    fn add_contracts(&self, c: &[(B256, Arc<Bytecode>)]) -> StoreResult<()> {
+        self.inner.add_contracts(c)
+    }
+}
+
+impl ChainStore for PreResolvedFloorStore {
+    fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>> {
+        self.inner.get_canonical_tip()
+    }
+    fn get_anchor(&self) -> StoreResult<Option<BlockMeta>> {
+        self.inner.get_anchor()
+    }
+    fn advance_chain(&self, b: &[BlockMeta]) -> StoreResult<()> {
+        self.inner.advance_chain(b)
+    }
+    fn get_block_hash(&self, n: BlockNumber) -> StoreResult<Option<BlockHash>> {
+        self.inner.get_block_hash(n)
+    }
+    fn get_earliest_block(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
+        self.inner.get_earliest_block()
+    }
+    fn rollback_chain(&self, n: BlockNumber) -> StoreResult<()> {
+        self.inner.rollback_chain(n)
+    }
+    fn reset_to_anchor(&self, a: &BlockMeta) -> StoreResult<()> {
+        self.inner.reset_to_anchor(a)
+    }
+    fn resolve_reorg_floor(
+        &self,
+        _mismatch_block: BlockNumber,
+    ) -> StoreResult<Option<BlockNumber>> {
+        Ok(Some(self.floor))
+    }
+}
+
+/// When the store pre-resolves the floor, the advancer must skip the divergence walk
+/// entirely. The mock fetcher carries *no* hashes — if `find_divergence_point` were
+/// called it would attempt `fetcher.block_hash(n)` and panic, failing the test.
+#[tokio::test]
+async fn test_chain_advancer_uses_store_resolved_floor() {
+    let tip = make_tip(10);
+    let store = PreResolvedFloorStore::new(tip.clone(), 7);
+    // No rpc_hashes — divergence walk would call fetcher.block_hash and fail.
+    let fetcher = MockFetcher { hashes: HashMap::default() };
+    let hooks = NoopHooks;
+    let (tx, rx) = kanal::bounded::<
+        std::result::Result<MockBlock, (Arc<dyn std::error::Error + Send + Sync>, ErrorAction)>,
+    >(16);
+
+    let bad_block = MockBlock {
+        number: 11,
+        hash: make_hash(11),
+        parent: BlockHash::from([0xFF; 32]),
+        state_root: B256::ZERO,
+    };
+    tx.to_async().send(Ok(bad_block)).await.unwrap();
+
+    let outcome =
+        chain_advancer(&fetcher, &store, &hooks, rx, tip, CancellationToken::new()).await.unwrap();
+    match outcome {
+        PipelineOutcome::Reorg(event) => {
+            assert_eq!(event.rollback_to, 7, "must use store-resolved floor, not walk");
+        }
+        other => panic!("Expected Reorg, got {other:?}"),
+    }
+}
+
 // find_divergence_point tests
 
 /// Minimal `DivergenceLookups` impl backed by a HashMap of block-number → hash for

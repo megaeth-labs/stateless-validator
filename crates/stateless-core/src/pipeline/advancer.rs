@@ -77,12 +77,26 @@ where
                     "Parent hash mismatch — reorg detected"
                 );
 
-                let rollback_to = match find_divergence_point(fetcher, store, persisted_tip).await {
-                    Ok(v) => v,
-                    Err(e) if e.is_fatal() => {
-                        return Ok(PipelineOutcome::Fatal(e.to_string()));
+                // Let the store short-circuit the divergence search when an embedder
+                // (e.g. mega-reth's state-sync) has already determined the rollback
+                // floor authoritatively. Default impl returns `None`, falling back to
+                // `find_divergence_point` as in the standalone binary.
+                let resolved = store.resolve_reorg_floor(next_expected)?;
+                let rollback_to = if let Some(floor) = resolved {
+                    debug!(
+                        block = next_expected,
+                        ?floor,
+                        "Store resolved reorg floor; skipping divergence search"
+                    );
+                    floor
+                } else {
+                    match find_divergence_point(fetcher, store, persisted_tip).await {
+                        Ok(v) => v,
+                        Err(e) if e.is_fatal() => {
+                            return Ok(PipelineOutcome::Fatal(e.to_string()));
+                        }
+                        Err(e) => return Err(e.into()),
                     }
-                    Err(e) => return Err(e.into()),
                 };
 
                 let depth = persisted_tip.saturating_sub(rollback_to);
