@@ -71,9 +71,8 @@ impl DivergenceError {
 /// Finds where the local chain diverges from the remote.
 ///
 /// Uses exponential search (efficient for near-tip reorgs) followed by binary search.
-/// Backend-agnostic: takes a [`DivergenceLookups`] for local chain reads (implemented
-/// automatically for every [`ChainStore`]); remote reads go through the
-/// `BlockFetcher`'s `eyre::Result`. [`DivergenceError`] wraps both.
+/// Backend-agnostic: takes a [`DivergenceLookups`] for local chain reads; remote reads go
+/// through the `BlockFetcher`'s `eyre::Result`. [`DivergenceError`] wraps both.
 #[instrument(skip_all, fields(mismatch_block), name = "find_divergence")]
 pub async fn find_divergence_point<F, L>(
     fetcher: &F,
