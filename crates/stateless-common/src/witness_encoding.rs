@@ -33,12 +33,16 @@ pub enum WitnessDecodingError {
     #[error("failed to decompress witness payload: {0}")]
     Decompress(#[from] io::Error),
     #[error("failed to deserialize witness: {0}")]
-    Deserialize(#[source] bincode::error::DecodeError),
+    Deserialize(#[from] bincode::error::DecodeError),
 }
 
 /// Serializes and compresses the witness tuple into the binary payload carried by
 /// the versioned RPC response.
-pub fn compress_witness_payload(
+///
+/// Returns `(uncompressed_size, compressed_payload)`. `uncompressed_size` is the length of
+/// the bincode-serialized tuple *before* zstd compression; producers use it on the upload
+/// path for compression-ratio statistics. [`encode_witness_response`] discards it.
+pub fn encode_witness_payload(
     salt_witness: &SaltWitness,
     withdrawal_witness: &MptWitness,
 ) -> Result<(usize, Vec<u8>), WitnessEncodingError> {
@@ -53,12 +57,11 @@ pub fn compress_witness_payload(
 
 /// Decompresses and deserializes the binary payload carried by the versioned RPC
 /// response.
-pub fn decompress_witness_payload(
+pub fn decode_witness_payload(
     compressed: &[u8],
 ) -> Result<(SaltWitness, MptWitness), WitnessDecodingError> {
     let decompressed = zstd::decode_all(compressed)?;
-    let (witness, _) = bincode::serde::decode_from_slice(&decompressed, bincode::config::legacy())
-        .map_err(WitnessDecodingError::Deserialize)?;
+    let (witness, _) = bincode::serde::decode_from_slice(&decompressed, bincode::config::legacy())?;
     Ok(witness)
 }
 
@@ -67,7 +70,7 @@ pub fn encode_witness_response(
     salt_witness: &SaltWitness,
     withdrawal_witness: &MptWitness,
 ) -> Result<String, WitnessEncodingError> {
-    let (_, compressed) = compress_witness_payload(salt_witness, withdrawal_witness)?;
+    let (_, compressed) = encode_witness_payload(salt_witness, withdrawal_witness)?;
     Ok(format!("{WITNESS_RESPONSE_VERSION_PREFIX}{}", BASE64.encode(compressed)))
 }
 
@@ -79,7 +82,7 @@ pub fn decode_witness_response(
         .strip_prefix(WITNESS_RESPONSE_VERSION_PREFIX)
         .ok_or(WitnessDecodingError::MissingPrefix)?;
     let compressed = BASE64.decode(payload)?;
-    decompress_witness_payload(&compressed)
+    decode_witness_payload(&compressed)
 }
 
 #[cfg(test)]
@@ -105,10 +108,10 @@ mod tests {
     }
 
     #[test]
-    fn compress_witness_payload_roundtrip() {
+    fn encode_witness_payload_roundtrip() {
         let (salt_witness, mpt_witness) = first_fixture_witness();
 
-        let (original_size, compressed) = compress_witness_payload(&salt_witness, &mpt_witness)
+        let (original_size, compressed) = encode_witness_payload(&salt_witness, &mpt_witness)
             .expect("compression should succeed");
         let decompressed =
             zstd::decode_all(compressed.as_slice()).expect("decompression should succeed");
@@ -149,5 +152,16 @@ mod tests {
     fn decode_witness_response_invalid_payload() {
         let err = decode_witness_response("v0:AAAA").expect_err("corrupt payload should fail");
         assert!(matches!(err, WitnessDecodingError::Decompress(_)));
+    }
+
+    #[test]
+    fn decode_witness_response_invalid_witness() {
+        // Valid base64 and a valid zstd frame, but the decompressed bytes are not a
+        // bincode-encoded `(SaltWitness, MptWitness)` tuple.
+        let compressed =
+            zstd::encode_all(&b"not a witness"[..], 9).expect("compression should succeed");
+        let response = format!("{WITNESS_RESPONSE_VERSION_PREFIX}{}", BASE64.encode(compressed));
+        let err = decode_witness_response(&response).expect_err("corrupt witness should fail");
+        assert!(matches!(err, WitnessDecodingError::Deserialize(_)));
     }
 }

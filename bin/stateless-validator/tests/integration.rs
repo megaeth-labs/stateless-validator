@@ -7,7 +7,6 @@ use std::{collections::HashMap, sync::Arc};
 
 use alloy_primitives::{B256, BlockHash};
 use alloy_rpc_types_eth::Block;
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use clap::Parser;
 use jsonrpsee::{
     RpcModule,
@@ -16,7 +15,7 @@ use jsonrpsee::{
 use jsonrpsee_types::error::{
     CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
 };
-use stateless_common::{RpcClient, WitnessRequestKeys};
+use stateless_common::{RpcClient, WitnessRequestKeys, encode_witness_response};
 use stateless_core::{
     ChainStore, ContractStore, PipelineConfig, db::BlockMeta, pipeline::run_pipeline,
     withdrawals::MptWitness,
@@ -353,25 +352,9 @@ async fn setup_mock_rpc_server(
                 )
             })?;
 
-            let encoded = bincode::serde::encode_to_vec(
-                &(salt_witness, mpt_witness),
-                bincode::config::legacy(),
-            )
-            .map_err(|e| {
-                make_rpc_error(
-                    CALL_EXECUTION_FAILED_CODE,
-                    format!("Failed to serialize witness: {e}"),
-                )
-            })
-            .and_then(|raw| {
-                zstd::encode_all(raw.as_slice(), 9).map_err(|e| {
-                    make_rpc_error(
-                        CALL_EXECUTION_FAILED_CODE,
-                        format!("Failed to compress witness: {e}"),
-                    )
-                })
-            })
-            .map(|compressed| format!("v0:{}", BASE64.encode(compressed)))?;
+            let encoded = encode_witness_response(&salt_witness, &mpt_witness).map_err(|e| {
+                make_rpc_error(CALL_EXECUTION_FAILED_CODE, format!("Failed to encode witness: {e}"))
+            })?;
 
             Ok::<_, ErrorObject<'static>>(encoded)
         })

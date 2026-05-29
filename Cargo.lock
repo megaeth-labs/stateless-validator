@@ -5702,7 +5702,6 @@ dependencies = [
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rpc-types-eth",
- "base64",
  "bincode 2.0.1",
  "clap",
  "eyre",
@@ -5725,7 +5724,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber 0.3.23",
- "zstd",
 ]
 
 [[package]]
