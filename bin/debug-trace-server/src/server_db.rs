@@ -12,10 +12,10 @@ use rayon::prelude::*;
 use redb::{ReadableDatabase, ReadableTable};
 use revm::state::Bytecode;
 use stateless_core::{
-    LightWitness,
+    DivergenceLookups, LightWitness,
     db::{
-        BlockMeta, BlockStore, ChainStore, ContractStore, MissingDataKind, PrunableChainStore,
-        StoreError, StoreResult, StoreResultExt,
+        BlockMeta, ChainStore, ContractStore, MissingDataKind, StoreError, StoreResult,
+        StoreResultExt,
     },
 };
 use stateless_db::{
@@ -24,6 +24,24 @@ use stateless_db::{
     read_block_hash, read_canonical_tip, read_contracts, read_earliest_block, write_add_contracts,
     write_advance_chain, write_reset_to_anchor, write_rollback_chain,
 };
+
+/// Block/witness storage + history pruning — **debug-trace-server-only**. This capability is
+/// specific to this bin (no other scenario stores raw blocks/witnesses or prunes a per-block
+/// chain on a schedule), so it lives here rather than as a stateless-core trait.
+///
+/// Supertraits: [`ChainStore`] (chain cursors) + [`DivergenceLookups`] (this bin bisects on reorg,
+/// and the DB-range metric reads `get_earliest`). `prune_chain` is folded in here — the old
+/// separate `PrunableChainStore` had the same single implementor (`ServerDB`) and was only ever
+/// reached through `dyn BlockStore`.
+pub trait BlockStore: ChainStore + DivergenceLookups {
+    /// Delete chain history strictly below `before_block`. Returns the number of blocks pruned.
+    fn prune_chain(&self, before_block: BlockNumber) -> StoreResult<u64>;
+    fn store_block_data(&self, blocks: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()>;
+    fn get_block_and_witness(
+        &self,
+        block_hash: BlockHash,
+    ) -> StoreResult<(Block<Transaction>, LightWitness)>;
+}
 
 /// Block storage and chain tracking database for debug-trace-server.
 pub struct ServerDB {
@@ -232,10 +250,6 @@ impl ChainStore for ServerDB {
         read_block_hash(&self.database, block_number)
     }
 
-    fn get_earliest_block(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
-        read_earliest_block(&self.database)
-    }
-
     fn rollback_chain(&self, to_block: BlockNumber) -> StoreResult<()> {
         write_rollback_chain(&self.database, to_block)
     }
@@ -245,13 +259,21 @@ impl ChainStore for ServerDB {
     }
 }
 
-impl PrunableChainStore for ServerDB {
-    fn prune_chain(&self, before_block: BlockNumber) -> StoreResult<u64> {
-        ServerDB::prune_history(self, before_block)
+impl DivergenceLookups for ServerDB {
+    fn get_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>> {
+        read_block_hash(&self.database, block_number)
+    }
+
+    fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
+        read_earliest_block(&self.database)
     }
 }
 
 impl BlockStore for ServerDB {
+    fn prune_chain(&self, before_block: BlockNumber) -> StoreResult<u64> {
+        ServerDB::prune_history(self, before_block)
+    }
+
     fn store_block_data(&self, blocks: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
         ServerDB::store_block_data(self, blocks)
     }
@@ -354,7 +376,7 @@ mod tests {
         let tip = ChainStore::get_canonical_tip(&db).unwrap().unwrap();
         assert_eq!(tip.block_number, 12);
 
-        let earliest = ChainStore::get_earliest_block(&db).unwrap().unwrap();
+        let earliest = DivergenceLookups::get_earliest(&db).unwrap().unwrap();
         assert_eq!(earliest.0, 10);
 
         let hash = ChainStore::get_block_hash(&db, 11).unwrap().unwrap();
@@ -406,7 +428,7 @@ mod tests {
         let metas: Vec<BlockMeta> = (1..=10).map(make_block_meta).collect();
         ChainStore::advance_chain(&db, &metas).unwrap();
 
-        let pruned = PrunableChainStore::prune_chain(&db, 6).unwrap();
+        let pruned = BlockStore::prune_chain(&db, 6).unwrap();
         assert_eq!(pruned, 5);
 
         for n in 1..=5 {

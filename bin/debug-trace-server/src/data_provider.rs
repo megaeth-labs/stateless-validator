@@ -36,13 +36,14 @@ use revm::state::Bytecode;
 use salt::SaltWitness;
 use stateless_common::{CodeFetchError, RpcClient, RpcDeadlineExceeded, estimate_witness_size};
 use stateless_core::{
-    BlockStore, ContractStore, LightWitness, StoreResult, db::StoreError, withdrawals::MptWitness,
+    ContractStore, LightWitness, StoreResult, db::StoreError, withdrawals::MptWitness,
 };
 use stateless_db::ContractCache;
 use tracing::{debug, instrument, trace, warn};
 
-use crate::metrics::{
-    ChainSyncMetrics, DataSourceMetrics, SingleFlightMetrics, WitnessSourceMetrics,
+use crate::{
+    metrics::{ChainSyncMetrics, DataSourceMetrics, SingleFlightMetrics, WitnessSourceMetrics},
+    server_db::BlockStore,
 };
 
 /// Block data bundle containing all information needed for stateless execution.
