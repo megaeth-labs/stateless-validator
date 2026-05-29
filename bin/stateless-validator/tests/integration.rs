@@ -17,8 +17,8 @@ use jsonrpsee_types::error::{
 };
 use stateless_common::{RpcClient, WitnessRequestKeys, encode_witness_response};
 use stateless_core::{
-    ChainStore, ContractStore, PipelineConfig, db::BlockMeta, pipeline::run_pipeline,
-    withdrawals::MptWitness,
+    BisectResolver, ChainStore, ContractStore, PipelineConfig, db::BlockMeta,
+    pipeline::run_pipeline, withdrawals::MptWitness,
 };
 use stateless_db::ContractCache;
 use stateless_test_utils::fixtures::TestFixtures;
@@ -411,9 +411,17 @@ async fn integration_test() {
     let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
     let hooks = Arc::new(ValidatorHooks);
 
-    run_pipeline(fetcher, Arc::clone(&validator_db), processor, hooks, config, shutdown)
-        .await
-        .unwrap();
+    run_pipeline(
+        fetcher,
+        Arc::clone(&validator_db),
+        processor,
+        hooks,
+        config,
+        shutdown,
+        BisectResolver,
+    )
+    .await
+    .unwrap();
 
     // Verify all fixture blocks were validated and persisted — guards against silent
     // partial-advance failures where the pipeline returns Ok but the DB is short.

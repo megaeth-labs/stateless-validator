@@ -4,30 +4,24 @@ use alloy_primitives::{BlockHash, BlockNumber};
 use tracing::{debug, instrument};
 
 use crate::{
-    ChainStore,
     db::{StoreError, StoreResult},
     pipeline::traits::BlockFetcher,
 };
 
-/// Minimal lookup surface that [`find_divergence_point`] needs from the local chain store.
+/// The bisection contract: the lookup surface a history-owning store exposes so the pipeline can
+/// locate a reorg fork by walking local history against the remote.
 ///
-/// Extracted from `ChainStore` so tests can implement a lightweight in-memory backend
-/// without having to stub every `ChainStore` method. Every `ChainStore` blanket-implements
-/// this trait automatically.
+/// This IS the "bisectable store" abstraction — the scenarios that own a per-block chain (the
+/// standalone validator's `ValidatorDB`, the debug-trace-server's `ServerDB`) implement it
+/// directly. Scenarios with no local history (the mega-reth FullNode) never implement it and never
+/// bisect; they resolve the reorg floor via the pipeline's
+/// [`ReorgResolver`](crate::pipeline::ReorgResolver) seam instead. Kept minimal (two reads) so the
+/// `find_divergence_point` unit tests can supply a tiny in-memory mock.
 pub trait DivergenceLookups {
     /// Hash for the block at `block_number`, or `None` if it's not in local history.
     fn get_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>>;
     /// The oldest (lowest-number, highest-depth) block still in local history.
     fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>>;
-}
-
-impl<S: ChainStore + ?Sized> DivergenceLookups for S {
-    fn get_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>> {
-        ChainStore::get_block_hash(self, block_number)
-    }
-    fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
-        ChainStore::get_earliest_block(self)
-    }
 }
 
 /// Errors from [`find_divergence_point`], classified for the pipeline.

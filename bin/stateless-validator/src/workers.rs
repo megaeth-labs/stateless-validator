@@ -5,7 +5,9 @@ use std::{sync::Arc, time::Duration};
 use alloy_primitives::B256;
 use eyre::Result;
 use stateless_common::RpcClient;
-use stateless_core::{ChainStore, PipelineConfig, chain_spec::ChainSpec, pipeline::run_pipeline};
+use stateless_core::{
+    BisectResolver, ChainStore, PipelineConfig, chain_spec::ChainSpec, pipeline::run_pipeline,
+};
 use stateless_db::ContractCache;
 use tokio::{signal, task};
 use tokio_util::sync::CancellationToken;
@@ -74,6 +76,7 @@ pub async fn run_with_signals(
         hooks,
         config,
         shutdown.clone(),
+        BisectResolver,
     ));
 
     // Signal wins → drain; pipeline wins → already done.

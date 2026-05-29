@@ -24,6 +24,7 @@ mod worker;
 use std::{sync::Arc, time::Duration};
 
 use advancer::chain_advancer;
+pub use advancer::{BisectResolver, ReorgResolution, ReorgResolver};
 use config::WorkerResult;
 pub use config::{ErrorAction, PipelineConfig, PipelineOutcome, ReorgEvent};
 pub use divergence::{DivergenceError, DivergenceLookups, find_divergence_point};
@@ -37,23 +38,27 @@ use worker::spawn_workers;
 
 use crate::ChainStore;
 
-/// Runs the full pipeline: fetch → process → advance.
+/// Runs the full pipeline: fetch → process → advance, with automatic reorg restart and optional
+/// stale-data detection in the outer loop.
 ///
-/// Handles reorg restart and optional stale-data detection in the outer loop.
-/// Returns when `shutdown` is cancelled, `sync_target` is reached, or a fatal error occurs.
-pub async fn run_pipeline<F, S, P, H>(
+/// The scenario supplies the `resolver` ([`ReorgResolver`]) that decides the rollback floor on a
+/// reorg — [`BisectResolver`] for history-owning stores, or the FullNode's own resolver. Returns
+/// when `shutdown` is cancelled, `sync_target` is reached, or a fatal error occurs.
+pub async fn run_pipeline<F, S, P, H, R>(
     fetcher: Arc<F>,
     store: Arc<S>,
     processor: Arc<P>,
     hooks: Arc<H>,
     config: Arc<PipelineConfig>,
     shutdown: CancellationToken,
+    resolver: R,
 ) -> Result<()>
 where
     F: BlockFetcher<Output = P::Input>,
     S: ChainStore + 'static,
     P: BlockProcessor,
     H: PipelineHooks<Output = P::Output>,
+    R: ReorgResolver<F, S>,
 {
     loop {
         if shutdown.is_cancelled() {
@@ -82,9 +87,16 @@ where
         let worker_handles =
             spawn_workers(processor.clone(), fetch_rx, result_tx, config.concurrent_workers);
 
-        let outcome =
-            chain_advancer(&*fetcher, &*store, &*hooks, result_rx, initial_tip, shutdown.clone())
-                .await;
+        let outcome = chain_advancer(
+            &*fetcher,
+            &*store,
+            &*hooks,
+            &resolver,
+            result_rx,
+            initial_tip,
+            shutdown.clone(),
+        )
+        .await;
 
         fetcher_shutdown.cancel();
         await_handles(fetcher_handle, worker_handles, config.await_handles_timeout).await;

@@ -12,12 +12,12 @@ use eyre::Result;
 use op_alloy_rpc_types::Transaction;
 use stateless_common::RpcClient;
 use stateless_core::{
-    BlockStore, LightWitness,
+    LightWitness,
     db::BlockMeta,
     pipeline::{BlockFetcher, BlockProcessor, PipelineHooks},
 };
 
-use crate::{metrics, response_cache::ResponseCache};
+use crate::{metrics, response_cache::ResponseCache, server_db::BlockStore};
 
 /// Fetcher for the trace server: fetches blocks + witnesses, discards MPT witness,
 /// converts SALT witness to [`LightWitness`].
@@ -224,9 +224,6 @@ mod tests {
         fn get_block_hash(&self, _: BlockNumber) -> StoreResult<Option<BlockHash>> {
             Ok(None)
         }
-        fn get_earliest_block(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
-            Ok(None)
-        }
         fn rollback_chain(&self, _: BlockNumber) -> StoreResult<()> {
             Ok(())
         }
@@ -234,12 +231,18 @@ mod tests {
             Ok(())
         }
     }
-    impl stateless_core::PrunableChainStore for MockBlockStore {
+    impl stateless_core::DivergenceLookups for MockBlockStore {
+        fn get_hash(&self, _: BlockNumber) -> StoreResult<Option<BlockHash>> {
+            Ok(None)
+        }
+        fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
+            Ok(None)
+        }
+    }
+    impl BlockStore for MockBlockStore {
         fn prune_chain(&self, _: BlockNumber) -> StoreResult<u64> {
             Ok(0)
         }
-    }
-    impl stateless_core::BlockStore for MockBlockStore {
         fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
             Ok(())
         }

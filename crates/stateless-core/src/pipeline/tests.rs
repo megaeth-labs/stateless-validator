@@ -7,10 +7,12 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     BlockFetcher, BlockProcessor, DivergenceError, ErrorAction, PipelineConfig, PipelineHooks,
-    PipelineOutcome, ProcessedBlock, advancer::chain_advancer, block_fetcher,
-    find_divergence_point, run_pipeline, worker::spawn_workers,
+    PipelineOutcome, ProcessedBlock, ReorgResolution, ReorgResolver,
+    advancer::{BisectResolver, chain_advancer},
+    block_fetcher, find_divergence_point, run_pipeline,
+    worker::spawn_workers,
 };
-use crate::{ChainStore, StoreResult, db::BlockMeta};
+use crate::{ChainStore, DivergenceLookups, StoreResult, db::BlockMeta};
 
 #[test]
 fn test_pipeline_config_default_uses_cpu_count() {
@@ -106,9 +108,6 @@ impl ChainStore for MockStore {
     fn get_block_hash(&self, n: BlockNumber) -> StoreResult<Option<BlockHash>> {
         Ok(self.chain.lock().unwrap().get(&n).map(|m| m.block_hash))
     }
-    fn get_earliest_block(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
-        Ok(self.chain.lock().unwrap().first_key_value().map(|(&n, m)| (n, m.block_hash)))
-    }
     fn rollback_chain(&self, to_block: BlockNumber) -> StoreResult<()> {
         self.chain.lock().unwrap().retain(|&n, _| n <= to_block);
         Ok(())
@@ -118,6 +117,15 @@ impl ChainStore for MockStore {
         chain.clear();
         chain.insert(anchor.block_number, anchor.clone());
         Ok(())
+    }
+}
+
+impl DivergenceLookups for MockStore {
+    fn get_hash(&self, n: BlockNumber) -> StoreResult<Option<BlockHash>> {
+        Ok(self.chain.lock().unwrap().get(&n).map(|m| m.block_hash))
+    }
+    fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
+        Ok(self.chain.lock().unwrap().first_key_value().map(|(&n, m)| (n, m.block_hash)))
     }
 }
 
@@ -201,7 +209,16 @@ async fn run_advancer(
         }
     }
 
-    let result = chain_advancer(&fetcher, &store, &hooks, rx, tip, CancellationToken::new()).await;
+    let result = chain_advancer(
+        &fetcher,
+        &store,
+        &hooks,
+        &BisectResolver,
+        rx,
+        tip,
+        CancellationToken::new(),
+    )
+    .await;
     (result, store)
 }
 
@@ -279,7 +296,8 @@ async fn run_bad_block_advancer(tip: BlockMeta, blocks: Vec<BadBlock>) -> Result
         }
     }
 
-    chain_advancer(&fetcher, &store, &hooks, rx, tip, CancellationToken::new()).await
+    chain_advancer(&fetcher, &store, &hooks, &BisectResolver, rx, tip, CancellationToken::new())
+        .await
 }
 
 /// Covers the `verify_continuity` → Fatal branch in `chain_advancer` (`advancer.rs:109`).
@@ -343,7 +361,8 @@ async fn test_chain_advancer_shutdown() {
     let shutdown = CancellationToken::new();
     shutdown.cancel();
 
-    let outcome = chain_advancer(&fetcher, &store, &hooks, rx, tip, shutdown).await.unwrap();
+    let outcome =
+        chain_advancer(&fetcher, &store, &hooks, &BisectResolver, rx, tip, shutdown).await.unwrap();
     assert!(matches!(outcome, PipelineOutcome::Shutdown));
 }
 
@@ -407,65 +426,25 @@ async fn test_chain_advancer_reorg_mid_batch_uses_persisted_tip() {
     }
 }
 
-/// Store wrapper that returns a pre-resolved rollback floor from `resolve_reorg_floor`,
-/// mirroring the mega-reth embedder where state-sync owns the canonical-chain rewind.
-struct PreResolvedFloorStore {
-    inner: MockStore,
+/// Mirrors the mega-reth FullNode embedder: a `ReorgResolver` that returns a host-supplied floor
+/// directly, never bisecting (and never touching the fetcher).
+struct PreResolvedFloorResolver {
     floor: BlockNumber,
 }
 
-impl PreResolvedFloorStore {
-    fn new(anchor: BlockMeta, floor: BlockNumber) -> Self {
-        Self { inner: MockStore::new(anchor), floor }
+impl<F: BlockFetcher, S: Send + Sync> ReorgResolver<F, S> for PreResolvedFloorResolver {
+    async fn resolve(&self, _: &F, _: &S, _: u64, _: u64) -> eyre::Result<ReorgResolution> {
+        Ok(ReorgResolution::Floor(self.floor))
     }
 }
 
-impl crate::ContractStore for PreResolvedFloorStore {
-    fn get_contracts(&self, h: &[B256]) -> StoreResult<(HashMap<B256, Arc<Bytecode>>, Vec<B256>)> {
-        self.inner.get_contracts(h)
-    }
-    fn add_contracts(&self, c: &[(B256, Arc<Bytecode>)]) -> StoreResult<()> {
-        self.inner.add_contracts(c)
-    }
-}
-
-impl ChainStore for PreResolvedFloorStore {
-    fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>> {
-        self.inner.get_canonical_tip()
-    }
-    fn get_anchor(&self) -> StoreResult<Option<BlockMeta>> {
-        self.inner.get_anchor()
-    }
-    fn advance_chain(&self, b: &[BlockMeta]) -> StoreResult<()> {
-        self.inner.advance_chain(b)
-    }
-    fn get_block_hash(&self, n: BlockNumber) -> StoreResult<Option<BlockHash>> {
-        self.inner.get_block_hash(n)
-    }
-    fn get_earliest_block(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
-        self.inner.get_earliest_block()
-    }
-    fn rollback_chain(&self, n: BlockNumber) -> StoreResult<()> {
-        self.inner.rollback_chain(n)
-    }
-    fn reset_to_anchor(&self, a: &BlockMeta) -> StoreResult<()> {
-        self.inner.reset_to_anchor(a)
-    }
-    fn resolve_reorg_floor(
-        &self,
-        _mismatch_block: BlockNumber,
-    ) -> StoreResult<Option<BlockNumber>> {
-        Ok(Some(self.floor))
-    }
-}
-
-/// When the store pre-resolves the floor, the advancer must skip the divergence walk
+/// When the resolver pre-resolves the floor, the advancer must skip the divergence walk
 /// entirely. The mock fetcher carries *no* hashes — if `find_divergence_point` were
 /// called it would attempt `fetcher.block_hash(n)` and panic, failing the test.
 #[tokio::test]
 async fn test_chain_advancer_uses_store_resolved_floor() {
     let tip = make_tip(10);
-    let store = PreResolvedFloorStore::new(tip.clone(), 7);
+    let store = MockStore::new(tip.clone());
     // No rpc_hashes — divergence walk would call fetcher.block_hash and fail.
     let fetcher = MockFetcher { hashes: HashMap::default() };
     let hooks = NoopHooks;
@@ -481,8 +460,17 @@ async fn test_chain_advancer_uses_store_resolved_floor() {
     };
     tx.to_async().send(Ok(bad_block)).await.unwrap();
 
-    let outcome =
-        chain_advancer(&fetcher, &store, &hooks, rx, tip, CancellationToken::new()).await.unwrap();
+    let outcome = chain_advancer(
+        &fetcher,
+        &store,
+        &hooks,
+        &PreResolvedFloorResolver { floor: 7 },
+        rx,
+        tip,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
     match outcome {
         PipelineOutcome::Reorg(event) => {
             assert_eq!(event.rollback_to, 7, "must use store-resolved floor, not walk");
@@ -981,6 +969,7 @@ async fn run_pipeline_reaches_sync_target() {
             Arc::new(NoopHooks),
             config,
             CancellationToken::new(),
+            BisectResolver,
         ),
     )
     .await
@@ -1021,6 +1010,7 @@ async fn run_pipeline_returns_on_pre_cancelled_shutdown() {
             Arc::new(NoopHooks),
             Arc::new(PipelineConfig::default()),
             shutdown,
+            BisectResolver,
         ),
     )
     .await

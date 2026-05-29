@@ -50,8 +50,8 @@ use eyre::Result;
 use jsonrpsee::server::{Server, ServerConfig};
 use stateless_common::{RpcClient, RpcClientConfig, logging::LogArgs};
 use stateless_core::{
-    BlockStore, ChainStore, ContractStore, PipelineConfig, chain_spec::ChainSpec, db::BlockMeta,
-    pipeline::run_pipeline,
+    BisectResolver, ChainStore, ContractStore, PipelineConfig, chain_spec::ChainSpec,
+    db::BlockMeta, pipeline::run_pipeline,
 };
 use stateless_db::ContractCache;
 use tokio::task;
@@ -71,7 +71,7 @@ mod tracing_executor;
 use data_provider::{DataProvider, NoopContractStore};
 use response_cache::{DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS, ResponseCache, ResponseCacheConfig};
 use rpc_service::RpcContext;
-use server_db::ServerDB;
+use server_db::{BlockStore, ServerDB};
 
 use crate::chain_sync::{TraceFetcher, TraceHooks, TraceProcessor};
 
@@ -370,7 +370,9 @@ async fn main() -> Result<()> {
             let db = Arc::clone(db);
             let shutdown = shutdown.clone();
             async move {
-                if let Err(e) = run_pipeline(fetcher, db, processor, hooks, config, shutdown).await
+                if let Err(e) =
+                    run_pipeline(fetcher, db, processor, hooks, config, shutdown, BisectResolver)
+                        .await
                 {
                     error!(error = %e, "Chain sync pipeline exited with error");
                 }
@@ -602,8 +604,7 @@ async fn history_pruner(
             }
 
             // Update DB block range metrics
-            let earliest =
-                validator_db.get_earliest_block().ok().flatten().map(|(n, _)| n).unwrap_or(0);
+            let earliest = validator_db.get_earliest().ok().flatten().map(|(n, _)| n).unwrap_or(0);
             chain_sync_metrics.set_db_block_range(earliest, current_tip);
 
             // Update DB file size metric

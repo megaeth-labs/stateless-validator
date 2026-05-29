@@ -12,8 +12,9 @@ use alloy_genesis::Genesis;
 use alloy_primitives::{B256, BlockHash, BlockNumber, map::HashMap};
 use redb::ReadableDatabase;
 use revm::state::Bytecode;
-use stateless_core::db::{
-    BlockMeta, ChainStore, ContractStore, GenesisStore, StoreResult, StoreResultExt,
+use stateless_core::{
+    DivergenceLookups,
+    db::{BlockMeta, ChainStore, ContractStore, StoreResult, StoreResultExt},
 };
 use stateless_db::{
     ANCHOR_BLOCK, CANONICAL_CHAIN, CONTRACTS, DEFAULT_MAX_CHAIN_LENGTH, Database, GENESIS_CONFIG,
@@ -84,8 +85,11 @@ impl ContractStore for ValidatorDB {
     }
 }
 
-impl GenesisStore for ValidatorDB {
-    fn store_genesis(&self, genesis: &Genesis) -> StoreResult<()> {
+impl ValidatorDB {
+    /// Persist the genesis config. Inherent (not a trait): genesis storage is specific to the
+    /// stateless-validator bin — nothing in stateless-core is generic over it, so it doesn't earn
+    /// a shared trait.
+    pub fn store_genesis(&self, genesis: &Genesis) -> StoreResult<()> {
         let json_bytes = serde_json::to_vec(genesis).store_err()?;
         let write_txn = self.database.begin_write().store_err()?;
         {
@@ -96,7 +100,8 @@ impl GenesisStore for ValidatorDB {
         Ok(())
     }
 
-    fn load_genesis(&self) -> StoreResult<Option<Genesis>> {
+    /// Load the persisted genesis config, if any.
+    pub fn load_genesis(&self) -> StoreResult<Option<Genesis>> {
         let read_txn = self.database.begin_read().store_err()?;
         let table = read_txn.open_table(GENESIS_CONFIG).store_err()?;
         match table.get("genesis").store_err()? {
@@ -129,16 +134,22 @@ impl ChainStore for ValidatorDB {
         read_block_hash(&self.database, block_number)
     }
 
-    fn get_earliest_block(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
-        read_earliest_block(&self.database)
-    }
-
     fn rollback_chain(&self, to_block: BlockNumber) -> StoreResult<()> {
         write_rollback_chain(&self.database, to_block)
     }
 
     fn reset_to_anchor(&self, anchor: &BlockMeta) -> StoreResult<()> {
         write_reset_to_anchor(&self.database, anchor)
+    }
+}
+
+impl DivergenceLookups for ValidatorDB {
+    fn get_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>> {
+        read_block_hash(&self.database, block_number)
+    }
+
+    fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
+        read_earliest_block(&self.database)
     }
 }
 
@@ -325,12 +336,12 @@ mod tests {
     fn test_get_earliest_block() {
         let (_dir, store) = temp_store();
 
-        assert!(ChainStore::get_earliest_block(&store).unwrap().is_none());
+        assert!(DivergenceLookups::get_earliest(&store).unwrap().is_none());
 
         let blocks: Vec<BlockMeta> = (5..=8).map(make_block_meta).collect();
         ChainStore::advance_chain(&store, &blocks).unwrap();
 
-        let (number, hash) = ChainStore::get_earliest_block(&store).unwrap().unwrap();
+        let (number, hash) = DivergenceLookups::get_earliest(&store).unwrap().unwrap();
         assert_eq!(number, 5);
         assert_eq!(hash, blocks[0].block_hash);
     }
