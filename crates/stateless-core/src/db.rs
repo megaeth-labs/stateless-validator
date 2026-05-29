@@ -32,7 +32,7 @@ pub struct BlockMeta {
 /// Errors returned by persistence trait methods.
 ///
 /// This is the single typed error at the library/binary boundary: every
-/// [`ChainStore`] / [`BlockStore`] / … method returns `Result<_, StoreError>`.
+/// [`ChainStore`] / … method returns `Result<_, StoreError>`.
 /// Binary code converts to `eyre::Report` automatically via `?`.
 ///
 /// Backend errors (redb, bincode, serde_json, lz4, …) are wrapped as an opaque
