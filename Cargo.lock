@@ -5644,6 +5644,7 @@ dependencies = [
  "kanal",
  "mega-evm",
  "num_cpus",
+ "op-alloy-consensus",
  "op-alloy-rpc-types",
  "reth-ethereum-forks",
  "reth-optimism-chainspec",

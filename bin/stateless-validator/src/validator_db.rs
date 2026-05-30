@@ -145,7 +145,8 @@ impl ChainStore for ValidatorDB {
 
 impl DivergenceLookups for ValidatorDB {
     fn get_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>> {
-        read_block_hash(&self.database, block_number)
+        // Same as the canonical block-hash read; delegate so the two can't drift.
+        ChainStore::get_block_hash(self, block_number)
     }
 
     fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
