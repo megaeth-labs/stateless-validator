@@ -27,6 +27,7 @@ mega-evm = { workspace = true, default-features = false }
 salt = { workspace = true, default-features = false }
 
 # op
+op-alloy-consensus.workspace = true
 op-alloy-rpc-types.workspace = true
 
 # reth
@@ -78,6 +79,7 @@ std = [
     "alloy-rpc-types-eth/std",
     "alloy-serde/std",
     "mega-evm/default",
+    "op-alloy-consensus/std",
     "op-alloy-rpc-types/std",
     "reth-ethereum-forks/std",
     "reth-optimism-chainspec/std",

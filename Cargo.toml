@@ -45,6 +45,7 @@ mega-evm = { git = "https://github.com/megaeth-labs/mega-evm-internal.git", rev 
 salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "a04647065f12dbd8461dc40569731656d160d694", default-features = false }
 
 # op
+op-alloy-consensus = { version = "0.18.12", default-features = false }
 op-alloy-network = { version = "0.18.12", default-features = false }
 op-alloy-rpc-types = { version = "0.18.12", default-features = false }
 

@@ -33,17 +33,17 @@ use alloy_evm::{
     EvmEnv,
     block::{BlockExecutor, ExecutableTx},
 };
-use alloy_network_primitives::TransactionResponse;
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{
     Address, Bloom, keccak256,
     map::{B256Map, HashMap},
 };
-use alloy_rpc_types_eth::{Block, BlockTransactions, Header};
+use alloy_rpc_types_eth::{Block, BlockTransactions};
 use mega_evm::{
     BlockLimits, ExternalEnvFactory, MegaBlockExecutionCtx, MegaBlockExecutorFactory,
     MegaEvmFactory, MegaHardforks, MegaSpecId,
 };
+use op_alloy_consensus::OpTxEnvelope;
 use op_alloy_rpc_types::Transaction as OpTransaction;
 #[cfg(feature = "std")]
 use revm::inspector::inspectors::TracerEip3155;
@@ -195,7 +195,10 @@ pub struct ValidationStats {
 /// Creates an EVM environment from a block header and chain specification.
 ///
 /// This function sets up the configuration and block environment needed for EVM execution.
-pub fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<MegaSpecId> {
+pub fn create_evm_env(
+    header: &alloy_consensus::Header,
+    chain_spec: &ChainSpec,
+) -> EvmEnv<MegaSpecId> {
     let cfg_env = CfgEnv::new_with_spec(chain_spec.spec_id(header.timestamp))
         .with_chain_id(chain_spec.chain_id);
 
@@ -215,6 +218,53 @@ pub fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<MegaSpe
     }
 
     EvmEnv::new(cfg_env, block_env)
+}
+
+/// Minimal projection of a block that [`replay_block`] / [`validate_block`] need: the consensus
+/// header (every execution/validation field lives there), the block hash (diagnostics only), and
+/// the recovered `(transaction, sender)` pairs.
+///
+/// Abstracting over this lets the same replay path consume either an RPC
+/// [`Block<OpTransaction>`] (standalone validator, debug-trace-server) or a host's
+/// already-recovered block (the mega-reth FullNode, which reads `RecoveredBlock` from its local DB
+/// and would otherwise pay a per-tx rebuild into RPC form). The trait itself is dependency-clean —
+/// the only impl here is for the RPC block; reth-backed impls live in the embedder that already
+/// depends on reth.
+pub trait BlockInput {
+    /// The consensus header carrying all replay/validation fields.
+    fn consensus_header(&self) -> &alloy_consensus::Header;
+    /// The block hash (used only for diagnostics).
+    fn block_hash(&self) -> B256;
+    /// Whether full transaction bodies are present. An RPC block carrying only hashes returns
+    /// `false`, which [`replay_block`] maps to [`ValidationError::BlockIncomplete`].
+    fn is_complete(&self) -> bool;
+    /// Recovered `(transaction, sender)` pairs, borrowed — no clone, no signature re-recovery.
+    fn txs_recovered(&self) -> impl Iterator<Item = Recovered<&OpTxEnvelope>> + '_;
+}
+
+impl BlockInput for Block<OpTransaction> {
+    fn consensus_header(&self) -> &alloy_consensus::Header {
+        &self.header.inner
+    }
+
+    fn block_hash(&self) -> B256 {
+        self.header.hash
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self.transactions, BlockTransactions::Full(_))
+    }
+
+    fn txs_recovered(&self) -> impl Iterator<Item = Recovered<&OpTxEnvelope>> + '_ {
+        // Borrow each `Recovered<OpTxEnvelope>` in place via `as_recovered_ref()` — clone-free,
+        // replacing the previous per-tx `tx.inner.clone().into_inner()`. The hashes-only case
+        // yields `&[]`, but `is_complete()` is checked first so it surfaces as `BlockIncomplete`.
+        let full = match &self.transactions {
+            BlockTransactions::Full(txs) => txs.as_slice(),
+            _ => &[],
+        };
+        full.iter().map(|tx| tx.inner.inner.as_recovered_ref())
+    }
 }
 
 /// Replays all transactions in a block to compute state changes.
@@ -249,26 +299,28 @@ pub fn create_evm_env(header: &Header, chain_spec: &ChainSpec) -> EvmEnv<MegaSpe
 /// 5. Applies post-execution changes
 /// 6. Merges state transitions into bundle state
 /// 7. Returns bundle accounts and execution output (receipts root, logs bloom, gas used)
-pub fn replay_block<DB, ENV, E>(
+pub fn replay_block<B, DB, ENV, E>(
     chain_spec: &ChainSpec,
-    block: &Block<OpTransaction>,
+    block: &B,
     db: &DB,
     env_oracle: ENV,
     #[cfg(feature = "std")] trace_writer: Option<Box<dyn Write>>,
 ) -> Result<(HashMap<Address, BundleAccount>, BlockExecutionOutput), ValidationError>
 where
+    B: BlockInput,
     DB: DatabaseRef<Error = E> + Debug,
     ENV: ExternalEnvFactory + Clone,
     E: core::error::Error + Send + Sync + 'static,
 {
-    // Extract full transaction data
-    let BlockTransactions::Full(transactions) = &block.transactions else {
+    // A block carrying only transaction hashes can't be replayed.
+    if !block.is_complete() {
         return Err(ValidationError::BlockIncomplete);
-    };
+    }
+    let header = block.consensus_header();
 
     // Setup execution environment
     let mut state = StateBuilder::new().with_database_ref(db).with_bundle_update().build();
-    let evm_env = create_evm_env(&block.header, chain_spec);
+    let evm_env = create_evm_env(header, chain_spec);
 
     let executor_factory = MegaBlockExecutorFactory::new(
         chain_spec.clone(),
@@ -276,21 +328,23 @@ where
         OpAlloyReceiptBuilder::default(),
     );
 
-    let hardfork = chain_spec.hardfork(block.header.timestamp);
+    let hardfork = chain_spec.hardfork(header.timestamp);
     debug!(
         "Replay block: block_number={}, block_hash={:?}, hardfork={:?}",
-        block.header.number, block.header.hash, hardfork
+        header.number,
+        block.block_hash(),
+        hardfork
     );
     let block_limits = if let Some(hardfork) = hardfork {
-        BlockLimits::from_hardfork_and_block_gas_limit(hardfork, block.header.gas_limit)
+        BlockLimits::from_hardfork_and_block_gas_limit(hardfork, header.gas_limit)
     } else {
-        BlockLimits::no_limits().with_block_gas_limit(block.header.gas_limit)
+        BlockLimits::no_limits().with_block_gas_limit(header.gas_limit)
     };
 
     let execution_context = MegaBlockExecutionCtx::new(
-        block.header.parent_hash,
-        block.header.parent_beacon_block_root,
-        block.header.extra_data.clone(),
+        header.parent_hash,
+        header.parent_beacon_block_root,
+        header.extra_data.clone(),
         block_limits,
     );
 
@@ -299,7 +353,7 @@ where
     // non-tracer path only needs to be made here.
     let run_plain = |state: &mut _, ctx, env| {
         let executor = executor_factory.create_executor(state, ctx, env);
-        execute_transactions(executor, transactions)
+        execute_transactions(executor, block.txs_recovered())
     };
 
     #[cfg(feature = "std")]
@@ -310,7 +364,7 @@ where
             evm_env,
             TracerEip3155::new(writer),
         );
-        execute_transactions(executor, transactions)?
+        execute_transactions(executor, block.txs_recovered())?
     } else {
         run_plain(&mut state, execution_context, evm_env)?
     };
@@ -349,23 +403,20 @@ where
     ))
 }
 
-/// Executes transactions using the given block executor.
-fn execute_transactions<E, T>(
+/// Executes a stream of recovered transactions using the given block executor.
+fn execute_transactions<'a, E, I>(
     mut executor: E,
-    transactions: &[OpTransaction<T>],
+    transactions: I,
 ) -> Result<(B256, Bloom, u64), ValidationError>
 where
-    E: BlockExecutor<Transaction = T>,
+    E: BlockExecutor<Transaction = OpTxEnvelope>,
     E::Receipt: Encodable2718 + TxReceipt,
-    T: Clone,
-    OpTransaction<T>: TransactionResponse,
-    for<'a> Recovered<&'a T>: ExecutableTx<E>,
+    I: Iterator<Item = Recovered<&'a OpTxEnvelope>>,
+    for<'b> Recovered<&'b OpTxEnvelope>: ExecutableTx<E>,
 {
     executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
 
-    for tx in transactions {
-        let tx_envelope = tx.inner.clone().into_inner();
-        let recovered_tx = Recovered::new_unchecked(&tx_envelope, tx.from());
+    for recovered_tx in transactions {
         executor.execute_transaction(recovered_tx).map_err(ValidationError::BlockReplayFailed)?;
     }
 
@@ -408,16 +459,18 @@ where
 ///
 /// Returns `Ok(ValidationStats)` if validation succeeds, containing state access metrics.
 /// Returns `Err(ValidationError)` with the specific validation failure.
-pub fn validate_block(
+pub fn validate_block<B: BlockInput>(
     chain_spec: &ChainSpec,
-    block: &Block<OpTransaction>,
+    block: &B,
     salt_witness: SaltWitness,
     mpt_witness: MptWitness,
     contracts: &HashMap<B256, Arc<Bytecode>>,
     #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
 ) -> Result<ValidationStats, ValidationError> {
+    let header = block.consensus_header();
+
     // Create external environment oracle from salt witness
-    let ext_env = WitnessExternalEnv::new(&salt_witness, block.header.number)
+    let ext_env = WitnessExternalEnv::new(&salt_witness, header.number)
         .map_err(ValidationError::EnvOracleConstructionFailed)?;
 
     // Verify witness proof against the current state root
@@ -431,7 +484,7 @@ pub fn validate_block(
     let witness_verification_time = 0.0_f64; // no_std: timing unavailable
 
     // Replay block transactions
-    let witness_db = WitnessDatabase { header: &block.header, witness: &witness, contracts };
+    let witness_db = WitnessDatabase { header, witness: &witness, contracts };
     let (accounts, output) = replay_block(
         chain_spec,
         block,
@@ -527,39 +580,39 @@ pub fn validate_block(
 
     // Check if computed withdrawals root matches the claimed one
     mpt_witness
-        .verify(&block.header, withdrawal_storage)
+        .verify(header, withdrawal_storage)
         .map_err(ValidationError::WithdrawalValidationFailed)?;
 
     // Verify receipts root matches the block header
-    if output.receipts_root != block.header.receipts_root {
+    if output.receipts_root != header.receipts_root {
         return Err(ValidationError::ReceiptsRootMismatch {
             actual: output.receipts_root,
-            claimed: block.header.receipts_root,
+            claimed: header.receipts_root,
         });
     }
 
     // Verify logs bloom matches the block header
-    if output.logs_bloom != block.header.logs_bloom {
+    if output.logs_bloom != header.logs_bloom {
         return Err(ValidationError::LogsBloomMismatch {
             actual: Box::new(output.logs_bloom),
-            claimed: Box::new(block.header.logs_bloom),
+            claimed: Box::new(header.logs_bloom),
         });
     }
 
     // Verify gas used matches the block header
-    if output.gas_used != block.header.gas_used {
+    if output.gas_used != header.gas_used {
         return Err(ValidationError::GasUsedMismatch {
             actual: output.gas_used,
-            claimed: block.header.gas_used,
+            claimed: header.gas_used,
         });
     }
 
     // Check if computed state root matches claimed state root
     let state_root = B256::from(state_root);
-    if state_root != block.header.state_root {
+    if state_root != header.state_root {
         return Err(ValidationError::StateRootMismatch {
             actual: state_root,
-            claimed: block.header.state_root,
+            claimed: header.state_root,
         });
     }
 

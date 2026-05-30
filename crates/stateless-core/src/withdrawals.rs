@@ -10,10 +10,9 @@ use std::{
     vec::Vec,
 };
 
-use alloy_consensus::constants::KECCAK_EMPTY;
+use alloy_consensus::{Header, constants::KECCAK_EMPTY};
 use alloy_primitives::{Address, B256, Bytes, U256, address, keccak256, map::B256Map};
 use alloy_rlp::Encodable;
-use alloy_rpc_types_eth::Header;
 use reth_trie_common::{EMPTY_ROOT_HASH, LeafNode, Nibbles, TrieAccount, TrieNode};
 use reth_trie_sparse::{
     SerialSparseTrie, SparseStateTrie, SparseTrie, provider::DefaultTrieNodeProviderFactory,
@@ -192,7 +191,7 @@ mod tests {
     use std::vec;
 
     use WithdrawalValidationError::*;
-    use alloy_primitives::{Sealable, b256};
+    use alloy_primitives::b256;
 
     use super::*;
 
@@ -214,8 +213,7 @@ mod tests {
         expected: Option<B256>,
         updates: &[(B256, U256)],
     ) -> Result<(), WithdrawalValidationError> {
-        let inner = alloy_consensus::Header { withdrawals_root: expected, ..Default::default() };
-        let header = Header::from_consensus(inner.seal_slow(), None, None);
+        let header = Header { withdrawals_root: expected, ..Default::default() };
         MptWitness { storage_root, state }.verify(&header, updates.iter().copied().collect())
     }
 

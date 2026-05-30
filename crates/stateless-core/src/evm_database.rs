@@ -11,9 +11,9 @@ use std::{
     vec::Vec,
 };
 
+use alloy_consensus::Header;
 use alloy_eips::eip2935::{HISTORY_SERVE_WINDOW, HISTORY_STORAGE_ADDRESS};
 use alloy_primitives::{Address, B256, BlockNumber, map::HashMap};
-use alloy_rpc_types_eth::Header;
 use mega_evm::{ExternalEnvFactory, ExternalEnvs, OracleEnv, SaltEnv};
 use revm::{
     DatabaseRef,

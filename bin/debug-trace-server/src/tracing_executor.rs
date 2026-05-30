@@ -128,7 +128,7 @@ impl<'a> TracingEnv<'a> {
             .map_err(ValidationError::EnvOracleConstructionFailed)?;
 
         let light_witness_executor = LightWitnessExecutor::from(light_witness);
-        let evm_env = create_evm_env(&block.header, chain_spec);
+        let evm_env = create_evm_env(&block.header.inner, chain_spec);
 
         let evm_factory = MegaEvmFactory::new().with_external_env_factory(ext_env);
         let executor_factory = MegaBlockExecutorFactory::new(
@@ -157,7 +157,7 @@ impl<'a> TracingEnv<'a> {
 
     fn create_witness_db<'b>(
         &'b self,
-        header: &'b alloy_rpc_types_eth::Header,
+        header: &'b alloy_consensus::Header,
         contracts: &'b HashMap<B256, Arc<Bytecode>>,
     ) -> WitnessDatabase<'b, LightWitnessExecutor> {
         WitnessDatabase { header, witness: &self.light_witness_executor, contracts }
@@ -442,7 +442,7 @@ pub fn trace_block(
 
     trace!(tx_count = env.transactions.len(), "Starting block trace");
 
-    let witness_db = env.create_witness_db(&block.header, contracts);
+    let witness_db = env.create_witness_db(&block.header.inner, contracts);
     let cache_db = CacheDB::new(&witness_db);
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
@@ -716,7 +716,7 @@ pub fn trace_transaction(
         "Starting transaction trace"
     );
 
-    let witness_db = env.create_witness_db(&block.header, contracts);
+    let witness_db = env.create_witness_db(&block.header.inner, contracts);
     let cache_db = CacheDB::new(&witness_db);
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
@@ -872,7 +872,7 @@ pub fn parity_trace_block(
 ) -> Result<Vec<LocalizedTransactionTrace>, ValidationError> {
     let env = TracingEnv::new(chain_spec, block, light_witness)?;
 
-    let witness_db = env.create_witness_db(&block.header, contracts);
+    let witness_db = env.create_witness_db(&block.header.inner, contracts);
     let cache_db = CacheDB::new(&witness_db);
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
@@ -926,7 +926,7 @@ pub fn parity_trace_transaction(
         return Err(ValidationError::BlockIncomplete);
     }
 
-    let witness_db = env.create_witness_db(&block.header, contracts);
+    let witness_db = env.create_witness_db(&block.header.inner, contracts);
     let cache_db = CacheDB::new(&witness_db);
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
