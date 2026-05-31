@@ -11,12 +11,10 @@ use crate::{
 /// The bisection contract: the lookup surface a history-owning store exposes so the pipeline can
 /// locate a reorg fork by walking local history against the remote.
 ///
-/// This IS the "bisectable store" abstraction — the scenarios that own a per-block chain (the
-/// standalone validator's `ValidatorDB`, the debug-trace-server's `ServerDB`) implement it
-/// directly. Scenarios with no local history (the mega-reth FullNode) never implement it and never
-/// bisect; they resolve the reorg floor via the pipeline's
-/// [`ReorgResolver`](crate::pipeline::ReorgResolver) seam instead. Kept minimal (two reads) so the
-/// `find_divergence_point` unit tests can supply a tiny in-memory mock.
+/// Implemented directly by the stores that own a per-block chain (the standalone validator's
+/// `ValidatorDB`, the debug-trace-server's `ServerDB`); stores with no local history resolve the
+/// reorg floor via the [`ReorgResolver`](crate::pipeline::ReorgResolver) seam instead. Kept minimal
+/// (two reads) so the `find_divergence_point` unit tests can supply a tiny in-memory mock.
 pub trait DivergenceLookups {
     /// Hash for the block at `block_number`, or `None` if it's not in local history.
     fn get_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>>;

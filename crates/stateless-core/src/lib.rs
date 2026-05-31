@@ -9,7 +9,7 @@
 //! - [`chain_spec`]: Chain specification and hardfork activation
 //! - [`light_witness`]: Fast witness deserialization (skips proof validation)
 //! - [`evm_database`]: Witness-backed `DatabaseRef` for REVM
-//! - [`db`]: Abstract storage traits (`ChainStore`, `ContractStore`, etc.)
+//! - [`db`]: Shared storage traits (`ChainStore`, `ContractStore`); scenario stores are bin-local
 //! - [`data_types`]: SALT key/value encoding utilities
 //! - [`executor`]: Block validation via EVM replay
 //! - [`pipeline`]: Generic three-stage chain sync pipeline (fetch → process → advance) — requires

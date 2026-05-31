@@ -9,6 +9,8 @@
 //! - [`BlockProcessor`]: Processing stage (validation or pass-through).
 //! - [`PipelineHooks`]: Callbacks for advance/reorg/stale events.
 //! - [`ProcessedBlock`]: Output of the processing stage.
+//! - [`ReorgResolver`]: Decides the rollback floor on a reorg. [`BisectResolver`] walks local
+//!   history (via [`DivergenceLookups`]); embedders can supply an externally-resolved floor.
 //!
 //! ## Entry Point
 //!
