@@ -433,7 +433,7 @@ struct PreResolvedFloorResolver {
 }
 
 impl<F: BlockFetcher, S: Send + Sync> ReorgResolver<F, S> for PreResolvedFloorResolver {
-    async fn resolve(&self, _: &F, _: &S, _: u64, _: u64) -> eyre::Result<ReorgResolution> {
+    async fn resolve(&self, _: &F, _: &S, _: u64) -> eyre::Result<ReorgResolution> {
         Ok(ReorgResolution::Floor(self.floor))
     }
 }
@@ -476,6 +476,35 @@ async fn test_chain_advancer_uses_store_resolved_floor() {
             assert_eq!(event.rollback_to, 7, "must use store-resolved floor, not walk");
         }
         other => panic!("Expected Reorg, got {other:?}"),
+    }
+}
+
+/// Regression for the `BisectResolver` transient-error path: a *non-fatal* `find_divergence_point`
+/// failure (here the remote read erroring mid-bisection) must surface as `PipelineOutcome::Retry`,
+/// not bubble up as an `Err`. Before the fix `BisectResolver` returned `Err(e.into())` for the
+/// non-fatal case, which `run_pipeline` logged as an *unexpected* error even though it's an
+/// intentional, retryable transient — exactly what the `Retry` variant exists for. Empty
+/// `rpc_hashes` makes `MockFetcher::block_hash` error on the divergence walk's first remote read.
+#[tokio::test]
+async fn test_chain_advancer_bisect_transient_error_returns_retry() {
+    let tip = make_tip(10);
+    // Block 11 with a bad parent triggers a reorg → `BisectResolver` runs `find_divergence_point`,
+    // whose first remote read (`fetcher.block_hash(10)`) errors because `rpc_hashes` is empty.
+    let bad_block = MockBlock {
+        number: 11,
+        hash: make_hash(11),
+        parent: BlockHash::from([0xFF; 32]),
+        state_root: B256::ZERO,
+    };
+    let (result, _) = run_advancer(tip, HashMap::default(), vec![Ok(bad_block)]).await;
+    match result.unwrap() {
+        PipelineOutcome::Retry(msg) => {
+            assert!(
+                msg.contains("Block 10 not found"),
+                "retry reason must carry the divergence transport error: {msg}"
+            );
+        }
+        other => panic!("expected Retry outcome, got {other:?}"),
     }
 }
 

@@ -38,7 +38,7 @@ pub enum ReorgResolution {
 /// - The mega-reth FullNode implements this trait in its own bin, returning the floor its host
 ///   (state-sync) already published — it never bisects and never touches the fetcher.
 pub trait ReorgResolver<F, S>: Send + Sync {
-    /// Resolve the rollback floor for the reorg detected at `mismatch_block`. `persisted_tip` is
+    /// Resolve the rollback floor for the reorg the advancer just detected. `persisted_tip` is
     /// the highest block durably written by `advance_chain` (the upper bound a bisection may read
     /// from the store).
     ///
@@ -48,7 +48,6 @@ pub trait ReorgResolver<F, S>: Send + Sync {
         &self,
         fetcher: &F,
         store: &S,
-        mismatch_block: u64,
         persisted_tip: u64,
     ) -> impl core::future::Future<Output = Result<ReorgResolution>> + Send;
 }
@@ -63,17 +62,14 @@ where
     F: BlockFetcher,
     S: DivergenceLookups + Send + Sync,
 {
-    async fn resolve(
-        &self,
-        fetcher: &F,
-        store: &S,
-        _mismatch_block: u64,
-        persisted_tip: u64,
-    ) -> Result<ReorgResolution> {
+    async fn resolve(&self, fetcher: &F, store: &S, persisted_tip: u64) -> Result<ReorgResolution> {
         match find_divergence_point(fetcher, store, persisted_tip).await {
             Ok(v) => Ok(ReorgResolution::Floor(v)),
             Err(e) if e.is_fatal() => Ok(ReorgResolution::Fatal(e.to_string())),
-            Err(e) => Err(e.into()),
+            // A non-fatal divergence error is a transport hiccup during the bisection fetches —
+            // an *intentional* transient signal, so route it through `Retry` (warn + sleep +
+            // restart) instead of leaking an `Err` the outer loop logs as "unexpected error".
+            Err(e) => Ok(ReorgResolution::Retry(e.to_string())),
         }
     }
 }
@@ -143,15 +139,14 @@ where
 
                 // Strategy is scenario-supplied (see `ReorgResolver`); `Floor` rolls back,
                 // `Fatal`/`Retry` end the cycle.
-                let rollback_to =
-                    match resolver.resolve(fetcher, store, next_expected, persisted_tip).await? {
-                        ReorgResolution::Floor(floor) => {
-                            debug!(block = next_expected, ?floor, "Resolved reorg floor");
-                            floor
-                        }
-                        ReorgResolution::Fatal(msg) => return Ok(PipelineOutcome::Fatal(msg)),
-                        ReorgResolution::Retry(msg) => return Ok(PipelineOutcome::Retry(msg)),
-                    };
+                let rollback_to = match resolver.resolve(fetcher, store, persisted_tip).await? {
+                    ReorgResolution::Floor(floor) => {
+                        debug!(block = next_expected, ?floor, "Resolved reorg floor");
+                        floor
+                    }
+                    ReorgResolution::Fatal(msg) => return Ok(PipelineOutcome::Fatal(msg)),
+                    ReorgResolution::Retry(msg) => return Ok(PipelineOutcome::Retry(msg)),
+                };
 
                 let depth = persisted_tip.saturating_sub(rollback_to);
                 let mut reverted_hashes = Vec::new();
