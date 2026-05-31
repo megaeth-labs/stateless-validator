@@ -30,9 +30,8 @@ use stateless_db::{
 /// chain on a schedule), so it lives here rather than as a stateless-core trait.
 ///
 /// Supertraits: [`ChainStore`] (chain cursors) + [`DivergenceLookups`] (this bin bisects on reorg,
-/// and the DB-range metric reads `get_earliest`). `prune_chain` is folded in here — the old
-/// separate `PrunableChainStore` had the same single implementor (`ServerDB`) and was only ever
-/// reached through `dyn BlockStore`.
+/// and the DB-range metric reads `get_earliest`). `prune_chain` is folded in from the former
+/// `PrunableChainStore` (same sole implementor, `ServerDB`).
 pub trait BlockStore: ChainStore + DivergenceLookups {
     /// Delete chain history strictly below `before_block`. Returns the number of blocks pruned.
     fn prune_chain(&self, before_block: BlockNumber) -> StoreResult<u64>;

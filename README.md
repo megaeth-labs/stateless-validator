@@ -185,7 +185,7 @@ Both binaries share a generic three-stage pipeline defined in `stateless-core`:
                           Persists via ChainStore::advance_chain()
 
  Outer loop (run_pipeline):
-   Reorg → rollback → restart pipeline
+   Reorg → ReorgResolver decides floor → rollback → restart pipeline
    Stale detection (optional) → reset anchor → restart
 ```
 
@@ -193,6 +193,7 @@ The pipeline is configured via `PipelineConfig` and customized through trait imp
 - `BlockProcessor`: Processing logic per block (validation or pass-through)
 - `PipelineHooks`: Callbacks for advance/reorg/stale events
 - `ProcessedBlock`: Output type of the processing stage
+- `ReorgResolver`: Decides the rollback floor on a detected reorg (`BisectResolver` walks local history; embedders can supply an externally-resolved floor)
 
 ### Key Source Files
 
@@ -200,7 +201,7 @@ The pipeline is configured via `PipelineConfig` and customized through trait imp
 | ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
 | `crates/stateless-core/src/pipeline/{mod,config,traits,fetcher,divergence,advancer,worker}.rs` | Generic three-stage pipeline split by responsibility                                |
 | `crates/stateless-core/src/executor.rs`                                                        | Block validation and EVM replay                                                     |
-| `crates/stateless-core/src/db.rs`                                                              | Abstract storage traits: `ChainStore`, `BlockStore`, `ContractStore`, `StoreError`  |
+| `crates/stateless-core/src/db.rs`                                                              | Shared storage traits: `ChainStore`, `ContractStore`, `StoreError` (scenario stores live in their binaries)  |
 | `crates/stateless-core/src/evm_database.rs`                                                    | `WitnessDatabase` implementing `revm::DatabaseRef`                                  |
 | `crates/stateless-core/src/withdrawals.rs`                                                     | Withdrawal validation and MPT witness handling                                      |
 | `crates/stateless-db/src/{lib,tables,helpers,serialize,cache}.rs`                              | Shared redb tables, helpers, serialization, and bounded `ContractCache`             |
@@ -212,7 +213,7 @@ The pipeline is configured via `PipelineConfig` and customized through trait imp
 | `bin/debug-trace-server/src/chain_sync.rs`                                                     | `TraceFetcher`, `TraceProcessor`, `TraceHooks`                                      |
 | `bin/debug-trace-server/src/rpc_service.rs`                                                    | RPC method definitions and handlers                                                 |
 | `bin/debug-trace-server/src/data_provider.rs`                                                  | Block data fetching with single-flight coalescing                                   |
-| `bin/debug-trace-server/src/server_db.rs`                                                      | Concrete `BlockStore` implementation backed by `stateless-db`                       |
+| `bin/debug-trace-server/src/server_db.rs`                                                      | Defines + implements the bin-local `BlockStore` trait, backed by `stateless-db`     |
 
 ### Database
 

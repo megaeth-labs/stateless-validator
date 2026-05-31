@@ -12,6 +12,9 @@
 //!   specification
 //! - [`replay_block`]: Replays block transactions to compute state changes
 //!
+//! [`replay_block`] / [`validate_block`] are generic over [`BlockInput`], the minimal block
+//! projection they consume (the in-repo impl is the RPC `Block`; embedders supply their own).
+//!
 //! ## Validation Process
 //!
 //! 1. Verify witness proof against previous state root
@@ -226,8 +229,7 @@ pub fn create_evm_env(
 ///
 /// Abstracting over this lets the same replay path consume either an RPC
 /// [`Block<OpTransaction>`] (standalone validator, debug-trace-server) or a host's
-/// already-recovered block (the mega-reth FullNode, which reads `RecoveredBlock` from its local DB
-/// and would otherwise pay a per-tx rebuild into RPC form). The trait itself is dependency-clean —
+/// already-recovered block, without a per-tx rebuild into RPC form. The trait is dependency-clean:
 /// the only impl here is for the RPC block; reth-backed impls live in the embedder that already
 /// depends on reth.
 pub trait BlockInput {
@@ -256,9 +258,9 @@ impl BlockInput for Block<OpTransaction> {
     }
 
     fn txs_recovered(&self) -> impl Iterator<Item = Recovered<&OpTxEnvelope>> + '_ {
-        // Borrow each `Recovered<OpTxEnvelope>` in place via `as_recovered_ref()` — clone-free,
-        // replacing the previous per-tx `tx.inner.clone().into_inner()`. The hashes-only case
-        // yields `&[]`, but `is_complete()` is checked first so it surfaces as `BlockIncomplete`.
+        // Borrow each `Recovered<OpTxEnvelope>` in place via `as_recovered_ref()` — clone-free.
+        // The hashes-only case yields `&[]`, but `is_complete()` is checked first so it surfaces
+        // as `BlockIncomplete`.
         let full = match &self.transactions {
             BlockTransactions::Full(txs) => txs.as_slice(),
             _ => &[],

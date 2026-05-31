@@ -141,10 +141,8 @@ where
                     "Parent hash mismatch — reorg detected"
                 );
 
-                // The reorg-resolution strategy is supplied by the scenario: `BisectResolver`
-                // walks local history via `find_divergence_point` (history-owning bins), while the
-                // mega-reth FullNode's own resolver returns the host-supplied floor. Either may end
-                // the cycle early (fatal / transient).
+                // Strategy is scenario-supplied (see `ReorgResolver`); `Floor` rolls back,
+                // `Fatal`/`Retry` end the cycle.
                 let rollback_to =
                     match resolver.resolve(fetcher, store, next_expected, persisted_tip).await? {
                         ReorgResolution::Floor(floor) => {

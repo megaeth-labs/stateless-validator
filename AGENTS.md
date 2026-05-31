@@ -56,12 +56,15 @@ Both binaries share a generic three-stage pipeline defined in `stateless-core::p
 3. **Advance** — `chain_advancer` reorders out-of-order results, verifies parent-hash continuity, detects reorgs, and persists via `ChainStore::advance_chain`.
 
 The outer loop (`run_pipeline`) handles reorg rollback + restart, stale-data anchor reset, and transient vs fatal error classification.
+On a detected reorg, the rollback floor comes from a pluggable `ReorgResolver`: the core `BisectResolver` walks local history via `find_divergence_point`, while an embedder with an externally-supplied floor (e.g. the mega-reth FullNode) provides its own.
 
 ### Database
 
 The validator and trace server each own a `redb`-backed database (`ValidatorDB` and `ServerDB`, living in their respective binaries).
 The shared persistence layer — table definitions, read/write helpers, serialization, and `ContractCache` — lives in the `stateless-db` crate.
-`stateless-core::db` defines the abstract storage traits (`ChainStore`, `BlockStore`, etc.) and the `StoreError` / `StoreResult` returned by them.
+`stateless-core::db` defines only the genuinely-shared storage traits (`ContractStore`, `ChainStore`) plus the `StoreError` / `StoreResult` they return.
+Scenario-specific storage lives in the owning binary rather than in core: genesis persistence is inherent on `ValidatorDB`, and block/witness storage with history pruning sits behind a bin-local `BlockStore` trait in the trace server.
+The pipeline owns the reorg seams: `DivergenceLookups` (the bisection contract) and `ReorgResolver` (which decides the rollback floor) live in `stateless-core::pipeline`.
 
 - **`ANCHOR_BLOCK`** — Trusted starting point (block number, hash, state root, withdrawals root).
 - **`CANONICAL_CHAIN`** — Validated chain progression (block number → hash, state root, withdrawals root).
@@ -109,9 +112,9 @@ The server includes an HTTP response cache (`quick_cache`) for pre-serialized JS
 | File                                                                                           | Purpose                                                                  |
 | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
 | `crates/stateless-core/src/pipeline/{mod,config,traits,fetcher,divergence,advancer,worker}.rs` | Generic three-stage pipeline split by responsibility                     |
-| `crates/stateless-core/src/executor.rs`                                                        | Block validation and EVM replay                                          |
+| `crates/stateless-core/src/executor.rs`                                                        | Block validation and EVM replay (generic over the `BlockInput` projection) |
 | `crates/stateless-core/src/evm_database.rs`                                                    | WitnessDatabase implementing `revm::DatabaseRef`                         |
-| `crates/stateless-core/src/db.rs`                                                              | Abstract storage traits + `StoreError` / `StoreResult`                   |
+| `crates/stateless-core/src/db.rs`                                                              | Shared storage traits (`ContractStore`, `ChainStore`) + `StoreError` / `StoreResult`                   |
 | `crates/stateless-core/src/withdrawals.rs`                                                     | Withdrawal validation and MPT witness handling                           |
 | `crates/stateless-db/src/{lib,tables,helpers,serialize,cache}.rs`                              | Shared redb tables, helpers, serialization, and `ContractCache`          |
 | `crates/stateless-common/src/rpc_client.rs`                                                    | RPC client for blocks, witnesses, and bytecode                           |
@@ -120,7 +123,7 @@ The server includes an HTTP response cache (`quick_cache`) for pre-serialized JS
 | `bin/debug-trace-server/src/chain_sync.rs`                                                     | TraceFetcher, TraceProcessor, TraceHooks                                 |
 | `bin/debug-trace-server/src/rpc_service.rs`                                                    | RPC method definitions and handlers                                      |
 | `bin/debug-trace-server/src/data_provider.rs`                                                  | Block data fetching with single-flight coalescing                        |
-| `bin/debug-trace-server/src/server_db.rs`                                                      | Concrete `BlockStore` implementation backed by `stateless-db`            |
+| `bin/debug-trace-server/src/server_db.rs`                                                      | Defines + implements the bin-local `BlockStore` trait (backed by `stateless-db`)            |
 
 ## Test Organization
 

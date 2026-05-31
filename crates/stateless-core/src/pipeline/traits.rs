@@ -70,7 +70,7 @@ pub trait BlockProcessor: Send + Sync + 'static {
     type Output: ProcessedBlock;
     /// Error type for processing failures. Must implement `std::error::Error` so the
     /// advancer can log the chained source while the channel carries it as
-    /// `Arc<dyn Error + Send + Sync>` (see [`crate::pipeline::WorkerResult`]).
+    /// `Arc<dyn Error + Send + Sync>` (see the crate-internal `WorkerResult`).
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Process a single block (called from N worker tasks in parallel).
