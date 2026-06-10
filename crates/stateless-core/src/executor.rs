@@ -335,10 +335,10 @@ where
 
     let hardfork = chain_spec.hardfork(header.timestamp);
     debug!(
-        "Replay block: block_number={}, block_hash={:?}, hardfork={:?}",
-        header.number,
-        block.block_hash(),
-        hardfork
+        block_number = header.number,
+        block_hash = ?block.block_hash(),
+        hardfork = ?hardfork,
+        "Replay block"
     );
     let block_limits = if let Some(hardfork) = hardfork {
         BlockLimits::from_hardfork_and_block_gas_limit(hardfork, header.gas_limit)
