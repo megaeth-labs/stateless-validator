@@ -122,7 +122,8 @@ impl ChainStore for MockStore {
 
 impl DivergenceLookups for MockStore {
     fn get_hash(&self, n: BlockNumber) -> StoreResult<Option<BlockHash>> {
-        Ok(self.chain.lock().unwrap().get(&n).map(|m| m.block_hash))
+        // Same delegation as the production impls, so the two reads can't drift.
+        ChainStore::get_block_hash(self, n)
     }
     fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
         Ok(self.chain.lock().unwrap().first_key_value().map(|(&n, m)| (n, m.block_hash)))
@@ -185,6 +186,15 @@ async fn run_advancer(
     rpc_hashes: HashMap<u64, BlockHash>,
     blocks: Vec<AdvancerStep>,
 ) -> (Result<PipelineOutcome>, MockStore) {
+    run_advancer_with_resolver(tip, rpc_hashes, blocks, &BisectResolver).await
+}
+
+async fn run_advancer_with_resolver<R: ReorgResolver<MockFetcher, MockStore>>(
+    tip: BlockMeta,
+    rpc_hashes: HashMap<u64, BlockHash>,
+    blocks: Vec<AdvancerStep>,
+    resolver: &R,
+) -> (Result<PipelineOutcome>, MockStore) {
     let store = MockStore::new(tip.clone());
     let fetcher = MockFetcher { hashes: rpc_hashes };
     let hooks = NoopHooks;
@@ -209,16 +219,8 @@ async fn run_advancer(
         }
     }
 
-    let result = chain_advancer(
-        &fetcher,
-        &store,
-        &hooks,
-        &BisectResolver,
-        rx,
-        tip,
-        CancellationToken::new(),
-    )
-    .await;
+    let result =
+        chain_advancer(&fetcher, &store, &hooks, resolver, rx, tip, CancellationToken::new()).await;
     (result, store)
 }
 
@@ -372,12 +374,7 @@ async fn test_chain_advancer_reorg_detected() {
     let mut rpc_hashes = HashMap::default();
     rpc_hashes.insert(10, make_hash(10));
 
-    let bad_block = MockBlock {
-        number: 11,
-        hash: make_hash(11),
-        parent: BlockHash::from([0xFF; 32]),
-        state_root: B256::ZERO,
-    };
+    let bad_block = make_block(11, BlockHash::from([0xFF; 32])); // wrong parent → reorg
     let (result, _) = run_advancer(tip, rpc_hashes, vec![Ok(bad_block)]).await;
     match result.unwrap() {
         PipelineOutcome::Reorg(event) => assert_eq!(event.rollback_to, 10),
@@ -402,12 +399,7 @@ async fn test_chain_advancer_reorg_mid_batch_uses_persisted_tip() {
     // inner while-let drains both in one pass — 11 passes parent-hash (`current_tip` advances
     // in memory to 11), then 12 fails parent-hash → reorg detected with the store still at 10.
     let block_11 = make_block(11, make_hash(10));
-    let block_12 = MockBlock {
-        number: 12,
-        hash: make_hash(12),
-        parent: BlockHash::from([0xFF; 32]), // wrong parent → reorg
-        state_root: B256::ZERO,
-    };
+    let block_12 = make_block(12, BlockHash::from([0xFF; 32])); // wrong parent → reorg
     let (result, _) = run_advancer(tip, rpc_hashes, vec![Ok(block_12), Ok(block_11)]).await;
 
     match result.unwrap() {
@@ -439,39 +431,20 @@ impl<F: BlockFetcher, S: Send + Sync> ReorgResolver<F, S> for PreResolvedFloorRe
 }
 
 /// When the resolver pre-resolves the floor, the advancer must skip the divergence walk
-/// entirely. The mock fetcher carries *no* hashes — if `find_divergence_point` were
-/// called it would attempt `fetcher.block_hash(n)` and panic, failing the test.
+/// entirely. The mock fetcher carries *no* hashes — if `find_divergence_point` were called,
+/// its remote reads would error and the outcome would be `Retry`, failing the assertion.
 #[tokio::test]
 async fn test_chain_advancer_uses_store_resolved_floor() {
     let tip = make_tip(10);
-    let store = MockStore::new(tip.clone());
-    // No rpc_hashes — divergence walk would call fetcher.block_hash and fail.
-    let fetcher = MockFetcher { hashes: HashMap::default() };
-    let hooks = NoopHooks;
-    let (tx, rx) = kanal::bounded::<
-        std::result::Result<MockBlock, (Arc<dyn std::error::Error + Send + Sync>, ErrorAction)>,
-    >(16);
-
-    let bad_block = MockBlock {
-        number: 11,
-        hash: make_hash(11),
-        parent: BlockHash::from([0xFF; 32]),
-        state_root: B256::ZERO,
-    };
-    tx.to_async().send(Ok(bad_block)).await.unwrap();
-
-    let outcome = chain_advancer(
-        &fetcher,
-        &store,
-        &hooks,
-        &PreResolvedFloorResolver { floor: 7 },
-        rx,
+    let bad_block = make_block(11, BlockHash::from([0xFF; 32])); // wrong parent → reorg
+    let (result, _) = run_advancer_with_resolver(
         tip,
-        CancellationToken::new(),
+        HashMap::default(), // no rpc_hashes — a divergence walk would fail
+        vec![Ok(bad_block)],
+        &PreResolvedFloorResolver { floor: 7 },
     )
-    .await
-    .unwrap();
-    match outcome {
+    .await;
+    match result.unwrap() {
         PipelineOutcome::Reorg(event) => {
             assert_eq!(event.rollback_to, 7, "must use store-resolved floor, not walk");
         }
@@ -490,12 +463,7 @@ async fn test_chain_advancer_bisect_transient_error_returns_retry() {
     let tip = make_tip(10);
     // Block 11 with a bad parent triggers a reorg → `BisectResolver` runs `find_divergence_point`,
     // whose first remote read (`fetcher.block_hash(10)`) errors because `rpc_hashes` is empty.
-    let bad_block = MockBlock {
-        number: 11,
-        hash: make_hash(11),
-        parent: BlockHash::from([0xFF; 32]),
-        state_root: B256::ZERO,
-    };
+    let bad_block = make_block(11, BlockHash::from([0xFF; 32]));
     let (result, _) = run_advancer(tip, HashMap::default(), vec![Ok(bad_block)]).await;
     match result.unwrap() {
         PipelineOutcome::Retry(msg) => {
@@ -518,12 +486,7 @@ async fn test_chain_advancer_bisect_catastrophic_reorg_returns_fatal() {
     let mut rpc_hashes = HashMap::default();
     rpc_hashes.insert(10, make_hash(99)); // remote disagrees with the earliest local block
 
-    let bad_block = MockBlock {
-        number: 11,
-        hash: make_hash(11),
-        parent: BlockHash::from([0xFF; 32]),
-        state_root: B256::ZERO,
-    };
+    let bad_block = make_block(11, BlockHash::from([0xFF; 32])); // wrong parent → reorg
     let (result, _) = run_advancer(tip, rpc_hashes, vec![Ok(bad_block)]).await;
     match result.unwrap() {
         PipelineOutcome::Fatal(msg) => {

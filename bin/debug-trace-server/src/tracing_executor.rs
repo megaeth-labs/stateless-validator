@@ -103,6 +103,9 @@ impl TracerKind {
 // Fast Tracing Environment Setup (for LightWitness)
 /// Pre-built execution environment for fast tracing operations.
 struct TracingEnv<'a> {
+    /// Consensus header of the block this env was built from — the single projection point,
+    /// so the witness DB can never be paired with a different block's header.
+    header: &'a alloy_consensus::Header,
     transactions: &'a [OpTransaction],
     executor_factory: MegaBlockExecutorFactory<
         ChainSpec,
@@ -152,15 +155,21 @@ impl<'a> TracingEnv<'a> {
             block_limits,
         );
 
-        Ok(Self { transactions, executor_factory, block_ctx, evm_env, light_witness_executor })
+        Ok(Self {
+            header: &block.header.inner,
+            transactions,
+            executor_factory,
+            block_ctx,
+            evm_env,
+            light_witness_executor,
+        })
     }
 
     fn create_witness_db<'b>(
         &'b self,
-        header: &'b alloy_consensus::Header,
         contracts: &'b HashMap<B256, Arc<Bytecode>>,
     ) -> WitnessDatabase<'b, LightWitnessExecutor> {
-        WitnessDatabase { header, witness: &self.light_witness_executor, contracts }
+        WitnessDatabase { header: self.header, witness: &self.light_witness_executor, contracts }
     }
 }
 
@@ -442,7 +451,7 @@ pub fn trace_block(
 
     trace!(tx_count = env.transactions.len(), "Starting block trace");
 
-    let witness_db = env.create_witness_db(&block.header.inner, contracts);
+    let witness_db = env.create_witness_db(contracts);
     let cache_db = CacheDB::new(&witness_db);
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
@@ -716,7 +725,7 @@ pub fn trace_transaction(
         "Starting transaction trace"
     );
 
-    let witness_db = env.create_witness_db(&block.header.inner, contracts);
+    let witness_db = env.create_witness_db(contracts);
     let cache_db = CacheDB::new(&witness_db);
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
@@ -872,7 +881,7 @@ pub fn parity_trace_block(
 ) -> Result<Vec<LocalizedTransactionTrace>, ValidationError> {
     let env = TracingEnv::new(chain_spec, block, light_witness)?;
 
-    let witness_db = env.create_witness_db(&block.header.inner, contracts);
+    let witness_db = env.create_witness_db(contracts);
     let cache_db = CacheDB::new(&witness_db);
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
@@ -926,7 +935,7 @@ pub fn parity_trace_transaction(
         return Err(ValidationError::BlockIncomplete);
     }
 
-    let witness_db = env.create_witness_db(&block.header.inner, contracts);
+    let witness_db = env.create_witness_db(contracts);
     let cache_db = CacheDB::new(&witness_db);
     let mut state = State::builder().with_database_ref(&cache_db).build();
 

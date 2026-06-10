@@ -101,7 +101,7 @@ pub trait ContractStore: Send + Sync {
 /// Chain-cursor management — the storage surface the pipeline drives on **every** scenario.
 ///
 /// Holds only operations the generic pipeline calls directly: read the tip/anchor, append a
-/// validated batch, read a block hash (for reorg reporting + bisection), roll back, and reset to
+/// validated batch, read a block hash (for reorg reporting), roll back, and reset to
 /// an anchor (stale-reset path). How a reorg *floor* is decided is NOT here — that's the
 /// pipeline's [`ReorgResolver`](crate::pipeline::ReorgResolver) seam, which each scenario supplies.
 /// History-owning stores additionally implement

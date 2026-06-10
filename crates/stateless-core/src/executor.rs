@@ -469,6 +469,11 @@ pub fn validate_block<B: BlockInput>(
     contracts: &HashMap<B256, Arc<Bytecode>>,
     #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
 ) -> Result<ValidationStats, ValidationError> {
+    // A block carrying only transaction hashes can't be replayed — fail fast before paying
+    // the witness proof verification. `replay_block` re-checks for direct callers.
+    if !block.is_complete() {
+        return Err(ValidationError::BlockIncomplete);
+    }
     let header = block.consensus_header();
 
     // Create external environment oracle from salt witness
@@ -629,27 +634,15 @@ pub fn validate_block<B: BlockInput>(
 
 #[cfg(test)]
 mod tests {
-    use stateless_test_utils::fixtures::TestFixtures;
+    use stateless_test_utils::{fixtures::TestFixtures, logging::init_test_logging};
 
     use super::*;
-
-    /// Print `stateless_core` debug logs (everything else at warn).
-    /// std-only: `set_default` and its guard live behind tracing's `std` feature.
-    #[cfg(feature = "std")]
-    fn init_test_logging() -> tracing::subscriber::DefaultGuard {
-        use tracing_subscriber::{EnvFilter, util::SubscriberInitExt};
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::new("warn").add_directive("stateless_core=debug".parse().unwrap()),
-            )
-            .set_default()
-    }
 
     /// Locks the `BlockInput` projection for RPC blocks: completeness, hash/header passthrough,
     /// and clone-free recovered senders (including the empty projection of a hashes-only block).
     #[test]
     fn block_input_projection_for_rpc_block() {
-        let fx = TestFixtures::mainnet();
+        let fx = TestFixtures::mainnet_shared();
         let (number, hash) = *fx.paired_blocks().first().expect("paired mainnet fixtures");
         let block = &fx.blocks[&hash];
 
@@ -676,10 +669,10 @@ mod tests {
     }
 
     /// A block carrying only transaction hashes must be rejected as `BlockIncomplete` by the
-    /// `is_complete()` gate before any replay is attempted.
+    /// `is_complete()` gate before any witness verification or replay work.
     #[test]
     fn validate_block_rejects_hashes_only_block() {
-        let fx = TestFixtures::mainnet();
+        let fx = TestFixtures::mainnet_shared();
         let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
         let (_, hash) = *fx.paired_blocks().first().expect("paired mainnet fixtures");
         let mut block = fx.blocks[&hash].clone();
@@ -700,9 +693,8 @@ mod tests {
 
     #[test]
     fn validate_block_mainnet_fixtures() {
-        #[cfg(feature = "std")]
-        let _logging = init_test_logging();
-        let fx = TestFixtures::mainnet();
+        let _logging = init_test_logging("stateless_core");
+        let fx = TestFixtures::mainnet_shared();
         let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
         let paired = fx.paired_blocks();
         assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");

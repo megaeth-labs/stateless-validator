@@ -21,14 +21,13 @@ use stateless_core::{
     pipeline::run_pipeline, withdrawals::MptWitness,
 };
 use stateless_db::ContractCache;
-use stateless_test_utils::fixtures::TestFixtures;
+use stateless_test_utils::{fixtures::TestFixtures, logging::init_test_logging};
 use stateless_validator::{
     CommandLineArgs, VALIDATOR_DB_FILENAME, ValidatorDB, ValidatorFetcher, ValidatorHooks,
     ValidatorProcessor, load_or_create_chain_spec,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
-use tracing_subscriber::{EnvFilter, util::SubscriberInitExt};
 
 /// Argv prefix for tests that exercise an *optional* flag — both required endpoints are
 /// already supplied so the parse only depends on the flag under test.
@@ -176,14 +175,6 @@ impl MockServerState {
             .collect();
         Self { fixtures, mpt_witnesses }
     }
-}
-
-fn init_test_logging() -> tracing::subscriber::DefaultGuard {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::new("warn").add_directive("stateless_validator=debug".parse().unwrap()),
-        )
-        .set_default()
 }
 
 fn make_rpc_error(code: i32, msg: String) -> ErrorObject<'static> {
@@ -376,7 +367,7 @@ async fn setup_mock_rpc_server(
 /// Synthetic data integration test: validates consecutive blocks via the streaming pipeline.
 #[tokio::test]
 async fn integration_test() {
-    let _logging = crate::init_test_logging();
+    let _logging = init_test_logging("stateless_validator");
     debug!("=== Loading Synthetic Test Data ===");
     let fx = TestFixtures::synthetic();
     let genesis_file = fx.data_dir.join("genesis.json");

@@ -58,7 +58,6 @@ stateless-test-utils = { path = "../stateless-test-utils" }
 
 # misc
 bincode.workspace = true
-tracing-subscriber.workspace = true
 
 [features]
 default = ["std"]

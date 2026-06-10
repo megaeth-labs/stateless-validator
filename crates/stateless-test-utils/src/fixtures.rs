@@ -13,7 +13,7 @@ use std::{
     fs::File,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use alloy_genesis::Genesis;
@@ -107,6 +107,13 @@ impl TestFixtures {
     /// Load `test_data/mainnet/` relative to the workspace root.
     pub fn mainnet() -> Self {
         Self::load(&workspace_root().join("test_data/mainnet"))
+    }
+
+    /// Shared mainnet fixtures, parsed once per test binary — use instead of [`Self::mainnet`]
+    /// when several tests in the same binary read (and don't mutate) the fixture set.
+    pub fn mainnet_shared() -> &'static Self {
+        static FIXTURES: LazyLock<TestFixtures> = LazyLock::new(TestFixtures::mainnet);
+        &FIXTURES
     }
 
     /// Load `test_data/synthetic/` relative to the workspace root.

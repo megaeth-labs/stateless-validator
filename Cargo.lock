@@ -5659,7 +5659,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber 0.3.23",
 ]
 
 [[package]]
@@ -5695,6 +5694,8 @@ dependencies = [
  "salt",
  "serde",
  "serde_json",
+ "tracing",
+ "tracing-subscriber 0.3.23",
 ]
 
 [[package]]
@@ -5724,7 +5725,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "tracing-subscriber 0.3.23",
 ]
 
 [[package]]
