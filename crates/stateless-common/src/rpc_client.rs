@@ -1800,10 +1800,6 @@ mod tests {
         let (handle, data_url) = start_block_number_rpc(1).await;
 
         let config = RpcClientConfig {
-            rpc_retry: BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(20)),
-            per_attempt_timeout: Duration::from_millis(150),
-            ..Default::default()
-        let config = RpcClientConfig {
             per_attempt_timeout: Duration::from_millis(150),
             ..Default::default()
         };
