@@ -14,7 +14,6 @@ alloy-eips.workspace = true
 alloy-evm.workspace = true
 alloy-genesis.workspace = true
 alloy-hardforks = { workspace = true, default-features = false }
-alloy-network-primitives.workspace = true
 alloy-op-evm.workspace = true
 alloy-op-hardforks = { workspace = true, default-features = false }
 alloy-primitives.workspace = true
@@ -59,6 +58,7 @@ stateless-test-utils = { path = "../stateless-test-utils" }
 
 # misc
 bincode.workspace = true
+tracing-subscriber.workspace = true
 
 [features]
 default = ["std"]
@@ -72,7 +72,6 @@ std = [
     "alloy-eips/std",
     "alloy-evm/std",
     "alloy-genesis/std",
-    "alloy-network-primitives/std",
     "alloy-op-evm/std",
     "alloy-primitives/std",
     "alloy-rlp/std",
