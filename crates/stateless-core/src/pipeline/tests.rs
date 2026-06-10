@@ -507,6 +507,37 @@ async fn test_chain_advancer_bisect_transient_error_returns_retry() {
     }
 }
 
+/// Covers `BisectResolver`'s fatal arm through the advancer: a reorg deeper than local history
+/// (the earliest local block's hash mismatches the remote → `CatastrophicReorg`, which
+/// `is_fatal()` classifies as unrecoverable) must end the cycle with `PipelineOutcome::Fatal`,
+/// not roll back or retry. Local history is only block 10, and the remote serves a different
+/// hash for it, so the divergence walk's first probe already detects the too-deep fork.
+#[tokio::test]
+async fn test_chain_advancer_bisect_catastrophic_reorg_returns_fatal() {
+    let tip = make_tip(10);
+    let mut rpc_hashes = HashMap::default();
+    rpc_hashes.insert(10, make_hash(99)); // remote disagrees with the earliest local block
+
+    let bad_block = MockBlock {
+        number: 11,
+        hash: make_hash(11),
+        parent: BlockHash::from([0xFF; 32]),
+        state_root: B256::ZERO,
+    };
+    let (result, _) = run_advancer(tip, rpc_hashes, vec![Ok(bad_block)]).await;
+    match result.unwrap() {
+        PipelineOutcome::Fatal(msg) => {
+            // Substring of `DivergenceError::CatastrophicReorg`'s own display — production
+            // code under test, unlike a mock's message format.
+            assert!(
+                msg.contains("Catastrophic reorg"),
+                "fatal reason must carry the catastrophic-reorg classification: {msg}"
+            );
+        }
+        other => panic!("expected Fatal outcome, got {other:?}"),
+    }
+}
+
 // find_divergence_point tests
 
 /// Minimal `DivergenceLookups` impl backed by a HashMap of block-number → hash for

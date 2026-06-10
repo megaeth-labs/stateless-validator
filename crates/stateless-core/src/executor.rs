@@ -645,6 +645,59 @@ mod tests {
             .set_default()
     }
 
+    /// Locks the `BlockInput` projection for RPC blocks: completeness, hash/header passthrough,
+    /// and clone-free recovered senders (including the empty projection of a hashes-only block).
+    #[test]
+    fn block_input_projection_for_rpc_block() {
+        let fx = TestFixtures::mainnet();
+        let (number, hash) = *fx.paired_blocks().first().expect("paired mainnet fixtures");
+        let block = &fx.blocks[&hash];
+
+        assert!(block.is_complete());
+        assert_eq!(BlockInput::block_hash(block), hash);
+        assert_eq!(block.consensus_header().number, number);
+
+        let BlockTransactions::Full(txs) = &block.transactions else {
+            panic!("fixture block must carry full transactions");
+        };
+        assert_eq!(block.txs_recovered().count(), txs.len());
+        for (recovered, tx) in block.txs_recovered().zip(txs) {
+            assert_eq!(
+                recovered.signer(),
+                tx.inner.inner.signer(),
+                "borrowed projection must keep the RPC-recovered sender"
+            );
+        }
+
+        let mut hashes_only = block.clone();
+        hashes_only.transactions = BlockTransactions::Hashes(Default::default());
+        assert!(!hashes_only.is_complete());
+        assert_eq!(hashes_only.txs_recovered().count(), 0);
+    }
+
+    /// A block carrying only transaction hashes must be rejected as `BlockIncomplete` by the
+    /// `is_complete()` gate before any replay is attempted.
+    #[test]
+    fn validate_block_rejects_hashes_only_block() {
+        let fx = TestFixtures::mainnet();
+        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
+        let (_, hash) = *fx.paired_blocks().first().expect("paired mainnet fixtures");
+        let mut block = fx.blocks[&hash].clone();
+        block.transactions = BlockTransactions::Hashes(Default::default());
+
+        let err = validate_block(
+            &chain_spec,
+            &block,
+            fx.salt_witnesses[&hash].clone(),
+            fx.mpt_witness(&hash),
+            &fx.contracts,
+            #[cfg(feature = "std")]
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ValidationError::BlockIncomplete), "{err:?}");
+    }
+
     #[test]
     fn validate_block_mainnet_fixtures() {
         #[cfg(feature = "std")]
