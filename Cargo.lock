@@ -5704,7 +5704,6 @@ dependencies = [
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rpc-types-eth",
- "bincode 2.0.1",
  "clap",
  "eyre",
  "jsonrpsee",

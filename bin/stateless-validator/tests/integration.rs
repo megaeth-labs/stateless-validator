@@ -171,13 +171,8 @@ impl MockServerState {
     fn new(fixtures: TestFixtures) -> Self {
         let mpt_witnesses = fixtures
             .mpt_witness_bytes
-            .iter()
-            .map(|(hash, bytes)| {
-                let (w, _): (MptWitness, _) =
-                    bincode::serde::decode_from_slice(bytes, bincode::config::legacy())
-                        .unwrap_or_else(|e| panic!("decode MptWitness for {hash}: {e}"));
-                (*hash, w)
-            })
+            .keys()
+            .map(|hash| (*hash, fixtures.mpt_witness(hash)))
             .collect();
         Self { fixtures, mpt_witnesses }
     }

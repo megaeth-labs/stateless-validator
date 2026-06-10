@@ -651,16 +651,11 @@ mod tests {
         let paired = fx.paired_blocks();
         assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
         for (number, hash) in paired {
-            let (mpt, _): (MptWitness, _) = bincode::serde::decode_from_slice(
-                &fx.mpt_witness_bytes[&hash],
-                bincode::config::legacy(),
-            )
-            .unwrap_or_else(|e| panic!("decode MptWitness for {hash}: {e}"));
             validate_block(
                 &chain_spec,
                 &fx.blocks[&hash],
                 fx.salt_witnesses[&hash].clone(),
-                mpt,
+                fx.mpt_witness(&hash),
                 &fx.contracts,
                 #[cfg(feature = "std")]
                 None,

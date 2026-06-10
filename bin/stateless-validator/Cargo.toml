@@ -32,7 +32,6 @@ stateless-core = { path = "../../crates/stateless-core" }
 stateless-db = { path = "../../crates/stateless-db" }
 
 # misc
-bincode.workspace = true
 clap = { workspace = true, features = ["env"] }
 eyre.workspace = true
 metrics.workspace = true

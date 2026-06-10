@@ -4,9 +4,8 @@
 //! used by integration tests across the workspace.
 //!
 //! `stateless-test-utils` intentionally does NOT depend on `stateless-core` to avoid
-//! circular dev-dependencies. Callers that need `MptWitness` or `ChainSpec` can decode
-//! `mpt_witness_bytes` themselves with
-//! `bincode::serde::decode_from_slice(&bytes, bincode::config::legacy())` and
+//! circular dev-dependencies. Callers that need `MptWitness` or `ChainSpec` can use the
+//! generic [`TestFixtures::mpt_witness`] decoder and
 //! `ChainSpec::from_genesis(fixtures.load_genesis().unwrap())`.
 
 use std::{
@@ -39,9 +38,8 @@ pub struct WitnessFileContent {
 /// Layout: `genesis.json`, `contracts.txt` (one JSON `[hash, bytecode]` per line),
 /// `blocks/<number>.json`, `stateless/witness/<number>.<hash>.{salt,mpt}` (bincode-legacy).
 ///
-/// `mpt_witness_bytes` stores raw bincode bytes; decode with
-/// `bincode::serde::decode_from_slice(&bytes, bincode::config::legacy())` in crates that
-/// depend on `stateless-core`.
+/// `mpt_witness_bytes` stores raw bincode-legacy bytes; decode via [`Self::mpt_witness`]
+/// in crates that depend on `stateless-core`.
 #[derive(Debug, Clone)]
 pub struct TestFixtures {
     pub data_dir: PathBuf,
@@ -114,6 +112,18 @@ impl TestFixtures {
     /// Load `test_data/synthetic/` relative to the workspace root.
     pub fn synthetic() -> Self {
         Self::load(&workspace_root().join("test_data/synthetic"))
+    }
+
+    /// Decodes the bincode-legacy MPT witness for `hash`, typically as
+    /// `stateless_core::withdrawals::MptWitness` (a type this crate cannot name).
+    pub fn mpt_witness<T: DeserializeOwned>(&self, hash: &BlockHash) -> T {
+        let bytes = self
+            .mpt_witness_bytes
+            .get(hash)
+            .unwrap_or_else(|| panic!("no MPT witness fixture for {hash}"));
+        let (witness, _) = bincode::serde::decode_from_slice(bytes, bincode::config::legacy())
+            .unwrap_or_else(|e| panic!("decode MPT witness for {hash}: {e}"));
+        witness
     }
 
     /// Blocks with both SALT and MPT witnesses, in block-number order.

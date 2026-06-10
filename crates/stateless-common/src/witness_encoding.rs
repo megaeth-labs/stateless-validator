@@ -98,13 +98,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("mainnet fixtures should contain paired witnesses");
-        let salt_witness = fixtures.salt_witnesses[&hash].clone();
-        let (mpt_witness, _): (MptWitness, usize) = bincode::serde::decode_from_slice(
-            &fixtures.mpt_witness_bytes[&hash],
-            bincode::config::legacy(),
-        )
-        .expect("fixture MPT witness should decode");
-        (salt_witness, mpt_witness)
+        (fixtures.salt_witnesses[&hash].clone(), fixtures.mpt_witness(&hash))
     }
 
     #[test]
