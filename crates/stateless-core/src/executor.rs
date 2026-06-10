@@ -630,12 +630,14 @@ pub fn validate_block<B: BlockInput>(
 #[cfg(test)]
 mod tests {
     use stateless_test_utils::fixtures::TestFixtures;
-    use tracing_subscriber::{EnvFilter, util::SubscriberInitExt};
 
     use super::*;
 
     /// Print `stateless_core` debug logs (everything else at warn).
+    /// std-only: `set_default` and its guard live behind tracing's `std` feature.
+    #[cfg(feature = "std")]
     fn init_test_logging() -> tracing::subscriber::DefaultGuard {
+        use tracing_subscriber::{EnvFilter, util::SubscriberInitExt};
         tracing_subscriber::fmt()
             .with_env_filter(
                 EnvFilter::new("warn").add_directive("stateless_core=debug".parse().unwrap()),
@@ -645,6 +647,7 @@ mod tests {
 
     #[test]
     fn validate_block_mainnet_fixtures() {
+        #[cfg(feature = "std")]
         let _logging = init_test_logging();
         let fx = TestFixtures::mainnet();
         let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
