@@ -241,6 +241,9 @@ pub trait BlockInput {
     /// `false`, which [`replay_block`] maps to [`ValidationError::BlockIncomplete`].
     fn is_complete(&self) -> bool;
     /// Recovered `(transaction, sender)` pairs, borrowed — no clone, no signature re-recovery.
+    ///
+    /// Callers must check [`Self::is_complete`] first: an incomplete block yields an empty
+    /// iterator here, not an error.
     fn txs_recovered(&self) -> impl Iterator<Item = Recovered<&OpTxEnvelope>> + '_;
 }
 

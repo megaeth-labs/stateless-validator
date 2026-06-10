@@ -141,7 +141,7 @@ where
                 // `Fatal`/`Retry` end the cycle.
                 let rollback_to = match resolver.resolve(fetcher, store, persisted_tip).await? {
                     ReorgResolution::Floor(floor) => {
-                        debug!(block = next_expected, ?floor, "Resolved reorg floor");
+                        debug!(block = next_expected, floor, "Resolved reorg floor");
                         floor
                     }
                     ReorgResolution::Fatal(msg) => return Ok(PipelineOutcome::Fatal(msg)),
