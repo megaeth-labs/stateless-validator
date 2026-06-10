@@ -47,7 +47,7 @@ use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
 use stateless_core::withdrawals::MptWitness;
 use tokio::sync::Semaphore;
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::{
     metrics::{RpcMethod, RpcMetrics},
@@ -610,7 +610,7 @@ impl RpcClient {
         {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(e)) => {
-                trace!(error = %e, "mega_setValidatedBlocks failed");
+                debug!(error = %e, "mega_setValidatedBlocks failed");
                 Err(eyre!("Failed to set validated blocks: {e}"))
             }
             Err(_) => {
