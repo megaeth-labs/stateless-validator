@@ -28,7 +28,7 @@ use stateless_validator::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{EnvFilter, util::SubscriberInitExt};
 
 /// Argv prefix for tests that exercise an *optional* flag — both required endpoints are
 /// already supplied so the parse only depends on the flag under test.
@@ -183,12 +183,12 @@ impl MockServerState {
     }
 }
 
-fn init_test_logging() {
-    let _ = tracing_subscriber::fmt()
+fn init_test_logging() -> tracing::subscriber::DefaultGuard {
+    tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::new("warn").add_directive("stateless_validator=debug".parse().unwrap()),
         )
-        .try_init();
+        .set_default()
 }
 
 fn make_rpc_error(code: i32, msg: String) -> ErrorObject<'static> {
@@ -381,7 +381,7 @@ async fn setup_mock_rpc_server(
 /// Synthetic data integration test: validates consecutive blocks via the streaming pipeline.
 #[tokio::test]
 async fn integration_test() {
-    init_test_logging();
+    let _logging = crate::init_test_logging();
     debug!("=== Loading Synthetic Test Data ===");
     let fx = TestFixtures::synthetic();
     let genesis_file = fx.data_dir.join("genesis.json");

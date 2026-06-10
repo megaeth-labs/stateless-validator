@@ -41,7 +41,10 @@
     "rex1Time": 1766282400,
     "rex2Time": 1770246000,
     "rex3Time": 1771639200,
-    "rex4Time": 1776659200
+    "rex4Time": 1776659200,
+    "rex5Time": 1780632000,
+    "rex5InitialSequencer": "0x7A49197dd1EBb8D38C67e4EB7626AF6adE432445",
+    "rex5InitialAdmin": "0x92e0E0B15e3e99b32c9ED9AD284F939553C7b7d6"
   },
   "nonce": "0x0",
   "timestamp": "0x691225d3",
