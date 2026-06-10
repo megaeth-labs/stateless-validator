@@ -18,11 +18,12 @@
 //!     healthy endpoints share load evenly.
 //!   - **Witness**: round always starts from provider 0 — the first witness endpoint is the
 //!     primary, others are failover-only.
-//! - **Deadlines**: every public method has a `_with_deadline` variant that takes an
+//! - **Deadlines**: retrying RPC methods have `_with_deadline` variants that take an
 //!   `Option<Instant>`. With `Some(deadline)` the retry loop returns [`RpcDeadlineExceeded`] once
 //!   the wall-clock deadline passes (and clamps each inter-round sleep so it doesn't overshoot).
 //!   With `None` the loop retries forever — this is the validator's background-sync contract. The
 //!   non-`_with_deadline` methods delegate to the deadline version with `None`.
+//!   `set_validated_blocks` is single-attempt, but still bounded by `per_attempt_timeout`.
 
 use std::{
     collections::HashMap,
@@ -597,16 +598,39 @@ impl RpcClient {
     ) -> Result<SetValidatedBlocksResponse> {
         let provider =
             self.report_provider.as_ref().ok_or_else(|| eyre!("Report provider not configured"))?;
-        let result = provider
-            .client()
-            .request("mega_setValidatedBlocks", (first_block, last_block))
-            .await
-            .map_err(|e| {
+        let attempt_start = Instant::now();
+        let result = match tokio::time::timeout(
+            self.config.per_attempt_timeout,
+            provider.client().request::<_, SetValidatedBlocksResponse>(
+                "mega_setValidatedBlocks",
+                (first_block, last_block),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(e)) => {
                 trace!(error = %e, "mega_setValidatedBlocks failed");
-                eyre!("Failed to set validated blocks: {e}")
-            });
+                Err(eyre!("Failed to set validated blocks: {e}"))
+            }
+            Err(_) => {
+                warn!(
+                    method = RpcMethod::MegaSetValidatedBlocks.as_str(),
+                    attempt_timeout_ms = self.config.per_attempt_timeout.as_millis() as u64,
+                    "Report RPC stalled past per-attempt timeout",
+                );
+                Err(eyre!(
+                    "mega_setValidatedBlocks timed out after {:?} (per_attempt_timeout)",
+                    self.config.per_attempt_timeout
+                ))
+            }
+        };
         if let Some(ref metrics) = self.config.metrics {
-            metrics.on_rpc_complete(RpcMethod::MegaSetValidatedBlocks, result.is_ok(), None);
+            metrics.on_rpc_complete(
+                RpcMethod::MegaSetValidatedBlocks,
+                result.is_ok(),
+                Some(attempt_start.elapsed().as_secs_f64()),
+            );
         }
         result
     }
@@ -1756,6 +1780,49 @@ mod tests {
             .await
             .expect("call must return — per-attempt timeout should rotate past stalled provider");
         assert_eq!(result, healthy_latest);
+
+        handle.stop().unwrap();
+    }
+
+    /// Reporting uses a dedicated provider and does not go through the retry helper, but it
+    /// still must have per-attempt timeout protection so the validation reporter task cannot
+    /// wedge forever on a TCP-accept-no-reply endpoint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_set_validated_blocks_times_out_stalled_report_provider() {
+        // Stalled report endpoint: keep a listener open so TCP connects succeed, but never
+        // accept/read/write from it. The HTTP request then waits forever without the timeout.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stalled_report_url = format!("http://{}/", listener.local_addr().unwrap());
+        let _listener = listener;
+
+        // Data/witness endpoints are unused by `set_validated_blocks`, but the client
+        // constructor requires them to be configured.
+        let (handle, data_url) = start_block_number_rpc(1).await;
+
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(20)),
+            per_attempt_timeout: Duration::from_millis(150),
+            ..Default::default()
+        };
+        let client = RpcClient::new_with_config(
+            &[&data_url],
+            &[&data_url],
+            config,
+            Some(&stalled_report_url),
+        )
+        .unwrap();
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(3),
+            client.set_validated_blocks((1, B256::ZERO), (2, B256::ZERO)),
+        )
+        .await
+        .expect("report call must return after per-attempt timeout")
+        .expect_err("stalled report endpoint should time out");
+        assert!(
+            err.to_string().contains("mega_setValidatedBlocks timed out"),
+            "unexpected error: {err}"
+        );
 
         handle.stop().unwrap();
     }
