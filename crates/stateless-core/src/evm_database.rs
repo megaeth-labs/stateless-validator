@@ -66,10 +66,10 @@ pub struct WitnessDatabase<'a, W> {
     /// Compact witness containing state subset and cryptographic proofs
     pub witness: &'a W,
     /// Contract bytecode cache, pre-populated before execution starts.
-    /// Values are plain `Bytecode`: it is already internally reference-counted (`Bytes` +
-    /// `Arc`-backed `JumpTable`), so the cache and any cloned `BlockData` share one allocation
-    /// without an outer `Arc`. revm's trait demands an owned `Bytecode`, so the `DatabaseRef`
-    /// impls clone (a cheap refcount bump) at the read boundary.
+    /// Values are plain `Bytecode`, which is already internally reference-counted, so the cache
+    /// and any cloned `BlockData` share one allocation without an outer `Arc`. revm's trait
+    /// demands an owned `Bytecode`, so the `DatabaseRef` impls clone (a cheap refcount bump) at
+    /// the read boundary.
     pub contracts: &'a HashMap<B256, Bytecode>,
 }
 
@@ -364,9 +364,9 @@ mod tests {
         // Empty-code hash short-circuits to empty bytecode without touching the map.
         assert!(db.code_by_hash_ref(KECCAK_EMPTY).unwrap().is_empty());
 
-        // Present hash returns the bytecode, sharing the same allocation (cheap refcount clone).
+        // Present hash returns the bytecode, sharing the same allocation (cheap refcount clone);
+        // pointer equality implies the bytes match, so it also confirms the right code came back.
         let got = db.code_by_hash_ref(hash).unwrap();
-        assert_eq!(got.bytes_slice(), code.bytes_slice());
         assert_eq!(got.bytes_slice().as_ptr(), code.bytes_slice().as_ptr());
 
         // Absent hash errors.

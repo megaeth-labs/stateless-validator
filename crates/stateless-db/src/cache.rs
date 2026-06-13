@@ -75,10 +75,9 @@ pub struct ContractCacheStats {
 /// Writes go to both disk and memory (write-through; disk first so a failed store
 /// write never leaves memory hotter than disk).
 ///
-/// Values are stored as plain `Bytecode`, which is already internally reference-counted
-/// (`Bytes` buffer + `Arc`-backed `JumpTable`), so hits — the hot path — return by a cheap
-/// refcount bump that shares the same allocation, not a deep copy. An outer `Arc` would be
-/// redundant indirection.
+/// Values are stored as plain `Bytecode`, which is already internally reference-counted, so hits
+/// — the hot path — return by a cheap refcount bump that shares the same allocation, not a deep
+/// copy. An outer `Arc` would be redundant indirection.
 pub struct ContractCache {
     memory: MemoryCache,
     store: Arc<dyn ContractStore>,
