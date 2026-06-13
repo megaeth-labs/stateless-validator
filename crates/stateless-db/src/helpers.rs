@@ -1,7 +1,5 @@
 //! Shared redb read/write helpers used by both concrete database implementations.
 
-use std::sync::Arc;
-
 use alloy_primitives::{B256, BlockHash, BlockNumber, map::HashMap};
 use redb::{ReadableDatabase, ReadableTable};
 use revm::state::Bytecode;
@@ -150,14 +148,14 @@ pub fn read_contracts(database: &Database, hashes: &[B256]) -> StoreResult<Contr
     let read_txn = database.begin_read().store_err()?;
     let table = read_txn.open_table(CONTRACTS).store_err()?;
 
-    let mut found: HashMap<B256, Arc<Bytecode>> = HashMap::default();
+    let mut found: HashMap<B256, Bytecode> = HashMap::default();
     let mut missing = Vec::new();
 
     for &hash in hashes {
         match table.get(hash.0).store_err()? {
             Some(data) => {
                 let bytecode: Bytecode = decode_from_slice(data.value().as_slice())?;
-                found.insert(hash, Arc::new(bytecode));
+                found.insert(hash, bytecode);
             }
             None => missing.push(hash),
         }
@@ -167,10 +165,7 @@ pub fn read_contracts(database: &Database, hashes: &[B256]) -> StoreResult<Contr
 }
 
 /// Stores contract bytecodes in the CONTRACTS table.
-pub fn write_add_contracts(
-    database: &Database,
-    codes: &[(B256, Arc<Bytecode>)],
-) -> StoreResult<()> {
+pub fn write_add_contracts(database: &Database, codes: &[(B256, Bytecode)]) -> StoreResult<()> {
     if codes.is_empty() {
         return Ok(());
     }
@@ -178,7 +173,7 @@ pub fn write_add_contracts(
     {
         let mut table = write_txn.open_table(CONTRACTS).store_err()?;
         for (hash, bytecode) in codes {
-            let encoded = encode_to_vec(bytecode.as_ref())?;
+            let encoded = encode_to_vec(bytecode)?;
             table.insert(hash.0, encoded).store_err()?;
         }
     }
@@ -264,8 +259,8 @@ mod tests {
     fn contracts_roundtrip_and_missing_report() {
         let (_dir, db) = temp_db();
 
-        let a = (B256::from([1u8; 32]), Arc::new(Bytecode::new_raw(Bytes::from_static(&[0x60]))));
-        let b = (B256::from([2u8; 32]), Arc::new(Bytecode::new_raw(Bytes::from_static(&[0x61]))));
+        let a = (B256::from([1u8; 32]), Bytecode::new_raw(Bytes::from_static(&[0x60])));
+        let b = (B256::from([2u8; 32]), Bytecode::new_raw(Bytes::from_static(&[0x61])));
         let missing_hash = B256::from([3u8; 32]);
 
         write_add_contracts(&db, &[]).unwrap();

@@ -196,7 +196,7 @@ impl BlockProcessor for ValidatorProcessor {
                     }
                 })?;
 
-            let new_bytecodes: Vec<(B256, Arc<Bytecode>)> = fetched.into_iter().collect();
+            let new_bytecodes: Vec<(B256, Bytecode)> = fetched.into_iter().collect();
 
             self.contract_cache
                 .insert(&new_bytecodes)

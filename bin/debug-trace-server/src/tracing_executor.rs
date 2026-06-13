@@ -24,8 +24,6 @@
 //! ## Parity-style (trace_* methods)
 //! - `LocalizedTransactionTrace` - Flat call traces with block/tx context
 
-use std::sync::Arc;
-
 use alloy_consensus::Transaction;
 use alloy_evm::{Evm as EvmTrait, block::BlockExecutor};
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
@@ -167,7 +165,7 @@ impl<'a> TracingEnv<'a> {
 
     fn create_witness_db<'b>(
         &'b self,
-        contracts: &'b HashMap<B256, Arc<Bytecode>>,
+        contracts: &'b HashMap<B256, Bytecode>,
     ) -> WitnessDatabase<'b, LightWitnessExecutor> {
         WitnessDatabase { header: self.header, witness: &self.light_witness_executor, contracts }
     }
@@ -444,7 +442,7 @@ pub fn trace_block(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
     witness: LightWitness,
-    contracts: &HashMap<B256, Arc<Bytecode>>,
+    contracts: &HashMap<B256, Bytecode>,
     opts: GethDebugTracingOptions,
 ) -> Result<Vec<TraceResult>, ValidationError> {
     let env = TracingEnv::new(chain_spec, block, witness)?;
@@ -710,7 +708,7 @@ pub fn trace_transaction(
     block: &Block<OpTransaction>,
     tx_index: usize,
     light_witness: LightWitness,
-    contracts: &HashMap<B256, Arc<Bytecode>>,
+    contracts: &HashMap<B256, Bytecode>,
     opts: GethDebugTracingOptions,
 ) -> Result<GethTrace, ValidationError> {
     let env = TracingEnv::new(chain_spec, block, light_witness)?;
@@ -877,7 +875,7 @@ pub fn parity_trace_block(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
     light_witness: LightWitness,
-    contracts: &HashMap<B256, Arc<Bytecode>>,
+    contracts: &HashMap<B256, Bytecode>,
 ) -> Result<Vec<LocalizedTransactionTrace>, ValidationError> {
     let env = TracingEnv::new(chain_spec, block, light_witness)?;
 
@@ -927,7 +925,7 @@ pub fn parity_trace_transaction(
     block: &Block<OpTransaction>,
     tx_index: usize,
     light_witness: LightWitness,
-    contracts: &HashMap<B256, Arc<Bytecode>>,
+    contracts: &HashMap<B256, Bytecode>,
 ) -> Result<Vec<LocalizedTransactionTrace>, ValidationError> {
     let env = TracingEnv::new(chain_spec, block, light_witness)?;
 

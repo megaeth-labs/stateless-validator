@@ -44,20 +44,15 @@ impl Default for ContractCacheConfig {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BytecodeWeighter;
 
-impl Weighter<B256, Arc<Bytecode>> for BytecodeWeighter {
-    fn weight(&self, _key: &B256, val: &Arc<Bytecode>) -> u64 {
+impl Weighter<B256, Bytecode> for BytecodeWeighter {
+    fn weight(&self, _key: &B256, val: &Bytecode) -> u64 {
         const ENTRY_OVERHEAD: u64 = 128;
         ENTRY_OVERHEAD + val.bytes_slice().len() as u64
     }
 }
 
-type MemoryCache = Cache<
-    B256,
-    Arc<Bytecode>,
-    BytecodeWeighter,
-    RandomState,
-    DefaultLifecycle<B256, Arc<Bytecode>>,
->;
+type MemoryCache =
+    Cache<B256, Bytecode, BytecodeWeighter, RandomState, DefaultLifecycle<B256, Bytecode>>;
 
 /// Snapshot of cache counters.
 #[derive(Debug, Clone, Copy, Default)]
@@ -80,8 +75,10 @@ pub struct ContractCacheStats {
 /// Writes go to both disk and memory (write-through; disk first so a failed store
 /// write never leaves memory hotter than disk).
 ///
-/// Values are stored as `Arc<Bytecode>` so that hits — the hot path — return by
-/// reference-count bump instead of deep-copying the bytecode.
+/// Values are stored as plain `Bytecode`, which is already internally reference-counted
+/// (`Bytes` buffer + `Arc`-backed `JumpTable`), so hits — the hot path — return by a cheap
+/// refcount bump that shares the same allocation, not a deep copy. An outer `Arc` would be
+/// redundant indirection.
 pub struct ContractCache {
     memory: MemoryCache,
     store: Arc<dyn ContractStore>,
@@ -120,14 +117,14 @@ impl ContractCache {
     /// caller should use a verified RPC fetch (`RpcClient::get_codes(.., verify=true)`)
     /// to populate the cache so all entries arrive pre-verified.
     pub fn get(&self, hashes: &[B256]) -> StoreResult<ContractLookup> {
-        let mut found: HashMap<B256, Arc<Bytecode>> = HashMap::default();
+        let mut found: HashMap<B256, Bytecode> = HashMap::default();
         found.reserve(hashes.len());
         let mut not_in_memory = Vec::with_capacity(hashes.len());
 
         for &hash in hashes {
-            if let Some(arc) = self.memory.get(&hash) {
+            if let Some(code) = self.memory.get(&hash) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
-                found.insert(hash, arc);
+                found.insert(hash, code);
             } else {
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 not_in_memory.push(hash);
@@ -140,8 +137,8 @@ impl ContractCache {
 
         let (from_disk, missing) = self.store.get_contracts(&not_in_memory)?;
 
-        for (hash, arc) in &from_disk {
-            self.memory.insert(*hash, arc.clone());
+        for (hash, code) in &from_disk {
+            self.memory.insert(*hash, code.clone());
         }
         found.extend(from_disk);
 
@@ -149,15 +146,15 @@ impl ContractCache {
     }
 
     /// Adds contract bytecodes to both disk and memory (write-through).
-    pub fn insert(&self, codes: &[(B256, Arc<Bytecode>)]) -> StoreResult<()> {
+    pub fn insert(&self, codes: &[(B256, Bytecode)]) -> StoreResult<()> {
         if codes.is_empty() {
             return Ok(());
         }
 
         self.store.add_contracts(codes)?;
 
-        for (hash, arc) in codes {
-            self.memory.insert(*hash, arc.clone());
+        for (hash, code) in codes {
+            self.memory.insert(*hash, code.clone());
         }
         self.inserts.fetch_add(1, Ordering::Relaxed);
 
@@ -185,12 +182,12 @@ mod tests {
 
     use super::*;
 
-    fn bc(b: u8) -> Arc<Bytecode> {
-        Arc::new(Bytecode::new_raw(Bytes::from(vec![b])))
+    fn bc(b: u8) -> Bytecode {
+        Bytecode::new_raw(Bytes::from(vec![b]))
     }
 
-    fn bc_sized(len: usize, fill: u8) -> Arc<Bytecode> {
-        Arc::new(Bytecode::new_raw(Bytes::from(vec![fill; len])))
+    fn bc_sized(len: usize, fill: u8) -> Bytecode {
+        Bytecode::new_raw(Bytes::from(vec![fill; len]))
     }
 
     fn h(n: u8) -> B256 {
@@ -200,7 +197,7 @@ mod tests {
     /// In-memory `ContractStore` that tracks hit counts and can be toggled to fail on writes.
     #[derive(Default)]
     struct FakeStore {
-        data: dashmap::DashMap<B256, Arc<Bytecode>>,
+        data: dashmap::DashMap<B256, Bytecode>,
         get_calls: AtomicUsize,
         add_calls: AtomicUsize,
         fail_add: std::sync::atomic::AtomicBool,
@@ -219,9 +216,9 @@ mod tests {
         fn get_contracts(
             &self,
             hashes: &[B256],
-        ) -> StoreResult<(HashMap<B256, Arc<Bytecode>>, Vec<B256>)> {
+        ) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
             self.get_calls.fetch_add(1, Ordering::Relaxed);
-            let mut found: HashMap<B256, Arc<Bytecode>> = HashMap::default();
+            let mut found: HashMap<B256, Bytecode> = HashMap::default();
             let mut missing = Vec::new();
             for &h in hashes {
                 match self.data.get(&h) {
@@ -234,7 +231,7 @@ mod tests {
             Ok((found, missing))
         }
 
-        fn add_contracts(&self, codes: &[(B256, Arc<Bytecode>)]) -> StoreResult<()> {
+        fn add_contracts(&self, codes: &[(B256, Bytecode)]) -> StoreResult<()> {
             self.add_calls.fetch_add(1, Ordering::Relaxed);
             if self.fail_add.load(Ordering::Relaxed) {
                 return Err(StoreError::Corrupt("fake add failure".into()));
@@ -255,7 +252,13 @@ mod tests {
 
         let (found, missing) = cache.get(&[h(1)]).unwrap();
         let returned = found.get(&h(1)).unwrap();
-        assert!(Arc::ptr_eq(returned, &original), "memory hit must share the same Arc allocation");
+        // `Bytecode` is internally reference-counted, so a memory hit shares the same underlying
+        // buffer rather than deep-copying: the cloned-out value points at the same allocation.
+        assert_eq!(
+            returned.bytes_slice().as_ptr(),
+            original.bytes_slice().as_ptr(),
+            "memory hit must share the same bytecode allocation (cheap clone, no deep copy)",
+        );
         assert!(missing.is_empty());
         assert_eq!(store.get_calls(), 0, "memory hit must not hit store");
     }

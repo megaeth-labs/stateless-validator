@@ -7,7 +7,6 @@
 use std::{
     format,
     string::{String, ToString},
-    sync::Arc,
     vec::Vec,
 };
 
@@ -67,10 +66,11 @@ pub struct WitnessDatabase<'a, W> {
     /// Compact witness containing state subset and cryptographic proofs
     pub witness: &'a W,
     /// Contract bytecode cache, pre-populated before execution starts.
-    /// Values are `Arc<Bytecode>` so the cache and any cloned `BlockData` share a
-    /// single allocation; revm's trait still demands an owned `Bytecode`, so the
-    /// `DatabaseRef` impls deref-clone at the read boundary.
-    pub contracts: &'a HashMap<B256, Arc<Bytecode>>,
+    /// Values are plain `Bytecode`: it is already internally reference-counted (`Bytes` +
+    /// `Arc`-backed `JumpTable`), so the cache and any cloned `BlockData` share one allocation
+    /// without an outer `Arc`. revm's trait demands an owned `Bytecode`, so the `DatabaseRef`
+    /// impls clone (a cheap refcount bump) at the read boundary.
+    pub contracts: &'a HashMap<B256, Bytecode>,
 }
 
 impl<'a, W> WitnessDatabase<'a, W>
@@ -104,10 +104,7 @@ where
             _ => None,
         }) {
             Some(acc) => {
-                let code = acc
-                    .codehash
-                    .and_then(|hash| self.contracts.get(&hash))
-                    .map(|arc| (**arc).clone());
+                let code = acc.codehash.and_then(|hash| self.contracts.get(&hash)).cloned();
                 Ok(Some(AccountInfo {
                     balance: acc.balance,
                     nonce: acc.nonce,
@@ -128,7 +125,7 @@ where
         }
         self.contracts
             .get(&code_hash)
-            .map(|arc| (**arc).clone())
+            .cloned()
             .ok_or_else(|| WitnessDatabaseError("Code not found".to_string()))
     }
 

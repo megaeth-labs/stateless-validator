@@ -12,7 +12,7 @@
 //! Concrete implementations live in their respective binaries;
 //! shared redb helpers live in the `stateless-db` crate.
 
-use std::{boxed::Box, fmt, string::String, sync::Arc, vec::Vec};
+use std::{boxed::Box, fmt, string::String, vec::Vec};
 
 use alloy_primitives::{B256, BlockHash, BlockNumber, map::HashMap};
 use revm::state::Bytecode;
@@ -86,16 +86,17 @@ impl fmt::Display for MissingDataKind {
 }
 
 /// Result of a contract bytecode lookup: `(found, missing)`.
-pub type ContractLookup = (HashMap<B256, Arc<Bytecode>>, Vec<B256>);
+pub type ContractLookup = (HashMap<B256, Bytecode>, Vec<B256>);
 
 /// Contract bytecode persistence.
 ///
-/// Values are exchanged as `Arc<Bytecode>` so the in-memory `ContractCache` and
-/// downstream consumers (e.g. revm execution via `WitnessDatabase`) can share a
-/// single allocation instead of deep-cloning bytecode on every cache hit.
+/// Values are exchanged as plain `Bytecode`, not `Arc<Bytecode>`: `Bytecode` is already
+/// internally reference-counted (its `Bytes` buffer and `JumpTable` are both `Arc`-backed),
+/// so cloning is an O(1) refcount bump that shares the same allocation. An outer `Arc` would
+/// only add a redundant layer of indirection and a second heap allocation per contract.
 pub trait ContractStore: Send + Sync {
     fn get_contracts(&self, hashes: &[B256]) -> StoreResult<ContractLookup>;
-    fn add_contracts(&self, codes: &[(B256, Arc<Bytecode>)]) -> StoreResult<()>;
+    fn add_contracts(&self, codes: &[(B256, Bytecode)]) -> StoreResult<()>;
 }
 
 /// Chain-cursor management — the storage surface the pipeline drives on **every** scenario.

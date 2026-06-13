@@ -3,7 +3,7 @@
 //! Provides persistent storage of block data, witnesses, and canonical chain state
 //! for serving `debug_*` and `trace_*` RPC methods.
 
-use std::{path::Path, sync::Arc};
+use std::path::Path;
 
 use alloy_primitives::{B256, BlockHash, BlockNumber, map::HashMap};
 use alloy_rpc_types_eth::Block;
@@ -218,14 +218,11 @@ impl ServerDB {
 }
 
 impl ContractStore for ServerDB {
-    fn get_contracts(
-        &self,
-        hashes: &[B256],
-    ) -> StoreResult<(HashMap<B256, Arc<Bytecode>>, Vec<B256>)> {
+    fn get_contracts(&self, hashes: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
         read_contracts(&self.database, hashes)
     }
 
-    fn add_contracts(&self, codes: &[(B256, Arc<Bytecode>)]) -> StoreResult<()> {
+    fn add_contracts(&self, codes: &[(B256, Bytecode)]) -> StoreResult<()> {
         write_add_contracts(&self.database, codes)
     }
 }
@@ -352,8 +349,7 @@ mod tests {
 
         let hash1 = B256::from([1u8; 32]);
         let hash2 = B256::from([2u8; 32]);
-        let bytecode =
-            Arc::new(Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00])));
+        let bytecode = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
 
         ContractStore::add_contracts(&db, &[(hash1, bytecode.clone())]).unwrap();
 

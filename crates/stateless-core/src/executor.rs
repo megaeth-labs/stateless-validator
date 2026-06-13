@@ -26,7 +26,7 @@
 //! The module integrates with the Salt witness system for state reconstruction
 //! and uses Revm for transaction execution.
 
-use std::{boxed::Box, collections::BTreeMap, fmt::Debug, sync::Arc, vec::Vec};
+use std::{boxed::Box, collections::BTreeMap, fmt::Debug, vec::Vec};
 #[cfg(feature = "std")]
 use std::{io::Write, time::Instant};
 
@@ -469,7 +469,7 @@ pub fn validate_block<B: BlockInput>(
     block: &B,
     salt_witness: SaltWitness,
     mpt_witness: MptWitness,
-    contracts: &HashMap<B256, Arc<Bytecode>>,
+    contracts: &HashMap<B256, Bytecode>,
     #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
 ) -> Result<ValidationStats, ValidationError> {
     // A block carrying only transaction hashes can't be replayed — fail fast before paying

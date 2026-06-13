@@ -65,8 +65,9 @@ pub struct BlockData {
     /// Light witness without expensive EC point validation.
     pub witness: LightWitness,
     /// Contract bytecodes keyed by code hash, required for EVM execution.
-    /// Values share allocations with the `ContractCache`.
-    pub contracts: HashMap<B256, Arc<Bytecode>>,
+    /// `Bytecode` is internally reference-counted, so values share their underlying allocation
+    /// with the `ContractCache` (and across `BlockData` clones) via cheap refcount-bump clones.
+    pub contracts: HashMap<B256, Bytecode>,
 }
 
 /// Default timeout for a user-facing witness fetch in seconds (8 seconds).
@@ -554,7 +555,7 @@ impl DataProvider {
         &self,
         code_hashes: &[B256],
         deadline: Instant,
-    ) -> DataProviderResult<HashMap<B256, Arc<Bytecode>>> {
+    ) -> DataProviderResult<HashMap<B256, Bytecode>> {
         resolve_contracts_inner(&self.rpc_client, &self.contract_cache, code_hashes, deadline).await
     }
 }
@@ -753,7 +754,7 @@ async fn resolve_contracts_inner(
     contract_cache: &ContractCache,
     code_hashes: &[B256],
     deadline: Instant,
-) -> DataProviderResult<HashMap<B256, Arc<Bytecode>>> {
+) -> DataProviderResult<HashMap<B256, Bytecode>> {
     let (mut contracts, missing) = contract_cache.get(code_hashes)?;
 
     if missing.is_empty() {
@@ -771,7 +772,7 @@ async fn resolve_contracts_inner(
     // `TraceRpcMetrics` adapter inside `round_robin_with_backoff`.
     let fetched = rpc_client.get_codes_with_deadline(&missing, true, Some(deadline)).await?;
 
-    let new_contracts: Vec<(B256, Arc<Bytecode>)> = fetched.into_iter().collect();
+    let new_contracts: Vec<(B256, Bytecode)> = fetched.into_iter().collect();
 
     // Write-through: memory always, disk in local-cache mode. We don't fail the trace on
     // cache-insert errors; the request has already been served.
@@ -791,14 +792,11 @@ async fn resolve_contracts_inner(
 pub(crate) struct NoopContractStore;
 
 impl ContractStore for NoopContractStore {
-    fn get_contracts(
-        &self,
-        hashes: &[B256],
-    ) -> StoreResult<(HashMap<B256, Arc<Bytecode>>, Vec<B256>)> {
+    fn get_contracts(&self, hashes: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
         Ok((HashMap::default(), hashes.to_vec()))
     }
 
-    fn add_contracts(&self, _codes: &[(B256, Arc<Bytecode>)]) -> StoreResult<()> {
+    fn add_contracts(&self, _codes: &[(B256, Bytecode)]) -> StoreResult<()> {
         Ok(())
     }
 }

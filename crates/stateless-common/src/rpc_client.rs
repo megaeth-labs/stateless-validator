@@ -654,15 +654,15 @@ impl RpcClient {
     ///
     /// # Return type
     ///
-    /// Returns `Arc<Bytecode>` so the value shares one allocation with the
-    /// [`crate::ContractCache`] end-to-end. Callers that feed into the verified
-    /// `ContractCache` tiers should pass `verify = true`; the cache itself trusts memory/disk
-    /// hits and does not re-verify.
+    /// Returns plain `Bytecode`: it is already internally reference-counted, so it shares one
+    /// underlying allocation with the [`crate::ContractCache`] end-to-end without an outer `Arc`.
+    /// Callers that feed into the verified `ContractCache` tiers should pass `verify = true`; the
+    /// cache itself trusts memory/disk hits and does not re-verify.
     pub async fn get_codes(
         &self,
         hashes: &[B256],
         verify: bool,
-    ) -> std::result::Result<HashMap<B256, Arc<Bytecode>>, CodeFetchError> {
+    ) -> std::result::Result<HashMap<B256, Bytecode>, CodeFetchError> {
         self.get_codes_with_deadline(hashes, verify, None).await
     }
 
@@ -677,7 +677,7 @@ impl RpcClient {
         hashes: &[B256],
         verify: bool,
         deadline: Option<Instant>,
-    ) -> std::result::Result<HashMap<B256, Arc<Bytecode>>, CodeFetchError> {
+    ) -> std::result::Result<HashMap<B256, Bytecode>, CodeFetchError> {
         // `try_join_all` cancels the remaining per-hash futures on the first error — a
         // `VerificationFailure` or `Deadline` on one hash stops the rest of the batch
         // immediately and releases their concurrency permits, so a slow straggler can't
@@ -691,7 +691,7 @@ impl RpcClient {
                     return Err(CodeFetchError::VerificationFailure { requested: hash, actual });
                 }
             }
-            Ok::<_, CodeFetchError>((hash, Arc::new(code)))
+            Ok::<_, CodeFetchError>((hash, code))
         }))
         .await
         .map(|pairs| pairs.into_iter().collect())
@@ -1655,10 +1655,10 @@ mod tests {
         handle.stop().unwrap();
     }
 
-    /// All-good batch: verified entries are returned wrapped in `Arc<Bytecode>` (the type
-    /// change that lets `ContractCache::insert` avoid a second allocation at each call site).
+    /// All-good batch: verified entries are returned as plain `Bytecode` (already internally
+    /// reference-counted, so `ContractCache::insert` shares the allocation without a second wrap).
     #[tokio::test]
-    async fn test_get_codes_verify_ok_returns_arc_bytecode() {
+    async fn test_get_codes_verify_ok_returns_bytecode() {
         let good_code = Bytes::from_static(&[0x60, 0x00, 0x60, 0x01]);
         let good_hash = Bytecode::new_raw(good_code.clone()).hash_slow();
 
@@ -1667,10 +1667,10 @@ mod tests {
 
         let ok = client.get_codes(&[good_hash], true).await.unwrap();
         assert_eq!(ok.len(), 1);
-        let arc = ok.get(&good_hash).expect("good hash present");
-        assert_eq!(arc.bytes_slice(), Bytecode::new_raw(good_code).bytes_slice());
-        // Compile-time check that the return type is `Arc<Bytecode>` (refcount share with cache).
-        let _arc_clone: Arc<Bytecode> = Arc::clone(arc);
+        let code = ok.get(&good_hash).expect("good hash present");
+        assert_eq!(code.bytes_slice(), Bytecode::new_raw(good_code).bytes_slice());
+        // Compile-time check that the return type is plain `Bytecode` (a cheap refcount clone).
+        let _code_clone: Bytecode = code.clone();
 
         handle.stop().unwrap();
     }

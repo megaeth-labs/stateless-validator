@@ -13,7 +13,7 @@ use std::{
     fs::File,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock},
+    sync::LazyLock,
 };
 
 use alloy_genesis::Genesis;
@@ -47,7 +47,7 @@ pub struct TestFixtures {
     pub block_numbers: BTreeMap<u64, BlockHash>,
     pub salt_witnesses: HashMap<BlockHash, SaltWitness>,
     pub mpt_witness_bytes: HashMap<BlockHash, Vec<u8>>,
-    pub contracts: HashMap<B256, Arc<Bytecode>>,
+    pub contracts: HashMap<B256, Bytecode>,
 }
 
 impl TestFixtures {
@@ -184,7 +184,7 @@ pub fn load_json<T: DeserializeOwned>(path: impl AsRef<Path>) -> Result<T> {
 }
 
 /// Loads contract bytecodes from a file (one `[hash, bytecode]` JSON per line).
-pub fn load_contracts(path: impl AsRef<Path>) -> HashMap<B256, Arc<Bytecode>> {
+pub fn load_contracts(path: impl AsRef<Path>) -> HashMap<B256, Bytecode> {
     let path = path.as_ref();
     let file = File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     BufReader::new(file)
@@ -194,7 +194,7 @@ pub fn load_contracts(path: impl AsRef<Path>) -> HashMap<B256, Arc<Bytecode>> {
         .map(|l| {
             let (hash, bytecode): (B256, Bytecode) =
                 serde_json::from_str(&l).expect("parse contract");
-            (hash, Arc::new(bytecode))
+            (hash, bytecode)
         })
         .collect()
 }
