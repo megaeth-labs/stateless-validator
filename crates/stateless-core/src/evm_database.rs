@@ -344,4 +344,33 @@ mod tests {
 
         assert!(err.0.contains("bad metadata for bucket 65536"));
     }
+
+    /// `code_by_hash_ref` serves bytecode from the pre-populated contracts map: the empty-code
+    /// hash short-circuits to empty bytecode, a present hash returns the bytecode (a cheap clone
+    /// sharing the same underlying buffer), and an absent hash errors. revm normally reads code
+    /// inline via `basic_ref`'s `AccountInfo.code`, so this by-hash path is otherwise untested.
+    #[test]
+    fn code_by_hash_ref_serves_contracts_map() {
+        let header = Header::default();
+        let witness = LightWitness { kvs: Default::default(), levels: Default::default() };
+
+        let code = Bytecode::new_raw(Bytes::from_static(&[0x60, 0x00, 0x60, 0x01]));
+        let hash = code.hash_slow();
+        let mut contracts = HashMap::default();
+        contracts.insert(hash, code.clone());
+
+        let db = WitnessDatabase { header: &header, witness: &witness, contracts: &contracts };
+
+        // Empty-code hash short-circuits to empty bytecode without touching the map.
+        assert!(db.code_by_hash_ref(KECCAK_EMPTY).unwrap().is_empty());
+
+        // Present hash returns the bytecode, sharing the same allocation (cheap refcount clone).
+        let got = db.code_by_hash_ref(hash).unwrap();
+        assert_eq!(got.bytes_slice(), code.bytes_slice());
+        assert_eq!(got.bytes_slice().as_ptr(), code.bytes_slice().as_ptr());
+
+        // Absent hash errors.
+        let err = db.code_by_hash_ref(B256::from([0xAB; 32])).unwrap_err();
+        assert!(err.0.contains("Code not found"));
+    }
 }
