@@ -364,9 +364,10 @@ mod tests {
         // Empty-code hash short-circuits to empty bytecode without touching the map.
         assert!(db.code_by_hash_ref(KECCAK_EMPTY).unwrap().is_empty());
 
-        // Present hash returns the bytecode, sharing the same allocation (cheap refcount clone);
-        // pointer equality implies the bytes match, so it also confirms the right code came back.
         let got = db.code_by_hash_ref(hash).unwrap();
+        // Correctness: the bytecode for the requested hash came back.
+        assert_eq!(got.bytes_slice(), code.bytes_slice());
+        // Cheap-clone property: the returned value shares the same underlying allocation.
         assert_eq!(got.bytes_slice().as_ptr(), code.bytes_slice().as_ptr());
 
         // Absent hash errors.
