@@ -1157,7 +1157,7 @@ checksum = "7b7e4c2464d97fe331d41de9d5db0def0a96f4d823b8b32a2efd503578988973"
 [[package]]
 name = "banderwagon"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.4#99781324bc9c5b4ee9a1a6e4bae536950e5e1786"
+source = "git+https://github.com/megaeth-labs/salt.git?tag=v1.0.4#99781324bc9c5b4ee9a1a6e4bae536950e5e1786"
 dependencies = [
  "ark-ec 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
  "ark-ed-on-bls12-381-bandersnatch",
@@ -1809,7 +1809,7 @@ dependencies = [
 
 [[package]]
 name = "debug-trace-server"
-version = "2.0.12"
+version = "2.0.13"
 dependencies = [
  "alloy-consensus",
  "alloy-evm",
@@ -2876,7 +2876,7 @@ dependencies = [
 [[package]]
 name = "ipa-multipoint"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.4#99781324bc9c5b4ee9a1a6e4bae536950e5e1786"
+source = "git+https://github.com/megaeth-labs/salt.git?tag=v1.0.4#99781324bc9c5b4ee9a1a6e4bae536950e5e1786"
 dependencies = [
  "banderwagon",
  "hashbrown 0.16.1",
@@ -3256,7 +3256,7 @@ dependencies = [
 [[package]]
 name = "mega-evm"
 version = "1.6.0"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=v1.6.0#be4418d5310a695a753b27f9ef627ae5b6035021"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?tag=v1.6.0#be4418d5310a695a753b27f9ef627ae5b6035021"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3284,7 +3284,7 @@ dependencies = [
 [[package]]
 name = "mega-system-contracts"
 version = "1.6.0"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=v1.6.0#be4418d5310a695a753b27f9ef627ae5b6035021"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?tag=v1.6.0#be4418d5310a695a753b27f9ef627ae5b6035021"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -5118,7 +5118,7 @@ checksum = "dd29631678d6fb0903b69223673e122c32e9ae559d0960a38d574695ebc0ea15"
 [[package]]
 name = "salt"
 version = "1.0.4"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.4#99781324bc9c5b4ee9a1a6e4bae536950e5e1786"
+source = "git+https://github.com/megaeth-labs/salt.git?tag=v1.0.4#99781324bc9c5b4ee9a1a6e4bae536950e5e1786"
 dependencies = [
  "auto_impl",
  "banderwagon",
@@ -5140,7 +5140,7 @@ dependencies = [
 [[package]]
 name = "salt-macros"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=v1.0.4#99781324bc9c5b4ee9a1a6e4bae536950e5e1786"
+source = "git+https://github.com/megaeth-labs/salt.git?tag=v1.0.4#99781324bc9c5b4ee9a1a6e4bae536950e5e1786"
 dependencies = [
  "rayon",
 ]
@@ -5589,7 +5589,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stateless-common"
-version = "2.0.12"
+version = "2.0.13"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -5623,7 +5623,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-core"
-version = "2.0.12"
+version = "2.0.13"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -5663,7 +5663,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-db"
-version = "2.0.12"
+version = "2.0.13"
 dependencies = [
  "alloy-primitives",
  "alloy-rpc-types-eth",
@@ -5682,7 +5682,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-test-utils"
-version = "2.0.12"
+version = "2.0.13"
 dependencies = [
  "alloy-genesis",
  "alloy-primitives",
@@ -5700,7 +5700,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-validator"
-version = "2.0.12"
+version = "2.0.13"
 dependencies = [
  "alloy-genesis",
  "alloy-primitives",

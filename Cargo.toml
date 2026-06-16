@@ -10,7 +10,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "2.0.12"
+version = "2.0.13"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
@@ -40,8 +40,8 @@ alloy-signer-local = "1.0.23"
 alloy-trie = { version = "0.9.0", default-features = false }
 
 # mega
-mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "v1.6.0", default-features = false }
-salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "v1.0.4", default-features = false }
+mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", tag = "v1.6.0", default-features = false }
+salt = { git = "https://github.com/megaeth-labs/salt.git", tag = "v1.0.4", default-features = false }
 
 # op
 op-alloy-consensus = { version = "0.18.12", default-features = false }
