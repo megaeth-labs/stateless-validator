@@ -3256,7 +3256,7 @@ dependencies = [
 [[package]]
 name = "mega-evm"
 version = "1.6.0"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?tag=v1.6.0#be4418d5310a695a753b27f9ef627ae5b6035021"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?branch=flyq%2Ffix%2Fskip-block-21951576-gaslimit#d7a76e6382e84aa9e869817528915264d886d770"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3284,7 +3284,7 @@ dependencies = [
 [[package]]
 name = "mega-system-contracts"
 version = "1.6.0"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?tag=v1.6.0#be4418d5310a695a753b27f9ef627ae5b6035021"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?branch=flyq%2Ffix%2Fskip-block-21951576-gaslimit#d7a76e6382e84aa9e869817528915264d886d770"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
