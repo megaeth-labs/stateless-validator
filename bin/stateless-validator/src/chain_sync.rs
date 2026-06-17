@@ -147,6 +147,14 @@ pub struct ValidatorProcessor {
     pub chain_spec: Arc<ChainSpec>,
     pub contract_cache: Arc<ContractCache>,
     pub rpc_client: Arc<RpcClient>,
+    /// Block numbers whose block-available-gas (block gas limit) check is skipped during
+    /// validation, configured via the `--skip-block-gas-limit-check` CLI parameter.
+    ///
+    /// `None` keeps mega-evm's default skip-set (`DEFAULT_SKIP_BLOCK_GAS_LIMIT_CHECK_BLOCKS`,
+    /// currently `{21951576}`), so the already-on-chain hotfix block is accepted without any
+    /// configuration. `Some(_)` fully replaces that default. Only the block-available-gas check is
+    /// skipped for these blocks; every other limit stays enforced.
+    pub skip_block_gas_limit_check_blocks: Option<Arc<[u64]>>,
 }
 
 impl BlockProcessor for ValidatorProcessor {
@@ -221,6 +229,7 @@ impl BlockProcessor for ValidatorProcessor {
 
         // Validate in a blocking thread
         let chain_spec = self.chain_spec.clone();
+        let skip_block_gas_limit_check_blocks = self.skip_block_gas_limit_check_blocks.clone();
         let validation_result = task::spawn_blocking(move || {
             validate_block(
                 &chain_spec,
@@ -228,6 +237,7 @@ impl BlockProcessor for ValidatorProcessor {
                 task.salt_witness,
                 task.mpt_witness,
                 &contracts,
+                skip_block_gas_limit_check_blocks.as_deref(),
                 None,
             )
         })

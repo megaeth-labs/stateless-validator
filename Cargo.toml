@@ -40,11 +40,12 @@ alloy-signer-local = "1.0.23"
 alloy-trie = { version = "0.9.0", default-features = false }
 
 # mega
-# TEMPORARY (block-21951576 hotfix): patched mega-evm that skips the block-available-gas
-# check for the single historical block 21951576, so the stateless validator accepts the
-# already-on-chain block during replay. Revert to `tag = "v1.6.0"` once block 21951576 is
-# past the replay window.
-mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", branch = "flyq/fix/skip-block-21951576-gaslimit", default-features = false }
+# TEMPORARY (block-21951576 hotfix): mega-evm pinned by commit (rev) to the build that makes the
+# block-available-gas check skip a configurable set of blocks (default {21951576}), so the
+# stateless validator accepts the already-on-chain block during replay. The validator's
+# `--skip-block-gas-limit-check` CLI parameter overrides the default. Revert to `tag = "v1.6.0"`
+# once the change is released and the affected blocks are past the replay window.
+mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "124153a1043b8f8c0f1952cb8a1adc0eaca21ad7", default-features = false }
 salt = { git = "https://github.com/megaeth-labs/salt.git", tag = "v1.0.4", default-features = false }
 
 # op

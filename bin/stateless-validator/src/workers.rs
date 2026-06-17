@@ -23,6 +23,7 @@ use crate::{
 ///
 /// Cleanly drains on SIGINT/SIGTERM and returns either the pipeline result or `Ok(())`
 /// on signal.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_with_signals(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
@@ -30,6 +31,7 @@ pub async fn run_with_signals(
     chain_spec: Arc<ChainSpec>,
     report_validation_endpoint: Option<String>,
     pipeline_config: PipelineConfig,
+    skip_block_gas_limit_check_blocks: Option<Arc<[u64]>>,
 ) -> Result<()> {
     let report_validation = report_validation_endpoint.is_some();
     let config = Arc::new(pipeline_config);
@@ -49,8 +51,12 @@ pub async fn run_with_signals(
         rpc_client: client.clone(),
         on_remote_height: metrics::set_remote_chain_height,
     });
-    let processor =
-        Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client.clone() });
+    let processor = Arc::new(ValidatorProcessor {
+        chain_spec,
+        contract_cache,
+        rpc_client: client.clone(),
+        skip_block_gas_limit_check_blocks,
+    });
     let hooks = Arc::new(ValidatorHooks);
 
     let reporter = if report_validation {

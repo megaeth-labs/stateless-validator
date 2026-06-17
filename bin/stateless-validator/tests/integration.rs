@@ -157,6 +157,34 @@ fn canonical_chain_max_length_rejects_zero() {
     assert!(from_env_zero.is_err(), "env-var 0 must also be rejected");
 }
 
+/// `--skip-block-gas-limit-check` parses a comma-separated list of block numbers (and accepts the
+/// same CSV form via env var). Omitting it yields an empty list, which the binary maps to
+/// mega-evm's default skip-set (`{21951576}`); a provided value fully replaces that default.
+#[test]
+fn skip_block_gas_limit_check_parses_block_list() {
+    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
+
+    assert!(
+        parse(&[]).unwrap().skip_block_gas_limit_check.is_empty(),
+        "omitting the flag must yield an empty list (binary falls back to the mega-evm default)",
+    );
+    assert_eq!(
+        parse(&["--skip-block-gas-limit-check", "21951576,22000000"])
+            .unwrap()
+            .skip_block_gas_limit_check,
+        vec![21951576, 22000000],
+    );
+
+    let guard = stateless_test_utils::env::env_lock();
+    let from_env = stateless_test_utils::env::with_env_var(
+        &guard,
+        "STATELESS_VALIDATOR_SKIP_BLOCK_GAS_LIMIT_CHECK",
+        "1,2,3",
+        || parse(&[]).unwrap().skip_block_gas_limit_check,
+    );
+    assert_eq!(from_env, vec![1, 2, 3]);
+}
+
 const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
 
 /// Mock RPC server backing state: all fields pre-decoded so the RPC handlers can respond
@@ -394,7 +422,13 @@ async fn integration_test() {
     let shutdown = CancellationToken::new();
     let fetcher =
         Arc::new(ValidatorFetcher { rpc_client: client.clone(), on_remote_height: |_| {} });
-    let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
+    let processor = Arc::new(ValidatorProcessor {
+        chain_spec,
+        contract_cache,
+        rpc_client: client,
+        // Exercise the default path: `None` keeps mega-evm's default skip-set ({21951576}).
+        skip_block_gas_limit_check_blocks: None,
+    });
     let hooks = Arc::new(ValidatorHooks);
 
     run_pipeline(

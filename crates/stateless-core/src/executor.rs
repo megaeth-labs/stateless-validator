@@ -283,6 +283,10 @@ impl BlockInput for Block<OpTransaction> {
 /// * `chain_spec` - Chain specification defining the EVM rules and parameters
 /// * `block` - Block containing full transaction data to replay
 /// * `db` - Witness database providing the necessary state data for execution
+/// * `skip_block_gas_limit_check_blocks` - Optional override of the block numbers whose
+///   block-available-gas (block gas limit) check is skipped. `None` keeps mega-evm's default
+///   (`DEFAULT_SKIP_BLOCK_GAS_LIMIT_CHECK_BLOCKS`, currently `{21951576}`); `Some(_)` fully
+///   replaces it. Only the block-available-gas check is skipped — all other limits stay enforced.
 ///
 /// # Returns
 ///
@@ -309,6 +313,7 @@ pub fn replay_block<B, DB, ENV, E>(
     block: &B,
     db: &DB,
     env_oracle: ENV,
+    skip_block_gas_limit_check_blocks: Option<&[u64]>,
     #[cfg(feature = "std")] trace_writer: Option<Box<dyn Write>>,
 ) -> Result<(HashMap<Address, BundleAccount>, BlockExecutionOutput), ValidationError>
 where
@@ -346,12 +351,20 @@ where
         BlockLimits::no_limits().with_block_gas_limit(header.gas_limit)
     };
 
-    let execution_context = MegaBlockExecutionCtx::new(
+    let mut execution_context = MegaBlockExecutionCtx::new(
         header.parent_hash,
         header.parent_beacon_block_root,
         header.extra_data.clone(),
         block_limits,
     );
+    // Override the block-available-gas skip-set when the caller configured one (from the
+    // `--skip-block-gas-limit-check` CLI parameter). When `None`, the context keeps mega-evm's
+    // default (`DEFAULT_SKIP_BLOCK_GAS_LIMIT_CHECK_BLOCKS`, currently `{21951576}`), so the
+    // already-on-chain hotfix block is still accepted during replay without any configuration.
+    if let Some(skip_blocks) = skip_block_gas_limit_check_blocks {
+        execution_context =
+            execution_context.with_skip_block_gas_limit_check_blocks(skip_blocks.to_vec());
+    }
 
     // Plain execution path, shared by the non-tracer std branch and the no_std build.
     // Extracted as a closure so the body lives in one place — any future change to the
@@ -457,6 +470,10 @@ where
 /// * `salt_witness` - The salt witness data needed for state validation
 /// * `mpt_witness` - The MPT witness data for withdrawal verification
 /// * `contracts` - Contract bytecode cache for transaction execution
+/// * `skip_block_gas_limit_check_blocks` - Optional override of the block numbers whose
+///   block-available-gas (block gas limit) check is skipped. `None` keeps mega-evm's default
+///   (`DEFAULT_SKIP_BLOCK_GAS_LIMIT_CHECK_BLOCKS`, currently `{21951576}`); `Some(_)` fully
+///   replaces it. Only the block-available-gas check is skipped — all other limits stay enforced.
 /// * `writer` - Optional writer for EIP-3155 trace output. When provided, enables step-by-step EVM
 ///   execution tracing in EIP-3155 format.
 ///
@@ -470,6 +487,7 @@ pub fn validate_block<B: BlockInput>(
     salt_witness: SaltWitness,
     mpt_witness: MptWitness,
     contracts: &HashMap<B256, Bytecode>,
+    skip_block_gas_limit_check_blocks: Option<&[u64]>,
     #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
 ) -> Result<ValidationStats, ValidationError> {
     // A block carrying only transaction hashes can't be replayed — fail fast before paying
@@ -500,6 +518,7 @@ pub fn validate_block<B: BlockInput>(
         block,
         &witness_db,
         ext_env,
+        skip_block_gas_limit_check_blocks,
         #[cfg(feature = "std")]
         writer,
     )?;
@@ -687,6 +706,7 @@ mod tests {
             fx.salt_witnesses[&hash].clone(),
             fx.mpt_witness(&hash),
             &fx.contracts,
+            None,
             #[cfg(feature = "std")]
             None,
         )
@@ -708,6 +728,7 @@ mod tests {
                 fx.salt_witnesses[&hash].clone(),
                 fx.mpt_witness(&hash),
                 &fx.contracts,
+                None,
                 #[cfg(feature = "std")]
                 None,
             )

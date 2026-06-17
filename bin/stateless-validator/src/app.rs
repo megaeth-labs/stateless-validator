@@ -157,6 +157,23 @@ pub struct CommandLineArgs {
     )]
     pub canonical_chain_max_length: Option<u64>,
 
+    /// Block numbers whose block-available-gas (block gas limit) check is skipped during
+    /// validation, given as a comma-separated list (e.g. `--skip-block-gas-limit-check 21951576`).
+    ///
+    /// These blocks are already on-chain but were produced by a sequencer incident that left their
+    /// block gas slightly over-committed, so the validator must accept them. When omitted, this
+    /// defaults to the mega-evm hotfix set (`mega_evm::DEFAULT_SKIP_BLOCK_GAS_LIMIT_CHECK_BLOCKS`,
+    /// currently `{21951576}`); passing a value fully replaces that default. Only the
+    /// block-available-gas check is skipped — every other block limit and every other block remain
+    /// fully enforced.
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_SKIP_BLOCK_GAS_LIMIT_CHECK",
+        value_delimiter = ',',
+        value_name = "BLOCK_NUMBERS"
+    )]
+    pub skip_block_gas_limit_check: Vec<u64>,
+
     /// Logging configuration.
     #[command(flatten)]
     pub log: LogArgs,
@@ -272,6 +289,17 @@ pub async fn run() -> Result<()> {
         override_ms(args.error_restart_delay_ms, pipeline_config.error_restart_delay);
     pipeline_config.tip_buffer = args.tip_buffer.unwrap_or(DEFAULT_TIP_BUFFER);
 
+    // Resolve the block-available-gas skip-set. An empty CLI value (flag omitted) maps to `None`
+    // so mega-evm keeps its default skip-set (`DEFAULT_SKIP_BLOCK_GAS_LIMIT_CHECK_BLOCKS`,
+    // currently `{21951576}`); a provided value fully replaces that default.
+    let skip_block_gas_limit_check_blocks: Option<Arc<[u64]>> =
+        (!args.skip_block_gas_limit_check.is_empty())
+            .then(|| Arc::from(args.skip_block_gas_limit_check.as_slice()));
+    info!(
+        skip_block_gas_limit_check = ?skip_block_gas_limit_check_blocks,
+        "Block-available-gas check skip-set (None = mega-evm default {{21951576}})"
+    );
+
     let result = workers::run_with_signals(
         client,
         validator_db,
@@ -279,6 +307,7 @@ pub async fn run() -> Result<()> {
         chain_spec,
         args.report_validation_endpoint,
         pipeline_config,
+        skip_block_gas_limit_check_blocks,
     )
     .await;
 
