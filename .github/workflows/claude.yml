@@ -50,6 +50,9 @@ jobs:
           extra_allowed_tools: "Bash(cargo:*)"
 
   pr-review:
+    concurrency:
+      group: claude-pr-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
     if: |
       github.event_name == 'pull_request' &&
       (github.event.action == 'opened' ||
