@@ -50,6 +50,9 @@ jobs:
           extra_allowed_tools: "Bash(cargo:*)"
 
   pr-review:
+    # Serialize reviews per PR: a new push queues behind an in-flight review
+    # rather than cancelling it, so a partial run never leaves comments/threads
+    # in an inconsistent state.
     concurrency:
       group: claude-pr-review-${{ github.event.pull_request.number }}
       cancel-in-progress: false
