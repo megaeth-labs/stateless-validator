@@ -43,7 +43,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - uses: megaeth-labs/mega-agents/.github/actions/interactive@main
+      - uses: megaeth-labs/mega-agents/.github/actions/claude-interactive@main
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_bots: "mega-putin"
@@ -69,7 +69,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - uses: megaeth-labs/mega-agents/.github/actions/pr-review@main
+      - uses: megaeth-labs/mega-agents/.github/actions/claude-pr-review@main
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_bots: "mega-putin"
@@ -97,7 +97,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - uses: megaeth-labs/mega-agents/.github/actions/label-check@main
+      - uses: megaeth-labs/mega-agents/.github/actions/claude-label-check@main
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_bots: "mega-putin"
@@ -116,7 +116,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - uses: megaeth-labs/mega-agents/.github/actions/issue-triage@main
+      - uses: megaeth-labs/mega-agents/.github/actions/claude-issue-triage@main
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_bots: "mega-putin"
