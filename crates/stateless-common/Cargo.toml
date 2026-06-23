@@ -35,11 +35,7 @@ clap.workspace = true
 eyre.workspace = true
 fastrand = { workspace = true, features = ["std"] }
 futures.workspace = true
-# Direct dep ONLY to enable gzip/brotli on the reqwest 0.12 that alloy-provider's
-# HTTP transport uses for witness/data fetches (Cargo feature unification). The
-# witness endpoint returns base64(zstd) and Cloudflare serves it Brotli-compressed,
-# so the validator decodes it transparently (~25% less witness bandwidth). The
-# crate is intentionally not referenced in code.
+# Enables gzip/brotli on alloy-provider's reqwest 0.12 (Cargo feature unification) for witness/data fetches; not referenced in code.
 reqwest = { version = "0.12", default-features = false, features = ["gzip", "brotli"] }
 rolling-file.workspace = true
 serde.workspace = true
