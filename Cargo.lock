@@ -1884,7 +1884,7 @@ dependencies = [
 
 [[package]]
 name = "debug-trace-server"
-version = "2.0.13"
+version = "2.0.14"
 dependencies = [
  "alloy-consensus",
  "alloy-evm",
@@ -3340,8 +3340,8 @@ dependencies = [
 
 [[package]]
 name = "mega-evm"
-version = "1.6.0"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?tag=v1.6.0#be4418d5310a695a753b27f9ef627ae5b6035021"
+version = "1.6.1"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?tag=v1.6.1#19f3965962c4cc1c12aaedd0ccbd972e4ab10d17"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3368,8 +3368,8 @@ dependencies = [
 
 [[package]]
 name = "mega-system-contracts"
-version = "1.6.0"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?tag=v1.6.0#be4418d5310a695a753b27f9ef627ae5b6035021"
+version = "1.6.1"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?tag=v1.6.1#19f3965962c4cc1c12aaedd0ccbd972e4ab10d17"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -5684,7 +5684,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stateless-common"
-version = "2.0.13"
+version = "2.0.14"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -5719,7 +5719,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-core"
-version = "2.0.13"
+version = "2.0.14"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -5759,7 +5759,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-db"
-version = "2.0.13"
+version = "2.0.14"
 dependencies = [
  "alloy-primitives",
  "alloy-rpc-types-eth",
@@ -5778,7 +5778,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-test-utils"
-version = "2.0.13"
+version = "2.0.14"
 dependencies = [
  "alloy-genesis",
  "alloy-primitives",
@@ -5796,7 +5796,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-validator"
-version = "2.0.13"
+version = "2.0.14"
 dependencies = [
  "alloy-genesis",
  "alloy-primitives",
