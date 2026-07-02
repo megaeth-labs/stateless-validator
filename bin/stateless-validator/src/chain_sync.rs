@@ -6,6 +6,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use alloy_consensus::Header;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, BlockId};
 use eyre::{Result, ensure};
@@ -45,7 +46,9 @@ impl BlockFetcher for ValidatorFetcher {
             self.rpc_client.get_witness(block_number, block_hash),
             self.rpc_client.get_block(BlockId::Hash(block_hash.into()), true),
         );
-        Ok(ValidationTask { block, salt_witness, mpt_witness })
+        let parent_header =
+            self.rpc_client.get_header(BlockId::Hash(block.header.parent_hash.into()), false).await;
+        Ok(ValidationTask { block, parent_header: parent_header.inner, salt_witness, mpt_witness })
     }
 
     async fn latest_block_number(&self) -> Result<u64> {
@@ -73,6 +76,7 @@ impl BlockFetcher for ValidatorFetcher {
 #[derive(Clone, Debug)]
 pub struct ValidationTask {
     pub block: Block<Transaction>,
+    pub parent_header: Header,
     pub salt_witness: SaltWitness,
     pub mpt_witness: MptWitness,
 }
@@ -225,6 +229,7 @@ impl BlockProcessor for ValidatorProcessor {
             validate_block(
                 &chain_spec,
                 &task.block,
+                &task.parent_header,
                 task.salt_witness,
                 task.mpt_witness,
                 &contracts,

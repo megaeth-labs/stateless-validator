@@ -12,8 +12,8 @@
 //!   specification
 //! - [`replay_block`]: Replays block transactions to compute state changes
 //!
-//! [`replay_block`] / [`validate_block`] are generic over [`BlockInput`], the minimal block
-//! projection they consume (the in-repo impl is the RPC `Block`; embedders supply their own).
+//! [`replay_block`] / [`validate_block`] consume RPC blocks directly, while [`BlockInput`] remains
+//! the minimal projection used by the Kona replay adapter.
 //!
 //! ## Validation Process
 //!
@@ -65,6 +65,7 @@ use crate::{
     chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec},
     data_types::{Account, PlainKey, PlainValue},
     evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv},
+    kona_replay::{self, KonaReplayError},
     withdrawals::{self, ADDRESS_L2_TO_L1_MESSAGE_PASSER, MptWitness},
 };
 
@@ -85,6 +86,9 @@ pub enum ValidationError {
 
     #[error("Block replay failed during transaction execution: {0}")]
     BlockReplayFailed(#[source] alloy_evm::block::BlockExecutionError),
+
+    #[error("Kona block replay failed: {0}")]
+    KonaReplayFailed(#[source] KonaReplayError),
 
     #[error("Failed to update salt state: {0}")]
     StateUpdateFailed(#[source] salt::SaltError),
@@ -138,6 +142,14 @@ pub enum ValidationError {
         actual: u64,
         /// The claimed gas used from the block header
         claimed: u64,
+    },
+
+    #[error("Block hash mismatch: claimed {claimed}, got {actual}")]
+    BlockHashMismatch {
+        /// The computed block hash from Kona block sealing
+        actual: B256,
+        /// The claimed block hash from the RPC block
+        claimed: B256,
     },
 }
 
@@ -304,15 +316,14 @@ impl BlockInput for Block<OpTransaction> {
 /// 5. Applies post-execution changes
 /// 6. Merges state transitions into bundle state
 /// 7. Returns bundle accounts and execution output (receipts root, logs bloom, gas used)
-pub fn replay_block<B, DB, ENV, E>(
+pub fn replay_block<DB, ENV, E>(
     chain_spec: &ChainSpec,
-    block: &B,
+    block: &Block<OpTransaction>,
     db: &DB,
     env_oracle: ENV,
     #[cfg(feature = "std")] trace_writer: Option<Box<dyn Write>>,
 ) -> Result<(HashMap<Address, BundleAccount>, BlockExecutionOutput), ValidationError>
 where
-    B: BlockInput,
     DB: DatabaseRef<Error = E> + Debug,
     ENV: ExternalEnvFactory + Clone,
     E: core::error::Error + Send + Sync + 'static,
@@ -321,9 +332,8 @@ where
     if !block.is_complete() {
         return Err(ValidationError::BlockIncomplete);
     }
-    let header = block.consensus_header();
 
-    // Setup execution environment
+    let header = block.consensus_header();
     let mut state = StateBuilder::new().with_database_ref(db).with_bundle_update().build();
     let evm_env = create_evm_env(header, chain_spec);
 
@@ -353,9 +363,6 @@ where
         block_limits,
     );
 
-    // Plain execution path, shared by the non-tracer std branch and the no_std build.
-    // Extracted as a closure so the body lives in one place — any future change to the
-    // non-tracer path only needs to be made here.
     let run_plain = |state: &mut _, ctx, env| {
         let executor = executor_factory.create_executor(state, ctx, env);
         execute_transactions(executor, block.txs_recovered())
@@ -376,7 +383,6 @@ where
     #[cfg(not(feature = "std"))]
     let (receipts_root, logs_bloom, gas_used) = run_plain(&mut state, execution_context, evm_env)?;
 
-    // Merge transitions into bundle_state
     state.merge_transitions(BundleRetention::PlainState);
 
     let total_accessed: usize = state
@@ -427,17 +433,49 @@ where
 
     let execution_result =
         executor.apply_post_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
-
-    // Compute logs bloom by ORing all receipt blooms together
     let logs_bloom =
         execution_result.receipts.iter().fold(Bloom::ZERO, |acc, receipt| acc | receipt.bloom());
-
-    // Gas used is the cumulative gas used of the last receipt
     let gas_used = execution_result.receipts.last().map(|r| r.cumulative_gas_used()).unwrap_or(0);
-
     let receipts_root = calculate_receipt_root(&execution_result.receipts);
 
     Ok((receipts_root, logs_bloom, gas_used))
+}
+
+fn validate_kona_replay(
+    chain_spec: &ChainSpec,
+    block: &Block<OpTransaction>,
+    parent_header: &alloy_consensus::Header,
+    salt_witness: &SaltWitness,
+    mpt_witness: &MptWitness,
+    contracts: &HashMap<B256, Bytecode>,
+) -> Result<(), ValidationError> {
+    let header = block.consensus_header();
+    debug!(
+        block_number = header.number,
+        block_hash = ?block.block_hash(),
+        "Replay block through Kona"
+    );
+
+    let rollup_config = kona_replay::rollup_config_for_chain_id(chain_spec.chain_id)
+        .map_err(ValidationError::KonaReplayFailed)?;
+    let output = kona_replay::replay_block_with_kona(
+        block,
+        parent_header,
+        salt_witness,
+        mpt_witness,
+        contracts,
+        &rollup_config,
+    )
+    .map_err(ValidationError::KonaReplayFailed)?;
+
+    if output.block_hash != block.block_hash() {
+        return Err(ValidationError::BlockHashMismatch {
+            actual: output.block_hash,
+            claimed: block.block_hash(),
+        });
+    }
+
+    Ok(())
 }
 
 /// Validates a block by creating a witness, replaying transactions, and comparing state roots.
@@ -464,9 +502,10 @@ where
 ///
 /// Returns `Ok(ValidationStats)` if validation succeeds, containing state access metrics.
 /// Returns `Err(ValidationError)` with the specific validation failure.
-pub fn validate_block<B: BlockInput>(
+pub fn validate_block(
     chain_spec: &ChainSpec,
-    block: &B,
+    block: &Block<OpTransaction>,
+    parent_header: &alloy_consensus::Header,
     salt_witness: SaltWitness,
     mpt_witness: MptWitness,
     contracts: &HashMap<B256, Bytecode>,
@@ -486,14 +525,16 @@ pub fn validate_block<B: BlockInput>(
     // Verify witness proof against the current state root
     #[cfg(feature = "std")]
     let start = Instant::now();
-    let witness = Witness::from(salt_witness);
+    let witness = Witness::from(salt_witness.clone());
     witness.verify().map_err(ValidationError::WitnessVerificationFailed)?;
     #[cfg(feature = "std")]
     let witness_verification_time = start.elapsed().as_secs_f64();
     #[cfg(not(feature = "std"))]
     let witness_verification_time = 0.0_f64; // no_std: timing unavailable
 
-    // Replay block transactions
+    // Replay through Kona first, then replay locally to recover the bundle state used by the
+    // historical SALT and withdrawal-root validation below.
+    validate_kona_replay(chain_spec, block, parent_header, &salt_witness, &mpt_witness, contracts)?;
     let witness_db = WitnessDatabase { header, witness: &witness, contracts };
     let (accounts, output) = replay_block(
         chain_spec,
@@ -684,6 +725,7 @@ mod tests {
         let err = validate_block(
             &chain_spec,
             &block,
+            &fx.blocks[&block.header.parent_hash].header.inner,
             fx.salt_witnesses[&hash].clone(),
             fx.mpt_witness(&hash),
             &fx.contracts,
@@ -702,9 +744,22 @@ mod tests {
         let paired = fx.paired_blocks();
         assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
         for (number, hash) in paired {
+            let block = &fx.blocks[&hash];
+            let parent_header = &fx
+                .blocks
+                .get(&block.header.parent_hash)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "parent block {} missing for fixture block {number} ({hash})",
+                        block.header.parent_hash
+                    )
+                })
+                .header
+                .inner;
             validate_block(
                 &chain_spec,
-                &fx.blocks[&hash],
+                block,
+                parent_header,
                 fx.salt_witnesses[&hash].clone(),
                 fx.mpt_witness(&hash),
                 &fx.contracts,
