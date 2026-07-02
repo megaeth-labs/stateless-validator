@@ -2,7 +2,8 @@
 //!
 //! This module encodes and decodes the temporary compatibility contract used by
 //! `mega_getBlockWitness`:
-//! `v0:base64(zstd(level=9, bincode-legacy((SaltWitness, MptWitness))))`.
+//! `v0:base64(zstd(bincode-legacy((SaltWitness, MptWitness))))`.
+//! The zstd level is a producer choice (see [`WITNESS_ZSTD_LEVEL`]); decoding is level-agnostic.
 
 use std::io;
 
@@ -11,8 +12,15 @@ use salt::SaltWitness;
 use stateless_core::withdrawals::MptWitness;
 
 /// Version prefix for the RPC response format:
-/// `"v0:" + base64(zstd(level=9, bincode-legacy((SaltWitness, MptWitness))))`.
+/// `"v0:" + base64(zstd(bincode-legacy((SaltWitness, MptWitness))))`.
 pub const WITNESS_RESPONSE_VERSION_PREFIX: &str = "v0:";
+
+/// zstd compression level used when encoding a witness payload.
+///
+/// Level 1: a witness is ~half high-entropy SALT proof, so higher levels cost several times
+/// more CPU for a few percent less output (see `benches/witness_zstd_level.rs`), and the HTTP
+/// transport compression recovers most of that difference anyway.
+pub const WITNESS_ZSTD_LEVEL: i32 = 1;
 
 /// Errors produced while serializing or compressing a witness payload.
 #[derive(Debug, thiserror::Error)]
@@ -51,7 +59,7 @@ pub fn encode_witness_payload(
         bincode::config::legacy(),
     )?;
     let original_size = original_data.len();
-    let compressed = zstd::encode_all(original_data.as_slice(), 9)?;
+    let compressed = zstd::encode_all(original_data.as_slice(), WITNESS_ZSTD_LEVEL)?;
     Ok((original_size, compressed))
 }
 
