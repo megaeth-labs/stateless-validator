@@ -11,7 +11,7 @@
 //! - [`evm_database`]: Witness-backed `DatabaseRef` for REVM
 //! - [`db`]: Shared storage traits (`ChainStore`, `ContractStore`); scenario stores are bin-local
 //! - [`data_types`]: SALT key/value encoding utilities
-//! - [`executor`]: Block validation via EVM replay
+//! - [`executor`]: Block validation via EVM replay, behind the pluggable `BlockValidator` seam
 //! - [`pipeline`]: Generic three-stage chain sync pipeline (fetch → process → advance) — requires
 //!   `std` feature
 //! - [`withdrawals`]: MPT witness verification for L2→L1 withdrawals
@@ -33,7 +33,10 @@ pub use db::{
 pub mod data_types;
 pub use data_types::{PlainKey, PlainValue, iter_code_hashes};
 pub mod executor;
-pub use executor::{BlockInput, ValidationError, ValidationStats, replay_block, validate_block};
+pub use executor::{
+    BlockInput, BlockValidator, MegaEvmValidator, ValidationError, ValidationInput,
+    ValidationStats, replay_block, validate_block,
+};
 #[cfg(feature = "std")]
 pub mod pipeline;
 #[cfg(feature = "std")]

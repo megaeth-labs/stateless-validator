@@ -6,7 +6,8 @@ use alloy_primitives::B256;
 use eyre::Result;
 use stateless_common::RpcClient;
 use stateless_core::{
-    BisectResolver, ChainStore, PipelineConfig, chain_spec::ChainSpec, pipeline::run_pipeline,
+    BisectResolver, ChainStore, MegaEvmValidator, PipelineConfig, chain_spec::ChainSpec,
+    pipeline::run_pipeline,
 };
 use stateless_db::ContractCache;
 use tokio::{signal, task};
@@ -49,8 +50,11 @@ pub async fn run_with_signals(
         rpc_client: client.clone(),
         on_remote_height: metrics::set_remote_chain_height,
     });
-    let processor =
-        Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client.clone() });
+    let processor = Arc::new(ValidatorProcessor {
+        validator: Arc::new(MegaEvmValidator::new(chain_spec.as_ref().clone())),
+        contract_cache,
+        rpc_client: client.clone(),
+    });
     let hooks = Arc::new(ValidatorHooks);
 
     let reporter = if report_validation {

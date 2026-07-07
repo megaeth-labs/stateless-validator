@@ -17,7 +17,7 @@ use jsonrpsee_types::error::{
 };
 use stateless_common::{RpcClient, WitnessRequestKeys, encode_witness_response};
 use stateless_core::{
-    BisectResolver, ChainStore, ContractStore, PipelineConfig, db::BlockMeta,
+    BisectResolver, ChainStore, ContractStore, MegaEvmValidator, PipelineConfig, db::BlockMeta,
     pipeline::run_pipeline, withdrawals::MptWitness,
 };
 use stateless_db::ContractCache;
@@ -381,9 +381,8 @@ async fn integration_test() {
     let (handle, url) = setup_mock_rpc_server(state).await;
     let client = Arc::new(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap());
 
-    let chain_spec = Arc::new(
-        load_or_create_chain_spec(&validator_db, Some(genesis_file.to_str().unwrap())).unwrap(),
-    );
+    let chain_spec =
+        load_or_create_chain_spec(&validator_db, Some(genesis_file.to_str().unwrap())).unwrap();
 
     // `#[non_exhaustive]` rules out struct-update syntax here; mutate a default.
     let mut cfg = PipelineConfig::default();
@@ -394,7 +393,11 @@ async fn integration_test() {
     let shutdown = CancellationToken::new();
     let fetcher =
         Arc::new(ValidatorFetcher { rpc_client: client.clone(), on_remote_height: |_| {} });
-    let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
+    let processor = Arc::new(ValidatorProcessor {
+        validator: Arc::new(MegaEvmValidator::new(chain_spec)),
+        contract_cache,
+        rpc_client: client,
+    });
     let hooks = Arc::new(ValidatorHooks);
 
     run_pipeline(

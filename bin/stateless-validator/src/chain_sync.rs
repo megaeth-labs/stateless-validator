@@ -1,7 +1,7 @@
 //! Validator-specific pipeline components.
 //!
-//! Provides [`ValidatorProcessor`] (block validation via [`validate_block`]) and
-//! [`ValidatorHooks`] (metrics integration) for the shared pipeline in
+//! Provides [`ValidatorProcessor`] (block validation through a pluggable [`BlockValidator`]
+//! backend) and [`ValidatorHooks`] (metrics integration) for the shared pipeline in
 //! [`stateless_core::pipeline::run_pipeline`].
 
 use std::{collections::HashSet, sync::Arc};
@@ -14,10 +14,9 @@ use revm::state::Bytecode;
 use salt::SaltWitness;
 use stateless_common::{CodeFetchError, RpcClient};
 use stateless_core::{
-    chain_spec::ChainSpec,
     data_types::iter_code_hashes,
     db::BlockMeta,
-    executor::validate_block,
+    executor::{BlockValidator, ValidationInput},
     pipeline::{BlockFetcher, BlockProcessor, ErrorAction, PipelineHooks, ProcessedBlock},
     withdrawals::MptWitness,
 };
@@ -142,14 +141,19 @@ pub struct ValidationFailure {
     pub transient: bool,
 }
 
-/// Block processor for the validator: validates blocks using EVM execution.
-pub struct ValidatorProcessor {
-    pub chain_spec: Arc<ChainSpec>,
+/// Block processor for the validator: resolves contract code, then validates each block
+/// through the [`BlockValidator`] backend `V` (production wiring uses
+/// [`stateless_core::MegaEvmValidator`]; alternative executor binaries supply their own).
+pub struct ValidatorProcessor<V> {
+    pub validator: Arc<V>,
     pub contract_cache: Arc<ContractCache>,
     pub rpc_client: Arc<RpcClient>,
 }
 
-impl BlockProcessor for ValidatorProcessor {
+impl<V> BlockProcessor for ValidatorProcessor<V>
+where
+    V: BlockValidator<Block<Transaction>> + Send + Sync + 'static,
+{
     type Input = ValidationTask;
     type Output = ValidatedBlock;
     type Error = ValidationFailure;
@@ -220,16 +224,15 @@ impl BlockProcessor for ValidatorProcessor {
             .ok_or_else(|| fail("Withdrawals root not found in block".to_string(), false))?;
 
         // Validate in a blocking thread
-        let chain_spec = self.chain_spec.clone();
+        let validator = Arc::clone(&self.validator);
         let validation_result = task::spawn_blocking(move || {
-            validate_block(
-                &chain_spec,
-                &task.block,
-                task.salt_witness,
-                task.mpt_witness,
+            let ValidationTask { block, salt_witness, mpt_witness } = task;
+            validator.validate_block(ValidationInput::new(
+                &block,
+                salt_witness,
+                mpt_witness,
                 &contracts,
-                None,
-            )
+            ))
         })
         .await
         .map_err(|e| fail(format!("Validation task panicked: {e}"), false))?;

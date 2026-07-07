@@ -15,6 +15,13 @@
 //! [`replay_block`] / [`validate_block`] are generic over [`BlockInput`], the minimal block
 //! projection they consume (the in-repo impl is the RPC `Block`; embedders supply their own).
 //!
+//! ## Executor Abstraction
+//!
+//! [`BlockValidator`] abstracts the whole per-block validation behind a backend trait, with
+//! [`ValidationInput`] bundling the per-block inputs.
+//! [`MegaEvmValidator`] is the in-repo backend wrapping [`validate_block`]; alternative
+//! executors (e.g. a kona-based validator) implement the trait out-of-tree.
+//!
 //! ## Validation Process
 //!
 //! 1. Verify witness proof against previous state root
@@ -269,6 +276,118 @@ impl BlockInput for Block<OpTransaction> {
             _ => &[],
         };
         full.iter().map(|tx| tx.inner.inner.as_recovered_ref())
+    }
+}
+
+/// Per-block inputs consumed by a [`BlockValidator`] backend.
+///
+/// Marked `#[non_exhaustive]` so new (optional) inputs can be added without breaking
+/// out-of-tree backends: construct it with [`ValidationInput::new`] plus the `with_*`
+/// builders instead of a struct literal.
+#[non_exhaustive]
+pub struct ValidationInput<'a, B> {
+    /// The block to validate.
+    pub block: &'a B,
+    /// Consensus header of `block`'s parent.
+    ///
+    /// The mega-evm backend reads every execution parameter from the block's own header and
+    /// ignores this. Backends that re-derive header fields from the parent (e.g. a kona-based
+    /// executor computing the EIP-1559 base fee from the parent) require it and must fail
+    /// with a backend error when it is `None`.
+    pub parent_header: Option<&'a alloy_consensus::Header>,
+    /// SALT witness carrying the accessed state subset and its proof.
+    pub salt_witness: SaltWitness,
+    /// MPT witness for withdrawals-root verification.
+    pub mpt_witness: MptWitness,
+    /// Bytecode for every code hash referenced by the witness.
+    pub contracts: &'a HashMap<B256, Bytecode>,
+}
+
+impl<'a, B> ValidationInput<'a, B> {
+    /// Creates an input from the required fields; optional context defaults to `None`.
+    pub fn new(
+        block: &'a B,
+        salt_witness: SaltWitness,
+        mpt_witness: MptWitness,
+        contracts: &'a HashMap<B256, Bytecode>,
+    ) -> Self {
+        Self { block, parent_header: None, salt_witness, mpt_witness, contracts }
+    }
+
+    /// Attaches the parent consensus header for backends that derive header fields from it.
+    pub fn with_parent_header(mut self, parent_header: &'a alloy_consensus::Header) -> Self {
+        self.parent_header = Some(parent_header);
+        self
+    }
+}
+
+/// A pluggable stateless block-validation backend — the executor seam.
+///
+/// [`validate_block`] hard-codes the in-repo execution engine (mega-evm replay + SALT root
+/// update). This trait abstracts that choice so binaries can run the same pipeline on a
+/// different engine — e.g. a kona-based executor that rebuilds the block from payload
+/// attributes — and so backends can live out-of-tree with their own dependencies and error
+/// types. Backends driven by the parallel pipeline must additionally be `Send + Sync`.
+///
+/// Implementations are pure per-block checks: chain-level concerns (parent-hash continuity,
+/// pre-state continuity against the canonical tip, reorg handling) belong to the pipeline's
+/// advancer, not the backend.
+///
+/// # Contract
+///
+/// Returning `Ok` asserts, at minimum, that:
+/// 1. the SALT witness is authentic for the block's pre-state, and
+/// 2. executing the block over that state reproduces the claimed header — state root, withdrawals
+///    root, receipts root, logs bloom, and gas used — verified either field-by-field (as
+///    [`validate_block`] does) or transitively via a sealed block-hash comparison.
+///
+/// The generic parameter `B` is the [`BlockInput`] projection the backend consumes; impls
+/// generic over `B` (like [`MegaEvmValidator`]) work with any block source, while a backend
+/// may instead require one concrete projection. The trait is object-safe:
+/// `dyn BlockValidator<B, Error = E>` works where runtime backend selection is needed.
+pub trait BlockValidator<B: BlockInput> {
+    /// Backend-specific validation error.
+    type Error: core::error::Error + Send + Sync + 'static;
+
+    /// Validates one block against its witnesses, per the trait-level contract.
+    fn validate_block(&self, input: ValidationInput<'_, B>)
+    -> Result<ValidationStats, Self::Error>;
+}
+
+/// The in-repo [`BlockValidator`]: mega-evm transaction replay plus SALT two-phase
+/// state-root update, as implemented by [`validate_block`].
+///
+/// Reads every execution parameter from the block's own header, so
+/// [`ValidationInput::parent_header`] is ignored. EIP-3155 tracing is not exposed through
+/// the backend seam — call [`validate_block`] / [`replay_block`] directly for that.
+#[derive(Debug, Clone)]
+pub struct MegaEvmValidator {
+    chain_spec: ChainSpec,
+}
+
+impl MegaEvmValidator {
+    /// Creates a backend validating against the given chain specification.
+    pub fn new(chain_spec: ChainSpec) -> Self {
+        Self { chain_spec }
+    }
+}
+
+impl<B: BlockInput> BlockValidator<B> for MegaEvmValidator {
+    type Error = ValidationError;
+
+    fn validate_block(
+        &self,
+        input: ValidationInput<'_, B>,
+    ) -> Result<ValidationStats, ValidationError> {
+        self::validate_block(
+            &self.chain_spec,
+            input.block,
+            input.salt_witness,
+            input.mpt_witness,
+            input.contracts,
+            #[cfg(feature = "std")]
+            None,
+        )
     }
 }
 
@@ -692,6 +811,91 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ValidationError::BlockIncomplete), "{err:?}");
+    }
+
+    /// The executor seam end-to-end: `MegaEvmValidator` validates a mainnet fixture through
+    /// the `BlockValidator` trait, and `parent_header` is genuinely optional context for it —
+    /// attaching one must not change the outcome.
+    #[test]
+    fn mega_evm_validator_through_the_trait() {
+        let _logging = init_test_logging("stateless_core");
+        let fx = TestFixtures::mainnet_shared();
+        let validator = MegaEvmValidator::new(ChainSpec::from_genesis(fx.load_genesis().unwrap()));
+        let (number, hash) = *fx.paired_blocks().first().expect("paired mainnet fixtures");
+        let block = &fx.blocks[&hash];
+
+        let input = ValidationInput::new(
+            block,
+            fx.salt_witnesses[&hash].clone(),
+            fx.mpt_witness(&hash),
+            &fx.contracts,
+        );
+        BlockValidator::validate_block(&validator, input)
+            .unwrap_or_else(|e| panic!("trait validation failed for {number} ({hash}): {e:?}"));
+
+        let parent = &fx
+            .blocks
+            .get(&block.header.parent_hash)
+            .expect("parent fixture for paired block")
+            .header
+            .inner;
+        let input = ValidationInput::new(
+            block,
+            fx.salt_witnesses[&hash].clone(),
+            fx.mpt_witness(&hash),
+            &fx.contracts,
+        )
+        .with_parent_header(parent);
+        BlockValidator::validate_block(&validator, input).unwrap_or_else(|e| {
+            panic!("trait validation with parent header failed for {number} ({hash}): {e:?}")
+        });
+    }
+
+    /// Locks the seam for out-of-tree backends: a custom impl with its own error type is
+    /// usable as `dyn BlockValidator` (object safety), and the input — including the
+    /// optional parent header — reaches the backend intact.
+    #[test]
+    fn block_validator_is_object_safe_for_custom_backends() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("backend rejected block {0}")]
+        struct RejectError(u64);
+
+        struct RejectingBackend;
+        impl BlockValidator<Block<OpTransaction>> for RejectingBackend {
+            type Error = RejectError;
+
+            fn validate_block(
+                &self,
+                input: ValidationInput<'_, Block<OpTransaction>>,
+            ) -> Result<ValidationStats, RejectError> {
+                // A parent-deriving backend (e.g. kona) depends on this reaching it.
+                let parent = input.parent_header.expect("parent header must reach the backend");
+                assert_eq!(parent.hash_slow(), input.block.consensus_header().parent_hash);
+                Err(RejectError(input.block.consensus_header().number))
+            }
+        }
+
+        let fx = TestFixtures::mainnet_shared();
+        let (number, hash) = *fx.paired_blocks().first().expect("paired mainnet fixtures");
+        let block = &fx.blocks[&hash];
+        let parent = &fx
+            .blocks
+            .get(&block.header.parent_hash)
+            .expect("parent fixture for paired block")
+            .header
+            .inner;
+
+        let backend: &dyn BlockValidator<Block<OpTransaction>, Error = RejectError> =
+            &RejectingBackend;
+        let input = ValidationInput::new(
+            block,
+            fx.salt_witnesses[&hash].clone(),
+            fx.mpt_witness(&hash),
+            &fx.contracts,
+        )
+        .with_parent_header(parent);
+        let err = backend.validate_block(input).unwrap_err();
+        assert_eq!(err.0, number);
     }
 
     #[test]

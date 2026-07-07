@@ -175,7 +175,7 @@ Both binaries share a generic three-stage pipeline defined in `stateless-core`:
                           Streams blocks + witnesses from RPC via a bounded in-flight window
                           ↓ channel
  Stage 2: PROCESS        N workers × BlockProcessor
-                          Validator: validate_block (EVM execution)
+                          Validator: BlockValidator backend (default: MegaEvmValidator)
                           Trace server: pass-through (no validation)
                           ↓ channel
  Stage 3: ADVANCE        chain_advancer
@@ -191,6 +191,7 @@ Both binaries share a generic three-stage pipeline defined in `stateless-core`:
 
 The pipeline is configured via `PipelineConfig` and customized through trait implementations:
 - `BlockProcessor`: Processing logic per block (validation or pass-through)
+- `BlockValidator`: The per-block validation backend behind the validator's processor (`MegaEvmValidator` is the in-repo mega-evm implementation; alternative executors implement it out-of-tree)
 - `PipelineHooks`: Callbacks for advance/reorg/stale events
 - `ProcessedBlock`: Output type of the processing stage
 - `ReorgResolver`: Decides the rollback floor on a detected reorg (`BisectResolver` walks local history; embedders can supply an externally-resolved floor)
@@ -200,7 +201,7 @@ The pipeline is configured via `PipelineConfig` and customized through trait imp
 | File                                                                                           | Purpose                                                                             |
 | ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
 | `crates/stateless-core/src/pipeline/{mod,config,traits,fetcher,divergence,advancer,worker}.rs` | Generic three-stage pipeline split by responsibility                                |
-| `crates/stateless-core/src/executor.rs`                                                        | Block validation and EVM replay                                                     |
+| `crates/stateless-core/src/executor.rs`                                                        | Block validation and EVM replay; `BlockValidator` executor seam                     |
 | `crates/stateless-core/src/db.rs`                                                              | Shared storage traits: `ChainStore`, `ContractStore`, `StoreError` (scenario stores live in their binaries)  |
 | `crates/stateless-core/src/evm_database.rs`                                                    | `WitnessDatabase` implementing `revm::DatabaseRef`                                  |
 | `crates/stateless-core/src/withdrawals.rs`                                                     | Withdrawal validation and MPT witness handling                                      |
