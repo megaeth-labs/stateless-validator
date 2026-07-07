@@ -6,6 +6,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use alloy_consensus::Header;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, BlockId};
 use eyre::{Result, ensure};
@@ -44,7 +45,9 @@ impl BlockFetcher for ValidatorFetcher {
             self.rpc_client.get_witness(block_number, block_hash),
             self.rpc_client.get_block(BlockId::Hash(block_hash.into()), true),
         );
-        Ok(ValidationTask { block, salt_witness, mpt_witness })
+        let parent_header =
+            self.rpc_client.get_header(BlockId::Hash(block.header.parent_hash.into()), false).await;
+        Ok(ValidationTask { block, parent_header: parent_header.inner, salt_witness, mpt_witness })
     }
 
     async fn latest_block_number(&self) -> Result<u64> {
@@ -72,6 +75,7 @@ impl BlockFetcher for ValidatorFetcher {
 #[derive(Clone, Debug)]
 pub struct ValidationTask {
     pub block: Block<Transaction>,
+    pub parent_header: Header,
     pub salt_witness: SaltWitness,
     pub mpt_witness: MptWitness,
 }
@@ -226,13 +230,11 @@ where
         // Validate in a blocking thread
         let validator = Arc::clone(&self.validator);
         let validation_result = task::spawn_blocking(move || {
-            let ValidationTask { block, salt_witness, mpt_witness } = task;
-            validator.validate_block(ValidationInput::new(
-                &block,
-                salt_witness,
-                mpt_witness,
-                &contracts,
-            ))
+            let ValidationTask { block, parent_header, salt_witness, mpt_witness } = task;
+            validator.validate_block(
+                ValidationInput::new(&block, salt_witness, mpt_witness, &contracts)
+                    .with_parent_header(&parent_header),
+            )
         })
         .await
         .map_err(|e| fail(format!("Validation task panicked: {e}"), false))?;
