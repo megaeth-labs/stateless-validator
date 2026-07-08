@@ -52,11 +52,17 @@ pub fn run(args: ReportArgs) -> Result<()> {
     let llvm_profdata = llvm::find_tool("llvm-profdata", args.llvm_profdata.as_deref())?;
     let llvm_cov = llvm::find_tool("llvm-cov", args.llvm_cov.as_deref())?;
 
+    // Archived per-pattern profiles are zstd'd sparse profdata; inflate to tmp
+    // for llvm-profdata (profdata files are valid merge inputs).
     let mut profraws = Vec::new();
     for b in &manifest.blocks {
-        let p = dirs.archived_profraw(b.number);
-        ensure!(p.exists(), "archived profraw missing for block {}: {}", b.number, p.display());
-        profraws.push(p);
+        let z = dirs.archived_profile(b.number);
+        ensure!(z.exists(), "archived profile missing for block {}: {}", b.number, z.display());
+        let raw = zstd::decode_all(&std::fs::read(&z)?[..])
+            .wrap_err_with(|| format!("decompress {}", z.display()))?;
+        let tmp = dirs.tmp().join(format!("report_{}.profdata", b.number));
+        crate::spool::write_atomic(&tmp, &raw)?;
+        profraws.push(tmp);
     }
 
     let merged = dirs.tmp().join("selected.profdata");
@@ -67,6 +73,9 @@ pub fn run(args: ReportArgs) -> Result<()> {
         .arg("-o")
         .arg(&merged)
         .output()?;
+    for p in &profraws {
+        let _ = std::fs::remove_file(p);
+    }
     ensure!(
         out.status.success(),
         "llvm-profdata merge failed: {}",

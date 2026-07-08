@@ -1,10 +1,11 @@
 //! On-disk spool entries: everything a worker needs to replay one block.
 //!
-//! Lifecycle: written by the fetcher, consumed by a worker, then either deleted
-//! (known coverage pattern — the common case) or moved into `archive/` when the
-//! block becomes a new pattern's representative (kept for version-bump
-//! resweeps). Full witnesses are never stored: consumers that need one (PR
-//! payload assembly) re-fetch it from the RPC, which serves the full history.
+//! Lifecycle: written by the fetcher, consumed by a worker, deleted after
+//! judgment — for every block, including new-pattern representatives. Nothing
+//! block-sized is retained: the RPC serves blocks and witnesses for the full
+//! history, so resweeps and PR payload assembly re-fetch representatives by
+//! block number (recorded in the store). The only per-pattern artifact kept
+//! is a small sparse profdata for `report`.
 
 use std::{
     collections::BTreeMap,
@@ -62,8 +63,7 @@ pub struct DataDir {
 impl DataDir {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let dir = Self { root: root.into() };
-        for d in [dir.spool(), dir.codes(), dir.tmp(), dir.archive_entries(), dir.archive_profraw()]
-        {
+        for d in [dir.spool(), dir.codes(), dir.tmp(), dir.archive_profiles()] {
             fs::create_dir_all(&d)?;
         }
         Ok(dir)
@@ -78,11 +78,8 @@ impl DataDir {
     pub fn tmp(&self) -> PathBuf {
         self.root.join("tmp")
     }
-    pub fn archive_entries(&self) -> PathBuf {
-        self.root.join("archive").join("entries")
-    }
-    pub fn archive_profraw(&self) -> PathBuf {
-        self.root.join("archive").join("profraw")
+    pub fn archive_profiles(&self) -> PathBuf {
+        self.root.join("archive").join("profiles")
     }
     pub fn store_path(&self) -> PathBuf {
         self.root.join("store.redb")
@@ -97,11 +94,12 @@ impl DataDir {
     pub fn code_file(&self, hash: &B256) -> PathBuf {
         self.codes().join(format!("{hash:x}.bin"))
     }
-    pub fn archived_entry(&self, block: u64) -> PathBuf {
-        self.archive_entries().join(format!("{block}.bin"))
-    }
-    pub fn archived_profraw(&self, block: u64) -> PathBuf {
-        self.archive_profraw().join(format!("{block}.profraw"))
+    /// Per-pattern sparse profdata (zstd) — only executed functions survive
+    /// the `llvm-profdata merge -sparse` conversion, so this is small; raw
+    /// profraws carry the whole binary's counter array plus an incompressible
+    /// name table (~2 MB even zstd'd) and are never archived.
+    pub fn archived_profile(&self, block: u64) -> PathBuf {
+        self.archive_profiles().join(format!("{block}.profdata.zst"))
     }
 }
 

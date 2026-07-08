@@ -188,13 +188,15 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     drop(dispatch_tx);
 
     // ---- judge (this task) ----
-    let mut judge = JudgeState::new(snapshot, &store, dirs.clone(), total);
+    let mut judge = JudgeState::new(snapshot, &store, dirs.clone(), total, llvm_profdata.clone());
     while let Some(outcome) = judged_rx.recv().await {
         judge.ingest(outcome)?;
     }
 
     fetcher.await.ok();
     while manager_set.join_next().await.is_some() {}
+    // Let in-flight sparse-profdata conversions finish before reporting done.
+    while judge.compressions.join_next().await.is_some() {}
     judge.final_summary();
     Ok(())
 }
@@ -379,6 +381,10 @@ struct JudgeState<'a> {
     /// Worker wall-clock per successfully replayed block (spool load + replay
     /// + profraw + bitmap extraction) — the E3 throughput measurement.
     elapsed_ok_ms: Vec<u64>,
+    llvm_profdata: PathBuf,
+    /// In-flight sparse-profdata conversions (off the judge's critical path);
+    /// drained before the run finishes.
+    compressions: tokio::task::JoinSet<()>,
 }
 
 impl<'a> JudgeState<'a> {
@@ -387,6 +393,7 @@ impl<'a> JudgeState<'a> {
         store: &'a Store,
         dirs: Arc<DataDir>,
         total: u64,
+        llvm_profdata: PathBuf,
     ) -> Self {
         let mut counters = HashMap::with_capacity(snapshot.counters.len());
         let mut next_dense = 0u32;
@@ -417,6 +424,8 @@ impl<'a> JudgeState<'a> {
             divergent_streak: 0,
             started: Instant::now(),
             elapsed_ok_ms: Vec::new(),
+            llvm_profdata,
+            compressions: tokio::task::JoinSet::new(),
         }
     }
 
@@ -553,15 +562,22 @@ impl<'a> JudgeState<'a> {
                 universe = self.universe.count_ones(),
                 "NEW coverage pattern — promoting block to archive"
             );
-            // Promote: spool entry + profraw move to the permanent archive.
-            std::fs::rename(
-                self.dirs.spool_entry(resp.block),
-                self.dirs.archived_entry(resp.block),
-            )
-            .wrap_err("promote spool entry")?;
-            std::fs::rename(&resp.profraw, self.dirs.archived_profraw(resp.block))
-                .wrap_err("promote profraw")?;
+            // Promote: nothing block-sized is kept — the spool entry is
+            // deleted like any other block (representatives are re-fetched
+            // from the RPC when needed). Only a sparse profdata survives for
+            // `report`, produced off the judge's critical path.
+            let _ = std::fs::remove_file(self.dirs.spool_entry(resp.block));
             let _ = std::fs::remove_file(&resp.symbols_tsv);
+            let llvm_profdata = self.llvm_profdata.clone();
+            let profraw = resp.profraw.clone();
+            let dest = self.dirs.archived_profile(resp.block);
+            let block = resp.block;
+            self.compressions.spawn_blocking(move || {
+                if let Err(e) = archive_sparse_profile(&llvm_profdata, &profraw, &dest) {
+                    warn!(block, error = %format!("{e:#}"), "failed to archive sparse profdata");
+                }
+                let _ = std::fs::remove_file(&profraw);
+            });
 
             let record = self.block_record_ok(&resp, key);
             self.patterns.insert(key, rec);
@@ -635,6 +651,34 @@ impl<'a> JudgeState<'a> {
             );
         }
     }
+}
+
+/// Converts a promoted block's profraw into a small zstd'd sparse profdata:
+/// `llvm-profdata merge -sparse` drops every zero-count function (and its
+/// name-table entry), which is almost all of them for a single block.
+fn archive_sparse_profile(
+    llvm_profdata: &std::path::Path,
+    profraw: &std::path::Path,
+    dest: &std::path::Path,
+) -> Result<()> {
+    let tmp = profraw.with_extension("profdata");
+    let out = std::process::Command::new(llvm_profdata)
+        .arg("merge")
+        .arg("-sparse")
+        .arg(profraw)
+        .arg("-o")
+        .arg(&tmp)
+        .output()
+        .wrap_err("spawn llvm-profdata")?;
+    ensure!(
+        out.status.success(),
+        "llvm-profdata merge -sparse failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let bytes = std::fs::read(&tmp)?;
+    let _ = std::fs::remove_file(&tmp);
+    write_atomic(dest, &zstd::encode_all(&bytes[..], 3)?)?;
+    Ok(())
 }
 
 /// Parses a worker symbols sidecar: `id_hex \t index \t func_hash \t symbol`.
