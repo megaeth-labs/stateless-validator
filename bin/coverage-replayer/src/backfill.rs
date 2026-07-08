@@ -21,8 +21,7 @@ use alloy_primitives::B256;
 use alloy_rpc_types_eth::BlockId;
 use clap::Args;
 use eyre::{Context, Result, ensure};
-use stateless_common::{RpcClient, encode_witness_payload};
-use stateless_core::LightWitness;
+use stateless_common::RpcClient;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt},
     process::Child,
@@ -226,16 +225,10 @@ async fn fetch_block(client: &RpcClient, dirs: &DataDir, n: u64) -> Result<()> {
 
     let block = client.get_block(BlockId::number(n), true).await;
     let hash = block.header.hash;
-    let (salt_witness, mpt_witness) = client.get_witness(n, hash).await;
-
-    // CPU-heavy part off the async runtime: LightWitness conversion + payload encode.
-    let (light_witness, witness_payload) = tokio::task::spawn_blocking(move || {
-        let light = LightWitness::from(&salt_witness);
-        let (_original, payload) = encode_witness_payload(&salt_witness, &mpt_witness)
-            .map_err(|e| eyre::eyre!("encode witness payload: {e}"))?;
-        Ok::<_, eyre::Report>((light, payload))
-    })
-    .await??;
+    // Zero-validation light fetch: no elliptic-curve work is spent on the
+    // proof we never verify, and the raw compressed payload comes back
+    // verbatim for archival — nothing to re-encode.
+    let (light_witness, _mpt_witness, witness_payload) = client.get_witness_light(n, hash).await;
 
     let code_hashes = crate::spool::code_hashes_of(&light_witness);
     let missing: Vec<B256> =

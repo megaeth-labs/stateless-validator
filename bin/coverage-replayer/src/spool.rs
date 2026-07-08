@@ -30,8 +30,9 @@ pub struct SpoolEntry {
     pub block_json: Vec<u8>,
     /// Execution witness (kvs + levels only, fast to decode).
     pub light_witness: LightWitness,
-    /// `encode_witness_payload(salt, mpt)` blob — the archive/R2 witness binary
-    /// format, kept verbatim for promotion; never decoded on the hot path.
+    /// Raw compressed wire payload (`zstd(bincode-legacy((SaltWitness, MptWitness)))`)
+    /// exactly as returned by `mega_getBlockWitness` — the archive/R2 witness
+    /// binary format, kept verbatim for promotion; never decoded again.
     pub witness_payload: Vec<u8>,
     /// Contract code hashes this block needs (resolved via the codes dir).
     pub code_hashes: Vec<B256>,

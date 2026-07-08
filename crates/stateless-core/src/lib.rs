@@ -23,7 +23,7 @@ extern crate alloc as std;
 
 pub mod chain_spec;
 pub mod light_witness;
-pub use light_witness::{LightWitness, LightWitnessExecutor};
+pub use light_witness::{LightWitness, LightWitnessExecutor, LightWitnessFromSalt};
 pub mod evm_database;
 pub use evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv};
 pub mod db;
