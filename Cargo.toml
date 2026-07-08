@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "bin/coverage-replayer",
     "bin/debug-trace-server",
     "bin/stateless-validator",
     "crates/stateless-common",
@@ -113,3 +114,14 @@ opt-level = 3
 debug-assertions = true
 incremental = true
 debug = true
+
+# Instrumented builds for coverage-replayer: coverage only cares about "was it
+# executed", so trade peak runtime speed for much faster builds (no LTO, many
+# codegen units). Build with:
+#   RUSTFLAGS="-C instrument-coverage -Z coverage-options=branch" \
+#     cargo build --profile coverage -p coverage-replayer --features coverage
+[profile.coverage]
+inherits = "release"
+opt-level = 2
+lto = "off"
+codegen-units = 16

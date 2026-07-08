@@ -1,0 +1,202 @@
+//! redb-backed persistence for the coverage-replayer dispatcher.
+//!
+//! All coverage data is namespaced by `binary_id` (a content hash of the
+//! running executable): counter ids and dense indices are only meaningful for
+//! one exact instrumented build. On mismatch the store refuses to open.
+
+use std::{collections::HashMap, path::Path};
+
+use alloy_primitives::B256;
+use eyre::{Result, ensure};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use serde::{Deserialize, Serialize};
+
+use crate::bitset::BitSet;
+
+const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+const COUNTERS: TableDefinition<u64, &[u8]> = TableDefinition::new("counters");
+const PATTERNS: TableDefinition<u64, &[u8]> = TableDefinition::new("patterns");
+const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("blocks");
+
+const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
+const SCHEMA_VERSION: u32 = 1;
+
+/// Info about one coverage counter (id → dense index + provenance).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CounterInfo {
+    pub dense: u32,
+    pub symbol: String,
+    pub func_hash: String,
+    pub index: u32,
+}
+
+/// One distinct coverage bitmap and its representative block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatternRecord {
+    pub bitmap: BitSet,
+    pub bits: u64,
+    pub first_block: u64,
+    pub last_block: u64,
+    pub hit_count: u64,
+    /// Block whose full data is kept in `archive/` for this pattern.
+    pub representative: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlockStatus {
+    /// Replayed cleanly, bitmap ingested.
+    Ok,
+    /// Executed but header sanity comparison failed — bitmap NOT ingested.
+    Divergent,
+    /// Replay failed with an error — bitmap NOT ingested.
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockRecord {
+    pub hash: B256,
+    pub status: BlockStatus,
+    /// Pattern key this block's bitmap deduped into (when `status == Ok`).
+    pub pattern_key: Option<u64>,
+    pub gas_used: u64,
+    pub tx_count: u64,
+    pub elapsed_ms: u64,
+    pub error: Option<String>,
+}
+
+pub struct Store {
+    db: Database,
+}
+
+impl Store {
+    /// Opens (or creates) the store and enforces the binary-id namespace.
+    pub fn open(path: &Path, binary_id: &str) -> Result<Self> {
+        let db = Database::create(path)?;
+
+        // Ensure all tables exist, then check/stamp namespace metadata.
+        let txn = db.begin_write()?;
+        {
+            let mut meta = txn.open_table(META)?;
+            txn.open_table(COUNTERS)?;
+            txn.open_table(PATTERNS)?;
+            txn.open_table(BLOCKS)?;
+
+            let existing = meta
+                .get("binary_id")?
+                .map(|guard| String::from_utf8_lossy(guard.value()).into_owned());
+            match existing {
+                Some(existing) => {
+                    ensure!(
+                        existing == binary_id,
+                        "store {} belongs to binary_id {existing}, current binary is \
+                         {binary_id}. The counter namespace is per-build: move the data-dir \
+                         aside (or start a fresh one) and re-sweep.",
+                        path.display(),
+                    );
+                }
+                None => {
+                    meta.insert("binary_id", binary_id.as_bytes())?;
+                    meta.insert("schema_version", SCHEMA_VERSION.to_le_bytes().as_slice())?;
+                }
+            }
+        }
+        txn.commit()?;
+
+        Ok(Self { db })
+    }
+
+    /// Loads the whole dispatcher state into memory (counters, patterns, blocks).
+    pub fn load(&self) -> Result<StoreSnapshot> {
+        let txn = self.db.begin_read()?;
+
+        let mut counters = HashMap::new();
+        {
+            let t = txn.open_table(COUNTERS)?;
+            for row in t.iter()? {
+                let (k, v) = row?;
+                let (info, _): (CounterInfo, _) =
+                    bincode::serde::decode_from_slice(v.value(), BINCODE_CONFIG)
+                        .map_err(|e| eyre::eyre!("decode CounterInfo: {e}"))?;
+                counters.insert(k.value(), info);
+            }
+        }
+
+        let mut patterns = HashMap::new();
+        {
+            let t = txn.open_table(PATTERNS)?;
+            for row in t.iter()? {
+                let (k, v) = row?;
+                let (rec, _): (PatternRecord, _) =
+                    bincode::serde::decode_from_slice(v.value(), BINCODE_CONFIG)
+                        .map_err(|e| eyre::eyre!("decode PatternRecord: {e}"))?;
+                patterns.insert(k.value(), rec);
+            }
+        }
+
+        let mut blocks = HashMap::new();
+        {
+            let t = txn.open_table(BLOCKS)?;
+            for row in t.iter()? {
+                let (k, v) = row?;
+                let (rec, _): (BlockRecord, _) =
+                    bincode::serde::decode_from_slice(v.value(), BINCODE_CONFIG)
+                        .map_err(|e| eyre::eyre!("decode BlockRecord: {e}"))?;
+                blocks.insert(k.value(), rec);
+            }
+        }
+
+        Ok(StoreSnapshot { counters, patterns, blocks })
+    }
+
+    /// Persists one judged block: its record, any new counters, and the
+    /// created/updated pattern — atomically in one transaction.
+    pub fn commit_block(
+        &self,
+        block: u64,
+        record: &BlockRecord,
+        new_counters: &[(u64, CounterInfo)],
+        pattern: Option<(u64, &PatternRecord)>,
+    ) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut t = txn.open_table(BLOCKS)?;
+            let bytes = bincode::serde::encode_to_vec(record, BINCODE_CONFIG)
+                .map_err(|e| eyre::eyre!("encode BlockRecord: {e}"))?;
+            t.insert(block, bytes.as_slice())?;
+        }
+        if !new_counters.is_empty() {
+            let mut t = txn.open_table(COUNTERS)?;
+            for (id, info) in new_counters {
+                let bytes = bincode::serde::encode_to_vec(info, BINCODE_CONFIG)
+                    .map_err(|e| eyre::eyre!("encode CounterInfo: {e}"))?;
+                t.insert(*id, bytes.as_slice())?;
+            }
+        }
+        if let Some((key, rec)) = pattern {
+            let mut t = txn.open_table(PATTERNS)?;
+            let bytes = bincode::serde::encode_to_vec(rec, BINCODE_CONFIG)
+                .map_err(|e| eyre::eyre!("encode PatternRecord: {e}"))?;
+            t.insert(key, bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+}
+
+/// In-memory image of the store, owned by the judge / set-cover.
+pub struct StoreSnapshot {
+    pub counters: HashMap<u64, CounterInfo>,
+    pub patterns: HashMap<u64, PatternRecord>,
+    pub blocks: HashMap<u64, BlockRecord>,
+}
+
+/// Content hash of the running executable — the coverage namespace key.
+pub fn current_binary_id() -> Result<String> {
+    use std::hash::Hasher;
+    let exe = std::env::current_exe()?;
+    let bytes = std::fs::read(&exe)?;
+    let mut h = rustc_hash::FxHasher::default();
+    h.write(&bytes);
+    h.write_u64(bytes.len() as u64);
+    Ok(format!("fx64:{:016x}:len{}", h.finish(), bytes.len()))
+}

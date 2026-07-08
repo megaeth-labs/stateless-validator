@@ -1,0 +1,52 @@
+[package]
+name = "coverage-replayer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[dependencies]
+# alloy
+alloy-consensus.workspace = true
+alloy-genesis.workspace = true
+alloy-primitives.workspace = true
+alloy-rpc-types-eth.workspace = true
+
+# mega
+salt.workspace = true
+
+# op
+op-alloy-rpc-types.workspace = true
+
+# revm
+revm.workspace = true
+
+# stateless
+stateless-common = { path = "../../crates/stateless-common" }
+stateless-core = { path = "../../crates/stateless-core" }
+
+# misc
+bincode.workspace = true
+clap.workspace = true
+eyre.workspace = true
+kanal.workspace = true
+num_cpus.workspace = true
+redb.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+# Enables the FFI calls into the LLVM profiler runtime. Only meaningful when the
+# binary is built with RUSTFLAGS="-C instrument-coverage ..." (which links the
+# runtime); regular builds keep this off so the symbols are never referenced.
+coverage = []
