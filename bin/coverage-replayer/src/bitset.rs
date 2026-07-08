@@ -60,6 +60,11 @@ impl BitSet {
     pub fn is_subset_of(&self, other: &BitSet) -> bool {
         self.andnot_count(other) == 0
     }
+
+    /// Raw 64-bit words (little-endian bit order within each word).
+    pub fn words(&self) -> &[u64] {
+        &self.words
+    }
 }
 
 #[cfg(test)]

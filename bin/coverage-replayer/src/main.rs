@@ -7,6 +7,7 @@
 
 mod backfill;
 mod bitset;
+mod inspect;
 mod llvm;
 mod profile_rt;
 mod proto;
@@ -35,6 +36,8 @@ enum Cmd {
     SetCover(setcover::SetCoverArgs),
     /// Print an llvm-cov report for the currently selected set.
     Report(report::ReportArgs),
+    /// Read-only store statistics (works on stores from other builds).
+    Inspect(inspect::InspectArgs),
     /// Internal: resident worker subprocess (spawned by backfill).
     #[clap(hide = true)]
     InternalWorker(worker::WorkerArgs),
@@ -57,5 +60,6 @@ fn main() -> Result<()> {
             .block_on(backfill::run(args)),
         Cmd::SetCover(args) => setcover::run(args),
         Cmd::Report(args) => report::run(args),
+        Cmd::Inspect(args) => inspect::run(args),
     }
 }

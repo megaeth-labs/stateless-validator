@@ -105,6 +105,24 @@ impl Store {
         Ok(Self { db })
     }
 
+    /// Opens an existing store WITHOUT the binary-id namespace check, for
+    /// read-only inspection of data produced by another build (e.g. analyzing
+    /// a store copied from a server). Returns the store and its binary_id.
+    pub fn open_readonly(path: &Path) -> Result<(Self, String)> {
+        ensure!(path.exists(), "store {} does not exist", path.display());
+        let db = Database::open(path)?;
+        let store = Self { db };
+        let txn = store.db.begin_read()?;
+        let meta = txn.open_table(META)?;
+        let binary_id = meta
+            .get("binary_id")?
+            .map(|g| String::from_utf8_lossy(g.value()).into_owned())
+            .unwrap_or_else(|| "<unset>".into());
+        drop(meta);
+        drop(txn);
+        Ok((store, binary_id))
+    }
+
     /// Loads the whole dispatcher state into memory (counters, patterns, blocks).
     pub fn load(&self) -> Result<StoreSnapshot> {
         let txn = self.db.begin_read()?;
