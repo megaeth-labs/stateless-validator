@@ -593,16 +593,12 @@ impl RpcClient {
     /// Zero-validation counterpart of [`Self::get_witness`] for execution-only
     /// consumers: decodes just the light witness (kvs + levels, no
     /// elliptic-curve work — see `stateless_core::light_witness` for the
-    /// safety model) and additionally returns the raw compressed payload so
-    /// callers can archive the exact wire bytes without re-encoding.
+    /// safety model). Consumers that later need the full witness (e.g. to
+    /// assemble test fixtures) re-fetch it via [`Self::get_witness`].
     ///
     /// Witness-size metrics are not recorded on this path (the breakdown
     /// requires the full proof).
-    pub async fn get_witness_light(
-        &self,
-        number: u64,
-        hash: B256,
-    ) -> (LightWitness, MptWitness, Vec<u8>) {
+    pub async fn get_witness_light(&self, number: u64, hash: B256) -> (LightWitness, MptWitness) {
         self.get_witness_light_with_deadline(number, hash, None)
             .await
             .expect("None deadline cannot time out")
@@ -614,7 +610,7 @@ impl RpcClient {
         number: u64,
         hash: B256,
         deadline: Option<Instant>,
-    ) -> std::result::Result<(LightWitness, MptWitness, Vec<u8>), RpcDeadlineExceeded> {
+    ) -> std::result::Result<(LightWitness, MptWitness), RpcDeadlineExceeded> {
         round_robin_with_backoff(
             &self.witness_providers,
             &self.witness_concurrency,
@@ -625,9 +621,7 @@ impl RpcClient {
             RpcMethod::MegaGetBlockWitness,
             self.config.metrics.as_ref(),
             deadline,
-            |provider| {
-                Box::pin(async move { fetch_witness_light_raw(&provider, number, hash).await })
-            },
+            |provider| Box::pin(async move { fetch_witness_light(&provider, number, hash).await }),
         )
         .await
     }
@@ -1128,13 +1122,13 @@ async fn fetch_witness_raw(
 }
 
 /// Zero-validation counterpart of [`fetch_witness_raw`]: decodes only the
-/// light witness plus the raw compressed payload with
+/// light witness with
 /// [`decode_witness_response_light`](crate::decode_witness_response_light).
-async fn fetch_witness_light_raw(
+async fn fetch_witness_light(
     provider: &RootProvider,
     number: u64,
     hash: B256,
-) -> Result<(LightWitness, MptWitness, Vec<u8>)> {
+) -> Result<(LightWitness, MptWitness)> {
     let keys = WitnessRequestKeys { block_number: U64::from(number), block_hash: hash };
     let encoded: String = provider
         .client()
@@ -1143,13 +1137,12 @@ async fn fetch_witness_light_raw(
         .map_err(|e| eyre!("mega_getBlockWitness failed for block {number}: {e}"))?;
 
     let decode_start = Instant::now();
-    let result =
-        tokio::task::spawn_blocking(move || -> Result<(LightWitness, MptWitness, Vec<u8>)> {
-            decode_witness_response_light(&encoded)
-                .map_err(|e| eyre!("failed to light-decode witness response: {e}"))
-        })
-        .await
-        .context("decode task panicked")??;
+    let result = tokio::task::spawn_blocking(move || -> Result<(LightWitness, MptWitness)> {
+        decode_witness_response_light(&encoded)
+            .map_err(|e| eyre!("failed to light-decode witness response: {e}"))
+    })
+    .await
+    .context("decode task panicked")??;
 
     trace!(
         block_number = number,

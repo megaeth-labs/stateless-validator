@@ -1,9 +1,10 @@
-//! On-disk spool entries: everything a worker needs to replay one block, plus
-//! the archive-ready witness payload for promotion.
+//! On-disk spool entries: everything a worker needs to replay one block.
 //!
 //! Lifecycle: written by the fetcher, consumed by a worker, then either deleted
 //! (known coverage pattern — the common case) or moved into `archive/` when the
-//! block becomes a new pattern's representative.
+//! block becomes a new pattern's representative (kept for version-bump
+//! resweeps). Full witnesses are never stored: consumers that need one (PR
+//! payload assembly) re-fetch it from the RPC, which serves the full history.
 
 use std::{
     collections::BTreeMap,
@@ -30,10 +31,6 @@ pub struct SpoolEntry {
     pub block_json: Vec<u8>,
     /// Execution witness (kvs + levels only, fast to decode).
     pub light_witness: LightWitness,
-    /// Raw compressed wire payload (`zstd(bincode-legacy((SaltWitness, MptWitness)))`)
-    /// exactly as returned by `mega_getBlockWitness` — the archive/R2 witness
-    /// binary format, kept verbatim for promotion; never decoded again.
-    pub witness_payload: Vec<u8>,
     /// Contract code hashes this block needs (resolved via the codes dir).
     pub code_hashes: Vec<B256>,
 }

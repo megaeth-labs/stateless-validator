@@ -226,9 +226,10 @@ async fn fetch_block(client: &RpcClient, dirs: &DataDir, n: u64) -> Result<()> {
     let block = client.get_block(BlockId::number(n), true).await;
     let hash = block.header.hash;
     // Zero-validation light fetch: no elliptic-curve work is spent on the
-    // proof we never verify, and the raw compressed payload comes back
-    // verbatim for archival — nothing to re-encode.
-    let (light_witness, _mpt_witness, witness_payload) = client.get_witness_light(n, hash).await;
+    // proof we never verify. Full witnesses are NOT stored anywhere — when a
+    // selected block needs one (PR payload assembly), it is re-fetched from
+    // the RPC, which serves witnesses for the full history (E4).
+    let (light_witness, _mpt_witness) = client.get_witness_light(n, hash).await;
 
     let code_hashes = crate::spool::code_hashes_of(&light_witness);
     let missing: Vec<B256> =
@@ -247,7 +248,6 @@ async fn fetch_block(client: &RpcClient, dirs: &DataDir, n: u64) -> Result<()> {
         block_hash: hash,
         block_json: serde_json::to_vec(&block)?,
         light_witness,
-        witness_payload,
         code_hashes,
     };
     let path = spool_path.clone();

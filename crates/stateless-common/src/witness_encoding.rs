@@ -107,18 +107,15 @@ pub fn decode_witness_response(
 }
 
 /// Zero-validation counterpart of [`decode_witness_response`]: decodes only
-/// the light witness from a versioned RPC response, and additionally returns
-/// the raw compressed payload so execution-only consumers can archive the
-/// exact wire bytes without re-encoding.
+/// the light witness from a versioned RPC response.
 pub fn decode_witness_response_light(
     response: &str,
-) -> Result<(LightWitness, MptWitness, Vec<u8>), WitnessDecodingError> {
+) -> Result<(LightWitness, MptWitness), WitnessDecodingError> {
     let payload = response
         .strip_prefix(WITNESS_RESPONSE_VERSION_PREFIX)
         .ok_or(WitnessDecodingError::MissingPrefix)?;
     let compressed = BASE64.decode(payload)?;
-    let (light, mpt) = decode_witness_payload_light(&compressed)?;
-    Ok((light, mpt, compressed))
+    decode_witness_payload_light(&compressed)
 }
 
 #[cfg(test)]
@@ -181,23 +178,18 @@ mod tests {
         assert_eq!(mpt, mpt_witness);
     }
 
-    /// Response-level light decode returns the exact compressed payload for
-    /// archival alongside the light parts.
+    /// Response-level light decode agrees with the full decode.
     #[test]
     fn decode_witness_response_light_matches_full() {
         let (salt_witness, mpt_witness) = first_fixture_witness();
         let encoded =
             encode_witness_response(&salt_witness, &mpt_witness).expect("encoding should succeed");
 
-        let (light, mpt, payload) =
+        let (light, mpt) =
             decode_witness_response_light(&encoded).expect("light decode should succeed");
 
         assert_eq!(light, LightWitness::from(&salt_witness));
         assert_eq!(mpt, mpt_witness);
-        let (full_salt, full_mpt) =
-            decode_witness_payload(&payload).expect("returned payload must be the real payload");
-        assert_eq!(full_salt, salt_witness);
-        assert_eq!(full_mpt, mpt_witness);
     }
 
     /// The committed real-mainnet payload (block 6906405, ~6.3 MiB
