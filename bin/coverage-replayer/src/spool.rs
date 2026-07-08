@@ -107,9 +107,21 @@ impl DataDir {
     }
 }
 
-/// Write via tmp file + rename so readers never observe partial files.
+/// Write via unique tmp file + rename so readers never observe partial files.
+///
+/// The tmp name embeds pid + a counter: concurrent writers of the SAME target
+/// (e.g. two fetch tasks resolving one shared contract hash) must not collide
+/// on the tmp path — last rename wins and both writers succeed.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path.with_extension("tmp");
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let unique = format!(
+        "{}.{}.{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed),
+    );
+    let tmp = path.with_file_name(unique);
     fs::write(&tmp, bytes).wrap_err_with(|| format!("write {}", tmp.display()))?;
     fs::rename(&tmp, path).wrap_err_with(|| format!("rename to {}", path.display()))?;
     Ok(())

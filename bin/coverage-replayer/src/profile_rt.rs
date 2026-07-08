@@ -38,9 +38,24 @@ pub fn write_profraw(path: &Path) -> Result<()> {
         ffi::__llvm_profile_set_filename(c_path.as_ptr());
         ffi::__llvm_profile_write_file()
     };
+    // Point the runtime back at /dev/null so the automatic at-exit write can't
+    // recreate a per-block profraw the judge may already have deleted.
+    suppress_default_profile();
     eyre::ensure!(rc == 0, "__llvm_profile_write_file returned {rc}");
     Ok(())
 }
+
+/// Sends the LLVM runtime's automatic at-exit profile write to /dev/null.
+/// Without this every instrumented process (dispatcher, set-cover, report)
+/// drops a stray `default_*.profraw` into the current directory on exit.
+#[cfg(feature = "coverage")]
+pub fn suppress_default_profile() {
+    static DEV_NULL: &std::ffi::CStr = c"/dev/null";
+    unsafe { ffi::__llvm_profile_set_filename(DEV_NULL.as_ptr()) }
+}
+
+#[cfg(not(feature = "coverage"))]
+pub fn suppress_default_profile() {}
 
 #[cfg(not(feature = "coverage"))]
 pub fn write_profraw(_path: &Path) -> Result<()> {

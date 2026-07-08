@@ -43,6 +43,7 @@ tracing-subscriber.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
+stateless-test-utils = { path = "../../crates/stateless-test-utils" }
 tempfile.workspace = true
 
 [features]

@@ -383,6 +383,9 @@ struct JudgeState<'a> {
     new_patterns: u64,
     divergent_streak: u64,
     started: Instant,
+    /// Worker wall-clock per successfully replayed block (spool load + replay
+    /// + profraw + bitmap extraction) — the E3 throughput measurement.
+    elapsed_ok_ms: Vec<u64>,
 }
 
 impl<'a> JudgeState<'a> {
@@ -420,6 +423,7 @@ impl<'a> JudgeState<'a> {
             new_patterns: 0,
             divergent_streak: 0,
             started: Instant::now(),
+            elapsed_ok_ms: Vec::new(),
         }
     }
 
@@ -496,6 +500,7 @@ impl<'a> JudgeState<'a> {
     }
 
     fn ingest_ok(&mut self, resp: WorkerResponse) -> Result<()> {
+        self.elapsed_ok_ms.push(resp.elapsed_ms);
         // Resolve counter ids → dense indices, registering unseen ids.
         let unknown: Vec<u64> =
             resp.counters.iter().filter(|id| !self.counters.contains_key(id)).copied().collect();
@@ -623,6 +628,19 @@ impl<'a> JudgeState<'a> {
             elapsed = %format!("{:.1}s", self.started.elapsed().as_secs_f64()),
             "backfill finished"
         );
+        if !self.elapsed_ok_ms.is_empty() {
+            let mut v = self.elapsed_ok_ms.clone();
+            v.sort_unstable();
+            let avg = v.iter().sum::<u64>() as f64 / v.len() as f64;
+            info!(
+                blocks = v.len(),
+                avg_ms = %format!("{avg:.0}"),
+                p50_ms = v[v.len() / 2],
+                p95_ms = v[(v.len() * 95 / 100).min(v.len() - 1)],
+                max_ms = v[v.len() - 1],
+                "per-block worker time (replay + profraw + bitmap)"
+            );
+        }
     }
 }
 

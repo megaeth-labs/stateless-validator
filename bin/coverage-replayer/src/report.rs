@@ -20,9 +20,14 @@ pub struct ReportArgs {
     /// Manifest to report on (default: <data-dir>/manifest.json).
     #[clap(long)]
     pub manifest: Option<PathBuf>,
-    /// Substring filter on source file paths in the per-file table.
-    #[clap(long, default_value = "mega-evm")]
-    pub path_filter: String,
+    /// Source directories passed to llvm-cov as the report scope. Default:
+    /// auto-detect the mega-evm checkout from ./Cargo.lock.
+    ///
+    /// IMPORTANT: restricting the scope is not just focus — reporting over the
+    /// full covmap crashes llvm-cov (LLVM bug in instantiation-group handling
+    /// for some dependency files); scoping to mega-evm sources avoids it.
+    #[clap(long = "source-dir")]
+    pub source_dirs: Vec<PathBuf>,
     /// Explicit llvm-profdata path (default: auto-detect).
     #[clap(long)]
     pub llvm_profdata: Option<String>,
@@ -68,11 +73,25 @@ pub fn run(args: ReportArgs) -> Result<()> {
         String::from_utf8_lossy(&out.stderr)
     );
 
+    let source_dirs = if args.source_dirs.is_empty() {
+        let detected = detect_mega_evm_checkout().ok_or_else(|| {
+            eyre::eyre!(
+                "could not auto-detect the mega-evm checkout (no ./Cargo.lock or no matching \
+                 ~/.cargo/git/checkouts entry); pass --source-dir explicitly"
+            )
+        })?;
+        info!(dir = %detected.display(), "auto-detected mega-evm sources");
+        vec![detected]
+    } else {
+        args.source_dirs.clone()
+    };
+
     let exe = std::env::current_exe()?;
     let report = Command::new(&llvm_cov)
         .arg("report")
         .arg(&exe)
         .arg(format!("--instr-profile={}", merged.display()))
+        .args(&source_dirs)
         .output()?;
     ensure!(
         report.status.success(),
@@ -85,23 +104,8 @@ pub fn run(args: ReportArgs) -> Result<()> {
         universe_counters = manifest.universe_counters,
         "coverage report for selected set (branch-granular counters: see manifest)"
     );
-    let text = String::from_utf8_lossy(&report.stdout);
-    let mut printed_header = false;
-    for line in text.lines() {
-        let is_header = line.starts_with("Filename") || line.starts_with('-');
-        let is_total = line.starts_with("TOTAL");
-        if is_header && !printed_header {
-            println!("{line}");
-            if line.starts_with('-') {
-                printed_header = true;
-            }
-            continue;
-        }
-        if is_total || line.contains(&args.path_filter) {
-            println!("{line}");
-        }
-    }
-    println!("\nselected blocks:");
+    println!("{}", String::from_utf8_lossy(&report.stdout));
+    println!("selected blocks:");
     for b in &manifest.blocks {
         println!(
             "  {:>10}  gain={:<6} bits={:<6} pattern={}  {}",
@@ -109,4 +113,33 @@ pub fn run(args: ReportArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Finds the cargo git checkout of the mega-evm rev pinned in ./Cargo.lock.
+fn detect_mega_evm_checkout() -> Option<PathBuf> {
+    let lock = std::fs::read_to_string("Cargo.lock").ok()?;
+    // `source = "git+https://github.com/megaeth-labs/mega-evm.git?tag=vX#<full-rev>"`
+    let rev: String = lock
+        .lines()
+        .find(|l| l.contains("mega-evm.git"))?
+        .rsplit('#')
+        .next()?
+        .trim_end_matches('"')
+        .chars()
+        .take(7)
+        .collect();
+    if rev.len() != 7 {
+        return None;
+    }
+    let home = std::env::var_os("HOME")?;
+    let checkouts = PathBuf::from(home).join(".cargo").join("git").join("checkouts");
+    for entry in std::fs::read_dir(checkouts).ok()?.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("mega-evm-") {
+            let candidate = entry.path().join(&rev);
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }

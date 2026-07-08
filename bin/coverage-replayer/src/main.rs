@@ -41,6 +41,7 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    profile_rt::suppress_default_profile();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

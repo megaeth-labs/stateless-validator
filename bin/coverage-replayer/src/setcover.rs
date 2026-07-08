@@ -57,6 +57,28 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
     let store = Store::open(&dirs.store_path(), &binary_id)?;
     let snapshot = store.load()?;
 
+    // E3 datapoint: worker wall-clock per successfully replayed block.
+    {
+        let mut v: Vec<u64> = snapshot
+            .blocks
+            .values()
+            .filter(|b| matches!(b.status, crate::store::BlockStatus::Ok))
+            .map(|b| b.elapsed_ms)
+            .collect();
+        if !v.is_empty() {
+            v.sort_unstable();
+            let avg = v.iter().sum::<u64>() as f64 / v.len() as f64;
+            info!(
+                blocks = v.len(),
+                avg_ms = %format!("{avg:.0}"),
+                p50_ms = v[v.len() / 2],
+                p95_ms = v[(v.len() * 95 / 100).min(v.len() - 1)],
+                max_ms = v[v.len() - 1],
+                "per-block worker time (replay + profraw + bitmap)"
+            );
+        }
+    }
+
     let incumbents: HashSet<u64> = match &args.incumbent_manifest {
         Some(path) => {
             let manifest: Manifest = serde_json::from_str(
