@@ -40,8 +40,8 @@ salt-stateless.workspace = true
 
 # op
 op-alloy-consensus.workspace = true
-op-alloy-rpc-types-engine.workspace = true
 op-alloy-rpc-types.workspace = true
+op-alloy-rpc-types-engine.workspace = true
 
 # reth
 reth-ethereum-forks.workspace = true
