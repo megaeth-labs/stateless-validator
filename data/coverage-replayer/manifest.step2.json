@@ -1,0 +1,169 @@
+{
+  "binary_id": "fx64:75e379eb29d2feea:len43305616",
+  "generated_at_unix": 1783580307,
+  "universe_counters": 1740,
+  "covered_counters": 1740,
+  "blocks": [
+    {
+      "number": 20679980,
+      "hash": "0xb03d8d9b0c49b51b46a7bd65a63d934cf28aa0cd7c7d60712a3fdf3c80beaf53",
+      "pattern": "e1915c6e83e1f9e4",
+      "gain": 79,
+      "bits": 1299
+    },
+    {
+      "number": 20685054,
+      "hash": "0xa5d529739619fd9ec347f6ecd04390a893e8fe47b2f00928ef53afe5981cbe48",
+      "pattern": "9bed25663104113b",
+      "gain": 35,
+      "bits": 1413
+    },
+    {
+      "number": 20600009,
+      "hash": "0x1490ef79229b8829cad30f166487ce8cd1179fbbc1761fa174705badae1ce2e6",
+      "pattern": "73050ac56017aa0b",
+      "gain": 22,
+      "bits": 1332
+    },
+    {
+      "number": 20603535,
+      "hash": "0xdb6f94acc31f94c6a5df50e79d45e4b41032c0665d873e7bb6c7a7c7d5afd446",
+      "pattern": "f4fd4a2e8596f927",
+      "gain": 21,
+      "bits": 1434
+    },
+    {
+      "number": 20697184,
+      "hash": "0xa62a3a27d630a558febbf8a9e220967a2fb10102c12961d6f64f549674ad2bbe",
+      "pattern": "ed646adf4d255b59",
+      "gain": 19,
+      "bits": 1408
+    },
+    {
+      "number": 20638267,
+      "hash": "0xbc4e180e8baee9f6593c4eb0350f8eaae335cf0e5bbee9668cf7e3904ee267a1",
+      "pattern": "49c01eb68d31c7f7",
+      "gain": 18,
+      "bits": 1273
+    },
+    {
+      "number": 20681700,
+      "hash": "0x4edc974ae95261036fd2c1ac84a2edf7bdac2e89d8b0349bbb67efe1cbb8153c",
+      "pattern": "d025dc5e3a4aef07",
+      "gain": 10,
+      "bits": 1404
+    },
+    {
+      "number": 20698877,
+      "hash": "0x2738c9d9363ad5d5bdbbf346cab71d5dde162a7cdf0a75a3a0c8867afb2f4459",
+      "pattern": "00dcd6084172d08e",
+      "gain": 9,
+      "bits": 1333
+    },
+    {
+      "number": 20672099,
+      "hash": "0xdaadc061a5c7002599d34a54f41d4a603446d61f9ac22880b9ccb0d3f5a34189",
+      "pattern": "b6c861946d0fa350",
+      "gain": 9,
+      "bits": 1431
+    },
+    {
+      "number": 20635496,
+      "hash": "0x5ba9a027b1b693cdee292dd5314d7458ce4031253e2b4cd8e301046950391336",
+      "pattern": "4587c3ae4bdc4368",
+      "gain": 6,
+      "bits": 1428
+    },
+    {
+      "number": 20680730,
+      "hash": "0x0427f1b8cfda7da30f9cf67525bfc98f5ecc12634d0e51e6905796252dc286f3",
+      "pattern": "c0819e94bfb9d318",
+      "gain": 4,
+      "bits": 1270
+    },
+    {
+      "number": 20659352,
+      "hash": "0xaf7fe9193922db8da441ab21fcb8ed2eecc033cfa9f69dc179f617ad4a6ac656",
+      "pattern": "40ffd2a07e88e399",
+      "gain": 4,
+      "bits": 1392
+    },
+    {
+      "number": 20653217,
+      "hash": "0x3c1dfe2ae12973627b24db5ef951ac9039d20d9860655930f84afa2b8b9c4cd3",
+      "pattern": "510f1364e01f19c2",
+      "gain": 4,
+      "bits": 1385
+    },
+    {
+      "number": 20700021,
+      "hash": "0x067cb603e5b4848c7fcbff79a30ab8b106ddc03edfaf8307605b0e8cf992d0f4",
+      "pattern": "787d4d66c4154930",
+      "gain": 2,
+      "bits": 1385
+    },
+    {
+      "number": 20698958,
+      "hash": "0xfd4c8e0475153338b018fd4b41aaa24dc1482c087c9b2a52c3e4c2402a9b5534",
+      "pattern": "8d4933e00f7c2f75",
+      "gain": 2,
+      "bits": 1383
+    },
+    {
+      "number": 20687954,
+      "hash": "0x9a3efe13addc5b95898f7472f69a2f3df4593ad89e041428243057f78d034238",
+      "pattern": "668bc30c60b9f95c",
+      "gain": 2,
+      "bits": 1394
+    },
+    {
+      "number": 20681453,
+      "hash": "0x387c2ddf4cf4f682ba68db29e72f531031b67b6838ba27d57a67964a02e01627",
+      "pattern": "ec2bbbc05af64503",
+      "gain": 2,
+      "bits": 1400
+    },
+    {
+      "number": 20679002,
+      "hash": "0x47f860bcd3994ce2eec8d2ce8aca4c659cd2cec2ef36417ec04b20270b5989ff",
+      "pattern": "71757b4b29660901",
+      "gain": 2,
+      "bits": 1424
+    },
+    {
+      "number": 20675703,
+      "hash": "0xd35307adffd0ffa8049c20a81c775bc11b770ceb26313be86ff11a0867d8bba9",
+      "pattern": "bbd10af471726d75",
+      "gain": 2,
+      "bits": 1409
+    },
+    {
+      "number": 20654774,
+      "hash": "0x2aaa3db51cd2f29a4e1eecaa03ae462fa9c3211121665d9eb1b5e02cd59b74de",
+      "pattern": "93b982266227d6df",
+      "gain": 2,
+      "bits": 1355
+    },
+    {
+      "number": 20620790,
+      "hash": "0xd88efbda7525410f74ed17826ec853f66a71bbf3a9dc6c2ae76e177b30755077",
+      "pattern": "f91782c7783fcb85",
+      "gain": 2,
+      "bits": 1350
+    },
+    {
+      "number": 20698805,
+      "hash": "0xb32c784d180a207edf21de2081a0497106d7b36b21db3de3076078dde5307b5e",
+      "pattern": "9ceec3fb8b5e72b6",
+      "gain": 1,
+      "bits": 1337
+    },
+    {
+      "number": 20643606,
+      "hash": "0x845b60a90ad897769ce3d1d642958f2ab5b322827973df860a77657064ca7bce",
+      "pattern": "1bd890a2a3df68b3",
+      "gain": 1,
+      "bits": 1321
+    }
+  ]
+}
