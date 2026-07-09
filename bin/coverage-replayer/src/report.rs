@@ -56,11 +56,13 @@ pub fn run(args: ReportArgs) -> Result<()> {
     // for llvm-profdata (profdata files are valid merge inputs).
     let mut profraws = Vec::new();
     for b in &manifest.blocks {
-        let z = dirs.archived_profile(b.number);
-        ensure!(z.exists(), "archived profile missing for block {}: {}", b.number, z.display());
+        let key = u64::from_str_radix(&b.pattern, 16)
+            .wrap_err_with(|| format!("bad pattern key {}", b.pattern))?;
+        let z = dirs.archived_profile(key);
+        ensure!(z.exists(), "archived profile missing for pattern {}: {}", b.pattern, z.display());
         let raw = zstd::decode_all(&std::fs::read(&z)?[..])
             .wrap_err_with(|| format!("decompress {}", z.display()))?;
-        let tmp = dirs.tmp().join(format!("report_{}.profdata", b.number));
+        let tmp = dirs.tmp().join(format!("report_{}.profdata", b.pattern));
         crate::spool::write_atomic(&tmp, &raw)?;
         profraws.push(tmp);
     }

@@ -38,8 +38,11 @@ pub struct PatternRecord {
     pub first_block: u64,
     pub last_block: u64,
     pub hit_count: u64,
-    /// Block whose full data is kept in `archive/` for this pattern.
+    /// The lightest (min replay time) block seen exhibiting this pattern — the
+    /// best fixture candidate. Re-homed whenever a lighter block appears.
     pub representative: u64,
+    /// Replay time of `representative`, to decide re-homing.
+    pub representative_elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -208,13 +211,18 @@ pub struct StoreSnapshot {
     pub blocks: HashMap<u64, BlockRecord>,
 }
 
-/// Content hash of the running executable — the coverage namespace key.
+/// Coverage namespace key: a fingerprint of the instrumented mega-evm build,
+/// NOT a whole-exe hash. Stays stable across dispatcher/orchestration edits
+/// (so the resident mode can continue a store built by `backfill`), and only
+/// changes when mega-evm's revision or the toolchain changes — exactly when
+/// the counter ids would actually shift. Captured at compile time by build.rs.
 pub fn current_binary_id() -> Result<String> {
     use std::hash::Hasher;
-    let exe = std::env::current_exe()?;
-    let bytes = std::fs::read(&exe)?;
+    let mega_evm = env!("COVERAGE_MEGA_EVM_REV");
+    let rustc = env!("COVERAGE_RUSTC_VERSION");
     let mut h = rustc_hash::FxHasher::default();
-    h.write(&bytes);
-    h.write_u64(bytes.len() as u64);
-    Ok(format!("fx64:{:016x}:len{}", h.finish(), bytes.len()))
+    h.write(mega_evm.as_bytes());
+    h.write_u8(0xff);
+    h.write(rustc.as_bytes());
+    Ok(format!("megaevm:{}:fx{:016x}", &mega_evm[..mega_evm.len().min(12)], h.finish()))
 }

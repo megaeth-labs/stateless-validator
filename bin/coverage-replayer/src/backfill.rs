@@ -538,6 +538,13 @@ impl<'a> JudgeState<'a> {
                 Some(rec) if rec.bitmap == bitmap => {
                     rec.hit_count += 1;
                     rec.last_block = rec.last_block.max(resp.block);
+                    // Re-home the representative to the lightest block seen for
+                    // this pattern — the best fixture candidate. Profile is
+                    // keyed by pattern, so nothing on disk moves.
+                    if resp.elapsed_ms < rec.representative_elapsed_ms {
+                        rec.representative = resp.block;
+                        rec.representative_elapsed_ms = resp.elapsed_ms;
+                    }
                     break false;
                 }
                 Some(_) => key = key.wrapping_add(PROBE_STEP),
@@ -552,6 +559,7 @@ impl<'a> JudgeState<'a> {
                 last_block: resp.block,
                 hit_count: 1,
                 representative: resp.block,
+                representative_elapsed_ms: resp.elapsed_ms,
             };
             // Dominated patterns (strict subset of an existing one) can never
             // beat their dominator in set cover — record the bitmap for dedup
@@ -582,7 +590,7 @@ impl<'a> JudgeState<'a> {
             } else {
                 let llvm_profdata = self.llvm_profdata.clone();
                 let profraw = resp.profraw.clone();
-                let dest = self.dirs.archived_profile(resp.block);
+                let dest = self.dirs.archived_profile(key);
                 let block = resp.block;
                 self.compressions.spawn_blocking(move || {
                     if let Err(e) = archive_sparse_profile(&llvm_profdata, &profraw, &dest) {

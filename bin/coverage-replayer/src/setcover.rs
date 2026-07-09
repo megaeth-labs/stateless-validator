@@ -120,7 +120,7 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
                 remaining[i].1.bitmap.is_subset_of(&remaining[j].1.bitmap)
             {
                 keep[i] = false;
-                let _ = std::fs::remove_file(dirs.archived_profile(remaining[i].1.representative));
+                let _ = std::fs::remove_file(dirs.archived_profile(*remaining[i].0));
                 break;
             }
         }

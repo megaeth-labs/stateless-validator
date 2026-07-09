@@ -98,8 +98,12 @@ impl DataDir {
     /// the `llvm-profdata merge -sparse` conversion, so this is small; raw
     /// profraws carry the whole binary's counter array plus an incompressible
     /// name table (~2 MB even zstd'd) and are never archived.
-    pub fn archived_profile(&self, block: u64) -> PathBuf {
-        self.archive_profiles().join(format!("{block}.profdata.zst"))
+    ///
+    /// Keyed by pattern (not block) so re-homing a pattern's representative to
+    /// a lighter block never moves or orphans its profile — the profile is the
+    /// same regardless of which block produced it (identical bitmap).
+    pub fn archived_profile(&self, pattern_key: u64) -> PathBuf {
+        self.archive_profiles().join(format!("{pattern_key:016x}.profdata.zst"))
     }
 }
 
