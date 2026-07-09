@@ -3849,7 +3849,7 @@ dependencies = [
 [[package]]
 name = "kona-cli"
 version = "0.3.2"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#0e12e4a4380aa46f06daca81afb72a1b91645dfc"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
 dependencies = [
  "alloy-chains",
  "alloy-primitives",
@@ -3869,7 +3869,7 @@ dependencies = [
 [[package]]
 name = "kona-derive"
 version = "0.4.5"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#0e12e4a4380aa46f06daca81afb72a1b91645dfc"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3890,7 +3890,7 @@ dependencies = [
 [[package]]
 name = "kona-driver"
 version = "0.4.0"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#0e12e4a4380aa46f06daca81afb72a1b91645dfc"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -3911,7 +3911,7 @@ dependencies = [
 [[package]]
 name = "kona-executor"
 version = "0.4.0"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#0e12e4a4380aa46f06daca81afb72a1b91645dfc"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3944,7 +3944,7 @@ dependencies = [
 [[package]]
 name = "kona-genesis"
 version = "0.4.5"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#0e12e4a4380aa46f06daca81afb72a1b91645dfc"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
@@ -3964,7 +3964,7 @@ dependencies = [
 [[package]]
 name = "kona-hardforks"
 version = "0.4.5"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#0e12e4a4380aa46f06daca81afb72a1b91645dfc"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -3975,7 +3975,7 @@ dependencies = [
 [[package]]
 name = "kona-log"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#0e12e4a4380aa46f06daca81afb72a1b91645dfc"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
 dependencies = [
  "risc0-zkvm",
 ]
@@ -3983,12 +3983,12 @@ dependencies = [
 [[package]]
 name = "kona-macros"
 version = "0.1.2"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#0e12e4a4380aa46f06daca81afb72a1b91645dfc"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
 
 [[package]]
 name = "kona-megaevm"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#0e12e4a4380aa46f06daca81afb72a1b91645dfc"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
 dependencies = [
  "alloy-hardforks 0.2.13",
  "alloy-op-hardforks 0.2.13",
@@ -4000,7 +4000,7 @@ dependencies = [
 [[package]]
 name = "kona-mpt"
 version = "0.3.0"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#0e12e4a4380aa46f06daca81afb72a1b91645dfc"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -4012,7 +4012,7 @@ dependencies = [
 [[package]]
 name = "kona-preimage"
 version = "0.3.0"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#0e12e4a4380aa46f06daca81afb72a1b91645dfc"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
 dependencies = [
  "alloy-primitives",
  "async-channel",
@@ -4025,7 +4025,7 @@ dependencies = [
 [[package]]
 name = "kona-proof"
 version = "0.3.0"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#0e12e4a4380aa46f06daca81afb72a1b91645dfc"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -4063,7 +4063,7 @@ dependencies = [
 [[package]]
 name = "kona-protocol"
 version = "0.4.5"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#0e12e4a4380aa46f06daca81afb72a1b91645dfc"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
 dependencies = [
  "alloc-no-stdlib",
  "alloy-consensus",
@@ -4092,7 +4092,7 @@ dependencies = [
 [[package]]
 name = "kona-registry"
 version = "0.4.5"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#0e12e4a4380aa46f06daca81afb72a1b91645dfc"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
 dependencies = [
  "alloy-chains",
  "alloy-eips",
@@ -4111,7 +4111,7 @@ dependencies = [
 [[package]]
 name = "kona-system-contracts"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#0e12e4a4380aa46f06daca81afb72a1b91645dfc"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
 dependencies = [
  "alloy-primitives",
  "mega-evm 1.5.1",
@@ -6869,7 +6869,7 @@ dependencies = [
 [[package]]
 name = "salt-stateless"
 version = "1.0.0"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#0e12e4a4380aa46f06daca81afb72a1b91645dfc"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",

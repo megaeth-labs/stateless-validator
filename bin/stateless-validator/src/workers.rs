@@ -3,11 +3,12 @@
 use std::{sync::Arc, time::Duration};
 
 use alloy_primitives::B256;
+use alloy_rpc_types_eth::Block;
 use eyre::Result;
+use op_alloy_rpc_types::Transaction;
 use stateless_common::RpcClient;
 use stateless_core::{
-    BisectResolver, ChainStore, KonaValidator, PipelineConfig, chain_spec::ChainSpec,
-    pipeline::run_pipeline,
+    BisectResolver, ChainStore, PipelineConfig, executor::BlockValidator, pipeline::run_pipeline,
 };
 use stateless_db::ContractCache;
 use tokio::{signal, task};
@@ -24,14 +25,18 @@ use crate::{
 ///
 /// Cleanly drains on SIGINT/SIGTERM and returns either the pipeline result or `Ok(())`
 /// on signal.
-pub async fn run_with_signals(
+pub async fn run_with_signals<V>(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
     contract_cache: Arc<ContractCache>,
-    chain_spec: Arc<ChainSpec>,
+    validator: Arc<V>,
     report_validation_endpoint: Option<String>,
     pipeline_config: PipelineConfig,
-) -> Result<()> {
+    fetch_parent_header: bool,
+) -> Result<()>
+where
+    V: BlockValidator<Block<Transaction>> + Send + Sync + 'static,
+{
     let report_validation = report_validation_endpoint.is_some();
     let config = Arc::new(pipeline_config);
     info!(
@@ -49,12 +54,10 @@ pub async fn run_with_signals(
     let fetcher = Arc::new(ValidatorFetcher {
         rpc_client: client.clone(),
         on_remote_height: metrics::set_remote_chain_height,
+        fetch_parent_header,
     });
-    let processor = Arc::new(ValidatorProcessor {
-        validator: Arc::new(KonaValidator::new(chain_spec.as_ref())?),
-        contract_cache,
-        rpc_client: client.clone(),
-    });
+    let processor =
+        Arc::new(ValidatorProcessor { validator, contract_cache, rpc_client: client.clone() });
     let hooks = Arc::new(ValidatorHooks);
 
     let reporter = if report_validation {

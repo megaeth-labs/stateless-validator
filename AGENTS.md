@@ -5,7 +5,7 @@ This file provides guidance to AI agents (e.g., Claude Code, Codex, Cursor, etc.
 ## Project Overview
 
 Stateless validator for MegaETH — validates blocks using SALT witness data without requiring full chain state.
-The workspace contains two binaries: `stateless-validator` (chain-following validator) and `debug-trace-server` (RPC server for debug/trace methods).
+The workspace contains three binaries: `stateless-validator` (chain-following MegaEVM validator), `kona-validator` (chain-following Kona validator), and `debug-trace-server` (RPC server for debug/trace methods).
 See `README.md` for detailed documentation and quickstart.
 
 ## Build & Development Commands
@@ -40,7 +40,8 @@ The project uses nightly `2026-02-03` toolchain (edition 2024, rust-version 1.95
 | `stateless-db`         | `crates/stateless-db`         | redb-backed persistence: table definitions, read/write helpers, `ContractCache`            |
 | `stateless-common`     | `crates/stateless-common`     | RPC client, metrics/logging utilities, witness size estimation                             |
 | `stateless-test-utils` | `crates/stateless-test-utils` | Test fixtures (blocks, witnesses, contracts) and env-var lock for integration tests        |
-| `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers (`app.rs` / `workers.rs` / `main.rs`) |
+| `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers with `MegaEvmValidator` (`app.rs` / `workers.rs` / `main.rs`) |
+| `kona-validator`       | `bin/stateless-validator`     | Kona-backed validator binary sharing the validator pipeline (`src/bin/kona-validator.rs`) |
 | `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                              |
 
 Additional directories: `test_data/` (integration test fixtures including genesis config), `audits/` (security audit reports).
@@ -49,7 +50,7 @@ Additional directories: `test_data/` (integration test fixtures including genesi
 
 ### Pipeline
 
-Both binaries share a generic three-stage pipeline defined in `stateless-core::pipeline`:
+The validator binaries and trace server share a generic three-stage pipeline defined in `stateless-core::pipeline`:
 
 1. **Fetch** — `block_fetcher` streams blocks + witnesses from a `BlockFetcher` via a bounded in-flight window (concurrency capped by `fetcher_max_in_flight`).
 2. **Process** — N workers run `BlockProcessor::process` (validator: EVM execution; trace server: pass-through).
@@ -61,7 +62,8 @@ On a detected reorg, the rollback floor comes from a pluggable `ReorgResolver`: 
 ### Executor abstraction
 
 Per-block validation is pluggable via the `BlockValidator` trait in `stateless-core::executor`, consumed by the validator's `ValidatorProcessor<V>`.
-`MegaEvmValidator` is the in-repo backend (mega-evm replay + SALT root update via `validate_block`); alternative executors (e.g. a kona-based validator binary) implement the trait out-of-tree with their own error types.
+`MegaEvmValidator` is the default in-repo backend (mega-evm replay + SALT root update via `validate_block`), while `KonaValidator` is exposed through the separate `kona-validator` binary.
+Other embedders can implement the trait out-of-tree with their own error types.
 `ValidationInput` bundles the per-block inputs (block, witnesses, contracts); its optional `parent_header` is required only by backends that re-derive header fields from the parent instead of trusting the block's own header.
 
 ### Database

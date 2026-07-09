@@ -32,6 +32,7 @@ use crate::metrics;
 pub struct ValidatorFetcher {
     pub rpc_client: Arc<RpcClient>,
     pub on_remote_height: fn(u64),
+    pub fetch_parent_header: bool,
 }
 
 impl BlockFetcher for ValidatorFetcher {
@@ -45,9 +46,17 @@ impl BlockFetcher for ValidatorFetcher {
             self.rpc_client.get_witness(block_number, block_hash),
             self.rpc_client.get_block(BlockId::Hash(block_hash.into()), true),
         );
-        let parent_header =
-            self.rpc_client.get_header(BlockId::Hash(block.header.parent_hash.into()), false).await;
-        Ok(ValidationTask { block, parent_header: parent_header.inner, salt_witness, mpt_witness })
+        let parent_header = if self.fetch_parent_header {
+            Some(
+                self.rpc_client
+                    .get_header(BlockId::Hash(block.header.parent_hash.into()), false)
+                    .await
+                    .inner,
+            )
+        } else {
+            None
+        };
+        Ok(ValidationTask { block, parent_header, salt_witness, mpt_witness })
     }
 
     async fn latest_block_number(&self) -> Result<u64> {
@@ -75,7 +84,7 @@ impl BlockFetcher for ValidatorFetcher {
 #[derive(Clone, Debug)]
 pub struct ValidationTask {
     pub block: Block<Transaction>,
-    pub parent_header: Header,
+    pub parent_header: Option<Header>,
     pub salt_witness: SaltWitness,
     pub mpt_witness: MptWitness,
 }
@@ -231,10 +240,13 @@ where
         let validator = Arc::clone(&self.validator);
         let validation_result = task::spawn_blocking(move || {
             let ValidationTask { block, parent_header, salt_witness, mpt_witness } = task;
-            validator.validate_block(
-                ValidationInput::new(&block, salt_witness, mpt_witness, &contracts)
-                    .with_parent_header(&parent_header),
-            )
+            let input = ValidationInput::new(&block, salt_witness, mpt_witness, &contracts);
+            match &parent_header {
+                Some(parent_header) => {
+                    validator.validate_block(input.with_parent_header(parent_header))
+                }
+                None => validator.validate_block(input),
+            }
         })
         .await
         .map_err(|e| fail(format!("Validation task panicked: {e}"), false))?;

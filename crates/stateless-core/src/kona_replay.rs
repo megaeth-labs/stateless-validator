@@ -878,35 +878,39 @@ mod tests {
     }
 
     #[test]
-    fn kona_validator_replays_mainnet_fixture() {
+    fn kona_validator_validate_block_mainnet_fixtures() {
         let _logging = init_test_logging("stateless_core");
         let fx = TestFixtures::mainnet_shared();
         let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
         let validator = KonaValidator::new(&chain_spec).unwrap();
-        let (number, hash) = *fx.paired_blocks().first().expect("paired mainnet fixtures");
-        let block = &fx.blocks[&hash];
-        let parent = &fx
-            .blocks
-            .get(&block.header.parent_hash)
-            .unwrap_or_else(|| {
-                panic!(
-                    "parent block {} missing for fixture block {number} ({hash})",
-                    block.header.parent_hash
-                )
-            })
-            .header
-            .inner;
+        let paired = fx.paired_blocks();
+        assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
 
-        let input = ValidationInput::new(
-            block,
-            fx.salt_witnesses[&hash].clone(),
-            fx.mpt_witness(&hash),
-            &fx.contracts,
-        )
-        .with_parent_header(parent);
+        for (number, hash) in paired {
+            let block = &fx.blocks[&hash];
+            let parent = &fx
+                .blocks
+                .get(&block.header.parent_hash)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "parent block {} missing for fixture block {number} ({hash})",
+                        block.header.parent_hash
+                    )
+                })
+                .header
+                .inner;
 
-        validator
-            .validate_block(input)
-            .unwrap_or_else(|e| panic!("Kona validation failed for {number} ({hash}): {e:?}"));
+            let input = ValidationInput::new(
+                block,
+                fx.salt_witnesses[&hash].clone(),
+                fx.mpt_witness(&hash),
+                &fx.contracts,
+            )
+            .with_parent_header(parent);
+
+            validator
+                .validate_block(input)
+                .unwrap_or_else(|e| panic!("Kona validation failed for {number} ({hash}): {e:?}"));
+        }
     }
 }
