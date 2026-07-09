@@ -5,14 +5,26 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use alloy_genesis::Genesis;
 use alloy_primitives::BlockHash;
 use alloy_rpc_types_eth::BlockId;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use eyre::Result;
 use stateless_common::{BackoffPolicy, RpcClient, RpcClientConfig, logging::LogArgs};
 use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::BlockMeta};
 use stateless_db::ContractCache;
 use tracing::info;
 
-use crate::{metrics, validator_db::ValidatorDB, workers};
+use crate::{metrics, r2_witness::R2WitnessClient, validator_db::ValidatorDB, workers};
+
+/// Where the validator sources witnesses from.
+#[derive(ValueEnum, Clone, Debug, PartialEq, Eq, Default)]
+#[clap(rename_all = "lowercase")]
+pub enum WitnessSource {
+    /// `mega_getBlockWitness` RPC (the production path; may fall back to KV upstream).
+    #[default]
+    Rpc,
+    /// Straight from the R2 bucket over the S3 API — bypasses RPC/KV to validate the migrated
+    /// archive end to end. Requires the `--r2-*` flags.
+    R2,
+}
 
 /// Database filename for the validator.
 pub const VALIDATOR_DB_FILENAME: &str = "validator.redb";
@@ -68,14 +80,43 @@ pub struct CommandLineArgs {
     /// One or more MegaETH JSON-RPC API endpoints for fetching witness data (tried in order).
     /// Accepts repeated flags (`--witness-endpoint a --witness-endpoint b`) or a comma-separated
     /// list (`--witness-endpoint a,b`, also via the env var).
+    ///
+    /// Required when `--witness-source rpc` (the default); ignored when `--witness-source r2`.
     #[clap(
         long,
         env = "STATELESS_VALIDATOR_WITNESS_ENDPOINT",
-        required = true,
         value_delimiter = ',',
         action = clap::ArgAction::Append,
     )]
     pub witness_endpoint: Vec<String>,
+
+    /// Where to source witnesses from: `rpc` (default) or `r2`. `r2` fetches each witness straight
+    /// from the R2 bucket over the S3 API (bypassing the RPC/KV path) to validate the migrated
+    /// archive end to end; it requires the `--r2-*` flags below.
+    #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_SOURCE", value_enum, default_value_t = WitnessSource::Rpc)]
+    pub witness_source: WitnessSource,
+
+    /// R2 S3 endpoint origin, e.g. `https://<account>.r2.cloudflarestorage.com` (no bucket path).
+    /// Required when `--witness-source r2`.
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_ENDPOINT")]
+    pub r2_endpoint: Option<String>,
+
+    /// R2 bucket holding the witnesses (e.g. `witness-mainnet`). Required when `--witness-source r2`.
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_BUCKET")]
+    pub r2_bucket: Option<String>,
+
+    /// R2 access key id (Object Read). Required when `--witness-source r2`.
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_KEY_ID")]
+    pub r2_access_key_id: Option<String>,
+
+    /// R2 secret access key. Required when `--witness-source r2`. Prefer the env var over the flag.
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_SECRET_ACCESS_KEY")]
+    pub r2_secret_access_key: Option<String>,
+
+    /// Optional inclusive end block: validate up to this height, then stop cleanly. Used to slice a
+    /// fixed block range across multiple servers. Omit to follow the chain tip indefinitely.
+    #[clap(long, env = "STATELESS_VALIDATOR_END_BLOCK")]
+    pub end_block: Option<u64>,
 
     /// Optional trusted block hash to start validation from.
     #[clap(long, env = "STATELESS_VALIDATOR_START_BLOCK")]
@@ -206,8 +247,40 @@ pub async fn run() -> Result<()> {
         ..rpc_defaults
     }
     .with_metrics(Arc::new(metrics::ValidatorMetrics));
+    // Resolve the witness source. In R2 mode the witness comes straight from the bucket, so the
+    // RpcClient's witness providers are never touched — but its constructor still requires a
+    // non-empty witness-endpoint list, so we hand it the data endpoints as an unused placeholder.
     let data_apis: Vec<&str> = args.rpc_endpoint.iter().map(String::as_str).collect();
-    let witness_apis: Vec<&str> = args.witness_endpoint.iter().map(String::as_str).collect();
+    let r2_witness = match args.witness_source {
+        WitnessSource::Rpc => {
+            if args.witness_endpoint.is_empty() {
+                return Err(eyre::eyre!(
+                    "--witness-endpoint is required with --witness-source rpc (the default)"
+                ));
+            }
+            None
+        }
+        WitnessSource::R2 => {
+            let endpoint = require_r2(&args.r2_endpoint, "--r2-endpoint")?;
+            let bucket = require_r2(&args.r2_bucket, "--r2-bucket")?;
+            let access_key_id = require_r2(&args.r2_access_key_id, "--r2-access-key-id")?;
+            let secret_access_key =
+                require_r2(&args.r2_secret_access_key, "--r2-secret-access-key")?;
+            info!(endpoint, bucket, "Witness source: R2 (direct S3, bypassing RPC/KV)");
+            Some(Arc::new(R2WitnessClient::new(
+                endpoint,
+                bucket.to_string(),
+                access_key_id.to_string(),
+                secret_access_key.to_string(),
+                per_attempt_timeout,
+            )?))
+        }
+    };
+
+    let witness_apis: Vec<&str> =
+        if r2_witness.is_some() { data_apis.clone() } else {
+            args.witness_endpoint.iter().map(String::as_str).collect()
+        };
     let client = Arc::new(RpcClient::new_with_config(
         &data_apis,
         &witness_apis,
@@ -271,9 +344,16 @@ pub async fn run() -> Result<()> {
     pipeline_config.error_restart_delay =
         override_ms(args.error_restart_delay_ms, pipeline_config.error_restart_delay);
     pipeline_config.tip_buffer = args.tip_buffer.unwrap_or(DEFAULT_TIP_BUFFER);
+    // Optional inclusive end block: the fetcher stops after this height. Slices a fixed range
+    // across servers (each server validates [start_block, end_block]).
+    pipeline_config.sync_target = args.end_block;
+    if let Some(end) = args.end_block {
+        info!(end_block = end, "Validating up to end block, then stopping");
+    }
 
     let result = workers::run_with_signals(
         client,
+        r2_witness,
         validator_db,
         contract_cache,
         chain_spec,
@@ -292,4 +372,12 @@ pub async fn run() -> Result<()> {
 /// otherwise spread across the backoff + pipeline-config overrides.
 fn override_ms(ms: Option<u64>, default: Duration) -> Duration {
     ms.map(Duration::from_millis).unwrap_or(default)
+}
+
+/// Unwraps a required `--r2-*` argument, erroring with the flag name when it is absent.
+fn require_r2<'a>(value: &'a Option<String>, flag: &str) -> Result<&'a str> {
+    value
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| eyre::eyre!("{flag} is required with --witness-source r2"))
 }

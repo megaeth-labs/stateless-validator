@@ -3379,6 +3379,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "megaeth-witness-r2"
+version = "2.1.0"
+source = "git+https://github.com/megaeth-labs/mega-reth.git?rev=c290c3e37f16b129ccaa290478e055857b4c6d01#c290c3e37f16b129ccaa290478e055857b4c6d01"
+dependencies = [
+ "bytes",
+ "chrono",
+ "hex",
+ "hmac",
+ "percent-encoding",
+ "reqwest 0.12.24",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "memchr"
 version = "2.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5801,14 +5815,17 @@ dependencies = [
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rpc-types-eth",
+ "chrono",
  "clap",
  "eyre",
  "jsonrpsee",
  "jsonrpsee-types",
+ "megaeth-witness-r2",
  "metrics",
  "metrics-exporter-prometheus",
  "op-alloy-rpc-types",
  "redb",
+ "reqwest 0.12.24",
  "revm",
  "salt",
  "serde_json",

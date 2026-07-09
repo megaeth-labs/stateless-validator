@@ -392,8 +392,11 @@ async fn integration_test() {
     let config = Arc::new(cfg);
 
     let shutdown = CancellationToken::new();
-    let fetcher =
-        Arc::new(ValidatorFetcher { rpc_client: client.clone(), on_remote_height: |_| {} });
+    let fetcher = Arc::new(ValidatorFetcher {
+        rpc_client: client.clone(),
+        r2_witness: None,
+        on_remote_height: |_| {},
+    });
     let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
     let hooks = Arc::new(ValidatorHooks);
 
