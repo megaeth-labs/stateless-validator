@@ -131,6 +131,85 @@ pub fn run(args: InspectArgs) -> Result<()> {
         100.0 * rare1 as f64 / universe_bits.max(1) as f64
     );
 
+    // ---- growth curve: patterns & universe by first-seen block ----
+    {
+        let mut by_first: Vec<(&crate::store::PatternRecord, u64)> =
+            snapshot.patterns.values().map(|r| (r, r.first_block)).collect();
+        by_first.sort_by_key(|(_, fb)| *fb);
+        if let (Some((_, lo)), Some((_, hi))) = (by_first.first(), by_first.last()) {
+            let (lo, hi) = (*lo, (*hi).max(lo + 1));
+            let buckets = 10u64;
+            let width = (hi - lo).div_ceil(buckets);
+            println!();
+            println!("growth by first-seen block ({buckets} buckets of {width} blocks):");
+            let mut cum = BitSet::new();
+            let mut idx = 0usize;
+            for b in 0..buckets {
+                let end = lo + width * (b + 1);
+                let mut new_patterns = 0u64;
+                while idx < by_first.len() && by_first[idx].1 < end {
+                    cum.union_with(&by_first[idx].0.bitmap);
+                    new_patterns += 1;
+                    idx += 1;
+                }
+                println!(
+                    "  ..{end:>10}: +{new_patterns:<5} patterns, universe={}",
+                    cum.count_ones()
+                );
+            }
+        }
+    }
+
+    // ---- antichain estimate: how many patterns survive dominated-pruning? ----
+    {
+        let mut recs: Vec<&crate::store::PatternRecord> = snapshot.patterns.values().collect();
+        // A pattern can only be dominated by one with >= bits; sort desc so we
+        // scan potential dominators first and can stop early.
+        recs.sort_by_key(|r| std::cmp::Reverse(r.bits));
+        let mut dominated = 0usize;
+        for i in 0..recs.len() {
+            for j in 0..i {
+                if recs[j].bits > recs[i].bits && recs[i].bitmap.is_subset_of(&recs[j].bitmap) {
+                    dominated += 1;
+                    break;
+                }
+            }
+        }
+        println!();
+        println!(
+            "antichain estimate: {} of {} patterns are strictly dominated ({:.1}%) — prunable \
+             along with their archived profiles",
+            dominated,
+            recs.len(),
+            100.0 * dominated as f64 / recs.len().max(1) as f64
+        );
+    }
+
+    // ---- greedy set cover (read-only preview, same tie-breaking as set-cover) ----
+    {
+        let mut covered = BitSet::new();
+        let mut remaining: Vec<(&u64, &crate::store::PatternRecord)> =
+            snapshot.patterns.iter().collect();
+        let mut picks = 0usize;
+        println!();
+        println!("greedy selection preview:");
+        loop {
+            let mut best: Option<(u64, u64, usize)> = None; // (gain, block, idx)
+            for (i, (_, rec)) in remaining.iter().enumerate() {
+                let gain = rec.bitmap.andnot_count(&covered);
+                if gain > 0 && best.is_none_or(|b| (gain, rec.representative) > (b.0, b.1)) {
+                    best = Some((gain, rec.representative, i));
+                }
+            }
+            let Some((gain, block, i)) = best else { break };
+            let (_, rec) = remaining.swap_remove(i);
+            covered.union_with(&rec.bitmap);
+            picks += 1;
+            println!("  {block:>12}  gain={gain:<6} bits={}", rec.bits);
+        }
+        println!("  => {picks} blocks cover {}/{}", covered.count_ones(), universe_bits);
+    }
+
     // ---- manifest ----
     let manifest_path = dirs.manifest_path();
     if manifest_path.exists() {
