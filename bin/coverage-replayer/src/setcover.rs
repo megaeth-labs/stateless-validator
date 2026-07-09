@@ -106,6 +106,33 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
     let mut covered = BitSet::new();
     let mut remaining: Vec<(&u64, &crate::store::PatternRecord)> =
         snapshot.patterns.iter().collect();
+
+    // Antichain prune: dominated patterns can never improve the cover, and a
+    // dominated pattern could otherwise win a gain tie-break and select a
+    // block whose profile was never archived. Their archived profiles (from
+    // before the dominator appeared) are deleted here.
+    remaining.sort_by_key(|(_, r)| std::cmp::Reverse(r.bits));
+    let mut keep = vec![true; remaining.len()];
+    for i in 0..remaining.len() {
+        for j in 0..i {
+            if keep[j] &&
+                remaining[j].1.bits > remaining[i].1.bits &&
+                remaining[i].1.bitmap.is_subset_of(&remaining[j].1.bitmap)
+            {
+                keep[i] = false;
+                let _ = std::fs::remove_file(dirs.archived_profile(remaining[i].1.representative));
+                break;
+            }
+        }
+    }
+    let before = remaining.len();
+    let mut it = keep.iter();
+    remaining.retain(|_| *it.next().unwrap());
+    info!(
+        pruned = before - remaining.len(),
+        antichain = remaining.len(),
+        "dominated patterns excluded (their archived profiles deleted)"
+    );
     let mut selected: Vec<(u64, u64, u64)> = Vec::new(); // (pattern_key, representative, gain)
 
     loop {

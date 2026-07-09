@@ -553,6 +553,15 @@ impl<'a> JudgeState<'a> {
                 hit_count: 1,
                 representative: resp.block,
             };
+            // Dominated patterns (strict subset of an existing one) can never
+            // beat their dominator in set cover — record the bitmap for dedup
+            // and stats, but skip the profile archive (93% of new patterns in
+            // practice). set-cover excludes them from candidates, so a
+            // selected block always has an archived profile.
+            let dominated = self
+                .patterns
+                .values()
+                .any(|r| r.bits > rec.bits && rec.bitmap.is_subset_of(&r.bitmap));
             self.universe.union_with(&rec.bitmap);
             self.new_patterns += 1;
             info!(
@@ -560,7 +569,7 @@ impl<'a> JudgeState<'a> {
                 pattern = %format!("{key:016x}"),
                 bits = rec.bits,
                 universe = self.universe.count_ones(),
-                "NEW coverage pattern — promoting block to archive"
+                "NEW coverage pattern"
             );
             // Promote: nothing block-sized is kept — the spool entry is
             // deleted like any other block (representatives are re-fetched
@@ -568,16 +577,20 @@ impl<'a> JudgeState<'a> {
             // `report`, produced off the judge's critical path.
             let _ = std::fs::remove_file(self.dirs.spool_entry(resp.block));
             let _ = std::fs::remove_file(&resp.symbols_tsv);
-            let llvm_profdata = self.llvm_profdata.clone();
-            let profraw = resp.profraw.clone();
-            let dest = self.dirs.archived_profile(resp.block);
-            let block = resp.block;
-            self.compressions.spawn_blocking(move || {
-                if let Err(e) = archive_sparse_profile(&llvm_profdata, &profraw, &dest) {
-                    warn!(block, error = %format!("{e:#}"), "failed to archive sparse profdata");
-                }
-                let _ = std::fs::remove_file(&profraw);
-            });
+            if dominated {
+                let _ = std::fs::remove_file(&resp.profraw);
+            } else {
+                let llvm_profdata = self.llvm_profdata.clone();
+                let profraw = resp.profraw.clone();
+                let dest = self.dirs.archived_profile(resp.block);
+                let block = resp.block;
+                self.compressions.spawn_blocking(move || {
+                    if let Err(e) = archive_sparse_profile(&llvm_profdata, &profraw, &dest) {
+                        warn!(block, error = %format!("{e:#}"), "failed to archive sparse profdata");
+                    }
+                    let _ = std::fs::remove_file(&profraw);
+                });
+            }
 
             let record = self.block_record_ok(&resp, key);
             self.patterns.insert(key, rec);
