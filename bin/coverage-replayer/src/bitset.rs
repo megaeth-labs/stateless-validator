@@ -65,6 +65,25 @@ impl BitSet {
     pub fn words(&self) -> &[u64] {
         &self.words
     }
+
+    /// Iterates the indices of all set bits, ascending.
+    pub fn iter_ones(&self) -> impl Iterator<Item = u32> + '_ {
+        self.words.iter().enumerate().flat_map(|(wi, &word)| {
+            let base = (wi as u32) * 64;
+            std::iter::from_fn({
+                let mut w = word;
+                move || {
+                    if w == 0 {
+                        None
+                    } else {
+                        let bit = w.trailing_zeros();
+                        w &= w - 1;
+                        Some(base + bit)
+                    }
+                }
+            })
+        })
+    }
 }
 
 #[cfg(test)]

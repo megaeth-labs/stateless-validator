@@ -202,9 +202,59 @@ impl Store {
         txn.commit()?;
         Ok(())
     }
+
+    /// Bulk-writes a merged snapshot into a fresh store, in batched
+    /// transactions. Used by the `merge` subcommand.
+    pub fn write_bulk(&self, snapshot: &StoreSnapshot) -> Result<()> {
+        const BATCH: usize = 100_000;
+
+        let counters: Vec<_> = snapshot.counters.iter().collect();
+        for chunk in counters.chunks(BATCH) {
+            let txn = self.db.begin_write()?;
+            {
+                let mut t = txn.open_table(COUNTERS)?;
+                for (id, info) in chunk {
+                    let bytes = bincode::serde::encode_to_vec(info, BINCODE_CONFIG)
+                        .map_err(|e| eyre::eyre!("encode CounterInfo: {e}"))?;
+                    t.insert(**id, bytes.as_slice())?;
+                }
+            }
+            txn.commit()?;
+        }
+
+        let patterns: Vec<_> = snapshot.patterns.iter().collect();
+        for chunk in patterns.chunks(BATCH) {
+            let txn = self.db.begin_write()?;
+            {
+                let mut t = txn.open_table(PATTERNS)?;
+                for (key, rec) in chunk {
+                    let bytes = bincode::serde::encode_to_vec(rec, BINCODE_CONFIG)
+                        .map_err(|e| eyre::eyre!("encode PatternRecord: {e}"))?;
+                    t.insert(**key, bytes.as_slice())?;
+                }
+            }
+            txn.commit()?;
+        }
+
+        let blocks: Vec<_> = snapshot.blocks.iter().collect();
+        for chunk in blocks.chunks(BATCH) {
+            let txn = self.db.begin_write()?;
+            {
+                let mut t = txn.open_table(BLOCKS)?;
+                for (num, rec) in chunk {
+                    let bytes = bincode::serde::encode_to_vec(rec, BINCODE_CONFIG)
+                        .map_err(|e| eyre::eyre!("encode BlockRecord: {e}"))?;
+                    t.insert(**num, bytes.as_slice())?;
+                }
+            }
+            txn.commit()?;
+        }
+        Ok(())
+    }
 }
 
 /// In-memory image of the store, owned by the judge / set-cover.
+#[derive(Clone)]
 pub struct StoreSnapshot {
     pub counters: HashMap<u64, CounterInfo>,
     pub patterns: HashMap<u64, PatternRecord>,

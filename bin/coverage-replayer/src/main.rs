@@ -9,6 +9,7 @@ mod backfill;
 mod bitset;
 mod inspect;
 mod llvm;
+mod merge;
 mod profile_rt;
 mod proto;
 mod report;
@@ -38,6 +39,8 @@ enum Cmd {
     Report(report::ReportArgs),
     /// Read-only store statistics (works on stores from other builds).
     Inspect(inspect::InspectArgs),
+    /// Merge per-shard stores (disjoint ranges, same build) into one.
+    Merge(merge::MergeArgs),
     /// Internal: resident worker subprocess (spawned by backfill).
     #[clap(hide = true)]
     InternalWorker(worker::WorkerArgs),
@@ -61,5 +64,6 @@ fn main() -> Result<()> {
         Cmd::SetCover(args) => setcover::run(args),
         Cmd::Report(args) => report::run(args),
         Cmd::Inspect(args) => inspect::run(args),
+        Cmd::Merge(args) => merge::run(args),
     }
 }
