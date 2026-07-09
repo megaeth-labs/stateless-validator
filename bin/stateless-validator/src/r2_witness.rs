@@ -27,7 +27,7 @@ use reqwest::Client;
 use salt::SaltWitness;
 use stateless_common::decode_witness_payload;
 use stateless_core::withdrawals::MptWitness;
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 /// Failure outcome of an R2 witness fetch.
 #[derive(Debug, thiserror::Error)]
@@ -225,11 +225,38 @@ impl R2WitnessClient {
 
         let status = response.status();
         if status.is_success() {
+            // Snapshot the response headers before `bytes()` consumes `response`. These prove the
+            // witness came from R2: `cf-ray` / `x-amz-request-id` are Cloudflare/S3 request ids,
+            // and the `x-amz-meta-*` set is the custom metadata the migration/uploader wrote onto
+            // the object — the RPC/KV witness path carries none of it. Cheap: header maps are tiny.
+            let headers = response.headers().clone();
+            let hdr = |name: &str| {
+                headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_owned()
+            };
             let bytes = response.bytes().await.map_err(|source| R2WitnessError::Transport {
                 number,
                 key: key.to_string(),
                 source,
             })?;
+            debug!(
+                block_number = number,
+                bucket = %self.bucket,
+                key,
+                http_status = status.as_u16(),
+                bytes = bytes.len(),
+                content_type = %hdr("content-type"),
+                etag = %hdr("etag"),
+                last_modified = %hdr("last-modified"),
+                cf_ray = %hdr("cf-ray"),
+                x_amz_request_id = %hdr("x-amz-request-id"),
+                x_amz_meta_compression = %hdr("x-amz-meta-compression"),
+                x_amz_meta_original_size = %hdr("x-amz-meta-original-size"),
+                x_amz_meta_compressed_size = %hdr("x-amz-meta-compressed-size"),
+                x_amz_meta_sha256 = %hdr("x-amz-meta-sha256"),
+                x_amz_meta_parent_hash = %hdr("x-amz-meta-parent-hash"),
+                x_amz_meta_attr_hash = %hdr("x-amz-meta-attr-hash"),
+                "witness fetched from R2 (S3 GET)",
+            );
             return Ok(Attempt::Found(bytes.to_vec()));
         }
         let code = status.as_u16();
