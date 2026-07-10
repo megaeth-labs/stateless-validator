@@ -18,11 +18,6 @@ alloy-primitives.workspace = true
 alloy-rpc-types-eth.workspace = true
 
 # mega
-# R2 witness-source validation reuses the authoritative object-key layout + SigV4 signer from the
-# witness generator/uploader crate, so the read path cannot drift from the write path. Leaf crate,
-# so no dependency cycle with mega-reth's git-tag dep on stateless-* (see the crate docs). Pinned to
-# a mega-reth develop rev so all four validation servers build reproducibly without a local checkout.
-megaeth-witness-r2 = { git = "https://github.com/megaeth-labs/mega-reth.git", rev = "c290c3e37f16b129ccaa290478e055857b4c6d01" }
 salt.workspace = true
 
 # op
@@ -35,18 +30,18 @@ revm = { workspace = true, features = ["serde"] }
 stateless-common = { path = "../../crates/stateless-common" }
 stateless-core = { path = "../../crates/stateless-core" }
 stateless-db = { path = "../../crates/stateless-db" }
+stateless-r2 = { path = "../../crates/stateless-r2" }
 
 # misc
 bytes.workspace = true
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono = { workspace = true, features = ["clock"] }
 clap = { workspace = true, features = ["env"] }
 eyre.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 redb.workspace = true
-# Pinned to 0.12 (not the workspace 0.13) to unify with stateless-common / alloy-provider /
-# megaeth-witness-r2; rustls-tls gives the R2 witness client HTTPS without a system TLS backend.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# rustls-tls gives the R2 witness client HTTPS without a system TLS backend.
+reqwest = { workspace = true, features = ["rustls-tls"] }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

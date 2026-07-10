@@ -1,35 +1,31 @@
-//! Direct-from-R2 witness source for end-to-end validation of the migrated archive.
+//! Direct-from-R2 witness source.
 //!
-//! The production validator fetches witnesses over `mega_getBlockWitness`, which transparently
-//! falls back to KV — so a block validating successfully does **not** prove its witness actually
-//! came from R2. This client bypasses the RPC entirely: it fetches the primary witness object
-//! straight from the R2 bucket over the S3 API (a SigV4-signed `GET`), decompresses it, and
-//! returns the same `(SaltWitness, MptWitness)` tuple the RPC path yields. Pointing the validator
-//! at this source and replaying a block range therefore proves every witness is present and
-//! correct in R2 alone.
+//! Fetches the primary witness object straight from the R2 bucket over the S3 API (a SigV4-signed
+//! `GET`), decompresses it, and returns the same `(SaltWitness, MptWitness)` tuple the RPC path
+//! yields.
 //!
-//! The object-key layout, SigV4 signer, and endpoint parsing are reused from `megaeth-witness-r2`
-//! — the very crate the witness generator and the replayer uploader write with — so the read path
-//! here cannot drift from the write path. The primary object body is
-//! `zstd(bincode-legacy((SaltWitness, MptWitness)))` (see the uploader's `encode_witness_payload`),
-//! which [`stateless_common::decode_witness_payload`] inverts exactly.
+//! The object-key layout, SigV4 signer, and endpoint parsing come from `stateless-r2` — the same
+//! crate the witness uploaders write with — so the read path here cannot drift from the write
+//! path. The primary object body is `zstd(bincode-legacy((SaltWitness, MptWitness)))` (the
+//! uploader's `encode_witness_payload`), which [`stateless_common::decode_witness_payload`]
+//! inverts exactly.
 
 use std::time::Duration;
 
 use alloy_primitives::B256;
 use bytes::Bytes;
 use chrono::Utc;
-use megaeth_witness_r2::{
-    endpoint::parse_endpoint,
-    keys,
-    sigv4::{SigV4Signer, encode_uri_path},
-};
 use reqwest::Client;
 use salt::SaltWitness;
 use stateless_common::{decode_witness_payload, witness_encoding::WitnessDecodingError};
 use stateless_core::withdrawals::MptWitness;
+use stateless_r2::{
+    endpoint::parse_endpoint,
+    keys,
+    sigv4::{SigV4Signer, encode_uri_path},
+};
 use tokio::task::JoinError;
-use tracing::{Level, debug, enabled, trace, warn};
+use tracing::{trace, warn};
 
 /// Max retry rounds for retryable (transport/429/5xx) failures before surfacing an error.
 const MAX_RETRIES: usize = 8;
@@ -44,9 +40,8 @@ const MISSING_THROTTLE: Duration = Duration::from_secs(2);
 /// Failure outcome of an R2 witness fetch.
 #[derive(Debug, thiserror::Error)]
 pub enum R2WitnessError {
-    /// The primary object is absent from the bucket (HTTP 404). For blocks known to have a
-    /// witness this is a genuine completeness gap in R2 — the whole point of the validation run
-    /// is to prove this never happens.
+    /// The primary object is absent from the bucket (HTTP 404) — a completeness gap in R2 for
+    /// blocks known to have a witness.
     #[error(
         "R2 witness MISSING for block {number} (key {key}): object not found (404) — R2 completeness gap"
     )]
@@ -64,11 +59,11 @@ pub enum R2WitnessError {
     #[error("R2 unexpected status {status} for block {number} (key {key}): {body}")]
     Status { number: u64, key: String, status: u16, body: String },
     /// The object was fetched but its bytes did not decode to a `(SaltWitness, MptWitness)` tuple
-    /// — a corrupt witness in R2. Deterministic; a finding, not retried.
+    /// — a corrupt witness in R2. Deterministic; not retried.
     #[error("R2 witness for block {number} (key {key}) failed to decode: {source}")]
     Decode { number: u64, key: String, source: WitnessDecodingError },
-    /// The decode task panicked. This is a bug in our own decoder, not evidence about the archive,
-    /// so it is kept out of [`Self::Decode`] — a panic must never masquerade as an R2 finding.
+    /// The decode task panicked. This is a bug in our own decoder, not a problem with the data in
+    /// R2, so it is kept out of [`Self::Decode`].
     #[error("R2 witness decode task for block {number} (key {key}) panicked: {source}")]
     DecodePanicked { number: u64, key: String, source: JoinError },
 }
@@ -137,28 +132,16 @@ impl R2WitnessClient {
         })
     }
 
-    /// The primary witness object key for `(number, hash)`: `block/{range}/{number}.{hash}`.
-    ///
-    /// Built from the same `megaeth-witness-r2` bucketing constants the uploader uses, so it is
-    /// byte-identical to the key that was written. `hash` renders via `B256`'s `Display`
-    /// (lowercase `0x` + 64 hex); the pinned test below guards that against drift.
-    fn block_key(number: u64, hash: B256) -> String {
-        let range_start = keys::block_range_prefix(number);
-        let range_end = range_start + keys::BLOCK_RANGE_SIZE - 1;
-        format!("{}/{range_start}_{range_end}/{number}.{hash}", keys::BLOCK_PREFIX)
-    }
-
     /// Fetches and decodes the witness for `(number, hash)` from R2.
     ///
-    /// Retryable failures (transport/429/5xx) are retried with exponential backoff up to
-    /// [`MAX_RETRIES`] times. `Missing` (404) and `Decode` failures are deterministic and surface
-    /// immediately as findings.
+    /// Transport/429/5xx failures are retried with backoff up to [`MAX_RETRIES`] times;
+    /// `Missing` (404) and `Decode` failures are deterministic and surface immediately.
     pub async fn get_witness(
         &self,
         number: u64,
         hash: B256,
     ) -> Result<(SaltWitness, MptWitness), R2WitnessError> {
-        let key = Self::block_key(number, hash);
+        let key = keys::block_object_key(number, hash);
         let mut backoff = INITIAL_BACKOFF;
         let mut attempt = 0usize;
 
@@ -210,36 +193,7 @@ impl R2WitnessClient {
 
         let status = response.status();
         if status.is_success() {
-            // Snapshot the response headers before `bytes()` consumes `response` — but only when
-            // the log will actually emit, since this sits on the per-block hot path. These prove
-            // the witness came from R2: `cf-ray` / `x-amz-request-id` are Cloudflare/S3 request
-            // ids, and the `x-amz-meta-*` set is the custom metadata the migration/uploader wrote
-            // onto the object — the RPC/KV witness path carries none of it.
-            let headers = enabled!(Level::DEBUG).then(|| response.headers().clone());
             let bytes = response.bytes().await.map_err(transport)?;
-            if let Some(headers) = headers {
-                let hdr =
-                    |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("");
-                debug!(
-                    block_number = number,
-                    bucket = %self.bucket,
-                    key,
-                    http_status = status.as_u16(),
-                    bytes = bytes.len(),
-                    content_type = hdr("content-type"),
-                    etag = hdr("etag"),
-                    last_modified = hdr("last-modified"),
-                    cf_ray = hdr("cf-ray"),
-                    x_amz_request_id = hdr("x-amz-request-id"),
-                    x_amz_meta_compression = hdr("x-amz-meta-compression"),
-                    x_amz_meta_original_size = hdr("x-amz-meta-original-size"),
-                    x_amz_meta_compressed_size = hdr("x-amz-meta-compressed-size"),
-                    x_amz_meta_sha256 = hdr("x-amz-meta-sha256"),
-                    x_amz_meta_parent_hash = hdr("x-amz-meta-parent-hash"),
-                    x_amz_meta_attr_hash = hdr("x-amz-meta-attr-hash"),
-                    "witness fetched from R2 (S3 GET)",
-                );
-            }
             return Ok(Attempt::Found(bytes));
         }
         let code = status.as_u16();
@@ -262,27 +216,18 @@ mod tests {
 
     use super::*;
 
-    /// Pins the object-key format to a real migrated mainnet key. If `B256`'s `Display` ever
-    /// stopped rendering full lowercase `0x` hex, every GET would 404 — this catches that at
-    /// build time rather than as a silent wall of "missing" in production.
+    /// Guards the one layer `stateless-r2` cannot pin itself: that [`B256`]'s `Display` renders
+    /// full lowercase `0x` hex. If that changed, every GET would 404.
     #[test]
-    fn block_key_matches_migrated_layout() {
+    fn block_object_key_renders_b256_as_lowercase_hex() {
         let hash =
             B256::from_str("0x05dd41e545b25db0ce04f628e6e1705232240c70a0435c8233ac4479176fe6b0")
                 .unwrap();
         assert_eq!(
-            R2WitnessClient::block_key(6_632_136, hash),
+            keys::block_object_key(6_632_136, hash),
             "block/6632000_6632999/6632136.\
              0x05dd41e545b25db0ce04f628e6e1705232240c70a0435c8233ac4479176fe6b0",
         );
-    }
-
-    #[test]
-    fn block_key_buckets_on_thousands() {
-        let h = B256::ZERO;
-        assert!(R2WitnessClient::block_key(0, h).starts_with("block/0_999/0."));
-        assert!(R2WitnessClient::block_key(999, h).starts_with("block/0_999/999."));
-        assert!(R2WitnessClient::block_key(1000, h).starts_with("block/1000_1999/1000."));
     }
 
     #[test]

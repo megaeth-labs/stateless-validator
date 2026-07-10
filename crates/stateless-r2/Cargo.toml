@@ -1,0 +1,22 @@
+[package]
+name = "stateless-r2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+exclude.workspace = true
+description = "Shared Cloudflare R2 (S3-compatible) witness primitives: minimal SigV4 signer, object-key layout, endpoint parsing, and signed PUT helper shared by the mega-reth witness uploaders (write path) and the stateless validator (read path)."
+
+[dependencies]
+# misc
+bytes.workspace = true
+chrono = { workspace = true, features = ["clock"] }
+hex = { workspace = true, features = ["alloc"] }
+hmac.workspace = true
+percent-encoding.workspace = true
+# Pinned explicitly (not workspace-inherited): `put_object` exposes `&reqwest::Client`, so the
+# reqwest major is part of this crate's API and must match mega-reth's workspace (0.12). Bumping
+# it is a coordinated two-repo change that a workspace-wide bump must not ride over.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+sha2.workspace = true

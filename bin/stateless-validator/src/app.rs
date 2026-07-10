@@ -18,11 +18,10 @@ use crate::{metrics, r2_witness::R2WitnessClient, validator_db::ValidatorDB, wor
 #[derive(ValueEnum, Clone, Debug, PartialEq, Eq, Default)]
 #[clap(rename_all = "lowercase")]
 pub enum WitnessSource {
-    /// `mega_getBlockWitness` RPC (the production path; may fall back to KV upstream).
+    /// `mega_getBlockWitness` RPC.
     #[default]
     Rpc,
-    /// Straight from the R2 bucket over the S3 API — bypasses RPC/KV to validate the migrated
-    /// archive end to end. Requires the `--r2-*` flags.
+    /// Straight from the R2 bucket over the S3 API. Requires the `--r2-*` flags.
     R2,
 }
 
@@ -91,8 +90,7 @@ pub struct CommandLineArgs {
     pub witness_endpoint: Vec<String>,
 
     /// Where to source witnesses from: `rpc` (default) or `r2`. `r2` fetches each witness straight
-    /// from the R2 bucket over the S3 API (bypassing the RPC/KV path) to validate the migrated
-    /// archive end to end; it requires the `--r2-*` flags below.
+    /// from the R2 bucket over the S3 API; it requires the `--r2-*` flags below.
     #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_SOURCE", value_enum, default_value_t = WitnessSource::Rpc)]
     pub witness_source: WitnessSource,
 
@@ -268,7 +266,7 @@ pub async fn run() -> Result<()> {
             let access_key_id = require_r2(&args.r2_access_key_id, "--r2-access-key-id")?;
             let secret_access_key =
                 require_r2(&args.r2_secret_access_key, "--r2-secret-access-key")?;
-            info!(endpoint, bucket, "Witness source: R2 (direct S3, bypassing RPC/KV)");
+            info!(endpoint, bucket, "Witness source: R2 (direct S3)");
             Some(Arc::new(R2WitnessClient::new(
                 endpoint,
                 bucket.to_string(),
