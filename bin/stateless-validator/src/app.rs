@@ -101,7 +101,8 @@ pub struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_R2_ENDPOINT")]
     pub r2_endpoint: Option<String>,
 
-    /// R2 bucket holding the witnesses (e.g. `witness-mainnet`). Required when `--witness-source r2`.
+    /// R2 bucket holding the witnesses (e.g. `witness-mainnet`). Required when `--witness-source
+    /// r2`.
     #[clap(long, env = "STATELESS_VALIDATOR_R2_BUCKET")]
     pub r2_bucket: Option<String>,
 
@@ -109,12 +110,13 @@ pub struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_KEY_ID")]
     pub r2_access_key_id: Option<String>,
 
-    /// R2 secret access key. Required when `--witness-source r2`. Prefer the env var over the flag.
+    /// R2 secret access key. Required when `--witness-source r2`. Prefer the env var over the
+    /// flag.
     #[clap(long, env = "STATELESS_VALIDATOR_R2_SECRET_ACCESS_KEY")]
     pub r2_secret_access_key: Option<String>,
 
-    /// Optional inclusive end block: validate up to this height, then stop cleanly. Used to slice a
-    /// fixed block range across multiple servers. Omit to follow the chain tip indefinitely.
+    /// Optional inclusive end block: validate up to this height, then stop cleanly. Used to slice
+    /// a fixed block range across multiple servers. Omit to follow the chain tip indefinitely.
     #[clap(long, env = "STATELESS_VALIDATOR_END_BLOCK")]
     pub end_block: Option<u64>,
 
@@ -277,10 +279,11 @@ pub async fn run() -> Result<()> {
         }
     };
 
-    let witness_apis: Vec<&str> =
-        if r2_witness.is_some() { data_apis.clone() } else {
-            args.witness_endpoint.iter().map(String::as_str).collect()
-        };
+    let witness_apis: Vec<&str> = if r2_witness.is_some() {
+        data_apis.clone()
+    } else {
+        args.witness_endpoint.iter().map(String::as_str).collect()
+    };
     let client = Arc::new(RpcClient::new_with_config(
         &data_apis,
         &witness_apis,

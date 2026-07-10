@@ -5815,6 +5815,7 @@ dependencies = [
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rpc-types-eth",
+ "bytes",
  "chrono",
  "clap",
  "eyre",

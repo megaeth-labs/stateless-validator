@@ -49,24 +49,18 @@ impl BlockFetcher for ValidatorFetcher {
         // Fetch by hash (not number) so a reorg between the hash lookup and the block fetch
         // surfaces as a hash mismatch rather than silently swapping the block under us.
         let block_fut = self.rpc_client.get_block(BlockId::Hash(block_hash.into()), true);
-        let (salt_witness, mpt_witness, block) = match &self.r2_witness {
-            // R2 fetch is fallible: a 404 (`Missing`) or a decode failure is a genuine finding
-            // about the archive and propagates as a fetch error (the pipeline re-enqueues, so the
-            // stuck block with its loud MISSING/decode error is unmistakable).
-            Some(r2) => {
-                let (witness, block) =
-                    tokio::join!(r2.get_witness(block_number, block_hash, None), block_fut);
-                let (salt_witness, mpt_witness) = witness?;
-                (salt_witness, mpt_witness, block)
-            }
-            None => {
-                let ((salt_witness, mpt_witness), block) = tokio::join!(
-                    self.rpc_client.get_witness(block_number, block_hash),
-                    block_fut,
-                );
-                (salt_witness, mpt_witness, block)
+        // The RPC witness path retries internally until it succeeds, but an R2 fetch is fallible:
+        // a 404 (`Missing`) or a decode failure is a genuine finding about the archive and
+        // propagates as a fetch error (the pipeline re-enqueues, so the stuck block with its loud
+        // MISSING/decode error is unmistakable).
+        let witness_fut = async {
+            match &self.r2_witness {
+                Some(r2) => Ok::<_, eyre::Report>(r2.get_witness(block_number, block_hash).await?),
+                None => Ok(self.rpc_client.get_witness(block_number, block_hash).await),
             }
         };
+        let (witness, block) = tokio::join!(witness_fut, block_fut);
+        let (salt_witness, mpt_witness) = witness?;
         Ok(ValidationTask { block, salt_witness, mpt_witness })
     }
 

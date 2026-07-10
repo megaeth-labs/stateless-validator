@@ -14,20 +14,32 @@
 //! `zstd(bincode-legacy((SaltWitness, MptWitness)))` (see the uploader's `encode_witness_payload`),
 //! which [`stateless_common::decode_witness_payload`] inverts exactly.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use alloy_primitives::B256;
+use bytes::Bytes;
 use chrono::Utc;
 use megaeth_witness_r2::{
     endpoint::parse_endpoint,
     keys,
-    sigv4::{encode_uri_path, SigV4Signer},
+    sigv4::{SigV4Signer, encode_uri_path},
 };
 use reqwest::Client;
 use salt::SaltWitness;
-use stateless_common::decode_witness_payload;
+use stateless_common::{decode_witness_payload, witness_encoding::WitnessDecodingError};
 use stateless_core::withdrawals::MptWitness;
-use tracing::{debug, trace, warn};
+use tokio::task::JoinError;
+use tracing::{Level, debug, enabled, trace, warn};
+
+/// Max retry rounds for retryable (transport/429/5xx) failures before surfacing an error.
+const MAX_RETRIES: usize = 8;
+/// First retry sleep; doubles each round up to [`MAX_BACKOFF`].
+const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+/// Upper bound on any single retry sleep.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// Throttle applied before surfacing a `Missing` (404), so the pipeline's immediate re-enqueue of
+/// a failed fetch does not hot-spin GETs against R2 on a genuine gap.
+const MISSING_THROTTLE: Duration = Duration::from_secs(2);
 
 /// Failure outcome of an R2 witness fetch.
 #[derive(Debug, thiserror::Error)]
@@ -35,7 +47,9 @@ pub enum R2WitnessError {
     /// The primary object is absent from the bucket (HTTP 404). For blocks known to have a
     /// witness this is a genuine completeness gap in R2 — the whole point of the validation run
     /// is to prove this never happens.
-    #[error("R2 witness MISSING for block {number} (key {key}): object not found (404) — R2 completeness gap")]
+    #[error(
+        "R2 witness MISSING for block {number} (key {key}): object not found (404) — R2 completeness gap"
+    )]
     Missing { number: u64, key: String },
     /// Transport-level failure (connection reset/timeout) — the endpoint is effectively
     /// unreachable. Retried internally with backoff before surfacing.
@@ -52,16 +66,16 @@ pub enum R2WitnessError {
     /// The object was fetched but its bytes did not decode to a `(SaltWitness, MptWitness)` tuple
     /// — a corrupt witness in R2. Deterministic; a finding, not retried.
     #[error("R2 witness for block {number} (key {key}) failed to decode: {source}")]
-    Decode {
-        number: u64,
-        key: String,
-        source: stateless_common::witness_encoding::WitnessDecodingError,
-    },
+    Decode { number: u64, key: String, source: WitnessDecodingError },
+    /// The decode task panicked. This is a bug in our own decoder, not evidence about the archive,
+    /// so it is kept out of [`Self::Decode`] — a panic must never masquerade as an R2 finding.
+    #[error("R2 witness decode task for block {number} (key {key}) panicked: {source}")]
+    DecodePanicked { number: u64, key: String, source: JoinError },
 }
 
 impl R2WitnessError {
     /// Whether an immediate retry against the same endpoint could plausibly succeed (transport
-    /// blips, 429, 5xx). `Missing`/`Status`/`Decode` are deterministic and not retried.
+    /// blips, 429, 5xx). Every other variant is deterministic and is surfaced without retrying.
     const fn is_retryable(&self) -> bool {
         matches!(self, Self::Transport { .. } | Self::Throttled { .. })
     }
@@ -69,8 +83,9 @@ impl R2WitnessError {
 
 /// Outcome of a single (non-retrying) GET attempt.
 enum Attempt {
-    /// 2xx with the object body.
-    Found(Vec<u8>),
+    /// 2xx with the object body. Held as [`Bytes`] (refcounted) so the multi-MB witness is never
+    /// copied between the HTTP response and the decoder.
+    Found(Bytes),
     /// 404 — object absent.
     Missing,
 }
@@ -88,13 +103,6 @@ pub struct R2WitnessClient {
     /// SigV4 canonical host (`host[:port]`).
     host: String,
     bucket: String,
-    /// Max retry rounds for retryable (transport/429/5xx) failures before surfacing an error.
-    max_retries: usize,
-    initial_backoff: Duration,
-    max_backoff: Duration,
-    /// Throttle applied before surfacing a `Missing` (404), so the pipeline's immediate
-    /// re-enqueue of a failed fetch does not hot-spin GETs against R2 on a genuine gap.
-    missing_throttle: Duration,
 }
 
 impl R2WitnessClient {
@@ -126,10 +134,6 @@ impl R2WitnessClient {
             endpoint: origin,
             host,
             bucket,
-            max_retries: 8,
-            initial_backoff: Duration::from_millis(500),
-            max_backoff: Duration::from_secs(30),
-            missing_throttle: Duration::from_secs(2),
         })
     }
 
@@ -147,16 +151,15 @@ impl R2WitnessClient {
     /// Fetches and decodes the witness for `(number, hash)` from R2.
     ///
     /// Retryable failures (transport/429/5xx) are retried with exponential backoff up to
-    /// `max_retries` (respecting `deadline` when given). `Missing` (404) and `Decode` failures are
-    /// deterministic and surface immediately as findings.
+    /// [`MAX_RETRIES`] times. `Missing` (404) and `Decode` failures are deterministic and surface
+    /// immediately as findings.
     pub async fn get_witness(
         &self,
         number: u64,
         hash: B256,
-        deadline: Option<Instant>,
     ) -> Result<(SaltWitness, MptWitness), R2WitnessError> {
         let key = Self::block_key(number, hash);
-        let mut backoff = self.initial_backoff;
+        let mut backoff = INITIAL_BACKOFF;
         let mut attempt = 0usize;
 
         let bytes = loop {
@@ -166,44 +169,29 @@ impl R2WitnessClient {
                 Ok(Attempt::Missing) => {
                     // Deterministic gap. Sleep briefly first: the fetcher re-enqueues a failed
                     // fetch immediately, so returning instantly would hot-loop 404s against R2.
-                    tokio::time::sleep(self.missing_throttle).await;
+                    tokio::time::sleep(MISSING_THROTTLE).await;
                     return Err(R2WitnessError::Missing { number, key });
                 }
                 Err(e) => {
-                    let out_of_retries = attempt > self.max_retries
-                        || deadline.is_some_and(|d| Instant::now() >= d);
-                    if !e.is_retryable() || out_of_retries {
+                    if !e.is_retryable() || attempt > MAX_RETRIES {
                         return Err(e);
                     }
-                    let sleep = match deadline {
-                        Some(d) => backoff.min(d.saturating_duration_since(Instant::now())),
-                        None => backoff,
-                    };
                     warn!(number, %key, attempt, error = %e, "R2 witness GET failed, backing off");
-                    tokio::time::sleep(sleep).await;
-                    backoff = (backoff * 2).min(self.max_backoff);
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(MAX_BACKOFF);
                 }
             }
         };
 
-        let decode_key = key.clone();
-        let (salt_witness, mpt_witness) = tokio::task::spawn_blocking(move || {
-            decode_witness_payload(&bytes)
-        })
-        .await
-        .map_err(|e| R2WitnessError::Decode {
-            number,
-            key: decode_key.clone(),
-            // A panic in decode is not a `WitnessDecodingError`; fold it into the same finding
-            // channel with a synthetic message rather than unwrapping and killing the worker.
-            source: stateless_common::witness_encoding::WitnessDecodingError::Decompress(
-                std::io::Error::other(format!("decode task panicked: {e}")),
-            ),
-        })?
-        .map_err(|source| R2WitnessError::Decode { number, key, source })?;
-
-        trace!(number, "R2 witness fetched and decoded");
-        Ok((salt_witness, mpt_witness))
+        // zstd + bincode over a multi-MB witness is CPU-bound; keep it off the runtime.
+        match tokio::task::spawn_blocking(move || decode_witness_payload(&bytes)).await {
+            Ok(Ok(witness)) => {
+                trace!(number, "R2 witness fetched and decoded");
+                Ok(witness)
+            }
+            Ok(Err(source)) => Err(R2WitnessError::Decode { number, key, source }),
+            Err(source) => Err(R2WitnessError::DecodePanicked { number, key, source }),
+        }
     }
 
     /// Performs one SigV4-signed GET and classifies the response. No retry.
@@ -217,57 +205,53 @@ impl R2WitnessClient {
         for (name, value) in signed {
             request = request.header(name, value);
         }
-        let response = request.send().await.map_err(|source| R2WitnessError::Transport {
-            number,
-            key: key.to_string(),
-            source,
-        })?;
+        let transport = |source| R2WitnessError::Transport { number, key: key.to_string(), source };
+        let response = request.send().await.map_err(transport)?;
 
         let status = response.status();
         if status.is_success() {
-            // Snapshot the response headers before `bytes()` consumes `response`. These prove the
-            // witness came from R2: `cf-ray` / `x-amz-request-id` are Cloudflare/S3 request ids,
-            // and the `x-amz-meta-*` set is the custom metadata the migration/uploader wrote onto
-            // the object — the RPC/KV witness path carries none of it. Cheap: header maps are tiny.
-            let headers = response.headers().clone();
-            let hdr = |name: &str| {
-                headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_owned()
-            };
-            let bytes = response.bytes().await.map_err(|source| R2WitnessError::Transport {
-                number,
-                key: key.to_string(),
-                source,
-            })?;
-            debug!(
-                block_number = number,
-                bucket = %self.bucket,
-                key,
-                http_status = status.as_u16(),
-                bytes = bytes.len(),
-                content_type = %hdr("content-type"),
-                etag = %hdr("etag"),
-                last_modified = %hdr("last-modified"),
-                cf_ray = %hdr("cf-ray"),
-                x_amz_request_id = %hdr("x-amz-request-id"),
-                x_amz_meta_compression = %hdr("x-amz-meta-compression"),
-                x_amz_meta_original_size = %hdr("x-amz-meta-original-size"),
-                x_amz_meta_compressed_size = %hdr("x-amz-meta-compressed-size"),
-                x_amz_meta_sha256 = %hdr("x-amz-meta-sha256"),
-                x_amz_meta_parent_hash = %hdr("x-amz-meta-parent-hash"),
-                x_amz_meta_attr_hash = %hdr("x-amz-meta-attr-hash"),
-                "witness fetched from R2 (S3 GET)",
-            );
-            return Ok(Attempt::Found(bytes.to_vec()));
+            // Snapshot the response headers before `bytes()` consumes `response` — but only when
+            // the log will actually emit, since this sits on the per-block hot path. These prove
+            // the witness came from R2: `cf-ray` / `x-amz-request-id` are Cloudflare/S3 request
+            // ids, and the `x-amz-meta-*` set is the custom metadata the migration/uploader wrote
+            // onto the object — the RPC/KV witness path carries none of it.
+            let headers = enabled!(Level::DEBUG).then(|| response.headers().clone());
+            let bytes = response.bytes().await.map_err(transport)?;
+            if let Some(headers) = headers {
+                let hdr =
+                    |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("");
+                debug!(
+                    block_number = number,
+                    bucket = %self.bucket,
+                    key,
+                    http_status = status.as_u16(),
+                    bytes = bytes.len(),
+                    content_type = hdr("content-type"),
+                    etag = hdr("etag"),
+                    last_modified = hdr("last-modified"),
+                    cf_ray = hdr("cf-ray"),
+                    x_amz_request_id = hdr("x-amz-request-id"),
+                    x_amz_meta_compression = hdr("x-amz-meta-compression"),
+                    x_amz_meta_original_size = hdr("x-amz-meta-original-size"),
+                    x_amz_meta_compressed_size = hdr("x-amz-meta-compressed-size"),
+                    x_amz_meta_sha256 = hdr("x-amz-meta-sha256"),
+                    x_amz_meta_parent_hash = hdr("x-amz-meta-parent-hash"),
+                    x_amz_meta_attr_hash = hdr("x-amz-meta-attr-hash"),
+                    "witness fetched from R2 (S3 GET)",
+                );
+            }
+            return Ok(Attempt::Found(bytes));
         }
         let code = status.as_u16();
         if code == 404 {
             return Ok(Attempt::Missing);
         }
         let body = response.text().await.unwrap_or_default();
+        let key = key.to_string();
         if code == 429 || code >= 500 {
-            Err(R2WitnessError::Throttled { number, key: key.to_string(), status: code, body })
+            Err(R2WitnessError::Throttled { number, key, status: code, body })
         } else {
-            Err(R2WitnessError::Status { number, key: key.to_string(), status: code, body })
+            Err(R2WitnessError::Status { number, key, status: code, body })
         }
     }
 }
@@ -283,10 +267,9 @@ mod tests {
     /// build time rather than as a silent wall of "missing" in production.
     #[test]
     fn block_key_matches_migrated_layout() {
-        let hash = B256::from_str(
-            "0x05dd41e545b25db0ce04f628e6e1705232240c70a0435c8233ac4479176fe6b0",
-        )
-        .unwrap();
+        let hash =
+            B256::from_str("0x05dd41e545b25db0ce04f628e6e1705232240c70a0435c8233ac4479176fe6b0")
+                .unwrap();
         assert_eq!(
             R2WitnessClient::block_key(6_632_136, hash),
             "block/6632000_6632999/6632136.\
