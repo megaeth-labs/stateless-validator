@@ -4,15 +4,19 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use alloy_genesis::Genesis;
 use alloy_primitives::BlockHash;
-use alloy_rpc_types_eth::BlockId;
+use alloy_rpc_types_eth::{Block, BlockId};
 use clap::Parser;
 use eyre::Result;
+use op_alloy_rpc_types::Transaction;
 use stateless_common::{BackoffPolicy, RpcClient, RpcClientConfig, logging::LogArgs};
-use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::BlockMeta};
+use stateless_core::{
+    ChainStore, ContractStore, KonaValidator, MegaEvmValidator, chain_spec::ChainSpec,
+    db::BlockMeta, executor::BlockValidator,
+};
 use stateless_db::ContractCache;
 use tracing::info;
 
-use crate::{metrics, validator_db::ValidatorDB, workers};
+use crate::{metrics, validator_db::ValidatorDB};
 
 /// Database filename for the validator.
 pub const VALIDATOR_DB_FILENAME: &str = "validator.redb";
@@ -168,6 +172,20 @@ pub struct CommandLineArgs {
 /// validator DB, loads or initializes the chain spec + anchor, then hands off to
 /// [`workers::run_with_signals`].
 pub async fn run() -> Result<()> {
+    run_with_validator(false, |chain_spec| Ok(MegaEvmValidator::new(chain_spec.clone()))).await
+}
+
+pub async fn run_kona() -> Result<()> {
+    run_with_validator(true, |chain_spec| Ok(KonaValidator::new(chain_spec)?)).await
+}
+
+async fn run_with_validator<V>(
+    fetch_parent_header: bool,
+    make_validator: impl FnOnce(&ChainSpec) -> Result<V>,
+) -> Result<()>
+where
+    V: BlockValidator<Block<Transaction>> + Send + Sync + 'static,
+{
     let args = CommandLineArgs::parse();
     let _log_guard = args.log.init_tracing()?;
     let start = std::time::Instant::now();
@@ -223,6 +241,7 @@ pub async fn run() -> Result<()> {
 
     let chain_spec =
         Arc::new(load_or_create_chain_spec(&validator_db, args.genesis_file.as_deref())?);
+    let validator = Arc::new(make_validator(chain_spec.as_ref())?);
     info!("Chain spec loaded successfully");
 
     if let Some(start_block_str) = &args.start_block {
@@ -272,13 +291,14 @@ pub async fn run() -> Result<()> {
         override_ms(args.error_restart_delay_ms, pipeline_config.error_restart_delay);
     pipeline_config.tip_buffer = args.tip_buffer.unwrap_or(DEFAULT_TIP_BUFFER);
 
-    let result = workers::run_with_signals(
+    let result = crate::workers::run_with_signals(
         client,
         validator_db,
         contract_cache,
-        chain_spec,
+        validator,
         args.report_validation_endpoint,
         pipeline_config,
+        fetch_parent_header,
     )
     .await;
 

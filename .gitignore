@@ -4,6 +4,7 @@
 .claude/
 .cursor/
 .mcp.json
+.omo/
 
 # database
 validator-data

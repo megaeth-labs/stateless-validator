@@ -11,8 +11,13 @@ exclude.workspace = true
 name = "stateless-validator"
 path = "src/main.rs"
 
+[[bin]]
+name = "kona-validator"
+path = "src/bin/kona-validator.rs"
+
 [dependencies]
 # alloy
+alloy-consensus.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-eth.workspace = true

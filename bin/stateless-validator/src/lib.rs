@@ -9,6 +9,6 @@ pub(crate) mod metrics;
 pub(crate) mod validator_db;
 pub(crate) mod workers;
 
-pub use app::{CommandLineArgs, VALIDATOR_DB_FILENAME, load_or_create_chain_spec, run};
+pub use app::{CommandLineArgs, VALIDATOR_DB_FILENAME, load_or_create_chain_spec, run, run_kona};
 pub use chain_sync::{ValidatorFetcher, ValidatorHooks, ValidatorProcessor};
 pub use validator_db::ValidatorDB;

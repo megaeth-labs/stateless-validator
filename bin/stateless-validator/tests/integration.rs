@@ -3,7 +3,7 @@
 //! Covers CLI argument parsing and end-to-end pipeline validation against a mock RPC server.
 //! Mainnet single-block validation is covered in `crates/stateless-core/src/executor.rs::tests`.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, process::Command, sync::Arc};
 
 use alloy_primitives::{B256, BlockHash};
 use alloy_rpc_types_eth::Block;
@@ -17,8 +17,12 @@ use jsonrpsee_types::error::{
 };
 use stateless_common::{RpcClient, WitnessRequestKeys, encode_witness_response};
 use stateless_core::{
-    BisectResolver, ChainStore, ContractStore, MegaEvmValidator, PipelineConfig, db::BlockMeta,
-    pipeline::run_pipeline, withdrawals::MptWitness,
+    BisectResolver, BlockValidator, ChainStore, ContractStore, KonaValidator, MegaEvmValidator,
+    PipelineConfig,
+    chain_spec::ChainSpec,
+    db::BlockMeta,
+    pipeline::{BlockFetcher, run_pipeline},
+    withdrawals::MptWitness,
 };
 use stateless_db::ContractCache;
 use stateless_test_utils::{fixtures::TestFixtures, logging::init_test_logging};
@@ -155,6 +159,15 @@ fn canonical_chain_max_length_rejects_zero() {
         || parse(&[]),
     );
     assert!(from_env_zero.is_err(), "env-var 0 must also be rejected");
+}
+
+#[test]
+fn kona_validator_binary_exposes_cli() {
+    let output = Command::new(env!("CARGO_BIN_EXE_kona-validator")).arg("--help").output().unwrap();
+
+    assert!(output.status.success(), "kona-validator --help failed: {output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Usage: kona-validator"), "unexpected help output: {stdout}");
 }
 
 const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
@@ -364,11 +377,43 @@ async fn setup_mock_rpc_server(
     (server.start(module), url)
 }
 
-/// Synthetic data integration test: validates consecutive blocks via the streaming pipeline.
 #[tokio::test]
-async fn integration_test() {
+async fn kona_fetcher_includes_parent_header() {
+    let fx = TestFixtures::synthetic();
+    let (block_number, block_hash) = fx
+        .paired_blocks()
+        .into_iter()
+        .find(|(_, hash)| fx.blocks.contains_key(&fx.blocks[hash].header.parent_hash))
+        .expect("fixture block with local parent");
+    let state = MockServerState::new(fx);
+    let (handle, url) = setup_mock_rpc_server(state).await;
+    let client = Arc::new(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap());
+    let fetcher = ValidatorFetcher {
+        rpc_client: client,
+        on_remote_height: |_| {},
+        fetch_parent_header: true,
+    };
+
+    let task = fetcher.fetch(block_number).await.unwrap();
+    let parent_header = task.parent_header.expect("Kona fetcher should fetch parent header");
+
+    assert_eq!(task.block.header.hash, block_hash);
+    assert_eq!(parent_header.hash_slow(), task.block.header.parent_hash);
+
+    handle.stop().unwrap();
+}
+
+/// Synthetic data integration test: validates consecutive blocks via the streaming pipeline.
+async fn run_integration_test_with_validator<V, E>(
+    validator_name: &str,
+    fetch_parent_header: bool,
+    make_validator: impl FnOnce(&ChainSpec) -> Result<V, E>,
+) where
+    E: std::fmt::Debug,
+    V: BlockValidator<Block<op_alloy_rpc_types::Transaction>> + Send + Sync + 'static,
+{
     let _logging = init_test_logging("stateless_validator");
-    debug!("=== Loading Synthetic Test Data ===");
+    debug!("=== Loading Synthetic Test Data for {validator_name} ===");
     let fx = TestFixtures::synthetic();
     let genesis_file = fx.data_dir.join("genesis.json");
 
@@ -391,10 +436,13 @@ async fn integration_test() {
     let config = Arc::new(cfg);
 
     let shutdown = CancellationToken::new();
-    let fetcher =
-        Arc::new(ValidatorFetcher { rpc_client: client.clone(), on_remote_height: |_| {} });
+    let fetcher = Arc::new(ValidatorFetcher {
+        rpc_client: client.clone(),
+        on_remote_height: |_| {},
+        fetch_parent_header,
+    });
     let processor = Arc::new(ValidatorProcessor {
-        validator: Arc::new(MegaEvmValidator::new(chain_spec)),
+        validator: Arc::new(make_validator(&chain_spec).unwrap()),
         contract_cache,
         rpc_client: client,
     });
@@ -417,9 +465,22 @@ async fn integration_test() {
     assert_eq!(
         validator_db.get_canonical_tip().unwrap().unwrap().block_number,
         max_block_number,
-        "expected validator DB tip to reach max fixture block",
+        "expected {validator_name} validator DB tip to reach max fixture block",
     );
 
     handle.stop().unwrap();
-    info!("Mock RPC server has been shut down");
+    info!("Mock RPC server has been shut down for {validator_name}");
+}
+
+#[tokio::test]
+async fn integration_test_mega_evm_validator() {
+    run_integration_test_with_validator("MegaEVM", false, |chain_spec| {
+        Ok::<_, std::convert::Infallible>(MegaEvmValidator::new(chain_spec.clone()))
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn integration_test_kona_validator() {
+    run_integration_test_with_validator("Kona", true, KonaValidator::new).await;
 }

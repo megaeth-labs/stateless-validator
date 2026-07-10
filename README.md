@@ -27,7 +27,7 @@ The stateless approach eliminates the need for validators to run on high-end har
 
 ## Project Structure
 
-The workspace contains two binaries and four library crates:
+The workspace contains three binaries and four library crates:
 
 | Crate                  | Path                          | Purpose                                                                             |
 | ---------------------- | ----------------------------- | ----------------------------------------------------------------------------------- |
@@ -35,7 +35,8 @@ The workspace contains two binaries and four library crates:
 | `stateless-db`         | `crates/stateless-db`         | redb-backed persistence: table definitions, read/write helpers, bounded `ContractCache` |
 | `stateless-common`     | `crates/stateless-common`     | Shared utilities: RPC client, logging, metrics                                      |
 | `stateless-test-utils` | `crates/stateless-test-utils` | Test fixtures (blocks, witnesses, contracts) and env-var lock for integration tests |
-| `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers                                |
+| `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers backed by `MegaEvmValidator`   |
+| `kona-validator`       | `bin/stateless-validator`     | Kona-backed validator binary sharing the validator pipeline                         |
 | `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                       |
 
 Additional directories: `test_data/` (integration test fixtures including genesis config), `audits/` (security audit reports).
@@ -52,6 +53,17 @@ cargo build --release
 
 ```bash
 cargo run --release --bin stateless-validator -- \
+  --data-dir /path/to/validator/data \
+  --rpc-endpoint <public-rpc-endpoint> \
+  --witness-endpoint <witness-rpc-endpoint> \
+  --genesis-file /path/to/genesis.json \
+  --start-block <trusted-block-hash>
+```
+
+The `kona-validator` binary accepts the same flags and runs the same pipeline with `KonaValidator` as the block-validation backend:
+
+```bash
+cargo run --release --bin kona-validator -- \
   --data-dir /path/to/validator/data \
   --rpc-endpoint <public-rpc-endpoint> \
   --witness-endpoint <witness-rpc-endpoint> \
@@ -168,7 +180,7 @@ This forms a **trust-minimized pipeline**: you rely only on L1 + DA (the rollup'
 
 ### Pipeline
 
-Both binaries share a generic three-stage pipeline defined in `stateless-core`:
+The validator binaries and trace server share a generic three-stage pipeline defined in `stateless-core`:
 
 ```
  Stage 1: FETCH          block_fetcher
@@ -191,7 +203,7 @@ Both binaries share a generic three-stage pipeline defined in `stateless-core`:
 
 The pipeline is configured via `PipelineConfig` and customized through trait implementations:
 - `BlockProcessor`: Processing logic per block (validation or pass-through)
-- `BlockValidator`: The per-block validation backend behind the validator's processor (`MegaEvmValidator` is the in-repo mega-evm implementation; alternative executors implement it out-of-tree)
+- `BlockValidator`: The per-block validation backend behind the validator's processor (`stateless-validator` wires `MegaEvmValidator`; `kona-validator` wires `KonaValidator`)
 - `PipelineHooks`: Callbacks for advance/reorg/stale events
 - `ProcessedBlock`: Output type of the processing stage
 - `ReorgResolver`: Decides the rollback floor on a detected reorg (`BisectResolver` walks local history; embedders can supply an externally-resolved floor)
