@@ -133,6 +133,47 @@ fn tip_buffer_flag_and_env() {
     });
 }
 
+#[test]
+fn end_block_flag_and_env() {
+    assert_optional_numeric_flag::<u64>("--end-block", "STATELESS_VALIDATOR_END_BLOCK", |a| {
+        a.end_block
+    });
+}
+
+/// `--witness-source` must default to `rpc`, parse both lowercase values (flag and env), and
+/// reject anything else at parse time.
+#[test]
+fn witness_source_flag_and_env() {
+    use stateless_validator::WitnessSource;
+
+    let guard = stateless_test_utils::env::env_lock();
+    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
+
+    assert_eq!(parse(&[]).unwrap().witness_source, WitnessSource::Rpc);
+    assert_eq!(parse(&["--witness-source", "rpc"]).unwrap().witness_source, WitnessSource::Rpc);
+    assert_eq!(parse(&["--witness-source", "r2"]).unwrap().witness_source, WitnessSource::R2);
+    assert!(parse(&["--witness-source", "s3"]).is_err());
+
+    let from_env = stateless_test_utils::env::with_env_var(
+        &guard,
+        "STATELESS_VALIDATOR_WITNESS_SOURCE",
+        "r2",
+        || parse(&[]).unwrap().witness_source,
+    );
+    assert_eq!(from_env, WitnessSource::R2);
+}
+
+/// `--witness-endpoint` is enforced at runtime per witness source (required for `rpc`, ignored
+/// for `r2`), so the parse itself must accept its absence in both modes.
+#[test]
+fn witness_endpoint_is_optional_at_parse_time() {
+    let base = &["stateless-validator", "--data-dir", "/tmp/x", "--rpc-endpoint", "http://rpc"];
+    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(base.iter().chain(extra));
+
+    assert!(parse(&[]).unwrap().witness_endpoint.is_empty());
+    assert!(parse(&["--witness-source", "r2"]).unwrap().witness_endpoint.is_empty());
+}
+
 /// `canonical_chain_max_length` must reject 0 at parse time. A value of 0 would make
 /// `advance_chain` prune the entire canonical chain on every successful advance,
 /// rolling the pipeline back to the anchor each round and looping forever.

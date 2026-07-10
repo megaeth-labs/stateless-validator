@@ -29,22 +29,34 @@ use tracing::{trace, warn};
 
 /// Max retry rounds for retryable (transport/429/5xx) failures before surfacing an error.
 const MAX_RETRIES: usize = 8;
-/// First retry sleep; doubles each round up to [`MAX_BACKOFF`].
+/// First retry sleep; doubles each round up to [`MAX_BACKOFF`]. (Test builds shrink the sleeps so
+/// the retry-path tests run in milliseconds; the loop logic is identical.)
+#[cfg(not(test))]
 const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const INITIAL_BACKOFF: Duration = Duration::from_millis(5);
 /// Upper bound on any single retry sleep.
+#[cfg(not(test))]
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
-/// Throttle applied before surfacing a `Missing` (404), so the pipeline's immediate re-enqueue of
-/// a failed fetch does not hot-spin GETs against R2 on a genuine gap.
-const MISSING_THROTTLE: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const MAX_BACKOFF: Duration = Duration::from_millis(20);
+/// Throttle applied before surfacing any deterministic failure (`Missing`, `Status`, `Decode`,
+/// `DecodePanicked`), so the pipeline's immediate re-enqueue of a failed fetch does not hot-loop
+/// signed GETs (and full block re-downloads) against R2 on a wrong credential, a corrupt object,
+/// or a genuine gap.
+#[cfg(not(test))]
+const DETERMINISTIC_FAILURE_THROTTLE: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const DETERMINISTIC_FAILURE_THROTTLE: Duration = Duration::from_millis(5);
 
 /// Failure outcome of an R2 witness fetch.
 #[derive(Debug, thiserror::Error)]
 pub enum R2WitnessError {
-    /// The primary object is absent from the bucket (HTTP 404) — a completeness gap in R2 for
-    /// blocks known to have a witness.
-    #[error(
-        "R2 witness MISSING for block {number} (key {key}): object not found (404) — R2 completeness gap"
-    )]
+    /// The primary object is absent from the bucket (HTTP 404). For a block known to have a
+    /// witness this is a completeness gap in R2, but near the tip (or right after a reorg) it can
+    /// also fire transiently before the uploader has PUT the object — the retry that follows the
+    /// pipeline's re-enqueue resolves those.
+    #[error("R2 witness MISSING for block {number} (key {key}): object not found (404)")]
     Missing { number: u64, key: String },
     /// Transport-level failure (connection reset/timeout) — the endpoint is effectively
     /// unreachable. Retried internally with backoff before surfacing.
@@ -54,8 +66,9 @@ pub enum R2WitnessError {
     /// overload / SlowDown). Retried internally with backoff before surfacing.
     #[error("R2 throttled/server error {status} for block {number} (key {key}): {body}")]
     Throttled { number: u64, key: String, status: u16, body: String },
-    /// A non-success status unlikely to clear on retry (typically 4xx other than 429 — e.g. 403
-    /// SignatureDoesNotMatch from bad credentials or a malformed endpoint).
+    /// A non-success status unlikely to clear on retry: 4xx other than 429 (e.g. 403
+    /// SignatureDoesNotMatch from bad credentials, 404 NoSuchBucket from a wrong bucket name) or a
+    /// 3xx (redirects are never followed — a signed GET cannot survive one).
     #[error("R2 unexpected status {status} for block {number} (key {key}): {body}")]
     Status { number: u64, key: String, status: u16, body: String },
     /// The object was fetched but its bytes did not decode to a `(SaltWitness, MptWitness)` tuple
@@ -121,6 +134,10 @@ impl R2WitnessClient {
         }
         let http = Client::builder()
             .timeout(per_attempt_timeout)
+            // A SigV4-signed GET can never survive a redirect (reqwest strips `authorization` on
+            // cross-host hops, and a same-host hop invalidates the signed URI), so following one
+            // just turns the real cause into a baffling 403. Surface the 3xx as a `Status` error.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| eyre::eyre!("Failed to build R2 HTTP client: {e}"))?;
         Ok(Self {
@@ -134,9 +151,27 @@ impl R2WitnessClient {
 
     /// Fetches and decodes the witness for `(number, hash)` from R2.
     ///
-    /// Transport/429/5xx failures are retried with backoff up to [`MAX_RETRIES`] times;
-    /// `Missing` (404) and `Decode` failures are deterministic and surface immediately.
+    /// Transport/429/5xx failures are retried with backoff up to [`MAX_RETRIES`] times. Every
+    /// other failure is deterministic; it surfaces after a short
+    /// [`DETERMINISTIC_FAILURE_THROTTLE`] sleep, because the pipeline re-enqueues a failed fetch
+    /// immediately and would otherwise hot-loop signed GETs (plus full block re-downloads) against
+    /// R2 on a wrong credential, a corrupt object, or a genuine gap.
     pub async fn get_witness(
+        &self,
+        number: u64,
+        hash: B256,
+    ) -> Result<(SaltWitness, MptWitness), R2WitnessError> {
+        let result = self.get_witness_inner(number, hash).await;
+        if let Err(e) = &result &&
+            !e.is_retryable()
+        {
+            tokio::time::sleep(DETERMINISTIC_FAILURE_THROTTLE).await;
+        }
+        result
+    }
+
+    /// [`Self::get_witness`] without the deterministic-failure throttle.
+    async fn get_witness_inner(
         &self,
         number: u64,
         hash: B256,
@@ -149,12 +184,7 @@ impl R2WitnessClient {
             attempt += 1;
             match self.get_object(number, &key).await {
                 Ok(Attempt::Found(bytes)) => break bytes,
-                Ok(Attempt::Missing) => {
-                    // Deterministic gap. Sleep briefly first: the fetcher re-enqueues a failed
-                    // fetch immediately, so returning instantly would hot-loop 404s against R2.
-                    tokio::time::sleep(MISSING_THROTTLE).await;
-                    return Err(R2WitnessError::Missing { number, key });
-                }
+                Ok(Attempt::Missing) => return Err(R2WitnessError::Missing { number, key }),
                 Err(e) => {
                     if !e.is_retryable() || attempt > MAX_RETRIES {
                         return Err(e);
@@ -197,10 +227,12 @@ impl R2WitnessClient {
             return Ok(Attempt::Found(bytes));
         }
         let code = status.as_u16();
-        if code == 404 {
+        let body = response.text().await.unwrap_or_default();
+        // A 404 usually means the object is absent (`NoSuchKey`) — but S3 also 404s a missing
+        // *bucket*, which is operator misconfiguration, not a data gap; keep those apart.
+        if code == 404 && !body.contains("NoSuchBucket") {
             return Ok(Attempt::Missing);
         }
-        let body = response.text().await.unwrap_or_default();
         let key = key.to_string();
         if code == 429 || code >= 500 {
             Err(R2WitnessError::Throttled { number, key, status: code, body })
@@ -212,7 +244,15 @@ impl R2WitnessClient {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use std::{
+        str::FromStr,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
 
@@ -242,5 +282,124 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("Invalid R2 endpoint"));
+    }
+
+    /// Serves one scripted HTTP/1.1 response per connection on a local port and counts requests.
+    /// The last response repeats if more connections arrive than were scripted.
+    async fn mock_r2(responses: Vec<(u16, &'static str)>) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let (status, body) = responses[n.min(responses.len() - 1)];
+                // Drain the request head before replying.
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let reason = match status {
+                    200 => "OK",
+                    301 => "Moved Permanently",
+                    _ => "X",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nconnection: close\r\n\
+                     location: http://example.invalid/elsewhere\r\n\
+                     content-length: {}\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+            }
+        });
+        (endpoint, hits)
+    }
+
+    fn client(endpoint: &str) -> R2WitnessClient {
+        R2WitnessClient::new(
+            endpoint,
+            "witness-test".to_string(),
+            "ak".to_string(),
+            "sk".to_string(),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    }
+
+    async fn fetch(endpoint: &str) -> Result<(SaltWitness, MptWitness), R2WitnessError> {
+        client(endpoint).get_witness(1, B256::ZERO).await
+    }
+
+    #[tokio::test]
+    async fn status_4xx_surfaces_without_retry() {
+        let (endpoint, hits) = mock_r2(vec![(403, "SignatureDoesNotMatch")]).await;
+        let err = fetch(&endpoint).await.unwrap_err();
+        assert!(matches!(err, R2WitnessError::Status { status: 403, .. }), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "4xx must not be retried");
+    }
+
+    #[tokio::test]
+    async fn missing_404_surfaces_without_retry() {
+        let (endpoint, hits) = mock_r2(vec![(404, "<Code>NoSuchKey</Code>")]).await;
+        let err = fetch(&endpoint).await.unwrap_err();
+        assert!(matches!(err, R2WitnessError::Missing { number: 1, .. }), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "404 must not be retried");
+    }
+
+    #[tokio::test]
+    async fn missing_bucket_404_is_a_config_error_not_a_gap() {
+        let (endpoint, _) = mock_r2(vec![(404, "<Code>NoSuchBucket</Code>")]).await;
+        let err = fetch(&endpoint).await.unwrap_err();
+        assert!(matches!(err, R2WitnessError::Status { status: 404, .. }), "{err}");
+    }
+
+    #[tokio::test]
+    async fn throttled_5xx_retries_until_a_deterministic_answer() {
+        let (endpoint, hits) = mock_r2(vec![(503, "SlowDown"), (503, "SlowDown"), (403, "")]).await;
+        let err = fetch(&endpoint).await.unwrap_err();
+        assert!(matches!(err, R2WitnessError::Status { status: 403, .. }), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "5xx must be retried, 4xx must stop the loop");
+    }
+
+    #[tokio::test]
+    async fn persistent_5xx_exhausts_retries_and_surfaces_throttled() {
+        let (endpoint, hits) = mock_r2(vec![(503, "overloaded")]).await;
+        let err = fetch(&endpoint).await.unwrap_err();
+        assert!(matches!(err, R2WitnessError::Throttled { status: 503, .. }), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), MAX_RETRIES + 1, "initial attempt + MAX_RETRIES");
+    }
+
+    #[tokio::test]
+    async fn undecodable_body_surfaces_decode_without_retry() {
+        let (endpoint, hits) = mock_r2(vec![(200, "not a zstd witness")]).await;
+        let err = fetch(&endpoint).await.unwrap_err();
+        assert!(matches!(err, R2WitnessError::Decode { .. }), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "a corrupt object must not be re-downloaded");
+    }
+
+    #[tokio::test]
+    async fn redirects_are_not_followed() {
+        // A signed GET cannot survive a redirect; the 3xx must surface instead of a spurious 403
+        // from the redirect target (which would also leak the request outside the endpoint).
+        let (endpoint, hits) = mock_r2(vec![(301, "moved")]).await;
+        let err = fetch(&endpoint).await.unwrap_err();
+        assert!(matches!(err, R2WitnessError::Status { status: 301, .. }), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// Every deterministic failure must be throttled before surfacing — the pipeline re-enqueues
+    /// failed fetches immediately, so an unthrottled return hot-loops GETs against R2.
+    #[tokio::test]
+    async fn deterministic_failures_are_throttled_before_surfacing() {
+        for (status, body) in [(403, ""), (404, ""), (200, "garbage")] {
+            let (endpoint, _) = mock_r2(vec![(status, body)]).await;
+            let started = std::time::Instant::now();
+            fetch(&endpoint).await.unwrap_err();
+            assert!(
+                started.elapsed() >= DETERMINISTIC_FAILURE_THROTTLE,
+                "status {status} surfaced without the deterministic-failure throttle",
+            );
+        }
     }
 }

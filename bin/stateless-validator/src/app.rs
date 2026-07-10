@@ -25,6 +25,31 @@ pub enum WitnessSource {
     R2,
 }
 
+/// A CLI/env secret that redacts itself in `Debug` output — [`CommandLineArgs`] derives `Debug`,
+/// and a secret must never ride along if the args are ever logged.
+#[derive(Clone)]
+pub struct RedactedSecret(String);
+
+impl std::str::FromStr for RedactedSecret {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
+    }
+}
+
+impl std::fmt::Debug for RedactedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+impl AsRef<str> for RedactedSecret {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Database filename for the validator.
 pub const VALIDATOR_DB_FILENAME: &str = "validator.redb";
 
@@ -111,10 +136,12 @@ pub struct CommandLineArgs {
     /// R2 secret access key. Required when `--witness-source r2`. Prefer the env var over the
     /// flag.
     #[clap(long, env = "STATELESS_VALIDATOR_R2_SECRET_ACCESS_KEY")]
-    pub r2_secret_access_key: Option<String>,
+    pub r2_secret_access_key: Option<RedactedSecret>,
 
     /// Optional inclusive end block: validate up to this height, then stop cleanly. Used to slice
     /// a fixed block range across multiple servers. Omit to follow the chain tip indefinitely.
+    /// Note: the fetcher stays `--tip-buffer` blocks behind the remote tip, so the run only
+    /// completes once the chain has advanced to `end_block + tip_buffer`.
     #[clap(long, env = "STATELESS_VALIDATOR_END_BLOCK")]
     pub end_block: Option<u64>,
 
@@ -176,7 +203,8 @@ pub struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_RPC_MAX_BACKOFF_MS")]
     pub rpc_max_backoff_ms: Option<u64>,
 
-    /// Per-attempt RPC timeout (milliseconds). Must be ≥ 100ms.
+    /// Per-attempt RPC timeout (milliseconds). Must be ≥ 100ms. With `--witness-source r2` this
+    /// also bounds each R2 witness GET.
     #[clap(
         long,
         env = "STATELESS_VALIDATOR_RPC_PER_ATTEMPT_TIMEOUT_MS",
@@ -376,9 +404,35 @@ fn override_ms(ms: Option<u64>, default: Duration) -> Duration {
 }
 
 /// Unwraps a required `--r2-*` argument, erroring with the flag name when it is absent.
-fn require_r2<'a>(value: &'a Option<String>, flag: &str) -> Result<&'a str> {
+fn require_r2<'a, T: AsRef<str>>(value: &'a Option<T>, flag: &str) -> Result<&'a str> {
     value
-        .as_deref()
+        .as_ref()
+        .map(AsRef::as_ref)
         .filter(|v| !v.is_empty())
         .ok_or_else(|| eyre::eyre!("{flag} is required with --witness-source r2"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn require_r2_rejects_absent_and_empty_values() {
+        assert!(require_r2(&None::<String>, "--r2-endpoint").is_err());
+        // An env var set to the empty string must not pass as configured.
+        assert!(require_r2(&Some(String::new()), "--r2-endpoint").is_err());
+        assert_eq!(
+            require_r2(&Some("https://x".to_string()), "--r2-endpoint").unwrap(),
+            "https://x"
+        );
+    }
+
+    /// `CommandLineArgs` derives `Debug`; the secret must never appear in that output.
+    #[test]
+    fn redacted_secret_never_debug_prints_its_value() {
+        let secret: RedactedSecret = "super-secret-key".parse().unwrap();
+        assert_eq!(format!("{secret:?}"), "[redacted]");
+        assert_eq!(format!("{:?}", Some(&secret)), "Some([redacted])");
+        assert_eq!(secret.as_ref(), "super-secret-key");
+    }
 }
