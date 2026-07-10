@@ -352,6 +352,16 @@ pub trait BlockValidator<B: BlockInput> {
     /// Validates one block against its witnesses, per the trait-level contract.
     fn validate_block(&self, input: ValidationInput<'_, B>)
     -> Result<ValidationStats, Self::Error>;
+
+    /// Whether this backend needs [`ValidationInput::parent_header`] populated.
+    ///
+    /// The embedder's fetcher consults this to decide whether to fetch the parent consensus
+    /// header alongside each block, so backends that re-derive header fields from the parent
+    /// (e.g. a kona-based executor) get it without hand-syncing a separate flag. Defaults to
+    /// `false`.
+    fn requires_parent_header(&self) -> bool {
+        false
+    }
 }
 
 /// The in-repo [`BlockValidator`]: mega-evm transaction replay plus SALT two-phase

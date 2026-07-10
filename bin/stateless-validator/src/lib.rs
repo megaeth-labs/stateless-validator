@@ -5,10 +5,16 @@
 
 pub(crate) mod app;
 pub(crate) mod chain_sync;
+#[cfg(feature = "kona")]
+pub mod kona_replay;
 pub(crate) mod metrics;
 pub(crate) mod validator_db;
 pub(crate) mod workers;
 
-pub use app::{CommandLineArgs, VALIDATOR_DB_FILENAME, load_or_create_chain_spec, run, run_kona};
+#[cfg(feature = "kona")]
+pub use app::run_kona;
+pub use app::{CommandLineArgs, VALIDATOR_DB_FILENAME, load_or_create_chain_spec, run};
 pub use chain_sync::{ValidatorFetcher, ValidatorHooks, ValidatorProcessor};
+#[cfg(feature = "kona")]
+pub use kona_replay::{KonaReplayError, KonaValidator};
 pub use validator_db::ValidatorDB;

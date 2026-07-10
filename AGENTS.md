@@ -5,7 +5,7 @@ This file provides guidance to AI agents (e.g., Claude Code, Codex, Cursor, etc.
 ## Project Overview
 
 Stateless validator for MegaETH — validates blocks using SALT witness data without requiring full chain state.
-The workspace contains three binaries: `stateless-validator` (chain-following MegaEVM validator), `kona-validator` (chain-following Kona validator), and `debug-trace-server` (RPC server for debug/trace methods).
+The workspace contains two default binaries — `stateless-validator` (chain-following MegaEVM validator) and `debug-trace-server` (RPC server for debug/trace methods) — plus the opt-in `kona-validator` bin target (chain-following Kona validator, built only with `--features kona`).
 See `README.md` for detailed documentation and quickstart.
 
 ## Build & Development Commands
@@ -40,8 +40,7 @@ The project uses nightly `2026-02-03` toolchain (edition 2024, rust-version 1.95
 | `stateless-db`         | `crates/stateless-db`         | redb-backed persistence: table definitions, read/write helpers, `ContractCache`            |
 | `stateless-common`     | `crates/stateless-common`     | RPC client, metrics/logging utilities, witness size estimation                             |
 | `stateless-test-utils` | `crates/stateless-test-utils` | Test fixtures (blocks, witnesses, contracts) and env-var lock for integration tests        |
-| `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers with `MegaEvmValidator` (`app.rs` / `workers.rs` / `main.rs`) |
-| `kona-validator`       | `bin/stateless-validator`     | Kona-backed validator binary sharing the validator pipeline (`src/bin/kona-validator.rs`) |
+| `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers with `MegaEvmValidator` (`app.rs` / `workers.rs` / `main.rs`); hosts the opt-in `kona-validator` bin target (feature `kona`, `src/kona_replay.rs`) |
 | `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                              |
 
 Additional directories: `test_data/` (integration test fixtures including genesis config), `audits/` (security audit reports).
@@ -62,9 +61,10 @@ On a detected reorg, the rollback floor comes from a pluggable `ReorgResolver`: 
 ### Executor abstraction
 
 Per-block validation is pluggable via the `BlockValidator` trait in `stateless-core::executor`, consumed by the validator's `ValidatorProcessor<V>`.
-`MegaEvmValidator` is the default in-repo backend (mega-evm replay + SALT root update via `validate_block`), while `KonaValidator` is exposed through the separate `kona-validator` binary.
+`MegaEvmValidator` is the default in-repo backend (mega-evm replay + SALT root update via `validate_block`).
+`KonaValidator` lives in `bin/stateless-validator/src/kona_replay.rs` behind the `kona` cargo feature (the kona stack is a private git dependency, so it must not leak into `stateless-core` or default builds); it rebuilds the block once through mega-kona's `execute_payload` and requires the rebuilt header to equal the claimed one, which transitively checks every consensus header field.
 Other embedders can implement the trait out-of-tree with their own error types.
-`ValidationInput` bundles the per-block inputs (block, witnesses, contracts); its optional `parent_header` is required only by backends that re-derive header fields from the parent instead of trusting the block's own header.
+`ValidationInput` bundles the per-block inputs (block, witnesses, contracts); its optional `parent_header` is required only by backends that re-derive header fields from the parent instead of trusting the block's own header, and a backend declares that need via `BlockValidator::requires_parent_header` so the fetcher wires the extra header fetch automatically.
 
 ### Database
 
@@ -127,7 +127,7 @@ The server includes an HTTP response cache (`quick_cache`) for pre-serialized JS
 | `crates/stateless-db/src/{lib,tables,helpers,serialize,cache}.rs`                              | Shared redb tables, helpers, serialization, and `ContractCache`          |
 | `crates/stateless-common/src/rpc_client.rs`                                                    | RPC client for blocks, witnesses, and bytecode                           |
 | `crates/stateless-common/src/metrics.rs`                                                       | RpcMethod, RpcMetrics, RpcClientConfig                                   |
-| `bin/stateless-validator/src/{main,app,workers,chain_sync,validator_db,metrics}.rs`            | Thin entry, CLI/startup wiring, pipeline+reporter, fetcher/processor, DB |
+| `bin/stateless-validator/src/{main,app,workers,chain_sync,kona_replay,validator_db,metrics}.rs`            | Thin entry, CLI/startup wiring, pipeline+reporter, fetcher/processor, DB |
 | `bin/debug-trace-server/src/chain_sync.rs`                                                     | TraceFetcher, TraceProcessor, TraceHooks                                 |
 | `bin/debug-trace-server/src/rpc_service.rs`                                                    | RPC method definitions and handlers                                      |
 | `bin/debug-trace-server/src/data_provider.rs`                                                  | Block data fetching with single-flight coalescing                        |

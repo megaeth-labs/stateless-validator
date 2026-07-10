@@ -1376,14 +1376,26 @@ checksum = "7b7e4c2464d97fe331d41de9d5db0def0a96f4d823b8b32a2efd503578988973"
 [[package]]
 name = "banderwagon"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb#80c02eb1e5d85c3348fc7f3075d80440eeebe1fb"
+source = "git+https://github.com/megaeth-labs/salt.git?tag=v1.0.5#b6b30e733276f50855a2d3c0781177803ba8f8d9"
 dependencies = [
  "ark-ec 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
  "ark-ed-on-bls12-381-bandersnatch",
  "ark-ff 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
  "ark-serialize 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
  "rayon",
- "salt-macros",
+ "salt-macros 0.1.0 (git+https://github.com/megaeth-labs/salt.git?tag=v1.0.5)",
+]
+
+[[package]]
+name = "banderwagon"
+version = "0.1.0"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb#80c02eb1e5d85c3348fc7f3075d80440eeebe1fb"
+dependencies = [
+ "ark-ec 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
+ "ark-ed-on-bls12-381-bandersnatch",
+ "ark-ff 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
+ "ark-serialize 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
+ "salt-macros 0.1.0 (git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb)",
 ]
 
 [[package]]
@@ -2328,7 +2340,7 @@ dependencies = [
  "reqwest 0.13.2",
  "revm",
  "revm-inspectors",
- "salt",
+ "salt 1.0.5",
  "serde",
  "serde_json",
  "stateless-common",
@@ -3615,15 +3627,30 @@ dependencies = [
 [[package]]
 name = "ipa-multipoint"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb#80c02eb1e5d85c3348fc7f3075d80440eeebe1fb"
+source = "git+https://github.com/megaeth-labs/salt.git?tag=v1.0.5#b6b30e733276f50855a2d3c0781177803ba8f8d9"
 dependencies = [
- "banderwagon",
+ "banderwagon 0.1.0 (git+https://github.com/megaeth-labs/salt.git?tag=v1.0.5)",
  "hashbrown 0.16.1",
  "hex",
  "itertools 0.10.5",
  "rayon",
  "rustc-hash",
- "salt-macros",
+ "salt-macros 0.1.0 (git+https://github.com/megaeth-labs/salt.git?tag=v1.0.5)",
+ "sha2 0.9.9",
+ "thiserror",
+]
+
+[[package]]
+name = "ipa-multipoint"
+version = "0.1.0"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb#80c02eb1e5d85c3348fc7f3075d80440eeebe1fb"
+dependencies = [
+ "banderwagon 0.1.0 (git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb)",
+ "hashbrown 0.16.1",
+ "hex",
+ "itertools 0.10.5",
+ "rustc-hash",
+ "salt-macros 0.1.0 (git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb)",
  "sha2 0.9.9",
  "thiserror",
 ]
@@ -3934,7 +3961,7 @@ dependencies = [
  "op-alloy-rpc-types 0.22.4",
  "op-alloy-rpc-types-engine",
  "risc0-zkvm",
- "salt",
+ "salt 1.0.3",
  "salt-stateless",
  "simd-json",
  "thiserror",
@@ -3994,7 +4021,7 @@ dependencies = [
  "alloy-op-hardforks 0.2.13",
  "alloy-primitives",
  "mega-evm 1.5.1",
- "salt",
+ "salt 1.0.3",
 ]
 
 [[package]]
@@ -6842,15 +6869,36 @@ version = "1.0.3"
 source = "git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb#80c02eb1e5d85c3348fc7f3075d80440eeebe1fb"
 dependencies = [
  "auto_impl",
- "banderwagon",
+ "banderwagon 0.1.0 (git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb)",
  "blake3",
  "derive_more",
  "hashbrown 0.16.1",
  "hex",
- "ipa-multipoint",
+ "ipa-multipoint 0.1.0 (git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb)",
+ "rustc-hash",
+ "salt-macros 0.1.0 (git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb)",
+ "serde",
+ "serde_arrays",
+ "spin 0.10.0",
+ "thiserror",
+ "zerocopy 0.7.35",
+]
+
+[[package]]
+name = "salt"
+version = "1.0.5"
+source = "git+https://github.com/megaeth-labs/salt.git?tag=v1.0.5#b6b30e733276f50855a2d3c0781177803ba8f8d9"
+dependencies = [
+ "auto_impl",
+ "banderwagon 0.1.0 (git+https://github.com/megaeth-labs/salt.git?tag=v1.0.5)",
+ "blake3",
+ "derive_more",
+ "hashbrown 0.16.1",
+ "hex",
+ "ipa-multipoint 0.1.0 (git+https://github.com/megaeth-labs/salt.git?tag=v1.0.5)",
  "rayon",
  "rustc-hash",
- "salt-macros",
+ "salt-macros 0.1.0 (git+https://github.com/megaeth-labs/salt.git?tag=v1.0.5)",
  "serde",
  "serde_arrays",
  "spin 0.10.0",
@@ -6861,10 +6909,15 @@ dependencies = [
 [[package]]
 name = "salt-macros"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb#80c02eb1e5d85c3348fc7f3075d80440eeebe1fb"
+source = "git+https://github.com/megaeth-labs/salt.git?tag=v1.0.5#b6b30e733276f50855a2d3c0781177803ba8f8d9"
 dependencies = [
  "rayon",
 ]
+
+[[package]]
+name = "salt-macros"
+version = "0.1.0"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb#80c02eb1e5d85c3348fc7f3075d80440eeebe1fb"
 
 [[package]]
 name = "salt-stateless"
@@ -6875,7 +6928,7 @@ dependencies = [
  "alloy-primitives",
  "anyhow",
  "mega-evm 1.5.1",
- "salt",
+ "salt 1.0.3",
 ]
 
 [[package]]
@@ -7417,7 +7470,7 @@ dependencies = [
  "reqwest 0.12.24",
  "revm",
  "rolling-file",
- "salt",
+ "salt 1.0.5",
  "serde",
  "stateless-core",
  "stateless-test-utils",
@@ -7443,36 +7496,24 @@ dependencies = [
  "alloy-op-hardforks 0.2.13",
  "alloy-primitives",
  "alloy-rlp",
- "alloy-rpc-types-engine",
  "alloy-rpc-types-eth",
  "alloy-serde",
- "alloy-tx-macros",
  "bincode 2.0.1",
  "dyn-clone",
  "eyre",
  "hashbrown 0.16.1",
  "kanal",
- "kona-driver",
- "kona-executor",
- "kona-genesis",
- "kona-megaevm",
- "kona-mpt",
- "kona-proof",
- "kona-registry",
- "mega-evm 1.5.1",
  "mega-evm 1.6.1",
  "num_cpus",
  "op-alloy-consensus 0.18.14",
  "op-alloy-rpc-types 0.18.14",
- "op-alloy-rpc-types-engine",
  "reth-ethereum-forks",
  "reth-optimism-chainspec",
  "reth-trie-common",
  "reth-trie-sparse",
  "revm",
  "rustc-hash",
- "salt",
- "salt-stateless",
+ "salt 1.0.5",
  "serde",
  "serde_json",
  "stateless-test-utils",
@@ -7512,7 +7553,7 @@ dependencies = [
  "eyre",
  "op-alloy-rpc-types 0.18.14",
  "revm",
- "salt",
+ "salt 1.0.5",
  "serde",
  "serde_json",
  "tracing",
@@ -7524,19 +7565,34 @@ name = "stateless-validator"
 version = "2.0.14"
 dependencies = [
  "alloy-consensus",
+ "alloy-eips",
  "alloy-genesis",
+ "alloy-op-hardforks 0.2.13",
  "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-engine",
  "alloy-rpc-types-eth",
+ "bincode 2.0.1",
  "clap",
  "eyre",
  "jsonrpsee",
  "jsonrpsee-types",
+ "kona-driver",
+ "kona-executor",
+ "kona-genesis",
+ "kona-megaevm",
+ "kona-mpt",
+ "kona-proof",
+ "kona-registry",
+ "mega-evm 1.6.1",
  "metrics",
  "metrics-exporter-prometheus",
+ "op-alloy-consensus 0.18.14",
  "op-alloy-rpc-types 0.18.14",
+ "op-alloy-rpc-types-engine",
  "redb",
  "revm",
- "salt",
+ "salt 1.0.5",
  "serde_json",
  "stateless-common",
  "stateless-core",

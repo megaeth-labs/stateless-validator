@@ -32,7 +32,6 @@ pub async fn run_with_signals<V>(
     validator: Arc<V>,
     report_validation_endpoint: Option<String>,
     pipeline_config: PipelineConfig,
-    fetch_parent_header: bool,
 ) -> Result<()>
 where
     V: BlockValidator<Block<Transaction>> + Send + Sync + 'static,
@@ -51,10 +50,11 @@ where
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .map_err(|e| eyre::eyre!("Failed to register SIGTERM handler: {e}"))?;
 
+    // The backend declares whether it needs the parent header; no hand-synced flag.
     let fetcher = Arc::new(ValidatorFetcher {
         rpc_client: client.clone(),
         on_remote_height: metrics::set_remote_chain_height,
-        fetch_parent_header,
+        fetch_parent_header: validator.requires_parent_header(),
     });
     let processor =
         Arc::new(ValidatorProcessor { validator, contract_cache, rpc_client: client.clone() });

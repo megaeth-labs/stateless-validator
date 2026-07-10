@@ -14,19 +14,36 @@ path = "src/main.rs"
 [[bin]]
 name = "kona-validator"
 path = "src/bin/kona-validator.rs"
+required-features = ["kona"]
 
 [dependencies]
 # alloy
 alloy-consensus.workspace = true
+alloy-eips = { workspace = true, optional = true }
 alloy-genesis.workspace = true
+alloy-op-hardforks = { workspace = true, default-features = false, optional = true }
 alloy-primitives.workspace = true
+alloy-rlp = { workspace = true, optional = true }
+alloy-rpc-types-engine = { workspace = true, optional = true }
 alloy-rpc-types-eth.workspace = true
 
+# kona
+kona-driver = { workspace = true, optional = true }
+kona-executor = { workspace = true, optional = true }
+kona-genesis = { workspace = true, optional = true }
+kona-megaevm = { workspace = true, optional = true }
+kona-mpt = { workspace = true, optional = true }
+kona-proof = { workspace = true, optional = true }
+kona-registry = { workspace = true, optional = true }
+
 # mega
+mega-evm = { workspace = true, default-features = false, optional = true }
 salt.workspace = true
 
 # op
+op-alloy-consensus = { workspace = true, optional = true }
 op-alloy-rpc-types.workspace = true
+op-alloy-rpc-types-engine = { workspace = true, optional = true }
 
 # revm
 revm = { workspace = true, features = ["serde"] }
@@ -37,6 +54,7 @@ stateless-core = { path = "../../crates/stateless-core" }
 stateless-db = { path = "../../crates/stateless-db" }
 
 # misc
+bincode = { workspace = true, optional = true }
 clap = { workspace = true, features = ["env"] }
 eyre.workspace = true
 metrics.workspace = true
@@ -58,6 +76,31 @@ tempfile.workspace = true
 stateless-test-utils = { path = "../../crates/stateless-test-utils" }
 
 [features]
+# Opt-in Kona validation backend (`kona-validator` binary). Kept off by default because the
+# kona stack lives in private git repositories; default builds must not require credentials.
+kona = [
+    "dep:alloy-eips",
+    "dep:alloy-op-hardforks",
+    "dep:alloy-rlp",
+    "dep:alloy-rpc-types-engine",
+    "dep:bincode",
+    "dep:kona-driver",
+    "dep:kona-executor",
+    "dep:kona-genesis",
+    "dep:kona-megaevm",
+    "dep:kona-mpt",
+    "dep:kona-proof",
+    "dep:kona-registry",
+    "dep:mega-evm",
+    "dep:op-alloy-consensus",
+    "dep:op-alloy-rpc-types-engine",
+    "alloy-rpc-types-engine/std",
+    "kona-genesis/std",
+    "kona-proof/std",
+    "kona-registry/std",
+    "mega-evm/default",
+    "op-alloy-rpc-types-engine/std",
+]
 test-bucket-resize = ["salt/test-bucket-resize", "stateless-core/test-bucket-resize"]
 
 [lib]

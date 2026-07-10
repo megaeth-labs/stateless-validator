@@ -37,8 +37,6 @@ pub use executor::{
     BlockInput, BlockValidator, MegaEvmValidator, ValidationError, ValidationInput,
     ValidationStats, replay_block, validate_block,
 };
-pub mod kona_replay;
-pub use kona_replay::{KonaReplayError, KonaValidator};
 #[cfg(feature = "std")]
 pub mod pipeline;
 #[cfg(feature = "std")]

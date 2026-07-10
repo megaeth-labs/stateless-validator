@@ -3,7 +3,7 @@
 //! Covers CLI argument parsing and end-to-end pipeline validation against a mock RPC server.
 //! Mainnet single-block validation is covered in `crates/stateless-core/src/executor.rs::tests`.
 
-use std::{collections::HashMap, process::Command, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use alloy_primitives::{B256, BlockHash};
 use alloy_rpc_types_eth::Block;
@@ -17,8 +17,7 @@ use jsonrpsee_types::error::{
 };
 use stateless_common::{RpcClient, WitnessRequestKeys, encode_witness_response};
 use stateless_core::{
-    BisectResolver, BlockValidator, ChainStore, ContractStore, KonaValidator, MegaEvmValidator,
-    PipelineConfig,
+    BisectResolver, BlockValidator, ChainStore, ContractStore, MegaEvmValidator, PipelineConfig,
     chain_spec::ChainSpec,
     db::BlockMeta,
     pipeline::{BlockFetcher, run_pipeline},
@@ -26,6 +25,8 @@ use stateless_core::{
 };
 use stateless_db::ContractCache;
 use stateless_test_utils::{fixtures::TestFixtures, logging::init_test_logging};
+#[cfg(feature = "kona")]
+use stateless_validator::KonaValidator;
 use stateless_validator::{
     CommandLineArgs, VALIDATOR_DB_FILENAME, ValidatorDB, ValidatorFetcher, ValidatorHooks,
     ValidatorProcessor, load_or_create_chain_spec,
@@ -161,9 +162,13 @@ fn canonical_chain_max_length_rejects_zero() {
     assert!(from_env_zero.is_err(), "env-var 0 must also be rejected");
 }
 
+#[cfg(feature = "kona")]
 #[test]
 fn kona_validator_binary_exposes_cli() {
-    let output = Command::new(env!("CARGO_BIN_EXE_kona-validator")).arg("--help").output().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_kona-validator"))
+        .arg("--help")
+        .output()
+        .unwrap();
 
     assert!(output.status.success(), "kona-validator --help failed: {output:?}");
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -400,13 +405,30 @@ async fn kona_fetcher_includes_parent_header() {
     assert_eq!(task.block.header.hash, block_hash);
     assert_eq!(parent_header.hash_slow(), task.block.header.parent_hash);
 
+    // The disabled half of the switch: the default (MegaEVM) backend must not request the
+    // extra header RPC, and a regression to always-fetch should fail here. Derive the flag
+    // from a real MegaEvmValidator exactly like the production wiring does.
+    let chain_spec = ChainSpec::from_genesis(
+        TestFixtures::synthetic().load_genesis().expect("synthetic genesis"),
+    );
+    let mega_validator = MegaEvmValidator::new(chain_spec);
+    let fetcher = ValidatorFetcher {
+        rpc_client: Arc::clone(&fetcher.rpc_client),
+        on_remote_height: |_| {},
+        fetch_parent_header:
+            BlockValidator::<Block<op_alloy_rpc_types::Transaction>>::requires_parent_header(
+                &mega_validator,
+            ),
+    };
+    let task = fetcher.fetch(block_number).await.unwrap();
+    assert!(task.parent_header.is_none(), "parent header must not be fetched when disabled");
+
     handle.stop().unwrap();
 }
 
 /// Synthetic data integration test: validates consecutive blocks via the streaming pipeline.
 async fn run_integration_test_with_validator<V, E>(
     validator_name: &str,
-    fetch_parent_header: bool,
     make_validator: impl FnOnce(&ChainSpec) -> Result<V, E>,
 ) where
     E: std::fmt::Debug,
@@ -436,16 +458,14 @@ async fn run_integration_test_with_validator<V, E>(
     let config = Arc::new(cfg);
 
     let shutdown = CancellationToken::new();
+    let validator = Arc::new(make_validator(&chain_spec).unwrap());
+    // Same derivation as production wiring in `workers::run_with_signals`.
     let fetcher = Arc::new(ValidatorFetcher {
         rpc_client: client.clone(),
         on_remote_height: |_| {},
-        fetch_parent_header,
+        fetch_parent_header: validator.requires_parent_header(),
     });
-    let processor = Arc::new(ValidatorProcessor {
-        validator: Arc::new(make_validator(&chain_spec).unwrap()),
-        contract_cache,
-        rpc_client: client,
-    });
+    let processor = Arc::new(ValidatorProcessor { validator, contract_cache, rpc_client: client });
     let hooks = Arc::new(ValidatorHooks);
 
     run_pipeline(
@@ -474,13 +494,14 @@ async fn run_integration_test_with_validator<V, E>(
 
 #[tokio::test]
 async fn integration_test_mega_evm_validator() {
-    run_integration_test_with_validator("MegaEVM", false, |chain_spec| {
+    run_integration_test_with_validator("MegaEVM", |chain_spec| {
         Ok::<_, std::convert::Infallible>(MegaEvmValidator::new(chain_spec.clone()))
     })
     .await;
 }
 
+#[cfg(feature = "kona")]
 #[tokio::test]
 async fn integration_test_kona_validator() {
-    run_integration_test_with_validator("Kona", true, KonaValidator::new).await;
+    run_integration_test_with_validator("Kona", KonaValidator::new).await;
 }

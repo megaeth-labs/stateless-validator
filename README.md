@@ -27,7 +27,7 @@ The stateless approach eliminates the need for validators to run on high-end har
 
 ## Project Structure
 
-The workspace contains three binaries and four library crates:
+The workspace contains two default binaries, an opt-in `kona-validator` bin target (feature `kona`), and four library crates:
 
 | Crate                  | Path                          | Purpose                                                                             |
 | ---------------------- | ----------------------------- | ----------------------------------------------------------------------------------- |
@@ -35,8 +35,7 @@ The workspace contains three binaries and four library crates:
 | `stateless-db`         | `crates/stateless-db`         | redb-backed persistence: table definitions, read/write helpers, bounded `ContractCache` |
 | `stateless-common`     | `crates/stateless-common`     | Shared utilities: RPC client, logging, metrics                                      |
 | `stateless-test-utils` | `crates/stateless-test-utils` | Test fixtures (blocks, witnesses, contracts) and env-var lock for integration tests |
-| `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers backed by `MegaEvmValidator`   |
-| `kona-validator`       | `bin/stateless-validator`     | Kona-backed validator binary sharing the validator pipeline                         |
+| `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers backed by `MegaEvmValidator`; also hosts the opt-in `kona-validator` bin target (feature `kona`) |
 | `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                       |
 
 Additional directories: `test_data/` (integration test fixtures including genesis config), `audits/` (security audit reports).
@@ -60,10 +59,11 @@ cargo run --release --bin stateless-validator -- \
   --start-block <trusted-block-hash>
 ```
 
-The `kona-validator` binary accepts the same flags and runs the same pipeline with `KonaValidator` as the block-validation backend:
+The `kona-validator` binary accepts the same flags and runs the same pipeline with `KonaValidator` as the block-validation backend.
+It is gated behind the `kona` cargo feature because the kona stack lives in private git repositories; default builds need no credentials, building with `--features kona` does.
 
 ```bash
-cargo run --release --bin kona-validator -- \
+cargo run --release --features kona --bin kona-validator -- \
   --data-dir /path/to/validator/data \
   --rpc-endpoint <public-rpc-endpoint> \
   --witness-endpoint <witness-rpc-endpoint> \
@@ -222,7 +222,7 @@ The pipeline is configured via `PipelineConfig` and customized through trait imp
 | `crates/stateless-common/src/metrics.rs`                                                       | `RpcMethod`, `RpcMetrics`, `RpcClientConfig`                                        |
 | `crates/stateless-common/src/witness_size.rs`                                                  | `WitnessSizeBreakdown` + `estimate_witness_size` for RPC and trace-server metrics   |
 | `crates/stateless-test-utils/src/fixtures.rs`                                                  | `TestFixtures` loader (blocks, SALT/MPT witnesses, contracts, genesis)              |
-| `bin/stateless-validator/src/{main,app,workers,chain_sync,validator_db,metrics}.rs`            | Thin entry, CLI/startup wiring, pipeline+reporter, fetcher/processor, DB            |
+| `bin/stateless-validator/src/{main,app,workers,chain_sync,kona_replay,validator_db,metrics}.rs`            | Thin entry, CLI/startup wiring, pipeline+reporter, fetcher/processor, DB            |
 | `bin/debug-trace-server/src/chain_sync.rs`                                                     | `TraceFetcher`, `TraceProcessor`, `TraceHooks`                                      |
 | `bin/debug-trace-server/src/rpc_service.rs`                                                    | RPC method definitions and handlers                                                 |
 | `bin/debug-trace-server/src/data_provider.rs`                                                  | Block data fetching with single-flight coalescing                                   |

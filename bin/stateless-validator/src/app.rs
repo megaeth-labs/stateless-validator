@@ -10,8 +10,8 @@ use eyre::Result;
 use op_alloy_rpc_types::Transaction;
 use stateless_common::{BackoffPolicy, RpcClient, RpcClientConfig, logging::LogArgs};
 use stateless_core::{
-    ChainStore, ContractStore, KonaValidator, MegaEvmValidator, chain_spec::ChainSpec,
-    db::BlockMeta, executor::BlockValidator,
+    ChainStore, ContractStore, MegaEvmValidator, chain_spec::ChainSpec, db::BlockMeta,
+    executor::BlockValidator,
 };
 use stateless_db::ContractCache;
 use tracing::info;
@@ -172,17 +172,16 @@ pub struct CommandLineArgs {
 /// validator DB, loads or initializes the chain spec + anchor, then hands off to
 /// [`workers::run_with_signals`].
 pub async fn run() -> Result<()> {
-    run_with_validator(false, |chain_spec| Ok(MegaEvmValidator::new(chain_spec.clone()))).await
+    run_with_validator(|chain_spec| Ok(MegaEvmValidator::new(chain_spec.clone()))).await
 }
 
+/// Entry point of the `kona-validator` binary: the same pipeline with the Kona backend.
+#[cfg(feature = "kona")]
 pub async fn run_kona() -> Result<()> {
-    run_with_validator(true, |chain_spec| Ok(KonaValidator::new(chain_spec)?)).await
+    run_with_validator(|chain_spec| Ok(crate::kona_replay::KonaValidator::new(chain_spec)?)).await
 }
 
-async fn run_with_validator<V>(
-    fetch_parent_header: bool,
-    make_validator: impl FnOnce(&ChainSpec) -> Result<V>,
-) -> Result<()>
+async fn run_with_validator<V>(make_validator: impl FnOnce(&ChainSpec) -> Result<V>) -> Result<()>
 where
     V: BlockValidator<Block<Transaction>> + Send + Sync + 'static,
 {
@@ -298,7 +297,6 @@ where
         validator,
         args.report_validation_endpoint,
         pipeline_config,
-        fetch_parent_header,
     )
     .await;
 

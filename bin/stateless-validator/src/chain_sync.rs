@@ -4,7 +4,11 @@
 //! backend) and [`ValidatorHooks`] (metrics integration) for the shared pipeline in
 //! [`stateless_core::pipeline::run_pipeline`].
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy_consensus::Header;
 use alloy_primitives::{B256, BlockHash, BlockNumber};
@@ -27,6 +31,12 @@ use tracing::{debug, error};
 
 use crate::metrics;
 
+/// Upper bound on one parent-header fetch. Unlike the block/witness fetches, the parent is
+/// looked up by a hash that a reorg can permanently remove from the remote, so an unbounded
+/// retry could pin this fetch slot forever; erroring out instead lets the pipeline re-enqueue
+/// the block and re-resolve it by number.
+const PARENT_HEADER_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Fetcher for the validator: fetches blocks + witnesses from RPC,
 /// wraps in [`ValidationTask`], and records remote chain height for metrics.
 pub struct ValidatorFetcher {
@@ -47,12 +57,17 @@ impl BlockFetcher for ValidatorFetcher {
             self.rpc_client.get_block(BlockId::Hash(block_hash.into()), true),
         );
         let parent_header = if self.fetch_parent_header {
-            Some(
-                self.rpc_client
-                    .get_header(BlockId::Hash(block.header.parent_hash.into()), false)
-                    .await
-                    .inner,
-            )
+            // verify_hash: a corrupt provider response is retried inside the client instead
+            // of surfacing later as a fatal per-block validation failure.
+            let header = self
+                .rpc_client
+                .get_header_with_deadline(
+                    BlockId::Hash(block.header.parent_hash.into()),
+                    true,
+                    Some(Instant::now() + PARENT_HEADER_FETCH_TIMEOUT),
+                )
+                .await?;
+            Some(header.inner)
         } else {
             None
         };

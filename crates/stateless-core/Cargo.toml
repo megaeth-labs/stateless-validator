@@ -18,30 +18,16 @@ alloy-op-evm.workspace = true
 alloy-op-hardforks = { workspace = true, default-features = false }
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
-alloy-rpc-types-engine.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-serde.workspace = true
-alloy-tx-macros.workspace = true
 
 # mega
 mega-evm = { workspace = true, default-features = false }
 salt = { workspace = true, default-features = false }
 
-# kona
-kona-driver.workspace = true
-kona-executor.workspace = true
-kona-genesis.workspace = true
-kona-megaevm.workspace = true
-kona-mpt.workspace = true
-kona-proof.workspace = true
-kona-registry.workspace = true
-mega-evm-kona.workspace = true
-salt-stateless.workspace = true
-
 # op
 op-alloy-consensus.workspace = true
 op-alloy-rpc-types.workspace = true
-op-alloy-rpc-types-engine.workspace = true
 
 # reth
 reth-ethereum-forks.workspace = true
@@ -53,7 +39,6 @@ reth-trie-sparse.workspace = true
 revm.workspace = true
 
 # misc
-bincode.workspace = true
 dyn-clone.workspace = true
 eyre = { workspace = true, optional = true }
 hashbrown.workspace = true
@@ -89,15 +74,10 @@ std = [
     "alloy-op-evm/std",
     "alloy-primitives/std",
     "alloy-rlp/std",
-    "alloy-rpc-types-engine/std",
     "alloy-rpc-types-eth/std",
     "alloy-serde/std",
-    "kona-genesis/std",
-    "kona-proof/std",
-    "kona-registry/std",
     "mega-evm/default",
     "op-alloy-consensus/std",
-    "op-alloy-rpc-types-engine/std",
     "op-alloy-rpc-types/std",
     "reth-ethereum-forks/std",
     "reth-optimism-chainspec/std",
