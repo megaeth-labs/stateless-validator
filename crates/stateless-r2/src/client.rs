@@ -101,8 +101,18 @@ pub async fn put_object(
     classify_response(response).await
 }
 
-/// Classifies an R2 (S3 API) response into [`R2Error`], treating `429` and any `5xx` as
-/// backoff-worthy throttling and every other non-success status as a plain failure.
+/// Whether a non-success HTTP status means R2 is throttling or struggling (`429` and any `5xx`)
+/// and the caller should back off before retrying, as opposed to a status that will not clear on
+/// retry.
+///
+/// The single definition of the throttle set: both the write path ([`classify_response`]) and the
+/// stateless validator's R2 witness reader classify with this predicate, so the two cannot drift.
+pub const fn is_throttle_status(status: u16) -> bool {
+    status == 429 || status >= 500
+}
+
+/// Classifies an R2 (S3 API) response into [`R2Error`], treating [`is_throttle_status`] statuses
+/// as backoff-worthy throttling and every other non-success status as a plain failure.
 async fn classify_response(response: reqwest::Response) -> Result<(), R2Error> {
     let status = response.status();
     if status.is_success() {
@@ -110,7 +120,7 @@ async fn classify_response(response: reqwest::Response) -> Result<(), R2Error> {
     }
     let code = status.as_u16();
     let body = response.text().await.unwrap_or_default();
-    if code == 429 || code >= 500 {
+    if is_throttle_status(code) {
         Err(R2Error::Throttled { status: code, body })
     } else {
         Err(R2Error::Status { status: code, body })

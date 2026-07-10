@@ -30,6 +30,10 @@ struct FetcherState<F: BlockFetcher> {
     /// Blocks awaiting retry. The RPC client retries transient errors internally, so failures
     /// bubbling up here are rare (integrity-check failures from corrupt providers). Re-enqueue
     /// without delay — a retry that rotates round-robin to a different provider will succeed.
+    /// Single-endpoint fetch sources have no rotation to lean on, so any pacing of deterministic
+    /// failures is their own responsibility (e.g. the validator's R2 witness client throttles
+    /// before surfacing them); if per-block re-enqueue backoff ever lands here, those client-side
+    /// throttles should be removed.
     failed: HashSet<u64>,
 }
 

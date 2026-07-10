@@ -17,9 +17,10 @@ use bytes::Bytes;
 use chrono::Utc;
 use reqwest::Client;
 use salt::SaltWitness;
-use stateless_common::{decode_witness_payload, witness_encoding::WitnessDecodingError};
+use stateless_common::{WitnessDecodingError, decode_witness_payload};
 use stateless_core::withdrawals::MptWitness;
 use stateless_r2::{
+    client::is_throttle_status,
     endpoint::parse_endpoint,
     keys,
     sigv4::{SigV4Signer, encode_uri_path},
@@ -29,25 +30,23 @@ use tracing::{trace, warn};
 
 /// Max retry rounds for retryable (transport/429/5xx) failures before surfacing an error.
 const MAX_RETRIES: usize = 8;
-/// First retry sleep; doubles each round up to [`MAX_BACKOFF`]. (Test builds shrink the sleeps so
-/// the retry-path tests run in milliseconds; the loop logic is identical.)
-#[cfg(not(test))]
-const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
-#[cfg(test)]
-const INITIAL_BACKOFF: Duration = Duration::from_millis(5);
+/// First retry sleep; doubles each round up to [`MAX_BACKOFF`]. Test builds shrink all three
+/// durations so the retry-path tests run in milliseconds; the loop logic is identical.
+const INITIAL_BACKOFF: Duration =
+    if cfg!(test) { Duration::from_millis(5) } else { Duration::from_millis(500) };
 /// Upper bound on any single retry sleep.
-#[cfg(not(test))]
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
-#[cfg(test)]
-const MAX_BACKOFF: Duration = Duration::from_millis(20);
+const MAX_BACKOFF: Duration =
+    if cfg!(test) { Duration::from_millis(20) } else { Duration::from_secs(30) };
 /// Throttle applied before surfacing any deterministic failure (`Missing`, `Status`, `Decode`,
-/// `DecodePanicked`), so the pipeline's immediate re-enqueue of a failed fetch does not hot-loop
-/// signed GETs (and full block re-downloads) against R2 on a wrong credential, a corrupt object,
-/// or a genuine gap.
-#[cfg(not(test))]
-const DETERMINISTIC_FAILURE_THROTTLE: Duration = Duration::from_secs(2);
-#[cfg(test)]
-const DETERMINISTIC_FAILURE_THROTTLE: Duration = Duration::from_millis(5);
+/// `DecodePanicked`): the pipeline fetcher re-enqueues a failed fetch immediately with no delay
+/// (`stateless-core/src/pipeline/fetcher.rs`), so returning instantly would hot-loop signed GETs
+/// (and full block re-downloads) against R2 on a wrong credential, a corrupt object, or a genuine
+/// gap. If the fetcher ever grows per-block re-enqueue backoff, this throttle is the piece to
+/// delete.
+const DETERMINISTIC_FAILURE_THROTTLE: Duration =
+    if cfg!(test) { Duration::from_millis(5) } else { Duration::from_secs(2) };
+/// Cap on the response body carried inside `Throttled`/`Status` errors.
+const MAX_ERROR_BODY_BYTES: usize = 1024;
 
 /// Failure outcome of an R2 witness fetch.
 #[derive(Debug, thiserror::Error)]
@@ -87,15 +86,6 @@ impl R2WitnessError {
     const fn is_retryable(&self) -> bool {
         matches!(self, Self::Transport { .. } | Self::Throttled { .. })
     }
-}
-
-/// Outcome of a single (non-retrying) GET attempt.
-enum Attempt {
-    /// 2xx with the object body. Held as [`Bytes`] (refcounted) so the multi-MB witness is never
-    /// copied between the HTTP response and the decoder.
-    Found(Bytes),
-    /// 404 — object absent.
-    Missing,
 }
 
 /// Fetches witness objects straight from an R2 bucket over the S3 API with SigV4-signed GETs.
@@ -152,10 +142,8 @@ impl R2WitnessClient {
     /// Fetches and decodes the witness for `(number, hash)` from R2.
     ///
     /// Transport/429/5xx failures are retried with backoff up to [`MAX_RETRIES`] times. Every
-    /// other failure is deterministic; it surfaces after a short
-    /// [`DETERMINISTIC_FAILURE_THROTTLE`] sleep, because the pipeline re-enqueues a failed fetch
-    /// immediately and would otherwise hot-loop signed GETs (plus full block re-downloads) against
-    /// R2 on a wrong credential, a corrupt object, or a genuine gap.
+    /// other failure is deterministic and surfaces after a short
+    /// [`DETERMINISTIC_FAILURE_THROTTLE`] sleep (see its docs for why).
     pub async fn get_witness(
         &self,
         number: u64,
@@ -183,8 +171,7 @@ impl R2WitnessClient {
         let bytes = loop {
             attempt += 1;
             match self.get_object(number, &key).await {
-                Ok(Attempt::Found(bytes)) => break bytes,
-                Ok(Attempt::Missing) => return Err(R2WitnessError::Missing { number, key }),
+                Ok(bytes) => break bytes,
                 Err(e) => {
                     if !e.is_retryable() || attempt > MAX_RETRIES {
                         return Err(e);
@@ -207,8 +194,10 @@ impl R2WitnessClient {
         }
     }
 
-    /// Performs one SigV4-signed GET and classifies the response. No retry.
-    async fn get_object(&self, number: u64, key: &str) -> Result<Attempt, R2WitnessError> {
+    /// Performs one SigV4-signed GET and classifies the response. No retry. The body comes back
+    /// as [`Bytes`] (refcounted), so the multi-MB witness is never copied between the HTTP
+    /// response and the decoder.
+    async fn get_object(&self, number: u64, key: &str) -> Result<Bytes, R2WitnessError> {
         let canonical_uri = encode_uri_path(&self.bucket, key);
         let url = format!("{}{}", self.endpoint, canonical_uri);
         // Signed-payload mode with an empty body: x-amz-content-sha256 = sha256("").
@@ -223,18 +212,27 @@ impl R2WitnessClient {
 
         let status = response.status();
         if status.is_success() {
-            let bytes = response.bytes().await.map_err(transport)?;
-            return Ok(Attempt::Found(bytes));
+            return response.bytes().await.map_err(transport);
         }
         let code = status.as_u16();
-        let body = response.text().await.unwrap_or_default();
+        let mut body = response.text().await.unwrap_or_default();
+        // Cap the body carried in the error (and re-printed by the retry `warn!`): real R2 error
+        // bodies are a few hundred bytes of XML, but a misconfigured endpoint fronted by a
+        // verbose proxy can return arbitrarily large HTML.
+        if body.len() > MAX_ERROR_BODY_BYTES {
+            let mut end = MAX_ERROR_BODY_BYTES;
+            while !body.is_char_boundary(end) {
+                end -= 1;
+            }
+            body.truncate(end);
+        }
         // A 404 usually means the object is absent (`NoSuchKey`) — but S3 also 404s a missing
         // *bucket*, which is operator misconfiguration, not a data gap; keep those apart.
         if code == 404 && !body.contains("NoSuchBucket") {
-            return Ok(Attempt::Missing);
+            return Err(R2WitnessError::Missing { number, key: key.to_string() });
         }
         let key = key.to_string();
-        if code == 429 || code >= 500 {
+        if is_throttle_status(code) {
             Err(R2WitnessError::Throttled { number, key, status: code, body })
         } else {
             Err(R2WitnessError::Status { number, key, status: code, body })
@@ -299,13 +297,10 @@ mod tests {
                 // Drain the request head before replying.
                 let mut buf = [0u8; 4096];
                 let _ = sock.read(&mut buf).await;
-                let reason = match status {
-                    200 => "OK",
-                    301 => "Moved Permanently",
-                    _ => "X",
-                };
+                // The reason phrase is never interpreted, and `location` is load-bearing only for
+                // the 3xx (redirects-not-followed) test — harmless noise on other statuses.
                 let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\nconnection: close\r\n\
+                    "HTTP/1.1 {status} X\r\nconnection: close\r\n\
                      location: http://example.invalid/elsewhere\r\n\
                      content-length: {}\r\n\r\n{body}",
                     body.len(),

@@ -41,6 +41,11 @@ const BASE_ARGS: &[&str] = &[
     "http://w",
 ];
 
+/// [`BASE_ARGS`] without `--witness-endpoint`, for tests that exercise that flag itself or its
+/// absence.
+const BASE_ARGS_NO_WITNESS: &[&str] =
+    &["stateless-validator", "--data-dir", "/tmp/x", "--rpc-endpoint", "http://rpc"];
+
 /// Verifies that an endpoint flag accepts repeated flags, CSV values, and env var —
 /// ensuring container deployments configured purely via env are not silently limited
 /// to one endpoint (clap's `value_delimiter` applies to env-var values too).
@@ -71,7 +76,7 @@ fn witness_endpoint_accepts_multiple_forms() {
     assert_endpoint_accepts_multiple_forms(
         "--witness-endpoint",
         "STATELESS_VALIDATOR_WITNESS_ENDPOINT",
-        &["stateless-validator", "--data-dir", "/tmp/x", "--rpc-endpoint", "http://rpc"],
+        BASE_ARGS_NO_WITNESS,
         |a| a.witness_endpoint,
     );
 }
@@ -167,8 +172,8 @@ fn witness_source_flag_and_env() {
 /// for `r2`), so the parse itself must accept its absence in both modes.
 #[test]
 fn witness_endpoint_is_optional_at_parse_time() {
-    let base = &["stateless-validator", "--data-dir", "/tmp/x", "--rpc-endpoint", "http://rpc"];
-    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(base.iter().chain(extra));
+    let parse =
+        |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS_NO_WITNESS.iter().chain(extra));
 
     assert!(parse(&[]).unwrap().witness_endpoint.is_empty());
     assert!(parse(&["--witness-source", "r2"]).unwrap().witness_endpoint.is_empty());
