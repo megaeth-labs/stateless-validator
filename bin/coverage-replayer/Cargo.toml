@@ -26,14 +26,17 @@ revm.workspace = true
 # stateless
 stateless-common = { path = "../../crates/stateless-common" }
 stateless-core = { path = "../../crates/stateless-core" }
+stateless-r2 = { path = "../../crates/stateless-r2" }
 
 # misc
 bincode.workspace = true
+chrono = { workspace = true, features = ["clock"] }
 clap.workspace = true
 eyre.workspace = true
 kanal.workspace = true
 num_cpus.workspace = true
 redb.workspace = true
+reqwest = { workspace = true, features = ["rustls-tls"] }
 rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true

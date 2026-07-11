@@ -16,3 +16,5 @@ tmp
 # coverage-replayer run data (transferred out-of-band, never via git)
 /data/
 *.profraw
+*.pid
+*.log

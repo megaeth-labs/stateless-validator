@@ -40,6 +40,16 @@ use crate::{
 /// Linear-probe step for pattern-key collisions (golden ratio).
 const PROBE_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 
+/// Witness source selector (mirrors the validator's `--witness-source`).
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WitnessSource {
+    /// `mega_getBlockWitness` RPC.
+    #[default]
+    Rpc,
+    /// Straight from the R2 bucket over the S3 API. Requires the `--r2-*` flags.
+    R2,
+}
+
 #[derive(Args, Debug, Clone)]
 pub struct BackfillArgs {
     /// First block of the range (inclusive).
@@ -56,14 +66,33 @@ pub struct BackfillArgs {
         required = true
     )]
     pub rpc_endpoints: Vec<String>,
-    /// Witness RPC endpoint(s) (`mega_getBlockWitness`).
+    /// Witness RPC endpoint(s) (`mega_getBlockWitness`). Required with
+    /// `--witness-source rpc` (the default); ignored with `r2`.
     #[clap(
         long = "witness-endpoint",
         env = "COVERAGE_REPLAYER_WITNESS_ENDPOINT",
-        value_delimiter = ',',
-        required = true
+        value_delimiter = ','
     )]
     pub witness_endpoints: Vec<String>,
+    /// Where to source witnesses from: `rpc` (default) or `r2` (straight from
+    /// the R2 bucket over the S3 API; requires the `--r2-*` flags).
+    #[clap(long, env = "COVERAGE_REPLAYER_WITNESS_SOURCE", value_enum, default_value_t = WitnessSource::Rpc)]
+    pub witness_source: WitnessSource,
+    /// R2 S3 endpoint origin, e.g. `https://<account>.r2.cloudflarestorage.com`
+    /// (no bucket path). Required when `--witness-source r2`.
+    #[clap(long, env = "COVERAGE_REPLAYER_R2_ENDPOINT")]
+    pub r2_endpoint: Option<String>,
+    /// R2 bucket holding the witnesses (e.g. `witness-mainnet`). Required when
+    /// `--witness-source r2`.
+    #[clap(long, env = "COVERAGE_REPLAYER_R2_BUCKET")]
+    pub r2_bucket: Option<String>,
+    /// R2 access key id (Object Read). Required when `--witness-source r2`.
+    #[clap(long, env = "COVERAGE_REPLAYER_R2_ACCESS_KEY_ID")]
+    pub r2_access_key_id: Option<String>,
+    /// R2 secret access key. Required when `--witness-source r2`. Prefer the
+    /// env var over the flag.
+    #[clap(long, env = "COVERAGE_REPLAYER_R2_SECRET_ACCESS_KEY")]
+    pub r2_secret_access_key: Option<String>,
     /// Genesis JSON path (e.g. test_data/mainnet/genesis.json).
     #[clap(long, env = "COVERAGE_REPLAYER_GENESIS_FILE")]
     pub genesis_file: String,
@@ -104,9 +133,38 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     let llvm_profdata = llvm::find_tool("llvm-profdata", args.llvm_profdata.as_deref())?;
     info!(llvm_profdata = %llvm_profdata.display(), "llvm tools resolved");
 
-    let endpoint_refs = |v: &[String]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    let data_apis = endpoint_refs(&args.rpc_endpoints);
-    let witness_apis = endpoint_refs(&args.witness_endpoints);
+    // R2 witness source: witnesses come from the bucket, so the RPC witness
+    // endpoints are unused — feed the data endpoints in as placeholders (the
+    // RpcClient requires a non-empty list).
+    let r2 = match args.witness_source {
+        WitnessSource::Rpc => {
+            ensure!(
+                !args.witness_endpoints.is_empty(),
+                "--witness-endpoint is required with --witness-source rpc"
+            );
+            None
+        }
+        WitnessSource::R2 => {
+            let require = |v: &Option<String>, flag: &str| {
+                v.clone().filter(|s| !s.is_empty()).ok_or_else(|| {
+                    eyre::eyre!("{flag} is required (and non-empty) with --witness-source r2")
+                })
+            };
+            let client = crate::r2::R2LightClient::new(
+                &require(&args.r2_endpoint, "--r2-endpoint")?,
+                require(&args.r2_bucket, "--r2-bucket")?,
+                require(&args.r2_access_key_id, "--r2-access-key-id")?,
+                require(&args.r2_secret_access_key, "--r2-secret-access-key")?,
+                Duration::from_secs(60),
+            )?;
+            info!("witness source: R2 (light decode)");
+            Some(Arc::new(client))
+        }
+    };
+
+    let data_apis: Vec<String> = args.rpc_endpoints.clone();
+    let witness_apis: Vec<String> =
+        if r2.is_some() { data_apis.clone() } else { args.witness_endpoints.clone() };
     let client = Arc::new(RpcClient::new(
         &data_apis.iter().map(String::as_str).collect::<Vec<_>>(),
         &witness_apis.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -161,6 +219,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     let fetcher = {
         let dirs = dirs.clone();
         let client = client.clone();
+        let r2 = r2.clone();
         let dispatch_tx = dispatch_tx.clone();
         let fetch_concurrency = args.fetch_concurrency.max(1);
         tokio::spawn(async move {
@@ -173,13 +232,14 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
                 }
                 let dirs = dirs.clone();
                 let client = client.clone();
+                let r2 = r2.clone();
                 // Retry until success — a block is never skipped. Transient
                 // RPC/IO failures resolve on retry; a persistent failure loops
                 // visibly in the log until the operator intervenes.
                 inflight.spawn(async move {
                     let mut attempt = 0u64;
                     loop {
-                        match fetch_block(&client, &dirs, n).await {
+                        match fetch_block(&client, r2.as_deref(), &dirs, n).await {
                             Ok(()) => break n,
                             Err(e) => {
                                 attempt += 1;
@@ -235,7 +295,12 @@ async fn forward_fetched(
 
 /// Fetches one block + witness, resolves missing bytecodes, writes the spool
 /// entry. Skips work that already exists on disk (crash resume).
-async fn fetch_block(client: &RpcClient, dirs: &DataDir, n: u64) -> Result<()> {
+async fn fetch_block(
+    client: &RpcClient,
+    r2: Option<&crate::r2::R2LightClient>,
+    dirs: &DataDir,
+    n: u64,
+) -> Result<()> {
     let spool_path = dirs.spool_entry(n);
     if spool_path.exists() {
         return Ok(());
@@ -243,11 +308,14 @@ async fn fetch_block(client: &RpcClient, dirs: &DataDir, n: u64) -> Result<()> {
 
     let block = client.get_block(BlockId::number(n), true).await;
     let hash = block.header.hash;
-    // Zero-validation light fetch: no elliptic-curve work is spent on the
-    // proof we never verify. Full witnesses are NOT stored anywhere — when a
-    // selected block needs one (PR payload assembly), it is re-fetched from
-    // the RPC, which serves witnesses for the full history (E4).
-    let (light_witness, _mpt_witness) = client.get_witness_light(n, hash).await;
+    // Zero-validation light fetch (from R2 or the witness RPC): no
+    // elliptic-curve work is spent on the proof we never verify. Full
+    // witnesses are NOT stored anywhere — when a selected block needs one, it
+    // is re-fetched on demand (both sources serve the full history).
+    let (light_witness, _mpt_witness) = match r2 {
+        Some(r2) => r2.get_witness_light(n, hash).await?,
+        None => client.get_witness_light(n, hash).await,
+    };
 
     let code_hashes = crate::spool::code_hashes_of(&light_witness);
     let missing: Vec<B256> =

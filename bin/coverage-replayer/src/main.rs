@@ -12,6 +12,7 @@ mod llvm;
 mod merge;
 mod profile_rt;
 mod proto;
+mod r2;
 mod report;
 mod setcover;
 mod spool;
