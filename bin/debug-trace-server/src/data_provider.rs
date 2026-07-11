@@ -33,8 +33,7 @@ use dashmap::DashMap;
 use futures::{FutureExt, future::Shared};
 use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
-use salt::SaltWitness;
-use stateless_common::{CodeFetchError, RpcClient, RpcDeadlineExceeded, estimate_witness_size};
+use stateless_common::{CodeFetchError, RpcClient, RpcDeadlineExceeded, WitnessSizeBreakdown};
 use stateless_core::{
     ContractStore, LightWitness, StoreResult, db::StoreError, withdrawals::MptWitness,
 };
@@ -592,7 +591,7 @@ fn shared_to_result(
 /// 2. Fetch witness and full block in parallel, each subject to the shared `deadline`. The witness
 ///    stage also gets a sub-deadline: `min(deadline, now + witness_timeout)`, tightened further for
 ///    old blocks (see `witness_deadline_for`).
-/// 3. Convert SaltWitness to LightWitness.
+/// 3. The witness arrives as a `LightWitness` already (zero-validation light decode).
 /// 4. Extract code hashes from witness and fetch contract bytecodes (shares `deadline`).
 async fn do_fetch_block_data(
     rpc_client: Arc<RpcClient>,
@@ -637,14 +636,10 @@ async fn do_fetch_block_data(
     let (block_result, block_elapsed) = block_timed;
 
     let fetch_witness_ms = witness_elapsed.as_millis();
-    let (salt_witness, _mpt_witness) = witness_result?;
+    // Step 3: the light decode already produced a LightWitness — no conversion.
+    let (witness, _mpt_witness) = witness_result?;
     let block = block_result?;
     let fetch_full_block_ms = block_elapsed.as_millis();
-
-    // Step 3: Convert SaltWitness to LightWitness.
-    let start = Instant::now();
-    let witness = LightWitness::from(&salt_witness);
-    let convert_witness_ms = start.elapsed().as_millis();
 
     // Step 4: Extract code hashes and fetch contracts.
     let start = Instant::now();
@@ -658,7 +653,6 @@ async fn do_fetch_block_data(
 
     if fetch_header_ms >= SLOW_STAGE_THRESHOLD_MS ||
         fetch_witness_ms >= SLOW_STAGE_THRESHOLD_MS ||
-        convert_witness_ms >= SLOW_STAGE_THRESHOLD_MS ||
         fetch_full_block_ms >= SLOW_STAGE_THRESHOLD_MS ||
         fetch_contracts_ms >= SLOW_STAGE_THRESHOLD_MS
     {
@@ -669,7 +663,6 @@ async fn do_fetch_block_data(
             num_contracts,
             fetch_header_ms = fetch_header_ms as u64,
             fetch_witness_ms = fetch_witness_ms as u64,
-            convert_witness_ms = convert_witness_ms as u64,
             fetch_full_block_ms = fetch_full_block_ms as u64,
             fetch_contracts_ms = fetch_contracts_ms as u64,
             total_ms = total_ms as u64,
@@ -718,19 +711,25 @@ fn witness_deadline_for(
 
 /// Fetches witness data via the deadline-aware `RpcClient` API. The `deadline` is the
 /// witness stage's effective deadline (see [`witness_deadline_for`]).
+///
+/// Uses the zero-validation light decode: the trace server never verifies the
+/// witness proof, so the full decode's per-point elliptic-curve work (~100ms
+/// wall / ~1 core·s on large witnesses) bought nothing. The recorded size is
+/// the light lower bound (excludes the never-decoded parent commitments).
 async fn fetch_witness(
     rpc_client: &RpcClient,
     block_number: u64,
     block_hash: B256,
     deadline: Instant,
-) -> DataProviderResult<(SaltWitness, MptWitness)> {
+) -> DataProviderResult<(LightWitness, MptWitness)> {
     let wg_metrics = WitnessSourceMetrics::new_for_source("witness_generator");
     let start = Instant::now();
 
-    match rpc_client.get_witness_with_deadline(block_number, block_hash, Some(deadline)).await {
+    match rpc_client.get_witness_light_with_deadline(block_number, block_hash, Some(deadline)).await
+    {
         Ok(w) => {
             wg_metrics.record_request(true, start.elapsed().as_secs_f64());
-            wg_metrics.record_size(estimate_witness_size(&w.0, &w.1));
+            wg_metrics.record_size(WitnessSizeBreakdown::new_light(&w.0, &w.1).total());
             DataSourceMetrics::new_for_source("witness_generator").record();
             Ok(w)
         }

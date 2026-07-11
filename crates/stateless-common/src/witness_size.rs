@@ -5,7 +5,7 @@
 //! (`on_witness_fetch`) and the trace server's data provider.
 
 use salt::SaltWitness;
-use stateless_core::withdrawals::MptWitness;
+use stateless_core::{LightWitness, withdrawals::MptWitness};
 
 /// Per-entry size of a SALT key-value pair: `SaltKey` (8 bytes) plus
 /// `Option<SaltValue>` (~95 bytes).
@@ -47,6 +47,21 @@ impl WitnessSizeBreakdown {
         let proof_size = salt.proof.parents_commitments.len() * SALT_COMMITMENT_BYTES +
             SALT_IPA_PROOF_BYTES +
             salt.proof.levels.len() * SALT_LEVEL_BYTES;
+        let salt_size = salt_kvs_size + proof_size;
+        let mpt_size = MPT_STORAGE_ROOT_BYTES + mpt.state.iter().map(|b| b.len()).sum::<usize>();
+        Self { salt_size, kvs_count, salt_kvs_size, mpt_size }
+    }
+
+    /// Computes the breakdown for a light-decoded witness.
+    ///
+    /// A [`LightWitness`] never materializes the parent commitments, so their
+    /// contribution is unknowable here and `salt_size` is a lower bound
+    /// (KVs + levels + the fixed IPA overhead). Use only for observability on
+    /// light-decode paths; full-decode paths should keep [`Self::new`].
+    pub fn new_light(light: &LightWitness, mpt: &MptWitness) -> Self {
+        let kvs_count = light.kvs.len();
+        let salt_kvs_size = kvs_count * SALT_KV_BYTES;
+        let proof_size = SALT_IPA_PROOF_BYTES + light.levels.len() * SALT_LEVEL_BYTES;
         let salt_size = salt_kvs_size + proof_size;
         let mpt_size = MPT_STORAGE_ROOT_BYTES + mpt.state.iter().map(|b| b.len()).sum::<usize>();
         Self { salt_size, kvs_count, salt_kvs_size, mpt_size }
