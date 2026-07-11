@@ -30,9 +30,8 @@ use crate::{metrics, r2_witness::R2WitnessClient};
 /// Fetcher for the validator: fetches blocks + witnesses, wraps in [`ValidationTask`], and records
 /// remote chain height for metrics.
 ///
-/// Blocks, headers, and contract code always come from the data RPC ([`Self::rpc_client`]). The
-/// witness comes from the configured source: the `mega_getBlockWitness` RPC (default), or
-/// straight from R2 via [`R2WitnessClient`].
+/// Blocks, headers, and contract code always come from the data RPC; the witness comes from
+/// `mega_getBlockWitness` (default) or straight from R2 ([`R2WitnessClient`]).
 pub struct ValidatorFetcher {
     pub rpc_client: Arc<RpcClient>,
     /// `Some` ⇒ fetch witnesses directly from R2; `None` ⇒ RPC.
@@ -48,9 +47,9 @@ impl BlockFetcher for ValidatorFetcher {
         // Fetch by hash (not number) so a reorg between the hash lookup and the block fetch
         // surfaces as a hash mismatch rather than silently swapping the block under us.
         let block_fut = self.rpc_client.get_block(BlockId::Hash(block_hash.into()), true);
-        // The RPC witness path retries internally until it succeeds, but an R2 fetch is fallible:
-        // a 404 (`Missing`) or a decode failure propagates as a fetch error (the pipeline
-        // re-enqueues, so the stuck block with its loud MISSING/decode error is unmistakable).
+        // The RPC witness path retries internally until it succeeds; an R2 fetch is fallible —
+        // a 404 (`Missing`) or decode failure surfaces as a fetch error and the pipeline
+        // re-enqueues.
         let witness_fut = async {
             match &self.r2_witness {
                 Some(r2) => Ok::<_, eyre::Report>(r2.get_witness(block_number, block_hash).await?),

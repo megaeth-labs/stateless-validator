@@ -38,9 +38,8 @@ const URI_SEGMENT: &AsciiSet =
 pub type Header = (String, String);
 
 /// Region placed in the credential scope. R2 ignores the value but requires a non-empty scope;
-/// Cloudflare's documented convention is the literal string `"auto"`. Unlike the endpoint, bucket,
-/// and credentials, this never varies by deployment, so it is hardcoded rather than exposed as a
-/// CLI/env option.
+/// Cloudflare's documented convention is the literal string `"auto"`. Never varies by deployment,
+/// so hardcoded.
 const REGION: &str = "auto";
 
 /// Holds the long-lived credentials and scope used to sign R2 requests.
@@ -48,9 +47,9 @@ const REGION: &str = "auto";
 pub struct SigV4Signer {
     access_key_id: String,
     secret_access_key: String,
-    /// Region placed in the credential scope. Always [`REGION`].
+    /// Always [`REGION`].
     region: String,
-    /// AWS service name in the credential scope. Always `"s3"` for R2.
+    /// Always `"s3"` for R2.
     service: String,
 }
 
@@ -139,10 +138,9 @@ impl SigV4Signer {
             self.access_key_id
         );
 
-        // Return the headers the caller must send: exactly the set that was signed, minus `host`
-        // (the HTTP client sets that from the URL), plus the computed authorization. Reusing the
-        // signed `headers` here — instead of rebuilding the list — both avoids re-cloning the meta
-        // headers and makes it impossible for the sent set to disagree with the signed set.
+        // Return exactly the signed set minus `host` (the HTTP client sets it from the URL) plus
+        // the computed authorization — reusing the signed list makes sent == signed by
+        // construction.
         let mut out: Vec<Header> = headers.into_iter().filter(|(name, _)| name != "host").collect();
         out.push(("authorization".to_string(), authorization));
         out
@@ -238,7 +236,6 @@ mod tests {
             now,
         );
 
-        // The signed payload hash is hex(sha256("payload")).
         let content_sha = headers
             .iter()
             .find(|(k, _)| k == "x-amz-content-sha256")

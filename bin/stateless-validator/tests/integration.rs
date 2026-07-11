@@ -3,7 +3,10 @@
 //! Covers CLI argument parsing and end-to-end pipeline validation against a mock RPC server.
 //! Mainnet single-block validation is covered in `crates/stateless-core/src/executor.rs::tests`.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use alloy_primitives::{B256, BlockHash};
 use alloy_rpc_types_eth::Block;
@@ -15,7 +18,7 @@ use jsonrpsee::{
 use jsonrpsee_types::error::{
     CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
 };
-use stateless_common::{RpcClient, WitnessRequestKeys, encode_witness_response};
+use stateless_common::{RpcClient, RpcClientConfig, WitnessRequestKeys, encode_witness_response};
 use stateless_core::{
     BisectResolver, ChainStore, ContractStore, PipelineConfig, db::BlockMeta,
     pipeline::run_pipeline, withdrawals::MptWitness,
@@ -24,7 +27,7 @@ use stateless_db::ContractCache;
 use stateless_test_utils::{fixtures::TestFixtures, logging::init_test_logging};
 use stateless_validator::{
     CommandLineArgs, VALIDATOR_DB_FILENAME, ValidatorDB, ValidatorFetcher, ValidatorHooks,
-    ValidatorProcessor, load_or_create_chain_spec,
+    ValidatorProcessor, load_or_create_chain_spec, run_with_signals,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -210,6 +213,10 @@ const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
 struct MockServerState {
     fixtures: TestFixtures,
     mpt_witnesses: HashMap<BlockHash, MptWitness>,
+    /// Every *accepted* `mega_setValidatedBlocks` call, as `(first_block, last_block)` numbers.
+    validated_reports: Arc<Mutex<Vec<(u64, u64)>>>,
+    /// Number of upcoming `mega_setValidatedBlocks` calls to reject with an RPC error.
+    reject_reports: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MockServerState {
@@ -219,7 +226,12 @@ impl MockServerState {
             .keys()
             .map(|hash| (*hash, fixtures.mpt_witness(hash)))
             .collect();
-        Self { fixtures, mpt_witnesses }
+        Self {
+            fixtures,
+            mpt_witnesses,
+            validated_reports: Arc::default(),
+            reject_reports: Arc::default(),
+        }
     }
 }
 
@@ -393,9 +405,20 @@ async fn setup_mock_rpc_server(
         .unwrap();
 
     module
-        .register_method("mega_setValidatedBlocks", |params, _ctx, _| {
-            let (_first_block, last_block): ((u64, String), (u64, String)) =
-                params.parse().unwrap();
+        .register_method("mega_setValidatedBlocks", |params, ctx, _| {
+            use std::sync::atomic::Ordering;
+            let (first_block, last_block): ((u64, String), (u64, String)) = params.parse().unwrap();
+            if ctx
+                .reject_reports
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(make_rpc_error(
+                    CALL_EXECUTION_FAILED_CODE,
+                    "transient report failure (scripted)".to_string(),
+                ));
+            }
+            ctx.validated_reports.lock().unwrap().push((first_block.0, last_block.0));
             let last_hash: BlockHash = last_block.1.parse().unwrap();
             Ok::<serde_json::Value, ErrorObjectOwned>(serde_json::json!({
                 "accepted": true,
@@ -468,4 +491,79 @@ async fn integration_test() {
 
     handle.stop().unwrap();
     info!("Mock RPC server has been shut down");
+}
+
+/// Runs `run_with_signals` to the fixtures' max block (`--end-block` → `sync_target`) with
+/// reports wired to the mock, failing the first `reject_first_reports` calls; asserts the last
+/// accepted report covers the end block and returns all accepted reports.
+async fn run_end_block_slice_and_assert_tip_reported(
+    reject_first_reports: usize,
+) -> Vec<(u64, u64)> {
+    let _logging = init_test_logging("stateless_validator");
+    let fx = TestFixtures::synthetic();
+    let genesis_file = fx.data_dir.join("genesis.json");
+
+    let max_block_number = fx.max_block().0;
+    let (validator_db, _tmp) = setup_test_db(&fx).unwrap();
+    let contract_cache =
+        Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
+    let state = MockServerState::new(fx);
+    let reports = Arc::clone(&state.validated_reports);
+    state.reject_reports.store(reject_first_reports, std::sync::atomic::Ordering::SeqCst);
+    let (handle, url) = setup_mock_rpc_server(state).await;
+    let client = Arc::new(
+        RpcClient::new_with_config(
+            &[url.as_str()],
+            &[url.as_str()],
+            RpcClientConfig::validator(),
+            Some(url.as_str()),
+        )
+        .unwrap(),
+    );
+    let chain_spec = Arc::new(
+        load_or_create_chain_spec(&validator_db, Some(genesis_file.to_str().unwrap())).unwrap(),
+    );
+
+    let mut cfg = PipelineConfig::default();
+    cfg.concurrent_workers = 1;
+    cfg.sync_target = Some(max_block_number);
+
+    run_with_signals(
+        client,
+        None,
+        Arc::clone(&validator_db),
+        contract_cache,
+        chain_spec,
+        Some(url.clone()),
+        cfg,
+    )
+    .await
+    .unwrap();
+
+    handle.stop().unwrap();
+
+    let reports = reports.lock().unwrap();
+    let &(_, last_reported) =
+        reports.last().expect("the run must report validated blocks before exiting");
+    assert_eq!(
+        last_reported, max_block_number,
+        "the final report must cover the end block (got reports: {reports:?})",
+    );
+    reports.clone()
+}
+
+/// A fixed-range run must flush its final validated tip before exiting: the periodic reporter
+/// is cancelled when the pipeline completes (its 1s tick rarely fires on a short slice) and a
+/// slice run has no restart to re-report, so the final flush in `run_with_signals` is the only
+/// path.
+#[tokio::test]
+async fn end_block_run_reports_final_tip() {
+    run_end_block_slice_and_assert_tip_reported(0).await;
+}
+
+/// Like [`end_block_run_reports_final_tip`], but the mock rejects the first report call: the
+/// final flush's bounded retry must still land the tip.
+#[tokio::test]
+async fn end_block_final_report_retries_after_transient_failure() {
+    run_end_block_slice_and_assert_tip_reported(1).await;
 }

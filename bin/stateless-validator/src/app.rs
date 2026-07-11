@@ -25,8 +25,8 @@ pub enum WitnessSource {
     R2,
 }
 
-/// A CLI/env secret that redacts itself in `Debug` output — [`CommandLineArgs`] derives `Debug`,
-/// and a secret must never ride along if the args are ever logged.
+/// A CLI/env secret that renders as `[redacted]` in `Debug` output, so it cannot leak when
+/// [`CommandLineArgs`] (which derives `Debug`) is logged.
 #[derive(Clone)]
 pub struct RedactedSecret(String);
 
@@ -114,8 +114,7 @@ pub struct CommandLineArgs {
     )]
     pub witness_endpoint: Vec<String>,
 
-    /// Where to source witnesses from: `rpc` (default) or `r2`. `r2` fetches each witness straight
-    /// from the R2 bucket over the S3 API; it requires the `--r2-*` flags below.
+    /// Where to source witnesses from: `rpc` (default) or `r2` (requires the `--r2-*` flags).
     #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_SOURCE", value_enum, default_value_t = WitnessSource::Rpc)]
     pub witness_source: WitnessSource,
 
@@ -140,8 +139,7 @@ pub struct CommandLineArgs {
 
     /// Optional inclusive end block: validate up to this height, then stop cleanly. Used to slice
     /// a fixed block range across multiple servers. Omit to follow the chain tip indefinitely.
-    /// Note: the fetcher stays `--tip-buffer` blocks behind the remote tip, so the run only
-    /// completes once the chain has advanced to `end_block + tip_buffer`.
+    /// Note: the run only completes once the chain reaches `end_block + tip_buffer`.
     #[clap(long, env = "STATELESS_VALIDATOR_END_BLOCK")]
     pub end_block: Option<u64>,
 
@@ -160,7 +158,7 @@ pub struct CommandLineArgs {
     pub report_validation_endpoint: Option<String>,
 
     /// Enable Prometheus metrics endpoint.
-    /// When enabled, metrics are exposed at http://0.0.0.0:<metrics-port>/metrics
+    /// When enabled, metrics are exposed at `http://0.0.0.0:<metrics-port>/metrics`.
     #[clap(long, env = "STATELESS_VALIDATOR_METRICS_ENABLED")]
     pub metrics_enabled: bool,
 
@@ -173,8 +171,8 @@ pub struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_DATA_MAX_CONCURRENT_REQUESTS")]
     pub data_max_concurrent_requests: Option<usize>,
 
-    /// Maximum concurrent in-flight witness fetches, independent of the data cap.
-    /// Omit for unlimited.
+    /// Maximum concurrent in-flight witness fetches, independent of the data cap. Omit for
+    /// unlimited. Applies to both RPC witness calls and, with `--witness-source r2`, R2 GETs.
     #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_MAX_CONCURRENT_REQUESTS")]
     pub witness_max_concurrent_requests: Option<usize>,
 
@@ -275,9 +273,8 @@ pub async fn run() -> Result<()> {
         ..rpc_defaults
     }
     .with_metrics(Arc::new(metrics::ValidatorMetrics));
-    // Resolve the witness source. In R2 mode the witness comes straight from the bucket, so the
-    // RpcClient's witness providers are never touched — but its constructor still requires a
-    // non-empty witness-endpoint list, so we hand it the data endpoints as an unused placeholder.
+    // In R2 mode the RpcClient's witness providers are never used, but its constructor requires
+    // a non-empty list — hand it the data endpoints as a placeholder.
     let data_apis: Vec<&str> = args.rpc_endpoint.iter().map(String::as_str).collect();
     let r2_witness = match args.witness_source {
         WitnessSource::Rpc => {
@@ -307,6 +304,7 @@ pub async fn run() -> Result<()> {
                 access_key_id.to_string(),
                 secret_access_key.to_string(),
                 per_attempt_timeout,
+                args.witness_max_concurrent_requests,
             )?))
         }
     };
@@ -379,8 +377,6 @@ pub async fn run() -> Result<()> {
     pipeline_config.error_restart_delay =
         override_ms(args.error_restart_delay_ms, pipeline_config.error_restart_delay);
     pipeline_config.tip_buffer = args.tip_buffer.unwrap_or(DEFAULT_TIP_BUFFER);
-    // Optional inclusive end block: the fetcher stops after this height. Slices a fixed range
-    // across servers (each server validates [start_block, end_block]).
     pipeline_config.sync_target = args.end_block;
     if let Some(end) = args.end_block {
         info!(end_block = end, "Validating up to end block, then stopping");
