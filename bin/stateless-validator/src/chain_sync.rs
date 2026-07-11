@@ -30,9 +30,9 @@ use crate::{metrics, r2_witness::R2WitnessClient};
 /// Fetcher for the validator: fetches blocks + witnesses, wraps in [`ValidationTask`], and records
 /// remote chain height for metrics.
 ///
-/// Blocks, headers, and contract code always come from the data RPC ([`rpc_client`]). The witness
-/// comes from the configured source: the `mega_getBlockWitness` RPC (default), or straight from
-/// R2 via [`R2WitnessClient`].
+/// Blocks, headers, and contract code always come from the data RPC ([`Self::rpc_client`]). The
+/// witness comes from the configured source: the `mega_getBlockWitness` RPC (default), or
+/// straight from R2 via [`R2WitnessClient`].
 pub struct ValidatorFetcher {
     pub rpc_client: Arc<RpcClient>,
     /// `Some` ⇒ fetch witnesses directly from R2; `None` ⇒ RPC.

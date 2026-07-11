@@ -10,14 +10,14 @@
 //! uploader's `encode_witness_payload`), which [`stateless_common::decode_witness_payload`]
 //! inverts exactly.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alloy_primitives::B256;
 use bytes::Bytes;
 use chrono::Utc;
 use reqwest::Client;
 use salt::SaltWitness;
-use stateless_common::{WitnessDecodingError, decode_witness_payload};
+use stateless_common::{WitnessDecodingError, WitnessSizeBreakdown, decode_witness_payload};
 use stateless_core::withdrawals::MptWitness;
 use stateless_r2::{
     client::is_throttle_status,
@@ -27,6 +27,8 @@ use stateless_r2::{
 };
 use tokio::task::JoinError;
 use tracing::{trace, warn};
+
+use crate::metrics;
 
 /// Max retry rounds for retryable (transport/429/5xx) failures before surfacing an error.
 const MAX_RETRIES: usize = 8;
@@ -81,6 +83,24 @@ pub enum R2WitnessError {
 }
 
 impl R2WitnessError {
+    /// Every label [`Self::kind`] can produce, for metrics pre-registration
+    /// (`crate::metrics::init_metrics` zero-inits the error counter per kind).
+    pub const KINDS: &'static [&'static str] =
+        &["missing", "transport", "throttled", "status", "decode", "decode_panicked"];
+
+    /// Stable lowercase label for this variant — the `kind` label on the R2 witness error
+    /// counter. Every value returned here must appear in [`Self::KINDS`].
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Missing { .. } => "missing",
+            Self::Transport { .. } => "transport",
+            Self::Throttled { .. } => "throttled",
+            Self::Status { .. } => "status",
+            Self::Decode { .. } => "decode",
+            Self::DecodePanicked { .. } => "decode_panicked",
+        }
+    }
+
     /// Whether an immediate retry against the same endpoint could plausibly succeed (transport
     /// blips, 429, 5xx). Every other variant is deterministic and is surfaced without retrying.
     const fn is_retryable(&self) -> bool {
@@ -141,19 +161,20 @@ impl R2WitnessClient {
 
     /// Fetches and decodes the witness for `(number, hash)` from R2.
     ///
-    /// Transport/429/5xx failures are retried with backoff up to [`MAX_RETRIES`] times. Every
+    /// Transport/429/5xx failures are retried with backoff up to `MAX_RETRIES` times. Every
     /// other failure is deterministic and surfaces after a short
-    /// [`DETERMINISTIC_FAILURE_THROTTLE`] sleep (see its docs for why).
+    /// `DETERMINISTIC_FAILURE_THROTTLE` sleep (see its docs for why).
     pub async fn get_witness(
         &self,
         number: u64,
         hash: B256,
     ) -> Result<(SaltWitness, MptWitness), R2WitnessError> {
         let result = self.get_witness_inner(number, hash).await;
-        if let Err(e) = &result &&
-            !e.is_retryable()
-        {
-            tokio::time::sleep(DETERMINISTIC_FAILURE_THROTTLE).await;
+        if let Err(e) = &result {
+            metrics::on_r2_witness_error(e.kind());
+            if !e.is_retryable() {
+                tokio::time::sleep(DETERMINISTIC_FAILURE_THROTTLE).await;
+            }
         }
         result
     }
@@ -164,6 +185,7 @@ impl R2WitnessClient {
         number: u64,
         hash: B256,
     ) -> Result<(SaltWitness, MptWitness), R2WitnessError> {
+        let started = Instant::now();
         let key = keys::block_object_key(number, hash);
         let mut backoff = INITIAL_BACKOFF;
         let mut attempt = 0usize;
@@ -176,6 +198,7 @@ impl R2WitnessClient {
                     if !e.is_retryable() || attempt > MAX_RETRIES {
                         return Err(e);
                     }
+                    metrics::on_r2_witness_retry();
                     warn!(number, %key, attempt, error = %e, "R2 witness GET failed, backing off");
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(MAX_BACKOFF);
@@ -187,6 +210,10 @@ impl R2WitnessClient {
         match tokio::task::spawn_blocking(move || decode_witness_payload(&bytes)).await {
             Ok(Ok(witness)) => {
                 trace!(number, "R2 witness fetched and decoded");
+                metrics::on_r2_witness_fetch_success(
+                    started.elapsed().as_secs_f64(),
+                    WitnessSizeBreakdown::new(&witness.0, &witness.1),
+                );
                 Ok(witness)
             }
             Ok(Err(source)) => Err(R2WitnessError::Decode { number, key, source }),
@@ -283,8 +310,11 @@ mod tests {
     }
 
     /// Serves one scripted HTTP/1.1 response per connection on a local port and counts requests.
-    /// The last response repeats if more connections arrive than were scripted.
-    async fn mock_r2(responses: Vec<(u16, &'static str)>) -> (String, Arc<AtomicUsize>) {
+    /// The last response repeats if more connections arrive than were scripted. Bodies are
+    /// anything `Into<Vec<u8>>` so failure tests pass `&str` and the happy-path test raw bytes.
+    async fn mock_r2(responses: Vec<(u16, impl Into<Vec<u8>>)>) -> (String, Arc<AtomicUsize>) {
+        let responses: Vec<(u16, Vec<u8>)> =
+            responses.into_iter().map(|(status, body)| (status, body.into())).collect();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let hits = Arc::new(AtomicUsize::new(0));
@@ -293,19 +323,20 @@ mod tests {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else { return };
                 let n = counter.fetch_add(1, Ordering::SeqCst);
-                let (status, body) = responses[n.min(responses.len() - 1)];
+                let (status, body) = &responses[n.min(responses.len() - 1)];
                 // Drain the request head before replying.
                 let mut buf = [0u8; 4096];
                 let _ = sock.read(&mut buf).await;
                 // The reason phrase is never interpreted, and `location` is load-bearing only for
                 // the 3xx (redirects-not-followed) test — harmless noise on other statuses.
-                let response = format!(
+                let head = format!(
                     "HTTP/1.1 {status} X\r\nconnection: close\r\n\
                      location: http://example.invalid/elsewhere\r\n\
-                     content-length: {}\r\n\r\n{body}",
+                     content-length: {}\r\n\r\n",
                     body.len(),
                 );
-                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(body).await;
             }
         });
         (endpoint, hits)
@@ -363,6 +394,30 @@ mod tests {
         let err = fetch(&endpoint).await.unwrap_err();
         assert!(matches!(err, R2WitnessError::Throttled { status: 503, .. }), "{err}");
         assert_eq!(hits.load(Ordering::SeqCst), MAX_RETRIES + 1, "initial attempt + MAX_RETRIES");
+    }
+
+    /// End-to-end happy path: a real fixture witness encoded exactly as the uploader writes it
+    /// (`encode_witness_payload`) and served with a 200 must decode back to the original tuple in
+    /// a single GET. This is the only test that exercises the success path of
+    /// `get_object` → `spawn_blocking` decode; the failure tests can't prove it.
+    #[tokio::test]
+    async fn valid_object_decodes_end_to_end() {
+        use stateless_test_utils::fixtures::TestFixtures;
+
+        let fixtures = TestFixtures::mainnet_shared();
+        let (_, hash) =
+            fixtures.paired_blocks().into_iter().next().expect("mainnet fixtures have a witness");
+        let salt_witness = fixtures.salt_witnesses[&hash].clone();
+        let mpt_witness: MptWitness = fixtures.mpt_witness(&hash);
+        let (_, payload) = stateless_common::encode_witness_payload(&salt_witness, &mpt_witness)
+            .expect("fixture witness must encode");
+
+        let (endpoint, hits) = mock_r2(vec![(200, payload)]).await;
+        let (decoded_salt, decoded_mpt) =
+            fetch(&endpoint).await.expect("valid object must fetch and decode");
+        assert_eq!(decoded_salt, salt_witness);
+        assert_eq!(decoded_mpt, mpt_witness);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "a successful fetch must take exactly one GET");
     }
 
     #[tokio::test]

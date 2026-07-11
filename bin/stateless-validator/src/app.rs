@@ -10,7 +10,7 @@ use eyre::Result;
 use stateless_common::{BackoffPolicy, RpcClient, RpcClientConfig, logging::LogArgs};
 use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::BlockMeta};
 use stateless_db::ContractCache;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{metrics, r2_witness::R2WitnessClient, validator_db::ValidatorDB, workers};
 
@@ -289,6 +289,12 @@ pub async fn run() -> Result<()> {
             None
         }
         WitnessSource::R2 => {
+            if !args.witness_endpoint.is_empty() {
+                warn!(
+                    "--witness-endpoint is ignored with --witness-source r2: witnesses come \
+                     straight from the R2 bucket, and there is no RPC witness fallback"
+                );
+            }
             let endpoint = require_r2(&args.r2_endpoint, "--r2-endpoint")?;
             let bucket = require_r2(&args.r2_bucket, "--r2-bucket")?;
             let access_key_id = require_r2(&args.r2_access_key_id, "--r2-access-key-id")?;
