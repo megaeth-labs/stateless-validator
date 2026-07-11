@@ -17,6 +17,8 @@ pub use stateless_common::{
 };
 use tracing::info;
 
+use crate::r2_witness::R2WitnessError;
+
 /// Metrics callback implementation for RPC client.
 ///
 /// This struct implements the `RpcMetrics` trait from stateless-core,
@@ -75,6 +77,11 @@ pub mod names {
     metric!(CODE_FETCH_TIME, "code_fetch_time_seconds");
     metric!(WITNESS_FETCH_RPC_TIME, "witness_fetch_rpc_time_seconds");
 
+    // R2 witness source (`--witness-source r2`)
+    metric!(WITNESS_FETCH_R2_TIME, "witness_fetch_r2_time_seconds");
+    metric!(R2_WITNESS_RETRY_ATTEMPTS_TOTAL, "r2_witness_retry_attempts_total");
+    metric!(R2_WITNESS_ERRORS_TOTAL, "r2_witness_errors_total");
+
     // Contract cache
     metric!(CONTRACT_CACHE_HITS, "contract_cache_hits_total");
     metric!(CONTRACT_CACHE_MISSES, "contract_cache_misses_total");
@@ -118,6 +125,7 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
 
     register_metric_descriptions();
     init_rpc_method_counters();
+    init_r2_witness_counters();
     info!("Prometheus exporter listening on {}", addr);
     Ok(())
 }
@@ -159,6 +167,20 @@ fn register_metric_descriptions() {
     describe_histogram!(names::CODE_FETCH_TIME, "Code fetch time (s)");
     describe_histogram!(names::WITNESS_FETCH_RPC_TIME, "Witness RPC fetch time (s)");
 
+    // R2 witness source
+    describe_histogram!(
+        names::WITNESS_FETCH_R2_TIME,
+        "R2 witness fetch+decode time incl. internal retries, excl. concurrency-cap queue wait (s)"
+    );
+    describe_counter!(
+        names::R2_WITNESS_RETRY_ATTEMPTS_TOTAL,
+        "R2 witness GET retry attempts (before final outcome)"
+    );
+    describe_counter!(
+        names::R2_WITNESS_ERRORS_TOTAL,
+        "R2 witness fetches that surfaced an error to the pipeline, by kind"
+    );
+
     // Contract cache
     describe_counter!(names::CONTRACT_CACHE_HITS, "Contract cache hits");
     describe_counter!(names::CONTRACT_CACHE_MISSES, "Contract cache misses");
@@ -187,6 +209,15 @@ fn init_rpc_method_counters() {
         counter!(names::RPC_REQUESTS_TOTAL, "method" => method_str).increment(0);
         counter!(names::RPC_ERRORS_TOTAL, "method" => method_str).increment(0);
         counter!(names::RPC_RETRY_ATTEMPTS_TOTAL, "method" => method_str).increment(0);
+    }
+}
+
+/// Pre-register the R2 witness-source counters (every error kind) so they appear in Prometheus
+/// output from startup, like the RPC method counters above.
+fn init_r2_witness_counters() {
+    counter!(names::R2_WITNESS_RETRY_ATTEMPTS_TOTAL).increment(0);
+    for kind in R2WitnessError::KINDS {
+        counter!(names::R2_WITNESS_ERRORS_TOTAL, "kind" => *kind).increment(0);
     }
 }
 
@@ -293,4 +324,25 @@ pub fn on_witness_fetch(b: WitnessSizeBreakdown) {
     histogram!(names::SALT_WITNESS_KEYS).record(b.kvs_count as f64);
     histogram!(names::SALT_WITNESS_KVS_SIZE).record(b.salt_kvs_size as f64);
     histogram!(names::MPT_WITNESS_SIZE).record(b.mpt_size as f64);
+}
+
+// R2 witness source metrics (`--witness-source r2`)
+
+/// Record a successful R2 witness fetch: duration (see [`names::WITNESS_FETCH_R2_TIME`]'s
+/// description for what it covers) plus the same size breakdown as [`on_witness_fetch`], so the
+/// witness-size histograms stay populated in R2 mode.
+pub fn on_r2_witness_fetch_success(duration: f64, breakdown: WitnessSizeBreakdown) {
+    histogram!(names::WITNESS_FETCH_R2_TIME).record(duration);
+    on_witness_fetch(breakdown);
+}
+
+/// Record one retried R2 witness GET attempt (transport/429/5xx, before the final outcome).
+pub fn on_r2_witness_retry() {
+    counter!(names::R2_WITNESS_RETRY_ATTEMPTS_TOTAL).increment(1);
+}
+
+/// Record an R2 witness fetch that surfaced an error to the pipeline, labelled by
+/// [`R2WitnessError::kind`].
+pub fn on_r2_witness_error(kind: &'static str) {
+    counter!(names::R2_WITNESS_ERRORS_TOTAL, "kind" => kind).increment(1);
 }

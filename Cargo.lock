@@ -376,7 +376,7 @@ dependencies = [
  "lru",
  "parking_lot",
  "pin-project",
- "reqwest 0.12.24",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
@@ -420,7 +420,7 @@ dependencies = [
  "alloy-transport-http",
  "futures",
  "pin-project",
- "reqwest 0.12.24",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",
@@ -620,7 +620,7 @@ checksum = "90aa6825760905898c106aba9c804b131816a15041523e80b6d4fe7af6380ada"
 dependencies = [
  "alloy-json-rpc",
  "alloy-transport",
- "reqwest 0.12.24",
+ "reqwest",
  "serde_json",
  "tower",
  "tracing",
@@ -1732,6 +1732,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "coverage-replayer"
+version = "2.0.14"
+dependencies = [
+ "alloy-genesis",
+ "alloy-primitives",
+ "alloy-rpc-types-eth",
+ "bincode 2.0.1",
+ "chrono",
+ "clap",
+ "eyre",
+ "kanal",
+ "num_cpus",
+ "op-alloy-rpc-types",
+ "redb",
+ "reqwest",
+ "revm",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "stateless-common",
+ "stateless-core",
+ "stateless-r2",
+ "stateless-test-utils",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+ "zstd",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1916,10 +1947,9 @@ dependencies = [
  "quick_cache",
  "rayon",
  "redb",
- "reqwest 0.13.2",
+ "reqwest",
  "revm",
  "revm-inspectors",
- "salt",
  "serde",
  "serde_json",
  "stateless-common",
@@ -4459,6 +4489,7 @@ dependencies = [
  "async-compression",
  "base64",
  "bytes",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",
@@ -4489,39 +4520,6 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "webpki-roots",
-]
-
-[[package]]
-name = "reqwest"
-version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab3f43e3283ab1488b624b44b0e988d0acea0b3214e694730a055cb6b2efa801"
-dependencies = [
- "base64",
- "bytes",
- "futures-channel",
- "futures-core",
- "futures-util",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-util",
- "js-sys",
- "log",
- "percent-encoding",
- "pin-project-lite",
- "serde",
- "serde_json",
- "sync_wrapper",
- "tokio",
- "tower",
- "tower-http",
- "tower-service",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
 ]
 
 [[package]]
@@ -5701,7 +5699,7 @@ dependencies = [
  "kanal",
  "op-alloy-network",
  "op-alloy-rpc-types",
- "reqwest 0.12.24",
+ "reqwest",
  "revm",
  "rolling-file",
  "salt",
@@ -5777,6 +5775,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "stateless-r2"
+version = "2.0.14"
+dependencies = [
+ "bytes",
+ "chrono",
+ "hex",
+ "hmac",
+ "percent-encoding",
+ "reqwest",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "stateless-test-utils"
 version = "2.0.14"
 dependencies = [
@@ -5801,6 +5812,8 @@ dependencies = [
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rpc-types-eth",
+ "bytes",
+ "chrono",
  "clap",
  "eyre",
  "jsonrpsee",
@@ -5809,12 +5822,14 @@ dependencies = [
  "metrics-exporter-prometheus",
  "op-alloy-rpc-types",
  "redb",
+ "reqwest",
  "revm",
  "salt",
  "serde_json",
  "stateless-common",
  "stateless-core",
  "stateless-db",
+ "stateless-r2",
  "stateless-test-utils",
  "tempfile",
  "thiserror 2.0.17",

@@ -19,7 +19,6 @@ alloy-rpc-types-trace.workspace = true
 
 # mega
 mega-evm.workspace = true
-salt.workspace = true
 
 # op
 op-alloy-network.workspace = true
@@ -69,7 +68,7 @@ dotenvy.workspace = true
 http-body-util.workspace = true
 
 # HTTP client for integration tests
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["blocking", "json"] }
 tempfile.workspace = true
 
 # stateless
