@@ -34,11 +34,11 @@ use crate::{
     llvm,
     proto::{WorkerRequest, WorkerResponse},
     spool::{DataDir, SpoolEntry, write_atomic},
-    store::{BlockRecord, BlockStatus, CounterInfo, PatternRecord, Store, current_binary_id},
+    store::{
+        BlockRecord, BlockStatus, CounterInfo, PatternRecord, Store, current_binary_id,
+        elapsed_stats, resolve_pattern_slot,
+    },
 };
-
-/// Linear-probe step for pattern-key collisions (golden ratio).
-const PROBE_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Witness source selector (mirrors the validator's `--witness-source`).
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -125,8 +125,9 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         "backfill requires the instrumented build (see [profile.coverage] in Cargo.toml)"
     );
 
-    let dirs = Arc::new(DataDir::new(&args.data_dir)?);
-    let binary_id = current_binary_id()?;
+    let dirs = Arc::new(DataDir::new(&args.data_dir));
+    dirs.ensure_layout()?;
+    let binary_id = current_binary_id();
     info!(binary_id, "opening store");
     let store = Store::open(&dirs.store_path(), &binary_id, Some(&args.symbol_filter))?;
     let snapshot = store.load()?;
@@ -332,7 +333,7 @@ async fn fetch_block(
         None => client.get_witness_light(n, hash).await,
     };
 
-    let code_hashes = crate::spool::code_hashes_of(&light_witness);
+    let code_hashes = stateless_core::collect_code_hashes(&light_witness.kvs);
     let missing: Vec<B256> =
         code_hashes.iter().filter(|h| !dirs.code_file(h).exists()).copied().collect();
     if !missing.is_empty() {
@@ -345,12 +346,7 @@ async fn fetch_block(
         }
     }
 
-    let entry = SpoolEntry {
-        block_hash: hash,
-        block_json: serde_json::to_vec(block)?,
-        light_witness,
-        code_hashes,
-    };
+    let entry = SpoolEntry { block_json: serde_json::to_vec(block)?, light_witness, code_hashes };
     let path = spool_path.clone();
     tokio::task::spawn_blocking(move || entry.write_to(&path)).await??;
     Ok(())
@@ -549,15 +545,7 @@ impl<'a> JudgeState<'a> {
         self.processed += 1;
 
         if !resp.ok {
-            let record = BlockRecord {
-                hash: resp.block_hash,
-                status: BlockStatus::Error,
-                pattern_key: None,
-                gas_used: 0,
-                tx_count: resp.tx_count,
-                elapsed_ms: resp.elapsed_ms,
-                error: resp.error.clone(),
-            };
+            let record = block_record(&resp, BlockStatus::Error, None);
             self.store.commit_block(resp.block, &record, &[], None)?;
             self.cleanup_tmp(resp.block);
             eyre::bail!(
@@ -571,15 +559,7 @@ impl<'a> JudgeState<'a> {
 
         let sane = resp.gas_ok && resp.receipts_root_ok && resp.logs_bloom_ok;
         if !sane {
-            let record = BlockRecord {
-                hash: resp.block_hash,
-                status: BlockStatus::Divergent,
-                pattern_key: None,
-                gas_used: resp.gas_used,
-                tx_count: resp.tx_count,
-                elapsed_ms: resp.elapsed_ms,
-                error: None,
-            };
+            let record = block_record(&resp, BlockStatus::Divergent, None);
             self.store.commit_block(resp.block, &record, &[], None)?;
             self.cleanup_tmp(resp.block);
             eyre::bail!(
@@ -624,30 +604,23 @@ impl<'a> JudgeState<'a> {
 
         let bitmap = BitSet::from_indices(resp.counters.iter().map(|id| self.counters[id]));
 
-        // Pattern lookup with collision probing (exact bitmap comparison).
-        // Keying MUST stay identical to merge's re-keying: both go through
-        // `pattern_base_key` (worker counters arrive sorted and deduped).
-        let mut key = crate::store::pattern_base_key(&resp.counters);
-        let is_new = loop {
-            match self.patterns.get_mut(&key) {
-                None => break true,
-                Some(rec) if rec.bitmap == bitmap => {
-                    rec.hit_count += 1;
-                    rec.last_block = rec.last_block.max(resp.block);
-                    // Re-home the representative to the lightest block seen for
-                    // this pattern — the best fixture candidate. Profile is
-                    // keyed by pattern, so nothing on disk moves.
-                    if resp.elapsed_ms < rec.representative_elapsed_ms {
-                        rec.representative = resp.block;
-                        rec.representative_elapsed_ms = resp.elapsed_ms;
-                    }
-                    break false;
-                }
-                Some(_) => key = key.wrapping_add(PROBE_STEP),
-            }
-        };
+        // Shared probing walk (worker counters arrive sorted and deduped) —
+        // the judge and merge MUST key identically; both go through
+        // `resolve_pattern_slot`.
+        let (key, occupied) = resolve_pattern_slot(&self.patterns, &resp.counters, &bitmap);
 
-        if is_new {
+        if occupied {
+            // Known pattern: merge stats; re-home the representative to the
+            // lightest block seen (best fixture candidate; the profile is
+            // keyed by pattern, so nothing on disk moves).
+            let rec = self.patterns.get_mut(&key).expect("occupied slot");
+            rec.hit_count += 1;
+            rec.last_block = rec.last_block.max(resp.block);
+            if resp.elapsed_ms < rec.representative_elapsed_ms {
+                rec.representative = resp.block;
+                rec.representative_elapsed_ms = resp.elapsed_ms;
+            }
+        } else {
             let rec = PatternRecord {
                 bits: bitmap.count_ones(),
                 bitmap,
@@ -662,10 +635,7 @@ impl<'a> JudgeState<'a> {
             // and stats, but skip the profile archive (93% of new patterns in
             // practice). set-cover excludes them from candidates, so a
             // selected block always has an archived profile.
-            let dominated = self
-                .patterns
-                .values()
-                .any(|r| r.bits > rec.bits && rec.bitmap.is_subset_of(&r.bitmap));
+            let dominated = self.patterns.values().any(|r| r.dominates(&rec));
             self.universe.union_with(&rec.bitmap);
             self.new_patterns += 1;
             info!(
@@ -683,9 +653,7 @@ impl<'a> JudgeState<'a> {
             // retried, later same-bitmap profraws deleted, `report` fails on
             // the missing profile). Archive failure aborts (fail-stop),
             // keeping profraw + spool for forensics.
-            if dominated {
-                let _ = std::fs::remove_file(&resp.profraw);
-            } else {
+            if !dominated {
                 archive_sparse_profile(
                     &self.llvm_profdata,
                     &resp.profraw,
@@ -699,39 +667,19 @@ impl<'a> JudgeState<'a> {
                         resp.profraw.display(),
                     )
                 })?;
-                let _ = std::fs::remove_file(&resp.profraw);
             }
-
-            let record = self.block_record_ok(&resp, key);
             self.patterns.insert(key, rec);
-            let rec_ref = &self.patterns[&key];
-            self.store.commit_block(resp.block, &record, &new_counters, Some((key, rec_ref)))?;
-            // Nothing block-sized is kept — the spool entry goes last, after
-            // the commit (a leftover from a crash here is harmless junk).
-            let _ = std::fs::remove_file(self.dirs.spool_entry(resp.block));
-            let _ = std::fs::remove_file(&resp.symbols_tsv);
-        } else {
-            // Known pattern: delete everything, keep only the block record.
-            let _ = std::fs::remove_file(self.dirs.spool_entry(resp.block));
-            let _ = std::fs::remove_file(&resp.profraw);
-            let _ = std::fs::remove_file(&resp.symbols_tsv);
-            let record = self.block_record_ok(&resp, key);
-            let rec_ref = &self.patterns[&key];
-            self.store.commit_block(resp.block, &record, &new_counters, Some((key, rec_ref)))?;
         }
-        Ok(())
-    }
 
-    fn block_record_ok(&self, resp: &WorkerResponse, pattern_key: u64) -> BlockRecord {
-        BlockRecord {
-            hash: resp.block_hash,
-            status: BlockStatus::Ok,
-            pattern_key: Some(pattern_key),
-            gas_used: resp.gas_used,
-            tx_count: resp.tx_count,
-            elapsed_ms: resp.elapsed_ms,
-            error: None,
-        }
+        // Shared tail: commit, then clean up (the spool entry goes after the
+        // commit — a leftover from a crash in between is harmless junk).
+        let _ = std::fs::remove_file(&resp.profraw);
+        let record = block_record(&resp, BlockStatus::Ok, Some(key));
+        let rec_ref = &self.patterns[&key];
+        self.store.commit_block(resp.block, &record, &new_counters, Some((key, rec_ref)))?;
+        let _ = std::fs::remove_file(self.dirs.spool_entry(resp.block));
+        let _ = std::fs::remove_file(&resp.symbols_tsv);
+        Ok(())
     }
 
     fn cleanup_tmp(&self, block: u64) {
@@ -755,7 +703,7 @@ impl<'a> JudgeState<'a> {
         );
     }
 
-    fn final_summary(&self) {
+    fn final_summary(&mut self) {
         info!(
             processed = self.processed,
             new_patterns = self.new_patterns,
@@ -764,19 +712,37 @@ impl<'a> JudgeState<'a> {
             elapsed = %format!("{:.1}s", self.started.elapsed().as_secs_f64()),
             "backfill finished"
         );
-        if !self.elapsed_ok_ms.is_empty() {
-            let mut v = self.elapsed_ok_ms.clone();
-            v.sort_unstable();
-            let avg = v.iter().sum::<u64>() as f64 / v.len() as f64;
+        let mut samples = std::mem::take(&mut self.elapsed_ok_ms);
+        if let Some((avg, p50, p95, max)) = elapsed_stats(&mut samples) {
             info!(
-                blocks = v.len(),
+                blocks = samples.len(),
                 avg_ms = %format!("{avg:.0}"),
-                p50_ms = v[v.len() / 2],
-                p95_ms = v[(v.len() * 95 / 100).min(v.len() - 1)],
-                max_ms = v[v.len() - 1],
+                p50_ms = p50,
+                p95_ms = p95,
+                max_ms = max,
                 "per-block worker time (replay + profraw + bitmap)"
             );
         }
+    }
+}
+
+/// Builds the per-block store record from a worker response. The judge's
+/// three commit paths (Ok / Divergent / Error) differ only in status and
+/// pattern key: on error paths `resp.gas_used` is 0 and on ok paths
+/// `resp.error` is `None`, so one constructor serves all.
+fn block_record(
+    resp: &WorkerResponse,
+    status: BlockStatus,
+    pattern_key: Option<u64>,
+) -> BlockRecord {
+    BlockRecord {
+        hash: resp.block_hash,
+        status,
+        pattern_key,
+        gas_used: resp.gas_used,
+        tx_count: resp.tx_count,
+        elapsed_ms: resp.elapsed_ms,
+        error: resp.error.clone(),
     }
 }
 
@@ -896,7 +862,8 @@ mod tests {
     #[test]
     fn known_pattern_dedups_and_rehomes_to_lightest() {
         let tmp = tempfile::tempdir().unwrap();
-        let dirs = Arc::new(DataDir::new(tmp.path()).unwrap());
+        let dirs = Arc::new(DataDir::new(tmp.path()));
+        dirs.ensure_layout().unwrap();
         let store = Store::open(&dirs.store_path(), "test-id", Some("f")).unwrap();
         let (key, rec) = seeded_pattern(&[1, 2], &[0, 1], 100, 500);
         let mut judge = judge_with(&store, dirs, vec![(key, rec)]);
@@ -920,7 +887,8 @@ mod tests {
     #[test]
     fn dominated_new_pattern_recorded_without_archive() {
         let tmp = tempfile::tempdir().unwrap();
-        let dirs = Arc::new(DataDir::new(tmp.path()).unwrap());
+        let dirs = Arc::new(DataDir::new(tmp.path()));
+        dirs.ensure_layout().unwrap();
         let store = Store::open(&dirs.store_path(), "test-id", Some("f")).unwrap();
         // Seed the dominator {1,2,3}.
         let (dom_key, dom_rec) = seeded_pattern(&[1, 2, 3], &[0, 1, 2], 100, 500);
@@ -951,7 +919,8 @@ mod tests {
     #[test]
     fn replay_error_and_divergence_fail_stop() {
         let tmp = tempfile::tempdir().unwrap();
-        let dirs = Arc::new(DataDir::new(tmp.path()).unwrap());
+        let dirs = Arc::new(DataDir::new(tmp.path()));
+        dirs.ensure_layout().unwrap();
         let store = Store::open(&dirs.store_path(), "test-id", Some("f")).unwrap();
         let mut judge = judge_with(&store, dirs, vec![]);
 

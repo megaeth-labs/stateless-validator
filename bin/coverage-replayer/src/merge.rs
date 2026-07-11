@@ -15,8 +15,9 @@
 //! So we: (1) build a unified id→dense map, (2) for each source pattern remap
 //! its bitmap through `source-dense → id → unified-dense`, and (3) fold
 //! same-key patterns together (summing hits, keeping the lightest
-//! representative). The result is byte-identical to what a single machine would
-//! have produced scanning every range sequentially.
+//! representative). The result is semantically equivalent to a sequential
+//! single-machine run (same universe, pattern keys, and stats); only the
+//! internal dense numbering may differ (see `merge_snapshots`).
 //!
 //! Archived profiles are keyed by pattern key (machine-stable), so they are
 //! merged by a plain file union — `rsync` every shard's `archive/profiles/`
@@ -31,12 +32,10 @@ use tracing::{info, warn};
 use crate::{
     bitset::BitSet,
     spool::DataDir,
-    store::{CounterInfo, PatternRecord, Store, StoreSnapshot, current_binary_id},
+    store::{
+        CounterInfo, PatternRecord, Store, StoreSnapshot, current_binary_id, resolve_pattern_slot,
+    },
 };
-
-/// Linear-probe step for pattern-key collisions — mirrors the judge, so a
-/// merged store keys patterns exactly as a sequential run would.
-const PROBE_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 
 #[derive(Args, Debug, Clone)]
 pub struct MergeArgs {
@@ -50,7 +49,8 @@ pub struct MergeArgs {
 
 pub fn run(args: MergeArgs) -> Result<()> {
     ensure!(args.shards.len() >= 2, "merge needs at least two --shard dirs");
-    let out_dirs = DataDir::new(&args.out)?;
+    let out_dirs = DataDir::new(&args.out);
+    out_dirs.ensure_layout()?;
     ensure!(
         !out_dirs.store_path().exists(),
         "output store already exists: {} (merge writes a fresh store)",
@@ -60,12 +60,12 @@ pub fn run(args: MergeArgs) -> Result<()> {
     // The merged store must carry the same binary_id as the shards, and the
     // current binary must match it (dense indices are only meaningful for one
     // instrumented build).
-    let expected_id = current_binary_id()?;
+    let expected_id = current_binary_id();
 
     let mut shard_snaps = Vec::with_capacity(args.shards.len());
     let mut shard_filter: Option<String> = None;
     for (i, shard) in args.shards.iter().enumerate() {
-        let dirs = DataDir::new(shard)?;
+        let dirs = DataDir::new(shard);
         let (store, binary_id) = Store::open_readonly(&dirs.store_path())
             .wrap_err_with(|| format!("open shard {}", shard.display()))?;
         ensure!(
@@ -141,9 +141,11 @@ fn merge_snapshots(shards: Vec<(String, StoreSnapshot)>) -> Result<StoreSnapshot
         // space. Registration goes in sorted-id order so the merged store is
         // reproducible run-to-run (HashMap iteration order is randomized).
         let mut src_dense_to_id: HashMap<u32, u64> = HashMap::with_capacity(snap.counters.len());
+        let mut max_src_dense = 0u32;
         let mut shard_ids: Vec<u64> = Vec::with_capacity(snap.counters.len());
         for (&id, info) in &snap.counters {
             src_dense_to_id.insert(info.dense, id);
+            max_src_dense = max_src_dense.max(info.dense);
             shard_ids.push(id);
         }
         shard_ids.sort_unstable();
@@ -156,55 +158,56 @@ fn merge_snapshots(shards: Vec<(String, StoreSnapshot)>) -> Result<StoreSnapshot
                 counters.insert(id, CounterInfo { dense, ..snap.counters[&id].clone() });
             }
         }
+        // Flat per-shard remap tables (src dense → id / unified dense): one
+        // array index per set bit in the remap loop instead of two hash
+        // lookups — billions of bits at full-history scale.
+        let mut flat_id: Vec<Option<u64>> = vec![None; max_src_dense as usize + 1];
+        let mut flat_unified: Vec<u32> = vec![0; max_src_dense as usize + 1];
+        for (&src, &id) in &src_dense_to_id {
+            flat_id[src as usize] = Some(id);
+            flat_unified[src as usize] = id_to_dense[&id];
+        }
         for (&stored_key, rec) in &snap.patterns {
             let mut remapped = BitSet::new();
             let mut ids: Vec<u64> = Vec::with_capacity(rec.bits as usize);
             for src_dense in rec.bitmap.iter_ones() {
-                let id = src_dense_to_id.get(&src_dense).ok_or_else(|| {
+                let id = flat_id.get(src_dense as usize).copied().flatten().ok_or_else(|| {
                     eyre::eyre!(
                         "shard {label} pattern {stored_key:016x} references dense {src_dense} \
                          with no counter — corrupt store"
                     )
                 })?;
-                remapped.insert(id_to_dense[id]);
-                ids.push(*id);
+                remapped.insert(flat_unified[src_dense as usize]);
+                ids.push(id);
             }
             ids.sort_unstable();
 
-            // Re-key exactly as the judge does (shared helper), linear-probing
-            // on a genuine bitmap-differing collision.
-            let mut key = crate::store::pattern_base_key(&ids);
-            let inserted = loop {
-                match patterns.get_mut(&key) {
-                    None => {
-                        patterns.insert(
-                            key,
-                            PatternRecord {
-                                bits: remapped.count_ones(),
-                                bitmap: remapped,
-                                first_block: rec.first_block,
-                                last_block: rec.last_block,
-                                hit_count: rec.hit_count,
-                                representative: rec.representative,
-                                representative_elapsed_ms: rec.representative_elapsed_ms,
-                            },
-                        );
-                        break true;
-                    }
-                    Some(existing) if existing.bitmap == remapped => {
-                        existing.hit_count += rec.hit_count;
-                        existing.first_block = existing.first_block.min(rec.first_block);
-                        existing.last_block = existing.last_block.max(rec.last_block);
-                        if rec.representative_elapsed_ms < existing.representative_elapsed_ms {
-                            existing.representative = rec.representative;
-                            existing.representative_elapsed_ms = rec.representative_elapsed_ms;
-                        }
-                        break false;
-                    }
-                    Some(_) => key = key.wrapping_add(PROBE_STEP),
+            // Re-key exactly as the judge does — same shared probing walk.
+            let (key, occupied) = resolve_pattern_slot(&patterns, &ids, &remapped);
+            if occupied {
+                let existing = patterns.get_mut(&key).expect("occupied slot");
+                existing.hit_count += rec.hit_count;
+                existing.first_block = existing.first_block.min(rec.first_block);
+                existing.last_block = existing.last_block.max(rec.last_block);
+                if rec.representative_elapsed_ms < existing.representative_elapsed_ms {
+                    existing.representative = rec.representative;
+                    existing.representative_elapsed_ms = rec.representative_elapsed_ms;
                 }
-            };
-            if inserted && key != stored_key {
+            } else {
+                patterns.insert(
+                    key,
+                    PatternRecord {
+                        bits: remapped.count_ones(),
+                        bitmap: remapped,
+                        first_block: rec.first_block,
+                        last_block: rec.last_block,
+                        hit_count: rec.hit_count,
+                        representative: rec.representative,
+                        representative_elapsed_ms: rec.representative_elapsed_ms,
+                    },
+                );
+            }
+            if !occupied && key != stored_key {
                 warn!(
                     shard = %label,
                     stored = %format!("{stored_key:016x}"),
@@ -239,7 +242,7 @@ mod tests {
     use alloy_primitives::B256;
 
     use super::*;
-    use crate::store::{BlockRecord, BlockStatus};
+    use crate::store::{BlockRecord, BlockStatus, pattern_base_key};
 
     fn info(dense: u32, sym: &str, idx: u32) -> CounterInfo {
         CounterInfo { dense, symbol: sym.into(), func_hash: "h".into(), index: idx }
@@ -279,16 +282,8 @@ mod tests {
         let a_counters: HashMap<u64, CounterInfo> =
             [(100, info(0, "a", 0)), (200, info(1, "b", 0)), (300, info(2, "c", 0))].into();
         // Shard A pattern {100,300} = local bits {0,2}.
-        let a_patterns: HashMap<u64, PatternRecord> = {
-            let key = {
-                use std::hash::Hasher;
-                let mut h = rustc_hash::FxHasher::default();
-                h.write_u64(100);
-                h.write_u64(300);
-                h.finish()
-            };
-            [(key, pat(BitSet::from_indices([0, 2]), 10, 50, 3))].into()
-        };
+        let a_patterns: HashMap<u64, PatternRecord> =
+            [(pattern_base_key(&[100, 300]), pat(BitSet::from_indices([0, 2]), 10, 50, 3))].into();
         let a = StoreSnapshot {
             counters: a_counters,
             patterns: a_patterns,
@@ -299,25 +294,11 @@ mod tests {
         let b_counters: HashMap<u64, CounterInfo> =
             [(300, info(0, "c", 0)), (200, info(1, "b", 0)), (100, info(2, "a", 0))].into();
         // Shard B pattern {100,300}: same ids, local bits {2,0}; plus {200}.
-        let b_patterns: HashMap<u64, PatternRecord> = {
-            use std::hash::Hasher;
-            let k1 = {
-                let mut h = rustc_hash::FxHasher::default();
-                h.write_u64(100);
-                h.write_u64(300);
-                h.finish()
-            };
-            let k2 = {
-                let mut h = rustc_hash::FxHasher::default();
-                h.write_u64(200);
-                h.finish()
-            };
-            [
-                (k1, pat(BitSet::from_indices([0, 2]), 20, 30, 5)),
-                (k2, pat(BitSet::from_indices([1]), 21, 40, 2)),
-            ]
-            .into()
-        };
+        let b_patterns: HashMap<u64, PatternRecord> = [
+            (pattern_base_key(&[100, 300]), pat(BitSet::from_indices([0, 2]), 20, 30, 5)),
+            (pattern_base_key(&[200]), pat(BitSet::from_indices([1]), 21, 40, 2)),
+        ]
+        .into();
         let b = StoreSnapshot {
             counters: b_counters,
             patterns: b_patterns,
@@ -362,14 +343,9 @@ mod tests {
             let counters: HashMap<u64, CounterInfo> =
                 ids_dense.iter().map(|&(id, d)| (id, info(d, "s", d))).collect();
             let key = {
-                use std::hash::Hasher;
                 let mut s: Vec<u64> = pat_ids.to_vec();
                 s.sort_unstable();
-                let mut h = rustc_hash::FxHasher::default();
-                for id in s {
-                    h.write_u64(id);
-                }
-                h.finish()
+                pattern_base_key(&s)
             };
             let bm = BitSet::from_indices(pat_ids.iter().map(|id| counters[id].dense));
             StoreSnapshot {

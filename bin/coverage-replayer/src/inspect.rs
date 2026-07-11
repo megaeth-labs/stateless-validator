@@ -2,18 +2,18 @@
 //!
 //! Unlike every other subcommand, `inspect` skips the binary-id namespace
 //! check so a store produced on another machine/build (e.g. copied from the
-//! server) can be analyzed locally. It never writes to the store (the shared
-//! `DataDir::new` does create the standard empty subdirectories if missing).
+//! server) can be analyzed locally. It never writes.
 
-use std::{collections::HashMap, path::PathBuf};
+use std::path::PathBuf;
 
 use clap::Args;
 use eyre::Result;
 
 use crate::{
     bitset::BitSet,
+    setcover::select_cover,
     spool::DataDir,
-    store::{BlockStatus, Store},
+    store::{BlockStatus, Store, elapsed_stats},
 };
 
 #[derive(Args, Debug, Clone)]
@@ -27,7 +27,7 @@ pub struct InspectArgs {
 }
 
 pub fn run(args: InspectArgs) -> Result<()> {
-    let dirs = DataDir::new(&args.data_dir)?;
+    let dirs = DataDir::new(&args.data_dir);
     let (store, binary_id) = Store::open_readonly(&dirs.store_path())?;
     let snapshot = store.load()?;
 
@@ -54,16 +54,9 @@ pub fn run(args: InspectArgs) -> Result<()> {
             BlockStatus::Error => errors += 1,
         }
     }
-    elapsed.sort_unstable();
     println!("blocks: total={total} ok={ok} divergent={divergent} error={errors}");
-    if !elapsed.is_empty() {
-        let avg = elapsed.iter().sum::<u64>() as f64 / elapsed.len() as f64;
-        println!(
-            "worker elapsed_ms: avg={avg:.0} p50={} p95={} max={}",
-            elapsed[elapsed.len() / 2],
-            elapsed[(elapsed.len() * 95 / 100).min(elapsed.len() - 1)],
-            elapsed[elapsed.len() - 1],
-        );
+    if let Some((avg, p50, p95, max)) = elapsed_stats(&mut elapsed) {
+        println!("worker elapsed_ms: avg={avg:.0} p50={p50} p95={p95} max={max}");
         println!("txs total={txs}  gas total={gas}");
     }
     if errors > 0 || divergent > 0 {
@@ -112,21 +105,17 @@ pub fn run(args: InspectArgs) -> Result<()> {
     println!();
 
     // ---- counter rarity: how fragile is the universe? ----
-    let mut coverage_count: HashMap<u32, u32> = HashMap::new();
+    // Dense indices are contiguous, so a Vec beats a HashMap here.
+    let mut coverage_count: Vec<u32> = vec![0; snapshot.counters.len()];
     for (_, rec) in &hits {
-        // Recover dense indices from the bitmap words.
-        for (word_idx, _) in rec.bitmap.words().iter().enumerate() {
-            let word = rec.bitmap.words()[word_idx];
-            let mut w = word;
-            while w != 0 {
-                let bit = w.trailing_zeros();
-                *coverage_count.entry((word_idx as u32) * 64 + bit).or_default() += 1;
-                w &= w - 1;
+        for dense in rec.bitmap.iter_ones() {
+            if let Some(c) = coverage_count.get_mut(dense as usize) {
+                *c += 1;
             }
         }
     }
-    let rare1 = coverage_count.values().filter(|&&c| c == 1).count();
-    let rare2 = coverage_count.values().filter(|&&c| c <= 2).count();
+    let rare1 = coverage_count.iter().filter(|&&c| c == 1).count();
+    let rare2 = coverage_count.iter().filter(|&&c| c > 0 && c <= 2).count();
     println!(
         "counter rarity: covered-by-exactly-1-pattern={rare1} ({:.1}% of universe), <=2 patterns={rare2}",
         100.0 * rare1 as f64 / universe_bits.max(1) as f64
@@ -161,54 +150,30 @@ pub fn run(args: InspectArgs) -> Result<()> {
         }
     }
 
-    // ---- antichain estimate: how many patterns survive dominated-pruning? ----
+    // ---- set-cover dry run: THE algorithm (select_cover), not a copy — the
+    // antichain count and the selection preview cannot drift from a real
+    // `set-cover` run (no incumbents, and no fs side effects here).
     {
-        let mut recs: Vec<&crate::store::PatternRecord> = snapshot.patterns.values().collect();
-        // A pattern can only be dominated by one with >= bits; sort desc so we
-        // scan potential dominators first and can stop early.
-        recs.sort_by_key(|r| std::cmp::Reverse(r.bits));
-        let mut dominated = 0usize;
-        for i in 0..recs.len() {
-            for j in 0..i {
-                if recs[j].bits > recs[i].bits && recs[i].bitmap.is_subset_of(&recs[j].bitmap) {
-                    dominated += 1;
-                    break;
-                }
-            }
-        }
+        let outcome = select_cover(&snapshot.patterns, &Default::default());
         println!();
         println!(
-            "antichain estimate: {} of {} patterns are strictly dominated ({:.1}%) — prunable \
+            "antichain: {} of {} patterns are strictly dominated ({:.1}%) — prunable \
              along with their archived profiles",
-            dominated,
-            recs.len(),
-            100.0 * dominated as f64 / recs.len().max(1) as f64
+            outcome.pruned_dominated.len(),
+            snapshot.patterns.len(),
+            100.0 * outcome.pruned_dominated.len() as f64 / snapshot.patterns.len().max(1) as f64
         );
-    }
-
-    // ---- greedy set cover (read-only preview, same tie-breaking as set-cover) ----
-    {
-        let mut covered = BitSet::new();
-        let mut remaining: Vec<(&u64, &crate::store::PatternRecord)> =
-            snapshot.patterns.iter().collect();
-        let mut picks = 0usize;
         println!();
-        println!("greedy selection preview:");
-        loop {
-            let mut best: Option<(u64, u64, usize)> = None; // (gain, block, idx)
-            for (i, (_, rec)) in remaining.iter().enumerate() {
-                let gain = rec.bitmap.andnot_count(&covered);
-                if gain > 0 && best.is_none_or(|b| (gain, rec.representative) > (b.0, b.1)) {
-                    best = Some((gain, rec.representative, i));
-                }
-            }
-            let Some((gain, block, i)) = best else { break };
-            let (_, rec) = remaining.swap_remove(i);
-            covered.union_with(&rec.bitmap);
-            picks += 1;
-            println!("  {block:>12}  gain={gain:<6} bits={}", rec.bits);
+        println!("greedy selection preview (matches a real set-cover run, no incumbents):");
+        for (key, rep, gain) in &outcome.selected {
+            println!("  {rep:>12}  gain={gain:<6} bits={}", snapshot.patterns[key].bits);
         }
-        println!("  => {picks} blocks cover {}/{}", covered.count_ones(), universe_bits);
+        println!(
+            "  => {} blocks cover {}/{}",
+            outcome.selected.len(),
+            outcome.covered_counters,
+            outcome.universe_counters
+        );
     }
 
     // ---- manifest ----

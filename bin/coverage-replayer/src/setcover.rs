@@ -15,7 +15,7 @@ use tracing::info;
 use crate::{
     bitset::BitSet,
     spool::DataDir,
-    store::{Store, current_binary_id},
+    store::{Store, current_binary_id, elapsed_stats},
 };
 
 #[derive(Args, Debug, Clone)]
@@ -52,8 +52,8 @@ pub struct ManifestBlock {
 }
 
 pub fn run(args: SetCoverArgs) -> Result<()> {
-    let dirs = DataDir::new(&args.data_dir)?;
-    let binary_id = current_binary_id()?;
+    let dirs = DataDir::new(&args.data_dir);
+    let binary_id = current_binary_id();
     // No filter check: set-cover consumes whatever universe the store holds.
     let store = Store::open(&dirs.store_path(), &binary_id, None)?;
     let snapshot = store.load()?;
@@ -66,15 +66,13 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
             .filter(|b| matches!(b.status, crate::store::BlockStatus::Ok))
             .map(|b| b.elapsed_ms)
             .collect();
-        if !v.is_empty() {
-            v.sort_unstable();
-            let avg = v.iter().sum::<u64>() as f64 / v.len() as f64;
+        if let Some((avg, p50, p95, max)) = elapsed_stats(&mut v) {
             info!(
                 blocks = v.len(),
                 avg_ms = %format!("{avg:.0}"),
-                p50_ms = v[v.len() / 2],
-                p95_ms = v[(v.len() * 95 / 100).min(v.len() - 1)],
-                max_ms = v[v.len() - 1],
+                p50_ms = p50,
+                p95_ms = p95,
+                max_ms = max,
                 "per-block worker time (replay + profraw + bitmap)"
             );
         }
@@ -165,14 +163,14 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
 
 /// Result of the pure set-cover algorithm.
 pub struct CoverOutcome {
-    /// Greedy picks in selection order: `(pattern_key, representative, gain)`.
-    /// Entries whose representative appears in `redundant_removed` were
-    /// eliminated by the final redundancy pass and must be filtered out.
+    /// The final cover in selection order: `(pattern_key, representative,
+    /// gain)`. Redundancy-eliminated picks are already removed.
     pub selected: Vec<(u64, u64, u64)>,
     /// Pattern keys strictly dominated by another pattern (excluded from the
     /// candidate pool; their archived profiles are safe to delete).
     pub pruned_dominated: Vec<u64>,
-    /// Representatives removed by redundancy elimination.
+    /// Representatives dropped by the redundancy-elimination pass (for
+    /// logging; no longer present in `selected`).
     pub redundant_removed: std::collections::HashSet<u64>,
     pub universe_counters: u64,
     pub covered_counters: u64,
@@ -201,10 +199,7 @@ pub fn select_cover(
     let mut pruned_dominated = Vec::new();
     for i in 0..remaining.len() {
         for j in 0..i {
-            if keep[j] &&
-                remaining[j].1.bits > remaining[i].1.bits &&
-                remaining[i].1.bitmap.is_subset_of(&remaining[j].1.bitmap)
-            {
+            if keep[j] && remaining[j].1.dominates(remaining[i].1) {
                 keep[i] = false;
                 pruned_dominated.push(*remaining[i].0);
                 break;
@@ -262,6 +257,10 @@ pub fn select_cover(
         }
     }
 
+    // The cover is final here: drop eliminated picks so every consumer sees
+    // the true selection (removed reps stay available for logging).
+    selected.retain(|(_, rep, _)| !removed.contains(rep));
+
     CoverOutcome {
         selected,
         pruned_dominated,
@@ -297,12 +296,7 @@ mod tests {
     ) -> (Vec<u64>, CoverOutcome) {
         let incumbents: HashSet<u64> = incumbents.iter().copied().collect();
         let outcome = select_cover(patterns, &incumbents);
-        let mut blocks: Vec<u64> = outcome
-            .selected
-            .iter()
-            .filter(|(_, rep, _)| !outcome.redundant_removed.contains(rep))
-            .map(|(_, rep, _)| *rep)
-            .collect();
+        let mut blocks: Vec<u64> = outcome.selected.iter().map(|(_, rep, _)| *rep).collect();
         blocks.sort_unstable();
         (blocks, outcome)
     }

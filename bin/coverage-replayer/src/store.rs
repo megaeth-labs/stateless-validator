@@ -47,6 +47,16 @@ pub struct PatternRecord {
     pub representative_elapsed_ms: u64,
 }
 
+impl PatternRecord {
+    /// Strict domination: `self` covers everything `other` does plus more.
+    /// The strictness (`bits >`, never `>=`) is load-bearing — equal-bits
+    /// distinct patterns must never dominate each other. Single definition
+    /// shared by the judge's archive-skip and set-cover's antichain prune.
+    pub fn dominates(&self, other: &Self) -> bool {
+        self.bits > other.bits && other.bitmap.is_subset_of(&self.bitmap)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlockStatus {
     /// Replayed cleanly, bitmap ingested.
@@ -166,44 +176,11 @@ impl Store {
     /// Loads the whole dispatcher state into memory (counters, patterns, blocks).
     pub fn load(&self) -> Result<StoreSnapshot> {
         let txn = self.db.begin_read()?;
-
-        let mut counters = HashMap::new();
-        {
-            let t = txn.open_table(COUNTERS)?;
-            for row in t.iter()? {
-                let (k, v) = row?;
-                let (info, _): (CounterInfo, _) =
-                    bincode::serde::decode_from_slice(v.value(), BINCODE_CONFIG)
-                        .map_err(|e| eyre::eyre!("decode CounterInfo: {e}"))?;
-                counters.insert(k.value(), info);
-            }
-        }
-
-        let mut patterns = HashMap::new();
-        {
-            let t = txn.open_table(PATTERNS)?;
-            for row in t.iter()? {
-                let (k, v) = row?;
-                let (rec, _): (PatternRecord, _) =
-                    bincode::serde::decode_from_slice(v.value(), BINCODE_CONFIG)
-                        .map_err(|e| eyre::eyre!("decode PatternRecord: {e}"))?;
-                patterns.insert(k.value(), rec);
-            }
-        }
-
-        let mut blocks = HashMap::new();
-        {
-            let t = txn.open_table(BLOCKS)?;
-            for row in t.iter()? {
-                let (k, v) = row?;
-                let (rec, _): (BlockRecord, _) =
-                    bincode::serde::decode_from_slice(v.value(), BINCODE_CONFIG)
-                        .map_err(|e| eyre::eyre!("decode BlockRecord: {e}"))?;
-                blocks.insert(k.value(), rec);
-            }
-        }
-
-        Ok(StoreSnapshot { counters, patterns, blocks })
+        Ok(StoreSnapshot {
+            counters: read_table(&txn, COUNTERS)?,
+            patterns: read_table(&txn, PATTERNS)?,
+            blocks: read_table(&txn, BLOCKS)?,
+        })
     }
 
     /// Persists one judged block: its record, any new counters, and the
@@ -243,51 +220,50 @@ impl Store {
     /// Bulk-writes a merged snapshot into a fresh store, in batched
     /// transactions. Used by the `merge` subcommand.
     pub fn write_bulk(&self, snapshot: &StoreSnapshot) -> Result<()> {
+        self.write_table(COUNTERS, &snapshot.counters)?;
+        self.write_table(PATTERNS, &snapshot.patterns)?;
+        self.write_table(BLOCKS, &snapshot.blocks)?;
+        Ok(())
+    }
+
+    /// Writes one `u64 -> bincode(T)` table in batched transactions.
+    fn write_table<T: serde::Serialize>(
+        &self,
+        table: TableDefinition<u64, &[u8]>,
+        rows: &HashMap<u64, T>,
+    ) -> Result<()> {
         const BATCH: usize = 100_000;
-
-        let counters: Vec<_> = snapshot.counters.iter().collect();
-        for chunk in counters.chunks(BATCH) {
+        let rows: Vec<_> = rows.iter().collect();
+        for chunk in rows.chunks(BATCH) {
             let txn = self.db.begin_write()?;
             {
-                let mut t = txn.open_table(COUNTERS)?;
-                for (id, info) in chunk {
-                    let bytes = bincode::serde::encode_to_vec(info, BINCODE_CONFIG)
-                        .map_err(|e| eyre::eyre!("encode CounterInfo: {e}"))?;
-                    t.insert(**id, bytes.as_slice())?;
-                }
-            }
-            txn.commit()?;
-        }
-
-        let patterns: Vec<_> = snapshot.patterns.iter().collect();
-        for chunk in patterns.chunks(BATCH) {
-            let txn = self.db.begin_write()?;
-            {
-                let mut t = txn.open_table(PATTERNS)?;
-                for (key, rec) in chunk {
-                    let bytes = bincode::serde::encode_to_vec(rec, BINCODE_CONFIG)
-                        .map_err(|e| eyre::eyre!("encode PatternRecord: {e}"))?;
+                let mut t = txn.open_table(table)?;
+                for (key, value) in chunk {
+                    let bytes = bincode::serde::encode_to_vec(value, BINCODE_CONFIG)
+                        .map_err(|e| eyre::eyre!("encode table row: {e}"))?;
                     t.insert(**key, bytes.as_slice())?;
-                }
-            }
-            txn.commit()?;
-        }
-
-        let blocks: Vec<_> = snapshot.blocks.iter().collect();
-        for chunk in blocks.chunks(BATCH) {
-            let txn = self.db.begin_write()?;
-            {
-                let mut t = txn.open_table(BLOCKS)?;
-                for (num, rec) in chunk {
-                    let bytes = bincode::serde::encode_to_vec(rec, BINCODE_CONFIG)
-                        .map_err(|e| eyre::eyre!("encode BlockRecord: {e}"))?;
-                    t.insert(**num, bytes.as_slice())?;
                 }
             }
             txn.commit()?;
         }
         Ok(())
     }
+}
+
+/// Reads a whole `u64 -> bincode(T)` table into a map.
+fn read_table<T: serde::de::DeserializeOwned>(
+    txn: &redb::ReadTransaction,
+    table: TableDefinition<u64, &[u8]>,
+) -> Result<HashMap<u64, T>> {
+    let t = txn.open_table(table)?;
+    let mut map = HashMap::new();
+    for row in t.iter()? {
+        let (k, v) = row?;
+        let (value, _): (T, _) = bincode::serde::decode_from_slice(v.value(), BINCODE_CONFIG)
+            .map_err(|e| eyre::eyre!("decode table row: {e}"))?;
+        map.insert(k.value(), value);
+    }
+    Ok(map)
 }
 
 /// In-memory image of the store, owned by the judge / set-cover.
@@ -298,11 +274,16 @@ pub struct StoreSnapshot {
     pub blocks: HashMap<u64, BlockRecord>,
 }
 
+/// Linear-probe step for pattern-key collisions (golden ratio). Lives beside
+/// [`pattern_base_key`] and [`resolve_pattern_slot`] — the probing walk must
+/// stay byte-identical between the judge and `merge`.
+pub const PROBE_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
+
 /// Base pattern key: FxHash64 of the pattern's counter ids in ascending
 /// order. The SINGLE keying function shared by the judge (backfill) and
 /// `merge` — both must key identically or a merged store diverges from a
-/// sequential run. Collisions between differing bitmaps are handled by the
-/// callers' linear probing (`PROBE_STEP`).
+/// sequential run. Collisions between differing bitmaps are handled by
+/// [`resolve_pattern_slot`]'s linear probing.
 pub fn pattern_base_key(sorted_ids: &[u64]) -> u64 {
     use std::hash::Hasher;
     debug_assert!(sorted_ids.is_sorted());
@@ -313,12 +294,32 @@ pub fn pattern_base_key(sorted_ids: &[u64]) -> u64 {
     h.finish()
 }
 
+/// Walks the probe chain for `bitmap` starting at [`pattern_base_key`] of its
+/// sorted counter ids: returns `(slot_key, occupied)` where `occupied` means
+/// the slot already holds this exact bitmap (the caller merges stats into
+/// it); otherwise the slot is vacant and the caller inserts. The SINGLE
+/// probing walk shared by the judge and `merge`.
+pub fn resolve_pattern_slot(
+    patterns: &HashMap<u64, PatternRecord>,
+    sorted_ids: &[u64],
+    bitmap: &BitSet,
+) -> (u64, bool) {
+    let mut key = pattern_base_key(sorted_ids);
+    loop {
+        match patterns.get(&key) {
+            None => return (key, false),
+            Some(rec) if rec.bitmap == *bitmap => return (key, true),
+            Some(_) => key = key.wrapping_add(PROBE_STEP),
+        }
+    }
+}
+
 /// Coverage namespace key: a fingerprint of the instrumented mega-evm build,
 /// NOT a whole-exe hash. Stays stable across dispatcher/orchestration edits
 /// (so the resident mode can continue a store built by `backfill`), and only
 /// changes when mega-evm's revision or the toolchain changes — exactly when
 /// the counter ids would actually shift. Captured at compile time by build.rs.
-pub fn current_binary_id() -> Result<String> {
+pub fn current_binary_id() -> String {
     use std::hash::Hasher;
     let mega_evm = env!("COVERAGE_MEGA_EVM_REV");
     let rustc = env!("COVERAGE_RUSTC_VERSION");
@@ -326,5 +327,22 @@ pub fn current_binary_id() -> Result<String> {
     h.write(mega_evm.as_bytes());
     h.write_u8(0xff);
     h.write(rustc.as_bytes());
-    Ok(format!("megaevm:{}:fx{:016x}", &mega_evm[..mega_evm.len().min(12)], h.finish()))
+    format!("megaevm:{}:fx{:016x}", &mega_evm[..mega_evm.len().min(12)], h.finish())
+}
+
+/// Sorted-sample summary for per-block worker times: `(avg, p50, p95, max)`.
+/// Returns `None` for an empty sample. One definition for the three log
+/// sites (backfill summary, set-cover, inspect).
+pub fn elapsed_stats(samples: &mut [u64]) -> Option<(f64, u64, u64, u64)> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable();
+    let avg = samples.iter().sum::<u64>() as f64 / samples.len() as f64;
+    Some((
+        avg,
+        samples[samples.len() / 2],
+        samples[(samples.len() * 95 / 100).min(samples.len() - 1)],
+        samples[samples.len() - 1],
+    ))
 }

@@ -31,7 +31,7 @@ pub use db::{
     BlockMeta, ChainStore, ContractStore, MissingDataKind, StoreError, StoreResult, StoreResultExt,
 };
 pub mod data_types;
-pub use data_types::{PlainKey, PlainValue, iter_code_hashes};
+pub use data_types::{PlainKey, PlainValue, collect_code_hashes, iter_code_hashes};
 pub mod executor;
 pub use executor::{BlockInput, ValidationError, ValidationStats, replay_block, validate_block};
 #[cfg(feature = "std")]

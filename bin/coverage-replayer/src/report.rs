@@ -41,7 +41,8 @@ pub fn run(args: ReportArgs) -> Result<()> {
         crate::profile_rt::is_instrumented_build(),
         "report must run from the instrumented build (its binary embeds the coverage map)"
     );
-    let dirs = DataDir::new(&args.data_dir)?;
+    let dirs = DataDir::new(&args.data_dir);
+    dirs.ensure_layout()?;
     let manifest_path = args.manifest.unwrap_or_else(|| dirs.manifest_path());
     let manifest: Manifest = serde_json::from_str(
         &std::fs::read_to_string(&manifest_path)
@@ -87,8 +88,8 @@ pub fn run(args: ReportArgs) -> Result<()> {
     let source_dirs = if args.source_dirs.is_empty() {
         let detected = detect_mega_evm_checkout().ok_or_else(|| {
             eyre::eyre!(
-                "could not auto-detect the mega-evm checkout (no ./Cargo.lock or no matching \
-                 ~/.cargo/git/checkouts entry); pass --source-dir explicitly"
+                "could not find the mega-evm checkout for the built-against rev under \
+                 ~/.cargo/git/checkouts; pass --source-dir explicitly"
             )
         })?;
         info!(dir = %detected.display(), "auto-detected mega-evm sources");
@@ -126,19 +127,11 @@ pub fn run(args: ReportArgs) -> Result<()> {
     Ok(())
 }
 
-/// Finds the cargo git checkout of the mega-evm rev pinned in ./Cargo.lock.
+/// Finds the cargo git checkout of the mega-evm rev this binary was BUILT
+/// against (embedded by build.rs) — no runtime Cargo.lock parsing, no cwd
+/// dependence, and the rev can never disagree with the instrumented build.
 fn detect_mega_evm_checkout() -> Option<PathBuf> {
-    let lock = std::fs::read_to_string("Cargo.lock").ok()?;
-    // `source = "git+https://github.com/megaeth-labs/mega-evm.git?tag=vX#<full-rev>"`
-    let rev: String = lock
-        .lines()
-        .find(|l| l.contains("mega-evm.git"))?
-        .rsplit('#')
-        .next()?
-        .trim_end_matches('"')
-        .chars()
-        .take(7)
-        .collect();
+    let rev: String = env!("COVERAGE_MEGA_EVM_REV").chars().take(7).collect();
     if rev.len() != 7 {
         return None;
     }

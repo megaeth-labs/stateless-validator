@@ -67,12 +67,6 @@ impl From<&salt::SaltWitness> for LightWitness {
     }
 }
 
-impl From<salt::SaltWitness> for LightWitness {
-    fn from(witness: salt::SaltWitness) -> Self {
-        Self { kvs: witness.kvs, levels: witness.proof.levels }
-    }
-}
-
 /// Newtype adapter whose `Deserialize` impl consumes a full `SaltWitness`
 /// stream and keeps only the light parts, skipping all elliptic-curve work
 /// (see the module docs for the safety model).
@@ -89,14 +83,16 @@ impl<'de> Deserialize<'de> for LightWitnessFromSalt {
     }
 }
 
-/// `#[serde(deserialize_with = ...)]`-compatible decoding of a [`LightWitness`]
-/// from a full-`SaltWitness` serde stream.
+/// Decoding of a [`LightWitness`] from a full-`SaltWitness` serde stream —
+/// the implementation behind [`LightWitnessFromSalt`] (the only public
+/// surface; make this module public if a `#[serde(deserialize_with = ...)]`
+/// consumer ever appears).
 ///
 /// The mirror types below must stay field-for-field congruent with
 /// `salt::SaltWitness` / `salt::SaltProof` (same field names, order, and wire
 /// shapes); the fixture tests in this module lock that in against real
 /// mainnet witnesses.
-pub mod from_salt_witness {
+mod from_salt_witness {
     use serde::de::{MapAccess, Visitor};
 
     use super::*;

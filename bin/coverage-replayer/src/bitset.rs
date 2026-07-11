@@ -57,13 +57,14 @@ impl BitSet {
         }
     }
 
+    /// Short-circuits on the first word disproving subset-hood — this is the
+    /// inner kernel of the O(n²) dominance scans, where the overwhelmingly
+    /// common answer is "no".
     pub fn is_subset_of(&self, other: &BitSet) -> bool {
-        self.andnot_count(other) == 0
-    }
-
-    /// Raw 64-bit words (little-endian bit order within each word).
-    pub fn words(&self) -> &[u64] {
-        &self.words
+        self.words
+            .iter()
+            .enumerate()
+            .all(|(i, w)| w & !other.words.get(i).copied().unwrap_or(0) == 0)
     }
 
     /// Iterates the indices of all set bits, ascending.

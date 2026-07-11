@@ -599,7 +599,7 @@ impl RpcClient {
     /// The `on_witness_fetch` size metric is not recorded here — the exact
     /// breakdown needs the proof's commitment count. Callers that want a size
     /// signal can record `WitnessSizeBreakdown::new_light` (a documented
-    /// lower bound) themselves, as the trace server does.
+    /// lower bound) themselves.
     pub async fn get_witness_light(&self, number: u64, hash: B256) -> (LightWitness, MptWitness) {
         self.get_witness_light_with_deadline(number, hash, None)
             .await
@@ -1097,30 +1097,7 @@ async fn fetch_witness_raw(
     number: u64,
     hash: B256,
 ) -> Result<(SaltWitness, MptWitness)> {
-    let keys = WitnessRequestKeys { block_number: U64::from(number), block_hash: hash };
-    let encoded: String = provider
-        .client()
-        .request("mega_getBlockWitness", (keys,))
-        .await
-        .map_err(|e| eyre!("mega_getBlockWitness failed for block {number}: {e}"))?;
-
-    let decode_start = Instant::now();
-    let (salt_witness, mpt_witness) =
-        tokio::task::spawn_blocking(move || -> Result<(SaltWitness, MptWitness)> {
-            decode_witness_response(&encoded)
-                .map_err(|e| eyre!("failed to decode witness response: {e}"))
-        })
-        .await
-        .context("decode task panicked")??;
-
-    trace!(
-        block_number = number,
-        %hash,
-        decode_ms = decode_start.elapsed().as_millis(),
-        "Witness decoded",
-    );
-
-    Ok((salt_witness, mpt_witness))
+    fetch_witness_with(provider, number, hash, decode_witness_response, "Witness decoded").await
 }
 
 /// Zero-validation counterpart of [`fetch_witness_raw`]: decodes only the
@@ -1131,6 +1108,26 @@ async fn fetch_witness_light(
     number: u64,
     hash: B256,
 ) -> Result<(LightWitness, MptWitness)> {
+    fetch_witness_with(
+        provider,
+        number,
+        hash,
+        decode_witness_response_light,
+        "Witness light-decoded",
+    )
+    .await
+}
+
+/// Shared single-attempt `mega_getBlockWitness` fetch: one RPC round trip,
+/// then the caller-chosen decoder on the blocking pool (zstd + bincode over a
+/// multi-MB payload is CPU-bound).
+async fn fetch_witness_with<T: Send + 'static>(
+    provider: &RootProvider,
+    number: u64,
+    hash: B256,
+    decode: fn(&str) -> std::result::Result<T, crate::WitnessDecodingError>,
+    trace_msg: &'static str,
+) -> Result<T> {
     let keys = WitnessRequestKeys { block_number: U64::from(number), block_hash: hash };
     let encoded: String = provider
         .client()
@@ -1139,9 +1136,8 @@ async fn fetch_witness_light(
         .map_err(|e| eyre!("mega_getBlockWitness failed for block {number}: {e}"))?;
 
     let decode_start = Instant::now();
-    let result = tokio::task::spawn_blocking(move || -> Result<(LightWitness, MptWitness)> {
-        decode_witness_response_light(&encoded)
-            .map_err(|e| eyre!("failed to light-decode witness response: {e}"))
+    let result = tokio::task::spawn_blocking(move || -> Result<T> {
+        decode(&encoded).map_err(|e| eyre!("failed to decode witness response: {e}"))
     })
     .await
     .context("decode task panicked")??;
@@ -1150,7 +1146,7 @@ async fn fetch_witness_light(
         block_number = number,
         %hash,
         decode_ms = decode_start.elapsed().as_millis(),
-        "Witness light-decoded",
+        trace_msg,
     );
 
     Ok(result)

@@ -8,7 +8,6 @@
 //! is a small sparse profdata for `report`.
 
 use std::{
-    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -25,8 +24,6 @@ const SPOOL_ZSTD_LEVEL: i32 = 1;
 
 #[derive(Serialize, Deserialize)]
 pub struct SpoolEntry {
-    /// Block hash (redundant with the JSON, kept for cheap access).
-    pub block_hash: B256,
     /// The RPC block re-serialized as JSON (`Block<op_alloy_rpc_types::Transaction>`),
     /// the same shape `test_data/mainnet/blocks/*.json` uses.
     pub block_json: Vec<u8>,
@@ -61,12 +58,19 @@ pub struct DataDir {
 }
 
 impl DataDir {
-    pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
-        let dir = Self { root: root.into() };
-        for d in [dir.spool(), dir.codes(), dir.tmp(), dir.archive_profiles()] {
+    /// Pure path arithmetic — creates nothing. Writers call
+    /// [`Self::ensure_layout`]; read-only consumers (inspect, merge's shard
+    /// inputs) must not scaffold empty trees in a mistyped or foreign path.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// Creates the standard subdirectory layout (idempotent).
+    pub fn ensure_layout(&self) -> Result<()> {
+        for d in [self.spool(), self.codes(), self.tmp(), self.archive_profiles()] {
             fs::create_dir_all(&d)?;
         }
-        Ok(dir)
+        Ok(())
     }
 
     pub fn spool(&self) -> PathBuf {
@@ -142,13 +146,4 @@ pub fn load_contracts(
         map.insert(*hash, revm::state::Bytecode::new_raw(bytes.into()));
     }
     Ok(map)
-}
-
-/// Extracts sorted, deduped code hashes referenced by a light witness.
-pub fn code_hashes_of(witness: &LightWitness) -> Vec<B256> {
-    let kvs: &BTreeMap<_, _> = &witness.kvs;
-    let mut hashes: Vec<B256> = stateless_core::iter_code_hashes(kvs).collect();
-    hashes.sort();
-    hashes.dedup();
-    hashes
 }
