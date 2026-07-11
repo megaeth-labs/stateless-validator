@@ -39,9 +39,6 @@ use crate::{
 
 /// Linear-probe step for pattern-key collisions (golden ratio).
 const PROBE_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
-/// Abort the run after this many consecutive sanity failures — the chain spec
-/// has almost certainly drifted and every further bitmap would be garbage.
-const MAX_DIVERGENT_STREAK: u64 = 20;
 
 #[derive(Args, Debug, Clone)]
 pub struct BackfillArgs {
@@ -85,14 +82,11 @@ pub struct BackfillArgs {
     /// Explicit llvm-profdata path (default: auto-detect via rustc sysroot).
     #[clap(long)]
     pub llvm_profdata: Option<String>,
-    /// Per-block worker timeout in seconds.
+    /// Interval (seconds) for the "block still executing" progress warning.
+    /// Blocks are NEVER timed out or skipped — a stuck block stays visibly
+    /// stuck in the log until it completes.
     #[clap(long, default_value_t = 600)]
-    pub block_timeout_secs: u64,
-}
-
-enum Judged {
-    Response(WorkerResponse),
-    Failed { block: u64, error: String },
+    pub slow_block_warn_secs: u64,
 }
 
 pub async fn run(args: BackfillArgs) -> Result<()> {
@@ -125,14 +119,18 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         args.to
     );
 
-    // Work list: skip blocks already judged in a previous run.
-    let todo: Vec<u64> =
-        (args.from..=args.to).filter(|n| !snapshot.blocks.contains_key(n)).collect();
+    // Work list: skip only blocks that previously replayed CLEANLY. Error /
+    // Divergent records are retried — no block is ever permanently excluded.
+    let todo: Vec<u64> = (args.from..=args.to)
+        .filter(|n| !matches!(snapshot.blocks.get(n), Some(r) if r.status == BlockStatus::Ok))
+        .collect();
+    let retrying = todo.iter().filter(|n| snapshot.blocks.contains_key(n)).count();
     let total = todo.len() as u64;
     info!(
         range = %format!("{}..={}", args.from, args.to),
         todo = total,
         skipped = (args.to - args.from + 1) - total,
+        retrying_quarantined = retrying,
         "backfill starting"
     );
     if todo.is_empty() {
@@ -142,7 +140,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
 
     let workers = args.workers.unwrap_or_else(|| num_cpus::get().saturating_sub(2).max(1));
     let (dispatch_tx, dispatch_rx) = kanal::bounded_async::<u64>(workers * 2);
-    let (judged_tx, mut judged_rx) = tokio::sync::mpsc::channel::<Judged>(workers * 2);
+    let (judged_tx, mut judged_rx) = tokio::sync::mpsc::channel::<WorkerResponse>(workers * 2);
 
     // ---- worker managers ----
     let mut manager_set = JoinSet::new();
@@ -166,7 +164,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         let dispatch_tx = dispatch_tx.clone();
         let fetch_concurrency = args.fetch_concurrency.max(1);
         tokio::spawn(async move {
-            let mut inflight: JoinSet<(u64, Result<()>)> = JoinSet::new();
+            let mut inflight: JoinSet<u64> = JoinSet::new();
             for n in todo {
                 while inflight.len() >= fetch_concurrency {
                     if let Some(done) = inflight.join_next().await {
@@ -175,9 +173,26 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
                 }
                 let dirs = dirs.clone();
                 let client = client.clone();
+                // Retry until success — a block is never skipped. Transient
+                // RPC/IO failures resolve on retry; a persistent failure loops
+                // visibly in the log until the operator intervenes.
                 inflight.spawn(async move {
-                    let res = fetch_block(&client, &dirs, n).await;
-                    (n, res)
+                    let mut attempt = 0u64;
+                    loop {
+                        match fetch_block(&client, &dirs, n).await {
+                            Ok(()) => break n,
+                            Err(e) => {
+                                attempt += 1;
+                                warn!(
+                                    block = n,
+                                    attempt,
+                                    error = %format!("{e:#}"),
+                                    "fetch failed; retrying in 5s (blocks are never skipped)"
+                                );
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                            }
+                        }
+                    }
                 });
             }
             while let Some(done) = inflight.join_next().await {
@@ -202,18 +217,19 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
 }
 
 async fn forward_fetched(
-    done: std::result::Result<(u64, Result<()>), tokio::task::JoinError>,
+    done: std::result::Result<u64, tokio::task::JoinError>,
     dispatch_tx: &kanal::AsyncSender<u64>,
 ) {
     match done {
-        Ok((n, Ok(()))) => {
+        Ok(n) => {
             // Queue closed (all managers dead) is fatal-ish; just log.
             if dispatch_tx.send(n).await.is_err() {
                 warn!(block = n, "dispatch queue closed, dropping fetched block");
             }
         }
-        Ok((n, Err(e))) => warn!(block = n, error = %format!("{e:#}"), "fetch failed, skipping"),
-        Err(e) => warn!(error = %e, "fetch task panicked"),
+        // A panic in a fetch task is a code bug; the block stays absent from
+        // the store, so a re-run picks it up. Loud, not silent.
+        Err(e) => tracing::error!(error = %e, "fetch task panicked — block will need a re-run"),
     }
 }
 
@@ -257,53 +273,55 @@ async fn fetch_block(client: &RpcClient, dirs: &DataDir, n: u64) -> Result<()> {
     Ok(())
 }
 
-/// Owns one resident worker child; respawns it on failure, retries a block
-/// once in a fresh child before reporting it as failed.
+/// Owns one resident worker child. A block is NEVER skipped: worker crashes
+/// respawn the child and retry the same block, indefinitely; long-running
+/// blocks are only warned about (see `slow_block_warn_secs`), never killed.
 async fn worker_manager(
     id: usize,
     rx: kanal::AsyncReceiver<u64>,
-    tx: tokio::sync::mpsc::Sender<Judged>,
+    tx: tokio::sync::mpsc::Sender<WorkerResponse>,
     dirs: Arc<DataDir>,
     args: BackfillArgs,
     llvm_profdata: PathBuf,
 ) {
     let mut worker: Option<WorkerHandle> = None;
-    let timeout = Duration::from_secs(args.block_timeout_secs);
+    let warn_after = Duration::from_secs(args.slow_block_warn_secs.max(1));
 
     while let Ok(n) = rx.recv().await {
         let req = WorkerRequest { block: n, spool: dirs.spool_entry(n) };
-        let mut last_err = String::new();
-        let mut delivered = false;
-
-        for _attempt in 0..2 {
+        let mut attempt = 0u64;
+        let resp = loop {
             if worker.is_none() {
                 match WorkerHandle::spawn(&args, &dirs, &llvm_profdata) {
                     Ok(w) => worker = Some(w),
                     Err(e) => {
-                        last_err = format!("spawn worker: {e:#}");
+                        warn!(worker = id, error = %format!("{e:#}"), "spawn worker failed; retrying in 1s");
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
                     }
                 }
             }
             let w = worker.as_mut().expect("just spawned");
-            match w.round_trip(&req, timeout).await {
-                Ok(resp) => {
-                    let _ = tx.send(Judged::Response(resp)).await;
-                    delivered = true;
-                    break;
-                }
+            match w.round_trip(&req, warn_after, id).await {
+                Ok(resp) => break resp,
                 Err(e) => {
-                    warn!(worker = id, block = n, error = %format!("{e:#}"), "worker round-trip failed, respawning");
-                    last_err = format!("{e:#}");
+                    attempt += 1;
+                    warn!(
+                        worker = id,
+                        block = n,
+                        attempt,
+                        error = %format!("{e:#}"),
+                        "worker died mid-block; respawning and retrying same block"
+                    );
                     if let Some(mut dead) = worker.take() {
                         dead.kill().await;
                     }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
-        }
-        if !delivered {
-            let _ = tx.send(Judged::Failed { block: n, error: last_err }).await;
+        };
+        if tx.send(resp).await.is_err() {
+            return; // judge gone (run aborting)
         }
     }
 }
@@ -340,19 +358,34 @@ impl WorkerHandle {
         Ok(Self { child, stdin, stdout: tokio::io::BufReader::new(stdout).lines() })
     }
 
+    /// Sends one request and waits for the response with NO deadline: a slow
+    /// block only produces a periodic warning, never a kill. Errors here mean
+    /// the child actually died (closed stdout / bad frame), not slowness.
     async fn round_trip(
         &mut self,
         req: &WorkerRequest,
-        timeout: Duration,
+        warn_after: Duration,
+        worker_id: usize,
     ) -> Result<WorkerResponse> {
         let mut line = serde_json::to_string(req)?;
         line.push('\n');
         self.stdin.write_all(line.as_bytes()).await?;
         self.stdin.flush().await?;
 
-        let next = tokio::time::timeout(timeout, self.stdout.next_line())
-            .await
-            .map_err(|_| eyre::eyre!("worker timed out after {timeout:?}"))??;
+        let started = Instant::now();
+        let next = loop {
+            match tokio::time::timeout(warn_after, self.stdout.next_line()).await {
+                Err(_still_running) => {
+                    warn!(
+                        worker = worker_id,
+                        block = req.block,
+                        running_secs = started.elapsed().as_secs(),
+                        "block still executing — waiting (blocks are never killed)"
+                    );
+                }
+                Ok(next) => break next?,
+            }
+        };
         let resp_line = next.ok_or_else(|| eyre::eyre!("worker closed stdout (crashed?)"))?;
         let resp: WorkerResponse = serde_json::from_str(&resp_line)
             .map_err(|e| eyre::eyre!("bad worker response {resp_line:?}: {e}"))?;
@@ -376,7 +409,6 @@ struct JudgeState<'a> {
     processed: u64,
     total: u64,
     new_patterns: u64,
-    divergent_streak: u64,
     started: Instant,
     /// Worker wall-clock per successfully replayed block (spool load + replay
     /// + profraw + bitmap extraction) — the E3 throughput measurement.
@@ -421,7 +453,6 @@ impl<'a> JudgeState<'a> {
             processed: 0,
             total,
             new_patterns: 0,
-            divergent_streak: 0,
             started: Instant::now(),
             elapsed_ok_ms: Vec::new(),
             llvm_profdata,
@@ -429,72 +460,63 @@ impl<'a> JudgeState<'a> {
         }
     }
 
-    fn ingest(&mut self, outcome: Judged) -> Result<()> {
+    /// Fail-stop policy: replay errors and sanity divergences are recorded to
+    /// the store (spool kept for forensics) and then ABORT the whole run.
+    /// Rationale: every block has been independently verified to replay
+    /// cleanly, so any failure here is an infrastructure/chain-spec bug — a
+    /// gap must never be silently scanned past. The recorded non-Ok status is
+    /// retried automatically on the next run (see the todo filter).
+    fn ingest(&mut self, resp: WorkerResponse) -> Result<()> {
         self.processed += 1;
-        match outcome {
-            Judged::Failed { block, error } => {
-                warn!(block, error, "block failed permanently, quarantined");
-                let record = BlockRecord {
-                    hash: B256::ZERO,
-                    status: BlockStatus::Error,
-                    pattern_key: None,
-                    gas_used: 0,
-                    tx_count: 0,
-                    elapsed_ms: 0,
-                    error: Some(error),
-                };
-                self.store.commit_block(block, &record, &[], None)?;
-                self.cleanup_tmp(block);
-                // Spool entry is kept for debugging.
-            }
-            Judged::Response(resp) if !resp.ok => {
-                warn!(block = resp.block, error = ?resp.error, "replay error, quarantined");
-                let record = BlockRecord {
-                    hash: resp.block_hash,
-                    status: BlockStatus::Error,
-                    pattern_key: None,
-                    gas_used: 0,
-                    tx_count: resp.tx_count,
-                    elapsed_ms: resp.elapsed_ms,
-                    error: resp.error.clone(),
-                };
-                self.store.commit_block(resp.block, &record, &[], None)?;
-                self.cleanup_tmp(resp.block);
-            }
-            Judged::Response(resp) => {
-                let sane = resp.gas_ok && resp.receipts_root_ok && resp.logs_bloom_ok;
-                if !sane {
-                    self.divergent_streak += 1;
-                    warn!(
-                        block = resp.block,
-                        gas_ok = resp.gas_ok,
-                        receipts_root_ok = resp.receipts_root_ok,
-                        logs_bloom_ok = resp.logs_bloom_ok,
-                        streak = self.divergent_streak,
-                        "SANITY FAILURE — execution diverged from header, bitmap NOT ingested"
-                    );
-                    let record = BlockRecord {
-                        hash: resp.block_hash,
-                        status: BlockStatus::Divergent,
-                        pattern_key: None,
-                        gas_used: resp.gas_used,
-                        tx_count: resp.tx_count,
-                        elapsed_ms: resp.elapsed_ms,
-                        error: None,
-                    };
-                    self.store.commit_block(resp.block, &record, &[], None)?;
-                    self.cleanup_tmp(resp.block);
-                    ensure!(
-                        self.divergent_streak < MAX_DIVERGENT_STREAK,
-                        "{} consecutive divergent blocks — chain spec drift, aborting",
-                        self.divergent_streak
-                    );
-                } else {
-                    self.divergent_streak = 0;
-                    self.ingest_ok(resp)?;
-                }
-            }
+
+        if !resp.ok {
+            let record = BlockRecord {
+                hash: resp.block_hash,
+                status: BlockStatus::Error,
+                pattern_key: None,
+                gas_used: 0,
+                tx_count: resp.tx_count,
+                elapsed_ms: resp.elapsed_ms,
+                error: resp.error.clone(),
+            };
+            self.store.commit_block(resp.block, &record, &[], None)?;
+            self.cleanup_tmp(resp.block);
+            eyre::bail!(
+                "block {} failed to replay: {} — ABORTING (no block may be skipped; \
+                 spool kept at {}; a re-run will retry this block)",
+                resp.block,
+                resp.error.as_deref().unwrap_or("unknown"),
+                self.dirs.spool_entry(resp.block).display(),
+            );
         }
+
+        let sane = resp.gas_ok && resp.receipts_root_ok && resp.logs_bloom_ok;
+        if !sane {
+            let record = BlockRecord {
+                hash: resp.block_hash,
+                status: BlockStatus::Divergent,
+                pattern_key: None,
+                gas_used: resp.gas_used,
+                tx_count: resp.tx_count,
+                elapsed_ms: resp.elapsed_ms,
+                error: None,
+            };
+            self.store.commit_block(resp.block, &record, &[], None)?;
+            self.cleanup_tmp(resp.block);
+            eyre::bail!(
+                "SANITY FAILURE at block {} (gas_ok={} receipts_root_ok={} logs_bloom_ok={}) — \
+                 execution diverged from the header; bitmap NOT ingested. ABORTING: this is \
+                 chain-spec drift or an execution bug, and continuing would leave a silent \
+                 coverage gap. Spool kept at {}.",
+                resp.block,
+                resp.gas_ok,
+                resp.receipts_root_ok,
+                resp.logs_bloom_ok,
+                self.dirs.spool_entry(resp.block).display(),
+            );
+        }
+
+        self.ingest_ok(resp)?;
         if self.processed.is_multiple_of(25) || self.processed == self.total {
             self.progress_log();
         }
