@@ -214,10 +214,8 @@ struct MockServerState {
     fixtures: TestFixtures,
     mpt_witnesses: HashMap<BlockHash, MptWitness>,
     /// Every *accepted* `mega_setValidatedBlocks` call, as `(first_block, last_block)` numbers.
-    /// Clone the `Arc` before handing the state to the server to assert on reports.
     validated_reports: Arc<Mutex<Vec<(u64, u64)>>>,
-    /// Number of upcoming `mega_setValidatedBlocks` calls to fail with an RPC error (simulating
-    /// a transient endpoint blip); decremented per rejected call.
+    /// Number of upcoming `mega_setValidatedBlocks` calls to reject with an RPC error.
     reject_reports: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -495,10 +493,9 @@ async fn integration_test() {
     info!("Mock RPC server has been shut down");
 }
 
-/// Runs `run_with_signals` over the synthetic fixtures to their max block (`--end-block` →
-/// `sync_target`) with the report endpoint wired to the mock server, failing the first
-/// `reject_first_reports` report calls, and asserts the last accepted report covers the end
-/// block. Returns every accepted report for further assertions.
+/// Runs `run_with_signals` to the fixtures' max block (`--end-block` → `sync_target`) with
+/// reports wired to the mock, failing the first `reject_first_reports` calls; asserts the last
+/// accepted report covers the end block and returns all accepted reports.
 async fn run_end_block_slice_and_assert_tip_reported(
     reject_first_reports: usize,
 ) -> Vec<(u64, u64)> {
@@ -514,8 +511,6 @@ async fn run_end_block_slice_and_assert_tip_reported(
     let reports = Arc::clone(&state.validated_reports);
     state.reject_reports.store(reject_first_reports, std::sync::atomic::Ordering::SeqCst);
     let (handle, url) = setup_mock_rpc_server(state).await;
-    // Unlike `integration_test`, the report endpoint is wired up (fourth argument), pointing at
-    // the same mock server.
     let client = Arc::new(
         RpcClient::new_with_config(
             &[url.as_str()],
@@ -557,19 +552,17 @@ async fn run_end_block_slice_and_assert_tip_reported(
     reports.clone()
 }
 
-/// A fixed-range run (`--end-block` → `sync_target`) must report its final validated tip
-/// upstream before exiting. The periodic reporter is cancelled the instant the pipeline
-/// completes and its 1s tick usually never fires on a short run, so without the final flush in
-/// `run_with_signals` the whole slice would finish unreported — and a slice run has no later
-/// restart whose first tick would re-report it.
+/// A fixed-range run must flush its final validated tip before exiting: the periodic reporter
+/// is cancelled when the pipeline completes (its 1s tick rarely fires on a short slice) and a
+/// slice run has no restart to re-report, so the final flush in `run_with_signals` is the only
+/// path.
 #[tokio::test]
 async fn end_block_run_reports_final_tip() {
     run_end_block_slice_and_assert_tip_reported(0).await;
 }
 
-/// The final report must survive a transient endpoint failure: the run has no reporter tick
-/// after it, so a single blip at exactly shutdown would otherwise permanently lose the tail.
-/// The mock fails the first report call; the final flush's bounded retry must land the second.
+/// Like [`end_block_run_reports_final_tip`], but the mock rejects the first report call: the
+/// final flush's bounded retry must still land the tip.
 #[tokio::test]
 async fn end_block_final_report_retries_after_transient_failure() {
     run_end_block_slice_and_assert_tip_reported(1).await;

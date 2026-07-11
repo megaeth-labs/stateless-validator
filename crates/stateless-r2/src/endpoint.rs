@@ -16,8 +16,7 @@ pub fn parse_endpoint(endpoint: &str) -> (String, String) {
     let Some(host_str) = url.host_str() else { return empty() };
 
     // Accept only a bare origin. `Url` normalizes a hostname-only URL to a "/" path, so treat "/"
-    // (and the empty path) as "no path"; anything else — plus any query or fragment — is a
-    // misconfigured endpoint we must not silently forward.
+    // (and the empty path) as "no path"; any other path, query, or fragment is rejected.
     let has_path = !matches!(url.path(), "" | "/");
     if has_path || url.query().is_some() || url.fragment().is_some() {
         return empty();
@@ -60,8 +59,6 @@ mod tests {
 
     #[test]
     fn parse_endpoint_rejects_endpoint_with_path() {
-        // A pasted dashboard bucket URL (bucket embedded as a path) must be rejected — the path
-        // would be sent on the wire but never signed, failing SigV4.
         let (endpoint, host) =
             parse_endpoint("https://acc.r2.cloudflarestorage.com/witness-testnet");
         assert!(endpoint.is_empty(), "an endpoint with a path must be rejected");

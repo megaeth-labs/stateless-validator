@@ -39,12 +39,9 @@ pub enum R2Error {
 }
 
 impl R2Error {
-    /// Whether this failure means the endpoint itself is unhealthy/overloaded and the caller should
-    /// apply a backoff (transport failures, `429`, and any `5xx`) rather than retry immediately.
-    ///
-    /// This is the single source of truth for "should the upload pool back off?"; classifying
-    /// transport failures and `5xx` here — not just `429`/`503` — is what prevents a retry storm
-    /// against an overloaded R2 endpoint.
+    /// Whether this failure means the endpoint itself is unhealthy/overloaded and the caller
+    /// should apply a backoff (transport failures, `429`, and any `5xx`) rather than retry
+    /// immediately.
     pub const fn is_backoff_worthy(&self) -> bool {
         matches!(self, Self::Transport(_) | Self::Throttled { .. })
     }
@@ -101,12 +98,9 @@ pub async fn put_object(
     classify_response(response).await
 }
 
-/// Whether a non-success HTTP status means R2 is throttling or struggling (`429` and any `5xx`)
-/// and the caller should back off before retrying, as opposed to a status that will not clear on
-/// retry.
-///
-/// The single definition of the throttle set: both the write path ([`classify_response`]) and the
-/// stateless validator's R2 witness reader classify with this predicate, so the two cannot drift.
+/// Whether a non-success status (`429` or any `5xx`) is backoff-worthy throttling, as opposed to
+/// one that will not clear on retry. The single definition of the throttle set — the write path
+/// (`classify_response`) and the validator's R2 reader both classify with it.
 pub const fn is_throttle_status(status: u16) -> bool {
     status == 429 || status >= 500
 }

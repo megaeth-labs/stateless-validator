@@ -36,18 +36,16 @@ use crate::metrics;
 /// Max retry rounds for retryable (transport/429/5xx) failures before surfacing an error.
 const MAX_RETRIES: usize = 8;
 /// First retry sleep; doubles each round up to [`MAX_BACKOFF`]. Test builds shrink all three
-/// durations so the retry-path tests run in milliseconds; the loop logic is identical.
+/// durations so the retry-path tests run in milliseconds.
 const INITIAL_BACKOFF: Duration =
     if cfg!(test) { Duration::from_millis(5) } else { Duration::from_millis(500) };
 /// Upper bound on any single retry sleep.
 const MAX_BACKOFF: Duration =
     if cfg!(test) { Duration::from_millis(20) } else { Duration::from_secs(30) };
-/// Throttle applied before surfacing any deterministic failure (`Missing`, `Status`, `Decode`,
-/// `DecodePanicked`): the pipeline fetcher re-enqueues a failed fetch immediately with no delay
-/// (`stateless-core/src/pipeline/fetcher.rs`), so returning instantly would hot-loop signed GETs
-/// (and full block re-downloads) against R2 on a wrong credential, a corrupt object, or a genuine
-/// gap. If the fetcher ever grows per-block re-enqueue backoff, this throttle is the piece to
-/// delete.
+/// Throttle applied before surfacing any deterministic (non-retryable) failure: the pipeline
+/// fetcher (`stateless-core/src/pipeline/fetcher.rs`) re-enqueues failed fetches with no delay,
+/// so returning instantly would hot-loop signed GETs against R2. Delete this once the fetcher
+/// grows per-block re-enqueue backoff.
 const DETERMINISTIC_FAILURE_THROTTLE: Duration =
     if cfg!(test) { Duration::from_millis(5) } else { Duration::from_secs(2) };
 /// Cap on the response body carried inside `Throttled`/`Status` errors.
@@ -56,10 +54,8 @@ const MAX_ERROR_BODY_BYTES: usize = 1024;
 /// Failure outcome of an R2 witness fetch.
 #[derive(Debug, thiserror::Error)]
 pub enum R2WitnessError {
-    /// The primary object is absent from the bucket (HTTP 404). For a block known to have a
-    /// witness this is a completeness gap in R2, but near the tip (or right after a reorg) it can
-    /// also fire transiently before the uploader has PUT the object — the retry that follows the
-    /// pipeline's re-enqueue resolves those.
+    /// The primary object is absent from the bucket (HTTP 404): a completeness gap in R2, or a
+    /// transient miss near the tip / right after a reorg, before the uploader has PUT the object.
     #[error("R2 witness MISSING for block {number} (key {key}): object not found (404)")]
     Missing { number: u64, key: String },
     /// Transport-level failure (connection reset/timeout) — the endpoint is effectively
@@ -70,9 +66,9 @@ pub enum R2WitnessError {
     /// overload / SlowDown). Retried internally with backoff before surfacing.
     #[error("R2 throttled/server error {status} for block {number} (key {key}): {body}")]
     Throttled { number: u64, key: String, status: u16, body: String },
-    /// A non-success status unlikely to clear on retry: 4xx other than 429 (e.g. 403
-    /// SignatureDoesNotMatch from bad credentials, 404 NoSuchBucket from a wrong bucket name) or a
-    /// 3xx (redirects are never followed — a signed GET cannot survive one).
+    /// A non-success status unlikely to clear on retry: a 4xx other than 429 (e.g. 403 bad
+    /// credentials, 404 NoSuchBucket) or a 3xx (redirects are never followed — see
+    /// [`R2WitnessClient::new`]).
     #[error("R2 unexpected status {status} for block {number} (key {key}): {body}")]
     Status { number: u64, key: String, status: u16, body: String },
     /// The object was fetched but its bytes did not decode to a `(SaltWitness, MptWitness)` tuple
@@ -124,9 +120,8 @@ pub struct R2WitnessClient {
     /// SigV4 canonical host (`host[:port]`).
     host: String,
     bucket: String,
-    /// Caps concurrent GETs, honoring `--witness-max-concurrent-requests` — the documented
-    /// knob for bounding witness I/O (the RPC witness path enforces it with its own semaphore
-    /// inside `RpcClient`, which this client bypasses).
+    /// Caps concurrent GETs, honoring `--witness-max-concurrent-requests` (the RPC witness path
+    /// enforces it inside `RpcClient`, which R2 mode bypasses).
     concurrency: Arc<Semaphore>,
 }
 
@@ -199,10 +194,8 @@ impl R2WitnessClient {
         hash: B256,
     ) -> Result<(SaltWitness, MptWitness), R2WitnessError> {
         let started = Instant::now();
-        // Time queued on the concurrency cap, subtracted from the fetch-duration metric below:
-        // queue wait is self-imposed by `--witness-max-concurrent-requests`, and folding it in
-        // would make the histogram indistinguishable from genuine R2 slowness. (The RPC witness
-        // path likewise starts its attempt timer only after acquiring its permit.)
+        // Subtracted from the fetch-duration metric below: queue wait on the concurrency cap is
+        // self-imposed, and folded in it would masquerade as R2 slowness.
         let mut queue_wait = Duration::ZERO;
         let key = keys::block_object_key(number, hash);
         let mut backoff = INITIAL_BACKOFF;
@@ -210,9 +203,8 @@ impl R2WitnessClient {
 
         let bytes = loop {
             attempt += 1;
-            // The permit is scoped to the request itself — holding it across the backoff sleep
-            // or the decode below would waste capacity other fetches could use. Mirrors the RPC
-            // path, which acquires its witness permit per attempt inside the retry loop.
+            // Permit scoped to the GET itself — holding it across the backoff sleep or the
+            // decode below would waste capacity other fetches could use.
             let outcome = {
                 let queued = Instant::now();
                 let _permit = self.concurrency.acquire().await.expect("semaphore is never closed");
@@ -355,8 +347,8 @@ mod tests {
                 // Drain the request head before replying.
                 let mut buf = [0u8; 4096];
                 let _ = sock.read(&mut buf).await;
-                // The reason phrase is never interpreted, and `location` is load-bearing only for
-                // the 3xx (redirects-not-followed) test — harmless noise on other statuses.
+                // The reason phrase is never interpreted; `location` matters only to the
+                // redirects-not-followed test.
                 let head = format!(
                     "HTTP/1.1 {status} X\r\nconnection: close\r\n\
                      location: http://example.invalid/elsewhere\r\n\
@@ -429,10 +421,9 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), MAX_RETRIES + 1, "initial attempt + MAX_RETRIES");
     }
 
-    /// End-to-end happy path: a real fixture witness encoded exactly as the uploader writes it
-    /// (`encode_witness_payload`) and served with a 200 must decode back to the original tuple in
-    /// a single GET. This is the only test that exercises the success path of
-    /// `get_object` → `spawn_blocking` decode; the failure tests can't prove it.
+    /// The only test of the success path (`get_object` → `spawn_blocking` decode): a fixture
+    /// witness encoded with the uploader's `encode_witness_payload` must round-trip to the
+    /// original tuple.
     #[tokio::test]
     async fn valid_object_decodes_end_to_end() {
         use stateless_test_utils::fixtures::TestFixtures;
@@ -463,27 +454,22 @@ mod tests {
 
     #[tokio::test]
     async fn redirects_are_not_followed() {
-        // A signed GET cannot survive a redirect; the 3xx must surface instead of a spurious 403
-        // from the redirect target (which would also leak the request outside the endpoint).
         let (endpoint, hits) = mock_r2(vec![(301, "moved")]).await;
         let err = fetch(&endpoint).await.unwrap_err();
         assert!(matches!(err, R2WitnessError::Status { status: 301, .. }), "{err}");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
-    /// `--witness-max-concurrent-requests` is the documented knob for bounding witness I/O, and
-    /// in R2 mode this client is the only thing enforcing it (the `RpcClient` witness semaphore
-    /// is bypassed). Six concurrent fetches against a limit of 2 must never have more than two
-    /// GETs in flight at once.
+    /// In R2 mode this client is the only enforcement of `--witness-max-concurrent-requests`:
+    /// six concurrent fetches against a limit of 2 must never exceed two in-flight GETs.
     #[tokio::test]
     async fn concurrency_limit_bounds_in_flight_gets() {
         const LIMIT: usize = 2;
         const FETCHES: u64 = 6;
 
-        // Handles each connection in its own task (unlike `mock_r2`, which serves one at a
-        // time and so cannot observe concurrency), tracking the in-flight high-water mark.
-        // Responses are held open long enough for the other fetches to pile up behind the
-        // semaphore, then answered 404 (a deterministic error → exactly one GET per fetch).
+        // Per-connection tasks (unlike `mock_r2`, which serves serially) track the in-flight
+        // high-water mark; each response is held 50ms so fetches pile up behind the semaphore,
+        // then answered 404 (deterministic → exactly one GET per fetch).
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let in_flight = Arc::new(AtomicUsize::new(0));
@@ -527,8 +513,8 @@ mod tests {
         assert_eq!(peak, LIMIT, "expected the fetches to saturate the concurrency limit");
     }
 
-    /// Every deterministic failure must be throttled before surfacing — the pipeline re-enqueues
-    /// failed fetches immediately, so an unthrottled return hot-loops GETs against R2.
+    /// Every deterministic failure must be throttled before surfacing (see
+    /// [`DETERMINISTIC_FAILURE_THROTTLE`] for why).
     #[tokio::test]
     async fn deterministic_failures_are_throttled_before_surfacing() {
         for (status, body) in [(403, ""), (404, ""), (200, "garbage")] {

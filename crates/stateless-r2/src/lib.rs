@@ -6,8 +6,7 @@
 //! (`bin/stateless-validator/src/r2_witness.rs`). The request signing, object-key layout, and
 //! response handling must be byte-for-byte identical across all of them, or the validator can no
 //! longer locate or authenticate against the uploaded objects. This crate is the single home for
-//! those primitives so the writers and the reader cannot drift; it lives in this repo and mega-reth
-//! consumes it from the same git tags it already pulls `stateless-core` / `stateless-common` from:
+//! those primitives so the writers and the reader cannot drift:
 //!
 //! - [`sigv4`] — a minimal AWS Signature Version 4 signer for buffered `PUT`/`GET`/`DELETE`
 //!   requests;

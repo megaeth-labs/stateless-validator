@@ -328,11 +328,9 @@ pub fn on_witness_fetch(b: WitnessSizeBreakdown) {
 
 // R2 witness source metrics (`--witness-source r2`)
 
-/// Record a successful R2 witness fetch: duration (GET incl. internal retries, plus decode —
-/// excluding time queued on the witness concurrency cap, which is self-imposed and would mask
-/// genuine R2 latency) and the same size breakdown the RPC path reports via
-/// [`on_witness_fetch`], so the witness-size histograms stay populated when the witness source
-/// is R2.
+/// Record a successful R2 witness fetch: duration (see [`names::WITNESS_FETCH_R2_TIME`]'s
+/// description for what it covers) plus the same size breakdown as [`on_witness_fetch`], so the
+/// witness-size histograms stay populated in R2 mode.
 pub fn on_r2_witness_fetch_success(duration: f64, breakdown: WitnessSizeBreakdown) {
     histogram!(names::WITNESS_FETCH_R2_TIME).record(duration);
     on_witness_fetch(breakdown);

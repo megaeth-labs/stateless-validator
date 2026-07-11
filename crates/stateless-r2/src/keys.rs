@@ -6,9 +6,8 @@
 //! - a **num** pointer `num/{range}/{number}`.
 //!
 //! This module is the single home of that layout plus the shared [`pointer_body`] and the
-//! `x-amz-meta-*` [`witness_metadata`], so the producers and the reader cannot drift. Objects
-//! carry no per-object expiry; retention is a bucket lifecycle rule targeting these prefixes
-//! (see the crate-level docs).
+//! `x-amz-meta-*` [`witness_metadata`], so the producers and the reader cannot drift. Retention
+//! is a bucket lifecycle rule targeting these prefixes (see the crate-level docs).
 
 use std::fmt::Display;
 
@@ -23,10 +22,8 @@ pub const ATTR_PREFIX: &str = "attr";
 /// Object-key prefix for the by-block-number reference pointer.
 pub const NUM_PREFIX: &str = "num";
 
-/// Block range size for grouping keys (1000 blocks per group).
-///
-/// Blocks are grouped into ranges of 1000 so R2 list and lifecycle operations can target contiguous
-/// block ranges by prefix.
+/// Block range size for grouping keys: ranges let R2 list and lifecycle operations target
+/// contiguous blocks by prefix.
 pub const BLOCK_RANGE_SIZE: u64 = 1000;
 
 /// Calculate the range-bucket prefix for grouping blocks into ranges.
@@ -42,9 +39,9 @@ pub const fn block_range_prefix(block_number: u64) -> u64 {
 
 /// Builds just the primary witness object key: `block/{range}/{number}.{hash}`.
 ///
-/// This is the single implementation of the primary-key template. [`object_keys`] (the write path)
-/// delegates here, and the stateless validator's R2 witness source (the read path) calls it
-/// directly, so the writers and the reader can never disagree on where a witness lives.
+/// The single implementation of the primary-key template: both the write path ([`object_keys`])
+/// and the validator's reader build the key here, so they can never disagree on where a witness
+/// lives.
 pub fn block_object_key(block_number: u64, block_hash: impl Display) -> String {
     let range_start = block_range_prefix(block_number);
     let range_end = range_start + BLOCK_RANGE_SIZE - 1;
@@ -83,8 +80,7 @@ pub fn pointer_body(block_number: u64, block_hash: impl Display) -> String {
 
 /// Builds the `x-amz-meta-*` custom-metadata headers stored alongside the primary witness object.
 ///
-/// The generator and the replayer must emit the same header names, order, and values — hence a
-/// single shared builder rather than a copy per binary.
+/// The generator and the replayer must emit identical header names, order, and values.
 pub fn witness_metadata(
     original_size: usize,
     compressed_size: usize,
