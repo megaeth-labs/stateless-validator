@@ -41,6 +41,11 @@ const BASE_ARGS: &[&str] = &[
     "http://w",
 ];
 
+/// [`BASE_ARGS`] without `--witness-endpoint`, for tests that exercise that flag itself or its
+/// absence.
+const BASE_ARGS_NO_WITNESS: &[&str] =
+    &["stateless-validator", "--data-dir", "/tmp/x", "--rpc-endpoint", "http://rpc"];
+
 /// Verifies that an endpoint flag accepts repeated flags, CSV values, and env var —
 /// ensuring container deployments configured purely via env are not silently limited
 /// to one endpoint (clap's `value_delimiter` applies to env-var values too).
@@ -71,7 +76,7 @@ fn witness_endpoint_accepts_multiple_forms() {
     assert_endpoint_accepts_multiple_forms(
         "--witness-endpoint",
         "STATELESS_VALIDATOR_WITNESS_ENDPOINT",
-        &["stateless-validator", "--data-dir", "/tmp/x", "--rpc-endpoint", "http://rpc"],
+        BASE_ARGS_NO_WITNESS,
         |a| a.witness_endpoint,
     );
 }
@@ -131,6 +136,47 @@ fn tip_buffer_flag_and_env() {
     assert_optional_numeric_flag::<u64>("--tip-buffer", "STATELESS_VALIDATOR_TIP_BUFFER", |a| {
         a.tip_buffer
     });
+}
+
+#[test]
+fn end_block_flag_and_env() {
+    assert_optional_numeric_flag::<u64>("--end-block", "STATELESS_VALIDATOR_END_BLOCK", |a| {
+        a.end_block
+    });
+}
+
+/// `--witness-source` must default to `rpc`, parse both lowercase values (flag and env), and
+/// reject anything else at parse time.
+#[test]
+fn witness_source_flag_and_env() {
+    use stateless_validator::WitnessSource;
+
+    let guard = stateless_test_utils::env::env_lock();
+    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
+
+    assert_eq!(parse(&[]).unwrap().witness_source, WitnessSource::Rpc);
+    assert_eq!(parse(&["--witness-source", "rpc"]).unwrap().witness_source, WitnessSource::Rpc);
+    assert_eq!(parse(&["--witness-source", "r2"]).unwrap().witness_source, WitnessSource::R2);
+    assert!(parse(&["--witness-source", "s3"]).is_err());
+
+    let from_env = stateless_test_utils::env::with_env_var(
+        &guard,
+        "STATELESS_VALIDATOR_WITNESS_SOURCE",
+        "r2",
+        || parse(&[]).unwrap().witness_source,
+    );
+    assert_eq!(from_env, WitnessSource::R2);
+}
+
+/// `--witness-endpoint` is enforced at runtime per witness source (required for `rpc`, ignored
+/// for `r2`), so the parse itself must accept its absence in both modes.
+#[test]
+fn witness_endpoint_is_optional_at_parse_time() {
+    let parse =
+        |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS_NO_WITNESS.iter().chain(extra));
+
+    assert!(parse(&[]).unwrap().witness_endpoint.is_empty());
+    assert!(parse(&["--witness-source", "r2"]).unwrap().witness_endpoint.is_empty());
 }
 
 /// `canonical_chain_max_length` must reject 0 at parse time. A value of 0 would make
@@ -392,8 +438,11 @@ async fn integration_test() {
     let config = Arc::new(cfg);
 
     let shutdown = CancellationToken::new();
-    let fetcher =
-        Arc::new(ValidatorFetcher { rpc_client: client.clone(), on_remote_height: |_| {} });
+    let fetcher = Arc::new(ValidatorFetcher {
+        rpc_client: client.clone(),
+        r2_witness: None,
+        on_remote_height: |_| {},
+    });
     let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
     let hooks = Arc::new(ValidatorHooks);
 

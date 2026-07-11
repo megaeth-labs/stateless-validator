@@ -27,16 +27,17 @@ The stateless approach eliminates the need for validators to run on high-end har
 
 ## Project Structure
 
-The workspace contains two binaries and four library crates:
+The workspace contains two binaries and five library crates:
 
-| Crate                  | Path                          | Purpose                                                                             |
-| ---------------------- | ----------------------------- | ----------------------------------------------------------------------------------- |
-| `stateless-core`       | `crates/stateless-core`       | Core validation logic, abstract storage traits, generic pipeline, EVM execution     |
-| `stateless-db`         | `crates/stateless-db`         | redb-backed persistence: table definitions, read/write helpers, bounded `ContractCache` |
-| `stateless-common`     | `crates/stateless-common`     | Shared utilities: RPC client, logging, metrics                                      |
-| `stateless-test-utils` | `crates/stateless-test-utils` | Test fixtures (blocks, witnesses, contracts) and env-var lock for integration tests |
-| `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers                                |
-| `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                       |
+| Crate                  | Path                          | Purpose                                                                                                                                                                              |
+| ---------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `stateless-core`       | `crates/stateless-core`       | Core validation logic, abstract storage traits, generic pipeline, EVM execution                                                                                                      |
+| `stateless-db`         | `crates/stateless-db`         | redb-backed persistence: table definitions, read/write helpers, bounded `ContractCache`                                                                                              |
+| `stateless-common`     | `crates/stateless-common`     | Shared utilities: RPC client, logging, metrics                                                                                                                                       |
+| `stateless-test-utils` | `crates/stateless-test-utils` | Test fixtures (blocks, witnesses, contracts) and env-var lock for integration tests                                                                                                  |
+| `stateless-r2`         | `crates/stateless-r2`         | Shared R2 (S3) witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT; consumed by mega-reth's witness uploaders (write) and this repo's validator (read) |
+| `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers                                                                                                                                 |
+| `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                                                                                                                        |
 
 Additional directories: `test_data/` (integration test fixtures including genesis config), `audits/` (security audit reports).
 
@@ -67,10 +68,14 @@ cargo run --release --bin stateless-validator -- \
 - `--witness-endpoint`: MegaETH JSON-RPC API endpoint URL(s) to retrieve witness data.
   Multiple endpoints can be provided via repeated flags or as a comma-separated list (tried in order on failure).
   The env var `STATELESS_VALIDATOR_WITNESS_ENDPOINT` accepts the same comma-separated form (e.g. `http://a:8545,http://b:8545`).
+  Required with `--witness-source rpc` (the default); ignored with `--witness-source r2`.
 
 **Optional Arguments:**
 - `--genesis-file`: Path to genesis JSON file containing hardfork activation configuration (required on first run, stored in database for subsequent runs)
 - `--start-block`: Trusted block hash to initialize validation from (required for first-time setup)
+- `--end-block`: Inclusive end block; validate up to this height, then stop cleanly (useful to slice a fixed range across multiple servers)
+- `--witness-source`: Where to fetch witnesses from: `rpc` (default) or `r2` (straight from the R2 bucket over the S3 API)
+- `--r2-endpoint`, `--r2-bucket`, `--r2-access-key-id`, `--r2-secret-access-key`: R2 connection settings, all required with `--witness-source r2` (prefer the env var for the secret)
 - `--report-validation-endpoint`: RPC endpoint URL for reporting validated blocks via `mega_setValidatedBlocks` (disabled if not provided)
 - `--metrics-enabled`: Enable Prometheus metrics endpoint (disabled by default)
 - `--metrics-port`: Port for Prometheus metrics HTTP endpoint (default: 9090)
@@ -102,6 +107,9 @@ Each command-line flag has an equivalent environment variable:
 - `STATELESS_VALIDATOR_WITNESS_ENDPOINT` → `--witness-endpoint`
 - `STATELESS_VALIDATOR_GENESIS_FILE` → `--genesis-file`
 - `STATELESS_VALIDATOR_START_BLOCK` → `--start-block`
+- `STATELESS_VALIDATOR_END_BLOCK` → `--end-block`
+- `STATELESS_VALIDATOR_WITNESS_SOURCE` → `--witness-source`
+- `STATELESS_VALIDATOR_R2_ENDPOINT` / `_R2_BUCKET` / `_R2_ACCESS_KEY_ID` / `_R2_SECRET_ACCESS_KEY` → `--r2-*`
 - `STATELESS_VALIDATOR_REPORT_VALIDATION_ENDPOINT` → `--report-validation-endpoint`
 - `STATELESS_VALIDATOR_METRICS_ENABLED` → `--metrics-enabled` (set to `true` to enable)
 - `STATELESS_VALIDATOR_METRICS_PORT` → `--metrics-port`
@@ -197,23 +205,23 @@ The pipeline is configured via `PipelineConfig` and customized through trait imp
 
 ### Key Source Files
 
-| File                                                                                           | Purpose                                                                             |
-| ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `crates/stateless-core/src/pipeline/{mod,config,traits,fetcher,divergence,advancer,worker}.rs` | Generic three-stage pipeline split by responsibility                                |
-| `crates/stateless-core/src/executor.rs`                                                        | Block validation and EVM replay                                                     |
-| `crates/stateless-core/src/db.rs`                                                              | Shared storage traits: `ChainStore`, `ContractStore`, `StoreError` (scenario stores live in their binaries)  |
-| `crates/stateless-core/src/evm_database.rs`                                                    | `WitnessDatabase` implementing `revm::DatabaseRef`                                  |
-| `crates/stateless-core/src/withdrawals.rs`                                                     | Withdrawal validation and MPT witness handling                                      |
-| `crates/stateless-db/src/{lib,tables,helpers,serialize,cache}.rs`                              | Shared redb tables, helpers, serialization, and bounded `ContractCache`             |
-| `crates/stateless-common/src/rpc_client.rs`                                                    | `RpcClient`: multi-endpoint HTTP client for blocks, witnesses, and bytecode         |
-| `crates/stateless-common/src/metrics.rs`                                                       | `RpcMethod`, `RpcMetrics`, `RpcClientConfig`                                        |
-| `crates/stateless-common/src/witness_size.rs`                                                  | `WitnessSizeBreakdown` + `estimate_witness_size` for RPC and trace-server metrics   |
-| `crates/stateless-test-utils/src/fixtures.rs`                                                  | `TestFixtures` loader (blocks, SALT/MPT witnesses, contracts, genesis)              |
-| `bin/stateless-validator/src/{main,app,workers,chain_sync,validator_db,metrics}.rs`            | Thin entry, CLI/startup wiring, pipeline+reporter, fetcher/processor, DB            |
-| `bin/debug-trace-server/src/chain_sync.rs`                                                     | `TraceFetcher`, `TraceProcessor`, `TraceHooks`                                      |
-| `bin/debug-trace-server/src/rpc_service.rs`                                                    | RPC method definitions and handlers                                                 |
-| `bin/debug-trace-server/src/data_provider.rs`                                                  | Block data fetching with single-flight coalescing                                   |
-| `bin/debug-trace-server/src/server_db.rs`                                                      | Defines + implements the bin-local `BlockStore` trait, backed by `stateless-db`     |
+| File                                                                                           | Purpose                                                                                                     |
+| ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| `crates/stateless-core/src/pipeline/{mod,config,traits,fetcher,divergence,advancer,worker}.rs` | Generic three-stage pipeline split by responsibility                                                        |
+| `crates/stateless-core/src/executor.rs`                                                        | Block validation and EVM replay                                                                             |
+| `crates/stateless-core/src/db.rs`                                                              | Shared storage traits: `ChainStore`, `ContractStore`, `StoreError` (scenario stores live in their binaries) |
+| `crates/stateless-core/src/evm_database.rs`                                                    | `WitnessDatabase` implementing `revm::DatabaseRef`                                                          |
+| `crates/stateless-core/src/withdrawals.rs`                                                     | Withdrawal validation and MPT witness handling                                                              |
+| `crates/stateless-db/src/{lib,tables,helpers,serialize,cache}.rs`                              | Shared redb tables, helpers, serialization, and bounded `ContractCache`                                     |
+| `crates/stateless-common/src/rpc_client.rs`                                                    | `RpcClient`: multi-endpoint HTTP client for blocks, witnesses, and bytecode                                 |
+| `crates/stateless-common/src/metrics.rs`                                                       | `RpcMethod`, `RpcMetrics`, `RpcClientConfig`                                                                |
+| `crates/stateless-common/src/witness_size.rs`                                                  | `WitnessSizeBreakdown` + `estimate_witness_size` for RPC and trace-server metrics                           |
+| `crates/stateless-test-utils/src/fixtures.rs`                                                  | `TestFixtures` loader (blocks, SALT/MPT witnesses, contracts, genesis)                                      |
+| `bin/stateless-validator/src/{main,app,workers,chain_sync,validator_db,metrics}.rs`            | Thin entry, CLI/startup wiring, pipeline+reporter, fetcher/processor, DB                                    |
+| `bin/debug-trace-server/src/chain_sync.rs`                                                     | `TraceFetcher`, `TraceProcessor`, `TraceHooks`                                                              |
+| `bin/debug-trace-server/src/rpc_service.rs`                                                    | RPC method definitions and handlers                                                                         |
+| `bin/debug-trace-server/src/data_provider.rs`                                                  | Block data fetching with single-flight coalescing                                                           |
+| `bin/debug-trace-server/src/server_db.rs`                                                      | Defines + implements the bin-local `BlockStore` trait, backed by `stateless-db`                             |
 
 ### Database
 

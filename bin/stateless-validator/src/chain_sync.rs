@@ -25,12 +25,18 @@ use stateless_db::ContractCache;
 use tokio::task;
 use tracing::{debug, error};
 
-use crate::metrics;
+use crate::{metrics, r2_witness::R2WitnessClient};
 
-/// Fetcher for the validator: fetches blocks + witnesses from RPC,
-/// wraps in [`ValidationTask`], and records remote chain height for metrics.
+/// Fetcher for the validator: fetches blocks + witnesses, wraps in [`ValidationTask`], and records
+/// remote chain height for metrics.
+///
+/// Blocks, headers, and contract code always come from the data RPC ([`Self::rpc_client`]). The
+/// witness comes from the configured source: the `mega_getBlockWitness` RPC (default), or
+/// straight from R2 via [`R2WitnessClient`].
 pub struct ValidatorFetcher {
     pub rpc_client: Arc<RpcClient>,
+    /// `Some` ⇒ fetch witnesses directly from R2; `None` ⇒ RPC.
+    pub r2_witness: Option<Arc<R2WitnessClient>>,
     pub on_remote_height: fn(u64),
 }
 
@@ -41,10 +47,18 @@ impl BlockFetcher for ValidatorFetcher {
         let block_hash = self.rpc_client.get_block_hash(block_number).await;
         // Fetch by hash (not number) so a reorg between the hash lookup and the block fetch
         // surfaces as a hash mismatch rather than silently swapping the block under us.
-        let ((salt_witness, mpt_witness), block) = tokio::join!(
-            self.rpc_client.get_witness(block_number, block_hash),
-            self.rpc_client.get_block(BlockId::Hash(block_hash.into()), true),
-        );
+        let block_fut = self.rpc_client.get_block(BlockId::Hash(block_hash.into()), true);
+        // The RPC witness path retries internally until it succeeds, but an R2 fetch is fallible:
+        // a 404 (`Missing`) or a decode failure propagates as a fetch error (the pipeline
+        // re-enqueues, so the stuck block with its loud MISSING/decode error is unmistakable).
+        let witness_fut = async {
+            match &self.r2_witness {
+                Some(r2) => Ok::<_, eyre::Report>(r2.get_witness(block_number, block_hash).await?),
+                None => Ok(self.rpc_client.get_witness(block_number, block_hash).await),
+            }
+        };
+        let (witness, block) = tokio::join!(witness_fut, block_fut);
+        let (salt_witness, mpt_witness) = witness?;
         Ok(ValidationTask { block, salt_witness, mpt_witness })
     }
 

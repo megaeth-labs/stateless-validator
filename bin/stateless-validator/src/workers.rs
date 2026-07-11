@@ -16,6 +16,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     chain_sync::{ValidatorFetcher, ValidatorHooks, ValidatorProcessor},
     metrics,
+    r2_witness::R2WitnessClient,
     validator_db::ValidatorDB,
 };
 
@@ -25,6 +26,7 @@ use crate::{
 /// on signal.
 pub async fn run_with_signals(
     client: Arc<RpcClient>,
+    r2_witness: Option<Arc<R2WitnessClient>>,
     validator_db: Arc<ValidatorDB>,
     contract_cache: Arc<ContractCache>,
     chain_spec: Arc<ChainSpec>,
@@ -47,6 +49,7 @@ pub async fn run_with_signals(
 
     let fetcher = Arc::new(ValidatorFetcher {
         rpc_client: client.clone(),
+        r2_witness,
         on_remote_height: metrics::set_remote_chain_height,
     });
     let processor =
