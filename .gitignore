@@ -12,3 +12,6 @@ validator-data
 archive
 codes
 tmp
+
+# coverage-replayer run data (transferred out-of-band, never via git)
+/data/
