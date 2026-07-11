@@ -2,7 +2,8 @@
 //!
 //! Unlike every other subcommand, `inspect` skips the binary-id namespace
 //! check so a store produced on another machine/build (e.g. copied from the
-//! server) can be analyzed locally. It never writes.
+//! server) can be analyzed locally. It never writes to the store (the shared
+//! `DataDir::new` does create the standard empty subdirectories if missing).
 
 use std::{collections::HashMap, path::PathBuf};
 

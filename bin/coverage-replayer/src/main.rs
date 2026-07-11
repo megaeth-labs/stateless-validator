@@ -1,9 +1,13 @@
-//! coverage-replayer: continuously derive the minimal mainnet block set that
-//! maximizes mega-evm code coverage.
+//! coverage-replayer: derive the minimal set of mainnet blocks that maximizes
+//! mega-evm branch coverage.
 //!
-//! See `validator-data/2026-07-08-coverage-replayer-design.md` for the design.
-//! M1 scope: `backfill` (range replay → pattern store), `set-cover`, `report`,
-//! plus the hidden `internal-worker` subprocess mode.
+//! `backfill` replays a block range under LLVM branch instrumentation:
+//! resident worker subprocesses execute each block (reset counters → replay →
+//! capture), and a judge dedups the resulting per-block coverage bitmaps into
+//! "patterns" in a redb store. `set-cover` computes the minimal block set
+//! covering every branch counter ever observed, `report` renders an llvm-cov
+//! summary for that set, `inspect` prints store statistics, and `merge`
+//! combines per-machine shard stores from a distributed scan.
 
 mod backfill;
 mod bitset;

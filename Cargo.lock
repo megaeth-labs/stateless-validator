@@ -1952,7 +1952,6 @@ dependencies = [
  "reqwest",
  "revm",
  "revm-inspectors",
- "salt",
  "serde",
  "serde_json",
  "stateless-common",

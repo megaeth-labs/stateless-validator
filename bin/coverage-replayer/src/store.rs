@@ -1,8 +1,10 @@
 //! redb-backed persistence for the coverage-replayer dispatcher.
 //!
-//! All coverage data is namespaced by `binary_id` (a content hash of the
-//! running executable): counter ids and dense indices are only meaningful for
-//! one exact instrumented build. On mismatch the store refuses to open.
+//! All coverage data is namespaced by `binary_id` (a fingerprint of the
+//! instrumented mega-evm build: locked git rev + toolchain/host, see
+//! [`current_binary_id`]) and by the symbol filter: counter ids and dense
+//! indices are only meaningful for one instrumented build, and the filter
+//! defines which counters exist. On mismatch the store refuses to open.
 
 use std::{collections::HashMap, path::Path};
 
@@ -72,8 +74,12 @@ pub struct Store {
 }
 
 impl Store {
-    /// Opens (or creates) the store and enforces the binary-id namespace.
-    pub fn open(path: &Path, binary_id: &str) -> Result<Self> {
+    /// Opens (or creates) the store and enforces the coverage namespace:
+    /// `binary_id` always, plus the symbol filter when the caller supplies one
+    /// (backfill/merge do — the filter defines which counters exist, so mixing
+    /// filters in one store would silently blend incompatible universes;
+    /// read-only consumers pass `None` to skip the filter check).
+    pub fn open(path: &Path, binary_id: &str, symbol_filter: Option<&str>) -> Result<Self> {
         let db = Database::create(path)?;
 
         // Ensure all tables exist, then check/stamp namespace metadata.
@@ -102,10 +108,41 @@ impl Store {
                     meta.insert("schema_version", SCHEMA_VERSION.to_le_bytes().as_slice())?;
                 }
             }
+
+            if let Some(filter) = symbol_filter {
+                let existing = meta
+                    .get("symbol_filter")?
+                    .map(|guard| String::from_utf8_lossy(guard.value()).into_owned());
+                match existing {
+                    Some(existing) => {
+                        ensure!(
+                            existing == filter,
+                            "store {} was built with --symbol-filter {existing:?}, this run \
+                             uses {filter:?}. The filter defines the counter universe: use a \
+                             fresh data-dir for a different filter.",
+                            path.display(),
+                        );
+                    }
+                    None => {
+                        meta.insert("symbol_filter", filter.as_bytes())?;
+                    }
+                }
+            }
         }
         txn.commit()?;
 
         Ok(Self { db })
+    }
+
+    /// Reads the stamped symbol filter, if any.
+    pub fn symbol_filter(&self) -> Result<Option<String>> {
+        let txn = self.db.begin_read()?;
+        let meta = txn.open_table(META)?;
+        let filter =
+            meta.get("symbol_filter")?.map(|g| String::from_utf8_lossy(g.value()).into_owned());
+        drop(meta);
+        drop(txn);
+        Ok(filter)
     }
 
     /// Opens an existing store WITHOUT the binary-id namespace check, for
@@ -259,6 +296,21 @@ pub struct StoreSnapshot {
     pub counters: HashMap<u64, CounterInfo>,
     pub patterns: HashMap<u64, PatternRecord>,
     pub blocks: HashMap<u64, BlockRecord>,
+}
+
+/// Base pattern key: FxHash64 of the pattern's counter ids in ascending
+/// order. The SINGLE keying function shared by the judge (backfill) and
+/// `merge` — both must key identically or a merged store diverges from a
+/// sequential run. Collisions between differing bitmaps are handled by the
+/// callers' linear probing (`PROBE_STEP`).
+pub fn pattern_base_key(sorted_ids: &[u64]) -> u64 {
+    use std::hash::Hasher;
+    debug_assert!(sorted_ids.is_sorted());
+    let mut h = rustc_hash::FxHasher::default();
+    for id in sorted_ids {
+        h.write_u64(*id);
+    }
+    h.finish()
 }
 
 /// Coverage namespace key: a fingerprint of the instrumented mega-evm build,

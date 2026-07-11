@@ -90,9 +90,9 @@ pub struct BackfillArgs {
     #[clap(long, env = "COVERAGE_REPLAYER_R2_ACCESS_KEY_ID")]
     pub r2_access_key_id: Option<String>,
     /// R2 secret access key. Required when `--witness-source r2`. Prefer the
-    /// env var over the flag.
+    /// env var over the flag. Redacted in `Debug` output.
     #[clap(long, env = "COVERAGE_REPLAYER_R2_SECRET_ACCESS_KEY")]
-    pub r2_secret_access_key: Option<String>,
+    pub r2_secret_access_key: Option<crate::r2::RedactedSecret>,
     /// Genesis JSON path (e.g. test_data/mainnet/genesis.json).
     #[clap(long, env = "COVERAGE_REPLAYER_GENESIS_FILE")]
     pub genesis_file: String,
@@ -128,7 +128,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     let dirs = Arc::new(DataDir::new(&args.data_dir)?);
     let binary_id = current_binary_id()?;
     info!(binary_id, "opening store");
-    let store = Store::open(&dirs.store_path(), &binary_id)?;
+    let store = Store::open(&dirs.store_path(), &binary_id, Some(&args.symbol_filter))?;
     let snapshot = store.load()?;
     let llvm_profdata = llvm::find_tool("llvm-profdata", args.llvm_profdata.as_deref())?;
     info!(llvm_profdata = %llvm_profdata.display(), "llvm tools resolved");
@@ -145,16 +145,19 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
             None
         }
         WitnessSource::R2 => {
-            let require = |v: &Option<String>, flag: &str| {
-                v.clone().filter(|s| !s.is_empty()).ok_or_else(|| {
+            let require = |v: Option<String>, flag: &str| {
+                v.filter(|s| !s.is_empty()).ok_or_else(|| {
                     eyre::eyre!("{flag} is required (and non-empty) with --witness-source r2")
                 })
             };
             let client = crate::r2::R2LightClient::new(
-                &require(&args.r2_endpoint, "--r2-endpoint")?,
-                require(&args.r2_bucket, "--r2-bucket")?,
-                require(&args.r2_access_key_id, "--r2-access-key-id")?,
-                require(&args.r2_secret_access_key, "--r2-secret-access-key")?,
+                &require(args.r2_endpoint.clone(), "--r2-endpoint")?,
+                require(args.r2_bucket.clone(), "--r2-bucket")?,
+                require(args.r2_access_key_id.clone(), "--r2-access-key-id")?,
+                require(
+                    args.r2_secret_access_key.as_ref().map(|s| s.as_ref().to_string()),
+                    "--r2-secret-access-key",
+                )?,
                 Duration::from_secs(60),
             )?;
             info!("witness source: R2 (light decode)");
@@ -197,6 +200,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     }
 
     let workers = args.workers.unwrap_or_else(|| num_cpus::get().saturating_sub(2).max(1));
+    ensure!(workers >= 1, "--workers must be at least 1");
     let (dispatch_tx, dispatch_rx) = kanal::bounded_async::<u64>(workers * 2);
     let (judged_tx, mut judged_rx) = tokio::sync::mpsc::channel::<WorkerResponse>(workers * 2);
 
@@ -238,8 +242,10 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
                 // visibly in the log until the operator intervenes.
                 inflight.spawn(async move {
                     let mut attempt = 0u64;
+                    let mut block_cache = None;
                     loop {
-                        match fetch_block(&client, r2.as_deref(), &dirs, n).await {
+                        match fetch_block(&client, r2.as_deref(), &dirs, n, &mut block_cache).await
+                        {
                             Ok(()) => break n,
                             Err(e) => {
                                 attempt += 1;
@@ -270,8 +276,6 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
 
     fetcher.await.ok();
     while manager_set.join_next().await.is_some() {}
-    // Let in-flight sparse-profdata conversions finish before reporting done.
-    while judge.compressions.join_next().await.is_some() {}
     judge.final_summary();
     Ok(())
 }
@@ -295,23 +299,34 @@ async fn forward_fetched(
 
 /// Fetches one block + witness, resolves missing bytecodes, writes the spool
 /// entry. Skips work that already exists on disk (crash resume).
+///
+/// `block_cache` holds the fetched block across the caller's retry rounds so
+/// a witness-side failure (e.g. R2 404 looping under retry-forever) does not
+/// re-download the full block every 5 seconds.
 async fn fetch_block(
     client: &RpcClient,
     r2: Option<&crate::r2::R2LightClient>,
     dirs: &DataDir,
     n: u64,
+    block_cache: &mut Option<alloy_rpc_types_eth::Block<op_alloy_rpc_types::Transaction>>,
 ) -> Result<()> {
     let spool_path = dirs.spool_entry(n);
     if spool_path.exists() {
         return Ok(());
     }
 
-    let block = client.get_block(BlockId::number(n), true).await;
+    if block_cache.is_none() {
+        *block_cache = Some(client.get_block(BlockId::number(n), true).await);
+    }
+    let block = block_cache.as_ref().expect("just filled");
     let hash = block.header.hash;
     // Zero-validation light fetch (from R2 or the witness RPC): no
     // elliptic-curve work is spent on the proof we never verify. Full
     // witnesses are NOT stored anywhere — when a selected block needs one, it
-    // is re-fetched on demand (both sources serve the full history).
+    // is re-fetched on demand. NOTE: the RPC serves witnesses for the full
+    // history; the R2 bucket is subject to its lifecycle retention — confirm
+    // the bucket actually holds the target range before pointing an old-era
+    // scan at `--witness-source r2`, or the 404s will retry forever.
     let (light_witness, _mpt_witness) = match r2 {
         Some(r2) => r2.get_witness_light(n, hash).await?,
         None => client.get_witness_light(n, hash).await,
@@ -332,7 +347,7 @@ async fn fetch_block(
 
     let entry = SpoolEntry {
         block_hash: hash,
-        block_json: serde_json::to_vec(&block)?,
+        block_json: serde_json::to_vec(block)?,
         light_witness,
         code_hashes,
     };
@@ -482,9 +497,6 @@ struct JudgeState<'a> {
     /// + profraw + bitmap extraction) — the E3 throughput measurement.
     elapsed_ok_ms: Vec<u64>,
     llvm_profdata: PathBuf,
-    /// In-flight sparse-profdata conversions (off the judge's critical path);
-    /// drained before the run finishes.
-    compressions: tokio::task::JoinSet<()>,
 }
 
 impl<'a> JudgeState<'a> {
@@ -524,7 +536,6 @@ impl<'a> JudgeState<'a> {
             started: Instant::now(),
             elapsed_ok_ms: Vec::new(),
             llvm_profdata,
-            compressions: tokio::task::JoinSet::new(),
         }
     }
 
@@ -614,14 +625,9 @@ impl<'a> JudgeState<'a> {
         let bitmap = BitSet::from_indices(resp.counters.iter().map(|id| self.counters[id]));
 
         // Pattern lookup with collision probing (exact bitmap comparison).
-        let mut key = {
-            use std::hash::Hasher;
-            let mut h = rustc_hash::FxHasher::default();
-            for id in &resp.counters {
-                h.write_u64(*id);
-            }
-            h.finish()
-        };
+        // Keying MUST stay identical to merge's re-keying: both go through
+        // `pattern_base_key` (worker counters arrive sorted and deduped).
+        let mut key = crate::store::pattern_base_key(&resp.counters);
         let is_new = loop {
             match self.patterns.get_mut(&key) {
                 None => break true,
@@ -669,31 +675,41 @@ impl<'a> JudgeState<'a> {
                 universe = self.universe.count_ones(),
                 "NEW coverage pattern"
             );
-            // Promote: nothing block-sized is kept — the spool entry is
-            // deleted like any other block (representatives are re-fetched
-            // from the RPC when needed). Only a sparse profdata survives for
-            // `report`, produced off the judge's critical path.
-            let _ = std::fs::remove_file(self.dirs.spool_entry(resp.block));
-            let _ = std::fs::remove_file(&resp.symbols_tsv);
+            // Promote. Ordering is the durability invariant: the sparse
+            // profdata must be ON DISK before the pattern + Ok record are
+            // committed — a crash in between leaves the block non-Ok, so a
+            // re-run re-executes it and re-archives. Committing first would
+            // permanently orphan a non-dominated pattern (block never
+            // retried, later same-bitmap profraws deleted, `report` fails on
+            // the missing profile). Archive failure aborts (fail-stop),
+            // keeping profraw + spool for forensics.
             if dominated {
                 let _ = std::fs::remove_file(&resp.profraw);
             } else {
-                let llvm_profdata = self.llvm_profdata.clone();
-                let profraw = resp.profraw.clone();
-                let dest = self.dirs.archived_profile(key);
-                let block = resp.block;
-                self.compressions.spawn_blocking(move || {
-                    if let Err(e) = archive_sparse_profile(&llvm_profdata, &profraw, &dest) {
-                        warn!(block, error = %format!("{e:#}"), "failed to archive sparse profdata");
-                    }
-                    let _ = std::fs::remove_file(&profraw);
-                });
+                archive_sparse_profile(
+                    &self.llvm_profdata,
+                    &resp.profraw,
+                    &self.dirs.archived_profile(key),
+                )
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to archive sparse profdata for NEW pattern of block {} \
+                         (profraw kept at {}) — ABORTING before the pattern is committed",
+                        resp.block,
+                        resp.profraw.display(),
+                    )
+                })?;
+                let _ = std::fs::remove_file(&resp.profraw);
             }
 
             let record = self.block_record_ok(&resp, key);
             self.patterns.insert(key, rec);
             let rec_ref = &self.patterns[&key];
             self.store.commit_block(resp.block, &record, &new_counters, Some((key, rec_ref)))?;
+            // Nothing block-sized is kept — the spool entry goes last, after
+            // the commit (a leftover from a crash here is harmless junk).
+            let _ = std::fs::remove_file(self.dirs.spool_entry(resp.block));
+            let _ = std::fs::remove_file(&resp.symbols_tsv);
         } else {
             // Known pattern: delete everything, keep only the block record.
             let _ = std::fs::remove_file(self.dirs.spool_entry(resp.block));
@@ -773,23 +789,28 @@ fn archive_sparse_profile(
     dest: &std::path::Path,
 ) -> Result<()> {
     let tmp = profraw.with_extension("profdata");
-    let out = std::process::Command::new(llvm_profdata)
-        .arg("merge")
-        .arg("-sparse")
-        .arg(profraw)
-        .arg("-o")
-        .arg(&tmp)
-        .output()
-        .wrap_err("spawn llvm-profdata")?;
-    ensure!(
-        out.status.success(),
-        "llvm-profdata merge -sparse failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let bytes = std::fs::read(&tmp)?;
+    // llvm-profdata creates its -o output before reading inputs, so the tmp
+    // file exists even on failure; clean it up on every exit path.
+    let result = (|| -> Result<()> {
+        let out = std::process::Command::new(llvm_profdata)
+            .arg("merge")
+            .arg("-sparse")
+            .arg(profraw)
+            .arg("-o")
+            .arg(&tmp)
+            .output()
+            .wrap_err("spawn llvm-profdata")?;
+        ensure!(
+            out.status.success(),
+            "llvm-profdata merge -sparse failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let bytes = std::fs::read(&tmp)?;
+        write_atomic(dest, &zstd::encode_all(&bytes[..], 3)?)?;
+        Ok(())
+    })();
     let _ = std::fs::remove_file(&tmp);
-    write_atomic(dest, &zstd::encode_all(&bytes[..], 3)?)?;
-    Ok(())
+    result
 }
 
 /// Parses a worker symbols sidecar: `id_hex \t index \t func_hash \t symbol`.
@@ -809,4 +830,154 @@ fn read_symbols_tsv(path: &std::path::Path) -> Result<HashMap<u64, (u32, String,
         map.insert(id, (index.parse()?, func_hash.to_string(), symbol.to_string()));
     }
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{StoreSnapshot, pattern_base_key};
+
+    fn counter_info(dense: u32) -> CounterInfo {
+        CounterInfo { dense, symbol: "s".into(), func_hash: "h".into(), index: dense }
+    }
+
+    fn seeded_pattern(ids: &[u64], denses: &[u32], rep: u64, elapsed: u64) -> (u64, PatternRecord) {
+        let bitmap = BitSet::from_indices(denses.iter().copied());
+        let mut sorted = ids.to_vec();
+        sorted.sort_unstable();
+        let key = pattern_base_key(&sorted);
+        let rec = PatternRecord {
+            bits: bitmap.count_ones(),
+            bitmap,
+            first_block: rep,
+            last_block: rep,
+            hit_count: 1,
+            representative: rep,
+            representative_elapsed_ms: elapsed,
+        };
+        (key, rec)
+    }
+
+    fn response(block: u64, counters: Vec<u64>, elapsed_ms: u64) -> WorkerResponse {
+        WorkerResponse {
+            block,
+            block_hash: B256::repeat_byte(7),
+            ok: true,
+            error: None,
+            gas_ok: true,
+            receipts_root_ok: true,
+            logs_bloom_ok: true,
+            counters,
+            profraw: PathBuf::from("/nonexistent/test.profraw"),
+            symbols_tsv: PathBuf::from("/nonexistent/test.tsv.zst"),
+            elapsed_ms,
+            tx_count: 1,
+            gas_used: 21000,
+        }
+    }
+
+    /// Judge harness on a real (temp) store, pre-seeded with counters for ids
+    /// 1/2/3 (dense 0/1/2) and one pattern. Only paths that need no
+    /// llvm-profdata are exercised (known-pattern dedup, dominated skip);
+    /// the archive path is covered by the instrumented E2E runs.
+    fn judge_with<'a>(
+        store: &'a Store,
+        dirs: Arc<DataDir>,
+        patterns: Vec<(u64, PatternRecord)>,
+    ) -> JudgeState<'a> {
+        let snapshot = StoreSnapshot {
+            counters: [(1u64, counter_info(0)), (2, counter_info(1)), (3, counter_info(2))].into(),
+            patterns: patterns.into_iter().collect(),
+            blocks: HashMap::new(),
+        };
+        JudgeState::new(snapshot, store, dirs, 10, PathBuf::from("llvm-profdata"))
+    }
+
+    #[test]
+    fn known_pattern_dedups_and_rehomes_to_lightest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Arc::new(DataDir::new(tmp.path()).unwrap());
+        let store = Store::open(&dirs.store_path(), "test-id", Some("f")).unwrap();
+        let (key, rec) = seeded_pattern(&[1, 2], &[0, 1], 100, 500);
+        let mut judge = judge_with(&store, dirs, vec![(key, rec)]);
+
+        // Same bitmap from a LIGHTER block → dedup + re-home.
+        judge.ingest(response(200, vec![1, 2], 300)).unwrap();
+        let rec = &judge.patterns[&key];
+        assert_eq!(rec.hit_count, 2);
+        assert_eq!(rec.representative, 200);
+        assert_eq!(rec.representative_elapsed_ms, 300);
+        assert_eq!(rec.last_block, 200);
+
+        // Same bitmap from a HEAVIER block → count only, no re-home.
+        judge.ingest(response(300, vec![1, 2], 900)).unwrap();
+        let rec = &judge.patterns[&key];
+        assert_eq!(rec.hit_count, 3);
+        assert_eq!(rec.representative, 200);
+        assert_eq!(judge.patterns.len(), 1, "no new pattern was created");
+    }
+
+    #[test]
+    fn dominated_new_pattern_recorded_without_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Arc::new(DataDir::new(tmp.path()).unwrap());
+        let store = Store::open(&dirs.store_path(), "test-id", Some("f")).unwrap();
+        // Seed the dominator {1,2,3}.
+        let (dom_key, dom_rec) = seeded_pattern(&[1, 2, 3], &[0, 1, 2], 100, 500);
+        let mut judge = judge_with(&store, dirs.clone(), vec![(dom_key, dom_rec)]);
+
+        // {1,2} is a strict subset → NEW pattern, dominated: bitmap recorded,
+        // profile NOT archived.
+        judge.ingest(response(200, vec![1, 2], 300)).unwrap();
+        assert_eq!(judge.patterns.len(), 2);
+        let sub_key = pattern_base_key(&[1, 2]);
+        assert!(judge.patterns.contains_key(&sub_key));
+        assert!(
+            !dirs.archived_profile(sub_key).exists(),
+            "dominated pattern must not get an archived profile"
+        );
+        // Universe unchanged: the subset contributed nothing new.
+        assert_eq!(judge.universe.count_ones(), 3);
+
+        // The store round-trips the newly committed pattern and block record
+        // (the seeded dominator lived only in the in-memory snapshot).
+        let snap = judge.store.load().unwrap();
+        assert_eq!(snap.patterns.len(), 1);
+        assert!(snap.patterns.contains_key(&sub_key));
+        assert_eq!(snap.blocks[&200].status, BlockStatus::Ok);
+        assert_eq!(snap.blocks[&200].pattern_key, Some(sub_key));
+    }
+
+    #[test]
+    fn replay_error_and_divergence_fail_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Arc::new(DataDir::new(tmp.path()).unwrap());
+        let store = Store::open(&dirs.store_path(), "test-id", Some("f")).unwrap();
+        let mut judge = judge_with(&store, dirs, vec![]);
+
+        let mut bad = response(400, vec![1], 100);
+        bad.ok = false;
+        bad.error = Some("boom".into());
+        let err = judge.ingest(bad).unwrap_err();
+        assert!(err.to_string().contains("ABORTING"), "{err}");
+        // The failure is recorded so a re-run retries the block.
+        let snap = judge.store.load().unwrap();
+        assert_eq!(snap.blocks[&400].status, BlockStatus::Error);
+
+        let mut divergent = response(401, vec![1], 100);
+        divergent.gas_ok = false;
+        let err = judge.ingest(divergent).unwrap_err();
+        assert!(err.to_string().contains("SANITY FAILURE"), "{err}");
+        let snap = judge.store.load().unwrap();
+        assert_eq!(snap.blocks[&401].status, BlockStatus::Divergent);
+    }
+
+    /// The keying contract shared with merge: sorted-id hashing, distinct sets
+    /// → distinct keys (up to 64-bit collisions).
+    #[test]
+    fn pattern_key_contract() {
+        assert_eq!(pattern_base_key(&[1, 2, 3]), pattern_base_key(&[1, 2, 3]));
+        assert_ne!(pattern_base_key(&[1, 2]), pattern_base_key(&[1, 3]));
+        assert_ne!(pattern_base_key(&[1]), pattern_base_key(&[1, 2]));
+    }
 }

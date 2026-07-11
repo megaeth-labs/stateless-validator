@@ -54,7 +54,8 @@ pub struct ManifestBlock {
 pub fn run(args: SetCoverArgs) -> Result<()> {
     let dirs = DataDir::new(&args.data_dir)?;
     let binary_id = current_binary_id()?;
-    let store = Store::open(&dirs.store_path(), &binary_id)?;
+    // No filter check: set-cover consumes whatever universe the store holds.
+    let store = Store::open(&dirs.store_path(), &binary_id, None)?;
     let snapshot = store.load()?;
 
     // E3 datapoint: worker wall-clock per successfully replayed block.
@@ -90,94 +91,35 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
         None => HashSet::new(),
     };
 
-    // Candidates: (pattern_key, record). Universe = union of all patterns.
-    let mut universe = BitSet::new();
-    for rec in snapshot.patterns.values() {
-        universe.union_with(&rec.bitmap);
-    }
-    let universe_counters = universe.count_ones();
     info!(
         patterns = snapshot.patterns.len(),
-        universe = universe_counters,
         incumbents = incumbents.len(),
         "computing greedy set cover"
     );
 
-    let mut covered = BitSet::new();
-    let mut remaining: Vec<(&u64, &crate::store::PatternRecord)> =
-        snapshot.patterns.iter().collect();
-
-    // Antichain prune: dominated patterns can never improve the cover, and a
-    // dominated pattern could otherwise win a gain tie-break and select a
-    // block whose profile was never archived. Their archived profiles (from
-    // before the dominator appeared) are deleted here.
-    remaining.sort_by_key(|(_, r)| std::cmp::Reverse(r.bits));
-    let mut keep = vec![true; remaining.len()];
-    for i in 0..remaining.len() {
-        for j in 0..i {
-            if keep[j] &&
-                remaining[j].1.bits > remaining[i].1.bits &&
-                remaining[i].1.bitmap.is_subset_of(&remaining[j].1.bitmap)
-            {
-                keep[i] = false;
-                let _ = std::fs::remove_file(dirs.archived_profile(*remaining[i].0));
-                break;
-            }
-        }
+    let outcome = select_cover(&snapshot.patterns, &incumbents);
+    // The pruned patterns' archived profiles are dead weight — delete them
+    // (the fs side effect lives here, outside the pure algorithm core).
+    for key in &outcome.pruned_dominated {
+        let _ = std::fs::remove_file(dirs.archived_profile(*key));
     }
-    let before = remaining.len();
-    let mut it = keep.iter();
-    remaining.retain(|_| *it.next().unwrap());
     info!(
-        pruned = before - remaining.len(),
-        antichain = remaining.len(),
+        pruned = outcome.pruned_dominated.len(),
+        antichain = snapshot.patterns.len() - outcome.pruned_dominated.len(),
         "dominated patterns excluded (their archived profiles deleted)"
     );
-    let mut selected: Vec<(u64, u64, u64)> = Vec::new(); // (pattern_key, representative, gain)
-
-    loop {
-        let mut best: Option<(u64, bool, u64, usize)> = None; // (gain, incumbent, block, idx)
-        for (idx, (_key, rec)) in remaining.iter().enumerate() {
-            let gain = rec.bitmap.andnot_count(&covered);
-            if gain == 0 {
-                continue;
-            }
-            let candidate =
-                (gain, incumbents.contains(&rec.representative), rec.representative, idx);
-            if best.is_none_or(|b| (candidate.0, candidate.1, candidate.2) > (b.0, b.1, b.2)) {
-                best = Some(candidate);
-            }
-        }
-        let Some((gain, _inc, _blk, idx)) = best else { break };
-        let (key, rec) = remaining.swap_remove(idx);
-        covered.union_with(&rec.bitmap);
-        selected.push((*key, rec.representative, gain));
+    for (_, rep, _) in
+        outcome.selected.iter().filter(|(_, rep, _)| outcome.redundant_removed.contains(rep))
+    {
+        info!(block = rep, "redundant after later picks, removing");
     }
 
-    // Redundancy elimination: drop blocks fully covered by the union of the rest.
-    let mut pruned = true;
-    while pruned {
-        pruned = false;
-        for i in 0..selected.len() {
-            let mut others = BitSet::new();
-            for (j, (key, _, _)) in selected.iter().enumerate() {
-                if i != j {
-                    others.union_with(&snapshot.patterns[key].bitmap);
-                }
-            }
-            let (key, rep, _) = selected[i];
-            if snapshot.patterns[&key].bitmap.is_subset_of(&others) {
-                info!(block = rep, "redundant after later picks, removing");
-                selected.remove(i);
-                pruned = true;
-                break;
-            }
-        }
-    }
-
-    let covered_counters = covered.count_ones();
-    let blocks: Vec<ManifestBlock> = selected
+    let universe_counters = outcome.universe_counters;
+    let covered_counters = outcome.covered_counters;
+    let blocks: Vec<ManifestBlock> = outcome
+        .selected
         .iter()
+        .filter(|(_, rep, _)| !outcome.redundant_removed.contains(rep))
         .map(|(key, rep, gain)| {
             let rec = &snapshot.patterns[key];
             let hash = snapshot
@@ -219,4 +161,227 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
         info!(block = b.number, gain = b.gain, bits = b.bits, "selected");
     }
     Ok(())
+}
+
+/// Result of the pure set-cover algorithm.
+pub struct CoverOutcome {
+    /// Greedy picks in selection order: `(pattern_key, representative, gain)`.
+    /// Entries whose representative appears in `redundant_removed` were
+    /// eliminated by the final redundancy pass and must be filtered out.
+    pub selected: Vec<(u64, u64, u64)>,
+    /// Pattern keys strictly dominated by another pattern (excluded from the
+    /// candidate pool; their archived profiles are safe to delete).
+    pub pruned_dominated: Vec<u64>,
+    /// Representatives removed by redundancy elimination.
+    pub redundant_removed: std::collections::HashSet<u64>,
+    pub universe_counters: u64,
+    pub covered_counters: u64,
+}
+
+/// Pure greedy set cover with antichain pruning, incumbent-biased
+/// tie-breaking, and a final redundancy-elimination pass. No I/O — the fs
+/// side effects (deleting pruned profiles) belong to the caller.
+pub fn select_cover(
+    patterns: &std::collections::HashMap<u64, crate::store::PatternRecord>,
+    incumbents: &HashSet<u64>,
+) -> CoverOutcome {
+    let mut universe = BitSet::new();
+    for rec in patterns.values() {
+        universe.union_with(&rec.bitmap);
+    }
+    let universe_counters = universe.count_ones();
+
+    // Antichain prune: a strict subset of another pattern can never improve
+    // the cover — and if left in, it could win a gain tie-break and select a
+    // block whose profile was never archived (dominated patterns skip the
+    // archive at promotion time).
+    let mut remaining: Vec<(&u64, &crate::store::PatternRecord)> = patterns.iter().collect();
+    remaining.sort_by_key(|(_, r)| std::cmp::Reverse(r.bits));
+    let mut keep = vec![true; remaining.len()];
+    let mut pruned_dominated = Vec::new();
+    for i in 0..remaining.len() {
+        for j in 0..i {
+            if keep[j] &&
+                remaining[j].1.bits > remaining[i].1.bits &&
+                remaining[i].1.bitmap.is_subset_of(&remaining[j].1.bitmap)
+            {
+                keep[i] = false;
+                pruned_dominated.push(*remaining[i].0);
+                break;
+            }
+        }
+    }
+    let mut it = keep.iter();
+    remaining.retain(|_| *it.next().unwrap());
+
+    // Greedy: max gain; ties prefer incumbents (churn damping), then the
+    // higher block number.
+    let mut covered = BitSet::new();
+    let mut selected: Vec<(u64, u64, u64)> = Vec::new();
+    loop {
+        let mut best: Option<(u64, bool, u64, usize)> = None; // (gain, incumbent, block, idx)
+        for (idx, (_key, rec)) in remaining.iter().enumerate() {
+            let gain = rec.bitmap.andnot_count(&covered);
+            if gain == 0 {
+                continue;
+            }
+            let candidate =
+                (gain, incumbents.contains(&rec.representative), rec.representative, idx);
+            if best.is_none_or(|b| (candidate.0, candidate.1, candidate.2) > (b.0, b.1, b.2)) {
+                best = Some(candidate);
+            }
+        }
+        let Some((gain, _inc, _blk, idx)) = best else { break };
+        let (key, rec) = remaining.swap_remove(idx);
+        covered.union_with(&rec.bitmap);
+        selected.push((*key, rec.representative, gain));
+    }
+
+    // Redundancy elimination: drop picks fully covered by the union of the
+    // others (an early large pick can become redundant after later picks).
+    let mut removed: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut pruned = true;
+    while pruned {
+        pruned = false;
+        for i in 0..selected.len() {
+            let (key, rep, _) = selected[i];
+            if removed.contains(&rep) {
+                continue;
+            }
+            let mut others = BitSet::new();
+            for (j, (other_key, other_rep, _)) in selected.iter().enumerate() {
+                if i != j && !removed.contains(other_rep) {
+                    others.union_with(&patterns[other_key].bitmap);
+                }
+            }
+            if patterns[&key].bitmap.is_subset_of(&others) {
+                removed.insert(rep);
+                pruned = true;
+                break;
+            }
+        }
+    }
+
+    CoverOutcome {
+        selected,
+        pruned_dominated,
+        redundant_removed: removed,
+        universe_counters,
+        covered_counters: covered.count_ones(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::store::PatternRecord;
+
+    fn pat(bits: &[u32], rep: u64) -> PatternRecord {
+        let bitmap = BitSet::from_indices(bits.iter().copied());
+        PatternRecord {
+            bits: bitmap.count_ones(),
+            bitmap,
+            first_block: rep,
+            last_block: rep,
+            hit_count: 1,
+            representative: rep,
+            representative_elapsed_ms: 100,
+        }
+    }
+
+    fn cover(
+        patterns: &HashMap<u64, PatternRecord>,
+        incumbents: &[u64],
+    ) -> (Vec<u64>, CoverOutcome) {
+        let incumbents: HashSet<u64> = incumbents.iter().copied().collect();
+        let outcome = select_cover(patterns, &incumbents);
+        let mut blocks: Vec<u64> = outcome
+            .selected
+            .iter()
+            .filter(|(_, rep, _)| !outcome.redundant_removed.contains(rep))
+            .map(|(_, rep, _)| *rep)
+            .collect();
+        blocks.sort_unstable();
+        (blocks, outcome)
+    }
+
+    /// Full coverage is always reached and dominated patterns never selected.
+    #[test]
+    fn covers_universe_and_prunes_dominated() {
+        let patterns: HashMap<u64, PatternRecord> = [
+            (1, pat(&[0, 1, 2, 3], 10)), // dominator
+            (2, pat(&[0, 1], 20)),       // strict subset of 1 → pruned
+            (3, pat(&[4, 5], 30)),
+            (4, pat(&[5], 40)), // strict subset of 3 → pruned
+        ]
+        .into();
+        let (blocks, outcome) = cover(&patterns, &[]);
+        assert_eq!(blocks, vec![10, 30]);
+        assert_eq!(outcome.covered_counters, outcome.universe_counters);
+        let mut pruned = outcome.pruned_dominated.clone();
+        pruned.sort_unstable();
+        assert_eq!(pruned, vec![2, 4]);
+    }
+
+    /// Equal-bits patterns with different bitmaps must BOTH survive the prune
+    /// (the guard is strictly `bits >`, never `>=`).
+    #[test]
+    fn equal_bits_distinct_patterns_both_survive() {
+        let patterns: HashMap<u64, PatternRecord> =
+            [(1, pat(&[0, 1], 10)), (2, pat(&[2, 3], 20))].into();
+        let (blocks, outcome) = cover(&patterns, &[]);
+        assert_eq!(blocks, vec![10, 20]);
+        assert!(outcome.pruned_dominated.is_empty());
+    }
+
+    /// On a gain tie, the incumbent block wins (churn damping).
+    #[test]
+    fn incumbent_wins_gain_ties() {
+        // Two disjoint equal-size patterns; both must be picked, but the
+        // FIRST pick (order) must be the incumbent regardless of block number.
+        let patterns: HashMap<u64, PatternRecord> =
+            [(1, pat(&[0, 1], 10)), (2, pat(&[2, 3], 99))].into();
+        let incumbents: HashSet<u64> = [10].into();
+        let outcome = select_cover(&patterns, &incumbents);
+        assert_eq!(outcome.selected[0].1, 10, "incumbent must be picked first on a tie");
+
+        // Without incumbency the higher block number wins the tie.
+        let outcome = select_cover(&patterns, &HashSet::new());
+        assert_eq!(outcome.selected[0].1, 99);
+    }
+
+    /// The {a,b}+{c} vs {a,b,c} shape: greedy picks the superset first and
+    /// the smaller earlier patterns are never selected at all.
+    #[test]
+    fn superset_pattern_makes_smaller_ones_redundant() {
+        let patterns: HashMap<u64, PatternRecord> = [
+            (1, pat(&[0, 1], 10)),
+            (2, pat(&[2], 20)),
+            (3, pat(&[0, 1, 2], 30)), // dominates 1 and 2 → both pruned
+        ]
+        .into();
+        let (blocks, _) = cover(&patterns, &[]);
+        assert_eq!(blocks, vec![30]);
+    }
+
+    /// Redundancy elimination: a first big pick that later picks fully cover
+    /// gets removed from the final set.
+    #[test]
+    fn redundancy_elimination_drops_covered_first_pick() {
+        // A = {0..5} (biggest, picked first). B = {0,1,2,6}, C = {3,4,5,7}.
+        // After B and C are picked (each adds a fresh counter), A ⊆ B∪C.
+        let patterns: HashMap<u64, PatternRecord> = [
+            (1, pat(&[0, 1, 2, 3, 4, 5], 10)),
+            (2, pat(&[0, 1, 2, 6], 20)),
+            (3, pat(&[3, 4, 5, 7], 30)),
+        ]
+        .into();
+        let (blocks, outcome) = cover(&patterns, &[]);
+        assert_eq!(blocks, vec![20, 30]);
+        assert!(outcome.redundant_removed.contains(&10));
+        // Coverage is still complete without the removed pick.
+        assert_eq!(outcome.covered_counters, outcome.universe_counters);
+    }
 }

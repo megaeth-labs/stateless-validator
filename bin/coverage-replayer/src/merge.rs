@@ -63,7 +63,8 @@ pub fn run(args: MergeArgs) -> Result<()> {
     let expected_id = current_binary_id()?;
 
     let mut shard_snaps = Vec::with_capacity(args.shards.len());
-    for shard in &args.shards {
+    let mut shard_filter: Option<String> = None;
+    for (i, shard) in args.shards.iter().enumerate() {
         let dirs = DataDir::new(shard)?;
         let (store, binary_id) = Store::open_readonly(&dirs.store_path())
             .wrap_err_with(|| format!("open shard {}", shard.display()))?;
@@ -73,6 +74,18 @@ pub fn run(args: MergeArgs) -> Result<()> {
              all shards must be produced by the same instrumented build",
             shard.display(),
         );
+        // All shards must share one symbol filter — it defines the universe.
+        let filter = store.symbol_filter()?;
+        if i == 0 {
+            shard_filter = filter;
+        } else {
+            ensure!(
+                filter == shard_filter,
+                "shard {} was built with symbol filter {filter:?}, expected {shard_filter:?}; \
+                 shards with different filters hold incompatible universes",
+                shard.display(),
+            );
+        }
         let snap = store.load()?;
         info!(
             shard = %shard.display(),
@@ -97,7 +110,7 @@ pub fn run(args: MergeArgs) -> Result<()> {
         "merge complete; writing output store"
     );
 
-    let out_store = Store::open(&out_dirs.store_path(), &expected_id)?;
+    let out_store = Store::open(&out_dirs.store_path(), &expected_id, shard_filter.as_deref())?;
     out_store.write_bulk(&merged)?;
     info!(
         out = %out_dirs.store_path().display(),
@@ -109,8 +122,14 @@ pub fn run(args: MergeArgs) -> Result<()> {
 
 /// Pure core: folds shard snapshots into one, remapping every bitmap through
 /// `source-dense → counter id → unified-dense` and merging same-key patterns.
-/// Result is independent of shard order and equal to a sequential single-store
-/// run over the union of ranges.
+///
+/// Semantically equivalent to a sequential single-store run over the union of
+/// ranges and independent of shard order: the universe, the pattern set (by
+/// counter-id content), pattern keys, and all merged stats are identical.
+/// The *dense numbering* (and therefore raw bitmap/store bytes) is an
+/// internal coordinate system and may differ from a sequential run's — dense
+/// assignment is deterministic for a given shard order (unseen ids are
+/// registered in sorted order per shard), but not canonical.
 fn merge_snapshots(shards: Vec<(String, StoreSnapshot)>) -> Result<StoreSnapshot> {
     let mut id_to_dense: HashMap<u64, u32> = HashMap::new();
     let mut counters: HashMap<u64, CounterInfo> = HashMap::new();
@@ -119,21 +138,27 @@ fn merge_snapshots(shards: Vec<(String, StoreSnapshot)>) -> Result<StoreSnapshot
 
     for (label, snap) in shards {
         // source dense → counter id, and register unseen ids into the unified
-        // space (next unified dense index = current unified counter count).
+        // space. Registration goes in sorted-id order so the merged store is
+        // reproducible run-to-run (HashMap iteration order is randomized).
         let mut src_dense_to_id: HashMap<u32, u64> = HashMap::with_capacity(snap.counters.len());
+        let mut shard_ids: Vec<u64> = Vec::with_capacity(snap.counters.len());
         for (&id, info) in &snap.counters {
             src_dense_to_id.insert(info.dense, id);
+            shard_ids.push(id);
+        }
+        shard_ids.sort_unstable();
+        for id in shard_ids {
             if let std::collections::hash_map::Entry::Vacant(e) = id_to_dense.entry(id) {
                 let dense = counters.len() as u32;
                 e.insert(dense);
                 // dense re-pointed below after all ids are known (kept here for
                 // symbol/func_hash/index provenance).
-                counters.insert(id, CounterInfo { dense, ..info.clone() });
+                counters.insert(id, CounterInfo { dense, ..snap.counters[&id].clone() });
             }
         }
-
         for (&stored_key, rec) in &snap.patterns {
             let mut remapped = BitSet::new();
+            let mut ids: Vec<u64> = Vec::with_capacity(rec.bits as usize);
             for src_dense in rec.bitmap.iter_ones() {
                 let id = src_dense_to_id.get(&src_dense).ok_or_else(|| {
                     eyre::eyre!(
@@ -142,11 +167,13 @@ fn merge_snapshots(shards: Vec<(String, StoreSnapshot)>) -> Result<StoreSnapshot
                     )
                 })?;
                 remapped.insert(id_to_dense[id]);
+                ids.push(*id);
             }
+            ids.sort_unstable();
 
-            // Re-key exactly as the judge does: FxHash of sorted counter ids,
-            // linear-probing on a genuine bitmap-differing collision.
-            let mut key = pattern_key(&remapped, &id_to_dense);
+            // Re-key exactly as the judge does (shared helper), linear-probing
+            // on a genuine bitmap-differing collision.
+            let mut key = crate::store::pattern_base_key(&ids);
             let inserted = loop {
                 match patterns.get_mut(&key) {
                     None => {
@@ -182,8 +209,11 @@ fn merge_snapshots(shards: Vec<(String, StoreSnapshot)>) -> Result<StoreSnapshot
                     shard = %label,
                     stored = %format!("{stored_key:016x}"),
                     merged = %format!("{key:016x}"),
-                    "pattern re-keyed on merge (hash collision); its archived profile filename \
-                     will not match — regenerate if selected"
+                    "pattern re-keyed on merge (64-bit key collision). Its archived profile was \
+                     written under the OLD key: after the rsync union that filename is either \
+                     missing or occupied by the colliding pattern's profile — if this pattern \
+                     gets selected, regenerate its profile from the representative block instead \
+                     of trusting the file"
                 );
             }
         }
@@ -202,20 +232,6 @@ fn merge_snapshots(shards: Vec<(String, StoreSnapshot)>) -> Result<StoreSnapshot
     }
 
     Ok(StoreSnapshot { counters, patterns, blocks })
-}
-
-/// FxHash of the pattern's counter ids, ascending — identical to the judge's
-/// keying so a merged store matches a sequential run.
-fn pattern_key(bitmap: &BitSet, id_to_dense: &HashMap<u64, u32>) -> u64 {
-    use std::hash::Hasher;
-    let dense_to_id: HashMap<u32, u64> = id_to_dense.iter().map(|(&id, &d)| (d, id)).collect();
-    let mut ids: Vec<u64> = bitmap.iter_ones().map(|d| dense_to_id[&d]).collect();
-    ids.sort_unstable();
-    let mut h = rustc_hash::FxHasher::default();
-    for id in ids {
-        h.write_u64(id);
-    }
-    h.finish()
 }
 
 #[cfg(test)]

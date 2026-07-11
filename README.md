@@ -27,7 +27,7 @@ The stateless approach eliminates the need for validators to run on high-end har
 
 ## Project Structure
 
-The workspace contains two binaries and five library crates:
+The workspace contains three binaries and five library crates:
 
 | Crate                  | Path                          | Purpose                                                                                                                                                                              |
 | ---------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -38,6 +38,7 @@ The workspace contains two binaries and five library crates:
 | `stateless-r2`         | `crates/stateless-r2`         | Shared R2 (S3) witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT; consumed by mega-reth's witness uploaders (write) and this repo's validator (read) |
 | `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers                                                                                                                                 |
 | `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                                                                                                                        |
+| `coverage-replayer`    | `bin/coverage-replayer`       | Offline coverage tool: replays mainnet blocks under LLVM branch instrumentation and derives the minimal block set maximizing mega-evm coverage                                       |
 
 Additional directories: `test_data/` (integration test fixtures including genesis config), `audits/` (security audit reports).
 

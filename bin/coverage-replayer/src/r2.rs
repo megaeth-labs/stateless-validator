@@ -32,6 +32,32 @@ use stateless_r2::{
 /// bodies are a few hundred bytes of XML; a proxy can return arbitrary HTML).
 const MAX_ERROR_BODY_BYTES: usize = 1024;
 
+/// A CLI/env secret that redacts itself in `Debug` output — `BackfillArgs`
+/// derives `Debug`, and the R2 secret access key must never reach a log.
+/// (Same hardening as the validator's `RedactedSecret`.)
+#[derive(Clone)]
+pub struct RedactedSecret(String);
+
+impl std::str::FromStr for RedactedSecret {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
+    }
+}
+
+impl std::fmt::Debug for RedactedSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+impl AsRef<str> for RedactedSecret {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Fetches witness objects from an R2 bucket with SigV4-signed GETs and
 /// decodes them on the light path. Cloning is cheap (`reqwest::Client` is
 /// refcounted; the signer redacts credentials in `Debug`).

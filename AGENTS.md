@@ -5,7 +5,7 @@ This file provides guidance to AI agents (e.g., Claude Code, Codex, Cursor, etc.
 ## Project Overview
 
 Stateless validator for MegaETH — validates blocks using SALT witness data without requiring full chain state.
-The workspace contains two binaries: `stateless-validator` (chain-following validator) and `debug-trace-server` (RPC server for debug/trace methods).
+The workspace contains three binaries: `stateless-validator` (chain-following validator), `debug-trace-server` (RPC server for debug/trace methods), and `coverage-replayer` (offline tool that derives the minimal mainnet block set maximizing mega-evm branch coverage).
 See `README.md` for detailed documentation and quickstart.
 
 ## Build & Development Commands
@@ -43,6 +43,7 @@ The project uses nightly `2026-02-03` toolchain (edition 2024, rust-version 1.95
 | `stateless-r2`         | `crates/stateless-r2`         | Shared R2 (S3) witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT; consumed by mega-reth's uploaders (write) and the validator's R2 witness source (read) |
 | `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers (`app.rs` / `workers.rs` / `main.rs`)                                                                                               |
 | `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                                                                                                                            |
+| `coverage-replayer`    | `bin/coverage-replayer`       | Offline coverage tool: replays blocks under LLVM branch instrumentation (`backfill`), dedups per-block coverage bitmaps into patterns, and computes the minimal covering block set (`set-cover` / `report` / `inspect` / `merge`). Requires the instrumented `[profile.coverage]` build |
 
 Additional directories: `test_data/` (integration test fixtures including genesis config), `audits/` (security audit reports).
 

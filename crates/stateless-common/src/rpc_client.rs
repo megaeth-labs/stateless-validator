@@ -596,8 +596,10 @@ impl RpcClient {
     /// safety model). Consumers that later need the full witness (e.g. to
     /// assemble test fixtures) re-fetch it via [`Self::get_witness`].
     ///
-    /// Witness-size metrics are not recorded on this path (the breakdown
-    /// requires the full proof).
+    /// The `on_witness_fetch` size metric is not recorded here — the exact
+    /// breakdown needs the proof's commitment count. Callers that want a size
+    /// signal can record `WitnessSizeBreakdown::new_light` (a documented
+    /// lower bound) themselves, as the trace server does.
     pub async fn get_witness_light(&self, number: u64, hash: B256) -> (LightWitness, MptWitness) {
         self.get_witness_light_with_deadline(number, hash, None)
             .await
