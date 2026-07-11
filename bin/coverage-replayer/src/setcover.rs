@@ -1,5 +1,12 @@
 //! Greedy set cover over the stored coverage patterns.
 //!
+//! Completeness contract: the selected set ALWAYS covers the full universe —
+//! greedy runs until no candidate adds a counter, and neither the antichain
+//! prune (dominated patterns contribute no unique counters) nor the
+//! redundancy-elimination pass (only drops picks fully covered by the rest)
+//! can reduce coverage. Minimality is best-effort on top of that, never at
+//! its expense.
+//!
 //! Selection is churn-damped: ties are broken in favor of blocks already in
 //! the incumbent manifest, then by freshness. A final redundancy-elimination
 //! pass drops any selected block whose bitmap is covered by the union of the
@@ -8,7 +15,7 @@
 use std::{collections::HashSet, path::PathBuf};
 
 use clap::Args;
-use eyre::{Context, Result};
+use eyre::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -53,6 +60,14 @@ pub struct ManifestBlock {
 
 pub fn run(args: SetCoverArgs) -> Result<()> {
     let dirs = DataDir::new(&args.data_dir);
+    // `Store::open` creates a missing store — on a mistyped --data-dir that
+    // would silently produce a 0-block manifest (and pin the fresh store to
+    // this binary_id). Require an existing store instead.
+    ensure!(
+        dirs.store_path().exists(),
+        "no store at {} — run backfill first (set-cover never creates one)",
+        dirs.store_path().display()
+    );
     let binary_id = current_binary_id();
     // No filter check: set-cover consumes whatever universe the store holds.
     let store = Store::open(&dirs.store_path(), &binary_id, None)?;
@@ -106,10 +121,10 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
         antichain = snapshot.patterns.len() - outcome.pruned_dominated.len(),
         "dominated patterns excluded (their archived profiles deleted)"
     );
-    for (_, rep, _) in
-        outcome.selected.iter().filter(|(_, rep, _)| outcome.redundant_removed.contains(rep))
-    {
-        info!(block = rep, "redundant after later picks, removing");
+    // `selected` no longer contains these (select_cover drops them), so the
+    // removal set itself is the only place they can be reported from.
+    for rep in &outcome.redundant_removed {
+        info!(block = rep, "selected early but redundant after later picks — removed");
     }
 
     let universe_counters = outcome.universe_counters;
@@ -117,7 +132,6 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
     let blocks: Vec<ManifestBlock> = outcome
         .selected
         .iter()
-        .filter(|(_, rep, _)| !outcome.redundant_removed.contains(rep))
         .map(|(key, rep, gain)| {
             let rec = &snapshot.patterns[key];
             let hash = snapshot

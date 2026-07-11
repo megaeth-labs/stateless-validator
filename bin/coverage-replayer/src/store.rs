@@ -112,6 +112,7 @@ impl Store {
                          aside (or start a fresh one) and re-sweep.",
                         path.display(),
                     );
+                    check_schema_version(&meta, path)?;
                 }
                 None => {
                     meta.insert("binary_id", binary_id.as_bytes())?;
@@ -164,6 +165,7 @@ impl Store {
         let store = Self { db };
         let txn = store.db.begin_read()?;
         let meta = txn.open_table(META)?;
+        check_schema_version(&meta, path)?;
         let binary_id = meta
             .get("binary_id")?
             .map(|g| String::from_utf8_lossy(g.value()).into_owned())
@@ -180,6 +182,31 @@ impl Store {
             counters: read_table(&txn, COUNTERS)?,
             patterns: read_table(&txn, PATTERNS)?,
             blocks: read_table(&txn, BLOCKS)?,
+        })
+    }
+
+    /// [`Self::load`] variant for `backfill`: counters and patterns in full
+    /// (they are the working set and bounded by the universe), but block
+    /// records only for the range being scanned. The BLOCKS table grows by
+    /// one row per block ever scanned — a full-history store holds tens of
+    /// millions of rows, and the judge only needs the current range's
+    /// statuses for its todo filter.
+    pub fn load_for_range(&self, blocks: std::ops::RangeInclusive<u64>) -> Result<StoreSnapshot> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(BLOCKS)?;
+        let mut in_range = HashMap::new();
+        for row in t.range(blocks)? {
+            let (k, v) = row?;
+            let (value, _): (BlockRecord, _) =
+                bincode::serde::decode_from_slice(v.value(), BINCODE_CONFIG)
+                    .map_err(|e| eyre::eyre!("decode BlockRecord: {e}"))?;
+            in_range.insert(k.value(), value);
+        }
+        drop(t);
+        Ok(StoreSnapshot {
+            counters: read_table(&txn, COUNTERS)?,
+            patterns: read_table(&txn, PATTERNS)?,
+            blocks: in_range,
         })
     }
 
@@ -248,6 +275,32 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// Rejects a store whose record encoding predates/postdates this binary —
+/// otherwise a format change surfaces as opaque bincode decode errors deep
+/// inside `read_table` instead of a clean mismatch message. Stores created
+/// before versioning are all schema 1.
+fn check_schema_version<T>(meta: &T, path: &Path) -> Result<()>
+where
+    T: redb::ReadableTable<&'static str, &'static [u8]>,
+{
+    let stored = match meta.get("schema_version")? {
+        Some(guard) => u32::from_le_bytes(
+            guard
+                .value()
+                .try_into()
+                .map_err(|_| eyre::eyre!("store {}: malformed schema_version", path.display()))?,
+        ),
+        None => 1,
+    };
+    ensure!(
+        stored == SCHEMA_VERSION,
+        "store {} has schema v{stored}, this binary reads v{SCHEMA_VERSION} — re-sweep into a \
+         fresh data-dir (or use a binary matching the store)",
+        path.display(),
+    );
+    Ok(())
 }
 
 /// Reads a whole `u64 -> bincode(T)` table into a map.
@@ -345,4 +398,143 @@ pub fn elapsed_stats(samples: &mut [u64]) -> Option<(f64, u64, u64, u64)> {
         samples[(samples.len() * 95 / 100).min(samples.len() - 1)],
         samples[samples.len() - 1],
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(bits: &[u32]) -> PatternRecord {
+        let bitmap = BitSet::from_indices(bits.iter().copied());
+        PatternRecord {
+            bits: bitmap.count_ones(),
+            bitmap,
+            first_block: 1,
+            last_block: 1,
+            hit_count: 1,
+            representative: 1,
+            representative_elapsed_ms: 10,
+        }
+    }
+
+    fn block(status: BlockStatus) -> BlockRecord {
+        BlockRecord {
+            hash: B256::ZERO,
+            status,
+            pattern_key: None,
+            gas_used: 0,
+            tx_count: 0,
+            elapsed_ms: 0,
+            error: None,
+        }
+    }
+
+    /// The collision branch of the shared probing walk — the one path whose
+    /// judge/merge divergence would silently corrupt merged stores. A
+    /// different bitmap at the base key must step by exactly `PROBE_STEP`;
+    /// the same bitmap parked one step out must be found as occupied.
+    #[test]
+    fn probe_collision_walks_probe_step() {
+        let ids = [100u64, 200, 300];
+        let base = pattern_base_key(&ids);
+        let target = rec(&[0, 1, 2]);
+
+        let mut patterns: HashMap<u64, PatternRecord> = [(base, rec(&[7]))].into();
+        assert_eq!(
+            resolve_pattern_slot(&patterns, &ids, &target.bitmap),
+            (base.wrapping_add(PROBE_STEP), false),
+            "occupied base slot with a different bitmap must probe one step"
+        );
+
+        patterns.insert(base.wrapping_add(PROBE_STEP), target.clone());
+        assert_eq!(
+            resolve_pattern_slot(&patterns, &ids, &target.bitmap),
+            (base.wrapping_add(PROBE_STEP), true),
+            "the same bitmap must be found at its probed slot"
+        );
+
+        // A second colliding stranger pushes the walk one more step.
+        let other = rec(&[3, 4]);
+        assert_eq!(
+            resolve_pattern_slot(&patterns, &ids, &other.bitmap),
+            (base.wrapping_add(PROBE_STEP).wrapping_add(PROBE_STEP), false),
+        );
+    }
+
+    #[test]
+    fn open_rejects_binary_id_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.redb");
+        drop(Store::open(&path, "megaevm:aaa:fx1", None).unwrap());
+        let err = Store::open(&path, "megaevm:bbb:fx2", None).err().expect("must fail");
+        assert!(err.to_string().contains("belongs to binary_id"), "got: {err}");
+    }
+
+    #[test]
+    fn open_rejects_symbol_filter_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.redb");
+        drop(Store::open(&path, "id", Some("mega_evm")).unwrap());
+        // Same filter reopens fine; a different one is refused.
+        drop(Store::open(&path, "id", Some("mega_evm")).unwrap());
+        let err = Store::open(&path, "id", Some("revm")).err().expect("must fail");
+        assert!(err.to_string().contains("--symbol-filter"), "got: {err}");
+    }
+
+    #[test]
+    fn open_rejects_schema_version_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.redb");
+        drop(Store::open(&path, "id", None).unwrap());
+
+        // Tamper: bump the stored schema version behind the API's back.
+        {
+            let db = Database::open(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut meta = txn.open_table(META).unwrap();
+                meta.insert("schema_version", (SCHEMA_VERSION + 1).to_le_bytes().as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let err = Store::open(&path, "id", None).err().expect("must fail");
+        assert!(err.to_string().contains("schema"), "open: {err}");
+        let err = Store::open_readonly(&path).err().expect("must fail");
+        assert!(err.to_string().contains("schema"), "open_readonly: {err}");
+    }
+
+    #[test]
+    fn load_for_range_limits_blocks_but_not_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("store.redb"), "id", None).unwrap();
+        let pattern = rec(&[0, 1]);
+        for n in [5u64, 10, 15, 20] {
+            store
+                .commit_block(
+                    n,
+                    &block(BlockStatus::Ok),
+                    &[(
+                        n,
+                        CounterInfo {
+                            dense: n as u32,
+                            symbol: "s".into(),
+                            func_hash: "h".into(),
+                            index: 0,
+                        },
+                    )],
+                    Some((n, &pattern)),
+                )
+                .unwrap();
+        }
+
+        let snap = store.load_for_range(10..=15).unwrap();
+        let mut in_range: Vec<u64> = snap.blocks.keys().copied().collect();
+        in_range.sort_unstable();
+        assert_eq!(in_range, vec![10, 15], "blocks limited to the range");
+        assert_eq!(snap.counters.len(), 4, "counters always loaded in full");
+        assert_eq!(snap.patterns.len(), 4, "patterns always loaded in full");
+        assert_eq!(store.load().unwrap().blocks.len(), 4, "full load unaffected");
+    }
 }

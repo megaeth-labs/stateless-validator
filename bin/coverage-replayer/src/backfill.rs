@@ -130,7 +130,20 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     let binary_id = current_binary_id();
     info!(binary_id, "opening store");
     let store = Store::open(&dirs.store_path(), &binary_id, Some(&args.symbol_filter))?;
-    let snapshot = store.load()?;
+    // Writers killed mid-write_atomic leave uniquely-named *.tmp files that
+    // would otherwise accumulate forever across crashes. Sweep only AFTER
+    // Store::open: its exclusive redb lock guarantees no other backfill is
+    // live on this data-dir (a doomed double-start must be refused before it
+    // can delete a live writer's tmp files); the age threshold protects
+    // non-locking processes like a concurrent `report`.
+    let swept: usize = [dirs.spool(), dirs.codes(), dirs.tmp(), dirs.archive_profiles()]
+        .iter()
+        .map(|d| crate::spool::sweep_stale_tmp(d, Duration::from_secs(3600)))
+        .sum();
+    if swept > 0 {
+        info!(swept, "removed stale tmp files from a previous crash");
+    }
+    let snapshot = store.load_for_range(args.from..=args.to)?;
     let llvm_profdata = llvm::find_tool("llvm-profdata", args.llvm_profdata.as_deref())?;
     info!(llvm_profdata = %llvm_profdata.display(), "llvm tools resolved");
 
@@ -146,6 +159,18 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
             None
         }
         WitnessSource::R2 => {
+            // The value itself is Debug-redacted, but a CLI-passed secret is
+            // still visible in the process list for the whole (multi-week)
+            // run. Detect "flag, not env" and nudge loudly.
+            if args.r2_secret_access_key.is_some() &&
+                std::env::var("COVERAGE_REPLAYER_R2_SECRET_ACCESS_KEY").is_err()
+            {
+                warn!(
+                    "--r2-secret-access-key was passed on the command line — it is visible in \
+                     `ps` for the lifetime of the process; prefer the \
+                     COVERAGE_REPLAYER_R2_SECRET_ACCESS_KEY env var"
+                );
+            }
             let require = |v: Option<String>, flag: &str| {
                 v.filter(|s| !s.is_empty()).ok_or_else(|| {
                     eyre::eyre!("{flag} is required (and non-empty) with --witness-source r2")
@@ -313,7 +338,42 @@ async fn fetch_block(
 ) -> Result<()> {
     let spool_path = dirs.spool_entry(n);
     if spool_path.exists() {
-        return Ok(());
+        // Trust nothing left on disk: a spool the worker cannot use (crash
+        // artifact, a SpoolEntry layout change between binary versions, a
+        // corrupt inner block_json, or a wrong-numbered block) would
+        // otherwise poison the worker on EVERY restart — the judge
+        // fail-stops on it, the re-run skips the fetch because the file
+        // exists, and the block can never complete. Validate exactly what
+        // the worker will check and refetch on failure so every block
+        // eventually executes.
+        let existing = {
+            let path = spool_path.clone();
+            tokio::task::spawn_blocking(move || {
+                let entry = SpoolEntry::read_from(&path)?;
+                validate_spool_entry(&entry, n)?;
+                Ok::<_, eyre::Report>(entry)
+            })
+            .await?
+        };
+        match existing {
+            Ok(entry) => {
+                // The spool is good, but its contract codes live in separate
+                // files — re-resolve any missing or corrupt ones so the
+                // worker never wedges on a half-cleaned codes dir.
+                resolve_missing_codes(client, dirs, &entry.code_hashes).await?;
+                return Ok(());
+            }
+            Err(e) => {
+                warn!(
+                    block = n,
+                    spool = %spool_path.display(),
+                    error = %format!("{e:#}"),
+                    "existing spool entry is corrupt — deleting and refetching"
+                );
+                std::fs::remove_file(&spool_path)
+                    .wrap_err_with(|| format!("remove corrupt spool {}", spool_path.display()))?;
+            }
+        }
     }
 
     if block_cache.is_none() {
@@ -334,8 +394,47 @@ async fn fetch_block(
     };
 
     let code_hashes = stateless_core::collect_code_hashes(&light_witness.kvs);
-    let missing: Vec<B256> =
-        code_hashes.iter().filter(|h| !dirs.code_file(h).exists()).copied().collect();
+    resolve_missing_codes(client, dirs, &code_hashes).await?;
+
+    let entry = SpoolEntry { block_json: serde_json::to_vec(block)?, light_witness, code_hashes };
+    let path = spool_path.clone();
+    tokio::task::spawn_blocking(move || entry.write_to(&path)).await??;
+    Ok(())
+}
+
+/// Mirror of the worker's own requirements on a spool entry (see
+/// `worker::process_block`): the inner block JSON must parse and carry the
+/// expected block number. The bincode envelope decoding alone would pass a
+/// spool whose opaque `block_json` bytes are damaged — and the worker would
+/// then fail-stop the run on it, on every restart.
+fn validate_spool_entry(entry: &SpoolEntry, block: u64) -> Result<()> {
+    let parsed: alloy_rpc_types_eth::Block<op_alloy_rpc_types::Transaction> =
+        serde_json::from_slice(&entry.block_json).wrap_err("spool block_json does not parse")?;
+    ensure!(
+        parsed.header.inner.number == block,
+        "spool holds block {}, expected {block}",
+        parsed.header.inner.number
+    );
+    Ok(())
+}
+
+/// Fetches and persists any of `code_hashes` not already in the codes dir —
+/// where "in" means present AND content-valid: the files are content-
+/// addressed, so anything whose keccak doesn't match its name (truncated by
+/// a pre-fsync crash, damaged media) is deleted and refetched. Without this,
+/// a corrupt code file wedges the run across restarts: the worker replays
+/// wrong bytes, diverges, and the judge fail-stops — forever.
+async fn resolve_missing_codes(
+    client: &RpcClient,
+    dirs: &DataDir,
+    code_hashes: &[B256],
+) -> Result<()> {
+    let mut missing: Vec<B256> = Vec::new();
+    for h in code_hashes {
+        if !code_file_is_valid(&dirs.code_file(h), h) {
+            missing.push(*h);
+        }
+    }
     if !missing.is_empty() {
         let codes = client
             .get_codes(&missing, true)
@@ -345,11 +444,26 @@ async fn fetch_block(
             write_atomic(&dirs.code_file(&code_hash), &bytecode.original_bytes())?;
         }
     }
-
-    let entry = SpoolEntry { block_json: serde_json::to_vec(block)?, light_witness, code_hashes };
-    let path = spool_path.clone();
-    tokio::task::spawn_blocking(move || entry.write_to(&path)).await??;
     Ok(())
+}
+
+/// Returns whether `path` holds exactly the bytes hashing to `hash`
+/// (content-addressed check, same keccak the RPC fetch verifies). A present-
+/// but-invalid file is deleted so the caller refetches it.
+fn code_file_is_valid(path: &std::path::Path, hash: &B256) -> bool {
+    match std::fs::read(path) {
+        Ok(bytes) if alloy_primitives::keccak256(&bytes) == *hash => true,
+        Ok(_) => {
+            warn!(
+                code = %format!("{hash:x}"),
+                path = %path.display(),
+                "content-addressed code file fails its hash — deleting and refetching"
+            );
+            let _ = std::fs::remove_file(path);
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 /// Owns one resident worker child. A block is NEVER skipped: worker crashes
@@ -392,6 +506,19 @@ async fn worker_manager(
                         error = %format!("{e:#}"),
                         "worker died mid-block; respawning and retrying same block"
                     );
+                    // Escalate a repeating crash on ONE block: by policy it is
+                    // retried forever, but an operator must be able to find
+                    // the wedge from the error log alone.
+                    if attempt.is_multiple_of(10) {
+                        tracing::error!(
+                            worker = id,
+                            block = n,
+                            attempt,
+                            spool = %dirs.spool_entry(n).display(),
+                            "block has crashed the worker {attempt} times — wedged by policy \
+                             (blocks are never skipped); this needs operator attention"
+                        );
+                    }
                     if let Some(mut dead) = worker.take() {
                         dead.kill().await;
                     }
@@ -452,22 +579,62 @@ impl WorkerHandle {
         self.stdin.flush().await?;
 
         let started = Instant::now();
-        let next = loop {
-            match tokio::time::timeout(warn_after, self.stdout.next_line()).await {
-                Err(_still_running) => {
+        let mut skipped_lines = 0u64;
+        let resp: WorkerResponse = loop {
+            let next = loop {
+                match tokio::time::timeout(warn_after, self.stdout.next_line()).await {
+                    Err(_still_running) => {
+                        // One factual message either way — a benign library
+                        // print must NOT flip this into "restart the run"
+                        // advice while a legitimately slow block executes.
+                        // The skipped count is the operator's clue: if the
+                        // block NEVER completes, the response frame may have
+                        // been torn by an interleaved (FFI) print — a
+                        // restart retries the block; check worker stderr.
+                        if skipped_lines > 0 {
+                            warn!(
+                                worker = worker_id,
+                                block = req.block,
+                                running_secs = started.elapsed().as_secs(),
+                                skipped_lines,
+                                "block still executing — waiting (blocks are never killed); \
+                                 stdout carried non-protocol lines: if this never completes, \
+                                 the response frame may have been torn by an interleaved print"
+                            );
+                        } else {
+                            warn!(
+                                worker = worker_id,
+                                block = req.block,
+                                running_secs = started.elapsed().as_secs(),
+                                "block still executing — waiting (blocks are never killed)"
+                            );
+                        }
+                    }
+                    Ok(next) => break next?,
+                }
+            };
+            let resp_line = next.ok_or_else(|| eyre::eyre!("worker closed stdout (crashed?)"))?;
+            // stdout is the protocol channel, but the replay stack underneath
+            // is not ours: a stray library print must not be treated as
+            // worker death (killing + retrying would deterministically hit
+            // the same print, wedging the block forever). Salvage a frame
+            // embedded anywhere in the line (an unterminated `print!` glues
+            // its bytes to the front of OUR response); skip pure garbage —
+            // loudly.
+            match parse_frame(&resp_line) {
+                Some(resp) => break resp,
+                None => {
+                    skipped_lines += 1;
+                    let head: String = resp_line.chars().take(200).collect();
                     warn!(
                         worker = worker_id,
                         block = req.block,
-                        running_secs = started.elapsed().as_secs(),
-                        "block still executing — waiting (blocks are never killed)"
+                        line = %head,
+                        "ignoring non-protocol line on worker stdout (library print?)"
                     );
                 }
-                Ok(next) => break next?,
             }
         };
-        let resp_line = next.ok_or_else(|| eyre::eyre!("worker closed stdout (crashed?)"))?;
-        let resp: WorkerResponse = serde_json::from_str(&resp_line)
-            .map_err(|e| eyre::eyre!("bad worker response {resp_line:?}: {e}"))?;
         ensure!(resp.block == req.block, "response for wrong block");
         Ok(resp)
     }
@@ -475,6 +642,23 @@ impl WorkerHandle {
     async fn kill(&mut self) {
         let _ = self.child.kill().await;
     }
+}
+
+/// Extracts a [`WorkerResponse`] frame from a worker stdout line, tolerating
+/// foreign bytes around it: an unterminated library `print!` glues its output
+/// to the FRONT of the response on one line, and an interleaved write can
+/// trail bytes AFTER it. Tries a prefix-parse from every `{` in the line —
+/// garbage JSON cannot satisfy the response's required fields, so a
+/// successful parse IS a frame. Returns `None` for a line with no frame.
+fn parse_frame(line: &str) -> Option<WorkerResponse> {
+    use serde::Deserialize;
+    for (idx, _) in line.match_indices('{') {
+        let mut de = serde_json::Deserializer::from_str(&line[idx..]);
+        if let Ok(resp) = WorkerResponse::deserialize(&mut de) {
+            return Some(resp);
+        }
+    }
+    None
 }
 
 /// Single-consumer ingest: pattern dedup, promotion, persistence, progress.
@@ -491,8 +675,44 @@ struct JudgeState<'a> {
     started: Instant,
     /// Worker wall-clock per successfully replayed block (spool load + replay
     /// + profraw + bitmap extraction) — the E3 throughput measurement.
-    elapsed_ok_ms: Vec<u64>,
+    elapsed_ok_ms: ElapsedSampler,
     llvm_profdata: PathBuf,
+}
+
+/// Bounded, deterministic reservoir for per-block timings: keeps every
+/// `stride`-th sample and doubles the stride when full. A full-history run
+/// would otherwise hold one u64 per block (hundreds of MB) just to print one
+/// avg/p50/p95 line at the end.
+struct ElapsedSampler {
+    samples: Vec<u64>,
+    stride: u64,
+    seen: u64,
+}
+
+impl ElapsedSampler {
+    /// ~8 MB worst case; large enough that percentiles are exact for any
+    /// single-machine range and statistically indistinguishable beyond it.
+    const CAP: usize = 1 << 20;
+
+    fn new() -> Self {
+        Self { samples: Vec::new(), stride: 1, seen: 0 }
+    }
+
+    fn record(&mut self, elapsed_ms: u64) {
+        if self.seen.is_multiple_of(self.stride) {
+            if self.samples.len() >= Self::CAP {
+                // Decimate: keep every other retained sample, double the stride.
+                let mut keep = false;
+                self.samples.retain(|_| {
+                    keep = !keep;
+                    keep
+                });
+                self.stride *= 2;
+            }
+            self.samples.push(elapsed_ms);
+        }
+        self.seen += 1;
+    }
 }
 
 impl<'a> JudgeState<'a> {
@@ -530,7 +750,7 @@ impl<'a> JudgeState<'a> {
             total,
             new_patterns: 0,
             started: Instant::now(),
-            elapsed_ok_ms: Vec::new(),
+            elapsed_ok_ms: ElapsedSampler::new(),
             llvm_profdata,
         }
     }
@@ -583,7 +803,7 @@ impl<'a> JudgeState<'a> {
     }
 
     fn ingest_ok(&mut self, resp: WorkerResponse) -> Result<()> {
-        self.elapsed_ok_ms.push(resp.elapsed_ms);
+        self.elapsed_ok_ms.record(resp.elapsed_ms);
         // Resolve counter ids → dense indices, registering unseen ids.
         let unknown: Vec<u64> =
             resp.counters.iter().filter(|id| !self.counters.contains_key(id)).copied().collect();
@@ -615,6 +835,10 @@ impl<'a> JudgeState<'a> {
             // keyed by pattern, so nothing on disk moves).
             let rec = self.patterns.get_mut(&key).expect("occupied slot");
             rec.hit_count += 1;
+            // Completion order != block order under parallel workers, so both
+            // bounds need clamping (merge does the same min/max fold —
+            // sequential and merged stores must agree on provenance).
+            rec.first_block = rec.first_block.min(resp.block);
             rec.last_block = rec.last_block.max(resp.block);
             if resp.elapsed_ms < rec.representative_elapsed_ms {
                 rec.representative = resp.block;
@@ -712,10 +936,13 @@ impl<'a> JudgeState<'a> {
             elapsed = %format!("{:.1}s", self.started.elapsed().as_secs_f64()),
             "backfill finished"
         );
-        let mut samples = std::mem::take(&mut self.elapsed_ok_ms);
+        let blocks = self.elapsed_ok_ms.seen;
+        let sampled = self.elapsed_ok_ms.stride > 1;
+        let mut samples = std::mem::take(&mut self.elapsed_ok_ms.samples);
         if let Some((avg, p50, p95, max)) = elapsed_stats(&mut samples) {
             info!(
-                blocks = samples.len(),
+                blocks,
+                sampled,
                 avg_ms = %format!("{avg:.0}"),
                 p50_ms = p50,
                 p95_ms = p95,
@@ -882,6 +1109,98 @@ mod tests {
         assert_eq!(rec.hit_count, 3);
         assert_eq!(rec.representative, 200);
         assert_eq!(judge.patterns.len(), 1, "no new pattern was created");
+
+        // Completion order != block order: an EARLIER block finishing late
+        // must pull first_block down (merge min-folds the same way — the two
+        // must agree on provenance).
+        assert_eq!(rec.first_block, 100);
+        judge.ingest(response(50, vec![1, 2], 900)).unwrap();
+        let rec = &judge.patterns[&key];
+        assert_eq!(rec.first_block, 50);
+        assert_eq!(rec.last_block, 300);
+    }
+
+    #[test]
+    fn parse_frame_salvages_embedded_responses() {
+        let frame = serde_json::to_string(&response(42, vec![1, 2], 100)).unwrap();
+
+        // Clean frame.
+        assert_eq!(parse_frame(&frame).unwrap().block, 42);
+        // Unterminated library print! glued to the front.
+        assert_eq!(parse_frame(&format!("checking foo... {frame}")).unwrap().block, 42);
+        // Garbage (even JSON-looking) before AND after.
+        assert_eq!(parse_frame(&format!("{{\"note\":1}} {frame} trailing")).unwrap().block, 42);
+        // Pure garbage: no frame.
+        assert!(parse_frame("progress 5/10 {done}").is_none());
+        assert!(parse_frame("{\"block\":7}").is_none(), "missing required fields is not a frame");
+        assert!(parse_frame("").is_none());
+    }
+
+    #[test]
+    fn spool_validation_rejects_wrong_or_damaged_block_json() {
+        let entry = |json: &[u8]| SpoolEntry {
+            block_json: json.to_vec(),
+            light_witness: stateless_core::LightWitness {
+                kvs: Default::default(),
+                levels: Default::default(),
+            },
+            code_hashes: vec![],
+        };
+
+        // Damaged inner JSON decodes fine as a bincode Vec<u8> but must fail
+        // validation.
+        assert!(validate_spool_entry(&entry(b"not json"), 7).is_err());
+
+        // A real fixture block validates against its own number and is
+        // rejected for any other.
+        let fixture_path = std::fs::read_dir("../../test_data/mainnet/blocks")
+            .expect("fixture dir")
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|e| e == "json"))
+            .expect("at least one block fixture");
+        let fixture = std::fs::read(&fixture_path).expect("fixture");
+        let block: alloy_rpc_types_eth::Block<op_alloy_rpc_types::Transaction> =
+            serde_json::from_slice(&fixture).unwrap();
+        let n = block.header.inner.number;
+        assert!(validate_spool_entry(&entry(&fixture), n).is_ok());
+        assert!(validate_spool_entry(&entry(&fixture), n + 1).is_err());
+    }
+
+    #[test]
+    fn corrupt_code_file_is_detected_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"\x60\x80\x60\x40".to_vec();
+        let hash = alloy_primitives::keccak256(&bytes);
+
+        let good = dir.path().join("good.bin");
+        std::fs::write(&good, &bytes).unwrap();
+        assert!(code_file_is_valid(&good, &hash));
+        assert!(good.exists());
+
+        let bad = dir.path().join("bad.bin");
+        std::fs::write(&bad, b"truncated").unwrap();
+        assert!(!code_file_is_valid(&bad, &hash));
+        assert!(!bad.exists(), "invalid content-addressed file must be deleted for refetch");
+
+        assert!(!code_file_is_valid(&dir.path().join("absent.bin"), &hash));
+    }
+
+    #[test]
+    fn elapsed_sampler_stays_bounded_and_representative() {
+        let mut s = ElapsedSampler::new();
+        let n = (ElapsedSampler::CAP * 3) as u64;
+        for i in 0..n {
+            s.record(i);
+        }
+        assert_eq!(s.seen, n);
+        assert!(s.samples.len() <= ElapsedSampler::CAP, "bounded: {}", s.samples.len());
+        assert!(s.stride > 1, "must have decimated");
+        // Still spans the full range (deterministic stride, no bias to
+        // either end): percentile estimates stay meaningful.
+        let (min, max) = (s.samples.iter().min().unwrap(), s.samples.iter().max().unwrap());
+        assert!(*min < n / 10, "min {} not near the start", min);
+        assert!(*max > n - n / 10, "max {} not near the end", max);
     }
 
     #[test]

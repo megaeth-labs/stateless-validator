@@ -167,6 +167,10 @@ fn merge_snapshots(shards: Vec<(String, StoreSnapshot)>) -> Result<StoreSnapshot
             flat_id[src as usize] = Some(id);
             flat_unified[src as usize] = id_to_dense[&id];
         }
+        // stored key → merged key, for rewriting the shard's block records:
+        // a 64-bit collision can land a pattern on a different slot in the
+        // merged space, and blocks must keep pointing at THEIR pattern.
+        let mut key_map: HashMap<u64, u64> = HashMap::with_capacity(snap.patterns.len());
         for (&stored_key, rec) in &snap.patterns {
             let mut remapped = BitSet::new();
             let mut ids: Vec<u64> = Vec::with_capacity(rec.bits as usize);
@@ -184,6 +188,7 @@ fn merge_snapshots(shards: Vec<(String, StoreSnapshot)>) -> Result<StoreSnapshot
 
             // Re-key exactly as the judge does — same shared probing walk.
             let (key, occupied) = resolve_pattern_slot(&patterns, &ids, &remapped);
+            key_map.insert(stored_key, key);
             if occupied {
                 let existing = patterns.get_mut(&key).expect("occupied slot");
                 existing.hit_count += rec.hit_count;
@@ -223,7 +228,14 @@ fn merge_snapshots(shards: Vec<(String, StoreSnapshot)>) -> Result<StoreSnapshot
 
         // Blocks: shards scan disjoint ranges, so a plain union. A duplicate
         // (should not happen) carries an identical record; last write wins.
-        for (num, rec) in snap.blocks {
+        // Pattern references follow their pattern through any re-keying; an
+        // unknown key (block committed, pattern lost — cannot happen with the
+        // archive-before-commit ordering) is kept verbatim rather than
+        // silently detached.
+        for (num, mut rec) in snap.blocks {
+            if let Some(pk) = rec.pattern_key {
+                rec.pattern_key = Some(key_map.get(&pk).copied().unwrap_or(pk));
+            }
             blocks.insert(num, rec);
         }
     }
@@ -333,6 +345,38 @@ mod tests {
         let d200 = merged.counters[&200].dense;
         let bits: Vec<u32> = folded.bitmap.iter_ones().collect();
         assert!(bits.contains(&d100) && bits.contains(&d300) && !bits.contains(&d200));
+    }
+
+    /// When a pattern lands on a different key in the merged space (source
+    /// shard had probed it off its base slot), the shard's block records must
+    /// follow it — otherwise they point at whatever occupies the old key.
+    #[test]
+    fn merge_rewrites_block_pattern_keys_on_rekey() {
+        let counters: HashMap<u64, CounterInfo> = [(100, info(0, "a", 0))].into();
+        // Stored under an arbitrary non-base key, as a collision would force.
+        let stored_key = 0xDEAD_BEEFu64;
+        let patterns: HashMap<u64, PatternRecord> =
+            [(stored_key, pat(BitSet::from_indices([0]), 10, 50, 1))].into();
+        let mut block = blk(1, 50);
+        block.pattern_key = Some(stored_key);
+        let a = StoreSnapshot { counters, patterns, blocks: [(10u64, block)].into() };
+        let b = StoreSnapshot {
+            counters: [(200, info(0, "b", 0))].into(),
+            patterns: [(pattern_base_key(&[200]), pat(BitSet::from_indices([0]), 20, 30, 1))]
+                .into(),
+            blocks: [(20u64, blk(2, 30))].into(),
+        };
+
+        let merged = merge_snapshots(vec![("A".into(), a), ("B".into(), b)]).expect("merge");
+
+        // The pattern re-keyed to its base slot in the merged space…
+        let expected_key = pattern_base_key(&[100]);
+        assert!(merged.patterns.contains_key(&expected_key));
+        assert!(!merged.patterns.contains_key(&stored_key));
+        // …and the block record followed it.
+        assert_eq!(merged.blocks[&10].pattern_key, Some(expected_key));
+        // The untouched shard's block reference is unchanged.
+        assert_eq!(merged.blocks[&20].pattern_key, Some(0));
     }
 
     /// Merge is order-independent: swapping shard order yields the same

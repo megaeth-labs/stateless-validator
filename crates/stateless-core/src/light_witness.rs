@@ -182,7 +182,14 @@ impl StateReader for LightWitness {
         match self.kvs.get(&metadata_key) {
             Some(Some(salt_value)) => BucketMeta::try_from(salt_value.clone())
                 .map_err(|_| LightWitnessError { message: "Failed to decode metadata" }),
-            Some(None) => unreachable!("Metadata should never be stored as None in witness"),
+            // A well-formed witness never maps a metadata key to a deletion,
+            // but witness bytes are network input (and the light decode
+            // validates nothing) — this must be an error, not a panic: a
+            // panic here takes down the whole consumer (RPC handler task,
+            // coverage worker process) on one corrupt response.
+            Some(None) => {
+                Err(LightWitnessError { message: "Corrupt witness: metadata key maps to None" })
+            }
             None => Err(LightWitnessError { message: "Metadata not in witness" }),
         }
     }
@@ -306,6 +313,23 @@ mod tests {
         let fast = LightWitness { kvs: BTreeMap::new(), levels: FxHashMap::default() };
         assert!(fast.kvs.is_empty());
         assert!(fast.levels.is_empty());
+    }
+
+    /// A corrupt witness that maps a bucket's metadata key to `None` must
+    /// surface as a `StateReader` error, not a panic: witness bytes are
+    /// unvalidated network input on the light path, and a panic here kills
+    /// the whole consumer (RPC handler, coverage worker) instead of failing
+    /// one request.
+    #[test]
+    fn metadata_key_mapped_to_none_is_an_error_not_a_panic() {
+        // First valid data-bucket id (bucket_metadata_key asserts the range).
+        let bucket: BucketId = 65536;
+        let mut kvs: BTreeMap<SaltKey, Option<SaltValue>> = BTreeMap::new();
+        kvs.insert(bucket_metadata_key(bucket), None);
+        let witness = LightWitness { kvs, levels: FxHashMap::default() };
+
+        let err = witness.metadata(bucket).expect_err("must not panic");
+        assert!(err.message.contains("Corrupt witness"), "got: {err}");
     }
 
     /// Round-trip a populated `LightWitness` through bincode to confirm the

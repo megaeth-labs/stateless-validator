@@ -130,7 +130,7 @@ The server includes an HTTP response cache (`quick_cache`) for pre-serialized JS
 ## Test Organization
 
 Unit tests are embedded in source files alongside the code they test.
-Integration tests live in `bin/debug-trace-server/tests/` (6 modules: cache_metrics, block_tag, consistency, performance, timing_header, prune) and in `bin/stateless-validator/tests/integration.rs` (CLI parsing, mock-RPC pipeline, mainnet single-block validation).
+Integration tests live in `bin/debug-trace-server/tests/` (5 modules: cache_metrics, block_tag, consistency, performance, timing_header), in `bin/stateless-validator/tests/integration.rs` (CLI parsing, mock-RPC pipeline, mainnet single-block validation), and in `bin/coverage-replayer/tests/replay_fixtures.rs` (worker replay glue over the `test_data/mainnet` fixtures).
 Test data (block JSON files, contract bytecode, witness data) is stored in `test_data/`.
 
 ## Version Control

@@ -135,15 +135,21 @@ pub fn run(args: InspectArgs) -> Result<()> {
             let mut cum = BitSet::new();
             let mut idx = 0usize;
             for b in 0..buckets {
+                // The last bucket takes everything left: with `(hi - lo)` an
+                // exact multiple of the bucket count, `end == hi` and a
+                // strict `<` would silently drop the patterns first seen at
+                // `hi` (at least one always exists).
+                let last = b + 1 == buckets;
                 let end = lo + width * (b + 1);
                 let mut new_patterns = 0u64;
-                while idx < by_first.len() && by_first[idx].1 < end {
+                while idx < by_first.len() && (last || by_first[idx].1 < end) {
                     cum.union_with(&by_first[idx].0.bitmap);
                     new_patterns += 1;
                     idx += 1;
                 }
                 println!(
-                    "  ..{end:>10}: +{new_patterns:<5} patterns, universe={}",
+                    "  ..{:>10}: +{new_patterns:<5} patterns, universe={}",
+                    end.min(hi),
                     cum.count_ones()
                 );
             }

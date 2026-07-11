@@ -37,7 +37,16 @@ impl SpoolEntry {
     pub fn write_to(&self, path: &Path) -> Result<()> {
         let raw = bincode::serde::encode_to_vec(self, BINCODE_CONFIG)
             .map_err(|e| eyre::eyre!("encode spool entry: {e}"))?;
-        let compressed = zstd::encode_all(&raw[..], SPOOL_ZSTD_LEVEL)?;
+        // Frame checksum (xxhash, ~free): most of the entry is opaque
+        // high-entropy bytes (block_json, witness kvs) where a media-level
+        // bit flip would decode "successfully" into wrong data — with the
+        // checksum, ANY byte corruption fails `read_from`, which the fetcher
+        // treats as delete-and-refetch. Old checksum-less spool files still
+        // decode (the flag is per-frame).
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), SPOOL_ZSTD_LEVEL)?;
+        encoder.include_checksum(true)?;
+        std::io::Write::write_all(&mut encoder, &raw)?;
+        let compressed = encoder.finish()?;
         write_atomic(path, &compressed)
     }
 
@@ -111,13 +120,23 @@ impl DataDir {
     }
 }
 
-/// Write via unique tmp file + rename so readers never observe partial files.
+/// Write via unique tmp file + rename so readers never observe partial files,
+/// fsynced so the result survives power loss, not just process crashes.
+///
+/// The fsync-before-rename is load-bearing for the judge's archive-before-
+/// commit invariant: redb commits are fsynced, so if archived profiles were
+/// only in the page cache a power cut could persist the pattern while losing
+/// its profile — an orphan no re-run can repair (the block is already Ok).
+/// The same ordering keeps spool entries from surviving truncated.
 ///
 /// The tmp name embeds pid + a counter: concurrent writers of the SAME target
 /// (e.g. two fetch tasks resolving one shared contract hash) must not collide
 /// on the tmp path — last rename wins and both writers succeed.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        io::Write as _,
+        sync::atomic::{AtomicU64, Ordering},
+    };
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let unique = format!(
         "{}.{}.{}.tmp",
@@ -126,9 +145,56 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         SEQ.fetch_add(1, Ordering::Relaxed),
     );
     let tmp = path.with_file_name(unique);
-    fs::write(&tmp, bytes).wrap_err_with(|| format!("write {}", tmp.display()))?;
-    fs::rename(&tmp, path).wrap_err_with(|| format!("rename to {}", path.display()))?;
-    Ok(())
+    let result = (|| -> Result<()> {
+        let mut f = fs::File::create(&tmp).wrap_err_with(|| format!("create {}", tmp.display()))?;
+        f.write_all(bytes).wrap_err_with(|| format!("write {}", tmp.display()))?;
+        f.sync_all().wrap_err_with(|| format!("fsync {}", tmp.display()))?;
+        drop(f);
+        fs::rename(&tmp, path).wrap_err_with(|| format!("rename to {}", path.display()))?;
+        // Make the rename itself durable. Directory fsync is best-effort:
+        // supported on Linux, may be a no-op/error elsewhere (macOS).
+        if let Some(parent) = path.parent() &&
+            let Ok(dir) = fs::File::open(parent)
+        {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        // ENOSPC/rename failure: don't leave the tmp file behind.
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Removes stale `*.tmp` files left by writers killed mid-`write_atomic`
+/// (their unique names are never reused, so they accumulate forever
+/// otherwise). Non-recursive.
+///
+/// `min_age` guards live writers: a healthy `write_atomic` holds its tmp for
+/// milliseconds, so anything older than the threshold is orphaned. Callers
+/// must still only sweep after acquiring the store lock (one backfill per
+/// data-dir) — the age filter is the second line of defense for processes
+/// that do NOT hold the lock (e.g. a concurrent `report` inflating profiles
+/// into the shared tmp dir).
+pub fn sweep_stale_tmp(dir: &Path, min_age: std::time::Duration) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else { return 0 };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        if !entry.file_name().to_string_lossy().ends_with(".tmp") {
+            continue;
+        }
+        let old_enough = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age >= min_age);
+        if old_enough && fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Loads contract bytecodes for the given hashes from the codes dir.
@@ -146,4 +212,74 @@ pub fn load_contracts(
         map.insert(*hash, revm::state::Bytecode::new_raw(bytes.into()));
     }
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Any single corrupted byte in a spool file must fail `read_from` (the
+    /// zstd frame checksum) — most of the entry is opaque high-entropy bytes
+    /// where corruption would otherwise decode into silently wrong data, and
+    /// the fetcher's delete-and-refetch self-heal keys off this error.
+    #[test]
+    fn spool_checksum_rejects_any_byte_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("1.bin");
+        let entry = SpoolEntry {
+            block_json: vec![0xA5; 4096],
+            light_witness: LightWitness { kvs: Default::default(), levels: Default::default() },
+            code_hashes: vec![B256::repeat_byte(3)],
+        };
+        entry.write_to(&path).unwrap();
+        assert!(SpoolEntry::read_from(&path).is_ok());
+
+        let clean = fs::read(&path).unwrap();
+        // Flip one bit in the middle of the payload region.
+        for at in [clean.len() / 2, clean.len() - 8] {
+            let mut damaged = clean.clone();
+            damaged[at] ^= 0x01;
+            fs::write(&path, &damaged).unwrap();
+            assert!(SpoolEntry::read_from(&path).is_err(), "byte {at} corruption must not decode");
+        }
+    }
+
+    #[test]
+    fn write_atomic_round_trips_and_leaves_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("out.bin");
+        write_atomic(&target, b"payload").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"payload");
+        assert_eq!(sweep_stale_tmp(dir.path(), Duration::ZERO), 0, "no tmp litter after success");
+    }
+
+    #[test]
+    fn write_atomic_failure_removes_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory at the target path makes the final rename fail.
+        let target = dir.path().join("occupied");
+        fs::create_dir(&target).unwrap();
+        assert!(write_atomic(&target, b"x").is_err());
+        assert_eq!(
+            sweep_stale_tmp(dir.path(), Duration::ZERO),
+            0,
+            "failed write must clean its tmp file"
+        );
+    }
+
+    #[test]
+    fn sweep_removes_only_old_tmp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("stale.bin.123.0.tmp"), b"junk").unwrap();
+        fs::write(dir.path().join("keep.bin"), b"data").unwrap();
+        // A generous min_age spares the freshly-written (live-looking) tmp…
+        assert_eq!(sweep_stale_tmp(dir.path(), Duration::from_secs(3600)), 0);
+        assert!(dir.path().join("stale.bin.123.0.tmp").exists());
+        // …zero age reaps it, leaving non-tmp files alone.
+        assert_eq!(sweep_stale_tmp(dir.path(), Duration::ZERO), 1);
+        assert!(dir.path().join("keep.bin").exists());
+        assert!(!dir.path().join("stale.bin.123.0.tmp").exists());
+    }
 }
