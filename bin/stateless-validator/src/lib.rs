@@ -16,3 +16,4 @@ pub use app::{
 pub use chain_sync::{ValidatorFetcher, ValidatorHooks, ValidatorProcessor};
 pub use r2_witness::{R2WitnessClient, R2WitnessError};
 pub use validator_db::ValidatorDB;
+pub use workers::run_with_signals;

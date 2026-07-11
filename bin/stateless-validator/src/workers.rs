@@ -58,7 +58,7 @@ pub async fn run_with_signals(
 
     let reporter = if report_validation {
         Some(task::spawn(validation_reporter(
-            client,
+            Arc::clone(&client),
             Arc::clone(&validator_db),
             Duration::from_secs(1),
             shutdown.clone(),
@@ -112,6 +112,20 @@ pub async fn run_with_signals(
         let _ = tokio::time::timeout(Duration::from_secs(3), reporter).await;
     }
 
+    // Final authoritative report, sent after the pipeline (and any drain) has fully stopped
+    // and the periodic reporter has been cancelled and joined (best-effort: a reporter wedged
+    // in a slow report past the 3s join above keeps running detached, but upstream applies
+    // reports through a forward-only cursor, so a stale late report cannot regress it). The
+    // reporter is cancelled the instant the pipeline stops, so anything validated since its
+    // last 1s tick — or during the drain — would otherwise go unreported. In tip-following
+    // mode the next restart re-reports the range on its first tick, but an `--end-block` slice
+    // run has no next restart, so this is its only chance to report the tail. Re-reporting an
+    // already-reported tip is harmless: that is exactly what every fresh start does. Bounded
+    // by the client's single-attempt `per_attempt_timeout`.
+    if report_validation && let Err(e) = report_range_once(&client, &validator_db, &mut 0).await {
+        warn!(error = %e, "Final validation report failed");
+    }
+
     // Canonical chain advances strictly +1 (advancer enforces parent-hash continuity and
     // rolls back on reorg), so the final tip bounds the validated range exactly.
     match (initial_tip, validator_db.get_canonical_tip()?.map(|t| t.block_number)) {
@@ -132,7 +146,9 @@ pub async fn run_with_signals(
 /// Reports validated blocks to the dedicated report endpoint.
 ///
 /// Periodically reads the canonical tip from ValidatorDB and reports the
-/// validated range to the upstream node.
+/// validated range to the upstream node. Exits as soon as `shutdown` fires;
+/// the final tip is reported by `run_with_signals` after the pipeline has
+/// fully stopped, so nothing validated after this task's last tick is lost.
 async fn validation_reporter(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
@@ -151,53 +167,67 @@ async fn validation_reporter(
             }
         }
 
-        let (anchor, tip) = match (validator_db.get_anchor(), validator_db.get_canonical_tip()) {
-            (Ok(Some(a)), Ok(Some(t))) => (a, t),
-            (Ok(None), _) | (_, Ok(None)) => continue,
-            (Err(e), _) | (_, Err(e)) => {
-                warn!(error = %e, "Failed to read anchor/tip, retrying");
-                continue;
-            }
-        };
+        report_range_once(&client, &validator_db, &mut last_reported_block).await?;
+    }
+}
 
-        if tip.block_number == last_reported_block {
-            continue;
+/// One reporter round: read anchor + tip and report the validated range upstream if the tip
+/// differs from `last_reported_block` (updated on an accepted report). A tip that regressed
+/// below it after a reorg rollback is deliberately re-reported — upstream must learn the new
+/// range. Read failures and rejected/failed reports are logged and skipped — the next round
+/// retries. The only `Err` is a detected validation gap, which is fatal to the reporter.
+async fn report_range_once(
+    client: &RpcClient,
+    validator_db: &ValidatorDB,
+    last_reported_block: &mut u64,
+) -> Result<()> {
+    let (anchor, tip) = match (validator_db.get_anchor(), validator_db.get_canonical_tip()) {
+        (Ok(Some(a)), Ok(Some(t))) => (a, t),
+        (Ok(None), _) | (_, Ok(None)) => return Ok(()),
+        (Err(e), _) | (_, Err(e)) => {
+            warn!(error = %e, "Failed to read anchor/tip, retrying");
+            return Ok(());
         }
+    };
 
-        let result = client
-            .set_validated_blocks(
-                (anchor.block_number, B256::from(anchor.block_hash.0)),
-                (tip.block_number, B256::from(tip.block_hash.0)),
-            )
-            .await;
+    if tip.block_number == *last_reported_block {
+        return Ok(());
+    }
 
-        match result {
-            Ok(response) if response.accepted => {
-                debug!(
-                    anchor = anchor.block_number,
-                    anchor_hash = %anchor.block_hash,
-                    tip = tip.block_number,
-                    tip_hash = %tip.block_hash,
-                    "Reported blocks"
-                );
-                last_reported_block = tip.block_number;
+    let result = client
+        .set_validated_blocks(
+            (anchor.block_number, B256::from(anchor.block_hash.0)),
+            (tip.block_number, B256::from(tip.block_hash.0)),
+        )
+        .await;
+
+    match result {
+        Ok(response) if response.accepted => {
+            debug!(
+                anchor = anchor.block_number,
+                anchor_hash = %anchor.block_hash,
+                tip = tip.block_number,
+                tip_hash = %tip.block_hash,
+                "Reported blocks"
+            );
+            *last_reported_block = tip.block_number;
+        }
+        Ok(response) => {
+            if response.last_validated_block.0 < anchor.block_number {
+                return Err(eyre::eyre!(
+                    "Validation gap detected: upstream at block {}, but local chain starts at {}",
+                    response.last_validated_block.0,
+                    anchor.block_number
+                ));
             }
-            Ok(response) => {
-                if response.last_validated_block.0 < anchor.block_number {
-                    return Err(eyre::eyre!(
-                        "Validation gap detected: upstream at block {}, but local chain starts at {}",
-                        response.last_validated_block.0,
-                        anchor.block_number
-                    ));
-                }
-                error!(
-                    upstream_block = ?response.last_validated_block,
-                    "Report rejected"
-                );
-            }
-            Err(e) => {
-                error!(error = %e, "Failed to report blocks");
-            }
+            error!(
+                upstream_block = ?response.last_validated_block,
+                "Report rejected"
+            );
+        }
+        Err(e) => {
+            error!(error = %e, "Failed to report blocks");
         }
     }
+    Ok(())
 }

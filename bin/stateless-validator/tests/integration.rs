@@ -3,7 +3,10 @@
 //! Covers CLI argument parsing and end-to-end pipeline validation against a mock RPC server.
 //! Mainnet single-block validation is covered in `crates/stateless-core/src/executor.rs::tests`.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use alloy_primitives::{B256, BlockHash};
 use alloy_rpc_types_eth::Block;
@@ -15,7 +18,7 @@ use jsonrpsee::{
 use jsonrpsee_types::error::{
     CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
 };
-use stateless_common::{RpcClient, WitnessRequestKeys, encode_witness_response};
+use stateless_common::{RpcClient, RpcClientConfig, WitnessRequestKeys, encode_witness_response};
 use stateless_core::{
     BisectResolver, ChainStore, ContractStore, PipelineConfig, db::BlockMeta,
     pipeline::run_pipeline, withdrawals::MptWitness,
@@ -24,7 +27,7 @@ use stateless_db::ContractCache;
 use stateless_test_utils::{fixtures::TestFixtures, logging::init_test_logging};
 use stateless_validator::{
     CommandLineArgs, VALIDATOR_DB_FILENAME, ValidatorDB, ValidatorFetcher, ValidatorHooks,
-    ValidatorProcessor, load_or_create_chain_spec,
+    ValidatorProcessor, load_or_create_chain_spec, run_with_signals,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -210,6 +213,9 @@ const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
 struct MockServerState {
     fixtures: TestFixtures,
     mpt_witnesses: HashMap<BlockHash, MptWitness>,
+    /// Every `mega_setValidatedBlocks` call received, as `(first_block, last_block)` numbers.
+    /// Clone the `Arc` before handing the state to the server to assert on reports.
+    validated_reports: Arc<Mutex<Vec<(u64, u64)>>>,
 }
 
 impl MockServerState {
@@ -219,7 +225,7 @@ impl MockServerState {
             .keys()
             .map(|hash| (*hash, fixtures.mpt_witness(hash)))
             .collect();
-        Self { fixtures, mpt_witnesses }
+        Self { fixtures, mpt_witnesses, validated_reports: Arc::default() }
     }
 }
 
@@ -393,9 +399,9 @@ async fn setup_mock_rpc_server(
         .unwrap();
 
     module
-        .register_method("mega_setValidatedBlocks", |params, _ctx, _| {
-            let (_first_block, last_block): ((u64, String), (u64, String)) =
-                params.parse().unwrap();
+        .register_method("mega_setValidatedBlocks", |params, ctx, _| {
+            let (first_block, last_block): ((u64, String), (u64, String)) = params.parse().unwrap();
+            ctx.validated_reports.lock().unwrap().push((first_block.0, last_block.0));
             let last_hash: BlockHash = last_block.1.parse().unwrap();
             Ok::<serde_json::Value, ErrorObjectOwned>(serde_json::json!({
                 "accepted": true,
@@ -468,4 +474,64 @@ async fn integration_test() {
 
     handle.stop().unwrap();
     info!("Mock RPC server has been shut down");
+}
+
+/// A fixed-range run (`--end-block` → `sync_target`) must report its final validated tip
+/// upstream before exiting. The periodic reporter is cancelled the instant the pipeline
+/// completes and its 1s tick usually never fires on a short run, so without the final flush in
+/// `run_with_signals` the whole slice would finish unreported — and a slice run has no later
+/// restart whose first tick would re-report it.
+#[tokio::test]
+async fn end_block_run_reports_final_tip() {
+    let _logging = init_test_logging("stateless_validator");
+    let fx = TestFixtures::synthetic();
+    let genesis_file = fx.data_dir.join("genesis.json");
+
+    let max_block_number = fx.max_block().0;
+    let (validator_db, _tmp) = setup_test_db(&fx).unwrap();
+    let contract_cache =
+        Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
+    let state = MockServerState::new(fx);
+    let reports = Arc::clone(&state.validated_reports);
+    let (handle, url) = setup_mock_rpc_server(state).await;
+    // Unlike `integration_test`, the report endpoint is wired up (fourth argument), pointing at
+    // the same mock server.
+    let client = Arc::new(
+        RpcClient::new_with_config(
+            &[url.as_str()],
+            &[url.as_str()],
+            RpcClientConfig::validator(),
+            Some(url.as_str()),
+        )
+        .unwrap(),
+    );
+    let chain_spec = Arc::new(
+        load_or_create_chain_spec(&validator_db, Some(genesis_file.to_str().unwrap())).unwrap(),
+    );
+
+    let mut cfg = PipelineConfig::default();
+    cfg.concurrent_workers = 1;
+    cfg.sync_target = Some(max_block_number);
+
+    run_with_signals(
+        client,
+        None,
+        Arc::clone(&validator_db),
+        contract_cache,
+        chain_spec,
+        Some(url.clone()),
+        cfg,
+    )
+    .await
+    .unwrap();
+
+    let reports = reports.lock().unwrap();
+    let &(_, last_reported) =
+        reports.last().expect("the run must report validated blocks before exiting");
+    assert_eq!(
+        last_reported, max_block_number,
+        "the final report must cover the end block (got reports: {reports:?})",
+    );
+
+    handle.stop().unwrap();
 }

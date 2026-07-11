@@ -170,7 +170,7 @@ fn register_metric_descriptions() {
     // R2 witness source
     describe_histogram!(
         names::WITNESS_FETCH_R2_TIME,
-        "R2 witness fetch+decode time incl. internal retries (s)"
+        "R2 witness fetch+decode time incl. internal retries, excl. concurrency-cap queue wait (s)"
     );
     describe_counter!(
         names::R2_WITNESS_RETRY_ATTEMPTS_TOTAL,
@@ -328,9 +328,11 @@ pub fn on_witness_fetch(b: WitnessSizeBreakdown) {
 
 // R2 witness source metrics (`--witness-source r2`)
 
-/// Record a successful R2 witness fetch: duration (GET incl. internal retries, plus decode) and
-/// the same size breakdown the RPC path reports via [`on_witness_fetch`], so the witness-size
-/// histograms stay populated when the witness source is R2.
+/// Record a successful R2 witness fetch: duration (GET incl. internal retries, plus decode —
+/// excluding time queued on the witness concurrency cap, which is self-imposed and would mask
+/// genuine R2 latency) and the same size breakdown the RPC path reports via
+/// [`on_witness_fetch`], so the witness-size histograms stay populated when the witness source
+/// is R2.
 pub fn on_r2_witness_fetch_success(duration: f64, breakdown: WitnessSizeBreakdown) {
     histogram!(names::WITNESS_FETCH_R2_TIME).record(duration);
     on_witness_fetch(breakdown);

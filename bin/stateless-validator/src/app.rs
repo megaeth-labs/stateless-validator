@@ -174,7 +174,8 @@ pub struct CommandLineArgs {
     pub data_max_concurrent_requests: Option<usize>,
 
     /// Maximum concurrent in-flight witness fetches, independent of the data cap.
-    /// Omit for unlimited.
+    /// Omit for unlimited. Applies to both witness sources: `mega_getBlockWitness` RPC calls
+    /// and, with `--witness-source r2`, direct R2 GETs.
     #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_MAX_CONCURRENT_REQUESTS")]
     pub witness_max_concurrent_requests: Option<usize>,
 
@@ -307,6 +308,7 @@ pub async fn run() -> Result<()> {
                 access_key_id.to_string(),
                 secret_access_key.to_string(),
                 per_attempt_timeout,
+                args.witness_max_concurrent_requests,
             )?))
         }
     };

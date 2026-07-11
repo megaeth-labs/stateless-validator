@@ -10,7 +10,10 @@
 //! uploader's `encode_witness_payload`), which [`stateless_common::decode_witness_payload`]
 //! inverts exactly.
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use alloy_primitives::B256;
 use bytes::Bytes;
@@ -25,7 +28,7 @@ use stateless_r2::{
     keys,
     sigv4::{SigV4Signer, encode_uri_path},
 };
-use tokio::task::JoinError;
+use tokio::{sync::Semaphore, task::JoinError};
 use tracing::{trace, warn};
 
 use crate::metrics;
@@ -121,12 +124,18 @@ pub struct R2WitnessClient {
     /// SigV4 canonical host (`host[:port]`).
     host: String,
     bucket: String,
+    /// Caps concurrent GETs, honoring `--witness-max-concurrent-requests` — the documented
+    /// knob for bounding witness I/O (the RPC witness path enforces it with its own semaphore
+    /// inside `RpcClient`, which this client bypasses).
+    concurrency: Arc<Semaphore>,
 }
 
 impl R2WitnessClient {
     /// Builds a client from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
     ///
-    /// `per_attempt_timeout` bounds each individual GET. Fails if the endpoint is not a bare
+    /// `per_attempt_timeout` bounds each individual GET. `max_concurrent_requests` caps the
+    /// number of GETs in flight at once (`None` = unlimited, `Some(0)` clamps to 1 — same
+    /// semantics as the RPC witness semaphore). Fails if the endpoint is not a bare
     /// `scheme://host[:port]` origin (see [`parse_endpoint`]) or the HTTP client cannot be built.
     pub fn new(
         endpoint: &str,
@@ -134,6 +143,7 @@ impl R2WitnessClient {
         access_key_id: String,
         secret_access_key: String,
         per_attempt_timeout: Duration,
+        max_concurrent_requests: Option<usize>,
     ) -> eyre::Result<Self> {
         let (origin, host) = parse_endpoint(endpoint);
         if host.is_empty() {
@@ -156,6 +166,9 @@ impl R2WitnessClient {
             endpoint: origin,
             host,
             bucket,
+            concurrency: Arc::new(Semaphore::new(
+                max_concurrent_requests.unwrap_or(Semaphore::MAX_PERMITS).max(1),
+            )),
         })
     }
 
@@ -186,13 +199,27 @@ impl R2WitnessClient {
         hash: B256,
     ) -> Result<(SaltWitness, MptWitness), R2WitnessError> {
         let started = Instant::now();
+        // Time queued on the concurrency cap, subtracted from the fetch-duration metric below:
+        // queue wait is self-imposed by `--witness-max-concurrent-requests`, and folding it in
+        // would make the histogram indistinguishable from genuine R2 slowness. (The RPC witness
+        // path likewise starts its attempt timer only after acquiring its permit.)
+        let mut queue_wait = Duration::ZERO;
         let key = keys::block_object_key(number, hash);
         let mut backoff = INITIAL_BACKOFF;
         let mut attempt = 0usize;
 
         let bytes = loop {
             attempt += 1;
-            match self.get_object(number, &key).await {
+            // The permit is scoped to the request itself — holding it across the backoff sleep
+            // or the decode below would waste capacity other fetches could use. Mirrors the RPC
+            // path, which acquires its witness permit per attempt inside the retry loop.
+            let outcome = {
+                let queued = Instant::now();
+                let _permit = self.concurrency.acquire().await.expect("semaphore is never closed");
+                queue_wait += queued.elapsed();
+                self.get_object(number, &key).await
+            };
+            match outcome {
                 Ok(bytes) => break bytes,
                 Err(e) => {
                     if !e.is_retryable() || attempt > MAX_RETRIES {
@@ -211,7 +238,7 @@ impl R2WitnessClient {
             Ok(Ok(witness)) => {
                 trace!(number, "R2 witness fetched and decoded");
                 metrics::on_r2_witness_fetch_success(
-                    started.elapsed().as_secs_f64(),
+                    started.elapsed().saturating_sub(queue_wait).as_secs_f64(),
                     WitnessSizeBreakdown::new(&witness.0, &witness.1),
                 );
                 Ok(witness)
@@ -304,6 +331,7 @@ mod tests {
             "ak".to_string(),
             "sk".to_string(),
             Duration::from_secs(20),
+            None,
         )
         .unwrap_err();
         assert!(err.to_string().contains("Invalid R2 endpoint"));
@@ -343,12 +371,17 @@ mod tests {
     }
 
     fn client(endpoint: &str) -> R2WitnessClient {
+        client_with_limit(endpoint, None)
+    }
+
+    fn client_with_limit(endpoint: &str, limit: Option<usize>) -> R2WitnessClient {
         R2WitnessClient::new(
             endpoint,
             "witness-test".to_string(),
             "ak".to_string(),
             "sk".to_string(),
             Duration::from_secs(5),
+            limit,
         )
         .unwrap()
     }
@@ -436,6 +469,62 @@ mod tests {
         let err = fetch(&endpoint).await.unwrap_err();
         assert!(matches!(err, R2WitnessError::Status { status: 301, .. }), "{err}");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// `--witness-max-concurrent-requests` is the documented knob for bounding witness I/O, and
+    /// in R2 mode this client is the only thing enforcing it (the `RpcClient` witness semaphore
+    /// is bypassed). Six concurrent fetches against a limit of 2 must never have more than two
+    /// GETs in flight at once.
+    #[tokio::test]
+    async fn concurrency_limit_bounds_in_flight_gets() {
+        const LIMIT: usize = 2;
+        const FETCHES: u64 = 6;
+
+        // Handles each connection in its own task (unlike `mock_r2`, which serves one at a
+        // time and so cannot observe concurrency), tracking the in-flight high-water mark.
+        // Responses are held open long enough for the other fetches to pile up behind the
+        // semaphore, then answered 404 (a deterministic error → exactly one GET per fetch).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        {
+            let (in_flight, peak) = (in_flight.clone(), peak.clone());
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut sock, _)) = listener.accept().await else { return };
+                    let (in_flight, peak) = (in_flight.clone(), peak.clone());
+                    tokio::spawn(async move {
+                        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        let mut buf = [0u8; 4096];
+                        let _ = sock.read(&mut buf).await;
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        let response =
+                            "HTTP/1.1 404 X\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
+                        let _ = sock.write_all(response.as_bytes()).await;
+                        in_flight.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            });
+        }
+
+        let client = client_with_limit(&endpoint, Some(LIMIT));
+        let mut fetches = tokio::task::JoinSet::new();
+        for number in 0..FETCHES {
+            let client = client.clone();
+            fetches.spawn(async move { client.get_witness(number, B256::ZERO).await });
+        }
+        while let Some(result) = fetches.join_next().await {
+            let err = result.unwrap().unwrap_err();
+            assert!(matches!(err, R2WitnessError::Missing { .. }), "{err}");
+        }
+
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak <= LIMIT, "peak in-flight GETs {peak} exceeded the limit {LIMIT}");
+        // Liveness guard: with six fetches, a 2-permit semaphore, and 50ms-held responses,
+        // the limit must actually be reached — otherwise this test can't have observed it.
+        assert_eq!(peak, LIMIT, "expected the fetches to saturate the concurrency limit");
     }
 
     /// Every deterministic failure must be throttled before surfacing — the pipeline re-enqueues
