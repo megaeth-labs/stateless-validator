@@ -299,6 +299,10 @@ impl LightWitnessExecutor {
 
 #[cfg(test)]
 mod tests {
+    // `std` is the `alloc` alias in no_std builds, where the prelude carries
+    // no `vec!` — import it explicitly (same as chain_spec.rs).
+    use std::vec;
+
     use super::*;
 
     #[test]
