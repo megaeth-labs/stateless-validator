@@ -20,6 +20,13 @@ use crate::{
     validator_db::ValidatorDB,
 };
 
+/// Attempts for the final shutdown report (first try + retries). An `--end-block` slice run
+/// has no reporter tick after this to publish its tail, so a transient endpoint blip at
+/// exactly shutdown must not silently drop the report.
+const FINAL_REPORT_ATTEMPTS: usize = 3;
+/// Sleep between final-report attempts.
+const FINAL_REPORT_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 /// Starts the validator pipeline, optional reporter, and signal handlers.
 ///
 /// Cleanly drains on SIGINT/SIGTERM and returns either the pipeline result or `Ok(())`
@@ -119,11 +126,33 @@ pub async fn run_with_signals(
     // reporter is cancelled the instant the pipeline stops, so anything validated since its
     // last 1s tick — or during the drain — would otherwise go unreported. In tip-following
     // mode the next restart re-reports the range on its first tick, but an `--end-block` slice
-    // run has no next restart, so this is its only chance to report the tail. Re-reporting an
-    // already-reported tip is harmless: that is exactly what every fresh start does. Bounded
-    // by the client's single-attempt `per_attempt_timeout`.
-    if report_validation && let Err(e) = report_range_once(&client, &validator_db, &mut 0).await {
-        warn!(error = %e, "Final validation report failed");
+    // run has no next restart, so this is its only chance to report the tail — hence, unlike
+    // the periodic loop (whose next tick is its retry), a failed attempt here is retried up to
+    // FINAL_REPORT_ATTEMPTS times before giving up with an ERROR log. Re-reporting an
+    // already-reported tip is harmless: that is exactly what every fresh start does. Worst
+    // case this delays shutdown by FINAL_REPORT_ATTEMPTS single-attempt reports (each bounded
+    // by `per_attempt_timeout`) plus the sleeps between them.
+    if report_validation {
+        let mut last_reported = 0u64;
+        for attempt in 1..=FINAL_REPORT_ATTEMPTS {
+            match report_range_once(&client, &validator_db, &mut last_reported).await {
+                Ok(true) => break,
+                Ok(false) if attempt < FINAL_REPORT_ATTEMPTS => {
+                    warn!(attempt, "Final validation report failed, retrying");
+                    tokio::time::sleep(FINAL_REPORT_RETRY_DELAY).await;
+                }
+                Ok(false) => error!(
+                    attempts = FINAL_REPORT_ATTEMPTS,
+                    "Final validation report failed; the validated tail may be unreported \
+                     upstream"
+                ),
+                // A detected validation gap is deterministic — retrying cannot resolve it.
+                Err(e) => {
+                    warn!(error = %e, "Final validation report failed");
+                    break;
+                }
+            }
+        }
     }
 
     // Canonical chain advances strictly +1 (advancer enforces parent-hash continuity and
@@ -174,24 +203,30 @@ async fn validation_reporter(
 /// One reporter round: read anchor + tip and report the validated range upstream if the tip
 /// differs from `last_reported_block` (updated on an accepted report). A tip that regressed
 /// below it after a reorg rollback is deliberately re-reported — upstream must learn the new
-/// range. Read failures and rejected/failed reports are logged and skipped — the next round
-/// retries. The only `Err` is a detected validation gap, which is fatal to the reporter.
+/// range.
+///
+/// Returns `Ok(true)` when this round is settled — the report was accepted, or there is
+/// nothing to report (no anchor/tip yet, or the tip is already reported). Returns `Ok(false)`
+/// when the attempt failed in a way a retry could resolve (read failure, transport failure, or
+/// a rejection without a gap) — the failure is logged here; the periodic loop just waits for
+/// its next tick, while the final shutdown flush retries a bounded number of times. The only
+/// `Err` is a detected validation gap, which is fatal to the reporter.
 async fn report_range_once(
     client: &RpcClient,
     validator_db: &ValidatorDB,
     last_reported_block: &mut u64,
-) -> Result<()> {
+) -> Result<bool> {
     let (anchor, tip) = match (validator_db.get_anchor(), validator_db.get_canonical_tip()) {
         (Ok(Some(a)), Ok(Some(t))) => (a, t),
-        (Ok(None), _) | (_, Ok(None)) => return Ok(()),
+        (Ok(None), _) | (_, Ok(None)) => return Ok(true),
         (Err(e), _) | (_, Err(e)) => {
             warn!(error = %e, "Failed to read anchor/tip, retrying");
-            return Ok(());
+            return Ok(false);
         }
     };
 
     if tip.block_number == *last_reported_block {
-        return Ok(());
+        return Ok(true);
     }
 
     let result = client
@@ -211,6 +246,7 @@ async fn report_range_once(
                 "Reported blocks"
             );
             *last_reported_block = tip.block_number;
+            Ok(true)
         }
         Ok(response) => {
             if response.last_validated_block.0 < anchor.block_number {
@@ -224,10 +260,11 @@ async fn report_range_once(
                 upstream_block = ?response.last_validated_block,
                 "Report rejected"
             );
+            Ok(false)
         }
         Err(e) => {
             error!(error = %e, "Failed to report blocks");
+            Ok(false)
         }
     }
-    Ok(())
 }

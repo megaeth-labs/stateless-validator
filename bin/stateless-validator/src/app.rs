@@ -160,7 +160,7 @@ pub struct CommandLineArgs {
     pub report_validation_endpoint: Option<String>,
 
     /// Enable Prometheus metrics endpoint.
-    /// When enabled, metrics are exposed at http://0.0.0.0:<metrics-port>/metrics
+    /// When enabled, metrics are exposed at `http://0.0.0.0:<metrics-port>/metrics`.
     #[clap(long, env = "STATELESS_VALIDATOR_METRICS_ENABLED")]
     pub metrics_enabled: bool,
 

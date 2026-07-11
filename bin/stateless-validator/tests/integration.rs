@@ -213,9 +213,12 @@ const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
 struct MockServerState {
     fixtures: TestFixtures,
     mpt_witnesses: HashMap<BlockHash, MptWitness>,
-    /// Every `mega_setValidatedBlocks` call received, as `(first_block, last_block)` numbers.
+    /// Every *accepted* `mega_setValidatedBlocks` call, as `(first_block, last_block)` numbers.
     /// Clone the `Arc` before handing the state to the server to assert on reports.
     validated_reports: Arc<Mutex<Vec<(u64, u64)>>>,
+    /// Number of upcoming `mega_setValidatedBlocks` calls to fail with an RPC error (simulating
+    /// a transient endpoint blip); decremented per rejected call.
+    reject_reports: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MockServerState {
@@ -225,7 +228,12 @@ impl MockServerState {
             .keys()
             .map(|hash| (*hash, fixtures.mpt_witness(hash)))
             .collect();
-        Self { fixtures, mpt_witnesses, validated_reports: Arc::default() }
+        Self {
+            fixtures,
+            mpt_witnesses,
+            validated_reports: Arc::default(),
+            reject_reports: Arc::default(),
+        }
     }
 }
 
@@ -400,7 +408,18 @@ async fn setup_mock_rpc_server(
 
     module
         .register_method("mega_setValidatedBlocks", |params, ctx, _| {
+            use std::sync::atomic::Ordering;
             let (first_block, last_block): ((u64, String), (u64, String)) = params.parse().unwrap();
+            if ctx
+                .reject_reports
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(make_rpc_error(
+                    CALL_EXECUTION_FAILED_CODE,
+                    "transient report failure (scripted)".to_string(),
+                ));
+            }
             ctx.validated_reports.lock().unwrap().push((first_block.0, last_block.0));
             let last_hash: BlockHash = last_block.1.parse().unwrap();
             Ok::<serde_json::Value, ErrorObjectOwned>(serde_json::json!({
@@ -476,13 +495,13 @@ async fn integration_test() {
     info!("Mock RPC server has been shut down");
 }
 
-/// A fixed-range run (`--end-block` → `sync_target`) must report its final validated tip
-/// upstream before exiting. The periodic reporter is cancelled the instant the pipeline
-/// completes and its 1s tick usually never fires on a short run, so without the final flush in
-/// `run_with_signals` the whole slice would finish unreported — and a slice run has no later
-/// restart whose first tick would re-report it.
-#[tokio::test]
-async fn end_block_run_reports_final_tip() {
+/// Runs `run_with_signals` over the synthetic fixtures to their max block (`--end-block` →
+/// `sync_target`) with the report endpoint wired to the mock server, failing the first
+/// `reject_first_reports` report calls, and asserts the last accepted report covers the end
+/// block. Returns every accepted report for further assertions.
+async fn run_end_block_slice_and_assert_tip_reported(
+    reject_first_reports: usize,
+) -> Vec<(u64, u64)> {
     let _logging = init_test_logging("stateless_validator");
     let fx = TestFixtures::synthetic();
     let genesis_file = fx.data_dir.join("genesis.json");
@@ -493,6 +512,7 @@ async fn end_block_run_reports_final_tip() {
         Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
     let state = MockServerState::new(fx);
     let reports = Arc::clone(&state.validated_reports);
+    state.reject_reports.store(reject_first_reports, std::sync::atomic::Ordering::SeqCst);
     let (handle, url) = setup_mock_rpc_server(state).await;
     // Unlike `integration_test`, the report endpoint is wired up (fourth argument), pointing at
     // the same mock server.
@@ -525,6 +545,8 @@ async fn end_block_run_reports_final_tip() {
     .await
     .unwrap();
 
+    handle.stop().unwrap();
+
     let reports = reports.lock().unwrap();
     let &(_, last_reported) =
         reports.last().expect("the run must report validated blocks before exiting");
@@ -532,6 +554,23 @@ async fn end_block_run_reports_final_tip() {
         last_reported, max_block_number,
         "the final report must cover the end block (got reports: {reports:?})",
     );
+    reports.clone()
+}
 
-    handle.stop().unwrap();
+/// A fixed-range run (`--end-block` → `sync_target`) must report its final validated tip
+/// upstream before exiting. The periodic reporter is cancelled the instant the pipeline
+/// completes and its 1s tick usually never fires on a short run, so without the final flush in
+/// `run_with_signals` the whole slice would finish unreported — and a slice run has no later
+/// restart whose first tick would re-report it.
+#[tokio::test]
+async fn end_block_run_reports_final_tip() {
+    run_end_block_slice_and_assert_tip_reported(0).await;
+}
+
+/// The final report must survive a transient endpoint failure: the run has no reporter tick
+/// after it, so a single blip at exactly shutdown would otherwise permanently lose the tail.
+/// The mock fails the first report call; the final flush's bounded retry must land the second.
+#[tokio::test]
+async fn end_block_final_report_retries_after_transient_failure() {
+    run_end_block_slice_and_assert_tip_reported(1).await;
 }
