@@ -193,11 +193,13 @@ pub struct CommandLineArgs {
     pub tip_buffer: Option<u64>,
 
     /// Initial round-level RPC retry backoff (milliseconds). Applied after every provider in a
-    /// round has failed; doubles each round up to `--rpc-max-backoff-ms`.
+    /// round has failed; doubles each round up to `--rpc-max-backoff-ms`. With
+    /// `--witness-source r2` this also paces R2 witness GET retries.
     #[clap(long, env = "STATELESS_VALIDATOR_RPC_INITIAL_BACKOFF_MS")]
     pub rpc_initial_backoff_ms: Option<u64>,
 
-    /// Cap on round-level RPC retry backoff (milliseconds).
+    /// Cap on round-level RPC retry backoff (milliseconds). With `--witness-source r2` this
+    /// also caps R2 witness GET retry backoff.
     #[clap(long, env = "STATELESS_VALIDATOR_RPC_MAX_BACKOFF_MS")]
     pub rpc_max_backoff_ms: Option<u64>,
 
@@ -304,6 +306,7 @@ pub async fn run() -> Result<()> {
                 access_key_id.to_string(),
                 secret_access_key.to_string(),
                 per_attempt_timeout,
+                rpc_config.rpc_retry.clone(),
                 args.witness_max_concurrent_requests,
             )?))
         }

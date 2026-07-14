@@ -5786,6 +5786,7 @@ dependencies = [
  "chrono",
  "clap",
  "eyre",
+ "fastrand",
  "jsonrpsee",
  "jsonrpsee-types",
  "metrics",

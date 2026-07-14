@@ -20,7 +20,9 @@ use bytes::Bytes;
 use chrono::Utc;
 use reqwest::Client;
 use salt::SaltWitness;
-use stateless_common::{WitnessDecodingError, WitnessSizeBreakdown, decode_witness_payload};
+use stateless_common::{
+    BackoffPolicy, WitnessDecodingError, WitnessSizeBreakdown, decode_witness_payload,
+};
 use stateless_core::withdrawals::MptWitness;
 use stateless_r2::{
     client::is_throttle_status,
@@ -34,18 +36,14 @@ use tracing::{trace, warn};
 use crate::metrics;
 
 /// Max retry rounds for retryable (transport/429/5xx) failures before surfacing an error.
+/// Stays a local constant while the backoff pacing is injected (see [`R2WitnessClient::new`]):
+/// the RPC path retries unboundedly, so there is no operator flag to mirror.
 const MAX_RETRIES: usize = 8;
-/// First retry sleep; doubles each round up to [`MAX_BACKOFF`]. Test builds shrink all three
-/// durations so the retry-path tests run in milliseconds.
-const INITIAL_BACKOFF: Duration =
-    if cfg!(test) { Duration::from_millis(5) } else { Duration::from_millis(500) };
-/// Upper bound on any single retry sleep.
-const MAX_BACKOFF: Duration =
-    if cfg!(test) { Duration::from_millis(20) } else { Duration::from_secs(30) };
 /// Throttle applied before surfacing any deterministic (non-retryable) failure: the pipeline
 /// fetcher (`stateless-core/src/pipeline/fetcher.rs`) re-enqueues failed fetches with no delay,
 /// so returning instantly would hot-loop signed GETs against R2. Delete this once the fetcher
-/// grows per-block re-enqueue backoff.
+/// grows per-block re-enqueue backoff. Test builds shrink it so the failure-path tests run in
+/// milliseconds.
 const DETERMINISTIC_FAILURE_THROTTLE: Duration =
     if cfg!(test) { Duration::from_millis(5) } else { Duration::from_secs(2) };
 /// Cap on the response body carried inside `Throttled`/`Status` errors.
@@ -120,6 +118,10 @@ pub struct R2WitnessClient {
     /// SigV4 canonical host (`host[:port]`).
     host: String,
     bucket: String,
+    /// Paces retries of retryable GET failures: doubling with jitter, mirroring the RPC retry
+    /// loop. Injected so the `--rpc-initial-backoff-ms` / `--rpc-max-backoff-ms` flags govern
+    /// R2 pacing too.
+    retry_backoff: BackoffPolicy,
     /// Caps concurrent GETs, honoring `--witness-max-concurrent-requests` (the RPC witness path
     /// enforces it inside `RpcClient`, which R2 mode bypasses).
     concurrency: Arc<Semaphore>,
@@ -128,9 +130,12 @@ pub struct R2WitnessClient {
 impl R2WitnessClient {
     /// Builds a client from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
     ///
-    /// `per_attempt_timeout` bounds each individual GET. `max_concurrent_requests` caps the
-    /// number of GETs in flight at once (`None` = unlimited, `Some(0)` clamps to 1 — same
-    /// semantics as the RPC witness semaphore). Fails if the endpoint is not a bare
+    /// `per_attempt_timeout` bounds each individual GET. `retry_backoff` paces the retries of
+    /// retryable failures — first sleep `initial`, doubling up to `max`, each with up to 50%
+    /// jitter — and is the same policy the RPC path builds from `--rpc-initial-backoff-ms` /
+    /// `--rpc-max-backoff-ms`, so one pair of flags tunes both paths. `max_concurrent_requests`
+    /// caps the number of GETs in flight at once (`None` = unlimited, `Some(0)` clamps to 1 —
+    /// same semantics as the RPC witness semaphore). Fails if the endpoint is not a bare
     /// `scheme://host[:port]` origin (see [`parse_endpoint`]) or the HTTP client cannot be built.
     pub fn new(
         endpoint: &str,
@@ -138,6 +143,7 @@ impl R2WitnessClient {
         access_key_id: String,
         secret_access_key: String,
         per_attempt_timeout: Duration,
+        retry_backoff: BackoffPolicy,
         max_concurrent_requests: Option<usize>,
     ) -> eyre::Result<Self> {
         let (origin, host) = parse_endpoint(endpoint);
@@ -161,6 +167,7 @@ impl R2WitnessClient {
             endpoint: origin,
             host,
             bucket,
+            retry_backoff,
             concurrency: Arc::new(Semaphore::new(
                 max_concurrent_requests.unwrap_or(Semaphore::MAX_PERMITS).max(1),
             )),
@@ -169,9 +176,9 @@ impl R2WitnessClient {
 
     /// Fetches and decodes the witness for `(number, hash)` from R2.
     ///
-    /// Transport/429/5xx failures are retried with backoff up to `MAX_RETRIES` times. Every
-    /// other failure is deterministic and surfaces after a short
-    /// `DETERMINISTIC_FAILURE_THROTTLE` sleep (see its docs for why).
+    /// Transport/429/5xx failures are retried up to `MAX_RETRIES` times, paced by the
+    /// `retry_backoff` policy given at construction. Every other failure is deterministic and
+    /// surfaces after a short `DETERMINISTIC_FAILURE_THROTTLE` sleep (see its docs for why).
     pub async fn get_witness(
         &self,
         number: u64,
@@ -198,7 +205,8 @@ impl R2WitnessClient {
         // self-imposed, and folded in it would masquerade as R2 slowness.
         let mut queue_wait = Duration::ZERO;
         let key = keys::block_object_key(number, hash);
-        let mut backoff = INITIAL_BACKOFF;
+        let max_backoff_ms = self.retry_backoff.max.as_millis() as u64;
+        let mut backoff_ms = self.retry_backoff.initial.as_millis() as u64;
         let mut attempt = 0usize;
 
         let bytes = loop {
@@ -218,9 +226,18 @@ impl R2WitnessClient {
                         return Err(e);
                     }
                     metrics::on_r2_witness_retry();
-                    warn!(number, %key, attempt, error = %e, "R2 witness GET failed, backing off");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    // Jittered doubling, mirroring the RPC retry loop: jitter keeps parallel
+                    // validators (several typically slice a block range) from retrying in
+                    // lockstep through a shared R2 brownout, and `.max(1)` keeps a
+                    // zero-duration policy from busy-looping.
+                    let jitter_ms = fastrand::u64(0..=backoff_ms / 2);
+                    let sleep_ms = (backoff_ms + jitter_ms).min(max_backoff_ms).max(1);
+                    warn!(
+                        number, %key, attempt, sleep_ms, error = %e,
+                        "R2 witness GET failed, backing off",
+                    );
+                    tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                    backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
                 }
             }
         };
@@ -323,6 +340,7 @@ mod tests {
             "ak".to_string(),
             "sk".to_string(),
             Duration::from_secs(20),
+            test_backoff(),
             None,
         )
         .unwrap_err();
@@ -362,17 +380,32 @@ mod tests {
         (endpoint, hits)
     }
 
+    /// Millisecond-scale retry pacing so the retry-path tests run fast (production runs pass
+    /// the seconds-scale policy built from the `--rpc-*-backoff-ms` flags).
+    fn test_backoff() -> BackoffPolicy {
+        BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(20))
+    }
+
     fn client(endpoint: &str) -> R2WitnessClient {
         client_with_limit(endpoint, None)
     }
 
     fn client_with_limit(endpoint: &str, limit: Option<usize>) -> R2WitnessClient {
+        client_with_backoff(endpoint, limit, test_backoff())
+    }
+
+    fn client_with_backoff(
+        endpoint: &str,
+        limit: Option<usize>,
+        retry_backoff: BackoffPolicy,
+    ) -> R2WitnessClient {
         R2WitnessClient::new(
             endpoint,
             "witness-test".to_string(),
             "ak".to_string(),
             "sk".to_string(),
             Duration::from_secs(5),
+            retry_backoff,
             limit,
         )
         .unwrap()
@@ -411,6 +444,26 @@ mod tests {
         let err = fetch(&endpoint).await.unwrap_err();
         assert!(matches!(err, R2WitnessError::Status { status: 403, .. }), "{err}");
         assert_eq!(hits.load(Ordering::SeqCst), 3, "5xx must be retried, 4xx must stop the loop");
+    }
+
+    /// The injected policy actually paces retries: with `initial = 50ms`, the sleep between
+    /// the throttled first attempt and the second must be at least 50ms (jitter only adds).
+    #[tokio::test]
+    async fn retries_are_paced_by_the_injected_backoff_policy() {
+        let (endpoint, hits) = mock_r2(vec![(503, "SlowDown"), (404, "")]).await;
+        let client = client_with_backoff(
+            &endpoint,
+            None,
+            BackoffPolicy::new(Duration::from_millis(50), Duration::from_millis(200)),
+        );
+        let started = std::time::Instant::now();
+        let err = client.get_witness(1, B256::ZERO).await.unwrap_err();
+        assert!(matches!(err, R2WitnessError::Missing { .. }), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "retry surfaced before the policy's initial backoff elapsed",
+        );
     }
 
     #[tokio::test]
