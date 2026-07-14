@@ -1383,19 +1383,7 @@ dependencies = [
  "ark-ff 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
  "ark-serialize 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
  "rayon",
- "salt-macros 0.1.0 (git+https://github.com/megaeth-labs/salt.git?tag=v1.0.5)",
-]
-
-[[package]]
-name = "banderwagon"
-version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb#80c02eb1e5d85c3348fc7f3075d80440eeebe1fb"
-dependencies = [
- "ark-ec 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
- "ark-ed-on-bls12-381-bandersnatch",
- "ark-ff 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
- "ark-serialize 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
- "salt-macros 0.1.0 (git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb)",
+ "salt-macros",
 ]
 
 [[package]]
@@ -2327,7 +2315,7 @@ dependencies = [
  "http-body-util",
  "jsonrpsee",
  "libc",
- "mega-evm 1.6.1",
+ "mega-evm",
  "metrics",
  "metrics-derive",
  "metrics-exporter-prometheus",
@@ -2340,7 +2328,7 @@ dependencies = [
  "reqwest 0.13.2",
  "revm",
  "revm-inspectors",
- "salt 1.0.5",
+ "salt",
  "serde",
  "serde_json",
  "stateless-common",
@@ -3629,28 +3617,13 @@ name = "ipa-multipoint"
 version = "0.1.0"
 source = "git+https://github.com/megaeth-labs/salt.git?tag=v1.0.5#b6b30e733276f50855a2d3c0781177803ba8f8d9"
 dependencies = [
- "banderwagon 0.1.0 (git+https://github.com/megaeth-labs/salt.git?tag=v1.0.5)",
+ "banderwagon",
  "hashbrown 0.16.1",
  "hex",
  "itertools 0.10.5",
  "rayon",
  "rustc-hash",
- "salt-macros 0.1.0 (git+https://github.com/megaeth-labs/salt.git?tag=v1.0.5)",
- "sha2 0.9.9",
- "thiserror",
-]
-
-[[package]]
-name = "ipa-multipoint"
-version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb#80c02eb1e5d85c3348fc7f3075d80440eeebe1fb"
-dependencies = [
- "banderwagon 0.1.0 (git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb)",
- "hashbrown 0.16.1",
- "hex",
- "itertools 0.10.5",
- "rustc-hash",
- "salt-macros 0.1.0 (git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb)",
+ "salt-macros",
  "sha2 0.9.9",
  "thiserror",
 ]
@@ -3876,7 +3849,7 @@ dependencies = [
 [[package]]
 name = "kona-cli"
 version = "0.3.2"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=develop#c83be842ec263e2bb2d55c7f92325990288bf061"
 dependencies = [
  "alloy-chains",
  "alloy-primitives",
@@ -3896,7 +3869,7 @@ dependencies = [
 [[package]]
 name = "kona-derive"
 version = "0.4.5"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=develop#c83be842ec263e2bb2d55c7f92325990288bf061"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3917,7 +3890,7 @@ dependencies = [
 [[package]]
 name = "kona-driver"
 version = "0.4.0"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=develop#c83be842ec263e2bb2d55c7f92325990288bf061"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -3927,7 +3900,7 @@ dependencies = [
  "kona-executor",
  "kona-genesis",
  "kona-protocol",
- "mega-evm 1.5.1",
+ "mega-evm",
  "op-alloy-consensus 0.22.4",
  "op-alloy-rpc-types-engine",
  "spin 0.10.0",
@@ -3938,7 +3911,7 @@ dependencies = [
 [[package]]
 name = "kona-executor"
 version = "0.4.0"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=develop#c83be842ec263e2bb2d55c7f92325990288bf061"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3956,12 +3929,12 @@ dependencies = [
  "kona-megaevm",
  "kona-mpt",
  "kona-protocol",
- "mega-evm 1.5.1",
+ "mega-evm",
  "op-alloy-consensus 0.22.4",
  "op-alloy-rpc-types 0.22.4",
  "op-alloy-rpc-types-engine",
  "risc0-zkvm",
- "salt 1.0.3",
+ "salt",
  "salt-stateless",
  "simd-json",
  "thiserror",
@@ -3971,7 +3944,7 @@ dependencies = [
 [[package]]
 name = "kona-genesis"
 version = "0.4.5"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=develop#c83be842ec263e2bb2d55c7f92325990288bf061"
 dependencies = [
  "alloy-chains",
  "alloy-consensus",
@@ -3982,7 +3955,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
  "derive_more",
- "mega-evm 1.5.1",
+ "mega-evm",
  "serde",
  "serde_repr",
  "thiserror",
@@ -3991,7 +3964,7 @@ dependencies = [
 [[package]]
 name = "kona-hardforks"
 version = "0.4.5"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=develop#c83be842ec263e2bb2d55c7f92325990288bf061"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
@@ -4002,7 +3975,7 @@ dependencies = [
 [[package]]
 name = "kona-log"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=develop#c83be842ec263e2bb2d55c7f92325990288bf061"
 dependencies = [
  "risc0-zkvm",
 ]
@@ -4010,24 +3983,24 @@ dependencies = [
 [[package]]
 name = "kona-macros"
 version = "0.1.2"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=develop#c83be842ec263e2bb2d55c7f92325990288bf061"
 
 [[package]]
 name = "kona-megaevm"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=develop#c83be842ec263e2bb2d55c7f92325990288bf061"
 dependencies = [
  "alloy-hardforks 0.2.13",
  "alloy-op-hardforks 0.2.13",
  "alloy-primitives",
- "mega-evm 1.5.1",
- "salt 1.0.3",
+ "mega-evm",
+ "salt",
 ]
 
 [[package]]
 name = "kona-mpt"
 version = "0.3.0"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=develop#c83be842ec263e2bb2d55c7f92325990288bf061"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
@@ -4039,7 +4012,7 @@ dependencies = [
 [[package]]
 name = "kona-preimage"
 version = "0.3.0"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=develop#c83be842ec263e2bb2d55c7f92325990288bf061"
 dependencies = [
  "alloy-primitives",
  "async-channel",
@@ -4052,7 +4025,7 @@ dependencies = [
 [[package]]
 name = "kona-proof"
 version = "0.3.0"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=develop#c83be842ec263e2bb2d55c7f92325990288bf061"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -4075,7 +4048,7 @@ dependencies = [
  "kona-system-contracts",
  "lazy_static",
  "lru 0.16.4",
- "mega-evm 1.5.1",
+ "mega-evm",
  "op-alloy-consensus 0.22.4",
  "op-alloy-rpc-types-engine",
  "serde",
@@ -4090,7 +4063,7 @@ dependencies = [
 [[package]]
 name = "kona-protocol"
 version = "0.4.5"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=develop#c83be842ec263e2bb2d55c7f92325990288bf061"
 dependencies = [
  "alloc-no-stdlib",
  "alloy-consensus",
@@ -4119,7 +4092,7 @@ dependencies = [
 [[package]]
 name = "kona-registry"
 version = "0.4.5"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=develop#c83be842ec263e2bb2d55c7f92325990288bf061"
 dependencies = [
  "alloy-chains",
  "alloy-eips",
@@ -4138,10 +4111,10 @@ dependencies = [
 [[package]]
 name = "kona-system-contracts"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=develop#c83be842ec263e2bb2d55c7f92325990288bf061"
 dependencies = [
  "alloy-primitives",
- "mega-evm 1.5.1",
+ "mega-evm",
 ]
 
 [[package]]
@@ -4395,34 +4368,6 @@ dependencies = [
 
 [[package]]
 name = "mega-evm"
-version = "1.5.1"
-source = "git+https://github.com/megaeth-labs/mega-evm-internal?rev=b3d8cb645e1caed3f3bf19046431be7d39beb1cf#b3d8cb645e1caed3f3bf19046431be7d39beb1cf"
-dependencies = [
- "alloy-consensus",
- "alloy-eips",
- "alloy-evm",
- "alloy-hardforks 0.2.13",
- "alloy-op-evm",
- "alloy-op-hardforks 0.2.13",
- "alloy-primitives",
- "alloy-sol-types",
- "auto_impl",
- "bitflags 2.10.0",
- "delegate",
- "derive_more",
- "mega-system-contracts 1.5.1",
- "once_cell",
- "op-alloy-consensus 0.18.14",
- "op-alloy-flz",
- "op-revm",
- "revm",
- "serde",
- "thiserror",
- "tracing",
-]
-
-[[package]]
-name = "mega-evm"
 version = "1.6.1"
 source = "git+https://github.com/megaeth-labs/mega-evm.git?tag=v1.6.1#19f3965962c4cc1c12aaedd0ccbd972e4ab10d17"
 dependencies = [
@@ -4438,7 +4383,7 @@ dependencies = [
  "bitflags 2.10.0",
  "delegate",
  "derive_more",
- "mega-system-contracts 1.6.1",
+ "mega-system-contracts",
  "once_cell",
  "op-alloy-consensus 0.18.14",
  "op-alloy-flz",
@@ -4447,18 +4392,6 @@ dependencies = [
  "serde",
  "thiserror",
  "tracing",
-]
-
-[[package]]
-name = "mega-system-contracts"
-version = "1.5.1"
-source = "git+https://github.com/megaeth-labs/mega-evm-internal?rev=b3d8cb645e1caed3f3bf19046431be7d39beb1cf#b3d8cb645e1caed3f3bf19046431be7d39beb1cf"
-dependencies = [
- "alloy-primitives",
- "alloy-sol-types",
- "semver 1.0.27",
- "serde",
- "serde_json",
 ]
 
 [[package]]
@@ -6865,40 +6798,19 @@ dependencies = [
 
 [[package]]
 name = "salt"
-version = "1.0.3"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb#80c02eb1e5d85c3348fc7f3075d80440eeebe1fb"
-dependencies = [
- "auto_impl",
- "banderwagon 0.1.0 (git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb)",
- "blake3",
- "derive_more",
- "hashbrown 0.16.1",
- "hex",
- "ipa-multipoint 0.1.0 (git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb)",
- "rustc-hash",
- "salt-macros 0.1.0 (git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb)",
- "serde",
- "serde_arrays",
- "spin 0.10.0",
- "thiserror",
- "zerocopy 0.7.35",
-]
-
-[[package]]
-name = "salt"
 version = "1.0.5"
 source = "git+https://github.com/megaeth-labs/salt.git?tag=v1.0.5#b6b30e733276f50855a2d3c0781177803ba8f8d9"
 dependencies = [
  "auto_impl",
- "banderwagon 0.1.0 (git+https://github.com/megaeth-labs/salt.git?tag=v1.0.5)",
+ "banderwagon",
  "blake3",
  "derive_more",
  "hashbrown 0.16.1",
  "hex",
- "ipa-multipoint 0.1.0 (git+https://github.com/megaeth-labs/salt.git?tag=v1.0.5)",
+ "ipa-multipoint",
  "rayon",
  "rustc-hash",
- "salt-macros 0.1.0 (git+https://github.com/megaeth-labs/salt.git?tag=v1.0.5)",
+ "salt-macros",
  "serde",
  "serde_arrays",
  "spin 0.10.0",
@@ -6915,20 +6827,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "salt-macros"
-version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?rev=80c02eb1e5d85c3348fc7f3075d80440eeebe1fb#80c02eb1e5d85c3348fc7f3075d80440eeebe1fb"
-
-[[package]]
 name = "salt-stateless"
 version = "1.0.0"
-source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=clay%2Ffeat%2Fregist_pnet_config#203e6cc723b235f03f9b71a8c76ccfdfa7937509"
+source = "git+https://github.com/megaeth-labs/mega-kona.git?branch=develop#c83be842ec263e2bb2d55c7f92325990288bf061"
 dependencies = [
  "alloy-eips",
  "alloy-primitives",
  "anyhow",
- "mega-evm 1.5.1",
- "salt 1.0.3",
+ "mega-evm",
+ "salt",
 ]
 
 [[package]]
@@ -7470,7 +7377,7 @@ dependencies = [
  "reqwest 0.12.24",
  "revm",
  "rolling-file",
- "salt 1.0.5",
+ "salt",
  "serde",
  "stateless-core",
  "stateless-test-utils",
@@ -7503,7 +7410,7 @@ dependencies = [
  "eyre",
  "hashbrown 0.16.1",
  "kanal",
- "mega-evm 1.6.1",
+ "mega-evm",
  "num_cpus",
  "op-alloy-consensus 0.18.14",
  "op-alloy-rpc-types 0.18.14",
@@ -7513,7 +7420,7 @@ dependencies = [
  "reth-trie-sparse",
  "revm",
  "rustc-hash",
- "salt 1.0.5",
+ "salt",
  "serde",
  "serde_json",
  "stateless-test-utils",
@@ -7553,7 +7460,7 @@ dependencies = [
  "eyre",
  "op-alloy-rpc-types 0.18.14",
  "revm",
- "salt 1.0.5",
+ "salt",
  "serde",
  "serde_json",
  "tracing",
@@ -7584,7 +7491,7 @@ dependencies = [
  "kona-mpt",
  "kona-proof",
  "kona-registry",
- "mega-evm 1.6.1",
+ "mega-evm",
  "metrics",
  "metrics-exporter-prometheus",
  "op-alloy-consensus 0.18.14",
@@ -7592,7 +7499,7 @@ dependencies = [
  "op-alloy-rpc-types-engine",
  "redb",
  "revm",
- "salt 1.0.5",
+ "salt",
  "serde_json",
  "stateless-common",
  "stateless-core",
