@@ -10,6 +10,8 @@
 //!   transaction replay, and state root comparison
 //! - [`validate_block_updates`]: Variant returning the replay-derived SALT state updates for
 //!   embedders that compare against an independently verified per-block changeset
+//! - [`validate_block_updates_light`]: The same over a zero-validation [`LightWitness`] — no curve
+//!   point is ever constructed on the whole decode + replay path
 //! - [`create_evm_env`]: Creates EVM execution environment from block header and chain
 //!   specification
 //! - [`replay_block`]: Replays block transactions to compute state changes
@@ -59,7 +61,10 @@ use revm::{
     primitives::{B256, KECCAK_EMPTY, U256},
     state::Bytecode,
 };
-use salt::{EphemeralSaltState, SaltValue, SaltWitness, StateRoot, StateUpdates, Witness};
+use salt::{
+    EphemeralSaltState, SaltValue, SaltWitness, StateRoot, StateUpdates, Witness,
+    traits::StateReader,
+};
 use thiserror::Error;
 use tracing::debug;
 
@@ -67,6 +72,7 @@ use crate::{
     chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec},
     data_types::{Account, PlainKey, PlainValue},
     evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv},
+    light_witness::{LightWitness, LightWitnessError, LightWitnessExecutor},
     withdrawals::{self, ADDRESS_L2_TO_L1_MESSAGE_PASSER, MptWitness},
 };
 
@@ -90,6 +96,9 @@ pub enum ValidationError {
 
     #[error("Failed to update salt state: {0}")]
     StateUpdateFailed(#[source] salt::SaltError),
+
+    #[error("Failed to update salt state over a light witness: {0}")]
+    LightStateUpdateFailed(#[source] LightWitnessError),
 
     #[error("Failed to update salt trie: {0}")]
     TrieUpdateFailed(#[source] salt::SaltError),
@@ -467,10 +476,15 @@ fn withdrawal_storage(accounts: &HashMap<Address, BundleAccount>) -> B256Map<U25
 ///
 /// The result is the net `{key ↦ (old, new)}` map between the block's pre- and post-states —
 /// the same map the SALT trie update consumes and the sequencer's `SaltDeltas` are derived from.
-fn derive_state_updates(
-    witness: &Witness,
+///
+/// Generic over the witness store: `salt::Witness` on the proof-carrying paths
+/// ([`validate_block`] / [`validate_block_updates`]) and [`LightWitnessExecutor`] on the
+/// zero-validation path ([`validate_block_updates_light`]); callers map the store error into
+/// their [`ValidationError`] variant.
+fn derive_state_updates<W: StateReader>(
+    witness: &W,
     accounts: HashMap<Address, BundleAccount>,
-) -> Result<StateUpdates, ValidationError> {
+) -> Result<StateUpdates, W::Error> {
     // Flatten Revm's BundleAccount format into plain key-value pairs
     let mut kv_updates: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
     for (address, bundle_account) in accounts {
@@ -523,11 +537,7 @@ fn derive_state_updates(
             inserts_or_deletes.insert(plain_key, opt_plain_value);
         }
     }
-    state_updates.merge(
-        witness_state
-            .update_fin(&inserts_or_deletes)
-            .map_err(ValidationError::StateUpdateFailed)?,
-    );
+    state_updates.merge(witness_state.update_fin(&inserts_or_deletes)?);
 
     Ok(state_updates)
 }
@@ -604,7 +614,8 @@ pub fn validate_block<B: BlockInput>(
     let withdrawal_storage = withdrawal_storage(&accounts);
 
     // Derive the net SALT state updates from the replayed accounts
-    let state_updates = derive_state_updates(&witness, accounts)?;
+    let state_updates =
+        derive_state_updates(&witness, accounts).map_err(ValidationError::StateUpdateFailed)?;
 
     // Update the state root
     let (state_root, _) = StateRoot::new(&witness)
@@ -782,7 +793,8 @@ pub fn validate_block_updates<B: BlockInput>(
     // Derive the net SALT state updates from the replayed accounts
     #[cfg(feature = "std")]
     let start = Instant::now();
-    let state_updates = derive_state_updates(&witness, accounts)?;
+    let state_updates =
+        derive_state_updates(&witness, accounts).map_err(ValidationError::StateUpdateFailed)?;
     #[cfg(feature = "std")]
     let salt_update_time = start.elapsed().as_secs_f64();
     #[cfg(not(feature = "std"))]
@@ -794,6 +806,115 @@ pub fn validate_block_updates<B: BlockInput>(
             state_reads: output.state_reads,
             state_writes: output.state_writes,
             witness_verification_time,
+            block_replay_time,
+            salt_update_time,
+        },
+    ))
+}
+
+/// [`validate_block_updates`] over a zero-validation [`LightWitness`] — the cheapest
+/// witness-based replay path.
+///
+/// Pairs with the light witness decode ([`LightWitnessFromSalt`](crate::LightWitnessFromSalt) /
+/// `RpcClient::get_witness_light*`): the full `SaltWitness` decode spends orders of magnitude
+/// more CPU constructing and validating one curve point per parent commitment, which the
+/// proof-skipping mode never uses. This entry point accepts the light form directly, so no
+/// elliptic-curve object is ever built anywhere on the path.
+///
+/// Differences from [`validate_block_updates`]:
+/// - No IPA verification is *possible* (the light witness carries no proof material), so there is
+///   no `verify_witness` switch; [`ValidationStats::witness_verification_time`] is always `0.0`.
+/// - No pre-state-root anchor is *possible* either (the state root is derived from the root
+///   commitment, which the light decode discards). The caller's trust chain must instead run
+///   entirely through the returned updates: comparing them against a changeset that is
+///   hash-committed in the signed block header binds the replay — and therefore the witness content
+///   it consumed — to the canonical chain.
+///
+/// The replayed header fields (withdrawals root, receipts root, logs bloom, gas used) are
+/// checked exactly as in [`validate_block_updates`].
+pub fn validate_block_updates_light<B: BlockInput>(
+    chain_spec: &ChainSpec,
+    block: &B,
+    light_witness: LightWitness,
+    mpt_witness: MptWitness,
+    contracts: &HashMap<B256, Bytecode>,
+    #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
+) -> Result<(StateUpdates, ValidationStats), ValidationError> {
+    // A block carrying only transaction hashes can't be replayed — fail fast.
+    // `replay_block` re-checks for direct callers.
+    if !block.is_complete() {
+        return Err(ValidationError::BlockIncomplete);
+    }
+    let header = block.consensus_header();
+
+    // Create external environment oracle from the light witness
+    let ext_env = WitnessExternalEnv::from_light_witness(&light_witness, header.number)
+        .map_err(ValidationError::EnvOracleConstructionFailed)?;
+
+    // Replay block transactions over the light executor (plain-key lookup table + kvs).
+    #[cfg(feature = "std")]
+    let start = Instant::now();
+    let executor = LightWitnessExecutor::from(light_witness);
+    let witness_db = WitnessDatabase { header, witness: &executor, contracts };
+    let (accounts, output) = replay_block(
+        chain_spec,
+        block,
+        &witness_db,
+        ext_env,
+        #[cfg(feature = "std")]
+        writer,
+    )?;
+    #[cfg(feature = "std")]
+    let block_replay_time = start.elapsed().as_secs_f64();
+    #[cfg(not(feature = "std"))]
+    let block_replay_time = 0.0_f64; // no_std: timing unavailable
+
+    // Check if computed withdrawals root matches the claimed one
+    let withdrawal_storage = withdrawal_storage(&accounts);
+    mpt_witness
+        .verify(header, withdrawal_storage)
+        .map_err(ValidationError::WithdrawalValidationFailed)?;
+
+    // Verify receipts root matches the block header
+    if output.receipts_root != header.receipts_root {
+        return Err(ValidationError::ReceiptsRootMismatch {
+            actual: output.receipts_root,
+            claimed: header.receipts_root,
+        });
+    }
+
+    // Verify logs bloom matches the block header
+    if output.logs_bloom != header.logs_bloom {
+        return Err(ValidationError::LogsBloomMismatch {
+            actual: Box::new(output.logs_bloom),
+            claimed: Box::new(header.logs_bloom),
+        });
+    }
+
+    // Verify gas used matches the block header
+    if output.gas_used != header.gas_used {
+        return Err(ValidationError::GasUsedMismatch {
+            actual: output.gas_used,
+            claimed: header.gas_used,
+        });
+    }
+
+    // Derive the net SALT state updates from the replayed accounts
+    #[cfg(feature = "std")]
+    let start = Instant::now();
+    let state_updates = derive_state_updates(&executor, accounts)
+        .map_err(ValidationError::LightStateUpdateFailed)?;
+    #[cfg(feature = "std")]
+    let salt_update_time = start.elapsed().as_secs_f64();
+    #[cfg(not(feature = "std"))]
+    let salt_update_time = 0.0_f64; // no_std: timing unavailable
+
+    Ok((
+        state_updates,
+        ValidationStats {
+            state_reads: output.state_reads,
+            state_writes: output.state_writes,
+            witness_verification_time: 0.0,
             block_replay_time,
             salt_update_time,
         },
@@ -1016,6 +1137,94 @@ mod tests {
             &fx.contracts,
             true,
             None,
+            #[cfg(feature = "std")]
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ValidationError::BlockIncomplete), "{err:?}");
+    }
+
+    /// `validate_block_updates_light` over the zero-validation decode must reproduce, for every
+    /// paired mainnet fixture, exactly the `StateUpdates` the full-witness path derives — and
+    /// those updates must still yield the header's state root through the SALT trie update.
+    /// The light witness is decoded from the exact bytes of the full encoding
+    /// ([`LightWitnessFromSalt`]), i.e. the same stream `RpcClient::get_witness_light*` consumes.
+    #[test]
+    fn validate_block_updates_light_matches_full_path() {
+        use crate::LightWitnessFromSalt;
+
+        let fx = TestFixtures::mainnet_shared();
+        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
+        let paired = fx.paired_blocks();
+        assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
+        for (number, hash) in paired {
+            let block = &fx.blocks[&hash];
+            let salt_witness = &fx.salt_witnesses[&hash];
+
+            // Light-decode from the full witness's exact wire bytes.
+            let bytes =
+                bincode::serde::encode_to_vec(salt_witness, bincode::config::legacy()).unwrap();
+            let (light, _): (LightWitnessFromSalt, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::legacy())
+                    .unwrap_or_else(|e| panic!("light decode {number} ({hash}): {e}"));
+
+            let (light_updates, stats) = validate_block_updates_light(
+                &chain_spec,
+                block,
+                light.0,
+                fx.mpt_witness(&hash),
+                &fx.contracts,
+                #[cfg(feature = "std")]
+                None,
+            )
+            .unwrap_or_else(|e| panic!("light validation failed for {number} ({hash}): {e:?}"));
+            assert_eq!(stats.witness_verification_time, 0.0, "light path never verifies");
+
+            let (full_updates, _) = validate_block_updates(
+                &chain_spec,
+                block,
+                salt_witness.clone(),
+                fx.mpt_witness(&hash),
+                &fx.contracts,
+                false,
+                None,
+                #[cfg(feature = "std")]
+                None,
+            )
+            .unwrap_or_else(|e| panic!("full-path validation failed for {number} ({hash}): {e:?}"));
+            assert_eq!(
+                light_updates.data, full_updates.data,
+                "light and full paths must derive identical updates for {number} ({hash})"
+            );
+
+            // Cross-check: the light-derived updates still reproduce the header state root.
+            let witness = Witness::from(salt_witness.clone());
+            let (state_root, _) = StateRoot::new(&witness)
+                .update_fin(&light_updates)
+                .unwrap_or_else(|e| panic!("trie update failed for {number} ({hash}): {e:?}"));
+            assert_eq!(
+                B256::from(state_root),
+                block.consensus_header().state_root,
+                "light updates from {number} ({hash}) must reproduce the header state root"
+            );
+        }
+    }
+
+    /// The light entry point rejects a hashes-only block before any witness work.
+    #[test]
+    fn validate_block_updates_light_rejects_hashes_only_block() {
+        let fx = TestFixtures::mainnet_shared();
+        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
+        let (_, hash) = *fx.paired_blocks().first().expect("paired mainnet fixtures");
+        let mut block = fx.blocks[&hash].clone();
+        block.transactions = BlockTransactions::Hashes(Default::default());
+
+        let err = validate_block_updates_light(
+            &chain_spec,
+            &block,
+            LightWitness::from(&fx.salt_witnesses[&hash]),
+            fx.mpt_witness(&hash),
+            &fx.contracts,
             #[cfg(feature = "std")]
             None,
         )
