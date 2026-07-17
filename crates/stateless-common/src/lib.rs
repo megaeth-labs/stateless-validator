@@ -14,7 +14,7 @@ pub use witness_encoding::{
     encode_witness_response,
 };
 pub mod witness_size;
-pub use witness_size::{WitnessSizeBreakdown, estimate_witness_size};
+pub use witness_size::WitnessSizeBreakdown;
 
 /// Default port for Prometheus metrics HTTP endpoint.
 pub const DEFAULT_METRICS_PORT: u16 = 9090;

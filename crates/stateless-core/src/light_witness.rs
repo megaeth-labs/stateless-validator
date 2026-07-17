@@ -1,6 +1,6 @@
 //! Light witness deserialization for tracing/execution.
 //!
-//! Execution-only consumers (debug-trace-server, replay/coverage tooling) read
+//! Execution-only consumers (e.g. debug-trace-server) read
 //! state from a witness but never verify its cryptographic proof. This module
 //! provides [`LightWitness`] — just the witnessed key-values and bucket
 //! subtree levels — plus two ways to obtain it cheaply:
@@ -10,12 +10,13 @@
 //!   `SaltWitness` bytes**: the proof material is parsed structurally (so the stream stays in sync)
 //!   but read as raw bytes and discarded — no curve point is ever constructed or validated.
 //!
-//! ## Performance (real mainnet witness, ~6.3 MiB, 65k commitments, 14 cores)
+//! ## Performance (real mainnet witness, ~6.3 MiB, 65k commitments, 14-core M4 Pro)
 //!
-//! - Full `SaltWitness` decode: ~110 ms wall even with salt's parallelized point validation (salt
-//!   #137) — and still ~1 core·s of CPU, since one `Element::from_bytes` (modular sqrt + subgroup
+//! - Full `SaltWitness` decode: ~112 ms wall even with salt's parallelized point validation (salt
+//!   #137) — and ~1.4 core·s of CPU, since one `Element::from_bytes` (modular sqrt + subgroup
 //!   check) runs per parent commitment.
-//! - [`LightWitnessFromSalt`] decode from the same bytes: ~1.4 ms, single-threaded.
+//! - [`LightWitnessFromSalt`] decode from the same bytes: ~3.7 ms, single-threaded — ~30x less wall
+//!   time and ~300x less CPU.
 //!
 //! ## Safety model
 //!
@@ -40,9 +41,9 @@ type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
 /// Light witness that only contains data needed for execution.
 ///
 /// The derived `Serialize`/`Deserialize` round-trip this two-field struct in
-/// its own compact layout (used for local storage, e.g. the trace server DB
-/// and the coverage-replayer spool). To decode from full `SaltWitness` bytes
-/// instead, use [`LightWitnessFromSalt`].
+/// its own compact layout (used for local storage, e.g. the trace server DB).
+/// To decode from full `SaltWitness` bytes instead, use
+/// [`LightWitnessFromSalt`].
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LightWitness {
     /// All witnessed key-value pairs (same as SaltWitness.kvs)
@@ -185,8 +186,8 @@ impl StateReader for LightWitness {
             // A well-formed witness never maps a metadata key to a deletion,
             // but witness bytes are network input (and the light decode
             // validates nothing) — this must be an error, not a panic: a
-            // panic here takes down the whole consumer (RPC handler task,
-            // coverage worker process) on one corrupt response.
+            // panic here takes down the whole consumer (e.g. an RPC handler
+            // task) on one corrupt response.
             Some(None) => {
                 Err(LightWitnessError { message: "Corrupt witness: metadata key maps to None" })
             }
@@ -318,8 +319,8 @@ mod tests {
     /// A corrupt witness that maps a bucket's metadata key to `None` must
     /// surface as a `StateReader` error, not a panic: witness bytes are
     /// unvalidated network input on the light path, and a panic here kills
-    /// the whole consumer (RPC handler, coverage worker) instead of failing
-    /// one request.
+    /// the whole consumer (e.g. an RPC handler) instead of failing one
+    /// request.
     #[test]
     fn metadata_key_mapped_to_none_is_an_error_not_a_panic() {
         // First valid data-bucket id (bucket_metadata_key asserts the range).

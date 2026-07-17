@@ -73,11 +73,6 @@ impl WitnessSizeBreakdown {
     }
 }
 
-/// Convenience wrapper that returns just the total estimated size.
-pub fn estimate_witness_size(salt: &SaltWitness, mpt: &MptWitness) -> usize {
-    WitnessSizeBreakdown::new(salt, mpt).total()
-}
-
 #[cfg(test)]
 mod tests {
     use stateless_test_utils::fixtures::TestFixtures;

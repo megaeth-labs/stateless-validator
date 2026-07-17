@@ -209,7 +209,7 @@ pub fn iter_code_hashes(
 }
 
 /// [`iter_code_hashes`], deduplicated and sorted for stable ordering — the
-/// form every witness fetcher wants (trace server, coverage replayer).
+/// form witness fetchers want (e.g. the trace server).
 pub fn collect_code_hashes(kvs: &BTreeMap<SaltKey, Option<SaltValue>>) -> Vec<B256> {
     let mut hashes: Vec<B256> = iter_code_hashes(kvs).collect();
     hashes.sort_unstable();
