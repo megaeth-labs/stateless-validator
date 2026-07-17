@@ -13,9 +13,9 @@
 //! ## Performance
 //!
 //! The full `SaltWitness` decode runs one `Element::from_bytes` (modular sqrt + subgroup check)
-//! per parent commitment — CPU work that dominates large-witness decoding even with salt's
-//! parallelized point validation (salt #137). The light decode skips all of it and is orders of
-//! magnitude cheaper, single-threaded; measured numbers live in PR #154.
+//! per parent commitment; on large witnesses that elliptic-curve work dominates the decode even
+//! though salt parallelizes it across cores. The light decode skips all of it and is orders of
+//! magnitude cheaper, single-threaded.
 //!
 //! ## Safety model
 //!
