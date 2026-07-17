@@ -8,6 +8,8 @@
 //!
 //! - [`validate_block`]: Main validation entry point that orchestrates witness verification,
 //!   transaction replay, and state root comparison
+//! - [`validate_block_updates`]: Variant returning the replay-derived SALT state updates for
+//!   embedders that compare against an independently verified per-block changeset
 //! - [`create_evm_env`]: Creates EVM execution environment from block header and chain
 //!   specification
 //! - [`replay_block`]: Replays block transactions to compute state changes
@@ -173,7 +175,11 @@ pub struct ValidationStats {
     pub witness_verification_time: f64,
     /// Time spent replaying block transactions (seconds; `0.0` in `no_std` builds)
     pub block_replay_time: f64,
-    /// Time spent updating SALT state (seconds; `0.0` in `no_std` builds)
+    /// Time spent updating SALT state (seconds; `0.0` in `no_std` builds).
+    ///
+    /// In [`validate_block`] this covers deriving the state updates **and** the SALT trie root
+    /// update; in [`validate_block_updates`] it covers only the state-update derivation (no trie
+    /// math happens there).
     pub salt_update_time: f64,
 }
 
@@ -440,6 +446,92 @@ where
     Ok((receipts_root, logs_bloom, gas_used))
 }
 
+/// Extracts the withdrawal-contract storage updates (only changed slots) from the replayed
+/// accounts, keyed by the hashed slot as [`MptWitness::verify`] expects.
+fn withdrawal_storage(accounts: &HashMap<Address, BundleAccount>) -> B256Map<U256> {
+    accounts
+        .get(&ADDRESS_L2_TO_L1_MESSAGE_PASSER)
+        .map(|a| {
+            a.storage
+                .iter()
+                .filter(|(_, v)| v.previous_or_original_value != v.present_value)
+                .map(|(&slot, v)| (keccak256(B256::from(slot)), v.present_value))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Derives the canonical SALT [`StateUpdates`] for a block from the replayed account states,
+/// by flattening Revm's `BundleAccount` format into plain key-value pairs and applying them to
+/// an ephemeral SALT state built over the witness.
+///
+/// The result is the net `{key ↦ (old, new)}` map between the block's pre- and post-states —
+/// the same map the SALT trie update consumes and the sequencer's `SaltDeltas` are derived from.
+fn derive_state_updates(
+    witness: &Witness,
+    accounts: HashMap<Address, BundleAccount>,
+) -> Result<StateUpdates, ValidationError> {
+    // Flatten Revm's BundleAccount format into plain key-value pairs
+    let mut kv_updates: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
+    for (address, bundle_account) in accounts {
+        if bundle_account.info != bundle_account.original_info {
+            // Process account changes
+            let account = bundle_account.info.map(|info| Account {
+                nonce: info.nonce,
+                balance: info.balance,
+                codehash: (info.code_hash != KECCAK_EMPTY).then_some(info.code_hash),
+            });
+
+            let account_key = PlainKey::Account(address).encode();
+            let account_value = account.and_then(|account| {
+                (!account.is_empty()).then(|| PlainValue::Account(account).encode())
+            });
+            kv_updates.insert(account_key, account_value);
+        }
+
+        // Process storage changes
+        for (slot, value) in bundle_account.storage {
+            if value.previous_or_original_value != value.present_value {
+                let storage_key =
+                    PlainKey::Storage(address, B256::new(slot.to_be_bytes())).encode();
+                let storage_value = (!value.present_value.is_zero())
+                    .then(|| PlainValue::Storage(value.present_value).encode());
+                kv_updates.insert(storage_key, storage_value);
+            }
+        }
+    }
+
+    // Update the SALT state: Apply updates first, then inserts/deletes in deterministic key
+    // order (same as Witness::create). This ordering is critical: inserts/deletes may trigger
+    // key displacement or bucket expansion, invalidating the witness's direct lookup table.
+    let mut witness_state = EphemeralSaltState::new(witness);
+    let mut state_updates = StateUpdates::default();
+    let mut inserts_or_deletes = BTreeMap::new();
+
+    for (plain_key, opt_plain_value) in kv_updates {
+        if let (Ok(Some((salt_key, old_value))), Some(new_value)) =
+            (witness_state.find(&plain_key), &opt_plain_value)
+        {
+            // Update operation: key exists and new value is not None
+            witness_state.update_value(
+                &mut state_updates,
+                salt_key,
+                Some(old_value),
+                Some(SaltValue::new(&plain_key, new_value)),
+            );
+        } else {
+            inserts_or_deletes.insert(plain_key, opt_plain_value);
+        }
+    }
+    state_updates.merge(
+        witness_state
+            .update_fin(&inserts_or_deletes)
+            .map_err(ValidationError::StateUpdateFailed)?,
+    );
+
+    Ok(state_updates)
+}
+
 /// Validates a block by creating a witness, replaying transactions, and comparing state roots.
 ///
 /// This function performs the core validation logic:
@@ -509,74 +601,10 @@ pub fn validate_block<B: BlockInput>(
     let block_replay_time = 0.0_f64; // no_std: timing unavailable
 
     // Extract and hash storage updates (only changed values)
-    let withdrawal_storage: B256Map<U256> = accounts
-        .get(&ADDRESS_L2_TO_L1_MESSAGE_PASSER)
-        .map(|a| {
-            a.storage
-                .iter()
-                .filter(|(_, v)| v.previous_or_original_value != v.present_value)
-                .map(|(&slot, v)| (keccak256(B256::from(slot)), v.present_value))
-                .collect()
-        })
-        .unwrap_or_default();
+    let withdrawal_storage = withdrawal_storage(&accounts);
 
-    // Flatten Revm's BundleAccount format into plain key-value pairs
-    let mut kv_updates: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
-    for (address, bundle_account) in accounts {
-        if bundle_account.info != bundle_account.original_info {
-            // Process account changes
-            let account = bundle_account.info.map(|info| Account {
-                nonce: info.nonce,
-                balance: info.balance,
-                codehash: (info.code_hash != KECCAK_EMPTY).then_some(info.code_hash),
-            });
-
-            let account_key = PlainKey::Account(address).encode();
-            let account_value = account.and_then(|account| {
-                (!account.is_empty()).then(|| PlainValue::Account(account).encode())
-            });
-            kv_updates.insert(account_key, account_value);
-        }
-
-        // Process storage changes
-        for (slot, value) in bundle_account.storage {
-            if value.previous_or_original_value != value.present_value {
-                let storage_key =
-                    PlainKey::Storage(address, B256::new(slot.to_be_bytes())).encode();
-                let storage_value = (!value.present_value.is_zero())
-                    .then(|| PlainValue::Storage(value.present_value).encode());
-                kv_updates.insert(storage_key, storage_value);
-            }
-        }
-    }
-
-    // Update the SALT state: Apply updates first, then inserts/deletes in deterministic key
-    // order (same as Witness::create). This ordering is critical: inserts/deletes may trigger
-    // key displacement or bucket expansion, invalidating the witness's direct lookup table.
-    let mut witness_state = EphemeralSaltState::new(&witness);
-    let mut state_updates = StateUpdates::default();
-    let mut inserts_or_deletes = BTreeMap::new();
-
-    for (plain_key, opt_plain_value) in kv_updates {
-        if let (Ok(Some((salt_key, old_value))), Some(new_value)) =
-            (witness_state.find(&plain_key), &opt_plain_value)
-        {
-            // Update operation: key exists and new value is not None
-            witness_state.update_value(
-                &mut state_updates,
-                salt_key,
-                Some(old_value),
-                Some(SaltValue::new(&plain_key, new_value)),
-            );
-        } else {
-            inserts_or_deletes.insert(plain_key, opt_plain_value);
-        }
-    }
-    state_updates.merge(
-        witness_state
-            .update_fin(&inserts_or_deletes)
-            .map_err(ValidationError::StateUpdateFailed)?,
-    );
+    // Derive the net SALT state updates from the replayed accounts
+    let state_updates = derive_state_updates(&witness, accounts)?;
 
     // Update the state root
     let (state_root, _) = StateRoot::new(&witness)
@@ -633,6 +661,143 @@ pub fn validate_block<B: BlockInput>(
         block_replay_time,
         salt_update_time,
     })
+}
+
+/// Validates a block by replaying its transactions over the witness and returning the derived
+/// SALT [`StateUpdates`] instead of computing the post state root.
+///
+/// This is the entry point for embedders that already hold an independently verified per-block
+/// changeset for the same block (e.g. a MegaETH full node, whose state sync persists the
+/// sequencer's hash-verified `SaltDeltas`): comparing the returned net update map against that
+/// changeset replaces the SALT trie/commitment recompute that [`validate_block`] performs.
+///
+/// Differences from [`validate_block`]:
+/// - Returns the replay-derived [`StateUpdates`] (the net `{key ↦ (old, new)}` map between the
+///   block's pre- and post-states); **no post state root is computed or checked** — the caller owns
+///   that comparison.
+/// - `verify_witness = false` skips the witness IPA proof verification entirely (the dominant
+///   cryptographic cost). The caller then relies on its own binding of the witness to the chain,
+///   e.g. anchoring `expected_pre_state_root` to the parent header and comparing the derived
+///   updates against a changeset that is hash-committed in the block header.
+/// - `expected_pre_state_root`, when provided, is checked against the witness's own state root
+///   before any other work, returning [`ValidationError::PreStateRootMismatch`] on divergence. This
+///   anchors the (possibly unverified) witness to the canonical parent block.
+///
+/// On success, [`ValidationStats::salt_update_time`] holds the state-update derivation time
+/// (there is no trie update here), and [`ValidationStats::witness_verification_time`] is `0.0`
+/// when `verify_witness` is `false`.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_block_updates<B: BlockInput>(
+    chain_spec: &ChainSpec,
+    block: &B,
+    salt_witness: SaltWitness,
+    mpt_witness: MptWitness,
+    contracts: &HashMap<B256, Bytecode>,
+    verify_witness: bool,
+    expected_pre_state_root: Option<B256>,
+    #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
+) -> Result<(StateUpdates, ValidationStats), ValidationError> {
+    // A block carrying only transaction hashes can't be replayed — fail fast before paying
+    // the witness proof verification. `replay_block` re-checks for direct callers.
+    if !block.is_complete() {
+        return Err(ValidationError::BlockIncomplete);
+    }
+    let header = block.consensus_header();
+
+    // Anchor the witness to the canonical chain before any other work: its internal state root
+    // must be the parent block's post state root.
+    if let Some(expected) = expected_pre_state_root {
+        let actual = B256::from(
+            salt_witness.state_root().map_err(ValidationError::WitnessVerificationFailed)?,
+        );
+        if actual != expected {
+            return Err(ValidationError::PreStateRootMismatch { expected, actual });
+        }
+    }
+
+    // Create external environment oracle from salt witness
+    let ext_env = WitnessExternalEnv::new(&salt_witness, header.number)
+        .map_err(ValidationError::EnvOracleConstructionFailed)?;
+
+    // Verify witness proof against the current state root (optional)
+    #[cfg(feature = "std")]
+    let start = Instant::now();
+    let witness = Witness::from(salt_witness);
+    if verify_witness {
+        witness.verify().map_err(ValidationError::WitnessVerificationFailed)?;
+    }
+    #[cfg(feature = "std")]
+    let witness_verification_time =
+        if verify_witness { start.elapsed().as_secs_f64() } else { 0.0 };
+    #[cfg(not(feature = "std"))]
+    let witness_verification_time = 0.0_f64; // no_std: timing unavailable
+
+    // Replay block transactions
+    #[cfg(feature = "std")]
+    let start = Instant::now();
+    let witness_db = WitnessDatabase { header, witness: &witness, contracts };
+    let (accounts, output) = replay_block(
+        chain_spec,
+        block,
+        &witness_db,
+        ext_env,
+        #[cfg(feature = "std")]
+        writer,
+    )?;
+    #[cfg(feature = "std")]
+    let block_replay_time = start.elapsed().as_secs_f64();
+    #[cfg(not(feature = "std"))]
+    let block_replay_time = 0.0_f64; // no_std: timing unavailable
+
+    // Check if computed withdrawals root matches the claimed one
+    let withdrawal_storage = withdrawal_storage(&accounts);
+    mpt_witness
+        .verify(header, withdrawal_storage)
+        .map_err(ValidationError::WithdrawalValidationFailed)?;
+
+    // Verify receipts root matches the block header
+    if output.receipts_root != header.receipts_root {
+        return Err(ValidationError::ReceiptsRootMismatch {
+            actual: output.receipts_root,
+            claimed: header.receipts_root,
+        });
+    }
+
+    // Verify logs bloom matches the block header
+    if output.logs_bloom != header.logs_bloom {
+        return Err(ValidationError::LogsBloomMismatch {
+            actual: Box::new(output.logs_bloom),
+            claimed: Box::new(header.logs_bloom),
+        });
+    }
+
+    // Verify gas used matches the block header
+    if output.gas_used != header.gas_used {
+        return Err(ValidationError::GasUsedMismatch {
+            actual: output.gas_used,
+            claimed: header.gas_used,
+        });
+    }
+
+    // Derive the net SALT state updates from the replayed accounts
+    #[cfg(feature = "std")]
+    let start = Instant::now();
+    let state_updates = derive_state_updates(&witness, accounts)?;
+    #[cfg(feature = "std")]
+    let salt_update_time = start.elapsed().as_secs_f64();
+    #[cfg(not(feature = "std"))]
+    let salt_update_time = 0.0_f64; // no_std: timing unavailable
+
+    Ok((
+        state_updates,
+        ValidationStats {
+            state_reads: output.state_reads,
+            state_writes: output.state_writes,
+            witness_verification_time,
+            block_replay_time,
+            salt_update_time,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -713,5 +878,148 @@ mod tests {
             )
             .unwrap_or_else(|e| panic!("validate_block failed for {number} ({hash}): {e:?}"));
         }
+    }
+
+    /// `validate_block_updates` must succeed on every paired mainnet fixture, and the returned
+    /// updates must reproduce the header's state root when fed through the SALT trie update —
+    /// locking its equivalence with the `validate_block` path the helpers were extracted from.
+    #[test]
+    fn validate_block_updates_mainnet_fixtures() {
+        let _logging = init_test_logging("stateless_core");
+        let fx = TestFixtures::mainnet_shared();
+        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
+        let paired = fx.paired_blocks();
+        assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
+        for (number, hash) in paired {
+            let block = &fx.blocks[&hash];
+            let (updates, stats) = validate_block_updates(
+                &chain_spec,
+                block,
+                fx.salt_witnesses[&hash].clone(),
+                fx.mpt_witness(&hash),
+                &fx.contracts,
+                true,
+                None,
+                #[cfg(feature = "std")]
+                None,
+            )
+            .unwrap_or_else(|e| {
+                panic!("validate_block_updates failed for {number} ({hash}): {e:?}")
+            });
+            assert!(stats.witness_verification_time > 0.0, "witness verification must be timed");
+
+            // Cross-check: the returned updates must yield the header's state root.
+            let witness = Witness::from(fx.salt_witnesses[&hash].clone());
+            let (state_root, _) = StateRoot::new(&witness)
+                .update_fin(&updates)
+                .unwrap_or_else(|e| panic!("trie update failed for {number} ({hash}): {e:?}"));
+            assert_eq!(
+                B256::from(state_root),
+                block.consensus_header().state_root,
+                "updates from {number} ({hash}) must reproduce the header state root"
+            );
+        }
+    }
+
+    /// With `verify_witness = false` the IPA proof check is skipped: validation still passes on
+    /// valid fixtures and the verification time reads `0.0` ("not measured").
+    #[test]
+    fn validate_block_updates_light_mode_passes() {
+        let fx = TestFixtures::mainnet_shared();
+        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
+        for (number, hash) in fx.paired_blocks() {
+            let (_, stats) = validate_block_updates(
+                &chain_spec,
+                &fx.blocks[&hash],
+                fx.salt_witnesses[&hash].clone(),
+                fx.mpt_witness(&hash),
+                &fx.contracts,
+                false,
+                None,
+                #[cfg(feature = "std")]
+                None,
+            )
+            .unwrap_or_else(|e| panic!("light validation failed for {number} ({hash}): {e:?}"));
+            assert_eq!(stats.witness_verification_time, 0.0, "skipped verify must not be timed");
+        }
+    }
+
+    /// The pre-state anchor must accept the parent header's state root and reject any other
+    /// value with `PreStateRootMismatch` (checked before any replay work).
+    #[test]
+    fn validate_block_updates_anchors_pre_state_root() {
+        let fx = TestFixtures::mainnet_shared();
+        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
+
+        // Use paired blocks whose parent block is also in the fixture set, so the anchor is the
+        // real parent header root — exactly what an embedder passes in.
+        let mut anchored = 0;
+        for (number, hash) in fx.paired_blocks() {
+            let block = &fx.blocks[&hash];
+            let parent_hash = block.consensus_header().parent_hash;
+            let Some(parent) = fx.blocks.get(&parent_hash) else { continue };
+            anchored += 1;
+
+            let parent_root = parent.header.inner.state_root;
+            validate_block_updates(
+                &chain_spec,
+                block,
+                fx.salt_witnesses[&hash].clone(),
+                fx.mpt_witness(&hash),
+                &fx.contracts,
+                false,
+                Some(parent_root),
+                #[cfg(feature = "std")]
+                None,
+            )
+            .unwrap_or_else(|e| panic!("anchored validation failed for {number} ({hash}): {e:?}"));
+
+            let bogus = B256::repeat_byte(0xAB);
+            let err = validate_block_updates(
+                &chain_spec,
+                block,
+                fx.salt_witnesses[&hash].clone(),
+                fx.mpt_witness(&hash),
+                &fx.contracts,
+                false,
+                Some(bogus),
+                #[cfg(feature = "std")]
+                None,
+            )
+            .unwrap_err();
+            match err {
+                ValidationError::PreStateRootMismatch { expected, actual } => {
+                    assert_eq!(expected, bogus);
+                    assert_eq!(actual, parent_root);
+                }
+                other => panic!("expected PreStateRootMismatch, got {other:?}"),
+            }
+        }
+        assert!(anchored > 0, "no fixture block has its parent in the set — anchor untested");
+    }
+
+    /// A block carrying only transaction hashes must be rejected as `BlockIncomplete` before
+    /// the pre-state anchor or any witness work.
+    #[test]
+    fn validate_block_updates_rejects_hashes_only_block() {
+        let fx = TestFixtures::mainnet_shared();
+        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
+        let (_, hash) = *fx.paired_blocks().first().expect("paired mainnet fixtures");
+        let mut block = fx.blocks[&hash].clone();
+        block.transactions = BlockTransactions::Hashes(Default::default());
+
+        let err = validate_block_updates(
+            &chain_spec,
+            &block,
+            fx.salt_witnesses[&hash].clone(),
+            fx.mpt_witness(&hash),
+            &fx.contracts,
+            true,
+            None,
+            #[cfg(feature = "std")]
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ValidationError::BlockIncomplete), "{err:?}");
     }
 }

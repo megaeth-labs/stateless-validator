@@ -33,7 +33,10 @@ pub use db::{
 pub mod data_types;
 pub use data_types::{PlainKey, PlainValue, iter_code_hashes};
 pub mod executor;
-pub use executor::{BlockInput, ValidationError, ValidationStats, replay_block, validate_block};
+pub use executor::{
+    BlockInput, ValidationError, ValidationStats, replay_block, validate_block,
+    validate_block_updates,
+};
 #[cfg(feature = "std")]
 pub mod pipeline;
 #[cfg(feature = "std")]
