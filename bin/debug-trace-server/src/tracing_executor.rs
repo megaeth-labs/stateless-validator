@@ -56,7 +56,6 @@ use revm_inspectors::tracing::{
 };
 use stateless_core::{
     chain_spec::ChainSpec,
-    data_types::iter_code_hashes,
     evm_database::{WitnessDatabase, WitnessExternalEnv},
     executor::{ValidationError, create_evm_env},
     light_witness::{LightWitness, LightWitnessExecutor},
@@ -65,10 +64,7 @@ use tracing::{instrument, trace, warn};
 
 /// Returns distinct contract code hashes referenced by the witness, sorted for stable ordering.
 pub fn extract_code_hashes(witness: &LightWitness) -> Vec<B256> {
-    let mut code_hashes: Vec<B256> = iter_code_hashes(&witness.kvs).collect();
-    code_hashes.sort();
-    code_hashes.dedup();
-    code_hashes
+    stateless_core::collect_code_hashes(&witness.kvs)
 }
 
 // TracerKind - Unified enum for TracingInspector-based tracers

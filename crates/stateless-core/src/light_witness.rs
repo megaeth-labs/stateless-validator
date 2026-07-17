@@ -1,34 +1,49 @@
 //! Light witness deserialization for tracing/execution.
 //!
-//! This module provides a fast witness type that skips expensive cryptographic
-//! point validation during deserialization. The standard `SaltWitness` type
-//! deserializes `SerdeCommitment` which calls `Element::from_bytes()` for
-//! elliptic curve point validation - this is slow (~240ms for large witnesses).
+//! Execution-only consumers (debug-trace-server, replay/coverage tooling) read
+//! state from a witness but never verify its cryptographic proof. This module
+//! provides [`LightWitness`] — just the witnessed key-values and bucket
+//! subtree levels — plus two ways to obtain it cheaply:
 //!
-//! For debug-trace-server, we only need the state data (`kvs`) and bucket levels
-//! (`proof.levels`) for execution. We don't need the cryptographic proofs since
-//! we trust our own database.
+//! - [`LightWitness::from`] an already-decoded `SaltWitness` (copies only the light parts), and
+//! - [`LightWitnessFromSalt`], a serde adapter that decodes the light parts **directly from full
+//!   `SaltWitness` bytes**: the proof material is parsed structurally (so the stream stays in sync)
+//!   but read as raw bytes and discarded — no curve point is ever constructed or validated.
 //!
-//! ## Performance
+//! ## Performance (real mainnet witness, ~6.3 MiB, 65k commitments, 14 cores)
 //!
-//! - Standard `SaltWitness` deserialization: ~240ms (due to EC point validation)
-//! - `LightWitness` deserialization: ~10-20ms (skips EC point validation)
+//! - Full `SaltWitness` decode: ~110 ms wall even with salt's parallelized point validation (salt
+//!   #137) — and still ~1 core·s of CPU, since one `Element::from_bytes` (modular sqrt + subgroup
+//!   check) runs per parent commitment.
+//! - [`LightWitnessFromSalt`] decode from the same bytes: ~1.4 ms, single-threaded.
+//!
+//! ## Safety model
+//!
+//! The zero-validation path performs no cryptographic checks: corrupt or
+//! malicious proof bytes decode successfully. Only use it where witness
+//! integrity is guaranteed elsewhere (trusted local storage, or a stream a
+//! validator has already verified). Never use it on the proof-verification
+//! path.
 
-use core::ops::RangeInclusive;
+use core::{fmt, ops::RangeInclusive};
 use std::{collections::BTreeMap, vec::Vec};
 
 use hashbrown::HashMap;
 use rustc_hash::FxBuildHasher;
-use salt::{BucketId, BucketMeta, SaltKey, SaltValue, bucket_metadata_key, traits::StateReader};
-use serde::{Deserialize, Serialize};
+use salt::{
+    BucketId, BucketMeta, NodeId, SaltKey, SaltValue, bucket_metadata_key, traits::StateReader,
+};
+use serde::{Deserialize, Deserializer, Serialize};
 
 type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
 
 /// Light witness that only contains data needed for execution.
 ///
-/// This struct mirrors `SaltWitness` but stores proof data as raw bytes
-/// instead of deserializing the expensive `SerdeCommitment` types.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// The derived `Serialize`/`Deserialize` round-trip this two-field struct in
+/// its own compact layout (used for local storage, e.g. the trace server DB
+/// and the coverage-replayer spool). To decode from full `SaltWitness` bytes
+/// instead, use [`LightWitnessFromSalt`].
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct LightWitness {
     /// All witnessed key-value pairs (same as SaltWitness.kvs)
     pub kvs: BTreeMap<SaltKey, Option<SaltValue>>,
@@ -49,6 +64,91 @@ pub struct LightWitness {
 impl From<&salt::SaltWitness> for LightWitness {
     fn from(witness: &salt::SaltWitness) -> Self {
         Self { kvs: witness.kvs.clone(), levels: witness.proof.levels.clone() }
+    }
+}
+
+/// Newtype adapter whose `Deserialize` impl consumes a full `SaltWitness`
+/// stream and keeps only the light parts, skipping all elliptic-curve work
+/// (see the module docs for the safety model).
+///
+/// Use it positionally wherever full witness bytes are decoded, e.g.
+/// `bincode::serde::decode_from_slice::<(LightWitnessFromSalt, MptWitness), _>(..)`
+/// against bytes produced from `(SaltWitness, MptWitness)`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LightWitnessFromSalt(pub LightWitness);
+
+impl<'de> Deserialize<'de> for LightWitnessFromSalt {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        from_salt_witness::deserialize(deserializer).map(Self)
+    }
+}
+
+/// Decoding of a [`LightWitness`] from a full-`SaltWitness` serde stream —
+/// the implementation behind [`LightWitnessFromSalt`] (the only public
+/// surface; make this module public if a `#[serde(deserialize_with = ...)]`
+/// consumer ever appears).
+///
+/// The mirror types below must stay field-for-field congruent with
+/// `salt::SaltWitness` / `salt::SaltProof` (same field names, order, and wire
+/// shapes); the fixture tests in this module lock that in against real
+/// mainnet witnesses.
+mod from_salt_witness {
+    use serde::de::{MapAccess, Visitor};
+
+    use super::*;
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<LightWitness, D::Error> {
+        let mirror = WitnessMirror::deserialize(d)?;
+        Ok(LightWitness { kvs: mirror.kvs, levels: mirror.proof.levels })
+    }
+
+    /// Serde-layout mirror of `salt::SaltWitness`.
+    #[derive(Deserialize)]
+    struct WitnessMirror {
+        kvs: BTreeMap<SaltKey, Option<SaltValue>>,
+        proof: ProofMirror,
+    }
+
+    /// Serde-layout mirror of `salt::SaltProof`. Proof material is consumed as
+    /// raw bytes and dropped; only `levels` is materialized.
+    #[derive(Deserialize)]
+    struct ProofMirror {
+        #[serde(deserialize_with = "discard_parents_commitments")]
+        #[allow(dead_code)]
+        parents_commitments: (),
+        #[serde(deserialize_with = "discard_ipa_proof_bytes")]
+        #[allow(dead_code)]
+        proof: (),
+        #[serde(with = "salt::fx_hashmap_serde")]
+        levels: FxHashMap<BucketId, u8>,
+    }
+
+    /// Consumes the `NodeId -> [u8; 32]` commitments map without building
+    /// anything: no `BTreeMap`, no `Element::from_bytes`, no subgroup checks.
+    fn discard_parents_commitments<'de, D: Deserializer<'de>>(d: D) -> Result<(), D::Error> {
+        struct DiscardMap;
+
+        impl<'de> Visitor<'de> for DiscardMap {
+            type Value = ();
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a map of NodeId to 32-byte compressed commitments")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<(), A::Error> {
+                while access.next_entry::<NodeId, [u8; 32]>()?.is_some() {}
+                Ok(())
+            }
+        }
+
+        d.deserialize_map(DiscardMap)
+    }
+
+    /// Consumes the IPA proof exactly as it was written (`SerdeMultiPointProof`
+    /// serializes its `to_bytes()` output as a `Vec<u8>`) without calling
+    /// `MultiPointProof::from_bytes`.
+    fn discard_ipa_proof_bytes<'de, D: Deserializer<'de>>(d: D) -> Result<(), D::Error> {
+        Vec::<u8>::deserialize(d).map(drop)
     }
 }
 
@@ -82,7 +182,14 @@ impl StateReader for LightWitness {
         match self.kvs.get(&metadata_key) {
             Some(Some(salt_value)) => BucketMeta::try_from(salt_value.clone())
                 .map_err(|_| LightWitnessError { message: "Failed to decode metadata" }),
-            Some(None) => unreachable!("Metadata should never be stored as None in witness"),
+            // A well-formed witness never maps a metadata key to a deletion,
+            // but witness bytes are network input (and the light decode
+            // validates nothing) — this must be an error, not a panic: a
+            // panic here takes down the whole consumer (RPC handler task,
+            // coverage worker process) on one corrupt response.
+            Some(None) => {
+                Err(LightWitnessError { message: "Corrupt witness: metadata key maps to None" })
+            }
             None => Err(LightWitnessError { message: "Metadata not in witness" }),
         }
     }
@@ -195,6 +302,10 @@ impl LightWitnessExecutor {
 
 #[cfg(test)]
 mod tests {
+    // `std` is the `alloc` alias in no_std builds, where the prelude carries
+    // no `vec!` — import it explicitly (same as chain_spec.rs).
+    use std::vec;
+
     use super::*;
 
     #[test]
@@ -202,6 +313,23 @@ mod tests {
         let fast = LightWitness { kvs: BTreeMap::new(), levels: FxHashMap::default() };
         assert!(fast.kvs.is_empty());
         assert!(fast.levels.is_empty());
+    }
+
+    /// A corrupt witness that maps a bucket's metadata key to `None` must
+    /// surface as a `StateReader` error, not a panic: witness bytes are
+    /// unvalidated network input on the light path, and a panic here kills
+    /// the whole consumer (RPC handler, coverage worker) instead of failing
+    /// one request.
+    #[test]
+    fn metadata_key_mapped_to_none_is_an_error_not_a_panic() {
+        // First valid data-bucket id (bucket_metadata_key asserts the range).
+        let bucket: BucketId = 65536;
+        let mut kvs: BTreeMap<SaltKey, Option<SaltValue>> = BTreeMap::new();
+        kvs.insert(bucket_metadata_key(bucket), None);
+        let witness = LightWitness { kvs, levels: FxHashMap::default() };
+
+        let err = witness.metadata(bucket).expect_err("must not panic");
+        assert!(err.message.contains("Corrupt witness"), "got: {err}");
     }
 
     /// Round-trip a populated `LightWitness` through bincode to confirm the
@@ -225,5 +353,82 @@ mod tests {
         for (k, v) in &original.levels {
             assert_eq!(decoded.levels.get(k), Some(v));
         }
+    }
+
+    /// Every real mainnet fixture witness light-decodes from the exact bytes
+    /// of its full encoding (wire config, bincode legacy), consuming the
+    /// stream to the last byte. This is the layout-congruence lock for the
+    /// mirror types in [`from_salt_witness`].
+    #[test]
+    fn light_decodes_from_full_witness_bytes() {
+        let fixtures = stateless_test_utils::fixtures::TestFixtures::mainnet_shared();
+        assert!(!fixtures.salt_witnesses.is_empty(), "no fixture witnesses");
+
+        for (hash, witness) in &fixtures.salt_witnesses {
+            let bytes = bincode::serde::encode_to_vec(witness, bincode::config::legacy()).unwrap();
+            let (light, consumed): (LightWitnessFromSalt, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::legacy())
+                    .unwrap_or_else(|e| panic!("light decode {hash}: {e}"));
+
+            assert_eq!(consumed, bytes.len(), "{hash} light decode left trailing bytes");
+            assert_eq!(light.0, LightWitness::from(witness), "{hash} light parts mismatch");
+            assert!(!light.0.kvs.is_empty(), "{hash} decoded no kvs");
+        }
+    }
+
+    /// The layout mirror is bincode-config-agnostic (varint vs fixint).
+    #[test]
+    fn light_decode_is_config_agnostic() {
+        let fixtures = stateless_test_utils::fixtures::TestFixtures::mainnet_shared();
+        let witness = fixtures.salt_witnesses.values().next().unwrap();
+
+        let bytes = bincode::serde::encode_to_vec(witness, bincode::config::standard()).unwrap();
+        let (light, _): (LightWitnessFromSalt, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+
+        assert_eq!(light.0, LightWitness::from(witness));
+    }
+
+    /// The point of the light path: proof bytes are NOT validated. A stream
+    /// whose commitments are not valid curve points fails the full decode but
+    /// light-decodes fine.
+    #[test]
+    fn light_decode_skips_ec_validation() {
+        #[derive(Serialize)]
+        struct RawWitness {
+            kvs: BTreeMap<SaltKey, Option<SaltValue>>,
+            proof: RawProof,
+        }
+        #[derive(Serialize)]
+        struct RawProof {
+            parents_commitments: BTreeMap<NodeId, [u8; 32]>,
+            proof: Vec<u8>,
+            #[serde(with = "salt::fx_hashmap_serde")]
+            levels: FxHashMap<BucketId, u8>,
+        }
+
+        let fixtures = stateless_test_utils::fixtures::TestFixtures::mainnet_shared();
+        let real = fixtures.salt_witnesses.values().next().unwrap();
+        let raw = RawWitness {
+            kvs: real.kvs.clone(),
+            proof: RawProof {
+                // 0xFF..FF is not a valid compressed banderwagon point.
+                parents_commitments: [(7u64, [0xFF; 32]), (9u64, [0xFF; 32])].into(),
+                proof: vec![0xAB; 64],
+                levels: real.proof.levels.clone(),
+            },
+        };
+        let bytes = bincode::serde::encode_to_vec(&raw, bincode::config::legacy()).unwrap();
+
+        // Full decode rejects the garbage point...
+        let full: Result<(salt::SaltWitness, usize), _> =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::legacy());
+        assert!(full.is_err(), "full decode must validate curve points");
+
+        // ...the light decode never looks at it.
+        let (light, _): (LightWitnessFromSalt, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).unwrap();
+        assert_eq!(light.0.kvs, real.kvs);
+        assert_eq!(light.0.levels, real.proof.levels);
     }
 }

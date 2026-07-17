@@ -23,7 +23,7 @@ extern crate alloc as std;
 
 pub mod chain_spec;
 pub mod light_witness;
-pub use light_witness::{LightWitness, LightWitnessExecutor};
+pub use light_witness::{LightWitness, LightWitnessExecutor, LightWitnessFromSalt};
 pub mod evm_database;
 pub use evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv};
 pub mod db;
@@ -31,7 +31,7 @@ pub use db::{
     BlockMeta, ChainStore, ContractStore, MissingDataKind, StoreError, StoreResult, StoreResultExt,
 };
 pub mod data_types;
-pub use data_types::{PlainKey, PlainValue, iter_code_hashes};
+pub use data_types::{PlainKey, PlainValue, collect_code_hashes, iter_code_hashes};
 pub mod executor;
 pub use executor::{BlockInput, ValidationError, ValidationStats, replay_block, validate_block};
 #[cfg(feature = "std")]
