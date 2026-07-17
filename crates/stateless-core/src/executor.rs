@@ -1027,7 +1027,12 @@ mod tests {
             .unwrap_or_else(|e| {
                 panic!("validate_block_updates failed for {number} ({hash}): {e:?}")
             });
-            assert!(stats.witness_verification_time > 0.0, "witness verification must be timed");
+            // `no_std` builds have no monotonic clock — every timing reads 0.0 ("not measured"),
+            // so the timed-verification expectation only holds with `std` enabled.
+            assert!(
+                stats.witness_verification_time > 0.0 || cfg!(not(feature = "std")),
+                "witness verification must be timed in std builds"
+            );
 
             // Cross-check: the returned updates must yield the header's state root.
             let witness = Witness::from(fx.salt_witnesses[&hash].clone());
