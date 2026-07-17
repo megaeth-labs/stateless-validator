@@ -42,14 +42,12 @@ pub struct WitnessSizeBreakdown {
 impl WitnessSizeBreakdown {
     /// Computes the breakdown for the given witness pair.
     pub fn new(salt: &SaltWitness, mpt: &MptWitness) -> Self {
-        let kvs_count = salt.kvs.len();
-        let salt_kvs_size = kvs_count * SALT_KV_BYTES;
-        let proof_size = salt.proof.parents_commitments.len() * SALT_COMMITMENT_BYTES +
-            SALT_IPA_PROOF_BYTES +
-            salt.proof.levels.len() * SALT_LEVEL_BYTES;
-        let salt_size = salt_kvs_size + proof_size;
-        let mpt_size = MPT_STORAGE_ROOT_BYTES + mpt.state.iter().map(|b| b.len()).sum::<usize>();
-        Self { salt_size, kvs_count, salt_kvs_size, mpt_size }
+        Self::from_counts(
+            salt.kvs.len(),
+            salt.proof.parents_commitments.len(),
+            salt.proof.levels.len(),
+            mpt,
+        )
     }
 
     /// Computes the breakdown for a light-decoded witness.
@@ -59,9 +57,14 @@ impl WitnessSizeBreakdown {
     /// (KVs + levels + the fixed IPA overhead). Use only for observability on
     /// light-decode paths; full-decode paths should keep [`Self::new`].
     pub fn new_light(light: &LightWitness, mpt: &MptWitness) -> Self {
-        let kvs_count = light.kvs.len();
+        Self::from_counts(light.kvs.len(), 0, light.levels.len(), mpt)
+    }
+
+    /// Shared assembly from entry counts plus the MPT byte sum.
+    fn from_counts(kvs_count: usize, commitments: usize, levels: usize, mpt: &MptWitness) -> Self {
         let salt_kvs_size = kvs_count * SALT_KV_BYTES;
-        let proof_size = SALT_IPA_PROOF_BYTES + light.levels.len() * SALT_LEVEL_BYTES;
+        let proof_size =
+            commitments * SALT_COMMITMENT_BYTES + SALT_IPA_PROOF_BYTES + levels * SALT_LEVEL_BYTES;
         let salt_size = salt_kvs_size + proof_size;
         let mpt_size = MPT_STORAGE_ROOT_BYTES + mpt.state.iter().map(|b| b.len()).sum::<usize>();
         Self { salt_size, kvs_count, salt_kvs_size, mpt_size }

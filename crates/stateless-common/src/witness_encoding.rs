@@ -68,9 +68,7 @@ pub fn encode_witness_payload(
 pub fn decode_witness_payload(
     compressed: &[u8],
 ) -> Result<(SaltWitness, MptWitness), WitnessDecodingError> {
-    let decompressed = zstd::decode_all(compressed)?;
-    let (witness, _) = bincode::serde::decode_from_slice(&decompressed, bincode::config::legacy())?;
-    Ok(witness)
+    decode_payload_as(compressed)
 }
 
 /// Zero-validation counterpart of [`decode_witness_payload`]: decodes only the
@@ -81,10 +79,18 @@ pub fn decode_witness_payload(
 pub fn decode_witness_payload_light(
     compressed: &[u8],
 ) -> Result<(LightWitness, MptWitness), WitnessDecodingError> {
-    let decompressed = zstd::decode_all(compressed)?;
-    let ((light, mpt), _): ((LightWitnessFromSalt, MptWitness), usize) =
-        bincode::serde::decode_from_slice(&decompressed, bincode::config::legacy())?;
+    let (light, mpt): (LightWitnessFromSalt, MptWitness) = decode_payload_as(compressed)?;
     Ok((light.0, mpt))
+}
+
+/// Shared payload decode: zstd, then bincode-legacy into the caller-chosen target — the one
+/// place that fixes the wire config for both the full and the light payload decode.
+fn decode_payload_as<T: serde::de::DeserializeOwned>(
+    compressed: &[u8],
+) -> Result<T, WitnessDecodingError> {
+    let decompressed = zstd::decode_all(compressed)?;
+    let (value, _) = bincode::serde::decode_from_slice(&decompressed, bincode::config::legacy())?;
+    Ok(value)
 }
 
 /// Encodes the witness tuple as a versioned RPC response string.
@@ -100,11 +106,7 @@ pub fn encode_witness_response(
 pub fn decode_witness_response(
     response: &str,
 ) -> Result<(SaltWitness, MptWitness), WitnessDecodingError> {
-    let payload = response
-        .strip_prefix(WITNESS_RESPONSE_VERSION_PREFIX)
-        .ok_or(WitnessDecodingError::MissingPrefix)?;
-    let compressed = BASE64.decode(payload)?;
-    decode_witness_payload(&compressed)
+    decode_response_with(response, decode_witness_payload)
 }
 
 /// Zero-validation counterpart of [`decode_witness_response`]: decodes only
@@ -112,11 +114,21 @@ pub fn decode_witness_response(
 pub fn decode_witness_response_light(
     response: &str,
 ) -> Result<(LightWitness, MptWitness), WitnessDecodingError> {
+    decode_response_with(response, decode_witness_payload_light)
+}
+
+/// Shared response prologue: strip the version prefix and base64-decode, then hand the
+/// compressed payload to the caller-chosen decoder — the one place that fixes the response
+/// framing for both the full and the light decode.
+fn decode_response_with<T>(
+    response: &str,
+    decode_payload: fn(&[u8]) -> Result<T, WitnessDecodingError>,
+) -> Result<T, WitnessDecodingError> {
     let payload = response
         .strip_prefix(WITNESS_RESPONSE_VERSION_PREFIX)
         .ok_or(WitnessDecodingError::MissingPrefix)?;
     let compressed = BASE64.decode(payload)?;
-    decode_witness_payload_light(&compressed)
+    decode_payload(&compressed)
 }
 
 #[cfg(test)]
