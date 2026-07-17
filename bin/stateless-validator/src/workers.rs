@@ -1,6 +1,12 @@
 //! Pipeline + signal handling + optional validation reporter.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use alloy_primitives::B256;
 use eyre::Result;
@@ -28,7 +34,10 @@ const FINAL_REPORT_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// Starts the validator pipeline, optional reporter, and signal handlers.
 ///
 /// Cleanly drains on SIGINT/SIGTERM and returns either the pipeline result or `Ok(())`
-/// on signal.
+/// on signal. Exception: on a fixed-range run (`--end-block`), a final validation report
+/// that cannot land (or a detected validation gap) fails the run — a slice has no later
+/// restart to re-report, so exiting 0 would let an orchestrator record the slice as
+/// complete while upstream never saw the tip.
 pub async fn run_with_signals(
     client: Arc<RpcClient>,
     r2_witness: Option<Arc<R2WitnessClient>>,
@@ -40,6 +49,7 @@ pub async fn run_with_signals(
 ) -> Result<()> {
     let report_validation = report_validation_endpoint.is_some();
     let config = Arc::new(pipeline_config);
+    let is_slice_run = config.sync_target.is_some();
     info!(
         concurrent_workers = config.concurrent_workers,
         poll_interval = ?config.poll_interval,
@@ -61,12 +71,17 @@ pub async fn run_with_signals(
         Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client.clone() });
     let hooks = Arc::new(ValidatorHooks);
 
+    // Last tip accepted upstream, shared between the periodic reporter and the final flush so
+    // the flush only covers the still-unreported tail instead of re-sending anchor→tip.
+    let last_reported = Arc::new(AtomicU64::new(0));
+
     let reporter = if report_validation {
         Some(task::spawn(validation_reporter(
             Arc::clone(&client),
             Arc::clone(&validator_db),
             Duration::from_secs(1),
             shutdown.clone(),
+            Arc::clone(&last_reported),
         )))
     } else {
         info!("Validation reporter disabled");
@@ -88,7 +103,7 @@ pub async fn run_with_signals(
     ));
 
     // Signal wins → drain; pipeline wins → already done.
-    let (result, needs_drain): (Result<()>, bool) = tokio::select! {
+    let (mut result, needs_drain): (Result<()>, bool) = tokio::select! {
         res = &mut pipeline_handle => {
             let r = res.unwrap_or_else(|e| Err(eyre::eyre!("Pipeline task panicked: {e}")));
             (r, false)
@@ -119,31 +134,47 @@ pub async fn run_with_signals(
 
     // Final report of the validated tail, sent after the pipeline (and any drain) has stopped
     // and the periodic reporter was joined. The reporter exits the moment the pipeline does, so
-    // blocks validated since its last tick would otherwise go unreported — and an `--end-block`
-    // slice run has no later restart to re-report them, hence the bounded retries (the periodic
-    // loop's next tick is its retry). Re-reporting an already-reported tip is harmless (every
-    // fresh start does it), and a reporter wedged past the 3s join above cannot regress
-    // upstream: reports apply through a forward-only cursor.
+    // blocks validated since its last accepted report would otherwise go unreported — and an
+    // `--end-block` slice run has no later restart to re-report them, hence the bounded retries
+    // (the periodic loop's next tick is its retry). The shared `last_reported` makes this a
+    // no-op when the reporter already landed the tip; a reporter wedged past the 3s join above
+    // cannot regress upstream either way: reports apply through a forward-only cursor.
     if report_validation {
-        let mut last_reported = 0u64;
+        let mut flush_failure: Option<eyre::Report> = None;
         for attempt in 1..=FINAL_REPORT_ATTEMPTS {
-            match report_range_once(&client, &validator_db, &mut last_reported).await {
+            match report_range_once(&client, &validator_db, &last_reported).await {
                 Ok(true) => break,
                 Ok(false) if attempt < FINAL_REPORT_ATTEMPTS => {
                     warn!(attempt, "Final validation report failed, retrying");
                     tokio::time::sleep(FINAL_REPORT_RETRY_DELAY).await;
                 }
-                Ok(false) => error!(
-                    attempts = FINAL_REPORT_ATTEMPTS,
-                    "Final validation report failed; the validated tail may be unreported \
-                     upstream"
-                ),
+                Ok(false) => {
+                    error!(
+                        attempts = FINAL_REPORT_ATTEMPTS,
+                        "Final validation report failed; the validated tail may be unreported \
+                         upstream"
+                    );
+                    flush_failure = Some(eyre::eyre!(
+                        "final validation report failed after {FINAL_REPORT_ATTEMPTS} attempts; \
+                         the validated tail may be unreported upstream"
+                    ));
+                }
                 // A detected validation gap is deterministic — retrying cannot resolve it.
                 Err(e) => {
-                    warn!(error = %e, "Final validation report failed");
+                    error!(error = %e, "Final validation report failed with a non-retryable error");
+                    flush_failure = Some(e);
                     break;
                 }
             }
+        }
+        // A chain-following run re-reports anchor→tip on its next start, so an unreported tail
+        // heals itself. An `--end-block` slice run has no later restart: fail the run so the
+        // orchestrator cannot record the slice as complete. A pipeline error, if any, takes
+        // precedence (the flush failure was already logged above).
+        if let Some(e) = flush_failure &&
+            is_slice_run
+        {
+            result = result.and(Err(e));
         }
     }
 
@@ -168,15 +199,16 @@ pub async fn run_with_signals(
 ///
 /// Periodically reads the canonical tip from ValidatorDB and reports the
 /// validated range to the upstream node. Exits as soon as `shutdown` fires;
-/// `run_with_signals` flushes the final tail afterwards.
+/// `run_with_signals` flushes the final tail afterwards, seeded by the shared
+/// `last_reported_block` so the flush skips what already landed here.
 async fn validation_reporter(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
     report_interval: Duration,
     shutdown: CancellationToken,
+    last_reported_block: Arc<AtomicU64>,
 ) -> Result<()> {
     info!("Starting validation reporter");
-    let mut last_reported_block = 0u64;
 
     loop {
         tokio::select! {
@@ -187,7 +219,7 @@ async fn validation_reporter(
             }
         }
 
-        report_range_once(&client, &validator_db, &mut last_reported_block).await?;
+        report_range_once(&client, &validator_db, &last_reported_block).await?;
     }
 }
 
@@ -201,7 +233,7 @@ async fn validation_reporter(
 async fn report_range_once(
     client: &RpcClient,
     validator_db: &ValidatorDB,
-    last_reported_block: &mut u64,
+    last_reported_block: &AtomicU64,
 ) -> Result<bool> {
     let (anchor, tip) = match (validator_db.get_anchor(), validator_db.get_canonical_tip()) {
         (Ok(Some(a)), Ok(Some(t))) => (a, t),
@@ -212,7 +244,10 @@ async fn report_range_once(
         }
     };
 
-    if tip.block_number == *last_reported_block {
+    // Relaxed suffices: this is a single monotonic hint, and both users are already ordered —
+    // the reporter is the only writer while it runs, and the final flush reads it only after
+    // joining the reporter task.
+    if tip.block_number == last_reported_block.load(Ordering::Relaxed) {
         return Ok(true);
     }
 
@@ -232,7 +267,7 @@ async fn report_range_once(
                 tip_hash = %tip.block_hash,
                 "Reported blocks"
             );
-            *last_reported_block = tip.block_number;
+            last_reported_block.store(tip.block_number, Ordering::Relaxed);
             Ok(true)
         }
         Ok(response) => {

@@ -35,10 +35,11 @@ use tracing::{trace, warn};
 
 use crate::metrics;
 
-/// Max retry rounds for retryable (transport/429/5xx) failures before surfacing an error.
-/// Stays a local constant while the backoff pacing is injected (see [`R2WitnessClient::new`]):
-/// the RPC path retries unboundedly, so there is no operator flag to mirror.
-const MAX_RETRIES: usize = 8;
+/// Total GET attempts (first try + retries) per fetch for retryable (transport/429/5xx)
+/// failures before the error surfaces. Stays a local constant while the backoff pacing is
+/// injected (see [`R2WitnessClient::new`]): the RPC path retries unboundedly, so there is no
+/// operator flag to mirror.
+const MAX_ATTEMPTS: usize = 9;
 /// Throttle applied before surfacing any deterministic (non-retryable) failure: the pipeline
 /// fetcher (`stateless-core/src/pipeline/fetcher.rs`) re-enqueues failed fetches with no delay,
 /// so returning instantly would hot-loop signed GETs against R2. Delete this once the fetcher
@@ -52,8 +53,16 @@ const MAX_ERROR_BODY_BYTES: usize = 1024;
 /// Failure outcome of an R2 witness fetch.
 #[derive(Debug, thiserror::Error)]
 pub enum R2WitnessError {
-    /// The primary object is absent from the bucket (HTTP 404): a completeness gap in R2, or a
-    /// transient miss near the tip / right after a reorg, before the uploader has PUT the object.
+    /// The primary object is absent from the bucket (HTTP 404 `NoSuchKey`): a transient miss
+    /// near the tip / right after a reorg (the uploader has not PUT the object yet), or a
+    /// permanent completeness gap in R2.
+    ///
+    /// Operator note: the pipeline retries a missing witness indefinitely (each attempt
+    /// throttled by [`DETERMINISTIC_FAILURE_THROTTLE`]). Near the tip that is exactly right —
+    /// the object appears once the uploader wins the race. But on a fixed `--end-block` slice
+    /// over history, a permanently absent object means the run never completes and never
+    /// fails: alert on `r2_witness_errors_total{kind="missing"}` staying hot for the same
+    /// block, and use the object key from this error's log line to check/backfill the bucket.
     #[error("R2 witness MISSING for block {number} (key {key}): object not found (404)")]
     Missing { number: u64, key: String },
     /// Transport-level failure (connection reset/timeout) — the endpoint is effectively
@@ -176,9 +185,13 @@ impl R2WitnessClient {
 
     /// Fetches and decodes the witness for `(number, hash)` from R2.
     ///
-    /// Transport/429/5xx failures are retried up to `MAX_RETRIES` times, paced by the
-    /// `retry_backoff` policy given at construction. Every other failure is deterministic and
-    /// surfaces after a short `DETERMINISTIC_FAILURE_THROTTLE` sleep (see its docs for why).
+    /// Transport/429/5xx failures are retried up to [`MAX_ATTEMPTS`] total attempts, paced by
+    /// the `retry_backoff` policy given at construction. Every surfaced failure pauses before
+    /// returning (the pipeline fetcher re-enqueues failed fetches with zero delay, so returning
+    /// instantly would hot-loop GETs against R2): deterministic failures wait the fixed
+    /// [`DETERMINISTIC_FAILURE_THROTTLE`], and exhausted retryable failures wait the policy's
+    /// `max` backoff — without that, the next fetch cycle would restart its ramp at `initial`,
+    /// re-bursting GETs into the same brownout the exhausted ramp just backed away from.
     pub async fn get_witness(
         &self,
         number: u64,
@@ -187,14 +200,17 @@ impl R2WitnessClient {
         let result = self.get_witness_inner(number, hash).await;
         if let Err(e) = &result {
             metrics::on_r2_witness_error(e.kind());
-            if !e.is_retryable() {
-                tokio::time::sleep(DETERMINISTIC_FAILURE_THROTTLE).await;
-            }
+            let pause = if e.is_retryable() {
+                self.retry_backoff.max
+            } else {
+                DETERMINISTIC_FAILURE_THROTTLE
+            };
+            tokio::time::sleep(pause).await;
         }
         result
     }
 
-    /// [`Self::get_witness`] without the deterministic-failure throttle.
+    /// [`Self::get_witness`] without the surfaced-failure pause.
     async fn get_witness_inner(
         &self,
         number: u64,
@@ -222,7 +238,7 @@ impl R2WitnessClient {
             match outcome {
                 Ok(bytes) => break bytes,
                 Err(e) => {
-                    if !e.is_retryable() || attempt > MAX_RETRIES {
+                    if !e.is_retryable() || attempt >= MAX_ATTEMPTS {
                         return Err(e);
                     }
                     metrics::on_r2_witness_retry();
@@ -290,8 +306,12 @@ impl R2WitnessClient {
             body.truncate(end);
         }
         // A 404 usually means the object is absent (`NoSuchKey`) — but S3 also 404s a missing
-        // *bucket*, which is operator misconfiguration, not a data gap; keep those apart.
-        if code == 404 && !body.contains("NoSuchBucket") {
+        // *bucket*, which is operator misconfiguration, not a data gap; keep those apart by
+        // parsing the S3 XML error code. A 404 with no parseable code (a proxy's bare 404, a
+        // truncated body) still counts as Missing: for a correctly configured endpoint that is
+        // by far the likeliest cause, and misreading a config error as Missing only changes
+        // the metric kind, not the retry behavior.
+        if code == 404 && s3_error_code(&body).is_none_or(|c| c == "NoSuchKey") {
             return Err(R2WitnessError::Missing { number, key: key.to_string() });
         }
         let key = key.to_string();
@@ -301,6 +321,15 @@ impl R2WitnessClient {
             Err(R2WitnessError::Status { number, key, status: code, body })
         }
     }
+}
+
+/// Extracts the value of the first `<Code>…</Code>` element from an S3 XML error body, e.g.
+/// `NoSuchKey` / `NoSuchBucket`. `None` when the body carries no such element (non-XML proxy
+/// response, truncation that ate the element).
+fn s3_error_code(body: &str) -> Option<&str> {
+    let start = body.find("<Code>")? + "<Code>".len();
+    let len = body[start..].find("</Code>")?;
+    Some(&body[start..start + len])
 }
 
 #[cfg(test)]
@@ -438,6 +467,31 @@ mod tests {
         assert!(matches!(err, R2WitnessError::Status { status: 404, .. }), "{err}");
     }
 
+    /// Any parseable S3 code other than `NoSuchKey` on a 404 is not a data gap; a 404 with no
+    /// parseable code (bare proxy 404, truncated body) still counts as Missing.
+    #[tokio::test]
+    async fn only_no_such_key_and_bare_404s_are_missing() {
+        let (endpoint, _) = mock_r2(vec![(404, "<Code>AccessDenied</Code>")]).await;
+        let err = fetch(&endpoint).await.unwrap_err();
+        assert!(matches!(err, R2WitnessError::Status { status: 404, .. }), "{err}");
+
+        let (endpoint, _) = mock_r2(vec![(404, "<html>not found</html>")]).await;
+        let err = fetch(&endpoint).await.unwrap_err();
+        assert!(matches!(err, R2WitnessError::Missing { .. }), "{err}");
+    }
+
+    #[test]
+    fn s3_error_code_parses_real_and_degenerate_bodies() {
+        let real = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>"#;
+        assert_eq!(s3_error_code(real), Some("NoSuchKey"));
+        assert_eq!(s3_error_code("<Code>NoSuchBucket</Code>"), Some("NoSuchBucket"));
+        assert_eq!(s3_error_code(""), None);
+        assert_eq!(s3_error_code("<html>gateway error</html>"), None);
+        // Truncation that ate the closing tag must not panic or misparse.
+        assert_eq!(s3_error_code("<Error><Code>NoSuchBu"), None);
+    }
+
     #[tokio::test]
     async fn throttled_5xx_retries_until_a_deterministic_answer() {
         let (endpoint, hits) = mock_r2(vec![(503, "SlowDown"), (503, "SlowDown"), (403, "")]).await;
@@ -471,7 +525,29 @@ mod tests {
         let (endpoint, hits) = mock_r2(vec![(503, "overloaded")]).await;
         let err = fetch(&endpoint).await.unwrap_err();
         assert!(matches!(err, R2WitnessError::Throttled { status: 503, .. }), "{err}");
-        assert_eq!(hits.load(Ordering::SeqCst), MAX_RETRIES + 1, "initial attempt + MAX_RETRIES");
+        assert_eq!(hits.load(Ordering::SeqCst), MAX_ATTEMPTS, "exactly MAX_ATTEMPTS GETs");
+    }
+
+    /// Exhausted retryable failures must pause the policy's `max` backoff before surfacing:
+    /// the pipeline fetcher re-enqueues with zero delay, so without the pause the next fetch
+    /// cycle would re-burst a fresh ramp (starting at `initial`) into the same brownout.
+    #[tokio::test]
+    async fn exhausted_retries_pause_max_backoff_before_surfacing() {
+        let (endpoint, hits) = mock_r2(vec![(503, "overloaded")]).await;
+        // The ramp's 8 in-loop sleeps double from 1ms and never reach the 400ms cap
+        // (1+2+…+128 = 255ms before jitter, ≤382ms with the ≤50% jitter), so of the asserted
+        // lower bound, ≥400ms is attributable to the exhaustion pause alone.
+        let (initial, max) = (Duration::from_millis(1), Duration::from_millis(400));
+        let client = client_with_backoff(&endpoint, None, BackoffPolicy::new(initial, max));
+        let started = std::time::Instant::now();
+        let err = client.get_witness(1, B256::ZERO).await.unwrap_err();
+        assert!(matches!(err, R2WitnessError::Throttled { status: 503, .. }), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), MAX_ATTEMPTS);
+        assert!(
+            started.elapsed() >= Duration::from_millis(255) + max,
+            "exhausted retries surfaced without the max-backoff pause ({:?})",
+            started.elapsed(),
+        );
     }
 
     /// The only test of the success path (`get_object` → `spawn_blocking` decode): a fixture

@@ -494,11 +494,11 @@ async fn integration_test() {
 }
 
 /// Runs `run_with_signals` to the fixtures' max block (`--end-block` → `sync_target`) with
-/// reports wired to the mock, failing the first `reject_first_reports` calls; asserts the last
-/// accepted report covers the end block and returns all accepted reports.
-async fn run_end_block_slice_and_assert_tip_reported(
+/// reports wired to the mock, failing the first `reject_first_reports` calls. Returns the run
+/// result, the accepted reports, and the slice's end block.
+async fn run_end_block_slice(
     reject_first_reports: usize,
-) -> Vec<(u64, u64)> {
+) -> (eyre::Result<()>, Vec<(u64, u64)>, u64) {
     let _logging = init_test_logging("stateless_validator");
     let fx = TestFixtures::synthetic();
     let genesis_file = fx.data_dir.join("genesis.json");
@@ -528,7 +528,7 @@ async fn run_end_block_slice_and_assert_tip_reported(
     cfg.concurrent_workers = 1;
     cfg.sync_target = Some(max_block_number);
 
-    run_with_signals(
+    let result = run_with_signals(
         client,
         None,
         Arc::clone(&validator_db),
@@ -537,19 +537,29 @@ async fn run_end_block_slice_and_assert_tip_reported(
         Some(url.clone()),
         cfg,
     )
-    .await
-    .unwrap();
+    .await;
 
     handle.stop().unwrap();
 
-    let reports = reports.lock().unwrap();
+    let reports = reports.lock().unwrap().clone();
+    (result, reports, max_block_number)
+}
+
+/// [`run_end_block_slice`] + asserts the run succeeded and the last accepted report covers the
+/// end block; returns all accepted reports.
+async fn run_end_block_slice_and_assert_tip_reported(
+    reject_first_reports: usize,
+) -> Vec<(u64, u64)> {
+    let (result, reports, max_block_number) = run_end_block_slice(reject_first_reports).await;
+    result.unwrap();
+
     let &(_, last_reported) =
         reports.last().expect("the run must report validated blocks before exiting");
     assert_eq!(
         last_reported, max_block_number,
         "the final report must cover the end block (got reports: {reports:?})",
     );
-    reports.clone()
+    reports
 }
 
 /// A fixed-range run must flush its final validated tip before exiting: the periodic reporter
@@ -566,4 +576,15 @@ async fn end_block_run_reports_final_tip() {
 #[tokio::test]
 async fn end_block_final_report_retries_after_transient_failure() {
     run_end_block_slice_and_assert_tip_reported(1).await;
+}
+
+/// If the final flush cannot land within its bounded retries, an `--end-block` slice run must
+/// fail rather than exit 0: the slice has no later restart to re-report, so a clean exit would
+/// let an orchestrator record the slice as complete while upstream never saw the tip.
+#[tokio::test]
+async fn end_block_run_fails_when_final_report_never_lands() {
+    let (result, reports, _) = run_end_block_slice(usize::MAX).await;
+    let err = result.expect_err("run must fail when the validated tail cannot be reported");
+    assert!(err.to_string().contains("final validation report failed"), "{err}");
+    assert!(reports.is_empty(), "mock rejected every report, yet some landed: {reports:?}");
 }
