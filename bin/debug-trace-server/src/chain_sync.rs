@@ -23,7 +23,7 @@ use crate::{metrics, response_cache::ResponseCache, server_db::BlockStore};
 ///
 /// Witnesses go through the zero-validation light decode (`get_witness_light`):
 /// the server never verifies the proof, so the full decode's per-point
-/// elliptic-curve work (~1 core·s on large witnesses) bought nothing.
+/// elliptic-curve work bought nothing.
 pub struct TraceFetcher {
     pub rpc_client: Arc<RpcClient>,
 }

@@ -713,9 +713,9 @@ fn witness_deadline_for(
 /// witness stage's effective deadline (see [`witness_deadline_for`]).
 ///
 /// Uses the zero-validation light decode: the trace server never verifies the
-/// witness proof, so the full decode's per-point elliptic-curve work (~110ms
-/// wall / ~1 core·s on large witnesses) bought nothing. The recorded size is
-/// the light lower bound (excludes the never-decoded parent commitments).
+/// witness proof, so the full decode's per-point elliptic-curve work bought
+/// nothing. The recorded size is the light lower bound (excludes the
+/// never-decoded parent commitments).
 async fn fetch_witness(
     rpc_client: &RpcClient,
     block_number: u64,

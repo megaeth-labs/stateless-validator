@@ -10,13 +10,12 @@
 //!   `SaltWitness` bytes**: the proof material is parsed structurally (so the stream stays in sync)
 //!   but read as raw bytes and discarded — no curve point is ever constructed or validated.
 //!
-//! ## Performance (real mainnet witness, ~6.3 MiB, 65k commitments, 14-core M4 Pro)
+//! ## Performance
 //!
-//! - Full `SaltWitness` decode: ~112 ms wall even with salt's parallelized point validation (salt
-//!   #137) — and ~1.4 core·s of CPU, since one `Element::from_bytes` (modular sqrt + subgroup
-//!   check) runs per parent commitment.
-//! - [`LightWitnessFromSalt`] decode from the same bytes: ~3.7 ms, single-threaded — ~30x less wall
-//!   time and ~300x less CPU.
+//! The full `SaltWitness` decode runs one `Element::from_bytes` (modular sqrt + subgroup check)
+//! per parent commitment — CPU work that dominates large-witness decoding even with salt's
+//! parallelized point validation (salt #137). The light decode skips all of it and is orders of
+//! magnitude cheaper, single-threaded; measured numbers live in PR #154.
 //!
 //! ## Safety model
 //!

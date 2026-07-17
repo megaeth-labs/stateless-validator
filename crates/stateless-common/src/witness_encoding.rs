@@ -74,8 +74,7 @@ pub fn decode_witness_payload(
 /// Zero-validation counterpart of [`decode_witness_payload`]: decodes only the
 /// light witness (kvs + levels) from the same payload bytes, skipping all
 /// elliptic-curve work (see `stateless_core::light_witness` for the safety
-/// model). On a large mainnet witness: ~21x less wall time and ~230x less CPU
-/// than the full decode (~125 ms / ~1.4 core·s vs ~6 ms single-threaded).
+/// and performance model).
 pub fn decode_witness_payload_light(
     compressed: &[u8],
 ) -> Result<(LightWitness, MptWitness), WitnessDecodingError> {
