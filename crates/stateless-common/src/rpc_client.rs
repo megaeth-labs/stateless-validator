@@ -45,13 +45,13 @@ use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
-use stateless_core::withdrawals::MptWitness;
+use stateless_core::{LightWitness, withdrawals::MptWitness};
 use tokio::sync::Semaphore;
 use tracing::{trace, warn};
 
 use crate::{
     metrics::{RpcMethod, RpcMetrics},
-    witness_encoding::decode_witness_response,
+    witness_encoding::{decode_witness_response, decode_witness_response_light},
     witness_size::WitnessSizeBreakdown,
 };
 
@@ -569,25 +569,77 @@ impl RpcClient {
         hash: B256,
         deadline: Option<Instant>,
     ) -> std::result::Result<(SaltWitness, MptWitness), RpcDeadlineExceeded> {
-        let witness = round_robin_with_backoff(
-            &self.witness_providers,
-            &self.witness_concurrency,
-            &self.config.rpc_retry,
-            self.config.per_attempt_timeout,
-            // Primary-failover: always start from provider 0 so the primary takes all traffic
-            // while healthy. Backup endpoints are touched only while the primary is failing.
-            0,
-            RpcMethod::MegaGetBlockWitness,
-            self.config.metrics.as_ref(),
-            deadline,
-            |provider| Box::pin(async move { fetch_witness_raw(&provider, number, hash).await }),
-        )
-        .await?;
+        let witness = self
+            .witness_round_robin(number, hash, deadline, decode_witness_response, "Witness decoded")
+            .await?;
 
         if let Some(ref metrics) = self.config.metrics {
             metrics.on_witness_fetch(WitnessSizeBreakdown::new(&witness.0, &witness.1));
         }
         Ok(witness)
+    }
+
+    /// Zero-validation counterpart of [`Self::get_witness`] for execution-only
+    /// consumers: decodes just the light witness (kvs + levels, no
+    /// elliptic-curve work — see `stateless_core::light_witness` for the
+    /// safety model). Consumers that later need the full witness (e.g. to
+    /// assemble test fixtures) re-fetch it via [`Self::get_witness`].
+    ///
+    /// The `on_witness_fetch` size metric is not recorded here — the exact
+    /// breakdown needs the proof's commitment count. Callers that want a size
+    /// signal can record `WitnessSizeBreakdown::new_light` (a documented
+    /// lower bound) themselves.
+    pub async fn get_witness_light(&self, number: u64, hash: B256) -> (LightWitness, MptWitness) {
+        self.get_witness_light_with_deadline(number, hash, None)
+            .await
+            .expect("None deadline cannot time out")
+    }
+
+    /// Deadline-aware counterpart of [`Self::get_witness_light`].
+    pub async fn get_witness_light_with_deadline(
+        &self,
+        number: u64,
+        hash: B256,
+        deadline: Option<Instant>,
+    ) -> std::result::Result<(LightWitness, MptWitness), RpcDeadlineExceeded> {
+        self.witness_round_robin(
+            number,
+            hash,
+            deadline,
+            decode_witness_response_light,
+            "Witness light-decoded",
+        )
+        .await
+    }
+
+    /// Shared `mega_getBlockWitness` retry loop: primary-failover rounds (always start from
+    /// provider 0 so the primary takes all traffic while healthy; backups are touched only
+    /// while it is failing), each attempt one RPC round trip followed by the caller-chosen
+    /// `decode` (see [`fetch_witness_with`]).
+    async fn witness_round_robin<T: Send + 'static>(
+        &self,
+        number: u64,
+        hash: B256,
+        deadline: Option<Instant>,
+        decode: fn(&str) -> std::result::Result<T, crate::WitnessDecodingError>,
+        trace_msg: &'static str,
+    ) -> std::result::Result<T, RpcDeadlineExceeded> {
+        round_robin_with_backoff(
+            &self.witness_providers,
+            &self.witness_concurrency,
+            &self.config.rpc_retry,
+            self.config.per_attempt_timeout,
+            0,
+            RpcMethod::MegaGetBlockWitness,
+            self.config.metrics.as_ref(),
+            deadline,
+            |provider| {
+                Box::pin(async move {
+                    fetch_witness_with(&provider, number, hash, decode, trace_msg).await
+                })
+            },
+        )
+        .await
     }
 
     /// Reports a range of validated blocks via the dedicated report endpoint.
@@ -1050,15 +1102,16 @@ async fn do_get_header(
     Ok(header)
 }
 
-/// Fetches and decodes witness data from a single RPC provider (one attempt, no retry).
-///
-/// Decodes the versioned `mega_getBlockWitness` response with
-/// [`decode_witness_response`](crate::decode_witness_response).
-async fn fetch_witness_raw(
+/// Shared single-attempt `mega_getBlockWitness` fetch: one RPC round trip,
+/// then the caller-chosen decoder on the blocking pool (zstd + bincode over a
+/// multi-MB payload is CPU-bound).
+async fn fetch_witness_with<T: Send + 'static>(
     provider: &RootProvider,
     number: u64,
     hash: B256,
-) -> Result<(SaltWitness, MptWitness)> {
+    decode: fn(&str) -> std::result::Result<T, crate::WitnessDecodingError>,
+    trace_msg: &'static str,
+) -> Result<T> {
     let keys = WitnessRequestKeys { block_number: U64::from(number), block_hash: hash };
     let encoded: String = provider
         .client()
@@ -1067,22 +1120,20 @@ async fn fetch_witness_raw(
         .map_err(|e| eyre!("mega_getBlockWitness failed for block {number}: {e}"))?;
 
     let decode_start = Instant::now();
-    let (salt_witness, mpt_witness) =
-        tokio::task::spawn_blocking(move || -> Result<(SaltWitness, MptWitness)> {
-            decode_witness_response(&encoded)
-                .map_err(|e| eyre!("failed to decode witness response: {e}"))
-        })
-        .await
-        .context("decode task panicked")??;
+    let result = tokio::task::spawn_blocking(move || -> Result<T> {
+        decode(&encoded).map_err(|e| eyre!("failed to decode witness response: {e}"))
+    })
+    .await
+    .context("decode task panicked")??;
 
     trace!(
         block_number = number,
         %hash,
         decode_ms = decode_start.elapsed().as_millis(),
-        "Witness decoded",
+        "{trace_msg}",
     );
 
-    Ok((salt_witness, mpt_witness))
+    Ok(result)
 }
 
 /// Verifies structural integrity of a block fetched from RPC.

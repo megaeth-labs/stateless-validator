@@ -19,8 +19,11 @@ use stateless_core::{
 
 use crate::{metrics, response_cache::ResponseCache, server_db::BlockStore};
 
-/// Fetcher for the trace server: fetches blocks + witnesses, discards MPT witness,
-/// converts SALT witness to [`LightWitness`].
+/// Fetcher for the trace server: fetches blocks + witnesses, discards MPT witness.
+///
+/// Witnesses go through the zero-validation light decode (`get_witness_light`):
+/// the server never verifies the proof, so the full decode's per-point
+/// elliptic-curve work bought nothing.
 pub struct TraceFetcher {
     pub rpc_client: Arc<RpcClient>,
 }
@@ -35,11 +38,11 @@ impl BlockFetcher for TraceFetcher {
         // fetch instead of serializing all three round trips.
         let block_hash = self.rpc_client.get_block_hash(block_number).await;
         let (witness_res, block_res) = tokio::join!(
-            self.rpc_client.get_witness(block_number, block_hash),
+            self.rpc_client.get_witness_light(block_number, block_hash),
             self.rpc_client.get_block(BlockId::Number(block_number.into()), true),
         );
-        let (salt, _mpt) = witness_res;
-        Ok((block_res, LightWitness::from(&salt)))
+        let (light, _mpt) = witness_res;
+        Ok((block_res, light))
     }
 
     async fn latest_block_number(&self) -> Result<u64> {

@@ -208,6 +208,15 @@ pub fn iter_code_hashes(
     })
 }
 
+/// [`iter_code_hashes`], deduplicated and sorted for stable ordering — the
+/// form witness fetchers want (e.g. the trace server).
+pub fn collect_code_hashes(kvs: &BTreeMap<SaltKey, Option<SaltValue>>) -> Vec<B256> {
+    let mut hashes: Vec<B256> = iter_code_hashes(kvs).collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    hashes
+}
+
 #[cfg(test)]
 mod tests {
     use std::vec;

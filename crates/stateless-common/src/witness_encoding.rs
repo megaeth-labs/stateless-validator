@@ -9,7 +9,7 @@ use std::io;
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use salt::SaltWitness;
-use stateless_core::withdrawals::MptWitness;
+use stateless_core::{LightWitness, LightWitnessFromSalt, withdrawals::MptWitness};
 
 /// Version prefix for the RPC response format:
 /// `"v0:" + base64(zstd(bincode-legacy((SaltWitness, MptWitness))))`.
@@ -68,9 +68,28 @@ pub fn encode_witness_payload(
 pub fn decode_witness_payload(
     compressed: &[u8],
 ) -> Result<(SaltWitness, MptWitness), WitnessDecodingError> {
+    decode_payload_as(compressed)
+}
+
+/// Zero-validation counterpart of [`decode_witness_payload`]: decodes only the
+/// light witness (kvs + levels) from the same payload bytes, skipping all
+/// elliptic-curve work (see `stateless_core::light_witness` for the safety
+/// and performance model).
+pub fn decode_witness_payload_light(
+    compressed: &[u8],
+) -> Result<(LightWitness, MptWitness), WitnessDecodingError> {
+    let (light, mpt): (LightWitnessFromSalt, MptWitness) = decode_payload_as(compressed)?;
+    Ok((light.0, mpt))
+}
+
+/// Shared payload decode: zstd, then bincode-legacy into the caller-chosen target — the one
+/// place that fixes the wire config for both the full and the light payload decode.
+fn decode_payload_as<T: serde::de::DeserializeOwned>(
+    compressed: &[u8],
+) -> Result<T, WitnessDecodingError> {
     let decompressed = zstd::decode_all(compressed)?;
-    let (witness, _) = bincode::serde::decode_from_slice(&decompressed, bincode::config::legacy())?;
-    Ok(witness)
+    let (value, _) = bincode::serde::decode_from_slice(&decompressed, bincode::config::legacy())?;
+    Ok(value)
 }
 
 /// Encodes the witness tuple as a versioned RPC response string.
@@ -86,11 +105,29 @@ pub fn encode_witness_response(
 pub fn decode_witness_response(
     response: &str,
 ) -> Result<(SaltWitness, MptWitness), WitnessDecodingError> {
+    decode_response_with(response, decode_witness_payload)
+}
+
+/// Zero-validation counterpart of [`decode_witness_response`]: decodes only
+/// the light witness from a versioned RPC response.
+pub fn decode_witness_response_light(
+    response: &str,
+) -> Result<(LightWitness, MptWitness), WitnessDecodingError> {
+    decode_response_with(response, decode_witness_payload_light)
+}
+
+/// Shared response prologue: strip the version prefix and base64-decode, then hand the
+/// compressed payload to the caller-chosen decoder — the one place that fixes the response
+/// framing for both the full and the light decode.
+fn decode_response_with<T>(
+    response: &str,
+    decode_payload: fn(&[u8]) -> Result<T, WitnessDecodingError>,
+) -> Result<T, WitnessDecodingError> {
     let payload = response
         .strip_prefix(WITNESS_RESPONSE_VERSION_PREFIX)
         .ok_or(WitnessDecodingError::MissingPrefix)?;
     let compressed = BASE64.decode(payload)?;
-    decode_witness_payload(&compressed)
+    decode_payload(&compressed)
 }
 
 #[cfg(test)]
@@ -136,6 +173,54 @@ mod tests {
 
         assert_eq!(decoded.0, salt_witness);
         assert_eq!(decoded.1, mpt_witness);
+    }
+
+    /// Same payload bytes, light decode: equal to the light parts of the full
+    /// decode, without touching any curve point.
+    #[test]
+    fn decode_witness_payload_light_matches_full() {
+        let (salt_witness, mpt_witness) = first_fixture_witness();
+        let (_, compressed) = encode_witness_payload(&salt_witness, &mpt_witness)
+            .expect("compression should succeed");
+
+        let (light, mpt) =
+            decode_witness_payload_light(&compressed).expect("light decode should succeed");
+
+        assert_eq!(light, LightWitness::from(&salt_witness));
+        assert_eq!(mpt, mpt_witness);
+    }
+
+    /// Response-level light decode agrees with the full decode.
+    #[test]
+    fn decode_witness_response_light_matches_full() {
+        let (salt_witness, mpt_witness) = first_fixture_witness();
+        let encoded =
+            encode_witness_response(&salt_witness, &mpt_witness).expect("encoding should succeed");
+
+        let (light, mpt) =
+            decode_witness_response_light(&encoded).expect("light decode should succeed");
+
+        assert_eq!(light, LightWitness::from(&salt_witness));
+        assert_eq!(mpt, mpt_witness);
+    }
+
+    /// The committed real-mainnet payload (block 6906405, ~6.3 MiB
+    /// uncompressed, 65k commitments) light-decodes to exactly the light
+    /// parts of its full decode — the end-to-end ".zst → light witness" lock.
+    #[test]
+    fn big_mainnet_zst_light_decodes() {
+        let path =
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_data/mainnet/bench/6906405.zst");
+        let compressed = std::fs::read(path).expect("read committed bench payload");
+
+        let (full_salt, full_mpt) =
+            decode_witness_payload(&compressed).expect("full decode should succeed");
+        let (light, mpt) =
+            decode_witness_payload_light(&compressed).expect("light decode should succeed");
+
+        assert_eq!(light, LightWitness::from(&full_salt));
+        assert_eq!(mpt, full_mpt);
+        assert!(!light.kvs.is_empty());
     }
 
     #[test]
