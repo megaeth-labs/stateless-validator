@@ -183,23 +183,38 @@ pub struct ValidationStats {
     pub salt_update_time: f64,
 }
 
-/// Caller policy for [`validate_block_updates`]: how the witness is bound to the canonical
+/// Caller policy for [`validate_block_updates`]: how the witnesses are bound to the canonical
 /// chain before the derived updates are handed back.
 ///
-/// The witness IPA proof is always verified; the anchor is an *additional* binding. `Default`
-/// performs no anchoring; embedders that compare the returned updates against an independently
-/// verified changeset typically anchor the witness to the parent header.
+/// Both witness proofs are always verified (the SALT witness's IPA proof, the MPT witness's
+/// Merkle proof); the anchors are an *additional* binding. `Default` performs no anchoring;
+/// embedders that compare the returned updates against an independently verified changeset
+/// typically anchor both witnesses to the parent header — the same
+/// `(state root, withdrawals root)` pair the standalone pipeline's continuity check enforces
+/// between consecutive blocks.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct ValidationOptions {
-    /// When set, require the witness's own state root to equal this value (the parent block's
-    /// post state root) before any other work, failing with
+    /// When set, require the SALT witness's own state root to equal this value (the parent
+    /// block's post state root) before any other work, failing with
     /// [`ValidationError::PreStateRootMismatch`] otherwise.
     pub expected_pre_state_root: Option<B256>,
+    /// When set, require the MPT witness's own storage root (the withdrawal contract's
+    /// pre-state) to equal this value (the parent block's post withdrawals root) before any
+    /// other work, failing with [`ValidationError::PreWithdrawalsRootMismatch`] otherwise.
+    ///
+    /// This is the only check that binds the MPT witness's *pre*-state to the chain:
+    /// [`MptWitness::verify`] proves the witness against its own claimed `storage_root` and
+    /// binds the *post* root to the block header, which exposes a fabricated pre-state only
+    /// when the fabrication survives into the post root — a fabrication confined to slots
+    /// this block rewrites converges to the correct post root and passes verify. The anchor
+    /// also fails fast, before any replay work, with the precise pre-root diagnosis rather
+    /// than a post-root error that reads like a replay fault.
+    pub expected_pre_withdrawals_root: Option<B256>,
 }
 
 impl ValidationOptions {
-    /// Anchors the witness to `root`, the parent block's post state root
+    /// Anchors the SALT witness to `root`, the parent block's post state root
     /// (see [`Self::expected_pre_state_root`]).
     ///
     /// The struct is `#[non_exhaustive]`, so out-of-crate callers build it as
@@ -207,6 +222,14 @@ impl ValidationOptions {
     #[must_use]
     pub fn with_expected_pre_state_root(mut self, root: B256) -> Self {
         self.expected_pre_state_root = Some(root);
+        self
+    }
+
+    /// Anchors the MPT witness to `root`, the parent block's post withdrawals root
+    /// (see [`Self::expected_pre_withdrawals_root`]).
+    #[must_use]
+    pub fn with_expected_pre_withdrawals_root(mut self, root: B256) -> Self {
+        self.expected_pre_withdrawals_root = Some(root);
         self
     }
 }
@@ -769,11 +792,15 @@ pub fn validate_block<B: BlockInput>(
 ///   that comparison. The map carries account and storage records only: newly deployed bytecode is
 ///   not derivable from it, so a changeset comparison does not cover the embedder's `codes` and
 ///   bytecode integrity must be enforced at ingest.
-/// - `options.expected_pre_state_root`, when provided, is checked against the witness's own state
-///   root before any other work, returning [`ValidationError::PreStateRootMismatch`] on divergence.
-///   This anchors the witness to the canonical parent block.
+/// - The [`ValidationOptions`] anchors, when provided, are checked against the witnesses' own
+///   pre-roots before any other work: `expected_pre_state_root` against the SALT witness's state
+///   root ([`ValidationError::PreStateRootMismatch`]) and `expected_pre_withdrawals_root` against
+///   the MPT witness's storage root ([`ValidationError::PreWithdrawalsRootMismatch`]). Together
+///   they anchor both witnesses to the canonical parent block — the same `(state root, withdrawals
+///   root)` pair the standalone pipeline's continuity check enforces.
 ///
-/// The witness IPA proof is always verified before replay, exactly as in [`validate_block`].
+/// Both witness proofs (the SALT witness's IPA proof before replay, the MPT witness's Merkle
+/// proof on the replay outputs) are always verified, exactly as in [`validate_block`].
 /// On success, [`ValidationStats::salt_update_time`] holds the state-update derivation time
 /// (there is no trie update here).
 pub fn validate_block_updates<B: BlockInput>(
@@ -792,14 +819,21 @@ pub fn validate_block_updates<B: BlockInput>(
     }
     let header = block.consensus_header();
 
-    // Anchor the witness to the canonical chain before any other work: its internal state root
-    // must be the parent block's post state root.
+    // Anchor the witnesses to the canonical chain before any other work: the SALT witness's
+    // internal state root must be the parent block's post state root, and the MPT witness's
+    // storage root the parent's post withdrawals root.
     if let Some(expected) = options.expected_pre_state_root {
         let actual = B256::from(
             salt_witness.state_root().map_err(ValidationError::WitnessVerificationFailed)?,
         );
         if actual != expected {
             return Err(ValidationError::PreStateRootMismatch { expected, actual });
+        }
+    }
+    if let Some(expected) = options.expected_pre_withdrawals_root {
+        let actual = mpt_witness.storage_root;
+        if actual != expected {
+            return Err(ValidationError::PreWithdrawalsRootMismatch { expected, actual });
         }
     }
 
@@ -1063,6 +1097,81 @@ mod tests {
             }
             other => panic!("expected PreStateRootMismatch, got {other:?}"),
         }
+
+        // Ordering proof: with a witness that would fail IPA verification, a bogus anchor
+        // must still surface as the anchor error — i.e. the anchor runs before any proof or
+        // replay work, which is its entire fail-fast value.
+        let mismatched = ValidationOptions::default().with_expected_pre_state_root(bogus);
+        let err = run_updates(fx, &chain_spec, block, tampered_witness(fx, hash), hash, mismatched)
+            .unwrap_err();
+        assert!(
+            matches!(err, ValidationError::PreStateRootMismatch { .. }),
+            "anchor must run before witness verification, got {err:?}"
+        );
+    }
+
+    /// The pre-withdrawals anchor must accept the parent header's withdrawals root and reject
+    /// any other value with `PreWithdrawalsRootMismatch` — the second half of the
+    /// `(state root, withdrawals root)` pair anchor mirroring the standalone pipeline's
+    /// continuity check.
+    #[test]
+    fn validate_block_updates_anchors_pre_withdrawals_root() {
+        let fx = TestFixtures::mainnet_shared();
+        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
+
+        // Every paired fixture MPT witness must carry its parent header's post withdrawals
+        // root — the exact value the anchor compares.
+        let mut anchored = None;
+        for (number, hash) in fx.paired_blocks() {
+            let block = &fx.blocks[&hash];
+            let parent_hash = block.consensus_header().parent_hash;
+            let Some(parent) = fx.blocks.get(&parent_hash) else { continue };
+
+            let parent_root =
+                parent.header.inner.withdrawals_root.unwrap_or_else(|| {
+                    panic!("parent of {number} ({hash}) lacks a withdrawals root")
+                });
+            let witness_root = fx.mpt_witness::<MptWitness>(&hash).storage_root;
+            assert_eq!(
+                witness_root, parent_root,
+                "MPT witness root for {number} ({hash}) must be the parent's post withdrawals root"
+            );
+            anchored.get_or_insert((hash, parent_root));
+        }
+
+        // Exercise the gate end-to-end on one block: the real root passes, a bogus one fails
+        // before any replay work.
+        let Some((hash, parent_root)) = anchored else {
+            panic!("no fixture block has its parent in the set — anchor untested");
+        };
+        let block = &fx.blocks[&hash];
+        let witness = fx.salt_witnesses[&hash].clone();
+        let options = ValidationOptions::default().with_expected_pre_withdrawals_root(parent_root);
+        run_updates(fx, &chain_spec, block, witness, hash, options)
+            .unwrap_or_else(|e| panic!("anchored validation failed for {hash}: {e:?}"));
+
+        let bogus = B256::repeat_byte(0xCD);
+        let mismatched = ValidationOptions::default().with_expected_pre_withdrawals_root(bogus);
+        let witness = fx.salt_witnesses[&hash].clone();
+        let err = run_updates(fx, &chain_spec, block, witness, hash, mismatched).unwrap_err();
+        match err {
+            ValidationError::PreWithdrawalsRootMismatch { expected, actual } => {
+                assert_eq!(expected, bogus);
+                assert_eq!(actual, parent_root);
+            }
+            other => panic!("expected PreWithdrawalsRootMismatch, got {other:?}"),
+        }
+
+        // Ordering proof: with a witness that would fail IPA verification, a bogus anchor
+        // must still surface as the anchor error — i.e. the anchor runs before any proof or
+        // replay work, which is its entire fail-fast value.
+        let mismatched = ValidationOptions::default().with_expected_pre_withdrawals_root(bogus);
+        let err = run_updates(fx, &chain_spec, block, tampered_witness(fx, hash), hash, mismatched)
+            .unwrap_err();
+        assert!(
+            matches!(err, ValidationError::PreWithdrawalsRootMismatch { .. }),
+            "anchor must run before witness verification, got {err:?}"
+        );
     }
 
     /// A block carrying only transaction hashes must be rejected as `BlockIncomplete` before
