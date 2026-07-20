@@ -198,6 +198,19 @@ pub struct ValidationOptions {
     pub expected_pre_state_root: Option<B256>,
 }
 
+impl ValidationOptions {
+    /// Anchors the witness to `root`, the parent block's post state root
+    /// (see [`Self::expected_pre_state_root`]).
+    ///
+    /// The struct is `#[non_exhaustive]`, so out-of-crate callers build it as
+    /// `ValidationOptions::default().with_expected_pre_state_root(root)`.
+    #[must_use]
+    pub fn with_expected_pre_state_root(mut self, root: B256) -> Self {
+        self.expected_pre_state_root = Some(root);
+        self
+    }
+}
+
 /// Creates an EVM execution environment from a block header and chain specification.
 ///
 /// This function configures the EVM environment with the appropriate chain settings,
@@ -588,6 +601,67 @@ fn verify_replay_outputs(
     Ok(())
 }
 
+/// Output of [`verify_and_replay`], the stages shared by [`validate_block`] and
+/// [`validate_block_updates`].
+struct VerifiedReplay {
+    /// The proof-verified witness the block was replayed over.
+    witness: Witness,
+    /// Net per-account state changes from the replay.
+    accounts: HashMap<Address, BundleAccount>,
+    /// Execution outputs claimed by the header, plus state access counts.
+    output: BlockExecutionOutput,
+    /// Time spent verifying the witness proof (seconds; `0.0` in `no_std` builds).
+    witness_verification_time: f64,
+    /// Time spent replaying block transactions (seconds; `0.0` in `no_std` builds).
+    block_replay_time: f64,
+}
+
+/// Verifies the witness IPA proof and replays the block's transactions over it — the front
+/// half shared by [`validate_block`] and [`validate_block_updates`]. Callers gate on
+/// [`BlockInput::is_complete`] first.
+fn verify_and_replay<B: BlockInput>(
+    chain_spec: &ChainSpec,
+    block: &B,
+    salt_witness: SaltWitness,
+    contracts: &HashMap<B256, Bytecode>,
+    #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
+) -> Result<VerifiedReplay, ValidationError> {
+    let header = block.consensus_header();
+
+    // Create external environment oracle from salt witness
+    let ext_env = WitnessExternalEnv::new(&salt_witness, header.number)
+        .map_err(ValidationError::EnvOracleConstructionFailed)?;
+
+    // Verify witness proof against its internal state root
+    #[cfg(feature = "std")]
+    let start = Instant::now();
+    let witness = Witness::from(salt_witness);
+    witness.verify().map_err(ValidationError::WitnessVerificationFailed)?;
+    #[cfg(feature = "std")]
+    let witness_verification_time = start.elapsed().as_secs_f64();
+    #[cfg(not(feature = "std"))]
+    let witness_verification_time = 0.0_f64; // no_std: timing unavailable
+
+    // Replay block transactions
+    #[cfg(feature = "std")]
+    let start = Instant::now();
+    let witness_db = WitnessDatabase { header, witness: &witness, contracts };
+    let (accounts, output) = replay_block(
+        chain_spec,
+        block,
+        &witness_db,
+        ext_env,
+        #[cfg(feature = "std")]
+        writer,
+    )?;
+    #[cfg(feature = "std")]
+    let block_replay_time = start.elapsed().as_secs_f64();
+    #[cfg(not(feature = "std"))]
+    let block_replay_time = 0.0_f64; // no_std: timing unavailable
+
+    Ok(VerifiedReplay { witness, accounts, output, witness_verification_time, block_replay_time })
+}
+
 /// Validates a block by creating a witness, replaying transactions, and comparing state roots.
 ///
 /// This function performs the core validation logic:
@@ -627,36 +701,20 @@ pub fn validate_block<B: BlockInput>(
     }
     let header = block.consensus_header();
 
-    // Create external environment oracle from salt witness
-    let ext_env = WitnessExternalEnv::new(&salt_witness, header.number)
-        .map_err(ValidationError::EnvOracleConstructionFailed)?;
-
-    // Verify witness proof against the current state root
-    #[cfg(feature = "std")]
-    let start = Instant::now();
-    let witness = Witness::from(salt_witness);
-    witness.verify().map_err(ValidationError::WitnessVerificationFailed)?;
-    #[cfg(feature = "std")]
-    let witness_verification_time = start.elapsed().as_secs_f64();
-    #[cfg(not(feature = "std"))]
-    let witness_verification_time = 0.0_f64; // no_std: timing unavailable
-
-    // Replay block transactions
-    let witness_db = WitnessDatabase { header, witness: &witness, contracts };
-    let (accounts, output) = replay_block(
-        chain_spec,
-        block,
-        &witness_db,
-        ext_env,
-        #[cfg(feature = "std")]
-        writer,
-    )?;
-    #[cfg(feature = "std")]
-    let block_replay_time = start.elapsed().as_secs_f64() - witness_verification_time;
-    #[cfg(not(feature = "std"))]
-    let block_replay_time = 0.0_f64; // no_std: timing unavailable
+    // Verify the witness proof and replay the block's transactions over it
+    let VerifiedReplay { witness, accounts, output, witness_verification_time, block_replay_time } =
+        verify_and_replay(
+            chain_spec,
+            block,
+            salt_witness,
+            contracts,
+            #[cfg(feature = "std")]
+            writer,
+        )?;
 
     // Extract and hash storage updates (only changed values)
+    #[cfg(feature = "std")]
+    let start = Instant::now();
     let withdrawal_storage = withdrawal_storage(&accounts);
 
     // Derive the net SALT state updates from the replayed accounts
@@ -667,8 +725,7 @@ pub fn validate_block<B: BlockInput>(
         .update_fin(&state_updates)
         .map_err(ValidationError::TrieUpdateFailed)?;
     #[cfg(feature = "std")]
-    let salt_update_time =
-        start.elapsed().as_secs_f64() - witness_verification_time - block_replay_time;
+    let salt_update_time = start.elapsed().as_secs_f64();
     #[cfg(not(feature = "std"))]
     let salt_update_time = 0.0_f64; // no_std: timing unavailable
 
@@ -704,7 +761,9 @@ pub fn validate_block<B: BlockInput>(
 /// Differences from [`validate_block`]:
 /// - Returns the replay-derived [`StateUpdates`] (the net `{key ↦ (old, new)}` map between the
 ///   block's pre- and post-states); **no post state root is computed or checked** — the caller owns
-///   that comparison.
+///   that comparison. The map carries account and storage records only: newly deployed bytecode is
+///   not derivable from it, so a changeset comparison does not cover the embedder's `codes` and
+///   bytecode integrity must be enforced at ingest.
 /// - `options.expected_pre_state_root`, when provided, is checked against the witness's own state
 ///   root before any other work, returning [`ValidationError::PreStateRootMismatch`] on divergence.
 ///   This anchors the witness to the canonical parent block.
@@ -739,36 +798,16 @@ pub fn validate_block_updates<B: BlockInput>(
         }
     }
 
-    // Create external environment oracle from salt witness
-    let ext_env = WitnessExternalEnv::new(&salt_witness, header.number)
-        .map_err(ValidationError::EnvOracleConstructionFailed)?;
-
-    // Verify witness proof against the current state root
-    #[cfg(feature = "std")]
-    let start = Instant::now();
-    let witness = Witness::from(salt_witness);
-    witness.verify().map_err(ValidationError::WitnessVerificationFailed)?;
-    #[cfg(feature = "std")]
-    let witness_verification_time = start.elapsed().as_secs_f64();
-    #[cfg(not(feature = "std"))]
-    let witness_verification_time = 0.0_f64; // no_std: timing unavailable
-
-    // Replay block transactions
-    #[cfg(feature = "std")]
-    let start = Instant::now();
-    let witness_db = WitnessDatabase { header, witness: &witness, contracts };
-    let (accounts, output) = replay_block(
-        chain_spec,
-        block,
-        &witness_db,
-        ext_env,
-        #[cfg(feature = "std")]
-        writer,
-    )?;
-    #[cfg(feature = "std")]
-    let block_replay_time = start.elapsed().as_secs_f64();
-    #[cfg(not(feature = "std"))]
-    let block_replay_time = 0.0_f64; // no_std: timing unavailable
+    // Verify the witness proof and replay the block's transactions over it
+    let VerifiedReplay { witness, accounts, output, witness_verification_time, block_replay_time } =
+        verify_and_replay(
+            chain_spec,
+            block,
+            salt_witness,
+            contracts,
+            #[cfg(feature = "std")]
+            writer,
+        )?;
 
     // Check the header's claims (withdrawals root, receipts root, logs bloom, gas used)
     // before the more expensive state-update derivation.
@@ -797,6 +836,7 @@ pub fn validate_block_updates<B: BlockInput>(
 
 #[cfg(test)]
 mod tests {
+    use salt::METADATA_KEYS_RANGE;
     use stateless_test_utils::{fixtures::TestFixtures, logging::init_test_logging};
 
     use super::*;
@@ -819,6 +859,22 @@ mod tests {
             #[cfg(feature = "std")]
             None,
         )
+    }
+
+    /// The fixture witness for `hash` with one byte of a witnessed (non-metadata) value
+    /// flipped, leaving the `key_len | value_len | key | value` structure intact so nothing
+    /// short of the proof check can notice.
+    fn tampered_witness(fx: &TestFixtures, hash: B256) -> SaltWitness {
+        let mut salt_witness = fx.salt_witnesses[&hash].clone();
+        let value = salt_witness
+            .kvs
+            .iter_mut()
+            .filter(|(key, _)| !METADATA_KEYS_RANGE.contains(key))
+            .find_map(|(_, value)| value.as_mut().filter(|v| !v.value().is_empty()))
+            .expect("fixture witness must hold a non-metadata value");
+        let first_value_byte = 2 + value.data[0] as usize;
+        value.data[first_value_byte] ^= 0x01;
+        salt_witness
     }
 
     /// The first paired fixture block with its transactions stripped down to hashes only.
@@ -973,13 +1029,13 @@ mod tests {
             anchored += 1;
 
             let parent_root = parent.header.inner.state_root;
-            let anchored = ValidationOptions { expected_pre_state_root: Some(parent_root) };
-            run_updates(fx, &chain_spec, block, hash, anchored).unwrap_or_else(|e| {
+            let options = ValidationOptions::default().with_expected_pre_state_root(parent_root);
+            run_updates(fx, &chain_spec, block, hash, options).unwrap_or_else(|e| {
                 panic!("anchored validation failed for {number} ({hash}): {e:?}")
             });
 
             let bogus = B256::repeat_byte(0xAB);
-            let mismatched = ValidationOptions { expected_pre_state_root: Some(bogus) };
+            let mismatched = ValidationOptions::default().with_expected_pre_state_root(bogus);
             let err = run_updates(fx, &chain_spec, block, hash, mismatched).unwrap_err();
             match err {
                 ValidationError::PreStateRootMismatch { expected, actual } => {
@@ -1003,5 +1059,41 @@ mod tests {
         let err =
             run_updates(fx, &chain_spec, &block, hash, ValidationOptions::default()).unwrap_err();
         assert!(matches!(err, ValidationError::BlockIncomplete), "{err:?}");
+    }
+
+    /// Corrupting a single witnessed value must fail both entry points with
+    /// `WitnessVerificationFailed` — the IPA proof check is unconditional, with no knob to
+    /// skip it.
+    #[test]
+    fn tampered_witness_fails_proof_verification() {
+        let fx = TestFixtures::mainnet_shared();
+        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
+        let (_, hash) = *fx.paired_blocks().first().expect("paired mainnet fixtures");
+        let block = &fx.blocks[&hash];
+
+        let err = validate_block_updates(
+            &chain_spec,
+            block,
+            tampered_witness(fx, hash),
+            fx.mpt_witness(&hash),
+            &fx.contracts,
+            ValidationOptions::default(),
+            #[cfg(feature = "std")]
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ValidationError::WitnessVerificationFailed(_)), "{err:?}");
+
+        let err = validate_block(
+            &chain_spec,
+            block,
+            tampered_witness(fx, hash),
+            fx.mpt_witness(&hash),
+            &fx.contracts,
+            #[cfg(feature = "std")]
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ValidationError::WitnessVerificationFailed(_)), "{err:?}");
     }
 }
