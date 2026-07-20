@@ -10,8 +10,6 @@
 //!   transaction replay, and state root comparison
 //! - [`validate_block_updates`]: Variant returning the replay-derived SALT state updates for
 //!   embedders that compare against an independently verified per-block changeset
-//! - [`validate_block_updates_light`]: The same over a zero-validation [`LightWitness`] — no curve
-//!   point is ever constructed on the whole decode + replay path
 //! - [`create_evm_env`]: Creates EVM execution environment from block header and chain
 //!   specification
 //! - [`replay_block`]: Replays block transactions to compute state changes
@@ -61,10 +59,7 @@ use revm::{
     primitives::{B256, KECCAK_EMPTY, U256},
     state::Bytecode,
 };
-use salt::{
-    EphemeralSaltState, SaltValue, SaltWitness, StateRoot, StateUpdates, Witness,
-    traits::StateReader,
-};
+use salt::{EphemeralSaltState, SaltValue, SaltWitness, StateRoot, StateUpdates, Witness};
 use thiserror::Error;
 use tracing::debug;
 
@@ -72,7 +67,6 @@ use crate::{
     chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec},
     data_types::{Account, PlainKey, PlainValue},
     evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv},
-    light_witness::{LightWitness, LightWitnessError, LightWitnessExecutor},
     withdrawals::{self, ADDRESS_L2_TO_L1_MESSAGE_PASSER, MptWitness},
 };
 
@@ -96,9 +90,6 @@ pub enum ValidationError {
 
     #[error("Failed to update salt state: {0}")]
     StateUpdateFailed(#[source] salt::SaltError),
-
-    #[error("Failed to update salt state over a light witness: {0}")]
-    LightStateUpdateFailed(#[source] LightWitnessError),
 
     #[error("Failed to update salt trie: {0}")]
     TrieUpdateFailed(#[source] salt::SaltError),
@@ -187,35 +178,24 @@ pub struct ValidationStats {
     /// Time spent updating SALT state (seconds; `0.0` in `no_std` builds).
     ///
     /// In [`validate_block`] this covers deriving the state updates **and** the SALT trie root
-    /// update; in [`validate_block_updates`] / [`validate_block_updates_light`] it covers only
-    /// the state-update derivation (no trie math happens there).
+    /// update; in [`validate_block_updates`] it covers only the state-update derivation (no
+    /// trie math happens there).
     pub salt_update_time: f64,
 }
 
 /// Caller policy for [`validate_block_updates`]: how the witness is bound to the canonical
 /// chain before the derived updates are handed back.
 ///
-/// Both knobs are facets of that one trust decision, and all four combinations are meaningful.
-/// `Default` is the strictest mode (verify the proof, no anchor); embedders that compare the
-/// returned updates against an independently verified changeset typically disable
-/// `verify_witness` and anchor the witness to the parent header instead.
-#[derive(Debug, Clone)]
+/// The witness IPA proof is always verified; the anchor is an *additional* binding. `Default`
+/// performs no anchoring; embedders that compare the returned updates against an independently
+/// verified changeset typically anchor the witness to the parent header.
+#[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct ValidationOptions {
-    /// Verify the witness's IPA proof — the dominant cryptographic cost — before replay.
-    /// When `false`, the caller owns the binding of the witness to the chain; see
-    /// [`validate_block_updates`].
-    pub verify_witness: bool,
     /// When set, require the witness's own state root to equal this value (the parent block's
     /// post state root) before any other work, failing with
     /// [`ValidationError::PreStateRootMismatch`] otherwise.
     pub expected_pre_state_root: Option<B256>,
-}
-
-impl Default for ValidationOptions {
-    fn default() -> Self {
-        Self { verify_witness: true, expected_pre_state_root: None }
-    }
 }
 
 /// Creates an EVM execution environment from a block header and chain specification.
@@ -502,15 +482,10 @@ fn withdrawal_storage(accounts: &HashMap<Address, BundleAccount>) -> B256Map<U25
 ///
 /// The result is the net `{key ↦ (old, new)}` map between the block's pre- and post-states —
 /// the same map the SALT trie update consumes and the sequencer's `SaltDeltas` are derived from.
-///
-/// Generic over the witness store: `salt::Witness` on the proof-carrying paths
-/// ([`validate_block`] / [`validate_block_updates`]) and [`LightWitnessExecutor`] on the
-/// zero-validation path ([`validate_block_updates_light`]); callers map the store error into
-/// their [`ValidationError`] variant.
-fn derive_state_updates<W: StateReader>(
-    witness: &W,
+fn derive_state_updates(
+    witness: &Witness,
     accounts: HashMap<Address, BundleAccount>,
-) -> Result<StateUpdates, W::Error> {
+) -> Result<StateUpdates, ValidationError> {
     // Flatten Revm's BundleAccount format into plain key-value pairs
     let mut kv_updates: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
     for (address, bundle_account) in accounts {
@@ -563,7 +538,11 @@ fn derive_state_updates<W: StateReader>(
             inserts_or_deletes.insert(plain_key, opt_plain_value);
         }
     }
-    state_updates.merge(witness_state.update_fin(&inserts_or_deletes)?);
+    state_updates.merge(
+        witness_state
+            .update_fin(&inserts_or_deletes)
+            .map_err(ValidationError::StateUpdateFailed)?,
+    );
 
     Ok(state_updates)
 }
@@ -607,75 +586,6 @@ fn verify_replay_outputs(
     }
 
     Ok(())
-}
-
-/// Shared tail of [`validate_block_updates`] / [`validate_block_updates_light`]: replays the
-/// block over the given witness store, verifies the replay outputs against the header
-/// ([`verify_replay_outputs`]), and derives the net SALT state updates.
-///
-/// `witness_verification_time` is whatever the caller spent verifying the witness (`0.0` when
-/// nothing was verified) and is passed through into the returned [`ValidationStats`];
-/// `map_store_err` lifts the store error into the caller's [`ValidationError`] variant, as on
-/// [`derive_state_updates`].
-#[allow(clippy::too_many_arguments)] // private seam; its surface is the entry points' union
-fn replay_and_derive_updates<B, W>(
-    chain_spec: &ChainSpec,
-    block: &B,
-    witness: &W,
-    ext_env: WitnessExternalEnv,
-    mpt_witness: MptWitness,
-    contracts: &HashMap<B256, Bytecode>,
-    witness_verification_time: f64,
-    map_store_err: impl FnOnce(W::Error) -> ValidationError,
-    #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
-) -> Result<(StateUpdates, ValidationStats), ValidationError>
-where
-    B: BlockInput,
-    W: StateReader + Debug,
-    W::Error: core::fmt::Display,
-{
-    let header = block.consensus_header();
-
-    // Replay block transactions
-    #[cfg(feature = "std")]
-    let start = Instant::now();
-    let witness_db = WitnessDatabase { header, witness, contracts };
-    let (accounts, output) = replay_block(
-        chain_spec,
-        block,
-        &witness_db,
-        ext_env,
-        #[cfg(feature = "std")]
-        writer,
-    )?;
-    #[cfg(feature = "std")]
-    let block_replay_time = start.elapsed().as_secs_f64();
-    #[cfg(not(feature = "std"))]
-    let block_replay_time = 0.0_f64; // no_std: timing unavailable
-
-    // Check the header's claims (withdrawals root, receipts root, logs bloom, gas used)
-    // before the more expensive state-update derivation.
-    verify_replay_outputs(header, &output, withdrawal_storage(&accounts), &mpt_witness)?;
-
-    // Derive the net SALT state updates from the replayed accounts
-    #[cfg(feature = "std")]
-    let start = Instant::now();
-    let state_updates = derive_state_updates(witness, accounts).map_err(map_store_err)?;
-    #[cfg(feature = "std")]
-    let salt_update_time = start.elapsed().as_secs_f64();
-    #[cfg(not(feature = "std"))]
-    let salt_update_time = 0.0_f64; // no_std: timing unavailable
-
-    Ok((
-        state_updates,
-        ValidationStats {
-            state_reads: output.state_reads,
-            state_writes: output.state_writes,
-            witness_verification_time,
-            block_replay_time,
-            salt_update_time,
-        },
-    ))
 }
 
 /// Validates a block by creating a witness, replaying transactions, and comparing state roots.
@@ -750,8 +660,7 @@ pub fn validate_block<B: BlockInput>(
     let withdrawal_storage = withdrawal_storage(&accounts);
 
     // Derive the net SALT state updates from the replayed accounts
-    let state_updates =
-        derive_state_updates(&witness, accounts).map_err(ValidationError::StateUpdateFailed)?;
+    let state_updates = derive_state_updates(&witness, accounts)?;
 
     // Update the state root
     let (state_root, _) = StateRoot::new(&witness)
@@ -796,18 +705,13 @@ pub fn validate_block<B: BlockInput>(
 /// - Returns the replay-derived [`StateUpdates`] (the net `{key ↦ (old, new)}` map between the
 ///   block's pre- and post-states); **no post state root is computed or checked** — the caller owns
 ///   that comparison.
-/// - How the witness is bound to the canonical chain is caller policy ([`ValidationOptions`]).
-///   `verify_witness = false` skips the witness IPA proof verification entirely (the dominant
-///   cryptographic cost). The caller then relies on its own binding of the witness to the chain,
-///   e.g. anchoring `expected_pre_state_root` to the parent header and comparing the derived
-///   updates against a changeset that is hash-committed in the block header.
-/// - `expected_pre_state_root`, when provided, is checked against the witness's own state root
-///   before any other work, returning [`ValidationError::PreStateRootMismatch`] on divergence. This
-///   anchors the (possibly unverified) witness to the canonical parent block.
+/// - `options.expected_pre_state_root`, when provided, is checked against the witness's own state
+///   root before any other work, returning [`ValidationError::PreStateRootMismatch`] on divergence.
+///   This anchors the witness to the canonical parent block.
 ///
+/// The witness IPA proof is always verified before replay, exactly as in [`validate_block`].
 /// On success, [`ValidationStats::salt_update_time`] holds the state-update derivation time
-/// (there is no trie update here), and [`ValidationStats::witness_verification_time`] is `0.0`
-/// when `verify_witness` is `false`.
+/// (there is no trie update here).
 pub fn validate_block_updates<B: BlockInput>(
     chain_spec: &ChainSpec,
     block: &B,
@@ -822,6 +726,7 @@ pub fn validate_block_updates<B: BlockInput>(
     if !block.is_complete() {
         return Err(ValidationError::BlockIncomplete);
     }
+    let header = block.consensus_header();
 
     // Anchor the witness to the canonical chain before any other work: its internal state root
     // must be the parent block's post state root.
@@ -835,90 +740,59 @@ pub fn validate_block_updates<B: BlockInput>(
     }
 
     // Create external environment oracle from salt witness
-    let ext_env = WitnessExternalEnv::new(&salt_witness, block.consensus_header().number)
+    let ext_env = WitnessExternalEnv::new(&salt_witness, header.number)
         .map_err(ValidationError::EnvOracleConstructionFailed)?;
 
-    // Verify witness proof against the current state root (optional)
+    // Verify witness proof against the current state root
     #[cfg(feature = "std")]
     let start = Instant::now();
     let witness = Witness::from(salt_witness);
-    if options.verify_witness {
-        witness.verify().map_err(ValidationError::WitnessVerificationFailed)?;
-    }
+    witness.verify().map_err(ValidationError::WitnessVerificationFailed)?;
     #[cfg(feature = "std")]
-    let witness_verification_time =
-        if options.verify_witness { start.elapsed().as_secs_f64() } else { 0.0 };
+    let witness_verification_time = start.elapsed().as_secs_f64();
     #[cfg(not(feature = "std"))]
     let witness_verification_time = 0.0_f64; // no_std: timing unavailable
 
-    replay_and_derive_updates(
+    // Replay block transactions
+    #[cfg(feature = "std")]
+    let start = Instant::now();
+    let witness_db = WitnessDatabase { header, witness: &witness, contracts };
+    let (accounts, output) = replay_block(
         chain_spec,
         block,
-        &witness,
+        &witness_db,
         ext_env,
-        mpt_witness,
-        contracts,
-        witness_verification_time,
-        ValidationError::StateUpdateFailed,
         #[cfg(feature = "std")]
         writer,
-    )
-}
+    )?;
+    #[cfg(feature = "std")]
+    let block_replay_time = start.elapsed().as_secs_f64();
+    #[cfg(not(feature = "std"))]
+    let block_replay_time = 0.0_f64; // no_std: timing unavailable
 
-/// [`validate_block_updates`] over a zero-validation [`LightWitness`] — the cheapest
-/// witness-based replay path.
-///
-/// Pairs with the light witness decode ([`LightWitnessFromSalt`](crate::LightWitnessFromSalt) /
-/// `RpcClient::get_witness_light*`): the full `SaltWitness` decode spends orders of magnitude
-/// more CPU constructing and validating one curve point per parent commitment, which the
-/// proof-skipping mode never uses. This entry point accepts the light form directly, so no
-/// elliptic-curve object is ever built anywhere on the path.
-///
-/// Differences from [`validate_block_updates`] (hence no [`ValidationOptions`] parameter):
-/// - No IPA verification is *possible* (the light witness carries no proof material);
-///   [`ValidationStats::witness_verification_time`] is always `0.0`.
-/// - No pre-state-root anchor is *possible* either (the state root is derived from the root
-///   commitment, which the light decode discards). The caller's trust chain must instead run
-///   entirely through the returned updates: comparing them against a changeset that is
-///   hash-committed in the signed block header binds the replay — and therefore the witness content
-///   it consumed — to the canonical chain.
-///
-/// The replayed header fields (withdrawals root, receipts root, logs bloom, gas used) are
-/// checked exactly as in [`validate_block_updates`].
-pub fn validate_block_updates_light<B: BlockInput>(
-    chain_spec: &ChainSpec,
-    block: &B,
-    light_witness: LightWitness,
-    mpt_witness: MptWitness,
-    contracts: &HashMap<B256, Bytecode>,
-    #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
-) -> Result<(StateUpdates, ValidationStats), ValidationError> {
-    // A block carrying only transaction hashes can't be replayed — fail fast.
-    // `replay_block` re-checks for direct callers.
-    if !block.is_complete() {
-        return Err(ValidationError::BlockIncomplete);
-    }
+    // Check the header's claims (withdrawals root, receipts root, logs bloom, gas used)
+    // before the more expensive state-update derivation.
+    verify_replay_outputs(header, &output, withdrawal_storage(&accounts), &mpt_witness)?;
 
-    // Create external environment oracle from the light witness
-    let ext_env =
-        WitnessExternalEnv::from_light_witness(&light_witness, block.consensus_header().number)
-            .map_err(ValidationError::EnvOracleConstructionFailed)?;
+    // Derive the net SALT state updates from the replayed accounts
+    #[cfg(feature = "std")]
+    let start = Instant::now();
+    let state_updates = derive_state_updates(&witness, accounts)?;
+    #[cfg(feature = "std")]
+    let salt_update_time = start.elapsed().as_secs_f64();
+    #[cfg(not(feature = "std"))]
+    let salt_update_time = 0.0_f64; // no_std: timing unavailable
 
-    // Replay over the light executor (plain-key lookup table + kvs); nothing is verifiable,
-    // so the verification time is a hard `0.0`.
-    let executor = LightWitnessExecutor::from(light_witness);
-    replay_and_derive_updates(
-        chain_spec,
-        block,
-        &executor,
-        ext_env,
-        mpt_witness,
-        contracts,
-        0.0,
-        ValidationError::LightStateUpdateFailed,
-        #[cfg(feature = "std")]
-        writer,
-    )
+    Ok((
+        state_updates,
+        ValidationStats {
+            state_reads: output.state_reads,
+            state_writes: output.state_writes,
+            witness_verification_time,
+            block_replay_time,
+            salt_update_time,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -1082,23 +956,6 @@ mod tests {
         }
     }
 
-    /// With `verify_witness = false` the IPA proof check is skipped: validation still passes on
-    /// valid fixtures and the verification time reads `0.0` ("not measured").
-    #[test]
-    fn validate_block_updates_skips_verification() {
-        let fx = TestFixtures::mainnet_shared();
-        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
-        for (number, hash) in fx.paired_blocks() {
-            let options =
-                ValidationOptions { verify_witness: false, expected_pre_state_root: None };
-            let (_, stats) = run_updates(fx, &chain_spec, &fx.blocks[&hash], hash, options)
-                .unwrap_or_else(|e| {
-                    panic!("unverified validation failed for {number} ({hash}): {e:?}")
-                });
-            assert_eq!(stats.witness_verification_time, 0.0, "skipped verify must not be timed");
-        }
-    }
-
     /// The pre-state anchor must accept the parent header's state root and reject any other
     /// value with `PreStateRootMismatch` (checked before any replay work).
     #[test]
@@ -1116,17 +973,13 @@ mod tests {
             anchored += 1;
 
             let parent_root = parent.header.inner.state_root;
-            let anchored = ValidationOptions {
-                verify_witness: false,
-                expected_pre_state_root: Some(parent_root),
-            };
+            let anchored = ValidationOptions { expected_pre_state_root: Some(parent_root) };
             run_updates(fx, &chain_spec, block, hash, anchored).unwrap_or_else(|e| {
                 panic!("anchored validation failed for {number} ({hash}): {e:?}")
             });
 
             let bogus = B256::repeat_byte(0xAB);
-            let mismatched =
-                ValidationOptions { verify_witness: false, expected_pre_state_root: Some(bogus) };
+            let mismatched = ValidationOptions { expected_pre_state_root: Some(bogus) };
             let err = run_updates(fx, &chain_spec, block, hash, mismatched).unwrap_err();
             match err {
                 ValidationError::PreStateRootMismatch { expected, actual } => {
@@ -1149,70 +1002,6 @@ mod tests {
 
         let err =
             run_updates(fx, &chain_spec, &block, hash, ValidationOptions::default()).unwrap_err();
-        assert!(matches!(err, ValidationError::BlockIncomplete), "{err:?}");
-    }
-
-    /// `validate_block_updates_light` over the zero-validation [`LightWitness`] must reproduce,
-    /// for every paired mainnet fixture, exactly the `StateUpdates` the full-witness path
-    /// derives — and those updates must still yield the header's state root through the SALT
-    /// trie update. (That `LightWitness::from` equals the wire-bytes decode the RPC client
-    /// consumes is locked separately by
-    /// `light_witness::tests::light_decodes_from_full_witness_bytes`.)
-    #[test]
-    fn validate_block_updates_light_matches_full_path() {
-        let fx = TestFixtures::mainnet_shared();
-        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
-        let paired = fx.paired_blocks();
-        assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
-        for (number, hash) in paired {
-            let block = &fx.blocks[&hash];
-            let salt_witness = &fx.salt_witnesses[&hash];
-
-            let (light_updates, stats) = validate_block_updates_light(
-                &chain_spec,
-                block,
-                LightWitness::from(salt_witness),
-                fx.mpt_witness(&hash),
-                &fx.contracts,
-                #[cfg(feature = "std")]
-                None,
-            )
-            .unwrap_or_else(|e| panic!("light validation failed for {number} ({hash}): {e:?}"));
-            assert_eq!(stats.witness_verification_time, 0.0, "light path never verifies");
-
-            let unverified =
-                ValidationOptions { verify_witness: false, expected_pre_state_root: None };
-            let (full_updates, _) = run_updates(fx, &chain_spec, block, hash, unverified)
-                .unwrap_or_else(|e| {
-                    panic!("full-path validation failed for {number} ({hash}): {e:?}")
-                });
-            assert_eq!(
-                light_updates.data, full_updates.data,
-                "light and full paths must derive identical updates for {number} ({hash})"
-            );
-
-            // Cross-check: the light-derived updates still reproduce the header state root.
-            assert_updates_reproduce_state_root(salt_witness, &light_updates, block, number, hash);
-        }
-    }
-
-    /// The light entry point rejects a hashes-only block before any witness work.
-    #[test]
-    fn validate_block_updates_light_rejects_hashes_only_block() {
-        let fx = TestFixtures::mainnet_shared();
-        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
-        let (hash, block) = hashes_only_block(fx);
-
-        let err = validate_block_updates_light(
-            &chain_spec,
-            &block,
-            LightWitness::from(&fx.salt_witnesses[&hash]),
-            fx.mpt_witness(&hash),
-            &fx.contracts,
-            #[cfg(feature = "std")]
-            None,
-        )
-        .unwrap_err();
         assert!(matches!(err, ValidationError::BlockIncomplete), "{err:?}");
     }
 }
