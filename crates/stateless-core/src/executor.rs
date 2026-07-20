@@ -187,21 +187,15 @@ pub struct ValidationStats {
 /// chain before the derived updates are handed back.
 ///
 /// Both witness proofs are always verified (the SALT witness's IPA proof, the MPT witness's
-/// Merkle proof); the anchors are an *additional* binding. `Default` performs no anchoring;
-/// embedders that compare the returned updates against an independently verified changeset
-/// typically anchor both witnesses to the parent header — the same
-/// `(state root, withdrawals root)` pair the standalone pipeline's continuity check enforces
-/// between consecutive blocks.
+/// Merkle proof); the anchor is an *additional* binding. `Default` performs no anchoring.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct ValidationOptions {
-    /// When set, require the SALT witness's own state root to equal this value (the parent
-    /// block's post state root) before any other work, failing with
-    /// [`ValidationError::PreStateRootMismatch`] otherwise.
-    pub expected_pre_state_root: Option<B256>,
-    /// When set, require the MPT witness's own storage root (the withdrawal contract's
-    /// pre-state) to equal this value (the parent block's post withdrawals root) before any
-    /// other work, failing with [`ValidationError::PreWithdrawalsRootMismatch`] otherwise.
+    /// When set, require each witness's own pre-root to equal the parent block's matching
+    /// post root before any other work: the SALT witness's state root against
+    /// [`ParentAnchor::state_root`] (failing with [`ValidationError::PreStateRootMismatch`]),
+    /// then the MPT witness's storage root against [`ParentAnchor::withdrawals_root`]
+    /// (failing with [`ValidationError::PreWithdrawalsRootMismatch`]).
     ///
     /// This is the only check that binds the MPT witness's *pre*-state to the chain:
     /// [`MptWitness::verify`] proves the witness against its own claimed `storage_root` and
@@ -210,26 +204,34 @@ pub struct ValidationOptions {
     /// this block rewrites converges to the correct post root and passes verify. The anchor
     /// also fails fast, before any replay work, with the precise pre-root diagnosis rather
     /// than a post-root error that reads like a replay fault.
-    pub expected_pre_withdrawals_root: Option<B256>,
+    pub parent_anchor: Option<ParentAnchor>,
+}
+
+/// The parent block's post-root pair that [`validate_block_updates`] anchors the witnesses
+/// to — the same `(state root, withdrawals root)` pair the standalone pipeline's continuity
+/// check enforces between consecutive blocks.
+///
+/// The pair is anchored atomically: real callers take both roots from the same parent header
+/// (or stored block meta) and never hold one without the other, so there is deliberately no
+/// way to anchor half of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParentAnchor {
+    /// The parent block's post state root, matched against the SALT witness's own root.
+    pub state_root: B256,
+    /// The parent block's post withdrawals root, matched against the MPT witness's storage
+    /// root.
+    pub withdrawals_root: B256,
 }
 
 impl ValidationOptions {
-    /// Anchors the SALT witness to `root`, the parent block's post state root
-    /// (see [`Self::expected_pre_state_root`]).
+    /// Anchors both witnesses to the parent block's post-root pair
+    /// (see [`Self::parent_anchor`]).
     ///
     /// The struct is `#[non_exhaustive]`, so out-of-crate callers build it as
-    /// `ValidationOptions::default().with_expected_pre_state_root(root)`.
+    /// `ValidationOptions::default().with_parent_anchor(state_root, withdrawals_root)`.
     #[must_use]
-    pub fn with_expected_pre_state_root(mut self, root: B256) -> Self {
-        self.expected_pre_state_root = Some(root);
-        self
-    }
-
-    /// Anchors the MPT witness to `root`, the parent block's post withdrawals root
-    /// (see [`Self::expected_pre_withdrawals_root`]).
-    #[must_use]
-    pub fn with_expected_pre_withdrawals_root(mut self, root: B256) -> Self {
-        self.expected_pre_withdrawals_root = Some(root);
+    pub fn with_parent_anchor(mut self, state_root: B256, withdrawals_root: B256) -> Self {
+        self.parent_anchor = Some(ParentAnchor { state_root, withdrawals_root });
         self
     }
 }
@@ -624,17 +626,18 @@ fn verify_replay_outputs(
     Ok(())
 }
 
-/// Runs `f` and returns its result together with the elapsed wall-clock seconds — `0.0` in
-/// `no_std` builds, where no monotonic clock is available ("not measured").
-fn timed<T>(f: impl FnOnce() -> T) -> (T, f64) {
+/// Runs the fallible `f` and returns its success value together with the elapsed wall-clock
+/// seconds — `0.0` in `no_std` builds, where no monotonic clock is available ("not
+/// measured"). On error the elapsed time is discarded with the stage's result.
+fn timed<T, E>(f: impl FnOnce() -> Result<T, E>) -> Result<(T, f64), E> {
     #[cfg(feature = "std")]
     let start = Instant::now();
-    let result = f();
+    let result = f()?;
     #[cfg(feature = "std")]
     let elapsed = start.elapsed().as_secs_f64();
     #[cfg(not(feature = "std"))]
     let elapsed = 0.0_f64;
-    (result, elapsed)
+    Ok((result, elapsed))
 }
 
 /// Output of [`verify_and_replay`], the stages shared by [`validate_block`] and
@@ -668,15 +671,14 @@ fn verify_and_replay<B: BlockInput>(
         .map_err(ValidationError::EnvOracleConstructionFailed)?;
 
     // Verify witness proof against its internal state root
-    let (verified, witness_verification_time) = timed(|| -> Result<_, ValidationError> {
+    let (witness, witness_verification_time) = timed(|| {
         let witness = Witness::from(salt_witness);
         witness.verify().map_err(ValidationError::WitnessVerificationFailed)?;
-        Ok(witness)
-    });
-    let witness = verified?;
+        Ok::<_, ValidationError>(witness)
+    })?;
 
     // Replay block transactions
-    let (replayed, block_replay_time) = timed(|| {
+    let ((accounts, output), block_replay_time) = timed(|| {
         let witness_db = WitnessDatabase { header, witness: &witness, contracts };
         replay_block(
             chain_spec,
@@ -686,8 +688,7 @@ fn verify_and_replay<B: BlockInput>(
             #[cfg(feature = "std")]
             writer,
         )
-    });
-    let (accounts, output) = replayed?;
+    })?;
 
     let stats = ValidationStats {
         state_reads: output.state_reads,
@@ -753,14 +754,13 @@ pub fn validate_block<B: BlockInput>(
 
     // Derive the net SALT state updates from the replayed accounts and roll them into the
     // trie to compute the post state root
-    let (updated, salt_update_time) = timed(|| -> Result<_, ValidationError> {
+    let (state_root, salt_update_time) = timed(|| {
         let state_updates = derive_state_updates(&witness, accounts)?;
         let (state_root, _) = StateRoot::new(&witness)
             .update_fin(&state_updates)
             .map_err(ValidationError::TrieUpdateFailed)?;
-        Ok(state_root)
-    });
-    let state_root = updated?;
+        Ok::<_, ValidationError>(state_root)
+    })?;
     stats.salt_update_time = salt_update_time;
 
     // Verify the replayed outputs against the header's claims
@@ -792,12 +792,9 @@ pub fn validate_block<B: BlockInput>(
 ///   that comparison. The map carries account and storage records only: newly deployed bytecode is
 ///   not derivable from it, so a changeset comparison does not cover the embedder's `codes` and
 ///   bytecode integrity must be enforced at ingest.
-/// - The [`ValidationOptions`] anchors, when provided, are checked against the witnesses' own
-///   pre-roots before any other work: `expected_pre_state_root` against the SALT witness's state
-///   root ([`ValidationError::PreStateRootMismatch`]) and `expected_pre_withdrawals_root` against
-///   the MPT witness's storage root ([`ValidationError::PreWithdrawalsRootMismatch`]). Together
-///   they anchor both witnesses to the canonical parent block — the same `(state root, withdrawals
-///   root)` pair the standalone pipeline's continuity check enforces.
+/// - [`ValidationOptions::parent_anchor`], when provided, is checked against both witnesses' own
+///   pre-roots before any other work, anchoring them to the canonical parent block — see its field
+///   docs for what each half binds and which error it raises.
 ///
 /// Both witness proofs (the SALT witness's IPA proof before replay, the MPT witness's Merkle
 /// proof on the replay outputs) are always verified, exactly as in [`validate_block`].
@@ -819,21 +816,22 @@ pub fn validate_block_updates<B: BlockInput>(
     }
     let header = block.consensus_header();
 
-    // Anchor the witnesses to the canonical chain before any other work: the SALT witness's
-    // internal state root must be the parent block's post state root, and the MPT witness's
-    // storage root the parent's post withdrawals root.
-    if let Some(expected) = options.expected_pre_state_root {
+    // Anchor both witnesses to the canonical parent block before any other work.
+    if let Some(anchor) = options.parent_anchor {
         let actual = B256::from(
             salt_witness.state_root().map_err(ValidationError::WitnessVerificationFailed)?,
         );
-        if actual != expected {
-            return Err(ValidationError::PreStateRootMismatch { expected, actual });
+        if actual != anchor.state_root {
+            return Err(ValidationError::PreStateRootMismatch {
+                expected: anchor.state_root,
+                actual,
+            });
         }
-    }
-    if let Some(expected) = options.expected_pre_withdrawals_root {
-        let actual = mpt_witness.storage_root;
-        if actual != expected {
-            return Err(ValidationError::PreWithdrawalsRootMismatch { expected, actual });
+        if mpt_witness.storage_root != anchor.withdrawals_root {
+            return Err(ValidationError::PreWithdrawalsRootMismatch {
+                expected: anchor.withdrawals_root,
+                actual: mpt_witness.storage_root,
+            });
         }
     }
 
@@ -852,8 +850,7 @@ pub fn validate_block_updates<B: BlockInput>(
     verify_replay_outputs(header, &output, withdrawal_storage(&accounts), &mpt_witness)?;
 
     // Derive the net SALT state updates from the replayed accounts
-    let (derived, salt_update_time) = timed(|| derive_state_updates(&witness, accounts));
-    let state_updates = derived?;
+    let (state_updates, salt_update_time) = timed(|| derive_state_updates(&witness, accounts))?;
     stats.salt_update_time = salt_update_time;
 
     Ok((state_updates, stats))
@@ -861,22 +858,29 @@ pub fn validate_block_updates<B: BlockInput>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use salt::METADATA_KEYS_RANGE;
     use stateless_test_utils::{fixtures::TestFixtures, logging::init_test_logging};
 
     use super::*;
 
+    /// Chain spec for the mainnet fixtures, parsed once per process — the per-test
+    /// counterpart of [`TestFixtures::mainnet_shared`].
+    static CHAIN_SPEC: LazyLock<ChainSpec> = LazyLock::new(|| {
+        ChainSpec::from_genesis(TestFixtures::mainnet_shared().load_genesis().unwrap())
+    });
+
     /// Runs [`validate_block_updates`] for one fixture block over the given witness.
     fn run_updates(
         fx: &TestFixtures,
-        chain_spec: &ChainSpec,
         block: &Block<OpTransaction>,
         salt_witness: SaltWitness,
         hash: B256,
         options: ValidationOptions,
     ) -> Result<(StateUpdates, ValidationStats), ValidationError> {
         validate_block_updates(
-            chain_spec,
+            &CHAIN_SPEC,
             block,
             salt_witness,
             fx.mpt_witness(&hash),
@@ -890,13 +894,12 @@ mod tests {
     /// Runs [`validate_block`] for one fixture block over the given witness.
     fn run_block(
         fx: &TestFixtures,
-        chain_spec: &ChainSpec,
         block: &Block<OpTransaction>,
         salt_witness: SaltWitness,
         hash: B256,
     ) -> Result<ValidationStats, ValidationError> {
         validate_block(
-            chain_spec,
+            &CHAIN_SPEC,
             block,
             salt_witness,
             fx.mpt_witness(&hash),
@@ -986,11 +989,9 @@ mod tests {
     #[test]
     fn validate_block_rejects_hashes_only_block() {
         let fx = TestFixtures::mainnet_shared();
-        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
         let (hash, block) = hashes_only_block(fx);
 
-        let err =
-            run_block(fx, &chain_spec, &block, fx.salt_witnesses[&hash].clone(), hash).unwrap_err();
+        let err = run_block(fx, &block, fx.salt_witnesses[&hash].clone(), hash).unwrap_err();
         assert!(matches!(err, ValidationError::BlockIncomplete), "{err:?}");
     }
 
@@ -998,39 +999,42 @@ mod tests {
     fn validate_block_mainnet_fixtures() {
         let _logging = init_test_logging("stateless_core");
         let fx = TestFixtures::mainnet_shared();
-        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
         let paired = fx.paired_blocks();
         assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
         for (number, hash) in paired {
             let block = &fx.blocks[&hash];
-            run_block(fx, &chain_spec, block, fx.salt_witnesses[&hash].clone(), hash)
+            run_block(fx, block, fx.salt_witnesses[&hash].clone(), hash)
                 .unwrap_or_else(|e| panic!("validate_block failed for {number} ({hash}): {e:?}"));
         }
     }
 
-    /// `validate_block_updates` must succeed on every paired mainnet fixture, and the returned
-    /// updates must reproduce the header's state root when fed through the SALT trie update —
-    /// locking its equivalence with the `validate_block` path the helpers were extracted from.
+    /// `validate_block_updates` must succeed on every paired mainnet fixture — anchored to the
+    /// parent whenever it is in the fixture set, the embedder's real call shape — and the
+    /// returned updates must reproduce the header's state root when fed through the SALT trie
+    /// update, locking its equivalence with the `validate_block` path the helpers were
+    /// extracted from.
     #[test]
     fn validate_block_updates_mainnet_fixtures() {
         let _logging = init_test_logging("stateless_core");
         let fx = TestFixtures::mainnet_shared();
-        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
         let paired = fx.paired_blocks();
         assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
         for (number, hash) in paired {
             let block = &fx.blocks[&hash];
-            let (updates, stats) = run_updates(
-                fx,
-                &chain_spec,
-                block,
-                fx.salt_witnesses[&hash].clone(),
-                hash,
-                ValidationOptions::default(),
-            )
-            .unwrap_or_else(|e| {
-                panic!("validate_block_updates failed for {number} ({hash}): {e:?}")
-            });
+            let options = match fx.blocks.get(&block.consensus_header().parent_hash) {
+                Some(parent) => ValidationOptions::default().with_parent_anchor(
+                    parent.header.inner.state_root,
+                    parent.header.inner.withdrawals_root.unwrap_or_else(|| {
+                        panic!("parent of {number} ({hash}) lacks a withdrawals root")
+                    }),
+                ),
+                None => ValidationOptions::default(),
+            };
+            let (updates, stats) =
+                run_updates(fx, block, fx.salt_witnesses[&hash].clone(), hash, options)
+                    .unwrap_or_else(|e| {
+                        panic!("validate_block_updates failed for {number} ({hash}): {e:?}")
+                    });
             // `no_std` builds have no monotonic clock — every timing reads 0.0 ("not measured"),
             // so the timed-verification expectation only holds with `std` enabled.
             assert!(
@@ -1049,142 +1053,81 @@ mod tests {
         }
     }
 
-    /// The pre-state anchor must accept the parent header's state root and reject any other
-    /// value with `PreStateRootMismatch` (checked before any replay work).
+    /// The parent anchor must match the parent header's post-root pair on every paired
+    /// fixture, and reject a mismatch on either half with that half's error — before any
+    /// witness verification or replay work.
     #[test]
-    fn validate_block_updates_anchors_pre_state_root() {
+    fn validate_block_updates_anchors_to_parent() {
         let fx = TestFixtures::mainnet_shared();
-        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
 
-        // Every paired fixture witness must carry its parent header's post state root — the
-        // exact value the anchor compares. Reading the witness root commitment is near-free,
-        // so this covers all blocks without re-running the validations the mainnet-fixtures
-        // sweep already performs.
+        // Every paired fixture witness must carry the parent header's post-root pair — the
+        // exact values the anchor compares. Near-free: no validation runs; the anchored
+        // accept path is exercised by `validate_block_updates_mainnet_fixtures`.
         let mut anchored = None;
         for (number, hash) in fx.paired_blocks() {
             let block = &fx.blocks[&hash];
-            let parent_hash = block.consensus_header().parent_hash;
-            let Some(parent) = fx.blocks.get(&parent_hash) else { continue };
+            let Some(parent) = fx.blocks.get(&block.consensus_header().parent_hash) else {
+                continue;
+            };
 
-            let parent_root = parent.header.inner.state_root;
-            let witness_root = B256::from(fx.salt_witnesses[&hash].state_root().unwrap());
+            let state_root = parent.header.inner.state_root;
+            let withdrawals_root =
+                parent.header.inner.withdrawals_root.unwrap_or_else(|| {
+                    panic!("parent of {number} ({hash}) lacks a withdrawals root")
+                });
             assert_eq!(
-                witness_root, parent_root,
+                B256::from(fx.salt_witnesses[&hash].state_root().unwrap()),
+                state_root,
                 "witness root for {number} ({hash}) must be the parent's post state root"
             );
-            anchored.get_or_insert((hash, parent_root));
+            assert_eq!(
+                fx.mpt_witness::<MptWitness>(&hash).storage_root,
+                withdrawals_root,
+                "MPT witness root for {number} ({hash}) must be the parent's post withdrawals root"
+            );
+            anchored.get_or_insert((hash, state_root, withdrawals_root));
         }
-
-        // Exercise the anchor gate end-to-end on one block: the real parent root passes, a
-        // bogus root fails before any replay work — exactly what an embedder passes in.
-        let Some((hash, parent_root)) = anchored else {
+        let Some((hash, state_root, withdrawals_root)) = anchored else {
             panic!("no fixture block has its parent in the set — anchor untested");
         };
         let block = &fx.blocks[&hash];
-        let witness = fx.salt_witnesses[&hash].clone();
-        let options = ValidationOptions::default().with_expected_pre_state_root(parent_root);
-        run_updates(fx, &chain_spec, block, witness, hash, options)
-            .unwrap_or_else(|e| panic!("anchored validation failed for {hash}: {e:?}"));
 
+        // Reject each mismatched half with its own exactly-field-checked error. The witness
+        // is tampered (it would fail proof verification), so the anchor error surfacing at
+        // all also proves the anchor runs before any proof or replay work — its fail-fast
+        // contract.
         let bogus = B256::repeat_byte(0xAB);
-        let mismatched = ValidationOptions::default().with_expected_pre_state_root(bogus);
-        let witness = fx.salt_witnesses[&hash].clone();
-        let err = run_updates(fx, &chain_spec, block, witness, hash, mismatched).unwrap_err();
+        let options = ValidationOptions::default().with_parent_anchor(bogus, withdrawals_root);
+        let err = run_updates(fx, block, tampered_witness(fx, hash), hash, options).unwrap_err();
         match err {
             ValidationError::PreStateRootMismatch { expected, actual } => {
                 assert_eq!(expected, bogus);
-                assert_eq!(actual, parent_root);
+                assert_eq!(actual, state_root);
             }
             other => panic!("expected PreStateRootMismatch, got {other:?}"),
         }
 
-        // Ordering proof: with a witness that would fail IPA verification, a bogus anchor
-        // must still surface as the anchor error — i.e. the anchor runs before any proof or
-        // replay work, which is its entire fail-fast value.
-        let mismatched = ValidationOptions::default().with_expected_pre_state_root(bogus);
-        let err = run_updates(fx, &chain_spec, block, tampered_witness(fx, hash), hash, mismatched)
-            .unwrap_err();
-        assert!(
-            matches!(err, ValidationError::PreStateRootMismatch { .. }),
-            "anchor must run before witness verification, got {err:?}"
-        );
-    }
-
-    /// The pre-withdrawals anchor must accept the parent header's withdrawals root and reject
-    /// any other value with `PreWithdrawalsRootMismatch` — the second half of the
-    /// `(state root, withdrawals root)` pair anchor mirroring the standalone pipeline's
-    /// continuity check.
-    #[test]
-    fn validate_block_updates_anchors_pre_withdrawals_root() {
-        let fx = TestFixtures::mainnet_shared();
-        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
-
-        // Every paired fixture MPT witness must carry its parent header's post withdrawals
-        // root — the exact value the anchor compares.
-        let mut anchored = None;
-        for (number, hash) in fx.paired_blocks() {
-            let block = &fx.blocks[&hash];
-            let parent_hash = block.consensus_header().parent_hash;
-            let Some(parent) = fx.blocks.get(&parent_hash) else { continue };
-
-            let parent_root =
-                parent.header.inner.withdrawals_root.unwrap_or_else(|| {
-                    panic!("parent of {number} ({hash}) lacks a withdrawals root")
-                });
-            let witness_root = fx.mpt_witness::<MptWitness>(&hash).storage_root;
-            assert_eq!(
-                witness_root, parent_root,
-                "MPT witness root for {number} ({hash}) must be the parent's post withdrawals root"
-            );
-            anchored.get_or_insert((hash, parent_root));
-        }
-
-        // Exercise the gate end-to-end on one block: the real root passes, a bogus one fails
-        // before any replay work.
-        let Some((hash, parent_root)) = anchored else {
-            panic!("no fixture block has its parent in the set — anchor untested");
-        };
-        let block = &fx.blocks[&hash];
-        let witness = fx.salt_witnesses[&hash].clone();
-        let options = ValidationOptions::default().with_expected_pre_withdrawals_root(parent_root);
-        run_updates(fx, &chain_spec, block, witness, hash, options)
-            .unwrap_or_else(|e| panic!("anchored validation failed for {hash}: {e:?}"));
-
-        let bogus = B256::repeat_byte(0xCD);
-        let mismatched = ValidationOptions::default().with_expected_pre_withdrawals_root(bogus);
-        let witness = fx.salt_witnesses[&hash].clone();
-        let err = run_updates(fx, &chain_spec, block, witness, hash, mismatched).unwrap_err();
+        // The matching state half must pass through to the withdrawals check.
+        let options = ValidationOptions::default().with_parent_anchor(state_root, bogus);
+        let err = run_updates(fx, block, tampered_witness(fx, hash), hash, options).unwrap_err();
         match err {
             ValidationError::PreWithdrawalsRootMismatch { expected, actual } => {
                 assert_eq!(expected, bogus);
-                assert_eq!(actual, parent_root);
+                assert_eq!(actual, withdrawals_root);
             }
             other => panic!("expected PreWithdrawalsRootMismatch, got {other:?}"),
         }
-
-        // Ordering proof: with a witness that would fail IPA verification, a bogus anchor
-        // must still surface as the anchor error — i.e. the anchor runs before any proof or
-        // replay work, which is its entire fail-fast value.
-        let mismatched = ValidationOptions::default().with_expected_pre_withdrawals_root(bogus);
-        let err = run_updates(fx, &chain_spec, block, tampered_witness(fx, hash), hash, mismatched)
-            .unwrap_err();
-        assert!(
-            matches!(err, ValidationError::PreWithdrawalsRootMismatch { .. }),
-            "anchor must run before witness verification, got {err:?}"
-        );
     }
 
     /// A block carrying only transaction hashes must be rejected as `BlockIncomplete` before
-    /// the pre-state anchor or any witness work.
+    /// the parent anchor or any witness work.
     #[test]
     fn validate_block_updates_rejects_hashes_only_block() {
         let fx = TestFixtures::mainnet_shared();
-        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
         let (hash, block) = hashes_only_block(fx);
 
         let witness = fx.salt_witnesses[&hash].clone();
-        let err = run_updates(fx, &chain_spec, &block, witness, hash, ValidationOptions::default())
-            .unwrap_err();
+        let err = run_updates(fx, &block, witness, hash, ValidationOptions::default()).unwrap_err();
         assert!(matches!(err, ValidationError::BlockIncomplete), "{err:?}");
     }
 
@@ -1194,16 +1137,14 @@ mod tests {
     #[test]
     fn tampered_witness_fails_proof_verification() {
         let fx = TestFixtures::mainnet_shared();
-        let chain_spec = ChainSpec::from_genesis(fx.load_genesis().unwrap());
         let (_, hash) = *fx.paired_blocks().first().expect("paired mainnet fixtures");
         let block = &fx.blocks[&hash];
 
         let tampered = tampered_witness(fx, hash);
-        let err = run_updates(fx, &chain_spec, block, tampered, hash, ValidationOptions::default())
-            .unwrap_err();
+        let err = run_updates(fx, block, tampered, hash, ValidationOptions::default()).unwrap_err();
         assert!(matches!(err, ValidationError::WitnessVerificationFailed(_)), "{err:?}");
 
-        let err = run_block(fx, &chain_spec, block, tampered_witness(fx, hash), hash).unwrap_err();
+        let err = run_block(fx, block, tampered_witness(fx, hash), hash).unwrap_err();
         assert!(matches!(err, ValidationError::WitnessVerificationFailed(_)), "{err:?}");
     }
 }
