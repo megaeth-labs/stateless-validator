@@ -858,18 +858,17 @@ pub fn validate_block_updates<B: BlockInput>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::LazyLock;
-
     use salt::METADATA_KEYS_RANGE;
     use stateless_test_utils::{fixtures::TestFixtures, logging::init_test_logging};
 
     use super::*;
 
-    /// Chain spec for the mainnet fixtures, parsed once per process — the per-test
-    /// counterpart of [`TestFixtures::mainnet_shared`].
-    static CHAIN_SPEC: LazyLock<ChainSpec> = LazyLock::new(|| {
+    /// Chain spec for the mainnet fixtures. Parsed per call: the 1.8 KB genesis is noise
+    /// next to the witness work every caller performs, and a memoizing `static` would need
+    /// real-std machinery (`LazyLock`) that `no_std` test builds cannot name (see lib.rs).
+    fn chain_spec() -> ChainSpec {
         ChainSpec::from_genesis(TestFixtures::mainnet_shared().load_genesis().unwrap())
-    });
+    }
 
     /// Runs [`validate_block_updates`] for one fixture block over the given witness.
     fn run_updates(
@@ -880,7 +879,7 @@ mod tests {
         options: ValidationOptions,
     ) -> Result<(StateUpdates, ValidationStats), ValidationError> {
         validate_block_updates(
-            &CHAIN_SPEC,
+            &chain_spec(),
             block,
             salt_witness,
             fx.mpt_witness(&hash),
@@ -899,7 +898,7 @@ mod tests {
         hash: B256,
     ) -> Result<ValidationStats, ValidationError> {
         validate_block(
-            &CHAIN_SPEC,
+            &chain_spec(),
             block,
             salt_witness,
             fx.mpt_witness(&hash),
