@@ -322,4 +322,18 @@ mod tests {
     fn test_iter_code_hashes_empty() {
         assert_eq!(iter_code_hashes(&BTreeMap::new()).count(), 0);
     }
+
+    #[test]
+    fn test_collect_code_hashes_dedups_and_sorts() {
+        let hi = B256::from([0xEE; 32]);
+        let lo = B256::from([0x11; 32]);
+        // Iteration order yields [hi, lo, hi]: unsorted and with a duplicate.
+        let map = kvs(vec![
+            Some(account_kv(1, Some(hi))),
+            Some(account_kv(2, Some(lo))),
+            Some(account_kv(3, Some(hi))),
+        ]);
+        assert_eq!(iter_code_hashes(&map).collect::<Vec<_>>(), vec![hi, lo, hi]);
+        assert_eq!(collect_code_hashes(&map), vec![lo, hi]);
+    }
 }
