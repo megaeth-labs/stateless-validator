@@ -35,7 +35,7 @@ pub use data_types::{PlainKey, PlainValue, collect_code_hashes, iter_code_hashes
 pub mod executor;
 pub use executor::{
     BlockInput, ParentAnchor, ValidationError, ValidationOptions, ValidationStats, replay_block,
-    validate_block, validate_block_updates,
+    validate_block, validate_block_deriving_updates,
 };
 #[cfg(feature = "std")]
 pub mod pipeline;
