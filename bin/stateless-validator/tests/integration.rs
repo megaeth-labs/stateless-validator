@@ -499,7 +499,6 @@ async fn integration_test() {
 async fn run_end_block_slice(
     reject_first_reports: usize,
 ) -> (eyre::Result<()>, Vec<(u64, u64)>, u64) {
-    let _logging = init_test_logging("stateless_validator");
     let fx = TestFixtures::synthetic();
     let genesis_file = fx.data_dir.join("genesis.json");
 
@@ -568,6 +567,10 @@ async fn run_end_block_slice_and_assert_tip_reported(
 /// path.
 #[tokio::test]
 async fn end_block_run_reports_final_tip() {
+    // Logging is enabled only here and in `integration_test`: one representative run per mock
+    // shape keeps the suite output readable — the scripted-failure twins would otherwise print
+    // alarming ERROR lines that are just their test script.
+    let _logging = init_test_logging("stateless_validator");
     run_end_block_slice_and_assert_tip_reported(0).await;
 }
 
