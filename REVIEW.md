@@ -17,6 +17,9 @@ These per-repo rules take precedence wherever they conflict with that baseline.
 
 - Changes to consensus-critical code — EVM execution, witness verification, state root computation, withdrawals — require extra scrutiny.
 - Watch for read-check-write without atomicity (lock, CAS, or database constraint), CPU-intensive work that should use `spawn_blocking` inside async contexts, and deadlocks from nested lock acquisition.
+- **Fail closed on the terminal publish.** The final step (e.g. `mega_setValidatedBlocks`) must not look like success when it permanently failed — surface a non-zero exit / `Err` so the orchestrator detects the miss and retries, instead of advancing while upstream never saw the tip.
+- **Validate config at the boundary.** Reject or clamp nonsensical config at load: a `*_timeout_ms` of `0` makes `tokio::time::timeout` fail every attempt immediately; an unbounded size/alloc hint invites upfront over-allocation. Require `> 0` (or a clamp) before the value reaches the retry loop.
+- **Classify remote errors precisely.** Match known error codes (e.g. a small set of S3 codes), not `body.contains(...)` on response text a proxy can reshape. Give an exhausted-retry cycle an inter-cycle throttle so it doesn't re-burst after a brownout.
 
 ## Observability
 
