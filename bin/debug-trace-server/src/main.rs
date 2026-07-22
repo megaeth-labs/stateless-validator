@@ -3,6 +3,8 @@
 //! # Overview
 //! A standalone RPC server for `debug_*` and `trace_*` methods using stateless execution.
 //! Data can be fetched from upstream RPC endpoints or from a local database with chain sync.
+//! Witness fetches route by block age: historical blocks skip the internal generator endpoint
+//! (which only retains a small recent window) and go straight to the fallback endpoints.
 //!
 //! # Architecture
 //! ```text
@@ -25,6 +27,8 @@
 //! ┌─────────────────────────────────────────────────────────────────┐
 //! │                      DataProvider                               │
 //! │  Multi-level lookup: Local DB → Remote RPC (with single-flight) │
+//! │  Witnesses: near-tip → full endpoint chain; historical skips    │
+//! │  the internal generator (guaranteed miss) → fallback endpoints  │
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -37,7 +41,7 @@
 //! - `debug_getCacheStatus` - Query current response cache status
 //!
 //! # Operating Modes
-//! - **Stateless mode**: Without `data_dir`, all data is fetched from remote RPC
+//! - **Stateless mode**: Without `data_dir`, all data is fetched from remote RPC endpoints
 //! - **Local cache mode**: With `data_dir`, enables chain sync to pre-fetch blocks into local DB
 
 use std::{path::PathBuf, sync::Arc};
@@ -68,7 +72,7 @@ mod server_db;
 mod timing;
 mod tracing_executor;
 
-use data_provider::{DataProvider, NoopContractStore};
+use data_provider::{DataProvider, NoopContractStore, WitnessFetchConfig};
 use response_cache::{DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS, ResponseCache, ResponseCacheConfig};
 use rpc_service::RpcContext;
 use server_db::{BlockStore, ServerDB};
@@ -97,7 +101,9 @@ struct Args {
 
     /// One or more upstream witness endpoint URLs for fetching witness data (tried in order).
     /// Accepts repeated flags (`--witness-endpoint a --witness-endpoint b`) or a comma-separated
-    /// list (`--witness-endpoint a,b`, also via the env var).
+    /// list (`--witness-endpoint a,b`, also via the env var). The first endpoint is positionally
+    /// special: it is treated as the internal witness generator and is skipped for historical
+    /// blocks (see `--witness-local-window`).
     #[clap(
         long,
         env = "DEBUG_TRACE_SERVER_WITNESS_ENDPOINT",
@@ -198,9 +204,39 @@ struct Args {
     data_max_concurrent_requests: Option<usize>,
 
     /// Maximum concurrent in-flight witness fetches, independent of the data cap.
-    /// Omit for unlimited.
+    /// Omit for unlimited. One global cap: recent and historical witness routes share it.
     #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_MAX_CONCURRENT_REQUESTS")]
     witness_max_concurrent_requests: Option<usize>,
+
+    /// Blocks within this many blocks of the local tip fetch witnesses through the full
+    /// witness endpoint chain (internal generator first); older blocks skip the first witness
+    /// endpoint — the generator only retains about this window (its `BACKUP` env, deployed at
+    /// 4096), so probing it for historical blocks is a guaranteed miss. Requires at least two
+    /// witness endpoints and a local DB (`--data-dir`), whose tip anchors block age; otherwise
+    /// all blocks use the full chain. Should match the generator's `BACKUP`.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_WITNESS_LOCAL_WINDOW",
+        default_value_t = data_provider::DEFAULT_WITNESS_LOCAL_WINDOW
+    )]
+    witness_local_window: u64,
+
+    /// Witness-stage budget in seconds for blocks at or below the local tip. Defaults to the
+    /// full witness budget; lower it to fail fast on blocks whose witness is likely pruned
+    /// everywhere. Clamped to `--witness-timeout`.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_WITNESS_OLD_BLOCK_TIMEOUT",
+        default_value_t = data_provider::DEFAULT_OLD_BLOCK_WITNESS_TIMEOUT_SECS
+    )]
+    witness_old_block_timeout: u64,
+
+    /// Chain-sync pipeline tip buffer: stay this many blocks behind the upstream head so the
+    /// fetcher does not race the witness generator — a fetch issued the moment a block appears
+    /// typically arrives before its witness is written and burns a failed round plus a backoff
+    /// sleep. 0 = fetch right at the head.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_TIP_BUFFER", default_value_t = 2)]
+    tip_buffer: u64,
 
     /// Per-attempt RPC timeout (milliseconds). Must be ≥ 100ms.
     #[clap(
@@ -255,9 +291,26 @@ fn parse_size(s: &str) -> Result<u64, String> {
     value.checked_mul(multiplier).ok_or_else(|| format!("size overflow: '{}'", s))
 }
 
+/// Validates cross-flag invariants that clap cannot express per-field.
+fn validate_args(args: &Args) -> Result<()> {
+    // Only meaningful with chain sync: the fetcher holds the local tip `tip_buffer` blocks
+    // behind the head, and `blocks_to_keep` doubles as the stale-reset threshold. A buffer at
+    // or past the threshold makes the built-in lag itself look stale, so every transient
+    // restart would reset the anchor and leave gaps in stored history.
+    if args.data_dir.is_some() && args.tip_buffer >= args.blocks_to_keep {
+        eyre::bail!(
+            "--tip-buffer ({}) must be smaller than --blocks-to-keep ({})",
+            args.tip_buffer,
+            args.blocks_to_keep
+        );
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    validate_args(&args)?;
     let _log_guard = args.log.init_tracing()?;
 
     info!(
@@ -269,6 +322,9 @@ async fn main() -> Result<()> {
         rpc_endpoints = ?args.rpc_endpoint,
         witness_endpoints = ?args.witness_endpoint,
         witness_timeout_secs = args.witness_timeout,
+        witness_old_block_timeout_secs = args.witness_old_block_timeout,
+        witness_local_window = args.witness_local_window,
+        tip_buffer = args.tip_buffer,
         response_cache_disabled,
         response_cache_max_size = args.response_cache_max_size,
         response_cache_estimated_items = args.response_cache_estimated_items,
@@ -306,6 +362,29 @@ async fn main() -> Result<()> {
     .with_metrics(Arc::new(metrics::TraceRpcMetrics));
     let rpc_client =
         Arc::new(RpcClient::new_with_config(&data_apis, &witness_apis, rpc_config, None)?);
+
+    // Historical witness routing: blocks at least `--witness-local-window` below the local
+    // tip skip the first witness endpoint (the internal generator, which only retains about
+    // that window and is a guaranteed miss for anything older). Needs a fallback endpoint to
+    // route to, and a local DB whose tip anchors block age.
+    let route_historical = witness_apis.len() >= 2 && args.data_dir.is_some();
+    if route_historical {
+        info!(
+            witness_local_window = args.witness_local_window,
+            skipped_endpoint = witness_apis[0],
+            "Historical witnesses (at least the local window below the tip) skip the internal \
+             generator endpoint"
+        );
+    } else if witness_apis.len() >= 2 {
+        warn!(
+            "Multiple witness endpoints but no --data-dir: historical witness routing is \
+             inactive (block age is anchored to the local DB tip); all witness fetches use the \
+             full endpoint chain"
+        );
+    } else {
+        debug!("Single witness endpoint configured; no historical witness routing");
+    }
+
     let validator_db = init_validator_db(&args, &rpc_client).await?;
 
     // Keep concrete ServerDB for pipeline (needs Sized), and dyn BlockStore for data_provider
@@ -322,11 +401,17 @@ async fn main() -> Result<()> {
     };
     let contract_cache = Arc::new(ContractCache::new(contract_store));
 
+    let witness_cfg = WitnessFetchConfig {
+        witness_timeout: std::time::Duration::from_secs(args.witness_timeout),
+        old_block_witness_timeout: std::time::Duration::from_secs(args.witness_old_block_timeout),
+        local_window: args.witness_local_window,
+        route_historical,
+    };
     let data_provider = Arc::new(DataProvider::new(
         rpc_client.clone(),
         block_store.clone(),
         contract_cache,
-        args.witness_timeout,
+        witness_cfg,
         args.block_fetch_timeout,
     ));
 
@@ -358,6 +443,7 @@ async fn main() -> Result<()> {
         // the crate boundary; mutate a default instance instead.
         let mut pipeline_cfg = PipelineConfig::default();
         pipeline_cfg.concurrent_workers = 1;
+        pipeline_cfg.tip_buffer = args.tip_buffer;
         pipeline_cfg.stale_reset_threshold = Some(args.blocks_to_keep);
         let config = Arc::new(pipeline_cfg);
         let processor = Arc::new(TraceProcessor);
@@ -669,6 +755,67 @@ mod tests {
             &["debug-trace-server", "--witness-endpoint", "http://w"],
             |a| a.rpc_endpoint,
         );
+    }
+
+    /// Pins the tiered-witness-routing knob defaults (`--witness-local-window` must track the
+    /// generator's `BACKUP`, the old-block budget defaults to the full witness budget) and the
+    /// CLI + env parsing of all three knobs — a typo in an env attribute string would
+    /// otherwise ship silently to env-only container deployments.
+    #[test]
+    fn tiered_routing_flag_defaults() {
+        let guard = stateless_test_utils::env::env_lock();
+        let base =
+            ["debug-trace-server", "--rpc-endpoint", "http://r", "--witness-endpoint", "http://w"];
+        let parse = |extra: &[&str]| Args::try_parse_from(base.iter().chain(extra)).unwrap();
+
+        let defaults = parse(&[]);
+        assert_eq!(defaults.witness_local_window, data_provider::DEFAULT_WITNESS_LOCAL_WINDOW);
+        assert_eq!(
+            defaults.witness_old_block_timeout,
+            data_provider::DEFAULT_OLD_BLOCK_WITNESS_TIMEOUT_SECS
+        );
+        assert_eq!(data_provider::DEFAULT_OLD_BLOCK_WITNESS_TIMEOUT_SECS, 8);
+        assert_eq!(defaults.tip_buffer, 2);
+
+        assert_eq!(parse(&["--tip-buffer", "0"]).tip_buffer, 0);
+        assert_eq!(parse(&["--witness-local-window", "128"]).witness_local_window, 128);
+        assert_eq!(parse(&["--witness-old-block-timeout", "3"]).witness_old_block_timeout, 3);
+
+        let env = |name, value: &str| {
+            stateless_test_utils::env::with_env_var(&guard, name, value, || parse(&[]))
+        };
+        assert_eq!(env("DEBUG_TRACE_SERVER_TIP_BUFFER", "5").tip_buffer, 5);
+        assert_eq!(env("DEBUG_TRACE_SERVER_WITNESS_LOCAL_WINDOW", "256").witness_local_window, 256);
+        assert_eq!(
+            env("DEBUG_TRACE_SERVER_WITNESS_OLD_BLOCK_TIMEOUT", "4").witness_old_block_timeout,
+            4
+        );
+    }
+
+    /// `--tip-buffer` must stay below `--blocks-to-keep` when chain sync is enabled: the
+    /// pipeline's built-in lag would otherwise satisfy the stale-reset test on every
+    /// transient restart. Inert in stateless mode, where neither flag is used.
+    #[test]
+    fn tip_buffer_must_stay_below_blocks_to_keep() {
+        // Args parsing reads `DEBUG_TRACE_SERVER_*` env vars, so it must be serialized with
+        // the tests that mutate them.
+        let _guard = stateless_test_utils::env::env_lock();
+        let base =
+            ["debug-trace-server", "--rpc-endpoint", "http://r", "--witness-endpoint", "http://w"];
+        let parse = |extra: &[&str]| Args::try_parse_from(base.iter().chain(extra)).unwrap();
+
+        // Stateless mode (no data dir): both flags are inert, any combination is accepted.
+        assert!(validate_args(&parse(&["--tip-buffer", "2000"])).is_ok());
+
+        let with_db = |extra: &[&str]| {
+            let mut v = vec!["--data-dir", "/tmp/x"];
+            v.extend_from_slice(extra);
+            parse(&v)
+        };
+        assert!(validate_args(&with_db(&[])).is_ok());
+        assert!(validate_args(&with_db(&["--tip-buffer", "999"])).is_ok());
+        assert!(validate_args(&with_db(&["--tip-buffer", "1000"])).is_err());
+        assert!(validate_args(&with_db(&["--tip-buffer", "5", "--blocks-to-keep", "5"])).is_err());
     }
 
     /// Verifies a concurrency cap flag parses via CLI and env var, and defaults to `None`.

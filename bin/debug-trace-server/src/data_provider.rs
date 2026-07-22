@@ -6,6 +6,11 @@
 //! 1. **Local Database** (fast) - Local DB for pre-fetched blocks (if configured)
 //! 2. **Remote RPC** (slower) - Upstream RPC endpoints as fallback
 //!
+//! Within the RPC fallback, the witness stage routes by block age (see [`WitnessFetchConfig`]):
+//! blocks within `local_window` of the local tip use the full witness endpoint chain (internal
+//! generator first), while historical blocks — which the generator has long pruned — skip the
+//! generator and go straight to the remaining endpoints.
+//!
 //! # Features
 //! - **Single-flight request coalescing**: concurrent callers for the same block hash share one
 //!   in-flight fetch via [`futures::future::Shared`]; the result is handed out as `Arc<BlockData>`
@@ -45,6 +50,37 @@ use crate::{
     server_db::BlockStore,
 };
 
+/// Witness-source routing and budget configuration, shared by the single-flight fetch futures.
+#[derive(Clone)]
+pub(crate) struct WitnessFetchConfig {
+    /// Sub-deadline applied to the witness stage for blocks above the local tip.
+    pub witness_timeout: Duration,
+    /// Sub-deadline for blocks at or below the local tip (clamped to `witness_timeout`).
+    pub old_block_witness_timeout: Duration,
+    /// Blocks at least this far below the local tip are historical: the internal witness
+    /// generator only retains about this window (its `BACKUP` env), so probing it first is a
+    /// guaranteed miss that costs a failover round trip.
+    pub local_window: u64,
+    /// Whether historical blocks skip the first witness endpoint (the internal generator) and
+    /// fetch from the remaining endpoints only. Must only be set when at least two witness
+    /// endpoints are configured — the skip-aware fetch panics on an empty rotation — and is
+    /// only effective with a local DB, whose tip is the reference point for block age.
+    pub route_historical: bool,
+}
+
+impl WitnessFetchConfig {
+    /// Single-chain config (no historical split) with default budgets and window.
+    #[cfg(test)]
+    pub fn single_chain(witness_timeout_secs: u64) -> Self {
+        Self {
+            witness_timeout: Duration::from_secs(witness_timeout_secs),
+            old_block_witness_timeout: Duration::from_secs(DEFAULT_OLD_BLOCK_WITNESS_TIMEOUT_SECS),
+            local_window: DEFAULT_WITNESS_LOCAL_WINDOW,
+            route_historical: false,
+        }
+    }
+}
+
 /// Block data bundle containing all information needed for stateless execution.
 ///
 /// This struct aggregates the block, its witness (state proof), and all
@@ -76,6 +112,22 @@ pub struct BlockData {
 /// the witness is still being generated upstream" case where a few seconds of waiting is
 /// normal.
 pub const DEFAULT_WITNESS_TIMEOUT_SECS: u64 = 8;
+
+/// Default witness-stage budget for blocks at or below the local tip, in seconds.
+///
+/// Defaults to the full witness budget: a tighter fail-fast here converts slow-but-successful
+/// fetches into client-visible timeouts whenever the witness tail latency approaches the cap.
+/// Operators who prefer failing fast on blocks whose witness is likely gone everywhere can
+/// lower `--witness-old-block-timeout`.
+pub const DEFAULT_OLD_BLOCK_WITNESS_TIMEOUT_SECS: u64 = 8;
+
+/// Default local-tip window (in blocks) below which witnesses are considered historical and
+/// skip the internal generator endpoint (see [`WitnessFetchConfig::route_historical`]).
+///
+/// Matches the witness generator's default deployed local retention (`BACKUP=4096`): blocks
+/// deeper than this are guaranteed misses on the internal generator endpoint, so probing it
+/// first only burns a failover round trip.
+pub const DEFAULT_WITNESS_LOCAL_WINDOW: u64 = 4096;
 
 /// Default deadline for the full block-fetch pipeline (header + witness + block + contracts)
 /// in seconds (13 seconds).
@@ -222,9 +274,10 @@ pub(crate) struct DataProvider {
     /// repeated trace requests for the same contract hit memory instead of
     /// redb (slow) or RPC (slowest).
     contract_cache: Arc<ContractCache>,
-    /// Sub-deadline applied to the witness stage only. The full-call deadline still
-    /// dominates; this caps how long the witness fetch can burn out of that budget.
-    witness_timeout: Duration,
+    /// Witness-stage routing (full chain vs historical skip-generator chain) and budgets.
+    /// The full-call deadline still dominates; the per-stage budgets cap how much of it the
+    /// witness fetch can burn.
+    witness_cfg: WitnessFetchConfig,
     /// Wall-clock budget for one user-facing block-data call, from entry through
     /// header + witness + block + contract resolution. The retry loop in `RpcClient`
     /// checks this before each round and clamps its sleep accordingly, so a missing
@@ -246,21 +299,21 @@ impl DataProvider {
     /// * `db` - Optional local database for cached block data
     /// * `contract_cache` - Shared in-memory contract cache (backed by the DB when present, or an
     ///   in-memory-only noop store in stateless mode)
-    /// * `witness_timeout_secs` - User-facing cap on a single witness fetch, in seconds
+    /// * `witness_cfg` - Witness-source routing (by block age) and per-stage budgets
     /// * `block_fetch_timeout_secs` - User-facing cap on the full block-fetch pipeline (header +
     ///   witness + block + contracts), in seconds
     pub fn new(
         rpc_client: Arc<RpcClient>,
         db: Option<Arc<dyn BlockStore>>,
         contract_cache: Arc<ContractCache>,
-        witness_timeout_secs: u64,
+        witness_cfg: WitnessFetchConfig,
         block_fetch_timeout_secs: u64,
     ) -> Self {
         Self {
             rpc_client,
             db,
             contract_cache,
-            witness_timeout: Duration::from_secs(witness_timeout_secs),
+            witness_cfg,
             block_fetch_timeout: Duration::from_secs(block_fetch_timeout_secs),
             in_flight: DashMap::new(),
         }
@@ -508,13 +561,13 @@ impl DataProvider {
                 let rpc_client = Arc::clone(&self.rpc_client);
                 let db = self.db.clone();
                 let contract_cache = Arc::clone(&self.contract_cache);
-                let witness_timeout = self.witness_timeout;
+                let witness_cfg = self.witness_cfg.clone();
                 let fut: BlockDataFetchFuture = Box::pin(async move {
                     do_fetch_block_data(
                         rpc_client,
                         db,
                         contract_cache,
-                        witness_timeout,
+                        witness_cfg,
                         block_hash,
                         deadline,
                     )
@@ -597,7 +650,7 @@ async fn do_fetch_block_data(
     rpc_client: Arc<RpcClient>,
     db: Option<Arc<dyn BlockStore>>,
     contract_cache: Arc<ContractCache>,
-    witness_timeout: Duration,
+    witness_cfg: WitnessFetchConfig,
     block_hash: B256,
     deadline: Instant,
 ) -> DataProviderResult<BlockData> {
@@ -612,14 +665,22 @@ async fn do_fetch_block_data(
     let fetch_header_ms = start.elapsed().as_millis();
 
     // Step 2: Pick the witness deadline based on "new vs old" heuristic, then run witness
-    // and full-block fetches in parallel.
-    let witness_deadline =
-        witness_deadline_for(db.as_deref(), block_number, witness_timeout, deadline);
+    // and full-block fetches in parallel. The tip is read once and shared by the deadline
+    // heuristic and the witness-source routing.
+    let db_tip = db_tip_height(db.as_deref());
+    let witness_deadline = witness_deadline_for(db_tip, block_number, &witness_cfg, deadline);
     let (witness_timed, block_timed) = tokio::join!(
         async {
             let start = Instant::now();
-            let result =
-                fetch_witness(&rpc_client, block_number, header.hash, witness_deadline).await;
+            let result = fetch_witness(
+                &rpc_client,
+                &witness_cfg,
+                db_tip,
+                block_number,
+                header.hash,
+                witness_deadline,
+            )
+            .await;
             (result, start.elapsed())
         },
         async {
@@ -673,71 +734,117 @@ async fn do_fetch_block_data(
     Ok(BlockData { block, witness, contracts })
 }
 
-/// Picks the effective deadline for a witness fetch.
-///
-/// - **New block** (above local tip or no local DB): full `witness_timeout` sub-deadline, clamped
-///   by the outer call deadline. Covers "witness still being generated upstream".
-/// - **Old / pruned block** (at or below local tip): tightened to `OLD_BLOCK_WITNESS_TIMEOUT` (≤
-///   witness_timeout) because witness data for such blocks is either available immediately or not
-///   at all; burning the full witness_timeout on a pruned block is a bad tradeoff.
+/// Reads the local DB's canonical tip height, `None` when no DB is configured or the tip is
+/// unknown.
+fn db_tip_height(db: Option<&dyn BlockStore>) -> Option<u64> {
+    db.and_then(|db| db.get_canonical_tip().ok().flatten().map(|tip| tip.block_number))
+}
+
+/// Witness-stage budget for a block: full `witness_timeout` for **new** blocks (above local tip
+/// or no local DB — covers "witness still being generated upstream"), and the separately
+/// configurable `old_block_witness_timeout` (clamped to `witness_timeout`) for blocks at or
+/// below the tip.
+fn witness_budget(db_tip: Option<u64>, block_number: u64, cfg: &WitnessFetchConfig) -> Duration {
+    let is_new_block = db_tip.is_none_or(|max| block_number > max);
+    if is_new_block {
+        cfg.witness_timeout
+    } else {
+        cfg.witness_timeout.min(cfg.old_block_witness_timeout)
+    }
+}
+
+/// Picks the effective deadline for a witness fetch: [`witness_budget`] from now, clamped by the
+/// outer call deadline.
 fn witness_deadline_for(
-    db: Option<&dyn BlockStore>,
+    db_tip: Option<u64>,
     block_number: u64,
-    witness_timeout: Duration,
+    cfg: &WitnessFetchConfig,
     outer_deadline: Instant,
 ) -> Instant {
-    /// Cap on witness fetches for blocks at or below the local tip.
-    ///
-    /// Sized against the default [`BackoffPolicy`](stateless_common::BackoffPolicy)
-    /// (`initial = 500 ms`, 2× doubling): 500 ms + 1 s + 2 s ≈ 3.5 s, so 3 s lets
-    /// every provider be probed across ~2–3 rounds before we fail.
-    const OLD_BLOCK_WITNESS_TIMEOUT: Duration = Duration::from_secs(3);
-
-    let db_max_height =
-        db.and_then(|db| db.get_canonical_tip().ok().flatten().map(|tip| tip.block_number));
-    let is_new_block = db_max_height.is_none_or(|max| block_number > max);
-    let budget =
-        if is_new_block { witness_timeout } else { witness_timeout.min(OLD_BLOCK_WITNESS_TIMEOUT) };
+    let budget = witness_budget(db_tip, block_number, cfg);
     let stage_deadline = Instant::now() + budget;
     trace!(
         block_number,
-        db_max_height,
-        is_new_block,
+        db_tip,
         budget_ms = budget.as_millis() as u64,
         "Computed witness stage deadline",
     );
     stage_deadline.min(outer_deadline)
 }
 
-/// Fetches witness data via the deadline-aware `RpcClient` API. The `deadline` is the
-/// witness stage's effective deadline (see [`witness_deadline_for`]).
+/// Whether a block is historical for witness routing: at least `local_window` blocks below the
+/// local tip. The internal witness generator retains only about the window (`BACKUP`), so its
+/// endpoint is a guaranteed miss for these; the remaining witness endpoints serve them.
+/// Unknown tip (or an overflowing window) conservatively counts as recent.
+fn is_historical(db_tip: Option<u64>, block_number: u64, local_window: u64) -> bool {
+    match (db_tip, block_number.checked_add(local_window)) {
+        (Some(tip), Some(horizon)) => horizon <= tip,
+        _ => false,
+    }
+}
+
+/// Witness route for a block: how many leading witness endpoints to skip, plus the metrics
+/// source label. Historical blocks (with [`WitnessFetchConfig::route_historical`] set) skip
+/// the internal generator at index 0; everything else uses the full chain.
+fn witness_route(
+    cfg: &WitnessFetchConfig,
+    db_tip: Option<u64>,
+    block_number: u64,
+) -> (usize, &'static str) {
+    if cfg.route_historical && is_historical(db_tip, block_number, cfg.local_window) {
+        (1, "witness_historical")
+    } else {
+        (0, "witness_generator")
+    }
+}
+
+/// Fetches witness data, routing by block age. The `deadline` is the witness stage's
+/// effective deadline (see [`witness_deadline_for`]).
 ///
-/// Uses the zero-validation light decode: the trace server never verifies the
-/// witness proof, so the full decode's per-point elliptic-curve work bought
-/// nothing. The recorded size is the light lower bound (excludes the
-/// never-decoded parent commitments).
+/// - **Recent block** (within `local_window` of the local tip, or tip unknown): the full RPC
+///   witness endpoint chain, tried in order — the internal generator first, so near-tip witnesses
+///   stay on the fast internal path.
+/// - **Historical block** with `route_historical` set: the same chain minus the first endpoint. The
+///   generator only retains ~`local_window` blocks, so probing it for a historical block is a
+///   guaranteed miss that costs a failover round trip before every real fetch.
+///
+/// Uses the zero-validation light decode: the trace server never verifies the witness proof,
+/// so the full decode's per-point elliptic-curve work bought nothing. The recorded size is
+/// the light lower bound (excludes the never-decoded parent commitments).
 async fn fetch_witness(
     rpc_client: &RpcClient,
+    cfg: &WitnessFetchConfig,
+    db_tip: Option<u64>,
     block_number: u64,
     block_hash: B256,
     deadline: Instant,
 ) -> DataProviderResult<(LightWitness, MptWitness)> {
-    let wg_metrics = WitnessSourceMetrics::new_for_source("witness_generator");
+    let (skip, source) = witness_route(cfg, db_tip, block_number);
+    let metrics = WitnessSourceMetrics::new_for_source(source);
     let start = Instant::now();
+    let budget = deadline.saturating_duration_since(start);
 
-    match rpc_client.get_witness_light_with_deadline(block_number, block_hash, Some(deadline)).await
+    match rpc_client
+        .get_witness_light_with_deadline_from(skip, block_number, block_hash, Some(deadline))
+        .await
     {
         Ok(w) => {
-            wg_metrics.record_request(true, start.elapsed().as_secs_f64());
-            wg_metrics.record_size(WitnessSizeBreakdown::new_light(&w.0, &w.1).total());
-            DataSourceMetrics::new_for_source("witness_generator").record();
+            metrics.record_request(true, start.elapsed().as_secs_f64());
+            metrics.record_size(WitnessSizeBreakdown::new_light(&w.0, &w.1).total());
+            DataSourceMetrics::new_for_source(source).record();
             Ok(w)
         }
         Err(e) => {
-            wg_metrics.record_request(false, start.elapsed().as_secs_f64());
+            metrics.record_request(false, start.elapsed().as_secs_f64());
+            // Attribution-grade context for the next timeout incident: the effective stage
+            // budget, the route taken, and whether the old-block clamp applied — the client
+            // only ever sees the generic `-32001` message.
             warn!(
                 block_number,
                 block_hash = %block_hash,
+                source,
+                old_block = db_tip.is_some_and(|tip| block_number <= tip),
+                budget_ms = budget.as_millis() as u64,
                 elapsed_ms = start.elapsed().as_millis() as u64,
                 "Witness fetch deadline exceeded",
             );
@@ -802,9 +909,12 @@ impl ContractStore for NoopContractStore {
 
 #[cfg(test)]
 mod tests {
-    use std::net::TcpListener;
+    use std::{
+        net::TcpListener,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
-    use stateless_common::RpcClientConfig;
+    use stateless_common::{BackoffPolicy, RpcClientConfig};
 
     use super::*;
 
@@ -822,6 +932,114 @@ mod tests {
 
         assert_eq!(DEFAULT_WITNESS_TIMEOUT_SECS, 8);
         assert_eq!(Duration::from_secs(DEFAULT_WITNESS_TIMEOUT_SECS).as_millis(), 8000);
+    }
+
+    /// Witness-source routing boundary: historical iff `number + local_window <= tip`;
+    /// unknown tip and window overflow are conservatively recent (RPC path).
+    #[test]
+    fn historical_routing_boundary() {
+        assert!(!is_historical(None, 100, 4096), "unknown tip is recent");
+        assert!(is_historical(Some(5000), 904, 4096), "904 + 4096 == 5000: exactly at the window");
+        assert!(!is_historical(Some(5000), 905, 4096), "one inside the window is recent");
+        assert!(!is_historical(Some(5000), 5000, 4096), "the tip itself is recent");
+        assert!(is_historical(Some(4096), 0, 4096), "genesis with tip == window");
+        assert!(!is_historical(Some(4095), 0, 4096));
+        assert!(!is_historical(Some(u64::MAX), u64::MAX, 4096), "overflowing horizon is recent");
+        assert!(is_historical(Some(100), 50, 0), "zero window: everything at/below tip");
+    }
+
+    /// Route selection: the skip-generator chain and the `witness_historical` label apply
+    /// only when routing is enabled AND the block is historical; everything else stays on
+    /// the full chain under the `witness_generator` label.
+    #[test]
+    fn witness_route_selection() {
+        let mut cfg = WitnessFetchConfig::single_chain(8);
+        cfg.local_window = 100;
+        // Routing disabled (single witness endpoint or no local DB): always the full chain.
+        assert_eq!(witness_route(&cfg, Some(5000), 900), (0, "witness_generator"));
+        cfg.route_historical = true;
+        assert_eq!(witness_route(&cfg, Some(5000), 900), (1, "witness_historical"));
+        assert_eq!(witness_route(&cfg, Some(5000), 4999), (0, "witness_generator"));
+        assert_eq!(witness_route(&cfg, None, 900), (0, "witness_generator"), "unknown tip");
+    }
+
+    /// Serves `mega_getBlockWitness` returning an RPC error, counting hits per endpoint.
+    async fn start_counting_witness_rpc()
+    -> (jsonrpsee::server::ServerHandle, String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut module = jsonrpsee::server::RpcModule::new(hits.clone());
+        module
+            .register_method("mega_getBlockWitness", |_p, hits, _| {
+                hits.fetch_add(1, Ordering::Relaxed);
+                Err::<String, _>(jsonrpsee::types::ErrorObjectOwned::owned::<()>(
+                    -32000,
+                    "no witness",
+                    None,
+                ))
+            })
+            .unwrap();
+        let server =
+            jsonrpsee::server::ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        (server.start(module), url, hits)
+    }
+
+    /// End-to-end routing dispatch through `fetch_witness`: a historical block must never
+    /// touch the first (generator) endpoint, while a recent block probes it first.
+    #[tokio::test]
+    async fn fetch_witness_routes_historical_blocks_past_the_generator() {
+        let (ha, url_a, hits_a) = start_counting_witness_rpc().await;
+        let (hb, url_b, hits_b) = start_counting_witness_rpc().await;
+
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
+            ..RpcClientConfig::trace_server()
+        };
+        let rpc_client = RpcClient::new_with_config(
+            &[url_a.as_str()],
+            &[url_a.as_str(), url_b.as_str()],
+            config,
+            None,
+        )
+        .unwrap();
+        let cfg = WitnessFetchConfig {
+            witness_timeout: Duration::from_secs(1),
+            old_block_witness_timeout: Duration::from_secs(1),
+            local_window: 100,
+            route_historical: true,
+        };
+        let db_tip = Some(5000);
+
+        // Historical block (900 + 100 <= 5000): the generator endpoint must stay untouched.
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let result = fetch_witness(&rpc_client, &cfg, db_tip, 900, B256::ZERO, deadline).await;
+        assert!(result.is_err(), "the mock only returns errors, so the deadline must fire");
+        assert_eq!(hits_a.load(Ordering::Relaxed), 0, "historical fetch must skip the generator");
+        assert!(hits_b.load(Ordering::Relaxed) >= 1, "the fallback endpoint must be tried");
+
+        // Recent block (the tip itself): the full chain, generator first.
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let _ = fetch_witness(&rpc_client, &cfg, db_tip, 5000, B256::ZERO, deadline).await;
+        assert!(hits_a.load(Ordering::Relaxed) >= 1, "recent fetch must probe the generator");
+
+        ha.stop().unwrap();
+        hb.stop().unwrap();
+    }
+
+    /// Old-block witness budget honors the configurable timeout and clamps to
+    /// `witness_timeout`.
+    #[test]
+    fn old_block_budget_is_configurable_and_clamped() {
+        let mut cfg = WitnessFetchConfig::single_chain(10);
+        cfg.old_block_witness_timeout = Duration::from_secs(8);
+        // New block (above tip / no tip): full witness_timeout.
+        assert_eq!(witness_budget(None, 42, &cfg), Duration::from_secs(10));
+        assert_eq!(witness_budget(Some(41), 42, &cfg), Duration::from_secs(10));
+        // Old block (at/below tip): the configured old-block budget.
+        assert_eq!(witness_budget(Some(42), 42, &cfg), Duration::from_secs(8));
+        // Clamped: old-block budget can never exceed witness_timeout.
+        cfg.old_block_witness_timeout = Duration::from_secs(30);
+        assert_eq!(witness_budget(Some(42), 42, &cfg), Duration::from_secs(10));
     }
 
     /// `BlockNumberOrTag` / `BlockId` variants that `resolve_block_number` matches on.
@@ -880,7 +1098,7 @@ mod tests {
             rpc_client,
             None,
             contract_cache,
-            DEFAULT_WITNESS_TIMEOUT_SECS,
+            WitnessFetchConfig::single_chain(DEFAULT_WITNESS_TIMEOUT_SECS),
             1, // 1-second block fetch timeout
         );
 
@@ -924,7 +1142,7 @@ mod tests {
             rpc_client,
             None,
             contract_cache,
-            DEFAULT_WITNESS_TIMEOUT_SECS,
+            WitnessFetchConfig::single_chain(DEFAULT_WITNESS_TIMEOUT_SECS),
             1, // 1-second block fetch timeout
         );
 
@@ -971,7 +1189,7 @@ mod tests {
             rpc_client,
             None,
             contract_cache,
-            DEFAULT_WITNESS_TIMEOUT_SECS,
+            WitnessFetchConfig::single_chain(DEFAULT_WITNESS_TIMEOUT_SECS),
             60,
         ));
 

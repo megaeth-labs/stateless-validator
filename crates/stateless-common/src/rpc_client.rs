@@ -372,6 +372,7 @@ impl RpcClient {
             if n > 1 { self.data_rr_counter.fetch_add(1, Ordering::Relaxed) % n } else { 0 };
         round_robin_with_backoff(
             &self.data_providers,
+            0,
             &self.data_concurrency,
             &self.config.rpc_retry,
             self.config.per_attempt_timeout,
@@ -570,7 +571,14 @@ impl RpcClient {
         deadline: Option<Instant>,
     ) -> std::result::Result<(SaltWitness, MptWitness), RpcDeadlineExceeded> {
         let witness = self
-            .witness_round_robin(number, hash, deadline, decode_witness_response, "Witness decoded")
+            .witness_round_robin(
+                0,
+                number,
+                hash,
+                deadline,
+                decode_witness_response,
+                "Witness decoded",
+            )
             .await?;
 
         if let Some(ref metrics) = self.config.metrics {
@@ -602,7 +610,26 @@ impl RpcClient {
         hash: B256,
         deadline: Option<Instant>,
     ) -> std::result::Result<(LightWitness, MptWitness), RpcDeadlineExceeded> {
+        self.get_witness_light_with_deadline_from(0, number, hash, deadline).await
+    }
+
+    /// Like [`Self::get_witness_light_with_deadline`], but skips the first `skip` witness
+    /// providers, for callers that know those endpoints cannot serve the request (e.g. an
+    /// internal generator that has pruned the block). Logged provider indices stay relative
+    /// to the full configured witness endpoint list, and the shared witness concurrency cap
+    /// still applies.
+    ///
+    /// # Panics
+    /// Panics if `skip >= witness_provider_count()` — at least one provider must remain.
+    pub async fn get_witness_light_with_deadline_from(
+        &self,
+        skip: usize,
+        number: u64,
+        hash: B256,
+        deadline: Option<Instant>,
+    ) -> std::result::Result<(LightWitness, MptWitness), RpcDeadlineExceeded> {
         self.witness_round_robin(
+            skip,
             number,
             hash,
             deadline,
@@ -613,19 +640,29 @@ impl RpcClient {
     }
 
     /// Shared `mega_getBlockWitness` retry loop: primary-failover rounds (always start from
-    /// provider 0 so the primary takes all traffic while healthy; backups are touched only
-    /// while it is failing), each attempt one RPC round trip followed by the caller-chosen
-    /// `decode` (see [`fetch_witness_with`]).
+    /// the first non-skipped provider so the primary takes all traffic while healthy; backups
+    /// are touched only while it is failing), each attempt one RPC round trip followed by the
+    /// caller-chosen `decode` (see [`fetch_witness_with`]).
+    ///
+    /// `skip` drops the first `skip` witness providers from the rotation while keeping logged
+    /// provider indices aligned with the full configured list.
     async fn witness_round_robin<T: Send + 'static>(
         &self,
+        skip: usize,
         number: u64,
         hash: B256,
         deadline: Option<Instant>,
         decode: fn(&str) -> std::result::Result<T, crate::WitnessDecodingError>,
         trace_msg: &'static str,
     ) -> std::result::Result<T, RpcDeadlineExceeded> {
+        assert!(
+            skip < self.witness_providers.len(),
+            "witness provider skip ({skip}) must leave at least one of {} providers",
+            self.witness_providers.len()
+        );
         round_robin_with_backoff(
-            &self.witness_providers,
+            &self.witness_providers[skip..],
+            skip,
             &self.witness_concurrency,
             &self.config.rpc_retry,
             self.config.per_attempt_timeout,
@@ -824,14 +861,19 @@ macro_rules! log_at {
 ///
 /// Used by both the data-method `call()` (rotates `rr_start` per call for load balancing) and
 /// `get_witness()` (pins `rr_start=0` for primary-failover).
-// 9-argument retry primitive. Each field plays a distinct role (providers, concurrency,
-// backoff policy, per-attempt timeout, starting provider, method label, metrics sink, deadline,
-// per-attempt closure) and bundling them into a struct would be ceremony without encapsulation —
-// there are exactly two call sites in this crate. Prefer clarity at the definition over fewer
-// commas at the call.
+///
+/// `providers` may be a slice of the caller's full configured list; `provider_idx_base` is the
+/// offset of that slice within the full list, so logged/reported provider indices always match
+/// the operator's endpoint ordering regardless of slicing.
+// 10-argument retry primitive. Each field plays a distinct role (providers, index base,
+// concurrency, backoff policy, per-attempt timeout, starting provider, method label, metrics
+// sink, deadline, per-attempt closure) and bundling them into a struct would be ceremony without
+// encapsulation — there are exactly two call sites in this crate. Prefer clarity at the
+// definition over fewer commas at the call.
 #[allow(clippy::too_many_arguments)]
 async fn round_robin_with_backoff<N, T>(
     providers: &[RootProvider<N>],
+    provider_idx_base: usize,
     semaphore: &Semaphore,
     policy: &BackoffPolicy,
     per_attempt_timeout: Duration,
@@ -875,7 +917,10 @@ where
             {
                 return Err(RpcDeadlineExceeded { method, elapsed: call_start.elapsed() });
             }
-            let provider_idx = (rr_start + offset) % n;
+            let slot = (rr_start + offset) % n;
+            // Index into the operator's full configured endpoint list (see
+            // `provider_idx_base`); `slot` indexes the possibly-sliced `providers`.
+            let provider_idx = provider_idx_base + slot;
             let permit = semaphore.acquire().await.expect("semaphore closed unexpectedly");
             // Per-attempt timing: record each provider call individually so histograms
             // and success/error counters reflect what actually happened in the retry loop
@@ -889,11 +934,8 @@ where
                 Some(d) => d.saturating_duration_since(Instant::now()).min(per_attempt_timeout),
                 None => per_attempt_timeout,
             };
-            let result = match tokio::time::timeout(
-                attempt_timeout,
-                f(providers[provider_idx].clone()),
-            )
-            .await
+            let result = match tokio::time::timeout(attempt_timeout, f(providers[slot].clone()))
+                .await
             {
                 Ok(r) => r,
                 Err(_) => {
@@ -1624,6 +1666,49 @@ mod tests {
 
         ha.stop().unwrap();
         hb.stop().unwrap();
+    }
+
+    /// `get_witness_light_with_deadline_from(skip=1, ..)` must never touch the first witness
+    /// provider: the rotation runs entirely over the remaining endpoints.
+    #[tokio::test]
+    async fn test_witness_fetch_with_skip_never_hits_skipped_provider() {
+        let order = Arc::new(std::sync::Mutex::new(Vec::<char>::new()));
+        let (ha, url_a) = start_ordered_witness_rpc('A', order.clone()).await;
+        let (hb, url_b) = start_ordered_witness_rpc('B', order.clone()).await;
+
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
+            ..Default::default()
+        };
+        let client = RpcClient::new_with_config(
+            &[url_a.as_str()],
+            &[url_a.as_str(), url_b.as_str()],
+            config,
+            None,
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let result = client
+            .get_witness_light_with_deadline_from(1, 1, BlockHash::ZERO, Some(deadline))
+            .await;
+        assert!(result.is_err(), "stub payloads fail decode, so the deadline must fire");
+
+        let log = order.lock().unwrap();
+        assert!(!log.is_empty(), "the non-skipped provider must have been tried");
+        assert!(log.iter().all(|&l| l == 'B'), "skipped provider A must never be hit: {log:?}");
+
+        ha.stop().unwrap();
+        hb.stop().unwrap();
+    }
+
+    /// Skipping every configured witness provider is a caller bug and must panic loudly
+    /// instead of silently retrying over an empty provider set.
+    #[tokio::test]
+    #[should_panic(expected = "must leave at least one")]
+    async fn test_witness_fetch_skip_of_all_providers_panics() {
+        let client = RpcClient::new(&[LOCALHOST_A], &[LOCALHOST_B]).unwrap();
+        let _ = client.get_witness_light_with_deadline_from(1, 1, BlockHash::ZERO, None).await;
     }
 
     /// Serves `mega_getBlockWitness` returning a stub that decodes-fails, while recording

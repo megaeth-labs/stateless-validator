@@ -98,6 +98,15 @@ Two operating modes:
 - **Stateless mode** (no `--data-dir`): All data fetched from remote RPC on demand.
 - **Local cache mode** (with `--data-dir`): Enables chain sync to pre-fetch blocks for faster serving.
 
+**Witness endpoint ordering:**
+For the debug-trace-server, the first `--witness-endpoint` is positionally special: it is treated as the internal witness generator, so list the generator first and durable fallbacks (e.g. an R2-backed witness service) after it.
+In local cache mode with two or more witness endpoints, blocks at least `--witness-local-window` blocks below the local tip skip that first endpoint and fetch from the remaining endpoints, because the generator only retains a recent window (its `BACKUP`, deployed at 4096) and probing it for pruned blocks is a guaranteed miss.
+
+**Witness routing and sync knobs** (each also settable via its `DEBUG_TRACE_SERVER_*` env var):
+- `--witness-local-window`: Block-age threshold for the historical witness route (default: 4096; should match the generator's `BACKUP`).
+- `--witness-old-block-timeout`: Witness-stage budget in seconds for blocks at or below the local tip (default: 8, the full witness budget; lower it to fail fast on pruned blocks).
+- `--tip-buffer`: Stay this many blocks behind the upstream head during chain sync so fetches don't race the witness generator (default: 2; must be smaller than `--blocks-to-keep`).
+
 ### Environment Variables
 
 Each command-line flag has an equivalent environment variable:
