@@ -891,6 +891,12 @@ where
     N: alloy_provider::Network,
     T: Send + 'static,
 {
+    debug_assert_eq!(
+        providers.len(),
+        provider_labels.len(),
+        "provider_labels must be parallel to providers (indexed by the same provider_idx)",
+    );
+
     // Records the logical-call deadline give-up (once) and builds the typed error. Called from
     // every site that abandons the call on a blown deadline, so the "request timed out" metric
     // and the returned error stay in lockstep.
