@@ -767,7 +767,7 @@ async fn resolve_contracts_inner(
         "Cache miss — fetching contracts from RPC"
     );
 
-    // Per-attempt `eth_getCodeByHash` metrics land on `UpstreamMetrics` via the
+    // Per-attempt `eth_getCodeByHash` metrics land on the upstream attempt metrics via the
     // `TraceRpcMetrics` adapter inside `round_robin_with_backoff`.
     let fetched = rpc_client.get_codes_with_deadline(&missing, true, Some(deadline)).await?;
 

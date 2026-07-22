@@ -13,7 +13,7 @@ use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gau
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 pub use stateless_common::{
     DEFAULT_METRICS_PORT, WitnessSizeBreakdown,
-    metrics::{BYTE_BUCKETS, REORG_DEPTH_BUCKETS, RpcMethod, RpcMetrics},
+    metrics::{BYTE_BUCKETS, REORG_DEPTH_BUCKETS, RpcAttemptOutcome, RpcMethod, RpcMetrics},
 };
 use tracing::info;
 
@@ -27,12 +27,22 @@ use crate::r2_witness::R2WitnessError;
 pub struct ValidatorMetrics;
 
 impl RpcMetrics for ValidatorMetrics {
-    fn on_rpc_complete(&self, method: RpcMethod, success: bool, duration_secs: Option<f64>) {
-        on_rpc_complete(method, success, duration_secs);
+    fn on_rpc_attempt(
+        &self,
+        method: RpcMethod,
+        _provider: &str,
+        outcome: RpcAttemptOutcome,
+        duration_secs: f64,
+    ) {
+        on_rpc_attempt(method, outcome, duration_secs);
     }
 
     fn on_rpc_retry(&self, method: RpcMethod) {
         on_rpc_retry(method);
+    }
+
+    fn on_rpc_deadline_exceeded(&self, method: RpcMethod, _elapsed_secs: f64) {
+        on_rpc_deadline_exceeded(method);
     }
 
     fn on_witness_fetch(&self, breakdown: WitnessSizeBreakdown) {
@@ -73,6 +83,7 @@ pub mod names {
     metric!(RPC_REQUESTS_TOTAL, "rpc_requests_total");
     metric!(RPC_ERRORS_TOTAL, "rpc_errors_total");
     metric!(RPC_RETRY_ATTEMPTS_TOTAL, "rpc_retry_attempts_total");
+    metric!(RPC_DEADLINE_EXCEEDED_TOTAL, "rpc_deadline_exceeded_total");
     metric!(BLOCK_FETCH_TIME, "block_fetch_time_seconds");
     metric!(CODE_FETCH_TIME, "code_fetch_time_seconds");
     metric!(WITNESS_FETCH_RPC_TIME, "witness_fetch_rpc_time_seconds");
@@ -163,6 +174,10 @@ fn register_metric_descriptions() {
         names::RPC_RETRY_ATTEMPTS_TOTAL,
         "RPC transient retry attempts (before final outcome)"
     );
+    describe_counter!(
+        names::RPC_DEADLINE_EXCEEDED_TOTAL,
+        "Logical RPC calls that gave up because their overall deadline elapsed"
+    );
     describe_histogram!(names::BLOCK_FETCH_TIME, "Block fetch time (s)");
     describe_histogram!(names::CODE_FETCH_TIME, "Code fetch time (s)");
     describe_histogram!(names::WITNESS_FETCH_RPC_TIME, "Witness RPC fetch time (s)");
@@ -209,6 +224,7 @@ fn init_rpc_method_counters() {
         counter!(names::RPC_REQUESTS_TOTAL, "method" => method_str).increment(0);
         counter!(names::RPC_ERRORS_TOTAL, "method" => method_str).increment(0);
         counter!(names::RPC_RETRY_ATTEMPTS_TOTAL, "method" => method_str).increment(0);
+        counter!(names::RPC_DEADLINE_EXCEEDED_TOTAL, "method" => method_str).increment(0);
     }
 }
 
@@ -286,27 +302,30 @@ pub fn on_rpc_retry(method: RpcMethod) {
     counter!(names::RPC_RETRY_ATTEMPTS_TOTAL, "method" => method.as_str()).increment(1);
 }
 
-pub fn on_rpc_complete(method: RpcMethod, success: bool, duration_secs: Option<f64>) {
+pub fn on_rpc_attempt(method: RpcMethod, outcome: RpcAttemptOutcome, duration_secs: f64) {
     let method_str = method.as_str();
     counter!(names::RPC_REQUESTS_TOTAL, "method" => method_str).increment(1);
-    if !success {
+    if !outcome.is_success() {
         counter!(names::RPC_ERRORS_TOTAL, "method" => method_str).increment(1);
     }
 
-    if let Some(duration) = duration_secs {
-        match method {
-            RpcMethod::EthGetCodeByHash => {
-                histogram!(names::CODE_FETCH_TIME).record(duration);
-            }
-            RpcMethod::EthGetBlock => {
-                histogram!(names::BLOCK_FETCH_TIME).record(duration);
-            }
-            RpcMethod::MegaGetBlockWitness => {
-                histogram!(names::WITNESS_FETCH_RPC_TIME).record(duration);
-            }
-            _ => {}
+    match method {
+        RpcMethod::EthGetCodeByHash => {
+            histogram!(names::CODE_FETCH_TIME).record(duration_secs);
         }
+        RpcMethod::EthGetBlock => {
+            histogram!(names::BLOCK_FETCH_TIME).record(duration_secs);
+        }
+        RpcMethod::MegaGetBlockWitness => {
+            histogram!(names::WITNESS_FETCH_RPC_TIME).record(duration_secs);
+        }
+        _ => {}
     }
+}
+
+/// Record a logical RPC call giving up because its overall deadline elapsed.
+pub fn on_rpc_deadline_exceeded(method: RpcMethod) {
+    counter!(names::RPC_DEADLINE_EXCEEDED_TOTAL, "method" => method.as_str()).increment(1);
 }
 
 pub fn on_contract_cache_read(hits: u64, misses: u64) {
