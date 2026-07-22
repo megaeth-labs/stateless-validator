@@ -2222,18 +2222,44 @@ mod tests {
             RpcClient::new_with_config(&[&stalled_url], &[&stalled_url], config, None).unwrap();
 
         // `deadline = None` so every per-attempt timeout emits the stall WARN (no deadline branch
-        // can steal it) — the assertion is independent of runner load. The outer timeout bounds
-        // the otherwise-unbounded retry so the test terminates.
-        let _ = tokio::time::timeout(
-            Duration::from_secs(1),
-            client.get_witness_light_with_deadline(4242, B256::ZERO, None),
-        )
-        .await;
-
-        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert!(
-            logs.contains("block_number") && logs.contains("4242"),
-            "witness failure log must carry the block_number span field, got:\n{logs}"
-        );
+        // can steal it). The unbounded retry runs as a background task while the test polls the
+        // captured logs and finishes on the first stall WARN that carries the span context.
+        //
+        // Two hardenings, both observed failure modes rather than paranoia:
+        // - No fixed wall-clock window around the fetch: a loaded runner can delay the first 50 ms
+        //   attempt timeout past any fixed budget.
+        // - Concurrent tests drive these same span/event callsites with no subscriber installed,
+        //   which can race `set_default`'s interest-cache rebuild and re-cache a stale `never` for
+        //   the span callsite — every span created afterwards on this thread is `none` and the
+        //   WARNs lose their `block_number` field. Periodically rebuilding the interest cache and
+        //   respawning the fetch creates a fresh span under the repaired cache, so the test
+        //   self-heals instead of flaking.
+        let spawn_fetch = |client: RpcClient| {
+            tokio::spawn(async move {
+                let _ = client.get_witness_light_with_deadline(4242, B256::ZERO, None).await;
+            })
+        };
+        let mut fetch = spawn_fetch(client.clone());
+        let give_up = Instant::now() + Duration::from_secs(30);
+        let mut respawn_at = Instant::now() + Duration::from_millis(500);
+        loop {
+            let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+            if logs.contains("block_number") && logs.contains("4242") {
+                break;
+            }
+            assert!(
+                Instant::now() < give_up,
+                "witness failure log must carry the block_number span field, got:\n{logs}"
+            );
+            if Instant::now() >= respawn_at {
+                fetch.abort();
+                tracing::callsite::rebuild_interest_cache();
+                buf.lock().unwrap().clear();
+                fetch = spawn_fetch(client.clone());
+                respawn_at = Instant::now() + Duration::from_millis(500);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        fetch.abort();
     }
 }
