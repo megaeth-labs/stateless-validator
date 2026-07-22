@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 
 use eyre::Result;
-use metrics::{Counter, Gauge, Histogram};
+use metrics::{Counter, Gauge, Histogram, counter, histogram};
 use metrics_derive::Metrics;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 pub use stateless_common::{
@@ -249,32 +249,33 @@ impl SingleFlightMetrics {
     }
 }
 
-/// Upstream RPC metrics with method label.
-#[derive(Clone, Metrics)]
-#[metrics(scope = "debug_trace")]
-pub struct UpstreamMetrics {
-    /// Total upstream RPC requests
-    upstream_requests_total: Counter,
-    /// Total upstream RPC errors
-    upstream_errors_total: Counter,
-    /// Duration of upstream RPC requests in seconds
-    upstream_duration_seconds: Histogram,
+/// Total upstream RPC attempts, labeled `(method, provider, outcome)`.
+const UPSTREAM_REQUESTS_TOTAL: &str = "debug_trace_upstream_requests_total";
+/// Per-attempt upstream RPC duration in seconds, labeled `(method, provider, outcome)`.
+const UPSTREAM_DURATION_SECONDS: &str = "debug_trace_upstream_duration_seconds";
+/// Logical-call deadline-exceeded ("request timed out") count, labeled `(method)`.
+const UPSTREAM_DEADLINE_EXCEEDED_TOTAL: &str = "debug_trace_upstream_deadline_exceeded_total";
+
+/// Records one upstream RPC attempt against `provider` with its `outcome` and duration.
+///
+/// The `(method, provider, outcome)` labeling is what lets operators attribute latency and
+/// separate a returned error from a stall-timeout, per endpoint — the collapsed method-only
+/// `success` boolean could do neither. `provider` is a bounded, credential-free endpoint host.
+fn record_upstream_attempt(
+    method: &'static str,
+    provider: &str,
+    outcome: &'static str,
+    duration_secs: f64,
+) {
+    counter!(UPSTREAM_REQUESTS_TOTAL, "method" => method, "provider" => provider.to_owned(), "outcome" => outcome)
+        .increment(1);
+    histogram!(UPSTREAM_DURATION_SECONDS, "method" => method, "provider" => provider.to_owned(), "outcome" => outcome)
+        .record(duration_secs);
 }
 
-impl UpstreamMetrics {
-    /// Creates metrics for a specific upstream RPC method.
-    pub fn new_for_method(method: &'static str) -> Self {
-        Self::new_with_labels(&[("method", method)])
-    }
-
-    /// Records an upstream RPC request.
-    pub fn record_request(&self, success: bool, duration_secs: f64) {
-        self.upstream_requests_total.increment(1);
-        if !success {
-            self.upstream_errors_total.increment(1);
-        }
-        self.upstream_duration_seconds.record(duration_secs);
-    }
+/// Records one logical upstream call giving up because its overall deadline elapsed.
+fn record_upstream_deadline_exceeded(method: &'static str) {
+    counter!(UPSTREAM_DEADLINE_EXCEEDED_TOTAL, "method" => method).increment(1);
 }
 
 /// Witness fetch metrics by source.
@@ -430,11 +431,15 @@ fn pre_register_all_metrics() {
     let _ = SingleFlightMetrics::new_for_type("coalesced");
     let _ = SingleFlightMetrics::new_for_type("bypassed");
 
-    // Data Fetch Layer: upstream RPC
-    let _ = UpstreamMetrics::new_for_method("eth_getHeaderByHash");
-    let _ = UpstreamMetrics::new_for_method("eth_getBlockByHash");
-    let _ = UpstreamMetrics::new_for_method("mega_getWitness");
-    let _ = UpstreamMetrics::new_for_method("eth_getCodeByHash");
+    // Data Fetch Layer: upstream RPC. The attempt series (`upstream_requests_total` /
+    // `upstream_duration_seconds`) carry a dynamic per-endpoint `provider` label, so they first
+    // appear on the initial attempt; only the method-keyed deadline-exceeded counter is
+    // pre-registrable here.
+    for method in
+        ["eth_getHeaderByHash", "eth_getBlockByHash", "mega_getWitness", "eth_getCodeByHash"]
+    {
+        counter!(UPSTREAM_DEADLINE_EXCEEDED_TOTAL, "method" => method).increment(0);
+    }
 
     // Witness Layer
     let _ = WitnessSourceMetrics::new_for_source("witness_generator");
@@ -500,7 +505,7 @@ pub fn record_rpc_error(method: &str) {
     RpcMethodMetrics::new_for_method(method).record_error();
 }
 
-/// Maps an [`RpcMethod`] to the `method` label used by [`UpstreamMetrics`].
+/// Maps an [`RpcMethod`] to the `method` label used by the upstream attempt metrics.
 ///
 /// The existing dashboard labels (`eth_getHeaderByHash`, `eth_getBlockByHash`, etc.)
 /// encode the trace-server-specific call flavor. Since [`RpcMethod`] is coarser
@@ -518,38 +523,42 @@ fn upstream_label_for(method: stateless_common::metrics::RpcMethod) -> &'static 
 }
 
 /// [`stateless_common::RpcMetrics`] adapter that forwards every per-attempt RPC
-/// event to [`UpstreamMetrics`], keyed by method label.
+/// event to the upstream metrics, keyed by `(method, provider, outcome)`.
 ///
 /// Wired via [`stateless_common::RpcClientConfig::with_metrics`] so that the
-/// per-attempt duration and success/failure counters recorded inside
-/// `round_robin_with_backoff` land on the same dashboards the trace server has
-/// always exposed — even though `get_block` / `get_header` / `get_witness` no
-/// longer surface their per-call success status at the caller level.
+/// per-attempt duration and per-endpoint outcome counters recorded inside
+/// `round_robin_with_backoff` reach Prometheus — including the primary-vs-failover
+/// split for `mega_getWitness` and the reason (error vs timeout) for each failure.
 #[derive(Default)]
 pub struct TraceRpcMetrics;
 
 impl stateless_common::RpcMetrics for TraceRpcMetrics {
-    fn on_rpc_complete(
+    fn on_rpc_attempt(
         &self,
         method: stateless_common::metrics::RpcMethod,
-        success: bool,
-        duration_secs: Option<f64>,
+        provider: &str,
+        outcome: stateless_common::metrics::RpcAttemptOutcome,
+        duration_secs: f64,
     ) {
-        let label = upstream_label_for(method);
-        // `new_for_method` is just a label binding — no allocation beyond what
-        // the metrics crate deduplicates internally.
-        UpstreamMetrics::new_for_method(label)
-            .record_request(success, duration_secs.unwrap_or(0.0));
+        record_upstream_attempt(
+            upstream_label_for(method),
+            provider,
+            outcome.as_str(),
+            duration_secs,
+        );
     }
 
-    fn on_rpc_retry(&self, _method: stateless_common::metrics::RpcMethod) {
-        // `on_rpc_complete(_, false, _)` fires alongside `on_rpc_retry` in the
-        // retry loop, so the error/request counters already capture retries.
+    fn on_rpc_deadline_exceeded(
+        &self,
+        method: stateless_common::metrics::RpcMethod,
+        _elapsed_secs: f64,
+    ) {
+        record_upstream_deadline_exceeded(upstream_label_for(method));
     }
 
     fn on_witness_fetch(&self, _breakdown: stateless_common::witness_size::WitnessSizeBreakdown) {
-        // Witness size/source metrics are recorded by `fetch_witness_with_timeout`
-        // at the outer timeout boundary (distinct semantics from per-attempt).
+        // Witness size/source metrics are recorded by `fetch_witness` at the outer
+        // boundary (distinct semantics from per-attempt).
     }
 }
 

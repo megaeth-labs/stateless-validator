@@ -50,17 +50,73 @@ impl RpcMethod {
     }
 }
 
+/// Outcome of a single provider attempt inside the retry loop.
+///
+/// The retry loop reports one of these per provider round trip, so metrics can
+/// attribute latency and failure *reason* per endpoint instead of collapsing
+/// every non-success into one opaque error count. `Error` and `Timeout` are
+/// both retriable failures; the split lets operators tell a provider that
+/// answered with an error from one that stalled and had to be timed out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcAttemptOutcome {
+    /// The provider returned a usable response.
+    Success,
+    /// The provider returned an error, or its response failed to decode.
+    Error,
+    /// The attempt hit the per-attempt timeout: the provider accepted the
+    /// request but did not answer within the budget (a stall).
+    Timeout,
+}
+
+impl RpcAttemptOutcome {
+    /// Stable metric-label string for this outcome.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RpcAttemptOutcome::Success => "success",
+            RpcAttemptOutcome::Error => "error",
+            RpcAttemptOutcome::Timeout => "timeout",
+        }
+    }
+
+    /// Whether this attempt succeeded.
+    pub fn is_success(&self) -> bool {
+        matches!(self, RpcAttemptOutcome::Success)
+    }
+}
+
 /// Trait for RPC metrics callbacks.
 ///
-/// Implement this trait to receive metrics events from the RPC client.
+/// Implement this trait to receive metrics events from the RPC client. All
+/// callbacks fire from inside the retry loop, so `on_rpc_attempt` is called
+/// once per provider round trip (not once per logical call).
 pub trait RpcMetrics: Send + Sync {
-    /// Called when an RPC request completes (final outcome — success or permanent failure).
-    fn on_rpc_complete(&self, method: RpcMethod, success: bool, duration_secs: Option<f64>);
+    /// Called once per provider attempt, tagged with the endpoint `provider`
+    /// label and the attempt [`RpcAttemptOutcome`].
+    ///
+    /// Every round trip the retry loop makes fires exactly one of these, so
+    /// both per-endpoint latency (via `duration_secs`) and per-reason failure
+    /// counts (via `outcome`) are derivable. `provider` is a bounded,
+    /// credential-free endpoint label (see the RPC client's `endpoint_label`).
+    fn on_rpc_attempt(
+        &self,
+        method: RpcMethod,
+        provider: &str,
+        outcome: RpcAttemptOutcome,
+        duration_secs: f64,
+    );
 
     /// Called on each transient failure that will be retried (not on the final outcome).
     ///
     /// Default: no-op. Implement to track retry volume separately from logical errors.
     fn on_rpc_retry(&self, _method: RpcMethod) {}
+
+    /// Called when a logical call gives up because its overall deadline elapsed.
+    ///
+    /// Distinct from a per-attempt [`RpcAttemptOutcome::Timeout`]: this counts
+    /// the *logical call* exhausting its whole budget (e.g. a witness fetch's
+    /// 3s deadline), which is the operator-facing "request timed out" signal.
+    /// Fires at most once per logical call. Default: no-op.
+    fn on_rpc_deadline_exceeded(&self, _method: RpcMethod, _elapsed_secs: f64) {}
 
     /// Called when witness data is successfully fetched.
     fn on_witness_fetch(&self, breakdown: WitnessSizeBreakdown);
@@ -77,5 +133,15 @@ mod tests {
         assert_eq!(RpcMethod::EthBlockNumber.as_str(), "eth_blockNumber");
         assert_eq!(RpcMethod::MegaGetBlockWitness.as_str(), "mega_getBlockWitness");
         assert_eq!(RpcMethod::MegaSetValidatedBlocks.as_str(), "mega_setValidatedBlocks");
+    }
+
+    #[test]
+    fn test_rpc_attempt_outcome() {
+        assert_eq!(RpcAttemptOutcome::Success.as_str(), "success");
+        assert_eq!(RpcAttemptOutcome::Error.as_str(), "error");
+        assert_eq!(RpcAttemptOutcome::Timeout.as_str(), "timeout");
+        assert!(RpcAttemptOutcome::Success.is_success());
+        assert!(!RpcAttemptOutcome::Error.is_success());
+        assert!(!RpcAttemptOutcome::Timeout.is_success());
     }
 }
