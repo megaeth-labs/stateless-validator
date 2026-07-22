@@ -42,6 +42,24 @@ pub struct PipelineConfig {
 }
 
 impl PipelineConfig {
+    /// Validates cross-field invariants.
+    ///
+    /// The fetcher holds the local tip at least `tip_buffer` behind the remote head, while the
+    /// outer loop treats a lag beyond `stale_reset_threshold` as stale data — a buffer at or
+    /// past the threshold would make the built-in lag itself trigger an anchor reset (and the
+    /// history gap that comes with it) on every transient restart.
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(threshold) = self.stale_reset_threshold &&
+            self.tip_buffer >= threshold
+        {
+            return Err(format!(
+                "tip_buffer ({}) must be smaller than stale_reset_threshold ({threshold})",
+                self.tip_buffer
+            ));
+        }
+        Ok(())
+    }
+
     /// Fetcher in-flight window: number of concurrent `BlockFetcher::fetch` tasks the
     /// fetcher stage may have outstanding at once. Derived from `concurrent_workers ×
     /// in_flight_multiplier`.

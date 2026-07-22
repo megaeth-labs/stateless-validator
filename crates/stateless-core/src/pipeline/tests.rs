@@ -736,6 +736,18 @@ async fn test_block_fetcher_streams_out_of_order() {
     assert!(tokio::time::timeout(Duration::from_secs(5), handle).await.is_ok());
 }
 
+/// `tip_buffer` must stay below `stale_reset_threshold`: the fetcher's built-in lag would
+/// otherwise satisfy the staleness test and anchor-reset on every transient restart.
+#[test]
+fn test_pipeline_config_rejects_tip_buffer_at_or_past_stale_threshold() {
+    let mut cfg = PipelineConfig { tip_buffer: 1000, ..PipelineConfig::default() };
+    assert!(cfg.validate().is_ok(), "no stale threshold: any buffer is fine");
+    cfg.stale_reset_threshold = Some(1000);
+    assert!(cfg.validate().is_err(), "equal is already pathological");
+    cfg.tip_buffer = 999;
+    assert!(cfg.validate().is_ok());
+}
+
 /// `tip_buffer` must keep the fetcher from spawning any fetch within that distance of the
 /// remote tip, so the upstream witness generator has headroom.
 #[tokio::test]

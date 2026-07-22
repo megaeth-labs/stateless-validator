@@ -62,6 +62,8 @@ where
     H: PipelineHooks<Output = P::Output>,
     R: ReorgResolver<F, S>,
 {
+    config.validate().map_err(|e| anyhow!("invalid pipeline config: {e}"))?;
+
     loop {
         if shutdown.is_cancelled() {
             return Ok(());

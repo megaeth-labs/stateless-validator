@@ -391,7 +391,6 @@ impl RpcClient {
         round_robin_with_backoff(
             &self.data_providers,
             &self.data_provider_labels,
-            0,
             &self.data_concurrency,
             &self.config.rpc_retry,
             self.config.per_attempt_timeout,
@@ -634,9 +633,9 @@ impl RpcClient {
 
     /// Like [`Self::get_witness_light_with_deadline`], but skips the first `skip` witness
     /// providers, for callers that know those endpoints cannot serve the request (e.g. an
-    /// internal generator that has pruned the block). Logged provider indices stay relative
-    /// to the full configured witness endpoint list, and the shared witness concurrency cap
-    /// still applies.
+    /// internal generator that has pruned the block). Logged endpoint labels keep their
+    /// position in the full configured witness endpoint list, and the shared witness
+    /// concurrency cap still applies.
     ///
     /// # Panics
     /// Panics if `skip >= witness_provider_count()` — at least one provider must remain.
@@ -663,8 +662,9 @@ impl RpcClient {
     /// are touched only while it is failing), each attempt one RPC round trip followed by the
     /// caller-chosen `decode` (see [`fetch_witness_with`]).
     ///
-    /// `skip` drops the first `skip` witness providers from the rotation while keeping logged
-    /// provider indices and endpoint labels aligned with the full configured list.
+    /// `skip` drops the first `skip` witness providers from the rotation; the logged endpoint
+    /// labels stay aligned with the full configured list because each label bakes in its
+    /// original index (see [`endpoint_label`]).
     // A `warn`-level span (not the usual `info`) so it stays enabled at the default `warn` log
     // filter: the generic retry loop's per-attempt failure logs then inherit `block_number`,
     // which they cannot see otherwise, so an endpoint stall/error is traceable to its block.
@@ -686,7 +686,6 @@ impl RpcClient {
         round_robin_with_backoff(
             &self.witness_providers[skip..],
             &self.witness_provider_labels[skip..],
-            skip,
             &self.witness_concurrency,
             &self.config.rpc_retry,
             self.config.per_attempt_timeout,
@@ -916,20 +915,18 @@ fn endpoint_label(url: &str, idx: usize) -> Arc<str> {
 /// `get_witness()` (pins `rr_start=0` for primary-failover).
 ///
 /// `providers`/`provider_labels` may be parallel slices of the caller's full configured list;
-/// `provider_idx_base` is the offset of those slices within the full list, so logged provider
-/// indices always match the operator's endpoint ordering regardless of slicing (the labels
-/// already carry their original global index, baked in at construction).
-// 11-argument retry primitive. Each field plays a distinct role (providers, their metric/log
-// labels, index base, concurrency, backoff policy, per-attempt timeout, starting provider,
-// method label, metrics sink, deadline, per-attempt closure) and bundling them into a struct
-// would be ceremony without encapsulation — there are exactly two call sites in this crate.
-// Prefer clarity at the definition over fewer commas at the call. `provider_labels` is parallel
-// to `providers` by index.
+/// attempts are identified in logs and errors by their label alone, which bakes in the
+/// endpoint's index in the full list at construction, so slicing never misattributes an
+/// attempt.
+// 10-argument retry primitive. Each field plays a distinct role (providers, their metric/log
+// labels, concurrency, backoff policy, per-attempt timeout, starting provider, method label,
+// metrics sink, deadline, per-attempt closure) and bundling them into a struct would be ceremony
+// without encapsulation — there are exactly two call sites in this crate. Prefer clarity at the
+// definition over fewer commas at the call. `provider_labels` is parallel to `providers` by index.
 #[allow(clippy::too_many_arguments)]
 async fn round_robin_with_backoff<N, T>(
     providers: &[RootProvider<N>],
     provider_labels: &[Arc<str>],
-    provider_idx_base: usize,
     semaphore: &Semaphore,
     policy: &BackoffPolicy,
     per_attempt_timeout: Duration,
@@ -946,7 +943,7 @@ where
     debug_assert_eq!(
         providers.len(),
         provider_labels.len(),
-        "provider_labels must be parallel to providers (indexed by the same provider_idx)",
+        "provider_labels must be parallel to providers (indexed by the same slot)",
     );
 
     // Records the logical-call deadline give-up (once) and builds the typed error. Called from
@@ -990,9 +987,6 @@ where
                 return Err(record_deadline(call_start.elapsed()));
             }
             let slot = (rr_start + offset) % n;
-            // Index into the operator's full configured endpoint list (see
-            // `provider_idx_base`); `slot` indexes the possibly-sliced `providers`/labels.
-            let provider_idx = provider_idx_base + slot;
             let provider_label: &str = &provider_labels[slot];
             let permit = semaphore.acquire().await.expect("semaphore closed unexpectedly");
             // Per-attempt timing: record each provider call individually so histograms
@@ -1020,9 +1014,8 @@ where
                     Ok(Err(e)) => Err((e, RpcAttemptOutcome::Error)),
                     Err(_) => Err((
                         eyre!(
-                            "{} attempt against provider {} ({}) timed out after {:?} (per_attempt_timeout)",
+                            "{} attempt against provider {} timed out after {:?} (per_attempt_timeout)",
                             method.as_str(),
-                            provider_idx,
                             provider_label,
                             attempt_timeout,
                         ),
@@ -1071,7 +1064,6 @@ where
                 // and ops need to see it on round 0 instead of waiting for the round-3 escalation.
                 warn!(
                     method = method.as_str(),
-                    provider_idx,
                     provider = %provider_label,
                     round,
                     attempt_timeout_ms = attempt_timeout.as_millis() as u64,
@@ -1091,7 +1083,6 @@ where
                 log_at!(
                     warn_level,
                     method = method.as_str(),
-                    provider_idx,
                     provider = %provider_label,
                     round,
                     error = %err,
@@ -2234,32 +2225,35 @@ mod tests {
         //   WARNs lose their `block_number` field. Periodically rebuilding the interest cache and
         //   respawning the fetch creates a fresh span under the repaired cache, so the test
         //   self-heals instead of flaking.
-        let spawn_fetch = |client: RpcClient| {
+        // 60 spawns × 20 polls × 25 ms = a 30 s give-up ceiling with a ~500 ms respawn cadence;
+        // the happy path exits on the first poll after the first ~50 ms attempt timeout.
+        let spawn_fetch = || {
+            let client = client.clone();
             tokio::spawn(async move {
                 let _ = client.get_witness_light_with_deadline(4242, B256::ZERO, None).await;
             })
         };
-        let mut fetch = spawn_fetch(client.clone());
-        let give_up = Instant::now() + Duration::from_secs(30);
-        let mut respawn_at = Instant::now() + Duration::from_millis(500);
-        loop {
-            let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-            if logs.contains("block_number") && logs.contains("4242") {
-                break;
-            }
-            assert!(
-                Instant::now() < give_up,
-                "witness failure log must carry the block_number span field, got:\n{logs}"
-            );
-            if Instant::now() >= respawn_at {
-                fetch.abort();
+        let mut logs = String::new();
+        let mut found = false;
+        for attempt in 0..60 {
+            if attempt > 0 {
                 tracing::callsite::rebuild_interest_cache();
                 buf.lock().unwrap().clear();
-                fetch = spawn_fetch(client.clone());
-                respawn_at = Instant::now() + Duration::from_millis(500);
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            let fetch = spawn_fetch();
+            for _ in 0..20 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+                if logs.contains("block_number") && logs.contains("4242") {
+                    found = true;
+                    break;
+                }
+            }
+            fetch.abort();
+            if found {
+                break;
+            }
         }
-        fetch.abort();
+        assert!(found, "witness failure log must carry the block_number span field, got:\n{logs}");
     }
 }

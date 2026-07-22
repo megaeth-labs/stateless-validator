@@ -363,26 +363,19 @@ async fn main() -> Result<()> {
     let rpc_client =
         Arc::new(RpcClient::new_with_config(&data_apis, &witness_apis, rpc_config, None)?);
 
-    // Historical witness routing: blocks at least `--witness-local-window` below the local
-    // tip skip the first witness endpoint (the internal generator, which only retains about
-    // that window and is a guaranteed miss for anything older). Needs a fallback endpoint to
-    // route to, and a local DB whose tip anchors block age.
-    let route_historical = witness_apis.len() >= 2 && args.data_dir.is_some();
-    if route_historical {
-        info!(
+    match (witness_apis.len() >= 2, args.data_dir.is_some()) {
+        (true, true) => info!(
             witness_local_window = args.witness_local_window,
             skipped_endpoint = witness_apis[0],
             "Historical witnesses (at least the local window below the tip) skip the internal \
              generator endpoint"
-        );
-    } else if witness_apis.len() >= 2 {
-        warn!(
+        ),
+        (true, false) => warn!(
             "Multiple witness endpoints but no --data-dir: historical witness routing is \
              inactive (block age is anchored to the local DB tip); all witness fetches use the \
              full endpoint chain"
-        );
-    } else {
-        debug!("Single witness endpoint configured; no historical witness routing");
+        ),
+        (false, _) => debug!("Single witness endpoint configured; no historical witness routing"),
     }
 
     let validator_db = init_validator_db(&args, &rpc_client).await?;
@@ -405,14 +398,13 @@ async fn main() -> Result<()> {
         witness_timeout: std::time::Duration::from_secs(args.witness_timeout),
         old_block_witness_timeout: std::time::Duration::from_secs(args.witness_old_block_timeout),
         local_window: args.witness_local_window,
-        route_historical,
     };
     let data_provider = Arc::new(DataProvider::new(
         rpc_client.clone(),
         block_store.clone(),
         contract_cache,
         witness_cfg,
-        args.block_fetch_timeout,
+        std::time::Duration::from_secs(args.block_fetch_timeout),
     ));
 
     let chain_spec = load_chain_spec(&args)?;
@@ -761,28 +753,38 @@ mod tests {
     /// generator's `BACKUP`, the old-block budget defaults to the full witness budget) and the
     /// CLI + env parsing of all three knobs — a typo in an env attribute string would
     /// otherwise ship silently to env-only container deployments.
+    /// Parses `Args` from the minimal required flags plus `extra`. Callers must hold
+    /// `stateless_test_utils::env::env_lock()` — parsing reads `DEBUG_TRACE_SERVER_*` env
+    /// vars, so it must be serialized with the tests that mutate them.
+    fn parse_args(extra: &[&str]) -> Args {
+        let base =
+            ["debug-trace-server", "--rpc-endpoint", "http://r", "--witness-endpoint", "http://w"];
+        Args::try_parse_from(base.iter().chain(extra)).unwrap()
+    }
+
     #[test]
     fn tiered_routing_flag_defaults() {
         let guard = stateless_test_utils::env::env_lock();
-        let base =
-            ["debug-trace-server", "--rpc-endpoint", "http://r", "--witness-endpoint", "http://w"];
-        let parse = |extra: &[&str]| Args::try_parse_from(base.iter().chain(extra)).unwrap();
 
-        let defaults = parse(&[]);
+        let defaults = parse_args(&[]);
         assert_eq!(defaults.witness_local_window, data_provider::DEFAULT_WITNESS_LOCAL_WINDOW);
         assert_eq!(
             defaults.witness_old_block_timeout,
             data_provider::DEFAULT_OLD_BLOCK_WITNESS_TIMEOUT_SECS
         );
-        assert_eq!(data_provider::DEFAULT_OLD_BLOCK_WITNESS_TIMEOUT_SECS, 8);
+        assert_eq!(
+            data_provider::DEFAULT_OLD_BLOCK_WITNESS_TIMEOUT_SECS,
+            data_provider::DEFAULT_WITNESS_TIMEOUT_SECS,
+            "old blocks default to the full witness budget",
+        );
         assert_eq!(defaults.tip_buffer, 2);
 
-        assert_eq!(parse(&["--tip-buffer", "0"]).tip_buffer, 0);
-        assert_eq!(parse(&["--witness-local-window", "128"]).witness_local_window, 128);
-        assert_eq!(parse(&["--witness-old-block-timeout", "3"]).witness_old_block_timeout, 3);
+        assert_eq!(parse_args(&["--tip-buffer", "0"]).tip_buffer, 0);
+        assert_eq!(parse_args(&["--witness-local-window", "128"]).witness_local_window, 128);
+        assert_eq!(parse_args(&["--witness-old-block-timeout", "3"]).witness_old_block_timeout, 3);
 
         let env = |name, value: &str| {
-            stateless_test_utils::env::with_env_var(&guard, name, value, || parse(&[]))
+            stateless_test_utils::env::with_env_var(&guard, name, value, || parse_args(&[]))
         };
         assert_eq!(env("DEBUG_TRACE_SERVER_TIP_BUFFER", "5").tip_buffer, 5);
         assert_eq!(env("DEBUG_TRACE_SERVER_WITNESS_LOCAL_WINDOW", "256").witness_local_window, 256);
@@ -797,20 +799,15 @@ mod tests {
     /// transient restart. Inert in stateless mode, where neither flag is used.
     #[test]
     fn tip_buffer_must_stay_below_blocks_to_keep() {
-        // Args parsing reads `DEBUG_TRACE_SERVER_*` env vars, so it must be serialized with
-        // the tests that mutate them.
         let _guard = stateless_test_utils::env::env_lock();
-        let base =
-            ["debug-trace-server", "--rpc-endpoint", "http://r", "--witness-endpoint", "http://w"];
-        let parse = |extra: &[&str]| Args::try_parse_from(base.iter().chain(extra)).unwrap();
 
         // Stateless mode (no data dir): both flags are inert, any combination is accepted.
-        assert!(validate_args(&parse(&["--tip-buffer", "2000"])).is_ok());
+        assert!(validate_args(&parse_args(&["--tip-buffer", "2000"])).is_ok());
 
         let with_db = |extra: &[&str]| {
             let mut v = vec!["--data-dir", "/tmp/x"];
             v.extend_from_slice(extra);
-            parse(&v)
+            parse_args(&v)
         };
         assert!(validate_args(&with_db(&[])).is_ok());
         assert!(validate_args(&with_db(&["--tip-buffer", "999"])).is_ok());
