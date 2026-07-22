@@ -2105,14 +2105,21 @@ mod tests {
         let stalled_url = format!("http://{}/", listener.local_addr().unwrap());
         let _listener = listener;
         let config = RpcClientConfig {
-            per_attempt_timeout: Duration::from_millis(80),
+            per_attempt_timeout: Duration::from_millis(50),
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
             ..Default::default()
         };
         let client =
             RpcClient::new_with_config(&[&stalled_url], &[&stalled_url], config, None).unwrap();
 
-        let deadline = Instant::now() + Duration::from_millis(120);
-        let _ = client.get_witness_light_with_deadline(4242, B256::ZERO, Some(deadline)).await;
+        // `deadline = None` so every per-attempt timeout emits the stall WARN (no deadline branch
+        // can steal it) — the assertion is independent of runner load. The outer timeout bounds
+        // the otherwise-unbounded retry so the test terminates.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(1),
+            client.get_witness_light_with_deadline(4242, B256::ZERO, None),
+        )
+        .await;
 
         let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
