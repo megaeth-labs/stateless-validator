@@ -398,7 +398,7 @@ impl RpcClient {
             method,
             self.config.metrics.as_ref(),
             deadline,
-            |provider| f(provider.clone()),
+            |provider, _provider_label| f(provider.clone()),
         )
         .await
     }
@@ -653,9 +653,10 @@ impl RpcClient {
             RpcMethod::MegaGetBlockWitness,
             self.config.metrics.as_ref(),
             deadline,
-            |provider| {
+            |provider, provider_label| {
                 Box::pin(async move {
-                    fetch_witness_with(&provider, number, hash, decode, trace_msg).await
+                    fetch_witness_with(&provider, &provider_label, number, hash, decode, trace_msg)
+                        .await
                 })
             },
         )
@@ -880,7 +881,7 @@ async fn round_robin_with_backoff<N, T>(
     method: RpcMethod,
     metrics: Option<&Arc<dyn RpcMetrics>>,
     deadline: Option<Instant>,
-    f: impl Fn(RootProvider<N>) -> BoxFuture<Result<T>>,
+    f: impl Fn(RootProvider<N>, Arc<str>) -> BoxFuture<Result<T>>,
 ) -> std::result::Result<T, RpcDeadlineExceeded>
 where
     N: alloy_provider::Network,
@@ -944,8 +945,11 @@ where
             // Classify the attempt into a value or a (typed error, reason) pair, so the failure
             // reason — a returned error vs a per-attempt stall — survives to the metrics and logs.
             let attempt: std::result::Result<T, (eyre::Error, RpcAttemptOutcome)> =
-                match tokio::time::timeout(attempt_timeout, f(providers[provider_idx].clone()))
-                    .await
+                match tokio::time::timeout(
+                    attempt_timeout,
+                    f(providers[provider_idx].clone(), Arc::clone(&provider_labels[provider_idx])),
+                )
+                .await
                 {
                     Ok(Ok(v)) => Ok(v),
                     Ok(Err(e)) => Err((e, RpcAttemptOutcome::Error)),
@@ -1156,17 +1160,20 @@ async fn do_get_header(
 /// multi-MB payload is CPU-bound).
 async fn fetch_witness_with<T: Send + 'static>(
     provider: &RootProvider,
+    provider_label: &str,
     number: u64,
     hash: B256,
     decode: fn(&str) -> std::result::Result<T, crate::WitnessDecodingError>,
     trace_msg: &'static str,
 ) -> Result<T> {
     let keys = WitnessRequestKeys { block_number: U64::from(number), block_hash: hash };
+    let request_start = Instant::now();
     let encoded: String = provider
         .client()
         .request("mega_getBlockWitness", (keys,))
         .await
         .map_err(|e| eyre!("mega_getBlockWitness failed for block {number}: {e}"))?;
+    let request_ms = request_start.elapsed().as_millis();
 
     let decode_start = Instant::now();
     let result = tokio::task::spawn_blocking(move || -> Result<T> {
@@ -1175,10 +1182,14 @@ async fn fetch_witness_with<T: Send + 'static>(
     .await
     .context("decode task panicked")??;
 
+    // Per-endpoint success trace: names the serving endpoint and splits the RPC round trip from the
+    // CPU-bound decode, so a slow witness fetch can be attributed to the right fallback endpoint.
     trace!(
         block_number = number,
         %hash,
-        decode_ms = decode_start.elapsed().as_millis(),
+        provider = %provider_label,
+        request_ms = request_ms as u64,
+        decode_ms = decode_start.elapsed().as_millis() as u64,
         "{trace_msg}",
     );
 
