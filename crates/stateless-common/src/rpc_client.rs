@@ -47,7 +47,7 @@ use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
 use stateless_core::{LightWitness, withdrawals::MptWitness};
 use tokio::sync::Semaphore;
-use tracing::{trace, warn};
+use tracing::{instrument, trace, warn};
 
 use crate::{
     metrics::{RpcAttemptOutcome, RpcMethod, RpcMetrics},
@@ -635,6 +635,10 @@ impl RpcClient {
     /// provider 0 so the primary takes all traffic while healthy; backups are touched only
     /// while it is failing), each attempt one RPC round trip followed by the caller-chosen
     /// `decode` (see [`fetch_witness_with`]).
+    // A `warn`-level span (not the usual `info`) so it stays enabled at the default `warn` log
+    // filter: the generic retry loop's per-attempt failure logs then inherit `block_number`,
+    // which they cannot see otherwise, so an endpoint stall/error is traceable to its block.
+    #[instrument(level = "warn", skip_all, fields(block_number = number, block_hash = %hash))]
     async fn witness_round_robin<T: Send + 'static>(
         &self,
         number: u64,
@@ -2056,5 +2060,58 @@ mod tests {
         );
 
         h.stop().unwrap();
+    }
+
+    /// A stalled witness fetch's failure log must carry `block_number` even at the default `warn`
+    /// filter, proving the `warn`-level span propagates block context into the generic retry
+    /// loop's per-attempt logs (which have no block identifier of their own).
+    #[tokio::test]
+    async fn test_witness_failure_log_carries_block_number() {
+        #[derive(Clone)]
+        struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+            type Writer = SharedBuf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(SharedBuf(buf.clone()))
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Stalled endpoint: accepts the TCP connection but never replies, so the per-attempt
+        // timeout fires and the retry loop emits its stall WARN — the log we assert on.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stalled_url = format!("http://{}/", listener.local_addr().unwrap());
+        let _listener = listener;
+        let config = RpcClientConfig {
+            per_attempt_timeout: Duration::from_millis(80),
+            ..Default::default()
+        };
+        let client =
+            RpcClient::new_with_config(&[&stalled_url], &[&stalled_url], config, None).unwrap();
+
+        let deadline = Instant::now() + Duration::from_millis(120);
+        let _ = client.get_witness_light_with_deadline(4242, B256::ZERO, Some(deadline)).await;
+
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("block_number") && logs.contains("4242"),
+            "witness failure log must carry the block_number span field, got:\n{logs}"
+        );
     }
 }
