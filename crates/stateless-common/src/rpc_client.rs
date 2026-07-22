@@ -843,17 +843,25 @@ macro_rules! log_at {
     };
 }
 
-/// Derives a bounded, credential-free metric/log label for an endpoint URL.
+/// Derives a bounded, credential-free, per-endpoint metric/log label from an endpoint URL and its
+/// index in the configured list.
 ///
-/// Returns the URL authority's host (with port, if present), stripping any `user:pass@` userinfo
-/// so endpoint credentials never leak into metric labels or logs. Cardinality is bounded because
-/// the endpoint list is operator-configured. Falls back to `provider_{idx}` when no host can be
-/// extracted (unreachable for the validated URLs the constructor accepts, but kept total).
+/// Format is `{idx}:{host}`: the host (with port) stays human-readable, while the index keeps two
+/// endpoints that share an authority (same SaaS host, different path or credentials) distinct — so
+/// the per-endpoint metric split holds instead of aggregating them — and also encodes primary (0)
+/// vs failover (1+). Any `user:pass@` userinfo is stripped so endpoint credentials never leak into
+/// labels or logs; cardinality is bounded because the endpoint list is operator-configured. Falls
+/// back to `provider_{idx}` when no host can be extracted (unreachable for the validated URLs the
+/// constructor accepts, but kept total).
 fn endpoint_label(url: &str, idx: usize) -> Arc<str> {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     let authority = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
     let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
-    if host.is_empty() { Arc::from(format!("provider_{idx}")) } else { Arc::from(host) }
+    if host.is_empty() {
+        Arc::from(format!("provider_{idx}"))
+    } else {
+        Arc::from(format!("{idx}:{host}"))
+    }
 }
 
 /// Runs a round-robin RPC call with round-level exponential backoff and an optional deadline.
@@ -992,19 +1000,25 @@ where
                 Err(pair) => pair,
             };
 
-            // Record every failed attempt with its endpoint + reason (error vs timeout).
+            // A per-attempt timeout that also blew the overall deadline is deadline pressure, not
+            // a provider stall: the attempt window was clamped to the little budget left, so the
+            // provider never got a fair round trip. Attribute it to the deadline (record_deadline)
+            // and do NOT record a per-provider `timeout` — otherwise the timeout metric blames the
+            // endpoint for the caller's exhausted budget.
+            if outcome == RpcAttemptOutcome::Timeout &&
+                let Some(d) = deadline &&
+                Instant::now() >= d
+            {
+                return Err(record_deadline(call_start.elapsed()));
+            }
+
+            // Record the failed attempt against its endpoint with the reason (error vs a genuine
+            // stall — a full per-attempt window elapsed with budget still remaining).
             if let Some(m) = metrics {
                 m.on_rpc_attempt(method, provider_label, outcome, attempt_duration);
             }
 
-            // A per-attempt timeout that also blew the overall deadline ends the call: record the
-            // give-up and return the typed error. No retry — this attempt was the last.
             if outcome == RpcAttemptOutcome::Timeout {
-                if let Some(d) = deadline &&
-                    Instant::now() >= d
-                {
-                    return Err(record_deadline(call_start.elapsed()));
-                }
                 // Stalled but budget remains. Always WARN, regardless of round — a stalled
                 // provider (TCP-accept-no-reply) is the failure mode this guard exists to catch,
                 // and ops need to see it on round 0 instead of waiting for the round-3 escalation.
@@ -1951,13 +1965,18 @@ mod tests {
     fn test_endpoint_label_extracts_host_without_credentials() {
         assert_eq!(
             &*endpoint_label("http://witness.example.com:8545/rpc", 0),
-            "witness.example.com:8545"
+            "0:witness.example.com:8545"
         );
-        assert_eq!(&*endpoint_label("http://127.0.0.1:9000", 1), "127.0.0.1:9000");
+        assert_eq!(&*endpoint_label("http://127.0.0.1:9000", 1), "1:127.0.0.1:9000");
         // userinfo, path, and query are all stripped — no credential can reach a label/log.
-        assert_eq!(&*endpoint_label("https://user:secret@host.io/v1?token=abc", 2), "host.io");
+        assert_eq!(&*endpoint_label("https://user:secret@host.io/v1?token=abc", 2), "2:host.io");
         // No host to extract → stable positional fallback.
         assert_eq!(&*endpoint_label("", 3), "provider_3");
+        // Same authority, different index → distinct labels, so per-endpoint metrics don't merge.
+        assert_ne!(
+            endpoint_label("https://gw.saas.io/key-a", 0),
+            endpoint_label("https://gw.saas.io/key-b", 1)
+        );
     }
 
     /// Captures [`RpcMetrics`] callbacks so tests can assert per-endpoint attribution.
