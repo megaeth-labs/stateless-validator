@@ -105,7 +105,7 @@ The background chain-sync prefetch always uses the full endpoint chain.
 
 **Witness routing and sync knobs** (each also settable via its `DEBUG_TRACE_SERVER_*` env var):
 - `--witness-local-window`: Block-age threshold for the historical witness route (default: 4096; should match the generator's `BACKUP`).
-- `--witness-old-block-timeout`: Witness-stage budget in seconds for blocks at or below the local tip (default: 8, the full witness budget; lower it to fail fast on pruned blocks).
+- `--witness-old-block-timeout`: Witness-stage budget in seconds for blocks at or below the local tip (defaults to the full `--witness-timeout` budget, tracking it when raised; lower it to fail fast on pruned blocks).
 - `--tip-buffer`: Stay this many blocks behind the upstream head during chain sync so fetches don't race the witness generator (default: 2; must be smaller than `--blocks-to-keep`).
 
 ### Environment Variables

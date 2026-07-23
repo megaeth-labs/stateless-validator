@@ -66,12 +66,13 @@ pub(crate) struct WitnessFetchConfig {
 }
 
 impl WitnessFetchConfig {
-    /// Config with default budgets and window.
+    /// Config with the default window and the default old-block budget (the full witness
+    /// budget, mirroring the unset `--witness-old-block-timeout` behavior).
     #[cfg(test)]
     pub fn with_defaults(witness_timeout_secs: u64) -> Self {
         Self {
             witness_timeout: Duration::from_secs(witness_timeout_secs),
-            old_block_witness_timeout: Duration::from_secs(DEFAULT_OLD_BLOCK_WITNESS_TIMEOUT_SECS),
+            old_block_witness_timeout: Duration::from_secs(witness_timeout_secs),
             local_window: DEFAULT_WITNESS_LOCAL_WINDOW,
         }
     }
@@ -108,13 +109,6 @@ pub struct BlockData {
 /// the witness is still being generated upstream" case where a few seconds of waiting is
 /// normal.
 pub const DEFAULT_WITNESS_TIMEOUT_SECS: u64 = 8;
-
-/// Default witness-stage budget for blocks at or below the local tip: the full witness budget.
-///
-/// A tighter fail-fast here converts slow-but-successful fetches into client-visible timeouts
-/// whenever the witness tail latency approaches the cap. Operators who prefer failing fast on
-/// blocks whose witness is likely gone everywhere can lower `--witness-old-block-timeout`.
-pub const DEFAULT_OLD_BLOCK_WITNESS_TIMEOUT_SECS: u64 = DEFAULT_WITNESS_TIMEOUT_SECS;
 
 /// Default local-tip window (in blocks): witnesses at least this far below the local tip are
 /// historical and skip the internal generator endpoint (see [`witness_route`]).

@@ -225,14 +225,10 @@ struct Args {
     witness_local_window: u64,
 
     /// Witness-stage budget in seconds for blocks at or below the local tip. Defaults to the
-    /// full witness budget; lower it to fail fast on blocks whose witness is likely pruned
-    /// everywhere. Clamped to `--witness-timeout`.
-    #[clap(
-        long,
-        env = "DEBUG_TRACE_SERVER_WITNESS_OLD_BLOCK_TIMEOUT",
-        default_value_t = data_provider::DEFAULT_OLD_BLOCK_WITNESS_TIMEOUT_SECS
-    )]
-    witness_old_block_timeout: u64,
+    /// full `--witness-timeout` budget (tracking it when raised); lower it to fail fast on
+    /// blocks whose witness is likely pruned everywhere. Clamped to `--witness-timeout`.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_OLD_BLOCK_TIMEOUT")]
+    witness_old_block_timeout: Option<u64>,
 
     /// Chain-sync pipeline tip buffer: stay this many blocks behind the upstream head so the
     /// fetcher does not race the witness generator — a fetch issued the moment a block appears
@@ -294,6 +290,13 @@ fn parse_size(s: &str) -> Result<u64, String> {
     value.checked_mul(multiplier).ok_or_else(|| format!("size overflow: '{}'", s))
 }
 
+/// Effective old-block witness budget in seconds: the flag when set (clamped to
+/// `--witness-timeout`), otherwise the full `--witness-timeout` budget — raising the witness
+/// budget also raises the old-block cap.
+fn old_block_witness_timeout_secs(args: &Args) -> u64 {
+    args.witness_old_block_timeout.unwrap_or(args.witness_timeout).min(args.witness_timeout)
+}
+
 /// Validates cross-flag invariants that clap cannot express per-field.
 fn validate_args(args: &Args) -> Result<()> {
     // Only meaningful with chain sync: the fetcher holds the local tip `tip_buffer` blocks
@@ -325,7 +328,7 @@ async fn main() -> Result<()> {
         rpc_endpoints = ?args.rpc_endpoint,
         witness_endpoints = ?args.witness_endpoint,
         witness_timeout_secs = args.witness_timeout,
-        witness_old_block_timeout_secs = args.witness_old_block_timeout,
+        witness_old_block_timeout_secs = old_block_witness_timeout_secs(&args),
         witness_local_window = args.witness_local_window,
         tip_buffer = args.tip_buffer,
         response_cache_disabled,
@@ -401,7 +404,9 @@ async fn main() -> Result<()> {
 
     let witness_cfg = WitnessFetchConfig {
         witness_timeout: std::time::Duration::from_secs(args.witness_timeout),
-        old_block_witness_timeout: std::time::Duration::from_secs(args.witness_old_block_timeout),
+        old_block_witness_timeout: std::time::Duration::from_secs(old_block_witness_timeout_secs(
+            &args,
+        )),
         local_window: args.witness_local_window,
     };
     let data_provider = Arc::new(DataProvider::new(
@@ -773,20 +778,32 @@ mod tests {
 
         let defaults = parse_args(&[]);
         assert_eq!(defaults.witness_local_window, data_provider::DEFAULT_WITNESS_LOCAL_WINDOW);
+        assert_eq!(defaults.witness_old_block_timeout, None);
         assert_eq!(
-            defaults.witness_old_block_timeout,
-            data_provider::DEFAULT_OLD_BLOCK_WITNESS_TIMEOUT_SECS
-        );
-        assert_eq!(
-            data_provider::DEFAULT_OLD_BLOCK_WITNESS_TIMEOUT_SECS,
+            old_block_witness_timeout_secs(&defaults),
             data_provider::DEFAULT_WITNESS_TIMEOUT_SECS,
             "old blocks default to the full witness budget",
         );
         assert_eq!(defaults.tip_buffer, 2);
 
+        // The unset default tracks a raised --witness-timeout; an explicit flag wins.
+        assert_eq!(old_block_witness_timeout_secs(&parse_args(&["--witness-timeout", "20"])), 20);
+        assert_eq!(
+            old_block_witness_timeout_secs(&parse_args(&[
+                "--witness-timeout",
+                "20",
+                "--witness-old-block-timeout",
+                "3"
+            ])),
+            3
+        );
+
         assert_eq!(parse_args(&["--tip-buffer", "0"]).tip_buffer, 0);
         assert_eq!(parse_args(&["--witness-local-window", "128"]).witness_local_window, 128);
-        assert_eq!(parse_args(&["--witness-old-block-timeout", "3"]).witness_old_block_timeout, 3);
+        assert_eq!(
+            parse_args(&["--witness-old-block-timeout", "3"]).witness_old_block_timeout,
+            Some(3)
+        );
 
         let env = |name, value: &str| {
             stateless_test_utils::env::with_env_var(&guard, name, value, || parse_args(&[]))
@@ -795,7 +812,7 @@ mod tests {
         assert_eq!(env("DEBUG_TRACE_SERVER_WITNESS_LOCAL_WINDOW", "256").witness_local_window, 256);
         assert_eq!(
             env("DEBUG_TRACE_SERVER_WITNESS_OLD_BLOCK_TIMEOUT", "4").witness_old_block_timeout,
-            4
+            Some(4)
         );
     }
 
