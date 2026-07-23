@@ -24,6 +24,12 @@ use crate::{metrics, response_cache::ResponseCache, server_db::BlockStore};
 /// Witnesses go through the zero-validation light decode (`get_witness_light`):
 /// the server never verifies the proof, so the full decode's per-point
 /// elliptic-curve work bought nothing.
+///
+/// Witness fetches deliberately use the full endpoint chain (no age-based routing): the sync
+/// frontier trails the remote head by only `tip_buffer`, inside the generator's retention —
+/// except during deep catch-up with `--blocks-to-keep` beyond that retention, where each
+/// pruned block burns one generator probe before failover (accepted; routing here would need
+/// a remote-head anchor instead of the local tip).
 pub struct TraceFetcher {
     pub rpc_client: Arc<RpcClient>,
 }

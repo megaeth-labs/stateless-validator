@@ -100,7 +100,8 @@ Two operating modes:
 
 **Witness endpoint ordering:**
 For the debug-trace-server, the first `--witness-endpoint` is positionally special: it is treated as the internal witness generator, so list the generator first and durable fallbacks (e.g. an R2-backed witness service) after it.
-In local cache mode with two or more witness endpoints, blocks at least `--witness-local-window` blocks below the local tip skip that first endpoint and fetch from the remaining endpoints, because the generator only retains a recent window (its `BACKUP`, deployed at 4096) and probing it for pruned blocks is a guaranteed miss.
+In local cache mode with two or more witness endpoints, requests for blocks at least `--witness-local-window` blocks below the local tip skip that first endpoint and fetch from the remaining endpoints, because the generator only retains a recent window (its `BACKUP`, deployed at 4096) and probing it for pruned blocks is a guaranteed miss.
+The background chain-sync prefetch always uses the full endpoint chain.
 
 **Witness routing and sync knobs** (each also settable via its `DEBUG_TRACE_SERVER_*` env var):
 - `--witness-local-window`: Block-age threshold for the historical witness route (default: 4096; should match the generator's `BACKUP`).

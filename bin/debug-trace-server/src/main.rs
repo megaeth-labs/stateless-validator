@@ -3,8 +3,9 @@
 //! # Overview
 //! A standalone RPC server for `debug_*` and `trace_*` methods using stateless execution.
 //! Data can be fetched from upstream RPC endpoints or from a local database with chain sync.
-//! Witness fetches route by block age: historical blocks skip the internal generator endpoint
-//! (which only retains a small recent window) and go straight to the fallback endpoints.
+//! Request-serving witness fetches route by block age: historical blocks skip the internal
+//! generator endpoint (which only retains a small recent window) and go straight to the
+//! fallback endpoints. Chain-sync prefetch always uses the full chain.
 //!
 //! # Architecture
 //! ```text
@@ -213,8 +214,9 @@ struct Args {
     /// skip the first witness endpoint — the generator only retains about this window (its
     /// `BACKUP` env, deployed at 4096), so probing it for historical blocks is a guaranteed
     /// miss. Requires at least two witness endpoints and a local DB (`--data-dir`), whose tip
-    /// anchors block age; otherwise all blocks use the full chain. Should match the
-    /// generator's `BACKUP`.
+    /// anchors block age; otherwise all blocks use the full chain. Applies to request
+    /// serving; chain-sync prefetch always uses the full chain. Should match the generator's
+    /// `BACKUP`.
     #[clap(
         long,
         env = "DEBUG_TRACE_SERVER_WITNESS_LOCAL_WINDOW",

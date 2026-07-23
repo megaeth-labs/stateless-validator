@@ -107,7 +107,8 @@ Two operating modes:
 - **Local cache mode** — With `data_dir`, enables chain sync to pre-fetch blocks into `ValidatorDB` for faster serving.
 
 The server includes an HTTP response cache (`quick_cache`) for pre-serialized JSON and a `DataProvider` with single-flight request coalescing.
-In local cache mode with two or more witness endpoints, witness fetches route by block age: blocks at least `--witness-local-window` blocks below the local tip skip the first witness endpoint (the internal generator, which prunes beyond its `BACKUP` window) and fetch from the remaining endpoints.
+In local cache mode with two or more witness endpoints, request-serving witness fetches route by block age: blocks at least `--witness-local-window` blocks below the local tip skip the first witness endpoint (the internal generator, which prunes beyond its `BACKUP` window) and fetch from the remaining endpoints.
+The background chain-sync prefetch always uses the full endpoint chain — it fetches at the sync frontier, which stays within the generator's retention unless `--blocks-to-keep` exceeds that retention during deep catch-up.
 
 ### Key Source Files
 
