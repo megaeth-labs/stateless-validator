@@ -100,19 +100,28 @@ struct Args {
     )]
     rpc_endpoint: Vec<String>,
 
-    /// One or more upstream witness endpoint URLs for fetching witness data (tried in order).
+    /// One or more durable witness endpoint URLs for fetching witness data (tried in order).
     /// Accepts repeated flags (`--witness-endpoint a --witness-endpoint b`) or a comma-separated
-    /// list (`--witness-endpoint a,b`, also via the env var). The first endpoint is positionally
-    /// special: it is treated as the internal witness generator and is skipped for historical
-    /// blocks (see `--witness-local-window`).
+    /// list (`--witness-endpoint a,b`, also via the env var). Deprecated fallback: when
+    /// `--witness-generator-endpoint` is absent and two or more endpoints are listed here, the
+    /// first is treated as the internal generator (see that flag).
     #[clap(
         long,
         env = "DEBUG_TRACE_SERVER_WITNESS_ENDPOINT",
-        required = true,
+        required_unless_present = "witness_generator_endpoint",
         value_delimiter = ',',
         action = clap::ArgAction::Append,
     )]
     witness_endpoint: Vec<String>,
+
+    /// The internal witness generator endpoint. It is probed first for recent blocks and
+    /// skipped for historical ones (it only retains about `--witness-local-window` blocks),
+    /// while `--witness-endpoint` lists the durable fallbacks (optional when this flag is
+    /// set — generator-only works like any single-endpoint config, without routing). When
+    /// absent, the first of two or more `--witness-endpoint` values fills this role
+    /// (deprecated positional form).
+    #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_GENERATOR_ENDPOINT")]
+    witness_generator_endpoint: Option<String>,
 
     /// Enable Prometheus metrics exporter.
     #[clap(long, env = "DEBUG_TRACE_SERVER_METRICS_ENABLED")]
@@ -213,7 +222,8 @@ struct Args {
     /// full witness endpoint chain (internal generator first); blocks at least this far below
     /// skip the first witness endpoint — the generator only retains about this window (its
     /// `BACKUP` env, deployed at 4096), so probing it for historical blocks is a guaranteed
-    /// miss. Requires at least two witness endpoints and a local DB (`--data-dir`), whose tip
+    /// miss. Requires a generator plus at least one fallback witness endpoint (see
+    /// `--witness-generator-endpoint`) and a local DB (`--data-dir`), whose tip
     /// anchors block age; otherwise all blocks use the full chain. Applies to request
     /// serving; chain-sync prefetch always uses the full chain. Should match the generator's
     /// `BACKUP`.
@@ -297,6 +307,22 @@ fn old_block_witness_timeout_secs(args: &Args) -> u64 {
     args.witness_old_block_timeout.unwrap_or(args.witness_timeout).min(args.witness_timeout)
 }
 
+/// The combined witness endpoint chain — the internal generator (when configured) first, then
+/// the durable fallbacks — plus whether the generator slot comes from the deprecated
+/// positional form (no `--witness-generator-endpoint`, two or more `--witness-endpoint`).
+///
+/// The chain always has the generator at index 0 when one exists, so the fetch-side routing
+/// derivation (skip the first endpoint iff the chain has at least two) holds under both the
+/// typed flag and the deprecated form.
+fn witness_endpoint_chain(args: &Args) -> (Vec<&str>, bool) {
+    let mut chain: Vec<&str> = Vec::with_capacity(args.witness_endpoint.len() + 1);
+    chain.extend(args.witness_generator_endpoint.as_deref());
+    chain.extend(args.witness_endpoint.iter().map(String::as_str));
+    let deprecated_positional =
+        args.witness_generator_endpoint.is_none() && args.witness_endpoint.len() >= 2;
+    (chain, deprecated_positional)
+}
+
 /// Validates cross-flag invariants that clap cannot express per-field.
 fn validate_args(args: &Args) -> Result<()> {
     // Only meaningful with chain sync: the fetcher holds the local tip `tip_buffer` blocks
@@ -308,6 +334,18 @@ fn validate_args(args: &Args) -> Result<()> {
             "--tip-buffer ({}) must be smaller than --blocks-to-keep ({})",
             args.tip_buffer,
             args.blocks_to_keep
+        );
+    }
+    // A generator listed again under --witness-endpoint would put the generator back into the
+    // historical route's fallback rotation — every historical fetch would probe the pruned
+    // endpoint the routing exists to skip, silently. The likely cause is migrating to
+    // --witness-generator-endpoint without removing the generator from the fallback list.
+    if let Some(generator) = &args.witness_generator_endpoint &&
+        args.witness_endpoint.contains(generator)
+    {
+        eyre::bail!(
+            "--witness-generator-endpoint ({generator}) must not also appear in \
+             --witness-endpoint: list the generator once, via the dedicated flag"
         );
     }
     Ok(())
@@ -324,9 +362,13 @@ async fn main() -> Result<()> {
         "Debug-trace-server starting"
     );
     let response_cache_disabled = args.response_cache_estimated_items == 0;
+    // The combined witness chain (generator first when configured) — the list actually fed to
+    // the RPC client, not just the fallback flag values.
+    let (witness_apis, deprecated_positional_generator) = witness_endpoint_chain(&args);
     debug!(
         rpc_endpoints = ?args.rpc_endpoint,
-        witness_endpoints = ?args.witness_endpoint,
+        witness_endpoints = ?witness_apis,
+        witness_generator_configured = args.witness_generator_endpoint.is_some(),
         witness_timeout_secs = args.witness_timeout,
         witness_old_block_timeout_secs = old_block_witness_timeout_secs(&args),
         witness_local_window = args.witness_local_window,
@@ -353,7 +395,6 @@ async fn main() -> Result<()> {
 
     // Initialize components
     let data_apis: Vec<&str> = args.rpc_endpoint.iter().map(String::as_str).collect();
-    let witness_apis: Vec<&str> = args.witness_endpoint.iter().map(String::as_str).collect();
     let rpc_defaults = RpcClientConfig::trace_server();
     let per_attempt_timeout = args
         .rpc_per_attempt_timeout_ms
@@ -370,18 +411,27 @@ async fn main() -> Result<()> {
         Arc::new(RpcClient::new_with_config(&data_apis, &witness_apis, rpc_config, None)?);
 
     match (witness_apis.len() >= 2, args.data_dir.is_some()) {
-        (true, true) => info!(
-            witness_local_window = args.witness_local_window,
-            // The credential-stripped label, not the raw URL — configured endpoint URLs may
-            // carry userinfo or token queries and this log line is info-level.
-            skipped_endpoint = rpc_client.witness_provider_label(0).unwrap_or("<none>"),
-            "Historical witnesses (at least the local window below the tip) skip the internal \
-             generator endpoint"
-        ),
+        (true, true) => {
+            info!(
+                witness_local_window = args.witness_local_window,
+                // The credential-stripped label, not the raw URL — configured endpoint URLs
+                // may carry userinfo or token queries and this log line is info-level.
+                skipped_endpoint = rpc_client.witness_provider_label(0).unwrap_or("<none>"),
+                "Historical witnesses (at least the local window below the tip) skip the \
+                 internal generator endpoint"
+            );
+            if deprecated_positional_generator {
+                warn!(
+                    "The first --witness-endpoint is being treated as the internal generator; \
+                     this positional form is deprecated — declare the generator explicitly via \
+                     --witness-generator-endpoint"
+                );
+            }
+        }
         (true, false) => warn!(
-            "Multiple witness endpoints but no --data-dir: historical witness routing is \
-             inactive (block age is anchored to the local DB tip); all witness fetches use the \
-             full endpoint chain"
+            "Witness generator plus fallback endpoints but no --data-dir: historical witness \
+             routing is inactive (block age is anchored to the local DB tip); all witness \
+             fetches use the full endpoint chain"
         ),
         (false, _) => debug!("Single witness endpoint configured; no historical witness routing"),
     }
@@ -814,6 +864,68 @@ mod tests {
             env("DEBUG_TRACE_SERVER_WITNESS_OLD_BLOCK_TIMEOUT", "4").witness_old_block_timeout,
             Some(4)
         );
+    }
+
+    /// The witness chain always puts the generator at index 0 — from the typed flag when
+    /// present, else (deprecated) the first of two or more `--witness-endpoint` values — so
+    /// the fetch-side skip derivation holds under both forms; a single durable endpoint has
+    /// no generator slot at all.
+    #[test]
+    fn witness_generator_endpoint_chain_and_deprecation() {
+        let guard = stateless_test_utils::env::env_lock();
+
+        // Typed flag: generator prepended, not deprecated.
+        let typed = parse_args(&["--witness-generator-endpoint", "http://gen"]);
+        assert_eq!(witness_endpoint_chain(&typed), (vec!["http://gen", "http://w"], false));
+
+        // Typed flag with multiple fallbacks keeps their order after the generator.
+        let multi = parse_args(&[
+            "--witness-generator-endpoint",
+            "http://gen",
+            "--witness-endpoint",
+            "http://w2",
+        ]);
+        assert_eq!(
+            witness_endpoint_chain(&multi),
+            (vec!["http://gen", "http://w", "http://w2"], false)
+        );
+
+        // Deprecated positional form: two-plus endpoints, no typed flag.
+        let legacy = parse_args(&["--witness-endpoint", "http://w2"]);
+        assert_eq!(witness_endpoint_chain(&legacy), (vec!["http://w", "http://w2"], true));
+
+        // Single endpoint without the flag: no generator slot, nothing deprecated.
+        assert_eq!(witness_endpoint_chain(&parse_args(&[])), (vec!["http://w"], false));
+
+        // Generator-only: --witness-endpoint becomes optional, chain is the lone generator.
+        let gen_only = Args::try_parse_from([
+            "debug-trace-server",
+            "--rpc-endpoint",
+            "http://r",
+            "--witness-generator-endpoint",
+            "http://gen",
+        ])
+        .unwrap();
+        assert_eq!(witness_endpoint_chain(&gen_only), (vec!["http://gen"], false));
+        // Neither witness flag: still rejected.
+        assert!(
+            Args::try_parse_from(["debug-trace-server", "--rpc-endpoint", "http://r"]).is_err()
+        );
+
+        // The generator duplicated in the fallback list is a rejected misconfiguration —
+        // it would put the generator back into the historical route's rotation.
+        let dup = parse_args(&["--witness-generator-endpoint", "http://w"]);
+        assert!(validate_args(&dup).is_err());
+        assert!(validate_args(&typed).is_ok());
+
+        // Env var parity with the CLI flag.
+        let from_env = stateless_test_utils::env::with_env_var(
+            &guard,
+            "DEBUG_TRACE_SERVER_WITNESS_GENERATOR_ENDPOINT",
+            "http://gen-env",
+            || parse_args(&[]),
+        );
+        assert_eq!(from_env.witness_generator_endpoint.as_deref(), Some("http://gen-env"));
     }
 
     /// `--tip-buffer` must stay below `--blocks-to-keep` when chain sync is enabled: the
