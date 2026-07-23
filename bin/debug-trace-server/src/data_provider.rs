@@ -7,9 +7,10 @@
 //! 2. **Remote RPC** (slower) - Upstream RPC endpoints as fallback
 //!
 //! Within the RPC fallback, the witness stage routes by block age (see [`WitnessFetchConfig`]):
-//! blocks within `local_window` of the local tip use the full witness endpoint chain (internal
-//! generator first), while historical blocks — which the generator has long pruned — skip the
-//! generator and go straight to the remaining endpoints.
+//! blocks fewer than `local_window` blocks below the local tip use the full witness endpoint
+//! chain (internal generator first), while historical blocks — at least `local_window` below,
+//! which the generator has long pruned — skip the generator and go straight to the remaining
+//! endpoints.
 //!
 //! # Features
 //! - **Single-flight request coalescing**: concurrent callers for the same block hash share one
@@ -115,12 +116,12 @@ pub const DEFAULT_WITNESS_TIMEOUT_SECS: u64 = 8;
 /// blocks whose witness is likely gone everywhere can lower `--witness-old-block-timeout`.
 pub const DEFAULT_OLD_BLOCK_WITNESS_TIMEOUT_SECS: u64 = DEFAULT_WITNESS_TIMEOUT_SECS;
 
-/// Default local-tip window (in blocks) below which witnesses are considered historical and
-/// skip the internal generator endpoint (see [`witness_route`]).
+/// Default local-tip window (in blocks): witnesses at least this far below the local tip are
+/// historical and skip the internal generator endpoint (see [`witness_route`]).
 ///
 /// Matches the witness generator's default deployed local retention (`BACKUP=4096`): blocks
-/// deeper than this are guaranteed misses on the internal generator endpoint, so probing it
-/// first only burns a failover round trip.
+/// at least this far below the tip are guaranteed misses on the internal generator endpoint,
+/// so probing it first only burns a failover round trip.
 pub const DEFAULT_WITNESS_LOCAL_WINDOW: u64 = 4096;
 
 /// Default deadline for the full block-fetch pipeline (header + witness + block + contracts)
@@ -799,9 +800,9 @@ fn witness_route(
 /// Fetches witness data, routing by block age. The `deadline` is the witness stage's
 /// effective deadline (see [`witness_deadline_for`]).
 ///
-/// - **Recent block** (within `local_window` of the local tip, or tip unknown): the full RPC
-///   witness endpoint chain, tried in order — the internal generator first, so near-tip witnesses
-///   stay on the fast internal path.
+/// - **Recent block** (fewer than `local_window` blocks below the local tip, or tip unknown): the
+///   full RPC witness endpoint chain, tried in order — the internal generator first, so near-tip
+///   witnesses stay on the fast internal path.
 /// - **Historical block** with a fallback endpoint configured: the same chain minus the first
 ///   endpoint, the guaranteed-miss probe [`DEFAULT_WITNESS_LOCAL_WINDOW`] describes.
 ///
@@ -1018,6 +1019,38 @@ mod tests {
 
         ha.stop().unwrap();
         hb.stop().unwrap();
+    }
+
+    /// With a single witness endpoint there is nothing to skip to: a historical block must
+    /// still fetch through the sole (generator) endpoint without tripping the skip assert.
+    /// Pins the `>= 2` fallback derivation in `fetch_witness` — a `>= 1` regression would
+    /// pass every other test and panic in production on the first historical fetch.
+    #[tokio::test]
+    async fn fetch_witness_single_endpoint_serves_historical_from_generator() {
+        let (ha, url_a, hits_a) = start_counting_witness_rpc().await;
+
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
+            ..RpcClientConfig::trace_server()
+        };
+        let rpc_client =
+            RpcClient::new_with_config(&[url_a.as_str()], &[url_a.as_str()], config, None).unwrap();
+        let cfg = WitnessFetchConfig {
+            witness_timeout: Duration::from_secs(1),
+            old_block_witness_timeout: Duration::from_secs(1),
+            local_window: 100,
+        };
+
+        // Historical block (900 + 100 <= 5000) with no fallback endpoint configured.
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let result = fetch_witness(&rpc_client, &cfg, Some(5000), 900, B256::ZERO, deadline).await;
+        assert!(result.is_err(), "the mock only returns errors, so the deadline must fire");
+        assert!(
+            hits_a.load(Ordering::Relaxed) >= 1,
+            "the sole endpoint must serve historical blocks"
+        );
+
+        ha.stop().unwrap();
     }
 
     /// Old-block witness budget honors the configurable timeout and clamps to

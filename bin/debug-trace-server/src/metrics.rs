@@ -208,8 +208,8 @@ impl CacheMetrics {
 
 /// Tracks which source provided block data. Sources: `cache`, `db`, and the two RPC witness
 /// routes — `witness_generator` (full endpoint chain, generator first) and
-/// `witness_historical` (skip-generator chain for blocks beyond the local window). The RPC
-/// path as a whole is the sum of the two witness labels.
+/// `witness_historical` (skip-generator chain for blocks at least the local window below the
+/// tip). The RPC path as a whole is the sum of the two witness labels.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
 pub struct DataSourceMetrics {

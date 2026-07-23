@@ -208,12 +208,13 @@ struct Args {
     #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_MAX_CONCURRENT_REQUESTS")]
     witness_max_concurrent_requests: Option<usize>,
 
-    /// Blocks within this many blocks of the local tip fetch witnesses through the full
-    /// witness endpoint chain (internal generator first); older blocks skip the first witness
-    /// endpoint — the generator only retains about this window (its `BACKUP` env, deployed at
-    /// 4096), so probing it for historical blocks is a guaranteed miss. Requires at least two
-    /// witness endpoints and a local DB (`--data-dir`), whose tip anchors block age; otherwise
-    /// all blocks use the full chain. Should match the generator's `BACKUP`.
+    /// Blocks fewer than this many blocks below the local tip fetch witnesses through the
+    /// full witness endpoint chain (internal generator first); blocks at least this far below
+    /// skip the first witness endpoint — the generator only retains about this window (its
+    /// `BACKUP` env, deployed at 4096), so probing it for historical blocks is a guaranteed
+    /// miss. Requires at least two witness endpoints and a local DB (`--data-dir`), whose tip
+    /// anchors block age; otherwise all blocks use the full chain. Should match the
+    /// generator's `BACKUP`.
     #[clap(
         long,
         env = "DEBUG_TRACE_SERVER_WITNESS_LOCAL_WINDOW",
@@ -366,7 +367,9 @@ async fn main() -> Result<()> {
     match (witness_apis.len() >= 2, args.data_dir.is_some()) {
         (true, true) => info!(
             witness_local_window = args.witness_local_window,
-            skipped_endpoint = witness_apis[0],
+            // The credential-stripped label, not the raw URL — configured endpoint URLs may
+            // carry userinfo or token queries and this log line is info-level.
+            skipped_endpoint = rpc_client.witness_provider_label(0).unwrap_or("<none>"),
             "Historical witnesses (at least the local window below the tip) skip the internal \
              generator endpoint"
         ),

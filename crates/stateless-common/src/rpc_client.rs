@@ -353,6 +353,13 @@ impl RpcClient {
         self.witness_providers.len()
     }
 
+    /// Returns the credential-stripped `{idx}:{host}` metric/log label of the witness
+    /// endpoint at `idx`, or `None` when out of range. Use this instead of the raw
+    /// configured URL wherever an endpoint identity is logged.
+    pub fn witness_provider_label(&self, idx: usize) -> Option<&str> {
+        self.witness_provider_labels.get(idx).map(|label| &**label)
+    }
+
     /// Wraps a data-method RPC call with round-robin load balancing and round-level backoff.
     ///
     /// Retries forever — transient failures never surface to callers. Use
@@ -1516,6 +1523,12 @@ mod tests {
                 endpoints.len()
             );
         }
+
+        // The public label accessor exposes the credential-stripped `{idx}:{host}` form and
+        // is total over out-of-range indices.
+        let client = RpcClient::new(&[LOCALHOST_A], &[LOCALHOST_B]).unwrap();
+        assert_eq!(client.witness_provider_label(0), Some("0:localhost:8546"));
+        assert_eq!(client.witness_provider_label(1), None);
     }
 
     #[test]
@@ -1780,6 +1793,60 @@ mod tests {
 
         ha.stop().unwrap();
         hb.stop().unwrap();
+    }
+
+    /// Label alignment under skip: with three witness endpoints and `skip = 1`, every
+    /// recorded attempt must carry its ORIGINAL-index label (`1:` / `2:`, never `0:`), and
+    /// the first non-skipped endpoint stays the rotation's primary. Pins the documented
+    /// parallel-slicing property the per-endpoint metrics rely on — a refactor that
+    /// re-derived labels from the sliced list would misattribute every backup attempt.
+    #[tokio::test]
+    async fn test_witness_skip_attempts_keep_original_index_labels() {
+        let order = Arc::new(std::sync::Mutex::new(Vec::<char>::new()));
+        let (ha, url_a) = start_ordered_witness_rpc('A', order.clone()).await;
+        let (hb, url_b) = start_ordered_witness_rpc('B', order.clone()).await;
+        let (hc, url_c) = start_ordered_witness_rpc('C', order.clone()).await;
+
+        let metrics = Arc::new(CapturingMetrics::default());
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
+            ..Default::default()
+        }
+        .with_metrics(metrics.clone());
+        let client = RpcClient::new_with_config(
+            &[url_a.as_str()],
+            &[url_a.as_str(), url_b.as_str(), url_c.as_str()],
+            config,
+            None,
+        )
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_millis(120);
+        let result = client
+            .get_witness_light_with_deadline_from(1, 1, BlockHash::ZERO, Some(deadline))
+            .await;
+        assert!(result.is_err(), "stub payloads fail decode, so the deadline must fire");
+
+        let attempts = metrics.attempts.lock().unwrap();
+        let labels: Vec<&str> = attempts
+            .iter()
+            .filter(|(m, _, _)| *m == RpcMethod::MegaGetBlockWitness)
+            .map(|(_, label, _)| label.as_str())
+            .collect();
+        assert!(labels.len() >= 2, "at least one full round over both non-skipped endpoints");
+        assert!(
+            labels.iter().all(|l| l.starts_with("1:") || l.starts_with("2:")),
+            "skipped endpoint 0 must never be attributed: {labels:?}"
+        );
+        assert!(labels[0].starts_with("1:"), "first non-skipped endpoint is the primary");
+        assert!(
+            labels.iter().any(|l| l.starts_with("2:")),
+            "the failover endpoint keeps its original index label: {labels:?}"
+        );
+
+        ha.stop().unwrap();
+        hb.stop().unwrap();
+        hc.stop().unwrap();
     }
 
     /// Skipping every configured witness provider is a caller bug and must panic loudly
