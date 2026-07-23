@@ -52,8 +52,8 @@ use crate::{
 };
 
 /// Witness-stage budget and routing-window configuration, shared by the single-flight fetch
-/// futures. Whether the historical route is actually taken is derived per fetch from the
-/// client's endpoint count and the local tip (see [`witness_route`]).
+/// futures. Whether the historical route is actually taken is derived per fetch from
+/// `generator_first`, the client's endpoint count, and the local tip (see [`witness_route`]).
 #[derive(Clone, Copy)]
 pub(crate) struct WitnessFetchConfig {
     /// Sub-deadline applied to the witness stage for blocks above the local tip.
@@ -63,17 +63,23 @@ pub(crate) struct WitnessFetchConfig {
     /// Blocks at least this far below the local tip are historical and skip the internal
     /// generator endpoint (see [`DEFAULT_WITNESS_LOCAL_WINDOW`] for the rationale).
     pub local_window: u64,
+    /// Whether the first witness endpoint is a declared internal generator
+    /// (`--witness-generator-endpoint`) — only then may historical blocks skip it. CLI
+    /// knowledge, not derivable from the client: every endpoint speaks the same witness RPC.
+    pub generator_first: bool,
 }
 
 impl WitnessFetchConfig {
-    /// Config with the default window and the default old-block budget (the full witness
-    /// budget, mirroring the unset `--witness-old-block-timeout` behavior).
+    /// Config with the default window, no declared generator, and the default old-block
+    /// budget (the full witness budget, mirroring the unset `--witness-old-block-timeout`
+    /// behavior).
     #[cfg(test)]
     pub fn with_defaults(witness_timeout_secs: u64) -> Self {
         Self {
             witness_timeout: Duration::from_secs(witness_timeout_secs),
             old_block_witness_timeout: Duration::from_secs(witness_timeout_secs),
             local_window: DEFAULT_WITNESS_LOCAL_WINDOW,
+            generator_first: false,
         }
     }
 }
@@ -776,15 +782,15 @@ fn is_historical(db_tip: Option<u64>, block_number: u64, local_window: u64) -> b
 
 /// Witness route for a block: how many leading witness endpoints to skip, plus the metrics
 /// source label. Historical blocks skip the internal generator at index 0 — but only with a
-/// fallback endpoint to skip to (`have_fallback`, derived from the client's endpoint count, so
-/// the skip-aware fetch never sees an empty rotation); everything else uses the full chain.
+/// fallback endpoint to skip to (`can_skip_generator`, so the skip-aware fetch never sees an
+/// empty rotation); everything else uses the full chain.
 fn witness_route(
-    have_fallback: bool,
+    can_skip_generator: bool,
     db_tip: Option<u64>,
     block_number: u64,
     local_window: u64,
 ) -> (usize, &'static str) {
-    if have_fallback && is_historical(db_tip, block_number, local_window) {
+    if can_skip_generator && is_historical(db_tip, block_number, local_window) {
         (1, "witness_historical")
     } else {
         (0, "witness_generator")
@@ -797,8 +803,9 @@ fn witness_route(
 /// - **Recent block** (fewer than `local_window` blocks below the local tip, or tip unknown): the
 ///   full RPC witness endpoint chain, tried in order — the internal generator first, so near-tip
 ///   witnesses stay on the fast internal path.
-/// - **Historical block** with a fallback endpoint configured: the same chain minus the first
-///   endpoint, the guaranteed-miss probe [`DEFAULT_WITNESS_LOCAL_WINDOW`] describes.
+/// - **Historical block** with a declared generator and a fallback endpoint configured: the same
+///   chain minus the generator, the guaranteed-miss probe [`DEFAULT_WITNESS_LOCAL_WINDOW`]
+///   describes.
 ///
 /// Uses the zero-validation light decode: the trace server never verifies the witness proof,
 /// so the full decode's per-point elliptic-curve work bought nothing. The recorded size is
@@ -811,11 +818,10 @@ async fn fetch_witness(
     block_hash: B256,
     deadline: Instant,
 ) -> DataProviderResult<(LightWitness, MptWitness)> {
-    let have_fallback = rpc_client.witness_provider_count() >= 2;
-    let (skip, source) = witness_route(have_fallback, db_tip, block_number, cfg.local_window);
+    let can_skip_generator = cfg.generator_first && rpc_client.witness_provider_count() >= 2;
+    let (skip, source) = witness_route(can_skip_generator, db_tip, block_number, cfg.local_window);
     let metrics = WitnessSourceMetrics::new_for_source(source);
     let start = Instant::now();
-    let budget = deadline.saturating_duration_since(start);
 
     match rpc_client
         .get_witness_light_with_deadline_from(skip, block_number, block_hash, Some(deadline))
@@ -829,6 +835,7 @@ async fn fetch_witness(
         }
         Err(e) => {
             metrics.record_request(false, start.elapsed().as_secs_f64());
+            let budget = deadline.saturating_duration_since(start);
             // Attribution-grade context for the next timeout incident: the effective stage
             // budget, the route taken, and whether the old-block clamp applied — the client
             // only ever sees the generic `-32001` message.
@@ -942,11 +949,12 @@ mod tests {
     }
 
     /// Route selection: the skip-generator chain and the `witness_historical` label apply
-    /// only with a fallback endpoint AND a historical block; everything else stays on the
-    /// full chain under the `witness_generator` label.
+    /// only when the generator may be skipped (declared generator + fallback) AND the block
+    /// is historical; everything else stays on the full chain under the `witness_generator`
+    /// label.
     #[test]
     fn witness_route_selection() {
-        // No fallback endpoint (single witness endpoint): always the full chain.
+        // No declared generator (or no fallback to skip to): always the full chain.
         assert_eq!(witness_route(false, Some(5000), 900, 100), (0, "witness_generator"));
         assert_eq!(witness_route(true, Some(5000), 900, 100), (1, "witness_historical"));
         assert_eq!(witness_route(true, Some(5000), 4999, 100), (0, "witness_generator"));
@@ -974,29 +982,33 @@ mod tests {
         (server.start(module), url, hits)
     }
 
+    /// Fast-retry client over `witness_urls` plus a routing config (1 s budgets, 100-block
+    /// window) for the `fetch_witness` dispatch tests below.
+    fn routing_fixture(
+        witness_urls: &[&str],
+        generator_first: bool,
+    ) -> (RpcClient, WitnessFetchConfig) {
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
+            ..RpcClientConfig::trace_server()
+        };
+        let rpc_client =
+            RpcClient::new_with_config(&witness_urls[..1], witness_urls, config, None).unwrap();
+        let cfg = WitnessFetchConfig {
+            local_window: 100,
+            generator_first,
+            ..WitnessFetchConfig::with_defaults(1)
+        };
+        (rpc_client, cfg)
+    }
+
     /// End-to-end routing dispatch through `fetch_witness`: a historical block must never
     /// touch the first (generator) endpoint, while a recent block probes it first.
     #[tokio::test]
     async fn fetch_witness_routes_historical_blocks_past_the_generator() {
         let (ha, url_a, hits_a) = start_counting_witness_rpc().await;
         let (hb, url_b, hits_b) = start_counting_witness_rpc().await;
-
-        let config = RpcClientConfig {
-            rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
-            ..RpcClientConfig::trace_server()
-        };
-        let rpc_client = RpcClient::new_with_config(
-            &[url_a.as_str()],
-            &[url_a.as_str(), url_b.as_str()],
-            config,
-            None,
-        )
-        .unwrap();
-        let cfg = WitnessFetchConfig {
-            witness_timeout: Duration::from_secs(1),
-            old_block_witness_timeout: Duration::from_secs(1),
-            local_window: 100,
-        };
+        let (rpc_client, cfg) = routing_fixture(&[url_a.as_str(), url_b.as_str()], true);
         let db_tip = Some(5000);
 
         // Historical block (900 + 100 <= 5000): the generator endpoint must stay untouched.
@@ -1015,25 +1027,14 @@ mod tests {
         hb.stop().unwrap();
     }
 
-    /// With a single witness endpoint there is nothing to skip to: a historical block must
-    /// still fetch through the sole (generator) endpoint without tripping the skip assert.
-    /// Pins the `>= 2` fallback derivation in `fetch_witness` — a `>= 1` regression would
-    /// pass every other test and panic in production on the first historical fetch.
+    /// A declared generator with no fallback has nothing to skip to: a historical block must
+    /// still fetch through the sole endpoint without tripping the skip assert. Pins the
+    /// `>= 2` fallback guard in `fetch_witness` — a `>= 1` regression would pass every other
+    /// test and panic in production on the first historical fetch.
     #[tokio::test]
     async fn fetch_witness_single_endpoint_serves_historical_from_generator() {
         let (ha, url_a, hits_a) = start_counting_witness_rpc().await;
-
-        let config = RpcClientConfig {
-            rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
-            ..RpcClientConfig::trace_server()
-        };
-        let rpc_client =
-            RpcClient::new_with_config(&[url_a.as_str()], &[url_a.as_str()], config, None).unwrap();
-        let cfg = WitnessFetchConfig {
-            witness_timeout: Duration::from_secs(1),
-            old_block_witness_timeout: Duration::from_secs(1),
-            local_window: 100,
-        };
+        let (rpc_client, cfg) = routing_fixture(&[url_a.as_str()], true);
 
         // Historical block (900 + 100 <= 5000) with no fallback endpoint configured.
         let deadline = Instant::now() + Duration::from_millis(150);
@@ -1045,6 +1046,26 @@ mod tests {
         );
 
         ha.stop().unwrap();
+    }
+
+    /// Two durable endpoints without a declared generator must never skip: historical blocks
+    /// still probe the first endpoint. Pins routing as an explicit opt-in — a pure failover
+    /// pair keeps its pre-routing behavior, with no endpoint special by position.
+    #[tokio::test]
+    async fn fetch_witness_without_generator_never_skips() {
+        let (ha, url_a, hits_a) = start_counting_witness_rpc().await;
+        let (hb, url_b, _hits_b) = start_counting_witness_rpc().await;
+        let (rpc_client, cfg) = routing_fixture(&[url_a.as_str(), url_b.as_str()], false);
+
+        // Historical block (900 + 100 <= 5000): with no declared generator, the first
+        // endpoint stays in the rotation.
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let result = fetch_witness(&rpc_client, &cfg, Some(5000), 900, B256::ZERO, deadline).await;
+        assert!(result.is_err(), "the mock only returns errors, so the deadline must fire");
+        assert!(hits_a.load(Ordering::Relaxed) >= 1, "first endpoint must not be skipped");
+
+        ha.stop().unwrap();
+        hb.stop().unwrap();
     }
 
     /// Old-block witness budget honors the configurable timeout and clamps to

@@ -28,8 +28,6 @@
 //! ┌─────────────────────────────────────────────────────────────────┐
 //! │                      DataProvider                               │
 //! │  Multi-level lookup: Local DB → Remote RPC (with single-flight) │
-//! │  Witnesses: near-tip → full endpoint chain; historical skips    │
-//! │  the internal generator (guaranteed miss) → fallback endpoints  │
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -102,9 +100,8 @@ struct Args {
 
     /// One or more durable witness endpoint URLs for fetching witness data (tried in order).
     /// Accepts repeated flags (`--witness-endpoint a --witness-endpoint b`) or a comma-separated
-    /// list (`--witness-endpoint a,b`, also via the env var). Deprecated fallback: when
-    /// `--witness-generator-endpoint` is absent and two or more endpoints are listed here, the
-    /// first is treated as the internal generator (see that flag).
+    /// list (`--witness-endpoint a,b`, also via the env var). No endpoint here is ever special
+    /// by position; declare the internal generator via `--witness-generator-endpoint`.
     #[clap(
         long,
         env = "DEBUG_TRACE_SERVER_WITNESS_ENDPOINT",
@@ -118,8 +115,7 @@ struct Args {
     /// skipped for historical ones (it only retains about `--witness-local-window` blocks),
     /// while `--witness-endpoint` lists the durable fallbacks (optional when this flag is
     /// set — generator-only works like any single-endpoint config, without routing). When
-    /// absent, the first of two or more `--witness-endpoint` values fills this role
-    /// (deprecated positional form).
+    /// absent, historical routing is disabled and every witness endpoint is plain failover.
     #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_GENERATOR_ENDPOINT")]
     witness_generator_endpoint: Option<String>,
 
@@ -307,28 +303,23 @@ fn old_block_witness_timeout_secs(args: &Args) -> u64 {
     args.witness_old_block_timeout.unwrap_or(args.witness_timeout).min(args.witness_timeout)
 }
 
-/// The combined witness endpoint chain — the internal generator (when configured) first, then
-/// the durable fallbacks — plus whether the generator slot comes from the deprecated
-/// positional form (no `--witness-generator-endpoint`, two or more `--witness-endpoint`).
-///
-/// The chain always has the generator at index 0 when one exists, so the fetch-side routing
-/// derivation (skip the first endpoint iff the chain has at least two) holds under both the
-/// typed flag and the deprecated form.
-fn witness_endpoint_chain(args: &Args) -> (Vec<&str>, bool) {
-    let mut chain: Vec<&str> = Vec::with_capacity(args.witness_endpoint.len() + 1);
-    chain.extend(args.witness_generator_endpoint.as_deref());
-    chain.extend(args.witness_endpoint.iter().map(String::as_str));
-    let deprecated_positional =
-        args.witness_generator_endpoint.is_none() && args.witness_endpoint.len() >= 2;
-    (chain, deprecated_positional)
+/// The combined witness endpoint chain: the declared internal generator
+/// (`--witness-generator-endpoint`) first when configured, then the durable fallbacks in
+/// their configured order. Without the flag no endpoint is special — the chain is plain
+/// failover.
+fn witness_endpoint_chain(args: &Args) -> Vec<&str> {
+    args.witness_generator_endpoint
+        .as_deref()
+        .into_iter()
+        .chain(args.witness_endpoint.iter().map(String::as_str))
+        .collect()
 }
 
 /// Validates cross-flag invariants that clap cannot express per-field.
 fn validate_args(args: &Args) -> Result<()> {
-    // Only meaningful with chain sync: the fetcher holds the local tip `tip_buffer` blocks
-    // behind the head, and `blocks_to_keep` doubles as the stale-reset threshold. A buffer at
-    // or past the threshold makes the built-in lag itself look stale, so every transient
-    // restart would reset the anchor and leave gaps in stored history.
+    // Early, flag-named mirror of `PipelineConfig::validate` (see its doc for the rationale);
+    // only meaningful with chain sync, where `blocks_to_keep` becomes the stale-reset
+    // threshold.
     if args.data_dir.is_some() && args.tip_buffer >= args.blocks_to_keep {
         eyre::bail!(
             "--tip-buffer ({}) must be smaller than --blocks-to-keep ({})",
@@ -364,11 +355,19 @@ async fn main() -> Result<()> {
     let response_cache_disabled = args.response_cache_estimated_items == 0;
     // The combined witness chain (generator first when configured) — the list actually fed to
     // the RPC client, not just the fallback flag values.
-    let (witness_apis, deprecated_positional_generator) = witness_endpoint_chain(&args);
+    let witness_apis = witness_endpoint_chain(&args);
+    let witness_cfg = WitnessFetchConfig {
+        witness_timeout: std::time::Duration::from_secs(args.witness_timeout),
+        old_block_witness_timeout: std::time::Duration::from_secs(old_block_witness_timeout_secs(
+            &args,
+        )),
+        local_window: args.witness_local_window,
+        generator_first: args.witness_generator_endpoint.is_some(),
+    };
     debug!(
         rpc_endpoints = ?args.rpc_endpoint,
         witness_endpoints = ?witness_apis,
-        witness_generator_configured = args.witness_generator_endpoint.is_some(),
+        witness_generator_configured = witness_cfg.generator_first,
         witness_timeout_secs = args.witness_timeout,
         witness_old_block_timeout_secs = old_block_witness_timeout_secs(&args),
         witness_local_window = args.witness_local_window,
@@ -410,30 +409,27 @@ async fn main() -> Result<()> {
     let rpc_client =
         Arc::new(RpcClient::new_with_config(&data_apis, &witness_apis, rpc_config, None)?);
 
-    match (witness_apis.len() >= 2, args.data_dir.is_some()) {
-        (true, true) => {
-            info!(
-                witness_local_window = args.witness_local_window,
-                // The credential-stripped label, not the raw URL — configured endpoint URLs
-                // may carry userinfo or token queries and this log line is info-level.
-                skipped_endpoint = rpc_client.witness_provider_label(0).unwrap_or("<none>"),
-                "Historical witnesses (at least the local window below the tip) skip the \
-                 internal generator endpoint"
-            );
-            if deprecated_positional_generator {
-                warn!(
-                    "The first --witness-endpoint is being treated as the internal generator; \
-                     this positional form is deprecated — declare the generator explicitly via \
-                     --witness-generator-endpoint"
-                );
-            }
-        }
+    // The same predicate `fetch_witness` evaluates per request: a declared generator plus at
+    // least one fallback in the combined chain.
+    let routing_configured = witness_cfg.generator_first && witness_apis.len() >= 2;
+    match (routing_configured, args.data_dir.is_some()) {
+        (true, true) => info!(
+            witness_local_window = args.witness_local_window,
+            // The credential-stripped label, not the raw URL — configured endpoint URLs
+            // may carry userinfo or token queries and this log line is info-level.
+            skipped_endpoint = rpc_client.witness_provider_label(0).unwrap_or("<none>"),
+            "Historical witnesses (at least the local window below the tip) skip the \
+             internal generator endpoint"
+        ),
         (true, false) => warn!(
             "Witness generator plus fallback endpoints but no --data-dir: historical witness \
              routing is inactive (block age is anchored to the local DB tip); all witness \
              fetches use the full endpoint chain"
         ),
-        (false, _) => debug!("Single witness endpoint configured; no historical witness routing"),
+        (false, _) => debug!(
+            "No --witness-generator-endpoint (or no fallback endpoints); historical witness \
+             routing disabled — witness endpoints are plain failover"
+        ),
     }
 
     let validator_db = init_validator_db(&args, &rpc_client).await?;
@@ -452,13 +448,6 @@ async fn main() -> Result<()> {
     };
     let contract_cache = Arc::new(ContractCache::new(contract_store));
 
-    let witness_cfg = WitnessFetchConfig {
-        witness_timeout: std::time::Duration::from_secs(args.witness_timeout),
-        old_block_witness_timeout: std::time::Duration::from_secs(old_block_witness_timeout_secs(
-            &args,
-        )),
-        local_window: args.witness_local_window,
-    };
     let data_provider = Arc::new(DataProvider::new(
         rpc_client.clone(),
         block_store.clone(),
@@ -809,10 +798,6 @@ mod tests {
         );
     }
 
-    /// Pins the tiered-witness-routing knob defaults (`--witness-local-window` must track the
-    /// generator's `BACKUP`, the old-block budget defaults to the full witness budget) and the
-    /// CLI + env parsing of all three knobs — a typo in an env attribute string would
-    /// otherwise ship silently to env-only container deployments.
     /// Parses `Args` from the minimal required flags plus `extra`. Callers must hold
     /// `stateless_test_utils::env::env_lock()` — parsing reads `DEBUG_TRACE_SERVER_*` env
     /// vars, so it must be serialized with the tests that mutate them.
@@ -822,6 +807,10 @@ mod tests {
         Args::try_parse_from(base.iter().chain(extra)).unwrap()
     }
 
+    /// Pins the tiered-witness-routing knob defaults (`--witness-local-window` must track the
+    /// generator's `BACKUP`, the old-block budget defaults to the full witness budget) and the
+    /// CLI + env parsing of all three knobs — a typo in an env attribute string would
+    /// otherwise ship silently to env-only container deployments.
     #[test]
     fn tiered_routing_flag_defaults() {
         let guard = stateless_test_utils::env::env_lock();
@@ -866,36 +855,30 @@ mod tests {
         );
     }
 
-    /// The witness chain always puts the generator at index 0 — from the typed flag when
-    /// present, else (deprecated) the first of two or more `--witness-endpoint` values — so
-    /// the fetch-side skip derivation holds under both forms; a single durable endpoint has
-    /// no generator slot at all.
+    /// The witness chain puts the declared generator at index 0; without the flag no endpoint
+    /// is special — even a multi-endpoint list is plain failover, keeping its pre-routing
+    /// behavior.
     #[test]
-    fn witness_generator_endpoint_chain_and_deprecation() {
+    fn witness_generator_endpoint_chain() {
         let guard = stateless_test_utils::env::env_lock();
 
-        // Typed flag: generator prepended, not deprecated.
+        // Typed flag: generator prepended ahead of the fallbacks.
         let typed = parse_args(&["--witness-generator-endpoint", "http://gen"]);
-        assert_eq!(witness_endpoint_chain(&typed), (vec!["http://gen", "http://w"], false));
+        assert_eq!(witness_endpoint_chain(&typed), vec!["http://gen", "http://w"]);
 
-        // Typed flag with multiple fallbacks keeps their order after the generator.
+        // Multiple fallbacks keep their order after the generator.
         let multi = parse_args(&[
             "--witness-generator-endpoint",
             "http://gen",
             "--witness-endpoint",
             "http://w2",
         ]);
-        assert_eq!(
-            witness_endpoint_chain(&multi),
-            (vec!["http://gen", "http://w", "http://w2"], false)
-        );
+        assert_eq!(witness_endpoint_chain(&multi), vec!["http://gen", "http://w", "http://w2"]);
 
-        // Deprecated positional form: two-plus endpoints, no typed flag.
-        let legacy = parse_args(&["--witness-endpoint", "http://w2"]);
-        assert_eq!(witness_endpoint_chain(&legacy), (vec!["http://w", "http://w2"], true));
-
-        // Single endpoint without the flag: no generator slot, nothing deprecated.
-        assert_eq!(witness_endpoint_chain(&parse_args(&[])), (vec!["http://w"], false));
+        // No flag: plain failover chains, regardless of endpoint count.
+        assert_eq!(witness_endpoint_chain(&parse_args(&[])), vec!["http://w"]);
+        let failover_pair = parse_args(&["--witness-endpoint", "http://w2"]);
+        assert_eq!(witness_endpoint_chain(&failover_pair), vec!["http://w", "http://w2"]);
 
         // Generator-only: --witness-endpoint becomes optional, chain is the lone generator.
         let gen_only = Args::try_parse_from([
@@ -906,7 +889,7 @@ mod tests {
             "http://gen",
         ])
         .unwrap();
-        assert_eq!(witness_endpoint_chain(&gen_only), (vec!["http://gen"], false));
+        assert_eq!(witness_endpoint_chain(&gen_only), vec!["http://gen"]);
         // Neither witness flag: still rejected.
         assert!(
             Args::try_parse_from(["debug-trace-server", "--rpc-endpoint", "http://r"]).is_err()
