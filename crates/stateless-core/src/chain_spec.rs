@@ -69,7 +69,7 @@ impl MegaHardforks for ChainSpec {
 }
 
 impl ChainSpec {
-    /// Creates a new [`ChainSpec`] from a [`Genesis`].
+    /// Create a new [`ChainSpec`] from a [`Genesis`].
     ///
     /// Ordering rules:
     /// - [`OpChainSpec`] already yields Optimism/Ethereum hardforks in the correct order, so they
@@ -81,13 +81,19 @@ impl ChainSpec {
     /// - The MegaETH set is then merged with the Optimism/Ethereum set to build a single
     ///   [`ChainHardforks`] that drives fork activation.
     ///
-    /// When `rex5Time` is configured, the genesis `config` extra fields must also carry the flat
-    /// `rex5InitialSequencer` / `rex5InitialAdmin` addresses; both are validated immediately so a
-    /// misconfigured genesis fails at load rather than at the first Rex5 block. Likewise, when
-    /// `rex6Time` is configured the extra fields must carry a non-zero `rex6MinRotationDelay`.
-    /// Scheduling Rex6 also requires Rex5 at the same or an earlier timestamp — Rex6 depends on
-    /// the SequencerRegistry that the Rex5 activation deploys, so a partial ladder is rejected
-    /// at load instead of stalling at the Rex6 activation block.
+    /// Panics if genesis schedules Rex5 (`rex5Time` set) or Rex6 (`rex6Time` set) but the bootstrap
+    /// config is missing or malformed. The bootstrap is conditionally required: dropping the
+    /// failure here would produce a chainspec that loads cleanly today and stalls the chain at
+    /// the fork's activation with `"... active but SequencerRegistry...Config not configured"`.
+    /// Surfacing it at chainspec-load means an operator typo fails fast on node start, before
+    /// any block is ever produced.
+    ///
+    /// Also panics if genesis schedules Rex6 without Rex5, or with Rex5 after it
+    /// (`rex5Time > rex6Time`; equal timestamps are legal — both forks activate together).
+    /// Rex6 depends on the SequencerRegistry that the Rex5 activation deploys, so such a
+    /// schedule would activate Rex6 with no registry in state and stall every block from the
+    /// activation on with `"Rex5 active but SequencerRegistryConfig not configured"` — the
+    /// same late-failure mode the load-time validation above exists to prevent.
     pub fn from_genesis(genesis: Genesis) -> Self {
         // A malformed `rex5Time`/`rex6Time` treated as "fork absent" would skip the
         // bootstrap-required check and diverge from mega-reth at the activation timestamp, so
@@ -272,24 +278,21 @@ impl MegaethGenesisSequencerRegistryConfig {
     }
 }
 
-/// Rex6 `SequencerRegistry` rotation-hardening config, parsed from genesis `config` extra fields.
+/// Optional SequencerRegistryRex6 bootstrap config embedded in genesis extra fields.
 ///
-/// Flat schema (matches mega-reth) so a single genesis.json works for both binaries.
-/// The delay must be non-zero or [`SequencerRegistryRex6Config::validate`] rejects it.
+/// Only relevant when Rex6 is enabled.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MegaethGenesisSequencerRegistryRex6Config {
-    /// Minimum number of blocks between scheduling a sequencer change and its activation,
-    /// seeded into the registry at Rex6 activation.
+    /// Minimum rotation delay (governance parameter) for the SequencerRegistry at Rex6 activation.
     pub rex6_min_rotation_delay: u64,
 }
 
 impl MegaethGenesisSequencerRegistryRex6Config {
-    /// Parse the required Rex6 rotation config from genesis extra fields.
+    /// Parse the required SequencerRegistryRex6 bootstrap config from genesis extra fields.
     ///
-    /// Returns a serde error if the delay field is missing or malformed. Callers should only
-    /// invoke it once they have decided the config is required, i.e. when `rex6Time` is
-    /// configured.
+    /// Missing fields and malformed u64 are returned as serde errors. Callers should only
+    /// invoke it after deciding the bootstrap is required, e.g. when `rex6Time` is configured.
     pub fn parse_required_from(others: &OtherFields) -> serde_json::Result<Self> {
         others.deserialize_as()
     }
@@ -583,9 +586,10 @@ mod tests {
         let _ = ChainSpec::from_genesis(genesis);
     }
 
-    /// `from_genesis` must reject a genesis that schedules Rex6 without Rex5: Rex6 depends on
-    /// the SequencerRegistry deployed by the Rex5 activation, so the chain would stall at the
-    /// Rex6 activation block — this load-time check turns that into a fail-fast on node start.
+    /// `from_genesis` must reject a genesis that schedules Rex6 without Rex5: mega-evm's
+    /// `hardfork()` would report REX6 at activation, but the Rex5-gated SequencerRegistry
+    /// deploy never runs, so `resolve_system_address` fails every block from the activation
+    /// on — a permanent stall this load-time check turns into a fail-fast on node start.
     #[test]
     #[should_panic(expected = "genesis schedules Rex6 but Rex5 is missing or scheduled after it")]
     fn test_chain_spec_rex6_without_rex5_panics() {
