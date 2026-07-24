@@ -85,6 +85,9 @@ impl ChainSpec {
     /// `rex5InitialSequencer` / `rex5InitialAdmin` addresses; both are validated immediately so a
     /// misconfigured genesis fails at load rather than at the first Rex5 block. Likewise, when
     /// `rex6Time` is configured the extra fields must carry a non-zero `rex6MinRotationDelay`.
+    /// Scheduling Rex6 also requires Rex5 at the same or an earlier timestamp — Rex6 depends on
+    /// the SequencerRegistry that the Rex5 activation deploys, so a partial ladder is rejected
+    /// at load instead of stalling at the Rex6 activation block.
     pub fn from_genesis(genesis: Genesis) -> Self {
         // A malformed `rex5Time`/`rex6Time` treated as "fork absent" would skip the
         // bootstrap-required check and diverge from mega-reth at the activation timestamp, so
@@ -93,6 +96,24 @@ impl ChainSpec {
             .unwrap_or_else(|err| panic!("malformed MegaETH hardforks in genesis: {err}"));
         let rex5_scheduled = megaeth_hardforks.rex_5_time.is_some();
         let rex6_scheduled = megaeth_hardforks.rex_6_time.is_some();
+
+        // Rex6 needs the SequencerRegistry deployed by the Rex5 activation. A partial ladder
+        // (Rex6 without Rex5, or Rex5 after Rex6) would load cleanly and then stall at the
+        // Rex6 activation block, so reject it here. Equal timestamps are fine: both forks
+        // activate together.
+        if rex6_scheduled &&
+            megaeth_hardforks
+                .rex_5_time
+                .zip(megaeth_hardforks.rex_6_time)
+                .is_none_or(|(rex5, rex6)| rex5 > rex6)
+        {
+            panic!(
+                "genesis schedules Rex6 but Rex5 is missing or scheduled after it \
+                 (rex5Time={:?}, rex6Time={:?})",
+                megaeth_hardforks.rex_5_time, megaeth_hardforks.rex_6_time
+            );
+        }
+
         let mut megaeth_hardforks = megaeth_hardforks.into_vec();
 
         // Rex5 SequencerRegistry bootstrap, required iff `rex5Time` is scheduled. Parsed from
@@ -303,6 +324,29 @@ mod tests {
 
     use super::*;
 
+    /// Inserts a complete, valid Rex5 schedule (`rex5Time` plus both bootstrap seeds) into
+    /// `genesis`, so Rex6 fixtures can build on a well-formed ladder and exercise only the
+    /// Rex6 behavior their names describe.
+    fn schedule_valid_rex5(genesis: &mut Genesis, rex5_time: u64) {
+        genesis.config.extra_fields.insert_value("rex5Time".to_string(), rex5_time).unwrap();
+        genesis
+            .config
+            .extra_fields
+            .insert_value(
+                "rex5InitialSequencer".to_string(),
+                "0x0000000000000000000000000000000000000001",
+            )
+            .unwrap();
+        genesis
+            .config
+            .extra_fields
+            .insert_value(
+                "rex5InitialAdmin".to_string(),
+                "0x0000000000000000000000000000000000000002",
+            )
+            .unwrap();
+    }
+
     #[test]
     fn test_create_from_default_genesis() {
         let genesis = Genesis::default();
@@ -479,13 +523,14 @@ mod tests {
     #[test]
     fn test_chain_spec_carries_rex6_registry_as_fork_params() {
         let mut genesis = Genesis::default();
-        genesis.config.extra_fields.insert_value("rex6Time".to_string(), 0).unwrap();
+        schedule_valid_rex5(&mut genesis, 0);
+        genesis.config.extra_fields.insert_value("rex6Time".to_string(), 10).unwrap();
         genesis.config.extra_fields.insert_value("rex6MinRotationDelay".to_string(), 7200).unwrap();
         let spec = ChainSpec::from_genesis(genesis);
         let params =
             spec.fork_params::<SequencerRegistryRex6Config>().expect("Rex6 params present");
         assert_eq!(params.rex6_min_rotation_delay, 7200);
-        assert_eq!(spec.hardforks.fork(MegaHardfork::Rex6), ForkCondition::Timestamp(0));
+        assert_eq!(spec.hardforks.fork(MegaHardfork::Rex6), ForkCondition::Timestamp(10));
     }
 
     #[test]
@@ -509,6 +554,7 @@ mod tests {
     #[should_panic(expected = "malformed or missing SequencerRegistryRex6Config in genesis")]
     fn test_chain_spec_rex6_without_bootstrap_panics() {
         let mut genesis = Genesis::default();
+        schedule_valid_rex5(&mut genesis, 0);
         genesis.config.extra_fields.insert_value("rex6Time".to_string(), 0).unwrap();
         let _ = ChainSpec::from_genesis(genesis);
     }
@@ -517,6 +563,7 @@ mod tests {
     #[should_panic(expected = "malformed or missing SequencerRegistryRex6Config in genesis")]
     fn test_chain_spec_rex6_malformed_delay_panics() {
         let mut genesis = Genesis::default();
+        schedule_valid_rex5(&mut genesis, 0);
         genesis.config.extra_fields.insert_value("rex6Time".to_string(), 0).unwrap();
         genesis
             .config
@@ -530,31 +577,53 @@ mod tests {
     #[should_panic(expected = "invalid SequencerRegistryRex6Config")]
     fn test_chain_spec_rex6_zero_delay_panics() {
         let mut genesis = Genesis::default();
+        schedule_valid_rex5(&mut genesis, 0);
         genesis.config.extra_fields.insert_value("rex6Time".to_string(), 0).unwrap();
         genesis.config.extra_fields.insert_value("rex6MinRotationDelay".to_string(), 0).unwrap();
         let _ = ChainSpec::from_genesis(genesis);
     }
 
+    /// `from_genesis` must reject a genesis that schedules Rex6 without Rex5: Rex6 depends on
+    /// the SequencerRegistry deployed by the Rex5 activation, so the chain would stall at the
+    /// Rex6 activation block — this load-time check turns that into a fail-fast on node start.
+    #[test]
+    #[should_panic(expected = "genesis schedules Rex6 but Rex5 is missing or scheduled after it")]
+    fn test_chain_spec_rex6_without_rex5_panics() {
+        let mut genesis = Genesis::default();
+        genesis.config.extra_fields.insert_value("rex6Time".to_string(), 0).unwrap();
+        genesis.config.extra_fields.insert_value("rex6MinRotationDelay".to_string(), 7200).unwrap();
+        // Intentionally omit rex5Time (and the Rex5 bootstrap).
+        let _ = ChainSpec::from_genesis(genesis);
+    }
+
+    /// Rex5 scheduled after Rex6 is the same hazard as a missing Rex5 — Rex6 activates first
+    /// with no registry deployed — and must fail at load, not at the activation block.
+    #[test]
+    #[should_panic(expected = "genesis schedules Rex6 but Rex5 is missing or scheduled after it")]
+    fn test_chain_spec_rex5_after_rex6_panics() {
+        let mut genesis = Genesis::default();
+        schedule_valid_rex5(&mut genesis, 10);
+        genesis.config.extra_fields.insert_value("rex6Time".to_string(), 5).unwrap();
+        genesis.config.extra_fields.insert_value("rex6MinRotationDelay".to_string(), 7200).unwrap();
+        let _ = ChainSpec::from_genesis(genesis);
+    }
+
+    /// Rex5 and Rex6 at the same timestamp is a legal ladder — both forks activate together.
+    #[test]
+    fn test_chain_spec_rex5_and_rex6_at_same_timestamp_ok() {
+        let mut genesis = Genesis::default();
+        schedule_valid_rex5(&mut genesis, 5);
+        genesis.config.extra_fields.insert_value("rex6Time".to_string(), 5).unwrap();
+        genesis.config.extra_fields.insert_value("rex6MinRotationDelay".to_string(), 7200).unwrap();
+        let spec = ChainSpec::from_genesis(genesis);
+        assert!(spec.fork_params::<SequencerRegistryConfig>().is_some(), "Rex5 config loaded");
+        assert!(spec.fork_params::<SequencerRegistryRex6Config>().is_some(), "Rex6 config loaded");
+    }
+
     #[test]
     fn test_chain_spec_rex5_and_rex6_coexist_in_canonical_order() {
         let mut genesis = Genesis::default();
-        genesis.config.extra_fields.insert_value("rex5Time".to_string(), 100).unwrap();
-        genesis
-            .config
-            .extra_fields
-            .insert_value(
-                "rex5InitialSequencer".to_string(),
-                "0x0000000000000000000000000000000000000001",
-            )
-            .unwrap();
-        genesis
-            .config
-            .extra_fields
-            .insert_value(
-                "rex5InitialAdmin".to_string(),
-                "0x0000000000000000000000000000000000000002",
-            )
-            .unwrap();
+        schedule_valid_rex5(&mut genesis, 100);
         genesis.config.extra_fields.insert_value("rex6Time".to_string(), 200).unwrap();
         genesis.config.extra_fields.insert_value("rex6MinRotationDelay".to_string(), 7200).unwrap();
         let spec = ChainSpec::from_genesis(genesis);
