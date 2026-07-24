@@ -8,7 +8,10 @@ use alloy_hardforks::{EthereumHardfork, EthereumHardforks, ForkCondition, Hardfo
 use alloy_op_hardforks::{OpHardfork, OpHardforks};
 use alloy_primitives::Address;
 use alloy_serde::OtherFields;
-use mega_evm::{HardforkParams, MegaHardfork, MegaHardforks, SequencerRegistryConfig};
+use mega_evm::{
+    HardforkParams, MegaHardfork, MegaHardforks, SequencerRegistryConfig,
+    SequencerRegistryRex6Config,
+};
 use reth_ethereum_forks::ChainHardforks;
 use reth_optimism_chainspec::OpChainSpec;
 
@@ -28,6 +31,11 @@ pub struct ChainSpec {
     ///
     /// `None` for pre-Rex5 chains; `Some(...)` when `rex5Time` is configured.
     pub sequencer_registry_config: Option<SequencerRegistryConfig>,
+    /// Rex6 `SequencerRegistry` rotation-hardening config, parsed from genesis `config` extra
+    /// fields.
+    ///
+    /// `None` for pre-Rex6 chains; `Some(...)` when `rex6Time` is configured.
+    pub sequencer_registry_rex6_config: Option<SequencerRegistryRex6Config>,
 }
 
 impl EthereumHardforks for ChainSpec {
@@ -52,6 +60,9 @@ impl MegaHardforks for ChainSpec {
             MegaHardfork::Rex5 => {
                 self.sequencer_registry_config.as_ref().map(|c| c as &(dyn Any + Send + Sync))
             }
+            MegaHardfork::Rex6 => {
+                self.sequencer_registry_rex6_config.as_ref().map(|c| c as &(dyn Any + Send + Sync))
+            }
             _ => None,
         }
     }
@@ -72,13 +83,16 @@ impl ChainSpec {
     ///
     /// When `rex5Time` is configured, the genesis `config` extra fields must also carry the flat
     /// `rex5InitialSequencer` / `rex5InitialAdmin` addresses; both are validated immediately so a
-    /// misconfigured genesis fails at load rather than at the first Rex5 block.
+    /// misconfigured genesis fails at load rather than at the first Rex5 block. Likewise, when
+    /// `rex6Time` is configured the extra fields must carry a non-zero `rex6MinRotationDelay`.
     pub fn from_genesis(genesis: Genesis) -> Self {
-        // A malformed `rex5Time` treated as "Rex5 absent" would skip the bootstrap-required
-        // check and diverge from mega-reth at the activation timestamp, so surface parse errors.
+        // A malformed `rex5Time`/`rex6Time` treated as "fork absent" would skip the
+        // bootstrap-required check and diverge from mega-reth at the activation timestamp, so
+        // surface parse errors.
         let megaeth_hardforks = MegaethGenesisHardforks::extract_from(&genesis.config.extra_fields)
             .unwrap_or_else(|err| panic!("malformed MegaETH hardforks in genesis: {err}"));
         let rex5_scheduled = megaeth_hardforks.rex_5_time.is_some();
+        let rex6_scheduled = megaeth_hardforks.rex_6_time.is_some();
         let mut megaeth_hardforks = megaeth_hardforks.into_vec();
 
         // Rex5 SequencerRegistry bootstrap, required iff `rex5Time` is scheduled. Parsed from
@@ -93,6 +107,23 @@ impl ChainSpec {
             });
             let cfg = parsed.into_config();
             cfg.validate().unwrap_or_else(|err| panic!("invalid SequencerRegistryConfig: {err}"));
+            Some(cfg)
+        } else {
+            None
+        };
+
+        // Rex6 `SequencerRegistry` rotation hardening, required iff `rex6Time` is scheduled.
+        // Same flat schema as mega-reth (`rex6MinRotationDelay` as a top-level `config` field).
+        let sequencer_registry_rex6_config = if rex6_scheduled {
+            let parsed = MegaethGenesisSequencerRegistryRex6Config::parse_required_from(
+                &genesis.config.extra_fields,
+            )
+            .unwrap_or_else(|err| {
+                panic!("malformed or missing SequencerRegistryRex6Config in genesis: {err}")
+            });
+            let cfg = parsed.into_config();
+            cfg.validate()
+                .unwrap_or_else(|err| panic!("invalid SequencerRegistryRex6Config: {err}"));
             Some(cfg)
         } else {
             None
@@ -125,7 +156,12 @@ impl ChainSpec {
         // we merge megaeth_hardforks with op_hardforks
         all_hardforks.append(&mut op_hardforks);
 
-        Self { chain_id, hardforks: ChainHardforks::new(all_hardforks), sequencer_registry_config }
+        Self {
+            chain_id,
+            hardforks: ChainHardforks::new(all_hardforks),
+            sequencer_registry_config,
+            sequencer_registry_rex6_config,
+        }
     }
 }
 
@@ -151,6 +187,8 @@ pub struct MegaethGenesisHardforks {
     pub rex_4_time: Option<u64>,
     /// Rex5 hardfork timestamp.
     pub rex_5_time: Option<u64>,
+    /// Rex6 hardfork timestamp.
+    pub rex_6_time: Option<u64>,
 }
 
 impl MegaethGenesisHardforks {
@@ -173,6 +211,7 @@ impl MegaethGenesisHardforks {
             (MegaHardfork::Rex3.boxed(), self.rex_3_time.map(ForkCondition::Timestamp)),
             (MegaHardfork::Rex4.boxed(), self.rex_4_time.map(ForkCondition::Timestamp)),
             (MegaHardfork::Rex5.boxed(), self.rex_5_time.map(ForkCondition::Timestamp)),
+            (MegaHardfork::Rex6.boxed(), self.rex_6_time.map(ForkCondition::Timestamp)),
         ]
         .into_iter()
         .filter_map(|(hardfork, condition)| condition.map(|c| (hardfork, c)))
@@ -212,6 +251,34 @@ impl MegaethGenesisSequencerRegistryConfig {
     }
 }
 
+/// Rex6 `SequencerRegistry` rotation-hardening config, parsed from genesis `config` extra fields.
+///
+/// Flat schema (matches mega-reth) so a single genesis.json works for both binaries.
+/// The delay must be non-zero or [`SequencerRegistryRex6Config::validate`] rejects it.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MegaethGenesisSequencerRegistryRex6Config {
+    /// Minimum number of blocks between scheduling a sequencer change and its activation,
+    /// seeded into the registry at Rex6 activation.
+    pub rex6_min_rotation_delay: u64,
+}
+
+impl MegaethGenesisSequencerRegistryRex6Config {
+    /// Parse the required Rex6 rotation config from genesis extra fields.
+    ///
+    /// Returns a serde error if the delay field is missing or malformed. Callers should only
+    /// invoke it once they have decided the config is required, i.e. when `rex6Time` is
+    /// configured.
+    pub fn parse_required_from(others: &OtherFields) -> serde_json::Result<Self> {
+        others.deserialize_as()
+    }
+
+    /// Convert to the canonical mega-evm [`SequencerRegistryRex6Config`].
+    pub fn into_config(self) -> SequencerRegistryRex6Config {
+        SequencerRegistryRex6Config { rex6_min_rotation_delay: self.rex6_min_rotation_delay }
+    }
+}
+
 /// Build a fresh `ChainHardforks` describing MegaETH's canonical hardfork sequence.
 pub fn mega_mainnet_hardforks() -> ChainHardforks {
     ChainHardforks::new(vec![
@@ -224,6 +291,7 @@ pub fn mega_mainnet_hardforks() -> ChainHardforks {
         (MegaHardfork::Rex3.boxed(), ForkCondition::Timestamp(0)),
         (MegaHardfork::Rex4.boxed(), ForkCondition::Timestamp(0)),
         (MegaHardfork::Rex5.boxed(), ForkCondition::Timestamp(0)),
+        (MegaHardfork::Rex6.boxed(), ForkCondition::Timestamp(0)),
     ])
 }
 
@@ -279,7 +347,8 @@ mod tests {
           "rex2Time": 6,
           "rex3Time": 7,
           "rex4Time": 8,
-          "rex5Time": 9
+          "rex5Time": 9,
+          "rex6Time": 10
         }
         "#;
         let fields = serde_json::from_str::<OtherFields>(genesis_info).unwrap();
@@ -293,6 +362,7 @@ mod tests {
         assert_eq!(hardforks.rex_3_time, Some(7));
         assert_eq!(hardforks.rex_4_time, Some(8));
         assert_eq!(hardforks.rex_5_time, Some(9));
+        assert_eq!(hardforks.rex_6_time, Some(10));
     }
 
     #[test]
@@ -382,6 +452,123 @@ mod tests {
             )
             .unwrap();
         let _ = ChainSpec::from_genesis(genesis);
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed MegaETH hardforks in genesis")]
+    fn test_chain_spec_malformed_rex6_time_panics() {
+        let mut genesis = Genesis::default();
+        genesis.config.extra_fields.insert_value("rex6Time".to_string(), "not-a-number").unwrap();
+        let _ = ChainSpec::from_genesis(genesis);
+    }
+
+    #[test]
+    fn test_parse_sequencer_registry_rex6_from_flat_json() {
+        let genesis_info = r#"
+        {
+          "rex6Time": 0,
+          "rex6MinRotationDelay": 7200
+        }
+        "#;
+        let fields = serde_json::from_str::<OtherFields>(genesis_info).unwrap();
+        let parsed =
+            MegaethGenesisSequencerRegistryRex6Config::parse_required_from(&fields).unwrap();
+        assert_eq!(parsed.rex6_min_rotation_delay, 7200);
+    }
+
+    #[test]
+    fn test_chain_spec_carries_rex6_registry_as_fork_params() {
+        let mut genesis = Genesis::default();
+        genesis.config.extra_fields.insert_value("rex6Time".to_string(), 0).unwrap();
+        genesis.config.extra_fields.insert_value("rex6MinRotationDelay".to_string(), 7200).unwrap();
+        let spec = ChainSpec::from_genesis(genesis);
+        let params =
+            spec.fork_params::<SequencerRegistryRex6Config>().expect("Rex6 params present");
+        assert_eq!(params.rex6_min_rotation_delay, 7200);
+        assert_eq!(spec.hardforks.fork(MegaHardfork::Rex6), ForkCondition::Timestamp(0));
+    }
+
+    #[test]
+    fn test_chain_spec_no_rex6_returns_none() {
+        let genesis = Genesis::default();
+        let spec = ChainSpec::from_genesis(genesis);
+        assert!(spec.fork_params::<SequencerRegistryRex6Config>().is_none());
+        assert!(spec.sequencer_registry_rex6_config.is_none());
+    }
+
+    #[test]
+    fn test_chain_spec_rex6_delay_without_time_ignored() {
+        let mut genesis = Genesis::default();
+        genesis.config.extra_fields.insert_value("rex6MinRotationDelay".to_string(), 7200).unwrap();
+        let spec = ChainSpec::from_genesis(genesis);
+        assert_eq!(spec.hardforks.fork(MegaHardfork::Rex6), ForkCondition::Never);
+        assert!(spec.sequencer_registry_rex6_config.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed or missing SequencerRegistryRex6Config in genesis")]
+    fn test_chain_spec_rex6_without_bootstrap_panics() {
+        let mut genesis = Genesis::default();
+        genesis.config.extra_fields.insert_value("rex6Time".to_string(), 0).unwrap();
+        let _ = ChainSpec::from_genesis(genesis);
+    }
+
+    #[test]
+    #[should_panic(expected = "malformed or missing SequencerRegistryRex6Config in genesis")]
+    fn test_chain_spec_rex6_malformed_delay_panics() {
+        let mut genesis = Genesis::default();
+        genesis.config.extra_fields.insert_value("rex6Time".to_string(), 0).unwrap();
+        genesis
+            .config
+            .extra_fields
+            .insert_value("rex6MinRotationDelay".to_string(), "not-a-number")
+            .unwrap();
+        let _ = ChainSpec::from_genesis(genesis);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid SequencerRegistryRex6Config")]
+    fn test_chain_spec_rex6_zero_delay_panics() {
+        let mut genesis = Genesis::default();
+        genesis.config.extra_fields.insert_value("rex6Time".to_string(), 0).unwrap();
+        genesis.config.extra_fields.insert_value("rex6MinRotationDelay".to_string(), 0).unwrap();
+        let _ = ChainSpec::from_genesis(genesis);
+    }
+
+    #[test]
+    fn test_chain_spec_rex5_and_rex6_coexist_in_canonical_order() {
+        let mut genesis = Genesis::default();
+        genesis.config.extra_fields.insert_value("rex5Time".to_string(), 100).unwrap();
+        genesis
+            .config
+            .extra_fields
+            .insert_value(
+                "rex5InitialSequencer".to_string(),
+                "0x0000000000000000000000000000000000000001",
+            )
+            .unwrap();
+        genesis
+            .config
+            .extra_fields
+            .insert_value(
+                "rex5InitialAdmin".to_string(),
+                "0x0000000000000000000000000000000000000002",
+            )
+            .unwrap();
+        genesis.config.extra_fields.insert_value("rex6Time".to_string(), 200).unwrap();
+        genesis.config.extra_fields.insert_value("rex6MinRotationDelay".to_string(), 7200).unwrap();
+        let spec = ChainSpec::from_genesis(genesis);
+
+        assert_eq!(spec.hardforks.fork(MegaHardfork::Rex5), ForkCondition::Timestamp(100));
+        assert_eq!(spec.hardforks.fork(MegaHardfork::Rex6), ForkCondition::Timestamp(200));
+        assert!(spec.fork_params::<SequencerRegistryConfig>().is_some());
+        assert!(spec.fork_params::<SequencerRegistryRex6Config>().is_some());
+
+        // Rex6 must sort after Rex5 in the merged canonical ordering.
+        let names: Vec<_> = spec.hardforks.forks_iter().map(|(f, _)| f.name()).collect();
+        let rex5_pos = names.iter().position(|n| *n == MegaHardfork::Rex5.name()).unwrap();
+        let rex6_pos = names.iter().position(|n| *n == MegaHardfork::Rex6.name()).unwrap();
+        assert!(rex5_pos < rex6_pos, "Rex6 must come after Rex5 in the hardfork order");
     }
 
     #[test]
