@@ -459,7 +459,9 @@ async fn main() -> Result<()> {
     let chain_spec = load_chain_spec(&args)?;
 
     let response_cache = if response_cache_disabled {
-        info!("Response cache disabled (estimated_items = 0)");
+        warn!(
+            "Response cache disabled (estimated_items = 0); every trace response will be recomputed"
+        );
         None
     } else {
         let cache = ResponseCache::new(ResponseCacheConfig::new(

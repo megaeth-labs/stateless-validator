@@ -98,6 +98,10 @@ Two operating modes:
 - **Stateless mode** (no `--data-dir`): All data fetched from remote RPC on demand.
 - **Local cache mode** (with `--data-dir`): Enables chain sync to pre-fetch blocks for faster serving.
 
+**Response cache:**
+The HTTP response cache stores block-level responses only for idempotent request shapes: the five built-in tracers (`callTracer`, `prestateTracer`, `4byteTracer`, `noopTracer`, `flatCallTracer`, each keyed by a hash of its `tracerConfig`) and the bare default struct-logger request (no tracer, no `tracerConfig`, default flags).
+JS tracers, `muxTracer`, and struct-logger requests with non-default flags bypass the cache and are recomputed on every request.
+
 **Witness endpoints:**
 Declare the internal witness generator via `--witness-generator-endpoint`; `--witness-endpoint` lists the durable fallbacks (e.g. an R2-backed witness service), tried in order.
 In local cache mode with a generator plus at least one fallback, requests for blocks at least `--witness-local-window` blocks below the local tip skip the generator and fetch from the fallbacks, because the generator only retains a recent window (its `BACKUP`, deployed at 4096) and probing it for pruned blocks is a guaranteed miss.

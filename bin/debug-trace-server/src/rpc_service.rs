@@ -301,15 +301,16 @@ async fn compute_parity_trace_block(
 
 // Cache Helper Functions
 /// Checks cache by block number and returns cached value if found.
+/// A `None` variant marks a non-cacheable request shape and bypasses the lookup.
 fn check_cache_by_number(
     cache: &Option<ResponseCache>,
     resource: CachedResource,
     block_num: u64,
-    variant: &ResponseVariant,
+    variant: Option<&ResponseVariant>,
     method_name: &'static str,
     start: Instant,
 ) -> Option<serde_json::Value> {
-    let cached_value = cache.as_ref()?.get(resource, block_num, variant.clone())?;
+    let cached_value = cache.as_ref()?.get(resource, block_num, variant?.clone())?;
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
     metrics::record_rpc_request(method_name, total_ms / 1000.0);
@@ -328,16 +329,17 @@ fn check_cache_by_number(
 }
 
 /// Checks cache by block hash and returns cached value if found.
+/// A `None` variant marks a non-cacheable request shape and bypasses the lookup.
 fn check_cache_by_hash(
     cache: &Option<ResponseCache>,
     resource: CachedResource,
     block_hash: B256,
-    variant: &ResponseVariant,
+    variant: Option<&ResponseVariant>,
     method_name: &'static str,
     start: Instant,
 ) -> Option<serde_json::Value> {
     let (cached_value, block_num) =
-        cache.as_ref()?.get_by_hash(resource, block_hash, variant.clone())?;
+        cache.as_ref()?.get_by_hash(resource, block_hash, variant?.clone())?;
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
     metrics::record_rpc_request(method_name, total_ms / 1000.0);
@@ -354,6 +356,21 @@ fn check_cache_by_hash(
     );
 
     Some(cached_value)
+}
+
+/// Inserts a computed response into the cache; a no-op when the cache is disabled or the
+/// request shape is not cacheable (`variant` is `None`).
+fn insert_cache(
+    cache: &Option<ResponseCache>,
+    resource: CachedResource,
+    block_num: u64,
+    block_hash: B256,
+    variant: Option<&ResponseVariant>,
+    result: &serde_json::Value,
+) {
+    if let (Some(cache), Some(variant)) = (cache, variant) {
+        cache.insert(resource, block_num, block_hash, variant.clone(), result.clone());
+    }
 }
 
 /// Records metrics and logs for a completed request.
@@ -396,14 +413,14 @@ impl DebugTraceRpcServer for RpcContext {
             })?;
         let resolve_ms = t0.elapsed().as_millis();
 
-        let variant = ResponseVariant::from_geth_options(&opts);
+        let variant = ResponseVariant::cacheable_from_geth_options(&opts);
 
         // Stage 2: Check cache
         if let Some(cached) = check_cache_by_number(
             &self.response_cache,
             CachedResource::DebugTraceBlock,
             block_num,
-            &variant,
+            variant.as_ref(),
             METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
             start,
         ) {
@@ -436,15 +453,14 @@ impl DebugTraceRpcServer for RpcContext {
 
         // Stage 5: Cache result
         let t4 = Instant::now();
-        if let Some(cache) = &self.response_cache {
-            cache.insert(
-                CachedResource::DebugTraceBlock,
-                block_num,
-                block_hash,
-                variant,
-                result.clone(),
-            );
-        }
+        insert_cache(
+            &self.response_cache,
+            CachedResource::DebugTraceBlock,
+            block_num,
+            block_hash,
+            variant.as_ref(),
+            &result,
+        );
         let cache_insert_ms = t4.elapsed().as_millis();
 
         let total_ms = start.elapsed().as_millis();
@@ -481,14 +497,14 @@ impl DebugTraceRpcServer for RpcContext {
         let start = Instant::now();
         let opts = opts.unwrap_or_default();
 
-        let variant = ResponseVariant::from_geth_options(&opts);
+        let variant = ResponseVariant::cacheable_from_geth_options(&opts);
 
         // Check cache
         if let Some(cached) = check_cache_by_hash(
             &self.response_cache,
             CachedResource::DebugTraceBlock,
             block_hash,
-            &variant,
+            variant.as_ref(),
             METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
             start,
         ) {
@@ -513,15 +529,14 @@ impl DebugTraceRpcServer for RpcContext {
         })?;
 
         // Cache and record metrics
-        if let Some(cache) = &self.response_cache {
-            cache.insert(
-                CachedResource::DebugTraceBlock,
-                block_num,
-                block_hash,
-                variant,
-                result.clone(),
-            );
-        }
+        insert_cache(
+            &self.response_cache,
+            CachedResource::DebugTraceBlock,
+            block_num,
+            block_hash,
+            variant.as_ref(),
+            &result,
+        );
         record_request_completion(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, block_num, start);
 
         Ok(result)
@@ -625,7 +640,7 @@ impl TraceRpcServer for RpcContext {
             &self.response_cache,
             CachedResource::TraceBlock,
             block_num,
-            &ResponseVariant::Default,
+            Some(&ResponseVariant::Default),
             METHOD_TRACE_BLOCK,
             start,
         ) {
@@ -646,15 +661,14 @@ impl TraceRpcServer for RpcContext {
             })?;
 
         // Cache and record metrics
-        if let Some(cache) = &self.response_cache {
-            cache.insert(
-                CachedResource::TraceBlock,
-                block_num,
-                block_hash,
-                ResponseVariant::Default,
-                result.clone(),
-            );
-        }
+        insert_cache(
+            &self.response_cache,
+            CachedResource::TraceBlock,
+            block_num,
+            block_hash,
+            Some(&ResponseVariant::Default),
+            &result,
+        );
         record_request_completion(METHOD_TRACE_BLOCK, block_num, start);
 
         Ok(result)
@@ -721,6 +735,7 @@ impl TraceRpcServer for RpcContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::response_cache::ResponseCacheConfig;
 
     #[test]
     fn test_rpc_err() {
@@ -822,7 +837,7 @@ mod tests {
             &None,
             CachedResource::DebugTraceBlock,
             100,
-            &ResponseVariant::Default,
+            Some(&ResponseVariant::Default),
             "test_method",
             Instant::now(),
         );
@@ -835,11 +850,70 @@ mod tests {
             &None,
             CachedResource::DebugTraceBlock,
             B256::ZERO,
-            &ResponseVariant::Default,
+            Some(&ResponseVariant::Default),
             "test_method",
             Instant::now(),
         );
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn check_cache_bypasses_on_non_cacheable_variant() {
+        let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
+        cache.insert(
+            CachedResource::DebugTraceBlock,
+            100,
+            B256::from([1u8; 32]),
+            ResponseVariant::Default,
+            serde_json::json!({"cached": true}),
+        );
+        let cache = Some(cache);
+
+        let by_number = check_cache_by_number(
+            &cache,
+            CachedResource::DebugTraceBlock,
+            100,
+            None,
+            "test_method",
+            Instant::now(),
+        );
+        assert!(by_number.is_none());
+
+        let by_hash = check_cache_by_hash(
+            &cache,
+            CachedResource::DebugTraceBlock,
+            B256::from([1u8; 32]),
+            None,
+            "test_method",
+            Instant::now(),
+        );
+        assert!(by_hash.is_none());
+    }
+
+    #[test]
+    fn insert_cache_skips_non_cacheable_variants() {
+        let cache = Some(ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100)));
+        let result = serde_json::json!([{"txHash": "0x01"}]);
+
+        insert_cache(
+            &cache,
+            CachedResource::DebugTraceBlock,
+            100,
+            B256::from([1u8; 32]),
+            None,
+            &result,
+        );
+        assert_eq!(cache.as_ref().unwrap().len(), 0);
+
+        insert_cache(
+            &cache,
+            CachedResource::DebugTraceBlock,
+            100,
+            B256::from([1u8; 32]),
+            Some(&ResponseVariant::Default),
+            &result,
+        );
+        assert_eq!(cache.as_ref().unwrap().len(), 1);
     }
 
     #[test]

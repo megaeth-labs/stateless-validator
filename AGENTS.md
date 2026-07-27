@@ -107,6 +107,7 @@ Two operating modes:
 - **Local cache mode** — With `data_dir`, enables chain sync to pre-fetch blocks into `ValidatorDB` for faster serving.
 
 The server includes an HTTP response cache (`quick_cache`) for pre-serialized JSON and a `DataProvider` with single-flight request coalescing.
+The response cache only stores idempotent request shapes: the five built-in tracers (keyed by a hash of their `tracerConfig`) and the bare default struct-logger request; JS tracers, `muxTracer`, and struct-logger requests with non-default flags bypass it entirely.
 In local cache mode with a `--witness-generator-endpoint` plus at least one fallback `--witness-endpoint`, request-serving witness fetches route by block age: blocks at least `--witness-local-window` blocks below the local tip skip the generator (which prunes beyond its `BACKUP` window) and fetch from the fallbacks; without the generator flag, witness endpoints are plain failover and routing is disabled.
 The background chain-sync prefetch always uses the full endpoint chain — it fetches at the sync frontier, which stays within the generator's retention unless `--blocks-to-keep` exceeds that retention during deep catch-up.
 

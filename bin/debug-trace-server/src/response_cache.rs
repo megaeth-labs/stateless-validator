@@ -19,7 +19,7 @@ use std::{
 };
 
 use alloy_primitives::B256;
-use alloy_rpc_types_trace::geth::GethDebugTracingOptions;
+use alloy_rpc_types_trace::geth::{GethDebugTracingOptions, GethDefaultTracingOptions};
 use quick_cache::{Lifecycle, Weighter, sync::Cache};
 use tracing::{debug, trace};
 
@@ -98,26 +98,6 @@ impl TracerType {
             _ => None,
         }
     }
-
-    /// Creates a TracerType from GethDebugTracingOptions.
-    pub fn from_geth_options(opts: &GethDebugTracingOptions) -> Self {
-        use alloy_rpc_types_trace::geth::{GethDebugBuiltInTracerType, GethDebugTracerType};
-
-        match &opts.tracer {
-            None => Self::Default,
-            Some(GethDebugTracerType::BuiltInTracer(builtin)) => match builtin {
-                GethDebugBuiltInTracerType::CallTracer => Self::CallTracer,
-                GethDebugBuiltInTracerType::PreStateTracer => Self::PrestateTracer,
-                GethDebugBuiltInTracerType::FourByteTracer => Self::FourByteTracer,
-                GethDebugBuiltInTracerType::NoopTracer => Self::NoopTracer,
-                GethDebugBuiltInTracerType::FlatCallTracer => Self::FlatCallTracer,
-                // MuxTracer and any future tracers fall back to Default with config hash
-                _ => Self::Default,
-            },
-            // JS tracers get their own unique hash via config
-            Some(GethDebugTracerType::JsTracer(_)) => Self::Default,
-        }
-    }
 }
 
 /// Response variant that distinguishes different parameter combinations.
@@ -131,28 +111,49 @@ pub enum ResponseVariant {
 }
 
 impl ResponseVariant {
-    /// Creates a Tracer variant from GethDebugTracingOptions.
-    pub fn from_geth_options(opts: &GethDebugTracingOptions) -> Self {
-        use std::{
-            collections::hash_map::DefaultHasher,
-            hash::{Hash, Hasher},
+    /// Returns the cache variant for a request shape whose response is fully determined by
+    /// the resulting key, or `None` for shapes that must bypass the cache (read and write).
+    ///
+    /// Cacheable: the five known built-in tracers, discriminated by a hash of
+    /// `opts.tracer_config` (top-level `opts.config` is excluded — no built-in tracer reads
+    /// it, so including it would only split identical responses across entries), and the bare
+    /// default struct-logger request (no tracer, no `tracer_config`, default `opts.config`).
+    ///
+    /// Bypassed: JS tracers (the response depends on the tracer source, which has no place in
+    /// the key), `muxTracer` and unknown future built-ins, and struct-logger requests with
+    /// non-default `opts.config` (those flags change struct-logger output).
+    pub fn cacheable_from_geth_options(opts: &GethDebugTracingOptions) -> Option<Self> {
+        use alloy_rpc_types_trace::geth::{GethDebugBuiltInTracerType, GethDebugTracerType};
+
+        let tracer_type = match &opts.tracer {
+            None => {
+                let pure_default = opts.tracer_config.is_null() &&
+                    opts.config == GethDefaultTracingOptions::default();
+                return pure_default.then_some(Self::Tracer(TracerType::Default, None));
+            }
+            Some(GethDebugTracerType::BuiltInTracer(builtin)) => match builtin {
+                GethDebugBuiltInTracerType::CallTracer => TracerType::CallTracer,
+                GethDebugBuiltInTracerType::PreStateTracer => TracerType::PrestateTracer,
+                GethDebugBuiltInTracerType::FourByteTracer => TracerType::FourByteTracer,
+                GethDebugBuiltInTracerType::NoopTracer => TracerType::NoopTracer,
+                GethDebugBuiltInTracerType::FlatCallTracer => TracerType::FlatCallTracer,
+                _ => return None,
+            },
+            Some(GethDebugTracerType::JsTracer(_)) => return None,
         };
 
-        let tracer_type = TracerType::from_geth_options(opts);
+        let config_hash = (!opts.tracer_config.is_null()).then(|| {
+            use std::{
+                collections::hash_map::DefaultHasher,
+                hash::{Hash, Hasher},
+            };
 
-        // Hash the tracer config for cache key discrimination
-        let config_hash = if opts.tracer_config.is_null() {
-            None
-        } else {
             let mut hasher = DefaultHasher::new();
-            // Hash the debug representation of the config
             format!("{:?}", opts.tracer_config).hash(&mut hasher);
-            // Also hash relevant default options
-            format!("{:?}", opts.config).hash(&mut hasher);
-            Some(hasher.finish())
-        };
+            hasher.finish()
+        });
 
-        Self::Tracer(tracer_type, config_hash)
+        Some(Self::Tracer(tracer_type, config_hash))
     }
 }
 
@@ -248,11 +249,30 @@ impl SecondaryIndices {
         self.inner.read().unwrap().hash_to_number.get(hash).copied()
     }
 
-    fn insert(&self, block_hash: B256, block_number: u64, key: ResponseCacheKey) {
+    /// Inserts the hash/number mapping and key.
+    ///
+    /// If `block_number` was previously indexed under a different hash — a reorg observed
+    /// without invalidation, e.g. in stateless mode where no chain sync runs — every response
+    /// cached for that number belongs to a dead block: the stale hash mapping is dropped here
+    /// and the dead block's keys are returned for the caller to evict.
+    fn insert(
+        &self,
+        block_hash: B256,
+        block_number: u64,
+        key: ResponseCacheKey,
+    ) -> Option<HashSet<ResponseCacheKey>> {
         let mut inner = self.inner.write().unwrap();
+        let stale = match inner.number_to_hash.get(&block_number) {
+            Some(&old_hash) if old_hash != block_hash => {
+                inner.hash_to_number.remove(&old_hash);
+                inner.number_to_keys.remove(&block_number)
+            }
+            _ => None,
+        };
         inner.hash_to_number.insert(block_hash, block_number);
         inner.number_to_hash.insert(block_number, block_hash);
         inner.number_to_keys.entry(block_number).or_default().insert(key);
+        stale
     }
 
     fn remove_block(&self, block_number: u64) -> Option<HashSet<ResponseCacheKey>> {
@@ -422,7 +442,6 @@ impl ResponseCache {
     }
 
     /// Inserts a response into the cache and updates secondary indices.
-    #[allow(dead_code)] // Used in tests
     pub fn insert(
         &self,
         resource: CachedResource,
@@ -435,7 +454,8 @@ impl ResponseCache {
         let cached = CachedResponse::new(response);
 
         self.inner.cache.insert(key.clone(), cached);
-        self.inner.indices.insert(block_hash, block_number, key);
+        let stale = self.inner.indices.insert(block_hash, block_number, key.clone());
+        self.evict_stale_keys(stale, &key);
         self.update_size_metrics();
     }
 
@@ -477,7 +497,8 @@ impl ResponseCache {
                 let byte_len = cached.byte_len;
                 let _ = guard.insert(cached);
 
-                self.inner.indices.insert(block_hash, block_number, key);
+                let stale = self.inner.indices.insert(block_hash, block_number, key.clone());
+                self.evict_stale_keys(stale, &key);
                 self.update_size_metrics();
 
                 self.inner.misses.fetch_add(1, Ordering::Relaxed);
@@ -492,6 +513,28 @@ impl ResponseCache {
 
                 Ok(result)
             }
+        }
+    }
+
+    /// Evicts cache entries whose index entries were purged by a re-keying
+    /// [`SecondaryIndices::insert`], skipping `keep` — on a same-variant re-key the stale set
+    /// contains a key equal to the one just written, whose slot already holds the fresh
+    /// response.
+    fn evict_stale_keys(&self, stale: Option<HashSet<ResponseCacheKey>>, keep: &ResponseCacheKey) {
+        let Some(stale) = stale else { return };
+        let mut evicted = 0usize;
+        for key in stale {
+            if &key != keep {
+                self.inner.cache.remove(&key);
+                evicted += 1;
+            }
+        }
+        if evicted > 0 {
+            debug!(
+                block_number = keep.block_number,
+                entries = evicted,
+                "Evicted responses of a re-keyed block number"
+            );
         }
     }
 
@@ -600,7 +643,183 @@ impl CacheStats {
 
 #[cfg(test)]
 mod tests {
+    use alloy_rpc_types_trace::geth::{
+        GethDebugBuiltInTracerType, GethDebugTracerConfig, GethDebugTracerType,
+    };
+    use serde_json::json;
+
     use super::*;
+
+    fn builtin_opts(tracer: GethDebugBuiltInTracerType) -> GethDebugTracingOptions {
+        GethDebugTracingOptions {
+            tracer: Some(GethDebugTracerType::BuiltInTracer(tracer)),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cacheable_variant_structlogger_requires_pure_default() {
+        let bare = GethDebugTracingOptions::default();
+        assert_eq!(
+            ResponseVariant::cacheable_from_geth_options(&bare),
+            Some(ResponseVariant::Tracer(TracerType::Default, None))
+        );
+
+        // Struct-logger flags change struct-logger output, so any non-default config must
+        // bypass the cache instead of colliding with the bare-default entry.
+        let with_flags = GethDebugTracingOptions {
+            config: GethDefaultTracingOptions { disable_storage: Some(true), ..Default::default() },
+            ..Default::default()
+        };
+        assert_eq!(ResponseVariant::cacheable_from_geth_options(&with_flags), None);
+
+        let with_tracer_config = GethDebugTracingOptions {
+            tracer_config: GethDebugTracerConfig(json!({"some": "config"})),
+            ..Default::default()
+        };
+        assert_eq!(ResponseVariant::cacheable_from_geth_options(&with_tracer_config), None);
+    }
+
+    #[test]
+    fn cacheable_variant_rejects_js_mux_and_unknown() {
+        let js_a = GethDebugTracingOptions {
+            tracer: Some(GethDebugTracerType::JsTracer("{fault: () => {}}".to_string())),
+            ..Default::default()
+        };
+        let js_b = GethDebugTracingOptions {
+            tracer: Some(GethDebugTracerType::JsTracer("{result: () => 42}".to_string())),
+            ..Default::default()
+        };
+        assert_eq!(ResponseVariant::cacheable_from_geth_options(&js_a), None);
+        assert_eq!(ResponseVariant::cacheable_from_geth_options(&js_b), None);
+
+        let js_with_config = GethDebugTracingOptions {
+            tracer: Some(GethDebugTracerType::JsTracer("{}".to_string())),
+            tracer_config: GethDebugTracerConfig(json!({"x": 1})),
+            ..Default::default()
+        };
+        assert_eq!(ResponseVariant::cacheable_from_geth_options(&js_with_config), None);
+
+        let mux = builtin_opts(GethDebugBuiltInTracerType::MuxTracer);
+        assert_eq!(ResponseVariant::cacheable_from_geth_options(&mux), None);
+    }
+
+    #[test]
+    fn cacheable_variant_builtin_ignores_default_config_flags() {
+        let bare_call = builtin_opts(GethDebugBuiltInTracerType::CallTracer);
+        let call_with_flags = GethDebugTracingOptions {
+            config: GethDefaultTracingOptions { disable_storage: Some(true), ..Default::default() },
+            ..builtin_opts(GethDebugBuiltInTracerType::CallTracer)
+        };
+        // Built-in tracers never read `opts.config`, so both shapes share one entry.
+        assert_eq!(
+            ResponseVariant::cacheable_from_geth_options(&bare_call),
+            ResponseVariant::cacheable_from_geth_options(&call_with_flags),
+        );
+
+        let call_top_only = GethDebugTracingOptions {
+            tracer_config: GethDebugTracerConfig(json!({"onlyTopCall": true})),
+            ..builtin_opts(GethDebugBuiltInTracerType::CallTracer)
+        };
+        let call_with_log = GethDebugTracingOptions {
+            tracer_config: GethDebugTracerConfig(json!({"withLog": true})),
+            ..builtin_opts(GethDebugBuiltInTracerType::CallTracer)
+        };
+        let v_bare = ResponseVariant::cacheable_from_geth_options(&bare_call).unwrap();
+        let v_top = ResponseVariant::cacheable_from_geth_options(&call_top_only).unwrap();
+        let v_log = ResponseVariant::cacheable_from_geth_options(&call_with_log).unwrap();
+        assert_ne!(v_bare, v_top);
+        assert_ne!(v_top, v_log);
+    }
+
+    #[test]
+    fn cacheable_variant_all_builtins_distinct() {
+        let variants: Vec<_> = [
+            GethDebugBuiltInTracerType::CallTracer,
+            GethDebugBuiltInTracerType::PreStateTracer,
+            GethDebugBuiltInTracerType::FourByteTracer,
+            GethDebugBuiltInTracerType::NoopTracer,
+            GethDebugBuiltInTracerType::FlatCallTracer,
+        ]
+        .into_iter()
+        .map(|t| ResponseVariant::cacheable_from_geth_options(&builtin_opts(t)).unwrap())
+        .collect();
+        let unique: HashSet<_> = variants.iter().cloned().collect();
+        assert_eq!(unique.len(), variants.len());
+    }
+
+    #[test]
+    fn secondary_index_rehash_purges_dead_block_entries() {
+        let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
+        let h1 = B256::from([1u8; 32]);
+        let h2 = B256::from([2u8; 32]);
+        let call = ResponseVariant::Tracer(TracerType::CallTracer, None);
+
+        cache.insert(CachedResource::DebugTraceBlock, 100, h1, call.clone(), json!({"v": 1}));
+        cache.insert(
+            CachedResource::DebugTraceBlock,
+            100,
+            h1,
+            ResponseVariant::Default,
+            json!({"v": 2}),
+        );
+        assert_eq!(cache.len(), 2);
+
+        // Re-keying block 100 to a new hash marks every entry cached under the old hash as
+        // belonging to a dead block.
+        cache.insert(
+            CachedResource::DebugTraceBlock,
+            100,
+            h2,
+            ResponseVariant::Default,
+            json!({"v": 3}),
+        );
+
+        assert!(cache.get(CachedResource::DebugTraceBlock, 100, call).is_none());
+        assert!(
+            cache
+                .get_by_hash(CachedResource::DebugTraceBlock, h1, ResponseVariant::Default)
+                .is_none()
+        );
+        // The fresh same-variant entry must survive the purge.
+        assert_eq!(
+            cache.get(CachedResource::DebugTraceBlock, 100, ResponseVariant::Default),
+            Some(json!({"v": 3}))
+        );
+        assert_eq!(
+            cache.get_by_hash(CachedResource::DebugTraceBlock, h2, ResponseVariant::Default),
+            Some((json!({"v": 3}), 100))
+        );
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_or_compute_rehash_purges_dead_block_entries() {
+        let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
+        let h1 = B256::from([1u8; 32]);
+        let h2 = B256::from([2u8; 32]);
+        let call = ResponseVariant::Tracer(TracerType::CallTracer, None);
+
+        cache.insert(CachedResource::DebugTraceBlock, 100, h1, call.clone(), json!({"v": 1}));
+
+        let computed: Result<_, std::convert::Infallible> = cache
+            .get_or_compute(
+                CachedResource::DebugTraceBlock,
+                100,
+                h2,
+                ResponseVariant::Default,
+                || async { Ok(json!({"v": 3})) },
+            )
+            .await;
+        assert_eq!(computed.unwrap(), json!({"v": 3}));
+
+        assert!(cache.get(CachedResource::DebugTraceBlock, 100, call).is_none());
+        assert_eq!(
+            cache.get(CachedResource::DebugTraceBlock, 100, ResponseVariant::Default),
+            Some(json!({"v": 3}))
+        );
+        assert_eq!(cache.len(), 1);
+    }
 
     #[test]
     fn test_tracer_type_parse() {
