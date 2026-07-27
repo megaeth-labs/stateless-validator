@@ -333,6 +333,15 @@ impl DataProvider {
         self.block_data_cache.as_ref().map(|cache| cache.stats())
     }
 
+    /// Drops a block from the memory cache after its data failed execution: a decodable but
+    /// incomplete witness would otherwise stay pinned, failing every retry until eviction —
+    /// dropping it lets the next request refetch from the endpoints.
+    pub fn evict_block_data(&self, block_hash: &B256) {
+        if let Some(cache) = &self.block_data_cache {
+            cache.remove(block_hash);
+        }
+    }
+
     /// Whether `hash` is the canonical hash for `number`, used to validate number-keyed
     /// response-cache hits.
     ///

@@ -488,6 +488,7 @@ impl DebugTraceRpcServer for RpcContext {
         .await
         .inspect_err(|_| {
             metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
+            self.data_provider.evict_block_data(&block_hash);
         })?;
         let trace_ms = t3.elapsed().as_millis();
 
@@ -566,6 +567,7 @@ impl DebugTraceRpcServer for RpcContext {
         .await
         .inspect_err(|_| {
             metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
+            self.data_provider.evict_block_data(&block_hash);
         })?;
 
         // Cache and record metrics
@@ -610,6 +612,7 @@ impl DebugTraceRpcServer for RpcContext {
         )
         .map_err(|e| {
             metrics::record_rpc_error(METHOD_DEBUG_TRACE_TRANSACTION);
+            self.data_provider.evict_block_data(&data.block.header.hash);
             rpc_err(format!("Trace execution failed: {e}"))
         })?;
         EvmExecutionMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION)
@@ -706,6 +709,7 @@ impl TraceRpcServer for RpcContext {
             .await
             .inspect_err(|_| {
                 metrics::record_rpc_error(METHOD_TRACE_BLOCK);
+                self.data_provider.evict_block_data(&block_hash);
             })?;
 
         // Cache and record metrics
@@ -753,6 +757,7 @@ impl TraceRpcServer for RpcContext {
         )
         .map_err(|e| {
             metrics::record_rpc_error(METHOD_TRACE_TRANSACTION);
+            self.data_provider.evict_block_data(&data.block.header.hash);
             rpc_err(format!("Trace execution failed: {e}"))
         })?;
         EvmExecutionMetrics::new_for_method(METHOD_TRACE_TRANSACTION)

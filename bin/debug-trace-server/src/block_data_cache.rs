@@ -54,8 +54,17 @@ pub struct BlockDataWeighter;
 const ENTRY_OVERHEAD: u64 = 128;
 /// Approximate fixed size of a block header + envelope.
 const BLOCK_FIXED_OVERHEAD: u64 = 2048;
-/// Approximate per-transaction size excluding calldata (envelope, signature, hashes).
+/// Approximate per-transaction size excluding variable-length fields (envelope, signature,
+/// hashes).
 const TX_OVERHEAD: u64 = 512;
+/// Approximate per-item size of an EIP-2930 access-list entry excluding its storage keys
+/// (address + vec header).
+const ACCESS_LIST_ITEM_BYTES: u64 = 64;
+/// Size of one access-list storage key.
+const STORAGE_KEY_BYTES: u64 = 32;
+/// Approximate size of one EIP-7702 signed authorization (chain id + address + nonce +
+/// signature).
+const AUTHORIZATION_BYTES: u64 = 192;
 
 impl Weighter<B256, Arc<BlockData>> for BlockDataWeighter {
     fn weight(&self, _key: &B256, val: &Arc<BlockData>) -> u64 {
@@ -67,9 +76,25 @@ impl Weighter<B256, Arc<BlockData>> for BlockDataWeighter {
             .sum();
         let block = BLOCK_FIXED_OVERHEAD +
             match &val.block.transactions {
-                BlockTransactions::Full(txs) => {
-                    txs.iter().map(|tx| TX_OVERHEAD + tx.inner.input().len() as u64).sum::<u64>()
-                }
+                BlockTransactions::Full(txs) => txs
+                    .iter()
+                    .map(|tx| {
+                        let calldata = tx.inner.input().len() as u64;
+                        let access_list = tx.inner.access_list().map_or(0, |al| {
+                            al.iter()
+                                .map(|item| {
+                                    ACCESS_LIST_ITEM_BYTES +
+                                        item.storage_keys.len() as u64 * STORAGE_KEY_BYTES
+                                })
+                                .sum()
+                        });
+                        let authorizations = tx
+                            .inner
+                            .authorization_list()
+                            .map_or(0, |auths| auths.len() as u64 * AUTHORIZATION_BYTES);
+                        TX_OVERHEAD + calldata + access_list + authorizations
+                    })
+                    .sum::<u64>(),
                 other => other.len() as u64 * TX_OVERHEAD,
             };
         ENTRY_OVERHEAD + witness + contracts + block
@@ -139,6 +164,13 @@ impl BlockDataCache {
     /// Inserts resolved block data and refreshes the size gauges.
     pub fn insert(&self, hash: B256, data: Arc<BlockData>) {
         self.cache.insert(hash, data);
+        self.metrics.set_size(self.cache.len(), self.cache.weight() as usize);
+    }
+
+    /// Removes an entry, e.g. when its witness turned out to be unusable at execution time —
+    /// a decodable but wrong upstream response must not stay pinned until eviction.
+    pub fn remove(&self, hash: &B256) {
+        self.cache.remove(hash);
         self.metrics.set_size(self.cache.len(), self.cache.weight() as usize);
     }
 
@@ -221,6 +253,11 @@ mod tests {
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 1);
         assert!(stats.total_bytes > 0);
+
+        // Execution-failure eviction path: a removed entry misses on the next request.
+        cache.remove(&hash);
+        assert!(cache.get(&hash).is_none());
+        assert_eq!(cache.stats().entry_count, 0);
     }
 
     #[test]
