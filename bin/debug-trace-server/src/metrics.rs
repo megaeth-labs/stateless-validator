@@ -59,6 +59,8 @@ pub const TIMED_METHOD_ALIASES: &[(&str, &str)] = &[
 pub const CACHE_TYPE_DEBUG_TRACE: &str = "debug_trace_block";
 /// Cache type for parity trace block responses.
 pub const CACHE_TYPE_TRACE: &str = "trace_block";
+/// Cache type for the in-memory block-data cache.
+pub const CACHE_TYPE_BLOCK_DATA: &str = "block_data";
 
 // All known RPC methods (for resolving &str → &'static str)
 const ALL_METHODS: &[&str] = &[
@@ -206,10 +208,11 @@ impl CacheMetrics {
     }
 }
 
-/// Tracks which source provided block data. Sources: `cache`, `db`, and the two RPC witness
-/// routes — `witness_generator` (full endpoint chain, generator first) and
-/// `witness_historical` (skip-generator chain for blocks at least the local window below the
-/// tip). The RPC path as a whole is the sum of the two witness labels.
+/// Tracks which source provided block data. Sources: `cache` (HTTP response cache),
+/// `memory` (in-memory block-data cache), `db`, and the two RPC witness routes —
+/// `witness_generator` (full endpoint chain, generator first) and `witness_historical`
+/// (skip-generator chain for blocks at least the local window below the tip). The RPC path
+/// as a whole is the sum of the two witness labels.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
 pub struct DataSourceMetrics {
@@ -419,9 +422,11 @@ fn pre_register_all_metrics() {
     // Cache Layer
     let _ = CacheMetrics::new_for_cache(CACHE_TYPE_DEBUG_TRACE);
     let _ = CacheMetrics::new_for_cache(CACHE_TYPE_TRACE);
+    let _ = CacheMetrics::new_for_cache(CACHE_TYPE_BLOCK_DATA);
 
     // Data Fetch Layer: data source
     let _ = DataSourceMetrics::new_for_source("cache");
+    let _ = DataSourceMetrics::new_for_source("memory");
     let _ = DataSourceMetrics::new_for_source("db");
     let _ = DataSourceMetrics::new_for_source("witness_generator");
     let _ = DataSourceMetrics::new_for_source("witness_historical");

@@ -597,26 +597,31 @@ impl DebugTraceRpcServer for RpcContext {
     }
 
     async fn get_cache_status(&self) -> RpcResult<serde_json::Value> {
-        let Some(cache) = &self.response_cache else {
-            return Ok(serde_json::json!({
-                "responseCache": {
-                    "status": "disabled"
-                }
-            }));
+        let response_cache = match &self.response_cache {
+            Some(cache) => cache_stats_json(&cache.stats()),
+            None => serde_json::json!({"status": "disabled"}),
         };
-
-        let stats = cache.stats();
+        let block_data_cache = match self.data_provider.block_data_cache_stats() {
+            Some(stats) => cache_stats_json(&stats),
+            None => serde_json::json!({"status": "disabled"}),
+        };
         Ok(serde_json::json!({
-            "responseCache": {
-                "entryCount": stats.entry_count,
-                "totalBytes": stats.total_bytes,
-                "totalBytesMB": format!("{:.2}", stats.total_bytes as f64 / 1024.0 / 1024.0),
-                "hits": stats.hits,
-                "misses": stats.misses,
-                "hitRate": format!("{:.1}%", stats.hit_rate())
-            }
+            "responseCache": response_cache,
+            "blockDataCache": block_data_cache,
         }))
     }
+}
+
+/// Renders [`crate::response_cache::CacheStats`] as the `debug_getCacheStatus` JSON shape.
+fn cache_stats_json(stats: &crate::response_cache::CacheStats) -> serde_json::Value {
+    serde_json::json!({
+        "entryCount": stats.entry_count,
+        "totalBytes": stats.total_bytes,
+        "totalBytesMB": format!("{:.2}", stats.total_bytes as f64 / 1024.0 / 1024.0),
+        "hits": stats.hits,
+        "misses": stats.misses,
+        "hitRate": format!("{:.1}%", stats.hit_rate())
+    })
 }
 
 // TraceRpc Implementation
@@ -888,6 +893,59 @@ mod tests {
             Instant::now(),
         );
         assert!(by_hash.is_none());
+    }
+
+    /// Builds an `RpcContext` around a never-called upstream, with the block-data cache and
+    /// response cache toggled per test case.
+    fn cache_status_context(
+        block_data_cache: bool,
+        response_cache: Option<ResponseCache>,
+    ) -> RpcContext {
+        use stateless_common::{RpcClient, RpcClientConfig};
+        use stateless_core::ContractStore;
+        use stateless_db::ContractCache;
+
+        use crate::{
+            block_data_cache::BlockDataCache,
+            data_provider::{DEFAULT_WITNESS_TIMEOUT_SECS, NoopContractStore, WitnessFetchConfig},
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let rpc_client = Arc::new(
+            RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
+                .unwrap(),
+        );
+        let contract_cache =
+            Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
+        let provider = Arc::new(DataProvider::new(
+            rpc_client,
+            None,
+            block_data_cache.then(|| Arc::new(BlockDataCache::new(1024 * 1024))),
+            contract_cache,
+            WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
+            Duration::from_secs(1),
+        ));
+        RpcContext::new(provider, Arc::new(ChainSpec::default()), response_cache)
+    }
+
+    /// `debug_getCacheStatus` must always report both cache sections, each independently
+    /// enabled or `{"status": "disabled"}`.
+    #[tokio::test]
+    async fn get_cache_status_reports_block_data_cache_section() {
+        let ctx = cache_status_context(true, None);
+        let status = ctx.get_cache_status().await.unwrap();
+        assert_eq!(status["responseCache"]["status"], "disabled");
+        assert_eq!(status["blockDataCache"]["entryCount"], 0);
+        assert_eq!(status["blockDataCache"]["hits"], 0);
+
+        let ctx = cache_status_context(
+            false,
+            Some(ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100))),
+        );
+        let status = ctx.get_cache_status().await.unwrap();
+        assert_eq!(status["blockDataCache"]["status"], "disabled");
+        assert_eq!(status["responseCache"]["entryCount"], 0);
     }
 
     #[test]

@@ -61,6 +61,7 @@ use tokio::task;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
+mod block_data_cache;
 mod chain_sync;
 mod data_provider;
 mod metrics;
@@ -71,6 +72,7 @@ mod server_db;
 mod timing;
 mod tracing_executor;
 
+use block_data_cache::{BlockDataCache, DEFAULT_BLOCK_DATA_CACHE_MAX_BYTES};
 use data_provider::{DataProvider, NoopContractStore, WitnessFetchConfig};
 use response_cache::{DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS, ResponseCache, ResponseCacheConfig};
 use rpc_service::RpcContext;
@@ -177,6 +179,17 @@ struct Args {
         default_value_t = DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS
     )]
     response_cache_estimated_items: usize,
+
+    /// Maximum memory for the in-memory block-data cache (e.g., "1GB", "512MB"; default 1GB).
+    /// Set to "0" to disable. Blocks heavier than a cache shard's budget are never
+    /// admitted, so very large blocks bypass the cache instead of thrashing it.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_BLOCK_DATA_CACHE_MAX_SIZE",
+        default_value_t = DEFAULT_BLOCK_DATA_CACHE_MAX_BYTES,
+        value_parser = parse_size,
+    )]
+    block_data_cache_max_size: u64,
 
     /// Number of recent blocks to retain in database (older blocks are pruned).
     #[clap(
@@ -448,9 +461,18 @@ async fn main() -> Result<()> {
     };
     let contract_cache = Arc::new(ContractCache::new(contract_store));
 
+    let block_data_cache = if args.block_data_cache_max_size == 0 {
+        warn!("Block-data cache disabled (max size = 0); every request re-resolves block data");
+        None
+    } else {
+        debug!(max_bytes = args.block_data_cache_max_size, "Block-data cache initialized");
+        Some(Arc::new(BlockDataCache::new(args.block_data_cache_max_size)))
+    };
+
     let data_provider = Arc::new(DataProvider::new(
         rpc_client.clone(),
         block_store.clone(),
+        block_data_cache,
         contract_cache,
         witness_cfg,
         std::time::Duration::from_secs(args.block_fetch_timeout),
@@ -855,6 +877,28 @@ mod tests {
             env("DEBUG_TRACE_SERVER_WITNESS_OLD_BLOCK_TIMEOUT", "4").witness_old_block_timeout,
             Some(4)
         );
+    }
+
+    /// Pins the block-data cache knob: 1 GB default, size-suffix parsing, "0" disables, and
+    /// the env attribute string.
+    #[test]
+    fn block_data_cache_flag_default_env_and_disable() {
+        let guard = stateless_test_utils::env::env_lock();
+
+        assert_eq!(parse_args(&[]).block_data_cache_max_size, DEFAULT_BLOCK_DATA_CACHE_MAX_BYTES);
+        assert_eq!(parse_args(&["--block-data-cache-max-size", "0"]).block_data_cache_max_size, 0);
+        assert_eq!(
+            parse_args(&["--block-data-cache-max-size", "512MB"]).block_data_cache_max_size,
+            512 * 1024 * 1024
+        );
+
+        let from_env = stateless_test_utils::env::with_env_var(
+            &guard,
+            "DEBUG_TRACE_SERVER_BLOCK_DATA_CACHE_MAX_SIZE",
+            "2GB",
+            || parse_args(&[]),
+        );
+        assert_eq!(from_env.block_data_cache_max_size, 2 * 1024 * 1024 * 1024);
     }
 
     /// The witness chain puts the declared generator at index 0; without the flag no endpoint

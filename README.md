@@ -102,6 +102,11 @@ Two operating modes:
 The HTTP response cache stores block-level responses only for idempotent request shapes: the five built-in tracers (`callTracer`, `prestateTracer`, `4byteTracer`, `noopTracer`, `flatCallTracer`, each keyed by a hash of its `tracerConfig`) and the bare default struct-logger request (no tracer, no `tracerConfig`, default flags).
 JS tracers, `muxTracer`, and struct-logger requests with non-default flags bypass the cache and are recomputed on every request.
 
+**Block-data cache:**
+A bounded in-memory `BlockData` cache keyed by block hash sits between the response cache and the local DB / RPC tiers, so requests that miss the response cache — other tracer variants of a block, and especially `debug_traceTransaction` calls for different transactions of the same block, which are never response-cached — reuse one witness fetch and contract resolution.
+Block-number lookups still resolve number → hash against the DB or upstream first, so canonicality is never cached and reorgs need no invalidation here.
+Size it with `--block-data-cache-max-size` (default `1GB`; `0` disables); blocks heavier than a cache shard's budget are never admitted, so very large blocks bypass it instead of thrashing it.
+
 **Witness endpoints:**
 Declare the internal witness generator via `--witness-generator-endpoint`; `--witness-endpoint` lists the durable fallbacks (e.g. an R2-backed witness service), tried in order.
 In local cache mode with a generator plus at least one fallback, requests for blocks at least `--witness-local-window` blocks below the local tip skip the generator and fetch from the fallbacks, because the generator only retains a recent window (its `BACKUP`, deployed at 4096) and probing it for pruned blocks is a guaranteed miss.
@@ -236,6 +241,7 @@ The pipeline is configured via `PipelineConfig` and customized through trait imp
 | `bin/debug-trace-server/src/chain_sync.rs`                                                     | `TraceFetcher`, `TraceProcessor`, `TraceHooks`                                                              |
 | `bin/debug-trace-server/src/rpc_service.rs`                                                    | RPC method definitions and handlers                                                                         |
 | `bin/debug-trace-server/src/data_provider.rs`                                                  | Block data fetching with single-flight coalescing                                                           |
+| `bin/debug-trace-server/src/block_data_cache.rs`                                               | Bounded in-memory `BlockData` cache keyed by block hash                                                     |
 | `bin/debug-trace-server/src/server_db.rs`                                                      | Defines + implements the bin-local `BlockStore` trait, backed by `stateless-db`                             |
 
 ### Database

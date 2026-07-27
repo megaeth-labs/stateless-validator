@@ -47,6 +47,7 @@ use stateless_db::ContractCache;
 use tracing::{debug, instrument, trace, warn};
 
 use crate::{
+    block_data_cache::BlockDataCache,
     metrics::{ChainSyncMetrics, DataSourceMetrics, SingleFlightMetrics, WitnessSourceMetrics},
     server_db::BlockStore,
 };
@@ -252,8 +253,9 @@ impl Drop for InFlightGuard<'_> {
 /// Data provider with single-flight request coalescing.
 ///
 /// # Data Lookup Strategy
-/// 1. Check local database (if configured)
-/// 2. Fetch from remote RPC endpoints (multi-provider fallback handled by `RpcClient`)
+/// 1. Check the in-memory block-data cache (if enabled)
+/// 2. Check local database (if configured)
+/// 3. Fetch from remote RPC endpoints (multi-provider fallback handled by `RpcClient`)
 ///
 /// # Single-Flight Pattern
 /// When multiple requests arrive for the same block simultaneously, only one
@@ -263,6 +265,11 @@ pub(crate) struct DataProvider {
     rpc_client: Arc<RpcClient>,
     /// Optional local database for pre-fetched blocks (trait object).
     db: Option<Arc<dyn BlockStore>>,
+    /// Optional bounded in-memory cache of resolved block data, keyed by block hash.
+    /// Fronts both the DB tier (repeated redb reads + witness decodes) and the RPC tier;
+    /// its main beneficiaries are transaction-level requests, which are never
+    /// response-cached and cluster on shared blocks.
+    block_data_cache: Option<Arc<BlockDataCache>>,
     /// In-memory contract bytecode cache backed by either `ServerDB` (local-cache mode)
     /// or [`NoopContractStore`] (stateless mode).
     /// Every contract read and every RPC-fetched contract goes through here, so
@@ -292,6 +299,7 @@ impl DataProvider {
     /// # Arguments
     /// * `rpc_client` - RPC client for upstream data fetching
     /// * `db` - Optional local database for cached block data
+    /// * `block_data_cache` - Optional in-memory cache of resolved block data
     /// * `contract_cache` - Shared in-memory contract cache (backed by the DB when present, or an
     ///   in-memory-only noop store in stateless mode)
     /// * `witness_cfg` - Witness-source routing window (by block age) and per-stage budgets
@@ -300,6 +308,7 @@ impl DataProvider {
     pub fn new(
         rpc_client: Arc<RpcClient>,
         db: Option<Arc<dyn BlockStore>>,
+        block_data_cache: Option<Arc<BlockDataCache>>,
         contract_cache: Arc<ContractCache>,
         witness_cfg: WitnessFetchConfig,
         block_fetch_timeout: Duration,
@@ -307,11 +316,17 @@ impl DataProvider {
         Self {
             rpc_client,
             db,
+            block_data_cache,
             contract_cache,
             witness_cfg,
             block_fetch_timeout,
             in_flight: DashMap::new(),
         }
+    }
+
+    /// Returns block-data cache statistics, or `None` when the cache is disabled.
+    pub fn block_data_cache_stats(&self) -> Option<crate::response_cache::CacheStats> {
+        self.block_data_cache.as_ref().map(|cache| cache.stats())
     }
 
     /// Gets block data by block number.
@@ -353,7 +368,22 @@ impl DataProvider {
     ) -> DataProviderResult<Arc<BlockData>> {
         let start = Instant::now();
 
-        // Try the local DB first. `Ok(None)` = "not in DB, fall through"; `Err(..)` surfaces
+        // Memory tier: a hit skips the DB read + witness decode entirely.
+        if let Some(cache) = &self.block_data_cache &&
+            let Some(data) = cache.get(&block_hash)
+        {
+            trace!(
+                block_hash = %block_hash,
+                source = "memory",
+                "Block data retrieved from memory cache"
+            );
+            DataSourceMetrics::new_for_source("memory").record();
+            SingleFlightMetrics::new_for_type("bypassed").record();
+            self.record_block_distance(data.block.header.number);
+            return Ok(data);
+        }
+
+        // Try the local DB next. `Ok(None)` = "not in DB, fall through"; `Err(..)` surfaces
         // typed errors (e.g. a `Timeout` from contract resolution) so we don't then burn the
         // remaining deadline on an RPC call that is guaranteed to hit the same timeout.
         if let Some(db) = &self.db &&
@@ -369,7 +399,11 @@ impl DataProvider {
             DataSourceMetrics::new_for_source("db").record();
             SingleFlightMetrics::new_for_type("bypassed").record();
             self.record_block_distance(data.block.header.number);
-            return Ok(Arc::new(data));
+            let data = Arc::new(data);
+            if let Some(cache) = &self.block_data_cache {
+                cache.insert(block_hash, Arc::clone(&data));
+            }
+            return Ok(data);
         }
 
         // Fall back to RPC
@@ -555,8 +589,9 @@ impl DataProvider {
                 let db = self.db.clone();
                 let contract_cache = Arc::clone(&self.contract_cache);
                 let witness_cfg = self.witness_cfg;
+                let block_data_cache = self.block_data_cache.clone();
                 let fut: BlockDataFetchFuture = Box::pin(async move {
-                    do_fetch_block_data(
+                    let data = do_fetch_block_data(
                         rpc_client,
                         db,
                         contract_cache,
@@ -566,7 +601,14 @@ impl DataProvider {
                     )
                     .await
                     .map(Arc::new)
-                    .map_err(Arc::new)
+                    .map_err(Arc::new)?;
+                    // Inserting inside the shared future gives exactly one insert per fetch
+                    // and still runs when the primary caller is cancelled while a coalesced
+                    // waiter drives the future to completion.
+                    if let Some(cache) = &block_data_cache {
+                        cache.insert(block_hash, Arc::clone(&data));
+                    }
+                    Ok(data)
                 });
                 let shared = fut.shared();
                 vacant.insert(shared.clone());
@@ -1002,6 +1044,181 @@ mod tests {
         (rpc_client, cfg)
     }
 
+    /// Builds a fixture `(block, witness)` pair plus a contract cache pre-loaded with every
+    /// code hash the witness references, so DB-served fetches never fall through to RPC.
+    fn fixture_block_and_cache() -> (Block<Transaction>, LightWitness, Arc<ContractCache>) {
+        let fixtures = stateless_test_utils::fixtures::TestFixtures::synthetic();
+        let (_, hash) = fixtures.paired_blocks().into_iter().next().expect("paired fixture");
+        let block = fixtures.blocks[&hash].clone();
+        let witness = LightWitness::from(&fixtures.salt_witnesses[&hash]);
+        let contract_cache =
+            Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
+        let codes: Vec<(B256, Bytecode)> = crate::tracing_executor::extract_code_hashes(&witness)
+            .into_iter()
+            .map(|h| {
+                let code = fixtures
+                    .contracts
+                    .get(&h)
+                    .cloned()
+                    .unwrap_or_else(|| Bytecode::new_raw(vec![0u8].into()));
+                (h, code)
+            })
+            .collect();
+        contract_cache.insert(&codes).unwrap();
+        (block, witness, contract_cache)
+    }
+
+    /// [`BlockStore`] stub serving one fixture block, counting `get_block_and_witness` reads.
+    struct CountingBlockStore {
+        block: Block<Transaction>,
+        witness: LightWitness,
+        reads: AtomicUsize,
+    }
+
+    impl ContractStore for CountingBlockStore {
+        fn get_contracts(&self, _: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
+            Ok((HashMap::default(), vec![]))
+        }
+        fn add_contracts(&self, _: &[(B256, Bytecode)]) -> StoreResult<()> {
+            Ok(())
+        }
+    }
+
+    impl stateless_core::ChainStore for CountingBlockStore {
+        fn get_canonical_tip(&self) -> StoreResult<Option<stateless_core::db::BlockMeta>> {
+            Ok(None)
+        }
+        fn get_anchor(&self) -> StoreResult<Option<stateless_core::db::BlockMeta>> {
+            Ok(None)
+        }
+        fn advance_chain(&self, _: &[stateless_core::db::BlockMeta]) -> StoreResult<()> {
+            Ok(())
+        }
+        fn get_block_hash(&self, _: u64) -> StoreResult<Option<B256>> {
+            Ok(None)
+        }
+        fn rollback_chain(&self, _: u64) -> StoreResult<()> {
+            Ok(())
+        }
+        fn reset_to_anchor(&self, _: &stateless_core::db::BlockMeta) -> StoreResult<()> {
+            Ok(())
+        }
+    }
+
+    impl stateless_core::DivergenceLookups for CountingBlockStore {
+        fn get_hash(&self, _: u64) -> StoreResult<Option<B256>> {
+            Ok(None)
+        }
+        fn get_earliest(&self) -> StoreResult<Option<(u64, B256)>> {
+            Ok(None)
+        }
+    }
+
+    impl BlockStore for CountingBlockStore {
+        fn prune_chain(&self, _: u64) -> StoreResult<u64> {
+            Ok(0)
+        }
+        fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
+            Ok(())
+        }
+        fn get_block_and_witness(
+            &self,
+            _: alloy_primitives::BlockHash,
+        ) -> StoreResult<(Block<Transaction>, LightWitness)> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok((self.block.clone(), self.witness.clone()))
+        }
+    }
+
+    /// A DB-served block populates the memory cache, so the second request for the same hash
+    /// is served from memory without touching the DB and shares the same allocation.
+    #[tokio::test]
+    async fn db_hit_populates_memory_cache_and_second_read_skips_db() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let rpc_client = Arc::new(
+            RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
+                .unwrap(),
+        );
+        let (block, witness, contract_cache) = fixture_block_and_cache();
+        let hash = block.header.hash;
+        let store = Arc::new(CountingBlockStore { block, witness, reads: AtomicUsize::new(0) });
+        let cache = Arc::new(BlockDataCache::new(1024 * 1024 * 1024));
+        let provider = DataProvider::new(
+            rpc_client,
+            Some(Arc::clone(&store) as Arc<dyn BlockStore>),
+            Some(Arc::clone(&cache)),
+            contract_cache,
+            WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
+            Duration::from_secs(5),
+        );
+
+        let first = provider.get_block_data_by_hash(hash).await.expect("db-served fetch");
+        let second = provider.get_block_data_by_hash(hash).await.expect("memory-served fetch");
+
+        assert_eq!(store.reads.load(Ordering::Relaxed), 1, "second read must come from memory");
+        assert!(Arc::ptr_eq(&first, &second), "memory hits share the same allocation");
+        assert_eq!(cache.stats().hits, 1);
+    }
+
+    /// A pre-seeded memory entry is served before DB and RPC: with a hanging upstream and no
+    /// DB, the request must return instantly instead of burning the block-fetch deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn memory_hit_short_circuits_before_db_and_rpc() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let rpc_client = Arc::new(
+            RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
+                .unwrap(),
+        );
+        let (block, witness, contract_cache) = fixture_block_and_cache();
+        let hash = block.header.hash;
+        let cache = Arc::new(BlockDataCache::new(1024 * 1024 * 1024));
+        cache.insert(hash, Arc::new(BlockData { block, witness, contracts: HashMap::default() }));
+        let provider = DataProvider::new(
+            rpc_client,
+            None,
+            Some(cache),
+            contract_cache,
+            WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
+            Duration::from_secs(1),
+        );
+
+        let start = std::time::Instant::now();
+        let data = provider.get_block_data_by_hash(hash).await.expect("memory hit");
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "memory hit must not reach the hanging upstream"
+        );
+        assert_eq!(data.block.header.hash, hash);
+    }
+
+    /// With the memory cache disabled, every request re-reads the DB.
+    #[tokio::test]
+    async fn disabled_block_data_cache_reads_db_each_time() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let rpc_client = Arc::new(
+            RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
+                .unwrap(),
+        );
+        let (block, witness, contract_cache) = fixture_block_and_cache();
+        let hash = block.header.hash;
+        let store = Arc::new(CountingBlockStore { block, witness, reads: AtomicUsize::new(0) });
+        let provider = DataProvider::new(
+            rpc_client,
+            Some(Arc::clone(&store) as Arc<dyn BlockStore>),
+            None,
+            contract_cache,
+            WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
+            Duration::from_secs(5),
+        );
+
+        provider.get_block_data_by_hash(hash).await.expect("first db read");
+        provider.get_block_data_by_hash(hash).await.expect("second db read");
+        assert_eq!(store.reads.load(Ordering::Relaxed), 2);
+    }
+
     /// End-to-end routing dispatch through `fetch_witness`: a historical block must never
     /// touch the first (generator) endpoint, while a recent block probes it first.
     #[tokio::test]
@@ -1139,6 +1356,7 @@ mod tests {
         let provider = DataProvider::new(
             rpc_client,
             None,
+            None,
             contract_cache,
             WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
             Duration::from_secs(1),
@@ -1182,6 +1400,7 @@ mod tests {
             Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
         let provider = DataProvider::new(
             rpc_client,
+            None,
             None,
             contract_cache,
             WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
@@ -1229,6 +1448,7 @@ mod tests {
         // Generous deadline so the task is cancelled *by us*, not by the deadline firing.
         let provider = Arc::new(DataProvider::new(
             rpc_client,
+            None,
             None,
             contract_cache,
             WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),

@@ -76,6 +76,15 @@ impl WitnessSizeBreakdown {
     }
 }
 
+/// Approximate in-memory footprint of a [`LightWitness`] alone (KV entries + level map).
+///
+/// Unlike [`WitnessSizeBreakdown`], this needs no `MptWitness` and carries no fixed IPA
+/// term: a light witness holds no proof in memory. Suitable for byte-weighing caches that
+/// retain the witness without its MPT counterpart.
+pub fn light_witness_memory_bytes(light: &LightWitness) -> usize {
+    light.kvs.len() * SALT_KV_BYTES + light.levels.len() * SALT_LEVEL_BYTES
+}
+
 #[cfg(test)]
 mod tests {
     use stateless_test_utils::fixtures::TestFixtures;
@@ -106,5 +115,20 @@ mod tests {
             "the gap must be exactly the commitments term"
         );
         assert!(lower.total() <= full.total());
+    }
+
+    /// The witness-only footprint is the light breakdown's salt terms without the fixed IPA
+    /// overhead (which only exists in serialized proofs, not in a retained light witness).
+    #[test]
+    fn light_witness_memory_bytes_is_the_kv_and_level_terms() {
+        let fixtures = TestFixtures::mainnet_shared();
+        let (_, hash) = fixtures.paired_blocks().into_iter().next().expect("paired fixture");
+        let salt = &fixtures.salt_witnesses[&hash];
+        let mpt: MptWitness = fixtures.mpt_witness(&hash);
+        let light = LightWitness::from(salt);
+
+        let lower = WitnessSizeBreakdown::new_light(&light, &mpt);
+        assert_eq!(light_witness_memory_bytes(&light), lower.salt_size - SALT_IPA_PROOF_BYTES);
+        assert!(light_witness_memory_bytes(&light) > 0);
     }
 }
