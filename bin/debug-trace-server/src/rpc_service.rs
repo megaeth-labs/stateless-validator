@@ -300,17 +300,36 @@ async fn compute_parity_trace_block(
 }
 
 // Cache Helper Functions
-/// Checks cache by block number and returns cached value if found.
+/// Checks cache by block number, serving a hit only after confirming the hash it was cached
+/// under is still canonical — number-keyed entries are otherwise unguarded against reorgs in
+/// stateless mode, where no chain-sync invalidation runs. A verified mismatch invalidates the
+/// dead entries; an unverifiable check falls through to recomputation without invalidating.
 /// A `None` variant marks a non-cacheable request shape and bypasses the lookup.
-fn check_cache_by_number(
+async fn check_cache_by_number(
     cache: &Option<ResponseCache>,
+    data_provider: &DataProvider,
     resource: CachedResource,
     block_num: u64,
     variant: Option<&ResponseVariant>,
     method_name: &'static str,
     start: Instant,
 ) -> Option<serde_json::Value> {
-    let cached_value = cache.as_ref()?.get(resource, block_num, variant?.clone())?;
+    let (cached_value, cached_hash) =
+        cache.as_ref()?.get_with_hash(resource, block_num, variant?.clone())?;
+    match data_provider.is_canonical(block_num, cached_hash).await {
+        Some(true) => {}
+        Some(false) => {
+            trace!(
+                method = method_name,
+                block = block_num,
+                cached_hash = %cached_hash,
+                "Cached entry belongs to a reorged block; invalidating"
+            );
+            cache.as_ref()?.invalidate_blocks(&[cached_hash]);
+            return None;
+        }
+        None => return None,
+    }
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
     metrics::record_rpc_request(method_name, total_ms / 1000.0);
@@ -358,8 +377,9 @@ fn check_cache_by_hash(
     Some(cached_value)
 }
 
-/// Inserts a computed response into the cache; a no-op when the cache is disabled or the
-/// request shape is not cacheable (`variant` is `None`).
+/// Inserts a response whose number/hash pairing came from a canonical by-number resolution;
+/// a no-op when the cache is disabled or the request shape is not cacheable (`variant` is
+/// `None`).
 fn insert_cache(
     cache: &Option<ResponseCache>,
     resource: CachedResource,
@@ -370,6 +390,23 @@ fn insert_cache(
 ) {
     if let (Some(cache), Some(variant)) = (cache, variant) {
         cache.insert(resource, block_num, block_hash, variant.clone(), result.clone());
+    }
+}
+
+/// Inserts a response computed for an explicitly requested block hash; unlike
+/// [`insert_cache`], this never re-keys the number's canonical mapping — a request for an
+/// orphaned hash must not evict the canonical block's entries (the insert is skipped when
+/// the hash conflicts with the current mapping).
+fn insert_cache_by_hash(
+    cache: &Option<ResponseCache>,
+    resource: CachedResource,
+    block_num: u64,
+    block_hash: B256,
+    variant: Option<&ResponseVariant>,
+    result: &serde_json::Value,
+) {
+    if let (Some(cache), Some(variant)) = (cache, variant) {
+        cache.insert_by_hash(resource, block_num, block_hash, variant.clone(), result.clone());
     }
 }
 
@@ -418,12 +455,15 @@ impl DebugTraceRpcServer for RpcContext {
         // Stage 2: Check cache
         if let Some(cached) = check_cache_by_number(
             &self.response_cache,
+            &self.data_provider,
             CachedResource::DebugTraceBlock,
             block_num,
             variant.as_ref(),
             METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
             start,
-        ) {
+        )
+        .await
+        {
             return Ok(cached);
         }
 
@@ -529,7 +569,7 @@ impl DebugTraceRpcServer for RpcContext {
         })?;
 
         // Cache and record metrics
-        insert_cache(
+        insert_cache_by_hash(
             &self.response_cache,
             CachedResource::DebugTraceBlock,
             block_num,
@@ -643,12 +683,15 @@ impl TraceRpcServer for RpcContext {
         // Check cache
         if let Some(cached) = check_cache_by_number(
             &self.response_cache,
+            &self.data_provider,
             CachedResource::TraceBlock,
             block_num,
             Some(&ResponseVariant::Default),
             METHOD_TRACE_BLOCK,
             start,
-        ) {
+        )
+        .await
+        {
             return Ok(cached);
         }
 
@@ -836,16 +879,51 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_check_cache_by_number_disabled() {
+    /// Provider over a hanging upstream with an optional fixed DB canonical hash, for the
+    /// cache-helper tests below.
+    fn test_provider(db_hash: Option<Option<B256>>) -> Arc<DataProvider> {
+        use stateless_common::{RpcClient, RpcClientConfig};
+        use stateless_core::ContractStore;
+        use stateless_db::ContractCache;
+
+        use crate::data_provider::{
+            DEFAULT_WITNESS_TIMEOUT_SECS, NoopContractStore, WitnessFetchConfig,
+            test_support::StaticHashStore,
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        std::mem::forget(listener);
+        let rpc_client = Arc::new(
+            RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
+                .unwrap(),
+        );
+        let contract_cache =
+            Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
+        let db =
+            db_hash.map(|h| Arc::new(StaticHashStore(h)) as Arc<dyn crate::server_db::BlockStore>);
+        Arc::new(DataProvider::new(
+            rpc_client,
+            db,
+            None,
+            contract_cache,
+            WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
+            Duration::from_secs(1),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_check_cache_by_number_disabled() {
         let result = check_cache_by_number(
             &None,
+            &test_provider(None),
             CachedResource::DebugTraceBlock,
             100,
             Some(&ResponseVariant::Default),
             "test_method",
             Instant::now(),
-        );
+        )
+        .await;
         assert!(result.is_none());
     }
 
@@ -862,8 +940,8 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[test]
-    fn check_cache_bypasses_on_non_cacheable_variant() {
+    #[tokio::test]
+    async fn check_cache_bypasses_on_non_cacheable_variant() {
         let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
         cache.insert(
             CachedResource::DebugTraceBlock,
@@ -876,12 +954,14 @@ mod tests {
 
         let by_number = check_cache_by_number(
             &cache,
+            &test_provider(Some(Some(B256::from([1u8; 32])))),
             CachedResource::DebugTraceBlock,
             100,
             None,
             "test_method",
             Instant::now(),
-        );
+        )
+        .await;
         assert!(by_number.is_none());
 
         let by_hash = check_cache_by_hash(
@@ -946,6 +1026,55 @@ mod tests {
         let status = ctx.get_cache_status().await.unwrap();
         assert_eq!(status["blockDataCache"]["status"], "disabled");
         assert_eq!(status["responseCache"]["entryCount"], 0);
+    }
+
+    /// Number-keyed hits serve only while the cached hash is canonical: a verified mismatch
+    /// invalidates the dead entries and reports a miss; an unverifiable check (stateless
+    /// mode, upstream down) reports a miss without invalidating.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn number_hit_requires_canonical_hash() {
+        let h1 = B256::from([1u8; 32]);
+        let h2 = B256::from([2u8; 32]);
+        let check = |cache: &Option<ResponseCache>, provider: Arc<DataProvider>| {
+            let cache = cache.clone();
+            async move {
+                check_cache_by_number(
+                    &cache,
+                    &provider,
+                    CachedResource::DebugTraceBlock,
+                    100,
+                    Some(&ResponseVariant::Default),
+                    "test_method",
+                    Instant::now(),
+                )
+                .await
+            }
+        };
+        let fresh_cache = || {
+            let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
+            cache.insert(
+                CachedResource::DebugTraceBlock,
+                100,
+                h1,
+                ResponseVariant::Default,
+                serde_json::json!({"v": 1}),
+            );
+            Some(cache)
+        };
+
+        // Canonical: served.
+        let cache = fresh_cache();
+        assert!(check(&cache, test_provider(Some(Some(h1)))).await.is_some());
+
+        // Verified mismatch: miss + the dead entry is invalidated.
+        let cache = fresh_cache();
+        assert!(check(&cache, test_provider(Some(Some(h2)))).await.is_none());
+        assert_eq!(cache.as_ref().unwrap().len(), 0, "reorged entry must be invalidated");
+
+        // Unverifiable (stateless, upstream down): miss, but nothing invalidated.
+        let cache = fresh_cache();
+        assert!(check(&cache, test_provider(None)).await.is_none());
+        assert_eq!(cache.as_ref().unwrap().len(), 1, "unverifiable must not invalidate");
     }
 
     #[test]
