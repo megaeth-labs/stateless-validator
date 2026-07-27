@@ -136,6 +136,10 @@ pub const DEFAULT_BLOCK_FETCH_TIMEOUT_SECS: u64 = 13;
 /// Slow stage threshold: any individual stage exceeding this triggers a warn log.
 pub(crate) const SLOW_STAGE_THRESHOLD_MS: u128 = 1000;
 
+/// Deadline for the upstream canonical-hash check backing number-keyed cache hits in
+/// stateless mode (see [`DataProvider::is_canonical`]).
+const CANONICAL_CHECK_TIMEOUT_SECS: u64 = 2;
+
 /// Stage that ran out of time. Used only to label the typed `Timeout` error below.
 #[derive(Debug, Clone, Copy)]
 pub enum TimeoutStage {
@@ -311,6 +315,30 @@ impl DataProvider {
             witness_cfg,
             block_fetch_timeout,
             in_flight: DashMap::new(),
+        }
+    }
+
+    /// Whether `hash` is the canonical hash for `number`, used to validate number-keyed
+    /// response-cache hits.
+    ///
+    /// `Some(true)` = canonical: the local DB agrees, or the number is below the DB's
+    /// retention window, where chain-sync reorg handling would have invalidated any
+    /// re-keyed entry long before it was pruned. `Some(false)` = verified mismatch (the
+    /// cached entry belongs to a dead block). `None` = unverifiable (treat as a cache miss,
+    /// but do not invalidate). Stateless mode has no local chain at all, so the check goes
+    /// upstream with a short deadline — still far cheaper than replaying the block.
+    pub async fn is_canonical(&self, number: u64, hash: B256) -> Option<bool> {
+        if let Some(db) = &self.db {
+            return match db.get_block_hash(number) {
+                Ok(Some(canonical)) => Some(canonical == hash),
+                Ok(None) => Some(true),
+                Err(_) => None,
+            };
+        }
+        let deadline = Instant::now() + Duration::from_secs(CANONICAL_CHECK_TIMEOUT_SECS);
+        match self.rpc_client.get_block_hash_with_deadline(number, Some(deadline)).await {
+            Ok(canonical) => Some(canonical == hash),
+            Err(_) => None,
         }
     }
 
@@ -907,6 +935,73 @@ impl ContractStore for NoopContractStore {
     }
 }
 
+/// Test doubles shared with `rpc_service` unit tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// [`BlockStore`] stub whose canonical index answers `get_block_hash` with a fixed value;
+    /// everything else is empty.
+    pub(crate) struct StaticHashStore(pub Option<B256>);
+
+    impl ContractStore for StaticHashStore {
+        fn get_contracts(&self, _: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
+            Ok((HashMap::default(), vec![]))
+        }
+        fn add_contracts(&self, _: &[(B256, Bytecode)]) -> StoreResult<()> {
+            Ok(())
+        }
+    }
+
+    impl stateless_core::ChainStore for StaticHashStore {
+        fn get_canonical_tip(&self) -> StoreResult<Option<stateless_core::db::BlockMeta>> {
+            Ok(None)
+        }
+        fn get_anchor(&self) -> StoreResult<Option<stateless_core::db::BlockMeta>> {
+            Ok(None)
+        }
+        fn advance_chain(&self, _: &[stateless_core::db::BlockMeta]) -> StoreResult<()> {
+            Ok(())
+        }
+        fn get_block_hash(&self, _: u64) -> StoreResult<Option<B256>> {
+            Ok(self.0)
+        }
+        fn rollback_chain(&self, _: u64) -> StoreResult<()> {
+            Ok(())
+        }
+        fn reset_to_anchor(&self, _: &stateless_core::db::BlockMeta) -> StoreResult<()> {
+            Ok(())
+        }
+    }
+
+    impl stateless_core::DivergenceLookups for StaticHashStore {
+        fn get_hash(&self, _: u64) -> StoreResult<Option<B256>> {
+            Ok(self.0)
+        }
+        fn get_earliest(&self) -> StoreResult<Option<(u64, B256)>> {
+            Ok(None)
+        }
+    }
+
+    impl BlockStore for StaticHashStore {
+        fn prune_chain(&self, _: u64) -> StoreResult<u64> {
+            Ok(0)
+        }
+        fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
+            Ok(())
+        }
+        fn get_block_and_witness(
+            &self,
+            block_hash: alloy_primitives::BlockHash,
+        ) -> StoreResult<(Block<Transaction>, LightWitness)> {
+            Err(StoreError::MissingData {
+                kind: stateless_core::db::MissingDataKind::Block,
+                block_hash,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1000,6 +1095,49 @@ mod tests {
             ..WitnessFetchConfig::with_defaults(1)
         };
         (rpc_client, cfg)
+    }
+
+    /// Provider over a hanging upstream with an optional DB canonical index.
+    fn canonical_fixture(db_hash: Option<Option<B256>>) -> DataProvider {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        // Leak the listener so the port stays bound (and hanging) for the provider's lifetime.
+        std::mem::forget(listener);
+        let rpc_client = Arc::new(
+            RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
+                .unwrap(),
+        );
+        let contract_cache =
+            Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
+        let db = db_hash
+            .map(|h| Arc::new(super::test_support::StaticHashStore(h)) as Arc<dyn BlockStore>);
+        DataProvider::new(
+            rpc_client,
+            db,
+            contract_cache,
+            WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
+            Duration::from_secs(1),
+        )
+    }
+
+    /// DB mode: a matching canonical index verifies the hit, a differing one is a verified
+    /// mismatch, and a pruned (below-retention) number is trusted by depth.
+    #[tokio::test]
+    async fn is_canonical_uses_db_index_and_depth() {
+        let h1 = B256::from([1u8; 32]);
+        let h2 = B256::from([2u8; 32]);
+
+        assert_eq!(canonical_fixture(Some(Some(h1))).is_canonical(7, h1).await, Some(true));
+        assert_eq!(canonical_fixture(Some(Some(h2))).is_canonical(7, h1).await, Some(false));
+        assert_eq!(canonical_fixture(Some(None)).is_canonical(7, h1).await, Some(true));
+    }
+
+    /// Stateless mode with an unreachable upstream: the check is unverifiable — the caller
+    /// must treat the hit as a miss without invalidating anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn is_canonical_unverifiable_without_chain_source() {
+        let provider = canonical_fixture(None);
+        assert_eq!(provider.is_canonical(7, B256::from([1u8; 32])).await, None);
     }
 
     /// End-to-end routing dispatch through `fetch_witness`: a historical block must never

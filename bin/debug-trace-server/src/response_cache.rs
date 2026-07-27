@@ -249,21 +249,41 @@ impl SecondaryIndices {
         self.inner.read().unwrap().hash_to_number.get(hash).copied()
     }
 
+    fn get_hash_by_number(&self, block_number: u64) -> Option<B256> {
+        self.inner.read().unwrap().number_to_hash.get(&block_number).copied()
+    }
+
+    fn contains_key(&self, key: &ResponseCacheKey) -> bool {
+        self.inner
+            .read()
+            .unwrap()
+            .number_to_keys
+            .get(&key.block_number)
+            .is_some_and(|keys| keys.contains(key))
+    }
+
     /// Inserts the hash/number mapping and key.
     ///
-    /// If `block_number` was previously indexed under a different hash — a reorg observed
-    /// without invalidation, e.g. in stateless mode where no chain sync runs — every response
-    /// cached for that number belongs to a dead block: the stale hash mapping is dropped here
-    /// and the dead block's keys are returned for the caller to evict.
+    /// If `block_number` is currently indexed under a different hash, the behavior depends on
+    /// `allow_rekey`. Canonical inserts (by-number resolution, which observed the current
+    /// canonical hash) pass `true`: the conflict is a reorg observed without invalidation
+    /// (e.g. stateless mode, where no chain sync runs), every response cached for that number
+    /// belongs to a dead block, and the dead keys are returned for eviction. By-hash inserts
+    /// pass `false`: an explicitly requested orphan hash must not redefine the number's
+    /// canonical mapping, so the insert is rejected and nothing may be cached.
     fn insert(
         &self,
         block_hash: B256,
         block_number: u64,
         key: ResponseCacheKey,
-    ) -> Option<HashSet<ResponseCacheKey>> {
+        allow_rekey: bool,
+    ) -> IndexInsert {
         let mut inner = self.inner.write().unwrap();
         let stale = match inner.number_to_hash.get(&block_number) {
             Some(&old_hash) if old_hash != block_hash => {
+                if !allow_rekey {
+                    return IndexInsert::Rejected;
+                }
                 inner.hash_to_number.remove(&old_hash);
                 inner.number_to_keys.remove(&block_number)
             }
@@ -272,7 +292,7 @@ impl SecondaryIndices {
         inner.hash_to_number.insert(block_hash, block_number);
         inner.number_to_hash.insert(block_number, block_hash);
         inner.number_to_keys.entry(block_number).or_default().insert(key);
-        stale
+        IndexInsert::Inserted(stale)
     }
 
     fn remove_block(&self, block_number: u64) -> Option<HashSet<ResponseCacheKey>> {
@@ -304,6 +324,15 @@ impl SecondaryIndices {
             }
         }
     }
+}
+
+/// Outcome of [`SecondaryIndices::insert`].
+enum IndexInsert {
+    /// Mapping and key recorded; on a canonical re-key, carries the dead block's keys.
+    Inserted(Option<HashSet<ResponseCacheKey>>),
+    /// The number is mapped to a different hash and re-keying was not allowed; nothing was
+    /// recorded and the caller must not cache the response.
+    Rejected,
 }
 
 #[derive(Clone)]
@@ -415,6 +444,28 @@ impl ResponseCache {
         result.map(|r| r.as_value())
     }
 
+    /// Retrieves a cached response by block number together with the hash it was cached
+    /// under, so the caller can verify that hash is still canonical before serving the hit.
+    pub fn get_with_hash(
+        &self,
+        resource: CachedResource,
+        block_number: u64,
+        variant: ResponseVariant,
+    ) -> Option<(serde_json::Value, B256)> {
+        let block_hash = self.inner.indices.get_hash_by_number(block_number)?;
+        let key = ResponseCacheKey::new(resource, block_number, variant);
+        let result = self.inner.cache.get(&key);
+        let metrics = self.metrics_for_resource(resource);
+        if result.is_some() {
+            self.inner.hits.fetch_add(1, Ordering::Relaxed);
+            metrics.record_hit();
+        } else {
+            self.inner.misses.fetch_add(1, Ordering::Relaxed);
+            metrics.record_miss();
+        }
+        result.map(|r| (r.as_value(), block_hash))
+    }
+
     /// Retrieves a cached response by block hash.
     ///
     /// First looks up the block number from the hash->number index,
@@ -441,7 +492,8 @@ impl ResponseCache {
         result.map(|r| (r.as_value(), block_number))
     }
 
-    /// Inserts a response into the cache and updates secondary indices.
+    /// Inserts a response whose `(block_number, block_hash)` pairing came from a canonical
+    /// by-number resolution; a conflicting older mapping is re-keyed and its entries evicted.
     pub fn insert(
         &self,
         resource: CachedResource,
@@ -454,9 +506,41 @@ impl ResponseCache {
         let cached = CachedResponse::new(response);
 
         self.inner.cache.insert(key.clone(), cached);
-        let stale = self.inner.indices.insert(block_hash, block_number, key.clone());
-        self.evict_stale_keys(stale, &key);
+        match self.inner.indices.insert(block_hash, block_number, key.clone(), true) {
+            IndexInsert::Inserted(stale) => self.evict_stale_keys(stale, &key),
+            IndexInsert::Rejected => unreachable!("canonical inserts may always re-key"),
+        }
         self.update_size_metrics();
+    }
+
+    /// Inserts a response computed for an explicitly requested block hash.
+    ///
+    /// Unlike [`Self::insert`], this never re-keys the number's mapping: a request for an
+    /// orphaned hash must not evict the canonical block's entries, and since the cache key
+    /// carries no hash, caching the orphan's response under the shared `(number, variant)`
+    /// key would poison number-keyed lookups — so a conflicting insert is skipped entirely.
+    pub fn insert_by_hash(
+        &self,
+        resource: CachedResource,
+        block_number: u64,
+        block_hash: B256,
+        variant: ResponseVariant,
+        response: serde_json::Value,
+    ) {
+        let key = ResponseCacheKey::new(resource, block_number, variant);
+        match self.inner.indices.insert(block_hash, block_number, key.clone(), false) {
+            IndexInsert::Inserted(_) => {
+                self.inner.cache.insert(key, CachedResponse::new(response));
+                self.update_size_metrics();
+            }
+            IndexInsert::Rejected => {
+                debug!(
+                    block_number,
+                    block_hash = %block_hash,
+                    "Skipped caching by-hash response for a non-canonical hash"
+                );
+            }
+        }
     }
 
     /// Gets a cached response or computes it, coalescing concurrent requests for the same key.
@@ -497,8 +581,10 @@ impl ResponseCache {
                 let byte_len = cached.byte_len;
                 let _ = guard.insert(cached);
 
-                let stale = self.inner.indices.insert(block_hash, block_number, key.clone());
-                self.evict_stale_keys(stale, &key);
+                match self.inner.indices.insert(block_hash, block_number, key.clone(), true) {
+                    IndexInsert::Inserted(stale) => self.evict_stale_keys(stale, &key),
+                    IndexInsert::Rejected => unreachable!("canonical inserts may always re-key"),
+                }
                 self.update_size_metrics();
 
                 self.inner.misses.fetch_add(1, Ordering::Relaxed);
@@ -519,12 +605,14 @@ impl ResponseCache {
     /// Evicts cache entries whose index entries were purged by a re-keying
     /// [`SecondaryIndices::insert`], skipping `keep` — on a same-variant re-key the stale set
     /// contains a key equal to the one just written, whose slot already holds the fresh
-    /// response.
+    /// response. Keys re-registered in the index since the purge (a concurrent insert for the
+    /// new hash) are also skipped so their fresh values survive; the unguarded window between
+    /// that insert's cache write and index write remains, costing at worst one recomputation.
     fn evict_stale_keys(&self, stale: Option<HashSet<ResponseCacheKey>>, keep: &ResponseCacheKey) {
         let Some(stale) = stale else { return };
         let mut evicted = 0usize;
         for key in stale {
-            if &key != keep {
+            if &key != keep && !self.inner.indices.contains_key(&key) {
                 self.inner.cache.remove(&key);
                 evicted += 1;
             }
@@ -746,6 +834,89 @@ mod tests {
         .collect();
         let unique: HashSet<_> = variants.iter().cloned().collect();
         assert_eq!(unique.len(), variants.len());
+    }
+
+    /// A by-hash insert must not redefine the number's canonical mapping: caching an
+    /// explicitly requested orphan hash is skipped when it conflicts with the current
+    /// mapping, and the canonical entries survive untouched.
+    #[test]
+    fn insert_by_hash_refuses_conflicting_rekey() {
+        let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
+        let orphan = B256::from([1u8; 32]);
+        let canonical = B256::from([2u8; 32]);
+        cache.insert(
+            CachedResource::DebugTraceBlock,
+            100,
+            canonical,
+            ResponseVariant::Default,
+            json!({"v": 2}),
+        );
+
+        cache.insert_by_hash(
+            CachedResource::DebugTraceBlock,
+            100,
+            orphan,
+            ResponseVariant::Default,
+            json!({"v": 1}),
+        );
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            cache.get(CachedResource::DebugTraceBlock, 100, ResponseVariant::Default),
+            Some(json!({"v": 2})),
+            "canonical entry must survive an orphan by-hash insert"
+        );
+        assert!(
+            cache
+                .get_by_hash(CachedResource::DebugTraceBlock, orphan, ResponseVariant::Default)
+                .is_none()
+        );
+        assert!(
+            cache
+                .get_by_hash(CachedResource::DebugTraceBlock, canonical, ResponseVariant::Default)
+                .is_some()
+        );
+    }
+
+    /// A by-hash insert for an unmapped number caches normally, and a later canonical insert
+    /// for a different hash re-keys it away.
+    #[test]
+    fn insert_by_hash_populates_unmapped_number() {
+        let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
+        let h1 = B256::from([1u8; 32]);
+        let h2 = B256::from([2u8; 32]);
+
+        cache.insert_by_hash(
+            CachedResource::DebugTraceBlock,
+            100,
+            h1,
+            ResponseVariant::Default,
+            json!({"v": 1}),
+        );
+        assert_eq!(cache.len(), 1);
+        assert!(
+            cache
+                .get_by_hash(CachedResource::DebugTraceBlock, h1, ResponseVariant::Default)
+                .is_some()
+        );
+
+        cache.insert(
+            CachedResource::DebugTraceBlock,
+            100,
+            h2,
+            ResponseVariant::Default,
+            json!({"v": 2}),
+        );
+        assert_eq!(
+            cache.get(CachedResource::DebugTraceBlock, 100, ResponseVariant::Default),
+            Some(json!({"v": 2}))
+        );
+        assert!(
+            cache
+                .get_by_hash(CachedResource::DebugTraceBlock, h1, ResponseVariant::Default)
+                .is_none()
+        );
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
