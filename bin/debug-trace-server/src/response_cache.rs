@@ -27,7 +27,8 @@ use std::{
 
 use alloy_primitives::B256;
 use alloy_rpc_types_trace::geth::{
-    CallConfig, FlatCallConfig, GethDebugTracingOptions, GethDefaultTracingOptions, PreStateConfig,
+    CallConfig, FlatCallConfig, GethDebugTracerConfig, GethDebugTracingOptions,
+    GethDefaultTracingOptions, PreStateConfig,
 };
 use quick_cache::{Lifecycle, Weighter, sync::Cache};
 use tracing::debug;
@@ -202,30 +203,24 @@ impl RequestShape {
                 }
             }
             Some(GethDebugTracerType::BuiltInTracer(builtin)) => match builtin {
-                GethDebugBuiltInTracerType::CallTracer => {
-                    match opts.tracer_config.clone().into_call_config() {
-                        Ok(config) => Self::Cacheable(ResponseVariant::CallTracer(config.into())),
-                        Err(error) => Self::InvalidTracerConfig { label: "call_tracer", error },
-                    }
-                }
-                GethDebugBuiltInTracerType::PreStateTracer => {
-                    match opts.tracer_config.clone().into_pre_state_config() {
-                        Ok(config) => {
-                            Self::Cacheable(ResponseVariant::PrestateTracer(config.into()))
-                        }
-                        Err(error) => Self::InvalidTracerConfig { label: "prestate_tracer", error },
-                    }
-                }
-                GethDebugBuiltInTracerType::FlatCallTracer => {
-                    match opts.tracer_config.clone().into_flat_call_config() {
-                        Ok(config) => {
-                            Self::Cacheable(ResponseVariant::FlatCallTracer(config.into()))
-                        }
-                        Err(error) => {
-                            Self::InvalidTracerConfig { label: "flat_call_tracer", error }
-                        }
-                    }
-                }
+                GethDebugBuiltInTracerType::CallTracer => Self::config_variant(
+                    opts,
+                    GethDebugTracerConfig::into_call_config,
+                    "call_tracer",
+                    |config: CallConfig| ResponseVariant::CallTracer(config.into()),
+                ),
+                GethDebugBuiltInTracerType::PreStateTracer => Self::config_variant(
+                    opts,
+                    GethDebugTracerConfig::into_pre_state_config,
+                    "prestate_tracer",
+                    |config: PreStateConfig| ResponseVariant::PrestateTracer(config.into()),
+                ),
+                GethDebugBuiltInTracerType::FlatCallTracer => Self::config_variant(
+                    opts,
+                    GethDebugTracerConfig::into_flat_call_config,
+                    "flat_call_tracer",
+                    |config: FlatCallConfig| ResponseVariant::FlatCallTracer(config.into()),
+                ),
                 // These two never read tracerConfig (the executor ignores it, as does geth),
                 // so even a malformed config is inert and collapses onto the bare variant.
                 GethDebugBuiltInTracerType::FourByteTracer => {
@@ -240,6 +235,21 @@ impl RequestShape {
                 _ => Self::Bypass("unknown_tracer"),
             },
             Some(GethDebugTracerType::JsTracer(_)) => Self::Bypass("js_tracer"),
+        }
+    }
+
+    /// Classifies one config-reading builtin: `parse` is alloy's own typed-config
+    /// conversion (null → default, unknown fields ignored — the collapsing the cache key
+    /// relies on), so alloy stays authoritative for what counts as malformed.
+    fn config_variant<C>(
+        opts: &GethDebugTracingOptions,
+        parse: fn(GethDebugTracerConfig) -> Result<C, serde_json::Error>,
+        label: &'static str,
+        wrap: fn(C) -> ResponseVariant,
+    ) -> Self {
+        match parse(opts.tracer_config.clone()) {
+            Ok(config) => Self::Cacheable(wrap(config)),
+            Err(error) => Self::InvalidTracerConfig { label, error },
         }
     }
 
@@ -290,9 +300,9 @@ pub struct CachedResponse {
 }
 
 impl CachedResponse {
-    /// Creates a new cached response from a JSON value.
-    pub fn new(value: serde_json::Value) -> Self {
-        let json = serde_json::to_string(&value).unwrap_or_default();
+    /// Creates a new cached response by serializing the JSON value (no clone of the tree).
+    pub fn new(value: &serde_json::Value) -> Self {
+        let json = serde_json::to_string(value).unwrap_or_default();
         let byte_len = json.len();
         Self { json: json.into(), byte_len }
     }
@@ -303,7 +313,7 @@ impl CachedResponse {
     }
 
     /// Returns the byte length of the cached JSON.
-    #[allow(dead_code)] // Used in tests
+    #[cfg(test)]
     pub const fn byte_len(&self) -> usize {
         self.byte_len
     }
@@ -324,11 +334,11 @@ impl Weighter<ResponseCacheKey, CachedResponse> for ResponseCacheWeighter {
 // Secondary Index for Reorg Invalidation + Eviction Cleanup
 /// `block_hash -> keys` reverse index: lets chain sync invalidate every variant cached for
 /// a reverted hash, and lets the eviction lifecycle keep itself consistent.
-struct SecondaryIndices {
+struct HashIndex {
     inner: std::sync::RwLock<HashMap<B256, HashSet<ResponseCacheKey>>>,
 }
 
-impl SecondaryIndices {
+impl HashIndex {
     fn new() -> Self {
         Self { inner: std::sync::RwLock::new(HashMap::new()) }
     }
@@ -363,7 +373,7 @@ impl SecondaryIndices {
 
 #[derive(Clone)]
 struct EvictionCleanupLifecycle {
-    indices: Arc<SecondaryIndices>,
+    index: Arc<HashIndex>,
 }
 
 impl Lifecycle<ResponseCacheKey, CachedResponse> for EvictionCleanupLifecycle {
@@ -372,7 +382,7 @@ impl Lifecycle<ResponseCacheKey, CachedResponse> for EvictionCleanupLifecycle {
     fn begin_request(&self) -> Self::RequestState {}
 
     fn on_evict(&self, _state: &mut (), key: ResponseCacheKey, _val: CachedResponse) {
-        self.indices.remove_key(&key);
+        self.index.remove_key(&key);
     }
 }
 
@@ -391,7 +401,7 @@ struct ResponseCacheInner {
         RandomState,
         EvictionCleanupLifecycle,
     >,
-    indices: Arc<SecondaryIndices>,
+    index: Arc<HashIndex>,
     /// Statistics
     hits: AtomicU64,
     misses: AtomicU64,
@@ -415,8 +425,8 @@ impl std::fmt::Debug for ResponseCache {
 impl ResponseCache {
     /// Creates a new response cache with the given configuration.
     pub fn new(config: ResponseCacheConfig) -> Self {
-        let indices = Arc::new(SecondaryIndices::new());
-        let lifecycle = EvictionCleanupLifecycle { indices: indices.clone() };
+        let index = Arc::new(HashIndex::new());
+        let lifecycle = EvictionCleanupLifecycle { index: index.clone() };
 
         let cache = Cache::with(
             config.estimated_items,
@@ -429,7 +439,7 @@ impl ResponseCache {
         Self {
             inner: Arc::new(ResponseCacheInner {
                 cache,
-                indices,
+                index,
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
                 metrics_debug_trace: CacheMetrics::new_for_cache(CACHE_TYPE_DEBUG_TRACE),
@@ -466,7 +476,9 @@ impl ResponseCache {
         result.map(|r| r.as_value())
     }
 
-    /// Inserts a response computed for the exact block hash.
+    /// Inserts a response computed for the exact block hash. Takes the response by
+    /// reference: serialization reads it in place, so multi-MB trace responses are never
+    /// deep-cloned on the fill path.
     ///
     /// The index is registered *before* the cache write: if `quick_cache` immediately
     /// weight-evicts the just-inserted key, `on_evict -> remove_key` then self-heals the
@@ -476,10 +488,10 @@ impl ResponseCache {
         resource: CachedResource,
         block_hash: B256,
         variant: ResponseVariant,
-        response: serde_json::Value,
+        response: &serde_json::Value,
     ) {
         let key = ResponseCacheKey::new(resource, block_hash, variant);
-        self.inner.indices.insert(key);
+        self.inner.index.insert(key);
         self.inner.cache.insert(key, CachedResponse::new(response));
         self.update_size_metrics();
     }
@@ -491,7 +503,7 @@ impl ResponseCache {
         let mut invalidated_count = 0;
 
         for block_hash in block_hashes {
-            if let Some(keys) = self.inner.indices.remove_hash(block_hash) {
+            if let Some(keys) = self.inner.index.remove_hash(block_hash) {
                 for key in keys {
                     self.inner.cache.remove(&key);
                     invalidated_count += 1;
@@ -511,7 +523,7 @@ impl ResponseCache {
 
     /// Invalidates all cache entries (used during stale anchor reset).
     pub fn invalidate_all(&self) {
-        let keys = self.inner.indices.clear();
+        let keys = self.inner.index.clear();
         for key in &keys {
             self.inner.cache.remove(key);
         }
@@ -522,19 +534,19 @@ impl ResponseCache {
     }
 
     /// Returns the number of cached entries.
-    #[allow(dead_code)] // Used in tests
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.inner.cache.len()
     }
 
     /// Returns true if the cache is empty.
-    #[allow(dead_code)] // Used in tests
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.inner.cache.is_empty()
     }
 
     /// Returns the current memory weight of the cache.
-    #[allow(dead_code)] // Used in tests
+    #[cfg(test)]
     pub fn weight(&self) -> u64 {
         self.inner.cache.weight()
     }
@@ -542,27 +554,23 @@ impl ResponseCache {
     /// True when the hash index holds no entries.
     #[cfg(test)]
     fn index_is_empty(&self) -> bool {
-        self.inner.indices.is_empty()
+        self.inner.index.is_empty()
     }
 
-    /// Updates prometheus cache size gauges with current cache state.
-    /// (Both resource types share one cache, so both labels report the same totals.)
-    fn update_size_metrics(&self) {
+    /// Updates the prometheus cache size gauges and returns `(entry_count, total_bytes)`
+    /// as read. (Both resource types share one cache, so both labels report the same
+    /// totals.)
+    fn update_size_metrics(&self) -> (usize, u64) {
         let entry_count = self.inner.cache.len();
-        let total_bytes = self.inner.cache.weight() as usize;
-        self.inner.metrics_debug_trace.set_size(entry_count, total_bytes);
-        self.inner.metrics_trace.set_size(entry_count, total_bytes);
+        let total_bytes = self.inner.cache.weight();
+        self.inner.metrics_debug_trace.set_size(entry_count, total_bytes as usize);
+        self.inner.metrics_trace.set_size(entry_count, total_bytes as usize);
+        (entry_count, total_bytes)
     }
 
     /// Returns cache statistics and updates prometheus metrics.
     pub fn stats(&self) -> CacheStats {
-        let entry_count = self.inner.cache.len();
-        let total_bytes = self.inner.cache.weight();
-
-        // Update prometheus cache size metrics (both types share the same cache)
-        self.inner.metrics_debug_trace.set_size(entry_count, total_bytes as usize);
-        self.inner.metrics_trace.set_size(entry_count, total_bytes as usize);
-
+        let (entry_count, total_bytes) = self.update_size_metrics();
         CacheStats {
             entry_count: entry_count as u64,
             total_bytes,
@@ -863,12 +871,7 @@ mod tests {
         assert!(
             cache.get(CachedResource::DebugTraceBlock, hash, ResponseVariant::Default).is_none()
         );
-        cache.insert(
-            CachedResource::DebugTraceBlock,
-            hash,
-            ResponseVariant::Default,
-            value.clone(),
-        );
+        cache.insert(CachedResource::DebugTraceBlock, hash, ResponseVariant::Default, &value);
         assert_eq!(
             cache.get(CachedResource::DebugTraceBlock, hash, ResponseVariant::Default),
             Some(value)
@@ -889,10 +892,10 @@ mod tests {
             CachedResource::DebugTraceBlock,
             h1,
             ResponseVariant::Default,
-            json!({"v": 1}),
+            &json!({"v": 1}),
         );
-        cache.insert(CachedResource::TraceBlock, h1, ResponseVariant::Default, json!({"v": 2}));
-        cache.insert(CachedResource::DebugTraceBlock, h2, call, json!({"v": 3}));
+        cache.insert(CachedResource::TraceBlock, h1, ResponseVariant::Default, &json!({"v": 2}));
+        cache.insert(CachedResource::DebugTraceBlock, h2, call, &json!({"v": 3}));
         assert_eq!(cache.len(), 3);
 
         // Every variant cached for the reverted hash goes; other hashes survive.
@@ -914,12 +917,12 @@ mod tests {
         let call = ResponseVariant::CallTracer(CallConfigKey::default());
         let prestate = ResponseVariant::PrestateTracer(PreStateConfigKey::default());
 
-        cache.insert(CachedResource::DebugTraceBlock, hash, call, json!({"tracer": "call"}));
+        cache.insert(CachedResource::DebugTraceBlock, hash, call, &json!({"tracer": "call"}));
         cache.insert(
             CachedResource::DebugTraceBlock,
             hash,
             prestate,
-            json!({"tracer": "prestate"}),
+            &json!({"tracer": "prestate"}),
         );
 
         assert_eq!(cache.len(), 2);
@@ -939,7 +942,7 @@ mod tests {
     fn eviction_cleans_hash_index() {
         // Budget fits roughly one entry; inserting more forces evictions.
         let payload = json!({"data": "x".repeat(512)});
-        let one_weight = 128 + CachedResponse::new(payload.clone()).byte_len() as u64;
+        let one_weight = 128 + CachedResponse::new(&payload).byte_len() as u64;
         let cache = ResponseCache::new(ResponseCacheConfig::new(one_weight * 3 / 2, 4));
 
         let hashes: Vec<B256> = (1..=4u8).map(|i| B256::from([i; 32])).collect();
@@ -948,7 +951,7 @@ mod tests {
                 CachedResource::DebugTraceBlock,
                 *hash,
                 ResponseVariant::Default,
-                payload.clone(),
+                &payload,
             );
         }
 
@@ -972,7 +975,7 @@ mod tests {
             CachedResource::DebugTraceBlock,
             B256::from([1u8; 32]),
             ResponseVariant::Default,
-            json!({"v": 1}),
+            &json!({"v": 1}),
         );
         assert!(!cache.is_empty());
         assert_eq!(cache.len(), 1);
@@ -1000,7 +1003,7 @@ mod tests {
     #[test]
     fn test_cached_response() {
         let value = json!({"key": "value"});
-        let cached = CachedResponse::new(value.clone());
+        let cached = CachedResponse::new(&value);
         assert!(cached.byte_len() > 0);
         assert_eq!(cached.as_value(), value);
     }

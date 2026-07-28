@@ -42,7 +42,9 @@ use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use stateless_common::{CodeFetchError, RpcClient, RpcDeadlineExceeded, WitnessSizeBreakdown};
 use stateless_core::{
-    ContractStore, LightWitness, StoreResult, db::StoreError, withdrawals::MptWitness,
+    ContractStore, LightWitness, StoreResult,
+    db::{BlockMeta, StoreError},
+    withdrawals::MptWitness,
 };
 use stateless_db::ContractCache;
 use tracing::{debug, instrument, trace, warn};
@@ -335,6 +337,13 @@ impl DataProvider {
     /// Lookup order: the local canonical index first (local-cache mode), then upstream
     /// `eth_getHeaderByNumber` on the shared `deadline`. A DB read error is logged and falls
     /// through to upstream rather than failing the request.
+    ///
+    /// **Lazy write-back**: an upstream-resolved header (fetched with `verify_hash = true`,
+    /// so its hash provably matches its content) is written back into the local canonical
+    /// index — strictly below the history floor, where it cannot disturb the bisection
+    /// range or the tip cursor — so the next by-number request for this height resolves
+    /// locally. The index thereby grows organically with the traffic instead of needing a
+    /// bulk backfill.
     pub(crate) async fn resolve_canonical_hash(
         &self,
         block_num: u64,
@@ -357,16 +366,42 @@ impl DataProvider {
                 }
             }
         }
-        match self.rpc_client.get_block_hash_with_deadline(block_num, Some(deadline)).await {
-            Ok(hash) => {
+        let header = match self
+            .rpc_client
+            .get_header_with_deadline(
+                BlockId::Number(BlockNumberOrTag::Number(block_num)),
+                true,
+                Some(deadline),
+            )
+            .await
+        {
+            Ok(header) => {
                 record_canonical_hash_resolution("upstream", "ok");
-                Ok(hash)
+                header
             }
             Err(e) => {
                 record_canonical_hash_resolution("upstream", "error");
-                Err(e.into())
+                return Err(e.into());
+            }
+        };
+        if let Some(db) = &self.db {
+            let meta = BlockMeta {
+                block_number: header.number,
+                block_hash: header.hash,
+                post_state_root: header.state_root,
+                post_withdrawals_root: header.withdrawals_root.unwrap_or_default(),
+            };
+            // Best-effort: the request already has its answer; a failed write-back only
+            // costs the next request another upstream round trip.
+            if let Err(e) = db.record_canonical_hash(&meta) {
+                warn!(
+                    block_number = block_num,
+                    error = %e,
+                    "Failed to write back resolved canonical hash",
+                );
             }
         }
+        Ok(header.hash)
     }
 
     /// Gets block data by block hash with single-flight coalescing, minting its own
@@ -957,14 +992,11 @@ pub(crate) mod test_support {
 
     use super::*;
 
-    /// Minimal valid RPC `Header` with `hash`/`number` populated; all other fields default.
-    /// Copy-adapted from the module-private `stateless-common` rpc_client test helpers.
-    pub(crate) fn header_stub(number: u64, hash: B256) -> alloy_rpc_types_eth::Header {
-        alloy_rpc_types_eth::Header {
-            hash,
-            inner: alloy_consensus::Header { number, ..Default::default() },
-            ..Default::default()
-        }
+    /// Minimal self-consistent RPC `Header` for `number`: `hash` is the real `hash_slow()`
+    /// of the inner header, so `verify_hash = true` fetches accept it.
+    pub(crate) fn consistent_header(number: u64) -> alloy_rpc_types_eth::Header {
+        let inner = alloy_consensus::Header { number, ..Default::default() };
+        alloy_rpc_types_eth::Header { hash: inner.hash_slow(), inner, ..Default::default() }
     }
 
     /// Starts a jsonrpsee server bound to a random port and registers methods via `register`.
@@ -979,15 +1011,13 @@ pub(crate) mod test_support {
         (server.start(module), url)
     }
 
-    /// Serves `eth_getHeaderByNumber` with headers derived from `hashes`.
-    pub(crate) async fn start_mock_rpc(
-        hashes: std::collections::HashMap<u64, B256>,
-    ) -> (ServerHandle, String) {
-        serve(hashes, |m| {
-            m.register_method("eth_getHeaderByNumber", |params, ctx, _| {
+    /// Serves `eth_getHeaderByNumber` with a self-consistent header for any number.
+    pub(crate) async fn start_mock_rpc() -> (ServerHandle, String) {
+        serve((), |m| {
+            m.register_method("eth_getHeaderByNumber", |params, _, _| {
                 let (hex,): (String,) = params.parse().unwrap();
                 let n = u64::from_str_radix(hex.strip_prefix("0x").unwrap_or(&hex), 16).unwrap();
-                Ok::<_, ErrorObjectOwned>(header_stub(n, ctx.get(&n).copied().unwrap_or_default()))
+                Ok::<_, ErrorObjectOwned>(consistent_header(n))
             })
             .unwrap();
         })
@@ -1044,6 +1074,9 @@ pub(crate) mod test_support {
 
     impl BlockStore for StaticHashStore {
         fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
+            Ok(())
+        }
+        fn record_canonical_hash(&self, _: &stateless_core::db::BlockMeta) -> StoreResult<()> {
             Ok(())
         }
         fn get_block_and_witness(
@@ -1153,10 +1186,10 @@ mod tests {
         (rpc_client, cfg)
     }
 
-    /// Provider over `url` with an optional DB canonical index, given as
-    /// `(canonical hash answer, sync tip)`, plus a fast-fail retry config (150 ms attempts,
-    /// millisecond backoff) and a 1 s fetch budget so hang tests stay fast.
-    fn provider_at(url: &str, db: Option<(Option<B256>, Option<u64>)>) -> DataProvider {
+    /// Provider over `url` with an arbitrary optional [`BlockStore`], a fast-fail retry
+    /// config (150 ms attempts, millisecond backoff), and a 1 s fetch budget so hang tests
+    /// stay fast.
+    fn provider_with(url: &str, db: Option<Arc<dyn BlockStore>>) -> DataProvider {
         let config = RpcClientConfig {
             rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
             per_attempt_timeout: Duration::from_millis(150),
@@ -1166,15 +1199,23 @@ mod tests {
             Arc::new(RpcClient::new_with_config(&[url], &[url], config, None).unwrap());
         let contract_cache =
             Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
-        let db = db.map(|(hash, tip)| {
-            Arc::new(test_support::StaticHashStore(hash, tip)) as Arc<dyn BlockStore>
-        });
         DataProvider::new(
             rpc_client,
             db,
             contract_cache,
             WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
             Duration::from_secs(1),
+        )
+    }
+
+    /// [`provider_with`] over a [`StaticHashStore`] canonical index, given as
+    /// `(canonical hash answer, sync tip)`.
+    fn provider_at(url: &str, db: Option<(Option<B256>, Option<u64>)>) -> DataProvider {
+        provider_with(
+            url,
+            db.map(|(hash, tip)| {
+                Arc::new(test_support::StaticHashStore(hash, tip)) as Arc<dyn BlockStore>
+            }),
         )
     }
 
@@ -1192,31 +1233,75 @@ mod tests {
         assert_eq!(provider.resolve_canonical_hash(7, deadline).await.unwrap(), h1);
     }
 
-    /// Stateless mode (no DB): the hash resolves upstream via `eth_getHeaderByNumber`.
+    /// Stateless mode (no DB): the hash resolves upstream via `eth_getHeaderByNumber`,
+    /// hash-verified — the mock serves self-consistent headers.
     #[tokio::test]
     async fn resolve_canonical_hash_resolves_upstream() {
-        let h = B256::from([7u8; 32]);
-        let hashes = std::collections::HashMap::from([(42, h)]);
-        let (handle, url) = test_support::start_mock_rpc(hashes).await;
+        let (handle, url) = test_support::start_mock_rpc().await;
 
         let provider = provider_at(&url, None);
         let deadline = Instant::now() + Duration::from_secs(2);
-        assert_eq!(provider.resolve_canonical_hash(42, deadline).await.unwrap(), h);
+        assert_eq!(
+            provider.resolve_canonical_hash(42, deadline).await.unwrap(),
+            test_support::consistent_header(42).hash
+        );
         handle.stop().unwrap();
     }
 
     /// Local-cache mode with the number missing from the DB index (above the sync frontier,
-    /// or below a not-yet-backfilled floor): resolution falls back to the upstream fetch.
+    /// or historical below the floor): resolution falls back to the upstream fetch.
     #[tokio::test]
     async fn resolve_canonical_hash_db_miss_falls_back_upstream() {
-        let h = B256::from([9u8; 32]);
-        let hashes = std::collections::HashMap::from([(42, h)]);
-        let (handle, url) = test_support::start_mock_rpc(hashes).await;
+        let (handle, url) = test_support::start_mock_rpc().await;
 
         let provider = provider_at(&url, Some((None, Some(3))));
         let deadline = Instant::now() + Duration::from_secs(2);
-        assert_eq!(provider.resolve_canonical_hash(42, deadline).await.unwrap(), h);
+        assert_eq!(
+            provider.resolve_canonical_hash(42, deadline).await.unwrap(),
+            test_support::consistent_header(42).hash
+        );
         handle.stop().unwrap();
+    }
+
+    /// The lazy write-back: an upstream-resolved hash for a height below the floor lands
+    /// in the local index (floor untouched), so the next resolution needs no upstream at
+    /// all — pinned by stopping the mock server before the second resolve.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_canonical_hash_writes_back_below_floor() {
+        use stateless_core::{ChainStore, DivergenceLookups};
+
+        let (handle, url) = test_support::start_mock_rpc().await;
+        let dir = tempfile::tempdir().unwrap();
+        let server_db =
+            Arc::new(crate::server_db::ServerDB::new(dir.path().join("t.redb")).unwrap());
+        let tip = BlockMeta {
+            block_number: 100,
+            block_hash: B256::from([100u8; 32]),
+            post_state_root: B256::ZERO,
+            post_withdrawals_root: B256::ZERO,
+        };
+        // The anchor-init path: the preserving reset installs the history floor.
+        ChainStore::reset_to_anchor(&*server_db, &tip).unwrap();
+
+        let provider = provider_with(&url, Some(Arc::clone(&server_db) as Arc<dyn BlockStore>));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let resolved = provider.resolve_canonical_hash(42, deadline).await.unwrap();
+        assert_eq!(resolved, test_support::consistent_header(42).hash);
+        assert_eq!(
+            ChainStore::get_block_hash(&*server_db, 42).unwrap(),
+            Some(resolved),
+            "resolved hash must be written back into the index"
+        );
+        assert_eq!(
+            DivergenceLookups::get_earliest(&*server_db).unwrap().unwrap().0,
+            100,
+            "written-back rows are island history and must not move the floor"
+        );
+
+        // With the upstream gone, the height must now resolve locally.
+        handle.stop().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        assert_eq!(provider.resolve_canonical_hash(42, deadline).await.unwrap(), resolved);
     }
 
     /// A hanging upstream surfaces as a typed `Timeout` bounded by the caller's deadline —

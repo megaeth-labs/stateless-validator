@@ -64,7 +64,6 @@ use tokio::task;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-mod backfill;
 mod chain_sync;
 mod data_provider;
 mod metrics;
@@ -221,36 +220,6 @@ struct Args {
     #[clap(long, env = "DEBUG_TRACE_SERVER_SIZE_PRUNE_MIN_RETAIN", default_value_t = 256)]
     size_prune_min_retain: u64,
 
-    /// Build the permanent block-number -> hash index back to genesis as a resumable
-    /// background task (requires `--data-dir`). Progress persists in the history floor;
-    /// safe to leave enabled once complete.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_BACKFILL_CANONICAL_INDEX")]
-    backfill_canonical_index: bool,
-
-    /// Headers fetched and applied per backfill batch.
-    #[clap(
-        long,
-        env = "DEBUG_TRACE_SERVER_BACKFILL_BATCH_SIZE",
-        default_value_t = 1024,
-        value_parser = clap::value_parser!(u64).range(1..),
-    )]
-    backfill_batch_size: u64,
-
-    /// Concurrent in-flight header fetches within a backfill batch (additionally bounded
-    /// by `--data-max-concurrent-requests`).
-    #[clap(
-        long,
-        env = "DEBUG_TRACE_SERVER_BACKFILL_MAX_CONCURRENT_HEADERS",
-        default_value_t = 32,
-        value_parser = clap::value_parser!(u64).range(1..),
-    )]
-    backfill_max_concurrent_headers: u64,
-
-    /// Pause between backfill batches in milliseconds (0 = none), to keep the backfill
-    /// from crowding out request-serving fetches.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_BACKFILL_THROTTLE_MS", default_value_t = 0)]
-    backfill_throttle_ms: u64,
-
     /// Maximum concurrent in-flight data-endpoint requests (blocks, headers, code, tx).
     /// Omit for unlimited.
     #[clap(long, env = "DEBUG_TRACE_SERVER_DATA_MAX_CONCURRENT_REQUESTS")]
@@ -386,12 +355,6 @@ fn validate_args(args: &Args) -> Result<()> {
              --witness-endpoint: list the generator once, via the dedicated flag"
         );
     }
-    if args.backfill_canonical_index && args.data_dir.is_none() {
-        eyre::bail!(
-            "--backfill-canonical-index requires --data-dir (the canonical index lives in \
-             the local database)"
-        );
-    }
     Ok(())
 }
 
@@ -405,7 +368,6 @@ async fn main() -> Result<()> {
         listen_addr = %args.addr,
         "Debug-trace-server starting"
     );
-    let response_cache_disabled = args.response_cache_disabled;
     // The combined witness chain (generator first when configured) — the list actually fed to
     // the RPC client, not just the fallback flag values.
     let witness_apis = witness_endpoint_chain(&args);
@@ -425,7 +387,7 @@ async fn main() -> Result<()> {
         witness_old_block_timeout_secs = old_block_witness_timeout_secs(&args),
         witness_local_window = args.witness_local_window,
         tip_buffer = args.tip_buffer,
-        response_cache_disabled,
+        response_cache_disabled = args.response_cache_disabled,
         response_cache_max_size = args.response_cache_max_size,
         response_cache_estimated_items = args.response_cache_estimated_items,
         "Server configuration"
@@ -511,7 +473,7 @@ async fn main() -> Result<()> {
 
     let chain_spec = load_chain_spec(&args)?;
 
-    let response_cache = if response_cache_disabled {
+    let response_cache = if args.response_cache_disabled {
         warn!(
             "Response cache disabled (--response-cache-disabled); every trace response will \
              be recomputed"
@@ -585,27 +547,6 @@ async fn main() -> Result<()> {
                 }
             }
         });
-
-        // Spawn the canonical-index backfill (opt-in): extends number -> hash history
-        // toward genesis so by-number requests resolve locally.
-        if args.backfill_canonical_index {
-            let config = backfill::BackfillConfig {
-                batch_size: args.backfill_batch_size,
-                max_concurrent_headers: args.backfill_max_concurrent_headers as usize,
-                throttle: std::time::Duration::from_millis(args.backfill_throttle_ms),
-                ..backfill::BackfillConfig::default()
-            };
-            task::spawn({
-                let db = Arc::clone(db);
-                let rpc_client = Arc::clone(&rpc_client);
-                let shutdown = shutdown.clone();
-                async move {
-                    if let Err(e) = backfill::run_backfill(db, rpc_client, config, shutdown).await {
-                        error!(error = %e, "Canonical-index backfill exited with error");
-                    }
-                }
-            });
-        }
     }
 
     // Create RPC context and module
@@ -839,7 +780,7 @@ fn run_prune_cycle(
     }
 
     // DB gauges: `db_earliest_block` is the canonical-index floor (descends while the
-    // backfill runs); `db_body_earliest_block` is the body-retention edge.
+    // index grows); `db_body_earliest_block` is the body-retention edge.
     let earliest = db.get_earliest().ok().flatten().map(|(n, _)| n).unwrap_or(0);
     chain_sync_metrics.set_db_block_range(earliest, current_tip);
     if let Ok(Some(body_earliest)) = db.get_earliest_block_record() {
@@ -1102,48 +1043,14 @@ mod tests {
         assert!(disabled_via_env);
     }
 
-    /// Backfill + pruner-guard flags: defaults, zero-rejecting range parsers, env parity,
-    /// and the `--data-dir` requirement.
+    /// Pruner-guard flag: default, CLI override, and env parity.
     #[test]
-    fn backfill_flags_and_validation() {
+    fn size_prune_min_retain_flag() {
         let guard = stateless_test_utils::env::env_lock();
 
-        let defaults = parse_args(&[]);
-        assert!(!defaults.backfill_canonical_index);
-        assert_eq!(defaults.backfill_batch_size, 1024);
-        assert_eq!(defaults.backfill_max_concurrent_headers, 32);
-        assert_eq!(defaults.backfill_throttle_ms, 0);
-        assert_eq!(defaults.size_prune_min_retain, 256);
+        assert_eq!(parse_args(&[]).size_prune_min_retain, 256);
+        assert_eq!(parse_args(&["--size-prune-min-retain", "1024"]).size_prune_min_retain, 1024);
 
-        let base =
-            ["debug-trace-server", "--rpc-endpoint", "http://r", "--witness-endpoint", "http://w"];
-        assert!(Args::try_parse_from(base.iter().chain(&["--backfill-batch-size", "0"])).is_err());
-        assert!(
-            Args::try_parse_from(base.iter().chain(&["--backfill-max-concurrent-headers", "0"]))
-                .is_err()
-        );
-
-        // Backfill without a local database is a rejected misconfiguration.
-        assert!(validate_args(&parse_args(&["--backfill-canonical-index"])).is_err());
-        assert!(
-            validate_args(&parse_args(&["--backfill-canonical-index", "--data-dir", "/tmp/x",]))
-                .is_ok()
-        );
-
-        let enabled_via_env = stateless_test_utils::env::with_env_var(
-            &guard,
-            "DEBUG_TRACE_SERVER_BACKFILL_CANONICAL_INDEX",
-            "true",
-            || parse_args(&[]).backfill_canonical_index,
-        );
-        assert!(enabled_via_env);
-        let batch_via_env = stateless_test_utils::env::with_env_var(
-            &guard,
-            "DEBUG_TRACE_SERVER_BACKFILL_BATCH_SIZE",
-            "512",
-            || parse_args(&[]).backfill_batch_size,
-        );
-        assert_eq!(batch_via_env, 512);
         let retain_via_env = stateless_test_utils::env::with_env_var(
             &guard,
             "DEBUG_TRACE_SERVER_SIZE_PRUNE_MIN_RETAIN",
@@ -1163,18 +1070,11 @@ mod tests {
         let db_path = dir.path().join(TRACE_SERVER_DB_FILENAME);
         let db = ServerDB::new(&db_path).unwrap();
 
+        use crate::server_db::test_support::{empty_light_witness, make_test_block};
+
         let block_hash = |n: u64| BlockHash::from(alloy_primitives::U256::from(n).to_be_bytes());
         let blocks: Vec<_> = (1..=500u64)
-            .map(|n| {
-                let mut header = alloy_rpc_types_eth::Header::<alloy_consensus::Header>::default();
-                header.inner.number = n;
-                header.hash = block_hash(n);
-                let witness = stateless_core::LightWitness {
-                    kvs: std::collections::BTreeMap::new(),
-                    levels: Default::default(),
-                };
-                (alloy_rpc_types_eth::Block { header, ..Default::default() }, witness)
-            })
+            .map(|n| (make_test_block(n, block_hash(n)), empty_light_witness()))
             .collect();
         db.store_block_data(&blocks).unwrap();
         let metas: Vec<BlockMeta> = (1..=500u64)

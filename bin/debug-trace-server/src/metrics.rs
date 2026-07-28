@@ -350,35 +350,6 @@ impl WitnessSourceMetrics {
     }
 }
 
-/// Canonical-index backfill metrics (singleton).
-#[derive(Clone, Metrics)]
-#[metrics(scope = "debug_trace")]
-pub struct BackfillMetrics {
-    /// Total canonical-index rows written by the backfill task
-    backfilled_blocks_total: Counter,
-    /// Current backfill floor: the lowest block of the contiguous canonical index
-    /// (descends toward 0 while the backfill runs)
-    backfill_floor: Gauge,
-}
-
-impl BackfillMetrics {
-    /// Creates backfill metrics.
-    pub fn create() -> Self {
-        Self::new_with_labels(&[("scope", "backfill")])
-    }
-
-    /// Sets the current backfill floor.
-    pub fn set_floor(&self, floor: u64) {
-        self.backfill_floor.set(floor as f64);
-    }
-
-    /// Records one applied batch: rows written and the new floor.
-    pub fn record_batch(&self, rows: u64, floor: u64) {
-        self.backfilled_blocks_total.increment(rows);
-        self.backfill_floor.set(floor as f64);
-    }
-}
-
 /// EVM execution metrics with method label.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
@@ -415,8 +386,7 @@ pub struct ChainSyncMetrics {
     /// Earliest block number in validator DB
     db_earliest_block: Gauge,
     /// Earliest block number with a stored body + witness (bodies are pruned;
-    /// `db_earliest_block` tracks the permanent canonical index's floor instead, which
-    /// descends while the backfill runs)
+    /// `db_earliest_block` tracks the permanent canonical index's history floor instead)
     db_body_earliest_block: Gauge,
     /// Latest block number in validator DB
     db_latest_block: Gauge,
@@ -548,7 +518,6 @@ fn pre_register_all_metrics() {
 
     // Infrastructure
     let _ = ChainSyncMetrics::create();
-    let _ = BackfillMetrics::create();
 }
 
 /// Transaction count per traced block (~ 1–500).

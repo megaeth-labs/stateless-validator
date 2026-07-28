@@ -196,6 +196,84 @@ impl RpcContext {
 
         Ok(module)
     }
+
+    /// The shared by-number prelude, encoding the reorg-safety invariant once for both
+    /// by-number handlers: resolve tag -> number -> canonical hash (local index first)
+    /// *before* the cache lookup, all on one request deadline; on a miss, fetch block data
+    /// by the resolved hash on the remaining budget.
+    async fn lookup_block_by_number(
+        &self,
+        method: &'static str,
+        resource: CachedResource,
+        variant: Option<ResponseVariant>,
+        block_number: BlockNumberOrTag,
+        start: Instant,
+    ) -> Result<BlockLookup, jsonrpsee::types::ErrorObjectOwned> {
+        // One wall-clock budget for the whole request: tag resolution, canonical-hash
+        // resolution, and the block-data fetch all share it.
+        let deadline = self.data_provider.fetch_deadline();
+
+        let t0 = Instant::now();
+        let block_num =
+            self.data_provider.resolve_block_number(block_number, deadline).await.map_err(|e| {
+                metrics::record_rpc_error(method);
+                rpc_err(format!("Failed to resolve block number: {e}"))
+            })?;
+        let resolve_ms = t0.elapsed().as_millis();
+        tracing::Span::current().record("block_number", block_num);
+
+        // Resolve number -> canonical hash (local index first, upstream fallback) BEFORE
+        // the cache lookup — this is what makes number-keyed hits reorg-safe.
+        let t1 = Instant::now();
+        let block_hash =
+            self.data_provider.resolve_canonical_hash(block_num, deadline).await.map_err(|e| {
+                metrics::record_rpc_error(method);
+                data_provider_error_to_rpc_error(&e)
+            })?;
+        let resolve_hash_ms = t1.elapsed().as_millis();
+
+        if let Some(cached) =
+            check_cache(&self.response_cache, resource, block_hash, variant, method, start)
+        {
+            return Ok(BlockLookup::Cached(cached));
+        }
+
+        let t2 = Instant::now();
+        let data = self
+            .data_provider
+            .get_block_data_by_hash_with_deadline(block_hash, deadline)
+            .await
+            .map_err(|e| {
+                metrics::record_rpc_error(method);
+                data_provider_error_to_rpc_error(&e)
+            })?;
+        let fetch_ms = t2.elapsed().as_millis();
+
+        Ok(BlockLookup::Fetched {
+            block_num,
+            block_hash,
+            data,
+            resolve_ms,
+            resolve_hash_ms,
+            fetch_ms,
+        })
+    }
+}
+
+/// Outcome of [`RpcContext::lookup_block_by_number`].
+enum BlockLookup {
+    /// Served straight from the response cache.
+    Cached(serde_json::Value),
+    /// Cache miss: block data fetched and ready to trace, with per-stage timings for the
+    /// caller's slow-stage warning.
+    Fetched {
+        block_num: u64,
+        block_hash: B256,
+        data: Arc<BlockData>,
+        resolve_ms: u128,
+        resolve_hash_ms: u128,
+        fetch_ms: u128,
+    },
 }
 
 // Error Helpers
@@ -203,8 +281,6 @@ impl RpcContext {
 const ERROR_CODE_INTERNAL: i32 = -32000;
 /// Error code for "resource not found" (used for missing blocks / pending txs / deadline).
 const ERROR_CODE_NOT_FOUND: i32 = -32001;
-/// Error code for invalid request parameters (malformed `tracerConfig`).
-const ERROR_CODE_INVALID_PARAMS: i32 = -32602;
 
 /// Creates a JSON-RPC internal error (code -32000).
 /// Used for execution failures, serialization errors, etc.
@@ -214,7 +290,11 @@ fn rpc_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
 
 /// Creates a JSON-RPC invalid-params error (code -32602).
 fn invalid_params_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
-    jsonrpsee::types::ErrorObjectOwned::owned(ERROR_CODE_INVALID_PARAMS, msg, None::<()>)
+    jsonrpsee::types::ErrorObjectOwned::owned(
+        jsonrpsee::types::error::INVALID_PARAMS_CODE,
+        msg,
+        None::<()>,
+    )
 }
 
 /// Classifies `opts`, records the request-shape metric, and rejects a type-malformed
@@ -365,7 +445,7 @@ fn insert_cache(
     result: &serde_json::Value,
 ) {
     if let (Some(cache), Some(variant)) = (cache, variant) {
-        cache.insert(resource, block_hash, variant, result.clone());
+        cache.insert(resource, block_hash, variant, result);
     }
 }
 
@@ -401,55 +481,29 @@ impl DebugTraceRpcServer for RpcContext {
         let opts = opts.unwrap_or_default();
         let variant = classify_and_gate(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, &opts)?;
 
-        // One wall-clock budget for the whole request: tag resolution, canonical-hash
-        // resolution, and the block-data fetch all share it.
-        let deadline = self.data_provider.fetch_deadline();
-
-        // Stage 1: Resolve tag -> block number
-        let t0 = Instant::now();
-        let block_num =
-            self.data_provider.resolve_block_number(block_number, deadline).await.map_err(|e| {
-                metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
-                rpc_err(format!("Failed to resolve block number: {e}"))
-            })?;
-        let resolve_ms = t0.elapsed().as_millis();
-
-        // Stage 2: Resolve number -> canonical hash (local index first, upstream fallback),
-        // BEFORE the cache lookup — this is what makes number-keyed hits reorg-safe.
-        let t1 = Instant::now();
-        let block_hash =
-            self.data_provider.resolve_canonical_hash(block_num, deadline).await.map_err(|e| {
-                metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
-                data_provider_error_to_rpc_error(&e)
-            })?;
-        let resolve_hash_ms = t1.elapsed().as_millis();
-
-        // Stage 3: Check cache under the canonical hash
-        if let Some(cached) = check_cache(
-            &self.response_cache,
-            CachedResource::DebugTraceBlock,
-            block_hash,
-            variant,
-            METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
-            start,
-        ) {
-            return Ok(cached);
-        }
-
-        // Stage 4: Fetch block data (DB -> RPC fallback) on the remaining budget
-        let t2 = Instant::now();
-        let data = self
-            .data_provider
-            .get_block_data_by_hash_with_deadline(block_hash, deadline)
-            .await
-            .map_err(|e| {
-                metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
-                data_provider_error_to_rpc_error(&e)
-            })?;
-        let fetch_ms = t2.elapsed().as_millis();
+        let (block_num, block_hash, data, resolve_ms, resolve_hash_ms, fetch_ms) = match self
+            .lookup_block_by_number(
+                METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+                CachedResource::DebugTraceBlock,
+                variant,
+                block_number,
+                start,
+            )
+            .await?
+        {
+            BlockLookup::Cached(cached) => return Ok(cached),
+            BlockLookup::Fetched {
+                block_num,
+                block_hash,
+                data,
+                resolve_ms,
+                resolve_hash_ms,
+                fetch_ms,
+            } => (block_num, block_hash, data, resolve_ms, resolve_hash_ms, fetch_ms),
+        };
         let tx_count = data.block.transactions.len();
 
-        // Stage 5: Execute trace
+        // Execute trace
         let t3 = Instant::now();
         let result = compute_debug_trace_block(
             &self.chain_spec,
@@ -463,7 +517,7 @@ impl DebugTraceRpcServer for RpcContext {
         })?;
         let trace_ms = t3.elapsed().as_millis();
 
-        // Stage 6: Cache result under the hash it was computed for
+        // Cache result under the hash it was computed for
         let t4 = Instant::now();
         insert_cache(
             &self.response_cache,
@@ -642,45 +696,22 @@ impl TraceRpcServer for RpcContext {
         let _guard = self.watch_dog.start_request(METHOD_TRACE_BLOCK, format!("{block_number}"));
         let start = Instant::now();
 
-        // One shared budget for tag resolution, hash resolution, and the fetch.
-        let deadline = self.data_provider.fetch_deadline();
-
-        let block_num =
-            self.data_provider.resolve_block_number(block_number, deadline).await.map_err(|e| {
-                metrics::record_rpc_error(METHOD_TRACE_BLOCK);
-                rpc_err(format!("Failed to resolve block number: {e}"))
-            })?;
-
-        tracing::Span::current().record("block_number", block_num);
-
-        // Resolve the canonical hash, then check the cache under it. `trace_block` takes no
-        // tracer options, so its variant is always `Default`.
-        let block_hash =
-            self.data_provider.resolve_canonical_hash(block_num, deadline).await.map_err(|e| {
-                metrics::record_rpc_error(METHOD_TRACE_BLOCK);
-                data_provider_error_to_rpc_error(&e)
-            })?;
-
-        if let Some(cached) = check_cache(
-            &self.response_cache,
-            CachedResource::TraceBlock,
-            block_hash,
-            Some(ResponseVariant::Default),
-            METHOD_TRACE_BLOCK,
-            start,
-        ) {
-            return Ok(cached);
-        }
-
-        // Fetch block data (DB -> RPC fallback)
-        let data = self
-            .data_provider
-            .get_block_data_by_hash_with_deadline(block_hash, deadline)
-            .await
-            .map_err(|e| {
-                metrics::record_rpc_error(METHOD_TRACE_BLOCK);
-                data_provider_error_to_rpc_error(&e)
-            })?;
+        // `trace_block` takes no tracer options, so its variant is always `Default`.
+        let (block_num, block_hash, data) = match self
+            .lookup_block_by_number(
+                METHOD_TRACE_BLOCK,
+                CachedResource::TraceBlock,
+                Some(ResponseVariant::Default),
+                block_number,
+                start,
+            )
+            .await?
+        {
+            BlockLookup::Cached(cached) => return Ok(cached),
+            BlockLookup::Fetched { block_num, block_hash, data, .. } => {
+                (block_num, block_hash, data)
+            }
+        };
 
         let result = compute_parity_trace_block(&self.chain_spec, &data, METHOD_TRACE_BLOCK)
             .await
@@ -885,7 +916,7 @@ mod tests {
             CachedResource::DebugTraceBlock,
             hash,
             ResponseVariant::Default,
-            serde_json::json!({"cached": true}),
+            &serde_json::json!({"cached": true}),
         );
         let cache = Some(cache);
 
@@ -914,7 +945,7 @@ mod tests {
             CachedResource::DebugTraceBlock,
             h1,
             ResponseVariant::Default,
-            serde_json::json!({"v": 1}),
+            &serde_json::json!({"v": 1}),
         );
         let cache = Some(cache);
 
@@ -972,7 +1003,7 @@ mod tests {
         }))
         .unwrap();
         let err = classify_and_gate("test_method", &opts).unwrap_err();
-        assert_eq!(err.code(), ERROR_CODE_INVALID_PARAMS);
+        assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
         assert!(
             err.message().contains("invalid tracerConfig for call_tracer"),
             "message: {}",

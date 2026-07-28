@@ -185,15 +185,7 @@ mod tests {
     use stateless_core::StoreResult;
 
     use super::*;
-
-    fn make_block_meta(block_number: u64) -> BlockMeta {
-        BlockMeta {
-            block_number,
-            block_hash: Default::default(),
-            post_state_root: Default::default(),
-            post_withdrawals_root: Default::default(),
-        }
-    }
+    use crate::server_db::test_support::make_block_meta;
 
     #[test]
     fn test_trace_hooks_reorg_without_cache() {
@@ -224,7 +216,7 @@ mod tests {
             (CachedResource::DebugTraceBlock, h2),
         ];
         for (resource, hash) in entries {
-            cache.insert(resource, hash, ResponseVariant::Default, serde_json::json!({"v": 1}));
+            cache.insert(resource, hash, ResponseVariant::Default, &serde_json::json!({"v": 1}));
         }
 
         let hooks = TraceHooks::new(Arc::new(MockBlockStore), Some(cache.clone()));
@@ -278,6 +270,9 @@ mod tests {
     }
     impl BlockStore for MockBlockStore {
         fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
+            Ok(())
+        }
+        fn record_canonical_hash(&self, _: &BlockMeta) -> StoreResult<()> {
             Ok(())
         }
         fn get_block_and_witness(

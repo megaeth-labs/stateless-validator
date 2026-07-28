@@ -1,10 +1,10 @@
 //! Canonical-chain scale benchmark: disk footprint and read/write performance of the
 //! permanent CANONICAL_CHAIN index at production row counts.
 //!
-//! The debug-trace-server keeps the number -> hash index forever and backfills it to
-//! genesis, so this measures the exact write shape the backfill uses (one transaction per
-//! descending batch: N chain-row inserts + the history-floor row, at a chosen durability)
-//! and the point-read pattern canonical-hash resolution uses.
+//! The debug-trace-server keeps the number -> hash index forever and grows it lazily
+//! (single-row write-back on upstream resolution), so this measures the point-read
+//! pattern canonical-hash resolution uses and the real write-back helper, on datasets
+//! bulk-loaded at production row counts.
 //!
 //! Run with `cargo bench -p stateless-db --bench canonical_chain_scale`.
 //!
@@ -23,16 +23,14 @@ use redb::{Durability, ReadableDatabase};
 use stateless_core::db::BlockMeta;
 use stateless_db::{
     ANCHOR_BLOCK, CANONICAL_CHAIN, Database, HISTORY_FLOOR_KEY, block_meta_to_tuple,
+    write_canonical_hash_below_floor,
 };
-
-/// Rows written per configuration in the write-throughput matrix.
-const WRITE_MATRIX_ROWS: u64 = 200_000;
 
 /// Point reads sampled per latency phase.
 const READ_SAMPLES: usize = 20_000;
 
-/// Immediate-durability barrier cadence for the `None`-durability configurations,
-/// mirroring the backfill task.
+/// Immediate-durability barrier cadence for the `None`-durability bulk-load
+/// configurations.
 const BARRIER_EVERY: u64 = 16;
 
 fn main() {
@@ -45,33 +43,35 @@ fn main() {
         .unwrap_or_else(|_| vec![100_000, 1_000_000, 10_000_000]);
     let mixed = std::env::var_os("CANONICAL_BENCH_MIXED").is_some();
 
-    write_throughput_matrix();
+    writeback_report();
 
     for &rows in &sizes {
         scale_report(rows, mixed);
     }
 }
 
-/// Write throughput for batch size x durability, on a fresh DB each, at a fixed row count
-/// (so `Immediate` configurations stay affordable).
-fn write_throughput_matrix() {
-    println!("write throughput ({WRITE_MATRIX_ROWS} rows per configuration, fresh DB each)");
-    println!("  batch  | durability            |     rows/s | wall time");
-    for &batch in &[1_024u64, 10_240] {
-        for &immediate in &[true, false] {
-            let dir = tempfile::tempdir().unwrap();
-            let db = open_db(&dir.path().join("bench.redb"));
-            let start = Instant::now();
-            build_descending(&db, WRITE_MATRIX_ROWS, batch, immediate);
-            let elapsed = start.elapsed();
-            let label = if immediate { "Immediate" } else { "None+barrier/16" };
-            println!(
-                "  {batch:>6} | {label:<21} | {:>10.0} | {:.2?}",
-                WRITE_MATRIX_ROWS as f64 / elapsed.as_secs_f64(),
-                elapsed,
-            );
-        }
+/// Measures the production write path — [`write_canonical_hash_below_floor`], one row
+/// per transaction — against a populated index with the floor set above the written range.
+fn writeback_report() {
+    const DATASET_ROWS: u64 = 200_000;
+    const WRITEBACK_ROWS: u64 = 500;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_db(&dir.path().join("bench.redb"));
+    build_descending(&db, DATASET_ROWS);
+    set_floor(&db, DATASET_ROWS + WRITEBACK_ROWS + 1);
+
+    let start = Instant::now();
+    for n in 1..=WRITEBACK_ROWS {
+        write_canonical_hash_below_floor(&db, &meta(DATASET_ROWS + n)).unwrap();
     }
+    let elapsed = start.elapsed();
+    println!(
+        "single-row write-back over {DATASET_ROWS} rows: {:.0} rows/s ({:.2?} per write, \
+         {WRITEBACK_ROWS} writes)",
+        WRITEBACK_ROWS as f64 / elapsed.as_secs_f64(),
+        elapsed / WRITEBACK_ROWS as u32,
+    );
     println!();
 }
 
@@ -82,19 +82,15 @@ fn scale_report(rows: u64, mixed: bool) {
     let path = dir.path().join("bench.redb");
     let db = open_db(&path);
 
-    // Build with the backfill's daily-driver configuration: 10240-row batches at
-    // Durability::None with an Immediate barrier every 16 batches.
+    // Bulk-load the dataset.
     let start = Instant::now();
-    build_descending(&db, rows, 10_240, false);
+    build_descending(&db, rows);
     let build = start.elapsed();
 
     let file_bytes = std::fs::metadata(&path).unwrap().len();
     let bytes_per_row = file_bytes as f64 / rows as f64;
     println!("scale report: {rows} rows");
-    println!(
-        "  build: {build:.2?} ({:.0} rows/s, batch 10240, None + barrier/16)",
-        rows as f64 / build.as_secs_f64()
-    );
+    println!("  build: {build:.2?} ({:.0} rows/s bulk load)", rows as f64 / build.as_secs_f64());
     println!(
         "  disk: {file_bytes} B ({:.1} MiB), {bytes_per_row:.1} B/row",
         file_bytes as f64 / (1024.0 * 1024.0)
@@ -161,8 +157,7 @@ fn meta(n: u64) -> BlockMeta {
     }
 }
 
-/// One backfill-shaped transaction: insert rows `lo..=hi` plus the floor row, committed at
-/// `durability`.
+/// One bulk-load transaction: insert rows `lo..=hi` at `durability`.
 fn write_batch(db: &Database, lo: u64, hi: u64, durability: Durability) {
     let mut txn = db.begin_write().unwrap();
     txn.set_durability(durability).unwrap();
@@ -174,22 +169,30 @@ fn write_batch(db: &Database, lo: u64, hi: u64, durability: Durability) {
                 .insert(n, (m.block_hash.0, m.post_state_root.0, m.post_withdrawals_root.0))
                 .unwrap();
         }
-        let mut anchor = txn.open_table(ANCHOR_BLOCK).unwrap();
-        anchor.insert(HISTORY_FLOOR_KEY, block_meta_to_tuple(&meta(lo))).unwrap();
     }
     txn.commit().unwrap();
 }
 
-/// Writes rows `1..=rows` in descending backfill order. `always_immediate` commits every
-/// batch at `Immediate`; otherwise batches ride `None` with an `Immediate` barrier every
-/// [`BARRIER_EVERY`] batches and at the end.
-fn build_descending(db: &Database, rows: u64, batch: u64, always_immediate: bool) {
+/// Sets the history-floor row to block `n`.
+fn set_floor(db: &Database, n: u64) {
+    let txn = db.begin_write().unwrap();
+    txn.open_table(ANCHOR_BLOCK)
+        .unwrap()
+        .insert(HISTORY_FLOOR_KEY, block_meta_to_tuple(&meta(n)))
+        .unwrap();
+    txn.commit().unwrap();
+}
+
+/// Bulk-loads rows `1..=rows` in descending order: 10240-row batches at `None` durability
+/// with an `Immediate` barrier every [`BARRIER_EVERY`] batches and at the end.
+fn build_descending(db: &Database, rows: u64) {
+    const BATCH: u64 = 10_240;
     let mut hi = rows;
     let mut batches = 0u64;
     while hi >= 1 {
-        let lo = hi.saturating_sub(batch - 1).max(1);
+        let lo = hi.saturating_sub(BATCH - 1).max(1);
         batches += 1;
-        let durability = if always_immediate || batches.is_multiple_of(BARRIER_EVERY) {
+        let durability = if batches.is_multiple_of(BARRIER_EVERY) {
             Durability::Immediate
         } else {
             Durability::None
@@ -200,7 +203,7 @@ fn build_descending(db: &Database, rows: u64, batch: u64, always_immediate: bool
         }
         hi = lo - 1;
     }
-    // Final barrier, as the backfill does at exit.
+    // Final barrier so the bulk load is fully durable.
     let mut txn = db.begin_write().unwrap();
     txn.set_durability(Durability::Immediate).unwrap();
     txn.commit().unwrap();
