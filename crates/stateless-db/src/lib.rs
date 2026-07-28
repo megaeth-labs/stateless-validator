@@ -14,8 +14,9 @@ pub mod tables;
 
 pub use cache::ContractCache;
 pub use helpers::{
-    read_anchor, read_block_hash, read_canonical_tip, read_contracts, read_earliest_block,
-    write_add_contracts, write_advance_chain, write_reset_to_anchor, write_rollback_chain,
+    HISTORY_FLOOR_KEY, read_anchor, read_block_hash, read_canonical_tip, read_contracts,
+    read_earliest_block, read_history_floor, write_add_contracts, write_advance_chain,
+    write_reset_to_anchor, write_reset_to_anchor_preserving_history, write_rollback_chain,
 };
 pub use serialize::{
     decode_block_from_slice, decode_from_slice, encode_block_to_vec, encode_to_vec,

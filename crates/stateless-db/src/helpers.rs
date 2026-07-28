@@ -123,6 +123,63 @@ pub fn write_rollback_chain(database: &Database, to_block: BlockNumber) -> Store
     Ok(())
 }
 
+/// ANCHOR_BLOCK key of the persisted **history floor**: the lowest block of the contiguous
+/// CANONICAL_CHAIN suffix ending at the tip. Rows may exist below it (immutable historical
+/// "islands" left by a stale reset), but only the range at or above the floor is guaranteed
+/// hole-free — which is what divergence bisection requires of `get_earliest`.
+pub const HISTORY_FLOOR_KEY: &str = "history_floor";
+
+/// Reads the history floor. Falls back to the earliest CANONICAL_CHAIN row when no floor
+/// row has been persisted (databases created before floor tracking), preserving the old
+/// `get_earliest` semantics for them.
+pub fn read_history_floor(database: &Database) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
+    let read_txn = database.begin_read().store_err()?;
+    let anchor_table = read_txn.open_table(ANCHOR_BLOCK).store_err()?;
+    let floor =
+        anchor_table.get(HISTORY_FLOOR_KEY).store_err()?.map(|v| block_meta_from_tuple(v.value()));
+    if let Some(meta) = floor {
+        return Ok(Some((meta.block_number, meta.block_hash)));
+    }
+    let chain = read_txn.open_table(CANONICAL_CHAIN).store_err()?;
+    Ok(chain.first().store_err()?.map(|(k, v)| (k.value(), BlockHash::from(v.value().0))))
+}
+
+/// History-preserving variant of [`write_reset_to_anchor`]: installs the new anchor and
+/// removes chain rows strictly *above* it (their lineage is unverified against the new
+/// anchor), but keeps every row below — accumulated canonical history is immutable and
+/// stays serviceable. The anchor also becomes the history floor: the reset leaves a gap
+/// right below it, so rows underneath are no longer guaranteed contiguous with the tip.
+pub fn write_reset_to_anchor_preserving_history(
+    database: &Database,
+    anchor: &BlockMeta,
+) -> StoreResult<()> {
+    let write_txn = database.begin_write().store_err()?;
+    {
+        let mut anchor_table = write_txn.open_table(ANCHOR_BLOCK).store_err()?;
+        anchor_table.insert("anchor", block_meta_to_tuple(anchor)).store_err()?;
+        anchor_table.insert(HISTORY_FLOOR_KEY, block_meta_to_tuple(anchor)).store_err()?;
+
+        let mut chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
+        let to_remove: Vec<u64> = chain
+            .range((anchor.block_number + 1)..)
+            .store_err()?
+            .map(|r| r.map(|(k, _)| k.value()))
+            .collect::<std::result::Result<_, _>>()
+            .store_err()?;
+        for n in to_remove {
+            chain.remove(n).store_err()?;
+        }
+        chain
+            .insert(
+                anchor.block_number,
+                (anchor.block_hash.0, anchor.post_state_root.0, anchor.post_withdrawals_root.0),
+            )
+            .store_err()?;
+    }
+    write_txn.commit().store_err()?;
+    Ok(())
+}
+
 /// Clears the canonical chain and sets anchor as the sole entry.
 pub fn write_reset_to_anchor(database: &Database, anchor: &BlockMeta) -> StoreResult<()> {
     let write_txn = database.begin_write().store_err()?;
@@ -190,6 +247,12 @@ mod tests {
     fn temp_db() -> (tempfile::TempDir, Database) {
         let dir = tempfile::tempdir().unwrap();
         let database = Database::create(dir.path().join("test.redb")).unwrap();
+        // Pre-create the tables read paths open, mirroring ValidatorDB/ServerDB::new —
+        // a redb read transaction cannot open a table that doesn't exist yet.
+        let write_txn = database.begin_write().unwrap();
+        write_txn.open_table(ANCHOR_BLOCK).unwrap();
+        write_txn.open_table(CANONICAL_CHAIN).unwrap();
+        write_txn.commit().unwrap();
         (dir, database)
     }
 
@@ -219,6 +282,61 @@ mod tests {
         for removed in [5u64, 10, 11, 12] {
             assert_eq!(read_block_hash(&db, removed).unwrap(), None, "stale block {removed}");
         }
+    }
+
+    /// The preserving reset keeps rows below the new anchor, drops rows above it, and
+    /// installs the anchor as both chain tip and history floor. The plain
+    /// `write_reset_to_anchor` (validator behavior) stays wipe-everything — pinned by
+    /// `reset_to_anchor_clears_chain_and_installs_anchor` above.
+    #[test]
+    fn preserving_reset_keeps_history_and_sets_floor() {
+        let (_dir, db) = temp_db();
+
+        write_advance_chain(&db, &[meta(10), meta(11), meta(12)], None).unwrap();
+
+        // Forward reset (stale-reset shape: anchor jumps above all local rows).
+        let anchor = meta(42);
+        write_reset_to_anchor_preserving_history(&db, &anchor).unwrap();
+
+        assert_eq!(read_anchor(&db).unwrap().as_ref(), Some(&anchor));
+        assert_eq!(read_canonical_tip(&db).unwrap().as_ref(), Some(&anchor));
+        assert_eq!(read_history_floor(&db).unwrap(), Some((42, anchor.block_hash)));
+        for kept in [10u64, 11, 12] {
+            assert_eq!(
+                read_block_hash(&db, kept).unwrap(),
+                Some(meta(kept).block_hash),
+                "island row {kept} must survive the reset"
+            );
+        }
+
+        // Reset landing below existing rows: rows above the anchor are unverified against
+        // it and must go; rows below stay.
+        let anchor = meta(11);
+        write_reset_to_anchor_preserving_history(&db, &anchor).unwrap();
+        assert_eq!(read_canonical_tip(&db).unwrap().as_ref(), Some(&anchor));
+        assert_eq!(read_history_floor(&db).unwrap(), Some((11, anchor.block_hash)));
+        assert_eq!(read_block_hash(&db, 10).unwrap(), Some(meta(10).block_hash));
+        assert_eq!(read_block_hash(&db, 12).unwrap(), None);
+        assert_eq!(read_block_hash(&db, 42).unwrap(), None);
+    }
+
+    /// Without a persisted floor row the floor falls back to the earliest chain row; once a
+    /// floor row exists it wins even though older island rows sit below it.
+    #[test]
+    fn read_history_floor_falls_back_to_earliest() {
+        let (_dir, db) = temp_db();
+        assert_eq!(read_history_floor(&db).unwrap(), None);
+
+        write_advance_chain(&db, &[meta(3), meta(4)], None).unwrap();
+        assert_eq!(read_history_floor(&db).unwrap(), Some((3, meta(3).block_hash)));
+
+        write_reset_to_anchor_preserving_history(&db, &meta(7)).unwrap();
+        assert_eq!(
+            read_history_floor(&db).unwrap(),
+            Some((7, meta(7).block_hash)),
+            "the floor row must win over the earlier island rows"
+        );
+        assert_eq!(read_earliest_block(&db).unwrap(), Some((3, meta(3).block_hash)));
     }
 
     #[test]
