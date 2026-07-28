@@ -283,7 +283,7 @@ fn record_upstream_deadline_exceeded(method: &'static str) {
 /// shapes bypass the response cache.
 const REQUEST_SHAPE_TOTAL: &str = "debug_trace_request_shape_total";
 
-/// Every label emitted by `ResponseVariant::shape_label`, for pre-registration and tests.
+/// Every label emitted by `RequestShape::label`, for pre-registration and tests.
 pub const REQUEST_SHAPES: &[&str] = &[
     "default",
     "call_tracer",
@@ -300,6 +300,19 @@ pub const REQUEST_SHAPES: &[&str] = &[
 /// Records one request of the given parameter shape for `method`.
 pub fn record_request_shape(method: &'static str, shape: &'static str) {
     counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => shape).increment(1);
+}
+
+/// Canonical number → hash resolution counter, labeled `(source, outcome)` — how often
+/// by-number requests resolve their canonical hash from the local DB index vs upstream,
+/// and how often resolution misses or fails.
+const CANONICAL_HASH_RESOLUTION_TOTAL: &str = "debug_trace_canonical_hash_resolution_total";
+
+/// Records one canonical-hash resolution attempt against `source` (`"db"` | `"upstream"`)
+/// with `outcome` (`"ok"` | `"miss"` | `"error"`; upstream has no miss — a missing block is
+/// an error from the retry loop).
+pub fn record_canonical_hash_resolution(source: &'static str, outcome: &'static str) {
+    counter!(CANONICAL_HASH_RESOLUTION_TOTAL, "source" => source, "outcome" => outcome)
+        .increment(1);
 }
 
 /// Witness fetch metrics by source.
@@ -474,6 +487,14 @@ fn pre_register_all_metrics() {
         for shape in REQUEST_SHAPES {
             counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => *shape).increment(0);
         }
+    }
+
+    // Data Fetch Layer: canonical number → hash resolution
+    for (source, outcome) in
+        [("db", "ok"), ("db", "miss"), ("db", "error"), ("upstream", "ok"), ("upstream", "error")]
+    {
+        counter!(CANONICAL_HASH_RESOLUTION_TOTAL, "source" => source, "outcome" => outcome)
+            .increment(0);
     }
 
     // Witness Layer

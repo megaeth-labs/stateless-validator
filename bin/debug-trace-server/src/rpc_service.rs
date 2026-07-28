@@ -26,7 +26,7 @@ use crate::{
         METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, METHOD_DEBUG_TRACE_TRANSACTION, METHOD_TRACE_BLOCK,
         METHOD_TRACE_TRANSACTION, ResponseSizeMetrics, RpcGlobalMetrics, SingleFlightMetrics,
     },
-    response_cache::{CachedResource, ResponseCache, ResponseVariant},
+    response_cache::{CachedResource, RequestShape, ResponseCache, ResponseVariant},
 };
 
 /// Slow request threshold for logging warnings.
@@ -203,11 +203,35 @@ impl RpcContext {
 const ERROR_CODE_INTERNAL: i32 = -32000;
 /// Error code for "resource not found" (used for missing blocks / pending txs / deadline).
 const ERROR_CODE_NOT_FOUND: i32 = -32001;
+/// Error code for invalid request parameters (malformed `tracerConfig`).
+const ERROR_CODE_INVALID_PARAMS: i32 = -32602;
 
 /// Creates a JSON-RPC internal error (code -32000).
 /// Used for execution failures, serialization errors, etc.
 fn rpc_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
     jsonrpsee::types::ErrorObjectOwned::owned(ERROR_CODE_INTERNAL, msg, None::<()>)
+}
+
+/// Creates a JSON-RPC invalid-params error (code -32602).
+fn invalid_params_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
+    jsonrpsee::types::ErrorObjectOwned::owned(ERROR_CODE_INVALID_PARAMS, msg, None::<()>)
+}
+
+/// Classifies `opts`, records the request-shape metric, and rejects a type-malformed
+/// `tracerConfig` on a config-reading builtin with `-32602 invalid params` — before any
+/// block data is fetched or executed. Returns the cache variant (`Some` only for
+/// cacheable shapes).
+fn classify_and_gate(
+    method_name: &'static str,
+    opts: &GethDebugTracingOptions,
+) -> Result<Option<ResponseVariant>, jsonrpsee::types::ErrorObjectOwned> {
+    let shape = RequestShape::classify(opts);
+    metrics::record_request_shape(method_name, shape.label());
+    if let RequestShape::InvalidTracerConfig { label, error } = &shape {
+        metrics::record_rpc_error(method_name);
+        return Err(invalid_params_err(format!("invalid tracerConfig for {label}: {error}")));
+    }
+    Ok(shape.cache_variant())
 }
 
 /// Maps a [`DataProviderError`] to a JSON-RPC error object.
@@ -300,75 +324,20 @@ async fn compute_parity_trace_block(
 }
 
 // Cache Helper Functions
-/// Checks cache by block number, serving a hit only after confirming the hash it was cached
-/// under is still canonical — number-keyed entries are otherwise unguarded against reorgs in
-/// stateless mode, where no chain-sync invalidation runs. A verified mismatch invalidates the
-/// dead entries; an unverifiable check falls through to recomputation without invalidating.
-/// A `None` variant marks a non-cacheable request shape and bypasses the lookup.
-async fn check_cache_by_number(
-    cache: &Option<ResponseCache>,
-    data_provider: &DataProvider,
-    resource: CachedResource,
-    block_num: u64,
-    variant: Option<&ResponseVariant>,
-    method_name: &'static str,
-    start: Instant,
-) -> Option<serde_json::Value> {
-    let cache = cache.as_ref()?;
-    let variant = variant?;
-    let Some((cached_value, cached_hash)) =
-        cache.get_with_hash(resource, block_num, variant.clone())
-    else {
-        cache.record_lookup_outcome(resource, false);
-        return None;
-    };
-    match data_provider.is_canonical(block_num, cached_hash).await {
-        Some(true) => cache.record_lookup_outcome(resource, true),
-        Some(false) => {
-            trace!(
-                method = method_name,
-                block = block_num,
-                cached_hash = %cached_hash,
-                "Cached entry belongs to a reorged block; invalidating"
-            );
-            cache.invalidate_blocks(&[cached_hash]);
-            cache.record_lookup_outcome(resource, false);
-            return None;
-        }
-        None => {
-            cache.record_lookup_outcome(resource, false);
-            return None;
-        }
-    }
-
-    let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-    metrics::record_rpc_request(method_name, total_ms / 1000.0);
-    DataSourceMetrics::new_for_source("cache").record();
-    SingleFlightMetrics::new_for_type("bypassed").record();
-
-    trace!(
-        method = method_name,
-        block = block_num,
-        total_ms = format!("{:.2}", total_ms),
-        cache_hit = true,
-        "Cache hit - returning cached result"
-    );
-
-    Some(cached_value)
-}
-
-/// Checks cache by block hash and returns cached value if found.
-/// A `None` variant marks a non-cacheable request shape and bypasses the lookup.
-fn check_cache_by_hash(
+/// Checks the cache for `(resource, block_hash, variant)`; a hit records request metrics
+/// and returns the pre-serialized response. A `None` variant marks a non-cacheable request
+/// shape and bypasses the lookup entirely (no hit/miss accounting). By-number callers
+/// resolve the canonical hash *before* calling this, so a hit is correct by construction —
+/// there is no serve-time canonicality validation anymore.
+fn check_cache(
     cache: &Option<ResponseCache>,
     resource: CachedResource,
     block_hash: B256,
-    variant: Option<&ResponseVariant>,
+    variant: Option<ResponseVariant>,
     method_name: &'static str,
     start: Instant,
 ) -> Option<serde_json::Value> {
-    let (cached_value, block_num) =
-        cache.as_ref()?.get_by_hash(resource, block_hash, variant?.clone())?;
+    let cached_value = cache.as_ref()?.get(resource, block_hash, variant?)?;
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
     metrics::record_rpc_request(method_name, total_ms / 1000.0);
@@ -377,7 +346,6 @@ fn check_cache_by_hash(
 
     trace!(
         method = method_name,
-        block = block_num,
         block_hash = %block_hash,
         total_ms = format!("{:.2}", total_ms),
         cache_hit = true,
@@ -387,36 +355,17 @@ fn check_cache_by_hash(
     Some(cached_value)
 }
 
-/// Inserts a response whose number/hash pairing came from a canonical by-number resolution;
-/// a no-op when the cache is disabled or the request shape is not cacheable (`variant` is
-/// `None`).
+/// Inserts a computed response under the hash of the block it was computed for; a no-op
+/// when the cache is disabled or the request shape is not cacheable (`variant` is `None`).
 fn insert_cache(
     cache: &Option<ResponseCache>,
     resource: CachedResource,
-    block_num: u64,
     block_hash: B256,
-    variant: Option<&ResponseVariant>,
+    variant: Option<ResponseVariant>,
     result: &serde_json::Value,
 ) {
     if let (Some(cache), Some(variant)) = (cache, variant) {
-        cache.insert(resource, block_num, block_hash, variant.clone(), result.clone());
-    }
-}
-
-/// Inserts a response computed for an explicitly requested block hash; unlike
-/// [`insert_cache`], this never re-keys the number's canonical mapping — a request for an
-/// orphaned hash must not evict the canonical block's entries (the insert is skipped when
-/// the hash conflicts with the current mapping).
-fn insert_cache_by_hash(
-    cache: &Option<ResponseCache>,
-    resource: CachedResource,
-    block_num: u64,
-    block_hash: B256,
-    variant: Option<&ResponseVariant>,
-    result: &serde_json::Value,
-) {
-    if let (Some(cache), Some(variant)) = (cache, variant) {
-        cache.insert_by_hash(resource, block_num, block_hash, variant.clone(), result.clone());
+        cache.insert(resource, block_hash, variant, result.clone());
     }
 }
 
@@ -450,48 +399,57 @@ impl DebugTraceRpcServer for RpcContext {
             .start_request(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, format!("{block_number}"));
         let start = Instant::now();
         let opts = opts.unwrap_or_default();
-        metrics::record_request_shape(
-            METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
-            ResponseVariant::shape_label(&opts),
-        );
+        let variant = classify_and_gate(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, &opts)?;
 
-        // Stage 1: Resolve block number
+        // One wall-clock budget for the whole request: tag resolution, canonical-hash
+        // resolution, and the block-data fetch all share it.
+        let deadline = self.data_provider.fetch_deadline();
+
+        // Stage 1: Resolve tag -> block number
         let t0 = Instant::now();
         let block_num =
-            self.data_provider.resolve_block_number(block_number).await.map_err(|e| {
+            self.data_provider.resolve_block_number(block_number, deadline).await.map_err(|e| {
                 metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
                 rpc_err(format!("Failed to resolve block number: {e}"))
             })?;
         let resolve_ms = t0.elapsed().as_millis();
 
-        let variant = ResponseVariant::cacheable_from_geth_options(&opts);
+        // Stage 2: Resolve number -> canonical hash (local index first, upstream fallback),
+        // BEFORE the cache lookup — this is what makes number-keyed hits reorg-safe.
+        let t1 = Instant::now();
+        let block_hash =
+            self.data_provider.resolve_canonical_hash(block_num, deadline).await.map_err(|e| {
+                metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
+                data_provider_error_to_rpc_error(&e)
+            })?;
+        let resolve_hash_ms = t1.elapsed().as_millis();
 
-        // Stage 2: Check cache
-        if let Some(cached) = check_cache_by_number(
+        // Stage 3: Check cache under the canonical hash
+        if let Some(cached) = check_cache(
             &self.response_cache,
-            &self.data_provider,
             CachedResource::DebugTraceBlock,
-            block_num,
-            variant.as_ref(),
+            block_hash,
+            variant,
             METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
             start,
-        )
-        .await
-        {
+        ) {
             return Ok(cached);
         }
 
-        // Stage 3: Fetch block data (DB -> RPC fallback)
+        // Stage 4: Fetch block data (DB -> RPC fallback) on the remaining budget
         let t2 = Instant::now();
-        let data = self.data_provider.get_block_data(block_num).await.map_err(|e| {
-            metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
-            data_provider_error_to_rpc_error(&e)
-        })?;
+        let data = self
+            .data_provider
+            .get_block_data_by_hash_with_deadline(block_hash, deadline)
+            .await
+            .map_err(|e| {
+                metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
+                data_provider_error_to_rpc_error(&e)
+            })?;
         let fetch_ms = t2.elapsed().as_millis();
-        let block_hash = data.block.header.hash;
         let tx_count = data.block.transactions.len();
 
-        // Stage 4: Execute trace
+        // Stage 5: Execute trace
         let t3 = Instant::now();
         let result = compute_debug_trace_block(
             &self.chain_spec,
@@ -505,14 +463,13 @@ impl DebugTraceRpcServer for RpcContext {
         })?;
         let trace_ms = t3.elapsed().as_millis();
 
-        // Stage 5: Cache result
+        // Stage 6: Cache result under the hash it was computed for
         let t4 = Instant::now();
         insert_cache(
             &self.response_cache,
             CachedResource::DebugTraceBlock,
-            block_num,
             block_hash,
-            variant.as_ref(),
+            variant,
             &result,
         );
         let cache_insert_ms = t4.elapsed().as_millis();
@@ -521,6 +478,7 @@ impl DebugTraceRpcServer for RpcContext {
         record_request_completion(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, block_num, start);
 
         if resolve_ms >= SLOW_STAGE_THRESHOLD_MS ||
+            resolve_hash_ms >= SLOW_STAGE_THRESHOLD_MS ||
             fetch_ms >= SLOW_STAGE_THRESHOLD_MS ||
             trace_ms >= SLOW_STAGE_THRESHOLD_MS ||
             cache_insert_ms >= SLOW_STAGE_THRESHOLD_MS
@@ -529,6 +487,7 @@ impl DebugTraceRpcServer for RpcContext {
                 block_number = block_num,
                 tx_count,
                 resolve_ms = resolve_ms as u64,
+                resolve_hash_ms = resolve_hash_ms as u64,
                 fetch_data_ms = fetch_ms as u64,
                 trace_ms = trace_ms as u64,
                 cache_insert_ms = cache_insert_ms as u64,
@@ -550,19 +509,14 @@ impl DebugTraceRpcServer for RpcContext {
             self.watch_dog.start_request(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, format!("{block_hash}"));
         let start = Instant::now();
         let opts = opts.unwrap_or_default();
-        metrics::record_request_shape(
-            METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
-            ResponseVariant::shape_label(&opts),
-        );
+        let variant = classify_and_gate(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, &opts)?;
 
-        let variant = ResponseVariant::cacheable_from_geth_options(&opts);
-
-        // Check cache
-        if let Some(cached) = check_cache_by_hash(
+        // Check cache — the requested hash IS the key; no resolution step.
+        if let Some(cached) = check_cache(
             &self.response_cache,
             CachedResource::DebugTraceBlock,
             block_hash,
-            variant.as_ref(),
+            variant,
             METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
             start,
         ) {
@@ -586,13 +540,13 @@ impl DebugTraceRpcServer for RpcContext {
             metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
         })?;
 
-        // Cache and record metrics
-        insert_cache_by_hash(
+        // Cache and record metrics. An entry for a non-canonical hash is still the correct
+        // answer for that hash — exactly what geth serves — and is unreachable by-number.
+        insert_cache(
             &self.response_cache,
             CachedResource::DebugTraceBlock,
-            block_num,
             block_hash,
-            variant.as_ref(),
+            variant,
             &result,
         );
         record_request_completion(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, block_num, start);
@@ -610,10 +564,9 @@ impl DebugTraceRpcServer for RpcContext {
             self.watch_dog.start_request(METHOD_DEBUG_TRACE_TRANSACTION, format!("{tx_hash}"));
         let start = Instant::now();
         let opts = opts.unwrap_or_default();
-        metrics::record_request_shape(
-            METHOD_DEBUG_TRACE_TRANSACTION,
-            ResponseVariant::shape_label(&opts),
-        );
+        // Shape metric + malformed-config rejection; tx-level responses are not cached, so
+        // the cache variant itself is unused.
+        let _ = classify_and_gate(METHOD_DEBUG_TRACE_TRANSACTION, &opts)?;
 
         let (data, tx_index) =
             self.data_provider.get_block_data_for_tx(tx_hash).await.map_err(|e| {
@@ -689,36 +642,46 @@ impl TraceRpcServer for RpcContext {
         let _guard = self.watch_dog.start_request(METHOD_TRACE_BLOCK, format!("{block_number}"));
         let start = Instant::now();
 
+        // One shared budget for tag resolution, hash resolution, and the fetch.
+        let deadline = self.data_provider.fetch_deadline();
+
         let block_num =
-            self.data_provider.resolve_block_number(block_number).await.map_err(|e| {
+            self.data_provider.resolve_block_number(block_number, deadline).await.map_err(|e| {
                 metrics::record_rpc_error(METHOD_TRACE_BLOCK);
                 rpc_err(format!("Failed to resolve block number: {e}"))
             })?;
 
         tracing::Span::current().record("block_number", block_num);
 
-        // Check cache
-        if let Some(cached) = check_cache_by_number(
+        // Resolve the canonical hash, then check the cache under it. `trace_block` takes no
+        // tracer options, so its variant is always `Default`.
+        let block_hash =
+            self.data_provider.resolve_canonical_hash(block_num, deadline).await.map_err(|e| {
+                metrics::record_rpc_error(METHOD_TRACE_BLOCK);
+                data_provider_error_to_rpc_error(&e)
+            })?;
+
+        if let Some(cached) = check_cache(
             &self.response_cache,
-            &self.data_provider,
             CachedResource::TraceBlock,
-            block_num,
-            Some(&ResponseVariant::Default),
+            block_hash,
+            Some(ResponseVariant::Default),
             METHOD_TRACE_BLOCK,
             start,
-        )
-        .await
-        {
+        ) {
             return Ok(cached);
         }
 
         // Fetch block data (DB -> RPC fallback)
-        let data = self.data_provider.get_block_data(block_num).await.map_err(|e| {
-            metrics::record_rpc_error(METHOD_TRACE_BLOCK);
-            data_provider_error_to_rpc_error(&e)
-        })?;
+        let data = self
+            .data_provider
+            .get_block_data_by_hash_with_deadline(block_hash, deadline)
+            .await
+            .map_err(|e| {
+                metrics::record_rpc_error(METHOD_TRACE_BLOCK);
+                data_provider_error_to_rpc_error(&e)
+            })?;
 
-        let block_hash = data.block.header.hash;
         let result = compute_parity_trace_block(&self.chain_spec, &data, METHOD_TRACE_BLOCK)
             .await
             .inspect_err(|_| {
@@ -729,9 +692,8 @@ impl TraceRpcServer for RpcContext {
         insert_cache(
             &self.response_cache,
             CachedResource::TraceBlock,
-            block_num,
             block_hash,
-            Some(&ResponseVariant::Default),
+            Some(ResponseVariant::Default),
             &result,
         );
         record_request_completion(METHOD_TRACE_BLOCK, block_num, start);
@@ -896,182 +858,133 @@ mod tests {
         }
     }
 
-    /// Provider over a hanging upstream with an optional fixed DB canonical hash, for the
-    /// cache-helper tests below.
-    fn test_provider(db_hash: Option<Option<B256>>) -> Arc<DataProvider> {
-        use stateless_common::{RpcClient, RpcClientConfig};
-        use stateless_core::ContractStore;
-        use stateless_db::ContractCache;
-
-        use crate::data_provider::{
-            DEFAULT_WITNESS_TIMEOUT_SECS, NoopContractStore, WitnessFetchConfig,
-            test_support::StaticHashStore,
-        };
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/", listener.local_addr().unwrap());
-        std::mem::forget(listener);
-        let rpc_client = Arc::new(
-            RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
-                .unwrap(),
-        );
-        let contract_cache =
-            Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
-        let db = db_hash.map(|h| {
-            Arc::new(StaticHashStore(h, Some(u64::MAX))) as Arc<dyn crate::server_db::BlockStore>
-        });
-        Arc::new(DataProvider::new(
-            rpc_client,
-            db,
-            contract_cache,
-            WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
-            Duration::from_secs(1),
-        ))
-    }
-
-    #[tokio::test]
-    async fn test_check_cache_by_number_disabled() {
-        let result = check_cache_by_number(
-            &None,
-            &test_provider(None),
-            CachedResource::DebugTraceBlock,
-            100,
-            Some(&ResponseVariant::Default),
-            "test_method",
-            Instant::now(),
-        )
-        .await;
-        assert!(result.is_none());
-    }
-
+    /// A disabled cache (`None`) always reports a bypass, for both cacheable and
+    /// non-cacheable variants.
     #[test]
-    fn test_check_cache_by_hash_disabled() {
-        let result = check_cache_by_hash(
-            &None,
-            CachedResource::DebugTraceBlock,
-            B256::ZERO,
-            Some(&ResponseVariant::Default),
-            "test_method",
-            Instant::now(),
-        );
-        assert!(result.is_none());
+    fn check_cache_disabled_returns_none() {
+        for variant in [Some(ResponseVariant::Default), None] {
+            let result = check_cache(
+                &None,
+                CachedResource::DebugTraceBlock,
+                B256::ZERO,
+                variant,
+                "test_method",
+                Instant::now(),
+            );
+            assert!(result.is_none());
+        }
     }
 
-    #[tokio::test]
-    async fn check_cache_bypasses_on_non_cacheable_variant() {
+    /// A `None` variant (non-cacheable shape) bypasses the lookup entirely — no value and
+    /// no hit/miss accounting, even when an entry exists under the same hash.
+    #[test]
+    fn check_cache_bypasses_on_non_cacheable_variant() {
+        let hash = B256::from([1u8; 32]);
         let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
         cache.insert(
             CachedResource::DebugTraceBlock,
-            100,
-            B256::from([1u8; 32]),
+            hash,
             ResponseVariant::Default,
             serde_json::json!({"cached": true}),
         );
         let cache = Some(cache);
 
-        let by_number = check_cache_by_number(
-            &cache,
-            &test_provider(Some(Some(B256::from([1u8; 32])))),
-            CachedResource::DebugTraceBlock,
-            100,
-            None,
-            "test_method",
-            Instant::now(),
-        )
-        .await;
-        assert!(by_number.is_none());
-
-        let by_hash = check_cache_by_hash(
+        let result = check_cache(
             &cache,
             CachedResource::DebugTraceBlock,
-            B256::from([1u8; 32]),
+            hash,
             None,
             "test_method",
             Instant::now(),
         );
-        assert!(by_hash.is_none());
+        assert!(result.is_none());
+
+        let stats = cache.as_ref().unwrap().stats();
+        assert_eq!((stats.hits, stats.misses), (0, 0), "bypass must not touch accounting");
     }
 
-    /// Number-keyed hits serve only while the cached hash is canonical: a verified mismatch
-    /// invalidates the dead entries and reports a miss; an unverifiable check (stateless
-    /// mode, upstream down) reports a miss without invalidating.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn number_hit_requires_canonical_hash() {
+    /// A hit returns the cached value and counts as a hit; a lookup under a different hash
+    /// misses — there is no number indirection left to go stale.
+    #[test]
+    fn check_cache_hit_returns_and_counts() {
         let h1 = B256::from([1u8; 32]);
         let h2 = B256::from([2u8; 32]);
-        let check = |cache: &Option<ResponseCache>, provider: Arc<DataProvider>| {
-            let cache = cache.clone();
-            async move {
-                check_cache_by_number(
-                    &cache,
-                    &provider,
-                    CachedResource::DebugTraceBlock,
-                    100,
-                    Some(&ResponseVariant::Default),
-                    "test_method",
-                    Instant::now(),
-                )
-                .await
-            }
-        };
-        let fresh_cache = || {
-            let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
-            cache.insert(
-                CachedResource::DebugTraceBlock,
-                100,
-                h1,
-                ResponseVariant::Default,
-                serde_json::json!({"v": 1}),
-            );
-            Some(cache)
-        };
+        let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
+        cache.insert(
+            CachedResource::DebugTraceBlock,
+            h1,
+            ResponseVariant::Default,
+            serde_json::json!({"v": 1}),
+        );
+        let cache = Some(cache);
 
-        // Canonical: served and counted as a hit.
-        let cache = fresh_cache();
-        assert!(check(&cache, test_provider(Some(Some(h1)))).await.is_some());
-        let stats = cache.as_ref().unwrap().stats();
-        assert_eq!((stats.hits, stats.misses), (1, 0));
+        let hit = check_cache(
+            &cache,
+            CachedResource::DebugTraceBlock,
+            h1,
+            Some(ResponseVariant::Default),
+            "test_method",
+            Instant::now(),
+        );
+        assert_eq!(hit, Some(serde_json::json!({"v": 1})));
 
-        // Verified mismatch: miss + the dead entry is invalidated; the found-but-rejected
-        // entry must count as a miss, not a hit.
-        let cache = fresh_cache();
-        assert!(check(&cache, test_provider(Some(Some(h2)))).await.is_none());
-        assert_eq!(cache.as_ref().unwrap().len(), 0, "reorged entry must be invalidated");
-        let stats = cache.as_ref().unwrap().stats();
-        assert_eq!((stats.hits, stats.misses), (0, 1));
+        let miss = check_cache(
+            &cache,
+            CachedResource::DebugTraceBlock,
+            h2,
+            Some(ResponseVariant::Default),
+            "test_method",
+            Instant::now(),
+        );
+        assert!(miss.is_none());
 
-        // Unverifiable (stateless, upstream down): miss, but nothing invalidated.
-        let cache = fresh_cache();
-        assert!(check(&cache, test_provider(None)).await.is_none());
-        assert_eq!(cache.as_ref().unwrap().len(), 1, "unverifiable must not invalidate");
         let stats = cache.as_ref().unwrap().stats();
-        assert_eq!((stats.hits, stats.misses), (0, 1));
+        assert_eq!((stats.hits, stats.misses), (1, 1));
     }
 
     #[test]
     fn insert_cache_skips_non_cacheable_variants() {
         let cache = Some(ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100)));
         let result = serde_json::json!([{"txHash": "0x01"}]);
+        let hash = B256::from([1u8; 32]);
 
-        insert_cache(
-            &cache,
-            CachedResource::DebugTraceBlock,
-            100,
-            B256::from([1u8; 32]),
-            None,
-            &result,
-        );
+        insert_cache(&cache, CachedResource::DebugTraceBlock, hash, None, &result);
         assert_eq!(cache.as_ref().unwrap().len(), 0);
 
         insert_cache(
             &cache,
             CachedResource::DebugTraceBlock,
-            100,
-            B256::from([1u8; 32]),
-            Some(&ResponseVariant::Default),
+            hash,
+            Some(ResponseVariant::Default),
             &result,
         );
         assert_eq!(cache.as_ref().unwrap().len(), 1);
+    }
+
+    /// A type-malformed `tracerConfig` on a config-reading builtin maps to `-32602 invalid
+    /// params` with the tracer's label and the serde error in the message; a valid config
+    /// passes the gate and yields a cacheable variant.
+    #[test]
+    fn invalid_tracer_config_maps_to_invalid_params() {
+        let opts: GethDebugTracingOptions = serde_json::from_value(serde_json::json!({
+            "tracer": "callTracer",
+            "tracerConfig": {"onlyTopCall": "yes-please"},
+        }))
+        .unwrap();
+        let err = classify_and_gate("test_method", &opts).unwrap_err();
+        assert_eq!(err.code(), ERROR_CODE_INVALID_PARAMS);
+        assert!(
+            err.message().contains("invalid tracerConfig for call_tracer"),
+            "message: {}",
+            err.message(),
+        );
+
+        let opts: GethDebugTracingOptions = serde_json::from_value(serde_json::json!({
+            "tracer": "callTracer",
+            "tracerConfig": {"onlyTopCall": true},
+        }))
+        .unwrap();
+        assert!(classify_and_gate("test_method", &opts).unwrap().is_some());
     }
 
     #[test]

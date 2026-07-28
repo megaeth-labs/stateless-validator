@@ -207,6 +207,37 @@ mod tests {
         hooks.on_stale_reset(&make_block_meta(100)).unwrap();
     }
 
+    /// A reorg evicts exactly the reverted hashes' entries — across resources — and leaves
+    /// other blocks' entries alone. This is memory hygiene, not correctness: dead entries
+    /// are unreachable by-number anyway, since number-keyed reads resolve the canonical
+    /// hash before the lookup.
+    #[test]
+    fn reorg_invalidates_hash_keyed_entries() {
+        use crate::response_cache::{CachedResource, ResponseCacheConfig, ResponseVariant};
+
+        let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
+        let h1 = B256::from([1u8; 32]);
+        let h2 = B256::from([2u8; 32]);
+        let entries = [
+            (CachedResource::DebugTraceBlock, h1),
+            (CachedResource::TraceBlock, h1),
+            (CachedResource::DebugTraceBlock, h2),
+        ];
+        for (resource, hash) in entries {
+            cache.insert(resource, hash, ResponseVariant::Default, serde_json::json!({"v": 1}));
+        }
+
+        let hooks = TraceHooks::new(Arc::new(MockBlockStore), Some(cache.clone()));
+        hooks.on_reorg(10, 1, &[h1]).unwrap();
+
+        assert!(cache.get(CachedResource::DebugTraceBlock, h1, ResponseVariant::Default).is_none());
+        assert!(cache.get(CachedResource::TraceBlock, h1, ResponseVariant::Default).is_none());
+        assert!(
+            cache.get(CachedResource::DebugTraceBlock, h2, ResponseVariant::Default).is_some(),
+            "untouched blocks must survive the reorg invalidation"
+        );
+    }
+
     // Minimal mock for test compilation
     struct MockBlockStore;
     impl stateless_core::ContractStore for MockBlockStore {

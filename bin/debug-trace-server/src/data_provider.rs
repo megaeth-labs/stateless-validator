@@ -16,10 +16,11 @@
 //! - **Single-flight request coalescing**: concurrent callers for the same block hash share one
 //!   in-flight fetch via [`futures::future::Shared`]; the result is handed out as `Arc<BlockData>`
 //!   so the hot path is a refcount bump, not a deep clone.
-//! - **Single deadline per call**: every public entry point computes one wall-clock deadline from
-//!   `block_fetch_timeout` and threads it through the full pipeline (hash resolution, header,
-//!   witness, block, contracts). The witness stage gets a tighter sub-deadline for blocks at or
-//!   below the local tip. No more nested `tokio::time::timeout` wrappers.
+//! - **Single deadline per request**: the RPC handler mints one wall-clock deadline via
+//!   [`DataProvider::fetch_deadline`] and threads it through the full pipeline (tag resolution,
+//!   canonical-hash resolution, header, witness, block, contracts). The witness stage gets a
+//!   tighter sub-deadline for blocks at or below the local tip. No more nested
+//!   `tokio::time::timeout` wrappers.
 //! - **Contract bytecode resolution**: checks [`ContractCache`] (memory → redb), falls back to a
 //!   parallel + verified `RpcClient::get_codes_with_deadline` fetch on miss.
 //!
@@ -47,7 +48,10 @@ use stateless_db::ContractCache;
 use tracing::{debug, instrument, trace, warn};
 
 use crate::{
-    metrics::{ChainSyncMetrics, DataSourceMetrics, SingleFlightMetrics, WitnessSourceMetrics},
+    metrics::{
+        ChainSyncMetrics, DataSourceMetrics, SingleFlightMetrics, WitnessSourceMetrics,
+        record_canonical_hash_resolution,
+    },
     server_db::BlockStore,
 };
 
@@ -135,10 +139,6 @@ pub const DEFAULT_BLOCK_FETCH_TIMEOUT_SECS: u64 = 13;
 
 /// Slow stage threshold: any individual stage exceeding this triggers a warn log.
 pub(crate) const SLOW_STAGE_THRESHOLD_MS: u128 = 1000;
-
-/// Deadline for the upstream canonical-hash check backing number-keyed cache hits in
-/// stateless mode (see [`DataProvider::is_canonical`]).
-const CANONICAL_CHECK_TIMEOUT_SECS: u64 = 2;
 
 /// Stage that ran out of time. Used only to label the typed `Timeout` error below.
 #[derive(Debug, Clone, Copy)]
@@ -318,75 +318,71 @@ impl DataProvider {
         }
     }
 
-    /// Whether `hash` is the canonical hash for `number`, used to validate number-keyed
-    /// response-cache hits.
+    /// Mints the single wall-clock deadline for one user-facing request, from
+    /// `block_fetch_timeout`. Handlers call this once at entry and thread the result through
+    /// every stage (tag resolution, canonical-hash resolution, header, witness, block,
+    /// contracts) so the whole request shares ONE budget.
+    pub(crate) fn fetch_deadline(&self) -> Instant {
+        Instant::now() + self.block_fetch_timeout
+    }
+
+    /// Resolves a block number to its canonical block hash.
     ///
-    /// `Some(true)` = canonical: the local DB agrees, or the number is below the DB's
-    /// retained range, where chain-sync reorg handling covered the height before it was
-    /// pruned. `Some(false)` = verified mismatch (the cached entry belongs to a dead
-    /// block). `None` = unverifiable (treat as a cache miss, but do not invalidate).
+    /// This is what makes number-keyed requests safe to serve from the hash-keyed response
+    /// cache: the number → hash binding is resolved *before* the cache lookup, so a reorged
+    /// height resolves to the new hash and misses cleanly instead of serving a dead block.
     ///
-    /// A number missing from the DB is depth-final only *below* the local sync tip; a
-    /// height *above* it was served via RPC before chain sync reached it, so it is checked
-    /// upstream — as is everything in stateless mode, where no local chain exists at all.
-    /// The upstream check runs on a short deadline, still far cheaper than replaying.
-    pub async fn is_canonical(&self, number: u64, hash: B256) -> Option<bool> {
+    /// Lookup order: the local canonical index first (local-cache mode), then upstream
+    /// `eth_getHeaderByNumber` on the shared `deadline`. A DB read error is logged and falls
+    /// through to upstream rather than failing the request.
+    pub(crate) async fn resolve_canonical_hash(
+        &self,
+        block_num: u64,
+        deadline: Instant,
+    ) -> DataProviderResult<B256> {
         if let Some(db) = &self.db {
-            match db.get_block_hash(number) {
-                Ok(Some(canonical)) => return Some(canonical == hash),
-                Ok(None) => {
-                    let above_tip = match db.get_canonical_tip() {
-                        Ok(Some(tip)) => number > tip.block_number,
-                        Ok(None) => true,
-                        Err(_) => return None,
-                    };
-                    if !above_tip {
-                        return Some(true);
-                    }
+            match db.get_block_hash(block_num) {
+                Ok(Some(hash)) => {
+                    record_canonical_hash_resolution("db", "ok");
+                    return Ok(hash);
                 }
-                Err(_) => return None,
+                Ok(None) => record_canonical_hash_resolution("db", "miss"),
+                Err(e) => {
+                    record_canonical_hash_resolution("db", "error");
+                    warn!(
+                        block_number = block_num,
+                        error = %e,
+                        "Local canonical index read failed; resolving hash upstream",
+                    );
+                }
             }
         }
-        let deadline = Instant::now() + Duration::from_secs(CANONICAL_CHECK_TIMEOUT_SECS);
-        match self.rpc_client.get_block_hash_with_deadline(number, Some(deadline)).await {
-            Ok(canonical) => Some(canonical == hash),
-            Err(_) => None,
+        match self.rpc_client.get_block_hash_with_deadline(block_num, Some(deadline)).await {
+            Ok(hash) => {
+                record_canonical_hash_resolution("upstream", "ok");
+                Ok(hash)
+            }
+            Err(e) => {
+                record_canonical_hash_resolution("upstream", "error");
+                Err(e.into())
+            }
         }
     }
 
-    /// Gets block data by block number.
-    ///
-    /// Lookup order: local database -> RPC. A single wall-clock deadline (computed from
-    /// `block_fetch_timeout`) covers the entire call — resolving the hash from RPC, fetching
-    /// the block + witness, and resolving contract bytecodes all share this one budget.
-    pub async fn get_block_data(&self, block_num: u64) -> DataProviderResult<Arc<BlockData>> {
-        let deadline = Instant::now() + self.block_fetch_timeout;
-
-        // Try to get block hash from local database first.
-        if let Some(db) = &self.db &&
-            let Ok(Some(hash)) = db.get_block_hash(block_num)
-        {
-            return self.get_block_data_by_hash_inner(hash, deadline).await;
-        }
-
-        // Fall back to RPC. The deadline carries through to `get_block_data_by_hash_inner` so
-        // there is only ONE budget shared across hash resolution + the full pipeline.
-        let block_hash =
-            self.rpc_client.get_block_hash_with_deadline(block_num, Some(deadline)).await?;
-        self.get_block_data_by_hash_inner(block_hash, deadline).await
-    }
-
-    /// Gets block data by block hash with single-flight coalescing. One deadline for the
-    /// whole call; see [`Self::get_block_data`] for the semantics.
+    /// Gets block data by block hash with single-flight coalescing, minting its own
+    /// deadline. Entry point for callers without a shared budget; handlers that already
+    /// resolved a hash on a deadline use [`Self::get_block_data_by_hash_with_deadline`].
     pub async fn get_block_data_by_hash(
         &self,
         block_hash: B256,
     ) -> DataProviderResult<Arc<BlockData>> {
-        let deadline = Instant::now() + self.block_fetch_timeout;
-        self.get_block_data_by_hash_inner(block_hash, deadline).await
+        self.get_block_data_by_hash_with_deadline(block_hash, self.fetch_deadline()).await
     }
 
-    async fn get_block_data_by_hash_inner(
+    /// Gets block data by block hash with single-flight coalescing on the caller's
+    /// `deadline` — the tail of the shared per-request budget minted by
+    /// [`Self::fetch_deadline`].
+    pub(crate) async fn get_block_data_by_hash_with_deadline(
         &self,
         block_hash: B256,
         deadline: Instant,
@@ -439,7 +435,7 @@ impl DataProvider {
         tx_hash: B256,
     ) -> DataProviderResult<(Arc<BlockData>, usize)> {
         trace!(tx_hash = %tx_hash, "Looking up transaction");
-        let deadline = Instant::now() + self.block_fetch_timeout;
+        let deadline = self.fetch_deadline();
 
         // Fetch the transaction to find its block. The outer result is `Err(Deadline)`; the
         // inner is `Err` for "tx exists but has no block_hash" (pending) — classify explicitly
@@ -461,28 +457,31 @@ impl DataProvider {
             "Transaction located in block"
         );
 
-        let data = self.get_block_data_by_hash_inner(block_hash, deadline).await?;
+        let data = self.get_block_data_by_hash_with_deadline(block_hash, deadline).await?;
         Ok((data, tx_index))
     }
 
-    /// Resolves a block tag to a concrete block number.
+    /// Resolves a block tag to a concrete block number on the caller's `deadline`.
     ///
     /// Numeric tags are a pure local no-op. `Latest`, `Finalized`, and `Safe` must hit
     /// upstream to learn the tip — there is no cache key until we have a concrete number,
-    /// so falling back to the cache on upstream failure is not an option. These branches
-    /// are bounded by `block_fetch_timeout` so a stuck upstream surfaces as a typed
-    /// [`DataProviderError::Timeout`] rather than hanging the RPC caller forever.
-    pub async fn resolve_block_number(&self, tag: BlockNumberOrTag) -> DataProviderResult<u64> {
+    /// so falling back to the cache on upstream failure is not an option. The `deadline` is
+    /// the shared per-request budget from [`Self::fetch_deadline`], so a stuck upstream
+    /// surfaces as a typed [`DataProviderError::Timeout`] rather than hanging the RPC
+    /// caller forever — and tag resolution cannot double the request's total budget.
+    pub async fn resolve_block_number(
+        &self,
+        tag: BlockNumberOrTag,
+        deadline: Instant,
+    ) -> DataProviderResult<u64> {
         match tag {
             BlockNumberOrTag::Number(n) => Ok(n),
             BlockNumberOrTag::Earliest => Ok(0),
             BlockNumberOrTag::Pending => Err(eyre::eyre!("Pending block not supported").into()),
             BlockNumberOrTag::Latest => {
-                let deadline = Instant::now() + self.block_fetch_timeout;
                 Ok(self.rpc_client.get_latest_block_number_with_deadline(Some(deadline)).await?)
             }
             BlockNumberOrTag::Finalized | BlockNumberOrTag::Safe => {
-                let deadline = Instant::now() + self.block_fetch_timeout;
                 let header = self
                     .rpc_client
                     .get_header_with_deadline(BlockId::Number(tag), false, Some(deadline))
@@ -950,7 +949,50 @@ impl ContractStore for NoopContractStore {
 /// Test doubles shared with `rpc_service` unit tests.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use jsonrpsee::{
+        RpcModule,
+        server::{ServerBuilder, ServerHandle},
+        types::ErrorObjectOwned,
+    };
+
     use super::*;
+
+    /// Minimal valid RPC `Header` with `hash`/`number` populated; all other fields default.
+    /// Copy-adapted from the module-private `stateless-common` rpc_client test helpers.
+    pub(crate) fn header_stub(number: u64, hash: B256) -> alloy_rpc_types_eth::Header {
+        alloy_rpc_types_eth::Header {
+            hash,
+            inner: alloy_consensus::Header { number, ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    /// Starts a jsonrpsee server bound to a random port and registers methods via `register`.
+    pub(crate) async fn serve<Ctx: Send + Sync + 'static>(
+        ctx: Ctx,
+        register: impl FnOnce(&mut RpcModule<Ctx>),
+    ) -> (ServerHandle, String) {
+        let mut module = RpcModule::new(ctx);
+        register(&mut module);
+        let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        (server.start(module), url)
+    }
+
+    /// Serves `eth_getHeaderByNumber` with headers derived from `hashes`.
+    pub(crate) async fn start_mock_rpc(
+        hashes: std::collections::HashMap<u64, B256>,
+    ) -> (ServerHandle, String) {
+        serve(hashes, |m| {
+            m.register_method("eth_getHeaderByNumber", |params, ctx, _| {
+                let (hex,): (String,) = params.parse().unwrap();
+                let n = u64::from_str_radix(hex.strip_prefix("0x").unwrap_or(&hex), 16).unwrap();
+                Ok::<_, ErrorObjectOwned>(header_stub(n, ctx.get(&n).copied().unwrap_or_default()))
+            })
+            .unwrap();
+        })
+        .await
+    }
 
     /// [`BlockStore`] stub whose canonical index answers `get_block_hash` with a fixed value
     /// and reports a fixed sync tip; everything else is empty.
@@ -1114,21 +1156,21 @@ mod tests {
         (rpc_client, cfg)
     }
 
-    /// Provider over a hanging upstream with an optional DB canonical index, given as
-    /// `(canonical hash answer, sync tip)`.
-    fn canonical_fixture(db: Option<(Option<B256>, Option<u64>)>) -> DataProvider {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/", listener.local_addr().unwrap());
-        // Leak the listener so the port stays bound (and hanging) for the provider's lifetime.
-        std::mem::forget(listener);
-        let rpc_client = Arc::new(
-            RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
-                .unwrap(),
-        );
+    /// Provider over `url` with an optional DB canonical index, given as
+    /// `(canonical hash answer, sync tip)`, plus a fast-fail retry config (150 ms attempts,
+    /// millisecond backoff) and a 1 s fetch budget so hang tests stay fast.
+    fn provider_at(url: &str, db: Option<(Option<B256>, Option<u64>)>) -> DataProvider {
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
+            per_attempt_timeout: Duration::from_millis(150),
+            ..RpcClientConfig::trace_server()
+        };
+        let rpc_client =
+            Arc::new(RpcClient::new_with_config(&[url], &[url], config, None).unwrap());
         let contract_cache =
             Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
         let db = db.map(|(hash, tip)| {
-            Arc::new(super::test_support::StaticHashStore(hash, tip)) as Arc<dyn BlockStore>
+            Arc::new(test_support::StaticHashStore(hash, tip)) as Arc<dyn BlockStore>
         });
         DataProvider::new(
             rpc_client,
@@ -1139,31 +1181,67 @@ mod tests {
         )
     }
 
-    /// DB mode: a matching canonical index verifies the hit, a differing one is a verified
-    /// mismatch, and a number missing below the sync tip (pruned range) is trusted by depth.
+    /// The local canonical index answers first: a DB hit never consults the upstream —
+    /// pinned by pointing the provider at a hanging listener that would eat the deadline.
     #[tokio::test]
-    async fn is_canonical_uses_db_index_and_depth() {
-        let h1 = B256::from([1u8; 32]);
-        let h2 = B256::from([2u8; 32]);
-        let tip = Some(u64::MAX);
+    async fn resolve_canonical_hash_prefers_db_index() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let _listener = listener;
 
-        assert_eq!(canonical_fixture(Some((Some(h1), tip))).is_canonical(7, h1).await, Some(true));
-        assert_eq!(canonical_fixture(Some((Some(h2), tip))).is_canonical(7, h1).await, Some(false));
-        assert_eq!(canonical_fixture(Some((None, tip))).is_canonical(7, h1).await, Some(true));
+        let h1 = B256::from([1u8; 32]);
+        let provider = provider_at(&url, Some((Some(h1), Some(u64::MAX))));
+        let deadline = Instant::now() + Duration::from_millis(300);
+        assert_eq!(provider.resolve_canonical_hash(7, deadline).await.unwrap(), h1);
     }
 
-    /// Heights the local DB cannot vouch for must be verified upstream: stateless mode
-    /// always, and DB mode for numbers above the sync tip (served via RPC before chain sync
-    /// reached them, so not depth-final). With the upstream unreachable both are
-    /// unverifiable — the caller treats the hit as a miss without invalidating.
+    /// Stateless mode (no DB): the hash resolves upstream via `eth_getHeaderByNumber`.
+    #[tokio::test]
+    async fn resolve_canonical_hash_resolves_upstream() {
+        let h = B256::from([7u8; 32]);
+        let hashes = std::collections::HashMap::from([(42, h)]);
+        let (handle, url) = test_support::start_mock_rpc(hashes).await;
+
+        let provider = provider_at(&url, None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        assert_eq!(provider.resolve_canonical_hash(42, deadline).await.unwrap(), h);
+        handle.stop().unwrap();
+    }
+
+    /// Local-cache mode with the number missing from the DB index (above the sync frontier,
+    /// or below a not-yet-backfilled floor): resolution falls back to the upstream fetch.
+    #[tokio::test]
+    async fn resolve_canonical_hash_db_miss_falls_back_upstream() {
+        let h = B256::from([9u8; 32]);
+        let hashes = std::collections::HashMap::from([(42, h)]);
+        let (handle, url) = test_support::start_mock_rpc(hashes).await;
+
+        let provider = provider_at(&url, Some((None, Some(3))));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        assert_eq!(provider.resolve_canonical_hash(42, deadline).await.unwrap(), h);
+        handle.stop().unwrap();
+    }
+
+    /// A hanging upstream surfaces as a typed `Timeout` bounded by the caller's deadline —
+    /// hash resolution shares the request budget and cannot hang the caller.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn is_canonical_unverifiable_without_chain_source() {
-        let h = B256::from([1u8; 32]);
-        assert_eq!(canonical_fixture(None).is_canonical(7, h).await, None);
-        assert_eq!(
-            canonical_fixture(Some((None, Some(3)))).is_canonical(7, h).await,
-            None,
-            "a miss above the sync tip must not be trusted by depth"
+    async fn resolve_canonical_hash_surfaces_timeout_when_upstream_hangs() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let _listener = listener;
+
+        let provider = provider_at(&url, None);
+        let start = Instant::now();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let err = provider.resolve_canonical_hash(42, deadline).await.unwrap_err();
+        assert!(
+            matches!(err, DataProviderError::Timeout { stage: TimeoutStage::Block, .. }),
+            "expected Timeout{{Block}}, got: {err:?}",
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "deadline must bound the hang; elapsed: {:?}",
+            start.elapsed(),
         );
     }
 
@@ -1294,6 +1372,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{addr}/");
+        let _listener = listener;
 
         let rpc_client = Arc::new(
             RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
@@ -1310,7 +1389,7 @@ mod tests {
         );
 
         let start = std::time::Instant::now();
-        let result = provider.get_block_data(42).await;
+        let result = provider.get_block_data_by_hash(B256::from([0x42; 32])).await;
         let elapsed = start.elapsed();
 
         let err = match result {
@@ -1329,33 +1408,23 @@ mod tests {
         );
     }
 
-    /// Tag-resolution branches (`Latest`/`Finalized`/`Safe`) must be deadline-bounded.
-    /// Before this was wired, `resolve_block_number("latest")` would call the non-deadline
-    /// `get_latest_block_number` / `get_header` helpers and retry the upstream forever,
-    /// hanging the RPC caller on a stuck endpoint.
+    /// Tag-resolution branches (`Latest`/`Finalized`/`Safe`) must be bounded by the
+    /// caller's deadline. Before this was wired, `resolve_block_number("latest")` would call
+    /// the non-deadline `get_latest_block_number` / `get_header` helpers and retry the
+    /// upstream forever, hanging the RPC caller on a stuck endpoint.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resolve_block_number_surfaces_timeout_when_upstream_hangs() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{addr}/");
+        let _listener = listener;
 
-        let rpc_client = Arc::new(
-            RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
-                .unwrap(),
-        );
-        let contract_cache =
-            Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
-        let provider = DataProvider::new(
-            rpc_client,
-            None,
-            contract_cache,
-            WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
-            Duration::from_secs(1),
-        );
+        let provider = provider_at(&url, None);
 
         for tag in [BlockNumberOrTag::Latest, BlockNumberOrTag::Finalized, BlockNumberOrTag::Safe] {
             let start = std::time::Instant::now();
-            let result = provider.resolve_block_number(tag).await;
+            let deadline = Instant::now() + Duration::from_millis(300);
+            let result = provider.resolve_block_number(tag, deadline).await;
             let elapsed = start.elapsed();
 
             let err = match result {
