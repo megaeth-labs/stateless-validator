@@ -33,3 +33,7 @@ serde_json.workspace = true
 [dev-dependencies]
 # misc
 tempfile.workspace = true
+
+[[bench]]
+harness = false
+name = "canonical_chain_scale"

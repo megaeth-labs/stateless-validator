@@ -99,8 +99,20 @@ Two operating modes:
 - **Local cache mode** (with `--data-dir`): Enables chain sync to pre-fetch blocks for faster serving.
 
 **Response cache:**
-The HTTP response cache stores block-level responses only for idempotent request shapes: the five built-in tracers (`callTracer`, `prestateTracer`, `4byteTracer`, `noopTracer`, `flatCallTracer`, each keyed by a hash of its `tracerConfig`) and the bare default struct-logger request (no tracer, no `tracerConfig`, default flags).
+The HTTP response cache is keyed by `(resource, block hash, tracer variant)` — an entry is an immutable fact about that exact block, so reorgs need no serve-time validation.
+By-number requests resolve their canonical hash before the lookup (local index first, upstream `eth_getHeaderByNumber` fallback — in stateless mode that is one upstream header fetch per request), so a reorged height resolves to the new hash and misses cleanly.
+Cacheable shapes are the five built-in tracers (`callTracer`, `prestateTracer`, `4byteTracer`, `noopTracer`, `flatCallTracer`, keyed by their parsed, typed `tracerConfig` — equivalent configs collapse onto one entry) and the bare default struct-logger request (no tracer, no `tracerConfig`, default flags).
 JS tracers, `muxTracer`, and struct-logger requests with non-default flags bypass the cache and are recomputed on every request.
+A type-malformed `tracerConfig` on a config-reading builtin (`callTracer`/`prestateTracer`/`flatCallTracer`) is rejected with `-32602 invalid params` instead of being silently traced with default settings.
+Disable the cache with `--response-cache-disabled`; `--response-cache-estimated-items` must be at least 1 (the old `=0` disable convention is rejected at startup).
+
+**Canonical index and backfill (local cache mode):**
+The block-number → hash index (`CANONICAL_CHAIN`) is permanent: pruning removes only block bodies and witnesses, and a stale reset preserves accumulated history below the new anchor.
+With `--backfill-canonical-index`, a resumable background task extends the index from the current history floor down to genesis, verifying every header cryptographically (recomputed header hash + parent-hash linkage), so by-number requests resolve their canonical hash locally forever after.
+Progress persists in the history floor across restarts; watch the `debug_trace_backfill_floor` gauge descend, and leave the flag on — a completed backfill exits immediately.
+The index costs roughly 220–340 bytes per block on disk (about 5 GiB projected for a full 25M-block history) — budget `--db-max-size` accordingly.
+Tuning: `--backfill-batch-size` (default 1024), `--backfill-max-concurrent-headers` (default 32), `--backfill-throttle-ms` (default 0).
+Size-based pruning never removes bodies above `tip - --size-prune-min-retain` (default 256), so a DB file stuck over `--db-max-size` cannot consume the whole body retention.
 
 **Witness endpoints:**
 Declare the internal witness generator via `--witness-generator-endpoint`; `--witness-endpoint` lists the durable fallbacks (e.g. an R2-backed witness service), tried in order.
@@ -244,13 +256,17 @@ The validator and trace server each have their own `redb`-backed database, shari
 
 | Table             | Key                        | Value                                                  | Used By                      |
 | ----------------- | -------------------------- | ------------------------------------------------------ | ---------------------------- |
-| `ANCHOR_BLOCK`    | `"anchor"`                 | `(BlockNumber, BlockHash, StateRoot, WithdrawalsRoot)` | Both                         |
+| `ANCHOR_BLOCK`    | `"anchor"`, `"history_floor"` | `(BlockNumber, BlockHash, StateRoot, WithdrawalsRoot)` | Both (floor: trace server) |
 | `CANONICAL_CHAIN` | `BlockNumber`              | `(BlockHash, StateRoot, WithdrawalsRoot)`              | Both                         |
 | `CONTRACTS`       | `CodeHash`                 | Bincode+LZ4 `Bytecode`                                 | Both                         |
 | `GENESIS_CONFIG`  | `"genesis"`                | JSON `Genesis`                                         | Validator                    |
 | `BLOCK_DATA`      | `BlockHash`                | JSON `Block<Transaction>`                              | Trace server                 |
 | `WITNESSES`       | `BlockHash`                | Bincode+LZ4 `LightWitness`                             | Trace server                 |
 | `BLOCK_RECORDS`   | `(BlockNumber, BlockHash)` | `()`                                                   | Trace server (pruning index) |
+
+In the trace server, `CANONICAL_CHAIN` is permanent: pruning removes only `BLOCK_DATA`/`WITNESSES`/`BLOCK_RECORDS`, and a stale reset keeps rows below the new anchor.
+The `"history_floor"` row marks the lowest block of the contiguous suffix ending at the tip — reorg bisection trusts only that range, while rows below the floor (backfilled or pre-reset history) still serve number → hash lookups.
+The validator's `CANONICAL_CHAIN` stays bounded (inline pruning) and its reset semantics are unchanged.
 
 ### SALT Witness Cryptography
 
