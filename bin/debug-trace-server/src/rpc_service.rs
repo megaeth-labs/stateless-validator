@@ -314,10 +314,16 @@ async fn check_cache_by_number(
     method_name: &'static str,
     start: Instant,
 ) -> Option<serde_json::Value> {
-    let (cached_value, cached_hash) =
-        cache.as_ref()?.get_with_hash(resource, block_num, variant?.clone())?;
+    let cache = cache.as_ref()?;
+    let variant = variant?;
+    let Some((cached_value, cached_hash)) =
+        cache.get_with_hash(resource, block_num, variant.clone())
+    else {
+        cache.record_lookup_outcome(resource, false);
+        return None;
+    };
     match data_provider.is_canonical(block_num, cached_hash).await {
-        Some(true) => {}
+        Some(true) => cache.record_lookup_outcome(resource, true),
         Some(false) => {
             trace!(
                 method = method_name,
@@ -325,10 +331,14 @@ async fn check_cache_by_number(
                 cached_hash = %cached_hash,
                 "Cached entry belongs to a reorged block; invalidating"
             );
-            cache.as_ref()?.invalidate_blocks(&[cached_hash]);
+            cache.invalidate_blocks(&[cached_hash]);
+            cache.record_lookup_outcome(resource, false);
             return None;
         }
-        None => return None,
+        None => {
+            cache.record_lookup_outcome(resource, false);
+            return None;
+        }
     }
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -440,6 +450,10 @@ impl DebugTraceRpcServer for RpcContext {
             .start_request(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, format!("{block_number}"));
         let start = Instant::now();
         let opts = opts.unwrap_or_default();
+        metrics::record_request_shape(
+            METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+            ResponseVariant::shape_label(&opts),
+        );
 
         // Stage 1: Resolve block number
         let t0 = Instant::now();
@@ -536,6 +550,10 @@ impl DebugTraceRpcServer for RpcContext {
             self.watch_dog.start_request(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, format!("{block_hash}"));
         let start = Instant::now();
         let opts = opts.unwrap_or_default();
+        metrics::record_request_shape(
+            METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
+            ResponseVariant::shape_label(&opts),
+        );
 
         let variant = ResponseVariant::cacheable_from_geth_options(&opts);
 
@@ -592,6 +610,10 @@ impl DebugTraceRpcServer for RpcContext {
             self.watch_dog.start_request(METHOD_DEBUG_TRACE_TRANSACTION, format!("{tx_hash}"));
         let start = Instant::now();
         let opts = opts.unwrap_or_default();
+        metrics::record_request_shape(
+            METHOD_DEBUG_TRACE_TRANSACTION,
+            ResponseVariant::shape_label(&opts),
+        );
 
         let (data, tx_index) =
             self.data_provider.get_block_data_for_tx(tx_hash).await.map_err(|e| {
@@ -895,8 +917,9 @@ mod tests {
         );
         let contract_cache =
             Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
-        let db =
-            db_hash.map(|h| Arc::new(StaticHashStore(h)) as Arc<dyn crate::server_db::BlockStore>);
+        let db = db_hash.map(|h| {
+            Arc::new(StaticHashStore(h, Some(u64::MAX))) as Arc<dyn crate::server_db::BlockStore>
+        });
         Arc::new(DataProvider::new(
             rpc_client,
             db,
@@ -1003,19 +1026,26 @@ mod tests {
             Some(cache)
         };
 
-        // Canonical: served.
+        // Canonical: served and counted as a hit.
         let cache = fresh_cache();
         assert!(check(&cache, test_provider(Some(Some(h1)))).await.is_some());
+        let stats = cache.as_ref().unwrap().stats();
+        assert_eq!((stats.hits, stats.misses), (1, 0));
 
-        // Verified mismatch: miss + the dead entry is invalidated.
+        // Verified mismatch: miss + the dead entry is invalidated; the found-but-rejected
+        // entry must count as a miss, not a hit.
         let cache = fresh_cache();
         assert!(check(&cache, test_provider(Some(Some(h2)))).await.is_none());
         assert_eq!(cache.as_ref().unwrap().len(), 0, "reorged entry must be invalidated");
+        let stats = cache.as_ref().unwrap().stats();
+        assert_eq!((stats.hits, stats.misses), (0, 1));
 
         // Unverifiable (stateless, upstream down): miss, but nothing invalidated.
         let cache = fresh_cache();
         assert!(check(&cache, test_provider(None)).await.is_none());
         assert_eq!(cache.as_ref().unwrap().len(), 1, "unverifiable must not invalidate");
+        let stats = cache.as_ref().unwrap().stats();
+        assert_eq!((stats.hits, stats.misses), (0, 1));
     }
 
     #[test]

@@ -155,6 +155,38 @@ impl ResponseVariant {
 
         Some(Self::Tracer(tracer_type, config_hash))
     }
+
+    /// Coarse request-shape label for observability, classifying like
+    /// [`Self::cacheable_from_geth_options`]: which tracer the caller asked for, with each
+    /// non-cacheable shape kept distinct so its production frequency is measurable.
+    /// Every returned label is listed in [`crate::metrics::REQUEST_SHAPES`].
+    pub fn shape_label(opts: &GethDebugTracingOptions) -> &'static str {
+        use alloy_rpc_types_trace::geth::{GethDebugBuiltInTracerType, GethDebugTracerType};
+
+        match &opts.tracer {
+            None => {
+                if opts.tracer_config.is_null() &&
+                    opts.config == GethDefaultTracingOptions::default()
+                {
+                    "default"
+                } else {
+                    "struct_logger_config"
+                }
+            }
+            Some(GethDebugTracerType::BuiltInTracer(builtin)) => match builtin {
+                GethDebugBuiltInTracerType::CallTracer => "call_tracer",
+                GethDebugBuiltInTracerType::PreStateTracer => "prestate_tracer",
+                GethDebugBuiltInTracerType::FourByteTracer => "four_byte_tracer",
+                GethDebugBuiltInTracerType::NoopTracer => "noop_tracer",
+                GethDebugBuiltInTracerType::FlatCallTracer => "flat_call_tracer",
+                GethDebugBuiltInTracerType::MuxTracer => "mux_tracer",
+                // Reachable only if a future alloy version adds tracer variants.
+                #[allow(unreachable_patterns)]
+                _ => "unknown_tracer",
+            },
+            Some(GethDebugTracerType::JsTracer(_)) => "js_tracer",
+        }
+    }
 }
 
 /// Cache key: resource type + block number + response variant.
@@ -279,20 +311,23 @@ impl SecondaryIndices {
         allow_rekey: bool,
     ) -> IndexInsert {
         let mut inner = self.inner.write().unwrap();
-        let stale = match inner.number_to_hash.get(&block_number) {
+        let rekeyed = match inner.number_to_hash.get(&block_number) {
             Some(&old_hash) if old_hash != block_hash => {
                 if !allow_rekey {
                     return IndexInsert::Rejected;
                 }
                 inner.hash_to_number.remove(&old_hash);
-                inner.number_to_keys.remove(&block_number)
+                Some(inner.number_to_keys.remove(&block_number).unwrap_or_default())
             }
             _ => None,
         };
         inner.hash_to_number.insert(block_hash, block_number);
         inner.number_to_hash.insert(block_number, block_hash);
         inner.number_to_keys.entry(block_number).or_default().insert(key);
-        IndexInsert::Inserted(stale)
+        match rekeyed {
+            Some(stale) => IndexInsert::Rekeyed(stale),
+            None => IndexInsert::Inserted,
+        }
     }
 
     fn remove_block(&self, block_number: u64) -> Option<HashSet<ResponseCacheKey>> {
@@ -328,8 +363,11 @@ impl SecondaryIndices {
 
 /// Outcome of [`SecondaryIndices::insert`].
 enum IndexInsert {
-    /// Mapping and key recorded; on a canonical re-key, carries the dead block's keys.
-    Inserted(Option<HashSet<ResponseCacheKey>>),
+    /// Mapping and key recorded; the number had no conflicting mapping.
+    Inserted,
+    /// Mapping and key recorded after re-keying the number to a new hash; carries the dead
+    /// block's keys for eviction.
+    Rekeyed(HashSet<ResponseCacheKey>),
     /// The number is mapped to a different hash and re-keying was not allowed; nothing was
     /// recorded and the caller must not cache the response.
     Rejected,
@@ -446,6 +484,10 @@ impl ResponseCache {
 
     /// Retrieves a cached response by block number together with the hash it was cached
     /// under, so the caller can verify that hash is still canonical before serving the hit.
+    ///
+    /// Records no hit/miss accounting: the caller decides whether the entry may actually be
+    /// served and reports the outcome via [`Self::record_lookup_outcome`] — a
+    /// canonicality-rejected entry must count as a miss, not a hit.
     pub fn get_with_hash(
         &self,
         resource: CachedResource,
@@ -454,16 +496,20 @@ impl ResponseCache {
     ) -> Option<(serde_json::Value, B256)> {
         let block_hash = self.inner.indices.get_hash_by_number(block_number)?;
         let key = ResponseCacheKey::new(resource, block_number, variant);
-        let result = self.inner.cache.get(&key);
+        self.inner.cache.get(&key).map(|r| (r.as_value(), block_hash))
+    }
+
+    /// Records the outcome of a [`Self::get_with_hash`] lookup once the caller has decided
+    /// whether the entry may be served.
+    pub fn record_lookup_outcome(&self, resource: CachedResource, served: bool) {
         let metrics = self.metrics_for_resource(resource);
-        if result.is_some() {
+        if served {
             self.inner.hits.fetch_add(1, Ordering::Relaxed);
             metrics.record_hit();
         } else {
             self.inner.misses.fetch_add(1, Ordering::Relaxed);
             metrics.record_miss();
         }
-        result.map(|r| (r.as_value(), block_hash))
     }
 
     /// Retrieves a cached response by block hash.
@@ -507,7 +553,8 @@ impl ResponseCache {
 
         self.inner.cache.insert(key.clone(), cached);
         match self.inner.indices.insert(block_hash, block_number, key.clone(), true) {
-            IndexInsert::Inserted(stale) => self.evict_stale_keys(stale, &key),
+            IndexInsert::Inserted => {}
+            IndexInsert::Rekeyed(stale) => self.evict_stale_keys(stale, &key),
             IndexInsert::Rejected => unreachable!("canonical inserts may always re-key"),
         }
         self.update_size_metrics();
@@ -529,10 +576,19 @@ impl ResponseCache {
     ) {
         let key = ResponseCacheKey::new(resource, block_number, variant);
         match self.inner.indices.insert(block_hash, block_number, key.clone(), false) {
-            IndexInsert::Inserted(_) => {
-                self.inner.cache.insert(key, CachedResponse::new(response));
+            IndexInsert::Inserted => {
+                self.inner.cache.insert(key.clone(), CachedResponse::new(response));
+                // A concurrent canonical insert may have re-keyed the number between our
+                // index registration and this cache write, which would leave our value in
+                // the shared `(number, variant)` slot under the new hash's mapping.
+                // Re-checking the mapping afterwards closes that window; at worst the next
+                // request recomputes.
+                if self.inner.indices.get_hash_by_number(block_number) != Some(block_hash) {
+                    self.inner.cache.remove(&key);
+                }
                 self.update_size_metrics();
             }
+            IndexInsert::Rekeyed(_) => unreachable!("by-hash inserts never re-key"),
             IndexInsert::Rejected => {
                 debug!(
                     block_number,
@@ -582,7 +638,8 @@ impl ResponseCache {
                 let _ = guard.insert(cached);
 
                 match self.inner.indices.insert(block_hash, block_number, key.clone(), true) {
-                    IndexInsert::Inserted(stale) => self.evict_stale_keys(stale, &key),
+                    IndexInsert::Inserted => {}
+                    IndexInsert::Rekeyed(stale) => self.evict_stale_keys(stale, &key),
                     IndexInsert::Rejected => unreachable!("canonical inserts may always re-key"),
                 }
                 self.update_size_metrics();
@@ -608,8 +665,7 @@ impl ResponseCache {
     /// response. Keys re-registered in the index since the purge (a concurrent insert for the
     /// new hash) are also skipped so their fresh values survive; the unguarded window between
     /// that insert's cache write and index write remains, costing at worst one recomputation.
-    fn evict_stale_keys(&self, stale: Option<HashSet<ResponseCacheKey>>, keep: &ResponseCacheKey) {
-        let Some(stale) = stale else { return };
+    fn evict_stale_keys(&self, stale: HashSet<ResponseCacheKey>, keep: &ResponseCacheKey) {
         let mut evicted = 0usize;
         for key in stale {
             if &key != keep && !self.inner.indices.contains_key(&key) {
@@ -834,6 +890,50 @@ mod tests {
         .collect();
         let unique: HashSet<_> = variants.iter().cloned().collect();
         assert_eq!(unique.len(), variants.len());
+    }
+
+    /// Every shape label is registered for metrics, and "cacheable" is exactly the
+    /// complement of the four bypass shapes — the observability classification and the
+    /// whitelist must never drift apart.
+    #[test]
+    fn shape_label_matches_cacheability() {
+        let bypass = ["struct_logger_config", "js_tracer", "mux_tracer", "unknown_tracer"];
+        let cases = [
+            GethDebugTracingOptions::default(),
+            builtin_opts(GethDebugBuiltInTracerType::CallTracer),
+            builtin_opts(GethDebugBuiltInTracerType::PreStateTracer),
+            builtin_opts(GethDebugBuiltInTracerType::FourByteTracer),
+            builtin_opts(GethDebugBuiltInTracerType::NoopTracer),
+            builtin_opts(GethDebugBuiltInTracerType::FlatCallTracer),
+            builtin_opts(GethDebugBuiltInTracerType::MuxTracer),
+            GethDebugTracingOptions {
+                tracer: Some(GethDebugTracerType::JsTracer("{}".to_string())),
+                ..Default::default()
+            },
+            GethDebugTracingOptions {
+                config: GethDefaultTracingOptions {
+                    disable_storage: Some(true),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ];
+
+        let mut seen = HashSet::new();
+        for opts in &cases {
+            let shape = ResponseVariant::shape_label(opts);
+            seen.insert(shape);
+            assert!(
+                crate::metrics::REQUEST_SHAPES.contains(&shape),
+                "shape {shape} must be pre-registered"
+            );
+            assert_eq!(
+                ResponseVariant::cacheable_from_geth_options(opts).is_some(),
+                !bypass.contains(&shape),
+                "cacheability must match the shape classification for {shape}"
+            );
+        }
+        assert_eq!(seen.len(), cases.len(), "every case must map to a distinct label");
     }
 
     /// A by-hash insert must not redefine the number's canonical mapping: caching an

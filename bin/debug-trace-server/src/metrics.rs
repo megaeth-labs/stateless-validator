@@ -278,6 +278,30 @@ fn record_upstream_deadline_exceeded(method: &'static str) {
     counter!(UPSTREAM_DEADLINE_EXCEEDED_TOTAL, "method" => method).increment(1);
 }
 
+/// Request parameter-shape counter, labeled `(method, shape)` — the first-hand answer to
+/// "which tracer shapes does production actually send", and how often the non-cacheable
+/// shapes bypass the response cache.
+const REQUEST_SHAPE_TOTAL: &str = "debug_trace_request_shape_total";
+
+/// Every label emitted by `ResponseVariant::shape_label`, for pre-registration and tests.
+pub const REQUEST_SHAPES: &[&str] = &[
+    "default",
+    "call_tracer",
+    "prestate_tracer",
+    "four_byte_tracer",
+    "noop_tracer",
+    "flat_call_tracer",
+    "struct_logger_config",
+    "js_tracer",
+    "mux_tracer",
+    "unknown_tracer",
+];
+
+/// Records one request of the given parameter shape for `method`.
+pub fn record_request_shape(method: &'static str, shape: &'static str) {
+    counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => shape).increment(1);
+}
+
 /// Witness fetch metrics by source.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
@@ -439,6 +463,17 @@ fn pre_register_all_metrics() {
         ["eth_getHeaderByHash", "eth_getBlockByHash", "mega_getWitness", "eth_getCodeByHash"]
     {
         counter!(UPSTREAM_DEADLINE_EXCEEDED_TOTAL, "method" => method).increment(0);
+    }
+
+    // Request Layer: parameter shapes (per opts-taking method)
+    for method in [
+        METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+        METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
+        METHOD_DEBUG_TRACE_TRANSACTION,
+    ] {
+        for shape in REQUEST_SHAPES {
+            counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => *shape).increment(0);
+        }
     }
 
     // Witness Layer

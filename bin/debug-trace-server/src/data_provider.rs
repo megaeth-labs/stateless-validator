@@ -322,18 +322,30 @@ impl DataProvider {
     /// response-cache hits.
     ///
     /// `Some(true)` = canonical: the local DB agrees, or the number is below the DB's
-    /// retention window, where chain-sync reorg handling would have invalidated any
-    /// re-keyed entry long before it was pruned. `Some(false)` = verified mismatch (the
-    /// cached entry belongs to a dead block). `None` = unverifiable (treat as a cache miss,
-    /// but do not invalidate). Stateless mode has no local chain at all, so the check goes
-    /// upstream with a short deadline — still far cheaper than replaying the block.
+    /// retained range, where chain-sync reorg handling covered the height before it was
+    /// pruned. `Some(false)` = verified mismatch (the cached entry belongs to a dead
+    /// block). `None` = unverifiable (treat as a cache miss, but do not invalidate).
+    ///
+    /// A number missing from the DB is depth-final only *below* the local sync tip; a
+    /// height *above* it was served via RPC before chain sync reached it, so it is checked
+    /// upstream — as is everything in stateless mode, where no local chain exists at all.
+    /// The upstream check runs on a short deadline, still far cheaper than replaying.
     pub async fn is_canonical(&self, number: u64, hash: B256) -> Option<bool> {
         if let Some(db) = &self.db {
-            return match db.get_block_hash(number) {
-                Ok(Some(canonical)) => Some(canonical == hash),
-                Ok(None) => Some(true),
-                Err(_) => None,
-            };
+            match db.get_block_hash(number) {
+                Ok(Some(canonical)) => return Some(canonical == hash),
+                Ok(None) => {
+                    let above_tip = match db.get_canonical_tip() {
+                        Ok(Some(tip)) => number > tip.block_number,
+                        Ok(None) => true,
+                        Err(_) => return None,
+                    };
+                    if !above_tip {
+                        return Some(true);
+                    }
+                }
+                Err(_) => return None,
+            }
         }
         let deadline = Instant::now() + Duration::from_secs(CANONICAL_CHECK_TIMEOUT_SECS);
         match self.rpc_client.get_block_hash_with_deadline(number, Some(deadline)).await {
@@ -940,9 +952,9 @@ impl ContractStore for NoopContractStore {
 pub(crate) mod test_support {
     use super::*;
 
-    /// [`BlockStore`] stub whose canonical index answers `get_block_hash` with a fixed value;
-    /// everything else is empty.
-    pub(crate) struct StaticHashStore(pub Option<B256>);
+    /// [`BlockStore`] stub whose canonical index answers `get_block_hash` with a fixed value
+    /// and reports a fixed sync tip; everything else is empty.
+    pub(crate) struct StaticHashStore(pub Option<B256>, pub Option<u64>);
 
     impl ContractStore for StaticHashStore {
         fn get_contracts(&self, _: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
@@ -955,7 +967,12 @@ pub(crate) mod test_support {
 
     impl stateless_core::ChainStore for StaticHashStore {
         fn get_canonical_tip(&self) -> StoreResult<Option<stateless_core::db::BlockMeta>> {
-            Ok(None)
+            Ok(self.1.map(|block_number| stateless_core::db::BlockMeta {
+                block_number,
+                block_hash: self.0.unwrap_or_default(),
+                post_state_root: B256::ZERO,
+                post_withdrawals_root: B256::ZERO,
+            }))
         }
         fn get_anchor(&self) -> StoreResult<Option<stateless_core::db::BlockMeta>> {
             Ok(None)
@@ -1097,8 +1114,9 @@ mod tests {
         (rpc_client, cfg)
     }
 
-    /// Provider over a hanging upstream with an optional DB canonical index.
-    fn canonical_fixture(db_hash: Option<Option<B256>>) -> DataProvider {
+    /// Provider over a hanging upstream with an optional DB canonical index, given as
+    /// `(canonical hash answer, sync tip)`.
+    fn canonical_fixture(db: Option<(Option<B256>, Option<u64>)>) -> DataProvider {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
         // Leak the listener so the port stays bound (and hanging) for the provider's lifetime.
@@ -1109,8 +1127,9 @@ mod tests {
         );
         let contract_cache =
             Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
-        let db = db_hash
-            .map(|h| Arc::new(super::test_support::StaticHashStore(h)) as Arc<dyn BlockStore>);
+        let db = db.map(|(hash, tip)| {
+            Arc::new(super::test_support::StaticHashStore(hash, tip)) as Arc<dyn BlockStore>
+        });
         DataProvider::new(
             rpc_client,
             db,
@@ -1121,23 +1140,31 @@ mod tests {
     }
 
     /// DB mode: a matching canonical index verifies the hit, a differing one is a verified
-    /// mismatch, and a pruned (below-retention) number is trusted by depth.
+    /// mismatch, and a number missing below the sync tip (pruned range) is trusted by depth.
     #[tokio::test]
     async fn is_canonical_uses_db_index_and_depth() {
         let h1 = B256::from([1u8; 32]);
         let h2 = B256::from([2u8; 32]);
+        let tip = Some(u64::MAX);
 
-        assert_eq!(canonical_fixture(Some(Some(h1))).is_canonical(7, h1).await, Some(true));
-        assert_eq!(canonical_fixture(Some(Some(h2))).is_canonical(7, h1).await, Some(false));
-        assert_eq!(canonical_fixture(Some(None)).is_canonical(7, h1).await, Some(true));
+        assert_eq!(canonical_fixture(Some((Some(h1), tip))).is_canonical(7, h1).await, Some(true));
+        assert_eq!(canonical_fixture(Some((Some(h2), tip))).is_canonical(7, h1).await, Some(false));
+        assert_eq!(canonical_fixture(Some((None, tip))).is_canonical(7, h1).await, Some(true));
     }
 
-    /// Stateless mode with an unreachable upstream: the check is unverifiable — the caller
-    /// must treat the hit as a miss without invalidating anything.
+    /// Heights the local DB cannot vouch for must be verified upstream: stateless mode
+    /// always, and DB mode for numbers above the sync tip (served via RPC before chain sync
+    /// reached them, so not depth-final). With the upstream unreachable both are
+    /// unverifiable — the caller treats the hit as a miss without invalidating.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn is_canonical_unverifiable_without_chain_source() {
-        let provider = canonical_fixture(None);
-        assert_eq!(provider.is_canonical(7, B256::from([1u8; 32])).await, None);
+        let h = B256::from([1u8; 32]);
+        assert_eq!(canonical_fixture(None).is_canonical(7, h).await, None);
+        assert_eq!(
+            canonical_fixture(Some((None, Some(3)))).is_canonical(7, h).await,
+            None,
+            "a miss above the sync tip must not be trusted by depth"
+        );
     }
 
     /// End-to-end routing dispatch through `fetch_witness`: a historical block must never
