@@ -39,6 +39,13 @@ pub const WITNESSES: TableDefinition<[u8; 32], Vec<u8>> = TableDefinition::new("
 pub const BLOCK_RECORDS: TableDefinition<(u64, [u8; 32]), ()> =
     TableDefinition::new("block_records");
 
+/// Permanent canonical-hash archive for heights that have left the bounded
+/// CANONICAL_CHAIN window. Maps BlockNumber → BlockHash. Fed by pruning / stale resets
+/// (locally verified rows) and by the lazy write-back of upstream-resolved hashes; read
+/// only by canonical-hash resolution, never by reorg bisection.
+/// Used by `ServerDB` only.
+pub const HASH_ARCHIVE: TableDefinition<u64, [u8; 32]> = TableDefinition::new("hash_archive");
+
 /// Default maximum number of entries to retain in CANONICAL_CHAIN.
 pub const DEFAULT_MAX_CHAIN_LENGTH: u64 = 1000;
 

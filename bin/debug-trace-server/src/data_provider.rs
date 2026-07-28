@@ -42,9 +42,7 @@ use op_alloy_rpc_types::Transaction;
 use revm::state::Bytecode;
 use stateless_common::{CodeFetchError, RpcClient, RpcDeadlineExceeded, WitnessSizeBreakdown};
 use stateless_core::{
-    ContractStore, LightWitness, StoreResult,
-    db::{BlockMeta, StoreError},
-    withdrawals::MptWitness,
+    ContractStore, LightWitness, StoreResult, db::StoreError, withdrawals::MptWitness,
 };
 use stateless_db::ContractCache;
 use tracing::{debug, instrument, trace, warn};
@@ -334,16 +332,16 @@ impl DataProvider {
     /// cache: the number → hash binding is resolved *before* the cache lookup, so a reorged
     /// height resolves to the new hash and misses cleanly instead of serving a dead block.
     ///
-    /// Lookup order: the local canonical index first (local-cache mode), then upstream
-    /// `eth_getHeaderByNumber` on the shared `deadline`. A DB read error is logged and falls
-    /// through to upstream rather than failing the request.
+    /// Lookup order: the bounded canonical window, then the permanent hash archive
+    /// (pruned/reset local history plus earlier write-backs), then upstream
+    /// `eth_getHeaderByNumber` on the shared `deadline`. A DB read error is logged and
+    /// falls through to the next tier rather than failing the request.
     ///
     /// **Lazy write-back**: an upstream-resolved header (fetched with `verify_hash = true`,
-    /// so its hash provably matches its content) is written back into the local canonical
-    /// index — strictly below the history floor, where it cannot disturb the bisection
-    /// range or the tip cursor — so the next by-number request for this height resolves
-    /// locally. The index thereby grows organically with the traffic instead of needing a
-    /// bulk backfill.
+    /// so its hash provably matches its content) is archived — only when strictly below
+    /// the canonical window, where the height is depth-final — so the next by-number
+    /// request for it resolves locally. The archive thereby grows organically with the
+    /// traffic (and with pruning, which archives locally verified rows for free).
     pub(crate) async fn resolve_canonical_hash(
         &self,
         block_num: u64,
@@ -361,7 +359,22 @@ impl DataProvider {
                     warn!(
                         block_number = block_num,
                         error = %e,
-                        "Local canonical index read failed; resolving hash upstream",
+                        "Canonical window read failed; trying the hash archive",
+                    );
+                }
+            }
+            match db.get_archived_hash(block_num) {
+                Ok(Some(hash)) => {
+                    record_canonical_hash_resolution("archive", "ok");
+                    return Ok(hash);
+                }
+                Ok(None) => record_canonical_hash_resolution("archive", "miss"),
+                Err(e) => {
+                    record_canonical_hash_resolution("archive", "error");
+                    warn!(
+                        block_number = block_num,
+                        error = %e,
+                        "Hash archive read failed; resolving hash upstream",
                     );
                 }
             }
@@ -385,19 +398,13 @@ impl DataProvider {
             }
         };
         if let Some(db) = &self.db {
-            let meta = BlockMeta {
-                block_number: header.number,
-                block_hash: header.hash,
-                post_state_root: header.state_root,
-                post_withdrawals_root: header.withdrawals_root.unwrap_or_default(),
-            };
             // Best-effort: the request already has its answer; a failed write-back only
             // costs the next request another upstream round trip.
-            if let Err(e) = db.record_canonical_hash(&meta) {
+            if let Err(e) = db.record_canonical_hash(header.number, header.hash) {
                 warn!(
                     block_number = block_num,
                     error = %e,
-                    "Failed to write back resolved canonical hash",
+                    "Failed to archive resolved canonical hash",
                 );
             }
         }
@@ -1076,7 +1083,10 @@ pub(crate) mod test_support {
         fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
             Ok(())
         }
-        fn record_canonical_hash(&self, _: &stateless_core::db::BlockMeta) -> StoreResult<()> {
+        fn get_archived_hash(&self, _: u64) -> StoreResult<Option<B256>> {
+            Ok(None)
+        }
+        fn record_canonical_hash(&self, _: u64, _: B256) -> StoreResult<()> {
             Ok(())
         }
         fn get_block_and_witness(
@@ -1249,7 +1259,7 @@ mod tests {
     }
 
     /// Local-cache mode with the number missing from the DB index (above the sync frontier,
-    /// or historical below the floor): resolution falls back to the upstream fetch.
+    /// or historical below the window): resolution falls back to the upstream fetch.
     #[tokio::test]
     async fn resolve_canonical_hash_db_miss_falls_back_upstream() {
         let (handle, url) = test_support::start_mock_rpc().await;
@@ -1263,12 +1273,13 @@ mod tests {
         handle.stop().unwrap();
     }
 
-    /// The lazy write-back: an upstream-resolved hash for a height below the floor lands
-    /// in the local index (floor untouched), so the next resolution needs no upstream at
-    /// all — pinned by stopping the mock server before the second resolve.
+    /// The lazy write-back: an upstream-resolved hash for a height below the canonical
+    /// window lands in the hash archive (the window itself untouched), so the next
+    /// resolution needs no upstream at all — pinned by stopping the mock server before
+    /// the second resolve.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resolve_canonical_hash_writes_back_below_floor() {
-        use stateless_core::{ChainStore, DivergenceLookups};
+    async fn resolve_canonical_hash_archives_upstream_answer() {
+        use stateless_core::{ChainStore, DivergenceLookups, db::BlockMeta};
 
         let (handle, url) = test_support::start_mock_rpc().await;
         let dir = tempfile::tempdir().unwrap();
@@ -1280,7 +1291,7 @@ mod tests {
             post_state_root: B256::ZERO,
             post_withdrawals_root: B256::ZERO,
         };
-        // The anchor-init path: the preserving reset installs the history floor.
+        // The anchor-init path installs the canonical window at {100}.
         ChainStore::reset_to_anchor(&*server_db, &tip).unwrap();
 
         let provider = provider_with(&url, Some(Arc::clone(&server_db) as Arc<dyn BlockStore>));
@@ -1288,17 +1299,18 @@ mod tests {
         let resolved = provider.resolve_canonical_hash(42, deadline).await.unwrap();
         assert_eq!(resolved, test_support::consistent_header(42).hash);
         assert_eq!(
-            ChainStore::get_block_hash(&*server_db, 42).unwrap(),
+            server_db.get_archived_hash(42).unwrap(),
             Some(resolved),
-            "resolved hash must be written back into the index"
+            "resolved hash must be archived"
         );
         assert_eq!(
-            DivergenceLookups::get_earliest(&*server_db).unwrap().unwrap().0,
-            100,
-            "written-back rows are island history and must not move the floor"
+            ChainStore::get_block_hash(&*server_db, 42).unwrap(),
+            None,
+            "the canonical window must not be touched by a write-back"
         );
+        assert_eq!(DivergenceLookups::get_earliest(&*server_db).unwrap().unwrap().0, 100);
 
-        // With the upstream gone, the height must now resolve locally.
+        // With the upstream gone, the height must now resolve from the archive.
         handle.stop().unwrap();
         let deadline = Instant::now() + Duration::from_millis(300);
         assert_eq!(provider.resolve_canonical_hash(42, deadline).await.unwrap(), resolved);

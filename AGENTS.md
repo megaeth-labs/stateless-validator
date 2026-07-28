@@ -67,8 +67,9 @@ The shared persistence layer — table definitions, read/write helpers, serializ
 Scenario-specific storage lives in the owning binary rather than in core: genesis persistence is inherent on `ValidatorDB`, and block/witness storage with history pruning sits behind a bin-local `BlockStore` trait in the trace server.
 The pipeline owns the reorg seams: `DivergenceLookups` (the bisection contract) and `ReorgResolver` (which decides the rollback floor) live in `stateless-core::pipeline`.
 
-- **`ANCHOR_BLOCK`** — Trusted starting point (block number, hash, state root, withdrawals root); in the trace server also the `"history_floor"` row marking the lowest block of the contiguous chain suffix (reorg bisection trusts only that range).
-- **`CANONICAL_CHAIN`** — Validated chain progression (block number → hash, state root, withdrawals root). Bounded in the validator; permanent in the trace server (pruning skips it, stale resets preserve rows below the anchor, and upstream-resolved hashes are lazily written back below the floor).
+- **`ANCHOR_BLOCK`** — Trusted starting point (block number, hash, state root, withdrawals root).
+- **`CANONICAL_CHAIN`** — Validated chain progression (block number → hash, state root, withdrawals root); a bounded contiguous window in both binaries, and exactly what reorg bisection trusts.
+- **`HASH_ARCHIVE`** — Trace server only: permanent block number → hash for heights that left the sync window (pruned/reset rows plus lazily written-back upstream resolutions); read by canonical-hash resolution, never by bisection.
 - **`CONTRACTS`** — Persistent tier of the contract bytecode cache (code hash → bincode+lz4 bytecode). The in-memory tier is the bounded `ContractCache` on top.
 - **`GENESIS_CONFIG`** — Hardfork activation rules (validator only).
 - **`BLOCK_DATA`** — Full block content (trace server only).
@@ -109,7 +110,7 @@ Two operating modes:
 The server includes an HTTP response cache (`quick_cache`) for pre-serialized JSON and a `DataProvider` with single-flight request coalescing.
 The response cache is keyed by `(resource, block hash, typed tracer variant)`; by-number handlers resolve number → canonical hash before the lookup (local `CANONICAL_CHAIN` first, upstream fallback).
 It only stores idempotent request shapes: the five built-in tracers (keyed by their parsed typed `tracerConfig`) and the bare default struct-logger request; JS tracers, `muxTracer`, and struct-logger requests with non-default flags bypass it entirely, and a type-malformed `tracerConfig` on call/prestate/flatCall is rejected with `-32602`.
-In local cache mode the trace server's `CANONICAL_CHAIN` is permanent (pruning removes only bodies/witnesses; stale resets preserve history below the new anchor), with a persisted history floor marking the contiguous suffix used for reorg bisection; upstream-resolved hashes are lazily written back below the floor so the index grows with the traffic.
+In local cache mode, canonical-hash resolution reads the bounded `CANONICAL_CHAIN` window first, then the permanent `HASH_ARCHIVE` (fed by pruning/stale resets moving outgoing rows over, plus the lazy write-back of upstream-resolved hashes for heights below the window), and only then upstream — so historical heights resolve locally after first touch.
 In local cache mode with a `--witness-generator-endpoint` plus at least one fallback `--witness-endpoint`, request-serving witness fetches route by block age: blocks at least `--witness-local-window` blocks below the local tip skip the generator (which prunes beyond its `BACKUP` window) and fetch from the fallbacks; without the generator flag, witness endpoints are plain failover and routing is disabled.
 The background chain-sync prefetch always uses the full endpoint chain — it fetches at the sync frontier, which stays within the generator's retention unless `--blocks-to-keep` exceeds that retention during deep catch-up.
 

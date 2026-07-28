@@ -19,11 +19,11 @@ use stateless_core::{
     },
 };
 use stateless_db::{
-    ANCHOR_BLOCK, BLOCK_DATA, BLOCK_RECORDS, CANONICAL_CHAIN, CONTRACTS, Database, WITNESSES,
-    decode_block_from_slice, decode_from_slice, encode_block_to_vec, encode_to_vec, read_anchor,
-    read_block_hash, read_canonical_tip, read_contracts, read_history_floor, write_add_contracts,
-    write_advance_chain, write_canonical_hash_below_floor, write_ensure_history_floor,
-    write_reset_to_anchor_preserving_history, write_rollback_chain,
+    ANCHOR_BLOCK, BLOCK_DATA, BLOCK_RECORDS, CANONICAL_CHAIN, CONTRACTS, Database, HASH_ARCHIVE,
+    WITNESSES, decode_block_from_slice, decode_from_slice, encode_block_to_vec, encode_to_vec,
+    read_anchor, read_archived_hash, read_block_hash, read_canonical_tip, read_contracts,
+    read_earliest_block, write_add_contracts, write_advance_chain,
+    write_archived_hash_below_window, write_reset_to_anchor_archiving, write_rollback_chain,
 };
 
 /// Block/witness storage + history pruning — **debug-trace-server-only**. This capability is
@@ -41,11 +41,20 @@ pub trait BlockStore: ChainStore + DivergenceLookups {
         &self,
         block_hash: BlockHash,
     ) -> StoreResult<(Block<Transaction>, LightWitness)>;
-    /// Persists an upstream-resolved canonical row, strictly below the history floor —
-    /// the lazy write-back that makes the next by-number request for this height resolve
-    /// locally. A row at or above the floor is skipped silently: that range is owned by
-    /// chain sync (and is what reorg bisection trusts).
-    fn record_canonical_hash(&self, meta: &BlockMeta) -> StoreResult<()>;
+    /// Canonical hash from the HASH_ARCHIVE — heights that have left the bounded
+    /// CANONICAL_CHAIN window (pruned/reset locally verified rows, plus lazily
+    /// written-back upstream resolutions). Consulted by canonical-hash resolution after
+    /// the window misses; never by reorg bisection.
+    fn get_archived_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>>;
+    /// Archives an upstream-resolved canonical hash — the lazy write-back that makes the
+    /// next by-number request for this height resolve locally. Heights at or above the
+    /// canonical window's start are skipped silently: they are not depth-final yet, and
+    /// the window itself answers them.
+    fn record_canonical_hash(
+        &self,
+        block_number: BlockNumber,
+        block_hash: BlockHash,
+    ) -> StoreResult<()>;
 }
 
 /// Block storage and chain tracking database for debug-trace-server.
@@ -66,14 +75,9 @@ impl ServerDB {
             let _block_records = write_txn.open_table(BLOCK_RECORDS).store_err()?;
             let _contracts = write_txn.open_table(CONTRACTS).store_err()?;
             let _anchor_block = write_txn.open_table(ANCHOR_BLOCK).store_err()?;
+            let _hash_archive = write_txn.open_table(HASH_ARCHIVE).store_err()?;
         }
         write_txn.commit().store_err()?;
-
-        // Open-time invariant, not a caller ritual: legacy databases (created before floor
-        // tracking) get their floor row materialized before any lazy write-back can run —
-        // written-back rows must stay out of the reorg-bisection range, which starts at
-        // the floor. Fresh databases are a no-op (the anchor reset installs the floor).
-        let _ = write_ensure_history_floor(&database)?;
 
         Ok(Self { database })
     }
@@ -125,19 +129,24 @@ impl ServerDB {
         }))
     }
 
-    /// Cleans up old block bodies to save storage space.
+    /// Cleans up old block data to save storage space.
     ///
-    /// Removes BLOCK_RECORDS + BLOCK_DATA + WITNESSES rows strictly below `before_block`;
-    /// the returned count is the number of BLOCK_RECORDS entries removed. CANONICAL_CHAIN
-    /// is deliberately untouched: the number -> hash index is a permanent record backing
-    /// canonical-hash resolution for the response cache, and its rows are two orders of
-    /// magnitude smaller than the bodies this prune exists to reclaim.
+    /// Removes BLOCK_RECORDS + BLOCK_DATA + WITNESSES + CANONICAL_CHAIN rows strictly
+    /// below `before_block`, moving each outgoing chain row's `(number, hash)` into
+    /// HASH_ARCHIVE first (same transaction) — the locally verified number -> hash history
+    /// keeps serving canonical-hash resolution at ~40 bytes per block after the bodies are
+    /// reclaimed. The returned count is the number of BLOCK_RECORDS entries removed; a
+    /// second pass also archives-and-removes orphaned CANONICAL_CHAIN entries below
+    /// `before_block` that had no matching BLOCK_RECORDS row (advanced but never stored),
+    /// which are NOT reflected in the count.
     pub fn prune_history(&self, before_block: BlockNumber) -> StoreResult<u64> {
         // Single write txn: scan + delete under one snapshot so a concurrently-committed
         // row below `before_block` can't slip past the scan and leak as an orphan.
         // Same pattern as `write_rollback_chain` in stateless-db's helpers.
         let write_txn = self.database.begin_write().store_err()?;
         let pruned_count = {
+            let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
+            let mut archive = write_txn.open_table(HASH_ARCHIVE).store_err()?;
             let mut block_records = write_txn.open_table(BLOCK_RECORDS).store_err()?;
             let mut block_data = write_txn.open_table(BLOCK_DATA).store_err()?;
             let mut witnesses = write_txn.open_table(WITNESSES).store_err()?;
@@ -151,9 +160,28 @@ impl ServerDB {
             let pruned_count = keys_to_remove.len() as u64;
 
             for (block_number, block_hash) in keys_to_remove {
+                archive.insert(block_number, block_hash).store_err()?;
+                canonical_chain.remove(block_number).store_err()?;
                 block_records.remove((block_number, block_hash)).store_err()?;
                 block_data.remove(block_hash).store_err()?;
                 witnesses.remove(block_hash).store_err()?;
+            }
+
+            // Archive + remove orphaned CANONICAL_CHAIN entries not tracked in
+            // BLOCK_RECORDS, so the chain window stays contiguous-from-its-first-row.
+            loop {
+                let (block_number, block_hash) = match canonical_chain.first().store_err()? {
+                    Some((k, v)) => {
+                        let n = k.value();
+                        if n >= before_block {
+                            break;
+                        }
+                        (n, v.value().0)
+                    }
+                    None => break,
+                };
+                archive.insert(block_number, block_hash).store_err()?;
+                canonical_chain.remove(block_number).store_err()?;
             }
 
             pruned_count
@@ -255,9 +283,9 @@ impl ChainStore for ServerDB {
     }
 
     fn reset_to_anchor(&self, anchor: &BlockMeta) -> StoreResult<()> {
-        // History-preserving variant: a stale reset must not erase the permanent canonical
-        // index — rows below the anchor stay serviceable for number -> hash resolution.
-        write_reset_to_anchor_preserving_history(&self.database, anchor)
+        // Archiving variant: the locally verified rows move into HASH_ARCHIVE before the
+        // wipe, staying serviceable for number -> hash resolution.
+        write_reset_to_anchor_archiving(&self.database, anchor)
     }
 }
 
@@ -268,10 +296,11 @@ impl DivergenceLookups for ServerDB {
     }
 
     fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
-        // The floor, not `chain.first()`: divergence bisection requires a hole-free range
-        // up to the tip, and rows below the floor (written-back history, pre-reset islands)
-        // don't guarantee that.
-        read_history_floor(&self.database)
+        // The bounded chain window is contiguous by construction (append at tip, prune
+        // from below, archive-and-wipe on reset), so its first row is exactly the
+        // hole-free lower bound divergence bisection requires. HASH_ARCHIVE rows are
+        // deliberately invisible here.
+        read_earliest_block(&self.database)
     }
 }
 
@@ -287,10 +316,18 @@ impl BlockStore for ServerDB {
         ServerDB::get_block_and_witness(self, block_hash)
     }
 
-    fn record_canonical_hash(&self, meta: &BlockMeta) -> StoreResult<()> {
-        // Floor gate, TOCTOU safety, and durability choice live in the shared helper —
-        // see `write_canonical_hash_below_floor`.
-        write_canonical_hash_below_floor(&self.database, meta)
+    fn get_archived_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>> {
+        read_archived_hash(&self.database, block_number)
+    }
+
+    fn record_canonical_hash(
+        &self,
+        block_number: BlockNumber,
+        block_hash: BlockHash,
+    ) -> StoreResult<()> {
+        // Depth gate, TOCTOU safety, and durability choice live in the shared helper —
+        // see `write_archived_hash_below_window`.
+        write_archived_hash_below_window(&self.database, block_number, block_hash)
     }
 }
 
@@ -404,16 +441,17 @@ mod tests {
         let tip = ChainStore::get_canonical_tip(&db).unwrap().unwrap();
         assert_eq!(tip, anchor);
 
-        // The reset preserves history: the row below the anchor survives as an island,
-        // while the floor (`get_earliest`) moves up to the anchor.
-        assert_eq!(ChainStore::get_block_hash(&db, 10).unwrap(), Some(blocks[0].block_hash));
+        // The archiving reset: the old row leaves the chain window (so `get_earliest`
+        // is the anchor) but stays resolvable via the archive.
+        assert_eq!(ChainStore::get_block_hash(&db, 10).unwrap(), None);
+        assert_eq!(db.get_archived_hash(10).unwrap(), Some(blocks[0].block_hash));
         assert_eq!(DivergenceLookups::get_earliest(&db).unwrap(), Some((50, anchor.block_hash)));
     }
 
-    /// `prune_history` never touches the canonical index: rows inserted via
-    /// `advance_chain` (with no stored bodies) survive a prune untouched.
+    /// Orphaned chain rows (advanced but never stored as bodies) below the cutoff are
+    /// archived and removed even though the counted record-prune is 0.
     #[test]
-    fn test_server_db_prune_history_retains_canonical_index() {
+    fn test_server_db_prune_history_archives_orphans() {
         let (_dir, db) = temp_server_db();
 
         let blocks: Vec<BlockMeta> = (1..=5).map(make_block_meta).collect();
@@ -422,11 +460,16 @@ mod tests {
         let pruned = db.prune_history(3).unwrap();
         assert_eq!(pruned, 0, "no block records existed, so nothing counts as pruned");
 
-        for n in 1..=5 {
-            assert!(
-                ChainStore::get_block_hash(&db, n).unwrap().is_some(),
-                "canonical row {n} must survive pruning"
+        for n in 1..=2u64 {
+            assert_eq!(ChainStore::get_block_hash(&db, n).unwrap(), None);
+            assert_eq!(
+                db.get_archived_hash(n).unwrap(),
+                Some(make_block_meta(n).block_hash),
+                "orphan row {n} must be archived"
             );
+        }
+        for n in 3..=5 {
+            assert!(ChainStore::get_block_hash(&db, n).unwrap().is_some());
         }
     }
 
@@ -449,16 +492,22 @@ mod tests {
         let pruned = db.prune_history(6).unwrap();
         assert_eq!(pruned, 5);
 
-        // Bodies below 6 are gone; the canonical index keeps every row.
+        // Bodies and chain rows below 6 are gone; their number -> hash moved to the
+        // archive; the remaining window stays contiguous from 6.
         for n in 1..=5u64 {
             assert!(db.get_block_and_witness(BlockHash::from([n as u8; 32])).is_err());
+            assert_eq!(ChainStore::get_block_hash(&db, n).unwrap(), None);
+            assert_eq!(
+                db.get_archived_hash(n).unwrap(),
+                Some(make_block_meta(n).block_hash),
+                "pruned row {n} must be archived"
+            );
         }
         for n in 6..=10u64 {
             assert!(db.get_block_and_witness(BlockHash::from([n as u8; 32])).is_ok());
-        }
-        for n in 1..=10 {
             assert!(ChainStore::get_block_hash(&db, n).unwrap().is_some());
         }
+        assert_eq!(DivergenceLookups::get_earliest(&db).unwrap().unwrap().0, 6);
         assert_eq!(db.get_earliest_block_record().unwrap(), Some(6));
     }
 
@@ -555,85 +604,34 @@ mod tests {
         assert!(ChainStore::get_block_hash(&db, 5).unwrap().is_none());
     }
 
-    /// Opening a legacy database (chain rows but no floor row) materializes the floor as
-    /// an open-time invariant of `ServerDB::new` — and the persisted row then wins over
-    /// rows that later appear below it.
+    /// The lazy write-back archives only heights strictly below the canonical window:
+    /// in-window and above-tip heights (and writes on an empty chain) are skipped
+    /// silently, and the chain window itself is never mutated by a write-back.
     #[test]
-    fn reopen_materializes_history_floor() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("server.redb");
-        {
-            // Simulates a pre-floor database: rows exist, no floor row was ever written
-            // (advance_chain alone never writes one; the fresh-DB open found no rows).
-            let db = ServerDB::new(&path).unwrap();
-            ChainStore::advance_chain(&db, &(8..=9).map(make_block_meta).collect::<Vec<_>>())
-                .unwrap();
-        }
-
-        let db = ServerDB::new(&path).unwrap();
-        assert_eq!(DivergenceLookups::get_earliest(&db).unwrap().unwrap().0, 8);
-
-        ChainStore::advance_chain(&db, &[make_block_meta(2)]).unwrap();
-        assert_eq!(
-            DivergenceLookups::get_earliest(&db).unwrap().unwrap().0,
-            8,
-            "a row below the floor must not move it"
-        );
-    }
-
-    /// The lazy write-back only lands strictly below the floor: rows at/above the floor
-    /// (chain-sync territory) and writes without any floor are skipped silently, and a
-    /// skipped write never mutates an existing row.
-    #[test]
-    fn record_canonical_hash_only_writes_below_floor() {
+    fn record_canonical_hash_only_archives_below_window() {
         let (_dir, db) = temp_server_db();
+        let hash = |n: u64| make_block_meta(n).block_hash;
 
-        // No floor row at all (fresh DB): nothing is written.
-        db.record_canonical_hash(&make_block_meta(5)).unwrap();
-        assert_eq!(ChainStore::get_block_hash(&db, 5).unwrap(), None);
+        // Empty chain: no depth guarantee, nothing is written.
+        db.record_canonical_hash(5, hash(5)).unwrap();
+        assert_eq!(db.get_archived_hash(5).unwrap(), None);
 
-        // The anchor-init path installs the floor at 10.
+        // The anchor-init path installs the window at {10}.
         ChainStore::reset_to_anchor(&db, &make_block_meta(10)).unwrap();
 
-        // Below the floor: written, readable, and the floor/tip cursors stay put.
-        db.record_canonical_hash(&make_block_meta(5)).unwrap();
-        assert_eq!(
-            ChainStore::get_block_hash(&db, 5).unwrap(),
-            Some(make_block_meta(5).block_hash)
-        );
+        // Below the window: archived; the chain window and its cursors stay put.
+        db.record_canonical_hash(5, hash(5)).unwrap();
+        assert_eq!(db.get_archived_hash(5).unwrap(), Some(hash(5)));
+        assert_eq!(ChainStore::get_block_hash(&db, 5).unwrap(), None);
         assert_eq!(DivergenceLookups::get_earliest(&db).unwrap().unwrap().0, 10);
         assert_eq!(db.get_local_tip().unwrap().unwrap().0, 10);
 
-        // Above the tip: skipped — a write here would corrupt the tip cursor.
-        db.record_canonical_hash(&make_block_meta(12)).unwrap();
-        assert_eq!(ChainStore::get_block_hash(&db, 12).unwrap(), None);
+        // At the window start and above the tip: skipped — not depth-final yet.
+        db.record_canonical_hash(10, BlockHash::from([0xAA; 32])).unwrap();
+        db.record_canonical_hash(12, hash(12)).unwrap();
+        assert_eq!(db.get_archived_hash(10).unwrap(), None);
+        assert_eq!(db.get_archived_hash(12).unwrap(), None);
+        assert_eq!(ChainStore::get_block_hash(&db, 10).unwrap(), Some(hash(10)));
         assert_eq!(db.get_local_tip().unwrap().unwrap().0, 10);
-
-        // At the floor itself with a different hash: skipped, the original row wins.
-        let mut forged = make_block_meta(10);
-        forged.block_hash = BlockHash::from([0xAA; 32]);
-        db.record_canonical_hash(&forged).unwrap();
-        assert_eq!(
-            ChainStore::get_block_hash(&db, 10).unwrap(),
-            Some(make_block_meta(10).block_hash)
-        );
-    }
-
-    /// Rows below the floor stay readable for canonical-hash resolution even though
-    /// `get_earliest` (the bisection contract) reports only the contiguous suffix.
-    #[test]
-    fn rows_below_floor_serve_hash_lookups() {
-        let (_dir, db) = temp_server_db();
-        ChainStore::advance_chain(&db, &[make_block_meta(3)]).unwrap();
-        ChainStore::reset_to_anchor(&db, &make_block_meta(10)).unwrap();
-
-        assert_eq!(
-            DivergenceLookups::get_earliest(&db).unwrap(),
-            Some((10, make_block_meta(10).block_hash))
-        );
-        assert_eq!(
-            ChainStore::get_block_hash(&db, 3).unwrap(),
-            Some(make_block_meta(3).block_hash)
-        );
     }
 }

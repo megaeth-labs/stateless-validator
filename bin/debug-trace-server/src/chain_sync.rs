@@ -272,7 +272,10 @@ mod tests {
         fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
             Ok(())
         }
-        fn record_canonical_hash(&self, _: &BlockMeta) -> StoreResult<()> {
+        fn get_archived_hash(&self, _: BlockNumber) -> StoreResult<Option<BlockHash>> {
+            Ok(None)
+        }
+        fn record_canonical_hash(&self, _: BlockNumber, _: BlockHash) -> StoreResult<()> {
             Ok(())
         }
         fn get_block_and_witness(

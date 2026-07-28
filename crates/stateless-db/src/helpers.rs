@@ -8,7 +8,7 @@ use stateless_core::db::{BlockMeta, ContractLookup, StoreResult, StoreResultExt}
 use crate::{
     serialize::{decode_from_slice, encode_to_vec},
     tables::{
-        ANCHOR_BLOCK, CANONICAL_CHAIN, CONTRACTS, Database, block_meta_from_tuple,
+        ANCHOR_BLOCK, CANONICAL_CHAIN, CONTRACTS, Database, HASH_ARCHIVE, block_meta_from_tuple,
         block_meta_to_tuple,
     },
 };
@@ -110,29 +110,17 @@ pub fn write_rollback_chain(database: &Database, to_block: BlockNumber) -> Store
     Ok(())
 }
 
-/// ANCHOR_BLOCK key of the persisted **history floor**: the lowest block of the contiguous
-/// CANONICAL_CHAIN suffix ending at the tip. Rows may exist below it (immutable historical
-/// "islands" left by a stale reset or the lazy write-back), but only the range at or above
-/// the floor is guaranteed hole-free — which is what divergence bisection requires of
-/// `get_earliest`.
-pub const HISTORY_FLOOR_KEY: &str = "history_floor";
-
 /// CANONICAL_CHAIN value tuple: `(block_hash, post_state_root, post_withdrawals_root)`.
 type ChainRow = ([u8; 32], [u8; 32], [u8; 32]);
 
-/// Reads the floor row from an open ANCHOR_BLOCK table (read-only or write).
-fn read_floor_row(
-    anchor_table: &impl ReadableTable<&'static str, (u64, [u8; 32], [u8; 32], [u8; 32])>,
-) -> StoreResult<Option<BlockMeta>> {
-    Ok(anchor_table.get(HISTORY_FLOOR_KEY).store_err()?.map(|v| block_meta_from_tuple(v.value())))
-}
-
-/// Reads the earliest CANONICAL_CHAIN row from an open table as a full [`BlockMeta`].
-fn earliest_chain_row(chain: &impl ReadableTable<u64, ChainRow>) -> StoreResult<Option<BlockMeta>> {
-    Ok(chain.first().store_err()?.map(|(k, v)| {
-        let (hash, state_root, withdrawals_root) = v.value();
-        block_meta_from_tuple((k.value(), hash, state_root, withdrawals_root))
-    }))
+/// Whether `block_number` lies strictly below the bounded CANONICAL_CHAIN window (i.e. is
+/// depth-final). `false` on an empty chain — with no local window there is no depth
+/// guarantee to lean on.
+fn below_chain_window(
+    chain: &impl ReadableTable<u64, ChainRow>,
+    block_number: BlockNumber,
+) -> StoreResult<bool> {
+    Ok(matches!(chain.first().store_err()?, Some((k, _)) if block_number < k.value()))
 }
 
 /// Inserts `meta` as a CANONICAL_CHAIN row.
@@ -167,100 +155,76 @@ fn remove_chain_rows_above(
     Ok(())
 }
 
-/// Reads the history floor. Falls back to the earliest CANONICAL_CHAIN row when no floor
-/// row has been persisted (databases created before floor tracking), preserving the old
-/// `get_earliest` semantics for them.
-pub fn read_history_floor(database: &Database) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
+/// Reads an archived canonical hash from HASH_ARCHIVE.
+pub fn read_archived_hash(
+    database: &Database,
+    block_number: BlockNumber,
+) -> StoreResult<Option<BlockHash>> {
     let read_txn = database.begin_read().store_err()?;
-    let anchor_table = read_txn.open_table(ANCHOR_BLOCK).store_err()?;
-    if let Some(meta) = read_floor_row(&anchor_table)? {
-        return Ok(Some((meta.block_number, meta.block_hash)));
-    }
-    let chain = read_txn.open_table(CANONICAL_CHAIN).store_err()?;
-    Ok(earliest_chain_row(&chain)?.map(|meta| (meta.block_number, meta.block_hash)))
+    let archive = read_txn.open_table(HASH_ARCHIVE).store_err()?;
+    Ok(archive.get(block_number).store_err()?.map(|v| BlockHash::from(v.value())))
 }
 
-/// Returns the persisted history floor as a full [`BlockMeta`], materializing the
-/// singleton row from the earliest CANONICAL_CHAIN entry when absent — the upgrade path
-/// for databases created before floor tracking, sharing the fallback rule with
-/// [`read_history_floor`]. `Ok(None)` on a fresh database with no chain rows at all.
-pub fn write_ensure_history_floor(database: &Database) -> StoreResult<Option<BlockMeta>> {
-    let write_txn = database.begin_write().store_err()?;
-    let floor = {
-        let mut anchor_table = write_txn.open_table(ANCHOR_BLOCK).store_err()?;
-        match read_floor_row(&anchor_table)? {
-            Some(meta) => Some(meta),
-            None => {
-                let chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
-                let earliest = earliest_chain_row(&chain)?;
-                if let Some(meta) = &earliest {
-                    anchor_table
-                        .insert(HISTORY_FLOOR_KEY, block_meta_to_tuple(meta))
-                        .store_err()?;
-                }
-                earliest
-            }
-        }
-    };
-    write_txn.commit().store_err()?;
-    Ok(floor)
-}
-
-/// Persists an upstream-resolved canonical row **strictly below the history floor** — the
-/// trace server's lazy write-back. Rows at/above the floor, or writes without any floor,
-/// are skipped silently: that range is owned by chain sync and is what reorg bisection
-/// trusts.
+/// Archives an upstream-resolved canonical hash — the trace server's lazy write-back.
+///
+/// Only heights **strictly below the bounded CANONICAL_CHAIN window** are archived: those
+/// are depth-final, whereas a height at or above the window's start could in principle
+/// still reorg before chain sync verifies it, and an archived stale hash would then serve
+/// wrong by-number responses. In-window and above-tip heights are skipped silently — the
+/// window itself answers them (or will, once sync catches up).
 ///
 /// A read-transaction pre-check filters the skip cases without touching redb's
-/// single-writer lock (heights above the sync tip arrive constantly, exactly while chain
-/// sync keeps that lock busiest); an actual write re-checks the floor inside its own
-/// transaction, so a concurrent stale reset (which only moves the floor up) cannot
-/// interleave a write into the trusted range. The commit uses [`redb::Durability::None`]
-/// to keep the fsync off the request path: losing the row to a crash costs one upstream
-/// refetch, and any later Immediate commit (chain sync advances constantly) makes it
-/// durable.
-pub fn write_canonical_hash_below_floor(database: &Database, meta: &BlockMeta) -> StoreResult<()> {
-    let below_floor =
-        |floor: &Option<BlockMeta>| matches!(floor, Some(f) if meta.block_number < f.block_number);
+/// single-writer lock (above-tip heights arrive constantly, exactly while chain sync keeps
+/// that lock busiest); an actual write re-checks the gate inside its own transaction. The
+/// window start only moves up (append-at-tip, prune-from-below), so the race is benign in
+/// the safe direction. The commit uses [`redb::Durability::None`] to keep the fsync off
+/// the request path: losing the row to a crash costs one upstream refetch, and any later
+/// Immediate commit (chain sync advances constantly) makes it durable.
+pub fn write_archived_hash_below_window(
+    database: &Database,
+    block_number: BlockNumber,
+    block_hash: BlockHash,
+) -> StoreResult<()> {
     {
         let read_txn = database.begin_read().store_err()?;
-        let anchor_table = read_txn.open_table(ANCHOR_BLOCK).store_err()?;
-        if !below_floor(&read_floor_row(&anchor_table)?) {
+        let chain = read_txn.open_table(CANONICAL_CHAIN).store_err()?;
+        if !below_chain_window(&chain, block_number)? {
             return Ok(());
         }
     }
     let mut write_txn = database.begin_write().store_err()?;
     write_txn.set_durability(redb::Durability::None).store_err()?;
     {
-        let anchor_table = write_txn.open_table(ANCHOR_BLOCK).store_err()?;
-        if !below_floor(&read_floor_row(&anchor_table)?) {
+        let chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
+        if !below_chain_window(&chain, block_number)? {
             // Dropping the uncommitted txn aborts it; nothing is written.
             return Ok(());
         }
-        let mut chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
-        insert_chain_row(&mut chain, meta)?;
+        let mut archive = write_txn.open_table(HASH_ARCHIVE).store_err()?;
+        archive.insert(block_number, block_hash.0).store_err()?;
     }
     write_txn.commit().store_err()?;
     Ok(())
 }
 
-/// History-preserving variant of [`write_reset_to_anchor`]: installs the new anchor and
-/// removes chain rows strictly *above* it (their lineage is unverified against the new
-/// anchor), but keeps every row below — accumulated canonical history is immutable and
-/// stays serviceable. The anchor also becomes the history floor: the reset leaves a gap
-/// right below it, so rows underneath are no longer guaranteed contiguous with the tip.
-pub fn write_reset_to_anchor_preserving_history(
-    database: &Database,
-    anchor: &BlockMeta,
-) -> StoreResult<()> {
+/// Trace-server variant of [`write_reset_to_anchor`]: archives every current chain row's
+/// `(number, hash)` into HASH_ARCHIVE, then clears the chain and installs the anchor as
+/// its sole entry. The archived rows were locally verified before the reset, and a stale
+/// reset only fires when the chain lags the remote by at least the retention window, so
+/// they are depth-final by construction.
+pub fn write_reset_to_anchor_archiving(database: &Database, anchor: &BlockMeta) -> StoreResult<()> {
     let write_txn = database.begin_write().store_err()?;
     {
         let mut anchor_table = write_txn.open_table(ANCHOR_BLOCK).store_err()?;
         anchor_table.insert("anchor", block_meta_to_tuple(anchor)).store_err()?;
-        anchor_table.insert(HISTORY_FLOOR_KEY, block_meta_to_tuple(anchor)).store_err()?;
 
         let mut chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
-        remove_chain_rows_above(&mut chain, anchor.block_number)?;
+        let mut archive = write_txn.open_table(HASH_ARCHIVE).store_err()?;
+        for row in chain.iter().store_err()? {
+            let (k, v) = row.store_err()?;
+            archive.insert(k.value(), v.value().0).store_err()?;
+        }
+        chain.retain(|_, _| false).store_err()?;
         insert_chain_row(&mut chain, anchor)?;
     }
     write_txn.commit().store_err()?;
@@ -334,6 +298,7 @@ mod tests {
         let write_txn = database.begin_write().unwrap();
         write_txn.open_table(ANCHOR_BLOCK).unwrap();
         write_txn.open_table(CANONICAL_CHAIN).unwrap();
+        write_txn.open_table(HASH_ARCHIVE).unwrap();
         write_txn.commit().unwrap();
         (dir, database)
     }
@@ -366,79 +331,57 @@ mod tests {
         }
     }
 
-    /// The preserving reset keeps rows below the new anchor, drops rows above it, and
-    /// installs the anchor as both chain tip and history floor. The plain
-    /// `write_reset_to_anchor` (validator behavior) stays wipe-everything — pinned by
-    /// `reset_to_anchor_clears_chain_and_installs_anchor` above.
+    /// The archiving reset moves every current chain row into HASH_ARCHIVE, then behaves
+    /// exactly like the plain reset: chain = {anchor} only. The plain
+    /// `write_reset_to_anchor` (validator behavior) stays wipe-without-archiving — pinned
+    /// by `reset_to_anchor_clears_chain_and_installs_anchor` above.
     #[test]
-    fn preserving_reset_keeps_history_and_sets_floor() {
+    fn archiving_reset_moves_rows_into_archive() {
         let (_dir, db) = temp_db();
 
         write_advance_chain(&db, &[meta(10), meta(11), meta(12)], None).unwrap();
 
-        // Forward reset (stale-reset shape: anchor jumps above all local rows).
         let anchor = meta(42);
-        write_reset_to_anchor_preserving_history(&db, &anchor).unwrap();
+        write_reset_to_anchor_archiving(&db, &anchor).unwrap();
 
         assert_eq!(read_anchor(&db).unwrap().as_ref(), Some(&anchor));
         assert_eq!(read_canonical_tip(&db).unwrap().as_ref(), Some(&anchor));
-        assert_eq!(read_history_floor(&db).unwrap(), Some((42, anchor.block_hash)));
-        for kept in [10u64, 11, 12] {
+        assert_eq!(read_earliest_block(&db).unwrap(), Some((42, anchor.block_hash)));
+        for moved in [10u64, 11, 12] {
+            assert_eq!(read_block_hash(&db, moved).unwrap(), None, "chain row {moved} must go");
             assert_eq!(
-                read_block_hash(&db, kept).unwrap(),
-                Some(meta(kept).block_hash),
-                "island row {kept} must survive the reset"
+                read_archived_hash(&db, moved).unwrap(),
+                Some(meta(moved).block_hash),
+                "row {moved} must be archived"
             );
         }
-
-        // Reset landing below existing rows: rows above the anchor are unverified against
-        // it and must go; rows below stay.
-        let anchor = meta(11);
-        write_reset_to_anchor_preserving_history(&db, &anchor).unwrap();
-        assert_eq!(read_canonical_tip(&db).unwrap().as_ref(), Some(&anchor));
-        assert_eq!(read_history_floor(&db).unwrap(), Some((11, anchor.block_hash)));
-        assert_eq!(read_block_hash(&db, 10).unwrap(), Some(meta(10).block_hash));
-        assert_eq!(read_block_hash(&db, 12).unwrap(), None);
-        assert_eq!(read_block_hash(&db, 42).unwrap(), None);
     }
 
-    /// `write_ensure_history_floor` materializes the floor from the earliest chain row
-    /// once, and the persisted row then wins over rows appearing below it — the same
-    /// fallback rule `read_history_floor` applies read-only.
+    /// The lazy write-back only archives heights strictly below the canonical window; an
+    /// in-window, above-tip, or empty-chain write is skipped silently.
     #[test]
-    fn ensure_history_floor_materializes_once() {
+    fn archived_hash_write_gated_by_chain_window() {
         let (_dir, db) = temp_db();
-        assert_eq!(write_ensure_history_floor(&db).unwrap(), None);
 
-        write_advance_chain(&db, &[meta(8), meta(9)], None).unwrap();
-        assert_eq!(write_ensure_history_floor(&db).unwrap(), Some(meta(8)));
+        // Empty chain: no depth guarantee, nothing is written.
+        write_archived_hash_below_window(&db, 5, meta(5).block_hash).unwrap();
+        assert_eq!(read_archived_hash(&db, 5).unwrap(), None);
 
-        write_advance_chain(&db, &[meta(2)], None).unwrap();
-        assert_eq!(
-            write_ensure_history_floor(&db).unwrap(),
-            Some(meta(8)),
-            "a row below the floor must not move it"
-        );
-        assert_eq!(read_history_floor(&db).unwrap(), Some((8, meta(8).block_hash)));
-    }
+        write_advance_chain(&db, &[meta(10), meta(11)], None).unwrap();
 
-    /// Without a persisted floor row the floor falls back to the earliest chain row; once a
-    /// floor row exists it wins even though older island rows sit below it.
-    #[test]
-    fn read_history_floor_falls_back_to_earliest() {
-        let (_dir, db) = temp_db();
-        assert_eq!(read_history_floor(&db).unwrap(), None);
+        // Below the window: archived.
+        write_archived_hash_below_window(&db, 5, meta(5).block_hash).unwrap();
+        assert_eq!(read_archived_hash(&db, 5).unwrap(), Some(meta(5).block_hash));
 
-        write_advance_chain(&db, &[meta(3), meta(4)], None).unwrap();
-        assert_eq!(read_history_floor(&db).unwrap(), Some((3, meta(3).block_hash)));
+        // In-window and above-tip heights: skipped — the window itself answers them.
+        write_archived_hash_below_window(&db, 10, meta(10).block_hash).unwrap();
+        write_archived_hash_below_window(&db, 15, meta(15).block_hash).unwrap();
+        assert_eq!(read_archived_hash(&db, 10).unwrap(), None);
+        assert_eq!(read_archived_hash(&db, 15).unwrap(), None);
 
-        write_reset_to_anchor_preserving_history(&db, &meta(7)).unwrap();
-        assert_eq!(
-            read_history_floor(&db).unwrap(),
-            Some((7, meta(7).block_hash)),
-            "the floor row must win over the earlier island rows"
-        );
-        assert_eq!(read_earliest_block(&db).unwrap(), Some((3, meta(3).block_hash)));
+        // The canonical window is untouched by archive writes.
+        assert_eq!(read_earliest_block(&db).unwrap(), Some((10, meta(10).block_hash)));
+        assert_eq!(read_canonical_tip(&db).unwrap().unwrap().block_number, 11);
     }
 
     #[test]

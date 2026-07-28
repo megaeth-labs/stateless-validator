@@ -106,10 +106,11 @@ JS tracers, `muxTracer`, and struct-logger requests with non-default flags bypas
 A type-malformed `tracerConfig` on a config-reading builtin (`callTracer`/`prestateTracer`/`flatCallTracer`) is rejected with `-32602 invalid params` instead of being silently traced with default settings.
 Disable the cache with `--response-cache-disabled`; `--response-cache-estimated-items` must be at least 1 (the old `=0` disable convention is rejected at startup).
 
-**Canonical index (local cache mode):**
-The block-number → hash index (`CANONICAL_CHAIN`) is permanent: pruning removes only block bodies and witnesses, and a stale reset preserves accumulated history below the new anchor.
-The index grows lazily: when a by-number request has to resolve its hash upstream, the hash-verified header is written back into the index (strictly below the history floor, so reorg bisection is untouched), and every later request for that height resolves locally.
-The index costs roughly 220–340 bytes per block on disk (about 5 GiB even for a full 25M-block history) — budget `--db-max-size` accordingly.
+**Hash archive (local cache mode):**
+`CANONICAL_CHAIN` stays a bounded, contiguous sync window; the permanent number → hash history lives in a dedicated `HASH_ARCHIVE` table.
+It fills from two sources: pruning and stale resets move each outgoing chain row's `(number, hash)` into the archive (locally verified, zero RPC), and a by-number request that had to resolve its hash upstream writes the hash-verified answer back — only for heights strictly below the sync window, where they are depth-final.
+Resolution order is window → archive → upstream, so every height resolves locally after first touch; reorg bisection reads only the window and never sees the archive.
+The archive costs roughly 110–140 bytes per block on disk (about 2.5–3 GiB even for a full 25M-block history) — budget `--db-max-size` accordingly.
 Size-based pruning never removes bodies above `tip - --size-prune-min-retain` (default 256), so a DB file stuck over `--db-max-size` cannot consume the whole body retention.
 
 **Witness endpoints:**
@@ -254,17 +255,17 @@ The validator and trace server each have their own `redb`-backed database, shari
 
 | Table             | Key                        | Value                                                  | Used By                      |
 | ----------------- | -------------------------- | ------------------------------------------------------ | ---------------------------- |
-| `ANCHOR_BLOCK`    | `"anchor"`, `"history_floor"` | `(BlockNumber, BlockHash, StateRoot, WithdrawalsRoot)` | Both (floor: trace server) |
+| `ANCHOR_BLOCK`    | `"anchor"`                 | `(BlockNumber, BlockHash, StateRoot, WithdrawalsRoot)` | Both                         |
 | `CANONICAL_CHAIN` | `BlockNumber`              | `(BlockHash, StateRoot, WithdrawalsRoot)`              | Both                         |
 | `CONTRACTS`       | `CodeHash`                 | Bincode+LZ4 `Bytecode`                                 | Both                         |
 | `GENESIS_CONFIG`  | `"genesis"`                | JSON `Genesis`                                         | Validator                    |
 | `BLOCK_DATA`      | `BlockHash`                | JSON `Block<Transaction>`                              | Trace server                 |
 | `WITNESSES`       | `BlockHash`                | Bincode+LZ4 `LightWitness`                             | Trace server                 |
 | `BLOCK_RECORDS`   | `(BlockNumber, BlockHash)` | `()`                                                   | Trace server (pruning index) |
+| `HASH_ARCHIVE`    | `BlockNumber`              | `BlockHash`                                            | Trace server (permanent)     |
 
-In the trace server, `CANONICAL_CHAIN` is permanent: pruning removes only `BLOCK_DATA`/`WITNESSES`/`BLOCK_RECORDS`, and a stale reset keeps rows below the new anchor.
-The `"history_floor"` row marks the lowest block of the contiguous suffix ending at the tip — reorg bisection trusts only that range, while rows below the floor (lazily written-back or pre-reset history) still serve number → hash lookups.
-The validator's `CANONICAL_CHAIN` stays bounded (inline pruning) and its reset semantics are unchanged.
+In the trace server, `CANONICAL_CHAIN` is the bounded contiguous sync window (reorg bisection trusts exactly this range), while `HASH_ARCHIVE` permanently keeps the number → hash of every height that has left it — via pruning, stale resets, and the lazy write-back of upstream-resolved hashes.
+The validator uses neither the archive nor the archiving reset; its `CANONICAL_CHAIN` semantics are unchanged.
 
 ### SALT Witness Cryptography
 

@@ -694,9 +694,9 @@ async fn history_pruner(
     }
 }
 
-/// One pruning pass: count-based body pruning, then size-based pruning down to the
-/// min-retain floor, then DB gauge updates. The canonical index is never pruned — only
-/// bodies/witnesses (see `ServerDB::prune_history`).
+/// One pruning pass: count-based pruning, then size-based pruning down to the
+/// min-retain floor, then DB gauge updates. Pruned heights keep their number -> hash in
+/// HASH_ARCHIVE (see `ServerDB::prune_history`).
 fn run_prune_cycle(
     db: &ServerDB,
     blocks_to_keep: u64,
@@ -779,8 +779,8 @@ fn run_prune_cycle(
         }
     }
 
-    // DB gauges: `db_earliest_block` is the canonical-index floor (descends while the
-    // index grows); `db_body_earliest_block` is the body-retention edge.
+    // DB gauges: `db_earliest_block` is the canonical window's start; the
+    // `db_body_earliest_block` body-retention edge can sit above it under size pressure.
     let earliest = db.get_earliest().ok().flatten().map(|(n, _)| n).unwrap_or(0);
     chain_sync_metrics.set_db_block_range(earliest, current_tip);
     if let Ok(Some(body_earliest)) = db.get_earliest_block_record() {
@@ -1062,8 +1062,8 @@ mod tests {
 
     /// Size-based pruning stops at the min-retain floor: with a DB file permanently over
     /// `db_max_size` (redb files never shrink), bodies within `tip - size_prune_min_retain`
-    /// survive every cycle instead of being pruned to nothing — and the canonical index is
-    /// untouched throughout.
+    /// survive every cycle instead of being pruned to nothing — and pruned heights keep
+    /// resolving number -> hash via the archive.
     #[test]
     fn run_prune_cycle_respects_min_retain_floor() {
         let dir = tempfile::tempdir().unwrap();
@@ -1098,9 +1098,14 @@ mod tests {
         }
         // Pruning did happen below the floor…
         assert!(db.get_block_and_witness(block_hash(1)).is_err(), "body 1 must be pruned");
-        // …and the canonical index kept every row.
-        for n in [1u64, 100, 250, 500] {
-            assert!(ChainStore::get_block_hash(&db, n).unwrap().is_some(), "index row {n}");
+        // …with the pruned range's number -> hash moved to the archive, and the retained
+        // window still answered by the chain itself.
+        for n in [1u64, 100] {
+            assert_eq!(ChainStore::get_block_hash(&db, n).unwrap(), None, "chain row {n}");
+            assert_eq!(db.get_archived_hash(n).unwrap(), Some(block_hash(n)), "archive row {n}");
+        }
+        for n in [250u64, 500] {
+            assert!(ChainStore::get_block_hash(&db, n).unwrap().is_some(), "window row {n}");
         }
     }
 

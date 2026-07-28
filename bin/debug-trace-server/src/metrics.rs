@@ -385,8 +385,9 @@ pub struct ChainSyncMetrics {
     block_distance_from_tip: Histogram,
     /// Earliest block number in validator DB
     db_earliest_block: Gauge,
-    /// Earliest block number with a stored body + witness (bodies are pruned;
-    /// `db_earliest_block` tracks the permanent canonical index's history floor instead)
+    /// Earliest block number with a stored body + witness. Tracks `db_earliest_block`
+    /// (pruning removes bodies and chain rows together) but can differ transiently, e.g.
+    /// chain rows advanced whose bodies were never stored
     db_body_earliest_block: Gauge,
     /// Latest block number in validator DB
     db_latest_block: Gauge,
