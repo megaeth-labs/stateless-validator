@@ -31,13 +31,11 @@ use stateless_db::{
 /// chain on a schedule), so it lives here rather than as a stateless-core trait.
 ///
 /// Supertraits: [`ChainStore`] (chain cursors) + [`DivergenceLookups`] (this bin bisects on reorg,
-/// and the DB-range metric reads `get_earliest`). `prune_chain` is folded in from the former
-/// `PrunableChainStore` (same sole implementer, `ServerDB`).
+/// and the DB-range metric reads `get_earliest`). Pruning is not part of the trait: the
+/// history pruner and the backfill task work on the concrete [`ServerDB`] (inherent
+/// `prune_history` / `backfill_canonical`), while this trait is the read/append seam shared
+/// with `DataProvider` and chain sync.
 pub trait BlockStore: ChainStore + DivergenceLookups {
-    /// Delete stored block bodies + witnesses strictly below `before_block`; the canonical
-    /// number -> hash index is permanent and is not pruned. Returns the number of block
-    /// records removed.
-    fn prune_chain(&self, before_block: BlockNumber) -> StoreResult<u64>;
     fn store_block_data(&self, blocks: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()>;
     fn get_block_and_witness(
         &self,
@@ -461,10 +459,6 @@ impl DivergenceLookups for ServerDB {
 }
 
 impl BlockStore for ServerDB {
-    fn prune_chain(&self, before_block: BlockNumber) -> StoreResult<u64> {
-        ServerDB::prune_history(self, before_block)
-    }
-
     fn store_block_data(&self, blocks: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
         ServerDB::store_block_data(self, blocks)
     }
@@ -623,7 +617,7 @@ mod tests {
         let metas: Vec<BlockMeta> = (1..=10).map(make_block_meta).collect();
         ChainStore::advance_chain(&db, &metas).unwrap();
 
-        let pruned = BlockStore::prune_chain(&db, 6).unwrap();
+        let pruned = db.prune_history(6).unwrap();
         assert_eq!(pruned, 5);
 
         // Bodies below 6 are gone; the canonical index keeps every row.

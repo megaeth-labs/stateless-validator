@@ -350,6 +350,35 @@ impl WitnessSourceMetrics {
     }
 }
 
+/// Canonical-index backfill metrics (singleton).
+#[derive(Clone, Metrics)]
+#[metrics(scope = "debug_trace")]
+pub struct BackfillMetrics {
+    /// Total canonical-index rows written by the backfill task
+    backfilled_blocks_total: Counter,
+    /// Current backfill floor: the lowest block of the contiguous canonical index
+    /// (descends toward 0 while the backfill runs)
+    backfill_floor: Gauge,
+}
+
+impl BackfillMetrics {
+    /// Creates backfill metrics.
+    pub fn create() -> Self {
+        Self::new_with_labels(&[("scope", "backfill")])
+    }
+
+    /// Sets the current backfill floor.
+    pub fn set_floor(&self, floor: u64) {
+        self.backfill_floor.set(floor as f64);
+    }
+
+    /// Records one applied batch: rows written and the new floor.
+    pub fn record_batch(&self, rows: u64, floor: u64) {
+        self.backfilled_blocks_total.increment(rows);
+        self.backfill_floor.set(floor as f64);
+    }
+}
+
 /// EVM execution metrics with method label.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
@@ -385,6 +414,10 @@ pub struct ChainSyncMetrics {
     block_distance_from_tip: Histogram,
     /// Earliest block number in validator DB
     db_earliest_block: Gauge,
+    /// Earliest block number with a stored body + witness (bodies are pruned;
+    /// `db_earliest_block` tracks the permanent canonical index's floor instead, which
+    /// descends while the backfill runs)
+    db_body_earliest_block: Gauge,
     /// Latest block number in validator DB
     db_latest_block: Gauge,
     /// Database file size in bytes
@@ -418,6 +451,11 @@ impl ChainSyncMetrics {
     pub fn set_db_block_range(&self, earliest: u64, latest: u64) {
         self.db_earliest_block.set(earliest as f64);
         self.db_latest_block.set(latest as f64);
+    }
+
+    /// Sets the earliest block that still has a stored body (the body-retention edge).
+    pub fn set_db_body_earliest_block(&self, earliest: u64) {
+        self.db_body_earliest_block.set(earliest as f64);
     }
 
     /// Sets the database file size in bytes.
@@ -510,6 +548,7 @@ fn pre_register_all_metrics() {
 
     // Infrastructure
     let _ = ChainSyncMetrics::create();
+    let _ = BackfillMetrics::create();
 }
 
 /// Transaction count per traced block (~ 1–500).

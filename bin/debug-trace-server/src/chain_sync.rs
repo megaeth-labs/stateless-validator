@@ -277,9 +277,6 @@ mod tests {
         }
     }
     impl BlockStore for MockBlockStore {
-        fn prune_chain(&self, _: BlockNumber) -> StoreResult<u64> {
-            Ok(0)
-        }
         fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
             Ok(())
         }

@@ -1043,9 +1043,6 @@ pub(crate) mod test_support {
     }
 
     impl BlockStore for StaticHashStore {
-        fn prune_chain(&self, _: u64) -> StoreResult<u64> {
-            Ok(0)
-        }
         fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
             Ok(())
         }
