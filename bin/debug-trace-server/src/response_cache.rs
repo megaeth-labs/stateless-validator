@@ -478,7 +478,11 @@ impl ResponseCache {
     ///
     /// The index is registered *before* the cache write: if `quick_cache` immediately
     /// weight-evicts the just-inserted key, `on_evict -> remove_key` then self-heals the
-    /// index. (Same-key replacement and explicit `remove` fire no `on_evict`.)
+    /// index. (Same-key replacement and explicit `remove` fire no `on_evict`.) The other
+    /// interleaving — an `invalidate_blocks` landing between the two steps — leaves the
+    /// entry cached but unindexed, which is harmless: a hash-keyed entry is still a true
+    /// fact for by-hash reads and unreachable by-number, so it merely occupies weight
+    /// until eviction.
     pub fn insert(
         &self,
         resource: CachedResource,

@@ -108,10 +108,11 @@ Disable the cache with `--response-cache-disabled`; `--response-cache-estimated-
 
 **Hash archive (local cache mode):**
 `CANONICAL_CHAIN` stays a bounded, contiguous sync window; the permanent number → hash history lives in a dedicated `HASH_ARCHIVE` table.
-It fills from two sources: pruning and stale resets move each outgoing chain row's `(number, hash)` into the archive (locally verified, zero RPC), and a by-number request that had to resolve its hash upstream writes the hash-verified answer back — only for heights strictly below the sync window, where they are depth-final.
+It fills from two sources: pruning and stale resets move each outgoing chain row's `(number, hash)` into the archive (locally verified, zero RPC), and a by-number request that had to resolve its hash upstream writes the hash-verified answer back — only for depth-final heights, strictly below the sync window and more than a safety depth below its tip (right after an anchor reset the window is a single row at the remote tip, so window position alone proves no depth).
 Resolution order is window → archive → upstream, so every height resolves locally after first touch; reorg bisection reads only the window and never sees the archive.
 The archive costs roughly 110–140 bytes per block on disk (about 2.5–3 GiB even for a full 25M-block history) — budget `--db-max-size` accordingly.
 Size-based pruning never removes bodies above `tip - --size-prune-min-retain` (default 256), so a DB file stuck over `--db-max-size` cannot consume the whole body retention.
+Because redb files never shrink on their own, a file that crosses `--db-max-size` ratchets body retention down to that floor and keeps it there until `--db-max-size` is raised or the database is rebuilt.
 
 **Witness endpoints:**
 Declare the internal witness generator via `--witness-generator-endpoint`; `--witness-endpoint` lists the durable fallbacks (e.g. an R2-backed witness service), tried in order.

@@ -338,10 +338,12 @@ impl DataProvider {
     /// falls through to the next tier rather than failing the request.
     ///
     /// **Lazy write-back**: an upstream-resolved header (fetched with `verify_hash = true`,
-    /// so its hash provably matches its content) is archived — only when strictly below
-    /// the canonical window, where the height is depth-final — so the next by-number
-    /// request for it resolves locally. The archive thereby grows organically with the
-    /// traffic (and with pruning, which archives locally verified rows for free).
+    /// so its hash provably matches its content) is archived — only when depth-final:
+    /// strictly below the canonical window and more than a safety depth below its tip —
+    /// so the next by-number request for it resolves locally. The write runs
+    /// fire-and-forget on the blocking pool, off this request's latency path. The archive
+    /// thereby grows organically with the traffic (and with pruning, which archives
+    /// locally verified rows for free).
     pub(crate) async fn resolve_canonical_hash(
         &self,
         block_num: u64,
@@ -397,15 +399,21 @@ impl DataProvider {
             }
         };
         if let Some(db) = &self.db {
-            // Best-effort: the request already has its answer; a failed write-back only
-            // costs the next request another upstream round trip.
-            if let Err(e) = db.record_canonical_hash(header.number, header.hash) {
-                warn!(
-                    block_number = block_num,
-                    error = %e,
-                    "Failed to archive resolved canonical hash",
-                );
-            }
+            // Fire-and-forget on the blocking pool: the write-back takes redb's single
+            // writer lock, which chain-sync commits can hold for a while — the request
+            // must not wait on it. Best-effort either way: a lost write-back only costs
+            // the next request another upstream round trip.
+            let db = Arc::clone(db);
+            let (number, hash) = (header.number, header.hash);
+            tokio::task::spawn_blocking(move || {
+                if let Err(e) = db.record_canonical_hash(number, hash) {
+                    warn!(
+                        block_number = number,
+                        error = %e,
+                        "Failed to archive resolved canonical hash",
+                    );
+                }
+            });
         }
         Ok(header.hash)
     }
@@ -1168,10 +1176,10 @@ mod tests {
         handle.stop().unwrap();
     }
 
-    /// The lazy write-back: an upstream-resolved hash for a height below the canonical
-    /// window lands in the hash archive (the window itself untouched), so the next
-    /// resolution needs no upstream at all — pinned by stopping the mock server before
-    /// the second resolve.
+    /// The lazy write-back: an upstream-resolved hash for a depth-final height below the
+    /// canonical window lands in the hash archive (the window itself untouched), so the
+    /// next resolution needs no upstream at all — pinned by stopping the mock server
+    /// before the second resolve.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resolve_canonical_hash_archives_upstream_answer() {
         use stateless_core::{ChainStore, DivergenceLookups};
@@ -1182,24 +1190,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_db =
             Arc::new(crate::server_db::ServerDB::new(dir.path().join("t.redb")).unwrap());
-        // The anchor-init path installs the canonical window at {100}.
-        ChainStore::reset_to_anchor(&*server_db, &make_block_meta(100)).unwrap();
+        // The anchor-init path installs the canonical window as a single row at {200};
+        // height 42 sits below it by more than the archive safety depth.
+        ChainStore::reset_to_anchor(&*server_db, &make_block_meta(200)).unwrap();
 
         let provider = provider_with(&url, Some(Arc::clone(&server_db) as Arc<dyn BlockStore>));
         let deadline = Instant::now() + Duration::from_secs(2);
         let resolved = provider.resolve_canonical_hash(42, deadline).await.unwrap();
         assert_eq!(resolved, consistent_header(42).hash);
-        assert_eq!(
-            server_db.get_archived_hash(42).unwrap(),
-            Some(resolved),
-            "resolved hash must be archived"
-        );
+
+        // The write-back is fire-and-forget on the blocking pool; wait for it to land.
+        let wait_deadline = Instant::now() + Duration::from_secs(2);
+        while server_db.get_archived_hash(42).unwrap() != Some(resolved) {
+            assert!(Instant::now() < wait_deadline, "write-back never landed in the archive");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert_eq!(
             ChainStore::get_block_hash(&*server_db, 42).unwrap(),
             None,
             "the canonical window must not be touched by a write-back"
         );
-        assert_eq!(DivergenceLookups::get_earliest(&*server_db).unwrap().unwrap().0, 100);
+        assert_eq!(DivergenceLookups::get_earliest(&*server_db).unwrap().unwrap().0, 200);
 
         // With the upstream gone, the height must now resolve from the archive.
         handle.stop().unwrap();

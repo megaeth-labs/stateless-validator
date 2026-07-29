@@ -779,8 +779,10 @@ fn run_prune_cycle(
         }
     }
 
-    // DB gauges: `db_earliest_block` is the canonical window's start; the
-    // `db_body_earliest_block` body-retention edge can sit above it under size pressure.
+    // DB gauges: `db_earliest_block` is the canonical window's start and
+    // `db_body_earliest_block` the body-retention edge; pruning moves both together, but
+    // they can diverge transiently (e.g. right after a stale reset, when the fresh
+    // anchor row has no stored body and pre-reset bodies still await pruning).
     let earliest = db.get_earliest().ok().flatten().map(|(n, _)| n).unwrap_or(0);
     chain_sync_metrics.set_db_block_range(earliest, current_tip);
     if let Ok(Some(body_earliest)) = db.get_earliest_block_record() {

@@ -19,11 +19,11 @@ use stateless_core::{
     },
 };
 use stateless_db::{
-    ANCHOR_BLOCK, BLOCK_DATA, BLOCK_RECORDS, CANONICAL_CHAIN, CONTRACTS, Database, HASH_ARCHIVE,
-    WITNESSES, block_meta_to_tuple, decode_block_from_slice, decode_from_slice,
-    encode_block_to_vec, encode_to_vec, read_anchor, read_block_hash, read_canonical_tip,
-    read_contracts, read_earliest_block, write_add_contracts, write_advance_chain,
-    write_rollback_chain,
+    ANCHOR_BLOCK, BLOCK_DATA, BLOCK_RECORDS, CANONICAL_CHAIN, CONTRACTS, ChainRow, Database,
+    HASH_ARCHIVE, WITNESSES, block_meta_to_tuple, decode_block_from_slice, decode_from_slice,
+    encode_block_to_vec, encode_to_vec, insert_chain_row, read_anchor, read_block_hash,
+    read_canonical_tip, read_contracts, read_earliest_block, write_add_contracts,
+    write_advance_chain, write_rollback_chain,
 };
 
 /// Block/witness storage — **debug-trace-server-only** (no other scenario stores raw
@@ -45,9 +45,11 @@ pub trait BlockStore: ChainStore + DivergenceLookups {
     /// the window misses; never by reorg bisection.
     fn get_archived_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>>;
     /// Archives an upstream-resolved canonical hash — the lazy write-back that makes the
-    /// next by-number request for this height resolve locally. Heights at or above the
-    /// canonical window's start are skipped silently: they are not depth-final yet, and
-    /// the window itself answers them.
+    /// next by-number request for this height resolve locally. Heights that are not yet
+    /// depth-final are skipped silently: at or above the canonical window's start the
+    /// window itself answers them, and heights within `ARCHIVE_MIN_DEPTH` of the window's
+    /// tip could still reorg (right after an anchor init or stale reset the window is a
+    /// single row at the remote tip, so "below the window" alone proves no depth).
     fn record_canonical_hash(
         &self,
         block_number: BlockNumber,
@@ -55,14 +57,25 @@ pub trait BlockStore: ChainStore + DivergenceLookups {
     ) -> StoreResult<()>;
 }
 
-/// Whether `block_number` lies strictly below the bounded CANONICAL_CHAIN window (i.e. is
-/// depth-final). `false` on an empty chain — with no local window there is no depth
-/// guarantee to lean on.
-fn below_chain_window(
-    chain: &impl ReadableTable<u64, ([u8; 32], [u8; 32], [u8; 32])>,
+/// Minimum depth below the canonical window's tip before an upstream-resolved hash may be
+/// archived permanently. An archived row is never re-checked against upstream, so it must
+/// sit deeper than any reorg plausible on the target chain — the window-start check alone
+/// cannot guarantee that while the window is freshly reset to a single row at the remote
+/// tip.
+const ARCHIVE_MIN_DEPTH: u64 = 64;
+
+/// Whether `block_number` is depth-final for the permanent archive: strictly below the
+/// bounded CANONICAL_CHAIN window *and* more than [`ARCHIVE_MIN_DEPTH`] below its tip.
+/// `false` on an empty chain — with no local window there is no depth guarantee to lean
+/// on.
+fn is_depth_final(
+    chain: &impl ReadableTable<u64, ChainRow>,
     block_number: BlockNumber,
 ) -> StoreResult<bool> {
-    Ok(matches!(chain.first().store_err()?, Some((k, _)) if block_number < k.value()))
+    let bounds = chain.first().store_err()?.zip(chain.last().store_err()?);
+    Ok(bounds.is_some_and(|((start, _), (tip, _))| {
+        block_number < start.value() && block_number < tip.value().saturating_sub(ARCHIVE_MIN_DEPTH)
+    }))
 }
 
 /// Block storage and chain tracking database for debug-trace-server.
@@ -142,7 +155,10 @@ impl ServerDB {
     /// Removes BLOCK_RECORDS + BLOCK_DATA + WITNESSES + CANONICAL_CHAIN rows strictly
     /// below `before_block`, moving each outgoing chain row's `(number, hash)` into
     /// HASH_ARCHIVE first (same transaction) — the locally verified number -> hash history
-    /// keeps serving canonical-hash resolution after the bodies are reclaimed. Returns the
+    /// keeps serving canonical-hash resolution after the bodies are reclaimed. The
+    /// archived hash always comes from the CANONICAL_CHAIN row, never from BLOCK_RECORDS:
+    /// records can hold reorged-away or never-canonicalized siblings at the same height
+    /// (rollback removes only chain rows), which must not feed the archive. Returns the
     /// number of BLOCK_RECORDS entries removed; orphaned CANONICAL_CHAIN rows (advanced
     /// but never stored) are archived and removed too, but not counted.
     pub fn prune_history(&self, before_block: BlockNumber) -> StoreResult<u64> {
@@ -165,8 +181,11 @@ impl ServerDB {
             let pruned_count = keys_to_remove.len() as u64;
 
             for (block_number, block_hash) in keys_to_remove {
-                archive.insert(block_number, block_hash).store_err()?;
-                canonical_chain.remove(block_number).store_err()?;
+                let canonical =
+                    canonical_chain.remove(block_number).store_err()?.map(|v| v.value().0);
+                if let Some(hash) = canonical {
+                    archive.insert(block_number, hash).store_err()?;
+                }
                 block_records.remove((block_number, block_hash)).store_err()?;
                 block_data.remove(block_hash).store_err()?;
                 witnesses.remove(block_hash).store_err()?;
@@ -304,12 +323,7 @@ impl ChainStore for ServerDB {
                 archive.insert(k.value(), v.value().0).store_err()?;
             }
             chain.retain(|_, _| false).store_err()?;
-            chain
-                .insert(
-                    anchor.block_number,
-                    (anchor.block_hash.0, anchor.post_state_root.0, anchor.post_withdrawals_root.0),
-                )
-                .store_err()?;
+            insert_chain_row(&mut chain, anchor)?;
         }
         write_txn.commit().store_err()?;
         Ok(())
@@ -352,8 +366,9 @@ impl BlockStore for ServerDB {
     /// A read-transaction pre-check filters the skip cases without touching redb's
     /// single-writer lock (above-tip heights arrive constantly, exactly while chain sync
     /// keeps that lock busiest); an actual write re-checks the gate inside its own
-    /// transaction. The window start only moves up (append-at-tip, prune-from-below), so
-    /// the race is benign in the safe direction. The commit uses
+    /// transaction, which is authoritative: the window start only moves up
+    /// (append-at-tip, prune-from-below) and a reorg can only roll the tip down, so the
+    /// re-check is at least as conservative as the pre-check. The commit uses
     /// [`redb::Durability::None`] to keep the fsync off the request path: losing the row
     /// to a crash costs one upstream refetch, and any later Immediate commit (chain sync
     /// advances constantly) makes it durable.
@@ -365,7 +380,7 @@ impl BlockStore for ServerDB {
         {
             let read_txn = self.database.begin_read().store_err()?;
             let chain = read_txn.open_table(CANONICAL_CHAIN).store_err()?;
-            if !below_chain_window(&chain, block_number)? {
+            if !is_depth_final(&chain, block_number)? {
                 return Ok(());
             }
         }
@@ -373,7 +388,7 @@ impl BlockStore for ServerDB {
         write_txn.set_durability(redb::Durability::None).store_err()?;
         {
             let chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
-            if !below_chain_window(&chain, block_number)? {
+            if !is_depth_final(&chain, block_number)? {
                 // Dropping the uncommitted txn aborts it; nothing is written.
                 return Ok(());
             }
@@ -623,6 +638,50 @@ mod tests {
         assert_eq!(db.get_earliest_block_record().unwrap(), Some(6));
     }
 
+    /// A reorg leaves sibling BLOCK_RECORDS rows at the same height (rollback removes
+    /// only chain rows), so pruning must archive the CANONICAL_CHAIN row's hash — never
+    /// whichever record sorts last. Sibling hashes sit on both sides of the canonical one
+    /// so an ordering-dependent implementation fails deterministically.
+    #[test]
+    fn test_prune_history_archives_canonical_hash_not_reorged_siblings() {
+        let (_dir, db) = temp_server_db();
+
+        let canon = |n: u64| make_block_meta(n).block_hash;
+        let dead_high = BlockHash::from([0xFF; 32]); // sorts after canon(1)
+        let dead_low = BlockHash::from([0u8; 32]); // sorts before canon(2)
+        let stray = BlockHash::from([9u8; 32]); // height 0: stored but never canonicalized
+
+        let bodies: Vec<_> = [
+            (0, stray),
+            (1, dead_high),
+            (1, canon(1)),
+            (2, dead_low),
+            (2, canon(2)),
+            (3, canon(3)),
+        ]
+        .map(|(n, hash)| (make_test_block(n, hash), empty_light_witness()))
+        .into();
+        db.store_block_data(&bodies).unwrap();
+        let metas: Vec<BlockMeta> = (1..=3).map(make_block_meta).collect();
+        ChainStore::advance_chain(&db, &metas).unwrap();
+
+        let pruned = db.prune_history(3).unwrap();
+        assert_eq!(pruned, 5, "five records lie below the cutoff");
+
+        // The canonical hashes are archived regardless of how the siblings sort…
+        assert_eq!(db.get_archived_hash(1).unwrap(), Some(canon(1)));
+        assert_eq!(db.get_archived_hash(2).unwrap(), Some(canon(2)));
+        // …and a height that never entered the canonical chain is not archived at all.
+        assert_eq!(db.get_archived_hash(0).unwrap(), None);
+
+        // All sibling bodies below the cutoff are reclaimed; the window keeps height 3.
+        for hash in [stray, dead_high, canon(1), dead_low, canon(2)] {
+            assert!(db.get_block_and_witness(hash).is_err());
+        }
+        assert!(db.get_block_and_witness(canon(3)).is_ok());
+        assert_eq!(DivergenceLookups::get_earliest(&db).unwrap().unwrap().0, 3);
+    }
+
     #[test]
     fn test_server_db_store_and_get_block_and_witness() {
         let (_dir, db) = temp_server_db();
@@ -687,11 +746,12 @@ mod tests {
         assert!(ChainStore::get_block_hash(&db, 5).unwrap().is_none());
     }
 
-    /// The lazy write-back archives only heights strictly below the canonical window:
-    /// in-window and above-tip heights (and writes on an empty chain) are skipped
-    /// silently, and the chain window itself is never mutated by a write-back.
+    /// The lazy write-back archives only depth-final heights: strictly below the
+    /// canonical window AND more than `ARCHIVE_MIN_DEPTH` below its tip. Empty-chain,
+    /// in-window, above-tip, and shallow post-reset heights are skipped silently, and the
+    /// chain window itself is never mutated by a write-back.
     #[test]
-    fn record_canonical_hash_only_archives_below_window() {
+    fn record_canonical_hash_only_archives_depth_final_heights() {
         let (_dir, db) = temp_server_db();
         let hash = |n: u64| make_block_meta(n).block_hash;
 
@@ -699,22 +759,33 @@ mod tests {
         db.record_canonical_hash(5, hash(5)).unwrap();
         assert_eq!(db.get_archived_hash(5).unwrap(), None);
 
-        // The anchor-init path installs the window at {10}.
-        ChainStore::reset_to_anchor(&db, &make_block_meta(10)).unwrap();
+        // The anchor-init path installs the window as a single row at the remote tip.
+        ChainStore::reset_to_anchor(&db, &make_block_meta(100)).unwrap();
 
-        // Below the window: archived; the chain window and its cursors stay put.
+        // Deep below the tip: archived; the chain window and its cursors stay put.
         db.record_canonical_hash(5, hash(5)).unwrap();
         assert_eq!(db.get_archived_hash(5).unwrap(), Some(hash(5)));
         assert_eq!(ChainStore::get_block_hash(&db, 5).unwrap(), None);
-        assert_eq!(DivergenceLookups::get_earliest(&db).unwrap().unwrap().0, 10);
-        assert_eq!(db.get_local_tip().unwrap().unwrap().0, 10);
+        assert_eq!(DivergenceLookups::get_earliest(&db).unwrap().unwrap().0, 100);
+        assert_eq!(db.get_local_tip().unwrap().unwrap().0, 100);
 
-        // At the window start and above the tip: skipped — not depth-final yet.
-        db.record_canonical_hash(10, BlockHash::from([0xAA; 32])).unwrap();
-        db.record_canonical_hash(12, hash(12)).unwrap();
-        assert_eq!(db.get_archived_hash(10).unwrap(), None);
-        assert_eq!(db.get_archived_hash(12).unwrap(), None);
-        assert_eq!(ChainStore::get_block_hash(&db, 10).unwrap(), Some(hash(10)));
-        assert_eq!(db.get_local_tip().unwrap().unwrap().0, 10);
+        // Below the fresh single-row window but too close to its tip: skipped — right
+        // after a reset "below the window" can mean one block deep, and those heights
+        // could still reorg. One deeper than the margin is archivable again.
+        let boundary = 100 - ARCHIVE_MIN_DEPTH;
+        db.record_canonical_hash(99, hash(99)).unwrap();
+        db.record_canonical_hash(boundary, hash(boundary)).unwrap();
+        assert_eq!(db.get_archived_hash(99).unwrap(), None);
+        assert_eq!(db.get_archived_hash(boundary).unwrap(), None);
+        db.record_canonical_hash(boundary - 1, hash(boundary - 1)).unwrap();
+        assert_eq!(db.get_archived_hash(boundary - 1).unwrap(), Some(hash(boundary - 1)));
+
+        // At the window start and above the tip: skipped — the window answers those.
+        db.record_canonical_hash(100, BlockHash::from([0xAA; 32])).unwrap();
+        db.record_canonical_hash(102, hash(102)).unwrap();
+        assert_eq!(db.get_archived_hash(100).unwrap(), None);
+        assert_eq!(db.get_archived_hash(102).unwrap(), None);
+        assert_eq!(ChainStore::get_block_hash(&db, 100).unwrap(), Some(hash(100)));
+        assert_eq!(db.get_local_tip().unwrap().unwrap().0, 100);
     }
 }
