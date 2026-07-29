@@ -309,6 +309,8 @@ const CANONICAL_HASH_RESOLUTION_TOTAL: &str = "debug_trace_canonical_hash_resolu
 /// Records one canonical-hash resolution attempt against `source` (`"db"` | `"memo"` |
 /// `"upstream"`) with `outcome` (`"ok"` | `"miss"` | `"error"`; the in-memory memo cannot
 /// error, and upstream has no miss — a missing block is an error from the retry loop).
+/// `source = "tip_seed"` (`"ok"` | `"error"`) counts the throttled `eth_blockNumber`
+/// fetches that teach the memo's depth gate the tip when no other tip source exists.
 pub fn record_canonical_hash_resolution(source: &'static str, outcome: &'static str) {
     counter!(CANONICAL_HASH_RESOLUTION_TOTAL, "source" => source, "outcome" => outcome)
         .increment(1);
@@ -506,6 +508,8 @@ fn pre_register_all_metrics() {
         ("memo", "miss"),
         ("upstream", "ok"),
         ("upstream", "error"),
+        ("tip_seed", "ok"),
+        ("tip_seed", "error"),
     ] {
         counter!(CANONICAL_HASH_RESOLUTION_TOTAL, "source" => source, "outcome" => outcome)
             .increment(0);

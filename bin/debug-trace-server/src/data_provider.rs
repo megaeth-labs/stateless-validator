@@ -31,7 +31,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -149,16 +149,34 @@ pub const DEFAULT_CANONICAL_HASH_MEMO_CAPACITY: u64 = 8_000_000;
 
 /// Minimum depth below the observed tip before an upstream-resolved number → hash binding
 /// may be memoized. A memoized binding is served without re-checking upstream for as long
-/// as it stays cached, so it must lie deeper than any reorg plausible on the target
-/// chain; shallow heights resolve upstream on every request instead.
+/// as it stays cached, so this margin carries the memo's safety argument. The operating
+/// assumption it encodes: **reorgs on the target chain never run deeper than this** —
+/// less the slack the tip hint itself can carry after a reorg (see `tip_hint`), so the
+/// effective headroom is this constant minus the deepest reorg since startup. Shallow
+/// heights resolve upstream on every request instead.
 ///
-/// This gate is the memo's entire reorg story — deliberately, no pipeline invalidation
-/// hook exists for it: in local-cache mode a memoizable height already lies below the
-/// sync window (the window answers everything it covers before the memo is consulted),
-/// and pipeline reorg handling never reaches below the window's start, so there is no
-/// event that could fire; in stateless mode there is no pipeline at all, the margin
-/// alone carries the argument, and an entry cannot outlive the process.
+/// In local-cache mode the assumption is additionally defended by hooks: the sync window
+/// answers every height it covers before the memo is consulted, and the chain-sync
+/// pipeline clears the memo on a stale reset and on any reorg at least this deep
+/// (`TraceHooks` in `chain_sync`). In stateless mode there is no pipeline and the margin
+/// alone is the argument — a deeper reorg would pin the orphaned hashes for the affected
+/// heights until the process restarts, with nothing to detect it.
 const CANONICAL_MEMO_MIN_DEPTH: u64 = 64;
+
+/// Minimum interval between upstream tip seeds (`eth_blockNumber`), fired when neither
+/// the tip hint nor the local window can decide whether a height is depth-final —
+/// without one, a numeric-only client in stateless mode would never raise the hint (a
+/// header cannot qualify its own height) and the memo would stay permanently empty. The
+/// throttle bounds the extra upstream call to one per interval across all requests;
+/// requests inside the window skip memoization for that round, and the resulting hint
+/// staleness only under-estimates (blocks becoming final meanwhile stay unmemoized a
+/// little longer), which is the safe direction.
+const TIP_SEED_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Cap on one tip seed's upstream wait, applied on top of the request's own deadline.
+/// The seed only enables future memoization — the caller's answer is already in hand —
+/// so a degraded upstream must not eat the request's remaining budget retrying it.
+const TIP_SEED_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Slow stage threshold: any individual stage exceeding this triggers a warn log.
 pub(crate) const SLOW_STAGE_THRESHOLD_MS: u128 = 1000;
@@ -314,13 +332,60 @@ pub(crate) struct DataProvider {
     /// Bounded in-memory memo of depth-final number → canonical-hash bindings, filled by
     /// upstream resolutions for heights the sync window no longer (or never) covers.
     /// Restart-cold by design: the first request per height after a restart pays one
-    /// upstream header fetch, and a stale entry cannot outlive the process.
-    canonical_hash_memo: Cache<u64, B256>,
+    /// upstream header fetch, and a stale entry cannot outlive the process. Shared with
+    /// the chain-sync hooks (see [`CanonicalHashMemo`]).
+    canonical_hash_memo: CanonicalHashMemo,
     /// Monotonic maximum chain height observed from upstream answers (latest-tag
-    /// resolutions, verified headers) and the local window tip. Only real on-chain
-    /// numbers feed it, so it never exceeds the true tip — a safe under-estimate for the
-    /// memo's depth gate.
+    /// resolutions, verified headers, tip seeds) and the local window tip. Only real
+    /// on-chain numbers feed it, so it never exceeds the highest height ever seen as
+    /// canonical — but a reorg lowers the real tip while the hint stays put, so it can
+    /// overshoot the *current* tip by up to the reorg's depth. The memo gate's effective
+    /// margin is therefore [`CANONICAL_MEMO_MIN_DEPTH`] minus the deepest reorg since
+    /// startup; that is the precise form of the depth-finality claim.
     tip_hint: AtomicU64,
+    /// Earliest instant the next upstream tip seed may fire. The lock's winner advances
+    /// it by [`TIP_SEED_MIN_INTERVAL`], so exactly one request per interval pays the
+    /// `eth_blockNumber` round-trip; it is only ever touched after the depth gate has
+    /// already failed, never on hit paths.
+    tip_seed_next: Mutex<Instant>,
+}
+
+/// Shared handle to the bounded number → canonical-hash memo. The chain-sync hooks hold a
+/// clone so pipeline events can invalidate memoized bindings alongside the response
+/// cache; the memo owns the reaction policy (see [`CANONICAL_MEMO_MIN_DEPTH`]), the
+/// hooks only forward the events.
+#[derive(Clone)]
+pub(crate) struct CanonicalHashMemo(Arc<Cache<u64, B256>>);
+
+impl CanonicalHashMemo {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self(Arc::new(Cache::new(capacity)))
+    }
+
+    pub(crate) fn get(&self, block_num: &u64) -> Option<B256> {
+        self.0.get(block_num)
+    }
+
+    pub(crate) fn insert(&self, block_num: u64, hash: B256) {
+        self.0.insert(block_num, hash);
+    }
+
+    /// Drops every memoized binding; they refill lazily at one header fetch per height.
+    pub(crate) fn clear(&self) {
+        self.0.clear();
+    }
+
+    /// Reorg reaction: a reorg at least [`CANONICAL_MEMO_MIN_DEPTH`] deep breaches the
+    /// margin every memoized binding relied on — some heights may now bind to orphaned
+    /// hashes, and once the sync window slides past them nothing else would ever correct
+    /// the binding — so the whole memo goes. Shallower reorgs cannot touch memoized
+    /// (depth-final) heights by construction and keep the memo intact.
+    pub(crate) fn on_reorg(&self, depth: u64) {
+        if depth >= CANONICAL_MEMO_MIN_DEPTH {
+            warn!(depth, "Deep reorg; clearing the canonical-hash memo");
+            self.0.clear();
+        }
+    }
 }
 
 impl DataProvider {
@@ -350,14 +415,46 @@ impl DataProvider {
             witness_cfg,
             block_fetch_timeout,
             in_flight: DashMap::new(),
-            canonical_hash_memo: Cache::new(canonical_hash_memo_capacity),
+            canonical_hash_memo: CanonicalHashMemo::new(canonical_hash_memo_capacity),
             tip_hint: AtomicU64::new(0),
+            tip_seed_next: Mutex::new(Instant::now()),
         }
+    }
+
+    /// Clonable handle to the canonical-hash memo, for the chain-sync invalidation hooks.
+    pub(crate) fn canonical_hash_memo(&self) -> CanonicalHashMemo {
+        self.canonical_hash_memo.clone()
     }
 
     /// Folds an observed on-chain height into the monotonic tip hint.
     fn observe_tip(&self, block_number: u64) {
         self.tip_hint.fetch_max(block_number, Ordering::Relaxed);
+    }
+
+    /// Learns the current tip from upstream (`eth_blockNumber`) so the memo's depth gate
+    /// can decide, when neither the hint nor a local window tip could. Throttled to one
+    /// upstream call per [`TIP_SEED_MIN_INTERVAL`] and best-effort: throttled or failed
+    /// seeds just skip memoization for this round, costing one repeat header fetch later.
+    async fn seed_tip_from_upstream(&self, deadline: Instant) {
+        let now = Instant::now();
+        {
+            let mut next = self.tip_seed_next.lock().unwrap();
+            if now < *next {
+                return;
+            }
+            *next = now + TIP_SEED_MIN_INTERVAL;
+        }
+        let deadline = deadline.min(now + TIP_SEED_TIMEOUT);
+        match self.rpc_client.get_latest_block_number_with_deadline(Some(deadline)).await {
+            Ok(tip) => {
+                record_canonical_hash_resolution("tip_seed", "ok");
+                self.observe_tip(tip);
+            }
+            Err(e) => {
+                record_canonical_hash_resolution("tip_seed", "error");
+                debug!(error = %e, "Upstream tip seed failed; skipping memoization this round");
+            }
+        }
     }
 
     /// Mints the single wall-clock deadline for one user-facing request, from
@@ -384,7 +481,8 @@ impl DataProvider {
     /// [`CANONICAL_MEMO_MIN_DEPTH`] below the observed tip, where the binding can no
     /// longer reorg — so repeat requests for historical heights resolve locally for the
     /// lifetime of the process. Shallow and above-window heights resolve upstream every
-    /// time.
+    /// time. When neither the hint nor a window tip can decide (stateless mode with
+    /// numeric-only traffic), a throttled `eth_blockNumber` seed learns the tip.
     pub(crate) async fn resolve_canonical_hash(
         &self,
         block_num: u64,
@@ -432,16 +530,23 @@ impl DataProvider {
             }
         };
 
-        // Memoize only depth-final heights. The tip hint never exceeds the real tip, so a
-        // gate that passes on it is final — consult the sync window's tip only when the
-        // hint alone cannot admit the height (typically just the first resolution after
-        // startup; a header can never qualify its own height).
+        // Memoize only depth-final heights. The tip hint never exceeds the highest height
+        // ever seen as canonical (see `tip_hint` for the reorg-slack caveat), so a gate
+        // that passes on it is final within the `CANONICAL_MEMO_MIN_DEPTH` assumption.
+        // When the hint alone cannot admit the height (typically just the first
+        // resolution after startup — a header can never qualify its own height), consult
+        // the sync window's tip; without one (stateless mode, or an empty window) fall
+        // back to a throttled upstream tip seed. A present-but-lagging window tip gets no
+        // seed: the window is that mode's authority, its lag is bounded by the
+        // stale-reset threshold, and skipped memoization is only ever a missed
+        // optimization.
         self.observe_tip(header.number);
         let gate = |hint: u64| block_num < hint.saturating_sub(CANONICAL_MEMO_MIN_DEPTH);
-        if !gate(self.tip_hint.load(Ordering::Relaxed)) &&
-            let Some(tip) = db_tip_height(self.db.as_deref())
-        {
-            self.observe_tip(tip);
+        if !gate(self.tip_hint.load(Ordering::Relaxed)) {
+            match db_tip_height(self.db.as_deref()) {
+                Some(tip) => self.observe_tip(tip),
+                None => self.seed_tip_from_upstream(deadline).await,
+            }
         }
         if gate(self.tip_hint.load(Ordering::Relaxed)) {
             self.canonical_hash_memo.insert(block_num, header.hash);
@@ -1049,9 +1154,12 @@ mod tests {
         alloy_rpc_types_eth::Header { hash: inner.hash_slow(), inner, ..Default::default() }
     }
 
-    /// Serves `eth_getHeaderByNumber` with a self-consistent header for any number.
-    async fn start_mock_rpc() -> (ServerHandle, String) {
-        let mut module = RpcModule::new(());
+    /// Serves `eth_getHeaderByNumber` with a self-consistent header for any number, and
+    /// `eth_blockNumber` with `tip` — counting the latter's calls so tip-seed tests can
+    /// assert whether (and how often) the seed fired.
+    async fn start_mock_rpc(tip: u64) -> (ServerHandle, String, Arc<AtomicUsize>) {
+        let seed_hits = Arc::new(AtomicUsize::new(0));
+        let mut module = RpcModule::new(seed_hits.clone());
         module
             .register_method("eth_getHeaderByNumber", |params, _, _| {
                 let (hex,): (String,) = params.parse().unwrap();
@@ -1059,10 +1167,16 @@ mod tests {
                 Ok::<_, ErrorObjectOwned>(consistent_header(n))
             })
             .unwrap();
+        module
+            .register_method("eth_blockNumber", move |_params, seed_hits, _| {
+                seed_hits.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, ErrorObjectOwned>(format!("{tip:#x}"))
+            })
+            .unwrap();
         let server =
             jsonrpsee::server::ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", server.local_addr().unwrap());
-        (server.start(module), url)
+        (server.start(module), url, seed_hits)
     }
 
     use super::*;
@@ -1199,7 +1313,7 @@ mod tests {
     /// self-consistent headers.
     #[tokio::test]
     async fn resolve_canonical_hash_resolves_upstream_without_db_or_on_db_miss() {
-        let (handle, url) = start_mock_rpc().await;
+        let (handle, url, _seed_hits) = start_mock_rpc(1_000_000).await;
 
         for db in [None, Some(None)] {
             let provider = provider_at(&url, db);
@@ -1223,7 +1337,7 @@ mod tests {
 
         use crate::server_db::test_support::make_block_meta;
 
-        let (handle, url) = start_mock_rpc().await;
+        let (handle, url, seed_hits) = start_mock_rpc(200).await;
         let dir = tempfile::tempdir().unwrap();
         let server_db =
             Arc::new(crate::server_db::ServerDB::new(dir.path().join("t.redb")).unwrap());
@@ -1243,6 +1357,11 @@ mod tests {
             "the canonical window must not be touched by memoization"
         );
         assert_eq!(DivergenceLookups::get_earliest(&*server_db).unwrap().unwrap().0, 200);
+        assert_eq!(
+            seed_hits.load(Ordering::Relaxed),
+            0,
+            "a present window tip must gate the memo without an upstream tip seed"
+        );
 
         // With the upstream gone: the depth-final height serves from the memo; the
         // shallow one must go upstream every time, and now fails.
@@ -1251,6 +1370,55 @@ mod tests {
         assert_eq!(provider.resolve_canonical_hash(42, deadline).await.unwrap(), resolved);
         let deadline = Instant::now() + Duration::from_millis(300);
         assert!(provider.resolve_canonical_hash(199, deadline).await.is_err());
+    }
+
+    /// Stateless mode with numeric-only traffic: no `latest` lookup ever raises the tip
+    /// hint, so the first resolution must learn the tip itself — via the throttled
+    /// `eth_blockNumber` seed — for the memo to ever fill. Later depth-final heights are
+    /// admitted by the seeded hint and shallow heights stay unmemoized, both without a
+    /// second seed call (the throttle); pinned by the seed counter and by stopping the
+    /// upstream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_canonical_hash_seeds_tip_for_stateless_numeric_traffic() {
+        let (handle, url, seed_hits) = start_mock_rpc(500).await;
+        let provider = provider_at(&url, None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        // Cold hint: height 42 alone cannot pass the gate, so the seed fires once and
+        // tip 500 admits it as depth-final.
+        let deep = provider.resolve_canonical_hash(42, deadline).await.unwrap();
+        assert_eq!(deep, consistent_header(42).hash);
+        assert_eq!(seed_hits.load(Ordering::Relaxed), 1, "cold hint must seed exactly once");
+
+        // 400 passes on the seeded hint (500 - 64 = 436); 450 fails the gate and its
+        // seed attempt lands inside the throttle window. Neither re-fetches the tip.
+        let mid = provider.resolve_canonical_hash(400, deadline).await.unwrap();
+        let shallow = provider.resolve_canonical_hash(450, deadline).await.unwrap();
+        assert_eq!(shallow, consistent_header(450).hash);
+        assert_eq!(seed_hits.load(Ordering::Relaxed), 1, "further seeds must be throttled");
+
+        // Upstream gone: both depth-final heights serve from the memo; the shallow one
+        // was never memoized and must fail upstream.
+        handle.stop().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        assert_eq!(provider.resolve_canonical_hash(42, deadline).await.unwrap(), deep);
+        assert_eq!(provider.resolve_canonical_hash(400, deadline).await.unwrap(), mid);
+        assert!(provider.resolve_canonical_hash(450, deadline).await.is_err());
+    }
+
+    /// The memo owns its reorg policy: reorgs shallower than the finality margin cannot
+    /// touch memoized (depth-final) heights and leave the memo intact; from the margin
+    /// on, the assumption every binding relied on is breached and everything goes.
+    #[test]
+    fn only_margin_deep_reorgs_clear_the_memo() {
+        let memo = CanonicalHashMemo::new(16);
+        memo.insert(42, B256::from([1u8; 32]));
+
+        memo.on_reorg(CANONICAL_MEMO_MIN_DEPTH - 1);
+        assert!(memo.get(&42).is_some(), "a sub-margin reorg must keep the memo");
+
+        memo.on_reorg(CANONICAL_MEMO_MIN_DEPTH);
+        assert!(memo.get(&42).is_none(), "a margin-deep reorg must clear the memo");
     }
 
     /// A hanging upstream surfaces as a typed `Timeout` bounded by the caller's deadline —

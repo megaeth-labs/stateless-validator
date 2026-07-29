@@ -17,7 +17,9 @@ use stateless_core::{
     pipeline::{BlockFetcher, BlockProcessor, PipelineHooks},
 };
 
-use crate::{metrics, response_cache::ResponseCache, server_db::BlockStore};
+use crate::{
+    data_provider::CanonicalHashMemo, metrics, response_cache::ResponseCache, server_db::BlockStore,
+};
 
 /// Fetcher for the trace server: fetches blocks + witnesses, discards MPT witness.
 ///
@@ -122,17 +124,27 @@ impl BlockProcessor for TraceProcessor {
     }
 }
 
-/// Pipeline hooks for the trace server: store block data before advancing,
-/// invalidate cache on reorg.
+/// Pipeline hooks for the trace server: store block data before advancing, invalidate
+/// the response cache and the canonical-hash memo on reorg / stale-reset events.
 pub struct TraceHooks {
     pub db: Arc<dyn BlockStore>,
     pub response_cache: Option<ResponseCache>,
+    pub canonical_hash_memo: CanonicalHashMemo,
     pub chain_sync_metrics: metrics::ChainSyncMetrics,
 }
 
 impl TraceHooks {
-    pub fn new(db: Arc<dyn BlockStore>, response_cache: Option<ResponseCache>) -> Self {
-        Self { db, response_cache, chain_sync_metrics: metrics::ChainSyncMetrics::create() }
+    pub fn new(
+        db: Arc<dyn BlockStore>,
+        response_cache: Option<ResponseCache>,
+        canonical_hash_memo: CanonicalHashMemo,
+    ) -> Self {
+        Self {
+            db,
+            response_cache,
+            canonical_hash_memo,
+            chain_sync_metrics: metrics::ChainSyncMetrics::create(),
+        }
     }
 }
 
@@ -152,7 +164,7 @@ impl PipelineHooks for TraceHooks {
     fn on_reorg(
         &self,
         _rollback_to: BlockNumber,
-        _depth: u64,
+        depth: u64,
         reverted_hashes: &[BlockHash],
     ) -> eyre::Result<()> {
         if !reverted_hashes.is_empty() {
@@ -165,6 +177,7 @@ impl PipelineHooks for TraceHooks {
                 cache.invalidate_blocks(reverted_hashes);
             }
         }
+        self.canonical_hash_memo.on_reorg(depth);
         Ok(())
     }
 
@@ -172,6 +185,11 @@ impl PipelineHooks for TraceHooks {
         if let Some(cache) = &self.response_cache {
             cache.invalidate_all();
         }
+        // Belt-and-braces: memoized bindings are depth-final by construction, but a stale
+        // reset means we fell far behind and re-anchored blind to whatever happened
+        // upstream meanwhile — drop the memo with the response cache; it refills lazily
+        // at one header fetch per height.
+        self.canonical_hash_memo.clear();
         Ok(())
     }
 }
@@ -185,16 +203,35 @@ mod tests {
     use super::*;
     use crate::server_db::test_support::{StaticHashStore, make_block_meta};
 
-    #[test]
-    fn test_trace_hooks_reorg_without_cache() {
-        let hooks = TraceHooks::new(Arc::new(StaticHashStore(None)), None);
-        hooks.on_reorg(10, 2, &[Default::default()]).unwrap();
+    fn test_memo() -> CanonicalHashMemo {
+        CanonicalHashMemo::new(16)
     }
 
+    /// A stale reset drops every memoized number → hash binding along with the response
+    /// cache: the node re-anchored blind to whatever happened upstream in between.
     #[test]
-    fn test_trace_hooks_stale_reset() {
-        let hooks = TraceHooks::new(Arc::new(StaticHashStore(None)), None);
+    fn stale_reset_clears_canonical_hash_memo() {
+        let memo = test_memo();
+        memo.insert(42, B256::from([1u8; 32]));
+        let hooks = TraceHooks::new(Arc::new(StaticHashStore(None)), None, memo.clone());
         hooks.on_stale_reset(&make_block_meta(100)).unwrap();
+        assert!(memo.get(&42).is_none());
+    }
+
+    /// The reorg hook forwards the depth to the memo, which owns the clearing policy:
+    /// shallow reorgs leave it intact, deep ones drop it (the exact boundary is pinned by
+    /// the memo's own test in `data_provider`).
+    #[test]
+    fn reorg_depth_reaches_the_memo() {
+        let memo = test_memo();
+        memo.insert(42, B256::from([1u8; 32]));
+        let hooks = TraceHooks::new(Arc::new(StaticHashStore(None)), None, memo.clone());
+
+        hooks.on_reorg(10, 1, &[Default::default()]).unwrap();
+        assert!(memo.get(&42).is_some(), "a shallow reorg must not clear the memo");
+
+        hooks.on_reorg(10, 1_000, &[Default::default()]).unwrap();
+        assert!(memo.get(&42).is_none(), "a deep reorg must clear the memo");
     }
 
     /// A reorg evicts exactly the reverted hashes' entries — across resources — and leaves
@@ -217,7 +254,8 @@ mod tests {
             cache.insert(resource, hash, ResponseVariant::Default, &serde_json::json!({"v": 1}));
         }
 
-        let hooks = TraceHooks::new(Arc::new(StaticHashStore(None)), Some(cache.clone()));
+        let hooks =
+            TraceHooks::new(Arc::new(StaticHashStore(None)), Some(cache.clone()), test_memo());
         hooks.on_reorg(10, 1, &[h1]).unwrap();
 
         assert!(cache.get(CachedResource::DebugTraceBlock, h1, ResponseVariant::Default).is_none());

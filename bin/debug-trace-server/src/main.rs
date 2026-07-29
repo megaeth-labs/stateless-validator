@@ -529,6 +529,7 @@ async fn main() -> Result<()> {
         let hooks = Arc::new(TraceHooks::new(
             Arc::clone(db) as Arc<dyn BlockStore>,
             response_cache.clone(),
+            data_provider.canonical_hash_memo(),
         ));
         let fetcher = Arc::new(TraceFetcher { rpc_client: Arc::clone(&rpc_client) });
         task::spawn({

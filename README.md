@@ -109,7 +109,9 @@ Disable the cache with `--response-cache-disabled`; `--response-cache-estimated-
 **Canonical-hash memo:**
 `CANONICAL_CHAIN` stays a bounded, contiguous sync window; heights outside it resolve number → hash upstream once, and the hash-verified answer is memoized in a bounded in-memory LRU.
 Only depth-final heights are memoized (more than a safety depth below the observed tip, so a memoized binding can no longer reorg); shallow and above-tip heights resolve upstream on every request.
+The observed tip comes from the local window and `latest`-tag lookups; when neither exists (stateless mode with numeric-only traffic), a throttled upstream `eth_blockNumber` seed learns it, so the memo fills there too.
 Resolution order is window → memo → upstream, so historical heights resolve locally after first touch for the lifetime of the process; a restart clears the memo, and reorg bisection reads only the window.
+In local cache mode chain sync also clears the memo on a stale reset and on any reorg at least the safety depth deep; in stateless mode the depth margin alone carries the safety argument (assumed deeper reorgs never happen on the target chain).
 The memo holds `--canonical-hash-memo-capacity` entries (default 8M, roughly 80 bytes each; it fills lazily, so the cap costs nothing until a deep historical scan uses it).
 
 **Size-based pruning:**
