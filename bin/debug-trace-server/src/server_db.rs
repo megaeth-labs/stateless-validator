@@ -20,21 +20,19 @@ use stateless_core::{
 };
 use stateless_db::{
     ANCHOR_BLOCK, BLOCK_DATA, BLOCK_RECORDS, CANONICAL_CHAIN, CONTRACTS, Database, HASH_ARCHIVE,
-    WITNESSES, decode_block_from_slice, decode_from_slice, encode_block_to_vec, encode_to_vec,
-    read_anchor, read_archived_hash, read_block_hash, read_canonical_tip, read_contracts,
-    read_earliest_block, write_add_contracts, write_advance_chain,
-    write_archived_hash_below_window, write_reset_to_anchor_archiving, write_rollback_chain,
+    WITNESSES, block_meta_to_tuple, decode_block_from_slice, decode_from_slice,
+    encode_block_to_vec, encode_to_vec, read_anchor, read_block_hash, read_canonical_tip,
+    read_contracts, read_earliest_block, write_add_contracts, write_advance_chain,
+    write_rollback_chain,
 };
 
-/// Block/witness storage + history pruning — **debug-trace-server-only**. This capability is
-/// specific to this bin (no other scenario stores raw blocks/witnesses or prunes a per-block
-/// chain on a schedule), so it lives here rather than as a stateless-core trait.
+/// Block/witness storage — **debug-trace-server-only** (no other scenario stores raw
+/// blocks/witnesses), so it lives here rather than as a stateless-core trait.
 ///
-/// Supertraits: [`ChainStore`] (chain cursors) + [`DivergenceLookups`] (this bin bisects on reorg,
-/// and the DB-range metric reads `get_earliest`). Pruning is not part of the trait: the
-/// history pruner works on the concrete [`ServerDB`] (inherent
-/// `prune_history`), while this trait is the read/append seam shared with `DataProvider`
-/// and chain sync.
+/// Supertraits: [`ChainStore`] (chain cursors) + [`DivergenceLookups`] (this bin bisects on
+/// reorg, and the DB-range metric reads `get_earliest`). History pruning is not part of the
+/// trait — the pruner works on the concrete [`ServerDB`] — leaving this the read/append
+/// seam shared with `DataProvider` and chain sync.
 pub trait BlockStore: ChainStore + DivergenceLookups {
     fn store_block_data(&self, blocks: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()>;
     fn get_block_and_witness(
@@ -55,6 +53,16 @@ pub trait BlockStore: ChainStore + DivergenceLookups {
         block_number: BlockNumber,
         block_hash: BlockHash,
     ) -> StoreResult<()>;
+}
+
+/// Whether `block_number` lies strictly below the bounded CANONICAL_CHAIN window (i.e. is
+/// depth-final). `false` on an empty chain — with no local window there is no depth
+/// guarantee to lean on.
+fn below_chain_window(
+    chain: &impl ReadableTable<u64, ([u8; 32], [u8; 32], [u8; 32])>,
+    block_number: BlockNumber,
+) -> StoreResult<bool> {
+    Ok(matches!(chain.first().store_err()?, Some((k, _)) if block_number < k.value()))
 }
 
 /// Block storage and chain tracking database for debug-trace-server.
@@ -134,15 +142,12 @@ impl ServerDB {
     /// Removes BLOCK_RECORDS + BLOCK_DATA + WITNESSES + CANONICAL_CHAIN rows strictly
     /// below `before_block`, moving each outgoing chain row's `(number, hash)` into
     /// HASH_ARCHIVE first (same transaction) — the locally verified number -> hash history
-    /// keeps serving canonical-hash resolution at ~40 bytes per block after the bodies are
-    /// reclaimed. The returned count is the number of BLOCK_RECORDS entries removed; a
-    /// second pass also archives-and-removes orphaned CANONICAL_CHAIN entries below
-    /// `before_block` that had no matching BLOCK_RECORDS row (advanced but never stored),
-    /// which are NOT reflected in the count.
+    /// keeps serving canonical-hash resolution after the bodies are reclaimed. Returns the
+    /// number of BLOCK_RECORDS entries removed; orphaned CANONICAL_CHAIN rows (advanced
+    /// but never stored) are archived and removed too, but not counted.
     pub fn prune_history(&self, before_block: BlockNumber) -> StoreResult<u64> {
         // Single write txn: scan + delete under one snapshot so a concurrently-committed
         // row below `before_block` can't slip past the scan and leak as an orphan.
-        // Same pattern as `write_rollback_chain` in stateless-db's helpers.
         let write_txn = self.database.begin_write().store_err()?;
         let pruned_count = {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
@@ -190,9 +195,8 @@ impl ServerDB {
         Ok(pruned_count)
     }
 
-    /// Earliest BLOCK_RECORDS entry — the lower edge of body/witness retention. The
-    /// canonical index now outlives the bodies, so `get_earliest` no longer reflects what
-    /// this reports.
+    /// Earliest BLOCK_RECORDS entry — the lower edge of body/witness retention, distinct
+    /// from `get_earliest` (the chain window's start).
     pub fn get_earliest_block_record(&self) -> StoreResult<Option<BlockNumber>> {
         let read_txn = self.database.begin_read().store_err()?;
         let records = read_txn.open_table(BLOCK_RECORDS).store_err()?;
@@ -283,9 +287,32 @@ impl ChainStore for ServerDB {
     }
 
     fn reset_to_anchor(&self, anchor: &BlockMeta) -> StoreResult<()> {
-        // Archiving variant: the locally verified rows move into HASH_ARCHIVE before the
-        // wipe, staying serviceable for number -> hash resolution.
-        write_reset_to_anchor_archiving(&self.database, anchor)
+        // Unlike the validator's plain wipe (`write_reset_to_anchor`), the trace server
+        // archives every current chain row's `(number, hash)` before clearing: the rows
+        // were locally verified, and a stale reset only fires when the chain lags the
+        // remote by at least the retention window, so they are depth-final by
+        // construction and stay serviceable for number -> hash resolution.
+        let write_txn = self.database.begin_write().store_err()?;
+        {
+            let mut anchor_table = write_txn.open_table(ANCHOR_BLOCK).store_err()?;
+            anchor_table.insert("anchor", block_meta_to_tuple(anchor)).store_err()?;
+
+            let mut chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
+            let mut archive = write_txn.open_table(HASH_ARCHIVE).store_err()?;
+            for row in chain.iter().store_err()? {
+                let (k, v) = row.store_err()?;
+                archive.insert(k.value(), v.value().0).store_err()?;
+            }
+            chain.retain(|_, _| false).store_err()?;
+            chain
+                .insert(
+                    anchor.block_number,
+                    (anchor.block_hash.0, anchor.post_state_root.0, anchor.post_withdrawals_root.0),
+                )
+                .store_err()?;
+        }
+        write_txn.commit().store_err()?;
+        Ok(())
     }
 }
 
@@ -317,24 +344,113 @@ impl BlockStore for ServerDB {
     }
 
     fn get_archived_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>> {
-        read_archived_hash(&self.database, block_number)
+        let read_txn = self.database.begin_read().store_err()?;
+        let archive = read_txn.open_table(HASH_ARCHIVE).store_err()?;
+        Ok(archive.get(block_number).store_err()?.map(|v| BlockHash::from(v.value())))
     }
 
+    /// A read-transaction pre-check filters the skip cases without touching redb's
+    /// single-writer lock (above-tip heights arrive constantly, exactly while chain sync
+    /// keeps that lock busiest); an actual write re-checks the gate inside its own
+    /// transaction. The window start only moves up (append-at-tip, prune-from-below), so
+    /// the race is benign in the safe direction. The commit uses
+    /// [`redb::Durability::None`] to keep the fsync off the request path: losing the row
+    /// to a crash costs one upstream refetch, and any later Immediate commit (chain sync
+    /// advances constantly) makes it durable.
     fn record_canonical_hash(
         &self,
         block_number: BlockNumber,
         block_hash: BlockHash,
     ) -> StoreResult<()> {
-        // Depth gate, TOCTOU safety, and durability choice live in the shared helper —
-        // see `write_archived_hash_below_window`.
-        write_archived_hash_below_window(&self.database, block_number, block_hash)
+        {
+            let read_txn = self.database.begin_read().store_err()?;
+            let chain = read_txn.open_table(CANONICAL_CHAIN).store_err()?;
+            if !below_chain_window(&chain, block_number)? {
+                return Ok(());
+            }
+        }
+        let mut write_txn = self.database.begin_write().store_err()?;
+        write_txn.set_durability(redb::Durability::None).store_err()?;
+        {
+            let chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
+            if !below_chain_window(&chain, block_number)? {
+                // Dropping the uncommitted txn aborts it; nothing is written.
+                return Ok(());
+            }
+            let mut archive = write_txn.open_table(HASH_ARCHIVE).store_err()?;
+            archive.insert(block_number, block_hash.0).store_err()?;
+        }
+        write_txn.commit().store_err()?;
+        Ok(())
     }
 }
 
-/// Block/meta/witness fixtures shared with the `chain_sync` and `main` test modules.
+/// Block/meta/witness fixtures and the [`BlockStore`] stub, shared with the
+/// `data_provider`, `chain_sync`, and `main` test modules.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+
+    /// No-op [`BlockStore`] stub whose canonical window answers `get_block_hash` with a
+    /// fixed value; everything else is empty.
+    pub(crate) struct StaticHashStore(pub Option<BlockHash>);
+
+    impl ContractStore for StaticHashStore {
+        fn get_contracts(&self, _: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
+            Ok((HashMap::default(), vec![]))
+        }
+        fn add_contracts(&self, _: &[(B256, Bytecode)]) -> StoreResult<()> {
+            Ok(())
+        }
+    }
+
+    impl ChainStore for StaticHashStore {
+        fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>> {
+            Ok(None)
+        }
+        fn get_anchor(&self) -> StoreResult<Option<BlockMeta>> {
+            Ok(None)
+        }
+        fn advance_chain(&self, _: &[BlockMeta]) -> StoreResult<()> {
+            Ok(())
+        }
+        fn get_block_hash(&self, _: BlockNumber) -> StoreResult<Option<BlockHash>> {
+            Ok(self.0)
+        }
+        fn rollback_chain(&self, _: BlockNumber) -> StoreResult<()> {
+            Ok(())
+        }
+        fn reset_to_anchor(&self, _: &BlockMeta) -> StoreResult<()> {
+            Ok(())
+        }
+    }
+
+    impl DivergenceLookups for StaticHashStore {
+        fn get_hash(&self, _: BlockNumber) -> StoreResult<Option<BlockHash>> {
+            Ok(self.0)
+        }
+        fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
+            Ok(None)
+        }
+    }
+
+    impl BlockStore for StaticHashStore {
+        fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
+            Ok(())
+        }
+        fn get_block_and_witness(
+            &self,
+            block_hash: BlockHash,
+        ) -> StoreResult<(Block<Transaction>, LightWitness)> {
+            Err(StoreError::MissingData { kind: MissingDataKind::Block, block_hash })
+        }
+        fn get_archived_hash(&self, _: BlockNumber) -> StoreResult<Option<BlockHash>> {
+            Ok(None)
+        }
+        fn record_canonical_hash(&self, _: BlockNumber, _: BlockHash) -> StoreResult<()> {
+            Ok(())
+        }
+    }
 
     pub(crate) fn make_block_meta(number: u64) -> BlockMeta {
         BlockMeta {
@@ -474,15 +590,11 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_chain() {
+    fn test_prune_history_archives_pruned_range() {
         let (_dir, db) = temp_server_db();
 
         let blocks_data: Vec<_> = (1..=10)
-            .map(|n| {
-                let block = make_test_block(n, B256::from([n as u8; 32]));
-                let witness = empty_light_witness();
-                (block, witness)
-            })
+            .map(|n| (make_test_block(n, B256::from([n as u8; 32])), empty_light_witness()))
             .collect();
         db.store_block_data(&blocks_data).unwrap();
 
@@ -542,35 +654,6 @@ mod tests {
             }
             other => panic!("expected MissingData error, got: {other}"),
         }
-    }
-
-    #[test]
-    fn test_server_db_prune_history_with_block_records() {
-        let (_dir, db) = temp_server_db();
-
-        let blocks_data: Vec<_> = (1..=5)
-            .map(|n| {
-                let block = make_test_block(n, B256::from([n as u8; 32]));
-                let witness = empty_light_witness();
-                (block, witness)
-            })
-            .collect();
-        db.store_block_data(&blocks_data).unwrap();
-
-        let metas: Vec<BlockMeta> = (1..=5).map(make_block_meta).collect();
-        ChainStore::advance_chain(&db, &metas).unwrap();
-
-        let pruned = db.prune_history(3).unwrap();
-        assert_eq!(pruned, 2);
-
-        let result = db.get_block_and_witness(BlockHash::from(B256::from([1u8; 32])));
-        assert!(result.is_err());
-        let result = db.get_block_and_witness(BlockHash::from(B256::from([2u8; 32])));
-        assert!(result.is_err());
-
-        let (block, _witness) =
-            db.get_block_and_witness(BlockHash::from(B256::from([3u8; 32]))).unwrap();
-        assert_eq!(block.header.number, 3);
     }
 
     #[test]

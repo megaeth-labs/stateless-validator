@@ -294,7 +294,6 @@ pub const REQUEST_SHAPES: &[&str] = &[
     "struct_logger_config",
     "js_tracer",
     "mux_tracer",
-    "unknown_tracer",
 ];
 
 /// Records one request of the given parameter shape for `method`.
@@ -307,9 +306,9 @@ pub fn record_request_shape(method: &'static str, shape: &'static str) {
 /// and how often resolution misses or fails.
 const CANONICAL_HASH_RESOLUTION_TOTAL: &str = "debug_trace_canonical_hash_resolution_total";
 
-/// Records one canonical-hash resolution attempt against `source` (`"db"` | `"upstream"`)
-/// with `outcome` (`"ok"` | `"miss"` | `"error"`; upstream has no miss — a missing block is
-/// an error from the retry loop).
+/// Records one canonical-hash resolution attempt against `source` (`"db"` | `"archive"` |
+/// `"upstream"`) with `outcome` (`"ok"` | `"miss"` | `"error"`; upstream has no miss — a
+/// missing block is an error from the retry loop).
 pub fn record_canonical_hash_resolution(source: &'static str, outcome: &'static str) {
     counter!(CANONICAL_HASH_RESOLUTION_TOTAL, "source" => source, "outcome" => outcome)
         .increment(1);
@@ -499,9 +498,16 @@ fn pre_register_all_metrics() {
     }
 
     // Data Fetch Layer: canonical number → hash resolution
-    for (source, outcome) in
-        [("db", "ok"), ("db", "miss"), ("db", "error"), ("upstream", "ok"), ("upstream", "error")]
-    {
+    for (source, outcome) in [
+        ("db", "ok"),
+        ("db", "miss"),
+        ("db", "error"),
+        ("archive", "ok"),
+        ("archive", "miss"),
+        ("archive", "error"),
+        ("upstream", "ok"),
+        ("upstream", "error"),
+    ] {
         counter!(CANONICAL_HASH_RESOLUTION_TOTAL, "source" => source, "outcome" => outcome)
             .increment(0);
     }

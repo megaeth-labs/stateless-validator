@@ -8,7 +8,7 @@ use stateless_core::db::{BlockMeta, ContractLookup, StoreResult, StoreResultExt}
 use crate::{
     serialize::{decode_from_slice, encode_to_vec},
     tables::{
-        ANCHOR_BLOCK, CANONICAL_CHAIN, CONTRACTS, Database, HASH_ARCHIVE, block_meta_from_tuple,
+        ANCHOR_BLOCK, CANONICAL_CHAIN, CONTRACTS, Database, block_meta_from_tuple,
         block_meta_to_tuple,
     },
 };
@@ -104,7 +104,15 @@ pub fn write_rollback_chain(database: &Database, to_block: BlockNumber) -> Store
     let write_txn = database.begin_write().store_err()?;
     {
         let mut chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
-        remove_chain_rows_above(&mut chain, to_block)?;
+        let to_remove: Vec<u64> = chain
+            .range((to_block + 1)..)
+            .store_err()?
+            .map(|r| r.map(|(k, _)| k.value()))
+            .collect::<std::result::Result<_, _>>()
+            .store_err()?;
+        for n in to_remove {
+            chain.remove(n).store_err()?;
+        }
     }
     write_txn.commit().store_err()?;
     Ok(())
@@ -112,16 +120,6 @@ pub fn write_rollback_chain(database: &Database, to_block: BlockNumber) -> Store
 
 /// CANONICAL_CHAIN value tuple: `(block_hash, post_state_root, post_withdrawals_root)`.
 type ChainRow = ([u8; 32], [u8; 32], [u8; 32]);
-
-/// Whether `block_number` lies strictly below the bounded CANONICAL_CHAIN window (i.e. is
-/// depth-final). `false` on an empty chain — with no local window there is no depth
-/// guarantee to lean on.
-fn below_chain_window(
-    chain: &impl ReadableTable<u64, ChainRow>,
-    block_number: BlockNumber,
-) -> StoreResult<bool> {
-    Ok(matches!(chain.first().store_err()?, Some((k, _)) if block_number < k.value()))
-}
 
 /// Inserts `meta` as a CANONICAL_CHAIN row.
 fn insert_chain_row(
@@ -134,100 +132,6 @@ fn insert_chain_row(
             (meta.block_hash.0, meta.post_state_root.0, meta.post_withdrawals_root.0),
         )
         .store_err()?;
-    Ok(())
-}
-
-/// Removes all CANONICAL_CHAIN rows strictly above `above` (scan + delete under the
-/// caller's write snapshot).
-fn remove_chain_rows_above(
-    chain: &mut redb::Table<'_, u64, ChainRow>,
-    above: BlockNumber,
-) -> StoreResult<()> {
-    let to_remove: Vec<u64> = chain
-        .range((above + 1)..)
-        .store_err()?
-        .map(|r| r.map(|(k, _)| k.value()))
-        .collect::<std::result::Result<_, _>>()
-        .store_err()?;
-    for n in to_remove {
-        chain.remove(n).store_err()?;
-    }
-    Ok(())
-}
-
-/// Reads an archived canonical hash from HASH_ARCHIVE.
-pub fn read_archived_hash(
-    database: &Database,
-    block_number: BlockNumber,
-) -> StoreResult<Option<BlockHash>> {
-    let read_txn = database.begin_read().store_err()?;
-    let archive = read_txn.open_table(HASH_ARCHIVE).store_err()?;
-    Ok(archive.get(block_number).store_err()?.map(|v| BlockHash::from(v.value())))
-}
-
-/// Archives an upstream-resolved canonical hash — the trace server's lazy write-back.
-///
-/// Only heights **strictly below the bounded CANONICAL_CHAIN window** are archived: those
-/// are depth-final, whereas a height at or above the window's start could in principle
-/// still reorg before chain sync verifies it, and an archived stale hash would then serve
-/// wrong by-number responses. In-window and above-tip heights are skipped silently — the
-/// window itself answers them (or will, once sync catches up).
-///
-/// A read-transaction pre-check filters the skip cases without touching redb's
-/// single-writer lock (above-tip heights arrive constantly, exactly while chain sync keeps
-/// that lock busiest); an actual write re-checks the gate inside its own transaction. The
-/// window start only moves up (append-at-tip, prune-from-below), so the race is benign in
-/// the safe direction. The commit uses [`redb::Durability::None`] to keep the fsync off
-/// the request path: losing the row to a crash costs one upstream refetch, and any later
-/// Immediate commit (chain sync advances constantly) makes it durable.
-pub fn write_archived_hash_below_window(
-    database: &Database,
-    block_number: BlockNumber,
-    block_hash: BlockHash,
-) -> StoreResult<()> {
-    {
-        let read_txn = database.begin_read().store_err()?;
-        let chain = read_txn.open_table(CANONICAL_CHAIN).store_err()?;
-        if !below_chain_window(&chain, block_number)? {
-            return Ok(());
-        }
-    }
-    let mut write_txn = database.begin_write().store_err()?;
-    write_txn.set_durability(redb::Durability::None).store_err()?;
-    {
-        let chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
-        if !below_chain_window(&chain, block_number)? {
-            // Dropping the uncommitted txn aborts it; nothing is written.
-            return Ok(());
-        }
-        let mut archive = write_txn.open_table(HASH_ARCHIVE).store_err()?;
-        archive.insert(block_number, block_hash.0).store_err()?;
-    }
-    write_txn.commit().store_err()?;
-    Ok(())
-}
-
-/// Trace-server variant of [`write_reset_to_anchor`]: archives every current chain row's
-/// `(number, hash)` into HASH_ARCHIVE, then clears the chain and installs the anchor as
-/// its sole entry. The archived rows were locally verified before the reset, and a stale
-/// reset only fires when the chain lags the remote by at least the retention window, so
-/// they are depth-final by construction.
-pub fn write_reset_to_anchor_archiving(database: &Database, anchor: &BlockMeta) -> StoreResult<()> {
-    let write_txn = database.begin_write().store_err()?;
-    {
-        let mut anchor_table = write_txn.open_table(ANCHOR_BLOCK).store_err()?;
-        anchor_table.insert("anchor", block_meta_to_tuple(anchor)).store_err()?;
-
-        let mut chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
-        let mut archive = write_txn.open_table(HASH_ARCHIVE).store_err()?;
-        for row in chain.iter().store_err()? {
-            let (k, v) = row.store_err()?;
-            archive.insert(k.value(), v.value().0).store_err()?;
-        }
-        chain.retain(|_, _| false).store_err()?;
-        insert_chain_row(&mut chain, anchor)?;
-    }
-    write_txn.commit().store_err()?;
     Ok(())
 }
 
@@ -298,7 +202,6 @@ mod tests {
         let write_txn = database.begin_write().unwrap();
         write_txn.open_table(ANCHOR_BLOCK).unwrap();
         write_txn.open_table(CANONICAL_CHAIN).unwrap();
-        write_txn.open_table(HASH_ARCHIVE).unwrap();
         write_txn.commit().unwrap();
         (dir, database)
     }
@@ -329,59 +232,6 @@ mod tests {
         for removed in [5u64, 10, 11, 12] {
             assert_eq!(read_block_hash(&db, removed).unwrap(), None, "stale block {removed}");
         }
-    }
-
-    /// The archiving reset moves every current chain row into HASH_ARCHIVE, then behaves
-    /// exactly like the plain reset: chain = {anchor} only. The plain
-    /// `write_reset_to_anchor` (validator behavior) stays wipe-without-archiving — pinned
-    /// by `reset_to_anchor_clears_chain_and_installs_anchor` above.
-    #[test]
-    fn archiving_reset_moves_rows_into_archive() {
-        let (_dir, db) = temp_db();
-
-        write_advance_chain(&db, &[meta(10), meta(11), meta(12)], None).unwrap();
-
-        let anchor = meta(42);
-        write_reset_to_anchor_archiving(&db, &anchor).unwrap();
-
-        assert_eq!(read_anchor(&db).unwrap().as_ref(), Some(&anchor));
-        assert_eq!(read_canonical_tip(&db).unwrap().as_ref(), Some(&anchor));
-        assert_eq!(read_earliest_block(&db).unwrap(), Some((42, anchor.block_hash)));
-        for moved in [10u64, 11, 12] {
-            assert_eq!(read_block_hash(&db, moved).unwrap(), None, "chain row {moved} must go");
-            assert_eq!(
-                read_archived_hash(&db, moved).unwrap(),
-                Some(meta(moved).block_hash),
-                "row {moved} must be archived"
-            );
-        }
-    }
-
-    /// The lazy write-back only archives heights strictly below the canonical window; an
-    /// in-window, above-tip, or empty-chain write is skipped silently.
-    #[test]
-    fn archived_hash_write_gated_by_chain_window() {
-        let (_dir, db) = temp_db();
-
-        // Empty chain: no depth guarantee, nothing is written.
-        write_archived_hash_below_window(&db, 5, meta(5).block_hash).unwrap();
-        assert_eq!(read_archived_hash(&db, 5).unwrap(), None);
-
-        write_advance_chain(&db, &[meta(10), meta(11)], None).unwrap();
-
-        // Below the window: archived.
-        write_archived_hash_below_window(&db, 5, meta(5).block_hash).unwrap();
-        assert_eq!(read_archived_hash(&db, 5).unwrap(), Some(meta(5).block_hash));
-
-        // In-window and above-tip heights: skipped — the window itself answers them.
-        write_archived_hash_below_window(&db, 10, meta(10).block_hash).unwrap();
-        write_archived_hash_below_window(&db, 15, meta(15).block_hash).unwrap();
-        assert_eq!(read_archived_hash(&db, 10).unwrap(), None);
-        assert_eq!(read_archived_hash(&db, 15).unwrap(), None);
-
-        // The canonical window is untouched by archive writes.
-        assert_eq!(read_earliest_block(&db).unwrap(), Some((10, meta(10).block_hash)));
-        assert_eq!(read_canonical_tip(&db).unwrap().unwrap().block_number, 11);
     }
 
     #[test]

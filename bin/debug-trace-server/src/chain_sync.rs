@@ -180,22 +180,20 @@ impl PipelineHooks for TraceHooks {
 mod tests {
     use std::sync::Arc;
 
-    use alloy_primitives::{B256, map::HashMap};
-    use revm::state::Bytecode;
-    use stateless_core::StoreResult;
+    use alloy_primitives::B256;
 
     use super::*;
-    use crate::server_db::test_support::make_block_meta;
+    use crate::server_db::test_support::{StaticHashStore, make_block_meta};
 
     #[test]
     fn test_trace_hooks_reorg_without_cache() {
-        let hooks = TraceHooks::new(Arc::new(MockBlockStore), None);
+        let hooks = TraceHooks::new(Arc::new(StaticHashStore(None)), None);
         hooks.on_reorg(10, 2, &[Default::default()]).unwrap();
     }
 
     #[test]
     fn test_trace_hooks_stale_reset() {
-        let hooks = TraceHooks::new(Arc::new(MockBlockStore), None);
+        let hooks = TraceHooks::new(Arc::new(StaticHashStore(None)), None);
         hooks.on_stale_reset(&make_block_meta(100)).unwrap();
     }
 
@@ -219,7 +217,7 @@ mod tests {
             cache.insert(resource, hash, ResponseVariant::Default, &serde_json::json!({"v": 1}));
         }
 
-        let hooks = TraceHooks::new(Arc::new(MockBlockStore), Some(cache.clone()));
+        let hooks = TraceHooks::new(Arc::new(StaticHashStore(None)), Some(cache.clone()));
         hooks.on_reorg(10, 1, &[h1]).unwrap();
 
         assert!(cache.get(CachedResource::DebugTraceBlock, h1, ResponseVariant::Default).is_none());
@@ -228,61 +226,5 @@ mod tests {
             cache.get(CachedResource::DebugTraceBlock, h2, ResponseVariant::Default).is_some(),
             "untouched blocks must survive the reorg invalidation"
         );
-    }
-
-    // Minimal mock for test compilation
-    struct MockBlockStore;
-    impl stateless_core::ContractStore for MockBlockStore {
-        fn get_contracts(&self, _: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
-            Ok((Default::default(), vec![]))
-        }
-        fn add_contracts(&self, _: &[(B256, Bytecode)]) -> StoreResult<()> {
-            Ok(())
-        }
-    }
-    impl stateless_core::ChainStore for MockBlockStore {
-        fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>> {
-            Ok(None)
-        }
-        fn get_anchor(&self) -> StoreResult<Option<BlockMeta>> {
-            Ok(None)
-        }
-        fn advance_chain(&self, _: &[BlockMeta]) -> StoreResult<()> {
-            Ok(())
-        }
-        fn get_block_hash(&self, _: BlockNumber) -> StoreResult<Option<BlockHash>> {
-            Ok(None)
-        }
-        fn rollback_chain(&self, _: BlockNumber) -> StoreResult<()> {
-            Ok(())
-        }
-        fn reset_to_anchor(&self, _: &BlockMeta) -> StoreResult<()> {
-            Ok(())
-        }
-    }
-    impl stateless_core::DivergenceLookups for MockBlockStore {
-        fn get_hash(&self, _: BlockNumber) -> StoreResult<Option<BlockHash>> {
-            Ok(None)
-        }
-        fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
-            Ok(None)
-        }
-    }
-    impl BlockStore for MockBlockStore {
-        fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
-            Ok(())
-        }
-        fn get_archived_hash(&self, _: BlockNumber) -> StoreResult<Option<BlockHash>> {
-            Ok(None)
-        }
-        fn record_canonical_hash(&self, _: BlockNumber, _: BlockHash) -> StoreResult<()> {
-            Ok(())
-        }
-        fn get_block_and_witness(
-            &self,
-            _: BlockHash,
-        ) -> StoreResult<(Block<Transaction>, LightWitness)> {
-            Err(stateless_core::StoreError::Corrupt("not implemented".into()))
-        }
     }
 }

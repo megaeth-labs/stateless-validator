@@ -181,14 +181,13 @@ pub enum RequestShape {
 impl RequestShape {
     /// Classifies the request parameters, parsing the typed tracer config exactly once.
     ///
-    /// Cacheable: the five known built-in tracers (keyed by their *parsed* config, so
-    /// reordered keys, unknown fields, and explicit null all collapse onto one entry) and
-    /// the bare default struct-logger request (no tracer, no `tracerConfig`, default
+    /// Cacheable: the five known built-in tracers (keyed by their *parsed* config) and the
+    /// bare default struct-logger request (no tracer, no `tracerConfig`, default
     /// `opts.config` — those flags change struct-logger output).
     ///
     /// Bypassed: JS tracers (the response depends on the tracer source, which has no place
-    /// in a bounded key), `muxTracer`, unknown future built-ins, and struct-logger requests
-    /// with non-default `opts.config`.
+    /// in a bounded key), `muxTracer`, and struct-logger requests with non-default
+    /// `opts.config`.
     pub fn classify(opts: &GethDebugTracingOptions) -> Self {
         use alloy_rpc_types_trace::geth::{GethDebugBuiltInTracerType, GethDebugTracerType};
 
@@ -221,26 +220,23 @@ impl RequestShape {
                     "flat_call_tracer",
                     |config: FlatCallConfig| ResponseVariant::FlatCallTracer(config.into()),
                 ),
-                // These two never read tracerConfig (the executor ignores it, as does geth),
-                // so even a malformed config is inert and collapses onto the bare variant.
                 GethDebugBuiltInTracerType::FourByteTracer => {
                     Self::Cacheable(ResponseVariant::FourByteTracer)
                 }
                 GethDebugBuiltInTracerType::NoopTracer => {
                     Self::Cacheable(ResponseVariant::NoopTracer)
                 }
+                // Exhaustive on purpose: a future alloy builtin variant must make an
+                // explicit cache-whitelist decision here instead of silently bypassing.
                 GethDebugBuiltInTracerType::MuxTracer => Self::Bypass("mux_tracer"),
-                // Reachable only if a future alloy version adds tracer variants.
-                #[allow(unreachable_patterns)]
-                _ => Self::Bypass("unknown_tracer"),
             },
             Some(GethDebugTracerType::JsTracer(_)) => Self::Bypass("js_tracer"),
         }
     }
 
     /// Classifies one config-reading builtin: `parse` is alloy's own typed-config
-    /// conversion (null → default, unknown fields ignored — the collapsing the cache key
-    /// relies on), so alloy stays authoritative for what counts as malformed.
+    /// conversion (null → default, unknown fields ignored), so alloy stays authoritative
+    /// for what counts as malformed.
     fn config_variant<C>(
         opts: &GethDebugTracingOptions,
         parse: fn(GethDebugTracerConfig) -> Result<C, serde_json::Error>,
@@ -658,17 +654,12 @@ mod tests {
     }
 
     #[test]
-    fn classify_rejects_js_mux_and_unknown() {
-        let js_a = GethDebugTracingOptions {
+    fn classify_bypasses_js_and_mux() {
+        let js = GethDebugTracingOptions {
             tracer: Some(GethDebugTracerType::JsTracer("{fault: () => {}}".to_string())),
             ..Default::default()
         };
-        let js_b = GethDebugTracingOptions {
-            tracer: Some(GethDebugTracerType::JsTracer("{result: () => 42}".to_string())),
-            ..Default::default()
-        };
-        assert!(matches!(RequestShape::classify(&js_a), RequestShape::Bypass("js_tracer")));
-        assert!(matches!(RequestShape::classify(&js_b), RequestShape::Bypass("js_tracer")));
+        assert!(matches!(RequestShape::classify(&js), RequestShape::Bypass("js_tracer")));
 
         let mux = builtin_opts(GethDebugBuiltInTracerType::MuxTracer);
         assert!(matches!(RequestShape::classify(&mux), RequestShape::Bypass("mux_tracer")));
@@ -774,7 +765,7 @@ mod tests {
     /// metrics, and "cacheable" is exactly the complement of the bypass/invalid shapes.
     #[test]
     fn shape_label_matches_cacheability() {
-        let bypass = ["struct_logger_config", "js_tracer", "mux_tracer", "unknown_tracer"];
+        let bypass = ["struct_logger_config", "js_tracer", "mux_tracer"];
         let cases = [
             GethDebugTracingOptions::default(),
             builtin_opts(GethDebugBuiltInTracerType::CallTracer),
@@ -821,45 +812,21 @@ mod tests {
         assert!(shape.cache_variant().is_none());
     }
 
+    /// Key identity (Eq + Hash, exercised through a `HashSet`) discriminates on every
+    /// component: resource, block hash, and variant.
     #[test]
-    fn test_cache_key_equality() {
+    fn test_cache_key_identity() {
         let h1 = B256::from([1u8; 32]);
         let h2 = B256::from([2u8; 32]);
         let call = ResponseVariant::CallTracer(CallConfigKey::default());
+        let key = |resource, hash, variant| ResponseCacheKey::new(resource, hash, variant);
 
-        assert_eq!(
-            ResponseCacheKey::new(CachedResource::DebugTraceBlock, h1, call),
-            ResponseCacheKey::new(CachedResource::DebugTraceBlock, h1, call),
-        );
-        assert_ne!(
-            ResponseCacheKey::new(CachedResource::DebugTraceBlock, h1, call),
-            ResponseCacheKey::new(CachedResource::DebugTraceBlock, h2, call),
-        );
-        assert_ne!(
-            ResponseCacheKey::new(CachedResource::DebugTraceBlock, h1, call),
-            ResponseCacheKey::new(CachedResource::DebugTraceBlock, h1, ResponseVariant::Default),
-        );
-    }
-
-    #[test]
-    fn test_response_cache_key_hash() {
         let mut set = HashSet::new();
-        let hash = B256::from([1u8; 32]);
-        set.insert(ResponseCacheKey::new(
-            CachedResource::DebugTraceBlock,
-            hash,
-            ResponseVariant::Default,
-        ));
-        assert!(set.contains(&ResponseCacheKey::new(
-            CachedResource::DebugTraceBlock,
-            hash,
-            ResponseVariant::Default
-        )));
-        assert!(!set.contains(&ResponseCacheKey::new(
-            CachedResource::TraceBlock,
-            hash,
-            ResponseVariant::Default
-        )));
+        set.insert(key(CachedResource::DebugTraceBlock, h1, call));
+        assert!(set.contains(&key(CachedResource::DebugTraceBlock, h1, call)));
+        assert!(!set.contains(&key(CachedResource::TraceBlock, h1, call)));
+        assert!(!set.contains(&key(CachedResource::DebugTraceBlock, h2, call)));
+        assert!(!set.contains(&key(CachedResource::DebugTraceBlock, h1, ResponseVariant::Default)));
     }
 
     #[test]
@@ -867,6 +834,8 @@ mod tests {
         let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
         let hash = B256::from([1u8; 32]);
         let value = json!([{"txHash": "0x01", "result": {}}]);
+        assert!(cache.is_empty());
+        assert_eq!((cache.len(), cache.weight()), (0, 0));
 
         assert!(
             cache.get(CachedResource::DebugTraceBlock, hash, ResponseVariant::Default).is_none()
@@ -877,6 +846,9 @@ mod tests {
             Some(value)
         );
 
+        assert!(!cache.is_empty());
+        assert_eq!(cache.len(), 1);
+        assert!(cache.weight() > 0);
         let stats = cache.stats();
         assert_eq!((stats.hits, stats.misses), (1, 1));
     }
@@ -964,32 +936,14 @@ mod tests {
         assert!(cache.index_is_empty(), "eviction must not leak index entries");
     }
 
+    /// Trivial derives and constants: variant/resource discriminants and the default config.
     #[test]
-    fn test_cache_empty_checks() {
-        let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
-        assert!(cache.is_empty());
-        assert_eq!(cache.len(), 0);
-        assert_eq!(cache.weight(), 0);
-
-        cache.insert(
-            CachedResource::DebugTraceBlock,
-            B256::from([1u8; 32]),
-            ResponseVariant::Default,
-            &json!({"v": 1}),
-        );
-        assert!(!cache.is_empty());
-        assert_eq!(cache.len(), 1);
-        assert!(cache.weight() > 0);
-    }
-
-    #[test]
-    fn test_response_variant_default() {
+    fn test_defaults_and_discriminants() {
         assert_eq!(ResponseVariant::default(), ResponseVariant::Default);
-    }
-
-    #[test]
-    fn test_cached_resource_variants() {
         assert_ne!(CachedResource::DebugTraceBlock, CachedResource::TraceBlock);
+        let config = ResponseCacheConfig::default();
+        assert_eq!(config.max_bytes, DEFAULT_RESPONSE_CACHE_MAX_BYTES);
+        assert_eq!(config.estimated_items, DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS);
     }
 
     #[test]
@@ -1006,12 +960,5 @@ mod tests {
         let cached = CachedResponse::new(&value);
         assert!(cached.byte_len() > 0);
         assert_eq!(cached.as_value(), value);
-    }
-
-    #[test]
-    fn test_response_cache_config_default() {
-        let config = ResponseCacheConfig::default();
-        assert_eq!(config.max_bytes, DEFAULT_RESPONSE_CACHE_MAX_BYTES);
-        assert_eq!(config.estimated_items, DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS);
     }
 }
