@@ -1004,7 +1004,7 @@ mod tests {
             TestFixtures::synthetic().load_genesis().expect("fixture genesis"),
         );
 
-        // Request-attributable: healthy cached data plus an unparseable mux config.
+        // Request-attributable: healthy cached data plus an unparsable mux config.
         let opts = GethDebugTracingOptions {
             tracer: Some(GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::MuxTracer)),
             tracer_config: GethDebugTracerConfig(serde_json::json!({"bogusTracer": {}})),

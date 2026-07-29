@@ -1107,7 +1107,7 @@ mod tests {
     /// The error discriminant the RPC layer keys cache hygiene off: a replay failure
     /// (here: every bytecode missing from the contracts map) aborts the block trace with
     /// [`TraceError::Data`] instead of returning `Ok` full of `TraceResult::Error`
-    /// entries, while an unparseable mux config over healthy data is
+    /// entries, while an unparsable mux config over healthy data is
     /// [`TraceError::Request`].
     #[test]
     fn trace_block_discriminates_data_and_request_errors() {
@@ -1135,7 +1135,7 @@ mod tests {
             ..Default::default()
         };
         let err = trace_block(&chain_spec, &block, witness, &contracts, opts)
-            .expect_err("an unparseable mux config must be rejected");
+            .expect_err("an unparsable mux config must be rejected");
         assert!(matches!(err, TraceError::Request(_)), "got: {err:?}");
     }
 }
