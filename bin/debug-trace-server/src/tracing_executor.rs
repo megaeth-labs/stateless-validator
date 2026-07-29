@@ -463,6 +463,9 @@ pub fn trace_block(
                     })
                     .collect(),
 
+                // The `unwrap_or_default()` on these three config parses is unreachable in
+                // practice: RPC handlers reject malformed configs via
+                // `RequestShape::classify` (-32602) before reaching the executor.
                 GethDebugBuiltInTracerType::CallTracer => {
                     let call_config = tracer_config.clone().into_call_config().unwrap_or_default();
                     trace_block_with_tracing_inspector(
@@ -735,6 +738,9 @@ pub fn trace_transaction(
                     Ok(GethTrace::NoopTracer(NoopFrame::default()))
                 }
 
+                // The `unwrap_or_default()` on these three config parses is unreachable in
+                // practice: RPC handlers reject malformed configs via
+                // `RequestShape::classify` (-32602) before reaching the executor.
                 GethDebugBuiltInTracerType::CallTracer => {
                     let call_config = tracer_config.clone().into_call_config().unwrap_or_default();
                     trace_tx_with_tracing_inspector(

@@ -25,16 +25,14 @@ use stateless_db::{
     write_advance_chain, write_reset_to_anchor, write_rollback_chain,
 };
 
-/// Block/witness storage + history pruning — **debug-trace-server-only**. This capability is
-/// specific to this bin (no other scenario stores raw blocks/witnesses or prunes a per-block
-/// chain on a schedule), so it lives here rather than as a stateless-core trait.
+/// Block/witness storage — **debug-trace-server-only** (no other scenario stores raw
+/// blocks/witnesses), so it lives here rather than as a stateless-core trait.
 ///
-/// Supertraits: [`ChainStore`] (chain cursors) + [`DivergenceLookups`] (this bin bisects on reorg,
-/// and the DB-range metric reads `get_earliest`). `prune_chain` is folded in from the former
-/// `PrunableChainStore` (same sole implementer, `ServerDB`).
+/// Supertraits: [`ChainStore`] (chain cursors) + [`DivergenceLookups`] (this bin bisects on
+/// reorg, and the DB-range metric reads `get_earliest`). History pruning is not part of the
+/// trait — the pruner works on the concrete [`ServerDB`] — leaving this the read/append
+/// seam shared with `DataProvider` and chain sync.
 pub trait BlockStore: ChainStore + DivergenceLookups {
-    /// Delete chain history strictly below `before_block`. Returns the number of blocks pruned.
-    fn prune_chain(&self, before_block: BlockNumber) -> StoreResult<u64>;
     fn store_block_data(&self, blocks: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()>;
     fn get_block_and_witness(
         &self,
@@ -115,15 +113,13 @@ impl ServerDB {
 
     /// Cleans up old block data to save storage space.
     ///
-    /// The returned count is the number of BLOCK_RECORDS entries removed (and, by
-    /// construction, the number of matching BLOCK_DATA + WITNESSES + CANONICAL_CHAIN rows).
-    /// A second pass also removes orphaned CANONICAL_CHAIN entries below `before_block`
-    /// that had no matching BLOCK_RECORDS row — those are a side-effect and are NOT
-    /// reflected in the returned count.
+    /// Removes BLOCK_RECORDS + BLOCK_DATA + WITNESSES + CANONICAL_CHAIN rows strictly
+    /// below `before_block`. Returns the number of BLOCK_RECORDS entries removed;
+    /// orphaned CANONICAL_CHAIN rows (advanced but never stored) are removed too, but not
+    /// counted.
     pub fn prune_history(&self, before_block: BlockNumber) -> StoreResult<u64> {
         // Single write txn: scan + delete under one snapshot so a concurrently-committed
         // row below `before_block` can't slip past the scan and leak as an orphan.
-        // Same pattern as `write_rollback_chain` in stateless-db's helpers.
         let write_txn = self.database.begin_write().store_err()?;
         let pruned_count = {
             let mut canonical_chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
@@ -146,11 +142,12 @@ impl ServerDB {
                 witnesses.remove(block_hash).store_err()?;
             }
 
-            // Clean up orphaned CANONICAL_CHAIN entries not tracked in BLOCK_RECORDS
+            // Remove orphaned CANONICAL_CHAIN entries not tracked in BLOCK_RECORDS, so
+            // the chain window stays contiguous-from-its-first-row.
             loop {
                 let block_number = match canonical_chain.first().store_err()? {
-                    Some(entry) => {
-                        let n = entry.0.value();
+                    Some((k, _)) => {
+                        let n = k.value();
                         if n >= before_block {
                             break;
                         }
@@ -165,6 +162,14 @@ impl ServerDB {
         };
         write_txn.commit().store_err()?;
         Ok(pruned_count)
+    }
+
+    /// Earliest BLOCK_RECORDS entry — the lower edge of body/witness retention, distinct
+    /// from `get_earliest` (the chain window's start).
+    pub fn get_earliest_block_record(&self) -> StoreResult<Option<BlockNumber>> {
+        let read_txn = self.database.begin_read().store_err()?;
+        let records = read_txn.open_table(BLOCK_RECORDS).store_err()?;
+        Ok(records.first().store_err()?.map(|(k, _)| k.value().0))
     }
 
     /// Retrieves block data and witness for a specific block hash.
@@ -262,15 +267,14 @@ impl DivergenceLookups for ServerDB {
     }
 
     fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
+        // The bounded chain window is contiguous by construction (append at tip, prune
+        // from below, wipe-and-reseed on reset), so its first row is exactly the
+        // hole-free lower bound divergence bisection requires.
         read_earliest_block(&self.database)
     }
 }
 
 impl BlockStore for ServerDB {
-    fn prune_chain(&self, before_block: BlockNumber) -> StoreResult<u64> {
-        ServerDB::prune_history(self, before_block)
-    }
-
     fn store_block_data(&self, blocks: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
         ServerDB::store_block_data(self, blocks)
     }
@@ -283,17 +287,83 @@ impl BlockStore for ServerDB {
     }
 }
 
+/// Block/meta/witness fixtures and the [`BlockStore`] stub, shared with the
+/// `data_provider`, `chain_sync`, and `main` test modules.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
-    fn temp_server_db() -> (tempfile::TempDir, ServerDB) {
-        let dir = tempfile::tempdir().unwrap();
-        let db = ServerDB::new(dir.path().join("server.redb")).unwrap();
-        (dir, db)
+    /// [`BlockStore`] stub: `canonical_hash` answers the canonical window, `canonical_tip`
+    /// the tip height (as a [`make_block_meta`] meta), and `block_data` serves
+    /// `get_block_and_witness` (`None` = missing); writes are no-ops. The read counters
+    /// let tests assert which tier served a request.
+    #[derive(Default)]
+    pub(crate) struct StubBlockStore {
+        pub canonical_hash: Option<BlockHash>,
+        pub canonical_tip: Option<u64>,
+        pub block_data: Option<(Block<Transaction>, LightWitness)>,
+        pub block_reads: AtomicUsize,
+        pub tip_reads: AtomicUsize,
     }
 
-    fn make_block_meta(number: u64) -> BlockMeta {
+    impl ContractStore for StubBlockStore {
+        fn get_contracts(&self, _: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
+            Ok((HashMap::default(), vec![]))
+        }
+        fn add_contracts(&self, _: &[(B256, Bytecode)]) -> StoreResult<()> {
+            Ok(())
+        }
+    }
+
+    impl ChainStore for StubBlockStore {
+        fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>> {
+            self.tip_reads.fetch_add(1, Ordering::Relaxed);
+            Ok(self.canonical_tip.map(make_block_meta))
+        }
+        fn get_anchor(&self) -> StoreResult<Option<BlockMeta>> {
+            Ok(None)
+        }
+        fn advance_chain(&self, _: &[BlockMeta]) -> StoreResult<()> {
+            Ok(())
+        }
+        fn get_block_hash(&self, _: BlockNumber) -> StoreResult<Option<BlockHash>> {
+            Ok(self.canonical_hash)
+        }
+        fn rollback_chain(&self, _: BlockNumber) -> StoreResult<()> {
+            Ok(())
+        }
+        fn reset_to_anchor(&self, _: &BlockMeta) -> StoreResult<()> {
+            Ok(())
+        }
+    }
+
+    impl DivergenceLookups for StubBlockStore {
+        fn get_hash(&self, _: BlockNumber) -> StoreResult<Option<BlockHash>> {
+            Ok(self.canonical_hash)
+        }
+        fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
+            Ok(None)
+        }
+    }
+
+    impl BlockStore for StubBlockStore {
+        fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
+            Ok(())
+        }
+        fn get_block_and_witness(
+            &self,
+            block_hash: BlockHash,
+        ) -> StoreResult<(Block<Transaction>, LightWitness)> {
+            self.block_reads.fetch_add(1, Ordering::Relaxed);
+            self.block_data
+                .clone()
+                .ok_or(StoreError::MissingData { kind: MissingDataKind::Block, block_hash })
+        }
+    }
+
+    pub(crate) fn make_block_meta(number: u64) -> BlockMeta {
         BlockMeta {
             block_number: number,
             block_hash: BlockHash::from([number as u8; 32]),
@@ -302,7 +372,7 @@ mod tests {
         }
     }
 
-    fn make_test_block(number: u64, hash: B256) -> Block<Transaction> {
+    pub(crate) fn make_test_block(number: u64, hash: B256) -> Block<Transaction> {
         let mut header = alloy_rpc_types_eth::Header::<alloy_consensus::Header>::default();
         header.inner.number = number;
         header.hash = hash;
@@ -310,8 +380,19 @@ mod tests {
         Block { header, ..Default::default() }
     }
 
-    fn empty_light_witness() -> LightWitness {
+    pub(crate) fn empty_light_witness() -> LightWitness {
         LightWitness { kvs: std::collections::BTreeMap::new(), levels: Default::default() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{test_support::*, *};
+
+    fn temp_server_db() -> (tempfile::TempDir, ServerDB) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ServerDB::new(dir.path().join("server.redb")).unwrap();
+        (dir, db)
     }
 
     #[test]
@@ -386,11 +467,14 @@ mod tests {
         ChainStore::reset_to_anchor(&db, &anchor).unwrap();
         let tip = ChainStore::get_canonical_tip(&db).unwrap().unwrap();
         assert_eq!(tip, anchor);
+
+        // The reset wipes the window and reseeds it with the anchor alone.
+        assert_eq!(ChainStore::get_block_hash(&db, 10).unwrap(), None);
+        assert_eq!(DivergenceLookups::get_earliest(&db).unwrap(), Some((50, anchor.block_hash)));
     }
 
-    /// Exercises the CANONICAL_CHAIN orphan-cleanup side-effect of `prune_history`
-    /// (entries without a matching BLOCK_RECORDS row — e.g. rows inserted via
-    /// `advance_chain` but never through `store_block_data`).
+    /// Orphaned chain rows (advanced but never stored as bodies) below the cutoff are
+    /// removed even though the counted record-prune is 0.
     #[test]
     fn test_server_db_prune_history_orphan_cleanup_only() {
         let (_dir, db) = temp_server_db();
@@ -398,41 +482,44 @@ mod tests {
         let blocks: Vec<BlockMeta> = (1..=5).map(make_block_meta).collect();
         ChainStore::advance_chain(&db, &blocks).unwrap();
 
-        // BLOCK_RECORDS was never populated, so the counted-prune return is 0 even though
-        // the orphan-cleanup pass below removes rows 1 and 2 from CANONICAL_CHAIN.
         let pruned = db.prune_history(3).unwrap();
-        assert_eq!(pruned, 0);
+        assert_eq!(pruned, 0, "no block records existed, so nothing counts as pruned");
 
-        assert!(ChainStore::get_block_hash(&db, 1).unwrap().is_none());
-        assert!(ChainStore::get_block_hash(&db, 2).unwrap().is_none());
-        assert!(ChainStore::get_block_hash(&db, 3).unwrap().is_some());
+        for n in 1..=2u64 {
+            assert_eq!(ChainStore::get_block_hash(&db, n).unwrap(), None);
+        }
+        for n in 3..=5 {
+            assert!(ChainStore::get_block_hash(&db, n).unwrap().is_some());
+        }
     }
 
     #[test]
-    fn test_prune_chain() {
+    fn test_prune_history_removes_range() {
         let (_dir, db) = temp_server_db();
 
         let blocks_data: Vec<_> = (1..=10)
-            .map(|n| {
-                let block = make_test_block(n, B256::from([n as u8; 32]));
-                let witness = empty_light_witness();
-                (block, witness)
-            })
+            .map(|n| (make_test_block(n, B256::from([n as u8; 32])), empty_light_witness()))
             .collect();
         db.store_block_data(&blocks_data).unwrap();
 
         let metas: Vec<BlockMeta> = (1..=10).map(make_block_meta).collect();
         ChainStore::advance_chain(&db, &metas).unwrap();
 
-        let pruned = BlockStore::prune_chain(&db, 6).unwrap();
+        let pruned = db.prune_history(6).unwrap();
         assert_eq!(pruned, 5);
 
-        for n in 1..=5 {
-            assert!(ChainStore::get_block_hash(&db, n).unwrap().is_none());
+        // Bodies and chain rows below 6 are gone; the remaining window stays contiguous
+        // from 6.
+        for n in 1..=5u64 {
+            assert!(db.get_block_and_witness(BlockHash::from([n as u8; 32])).is_err());
+            assert_eq!(ChainStore::get_block_hash(&db, n).unwrap(), None);
         }
-        for n in 6..=10 {
+        for n in 6..=10u64 {
+            assert!(db.get_block_and_witness(BlockHash::from([n as u8; 32])).is_ok());
             assert!(ChainStore::get_block_hash(&db, n).unwrap().is_some());
         }
+        assert_eq!(DivergenceLookups::get_earliest(&db).unwrap().unwrap().0, 6);
+        assert_eq!(db.get_earliest_block_record().unwrap(), Some(6));
     }
 
     #[test]
@@ -466,35 +553,6 @@ mod tests {
             }
             other => panic!("expected MissingData error, got: {other}"),
         }
-    }
-
-    #[test]
-    fn test_server_db_prune_history_with_block_records() {
-        let (_dir, db) = temp_server_db();
-
-        let blocks_data: Vec<_> = (1..=5)
-            .map(|n| {
-                let block = make_test_block(n, B256::from([n as u8; 32]));
-                let witness = empty_light_witness();
-                (block, witness)
-            })
-            .collect();
-        db.store_block_data(&blocks_data).unwrap();
-
-        let metas: Vec<BlockMeta> = (1..=5).map(make_block_meta).collect();
-        ChainStore::advance_chain(&db, &metas).unwrap();
-
-        let pruned = db.prune_history(3).unwrap();
-        assert_eq!(pruned, 2);
-
-        let result = db.get_block_and_witness(BlockHash::from(B256::from([1u8; 32])));
-        assert!(result.is_err());
-        let result = db.get_block_and_witness(BlockHash::from(B256::from([2u8; 32])));
-        assert!(result.is_err());
-
-        let (block, _witness) =
-            db.get_block_and_witness(BlockHash::from(B256::from([3u8; 32]))).unwrap();
-        assert_eq!(block.header.number, 3);
     }
 
     #[test]

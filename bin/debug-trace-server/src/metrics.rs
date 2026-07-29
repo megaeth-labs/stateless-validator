@@ -303,6 +303,44 @@ fn record_upstream_deadline_exceeded(method: &'static str) {
     counter!(UPSTREAM_DEADLINE_EXCEEDED_TOTAL, "method" => method).increment(1);
 }
 
+/// Request parameter-shape counter, labeled `(method, shape)` — the first-hand answer to
+/// "which tracer shapes does production actually send", and how often the non-cacheable
+/// shapes bypass the response cache.
+const REQUEST_SHAPE_TOTAL: &str = "debug_trace_request_shape_total";
+
+/// Every label emitted by `RequestShape::label`, for pre-registration and tests.
+pub const REQUEST_SHAPES: &[&str] = &[
+    "default",
+    "call_tracer",
+    "prestate_tracer",
+    "four_byte_tracer",
+    "noop_tracer",
+    "flat_call_tracer",
+    "struct_logger_config",
+    "js_tracer",
+    "mux_tracer",
+];
+
+/// Records one request of the given parameter shape for `method`.
+pub fn record_request_shape(method: &'static str, shape: &'static str) {
+    counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => shape).increment(1);
+}
+
+/// Canonical number → hash resolution counter, labeled `(source, outcome)` — how often
+/// by-number requests resolve their canonical hash from the local DB index vs upstream,
+/// and how often resolution misses or fails.
+const CANONICAL_HASH_RESOLUTION_TOTAL: &str = "debug_trace_canonical_hash_resolution_total";
+
+/// Records one canonical-hash resolution attempt against `source` (`"db"` | `"memo"` |
+/// `"upstream"`) with `outcome` (`"ok"` | `"miss"` | `"error"`; the in-memory memo cannot
+/// error, and upstream has no miss — a missing block is an error from the retry loop).
+/// `source = "tip_seed"` (`"ok"` | `"error"`) counts the throttled `eth_blockNumber`
+/// fetches that teach the memo's depth gate the tip when no other tip source exists.
+pub fn record_canonical_hash_resolution(source: &'static str, outcome: &'static str) {
+    counter!(CANONICAL_HASH_RESOLUTION_TOTAL, "source" => source, "outcome" => outcome)
+        .increment(1);
+}
+
 /// Witness fetch metrics by source.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
@@ -373,6 +411,10 @@ pub struct ChainSyncMetrics {
     block_distance_from_tip: Histogram,
     /// Earliest block number in validator DB
     db_earliest_block: Gauge,
+    /// Earliest block number with a stored body + witness. Tracks `db_earliest_block`
+    /// (pruning removes bodies and chain rows together) but can differ transiently, e.g.
+    /// chain rows advanced whose bodies were never stored
+    db_body_earliest_block: Gauge,
     /// Latest block number in validator DB
     db_latest_block: Gauge,
     /// Database file size in bytes
@@ -406,6 +448,11 @@ impl ChainSyncMetrics {
     pub fn set_db_block_range(&self, earliest: u64, latest: u64) {
         self.db_earliest_block.set(earliest as f64);
         self.db_latest_block.set(latest as f64);
+    }
+
+    /// Sets the earliest block that still has a stored body (the body-retention edge).
+    pub fn set_db_body_earliest_block(&self, earliest: u64) {
+        self.db_body_earliest_block.set(earliest as f64);
     }
 
     /// Sets the database file size in bytes.
@@ -466,6 +513,33 @@ fn pre_register_all_metrics() {
         ["eth_getHeaderByHash", "eth_getBlockByHash", "mega_getWitness", "eth_getCodeByHash"]
     {
         counter!(UPSTREAM_DEADLINE_EXCEEDED_TOTAL, "method" => method).increment(0);
+    }
+
+    // Request Layer: parameter shapes (per opts-taking method)
+    for method in [
+        METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+        METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
+        METHOD_DEBUG_TRACE_TRANSACTION,
+    ] {
+        for shape in REQUEST_SHAPES {
+            counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => *shape).increment(0);
+        }
+    }
+
+    // Data Fetch Layer: canonical number → hash resolution
+    for (source, outcome) in [
+        ("db", "ok"),
+        ("db", "miss"),
+        ("db", "error"),
+        ("memo", "ok"),
+        ("memo", "miss"),
+        ("upstream", "ok"),
+        ("upstream", "error"),
+        ("tip_seed", "ok"),
+        ("tip_seed", "error"),
+    ] {
+        counter!(CANONICAL_HASH_RESOLUTION_TOTAL, "source" => source, "outcome" => outcome)
+            .increment(0);
     }
 
     // Witness Layer
