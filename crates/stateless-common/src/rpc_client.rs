@@ -560,21 +560,6 @@ impl RpcClient {
         self.get_header(BlockId::Number(BlockNumberOrTag::Number(block_number)), false).await.hash
     }
 
-    /// Deadline-aware counterpart of [`Self::get_block_hash`].
-    pub async fn get_block_hash_with_deadline(
-        &self,
-        block_number: u64,
-        deadline: Option<Instant>,
-    ) -> std::result::Result<B256, RpcDeadlineExceeded> {
-        self.get_header_with_deadline(
-            BlockId::Number(BlockNumberOrTag::Number(block_number)),
-            false,
-            deadline,
-        )
-        .await
-        .map(|h| h.hash)
-    }
-
     /// Gets execution witness data for a specific block. Retries forever.
     ///
     /// Uses primary-failover rather than round-robin: each round starts from provider 0

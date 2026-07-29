@@ -200,7 +200,9 @@ impl RpcContext {
     /// The shared by-number prelude, encoding the reorg-safety invariant once for both
     /// by-number handlers: resolve tag -> number -> canonical hash (local index first)
     /// *before* the cache lookup, all on one request deadline; on a miss, fetch block data
-    /// by the resolved hash on the remaining budget.
+    /// by the resolved hash on the remaining budget. Slow prelude stages are warned about
+    /// here, where they are measured; trace/serialize timing lives in
+    /// [`compute_block_trace`] and cache-insert timing in [`insert_cache`].
     async fn lookup_block_by_number(
         &self,
         method: &'static str,
@@ -245,7 +247,41 @@ impl RpcContext {
             })?;
         let fetch_ms = t2.elapsed().as_millis();
 
-        Ok(BlockLookup::Fetched(FetchedBlock { data, resolve_ms, resolve_hash_ms, fetch_ms }))
+        if resolve_ms >= SLOW_STAGE_THRESHOLD_MS ||
+            resolve_hash_ms >= SLOW_STAGE_THRESHOLD_MS ||
+            fetch_ms >= SLOW_STAGE_THRESHOLD_MS
+        {
+            warn!(
+                method,
+                block_number = block_num,
+                resolve_ms = resolve_ms as u64,
+                resolve_hash_ms = resolve_hash_ms as u64,
+                fetch_data_ms = fetch_ms as u64,
+                "by-number lookup slow stages detected"
+            );
+        }
+
+        Ok(BlockLookup::Fetched(data))
+    }
+
+    /// Runs the geth-style block-trace executor over `data` via [`compute_block_trace`] —
+    /// the one place the executor call shape lives for both debug block handlers.
+    fn compute_debug_trace(
+        &self,
+        data: &BlockData,
+        method: &'static str,
+        opts: GethDebugTracingOptions,
+    ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
+        compute_block_trace(data, method, || {
+            crate::tracing_executor::trace_block(
+                &self.chain_spec,
+                &data.block,
+                data.witness.clone(),
+                &data.contracts,
+                opts,
+            )
+        })
+        .inspect_err(|_| metrics::record_rpc_error(method))
     }
 }
 
@@ -253,28 +289,8 @@ impl RpcContext {
 enum BlockLookup {
     /// Served straight from the response cache.
     Cached(serde_json::Value),
-    /// Cache miss: block data fetched and ready to trace.
-    Fetched(FetchedBlock),
-}
-
-/// Fetched block data plus the prelude's per-stage timings for the caller's slow-stage
-/// warning. The block's number and canonical hash are read off `data` (the fetch was keyed
-/// by the resolved hash).
-struct FetchedBlock {
-    data: Arc<BlockData>,
-    resolve_ms: u128,
-    resolve_hash_ms: u128,
-    fetch_ms: u128,
-}
-
-impl FetchedBlock {
-    fn block_num(&self) -> u64 {
-        self.data.block.header.number
-    }
-
-    fn block_hash(&self) -> B256 {
-        self.data.block.header.hash
-    }
+    /// Cache miss: block data fetched by the resolved canonical hash, ready to trace.
+    Fetched(Arc<BlockData>),
 }
 
 // Error Helpers
@@ -407,15 +423,29 @@ fn check_cache(
 
 /// Inserts a computed response under the hash of the block it was computed for; a no-op
 /// when the cache is disabled or the request shape is not cacheable (`variant` is `None`).
+/// Serializing a multi-MB response into the cache can be slow, so the insert is timed and
+/// warned about here, where it happens.
 fn insert_cache(
     cache: &Option<ResponseCache>,
     resource: CachedResource,
     block_hash: B256,
     variant: Option<ResponseVariant>,
+    method_name: &'static str,
     result: &serde_json::Value,
 ) {
-    if let (Some(cache), Some(variant)) = (cache, variant) {
-        cache.insert(resource, block_hash, variant, result);
+    let (Some(cache), Some(variant)) = (cache, variant) else {
+        return;
+    };
+    let t = Instant::now();
+    cache.insert(resource, block_hash, variant, result);
+    let insert_ms = t.elapsed().as_millis();
+    if insert_ms >= SLOW_STAGE_THRESHOLD_MS {
+        warn!(
+            method = method_name,
+            block_hash = %block_hash,
+            cache_insert_ms = insert_ms as u64,
+            "slow response-cache insert"
+        );
     }
 }
 
@@ -451,7 +481,7 @@ impl DebugTraceRpcServer for RpcContext {
         let opts = opts.unwrap_or_default();
         let variant = classify_and_gate(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, &opts)?;
 
-        let fetched = match self
+        let data = match self
             .lookup_block_by_number(
                 METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
                 CachedResource::DebugTraceBlock,
@@ -462,55 +492,24 @@ impl DebugTraceRpcServer for RpcContext {
             .await?
         {
             BlockLookup::Cached(cached) => return Ok(cached),
-            BlockLookup::Fetched(fetched) => fetched,
+            BlockLookup::Fetched(data) => data,
         };
 
-        let t3 = Instant::now();
-        let result = compute_block_trace(&fetched.data, METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, || {
-            crate::tracing_executor::trace_block(
-                &self.chain_spec,
-                &fetched.data.block,
-                fetched.data.witness.clone(),
-                &fetched.data.contracts,
-                opts,
-            )
-        })
-        .inspect_err(|_| {
-            metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
-        })?;
-        let trace_ms = t3.elapsed().as_millis();
+        let result = self.compute_debug_trace(&data, METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, opts)?;
 
-        let t4 = Instant::now();
         insert_cache(
             &self.response_cache,
             CachedResource::DebugTraceBlock,
-            fetched.block_hash(),
+            data.block.header.hash,
             variant,
+            METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
             &result,
         );
-        let cache_insert_ms = t4.elapsed().as_millis();
-
-        let total_ms = start.elapsed().as_millis();
-        record_request_completion(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, fetched.block_num(), start);
-
-        if fetched.resolve_ms >= SLOW_STAGE_THRESHOLD_MS ||
-            fetched.resolve_hash_ms >= SLOW_STAGE_THRESHOLD_MS ||
-            fetched.fetch_ms >= SLOW_STAGE_THRESHOLD_MS ||
-            trace_ms >= SLOW_STAGE_THRESHOLD_MS ||
-            cache_insert_ms >= SLOW_STAGE_THRESHOLD_MS
-        {
-            warn!(
-                block_number = fetched.block_num(),
-                tx_count = fetched.data.block.transactions.len(),
-                resolve_ms = fetched.resolve_ms as u64,
-                resolve_hash_ms = fetched.resolve_hash_ms as u64,
-                fetch_data_ms = fetched.fetch_ms as u64,
-                trace_ms = trace_ms as u64,
-                cache_insert_ms = cache_insert_ms as u64,
-                total_ms = total_ms as u64,
-                "debug_traceBlockByNumber slow stages detected"
-            );
-        }
+        record_request_completion(
+            METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+            data.block.header.number,
+            start,
+        );
 
         Ok(result)
     }
@@ -544,18 +543,7 @@ impl DebugTraceRpcServer for RpcContext {
             data_provider_error_to_rpc_error(&e)
         })?;
         let block_num = data.block.header.number;
-        let result = compute_block_trace(&data, METHOD_DEBUG_TRACE_BLOCK_BY_HASH, || {
-            crate::tracing_executor::trace_block(
-                &self.chain_spec,
-                &data.block,
-                data.witness.clone(),
-                &data.contracts,
-                opts,
-            )
-        })
-        .inspect_err(|_| {
-            metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
-        })?;
+        let result = self.compute_debug_trace(&data, METHOD_DEBUG_TRACE_BLOCK_BY_HASH, opts)?;
 
         // An entry for a non-canonical hash is still the correct answer for that hash —
         // exactly what geth serves — and is unreachable by-number.
@@ -564,6 +552,7 @@ impl DebugTraceRpcServer for RpcContext {
             CachedResource::DebugTraceBlock,
             block_hash,
             variant,
+            METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
             &result,
         );
         record_request_completion(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, block_num, start);
@@ -660,7 +649,7 @@ impl TraceRpcServer for RpcContext {
         let start = Instant::now();
 
         // `trace_block` takes no tracer options, so its variant is always `Default`.
-        let fetched = match self
+        let data = match self
             .lookup_block_by_number(
                 METHOD_TRACE_BLOCK,
                 CachedResource::TraceBlock,
@@ -671,15 +660,15 @@ impl TraceRpcServer for RpcContext {
             .await?
         {
             BlockLookup::Cached(cached) => return Ok(cached),
-            BlockLookup::Fetched(fetched) => fetched,
+            BlockLookup::Fetched(data) => data,
         };
 
-        let result = compute_block_trace(&fetched.data, METHOD_TRACE_BLOCK, || {
+        let result = compute_block_trace(&data, METHOD_TRACE_BLOCK, || {
             crate::tracing_executor::parity_trace_block(
                 &self.chain_spec,
-                &fetched.data.block,
-                fetched.data.witness.clone(),
-                &fetched.data.contracts,
+                &data.block,
+                data.witness.clone(),
+                &data.contracts,
             )
         })
         .inspect_err(|_| {
@@ -689,11 +678,12 @@ impl TraceRpcServer for RpcContext {
         insert_cache(
             &self.response_cache,
             CachedResource::TraceBlock,
-            fetched.block_hash(),
+            data.block.header.hash,
             Some(ResponseVariant::Default),
+            METHOD_TRACE_BLOCK,
             &result,
         );
-        record_request_completion(METHOD_TRACE_BLOCK, fetched.block_num(), start);
+        record_request_completion(METHOD_TRACE_BLOCK, data.block.header.number, start);
 
         Ok(result)
     }
@@ -910,7 +900,7 @@ mod tests {
         let result = serde_json::json!([{"txHash": "0x01"}]);
         let hash = B256::from([1u8; 32]);
 
-        insert_cache(&cache, CachedResource::DebugTraceBlock, hash, None, &result);
+        insert_cache(&cache, CachedResource::DebugTraceBlock, hash, None, "m", &result);
         assert_eq!(cache.as_ref().unwrap().len(), 0);
 
         insert_cache(
@@ -918,6 +908,7 @@ mod tests {
             CachedResource::DebugTraceBlock,
             hash,
             Some(ResponseVariant::Default),
+            "m",
             &result,
         );
         assert_eq!(cache.as_ref().unwrap().len(), 1);

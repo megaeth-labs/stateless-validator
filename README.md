@@ -111,6 +111,8 @@ Disable the cache with `--response-cache-disabled`; `--response-cache-estimated-
 Only depth-final heights are memoized (more than a safety depth below the observed tip, so a memoized binding can no longer reorg); shallow and above-tip heights resolve upstream on every request.
 Resolution order is window → memo → upstream, so historical heights resolve locally after first touch for the lifetime of the process; a restart clears the memo, and reorg bisection reads only the window.
 The memo holds `--canonical-hash-memo-capacity` entries (default 8M, roughly 80 bytes each; it fills lazily, so the cap costs nothing until a deep historical scan uses it).
+
+**Size-based pruning:**
 Size-based pruning never removes bodies above `tip - --size-prune-min-retain` (default 256), so a DB file stuck over `--db-max-size` cannot consume the whole body retention.
 Because redb files never shrink on their own, a file that crosses `--db-max-size` ratchets body retention down to that floor and keeps it there until `--db-max-size` is raised or the database is rebuilt.
 

@@ -229,7 +229,11 @@ struct Args {
     /// bodies that stays resident even when the DB file remains over `--db-max-size`
     /// (redb files never shrink, so a permanently-over-limit file must not consume the
     /// whole body retention).
-    #[clap(long, env = "DEBUG_TRACE_SERVER_SIZE_PRUNE_MIN_RETAIN", default_value_t = 256)]
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_SIZE_PRUNE_MIN_RETAIN",
+        default_value_t = DEFAULT_SIZE_PRUNE_MIN_RETAIN
+    )]
     size_prune_min_retain: u64,
 
     /// Maximum concurrent in-flight data-endpoint requests (blocks, headers, code, tx).
@@ -292,6 +296,9 @@ const DEFAULT_BLOCKS_TO_KEEP: u64 = 1000;
 
 /// Default pruner interval in seconds (5 minutes).
 const DEFAULT_PRUNER_INTERVAL_SECS: u64 = 300;
+
+/// Default floor of recent block bodies that size-based pruning never removes.
+const DEFAULT_SIZE_PRUNE_MIN_RETAIN: u64 = 256;
 
 /// Parses a human-readable size string into bytes.
 ///

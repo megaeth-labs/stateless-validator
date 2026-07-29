@@ -13,10 +13,27 @@ use crate::{
     },
 };
 
+/// Opens a table in a read transaction, treating a not-yet-created table as empty —
+/// redb only materializes a table on its first write-transaction open, so a freshly
+/// created database legitimately lacks the tables its readers ask about. This keeps the
+/// read helpers below free of any "constructor must pre-create tables" precondition.
+fn open_read_table<K: redb::Key + 'static, V: redb::Value + 'static>(
+    read_txn: &redb::ReadTransaction,
+    table: redb::TableDefinition<'_, K, V>,
+) -> StoreResult<Option<redb::ReadOnlyTable<K, V>>> {
+    match read_txn.open_table(table) {
+        Ok(table) => Ok(Some(table)),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+        Err(e) => Err(e).store_err(),
+    }
+}
+
 /// Reads the canonical tip (highest block) from CANONICAL_CHAIN.
 pub fn read_canonical_tip(database: &Database) -> StoreResult<Option<BlockMeta>> {
     let read_txn = database.begin_read().store_err()?;
-    let chain = read_txn.open_table(CANONICAL_CHAIN).store_err()?;
+    let Some(chain) = open_read_table(&read_txn, CANONICAL_CHAIN)? else {
+        return Ok(None);
+    };
     Ok(chain.last().store_err()?.map(|(k, v)| {
         let (hash, state_root, withdrawals_root) = v.value();
         BlockMeta {
@@ -31,7 +48,9 @@ pub fn read_canonical_tip(database: &Database) -> StoreResult<Option<BlockMeta>>
 /// Reads the anchor block from ANCHOR_BLOCK.
 pub fn read_anchor(database: &Database) -> StoreResult<Option<BlockMeta>> {
     let read_txn = database.begin_read().store_err()?;
-    let table = read_txn.open_table(ANCHOR_BLOCK).store_err()?;
+    let Some(table) = open_read_table(&read_txn, ANCHOR_BLOCK)? else {
+        return Ok(None);
+    };
     Ok(table.get("anchor").store_err()?.map(|v| block_meta_from_tuple(v.value())))
 }
 
@@ -41,14 +60,18 @@ pub fn read_block_hash(
     block_number: BlockNumber,
 ) -> StoreResult<Option<BlockHash>> {
     let read_txn = database.begin_read().store_err()?;
-    let chain = read_txn.open_table(CANONICAL_CHAIN).store_err()?;
+    let Some(chain) = open_read_table(&read_txn, CANONICAL_CHAIN)? else {
+        return Ok(None);
+    };
     Ok(chain.get(block_number).store_err()?.map(|v| BlockHash::from(v.value().0)))
 }
 
 /// Returns the earliest (lowest block number) entry in CANONICAL_CHAIN.
 pub fn read_earliest_block(database: &Database) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
     let read_txn = database.begin_read().store_err()?;
-    let chain = read_txn.open_table(CANONICAL_CHAIN).store_err()?;
+    let Some(chain) = open_read_table(&read_txn, CANONICAL_CHAIN)? else {
+        return Ok(None);
+    };
     Ok(chain.first().store_err()?.map(|(k, v)| (k.value(), BlockHash::from(v.value().0))))
 }
 
@@ -153,7 +176,9 @@ pub fn write_reset_to_anchor(database: &Database, anchor: &BlockMeta) -> StoreRe
 /// Retrieves cached contract bytecodes. Returns `(found, missing)`.
 pub fn read_contracts(database: &Database, hashes: &[B256]) -> StoreResult<ContractLookup> {
     let read_txn = database.begin_read().store_err()?;
-    let table = read_txn.open_table(CONTRACTS).store_err()?;
+    let Some(table) = open_read_table(&read_txn, CONTRACTS)? else {
+        return Ok((HashMap::default(), hashes.to_vec()));
+    };
 
     let mut found: HashMap<B256, Bytecode> = HashMap::default();
     let mut missing = Vec::new();
@@ -197,12 +222,6 @@ mod tests {
     fn temp_db() -> (tempfile::TempDir, Database) {
         let dir = tempfile::tempdir().unwrap();
         let database = Database::create(dir.path().join("test.redb")).unwrap();
-        // Pre-create the tables read paths open, mirroring ValidatorDB/ServerDB::new —
-        // a redb read transaction cannot open a table that doesn't exist yet.
-        let write_txn = database.begin_write().unwrap();
-        write_txn.open_table(ANCHOR_BLOCK).unwrap();
-        write_txn.open_table(CANONICAL_CHAIN).unwrap();
-        write_txn.commit().unwrap();
         (dir, database)
     }
 

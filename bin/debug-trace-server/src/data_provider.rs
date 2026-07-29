@@ -151,6 +151,13 @@ pub const DEFAULT_CANONICAL_HASH_MEMO_CAPACITY: u64 = 8_000_000;
 /// may be memoized. A memoized binding is served without re-checking upstream for as long
 /// as it stays cached, so it must lie deeper than any reorg plausible on the target
 /// chain; shallow heights resolve upstream on every request instead.
+///
+/// This gate is the memo's entire reorg story — deliberately, no pipeline invalidation
+/// hook exists for it: in local-cache mode a memoizable height already lies below the
+/// sync window (the window answers everything it covers before the memo is consulted),
+/// and pipeline reorg handling never reaches below the window's start, so there is no
+/// event that could fire; in stateless mode there is no pipeline at all, the margin
+/// alone carries the argument, and an entry cannot outlive the process.
 const CANONICAL_MEMO_MIN_DEPTH: u64 = 64;
 
 /// Slow stage threshold: any individual stage exceeding this triggers a warn log.
@@ -425,16 +432,18 @@ impl DataProvider {
             }
         };
 
-        // Memoize only depth-final heights. The tip hint is refreshed from this verified
-        // header and (in local-cache mode) the sync window's tip; it never exceeds the
-        // real tip, so the gate errs conservative — in particular, a header can never
-        // qualify its own height.
+        // Memoize only depth-final heights. The tip hint never exceeds the real tip, so a
+        // gate that passes on it is final — consult the sync window's tip only when the
+        // hint alone cannot admit the height (typically just the first resolution after
+        // startup; a header can never qualify its own height).
         self.observe_tip(header.number);
-        if let Some(tip) = db_tip_height(self.db.as_deref()) {
+        let gate = |hint: u64| block_num < hint.saturating_sub(CANONICAL_MEMO_MIN_DEPTH);
+        if !gate(self.tip_hint.load(Ordering::Relaxed)) &&
+            let Some(tip) = db_tip_height(self.db.as_deref())
+        {
             self.observe_tip(tip);
         }
-        let hint = self.tip_hint.load(Ordering::Relaxed);
-        if block_num < hint.saturating_sub(CANONICAL_MEMO_MIN_DEPTH) {
+        if gate(self.tip_hint.load(Ordering::Relaxed)) {
             self.canonical_hash_memo.insert(block_num, header.hash);
         }
         Ok(header.hash)
