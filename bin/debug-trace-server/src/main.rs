@@ -187,6 +187,18 @@ struct Args {
     )]
     response_cache_estimated_items: u64,
 
+    /// Maximum entries in the in-memory canonical-hash memo (number → hash for
+    /// depth-final heights below the sync window). Roughly 80 bytes per entry when full;
+    /// it fills lazily, so a generous cap costs nothing until a deep historical scan
+    /// actually uses it.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_CANONICAL_HASH_MEMO_CAPACITY",
+        default_value_t = data_provider::DEFAULT_CANONICAL_HASH_MEMO_CAPACITY,
+        value_parser = clap::value_parser!(u64).range(1..),
+    )]
+    canonical_hash_memo_capacity: u64,
+
     /// Number of recent blocks to retain in database (older blocks are pruned).
     #[clap(
         long,
@@ -469,6 +481,7 @@ async fn main() -> Result<()> {
         contract_cache,
         witness_cfg,
         std::time::Duration::from_secs(args.block_fetch_timeout),
+        args.canonical_hash_memo_capacity as usize,
     ));
 
     let chain_spec = load_chain_spec(&args)?;
@@ -695,8 +708,7 @@ async fn history_pruner(
 }
 
 /// One pruning pass: count-based pruning, then size-based pruning down to the
-/// min-retain floor, then DB gauge updates. Pruned heights keep their number -> hash in
-/// HASH_ARCHIVE (see `ServerDB::prune_history`).
+/// min-retain floor, then DB gauge updates.
 fn run_prune_cycle(
     db: &ServerDB,
     blocks_to_keep: u64,
@@ -1062,10 +1074,40 @@ mod tests {
         assert_eq!(retain_via_env, 512);
     }
 
+    /// Canonical-hash memo capacity: default, CLI override, env parity, and 0 rejected at
+    /// parse time.
+    #[test]
+    fn canonical_hash_memo_capacity_flag() {
+        let guard = stateless_test_utils::env::env_lock();
+
+        assert_eq!(
+            parse_args(&[]).canonical_hash_memo_capacity,
+            data_provider::DEFAULT_CANONICAL_HASH_MEMO_CAPACITY
+        );
+        assert_eq!(
+            parse_args(&["--canonical-hash-memo-capacity", "1000000"]).canonical_hash_memo_capacity,
+            1_000_000
+        );
+
+        let base =
+            ["debug-trace-server", "--rpc-endpoint", "http://r", "--witness-endpoint", "http://w"];
+        assert!(
+            Args::try_parse_from(base.iter().chain(&["--canonical-hash-memo-capacity", "0"]))
+                .is_err(),
+            "0 memo capacity must be rejected at parse time"
+        );
+        let via_env = stateless_test_utils::env::with_env_var(
+            &guard,
+            "DEBUG_TRACE_SERVER_CANONICAL_HASH_MEMO_CAPACITY",
+            "4096",
+            || parse_args(&[]).canonical_hash_memo_capacity,
+        );
+        assert_eq!(via_env, 4096);
+    }
+
     /// Size-based pruning stops at the min-retain floor: with a DB file permanently over
     /// `db_max_size` (redb files never shrink), bodies within `tip - size_prune_min_retain`
-    /// survive every cycle instead of being pruned to nothing — and pruned heights keep
-    /// resolving number -> hash via the archive.
+    /// survive every cycle instead of being pruned to nothing.
     #[test]
     fn run_prune_cycle_respects_min_retain_floor() {
         let dir = tempfile::tempdir().unwrap();
@@ -1098,13 +1140,11 @@ mod tests {
         for n in [250u64, 300, 500] {
             assert!(db.get_block_and_witness(block_hash(n)).is_ok(), "body {n} must survive");
         }
-        // Pruning did happen below the floor…
+        // Pruning did happen below the floor, chain rows included; the retained window
+        // still answers.
         assert!(db.get_block_and_witness(block_hash(1)).is_err(), "body 1 must be pruned");
-        // …with the pruned range's number -> hash moved to the archive, and the retained
-        // window still answered by the chain itself.
         for n in [1u64, 100] {
             assert_eq!(ChainStore::get_block_hash(&db, n).unwrap(), None, "chain row {n}");
-            assert_eq!(db.get_archived_hash(n).unwrap(), Some(block_hash(n)), "archive row {n}");
         }
         for n in [250u64, 500] {
             assert!(ChainStore::get_block_hash(&db, n).unwrap().is_some(), "window row {n}");

@@ -30,7 +30,10 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -39,6 +42,7 @@ use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
 use dashmap::DashMap;
 use futures::{FutureExt, future::Shared};
 use op_alloy_rpc_types::Transaction;
+use quick_cache::sync::Cache;
 use revm::state::Bytecode;
 use stateless_common::{CodeFetchError, RpcClient, RpcDeadlineExceeded, WitnessSizeBreakdown};
 use stateless_core::{
@@ -136,6 +140,18 @@ pub const DEFAULT_WITNESS_LOCAL_WINDOW: u64 = 4096;
 /// surfaces quickly instead of hanging. This is the full budget for one user-facing RPC
 /// request — every upstream fetch on the way to serving the response shares it.
 pub const DEFAULT_BLOCK_FETCH_TIMEOUT_SECS: u64 = 13;
+
+/// Default capacity (entries) of the in-memory canonical-hash memo. An entry is one
+/// `u64 → B256` binding (~80 bytes with cache overhead), and the memo fills lazily, so a
+/// generous cap costs nothing until a deep historical scan actually uses it — full, it
+/// covers a full-history crawl's working set many times over.
+pub const DEFAULT_CANONICAL_HASH_MEMO_CAPACITY: u64 = 8_000_000;
+
+/// Minimum depth below the observed tip before an upstream-resolved number → hash binding
+/// may be memoized. A memoized binding is served without re-checking upstream for as long
+/// as it stays cached, so it must lie deeper than any reorg plausible on the target
+/// chain; shallow heights resolve upstream on every request instead.
+const CANONICAL_MEMO_MIN_DEPTH: u64 = 64;
 
 /// Slow stage threshold: any individual stage exceeding this triggers a warn log.
 pub(crate) const SLOW_STAGE_THRESHOLD_MS: u128 = 1000;
@@ -288,6 +304,16 @@ pub(crate) struct DataProvider {
     /// hot path is a refcount bump. The map holds the shared future's handle for the
     /// duration of the fetch; the primary task removes it after `.await` completes.
     in_flight: DashMap<B256, BlockDataFuture>,
+    /// Bounded in-memory memo of depth-final number → canonical-hash bindings, filled by
+    /// upstream resolutions for heights the sync window no longer (or never) covers.
+    /// Restart-cold by design: the first request per height after a restart pays one
+    /// upstream header fetch, and a stale entry cannot outlive the process.
+    canonical_hash_memo: Cache<u64, B256>,
+    /// Monotonic maximum chain height observed from upstream answers (latest-tag
+    /// resolutions, verified headers) and the local window tip. Only real on-chain
+    /// numbers feed it, so it never exceeds the true tip — a safe under-estimate for the
+    /// memo's depth gate.
+    tip_hint: AtomicU64,
 }
 
 impl DataProvider {
@@ -301,12 +327,14 @@ impl DataProvider {
     /// * `witness_cfg` - Witness-source routing window (by block age) and per-stage budgets
     /// * `block_fetch_timeout` - User-facing cap on the full block-fetch pipeline (header + witness
     ///   + block + contracts)
+    /// * `canonical_hash_memo_capacity` - Entry cap for the in-memory canonical-hash memo
     pub fn new(
         rpc_client: Arc<RpcClient>,
         db: Option<Arc<dyn BlockStore>>,
         contract_cache: Arc<ContractCache>,
         witness_cfg: WitnessFetchConfig,
         block_fetch_timeout: Duration,
+        canonical_hash_memo_capacity: usize,
     ) -> Self {
         Self {
             rpc_client,
@@ -315,7 +343,14 @@ impl DataProvider {
             witness_cfg,
             block_fetch_timeout,
             in_flight: DashMap::new(),
+            canonical_hash_memo: Cache::new(canonical_hash_memo_capacity),
+            tip_hint: AtomicU64::new(0),
         }
+    }
+
+    /// Folds an observed on-chain height into the monotonic tip hint.
+    fn observe_tip(&self, block_number: u64) {
+        self.tip_hint.fetch_max(block_number, Ordering::Relaxed);
     }
 
     /// Mints the single wall-clock deadline for one user-facing request, from
@@ -332,54 +367,45 @@ impl DataProvider {
     /// cache: the number → hash binding is resolved *before* the cache lookup, so a reorged
     /// height resolves to the new hash and misses cleanly instead of serving a dead block.
     ///
-    /// Lookup order: the bounded canonical window, then the permanent hash archive
-    /// (pruned/reset local history plus earlier write-backs), then upstream
-    /// `eth_getHeaderByNumber` on the shared `deadline`. A DB read error is logged and
-    /// falls through to the next tier rather than failing the request.
+    /// Lookup order: the bounded canonical window, then the in-memory memo of depth-final
+    /// bindings, then upstream `eth_getHeaderByNumber` on the shared `deadline`. A DB
+    /// read error is logged and falls through to the next tier rather than failing the
+    /// request.
     ///
-    /// **Lazy write-back**: an upstream-resolved header (fetched with `verify_hash = true`,
-    /// so its hash provably matches its content) is archived — only when depth-final:
-    /// strictly below the canonical window and more than a safety depth below its tip —
-    /// so the next by-number request for it resolves locally. The write runs
-    /// fire-and-forget on the blocking pool, off this request's latency path. The archive
-    /// thereby grows organically with the traffic (and with pruning, which archives
-    /// locally verified rows for free).
+    /// **Memoization**: an upstream-resolved header (fetched with `verify_hash = true`,
+    /// so its hash provably matches its content) is memoized — only when more than
+    /// [`CANONICAL_MEMO_MIN_DEPTH`] below the observed tip, where the binding can no
+    /// longer reorg — so repeat requests for historical heights resolve locally for the
+    /// lifetime of the process. Shallow and above-window heights resolve upstream every
+    /// time.
     pub(crate) async fn resolve_canonical_hash(
         &self,
         block_num: u64,
         deadline: Instant,
     ) -> DataProviderResult<B256> {
         if let Some(db) = &self.db {
-            // One accounting shape for both local tiers; the archive read only runs after
-            // a window miss.
-            let check_tier = |source: &'static str, result: StoreResult<Option<B256>>| match result
-            {
+            match db.get_block_hash(block_num) {
                 Ok(Some(hash)) => {
-                    record_canonical_hash_resolution(source, "ok");
-                    Some(hash)
+                    record_canonical_hash_resolution("db", "ok");
+                    return Ok(hash);
                 }
-                Ok(None) => {
-                    record_canonical_hash_resolution(source, "miss");
-                    None
-                }
+                Ok(None) => record_canonical_hash_resolution("db", "miss"),
                 Err(e) => {
-                    record_canonical_hash_resolution(source, "error");
+                    record_canonical_hash_resolution("db", "error");
                     warn!(
                         block_number = block_num,
-                        source,
                         error = %e,
                         "Local canonical-hash read failed; trying the next tier",
                     );
-                    None
                 }
-            };
-            if let Some(hash) = check_tier("db", db.get_block_hash(block_num)) {
-                return Ok(hash);
-            }
-            if let Some(hash) = check_tier("archive", db.get_archived_hash(block_num)) {
-                return Ok(hash);
             }
         }
+        if let Some(hash) = self.canonical_hash_memo.get(&block_num) {
+            record_canonical_hash_resolution("memo", "ok");
+            return Ok(hash);
+        }
+        record_canonical_hash_resolution("memo", "miss");
+
         let header = match self
             .rpc_client
             .get_header_with_deadline(
@@ -398,22 +424,18 @@ impl DataProvider {
                 return Err(e.into());
             }
         };
-        if let Some(db) = &self.db {
-            // Fire-and-forget on the blocking pool: the write-back takes redb's single
-            // writer lock, which chain-sync commits can hold for a while — the request
-            // must not wait on it. Best-effort either way: a lost write-back only costs
-            // the next request another upstream round trip.
-            let db = Arc::clone(db);
-            let (number, hash) = (header.number, header.hash);
-            tokio::task::spawn_blocking(move || {
-                if let Err(e) = db.record_canonical_hash(number, hash) {
-                    warn!(
-                        block_number = number,
-                        error = %e,
-                        "Failed to archive resolved canonical hash",
-                    );
-                }
-            });
+
+        // Memoize only depth-final heights. The tip hint is refreshed from this verified
+        // header and (in local-cache mode) the sync window's tip; it never exceeds the
+        // real tip, so the gate errs conservative — in particular, a header can never
+        // qualify its own height.
+        self.observe_tip(header.number);
+        if let Some(tip) = db_tip_height(self.db.as_deref()) {
+            self.observe_tip(tip);
+        }
+        let hint = self.tip_hint.load(Ordering::Relaxed);
+        if block_num < hint.saturating_sub(CANONICAL_MEMO_MIN_DEPTH) {
+            self.canonical_hash_memo.insert(block_num, header.hash);
         }
         Ok(header.hash)
     }
@@ -528,13 +550,17 @@ impl DataProvider {
             BlockNumberOrTag::Earliest => Ok(0),
             BlockNumberOrTag::Pending => Err(eyre::eyre!("Pending block not supported").into()),
             BlockNumberOrTag::Latest => {
-                Ok(self.rpc_client.get_latest_block_number_with_deadline(Some(deadline)).await?)
+                let number =
+                    self.rpc_client.get_latest_block_number_with_deadline(Some(deadline)).await?;
+                self.observe_tip(number);
+                Ok(number)
             }
             BlockNumberOrTag::Finalized | BlockNumberOrTag::Safe => {
                 let header = self
                     .rpc_client
                     .get_header_with_deadline(BlockId::Number(tag), false, Some(deadline))
                     .await?;
+                self.observe_tip(header.number);
                 Ok(header.number)
             }
         }
@@ -1135,6 +1161,7 @@ mod tests {
             contract_cache,
             WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
             Duration::from_secs(1),
+            1024,
         )
     }
 
@@ -1176,12 +1203,13 @@ mod tests {
         handle.stop().unwrap();
     }
 
-    /// The lazy write-back: an upstream-resolved hash for a depth-final height below the
-    /// canonical window lands in the hash archive (the window itself untouched), so the
-    /// next resolution needs no upstream at all — pinned by stopping the mock server
-    /// before the second resolve.
+    /// The memo: an upstream-resolved hash for a depth-final height below the canonical
+    /// window is memoized (the window itself untouched), so the next resolution needs no
+    /// upstream at all — pinned by stopping the mock server between resolves. A shallow
+    /// height (within the safety depth of the tip) is never memoized and must fail once
+    /// the upstream is gone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resolve_canonical_hash_archives_upstream_answer() {
+    async fn resolve_canonical_hash_memoizes_depth_final_upstream_answers() {
         use stateless_core::{ChainStore, DivergenceLookups};
 
         use crate::server_db::test_support::make_block_meta;
@@ -1190,32 +1218,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server_db =
             Arc::new(crate::server_db::ServerDB::new(dir.path().join("t.redb")).unwrap());
-        // The anchor-init path installs the canonical window as a single row at {200};
-        // height 42 sits below it by more than the archive safety depth.
+        // The anchor-init path installs the canonical window as a single row at {200}:
+        // height 42 is more than the safety depth below that tip, height 199 is not.
         ChainStore::reset_to_anchor(&*server_db, &make_block_meta(200)).unwrap();
 
         let provider = provider_with(&url, Some(Arc::clone(&server_db) as Arc<dyn BlockStore>));
         let deadline = Instant::now() + Duration::from_secs(2);
         let resolved = provider.resolve_canonical_hash(42, deadline).await.unwrap();
         assert_eq!(resolved, consistent_header(42).hash);
-
-        // The write-back is fire-and-forget on the blocking pool; wait for it to land.
-        let wait_deadline = Instant::now() + Duration::from_secs(2);
-        while server_db.get_archived_hash(42).unwrap() != Some(resolved) {
-            assert!(Instant::now() < wait_deadline, "write-back never landed in the archive");
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        let shallow = provider.resolve_canonical_hash(199, deadline).await.unwrap();
+        assert_eq!(shallow, consistent_header(199).hash);
         assert_eq!(
             ChainStore::get_block_hash(&*server_db, 42).unwrap(),
             None,
-            "the canonical window must not be touched by a write-back"
+            "the canonical window must not be touched by memoization"
         );
         assert_eq!(DivergenceLookups::get_earliest(&*server_db).unwrap().unwrap().0, 200);
 
-        // With the upstream gone, the height must now resolve from the archive.
+        // With the upstream gone: the depth-final height serves from the memo; the
+        // shallow one must go upstream every time, and now fails.
         handle.stop().unwrap();
         let deadline = Instant::now() + Duration::from_millis(300);
         assert_eq!(provider.resolve_canonical_hash(42, deadline).await.unwrap(), resolved);
+        let deadline = Instant::now() + Duration::from_millis(300);
+        assert!(provider.resolve_canonical_hash(199, deadline).await.is_err());
     }
 
     /// A hanging upstream surfaces as a typed `Timeout` bounded by the caller's deadline —
@@ -1447,6 +1473,7 @@ mod tests {
             contract_cache,
             WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
             Duration::from_secs(60),
+            1024,
         ));
 
         let block_hash = B256::from([0xAB; 32]);

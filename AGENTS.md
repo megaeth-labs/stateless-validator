@@ -69,7 +69,6 @@ The pipeline owns the reorg seams: `DivergenceLookups` (the bisection contract) 
 
 - **`ANCHOR_BLOCK`** — Trusted starting point (block number, hash, state root, withdrawals root).
 - **`CANONICAL_CHAIN`** — Validated chain progression (block number → hash, state root, withdrawals root); a bounded contiguous window in both binaries, and exactly what reorg bisection trusts.
-- **`HASH_ARCHIVE`** — Trace server only: permanent block number → hash for heights that left the sync window (pruned/reset rows plus lazily written-back upstream resolutions); read by canonical-hash resolution, never by bisection.
 - **`CONTRACTS`** — Persistent tier of the contract bytecode cache (code hash → bincode+lz4 bytecode). The in-memory tier is the bounded `ContractCache` on top.
 - **`GENESIS_CONFIG`** — Hardfork activation rules (validator only).
 - **`BLOCK_DATA`** — Full block content (trace server only).
@@ -110,7 +109,7 @@ Two operating modes:
 The server includes an HTTP response cache (`quick_cache`) for pre-serialized JSON and a `DataProvider` with single-flight request coalescing.
 The response cache is keyed by `(resource, block hash, typed tracer variant)`; by-number handlers resolve number → canonical hash before the lookup (local `CANONICAL_CHAIN` first, upstream fallback).
 It only stores idempotent request shapes: the five built-in tracers (keyed by their parsed typed `tracerConfig`) and the bare default struct-logger request; JS tracers, `muxTracer`, and struct-logger requests with non-default flags bypass it entirely, and a type-malformed `tracerConfig` on call/prestate/flatCall is rejected with `-32602`.
-In local cache mode, canonical-hash resolution reads the bounded `CANONICAL_CHAIN` window first, then the permanent `HASH_ARCHIVE` (fed by pruning/stale resets moving outgoing rows over, plus the lazy write-back of upstream-resolved hashes for depth-final heights below the window), and only then upstream — so historical heights resolve locally after first touch.
+Canonical-hash resolution reads the bounded `CANONICAL_CHAIN` window first (local cache mode), then a bounded in-memory memo of upstream-resolved bindings (`--canonical-hash-memo-capacity`; only depth-final heights are memoized, so a memoized binding can no longer reorg), and only then upstream — so historical heights resolve locally after first touch within a process lifetime.
 In local cache mode with a `--witness-generator-endpoint` plus at least one fallback `--witness-endpoint`, request-serving witness fetches route by block age: blocks at least `--witness-local-window` blocks below the local tip skip the generator (which prunes beyond its `BACKUP` window) and fetch from the fallbacks; without the generator flag, witness endpoints are plain failover and routing is disabled.
 The background chain-sync prefetch always uses the full endpoint chain — it fetches at the sync frontier, which stays within the generator's retention unless `--blocks-to-keep` exceeds that retention during deep catch-up.
 

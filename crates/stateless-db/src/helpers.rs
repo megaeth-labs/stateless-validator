@@ -119,10 +119,10 @@ pub fn write_rollback_chain(database: &Database, to_block: BlockNumber) -> Store
 }
 
 /// CANONICAL_CHAIN value tuple: `(block_hash, post_state_root, post_withdrawals_root)`.
-pub type ChainRow = ([u8; 32], [u8; 32], [u8; 32]);
+type ChainRow = ([u8; 32], [u8; 32], [u8; 32]);
 
 /// Inserts `meta` as a CANONICAL_CHAIN row.
-pub fn insert_chain_row(
+fn insert_chain_row(
     chain: &mut redb::Table<'_, u64, ChainRow>,
     meta: &BlockMeta,
 ) -> StoreResult<()> {

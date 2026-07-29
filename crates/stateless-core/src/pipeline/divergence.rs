@@ -20,8 +20,8 @@ pub trait DivergenceLookups {
     fn get_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>>;
     /// The lowest block from which local history is **hole-free up to the tip**: the
     /// bisection walks `[earliest, tip]` and treats a missing hash inside that range as
-    /// fatal corruption, so a store that also keeps non-contiguous older records (e.g.
-    /// the trace server's hash archive) must keep them out of this lookup surface.
+    /// fatal corruption, so a store that also keeps non-contiguous older records must
+    /// keep them out of this lookup surface.
     fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>>;
 }
 

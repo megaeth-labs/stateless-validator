@@ -306,9 +306,9 @@ pub fn record_request_shape(method: &'static str, shape: &'static str) {
 /// and how often resolution misses or fails.
 const CANONICAL_HASH_RESOLUTION_TOTAL: &str = "debug_trace_canonical_hash_resolution_total";
 
-/// Records one canonical-hash resolution attempt against `source` (`"db"` | `"archive"` |
-/// `"upstream"`) with `outcome` (`"ok"` | `"miss"` | `"error"`; upstream has no miss — a
-/// missing block is an error from the retry loop).
+/// Records one canonical-hash resolution attempt against `source` (`"db"` | `"memo"` |
+/// `"upstream"`) with `outcome` (`"ok"` | `"miss"` | `"error"`; the in-memory memo cannot
+/// error, and upstream has no miss — a missing block is an error from the retry loop).
 pub fn record_canonical_hash_resolution(source: &'static str, outcome: &'static str) {
     counter!(CANONICAL_HASH_RESOLUTION_TOTAL, "source" => source, "outcome" => outcome)
         .increment(1);
@@ -502,9 +502,8 @@ fn pre_register_all_metrics() {
         ("db", "ok"),
         ("db", "miss"),
         ("db", "error"),
-        ("archive", "ok"),
-        ("archive", "miss"),
-        ("archive", "error"),
+        ("memo", "ok"),
+        ("memo", "miss"),
         ("upstream", "ok"),
         ("upstream", "error"),
     ] {

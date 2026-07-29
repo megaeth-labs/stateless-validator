@@ -100,17 +100,17 @@ Two operating modes:
 
 **Response cache:**
 The HTTP response cache is keyed by `(resource, block hash, tracer variant)` — an entry is an immutable fact about that exact block, so reorgs need no serve-time validation.
-By-number requests resolve their canonical hash before the lookup (local index first, upstream `eth_getHeaderByNumber` fallback — in stateless mode that is one upstream header fetch per request), so a reorged height resolves to the new hash and misses cleanly.
+By-number requests resolve their canonical hash before the lookup (local index, then an in-memory memo, then upstream `eth_getHeaderByNumber`), so a reorged height resolves to the new hash and misses cleanly.
 Cacheable shapes are the five built-in tracers (`callTracer`, `prestateTracer`, `4byteTracer`, `noopTracer`, `flatCallTracer`, keyed by their parsed, typed `tracerConfig` — equivalent configs collapse onto one entry) and the bare default struct-logger request (no tracer, no `tracerConfig`, default flags).
 JS tracers, `muxTracer`, and struct-logger requests with non-default flags bypass the cache and are recomputed on every request.
 A type-malformed `tracerConfig` on a config-reading builtin (`callTracer`/`prestateTracer`/`flatCallTracer`) is rejected with `-32602 invalid params` instead of being silently traced with default settings.
 Disable the cache with `--response-cache-disabled`; `--response-cache-estimated-items` must be at least 1 (the old `=0` disable convention is rejected at startup).
 
-**Hash archive (local cache mode):**
-`CANONICAL_CHAIN` stays a bounded, contiguous sync window; the permanent number → hash history lives in a dedicated `HASH_ARCHIVE` table.
-It fills from two sources: pruning and stale resets move each outgoing chain row's `(number, hash)` into the archive (locally verified, zero RPC), and a by-number request that had to resolve its hash upstream writes the hash-verified answer back — only for depth-final heights, strictly below the sync window and more than a safety depth below its tip (right after an anchor reset the window is a single row at the remote tip, so window position alone proves no depth).
-Resolution order is window → archive → upstream, so every height resolves locally after first touch; reorg bisection reads only the window and never sees the archive.
-The archive costs roughly 110–140 bytes per block on disk (about 2.5–3 GiB even for a full 25M-block history) — budget `--db-max-size` accordingly.
+**Canonical-hash memo:**
+`CANONICAL_CHAIN` stays a bounded, contiguous sync window; heights outside it resolve number → hash upstream once, and the hash-verified answer is memoized in a bounded in-memory LRU.
+Only depth-final heights are memoized (more than a safety depth below the observed tip, so a memoized binding can no longer reorg); shallow and above-tip heights resolve upstream on every request.
+Resolution order is window → memo → upstream, so historical heights resolve locally after first touch for the lifetime of the process; a restart clears the memo, and reorg bisection reads only the window.
+The memo holds `--canonical-hash-memo-capacity` entries (default 8M, roughly 80 bytes each; it fills lazily, so the cap costs nothing until a deep historical scan uses it).
 Size-based pruning never removes bodies above `tip - --size-prune-min-retain` (default 256), so a DB file stuck over `--db-max-size` cannot consume the whole body retention.
 Because redb files never shrink on their own, a file that crosses `--db-max-size` ratchets body retention down to that floor and keeps it there until `--db-max-size` is raised or the database is rebuilt.
 
@@ -263,10 +263,8 @@ The validator and trace server each have their own `redb`-backed database, shari
 | `BLOCK_DATA`      | `BlockHash`                | JSON `Block<Transaction>`                              | Trace server                 |
 | `WITNESSES`       | `BlockHash`                | Bincode+LZ4 `LightWitness`                             | Trace server                 |
 | `BLOCK_RECORDS`   | `(BlockNumber, BlockHash)` | `()`                                                   | Trace server (pruning index) |
-| `HASH_ARCHIVE`    | `BlockNumber`              | `BlockHash`                                            | Trace server (permanent)     |
 
-In the trace server, `CANONICAL_CHAIN` is the bounded contiguous sync window (reorg bisection trusts exactly this range), while `HASH_ARCHIVE` permanently keeps the number → hash of every height that has left it — via pruning, stale resets, and the lazy write-back of upstream-resolved hashes.
-The validator uses neither the archive nor the archiving reset; its `CANONICAL_CHAIN` semantics are unchanged.
+In both binaries, `CANONICAL_CHAIN` is a bounded contiguous window — exactly the range reorg bisection trusts.
 
 ### SALT Witness Cryptography
 

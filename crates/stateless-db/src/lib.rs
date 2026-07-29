@@ -14,14 +14,13 @@ pub mod tables;
 
 pub use cache::ContractCache;
 pub use helpers::{
-    ChainRow, insert_chain_row, read_anchor, read_block_hash, read_canonical_tip, read_contracts,
-    read_earliest_block, write_add_contracts, write_advance_chain, write_reset_to_anchor,
-    write_rollback_chain,
+    read_anchor, read_block_hash, read_canonical_tip, read_contracts, read_earliest_block,
+    write_add_contracts, write_advance_chain, write_reset_to_anchor, write_rollback_chain,
 };
 pub use serialize::{
     decode_block_from_slice, decode_from_slice, encode_block_to_vec, encode_to_vec,
 };
 pub use tables::{
     ANCHOR_BLOCK, BLOCK_DATA, BLOCK_RECORDS, CANONICAL_CHAIN, CONTRACTS, DEFAULT_MAX_CHAIN_LENGTH,
-    Database, GENESIS_CONFIG, HASH_ARCHIVE, WITNESSES, block_meta_from_tuple, block_meta_to_tuple,
+    Database, GENESIS_CONFIG, WITNESSES, block_meta_from_tuple, block_meta_to_tuple,
 };
