@@ -12,7 +12,7 @@ pub mod helpers;
 pub mod serialize;
 pub mod tables;
 
-pub use cache::ContractCache;
+pub use cache::{ContractCache, bytecode_weight};
 pub use helpers::{
     read_anchor, read_block_hash, read_canonical_tip, read_contracts, read_earliest_block,
     write_add_contracts, write_advance_chain, write_reset_to_anchor, write_rollback_chain,

@@ -11,27 +11,21 @@
 //! canonicality is never cached and no reorg invalidation hook is needed. Entries for
 //! orphaned hashes linger until evicted, bounded by the byte budget.
 
-use std::{
-    hash::RandomState,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
 };
 
 use alloy_consensus::Transaction;
 use alloy_primitives::B256;
 use alloy_rpc_types_eth::BlockTransactions;
-use quick_cache::{
-    Weighter,
-    sync::{Cache, DefaultLifecycle},
-};
+use quick_cache::{Weighter, sync::Cache};
 use stateless_common::witness_size::light_witness_memory_bytes;
+use stateless_db::bytecode_weight;
 
 use crate::{
     data_provider::BlockData,
-    metrics::{CACHE_TYPE_BLOCK_DATA, CacheMetrics},
-    response_cache::CacheStats,
+    metrics::{CACHE_TYPE_BLOCK_DATA, CacheMetrics, CacheStats},
 };
 
 /// Default maximum memory for the block-data cache (1 GB).
@@ -39,16 +33,6 @@ pub const DEFAULT_BLOCK_DATA_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Initial capacity hint; not a cap.
 const BLOCK_DATA_CACHE_ESTIMATED_ITEMS: usize = 1024;
-
-/// Weighter approximating the in-memory footprint of a [`BlockData`].
-///
-/// Charges the witness KV/level payload, each contract's bytecode, and a per-transaction
-/// envelope overhead plus calldata — the only unbounded variable-size block component.
-/// Allocator and map-node overhead is not counted, so true RSS can exceed the budget by
-/// tens of percent for kv-heavy witnesses; the contracts term over-counts in the other
-/// direction (bytecode allocations are refcounted and shared with the contract cache).
-#[derive(Debug, Clone, Default)]
-pub struct BlockDataWeighter;
 
 /// Fixed per-entry bookkeeping overhead.
 const ENTRY_OVERHEAD: u64 = 128;
@@ -66,48 +50,58 @@ const STORAGE_KEY_BYTES: u64 = 32;
 /// signature).
 const AUTHORIZATION_BYTES: u64 = 192;
 
-impl Weighter<B256, Arc<BlockData>> for BlockDataWeighter {
-    fn weight(&self, _key: &B256, val: &Arc<BlockData>) -> u64 {
-        let witness = light_witness_memory_bytes(&val.witness) as u64;
-        let contracts: u64 = val
-            .contracts
-            .values()
-            .map(|code| ENTRY_OVERHEAD + code.bytes_slice().len() as u64)
-            .sum();
-        let block = BLOCK_FIXED_OVERHEAD +
-            match &val.block.transactions {
-                BlockTransactions::Full(txs) => txs
-                    .iter()
-                    .map(|tx| {
-                        let calldata = tx.inner.input().len() as u64;
-                        let access_list = tx.inner.access_list().map_or(0, |al| {
-                            al.iter()
-                                .map(|item| {
-                                    ACCESS_LIST_ITEM_BYTES +
-                                        item.storage_keys.len() as u64 * STORAGE_KEY_BYTES
-                                })
-                                .sum()
-                        });
-                        let authorizations = tx
-                            .inner
-                            .authorization_list()
-                            .map_or(0, |auths| auths.len() as u64 * AUTHORIZATION_BYTES);
-                        TX_OVERHEAD + calldata + access_list + authorizations
-                    })
-                    .sum::<u64>(),
-                other => other.len() as u64 * TX_OVERHEAD,
-            };
-        ENTRY_OVERHEAD + witness + contracts + block
+/// Approximates the in-memory footprint of a [`BlockData`].
+///
+/// Charges the witness KV/level payload, each contract's bytecode (same accounting as the
+/// contract cache, via [`bytecode_weight`]), and a per-transaction envelope overhead plus
+/// calldata — the only unbounded variable-size block component. Allocator and map-node
+/// overhead is not counted, so true RSS can exceed the budget by tens of percent for
+/// kv-heavy witnesses; the contracts term over-counts in the other direction (bytecode
+/// allocations are refcounted and shared with the contract cache).
+///
+/// Computed once per entry at insert time; the cache stores the result so the weigher —
+/// which quick_cache re-invokes on admission, promotion, and eviction, under a shard
+/// lock — never re-walks the payload.
+pub fn block_data_weight(data: &BlockData) -> u64 {
+    let witness = light_witness_memory_bytes(&data.witness) as u64;
+    let contracts: u64 = data.contracts.values().map(bytecode_weight).sum();
+    let block = BLOCK_FIXED_OVERHEAD +
+        match &data.block.transactions {
+            BlockTransactions::Full(txs) => txs
+                .iter()
+                .map(|tx| {
+                    let calldata = tx.inner.input().len() as u64;
+                    let access_list = tx.inner.access_list().map_or(0, |al| {
+                        al.iter()
+                            .map(|item| {
+                                ACCESS_LIST_ITEM_BYTES +
+                                    item.storage_keys.len() as u64 * STORAGE_KEY_BYTES
+                            })
+                            .sum()
+                    });
+                    let authorizations = tx
+                        .inner
+                        .authorization_list()
+                        .map_or(0, |auths| auths.len() as u64 * AUTHORIZATION_BYTES);
+                    TX_OVERHEAD + calldata + access_list + authorizations
+                })
+                .sum::<u64>(),
+            other => other.len() as u64 * TX_OVERHEAD,
+        };
+    ENTRY_OVERHEAD + witness + contracts + block
+}
+
+/// Weighter reading the [`block_data_weight`] precomputed at insert.
+#[derive(Debug, Clone, Default)]
+pub struct BlockDataWeighter;
+
+impl Weighter<B256, (u64, Arc<BlockData>)> for BlockDataWeighter {
+    fn weight(&self, _key: &B256, val: &(u64, Arc<BlockData>)) -> u64 {
+        val.0
     }
 }
 
-type MemoryCache = Cache<
-    B256,
-    Arc<BlockData>,
-    BlockDataWeighter,
-    RandomState,
-    DefaultLifecycle<B256, Arc<BlockData>>,
->;
+type MemoryCache = Cache<B256, (u64, Arc<BlockData>), BlockDataWeighter>;
 
 /// Thread-safe bounded cache of resolved block data.
 ///
@@ -120,27 +114,14 @@ pub struct BlockDataCache {
     metrics: CacheMetrics,
 }
 
-impl std::fmt::Debug for BlockDataCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BlockDataCache")
-            .field("len", &self.cache.len())
-            .field("weight", &self.cache.weight())
-            .field("hits", &self.hits.load(Ordering::Relaxed))
-            .field("misses", &self.misses.load(Ordering::Relaxed))
-            .finish()
-    }
-}
-
 impl BlockDataCache {
     /// Creates a new cache bounded to `max_bytes` of estimated memory.
     pub fn new(max_bytes: u64) -> Self {
         Self {
-            cache: Cache::with(
+            cache: Cache::with_weighter(
                 BLOCK_DATA_CACHE_ESTIMATED_ITEMS,
                 max_bytes,
                 BlockDataWeighter,
-                RandomState::default(),
-                DefaultLifecycle::default(),
             ),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -150,7 +131,7 @@ impl BlockDataCache {
 
     /// Returns the cached block data for `hash`, recording hit/miss counters.
     pub fn get(&self, hash: &B256) -> Option<Arc<BlockData>> {
-        let result = self.cache.get(hash);
+        let result = self.cache.get(hash).map(|(_, data)| data);
         if result.is_some() {
             self.hits.fetch_add(1, Ordering::Relaxed);
             self.metrics.record_hit();
@@ -161,22 +142,22 @@ impl BlockDataCache {
         result
     }
 
-    /// Inserts resolved block data and refreshes the size gauges.
+    /// Inserts resolved block data, weighing it once, and refreshes the size gauges.
     pub fn insert(&self, hash: B256, data: Arc<BlockData>) {
-        self.cache.insert(hash, data);
-        self.metrics.set_size(self.cache.len(), self.cache.weight() as usize);
+        self.cache.insert(hash, (block_data_weight(&data), data));
+        self.refresh_size_gauges();
     }
 
     /// Removes an entry, e.g. when its witness turned out to be unusable at execution time —
     /// a decodable but wrong upstream response must not stay pinned until eviction.
     pub fn remove(&self, hash: &B256) {
         self.cache.remove(hash);
-        self.metrics.set_size(self.cache.len(), self.cache.weight() as usize);
+        self.refresh_size_gauges();
     }
 
     /// Returns cache statistics and refreshes the size gauges.
     pub fn stats(&self) -> CacheStats {
-        self.metrics.set_size(self.cache.len(), self.cache.weight() as usize);
+        self.refresh_size_gauges();
         CacheStats {
             entry_count: self.cache.len() as u64,
             total_bytes: self.cache.weight(),
@@ -185,56 +166,31 @@ impl BlockDataCache {
         }
     }
 
-    /// Returns the number of cached entries.
-    #[allow(dead_code)] // Used in tests
-    pub fn len(&self) -> usize {
-        self.cache.len()
-    }
-
-    /// Returns the current memory weight of the cache.
-    #[allow(dead_code)] // Used in tests
-    pub fn weight(&self) -> u64 {
-        self.cache.weight()
+    /// Pushes the current entry count and byte weight to the Prometheus gauges.
+    fn refresh_size_gauges(&self) {
+        self.metrics.set_size(self.cache.len(), self.cache.weight() as usize);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::map::HashMap;
     use revm::state::Bytecode;
-    use stateless_core::LightWitness;
-    use stateless_test_utils::fixtures::TestFixtures;
 
     use super::*;
-
-    /// Builds a real `BlockData` from the synthetic fixture set.
-    fn fixture_block_data() -> BlockData {
-        let fixtures = TestFixtures::synthetic();
-        let (_, hash) = fixtures.paired_blocks().into_iter().next().expect("paired fixture");
-        let block = fixtures.blocks[&hash].clone();
-        let witness = LightWitness::from(&fixtures.salt_witnesses[&hash]);
-        let contracts: HashMap<B256, Bytecode> =
-            fixtures.contracts.iter().map(|(h, code)| (*h, code.clone())).collect();
-        BlockData { block, witness, contracts }
-    }
+    use crate::data_provider::test_support::fixture_block_data;
 
     #[test]
     fn weigher_charges_witness_contracts_and_transactions() {
         let data = fixture_block_data();
         let witness_bytes = light_witness_memory_bytes(&data.witness) as u64;
-        let contract_bytes: u64 = data
-            .contracts
-            .values()
-            .map(|code| ENTRY_OVERHEAD + code.bytes_slice().len() as u64)
-            .sum();
+        let contract_bytes: u64 = data.contracts.values().map(bytecode_weight).sum();
 
-        let weight = BlockDataWeighter.weight(&B256::ZERO, &Arc::new(data));
+        let weight = block_data_weight(&data);
         assert!(weight >= witness_bytes + contract_bytes + BLOCK_FIXED_OVERHEAD);
 
         let mut heavier = fixture_block_data();
         heavier.contracts.insert(B256::from([9u8; 32]), Bytecode::new_raw([0u8; 64].into()));
-        let heavier_weight = BlockDataWeighter.weight(&B256::ZERO, &Arc::new(heavier));
-        assert!(heavier_weight > weight, "adding a contract must increase the weight");
+        assert!(block_data_weight(&heavier) > weight, "adding a contract must increase the weight");
     }
 
     #[test]
@@ -263,7 +219,7 @@ mod tests {
     #[test]
     fn eviction_respects_byte_budget() {
         let data = Arc::new(fixture_block_data());
-        let one = BlockDataWeighter.weight(&B256::ZERO, &data);
+        let one = block_data_weight(&data);
         let cache = BlockDataCache::new(one * 3 / 2);
 
         for i in 1..=3u8 {
@@ -271,7 +227,8 @@ mod tests {
         }
         // quick_cache admits entries only within the byte budget (over-budget entries are
         // rejected or evict older ones), so the cache never exceeds it.
-        assert!(cache.weight() <= one * 3 / 2);
-        assert!(cache.len() <= 2);
+        let stats = cache.stats();
+        assert!(stats.total_bytes <= one * 3 / 2);
+        assert!(stats.entry_count <= 2);
     }
 }

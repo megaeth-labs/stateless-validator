@@ -40,14 +40,21 @@ impl Default for ContractCacheConfig {
     }
 }
 
-/// Weighter that charges a fixed entry overhead plus the bytecode length.
+/// Cache weight of one bytecode entry: a fixed bookkeeping overhead plus the bytecode
+/// length. Shared with byte-weighing caches elsewhere that account contract bytecode the
+/// same way (e.g. the trace server's block-data cache), so the formula has one home.
+pub fn bytecode_weight(code: &Bytecode) -> u64 {
+    const ENTRY_OVERHEAD: u64 = 128;
+    ENTRY_OVERHEAD + code.bytes_slice().len() as u64
+}
+
+/// Weighter that charges [`bytecode_weight`] per entry.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BytecodeWeighter;
 
 impl Weighter<B256, Bytecode> for BytecodeWeighter {
     fn weight(&self, _key: &B256, val: &Bytecode) -> u64 {
-        const ENTRY_OVERHEAD: u64 = 128;
-        ENTRY_OVERHEAD + val.bytes_slice().len() as u64
+        bytecode_weight(val)
     }
 }
 

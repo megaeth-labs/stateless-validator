@@ -22,7 +22,7 @@ use tracing::{trace, warn};
 use crate::{
     data_provider::{BlockData, DataProvider, DataProviderError, SLOW_STAGE_THRESHOLD_MS},
     metrics::{
-        self, DataSourceMetrics, EvmExecutionMetrics, METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
+        self, CacheStats, DataSourceMetrics, EvmExecutionMetrics, METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
         METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, METHOD_DEBUG_TRACE_TRANSACTION, METHOD_TRACE_BLOCK,
         METHOD_TRACE_TRANSACTION, ResponseSizeMetrics, RpcGlobalMetrics, SingleFlightMetrics,
     },
@@ -177,6 +177,15 @@ impl RpcContext {
     /// Returns a reference to the watch dog for spawning the checker task.
     pub fn watch_dog(&self) -> &RpcWatchDog {
         &self.watch_dog
+    }
+
+    /// Bookkeeping for a failed trace execution: records the per-method error metric and
+    /// drops the block's cached data, so a decodable-but-wrong witness is refetched on the
+    /// next request instead of staying pinned until eviction. Every handler that executes a
+    /// trace must route its failure path through here to keep that invariant.
+    fn on_trace_failure(&self, method: &'static str, block_hash: &B256) {
+        metrics::record_rpc_error(method);
+        self.data_provider.evict_block_data(block_hash);
     }
 
     /// Creates the merged RPC module containing all methods.
@@ -486,10 +495,7 @@ impl DebugTraceRpcServer for RpcContext {
             METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
         )
         .await
-        .inspect_err(|_| {
-            metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
-            self.data_provider.evict_block_data(&block_hash);
-        })?;
+        .inspect_err(|_| self.on_trace_failure(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, &block_hash))?;
         let trace_ms = t3.elapsed().as_millis();
 
         // Stage 5: Cache result
@@ -565,10 +571,7 @@ impl DebugTraceRpcServer for RpcContext {
             METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
         )
         .await
-        .inspect_err(|_| {
-            metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
-            self.data_provider.evict_block_data(&block_hash);
-        })?;
+        .inspect_err(|_| self.on_trace_failure(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, &block_hash))?;
 
         // Cache and record metrics
         insert_cache_by_hash(
@@ -611,8 +614,7 @@ impl DebugTraceRpcServer for RpcContext {
             opts,
         )
         .map_err(|e| {
-            metrics::record_rpc_error(METHOD_DEBUG_TRACE_TRANSACTION);
-            self.data_provider.evict_block_data(&data.block.header.hash);
+            self.on_trace_failure(METHOD_DEBUG_TRACE_TRANSACTION, &data.block.header.hash);
             rpc_err(format!("Trace execution failed: {e}"))
         })?;
         EvmExecutionMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION)
@@ -640,31 +642,27 @@ impl DebugTraceRpcServer for RpcContext {
     }
 
     async fn get_cache_status(&self) -> RpcResult<serde_json::Value> {
-        let response_cache = match &self.response_cache {
-            Some(cache) => cache_stats_json(&cache.stats()),
-            None => serde_json::json!({"status": "disabled"}),
-        };
-        let block_data_cache = match self.data_provider.block_data_cache_stats() {
-            Some(stats) => cache_stats_json(&stats),
-            None => serde_json::json!({"status": "disabled"}),
-        };
         Ok(serde_json::json!({
-            "responseCache": response_cache,
-            "blockDataCache": block_data_cache,
+            "responseCache": cache_section(self.response_cache.as_ref().map(ResponseCache::stats)),
+            "blockDataCache": cache_section(self.data_provider.block_data_cache_stats()),
         }))
     }
 }
 
-/// Renders [`crate::response_cache::CacheStats`] as the `debug_getCacheStatus` JSON shape.
-fn cache_stats_json(stats: &crate::response_cache::CacheStats) -> serde_json::Value {
-    serde_json::json!({
-        "entryCount": stats.entry_count,
-        "totalBytes": stats.total_bytes,
-        "totalBytesMB": format!("{:.2}", stats.total_bytes as f64 / 1024.0 / 1024.0),
-        "hits": stats.hits,
-        "misses": stats.misses,
-        "hitRate": format!("{:.1}%", stats.hit_rate())
-    })
+/// Renders one cache's `debug_getCacheStatus` JSON section: its [`CacheStats`], or
+/// `{"status": "disabled"}` when the cache is off.
+fn cache_section(stats: Option<CacheStats>) -> serde_json::Value {
+    match stats {
+        Some(stats) => serde_json::json!({
+            "entryCount": stats.entry_count,
+            "totalBytes": stats.total_bytes,
+            "totalBytesMB": format!("{:.2}", stats.total_bytes as f64 / 1024.0 / 1024.0),
+            "hits": stats.hits,
+            "misses": stats.misses,
+            "hitRate": format!("{:.1}%", stats.hit_rate())
+        }),
+        None => serde_json::json!({"status": "disabled"}),
+    }
 }
 
 // TraceRpc Implementation
@@ -707,10 +705,7 @@ impl TraceRpcServer for RpcContext {
         let block_hash = data.block.header.hash;
         let result = compute_parity_trace_block(&self.chain_spec, &data, METHOD_TRACE_BLOCK)
             .await
-            .inspect_err(|_| {
-                metrics::record_rpc_error(METHOD_TRACE_BLOCK);
-                self.data_provider.evict_block_data(&block_hash);
-            })?;
+            .inspect_err(|_| self.on_trace_failure(METHOD_TRACE_BLOCK, &block_hash))?;
 
         // Cache and record metrics
         insert_cache(
@@ -756,8 +751,7 @@ impl TraceRpcServer for RpcContext {
             &data.contracts,
         )
         .map_err(|e| {
-            metrics::record_rpc_error(METHOD_TRACE_TRANSACTION);
-            self.data_provider.evict_block_data(&data.block.header.hash);
+            self.on_trace_failure(METHOD_TRACE_TRANSACTION, &data.block.header.hash);
             rpc_err(format!("Trace execution failed: {e}"))
         })?;
         EvmExecutionMetrics::new_for_method(METHOD_TRACE_TRANSACTION)
@@ -884,16 +878,19 @@ mod tests {
         }
     }
 
-    /// Provider over a hanging upstream with an optional fixed DB canonical hash, for the
-    /// cache-helper tests below.
-    fn test_provider(db_hash: Option<Option<B256>>) -> Arc<DataProvider> {
+    /// Provider over a hanging upstream with an optional fixed DB canonical hash and an
+    /// optional block-data cache, for the cache-helper and cache-status tests below.
+    fn test_provider(
+        db_hash: Option<Option<B256>>,
+        block_data_cache: Option<Arc<crate::block_data_cache::BlockDataCache>>,
+    ) -> Arc<DataProvider> {
         use stateless_common::{RpcClient, RpcClientConfig};
         use stateless_core::ContractStore;
         use stateless_db::ContractCache;
 
         use crate::data_provider::{
             DEFAULT_WITNESS_TIMEOUT_SECS, NoopContractStore, WitnessFetchConfig,
-            test_support::StaticHashStore,
+            test_support::StubBlockStore,
         };
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -905,12 +902,14 @@ mod tests {
         );
         let contract_cache =
             Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
-        let db =
-            db_hash.map(|h| Arc::new(StaticHashStore(h)) as Arc<dyn crate::server_db::BlockStore>);
+        let db = db_hash.map(|h| {
+            Arc::new(StubBlockStore { canonical_hash: h, ..Default::default() })
+                as Arc<dyn crate::server_db::BlockStore>
+        });
         Arc::new(DataProvider::new(
             rpc_client,
             db,
-            None,
+            block_data_cache,
             contract_cache,
             WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
             Duration::from_secs(1),
@@ -921,7 +920,7 @@ mod tests {
     async fn test_check_cache_by_number_disabled() {
         let result = check_cache_by_number(
             &None,
-            &test_provider(None),
+            &test_provider(None, None),
             CachedResource::DebugTraceBlock,
             100,
             Some(&ResponseVariant::Default),
@@ -959,7 +958,7 @@ mod tests {
 
         let by_number = check_cache_by_number(
             &cache,
-            &test_provider(Some(Some(B256::from([1u8; 32])))),
+            &test_provider(Some(Some(B256::from([1u8; 32]))), None),
             CachedResource::DebugTraceBlock,
             100,
             None,
@@ -986,31 +985,12 @@ mod tests {
         block_data_cache: bool,
         response_cache: Option<ResponseCache>,
     ) -> RpcContext {
-        use stateless_common::{RpcClient, RpcClientConfig};
-        use stateless_core::ContractStore;
-        use stateless_db::ContractCache;
+        use crate::block_data_cache::BlockDataCache;
 
-        use crate::{
-            block_data_cache::BlockDataCache,
-            data_provider::{DEFAULT_WITNESS_TIMEOUT_SECS, NoopContractStore, WitnessFetchConfig},
-        };
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/", listener.local_addr().unwrap());
-        let rpc_client = Arc::new(
-            RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
-                .unwrap(),
-        );
-        let contract_cache =
-            Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
-        let provider = Arc::new(DataProvider::new(
-            rpc_client,
+        let provider = test_provider(
             None,
             block_data_cache.then(|| Arc::new(BlockDataCache::new(1024 * 1024))),
-            contract_cache,
-            WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
-            Duration::from_secs(1),
-        ));
+        );
         RpcContext::new(provider, Arc::new(ChainSpec::default()), response_cache)
     }
 
@@ -1069,16 +1049,16 @@ mod tests {
 
         // Canonical: served.
         let cache = fresh_cache();
-        assert!(check(&cache, test_provider(Some(Some(h1)))).await.is_some());
+        assert!(check(&cache, test_provider(Some(Some(h1)), None)).await.is_some());
 
         // Verified mismatch: miss + the dead entry is invalidated.
         let cache = fresh_cache();
-        assert!(check(&cache, test_provider(Some(Some(h2)))).await.is_none());
+        assert!(check(&cache, test_provider(Some(Some(h2)), None)).await.is_none());
         assert_eq!(cache.as_ref().unwrap().len(), 0, "reorged entry must be invalidated");
 
         // Unverifiable (stateless, upstream down): miss, but nothing invalidated.
         let cache = fresh_cache();
-        assert!(check(&cache, test_provider(None)).await.is_none());
+        assert!(check(&cache, test_provider(None, None)).await.is_none());
         assert_eq!(cache.as_ref().unwrap().len(), 1, "unverifiable must not invalidate");
     }
 

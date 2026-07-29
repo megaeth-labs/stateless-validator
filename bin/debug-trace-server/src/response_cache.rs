@@ -23,7 +23,7 @@ use alloy_rpc_types_trace::geth::{GethDebugTracingOptions, GethDefaultTracingOpt
 use quick_cache::{Lifecycle, Weighter, sync::Cache};
 use tracing::{debug, trace};
 
-use crate::metrics::{CACHE_TYPE_DEBUG_TRACE, CACHE_TYPE_TRACE, CacheMetrics};
+use crate::metrics::{CACHE_TYPE_DEBUG_TRACE, CACHE_TYPE_TRACE, CacheMetrics, CacheStats};
 
 // Configuration
 /// Default maximum memory for the response cache (1 GB).
@@ -705,27 +705,6 @@ impl ResponseCache {
             hits: self.inner.hits.load(Ordering::Relaxed),
             misses: self.inner.misses.load(Ordering::Relaxed),
         }
-    }
-}
-
-/// Cache statistics.
-#[derive(Debug, Clone)]
-pub struct CacheStats {
-    /// Number of entries in cache.
-    pub entry_count: u64,
-    /// Total bytes cached.
-    pub total_bytes: u64,
-    /// Number of cache hits.
-    pub hits: u64,
-    /// Number of cache misses.
-    pub misses: u64,
-}
-
-impl CacheStats {
-    /// Returns the cache hit rate as a percentage.
-    pub fn hit_rate(&self) -> f64 {
-        let total = self.hits + self.misses;
-        if total == 0 { 0.0 } else { (self.hits as f64 / total as f64) * 100.0 }
     }
 }
 

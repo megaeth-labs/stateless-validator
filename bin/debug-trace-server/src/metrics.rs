@@ -208,6 +208,28 @@ impl CacheMetrics {
     }
 }
 
+/// Point-in-time counter snapshot of a cache, the query-side counterpart of
+/// [`CacheMetrics`]; shared by the response cache and the block-data cache.
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+    /// Number of entries in cache.
+    pub entry_count: u64,
+    /// Total bytes cached.
+    pub total_bytes: u64,
+    /// Number of cache hits.
+    pub hits: u64,
+    /// Number of cache misses.
+    pub misses: u64,
+}
+
+impl CacheStats {
+    /// Returns the cache hit rate as a percentage.
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 { 0.0 } else { (self.hits as f64 / total as f64) * 100.0 }
+    }
+}
+
 /// Tracks which source provided block data. Sources: `cache` (HTTP response cache),
 /// `memory` (in-memory block-data cache), `db`, and the two RPC witness routes —
 /// `witness_generator` (full endpoint chain, generator first) and `witness_historical`
