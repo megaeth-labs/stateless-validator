@@ -4,12 +4,14 @@
 //! in-memory layout. Used by metrics reporting in both the RPC client
 //! (`on_witness_fetch`) and the trace server's data provider.
 
-use salt::SaltWitness;
+use salt::{SaltKey, SaltValue, SaltWitness};
 use stateless_core::{LightWitness, withdrawals::MptWitness};
 
-/// Per-entry size of a SALT key-value pair: `SaltKey` (8 bytes) plus
-/// `Option<SaltValue>` (~95 bytes).
-const SALT_KV_BYTES: usize = 103;
+/// Per-entry size of a SALT key-value pair, derived from the type layout so a `salt` bump
+/// that grows `SaltKey`/`SaltValue` is picked up automatically — this constant no longer
+/// only feeds metrics, it also enforces the block-data cache's byte budget. Map-node
+/// overhead is deliberately excluded.
+const SALT_KV_BYTES: usize = size_of::<(SaltKey, Option<SaltValue>)>();
 
 /// Per-commitment size for SALT parent commitments (64 bytes).
 const SALT_COMMITMENT_BYTES: usize = 64;

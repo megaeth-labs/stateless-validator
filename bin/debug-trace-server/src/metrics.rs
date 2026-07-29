@@ -171,7 +171,7 @@ impl CpuTimeMetrics {
     }
 }
 
-/// Response cache metrics with cache type label.
+/// Cache hit/miss/size metrics with cache type label, shared by every cache tier.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
 pub struct CacheMetrics {
@@ -183,6 +183,9 @@ pub struct CacheMetrics {
     cache_entries: Gauge,
     /// Current cache data size in bytes
     cache_bytes: Gauge,
+    /// Inserts that were not retained by the cache (rejected at admission or immediately
+    /// evicted), so silent non-admission is distinguishable from ordinary misses
+    cache_admission_rejects_total: Counter,
 }
 
 impl CacheMetrics {
@@ -201,10 +204,37 @@ impl CacheMetrics {
         self.cache_misses_total.increment(1);
     }
 
+    /// Records an insert the cache did not retain.
+    pub fn record_admission_reject(&self) {
+        self.cache_admission_rejects_total.increment(1);
+    }
+
     /// Sets the current cache size.
     pub fn set_size(&self, entry_count: usize, data_bytes: usize) {
         self.cache_entries.set(entry_count as f64);
         self.cache_bytes.set(data_bytes as f64);
+    }
+}
+
+/// Counts block-data cache entries dropped after a data-attributable trace failure,
+/// labelled by the RPC method that observed the failure. A sustained rate points at an
+/// upstream serving bad witnesses (or at eviction misclassification).
+#[derive(Clone, Metrics)]
+#[metrics(scope = "debug_trace")]
+pub struct BlockDataEvictionMetrics {
+    /// Total block-data cache evictions triggered by trace failures
+    block_data_evictions_total: Counter,
+}
+
+impl BlockDataEvictionMetrics {
+    /// Creates metrics for a specific RPC method.
+    pub fn new_for_method(method: &'static str) -> Self {
+        Self::new_with_labels(&[("method", method)])
+    }
+
+    /// Records one eviction.
+    pub fn record(&self) {
+        self.block_data_evictions_total.increment(1);
     }
 }
 
@@ -492,6 +522,11 @@ fn pre_register_all_metrics() {
     let _ = CacheMetrics::new_for_cache(CACHE_TYPE_DEBUG_TRACE);
     let _ = CacheMetrics::new_for_cache(CACHE_TYPE_TRACE);
     let _ = CacheMetrics::new_for_cache(CACHE_TYPE_BLOCK_DATA);
+    let _ = BlockDataEvictionMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
+    let _ = BlockDataEvictionMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
+    let _ = BlockDataEvictionMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION);
+    let _ = BlockDataEvictionMetrics::new_for_method(METHOD_TRACE_BLOCK);
+    let _ = BlockDataEvictionMetrics::new_for_method(METHOD_TRACE_TRANSACTION);
 
     // Data Fetch Layer: data source
     let _ = DataSourceMetrics::new_for_source("cache");

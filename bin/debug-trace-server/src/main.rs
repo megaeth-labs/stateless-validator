@@ -499,7 +499,7 @@ async fn main() -> Result<()> {
         warn!("Block-data cache disabled (max size = 0); every request re-resolves block data");
         None
     } else {
-        debug!(max_bytes = args.block_data_cache_max_size, "Block-data cache initialized");
+        // `BlockDataCache::new` logs the effective sizing (shards, per-shard budget).
         Some(Arc::new(BlockDataCache::new(args.block_data_cache_max_size)))
     };
 

@@ -22,11 +22,13 @@ use tracing::{trace, warn};
 use crate::{
     data_provider::{BlockData, DataProvider, DataProviderError, SLOW_STAGE_THRESHOLD_MS},
     metrics::{
-        self, CacheStats, DataSourceMetrics, EvmExecutionMetrics, METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
-        METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, METHOD_DEBUG_TRACE_TRANSACTION, METHOD_TRACE_BLOCK,
-        METHOD_TRACE_TRANSACTION, ResponseSizeMetrics, RpcGlobalMetrics, SingleFlightMetrics,
+        self, BlockDataEvictionMetrics, CacheStats, DataSourceMetrics, EvmExecutionMetrics,
+        METHOD_DEBUG_TRACE_BLOCK_BY_HASH, METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+        METHOD_DEBUG_TRACE_TRANSACTION, METHOD_TRACE_BLOCK, METHOD_TRACE_TRANSACTION,
+        ResponseSizeMetrics, RpcGlobalMetrics, SingleFlightMetrics,
     },
     response_cache::{CachedResource, RequestShape, ResponseCache, ResponseVariant},
+    tracing_executor::TraceError,
 };
 
 /// Slow request threshold for logging warnings.
@@ -179,13 +181,18 @@ impl RpcContext {
         &self.watch_dog
     }
 
-    /// Bookkeeping for a failed trace execution: records the per-method error metric and
-    /// drops the block's cached data, so a decodable-but-wrong witness is refetched on the
-    /// next request instead of staying pinned until eviction. Every handler that executes a
-    /// trace must route its failure path through here to keep that invariant.
-    fn on_trace_failure(&self, method: &'static str, block_hash: &B256) {
+    /// Bookkeeping for a failed trace: records the per-method error metric, and — only for
+    /// data-attributable failures ([`TraceError::Data`]) — drops the block's cached data,
+    /// so a decodable-but-wrong witness is refetched on the next request instead of
+    /// staying pinned until eviction. Request-attributable failures (invalid tracer
+    /// configs, tracer construction/output errors) never evict: mux/JS shapes bypass the
+    /// response cache, so evicting on them would let any client drop hot entries at will.
+    /// Every handler that executes a trace must route its failure path through here.
+    fn on_trace_failure(&self, method: &'static str, block_hash: &B256, error: &TraceError) {
         metrics::record_rpc_error(method);
-        self.data_provider.evict_block_data(block_hash);
+        if matches!(error, TraceError::Data(_)) && self.data_provider.evict_block_data(block_hash) {
+            BlockDataEvictionMetrics::new_for_method(method).record();
+        }
     }
 
     /// Creates the merged RPC module containing all methods.
@@ -290,7 +297,8 @@ impl RpcContext {
                 opts,
             )
         })
-        .inspect_err(|_| self.on_trace_failure(method, &data.block.header.hash))
+        .inspect_err(|e| self.on_trace_failure(method, &data.block.header.hash, e))
+        .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))
     }
 }
 
@@ -362,22 +370,23 @@ fn data_provider_error_to_rpc_error(e: &DataProviderError) -> jsonrpsee::types::
 // Trace Computation Helpers
 /// Runs a block-trace executor closure and wraps the scaffolding shared by every
 /// block-level handler: EVM timing + metrics, JSON serialization, the response-size
-/// metric, and the slow-stage warning.
-fn compute_block_trace<T: serde::Serialize, E: std::fmt::Display>(
+/// metric, and the slow-stage warning. Returns the typed [`TraceError`] so the caller can
+/// key cache hygiene off its data-vs-request discriminant before rendering an RPC error.
+fn compute_block_trace<T: serde::Serialize>(
     data: &BlockData,
     method_name: &'static str,
-    run: impl FnOnce() -> Result<T, E>,
-) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
+    run: impl FnOnce() -> Result<T, TraceError>,
+) -> Result<serde_json::Value, TraceError> {
     let start = Instant::now();
 
-    let results = run().map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
+    let results = run()?;
 
     let trace_ms = start.elapsed().as_millis();
     EvmExecutionMetrics::new_for_method(method_name)
         .record(start.elapsed().as_secs_f64(), data.block.transactions.len());
 
     let value = serde_json::to_value(&results)
-        .map_err(|e| rpc_err(format!("Serialization failed: {e}")))?;
+        .map_err(|e| TraceError::Request(format!("Serialization failed: {e}")))?;
 
     let serialize_ms = start.elapsed().as_millis() - trace_ms;
     let response_size = value.to_string().len();
@@ -599,7 +608,7 @@ impl DebugTraceRpcServer for RpcContext {
             opts,
         )
         .map_err(|e| {
-            self.on_trace_failure(METHOD_DEBUG_TRACE_TRANSACTION, &data.block.header.hash);
+            self.on_trace_failure(METHOD_DEBUG_TRACE_TRANSACTION, &data.block.header.hash, &e);
             rpc_err(format!("Trace execution failed: {e}"))
         })?;
         EvmExecutionMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION)
@@ -681,7 +690,8 @@ impl TraceRpcServer for RpcContext {
                 &data.contracts,
             )
         })
-        .inspect_err(|_| self.on_trace_failure(METHOD_TRACE_BLOCK, &data.block.header.hash))?;
+        .inspect_err(|e| self.on_trace_failure(METHOD_TRACE_BLOCK, &data.block.header.hash, e))
+        .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
 
         insert_cache(
             &self.response_cache,
@@ -726,7 +736,7 @@ impl TraceRpcServer for RpcContext {
             &data.contracts,
         )
         .map_err(|e| {
-            self.on_trace_failure(METHOD_TRACE_TRANSACTION, &data.block.header.hash);
+            self.on_trace_failure(METHOD_TRACE_TRANSACTION, &data.block.header.hash, &e);
             rpc_err(format!("Trace execution failed: {e}"))
         })?;
         EvmExecutionMetrics::new_for_method(METHOD_TRACE_TRANSACTION)
@@ -902,19 +912,19 @@ mod tests {
         assert_eq!(stats(), (1, 1));
     }
 
-    /// Builds an `RpcContext` around a never-called upstream, with the block-data cache and
-    /// response cache toggled per test case.
-    fn cache_status_context(
-        block_data_cache: bool,
+    /// Builds an `RpcContext` around a never-called upstream, with the given block-data
+    /// cache, response cache, and chain spec.
+    fn test_context(
+        block_data_cache: Option<Arc<crate::block_data_cache::BlockDataCache>>,
         response_cache: Option<ResponseCache>,
+        chain_spec: ChainSpec,
     ) -> RpcContext {
         use stateless_common::{RpcClient, RpcClientConfig};
         use stateless_core::ContractStore;
         use stateless_db::ContractCache;
 
-        use crate::{
-            block_data_cache::BlockDataCache,
-            data_provider::{DEFAULT_WITNESS_TIMEOUT_SECS, NoopContractStore, WitnessFetchConfig},
+        use crate::data_provider::{
+            DEFAULT_WITNESS_TIMEOUT_SECS, NoopContractStore, WitnessFetchConfig,
         };
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -929,13 +939,80 @@ mod tests {
         let provider = Arc::new(DataProvider::new(
             rpc_client,
             None,
-            block_data_cache.then(|| Arc::new(BlockDataCache::new(1024 * 1024))),
+            block_data_cache,
             contract_cache,
             WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
             Duration::from_secs(1),
             1024,
         ));
-        RpcContext::new(provider, Arc::new(ChainSpec::default()), response_cache)
+        RpcContext::new(provider, Arc::new(chain_spec), response_cache)
+    }
+
+    /// [`test_context`] with the block-data cache merely toggled, for the cache-status
+    /// tests.
+    fn cache_status_context(
+        block_data_cache: bool,
+        response_cache: Option<ResponseCache>,
+    ) -> RpcContext {
+        use crate::block_data_cache::BlockDataCache;
+
+        test_context(
+            block_data_cache.then(|| Arc::new(BlockDataCache::new(1024 * 1024))),
+            response_cache,
+            ChainSpec::default(),
+        )
+    }
+
+    /// The eviction rule at `on_trace_failure`: a data-attributable failure (a witness
+    /// that cannot replay the block) drops the cached block data, while a
+    /// request-attributable one (a mux tracer config that fails to parse) must not —
+    /// mux/JS shapes bypass the response cache, so evicting on them would let any client
+    /// drop hot entries at will.
+    #[tokio::test]
+    async fn trace_failure_evicts_block_data_only_for_data_errors() {
+        use alloy_rpc_types_trace::geth::{
+            GethDebugBuiltInTracerType, GethDebugTracerConfig, GethDebugTracerType,
+        };
+        use stateless_test_utils::fixtures::TestFixtures;
+
+        use crate::{
+            block_data_cache::BlockDataCache, data_provider::test_support::fixture_block_data,
+            server_db::test_support::empty_light_witness,
+        };
+
+        let chain_spec = ChainSpec::from_genesis(
+            TestFixtures::synthetic().load_genesis().expect("fixture genesis"),
+        );
+
+        // Request-attributable: healthy cached data plus an unparseable mux config.
+        let cache = Arc::new(BlockDataCache::new(64 * 1024 * 1024));
+        let data = fixture_block_data();
+        let hash = data.block.header.hash;
+        cache.insert(hash, Arc::new(data));
+        let ctx = test_context(Some(Arc::clone(&cache)), None, chain_spec.clone());
+        let opts = GethDebugTracingOptions {
+            tracer: Some(GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::MuxTracer)),
+            tracer_config: GethDebugTracerConfig(serde_json::json!({"bogusTracer": {}})),
+            ..Default::default()
+        };
+        ctx.trace_block_by_hash(hash, Some(opts)).await.unwrap_err();
+        assert_eq!(cache.stats().entry_count, 1, "a request error must not evict");
+
+        // Data-attributable: the same block cached with a witness that cannot replay it.
+        let cache = Arc::new(BlockDataCache::new(64 * 1024 * 1024));
+        let data = fixture_block_data();
+        let hash = data.block.header.hash;
+        cache.insert(
+            hash,
+            Arc::new(BlockData {
+                block: data.block,
+                witness: empty_light_witness(),
+                contracts: data.contracts,
+            }),
+        );
+        let ctx = test_context(Some(Arc::clone(&cache)), None, chain_spec);
+        ctx.trace_block_by_hash(hash, None).await.unwrap_err();
+        assert_eq!(cache.stats().entry_count, 0, "a data error must evict the poisoned entry");
     }
 
     /// `debug_getCacheStatus` must always report both cache sections, each independently

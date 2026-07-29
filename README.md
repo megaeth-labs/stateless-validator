@@ -120,8 +120,10 @@ Because redb files never shrink on their own, a file that crosses `--db-max-size
 
 **Block-data cache:**
 A bounded in-memory `BlockData` cache keyed by block hash sits between the response cache and the local DB / RPC tiers, so requests that miss the response cache — other tracer variants of a block, and especially `debug_traceTransaction` calls for different transactions of the same block, which are never response-cached — reuse one witness fetch and contract resolution.
-Block-number lookups still resolve number → hash against the DB or upstream first, so canonicality is never cached and reorgs need no invalidation here.
-Size it with `--block-data-cache-max-size` (default `1GB`; `0` disables); blocks heavier than a cache shard's budget are never admitted, so very large blocks bypass it instead of thrashing it.
+Block-number lookups still resolve number → hash against the DB or upstream first, so canonicality is never cached and reorgs need no invalidation here; when a trace fails for a data-attributable reason (the witness cannot replay the block), the entry is dropped so the next request refetches instead of replaying the poisoned data, and each such eviction is counted (`block_data_evictions_total`).
+Size it with `--block-data-cache-max-size` (default `1GB`; `0` disables); the cache uses a fixed 4 shards, so the largest cacheable entry is `max_bytes / 4` on every host (~256 MB at the default), and an insert the cache does not retain is counted (`cache_admission_rejects_total`) and logged rather than masquerading as a miss.
+The byte budget is an estimate of retained payload, not exact RSS: map/allocator overhead is under-counted, and contract bytecode is charged here *and* in the contract cache (the same refcounted allocations), so evicting an entry can free less than its accounted weight.
+Combined default memory across the three caches is roughly 2.5 GB — response cache 1 GB + block-data cache 1 GB + contract cache 512 MB — on top of ordinary heap; size hosts (or lower the knobs) accordingly.
 
 **Witness endpoints:**
 Declare the internal witness generator via `--witness-generator-endpoint`; `--witness-endpoint` lists the durable fallbacks (e.g. an R2-backed witness service), tried in order.

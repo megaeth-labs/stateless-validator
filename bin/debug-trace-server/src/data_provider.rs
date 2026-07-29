@@ -443,11 +443,10 @@ impl DataProvider {
 
     /// Drops a block from the memory cache after its data failed execution: a decodable but
     /// incomplete witness would otherwise stay pinned, failing every retry until eviction —
-    /// dropping it lets the next request refetch from the endpoints.
-    pub fn evict_block_data(&self, block_hash: &B256) {
-        if let Some(cache) = &self.block_data_cache {
-            cache.remove(block_hash);
-        }
+    /// dropping it lets the next request refetch from the endpoints. Returns whether an
+    /// entry was actually removed, so the caller can count real evictions.
+    pub fn evict_block_data(&self, block_hash: &B256) -> bool {
+        self.block_data_cache.as_ref().is_some_and(|cache| cache.remove(block_hash))
     }
 
     /// Clonable handle to the canonical-hash memo, for the chain-sync invalidation hooks.

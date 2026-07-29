@@ -11,17 +11,24 @@
 //! canonicality is never cached and no reorg invalidation hook is needed. Entries for
 //! orphaned hashes linger until evicted, bounded by the byte budget.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    hash::RandomState,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use alloy_consensus::Transaction;
 use alloy_primitives::B256;
 use alloy_rpc_types_eth::BlockTransactions;
-use quick_cache::{Weighter, sync::Cache};
+use quick_cache::{
+    OptionsBuilder, Weighter,
+    sync::{Cache, DefaultLifecycle},
+};
 use stateless_common::witness_size::light_witness_memory_bytes;
 use stateless_db::bytecode_weight;
+use tracing::{debug, info};
 
 use crate::{
     data_provider::BlockData,
@@ -31,8 +38,16 @@ use crate::{
 /// Default maximum memory for the block-data cache (1 GB).
 pub const DEFAULT_BLOCK_DATA_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Initial capacity hint; not a cap.
-const BLOCK_DATA_CACHE_ESTIMATED_ITEMS: usize = 1024;
+/// Shard count, pinned so the per-shard byte budget — the admission ceiling for a single
+/// entry — is `max_bytes / 4` on every host. quick_cache's default shard count scales
+/// with the core count, which would shrink the largest admissible block as machines get
+/// bigger; four shards keep contention negligible at trace-server request rates while
+/// leaving the ceiling far above any realistic block.
+const BLOCK_DATA_CACHE_SHARDS: usize = 4;
+
+/// Assumed typical in-memory size of one resolved block, used only to derive the
+/// estimated-items capacity hint from the byte budget.
+const EXPECTED_BLOCK_DATA_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Fixed per-entry bookkeeping overhead.
 const ENTRY_OVERHEAD: u64 = 128;
@@ -86,6 +101,8 @@ pub fn block_data_weight(data: &BlockData) -> u64 {
                     TX_OVERHEAD + calldata + access_list + authorizations
                 })
                 .sum::<u64>(),
+            // Defensive: tracing requires full transactions, so cached blocks always carry
+            // `Full` and this arm is not reached in practice.
             other => other.len() as u64 * TX_OVERHEAD,
         };
     ENTRY_OVERHEAD + witness + contracts + block
@@ -105,26 +122,51 @@ type MemoryCache = Cache<B256, (u64, Arc<BlockData>), BlockDataWeighter>;
 
 /// Thread-safe bounded cache of resolved block data.
 ///
-/// Entries heavier than a cache shard's budget are never admitted by `quick_cache`, so with
-/// a small byte budget the largest blocks simply bypass the cache instead of thrashing it.
+/// Entries heavier than a single shard's byte budget (`max_bytes` divided by the pinned
+/// [`BLOCK_DATA_CACHE_SHARDS`]) are never admitted by `quick_cache`, so with a small byte
+/// budget the largest blocks simply bypass the cache instead of thrashing it. Non-retained
+/// inserts are counted, so a budget too small for real blocks is visible instead of
+/// masquerading as an ordinary low hit rate.
 pub struct BlockDataCache {
     cache: MemoryCache,
     hits: AtomicU64,
     misses: AtomicU64,
+    admission_rejects: AtomicU64,
     metrics: CacheMetrics,
 }
 
 impl BlockDataCache {
     /// Creates a new cache bounded to `max_bytes` of estimated memory.
     pub fn new(max_bytes: u64) -> Self {
+        Self::with_shards(max_bytes, BLOCK_DATA_CACHE_SHARDS)
+    }
+
+    /// [`Self::new`] with an explicit shard count; tests pin a single shard so the
+    /// admission arithmetic is deterministic.
+    fn with_shards(max_bytes: u64, shards: usize) -> Self {
+        let estimated_items = (max_bytes / EXPECTED_BLOCK_DATA_BYTES).clamp(64, 4096) as usize;
+        let options = OptionsBuilder::new()
+            .estimated_items_capacity(estimated_items)
+            .weight_capacity(max_bytes)
+            .shards(shards)
+            .build()
+            .expect("block-data cache options are statically valid");
+        info!(
+            max_bytes,
+            shards,
+            per_shard_budget = max_bytes / shards as u64,
+            "Block-data cache initialized; entries above the per-shard budget are never admitted"
+        );
         Self {
-            cache: Cache::with_weighter(
-                BLOCK_DATA_CACHE_ESTIMATED_ITEMS,
-                max_bytes,
+            cache: Cache::with_options(
+                options,
                 BlockDataWeighter,
+                RandomState::default(),
+                DefaultLifecycle::default(),
             ),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            admission_rejects: AtomicU64::new(0),
             metrics: CacheMetrics::new_for_cache(CACHE_TYPE_BLOCK_DATA),
         }
     }
@@ -143,16 +185,27 @@ impl BlockDataCache {
     }
 
     /// Inserts resolved block data, weighing it once, and refreshes the size gauges.
+    /// An insert the cache did not retain — the entry outweighs a shard's budget, or was
+    /// evicted on arrival — is counted and logged, since it is otherwise indistinguishable
+    /// from an ordinary miss on the next request.
     pub fn insert(&self, hash: B256, data: Arc<BlockData>) {
-        self.cache.insert(hash, (block_data_weight(&data), data));
+        let weight = block_data_weight(&data);
+        self.cache.insert(hash, (weight, data));
+        if self.cache.peek(&hash).is_none() {
+            self.admission_rejects.fetch_add(1, Ordering::Relaxed);
+            self.metrics.record_admission_reject();
+            debug!(block_hash = %hash, weight, "Block-data cache did not retain insert");
+        }
         self.refresh_size_gauges();
     }
 
     /// Removes an entry, e.g. when its witness turned out to be unusable at execution time —
-    /// a decodable but wrong upstream response must not stay pinned until eviction.
-    pub fn remove(&self, hash: &B256) {
-        self.cache.remove(hash);
+    /// a decodable but wrong upstream response must not stay pinned until eviction. Returns
+    /// whether an entry was present.
+    pub fn remove(&self, hash: &B256) -> bool {
+        let removed = self.cache.remove(hash).is_some();
         self.refresh_size_gauges();
+        removed
     }
 
     /// Returns cache statistics and refreshes the size gauges.
@@ -174,6 +227,15 @@ impl BlockDataCache {
 
 #[cfg(test)]
 mod tests {
+    use alloy_consensus::{Signed, TxEip7702, transaction::Recovered};
+    use alloy_primitives::{Address, Bytes, Signature, U256};
+    use mega_evm::{
+        alloy_eips::{
+            eip2930::{AccessList, AccessListItem},
+            eip7702::{Authorization, SignedAuthorization},
+        },
+        op_alloy_consensus::OpTxEnvelope,
+    };
     use revm::state::Bytecode;
 
     use super::*;
@@ -191,6 +253,73 @@ mod tests {
         let mut heavier = fixture_block_data();
         heavier.contracts.insert(B256::from([9u8; 32]), Bytecode::new_raw([0u8; 64].into()));
         assert!(block_data_weight(&heavier) > weight, "adding a contract must increase the weight");
+    }
+
+    /// Builds an EIP-7702 transaction carrying `calldata_len` input bytes, one access-list
+    /// item with `storage_keys` keys, and `auths` signed authorizations.
+    fn synthetic_list_tx(
+        calldata_len: usize,
+        storage_keys: usize,
+        auths: usize,
+    ) -> op_alloy_rpc_types::Transaction {
+        let tx = TxEip7702 {
+            chain_id: 1,
+            nonce: 0,
+            gas_limit: 21_000,
+            max_fee_per_gas: 0,
+            max_priority_fee_per_gas: 0,
+            to: Address::ZERO,
+            value: U256::ZERO,
+            access_list: AccessList(vec![AccessListItem {
+                address: Address::ZERO,
+                storage_keys: vec![B256::ZERO; storage_keys],
+            }]),
+            authorization_list: (0..auths)
+                .map(|_| {
+                    SignedAuthorization::new_unchecked(
+                        Authorization { chain_id: U256::ONE, address: Address::ZERO, nonce: 0 },
+                        0,
+                        U256::ONE,
+                        U256::ONE,
+                    )
+                })
+                .collect(),
+            input: Bytes::from(vec![0u8; calldata_len]),
+        };
+        let signed = Signed::new_unchecked(tx, Signature::test_signature(), B256::ZERO);
+        op_alloy_rpc_types::Transaction {
+            inner: alloy_rpc_types_eth::Transaction {
+                inner: Recovered::new_unchecked(OpTxEnvelope::Eip7702(signed), Address::ZERO),
+                block_hash: None,
+                block_number: None,
+                transaction_index: None,
+                effective_gas_price: None,
+            },
+            deposit_nonce: None,
+            deposit_receipt_version: None,
+        }
+    }
+
+    /// The variable transaction terms must be charged exactly: appending a transaction
+    /// with known calldata, access-list, and authorization-list sizes increases the weight
+    /// by precisely the documented arithmetic — dropping any term fails this test.
+    #[test]
+    fn weigher_charges_access_and_authorization_lists() {
+        let mut data = fixture_block_data();
+        let base = block_data_weight(&data);
+
+        let (calldata, keys, auths) = (100usize, 3usize, 2usize);
+        let BlockTransactions::Full(txs) = &mut data.block.transactions else {
+            panic!("fixture block must carry full transactions");
+        };
+        txs.push(synthetic_list_tx(calldata, keys, auths));
+
+        let expected = TX_OVERHEAD +
+            calldata as u64 +
+            ACCESS_LIST_ITEM_BYTES +
+            keys as u64 * STORAGE_KEY_BYTES +
+            auths as u64 * AUTHORIZATION_BYTES;
+        assert_eq!(block_data_weight(&data) - base, expected);
     }
 
     #[test]
@@ -216,19 +345,35 @@ mod tests {
         assert_eq!(cache.stats().entry_count, 0);
     }
 
+    /// With one shard the admission arithmetic is deterministic: three same-weight inserts
+    /// into a budget with room for two must retain exactly two entries — this fails both
+    /// if the budget is not enforced and if the cache silently admits nothing.
     #[test]
     fn eviction_respects_byte_budget() {
         let data = Arc::new(fixture_block_data());
         let one = block_data_weight(&data);
-        let cache = BlockDataCache::new(one * 3 / 2);
+        let cache = BlockDataCache::with_shards(one * 5 / 2, 1);
 
         for i in 1..=3u8 {
             cache.insert(B256::from([i; 32]), Arc::clone(&data));
         }
-        // quick_cache admits entries only within the byte budget (over-budget entries are
-        // rejected or evict older ones), so the cache never exceeds it.
         let stats = cache.stats();
-        assert!(stats.total_bytes <= one * 3 / 2);
-        assert!(stats.entry_count <= 2);
+        assert_eq!(stats.entry_count, 2, "budget with room for two must retain exactly two");
+        assert_eq!(stats.total_bytes, one * 2);
+    }
+
+    /// An entry heavier than a shard's budget is never admitted, and the rejected insert
+    /// is counted instead of masquerading as an ordinary miss.
+    #[test]
+    fn oversized_entry_is_rejected_and_counted() {
+        let data = Arc::new(fixture_block_data());
+        let one = block_data_weight(&data);
+        let cache = BlockDataCache::with_shards(one / 2, 1);
+
+        let hash = B256::from([1u8; 32]);
+        cache.insert(hash, data);
+        assert!(cache.get(&hash).is_none());
+        assert_eq!(cache.stats().entry_count, 0);
+        assert_eq!(cache.admission_rejects.load(Ordering::Relaxed), 1);
     }
 }
