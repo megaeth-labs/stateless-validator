@@ -28,7 +28,7 @@ use quick_cache::{
 };
 use stateless_common::witness_size::light_witness_memory_bytes;
 use stateless_db::bytecode_weight;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::{
     data_provider::BlockData,
@@ -43,7 +43,7 @@ pub const DEFAULT_BLOCK_DATA_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 /// with the core count, which would shrink the largest admissible block as machines get
 /// bigger; four shards keep contention negligible at trace-server request rates while
 /// leaving the ceiling far above any realistic block.
-const BLOCK_DATA_CACHE_SHARDS: usize = 4;
+pub(crate) const BLOCK_DATA_CACHE_SHARDS: usize = 4;
 
 /// Assumed typical in-memory size of one resolved block, used only to derive the
 /// estimated-items capacity hint from the byte budget.
@@ -151,12 +151,6 @@ impl BlockDataCache {
             .shards(shards)
             .build()
             .expect("block-data cache options are statically valid");
-        info!(
-            max_bytes,
-            shards,
-            per_shard_budget = max_bytes / shards as u64,
-            "Block-data cache initialized; entries above the per-shard budget are never admitted"
-        );
         Self {
             cache: Cache::with_options(
                 options,
@@ -210,18 +204,21 @@ impl BlockDataCache {
 
     /// Returns cache statistics and refreshes the size gauges.
     pub fn stats(&self) -> CacheStats {
-        self.refresh_size_gauges();
+        let (entry_count, total_bytes) = self.refresh_size_gauges();
         CacheStats {
-            entry_count: self.cache.len() as u64,
-            total_bytes: self.cache.weight(),
+            entry_count: entry_count as u64,
+            total_bytes,
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
         }
     }
 
-    /// Pushes the current entry count and byte weight to the Prometheus gauges.
-    fn refresh_size_gauges(&self) {
-        self.metrics.set_size(self.cache.len(), self.cache.weight() as usize);
+    /// Pushes the current entry count and byte weight to the Prometheus gauges and returns
+    /// the pair, so callers don't re-sweep the shards for values just read.
+    fn refresh_size_gauges(&self) -> (usize, u64) {
+        let (entry_count, total_bytes) = (self.cache.len(), self.cache.weight());
+        self.metrics.set_size(entry_count, total_bytes as usize);
+        (entry_count, total_bytes)
     }
 }
 

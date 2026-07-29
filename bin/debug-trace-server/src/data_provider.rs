@@ -1204,13 +1204,28 @@ impl ContractStore for NoopContractStore {
     }
 }
 
-/// Test fixtures shared with `block_data_cache` unit tests; the [`BlockStore`] stub lives
-/// in `server_db::test_support`, next to the trait.
+/// Test fixtures shared with the `rpc_service`, `block_data_cache`, and
+/// `tracing_executor` unit tests; the [`BlockStore`] stub lives in
+/// `server_db::test_support`, next to the trait.
 #[cfg(test)]
 pub(crate) mod test_support {
     use stateless_test_utils::fixtures::TestFixtures;
 
     use super::*;
+
+    /// URL of a bound-but-never-answering listener, leaked so connects hang (instead of
+    /// failing fast) for the process lifetime.
+    pub(crate) fn hanging_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        std::mem::forget(listener);
+        url
+    }
+
+    /// An empty contract cache over the no-op store.
+    pub(crate) fn noop_contract_cache() -> Arc<ContractCache> {
+        Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>))
+    }
 
     /// Builds a real [`BlockData`] (block, light witness, full fixture contract map) from
     /// the synthetic fixture set.
@@ -1359,8 +1374,7 @@ mod tests {
     /// code hash the witness references, so DB-served fetches never fall through to RPC.
     fn fixture_block_and_cache() -> (Block<Transaction>, LightWitness, Arc<ContractCache>) {
         let BlockData { block, witness, contracts } = test_support::fixture_block_data();
-        let contract_cache =
-            Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
+        let contract_cache = test_support::noop_contract_cache();
         let codes: Vec<(B256, Bytecode)> = crate::tracing_executor::extract_code_hashes(&witness)
             .into_iter()
             .map(|h| {
@@ -1373,15 +1387,6 @@ mod tests {
             .collect();
         contract_cache.insert(&codes).unwrap();
         (block, witness, contract_cache)
-    }
-
-    /// URL of a bound-but-never-answering listener, leaked so connects hang (instead of
-    /// failing fast) for the process lifetime.
-    fn hanging_url() -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/", listener.local_addr().unwrap());
-        std::mem::forget(listener);
-        url
     }
 
     /// Provider over `url` with optional DB / memory-cache tiers and a caller-supplied
@@ -1414,9 +1419,7 @@ mod tests {
     /// [`provider_with_tiers`] with no memory cache and an empty noop-backed contract
     /// cache.
     fn provider_with(url: &str, db: Option<Arc<dyn BlockStore>>) -> DataProvider {
-        let contract_cache =
-            Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
-        provider_with_tiers(url, db, None, contract_cache)
+        provider_with_tiers(url, db, None, test_support::noop_contract_cache())
     }
 
     /// A DB-served block populates the memory cache: the second request for the same hash is
@@ -1433,7 +1436,7 @@ mod tests {
         });
         let cache = Arc::new(BlockDataCache::new(1024 * 1024 * 1024));
         let provider = provider_with_tiers(
-            &hanging_url(),
+            &test_support::hanging_url(),
             Some(Arc::clone(&store) as Arc<dyn BlockStore>),
             Some(Arc::clone(&cache)),
             contract_cache,
@@ -1464,7 +1467,8 @@ mod tests {
         let hash = block.header.hash;
         let cache = Arc::new(BlockDataCache::new(1024 * 1024 * 1024));
         cache.insert(hash, Arc::new(BlockData { block, witness, contracts: HashMap::default() }));
-        let provider = provider_with_tiers(&hanging_url(), None, Some(cache), contract_cache);
+        let provider =
+            provider_with_tiers(&test_support::hanging_url(), None, Some(cache), contract_cache);
 
         let start = std::time::Instant::now();
         let data = provider.get_block_data_by_hash(hash).await.expect("memory hit");
@@ -1483,7 +1487,7 @@ mod tests {
         let store =
             Arc::new(StubBlockStore { block_data: Some((block, witness)), ..Default::default() });
         let provider = provider_with_tiers(
-            &hanging_url(),
+            &test_support::hanging_url(),
             Some(Arc::clone(&store) as Arc<dyn BlockStore>),
             None,
             contract_cache,
@@ -1853,14 +1857,12 @@ mod tests {
             RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
                 .unwrap(),
         );
-        let contract_cache =
-            Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
         // Generous deadline so the task is cancelled *by us*, not by the deadline firing.
         let provider = Arc::new(DataProvider::new(
             rpc_client,
             None,
             None,
-            contract_cache,
+            test_support::noop_contract_cache(),
             WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
             Duration::from_secs(60),
             1024,

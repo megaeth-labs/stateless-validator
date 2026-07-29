@@ -31,9 +31,10 @@ use alloy_primitives::{B256, map::HashMap};
 use alloy_rpc_types_eth::{Block, BlockTransactions, TransactionInfo};
 use alloy_rpc_types_trace::{
     geth::{
-        FourByteFrame, GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions,
-        GethTrace, NoopFrame, TraceResult,
+        FourByteFrame, GethDebugBuiltInTracerType, GethDebugTracerConfig, GethDebugTracerType,
+        GethDebugTracingOptions, GethTrace, NoopFrame, TraceResult,
         call::{CallConfig, FlatCallConfig},
+        mux::MuxConfig,
         pre_state::{AccountState, PreStateConfig, PreStateFrame},
     },
     parity::LocalizedTransactionTrace,
@@ -195,12 +196,64 @@ pub enum TraceError {
     Data(#[from] ValidationError),
 }
 
-/// Data-attributable error for a prestate frame that failed to build: the frame builder
-/// only fails on witness/DB reads, so it indicates bad block data like a replay failure.
-fn prestate_frame_error(e: impl std::fmt::Debug) -> ValidationError {
+/// Request-attributable error: tracer config parsing, inspector construction, or tracer
+/// output — nothing about the block's data. New sites pick a constructor by failure kind
+/// instead of hand-assembling a [`TraceError`] variant.
+fn request_error(context: &str, e: impl std::fmt::Debug) -> TraceError {
+    TraceError::Request(format!("{context}: {e:?}"))
+}
+
+/// Data-attributable error for a trace frame that failed to build: the prestate/mux frame
+/// builders fail only on witness/DB reads (`DB::Error`), so a failure indicates bad block
+/// data just like a replay failure.
+fn frame_build_error(context: &str, e: impl std::fmt::Debug) -> ValidationError {
     ValidationError::BlockReplayFailed(alloy_evm::block::BlockExecutionError::msg(format!(
-        "PreState trace failed: {e:?}"
+        "{context}: {e:?}"
     )))
+}
+
+/// Logs and types a per-transaction replay failure. A canonical block's transactions
+/// always execute (reverts included) against correct state, so a replay failure means the
+/// witness/env data is bad — callers abort the trace with this data-attributable error so
+/// the RPC layer drops the poisoned data, instead of returning a cacheable `Ok` full of
+/// `TraceResult::Error` entries.
+fn tx_replay_failure(
+    index: usize,
+    tx_hash: B256,
+    e: alloy_evm::block::BlockExecutionError,
+) -> ValidationError {
+    warn!(tx_index = index, tx_hash = %tx_hash, %e, "Transaction trace failed");
+    ValidationError::BlockReplayFailed(e)
+}
+
+/// Builds a [`MuxInspector`] from an already-parsed config (request-attributable on
+/// failure).
+fn mux_inspector(config: MuxConfig) -> Result<MuxInspector, TraceError> {
+    MuxInspector::try_from_config(config)
+        .map_err(|e| request_error("MuxInspector creation failed", e))
+}
+
+/// Parses the mux `tracerConfig` and builds its inspector — the one home for the mux
+/// construction path shared by the block and transaction dispatchers.
+fn mux_config_and_inspector(
+    tracer_config: &GethDebugTracerConfig,
+) -> Result<(MuxConfig, MuxInspector), TraceError> {
+    let config = tracer_config
+        .clone()
+        .into_mux_config()
+        .map_err(|_| TraceError::Request("Invalid mux tracer config".into()))?;
+    let inspector = mux_inspector(config.clone())?;
+    Ok((config, inspector))
+}
+
+/// Builds a [`JsInspector`] for one transaction context (request-attributable on failure).
+fn js_inspector(
+    code: String,
+    config: serde_json::Value,
+    ctx: TransactionContext,
+) -> Result<JsInspector, TraceError> {
+    JsInspector::with_transaction_context(code, config, ctx)
+        .map_err(|e| request_error("Failed to create JsInspector", e))
 }
 
 fn make_tx_ctx(info: &TransactionInfo) -> TransactionContext {
@@ -292,9 +345,7 @@ fn trace_block_with_tracing_inspector(
                                 };
                                 GethTrace::from(final_frame)
                             }
-                            // `geth_prestate_traces` fails only on witness/DB reads, so
-                            // this is data-attributable like a replay failure.
-                            Err(e) => return Err(prestate_frame_error(e)),
+                            Err(e) => return Err(frame_build_error("PreState trace failed", e)),
                         }
                     }
                     TracerKind::FlatCall(_) => {
@@ -339,14 +390,7 @@ fn trace_block_with_tracing_inspector(
                 *executor.inspector_mut() = tracer.create_inspector();
                 executor.evm.db_mut().commit(state_changes);
             }
-            // A canonical block's transactions always execute (reverts included) against
-            // correct state, so a replay failure means the witness/env data is bad — abort
-            // with a typed error so the caller can drop the poisoned data, instead of
-            // returning a cacheable `Ok` full of `TraceResult::Error` entries.
-            Err(e) => {
-                warn!(tx_index = index, tx_hash = %tx_hash, %e, "Transaction trace failed");
-                return Err(ValidationError::BlockReplayFailed(e));
-            }
+            Err(e) => return Err(tx_replay_failure(index, tx_hash, e)),
         }
     }
     Ok(results)
@@ -364,7 +408,7 @@ fn trace_tx_with_tracing_inspector(
     >,
     tx_index: usize,
     tracer: &TracerKind,
-) -> Result<GethTrace, ValidationError> {
+) -> Result<GethTrace, TraceError> {
     setup_executor!(env, state, tracer.create_inspector() => executor);
     replay_preceding_txs!(executor, env, tx_index);
 
@@ -413,8 +457,7 @@ fn trace_tx_with_tracing_inspector(
                     };
                     Ok(final_frame.into())
                 }
-                // Data-attributable, same as the block-level prestate path.
-                Err(e) => Err(prestate_frame_error(e)),
+                Err(e) => Err(frame_build_error("PreState trace failed", e).into()),
             }
         }
         TracerKind::FlatCall(_) => {
@@ -536,24 +579,14 @@ pub fn trace_block(
                                     tx_hash: Some(tx_hash),
                                 });
                             }
-                            Err(e) => {
-                                warn!(tx_index = index, tx_hash = %tx_hash, %e, "Transaction trace failed");
-                                return Err(ValidationError::BlockReplayFailed(e).into());
-                            }
+                            Err(e) => return Err(tx_replay_failure(index, tx_hash, e).into()),
                         }
                     }
                     results
                 }
 
                 GethDebugBuiltInTracerType::MuxTracer => {
-                    let mux_config = tracer_config
-                        .clone()
-                        .into_mux_config()
-                        .map_err(|_| TraceError::Request("Invalid mux tracer config".into()))?;
-                    let inspector =
-                        MuxInspector::try_from_config(mux_config.clone()).map_err(|e| {
-                            TraceError::Request(format!("MuxInspector creation failed: {:?}", e))
-                        })?;
+                    let (mux_config, inspector) = mux_config_and_inspector(tracer_config)?;
 
                     setup_executor!(&env, &mut state, inspector => executor);
 
@@ -590,18 +623,19 @@ pub fn trace_block(
                                             tx_hash: Some(tx_hash),
                                         });
                                     }
+                                    // The mux frame builder fails only via `DB::Error`
+                                    // (witness reads), so this aborts as data, like the
+                                    // plain prestate path.
                                     Err(e) => {
-                                        results.push(TraceResult::Error {
-                                            error: format!("MuxFrame creation failed: {:?}", e),
-                                            tx_hash: Some(tx_hash),
-                                        });
+                                        return Err(frame_build_error(
+                                            "MuxFrame creation failed",
+                                            e,
+                                        )
+                                        .into());
                                     }
                                 }
                             }
-                            Err(e) => {
-                                warn!(tx_index = index, tx_hash = %tx_hash, %e, "Transaction trace failed");
-                                return Err(ValidationError::BlockReplayFailed(e).into());
-                            }
+                            Err(e) => return Err(tx_replay_failure(index, tx_hash, e).into()),
                         }
                     }
                     results
@@ -616,14 +650,8 @@ pub fn trace_block(
                 }
 
                 let first_info = tx_info_at(block, &env.transactions[0], 0);
-                let inspector = JsInspector::with_transaction_context(
-                    code.clone(),
-                    config_json.clone(),
-                    make_tx_ctx(&first_info),
-                )
-                .map_err(|e| {
-                    TraceError::Request(format!("Failed to create JsInspector: {:?}", e))
-                })?;
+                let inspector =
+                    js_inspector(code.clone(), config_json.clone(), make_tx_ctx(&first_info))?;
 
                 setup_executor!(&env, &mut state, inspector => executor);
 
@@ -690,10 +718,7 @@ pub fn trace_block(
                                 }
                             }
                         }
-                        Err(e) => {
-                            warn!(tx_index = index, tx_hash = %tx_hash, %e, "Transaction trace failed");
-                            return Err(ValidationError::BlockReplayFailed(e).into());
-                        }
+                        Err(e) => return Err(tx_replay_failure(index, tx_hash, e).into()),
                     }
                 }
                 results
@@ -762,7 +787,6 @@ pub fn trace_transaction(
                         tx_index,
                         &TracerKind::Call(call_config),
                     )
-                    .map_err(Into::into)
                 }
 
                 GethDebugBuiltInTracerType::PreStateTracer => {
@@ -775,7 +799,6 @@ pub fn trace_transaction(
                         tx_index,
                         &TracerKind::PreState(prestate_config),
                     )
-                    .map_err(Into::into)
                 }
 
                 GethDebugBuiltInTracerType::FlatCallTracer => {
@@ -788,7 +811,6 @@ pub fn trace_transaction(
                         tx_index,
                         &TracerKind::FlatCall(flat_call_config),
                     )
-                    .map_err(Into::into)
                 }
 
                 GethDebugBuiltInTracerType::FourByteTracer => {
@@ -805,22 +827,12 @@ pub fn trace_transaction(
                 }
 
                 GethDebugBuiltInTracerType::MuxTracer => {
-                    let mux_config = tracer_config
-                        .clone()
-                        .into_mux_config()
-                        .map_err(|_| TraceError::Request("Invalid mux tracer config".into()))?;
-                    let inspector =
-                        MuxInspector::try_from_config(mux_config.clone()).map_err(|e| {
-                            TraceError::Request(format!("MuxInspector creation failed: {:?}", e))
-                        })?;
+                    let (mux_config, inspector) = mux_config_and_inspector(tracer_config)?;
 
                     setup_executor!(&env, &mut state, inspector => executor);
                     replay_preceding_txs!(executor, &env, tx_index);
 
-                    *executor.inspector_mut() =
-                        MuxInspector::try_from_config(mux_config).map_err(|e| {
-                            TraceError::Request(format!("MuxInspector creation failed: {:?}", e))
-                        })?;
+                    *executor.inspector_mut() = mux_inspector(mux_config)?;
 
                     let outcome = executor
                         .run_transaction(recovered_target)
@@ -833,38 +845,25 @@ pub fn trace_transaction(
 
                     let db = executor.evm.db();
                     let inspector = executor.inspector();
+                    // Data-attributable: the mux frame builder fails only via
+                    // `DB::Error` (witness reads), like the plain prestate path.
                     inspector
                         .try_into_mux_frame(&result_and_state, db, info)
                         .map(|frame| frame.into())
-                        .map_err(|e| {
-                            TraceError::Request(format!("MuxFrame creation failed: {:?}", e))
-                        })
+                        .map_err(|e| frame_build_error("MuxFrame creation failed", e).into())
                 }
             },
 
             GethDebugTracerType::JsTracer(code) => {
                 let config_json = tracer_config.clone().into_json();
-                let tx_ctx = make_tx_ctx(&info);
-                let inspector = JsInspector::with_transaction_context(
-                    code.clone(),
-                    config_json.clone(),
-                    tx_ctx,
-                )
-                .map_err(|e| {
-                    TraceError::Request(format!("Failed to create JsInspector: {:?}", e))
-                })?;
+                let inspector =
+                    js_inspector(code.clone(), config_json.clone(), make_tx_ctx(&info))?;
 
                 setup_executor!(&env, &mut state, inspector => executor);
                 replay_preceding_txs!(executor, &env, tx_index);
 
-                *executor.inspector_mut() = JsInspector::with_transaction_context(
-                    code.clone(),
-                    config_json,
-                    make_tx_ctx(&info),
-                )
-                .map_err(|e| {
-                    TraceError::Request(format!("Failed to create JsInspector: {:?}", e))
-                })?;
+                *executor.inspector_mut() =
+                    js_inspector(code.clone(), config_json, make_tx_ctx(&info))?;
 
                 let outcome = executor
                     .run_transaction(recovered_target)
@@ -879,16 +878,13 @@ pub fn trace_transaction(
                 js_inspector
                     .json_result(result_and_state, &tx_env, &evm_env_ref.block_env, &*db)
                     .map(GethTrace::JS)
-                    .map_err(|e| {
-                        TraceError::Request(format!("JS tracer execution failed: {:?}", e))
-                    })
+                    .map_err(|e| request_error("JS tracer execution failed", e))
             }
         };
     }
 
     // Default: struct logger tracer
     trace_tx_with_tracing_inspector(&env, block, &mut state, tx_index, &TracerKind::Default(opts))
-        .map_err(Into::into)
 }
 
 // Public API - Parity-style Tracing
@@ -1115,28 +1111,24 @@ mod tests {
     /// [`TraceError::Request`].
     #[test]
     fn trace_block_discriminates_data_and_request_errors() {
-        use alloy_rpc_types_trace::geth::GethDebugTracerConfig;
         use stateless_test_utils::fixtures::TestFixtures;
 
-        let fixtures = TestFixtures::synthetic();
-        let chain_spec = ChainSpec::from_genesis(fixtures.load_genesis().expect("genesis"));
-        let (_, hash) = fixtures.paired_blocks().into_iter().next().expect("paired fixture");
-        let block = fixtures.blocks[&hash].clone();
-        let witness = LightWitness::from(&fixtures.salt_witnesses[&hash]);
+        use crate::data_provider::{BlockData, test_support::fixture_block_data};
 
-        let missing_contracts = HashMap::default();
+        let chain_spec =
+            ChainSpec::from_genesis(TestFixtures::synthetic().load_genesis().expect("genesis"));
+        let BlockData { block, witness, contracts } = fixture_block_data();
+
         let err = trace_block(
             &chain_spec,
             &block,
             witness.clone(),
-            &missing_contracts,
+            &HashMap::default(),
             GethDebugTracingOptions::default(),
         )
         .expect_err("missing bytecode must fail the replay");
         assert!(matches!(err, TraceError::Data(_)), "got: {err:?}");
 
-        let contracts: HashMap<B256, Bytecode> =
-            fixtures.contracts.iter().map(|(h, code)| (*h, code.clone())).collect();
         let opts = GethDebugTracingOptions {
             tracer: Some(GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::MuxTracer)),
             tracer_config: GethDebugTracerConfig(serde_json::json!({"bogusTracer": {}})),

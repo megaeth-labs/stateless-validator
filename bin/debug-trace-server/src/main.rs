@@ -75,7 +75,9 @@ mod server_db;
 mod timing;
 mod tracing_executor;
 
-use block_data_cache::{BlockDataCache, DEFAULT_BLOCK_DATA_CACHE_MAX_BYTES};
+use block_data_cache::{
+    BLOCK_DATA_CACHE_SHARDS, BlockDataCache, DEFAULT_BLOCK_DATA_CACHE_MAX_BYTES,
+};
 use data_provider::{DataProvider, NoopContractStore, WitnessFetchConfig};
 use response_cache::{DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS, ResponseCache, ResponseCacheConfig};
 use rpc_service::RpcContext;
@@ -499,7 +501,12 @@ async fn main() -> Result<()> {
         warn!("Block-data cache disabled (max size = 0); every request re-resolves block data");
         None
     } else {
-        // `BlockDataCache::new` logs the effective sizing (shards, per-shard budget).
+        debug!(
+            max_bytes = args.block_data_cache_max_size,
+            shards = BLOCK_DATA_CACHE_SHARDS,
+            per_shard_budget = args.block_data_cache_max_size / BLOCK_DATA_CACHE_SHARDS as u64,
+            "Block-data cache initialized; entries above the per-shard budget are never admitted"
+        );
         Some(Arc::new(BlockDataCache::new(args.block_data_cache_max_size)))
     };
 
