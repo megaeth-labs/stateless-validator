@@ -665,14 +665,11 @@ impl RpcClient {
     }
 
     /// Like [`Self::get_witness_light_with_deadline`], but consults only the FIRST witness
-    /// provider (the generator, when one is declared) — the complement of
-    /// [`Self::get_witness_light_with_deadline_from`]. That one skips providers that cannot
-    /// have the witness anymore (pruned); this one is for callers that know the later
-    /// providers cannot have it *yet*: fallbacks receive witnesses from the same generation
-    /// pipeline, so for a witness still being generated they cannot be ahead of the
-    /// generator, and rotating to them on a fresh miss wastes a round trip per attempt and
-    /// exposes the caller to fallback stalls. Retries the single provider with round
-    /// backoff until `deadline`.
+    /// provider — the complement of [`Self::get_witness_light_with_deadline_from`]: that
+    /// one skips providers that cannot have the witness anymore (pruned), this one is for
+    /// callers that know the later providers cannot have it *yet* (e.g. it is still being
+    /// generated upstream). Retries the single provider with round backoff until
+    /// `deadline`.
     pub async fn get_witness_light_first_provider_only(
         &self,
         number: u64,

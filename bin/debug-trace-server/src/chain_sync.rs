@@ -21,7 +21,6 @@ use stateless_core::{
     LightWitness,
     db::BlockMeta,
     pipeline::{BlockFetcher, BlockProcessor, PipelineHooks},
-    withdrawals::MptWitness,
 };
 
 use crate::{metrics, response_cache::ResponseCache, server_db::BlockStore};
@@ -55,8 +54,15 @@ const GENERATOR_WITNESS_GRACE: Duration = Duration::from_secs(6);
 /// found" means "not generated yet", not "ask someone else" — and only fall back to the
 /// full endpoint chain when the grace expires; everything else (deep catch-up, where the
 /// generator may have pruned the block) uses the full chain from the first attempt.
+/// The request-serving twin of this policy is `witness_route` in `data_provider.rs`
+/// (local-tip anchor, skip-generator direction); both gate on the CLI-declared generator.
 pub struct TraceFetcher {
     rpc_client: Arc<RpcClient>,
+    /// Whether witness endpoint 0 is the CLI-declared generator
+    /// (`--witness-generator-endpoint`). CLI knowledge, not derivable from the client;
+    /// without it no endpoint is special and the grace is disabled — plain failover,
+    /// matching the request path's `can_skip_generator` gate.
+    generator_first: bool,
     /// Last remote head observed by [`Self::latest_block_number`] — the freshness anchor
     /// for witness routing. `u64::MAX` until the first successful poll, which classifies
     /// every block as non-fresh (full-chain fetch) rather than guessing.
@@ -66,33 +72,34 @@ pub struct TraceFetcher {
 }
 
 impl TraceFetcher {
-    pub fn new(rpc_client: Arc<RpcClient>) -> Self {
+    pub fn new(rpc_client: Arc<RpcClient>, generator_first: bool) -> Self {
         Self {
             rpc_client,
+            generator_first,
             remote_head: AtomicU64::new(u64::MAX),
             generator_grace: GENERATOR_WITNESS_GRACE,
         }
     }
 
     /// Witness fetch with frontier-aware provider routing; see the type-level doc.
-    async fn fetch_witness(&self, number: u64, hash: BlockHash) -> (LightWitness, MptWitness) {
+    async fn fetch_witness(&self, number: u64, hash: BlockHash) -> LightWitness {
         let head = self.remote_head.load(Ordering::Relaxed);
         // `u64::MAX` (head not yet observed) saturates to "very far below the head" and
         // correctly classifies as non-fresh.
         let fresh = head.saturating_sub(number) <= FRONTIER_FRESHNESS_BLOCKS;
-        if fresh && self.rpc_client.witness_provider_count() > 1 {
+        if fresh && self.generator_first && self.rpc_client.witness_provider_count() > 1 {
             let grace = Instant::now() + self.generator_grace;
-            if let Ok(witness) = self
+            if let Ok((light, _mpt)) = self
                 .rpc_client
                 .get_witness_light_first_provider_only(number, hash, Some(grace))
                 .await
             {
-                return witness;
+                return light;
             }
             // Grace expired: the witness is genuinely unavailable at the generator (down,
             // or never written). Fall through to the full chain — the pre-routing shape.
         }
-        self.rpc_client.get_witness_light(number, hash).await
+        self.rpc_client.get_witness_light(number, hash).await.0
     }
 }
 
@@ -105,11 +112,10 @@ impl BlockFetcher for TraceFetcher {
         // clock under chain-sync load by overlapping the witness fetch with the full-block
         // fetch instead of serializing all three round trips.
         let block_hash = self.rpc_client.get_block_hash(block_number).await;
-        let (witness_res, block_res) = tokio::join!(
+        let (light, block_res) = tokio::join!(
             self.fetch_witness(block_number, block_hash),
             self.rpc_client.get_block(BlockId::Number(block_number.into()), true),
         );
-        let (light, _mpt) = witness_res;
         Ok((block_res, light))
     }
 
@@ -247,7 +253,7 @@ mod tests {
     use alloy_primitives::{B256, map::HashMap};
     use revm::state::Bytecode;
     use stateless_common::{BackoffPolicy, RpcClientConfig, witness_encoding};
-    use stateless_core::StoreResult;
+    use stateless_core::{StoreResult, withdrawals::MptWitness};
     use stateless_test_utils::fixtures::TestFixtures;
 
     use super::*;
@@ -304,12 +310,11 @@ mod tests {
             RpcClient::new_with_config(&["http://127.0.0.1:9/"], witness_urls, config, None)
                 .unwrap(),
         );
-        TraceFetcher { rpc_client, remote_head: AtomicU64::new(u64::MAX), generator_grace: grace }
+        TraceFetcher { generator_grace: grace, ..TraceFetcher::new(rpc_client, true) }
     }
 
     /// A frontier-fresh miss stays on the generator: retried through the grace and served
-    /// there, with the fallback never contacted — frontier witnesses come from the
-    /// generation pipeline, so the fallback cannot be ahead of the generator.
+    /// there, with the fallback never contacted.
     #[tokio::test]
     async fn fresh_witness_miss_retries_generator_without_touching_fallback() {
         let (number, hash, wire, light) = fixture_wire();
@@ -318,7 +323,7 @@ mod tests {
         let fetcher = test_fetcher(&[&gen_url, &fb_url], Duration::from_secs(10));
         fetcher.remote_head.store(number, Ordering::Relaxed);
 
-        let (got, _mpt) = fetcher.fetch_witness(number, hash).await;
+        let got = fetcher.fetch_witness(number, hash).await;
 
         assert_eq!(got, light);
         assert_eq!(
@@ -340,12 +345,35 @@ mod tests {
         fetcher.remote_head.store(number + FRONTIER_FRESHNESS_BLOCKS + 1, Ordering::Relaxed);
 
         let start = Instant::now();
-        let (got, _mpt) = fetcher.fetch_witness(number, hash).await;
+        let got = fetcher.fetch_witness(number, hash).await;
 
         assert_eq!(got, light);
         assert_eq!(gen_hits.load(Ordering::Relaxed), 1);
         assert_eq!(fb_hits.load(Ordering::Relaxed), 1);
         assert!(start.elapsed() < Duration::from_secs(5), "no generator grace on stale blocks");
+    }
+
+    /// Without a CLI-declared generator no endpoint is special: even a frontier-fresh
+    /// miss rotates to the second endpoint in the same round — plain failover, mirroring
+    /// the request path's `fetch_witness_without_generator_never_skips`.
+    #[tokio::test]
+    async fn no_declared_generator_keeps_plain_failover() {
+        let (number, hash, wire, light) = fixture_wire();
+        let (_first, first_url, first_hits) = scripted_witness_rpc(0, None).await;
+        let (_second, second_url, second_hits) = scripted_witness_rpc(0, Some(wire)).await;
+        let fetcher = TraceFetcher {
+            generator_first: false,
+            ..test_fetcher(&[&first_url, &second_url], Duration::from_secs(30))
+        };
+        fetcher.remote_head.store(number, Ordering::Relaxed);
+
+        let start = Instant::now();
+        let got = fetcher.fetch_witness(number, hash).await;
+
+        assert_eq!(got, light);
+        assert_eq!(first_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(second_hits.load(Ordering::Relaxed), 1);
+        assert!(start.elapsed() < Duration::from_secs(5), "no grace without a generator");
     }
 
     /// Before the first head poll nothing classifies as fresh: full-chain behavior, no
@@ -357,7 +385,7 @@ mod tests {
         let (_fb, fb_url, fb_hits) = scripted_witness_rpc(0, Some(wire)).await;
         let fetcher = test_fetcher(&[&gen_url, &fb_url], Duration::from_secs(30));
 
-        let (got, _mpt) = fetcher.fetch_witness(number, hash).await;
+        let got = fetcher.fetch_witness(number, hash).await;
 
         assert_eq!(got, light);
         assert_eq!(fb_hits.load(Ordering::Relaxed), 1, "unknown head must use the full chain");
@@ -377,7 +405,7 @@ mod tests {
         fetcher.remote_head.store(number, Ordering::Relaxed);
 
         let start = Instant::now();
-        let (got, _mpt) = fetcher.fetch_witness(number, hash).await;
+        let got = fetcher.fetch_witness(number, hash).await;
 
         assert_eq!(got, light);
         assert!(
@@ -401,7 +429,7 @@ mod tests {
             RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
                 .unwrap(),
         );
-        let fetcher = TraceFetcher::new(rpc_client);
+        let fetcher = TraceFetcher::new(rpc_client, true);
         assert_eq!(fetcher.remote_head.load(Ordering::Relaxed), u64::MAX);
 
         assert_eq!(fetcher.latest_block_number().await.unwrap(), 0x64);

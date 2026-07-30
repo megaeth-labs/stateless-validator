@@ -492,7 +492,8 @@ async fn main() -> Result<()> {
             Arc::clone(db) as Arc<dyn BlockStore>,
             response_cache.clone(),
         ));
-        let fetcher = Arc::new(TraceFetcher::new(Arc::clone(&rpc_client)));
+        let fetcher =
+            Arc::new(TraceFetcher::new(Arc::clone(&rpc_client), witness_cfg.generator_first));
         task::spawn({
             let db = Arc::clone(db);
             let shutdown = shutdown.clone();
