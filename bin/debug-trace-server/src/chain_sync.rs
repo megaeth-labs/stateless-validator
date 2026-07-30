@@ -9,7 +9,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use alloy_primitives::{BlockHash, BlockNumber};
@@ -40,6 +40,11 @@ const FRONTIER_FRESHNESS_BLOCKS: u64 = 256;
 /// routine generation lag; small enough that a genuinely unavailable fresh witness (the
 /// generator is down, or the witness was never written) only delays failover by this much
 /// before the fetch behaves exactly as it did without frontier routing.
+///
+/// The grace is enforced by a caller-side timeout around a deadline-less probe, not by the
+/// RPC client's deadline: expiry is an internal routing budget, not a failed logical call,
+/// and must not increment the upstream deadline-exceeded counter that alerting reads as
+/// real witness-fetch failures.
 const GENERATOR_WITNESS_GRACE: Duration = Duration::from_secs(6);
 
 /// Fetcher for the trace server: fetches blocks + witnesses, discards MPT witness.
@@ -67,7 +72,7 @@ pub struct TraceFetcher {
     /// for witness routing. `u64::MAX` until the first successful poll, which classifies
     /// every block as non-fresh (full-chain fetch) rather than guessing.
     remote_head: AtomicU64,
-    /// [`GENERATOR_WITNESS_GRACE`], as a field so tests can shrink it.
+    /// [`GENERATOR_WITNESS_GRACE`]; a field so tests can shrink it.
     generator_grace: Duration,
 }
 
@@ -88,12 +93,8 @@ impl TraceFetcher {
         // correctly classifies as non-fresh.
         let fresh = head.saturating_sub(number) <= FRONTIER_FRESHNESS_BLOCKS;
         if fresh && self.generator_first && self.rpc_client.witness_provider_count() > 1 {
-            let grace = Instant::now() + self.generator_grace;
-            if let Ok((light, _mpt)) = self
-                .rpc_client
-                .get_witness_light_first_provider_only(number, hash, Some(grace))
-                .await
-            {
+            let probe = self.rpc_client.get_witness_light_first_provider_only(number, hash, None);
+            if let Ok(Ok((light, _mpt))) = tokio::time::timeout(self.generator_grace, probe).await {
                 return light;
             }
             // Grace expired: the witness is genuinely unavailable at the generator (down,
@@ -248,7 +249,10 @@ impl PipelineHooks for TraceHooks {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::AtomicUsize};
+    use std::{
+        sync::{Arc, atomic::AtomicUsize},
+        time::Instant,
+    };
 
     use alloy_primitives::{B256, map::HashMap};
     use revm::state::Bytecode;
@@ -391,8 +395,29 @@ mod tests {
         assert_eq!(fb_hits.load(Ordering::Relaxed), 1, "unknown head must use the full chain");
     }
 
+    /// Counts `on_rpc_deadline_exceeded` calls; every other [`RpcMetrics`] hook keeps its
+    /// default no-op.
+    struct DeadlineCounter(AtomicUsize);
+
+    impl stateless_common::RpcMetrics for DeadlineCounter {
+        fn on_rpc_attempt(
+            &self,
+            _method: stateless_common::RpcMethod,
+            _provider: &str,
+            _outcome: stateless_common::metrics::RpcAttemptOutcome,
+            _duration_secs: f64,
+        ) {
+        }
+        fn on_witness_fetch(&self, _breakdown: stateless_common::WitnessSizeBreakdown) {}
+        fn on_rpc_deadline_exceeded(&self, _method: stateless_common::RpcMethod, _secs: f64) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// A downed generator costs at most the grace on a fresh block: the fetch then falls
-    /// back to the full chain and succeeds on the fallback.
+    /// back to the full chain and succeeds on the fallback — and the expired grace is an
+    /// internal routing budget, so it must not count as an upstream deadline-exceeded
+    /// (alerting reads that metric as real witness-fetch failures).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fresh_fetch_falls_back_after_grace_when_generator_is_down() {
         let (number, hash, wire, light) = fixture_wire();
@@ -401,7 +426,26 @@ mod tests {
         let gen_url = format!("http://{}", dead.local_addr().unwrap());
         drop(dead);
         let (_fb, fb_url, fb_hits) = scripted_witness_rpc(0, Some(wire)).await;
-        let fetcher = test_fetcher(&[&gen_url, &fb_url], Duration::from_millis(300));
+        let deadline_exceeded = Arc::new(DeadlineCounter(AtomicUsize::new(0)));
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
+            per_attempt_timeout: Duration::from_millis(500),
+            metrics: Some(Arc::clone(&deadline_exceeded) as _),
+            ..RpcClientConfig::trace_server()
+        };
+        let rpc_client = Arc::new(
+            RpcClient::new_with_config(
+                &["http://127.0.0.1:9/"],
+                &[&gen_url, &fb_url],
+                config,
+                None,
+            )
+            .unwrap(),
+        );
+        let fetcher = TraceFetcher {
+            generator_grace: Duration::from_millis(300),
+            ..TraceFetcher::new(rpc_client, true)
+        };
         fetcher.remote_head.store(number, Ordering::Relaxed);
 
         let start = Instant::now();
@@ -413,6 +457,11 @@ mod tests {
             "the generator keeps its grace before failover"
         );
         assert!(fb_hits.load(Ordering::Relaxed) >= 1);
+        assert_eq!(
+            deadline_exceeded.0.load(Ordering::Relaxed),
+            0,
+            "an expired grace must not record an upstream deadline-exceeded"
+        );
     }
 
     /// `latest_block_number` feeds the freshness anchor.
