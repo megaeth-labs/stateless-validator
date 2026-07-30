@@ -108,7 +108,7 @@ Two operating modes:
 
 The server includes an HTTP response cache (`quick_cache`) for pre-serialized JSON and a `DataProvider` with single-flight request coalescing.
 In local cache mode with a `--witness-generator-endpoint` plus at least one fallback `--witness-endpoint`, request-serving witness fetches route by block age: blocks at least `--witness-local-window` blocks below the local tip skip the generator (which prunes beyond its `BACKUP` window) and fetch from the fallbacks; without the generator flag, witness endpoints are plain failover and routing is disabled.
-The background chain-sync prefetch always uses the full endpoint chain — it fetches at the sync frontier, which stays within the generator's retention unless `--blocks-to-keep` exceeds that retention during deep catch-up.
+The background chain-sync prefetch routes by freshness against the last observed remote head: frontier-fresh blocks give the generator a short exclusive grace (its "witness not found" means "not generated yet" — fallbacks are fed by the same pipeline and cannot be ahead) before falling back to the full endpoint chain, while deep catch-up blocks use the full chain from the first attempt.
 
 ### Key Source Files
 

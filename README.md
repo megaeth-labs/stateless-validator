@@ -101,7 +101,8 @@ Two operating modes:
 **Witness endpoints:**
 Declare the internal witness generator via `--witness-generator-endpoint`; `--witness-endpoint` lists the durable fallbacks (e.g. an R2-backed witness service), tried in order.
 In local cache mode with a generator plus at least one fallback, requests for blocks at least `--witness-local-window` blocks below the local tip skip the generator and fetch from the fallbacks, because the generator only retains a recent window (its `BACKUP`, deployed at 4096) and probing it for pruned blocks is a guaranteed miss.
-The background chain-sync prefetch always uses the full endpoint chain.
+The background chain-sync prefetch routes by freshness against the last observed remote head: for frontier-fresh blocks the generator gets a short exclusive grace before the full endpoint chain — its "witness not found" at the frontier means "not generated yet", and the fallbacks receive witnesses from the same generation pipeline, so rotating to them on a fresh miss wastes a round trip per block and exposes tip sync to fallback stalls.
+Deep catch-up blocks (far below the observed head, where the generator may have pruned the witness) keep full failover from the first attempt.
 Without `--witness-generator-endpoint`, historical routing is disabled and the endpoints are plain failover.
 
 **Witness routing and sync knobs** (each also settable via its `DEBUG_TRACE_SERVER_*` env var):
