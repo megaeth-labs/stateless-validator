@@ -184,7 +184,8 @@ pub struct CacheMetrics {
     /// Current cache data size in bytes
     cache_bytes: Gauge,
     /// Inserts that were not retained by the cache (rejected at admission or immediately
-    /// evicted), so silent non-admission is distinguishable from ordinary misses
+    /// evicted), so silent non-admission is distinguishable from ordinary misses; may
+    /// include rare false positives from a concurrent eviction racing the retention check
     cache_admission_rejects_total: Counter,
 }
 

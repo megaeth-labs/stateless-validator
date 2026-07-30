@@ -46,8 +46,11 @@ pub const DEFAULT_BLOCK_DATA_CACHE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 pub(crate) const BLOCK_DATA_CACHE_SHARDS: usize = 4;
 
 /// Assumed typical in-memory size of one resolved block, used only to derive the
-/// estimated-items capacity hint from the byte budget.
-const EXPECTED_BLOCK_DATA_BYTES: u64 = 4 * 1024 * 1024;
+/// estimated-items capacity hint (initial sizing + ghost-queue length, not correctness)
+/// from the byte budget. Measured with `block_data_weight` over the mainnet fixture
+/// blocks: quiet blocks (~25 txs) weigh ~70–360 KB and the load-test-era ones (~600 txs)
+/// ~0.5–1.0 MB, so 256 KiB sits near the sample median.
+const EXPECTED_BLOCK_DATA_BYTES: u64 = 256 * 1024;
 
 /// Fixed per-entry bookkeeping overhead.
 const ENTRY_OVERHEAD: u64 = 128;
@@ -181,7 +184,9 @@ impl BlockDataCache {
     /// Inserts resolved block data, weighing it once, and refreshes the size gauges.
     /// An insert the cache did not retain — the entry outweighs a shard's budget, or was
     /// evicted on arrival — is counted and logged, since it is otherwise indistinguishable
-    /// from an ordinary miss on the next request.
+    /// from an ordinary miss on the next request. The check races concurrent inserts, so
+    /// an entry legitimately evicted under pressure between the insert and the check also
+    /// counts — the counter is a pressure signal, not an exact tally of oversized entries.
     pub fn insert(&self, hash: B256, data: Arc<BlockData>) {
         let weight = block_data_weight(&data);
         self.cache.insert(hash, (weight, data));
