@@ -27,7 +27,7 @@ use crate::{
         METHOD_DEBUG_TRACE_TRANSACTION, METHOD_TRACE_BLOCK, METHOD_TRACE_TRANSACTION,
         ResponseSizeMetrics, RpcGlobalMetrics, SingleFlightMetrics,
     },
-    response_cache::{CachedResource, RequestShape, ResponseCache, ResponseVariant},
+    response_cache::{CachedResource, RawJson, RequestShape, ResponseCache, ResponseVariant},
     tracing_executor::TraceError,
 };
 
@@ -44,7 +44,7 @@ pub trait DebugTraceRpc {
         &self,
         block_number: BlockNumberOrTag,
         opts: Option<GethDebugTracingOptions>,
-    ) -> RpcResult<serde_json::Value>;
+    ) -> RpcResult<RawJson>;
 
     /// Trace block execution by block hash.
     #[method(name = "traceBlockByHash")]
@@ -52,7 +52,7 @@ pub trait DebugTraceRpc {
         &self,
         block_hash: B256,
         opts: Option<GethDebugTracingOptions>,
-    ) -> RpcResult<serde_json::Value>;
+    ) -> RpcResult<RawJson>;
 
     /// Trace a single transaction execution.
     #[method(name = "traceTransaction")]
@@ -60,7 +60,7 @@ pub trait DebugTraceRpc {
         &self,
         tx_hash: B256,
         opts: Option<GethDebugTracingOptions>,
-    ) -> RpcResult<serde_json::Value>;
+    ) -> RpcResult<RawJson>;
 
     /// Query current response cache status.
     #[method(name = "getCacheStatus")]
@@ -72,12 +72,12 @@ pub trait DebugTraceRpc {
 pub trait TraceRpc {
     /// Parity-style block tracing (flat call traces).
     #[method(name = "block")]
-    async fn trace_block(&self, block_number: BlockNumberOrTag) -> RpcResult<serde_json::Value>;
+    async fn trace_block(&self, block_number: BlockNumberOrTag) -> RpcResult<RawJson>;
 
     /// Parity-style transaction tracing.
     /// Returns null (not error) when transaction is not found, matching mega-reth behavior.
     #[method(name = "transaction")]
-    async fn trace_parity_transaction(&self, tx_hash: B256) -> RpcResult<serde_json::Value>;
+    async fn trace_parity_transaction(&self, tx_hash: B256) -> RpcResult<RawJson>;
 }
 
 // RPC Watch Dog
@@ -224,7 +224,7 @@ impl RpcContext {
     /// *before* the cache lookup, all on one request deadline; on a miss, fetch block data
     /// by the resolved hash on the remaining budget. Slow prelude stages are warned about
     /// here, where they are measured; trace/serialize timing lives in
-    /// [`compute_block_trace`] and cache-insert timing in [`insert_cache`].
+    /// [`compute_block_trace`].
     async fn lookup_block_by_number(
         &self,
         method: &'static str,
@@ -293,7 +293,7 @@ impl RpcContext {
         data: &BlockData,
         method: &'static str,
         opts: GethDebugTracingOptions,
-    ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
+    ) -> Result<RawJson, jsonrpsee::types::ErrorObjectOwned> {
         compute_block_trace(data, method, || {
             crate::tracing_executor::trace_block(
                 &self.chain_spec,
@@ -310,7 +310,7 @@ impl RpcContext {
 /// Outcome of [`RpcContext::lookup_block_by_number`].
 enum BlockLookup {
     /// Served straight from the response cache.
-    Cached(serde_json::Value),
+    Cached(RawJson),
     /// Cache miss: block data fetched by the resolved canonical hash, ready to trace.
     Fetched(Arc<BlockData>),
 }
@@ -374,14 +374,16 @@ fn data_provider_error_to_rpc_error(e: &DataProviderError) -> jsonrpsee::types::
 
 // Trace Computation Helpers
 /// Runs a block-trace executor closure and wraps the scaffolding shared by every
-/// block-level handler: EVM timing + metrics, JSON serialization, the response-size
-/// metric, and the slow-stage warning. Returns the typed [`TraceError`] so the caller can
-/// key cache hygiene off its data-vs-request discriminant before rendering an RPC error.
+/// block-level handler: EVM timing + metrics, the single JSON serialization (straight
+/// from the trace output into [`RawJson`] bytes — the tree is never rebuilt as a
+/// `serde_json::Value`), the response-size metric, and the slow-stage warning. Returns
+/// the typed [`TraceError`] so the caller can key cache hygiene off its data-vs-request
+/// discriminant before rendering an RPC error.
 fn compute_block_trace<T: serde::Serialize>(
     data: &BlockData,
     method_name: &'static str,
     run: impl FnOnce() -> Result<T, TraceError>,
-) -> Result<serde_json::Value, TraceError> {
+) -> Result<RawJson, TraceError> {
     let start = Instant::now();
 
     let results = run()?;
@@ -390,11 +392,12 @@ fn compute_block_trace<T: serde::Serialize>(
     EvmExecutionMetrics::new_for_method(method_name)
         .record(start.elapsed().as_secs_f64(), data.block.transactions.len());
 
-    let value = serde_json::to_value(&results)
-        .map_err(|e| TraceError::Request(format!("Serialization failed: {e}")))?;
+    let json: RawJson = serde_json::value::to_raw_value(&results)
+        .map_err(|e| TraceError::Request(format!("Serialization failed: {e}")))?
+        .into();
 
     let serialize_ms = start.elapsed().as_millis() - trace_ms;
-    let response_size = value.to_string().len();
+    let response_size = json.byte_len();
     ResponseSizeMetrics::new_for_method(method_name).record(response_size);
 
     if trace_ms >= SLOW_STAGE_THRESHOLD_MS || serialize_ms >= SLOW_STAGE_THRESHOLD_MS {
@@ -409,15 +412,16 @@ fn compute_block_trace<T: serde::Serialize>(
         );
     }
 
-    Ok(value)
+    Ok(json)
 }
 
 // Cache Helper Functions
 /// Checks the cache for `(resource, block_hash, variant)`; a hit records request metrics
-/// and returns the pre-serialized response. A `None` variant marks a non-cacheable request
-/// shape and bypasses the lookup entirely (no hit/miss accounting). By-number callers
-/// resolve the canonical hash *before* calling this, so a hit is correct by construction —
-/// there is no serve-time canonicality validation anymore.
+/// and returns the pre-serialized response bytes, ready to splice into the reply. A
+/// `None` variant marks a non-cacheable request shape and bypasses the lookup entirely
+/// (no hit/miss accounting). By-number callers resolve the canonical hash *before*
+/// calling this, so a hit is correct by construction — there is no serve-time
+/// canonicality validation anymore.
 fn check_cache(
     cache: &Option<ResponseCache>,
     resource: CachedResource,
@@ -425,7 +429,7 @@ fn check_cache(
     variant: Option<ResponseVariant>,
     method_name: &'static str,
     start: Instant,
-) -> Option<serde_json::Value> {
+) -> Option<RawJson> {
     let cached_value = cache.as_ref()?.get(resource, block_hash, variant?)?;
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -446,30 +450,19 @@ fn check_cache(
 
 /// Inserts a computed response under the hash of the block it was computed for; a no-op
 /// when the cache is disabled or the request shape is not cacheable (`variant` is `None`).
-/// Serializing a multi-MB response into the cache can be slow, so the insert is timed and
-/// warned about here, where it happens.
+/// The insert shares the reply's already-serialized bytes (an `Arc` clone), so nothing is
+/// re-serialized and there is no multi-MB copy to time.
 fn insert_cache(
     cache: &Option<ResponseCache>,
     resource: CachedResource,
     block_hash: B256,
     variant: Option<ResponseVariant>,
-    method_name: &'static str,
-    result: &serde_json::Value,
+    result: &RawJson,
 ) {
     let (Some(cache), Some(variant)) = (cache, variant) else {
         return;
     };
-    let t = Instant::now();
     cache.insert(resource, block_hash, variant, result);
-    let insert_ms = t.elapsed().as_millis();
-    if insert_ms >= SLOW_STAGE_THRESHOLD_MS {
-        warn!(
-            method = method_name,
-            block_hash = %block_hash,
-            cache_insert_ms = insert_ms as u64,
-            "slow response-cache insert"
-        );
-    }
 }
 
 /// Records metrics and logs for a completed request.
@@ -496,7 +489,7 @@ impl DebugTraceRpcServer for RpcContext {
         &self,
         block_number: BlockNumberOrTag,
         opts: Option<GethDebugTracingOptions>,
-    ) -> RpcResult<serde_json::Value> {
+    ) -> RpcResult<RawJson> {
         let _guard = self
             .watch_dog
             .start_request(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, format!("{block_number}"));
@@ -525,7 +518,6 @@ impl DebugTraceRpcServer for RpcContext {
             CachedResource::DebugTraceBlock,
             data.block.header.hash,
             variant,
-            METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
             &result,
         );
         record_request_completion(
@@ -542,7 +534,7 @@ impl DebugTraceRpcServer for RpcContext {
         &self,
         block_hash: B256,
         opts: Option<GethDebugTracingOptions>,
-    ) -> RpcResult<serde_json::Value> {
+    ) -> RpcResult<RawJson> {
         let _guard =
             self.watch_dog.start_request(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, format!("{block_hash}"));
         let start = Instant::now();
@@ -575,7 +567,6 @@ impl DebugTraceRpcServer for RpcContext {
             CachedResource::DebugTraceBlock,
             block_hash,
             variant,
-            METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
             &result,
         );
         record_request_completion(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, block_num, start);
@@ -588,7 +579,7 @@ impl DebugTraceRpcServer for RpcContext {
         &self,
         tx_hash: B256,
         opts: Option<GethDebugTracingOptions>,
-    ) -> RpcResult<serde_json::Value> {
+    ) -> RpcResult<RawJson> {
         let _guard =
             self.watch_dog.start_request(METHOD_DEBUG_TRACE_TRANSACTION, format!("{tx_hash}"));
         let start = Instant::now();
@@ -636,11 +627,11 @@ impl DebugTraceRpcServer for RpcContext {
             );
         }
 
-        let value = serde_json::to_value(&result)
-            .map_err(|e| rpc_err(format!("Serialization failed: {e}")))?;
-        ResponseSizeMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION)
-            .record(value.to_string().len());
-        Ok(value)
+        let json: RawJson = serde_json::value::to_raw_value(&result)
+            .map_err(|e| rpc_err(format!("Serialization failed: {e}")))?
+            .into();
+        ResponseSizeMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION).record(json.byte_len());
+        Ok(json)
     }
 
     async fn get_cache_status(&self) -> RpcResult<serde_json::Value> {
@@ -671,7 +662,7 @@ fn cache_section(stats: Option<CacheStats>) -> serde_json::Value {
 #[jsonrpsee::core::async_trait]
 impl TraceRpcServer for RpcContext {
     #[tracing::instrument(level = "trace", skip(self), fields(block_number))]
-    async fn trace_block(&self, block_number: BlockNumberOrTag) -> RpcResult<serde_json::Value> {
+    async fn trace_block(&self, block_number: BlockNumberOrTag) -> RpcResult<RawJson> {
         let _guard = self.watch_dog.start_request(METHOD_TRACE_BLOCK, format!("{block_number}"));
         let start = Instant::now();
 
@@ -707,7 +698,6 @@ impl TraceRpcServer for RpcContext {
             CachedResource::TraceBlock,
             data.block.header.hash,
             Some(ResponseVariant::Default),
-            METHOD_TRACE_BLOCK,
             &result,
         );
         record_request_completion(METHOD_TRACE_BLOCK, data.block.header.number, start);
@@ -716,7 +706,7 @@ impl TraceRpcServer for RpcContext {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn trace_parity_transaction(&self, tx_hash: B256) -> RpcResult<serde_json::Value> {
+    async fn trace_parity_transaction(&self, tx_hash: B256) -> RpcResult<RawJson> {
         let _guard = self.watch_dog.start_request(METHOD_TRACE_TRANSACTION, format!("{tx_hash}"));
         let start = Instant::now();
 
@@ -729,7 +719,7 @@ impl TraceRpcServer for RpcContext {
                 DataProviderError::TransactionNotFound(_) |
                 DataProviderError::TransactionPending(_) |
                 DataProviderError::Timeout { .. },
-            ) => return Ok(serde_json::Value::Null),
+            ) => return Ok(RawJson::null()),
             Err(DataProviderError::Internal(_)) => {
                 metrics::record_rpc_error(METHOD_TRACE_TRANSACTION);
                 return Err(rpc_err("internal error".to_string()));
@@ -764,11 +754,11 @@ impl TraceRpcServer for RpcContext {
             );
         }
 
-        let value = serde_json::to_value(&result)
-            .map_err(|e| rpc_err(format!("Serialization failed: {e}")))?;
-        ResponseSizeMetrics::new_for_method(METHOD_TRACE_TRANSACTION)
-            .record(value.to_string().len());
-        Ok(value)
+        let json: RawJson = serde_json::value::to_raw_value(&result)
+            .map_err(|e| rpc_err(format!("Serialization failed: {e}")))?
+            .into();
+        ResponseSizeMetrics::new_for_method(METHOD_TRACE_TRANSACTION).record(json.byte_len());
+        Ok(json)
     }
 }
 
@@ -896,13 +886,9 @@ mod tests {
     fn check_cache_hit_miss_and_bypass() {
         let h1 = B256::from([1u8; 32]);
         let h2 = B256::from([2u8; 32]);
+        let inserted = RawJson::from_value(&serde_json::json!({"v": 1}));
         let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
-        cache.insert(
-            CachedResource::DebugTraceBlock,
-            h1,
-            ResponseVariant::Default,
-            &serde_json::json!({"v": 1}),
-        );
+        cache.insert(CachedResource::DebugTraceBlock, h1, ResponseVariant::Default, &inserted);
         let cache = Some(cache);
         let check = |hash, variant| {
             check_cache(&cache, CachedResource::DebugTraceBlock, hash, variant, "m", Instant::now())
@@ -915,9 +901,33 @@ mod tests {
         assert!(check(h1, None).is_none());
         assert_eq!(stats(), (0, 0), "bypass must not touch accounting");
 
-        assert_eq!(check(h1, Some(ResponseVariant::Default)), Some(serde_json::json!({"v": 1})));
+        let hit = check(h1, Some(ResponseVariant::Default)).expect("inserted entry must hit");
+        assert!(hit.shares_bytes_with(&inserted), "a hit must serve the inserted bytes");
         assert!(check(h2, Some(ResponseVariant::Default)).is_none());
         assert_eq!(stats(), (1, 1));
+    }
+
+    /// End-to-end through the real jsonrpsee reply path: a handler returning [`RawJson`]
+    /// must have its bytes spliced verbatim into the JSON-RPC envelope — the property the
+    /// whole serialize-once design rests on.
+    #[tokio::test]
+    async fn raw_json_passes_through_jsonrpsee_verbatim() {
+        let mut module = jsonrpsee::server::RpcModule::new(());
+        module
+            .register_method("echo", |_, _, _| {
+                jsonrpsee::ResponsePayload::success(RawJson::from_value(
+                    &serde_json::json!({"a": [1, 2], "b": "x"}),
+                ))
+            })
+            .unwrap();
+        let (resp, _) = module
+            .raw_json_request(r#"{"jsonrpc":"2.0","id":1,"method":"echo"}"#, 1)
+            .await
+            .expect("call must succeed");
+        assert!(
+            resp.get().contains(r#""result":{"a":[1,2],"b":"x"}"#),
+            "reply must contain the raw bytes verbatim: {resp}"
+        );
     }
 
     /// Builds an `RpcContext` around a never-called upstream, with the given block-data
@@ -1044,10 +1054,10 @@ mod tests {
     #[test]
     fn insert_cache_skips_non_cacheable_variants() {
         let cache = Some(ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100)));
-        let result = serde_json::json!([{"txHash": "0x01"}]);
+        let result = RawJson::from_value(&serde_json::json!([{"txHash": "0x01"}]));
         let hash = B256::from([1u8; 32]);
 
-        insert_cache(&cache, CachedResource::DebugTraceBlock, hash, None, "m", &result);
+        insert_cache(&cache, CachedResource::DebugTraceBlock, hash, None, &result);
         assert_eq!(cache.as_ref().unwrap().len(), 0);
 
         insert_cache(
@@ -1055,7 +1065,6 @@ mod tests {
             CachedResource::DebugTraceBlock,
             hash,
             Some(ResponseVariant::Default),
-            "m",
             &result,
         );
         assert_eq!(cache.as_ref().unwrap().len(), 1);

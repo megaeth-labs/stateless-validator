@@ -107,6 +107,7 @@ Two operating modes:
 - **Local cache mode** — With `data_dir`, enables chain sync to pre-fetch blocks into `ValidatorDB` for faster serving.
 
 The server includes an HTTP response cache (`quick_cache`) for pre-serialized JSON and a `DataProvider` with single-flight request coalescing.
+Responses are serialized exactly once, straight from the trace output into raw JSON bytes (`RawJson`) spliced verbatim into the reply; the cache shares those bytes by `Arc`, so a hit never re-parses or re-serializes the JSON tree.
 The response cache is keyed by `(resource, block hash, typed tracer variant)`; by-number handlers resolve number → canonical hash before the lookup (local `CANONICAL_CHAIN` first, upstream fallback).
 It only stores idempotent request shapes: the five built-in tracers (keyed by their parsed typed `tracerConfig`) and the bare default struct-logger request; JS tracers, `muxTracer`, and struct-logger requests with non-default flags bypass it entirely, and a type-malformed `tracerConfig` on call/prestate/flatCall is rejected with `-32602`.
 Canonical-hash resolution reads the bounded `CANONICAL_CHAIN` window first (local cache mode), then a bounded in-memory memo of upstream-resolved bindings (`--canonical-hash-memo-capacity`; only depth-final heights are memoized, so a memoized binding can no longer reorg), and only then upstream — so historical heights resolve locally after first touch within a process lifetime.
