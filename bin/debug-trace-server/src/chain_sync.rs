@@ -65,11 +65,13 @@ const GENERATOR_WITNESS_GRACE: Duration = Duration::from_secs(6);
 /// (local-tip anchor, skip-generator direction); both gate on the CLI-declared generator.
 pub struct TraceFetcher {
     rpc_client: Arc<RpcClient>,
-    /// Whether witness endpoint 0 is the CLI-declared generator
-    /// (`--witness-generator-endpoint`). CLI knowledge, not derivable from the client;
-    /// without it no endpoint is special and the grace is disabled — plain failover,
-    /// matching the request path's `can_skip_generator` gate.
-    generator_first: bool,
+    /// Frontier routing switch: true iff the CLI declared witness endpoint 0 as the
+    /// generator (`--witness-generator-endpoint`) with at least one fallback behind it —
+    /// `routing_configured` in `main.rs`, the same startup-fixed predicate the request
+    /// path gates on via `can_skip_generator`. CLI knowledge, not derivable from the
+    /// client; false means no endpoint is special and the grace is disabled — plain
+    /// failover.
+    frontier_routing: bool,
     /// Last remote head observed by [`Self::latest_block_number`] — the freshness anchor
     /// for witness routing. `u64::MAX` until the first successful poll, which classifies
     /// every block as non-fresh (full-chain fetch) rather than guessing.
@@ -79,10 +81,10 @@ pub struct TraceFetcher {
 }
 
 impl TraceFetcher {
-    pub fn new(rpc_client: Arc<RpcClient>, generator_first: bool) -> Self {
+    pub fn new(rpc_client: Arc<RpcClient>, frontier_routing: bool) -> Self {
         Self {
             rpc_client,
-            generator_first,
+            frontier_routing,
             remote_head: AtomicU64::new(u64::MAX),
             generator_grace: GENERATOR_WITNESS_GRACE,
         }
@@ -94,9 +96,9 @@ impl TraceFetcher {
         // `u64::MAX` (head not yet observed) saturates to "very far below the head" and
         // correctly classifies as non-fresh.
         let fresh = head.saturating_sub(number) <= FRONTIER_FRESHNESS_BLOCKS;
-        if fresh && self.generator_first && self.rpc_client.witness_provider_count() > 1 {
-            let probe = self.rpc_client.get_witness_light_first_provider_only(number, hash, None);
-            if let Ok(Ok((light, _mpt))) = tokio::time::timeout(self.generator_grace, probe).await {
+        if fresh && self.frontier_routing {
+            let probe = self.rpc_client.get_witness_light_first_provider_only(number, hash);
+            if let Ok((light, _mpt)) = tokio::time::timeout(self.generator_grace, probe).await {
                 return light;
             }
             // Grace expired: the witness is genuinely unavailable at the generator (down,
@@ -273,40 +275,15 @@ mod tests {
     };
 
     use alloy_primitives::B256;
-    use stateless_common::{BackoffPolicy, RpcClientConfig, witness_encoding};
+    use stateless_common::{BackoffPolicy, RpcClientConfig, RpcMetrics, witness_encoding};
     use stateless_core::withdrawals::MptWitness;
     use stateless_test_utils::fixtures::TestFixtures;
 
     use super::*;
-    use crate::server_db::test_support::{StubBlockStore, make_block_meta};
-
-    /// Serves `mega_getBlockWitness`: "not generated yet" errors for the first
-    /// `misses_before_serve` calls, then `wire` forever (always errors when `wire` is
-    /// `None`), counting every call.
-    async fn scripted_witness_rpc(
-        misses_before_serve: usize,
-        wire: Option<String>,
-    ) -> (jsonrpsee::server::ServerHandle, String, Arc<AtomicUsize>) {
-        let hits = Arc::new(AtomicUsize::new(0));
-        let mut module = jsonrpsee::server::RpcModule::new((hits.clone(), wire));
-        module
-            .register_method("mega_getBlockWitness", move |_p, (hits, wire), _| {
-                let call = hits.fetch_add(1, Ordering::Relaxed);
-                match wire {
-                    Some(wire) if call >= misses_before_serve => Ok(wire.clone()),
-                    _ => Err(jsonrpsee::types::ErrorObjectOwned::owned::<()>(
-                        -32602,
-                        "Failed to get witness: not generated yet",
-                        None,
-                    )),
-                }
-            })
-            .unwrap();
-        let server =
-            jsonrpsee::server::ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", server.local_addr().unwrap());
-        (server.start(module), url, hits)
-    }
+    use crate::{
+        data_provider::test_support::{scripted_witness_rpc, start_mock_rpc},
+        server_db::test_support::{StubBlockStore, make_block_meta},
+    };
 
     /// A real `(number, hash, wire response, expected light witness)` from the synthetic
     /// fixtures, encoded with the production wire format.
@@ -321,18 +298,26 @@ mod tests {
     }
 
     /// Fetcher over the given witness endpoints with millisecond retry backoff, a dummy
-    /// RPC endpoint, and the given generator grace.
-    fn test_fetcher(witness_urls: &[&str], grace: Duration) -> TraceFetcher {
+    /// RPC endpoint, and the given routing switch, generator grace, and RPC metrics.
+    fn test_fetcher(
+        witness_urls: &[&str],
+        frontier_routing: bool,
+        grace: Duration,
+        metrics: Option<Arc<dyn RpcMetrics>>,
+    ) -> TraceFetcher {
         let config = RpcClientConfig {
             rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
             per_attempt_timeout: Duration::from_millis(500),
+            metrics,
             ..RpcClientConfig::trace_server()
         };
         let rpc_client = Arc::new(
             RpcClient::new_with_config(&["http://127.0.0.1:9/"], witness_urls, config, None)
                 .unwrap(),
         );
-        TraceFetcher { generator_grace: grace, ..TraceFetcher::new(rpc_client, true) }
+        let mut fetcher = TraceFetcher::new(rpc_client, frontier_routing);
+        fetcher.generator_grace = grace;
+        fetcher
     }
 
     /// A frontier-fresh miss stays on the generator: retried through the grace and served
@@ -342,7 +327,7 @@ mod tests {
         let (number, hash, wire, light) = fixture_wire();
         let (_gen, gen_url, gen_hits) = scripted_witness_rpc(2, Some(wire)).await;
         let (_fb, fb_url, fb_hits) = scripted_witness_rpc(0, None).await;
-        let fetcher = test_fetcher(&[&gen_url, &fb_url], Duration::from_secs(10));
+        let fetcher = test_fetcher(&[&gen_url, &fb_url], true, Duration::from_secs(10), None);
         fetcher.remote_head.store(number, Ordering::Relaxed);
 
         let got = fetcher.fetch_witness(number, hash).await;
@@ -363,7 +348,7 @@ mod tests {
         let (number, hash, wire, light) = fixture_wire();
         let (_gen, gen_url, gen_hits) = scripted_witness_rpc(0, None).await;
         let (_fb, fb_url, fb_hits) = scripted_witness_rpc(0, Some(wire)).await;
-        let fetcher = test_fetcher(&[&gen_url, &fb_url], Duration::from_secs(30));
+        let fetcher = test_fetcher(&[&gen_url, &fb_url], true, Duration::from_secs(30), None);
         fetcher.remote_head.store(number + FRONTIER_FRESHNESS_BLOCKS + 1, Ordering::Relaxed);
 
         let start = Instant::now();
@@ -375,18 +360,17 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(5), "no generator grace on stale blocks");
     }
 
-    /// Without a CLI-declared generator no endpoint is special: even a frontier-fresh
-    /// miss rotates to the second endpoint in the same round — plain failover, mirroring
-    /// the request path's `fetch_witness_without_generator_never_skips`.
+    /// With frontier routing off (no CLI-declared generator, or no fallback behind it) no
+    /// endpoint is special: even a frontier-fresh miss rotates to the second endpoint in
+    /// the same round — plain failover, mirroring the request path's
+    /// `fetch_witness_without_generator_never_skips`.
     #[tokio::test]
     async fn no_declared_generator_keeps_plain_failover() {
         let (number, hash, wire, light) = fixture_wire();
         let (_first, first_url, first_hits) = scripted_witness_rpc(0, None).await;
         let (_second, second_url, second_hits) = scripted_witness_rpc(0, Some(wire)).await;
-        let fetcher = TraceFetcher {
-            generator_first: false,
-            ..test_fetcher(&[&first_url, &second_url], Duration::from_secs(30))
-        };
+        let fetcher =
+            test_fetcher(&[&first_url, &second_url], false, Duration::from_secs(30), None);
         fetcher.remote_head.store(number, Ordering::Relaxed);
 
         let start = Instant::now();
@@ -405,7 +389,7 @@ mod tests {
         let (number, hash, wire, light) = fixture_wire();
         let (_gen, gen_url, _gen_hits) = scripted_witness_rpc(0, None).await;
         let (_fb, fb_url, fb_hits) = scripted_witness_rpc(0, Some(wire)).await;
-        let fetcher = test_fetcher(&[&gen_url, &fb_url], Duration::from_secs(30));
+        let fetcher = test_fetcher(&[&gen_url, &fb_url], true, Duration::from_secs(30), None);
 
         let got = fetcher.fetch_witness(number, hash).await;
 
@@ -445,25 +429,12 @@ mod tests {
         drop(dead);
         let (_fb, fb_url, fb_hits) = scripted_witness_rpc(0, Some(wire)).await;
         let deadline_exceeded = Arc::new(DeadlineCounter(AtomicUsize::new(0)));
-        let config = RpcClientConfig {
-            rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
-            per_attempt_timeout: Duration::from_millis(500),
-            metrics: Some(Arc::clone(&deadline_exceeded) as _),
-            ..RpcClientConfig::trace_server()
-        };
-        let rpc_client = Arc::new(
-            RpcClient::new_with_config(
-                &["http://127.0.0.1:9/"],
-                &[&gen_url, &fb_url],
-                config,
-                None,
-            )
-            .unwrap(),
+        let fetcher = test_fetcher(
+            &[&gen_url, &fb_url],
+            true,
+            Duration::from_millis(300),
+            Some(Arc::clone(&deadline_exceeded) as _),
         );
-        let fetcher = TraceFetcher {
-            generator_grace: Duration::from_millis(300),
-            ..TraceFetcher::new(rpc_client, true)
-        };
         fetcher.remote_head.store(number, Ordering::Relaxed);
 
         let start = Instant::now();
@@ -485,13 +456,7 @@ mod tests {
     /// `latest_block_number` feeds the freshness anchor.
     #[tokio::test]
     async fn latest_block_number_updates_the_freshness_anchor() {
-        let mut module = jsonrpsee::server::RpcModule::new(());
-        module.register_method("eth_blockNumber", |_, _, _| "0x64").unwrap();
-        let server =
-            jsonrpsee::server::ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", server.local_addr().unwrap());
-        let _handle = server.start(module);
-
+        let (_handle, url, _hits) = start_mock_rpc(0x64).await;
         let rpc_client = Arc::new(
             RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
                 .unwrap(),

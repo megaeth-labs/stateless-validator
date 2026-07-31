@@ -1209,6 +1209,9 @@ impl ContractStore for NoopContractStore {
 /// `server_db::test_support`, next to the trait.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use jsonrpsee::{RpcModule, server::ServerHandle, types::ErrorObjectOwned};
     use stateless_test_utils::fixtures::TestFixtures;
 
     use super::*;
@@ -1238,23 +1241,10 @@ pub(crate) mod test_support {
             fixtures.contracts.iter().map(|(h, code)| (*h, code.clone())).collect();
         BlockData { block, witness, contracts }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        net::TcpListener,
-        sync::atomic::{AtomicUsize, Ordering},
-    };
-
-    use jsonrpsee::{RpcModule, server::ServerHandle, types::ErrorObjectOwned};
-    use stateless_common::{BackoffPolicy, RpcClientConfig};
-
-    use crate::server_db::test_support::StubBlockStore;
 
     /// Minimal self-consistent RPC `Header` for `number`: `hash` is the real `hash_slow()`
     /// of the inner header, so `verify_hash = true` fetches accept it.
-    fn consistent_header(number: u64) -> alloy_rpc_types_eth::Header {
+    pub(crate) fn consistent_header(number: u64) -> alloy_rpc_types_eth::Header {
         let inner = alloy_consensus::Header { number, ..Default::default() };
         alloy_rpc_types_eth::Header { hash: inner.hash_slow(), inner, ..Default::default() }
     }
@@ -1262,7 +1252,7 @@ mod tests {
     /// Serves `eth_getHeaderByNumber` with a self-consistent header for any number, and
     /// `eth_blockNumber` with `tip` — counting the latter's calls so tip-seed tests can
     /// assert whether (and how often) the seed fired.
-    async fn start_mock_rpc(tip: u64) -> (ServerHandle, String, Arc<AtomicUsize>) {
+    pub(crate) async fn start_mock_rpc(tip: u64) -> (ServerHandle, String, Arc<AtomicUsize>) {
         let seed_hits = Arc::new(AtomicUsize::new(0));
         let mut module = RpcModule::new(seed_hits.clone());
         module
@@ -1284,7 +1274,46 @@ mod tests {
         (server.start(module), url, seed_hits)
     }
 
-    use super::*;
+    /// Serves `mega_getBlockWitness`: "not generated yet" errors for the first
+    /// `misses_before_serve` calls, then `wire` forever (always errors when `wire` is
+    /// `None`), counting every call.
+    pub(crate) async fn scripted_witness_rpc(
+        misses_before_serve: usize,
+        wire: Option<String>,
+    ) -> (ServerHandle, String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut module = RpcModule::new((hits.clone(), wire));
+        module
+            .register_method("mega_getBlockWitness", move |_p, (hits, wire), _| {
+                let call = hits.fetch_add(1, Ordering::Relaxed);
+                match wire {
+                    Some(wire) if call >= misses_before_serve => Ok(wire.clone()),
+                    _ => Err(ErrorObjectOwned::owned::<()>(
+                        -32602,
+                        "Failed to get witness: not generated yet",
+                        None,
+                    )),
+                }
+            })
+            .unwrap();
+        let server =
+            jsonrpsee::server::ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        (server.start(module), url, hits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{net::TcpListener, sync::atomic::Ordering};
+
+    use stateless_common::{BackoffPolicy, RpcClientConfig};
+
+    use super::{
+        test_support::{consistent_header, scripted_witness_rpc, start_mock_rpc},
+        *,
+    };
+    use crate::server_db::test_support::StubBlockStore;
 
     /// Compile-time trait bounds + timeout constants.
     #[test]
@@ -1327,27 +1356,6 @@ mod tests {
         assert_eq!(witness_route(true, Some(5000), 900, 100), (1, "witness_historical"));
         assert_eq!(witness_route(true, Some(5000), 4999, 100), (0, "witness_generator"));
         assert_eq!(witness_route(true, None, 900, 100), (0, "witness_generator"), "unknown tip");
-    }
-
-    /// Serves `mega_getBlockWitness` returning an RPC error, counting hits per endpoint.
-    async fn start_counting_witness_rpc()
-    -> (jsonrpsee::server::ServerHandle, String, Arc<AtomicUsize>) {
-        let hits = Arc::new(AtomicUsize::new(0));
-        let mut module = jsonrpsee::server::RpcModule::new(hits.clone());
-        module
-            .register_method("mega_getBlockWitness", |_p, hits, _| {
-                hits.fetch_add(1, Ordering::Relaxed);
-                Err::<String, _>(jsonrpsee::types::ErrorObjectOwned::owned::<()>(
-                    -32000,
-                    "no witness",
-                    None,
-                ))
-            })
-            .unwrap();
-        let server =
-            jsonrpsee::server::ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", server.local_addr().unwrap());
-        (server.start(module), url, hits)
     }
 
     /// Fast-retry client over `witness_urls` plus a routing config (1 s budgets, 100-block
@@ -1664,8 +1672,8 @@ mod tests {
     /// touch the first (generator) endpoint, while a recent block probes it first.
     #[tokio::test]
     async fn fetch_witness_routes_historical_blocks_past_the_generator() {
-        let (ha, url_a, hits_a) = start_counting_witness_rpc().await;
-        let (hb, url_b, hits_b) = start_counting_witness_rpc().await;
+        let (ha, url_a, hits_a) = scripted_witness_rpc(0, None).await;
+        let (hb, url_b, hits_b) = scripted_witness_rpc(0, None).await;
         let (rpc_client, cfg) = routing_fixture(&[url_a.as_str(), url_b.as_str()], true);
         let db_tip = Some(5000);
 
@@ -1691,7 +1699,7 @@ mod tests {
     /// test and panic in production on the first historical fetch.
     #[tokio::test]
     async fn fetch_witness_single_endpoint_serves_historical_from_generator() {
-        let (ha, url_a, hits_a) = start_counting_witness_rpc().await;
+        let (ha, url_a, hits_a) = scripted_witness_rpc(0, None).await;
         let (rpc_client, cfg) = routing_fixture(&[url_a.as_str()], true);
 
         // Historical block (900 + 100 <= 5000) with no fallback endpoint configured.
@@ -1711,8 +1719,8 @@ mod tests {
     /// pair keeps its pre-routing behavior, with no endpoint special by position.
     #[tokio::test]
     async fn fetch_witness_without_generator_never_skips() {
-        let (ha, url_a, hits_a) = start_counting_witness_rpc().await;
-        let (hb, url_b, _hits_b) = start_counting_witness_rpc().await;
+        let (ha, url_a, hits_a) = scripted_witness_rpc(0, None).await;
+        let (hb, url_b, _hits_b) = scripted_witness_rpc(0, None).await;
         let (rpc_client, cfg) = routing_fixture(&[url_a.as_str(), url_b.as_str()], false);
 
         // Historical block (900 + 100 <= 5000): with no declared generator, the first

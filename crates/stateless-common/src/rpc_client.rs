@@ -649,27 +649,30 @@ impl RpcClient {
         .await
     }
 
-    /// Like [`Self::get_witness_light_with_deadline`], but consults only the FIRST witness
-    /// provider — the complement of [`Self::get_witness_light_with_deadline_from`]: that
-    /// one skips providers that cannot have the witness anymore (pruned), this one is for
-    /// callers that know the later providers cannot have it *yet* (e.g. it is still being
-    /// generated upstream). Retries the single provider with round backoff until
-    /// `deadline`.
+    /// Like [`Self::get_witness_light`], but consults only the FIRST witness provider —
+    /// the complement of [`Self::get_witness_light_with_deadline_from`]: that one skips
+    /// providers that cannot have the witness anymore (pruned), this one is for callers
+    /// that know the later providers cannot have it *yet* (e.g. it is still being
+    /// generated upstream). Retries the single provider with round backoff indefinitely;
+    /// callers bound the wait with their own timeout around the future. Deliberately no
+    /// `deadline` parameter: an expired caller budget is a routing decision, not a failed
+    /// logical call, and must not increment the `on_rpc_deadline_exceeded` metric the
+    /// client's deadline path records.
     pub async fn get_witness_light_first_provider_only(
         &self,
         number: u64,
         hash: B256,
-        deadline: Option<Instant>,
-    ) -> std::result::Result<(LightWitness, MptWitness), RpcDeadlineExceeded> {
+    ) -> (LightWitness, MptWitness) {
         self.witness_round_robin(
             0..1,
             number,
             hash,
-            deadline,
+            None,
             decode_witness_response_light,
             "Witness light-decoded",
         )
         .await
+        .expect("None deadline cannot time out")
     }
 
     /// Shared `mega_getBlockWitness` retry loop: primary-failover rounds (always start from
@@ -1807,7 +1810,8 @@ mod tests {
     }
 
     /// `get_witness_light_first_provider_only` must never rotate past the first witness
-    /// provider: rounds retry it alone until the deadline.
+    /// provider: rounds retry it alone until the caller-side timeout — the production
+    /// usage shape, since the method itself takes no deadline — cuts the probe off.
     #[tokio::test]
     async fn test_witness_fetch_first_only_never_hits_later_providers() {
         let order = Arc::new(std::sync::Mutex::new(Vec::<char>::new()));
@@ -1826,10 +1830,9 @@ mod tests {
         )
         .unwrap();
 
-        let deadline = Instant::now() + Duration::from_millis(100);
-        let result =
-            client.get_witness_light_first_provider_only(1, BlockHash::ZERO, Some(deadline)).await;
-        assert!(result.is_err(), "stub payloads fail decode, so the deadline must fire");
+        let probe = client.get_witness_light_first_provider_only(1, BlockHash::ZERO);
+        let result = tokio::time::timeout(Duration::from_millis(100), probe).await;
+        assert!(result.is_err(), "stub payloads fail decode, so the caller timeout must fire");
 
         let log = order.lock().unwrap();
         assert!(log.len() >= 2, "the first provider must be retried across rounds: {log:?}");

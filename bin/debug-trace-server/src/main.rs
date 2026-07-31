@@ -268,8 +268,9 @@ struct Args {
     /// miss. Requires a generator plus at least one fallback witness endpoint (see
     /// `--witness-generator-endpoint`) and a local DB (`--data-dir`), whose tip
     /// anchors block age; otherwise all blocks use the full chain. Applies to request
-    /// serving; chain-sync prefetch always uses the full chain. Should match the generator's
-    /// `BACKUP`.
+    /// serving; the chain-sync prefetch routes by freshness against the remote head
+    /// instead (frontier-fresh blocks give the generator a short exclusive grace).
+    /// Should match the generator's `BACKUP`.
     #[clap(
         long,
         env = "DEBUG_TRACE_SERVER_WITNESS_LOCAL_WINDOW",
@@ -459,7 +460,8 @@ async fn main() -> Result<()> {
         Arc::new(RpcClient::new_with_config(&data_apis, &witness_apis, rpc_config, None)?);
 
     // The same predicate `fetch_witness` evaluates per request: a declared generator plus at
-    // least one fallback in the combined chain.
+    // least one fallback in the combined chain. Also handed to the chain-sync fetcher as its
+    // frontier-routing switch.
     let routing_configured = witness_cfg.generator_first && witness_apis.len() >= 2;
     match (routing_configured, args.data_dir.is_some()) {
         (true, true) => info!(
@@ -560,8 +562,7 @@ async fn main() -> Result<()> {
             response_cache.clone(),
             data_provider.canonical_hash_memo(),
         ));
-        let fetcher =
-            Arc::new(TraceFetcher::new(Arc::clone(&rpc_client), witness_cfg.generator_first));
+        let fetcher = Arc::new(TraceFetcher::new(Arc::clone(&rpc_client), routing_configured));
         task::spawn({
             let db = Arc::clone(db);
             let shutdown = shutdown.clone();
