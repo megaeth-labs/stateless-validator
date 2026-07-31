@@ -298,15 +298,18 @@ fn trace_block_with_tracing_inspector(
                         // Convert DefaultFrame to JSON and fix returnValue serialization.
                         // alloy-rpc-types-trace 1.1.2 serializes Bytes with "0x" prefix,
                         // but mega-reth uses v1.0.23 which serializes without prefix.
-                        let mut frame_value = serde_json::to_value(frame).unwrap();
-                        if let Some(rv) = frame_value.get_mut("returnValue") &&
-                            let Some(s) = rv.as_str()
-                        {
-                            *rv = serde_json::Value::String(
-                                s.strip_prefix("0x").unwrap_or(s).to_string(),
-                            );
-                        }
-                        Ok(GethTrace::JS(frame_value))
+                        serde_json::to_value(frame)
+                            .map(|mut frame_value| {
+                                if let Some(rv) = frame_value.get_mut("returnValue") &&
+                                    let Some(s) = rv.as_str()
+                                {
+                                    *rv = serde_json::Value::String(
+                                        s.strip_prefix("0x").unwrap_or(s).to_string(),
+                                    );
+                                }
+                                GethTrace::JS(frame_value)
+                            })
+                            .map_err(|e| format!("Default trace serialization failed: {e}"))
                     }
                 };
 
@@ -416,7 +419,8 @@ fn trace_tx_with_tracing_inspector(
             inspector.set_transaction_gas_limit(tx_gas_limit);
             let frame = inspector.geth_builder().geth_traces(gas_used, return_value, opts.config);
 
-            let mut frame_value = serde_json::to_value(frame).unwrap();
+            let mut frame_value = serde_json::to_value(frame)
+                .map_err(|e| replay_error(format!("Default trace serialization failed: {e}")))?;
             if let Some(rv) = frame_value.get_mut("returnValue") &&
                 let Some(s) = rv.as_str()
             {
@@ -545,6 +549,19 @@ pub fn trace_block(
                         let info = tx_info_at(block, tx, index);
                         trace!(tx_index = index, tx_hash = %tx_hash, "Tracing transaction");
 
+                        if index > 0 {
+                            match MuxInspector::try_from_config(mux_config.clone()) {
+                                Ok(insp) => *executor.inspector_mut() = insp,
+                                Err(e) => {
+                                    results.push(TraceResult::Error {
+                                        error: format!("MuxInspector creation failed: {:?}", e),
+                                        tx_hash: Some(tx_hash),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+
                         match executor.run_transaction(recovered_tx) {
                             Ok(outcome) => {
                                 let result = outcome.inner.result;
@@ -560,8 +577,6 @@ pub fn trace_block(
                                     inspector.try_into_mux_frame(&result_and_state, db, info)
                                 };
 
-                                *executor.inspector_mut() =
-                                    MuxInspector::try_from_config(mux_config.clone()).unwrap();
                                 executor.evm.db_mut().commit(state_changes);
 
                                 match mux_result {
