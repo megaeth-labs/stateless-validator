@@ -5,11 +5,8 @@
 //! in [`stateless_core::pipeline::run_pipeline`].
 
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use alloy_primitives::{BlockHash, BlockNumber};
@@ -47,6 +44,11 @@ const FRONTIER_FRESHNESS_BLOCKS: u64 = 256;
 /// RPC client's deadline: expiry is an internal routing budget, not a failed logical call,
 /// and must not increment the upstream deadline-exceeded counter that alerting reads as
 /// real witness-fetch failures.
+///
+/// Doubles as the trust horizon for the head observation behind the freshness test: a
+/// block is at least as old as the anchor that classified it, so once the anchor exceeds
+/// the grace, "not generated yet" is no longer a plausible reason for a missing witness
+/// and the grace has nothing left to buy (see `remote_head`).
 const GENERATOR_WITNESS_GRACE: Duration = Duration::from_secs(6);
 
 /// Fetcher for the trace server: fetches blocks + witnesses, discards MPT witness.
@@ -57,10 +59,11 @@ const GENERATOR_WITNESS_GRACE: Duration = Duration::from_secs(6);
 ///
 /// Witness fetches route by block freshness against the last remote head observed by
 /// [`Self::latest_block_number`] (which the pipeline polls to place the frontier):
-/// frontier-fresh blocks give the generator an exclusive grace first — its "witness not
-/// found" means "not generated yet", not "ask someone else" — and only fall back to the
-/// full endpoint chain when the grace expires; everything else (deep catch-up, where the
-/// generator may have pruned the block) uses the full chain from the first attempt.
+/// frontier-fresh blocks — near a recently observed head; a stale anchor never grants the
+/// grace — give the generator an exclusive grace first (its "witness not found" means
+/// "not generated yet", not "ask someone else") and only fall back to the full endpoint
+/// chain when the grace expires; everything else (deep catch-up, where the generator may
+/// have pruned the block) uses the full chain from the first attempt.
 /// The request-serving twin of this policy is `witness_route` in `data_provider.rs`
 /// (local-tip anchor, skip-generator direction); both gate on the CLI-declared generator.
 pub struct TraceFetcher {
@@ -72,11 +75,15 @@ pub struct TraceFetcher {
     /// client; false means no endpoint is special and the grace is disabled — plain
     /// failover.
     frontier_routing: bool,
-    /// Last remote head observed by [`Self::latest_block_number`] — the freshness anchor
-    /// for witness routing. `u64::MAX` until the first successful poll, which classifies
-    /// every block as non-fresh (full-chain fetch) rather than guessing.
-    remote_head: AtomicU64,
-    /// [`GENERATOR_WITNESS_GRACE`]; a field so tests can shrink it.
+    /// Last remote head observed by [`Self::latest_block_number`] and when — the freshness
+    /// anchor for witness routing. `None` until the first successful poll, which classifies
+    /// every block as non-fresh (full-chain fetch) rather than guessing. The observation
+    /// instant bounds the anchor's trust: the pipeline re-polls the tip only when its spawn
+    /// window runs past the ceiling, so a long catch-up stretch leaves the anchor stale
+    /// while the real head — and the generator's pruning horizon — move on.
+    remote_head: Mutex<Option<(u64, Instant)>>,
+    /// [`GENERATOR_WITNESS_GRACE`], which is also the anchor-trust horizon; a field so
+    /// tests can shrink it.
     generator_grace: Duration,
 }
 
@@ -85,17 +92,30 @@ impl TraceFetcher {
         Self {
             rpc_client,
             frontier_routing,
-            remote_head: AtomicU64::new(u64::MAX),
+            remote_head: Mutex::new(None),
             generator_grace: GENERATOR_WITNESS_GRACE,
         }
     }
 
+    /// Records a just-observed remote head as the freshness anchor.
+    fn note_remote_head(&self, head: u64) {
+        *self.remote_head.lock().unwrap() = Some((head, Instant::now()));
+    }
+
     /// Witness fetch with frontier-aware provider routing; see the type-level doc.
     async fn fetch_witness(&self, number: u64, hash: BlockHash) -> LightWitness {
-        let head = self.remote_head.load(Ordering::Relaxed);
-        // `u64::MAX` (head not yet observed) saturates to "very far below the head" and
-        // correctly classifies as non-fresh.
-        let fresh = head.saturating_sub(number) <= FRONTIER_FRESHNESS_BLOCKS;
+        // Fresh = near a *recently* observed remote head; an unobserved head (`None`)
+        // classifies as non-fresh. The age gate keeps a stale anchor from granting the
+        // grace: during a long catch-up stretch the pipeline does not re-poll the tip, and
+        // the real head may meanwhile advance past the generator's retention — the tail of
+        // such a stretch would then burn the full grace per block on pruned witnesses.
+        let fresh = match *self.remote_head.lock().unwrap() {
+            Some((head, at)) => {
+                head.saturating_sub(number) <= FRONTIER_FRESHNESS_BLOCKS &&
+                    at.elapsed() <= self.generator_grace
+            }
+            None => false,
+        };
         if fresh && self.frontier_routing {
             let probe = self.rpc_client.get_witness_light_first_provider_only(number, hash);
             if let Ok((light, _mpt)) = tokio::time::timeout(self.generator_grace, probe).await {
@@ -126,7 +146,7 @@ impl BlockFetcher for TraceFetcher {
 
     async fn latest_block_number(&self) -> Result<u64> {
         let head = self.rpc_client.get_latest_block_number().await;
-        self.remote_head.store(head, Ordering::Relaxed);
+        self.note_remote_head(head);
         Ok(head)
     }
 
@@ -269,9 +289,9 @@ impl PipelineHooks for TraceHooks {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::{Arc, atomic::AtomicUsize},
-        time::Instant,
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
     };
 
     use alloy_primitives::B256;
@@ -328,7 +348,7 @@ mod tests {
         let (_gen, gen_url, gen_hits) = scripted_witness_rpc(2, Some(wire)).await;
         let (_fb, fb_url, fb_hits) = scripted_witness_rpc(0, None).await;
         let fetcher = test_fetcher(&[&gen_url, &fb_url], true, Duration::from_secs(10), None);
-        fetcher.remote_head.store(number, Ordering::Relaxed);
+        fetcher.note_remote_head(number);
 
         let got = fetcher.fetch_witness(number, hash).await;
 
@@ -349,7 +369,7 @@ mod tests {
         let (_gen, gen_url, gen_hits) = scripted_witness_rpc(0, None).await;
         let (_fb, fb_url, fb_hits) = scripted_witness_rpc(0, Some(wire)).await;
         let fetcher = test_fetcher(&[&gen_url, &fb_url], true, Duration::from_secs(30), None);
-        fetcher.remote_head.store(number + FRONTIER_FRESHNESS_BLOCKS + 1, Ordering::Relaxed);
+        fetcher.note_remote_head(number + FRONTIER_FRESHNESS_BLOCKS + 1);
 
         let start = Instant::now();
         let got = fetcher.fetch_witness(number, hash).await;
@@ -371,7 +391,7 @@ mod tests {
         let (_second, second_url, second_hits) = scripted_witness_rpc(0, Some(wire)).await;
         let fetcher =
             test_fetcher(&[&first_url, &second_url], false, Duration::from_secs(30), None);
-        fetcher.remote_head.store(number, Ordering::Relaxed);
+        fetcher.note_remote_head(number);
 
         let start = Instant::now();
         let got = fetcher.fetch_witness(number, hash).await;
@@ -395,6 +415,29 @@ mod tests {
 
         assert_eq!(got, light);
         assert_eq!(fb_hits.load(Ordering::Relaxed), 1, "unknown head must use the full chain");
+    }
+
+    /// Freshness needs a *recent* head observation, not just block-number proximity:
+    /// during a long catch-up stretch the pipeline does not re-poll the tip, and the real
+    /// head may meanwhile advance past the generator's retention — so an anchor older than
+    /// the grace horizon downgrades to full-chain failover from the first attempt instead
+    /// of burning the grace per block on pruned witnesses.
+    #[tokio::test]
+    async fn stale_head_observation_disables_the_grace() {
+        let (number, hash, wire, light) = fixture_wire();
+        let (_gen, gen_url, gen_hits) = scripted_witness_rpc(0, None).await;
+        let (_fb, fb_url, fb_hits) = scripted_witness_rpc(0, Some(wire)).await;
+        let fetcher = test_fetcher(&[&gen_url, &fb_url], true, Duration::from_millis(500), None);
+        *fetcher.remote_head.lock().unwrap() =
+            Some((number, Instant::now() - Duration::from_secs(2)));
+
+        let start = Instant::now();
+        let got = fetcher.fetch_witness(number, hash).await;
+
+        assert_eq!(got, light);
+        assert_eq!(gen_hits.load(Ordering::Relaxed), 1, "no grace retries on a stale anchor");
+        assert_eq!(fb_hits.load(Ordering::Relaxed), 1);
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     /// Counts `on_rpc_deadline_exceeded` calls; every other [`RpcMetrics`] hook keeps its
@@ -435,7 +478,7 @@ mod tests {
             Duration::from_millis(300),
             Some(Arc::clone(&deadline_exceeded) as _),
         );
-        fetcher.remote_head.store(number, Ordering::Relaxed);
+        fetcher.note_remote_head(number);
 
         let start = Instant::now();
         let got = fetcher.fetch_witness(number, hash).await;
@@ -462,10 +505,10 @@ mod tests {
                 .unwrap(),
         );
         let fetcher = TraceFetcher::new(rpc_client, true);
-        assert_eq!(fetcher.remote_head.load(Ordering::Relaxed), u64::MAX);
+        assert!(fetcher.remote_head.lock().unwrap().is_none());
 
         assert_eq!(fetcher.latest_block_number().await.unwrap(), 0x64);
-        assert_eq!(fetcher.remote_head.load(Ordering::Relaxed), 0x64);
+        assert_eq!(fetcher.remote_head.lock().unwrap().map(|(head, _)| head), Some(0x64));
     }
 
     fn test_memo() -> CanonicalHashMemo {
