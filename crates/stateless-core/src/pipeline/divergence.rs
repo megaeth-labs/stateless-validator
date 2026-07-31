@@ -18,7 +18,10 @@ use crate::{
 pub trait DivergenceLookups {
     /// Hash for the block at `block_number`, or `None` if it's not in local history.
     fn get_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>>;
-    /// The oldest (lowest-number, highest-depth) block still in local history.
+    /// The lowest block from which local history is **hole-free up to the tip**: the
+    /// bisection walks `[earliest, tip]` and treats a missing hash inside that range as
+    /// fatal corruption, so a store that also keeps non-contiguous older records must
+    /// keep them out of this lookup surface.
     fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>>;
 }
 

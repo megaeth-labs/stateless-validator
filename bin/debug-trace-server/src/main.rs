@@ -43,7 +43,10 @@
 //! - **Stateless mode**: Without `data_dir`, all data is fetched from remote RPC endpoints
 //! - **Local cache mode**: With `data_dir`, enables chain sync to pre-fetch blocks into local DB
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use alloy_genesis::Genesis;
 use alloy_primitives::BlockHash;
@@ -53,14 +56,15 @@ use eyre::Result;
 use jsonrpsee::server::{Server, ServerConfig};
 use stateless_common::{RpcClient, RpcClientConfig, logging::LogArgs};
 use stateless_core::{
-    BisectResolver, ChainStore, ContractStore, PipelineConfig, chain_spec::ChainSpec,
-    db::BlockMeta, pipeline::run_pipeline,
+    BisectResolver, ChainStore, ContractStore, DivergenceLookups, PipelineConfig,
+    chain_spec::ChainSpec, db::BlockMeta, pipeline::run_pipeline,
 };
 use stateless_db::ContractCache;
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
+mod block_data_cache;
 mod chain_sync;
 mod data_provider;
 mod metrics;
@@ -71,6 +75,9 @@ mod server_db;
 mod timing;
 mod tracing_executor;
 
+use block_data_cache::{
+    BLOCK_DATA_CACHE_SHARDS, BlockDataCache, DEFAULT_BLOCK_DATA_CACHE_MAX_BYTES,
+};
 use data_provider::{DataProvider, NoopContractStore, WitnessFetchConfig};
 use response_cache::{DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS, ResponseCache, ResponseCacheConfig};
 use rpc_service::RpcContext;
@@ -170,13 +177,42 @@ struct Args {
     )]
     response_cache_max_size: u64,
 
-    /// Estimated number of items in response cache (for initial capacity).
+    /// Disable the HTTP response cache entirely (every trace response is recomputed).
+    #[clap(long, env = "DEBUG_TRACE_SERVER_RESPONSE_CACHE_DISABLED")]
+    response_cache_disabled: bool,
+
+    /// Estimated number of items in response cache (for initial capacity). Must be at
+    /// least 1 — disable the cache with `--response-cache-disabled`, not with 0.
     #[clap(
         long,
         env = "DEBUG_TRACE_SERVER_RESPONSE_CACHE_ESTIMATED_ITEMS",
-        default_value_t = DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS
+        default_value_t = DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS as u64,
+        value_parser = clap::value_parser!(u64).range(1..),
     )]
-    response_cache_estimated_items: usize,
+    response_cache_estimated_items: u64,
+
+    /// Maximum entries in the in-memory canonical-hash memo (number → hash for
+    /// depth-final heights below the sync window). Roughly 80 bytes per entry when full;
+    /// it fills lazily, so a generous cap costs nothing until a deep historical scan
+    /// actually uses it.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_CANONICAL_HASH_MEMO_CAPACITY",
+        default_value_t = data_provider::DEFAULT_CANONICAL_HASH_MEMO_CAPACITY,
+        value_parser = clap::value_parser!(u64).range(1..),
+    )]
+    canonical_hash_memo_capacity: u64,
+
+    /// Maximum memory for the in-memory block-data cache (e.g., "1GB", "512MB"; default 1GB).
+    /// Set to "0" to disable. Blocks heavier than a cache shard's budget are never
+    /// admitted, so very large blocks bypass the cache instead of thrashing it.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_BLOCK_DATA_CACHE_MAX_SIZE",
+        default_value_t = DEFAULT_BLOCK_DATA_CACHE_MAX_BYTES,
+        value_parser = parse_size,
+    )]
+    block_data_cache_max_size: u64,
 
     /// Number of recent blocks to retain in database (older blocks are pruned).
     #[clap(
@@ -203,6 +239,17 @@ struct Args {
         default_value_t = DEFAULT_PRUNER_INTERVAL_SECS
     )]
     pruner_interval_secs: u64,
+
+    /// Size-based pruning never removes block bodies above `tip - this`: a floor of recent
+    /// bodies that stays resident even when the DB file remains over `--db-max-size`
+    /// (redb files never shrink, so a permanently-over-limit file must not consume the
+    /// whole body retention).
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_SIZE_PRUNE_MIN_RETAIN",
+        default_value_t = DEFAULT_SIZE_PRUNE_MIN_RETAIN
+    )]
+    size_prune_min_retain: u64,
 
     /// Maximum concurrent in-flight data-endpoint requests (blocks, headers, code, tx).
     /// Omit for unlimited.
@@ -264,6 +311,9 @@ const DEFAULT_BLOCKS_TO_KEEP: u64 = 1000;
 
 /// Default pruner interval in seconds (5 minutes).
 const DEFAULT_PRUNER_INTERVAL_SECS: u64 = 300;
+
+/// Default floor of recent block bodies that size-based pruning never removes.
+const DEFAULT_SIZE_PRUNE_MIN_RETAIN: u64 = 256;
 
 /// Parses a human-readable size string into bytes.
 ///
@@ -352,7 +402,6 @@ async fn main() -> Result<()> {
         listen_addr = %args.addr,
         "Debug-trace-server starting"
     );
-    let response_cache_disabled = args.response_cache_estimated_items == 0;
     // The combined witness chain (generator first when configured) — the list actually fed to
     // the RPC client, not just the fallback flag values.
     let witness_apis = witness_endpoint_chain(&args);
@@ -372,7 +421,7 @@ async fn main() -> Result<()> {
         witness_old_block_timeout_secs = old_block_witness_timeout_secs(&args),
         witness_local_window = args.witness_local_window,
         tip_buffer = args.tip_buffer,
-        response_cache_disabled,
+        response_cache_disabled = args.response_cache_disabled,
         response_cache_max_size = args.response_cache_max_size,
         response_cache_estimated_items = args.response_cache_estimated_items,
         "Server configuration"
@@ -448,23 +497,41 @@ async fn main() -> Result<()> {
     };
     let contract_cache = Arc::new(ContractCache::new(contract_store));
 
+    let block_data_cache = if args.block_data_cache_max_size == 0 {
+        warn!("Block-data cache disabled (max size = 0); every request re-resolves block data");
+        None
+    } else {
+        debug!(
+            max_bytes = args.block_data_cache_max_size,
+            shards = BLOCK_DATA_CACHE_SHARDS,
+            per_shard_budget = args.block_data_cache_max_size / BLOCK_DATA_CACHE_SHARDS as u64,
+            "Block-data cache initialized; entries above the per-shard budget are never admitted"
+        );
+        Some(Arc::new(BlockDataCache::new(args.block_data_cache_max_size)))
+    };
+
     let data_provider = Arc::new(DataProvider::new(
         rpc_client.clone(),
         block_store.clone(),
+        block_data_cache,
         contract_cache,
         witness_cfg,
         std::time::Duration::from_secs(args.block_fetch_timeout),
+        args.canonical_hash_memo_capacity as usize,
     ));
 
     let chain_spec = load_chain_spec(&args)?;
 
-    let response_cache = if response_cache_disabled {
-        info!("Response cache disabled (estimated_items = 0)");
+    let response_cache = if args.response_cache_disabled {
+        warn!(
+            "Response cache disabled (--response-cache-disabled); every trace response will \
+             be recomputed"
+        );
         None
     } else {
         let cache = ResponseCache::new(ResponseCacheConfig::new(
             args.response_cache_max_size,
-            args.response_cache_estimated_items,
+            args.response_cache_estimated_items as usize,
         ));
         debug!(
             max_bytes = args.response_cache_max_size,
@@ -491,6 +558,7 @@ async fn main() -> Result<()> {
         let hooks = Arc::new(TraceHooks::new(
             Arc::clone(db) as Arc<dyn BlockStore>,
             response_cache.clone(),
+            data_provider.canonical_hash_memo(),
         ));
         let fetcher =
             Arc::new(TraceFetcher::new(Arc::clone(&rpc_client), witness_cfg.generator_first));
@@ -513,12 +581,14 @@ async fn main() -> Result<()> {
         let pruner_metrics = metrics::ChainSyncMetrics::create();
         task::spawn({
             let db = Arc::clone(db);
+            let size_prune_min_retain = args.size_prune_min_retain;
             async move {
                 if let Err(e) = history_pruner(
                     db,
                     args.blocks_to_keep,
                     args.pruner_interval_secs,
                     args.db_max_size,
+                    size_prune_min_retain,
                     db_path,
                     pruner_metrics,
                 )
@@ -641,16 +711,15 @@ fn load_chain_spec(args: &Args) -> Result<Arc<ChainSpec>> {
     }
 }
 
-/// Background task that periodically prunes old block data to prevent unbounded database growth.
-///
-/// Runs in an infinite loop, removing blocks older than `blocks_to_keep` from the current tip.
-/// If `db_max_size > 0`, also prunes additional blocks when the DB file exceeds that size.
+/// Background task that periodically prunes old block bodies to prevent unbounded database
+/// growth. Runs [`run_prune_cycle`] every `interval_secs`.
 #[instrument(skip_all, name = "history_pruner")]
 async fn history_pruner(
-    validator_db: Arc<dyn BlockStore>,
+    db: Arc<ServerDB>,
     blocks_to_keep: u64,
     interval_secs: u64,
     db_max_size: u64,
+    size_prune_min_retain: u64,
     db_path: PathBuf,
     chain_sync_metrics: metrics::ChainSyncMetrics,
 ) -> Result<()> {
@@ -659,89 +728,118 @@ async fn history_pruner(
         blocks_to_keep = blocks_to_keep,
         interval_secs = interval_secs,
         db_max_size = db_max_size,
+        size_prune_min_retain = size_prune_min_retain,
         "Starting history pruner"
     );
 
+    loop {
+        run_prune_cycle(
+            &db,
+            blocks_to_keep,
+            db_max_size,
+            size_prune_min_retain,
+            &db_path,
+            &chain_sync_metrics,
+        );
+        tokio::time::sleep(interval).await;
+    }
+}
+
+/// One pruning pass: count-based pruning, then size-based pruning down to the
+/// min-retain floor, then DB gauge updates.
+fn run_prune_cycle(
+    db: &ServerDB,
+    blocks_to_keep: u64,
+    db_max_size: u64,
+    size_prune_min_retain: u64,
+    db_path: &Path,
+    chain_sync_metrics: &metrics::ChainSyncMetrics,
+) {
     /// Number of extra blocks to prune per iteration when DB file is over size limit.
     const SIZE_PRUNE_BATCH: u64 = 100;
 
-    loop {
-        if let Ok(Some(tip)) = validator_db.get_canonical_tip() {
-            let current_tip = tip.block_number;
-            let mut prune_before = current_tip.saturating_sub(blocks_to_keep);
-            match validator_db.prune_chain(prune_before) {
+    let Ok(Some(tip)) = db.get_canonical_tip() else {
+        return;
+    };
+    let current_tip = tip.block_number;
+    let mut prune_before = current_tip.saturating_sub(blocks_to_keep);
+    match db.prune_history(prune_before) {
+        Ok(blocks_pruned) if blocks_pruned > 0 => {
+            debug!(
+                blocks_pruned = blocks_pruned,
+                prune_before = prune_before,
+                "Pruned old blocks from database"
+            );
+        }
+        Err(e) => warn!(error = %e, "Failed to prune old block data"),
+        _ => {}
+    }
+
+    // Size-based pruning: keep removing bodies until the DB file is under the limit or the
+    // minimum-retention floor is reached. redb files never shrink on their own, so a file
+    // that stays over the limit forever must not be allowed to eat every stored body.
+    if db_max_size > 0 {
+        let retain_floor = current_tip.saturating_sub(size_prune_min_retain);
+        loop {
+            let file_size = match std::fs::metadata(db_path) {
+                Ok(m) => m.len(),
+                Err(e) => {
+                    warn!(error = %e, "Failed to read DB file size");
+                    break;
+                }
+            };
+
+            if file_size <= db_max_size {
+                break;
+            }
+
+            prune_before = prune_before.saturating_add(SIZE_PRUNE_BATCH);
+            if prune_before >= retain_floor {
+                info!(
+                    file_size = file_size,
+                    db_max_size = db_max_size,
+                    retain_floor = retain_floor,
+                    "DB over size limit but at the minimum body-retention floor; not \
+                     pruning further"
+                );
+                break;
+            }
+
+            info!(
+                file_size = file_size,
+                db_max_size = db_max_size,
+                prune_before = prune_before,
+                "DB over size limit, pruning additional blocks"
+            );
+
+            match db.prune_history(prune_before) {
                 Ok(blocks_pruned) if blocks_pruned > 0 => {
                     debug!(
                         blocks_pruned = blocks_pruned,
                         prune_before = prune_before,
-                        "Pruned old blocks from database"
+                        "Size-based prune completed"
                     );
                 }
-                Err(e) => warn!(error = %e, "Failed to prune old block data"),
-                _ => {}
-            }
-
-            // Size-based pruning: keep removing blocks until DB is under the limit
-            if db_max_size > 0 {
-                loop {
-                    let file_size = match std::fs::metadata(&db_path) {
-                        Ok(m) => m.len(),
-                        Err(e) => {
-                            warn!(error = %e, "Failed to read DB file size");
-                            break;
-                        }
-                    };
-
-                    if file_size <= db_max_size {
-                        break;
-                    }
-
-                    prune_before = prune_before.saturating_add(SIZE_PRUNE_BATCH);
-                    // Don't prune beyond the current tip
-                    if prune_before >= current_tip {
-                        info!(
-                            file_size = file_size,
-                            db_max_size = db_max_size,
-                            "DB still over size limit but no more blocks to prune"
-                        );
-                        break;
-                    }
-
-                    info!(
-                        file_size = file_size,
-                        db_max_size = db_max_size,
-                        prune_before = prune_before,
-                        "DB over size limit, pruning additional blocks"
-                    );
-
-                    match validator_db.prune_chain(prune_before) {
-                        Ok(blocks_pruned) if blocks_pruned > 0 => {
-                            debug!(
-                                blocks_pruned = blocks_pruned,
-                                prune_before = prune_before,
-                                "Size-based prune completed"
-                            );
-                        }
-                        Ok(_) => break, // No more blocks to prune
-                        Err(e) => {
-                            warn!(error = %e, "Failed to prune during size-based pruning");
-                            break;
-                        }
-                    }
+                Ok(_) => break, // No more blocks to prune
+                Err(e) => {
+                    warn!(error = %e, "Failed to prune during size-based pruning");
+                    break;
                 }
-            }
-
-            // Update DB block range metrics
-            let earliest = validator_db.get_earliest().ok().flatten().map(|(n, _)| n).unwrap_or(0);
-            chain_sync_metrics.set_db_block_range(earliest, current_tip);
-
-            // Update DB file size metric
-            if let Ok(m) = std::fs::metadata(&db_path) {
-                chain_sync_metrics.set_db_size(m.len());
             }
         }
+    }
 
-        tokio::time::sleep(interval).await;
+    // DB gauges: `db_earliest_block` is the canonical window's start and
+    // `db_body_earliest_block` the body-retention edge; pruning moves both together, but
+    // they can diverge transiently (e.g. right after a stale reset, when the fresh
+    // anchor row has no stored body and pre-reset bodies still await pruning).
+    let earliest = db.get_earliest().ok().flatten().map(|(n, _)| n).unwrap_or(0);
+    chain_sync_metrics.set_db_block_range(earliest, current_tip);
+    if let Ok(Some(body_earliest)) = db.get_earliest_block_record() {
+        chain_sync_metrics.set_db_body_earliest_block(body_earliest);
+    }
+    if let Ok(m) = std::fs::metadata(db_path) {
+        chain_sync_metrics.set_db_size(m.len());
     }
 }
 
@@ -856,6 +954,28 @@ mod tests {
         );
     }
 
+    /// Pins the block-data cache knob: 1 GB default, size-suffix parsing, "0" disables, and
+    /// the env attribute string.
+    #[test]
+    fn block_data_cache_flag_default_env_and_disable() {
+        let guard = stateless_test_utils::env::env_lock();
+
+        assert_eq!(parse_args(&[]).block_data_cache_max_size, DEFAULT_BLOCK_DATA_CACHE_MAX_BYTES);
+        assert_eq!(parse_args(&["--block-data-cache-max-size", "0"]).block_data_cache_max_size, 0);
+        assert_eq!(
+            parse_args(&["--block-data-cache-max-size", "512MB"]).block_data_cache_max_size,
+            512 * 1024 * 1024
+        );
+
+        let from_env = stateless_test_utils::env::with_env_var(
+            &guard,
+            "DEBUG_TRACE_SERVER_BLOCK_DATA_CACHE_MAX_SIZE",
+            "2GB",
+            || parse_args(&[]),
+        );
+        assert_eq!(from_env.block_data_cache_max_size, 2 * 1024 * 1024 * 1024);
+    }
+
     /// The witness chain puts the declared generator at index 0; without the flag no endpoint
     /// is special — even a multi-endpoint list is plain failover, keeping its pre-routing
     /// behavior.
@@ -949,6 +1069,146 @@ mod tests {
 
         let from_env = stateless_test_utils::env::with_env_var(&guard, env, "12", || parse(&[]));
         assert_eq!(from_env, Some(12));
+    }
+
+    /// Response-cache flags: disabling is a dedicated flag (CLI + env), and 0 estimated
+    /// items — the old disable convention — is rejected at parse time on both paths, so a
+    /// deployment still exporting `..._ESTIMATED_ITEMS=0` fails loudly instead of silently
+    /// running uncached.
+    #[test]
+    fn response_cache_flags() {
+        let guard = stateless_test_utils::env::env_lock();
+
+        let defaults = parse_args(&[]);
+        assert!(!defaults.response_cache_disabled);
+        assert_eq!(
+            defaults.response_cache_estimated_items,
+            DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS as u64
+        );
+
+        assert!(parse_args(&["--response-cache-disabled"]).response_cache_disabled);
+        assert_eq!(
+            parse_args(&["--response-cache-estimated-items", "50000"])
+                .response_cache_estimated_items,
+            50_000
+        );
+
+        let base =
+            ["debug-trace-server", "--rpc-endpoint", "http://r", "--witness-endpoint", "http://w"];
+        assert!(
+            Args::try_parse_from(base.iter().chain(&["--response-cache-estimated-items", "0"]))
+                .is_err(),
+            "0 estimated items must be rejected at parse time"
+        );
+        let env_zero_rejected = stateless_test_utils::env::with_env_var(
+            &guard,
+            "DEBUG_TRACE_SERVER_RESPONSE_CACHE_ESTIMATED_ITEMS",
+            "0",
+            || Args::try_parse_from(base).is_err(),
+        );
+        assert!(env_zero_rejected, "0 estimated items via env must be rejected at parse time");
+
+        let disabled_via_env = stateless_test_utils::env::with_env_var(
+            &guard,
+            "DEBUG_TRACE_SERVER_RESPONSE_CACHE_DISABLED",
+            "true",
+            || parse_args(&[]).response_cache_disabled,
+        );
+        assert!(disabled_via_env);
+    }
+
+    /// Pruner-guard flag: default, CLI override, and env parity.
+    #[test]
+    fn size_prune_min_retain_flag() {
+        let guard = stateless_test_utils::env::env_lock();
+
+        assert_eq!(parse_args(&[]).size_prune_min_retain, 256);
+        assert_eq!(parse_args(&["--size-prune-min-retain", "1024"]).size_prune_min_retain, 1024);
+
+        let retain_via_env = stateless_test_utils::env::with_env_var(
+            &guard,
+            "DEBUG_TRACE_SERVER_SIZE_PRUNE_MIN_RETAIN",
+            "512",
+            || parse_args(&[]).size_prune_min_retain,
+        );
+        assert_eq!(retain_via_env, 512);
+    }
+
+    /// Canonical-hash memo capacity: default, CLI override, env parity, and 0 rejected at
+    /// parse time.
+    #[test]
+    fn canonical_hash_memo_capacity_flag() {
+        let guard = stateless_test_utils::env::env_lock();
+
+        assert_eq!(
+            parse_args(&[]).canonical_hash_memo_capacity,
+            data_provider::DEFAULT_CANONICAL_HASH_MEMO_CAPACITY
+        );
+        assert_eq!(
+            parse_args(&["--canonical-hash-memo-capacity", "1000000"]).canonical_hash_memo_capacity,
+            1_000_000
+        );
+
+        let base =
+            ["debug-trace-server", "--rpc-endpoint", "http://r", "--witness-endpoint", "http://w"];
+        assert!(
+            Args::try_parse_from(base.iter().chain(&["--canonical-hash-memo-capacity", "0"]))
+                .is_err(),
+            "0 memo capacity must be rejected at parse time"
+        );
+        let via_env = stateless_test_utils::env::with_env_var(
+            &guard,
+            "DEBUG_TRACE_SERVER_CANONICAL_HASH_MEMO_CAPACITY",
+            "4096",
+            || parse_args(&[]).canonical_hash_memo_capacity,
+        );
+        assert_eq!(via_env, 4096);
+    }
+
+    /// Size-based pruning stops at the min-retain floor: with a DB file permanently over
+    /// `db_max_size` (redb files never shrink), bodies within `tip - size_prune_min_retain`
+    /// survive every cycle instead of being pruned to nothing.
+    #[test]
+    fn run_prune_cycle_respects_min_retain_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(TRACE_SERVER_DB_FILENAME);
+        let db = ServerDB::new(&db_path).unwrap();
+
+        use crate::server_db::test_support::{empty_light_witness, make_test_block};
+
+        let block_hash = |n: u64| BlockHash::from(alloy_primitives::U256::from(n).to_be_bytes());
+        let blocks: Vec<_> = (1..=500u64)
+            .map(|n| (make_test_block(n, block_hash(n)), empty_light_witness()))
+            .collect();
+        db.store_block_data(&blocks).unwrap();
+        let metas: Vec<BlockMeta> = (1..=500u64)
+            .map(|n| BlockMeta {
+                block_number: n,
+                block_hash: block_hash(n),
+                post_state_root: Default::default(),
+                post_withdrawals_root: Default::default(),
+            })
+            .collect();
+        ChainStore::advance_chain(&db, &metas).unwrap();
+
+        // db_max_size = 1 byte: permanently over the limit. blocks_to_keep exceeds the
+        // chain length, so only size-based pruning can remove anything.
+        let metrics = metrics::ChainSyncMetrics::create();
+        run_prune_cycle(&db, 1_000, 1, 250, &db_path, &metrics);
+
+        // The contract: bodies at or above tip - min_retain = 250 always survive.
+        for n in [250u64, 300, 500] {
+            assert!(db.get_block_and_witness(block_hash(n)).is_ok(), "body {n} must survive");
+        }
+        // Pruning did happen below the floor, chain rows included; the retained window
+        // still answers.
+        assert!(db.get_block_and_witness(block_hash(1)).is_err(), "body 1 must be pruned");
+        for n in [1u64, 100] {
+            assert_eq!(ChainStore::get_block_hash(&db, n).unwrap(), None, "chain row {n}");
+        }
+        for n in [250u64, 500] {
+            assert!(ChainStore::get_block_hash(&db, n).unwrap().is_some(), "window row {n}");
+        }
     }
 
     #[test]

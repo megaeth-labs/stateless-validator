@@ -23,7 +23,9 @@ use stateless_core::{
     pipeline::{BlockFetcher, BlockProcessor, PipelineHooks},
 };
 
-use crate::{metrics, response_cache::ResponseCache, server_db::BlockStore};
+use crate::{
+    data_provider::CanonicalHashMemo, metrics, response_cache::ResponseCache, server_db::BlockStore,
+};
 
 /// Blocks within this distance of the last observed remote head are "frontier-fresh": their
 /// witness may still be generating upstream, so the generator gets a short exclusive grace
@@ -193,17 +195,27 @@ impl BlockProcessor for TraceProcessor {
     }
 }
 
-/// Pipeline hooks for the trace server: store block data before advancing,
-/// invalidate cache on reorg.
+/// Pipeline hooks for the trace server: store block data before advancing, invalidate
+/// the response cache and the canonical-hash memo on reorg / stale-reset events.
 pub struct TraceHooks {
     pub db: Arc<dyn BlockStore>,
     pub response_cache: Option<ResponseCache>,
+    pub canonical_hash_memo: CanonicalHashMemo,
     pub chain_sync_metrics: metrics::ChainSyncMetrics,
 }
 
 impl TraceHooks {
-    pub fn new(db: Arc<dyn BlockStore>, response_cache: Option<ResponseCache>) -> Self {
-        Self { db, response_cache, chain_sync_metrics: metrics::ChainSyncMetrics::create() }
+    pub fn new(
+        db: Arc<dyn BlockStore>,
+        response_cache: Option<ResponseCache>,
+        canonical_hash_memo: CanonicalHashMemo,
+    ) -> Self {
+        Self {
+            db,
+            response_cache,
+            canonical_hash_memo,
+            chain_sync_metrics: metrics::ChainSyncMetrics::create(),
+        }
     }
 }
 
@@ -223,7 +235,7 @@ impl PipelineHooks for TraceHooks {
     fn on_reorg(
         &self,
         _rollback_to: BlockNumber,
-        _depth: u64,
+        depth: u64,
         reverted_hashes: &[BlockHash],
     ) -> eyre::Result<()> {
         if !reverted_hashes.is_empty() {
@@ -236,6 +248,7 @@ impl PipelineHooks for TraceHooks {
                 cache.invalidate_blocks(reverted_hashes);
             }
         }
+        self.canonical_hash_memo.on_reorg(depth);
         Ok(())
     }
 
@@ -243,6 +256,11 @@ impl PipelineHooks for TraceHooks {
         if let Some(cache) = &self.response_cache {
             cache.invalidate_all();
         }
+        // Belt-and-braces: memoized bindings are depth-final by construction, but a stale
+        // reset means we fell far behind and re-anchored blind to whatever happened
+        // upstream meanwhile — drop the memo with the response cache; it refills lazily
+        // at one header fetch per height.
+        self.canonical_hash_memo.clear();
         Ok(())
     }
 }
@@ -254,13 +272,13 @@ mod tests {
         time::Instant,
     };
 
-    use alloy_primitives::{B256, map::HashMap};
-    use revm::state::Bytecode;
+    use alloy_primitives::B256;
     use stateless_common::{BackoffPolicy, RpcClientConfig, witness_encoding};
-    use stateless_core::{StoreResult, withdrawals::MptWitness};
+    use stateless_core::withdrawals::MptWitness;
     use stateless_test_utils::fixtures::TestFixtures;
 
     use super::*;
+    use crate::server_db::test_support::{StubBlockStore, make_block_meta};
 
     /// Serves `mega_getBlockWitness`: "not generated yet" errors for the first
     /// `misses_before_serve` calls, then `wire` forever (always errors when `wire` is
@@ -485,77 +503,66 @@ mod tests {
         assert_eq!(fetcher.remote_head.load(Ordering::Relaxed), 0x64);
     }
 
-    fn make_block_meta(block_number: u64) -> BlockMeta {
-        BlockMeta {
-            block_number,
-            block_hash: Default::default(),
-            post_state_root: Default::default(),
-            post_withdrawals_root: Default::default(),
-        }
+    fn test_memo() -> CanonicalHashMemo {
+        CanonicalHashMemo::new(16)
     }
 
+    /// A stale reset drops every memoized number → hash binding along with the response
+    /// cache: the node re-anchored blind to whatever happened upstream in between.
     #[test]
-    fn test_trace_hooks_reorg_without_cache() {
-        let hooks = TraceHooks::new(Arc::new(MockBlockStore), None);
-        hooks.on_reorg(10, 2, &[Default::default()]).unwrap();
-    }
-
-    #[test]
-    fn test_trace_hooks_stale_reset() {
-        let hooks = TraceHooks::new(Arc::new(MockBlockStore), None);
+    fn stale_reset_clears_canonical_hash_memo() {
+        let memo = test_memo();
+        memo.insert(42, B256::from([1u8; 32]));
+        let hooks = TraceHooks::new(Arc::new(StubBlockStore::default()), None, memo.clone());
         hooks.on_stale_reset(&make_block_meta(100)).unwrap();
+        assert!(memo.get(&42).is_none());
     }
 
-    // Minimal mock for test compilation
-    struct MockBlockStore;
-    impl stateless_core::ContractStore for MockBlockStore {
-        fn get_contracts(&self, _: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
-            Ok((Default::default(), vec![]))
-        }
-        fn add_contracts(&self, _: &[(B256, Bytecode)]) -> StoreResult<()> {
-            Ok(())
-        }
+    /// The reorg hook forwards the depth to the memo, which owns the clearing policy:
+    /// shallow reorgs leave it intact, deep ones drop it (the exact boundary is pinned by
+    /// the memo's own test in `data_provider`).
+    #[test]
+    fn reorg_depth_reaches_the_memo() {
+        let memo = test_memo();
+        memo.insert(42, B256::from([1u8; 32]));
+        let hooks = TraceHooks::new(Arc::new(StubBlockStore::default()), None, memo.clone());
+
+        hooks.on_reorg(10, 1, &[Default::default()]).unwrap();
+        assert!(memo.get(&42).is_some(), "a shallow reorg must not clear the memo");
+
+        hooks.on_reorg(10, 1_000, &[Default::default()]).unwrap();
+        assert!(memo.get(&42).is_none(), "a deep reorg must clear the memo");
     }
-    impl stateless_core::ChainStore for MockBlockStore {
-        fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>> {
-            Ok(None)
+
+    /// A reorg evicts exactly the reverted hashes' entries — across resources — and leaves
+    /// other blocks' entries alone. This is memory hygiene, not correctness: dead entries
+    /// are unreachable by-number anyway, since number-keyed reads resolve the canonical
+    /// hash before the lookup.
+    #[test]
+    fn reorg_invalidates_hash_keyed_entries() {
+        use crate::response_cache::{CachedResource, ResponseCacheConfig, ResponseVariant};
+
+        let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
+        let h1 = B256::from([1u8; 32]);
+        let h2 = B256::from([2u8; 32]);
+        let entries = [
+            (CachedResource::DebugTraceBlock, h1),
+            (CachedResource::TraceBlock, h1),
+            (CachedResource::DebugTraceBlock, h2),
+        ];
+        for (resource, hash) in entries {
+            cache.insert(resource, hash, ResponseVariant::Default, &serde_json::json!({"v": 1}));
         }
-        fn get_anchor(&self) -> StoreResult<Option<BlockMeta>> {
-            Ok(None)
-        }
-        fn advance_chain(&self, _: &[BlockMeta]) -> StoreResult<()> {
-            Ok(())
-        }
-        fn get_block_hash(&self, _: BlockNumber) -> StoreResult<Option<BlockHash>> {
-            Ok(None)
-        }
-        fn rollback_chain(&self, _: BlockNumber) -> StoreResult<()> {
-            Ok(())
-        }
-        fn reset_to_anchor(&self, _: &BlockMeta) -> StoreResult<()> {
-            Ok(())
-        }
-    }
-    impl stateless_core::DivergenceLookups for MockBlockStore {
-        fn get_hash(&self, _: BlockNumber) -> StoreResult<Option<BlockHash>> {
-            Ok(None)
-        }
-        fn get_earliest(&self) -> StoreResult<Option<(BlockNumber, BlockHash)>> {
-            Ok(None)
-        }
-    }
-    impl BlockStore for MockBlockStore {
-        fn prune_chain(&self, _: BlockNumber) -> StoreResult<u64> {
-            Ok(0)
-        }
-        fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
-            Ok(())
-        }
-        fn get_block_and_witness(
-            &self,
-            _: BlockHash,
-        ) -> StoreResult<(Block<Transaction>, LightWitness)> {
-            Err(stateless_core::StoreError::Corrupt("not implemented".into()))
-        }
+
+        let hooks =
+            TraceHooks::new(Arc::new(StubBlockStore::default()), Some(cache.clone()), test_memo());
+        hooks.on_reorg(10, 1, &[h1]).unwrap();
+
+        assert!(cache.get(CachedResource::DebugTraceBlock, h1, ResponseVariant::Default).is_none());
+        assert!(cache.get(CachedResource::TraceBlock, h1, ResponseVariant::Default).is_none());
+        assert!(
+            cache.get(CachedResource::DebugTraceBlock, h2, ResponseVariant::Default).is_some(),
+            "untouched blocks must survive the reorg invalidation"
+        );
     }
 }

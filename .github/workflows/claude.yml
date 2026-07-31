@@ -54,14 +54,17 @@ jobs:
     # rather than cancelling it, so a partial run never leaves comments/threads
     # in an inconsistent state.
     concurrency:
-      group: claude-pr-review-${{ github.event.pull_request.number }}
+      group: claude-pr-review-${{ github.event.pull_request.number || github.event.issue.number }}
       cancel-in-progress: false
     if: |
-      github.event_name == 'pull_request' &&
-      (github.event.action == 'opened' ||
-       github.event.action == 'synchronize' ||
-       github.event.action == 'ready_for_review' ||
-       github.event.action == 'reopened')
+      (github.event_name == 'pull_request' &&
+       (github.event.action == 'opened' ||
+        github.event.action == 'synchronize' ||
+        github.event.action == 'ready_for_review' ||
+        github.event.action == 'reopened')) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       github.event.comment.user.login != 'mega-maxwell[bot]')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -83,6 +86,7 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/head', github.event.issue.number) || '' }}
           token: ${{ steps.app-token.outputs.token }}
           persist-credentials: false
           submodules: recursive

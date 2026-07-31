@@ -22,11 +22,13 @@ use tracing::{trace, warn};
 use crate::{
     data_provider::{BlockData, DataProvider, DataProviderError, SLOW_STAGE_THRESHOLD_MS},
     metrics::{
-        self, DataSourceMetrics, EvmExecutionMetrics, METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
-        METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, METHOD_DEBUG_TRACE_TRANSACTION, METHOD_TRACE_BLOCK,
-        METHOD_TRACE_TRANSACTION, ResponseSizeMetrics, RpcGlobalMetrics, SingleFlightMetrics,
+        self, BlockDataEvictionMetrics, CacheStats, DataSourceMetrics, EvmExecutionMetrics,
+        METHOD_DEBUG_TRACE_BLOCK_BY_HASH, METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+        METHOD_DEBUG_TRACE_TRANSACTION, METHOD_TRACE_BLOCK, METHOD_TRACE_TRANSACTION,
+        ResponseSizeMetrics, RpcGlobalMetrics, SingleFlightMetrics,
     },
-    response_cache::{CachedResource, ResponseCache, ResponseVariant},
+    response_cache::{CachedResource, RequestShape, ResponseCache, ResponseVariant},
+    tracing_executor::TraceError,
 };
 
 /// Slow request threshold for logging warnings.
@@ -179,6 +181,26 @@ impl RpcContext {
         &self.watch_dog
     }
 
+    /// The sole [`TraceError`] → RPC-error conversion, so rendering a trace failure runs
+    /// its bookkeeping by construction: the per-method error metric, and — only for
+    /// data-attributable failures ([`TraceError::Data`]) — dropping the block's cached
+    /// data, so a decodable-but-wrong witness is refetched on the next request instead of
+    /// staying pinned until eviction. Request-attributable failures (invalid tracer
+    /// configs, tracer construction/output errors) never evict: mux/JS shapes bypass the
+    /// response cache, so evicting on them would let any client drop hot entries at will.
+    fn trace_failure_to_rpc_err(
+        &self,
+        method: &'static str,
+        block_hash: &B256,
+        error: TraceError,
+    ) -> jsonrpsee::types::ErrorObjectOwned {
+        metrics::record_rpc_error(method);
+        if matches!(error, TraceError::Data(_)) && self.data_provider.evict_block_data(block_hash) {
+            BlockDataEvictionMetrics::new_for_method(method).record();
+        }
+        rpc_err(format!("Trace execution failed: {error}"))
+    }
+
     /// Creates the merged RPC module containing all methods.
     ///
     /// Also registers `timed_` prefixed aliases for every method, so that
@@ -196,6 +218,101 @@ impl RpcContext {
 
         Ok(module)
     }
+
+    /// The shared by-number prelude, encoding the reorg-safety invariant once for both
+    /// by-number handlers: resolve tag -> number -> canonical hash (local index first)
+    /// *before* the cache lookup, all on one request deadline; on a miss, fetch block data
+    /// by the resolved hash on the remaining budget. Slow prelude stages are warned about
+    /// here, where they are measured; trace/serialize timing lives in
+    /// [`compute_block_trace`] and cache-insert timing in [`insert_cache`].
+    async fn lookup_block_by_number(
+        &self,
+        method: &'static str,
+        resource: CachedResource,
+        variant: Option<ResponseVariant>,
+        block_number: BlockNumberOrTag,
+        start: Instant,
+    ) -> Result<BlockLookup, jsonrpsee::types::ErrorObjectOwned> {
+        let deadline = self.data_provider.fetch_deadline();
+
+        let t0 = Instant::now();
+        let block_num =
+            self.data_provider.resolve_block_number(block_number, deadline).await.map_err(|e| {
+                metrics::record_rpc_error(method);
+                rpc_err(format!("Failed to resolve block number: {e}"))
+            })?;
+        let resolve_ms = t0.elapsed().as_millis();
+        tracing::Span::current().record("block_number", block_num);
+
+        let t1 = Instant::now();
+        let block_hash =
+            self.data_provider.resolve_canonical_hash(block_num, deadline).await.map_err(|e| {
+                metrics::record_rpc_error(method);
+                data_provider_error_to_rpc_error(&e)
+            })?;
+        let resolve_hash_ms = t1.elapsed().as_millis();
+
+        if let Some(cached) =
+            check_cache(&self.response_cache, resource, block_hash, variant, method, start)
+        {
+            return Ok(BlockLookup::Cached(cached));
+        }
+
+        let t2 = Instant::now();
+        let data = self
+            .data_provider
+            .get_block_data_by_hash_with_deadline(block_hash, deadline)
+            .await
+            .map_err(|e| {
+                metrics::record_rpc_error(method);
+                data_provider_error_to_rpc_error(&e)
+            })?;
+        let fetch_ms = t2.elapsed().as_millis();
+
+        if resolve_ms >= SLOW_STAGE_THRESHOLD_MS ||
+            resolve_hash_ms >= SLOW_STAGE_THRESHOLD_MS ||
+            fetch_ms >= SLOW_STAGE_THRESHOLD_MS
+        {
+            warn!(
+                method,
+                block_number = block_num,
+                resolve_ms = resolve_ms as u64,
+                resolve_hash_ms = resolve_hash_ms as u64,
+                fetch_data_ms = fetch_ms as u64,
+                "by-number lookup slow stages detected"
+            );
+        }
+
+        Ok(BlockLookup::Fetched(data))
+    }
+
+    /// Runs the geth-style block-trace executor over `data` via [`compute_block_trace`] —
+    /// the one place the executor call shape lives for both debug block handlers.
+    fn compute_debug_trace(
+        &self,
+        data: &BlockData,
+        method: &'static str,
+        opts: GethDebugTracingOptions,
+    ) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
+        compute_block_trace(data, method, || {
+            crate::tracing_executor::trace_block(
+                &self.chain_spec,
+                &data.block,
+                data.witness.clone(),
+                &data.contracts,
+                opts,
+            )
+        })
+        .map_err(|e| self.trace_failure_to_rpc_err(method, &data.block.header.hash, e))
+    }
+}
+
+/// Outcome of [`RpcContext::lookup_block_by_number`].
+enum BlockLookup {
+    /// Served straight from the response cache.
+    Cached(serde_json::Value),
+    /// Cache miss: block data fetched by the resolved canonical hash, ready to trace.
+    Fetched(Arc<BlockData>),
 }
 
 // Error Helpers
@@ -208,6 +325,32 @@ const ERROR_CODE_NOT_FOUND: i32 = -32001;
 /// Used for execution failures, serialization errors, etc.
 fn rpc_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
     jsonrpsee::types::ErrorObjectOwned::owned(ERROR_CODE_INTERNAL, msg, None::<()>)
+}
+
+/// Creates a JSON-RPC invalid-params error (code -32602).
+fn invalid_params_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
+    jsonrpsee::types::ErrorObjectOwned::owned(
+        jsonrpsee::types::error::INVALID_PARAMS_CODE,
+        msg,
+        None::<()>,
+    )
+}
+
+/// Classifies `opts`, records the request-shape metric, and rejects a type-malformed
+/// `tracerConfig` on a config-reading builtin with `-32602 invalid params` — before any
+/// block data is fetched or executed. Returns the cache variant (`Some` only for
+/// cacheable shapes).
+fn classify_and_gate(
+    method_name: &'static str,
+    opts: &GethDebugTracingOptions,
+) -> Result<Option<ResponseVariant>, jsonrpsee::types::ErrorObjectOwned> {
+    let shape = RequestShape::classify(opts);
+    metrics::record_request_shape(method_name, shape.label());
+    if let RequestShape::InvalidTracerConfig { label, error } = &shape {
+        metrics::record_rpc_error(method_name);
+        return Err(invalid_params_err(format!("invalid tracerConfig for {label}: {error}")));
+    }
+    Ok(shape.cache_variant())
 }
 
 /// Maps a [`DataProviderError`] to a JSON-RPC error object.
@@ -230,30 +373,25 @@ fn data_provider_error_to_rpc_error(e: &DataProviderError) -> jsonrpsee::types::
 }
 
 // Trace Computation Helpers
-/// Computes debug trace for a block (Geth-style).
-async fn compute_debug_trace_block(
-    chain_spec: &ChainSpec,
+/// Runs a block-trace executor closure and wraps the scaffolding shared by every
+/// block-level handler: EVM timing + metrics, JSON serialization, the response-size
+/// metric, and the slow-stage warning. Returns the typed [`TraceError`] so the caller can
+/// key cache hygiene off its data-vs-request discriminant before rendering an RPC error.
+fn compute_block_trace<T: serde::Serialize>(
     data: &BlockData,
-    opts: GethDebugTracingOptions,
     method_name: &'static str,
-) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
+    run: impl FnOnce() -> Result<T, TraceError>,
+) -> Result<serde_json::Value, TraceError> {
     let start = Instant::now();
 
-    let results = crate::tracing_executor::trace_block(
-        chain_spec,
-        &data.block,
-        data.witness.clone(),
-        &data.contracts,
-        opts,
-    )
-    .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
+    let results = run()?;
 
     let trace_ms = start.elapsed().as_millis();
     EvmExecutionMetrics::new_for_method(method_name)
         .record(start.elapsed().as_secs_f64(), data.block.transactions.len());
 
     let value = serde_json::to_value(&results)
-        .map_err(|e| rpc_err(format!("Serialization failed: {e}")))?;
+        .map_err(|e| TraceError::Request(format!("Serialization failed: {e}")))?;
 
     let serialize_ms = start.elapsed().as_millis() - trace_ms;
     let response_size = value.to_string().len();
@@ -261,83 +399,34 @@ async fn compute_debug_trace_block(
 
     if trace_ms >= SLOW_STAGE_THRESHOLD_MS || serialize_ms >= SLOW_STAGE_THRESHOLD_MS {
         warn!(
+            method = method_name,
             block_number = data.block.header.number,
             tx_count = data.block.transactions.len(),
             trace_ms = trace_ms as u64,
             serialize_ms = serialize_ms as u64,
             response_size_kb = response_size / 1024,
-            "compute_debug_trace_block slow stages detected"
+            "block trace slow stages detected"
         );
     }
 
     Ok(value)
 }
 
-/// Computes parity trace for a block.
-async fn compute_parity_trace_block(
-    chain_spec: &ChainSpec,
-    data: &BlockData,
-    method_name: &'static str,
-) -> Result<serde_json::Value, jsonrpsee::types::ErrorObjectOwned> {
-    let start = Instant::now();
-
-    let results = crate::tracing_executor::parity_trace_block(
-        chain_spec,
-        &data.block,
-        data.witness.clone(),
-        &data.contracts,
-    )
-    .map_err(|e| rpc_err(format!("Trace execution failed: {e}")))?;
-
-    EvmExecutionMetrics::new_for_method(method_name)
-        .record(start.elapsed().as_secs_f64(), data.block.transactions.len());
-
-    let value =
-        serde_json::to_value(results).map_err(|e| rpc_err(format!("Serialization failed: {e}")))?;
-    ResponseSizeMetrics::new_for_method(method_name).record(value.to_string().len());
-
-    Ok(value)
-}
-
 // Cache Helper Functions
-/// Checks cache by block number and returns cached value if found.
-fn check_cache_by_number(
-    cache: &Option<ResponseCache>,
-    resource: CachedResource,
-    block_num: u64,
-    variant: &ResponseVariant,
-    method_name: &'static str,
-    start: Instant,
-) -> Option<serde_json::Value> {
-    let cached_value = cache.as_ref()?.get(resource, block_num, variant.clone())?;
-
-    let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-    metrics::record_rpc_request(method_name, total_ms / 1000.0);
-    DataSourceMetrics::new_for_source("cache").record();
-    SingleFlightMetrics::new_for_type("bypassed").record();
-
-    trace!(
-        method = method_name,
-        block = block_num,
-        total_ms = format!("{:.2}", total_ms),
-        cache_hit = true,
-        "Cache hit - returning cached result"
-    );
-
-    Some(cached_value)
-}
-
-/// Checks cache by block hash and returns cached value if found.
-fn check_cache_by_hash(
+/// Checks the cache for `(resource, block_hash, variant)`; a hit records request metrics
+/// and returns the pre-serialized response. A `None` variant marks a non-cacheable request
+/// shape and bypasses the lookup entirely (no hit/miss accounting). By-number callers
+/// resolve the canonical hash *before* calling this, so a hit is correct by construction —
+/// there is no serve-time canonicality validation anymore.
+fn check_cache(
     cache: &Option<ResponseCache>,
     resource: CachedResource,
     block_hash: B256,
-    variant: &ResponseVariant,
+    variant: Option<ResponseVariant>,
     method_name: &'static str,
     start: Instant,
 ) -> Option<serde_json::Value> {
-    let (cached_value, block_num) =
-        cache.as_ref()?.get_by_hash(resource, block_hash, variant.clone())?;
+    let cached_value = cache.as_ref()?.get(resource, block_hash, variant?)?;
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
     metrics::record_rpc_request(method_name, total_ms / 1000.0);
@@ -346,7 +435,6 @@ fn check_cache_by_hash(
 
     trace!(
         method = method_name,
-        block = block_num,
         block_hash = %block_hash,
         total_ms = format!("{:.2}", total_ms),
         cache_hit = true,
@@ -354,6 +442,34 @@ fn check_cache_by_hash(
     );
 
     Some(cached_value)
+}
+
+/// Inserts a computed response under the hash of the block it was computed for; a no-op
+/// when the cache is disabled or the request shape is not cacheable (`variant` is `None`).
+/// Serializing a multi-MB response into the cache can be slow, so the insert is timed and
+/// warned about here, where it happens.
+fn insert_cache(
+    cache: &Option<ResponseCache>,
+    resource: CachedResource,
+    block_hash: B256,
+    variant: Option<ResponseVariant>,
+    method_name: &'static str,
+    result: &serde_json::Value,
+) {
+    let (Some(cache), Some(variant)) = (cache, variant) else {
+        return;
+    };
+    let t = Instant::now();
+    cache.insert(resource, block_hash, variant, result);
+    let insert_ms = t.elapsed().as_millis();
+    if insert_ms >= SLOW_STAGE_THRESHOLD_MS {
+        warn!(
+            method = method_name,
+            block_hash = %block_hash,
+            cache_insert_ms = insert_ms as u64,
+            "slow response-cache insert"
+        );
+    }
 }
 
 /// Records metrics and logs for a completed request.
@@ -386,86 +502,37 @@ impl DebugTraceRpcServer for RpcContext {
             .start_request(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, format!("{block_number}"));
         let start = Instant::now();
         let opts = opts.unwrap_or_default();
+        let variant = classify_and_gate(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, &opts)?;
 
-        // Stage 1: Resolve block number
-        let t0 = Instant::now();
-        let block_num =
-            self.data_provider.resolve_block_number(block_number).await.map_err(|e| {
-                metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
-                rpc_err(format!("Failed to resolve block number: {e}"))
-            })?;
-        let resolve_ms = t0.elapsed().as_millis();
+        let data = match self
+            .lookup_block_by_number(
+                METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+                CachedResource::DebugTraceBlock,
+                variant,
+                block_number,
+                start,
+            )
+            .await?
+        {
+            BlockLookup::Cached(cached) => return Ok(cached),
+            BlockLookup::Fetched(data) => data,
+        };
 
-        let variant = ResponseVariant::from_geth_options(&opts);
+        let result = self.compute_debug_trace(&data, METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, opts)?;
 
-        // Stage 2: Check cache
-        if let Some(cached) = check_cache_by_number(
+        insert_cache(
             &self.response_cache,
             CachedResource::DebugTraceBlock,
-            block_num,
-            &variant,
+            data.block.header.hash,
+            variant,
             METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+            &result,
+        );
+        record_request_completion(
+            METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+            data.block.header.number,
             start,
-        ) {
-            return Ok(cached);
-        }
-
-        // Stage 3: Fetch block data (DB -> RPC fallback)
-        let t2 = Instant::now();
-        let data = self.data_provider.get_block_data(block_num).await.map_err(|e| {
-            metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
-            data_provider_error_to_rpc_error(&e)
-        })?;
-        let fetch_ms = t2.elapsed().as_millis();
-        let block_hash = data.block.header.hash;
-        let tx_count = data.block.transactions.len();
-
-        // Stage 4: Execute trace
-        let t3 = Instant::now();
-        let result = compute_debug_trace_block(
-            &self.chain_spec,
-            &data,
-            opts,
-            METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
-        )
-        .await
-        .inspect_err(|_| {
-            metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
-        })?;
-        let trace_ms = t3.elapsed().as_millis();
-
-        // Stage 5: Cache result
-        let t4 = Instant::now();
-        if let Some(cache) = &self.response_cache {
-            cache.insert(
-                CachedResource::DebugTraceBlock,
-                block_num,
-                block_hash,
-                variant,
-                result.clone(),
-            );
-        }
-        let cache_insert_ms = t4.elapsed().as_millis();
-
-        let total_ms = start.elapsed().as_millis();
-        record_request_completion(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, block_num, start);
-
-        if resolve_ms >= SLOW_STAGE_THRESHOLD_MS ||
-            fetch_ms >= SLOW_STAGE_THRESHOLD_MS ||
-            trace_ms >= SLOW_STAGE_THRESHOLD_MS ||
-            cache_insert_ms >= SLOW_STAGE_THRESHOLD_MS
-        {
-            warn!(
-                block_number = block_num,
-                tx_count,
-                resolve_ms = resolve_ms as u64,
-                fetch_data_ms = fetch_ms as u64,
-                trace_ms = trace_ms as u64,
-                cache_insert_ms = cache_insert_ms as u64,
-                total_ms = total_ms as u64,
-                "debug_traceBlockByNumber slow stages detected"
-            );
-        }
+        );
 
         Ok(result)
     }
@@ -480,48 +547,37 @@ impl DebugTraceRpcServer for RpcContext {
             self.watch_dog.start_request(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, format!("{block_hash}"));
         let start = Instant::now();
         let opts = opts.unwrap_or_default();
+        let variant = classify_and_gate(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, &opts)?;
 
-        let variant = ResponseVariant::from_geth_options(&opts);
-
-        // Check cache
-        if let Some(cached) = check_cache_by_hash(
+        // Check cache — the requested hash IS the key; no resolution step.
+        if let Some(cached) = check_cache(
             &self.response_cache,
             CachedResource::DebugTraceBlock,
             block_hash,
-            &variant,
+            variant,
             METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
             start,
         ) {
             return Ok(cached);
         }
 
-        // Fetch block data (DB -> RPC fallback)
         let data = self.data_provider.get_block_data_by_hash(block_hash).await.map_err(|e| {
             metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
             data_provider_error_to_rpc_error(&e)
         })?;
         let block_num = data.block.header.number;
-        let result = compute_debug_trace_block(
-            &self.chain_spec,
-            &data,
-            opts,
-            METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
-        )
-        .await
-        .inspect_err(|_| {
-            metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
-        })?;
+        let result = self.compute_debug_trace(&data, METHOD_DEBUG_TRACE_BLOCK_BY_HASH, opts)?;
 
-        // Cache and record metrics
-        if let Some(cache) = &self.response_cache {
-            cache.insert(
-                CachedResource::DebugTraceBlock,
-                block_num,
-                block_hash,
-                variant,
-                result.clone(),
-            );
-        }
+        // An entry for a non-canonical hash is still the correct answer for that hash —
+        // exactly what geth serves — and is unreachable by-number.
+        insert_cache(
+            &self.response_cache,
+            CachedResource::DebugTraceBlock,
+            block_hash,
+            variant,
+            METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
+            &result,
+        );
         record_request_completion(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, block_num, start);
 
         Ok(result)
@@ -537,6 +593,9 @@ impl DebugTraceRpcServer for RpcContext {
             self.watch_dog.start_request(METHOD_DEBUG_TRACE_TRANSACTION, format!("{tx_hash}"));
         let start = Instant::now();
         let opts = opts.unwrap_or_default();
+        // Shape metric + malformed-config rejection; tx-level responses are not cached, so
+        // the cache variant itself is unused.
+        let _ = classify_and_gate(METHOD_DEBUG_TRACE_TRANSACTION, &opts)?;
 
         let (data, tx_index) =
             self.data_provider.get_block_data_for_tx(tx_hash).await.map_err(|e| {
@@ -554,8 +613,11 @@ impl DebugTraceRpcServer for RpcContext {
             opts,
         )
         .map_err(|e| {
-            metrics::record_rpc_error(METHOD_DEBUG_TRACE_TRANSACTION);
-            rpc_err(format!("Trace execution failed: {e}"))
+            self.trace_failure_to_rpc_err(
+                METHOD_DEBUG_TRACE_TRANSACTION,
+                &data.block.header.hash,
+                e,
+            )
         })?;
         EvmExecutionMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION)
             .record(evm_start.elapsed().as_secs_f64(), 1);
@@ -582,25 +644,26 @@ impl DebugTraceRpcServer for RpcContext {
     }
 
     async fn get_cache_status(&self) -> RpcResult<serde_json::Value> {
-        let Some(cache) = &self.response_cache else {
-            return Ok(serde_json::json!({
-                "responseCache": {
-                    "status": "disabled"
-                }
-            }));
-        };
-
-        let stats = cache.stats();
         Ok(serde_json::json!({
-            "responseCache": {
-                "entryCount": stats.entry_count,
-                "totalBytes": stats.total_bytes,
-                "totalBytesMB": format!("{:.2}", stats.total_bytes as f64 / 1024.0 / 1024.0),
-                "hits": stats.hits,
-                "misses": stats.misses,
-                "hitRate": format!("{:.1}%", stats.hit_rate())
-            }
+            "responseCache": cache_section(self.response_cache.as_ref().map(ResponseCache::stats)),
+            "blockDataCache": cache_section(self.data_provider.block_data_cache_stats()),
         }))
+    }
+}
+
+/// Renders one cache's `debug_getCacheStatus` JSON section: its [`CacheStats`], or
+/// `{"status": "disabled"}` when the cache is off.
+fn cache_section(stats: Option<CacheStats>) -> serde_json::Value {
+    match stats {
+        Some(stats) => serde_json::json!({
+            "entryCount": stats.entry_count,
+            "totalBytes": stats.total_bytes,
+            "totalBytesMB": format!("{:.2}", stats.total_bytes as f64 / 1024.0 / 1024.0),
+            "hits": stats.hits,
+            "misses": stats.misses,
+            "hitRate": format!("{:.1}%", stats.hit_rate())
+        }),
+        None => serde_json::json!({"status": "disabled"}),
     }
 }
 
@@ -612,50 +675,42 @@ impl TraceRpcServer for RpcContext {
         let _guard = self.watch_dog.start_request(METHOD_TRACE_BLOCK, format!("{block_number}"));
         let start = Instant::now();
 
-        let block_num =
-            self.data_provider.resolve_block_number(block_number).await.map_err(|e| {
-                metrics::record_rpc_error(METHOD_TRACE_BLOCK);
-                rpc_err(format!("Failed to resolve block number: {e}"))
-            })?;
+        // `trace_block` takes no tracer options, so its variant is always `Default`.
+        let data = match self
+            .lookup_block_by_number(
+                METHOD_TRACE_BLOCK,
+                CachedResource::TraceBlock,
+                Some(ResponseVariant::Default),
+                block_number,
+                start,
+            )
+            .await?
+        {
+            BlockLookup::Cached(cached) => return Ok(cached),
+            BlockLookup::Fetched(data) => data,
+        };
 
-        tracing::Span::current().record("block_number", block_num);
-
-        // Check cache
-        if let Some(cached) = check_cache_by_number(
-            &self.response_cache,
-            CachedResource::TraceBlock,
-            block_num,
-            &ResponseVariant::Default,
-            METHOD_TRACE_BLOCK,
-            start,
-        ) {
-            return Ok(cached);
-        }
-
-        // Fetch block data (DB -> RPC fallback)
-        let data = self.data_provider.get_block_data(block_num).await.map_err(|e| {
-            metrics::record_rpc_error(METHOD_TRACE_BLOCK);
-            data_provider_error_to_rpc_error(&e)
+        let result = compute_block_trace(&data, METHOD_TRACE_BLOCK, || {
+            crate::tracing_executor::parity_trace_block(
+                &self.chain_spec,
+                &data.block,
+                data.witness.clone(),
+                &data.contracts,
+            )
+        })
+        .map_err(|e| {
+            self.trace_failure_to_rpc_err(METHOD_TRACE_BLOCK, &data.block.header.hash, e)
         })?;
 
-        let block_hash = data.block.header.hash;
-        let result = compute_parity_trace_block(&self.chain_spec, &data, METHOD_TRACE_BLOCK)
-            .await
-            .inspect_err(|_| {
-                metrics::record_rpc_error(METHOD_TRACE_BLOCK);
-            })?;
-
-        // Cache and record metrics
-        if let Some(cache) = &self.response_cache {
-            cache.insert(
-                CachedResource::TraceBlock,
-                block_num,
-                block_hash,
-                ResponseVariant::Default,
-                result.clone(),
-            );
-        }
-        record_request_completion(METHOD_TRACE_BLOCK, block_num, start);
+        insert_cache(
+            &self.response_cache,
+            CachedResource::TraceBlock,
+            data.block.header.hash,
+            Some(ResponseVariant::Default),
+            METHOD_TRACE_BLOCK,
+            &result,
+        );
+        record_request_completion(METHOD_TRACE_BLOCK, data.block.header.number, start);
 
         Ok(result)
     }
@@ -690,8 +745,7 @@ impl TraceRpcServer for RpcContext {
             &data.contracts,
         )
         .map_err(|e| {
-            metrics::record_rpc_error(METHOD_TRACE_TRANSACTION);
-            rpc_err(format!("Trace execution failed: {e}"))
+            self.trace_failure_to_rpc_err(METHOD_TRACE_TRANSACTION, &data.block.header.hash, e)
         })?;
         EvmExecutionMetrics::new_for_method(METHOD_TRACE_TRANSACTION)
             .record(evm_start.elapsed().as_secs_f64(), 1);
@@ -721,6 +775,7 @@ impl TraceRpcServer for RpcContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::response_cache::ResponseCacheConfig;
 
     #[test]
     fn test_rpc_err() {
@@ -816,30 +871,220 @@ mod tests {
         }
     }
 
+    /// A disabled cache (`None`) always reports a bypass, for both cacheable and
+    /// non-cacheable variants.
     #[test]
-    fn test_check_cache_by_number_disabled() {
-        let result = check_cache_by_number(
-            &None,
+    fn check_cache_disabled_returns_none() {
+        for variant in [Some(ResponseVariant::Default), None] {
+            let result = check_cache(
+                &None,
+                CachedResource::DebugTraceBlock,
+                B256::ZERO,
+                variant,
+                "test_method",
+                Instant::now(),
+            );
+            assert!(result.is_none());
+        }
+    }
+
+    /// A `None` variant (non-cacheable shape) bypasses the lookup entirely — no value and
+    /// no hit/miss accounting, even when an entry exists under the same hash. A cacheable
+    /// variant hits under the inserted hash and misses under any other — there is no
+    /// number indirection left to go stale.
+    #[test]
+    fn check_cache_hit_miss_and_bypass() {
+        let h1 = B256::from([1u8; 32]);
+        let h2 = B256::from([2u8; 32]);
+        let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
+        cache.insert(
             CachedResource::DebugTraceBlock,
-            100,
-            &ResponseVariant::Default,
-            "test_method",
-            Instant::now(),
+            h1,
+            ResponseVariant::Default,
+            &serde_json::json!({"v": 1}),
         );
-        assert!(result.is_none());
+        let cache = Some(cache);
+        let check = |hash, variant| {
+            check_cache(&cache, CachedResource::DebugTraceBlock, hash, variant, "m", Instant::now())
+        };
+        let stats = || {
+            let s = cache.as_ref().unwrap().stats();
+            (s.hits, s.misses)
+        };
+
+        assert!(check(h1, None).is_none());
+        assert_eq!(stats(), (0, 0), "bypass must not touch accounting");
+
+        assert_eq!(check(h1, Some(ResponseVariant::Default)), Some(serde_json::json!({"v": 1})));
+        assert!(check(h2, Some(ResponseVariant::Default)).is_none());
+        assert_eq!(stats(), (1, 1));
+    }
+
+    /// Builds an `RpcContext` around a never-called upstream, with the given block-data
+    /// cache, response cache, and chain spec.
+    fn test_context(
+        block_data_cache: Option<Arc<crate::block_data_cache::BlockDataCache>>,
+        response_cache: Option<ResponseCache>,
+        chain_spec: ChainSpec,
+    ) -> RpcContext {
+        use stateless_common::{RpcClient, RpcClientConfig};
+
+        use crate::data_provider::{
+            DEFAULT_WITNESS_TIMEOUT_SECS, WitnessFetchConfig,
+            test_support::{hanging_url, noop_contract_cache},
+        };
+
+        let url = hanging_url();
+        let rpc_client = Arc::new(
+            RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
+                .unwrap(),
+        );
+        let provider = Arc::new(DataProvider::new(
+            rpc_client,
+            None,
+            block_data_cache,
+            noop_contract_cache(),
+            WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
+            Duration::from_secs(1),
+            1024,
+        ));
+        RpcContext::new(provider, Arc::new(chain_spec), response_cache)
+    }
+
+    /// [`test_context`] with the block-data cache merely toggled, for the cache-status
+    /// tests.
+    fn cache_status_context(
+        block_data_cache: bool,
+        response_cache: Option<ResponseCache>,
+    ) -> RpcContext {
+        use crate::block_data_cache::BlockDataCache;
+
+        test_context(
+            block_data_cache.then(|| Arc::new(BlockDataCache::new(1024 * 1024))),
+            response_cache,
+            ChainSpec::default(),
+        )
+    }
+
+    /// Caches `data`, runs a failing `debug_traceBlockByHash` over it, and returns the
+    /// entry count left behind — 1 = the failure did not evict, 0 = it did.
+    async fn entries_left_after_failed_trace(
+        chain_spec: ChainSpec,
+        data: BlockData,
+        opts: Option<GethDebugTracingOptions>,
+    ) -> u64 {
+        use crate::block_data_cache::BlockDataCache;
+
+        let cache = Arc::new(BlockDataCache::new(64 * 1024 * 1024));
+        let hash = data.block.header.hash;
+        cache.insert(hash, Arc::new(data));
+        let ctx = test_context(Some(Arc::clone(&cache)), None, chain_spec);
+        ctx.trace_block_by_hash(hash, opts).await.unwrap_err();
+        cache.stats().entry_count
+    }
+
+    /// The eviction rule at `trace_failure_to_rpc_err`: a data-attributable failure (a
+    /// witness that cannot replay the block) drops the cached block data, while a
+    /// request-attributable one (a mux tracer config that fails to parse) must not —
+    /// mux/JS shapes bypass the response cache, so evicting on them would let any client
+    /// drop hot entries at will.
+    #[tokio::test]
+    async fn trace_failure_evicts_block_data_only_for_data_errors() {
+        use alloy_rpc_types_trace::geth::{
+            GethDebugBuiltInTracerType, GethDebugTracerConfig, GethDebugTracerType,
+        };
+        use stateless_test_utils::fixtures::TestFixtures;
+
+        use crate::{
+            data_provider::test_support::fixture_block_data,
+            server_db::test_support::empty_light_witness,
+        };
+
+        let chain_spec = ChainSpec::from_genesis(
+            TestFixtures::synthetic().load_genesis().expect("fixture genesis"),
+        );
+
+        // Request-attributable: healthy cached data plus an unparsable mux config.
+        let opts = GethDebugTracingOptions {
+            tracer: Some(GethDebugTracerType::BuiltInTracer(GethDebugBuiltInTracerType::MuxTracer)),
+            tracer_config: GethDebugTracerConfig(serde_json::json!({"bogusTracer": {}})),
+            ..Default::default()
+        };
+        let left =
+            entries_left_after_failed_trace(chain_spec.clone(), fixture_block_data(), Some(opts))
+                .await;
+        assert_eq!(left, 1, "a request error must not evict");
+
+        // Data-attributable: the same block cached with a witness that cannot replay it.
+        let mut data = fixture_block_data();
+        data.witness = empty_light_witness();
+        let left = entries_left_after_failed_trace(chain_spec, data, None).await;
+        assert_eq!(left, 0, "a data error must evict the poisoned entry");
+    }
+
+    /// `debug_getCacheStatus` must always report both cache sections, each independently
+    /// enabled or `{"status": "disabled"}`.
+    #[tokio::test]
+    async fn get_cache_status_reports_block_data_cache_section() {
+        let ctx = cache_status_context(true, None);
+        let status = ctx.get_cache_status().await.unwrap();
+        assert_eq!(status["responseCache"]["status"], "disabled");
+        assert_eq!(status["blockDataCache"]["entryCount"], 0);
+        assert_eq!(status["blockDataCache"]["hits"], 0);
+
+        let ctx = cache_status_context(
+            false,
+            Some(ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100))),
+        );
+        let status = ctx.get_cache_status().await.unwrap();
+        assert_eq!(status["blockDataCache"]["status"], "disabled");
+        assert_eq!(status["responseCache"]["entryCount"], 0);
     }
 
     #[test]
-    fn test_check_cache_by_hash_disabled() {
-        let result = check_cache_by_hash(
-            &None,
+    fn insert_cache_skips_non_cacheable_variants() {
+        let cache = Some(ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100)));
+        let result = serde_json::json!([{"txHash": "0x01"}]);
+        let hash = B256::from([1u8; 32]);
+
+        insert_cache(&cache, CachedResource::DebugTraceBlock, hash, None, "m", &result);
+        assert_eq!(cache.as_ref().unwrap().len(), 0);
+
+        insert_cache(
+            &cache,
             CachedResource::DebugTraceBlock,
-            B256::ZERO,
-            &ResponseVariant::Default,
-            "test_method",
-            Instant::now(),
+            hash,
+            Some(ResponseVariant::Default),
+            "m",
+            &result,
         );
-        assert!(result.is_none());
+        assert_eq!(cache.as_ref().unwrap().len(), 1);
+    }
+
+    /// A type-malformed `tracerConfig` on a config-reading builtin maps to `-32602 invalid
+    /// params` with the tracer's label and the serde error in the message; a valid config
+    /// passes the gate and yields a cacheable variant.
+    #[test]
+    fn invalid_tracer_config_maps_to_invalid_params() {
+        let opts: GethDebugTracingOptions = serde_json::from_value(serde_json::json!({
+            "tracer": "callTracer",
+            "tracerConfig": {"onlyTopCall": "yes-please"},
+        }))
+        .unwrap();
+        let err = classify_and_gate("test_method", &opts).unwrap_err();
+        assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+        assert!(
+            err.message().contains("invalid tracerConfig for call_tracer"),
+            "message: {}",
+            err.message(),
+        );
+
+        let opts: GethDebugTracingOptions = serde_json::from_value(serde_json::json!({
+            "tracer": "callTracer",
+            "tracerConfig": {"onlyTopCall": true},
+        }))
+        .unwrap();
+        assert!(classify_and_gate("test_method", &opts).unwrap().is_some());
     }
 
     #[test]

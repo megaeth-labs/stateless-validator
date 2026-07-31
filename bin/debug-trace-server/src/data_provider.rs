@@ -16,10 +16,11 @@
 //! - **Single-flight request coalescing**: concurrent callers for the same block hash share one
 //!   in-flight fetch via [`futures::future::Shared`]; the result is handed out as `Arc<BlockData>`
 //!   so the hot path is a refcount bump, not a deep clone.
-//! - **Single deadline per call**: every public entry point computes one wall-clock deadline from
-//!   `block_fetch_timeout` and threads it through the full pipeline (hash resolution, header,
-//!   witness, block, contracts). The witness stage gets a tighter sub-deadline for blocks at or
-//!   below the local tip. No more nested `tokio::time::timeout` wrappers.
+//! - **Single deadline per request**: the RPC handler mints one wall-clock deadline via
+//!   [`DataProvider::fetch_deadline`] and threads it through the full pipeline (tag resolution,
+//!   canonical-hash resolution, header, witness, block, contracts). The witness stage gets a
+//!   tighter sub-deadline for blocks at or below the local tip. No more nested
+//!   `tokio::time::timeout` wrappers.
 //! - **Contract bytecode resolution**: checks [`ContractCache`] (memory → redb), falls back to a
 //!   parallel + verified `RpcClient::get_codes_with_deadline` fetch on miss.
 //!
@@ -29,7 +30,10 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -38,6 +42,7 @@ use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag};
 use dashmap::DashMap;
 use futures::{FutureExt, future::Shared};
 use op_alloy_rpc_types::Transaction;
+use quick_cache::sync::Cache;
 use revm::state::Bytecode;
 use stateless_common::{CodeFetchError, RpcClient, RpcDeadlineExceeded, WitnessSizeBreakdown};
 use stateless_core::{
@@ -47,7 +52,11 @@ use stateless_db::ContractCache;
 use tracing::{debug, instrument, trace, warn};
 
 use crate::{
-    metrics::{ChainSyncMetrics, DataSourceMetrics, SingleFlightMetrics, WitnessSourceMetrics},
+    block_data_cache::BlockDataCache,
+    metrics::{
+        CacheStats, ChainSyncMetrics, DataSourceMetrics, SingleFlightMetrics, WitnessSourceMetrics,
+        record_canonical_hash_resolution,
+    },
     server_db::BlockStore,
 };
 
@@ -132,6 +141,43 @@ pub const DEFAULT_WITNESS_LOCAL_WINDOW: u64 = 4096;
 /// surfaces quickly instead of hanging. This is the full budget for one user-facing RPC
 /// request — every upstream fetch on the way to serving the response shares it.
 pub const DEFAULT_BLOCK_FETCH_TIMEOUT_SECS: u64 = 13;
+
+/// Default capacity (entries) of the in-memory canonical-hash memo. An entry is one
+/// `u64 → B256` binding (~80 bytes with cache overhead), and the memo fills lazily, so a
+/// generous cap costs nothing until a deep historical scan actually uses it — full, it
+/// covers a full-history crawl's working set many times over.
+pub const DEFAULT_CANONICAL_HASH_MEMO_CAPACITY: u64 = 8_000_000;
+
+/// Minimum depth below the observed tip before an upstream-resolved number → hash binding
+/// may be memoized. A memoized binding is served without re-checking upstream for as long
+/// as it stays cached, so this margin carries the memo's safety argument. The operating
+/// assumption it encodes: **reorgs on the target chain never run deeper than this** —
+/// less the slack the tip hint itself can carry after a reorg (see `tip_hint`), so the
+/// effective headroom is this constant minus the deepest reorg since startup. Shallow
+/// heights resolve upstream on every request instead.
+///
+/// In local-cache mode the assumption is additionally defended by hooks: the sync window
+/// answers every height it covers before the memo is consulted, and the chain-sync
+/// pipeline clears the memo on a stale reset and on any reorg at least this deep
+/// (`TraceHooks` in `chain_sync`). In stateless mode there is no pipeline and the margin
+/// alone is the argument — a deeper reorg would pin the orphaned hashes for the affected
+/// heights until the process restarts, with nothing to detect it.
+const CANONICAL_MEMO_MIN_DEPTH: u64 = 64;
+
+/// Minimum interval between upstream tip seeds (`eth_blockNumber`), fired when neither
+/// the tip hint nor the local window can decide whether a height is depth-final —
+/// without one, a numeric-only client in stateless mode would never raise the hint (a
+/// header cannot qualify its own height) and the memo would stay permanently empty. The
+/// throttle bounds the extra upstream call to one per interval across all requests;
+/// requests inside the window skip memoization for that round, and the resulting hint
+/// staleness only under-estimates (blocks becoming final meanwhile stay unmemoized a
+/// little longer), which is the safe direction.
+const TIP_SEED_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Cap on one tip seed's upstream wait, applied on top of the request's own deadline.
+/// The seed only enables future memoization — the caller's answer is already in hand —
+/// so a degraded upstream must not eat the request's remaining budget retrying it.
+const TIP_SEED_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Slow stage threshold: any individual stage exceeding this triggers a warn log.
 pub(crate) const SLOW_STAGE_THRESHOLD_MS: u128 = 1000;
@@ -252,8 +298,9 @@ impl Drop for InFlightGuard<'_> {
 /// Data provider with single-flight request coalescing.
 ///
 /// # Data Lookup Strategy
-/// 1. Check local database (if configured)
-/// 2. Fetch from remote RPC endpoints (multi-provider fallback handled by `RpcClient`)
+/// 1. Check the in-memory block-data cache (if enabled)
+/// 2. Check local database (if configured)
+/// 3. Fetch from remote RPC endpoints (multi-provider fallback handled by `RpcClient`)
 ///
 /// # Single-Flight Pattern
 /// When multiple requests arrive for the same block simultaneously, only one
@@ -263,6 +310,15 @@ pub(crate) struct DataProvider {
     rpc_client: Arc<RpcClient>,
     /// Optional local database for pre-fetched blocks (trait object).
     db: Option<Arc<dyn BlockStore>>,
+    /// Optional bounded in-memory cache of resolved block data, keyed by block hash.
+    /// Fronts both the DB tier (repeated redb reads + witness decodes) and the RPC tier;
+    /// its main beneficiaries are transaction-level requests, which are never
+    /// response-cached and cluster on shared blocks.
+    block_data_cache: Option<Arc<BlockDataCache>>,
+    /// Tip height memoized by the last DB-backed [`Self::record_block_distance`], so the
+    /// memory-tier hit path records its block distance without opening a redb read.
+    /// `u64::MAX` = no tip observed yet.
+    last_seen_db_tip: AtomicU64,
     /// In-memory contract bytecode cache backed by either `ServerDB` (local-cache mode)
     /// or [`NoopContractStore`] (stateless mode).
     /// Every contract read and every RPC-fetched contract goes through here, so
@@ -284,6 +340,63 @@ pub(crate) struct DataProvider {
     /// hot path is a refcount bump. The map holds the shared future's handle for the
     /// duration of the fetch; the primary task removes it after `.await` completes.
     in_flight: DashMap<B256, BlockDataFuture>,
+    /// Bounded in-memory memo of depth-final number → canonical-hash bindings, filled by
+    /// upstream resolutions for heights the sync window no longer (or never) covers.
+    /// Restart-cold by design: the first request per height after a restart pays one
+    /// upstream header fetch, and a stale entry cannot outlive the process. Shared with
+    /// the chain-sync hooks (see [`CanonicalHashMemo`]).
+    canonical_hash_memo: CanonicalHashMemo,
+    /// Monotonic maximum chain height observed from upstream answers (latest-tag
+    /// resolutions, verified headers, tip seeds) and the local window tip. Only real
+    /// on-chain numbers feed it, so it never exceeds the highest height ever seen as
+    /// canonical — but a reorg lowers the real tip while the hint stays put, so it can
+    /// overshoot the *current* tip by up to the reorg's depth. The memo gate's effective
+    /// margin is therefore [`CANONICAL_MEMO_MIN_DEPTH`] minus the deepest reorg since
+    /// startup; that is the precise form of the depth-finality claim.
+    tip_hint: AtomicU64,
+    /// Earliest instant the next upstream tip seed may fire. The lock's winner advances
+    /// it by [`TIP_SEED_MIN_INTERVAL`], so exactly one request per interval pays the
+    /// `eth_blockNumber` round-trip; it is only ever touched after the depth gate has
+    /// already failed, never on hit paths.
+    tip_seed_next: Mutex<Instant>,
+}
+
+/// Shared handle to the bounded number → canonical-hash memo. The chain-sync hooks hold a
+/// clone so pipeline events can invalidate memoized bindings alongside the response
+/// cache; the memo owns the reaction policy (see [`CANONICAL_MEMO_MIN_DEPTH`]), the
+/// hooks only forward the events.
+#[derive(Clone)]
+pub(crate) struct CanonicalHashMemo(Arc<Cache<u64, B256>>);
+
+impl CanonicalHashMemo {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self(Arc::new(Cache::new(capacity)))
+    }
+
+    pub(crate) fn get(&self, block_num: &u64) -> Option<B256> {
+        self.0.get(block_num)
+    }
+
+    pub(crate) fn insert(&self, block_num: u64, hash: B256) {
+        self.0.insert(block_num, hash);
+    }
+
+    /// Drops every memoized binding; they refill lazily at one header fetch per height.
+    pub(crate) fn clear(&self) {
+        self.0.clear();
+    }
+
+    /// Reorg reaction: a reorg at least [`CANONICAL_MEMO_MIN_DEPTH`] deep breaches the
+    /// margin every memoized binding relied on — some heights may now bind to orphaned
+    /// hashes, and once the sync window slides past them nothing else would ever correct
+    /// the binding — so the whole memo goes. Shallower reorgs cannot touch memoized
+    /// (depth-final) heights by construction and keep the memo intact.
+    pub(crate) fn on_reorg(&self, depth: u64) {
+        if depth >= CANONICAL_MEMO_MIN_DEPTH {
+            warn!(depth, "Deep reorg; clearing the canonical-hash memo");
+            self.0.clear();
+        }
+    }
 }
 
 impl DataProvider {
@@ -292,68 +405,219 @@ impl DataProvider {
     /// # Arguments
     /// * `rpc_client` - RPC client for upstream data fetching
     /// * `db` - Optional local database for cached block data
+    /// * `block_data_cache` - Optional in-memory cache of resolved block data
     /// * `contract_cache` - Shared in-memory contract cache (backed by the DB when present, or an
     ///   in-memory-only noop store in stateless mode)
     /// * `witness_cfg` - Witness-source routing window (by block age) and per-stage budgets
     /// * `block_fetch_timeout` - User-facing cap on the full block-fetch pipeline (header + witness
     ///   + block + contracts)
+    /// * `canonical_hash_memo_capacity` - Entry cap for the in-memory canonical-hash memo
     pub fn new(
         rpc_client: Arc<RpcClient>,
         db: Option<Arc<dyn BlockStore>>,
+        block_data_cache: Option<Arc<BlockDataCache>>,
         contract_cache: Arc<ContractCache>,
         witness_cfg: WitnessFetchConfig,
         block_fetch_timeout: Duration,
+        canonical_hash_memo_capacity: usize,
     ) -> Self {
         Self {
             rpc_client,
             db,
+            block_data_cache,
+            last_seen_db_tip: AtomicU64::new(u64::MAX),
             contract_cache,
             witness_cfg,
             block_fetch_timeout,
             in_flight: DashMap::new(),
+            canonical_hash_memo: CanonicalHashMemo::new(canonical_hash_memo_capacity),
+            tip_hint: AtomicU64::new(0),
+            tip_seed_next: Mutex::new(Instant::now()),
         }
     }
 
-    /// Gets block data by block number.
-    ///
-    /// Lookup order: local database -> RPC. A single wall-clock deadline (computed from
-    /// `block_fetch_timeout`) covers the entire call — resolving the hash from RPC, fetching
-    /// the block + witness, and resolving contract bytecodes all share this one budget.
-    pub async fn get_block_data(&self, block_num: u64) -> DataProviderResult<Arc<BlockData>> {
-        let deadline = Instant::now() + self.block_fetch_timeout;
+    /// Returns block-data cache statistics, or `None` when the cache is disabled.
+    pub fn block_data_cache_stats(&self) -> Option<CacheStats> {
+        self.block_data_cache.as_ref().map(|cache| cache.stats())
+    }
 
-        // Try to get block hash from local database first.
-        if let Some(db) = &self.db &&
-            let Ok(Some(hash)) = db.get_block_hash(block_num)
+    /// Drops a block from the memory cache after its data failed execution: a decodable but
+    /// incomplete witness would otherwise stay pinned, failing every retry until eviction —
+    /// dropping it lets the next request refetch from the endpoints. Returns whether an
+    /// entry was actually removed, so the caller can count real evictions.
+    pub fn evict_block_data(&self, block_hash: &B256) -> bool {
+        self.block_data_cache.as_ref().is_some_and(|cache| cache.remove(block_hash))
+    }
+
+    /// Clonable handle to the canonical-hash memo, for the chain-sync invalidation hooks.
+    pub(crate) fn canonical_hash_memo(&self) -> CanonicalHashMemo {
+        self.canonical_hash_memo.clone()
+    }
+
+    /// Folds an observed on-chain height into the monotonic tip hint.
+    fn observe_tip(&self, block_number: u64) {
+        self.tip_hint.fetch_max(block_number, Ordering::Relaxed);
+    }
+
+    /// Learns the current tip from upstream (`eth_blockNumber`) so the memo's depth gate
+    /// can decide, when neither the hint nor a local window tip could. Throttled to one
+    /// upstream call per [`TIP_SEED_MIN_INTERVAL`] and best-effort: throttled or failed
+    /// seeds just skip memoization for this round, costing one repeat header fetch later.
+    async fn seed_tip_from_upstream(&self, deadline: Instant) {
+        let now = Instant::now();
         {
-            return self.get_block_data_by_hash_inner(hash, deadline).await;
+            let mut next = self.tip_seed_next.lock().unwrap();
+            if now < *next {
+                return;
+            }
+            *next = now + TIP_SEED_MIN_INTERVAL;
         }
-
-        // Fall back to RPC. The deadline carries through to `get_block_data_by_hash_inner` so
-        // there is only ONE budget shared across hash resolution + the full pipeline.
-        let block_hash =
-            self.rpc_client.get_block_hash_with_deadline(block_num, Some(deadline)).await?;
-        self.get_block_data_by_hash_inner(block_hash, deadline).await
+        let deadline = deadline.min(now + TIP_SEED_TIMEOUT);
+        match self.rpc_client.get_latest_block_number_with_deadline(Some(deadline)).await {
+            Ok(tip) => {
+                record_canonical_hash_resolution("tip_seed", "ok");
+                self.observe_tip(tip);
+            }
+            Err(e) => {
+                record_canonical_hash_resolution("tip_seed", "error");
+                debug!(error = %e, "Upstream tip seed failed; skipping memoization this round");
+            }
+        }
     }
 
-    /// Gets block data by block hash with single-flight coalescing. One deadline for the
-    /// whole call; see [`Self::get_block_data`] for the semantics.
+    /// Mints the single wall-clock deadline for one user-facing request, from
+    /// `block_fetch_timeout`. Handlers call this once at entry and thread the result through
+    /// every stage (tag resolution, canonical-hash resolution, header, witness, block,
+    /// contracts) so the whole request shares ONE budget.
+    pub(crate) fn fetch_deadline(&self) -> Instant {
+        Instant::now() + self.block_fetch_timeout
+    }
+
+    /// Resolves a block number to its canonical block hash.
+    ///
+    /// This is what makes number-keyed requests safe to serve from the hash-keyed response
+    /// cache: the number → hash binding is resolved *before* the cache lookup, so a reorged
+    /// height resolves to the new hash and misses cleanly instead of serving a dead block.
+    ///
+    /// Lookup order: the bounded canonical window, then the in-memory memo of depth-final
+    /// bindings, then upstream `eth_getHeaderByNumber` on the shared `deadline`. A DB
+    /// read error is logged and falls through to the next tier rather than failing the
+    /// request.
+    ///
+    /// **Memoization**: an upstream-resolved header (fetched with `verify_hash = true`,
+    /// so its hash provably matches its content) is memoized — only when more than
+    /// [`CANONICAL_MEMO_MIN_DEPTH`] below the observed tip, where the binding can no
+    /// longer reorg — so repeat requests for historical heights resolve locally for the
+    /// lifetime of the process. Shallow and above-window heights resolve upstream every
+    /// time. When neither the hint nor a window tip can decide (stateless mode with
+    /// numeric-only traffic), a throttled `eth_blockNumber` seed learns the tip.
+    pub(crate) async fn resolve_canonical_hash(
+        &self,
+        block_num: u64,
+        deadline: Instant,
+    ) -> DataProviderResult<B256> {
+        if let Some(db) = &self.db {
+            match db.get_block_hash(block_num) {
+                Ok(Some(hash)) => {
+                    record_canonical_hash_resolution("db", "ok");
+                    return Ok(hash);
+                }
+                Ok(None) => record_canonical_hash_resolution("db", "miss"),
+                Err(e) => {
+                    record_canonical_hash_resolution("db", "error");
+                    warn!(
+                        block_number = block_num,
+                        error = %e,
+                        "Local canonical-hash read failed; trying the next tier",
+                    );
+                }
+            }
+        }
+        if let Some(hash) = self.canonical_hash_memo.get(&block_num) {
+            record_canonical_hash_resolution("memo", "ok");
+            return Ok(hash);
+        }
+        record_canonical_hash_resolution("memo", "miss");
+
+        let header = match self
+            .rpc_client
+            .get_header_with_deadline(
+                BlockId::Number(BlockNumberOrTag::Number(block_num)),
+                true,
+                Some(deadline),
+            )
+            .await
+        {
+            Ok(header) => {
+                record_canonical_hash_resolution("upstream", "ok");
+                header
+            }
+            Err(e) => {
+                record_canonical_hash_resolution("upstream", "error");
+                return Err(e.into());
+            }
+        };
+
+        // Memoize only depth-final heights. The tip hint never exceeds the highest height
+        // ever seen as canonical (see `tip_hint` for the reorg-slack caveat), so a gate
+        // that passes on it is final within the `CANONICAL_MEMO_MIN_DEPTH` assumption.
+        // When the hint alone cannot admit the height (typically just the first
+        // resolution after startup — a header can never qualify its own height), consult
+        // the sync window's tip; without one (stateless mode, or an empty window) fall
+        // back to a throttled upstream tip seed. A present-but-lagging window tip gets no
+        // seed: the window is that mode's authority, its lag is bounded by the
+        // stale-reset threshold, and skipped memoization is only ever a missed
+        // optimization.
+        self.observe_tip(header.number);
+        let gate = |hint: u64| block_num < hint.saturating_sub(CANONICAL_MEMO_MIN_DEPTH);
+        if !gate(self.tip_hint.load(Ordering::Relaxed)) {
+            match db_tip_height(self.db.as_deref()) {
+                Some(tip) => self.observe_tip(tip),
+                None => self.seed_tip_from_upstream(deadline).await,
+            }
+        }
+        if gate(self.tip_hint.load(Ordering::Relaxed)) {
+            self.canonical_hash_memo.insert(block_num, header.hash);
+        }
+        Ok(header.hash)
+    }
+
+    /// Gets block data by block hash with single-flight coalescing, minting its own
+    /// deadline. Entry point for callers without a shared budget; handlers that already
+    /// resolved a hash on a deadline use [`Self::get_block_data_by_hash_with_deadline`].
     pub async fn get_block_data_by_hash(
         &self,
         block_hash: B256,
     ) -> DataProviderResult<Arc<BlockData>> {
-        let deadline = Instant::now() + self.block_fetch_timeout;
-        self.get_block_data_by_hash_inner(block_hash, deadline).await
+        self.get_block_data_by_hash_with_deadline(block_hash, self.fetch_deadline()).await
     }
 
-    async fn get_block_data_by_hash_inner(
+    /// Gets block data by block hash with single-flight coalescing on the caller's
+    /// `deadline` — the tail of the shared per-request budget minted by
+    /// [`Self::fetch_deadline`].
+    pub(crate) async fn get_block_data_by_hash_with_deadline(
         &self,
         block_hash: B256,
         deadline: Instant,
     ) -> DataProviderResult<Arc<BlockData>> {
         let start = Instant::now();
 
-        // Try the local DB first. `Ok(None)` = "not in DB, fall through"; `Err(..)` surfaces
+        // Memory tier: a hit skips the DB read + witness decode entirely.
+        if let Some(cache) = &self.block_data_cache &&
+            let Some(data) = cache.get(&block_hash)
+        {
+            trace!(
+                block_hash = %block_hash,
+                source = "memory",
+                "Block data retrieved from memory cache"
+            );
+            DataSourceMetrics::new_for_source("memory").record();
+            SingleFlightMetrics::new_for_type("bypassed").record();
+            self.record_block_distance_cached(data.block.header.number);
+            return Ok(data);
+        }
+
+        // Try the local DB next. `Ok(None)` = "not in DB, fall through"; `Err(..)` surfaces
         // typed errors (e.g. a `Timeout` from contract resolution) so we don't then burn the
         // remaining deadline on an RPC call that is guaranteed to hit the same timeout.
         if let Some(db) = &self.db &&
@@ -369,7 +633,11 @@ impl DataProvider {
             DataSourceMetrics::new_for_source("db").record();
             SingleFlightMetrics::new_for_type("bypassed").record();
             self.record_block_distance(data.block.header.number);
-            return Ok(Arc::new(data));
+            let data = Arc::new(data);
+            if let Some(cache) = &self.block_data_cache {
+                cache.insert(block_hash, Arc::clone(&data));
+            }
+            return Ok(data);
         }
 
         // Fall back to RPC
@@ -399,7 +667,7 @@ impl DataProvider {
         tx_hash: B256,
     ) -> DataProviderResult<(Arc<BlockData>, usize)> {
         trace!(tx_hash = %tx_hash, "Looking up transaction");
-        let deadline = Instant::now() + self.block_fetch_timeout;
+        let deadline = self.fetch_deadline();
 
         // Fetch the transaction to find its block. The outer result is `Err(Deadline)`; the
         // inner is `Err` for "tx exists but has no block_hash" (pending) — classify explicitly
@@ -421,42 +689,63 @@ impl DataProvider {
             "Transaction located in block"
         );
 
-        let data = self.get_block_data_by_hash_inner(block_hash, deadline).await?;
+        let data = self.get_block_data_by_hash_with_deadline(block_hash, deadline).await?;
         Ok((data, tx_index))
     }
 
-    /// Resolves a block tag to a concrete block number.
+    /// Resolves a block tag to a concrete block number on the caller's `deadline`.
     ///
     /// Numeric tags are a pure local no-op. `Latest`, `Finalized`, and `Safe` must hit
     /// upstream to learn the tip — there is no cache key until we have a concrete number,
-    /// so falling back to the cache on upstream failure is not an option. These branches
-    /// are bounded by `block_fetch_timeout` so a stuck upstream surfaces as a typed
-    /// [`DataProviderError::Timeout`] rather than hanging the RPC caller forever.
-    pub async fn resolve_block_number(&self, tag: BlockNumberOrTag) -> DataProviderResult<u64> {
+    /// so falling back to the cache on upstream failure is not an option. The `deadline` is
+    /// the shared per-request budget from [`Self::fetch_deadline`], so a stuck upstream
+    /// surfaces as a typed [`DataProviderError::Timeout`] rather than hanging the RPC
+    /// caller forever — and tag resolution cannot double the request's total budget.
+    pub async fn resolve_block_number(
+        &self,
+        tag: BlockNumberOrTag,
+        deadline: Instant,
+    ) -> DataProviderResult<u64> {
         match tag {
             BlockNumberOrTag::Number(n) => Ok(n),
             BlockNumberOrTag::Earliest => Ok(0),
             BlockNumberOrTag::Pending => Err(eyre::eyre!("Pending block not supported").into()),
             BlockNumberOrTag::Latest => {
-                let deadline = Instant::now() + self.block_fetch_timeout;
-                Ok(self.rpc_client.get_latest_block_number_with_deadline(Some(deadline)).await?)
+                let number =
+                    self.rpc_client.get_latest_block_number_with_deadline(Some(deadline)).await?;
+                self.observe_tip(number);
+                Ok(number)
             }
             BlockNumberOrTag::Finalized | BlockNumberOrTag::Safe => {
-                let deadline = Instant::now() + self.block_fetch_timeout;
                 let header = self
                     .rpc_client
                     .get_header_with_deadline(BlockId::Number(tag), false, Some(deadline))
                     .await?;
+                self.observe_tip(header.number);
                 Ok(header.number)
             }
         }
     }
 
-    /// Records the distance of a requested block from the local chain tip.
+    /// Records the distance of a requested block from the local chain tip, memoizing the
+    /// tip for [`Self::record_block_distance_cached`].
     fn record_block_distance(&self, block_number: u64) {
         if let Some(tip) = db_tip_height(self.db.as_deref()) {
+            self.last_seen_db_tip.store(tip, Ordering::Relaxed);
             let distance = tip.saturating_sub(block_number);
             ChainSyncMetrics::create().record_block_distance(distance);
+        }
+    }
+
+    /// [`Self::record_block_distance`] against the memoized tip, for the memory-tier hit
+    /// path: a pure cache hit must not open a redb read just for this histogram. The memo
+    /// can lag the real tip by the blocks synced since the last DB-backed serve, which is
+    /// immaterial for a distance distribution; with no tip observed yet (stateless mode, or
+    /// no DB-backed serve so far) nothing is recorded, matching the DB-backed variant.
+    fn record_block_distance_cached(&self, block_number: u64) {
+        let tip = self.last_seen_db_tip.load(Ordering::Relaxed);
+        if tip != u64::MAX {
+            ChainSyncMetrics::create().record_block_distance(tip.saturating_sub(block_number));
         }
     }
 
@@ -555,8 +844,9 @@ impl DataProvider {
                 let db = self.db.clone();
                 let contract_cache = Arc::clone(&self.contract_cache);
                 let witness_cfg = self.witness_cfg;
+                let block_data_cache = self.block_data_cache.clone();
                 let fut: BlockDataFetchFuture = Box::pin(async move {
-                    do_fetch_block_data(
+                    let data = do_fetch_block_data(
                         rpc_client,
                         db,
                         contract_cache,
@@ -566,7 +856,14 @@ impl DataProvider {
                     )
                     .await
                     .map(Arc::new)
-                    .map_err(Arc::new)
+                    .map_err(Arc::new)?;
+                    // Inserting inside the shared future gives exactly one insert per fetch
+                    // and still runs when the primary caller is cancelled while a coalesced
+                    // waiter drives the future to completion.
+                    if let Some(cache) = &block_data_cache {
+                        cache.insert(block_hash, Arc::clone(&data));
+                    }
+                    Ok(data)
                 });
                 let shared = fut.shared();
                 vacant.insert(shared.clone());
@@ -907,6 +1204,42 @@ impl ContractStore for NoopContractStore {
     }
 }
 
+/// Test fixtures shared with the `rpc_service`, `block_data_cache`, and
+/// `tracing_executor` unit tests; the [`BlockStore`] stub lives in
+/// `server_db::test_support`, next to the trait.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use stateless_test_utils::fixtures::TestFixtures;
+
+    use super::*;
+
+    /// URL of a bound-but-never-answering listener, leaked so connects hang (instead of
+    /// failing fast) for the process lifetime.
+    pub(crate) fn hanging_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        std::mem::forget(listener);
+        url
+    }
+
+    /// An empty contract cache over the no-op store.
+    pub(crate) fn noop_contract_cache() -> Arc<ContractCache> {
+        Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>))
+    }
+
+    /// Builds a real [`BlockData`] (block, light witness, full fixture contract map) from
+    /// the synthetic fixture set.
+    pub(crate) fn fixture_block_data() -> BlockData {
+        let fixtures = TestFixtures::synthetic();
+        let (_, hash) = fixtures.paired_blocks().into_iter().next().expect("paired fixture");
+        let block = fixtures.blocks[&hash].clone();
+        let witness = LightWitness::from(&fixtures.salt_witnesses[&hash]);
+        let contracts: HashMap<B256, Bytecode> =
+            fixtures.contracts.iter().map(|(h, code)| (*h, code.clone())).collect();
+        BlockData { block, witness, contracts }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -914,7 +1247,42 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
 
+    use jsonrpsee::{RpcModule, server::ServerHandle, types::ErrorObjectOwned};
     use stateless_common::{BackoffPolicy, RpcClientConfig};
+
+    use crate::server_db::test_support::StubBlockStore;
+
+    /// Minimal self-consistent RPC `Header` for `number`: `hash` is the real `hash_slow()`
+    /// of the inner header, so `verify_hash = true` fetches accept it.
+    fn consistent_header(number: u64) -> alloy_rpc_types_eth::Header {
+        let inner = alloy_consensus::Header { number, ..Default::default() };
+        alloy_rpc_types_eth::Header { hash: inner.hash_slow(), inner, ..Default::default() }
+    }
+
+    /// Serves `eth_getHeaderByNumber` with a self-consistent header for any number, and
+    /// `eth_blockNumber` with `tip` — counting the latter's calls so tip-seed tests can
+    /// assert whether (and how often) the seed fired.
+    async fn start_mock_rpc(tip: u64) -> (ServerHandle, String, Arc<AtomicUsize>) {
+        let seed_hits = Arc::new(AtomicUsize::new(0));
+        let mut module = RpcModule::new(seed_hits.clone());
+        module
+            .register_method("eth_getHeaderByNumber", |params, _, _| {
+                let (hex,): (String,) = params.parse().unwrap();
+                let n = u64::from_str_radix(hex.strip_prefix("0x").unwrap_or(&hex), 16).unwrap();
+                Ok::<_, ErrorObjectOwned>(consistent_header(n))
+            })
+            .unwrap();
+        module
+            .register_method("eth_blockNumber", move |_params, seed_hits, _| {
+                seed_hits.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, ErrorObjectOwned>(format!("{tip:#x}"))
+            })
+            .unwrap();
+        let server =
+            jsonrpsee::server::ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        (server.start(module), url, seed_hits)
+    }
 
     use super::*;
 
@@ -1000,6 +1368,296 @@ mod tests {
             ..WitnessFetchConfig::with_defaults(1)
         };
         (rpc_client, cfg)
+    }
+
+    /// Builds a fixture `(block, witness)` pair plus a contract cache pre-loaded with every
+    /// code hash the witness references, so DB-served fetches never fall through to RPC.
+    fn fixture_block_and_cache() -> (Block<Transaction>, LightWitness, Arc<ContractCache>) {
+        let BlockData { block, witness, contracts } = test_support::fixture_block_data();
+        let contract_cache = test_support::noop_contract_cache();
+        let codes: Vec<(B256, Bytecode)> = crate::tracing_executor::extract_code_hashes(&witness)
+            .into_iter()
+            .map(|h| {
+                let code = contracts
+                    .get(&h)
+                    .cloned()
+                    .unwrap_or_else(|| Bytecode::new_raw(vec![0u8].into()));
+                (h, code)
+            })
+            .collect();
+        contract_cache.insert(&codes).unwrap();
+        (block, witness, contract_cache)
+    }
+
+    /// Provider over `url` with optional DB / memory-cache tiers and a caller-supplied
+    /// contract cache, using a fast-fail retry config (150 ms attempts, millisecond
+    /// backoff) and a 1 s fetch budget so hang tests stay fast.
+    fn provider_with_tiers(
+        url: &str,
+        db: Option<Arc<dyn BlockStore>>,
+        block_data_cache: Option<Arc<BlockDataCache>>,
+        contract_cache: Arc<ContractCache>,
+    ) -> DataProvider {
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
+            per_attempt_timeout: Duration::from_millis(150),
+            ..RpcClientConfig::trace_server()
+        };
+        let rpc_client =
+            Arc::new(RpcClient::new_with_config(&[url], &[url], config, None).unwrap());
+        DataProvider::new(
+            rpc_client,
+            db,
+            block_data_cache,
+            contract_cache,
+            WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
+            Duration::from_secs(1),
+            1024,
+        )
+    }
+
+    /// [`provider_with_tiers`] with no memory cache and an empty noop-backed contract
+    /// cache.
+    fn provider_with(url: &str, db: Option<Arc<dyn BlockStore>>) -> DataProvider {
+        provider_with_tiers(url, db, None, test_support::noop_contract_cache())
+    }
+
+    /// A DB-served block populates the memory cache: the second request for the same hash is
+    /// served from memory — no DB block read, and no fresh tip read for the block-distance
+    /// histogram — and shares the same allocation.
+    #[tokio::test]
+    async fn db_hit_populates_memory_cache_and_second_read_skips_db() {
+        let (block, witness, contract_cache) = fixture_block_and_cache();
+        let hash = block.header.hash;
+        let store = Arc::new(StubBlockStore {
+            canonical_tip: Some(block.header.number),
+            block_data: Some((block, witness)),
+            ..Default::default()
+        });
+        let cache = Arc::new(BlockDataCache::new(1024 * 1024 * 1024));
+        let provider = provider_with_tiers(
+            &test_support::hanging_url(),
+            Some(Arc::clone(&store) as Arc<dyn BlockStore>),
+            Some(Arc::clone(&cache)),
+            contract_cache,
+        );
+
+        let first = provider.get_block_data_by_hash(hash).await.expect("db-served fetch");
+        let second = provider.get_block_data_by_hash(hash).await.expect("memory-served fetch");
+
+        assert_eq!(
+            store.block_reads.load(Ordering::Relaxed),
+            1,
+            "second read must come from memory"
+        );
+        assert!(Arc::ptr_eq(&first, &second), "memory hits share the same allocation");
+        assert_eq!(cache.stats().hits, 1);
+        assert_eq!(
+            store.tip_reads.load(Ordering::Relaxed),
+            1,
+            "the memory hit must record its distance from the memoized tip, not a DB read"
+        );
+    }
+
+    /// A pre-seeded memory entry is served before DB and RPC: with a hanging upstream and no
+    /// DB, the request must return instantly instead of burning the block-fetch deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn memory_hit_short_circuits_before_db_and_rpc() {
+        let (block, witness, contract_cache) = fixture_block_and_cache();
+        let hash = block.header.hash;
+        let cache = Arc::new(BlockDataCache::new(1024 * 1024 * 1024));
+        cache.insert(hash, Arc::new(BlockData { block, witness, contracts: HashMap::default() }));
+        let provider =
+            provider_with_tiers(&test_support::hanging_url(), None, Some(cache), contract_cache);
+
+        let start = std::time::Instant::now();
+        let data = provider.get_block_data_by_hash(hash).await.expect("memory hit");
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "memory hit must not reach the hanging upstream"
+        );
+        assert_eq!(data.block.header.hash, hash);
+    }
+
+    /// With the memory cache disabled, every request re-reads the DB.
+    #[tokio::test]
+    async fn disabled_block_data_cache_reads_db_each_time() {
+        let (block, witness, contract_cache) = fixture_block_and_cache();
+        let hash = block.header.hash;
+        let store =
+            Arc::new(StubBlockStore { block_data: Some((block, witness)), ..Default::default() });
+        let provider = provider_with_tiers(
+            &test_support::hanging_url(),
+            Some(Arc::clone(&store) as Arc<dyn BlockStore>),
+            None,
+            contract_cache,
+        );
+
+        provider.get_block_data_by_hash(hash).await.expect("first db read");
+        provider.get_block_data_by_hash(hash).await.expect("second db read");
+        assert_eq!(store.block_reads.load(Ordering::Relaxed), 2);
+    }
+
+    /// [`provider_with`] over a [`StubBlockStore`] whose canonical window answers with
+    /// the given fixed hash.
+    fn provider_at(url: &str, db: Option<Option<B256>>) -> DataProvider {
+        provider_with(
+            url,
+            db.map(|hash| {
+                Arc::new(StubBlockStore { canonical_hash: hash, ..Default::default() })
+                    as Arc<dyn BlockStore>
+            }),
+        )
+    }
+
+    /// The local canonical index answers first: a DB hit never consults the upstream —
+    /// pinned by pointing the provider at a hanging listener that would eat the deadline.
+    #[tokio::test]
+    async fn resolve_canonical_hash_prefers_db_index() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let _listener = listener;
+
+        let h1 = B256::from([1u8; 32]);
+        let provider = provider_at(&url, Some(Some(h1)));
+        let deadline = Instant::now() + Duration::from_millis(300);
+        assert_eq!(provider.resolve_canonical_hash(7, deadline).await.unwrap(), h1);
+    }
+
+    /// Stateless mode (no DB) and local-cache mode with a DB miss both resolve the hash
+    /// upstream via `eth_getHeaderByNumber`, hash-verified — the mock serves
+    /// self-consistent headers.
+    #[tokio::test]
+    async fn resolve_canonical_hash_resolves_upstream_without_db_or_on_db_miss() {
+        let (handle, url, _seed_hits) = start_mock_rpc(1_000_000).await;
+
+        for db in [None, Some(None)] {
+            let provider = provider_at(&url, db);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            assert_eq!(
+                provider.resolve_canonical_hash(42, deadline).await.unwrap(),
+                consistent_header(42).hash
+            );
+        }
+        handle.stop().unwrap();
+    }
+
+    /// The memo: an upstream-resolved hash for a depth-final height below the canonical
+    /// window is memoized (the window itself untouched), so the next resolution needs no
+    /// upstream at all — pinned by stopping the mock server between resolves. A shallow
+    /// height (within the safety depth of the tip) is never memoized and must fail once
+    /// the upstream is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_canonical_hash_memoizes_depth_final_upstream_answers() {
+        use stateless_core::{ChainStore, DivergenceLookups};
+
+        use crate::server_db::test_support::make_block_meta;
+
+        let (handle, url, seed_hits) = start_mock_rpc(200).await;
+        let dir = tempfile::tempdir().unwrap();
+        let server_db =
+            Arc::new(crate::server_db::ServerDB::new(dir.path().join("t.redb")).unwrap());
+        // The anchor-init path installs the canonical window as a single row at {200}:
+        // height 42 is more than the safety depth below that tip, height 199 is not.
+        ChainStore::reset_to_anchor(&*server_db, &make_block_meta(200)).unwrap();
+
+        let provider = provider_with(&url, Some(Arc::clone(&server_db) as Arc<dyn BlockStore>));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let resolved = provider.resolve_canonical_hash(42, deadline).await.unwrap();
+        assert_eq!(resolved, consistent_header(42).hash);
+        let shallow = provider.resolve_canonical_hash(199, deadline).await.unwrap();
+        assert_eq!(shallow, consistent_header(199).hash);
+        assert_eq!(
+            ChainStore::get_block_hash(&*server_db, 42).unwrap(),
+            None,
+            "the canonical window must not be touched by memoization"
+        );
+        assert_eq!(DivergenceLookups::get_earliest(&*server_db).unwrap().unwrap().0, 200);
+        assert_eq!(
+            seed_hits.load(Ordering::Relaxed),
+            0,
+            "a present window tip must gate the memo without an upstream tip seed"
+        );
+
+        // With the upstream gone: the depth-final height serves from the memo; the
+        // shallow one must go upstream every time, and now fails.
+        handle.stop().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        assert_eq!(provider.resolve_canonical_hash(42, deadline).await.unwrap(), resolved);
+        let deadline = Instant::now() + Duration::from_millis(300);
+        assert!(provider.resolve_canonical_hash(199, deadline).await.is_err());
+    }
+
+    /// Stateless mode with numeric-only traffic: no `latest` lookup ever raises the tip
+    /// hint, so the first resolution must learn the tip itself — via the throttled
+    /// `eth_blockNumber` seed — for the memo to ever fill. Later depth-final heights are
+    /// admitted by the seeded hint and shallow heights stay unmemoized, both without a
+    /// second seed call (the throttle); pinned by the seed counter and by stopping the
+    /// upstream.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_canonical_hash_seeds_tip_for_stateless_numeric_traffic() {
+        let (handle, url, seed_hits) = start_mock_rpc(500).await;
+        let provider = provider_at(&url, None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        // Cold hint: height 42 alone cannot pass the gate, so the seed fires once and
+        // tip 500 admits it as depth-final.
+        let deep = provider.resolve_canonical_hash(42, deadline).await.unwrap();
+        assert_eq!(deep, consistent_header(42).hash);
+        assert_eq!(seed_hits.load(Ordering::Relaxed), 1, "cold hint must seed exactly once");
+
+        // 400 passes on the seeded hint (500 - 64 = 436); 450 fails the gate and its
+        // seed attempt lands inside the throttle window. Neither re-fetches the tip.
+        let mid = provider.resolve_canonical_hash(400, deadline).await.unwrap();
+        let shallow = provider.resolve_canonical_hash(450, deadline).await.unwrap();
+        assert_eq!(shallow, consistent_header(450).hash);
+        assert_eq!(seed_hits.load(Ordering::Relaxed), 1, "further seeds must be throttled");
+
+        // Upstream gone: both depth-final heights serve from the memo; the shallow one
+        // was never memoized and must fail upstream.
+        handle.stop().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        assert_eq!(provider.resolve_canonical_hash(42, deadline).await.unwrap(), deep);
+        assert_eq!(provider.resolve_canonical_hash(400, deadline).await.unwrap(), mid);
+        assert!(provider.resolve_canonical_hash(450, deadline).await.is_err());
+    }
+
+    /// The memo owns its reorg policy: reorgs shallower than the finality margin cannot
+    /// touch memoized (depth-final) heights and leave the memo intact; from the margin
+    /// on, the assumption every binding relied on is breached and everything goes.
+    #[test]
+    fn only_margin_deep_reorgs_clear_the_memo() {
+        let memo = CanonicalHashMemo::new(16);
+        memo.insert(42, B256::from([1u8; 32]));
+
+        memo.on_reorg(CANONICAL_MEMO_MIN_DEPTH - 1);
+        assert!(memo.get(&42).is_some(), "a sub-margin reorg must keep the memo");
+
+        memo.on_reorg(CANONICAL_MEMO_MIN_DEPTH);
+        assert!(memo.get(&42).is_none(), "a margin-deep reorg must clear the memo");
+    }
+
+    /// A hanging upstream surfaces as a typed `Timeout` bounded by the caller's deadline —
+    /// hash resolution shares the request budget and cannot hang the caller.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_canonical_hash_surfaces_timeout_when_upstream_hangs() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let _listener = listener;
+
+        let provider = provider_at(&url, None);
+        let start = Instant::now();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let err = provider.resolve_canonical_hash(42, deadline).await.unwrap_err();
+        assert!(
+            matches!(err, DataProviderError::Timeout { stage: TimeoutStage::Block, .. }),
+            "expected Timeout{{Block}}, got: {err:?}",
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "deadline must bound the hang; elapsed: {:?}",
+            start.elapsed(),
+        );
     }
 
     /// End-to-end routing dispatch through `fetch_witness`: a historical block must never
@@ -1127,25 +1785,12 @@ mod tests {
     async fn get_block_data_surfaces_timeout_when_upstream_hangs() {
         // Bind to a real port that accepts but never responds — forces the RPC call to hang.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let url = format!("http://{addr}/");
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let _listener = listener;
 
-        let rpc_client = Arc::new(
-            RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
-                .unwrap(),
-        );
-        let contract_cache =
-            Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
-        let provider = DataProvider::new(
-            rpc_client,
-            None,
-            contract_cache,
-            WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
-            Duration::from_secs(1),
-        );
-
+        let provider = provider_at(&url, None);
         let start = std::time::Instant::now();
-        let result = provider.get_block_data(42).await;
+        let result = provider.get_block_data_by_hash(B256::from([0x42; 32])).await;
         let elapsed = start.elapsed();
 
         let err = match result {
@@ -1164,33 +1809,21 @@ mod tests {
         );
     }
 
-    /// Tag-resolution branches (`Latest`/`Finalized`/`Safe`) must be deadline-bounded.
-    /// Before this was wired, `resolve_block_number("latest")` would call the non-deadline
-    /// `get_latest_block_number` / `get_header` helpers and retry the upstream forever,
-    /// hanging the RPC caller on a stuck endpoint.
+    /// Tag-resolution branches (`Latest`/`Finalized`/`Safe`) must be bounded by the
+    /// caller's deadline rather than retrying a stuck upstream forever.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resolve_block_number_surfaces_timeout_when_upstream_hangs() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{addr}/");
+        let _listener = listener;
 
-        let rpc_client = Arc::new(
-            RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
-                .unwrap(),
-        );
-        let contract_cache =
-            Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
-        let provider = DataProvider::new(
-            rpc_client,
-            None,
-            contract_cache,
-            WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
-            Duration::from_secs(1),
-        );
+        let provider = provider_at(&url, None);
 
         for tag in [BlockNumberOrTag::Latest, BlockNumberOrTag::Finalized, BlockNumberOrTag::Safe] {
             let start = std::time::Instant::now();
-            let result = provider.resolve_block_number(tag).await;
+            let deadline = Instant::now() + Duration::from_millis(300);
+            let result = provider.resolve_block_number(tag, deadline).await;
             let elapsed = start.elapsed();
 
             let err = match result {
@@ -1224,15 +1857,15 @@ mod tests {
             RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::trace_server(), None)
                 .unwrap(),
         );
-        let contract_cache =
-            Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>));
         // Generous deadline so the task is cancelled *by us*, not by the deadline firing.
         let provider = Arc::new(DataProvider::new(
             rpc_client,
             None,
-            contract_cache,
+            None,
+            test_support::noop_contract_cache(),
             WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
             Duration::from_secs(60),
+            1024,
         ));
 
         let block_hash = B256::from([0xAB; 32]);

@@ -68,7 +68,7 @@ Scenario-specific storage lives in the owning binary rather than in core: genesi
 The pipeline owns the reorg seams: `DivergenceLookups` (the bisection contract) and `ReorgResolver` (which decides the rollback floor) live in `stateless-core::pipeline`.
 
 - **`ANCHOR_BLOCK`** — Trusted starting point (block number, hash, state root, withdrawals root).
-- **`CANONICAL_CHAIN`** — Validated chain progression (block number → hash, state root, withdrawals root).
+- **`CANONICAL_CHAIN`** — Validated chain progression (block number → hash, state root, withdrawals root); a bounded contiguous window in both binaries, and exactly what reorg bisection trusts.
 - **`CONTRACTS`** — Persistent tier of the contract bytecode cache (code hash → bincode+lz4 bytecode). The in-memory tier is the bounded `ContractCache` on top.
 - **`GENESIS_CONFIG`** — Hardfork activation rules (validator only).
 - **`BLOCK_DATA`** — Full block content (trace server only).
@@ -107,6 +107,12 @@ Two operating modes:
 - **Local cache mode** — With `data_dir`, enables chain sync to pre-fetch blocks into `ValidatorDB` for faster serving.
 
 The server includes an HTTP response cache (`quick_cache`) for pre-serialized JSON and a `DataProvider` with single-flight request coalescing.
+The response cache is keyed by `(resource, block hash, typed tracer variant)`; by-number handlers resolve number → canonical hash before the lookup (local `CANONICAL_CHAIN` first, upstream fallback).
+It only stores idempotent request shapes: the five built-in tracers (keyed by their parsed typed `tracerConfig`) and the bare default struct-logger request; JS tracers, `muxTracer`, and struct-logger requests with non-default flags bypass it entirely, and a type-malformed `tracerConfig` on call/prestate/flatCall is rejected with `-32602`.
+Canonical-hash resolution reads the bounded `CANONICAL_CHAIN` window first (local cache mode), then a bounded in-memory memo of upstream-resolved bindings (`--canonical-hash-memo-capacity`; only depth-final heights are memoized, so a memoized binding can no longer reorg), and only then upstream — so historical heights resolve locally after first touch within a process lifetime.
+The memo's depth gate learns the tip from the window and `latest`-tag lookups, falling back to a throttled upstream `eth_blockNumber` seed (stateless mode with numeric-only traffic); chain sync clears the memo on stale resets and on reorgs at least the safety depth deep.
+Below the response cache, a bounded in-memory `BlockData` cache keyed by block hash (`--block-data-cache-max-size`, default 1GB, 0 disables) fronts the DB and RPC tiers; block-number lookups resolve number → hash before touching it, so canonicality is never cached and it needs no reorg invalidation.
+The cache pins 4 shards (largest cacheable entry = `max_bytes / 4` on any host), counts non-retained inserts, and drops an entry when a trace fails for a data-attributable reason (`TraceError::Data` — bad witness) while request-attributable failures (invalid tracer configs) never evict.
 In local cache mode with a `--witness-generator-endpoint` plus at least one fallback `--witness-endpoint`, request-serving witness fetches route by block age: blocks at least `--witness-local-window` blocks below the local tip skip the generator (which prunes beyond its `BACKUP` window) and fetch from the fallbacks; without the generator flag, witness endpoints are plain failover and routing is disabled.
 The background chain-sync prefetch routes by freshness against the last observed remote head: frontier-fresh blocks give the generator a short exclusive grace (its "witness not found" means "not generated yet" — fallbacks are fed by the same pipeline and cannot be ahead) before falling back to the full endpoint chain, while deep catch-up blocks use the full chain from the first attempt.
 
@@ -126,6 +132,7 @@ The background chain-sync prefetch routes by freshness against the last observed
 | `bin/debug-trace-server/src/chain_sync.rs`                                                     | TraceFetcher, TraceProcessor, TraceHooks                                             |
 | `bin/debug-trace-server/src/rpc_service.rs`                                                    | RPC method definitions and handlers                                                  |
 | `bin/debug-trace-server/src/data_provider.rs`                                                  | Block data fetching with single-flight coalescing                                    |
+| `bin/debug-trace-server/src/block_data_cache.rs`                                               | Bounded in-memory `BlockData` cache keyed by block hash                              |
 | `bin/debug-trace-server/src/server_db.rs`                                                      | Defines + implements the bin-local `BlockStore` trait (backed by `stateless-db`)     |
 
 ## Test Organization

@@ -59,6 +59,8 @@ pub const TIMED_METHOD_ALIASES: &[(&str, &str)] = &[
 pub const CACHE_TYPE_DEBUG_TRACE: &str = "debug_trace_block";
 /// Cache type for parity trace block responses.
 pub const CACHE_TYPE_TRACE: &str = "trace_block";
+/// Cache type for the in-memory block-data cache.
+pub const CACHE_TYPE_BLOCK_DATA: &str = "block_data";
 
 // All known RPC methods (for resolving &str → &'static str)
 const ALL_METHODS: &[&str] = &[
@@ -169,7 +171,7 @@ impl CpuTimeMetrics {
     }
 }
 
-/// Response cache metrics with cache type label.
+/// Cache hit/miss/size metrics with cache type label, shared by every cache tier.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
 pub struct CacheMetrics {
@@ -181,6 +183,10 @@ pub struct CacheMetrics {
     cache_entries: Gauge,
     /// Current cache data size in bytes
     cache_bytes: Gauge,
+    /// Inserts that were not retained by the cache (rejected at admission or immediately
+    /// evicted), so silent non-admission is distinguishable from ordinary misses; may
+    /// include rare false positives from a concurrent eviction racing the retention check
+    cache_admission_rejects_total: Counter,
 }
 
 impl CacheMetrics {
@@ -199,6 +205,11 @@ impl CacheMetrics {
         self.cache_misses_total.increment(1);
     }
 
+    /// Records an insert the cache did not retain.
+    pub fn record_admission_reject(&self) {
+        self.cache_admission_rejects_total.increment(1);
+    }
+
     /// Sets the current cache size.
     pub fn set_size(&self, entry_count: usize, data_bytes: usize) {
         self.cache_entries.set(entry_count as f64);
@@ -206,10 +217,55 @@ impl CacheMetrics {
     }
 }
 
-/// Tracks which source provided block data. Sources: `cache`, `db`, and the two RPC witness
-/// routes — `witness_generator` (full endpoint chain, generator first) and
-/// `witness_historical` (skip-generator chain for blocks at least the local window below the
-/// tip). The RPC path as a whole is the sum of the two witness labels.
+/// Counts block-data cache entries dropped after a data-attributable trace failure,
+/// labelled by the RPC method that observed the failure. A sustained rate points at an
+/// upstream serving bad witnesses (or at eviction misclassification).
+#[derive(Clone, Metrics)]
+#[metrics(scope = "debug_trace")]
+pub struct BlockDataEvictionMetrics {
+    /// Total block-data cache evictions triggered by trace failures
+    block_data_evictions_total: Counter,
+}
+
+impl BlockDataEvictionMetrics {
+    /// Creates metrics for a specific RPC method.
+    pub fn new_for_method(method: &'static str) -> Self {
+        Self::new_with_labels(&[("method", method)])
+    }
+
+    /// Records one eviction.
+    pub fn record(&self) {
+        self.block_data_evictions_total.increment(1);
+    }
+}
+
+/// Point-in-time counter snapshot of a cache, the query-side counterpart of
+/// [`CacheMetrics`]; shared by the response cache and the block-data cache.
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+    /// Number of entries in cache.
+    pub entry_count: u64,
+    /// Total bytes cached.
+    pub total_bytes: u64,
+    /// Number of cache hits.
+    pub hits: u64,
+    /// Number of cache misses.
+    pub misses: u64,
+}
+
+impl CacheStats {
+    /// Returns the cache hit rate as a percentage.
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 { 0.0 } else { (self.hits as f64 / total as f64) * 100.0 }
+    }
+}
+
+/// Tracks which source provided block data. Sources: `cache` (HTTP response cache),
+/// `memory` (in-memory block-data cache), `db`, and the two RPC witness routes —
+/// `witness_generator` (full endpoint chain, generator first) and `witness_historical`
+/// (skip-generator chain for blocks at least the local window below the tip). The RPC path
+/// as a whole is the sum of the two witness labels.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
 pub struct DataSourceMetrics {
@@ -276,6 +332,44 @@ fn record_upstream_attempt(
 /// Records one logical upstream call giving up because its overall deadline elapsed.
 fn record_upstream_deadline_exceeded(method: &'static str) {
     counter!(UPSTREAM_DEADLINE_EXCEEDED_TOTAL, "method" => method).increment(1);
+}
+
+/// Request parameter-shape counter, labeled `(method, shape)` — the first-hand answer to
+/// "which tracer shapes does production actually send", and how often the non-cacheable
+/// shapes bypass the response cache.
+const REQUEST_SHAPE_TOTAL: &str = "debug_trace_request_shape_total";
+
+/// Every label emitted by `RequestShape::label`, for pre-registration and tests.
+pub const REQUEST_SHAPES: &[&str] = &[
+    "default",
+    "call_tracer",
+    "prestate_tracer",
+    "four_byte_tracer",
+    "noop_tracer",
+    "flat_call_tracer",
+    "struct_logger_config",
+    "js_tracer",
+    "mux_tracer",
+];
+
+/// Records one request of the given parameter shape for `method`.
+pub fn record_request_shape(method: &'static str, shape: &'static str) {
+    counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => shape).increment(1);
+}
+
+/// Canonical number → hash resolution counter, labeled `(source, outcome)` — how often
+/// by-number requests resolve their canonical hash from the local DB index vs upstream,
+/// and how often resolution misses or fails.
+const CANONICAL_HASH_RESOLUTION_TOTAL: &str = "debug_trace_canonical_hash_resolution_total";
+
+/// Records one canonical-hash resolution attempt against `source` (`"db"` | `"memo"` |
+/// `"upstream"`) with `outcome` (`"ok"` | `"miss"` | `"error"`; the in-memory memo cannot
+/// error, and upstream has no miss — a missing block is an error from the retry loop).
+/// `source = "tip_seed"` (`"ok"` | `"error"`) counts the throttled `eth_blockNumber`
+/// fetches that teach the memo's depth gate the tip when no other tip source exists.
+pub fn record_canonical_hash_resolution(source: &'static str, outcome: &'static str) {
+    counter!(CANONICAL_HASH_RESOLUTION_TOTAL, "source" => source, "outcome" => outcome)
+        .increment(1);
 }
 
 /// Witness fetch metrics by source.
@@ -348,6 +442,10 @@ pub struct ChainSyncMetrics {
     block_distance_from_tip: Histogram,
     /// Earliest block number in validator DB
     db_earliest_block: Gauge,
+    /// Earliest block number with a stored body + witness. Tracks `db_earliest_block`
+    /// (pruning removes bodies and chain rows together) but can differ transiently, e.g.
+    /// chain rows advanced whose bodies were never stored
+    db_body_earliest_block: Gauge,
     /// Latest block number in validator DB
     db_latest_block: Gauge,
     /// Database file size in bytes
@@ -381,6 +479,11 @@ impl ChainSyncMetrics {
     pub fn set_db_block_range(&self, earliest: u64, latest: u64) {
         self.db_earliest_block.set(earliest as f64);
         self.db_latest_block.set(latest as f64);
+    }
+
+    /// Sets the earliest block that still has a stored body (the body-retention edge).
+    pub fn set_db_body_earliest_block(&self, earliest: u64) {
+        self.db_body_earliest_block.set(earliest as f64);
     }
 
     /// Sets the database file size in bytes.
@@ -419,9 +522,16 @@ fn pre_register_all_metrics() {
     // Cache Layer
     let _ = CacheMetrics::new_for_cache(CACHE_TYPE_DEBUG_TRACE);
     let _ = CacheMetrics::new_for_cache(CACHE_TYPE_TRACE);
+    let _ = CacheMetrics::new_for_cache(CACHE_TYPE_BLOCK_DATA);
+    let _ = BlockDataEvictionMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
+    let _ = BlockDataEvictionMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
+    let _ = BlockDataEvictionMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION);
+    let _ = BlockDataEvictionMetrics::new_for_method(METHOD_TRACE_BLOCK);
+    let _ = BlockDataEvictionMetrics::new_for_method(METHOD_TRACE_TRANSACTION);
 
     // Data Fetch Layer: data source
     let _ = DataSourceMetrics::new_for_source("cache");
+    let _ = DataSourceMetrics::new_for_source("memory");
     let _ = DataSourceMetrics::new_for_source("db");
     let _ = DataSourceMetrics::new_for_source("witness_generator");
     let _ = DataSourceMetrics::new_for_source("witness_historical");
@@ -439,6 +549,33 @@ fn pre_register_all_metrics() {
         ["eth_getHeaderByHash", "eth_getBlockByHash", "mega_getWitness", "eth_getCodeByHash"]
     {
         counter!(UPSTREAM_DEADLINE_EXCEEDED_TOTAL, "method" => method).increment(0);
+    }
+
+    // Request Layer: parameter shapes (per opts-taking method)
+    for method in [
+        METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+        METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
+        METHOD_DEBUG_TRACE_TRANSACTION,
+    ] {
+        for shape in REQUEST_SHAPES {
+            counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => *shape).increment(0);
+        }
+    }
+
+    // Data Fetch Layer: canonical number → hash resolution
+    for (source, outcome) in [
+        ("db", "ok"),
+        ("db", "miss"),
+        ("db", "error"),
+        ("memo", "ok"),
+        ("memo", "miss"),
+        ("upstream", "ok"),
+        ("upstream", "error"),
+        ("tip_seed", "ok"),
+        ("tip_seed", "error"),
+    ] {
+        counter!(CANONICAL_HASH_RESOLUTION_TOTAL, "source" => source, "outcome" => outcome)
+            .increment(0);
     }
 
     // Witness Layer
