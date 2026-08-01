@@ -221,8 +221,7 @@ impl R2WitnessClient {
         // self-imposed, and folded in it would masquerade as R2 slowness.
         let mut queue_wait = Duration::ZERO;
         let key = keys::block_object_key(number, hash);
-        let max_backoff_ms = self.retry_backoff.max.as_millis() as u64;
-        let mut backoff_ms = self.retry_backoff.initial.as_millis() as u64;
+        let mut backoff = self.retry_backoff.schedule();
         let mut attempt = 0usize;
 
         let bytes = loop {
@@ -242,18 +241,15 @@ impl R2WitnessClient {
                         return Err(e);
                     }
                     metrics::on_r2_witness_retry();
-                    // Jittered doubling, mirroring the RPC retry loop: jitter keeps parallel
-                    // validators (several typically slice a block range) from retrying in
-                    // lockstep through a shared R2 brownout, and `.max(1)` keeps a
-                    // zero-duration policy from busy-looping.
-                    let jitter_ms = fastrand::u64(0..=backoff_ms / 2);
-                    let sleep_ms = (backoff_ms + jitter_ms).min(max_backoff_ms).max(1);
+                    // The shared jittered-doubling schedule (`BackoffPolicy::schedule`): jitter
+                    // keeps parallel validators (several typically slice a block range) from
+                    // retrying in lockstep through a shared R2 brownout.
+                    let sleep_ms = backoff.next_sleep_ms();
                     warn!(
                         number, %key, attempt, sleep_ms, error = %e,
                         "R2 witness GET failed, backing off",
                     );
                     tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
-                    backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
                 }
             }
         };

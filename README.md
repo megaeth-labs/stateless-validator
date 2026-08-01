@@ -257,7 +257,7 @@ The pipeline is configured via `PipelineConfig` and customized through trait imp
 | `crates/stateless-common/src/metrics.rs`                                                       | `RpcMethod`, `RpcMetrics`, `RpcClientConfig`                                                                |
 | `crates/stateless-common/src/witness_size.rs`                                                  | `WitnessSizeBreakdown` + `estimate_witness_size` for RPC and trace-server metrics                           |
 | `crates/stateless-test-utils/src/fixtures.rs`                                                  | `TestFixtures` loader (blocks, SALT/MPT witnesses, contracts, genesis)                                      |
-| `bin/stateless-validator/src/{main,app,workers,chain_sync,validator_db,metrics}.rs`            | Thin entry, CLI/startup wiring, pipeline+reporter, fetcher/processor, DB                                    |
+| `bin/stateless-validator/src/{main,app,runner,chain_sync,validator_db,metrics}.rs`            | Thin entry, CLI/startup wiring, pipeline+reporter, fetcher/processor, DB                                    |
 | `bin/debug-trace-server/src/chain_sync.rs`                                                     | `TraceFetcher`, `TraceProcessor`, `TraceHooks`                                                              |
 | `bin/debug-trace-server/src/rpc_service.rs`                                                    | RPC method definitions and handlers                                                                         |
 | `bin/debug-trace-server/src/data_provider.rs`                                                  | Block data fetching with single-flight coalescing                                                           |

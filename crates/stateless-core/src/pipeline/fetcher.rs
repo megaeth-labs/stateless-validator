@@ -14,17 +14,17 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 use crate::pipeline::{config::PipelineConfig, traits::BlockFetcher};
 
 /// Invariant: every block in `[base_block, next_block)` is in exactly one of
-/// `in_flight_blocks`, `sent`, or `failed`. All mutations go through the methods below.
+/// `task_to_block` (in flight), `sent`, or `failed`. All mutations go through the methods below.
 struct FetcherState<F: BlockFetcher> {
     /// Lowest block not yet sent downstream.
     base_block: u64,
     /// Next block to spawn fresh.
     next_block: u64,
     tasks: JoinSet<(u64, Result<F::Output>)>,
-    /// Task id → block, for panic recovery (`JoinError` only carries the id).
+    /// Task id → block, for panic recovery (`JoinError` only carries the id) and
+    /// block-in-flight lookups (`recover_gaps` scans the values; the set is bounded by
+    /// `max_in_flight`, so a linear scan is negligible next to the awaited fetches).
     task_to_block: HashMap<Id, u64>,
-    /// Mirror of `task_to_block.values()` for O(1) block-in-flight lookup.
-    in_flight_blocks: HashSet<u64>,
     /// Successful blocks, waiting for `base_block` to catch up.
     sent: HashSet<u64>,
     /// Blocks awaiting retry. The RPC client retries transient errors internally, so failures
@@ -42,7 +42,6 @@ impl<F: BlockFetcher> FetcherState<F> {
             next_block: start_block,
             tasks: JoinSet::new(),
             task_to_block: HashMap::new(),
-            in_flight_blocks: HashSet::new(),
             sent: HashSet::new(),
             failed: HashSet::new(),
         }
@@ -75,7 +74,6 @@ impl<F: BlockFetcher> FetcherState<F> {
         let handle =
             self.tasks.spawn(async move { (bn, fetcher.fetch(bn).await) }.instrument(span));
         self.task_to_block.insert(handle.id(), bn);
-        self.in_flight_blocks.insert(bn);
     }
 
     fn spawn_next(&mut self, fetcher: &Arc<F>) {
@@ -93,21 +91,18 @@ impl<F: BlockFetcher> FetcherState<F> {
 
     fn on_success(&mut self, id: Id, bn: u64) {
         self.task_to_block.remove(&id);
-        self.in_flight_blocks.remove(&bn);
         self.sent.insert(bn);
     }
 
     fn on_failure(&mut self, id: Id, bn: u64) {
         self.task_to_block.remove(&id);
-        self.in_flight_blocks.remove(&bn);
         self.failed.insert(bn);
     }
 
     /// Re-enqueues the panicked task's block. Returns `None` if the id is unknown
-    /// (shouldn't happen — would leak the block from `in_flight_blocks`).
+    /// (shouldn't happen — `recover_gaps` would pick the block up).
     fn on_panic(&mut self, id: Id) -> Option<u64> {
         let bn = self.task_to_block.remove(&id)?;
-        self.in_flight_blocks.remove(&bn);
         self.failed.insert(bn);
         Some(bn)
     }
@@ -129,8 +124,8 @@ impl<F: BlockFetcher> FetcherState<F> {
         let mut recovered = 0;
         for bn in self.base_block..self.next_block {
             if !self.sent.contains(&bn) &&
-                !self.in_flight_blocks.contains(&bn) &&
-                !self.failed.contains(&bn)
+                !self.failed.contains(&bn) &&
+                !self.task_to_block.values().any(|&in_flight| in_flight == bn)
             {
                 self.failed.insert(bn);
                 recovered += 1;
@@ -344,12 +339,11 @@ mod tests {
     async fn on_failure_re_enqueues_for_immediate_retry() {
         let mut state = FetcherState::<StubFetcher>::new(100);
         let id = fresh_task_id(&mut state.tasks, 100).await;
-        state.in_flight_blocks.insert(100);
         state.task_to_block.insert(id, 100);
 
         state.on_failure(id, 100);
         assert!(state.failed.contains(&100));
-        assert!(!state.in_flight_blocks.contains(&100));
+        assert!(!state.task_to_block.contains_key(&id));
 
         assert_eq!(state.pop_failed(), Some(100));
         assert!(!state.failed.contains(&100));
@@ -382,7 +376,8 @@ mod tests {
         let mut state = FetcherState::<StubFetcher>::new(100);
         state.next_block = 103;
         state.sent.insert(100);
-        state.in_flight_blocks.insert(101);
+        let id = fresh_task_id(&mut state.tasks, 101).await;
+        state.task_to_block.insert(id, 101);
         state.failed.insert(102);
 
         assert_eq!(state.recover_gaps(), 0);
@@ -395,13 +390,11 @@ mod tests {
     async fn on_panic_re_enqueues_known_task() {
         let mut state = FetcherState::<StubFetcher>::new(100);
         let id = fresh_task_id(&mut state.tasks, 100).await;
-        state.in_flight_blocks.insert(100);
         state.task_to_block.insert(id, 100);
 
         let bn = state.on_panic(id);
         assert_eq!(bn, Some(100));
         assert!(state.failed.contains(&100));
-        assert!(!state.in_flight_blocks.contains(&100));
         assert!(!state.task_to_block.contains_key(&id));
     }
 

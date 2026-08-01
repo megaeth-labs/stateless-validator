@@ -93,8 +93,8 @@ where
 
         let outcome = chain_advancer(
             &*fetcher,
-            &*store,
-            &*hooks,
+            store.clone(),
+            hooks.clone(),
             &resolver,
             result_rx,
             initial_tip,
@@ -105,7 +105,7 @@ where
         fetcher_shutdown.cancel();
         await_handles(fetcher_handle, worker_handles, config.await_handles_timeout).await;
 
-        let transient_reason: String = match outcome {
+        match outcome {
             Ok(PipelineOutcome::Shutdown) => {
                 info!("Shutting down");
                 return Ok(());
@@ -129,27 +129,16 @@ where
             }
             Ok(PipelineOutcome::Retry(msg)) => {
                 warn!(reason = %msg, "Cycle ended with retry signal");
-                msg
             }
             Err(e) => {
                 // Any `Err` at this level is unexpected (every intentional transient/fatal
                 // case returns `Ok(PipelineOutcome::..)`). Log and fall into the same
                 // stale-detect + sleep + continue recovery path as `Retry`.
                 error!(error = %e, "Cycle ended with unexpected error");
-                e.to_string()
             }
-        };
+        }
 
-        if handle_transient_restart(
-            transient_reason,
-            &*fetcher,
-            &*store,
-            &*hooks,
-            &config,
-            &shutdown,
-        )
-        .await?
-        {
+        if handle_transient_restart(&*fetcher, &*store, &*hooks, &config, &shutdown).await? {
             return Ok(());
         }
     }
@@ -162,7 +151,6 @@ where
 /// returns `Ok(false)` so the outer loop `continue`s. Propagates `Err` only for store /
 /// hook failures the caller can't meaningfully recover from.
 async fn handle_transient_restart<F, S, H>(
-    _reason: String,
     fetcher: &F,
     store: &S,
     hooks: &H,

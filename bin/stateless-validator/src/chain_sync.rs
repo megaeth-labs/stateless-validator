@@ -4,7 +4,7 @@
 //! [`ValidatorHooks`] (metrics integration) for the shared pipeline in
 //! [`stateless_core::pipeline::run_pipeline`].
 
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, BlockId};
@@ -15,7 +15,7 @@ use salt::SaltWitness;
 use stateless_common::{CodeFetchError, RpcClient};
 use stateless_core::{
     chain_spec::ChainSpec,
-    data_types::iter_code_hashes,
+    data_types::collect_code_hashes,
     db::BlockMeta,
     executor::validate_block,
     pipeline::{BlockFetcher, BlockProcessor, ErrorAction, PipelineHooks, ProcessedBlock},
@@ -36,7 +36,6 @@ pub struct ValidatorFetcher {
     pub rpc_client: Arc<RpcClient>,
     /// `Some` ⇒ fetch witnesses directly from R2; `None` ⇒ RPC.
     pub r2_witness: Option<Arc<R2WitnessClient>>,
-    pub on_remote_height: fn(u64),
 }
 
 impl BlockFetcher for ValidatorFetcher {
@@ -63,7 +62,7 @@ impl BlockFetcher for ValidatorFetcher {
 
     async fn latest_block_number(&self) -> Result<u64> {
         let n = self.rpc_client.get_latest_block_number().await;
-        (self.on_remote_height)(n);
+        metrics::set_remote_chain_height(n);
         Ok(n)
     }
 
@@ -73,12 +72,7 @@ impl BlockFetcher for ValidatorFetcher {
 
     async fn latest_block_meta(&self) -> Result<BlockMeta> {
         let header = self.rpc_client.get_header(BlockId::latest(), false).await;
-        Ok(BlockMeta {
-            block_number: header.number,
-            block_hash: header.hash,
-            post_state_root: header.state_root,
-            post_withdrawals_root: header.withdrawals_root.unwrap_or_default(),
-        })
+        Ok(BlockMeta::from_header(&header))
     }
 }
 
@@ -186,8 +180,7 @@ impl BlockProcessor for ValidatorProcessor {
 
         // Resolve contract codes via the shared three-tier chain. Memory/disk hits
         // are trusted; the RPC tier verifies each bytecode's hash inside `get_codes`.
-        let codehashes: Vec<B256> =
-            iter_code_hashes(&task.salt_witness.kvs).collect::<HashSet<_>>().into_iter().collect();
+        let codehashes: Vec<B256> = collect_code_hashes(&task.salt_witness.kvs);
         let (mut contracts, missing_contracts) = self
             .contract_cache
             .get(&codehashes)
@@ -241,7 +234,6 @@ impl BlockProcessor for ValidatorProcessor {
                 task.salt_witness,
                 task.mpt_witness,
                 &contracts,
-                None,
             )
         })
         .await
@@ -313,15 +305,7 @@ mod tests {
     use stateless_core::pipeline::ProcessedBlock;
 
     use super::*;
-
-    fn make_block_meta(num: u64) -> BlockMeta {
-        BlockMeta {
-            block_number: num,
-            block_hash: BlockHash::from([num as u8; 32]),
-            post_state_root: B256::from([(num.wrapping_add(100)) as u8; 32]),
-            post_withdrawals_root: B256::from([(num.wrapping_add(200)) as u8; 32]),
-        }
-    }
+    use crate::test_support::make_block_meta;
 
     #[test]
     fn test_verify_continuity_success() {

@@ -1,9 +1,34 @@
 //! RPC metrics types shared by both binaries.
 //!
-//! Provides [`RpcMethod`] for identifying RPC calls and [`RpcMetrics`] as a
-//! callback trait for tracking RPC performance.
+//! Provides [`RpcMethod`] for identifying RPC calls, [`RpcMetrics`] as a
+//! callback trait for tracking RPC performance, and the shared Prometheus
+//! exporter installer ([`install_prometheus_exporter`]).
+
+use std::net::SocketAddr;
+
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 
 use crate::witness_size::WitnessSizeBreakdown;
+
+/// Installs the Prometheus exporter with an HTTP listener on `addr`, applying the given
+/// per-metric histogram buckets (`(metric_name, buckets)` pairs) before install.
+///
+/// Shared by both binaries; each keeps its own metric names, descriptions, and
+/// pre-registration after this returns.
+pub fn install_prometheus_exporter(
+    addr: SocketAddr,
+    bucket_specs: &[(&str, &[f64])],
+) -> eyre::Result<()> {
+    let builder = bucket_specs.iter().fold(PrometheusBuilder::new(), |b, &(name, buckets)| {
+        b.set_buckets_for_metric(Matcher::Full(name.to_owned()), buckets)
+            .expect("valid bucket config")
+    });
+
+    builder
+        .with_http_listener(addr)
+        .install()
+        .map_err(|e| eyre::eyre!("Failed to install Prometheus exporter: {e}"))
+}
 
 /// Byte-size histogram buckets: 1 KB, 10 KB, 50 KB, 200 KB, 1 MB, 5 MB, 20 MB.
 pub const BYTE_BUCKETS: &[f64] =

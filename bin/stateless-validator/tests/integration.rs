@@ -233,10 +233,46 @@ impl MockServerState {
             reject_reports: Arc::default(),
         }
     }
+
+    /// Fixture block for a `0x…` hex block number, or the RPC error the handlers return
+    /// for unknown blocks. Shared by the by-number block and header handlers.
+    fn block_by_number_hex(
+        &self,
+        hex_number: &str,
+    ) -> Result<&Block<op_alloy_rpc_types::Transaction>, ErrorObject<'static>> {
+        let block_number =
+            u64::from_str_radix(hex_number.trim_start_matches("0x"), 16).unwrap_or(0);
+        self.fixtures
+            .block_numbers
+            .get(&block_number)
+            .and_then(|hash| self.fixtures.blocks.get(hash))
+            .ok_or_else(|| {
+                make_rpc_error(
+                    CALL_EXECUTION_FAILED_CODE,
+                    format!("Block {block_number} not found"),
+                )
+            })
+    }
+
+    /// Fixture block for a block hash, or the RPC error the handlers return for unknown
+    /// blocks. Shared by the by-hash block and header handlers.
+    fn block_by_hash(
+        &self,
+        hash: B256,
+    ) -> Result<&Block<op_alloy_rpc_types::Transaction>, ErrorObject<'static>> {
+        self.fixtures.blocks.get(&BlockHash::from(hash.0)).ok_or_else(|| {
+            make_rpc_error(CALL_EXECUTION_FAILED_CODE, format!("Block {hash} not found"))
+        })
+    }
 }
 
 fn make_rpc_error(code: i32, msg: String) -> ErrorObject<'static> {
     ErrorObject::owned(code, msg, None::<()>)
+}
+
+/// Invalid-params RPC error for a failed `params.parse()`.
+fn invalid_params(e: impl std::fmt::Display) -> ErrorObject<'static> {
+    make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
 }
 
 fn shape_block(
@@ -284,39 +320,17 @@ async fn setup_mock_rpc_server(
 
     module
         .register_method("eth_getBlockByNumber", |params, ctx, _| {
-            let (hex_number, full_block): (String, bool) = params
-                .parse()
-                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
-            let block_number = u64::from_str_radix(&hex_number[2..], 16).unwrap_or(0);
-
-            let block = ctx
-                .fixtures
-                .block_numbers
-                .get(&block_number)
-                .and_then(|hash| ctx.fixtures.blocks.get(hash))
-                .ok_or_else(|| {
-                    make_rpc_error(
-                        CALL_EXECUTION_FAILED_CODE,
-                        format!("Block {block_number} not found"),
-                    )
-                })?;
-
+            let (hex_number, full_block): (String, bool) =
+                params.parse().map_err(invalid_params)?;
+            let block = ctx.block_by_number_hex(&hex_number)?;
             Ok::<_, ErrorObject<'static>>(shape_block(block, full_block))
         })
         .unwrap();
 
     module
         .register_method("eth_getBlockByHash", |params, ctx, _| {
-            let (hash, full_block): (B256, bool) = params
-                .parse()
-                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
-
-            let block_hash = BlockHash::from(hash.0);
-            let block = ctx.fixtures.blocks.get(&block_hash).ok_or_else(|| {
-                make_rpc_error(CALL_EXECUTION_FAILED_CODE, format!("Block {hash} not found"))
-            })?;
-
-            Ok::<_, ErrorObject<'static>>(shape_block(block, full_block))
+            let (hash, full_block): (B256, bool) = params.parse().map_err(invalid_params)?;
+            Ok::<_, ErrorObject<'static>>(shape_block(ctx.block_by_hash(hash)?, full_block))
         })
         .unwrap();
 
@@ -329,45 +343,21 @@ async fn setup_mock_rpc_server(
 
     module
         .register_method("eth_getHeaderByNumber", |params, ctx, _| {
-            let (hex_number,): (String,) = params.parse().unwrap();
-            let block_number = u64::from_str_radix(&hex_number[2..], 16).unwrap_or(0);
-
-            let block = ctx
-                .fixtures
-                .block_numbers
-                .get(&block_number)
-                .and_then(|hash| ctx.fixtures.blocks.get(hash))
-                .ok_or_else(|| {
-                    make_rpc_error(
-                        CALL_EXECUTION_FAILED_CODE,
-                        format!("Block {block_number} not found"),
-                    )
-                })?;
-
-            Ok::<_, ErrorObject<'static>>(block.header.clone())
+            let (hex_number,): (String,) = params.parse().map_err(invalid_params)?;
+            Ok::<_, ErrorObject<'static>>(ctx.block_by_number_hex(&hex_number)?.header.clone())
         })
         .unwrap();
 
     module
         .register_method("eth_getHeaderByHash", |params, ctx, _| {
-            let (hash,): (B256,) = params
-                .parse()
-                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
-
-            let block_hash = BlockHash::from(hash.0);
-            let block = ctx.fixtures.blocks.get(&block_hash).ok_or_else(|| {
-                make_rpc_error(CALL_EXECUTION_FAILED_CODE, format!("Block {hash} not found"))
-            })?;
-
-            Ok::<_, ErrorObject<'static>>(block.header.clone())
+            let (hash,): (B256,) = params.parse().map_err(invalid_params)?;
+            Ok::<_, ErrorObject<'static>>(ctx.block_by_hash(hash)?.header.clone())
         })
         .unwrap();
 
     module
         .register_method("eth_getCodeByHash", |params, ctx, _| {
-            let (hash,): (B256,) = params
-                .parse()
-                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
+            let (hash,): (B256,) = params.parse().map_err(invalid_params)?;
 
             let code = ctx.fixtures.contracts.get(&hash).cloned().unwrap_or_default();
             Ok::<_, ErrorObject<'static>>(code.original_bytes())
@@ -376,9 +366,7 @@ async fn setup_mock_rpc_server(
 
     module
         .register_method("mega_getBlockWitness", |params, ctx, _| {
-            let (keys,): (WitnessRequestKeys,) = params
-                .parse()
-                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
+            let (keys,): (WitnessRequestKeys,) = params.parse().map_err(invalid_params)?;
             let block_hash = BlockHash::from(keys.block_hash.0);
 
             let salt_witness =
@@ -461,11 +449,7 @@ async fn integration_test() {
     let config = Arc::new(cfg);
 
     let shutdown = CancellationToken::new();
-    let fetcher = Arc::new(ValidatorFetcher {
-        rpc_client: client.clone(),
-        r2_witness: None,
-        on_remote_height: |_| {},
-    });
+    let fetcher = Arc::new(ValidatorFetcher { rpc_client: client.clone(), r2_witness: None });
     let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
     let hooks = Arc::new(ValidatorHooks);
 
@@ -533,7 +517,7 @@ async fn run_end_block_slice(
         Arc::clone(&validator_db),
         contract_cache,
         chain_spec,
-        Some(url.clone()),
+        true,
         cfg,
     )
     .await;

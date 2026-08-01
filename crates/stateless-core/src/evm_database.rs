@@ -5,9 +5,9 @@
 //! validation.
 
 use std::{
+    collections::BTreeMap,
     format,
     string::{String, ToString},
-    vec::Vec,
 };
 
 use alloy_consensus::Header;
@@ -78,10 +78,16 @@ where
     W: StateReader,
     W::Error: core::fmt::Display,
 {
-    /// Get value from witness for the given plain key
-    fn plain_value(&self, plain_key: &[u8]) -> Result<Option<Vec<u8>>, WitnessDatabaseError> {
+    /// Get the witness entry for the given plain key.
+    ///
+    /// Returns the whole `SaltValue` (an inline array) instead of going through salt's
+    /// `plain_value()`, which heap-allocates a copy of the value bytes on every read —
+    /// this lookup runs once per unique account/slot touched during block replay.
+    /// Callers decode from `.value()` in place.
+    fn find(&self, plain_key: &[u8]) -> Result<Option<SaltValue>, WitnessDatabaseError> {
         EphemeralSaltState::new(self.witness)
-            .plain_value(plain_key)
+            .find(plain_key)
+            .map(|found| found.map(|(_, salt_value)| salt_value))
             .map_err(|e| WitnessDatabaseError(e.to_string()))
     }
 }
@@ -97,9 +103,9 @@ where
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         trace!(?address, "basic_ref");
 
-        let raw_value = self.plain_value(&PlainKey::Account(address).encode())?;
+        let salt_value = self.find(PlainKey::account_key_bytes(&address))?;
 
-        match raw_value.and_then(|v| match PlainValue::decode(&v) {
+        match salt_value.and_then(|v| match PlainValue::decode(v.value()) {
             PlainValue::Account(acc) => Some(acc),
             _ => None,
         }) {
@@ -133,10 +139,11 @@ where
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
         trace!(?address, index = %format_args!("{:#x}", index), "storage_ref");
 
-        let raw_value = self.plain_value(&PlainKey::Storage(address, index.into()).encode())?;
+        let salt_value =
+            self.find(PlainKey::storage_key_bytes(address, index.into()).as_slice())?;
 
-        Ok(raw_value
-            .and_then(|v| match PlainValue::decode(&v) {
+        Ok(salt_value
+            .and_then(|v| match PlainValue::decode(v.value()) {
                 PlainValue::Storage(value) => Some(value),
                 _ => None,
             })
@@ -225,8 +232,16 @@ impl WitnessExternalEnv {
         salt_witness: &SaltWitness,
         block_number: BlockNumber,
     ) -> Result<Self, WitnessDatabaseError> {
-        let bucket_capacities = salt_witness
-            .kvs
+        Self::from_metadata_kvs(&salt_witness.kvs, block_number)
+    }
+
+    /// Shared constructor body: scans the metadata key range of a witness's `kvs` map and
+    /// collects the bucket capacities (both witness types expose the same map layout).
+    fn from_metadata_kvs(
+        kvs: &BTreeMap<SaltKey, Option<SaltValue>>,
+        block_number: BlockNumber,
+    ) -> Result<Self, WitnessDatabaseError> {
+        let bucket_capacities = kvs
             .range(METADATA_KEYS_RANGE)
             .map(|(key, value)| Self::parse_metadata_entry(key, value))
             .collect::<Result<HashMap<_, _>, _>>()?;
@@ -260,13 +275,7 @@ impl WitnessExternalEnv {
         light_witness: &LightWitness,
         block_number: BlockNumber,
     ) -> Result<Self, WitnessDatabaseError> {
-        let bucket_capacities = light_witness
-            .kvs
-            .range(METADATA_KEYS_RANGE)
-            .map(|(key, value)| Self::parse_metadata_entry(key, value))
-            .collect::<Result<HashMap<_, _>, _>>()?;
-
-        Ok(Self { block_number, bucket_capacities })
+        Self::from_metadata_kvs(&light_witness.kvs, block_number)
     }
 }
 
@@ -295,11 +304,11 @@ impl SaltEnv for WitnessExternalEnv {
     }
 
     fn bucket_id_for_account(account: Address) -> BucketId {
-        hasher::bucket_id(&PlainKey::Account(account).encode())
+        hasher::bucket_id(PlainKey::account_key_bytes(&account))
     }
 
     fn bucket_id_for_slot(address: Address, key: U256) -> BucketId {
-        hasher::bucket_id(&PlainKey::Storage(address, key.into()).encode())
+        hasher::bucket_id(PlainKey::storage_key_bytes(address, key.into()).as_slice())
     }
 }
 

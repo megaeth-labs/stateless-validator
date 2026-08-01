@@ -15,9 +15,6 @@ use mega_evm::{
 use reth_ethereum_forks::ChainHardforks;
 use reth_optimism_chainspec::OpChainSpec;
 
-/// Default blob gas price update fraction for Cancun (from EIP-4844)
-pub const BLOB_GASPRICE_UPDATE_FRACTION: u64 = 3338477;
-
 /// Chain specification for the Optimism network.
 ///
 /// Defines when various Ethereum and Optimism hardforks are activated.
@@ -74,10 +71,8 @@ impl ChainSpec {
     /// Ordering rules:
     /// - [`OpChainSpec`] already yields Optimism/Ethereum hardforks in the correct order, so they
     ///   do not require reordering.
-    /// - MegaETH hardforks are extracted from the genesis `extra_fields` and explicitly ordered to
-    ///   match the canonical sequence defined by [`mega_mainnet_hardforks()`]. Any remaining,
-    ///   unknown MegaETH hardforks are preserved and appended after the known ones so nothing is
-    ///   dropped.
+    /// - MegaETH hardforks are extracted from the genesis `extra_fields`;
+    ///   [`MegaethGenesisHardforks::into_vec`] yields them in canonical activation order.
     /// - The MegaETH set is then merged with the Optimism/Ethereum set to build a single
     ///   [`ChainHardforks`] that drives fork activation.
     ///
@@ -120,7 +115,7 @@ impl ChainSpec {
             );
         }
 
-        let mut megaeth_hardforks = megaeth_hardforks.into_vec();
+        let megaeth_hardforks = megaeth_hardforks.into_vec();
 
         // Rex5 SequencerRegistry bootstrap, required iff `rex5Time` is scheduled. Parsed from
         // the same flat schema mega-reth uses (`rex5InitialSequencer` / `rex5InitialAdmin` as
@@ -167,20 +162,9 @@ impl ChainSpec {
             .map(|(f, b)| (dyn_clone::clone_box(f), b))
             .collect();
 
-        let hardfork_order = mega_mainnet_hardforks();
-        let mut all_hardforks = Vec::with_capacity(op_hardforks.len() + megaeth_hardforks.len());
-        for (order, _) in hardfork_order.forks_iter() {
-            if let Some(mega_hardfork_index) =
-                megaeth_hardforks.iter().position(|(hardfork, _)| **hardfork == *order)
-            {
-                all_hardforks.push(megaeth_hardforks.remove(mega_hardfork_index));
-            }
-        }
-
-        // append the remaining unknown hardforks to ensure we don't filter any out
-        all_hardforks.append(&mut megaeth_hardforks);
-
-        // we merge megaeth_hardforks with op_hardforks
+        // `into_vec` yields the MegaETH hardforks already in canonical activation order,
+        // so the merge is a straight concatenation.
+        let mut all_hardforks = megaeth_hardforks;
         all_hardforks.append(&mut op_hardforks);
 
         Self {
@@ -227,6 +211,10 @@ impl MegaethGenesisHardforks {
     }
 
     /// Convert the MegaETH genesis hardforks into a vector of hardforks and their conditions.
+    ///
+    /// The literal below is the single source of the canonical MegaETH activation order —
+    /// [`ChainSpec::from_genesis`] merges it as-is, so new hardforks must be inserted at
+    /// their activation position.
     pub fn into_vec(self) -> Vec<(Box<dyn Hardfork>, ForkCondition)> {
         vec![
             (MegaHardfork::MiniRex.boxed(), self.mini_rex_time.map(ForkCondition::Timestamp)),
@@ -301,22 +289,6 @@ impl MegaethGenesisSequencerRegistryRex6Config {
     pub fn into_config(self) -> SequencerRegistryRex6Config {
         SequencerRegistryRex6Config { rex6_min_rotation_delay: self.rex6_min_rotation_delay }
     }
-}
-
-/// Build a fresh `ChainHardforks` describing MegaETH's canonical hardfork sequence.
-pub fn mega_mainnet_hardforks() -> ChainHardforks {
-    ChainHardforks::new(vec![
-        (MegaHardfork::MiniRex.boxed(), ForkCondition::Timestamp(0)),
-        (MegaHardfork::MiniRex1.boxed(), ForkCondition::Timestamp(0)),
-        (MegaHardfork::MiniRex2.boxed(), ForkCondition::Timestamp(0)),
-        (MegaHardfork::Rex.boxed(), ForkCondition::Timestamp(0)),
-        (MegaHardfork::Rex1.boxed(), ForkCondition::Timestamp(0)),
-        (MegaHardfork::Rex2.boxed(), ForkCondition::Timestamp(0)),
-        (MegaHardfork::Rex3.boxed(), ForkCondition::Timestamp(0)),
-        (MegaHardfork::Rex4.boxed(), ForkCondition::Timestamp(0)),
-        (MegaHardfork::Rex5.boxed(), ForkCondition::Timestamp(0)),
-        (MegaHardfork::Rex6.boxed(), ForkCondition::Timestamp(0)),
-    ])
 }
 
 #[cfg(test)]

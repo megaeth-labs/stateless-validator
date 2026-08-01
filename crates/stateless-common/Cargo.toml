@@ -35,6 +35,7 @@ clap.workspace = true
 eyre.workspace = true
 fastrand = { workspace = true, features = ["std"] }
 futures.workspace = true
+metrics-exporter-prometheus.workspace = true
 # Enables gzip/brotli on alloy-provider's reqwest 0.12 (Cargo feature unification) for witness/data fetches; not referenced in code.
 reqwest = { workspace = true, features = ["gzip", "brotli"] }
 rolling-file.workspace = true
