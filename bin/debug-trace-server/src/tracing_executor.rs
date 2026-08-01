@@ -40,9 +40,7 @@ use alloy_rpc_types_trace::{
     parity::LocalizedTransactionTrace,
 };
 use eyre::Result;
-use mega_evm::{
-    BlockLimits, MegaBlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory, MegaHardforks,
-};
+use mega_evm::{MegaBlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory};
 use op_alloy_network::TransactionResponse;
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use revm::{
@@ -58,7 +56,7 @@ use revm_inspectors::tracing::{
 use stateless_core::{
     chain_spec::ChainSpec,
     evm_database::{WitnessDatabase, WitnessExternalEnv},
-    executor::{ValidationError, create_evm_env},
+    executor::{ValidationError, create_block_execution_env},
     light_witness::{LightWitness, LightWitnessExecutor},
 };
 use tracing::{instrument, trace, warn};
@@ -126,29 +124,11 @@ impl<'a> TracingEnv<'a> {
             .map_err(ValidationError::EnvOracleConstructionFailed)?;
 
         let light_witness_executor = LightWitnessExecutor::from(light_witness);
-        let evm_env = create_evm_env(&block.header.inner, chain_spec);
 
-        let evm_factory = MegaEvmFactory::new().with_external_env_factory(ext_env);
-        let executor_factory = MegaBlockExecutorFactory::new(
-            chain_spec.clone(),
-            evm_factory,
-            OpAlloyReceiptBuilder::default(),
-        );
-
-        let hardfork = chain_spec.hardfork(block.header.timestamp);
-        let block_limits = if let Some(hardfork) = hardfork {
-            BlockLimits::from_hardfork_and_block_gas_limit(hardfork, block.header.gas_limit)
-        } else {
-            BlockLimits::no_limits()
-        };
-
-        // Use actual extra_data (contains system transactions) to match validator behavior.
-        let block_ctx = MegaBlockExecutionCtx::new(
-            block.header.parent_hash,
-            block.header.parent_beacon_block_root,
-            block.header.extra_data.clone(),
-            block_limits,
-        );
+        // Shared with `replay_block`: the same env, factory, hardfork → limits mapping, and
+        // extra_data (system transactions) the validator executes with.
+        let (evm_env, executor_factory, block_ctx) =
+            create_block_execution_env(chain_spec, &block.header.inner, ext_env);
 
         Ok(Self {
             header: &block.header.inner,

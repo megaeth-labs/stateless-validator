@@ -282,6 +282,47 @@ pub fn create_evm_env(
     EvmEnv::new(cfg_env, block_env)
 }
 
+/// Builds the full mega-evm execution environment for one block: the [`EvmEnv`], the block
+/// executor factory, and the execution context carrying the hardfork-derived [`BlockLimits`].
+///
+/// This is the single home of the hardfork → limits mapping, shared by [`replay_block`] and
+/// the debug-trace-server's tracing executor, so validation and tracing cannot drift apart.
+/// Without an active MegaETH hardfork the limits fall back to unlimited *except* the header's
+/// own gas limit — execution enforces the block's declared gas ceiling either way.
+pub fn create_block_execution_env<ENV>(
+    chain_spec: &ChainSpec,
+    header: &alloy_consensus::Header,
+    ext_env: ENV,
+) -> (
+    EvmEnv<MegaSpecId>,
+    MegaBlockExecutorFactory<ChainSpec, MegaEvmFactory<ENV>, OpAlloyReceiptBuilder>,
+    MegaBlockExecutionCtx,
+)
+where
+    ENV: ExternalEnvFactory + Clone,
+{
+    let evm_env = create_evm_env(header, chain_spec);
+    let executor_factory = MegaBlockExecutorFactory::new(
+        chain_spec.clone(),
+        MegaEvmFactory::new().with_external_env_factory(ext_env),
+        OpAlloyReceiptBuilder::default(),
+    );
+
+    let block_limits = if let Some(hardfork) = chain_spec.hardfork(header.timestamp) {
+        BlockLimits::from_hardfork_and_block_gas_limit(hardfork, header.gas_limit)
+    } else {
+        BlockLimits::no_limits().with_block_gas_limit(header.gas_limit)
+    };
+    let execution_context = MegaBlockExecutionCtx::new(
+        header.parent_hash,
+        header.parent_beacon_block_root,
+        header.extra_data.clone(),
+        block_limits,
+    );
+
+    (evm_env, executor_factory, execution_context)
+}
+
 /// Minimal projection of a block that [`replay_block`] / [`validate_block`] need: the consensus
 /// header (every execution/validation field lives there), the block hash (diagnostics only), and
 /// the recovered `(transaction, sender)` pairs.
@@ -383,33 +424,14 @@ where
 
     // Setup execution environment
     let mut state = StateBuilder::new().with_database_ref(db).with_bundle_update().build();
-    let evm_env = create_evm_env(header, chain_spec);
-
-    let executor_factory = MegaBlockExecutorFactory::new(
-        chain_spec.clone(),
-        MegaEvmFactory::new().with_external_env_factory(env_oracle),
-        OpAlloyReceiptBuilder::default(),
-    );
-
-    let hardfork = chain_spec.hardfork(header.timestamp);
     debug!(
         block_number = header.number,
         block_hash = ?block.block_hash(),
-        hardfork = ?hardfork,
+        hardfork = ?chain_spec.hardfork(header.timestamp),
         "Replay block"
     );
-    let block_limits = if let Some(hardfork) = hardfork {
-        BlockLimits::from_hardfork_and_block_gas_limit(hardfork, header.gas_limit)
-    } else {
-        BlockLimits::no_limits().with_block_gas_limit(header.gas_limit)
-    };
-
-    let execution_context = MegaBlockExecutionCtx::new(
-        header.parent_hash,
-        header.parent_beacon_block_root,
-        header.extra_data.clone(),
-        block_limits,
-    );
+    let (evm_env, executor_factory, execution_context) =
+        create_block_execution_env(chain_spec, header, env_oracle);
 
     let executor = executor_factory.create_executor(&mut state, execution_context, evm_env);
     let (receipts_root, logs_bloom, gas_used) =
@@ -851,6 +873,51 @@ mod tests {
         hash: B256,
     ) -> Result<ValidationStats, ValidationError> {
         validate_block(&chain_spec(), block, salt_witness, fx.mpt_witness(&hash), &fx.contracts)
+    }
+
+    /// Empty-witness external env for tests that only exercise environment assembly.
+    fn empty_ext_env(block_number: u64) -> WitnessExternalEnv {
+        let witness = crate::LightWitness { kvs: Default::default(), levels: Default::default() };
+        WitnessExternalEnv::from_light_witness(&witness, block_number).unwrap()
+    }
+
+    /// Without an active MegaETH hardfork, `create_block_execution_env` must still cap
+    /// execution by the header's own gas limit (everything else unlimited). The trace server
+    /// once drifted to fully-unlimited on this branch; both binaries now share this mapping.
+    #[test]
+    fn execution_env_no_hardfork_fallback_caps_block_gas() {
+        let header =
+            alloy_consensus::Header { gas_limit: 12_345, ..alloy_consensus::Header::default() };
+        // `ChainSpec::default()` schedules no hardforks → the fallback branch.
+        let (_, _, ctx) = create_block_execution_env(
+            &ChainSpec::default(),
+            &header,
+            empty_ext_env(header.number),
+        );
+        assert_eq!(
+            ctx.block_limits,
+            BlockLimits::no_limits().with_block_gas_limit(12_345),
+            "fallback limits must be unlimited except the header's own gas limit",
+        );
+    }
+
+    /// With an active hardfork, the limits must be exactly the hardfork-derived set.
+    #[test]
+    fn execution_env_uses_hardfork_limits_when_active() {
+        let spec = chain_spec();
+        // Far-future timestamp: every hardfork scheduled by the fixture genesis is active.
+        let header = alloy_consensus::Header {
+            timestamp: u64::MAX,
+            gas_limit: 30_000_000,
+            ..alloy_consensus::Header::default()
+        };
+        let hardfork =
+            spec.hardfork(header.timestamp).expect("fixture genesis schedules hardforks");
+        let (_, _, ctx) = create_block_execution_env(&spec, &header, empty_ext_env(header.number));
+        assert_eq!(
+            ctx.block_limits,
+            BlockLimits::from_hardfork_and_block_gas_limit(hardfork, header.gas_limit),
+        );
     }
 
     /// The fixture witness for `hash` with the first byte of one witnessed (non-metadata)
