@@ -34,10 +34,12 @@ use alloy_rpc_types_trace::geth::{
     GethDefaultTracingOptions, PreStateConfig,
 };
 use quick_cache::{Lifecycle, Weighter, sync::Cache};
-use serde_json::value::RawValue;
 use tracing::debug;
 
-use crate::metrics::{CACHE_TYPE_DEBUG_TRACE, CACHE_TYPE_TRACE, CacheMetrics, CacheStats};
+use crate::{
+    metrics::{CACHE_TYPE_DEBUG_TRACE, CACHE_TYPE_TRACE, CacheMetrics, CacheStats},
+    raw_json::RawJson,
+};
 
 // Configuration
 /// Default maximum memory for the response cache (1 GB).
@@ -286,60 +288,6 @@ impl ResponseCacheKey {
     /// Creates a new cache key.
     pub const fn new(resource: CachedResource, block_hash: B256, variant: ResponseVariant) -> Self {
         Self { resource, block_hash, variant }
-    }
-}
-
-// Raw JSON
-/// A pre-serialized JSON response body, shared between the cache and the jsonrpsee reply
-/// path. Its `Serialize` impl splices the bytes verbatim (the [`RawValue`] mechanism), so
-/// serving one — fresh or cached — never rebuilds or re-serializes the JSON tree; the
-/// bytes are produced by exactly one serialization on the fill path
-/// (`serde_json::value::to_raw_value`, which also never re-validates its own output).
-#[derive(Debug, Clone)]
-pub struct RawJson(Arc<RawValue>);
-
-impl RawJson {
-    /// The serialized length in bytes.
-    pub fn byte_len(&self) -> usize {
-        self.0.get().len()
-    }
-
-    /// The JSON literal `null` (the not-found reply of `trace_transaction`).
-    pub fn null() -> Self {
-        RawValue::from_string("null".to_owned()).expect("null is valid JSON").into()
-    }
-
-    /// The raw serialized JSON.
-    #[cfg(test)]
-    pub fn as_str(&self) -> &str {
-        self.0.get()
-    }
-
-    /// Serializes a JSON tree into a `RawJson` — test fixtures only; production
-    /// responses are serialized once, straight from the trace output.
-    #[cfg(test)]
-    pub fn from_value(value: &serde_json::Value) -> Self {
-        serde_json::value::to_raw_value(value).expect("Value serialization cannot fail").into()
-    }
-
-    /// Whether two handles share the same underlying bytes (a hit is an `Arc` clone).
-    #[cfg(test)]
-    pub fn shares_bytes_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl From<Box<RawValue>> for RawJson {
-    fn from(raw: Box<RawValue>) -> Self {
-        Self(raw.into())
-    }
-}
-
-impl serde::Serialize for RawJson {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // Delegate to the `RawValue` pointee explicitly — `Arc<T>` itself is only
-        // `Serialize` behind serde's optional `rc` feature.
-        self.0.as_ref().serialize(serializer)
     }
 }
 
@@ -844,7 +792,8 @@ mod tests {
     fn test_cache_insert_and_get() {
         let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
         let hash = B256::from([1u8; 32]);
-        let value = RawJson::from_value(&json!([{"txHash": "0x01", "result": {}}]));
+        let value =
+            RawJson::try_new(&json!([{"txHash": "0x01", "result": {}}])).expect("serialize");
         assert!(cache.is_empty());
         assert_eq!((cache.len(), cache.weight()), (0, 0));
 
@@ -878,19 +827,19 @@ mod tests {
             CachedResource::DebugTraceBlock,
             h1,
             ResponseVariant::Default,
-            &RawJson::from_value(&json!({"v": 1})),
+            &RawJson::try_new(&json!({"v": 1})).expect("serialize"),
         );
         cache.insert(
             CachedResource::TraceBlock,
             h1,
             ResponseVariant::Default,
-            &RawJson::from_value(&json!({"v": 2})),
+            &RawJson::try_new(&json!({"v": 2})).expect("serialize"),
         );
         cache.insert(
             CachedResource::DebugTraceBlock,
             h2,
             call,
-            &RawJson::from_value(&json!({"v": 3})),
+            &RawJson::try_new(&json!({"v": 3})).expect("serialize"),
         );
         assert_eq!(cache.len(), 3);
 
@@ -916,8 +865,9 @@ mod tests {
         let call = ResponseVariant::CallTracer(CallConfigKey::default());
         let prestate = ResponseVariant::PrestateTracer(PreStateConfigKey::default());
 
-        let call_response = RawJson::from_value(&json!({"tracer": "call"}));
-        let prestate_response = RawJson::from_value(&json!({"tracer": "prestate"}));
+        let call_response = RawJson::try_new(&json!({"tracer": "call"})).expect("serialize");
+        let prestate_response =
+            RawJson::try_new(&json!({"tracer": "prestate"})).expect("serialize");
         cache.insert(CachedResource::DebugTraceBlock, hash, call, &call_response);
         cache.insert(CachedResource::DebugTraceBlock, hash, prestate, &prestate_response);
 
@@ -939,7 +889,7 @@ mod tests {
     #[test]
     fn eviction_cleans_hash_index() {
         // Budget fits roughly one entry; inserting more forces evictions.
-        let payload = RawJson::from_value(&json!({"data": "x".repeat(512)}));
+        let payload = RawJson::try_new(&json!({"data": "x".repeat(512)})).expect("serialize");
         let one_weight = 128 + payload.byte_len() as u64;
         let cache = ResponseCache::new(ResponseCacheConfig::new(one_weight * 3 / 2, 4));
 
@@ -978,18 +928,5 @@ mod tests {
         assert!((stats.hit_rate() - 80.0).abs() < f64::EPSILON);
         let empty = CacheStats { entry_count: 0, total_bytes: 0, hits: 0, misses: 0 };
         assert!((empty.hit_rate() - 0.0).abs() < f64::EPSILON);
-    }
-
-    /// The property the whole design rests on: serializing a [`RawJson`] (what jsonrpsee
-    /// does to build the reply) emits the stored bytes verbatim — no re-parse, no
-    /// normalization, byte-for-byte what the fill request serialized.
-    #[test]
-    fn raw_json_serializes_verbatim() {
-        let value = json!({"key": "value", "nested": [1, 2, {"deep": null}]});
-        let raw = RawJson::from_value(&value);
-        assert_eq!(raw.byte_len(), raw.as_str().len());
-        assert_eq!(serde_json::to_string(&raw).expect("splice"), raw.as_str());
-        assert_eq!(serde_json::to_string(&raw).expect("splice"), value.to_string());
-        assert_eq!(serde_json::to_string(&RawJson::null()).expect("splice"), "null");
     }
 }

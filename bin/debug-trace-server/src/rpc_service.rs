@@ -27,7 +27,8 @@ use crate::{
         METHOD_DEBUG_TRACE_TRANSACTION, METHOD_TRACE_BLOCK, METHOD_TRACE_TRANSACTION,
         ResponseSizeMetrics, RpcGlobalMetrics, SingleFlightMetrics,
     },
-    response_cache::{CachedResource, RawJson, RequestShape, ResponseCache, ResponseVariant},
+    raw_json::RawJson,
+    response_cache::{CachedResource, RequestShape, ResponseCache, ResponseVariant},
     tracing_executor::TraceError,
 };
 
@@ -392,9 +393,8 @@ fn compute_block_trace<T: serde::Serialize>(
     EvmExecutionMetrics::new_for_method(method_name)
         .record(start.elapsed().as_secs_f64(), data.block.transactions.len());
 
-    let json: RawJson = serde_json::value::to_raw_value(&results)
-        .map_err(|e| TraceError::Request(format!("Serialization failed: {e}")))?
-        .into();
+    let json = RawJson::try_new(&results)
+        .map_err(|e| TraceError::Request(format!("Serialization failed: {e}")))?;
 
     let serialize_ms = start.elapsed().as_millis() - trace_ms;
     let response_size = json.byte_len();
@@ -463,6 +463,20 @@ fn insert_cache(
         return;
     };
     cache.insert(resource, block_hash, variant, result);
+}
+
+/// Serializes a result into its [`RawJson`] reply body and records the response-size
+/// metric — the shared epilogue of the uncached transaction handlers (the block-level
+/// twin lives in `compute_block_trace`, which folds the same serialization into its
+/// stage timing and maps failures to [`TraceError`] instead).
+fn serialize_reply<T: serde::Serialize>(
+    result: &T,
+    method_name: &'static str,
+) -> RpcResult<RawJson> {
+    let json =
+        RawJson::try_new(result).map_err(|e| rpc_err(format!("Serialization failed: {e}")))?;
+    ResponseSizeMetrics::new_for_method(method_name).record(json.byte_len());
+    Ok(json)
 }
 
 /// Records metrics and logs for a completed request.
@@ -627,11 +641,7 @@ impl DebugTraceRpcServer for RpcContext {
             );
         }
 
-        let json: RawJson = serde_json::value::to_raw_value(&result)
-            .map_err(|e| rpc_err(format!("Serialization failed: {e}")))?
-            .into();
-        ResponseSizeMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION).record(json.byte_len());
-        Ok(json)
+        serialize_reply(&result, METHOD_DEBUG_TRACE_TRANSACTION)
     }
 
     async fn get_cache_status(&self) -> RpcResult<serde_json::Value> {
@@ -754,11 +764,7 @@ impl TraceRpcServer for RpcContext {
             );
         }
 
-        let json: RawJson = serde_json::value::to_raw_value(&result)
-            .map_err(|e| rpc_err(format!("Serialization failed: {e}")))?
-            .into();
-        ResponseSizeMetrics::new_for_method(METHOD_TRACE_TRANSACTION).record(json.byte_len());
-        Ok(json)
+        serialize_reply(&result, METHOD_TRACE_TRANSACTION)
     }
 }
 
@@ -886,7 +892,7 @@ mod tests {
     fn check_cache_hit_miss_and_bypass() {
         let h1 = B256::from([1u8; 32]);
         let h2 = B256::from([2u8; 32]);
-        let inserted = RawJson::from_value(&serde_json::json!({"v": 1}));
+        let inserted = RawJson::try_new(&serde_json::json!({"v": 1})).expect("serialize");
         let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
         cache.insert(CachedResource::DebugTraceBlock, h1, ResponseVariant::Default, &inserted);
         let cache = Some(cache);
@@ -915,9 +921,10 @@ mod tests {
         let mut module = jsonrpsee::server::RpcModule::new(());
         module
             .register_method("echo", |_, _, _| {
-                jsonrpsee::ResponsePayload::success(RawJson::from_value(
-                    &serde_json::json!({"a": [1, 2], "b": "x"}),
-                ))
+                jsonrpsee::ResponsePayload::success(
+                    RawJson::try_new(&serde_json::json!({"a": [1, 2], "b": "x"}))
+                        .expect("serialize"),
+                )
             })
             .unwrap();
         let (resp, _) = module
@@ -1054,7 +1061,7 @@ mod tests {
     #[test]
     fn insert_cache_skips_non_cacheable_variants() {
         let cache = Some(ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100)));
-        let result = RawJson::from_value(&serde_json::json!([{"txHash": "0x01"}]));
+        let result = RawJson::try_new(&serde_json::json!([{"txHash": "0x01"}])).expect("serialize");
         let hash = B256::from([1u8; 32]);
 
         insert_cache(&cache, CachedResource::DebugTraceBlock, hash, None, &result);
