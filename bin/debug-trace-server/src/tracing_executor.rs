@@ -241,9 +241,47 @@ fn mux_config_and_inspector(
     let config = tracer_config
         .clone()
         .into_mux_config()
-        .map_err(|_| TraceError::Request("Invalid mux tracer config".into()))?;
+        .map_err(|e| request_error("invalid muxTracer tracerConfig", e))?;
     let inspector = mux_inspector(config.clone())?;
     Ok((config, inspector))
+}
+
+/// Parses a config-reading builtin's `tracerConfig` into its [`TracerKind`] — the one
+/// home for the strict-parse contract shared by the block and transaction dispatchers.
+///
+/// Defense in depth: RPC handlers already reject malformed configs via
+/// `RequestShape::classify` (-32602) before the executor runs, so from the current entry
+/// points this rejection is unreachable — but a malformed config must never silently
+/// trace with default settings if a future entry point skips the boundary gate. The
+/// executor guarantees only that much: its rejection surfaces as a request-attributable
+/// [`TraceError`], not as the gate's `-32602` wire code.
+fn builtin_tracer_kind(
+    builtin: GethDebugBuiltInTracerType,
+    tracer_config: &GethDebugTracerConfig,
+) -> Result<TracerKind, TraceError> {
+    let config = tracer_config.clone();
+    match builtin {
+        GethDebugBuiltInTracerType::CallTracer => config
+            .into_call_config()
+            .map(TracerKind::Call)
+            .map_err(|e| request_error("invalid callTracer tracerConfig", e)),
+        GethDebugBuiltInTracerType::PreStateTracer => config
+            .into_pre_state_config()
+            .map(TracerKind::PreState)
+            .map_err(|e| request_error("invalid prestateTracer tracerConfig", e)),
+        GethDebugBuiltInTracerType::FlatCallTracer => config
+            .into_flat_call_config()
+            .map(TracerKind::FlatCall)
+            .map_err(|e| request_error("invalid flatCallTracer tracerConfig", e)),
+        // Not TracingInspector tracers: the dispatchers execute these in their own arms
+        // (mux via `mux_config_and_inspector`) and never route them here; kept total —
+        // a request error rather than a panic.
+        GethDebugBuiltInTracerType::FourByteTracer |
+        GethDebugBuiltInTracerType::NoopTracer |
+        GethDebugBuiltInTracerType::MuxTracer => {
+            Err(request_error("tracer takes no typed tracerConfig here", builtin))
+        }
+    }
 }
 
 /// Builds a [`JsInspector`] for one transaction context (request-attributable on failure).
@@ -525,49 +563,16 @@ pub fn trace_block(
                     })
                     .collect(),
 
-                // Defense in depth: RPC handlers already reject malformed configs via
-                // `RequestShape::classify` (-32602) before the executor runs, so these
-                // rejections are unreachable from the current entry points — but a
-                // malformed config must never silently trace with default settings if a
-                // future entry point skips the boundary gate.
-                GethDebugBuiltInTracerType::CallTracer => {
-                    let call_config = tracer_config
-                        .clone()
-                        .into_call_config()
-                        .map_err(|e| request_error("invalid callTracer tracerConfig", e))?;
-                    trace_block_with_tracing_inspector(
-                        &env,
-                        block,
-                        &mut state,
-                        &TracerKind::Call(call_config),
-                    )?
-                }
-
-                GethDebugBuiltInTracerType::PreStateTracer => {
-                    let prestate_config = tracer_config
-                        .clone()
-                        .into_pre_state_config()
-                        .map_err(|e| request_error("invalid prestateTracer tracerConfig", e))?;
-                    trace_block_with_tracing_inspector(
-                        &env,
-                        block,
-                        &mut state,
-                        &TracerKind::PreState(prestate_config),
-                    )?
-                }
-
-                GethDebugBuiltInTracerType::FlatCallTracer => {
-                    let flat_call_config = tracer_config
-                        .clone()
-                        .into_flat_call_config()
-                        .map_err(|e| request_error("invalid flatCallTracer tracerConfig", e))?;
-                    trace_block_with_tracing_inspector(
-                        &env,
-                        block,
-                        &mut state,
-                        &TracerKind::FlatCall(flat_call_config),
-                    )?
-                }
+                // Strict parse in `builtin_tracer_kind` — see its doc for why the
+                // executor re-rejects what the boundary gate already screens.
+                GethDebugBuiltInTracerType::CallTracer |
+                GethDebugBuiltInTracerType::PreStateTracer |
+                GethDebugBuiltInTracerType::FlatCallTracer => trace_block_with_tracing_inspector(
+                    &env,
+                    block,
+                    &mut state,
+                    &builtin_tracer_kind(*builtin, tracer_config)?,
+                )?,
 
                 GethDebugBuiltInTracerType::FourByteTracer => {
                     setup_executor!(&env, &mut state, FourByteInspector::default() => executor);
@@ -784,52 +789,17 @@ pub fn trace_transaction(
                     Ok(GethTrace::NoopTracer(NoopFrame::default()))
                 }
 
-                // Defense in depth: RPC handlers already reject malformed configs via
-                // `RequestShape::classify` (-32602) before the executor runs, so these
-                // rejections are unreachable from the current entry points — but a
-                // malformed config must never silently trace with default settings if a
-                // future entry point skips the boundary gate.
-                GethDebugBuiltInTracerType::CallTracer => {
-                    let call_config = tracer_config
-                        .clone()
-                        .into_call_config()
-                        .map_err(|e| request_error("invalid callTracer tracerConfig", e))?;
-                    trace_tx_with_tracing_inspector(
-                        &env,
-                        block,
-                        &mut state,
-                        tx_index,
-                        &TracerKind::Call(call_config),
-                    )
-                }
-
-                GethDebugBuiltInTracerType::PreStateTracer => {
-                    let prestate_config = tracer_config
-                        .clone()
-                        .into_pre_state_config()
-                        .map_err(|e| request_error("invalid prestateTracer tracerConfig", e))?;
-                    trace_tx_with_tracing_inspector(
-                        &env,
-                        block,
-                        &mut state,
-                        tx_index,
-                        &TracerKind::PreState(prestate_config),
-                    )
-                }
-
-                GethDebugBuiltInTracerType::FlatCallTracer => {
-                    let flat_call_config = tracer_config
-                        .clone()
-                        .into_flat_call_config()
-                        .map_err(|e| request_error("invalid flatCallTracer tracerConfig", e))?;
-                    trace_tx_with_tracing_inspector(
-                        &env,
-                        block,
-                        &mut state,
-                        tx_index,
-                        &TracerKind::FlatCall(flat_call_config),
-                    )
-                }
+                // Strict parse in `builtin_tracer_kind` — see its doc for why the
+                // executor re-rejects what the boundary gate already screens.
+                GethDebugBuiltInTracerType::CallTracer |
+                GethDebugBuiltInTracerType::PreStateTracer |
+                GethDebugBuiltInTracerType::FlatCallTracer => trace_tx_with_tracing_inspector(
+                    &env,
+                    block,
+                    &mut state,
+                    tx_index,
+                    &builtin_tracer_kind(*builtin, tracer_config)?,
+                ),
 
                 GethDebugBuiltInTracerType::FourByteTracer => {
                     setup_executor!(&env, &mut state, FourByteInspector::default() => executor);
@@ -1180,6 +1150,7 @@ mod tests {
                 GethDebugBuiltInTracerType::FlatCallTracer,
                 serde_json::json!({"convertParityErrors": "yes"}),
             ),
+            (GethDebugBuiltInTracerType::MuxTracer, serde_json::json!({"notATracer": {}})),
         ];
         for (tracer, config) in malformed {
             let opts = GethDebugTracingOptions {
