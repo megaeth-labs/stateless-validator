@@ -583,45 +583,26 @@ impl DataProvider {
     }
 
     /// Gets block data by block hash with single-flight coalescing, minting its own
-    /// deadline. Entry point for callers without a shared budget; handlers that already
-    /// resolved a hash on a deadline use [`Self::get_block_data_by_hash_with_deadline`].
+    /// deadline. Entry point for callers without a shared budget; handlers on a shared
+    /// per-request budget use [`Self::get_block_data`] with the tail of their deadline.
     pub async fn get_block_data_by_hash(
         &self,
         block_hash: B256,
     ) -> DataProviderResult<Arc<BlockData>> {
-        self.get_block_data_by_hash_with_deadline(block_hash, self.fetch_deadline()).await
+        self.get_block_data(block_hash, None, self.fetch_deadline()).await
     }
 
-    /// Gets block data by block hash with single-flight coalescing on the caller's
-    /// `deadline` — the tail of the shared per-request budget minted by
-    /// [`Self::fetch_deadline`].
-    pub(crate) async fn get_block_data_by_hash_with_deadline(
-        &self,
-        block_hash: B256,
-        deadline: Instant,
-    ) -> DataProviderResult<Arc<BlockData>> {
-        self.get_block_data_inner(block_hash, None, deadline).await
-    }
-
-    /// [`Self::get_block_data_by_hash_with_deadline`] for callers that already hold the
-    /// block's number alongside its hash (a resolved by-number lookup, a tag binding, a
-    /// transaction lookup): a cold miss skips the fetch pipeline's number-discovery header
-    /// round trip. The number is trusted only as routing input (witness-source selection
-    /// and deadline tightening) — the served `BlockData` content is keyed and fetched
-    /// purely by `block_hash` either way.
-    pub(crate) async fn get_block_data_with_known_number(
-        &self,
-        block_number: u64,
-        block_hash: B256,
-        deadline: Instant,
-    ) -> DataProviderResult<Arc<BlockData>> {
-        self.get_block_data_inner(block_hash, Some(block_number), deadline).await
-    }
-
-    /// Tiered lookup behind both public entry points: memory cache → local DB →
-    /// single-flight RPC fetch, all keyed by `block_hash`; `known_number` only spares the
-    /// RPC tier its header round trip.
-    async fn get_block_data_inner(
+    /// Tiered block-data lookup: memory cache → local DB → single-flight RPC fetch, all
+    /// keyed by `block_hash`, bounded by the caller's `deadline` (the tail of the shared
+    /// per-request budget minted by [`Self::fetch_deadline`]).
+    ///
+    /// Callers that already hold the block's number alongside its hash (a resolved
+    /// by-number lookup, a tag binding, a transaction lookup) pass it as `known_number`,
+    /// sparing a cold miss the fetch pipeline's number-discovery header round trip. The
+    /// number is trusted only as routing input (witness-source selection and deadline
+    /// tightening) — the served `BlockData` content is keyed and fetched purely by
+    /// `block_hash` either way.
+    pub(crate) async fn get_block_data(
         &self,
         block_hash: B256,
         known_number: Option<u64>,
@@ -718,12 +699,7 @@ impl DataProvider {
 
         // A mined tx carries its block number next to the hash; missing it is not a reason
         // to fail the request, just to fall back to number discovery in the fetch pipeline.
-        let data = match tx.block_number {
-            Some(number) => {
-                self.get_block_data_with_known_number(number, block_hash, deadline).await?
-            }
-            None => self.get_block_data_by_hash_with_deadline(block_hash, deadline).await?,
-        };
+        let data = self.get_block_data(block_hash, tx.block_number, deadline).await?;
         Ok((data, tx_index))
     }
 
@@ -966,14 +942,15 @@ fn shared_to_result(
 /// Free function version of the fetch pipeline so it can be `.shared()` without borrowing `self`.
 ///
 /// Performs the complete RPC fetch sequence:
-/// 1. Learn the block number: taken from `known_number` when the caller already resolved it
-///    (by-number, tag, and transaction lookups all did), otherwise via one header fetch (a raw
-///    by-hash request is the only caller without it).
-/// 2. Fetch witness and full block in parallel, each subject to the shared `deadline`. The witness
-///    stage also gets a sub-deadline: `min(deadline, now + witness_timeout)`, tightened further for
-///    old blocks (see `witness_deadline_for`).
-/// 3. The witness arrives as a `LightWitness` already (zero-validation light decode).
-/// 4. Extract code hashes from witness and fetch contract bytecodes (shares `deadline`).
+/// 1. Fetch witness and full block in parallel, each subject to the shared `deadline`. The witness
+///    arm first learns the block number — taken from `known_number` when the caller already
+///    resolved it (by-number, tag, and transaction lookups all did), otherwise via one header fetch
+///    (a raw by-hash request is the only caller without it) — while the full-block fetch, keyed
+///    purely by hash, starts immediately. The witness stage also gets a sub-deadline:
+///    `min(deadline, now + witness_timeout)`, tightened further for old blocks (see
+///    `witness_deadline_for`).
+/// 2. The witness arrives as a `LightWitness` already (zero-validation light decode).
+/// 3. Extract code hashes from witness and fetch contract bytecodes (shares `deadline`).
 async fn do_fetch_block_data(
     rpc_client: Arc<RpcClient>,
     db: Option<Arc<dyn BlockStore>>,
@@ -985,37 +962,46 @@ async fn do_fetch_block_data(
 ) -> DataProviderResult<BlockData> {
     let overall_start = Instant::now();
 
-    // Step 1: the block number — routing input for the witness stage below. Every fetch
-    // stays keyed by `block_hash`, so a caller-supplied number can misroute at worst,
-    // never mis-serve.
-    let start = Instant::now();
-    let block_number = match known_number {
-        Some(number) => number,
-        None => {
-            rpc_client
-                .get_header_with_deadline(BlockId::Hash(block_hash.into()), false, Some(deadline))
-                .await?
-                .number
-        }
-    };
-    let fetch_header_ms = start.elapsed().as_millis();
-
-    // Step 2: Pick the witness deadline based on "new vs old" heuristic, then run witness
-    // and full-block fetches in parallel. The tip is read once and shared by the deadline
-    // heuristic and the witness-source routing.
+    // Step 1: witness and full-block fetches in parallel. The witness arm first learns
+    // the block number — from `known_number` when the caller already resolved it, else via
+    // one header fetch — because only witness routing (source selection and the deadline
+    // heuristic below) consumes it; a caller-supplied number can misroute at worst, never
+    // mis-serve, as every fetch stays keyed by `block_hash`. The full-block fetch needs
+    // only the hash, so it starts immediately instead of idling behind the discovery
+    // round trip. The tip is read once and shared by the deadline heuristic and the
+    // witness-source routing.
     let db_tip = db_tip_height(db.as_deref());
-    let witness_deadline = witness_deadline_for(db_tip, block_number, &witness_cfg, deadline);
     let (witness_timed, block_timed) = tokio::join!(
         async {
             let start = Instant::now();
-            let result = fetch_witness(
-                &rpc_client,
-                &witness_cfg,
-                db_tip,
-                block_number,
-                block_hash,
-                witness_deadline,
-            )
+            let result = async {
+                let (block_number, fetch_header_ms) = match known_number {
+                    Some(number) => (number, 0),
+                    None => {
+                        let discovery = Instant::now();
+                        let header = rpc_client
+                            .get_header_with_deadline(
+                                BlockId::Hash(block_hash.into()),
+                                false,
+                                Some(deadline),
+                            )
+                            .await?;
+                        (header.number, discovery.elapsed().as_millis())
+                    }
+                };
+                let witness_deadline =
+                    witness_deadline_for(db_tip, block_number, &witness_cfg, deadline);
+                let witness = fetch_witness(
+                    &rpc_client,
+                    &witness_cfg,
+                    db_tip,
+                    block_number,
+                    block_hash,
+                    witness_deadline,
+                )
+                .await?;
+                Ok::<_, DataProviderError>((block_number, fetch_header_ms, witness))
+            }
             .await;
             (result, start.elapsed())
         },
@@ -1032,13 +1018,13 @@ async fn do_fetch_block_data(
     let (witness_result, witness_elapsed) = witness_timed;
     let (block_result, block_elapsed) = block_timed;
 
-    let fetch_witness_ms = witness_elapsed.as_millis();
-    // Step 3: the light decode already produced a LightWitness — no conversion.
-    let (witness, _mpt_witness) = witness_result?;
+    // Step 2: the light decode already produced a LightWitness — no conversion.
+    let (block_number, fetch_header_ms, (witness, _mpt_witness)) = witness_result?;
+    let fetch_witness_ms = witness_elapsed.as_millis().saturating_sub(fetch_header_ms);
     let block = block_result?;
     let fetch_full_block_ms = block_elapsed.as_millis();
 
-    // Step 4: Extract code hashes and fetch contracts.
+    // Step 3: Extract code hashes and fetch contracts.
     let start = Instant::now();
     let code_hashes = crate::tracing_executor::extract_code_hashes(&witness);
     let num_contracts = code_hashes.len();
@@ -1317,11 +1303,10 @@ pub(crate) mod test_support {
         module
             .register_method("eth_getHeaderByNumber", move |params, hits, _| {
                 hits.header_by_number.fetch_add(1, Ordering::Relaxed);
-                let (tag,): (String,) = params.parse().unwrap();
-                let n = match tag.as_str() {
-                    "latest" | "finalized" | "safe" => tip,
-                    hex => u64::from_str_radix(hex.strip_prefix("0x").unwrap_or(hex), 16).unwrap(),
-                };
+                // Parse with the same type the production client serializes from, so the
+                // mock cannot drift from the real wire encoding.
+                let (tag,): (BlockNumberOrTag,) = params.parse().unwrap();
+                let n = tag.as_number().unwrap_or(tip);
                 Ok::<_, ErrorObjectOwned>(consistent_header(n))
             })
             .unwrap();
@@ -1978,7 +1963,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_millis(300);
         let err = provider
-            .get_block_data_with_known_number(200, hash, deadline)
+            .get_block_data(hash, Some(200), deadline)
             .await
             .err()
             .expect("unserved witness/block stages must time out");
@@ -1994,7 +1979,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_millis(300);
         let err = provider
-            .get_block_data_by_hash_with_deadline(hash, deadline)
+            .get_block_data(hash, None, deadline)
             .await
             .err()
             .expect("unserved witness/block stages must time out");

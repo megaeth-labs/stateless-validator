@@ -268,12 +268,12 @@ impl RpcContext {
         let t2 = Instant::now();
         let data = self
             .data_provider
-            .get_block_data_with_known_number(block_num, block_hash, deadline)
+            .get_block_data(block_hash, Some(block_num), deadline)
             .await
             .map_err(|e| {
-                metrics::record_rpc_error(method);
-                data_provider_error_to_rpc_error(&e)
-            })?;
+            metrics::record_rpc_error(method);
+            data_provider_error_to_rpc_error(&e)
+        })?;
         let fetch_ms = t2.elapsed().as_millis();
 
         if resolve_ms >= SLOW_STAGE_THRESHOLD_MS ||
