@@ -525,11 +525,16 @@ pub fn trace_block(
                     })
                     .collect(),
 
-                // The `unwrap_or_default()` on these three config parses is unreachable in
-                // practice: RPC handlers reject malformed configs via
-                // `RequestShape::classify` (-32602) before reaching the executor.
+                // Defense in depth: RPC handlers already reject malformed configs via
+                // `RequestShape::classify` (-32602) before the executor runs, so these
+                // rejections are unreachable from the current entry points — but a
+                // malformed config must never silently trace with default settings if a
+                // future entry point skips the boundary gate.
                 GethDebugBuiltInTracerType::CallTracer => {
-                    let call_config = tracer_config.clone().into_call_config().unwrap_or_default();
+                    let call_config = tracer_config
+                        .clone()
+                        .into_call_config()
+                        .map_err(|e| request_error("invalid callTracer tracerConfig", e))?;
                     trace_block_with_tracing_inspector(
                         &env,
                         block,
@@ -539,8 +544,10 @@ pub fn trace_block(
                 }
 
                 GethDebugBuiltInTracerType::PreStateTracer => {
-                    let prestate_config =
-                        tracer_config.clone().into_pre_state_config().unwrap_or_default();
+                    let prestate_config = tracer_config
+                        .clone()
+                        .into_pre_state_config()
+                        .map_err(|e| request_error("invalid prestateTracer tracerConfig", e))?;
                     trace_block_with_tracing_inspector(
                         &env,
                         block,
@@ -550,8 +557,10 @@ pub fn trace_block(
                 }
 
                 GethDebugBuiltInTracerType::FlatCallTracer => {
-                    let flat_call_config =
-                        tracer_config.clone().into_flat_call_config().unwrap_or_default();
+                    let flat_call_config = tracer_config
+                        .clone()
+                        .into_flat_call_config()
+                        .map_err(|e| request_error("invalid flatCallTracer tracerConfig", e))?;
                     trace_block_with_tracing_inspector(
                         &env,
                         block,
@@ -775,11 +784,16 @@ pub fn trace_transaction(
                     Ok(GethTrace::NoopTracer(NoopFrame::default()))
                 }
 
-                // The `unwrap_or_default()` on these three config parses is unreachable in
-                // practice: RPC handlers reject malformed configs via
-                // `RequestShape::classify` (-32602) before reaching the executor.
+                // Defense in depth: RPC handlers already reject malformed configs via
+                // `RequestShape::classify` (-32602) before the executor runs, so these
+                // rejections are unreachable from the current entry points — but a
+                // malformed config must never silently trace with default settings if a
+                // future entry point skips the boundary gate.
                 GethDebugBuiltInTracerType::CallTracer => {
-                    let call_config = tracer_config.clone().into_call_config().unwrap_or_default();
+                    let call_config = tracer_config
+                        .clone()
+                        .into_call_config()
+                        .map_err(|e| request_error("invalid callTracer tracerConfig", e))?;
                     trace_tx_with_tracing_inspector(
                         &env,
                         block,
@@ -790,8 +804,10 @@ pub fn trace_transaction(
                 }
 
                 GethDebugBuiltInTracerType::PreStateTracer => {
-                    let prestate_config =
-                        tracer_config.clone().into_pre_state_config().unwrap_or_default();
+                    let prestate_config = tracer_config
+                        .clone()
+                        .into_pre_state_config()
+                        .map_err(|e| request_error("invalid prestateTracer tracerConfig", e))?;
                     trace_tx_with_tracing_inspector(
                         &env,
                         block,
@@ -802,8 +818,10 @@ pub fn trace_transaction(
                 }
 
                 GethDebugBuiltInTracerType::FlatCallTracer => {
-                    let flat_call_config =
-                        tracer_config.clone().into_flat_call_config().unwrap_or_default();
+                    let flat_call_config = tracer_config
+                        .clone()
+                        .into_flat_call_config()
+                        .map_err(|e| request_error("invalid flatCallTracer tracerConfig", e))?;
                     trace_tx_with_tracing_inspector(
                         &env,
                         block,
@@ -1137,5 +1155,57 @@ mod tests {
         let err = trace_block(&chain_spec, &block, witness, &contracts, opts)
             .expect_err("an unparsable mux config must be rejected");
         assert!(matches!(err, TraceError::Request(_)), "got: {err:?}");
+    }
+
+    /// Defense in depth behind the RPC boundary gate: a type-malformed `tracerConfig` on
+    /// a config-reading builtin is rejected with [`TraceError::Request`] by the executor
+    /// itself — on both the block and the single-transaction paths — never silently
+    /// traced with default settings, while a well-formed config still traces. (The RPC
+    /// layer's own `-32602` rejection is pinned by
+    /// `invalid_tracer_config_maps_to_invalid_params` in `rpc_service`.)
+    #[test]
+    fn malformed_tracer_config_is_rejected_not_defaulted() {
+        use stateless_test_utils::fixtures::TestFixtures;
+
+        use crate::data_provider::{BlockData, test_support::fixture_block_data};
+
+        let chain_spec =
+            ChainSpec::from_genesis(TestFixtures::synthetic().load_genesis().expect("genesis"));
+        let BlockData { block, witness, contracts } = fixture_block_data();
+
+        let malformed = [
+            (GethDebugBuiltInTracerType::CallTracer, serde_json::json!({"onlyTopCall": "yes"})),
+            (GethDebugBuiltInTracerType::PreStateTracer, serde_json::json!({"diffMode": "yes"})),
+            (
+                GethDebugBuiltInTracerType::FlatCallTracer,
+                serde_json::json!({"convertParityErrors": "yes"}),
+            ),
+        ];
+        for (tracer, config) in malformed {
+            let opts = GethDebugTracingOptions {
+                tracer: Some(GethDebugTracerType::BuiltInTracer(tracer)),
+                tracer_config: GethDebugTracerConfig(config),
+                ..Default::default()
+            };
+
+            let err = trace_block(&chain_spec, &block, witness.clone(), &contracts, opts.clone())
+                .expect_err("malformed config must fail the block trace");
+            assert!(matches!(&err, TraceError::Request(msg) if msg.contains("tracerConfig")));
+
+            let err = trace_transaction(&chain_spec, &block, 0, witness.clone(), &contracts, opts)
+                .expect_err("malformed config must fail the tx trace");
+            assert!(matches!(&err, TraceError::Request(msg) if msg.contains("tracerConfig")));
+        }
+
+        // Control: a well-formed config on the same inputs still traces.
+        let opts = GethDebugTracingOptions {
+            tracer: Some(GethDebugTracerType::BuiltInTracer(
+                GethDebugBuiltInTracerType::CallTracer,
+            )),
+            tracer_config: GethDebugTracerConfig(serde_json::json!({"onlyTopCall": true})),
+            ..Default::default()
+        };
+        trace_block(&chain_spec, &block, witness, &contracts, opts)
+            .expect("a well-formed config must trace");
     }
 }
