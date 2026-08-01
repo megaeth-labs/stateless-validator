@@ -5656,6 +5656,7 @@ dependencies = [
  "alloy-consensus",
  "alloy-primitives",
  "alloy-provider",
+ "alloy-rpc-client",
  "alloy-rpc-types-eth",
  "alloy-trie",
  "base64",
