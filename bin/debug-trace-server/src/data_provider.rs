@@ -600,6 +600,33 @@ impl DataProvider {
         block_hash: B256,
         deadline: Instant,
     ) -> DataProviderResult<Arc<BlockData>> {
+        self.get_block_data_inner(block_hash, None, deadline).await
+    }
+
+    /// [`Self::get_block_data_by_hash_with_deadline`] for callers that already hold the
+    /// block's number alongside its hash (a resolved by-number lookup, a tag binding, a
+    /// transaction lookup): a cold miss skips the fetch pipeline's number-discovery header
+    /// round trip. The number is trusted only as routing input (witness-source selection
+    /// and deadline tightening) — the served `BlockData` content is keyed and fetched
+    /// purely by `block_hash` either way.
+    pub(crate) async fn get_block_data_with_known_number(
+        &self,
+        block_number: u64,
+        block_hash: B256,
+        deadline: Instant,
+    ) -> DataProviderResult<Arc<BlockData>> {
+        self.get_block_data_inner(block_hash, Some(block_number), deadline).await
+    }
+
+    /// Tiered lookup behind both public entry points: memory cache → local DB →
+    /// single-flight RPC fetch, all keyed by `block_hash`; `known_number` only spares the
+    /// RPC tier its header round trip.
+    async fn get_block_data_inner(
+        &self,
+        block_hash: B256,
+        known_number: Option<u64>,
+        deadline: Instant,
+    ) -> DataProviderResult<Arc<BlockData>> {
         let start = Instant::now();
 
         // Memory tier: a hit skips the DB read + witness decode entirely.
@@ -646,7 +673,7 @@ impl DataProvider {
             source = "rpc",
             "Fetching block data from RPC"
         );
-        let data = self.fetch_block_data_single_flight(block_hash, deadline).await?;
+        let data = self.fetch_block_data_single_flight(block_hash, known_number, deadline).await?;
 
         trace!(
             block_hash = %block_hash,
@@ -689,40 +716,47 @@ impl DataProvider {
             "Transaction located in block"
         );
 
-        let data = self.get_block_data_by_hash_with_deadline(block_hash, deadline).await?;
+        // A mined tx carries its block number next to the hash; missing it is not a reason
+        // to fail the request, just to fall back to number discovery in the fetch pipeline.
+        let data = match tx.block_number {
+            Some(number) => {
+                self.get_block_data_with_known_number(number, block_hash, deadline).await?
+            }
+            None => self.get_block_data_by_hash_with_deadline(block_hash, deadline).await?,
+        };
         Ok((data, tx_index))
     }
 
-    /// Resolves a block tag to a concrete block number on the caller's `deadline`.
+    /// Resolves a block tag to a concrete block number — and, for the upstream tags, the
+    /// canonical hash bound to it — on the caller's `deadline`.
     ///
-    /// Numeric tags are a pure local no-op. `Latest`, `Finalized`, and `Safe` must hit
-    /// upstream to learn the tip — there is no cache key until we have a concrete number,
-    /// so falling back to the cache on upstream failure is not an option. The `deadline` is
-    /// the shared per-request budget from [`Self::fetch_deadline`], so a stuck upstream
-    /// surfaces as a typed [`DataProviderError::Timeout`] rather than hanging the RPC
-    /// caller forever — and tag resolution cannot double the request's total budget.
+    /// Numeric tags are a pure local no-op and return no hash: their number → hash binding
+    /// comes from [`Self::resolve_canonical_hash`]. `Latest`, `Finalized`, and `Safe` must
+    /// hit upstream to learn the tip — there is no cache key until we have a concrete
+    /// number, so falling back to the cache on upstream failure is not an option — and
+    /// that one header fetch already carries the hash, so it is returned alongside the
+    /// number (hash-verified, the same trust bar as the numeric upstream path): resolving
+    /// the same header again by number would burn a second round trip for a binding this
+    /// response already pinned atomically. The `deadline` is the shared per-request budget
+    /// from [`Self::fetch_deadline`], so a stuck upstream surfaces as a typed
+    /// [`DataProviderError::Timeout`] rather than hanging the RPC caller forever — and tag
+    /// resolution cannot double the request's total budget.
     pub async fn resolve_block_number(
         &self,
         tag: BlockNumberOrTag,
         deadline: Instant,
-    ) -> DataProviderResult<u64> {
+    ) -> DataProviderResult<(u64, Option<B256>)> {
         match tag {
-            BlockNumberOrTag::Number(n) => Ok(n),
-            BlockNumberOrTag::Earliest => Ok(0),
+            BlockNumberOrTag::Number(n) => Ok((n, None)),
+            BlockNumberOrTag::Earliest => Ok((0, None)),
             BlockNumberOrTag::Pending => Err(eyre::eyre!("Pending block not supported").into()),
-            BlockNumberOrTag::Latest => {
-                let number =
-                    self.rpc_client.get_latest_block_number_with_deadline(Some(deadline)).await?;
-                self.observe_tip(number);
-                Ok(number)
-            }
-            BlockNumberOrTag::Finalized | BlockNumberOrTag::Safe => {
+            BlockNumberOrTag::Latest | BlockNumberOrTag::Finalized | BlockNumberOrTag::Safe => {
                 let header = self
                     .rpc_client
-                    .get_header_with_deadline(BlockId::Number(tag), false, Some(deadline))
+                    .get_header_with_deadline(BlockId::Number(tag), true, Some(deadline))
                     .await?;
                 self.observe_tip(header.number);
-                Ok(header.number)
+                Ok((header.number, Some(header.hash)))
             }
         }
     }
@@ -826,6 +860,7 @@ impl DataProvider {
     async fn fetch_block_data_single_flight(
         &self,
         block_hash: B256,
+        known_number: Option<u64>,
         deadline: Instant,
     ) -> DataProviderResult<Arc<BlockData>> {
         // `_guard` is only set on the primary path; coalesced waiters leave it `None`.
@@ -852,6 +887,7 @@ impl DataProvider {
                         contract_cache,
                         witness_cfg,
                         block_hash,
+                        known_number,
                         deadline,
                     )
                     .await
@@ -930,7 +966,9 @@ fn shared_to_result(
 /// Free function version of the fetch pipeline so it can be `.shared()` without borrowing `self`.
 ///
 /// Performs the complete RPC fetch sequence:
-/// 1. Fetch block header (without transactions) to get the block number.
+/// 1. Learn the block number: taken from `known_number` when the caller already resolved it
+///    (by-number, tag, and transaction lookups all did), otherwise via one header fetch (a raw
+///    by-hash request is the only caller without it).
 /// 2. Fetch witness and full block in parallel, each subject to the shared `deadline`. The witness
 ///    stage also gets a sub-deadline: `min(deadline, now + witness_timeout)`, tightened further for
 ///    old blocks (see `witness_deadline_for`).
@@ -942,16 +980,24 @@ async fn do_fetch_block_data(
     contract_cache: Arc<ContractCache>,
     witness_cfg: WitnessFetchConfig,
     block_hash: B256,
+    known_number: Option<u64>,
     deadline: Instant,
 ) -> DataProviderResult<BlockData> {
     let overall_start = Instant::now();
 
-    // Step 1: Fetch header first to get the block number.
+    // Step 1: the block number — routing input for the witness stage below. Every fetch
+    // stays keyed by `block_hash`, so a caller-supplied number can misroute at worst,
+    // never mis-serve.
     let start = Instant::now();
-    let header = rpc_client
-        .get_header_with_deadline(BlockId::Hash(block_hash.into()), false, Some(deadline))
-        .await?;
-    let block_number = header.number;
+    let block_number = match known_number {
+        Some(number) => number,
+        None => {
+            rpc_client
+                .get_header_with_deadline(BlockId::Hash(block_hash.into()), false, Some(deadline))
+                .await?
+                .number
+        }
+    };
     let fetch_header_ms = start.elapsed().as_millis();
 
     // Step 2: Pick the witness deadline based on "new vs old" heuristic, then run witness
@@ -967,7 +1013,7 @@ async fn do_fetch_block_data(
                 &witness_cfg,
                 db_tip,
                 block_number,
-                header.hash,
+                block_hash,
                 witness_deadline,
             )
             .await;
@@ -1249,29 +1295,56 @@ pub(crate) mod test_support {
         alloy_rpc_types_eth::Header { hash: inner.hash_slow(), inner, ..Default::default() }
     }
 
-    /// Serves `eth_getHeaderByNumber` with a self-consistent header for any number, and
-    /// `eth_blockNumber` with `tip` — counting the latter's calls so tip-seed tests can
-    /// assert whether (and how often) the seed fired.
-    pub(crate) async fn start_mock_rpc(tip: u64) -> (ServerHandle, String, Arc<AtomicUsize>) {
-        let seed_hits = Arc::new(AtomicUsize::new(0));
-        let mut module = RpcModule::new(seed_hits.clone());
+    /// Per-method call counters for [`start_mock_rpc`], so round-trip-shape tests can
+    /// assert which upstream calls a path made (and which it skipped).
+    #[derive(Default)]
+    pub(crate) struct MockRpcHits {
+        /// `eth_blockNumber` calls (the tip seed).
+        pub(crate) block_number: AtomicUsize,
+        /// `eth_getHeaderByNumber` calls (numeric or tag).
+        pub(crate) header_by_number: AtomicUsize,
+        /// `eth_getHeaderByHash` calls (the fetch pipeline's number discovery).
+        pub(crate) header_by_hash: AtomicUsize,
+    }
+
+    /// Serves `eth_getHeaderByNumber` (numeric hex or the `latest`/`finalized`/`safe`
+    /// tags, tags answering at `tip`), `eth_getHeaderByHash` (a `tip` header, enough for
+    /// paths that only read the number), and `eth_blockNumber` with `tip` — counting every
+    /// call per method in [`MockRpcHits`].
+    pub(crate) async fn start_mock_rpc(tip: u64) -> (ServerHandle, String, Arc<MockRpcHits>) {
+        let hits = Arc::new(MockRpcHits::default());
+        let mut module = RpcModule::new(hits.clone());
         module
-            .register_method("eth_getHeaderByNumber", |params, _, _| {
-                let (hex,): (String,) = params.parse().unwrap();
-                let n = u64::from_str_radix(hex.strip_prefix("0x").unwrap_or(&hex), 16).unwrap();
+            .register_method("eth_getHeaderByNumber", move |params, hits, _| {
+                hits.header_by_number.fetch_add(1, Ordering::Relaxed);
+                let (tag,): (String,) = params.parse().unwrap();
+                let n = match tag.as_str() {
+                    "latest" | "finalized" | "safe" => tip,
+                    hex => u64::from_str_radix(hex.strip_prefix("0x").unwrap_or(hex), 16).unwrap(),
+                };
                 Ok::<_, ErrorObjectOwned>(consistent_header(n))
             })
             .unwrap();
         module
-            .register_method("eth_blockNumber", move |_params, seed_hits, _| {
-                seed_hits.fetch_add(1, Ordering::Relaxed);
+            .register_method("eth_getHeaderByHash", move |params, hits, _| {
+                hits.header_by_hash.fetch_add(1, Ordering::Relaxed);
+                // Echo the requested hash (the client cross-checks it against the
+                // request); the content is a `tip` header, enough for number discovery.
+                let (hash,): (B256,) = params.parse().unwrap();
+                let header = alloy_rpc_types_eth::Header { hash, ..consistent_header(tip) };
+                Ok::<_, ErrorObjectOwned>(header)
+            })
+            .unwrap();
+        module
+            .register_method("eth_blockNumber", move |_params, hits, _| {
+                hits.block_number.fetch_add(1, Ordering::Relaxed);
                 Ok::<_, ErrorObjectOwned>(format!("{tip:#x}"))
             })
             .unwrap();
         let server =
             jsonrpsee::server::ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", server.local_addr().unwrap());
-        (server.start(module), url, seed_hits)
+        (server.start(module), url, hits)
     }
 
     /// Serves `mega_getBlockWitness`: "not generated yet" errors for the first
@@ -1537,7 +1610,7 @@ mod tests {
     /// self-consistent headers.
     #[tokio::test]
     async fn resolve_canonical_hash_resolves_upstream_without_db_or_on_db_miss() {
-        let (handle, url, _seed_hits) = start_mock_rpc(1_000_000).await;
+        let (handle, url, _hits) = start_mock_rpc(1_000_000).await;
 
         for db in [None, Some(None)] {
             let provider = provider_at(&url, db);
@@ -1561,7 +1634,7 @@ mod tests {
 
         use crate::server_db::test_support::make_block_meta;
 
-        let (handle, url, seed_hits) = start_mock_rpc(200).await;
+        let (handle, url, hits) = start_mock_rpc(200).await;
         let dir = tempfile::tempdir().unwrap();
         let server_db =
             Arc::new(crate::server_db::ServerDB::new(dir.path().join("t.redb")).unwrap());
@@ -1582,7 +1655,7 @@ mod tests {
         );
         assert_eq!(DivergenceLookups::get_earliest(&*server_db).unwrap().unwrap().0, 200);
         assert_eq!(
-            seed_hits.load(Ordering::Relaxed),
+            hits.block_number.load(Ordering::Relaxed),
             0,
             "a present window tip must gate the memo without an upstream tip seed"
         );
@@ -1604,7 +1677,7 @@ mod tests {
     /// upstream.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resolve_canonical_hash_seeds_tip_for_stateless_numeric_traffic() {
-        let (handle, url, seed_hits) = start_mock_rpc(500).await;
+        let (handle, url, hits) = start_mock_rpc(500).await;
         let provider = provider_at(&url, None);
         let deadline = Instant::now() + Duration::from_secs(2);
 
@@ -1612,14 +1685,18 @@ mod tests {
         // tip 500 admits it as depth-final.
         let deep = provider.resolve_canonical_hash(42, deadline).await.unwrap();
         assert_eq!(deep, consistent_header(42).hash);
-        assert_eq!(seed_hits.load(Ordering::Relaxed), 1, "cold hint must seed exactly once");
+        assert_eq!(
+            hits.block_number.load(Ordering::Relaxed),
+            1,
+            "cold hint must seed exactly once"
+        );
 
         // 400 passes on the seeded hint (500 - 64 = 436); 450 fails the gate and its
         // seed attempt lands inside the throttle window. Neither re-fetches the tip.
         let mid = provider.resolve_canonical_hash(400, deadline).await.unwrap();
         let shallow = provider.resolve_canonical_hash(450, deadline).await.unwrap();
         assert_eq!(shallow, consistent_header(450).hash);
-        assert_eq!(seed_hits.load(Ordering::Relaxed), 1, "further seeds must be throttled");
+        assert_eq!(hits.block_number.load(Ordering::Relaxed), 1, "further seeds must be throttled");
 
         // Upstream gone: both depth-final heights serve from the memo; the shallow one
         // was never memoized and must fail upstream.
@@ -1835,7 +1912,7 @@ mod tests {
             let elapsed = start.elapsed();
 
             let err = match result {
-                Ok(n) => panic!("hanging upstream must surface as an error for {tag:?}, got {n}"),
+                Ok(n) => panic!("hanging upstream must surface as an error for {tag:?}, got {n:?}"),
                 Err(e) => e,
             };
             assert!(
@@ -1847,6 +1924,86 @@ mod tests {
                 "timeout must fire quickly for {tag:?}; elapsed: {elapsed:?}"
             );
         }
+    }
+
+    /// Tag resolution (`Latest`/`Finalized`/`Safe`) binds number → hash in its single
+    /// upstream header fetch: one `eth_getHeaderByNumber` per call, no `eth_blockNumber`
+    /// (which `Latest` used to burn as a separate first round trip), and the returned
+    /// hash is exactly the fetched header's. Numeric and `Earliest` tags stay local and
+    /// return no binding — theirs comes from `resolve_canonical_hash`.
+    #[tokio::test]
+    async fn tag_resolution_binds_hash_in_its_single_round_trip() {
+        let tags = [BlockNumberOrTag::Latest, BlockNumberOrTag::Finalized, BlockNumberOrTag::Safe];
+        let (_handle, url, hits) = start_mock_rpc(200).await;
+        let provider = provider_at(&url, None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        for (i, tag) in tags.into_iter().enumerate() {
+            let resolved = provider.resolve_block_number(tag, deadline).await.unwrap();
+            assert_eq!(resolved, (200, Some(consistent_header(200).hash)), "for {tag:?}");
+            assert_eq!(
+                hits.header_by_number.load(Ordering::Relaxed),
+                i + 1,
+                "exactly one header fetch per {tag:?} resolution"
+            );
+        }
+        assert_eq!(
+            hits.block_number.load(Ordering::Relaxed),
+            0,
+            "no tag resolution may spend a separate eth_blockNumber round trip"
+        );
+        assert_eq!(provider.tip_hint.load(Ordering::Relaxed), 200, "tags must feed the tip hint");
+
+        let seven = provider.resolve_block_number(BlockNumberOrTag::Number(7), deadline).await;
+        assert_eq!(seven.unwrap(), (7, None));
+        let earliest = provider.resolve_block_number(BlockNumberOrTag::Earliest, deadline).await;
+        assert_eq!(earliest.unwrap(), (0, None));
+        assert_eq!(
+            hits.header_by_number.load(Ordering::Relaxed),
+            tags.len(),
+            "numeric tags must resolve without upstream traffic"
+        );
+    }
+
+    /// The fetch pipeline's number-discovery header round trip runs only when the caller
+    /// could not supply the number: a known number skips it entirely; the plain by-hash
+    /// entry still pays it. Pinned by per-method mock counters — the fetch itself times
+    /// out at the (unserved) witness/block stages either way, which is fine: the
+    /// assertion is about which upstream calls were made on the way there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn known_number_skips_header_discovery() {
+        let (_handle, url, hits) = start_mock_rpc(200).await;
+        let provider = provider_with(&url, None);
+        let hash = B256::from([9u8; 32]);
+
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let err = provider
+            .get_block_data_with_known_number(200, hash, deadline)
+            .await
+            .err()
+            .expect("unserved witness/block stages must time out");
+        assert!(matches!(err, DataProviderError::Timeout { .. }), "got: {err:?}");
+        assert_eq!(
+            (
+                hits.header_by_hash.load(Ordering::Relaxed),
+                hits.header_by_number.load(Ordering::Relaxed)
+            ),
+            (0, 0),
+            "a known number must skip header discovery"
+        );
+
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let err = provider
+            .get_block_data_by_hash_with_deadline(hash, deadline)
+            .await
+            .err()
+            .expect("unserved witness/block stages must time out");
+        assert!(matches!(err, DataProviderError::Timeout { .. }), "got: {err:?}");
+        assert_eq!(
+            hits.header_by_hash.load(Ordering::Relaxed),
+            1,
+            "the raw by-hash entry still discovers the number upstream"
+        );
     }
 
     /// Cancellation of the primary fetch task (e.g. client disconnect) must not leak an
