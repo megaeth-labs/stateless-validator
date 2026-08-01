@@ -337,7 +337,9 @@ impl From<Box<RawValue>> for RawJson {
 
 impl serde::Serialize for RawJson {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0.serialize(serializer)
+        // Delegate to the `RawValue` pointee explicitly — `Arc<T>` itself is only
+        // `Serialize` behind serde's optional `rc` feature.
+        self.0.as_ref().serialize(serializer)
     }
 }
 
