@@ -10,8 +10,10 @@
 //!   transaction replay, and state root comparison
 //! - [`validate_block_deriving_updates`]: Variant returning the replay-derived SALT state updates
 //!   for embedders that compare against an independently verified per-block changeset
-//! - [`create_evm_env`]: Creates EVM execution environment from block header and chain
-//!   specification
+//! - [`create_block_execution_env`]: Single home for the per-block execution environment —
+//!   [`EvmEnv`], block executor factory, and hardfork-derived block limits — shared by
+//!   [`replay_block`] and the debug-trace-server's tracing executor ([`create_evm_env`] is its
+//!   EvmEnv sub-step)
 //! - [`replay_block`]: Replays block transactions to compute state changes
 //!
 //! [`replay_block`] / [`validate_block`] are generic over [`BlockInput`], the minimal block
@@ -282,6 +284,20 @@ pub fn create_evm_env(
     EvmEnv::new(cfg_env, block_env)
 }
 
+/// The assembled per-block execution environment — [`create_block_execution_env`]'s output,
+/// named so the assembled shape is spelled once and callers hold one value instead of
+/// re-declaring the factory's generics.
+pub struct BlockExecutionEnv<ENV> {
+    /// EVM configuration + block environment.
+    pub evm_env: EvmEnv<MegaSpecId>,
+    /// Block executor factory wired with the chain spec and the external-env factory.
+    pub executor_factory:
+        MegaBlockExecutorFactory<ChainSpec, MegaEvmFactory<ENV>, OpAlloyReceiptBuilder>,
+    /// Execution context carrying parent linkage, extra data, and the hardfork-derived
+    /// [`BlockLimits`].
+    pub ctx: MegaBlockExecutionCtx,
+}
+
 /// Builds the full mega-evm execution environment for one block: the [`EvmEnv`], the block
 /// executor factory, and the execution context carrying the hardfork-derived [`BlockLimits`].
 ///
@@ -293,11 +309,7 @@ pub fn create_block_execution_env<ENV>(
     chain_spec: &ChainSpec,
     header: &alloy_consensus::Header,
     ext_env: ENV,
-) -> (
-    EvmEnv<MegaSpecId>,
-    MegaBlockExecutorFactory<ChainSpec, MegaEvmFactory<ENV>, OpAlloyReceiptBuilder>,
-    MegaBlockExecutionCtx,
-)
+) -> BlockExecutionEnv<ENV>
 where
     ENV: ExternalEnvFactory + Clone,
 {
@@ -320,7 +332,7 @@ where
         block_limits,
     );
 
-    (evm_env, executor_factory, execution_context)
+    BlockExecutionEnv { evm_env, executor_factory, ctx: execution_context }
 }
 
 /// Minimal projection of a block that [`replay_block`] / [`validate_block`] need: the consensus
@@ -430,7 +442,7 @@ where
         hardfork = ?chain_spec.hardfork(header.timestamp),
         "Replay block"
     );
-    let (evm_env, executor_factory, execution_context) =
+    let BlockExecutionEnv { evm_env, executor_factory, ctx: execution_context } =
         create_block_execution_env(chain_spec, header, env_oracle);
 
     let executor = executor_factory.create_executor(&mut state, execution_context, evm_env);
@@ -877,8 +889,8 @@ mod tests {
 
     /// Empty-witness external env for tests that only exercise environment assembly.
     fn empty_ext_env(block_number: u64) -> WitnessExternalEnv {
-        let witness = crate::LightWitness { kvs: Default::default(), levels: Default::default() };
-        WitnessExternalEnv::from_light_witness(&witness, block_number).unwrap()
+        WitnessExternalEnv::from_light_witness(&crate::LightWitness::default(), block_number)
+            .unwrap()
     }
 
     /// Without an active MegaETH hardfork, `create_block_execution_env` must still cap
@@ -889,11 +901,12 @@ mod tests {
         let header =
             alloy_consensus::Header { gas_limit: 12_345, ..alloy_consensus::Header::default() };
         // `ChainSpec::default()` schedules no hardforks → the fallback branch.
-        let (_, _, ctx) = create_block_execution_env(
+        let ctx = create_block_execution_env(
             &ChainSpec::default(),
             &header,
             empty_ext_env(header.number),
-        );
+        )
+        .ctx;
         assert_eq!(
             ctx.block_limits,
             BlockLimits::no_limits().with_block_gas_limit(12_345),
@@ -913,7 +926,7 @@ mod tests {
         };
         let hardfork =
             spec.hardfork(header.timestamp).expect("fixture genesis schedules hardforks");
-        let (_, _, ctx) = create_block_execution_env(&spec, &header, empty_ext_env(header.number));
+        let ctx = create_block_execution_env(&spec, &header, empty_ext_env(header.number)).ctx;
         assert_eq!(
             ctx.block_limits,
             BlockLimits::from_hardfork_and_block_gas_limit(hardfork, header.gas_limit),

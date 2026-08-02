@@ -26,7 +26,6 @@
 
 use alloy_consensus::Transaction;
 use alloy_evm::{Evm as EvmTrait, block::BlockExecutor};
-use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{B256, map::HashMap};
 use alloy_rpc_types_eth::{Block, BlockTransactions, TransactionInfo};
 use alloy_rpc_types_trace::{
@@ -40,7 +39,6 @@ use alloy_rpc_types_trace::{
     parity::LocalizedTransactionTrace,
 };
 use eyre::Result;
-use mega_evm::{MegaBlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory};
 use op_alloy_network::TransactionResponse;
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use revm::{
@@ -56,7 +54,7 @@ use revm_inspectors::tracing::{
 use stateless_core::{
     chain_spec::ChainSpec,
     evm_database::{WitnessDatabase, WitnessExternalEnv},
-    executor::{ValidationError, create_block_execution_env},
+    executor::{BlockExecutionEnv, ValidationError, create_block_execution_env},
     light_witness::{LightWitness, LightWitnessExecutor},
 };
 use tracing::{instrument, trace, warn};
@@ -100,13 +98,9 @@ struct TracingEnv<'a> {
     /// so the witness DB can never be paired with a different block's header.
     header: &'a alloy_consensus::Header,
     transactions: &'a [OpTransaction],
-    executor_factory: MegaBlockExecutorFactory<
-        ChainSpec,
-        MegaEvmFactory<WitnessExternalEnv>,
-        OpAlloyReceiptBuilder,
-    >,
-    block_ctx: MegaBlockExecutionCtx,
-    evm_env: alloy_evm::EvmEnv<mega_evm::MegaSpecId>,
+    /// Shared with `replay_block`: the same env, factory, hardfork → limits mapping, and
+    /// extra_data (system transactions) the validator executes with.
+    exec: BlockExecutionEnv<WitnessExternalEnv>,
     light_witness_executor: LightWitnessExecutor,
 }
 
@@ -124,20 +118,9 @@ impl<'a> TracingEnv<'a> {
             .map_err(ValidationError::EnvOracleConstructionFailed)?;
 
         let light_witness_executor = LightWitnessExecutor::from(light_witness);
+        let exec = create_block_execution_env(chain_spec, &block.header.inner, ext_env);
 
-        // Shared with `replay_block`: the same env, factory, hardfork → limits mapping, and
-        // extra_data (system transactions) the validator executes with.
-        let (evm_env, executor_factory, block_ctx) =
-            create_block_execution_env(chain_spec, &block.header.inner, ext_env);
-
-        Ok(Self {
-            header: &block.header.inner,
-            transactions,
-            executor_factory,
-            block_ctx,
-            evm_env,
-            light_witness_executor,
-        })
+        Ok(Self { header: &block.header.inner, transactions, exec, light_witness_executor })
     }
 
     fn create_witness_db<'b>(
@@ -246,10 +229,10 @@ fn make_tx_ctx(info: &TransactionInfo) -> TransactionContext {
 
 macro_rules! setup_executor {
     ($env:expr, $state:expr, $inspector:expr => $executor:ident) => {
-        let mut $executor = $env.executor_factory.create_executor_with_inspector(
+        let mut $executor = $env.exec.executor_factory.create_executor_with_inspector(
             $state,
-            $env.block_ctx.clone(),
-            $env.evm_env.clone(),
+            $env.exec.ctx.clone(),
+            $env.exec.evm_env.clone(),
             $inspector,
         );
         $executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
@@ -668,7 +651,7 @@ pub fn trace_block(
                                 state: outcome.inner.state,
                             };
 
-                            let evm_env_ref = env.evm_env.clone();
+                            let evm_env_ref = env.exec.evm_env.clone();
                             let tx_env = TxEnv::default();
                             let json_result = {
                                 let (db, js_inspector, _) =
@@ -852,7 +835,7 @@ pub fn trace_transaction(
                 let result_and_state =
                     revm::context::result::ResultAndState { result, state: outcome.inner.state };
 
-                let evm_env_ref = env.evm_env.clone();
+                let evm_env_ref = env.exec.evm_env.clone();
                 let tx_env = TxEnv::default();
                 let (db, js_inspector, _) = EvmTrait::components_mut(&mut executor.evm);
                 js_inspector
