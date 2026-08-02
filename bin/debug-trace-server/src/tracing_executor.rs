@@ -24,7 +24,7 @@
 //! ## Parity-style (trace_* methods)
 //! - `LocalizedTransactionTrace` - Flat call traces with block/tx context
 
-use alloy_consensus::Transaction;
+use alloy_consensus::{Transaction, transaction::Recovered};
 use alloy_evm::{Evm as EvmTrait, block::BlockExecutor};
 use alloy_primitives::{B256, map::HashMap};
 use alloy_rpc_types_eth::{Block, BlockTransactions, TransactionInfo};
@@ -39,6 +39,7 @@ use alloy_rpc_types_trace::{
     parity::LocalizedTransactionTrace,
 };
 use eyre::Result;
+use op_alloy_consensus::OpTxEnvelope;
 use op_alloy_network::TransactionResponse;
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use revm::{
@@ -227,14 +228,23 @@ fn make_tx_ctx(info: &TransactionInfo) -> TransactionContext {
     }
 }
 
-macro_rules! replay_preceding_txs {
-    ($executor:expr, $env:expr, $tx_index:expr) => {
-        for tx in $env.transactions.iter().take($tx_index) {
-            $executor
-                .execute_transaction(&tx.inner.inner)
-                .map_err(ValidationError::BlockReplayFailed)?;
-        }
-    };
+/// Replays the transactions preceding `tx_index` through `executor` (discarding their
+/// output) so the target transaction executes against its true intra-block prestate.
+fn replay_preceding_txs<E>(
+    executor: &mut E,
+    env: &TracingEnv<'_>,
+    tx_index: usize,
+) -> Result<(), ValidationError>
+where
+    E: BlockExecutor,
+    for<'t> &'t Recovered<OpTxEnvelope>: alloy_evm::block::ExecutableTx<E>,
+{
+    for tx in env.transactions.iter().take(tx_index) {
+        executor
+            .execute_transaction(&tx.inner.inner)
+            .map_err(ValidationError::BlockReplayFailed)?;
+    }
+    Ok(())
 }
 
 // TracingInspector-based helpers (shared by Call, PreState, FlatCall, Default)
@@ -361,7 +371,7 @@ fn trace_tx_with_tracing_inspector(
     tracer: &TracerKind,
 ) -> Result<GethTrace, TraceError> {
     let mut executor = env.exec.start_executor_with_inspector(state, tracer.create_inspector())?;
-    replay_preceding_txs!(executor, env, tx_index);
+    replay_preceding_txs(&mut executor, env, tx_index)?;
 
     *executor.inspector_mut() = tracer.create_inspector();
 
@@ -771,7 +781,7 @@ pub fn trace_transaction(
                     let mut executor = env
                         .exec
                         .start_executor_with_inspector(&mut state, FourByteInspector::default())?;
-                    replay_preceding_txs!(executor, &env, tx_index);
+                    replay_preceding_txs(&mut executor, &env, tx_index)?;
 
                     *executor.inspector_mut() = FourByteInspector::default();
 
@@ -787,7 +797,7 @@ pub fn trace_transaction(
 
                     let mut executor =
                         env.exec.start_executor_with_inspector(&mut state, inspector)?;
-                    replay_preceding_txs!(executor, &env, tx_index);
+                    replay_preceding_txs(&mut executor, &env, tx_index)?;
 
                     *executor.inspector_mut() = mux_inspector(mux_config)?;
 
@@ -817,7 +827,7 @@ pub fn trace_transaction(
                     js_inspector(code.clone(), config_json.clone(), make_tx_ctx(&info))?;
 
                 let mut executor = env.exec.start_executor_with_inspector(&mut state, inspector)?;
-                replay_preceding_txs!(executor, &env, tx_index);
+                replay_preceding_txs(&mut executor, &env, tx_index)?;
 
                 *executor.inspector_mut() =
                     js_inspector(code.clone(), config_json, make_tx_ctx(&info))?;
@@ -918,7 +928,7 @@ pub fn parity_trace_transaction(
 
     let inspector = TracingInspector::new(TracingInspectorConfig::default_parity());
     let mut executor = env.exec.start_executor_with_inspector(&mut state, inspector)?;
-    replay_preceding_txs!(executor, &env, tx_index);
+    replay_preceding_txs(&mut executor, &env, tx_index)?;
 
     *executor.inspector_mut() = TracingInspector::new(TracingInspectorConfig::default_parity());
 

@@ -1909,6 +1909,7 @@ dependencies = [
  "mega-evm",
  "metrics",
  "metrics-derive",
+ "op-alloy-consensus",
  "op-alloy-network",
  "op-alloy-rpc-types",
  "pin-project-lite",
