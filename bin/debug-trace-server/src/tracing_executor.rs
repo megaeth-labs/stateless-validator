@@ -227,18 +227,6 @@ fn make_tx_ctx(info: &TransactionInfo) -> TransactionContext {
     }
 }
 
-macro_rules! setup_executor {
-    ($env:expr, $state:expr, $inspector:expr => $executor:ident) => {
-        let mut $executor = $env.exec.executor_factory.create_executor_with_inspector(
-            $state,
-            $env.exec.ctx.clone(),
-            $env.exec.evm_env.clone(),
-            $inspector,
-        );
-        $executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
-    };
-}
-
 macro_rules! replay_preceding_txs {
     ($executor:expr, $env:expr, $tx_index:expr) => {
         for tx in $env.transactions.iter().take($tx_index) {
@@ -262,7 +250,7 @@ fn trace_block_with_tracing_inspector(
     >,
     tracer: &TracerKind,
 ) -> Result<Vec<TraceResult>, ValidationError> {
-    setup_executor!(env, state, tracer.create_inspector() => executor);
+    let mut executor = env.exec.start_executor_with_inspector(state, tracer.create_inspector())?;
 
     let mut results = Vec::with_capacity(env.transactions.len());
     for (index, tx) in env.transactions.iter().enumerate() {
@@ -372,7 +360,7 @@ fn trace_tx_with_tracing_inspector(
     tx_index: usize,
     tracer: &TracerKind,
 ) -> Result<GethTrace, TraceError> {
-    setup_executor!(env, state, tracer.create_inspector() => executor);
+    let mut executor = env.exec.start_executor_with_inspector(state, tracer.create_inspector())?;
     replay_preceding_txs!(executor, env, tx_index);
 
     *executor.inspector_mut() = tracer.create_inspector();
@@ -524,7 +512,9 @@ pub fn trace_block(
                 }
 
                 GethDebugBuiltInTracerType::FourByteTracer => {
-                    setup_executor!(&env, &mut state, FourByteInspector::default() => executor);
+                    let mut executor = env
+                        .exec
+                        .start_executor_with_inspector(&mut state, FourByteInspector::default())?;
 
                     let mut results = Vec::with_capacity(env.transactions.len());
                     for (index, tx) in env.transactions.iter().enumerate() {
@@ -551,7 +541,8 @@ pub fn trace_block(
                 GethDebugBuiltInTracerType::MuxTracer => {
                     let (mux_config, inspector) = mux_config_and_inspector(tracer_config)?;
 
-                    setup_executor!(&env, &mut state, inspector => executor);
+                    let mut executor =
+                        env.exec.start_executor_with_inspector(&mut state, inspector)?;
 
                     let mut results = Vec::with_capacity(env.transactions.len());
                     for (index, tx) in env.transactions.iter().enumerate() {
@@ -616,7 +607,7 @@ pub fn trace_block(
                 let inspector =
                     js_inspector(code.clone(), config_json.clone(), make_tx_ctx(&first_info))?;
 
-                setup_executor!(&env, &mut state, inspector => executor);
+                let mut executor = env.exec.start_executor_with_inspector(&mut state, inspector)?;
 
                 let mut results = Vec::with_capacity(env.transactions.len());
                 for (index, tx) in env.transactions.iter().enumerate() {
@@ -777,7 +768,9 @@ pub fn trace_transaction(
                 }
 
                 GethDebugBuiltInTracerType::FourByteTracer => {
-                    setup_executor!(&env, &mut state, FourByteInspector::default() => executor);
+                    let mut executor = env
+                        .exec
+                        .start_executor_with_inspector(&mut state, FourByteInspector::default())?;
                     replay_preceding_txs!(executor, &env, tx_index);
 
                     *executor.inspector_mut() = FourByteInspector::default();
@@ -792,7 +785,8 @@ pub fn trace_transaction(
                 GethDebugBuiltInTracerType::MuxTracer => {
                     let (mux_config, inspector) = mux_config_and_inspector(tracer_config)?;
 
-                    setup_executor!(&env, &mut state, inspector => executor);
+                    let mut executor =
+                        env.exec.start_executor_with_inspector(&mut state, inspector)?;
                     replay_preceding_txs!(executor, &env, tx_index);
 
                     *executor.inspector_mut() = mux_inspector(mux_config)?;
@@ -822,7 +816,7 @@ pub fn trace_transaction(
                 let inspector =
                     js_inspector(code.clone(), config_json.clone(), make_tx_ctx(&info))?;
 
-                setup_executor!(&env, &mut state, inspector => executor);
+                let mut executor = env.exec.start_executor_with_inspector(&mut state, inspector)?;
                 replay_preceding_txs!(executor, &env, tx_index);
 
                 *executor.inspector_mut() =
@@ -869,7 +863,7 @@ pub fn parity_trace_block(
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
     let inspector = TracingInspector::new(TracingInspectorConfig::default_parity());
-    setup_executor!(&env, &mut state, inspector => executor);
+    let mut executor = env.exec.start_executor_with_inspector(&mut state, inspector)?;
 
     let mut all_traces = Vec::new();
 
@@ -923,7 +917,7 @@ pub fn parity_trace_transaction(
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
     let inspector = TracingInspector::new(TracingInspectorConfig::default_parity());
-    setup_executor!(&env, &mut state, inspector => executor);
+    let mut executor = env.exec.start_executor_with_inspector(&mut state, inspector)?;
     replay_preceding_txs!(executor, &env, tx_index);
 
     *executor.inspector_mut() = TracingInspector::new(TracingInspectorConfig::default_parity());

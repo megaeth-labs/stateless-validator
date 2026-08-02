@@ -47,15 +47,18 @@ use alloy_primitives::{
 };
 use alloy_rpc_types_eth::{Block, BlockTransactions};
 use mega_evm::{
-    BlockLimits, ExternalEnvFactory, MegaBlockExecutionCtx, MegaBlockExecutorFactory,
-    MegaEvmFactory, MegaHardforks, MegaSpecId,
+    BlockLimits, ExternalEnvFactory, MegaBlockExecutionCtx, MegaBlockExecutor,
+    MegaBlockExecutorFactory, MegaContext, MegaEvm, MegaEvmFactory, MegaHardforks, MegaSpecId,
 };
 use op_alloy_consensus::OpTxEnvelope;
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use revm::{
     DatabaseRef,
     context::{BlockEnv, CfgEnv},
-    database::states::{BundleAccount, StateBuilder, bundle_state::BundleRetention},
+    database::{
+        State,
+        states::{BundleAccount, StateBuilder, bundle_state::BundleRetention},
+    },
     primitives::{B256, KECCAK_EMPTY, U256, eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN},
     state::Bytecode,
 };
@@ -296,6 +299,44 @@ pub struct BlockExecutionEnv<ENV> {
     /// Execution context carrying parent linkage, extra data, and the hardfork-derived
     /// [`BlockLimits`].
     pub ctx: MegaBlockExecutionCtx,
+}
+
+/// The block executor [`BlockExecutionEnv::start_executor_with_inspector`] produces: a
+/// [`MegaBlockExecutor`] over the caller's `state` and `inspector`, wired to the env's
+/// external-env factory.
+pub type EnvExecutor<'a, DB, I, ENV> = MegaBlockExecutor<
+    ChainSpec,
+    MegaEvm<&'a mut State<DB>, I, <ENV as ExternalEnvFactory>::EnvTypes>,
+    OpAlloyReceiptBuilder,
+>;
+
+impl<ENV> BlockExecutionEnv<ENV>
+where
+    ENV: ExternalEnvFactory + Clone,
+{
+    /// Creates a block executor over `state` with `inspector` and applies the pre-execution
+    /// changes — the executor prologue shared by every tracing dispatch arm (validation's
+    /// transaction replay runs the same prologue inline). Living here, the executor's
+    /// concrete type is spelled once next to the env that produces it; callers bind the
+    /// result by inference.
+    pub fn start_executor_with_inspector<'a, DB, I>(
+        &self,
+        state: &'a mut State<DB>,
+        inspector: I,
+    ) -> Result<EnvExecutor<'a, DB, I, ENV>, ValidationError>
+    where
+        DB: alloy_evm::Database + 'a,
+        I: revm::Inspector<MegaContext<&'a mut State<DB>, ENV::EnvTypes>> + 'a,
+    {
+        let mut executor = self.executor_factory.create_executor_with_inspector(
+            state,
+            self.ctx.clone(),
+            self.evm_env.clone(),
+            inspector,
+        );
+        executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
+        Ok(executor)
+    }
 }
 
 /// Builds the full mega-evm execution environment for one block: the [`EvmEnv`], the block
