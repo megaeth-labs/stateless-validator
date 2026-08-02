@@ -103,7 +103,6 @@ where
     // Reused across iterations to avoid per-iteration allocations; typical batch
     // size is small (<= `concurrent_workers`) and stable.
     let mut batch: Vec<H::Output> = Vec::new();
-    let mut metas: Vec<BlockMeta> = Vec::new();
 
     loop {
         let item = tokio::select! {
@@ -188,17 +187,16 @@ where
             let advance_store = store.clone();
             let advance_hooks = hooks.clone();
             let owned_batch = std::mem::take(&mut batch);
-            let mut owned_metas = std::mem::take(&mut metas);
             let advanced = tokio::task::spawn_blocking(move || {
-                owned_metas.clear();
-                owned_metas.extend(owned_batch.iter().map(|item| item.to_block_meta()));
+                let metas: Vec<BlockMeta> =
+                    owned_batch.iter().map(|item| item.to_block_meta()).collect();
                 advance_hooks.pre_advance(&owned_batch)?;
-                advance_store.advance_chain(&owned_metas)?;
-                Ok::<_, eyre::Report>((owned_batch, owned_metas))
+                advance_store.advance_chain(&metas)?;
+                Ok::<_, eyre::Report>(owned_batch)
             })
             .await;
-            (batch, metas) = match advanced {
-                Ok(bufs) => bufs?,
+            batch = match advanced {
+                Ok(buf) => buf?,
                 // A panic in the store/hooks must propagate unchanged, exactly as it did
                 // when these calls ran inline on this task.
                 Err(join_err) => match join_err.try_into_panic() {
@@ -209,7 +207,7 @@ where
             persisted_tip = current_tip.block_number;
             debug!(
                 tip = current_tip.block_number,
-                advanced = metas.len(),
+                advanced = batch.len(),
                 buffered = buffer.len(),
                 "Chain advanced"
             );
