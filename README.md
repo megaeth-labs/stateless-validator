@@ -108,9 +108,11 @@ Disable the cache with `--response-cache-disabled`; `--response-cache-estimated-
 
 **Response compression:**
 Responses negotiate gzip/zstd per request via the client's `Accept-Encoding` header; clients that do not send it keep receiving identity bodies, so nothing changes for consumers that have not opted in.
+Bodies of 4 KiB or less are always served identity: compressing them would cost a per-response encoder allocation and downgrade `Content-Length` to chunked framing for a few dozen saved bytes.
 Compression runs at the fastest level while the body streams, so `x-execution-time-ns` excludes its CPU cost and `x-response-size` keeps reporting the uncompressed payload size.
 Compressing at the origin also shrinks a fronting CDN's back-to-origin leg, which edge-side compression alone cannot do.
-Disable with `--response-compression-disabled` if compression CPU ever needs to be shed at the server.
+Known trade-off: the response cache stores identity JSON, so an opted-in client pays the (fast-level) compression on every cache hit; a per-encoding compressed-variant cache is the follow-up if hit-path CPU ever shows up in profiles.
+Disable with `--response-compression-disabled` if compression CPU needs to be shed at the server immediately.
 
 **Canonical-hash memo:**
 `CANONICAL_CHAIN` stays a bounded, contiguous sync window; heights outside it resolve number → hash upstream once, and the hash-verified answer is memoized in a bounded in-memory LRU.

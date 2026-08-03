@@ -62,6 +62,10 @@ use stateless_core::{
 use stateless_db::ContractCache;
 use tokio::task;
 use tokio_util::sync::CancellationToken;
+use tower::{
+    ServiceBuilder,
+    layer::util::{Identity, Stack},
+};
 use tracing::{debug, error, info, instrument, warn};
 
 mod block_data_cache;
@@ -400,6 +404,31 @@ fn validate_args(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// The middleware stack [`http_middleware`] composes, innermost layer first.
+type HttpMiddleware = ServiceBuilder<
+    Stack<
+        timing::TimingHeaderLayer,
+        Stack<
+            response_size::ResponseSizeLayer,
+            Stack<compression::ResponseCompressionLayer, Identity>,
+        >,
+    >,
+>;
+
+/// Composes the HTTP middleware stack — the one place its order is defined (the unit
+/// tests in [`compression`] run requests through this exact stack).
+///
+/// Compression must stay outermost: `ResponseSizeLayer` reads the body's exact
+/// `size_hint` (gone once the body is a compressed stream), and the timing layer's
+/// future resolves before the body streams — so this order keeps `x-response-size` at
+/// the uncompressed payload size and `x-execution-time-ns` free of compression CPU.
+pub(crate) fn http_middleware(compression_enabled: bool) -> HttpMiddleware {
+    ServiceBuilder::new()
+        .layer(compression::layer(compression_enabled))
+        .layer(response_size::ResponseSizeLayer)
+        .layer(timing::TimingHeaderLayer)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -432,6 +461,7 @@ async fn main() -> Result<()> {
         response_cache_disabled = args.response_cache_disabled,
         response_cache_max_size = args.response_cache_max_size,
         response_cache_estimated_items = args.response_cache_estimated_items,
+        response_compression_disabled = args.response_compression_disabled,
         "Server configuration"
     );
 
@@ -628,23 +658,13 @@ async fn main() -> Result<()> {
     let config = ServerConfig::builder().max_response_body_size(u32::MAX).build();
     let server = Server::builder()
         .set_config(config)
-        .set_http_middleware(
-            tower::ServiceBuilder::new()
-                // outermost so x-response-size below still sees the uncompressed body
-                .layer(compression::layer(!args.response_compression_disabled))
-                .layer(response_size::ResponseSizeLayer)
-                .layer(timing::TimingHeaderLayer),
-        )
+        .set_http_middleware(http_middleware(!args.response_compression_disabled))
         .build(&args.addr)
         .await?;
     let addr = server.local_addr()?;
     let handle = server.start(module);
 
-    info!(
-        listen_addr = %addr,
-        response_compression = !args.response_compression_disabled,
-        "Server started"
-    );
+    info!(listen_addr = %addr, "Server started");
     handle.stopped().await;
 
     Ok(())
@@ -1127,6 +1147,23 @@ mod tests {
             "DEBUG_TRACE_SERVER_RESPONSE_CACHE_DISABLED",
             "true",
             || parse_args(&[]).response_cache_disabled,
+        );
+        assert!(disabled_via_env);
+    }
+
+    /// Compression kill switch: compression defaults on, disable via CLI or env.
+    #[test]
+    fn response_compression_flag() {
+        let guard = stateless_test_utils::env::env_lock();
+
+        assert!(!parse_args(&[]).response_compression_disabled);
+        assert!(parse_args(&["--response-compression-disabled"]).response_compression_disabled);
+
+        let disabled_via_env = stateless_test_utils::env::with_env_var(
+            &guard,
+            "DEBUG_TRACE_SERVER_RESPONSE_COMPRESSION_DISABLED",
+            "true",
+            || parse_args(&[]).response_compression_disabled,
         );
         assert!(disabled_via_env);
     }
