@@ -66,6 +66,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 mod block_data_cache;
 mod chain_sync;
+mod compression;
 mod data_provider;
 mod metrics;
 mod response_cache;
@@ -180,6 +181,12 @@ struct Args {
     /// Disable the HTTP response cache entirely (every trace response is recomputed).
     #[clap(long, env = "DEBUG_TRACE_SERVER_RESPONSE_CACHE_DISABLED")]
     response_cache_disabled: bool,
+
+    /// Disable gzip/zstd response compression (normally negotiated per request via the
+    /// client's `Accept-Encoding` header; clients that do not opt in always get
+    /// identity bodies either way).
+    #[clap(long, env = "DEBUG_TRACE_SERVER_RESPONSE_COMPRESSION_DISABLED")]
+    response_compression_disabled: bool,
 
     /// Estimated number of items in response cache (for initial capacity). Must be at
     /// least 1 — disable the cache with `--response-cache-disabled`, not with 0.
@@ -623,6 +630,8 @@ async fn main() -> Result<()> {
         .set_config(config)
         .set_http_middleware(
             tower::ServiceBuilder::new()
+                // outermost so x-response-size below still sees the uncompressed body
+                .layer(compression::layer(!args.response_compression_disabled))
                 .layer(response_size::ResponseSizeLayer)
                 .layer(timing::TimingHeaderLayer),
         )
@@ -631,7 +640,11 @@ async fn main() -> Result<()> {
     let addr = server.local_addr()?;
     let handle = server.start(module);
 
-    info!(listen_addr = %addr, "Server started");
+    info!(
+        listen_addr = %addr,
+        response_compression = !args.response_compression_disabled,
+        "Server started"
+    );
     handle.stopped().await;
 
     Ok(())

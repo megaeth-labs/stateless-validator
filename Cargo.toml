@@ -70,6 +70,7 @@ dotenvy = "0.15"
 dyn-clone = "1.0"
 eyre = { version = "0.6", features = ["auto-install"], default-features = false }
 fastrand = { version = "2.4", default-features = false }
+flate2 = { version = "1.1", features = ["rust_backend"], default-features = false }
 futures = { version = "0.3", default-features = false }
 hashbrown = { version = "0.16", default-features = false }
 hex = { version = "0.4", default-features = false }
@@ -102,6 +103,7 @@ thiserror = { version = "2.0", default-features = false }
 tokio = { version = "1.51", features = ["rt-multi-thread", "signal"], default-features = false }
 tokio-util = { version = "0.7", default-features = false }
 tower = "0.5"
+tower-http = { version = "0.6", features = ["compression-gzip", "compression-zstd"], default-features = false }
 tracing = { version = "0.1", default-features = false }
 tracing-appender = "0.2"
 tracing-subscriber = { version = "=0.3.23", features = ["ansi", "env-filter", "fmt", "json"], default-features = false }

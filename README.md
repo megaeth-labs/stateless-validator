@@ -106,6 +106,12 @@ JS tracers, `muxTracer`, and struct-logger requests with non-default flags bypas
 A type-malformed `tracerConfig` on a config-reading builtin (`callTracer`/`prestateTracer`/`flatCallTracer`) is rejected with `-32602 invalid params` instead of being silently traced with default settings.
 Disable the cache with `--response-cache-disabled`; `--response-cache-estimated-items` must be at least 1 (the old `=0` disable convention is rejected at startup).
 
+**Response compression:**
+Responses negotiate gzip/zstd per request via the client's `Accept-Encoding` header; clients that do not send it keep receiving identity bodies, so nothing changes for consumers that have not opted in.
+Compression runs at the fastest level while the body streams, so `x-execution-time-ns` excludes its CPU cost and `x-response-size` keeps reporting the uncompressed payload size.
+Compressing at the origin also shrinks a fronting CDN's back-to-origin leg, which edge-side compression alone cannot do.
+Disable with `--response-compression-disabled` if compression CPU ever needs to be shed at the server.
+
 **Canonical-hash memo:**
 `CANONICAL_CHAIN` stays a bounded, contiguous sync window; heights outside it resolve number → hash upstream once, and the hash-verified answer is memoized in a bounded in-memory LRU.
 Only depth-final heights are memoized (more than a safety depth below the observed tip, so a memoized binding can no longer reorg); shallow and above-tip heights resolve upstream on every request.

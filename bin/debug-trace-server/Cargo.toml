@@ -55,6 +55,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tokio-util.workspace = true
 tower.workspace = true
+tower-http.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
@@ -65,11 +66,13 @@ alloy-primitives.workspace = true
 alloy-signer-local.workspace = true
 bytes.workspace = true
 dotenvy.workspace = true
+flate2.workspace = true
 http-body-util.workspace = true
 
 # HTTP client for integration tests
 reqwest = { workspace = true, features = ["blocking", "json"] }
 tempfile.workspace = true
+zstd.workspace = true
 
 # stateless
 stateless-test-utils = { path = "../../crates/stateless-test-utils" }
