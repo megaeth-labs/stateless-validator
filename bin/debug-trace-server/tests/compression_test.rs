@@ -82,6 +82,11 @@ fn large_trace(client: &Client, accept_encoding: &str) -> Option<(HeaderMap, Vec
         .parse()
         .unwrap();
     if size <= MIN_COMPRESS_SIZE {
+        // still assert the threshold behavior before skipping the compression checks
+        assert!(
+            headers.get(CONTENT_ENCODING).is_none(),
+            "sub-threshold response must stay identity"
+        );
         println!(
             "    ⚠ latest-block trace is only {size} bytes (≤ {MIN_COMPRESS_SIZE}) — skipping"
         );
@@ -135,7 +140,7 @@ fn test_gzip_negotiated() {
 fn test_zstd_negotiated() {
     let Some((headers, body)) = large_trace(&client(), "zstd") else { return };
     assert_eq!(headers.get(CONTENT_ENCODING).map(|v| v.to_str().unwrap()), Some("zstd"));
-    let decoded = zstd::stream::decode_all(&body[..]).expect("body should be valid zstd");
+    let decoded = zstd::decode_all(&body[..]).expect("body should be valid zstd");
     serde_json::from_slice::<Value>(&decoded).expect("decoded body should be JSON");
     println!("    ✓ zstd: {} bytes on the wire, {} decoded", body.len(), decoded.len());
 }
