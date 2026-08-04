@@ -1034,6 +1034,33 @@ mod tests {
         );
     }
 
+    /// `start_executor_with_inspector` is the executor prologue shared with the trace
+    /// server's dispatch arms; run it over an empty state from core's own tests so the
+    /// wiring (executor construction + pre-execution changes) is exercised here, not only
+    /// through the trace-server binary.
+    #[test]
+    fn execution_env_starts_executor_with_inspector() {
+        // Far-future timestamp: the fixture genesis's hardforks (incl. Regolith, which
+        // mega-evm asserts is active) are all in effect.
+        let header = alloy_consensus::Header {
+            timestamp: u64::MAX,
+            gas_limit: 30_000_000,
+            // Post-Cancun headers must carry it; the EIP-4788 pre-execution call reads it.
+            parent_beacon_block_root: Some(B256::ZERO),
+            ..alloy_consensus::Header::default()
+        };
+        let env =
+            create_block_execution_env(&chain_spec(), &header, empty_ext_env(header.number));
+        let mut state = StateBuilder::new()
+            .with_database_ref(revm::database::EmptyDB::default())
+            .with_bundle_update()
+            .build();
+        let executor = env
+            .start_executor_with_inspector(&mut state, revm::inspector::NoOpInspector)
+            .expect("executor prologue over an empty state must succeed");
+        drop(executor);
+    }
+
     /// The fixture witness for `hash` with the first byte of one witnessed (non-metadata)
     /// value flipped, re-encoded through [`SaltValue::new`] so the entry stays structurally
     /// valid and nothing short of the proof check can notice.
