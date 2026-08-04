@@ -1049,8 +1049,7 @@ mod tests {
             parent_beacon_block_root: Some(B256::ZERO),
             ..alloy_consensus::Header::default()
         };
-        let env =
-            create_block_execution_env(&chain_spec(), &header, empty_ext_env(header.number));
+        let env = create_block_execution_env(&chain_spec(), &header, empty_ext_env(header.number));
         let mut state = StateBuilder::new()
             .with_database_ref(revm::database::EmptyDB::default())
             .with_bundle_update()
