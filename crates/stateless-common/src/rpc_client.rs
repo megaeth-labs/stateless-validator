@@ -2177,7 +2177,16 @@ mod tests {
             }
             if queue_filler.len() >= 64 {
                 // The kernel keeps completing handshakes far past the requested backlog, so
-                // the no-reply condition cannot be reproduced on this host.
+                // the no-reply condition cannot be reproduced on this host. On Linux — the
+                // CI platform, where a backlog-1 listener saturates within a few connects —
+                // that is a hard failure: this is the only regression test of
+                // `connect_timeout`, and a silent skip would let a regression ship behind a
+                // green check. Other dev platforms keep the loud skip.
+                assert!(
+                    !cfg!(target_os = "linux"),
+                    "accept queue did not saturate after 64 connects — \
+                     the connect-timeout path was never exercised"
+                );
                 eprintln!("skipping: accept queue did not saturate");
                 return;
             }
