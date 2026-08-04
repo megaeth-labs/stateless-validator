@@ -599,9 +599,13 @@ impl DataProvider {
     /// Callers that already hold the block's number alongside its hash (a resolved
     /// by-number lookup, a tag binding, a transaction lookup) pass it as `known_number`,
     /// sparing a cold miss the fetch pipeline's number-discovery header round trip. The
-    /// number is trusted only as routing input (witness-source selection and deadline
-    /// tightening) — the served `BlockData` content is keyed and fetched purely by
-    /// `block_hash` either way.
+    /// number does more than route (witness-source selection and deadline tightening):
+    /// it also keys the upstream witness lookup, which resolves rows by number and then
+    /// filters by hash. The hash filter is what makes a wrong number safe — no row at
+    /// the wrong height matches the hash, so the outcome is a miss/error rather than a
+    /// wrong witness — and the served `BlockData` content is keyed and fetched purely by
+    /// `block_hash` either way. A new `known_number` source therefore only needs to be
+    /// hash-consistent, not trusted.
     pub(crate) async fn get_block_data(
         &self,
         block_hash: B256,
