@@ -450,19 +450,31 @@ fn check_cache(
 
 /// Inserts a computed response under the hash of the block it was computed for; a no-op
 /// when the cache is disabled or the request shape is not cacheable (`variant` is `None`).
-/// The insert shares the reply's already-serialized bytes (an `Arc` clone), so nothing is
-/// re-serialized and there is no multi-MB copy to time.
+/// The insert shares the reply's already-serialized bytes (an `Arc` clone), but it is not
+/// free: at the weight ceiling `quick_cache` evicts synchronously and each eviction takes
+/// the index lock, so the insert is still timed and warned about here, where it happens.
 fn insert_cache(
     cache: &Option<ResponseCache>,
     resource: CachedResource,
     block_hash: B256,
     variant: Option<ResponseVariant>,
+    method_name: &'static str,
     result: &RawJson,
 ) {
     let (Some(cache), Some(variant)) = (cache, variant) else {
         return;
     };
+    let t = Instant::now();
     cache.insert(resource, block_hash, variant, result);
+    let insert_ms = t.elapsed().as_millis();
+    if insert_ms >= SLOW_STAGE_THRESHOLD_MS {
+        warn!(
+            method = method_name,
+            block_hash = %block_hash,
+            cache_insert_ms = insert_ms as u64,
+            "slow response-cache insert"
+        );
+    }
 }
 
 /// Serializes a result into its [`RawJson`] reply body and records the response-size
@@ -532,6 +544,7 @@ impl DebugTraceRpcServer for RpcContext {
             CachedResource::DebugTraceBlock,
             data.block.header.hash,
             variant,
+            METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
             &result,
         );
         record_request_completion(
@@ -581,6 +594,7 @@ impl DebugTraceRpcServer for RpcContext {
             CachedResource::DebugTraceBlock,
             block_hash,
             variant,
+            METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
             &result,
         );
         record_request_completion(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, block_num, start);
@@ -708,6 +722,7 @@ impl TraceRpcServer for RpcContext {
             CachedResource::TraceBlock,
             data.block.header.hash,
             Some(ResponseVariant::Default),
+            METHOD_TRACE_BLOCK,
             &result,
         );
         record_request_completion(METHOD_TRACE_BLOCK, data.block.header.number, start);
@@ -1064,7 +1079,7 @@ mod tests {
         let result = RawJson::try_new(&serde_json::json!([{"txHash": "0x01"}])).expect("serialize");
         let hash = B256::from([1u8; 32]);
 
-        insert_cache(&cache, CachedResource::DebugTraceBlock, hash, None, &result);
+        insert_cache(&cache, CachedResource::DebugTraceBlock, hash, None, "m", &result);
         assert_eq!(cache.as_ref().unwrap().len(), 0);
 
         insert_cache(
@@ -1072,6 +1087,7 @@ mod tests {
             CachedResource::DebugTraceBlock,
             hash,
             Some(ResponseVariant::Default),
+            "m",
             &result,
         );
         assert_eq!(cache.as_ref().unwrap().len(), 1);
