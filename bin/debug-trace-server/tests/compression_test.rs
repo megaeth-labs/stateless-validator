@@ -114,7 +114,7 @@ fn test_no_accept_encoding_stays_identity() {
 #[ignore]
 fn test_small_response_stays_identity() {
     let (headers, body) = rpc_raw(&client(), "debug_getCacheStatus", json!([]), Some("gzip, zstd"));
-    assert!(body.len() <= MIN_COMPRESS_SIZE, "cache status unexpectedly large: {}", body.len());
+    assert!(body.len() < MIN_COMPRESS_SIZE, "cache status unexpectedly large: {}", body.len());
     assert!(headers.get(CONTENT_ENCODING).is_none());
     serde_json::from_slice::<Value>(&body).expect("identity body should be plain JSON");
     println!("    ✓ small response stays identity with Accept-Encoding set ({} bytes)", body.len());
