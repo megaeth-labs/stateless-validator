@@ -171,6 +171,33 @@ impl CpuTimeMetrics {
     }
 }
 
+/// Body-streaming telemetry, labeled by negotiated content encoding.
+///
+/// Covers the phase [`CpuTimeMetrics`] cannot see: the request-scoped CPU measurement
+/// is finalized before the first body frame is polled, while compression runs inside
+/// body polling — so its CPU and the actual wire bytes are only observable there.
+#[derive(Clone, Metrics)]
+#[metrics(scope = "debug_trace")]
+pub struct BodyMetrics {
+    /// Thread CPU seconds spent streaming one response body (compression + frame copies)
+    body_cpu_time_seconds: Histogram,
+    /// Bytes put on the wire (post-compression)
+    wire_bytes_total: Counter,
+}
+
+impl BodyMetrics {
+    /// Creates body metrics for one negotiated encoding (`"identity"` when none).
+    pub fn create(encoding: &'static str) -> Self {
+        Self::new_with_labels(&[("encoding", encoding)])
+    }
+
+    /// Records one finished (or aborted) response body.
+    pub fn record(&self, cpu_seconds: f64, wire_bytes: u64) {
+        self.body_cpu_time_seconds.record(cpu_seconds);
+        self.wire_bytes_total.increment(wire_bytes);
+    }
+}
+
 /// Cache hit/miss/size metrics with cache type label, shared by every cache tier.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]

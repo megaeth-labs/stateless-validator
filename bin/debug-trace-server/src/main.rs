@@ -65,6 +65,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 mod block_data_cache;
+mod body_metrics;
 mod chain_sync;
 mod compression;
 mod data_provider;

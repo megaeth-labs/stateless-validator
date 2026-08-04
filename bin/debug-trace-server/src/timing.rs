@@ -127,7 +127,7 @@ where
 /// Uses `clock_gettime` with `CLOCK_THREAD_CPUTIME_ID` to get thread-specific
 /// CPU time, which excludes time spent sleeping or waiting for I/O.
 /// Returns [`Duration::ZERO`] if the system call fails.
-fn thread_cpu_time() -> Duration {
+pub(crate) fn thread_cpu_time() -> Duration {
     use libc::{CLOCK_THREAD_CPUTIME_ID, clock_gettime, timespec};
     unsafe {
         let mut ts = timespec { tv_sec: 0, tv_nsec: 0 };
