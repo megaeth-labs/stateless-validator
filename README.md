@@ -108,11 +108,12 @@ Disable the cache with `--response-cache-disabled`; `--response-cache-estimated-
 
 **Response compression:**
 Responses negotiate gzip/zstd per request via the client's `Accept-Encoding` header; clients that do not send it keep receiving identity bodies, so nothing changes for consumers that have not opted in.
-Bodies of 4 KiB or less are always served identity: compressing them would cost a per-response encoder allocation and downgrade `Content-Length` to chunked framing for a few dozen saved bytes.
-Compression runs at the fastest level while the body streams, so `x-execution-time-ns` excludes its CPU cost and `x-response-size` keeps reporting the uncompressed payload size.
+Bodies under 4 KiB are always served identity: compressing them would cost a per-response encoder allocation and downgrade `Content-Length` to chunked framing for a few dozen saved bytes.
+Compression runs at the fastest level while the body streams, so `x-execution-time-ns` excludes its CPU cost — the header reflects request processing and no longer bounds total request cost — and `x-response-size` keeps reporting the uncompressed payload size.
+The body-streaming phase is metered separately: `debug_trace_body_cpu_time_seconds` and `debug_trace_wire_bytes_total` (labeled by negotiated encoding) record per-response streaming CPU — compression included — and post-compression wire bytes, which is what tells an operator when compression CPU is worth shedding.
 Compressing at the origin also shrinks a fronting CDN's back-to-origin leg, which edge-side compression alone cannot do.
 Known trade-off: the response cache stores identity JSON, so an opted-in client pays the (fast-level) compression on every cache hit.
-Disable with `--response-compression-disabled` if compression CPU needs to be shed at the server immediately.
+Disable with `--response-compression-disabled`; the flag is read at startup, so shedding compression CPU means a restart and a cold-cache window.
 
 **Canonical-hash memo:**
 `CANONICAL_CHAIN` stays a bounded, contiguous sync window; heights outside it resolve number → hash upstream once, and the hash-verified answer is memoized in a bounded in-memory LRU.

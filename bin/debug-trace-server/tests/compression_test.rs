@@ -81,14 +81,14 @@ fn large_trace(client: &Client, accept_encoding: &str) -> Option<(HeaderMap, Vec
         .unwrap()
         .parse()
         .unwrap();
-    if size <= MIN_COMPRESS_SIZE {
+    if size < MIN_COMPRESS_SIZE {
         // still assert the threshold behavior before skipping the compression checks
         assert!(
             headers.get(CONTENT_ENCODING).is_none(),
             "sub-threshold response must stay identity"
         );
         println!(
-            "    ⚠ latest-block trace is only {size} bytes (≤ {MIN_COMPRESS_SIZE}) — skipping"
+            "    ⚠ latest-block trace is only {size} bytes (< {MIN_COMPRESS_SIZE}) — skipping"
         );
         return None;
     }

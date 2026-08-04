@@ -12,7 +12,7 @@ use tower_http::{
     },
 };
 
-/// Bodies at or below this size are served identity even for opted-in clients:
+/// Bodies below this size are served identity even for opted-in clients:
 /// compressing them costs a fresh per-response encoder allocation and downgrades
 /// `Content-Length` to chunked framing for a saving of a few dozen wire bytes.
 pub(crate) const MIN_COMPRESS_SIZE: u16 = 4096;
@@ -29,11 +29,19 @@ pub(crate) type ResponseCompressionLayer = CompressionLayer<And<SizeAbove, Defau
 /// where the fast level already collapses most of the redundancy while keeping
 /// per-response CPU small next to the trace itself.
 pub(crate) fn layer(enabled: bool) -> ResponseCompressionLayer {
+    // no_br/no_deflate are load-bearing, not defaults restated: the layer starts with
+    // every *compiled* encoding enabled, and tower-http features are additive across
+    // the workspace graph — without the explicit opt-out, any dependency enabling
+    // compression-br/compression-deflate would silently widen what this server
+    // negotiates and punch through the kill switch.
+    //
     // size gate first: it short-circuits the content-type checks for the small
     // responses it exists to reject
     CompressionLayer::new()
         .quality(CompressionLevel::Fastest)
         .gzip(enabled)
         .zstd(enabled)
+        .no_br()
+        .no_deflate()
         .compress_when(SizeAbove::new(MIN_COMPRESS_SIZE).and(DefaultPredicate::new()))
 }

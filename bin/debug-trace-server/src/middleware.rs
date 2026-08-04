@@ -1,18 +1,21 @@
 //! Composes the HTTP middleware stack — the one place its order is defined.
 //!
-//! Compression must stay outermost: `ResponseSizeLayer` reads the body's exact
-//! `size_hint` (gone once the body is a compressed stream), and the timing layer's
-//! future resolves before the body streams — so this order keeps `x-response-size` at
-//! the uncompressed payload size and `x-execution-time-ns` free of compression CPU.
-//! The tests below pin exactly that by driving requests through this stack, not a
-//! replica.
+//! Compression must sit outside the size and timing layers: `ResponseSizeLayer` reads
+//! the body's exact `size_hint` (gone once the body is a compressed stream), and the
+//! timing layer's future resolves before the body streams — so this order keeps
+//! `x-response-size` at the uncompressed payload size and `x-execution-time-ns` free of
+//! compression CPU. The body-metrics layer sits outermost, around compression, because
+//! that is the only vantage where compression CPU and true wire bytes are observable
+//! (both happen during body streaming, after every request-scoped measurement is
+//! sealed). The tests below pin exactly that by driving requests through this stack,
+//! not a replica.
 
 use tower::{
     ServiceBuilder,
     layer::util::{Identity, Stack},
 };
 
-use crate::{compression, response_size, timing};
+use crate::{body_metrics, compression, response_size, timing};
 
 /// The middleware stack [`http_middleware`] composes, innermost layer first.
 pub(crate) type HttpMiddleware = ServiceBuilder<
@@ -20,7 +23,10 @@ pub(crate) type HttpMiddleware = ServiceBuilder<
         timing::TimingHeaderLayer,
         Stack<
             response_size::ResponseSizeLayer,
-            Stack<compression::ResponseCompressionLayer, Identity>,
+            Stack<
+                compression::ResponseCompressionLayer,
+                Stack<body_metrics::BodyMetricsLayer, Identity>,
+            >,
         >,
     >,
 >;
@@ -29,6 +35,7 @@ pub(crate) type HttpMiddleware = ServiceBuilder<
 /// load-bearing.
 pub(crate) fn http_middleware(compression_enabled: bool) -> HttpMiddleware {
     ServiceBuilder::new()
+        .layer(body_metrics::BodyMetricsLayer)
         .layer(compression::layer(compression_enabled))
         .layer(response_size::ResponseSizeLayer)
         .layer(timing::TimingHeaderLayer)
@@ -141,10 +148,34 @@ mod tests {
     #[tokio::test]
     async fn small_response_stays_identity() {
         let small = Bytes::from_static(br#"{"jsonrpc":"2.0","id":1,"result":null}"#);
-        assert!(small.len() <= MIN_COMPRESS_SIZE as usize);
+        assert!(small.len() < MIN_COMPRESS_SIZE as usize);
         let (headers, body) = run(true, Some("gzip, zstd"), small.clone()).await;
         assert!(headers.get(CONTENT_ENCODING).is_none());
         assert_eq!(body, small);
+    }
+
+    /// `SizeAbove` compresses at `size >= MIN_COMPRESS_SIZE`: exactly the threshold
+    /// compresses, one byte less stays identity.
+    #[tokio::test]
+    async fn threshold_boundary_is_exact() {
+        let at = Bytes::from(vec![b'a'; MIN_COMPRESS_SIZE as usize]);
+        let (headers, _) = run(true, Some("gzip"), at).await;
+        assert_eq!(headers.get(CONTENT_ENCODING).unwrap(), "gzip");
+
+        let below = Bytes::from(vec![b'a'; MIN_COMPRESS_SIZE as usize - 1]);
+        let (headers, body) = run(true, Some("gzip"), below.clone()).await;
+        assert!(headers.get(CONTENT_ENCODING).is_none());
+        assert_eq!(body, below);
+    }
+
+    /// br/deflate are deliberately not offered; the explicit `no_br()`/`no_deflate()`
+    /// opt-out must hold even if a future dependency turns their tower-http features on
+    /// through workspace feature unification.
+    #[tokio::test]
+    async fn br_and_deflate_are_not_negotiated() {
+        let (headers, body) = run(true, Some("br, deflate"), BODY.clone()).await;
+        assert!(headers.get(CONTENT_ENCODING).is_none());
+        assert_eq!(body, *BODY);
     }
 
     #[tokio::test]
