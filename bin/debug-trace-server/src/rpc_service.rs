@@ -225,7 +225,7 @@ impl RpcContext {
     /// *before* the cache lookup, all on one request deadline; on a miss, fetch block data
     /// by the resolved hash on the remaining budget. Slow prelude stages are warned about
     /// here, where they are measured; trace/serialize timing lives in
-    /// [`compute_block_trace`].
+    /// [`compute_block_trace`] and cache-insert timing in [`insert_cache`].
     async fn lookup_block_by_number(
         &self,
         method: &'static str,
