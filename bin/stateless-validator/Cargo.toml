@@ -37,7 +37,9 @@ bytes.workspace = true
 chrono = { workspace = true, features = ["clock"] }
 clap = { workspace = true, features = ["env"] }
 eyre.workspace = true
+fastrand = { workspace = true, features = ["std"] }
 metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
 redb.workspace = true
 # rustls-tls gives the R2 witness client HTTPS without a system TLS backend.
 reqwest = { workspace = true, features = ["rustls-tls"] }

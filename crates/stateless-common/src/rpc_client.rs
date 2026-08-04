@@ -55,11 +55,11 @@ use crate::{
     witness_size::WitnessSizeBreakdown,
 };
 
-/// Exponential-backoff policy used by [`RpcClient`]'s round-level retry loop and the
-/// validator's R2 witness retry loop.
+/// Exponential-backoff policy used by [`RpcClient`]'s round-level retry loop.
 ///
-/// `initial` is the first sleep duration; each retry doubles it up to `max`. Retry loops
-/// execute the schedule via [`Self::schedule`], which owns the jitter/cap/floor invariants.
+/// `initial` is the first sleep duration; each round doubles it up to `max`.
+/// The loop itself lives in [`round_robin_with_backoff`]; this type only describes
+/// the sleep schedule.
 #[derive(Debug, Clone)]
 pub struct BackoffPolicy {
     /// First retry sleep. Each subsequent retry doubles up to `max`.
@@ -72,36 +72,6 @@ impl BackoffPolicy {
     /// Creates a new policy with the given `initial` and `max` sleep durations.
     pub const fn new(initial: Duration, max: Duration) -> Self {
         Self { initial, max }
-    }
-
-    /// Starts executing the schedule from `initial`.
-    pub fn schedule(&self) -> BackoffSchedule {
-        BackoffSchedule {
-            current_ms: self.initial.as_millis() as u64,
-            max_ms: self.max.as_millis() as u64,
-        }
-    }
-}
-
-/// Stepping state for a [`BackoffPolicy`]'s sleep schedule.
-///
-/// Owns the three invariants every consumer relies on: up to 50% random jitter per sleep
-/// (keeps parallel clients from retrying in lockstep through a shared outage), the `max`
-/// cap, and a 1 ms floor so a zero-duration policy cannot busy-loop a retry loop.
-#[derive(Debug)]
-pub struct BackoffSchedule {
-    current_ms: u64,
-    max_ms: u64,
-}
-
-impl BackoffSchedule {
-    /// Returns the next sleep in milliseconds (jittered, capped, floored at 1 ms) and
-    /// advances the doubling state.
-    pub fn next_sleep_ms(&mut self) -> u64 {
-        let jitter_ms = fastrand::u64(0..=self.current_ms / 2);
-        let sleep_ms = (self.current_ms + jitter_ms).min(self.max_ms).max(1);
-        self.current_ms = (self.current_ms * 2).min(self.max_ms);
-        sleep_ms
     }
 }
 
@@ -296,10 +266,7 @@ impl RpcClient {
     /// # Arguments
     /// * `data_apis` - HTTP URLs of the standard JSON-RPC endpoints for blocks and contract data
     ///   (tried in order, non-empty)
-    /// * `witness_apis` - HTTP URLs of the witness RPC endpoints (tried in order). May be empty
-    ///   when the deployment sources witnesses elsewhere (e.g. the validator's R2 witness mode); a
-    ///   witness call issued with no providers configured panics (see `witness_round_robin`)
-    ///   instead of silently retrying against the wrong endpoints.
+    /// * `witness_apis` - HTTP URLs of the witness RPC endpoints (tried in order, non-empty)
     /// * `config` - Configuration controlling verification, retry, and concurrency behavior
     /// * `report_api` - Optional HTTP URL of the endpoint for reporting validated blocks
     pub fn new_with_config(
@@ -310,6 +277,9 @@ impl RpcClient {
     ) -> Result<Self> {
         if data_apis.is_empty() {
             return Err(eyre!("At least one data API URL must be provided"));
+        }
+        if witness_apis.is_empty() {
+            return Err(eyre!("At least one witness API URL must be provided"));
         }
 
         let data_providers = data_apis
@@ -501,18 +471,10 @@ impl RpcClient {
         self.call_with_deadline(RpcMethod::EthGetBlock, deadline, move |provider| {
             Box::pin(async move {
                 let block = do_get_block_unchecked(&provider, block_id, full_txs).await?;
-                if !verify {
-                    return Ok(block);
-                }
-                // Per-tx ECDSA recovery + re-encoding over a full block is CPU-bound — run it
-                // on the blocking pool (like the witness decode in `fetch_witness_with`)
-                // instead of pinning an async runtime worker for the duration.
-                tokio::task::spawn_blocking(move || {
+                if verify {
                     verify_block_integrity(&block)?;
-                    Ok(block)
-                })
-                .await
-                .context("block verification task panicked")?
+                }
+                Ok(block)
             })
         })
         .await
@@ -737,11 +699,6 @@ impl RpcClient {
         decode: fn(&str) -> std::result::Result<T, crate::WitnessDecodingError>,
         trace_msg: &'static str,
     ) -> std::result::Result<T, RpcDeadlineExceeded> {
-        assert!(
-            !self.witness_providers.is_empty(),
-            "witness call issued with no witness providers configured — this client was \
-             constructed for a deployment that sources witnesses elsewhere (R2 witness mode)"
-        );
         assert!(
             !providers.is_empty() && providers.end <= self.witness_providers.len(),
             "witness provider range ({providers:?}) must select at least one of {} providers",
@@ -1027,7 +984,9 @@ where
     const WARN_AT_ROUND: u32 = 3;
 
     let n = providers.len();
-    let mut backoff = policy.schedule();
+    let max_backoff_ms = policy.max.as_millis() as u64;
+    let initial_backoff_ms = policy.initial.as_millis() as u64;
+    let mut round_backoff_ms = initial_backoff_ms;
     let mut round = 0u32;
     let call_start = Instant::now();
 
@@ -1158,7 +1117,11 @@ where
         // `last_err` is always `Some` here: `n >= 1` is enforced by the `RpcClient`
         // constructor and we only reach this point after `n` iterations that each set it.
         let last_err = last_err.expect("last_err set when every provider failed this round");
-        let mut sleep_ms = backoff.next_sleep_ms();
+        let jitter_ms = fastrand::u64(0..=round_backoff_ms / 2);
+        // `.max(1)` prevents a hot-spin loop if a caller constructs a zero-backoff policy
+        // (`BackoffPolicy::new(Duration::ZERO, Duration::ZERO)`): the computed sleep would
+        // otherwise be `0` and the retry loop would busy-wait on every round.
+        let mut sleep_ms = (round_backoff_ms + jitter_ms).min(max_backoff_ms).max(1);
         // Clamp the sleep so it doesn't overshoot the caller's deadline — if no time is
         // left we bail immediately rather than sleeping past the deadline and then bailing.
         if let Some(d) = deadline {
@@ -1178,6 +1141,7 @@ where
             "All providers failed this round, backing off",
         );
         tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+        round_backoff_ms = (round_backoff_ms * 2).min(max_backoff_ms);
         round += 1;
     }
 }
@@ -1341,19 +1305,13 @@ fn verify_block_integrity(block: &Block<Transaction>) -> Result<()> {
 
     // Verify transaction hashes and transactions root
     if let BlockTransactions::Full(ref transactions) = block.transactions {
-        // Encode each envelope exactly once: keccak of the encoding is the tx hash, and the
-        // same bytes feed the ordered trie for the transactions-root check.
-        let mut encoded_txs: Vec<Vec<u8>> = Vec::with_capacity(transactions.len());
         for tx in transactions {
-            let tx_envelope = tx.inner.inner.inner();
-            let mut encoded = Vec::with_capacity(tx_envelope.encode_2718_len());
-            tx_envelope.encode_2718(&mut encoded);
-            let computed_hash = alloy_primitives::keccak256(&encoded);
+            let tx_envelope = tx.inner.clone().into_inner();
             ensure!(
-                computed_hash == *tx_envelope.hash(),
+                tx_envelope.trie_hash() == *tx_envelope.hash(),
                 "Transaction hash mismatch: expected {:?}, computed {:?}",
                 tx_envelope.hash(),
-                computed_hash
+                tx_envelope.trie_hash()
             );
 
             let recovered = tx_envelope
@@ -1366,11 +1324,10 @@ fn verify_block_integrity(block: &Block<Transaction>) -> Result<()> {
                 tx.from(),
                 recovered
             );
-            encoded_txs.push(encoded);
         }
 
-        let computed_tx_root = ordered_trie_root_with_encoder(&encoded_txs, |tx_bytes, buf| {
-            buf.extend_from_slice(tx_bytes)
+        let computed_tx_root = ordered_trie_root_with_encoder(transactions, |tx, buf| {
+            tx.inner.clone().into_inner().encode_2718(buf)
         });
         ensure!(
             computed_tx_root == block.header.transactions_root,
@@ -1563,12 +1520,11 @@ mod tests {
                 .to_string()
                 .contains("At least one data API")
         );
-        // An empty witness list is a legal configuration (the validator's R2 witness mode);
-        // witness calls on such a client panic instead (see `witness_round_robin`).
-        assert_eq!(
-            RpcClient::new(&[LOCALHOST_A], &[]).unwrap().witness_provider_count(),
-            0,
-            "empty witness list must construct"
+        assert!(
+            RpcClient::new(&[LOCALHOST_A], &[])
+                .unwrap_err()
+                .to_string()
+                .contains("At least one witness API")
         );
 
         for endpoints in [&[LOCALHOST_B][..], &[LOCALHOST_B, "http://localhost:8547"]] {

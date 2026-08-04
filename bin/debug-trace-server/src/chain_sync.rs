@@ -157,7 +157,12 @@ impl BlockFetcher for TraceFetcher {
     async fn latest_block_meta(&self) -> Result<BlockMeta> {
         let header =
             self.rpc_client.get_header(BlockId::Number(BlockNumberOrTag::Latest), false).await;
-        Ok(BlockMeta::from_header(&header))
+        Ok(BlockMeta {
+            block_number: header.number,
+            block_hash: header.hash,
+            post_state_root: header.state_root,
+            post_withdrawals_root: header.withdrawals_root.unwrap_or_default(),
+        })
     }
 }
 
@@ -202,7 +207,12 @@ impl BlockProcessor for TraceProcessor {
         &self,
         (block, witness): Self::Input,
     ) -> std::result::Result<TraceProcessedBlock, Self::Error> {
-        let meta = BlockMeta::from_header(&block.header);
+        let meta = BlockMeta {
+            block_number: block.header.number,
+            block_hash: block.header.hash,
+            post_state_root: block.header.state_root,
+            post_withdrawals_root: block.header.withdrawals_root.unwrap_or_default(),
+        };
         Ok(TraceProcessedBlock { block, witness, meta })
     }
 }

@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     chain_sync::{ValidatorFetcher, ValidatorHooks, ValidatorProcessor},
+    metrics,
     r2_witness::R2WitnessClient,
     validator_db::ValidatorDB,
 };
@@ -43,9 +44,10 @@ pub async fn run_with_signals(
     validator_db: Arc<ValidatorDB>,
     contract_cache: Arc<ContractCache>,
     chain_spec: Arc<ChainSpec>,
-    report_validation: bool,
+    report_validation_endpoint: Option<String>,
     pipeline_config: PipelineConfig,
 ) -> Result<()> {
+    let report_validation = report_validation_endpoint.is_some();
     let config = Arc::new(pipeline_config);
     let is_slice_run = config.sync_target.is_some();
     info!(
@@ -60,7 +62,11 @@ pub async fn run_with_signals(
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .map_err(|e| eyre::eyre!("Failed to register SIGTERM handler: {e}"))?;
 
-    let fetcher = Arc::new(ValidatorFetcher { rpc_client: client.clone(), r2_witness });
+    let fetcher = Arc::new(ValidatorFetcher {
+        rpc_client: client.clone(),
+        r2_witness,
+        on_remote_height: metrics::set_remote_chain_height,
+    });
     let processor =
         Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client.clone() });
     let hooks = Arc::new(ValidatorHooks);

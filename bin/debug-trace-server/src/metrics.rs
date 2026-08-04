@@ -10,9 +10,10 @@ use std::net::SocketAddr;
 use eyre::Result;
 use metrics::{Counter, Gauge, Histogram, counter, histogram};
 use metrics_derive::Metrics;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 pub use stateless_common::{
     DEFAULT_METRICS_PORT,
-    metrics::{BYTE_BUCKETS, REORG_DEPTH_BUCKETS, install_prometheus_exporter},
+    metrics::{BYTE_BUCKETS, REORG_DEPTH_BUCKETS},
 };
 
 /// Prefix for timed RPC method aliases.
@@ -608,7 +609,15 @@ const BUCKET_SPECS: &[(&str, &[f64])] = &[
 
 /// Initializes the Prometheus metrics exporter.
 pub fn init_metrics(addr: SocketAddr) -> Result<()> {
-    install_prometheus_exporter(addr, BUCKET_SPECS)?;
+    let builder = BUCKET_SPECS.iter().fold(PrometheusBuilder::new(), |b, &(name, buckets)| {
+        b.set_buckets_for_metric(Matcher::Full(name.to_owned()), buckets)
+            .expect("valid bucket config")
+    });
+
+    builder
+        .with_http_listener(addr)
+        .install()
+        .map_err(|e| eyre::eyre!("Failed to install metrics exporter: {}", e))?;
 
     // Pre-register all metrics
     pre_register_all_metrics();

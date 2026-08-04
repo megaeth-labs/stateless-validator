@@ -30,9 +30,9 @@
 //! The module integrates with the Salt witness system for state reconstruction
 //! and uses Revm for transaction execution.
 
-#[cfg(feature = "std")]
-use std::time::Instant;
 use std::{boxed::Box, collections::BTreeMap, fmt::Debug, vec::Vec};
+#[cfg(feature = "std")]
+use std::{io::Write, time::Instant};
 
 use alloy_consensus::{TxReceipt, proofs::calculate_receipt_root, transaction::Recovered};
 use alloy_eips::eip2718::Encodable2718;
@@ -52,6 +52,8 @@ use mega_evm::{
 };
 use op_alloy_consensus::OpTxEnvelope;
 use op_alloy_rpc_types::Transaction as OpTransaction;
+#[cfg(feature = "std")]
+use revm::inspector::inspectors::TracerEip3155;
 use revm::{
     DatabaseRef,
     context::{BlockEnv, CfgEnv},
@@ -59,7 +61,7 @@ use revm::{
         State,
         states::{BundleAccount, StateBuilder, bundle_state::BundleRetention},
     },
-    primitives::{B256, KECCAK_EMPTY, U256, eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN},
+    primitives::{B256, KECCAK_EMPTY, U256},
     state::Bytecode,
 };
 use salt::{EphemeralSaltState, SaltValue, SaltWitness, StateRoot, StateUpdates, Witness};
@@ -67,7 +69,7 @@ use thiserror::Error;
 use tracing::debug;
 
 use crate::{
-    chain_spec::ChainSpec,
+    chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec},
     data_types::{Account, PlainKey, PlainValue},
     evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv},
     withdrawals::{self, ADDRESS_L2_TO_L1_MESSAGE_PASSER, MptWitness},
@@ -261,6 +263,10 @@ impl ValidationOptions {
 /// - Chain configuration with appropriate spec ID for the block number
 /// - Block environment with gas limits, timestamps, and fee parameters
 /// - Blob gas pricing if excess blob gas is present in the header
+///
+/// Creates an EVM environment from a block header and chain specification.
+///
+/// This function sets up the configuration and block environment needed for EVM execution.
 pub fn create_evm_env(
     header: &alloy_consensus::Header,
     chain_spec: &ChainSpec,
@@ -280,8 +286,7 @@ pub fn create_evm_env(
     };
 
     if let Some(excess_blob_gas) = header.excess_blob_gas {
-        block_env
-            .set_blob_excess_gas_and_price(excess_blob_gas, BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN);
+        block_env.set_blob_excess_gas_and_price(excess_blob_gas, BLOB_GASPRICE_UPDATE_FRACTION);
     }
 
     EvmEnv::new(cfg_env, block_env)
@@ -462,6 +467,7 @@ pub fn replay_block<B, DB, ENV, E>(
     block: &B,
     db: &DB,
     env_oracle: ENV,
+    #[cfg(feature = "std")] trace_writer: Option<Box<dyn Write>>,
 ) -> Result<(HashMap<Address, BundleAccount>, BlockExecutionOutput), ValidationError>
 where
     B: BlockInput,
@@ -486,9 +492,28 @@ where
     let BlockExecutionEnv { evm_env, executor_factory, ctx: execution_context } =
         create_block_execution_env(chain_spec, header, env_oracle);
 
-    let executor = executor_factory.create_executor(&mut state, execution_context, evm_env);
-    let (receipts_root, logs_bloom, gas_used) =
-        execute_transactions(executor, block.txs_recovered())?;
+    // Plain execution path, shared by the non-tracer std branch and the no_std build.
+    // Extracted as a closure so the body lives in one place — any future change to the
+    // non-tracer path only needs to be made here.
+    let run_plain = |state: &mut _, ctx, env| {
+        let executor = executor_factory.create_executor(state, ctx, env);
+        execute_transactions(executor, block.txs_recovered())
+    };
+
+    #[cfg(feature = "std")]
+    let (receipts_root, logs_bloom, gas_used) = if let Some(writer) = trace_writer {
+        let executor = executor_factory.create_executor_with_inspector(
+            &mut state,
+            execution_context,
+            evm_env,
+            TracerEip3155::new(writer),
+        );
+        execute_transactions(executor, block.txs_recovered())?
+    } else {
+        run_plain(&mut state, execution_context, evm_env)?
+    };
+    #[cfg(not(feature = "std"))]
+    let (receipts_root, logs_bloom, gas_used) = run_plain(&mut state, execution_context, evm_env)?;
 
     // Merge transitions into bundle_state
     state.merge_transitions(BundleRetention::PlainState);
@@ -546,7 +571,8 @@ where
     let logs_bloom =
         execution_result.receipts.iter().fold(Bloom::ZERO, |acc, receipt| acc | receipt.bloom());
 
-    let gas_used = execution_result.gas_used;
+    // Gas used is the cumulative gas used of the last receipt
+    let gas_used = execution_result.receipts.last().map(|r| r.cumulative_gas_used()).unwrap_or(0);
 
     let receipts_root = calculate_receipt_root(&execution_result.receipts);
 
@@ -716,6 +742,7 @@ fn verify_and_replay<B: BlockInput>(
     block: &B,
     salt_witness: SaltWitness,
     contracts: &HashMap<B256, Bytecode>,
+    #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
 ) -> Result<VerifiedReplay, ValidationError> {
     let header = block.consensus_header();
 
@@ -733,7 +760,14 @@ fn verify_and_replay<B: BlockInput>(
     // Replay block transactions
     let ((accounts, output), block_replay_time) = timed(|| {
         let witness_db = WitnessDatabase { header, witness: &witness, contracts };
-        replay_block(chain_spec, block, &witness_db, ext_env)
+        replay_block(
+            chain_spec,
+            block,
+            &witness_db,
+            ext_env,
+            #[cfg(feature = "std")]
+            writer,
+        )
     })?;
 
     let stats = ValidationStats {
@@ -763,6 +797,8 @@ fn verify_and_replay<B: BlockInput>(
 /// * `salt_witness` - The salt witness data needed for state validation
 /// * `mpt_witness` - The MPT witness data for withdrawal verification
 /// * `contracts` - Contract bytecode cache for transaction execution
+/// * `writer` - Optional writer for EIP-3155 trace output. When provided, enables step-by-step EVM
+///   execution tracing in EIP-3155 format.
 ///
 /// # Returns
 ///
@@ -774,6 +810,7 @@ pub fn validate_block<B: BlockInput>(
     salt_witness: SaltWitness,
     mpt_witness: MptWitness,
     contracts: &HashMap<B256, Bytecode>,
+    #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
 ) -> Result<ValidationStats, ValidationError> {
     // A block carrying only transaction hashes can't be replayed — fail fast before paying
     // the witness proof verification. `replay_block` re-checks for direct callers.
@@ -783,8 +820,14 @@ pub fn validate_block<B: BlockInput>(
     let header = block.consensus_header();
 
     // Verify the witness proof and replay the block's transactions over it
-    let VerifiedReplay { witness, accounts, output, mut stats } =
-        verify_and_replay(chain_spec, block, salt_witness, contracts)?;
+    let VerifiedReplay { witness, accounts, output, mut stats } = verify_and_replay(
+        chain_spec,
+        block,
+        salt_witness,
+        contracts,
+        #[cfg(feature = "std")]
+        writer,
+    )?;
 
     // Extract and hash storage updates (only changed values)
     let withdrawal_storage = withdrawal_storage(&accounts);
@@ -844,6 +887,7 @@ pub fn validate_block_deriving_updates<B: BlockInput>(
     mpt_witness: MptWitness,
     contracts: &HashMap<B256, Bytecode>,
     options: ValidationOptions,
+    #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
 ) -> Result<(StateUpdates, ValidationStats), ValidationError> {
     // A block carrying only transaction hashes can't be replayed — fail fast before paying
     // the witness proof verification. `replay_block` re-checks for direct callers.
@@ -872,8 +916,14 @@ pub fn validate_block_deriving_updates<B: BlockInput>(
     }
 
     // Verify the witness proof and replay the block's transactions over it
-    let VerifiedReplay { witness, accounts, output, mut stats } =
-        verify_and_replay(chain_spec, block, salt_witness, contracts)?;
+    let VerifiedReplay { witness, accounts, output, mut stats } = verify_and_replay(
+        chain_spec,
+        block,
+        salt_witness,
+        contracts,
+        #[cfg(feature = "std")]
+        writer,
+    )?;
 
     // Check the header's claims (withdrawals root, receipts root, logs bloom, gas used)
     // before the more expensive state-update derivation.
@@ -915,6 +965,8 @@ mod tests {
             fx.mpt_witness(&hash),
             &fx.contracts,
             options,
+            #[cfg(feature = "std")]
+            None,
         )
     }
 
@@ -925,7 +977,15 @@ mod tests {
         salt_witness: SaltWitness,
         hash: B256,
     ) -> Result<ValidationStats, ValidationError> {
-        validate_block(&chain_spec(), block, salt_witness, fx.mpt_witness(&hash), &fx.contracts)
+        validate_block(
+            &chain_spec(),
+            block,
+            salt_witness,
+            fx.mpt_witness(&hash),
+            &fx.contracts,
+            #[cfg(feature = "std")]
+            None,
+        )
     }
 
     /// Empty-witness external env for tests that only exercise environment assembly.

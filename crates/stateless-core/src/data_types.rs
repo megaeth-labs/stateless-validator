@@ -26,7 +26,7 @@
 use std::{collections::BTreeMap, vec::Vec};
 
 pub use alloy_primitives::Bytes;
-use alloy_primitives::{Address, B256, FixedBytes, U256};
+use alloy_primitives::{Address, B256, U256};
 use revm::primitives::KECCAK_EMPTY;
 use salt::{SaltKey, SaltValue};
 
@@ -67,31 +67,12 @@ impl PlainKey {
     /// - Unknown: preserved raw bytes from decode
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            PlainKey::Account(addr) => Self::account_key_bytes(addr).to_vec(),
-            PlainKey::Storage(addr, slot) => Self::storage_key_bytes(*addr, *slot).to_vec(),
+            PlainKey::Account(addr) => addr.as_slice().to_vec(),
+            PlainKey::Storage(addr, slot) => {
+                addr.concat_const::<SLOT_KEY_LEN, STORAGE_SLOT_KEY_LEN>(*slot).as_slice().to_vec()
+            }
             PlainKey::Unknown(data) => data.clone(),
         }
-    }
-
-    /// Encoding of an account key — the raw address bytes.
-    ///
-    /// Same bytes as `PlainKey::Account(address).encode()` without the heap allocation,
-    /// for per-state-read hot paths.
-    #[inline]
-    pub(crate) fn account_key_bytes(address: &Address) -> &[u8] {
-        address.as_slice()
-    }
-
-    /// Stack-allocated encoding of a storage-slot key — address (20) ++ slot (32).
-    ///
-    /// Same bytes as `PlainKey::Storage(address, slot).encode()` without the heap
-    /// allocation, for per-state-read hot paths.
-    #[inline]
-    pub(crate) fn storage_key_bytes(
-        address: Address,
-        slot: B256,
-    ) -> FixedBytes<STORAGE_SLOT_KEY_LEN> {
-        address.concat_const::<SLOT_KEY_LEN, STORAGE_SLOT_KEY_LEN>(slot)
     }
 
     /// Decodes a byte slice into a PlainKey.

@@ -12,7 +12,7 @@ use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::Block
 use stateless_db::ContractCache;
 use tracing::{info, warn};
 
-use crate::{metrics, r2_witness::R2WitnessClient, runner, validator_db::ValidatorDB};
+use crate::{metrics, r2_witness::R2WitnessClient, validator_db::ValidatorDB, workers};
 
 /// Where the validator sources witnesses from.
 #[derive(ValueEnum, Clone, Debug, PartialEq, Eq, Default)]
@@ -235,7 +235,7 @@ pub struct CommandLineArgs {
 ///
 /// Parses CLI args, initializes tracing and metrics, constructs the RPC client and
 /// validator DB, loads or initializes the chain spec + anchor, then hands off to
-/// [`runner::run_with_signals`].
+/// [`workers::run_with_signals`].
 pub async fn run() -> Result<()> {
     let args = CommandLineArgs::parse();
     let _log_guard = args.log.init_tracing()?;
@@ -275,6 +275,8 @@ pub async fn run() -> Result<()> {
         ..rpc_defaults
     }
     .with_metrics(Arc::new(metrics::ValidatorMetrics));
+    // In R2 mode the RpcClient's witness providers are never used, but its constructor requires
+    // a non-empty list — hand it the data endpoints as a placeholder.
     let data_apis: Vec<&str> = args.rpc_endpoint.iter().map(String::as_str).collect();
     let r2_witness = match args.witness_source {
         WitnessSource::Rpc => {
@@ -310,10 +312,8 @@ pub async fn run() -> Result<()> {
         }
     };
 
-    // In R2 mode the client carries no witness providers: witnesses come straight from R2,
-    // and an accidental witness RPC call fails loudly instead of hitting the data endpoints.
     let witness_apis: Vec<&str> = if r2_witness.is_some() {
-        Vec::new()
+        data_apis.clone()
     } else {
         args.witness_endpoint.iter().map(String::as_str).collect()
     };
@@ -385,13 +385,13 @@ pub async fn run() -> Result<()> {
         info!(end_block = end, "Validating up to end block, then stopping");
     }
 
-    let result = runner::run_with_signals(
+    let result = workers::run_with_signals(
         client,
         r2_witness,
         validator_db,
         contract_cache,
         chain_spec,
-        args.report_validation_endpoint.is_some(),
+        args.report_validation_endpoint,
         pipeline_config,
     )
     .await;

@@ -10,12 +10,10 @@ use std::{
 
 use eyre::Result;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 pub use stateless_common::{
     DEFAULT_METRICS_PORT, WitnessSizeBreakdown,
-    metrics::{
-        BYTE_BUCKETS, REORG_DEPTH_BUCKETS, RpcAttemptOutcome, RpcMethod, RpcMetrics,
-        install_prometheus_exporter,
-    },
+    metrics::{BYTE_BUCKETS, REORG_DEPTH_BUCKETS, RpcAttemptOutcome, RpcMethod, RpcMetrics},
 };
 use tracing::info;
 
@@ -126,7 +124,15 @@ const BUCKET_SPECS: &[(&str, &[f64])] = &[
 
 /// Initialize the Prometheus metrics exporter at the given address.
 pub fn init_metrics(addr: SocketAddr) -> Result<()> {
-    install_prometheus_exporter(addr, BUCKET_SPECS)?;
+    let builder = BUCKET_SPECS.iter().fold(PrometheusBuilder::new(), |b, &(name, buckets)| {
+        b.set_buckets_for_metric(Matcher::Full(name.to_owned()), buckets)
+            .expect("valid bucket config")
+    });
+
+    builder
+        .with_http_listener(addr)
+        .install()
+        .map_err(|e| eyre::eyre!("Failed to install Prometheus exporter: {}", e))?;
 
     register_metric_descriptions();
     init_rpc_method_counters();
@@ -209,6 +215,7 @@ fn init_rpc_method_counters() {
         RpcMethod::EthGetBlock,
         RpcMethod::EthBlockNumber,
         RpcMethod::EthGetHeader,
+        RpcMethod::EthGetTransactionByHash,
         RpcMethod::MegaGetBlockWitness,
         RpcMethod::MegaSetValidatedBlocks,
     ];
