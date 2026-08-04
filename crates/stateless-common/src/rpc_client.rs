@@ -2182,11 +2182,12 @@ mod tests {
                 // that is a hard failure: this is the only regression test of
                 // `connect_timeout`, and a silent skip would let a regression ship behind a
                 // green check. Other dev platforms keep the loud skip.
-                assert!(
-                    !cfg!(target_os = "linux"),
-                    "accept queue did not saturate after 64 connects — \
-                     the connect-timeout path was never exercised"
-                );
+                if cfg!(target_os = "linux") {
+                    panic!(
+                        "accept queue did not saturate after 64 connects — \
+                         the connect-timeout path was never exercised"
+                    );
+                }
                 eprintln!("skipping: accept queue did not saturate");
                 return;
             }
