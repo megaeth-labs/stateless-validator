@@ -214,7 +214,10 @@ impl MegaethGenesisHardforks {
     ///
     /// The literal below is the single source of the canonical MegaETH activation order —
     /// [`ChainSpec::from_genesis`] merges it as-is, so new hardforks must be inserted at
-    /// their activation position.
+    /// their activation position and appended to the expected list in
+    /// `test_mega_hardforks_iterate_in_activation_order`, which pins the order (fork
+    /// selection by timestamp walks `forks_iter()` in insertion order, so a wrong order
+    /// here means wrong hardfork params — consensus divergence — with lookups still green).
     pub fn into_vec(self) -> Vec<(Box<dyn Hardfork>, ForkCondition)> {
         vec![
             (MegaHardfork::MiniRex.boxed(), self.mini_rex_time.map(ForkCondition::Timestamp)),
@@ -352,6 +355,57 @@ mod tests {
         assert_eq!(spec.hardforks.fork(OpHardfork::Holocene), ForkCondition::Timestamp(3));
         assert_eq!(spec.hardforks.fork(OpHardfork::Isthmus), ForkCondition::Timestamp(6));
         assert_eq!(spec.hardforks.fork(MegaHardfork::MiniRex), ForkCondition::Timestamp(3));
+    }
+
+    /// Fork selection by timestamp walks `forks_iter()` in insertion order, so the
+    /// `into_vec` literal IS the consensus activation order. This pins the relative order
+    /// of every MegaETH fork end-to-end through `from_genesis`; a new hardfork must be
+    /// inserted at its activation position in `into_vec` and appended to the expected
+    /// list here.
+    #[test]
+    fn test_mega_hardforks_iterate_in_activation_order() {
+        let mut genesis = Genesis::default();
+        for (field, ts) in [
+            ("miniRexTime", 1u64),
+            ("miniRex1Time", 2),
+            ("miniRex2Time", 3),
+            ("rexTime", 4),
+            ("rex1Time", 5),
+            ("rex2Time", 6),
+            ("rex3Time", 7),
+            ("rex4Time", 8),
+        ] {
+            genesis.config.extra_fields.insert_value(field.to_string(), ts).unwrap();
+        }
+        schedule_valid_rex5(&mut genesis, 9);
+        genesis.config.extra_fields.insert_value("rex6Time".to_string(), 10).unwrap();
+        genesis.config.extra_fields.insert_value("rex6MinRotationDelay".to_string(), 7200).unwrap();
+        let spec = ChainSpec::from_genesis(genesis);
+
+        let expected = [
+            MegaHardfork::MiniRex,
+            MegaHardfork::MiniRex1,
+            MegaHardfork::MiniRex2,
+            MegaHardfork::Rex,
+            MegaHardfork::Rex1,
+            MegaHardfork::Rex2,
+            MegaHardfork::Rex3,
+            MegaHardfork::Rex4,
+            MegaHardfork::Rex5,
+            MegaHardfork::Rex6,
+        ];
+        let mega_order: Vec<&str> = spec
+            .hardforks
+            .forks_iter()
+            .map(|(hardfork, _)| hardfork.name())
+            .filter(|name| expected.iter().any(|mega| mega.name() == *name))
+            .collect();
+        assert_eq!(
+            mega_order,
+            expected.iter().map(|mega| mega.name()).collect::<Vec<_>>(),
+            "MegaETH forks must iterate in canonical activation order — fix the \
+             `into_vec` literal, not this list"
+        );
     }
 
     #[test]

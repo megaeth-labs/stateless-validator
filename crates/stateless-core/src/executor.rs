@@ -471,7 +471,18 @@ where
     let logs_bloom =
         execution_result.receipts.iter().fold(Bloom::ZERO, |acc, receipt| acc | receipt.bloom());
 
+    // `BlockExecutionResult::gas_used` is defined by mega-evm's `finish()` as
+    // `receipts.last().cumulative_gas_used()` — the exact expression the header check
+    // read before switching to this field, so the two cannot disagree regardless of how
+    // system transactions are accounted. The assertion pins that upstream definition: a
+    // future mega-evm that accounts gas outside the receipt chain fails loudly in every
+    // debug/test run instead of silently changing the header check.
     let gas_used = execution_result.gas_used;
+    debug_assert_eq!(
+        gas_used,
+        execution_result.receipts.last().map(|r| r.cumulative_gas_used()).unwrap_or(0),
+        "mega-evm gas_used no longer equals the last receipt's cumulative gas"
+    );
 
     let receipts_root = calculate_receipt_root(&execution_result.receipts);
 
