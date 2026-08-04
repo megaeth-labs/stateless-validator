@@ -294,7 +294,7 @@ pub fn create_evm_env(
 
 /// The assembled per-block execution environment — [`create_block_execution_env`]'s output,
 /// named so the assembled shape is spelled once and callers hold one value instead of
-/// re-declaring the factory's generics.
+/// respelling the factory's generics.
 pub struct BlockExecutionEnv<ENV> {
     /// EVM configuration + block environment.
     pub evm_env: EvmEnv<MegaSpecId>,
