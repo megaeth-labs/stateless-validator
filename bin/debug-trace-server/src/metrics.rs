@@ -403,6 +403,19 @@ pub fn record_r2_witness_error(kind: &'static str) {
     counter!(R2_WITNESS_ERRORS_TOTAL, "kind" => kind).increment(1);
 }
 
+/// Historical-readahead prefetch counter, labeled by outcome.
+const READAHEAD_TOTAL: &str = "debug_trace_readahead_total";
+
+/// Every `outcome` label [`record_readahead`] is called with, for pre-registration:
+/// `scheduled` (prefetch task spawned), `completed` / `failed` (its result), and
+/// `saturated` (candidates dropped because all prefetch permits were in flight).
+pub const READAHEAD_OUTCOMES: &[&str] = &["scheduled", "completed", "failed", "saturated"];
+
+/// Records one readahead scheduling or completion outcome.
+pub fn record_readahead(outcome: &'static str) {
+    counter!(READAHEAD_TOTAL, "outcome" => outcome).increment(1);
+}
+
 /// Canonical number → hash resolution counter, labeled `(source, outcome)` — how often
 /// by-number requests resolve their canonical hash from the local DB index vs upstream,
 /// and how often resolution misses or fails.
@@ -593,6 +606,11 @@ fn pre_register_all_metrics() {
     counter!(R2_WITNESS_RETRIES_TOTAL).increment(0);
     for kind in crate::r2_witness::R2WitnessError::KINDS {
         counter!(R2_WITNESS_ERRORS_TOTAL, "kind" => *kind).increment(0);
+    }
+
+    // Data Fetch Layer: historical readahead
+    for outcome in READAHEAD_OUTCOMES {
+        counter!(READAHEAD_TOTAL, "outcome" => *outcome).increment(0);
     }
 
     // Data Fetch Layer: single-flight

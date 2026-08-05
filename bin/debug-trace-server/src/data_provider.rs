@@ -28,6 +28,7 @@
 //! Response caching is handled at the HTTP layer by `ResponseCache`, not here.
 
 use std::{
+    collections::{HashSet, VecDeque},
     future::Future,
     pin::Pin,
     sync::{
@@ -183,6 +184,11 @@ const TIP_SEED_TIMEOUT: Duration = Duration::from_secs(1);
 /// Slow stage threshold: any individual stage exceeding this triggers a warn log.
 pub(crate) const SLOW_STAGE_THRESHOLD_MS: u128 = 1000;
 
+/// Concurrent prefetch fetches the historical readahead may hold in flight. Scheduling uses
+/// `try_acquire`, so this also bounds the spawned-task backlog: a saturated readahead drops
+/// further candidates instead of queueing them, and the next by-number request re-triggers.
+const READAHEAD_CONCURRENCY: usize = 16;
+
 /// Stage that ran out of time. Used only to label the typed `Timeout` error below.
 #[derive(Debug, Clone, Copy)]
 pub enum TimeoutStage {
@@ -296,6 +302,72 @@ impl Drop for InFlightGuard<'_> {
     }
 }
 
+/// Sequential-readahead state for historical by-number traffic.
+///
+/// Backfill crawlers walk block numbers in order, and every historical block costs an
+/// upstream witness fetch; prefetching the next few numbers turns their next requests into
+/// warm block-data-cache (or single-flight coalesce) hits. Prefetches run the same
+/// resolve + fetch pipeline as real requests, so results land in the shared cache and the
+/// canonical-hash memo with no separate code path.
+struct Readahead {
+    /// How many blocks past a requested number to prefetch.
+    depth: u64,
+    /// Bounds in-flight prefetch tasks (see [`READAHEAD_CONCURRENCY`]).
+    permits: Arc<tokio::sync::Semaphore>,
+    /// Recently scheduled numbers (insertion-ordered, bounded), so repeated requests
+    /// sweeping through an already-warmed range don't re-schedule the same prefetches.
+    /// Entries age out by insertion order; failed prefetches are removed eagerly so a
+    /// later pass can retry them.
+    scheduled: Mutex<ScheduledWindow>,
+}
+
+/// Bounded insertion-ordered set backing [`Readahead::scheduled`].
+struct ScheduledWindow {
+    set: HashSet<u64>,
+    order: VecDeque<u64>,
+    cap: usize,
+}
+
+impl Readahead {
+    fn new(depth: u64) -> Self {
+        // Wide enough to cover the active frontier of an interleaved multi-batch crawler
+        // (the incident client flies 15 batches at once) many times over, small enough to
+        // stay irrelevant memory-wise.
+        let cap = (depth as usize * 8).clamp(256, 65_536);
+        Self {
+            depth,
+            permits: Arc::new(tokio::sync::Semaphore::new(READAHEAD_CONCURRENCY)),
+            scheduled: Mutex::new(ScheduledWindow {
+                set: HashSet::new(),
+                order: VecDeque::new(),
+                cap,
+            }),
+        }
+    }
+
+    /// Marks `number` as scheduled. Returns `false` when it is already in the window.
+    fn mark(&self, number: u64) -> bool {
+        let mut window = self.scheduled.lock().expect("readahead window lock");
+        if !window.set.insert(number) {
+            return false;
+        }
+        window.order.push_back(number);
+        while window.order.len() > window.cap {
+            let evicted = window.order.pop_front().expect("order tracks set");
+            window.set.remove(&evicted);
+        }
+        true
+    }
+
+    /// Forgets `number` so a later request may schedule it again (failed or dropped
+    /// prefetches must not poison the window for the whole window lifetime).
+    fn unmark(&self, number: u64) {
+        // The stale `order` entry is left behind; it ages out and its second eviction is a
+        // no-op on the set.
+        self.scheduled.lock().expect("readahead window lock").set.remove(&number);
+    }
+}
+
 /// Data provider with single-flight request coalescing.
 ///
 /// # Data Lookup Strategy
@@ -334,6 +406,9 @@ pub(crate) struct DataProvider {
     /// stage tries it before the RPC chain for blocks the routing window classifies as
     /// historical; every R2 failure falls back to the RPC chain on the remaining deadline.
     r2_witness: Option<Arc<R2WitnessSource>>,
+    /// Optional sequential readahead for historical by-number traffic
+    /// (`--historical-readahead`; `None` = disabled).
+    readahead: Option<Readahead>,
     /// Wall-clock budget for one user-facing block-data call, from entry through
     /// header + witness + block + contract resolution. The retry loop in `RpcClient`
     /// checks this before each round and clamps its sleep accordingly, so a missing
@@ -436,11 +511,74 @@ impl DataProvider {
             contract_cache,
             witness_cfg,
             r2_witness,
+            readahead: None,
             block_fetch_timeout,
             in_flight: DashMap::new(),
             canonical_hash_memo: CanonicalHashMemo::new(canonical_hash_memo_capacity),
             tip_hint: AtomicU64::new(0),
             tip_seed_next: Mutex::new(Instant::now()),
+        }
+    }
+
+    /// Enables sequential readahead for historical by-number traffic: each request for a
+    /// historical number schedules background prefetches of the next `depth` numbers.
+    /// `depth = 0` leaves readahead disabled.
+    pub fn with_historical_readahead(mut self, depth: u64) -> Self {
+        self.readahead = (depth > 0).then(|| Readahead::new(depth));
+        self
+    }
+
+    /// Schedules background prefetches of the blocks after `from_block`, when readahead is
+    /// enabled and `from_block` is historical (a non-historical number serves from the local
+    /// DB, where prefetching buys nothing). Cheap no-op for already-scheduled numbers; when
+    /// the prefetch permits are exhausted the remaining candidates are dropped — the next
+    /// by-number request re-triggers scheduling, so the frontier keeps pace with the crawl.
+    ///
+    /// Callers hand this the *requested* number on every by-number lookup, cached or not:
+    /// requests sweeping through an already-warmed range must keep pushing the prefetch
+    /// frontier ahead of the cursor, or the crawl would stall on a cold block every `depth`
+    /// blocks.
+    pub fn schedule_readahead(self: &Arc<Self>, from_block: u64) {
+        let Some(readahead) = &self.readahead else { return };
+        let db_tip = db_tip_height(self.db.as_deref());
+        if !is_historical(db_tip, from_block, self.witness_cfg.local_window) {
+            return;
+        }
+        for number in from_block + 1..=from_block.saturating_add(readahead.depth) {
+            // The crawl runs toward the tip; stop at the local window — those blocks serve
+            // from the DB.
+            if !is_historical(db_tip, number, self.witness_cfg.local_window) {
+                break;
+            }
+            if !readahead.mark(number) {
+                continue;
+            }
+            let Ok(permit) = Arc::clone(&readahead.permits).try_acquire_owned() else {
+                readahead.unmark(number);
+                crate::metrics::record_readahead("saturated");
+                return;
+            };
+            crate::metrics::record_readahead("scheduled");
+            let provider = Arc::clone(self);
+            tokio::spawn(async move {
+                let _permit = permit;
+                let deadline = provider.fetch_deadline();
+                let fetched = async {
+                    let hash = provider.resolve_canonical_hash(number, deadline).await?;
+                    provider.get_block_data_by_hash_with_deadline(hash, deadline).await
+                }
+                .await;
+                match fetched {
+                    Ok(_) => crate::metrics::record_readahead("completed"),
+                    Err(e) => {
+                        crate::metrics::record_readahead("failed");
+                        // Forget the number so a later pass can retry it; prefetches are
+                        // best-effort and must never log above debug.
+                        provider.readahead.as_ref().expect("spawned by readahead").unmark(number);
+                        debug!(number, error = %e, "Readahead prefetch failed");
+                    }
+                }
+            });
         }
     }
 
@@ -1861,6 +1999,87 @@ mod tests {
 
         ha.stop().unwrap();
         hb.stop().unwrap();
+    }
+
+    /// Readahead window semantics: dedup on mark, re-admission after unmark, eviction by
+    /// insertion order once the cap is exceeded — and depth 0 disables readahead entirely.
+    #[test]
+    fn readahead_window_marks_dedups_and_evicts() {
+        let readahead = Readahead::new(32); // cap clamps to 256
+        assert!(readahead.mark(1));
+        assert!(!readahead.mark(1), "second mark of the same number must dedup");
+        readahead.unmark(1);
+        assert!(readahead.mark(1), "unmark must re-admit the number");
+
+        // Fill far past the cap; the oldest entries fall out and become re-admittable.
+        for number in 0..300u64 {
+            readahead.mark(10_000 + number);
+        }
+        assert!(readahead.mark(10_000), "evicted numbers must be re-admittable");
+
+        let disabled = provider_with("http://127.0.0.1:9/", None).with_historical_readahead(0);
+        assert!(disabled.readahead.is_none(), "depth 0 must leave readahead disabled");
+    }
+
+    /// `schedule_readahead` covers the following historical numbers exactly once, stops at
+    /// the local-window boundary, and no-ops for non-historical requests. Current-thread
+    /// runtime: the spawned prefetch tasks are never polled, so the scheduling window is
+    /// race-free to assert.
+    #[tokio::test]
+    async fn schedule_readahead_covers_the_following_historical_numbers_once() {
+        // tip 5000, local window 4096 ⇒ historical numbers are those ≤ 904. The URL is never
+        // contacted: the prefetch tasks are spawned but not polled.
+        let db: Arc<dyn BlockStore> =
+            Arc::new(StubBlockStore { canonical_tip: Some(5000), ..Default::default() });
+        let provider =
+            Arc::new(provider_with("http://127.0.0.1:9/", Some(db)).with_historical_readahead(8));
+        let window_len = || {
+            let readahead = provider.readahead.as_ref().unwrap();
+            let window = readahead.scheduled.lock().unwrap();
+            window.order.len()
+        };
+
+        provider.schedule_readahead(890);
+        {
+            let readahead = provider.readahead.as_ref().unwrap();
+            let window = readahead.scheduled.lock().unwrap();
+            assert!((891..=898).all(|n| window.set.contains(&n)), "depth-8 span from 890");
+            assert_eq!(window.order.len(), 8);
+        }
+
+        // The same cursor again: pure dedup. An advanced cursor: only the new tail.
+        provider.schedule_readahead(890);
+        assert_eq!(window_len(), 8);
+        provider.schedule_readahead(892);
+        assert_eq!(window_len(), 10, "893..=900 adds only 899 and 900");
+
+        // The last historical number has no historical successors; a non-historical
+        // request must not schedule at all.
+        provider.schedule_readahead(904);
+        assert_eq!(window_len(), 10);
+        provider.schedule_readahead(4000);
+        assert_eq!(window_len(), 10);
+    }
+
+    /// Exhausted prefetch permits drop the remaining candidates (and forget them, so a
+    /// later request can retry) instead of queueing unbounded tasks.
+    #[tokio::test]
+    async fn schedule_readahead_saturates_at_the_concurrency_cap() {
+        let db: Arc<dyn BlockStore> =
+            Arc::new(StubBlockStore { canonical_tip: Some(10_000), ..Default::default() });
+        let provider =
+            Arc::new(provider_with("http://127.0.0.1:9/", Some(db)).with_historical_readahead(8));
+
+        // Two full spans consume all 16 permits (the unpolled tasks hold them); the third
+        // must saturate without marking anything.
+        provider.schedule_readahead(5000);
+        provider.schedule_readahead(5010);
+        provider.schedule_readahead(5020);
+
+        let readahead = provider.readahead.as_ref().unwrap();
+        let window = readahead.scheduled.lock().unwrap();
+        assert_eq!(window.set.len(), READAHEAD_CONCURRENCY, "exactly the permit count sticks");
+        assert!(!window.set.contains(&5021), "saturated candidates must be forgotten");
     }
 
     /// Recent blocks never touch R2 (the bucket lags the generator at the frontier): the

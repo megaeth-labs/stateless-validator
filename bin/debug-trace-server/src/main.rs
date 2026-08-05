@@ -323,6 +323,14 @@ struct Args {
     #[clap(long, env = "DEBUG_TRACE_SERVER_R2_MAX_CONCURRENT_REQUESTS", requires = "r2_endpoint")]
     r2_max_concurrent_requests: Option<usize>,
 
+    /// Sequential readahead depth for historical by-number requests: each request also
+    /// prefetches this many following blocks into the block-data cache in the background,
+    /// so an in-order backfill crawl mostly hits warm data. 0 disables. Prefetches use the
+    /// same witness route as requests (R2 first when configured), bounded by an internal
+    /// concurrency cap; requires a local DB (`--data-dir`) to anchor block age.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_HISTORICAL_READAHEAD", default_value_t = 0)]
+    historical_readahead: u64,
+
     /// Chain-sync pipeline tip buffer: stay this many blocks behind the upstream head so the
     /// fetcher does not race the witness generator — a fetch issued the moment a block appears
     /// typically arrives before its witness is written and burns a failed round plus a backoff
@@ -461,6 +469,7 @@ async fn main() -> Result<()> {
         witness_old_block_timeout_secs = old_block_witness_timeout_secs(&args),
         witness_local_window = args.witness_local_window,
         r2_witness_configured = args.r2_endpoint.is_some(),
+        historical_readahead = args.historical_readahead,
         tip_buffer = args.tip_buffer,
         response_cache_disabled = args.response_cache_disabled,
         response_cache_max_size = args.response_cache_max_size,
@@ -596,7 +605,8 @@ async fn main() -> Result<()> {
         r2_witness_source,
         std::time::Duration::from_secs(args.block_fetch_timeout),
         args.canonical_hash_memo_capacity as usize,
-    ));
+    )
+    .with_historical_readahead(args.historical_readahead));
 
     let chain_spec = load_chain_spec(&args)?;
 
