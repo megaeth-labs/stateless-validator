@@ -1927,6 +1927,7 @@ dependencies = [
  "stateless-common",
  "stateless-core",
  "stateless-db",
+ "stateless-r2",
  "stateless-test-utils",
  "tempfile",
  "thiserror 2.0.17",

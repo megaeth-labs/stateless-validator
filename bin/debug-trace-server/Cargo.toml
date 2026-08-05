@@ -32,6 +32,7 @@ revm-inspectors.workspace = true
 stateless-common = { path = "../../crates/stateless-common" }
 stateless-core = { path = "../../crates/stateless-core" }
 stateless-db = { path = "../../crates/stateless-db" }
+stateless-r2 = { path = "../../crates/stateless-r2" }
 
 # misc
 bytes.workspace = true

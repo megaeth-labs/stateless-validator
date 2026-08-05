@@ -91,6 +91,20 @@ pub enum R2GetError {
 }
 
 impl R2GetError {
+    /// Every label [`Self::kind`] can produce, for callers pre-registering per-kind metrics.
+    pub const KINDS: &'static [&'static str] = &["missing", "transport", "throttled", "status"];
+
+    /// Stable lowercase label for this variant, for callers' per-kind error metrics. Every
+    /// value returned here appears in [`Self::KINDS`].
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Missing { .. } => "missing",
+            Self::Transport { .. } => "transport",
+            Self::Throttled { .. } => "throttled",
+            Self::Status { .. } => "status",
+        }
+    }
+
     /// Whether an immediate retry against the same endpoint could plausibly succeed
     /// (transport blips, 429, 5xx). The other variants are deterministic and are surfaced
     /// without retrying.

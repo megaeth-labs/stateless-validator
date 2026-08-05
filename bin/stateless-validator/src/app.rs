@@ -7,7 +7,7 @@ use alloy_primitives::BlockHash;
 use alloy_rpc_types_eth::BlockId;
 use clap::{Parser, ValueEnum};
 use eyre::Result;
-use stateless_common::{BackoffPolicy, RpcClient, RpcClientConfig, logging::LogArgs};
+use stateless_common::{BackoffPolicy, RedactedSecret, RpcClient, RpcClientConfig, logging::LogArgs};
 use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::BlockMeta};
 use stateless_db::ContractCache;
 use tracing::{info, warn};
@@ -23,31 +23,6 @@ pub enum WitnessSource {
     Rpc,
     /// Straight from the R2 bucket over the S3 API. Requires the `--r2-*` flags.
     R2,
-}
-
-/// A CLI/env secret that renders as `[redacted]` in `Debug` output, so it cannot leak when
-/// [`CommandLineArgs`] (which derives `Debug`) is logged.
-#[derive(Clone)]
-pub struct RedactedSecret(String);
-
-impl std::str::FromStr for RedactedSecret {
-    type Err = std::convert::Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(s.to_string()))
-    }
-}
-
-impl std::fmt::Debug for RedactedSecret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("[redacted]")
-    }
-}
-
-impl AsRef<str> for RedactedSecret {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
 }
 
 /// Database filename for the validator.
@@ -432,12 +407,4 @@ mod tests {
         );
     }
 
-    /// `CommandLineArgs` derives `Debug`; the secret must never appear in that output.
-    #[test]
-    fn redacted_secret_never_debug_prints_its_value() {
-        let secret: RedactedSecret = "super-secret-key".parse().unwrap();
-        assert_eq!(format!("{secret:?}"), "[redacted]");
-        assert_eq!(format!("{:?}", Some(&secret)), "Some([redacted])");
-        assert_eq!(secret.as_ref(), "super-secret-key");
-    }
 }

@@ -977,6 +977,7 @@ mod tests {
             block_data_cache,
             noop_contract_cache(),
             WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
+            None,
             Duration::from_secs(1),
             1024,
         ));

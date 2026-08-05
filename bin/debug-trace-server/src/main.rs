@@ -54,7 +54,7 @@ use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::Result;
 use jsonrpsee::server::{Server, ServerConfig};
-use stateless_common::{RpcClient, RpcClientConfig, logging::LogArgs};
+use stateless_common::{RedactedSecret, RpcClient, RpcClientConfig, logging::LogArgs};
 use stateless_core::{
     BisectResolver, ChainStore, ContractStore, DivergenceLookups, PipelineConfig,
     chain_spec::ChainSpec, db::BlockMeta, pipeline::run_pipeline,
@@ -71,6 +71,7 @@ mod compression;
 mod data_provider;
 mod metrics;
 mod middleware;
+mod r2_witness;
 mod raw_json;
 mod response_cache;
 mod response_size;
@@ -83,6 +84,7 @@ use block_data_cache::{
     BLOCK_DATA_CACHE_SHARDS, BlockDataCache, DEFAULT_BLOCK_DATA_CACHE_MAX_BYTES,
 };
 use data_provider::{DataProvider, NoopContractStore, WitnessFetchConfig};
+use r2_witness::R2WitnessSource;
 use response_cache::{DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS, ResponseCache, ResponseCacheConfig};
 use rpc_service::RpcContext;
 use server_db::{BlockStore, ServerDB};
@@ -294,6 +296,33 @@ struct Args {
     #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_OLD_BLOCK_TIMEOUT")]
     witness_old_block_timeout: Option<u64>,
 
+    /// R2 S3 endpoint origin, e.g. `https://<account>.r2.cloudflarestorage.com` (no bucket
+    /// path). With `--r2-bucket` and the credential flags, historical witnesses are fetched
+    /// straight from the bucket, with the RPC witness chain as fallback; frontier blocks keep
+    /// the generator path. Requires a local DB (`--data-dir`) to anchor block age.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ENDPOINT", requires_all = ["r2_bucket", "r2_access_key_id", "r2_secret_access_key"])]
+    r2_endpoint: Option<String>,
+
+    /// R2 bucket holding the archived witness objects. Requires `--r2-endpoint`.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_BUCKET", requires = "r2_endpoint")]
+    r2_bucket: Option<String>,
+
+    /// R2 access key id (Object Read). Requires `--r2-endpoint`.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ACCESS_KEY_ID", requires = "r2_endpoint")]
+    r2_access_key_id: Option<String>,
+
+    /// R2 secret access key. Requires `--r2-endpoint`. Prefer the env var over the flag so
+    /// the secret stays out of shell history and process listings.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_SECRET_ACCESS_KEY", requires = "r2_endpoint")]
+    r2_secret_access_key: Option<RedactedSecret>,
+
+    /// Maximum concurrent in-flight R2 witness GETs, across request serving and readahead.
+    /// Omit for unlimited. Deliberately separate from
+    /// `--witness-max-concurrent-requests`: that cap sizes the shared RPC gateway, while R2
+    /// tolerates far higher parallelism.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_MAX_CONCURRENT_REQUESTS", requires = "r2_endpoint")]
+    r2_max_concurrent_requests: Option<usize>,
+
     /// Chain-sync pipeline tip buffer: stay this many blocks behind the upstream head so the
     /// fetcher does not race the witness generator — a fetch issued the moment a block appears
     /// typically arrives before its witness is written and burns a failed round plus a backoff
@@ -431,6 +460,7 @@ async fn main() -> Result<()> {
         witness_timeout_secs = args.witness_timeout,
         witness_old_block_timeout_secs = old_block_witness_timeout_secs(&args),
         witness_local_window = args.witness_local_window,
+        r2_witness_configured = args.r2_endpoint.is_some(),
         tip_buffer = args.tip_buffer,
         response_cache_disabled = args.response_cache_disabled,
         response_cache_max_size = args.response_cache_max_size,
@@ -460,6 +490,7 @@ async fn main() -> Result<()> {
         .rpc_per_attempt_timeout_ms
         .map(std::time::Duration::from_millis)
         .unwrap_or(rpc_defaults.per_attempt_timeout);
+    let rpc_retry = rpc_defaults.rpc_retry.clone();
     let rpc_config = RpcClientConfig {
         data_max_concurrent_requests: args.data_max_concurrent_requests,
         witness_max_concurrent_requests: args.witness_max_concurrent_requests,
@@ -493,6 +524,39 @@ async fn main() -> Result<()> {
              routing disabled — witness endpoints are plain failover"
         ),
     }
+
+    // Direct-from-R2 historical witness source. Clap's `requires` wiring makes the four
+    // `--r2-*` flags all-or-nothing, so matching on the quad only splits "configured" from
+    // "absent". Shares the RPC path's per-attempt timeout and retry pacing.
+    let r2_witness_source = match
+        (&args.r2_endpoint, &args.r2_bucket, &args.r2_access_key_id, &args.r2_secret_access_key)
+    {
+        (Some(endpoint), Some(bucket), Some(access_key_id), Some(secret)) => {
+            let source = R2WitnessSource::new(
+                endpoint,
+                bucket.clone(),
+                access_key_id.clone(),
+                secret.as_ref().to_string(),
+                per_attempt_timeout,
+                rpc_retry,
+                args.r2_max_concurrent_requests,
+            )?;
+            info!(
+                endpoint,
+                bucket,
+                "Historical witness source: R2 (direct S3), RPC chain as fallback"
+            );
+            if args.data_dir.is_none() {
+                warn!(
+                    "--r2-endpoint without --data-dir: block age cannot be anchored to a \
+                     local tip, so the R2 historical route is inactive and all witnesses \
+                     use the RPC chain"
+                );
+            }
+            Some(Arc::new(source))
+        }
+        _ => None,
+    };
 
     let validator_db = init_validator_db(&args, &rpc_client).await?;
 
@@ -529,6 +593,7 @@ async fn main() -> Result<()> {
         block_data_cache,
         contract_cache,
         witness_cfg,
+        r2_witness_source,
         std::time::Duration::from_secs(args.block_fetch_timeout),
         args.canonical_hash_memo_capacity as usize,
     ));

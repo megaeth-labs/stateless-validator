@@ -384,6 +384,25 @@ pub fn record_request_shape(method: &'static str, shape: &'static str) {
     counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => shape).increment(1);
 }
 
+/// R2 historical-witness GET retries (one increment per retried attempt).
+const R2_WITNESS_RETRIES_TOTAL: &str = "debug_trace_r2_witness_retries_total";
+
+/// R2 historical-witness fetch failures, labeled by `kind`
+/// (see `crate::r2_witness::R2WitnessError::KINDS`). Failures here are not user-visible
+/// errors — the witness stage falls back to the RPC chain — so this counter is the signal
+/// that the R2 fast path is degrading.
+const R2_WITNESS_ERRORS_TOTAL: &str = "debug_trace_r2_witness_errors_total";
+
+/// Records one retried R2 witness GET attempt.
+pub fn record_r2_witness_retry() {
+    counter!(R2_WITNESS_RETRIES_TOTAL).increment(1);
+}
+
+/// Records one failed R2 witness fetch of the given error `kind`.
+pub fn record_r2_witness_error(kind: &'static str) {
+    counter!(R2_WITNESS_ERRORS_TOTAL, "kind" => kind).increment(1);
+}
+
 /// Canonical number → hash resolution counter, labeled `(source, outcome)` — how often
 /// by-number requests resolve their canonical hash from the local DB index vs upstream,
 /// and how often resolution misses or fails.
@@ -568,6 +587,13 @@ fn pre_register_all_metrics() {
     let _ = DataSourceMetrics::new_for_source("db");
     let _ = DataSourceMetrics::new_for_source("witness_generator");
     let _ = DataSourceMetrics::new_for_source("witness_historical");
+    let _ = DataSourceMetrics::new_for_source("witness_r2");
+
+    // Data Fetch Layer: R2 historical witness source
+    counter!(R2_WITNESS_RETRIES_TOTAL).increment(0);
+    for kind in crate::r2_witness::R2WitnessError::KINDS {
+        counter!(R2_WITNESS_ERRORS_TOTAL, "kind" => *kind).increment(0);
+    }
 
     // Data Fetch Layer: single-flight
     let _ = SingleFlightMetrics::new_for_type("new");
@@ -614,6 +640,7 @@ fn pre_register_all_metrics() {
     // Witness Layer
     let _ = WitnessSourceMetrics::new_for_source("witness_generator");
     let _ = WitnessSourceMetrics::new_for_source("witness_historical");
+    let _ = WitnessSourceMetrics::new_for_source("witness_r2");
 
     // Execution Layer (per method)
     let _ = EvmExecutionMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
