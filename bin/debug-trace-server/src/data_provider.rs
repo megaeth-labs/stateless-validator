@@ -489,17 +489,18 @@ impl DataProvider {
     /// * `contract_cache` - Shared in-memory contract cache (backed by the DB when present, or an
     ///   in-memory-only noop store in stateless mode)
     /// * `witness_cfg` - Witness-source routing window (by block age) and per-stage budgets
-    /// * `r2_witness` - Optional direct-from-R2 source tried first for historical witnesses
     /// * `block_fetch_timeout` - User-facing cap on the full block-fetch pipeline (header + witness
     ///   + block + contracts)
     /// * `canonical_hash_memo_capacity` - Entry cap for the in-memory canonical-hash memo
+    ///
+    /// The optional extras — the R2 historical witness source and the historical readahead —
+    /// attach via [`Self::with_r2_witness`] / [`Self::with_historical_readahead`].
     pub fn new(
         rpc_client: Arc<RpcClient>,
         db: Option<Arc<dyn BlockStore>>,
         block_data_cache: Option<Arc<BlockDataCache>>,
         contract_cache: Arc<ContractCache>,
         witness_cfg: WitnessFetchConfig,
-        r2_witness: Option<Arc<R2WitnessSource>>,
         block_fetch_timeout: Duration,
         canonical_hash_memo_capacity: usize,
     ) -> Self {
@@ -510,7 +511,7 @@ impl DataProvider {
             last_seen_db_tip: AtomicU64::new(u64::MAX),
             contract_cache,
             witness_cfg,
-            r2_witness,
+            r2_witness: None,
             readahead: None,
             block_fetch_timeout,
             in_flight: DashMap::new(),
@@ -518,6 +519,13 @@ impl DataProvider {
             tip_hint: AtomicU64::new(0),
             tip_seed_next: Mutex::new(Instant::now()),
         }
+    }
+
+    /// Attaches a direct-from-R2 source, tried before the RPC chain for historical
+    /// witnesses. `None` keeps the RPC chain as the only witness source.
+    pub fn with_r2_witness(mut self, r2_witness: Option<Arc<R2WitnessSource>>) -> Self {
+        self.r2_witness = r2_witness;
+        self
     }
 
     /// Enables sequential readahead for historical by-number traffic: each request for a
@@ -1275,9 +1283,8 @@ async fn fetch_witness(
     {
         // Half the remaining witness budget, so a hung R2 endpoint can never starve the RPC
         // fallback of its turn; a healthy R2 answers in a fraction of it.
-        let r2_deadline = (Instant::now() +
-            deadline.saturating_duration_since(Instant::now()) / 2)
-            .min(deadline);
+        let r2_deadline =
+            (Instant::now() + deadline.saturating_duration_since(Instant::now()) / 2).min(deadline);
         let metrics = WitnessSourceMetrics::new_for_source("witness_r2");
         let start = Instant::now();
         match r2.get_witness_light(block_number, block_hash, r2_deadline).await {
@@ -1606,7 +1613,6 @@ mod tests {
             block_data_cache,
             contract_cache,
             WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
-            None,
             Duration::from_secs(1),
             1024,
         )
@@ -1867,7 +1873,8 @@ mod tests {
 
         // Historical block (900 + 100 <= 5000): the generator endpoint must stay untouched.
         let deadline = Instant::now() + Duration::from_millis(150);
-        let result = fetch_witness(&rpc_client, &cfg, None, db_tip, 900, B256::ZERO, deadline).await;
+        let result =
+            fetch_witness(&rpc_client, &cfg, None, db_tip, 900, B256::ZERO, deadline).await;
         assert!(result.is_err(), "the mock only returns errors, so the deadline must fire");
         assert_eq!(hits_a.load(Ordering::Relaxed), 0, "historical fetch must skip the generator");
         assert!(hits_b.load(Ordering::Relaxed) >= 1, "the fallback endpoint must be tried");
@@ -1892,7 +1899,8 @@ mod tests {
 
         // Historical block (900 + 100 <= 5000) with no fallback endpoint configured.
         let deadline = Instant::now() + Duration::from_millis(150);
-        let result = fetch_witness(&rpc_client, &cfg, None, Some(5000), 900, B256::ZERO, deadline).await;
+        let result =
+            fetch_witness(&rpc_client, &cfg, None, Some(5000), 900, B256::ZERO, deadline).await;
         assert!(result.is_err(), "the mock only returns errors, so the deadline must fire");
         assert!(
             hits_a.load(Ordering::Relaxed) >= 1,
@@ -1914,7 +1922,8 @@ mod tests {
         // Historical block (900 + 100 <= 5000): with no declared generator, the first
         // endpoint stays in the rotation.
         let deadline = Instant::now() + Duration::from_millis(150);
-        let result = fetch_witness(&rpc_client, &cfg, None, Some(5000), 900, B256::ZERO, deadline).await;
+        let result =
+            fetch_witness(&rpc_client, &cfg, None, Some(5000), 900, B256::ZERO, deadline).await;
         assert!(result.is_err(), "the mock only returns errors, so the deadline must fire");
         assert!(hits_a.load(Ordering::Relaxed) >= 1, "first endpoint must not be skipped");
 
@@ -2243,7 +2252,6 @@ mod tests {
             None,
             test_support::noop_contract_cache(),
             WitnessFetchConfig::with_defaults(DEFAULT_WITNESS_TIMEOUT_SECS),
-            None,
             Duration::from_secs(60),
             1024,
         ));

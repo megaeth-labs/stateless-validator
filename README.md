@@ -35,7 +35,7 @@ The workspace contains two binaries and five library crates:
 | `stateless-db`         | `crates/stateless-db`         | redb-backed persistence: table definitions, read/write helpers, bounded `ContractCache`                                                                                              |
 | `stateless-common`     | `crates/stateless-common`     | Shared utilities: RPC client, logging, metrics                                                                                                                                       |
 | `stateless-test-utils` | `crates/stateless-test-utils` | Test fixtures (blocks, witnesses, contracts) and env-var lock for integration tests                                                                                                  |
-| `stateless-r2`         | `crates/stateless-r2`         | Shared R2 (S3) witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT; consumed by mega-reth's witness uploaders (write) and this repo's validator (read) |
+| `stateless-r2`         | `crates/stateless-r2`         | Shared R2 (S3) witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT/GET with retry; consumed by mega-reth's witness uploaders (write), this repo's validator, and the trace server's historical witness source (read) |
 | `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers                                                                                                                                 |
 | `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                                                                                                                        |
 
@@ -142,6 +142,16 @@ The background chain-sync prefetch routes by freshness against the last observed
 The head observation is trusted as a freshness anchor only while itself recent (no older than the grace): during a long catch-up stretch the tip is not re-polled and the real head may advance past the generator's retention, so blocks near the stale ceiling fall back to full-chain failover from the first attempt instead of burning the grace on pruned witnesses.
 Deep catch-up blocks (far below the observed head, where the generator may have pruned the witness) keep full failover from the first attempt.
 Without `--witness-generator-endpoint`, historical routing is disabled and the endpoints are plain failover.
+
+**Direct-from-R2 historical witnesses:**
+With `--r2-endpoint`, `--r2-bucket`, `--r2-access-key-id`, and `--r2-secret-access-key` (all four together), request-serving witness fetches for historical blocks try a SigV4-signed GET against the bucket before the RPC witness chain.
+Object storage tolerates far higher parallelism than a shared RPC gateway and the bucket holds full history, so bulk backfill traffic stops competing with everything else on the public endpoint; any R2 failure (missing object, throttle, transport, corrupt payload — counted in `debug_trace_r2_witness_errors_total{kind}`) falls back to the RPC chain on the remaining witness budget, and the R2 attempt is capped at half that budget so a hung endpoint can never starve the fallback.
+Frontier blocks keep the generator path (the bucket receives objects only after the uploader PUTs them), and the route needs a local DB (`--data-dir`) to anchor block age.
+`--r2-max-concurrent-requests` caps in-flight GETs separately from `--witness-max-concurrent-requests` — the RPC cap sizes a shared gateway, R2 tolerates far more.
+
+**Historical readahead:**
+`--historical-readahead <N>` (default 0 = off) makes every by-number request for a historical block also prefetch the next N blocks into the block-data cache in the background, so an in-order backfill crawl finds its next blocks warm (or coalesces onto the in-flight prefetch via single-flight).
+Prefetches run the same resolve + fetch pipeline as real requests (R2 first when configured), are bounded by an internal 16-task cap (excess candidates are dropped and re-tried by later requests), and count their outcomes in `debug_trace_readahead_total{outcome}`.
 
 **Witness routing and sync knobs** (each also settable via its `DEBUG_TRACE_SERVER_*` env var):
 - `--witness-local-window`: Block-age threshold for the historical witness route (default: 4096; should match the generator's `BACKUP`).

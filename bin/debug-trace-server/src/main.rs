@@ -5,7 +5,9 @@
 //! Data can be fetched from upstream RPC endpoints or from a local database with chain sync.
 //! Request-serving witness fetches route by block age: historical blocks skip the internal
 //! generator endpoint (which only retains a small recent window) and go straight to the
-//! fallback endpoints. Chain-sync prefetch always uses the full chain.
+//! fallback endpoints — or, with the `--r2-*` flags, straight to the R2 bucket with the RPC
+//! chain as fallback. `--historical-readahead` additionally prefetches the blocks following
+//! each historical by-number request. Chain-sync prefetch always uses the full chain.
 //!
 //! # Architecture
 //! ```text
@@ -537,9 +539,12 @@ async fn main() -> Result<()> {
     // Direct-from-R2 historical witness source. Clap's `requires` wiring makes the four
     // `--r2-*` flags all-or-nothing, so matching on the quad only splits "configured" from
     // "absent". Shares the RPC path's per-attempt timeout and retry pacing.
-    let r2_witness_source = match
-        (&args.r2_endpoint, &args.r2_bucket, &args.r2_access_key_id, &args.r2_secret_access_key)
-    {
+    let r2_witness_source = match (
+        &args.r2_endpoint,
+        &args.r2_bucket,
+        &args.r2_access_key_id,
+        &args.r2_secret_access_key,
+    ) {
         (Some(endpoint), Some(bucket), Some(access_key_id), Some(secret)) => {
             let source = R2WitnessSource::new(
                 endpoint,
@@ -552,8 +557,7 @@ async fn main() -> Result<()> {
             )?;
             info!(
                 endpoint,
-                bucket,
-                "Historical witness source: R2 (direct S3), RPC chain as fallback"
+                bucket, "Historical witness source: R2 (direct S3), RPC chain as fallback"
             );
             if args.data_dir.is_none() {
                 warn!(
@@ -596,17 +600,19 @@ async fn main() -> Result<()> {
         Some(Arc::new(BlockDataCache::new(args.block_data_cache_max_size)))
     };
 
-    let data_provider = Arc::new(DataProvider::new(
-        rpc_client.clone(),
-        block_store.clone(),
-        block_data_cache,
-        contract_cache,
-        witness_cfg,
-        r2_witness_source,
-        std::time::Duration::from_secs(args.block_fetch_timeout),
-        args.canonical_hash_memo_capacity as usize,
-    )
-    .with_historical_readahead(args.historical_readahead));
+    let data_provider = Arc::new(
+        DataProvider::new(
+            rpc_client.clone(),
+            block_store.clone(),
+            block_data_cache,
+            contract_cache,
+            witness_cfg,
+            std::time::Duration::from_secs(args.block_fetch_timeout),
+            args.canonical_hash_memo_capacity as usize,
+        )
+        .with_r2_witness(r2_witness_source)
+        .with_historical_readahead(args.historical_readahead),
+    );
 
     let chain_spec = load_chain_spec(&args)?;
 
@@ -1341,5 +1347,74 @@ mod tests {
             ],
             |a| a.witness_max_concurrent_requests,
         );
+    }
+
+    /// The `--r2-*` group is all-or-nothing: any subset missing a member must fail parsing,
+    /// the full quad must parse, and none-of-them stays valid.
+    #[test]
+    fn r2_flag_group_is_all_or_nothing() {
+        let base = [
+            "debug-trace-server",
+            "--rpc-endpoint",
+            "http://rpc",
+            "--witness-endpoint",
+            "http://w",
+        ];
+        let full = [
+            "--r2-endpoint",
+            "https://acc.r2.cloudflarestorage.com",
+            "--r2-bucket",
+            "witness-mainnet",
+            "--r2-access-key-id",
+            "ak",
+            "--r2-secret-access-key",
+            "sk",
+        ];
+
+        let args = Args::try_parse_from(base.iter().chain(full.iter())).expect("full quad parses");
+        assert_eq!(args.r2_bucket.as_deref(), Some("witness-mainnet"));
+
+        assert!(Args::try_parse_from(base).is_ok(), "no R2 flags stays valid");
+        // Dropping any one member of the quad breaks the group.
+        for missing in (0..4).map(|i| i * 2) {
+            let partial: Vec<&str> = full
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != missing && *i != missing + 1)
+                .map(|(_, s)| *s)
+                .collect();
+            assert!(
+                Args::try_parse_from(base.iter().copied().chain(partial)).is_err(),
+                "missing {} must fail parsing",
+                full[missing],
+            );
+        }
+    }
+
+    /// `--historical-readahead` parses from flag and env and defaults to 0 (disabled).
+    #[test]
+    fn historical_readahead_flag_and_env() {
+        let guard = stateless_test_utils::env::env_lock();
+        let base = [
+            "debug-trace-server",
+            "--rpc-endpoint",
+            "http://rpc",
+            "--witness-endpoint",
+            "http://w",
+        ];
+        let parse = |extra: &[&str]| {
+            Args::try_parse_from(base.iter().chain(extra)).unwrap().historical_readahead
+        };
+
+        assert_eq!(parse(&[]), 0);
+        assert_eq!(parse(&["--historical-readahead", "64"]), 64);
+
+        let from_env = stateless_test_utils::env::with_env_var(
+            &guard,
+            "DEBUG_TRACE_SERVER_HISTORICAL_READAHEAD",
+            "128",
+            || parse(&[]),
+        );
+        assert_eq!(from_env, 128);
     }
 }

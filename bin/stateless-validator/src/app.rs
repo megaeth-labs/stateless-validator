@@ -7,7 +7,9 @@ use alloy_primitives::BlockHash;
 use alloy_rpc_types_eth::BlockId;
 use clap::{Parser, ValueEnum};
 use eyre::Result;
-use stateless_common::{BackoffPolicy, RedactedSecret, RpcClient, RpcClientConfig, logging::LogArgs};
+use stateless_common::{
+    BackoffPolicy, RedactedSecret, RpcClient, RpcClientConfig, logging::LogArgs,
+};
 use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::BlockMeta};
 use stateless_db::ContractCache;
 use tracing::{info, warn};
@@ -406,5 +408,4 @@ mod tests {
             "https://x"
         );
     }
-
 }

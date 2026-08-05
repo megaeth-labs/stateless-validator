@@ -117,13 +117,19 @@ impl Display for R2GetError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Missing { number, key } => {
-                write!(f, "R2 witness MISSING for block {number} (key {key}): object not found (404)")
+                write!(
+                    f,
+                    "R2 witness MISSING for block {number} (key {key}): object not found (404)"
+                )
             }
             Self::Transport { number, key, source } => {
                 write!(f, "R2 transport failure for block {number} (key {key}): {source}")
             }
             Self::Throttled { number, key, status, body } => {
-                write!(f, "R2 throttled/server error {status} for block {number} (key {key}): {body}")
+                write!(
+                    f,
+                    "R2 throttled/server error {status} for block {number} (key {key}): {body}"
+                )
             }
             Self::Status { number, key, status, body } => {
                 write!(f, "R2 unexpected status {status} for block {number} (key {key}): {body}")
@@ -279,9 +285,8 @@ impl R2ObjectFetcher {
                     // busy-looping.
                     let jitter_ms = fastrand::u64(0..=backoff_ms / 2);
                     let sleep_ms = (backoff_ms + jitter_ms).min(max_backoff_ms).max(1);
-                    let out_of_time = deadline.is_some_and(|d| {
-                        Instant::now() + Duration::from_millis(sleep_ms) >= d
-                    });
+                    let out_of_time = deadline
+                        .is_some_and(|d| Instant::now() + Duration::from_millis(sleep_ms) >= d);
                     if !e.is_retryable() || attempt >= max_attempts || out_of_time {
                         return Err(e);
                     }
@@ -315,9 +320,8 @@ impl R2ObjectFetcher {
         // Clamp the attempt to the remaining budget; an already-expired deadline degrades to
         // a floor timeout whose transport error the retry loop then surfaces as out-of-time.
         if let Some(deadline) = deadline {
-            let remaining = deadline
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_millis(1));
+            let remaining =
+                deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
             request = request.timeout(self.per_attempt_timeout.min(remaining));
         }
         for (name, value) in signed {
@@ -390,11 +394,7 @@ mod tests {
         fetcher_with(endpoint, None, test_pacing())
     }
 
-    fn fetcher_with(
-        endpoint: &str,
-        limit: Option<usize>,
-        pacing: RetryPacing,
-    ) -> R2ObjectFetcher {
+    fn fetcher_with(endpoint: &str, limit: Option<usize>, pacing: RetryPacing) -> R2ObjectFetcher {
         R2ObjectFetcher::new(
             endpoint,
             "witness-test".to_string(),

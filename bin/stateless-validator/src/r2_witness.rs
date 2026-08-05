@@ -201,7 +201,13 @@ impl R2WitnessClient {
         let started = Instant::now();
         let fetched = self
             .fetcher
-            .get_block_object(number, hash, DEFAULT_MAX_ATTEMPTS, None, metrics::on_r2_witness_retry)
+            .get_block_object(
+                number,
+                hash,
+                DEFAULT_MAX_ATTEMPTS,
+                None,
+                metrics::on_r2_witness_retry,
+            )
             .await?;
         let bytes = fetched.bytes;
 
