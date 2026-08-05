@@ -12,6 +12,7 @@ description = "Shared Cloudflare R2 (S3-compatible) witness primitives: minimal 
 # misc
 bytes.workspace = true
 chrono = { workspace = true, features = ["clock"] }
+fastrand = { workspace = true, features = ["std"] }
 hex = { workspace = true, features = ["alloc"] }
 hmac.workspace = true
 percent-encoding.workspace = true
@@ -20,3 +21,10 @@ percent-encoding.workspace = true
 # it is a coordinated two-repo change that a workspace-wide bump must not ride over.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 sha2.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+tracing = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+# misc
+stateless-test-utils = { path = "../stateless-test-utils" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

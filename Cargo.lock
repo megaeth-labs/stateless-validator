@@ -5754,11 +5754,15 @@ version = "2.0.16"
 dependencies = [
  "bytes",
  "chrono",
+ "fastrand",
  "hex",
  "hmac",
  "percent-encoding",
  "reqwest",
  "sha2 0.10.9",
+ "stateless-test-utils",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -5775,6 +5779,7 @@ dependencies = [
  "salt",
  "serde",
  "serde_json",
+ "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
 ]

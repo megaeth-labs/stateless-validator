@@ -25,5 +25,6 @@
 
 pub mod client;
 pub mod endpoint;
+pub mod fetch;
 pub mod keys;
 pub mod sigv4;
