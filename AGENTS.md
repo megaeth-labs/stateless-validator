@@ -107,6 +107,7 @@ Two operating modes:
 - **Local cache mode** — With `data_dir`, enables chain sync to pre-fetch blocks into `ValidatorDB` for faster serving.
 
 The server includes an HTTP response cache (`quick_cache`) for pre-serialized JSON and a `DataProvider` with single-flight request coalescing.
+Responses are serialized exactly once, straight from the trace output into raw JSON bytes (`RawJson`) spliced verbatim into the reply; the cache shares those bytes by `Arc`, so a hit never re-parses or re-serializes the JSON tree.
 HTTP responses negotiate gzip/zstd compression per request via `Accept-Encoding` (kill switch: `--response-compression-disabled`); bodies under 4 KiB stay identity, the stack order lives in `http_middleware()` (compression outside the size/timing layers keeps `x-response-size` at the uncompressed size and `x-execution-time-ns` free of compression CPU), and response-cache hits re-compress per hit.
 Body-streaming cost is metered by the outermost middleware layer (`debug_trace_body_cpu_time_seconds` / `debug_trace_wire_bytes_total`, labeled by encoding), since every request-scoped measurement is sealed before the body streams.
 The response cache is keyed by `(resource, block hash, typed tracer variant)`; by-number handlers resolve number → canonical hash before the lookup (local `CANONICAL_CHAIN` first, upstream fallback).

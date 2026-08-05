@@ -71,6 +71,7 @@ mod compression;
 mod data_provider;
 mod metrics;
 mod middleware;
+mod raw_json;
 mod response_cache;
 mod response_size;
 mod rpc_service;
