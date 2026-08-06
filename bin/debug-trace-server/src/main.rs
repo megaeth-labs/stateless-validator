@@ -326,6 +326,7 @@ struct Args {
         env = "DEBUG_TRACE_SERVER_R2_CONNECT_TIMEOUT_MS",
         default_value_t = stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT.as_millis() as u64,
         value_parser = clap::value_parser!(u64).range(100..),
+        requires = "r2_endpoint",
     )]
     r2_connect_timeout_ms: u64,
 
@@ -1382,6 +1383,14 @@ mod tests {
         let with_timeout: Vec<&str> =
             full.iter().copied().chain(["--r2-connect-timeout-ms", "2000"]).collect();
         assert_eq!(parse_args(&with_timeout).r2_connect_timeout_ms, 2000);
+        // Tuning flags are part of the fail-loud group: explicitly set without the
+        // endpoint they must be rejected, not silently ignored (defaults stay exempt).
+        let base =
+            ["debug-trace-server", "--rpc-endpoint", "http://r", "--witness-endpoint", "http://w"];
+        assert!(
+            Args::try_parse_from(base.iter().copied().chain(["--r2-connect-timeout-ms", "2000"]))
+                .is_err()
+        );
         let _ = parse_args(&[]); // no R2 flags stays valid
 
         // Dropping any one flag=value pair of the quad breaks the group.
