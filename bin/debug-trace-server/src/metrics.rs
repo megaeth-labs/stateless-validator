@@ -198,6 +198,26 @@ impl BodyMetrics {
     }
 }
 
+/// Inbound JSON-RPC batch shape, recorded by the concurrent-batch RPC middleware.
+#[derive(Clone, Metrics)]
+#[metrics(scope = "debug_trace")]
+pub struct BatchMetrics {
+    /// Entries per inbound JSON-RPC batch request
+    batch_size: Histogram,
+}
+
+impl BatchMetrics {
+    /// Creates the global batch-shape metrics.
+    pub fn create() -> Self {
+        Self::new_with_labels(&[] as &[(&str, &str)])
+    }
+
+    /// Records one inbound batch's entry count.
+    pub fn record(&self, entries: usize) {
+        self.batch_size.record(entries as f64);
+    }
+}
+
 /// Cache hit/miss/size metrics with cache type label, shared by every cache tier.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]

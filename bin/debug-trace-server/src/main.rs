@@ -53,7 +53,7 @@ use alloy_primitives::BlockHash;
 use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::Result;
-use jsonrpsee::server::{Server, ServerConfig};
+use jsonrpsee::server::{Server, ServerConfig, middleware::rpc::RpcServiceBuilder};
 use stateless_common::{RpcClient, RpcClientConfig, logging::LogArgs};
 use stateless_core::{
     BisectResolver, ChainStore, ContractStore, DivergenceLookups, PipelineConfig,
@@ -74,6 +74,7 @@ mod middleware;
 mod raw_json;
 mod response_cache;
 mod response_size;
+mod rpc_middleware;
 mod rpc_service;
 mod server_db;
 mod timing;
@@ -190,6 +191,18 @@ struct Args {
     /// identity bodies either way).
     #[clap(long, env = "DEBUG_TRACE_SERVER_RESPONSE_COMPRESSION_DISABLED")]
     response_compression_disabled: bool,
+
+    /// Maximum entries of one inbound JSON-RPC batch request executed concurrently.
+    /// Each entry goes through the regular per-request pipeline either way; the bound
+    /// only stops a single huge batch from monopolizing downstream resources. Set to 1
+    /// for strictly sequential batch execution.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_BATCH_ITEM_CONCURRENCY",
+        default_value_t = rpc_middleware::DEFAULT_BATCH_ITEM_CONCURRENCY,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
+    batch_item_concurrency: u32,
 
     /// Estimated number of items in response cache (for initial capacity). Must be at
     /// least 1 — disable the cache with `--response-cache-disabled`, not with 0.
@@ -436,6 +449,7 @@ async fn main() -> Result<()> {
         response_cache_max_size = args.response_cache_max_size,
         response_cache_estimated_items = args.response_cache_estimated_items,
         response_compression_disabled = args.response_compression_disabled,
+        batch_item_concurrency = args.batch_item_concurrency,
         "Server configuration"
     );
 
@@ -629,9 +643,15 @@ async fn main() -> Result<()> {
     let module = ctx.into_rpc_module()?;
 
     // Start server
-    let config = ServerConfig::builder().max_response_body_size(u32::MAX).build();
+    let max_response_body_size = u32::MAX;
+    let config = ServerConfig::builder().max_response_body_size(max_response_body_size).build();
+    let rpc_middleware = RpcServiceBuilder::new().layer(rpc_middleware::ConcurrentBatchLayer::new(
+        args.batch_item_concurrency as usize,
+        max_response_body_size as usize,
+    ));
     let server = Server::builder()
         .set_config(config)
+        .set_rpc_middleware(rpc_middleware)
         .set_http_middleware(middleware::http_middleware(!args.response_compression_disabled))
         .build(&args.addr)
         .await?;
@@ -1140,6 +1160,33 @@ mod tests {
             || parse_args(&[]).response_compression_disabled,
         );
         assert!(disabled_via_env);
+    }
+
+    /// Batch concurrency knob: default, CLI/env override, and the zero rejection.
+    #[test]
+    fn batch_item_concurrency_flag() {
+        let guard = stateless_test_utils::env::env_lock();
+
+        assert_eq!(
+            parse_args(&[]).batch_item_concurrency,
+            rpc_middleware::DEFAULT_BATCH_ITEM_CONCURRENCY
+        );
+        assert_eq!(parse_args(&["--batch-item-concurrency", "1"]).batch_item_concurrency, 1);
+
+        let base =
+            ["debug-trace-server", "--rpc-endpoint", "http://r", "--witness-endpoint", "http://w"];
+        assert!(
+            Args::try_parse_from(base.iter().chain(&["--batch-item-concurrency", "0"])).is_err(),
+            "0 batch concurrency must be rejected at parse time (1 = sequential)"
+        );
+
+        let via_env = stateless_test_utils::env::with_env_var(
+            &guard,
+            "DEBUG_TRACE_SERVER_BATCH_ITEM_CONCURRENCY",
+            "32",
+            || parse_args(&[]).batch_item_concurrency,
+        );
+        assert_eq!(via_env, 32);
     }
 
     /// Pruner-guard flag: default, CLI override, and env parity.

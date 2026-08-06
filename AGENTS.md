@@ -108,6 +108,7 @@ Two operating modes:
 
 The server includes an HTTP response cache (`quick_cache`) for pre-serialized JSON and a `DataProvider` with single-flight request coalescing.
 Responses are serialized exactly once, straight from the trace output into raw JSON bytes (`RawJson`) spliced verbatim into the reply; the cache shares those bytes by `Arc`, so a hit never re-parses or re-serializes the JSON tree.
+Inbound JSON-RPC batch entries execute concurrently through the regular per-request pipeline (`rpc_middleware.rs`, bounded by `--batch-item-concurrency`, default 16; 1 restores jsonrpsee's sequential behavior; batch shape observable via `debug_trace_batch_size`), so a batch answers near its slowest entry instead of the sum of its entries.
 HTTP responses negotiate gzip/zstd compression per request via `Accept-Encoding` (kill switch: `--response-compression-disabled`); bodies under 4 KiB stay identity, the stack order lives in `http_middleware()` (compression outside the size/timing layers keeps `x-response-size` at the uncompressed size and `x-execution-time-ns` free of compression CPU), and response-cache hits re-compress per hit.
 Body-streaming cost is metered by the outermost middleware layer (`debug_trace_body_cpu_time_seconds` / `debug_trace_wire_bytes_total`, labeled by encoding), since every request-scoped measurement is sealed before the body streams.
 The response cache is keyed by `(resource, block hash, typed tracer variant)`; by-number handlers resolve number → canonical hash before the lookup (local `CANONICAL_CHAIN` first, upstream fallback).
@@ -134,6 +135,7 @@ The background chain-sync prefetch routes by freshness against the last observed
 | `bin/stateless-validator/src/{main,app,workers,chain_sync,validator_db,metrics}.rs`            | Thin entry, CLI/startup wiring, pipeline+reporter, fetcher/processor, DB             |
 | `bin/debug-trace-server/src/chain_sync.rs`                                                     | TraceFetcher, TraceProcessor, TraceHooks                                             |
 | `bin/debug-trace-server/src/rpc_service.rs`                                                    | RPC method definitions and handlers                                                  |
+| `bin/debug-trace-server/src/rpc_middleware.rs`                                                 | Concurrent execution of inbound JSON-RPC batch entries                               |
 | `bin/debug-trace-server/src/data_provider.rs`                                                  | Block data fetching with single-flight coalescing                                    |
 | `bin/debug-trace-server/src/block_data_cache.rs`                                               | Bounded in-memory `BlockData` cache keyed by block hash                              |
 | `bin/debug-trace-server/src/server_db.rs`                                                      | Defines + implements the bin-local `BlockStore` trait (backed by `stateless-db`)     |

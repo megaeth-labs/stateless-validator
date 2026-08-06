@@ -72,6 +72,7 @@ http-body-util.workspace = true
 # HTTP client for integration tests
 reqwest = { workspace = true, features = ["blocking", "json"] }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 zstd.workspace = true
 
 # stateless
