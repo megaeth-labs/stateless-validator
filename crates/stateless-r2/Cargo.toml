@@ -19,6 +19,9 @@ percent-encoding.workspace = true
 # Pinned explicitly (not workspace-inherited): `put_object` exposes `&reqwest::Client`, so the
 # reqwest major is part of this crate's API and must match mega-reth's workspace (0.12). Bumping
 # it is a coordinated two-repo change that a workspace-wide bump must not ride over.
+# No `http2` feature on purpose: R2's S3 endpoint negotiates HTTP/1.1 only (ALPN-verified by
+# `examples/r2_probe.rs`), so h2 would buy the R2 paths nothing while feature-unifying onto
+# every workspace and downstream reqwest user.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 sha2.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
@@ -26,5 +29,6 @@ tracing = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 # misc
+serde_json.workspace = true
 stateless-test-utils = { path = "../stateless-test-utils" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
