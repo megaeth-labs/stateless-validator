@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 exclude.workspace = true
-description = "Shared Cloudflare R2 (S3-compatible) witness primitives: minimal SigV4 signer, object-key layout, endpoint parsing, and signed PUT helper shared by the mega-reth witness uploaders (write path) and the stateless validator (read path)."
+description = "Shared Cloudflare R2 (S3-compatible) witness primitives: minimal SigV4 signer, object-key layout, endpoint parsing, signed PUT helper, and the retrying witness-object GET fetcher — shared by the mega-reth witness uploaders (write path) and both stateless binaries' R2 witness sources (read path)."
 
 [dependencies]
 # misc

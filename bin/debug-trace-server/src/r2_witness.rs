@@ -63,10 +63,8 @@ impl R2WitnessError {
 }
 
 /// Fetches and light-decodes historical witnesses straight from an R2 bucket.
-///
-/// Cloning is cheap — the fetcher's `reqwest::Client` and signer are internally
-/// reference-counted / small, and its `Debug` redacts the credentials.
-#[derive(Clone, Debug)]
+/// The fetcher's `Debug` redacts the credentials.
+#[derive(Debug)]
 pub struct R2WitnessSource {
     fetcher: R2ObjectFetcher,
 }

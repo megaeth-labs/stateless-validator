@@ -26,7 +26,7 @@ use stateless_common::{
 };
 use stateless_core::withdrawals::MptWitness;
 use stateless_r2::{
-    fetch::{DEFAULT_MAX_ATTEMPTS, R2GetError, R2ObjectFetcher, RetryPacing},
+    fetch::{R2GetError, R2ObjectFetcher, RetryPacing},
     keys,
 };
 use tokio::task::JoinError;
@@ -41,6 +41,11 @@ use crate::metrics;
 /// milliseconds.
 const DETERMINISTIC_FAILURE_THROTTLE: Duration =
     if cfg!(test) { Duration::from_millis(5) } else { Duration::from_secs(2) };
+
+/// Total GET attempts (first try + retries) per fetch for retryable (transport/429/5xx)
+/// failures before the error surfaces. Stays a local constant: the RPC witness path retries
+/// unboundedly, so there is no operator flag to mirror.
+const MAX_ATTEMPTS: usize = 9;
 
 /// Failure outcome of an R2 witness fetch.
 #[derive(Debug, thiserror::Error)]
@@ -83,16 +88,10 @@ impl R2WitnessError {
 }
 
 /// Fetches witness objects straight from an R2 bucket over the S3 API with SigV4-signed GETs.
-///
-/// Cloning is cheap — the fetcher's `reqwest::Client` and signer are internally
-/// reference-counted / small, and its `Debug` redacts the credentials.
-#[derive(Clone, Debug)]
+/// The fetcher's `Debug` redacts the credentials.
+#[derive(Debug)]
 pub struct R2WitnessClient {
     fetcher: R2ObjectFetcher,
-    /// Pause applied before surfacing an exhausted retryable failure (the pacing's `max`):
-    /// without it, the next fetch cycle would restart its ramp at `initial`, re-bursting GETs
-    /// into the same brownout the exhausted ramp just backed away from.
-    exhausted_pause: Duration,
 }
 
 impl R2WitnessClient {
@@ -125,7 +124,7 @@ impl R2WitnessClient {
             max_concurrent_requests,
         )
         .map_err(|e| eyre::eyre!(e))?;
-        Ok(Self { fetcher, exhausted_pause: retry_backoff.max })
+        Ok(Self { fetcher })
     }
 
     /// Fetches and decodes the witness for `(number, hash)` from R2.
@@ -145,8 +144,11 @@ impl R2WitnessClient {
         let result = self.get_witness_inner(number, hash).await;
         if let Err(e) = &result {
             metrics::on_r2_witness_error(e.kind());
+            // Exhausted retryable failures pause the pacing's `max`: without it, the next
+            // fetch cycle would restart its ramp at `initial`, re-bursting GETs into the
+            // same brownout the exhausted ramp just backed away from.
             let pause = if e.is_retryable() {
-                self.exhausted_pause
+                self.fetcher.pacing().max
             } else {
                 DETERMINISTIC_FAILURE_THROTTLE
             };
@@ -164,13 +166,7 @@ impl R2WitnessClient {
         let started = Instant::now();
         let fetched = self
             .fetcher
-            .get_block_object(
-                number,
-                hash,
-                DEFAULT_MAX_ATTEMPTS,
-                None,
-                metrics::on_r2_witness_retry,
-            )
+            .get_block_object(number, hash, MAX_ATTEMPTS, None, metrics::on_r2_witness_retry)
             .await?;
         let bytes = fetched.bytes;
 
@@ -319,7 +315,7 @@ mod tests {
             matches!(err, R2WitnessError::Get(R2GetError::Throttled { status: 503, .. })),
             "{err}"
         );
-        assert_eq!(hits.load(Ordering::SeqCst), DEFAULT_MAX_ATTEMPTS);
+        assert_eq!(hits.load(Ordering::SeqCst), MAX_ATTEMPTS);
         assert!(
             started.elapsed() >= Duration::from_millis(255) + max,
             "exhausted retries surfaced without the max-backoff pause ({:?})",

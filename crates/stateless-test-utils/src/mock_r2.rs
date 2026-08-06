@@ -1,7 +1,8 @@
-//! Minimal scripted HTTP server standing in for an R2 (S3 API) endpoint in tests.
+//! Minimal scripted HTTP servers standing in for an R2 (S3 API) endpoint in tests.
 //!
-//! Shared by every R2 witness *reader* test — `stateless-r2`'s fetcher tests and the
-//! binaries' adapter tests — so the response scripting stays identical across them.
+//! [`mock_r2`] is shared by the R2 reader tests across `stateless-r2` and both binaries'
+//! adapters, so the response scripting stays identical across them; [`mock_r2_held`]
+//! serves the fetcher's concurrency/deadline tests.
 
 use std::sync::{
     Arc,
@@ -11,24 +12,19 @@ use std::sync::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Serves every connection concurrently with the same held response: reads the request,
-/// sleeps `hold`, then replies `status` with an empty body. Returns the endpoint, the
-/// request counter, and the in-flight high-water mark — for tests of concurrency caps
-/// (consume the peak) and of deadlines shorter than `hold` (ignore it).
-pub async fn mock_r2_held(
-    status: u16,
-    hold: std::time::Duration,
-) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+/// sleeps `hold`, then replies `status` with an empty body. Returns the endpoint and the
+/// in-flight high-water mark — for tests of concurrency caps (consume the peak) and of
+/// deadlines shorter than `hold` (ignore it).
+pub async fn mock_r2_held(status: u16, hold: std::time::Duration) -> (String, Arc<AtomicUsize>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let hits = Arc::new(AtomicUsize::new(0));
     let in_flight = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     {
-        let (hits, in_flight, peak) = (hits.clone(), in_flight.clone(), peak.clone());
+        let (in_flight, peak) = (in_flight.clone(), peak.clone());
         tokio::spawn(async move {
             loop {
                 let Ok((mut sock, _)) = listener.accept().await else { return };
-                hits.fetch_add(1, Ordering::SeqCst);
                 let (in_flight, peak) = (in_flight.clone(), peak.clone());
                 tokio::spawn(async move {
                     let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -45,7 +41,7 @@ pub async fn mock_r2_held(
             }
         });
     }
-    (endpoint, hits, peak)
+    (endpoint, peak)
 }
 
 /// Serves one scripted HTTP/1.1 response per connection on a local port and counts requests.

@@ -28,11 +28,6 @@ use crate::{
     sigv4::{SigV4Signer, encode_uri_path},
 };
 
-/// Default total GET attempts (first try + retries) per fetch for retryable
-/// (transport/429/5xx) failures before the error surfaces. Sized for deadline-less
-/// pipeline readers; request-serving callers with a fallback waiting pass fewer.
-pub const DEFAULT_MAX_ATTEMPTS: usize = 9;
-
 /// Cap on the response body carried inside `Throttled`/`Status` errors.
 const MAX_ERROR_BODY_BYTES: usize = 1024;
 
@@ -165,6 +160,12 @@ pub struct R2ObjectFetcher {
 }
 
 impl R2ObjectFetcher {
+    /// The retry pacing this fetcher was built with, for callers whose surfaced-failure
+    /// policies must stay in sync with the retry ramp (e.g. pausing the ramp's `max`).
+    pub const fn pacing(&self) -> RetryPacing {
+        self.pacing
+    }
+
     /// Builds a fetcher from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
     ///
     /// `per_attempt_timeout` bounds each individual GET. `pacing` governs the retry sleeps of
@@ -248,13 +249,16 @@ impl R2ObjectFetcher {
             match outcome {
                 Ok(bytes) => return Ok(FetchedObject { bytes, queue_wait }),
                 Err(e) => {
+                    if !e.is_retryable() || attempt >= max_attempts {
+                        return Err(e);
+                    }
                     // Jittered doubling; `.max(1)` keeps a zero-duration policy from
                     // busy-looping.
                     let jitter_ms = fastrand::u64(0..=backoff_ms / 2);
                     let sleep_ms = (backoff_ms + jitter_ms).min(max_backoff_ms).max(1);
-                    let out_of_time = deadline
-                        .is_some_and(|d| Instant::now() + Duration::from_millis(sleep_ms) >= d);
-                    if !e.is_retryable() || attempt >= max_attempts || out_of_time {
+                    if deadline
+                        .is_some_and(|d| Instant::now() + Duration::from_millis(sleep_ms) >= d)
+                    {
                         return Err(e);
                     }
                     on_retry();
@@ -346,6 +350,9 @@ mod tests {
 
     use super::*;
 
+    /// Attempt budget used by the exhaust-path tests (the pipeline reader's sizing).
+    const MAX_ATTEMPTS: usize = 9;
+
     /// Millisecond-scale retry pacing so the retry-path tests run fast.
     fn test_pacing() -> RetryPacing {
         RetryPacing { initial: Duration::from_millis(5), max: Duration::from_millis(20) }
@@ -369,7 +376,7 @@ mod tests {
     }
 
     async fn fetch(endpoint: &str) -> Result<FetchedObject, R2GetError> {
-        fetcher(endpoint).get_block_object(1, "0xhash", DEFAULT_MAX_ATTEMPTS, None, || ()).await
+        fetcher(endpoint).get_block_object(1, "0xhash", MAX_ATTEMPTS, None, || ()).await
     }
 
     #[test]
@@ -463,10 +470,8 @@ mod tests {
             RetryPacing { initial: Duration::from_millis(50), max: Duration::from_millis(200) },
         );
         let started = Instant::now();
-        let err = fetcher
-            .get_block_object(1, "0xhash", DEFAULT_MAX_ATTEMPTS, None, || ())
-            .await
-            .unwrap_err();
+        let err =
+            fetcher.get_block_object(1, "0xhash", MAX_ATTEMPTS, None, || ()).await.unwrap_err();
         assert!(matches!(err, R2GetError::Missing { .. }), "{err}");
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         assert!(
@@ -480,7 +485,7 @@ mod tests {
         let (endpoint, hits) = mock_r2(vec![(503, "overloaded")]).await;
         let err = fetch(&endpoint).await.unwrap_err();
         assert!(matches!(err, R2GetError::Throttled { status: 503, .. }), "{err}");
-        assert_eq!(hits.load(Ordering::SeqCst), DEFAULT_MAX_ATTEMPTS, "exactly max_attempts GETs");
+        assert_eq!(hits.load(Ordering::SeqCst), MAX_ATTEMPTS, "exactly max_attempts GETs");
     }
 
     /// `on_retry` fires once per retry — attempts minus one.
@@ -520,7 +525,7 @@ mod tests {
         let started = Instant::now();
         let deadline = Instant::now() + Duration::from_millis(50);
         let err = fetcher
-            .get_block_object(1, "0xhash", DEFAULT_MAX_ATTEMPTS, Some(deadline), || ())
+            .get_block_object(1, "0xhash", MAX_ATTEMPTS, Some(deadline), || ())
             .await
             .unwrap_err();
         assert!(matches!(err, R2GetError::Throttled { status: 503, .. }), "{err}");
@@ -537,11 +542,11 @@ mod tests {
     #[tokio::test]
     async fn expired_deadline_surfaces_a_transport_error_fast() {
         // Holds every response far past the floor timeout.
-        let (endpoint, _, _) = mock_r2_held(404, Duration::from_secs(5)).await;
+        let (endpoint, _) = mock_r2_held(404, Duration::from_secs(5)).await;
         let started = Instant::now();
         let deadline = Instant::now() - Duration::from_secs(1);
         let err = fetcher(&endpoint)
-            .get_block_object(1, "0xhash", DEFAULT_MAX_ATTEMPTS, Some(deadline), || ())
+            .get_block_object(1, "0xhash", MAX_ATTEMPTS, Some(deadline), || ())
             .await
             .unwrap_err();
         assert!(matches!(err, R2GetError::Transport { .. }), "{err}");
@@ -560,14 +565,14 @@ mod tests {
 
         // Responses held 50ms so fetches pile up behind the semaphore, then answered 404
         // (deterministic -> exactly one GET per fetch).
-        let (endpoint, _, peak) = mock_r2_held(404, Duration::from_millis(50)).await;
+        let (endpoint, peak) = mock_r2_held(404, Duration::from_millis(50)).await;
 
         let fetcher = fetcher_with(&endpoint, Some(LIMIT), test_pacing());
         let mut fetches = tokio::task::JoinSet::new();
         for number in 0..FETCHES {
             let fetcher = fetcher.clone();
             fetches.spawn(async move {
-                fetcher.get_block_object(number, "0xhash", DEFAULT_MAX_ATTEMPTS, None, || ()).await
+                fetcher.get_block_object(number, "0xhash", MAX_ATTEMPTS, None, || ()).await
             });
         }
         while let Some(result) = fetches.join_next().await {

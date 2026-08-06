@@ -535,6 +535,16 @@ async fn main() -> Result<()> {
         &args.r2_access_key_id,
         &args.r2_secret_access_key,
     ) {
+        // Without a local DB there is no tip to anchor block age, so the historical route
+        // can never fire — skip building the client instead of holding a dead one.
+        (Some(_), ..) if args.data_dir.is_none() => {
+            warn!(
+                "--r2-endpoint without --data-dir: block age cannot be anchored to a \
+                 local tip, so the R2 historical route is inactive and all witnesses \
+                 use the RPC chain"
+            );
+            None
+        }
         (Some(endpoint), Some(bucket), Some(access_key_id), Some(secret)) => {
             let source = R2WitnessSource::new(
                 endpoint,
@@ -549,13 +559,6 @@ async fn main() -> Result<()> {
                 endpoint,
                 bucket, "Historical witness source: R2 (direct S3), RPC chain as fallback"
             );
-            if args.data_dir.is_none() {
-                warn!(
-                    "--r2-endpoint without --data-dir: block age cannot be anchored to a \
-                     local tip, so the R2 historical route is inactive and all witnesses \
-                     use the RPC chain"
-                );
-            }
             Some(Arc::new(source))
         }
         _ => None,
