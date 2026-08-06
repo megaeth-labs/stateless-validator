@@ -1353,13 +1353,6 @@ mod tests {
     /// the full quad must parse, and none-of-them stays valid.
     #[test]
     fn r2_flag_group_is_all_or_nothing() {
-        let base = [
-            "debug-trace-server",
-            "--rpc-endpoint",
-            "http://rpc",
-            "--witness-endpoint",
-            "http://w",
-        ];
         let full = [
             "--r2-endpoint",
             "https://acc.r2.cloudflarestorage.com",
@@ -1371,22 +1364,28 @@ mod tests {
             "sk",
         ];
 
-        let args = Args::try_parse_from(base.iter().chain(full.iter())).expect("full quad parses");
-        assert_eq!(args.r2_bucket.as_deref(), Some("witness-mainnet"));
+        assert_eq!(parse_args(&full).r2_bucket.as_deref(), Some("witness-mainnet"));
+        let _ = parse_args(&[]); // no R2 flags stays valid
 
-        assert!(Args::try_parse_from(base).is_ok(), "no R2 flags stays valid");
-        // Dropping any one member of the quad breaks the group.
-        for missing in (0..4).map(|i| i * 2) {
+        // Dropping any one flag=value pair of the quad breaks the group.
+        for skip in 0..4 {
             let partial: Vec<&str> = full
-                .iter()
+                .chunks(2)
                 .enumerate()
-                .filter(|(i, _)| *i != missing && *i != missing + 1)
-                .map(|(_, s)| *s)
+                .filter(|(i, _)| *i != skip)
+                .flat_map(|(_, pair)| pair.iter().copied())
                 .collect();
+            let base = [
+                "debug-trace-server",
+                "--rpc-endpoint",
+                "http://r",
+                "--witness-endpoint",
+                "http://w",
+            ];
             assert!(
                 Args::try_parse_from(base.iter().copied().chain(partial)).is_err(),
                 "missing {} must fail parsing",
-                full[missing],
+                full[skip * 2],
             );
         }
     }
@@ -1395,25 +1394,15 @@ mod tests {
     #[test]
     fn historical_readahead_flag_and_env() {
         let guard = stateless_test_utils::env::env_lock();
-        let base = [
-            "debug-trace-server",
-            "--rpc-endpoint",
-            "http://rpc",
-            "--witness-endpoint",
-            "http://w",
-        ];
-        let parse = |extra: &[&str]| {
-            Args::try_parse_from(base.iter().chain(extra)).unwrap().historical_readahead
-        };
 
-        assert_eq!(parse(&[]), 0);
-        assert_eq!(parse(&["--historical-readahead", "64"]), 64);
+        assert_eq!(parse_args(&[]).historical_readahead, 0);
+        assert_eq!(parse_args(&["--historical-readahead", "64"]).historical_readahead, 64);
 
         let from_env = stateless_test_utils::env::with_env_var(
             &guard,
             "DEBUG_TRACE_SERVER_HISTORICAL_READAHEAD",
             "128",
-            || parse(&[]),
+            || parse_args(&[]).historical_readahead,
         );
         assert_eq!(from_env, 128);
     }

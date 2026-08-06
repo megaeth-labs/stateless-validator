@@ -144,6 +144,14 @@ impl TestFixtures {
             .collect()
     }
 
+    /// The first paired block's `(SaltWitness, MptWitness)` — the standard input for tests
+    /// that encode a witness payload. One home so every R2/witness-wire test selects the
+    /// same fixture.
+    pub fn first_paired_witness<T: DeserializeOwned>(&self) -> (SaltWitness, T) {
+        let (_, hash) = *self.paired_blocks().first().expect("fixtures have a paired witness");
+        (self.salt_witnesses[&hash].clone(), self.mpt_witness(&hash))
+    }
+
     pub fn load_genesis(&self) -> Result<Genesis> {
         load_json(self.data_dir.join("genesis.json"))
     }

@@ -127,6 +127,10 @@ pub struct BlockData {
 /// normal.
 pub const DEFAULT_WITNESS_TIMEOUT_SECS: u64 = 8;
 
+/// The R2 attempt's share of the remaining witness budget: half, so a hung R2 endpoint can
+/// never starve the RPC fallback of its turn; a healthy R2 answers in a fraction of it.
+const R2_WITNESS_BUDGET_DIVISOR: u32 = 2;
+
 /// Default local-tip window (in blocks): witnesses at least this far below the local tip are
 /// historical and skip the internal generator endpoint (see [`witness_route`]).
 ///
@@ -185,8 +189,7 @@ const TIP_SEED_TIMEOUT: Duration = Duration::from_secs(1);
 pub(crate) const SLOW_STAGE_THRESHOLD_MS: u128 = 1000;
 
 /// Concurrent prefetch fetches the historical readahead may hold in flight. Scheduling uses
-/// `try_acquire`, so this also bounds the spawned-task backlog: a saturated readahead drops
-/// further candidates instead of queueing them, and the next by-number request re-triggers.
+/// `try_acquire`, so this also bounds the spawned-task backlog.
 const READAHEAD_CONCURRENCY: usize = 16;
 
 /// Stage that ran out of time. Used only to label the typed `Timeout` error below.
@@ -316,8 +319,6 @@ struct Readahead {
     permits: Arc<tokio::sync::Semaphore>,
     /// Recently scheduled numbers (insertion-ordered, bounded), so repeated requests
     /// sweeping through an already-warmed range don't re-schedule the same prefetches.
-    /// Entries age out by insertion order; failed prefetches are removed eagerly so a
-    /// later pass can retry them.
     scheduled: Mutex<ScheduledWindow>,
 }
 
@@ -345,26 +346,34 @@ impl Readahead {
         }
     }
 
-    /// Marks `number` as scheduled. Returns `false` when it is already in the window.
-    fn mark(&self, number: u64) -> bool {
+    /// Marks every not-yet-scheduled candidate under one lock and returns the newly marked
+    /// numbers (empty for a fully warmed range, without allocating).
+    fn mark_range(&self, candidates: impl Iterator<Item = u64>) -> Vec<u64> {
         let mut window = self.scheduled.lock().expect("readahead window lock");
-        if !window.set.insert(number) {
-            return false;
+        let mut fresh = Vec::new();
+        for number in candidates {
+            if !window.set.insert(number) {
+                continue;
+            }
+            window.order.push_back(number);
+            while window.order.len() > window.cap {
+                let evicted = window.order.pop_front().expect("order tracks set");
+                window.set.remove(&evicted);
+            }
+            fresh.push(number);
         }
-        window.order.push_back(number);
-        while window.order.len() > window.cap {
-            let evicted = window.order.pop_front().expect("order tracks set");
-            window.set.remove(&evicted);
-        }
-        true
+        fresh
     }
 
-    /// Forgets `number` so a later request may schedule it again (failed or dropped
-    /// prefetches must not poison the window for the whole window lifetime).
-    fn unmark(&self, number: u64) {
-        // The stale `order` entry is left behind; it ages out and its second eviction is a
-        // no-op on the set.
-        self.scheduled.lock().expect("readahead window lock").set.remove(&number);
+    /// Forgets `numbers` so a later request may schedule them again (failed or dropped
+    /// prefetches must not poison the window for its whole lifetime). Stale `order` entries
+    /// are left behind; they age out, and a re-marked number's early eviction via its stale
+    /// entry only allows an earlier re-schedule.
+    fn unmark(&self, numbers: &[u64]) {
+        let mut window = self.scheduled.lock().expect("readahead window lock");
+        for number in numbers {
+            window.set.remove(number);
+        }
     }
 }
 
@@ -536,9 +545,7 @@ impl DataProvider {
         self
     }
 
-    /// Schedules background prefetches of the blocks after `from_block`, when readahead is
-    /// enabled and `from_block` is historical (a non-historical number serves from the local
-    /// DB, where prefetching buys nothing). Cheap no-op for already-scheduled numbers; when
+    /// Schedules background prefetches of the historical blocks after `from_block`. When
     /// the prefetch permits are exhausted the remaining candidates are dropped — the next
     /// by-number request re-triggers scheduling, so the frontier keeps pace with the crawl.
     ///
@@ -548,21 +555,29 @@ impl DataProvider {
     /// blocks.
     pub fn schedule_readahead(self: &Arc<Self>, from_block: u64) {
         let Some(readahead) = &self.readahead else { return };
-        let db_tip = db_tip_height(self.db.as_deref());
+        // The memoized tip spares this per-request prelude a redb read; refreshed here when
+        // unset. Staleness is bounded by the blocks synced since the last DB-backed serve —
+        // immaterial against the 4096-block window, and stale-low only skips readahead.
+        let db_tip = match self.last_seen_db_tip.load(Ordering::Relaxed) {
+            u64::MAX => {
+                let tip = db_tip_height(self.db.as_deref());
+                if let Some(tip) = tip {
+                    self.last_seen_db_tip.store(tip, Ordering::Relaxed);
+                }
+                tip
+            }
+            tip => Some(tip),
+        };
         if !is_historical(db_tip, from_block, self.witness_cfg.local_window) {
             return;
         }
-        for number in from_block + 1..=from_block.saturating_add(readahead.depth) {
-            // The crawl runs toward the tip; stop at the local window — those blocks serve
-            // from the DB.
-            if !is_historical(db_tip, number, self.witness_cfg.local_window) {
-                break;
-            }
-            if !readahead.mark(number) {
-                continue;
-            }
+        // Candidates stop at the local window — those blocks serve from the DB.
+        let candidates = (from_block + 1..=from_block.saturating_add(readahead.depth))
+            .take_while(|&n| is_historical(db_tip, n, self.witness_cfg.local_window));
+        let fresh = readahead.mark_range(candidates);
+        for (scheduled, &number) in fresh.iter().enumerate() {
             let Ok(permit) = Arc::clone(&readahead.permits).try_acquire_owned() else {
-                readahead.unmark(number);
+                readahead.unmark(&fresh[scheduled..]);
                 crate::metrics::record_readahead("saturated");
                 return;
             };
@@ -580,9 +595,9 @@ impl DataProvider {
                     Ok(_) => crate::metrics::record_readahead("completed"),
                     Err(e) => {
                         crate::metrics::record_readahead("failed");
-                        // Forget the number so a later pass can retry it; prefetches are
-                        // best-effort and must never log above debug.
-                        provider.readahead.as_ref().expect("spawned by readahead").unmark(number);
+                        // Forget the number so a later pass can retry it.
+                        let readahead = provider.readahead.as_ref().expect("spawned by readahead");
+                        readahead.unmark(&[number]);
                         debug!(number, error = %e, "Readahead prefetch failed");
                     }
                 }
@@ -1279,34 +1294,10 @@ async fn fetch_witness(
     deadline: Instant,
 ) -> DataProviderResult<(LightWitness, MptWitness)> {
     if let Some(r2) = r2_witness &&
-        is_historical(db_tip, block_number, cfg.local_window)
+        is_historical(db_tip, block_number, cfg.local_window) &&
+        let Some(witness) = try_r2_witness(r2, block_number, block_hash, deadline).await
     {
-        // Half the remaining witness budget, so a hung R2 endpoint can never starve the RPC
-        // fallback of its turn; a healthy R2 answers in a fraction of it.
-        let r2_deadline =
-            (Instant::now() + deadline.saturating_duration_since(Instant::now()) / 2).min(deadline);
-        let metrics = WitnessSourceMetrics::new_for_source("witness_r2");
-        let start = Instant::now();
-        match r2.get_witness_light(block_number, block_hash, r2_deadline).await {
-            Ok(witness) => {
-                metrics.record_request(true, start.elapsed().as_secs_f64());
-                metrics
-                    .record_size(WitnessSizeBreakdown::new_light(&witness.0, &witness.1).total());
-                DataSourceMetrics::new_for_source("witness_r2").record();
-                return Ok(witness);
-            }
-            Err(e) => {
-                metrics.record_request(false, start.elapsed().as_secs_f64());
-                crate::metrics::record_r2_witness_error(e.kind());
-                warn!(
-                    block_number,
-                    block_hash = %block_hash,
-                    kind = e.kind(),
-                    error = %e,
-                    "R2 witness fetch failed, falling back to the RPC chain",
-                );
-            }
-        }
+        return Ok(witness);
     }
 
     let can_skip_generator = cfg.generator_first && rpc_client.witness_provider_count() >= 2;
@@ -1319,9 +1310,7 @@ async fn fetch_witness(
         .await
     {
         Ok(w) => {
-            metrics.record_request(true, start.elapsed().as_secs_f64());
-            metrics.record_size(WitnessSizeBreakdown::new_light(&w.0, &w.1).total());
-            DataSourceMetrics::new_for_source(source).record();
+            record_witness_success(&metrics, source, start, &w);
             Ok(w)
         }
         Err(e) => {
@@ -1342,6 +1331,49 @@ async fn fetch_witness(
             Err(e.into())
         }
     }
+}
+
+/// One R2 attempt for a historical witness, on [`R2_WITNESS_BUDGET_DIVISOR`]'s share of the
+/// remaining budget. `None` on any failure — the caller falls back to the RPC chain.
+async fn try_r2_witness(
+    r2: &R2WitnessSource,
+    block_number: u64,
+    block_hash: B256,
+    deadline: Instant,
+) -> Option<(LightWitness, MptWitness)> {
+    let now = Instant::now();
+    let r2_deadline = now + deadline.saturating_duration_since(now) / R2_WITNESS_BUDGET_DIVISOR;
+    let metrics = WitnessSourceMetrics::new_for_source("witness_r2");
+    match r2.get_witness_light(block_number, block_hash, r2_deadline).await {
+        Ok(witness) => {
+            record_witness_success(&metrics, "witness_r2", now, &witness);
+            Some(witness)
+        }
+        Err(e) => {
+            metrics.record_request(false, now.elapsed().as_secs_f64());
+            crate::metrics::record_r2_witness_error(e.kind());
+            warn!(
+                block_number,
+                block_hash = %block_hash,
+                kind = e.kind(),
+                error = %e,
+                "R2 witness fetch failed, falling back to the RPC chain",
+            );
+            None
+        }
+    }
+}
+
+/// Success-side witness bookkeeping shared by the R2 and RPC arms of the witness stage.
+fn record_witness_success(
+    metrics: &WitnessSourceMetrics,
+    source: &'static str,
+    start: Instant,
+    witness: &(LightWitness, MptWitness),
+) {
+    metrics.record_request(true, start.elapsed().as_secs_f64());
+    metrics.record_size(WitnessSizeBreakdown::new_light(&witness.0, &witness.1).total());
+    DataSourceMetrics::new_for_source(source).record();
 }
 
 /// Free-function version of contract resolution so it can be called from the shared-future
@@ -1502,6 +1534,7 @@ mod tests {
     use std::{net::TcpListener, sync::atomic::Ordering};
 
     use stateless_common::{BackoffPolicy, RpcClientConfig};
+    use stateless_test_utils::{fixtures::TestFixtures, mock_r2::mock_r2};
 
     use super::{
         test_support::{consistent_header, scripted_witness_rpc, start_mock_rpc},
@@ -1931,45 +1964,24 @@ mod tests {
         hb.stop().unwrap();
     }
 
-    /// R2 source for routing tests, pointed at a mock endpoint with millisecond retry pacing.
-    fn r2_source(endpoint: &str) -> R2WitnessSource {
-        R2WitnessSource::new(
-            endpoint,
-            "witness-test".to_string(),
-            "ak".to_string(),
-            "sk".to_string(),
-            Duration::from_secs(5),
-            BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
-            None,
-        )
-        .unwrap()
-    }
-
     /// Fixture witness encoded as an R2 object body (the uploader's wire format).
     fn fixture_r2_payload() -> Vec<u8> {
-        use stateless_test_utils::fixtures::TestFixtures;
-
-        let fixtures = TestFixtures::mainnet_shared();
-        let (_, hash) =
-            fixtures.paired_blocks().into_iter().next().expect("mainnet fixtures have a witness");
-        let salt_witness = fixtures.salt_witnesses[&hash].clone();
-        let mpt_witness = fixtures.mpt_witness(&hash);
-        let (_, payload) = stateless_common::encode_witness_payload(&salt_witness, &mpt_witness)
-            .expect("fixture witness must encode");
-        payload
+        let (salt_witness, mpt_witness): (_, MptWitness) =
+            TestFixtures::mainnet_shared().first_paired_witness();
+        stateless_common::encode_witness_payload(&salt_witness, &mpt_witness)
+            .expect("fixture witness must encode")
+            .1
     }
 
     /// A historical block with R2 configured is served from R2 alone: neither the generator
     /// nor the fallback RPC endpoint sees a request.
     #[tokio::test]
     async fn fetch_witness_historical_prefers_r2_over_the_rpc_chain() {
-        use stateless_test_utils::mock_r2::mock_r2;
-
         let (r2_endpoint, r2_hits) = mock_r2(vec![(200, fixture_r2_payload())]).await;
         let (ha, url_a, hits_a) = scripted_witness_rpc(0, None).await;
         let (hb, url_b, hits_b) = scripted_witness_rpc(0, None).await;
         let (rpc_client, cfg) = routing_fixture(&[url_a.as_str(), url_b.as_str()], true);
-        let r2 = r2_source(&r2_endpoint);
+        let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
 
         // Historical block (900 + 100 <= 5000).
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1989,13 +2001,11 @@ mod tests {
     /// historical blocks — instead of surfacing to the caller.
     #[tokio::test]
     async fn fetch_witness_falls_back_to_the_rpc_chain_when_r2_misses() {
-        use stateless_test_utils::mock_r2::mock_r2;
-
         let (r2_endpoint, r2_hits) = mock_r2(vec![(404, "<Code>NoSuchKey</Code>")]).await;
         let (ha, url_a, hits_a) = scripted_witness_rpc(0, None).await;
         let (hb, url_b, hits_b) = scripted_witness_rpc(0, None).await;
         let (rpc_client, cfg) = routing_fixture(&[url_a.as_str(), url_b.as_str()], true);
-        let r2 = r2_source(&r2_endpoint);
+        let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
 
         let deadline = Instant::now() + Duration::from_millis(150);
         let result =
@@ -2015,16 +2025,14 @@ mod tests {
     #[test]
     fn readahead_window_marks_dedups_and_evicts() {
         let readahead = Readahead::new(32); // cap clamps to 256
-        assert!(readahead.mark(1));
-        assert!(!readahead.mark(1), "second mark of the same number must dedup");
-        readahead.unmark(1);
-        assert!(readahead.mark(1), "unmark must re-admit the number");
+        assert_eq!(readahead.mark_range(1..=1), vec![1]);
+        assert!(readahead.mark_range(1..=1).is_empty(), "a marked number must dedup");
+        readahead.unmark(&[1]);
+        assert_eq!(readahead.mark_range(1..=1), vec![1], "unmark must re-admit the number");
 
         // Fill far past the cap; the oldest entries fall out and become re-admittable.
-        for number in 0..300u64 {
-            readahead.mark(10_000 + number);
-        }
-        assert!(readahead.mark(10_000), "evicted numbers must be re-admittable");
+        readahead.mark_range(10_000..10_300);
+        assert_eq!(readahead.mark_range(10_000..=10_000), vec![10_000], "evicted re-admits");
 
         let disabled = provider_with("http://127.0.0.1:9/", None).with_historical_readahead(0);
         assert!(disabled.readahead.is_none(), "depth 0 must leave readahead disabled");
@@ -2042,32 +2050,28 @@ mod tests {
             Arc::new(StubBlockStore { canonical_tip: Some(5000), ..Default::default() });
         let provider =
             Arc::new(provider_with("http://127.0.0.1:9/", Some(db)).with_historical_readahead(8));
-        let window_len = || {
-            let readahead = provider.readahead.as_ref().unwrap();
-            let window = readahead.scheduled.lock().unwrap();
-            window.order.len()
-        };
 
         provider.schedule_readahead(890);
-        {
-            let readahead = provider.readahead.as_ref().unwrap();
-            let window = readahead.scheduled.lock().unwrap();
-            assert!((891..=898).all(|n| window.set.contains(&n)), "depth-8 span from 890");
-            assert_eq!(window.order.len(), 8);
-        }
+        assert!((891..=898).all(|n| window(&provider).set.contains(&n)), "depth-8 span from 890");
+        assert_eq!(window(&provider).order.len(), 8);
 
         // The same cursor again: pure dedup. An advanced cursor: only the new tail.
         provider.schedule_readahead(890);
-        assert_eq!(window_len(), 8);
+        assert_eq!(window(&provider).order.len(), 8);
         provider.schedule_readahead(892);
-        assert_eq!(window_len(), 10, "893..=900 adds only 899 and 900");
+        assert_eq!(window(&provider).order.len(), 10, "893..=900 adds only 899 and 900");
 
         // The last historical number has no historical successors; a non-historical
         // request must not schedule at all.
         provider.schedule_readahead(904);
-        assert_eq!(window_len(), 10);
+        assert_eq!(window(&provider).order.len(), 10);
         provider.schedule_readahead(4000);
-        assert_eq!(window_len(), 10);
+        assert_eq!(window(&provider).order.len(), 10);
+    }
+
+    /// The readahead scheduling window, for assertions.
+    fn window(provider: &DataProvider) -> std::sync::MutexGuard<'_, ScheduledWindow> {
+        provider.readahead.as_ref().unwrap().scheduled.lock().unwrap()
     }
 
     /// Exhausted prefetch permits drop the remaining candidates (and forget them, so a
@@ -2085,8 +2089,7 @@ mod tests {
         provider.schedule_readahead(5010);
         provider.schedule_readahead(5020);
 
-        let readahead = provider.readahead.as_ref().unwrap();
-        let window = readahead.scheduled.lock().unwrap();
+        let window = window(&provider);
         assert_eq!(window.set.len(), READAHEAD_CONCURRENCY, "exactly the permit count sticks");
         assert!(!window.set.contains(&5021), "saturated candidates must be forgotten");
     }
@@ -2095,13 +2098,11 @@ mod tests {
     /// full RPC chain with the generator first keeps serving them.
     #[tokio::test]
     async fn fetch_witness_recent_block_ignores_r2() {
-        use stateless_test_utils::mock_r2::mock_r2;
-
         let (r2_endpoint, r2_hits) = mock_r2(vec![(200, "never fetched")]).await;
         let (ha, url_a, hits_a) = scripted_witness_rpc(0, None).await;
         let (hb, url_b, _hits_b) = scripted_witness_rpc(0, None).await;
         let (rpc_client, cfg) = routing_fixture(&[url_a.as_str(), url_b.as_str()], true);
-        let r2 = r2_source(&r2_endpoint);
+        let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
 
         // The tip itself is recent: R2 must stay untouched, the generator probed first.
         let deadline = Instant::now() + Duration::from_millis(150);

@@ -7,10 +7,7 @@
 //! exponential backoff, and the in-flight concurrency cap. Everything reader-specific stays
 //! with the caller: payload decoding (full vs light), metrics, and failure pacing policies.
 //!
-//! The loop is deadline-aware: with `deadline = Some(..)` each attempt's HTTP timeout is
-//! clamped to the remaining budget and a retry is never started that could not finish its
-//! backoff sleep in time — request-serving callers thread their per-request budget through,
-//! while pipeline callers pass `None` and rely on the attempt cap alone.
+//! The loop is optionally deadline-aware (see [`R2ObjectFetcher::get_block_object`]).
 
 use std::{
     fmt::Display,
@@ -32,7 +29,8 @@ use crate::{
 };
 
 /// Default total GET attempts (first try + retries) per fetch for retryable
-/// (transport/429/5xx) failures before the error surfaces.
+/// (transport/429/5xx) failures before the error surfaces. Sized for deadline-less
+/// pipeline readers; request-serving callers with a fallback waiting pass fewer.
 pub const DEFAULT_MAX_ATTEMPTS: usize = 9;
 
 /// Cap on the response body carried inside `Throttled`/`Status` errors.
@@ -47,47 +45,17 @@ pub enum R2GetError {
     /// The object is absent from the bucket (HTTP 404 `NoSuchKey`): a transient miss near
     /// the tip / right after a reorg (the uploader has not PUT the object yet), or a
     /// permanent completeness gap in R2.
-    Missing {
-        /// Block number of the requested witness.
-        number: u64,
-        /// Object key the GET targeted.
-        key: String,
-    },
+    Missing { number: u64, key: String },
     /// Transport-level failure (connection reset/timeout) — the endpoint is effectively
     /// unreachable. Retried internally with backoff before surfacing.
-    Transport {
-        /// Block number of the requested witness.
-        number: u64,
-        /// Object key the GET targeted.
-        key: String,
-        /// Underlying transport error.
-        source: reqwest::Error,
-    },
+    Transport { number: u64, key: String, source: reqwest::Error },
     /// R2 asked us to slow down (429) or returned a server-side error (5xx, including R2's
     /// 503 overload / SlowDown). Retried internally with backoff before surfacing.
-    Throttled {
-        /// Block number of the requested witness.
-        number: u64,
-        /// Object key the GET targeted.
-        key: String,
-        /// HTTP status code returned by R2.
-        status: u16,
-        /// Response body (best-effort, capped), included for diagnostics.
-        body: String,
-    },
+    Throttled { number: u64, key: String, status: u16, body: String },
     /// A non-success status unlikely to clear on retry: a 4xx other than 429 (e.g. 403 bad
     /// credentials, 404 NoSuchBucket) or a 3xx (redirects are never followed — see
-    /// [`R2ObjectFetcher::new`]).
-    Status {
-        /// Block number of the requested witness.
-        number: u64,
-        /// Object key the GET targeted.
-        key: String,
-        /// HTTP status code returned by R2.
-        status: u16,
-        /// Response body (best-effort, capped), included for diagnostics.
-        body: String,
-    },
+    /// [`R2ObjectFetcher::new`]). Bodies are best-effort and capped.
+    Status { number: u64, key: String, status: u16, body: String },
 }
 
 impl R2GetError {
@@ -265,7 +233,6 @@ impl R2ObjectFetcher {
         let max_backoff_ms = self.pacing.max.as_millis() as u64;
         let mut backoff_ms = self.pacing.initial.as_millis() as u64;
         let mut attempt = 0usize;
-        // Reported to the caller so duration metrics can subtract self-imposed queueing.
         let mut queue_wait = Duration::ZERO;
 
         loop {
@@ -302,9 +269,7 @@ impl R2ObjectFetcher {
         }
     }
 
-    /// Performs one SigV4-signed GET and classifies the response. No retry. The body comes
-    /// back as [`Bytes`] (refcounted), so the multi-MB witness is never copied between the
-    /// HTTP response and the caller's decoder.
+    /// Performs one SigV4-signed GET and classifies the response. No retry.
     async fn get_object(
         &self,
         number: u64,
@@ -375,13 +340,9 @@ fn s3_error_code(body: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use stateless_test_utils::mock_r2::mock_r2;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use stateless_test_utils::mock_r2::{mock_r2, mock_r2_held};
 
     use super::*;
 
@@ -575,19 +536,8 @@ mod tests {
     /// a transport timeout and surfaces without any backoff sleep.
     #[tokio::test]
     async fn expired_deadline_surfaces_a_transport_error_fast() {
-        // A server that accepts but never replies within the floor timeout.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else { return };
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    let _ = sock.read(&mut buf).await;
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                });
-            }
-        });
+        // Holds every response far past the floor timeout.
+        let (endpoint, _, _) = mock_r2_held(404, Duration::from_secs(5)).await;
         let started = Instant::now();
         let deadline = Instant::now() - Duration::from_secs(1);
         let err = fetcher(&endpoint)
@@ -608,33 +558,9 @@ mod tests {
         const LIMIT: usize = 2;
         const FETCHES: u64 = 6;
 
-        // Per-connection tasks (unlike `mock_r2`, which serves serially) track the in-flight
-        // high-water mark; each response is held 50ms so fetches pile up behind the semaphore,
-        // then answered 404 (deterministic → exactly one GET per fetch).
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-        {
-            let (in_flight, peak) = (in_flight.clone(), peak.clone());
-            tokio::spawn(async move {
-                loop {
-                    let Ok((mut sock, _)) = listener.accept().await else { return };
-                    let (in_flight, peak) = (in_flight.clone(), peak.clone());
-                    tokio::spawn(async move {
-                        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                        peak.fetch_max(now, Ordering::SeqCst);
-                        let mut buf = [0u8; 4096];
-                        let _ = sock.read(&mut buf).await;
-                        tokio::time::sleep(Duration::from_millis(50)).await;
-                        let response =
-                            "HTTP/1.1 404 X\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
-                        let _ = sock.write_all(response.as_bytes()).await;
-                        in_flight.fetch_sub(1, Ordering::SeqCst);
-                    });
-                }
-            });
-        }
+        // Responses held 50ms so fetches pile up behind the semaphore, then answered 404
+        // (deterministic -> exactly one GET per fetch).
+        let (endpoint, _, peak) = mock_r2_held(404, Duration::from_millis(50)).await;
 
         let fetcher = fetcher_with(&endpoint, Some(LIMIT), test_pacing());
         let mut fetches = tokio::task::JoinSet::new();

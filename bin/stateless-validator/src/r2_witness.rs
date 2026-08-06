@@ -1,17 +1,21 @@
 //! Direct-from-R2 witness source.
 //!
-//! Fetches the primary witness object straight from the R2 bucket over the S3 API (a SigV4-signed
-//! `GET`), decompresses it, and returns the same `(SaltWitness, MptWitness)` tuple the RPC path
-//! yields.
+//! Fetches the primary witness object straight from the R2 bucket over the S3 API and returns
+//! the same `(SaltWitness, MptWitness)` tuple the RPC path yields. The transport core is
+//! [`R2ObjectFetcher`] from `stateless-r2`, shared with the debug-trace-server's historical
+//! witness source; this adapter owns what is validator-specific: the **full** payload decode
+//! (proof verification needs the elliptic-curve points the light decode skips), the validator
+//! metrics, and the surfaced-failure pacing the pipeline fetcher relies on. The object body is
+//! `zstd(bincode-legacy((SaltWitness, MptWitness)))`, which
+//! [`stateless_common::decode_witness_payload`] inverts exactly.
 //!
-//! The transport core — signed GET, response classification, retry/backoff, concurrency cap —
-//! is [`R2ObjectFetcher`] from `stateless-r2`, shared with the debug-trace-server's historical
-//! witness source so the readers cannot drift. This adapter owns what is validator-specific:
-//! the **full** payload decode (proof verification needs the elliptic-curve points light decode
-//! skips), the validator metrics, and the surfaced-failure pacing the pipeline fetcher relies
-//! on. The primary object body is `zstd(bincode-legacy((SaltWitness, MptWitness)))` (the
-//! uploader's `encode_witness_payload`), which [`stateless_common::decode_witness_payload`]
-//! inverts exactly.
+//! Operator note on missing objects: the pipeline retries a `Missing` witness indefinitely
+//! (each attempt throttled by [`DETERMINISTIC_FAILURE_THROTTLE`]). Near the tip that is
+//! exactly right — the object appears once the uploader wins the race. But on a fixed
+//! `--end-block` slice over history, a permanently absent object means the run never
+//! completes and never fails: alert on `r2_witness_errors_total{kind="missing"}` staying hot
+//! for the same block, and use the object key from the error's log line to check/backfill
+//! the bucket.
 
 use std::time::{Duration, Instant};
 
@@ -41,31 +45,10 @@ const DETERMINISTIC_FAILURE_THROTTLE: Duration =
 /// Failure outcome of an R2 witness fetch.
 #[derive(Debug, thiserror::Error)]
 pub enum R2WitnessError {
-    /// The primary object is absent from the bucket (HTTP 404 `NoSuchKey`): a transient miss
-    /// near the tip / right after a reorg (the uploader has not PUT the object yet), or a
-    /// permanent completeness gap in R2.
-    ///
-    /// Operator note: the pipeline retries a missing witness indefinitely (each attempt
-    /// throttled by [`DETERMINISTIC_FAILURE_THROTTLE`]). Near the tip that is exactly right —
-    /// the object appears once the uploader wins the race. But on a fixed `--end-block` slice
-    /// over history, a permanently absent object means the run never completes and never
-    /// fails: alert on `r2_witness_errors_total{kind="missing"}` staying hot for the same
-    /// block, and use the object key from this error's log line to check/backfill the bucket.
-    #[error("R2 witness MISSING for block {number} (key {key}): object not found (404)")]
-    Missing { number: u64, key: String },
-    /// Transport-level failure (connection reset/timeout) — the endpoint is effectively
-    /// unreachable. Retried internally with backoff before surfacing.
-    #[error("R2 transport failure for block {number} (key {key}): {source}")]
-    Transport { number: u64, key: String, source: reqwest::Error },
-    /// R2 asked us to slow down (429) or returned a server-side error (5xx, including R2's 503
-    /// overload / SlowDown). Retried internally with backoff before surfacing.
-    #[error("R2 throttled/server error {status} for block {number} (key {key}): {body}")]
-    Throttled { number: u64, key: String, status: u16, body: String },
-    /// A non-success status unlikely to clear on retry: a 4xx other than 429 (e.g. 403 bad
-    /// credentials, 404 NoSuchBucket) or a 3xx (redirects are never followed — see
-    /// [`R2ObjectFetcher::new`]).
-    #[error("R2 unexpected status {status} for block {number} (key {key}): {body}")]
-    Status { number: u64, key: String, status: u16, body: String },
+    /// The signed GET failed (absent object, transport, throttle, or unexpected status —
+    /// see [`R2GetError`], and the module docs for the `Missing` operator note).
+    #[error(transparent)]
+    Get(#[from] R2GetError),
     /// The object was fetched but its bytes did not decode to a `(SaltWitness, MptWitness)` tuple
     /// — a corrupt witness in R2. Deterministic; not retried.
     #[error("R2 witness for block {number} (key {key}) failed to decode: {source}")]
@@ -74,23 +57,6 @@ pub enum R2WitnessError {
     /// R2, so it is kept out of [`Self::Decode`].
     #[error("R2 witness decode task for block {number} (key {key}) panicked: {source}")]
     DecodePanicked { number: u64, key: String, source: JoinError },
-}
-
-impl From<R2GetError> for R2WitnessError {
-    fn from(e: R2GetError) -> Self {
-        match e {
-            R2GetError::Missing { number, key } => Self::Missing { number, key },
-            R2GetError::Transport { number, key, source } => {
-                Self::Transport { number, key, source }
-            }
-            R2GetError::Throttled { number, key, status, body } => {
-                Self::Throttled { number, key, status, body }
-            }
-            R2GetError::Status { number, key, status, body } => {
-                Self::Status { number, key, status, body }
-            }
-        }
-    }
 }
 
 impl R2WitnessError {
@@ -103,10 +69,7 @@ impl R2WitnessError {
     /// counter. Every value returned here must appear in [`Self::KINDS`].
     pub const fn kind(&self) -> &'static str {
         match self {
-            Self::Missing { .. } => "missing",
-            Self::Transport { .. } => "transport",
-            Self::Throttled { .. } => "throttled",
-            Self::Status { .. } => "status",
+            Self::Get(e) => e.kind(),
             Self::Decode { .. } => "decode",
             Self::DecodePanicked { .. } => "decode_panicked",
         }
@@ -115,7 +78,7 @@ impl R2WitnessError {
     /// Whether an immediate retry against the same endpoint could plausibly succeed (transport
     /// blips, 429, 5xx). Every other variant is deterministic and is surfaced without retrying.
     const fn is_retryable(&self) -> bool {
-        matches!(self, Self::Transport { .. } | Self::Throttled { .. })
+        matches!(self, Self::Get(e) if e.is_retryable())
     }
 }
 
@@ -234,7 +197,7 @@ impl R2WitnessClient {
 mod tests {
     use std::{str::FromStr, sync::atomic::Ordering};
 
-    use stateless_test_utils::mock_r2::mock_r2;
+    use stateless_test_utils::{fixtures::TestFixtures, mock_r2::mock_r2};
 
     use super::*;
 
@@ -258,10 +221,6 @@ mod tests {
         BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(20))
     }
 
-    fn client(endpoint: &str) -> R2WitnessClient {
-        client_with_backoff(endpoint, test_backoff())
-    }
-
     fn client_with_backoff(endpoint: &str, retry_backoff: BackoffPolicy) -> R2WitnessClient {
         R2WitnessClient::new(
             endpoint,
@@ -276,12 +235,12 @@ mod tests {
     }
 
     async fn fetch(endpoint: &str) -> Result<(SaltWitness, MptWitness), R2WitnessError> {
-        client(endpoint).get_witness(1, B256::ZERO).await
+        client_with_backoff(endpoint, test_backoff()).get_witness(1, B256::ZERO).await
     }
 
+    /// Construction errors from the shared fetcher must surface through the eyre conversion.
     #[test]
     fn rejects_endpoint_with_path() {
-        // A bucket-in-path URL is the classic misconfiguration; construction must fail fast.
         let err = R2WitnessClient::new(
             "https://acc.r2.cloudflarestorage.com/witness-mainnet",
             "witness-mainnet".to_string(),
@@ -295,24 +254,11 @@ mod tests {
         assert!(err.to_string().contains("Invalid R2 endpoint"));
     }
 
-    /// Every fetch-level classification must map onto the matching validator variant (and
-    /// therefore the matching metrics kind).
+    /// Every fetch-level kind must appear in this adapter's pre-registered [`KINDS`] — a new
+    /// `R2GetError` kind escaping metric pre-registration would drift silently otherwise.
     #[test]
-    fn fetch_errors_map_onto_matching_kinds() {
-        let cases: Vec<(R2GetError, &str)> = vec![
-            (R2GetError::Missing { number: 1, key: "k".into() }, "missing"),
-            (
-                R2GetError::Throttled { number: 1, key: "k".into(), status: 503, body: "".into() },
-                "throttled",
-            ),
-            (
-                R2GetError::Status { number: 1, key: "k".into(), status: 403, body: "".into() },
-                "status",
-            ),
-        ];
-        for (fetch_error, kind) in cases {
-            assert_eq!(R2WitnessError::from(fetch_error).kind(), kind);
-        }
+    fn kinds_cover_all_fetch_kinds() {
+        assert!(R2GetError::KINDS.iter().all(|k| R2WitnessError::KINDS.contains(k)));
     }
 
     /// The only test of the success path (fetch → `spawn_blocking` decode): a fixture witness
@@ -320,13 +266,8 @@ mod tests {
     /// tuple.
     #[tokio::test]
     async fn valid_object_decodes_end_to_end() {
-        use stateless_test_utils::fixtures::TestFixtures;
-
-        let fixtures = TestFixtures::mainnet_shared();
-        let (_, hash) =
-            fixtures.paired_blocks().into_iter().next().expect("mainnet fixtures have a witness");
-        let salt_witness = fixtures.salt_witnesses[&hash].clone();
-        let mpt_witness: MptWitness = fixtures.mpt_witness(&hash);
+        let (salt_witness, mpt_witness): (_, MptWitness) =
+            TestFixtures::mainnet_shared().first_paired_witness();
         let (_, payload) = stateless_common::encode_witness_payload(&salt_witness, &mpt_witness)
             .expect("fixture witness must encode");
 
@@ -374,7 +315,10 @@ mod tests {
         let client = client_with_backoff(&endpoint, BackoffPolicy::new(initial, max));
         let started = std::time::Instant::now();
         let err = client.get_witness(1, B256::ZERO).await.unwrap_err();
-        assert!(matches!(err, R2WitnessError::Throttled { status: 503, .. }), "{err}");
+        assert!(
+            matches!(err, R2WitnessError::Get(R2GetError::Throttled { status: 503, .. })),
+            "{err}"
+        );
         assert_eq!(hits.load(Ordering::SeqCst), DEFAULT_MAX_ATTEMPTS);
         assert!(
             started.elapsed() >= Duration::from_millis(255) + max,

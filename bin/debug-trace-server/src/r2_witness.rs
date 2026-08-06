@@ -26,10 +26,8 @@ use tracing::trace;
 
 use crate::metrics;
 
-/// Total GET attempts (first try + retries) per fetch for retryable (transport/429/5xx)
-/// failures. Deliberately smaller than the validator pipeline's budget: a request-serving
-/// fetch has the RPC witness chain waiting as fallback, so R2 gets a couple of chances and
-/// then hands over — the caller's deadline clamps the loop harder anyway.
+/// Total GET attempts per fetch: small because the RPC chain waits as fallback, and the
+/// caller's deadline clamps the loop harder anyway.
 const MAX_ATTEMPTS: usize = 3;
 
 /// Failure outcome of an R2 historical witness fetch.
@@ -76,11 +74,10 @@ pub struct R2WitnessSource {
 impl R2WitnessSource {
     /// Builds a source from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
     ///
-    /// `per_attempt_timeout` bounds each individual GET (further clamped per attempt by the
-    /// caller's deadline). `retry_backoff` paces the (at most [`MAX_ATTEMPTS`]) retries.
-    /// `max_concurrent_requests` caps in-flight GETs across all requests and readahead
-    /// (`None` = unlimited) — deliberately separate from the RPC witness semaphore: the RPC
-    /// cap sizes a shared public gateway, while R2 tolerates far higher parallelism.
+    /// `per_attempt_timeout` bounds each individual GET (further clamped by the caller's
+    /// deadline), `retry_backoff` paces the retries, and `max_concurrent_requests` caps
+    /// in-flight GETs across requests and readahead (`None` = unlimited; see the
+    /// `--r2-max-concurrent-requests` flag for why it is separate from the RPC cap).
     pub fn new(
         endpoint: &str,
         bucket: String,
@@ -104,9 +101,6 @@ impl R2WitnessSource {
     }
 
     /// Fetches and light-decodes the witness for `(number, hash)` under `deadline`.
-    ///
-    /// Surfaces every failure immediately — pacing after a failure is the RPC fallback's
-    /// job to spend, not this source's.
     pub async fn get_witness_light(
         &self,
         number: u64,
@@ -139,26 +133,31 @@ impl R2WitnessSource {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::atomic::Ordering;
-
-    use stateless_test_utils::mock_r2::mock_r2;
-
+pub(crate) mod test_support {
     use super::*;
 
-    fn source(endpoint: &str) -> R2WitnessSource {
+    /// Test source pointed at a mock endpoint, with millisecond retry pacing.
+    pub(crate) fn source(endpoint: &str) -> R2WitnessSource {
         R2WitnessSource::new(
             endpoint,
             "witness-test".to_string(),
             "ak".to_string(),
             "sk".to_string(),
             Duration::from_secs(5),
-            // Millisecond pacing so the retry tests run fast.
             BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(20)),
             None,
         )
         .unwrap()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use stateless_test_utils::{fixtures::TestFixtures, mock_r2::mock_r2};
+
+    use super::{test_support::source, *};
 
     fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(5)
@@ -168,13 +167,8 @@ mod tests {
     /// light-decode to the same kvs the RPC light path yields.
     #[tokio::test]
     async fn valid_object_light_decodes_end_to_end() {
-        use stateless_test_utils::fixtures::TestFixtures;
-
-        let fixtures = TestFixtures::mainnet_shared();
-        let (_, hash) =
-            fixtures.paired_blocks().into_iter().next().expect("mainnet fixtures have a witness");
-        let salt_witness = fixtures.salt_witnesses[&hash].clone();
-        let mpt_witness: MptWitness = fixtures.mpt_witness(&hash);
+        let (salt_witness, mpt_witness): (_, MptWitness) =
+            TestFixtures::mainnet_shared().first_paired_witness();
         let (_, payload) = stateless_common::encode_witness_payload(&salt_witness, &mpt_witness)
             .expect("fixture witness must encode");
         let (expected_light, _) =
@@ -214,6 +208,13 @@ mod tests {
         let err = source(&endpoint).get_witness_light(1, B256::ZERO, deadline()).await.unwrap_err();
         assert!(matches!(err, R2WitnessError::Get(R2GetError::Throttled { .. })), "{err}");
         assert_eq!(hits.load(Ordering::SeqCst), MAX_ATTEMPTS);
+    }
+
+    /// Every fetch-level kind must appear in this adapter's pre-registered [`KINDS`] — a new
+    /// `R2GetError` kind escaping metric pre-registration would drift silently otherwise.
+    #[test]
+    fn kinds_cover_all_fetch_kinds() {
+        assert!(R2GetError::KINDS.iter().all(|k| R2WitnessError::KINDS.contains(k)));
     }
 
     #[tokio::test]
