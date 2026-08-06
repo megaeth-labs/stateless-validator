@@ -149,10 +149,6 @@ Object storage tolerates far higher parallelism than a shared RPC gateway and th
 Frontier blocks keep the generator path (the bucket receives objects only after the uploader PUTs them), and the route needs a local DB (`--data-dir`) to anchor block age.
 `--r2-max-concurrent-requests` caps in-flight GETs separately from `--witness-max-concurrent-requests` — the RPC cap sizes a shared gateway, R2 tolerates far more.
 
-**Historical readahead:**
-`--historical-readahead <N>` (default 0 = off) makes every by-number request for a historical block also prefetch the next N blocks into the block-data cache in the background, so an in-order backfill crawl finds its next blocks warm (or coalesces onto the in-flight prefetch via single-flight).
-Prefetches run the same resolve + fetch pipeline as real requests (R2 first when configured), are bounded by an internal 16-task cap (excess candidates are dropped and re-tried by later requests), and count their outcomes in `debug_trace_readahead_total{outcome}`.
-
 **Witness routing and sync knobs** (each also settable via its `DEBUG_TRACE_SERVER_*` env var):
 - `--witness-local-window`: Block-age threshold for the historical witness route (default: 4096; should match the generator's `BACKUP`).
 - `--witness-old-block-timeout`: Witness-stage budget in seconds for blocks at or below the local tip (defaults to the full `--witness-timeout` budget, tracking it when raised; lower it to fail fast on pruned blocks).

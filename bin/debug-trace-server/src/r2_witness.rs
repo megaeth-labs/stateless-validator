@@ -76,8 +76,8 @@ impl R2WitnessSource {
     ///
     /// `per_attempt_timeout` bounds each individual GET (further clamped by the caller's
     /// deadline), `retry_backoff` paces the retries, and `max_concurrent_requests` caps
-    /// in-flight GETs across requests and readahead (`None` = unlimited; see the
-    /// `--r2-max-concurrent-requests` flag for why it is separate from the RPC cap).
+    /// in-flight GETs (`None` = unlimited; see the `--r2-max-concurrent-requests` flag
+    /// for why it is separate from the RPC cap).
     pub fn new(
         endpoint: &str,
         bucket: String,

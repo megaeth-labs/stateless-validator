@@ -253,10 +253,6 @@ impl RpcContext {
             })?;
         let resolve_hash_ms = t1.elapsed().as_millis();
 
-        // Fires on every by-number lookup — including response-cache hits below — so a crawl
-        // sweeping a warmed range keeps pushing the prefetch frontier ahead of its cursor.
-        self.data_provider.schedule_readahead(block_num);
-
         if let Some(cached) =
             check_cache(&self.response_cache, resource, block_hash, variant, method, start)
         {
