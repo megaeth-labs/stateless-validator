@@ -114,6 +114,17 @@ pub struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_R2_SECRET_ACCESS_KEY")]
     pub r2_secret_access_key: Option<RedactedSecret>,
 
+    /// R2 connection-establishment timeout (milliseconds). A healthy handshake to the local
+    /// anycast edge is tens of ms; hangs past this are the per-IP connection-budget
+    /// mitigation's signature and surface as retryable `connect`-kind errors.
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_R2_CONNECT_TIMEOUT_MS",
+        default_value_t = stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT.as_millis() as u64,
+        value_parser = clap::value_parser!(u64).range(100..),
+    )]
+    pub r2_connect_timeout_ms: u64,
+
     /// Optional inclusive end block: validate up to this height, then stop cleanly. Used to slice
     /// a fixed block range across multiple servers. Omit to follow the chain tip indefinitely.
     /// Note: the run only completes once the chain reaches `end_block + tip_buffer`.
@@ -285,7 +296,10 @@ pub async fn run() -> Result<()> {
                 bucket.to_string(),
                 access_key_id.to_string(),
                 secret_access_key.to_string(),
-                per_attempt_timeout,
+                stateless_r2::fetch::FetchTimeouts {
+                    per_attempt: per_attempt_timeout,
+                    connect: Duration::from_millis(args.r2_connect_timeout_ms),
+                },
                 rpc_config.rpc_retry.clone(),
                 args.witness_max_concurrent_requests,
             )?))

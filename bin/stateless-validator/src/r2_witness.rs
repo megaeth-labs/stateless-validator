@@ -26,7 +26,7 @@ use stateless_common::{
 };
 use stateless_core::withdrawals::MptWitness;
 use stateless_r2::{
-    fetch::{R2GetError, R2ObjectFetcher, RetryPacing},
+    fetch::{FetchTimeouts, R2GetError, R2ObjectFetcher, RetryPacing},
     keys,
 };
 use tokio::task::JoinError;
@@ -105,20 +105,21 @@ pub struct R2WitnessClient {
 impl R2WitnessClient {
     /// Builds a client from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
     ///
-    /// `per_attempt_timeout` bounds each individual GET. `retry_backoff` paces the retries of
-    /// retryable failures — first sleep `initial`, doubling up to `max`, each with up to 50%
-    /// jitter — and is the same policy the RPC path builds from `--rpc-initial-backoff-ms` /
-    /// `--rpc-max-backoff-ms`, so one pair of flags tunes both paths. `max_concurrent_requests`
-    /// caps the number of GETs in flight at once (`None` = unlimited, `Some(0)` clamps to 1 —
-    /// same semantics as the RPC witness semaphore; in R2 mode this client is the only
-    /// enforcement of `--witness-max-concurrent-requests`). Fails if the endpoint is not a bare
-    /// `scheme://host[:port]` origin or the HTTP client cannot be built.
+    /// `timeouts` bounds each individual GET (end-to-end and connect). `retry_backoff` paces the
+    /// retries of retryable failures — first sleep `initial`, doubling up to `max`, each with
+    /// up to 50% jitter — and is the same policy the RPC path builds from
+    /// `--rpc-initial-backoff-ms` / `--rpc-max-backoff-ms`, so one pair of flags tunes both
+    /// paths. `max_concurrent_requests` caps the number of GETs in flight at once (`None` =
+    /// unlimited, `Some(0)` clamps to 1 — same semantics as the RPC witness semaphore; in R2
+    /// mode this client is the only enforcement of `--witness-max-concurrent-requests`). Fails
+    /// if the endpoint is not a bare `scheme://host[:port]` origin or the HTTP client cannot be
+    /// built.
     pub fn new(
         endpoint: &str,
         bucket: String,
         access_key_id: String,
         secret_access_key: String,
-        per_attempt_timeout: Duration,
+        timeouts: FetchTimeouts,
         retry_backoff: BackoffPolicy,
         max_concurrent_requests: Option<usize>,
     ) -> eyre::Result<Self> {
@@ -127,7 +128,7 @@ impl R2WitnessClient {
             bucket,
             access_key_id,
             secret_access_key,
-            per_attempt_timeout,
+            timeouts,
             RetryPacing { initial: retry_backoff.initial, max: retry_backoff.max },
             max_concurrent_requests,
         )
@@ -225,13 +226,20 @@ mod tests {
         BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(20))
     }
 
+    fn test_timeouts() -> FetchTimeouts {
+        FetchTimeouts {
+            per_attempt: Duration::from_secs(5),
+            connect: stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT,
+        }
+    }
+
     fn client_with_backoff(endpoint: &str, retry_backoff: BackoffPolicy) -> R2WitnessClient {
         R2WitnessClient::new(
             endpoint,
             "witness-test".to_string(),
             "ak".to_string(),
             "sk".to_string(),
-            Duration::from_secs(5),
+            test_timeouts(),
             retry_backoff,
             None,
         )
@@ -250,7 +258,7 @@ mod tests {
             "witness-mainnet".to_string(),
             "ak".to_string(),
             "sk".to_string(),
-            Duration::from_secs(20),
+            test_timeouts(),
             test_backoff(),
             None,
         )

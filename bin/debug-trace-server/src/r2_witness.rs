@@ -18,7 +18,7 @@ use alloy_primitives::B256;
 use stateless_common::{BackoffPolicy, WitnessDecodingError, decode_witness_payload_light};
 use stateless_core::{LightWitness, withdrawals::MptWitness};
 use stateless_r2::{
-    fetch::{R2GetError, R2ObjectFetcher, RetryPacing},
+    fetch::{FetchTimeouts, R2GetError, R2ObjectFetcher, RetryPacing},
     keys,
 };
 use tokio::task::JoinError;
@@ -81,16 +81,16 @@ pub struct R2WitnessSource {
 impl R2WitnessSource {
     /// Builds a source from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
     ///
-    /// `per_attempt_timeout` bounds each individual GET (further clamped by the caller's
-    /// deadline), `retry_backoff` paces the retries, and `max_concurrent_requests` caps
-    /// in-flight GETs (`None` = unlimited; see the `--r2-max-concurrent-requests` flag
-    /// for why it is separate from the RPC cap).
+    /// `timeouts` bounds each individual GET end-to-end and in its connect phase (further
+    /// clamped by the caller's deadline), `retry_backoff` paces the retries, and
+    /// `max_concurrent_requests` caps in-flight GETs (`None` = unlimited; see the
+    /// `--r2-max-concurrent-requests` flag for why it is separate from the RPC cap).
     pub fn new(
         endpoint: &str,
         bucket: String,
         access_key_id: String,
         secret_access_key: String,
-        per_attempt_timeout: Duration,
+        timeouts: FetchTimeouts,
         retry_backoff: BackoffPolicy,
         max_concurrent_requests: Option<usize>,
     ) -> eyre::Result<Self> {
@@ -99,7 +99,7 @@ impl R2WitnessSource {
             bucket,
             access_key_id,
             secret_access_key,
-            per_attempt_timeout,
+            timeouts,
             RetryPacing { initial: retry_backoff.initial, max: retry_backoff.max },
             max_concurrent_requests,
         )
@@ -150,7 +150,10 @@ pub(crate) mod test_support {
             "witness-test".to_string(),
             "ak".to_string(),
             "sk".to_string(),
-            Duration::from_secs(5),
+            FetchTimeouts {
+                per_attempt: Duration::from_secs(5),
+                connect: stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT,
+            },
             BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(20)),
             None,
         )

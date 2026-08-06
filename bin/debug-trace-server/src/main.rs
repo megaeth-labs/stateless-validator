@@ -317,6 +317,18 @@ struct Args {
     #[clap(long, env = "DEBUG_TRACE_SERVER_R2_SECRET_ACCESS_KEY", requires = "r2_endpoint")]
     r2_secret_access_key: Option<RedactedSecret>,
 
+    /// R2 connection-establishment timeout (milliseconds). A healthy handshake to the local
+    /// anycast edge is tens of ms; hangs past this are the per-IP connection-budget
+    /// mitigation's signature and surface as retryable `connect`-kind errors, falling back
+    /// to the RPC chain fast.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_R2_CONNECT_TIMEOUT_MS",
+        default_value_t = stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT.as_millis() as u64,
+        value_parser = clap::value_parser!(u64).range(100..),
+    )]
+    r2_connect_timeout_ms: u64,
+
     /// Maximum concurrent in-flight R2 witness GETs. Omit for unlimited. Deliberately
     /// separate from
     /// `--witness-max-concurrent-requests`: that cap sizes the shared RPC gateway, while R2
@@ -551,7 +563,10 @@ async fn main() -> Result<()> {
                 bucket.clone(),
                 access_key_id.clone(),
                 secret.as_ref().to_string(),
-                per_attempt_timeout,
+                stateless_r2::fetch::FetchTimeouts {
+                    per_attempt: per_attempt_timeout,
+                    connect: std::time::Duration::from_millis(args.r2_connect_timeout_ms),
+                },
                 rpc_retry,
                 args.r2_max_concurrent_requests,
             )?;
@@ -1363,6 +1378,10 @@ mod tests {
         ];
 
         assert_eq!(parse_args(&full).r2_bucket.as_deref(), Some("witness-mainnet"));
+        assert_eq!(parse_args(&full).r2_connect_timeout_ms, 1000, "default connect timeout");
+        let with_timeout: Vec<&str> =
+            full.iter().copied().chain(["--r2-connect-timeout-ms", "2000"]).collect();
+        assert_eq!(parse_args(&with_timeout).r2_connect_timeout_ms, 2000);
         let _ = parse_args(&[]); // no R2 flags stays valid
 
         // Dropping any one flag=value pair of the quad breaks the group.

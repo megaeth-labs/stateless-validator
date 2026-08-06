@@ -31,13 +31,25 @@ use crate::{
 /// Cap on the response body carried inside `Throttled`/`Status` errors.
 const MAX_ERROR_BODY_BYTES: usize = 1024;
 
-/// Bound on connection establishment (DNS + TCP + TLS). A healthy handshake to the local
-/// anycast edge is ~10-50ms; Cloudflare's per-IP connection mitigation manifests as
+/// Default bound on connection establishment (DNS + TCP + TLS). A healthy handshake to the
+/// local anycast edge is ~10-50ms; Cloudflare's per-IP connection mitigation manifests as
 /// handshakes that hang without erroring, so anything past this is that signature (the one
 /// legitimate slow case — a lost SYN retried at the kernel's 1s RTO — is cheaper to abort
 /// and retry on a fresh attempt than to wait out). Keeps a mitigated endpoint from eating
-/// the caller's whole budget before its fallback gets a turn.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+/// the caller's whole budget before its fallback gets a turn. Operators tune it via the
+/// binaries' `--r2-connect-timeout-ms`.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// The two HTTP-level bounds a fetcher applies to every GET attempt, threaded together so
+/// constructor signatures stay flat.
+#[derive(Clone, Copy, Debug)]
+pub struct FetchTimeouts {
+    /// Hard cap on a single GET attempt end-to-end; with a deadline, each attempt uses
+    /// `min(per_attempt, remaining)`.
+    pub per_attempt: Duration,
+    /// Cap on connection establishment (see [`DEFAULT_CONNECT_TIMEOUT`]).
+    pub connect: Duration,
+}
 
 /// Failure outcome of a signed witness-object `GET`, after the fetcher's own retries.
 ///
@@ -59,7 +71,7 @@ pub enum R2GetError {
     /// credentials, 404 NoSuchBucket) or a 3xx (redirects are never followed — see
     /// [`R2ObjectFetcher::new`]). Bodies are best-effort and capped.
     Status { number: u64, key: String, status: u16, body: String },
-    /// Connection establishment failed or exceeded [`CONNECT_TIMEOUT`] — distinct from
+    /// Connection establishment failed or exceeded the connect timeout — distinct from
     /// [`Self::Transport`] because a hung handshake to the local anycast edge is the
     /// signature of the per-IP connection-budget mitigation, and operators alert on this
     /// kind to detect it.
@@ -186,7 +198,7 @@ pub struct R2ObjectFetcher {
     host: String,
     bucket: String,
     /// Hard cap on a single GET attempt; with a deadline, each attempt uses
-    /// `min(per_attempt_timeout, remaining)`.
+    /// `min(timeouts.per_attempt, remaining)`.
     per_attempt_timeout: Duration,
     pacing: RetryPacing,
     /// Caps concurrent GETs across all fetches sharing this fetcher.
@@ -202,17 +214,18 @@ impl R2ObjectFetcher {
 
     /// Builds a fetcher from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
     ///
-    /// `per_attempt_timeout` bounds each individual GET. `pacing` governs the retry sleeps of
-    /// retryable failures. `max_concurrent_requests` caps the number of GETs in flight at once
-    /// (`None` = unlimited, `Some(0)` clamps to 1). Fails if the endpoint is not a bare
-    /// `scheme://host[:port]` origin (see [`parse_endpoint`]) or the HTTP client cannot be
-    /// built; the error is a plain message so this crate needs no error-handling dependency.
+    /// `timeouts` bounds each individual GET (end-to-end and connect phase). `pacing`
+    /// governs the retry sleeps of retryable failures. `max_concurrent_requests` caps the
+    /// number of GETs in flight at once (`None` = unlimited, `Some(0)` clamps to 1). Fails
+    /// if the endpoint is not a bare `scheme://host[:port]` origin (see [`parse_endpoint`])
+    /// or the HTTP client cannot be built; the error is a plain message so this crate needs
+    /// no error-handling dependency.
     pub fn new(
         endpoint: &str,
         bucket: String,
         access_key_id: String,
         secret_access_key: String,
-        per_attempt_timeout: Duration,
+        timeouts: FetchTimeouts,
         pacing: RetryPacing,
         max_concurrent_requests: Option<usize>,
     ) -> Result<Self, String> {
@@ -225,8 +238,8 @@ impl R2ObjectFetcher {
                 .to_string());
         }
         let http = Client::builder()
-            .timeout(per_attempt_timeout)
-            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(timeouts.per_attempt)
+            .connect_timeout(timeouts.connect)
             // A SigV4-signed GET can never survive a redirect (reqwest strips `authorization` on
             // cross-host hops, and a same-host hop invalidates the signed URI), so following one
             // just turns the real cause into a baffling 403. Surface the 3xx as a `Status` error.
@@ -239,7 +252,7 @@ impl R2ObjectFetcher {
             endpoint: origin,
             host,
             bucket,
-            per_attempt_timeout,
+            per_attempt_timeout: timeouts.per_attempt,
             pacing,
             concurrency: Arc::new(Semaphore::new(
                 max_concurrent_requests.unwrap_or(Semaphore::MAX_PERMITS).max(1),
@@ -417,13 +430,17 @@ mod tests {
         fetcher_with(endpoint, None, test_pacing())
     }
 
+    fn test_timeouts() -> FetchTimeouts {
+        FetchTimeouts { per_attempt: Duration::from_secs(5), connect: DEFAULT_CONNECT_TIMEOUT }
+    }
+
     fn fetcher_with(endpoint: &str, limit: Option<usize>, pacing: RetryPacing) -> R2ObjectFetcher {
         R2ObjectFetcher::new(
             endpoint,
             "witness-test".to_string(),
             "ak".to_string(),
             "sk".to_string(),
-            Duration::from_secs(5),
+            test_timeouts(),
             pacing,
             limit,
         )
@@ -442,7 +459,7 @@ mod tests {
             "witness-mainnet".to_string(),
             "ak".to_string(),
             "sk".to_string(),
-            Duration::from_secs(20),
+            test_timeouts(),
             test_pacing(),
             None,
         )
@@ -624,8 +641,8 @@ mod tests {
         assert!(matches!(err, R2GetError::Connect { .. }), "{err}");
         assert_eq!(err.kind(), "connect");
         assert!(
-            started.elapsed() < CONNECT_TIMEOUT + Duration::from_millis(500),
-            "connect failure must be bounded by CONNECT_TIMEOUT ({:?})",
+            started.elapsed() < DEFAULT_CONNECT_TIMEOUT + Duration::from_millis(500),
+            "connect failure must be bounded by the connect timeout ({:?})",
             started.elapsed(),
         );
     }
