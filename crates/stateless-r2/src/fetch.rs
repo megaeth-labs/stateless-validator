@@ -31,6 +31,14 @@ use crate::{
 /// Cap on the response body carried inside `Throttled`/`Status` errors.
 const MAX_ERROR_BODY_BYTES: usize = 1024;
 
+/// Bound on connection establishment (DNS + TCP + TLS). A healthy handshake to the local
+/// anycast edge is ~10-50ms; Cloudflare's per-IP connection mitigation manifests as
+/// handshakes that hang without erroring, so anything past this is that signature (the one
+/// legitimate slow case — a lost SYN retried at the kernel's 1s RTO — is cheaper to abort
+/// and retry on a fresh attempt than to wait out). Keeps a mitigated endpoint from eating
+/// the caller's whole budget before its fallback gets a turn.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Failure outcome of a signed witness-object `GET`, after the fetcher's own retries.
 ///
 /// Decode failures are deliberately absent: the fetcher stops at bytes, and each reader
@@ -51,6 +59,11 @@ pub enum R2GetError {
     /// credentials, 404 NoSuchBucket) or a 3xx (redirects are never followed — see
     /// [`R2ObjectFetcher::new`]). Bodies are best-effort and capped.
     Status { number: u64, key: String, status: u16, body: String },
+    /// Connection establishment failed or exceeded [`CONNECT_TIMEOUT`] — distinct from
+    /// [`Self::Transport`] because a hung handshake to the local anycast edge is the
+    /// signature of the per-IP connection-budget mitigation, and operators alert on this
+    /// kind to detect it.
+    Connect { number: u64, key: String, source: reqwest::Error },
     /// The caller's deadline expired while the fetch was still queued for a concurrency
     /// permit — under saturation the queue wait must not eat the budget the caller reserved
     /// for its fallback. Only produced when a deadline is passed.
@@ -60,7 +73,7 @@ pub enum R2GetError {
 impl R2GetError {
     /// Every label [`Self::kind`] can produce, for callers pre-registering per-kind metrics.
     pub const KINDS: &'static [&'static str] =
-        &["missing", "transport", "throttled", "status", "deadline"];
+        &["missing", "transport", "throttled", "status", "connect", "deadline"];
 
     /// Stable lowercase label for this variant, for callers' per-kind error metrics. Every
     /// value returned here appears in [`Self::KINDS`].
@@ -70,6 +83,7 @@ impl R2GetError {
             Self::Transport { .. } => "transport",
             Self::Throttled { .. } => "throttled",
             Self::Status { .. } => "status",
+            Self::Connect { .. } => "connect",
             Self::Deadline { .. } => "deadline",
         }
     }
@@ -78,7 +92,7 @@ impl R2GetError {
     /// (transport blips, 429, 5xx). The other variants are deterministic and are surfaced
     /// without retrying.
     pub const fn is_retryable(&self) -> bool {
-        matches!(self, Self::Transport { .. } | Self::Throttled { .. })
+        matches!(self, Self::Transport { .. } | Self::Throttled { .. } | Self::Connect { .. })
     }
 }
 
@@ -103,6 +117,13 @@ impl Display for R2GetError {
             Self::Status { number, key, status, body } => {
                 write!(f, "R2 unexpected status {status} for block {number} (key {key}): {body}")
             }
+            Self::Connect { number, key, source } => {
+                write!(
+                    f,
+                    "R2 connect/TLS handshake failed or timed out for block {number} \
+                     (key {key}): {source}"
+                )
+            }
             Self::Deadline { number, key } => {
                 write!(
                     f,
@@ -117,7 +138,7 @@ impl Display for R2GetError {
 impl std::error::Error for R2GetError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Transport { source, .. } => Some(source),
+            Self::Transport { source, .. } | Self::Connect { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -205,6 +226,7 @@ impl R2ObjectFetcher {
         }
         let http = Client::builder()
             .timeout(per_attempt_timeout)
+            .connect_timeout(CONNECT_TIMEOUT)
             // A SigV4-signed GET can never survive a redirect (reqwest strips `authorization` on
             // cross-host hops, and a same-host hop invalidates the signed URI), so following one
             // just turns the real cause into a baffling 403. Surface the 3xx as a `Status` error.
@@ -322,7 +344,14 @@ impl R2ObjectFetcher {
         for (name, value) in signed {
             request = request.header(name, value);
         }
-        let transport = |source| R2GetError::Transport { number, key: key.to_string(), source };
+        let transport = |source: reqwest::Error| {
+            let key = key.to_string();
+            if source.is_connect() {
+                R2GetError::Connect { number, key, source }
+            } else {
+                R2GetError::Transport { number, key, source }
+            }
+        };
         let response = request.send().await.map_err(transport)?;
 
         let status = response.status();
@@ -579,6 +608,24 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "expired deadline must fail fast ({:?})",
+            started.elapsed(),
+        );
+    }
+
+    /// Connection-establishment failures surface as `Connect` (the mitigation-detection
+    /// kind) and are bounded by [`CONNECT_TIMEOUT`] rather than the full attempt timeout.
+    /// 192.0.2.1 (TEST-NET-1) is unroutable: the connect either errors immediately or
+    /// blackholes until the connect timeout — both must classify as `Connect`, fast.
+    #[tokio::test]
+    async fn unreachable_endpoint_surfaces_connect_kind_fast() {
+        let fetcher = fetcher_with("http://192.0.2.1:81", None, test_pacing());
+        let started = Instant::now();
+        let err = fetcher.get_block_object(1, "0xhash", 1, None, || ()).await.unwrap_err();
+        assert!(matches!(err, R2GetError::Connect { .. }), "{err}");
+        assert_eq!(err.kind(), "connect");
+        assert!(
+            started.elapsed() < CONNECT_TIMEOUT + Duration::from_millis(500),
+            "connect failure must be bounded by CONNECT_TIMEOUT ({:?})",
             started.elapsed(),
         );
     }
