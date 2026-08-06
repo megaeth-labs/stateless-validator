@@ -1385,7 +1385,10 @@ mod tests {
     use std::{net::TcpListener, sync::atomic::Ordering};
 
     use stateless_common::{BackoffPolicy, RpcClientConfig};
-    use stateless_test_utils::{fixtures::TestFixtures, mock_r2::mock_r2};
+    use stateless_test_utils::{
+        fixtures::TestFixtures,
+        mock_r2::{mock_r2, mock_r2_held},
+    };
 
     use super::{
         test_support::{consistent_header, scripted_witness_rpc, start_mock_rpc},
@@ -1866,6 +1869,55 @@ mod tests {
         assert_eq!(r2_hits.load(Ordering::SeqCst), 1, "the R2 miss must not be retried");
         assert_eq!(hits_a.load(Ordering::Relaxed), 0, "the fallback still skips the generator");
         assert!(hits_b.load(Ordering::Relaxed) >= 1, "the RPC chain must take over after R2");
+
+        ha.stop().unwrap();
+        hb.stop().unwrap();
+    }
+
+    /// The R2 attempt gets only its [`R2_WITNESS_BUDGET_DIVISOR`] share of the remaining
+    /// budget: with R2 hung (the server accepts and never answers), the RPC fallback still
+    /// serves the witness inside the caller's original deadline. Goes red if the divisor
+    /// is removed or set to 1 — a hung R2 would then hold the entire deadline and leave
+    /// the fallback nothing.
+    #[tokio::test]
+    async fn fetch_witness_hung_r2_leaves_budget_for_the_rpc_fallback() {
+        let (r2_endpoint, _r2_peak) = mock_r2_held(200, Duration::from_secs(30)).await;
+        let (salt_witness, mpt_witness): (_, MptWitness) =
+            TestFixtures::mainnet_shared().first_paired_witness();
+        let wire = stateless_common::encode_witness_response(&salt_witness, &mpt_witness)
+            .expect("fixture witness must encode");
+        let (ha, url_a, hits_a) = scripted_witness_rpc(0, None).await;
+        let (hb, url_b, hits_b) = scripted_witness_rpc(0, Some(wire)).await;
+        let (rpc_client, cfg) = routing_fixture(&[url_a.as_str(), url_b.as_str()], true);
+        let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
+
+        let budget = Duration::from_secs(2);
+        let started = Instant::now();
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            Some(&r2),
+            Some(5000),
+            900,
+            B256::ZERO,
+            started + budget,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "the RPC fallback must deliver inside the original deadline: {:?}",
+            result.err(),
+        );
+        assert!(elapsed < budget, "fetch must finish inside the deadline ({elapsed:?})");
+        // The hung R2 attempt must have been held to (roughly) its share, no longer.
+        assert!(
+            elapsed >= budget / R2_WITNESS_BUDGET_DIVISOR - Duration::from_millis(100),
+            "R2 gave up before its budget share was spent ({elapsed:?})"
+        );
+        assert_eq!(hits_a.load(Ordering::Relaxed), 0, "the fallback still skips the generator");
+        assert!(hits_b.load(Ordering::Relaxed) >= 1, "the RPC chain must serve the witness");
 
         ha.stop().unwrap();
         hb.stop().unwrap();

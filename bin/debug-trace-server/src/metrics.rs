@@ -403,6 +403,18 @@ pub fn record_r2_witness_error(kind: &'static str) {
     counter!(R2_WITNESS_ERRORS_TOTAL, "kind" => kind).increment(1);
 }
 
+/// Time an R2 witness GET spent queued on the self-imposed concurrency cap
+/// (`--r2-max-concurrent-requests`) before its first attempt. Deliberately separate from
+/// the `witness_r2` duration histogram: on the request path the caller really did wait
+/// through this queue, so that histogram reports honest end-to-end time — and this one
+/// makes cap-induced queueing distinguishable from actual R2 slowness.
+const R2_WITNESS_QUEUE_WAIT_SECONDS: &str = "debug_trace_r2_witness_queue_wait_seconds";
+
+/// Records the queued share of one R2 witness fetch.
+pub fn record_r2_witness_queue_wait(seconds: f64) {
+    histogram!(R2_WITNESS_QUEUE_WAIT_SECONDS).record(seconds);
+}
+
 /// Canonical number → hash resolution counter, labeled `(source, outcome)` — how often
 /// by-number requests resolve their canonical hash from the local DB index vs upstream,
 /// and how often resolution misses or fails.
@@ -594,6 +606,7 @@ fn pre_register_all_metrics() {
     for kind in crate::r2_witness::R2WitnessError::KINDS {
         counter!(R2_WITNESS_ERRORS_TOTAL, "kind" => *kind).increment(0);
     }
+    let _ = histogram!(R2_WITNESS_QUEUE_WAIT_SECONDS);
 
     // Data Fetch Layer: single-flight
     let _ = SingleFlightMetrics::new_for_type("new");

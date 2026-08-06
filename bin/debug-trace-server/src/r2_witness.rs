@@ -124,6 +124,11 @@ impl R2WitnessSource {
                 metrics::record_r2_witness_retry,
             )
             .await?;
+        // The caller's end-to-end duration metric deliberately keeps this queue wait in —
+        // on the request path the user really did wait through it — so the queued share is
+        // reported on its own series instead of being subtracted the way the validator's
+        // throughput pipeline does.
+        metrics::record_r2_witness_queue_wait(fetched.queue_wait.as_secs_f64());
         let bytes = fetched.bytes;
 
         // zstd + bincode over a multi-MB witness is CPU-bound; keep it off the runtime.

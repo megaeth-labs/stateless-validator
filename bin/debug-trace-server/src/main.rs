@@ -443,6 +443,33 @@ fn validate_args(args: &Args) -> Result<()> {
              --witness-endpoint: list the generator once, via the dedicated flag"
         );
     }
+    // Clap's `requires` wiring makes the `--r2-*` flags all-or-nothing, but it checks
+    // presence, not content: an env var injected as the empty string (a secret that failed
+    // to materialize is the common shape) would otherwise build a live source whose every
+    // GET reports `kind="missing"` — the exact counter operators watch for
+    // bucket-completeness gaps. Reject emptiness before a bad deploy can read as data loss.
+    let r2_values = [
+        ("--r2-endpoint", args.r2_endpoint.as_deref()),
+        ("--r2-bucket", args.r2_bucket.as_deref()),
+        ("--r2-access-key-id", args.r2_access_key_id.as_deref()),
+        ("--r2-secret-access-key", args.r2_secret_access_key.as_ref().map(|s| s.as_ref())),
+    ];
+    for (flag, value) in r2_values {
+        if value.is_some_and(str::is_empty) {
+            eyre::bail!(
+                "{flag} is set but empty (empty env var injection?): unset it or give it a value"
+            );
+        }
+    }
+    // The R2 historical route anchors block age to the local DB tip, so without --data-dir
+    // it can never fire. An operator who configured R2 asked for that route explicitly —
+    // fail closed instead of silently running the RPC-only setup R2 exists to replace.
+    if args.r2_endpoint.is_some() && args.data_dir.is_none() {
+        eyre::bail!(
+            "--r2-endpoint requires --data-dir: the R2 historical witness route anchors \
+             block age to the local DB tip and can never fire in stateless mode"
+        );
+    }
     Ok(())
 }
 
@@ -540,7 +567,8 @@ async fn main() -> Result<()> {
     }
 
     // Direct-from-R2 historical witness source. Clap's `requires` wiring makes the four
-    // `--r2-*` flags all-or-nothing, so matching on the quad only splits "configured" from
+    // `--r2-*` flags all-or-nothing and `validate_args` rejects empty values and the
+    // data-dir-less combination, so matching on the quad only splits "configured" from
     // "absent". Shares the RPC path's per-attempt timeout and retry pacing.
     let r2_witness_source = match (
         &args.r2_endpoint,
@@ -548,16 +576,6 @@ async fn main() -> Result<()> {
         &args.r2_access_key_id,
         &args.r2_secret_access_key,
     ) {
-        // Without a local DB there is no tip to anchor block age, so the historical route
-        // can never fire — skip building the client instead of holding a dead one.
-        (Some(_), ..) if args.data_dir.is_none() => {
-            warn!(
-                "--r2-endpoint without --data-dir: block age cannot be anchored to a \
-                 local tip, so the R2 historical route is inactive and all witnesses \
-                 use the RPC chain"
-            );
-            None
-        }
         (Some(endpoint), Some(bucket), Some(access_key_id), Some(secret)) => {
             let source = R2WitnessSource::new(
                 endpoint,
@@ -1413,6 +1431,45 @@ mod tests {
                 "missing {} must fail parsing",
                 full[skip * 2],
             );
+        }
+    }
+
+    /// R2 misconfigurations fail startup validation: an empty value on any `--r2-*` flag
+    /// (the shape of a failed env injection, which clap's presence-only `requires` cannot
+    /// see) and the data-dir-less combination whose historical route can never fire.
+    #[test]
+    fn validate_args_rejects_r2_misconfigurations() {
+        let _guard = stateless_test_utils::env::env_lock();
+        let quad = [
+            ("--r2-endpoint", "https://acc.r2.cloudflarestorage.com"),
+            ("--r2-bucket", "witness-mainnet"),
+            ("--r2-access-key-id", "ak"),
+            ("--r2-secret-access-key", "sk"),
+        ];
+        let build = |empty: Option<&str>, data_dir: bool| {
+            let mut v = vec![
+                "debug-trace-server",
+                "--rpc-endpoint",
+                "http://r",
+                "--witness-endpoint",
+                "http://w",
+            ];
+            for (flag, value) in quad {
+                v.push(flag);
+                v.push(if empty == Some(flag) { "" } else { value });
+            }
+            if data_dir {
+                v.extend(["--data-dir", "/tmp/dts-test"]);
+            }
+            Args::try_parse_from(v).unwrap()
+        };
+
+        assert!(validate_args(&build(None, true)).is_ok());
+        // Explicitly configured R2 without a local DB is inert — fail closed, not warn.
+        assert!(validate_args(&build(None, false)).is_err());
+        // Any single empty value must fail instead of building a live source over it.
+        for (flag, _) in quad {
+            assert!(validate_args(&build(Some(flag), true)).is_err(), "{flag} empty must fail");
         }
     }
 }
