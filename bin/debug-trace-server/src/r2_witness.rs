@@ -12,7 +12,7 @@
 //! re-enqueue), and the retry budget is small — a throttled R2 should hand over to the RPC
 //! chain quickly instead of burning the witness budget on backoff sleeps.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use alloy_primitives::B256;
 use stateless_common::{BackoffPolicy, WitnessDecodingError, decode_witness_payload_light};
@@ -141,6 +141,8 @@ impl R2WitnessSource {
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::time::Duration;
+
     use super::*;
 
     /// Test source pointed at a mock endpoint, with millisecond retry pacing.
@@ -163,7 +165,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
+    use std::{sync::atomic::Ordering, time::Duration};
 
     use stateless_test_utils::{fixtures::TestFixtures, mock_r2::mock_r2};
 
