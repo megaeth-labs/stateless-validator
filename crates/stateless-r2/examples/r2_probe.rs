@@ -6,13 +6,10 @@
 //! at deploy time, and for measuring a host's realistic per-GET latency and safe
 //! concurrency before setting `--r2-max-concurrent-requests`.
 //!
-//! Finding this probe documents (2026-08): **R2's bare S3 endpoint negotiates HTTP/1.1
-//! only** — the client offers h2 via ALPN, the server picks `http/1.1` — so on that
-//! endpoint every in-flight GET holds its own connection and the fetcher's concurrency cap
-//! must respect the egress IP's connection budget. R2 **custom domains** ride the regular
-//! CDN stack and do negotiate h2: set `R2_PROBE_CUSTOM_DOMAIN=https://<domain>` to probe
-//! one instead (unsigned GETs of `/{key}`, the custom-domain layout — expect the ALPN line
-//! to say HTTP/2 and high concurrency to hold few connections).
+//! Finding this probe documents (2026-08): **R2's S3 endpoint negotiates HTTP/1.1 only** —
+//! the client offers h2 via ALPN, the server picks `http/1.1` (the CDN-fronted gateway by
+//! contrast picks h2). Every in-flight GET therefore holds its own connection, which is why
+//! the fetcher's concurrency cap must respect the egress IP's connection budget.
 //!
 //! Block hashes are resolved through the gateway so the probe needs no local node.
 //!
@@ -33,10 +30,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use stateless_r2::{
-    fetch::{R2ObjectFetcher, RetryPacing},
-    keys,
-};
+use stateless_r2::fetch::{R2ObjectFetcher, RetryPacing};
 
 fn envv(name: &str) -> Result<String, String> {
     env::var(name).map_err(|_| format!("missing env {name}"))
@@ -125,63 +119,6 @@ async fn run_level(
     (wall, lat, fails, bytes)
 }
 
-/// Unsigned custom-domain GETs (`{domain}/{key}`) at the given concurrency.
-async fn run_level_custom(
-    client: &reqwest::Client,
-    domain: &str,
-    concurrency: usize,
-    blocks: &[(u64, String)],
-) -> (f64, Vec<f64>, usize, u64) {
-    let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
-    let lat = Arc::new(Mutex::new(Vec::new()));
-    let mut fails = 0usize;
-    let mut bytes = 0u64;
-    let t0 = Instant::now();
-    let mut tasks = tokio::task::JoinSet::new();
-    for (number, hash) in blocks.iter().cloned() {
-        let (client, lat, sem) = (client.clone(), Arc::clone(&lat), Arc::clone(&sem));
-        let url = format!("{domain}/{}", keys::block_object_key(number, &hash));
-        tasks.spawn(async move {
-            let _p = sem.acquire_owned().await.unwrap();
-            let t = Instant::now();
-            match client.get(&url).send().await {
-                Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                    Ok(b) => {
-                        lat.lock().unwrap().push(t.elapsed().as_secs_f64() * 1000.0);
-                        Ok(b.len() as u64)
-                    }
-                    Err(_) => Err(()),
-                },
-                _ => Err(()),
-            }
-        });
-    }
-    while let Some(res) = tasks.join_next().await {
-        match res.unwrap() {
-            Ok(b) => bytes += b,
-            Err(()) => fails += 1,
-        }
-    }
-    let wall = t0.elapsed().as_secs_f64();
-    let mut lat = Arc::try_unwrap(lat).unwrap().into_inner().unwrap();
-    lat.sort_by(f64::total_cmp);
-    (wall, lat, fails, bytes)
-}
-
-fn report(tag: &str, conc: usize, wall: f64, lat: &[f64], fails: usize, bytes: u64, n: usize) {
-    println!(
-        "[{tag} conc={conc:3}] wall={:6.0}ms  ok={:3} fail={fails:3}  {:5.1} wit/s           {:6.2}MB  p50/p90/p99/max={:.0}/{:.0}/{:.0}/{:.0}ms",
-        wall * 1000.0,
-        n - fails,
-        (n - fails) as f64 / wall,
-        bytes as f64 / 1e6,
-        pct(lat, 0.5),
-        pct(lat, 0.9),
-        pct(lat, 0.99),
-        lat.last().copied().unwrap_or(f64::NAN),
-    );
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = env::args().collect();
@@ -201,13 +138,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let sk = envv("DEBUG_TRACE_SERVER_R2_SECRET_ACCESS_KEY")?;
     let gateway = envv("DEBUG_TRACE_SERVER_WITNESS_ENDPOINT")?;
 
-    let custom_domain = env::var("R2_PROBE_CUSTOM_DOMAIN").ok();
-
     // An unauthenticated GET is enough to learn the ALPN outcome — the error response
     // still carries the negotiated version.
     let probe_client = reqwest::Client::builder().build()?;
-    let alpn_target = custom_domain.as_deref().unwrap_or(&endpoint);
-    match probe_client.get(alpn_target).send().await {
+    match probe_client.get(&endpoint).send().await {
         Ok(resp) => println!("[alpn] negotiated {:?}, status {}", resp.version(), resp.status()),
         Err(e) => println!("[alpn] probe request failed: {e}"),
     }
@@ -215,17 +149,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("[prep] resolving {count} hashes from block {start} via gateway ...");
     let blocks = resolve_hashes(&gateway, start, count).await?;
     println!("[prep] resolved {}", blocks.len());
-
-    if let Some(domain) = custom_domain {
-        let domain = domain.trim_end_matches('/').to_string();
-        let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
-        for &conc in &ladder {
-            let (wall, lat, fails, bytes) = run_level_custom(&client, &domain, conc, &blocks).await;
-            report("custom", conc, wall, &lat, fails, bytes, blocks.len());
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-        return Ok(());
-    }
 
     for &conc in &ladder {
         let fetcher = R2ObjectFetcher::new(
@@ -239,7 +162,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .map_err(|e| -> Box<dyn Error> { e.into() })?;
         let (wall, lat, fails, bytes) = run_level(&fetcher, &blocks).await;
-        report("s3", conc, wall, &lat, fails, bytes, blocks.len());
+        println!(
+            "[conc={conc:3}] wall={:6.0}ms  ok={:3} fail={fails:3}  {:5.1} wit/s  {:6.2}MB  \
+             p50/p90/p99/max={:.0}/{:.0}/{:.0}/{:.0}ms",
+            wall * 1000.0,
+            blocks.len() - fails,
+            (blocks.len() - fails) as f64 / wall,
+            bytes as f64 / 1e6,
+            pct(&lat, 0.5),
+            pct(&lat, 0.9),
+            pct(&lat, 0.99),
+            lat.last().copied().unwrap_or(f64::NAN),
+        );
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     Ok(())
