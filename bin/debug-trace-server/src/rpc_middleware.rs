@@ -9,15 +9,16 @@
 //! service's `call` one by one — every per-request mechanism (single-flight, caches,
 //! semaphores, metrics) applies unchanged — but up to `concurrency` of them run at
 //! once, and the batch completes near its slowest item. The bound exists so a single
-//! oversized batch cannot monopolize downstream permits (witness fetches, the blocking
-//! EVM pool) against concurrently served requests; `1` restores strictly sequential
-//! execution.
+//! oversized batch cannot monopolize what its entries actually contend on — the
+//! witness-fetch semaphores and the runtime's worker threads (traces execute inline on
+//! the async runtime) — against concurrently served requests; `1` restores strictly
+//! sequential execution.
 
 use futures::stream::{self, StreamExt};
 use jsonrpsee::{
     core::server::BatchResponseBuilder,
     server::middleware::rpc::{
-        Batch, BatchEntry, MethodResponse, Notification, Request, RpcServiceT,
+        Batch, BatchEntry, BatchEntryErr, MethodResponse, Notification, Request, RpcServiceT,
     },
 };
 use tower::Layer;
@@ -36,15 +37,12 @@ pub(crate) struct ConcurrentBatchLayer {
 }
 
 impl ConcurrentBatchLayer {
-    /// `concurrency` is clamped to at least 1; `max_response_body_size` must match the
-    /// server's configured limit so batch responses are capped identically to
-    /// jsonrpsee's own batch path.
+    /// `concurrency` must be at least 1 (the CLI parser enforces it);
+    /// `max_response_body_size` must match the server's configured limit so batch
+    /// responses are capped identically to jsonrpsee's own batch path.
     pub(crate) fn new(concurrency: usize, max_response_body_size: usize) -> Self {
-        Self {
-            concurrency: concurrency.max(1),
-            max_response_body_size,
-            metrics: BatchMetrics::create(),
-        }
+        debug_assert!(concurrency >= 1, "a zero bound would stall every batch stream");
+        Self { concurrency, max_response_body_size, metrics: BatchMetrics::create() }
     }
 }
 
@@ -57,6 +55,33 @@ impl<S> Layer<S> for ConcurrentBatchLayer {
             concurrency: self.concurrency,
             max_response_body_size: self.max_response_body_size,
             metrics: self.metrics.clone(),
+        }
+    }
+}
+
+/// Executes one batch entry: parse-failed entries answer directly, calls and
+/// notifications go through the inner service. `None` marks a notification (which gets
+/// no response entry). A named `async fn` rather than a closure-held `async` block —
+/// the closure form trips rustc's higher-ranked lifetime inference inside
+/// `buffer_unordered`.
+async fn run_entry<'a, S>(
+    service: &S,
+    entry: Result<BatchEntry<'a>, BatchEntryErr<'a>>,
+) -> Option<MethodResponse>
+where
+    S: RpcServiceT<MethodResponse = MethodResponse, NotificationResponse = MethodResponse>
+        + Send
+        + Sync,
+{
+    match entry {
+        Ok(BatchEntry::Call(req)) => Some(service.call(req).await),
+        Ok(BatchEntry::Notification(n)) => {
+            service.notification(n).await;
+            None
+        }
+        Err(err) => {
+            let (err, id) = err.into_parts();
+            Some(MethodResponse::error(id, err))
         }
     }
 }
@@ -107,41 +132,21 @@ where
         async move {
             let mut got_notification = false;
 
-            // Entries that already failed parsing answer without touching the service;
-            // everything else becomes one future, executed at most `concurrency` at a
-            // time. Responses are appended in completion order — valid per spec, and
-            // what keeps a slow entry from holding back an open concurrency slot.
-            let mut work = Vec::with_capacity(batch.len());
-            for entry in batch.into_iter() {
-                match entry {
-                    Ok(entry) => work.push(entry),
-                    Err(err) => {
-                        let (err, id) = err.into_parts();
-                        if let Err(err) = batch_rp.append(MethodResponse::error(id, err)) {
-                            return err;
-                        }
-                    }
-                }
-            }
-
-            // Futures are built eagerly (they stay inert until polled) so the stream
-            // is over concrete futures; `buffer_unordered` polls at most `concurrency`
-            // of them at a time.
-            let futs: Vec<_> = work
-                .into_iter()
-                .map(|entry| {
-                    let service = service.clone();
-                    async move {
-                        match entry {
-                            BatchEntry::Call(req) => Some(service.call(req).await),
-                            BatchEntry::Notification(n) => {
-                                service.notification(n).await;
-                                None
-                            }
-                        }
-                    }
-                })
-                .collect();
+            // One lazy pass: every entry becomes one future — parse-failed entries as
+            // ready error responses, calls and notifications through the (borrowed)
+            // inner service. `buffer_unordered` pulls futures from the iterator only as
+            // slots free up, so it both bounds the parallelism and keeps at most
+            // `concurrency` futures alive — an oversized batch cannot balloon memory
+            // ahead of execution. Responses append in completion order — valid per spec
+            // (matched by `id`), and what keeps a slow entry from holding back an open
+            // concurrency slot.
+            let service = &service;
+            // `from_fn` instead of `Iterator::map`: a closure taking the
+            // lifetime-carrying entries as input trips rustc's higher-ranked lifetime
+            // inference once it appears in the stream's type; this closure takes no
+            // input, so the stream stays lazy without the false obligation.
+            let mut entries = batch.into_iter();
+            let futs = std::iter::from_fn(move || Some(run_entry(service, entries.next()?)));
             let mut responses = stream::iter(futs).buffer_unordered(concurrency);
 
             while let Some(rp) = responses.next().await {
@@ -183,12 +188,7 @@ mod tests {
 
     const SLOW_MS: u64 = 200;
 
-    /// Server with a `slow` method (sleeps [`SLOW_MS`]) and an `echo` method, batches
-    /// executed through [`ConcurrentBatchLayer`] at the given bound and response cap.
-    async fn spawn(
-        concurrency: usize,
-        max_response_body_size: usize,
-    ) -> (SocketAddr, ServerHandle) {
+    fn test_module() -> RpcModule<()> {
         let mut module = RpcModule::new(());
         module
             .register_async_method("slow", |_, _, _| async {
@@ -201,7 +201,15 @@ mod tests {
                 params.one::<String>().unwrap_or_default()
             })
             .unwrap();
+        module
+    }
 
+    /// Server with a `slow` method (sleeps [`SLOW_MS`]) and an `echo` method, batches
+    /// executed through [`ConcurrentBatchLayer`] at the given bound and response cap.
+    async fn spawn(
+        concurrency: usize,
+        max_response_body_size: usize,
+    ) -> (SocketAddr, ServerHandle) {
         let rpc_middleware = RpcServiceBuilder::new()
             .layer(ConcurrentBatchLayer::new(concurrency, max_response_body_size));
         let server = Server::builder()
@@ -210,11 +218,18 @@ mod tests {
             .await
             .unwrap();
         let addr = server.local_addr().unwrap();
-        (addr, server.start(module))
+        (addr, server.start(test_module()))
     }
 
-    async fn post_raw(addr: SocketAddr, body: String) -> Value {
-        let raw = reqwest::Client::new()
+    /// The same server without the layer — jsonrpsee's stock sequential batch path.
+    async fn spawn_bare() -> (SocketAddr, ServerHandle) {
+        let server = Server::builder().build("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        (addr, server.start(test_module()))
+    }
+
+    async fn post_text(addr: SocketAddr, body: String) -> String {
+        reqwest::Client::new()
             .post(format!("http://{addr}"))
             .header("content-type", "application/json")
             .body(body)
@@ -223,8 +238,11 @@ mod tests {
             .unwrap()
             .text()
             .await
-            .unwrap();
-        serde_json::from_str(&raw).unwrap()
+            .unwrap()
+    }
+
+    async fn post_raw(addr: SocketAddr, body: String) -> Value {
+        serde_json::from_str(&post_text(addr, body).await).unwrap()
     }
 
     fn slow_batch(n: u64) -> String {
@@ -303,13 +321,27 @@ mod tests {
         let (addr, _handle) = spawn(16, 128).await;
 
         let long = "x".repeat(200);
-        let body = serde_json::to_string(&vec![
-            json!({"jsonrpc": "2.0", "id": 1, "method": "echo", "params": [long]}),
-        ])
-        .unwrap();
-        let rp = post_raw(addr, body).await;
+        let body = json!([{"jsonrpc": "2.0", "id": 1, "method": "echo", "params": [long]}]);
+        let rp = post_raw(addr, body.to_string()).await;
 
         assert!(rp.is_object(), "over-limit batch collapses to one error: {rp}");
         assert!(rp["error"]["code"].is_i64());
+    }
+
+    /// The tail branches mirrored from jsonrpsee's sequential batch implementation
+    /// (empty batch, notifications-only batch) stay pinned to its semantics by
+    /// construction: this layer's wire output must equal a bare jsonrpsee server's for
+    /// those shapes. Breaks loudly if an upstream upgrade changes the tail while the
+    /// mirror silently keeps the old shape.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tail_semantics_match_jsonrpsee() {
+        let (ours, _h1) = spawn(16, u32::MAX as usize).await;
+        let (bare, _h2) = spawn_bare().await;
+
+        for body in ["[]", r#"[{"jsonrpc":"2.0","method":"echo","params":["x"]}]"#] {
+            let a = post_text(ours, body.to_string()).await;
+            let b = post_text(bare, body.to_string()).await;
+            assert_eq!(a, b, "tail output diverged from jsonrpsee for {body}");
+        }
     }
 }

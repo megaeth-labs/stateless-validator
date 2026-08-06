@@ -566,6 +566,9 @@ fn pre_register_all_metrics() {
     // Request Layer: CPU time (global)
     let _ = CpuTimeMetrics::create();
 
+    // Request Layer: inbound batch shape (global)
+    let _ = BatchMetrics::create();
+
     // Request Layer: body streaming (per negotiated encoding); br/deflate are
     // deliberately not offered, so only these three series can ever be written
     for encoding in ["identity", "gzip", "zstd"] {
@@ -661,6 +664,7 @@ const BODY_CPU_TIME_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.
 /// (metric_name, buckets) pairs applied via `set_buckets_for_metric` at startup.
 const BUCKET_SPECS: &[(&str, &[f64])] = &[
     ("debug_trace_evm_block_tx_count", TX_COUNT_BUCKETS),
+    ("debug_trace_batch_size", TX_COUNT_BUCKETS),
     ("debug_trace_block_distance_from_tip", BLOCK_DISTANCE_BUCKETS),
     ("debug_trace_reorg_depth", REORG_DEPTH_BUCKETS),
     ("debug_trace_witness_bytes", BYTE_BUCKETS),
