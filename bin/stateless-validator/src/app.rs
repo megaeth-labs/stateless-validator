@@ -276,7 +276,10 @@ pub async fn run() -> Result<()> {
             let access_key_id = require_r2(&args.r2_access_key_id, "--r2-access-key-id")?;
             let secret_access_key =
                 require_r2(&args.r2_secret_access_key, "--r2-secret-access-key")?;
-            info!(endpoint, bucket, "Witness source: R2 (direct S3)");
+            // Log the parsed origin, not the raw flag value — the raw string is operator
+            // input and this line is info-level.
+            let (origin, _) = stateless_r2::endpoint::parse_endpoint(endpoint);
+            info!(endpoint = %origin, bucket, "Witness source: R2 (direct S3)");
             Some(Arc::new(R2WitnessClient::new(
                 endpoint,
                 bucket.to_string(),

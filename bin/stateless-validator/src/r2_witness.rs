@@ -68,7 +68,7 @@ impl R2WitnessError {
     /// Every label [`Self::kind`] can produce, for metrics pre-registration
     /// (`crate::metrics::init_metrics` zero-inits the error counter per kind).
     pub const KINDS: &'static [&'static str] =
-        &["missing", "transport", "throttled", "status", "decode", "decode_panicked"];
+        &["missing", "transport", "throttled", "status", "deadline", "decode", "decode_panicked"];
 
     /// Stable lowercase label for this variant — the `kind` label on the R2 witness error
     /// counter. Every value returned here must appear in [`Self::KINDS`].

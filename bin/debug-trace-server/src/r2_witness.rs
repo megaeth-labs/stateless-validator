@@ -33,7 +33,8 @@ const MAX_ATTEMPTS: usize = 3;
 /// Failure outcome of an R2 historical witness fetch.
 #[derive(Debug, thiserror::Error)]
 pub enum R2WitnessError {
-    /// The signed GET failed (absent object, transport, throttle, or unexpected status).
+    /// The signed GET failed (absent object, transport, throttle, unexpected status, or
+    /// out of deadline while queued).
     #[error(transparent)]
     Get(#[from] R2GetError),
     /// The object was fetched but its bytes did not decode to a witness tuple — a corrupt
@@ -49,7 +50,7 @@ pub enum R2WitnessError {
 impl R2WitnessError {
     /// Every label [`Self::kind`] can produce, for metrics pre-registration.
     pub const KINDS: &'static [&'static str] =
-        &["missing", "transport", "throttled", "status", "decode", "decode_panicked"];
+        &["missing", "transport", "throttled", "status", "deadline", "decode", "decode_panicked"];
 
     /// Stable lowercase label for this variant — the `kind` label on the R2 witness error
     /// counter. Every value returned here must appear in [`Self::KINDS`].

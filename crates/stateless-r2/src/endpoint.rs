@@ -6,9 +6,12 @@ use reqwest::Url;
 /// request host (`host[:port]`) used for `SigV4` canonical headers.
 ///
 /// Returns empty strings when the endpoint is unusable: not a valid URL, no host, or anything
-/// beyond a bare origin (path/query/fragment). A path would be sent on the wire but never signed
-/// (the signer builds `/{bucket}/{key}` itself), failing every request with 403
+/// beyond a bare origin (path/query/fragment/userinfo). A path would be sent on the wire but
+/// never signed (the signer builds `/{bucket}/{key}` itself), failing every request with 403
 /// `SignatureDoesNotMatch` — so e.g. a pasted R2 dashboard bucket URL is rejected at startup.
+/// Userinfo (`https://token@host`) is rejected rather than silently dropped: SigV4 carries the
+/// credentials, so an inline token is a misconfiguration, and accepting it would leave the
+/// secret-bearing raw string around for logs to echo.
 pub fn parse_endpoint(endpoint: &str) -> (String, String) {
     let empty = || (String::new(), String::new());
     let trimmed = endpoint.trim_end_matches('/');
@@ -18,7 +21,12 @@ pub fn parse_endpoint(endpoint: &str) -> (String, String) {
     // Accept only a bare origin. `Url` normalizes a hostname-only URL to a "/" path, so treat "/"
     // (and the empty path) as "no path"; any other path, query, or fragment is rejected.
     let has_path = !matches!(url.path(), "" | "/");
-    if has_path || url.query().is_some() || url.fragment().is_some() {
+    if has_path ||
+        url.query().is_some() ||
+        url.fragment().is_some() ||
+        !url.username().is_empty() ||
+        url.password().is_some()
+    {
         return empty();
     }
 
@@ -68,6 +76,18 @@ mod tests {
         let (endpoint, host) = parse_endpoint("https://acc.r2.cloudflarestorage.com/");
         assert_eq!(endpoint, "https://acc.r2.cloudflarestorage.com");
         assert_eq!(host, "acc.r2.cloudflarestorage.com");
+    }
+
+    #[test]
+    fn parse_endpoint_rejects_userinfo() {
+        assert_eq!(
+            parse_endpoint("https://secret-token@acc.r2.cloudflarestorage.com"),
+            (String::new(), String::new())
+        );
+        assert_eq!(
+            parse_endpoint("https://user:pass@acc.r2.cloudflarestorage.com"),
+            (String::new(), String::new())
+        );
     }
 
     #[test]

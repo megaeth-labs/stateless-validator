@@ -555,8 +555,11 @@ async fn main() -> Result<()> {
                 rpc_retry,
                 args.r2_max_concurrent_requests,
             )?;
+            // Log the parsed origin, not the raw flag value — the raw string is
+            // operator input and this line is info-level.
+            let (origin, _) = stateless_r2::endpoint::parse_endpoint(endpoint);
             info!(
-                endpoint,
+                endpoint = %origin,
                 bucket, "Historical witness source: R2 (direct S3), RPC chain as fallback"
             );
             Some(Arc::new(source))
@@ -1345,6 +1348,9 @@ mod tests {
     /// the full quad must parse, and none-of-them stays valid.
     #[test]
     fn r2_flag_group_is_all_or_nothing() {
+        // Parsing reads every `#[clap(env = ...)]` variable, so serialize with the
+        // env-mutating tests.
+        let _guard = stateless_test_utils::env::env_lock();
         let full = [
             "--r2-endpoint",
             "https://acc.r2.cloudflarestorage.com",

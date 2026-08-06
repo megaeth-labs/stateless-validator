@@ -51,11 +51,16 @@ pub enum R2GetError {
     /// credentials, 404 NoSuchBucket) or a 3xx (redirects are never followed — see
     /// [`R2ObjectFetcher::new`]). Bodies are best-effort and capped.
     Status { number: u64, key: String, status: u16, body: String },
+    /// The caller's deadline expired while the fetch was still queued for a concurrency
+    /// permit — under saturation the queue wait must not eat the budget the caller reserved
+    /// for its fallback. Only produced when a deadline is passed.
+    Deadline { number: u64, key: String },
 }
 
 impl R2GetError {
     /// Every label [`Self::kind`] can produce, for callers pre-registering per-kind metrics.
-    pub const KINDS: &'static [&'static str] = &["missing", "transport", "throttled", "status"];
+    pub const KINDS: &'static [&'static str] =
+        &["missing", "transport", "throttled", "status", "deadline"];
 
     /// Stable lowercase label for this variant, for callers' per-kind error metrics. Every
     /// value returned here appears in [`Self::KINDS`].
@@ -65,6 +70,7 @@ impl R2GetError {
             Self::Transport { .. } => "transport",
             Self::Throttled { .. } => "throttled",
             Self::Status { .. } => "status",
+            Self::Deadline { .. } => "deadline",
         }
     }
 
@@ -96,6 +102,13 @@ impl Display for R2GetError {
             }
             Self::Status { number, key, status, body } => {
                 write!(f, "R2 unexpected status {status} for block {number} (key {key}): {body}")
+            }
+            Self::Deadline { number, key } => {
+                write!(
+                    f,
+                    "R2 witness fetch for block {number} (key {key}) ran out of deadline \
+                     queued for a concurrency permit"
+                )
             }
         }
     }
@@ -184,10 +197,11 @@ impl R2ObjectFetcher {
     ) -> Result<Self, String> {
         let (origin, host) = parse_endpoint(endpoint);
         if host.is_empty() {
-            return Err(format!(
-                "Invalid R2 endpoint {endpoint:?}: expected a bare scheme://host origin \
-                 (no path/query), e.g. https://<account>.r2.cloudflarestorage.com"
-            ));
+            // The raw input is not echoed: a rejected shape may carry inline credentials
+            // (userinfo), and this message ends up in startup logs.
+            return Err("Invalid R2 endpoint: expected a bare scheme://host origin (no \
+                 path/query/userinfo), e.g. https://<account>.r2.cloudflarestorage.com"
+                .to_string());
         }
         let http = Client::builder()
             .timeout(per_attempt_timeout)
@@ -242,8 +256,20 @@ impl R2ObjectFetcher {
             // waste capacity other fetches could use.
             let outcome = {
                 let queued = Instant::now();
-                let _permit = self.concurrency.acquire().await.expect("semaphore is never closed");
+                // A deadline bounds the queue wait too: under saturation the caller's budget
+                // must stay available for its fallback, not drain waiting for a permit.
+                let permit = match deadline {
+                    None => self.concurrency.acquire().await,
+                    Some(d) => {
+                        match tokio::time::timeout_at(d.into(), self.concurrency.acquire()).await {
+                            Ok(acquired) => acquired,
+                            Err(_) => return Err(R2GetError::Deadline { number, key }),
+                        }
+                    }
+                }
+                .expect("semaphore is never closed");
                 queue_wait += queued.elapsed();
+                let _permit = permit;
                 self.get_object(number, &key, deadline).await
             };
             match outcome {
@@ -555,6 +581,34 @@ mod tests {
             "expired deadline must fail fast ({:?})",
             started.elapsed(),
         );
+    }
+
+    /// A fetch whose deadline expires while queued for a permit surfaces `Deadline`
+    /// promptly instead of waiting out the holder — the queue wait must not consume the
+    /// budget the caller reserved for its fallback.
+    #[tokio::test]
+    async fn queued_fetch_surfaces_deadline_before_permit_frees() {
+        let (endpoint, _) = mock_r2_held(404, Duration::from_secs(3)).await;
+        let fetcher = fetcher_with(&endpoint, Some(1), test_pacing());
+
+        // Occupy the single permit with a long-held GET.
+        let holder = {
+            let fetcher = fetcher.clone();
+            tokio::spawn(async move { fetcher.get_block_object(1, "0xhold", 1, None, || ()).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let started = Instant::now();
+        let deadline = Instant::now() + Duration::from_millis(150);
+        let err =
+            fetcher.get_block_object(2, "0xqueued", 1, Some(deadline), || ()).await.unwrap_err();
+        assert!(matches!(err, R2GetError::Deadline { number: 2, .. }), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "queued fetch must surface at its deadline, not the holder's ({:?})",
+            started.elapsed(),
+        );
+        let _ = holder.await;
     }
 
     /// Six concurrent fetches against a limit of 2 must never exceed two in-flight GETs.
