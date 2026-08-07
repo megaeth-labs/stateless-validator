@@ -42,12 +42,17 @@ pub(crate) struct ConcurrentBatchLayer {
 }
 
 impl ConcurrentBatchLayer {
-    /// `concurrency` must be at least 1 (the CLI parser enforces it);
-    /// `max_response_body_size` must match the server's configured limit so batch
-    /// responses are capped identically to jsonrpsee's own batch path.
+    /// `concurrency` is clamped to at least 1: the CLI parser already enforces it, but a
+    /// zero bound would silently answer every batch as empty, so the floor is structural
+    /// rather than an assertion that compiles out. `max_response_body_size` must match
+    /// the server's configured limit so batch responses are capped identically to
+    /// jsonrpsee's own batch path.
     pub(crate) fn new(concurrency: usize, max_response_body_size: usize) -> Self {
-        debug_assert!(concurrency >= 1, "a zero bound would stall every batch stream");
-        Self { concurrency, max_response_body_size, metrics: BatchMetrics::create() }
+        Self {
+            concurrency: concurrency.max(1),
+            max_response_body_size,
+            metrics: BatchMetrics::create(),
+        }
     }
 }
 
@@ -312,7 +317,9 @@ mod tests {
     /// the inline EVM trace) must still overlap: spawned as independent tasks they
     /// occupy separate worker threads. The regression mode is interleaving all entry
     /// futures on the one connection task, where the batch degrades to the sum of its
-    /// entries' CPU time.
+    /// entries' CPU time. A blocking sleep rather than a spin pins the same property —
+    /// worker-thread occupancy — while staying independent of the CI host's core count
+    /// (four sleeps overlap on four worker threads even on one core; four spins do not).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cpu_bound_entries_parallelize() {
         let (addr, _handle) = spawn(16, u32::MAX as usize).await;
