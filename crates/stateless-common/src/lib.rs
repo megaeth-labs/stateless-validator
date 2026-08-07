@@ -13,6 +13,8 @@ pub use witness_encoding::{
     decode_witness_response, decode_witness_response_light, encode_witness_payload,
     encode_witness_response,
 };
+pub mod secret;
+pub use secret::RedactedSecret;
 pub mod witness_size;
 pub use witness_size::WitnessSizeBreakdown;
 

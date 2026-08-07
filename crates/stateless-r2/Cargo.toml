@@ -6,17 +6,28 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 exclude.workspace = true
-description = "Shared Cloudflare R2 (S3-compatible) witness primitives: minimal SigV4 signer, object-key layout, endpoint parsing, and signed PUT helper shared by the mega-reth witness uploaders (write path) and the stateless validator (read path)."
+description = "Shared Cloudflare R2 (S3-compatible) witness primitives: minimal SigV4 signer, object-key layout, endpoint parsing, signed PUT helper, and the retrying witness-object GET fetcher — shared by the mega-reth witness uploaders (write path) and both stateless binaries' R2 witness sources (read path)."
 
 [dependencies]
 # misc
 bytes.workspace = true
 chrono = { workspace = true, features = ["clock"] }
+fastrand = { workspace = true, features = ["std"] }
 hex = { workspace = true, features = ["alloc"] }
 hmac.workspace = true
 percent-encoding.workspace = true
 # Pinned explicitly (not workspace-inherited): `put_object` exposes `&reqwest::Client`, so the
 # reqwest major is part of this crate's API and must match mega-reth's workspace (0.12). Bumping
 # it is a coordinated two-repo change that a workspace-wide bump must not ride over.
+# No `http2` feature: R2's bare S3 endpoint negotiates HTTP/1.1 only (ALPN-verified live),
+# so h2 buys these paths nothing today. Revisit alongside the R2 custom-domain work, which
+# does ride an h2-capable stack.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 sha2.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+tracing = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+# misc
+stateless-test-utils = { path = "../stateless-test-utils" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

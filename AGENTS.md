@@ -40,7 +40,7 @@ The project uses nightly `2026-02-03` toolchain (edition 2024, rust-version 1.95
 | `stateless-db`         | `crates/stateless-db`         | redb-backed persistence: table definitions, read/write helpers, `ContractCache`                                                                                                          |
 | `stateless-common`     | `crates/stateless-common`     | RPC client, metrics/logging utilities, witness size estimation                                                                                                                           |
 | `stateless-test-utils` | `crates/stateless-test-utils` | Test fixtures (blocks, witnesses, contracts) and env-var lock for integration tests                                                                                                      |
-| `stateless-r2`         | `crates/stateless-r2`         | Shared R2 (S3) witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT; consumed by mega-reth's uploaders (write) and the validator's R2 witness source (read) |
+| `stateless-r2`         | `crates/stateless-r2`         | Shared R2 (S3) witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT, and the retrying witness-object GET fetcher; consumed by mega-reth's uploaders (write) and both binaries' R2 witness sources (read) |
 | `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers (`app.rs` / `workers.rs` / `main.rs`)                                                                                               |
 | `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                                                                                                                            |
 
@@ -118,6 +118,7 @@ The memo's depth gate learns the tip from the window and `latest`-tag lookups, f
 Below the response cache, a bounded in-memory `BlockData` cache keyed by block hash (`--block-data-cache-max-size`, default 1GB, 0 disables) fronts the DB and RPC tiers; block-number lookups resolve number → hash before touching it, so canonicality is never cached and it needs no reorg invalidation.
 The cache pins 4 shards (largest cacheable entry = `max_bytes / 4` on any host), counts non-retained inserts, and drops an entry when a trace fails for a data-attributable reason (`TraceError::Data` — bad witness) while request-attributable failures (invalid tracer configs) never evict.
 In local cache mode with a `--witness-generator-endpoint` plus at least one fallback `--witness-endpoint`, request-serving witness fetches route by block age: blocks at least `--witness-local-window` blocks below the local tip skip the generator (which prunes beyond its `BACKUP` window) and fetch from the fallbacks; without the generator flag, witness endpoints are plain failover and routing is disabled.
+With the `--r2-*` flag group (endpoint, bucket, access key id, secret), historical witness fetches try a direct SigV4-signed R2 GET (light decode, capped at half the remaining witness budget) before the RPC chain, falling back on any failure; frontier blocks keep the generator path, and `--r2-max-concurrent-requests` caps R2 GETs separately from the RPC witness semaphore.
 The background chain-sync prefetch routes by freshness against the last observed remote head: frontier-fresh blocks give the generator a short exclusive grace (its "witness not found" means "not generated yet" — fallbacks are fed by the same pipeline and cannot be ahead) before falling back to the full endpoint chain, while deep catch-up blocks — and any block classified against a stale head observation (older than the grace, as during a long catch-up stretch when the tip is not re-polled) — use the full chain from the first attempt.
 
 ### Key Source Files
@@ -138,6 +139,7 @@ The background chain-sync prefetch routes by freshness against the last observed
 | `bin/debug-trace-server/src/rpc_middleware.rs`                                                 | Concurrent execution of inbound JSON-RPC batch entries                               |
 | `bin/debug-trace-server/src/data_provider.rs`                                                  | Block data fetching with single-flight coalescing                                    |
 | `bin/debug-trace-server/src/block_data_cache.rs`                                               | Bounded in-memory `BlockData` cache keyed by block hash                              |
+| `bin/debug-trace-server/src/r2_witness.rs`                                                     | Direct-from-R2 historical witness source (light decode, deadline-aware)              |
 | `bin/debug-trace-server/src/server_db.rs`                                                      | Defines + implements the bin-local `BlockStore` trait (backed by `stateless-db`)     |
 
 ## Test Organization
