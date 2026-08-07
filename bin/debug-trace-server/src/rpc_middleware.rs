@@ -6,21 +6,26 @@
 //! independent of server capacity. JSON-RPC 2.0 explicitly allows processing batch
 //! entries concurrently and responding in any order (responses are matched by `id`),
 //! so this layer replaces just the batch path: entries still go through the inner
-//! service's `call` one by one — every per-request mechanism (single-flight, caches,
-//! semaphores, metrics) applies unchanged — but up to `concurrency` of them run at
-//! once, and the batch completes near its slowest item. The bound exists so a single
-//! oversized batch cannot monopolize what its entries actually contend on — the
-//! witness-fetch semaphores and the runtime's worker threads (traces execute inline on
-//! the async runtime) — against concurrently served requests; `1` restores strictly
-//! sequential execution.
+//! service's `call` — every per-request mechanism (single-flight, caches, semaphores,
+//! metrics) applies unchanged — but up to `concurrency` of them run **as independent
+//! runtime tasks**, and the batch completes near its slowest entry. Spawning, rather
+//! than interleaving entry futures on the one connection task, is what makes that hold
+//! for CPU-bound entries too: EVM tracing runs synchronously inline, so a merely
+//! interleaved batch would serialize behind whichever entry is mid-trace, while spawned
+//! entries proceed on other worker threads. The bound exists so a single oversized
+//! batch cannot monopolize what its entries contend on — the witness-fetch semaphores
+//! and the runtime's workers — against concurrently served requests; `1` restores
+//! strictly sequential execution.
 
-use futures::stream::{self, StreamExt};
+use std::borrow::Cow;
+
 use jsonrpsee::{
     core::server::BatchResponseBuilder,
     server::middleware::rpc::{
-        Batch, BatchEntry, BatchEntryErr, MethodResponse, Notification, Request, RpcServiceT,
+        Batch, BatchEntry, MethodResponse, Notification, Request, RpcServiceT,
     },
 };
+use tokio::task::JoinSet;
 use tower::Layer;
 
 use crate::metrics::BatchMetrics;
@@ -59,31 +64,26 @@ impl<S> Layer<S> for ConcurrentBatchLayer {
     }
 }
 
-/// Executes one batch entry: parse-failed entries answer directly, calls and
-/// notifications go through the inner service. `None` marks a notification (which gets
-/// no response entry). A named `async fn` rather than a closure-held `async` block —
-/// the closure form trips rustc's higher-ranked lifetime inference inside
-/// `buffer_unordered`.
-async fn run_entry<'a, S>(
-    service: &S,
-    entry: Result<BatchEntry<'a>, BatchEntryErr<'a>>,
-) -> Option<MethodResponse>
-where
-    S: RpcServiceT<MethodResponse = MethodResponse, NotificationResponse = MethodResponse>
-        + Send
-        + Sync,
-{
-    match entry {
-        Ok(BatchEntry::Call(req)) => Some(service.call(req).await),
-        Ok(BatchEntry::Notification(n)) => {
-            service.notification(n).await;
-            None
-        }
-        Err(err) => {
-            let (err, id) = err.into_parts();
-            Some(MethodResponse::error(id, err))
-        }
-    }
+/// Rebuilds a borrowed request as `'static` (owned id/method/params) so its execution
+/// can be spawned as an independent runtime task.
+fn owned_request(req: Request<'_>) -> Request<'static> {
+    let mut owned = Request::owned(
+        req.method.into_owned(),
+        req.params.map(Cow::into_owned),
+        req.id.into_owned(),
+    );
+    owned.extensions = req.extensions;
+    owned
+}
+
+/// [`owned_request`]'s counterpart for notification entries.
+fn owned_notification(n: Notification<'_>) -> Notification<'static> {
+    let mut owned = Notification::new(
+        Cow::Owned(n.method.into_owned()),
+        n.params.map(|p| Cow::Owned(p.into_owned())),
+    );
+    owned.extensions = n.extensions;
+    owned
 }
 
 /// Passes single calls and notifications through untouched; overrides only `batch`.
@@ -131,32 +131,57 @@ where
         self.metrics.record(batch.len());
         async move {
             let mut got_notification = false;
-
-            // One lazy pass: every entry becomes one future — parse-failed entries as
-            // ready error responses, calls and notifications through the (borrowed)
-            // inner service. `buffer_unordered` pulls futures from the iterator only as
-            // slots free up, so it both bounds the parallelism and keeps at most
-            // `concurrency` futures alive — an oversized batch cannot balloon memory
-            // ahead of execution. Responses append in completion order — valid per spec
-            // (matched by `id`), and what keeps a slow entry from holding back an open
-            // concurrency slot.
-            let service = &service;
-            // `from_fn` instead of `Iterator::map`: a closure taking the
-            // lifetime-carrying entries as input trips rustc's higher-ranked lifetime
-            // inference once it appears in the stream's type; this closure takes no
-            // input, so the stream stays lazy without the false obligation.
             let mut entries = batch.into_iter();
-            let futs = std::iter::from_fn(move || Some(run_entry(service, entries.next()?)));
-            let mut responses = stream::iter(futs).buffer_unordered(concurrency);
 
-            while let Some(rp) = responses.next().await {
-                match rp {
-                    Some(rp) => {
+            // Refill-and-drain: at most `concurrency` entries are alive as spawned
+            // tasks, converted to owned form lazily at spawn time — an oversized batch
+            // cannot balloon memory ahead of execution. Parse-failed entries answer
+            // inline without consuming a slot. Responses append in completion order —
+            // valid per spec (matched by `id`), and what keeps a slow entry from holding
+            // back an open slot. Dropping the set (early return, client disconnect)
+            // aborts every outstanding entry.
+            let mut tasks = JoinSet::new();
+            loop {
+                while tasks.len() < concurrency {
+                    let Some(entry) = entries.next() else { break };
+                    match entry {
+                        Ok(BatchEntry::Call(req)) => {
+                            let service = service.clone();
+                            let req = owned_request(req);
+                            tasks.spawn(async move { Some(service.call(req).await) });
+                        }
+                        Ok(BatchEntry::Notification(n)) => {
+                            let service = service.clone();
+                            let n = owned_notification(n);
+                            tasks.spawn(async move {
+                                service.notification(n).await;
+                                None
+                            });
+                        }
+                        Err(err) => {
+                            let (err, id) = err.into_parts();
+                            if let Err(err) = batch_rp.append(MethodResponse::error(id, err)) {
+                                return err;
+                            }
+                        }
+                    }
+                }
+                match tasks.join_next().await {
+                    Some(Ok(Some(rp))) => {
                         if let Err(err) = batch_rp.append(rp) {
                             return err;
                         }
                     }
-                    None => got_notification = true,
+                    Some(Ok(None)) => got_notification = true,
+                    Some(Err(e)) => {
+                        // A panicking method unwinds this (connection) task, matching
+                        // the sequential batch path; cancellation is unobservable here
+                        // (entries are only aborted when the set itself is dropped).
+                        if e.is_panic() {
+                            std::panic::resume_unwind(e.into_panic());
+                        }
+                    }
+                    None => break,
                 }
             }
 
@@ -199,6 +224,14 @@ mod tests {
         module
             .register_async_method("echo", |params, _, _| async move {
                 params.one::<String>().unwrap_or_default()
+            })
+            .unwrap();
+        // Synchronous-CPU stand-in: blocks its worker thread for the whole duration,
+        // like the inline EVM trace does.
+        module
+            .register_async_method("busy", |_, _, _| async {
+                std::thread::sleep(Duration::from_millis(SLOW_MS));
+                "done"
             })
             .unwrap();
         module
@@ -245,9 +278,9 @@ mod tests {
         serde_json::from_str(&post_text(addr, body).await).unwrap()
     }
 
-    fn slow_batch(n: u64) -> String {
+    fn batch_of(method: &str, n: u64) -> String {
         let entries: Vec<Value> = (1..=n)
-            .map(|id| json!({"jsonrpc": "2.0", "id": id, "method": "slow", "params": []}))
+            .map(|id| json!({"jsonrpc": "2.0", "id": id, "method": method, "params": []}))
             .collect();
         serde_json::to_string(&entries).unwrap()
     }
@@ -257,7 +290,7 @@ mod tests {
         let (addr, _handle) = spawn(16, u32::MAX as usize).await;
 
         let started = Instant::now();
-        let rp = post_raw(addr, slow_batch(8)).await;
+        let rp = post_raw(addr, batch_of("slow", 8)).await;
         let elapsed = started.elapsed();
 
         let items = rp.as_array().expect("batch response is an array");
@@ -275,12 +308,37 @@ mod tests {
         );
     }
 
+    /// Entries whose cost is synchronous CPU (stand-in: a worker-blocking sleep, like
+    /// the inline EVM trace) must still overlap: spawned as independent tasks they
+    /// occupy separate worker threads. The regression mode is interleaving all entry
+    /// futures on the one connection task, where the batch degrades to the sum of its
+    /// entries' CPU time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cpu_bound_entries_parallelize() {
+        let (addr, _handle) = spawn(16, u32::MAX as usize).await;
+
+        let started = Instant::now();
+        let rp = post_raw(addr, batch_of("busy", 6)).await;
+        let elapsed = started.elapsed();
+
+        let items = rp.as_array().expect("batch response is an array");
+        assert_eq!(items.len(), 6);
+        assert!(items.iter().all(|i| i["result"] == "done"), "all entries succeed: {rp}");
+        // 6 × SLOW_MS of blocking work over 4 workers ≈ 2 × SLOW_MS; single-task
+        // interleaving would need the full 6 ×.
+        assert!(
+            elapsed < Duration::from_millis(5 * SLOW_MS),
+            "cpu-bound batch took {elapsed:?}, expected near {}ms",
+            2 * SLOW_MS
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrency_one_is_sequential_and_ordered() {
         let (addr, _handle) = spawn(1, u32::MAX as usize).await;
 
         let started = Instant::now();
-        let rp = post_raw(addr, slow_batch(3)).await;
+        let rp = post_raw(addr, batch_of("slow", 3)).await;
         let elapsed = started.elapsed();
 
         // One entry at a time both sums the latencies and preserves request order.

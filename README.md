@@ -108,7 +108,7 @@ A type-malformed `tracerConfig` on a config-reading builtin (`callTracer`/`prest
 Disable the cache with `--response-cache-disabled`; `--response-cache-estimated-items` must be at least 1 (the old `=0` disable convention is rejected at startup).
 
 **Concurrent batch execution:**
-Entries of an inbound JSON-RPC batch request execute concurrently, so a batch answers near its slowest entry instead of the sum of its entries (jsonrpsee's built-in batch path is strictly sequential).
+Entries of an inbound JSON-RPC batch request execute concurrently as independent runtime tasks, so a batch answers near its slowest entry instead of the sum of its entries — including CPU-bound entries, since EVM tracing runs synchronously inline and merely interleaved futures would serialize behind it (jsonrpsee's built-in batch path is strictly sequential).
 Each entry still goes through the regular per-request pipeline — response cache, single-flight, witness routing, and per-method metrics apply unchanged — and responses may arrive in any order, matched by `id` as JSON-RPC 2.0 permits.
 `--batch-item-concurrency` (default 16) bounds how many entries of one batch run at once, so a single huge batch cannot monopolize downstream resources against concurrently served requests; set it to 1 to restore sequential execution.
 The `debug_trace_batch_size` histogram records entries per inbound batch.
