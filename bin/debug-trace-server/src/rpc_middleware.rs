@@ -70,24 +70,25 @@ impl<S> Layer<S> for ConcurrentBatchLayer {
 }
 
 /// Rebuilds a borrowed request as `'static` (owned id/method/params) so its execution
-/// can be spawned as an independent runtime task.
+/// can be spawned as an independent runtime task. Exhaustive destructuring makes an
+/// upstream field added to `Request` a compile error here instead of a silently dropped
+/// piece of context.
 fn owned_request(req: Request<'_>) -> Request<'static> {
-    let mut owned = Request::owned(
-        req.method.into_owned(),
-        req.params.map(Cow::into_owned),
-        req.id.into_owned(),
-    );
-    owned.extensions = req.extensions;
+    let Request { jsonrpc: _, id, method, params, extensions } = req;
+    let mut owned =
+        Request::owned(method.into_owned(), params.map(Cow::into_owned), id.into_owned());
+    owned.extensions = extensions;
     owned
 }
 
 /// [`owned_request`]'s counterpart for notification entries.
 fn owned_notification(n: Notification<'_>) -> Notification<'static> {
+    let Notification { jsonrpc: _, method, params, extensions } = n;
     let mut owned = Notification::new(
-        Cow::Owned(n.method.into_owned()),
-        n.params.map(|p| Cow::Owned(p.into_owned())),
+        Cow::Owned(method.into_owned()),
+        params.map(|p| Cow::Owned(p.into_owned())),
     );
-    owned.extensions = n.extensions;
+    owned.extensions = extensions;
     owned
 }
 
@@ -102,13 +103,9 @@ pub(crate) struct ConcurrentBatch<S> {
 
 impl<S> RpcServiceT for ConcurrentBatch<S>
 where
-    S: RpcServiceT<
-            MethodResponse = MethodResponse,
-            NotificationResponse = MethodResponse,
-            BatchResponse = MethodResponse,
-        > + Clone
+    S: RpcServiceT<MethodResponse = MethodResponse, NotificationResponse = MethodResponse>
+        + Clone
         + Send
-        + Sync
         + 'static,
 {
     type MethodResponse = MethodResponse;
@@ -242,8 +239,8 @@ mod tests {
         module
     }
 
-    /// Server with a `slow` method (sleeps [`SLOW_MS`]) and an `echo` method, batches
-    /// executed through [`ConcurrentBatchLayer`] at the given bound and response cap.
+    /// Server running [`test_module`]'s methods behind [`ConcurrentBatchLayer`] at the
+    /// given bound and response cap.
     async fn spawn(
         concurrency: usize,
         max_response_body_size: usize,
