@@ -15,9 +15,18 @@
 //! entries proceed on other worker threads. The bound exists so a single oversized
 //! batch cannot monopolize what its entries contend on — the witness-fetch semaphores
 //! and the runtime's workers — against concurrently served requests; `1` restores
-//! strictly sequential execution.
+//! strictly sequential execution. CPU burned inside spawned entries is invisible to the
+//! timing layer's thread-clock sampling of the connection task, so it is summed per
+//! batch and folded back into `x-execution-time-ns` and the request CPU metric through
+//! a response extension.
 
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use jsonrpsee::{
     core::server::BatchResponseBuilder,
@@ -28,7 +37,10 @@ use jsonrpsee::{
 use tokio::task::JoinSet;
 use tower::Layer;
 
-use crate::metrics::BatchMetrics;
+use crate::{
+    metrics::BatchMetrics,
+    timing::{CpuSampled, SpawnedCpuNanos},
+};
 
 /// Default bound on concurrently executing entries of one batch request.
 pub(crate) const DEFAULT_BATCH_ITEM_CONCURRENCY: u32 = 16;
@@ -92,6 +104,15 @@ fn owned_notification(n: Notification<'_>) -> Notification<'static> {
     owned
 }
 
+/// Attaches the entries' summed off-task CPU to a batch response so the timing layer
+/// can fold it into `x-execution-time-ns` and the request CPU metric — spawned entries
+/// burn their CPU on other worker threads, invisible to that layer's thread-clock
+/// sampling of the connection task.
+fn stamp_entry_cpu(mut rp: MethodResponse, entry_cpu: &AtomicU64) -> MethodResponse {
+    rp.extensions_mut().insert(SpawnedCpuNanos(entry_cpu.load(Ordering::Relaxed)));
+    rp
+}
+
 /// Passes single calls and notifications through untouched; overrides only `batch`.
 #[derive(Clone)]
 pub(crate) struct ConcurrentBatch<S> {
@@ -134,6 +155,7 @@ where
         async move {
             let mut got_notification = false;
             let mut entries = batch.into_iter();
+            let entry_cpu = Arc::new(AtomicU64::new(0));
 
             // Refill-and-drain: at most `concurrency` entries are alive as spawned
             // tasks, converted to owned form lazily at spawn time — an oversized batch
@@ -150,20 +172,26 @@ where
                         Ok(BatchEntry::Call(req)) => {
                             let service = service.clone();
                             let req = owned_request(req);
-                            tasks.spawn(async move { Some(service.call(req).await) });
+                            tasks.spawn(CpuSampled::new(
+                                async move { Some(service.call(req).await) },
+                                entry_cpu.clone(),
+                            ));
                         }
                         Ok(BatchEntry::Notification(n)) => {
                             let service = service.clone();
                             let n = owned_notification(n);
-                            tasks.spawn(async move {
-                                service.notification(n).await;
-                                None
-                            });
+                            tasks.spawn(CpuSampled::new(
+                                async move {
+                                    service.notification(n).await;
+                                    None
+                                },
+                                entry_cpu.clone(),
+                            ));
                         }
                         Err(err) => {
                             let (err, id) = err.into_parts();
                             if let Err(err) = batch_rp.append(MethodResponse::error(id, err)) {
-                                return err;
+                                return stamp_entry_cpu(err, &entry_cpu);
                             }
                         }
                     }
@@ -171,7 +199,7 @@ where
                 match tasks.join_next().await {
                     Some(Ok(Some(rp))) => {
                         if let Err(err) = batch_rp.append(rp) {
-                            return err;
+                            return stamp_entry_cpu(err, &entry_cpu);
                         }
                     }
                     Some(Ok(None)) => got_notification = true,
@@ -189,11 +217,12 @@ where
 
             // Mirrors jsonrpsee's sequential batch tail: only-notifications batches get
             // an empty reply, empty batches an invalid-request error.
-            if batch_rp.is_empty() && got_notification {
+            let rp = if batch_rp.is_empty() && got_notification {
                 MethodResponse::notification()
             } else {
                 MethodResponse::from_batch(batch_rp.finish())
-            }
+            };
+            stamp_entry_cpu(rp, &entry_cpu)
         }
     }
 }
@@ -214,6 +243,7 @@ mod tests {
     use super::*;
 
     const SLOW_MS: u64 = 200;
+    const SPIN_MS: u64 = 40;
 
     fn test_module() -> RpcModule<()> {
         let mut module = RpcModule::new(());
@@ -236,19 +266,35 @@ mod tests {
                 "done"
             })
             .unwrap();
+        // Burns ~SPIN_MS of real thread CPU (measured by the CPU clock, so the amount
+        // is scheduling-independent) — for CPU-accounting tests.
+        module
+            .register_async_method("spin", |_, _, _| async {
+                let start = crate::timing::thread_cpu_time();
+                while crate::timing::thread_cpu_time().saturating_sub(start) <
+                    Duration::from_millis(SPIN_MS)
+                {
+                    std::hint::black_box(0u64);
+                }
+                "done"
+            })
+            .unwrap();
         module
     }
 
     /// Server running [`test_module`]'s methods behind [`ConcurrentBatchLayer`] at the
-    /// given bound and response cap.
+    /// given bound and response cap, with the timing layer sealing
+    /// `x-execution-time-ns` like production.
     async fn spawn(
         concurrency: usize,
         max_response_body_size: usize,
     ) -> (SocketAddr, ServerHandle) {
         let rpc_middleware = RpcServiceBuilder::new()
             .layer(ConcurrentBatchLayer::new(concurrency, max_response_body_size));
+        let http_middleware = tower::ServiceBuilder::new().layer(crate::timing::TimingHeaderLayer);
         let server = Server::builder()
             .set_rpc_middleware(rpc_middleware)
+            .set_http_middleware(http_middleware)
             .build("127.0.0.1:0")
             .await
             .unwrap();
@@ -334,6 +380,41 @@ mod tests {
             elapsed < Duration::from_millis(5 * SLOW_MS),
             "cpu-bound batch took {elapsed:?}, expected near {}ms",
             2 * SLOW_MS
+        );
+    }
+
+    /// Spawned entries burn their CPU on other worker threads, invisible to the timing
+    /// layer's thread-clock sampling of the connection task — the summed entry CPU must
+    /// ride back on the response so `x-execution-time-ns` still accounts for it. The
+    /// regression mode is a batch header reporting only JoinSet orchestration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn batch_header_accounts_for_spawned_entry_cpu() {
+        let (addr, _handle) = spawn(16, u32::MAX as usize).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}"))
+            .header("content-type", "application/json")
+            .body(batch_of("spin", 3))
+            .send()
+            .await
+            .unwrap();
+        let cpu_ns: u64 = resp
+            .headers()
+            .get(crate::timing::TIMING_HEADER_NAME)
+            .expect("timing header present")
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let rp: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(rp.as_array().unwrap().len(), 3);
+
+        // Each spin burns >= SPIN_MS of thread CPU by the CPU clock, however the
+        // entries are scheduled; a small allowance covers sampling granularity.
+        let expected_ns = (3 * SPIN_MS - 5) * 1_000_000;
+        assert!(
+            cpu_ns >= expected_ns,
+            "header reports {cpu_ns}ns, expected at least {expected_ns}ns of entry CPU"
         );
     }
 

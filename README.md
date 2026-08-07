@@ -111,7 +111,7 @@ Disable the cache with `--response-cache-disabled`; `--response-cache-estimated-
 Entries of an inbound JSON-RPC batch request execute concurrently as independent runtime tasks, so a batch answers near its slowest entry instead of the sum of its entries — including CPU-bound entries, since EVM tracing runs synchronously inline and merely interleaved futures would serialize behind it (jsonrpsee's built-in batch path is strictly sequential).
 Each entry still goes through the regular per-request pipeline — response cache, single-flight, witness routing, and per-method metrics apply unchanged — and responses may arrive in any order, matched by `id` as JSON-RPC 2.0 permits.
 `--batch-item-concurrency` (default 16) bounds how many entries of one batch run at once, so a single huge batch cannot monopolize downstream resources against concurrently served requests; set it to 1 to restore sequential execution.
-The `debug_trace_batch_size` histogram records entries per inbound batch.
+The `debug_trace_batch_size` histogram records entries per inbound batch, and CPU burned inside spawned entries is folded back into `x-execution-time-ns` and the request CPU metric, so batch requests do not under-report their cost.
 
 **Response compression:**
 Responses negotiate gzip/zstd per request via the client's `Accept-Encoding` header; clients that do not send it keep receiving identity bodies, so nothing changes for consumers that have not opted in.

@@ -9,6 +9,10 @@
 use std::{
     future::Future,
     pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -21,6 +25,45 @@ use crate::metrics::CpuTimeMetrics;
 
 /// Header name for execution time in nanoseconds.
 pub const TIMING_HEADER_NAME: &str = "x-execution-time-ns";
+
+/// Response-extension marker carrying CPU nanoseconds consumed on other runtime tasks
+/// on behalf of this request (spawned batch entries). The thread-clock sampling below
+/// only sees polls of the request's own future, so off-task work reports its summed CPU
+/// out-of-band and [`TimedResponseFuture`] folds it into the header and metric.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SpawnedCpuNanos(pub u64);
+
+pin_project! {
+    /// Accumulates the polling thread's CPU time across this future's polls into a
+    /// shared counter — the same per-poll measurement [`TimedResponseFuture`] applies to
+    /// the HTTP future, for request work that runs on other tasks where the request's
+    /// own sampler cannot see it. Per-poll sampling stays correct when the task
+    /// migrates worker threads between polls.
+    pub(crate) struct CpuSampled<F> {
+        #[pin]
+        inner: F,
+        sink: Arc<AtomicU64>,
+    }
+}
+
+impl<F> CpuSampled<F> {
+    pub(crate) fn new(inner: F, sink: Arc<AtomicU64>) -> Self {
+        Self { inner, sink }
+    }
+}
+
+impl<F: Future> Future for CpuSampled<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let start = thread_cpu_time();
+        let res = this.inner.poll(cx);
+        let delta = thread_cpu_time().saturating_sub(start);
+        this.sink.fetch_add(delta.as_nanos() as u64, Ordering::Relaxed);
+        res
+    }
+}
 
 /// Tower layer that creates [`TimingHeaderService`] instances.
 #[derive(Debug, Clone, Copy, Default)]
@@ -105,7 +148,11 @@ where
         match res {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(mut response)) => {
-                let cpu_ns = this.cpu_time.as_nanos() as u64;
+                // Work spawned onto other tasks for this request (batch entries) is
+                // invisible to this thread's clock; it reports its summed CPU via the
+                // response extension instead.
+                let spawned = response.extensions().get::<SpawnedCpuNanos>().map_or(0, |s| s.0);
+                let cpu_ns = this.cpu_time.as_nanos() as u64 + spawned;
                 let mut buf = [0u8; 24];
                 if let Some(value_str) = format_u64(cpu_ns, &mut buf) {
                     let header_name = HeaderName::from_static(TIMING_HEADER_NAME);
