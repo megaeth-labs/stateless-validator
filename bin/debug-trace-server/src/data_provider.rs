@@ -219,6 +219,14 @@ pub enum DataProviderError {
     TransactionPending(B256),
     #[error("{stage} fetch exceeded deadline after {elapsed:?}")]
     Timeout { stage: TimeoutStage, elapsed: Duration },
+    /// A frontier block's witness has not been generated upstream yet.
+    ///
+    /// Deliberately distinct from [`Self::Timeout`]: the block exists and the request was
+    /// not too slow — the data simply is not written yet, and the same request will
+    /// succeed shortly. Collapsing it onto the deadline variant is what made "the chain
+    /// has not caught up" indistinguishable from "we are overloaded" for clients.
+    #[error("witness for block {block_number} is not generated yet; retry shortly")]
+    WitnessNotReady { block_number: u64 },
     /// Wrapped in `Arc` so [`shared_to_result`] can clone the pointer across coalesced
     /// callers without losing the `eyre::Error` cause chain (which is the operational
     /// signal for redb / bincode / transport decode errors). `eyre::Error` itself isn't
@@ -944,6 +952,9 @@ fn shared_to_result(
             DataProviderError::Timeout { stage: *stage, elapsed: *elapsed }
         }
         DataProviderError::TransactionNotFound(h) => DataProviderError::TransactionNotFound(*h),
+        DataProviderError::WitnessNotReady { block_number } => {
+            DataProviderError::WitnessNotReady { block_number: *block_number }
+        }
         DataProviderError::TransactionPending(h) => DataProviderError::TransactionPending(*h),
         DataProviderError::Internal(e) => DataProviderError::Internal(Arc::clone(e)),
     })
@@ -1054,6 +1065,22 @@ fn db_tip_height(db: Option<&dyn BlockStore>) -> Option<u64> {
     db.and_then(|db| db.get_canonical_tip().ok().flatten().map(|tip| tip.block_number))
 }
 
+/// Exclusive grace the generator gets for a frontier block's witness before the fetch
+/// falls back to the full provider chain, clamped by [`FRONTIER_GRACE_BUDGET_DIVISOR`].
+///
+/// Rotating to the fallback endpoints on a frontier miss is structurally useless: they are
+/// fed by the same generation pipeline and cannot be ahead of the generator, so every
+/// rotation burns a public-gateway round trip to learn what the generator already said.
+///
+/// Unlike chain sync's twin, this grace carries only one meaning. The request path's
+/// freshness signal is the local DB tip, read fresh from redb on every fetch, so there is
+/// no head-observation anchor here that could go stale and silently disable the routing.
+const FRONTIER_WITNESS_GRACE: Duration = Duration::from_secs(6);
+
+/// The grace's share of the witness budget, so an unavailable generator still leaves the
+/// fallback chain a real budget instead of inheriting a nearly-expired one.
+const FRONTIER_GRACE_BUDGET_DIVISOR: u32 = 2;
+
 /// Whether a block is at or below the local tip. `false` with no local DB — a new block's
 /// witness may still be generating upstream, so unknown conservatively counts as new.
 fn is_old_block(db_tip: Option<u64>, block_number: u64) -> bool {
@@ -1156,6 +1183,28 @@ async fn fetch_witness(
     let metrics = WitnessSourceMetrics::new_for_source(source);
     let start = Instant::now();
 
+    // Frontier blocks: give the generator an exclusive grace before rotating. `db_tip` is
+    // known here (otherwise every block would look frontier and the grace would apply to
+    // deep history too), and the generator must actually be first in a chain that has
+    // somewhere to rotate to — with a single provider the grace changes nothing.
+    let frontier = db_tip.is_some() && !is_old_block(db_tip, block_number) && can_skip_generator;
+    if frontier {
+        let remaining = deadline.saturating_duration_since(start);
+        let grace = FRONTIER_WITNESS_GRACE.min(remaining / FRONTIER_GRACE_BUDGET_DIVISOR);
+        let probe = rpc_client.get_witness_light_first_provider_only(block_number, block_hash);
+        match tokio::time::timeout(grace, probe).await {
+            Ok(w) => {
+                crate::metrics::record_frontier_grace("served");
+                record_witness_success(&metrics, source, start, &w);
+                return Ok(w);
+            }
+            // Grace expired: fall through to the full chain on the remaining budget, which
+            // is the pre-routing shape. The probe is deadline-less by construction, so its
+            // expiry is an internal routing budget and must not look like a failed call.
+            Err(_) => crate::metrics::record_frontier_grace("expired"),
+        }
+    }
+
     match rpc_client
         .get_witness_light_with_deadline_from(skip, block_number, block_hash, Some(deadline))
         .await
@@ -1179,6 +1228,12 @@ async fn fetch_witness(
                 elapsed_ms = start.elapsed().as_millis() as u64,
                 "Witness fetch deadline exceeded",
             );
+            // A frontier block that never produced a witness is not a slow request — the
+            // data does not exist yet. Saying so lets the client retry instead of treating
+            // it as an overload signal, and keeps `deadline_witness` meaning what it says.
+            if frontier {
+                return Err(DataProviderError::WitnessNotReady { block_number });
+            }
             Err(e.into())
         }
     }

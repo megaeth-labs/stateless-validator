@@ -107,6 +107,15 @@ impl RpcMethodMetrics {
     }
 }
 
+/// Outcome of the request path's frontier-witness grace, labeled `(outcome)`.
+const FRONTIER_GRACE_TOTAL: &str = "debug_trace_frontier_grace_total";
+
+/// Records how a frontier block's exclusive generator grace ended: `served` (the witness
+/// appeared within it) or `expired` (fell through to the full provider chain).
+pub fn record_frontier_grace(outcome: &'static str) {
+    counter!(FRONTIER_GRACE_TOTAL, "outcome" => outcome).increment(1);
+}
+
 /// Client-visible error outcomes, labeled `(method, reason)`.
 const RPC_ERRORS_TOTAL: &str = "debug_trace_rpc_errors_total";
 /// Requests abandoned by the client before the handler produced a response, labeled `(method)`.
@@ -129,6 +138,8 @@ pub enum ErrorReason {
     DeadlineBlock,
     /// Deterministically absent: unknown transaction, or a transaction still pending.
     NotFound,
+    /// A frontier block's witness is not generated upstream yet — retryable, not overload.
+    WitnessNotReady,
     /// Rejected at the boundary before any fetch — currently a type-malformed `tracerConfig`.
     InvalidParams,
     /// The tracer ran and failed, or its output could not be serialized.
@@ -144,6 +155,7 @@ impl ErrorReason {
             Self::DeadlineWitness => "deadline_witness",
             Self::DeadlineBlock => "deadline_block",
             Self::NotFound => "not_found",
+            Self::WitnessNotReady => "witness_not_ready",
             Self::InvalidParams => "invalid_params",
             Self::TraceFailed => "trace_failed",
             Self::Internal => "internal",
@@ -155,6 +167,7 @@ impl ErrorReason {
         Self::DeadlineWitness,
         Self::DeadlineBlock,
         Self::NotFound,
+        Self::WitnessNotReady,
         Self::InvalidParams,
         Self::TraceFailed,
         Self::Internal,
@@ -654,6 +667,9 @@ fn pre_register_all_metrics() {
             counter!(RPC_ERRORS_TOTAL, "method" => method, "reason" => reason.as_str())
                 .increment(0);
         }
+    }
+    for outcome in ["served", "expired"] {
+        counter!(FRONTIER_GRACE_TOTAL, "outcome" => outcome).increment(0);
     }
     // Only the Parity `trace_*` pair degrades a failure to a null result.
     for method in [METHOD_TRACE_TRANSACTION, METHOD_TRACE_BLOCK] {

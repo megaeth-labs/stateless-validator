@@ -320,6 +320,10 @@ enum BlockLookup {
 const ERROR_CODE_INTERNAL: i32 = -32000;
 /// Error code for "resource not found" (used for missing blocks / pending txs / deadline).
 const ERROR_CODE_NOT_FOUND: i32 = -32001;
+/// Error code for "the data exists but is not written yet" — a frontier witness still being
+/// generated upstream. Distinct from [`ERROR_CODE_NOT_FOUND`] so a client can tell "retry in
+/// a moment" apart from "this block does not exist" and from an overload signal.
+const ERROR_CODE_NOT_READY: i32 = -32002;
 
 /// Creates a JSON-RPC internal error (code -32000).
 /// Used for execution failures, serialization errors, etc.
@@ -366,6 +370,9 @@ fn data_provider_error_to_rpc_error(e: &DataProviderError) -> jsonrpsee::types::
         DataProviderError::Timeout { .. } => {
             ErrorObjectOwned::owned(ERROR_CODE_NOT_FOUND, e.to_string(), None::<()>)
         }
+        DataProviderError::WitnessNotReady { .. } => {
+            ErrorObjectOwned::owned(ERROR_CODE_NOT_READY, e.to_string(), None::<()>)
+        }
         DataProviderError::Internal(_) => {
             ErrorObjectOwned::owned(ERROR_CODE_INTERNAL, "internal error".to_string(), None::<()>)
         }
@@ -387,6 +394,7 @@ fn error_reason(e: &DataProviderError) -> ErrorReason {
         DataProviderError::TransactionNotFound(_) | DataProviderError::TransactionPending(_) => {
             ErrorReason::NotFound
         }
+        DataProviderError::WitnessNotReady { .. } => ErrorReason::WitnessNotReady,
         DataProviderError::Internal(_) => ErrorReason::Internal,
     }
 }
@@ -774,6 +782,7 @@ impl TraceRpcServer for RpcContext {
             Err(
                 e @ (DataProviderError::TransactionNotFound(_) |
                 DataProviderError::TransactionPending(_) |
+                DataProviderError::WitnessNotReady { .. } |
                 DataProviderError::Timeout { .. }),
             ) => {
                 // A null result is still a served request, so it must be counted as one or
@@ -860,6 +869,19 @@ mod tests {
         for e in [&witness, &block, &missing] {
             assert_eq!(data_provider_error_to_rpc_error(e).code(), ERROR_CODE_NOT_FOUND);
         }
+
+        // "not generated yet" is deliberately NOT one of them: it gets its own code so a
+        // client can tell a retryable frontier lag apart from a nonexistent block.
+        let not_ready = DataProviderError::WitnessNotReady { block_number: 23_461_272 };
+        assert_eq!(error_reason(&not_ready), ErrorReason::WitnessNotReady);
+        let rendered = data_provider_error_to_rpc_error(&not_ready);
+        assert_eq!(rendered.code(), ERROR_CODE_NOT_READY);
+        assert_ne!(rendered.code(), ERROR_CODE_NOT_FOUND);
+        assert!(
+            rendered.message().contains("not generated yet"),
+            "the message must tell the client to retry, got: {}",
+            rendered.message()
+        );
     }
 
     /// `ErrorReason::ALL` must stay in step with the enum, and the labels must be unique —
