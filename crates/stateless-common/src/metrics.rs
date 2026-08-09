@@ -66,6 +66,16 @@ pub enum RpcAttemptOutcome {
     /// The attempt hit the per-attempt timeout: the provider accepted the
     /// request but did not answer within the budget (a stall).
     Timeout,
+    /// The attempt was abandoned because the *logical call's* deadline elapsed while it
+    /// was still running.
+    ///
+    /// Deliberately separate from [`Self::Timeout`]: the attempt window was clamped to
+    /// whatever budget was left, so the provider never got a fair round trip and blaming
+    /// it for a stall would be wrong. But the attempt did happen and did consume that
+    /// budget, and recording nothing at all — as this path used to — makes a provider that
+    /// swallows the entire remaining budget indistinguishable from one that was never
+    /// called. That ambiguity is exactly what blocked the 2026-08-09 timeout diagnosis.
+    DeadlineClamped,
 }
 
 impl RpcAttemptOutcome {
@@ -73,6 +83,7 @@ impl RpcAttemptOutcome {
     pub fn as_str(&self) -> &'static str {
         match self {
             RpcAttemptOutcome::Success => "success",
+            RpcAttemptOutcome::DeadlineClamped => "deadline_clamped",
             RpcAttemptOutcome::Error => "error",
             RpcAttemptOutcome::Timeout => "timeout",
         }
@@ -109,6 +120,15 @@ pub trait RpcMetrics: Send + Sync {
     ///
     /// Default: no-op. Implement to track retry volume separately from logical errors.
     fn on_rpc_retry(&self, _method: RpcMethod) {}
+
+    /// Called once per provider attempt with the time spent waiting for a concurrency
+    /// permit before the attempt could start.
+    ///
+    /// Separates "the endpoint was slow" from "we were queued behind our own concurrency
+    /// cap" — two causes with opposite fixes that are otherwise indistinguishable, because
+    /// the permit wait sits inside the caller's deadline and emits no signal of its own.
+    /// Default: no-op.
+    fn on_rpc_permit_wait(&self, _method: RpcMethod, _wait_secs: f64) {}
 
     /// Called when a logical call gives up because its overall deadline elapsed.
     ///

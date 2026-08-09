@@ -376,6 +376,18 @@ fn record_upstream_attempt(
         .record(duration_secs);
 }
 
+/// Time an upstream attempt spent queued behind our own concurrency cap, labeled `(method)`.
+const UPSTREAM_PERMIT_WAIT_SECONDS: &str = "debug_trace_upstream_permit_wait_seconds";
+
+/// Records how long an upstream attempt waited for a concurrency permit.
+///
+/// This wait sits inside the caller's deadline, so without it "the endpoint was slow" and
+/// "we were queued behind `--witness-max-concurrent-requests`" are the same observation —
+/// and they have opposite fixes.
+fn record_upstream_permit_wait(method: &'static str, wait_secs: f64) {
+    histogram!(UPSTREAM_PERMIT_WAIT_SECONDS, "method" => method).record(wait_secs);
+}
+
 /// Records one logical upstream call giving up because its overall deadline elapsed.
 fn record_upstream_deadline_exceeded(method: &'static str) {
     counter!(UPSTREAM_DEADLINE_EXCEEDED_TOTAL, "method" => method).increment(1);
@@ -787,6 +799,10 @@ impl stateless_common::RpcMetrics for TraceRpcMetrics {
             outcome.as_str(),
             duration_secs,
         );
+    }
+
+    fn on_rpc_permit_wait(&self, method: stateless_common::metrics::RpcMethod, wait_secs: f64) {
+        record_upstream_permit_wait(upstream_label_for(method), wait_secs);
     }
 
     fn on_rpc_deadline_exceeded(
