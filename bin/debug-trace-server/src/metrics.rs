@@ -72,18 +72,24 @@ const ALL_METHODS: &[&str] = &[
     METHOD_TRACE_TRANSACTION,
 ];
 
-fn resolve_method(method: &str) -> &'static str {
+/// Maps an arbitrary method string onto one of the known `&'static str` labels, so a
+/// caller that only has a borrowed name can still label a metric without allocating.
+/// Unknown methods collapse to `"unknown"`, keeping label cardinality bounded against
+/// arbitrary client input.
+pub fn resolve_method(method: &str) -> &'static str {
     ALL_METHODS.iter().find(|&&m| m == method).copied().unwrap_or("unknown")
 }
 
 /// RPC method metrics with method label.
+///
+/// `rpc_errors_total` deliberately does *not* live here: it needs a second `reason` label
+/// (see [`ErrorReason`]) and is emitted through [`record_rpc_error`] instead, so the two
+/// label sets never collide on one metric name.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
 pub struct RpcMethodMetrics {
     /// Total number of RPC requests
     rpc_requests_total: Counter,
-    /// Total number of RPC errors
-    rpc_errors_total: Counter,
     /// Duration of RPC method calls in seconds
     request_duration_seconds: Histogram,
 }
@@ -99,11 +105,60 @@ impl RpcMethodMetrics {
         self.rpc_requests_total.increment(1);
         self.request_duration_seconds.record(duration_secs);
     }
+}
 
-    /// Records an RPC error.
-    pub fn record_error(&self) {
-        self.rpc_errors_total.increment(1);
+/// Client-visible error outcomes, labeled `(method, reason)`.
+const RPC_ERRORS_TOTAL: &str = "debug_trace_rpc_errors_total";
+/// Requests abandoned by the client before the handler produced a response, labeled `(method)`.
+const RPC_REQUESTS_CANCELLED_TOTAL: &str = "debug_trace_requests_cancelled_total";
+/// Requests answered with a JSON `null` result because an underlying failure was
+/// deliberately degraded rather than surfaced, labeled `(method, reason)`.
+const RPC_NULL_RESULTS_TOTAL: &str = "debug_trace_null_results_total";
+
+/// Why a request failed, as seen by the client.
+///
+/// Exists because a single unlabeled error counter cannot answer the one question that
+/// matters operationally — "did anyone get a timeout?" — since a malformed `tracerConfig`
+/// (`-32602`), a missing transaction (`-32001`), a blown deadline (`-32001`) and a trace
+/// execution failure (`-32000`) otherwise collapse into the same series.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorReason {
+    /// The witness sub-deadline elapsed — the frontier-witness case operators must alert on.
+    DeadlineWitness,
+    /// The block-pipeline deadline elapsed (header, full block, contracts, tag resolution).
+    DeadlineBlock,
+    /// Deterministically absent: unknown transaction, or a transaction still pending.
+    NotFound,
+    /// Rejected at the boundary before any fetch — currently a type-malformed `tracerConfig`.
+    InvalidParams,
+    /// The tracer ran and failed, or its output could not be serialized.
+    TraceFailed,
+    /// Transport decode, DB, or another internal fault.
+    Internal,
+}
+
+impl ErrorReason {
+    /// The `reason` label value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeadlineWitness => "deadline_witness",
+            Self::DeadlineBlock => "deadline_block",
+            Self::NotFound => "not_found",
+            Self::InvalidParams => "invalid_params",
+            Self::TraceFailed => "trace_failed",
+            Self::Internal => "internal",
+        }
     }
+
+    /// Every variant, for pre-registration and tests.
+    pub const ALL: &'static [Self] = &[
+        Self::DeadlineWitness,
+        Self::DeadlineBlock,
+        Self::NotFound,
+        Self::InvalidParams,
+        Self::TraceFailed,
+        Self::Internal,
+    ];
 }
 
 /// Global RPC metrics (singleton).
@@ -584,6 +639,32 @@ fn pre_register_all_metrics() {
     let _ = RpcMethodMetrics::new_for_method(METHOD_TRACE_BLOCK);
     let _ = RpcMethodMetrics::new_for_method(METHOD_TRACE_TRANSACTION);
 
+    // Request Layer: the accounting identity's error/cancellation terms. Pre-registering the
+    // full (method x reason) grid means a dashboard can subtract zeros instead of missing
+    // series, and `rate(...{reason="deadline_witness"})` alerts on absence from boot.
+    for method in [
+        METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+        METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
+        METHOD_DEBUG_TRACE_TRANSACTION,
+        METHOD_TRACE_BLOCK,
+        METHOD_TRACE_TRANSACTION,
+    ] {
+        counter!(RPC_REQUESTS_CANCELLED_TOTAL, "method" => method).increment(0);
+        for reason in ErrorReason::ALL {
+            counter!(RPC_ERRORS_TOTAL, "method" => method, "reason" => reason.as_str())
+                .increment(0);
+        }
+    }
+    // Only the Parity `trace_*` pair degrades a failure to a null result.
+    for method in [METHOD_TRACE_TRANSACTION, METHOD_TRACE_BLOCK] {
+        for reason in
+            [ErrorReason::DeadlineWitness, ErrorReason::DeadlineBlock, ErrorReason::NotFound]
+        {
+            counter!(RPC_NULL_RESULTS_TOTAL, "method" => method, "reason" => reason.as_str())
+                .increment(0);
+        }
+    }
+
     // Request Layer: global
     let _ = RpcGlobalMetrics::create();
 
@@ -740,10 +821,36 @@ pub fn record_rpc_request(method: &str, duration_secs: f64) {
     RpcMethodMetrics::new_for_method(method).record_request(duration_secs);
 }
 
-/// Records an RPC error for a specific method.
-pub fn record_rpc_error(method: &str) {
+/// Records a client-visible RPC error, attributed to `reason`.
+///
+/// Together with [`record_rpc_request`], [`record_request_cancelled`] and
+/// [`record_request_shape`] this closes the per-method accounting identity
+/// `request_shape_total = rpc_requests_total + rpc_errors_total + requests_cancelled_total`,
+/// which is what makes "no client saw a timeout" a checkable statement rather than an
+/// inference from three subtracted counters.
+pub fn record_rpc_error(method: &str, reason: ErrorReason) {
     let method = resolve_method(strip_timed_prefix(method));
-    RpcMethodMetrics::new_for_method(method).record_error();
+    counter!(RPC_ERRORS_TOTAL, "method" => method, "reason" => reason.as_str()).increment(1);
+}
+
+/// Records a request whose handler future was dropped before producing a response —
+/// in practice a client that hung up or timed out on its own side.
+///
+/// Recorded from the RPC middleware rather than the handlers: it is the only layer that
+/// observes every entry (single calls *and* batch entries) and still sees the drop.
+pub fn record_request_cancelled(method: &str) {
+    let method = resolve_method(strip_timed_prefix(method));
+    counter!(RPC_REQUESTS_CANCELLED_TOTAL, "method" => method).increment(1);
+}
+
+/// Records a request answered with a JSON `null` result after an underlying failure was
+/// deliberately degraded (the Parity `trace_*` compatibility behaviour).
+///
+/// The request still counts as served by [`record_rpc_request`], so the accounting identity
+/// holds; this counter is what keeps the swallowed failure visible instead of silent.
+pub fn record_null_result(method: &str, reason: ErrorReason) {
+    let method = resolve_method(strip_timed_prefix(method));
+    counter!(RPC_NULL_RESULTS_TOTAL, "method" => method, "reason" => reason.as_str()).increment(1);
 }
 
 /// Maps an [`RpcMethod`] to the `method` label used by the upstream attempt metrics.

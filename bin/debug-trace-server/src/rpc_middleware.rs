@@ -113,6 +113,47 @@ fn stamp_entry_cpu(mut rp: MethodResponse, entry_cpu: &AtomicU64) -> MethodRespo
     rp
 }
 
+/// Counts a request whose future was dropped before it produced a response.
+///
+/// The drop is the only observable trace of a client hanging up: jsonrpsee cancels the
+/// handler by dropping its future, and every completion-time metric (`rpc_requests_total`,
+/// `rpc_errors_total`, `request_duration_seconds`) is by definition never reached. Placing
+/// the guard here rather than in the handlers is what makes it cover batch entries too —
+/// this layer is the only one that sees every entry.
+struct CancelGuard {
+    /// `None` once the request produced a response, which disarms the drop.
+    method: Option<&'static str>,
+}
+
+impl CancelGuard {
+    fn new(method: &str) -> Self {
+        Self {
+            method: Some(crate::metrics::resolve_method(crate::metrics::strip_timed_prefix(
+                method,
+            ))),
+        }
+    }
+
+    /// Marks the request as answered, so dropping the guard records nothing.
+    fn settle(mut self) {
+        self.method = None;
+    }
+
+    /// Whether dropping now would count a cancellation.
+    #[cfg(test)]
+    fn armed(&self) -> bool {
+        self.method.is_some()
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if let Some(method) = self.method {
+            crate::metrics::record_request_cancelled(method);
+        }
+    }
+}
+
 /// Passes single calls and notifications through untouched; overrides only `batch`.
 #[derive(Clone)]
 pub(crate) struct ConcurrentBatch<S> {
@@ -137,7 +178,13 @@ where
         &self,
         request: Request<'a>,
     ) -> impl Future<Output = Self::MethodResponse> + Send + 'a {
-        self.service.call(request)
+        let service = self.service.clone();
+        let guard = CancelGuard::new(request.method_name());
+        async move {
+            let rp = service.call(request).await;
+            guard.settle();
+            rp
+        }
     }
 
     fn notification<'a>(
@@ -171,9 +218,14 @@ where
                     match entry {
                         Ok(BatchEntry::Call(req)) => {
                             let service = service.clone();
+                            let guard = CancelGuard::new(req.method_name());
                             let req = owned_request(req);
                             tasks.spawn(CpuSampled::new(
-                                async move { Some(service.call(req).await) },
+                                async move {
+                                    let rp = service.call(req).await;
+                                    guard.settle();
+                                    Some(rp)
+                                },
                                 entry_cpu.clone(),
                             ));
                         }
@@ -324,6 +376,25 @@ mod tests {
 
     async fn post_raw(addr: SocketAddr, body: String) -> Value {
         serde_json::from_str(&post_text(addr, body).await).unwrap()
+    }
+
+    /// The cancel guard is armed on creation and disarmed by `settle`, so only a request
+    /// that never produced a response can be counted as cancelled. Unknown methods collapse
+    /// to the bounded `"unknown"` label rather than letting client input drive cardinality.
+    #[test]
+    fn cancel_guard_arms_until_settled() {
+        let g = CancelGuard::new("debug_traceBlockByNumber");
+        assert!(g.armed(), "a fresh guard must count a drop as a cancellation");
+        assert_eq!(g.method, Some("debug_traceBlockByNumber"));
+        g.settle();
+
+        // `timed_` aliases share the underlying method's label.
+        assert_eq!(
+            CancelGuard::new("timed_debug_traceTransaction").method,
+            Some("debug_traceTransaction")
+        );
+        // Arbitrary client input must not widen label cardinality.
+        assert_eq!(CancelGuard::new("not_a_method").method, Some("unknown"));
     }
 
     fn batch_of(method: &str, n: u64) -> String {

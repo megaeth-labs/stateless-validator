@@ -20,10 +20,12 @@ use stateless_core::chain_spec::ChainSpec;
 use tracing::{trace, warn};
 
 use crate::{
-    data_provider::{BlockData, DataProvider, DataProviderError, SLOW_STAGE_THRESHOLD_MS},
+    data_provider::{
+        BlockData, DataProvider, DataProviderError, SLOW_STAGE_THRESHOLD_MS, TimeoutStage,
+    },
     metrics::{
-        self, BlockDataEvictionMetrics, CacheStats, DataSourceMetrics, EvmExecutionMetrics,
-        METHOD_DEBUG_TRACE_BLOCK_BY_HASH, METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+        self, BlockDataEvictionMetrics, CacheStats, DataSourceMetrics, ErrorReason,
+        EvmExecutionMetrics, METHOD_DEBUG_TRACE_BLOCK_BY_HASH, METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
         METHOD_DEBUG_TRACE_TRANSACTION, METHOD_TRACE_BLOCK, METHOD_TRACE_TRANSACTION,
         ResponseSizeMetrics, RpcGlobalMetrics, SingleFlightMetrics,
     },
@@ -195,7 +197,7 @@ impl RpcContext {
         block_hash: &B256,
         error: TraceError,
     ) -> jsonrpsee::types::ErrorObjectOwned {
-        metrics::record_rpc_error(method);
+        metrics::record_rpc_error(method, ErrorReason::TraceFailed);
         if matches!(error, TraceError::Data(_)) && self.data_provider.evict_block_data(block_hash) {
             BlockDataEvictionMetrics::new_for_method(method).record();
         }
@@ -239,18 +241,18 @@ impl RpcContext {
         let t0 = Instant::now();
         let block_num =
             self.data_provider.resolve_block_number(block_number, deadline).await.map_err(|e| {
-                metrics::record_rpc_error(method);
+                metrics::record_rpc_error(method, error_reason(&e));
                 rpc_err(format!("Failed to resolve block number: {e}"))
             })?;
         let resolve_ms = t0.elapsed().as_millis();
         tracing::Span::current().record("block_number", block_num);
 
         let t1 = Instant::now();
-        let block_hash =
-            self.data_provider.resolve_canonical_hash(block_num, deadline).await.map_err(|e| {
-                metrics::record_rpc_error(method);
-                data_provider_error_to_rpc_error(&e)
-            })?;
+        let block_hash = self
+            .data_provider
+            .resolve_canonical_hash(block_num, deadline)
+            .await
+            .map_err(|e| data_provider_failure(method, &e))?;
         let resolve_hash_ms = t1.elapsed().as_millis();
 
         if let Some(cached) =
@@ -264,10 +266,7 @@ impl RpcContext {
             .data_provider
             .get_block_data_by_hash_with_deadline(block_hash, deadline)
             .await
-            .map_err(|e| {
-                metrics::record_rpc_error(method);
-                data_provider_error_to_rpc_error(&e)
-            })?;
+            .map_err(|e| data_provider_failure(method, &e))?;
         let fetch_ms = t2.elapsed().as_millis();
 
         if resolve_ms >= SLOW_STAGE_THRESHOLD_MS ||
@@ -348,7 +347,7 @@ fn classify_and_gate(
     let shape = RequestShape::classify(opts);
     metrics::record_request_shape(method_name, shape.label());
     if let RequestShape::InvalidTracerConfig { label, error } = &shape {
-        metrics::record_rpc_error(method_name);
+        metrics::record_rpc_error(method_name, ErrorReason::InvalidParams);
         return Err(invalid_params_err(format!("invalid tracerConfig for {label}: {error}")));
     }
     Ok(shape.cache_variant())
@@ -371,6 +370,37 @@ fn data_provider_error_to_rpc_error(e: &DataProviderError) -> jsonrpsee::types::
             ErrorObjectOwned::owned(ERROR_CODE_INTERNAL, "internal error".to_string(), None::<()>)
         }
     }
+}
+
+/// The `reason` label for a [`DataProviderError`].
+///
+/// Split out from [`data_provider_error_to_rpc_error`] because the JSON-RPC code is coarser
+/// than the label on purpose: three distinct reasons share `-32001`, and telling a blown
+/// witness deadline apart from a genuinely unknown transaction is exactly what the metric
+/// is for.
+fn error_reason(e: &DataProviderError) -> ErrorReason {
+    match e {
+        DataProviderError::Timeout { stage: TimeoutStage::Witness, .. } => {
+            ErrorReason::DeadlineWitness
+        }
+        DataProviderError::Timeout { stage: TimeoutStage::Block, .. } => ErrorReason::DeadlineBlock,
+        DataProviderError::TransactionNotFound(_) | DataProviderError::TransactionPending(_) => {
+            ErrorReason::NotFound
+        }
+        DataProviderError::Internal(_) => ErrorReason::Internal,
+    }
+}
+
+/// Records a [`DataProviderError`] against `method` and renders it as an RPC error.
+///
+/// Single funnel for every fetch-path failure so the counter and the returned code are
+/// emitted from one place and cannot drift apart as new call sites appear.
+fn data_provider_failure(
+    method: &str,
+    e: &DataProviderError,
+) -> jsonrpsee::types::ErrorObjectOwned {
+    metrics::record_rpc_error(method, error_reason(e));
+    data_provider_error_to_rpc_error(e)
 }
 
 // Trace Computation Helpers
@@ -580,10 +610,11 @@ impl DebugTraceRpcServer for RpcContext {
             return Ok(cached);
         }
 
-        let data = self.data_provider.get_block_data_by_hash(block_hash).await.map_err(|e| {
-            metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
-            data_provider_error_to_rpc_error(&e)
-        })?;
+        let data = self
+            .data_provider
+            .get_block_data_by_hash(block_hash)
+            .await
+            .map_err(|e| data_provider_failure(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, &e))?;
         let block_num = data.block.header.number;
         let result = self.compute_debug_trace(&data, METHOD_DEBUG_TRACE_BLOCK_BY_HASH, opts)?;
 
@@ -616,11 +647,11 @@ impl DebugTraceRpcServer for RpcContext {
         // the cache variant itself is unused.
         let _ = classify_and_gate(METHOD_DEBUG_TRACE_TRANSACTION, &opts)?;
 
-        let (data, tx_index) =
-            self.data_provider.get_block_data_for_tx(tx_hash).await.map_err(|e| {
-                metrics::record_rpc_error(METHOD_DEBUG_TRACE_TRANSACTION);
-                data_provider_error_to_rpc_error(&e)
-            })?;
+        let (data, tx_index) = self
+            .data_provider
+            .get_block_data_for_tx(tx_hash)
+            .await
+            .map_err(|e| data_provider_failure(METHOD_DEBUG_TRACE_TRANSACTION, &e))?;
 
         let evm_start = Instant::now();
         let result = crate::tracing_executor::trace_transaction(
@@ -741,12 +772,23 @@ impl TraceRpcServer for RpcContext {
         let (data, tx_index) = match self.data_provider.get_block_data_for_tx(tx_hash).await {
             Ok(result) => result,
             Err(
-                DataProviderError::TransactionNotFound(_) |
+                e @ (DataProviderError::TransactionNotFound(_) |
                 DataProviderError::TransactionPending(_) |
-                DataProviderError::Timeout { .. },
-            ) => return Ok(RawJson::null()),
-            Err(DataProviderError::Internal(_)) => {
-                metrics::record_rpc_error(METHOD_TRACE_TRANSACTION);
+                DataProviderError::Timeout { .. }),
+            ) => {
+                // A null result is still a served request, so it must be counted as one or
+                // the accounting identity silently loses it. The degraded failure stays
+                // visible on its own counter — a timeout hidden behind `null` is precisely
+                // the case that used to be invisible from both sides.
+                metrics::record_null_result(METHOD_TRACE_TRANSACTION, error_reason(&e));
+                metrics::record_rpc_request(
+                    METHOD_TRACE_TRANSACTION,
+                    start.elapsed().as_secs_f64(),
+                );
+                return Ok(RawJson::null());
+            }
+            Err(e @ DataProviderError::Internal(_)) => {
+                metrics::record_rpc_error(METHOD_TRACE_TRANSACTION, error_reason(&e));
                 return Err(rpc_err("internal error".to_string()));
             }
         };
@@ -786,6 +828,52 @@ impl TraceRpcServer for RpcContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Every `DataProviderError` maps to a distinct, stable `reason` label, and the two
+    /// deadline stages stay separable — the whole point of the label is that a blown
+    /// witness deadline is not the same event as an unknown transaction, even though both
+    /// leave as `-32001`.
+    #[test]
+    fn error_reason_separates_deadlines_from_not_found() {
+        use std::time::Duration;
+
+        use crate::data_provider::TimeoutStage;
+
+        let witness = DataProviderError::Timeout {
+            stage: TimeoutStage::Witness,
+            elapsed: Duration::from_secs(8),
+        };
+        let block = DataProviderError::Timeout {
+            stage: TimeoutStage::Block,
+            elapsed: Duration::from_secs(13),
+        };
+        let missing = DataProviderError::TransactionNotFound(B256::ZERO);
+        let pending = DataProviderError::TransactionPending(B256::ZERO);
+        let internal = DataProviderError::Internal(std::sync::Arc::new(eyre::eyre!("boom")));
+
+        assert_eq!(error_reason(&witness), ErrorReason::DeadlineWitness);
+        assert_eq!(error_reason(&block), ErrorReason::DeadlineBlock);
+        assert_eq!(error_reason(&missing), ErrorReason::NotFound);
+        assert_eq!(error_reason(&pending), ErrorReason::NotFound);
+        assert_eq!(error_reason(&internal), ErrorReason::Internal);
+
+        // All three of these share one JSON-RPC code, which is exactly why the label exists.
+        for e in [&witness, &block, &missing] {
+            assert_eq!(data_provider_error_to_rpc_error(e).code(), ERROR_CODE_NOT_FOUND);
+        }
+    }
+
+    /// `ErrorReason::ALL` must stay in step with the enum, and the labels must be unique —
+    /// a duplicate would silently merge two outcomes into one series.
+    #[test]
+    fn error_reason_labels_are_unique_and_complete() {
+        let labels: Vec<_> = ErrorReason::ALL.iter().map(|r| r.as_str()).collect();
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "duplicate reason label in {labels:?}");
+        assert!(labels.contains(&"deadline_witness"), "the alerting label must exist");
+    }
+
     use crate::response_cache::ResponseCacheConfig;
 
     #[test]
