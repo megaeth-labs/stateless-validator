@@ -548,7 +548,10 @@ mod tests {
     /// hash before the lookup.
     #[test]
     fn reorg_invalidates_hash_keyed_entries() {
-        use crate::response_cache::{CachedResource, ResponseCacheConfig, ResponseVariant};
+        use crate::{
+            raw_json::RawJson,
+            response_cache::{CachedResource, ResponseCacheConfig, ResponseVariant},
+        };
 
         let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
         let h1 = B256::from([1u8; 32]);
@@ -558,8 +561,9 @@ mod tests {
             (CachedResource::TraceBlock, h1),
             (CachedResource::DebugTraceBlock, h2),
         ];
+        let response = RawJson::try_new(&serde_json::json!({"v": 1})).expect("serialize");
         for (resource, hash) in entries {
-            cache.insert(resource, hash, ResponseVariant::Default, &serde_json::json!({"v": 1}));
+            cache.insert(resource, hash, ResponseVariant::Default, &response);
         }
 
         let hooks =

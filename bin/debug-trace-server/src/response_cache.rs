@@ -1,6 +1,9 @@
 //! HTTP RPC Response Cache
 //!
 //! Caches pre-serialized JSON responses for the block-level trace methods.
+//! Entries are [`RawJson`] — the exact bytes produced by the fill request's one
+//! serialization — and a hit is an `Arc` clone spliced verbatim into the reply, so the
+//! JSON tree is never re-parsed or re-serialized on either side of the cache.
 //!
 //! # Design
 //!
@@ -33,7 +36,10 @@ use alloy_rpc_types_trace::geth::{
 use quick_cache::{Lifecycle, Weighter, sync::Cache};
 use tracing::debug;
 
-use crate::metrics::{CACHE_TYPE_DEBUG_TRACE, CACHE_TYPE_TRACE, CacheMetrics, CacheStats};
+use crate::{
+    metrics::{CACHE_TYPE_DEBUG_TRACE, CACHE_TYPE_TRACE, CacheMetrics, CacheStats},
+    raw_json::RawJson,
+};
 
 // Configuration
 /// Default maximum memory for the response cache (1 GB).
@@ -285,45 +291,15 @@ impl ResponseCacheKey {
     }
 }
 
-// Cached Response
-/// A cached JSON response entry.
-#[derive(Debug, Clone)]
-pub struct CachedResponse {
-    /// Pre-serialized JSON result.
-    json: Arc<str>,
-    /// Cached byte length for efficient weight calculation.
-    byte_len: usize,
-}
-
-impl CachedResponse {
-    /// Creates a new cached response by serializing the JSON value (no clone of the tree).
-    pub fn new(value: &serde_json::Value) -> Self {
-        let json = serde_json::to_string(value).unwrap_or_default();
-        let byte_len = json.len();
-        Self { json: json.into(), byte_len }
-    }
-
-    /// Returns the JSON value.
-    pub fn as_value(&self) -> serde_json::Value {
-        serde_json::from_str(&self.json).unwrap_or(serde_json::Value::Null)
-    }
-
-    /// Returns the byte length of the cached JSON.
-    #[cfg(test)]
-    pub const fn byte_len(&self) -> usize {
-        self.byte_len
-    }
-}
-
 // Cache Weighter
 /// Weighter for response cache entries based on memory usage.
 #[derive(Debug, Clone, Default)]
 pub struct ResponseCacheWeighter;
 
-impl Weighter<ResponseCacheKey, CachedResponse> for ResponseCacheWeighter {
-    fn weight(&self, _key: &ResponseCacheKey, val: &CachedResponse) -> u64 {
+impl Weighter<ResponseCacheKey, RawJson> for ResponseCacheWeighter {
+    fn weight(&self, _key: &ResponseCacheKey, val: &RawJson) -> u64 {
         const ENTRY_OVERHEAD: u64 = 128;
-        ENTRY_OVERHEAD + val.byte_len as u64
+        ENTRY_OVERHEAD + val.byte_len() as u64
     }
 }
 
@@ -372,12 +348,12 @@ struct EvictionCleanupLifecycle {
     index: Arc<HashIndex>,
 }
 
-impl Lifecycle<ResponseCacheKey, CachedResponse> for EvictionCleanupLifecycle {
+impl Lifecycle<ResponseCacheKey, RawJson> for EvictionCleanupLifecycle {
     type RequestState = ();
 
     fn begin_request(&self) -> Self::RequestState {}
 
-    fn on_evict(&self, _state: &mut (), key: ResponseCacheKey, _val: CachedResponse) {
+    fn on_evict(&self, _state: &mut (), key: ResponseCacheKey, _val: RawJson) {
         self.index.remove_key(&key);
     }
 }
@@ -392,7 +368,7 @@ pub struct ResponseCache {
 struct ResponseCacheInner {
     cache: Cache<
         ResponseCacheKey,
-        CachedResponse,
+        RawJson,
         ResponseCacheWeighter,
         RandomState,
         EvictionCleanupLifecycle,
@@ -452,13 +428,14 @@ impl ResponseCache {
         }
     }
 
-    /// Retrieves a cached response for the exact block hash, recording hit/miss accounting.
+    /// Retrieves a cached response for the exact block hash, recording hit/miss
+    /// accounting. A hit is an `Arc` clone of the stored bytes — no parsing, no copy.
     pub fn get(
         &self,
         resource: CachedResource,
         block_hash: B256,
         variant: ResponseVariant,
-    ) -> Option<serde_json::Value> {
+    ) -> Option<RawJson> {
         let key = ResponseCacheKey::new(resource, block_hash, variant);
         let result = self.inner.cache.get(&key);
         let metrics = self.metrics_for_resource(resource);
@@ -469,12 +446,11 @@ impl ResponseCache {
             self.inner.misses.fetch_add(1, Ordering::Relaxed);
             metrics.record_miss();
         }
-        result.map(|r| r.as_value())
+        result
     }
 
-    /// Inserts a response computed for the exact block hash. Takes the response by
-    /// reference: serialization reads it in place, so multi-MB trace responses are never
-    /// deep-cloned on the fill path.
+    /// Inserts a response computed for the exact block hash, sharing the reply's
+    /// already-serialized bytes (an `Arc` clone — nothing is re-serialized or copied).
     ///
     /// The index is registered *before* the cache write: if `quick_cache` immediately
     /// weight-evicts the just-inserted key, `on_evict -> remove_key` then self-heals the
@@ -488,11 +464,11 @@ impl ResponseCache {
         resource: CachedResource,
         block_hash: B256,
         variant: ResponseVariant,
-        response: &serde_json::Value,
+        response: &RawJson,
     ) {
         let key = ResponseCacheKey::new(resource, block_hash, variant);
         self.inner.index.insert(key);
-        self.inner.cache.insert(key, CachedResponse::new(response));
+        self.inner.cache.insert(key, response.clone());
         self.update_size_metrics();
     }
 
@@ -816,7 +792,8 @@ mod tests {
     fn test_cache_insert_and_get() {
         let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
         let hash = B256::from([1u8; 32]);
-        let value = json!([{"txHash": "0x01", "result": {}}]);
+        let value =
+            RawJson::try_new(&json!([{"txHash": "0x01", "result": {}}])).expect("serialize");
         assert!(cache.is_empty());
         assert_eq!((cache.len(), cache.weight()), (0, 0));
 
@@ -824,9 +801,12 @@ mod tests {
             cache.get(CachedResource::DebugTraceBlock, hash, ResponseVariant::Default).is_none()
         );
         cache.insert(CachedResource::DebugTraceBlock, hash, ResponseVariant::Default, &value);
-        assert_eq!(
-            cache.get(CachedResource::DebugTraceBlock, hash, ResponseVariant::Default),
-            Some(value)
+        let hit = cache
+            .get(CachedResource::DebugTraceBlock, hash, ResponseVariant::Default)
+            .expect("inserted entry must hit");
+        assert!(
+            hit.shares_bytes_with(&value),
+            "a hit must be an Arc clone of the inserted bytes, not a copy"
         );
 
         assert!(!cache.is_empty());
@@ -847,17 +827,30 @@ mod tests {
             CachedResource::DebugTraceBlock,
             h1,
             ResponseVariant::Default,
-            &json!({"v": 1}),
+            &RawJson::try_new(&json!({"v": 1})).expect("serialize"),
         );
-        cache.insert(CachedResource::TraceBlock, h1, ResponseVariant::Default, &json!({"v": 2}));
-        cache.insert(CachedResource::DebugTraceBlock, h2, call, &json!({"v": 3}));
+        cache.insert(
+            CachedResource::TraceBlock,
+            h1,
+            ResponseVariant::Default,
+            &RawJson::try_new(&json!({"v": 2})).expect("serialize"),
+        );
+        cache.insert(
+            CachedResource::DebugTraceBlock,
+            h2,
+            call,
+            &RawJson::try_new(&json!({"v": 3})).expect("serialize"),
+        );
         assert_eq!(cache.len(), 3);
 
         // Every variant cached for the reverted hash goes; other hashes survive.
         cache.invalidate_blocks(&[h1]);
         assert!(cache.get(CachedResource::DebugTraceBlock, h1, ResponseVariant::Default).is_none());
         assert!(cache.get(CachedResource::TraceBlock, h1, ResponseVariant::Default).is_none());
-        assert_eq!(cache.get(CachedResource::DebugTraceBlock, h2, call), Some(json!({"v": 3})));
+        assert_eq!(
+            cache.get(CachedResource::DebugTraceBlock, h2, call).map(|r| r.as_str().to_owned()),
+            Some(r#"{"v":3}"#.to_owned())
+        );
         assert_eq!(cache.len(), 1);
 
         cache.invalidate_all();
@@ -872,22 +865,22 @@ mod tests {
         let call = ResponseVariant::CallTracer(CallConfigKey::default());
         let prestate = ResponseVariant::PrestateTracer(PreStateConfigKey::default());
 
-        cache.insert(CachedResource::DebugTraceBlock, hash, call, &json!({"tracer": "call"}));
-        cache.insert(
-            CachedResource::DebugTraceBlock,
-            hash,
-            prestate,
-            &json!({"tracer": "prestate"}),
-        );
+        let call_response = RawJson::try_new(&json!({"tracer": "call"})).expect("serialize");
+        let prestate_response =
+            RawJson::try_new(&json!({"tracer": "prestate"})).expect("serialize");
+        cache.insert(CachedResource::DebugTraceBlock, hash, call, &call_response);
+        cache.insert(CachedResource::DebugTraceBlock, hash, prestate, &prestate_response);
 
         assert_eq!(cache.len(), 2);
-        assert_eq!(
-            cache.get(CachedResource::DebugTraceBlock, hash, call),
-            Some(json!({"tracer": "call"}))
+        assert!(
+            cache
+                .get(CachedResource::DebugTraceBlock, hash, call)
+                .is_some_and(|r| r.shares_bytes_with(&call_response))
         );
-        assert_eq!(
-            cache.get(CachedResource::DebugTraceBlock, hash, prestate),
-            Some(json!({"tracer": "prestate"}))
+        assert!(
+            cache
+                .get(CachedResource::DebugTraceBlock, hash, prestate)
+                .is_some_and(|r| r.shares_bytes_with(&prestate_response))
         );
     }
 
@@ -896,8 +889,8 @@ mod tests {
     #[test]
     fn eviction_cleans_hash_index() {
         // Budget fits roughly one entry; inserting more forces evictions.
-        let payload = json!({"data": "x".repeat(512)});
-        let one_weight = 128 + CachedResponse::new(&payload).byte_len() as u64;
+        let payload = RawJson::try_new(&json!({"data": "x".repeat(512)})).expect("serialize");
+        let one_weight = 128 + payload.byte_len() as u64;
         let cache = ResponseCache::new(ResponseCacheConfig::new(one_weight * 3 / 2, 4));
 
         let hashes: Vec<B256> = (1..=4u8).map(|i| B256::from([i; 32])).collect();
@@ -935,13 +928,5 @@ mod tests {
         assert!((stats.hit_rate() - 80.0).abs() < f64::EPSILON);
         let empty = CacheStats { entry_count: 0, total_bytes: 0, hits: 0, misses: 0 };
         assert!((empty.hit_rate() - 0.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_cached_response() {
-        let value = json!({"key": "value"});
-        let cached = CachedResponse::new(&value);
-        assert!(cached.byte_len() > 0);
-        assert_eq!(cached.as_value(), value);
     }
 }

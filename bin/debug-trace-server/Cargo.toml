@@ -32,8 +32,10 @@ revm-inspectors.workspace = true
 stateless-common = { path = "../../crates/stateless-common" }
 stateless-core = { path = "../../crates/stateless-core" }
 stateless-db = { path = "../../crates/stateless-db" }
+stateless-r2 = { path = "../../crates/stateless-r2" }
 
 # misc
+bytes.workspace = true
 clap.workspace = true
 dashmap.workspace = true
 eyre.workspace = true
@@ -50,11 +52,12 @@ quick_cache.workspace = true
 rayon.workspace = true
 redb.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["rt", "sync"] }
 tokio-util.workspace = true
 tower.workspace = true
+tower-http.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
@@ -63,13 +66,15 @@ alloy-primitives.workspace = true
 
 # Transaction signing for integration tests
 alloy-signer-local.workspace = true
-bytes.workspace = true
 dotenvy.workspace = true
+flate2.workspace = true
 http-body-util.workspace = true
 
 # HTTP client for integration tests
 reqwest = { workspace = true, features = ["blocking", "json"] }
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+zstd.workspace = true
 
 # stateless
 stateless-test-utils = { path = "../../crates/stateless-test-utils" }

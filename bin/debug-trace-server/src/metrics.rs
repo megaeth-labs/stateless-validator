@@ -171,6 +171,53 @@ impl CpuTimeMetrics {
     }
 }
 
+/// Body-streaming telemetry, labeled by negotiated content encoding.
+///
+/// Covers the phase [`CpuTimeMetrics`] cannot see: the request-scoped CPU measurement
+/// is finalized before the first body frame is polled, while compression runs inside
+/// body polling — so its CPU and the actual wire bytes are only observable there.
+#[derive(Clone, Metrics)]
+#[metrics(scope = "debug_trace")]
+pub struct BodyMetrics {
+    /// Thread CPU seconds spent streaming one response body (compression + frame copies)
+    body_cpu_time_seconds: Histogram,
+    /// Bytes put on the wire (post-compression)
+    wire_bytes_total: Counter,
+}
+
+impl BodyMetrics {
+    /// Creates body metrics for one negotiated encoding (`"identity"` when none).
+    pub fn create(encoding: &'static str) -> Self {
+        Self::new_with_labels(&[("encoding", encoding)])
+    }
+
+    /// Records one finished (or aborted) response body.
+    pub fn record(&self, cpu_seconds: f64, wire_bytes: u64) {
+        self.body_cpu_time_seconds.record(cpu_seconds);
+        self.wire_bytes_total.increment(wire_bytes);
+    }
+}
+
+/// Inbound JSON-RPC batch shape, recorded by the concurrent-batch RPC middleware.
+#[derive(Clone, Metrics)]
+#[metrics(scope = "debug_trace")]
+pub struct BatchMetrics {
+    /// Entries per inbound JSON-RPC batch request
+    batch_size: Histogram,
+}
+
+impl BatchMetrics {
+    /// Creates the global batch-shape metrics.
+    pub fn create() -> Self {
+        Self::new_with_labels(&[] as &[(&str, &str)])
+    }
+
+    /// Records one inbound batch's entry count.
+    pub fn record(&self, entries: usize) {
+        self.batch_size.record(entries as f64);
+    }
+}
+
 /// Cache hit/miss/size metrics with cache type label, shared by every cache tier.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
@@ -357,6 +404,37 @@ pub fn record_request_shape(method: &'static str, shape: &'static str) {
     counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => shape).increment(1);
 }
 
+/// R2 historical-witness GET retries (one increment per retried attempt).
+const R2_WITNESS_RETRIES_TOTAL: &str = "debug_trace_r2_witness_retries_total";
+
+/// R2 historical-witness fetch failures, labeled by `kind`
+/// (see `crate::r2_witness::R2WitnessError::KINDS`). Failures here are not user-visible
+/// errors — the witness stage falls back to the RPC chain — so this counter is the signal
+/// that the R2 fast path is degrading.
+const R2_WITNESS_ERRORS_TOTAL: &str = "debug_trace_r2_witness_errors_total";
+
+/// Records one retried R2 witness GET attempt.
+pub fn record_r2_witness_retry() {
+    counter!(R2_WITNESS_RETRIES_TOTAL).increment(1);
+}
+
+/// Records one failed R2 witness fetch of the given error `kind`.
+pub fn record_r2_witness_error(kind: &'static str) {
+    counter!(R2_WITNESS_ERRORS_TOTAL, "kind" => kind).increment(1);
+}
+
+/// Time an R2 witness GET spent queued on the self-imposed concurrency cap
+/// (`--r2-max-concurrent-requests`) before its first attempt. Deliberately separate from
+/// the `witness_r2` duration histogram: on the request path the caller really did wait
+/// through this queue, so that histogram reports honest end-to-end time — and this one
+/// makes cap-induced queueing distinguishable from actual R2 slowness.
+const R2_WITNESS_QUEUE_WAIT_SECONDS: &str = "debug_trace_r2_witness_queue_wait_seconds";
+
+/// Records the queued share of one R2 witness fetch.
+pub fn record_r2_witness_queue_wait(seconds: f64) {
+    histogram!(R2_WITNESS_QUEUE_WAIT_SECONDS).record(seconds);
+}
+
 /// Canonical number → hash resolution counter, labeled `(source, outcome)` — how often
 /// by-number requests resolve their canonical hash from the local DB index vs upstream,
 /// and how often resolution misses or fails.
@@ -519,6 +597,15 @@ fn pre_register_all_metrics() {
     // Request Layer: CPU time (global)
     let _ = CpuTimeMetrics::create();
 
+    // Request Layer: inbound batch shape (global)
+    let _ = BatchMetrics::create();
+
+    // Request Layer: body streaming (per negotiated encoding); br/deflate are
+    // deliberately not offered, so only these three series can ever be written
+    for encoding in ["identity", "gzip", "zstd"] {
+        let _ = BodyMetrics::create(encoding);
+    }
+
     // Cache Layer
     let _ = CacheMetrics::new_for_cache(CACHE_TYPE_DEBUG_TRACE);
     let _ = CacheMetrics::new_for_cache(CACHE_TYPE_TRACE);
@@ -535,6 +622,14 @@ fn pre_register_all_metrics() {
     let _ = DataSourceMetrics::new_for_source("db");
     let _ = DataSourceMetrics::new_for_source("witness_generator");
     let _ = DataSourceMetrics::new_for_source("witness_historical");
+    let _ = DataSourceMetrics::new_for_source("witness_r2");
+
+    // Data Fetch Layer: R2 historical witness source
+    counter!(R2_WITNESS_RETRIES_TOTAL).increment(0);
+    for kind in crate::r2_witness::R2WitnessError::KINDS {
+        counter!(R2_WITNESS_ERRORS_TOTAL, "kind" => *kind).increment(0);
+    }
+    let _ = histogram!(R2_WITNESS_QUEUE_WAIT_SECONDS);
 
     // Data Fetch Layer: single-flight
     let _ = SingleFlightMetrics::new_for_type("new");
@@ -581,6 +676,7 @@ fn pre_register_all_metrics() {
     // Witness Layer
     let _ = WitnessSourceMetrics::new_for_source("witness_generator");
     let _ = WitnessSourceMetrics::new_for_source("witness_historical");
+    let _ = WitnessSourceMetrics::new_for_source("witness_r2");
 
     // Execution Layer (per method)
     let _ = EvmExecutionMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
@@ -599,12 +695,20 @@ const TX_COUNT_BUCKETS: &[f64] = &[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 200.0
 /// Block distance from chain tip (~ 0–1000 blocks).
 const BLOCK_DISTANCE_BUCKETS: &[f64] = &[0.0, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0];
 
+/// Body-streaming CPU per response, seconds (~ sub-ms identity frames to hundreds of ms
+/// compressing a multi-MB trace). Explicit buckets keep this an aggregatable histogram —
+/// without them the exporter renders per-instance summary quantiles, which cannot be
+/// combined across replicas or alerted on cleanly.
+const BODY_CPU_TIME_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5];
+
 /// (metric_name, buckets) pairs applied via `set_buckets_for_metric` at startup.
 const BUCKET_SPECS: &[(&str, &[f64])] = &[
     ("debug_trace_evm_block_tx_count", TX_COUNT_BUCKETS),
+    ("debug_trace_batch_size", TX_COUNT_BUCKETS),
     ("debug_trace_block_distance_from_tip", BLOCK_DISTANCE_BUCKETS),
     ("debug_trace_reorg_depth", REORG_DEPTH_BUCKETS),
     ("debug_trace_witness_bytes", BYTE_BUCKETS),
+    ("debug_trace_body_cpu_time_seconds", BODY_CPU_TIME_BUCKETS),
 ];
 
 /// Initializes the Prometheus metrics exporter.

@@ -1664,6 +1664,8 @@ dependencies = [
  "compression-core",
  "flate2",
  "memchr",
+ "zstd",
+ "zstd-safe",
 ]
 
 [[package]]
@@ -1884,7 +1886,7 @@ dependencies = [
 
 [[package]]
 name = "debug-trace-server"
-version = "2.0.15"
+version = "2.0.16"
 dependencies = [
  "alloy-consensus",
  "alloy-evm",
@@ -1900,6 +1902,7 @@ dependencies = [
  "dashmap",
  "dotenvy",
  "eyre",
+ "flate2",
  "futures",
  "http",
  "http-body",
@@ -1924,13 +1927,16 @@ dependencies = [
  "stateless-common",
  "stateless-core",
  "stateless-db",
+ "stateless-r2",
  "stateless-test-utils",
  "tempfile",
  "thiserror 2.0.17",
  "tokio",
  "tokio-util",
  "tower",
+ "tower-http",
  "tracing",
+ "zstd",
 ]
 
 [[package]]
@@ -5651,7 +5657,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stateless-common"
-version = "2.0.15"
+version = "2.0.16"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -5686,7 +5692,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-core"
-version = "2.0.15"
+version = "2.0.16"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -5726,7 +5732,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-db"
-version = "2.0.15"
+version = "2.0.16"
 dependencies = [
  "alloy-primitives",
  "alloy-rpc-types-eth",
@@ -5745,20 +5751,24 @@ dependencies = [
 
 [[package]]
 name = "stateless-r2"
-version = "2.0.15"
+version = "2.0.16"
 dependencies = [
  "bytes",
  "chrono",
+ "fastrand",
  "hex",
  "hmac",
  "percent-encoding",
  "reqwest",
  "sha2 0.10.9",
+ "stateless-test-utils",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
 name = "stateless-test-utils"
-version = "2.0.15"
+version = "2.0.16"
 dependencies = [
  "alloy-genesis",
  "alloy-primitives",
@@ -5770,29 +5780,26 @@ dependencies = [
  "salt",
  "serde",
  "serde_json",
+ "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
 ]
 
 [[package]]
 name = "stateless-validator"
-version = "2.0.15"
+version = "2.0.16"
 dependencies = [
  "alloy-genesis",
  "alloy-primitives",
  "alloy-rpc-types-eth",
- "bytes",
- "chrono",
  "clap",
  "eyre",
- "fastrand",
  "jsonrpsee",
  "jsonrpsee-types",
  "metrics",
  "metrics-exporter-prometheus",
  "op-alloy-rpc-types",
  "redb",
- "reqwest",
  "revm",
  "salt",
  "serde_json",
@@ -6176,13 +6183,17 @@ version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4e6559d53cc268e5031cd8429d05415bc4cb4aefc4aa5d6cc35fbf5b924a1f8"
 dependencies = [
+ "async-compression",
  "bitflags",
  "bytes",
+ "futures-core",
  "futures-util",
  "http",
  "http-body",
  "iri-string",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",

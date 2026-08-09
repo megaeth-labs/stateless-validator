@@ -35,7 +35,7 @@ The workspace contains two binaries and five library crates:
 | `stateless-db`         | `crates/stateless-db`         | redb-backed persistence: table definitions, read/write helpers, bounded `ContractCache`                                                                                              |
 | `stateless-common`     | `crates/stateless-common`     | Shared utilities: RPC client, logging, metrics                                                                                                                                       |
 | `stateless-test-utils` | `crates/stateless-test-utils` | Test fixtures (blocks, witnesses, contracts) and env-var lock for integration tests                                                                                                  |
-| `stateless-r2`         | `crates/stateless-r2`         | Shared R2 (S3) witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT; consumed by mega-reth's witness uploaders (write) and this repo's validator (read) |
+| `stateless-r2`         | `crates/stateless-r2`         | Shared R2 (S3) witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT/GET with retry; consumed by mega-reth's witness uploaders (write), this repo's validator, and the trace server's historical witness source (read) |
 | `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers                                                                                                                                 |
 | `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                                                                                                                        |
 
@@ -100,12 +100,28 @@ Two operating modes:
 
 **Response cache:**
 The HTTP response cache is keyed by `(resource, block hash, tracer variant)` — an entry is an immutable fact about that exact block, so reorgs need no serve-time validation.
+Entries hold the reply's raw JSON bytes, serialized exactly once from the trace output and spliced verbatim into every response — a hit shares the bytes by `Arc` instead of re-parsing and re-serializing the JSON tree.
 By-number requests resolve their canonical hash before the lookup (local index, then an in-memory memo, then upstream `eth_getHeaderByNumber`), so a reorged height resolves to the new hash and misses cleanly.
 Tag requests (`latest`/`finalized`/`safe`) bind number → hash in their single upstream header fetch, and every resolved (number, hash) pair — tag, canonical-hash resolution, or transaction lookup — is handed to the fetch pipeline, which then skips its own number-discovery header round trip (only raw by-hash requests still pay it).
 Cacheable shapes are the five built-in tracers (`callTracer`, `prestateTracer`, `4byteTracer`, `noopTracer`, `flatCallTracer`, keyed by their parsed, typed `tracerConfig` — equivalent configs collapse onto one entry) and the bare default struct-logger request (no tracer, no `tracerConfig`, default flags).
 JS tracers, `muxTracer`, and struct-logger requests with non-default flags bypass the cache and are recomputed on every request.
 A type-malformed `tracerConfig` on a config-reading builtin (`callTracer`/`prestateTracer`/`flatCallTracer`) is rejected with `-32602 invalid params` instead of being silently traced with default settings.
 Disable the cache with `--response-cache-disabled`; `--response-cache-estimated-items` must be at least 1 (the old `=0` disable convention is rejected at startup).
+
+**Concurrent batch execution:**
+Entries of an inbound JSON-RPC batch request execute concurrently as independent runtime tasks, so a batch answers near its slowest entry instead of the sum of its entries — including CPU-bound entries, since EVM tracing runs synchronously inline and merely interleaved futures would serialize behind it (jsonrpsee's built-in batch path is strictly sequential).
+Each entry still goes through the regular per-request pipeline — response cache, single-flight, witness routing, and per-method metrics apply unchanged — and responses may arrive in any order, matched by `id` as JSON-RPC 2.0 permits.
+`--batch-item-concurrency` (default 16) bounds how many entries of one batch run at once, so a single huge batch cannot monopolize downstream resources against concurrently served requests; set it to 1 to restore sequential execution.
+The `debug_trace_batch_size` histogram records entries per inbound batch, and CPU burned inside spawned entries is folded back into `x-execution-time-ns` and the request CPU metric, so batch requests do not under-report their cost.
+
+**Response compression:**
+Responses negotiate gzip/zstd per request via the client's `Accept-Encoding` header; clients that do not send it keep receiving identity bodies, so nothing changes for consumers that have not opted in.
+Bodies under 4 KiB are always served identity: compressing them would cost a per-response encoder allocation and downgrade `Content-Length` to chunked framing for a few dozen saved bytes.
+Compression runs at the fastest level while the body streams, so `x-execution-time-ns` excludes its CPU cost — the header reflects request processing and no longer bounds total request cost — and `x-response-size` keeps reporting the uncompressed payload size.
+The body-streaming phase is metered separately: `debug_trace_body_cpu_time_seconds` and `debug_trace_wire_bytes_total` (labeled by negotiated encoding) record per-response streaming CPU — compression included — and post-compression wire bytes, which is what tells an operator when compression CPU is worth shedding.
+Compressing at the origin also shrinks a fronting CDN's back-to-origin leg, which edge-side compression alone cannot do.
+Known trade-off: the response cache stores identity JSON, so an opted-in client pays the (fast-level) compression on every cache hit.
+Disable with `--response-compression-disabled`; the flag is read at startup, so shedding compression CPU means a restart and a cold-cache window.
 
 **Canonical-hash memo:**
 `CANONICAL_CHAIN` stays a bounded, contiguous sync window; heights outside it resolve number → hash upstream once, and the hash-verified answer is memoized in a bounded in-memory LRU.
@@ -133,6 +149,12 @@ The background chain-sync prefetch routes by freshness against the last observed
 The head observation is trusted as a freshness anchor only while itself recent (no older than the grace): during a long catch-up stretch the tip is not re-polled and the real head may advance past the generator's retention, so blocks near the stale ceiling fall back to full-chain failover from the first attempt instead of burning the grace on pruned witnesses.
 Deep catch-up blocks (far below the observed head, where the generator may have pruned the witness) keep full failover from the first attempt.
 Without `--witness-generator-endpoint`, historical routing is disabled and the endpoints are plain failover.
+
+**Direct-from-R2 historical witnesses:**
+With `--r2-endpoint`, `--r2-bucket`, `--r2-access-key-id`, and `--r2-secret-access-key` (all four together), request-serving witness fetches for historical blocks try a SigV4-signed GET against the bucket before the RPC witness chain.
+Object storage tolerates far higher parallelism than a shared RPC gateway and the bucket holds full history, so bulk backfill traffic stops competing with everything else on the public endpoint; any R2 failure (missing object, throttle, transport, corrupt payload — counted in `debug_trace_r2_witness_errors_total{kind}`) falls back to the RPC chain on the remaining witness budget, and the R2 attempt is capped at half that budget so a hung endpoint can never starve the fallback.
+Frontier blocks keep the generator path (the bucket receives objects only after the uploader PUTs them), and the route needs a local DB (`--data-dir`) to anchor block age.
+`--r2-max-concurrent-requests` caps in-flight GETs separately from `--witness-max-concurrent-requests` — the RPC cap sizes a shared gateway, R2 tolerates far more.
 
 **Witness routing and sync knobs** (each also settable via its `DEBUG_TRACE_SERVER_*` env var):
 - `--witness-local-window`: Block-age threshold for the historical witness route (default: 4096; should match the generator's `BACKUP`).

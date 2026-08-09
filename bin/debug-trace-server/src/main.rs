@@ -5,7 +5,8 @@
 //! Data can be fetched from upstream RPC endpoints or from a local database with chain sync.
 //! Request-serving witness fetches route by block age: historical blocks skip the internal
 //! generator endpoint (which only retains a small recent window) and go straight to the
-//! fallback endpoints. Chain-sync prefetch always uses the full chain.
+//! fallback endpoints — or, with the `--r2-*` flags, straight to the R2 bucket with the RPC
+//! chain as fallback. Chain-sync prefetch always uses the full chain.
 //!
 //! # Architecture
 //! ```text
@@ -53,8 +54,8 @@ use alloy_primitives::BlockHash;
 use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::Result;
-use jsonrpsee::server::{Server, ServerConfig};
-use stateless_common::{RpcClient, RpcClientConfig, logging::LogArgs};
+use jsonrpsee::server::{Server, ServerConfig, middleware::rpc::RpcServiceBuilder};
+use stateless_common::{RedactedSecret, RpcClient, RpcClientConfig, logging::LogArgs};
 use stateless_core::{
     BisectResolver, ChainStore, ContractStore, DivergenceLookups, PipelineConfig,
     chain_spec::ChainSpec, db::BlockMeta, pipeline::run_pipeline,
@@ -65,11 +66,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
 mod block_data_cache;
+mod body_metrics;
 mod chain_sync;
+mod compression;
 mod data_provider;
 mod metrics;
+mod middleware;
+mod r2_witness;
+mod raw_json;
 mod response_cache;
 mod response_size;
+mod rpc_middleware;
 mod rpc_service;
 mod server_db;
 mod timing;
@@ -79,6 +86,7 @@ use block_data_cache::{
     BLOCK_DATA_CACHE_SHARDS, BlockDataCache, DEFAULT_BLOCK_DATA_CACHE_MAX_BYTES,
 };
 use data_provider::{DataProvider, NoopContractStore, WitnessFetchConfig};
+use r2_witness::R2WitnessSource;
 use response_cache::{DEFAULT_RESPONSE_CACHE_ESTIMATED_ITEMS, ResponseCache, ResponseCacheConfig};
 use rpc_service::RpcContext;
 use server_db::{BlockStore, ServerDB};
@@ -180,6 +188,24 @@ struct Args {
     /// Disable the HTTP response cache entirely (every trace response is recomputed).
     #[clap(long, env = "DEBUG_TRACE_SERVER_RESPONSE_CACHE_DISABLED")]
     response_cache_disabled: bool,
+
+    /// Disable gzip/zstd response compression (normally negotiated per request via the
+    /// client's `Accept-Encoding` header; clients that do not opt in always get
+    /// identity bodies either way).
+    #[clap(long, env = "DEBUG_TRACE_SERVER_RESPONSE_COMPRESSION_DISABLED")]
+    response_compression_disabled: bool,
+
+    /// Maximum entries of one inbound JSON-RPC batch request executed concurrently.
+    /// Each entry goes through the regular per-request pipeline either way; the bound
+    /// only stops a single huge batch from monopolizing downstream resources. Set to 1
+    /// for strictly sequential batch execution.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_BATCH_ITEM_CONCURRENCY",
+        default_value_t = rpc_middleware::DEFAULT_BATCH_ITEM_CONCURRENCY,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
+    batch_item_concurrency: u32,
 
     /// Estimated number of items in response cache (for initial capacity). Must be at
     /// least 1 — disable the cache with `--response-cache-disabled`, not with 0.
@@ -283,6 +309,46 @@ struct Args {
     /// blocks whose witness is likely pruned everywhere. Clamped to `--witness-timeout`.
     #[clap(long, env = "DEBUG_TRACE_SERVER_WITNESS_OLD_BLOCK_TIMEOUT")]
     witness_old_block_timeout: Option<u64>,
+
+    /// R2 S3 endpoint origin, e.g. `https://<account>.r2.cloudflarestorage.com` (no bucket
+    /// path). With `--r2-bucket` and the credential flags, historical witnesses are fetched
+    /// straight from the bucket, with the RPC witness chain as fallback; frontier blocks keep
+    /// the generator path. Requires a local DB (`--data-dir`) to anchor block age.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ENDPOINT", requires_all = ["r2_bucket", "r2_access_key_id", "r2_secret_access_key"])]
+    r2_endpoint: Option<String>,
+
+    /// R2 bucket holding the archived witness objects. Requires `--r2-endpoint`.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_BUCKET", requires = "r2_endpoint")]
+    r2_bucket: Option<String>,
+
+    /// R2 access key id (Object Read). Requires `--r2-endpoint`.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ACCESS_KEY_ID", requires = "r2_endpoint")]
+    r2_access_key_id: Option<String>,
+
+    /// R2 secret access key. Requires `--r2-endpoint`. Prefer the env var over the flag so
+    /// the secret stays out of shell history and process listings.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_SECRET_ACCESS_KEY", requires = "r2_endpoint")]
+    r2_secret_access_key: Option<RedactedSecret>,
+
+    /// R2 connection-establishment timeout (milliseconds). A healthy handshake to the local
+    /// anycast edge is tens of ms; hangs past this are the per-IP connection-budget
+    /// mitigation's signature and surface as retryable `connect`-kind errors, falling back
+    /// to the RPC chain fast.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_R2_CONNECT_TIMEOUT_MS",
+        default_value_t = stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT.as_millis() as u64,
+        value_parser = clap::value_parser!(u64).range(100..),
+        requires = "r2_endpoint",
+    )]
+    r2_connect_timeout_ms: u64,
+
+    /// Maximum concurrent in-flight R2 witness GETs. Omit for unlimited. Deliberately
+    /// separate from
+    /// `--witness-max-concurrent-requests`: that cap sizes the shared RPC gateway, while R2
+    /// tolerates far higher parallelism.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_MAX_CONCURRENT_REQUESTS", requires = "r2_endpoint")]
+    r2_max_concurrent_requests: Option<usize>,
 
     /// Chain-sync pipeline tip buffer: stay this many blocks behind the upstream head so the
     /// fetcher does not race the witness generator — a fetch issued the moment a block appears
@@ -390,6 +456,33 @@ fn validate_args(args: &Args) -> Result<()> {
              --witness-endpoint: list the generator once, via the dedicated flag"
         );
     }
+    // Clap's `requires` wiring makes the `--r2-*` flags all-or-nothing, but it checks
+    // presence, not content: an env var injected as the empty string (a secret that failed
+    // to materialize is the common shape) would otherwise build a live source whose every
+    // GET reports `kind="missing"` — the exact counter operators watch for
+    // bucket-completeness gaps. Reject emptiness before a bad deploy can read as data loss.
+    let r2_values = [
+        ("--r2-endpoint", args.r2_endpoint.as_deref()),
+        ("--r2-bucket", args.r2_bucket.as_deref()),
+        ("--r2-access-key-id", args.r2_access_key_id.as_deref()),
+        ("--r2-secret-access-key", args.r2_secret_access_key.as_ref().map(|s| s.as_ref())),
+    ];
+    for (flag, value) in r2_values {
+        if value.is_some_and(str::is_empty) {
+            eyre::bail!(
+                "{flag} is set but empty (empty env var injection?): unset it or give it a value"
+            );
+        }
+    }
+    // The R2 historical route anchors block age to the local DB tip, so without --data-dir
+    // it can never fire. An operator who configured R2 asked for that route explicitly —
+    // fail closed instead of silently running the RPC-only setup R2 exists to replace.
+    if args.r2_endpoint.is_some() && args.data_dir.is_none() {
+        eyre::bail!(
+            "--r2-endpoint requires --data-dir: the R2 historical witness route anchors \
+             block age to the local DB tip and can never fire in stateless mode"
+        );
+    }
     Ok(())
 }
 
@@ -421,10 +514,13 @@ async fn main() -> Result<()> {
         witness_timeout_secs = args.witness_timeout,
         witness_old_block_timeout_secs = old_block_witness_timeout_secs(&args),
         witness_local_window = args.witness_local_window,
+        r2_witness_configured = args.r2_endpoint.is_some(),
         tip_buffer = args.tip_buffer,
         response_cache_disabled = args.response_cache_disabled,
         response_cache_max_size = args.response_cache_max_size,
         response_cache_estimated_items = args.response_cache_estimated_items,
+        response_compression_disabled = args.response_compression_disabled,
+        batch_item_concurrency = args.batch_item_concurrency,
         "Server configuration"
     );
 
@@ -449,6 +545,7 @@ async fn main() -> Result<()> {
         .rpc_per_attempt_timeout_ms
         .map(std::time::Duration::from_millis)
         .unwrap_or(rpc_defaults.per_attempt_timeout);
+    let rpc_retry = rpc_defaults.rpc_retry.clone();
     let rpc_config = RpcClientConfig {
         data_max_concurrent_requests: args.data_max_concurrent_requests,
         witness_max_concurrent_requests: args.witness_max_concurrent_requests,
@@ -483,6 +580,41 @@ async fn main() -> Result<()> {
         ),
     }
 
+    // Direct-from-R2 historical witness source. Clap's `requires` wiring makes the four
+    // `--r2-*` flags all-or-nothing and `validate_args` rejects empty values and the
+    // data-dir-less combination, so matching on the quad only splits "configured" from
+    // "absent". Shares the RPC path's per-attempt timeout and retry pacing.
+    let r2_witness_source = match (
+        &args.r2_endpoint,
+        &args.r2_bucket,
+        &args.r2_access_key_id,
+        &args.r2_secret_access_key,
+    ) {
+        (Some(endpoint), Some(bucket), Some(access_key_id), Some(secret)) => {
+            let source = R2WitnessSource::new(
+                endpoint,
+                bucket.clone(),
+                access_key_id.clone(),
+                secret.as_ref().to_string(),
+                stateless_r2::fetch::FetchTimeouts {
+                    per_attempt: per_attempt_timeout,
+                    connect: std::time::Duration::from_millis(args.r2_connect_timeout_ms),
+                },
+                rpc_retry,
+                args.r2_max_concurrent_requests,
+            )?;
+            // Log the parsed origin, not the raw flag value — the raw string is
+            // operator input and this line is info-level.
+            let (origin, _) = stateless_r2::endpoint::parse_endpoint(endpoint);
+            info!(
+                endpoint = %origin,
+                bucket, "Historical witness source: R2 (direct S3), RPC chain as fallback"
+            );
+            Some(Arc::new(source))
+        }
+        _ => None,
+    };
+
     let validator_db = init_validator_db(&args, &rpc_client).await?;
 
     // Keep concrete ServerDB for pipeline (needs Sized), and dyn BlockStore for data_provider
@@ -512,15 +644,18 @@ async fn main() -> Result<()> {
         Some(Arc::new(BlockDataCache::new(args.block_data_cache_max_size)))
     };
 
-    let data_provider = Arc::new(DataProvider::new(
-        rpc_client.clone(),
-        block_store.clone(),
-        block_data_cache,
-        contract_cache,
-        witness_cfg,
-        std::time::Duration::from_secs(args.block_fetch_timeout),
-        args.canonical_hash_memo_capacity as usize,
-    ));
+    let data_provider = Arc::new(
+        DataProvider::new(
+            rpc_client.clone(),
+            block_store.clone(),
+            block_data_cache,
+            contract_cache,
+            witness_cfg,
+            std::time::Duration::from_secs(args.block_fetch_timeout),
+            args.canonical_hash_memo_capacity as usize,
+        )
+        .with_r2_witness(r2_witness_source),
+    );
 
     let chain_spec = load_chain_spec(&args)?;
 
@@ -618,14 +753,16 @@ async fn main() -> Result<()> {
     let module = ctx.into_rpc_module()?;
 
     // Start server
-    let config = ServerConfig::builder().max_response_body_size(u32::MAX).build();
+    let max_response_body_size = u32::MAX;
+    let config = ServerConfig::builder().max_response_body_size(max_response_body_size).build();
+    let rpc_middleware = RpcServiceBuilder::new().layer(rpc_middleware::ConcurrentBatchLayer::new(
+        args.batch_item_concurrency as usize,
+        max_response_body_size as usize,
+    ));
     let server = Server::builder()
         .set_config(config)
-        .set_http_middleware(
-            tower::ServiceBuilder::new()
-                .layer(response_size::ResponseSizeLayer)
-                .layer(timing::TimingHeaderLayer),
-        )
+        .set_rpc_middleware(rpc_middleware)
+        .set_http_middleware(middleware::http_middleware(!args.response_compression_disabled))
         .build(&args.addr)
         .await?;
     let addr = server.local_addr()?;
@@ -1118,6 +1255,50 @@ mod tests {
         assert!(disabled_via_env);
     }
 
+    /// Compression kill switch: compression defaults on, disable via CLI or env.
+    #[test]
+    fn response_compression_flag() {
+        let guard = stateless_test_utils::env::env_lock();
+
+        assert!(!parse_args(&[]).response_compression_disabled);
+        assert!(parse_args(&["--response-compression-disabled"]).response_compression_disabled);
+
+        let disabled_via_env = stateless_test_utils::env::with_env_var(
+            &guard,
+            "DEBUG_TRACE_SERVER_RESPONSE_COMPRESSION_DISABLED",
+            "true",
+            || parse_args(&[]).response_compression_disabled,
+        );
+        assert!(disabled_via_env);
+    }
+
+    /// Batch concurrency knob: default, CLI/env override, and the zero rejection.
+    #[test]
+    fn batch_item_concurrency_flag() {
+        let guard = stateless_test_utils::env::env_lock();
+
+        assert_eq!(
+            parse_args(&[]).batch_item_concurrency,
+            rpc_middleware::DEFAULT_BATCH_ITEM_CONCURRENCY
+        );
+        assert_eq!(parse_args(&["--batch-item-concurrency", "1"]).batch_item_concurrency, 1);
+
+        let base =
+            ["debug-trace-server", "--rpc-endpoint", "http://r", "--witness-endpoint", "http://w"];
+        assert!(
+            Args::try_parse_from(base.iter().chain(&["--batch-item-concurrency", "0"])).is_err(),
+            "0 batch concurrency must be rejected at parse time (1 = sequential)"
+        );
+
+        let via_env = stateless_test_utils::env::with_env_var(
+            &guard,
+            "DEBUG_TRACE_SERVER_BATCH_ITEM_CONCURRENCY",
+            "32",
+            || parse_args(&[]).batch_item_concurrency,
+        );
+        assert_eq!(via_env, 32);
+    }
+
     /// Pruner-guard flag: default, CLI override, and env parity.
     #[test]
     fn size_prune_min_retain_flag() {
@@ -1242,5 +1423,100 @@ mod tests {
             ],
             |a| a.witness_max_concurrent_requests,
         );
+    }
+
+    /// The `--r2-*` group is all-or-nothing: any subset missing a member must fail parsing,
+    /// the full quad must parse, and none-of-them stays valid.
+    #[test]
+    fn r2_flag_group_is_all_or_nothing() {
+        // Parsing reads every `#[clap(env = ...)]` variable, so serialize with the
+        // env-mutating tests.
+        let _guard = stateless_test_utils::env::env_lock();
+        let full = [
+            "--r2-endpoint",
+            "https://acc.r2.cloudflarestorage.com",
+            "--r2-bucket",
+            "witness-mainnet",
+            "--r2-access-key-id",
+            "ak",
+            "--r2-secret-access-key",
+            "sk",
+        ];
+
+        assert_eq!(parse_args(&full).r2_bucket.as_deref(), Some("witness-mainnet"));
+        assert_eq!(parse_args(&full).r2_connect_timeout_ms, 1000, "default connect timeout");
+        let with_timeout: Vec<&str> =
+            full.iter().copied().chain(["--r2-connect-timeout-ms", "2000"]).collect();
+        assert_eq!(parse_args(&with_timeout).r2_connect_timeout_ms, 2000);
+        // Tuning flags are part of the fail-loud group: explicitly set without the
+        // endpoint they must be rejected, not silently ignored (defaults stay exempt).
+        let base =
+            ["debug-trace-server", "--rpc-endpoint", "http://r", "--witness-endpoint", "http://w"];
+        assert!(
+            Args::try_parse_from(base.iter().copied().chain(["--r2-connect-timeout-ms", "2000"]))
+                .is_err()
+        );
+        let _ = parse_args(&[]); // no R2 flags stays valid
+
+        // Dropping any one flag=value pair of the quad breaks the group.
+        for skip in 0..4 {
+            let partial: Vec<&str> = full
+                .chunks(2)
+                .enumerate()
+                .filter(|(i, _)| *i != skip)
+                .flat_map(|(_, pair)| pair.iter().copied())
+                .collect();
+            let base = [
+                "debug-trace-server",
+                "--rpc-endpoint",
+                "http://r",
+                "--witness-endpoint",
+                "http://w",
+            ];
+            assert!(
+                Args::try_parse_from(base.iter().copied().chain(partial)).is_err(),
+                "missing {} must fail parsing",
+                full[skip * 2],
+            );
+        }
+    }
+
+    /// R2 misconfigurations fail startup validation: an empty value on any `--r2-*` flag
+    /// (the shape of a failed env injection, which clap's presence-only `requires` cannot
+    /// see) and the data-dir-less combination whose historical route can never fire.
+    #[test]
+    fn validate_args_rejects_r2_misconfigurations() {
+        let _guard = stateless_test_utils::env::env_lock();
+        let quad = [
+            ("--r2-endpoint", "https://acc.r2.cloudflarestorage.com"),
+            ("--r2-bucket", "witness-mainnet"),
+            ("--r2-access-key-id", "ak"),
+            ("--r2-secret-access-key", "sk"),
+        ];
+        let build = |empty: Option<&str>, data_dir: bool| {
+            let mut v = vec![
+                "debug-trace-server",
+                "--rpc-endpoint",
+                "http://r",
+                "--witness-endpoint",
+                "http://w",
+            ];
+            for (flag, value) in quad {
+                v.push(flag);
+                v.push(if empty == Some(flag) { "" } else { value });
+            }
+            if data_dir {
+                v.extend(["--data-dir", "/tmp/dts-test"]);
+            }
+            Args::try_parse_from(v).unwrap()
+        };
+
+        assert!(validate_args(&build(None, true)).is_ok());
+        // Explicitly configured R2 without a local DB is inert — fail closed, not warn.
+        assert!(validate_args(&build(None, false)).is_err());
+        // Any single empty value must fail instead of building a live source over it.
+        for (flag, _) in quad {
+            assert!(validate_args(&build(Some(flag), true)).is_err(), "{flag} empty must fail");
+        }
     }
 }

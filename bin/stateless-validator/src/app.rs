@@ -7,7 +7,9 @@ use alloy_primitives::BlockHash;
 use alloy_rpc_types_eth::BlockId;
 use clap::{Parser, ValueEnum};
 use eyre::Result;
-use stateless_common::{BackoffPolicy, RpcClient, RpcClientConfig, logging::LogArgs};
+use stateless_common::{
+    BackoffPolicy, RedactedSecret, RpcClient, RpcClientConfig, logging::LogArgs,
+};
 use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::BlockMeta};
 use stateless_db::ContractCache;
 use tracing::{info, warn};
@@ -23,31 +25,6 @@ pub enum WitnessSource {
     Rpc,
     /// Straight from the R2 bucket over the S3 API. Requires the `--r2-*` flags.
     R2,
-}
-
-/// A CLI/env secret that renders as `[redacted]` in `Debug` output, so it cannot leak when
-/// [`CommandLineArgs`] (which derives `Debug`) is logged.
-#[derive(Clone)]
-pub struct RedactedSecret(String);
-
-impl std::str::FromStr for RedactedSecret {
-    type Err = std::convert::Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(s.to_string()))
-    }
-}
-
-impl std::fmt::Debug for RedactedSecret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("[redacted]")
-    }
-}
-
-impl AsRef<str> for RedactedSecret {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
 }
 
 /// Database filename for the validator.
@@ -136,6 +113,17 @@ pub struct CommandLineArgs {
     /// flag.
     #[clap(long, env = "STATELESS_VALIDATOR_R2_SECRET_ACCESS_KEY")]
     pub r2_secret_access_key: Option<RedactedSecret>,
+
+    /// R2 connection-establishment timeout (milliseconds). A healthy handshake to the local
+    /// anycast edge is tens of ms; hangs past this are the per-IP connection-budget
+    /// mitigation's signature and surface as retryable `connect`-kind errors.
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_R2_CONNECT_TIMEOUT_MS",
+        default_value_t = stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT.as_millis() as u64,
+        value_parser = clap::value_parser!(u64).range(100..),
+    )]
+    pub r2_connect_timeout_ms: u64,
 
     /// Optional inclusive end block: validate up to this height, then stop cleanly. Used to slice
     /// a fixed block range across multiple servers. Omit to follow the chain tip indefinitely.
@@ -299,13 +287,19 @@ pub async fn run() -> Result<()> {
             let access_key_id = require_r2(&args.r2_access_key_id, "--r2-access-key-id")?;
             let secret_access_key =
                 require_r2(&args.r2_secret_access_key, "--r2-secret-access-key")?;
-            info!(endpoint, bucket, "Witness source: R2 (direct S3)");
+            // Log the parsed origin, not the raw flag value — the raw string is operator
+            // input and this line is info-level.
+            let (origin, _) = stateless_r2::endpoint::parse_endpoint(endpoint);
+            info!(endpoint = %origin, bucket, "Witness source: R2 (direct S3)");
             Some(Arc::new(R2WitnessClient::new(
                 endpoint,
                 bucket.to_string(),
                 access_key_id.to_string(),
                 secret_access_key.to_string(),
-                per_attempt_timeout,
+                stateless_r2::fetch::FetchTimeouts {
+                    per_attempt: per_attempt_timeout,
+                    connect: Duration::from_millis(args.r2_connect_timeout_ms),
+                },
                 rpc_config.rpc_retry.clone(),
                 args.witness_max_concurrent_requests,
             )?))
@@ -430,14 +424,5 @@ mod tests {
             require_r2(&Some("https://x".to_string()), "--r2-endpoint").unwrap(),
             "https://x"
         );
-    }
-
-    /// `CommandLineArgs` derives `Debug`; the secret must never appear in that output.
-    #[test]
-    fn redacted_secret_never_debug_prints_its_value() {
-        let secret: RedactedSecret = "super-secret-key".parse().unwrap();
-        assert_eq!(format!("{secret:?}"), "[redacted]");
-        assert_eq!(format!("{:?}", Some(&secret)), "Some([redacted])");
-        assert_eq!(secret.as_ref(), "super-secret-key");
     }
 }

@@ -2,18 +2,21 @@
 //!
 //! Both witness producers — mega-reth's standalone witness generator (`bin/stateless/witness`) and
 //! its replayer uploader (`bin/replayer/src/uploader`) — archive block witnesses to the same
-//! Cloudflare R2 bucket using R2's S3-compatible API, and this repo's validator reads them back
-//! (`bin/stateless-validator/src/r2_witness.rs`). The request signing, object-key layout, and
-//! response handling must be byte-for-byte identical across all of them, or the validator can no
-//! longer locate or authenticate against the uploaded objects. This crate is the single home for
-//! those primitives so the writers and the reader cannot drift:
+//! Cloudflare R2 bucket using R2's S3-compatible API, and this repo's readers fetch them back:
+//! the validator's pipeline source and the debug-trace-server's historical witness source (each
+//! binary's `r2_witness.rs`). The request signing, object-key layout, and response handling must
+//! be byte-for-byte identical across all of them, or the readers can no longer locate or
+//! authenticate against the uploaded objects. This crate is the single home for those primitives
+//! so the writers and the readers cannot drift:
 //!
 //! - [`sigv4`] — a minimal AWS Signature Version 4 signer for buffered `PUT`/`GET`/`DELETE`
 //!   requests;
 //! - [`keys`] — the `block/`, `attr/`, `num/` object-key scheme and its block-range bucketing;
 //! - [`endpoint`] — parsing an R2 endpoint into the origin and `SigV4` canonical host;
 //! - [`client`] — a signed `PUT` helper that classifies the response into a small retry-friendly
-//!   error set ([`client::R2Error`]).
+//!   error set ([`client::R2Error`]);
+//! - [`fetch`] — the retrying signed-`GET` witness-object fetcher shared by the readers
+//!   ([`fetch::R2ObjectFetcher`]).
 //!
 //! ## Object retention
 //!
@@ -25,5 +28,6 @@
 
 pub mod client;
 pub mod endpoint;
+pub mod fetch;
 pub mod keys;
 pub mod sigv4;
