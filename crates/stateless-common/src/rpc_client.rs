@@ -135,6 +135,11 @@ pub struct RpcClientConfig {
     /// entire stage — leaving no budget for another rotation, which is what turns one slow
     /// hop into a client-visible timeout. The trace server sets half its witness stage
     /// budget, so any single hop leaves at least half the stage for the rest of the chain.
+    /// The value is a ceiling, not the effective cap: each deadline-bound witness chain
+    /// entry tightens it to `min(cap, per_attempt_timeout, remaining / 2)`, so an
+    /// operator's stricter global per-attempt timeout is honored, and a stage that
+    /// already lost budget (the old-block clamp, a slow R2 pre-try) still keeps one
+    /// rotation possible instead of letting the first stalled hop consume what is left.
     ///
     /// Deadline-less witness fetches (the chain-sync prefetch) deliberately keep the
     /// general cap: with unbounded rounds, cutting a deterministically-slow-but-honest
@@ -724,11 +729,22 @@ impl RpcClient {
         // The witness attempt cap protects a bounded stage budget from a single stalled
         // hop; a deadline-less fetch has no budget to protect and must instead be able to
         // out-wait transfers slower than the cap (see `witness_per_attempt_timeout`).
-        let per_attempt = match deadline {
-            Some(_) => {
-                self.config.witness_per_attempt_timeout.unwrap_or(self.config.per_attempt_timeout)
-            }
-            None => self.config.per_attempt_timeout,
+        //
+        // The effective cap is the tightest of three bounds:
+        // - the configured cap (half the *full* witness stage, a static value);
+        // - the global per-attempt timeout — an operator who set `--rpc-per-attempt-timeout-ms`
+        //   below the cap asked for stalled attempts to be cut sooner, and the witness path must
+        //   not quietly loosen that;
+        // - half of what the stage has *actually* left at chain entry — the old-block clamp and a
+        //   slow R2 pre-try both shrink the real budget, and a cap derived from the full stage
+        //   stops binding exactly in those runs, letting one stalled hop consume everything the
+        //   stage had left. Halving at entry (not per attempt) keeps one rotation possible without
+        //   geometrically starving later rounds.
+        let per_attempt = match (deadline, self.config.witness_per_attempt_timeout) {
+            (Some(d), Some(cap)) => cap
+                .min(self.config.per_attempt_timeout)
+                .min(d.saturating_duration_since(Instant::now()) / 2),
+            _ => self.config.per_attempt_timeout,
         };
         round_robin_with_backoff(
             &self.witness_providers[providers.clone()],

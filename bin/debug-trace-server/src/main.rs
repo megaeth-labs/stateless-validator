@@ -556,7 +556,9 @@ async fn main() -> Result<()> {
         // Half the witness stage budget, mirroring the R2 pre-try's half-budget rule: no
         // single witness hop — generator, gateway, or R2 — may consume more than half the
         // stage, so one stalled endpoint always leaves budget for another rotation. Derived
-        // rather than flagged: it moves with --witness-timeout.
+        // rather than flagged: it moves with --witness-timeout. A ceiling, not the final
+        // cap — the client tightens it per fetch to `min(cap, per-attempt timeout,
+        // remaining stage / 2)`, covering old-block-clamped stages and post-R2 remainders.
         witness_per_attempt_timeout: Some(std::time::Duration::from_secs(args.witness_timeout) / 2),
         ..rpc_defaults
     }

@@ -2070,6 +2070,106 @@ mod tests {
         ha.stop().unwrap();
     }
 
+    /// The hop cap must bind against what the stage actually has left, not the configured
+    /// full stage: an old-block clamp or a slow R2 pre-try can shrink the stage below the
+    /// static cap, and a cap that stops binding exactly there lets one stalled hop consume
+    /// the entire remainder. Here the stage is 1s while the configured cap is 6s — entry
+    /// halving must cut the stalled hop at ~0.5s so round 1 still fits. Goes red if the
+    /// effective cap is only `min(configured, remaining)`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hop_cap_tracks_the_shrunken_stage_budget() {
+        let (ha, url_gen, hits_gen) = scripted_witness_rpc(1, Some(fixture_wire())).await;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url_gw = format!("http://{}/", listener.local_addr().unwrap());
+        let _held = listener;
+
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(20), Duration::from_millis(40)),
+            // Deliberately larger than the whole stage below: only the entry-remaining
+            // bound can save this fetch.
+            witness_per_attempt_timeout: Some(Duration::from_secs(6)),
+            ..RpcClientConfig::trace_server()
+        };
+        let rpc_client = RpcClient::new_with_config(
+            &[url_gen.as_str()],
+            &[url_gen.as_str(), url_gw.as_str()],
+            config,
+            None,
+        )
+        .unwrap();
+        let cfg = WitnessFetchConfig {
+            local_window: 100,
+            generator_first: true,
+            ..WitnessFetchConfig::with_defaults(1)
+        };
+
+        let budget = Duration::from_secs(1);
+        let started = Instant::now();
+        let result =
+            fetch_witness(&rpc_client, &cfg, None, Some(5000), 5001, B256::ZERO, started + budget)
+                .await;
+
+        assert!(result.is_ok(), "round 1 must fit inside the shrunken stage: {:?}", result.err());
+        assert!(started.elapsed() < budget, "must not ride the deadline ({:?})", started.elapsed());
+        assert!(hits_gen.load(Ordering::Relaxed) >= 2, "round 1 must reach the generator");
+
+        ha.stop().unwrap();
+    }
+
+    /// An operator's explicit `--rpc-per-attempt-timeout-ms` below the witness cap asked
+    /// for stalled attempts to be cut *sooner*; the witness cap is a ceiling and must not
+    /// quietly loosen it. With a 200ms global per-attempt, the stalled hop is cut at
+    /// ~200ms and the fetch completes far inside the second — not at the witness cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_per_attempt_timeout_stays_the_tighter_bound() {
+        let (ha, url_gen, hits_gen) = scripted_witness_rpc(1, Some(fixture_wire())).await;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url_gw = format!("http://{}/", listener.local_addr().unwrap());
+        let _held = listener;
+
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(20), Duration::from_millis(40)),
+            per_attempt_timeout: Duration::from_millis(200),
+            witness_per_attempt_timeout: Some(Duration::from_secs(10)),
+            ..RpcClientConfig::trace_server()
+        };
+        let rpc_client = RpcClient::new_with_config(
+            &[url_gen.as_str()],
+            &[url_gen.as_str(), url_gw.as_str()],
+            config,
+            None,
+        )
+        .unwrap();
+        let cfg = WitnessFetchConfig {
+            local_window: 100,
+            generator_first: true,
+            ..WitnessFetchConfig::with_defaults(4)
+        };
+
+        let started = Instant::now();
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            None,
+            Some(5000),
+            5001,
+            B256::ZERO,
+            started + Duration::from_secs(4),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_ok(), "the fetch must succeed: {:?}", result.err());
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the 200ms global per-attempt must cut the stalled hop, not the witness cap \
+             ({elapsed:?})"
+        );
+        assert!(hits_gen.load(Ordering::Relaxed) >= 2, "round 1 must reach the generator");
+
+        ha.stop().unwrap();
+    }
+
     /// Old-block witness budget honors the configurable timeout and clamps to
     /// `witness_timeout`.
     #[test]
