@@ -1254,7 +1254,11 @@ where
                     round,
                 ));
             }
-            sleep_ms = sleep_ms.min(remaining_ms);
+            // Never sleep into more than half of what is left: clamped to `remaining`,
+            // a backoff that swallows the remainder wakes exactly at the deadline and
+            // forfeits the very retry it was sleeping for. The loop's own sleep obeys the
+            // same rule as a hop — no single component may consume everything that's left.
+            sleep_ms = sleep_ms.min((remaining_ms / 2).max(1));
         }
         log_at!(
             warn_level,

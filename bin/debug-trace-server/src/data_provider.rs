@@ -2116,6 +2116,55 @@ mod tests {
         ha.stop().unwrap();
     }
 
+    /// The inter-round backoff must obey the same rule as a hop: it may not consume
+    /// everything the stage has left. Clamped only to `remaining`, a sleep that swallows
+    /// the remainder wakes exactly at the deadline and forfeits the retry it slept for —
+    /// the hop cap's savings are eaten by our own backoff. With the sleep held to half
+    /// the remainder, round 1 fits and the generator serves. Goes red against
+    /// `sleep.min(remaining)`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deadline_pressure_shortens_the_backoff_instead_of_sleeping_into_it() {
+        let (ha, url_gen, hits_gen) = scripted_witness_rpc(1, Some(fixture_wire())).await;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url_gw = format!("http://{}/", listener.local_addr().unwrap());
+        let _held = listener;
+
+        let config = RpcClientConfig {
+            // Production-shaped backoff: larger than what round 0 leaves of the stage.
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(600), Duration::from_millis(800)),
+            witness_per_attempt_timeout: Some(Duration::from_secs(6)),
+            ..RpcClientConfig::trace_server()
+        };
+        let rpc_client = RpcClient::new_with_config(
+            &[url_gen.as_str()],
+            &[url_gen.as_str(), url_gw.as_str()],
+            config,
+            None,
+        )
+        .unwrap();
+        let cfg = WitnessFetchConfig {
+            local_window: 100,
+            generator_first: true,
+            ..WitnessFetchConfig::with_defaults(1)
+        };
+
+        let budget = Duration::from_millis(800);
+        let started = Instant::now();
+        let result =
+            fetch_witness(&rpc_client, &cfg, None, Some(5000), 5001, B256::ZERO, started + budget)
+                .await;
+
+        assert!(
+            result.is_ok(),
+            "the shortened backoff must leave room for round 1: {:?}",
+            result.err()
+        );
+        assert!(started.elapsed() < budget, "must not ride the deadline ({:?})", started.elapsed());
+        assert!(hits_gen.load(Ordering::Relaxed) >= 2, "round 1 must reach the generator");
+
+        ha.stop().unwrap();
+    }
+
     /// An operator's explicit `--rpc-per-attempt-timeout-ms` below the witness cap asked
     /// for stalled attempts to be cut *sooner*; the witness cap is a ceiling and must not
     /// quietly loosen it. With a 200ms global per-attempt, the stalled hop is cut at
