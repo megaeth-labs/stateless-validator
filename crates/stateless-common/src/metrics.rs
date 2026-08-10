@@ -74,7 +74,7 @@ pub enum RpcAttemptOutcome {
     /// it for a stall would be wrong. But the attempt did happen and did consume that
     /// budget, and recording nothing at all — as this path used to — makes a provider that
     /// swallows the entire remaining budget indistinguishable from one that was never
-    /// called. That ambiguity is exactly what blocked the 2026-08-09 timeout diagnosis.
+    /// called.
     DeadlineClamped,
 }
 
@@ -160,8 +160,10 @@ mod tests {
         assert_eq!(RpcAttemptOutcome::Success.as_str(), "success");
         assert_eq!(RpcAttemptOutcome::Error.as_str(), "error");
         assert_eq!(RpcAttemptOutcome::Timeout.as_str(), "timeout");
+        assert_eq!(RpcAttemptOutcome::DeadlineClamped.as_str(), "deadline_clamped");
         assert!(RpcAttemptOutcome::Success.is_success());
         assert!(!RpcAttemptOutcome::Error.is_success());
         assert!(!RpcAttemptOutcome::Timeout.is_success());
+        assert!(!RpcAttemptOutcome::DeadlineClamped.is_success());
     }
 }
