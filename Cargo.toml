@@ -20,44 +20,48 @@ exclude = [".github/"]
 
 [workspace.dependencies]
 # alloy
-alloy-consensus = { version = "1.0.23", default-features = false }
-alloy-eips = { version = "1.0.23", default-features = false }
-alloy-evm = { version = "0.15.0", default-features = false }
-alloy-genesis = { version = "1.0.23", default-features = false }
-alloy-hardforks = { version = "0.2.7", default-features = false }
-alloy-network = "1.0.23"
-alloy-op-evm = { version = "0.15.0", default-features = false }
-alloy-op-hardforks = { version = "0.2.7", default-features = false }
-alloy-primitives = { version = "1.3.0", default-features = false }
-alloy-provider = { version = "1.0.23", features = [
+alloy-consensus = { version = "2.0.5", default-features = false }
+alloy-eips = { version = "2.0.5", default-features = false }
+alloy-evm = { version = "0.36.0", default-features = false }
+alloy-genesis = { version = "2.0.5", default-features = false }
+alloy-hardforks = { version = "0.4.7", default-features = false }
+alloy-network = "2.0.5"
+alloy-op-evm = { git = "https://github.com/ethereum-optimism/optimism", rev = "f67d87cd5c9992b62d215c043917b94e3f019629", default-features = false }
+alloy-op-hardforks = { git = "https://github.com/ethereum-optimism/optimism", rev = "f67d87cd5c9992b62d215c043917b94e3f019629", default-features = false }
+alloy-primitives = { version = "1.6.0", default-features = false }
+alloy-provider = { version = "2.0.5", features = [
     "reqwest",
     "reqwest-rustls-tls",
 ], default-features = false }
-alloy-rlp = { version = "0.3.10", default-features = false }
-alloy-rpc-types-eth = { version = "1.0.23", default-features = false }
-alloy-rpc-types-trace = "1.0.23"
-alloy-serde = { version = "1.0.23", default-features = false }
-alloy-signer-local = "1.0.23"
-alloy-trie = { version = "0.9.0", default-features = false }
+alloy-rlp = { version = "0.3.13", default-features = false }
+alloy-rpc-types-eth = { version = "2.0.5", default-features = false }
+alloy-rpc-types-trace = "2.0.5"
+alloy-serde = { version = "2.0.5", default-features = false }
+alloy-signer-local = "2.0.5"
+alloy-trie = { version = "0.9.4", default-features = false }
 
 # mega
-mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", tag = "v1.7.0", default-features = false }
+mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", branch = "cz/chore/upgrade-revm-40", default-features = false }
 salt = { git = "https://github.com/megaeth-labs/salt.git", tag = "v1.0.5", default-features = false }
 
 # op
-op-alloy-consensus = { version = "0.18.12", default-features = false }
-op-alloy-network = { version = "0.18.12", default-features = false }
-op-alloy-rpc-types = { version = "0.18.12", default-features = false }
+# The OP crates are pinned to the same Optimism monorepo revision as mega-evm's
+# cz/chore/upgrade-revm-40 branch: crates.io has no op-revm / alloy-op-evm release built
+# against revm 40, and every OP crate must share one source identity for OpTxEnvelope,
+# receipt, and hardfork types. reth-optimism-chainspec also lives in that monorepo now.
+op-alloy-consensus = { git = "https://github.com/ethereum-optimism/optimism", rev = "f67d87cd5c9992b62d215c043917b94e3f019629", default-features = false }
+op-alloy-network = { git = "https://github.com/ethereum-optimism/optimism", rev = "f67d87cd5c9992b62d215c043917b94e3f019629", default-features = false }
+op-alloy-rpc-types = { git = "https://github.com/ethereum-optimism/optimism", rev = "f67d87cd5c9992b62d215c043917b94e3f019629", default-features = false }
 
 # reth
-reth-ethereum-forks = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-optimism-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-trie-common = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
-reth-trie-sparse = { git = "https://github.com/paradigmxyz/reth", tag = "v1.6.0", default-features = false }
+reth-ethereum-forks = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-optimism-chainspec = { git = "https://github.com/ethereum-optimism/optimism", rev = "f67d87cd5c9992b62d215c043917b94e3f019629", default-features = false }
+reth-trie-common = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
+reth-trie-sparse = { git = "https://github.com/paradigmxyz/reth", tag = "v2.3.0", default-features = false }
 
 # revm
-revm = { version = "27.1.0", default-features = false }
-revm-inspectors = { version = "0.27.3", features = ["std", "js-tracer"], default-features = false }
+revm = { version = "40.0.3", default-features = false }
+revm-inspectors = { version = "0.40.1", features = ["std", "js-tracer"], default-features = false }
 
 # misc
 base64 = { version = "0.22", default-features = false }
