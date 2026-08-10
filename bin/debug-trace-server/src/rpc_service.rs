@@ -338,18 +338,25 @@ fn invalid_params_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
 }
 
 /// Classifies `opts`, records the request-shape metric, and rejects a type-malformed
-/// `tracerConfig` on a config-reading builtin with `-32602 invalid params` — before any
-/// block data is fetched or executed. Returns the cache variant (`Some` only for
-/// cacheable shapes).
+/// `tracerConfig` on a config-reading builtin — or an unsupported tracer — with
+/// `-32602 invalid params`, before any block data is fetched or executed. Returns the
+/// cache variant (`Some` only for cacheable shapes).
 fn classify_and_gate(
     method_name: &'static str,
     opts: &GethDebugTracingOptions,
 ) -> Result<Option<ResponseVariant>, jsonrpsee::types::ErrorObjectOwned> {
     let shape = RequestShape::classify(opts);
     metrics::record_request_shape(method_name, shape.label());
-    if let RequestShape::InvalidTracerConfig { label, error } = &shape {
-        metrics::record_rpc_error(method_name);
-        return Err(invalid_params_err(format!("invalid tracerConfig for {label}: {error}")));
+    match &shape {
+        RequestShape::InvalidTracerConfig { label, error } => {
+            metrics::record_rpc_error(method_name);
+            return Err(invalid_params_err(format!("invalid tracerConfig for {label}: {error}")));
+        }
+        RequestShape::Unsupported { label } => {
+            metrics::record_rpc_error(method_name);
+            return Err(invalid_params_err(format!("unsupported tracer: {label}")));
+        }
+        _ => {}
     }
     Ok(shape.cache_variant())
 }

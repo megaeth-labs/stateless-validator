@@ -278,9 +278,8 @@ pub fn create_evm_env(
         difficulty: header.difficulty,
         prevrandao: Some(header.mix_hash),
         blob_excess_gas_and_price: None,
-        // EIP-7843 slot number. MegaETH has not activated Amsterdam, so headers carry
-        // no slot number and this stays 0 (the upstream `unwrap_or_default()` path).
-        slot_num: 0,
+        // EIP-7843 slot number: absent until Amsterdam activates (mirrors upstream).
+        slot_num: header.slot_number.unwrap_or_default(),
     };
 
     if let Some(excess_blob_gas) = header.excess_blob_gas {

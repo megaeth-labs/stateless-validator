@@ -42,7 +42,7 @@ use alloy_primitives::{Address, B256, Bytes, U256, address, keccak256, map::B256
 use alloy_rlp::Decodable;
 use alloy_trie::{
     EMPTY_ROOT_HASH, HashBuilder, Nibbles,
-    nodes::{RlpNode, TrieNode},
+    nodes::{BranchNode, RlpNode, TrieNode},
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -145,7 +145,12 @@ impl MptWitness {
             });
         }
 
-        let post_root = linearizer.compute_root(self.storage_root, &updates)?;
+        // With no updates the post-state is the pre-state just verified above.
+        let post_root = if updates.is_empty() {
+            pre_root
+        } else {
+            linearizer.compute_root(self.storage_root, &updates)?
+        };
         if post_root != expected_post_root {
             return Err(WithdrawalValidationError::PostStateRootMismatch {
                 expected: expected_post_root,
@@ -175,11 +180,7 @@ impl Linearizer<'_> {
         let mut hb = HashBuilder::default();
         if root == EMPTY_ROOT_HASH {
             // Nothing exists: inserts materialize, removals of absent slots are no-ops.
-            for (path, update) in updates {
-                if let Some(value) = update {
-                    hb.add_leaf(*path, value);
-                }
-            }
+            add_insert_leaves(&mut hb, updates);
         } else if self.nodes.contains_key(&root) {
             self.emit_subtree(&mut hb, &RlpNode::word_rlp(&root), Nibbles::default(), updates)?;
         } else {
@@ -264,31 +265,13 @@ impl Linearizer<'_> {
                 // absent slots: removals are no-ops, inserts become fresh leaves.
                 // The extension split this implies (and the child hash it reuses)
                 // falls out of the emitted stream — the child is never read.
-                for (leaf_path, update) in before {
-                    if let Some(value) = update {
-                        hb.add_leaf(*leaf_path, value);
-                    }
-                }
+                add_insert_leaves(hb, before);
                 self.emit_subtree(hb, &ext.child, boundary, under)?;
-                for (leaf_path, update) in after {
-                    if let Some(value) = update {
-                        hb.add_leaf(*leaf_path, value);
-                    }
-                }
+                add_insert_leaves(hb, after);
                 Ok(())
             }
             TrieNode::Branch(branch) => {
-                // Partition updates into per-child regions (contiguous runs, since
-                // they are sorted and all share `path` as a prefix).
-                let mut regions: Vec<(u8, Option<RlpNode>, &Updates)> = Vec::new();
-                let mut rest = updates;
-                for (idx, child) in branch.as_ref().children() {
-                    let split = rest.partition_point(|(p, _)| p.get_unchecked(path.len()) <= idx);
-                    let (region, tail) = rest.split_at(split);
-                    rest = tail;
-                    regions.push((idx, child.cloned(), region));
-                }
-                debug_assert!(rest.is_empty());
+                let regions = child_regions(&branch, &path, updates);
 
                 // A branch that ends up with a single surviving region collapses: the
                 // survivor merges upward. That is derived by the `HashBuilder` from
@@ -296,40 +279,33 @@ impl Linearizer<'_> {
                 // unwitnessed subtree, whose node kind (and thus merged shape) is
                 // unknowable. reth v1.6.0's sparse trie failed the same way, via its
                 // empty node provider.
-                let mut survivors = 0usize;
-                let mut sole: Option<&(u8, Option<RlpNode>, &Updates)> = None;
+                let mut survivors = Vec::new();
                 for region in &regions {
                     if self.region_survives(region, path)? {
-                        survivors += 1;
-                        sole = Some(region);
+                        survivors.push(region);
                     }
                 }
-                if survivors == 1 {
-                    let (idx, child, region) = sole.expect("survivors == 1");
-                    if region.is_empty() &&
-                        let Some(child) = child &&
-                        let Some(hash) = child.as_hash() &&
-                        !self.nodes.contains_key(&hash)
-                    {
-                        return Err(trie_error(format!(
-                            "branch collapse at {path:?} adopts unwitnessed subtree at child {idx:x}"
-                        )));
-                    }
+                if let [sole] = survivors[..] &&
+                    sole.updates.is_empty() &&
+                    let Some(child) = &sole.child &&
+                    let Some(hash) = child.as_hash() &&
+                    !self.nodes.contains_key(&hash)
+                {
+                    return Err(trie_error(format!(
+                        "branch collapse at {path:?} adopts unwitnessed subtree at child {:x}",
+                        sole.idx
+                    )));
                 }
 
-                for (idx, child, region) in regions {
+                for region in regions {
                     let mut child_path = path;
-                    child_path.push_unchecked(idx);
-                    match child {
-                        Some(child) => self.emit_subtree(hb, &child, child_path, region)?,
+                    child_path.push_unchecked(region.idx);
+                    match region.child {
+                        Some(child) => self.emit_subtree(hb, &child, child_path, region.updates)?,
                         None => {
                             // Empty slot: absence is proven by the branch mask, so
                             // removals are no-ops and inserts are fresh leaves.
-                            for (leaf_path, update) in region {
-                                if let Some(value) = update {
-                                    hb.add_leaf(*leaf_path, value);
-                                }
-                            }
+                            add_insert_leaves(hb, region.updates);
                         }
                     }
                 }
@@ -341,23 +317,20 @@ impl Linearizer<'_> {
     /// Whether a branch child region still holds any content after its updates.
     fn region_survives(
         &self,
-        (idx, child, region): &(u8, Option<RlpNode>, &Updates),
+        region: &ChildRegion<'_>,
         path: Nibbles,
     ) -> Result<bool, WithdrawalValidationError> {
-        // Any insert keeps the region alive; existing content with no updates survives.
-        if region.iter().any(|(_, update)| update.is_some()) {
+        // Any insert keeps the region alive; untouched existing content survives
+        // (`survives_removals` returns true immediately for an empty update set).
+        if region.updates.iter().any(|(_, update)| update.is_some()) {
             return Ok(true);
         }
-        match child {
+        match &region.child {
             None => Ok(false),
-            Some(child) if region.is_empty() => {
-                let _ = child;
-                Ok(true)
-            }
             Some(child) => {
                 let mut child_path = path;
-                child_path.push_unchecked(*idx);
-                self.survives_removals(child, child_path, region)
+                child_path.push_unchecked(region.idx);
+                self.survives_removals(child, child_path, region.updates)
             }
         }
     }
@@ -391,20 +364,53 @@ impl Linearizer<'_> {
                 self.survives_removals(&ext.child, boundary, under)
             }
             TrieNode::Branch(branch) => {
-                let mut rest = removals;
-                for (idx, child) in branch.as_ref().children() {
-                    let split = rest.partition_point(|(p, _)| p.get_unchecked(path.len()) <= idx);
-                    let (region, tail) = rest.split_at(split);
-                    rest = tail;
-                    let Some(child) = child else { continue };
-                    let mut child_path = path;
-                    child_path.push_unchecked(idx);
-                    if region.is_empty() || self.survives_removals(child, child_path, region)? {
+                for region in child_regions(&branch, &path, removals) {
+                    if self.region_survives(&region, path)? {
                         return Ok(true);
                     }
                 }
                 Ok(false)
             }
+        }
+    }
+}
+
+/// One branch child slot together with the updates that fall under it.
+struct ChildRegion<'a> {
+    /// The child's nibble index within the branch.
+    idx: u8,
+    /// The child reference from the branch stack; `None` for an empty slot.
+    child: Option<RlpNode>,
+    /// The updates whose paths run through this slot.
+    updates: &'a Updates,
+}
+
+/// Partitions `updates` (sorted, all lying under `path`) into the branch's 16 child
+/// regions. Each region is a contiguous run because the paths are sorted and grouped
+/// by their nibble at depth `path.len()`.
+fn child_regions<'a>(
+    branch: &BranchNode,
+    path: &Nibbles,
+    updates: &'a Updates,
+) -> Vec<ChildRegion<'a>> {
+    let mut regions = Vec::with_capacity(16);
+    let mut rest = updates;
+    for (idx, child) in branch.as_ref().children() {
+        let split = rest.partition_point(|(p, _)| p.get_unchecked(path.len()) <= idx);
+        let (region, tail) = rest.split_at(split);
+        rest = tail;
+        regions.push(ChildRegion { idx, child: child.cloned(), updates: region });
+    }
+    debug_assert!(rest.is_empty());
+    regions
+}
+
+/// Emits the inserted leaves of `updates` into `hb`. Only valid where the removals in
+/// `updates` are proven no-ops (their target region is known to hold no such leaves).
+fn add_insert_leaves(hb: &mut HashBuilder, updates: &Updates) {
+    for (path, update) in updates {
+        if let Some(value) = update {
+            hb.add_leaf(*path, value);
         }
     }
 }
@@ -439,12 +445,19 @@ mod tests {
     use super::*;
 
     const SLOT: B256 = b256!("0x1111111111111111111111111111111111111111111111111111111111111111");
+    /// A second slot diverging from `SLOT` at the first nibble.
+    const SLOT_B: B256 =
+        b256!("0x2111111111111111111111111111111111111111111111111111111111111111");
     const BOGUS: B256 = b256!("0xdeadbeef00000000000000000000000000000000000000000000000000000000");
 
     fn encoded(node: &TrieNode) -> Bytes {
         let mut rlp = Vec::new();
         node.encode(&mut rlp);
         Bytes::from(rlp)
+    }
+
+    fn rlp_of(node: &TrieNode) -> RlpNode {
+        node.rlp(&mut Vec::new())
     }
 
     fn value_rlp(value: u64) -> Vec<u8> {
@@ -564,9 +577,37 @@ mod tests {
     /// extension's first key nibble.
     #[test]
     fn insert_splitting_extension_with_absent_child_branch() {
-        let rlp_of = |node: &TrieNode| RlpNode::from_rlp(&encoded(node));
+        let (pre_root, witness, branch_hash) = ext_with_absent_branch();
 
-        // Child branch of the extension: two empty-key leaves at nibbles 1 and 2.
+        // Expected post-state: branch at the root splitting nibble 1 (old subtree,
+        // reached via the shortened extension) from nibble 2 (the new leaf).
+        let ext_key = Nibbles::unpack(SLOT).slice(0..63);
+        let shortened_ext = TrieNode::Extension(ExtensionNode::new(
+            ext_key.slice(1..),
+            RlpNode::word_rlp(&branch_hash),
+        ));
+        let new_leaf = leaf_node(Nibbles::unpack(SLOT_B).slice(1..), 9);
+        let split_branch = TrieNode::Branch(BranchNode::new(
+            vec![rlp_of(&shortened_ext), rlp_of(&new_leaf)],
+            0b0110.into(),
+        ));
+        let expected_post_root = keccak256(encoded(&split_branch));
+
+        run(pre_root, witness, Some(expected_post_root), &[(SLOT_B, U256::from(9u64))]).unwrap();
+    }
+
+    /// A zero-write to a slot that provably diverges inside a witnessed extension
+    /// key is a no-op: the post root equals the pre root.
+    #[test]
+    fn diverging_removal_is_noop() {
+        let (pre_root, witness, _) = ext_with_absent_branch();
+        run(pre_root, witness, Some(pre_root), &[(SLOT_B, U256::ZERO)]).unwrap();
+    }
+
+    /// Root extension (key = first 63 nibbles of `SLOT`) whose child branch — two
+    /// empty-key leaves at nibbles 1 and 2 — is intentionally absent from the
+    /// witness: returns `(pre_root, witness, branch_hash)`.
+    fn ext_with_absent_branch() -> (B256, Vec<Bytes>, B256) {
         let branch = TrieNode::Branch(BranchNode::new(
             vec![
                 rlp_of(&leaf_node(Nibbles::default(), 7)),
@@ -575,93 +616,44 @@ mod tests {
             0b0110.into(),
         ));
         let branch_hash = keccak256(encoded(&branch));
-
-        // Root extension covering the first 63 nibbles of SLOT.
-        let ext_key = Nibbles::unpack(SLOT).slice(0..63);
-        let ext = TrieNode::Extension(ExtensionNode::new(ext_key, RlpNode::word_rlp(&branch_hash)));
-        let ext_rlp = encoded(&ext);
-        let pre_root = keccak256(&ext_rlp);
-
-        // Insert a slot that diverges from the extension key at nibble 0.
-        let diverging_slot =
-            b256!("0x2111111111111111111111111111111111111111111111111111111111111111");
-
-        // Expected post-state: branch at the root splitting nibble 1 (old subtree,
-        // reached via the shortened extension) from nibble 2 (the new leaf).
-        let shortened_ext = TrieNode::Extension(ExtensionNode::new(
-            ext_key.slice(1..),
-            RlpNode::word_rlp(&branch_hash),
-        ));
-        let new_leaf =
-            TrieNode::Leaf(LeafNode::new(Nibbles::unpack(diverging_slot).slice(1..), value_rlp(9)));
-        let split_branch = TrieNode::Branch(BranchNode::new(
-            vec![rlp_of(&shortened_ext), rlp_of(&new_leaf)],
-            0b0110.into(),
-        ));
-        let expected_post_root = keccak256(encoded(&split_branch));
-
-        // Witness: extension only — the child branch is intentionally absent.
-        run(
-            pre_root,
-            vec![ext_rlp],
-            Some(expected_post_root),
-            &[(diverging_slot, U256::from(9u64))],
-        )
-        .unwrap();
-    }
-
-    /// A zero-write to a slot that provably diverges inside a witnessed extension
-    /// key is a no-op: the post root equals the pre root.
-    #[test]
-    fn diverging_removal_is_noop() {
-        let branch =
-            TrieNode::Branch(BranchNode::new(vec![rlp_of_leaf(7), rlp_of_leaf(8)], 0b0110.into()));
         let ext = TrieNode::Extension(ExtensionNode::new(
             Nibbles::unpack(SLOT).slice(0..63),
-            RlpNode::word_rlp(&keccak256(encoded(&branch))),
+            RlpNode::word_rlp(&branch_hash),
         ));
         let ext_rlp = encoded(&ext);
-        let pre_root = keccak256(&ext_rlp);
-        let diverging_slot =
-            b256!("0x2111111111111111111111111111111111111111111111111111111111111111");
-        run(pre_root, vec![ext_rlp], Some(pre_root), &[(diverging_slot, U256::ZERO)]).unwrap();
+        (keccak256(&ext_rlp), vec![ext_rlp], branch_hash)
     }
 
-    fn rlp_of_leaf(value: u64) -> RlpNode {
-        RlpNode::from_rlp(&encoded(&leaf_node(Nibbles::default(), value)))
-    }
-
-    /// Two-leaf trie under a root branch: (root, branch_rlp, leaf rlps, slots).
-    fn two_leaf_branch() -> (B256, Vec<Bytes>, B256, B256) {
-        let slot_b = b256!("0x2111111111111111111111111111111111111111111111111111111111111111");
+    /// Two-leaf trie: root branch holding `SLOT` under nibble 1 and `SLOT_B` under
+    /// nibble 2, all nodes witnessed. Returns `(root, witness)`.
+    fn two_leaf_branch() -> (B256, Vec<Bytes>) {
         let leaf_a = leaf_node(Nibbles::unpack(SLOT).slice(1..), 7);
-        let leaf_b = leaf_node(Nibbles::unpack(slot_b).slice(1..), 8);
+        let leaf_b = leaf_node(Nibbles::unpack(SLOT_B).slice(1..), 8);
         let branch = TrieNode::Branch(BranchNode::new(
-            vec![RlpNode::from_rlp(&encoded(&leaf_a)), RlpNode::from_rlp(&encoded(&leaf_b))],
+            vec![rlp_of(&leaf_a), rlp_of(&leaf_b)],
             0b0110.into(),
         ));
         let branch_rlp = encoded(&branch);
-        let root = keccak256(&branch_rlp);
-        (root, vec![branch_rlp, encoded(&leaf_a), encoded(&leaf_b)], SLOT, slot_b)
+        (keccak256(&branch_rlp), vec![branch_rlp, encoded(&leaf_a), encoded(&leaf_b)])
     }
 
     /// Removing one of two leaves collapses the root branch into the surviving
     /// leaf, whose node is witnessed — the merged single-leaf root must come out.
     #[test]
     fn removal_collapse_merges_witnessed_sibling() {
-        let (root, state, slot_a, slot_b) = two_leaf_branch();
-        let expected = keccak256(encoded(&leaf_node(Nibbles::unpack(slot_b), 8)));
-        run(root, state, Some(expected), &[(slot_a, U256::ZERO)]).unwrap();
+        let (root, state) = two_leaf_branch();
+        let expected = keccak256(encoded(&leaf_node(Nibbles::unpack(SLOT_B), 8)));
+        run(root, state, Some(expected), &[(SLOT, U256::ZERO)]).unwrap();
     }
 
     /// Same collapse, but the surviving sibling's node is absent from the witness:
     /// its merged shape is unknowable, so verification must fail closed.
     #[test]
     fn removal_collapse_with_unwitnessed_survivor_errors() {
-        let (root, mut state, slot_a, _) = two_leaf_branch();
+        let (root, mut state) = two_leaf_branch();
         state.truncate(2); // drop leaf_b — the survivor
         assert!(matches!(
-            run(root, state, Some(root), &[(slot_a, U256::ZERO)]),
+            run(root, state, Some(root), &[(SLOT, U256::ZERO)]),
             Err(TrieOperationFailed(_))
         ));
     }
@@ -669,10 +661,10 @@ mod tests {
     /// An update descending into an unwitnessed branch child must fail closed.
     #[test]
     fn update_descending_into_unwitnessed_subtree_errors() {
-        let (root, mut state, _, slot_b) = two_leaf_branch();
-        state.truncate(2); // drop leaf_b; slot_b's region is now opaque
+        let (root, mut state) = two_leaf_branch();
+        state.truncate(2); // drop leaf_b; SLOT_B's region is now opaque
         assert!(matches!(
-            run(root, state, Some(root), &[(slot_b, U256::from(9u64))]),
+            run(root, state, Some(root), &[(SLOT_B, U256::from(9u64))]),
             Err(TrieOperationFailed(_))
         ));
     }

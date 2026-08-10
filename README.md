@@ -103,7 +103,7 @@ The HTTP response cache is keyed by `(resource, block hash, tracer variant)` —
 Entries hold the reply's raw JSON bytes, serialized exactly once from the trace output and spliced verbatim into every response — a hit shares the bytes by `Arc` instead of re-parsing and re-serializing the JSON tree.
 By-number requests resolve their canonical hash before the lookup (local index, then an in-memory memo, then upstream `eth_getHeaderByNumber`), so a reorged height resolves to the new hash and misses cleanly.
 Cacheable shapes are the five built-in tracers (`callTracer`, `prestateTracer`, `4byteTracer`, `noopTracer`, `flatCallTracer`, keyed by their parsed, typed `tracerConfig` — equivalent configs collapse onto one entry) and the bare default struct-logger request (no tracer, no `tracerConfig`, default flags).
-JS tracers, `muxTracer`, the unimplemented `erc7562Tracer` (rejected with a request error), and struct-logger requests with non-default flags bypass the cache and are recomputed on every request.
+JS tracers, `muxTracer`, and struct-logger requests with non-default flags bypass the cache and are recomputed on every request; the unimplemented `erc7562Tracer` is rejected with `-32602` before any block data is fetched.
 A type-malformed `tracerConfig` on a config-reading builtin (`callTracer`/`prestateTracer`/`flatCallTracer`) is rejected with `-32602 invalid params` instead of being silently traced with default settings.
 Disable the cache with `--response-cache-disabled`; `--response-cache-estimated-items` must be at least 1 (the old `=0` disable convention is rejected at startup).
 
@@ -273,7 +273,7 @@ The pipeline is configured via `PipelineConfig` and customized through trait imp
 | `crates/stateless-core/src/executor.rs`                                                        | Block validation and EVM replay                                                                             |
 | `crates/stateless-core/src/db.rs`                                                              | Shared storage traits: `ChainStore`, `ContractStore`, `StoreError` (scenario stores live in their binaries) |
 | `crates/stateless-core/src/evm_database.rs`                                                    | `WitnessDatabase` implementing `revm::DatabaseRef`                                                          |
-| `crates/stateless-core/src/withdrawals/`                                                       | Withdrawal MPT witness verification (witness linearized into `alloy_trie::HashBuilder`)                                                              |
+| `crates/stateless-core/src/withdrawals.rs`                                                     | Withdrawal MPT witness verification (witness linearized into `alloy_trie::HashBuilder`)                                                              |
 | `crates/stateless-db/src/{lib,tables,helpers,serialize,cache}.rs`                              | Shared redb tables, helpers, serialization, and bounded `ContractCache`                                     |
 | `crates/stateless-common/src/rpc_client.rs`                                                    | `RpcClient`: multi-endpoint HTTP client for blocks, witnesses, and bytecode                                 |
 | `crates/stateless-common/src/metrics.rs`                                                       | `RpcMethod`, `RpcMetrics`, `RpcClientConfig`                                                                |

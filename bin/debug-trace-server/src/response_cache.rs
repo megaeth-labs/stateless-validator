@@ -182,6 +182,12 @@ pub enum RequestShape {
         /// The deserialization failure.
         error: serde_json::Error,
     },
+    /// A builtin tracer this server does not implement: the request must be rejected
+    /// before any block data is fetched or executed.
+    Unsupported {
+        /// Shape label of the unsupported tracer.
+        label: &'static str,
+    },
 }
 
 impl RequestShape {
@@ -193,7 +199,8 @@ impl RequestShape {
     ///
     /// Bypassed: JS tracers (the response depends on the tracer source, which has no place
     /// in a bounded key), `muxTracer`, and struct-logger requests with non-default
-    /// `opts.config`.
+    /// `opts.config`. The unimplemented `erc7562Tracer` classifies as [`Self::Unsupported`]
+    /// and is rejected at the gate.
     pub fn classify(opts: &GethDebugTracingOptions) -> Self {
         use alloy_rpc_types_trace::geth::{GethDebugBuiltInTracerType, GethDebugTracerType};
 
@@ -235,9 +242,9 @@ impl RequestShape {
                 // Exhaustive on purpose: a future alloy builtin variant must make an
                 // explicit cache-whitelist decision here instead of silently bypassing.
                 GethDebugBuiltInTracerType::MuxTracer => Self::Bypass("mux_tracer"),
-                // Not implemented by the tracing executor (rejected there with a
-                // request error), so it must not claim a cache slot.
-                GethDebugBuiltInTracerType::Erc7562Tracer => Self::Bypass("erc7562_tracer"),
+                GethDebugBuiltInTracerType::Erc7562Tracer => {
+                    Self::Unsupported { label: "erc7562_tracer" }
+                }
             },
             Some(GethDebugTracerType::JsTracer(_)) => Self::Bypass("js_tracer"),
         }
@@ -263,7 +270,7 @@ impl RequestShape {
         match self {
             Self::Cacheable(variant) => variant.label(),
             Self::Bypass(label) => label,
-            Self::InvalidTracerConfig { label, .. } => label,
+            Self::InvalidTracerConfig { label, .. } | Self::Unsupported { label } => label,
         }
     }
 
