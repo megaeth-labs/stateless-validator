@@ -12,7 +12,6 @@ exclude.workspace = true
 alloy-consensus.workspace = true
 alloy-evm.workspace = true
 alloy-genesis.workspace = true
-alloy-op-evm.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-rpc-types-trace.workspace = true
@@ -21,6 +20,7 @@ alloy-rpc-types-trace.workspace = true
 mega-evm.workspace = true
 
 # op
+alloy-op-evm.workspace = true
 op-alloy-network.workspace = true
 op-alloy-rpc-types.workspace = true
 
