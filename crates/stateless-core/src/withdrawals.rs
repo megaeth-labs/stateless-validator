@@ -9,6 +9,7 @@
 //! closed.
 
 use std::{
+    format,
     string::{String, ToString},
     vec::Vec,
 };
