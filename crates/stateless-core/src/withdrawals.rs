@@ -13,10 +13,10 @@ use std::{
 use alloy_consensus::{Header, constants::KECCAK_EMPTY};
 use alloy_primitives::{Address, B256, Bytes, U256, address, keccak256, map::B256Map};
 use alloy_rlp::Encodable;
-use reth_trie_common::{EMPTY_ROOT_HASH, LeafNode, Nibbles, TrieAccount, TrieNode};
-use reth_trie_sparse::{
-    SerialSparseTrie, SparseStateTrie, SparseTrie, provider::DefaultTrieNodeProviderFactory,
+use reth_trie_common::{
+    DecodedMultiProofV2, EMPTY_ROOT_HASH, LeafNode, Nibbles, TrieAccount, TrieNode,
 };
+use reth_trie_sparse::{RevealableSparseTrie, SparseStateTrie};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -87,26 +87,28 @@ impl MptWitness {
         // Synthesize account-level witness and reveal via BFS
         let (synthesized_state_root, witness_map, hashed_address) = synthesize_state_witness(self);
 
-        let mut state_trie = SparseStateTrie::<SerialSparseTrie>::default();
+        let mut state_trie = SparseStateTrie::default();
+        let multiproof = DecodedMultiProofV2::from_witness(synthesized_state_root, &witness_map)
+            .map_err(|e| WithdrawalValidationError::TrieOperationFailed(e.to_string()))?;
         state_trie
-            .reveal_witness(synthesized_state_root, &witness_map)
+            .reveal_decoded_multiproof_v2(multiproof)
             .map_err(|e| WithdrawalValidationError::TrieOperationFailed(e.to_string()))?;
 
-        // `reveal_witness` skips storage subtrees whose root is `EMPTY_ROOT_HASH`,
+        // `from_witness` skips storage subtrees whose root is `EMPTY_ROOT_HASH`,
         // leaving the per-address storage trie blind. That's fine for pre-state
         // verification, but if the block writes any non-zero slot to an
         // empty-pre-state trie (e.g. the first-ever withdrawal), the subsequent
         // `update_storage_leaf` call would fail with "sparse trie is blind".
         // Insert a revealed-empty storage trie so writes can proceed.
         if self.storage_root == EMPTY_ROOT_HASH {
-            state_trie.insert_storage_trie(hashed_address, SparseTrie::revealed_empty());
+            state_trie.insert_storage_trie(hashed_address, RevealableSparseTrie::revealed_empty());
         }
 
         // Verify pre-state root. `storage_root` returns `None` when the storage
         // trie wasn't revealed; that only happens when `self.storage_root` was
         // non-empty and reveal_witness failed to populate it, which the check
         // below will catch as a mismatch.
-        let pre_root = state_trie.storage_root(hashed_address).unwrap_or(EMPTY_ROOT_HASH);
+        let pre_root = state_trie.storage_root(&hashed_address).unwrap_or(EMPTY_ROOT_HASH);
         if pre_root != self.storage_root {
             return Err(WithdrawalValidationError::PreStateRootMismatch {
                 expected: self.storage_root,
@@ -120,22 +122,17 @@ impl MptWitness {
             if !value.is_zero() {
                 let encoded = alloy_rlp::encode_fixed_size(&value).to_vec();
                 state_trie
-                    .update_storage_leaf(
-                        hashed_address,
-                        nibbles,
-                        encoded,
-                        DefaultTrieNodeProviderFactory,
-                    )
+                    .update_storage_leaf(hashed_address, nibbles, encoded)
                     .map_err(|e| WithdrawalValidationError::TrieOperationFailed(e.to_string()))?;
             } else {
                 state_trie
-                    .remove_storage_leaf(hashed_address, &nibbles, DefaultTrieNodeProviderFactory)
+                    .remove_storage_leaf(hashed_address, &nibbles)
                     .map_err(|e| WithdrawalValidationError::TrieOperationFailed(e.to_string()))?;
             }
         }
 
         // Verify post-state root (same empty-trie caveat as pre-state).
-        let post_root = state_trie.storage_root(hashed_address).unwrap_or(EMPTY_ROOT_HASH);
+        let post_root = state_trie.storage_root(&hashed_address).unwrap_or(EMPTY_ROOT_HASH);
         if post_root != expected_post_root {
             return Err(WithdrawalValidationError::PostStateRootMismatch {
                 expected: expected_post_root,

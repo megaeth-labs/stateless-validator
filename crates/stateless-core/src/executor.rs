@@ -40,8 +40,8 @@ use alloy_evm::{
 };
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{
-    Address, Bloom, keccak256,
-    map::{B256Map, HashMap},
+    Bloom, keccak256,
+    map::{AddressMap, B256Map, HashMap},
 };
 use alloy_rpc_types_eth::{Block, BlockTransactions};
 use mega_evm::{
@@ -278,6 +278,9 @@ pub fn create_evm_env(
         difficulty: header.difficulty,
         prevrandao: Some(header.mix_hash),
         blob_excess_gas_and_price: None,
+        // EIP-7843 slot number. MegaETH has not activated Amsterdam, so headers carry
+        // no slot number and this stays 0 (the upstream `unwrap_or_default()` path).
+        slot_num: 0,
     };
 
     if let Some(excess_blob_gas) = header.excess_blob_gas {
@@ -374,7 +377,7 @@ pub fn replay_block<B, DB, ENV, E>(
     db: &DB,
     env_oracle: ENV,
     #[cfg(feature = "std")] trace_writer: Option<Box<dyn Write>>,
-) -> Result<(HashMap<Address, BundleAccount>, BlockExecutionOutput), ValidationError>
+) -> Result<(AddressMap<BundleAccount>, BlockExecutionOutput), ValidationError>
 where
     B: BlockInput,
     DB: DatabaseRef<Error = E> + Debug,
@@ -506,7 +509,7 @@ where
 
 /// Extracts the withdrawal-contract storage updates (only changed slots) from the replayed
 /// accounts, keyed by the hashed slot as [`MptWitness::verify`] expects.
-fn withdrawal_storage(accounts: &HashMap<Address, BundleAccount>) -> B256Map<U256> {
+fn withdrawal_storage(accounts: &AddressMap<BundleAccount>) -> B256Map<U256> {
     accounts
         .get(&ADDRESS_L2_TO_L1_MESSAGE_PASSER)
         .map(|a| {
@@ -527,7 +530,7 @@ fn withdrawal_storage(accounts: &HashMap<Address, BundleAccount>) -> B256Map<U25
 /// the same map the SALT trie update consumes and the sequencer's `SaltDeltas` are derived from.
 fn derive_state_updates(
     witness: &Witness,
-    accounts: HashMap<Address, BundleAccount>,
+    accounts: AddressMap<BundleAccount>,
 ) -> Result<StateUpdates, ValidationError> {
     // Flatten Revm's BundleAccount format into plain key-value pairs
     let mut kv_updates: BTreeMap<Vec<u8>, Option<Vec<u8>>> = BTreeMap::new();
@@ -651,7 +654,7 @@ struct VerifiedReplay {
     /// The proof-verified witness the block was replayed over.
     witness: Witness,
     /// Net per-account state changes from the replay.
-    accounts: HashMap<Address, BundleAccount>,
+    accounts: AddressMap<BundleAccount>,
     /// Execution outputs claimed by the header, plus state access counts.
     output: BlockExecutionOutput,
     /// Stats for the completed stages; [`ValidationStats::salt_update_time`] is left `0.0`
