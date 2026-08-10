@@ -158,7 +158,9 @@ struct Args {
     #[clap(long, env = "DEBUG_TRACE_SERVER_START_BLOCK")]
     start_block: Option<String>,
 
-    /// Witness fetch timeout in seconds.
+    /// Witness fetch timeout in seconds. Half of it also caps any single witness-chain
+    /// attempt (and the R2 pre-try), so one stalled endpoint can never consume the whole
+    /// stage and starve the retry rotation.
     #[clap(
         long,
         env = "DEBUG_TRACE_SERVER_WITNESS_TIMEOUT",
@@ -311,9 +313,10 @@ struct Args {
     witness_old_block_timeout: Option<u64>,
 
     /// R2 S3 endpoint origin, e.g. `https://<account>.r2.cloudflarestorage.com` (no bucket
-    /// path). With `--r2-bucket` and the credential flags, historical witnesses are fetched
-    /// straight from the bucket, with the RPC witness chain as fallback; frontier blocks keep
-    /// the generator path. Requires a local DB (`--data-dir`) to anchor block age.
+    /// path). With `--r2-bucket` and the credential flags, every witness fetch tries the
+    /// bucket first, with the RPC witness chain as fallback — frontier probes usually miss
+    /// (one fast 404) while historical fetches are served here. Requires a local DB
+    /// (`--data-dir`) to anchor block age.
     #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ENDPOINT", requires_all = ["r2_bucket", "r2_access_key_id", "r2_secret_access_key"])]
     r2_endpoint: Option<String>,
 
@@ -550,6 +553,11 @@ async fn main() -> Result<()> {
         data_max_concurrent_requests: args.data_max_concurrent_requests,
         witness_max_concurrent_requests: args.witness_max_concurrent_requests,
         per_attempt_timeout,
+        // Half the witness stage budget, mirroring the R2 pre-try's half-budget rule: no
+        // single witness hop — generator, gateway, or R2 — may consume more than half the
+        // stage, so one stalled endpoint always leaves budget for another rotation. Derived
+        // rather than flagged: it moves with --witness-timeout.
+        witness_per_attempt_timeout: Some(std::time::Duration::from_secs(args.witness_timeout) / 2),
         ..rpc_defaults
     }
     .with_metrics(Arc::new(metrics::TraceRpcMetrics));

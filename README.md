@@ -35,7 +35,7 @@ The workspace contains two binaries and five library crates:
 | `stateless-db`         | `crates/stateless-db`         | redb-backed persistence: table definitions, read/write helpers, bounded `ContractCache`                                                                                              |
 | `stateless-common`     | `crates/stateless-common`     | Shared utilities: RPC client, logging, metrics                                                                                                                                       |
 | `stateless-test-utils` | `crates/stateless-test-utils` | Test fixtures (blocks, witnesses, contracts) and env-var lock for integration tests                                                                                                  |
-| `stateless-r2`         | `crates/stateless-r2`         | Shared R2 (S3) witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT/GET with retry; consumed by mega-reth's witness uploaders (write), this repo's validator, and the trace server's historical witness source (read) |
+| `stateless-r2`         | `crates/stateless-r2`         | Shared R2 (S3) witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT/GET with retry; consumed by mega-reth's witness uploaders (write), this repo's validator, and the trace server's witness source (read) |
 | `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers                                                                                                                                 |
 | `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                                                                                                                        |
 
@@ -149,10 +149,12 @@ The head observation is trusted as a freshness anchor only while itself recent (
 Deep catch-up blocks (far below the observed head, where the generator may have pruned the witness) keep full failover from the first attempt.
 Without `--witness-generator-endpoint`, historical routing is disabled and the endpoints are plain failover.
 
-**Direct-from-R2 historical witnesses:**
-With `--r2-endpoint`, `--r2-bucket`, `--r2-access-key-id`, and `--r2-secret-access-key` (all four together), request-serving witness fetches for historical blocks try a SigV4-signed GET against the bucket before the RPC witness chain.
+**Direct-from-R2 witnesses:**
+With `--r2-endpoint`, `--r2-bucket`, `--r2-access-key-id`, and `--r2-secret-access-key` (all four together), every request-serving witness fetch tries a SigV4-signed GET against the bucket before the RPC witness chain.
 Object storage tolerates far higher parallelism than a shared RPC gateway and the bucket holds full history, so bulk backfill traffic stops competing with everything else on the public endpoint; any R2 failure (missing object, throttle, transport, corrupt payload — counted in `debug_trace_r2_witness_errors_total{kind}`) falls back to the RPC chain on the remaining witness budget, and the R2 attempt is capped at half that budget so a hung endpoint can never starve the fallback.
-Frontier blocks keep the generator path (the bucket receives objects only after the uploader PUTs them), and the route needs a local DB (`--data-dir`) to anchor block age.
+Frontier probes usually miss — the uploader typically lags the generator — and cost one fast 404; hits are labeled `witness_r2_frontier` (vs `witness_r2` for historical) so their hit rate stays separable, and a frontier `missing` is deliberately excluded from `debug_trace_r2_witness_errors_total{kind="missing"}`, which remains the bucket-integrity alarm for historical holes.
+The bucket is the same store the public gateway serves witnesses from, so at the frontier it can lead the generator (whose RPC server publishes from a different file than the uploader reads); the route needs a local DB (`--data-dir`) to anchor block age.
+Any single witness-chain RPC attempt under a deadline is additionally capped at half the witness stage budget, so a stalled endpoint (or a saturated concurrency permit — waits are deadline-bounded too) can never consume the stage and leave nothing for another rotation.
 `--r2-max-concurrent-requests` caps in-flight GETs separately from `--witness-max-concurrent-requests` — the RPC cap sizes a shared gateway, R2 tolerates far more.
 
 **Witness routing and sync knobs** (each also settable via its `DEBUG_TRACE_SERVER_*` env var):

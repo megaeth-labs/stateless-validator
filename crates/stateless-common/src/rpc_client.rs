@@ -126,6 +126,21 @@ pub struct RpcClientConfig {
     /// timing out the attempt rotates `round_robin_with_backoff` to the next provider.
     /// With `deadline = Some(d)`, each attempt uses `min(per_attempt_timeout, d - now)`.
     pub per_attempt_timeout: Duration,
+    /// Witness-specific override of [`Self::per_attempt_timeout`], applied only when the
+    /// logical call carries a deadline. `None` inherits `per_attempt_timeout`.
+    ///
+    /// Exists because on the witness path the general cap is dead code: the witness stage
+    /// budget sits below `per_attempt_timeout`, so `min(per_attempt, remaining)` always
+    /// resolves to `remaining` and the first stalled endpoint can legally consume the
+    /// entire stage — leaving no budget for another rotation, which is what turns one slow
+    /// hop into a client-visible timeout. The trace server sets half its witness stage
+    /// budget, so any single hop leaves at least half the stage for the rest of the chain.
+    ///
+    /// Deadline-less witness fetches (the chain-sync prefetch) deliberately keep the
+    /// general cap: with unbounded rounds, cutting a deterministically-slow-but-honest
+    /// transfer at a value below its duration would re-cut it every round and wedge the
+    /// fetch permanently instead of merely making it slow.
+    pub witness_per_attempt_timeout: Option<Duration>,
 }
 
 impl Default for RpcClientConfig {
@@ -143,6 +158,7 @@ impl Default for RpcClientConfig {
             // several seconds; everything else is sub-second), but bounded enough that a
             // stalled (TCP-accept-no-reply) provider is detected within reasonable time.
             per_attempt_timeout: Duration::from_secs(20),
+            witness_per_attempt_timeout: None,
         }
     }
 }
@@ -156,6 +172,7 @@ impl std::fmt::Debug for RpcClientConfig {
             .field("witness_max_concurrent_requests", &self.witness_max_concurrent_requests)
             .field("rpc_retry", &self.rpc_retry)
             .field("per_attempt_timeout", &self.per_attempt_timeout)
+            .field("witness_per_attempt_timeout", &self.witness_per_attempt_timeout)
             .finish()
     }
 }
@@ -704,12 +721,21 @@ impl RpcClient {
             "witness provider range ({providers:?}) must select at least one of {} providers",
             self.witness_providers.len()
         );
+        // The witness attempt cap protects a bounded stage budget from a single stalled
+        // hop; a deadline-less fetch has no budget to protect and must instead be able to
+        // out-wait transfers slower than the cap (see `witness_per_attempt_timeout`).
+        let per_attempt = match deadline {
+            Some(_) => {
+                self.config.witness_per_attempt_timeout.unwrap_or(self.config.per_attempt_timeout)
+            }
+            None => self.config.per_attempt_timeout,
+        };
         round_robin_with_backoff(
             &self.witness_providers[providers.clone()],
             &self.witness_provider_labels[providers],
             &self.witness_concurrency,
             &self.config.rpc_retry,
-            self.config.per_attempt_timeout,
+            per_attempt,
             0,
             RpcMethod::MegaGetBlockWitness,
             self.config.metrics.as_ref(),
@@ -1040,7 +1066,30 @@ where
             // concurrency cap and an unresponsive endpoint are otherwise the same
             // observation, and they have opposite fixes.
             let queued = Instant::now();
-            let permit = semaphore.acquire().await.expect("semaphore closed unexpectedly");
+            // A deadline bounds the queue wait too: under saturation the caller's budget
+            // must stay available for its own fallback instead of draining in the queue —
+            // and a parked acquire would otherwise return long after the caller's deadline.
+            let permit = match deadline {
+                None => semaphore.acquire().await,
+                Some(d) => match tokio::time::timeout_at(d.into(), semaphore.acquire()).await {
+                    Ok(acquired) => acquired,
+                    Err(_elapsed) => {
+                        let permit_wait = queued.elapsed();
+                        if let Some(m) = metrics {
+                            m.on_rpc_permit_wait(method, permit_wait.as_secs_f64());
+                        }
+                        return Err(record_deadline(
+                            call_start.elapsed(),
+                            "permit_wait",
+                            Some(provider_label),
+                            permit_wait,
+                            Duration::ZERO,
+                            round,
+                        ));
+                    }
+                },
+            }
+            .expect("semaphore closed unexpectedly");
             let permit_wait = queued.elapsed();
             if let Some(m) = metrics {
                 m.on_rpc_permit_wait(method, permit_wait.as_secs_f64());

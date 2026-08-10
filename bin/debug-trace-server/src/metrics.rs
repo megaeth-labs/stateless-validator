@@ -635,6 +635,7 @@ fn pre_register_all_metrics() {
     let _ = DataSourceMetrics::new_for_source("witness_generator");
     let _ = DataSourceMetrics::new_for_source("witness_historical");
     let _ = DataSourceMetrics::new_for_source("witness_r2");
+    let _ = DataSourceMetrics::new_for_source("witness_r2_frontier");
 
     // Data Fetch Layer: R2 historical witness source
     counter!(R2_WITNESS_RETRIES_TOTAL).increment(0);
@@ -689,6 +690,7 @@ fn pre_register_all_metrics() {
     let _ = WitnessSourceMetrics::new_for_source("witness_generator");
     let _ = WitnessSourceMetrics::new_for_source("witness_historical");
     let _ = WitnessSourceMetrics::new_for_source("witness_r2");
+    let _ = WitnessSourceMetrics::new_for_source("witness_r2_frontier");
 
     // Execution Layer (per method)
     let _ = EvmExecutionMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
