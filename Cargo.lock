@@ -4828,29 +4828,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reth-trie-common"
-version = "2.3.0"
-source = "git+https://github.com/paradigmxyz/reth?tag=v2.3.0#9384bc53d8c0c77e59cac83fdaaf3b372c6d2216"
-dependencies = [
- "alloy-consensus",
- "alloy-primitives",
- "alloy-rlp",
- "alloy-rpc-types-eth",
- "alloy-serde",
- "alloy-trie",
- "arrayvec",
- "bytes",
- "derive_more",
- "itertools 0.14.0",
- "nybbles",
- "reth-codecs",
- "reth-primitives-traits",
- "revm-database",
- "serde",
- "serde_with",
-]
-
-[[package]]
 name = "reth-zstd-compressors"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5892,7 +5869,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-rpc-types-eth",
  "alloy-serde",
- "auto_impl",
+ "alloy-trie",
  "bincode",
  "dyn-clone",
  "eyre",
@@ -5904,13 +5881,11 @@ dependencies = [
  "op-alloy-rpc-types",
  "reth-ethereum-forks",
  "reth-optimism-chainspec",
- "reth-trie-common",
  "revm",
  "rustc-hash",
  "salt",
  "serde",
  "serde_json",
- "smallvec",
  "stateless-test-utils",
  "thiserror 2.0.20",
  "tokio",

@@ -21,9 +21,6 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc as std;
 
-// The vendored sparse-trie code (`withdrawals::sparse_trie`) uses `alloc::` paths verbatim.
-extern crate alloc;
-
 pub mod chain_spec;
 pub mod light_witness;
 pub use light_witness::{LightWitness, LightWitnessExecutor, LightWitnessFromSalt};

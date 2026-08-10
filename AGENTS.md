@@ -129,7 +129,7 @@ The background chain-sync prefetch routes by freshness against the last observed
 | `crates/stateless-core/src/executor.rs`                                                        | Block validation and EVM replay (generic over the `BlockInput` projection)           |
 | `crates/stateless-core/src/evm_database.rs`                                                    | WitnessDatabase implementing `revm::DatabaseRef`                                     |
 | `crates/stateless-core/src/db.rs`                                                              | Shared storage traits (`ContractStore`, `ChainStore`) + `StoreError` / `StoreResult` |
-| `crates/stateless-core/src/withdrawals/`                                                       | Withdrawal MPT witness verification (sparse trie vendored from reth v1.6.0)                                       |
+| `crates/stateless-core/src/withdrawals/`                                                       | Withdrawal MPT witness verification (witness linearized into `alloy_trie::HashBuilder`)                                       |
 | `crates/stateless-db/src/{lib,tables,helpers,serialize,cache}.rs`                              | Shared redb tables, helpers, serialization, and `ContractCache`                      |
 | `crates/stateless-common/src/rpc_client.rs`                                                    | RPC client for blocks, witnesses, and bytecode                                       |
 | `crates/stateless-common/src/metrics.rs`                                                       | RpcMethod, RpcMetrics, RpcClientConfig                                               |
