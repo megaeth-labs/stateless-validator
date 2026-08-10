@@ -2165,6 +2165,65 @@ mod tests {
         ha.stop().unwrap();
     }
 
+    /// A saturated witness semaphore must not park a deadline-bound call past its budget:
+    /// the permit wait is selected against the deadline, gives up at it, and records the
+    /// give-up (`phase="permit_wait"`) — instead of waiting for an unrelated in-flight
+    /// attempt to free a permit and only then discovering the deadline. Goes red with a
+    /// bare `acquire().await`, which parks until the hog's per-attempt timeout fires
+    /// seconds later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn saturated_permit_queue_fails_at_the_deadline_not_after_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url_hang = format!("http://{}/", listener.local_addr().unwrap());
+        let _held = listener;
+
+        let config = RpcClientConfig {
+            witness_max_concurrent_requests: Some(1),
+            // Keeps the hog parked in its attempt well past the victim's deadline.
+            per_attempt_timeout: Duration::from_secs(5),
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(20), Duration::from_millis(40)),
+            ..RpcClientConfig::trace_server()
+        };
+        let rpc_client = Arc::new(
+            RpcClient::new_with_config(&[url_hang.as_str()], &[url_hang.as_str()], config, None)
+                .unwrap(),
+        );
+
+        // Hog: takes the only permit and stalls inside its attempt against the hung server.
+        let hog = {
+            let client = Arc::clone(&rpc_client);
+            tokio::spawn(async move {
+                let _ = client
+                    .get_witness_light_with_deadline(
+                        1,
+                        B256::ZERO,
+                        Some(Instant::now() + Duration::from_secs(4)),
+                    )
+                    .await;
+            })
+        };
+        // Let the hog reach its attempt so the permit is genuinely held.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let started = Instant::now();
+        let result = rpc_client
+            .get_witness_light_with_deadline(
+                2,
+                B256::ZERO,
+                Some(Instant::now() + Duration::from_millis(300)),
+            )
+            .await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_err(), "the queued call must give up on its own deadline");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the give-up must happen at the deadline, not when the hog frees the permit \
+             ({elapsed:?})"
+        );
+        hog.abort();
+    }
+
     /// An operator's explicit `--rpc-per-attempt-timeout-ms` below the witness cap asked
     /// for stalled attempts to be cut *sooner*; the witness cap is a ceiling and must not
     /// quietly loosen it. With a 200ms global per-attempt, the stalled hop is cut at
