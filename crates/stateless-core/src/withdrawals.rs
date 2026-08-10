@@ -3,34 +3,10 @@
 //! This module verifies storage state transitions for the L2ToL1MessagePasser contract,
 //! which stores commitments to withdrawal transactions. Given a pre-state witness and
 //! storage updates from block execution, it cryptographically proves the storage root
-//! transition is valid.
-//!
-//! # Approach
-//!
-//! The witness is the union of `eth_getProof`-style minimal per-slot proofs for the
-//! contract's storage trie: RLP nodes along each touched slot's inclusion or exclusion
-//! path, and nothing else. In particular, an exclusion path may end at an extension
-//! node whose child branch is absent — splitting that extension on insert never reads
-//! the child.
-//!
-//! Verification linearizes the witnessed trie into [`alloy_trie::HashBuilder`] — the
-//! same primitive reth's own proof generator is built on — as a sorted stream of:
-//!
-//! - `add_leaf` for every surviving or updated leaf (leaf paths are the hashed slots and never
-//!   change), and
-//! - `add_branch` for every unwitnessed subtree (its position and hash are invariant under edits
-//!   elsewhere).
-//!
-//! All structural changes — extension splits, branch collapses, new branches — fall
-//! out of the stream shape inside the builder, so no trie mutation code exists here.
-//!
-//! Two passes run per verification. The pre-pass linearizes the witness with **no**
-//! updates and must reproduce `storage_root` bit-for-bit, self-checking the walk on
-//! the very witness being verified; the post-pass applies the updates and must
-//! reproduce the header's `withdrawals_root`. Updates that cannot be proven against
-//! the witness (descent into an unwitnessed subtree, or a branch collapse adopting an
-//! unwitnessed node) fail closed, matching the behavior of the reth v1.6.0 sparse
-//! trie this module previously relied on.
+//! transition is valid: the witnessed trie is rebuilt with [`alloy_trie::HashBuilder`]
+//! once without updates (must reproduce `storage_root`) and once with them (must
+//! reproduce the header's `withdrawals_root`); updates the witness cannot prove fail
+//! closed.
 
 use std::{
     string::{String, ToString},
