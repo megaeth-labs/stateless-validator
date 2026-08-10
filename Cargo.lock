@@ -2501,27 +2501,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fixed-map"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86ed19add84e8cb9e8cc5f7074de0324247149ffef0b851e215fb0edc50c229b"
-dependencies = [
- "fixed-map-derive",
- "serde",
-]
-
-[[package]]
-name = "fixed-map-derive"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6dc7a9cb3326bafb80642c5ce99b39a2c0702d4bfa8ee8a3e773791a6cbe2407"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
-]
-
-[[package]]
 name = "fixedbitset"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4739,19 +4718,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "reth-execution-errors"
-version = "2.3.0"
-source = "git+https://github.com/paradigmxyz/reth?tag=v2.3.0#9384bc53d8c0c77e59cac83fdaaf3b372c6d2216"
-dependencies = [
- "alloy-evm",
- "alloy-primitives",
- "alloy-rlp",
- "nybbles",
- "reth-storage-errors",
- "thiserror 2.0.20",
-]
-
-[[package]]
 name = "reth-network-peers"
 version = "2.3.0"
 source = "git+https://github.com/paradigmxyz/reth?tag=v2.3.0#9384bc53d8c0c77e59cac83fdaaf3b372c6d2216"
@@ -4837,7 +4803,6 @@ dependencies = [
  "dashmap",
  "derive_more",
  "once_cell",
- "rayon",
  "reth-codecs",
  "revm-bytecode",
  "revm-primitives",
@@ -4845,20 +4810,6 @@ dependencies = [
  "secp256k1 0.30.0",
  "serde",
  "thiserror 2.0.20",
-]
-
-[[package]]
-name = "reth-prune-types"
-version = "2.3.0"
-source = "git+https://github.com/paradigmxyz/reth?tag=v2.3.0#9384bc53d8c0c77e59cac83fdaaf3b372c6d2216"
-dependencies = [
- "alloy-primitives",
- "derive_more",
- "reth-codecs",
- "serde",
- "strum",
- "thiserror 2.0.20",
- "tracing",
 ]
 
 [[package]]
@@ -4873,50 +4824,6 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-signer",
  "reth-primitives-traits",
- "thiserror 2.0.20",
-]
-
-[[package]]
-name = "reth-stages-types"
-version = "2.3.0"
-source = "git+https://github.com/paradigmxyz/reth?tag=v2.3.0#9384bc53d8c0c77e59cac83fdaaf3b372c6d2216"
-dependencies = [
- "alloy-primitives",
- "bytes",
- "reth-codecs",
- "reth-trie-common",
- "serde",
-]
-
-[[package]]
-name = "reth-static-file-types"
-version = "2.3.0"
-source = "git+https://github.com/paradigmxyz/reth?tag=v2.3.0#9384bc53d8c0c77e59cac83fdaaf3b372c6d2216"
-dependencies = [
- "alloy-primitives",
- "derive_more",
- "fixed-map",
- "reth-stages-types",
- "serde",
- "strum",
- "tracing",
-]
-
-[[package]]
-name = "reth-storage-errors"
-version = "2.3.0"
-source = "git+https://github.com/paradigmxyz/reth?tag=v2.3.0#9384bc53d8c0c77e59cac83fdaaf3b372c6d2216"
-dependencies = [
- "alloy-eips",
- "alloy-primitives",
- "alloy-rlp",
- "derive_more",
- "reth-codecs",
- "reth-primitives-traits",
- "reth-prune-types",
- "reth-static-file-types",
- "revm-database-interface",
- "revm-state",
  "thiserror 2.0.20",
 ]
 
@@ -4941,26 +4848,6 @@ dependencies = [
  "revm-database",
  "serde",
  "serde_with",
-]
-
-[[package]]
-name = "reth-trie-sparse"
-version = "2.3.0"
-source = "git+https://github.com/paradigmxyz/reth?tag=v2.3.0#9384bc53d8c0c77e59cac83fdaaf3b372c6d2216"
-dependencies = [
- "alloy-primitives",
- "alloy-rlp",
- "alloy-trie",
- "either",
- "rayon",
- "reth-execution-errors",
- "reth-primitives-traits",
- "reth-trie-common",
- "serde",
- "serde_json",
- "slotmap",
- "smallvec",
- "tracing",
 ]
 
 [[package]]
@@ -5884,15 +5771,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 
 [[package]]
-name = "slotmap"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bdd58c3c93c3d278ca835519292445cb4b0d4dc59ccfdf7ceadaab3f8aeb4038"
-dependencies = [
- "version_check",
-]
-
-[[package]]
 name = "small_btree"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6014,6 +5892,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-rpc-types-eth",
  "alloy-serde",
+ "auto_impl",
  "bincode",
  "dyn-clone",
  "eyre",
@@ -6026,12 +5905,12 @@ dependencies = [
  "reth-ethereum-forks",
  "reth-optimism-chainspec",
  "reth-trie-common",
- "reth-trie-sparse",
  "revm",
  "rustc-hash",
  "salt",
  "serde",
  "serde_json",
+ "smallvec",
  "stateless-test-utils",
  "thiserror 2.0.20",
  "tokio",

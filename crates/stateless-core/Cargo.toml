@@ -33,12 +33,12 @@ op-alloy-rpc-types.workspace = true
 reth-ethereum-forks.workspace = true
 reth-optimism-chainspec.workspace = true
 reth-trie-common.workspace = true
-reth-trie-sparse.workspace = true
 
 # revm
 revm.workspace = true
 
 # misc
+auto_impl.workspace = true
 dyn-clone.workspace = true
 eyre = { workspace = true, optional = true }
 hashbrown.workspace = true
@@ -47,6 +47,7 @@ num_cpus = { workspace = true, optional = true }
 rustc-hash = { workspace = true, default-features = false }
 serde.workspace = true
 serde_json.workspace = true
+smallvec.workspace = true
 thiserror = { workspace = true, default-features = false }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
@@ -82,7 +83,6 @@ std = [
     "reth-ethereum-forks/std",
     "reth-optimism-chainspec/std",
     "reth-trie-common/std",
-    "reth-trie-sparse/std",
     "revm/default",
     "rustc-hash/std",
     "salt/default",

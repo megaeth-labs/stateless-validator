@@ -175,6 +175,7 @@ fn tx_info_at(block: &Block<OpTransaction>, tx: &OpTransaction, index: usize) ->
         block_hash: Some(block.header.hash),
         block_number: Some(block.header.number),
         base_fee: block.header.base_fee_per_gas,
+        block_timestamp: Some(block.header.timestamp),
     }
 }
 
@@ -313,7 +314,7 @@ fn trace_block_with_tracing_inspector(
 
                 let trace_result = match tracer {
                     TracerKind::Call(call_config) => {
-                        let gas_used = outcome.inner.result.gas_used();
+                        let gas_used = outcome.inner.result.tx_gas_used();
                         let inspector = executor.inspector_mut();
                         inspector.set_transaction_gas_limit(tx.inner.gas_limit());
                         let frame =
@@ -321,10 +322,7 @@ fn trace_block_with_tracing_inspector(
                         GethTrace::from(frame)
                     }
                     TracerKind::PreState(prestate_config) => {
-                        let result_and_state = revm::context::result::ResultAndState {
-                            result: outcome.inner.result,
-                            state: outcome.inner.state,
-                        };
+                        let result_and_state = outcome.inner.result_and_state;
                         executor.inspector_mut().set_transaction_gas_limit(tx.inner.gas_limit());
                         let frame_result = {
                             let db = executor.evm.db();
@@ -359,7 +357,7 @@ fn trace_block_with_tracing_inspector(
                         GethTrace::from(frame)
                     }
                     TracerKind::Default(opts) => {
-                        let gas_used = outcome.inner.result.gas_used();
+                        let gas_used = outcome.inner.result.tx_gas_used();
                         let return_value =
                             outcome.inner.result.output().cloned().unwrap_or_default();
                         let inspector = executor.inspector_mut();
@@ -423,7 +421,7 @@ fn trace_tx_with_tracing_inspector(
 
     match tracer {
         TracerKind::Call(call_config) => {
-            let gas_used = outcome.inner.result.gas_used();
+            let gas_used = outcome.inner.result.tx_gas_used();
             let inspector = executor.inspector_mut();
             inspector.set_transaction_gas_limit(tx_gas_limit);
             let frame = inspector.geth_builder().geth_call_traces(*call_config, gas_used);
@@ -431,10 +429,7 @@ fn trace_tx_with_tracing_inspector(
         }
         TracerKind::PreState(prestate_config) => {
             let state_changes = outcome.inner.state.clone();
-            let result_and_state = revm::context::result::ResultAndState {
-                result: outcome.inner.result,
-                state: outcome.inner.state,
-            };
+            let result_and_state = outcome.inner.result_and_state;
 
             executor.inspector_mut().set_transaction_gas_limit(tx_gas_limit);
             let frame_result = {
@@ -471,7 +466,7 @@ fn trace_tx_with_tracing_inspector(
             Ok(frame.into())
         }
         TracerKind::Default(opts) => {
-            let gas_used = outcome.inner.result.gas_used();
+            let gas_used = outcome.inner.result.tx_gas_used();
             let return_value = outcome.inner.result.output().cloned().unwrap_or_default();
 
             let inspector = executor.inspector_mut();
@@ -573,7 +568,7 @@ pub fn trace_block(
                             Ok(outcome) => {
                                 let frame = FourByteFrame::from(executor.inspector());
                                 *executor.inspector_mut() = FourByteInspector::default();
-                                executor.evm.db_mut().commit(outcome.inner.state);
+                                executor.evm.db_mut().commit(outcome.inner.result_and_state.state);
                                 results.push(TraceResult::Success {
                                     result: frame.into(),
                                     tx_hash: Some(tx_hash),
@@ -599,12 +594,8 @@ pub fn trace_block(
 
                         match executor.run_transaction(recovered_tx) {
                             Ok(outcome) => {
-                                let result = outcome.inner.result;
-                                let state_changes = outcome.inner.state.clone();
-                                let result_and_state = revm::context::result::ResultAndState {
-                                    result,
-                                    state: outcome.inner.state,
-                                };
+                                let result_and_state = outcome.inner.result_and_state;
+                                let state_changes = result_and_state.state.clone();
 
                                 let mux_result = {
                                     let db = executor.evm.db();
@@ -639,6 +630,14 @@ pub fn trace_block(
                         }
                     }
                     results
+                }
+
+                // Not implemented (request-attributable, like an unknown JS tracer
+                // before alloy knew the name): supporting it means wiring the
+                // erc7562 inspector config through `TracerKind` and the response
+                // cache — its own change, not part of the dependency upgrade.
+                GethDebugBuiltInTracerType::Erc7562Tracer => {
+                    return Err(request_error("Unsupported tracer", "erc7562Tracer"));
                 }
             },
 
@@ -681,12 +680,8 @@ pub fn trace_block(
 
                     match executor.run_transaction(recovered_tx) {
                         Ok(outcome) => {
-                            let result = outcome.inner.result;
-                            let state_changes = outcome.inner.state.clone();
-                            let result_and_state = revm::context::result::ResultAndState {
-                                result,
-                                state: outcome.inner.state,
-                            };
+                            let result_and_state = outcome.inner.result_and_state;
+                            let state_changes = result_and_state.state.clone();
 
                             let evm_env_ref = env.evm_env.clone();
                             let tx_env = TxEnv::default();
@@ -837,11 +832,7 @@ pub fn trace_transaction(
                     let outcome = executor
                         .run_transaction(recovered_target)
                         .map_err(ValidationError::BlockReplayFailed)?;
-                    let result = outcome.inner.result;
-                    let result_and_state = revm::context::result::ResultAndState {
-                        result,
-                        state: outcome.inner.state,
-                    };
+                    let result_and_state = outcome.inner.result_and_state;
 
                     let db = executor.evm.db();
                     let inspector = executor.inspector();
@@ -851,6 +842,11 @@ pub fn trace_transaction(
                         .try_into_mux_frame(&result_and_state, db, info)
                         .map(|frame| frame.into())
                         .map_err(|e| frame_build_error("MuxFrame creation failed", e).into())
+                }
+
+                // Not implemented; see the block-level match for rationale.
+                GethDebugBuiltInTracerType::Erc7562Tracer => {
+                    Err(request_error("Unsupported tracer", "erc7562Tracer"))
                 }
             },
 
@@ -868,9 +864,7 @@ pub fn trace_transaction(
                 let outcome = executor
                     .run_transaction(recovered_target)
                     .map_err(ValidationError::BlockReplayFailed)?;
-                let result = outcome.inner.result;
-                let result_and_state =
-                    revm::context::result::ResultAndState { result, state: outcome.inner.state };
+                let result_and_state = outcome.inner.result_and_state;
 
                 let evm_env_ref = env.evm_env.clone();
                 let tx_env = TxEnv::default();
@@ -916,7 +910,7 @@ pub fn parity_trace_block(
 
         match executor.run_transaction(recovered_tx) {
             Ok(outcome) => {
-                let state_changes = outcome.inner.state;
+                let state_changes = outcome.inner.result_and_state.state;
                 let traces = executor
                     .inspector()
                     .clone()

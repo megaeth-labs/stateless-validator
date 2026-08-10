@@ -235,6 +235,9 @@ impl RequestShape {
                 // Exhaustive on purpose: a future alloy builtin variant must make an
                 // explicit cache-whitelist decision here instead of silently bypassing.
                 GethDebugBuiltInTracerType::MuxTracer => Self::Bypass("mux_tracer"),
+                // Not implemented by the tracing executor (rejected there with a
+                // request error), so it must not claim a cache slot.
+                GethDebugBuiltInTracerType::Erc7562Tracer => Self::Bypass("erc7562_tracer"),
             },
             Some(GethDebugTracerType::JsTracer(_)) => Self::Bypass("js_tracer"),
         }
