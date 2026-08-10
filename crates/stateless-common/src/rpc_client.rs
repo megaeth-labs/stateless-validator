@@ -939,6 +939,31 @@ fn endpoint_label(url: &str, idx: usize) -> Arc<str> {
 /// attempts are identified in logs and errors by their label alone, which bakes in the
 /// endpoint's index in the full list at construction, so slicing never misattributes an
 /// attempt.
+/// Where a deadline-bound logical call's budget ran out, for the give-up WARN in
+/// `round_robin_with_backoff`. Only [`Self::AttemptClamped`] carries measurements: the
+/// other phases never ran an attempt, and omitting their fields keeps "not applicable"
+/// distinguishable from a genuinely zero measurement in the log.
+enum GiveUpPhase<'a> {
+    /// The deadline had already passed before the next attempt could start.
+    BeforeAttempt,
+    /// The running attempt was cut because the deadline elapsed alongside it;
+    /// `permit_wait` / `attempt` split the lost hop into queue wait vs call time.
+    AttemptClamped { provider: &'a str, permit_wait: Duration, attempt: Duration },
+    /// Every provider failed the round and no budget remains for the backoff sleep.
+    BeforeBackoff,
+}
+
+impl GiveUpPhase<'_> {
+    /// Stable `phase` label for the give-up WARN.
+    fn as_str(&self) -> &'static str {
+        match self {
+            GiveUpPhase::BeforeAttempt => "before_attempt",
+            GiveUpPhase::AttemptClamped { .. } => "attempt_clamped",
+            GiveUpPhase::BeforeBackoff => "before_backoff",
+        }
+    }
+}
+
 // 10-argument retry primitive. Each field plays a distinct role (providers, their metric/log
 // labels, concurrency, backoff policy, per-attempt timeout, starting provider, method label,
 // metrics sink, deadline, per-attempt closure) and bundling them into a struct would be ceremony
@@ -967,36 +992,6 @@ where
         "provider_labels must be parallel to providers (indexed by the same slot)",
     );
 
-    // Records the logical-call deadline give-up (once) and builds the typed error. Called from
-    // every site that abandons the call on a blown deadline, so the "request timed out" metric
-    // and the returned error stay in lockstep.
-    // `phase` names where the budget actually ran out, and `permit_wait_ms` / `attempt_ms`
-    // split the last hop into "queued behind our own concurrency cap" vs "the endpoint did
-    // not answer". Without that split the give-up is a black box: both are silent waits
-    // inside the deadline and produce identical observations from outside.
-    let record_deadline = |elapsed: Duration,
-                           phase: &'static str,
-                           provider: Option<&str>,
-                           permit_wait: Duration,
-                           attempt: Duration,
-                           round: u32|
-     -> RpcDeadlineExceeded {
-        if let Some(m) = metrics {
-            m.on_rpc_deadline_exceeded(method, elapsed.as_secs_f64());
-        }
-        warn!(
-            method = method.as_str(),
-            phase,
-            provider = provider.unwrap_or("-"),
-            round,
-            elapsed_ms = elapsed.as_millis() as u64,
-            permit_wait_ms = permit_wait.as_millis() as u64,
-            attempt_ms = attempt.as_millis() as u64,
-            "RPC logical call gave up on its deadline",
-        );
-        RpcDeadlineExceeded { method, elapsed }
-    };
-
     /// Round index from which retry logs escalate DEBUG → WARN. Short blips typically resolve
     /// within the first few rounds (with `initial=500ms, max=30s` defaults that's rounds 0/1/2
     /// sleeping 500/1000/2000 ms + jitter, so cumulative 3.5–5.25 s before a round-3 WARN).
@@ -1009,6 +1004,37 @@ where
     let mut round_backoff_ms = initial_backoff_ms;
     let mut round = 0u32;
     let call_start = Instant::now();
+    // Records the logical-call deadline give-up (once) and builds the typed error. Called
+    // from every site that abandons the call on a blown deadline, so the "request timed
+    // out" metric and the returned error stay in lockstep; measurements appear in the WARN
+    // only for the phase that has them (see [`GiveUpPhase`]).
+    let record_deadline = |phase: GiveUpPhase<'_>, round: u32| -> RpcDeadlineExceeded {
+        let elapsed = call_start.elapsed();
+        if let Some(m) = metrics {
+            m.on_rpc_deadline_exceeded(method, elapsed.as_secs_f64());
+        }
+        let phase_label = phase.as_str();
+        match phase {
+            GiveUpPhase::AttemptClamped { provider, permit_wait, attempt } => warn!(
+                method = method.as_str(),
+                phase = phase_label,
+                provider,
+                round,
+                elapsed_ms = elapsed.as_millis() as u64,
+                permit_wait_ms = permit_wait.as_millis() as u64,
+                attempt_ms = attempt.as_millis() as u64,
+                "RPC logical call gave up on its deadline",
+            ),
+            GiveUpPhase::BeforeAttempt | GiveUpPhase::BeforeBackoff => warn!(
+                method = method.as_str(),
+                phase = phase_label,
+                round,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "RPC logical call gave up on its deadline",
+            ),
+        }
+        RpcDeadlineExceeded { method, elapsed }
+    };
 
     loop {
         // Last error observed in this round. Used for the round-summary log at the bottom so
@@ -1025,20 +1051,12 @@ where
             if let Some(d) = deadline &&
                 Instant::now() >= d
             {
-                return Err(record_deadline(
-                    call_start.elapsed(),
-                    "before_attempt",
-                    None,
-                    Duration::ZERO,
-                    Duration::ZERO,
-                    round,
-                ));
+                return Err(record_deadline(GiveUpPhase::BeforeAttempt, round));
             }
             let slot = (rr_start + offset) % n;
             let provider_label: &str = &provider_labels[slot];
-            // Timed because this wait is inside the caller's deadline: a saturated
-            // concurrency cap and an unresponsive endpoint are otherwise the same
-            // observation, and they have opposite fixes.
+            // The wait sits inside the caller's deadline; `RpcMetrics::on_rpc_permit_wait`
+            // documents why it is metered apart from the attempt itself.
             let queued = Instant::now();
             let permit = semaphore.acquire().await.expect("semaphore closed unexpectedly");
             let permit_wait = queued.elapsed();
@@ -1078,10 +1096,11 @@ where
                         RpcAttemptOutcome::Timeout,
                     )),
                 };
-            let attempt_duration = attempt_start.elapsed().as_secs_f64();
+            let attempt_elapsed = attempt_start.elapsed();
+            let attempt_duration = attempt_elapsed.as_secs_f64();
             drop(permit);
 
-            let (err, outcome) = match attempt {
+            let (err, mut outcome) = match attempt {
                 Ok(v) => {
                     if let Some(m) = metrics {
                         m.on_rpc_attempt(
@@ -1096,40 +1115,33 @@ where
                 Err(pair) => pair,
             };
 
-            // A per-attempt timeout that also blew the overall deadline is deadline pressure, not
-            // a provider stall: the attempt window was clamped to the little budget left, so the
-            // provider never got a fair round trip. Attribute it to the deadline (record_deadline)
-            // and do NOT record a per-provider `timeout` — otherwise the timeout metric blames the
-            // endpoint for the caller's exhausted budget.
+            // A per-attempt timeout that also blew the overall deadline is deadline pressure,
+            // not a provider stall: the attempt window was clamped to the little budget left,
+            // so the provider never got a fair round trip and blaming it for a stall would be
+            // wrong — but the attempt did run and did consume the budget, so it must not be
+            // dropped either. Reclassify before the single recording site below.
             if outcome == RpcAttemptOutcome::Timeout &&
                 let Some(d) = deadline &&
                 Instant::now() >= d
             {
-                // Record the attempt under its own outcome rather than dropping it: it did
-                // run and it did consume the budget. Blaming the endpoint for a stall would
-                // still be wrong, which is why this is not `Timeout`.
-                if let Some(m) = metrics {
-                    m.on_rpc_attempt(
-                        method,
-                        provider_label,
-                        RpcAttemptOutcome::DeadlineClamped,
-                        attempt_duration,
-                    );
-                }
-                return Err(record_deadline(
-                    call_start.elapsed(),
-                    "attempt_clamped",
-                    Some(provider_label),
-                    permit_wait,
-                    Duration::from_secs_f64(attempt_duration),
-                    round,
-                ));
+                outcome = RpcAttemptOutcome::DeadlineClamped;
             }
 
             // Record the failed attempt against its endpoint with the reason (error vs a genuine
-            // stall — a full per-attempt window elapsed with budget still remaining).
+            // stall vs an attempt the caller's deadline cut short).
             if let Some(m) = metrics {
                 m.on_rpc_attempt(method, provider_label, outcome, attempt_duration);
+            }
+
+            if outcome == RpcAttemptOutcome::DeadlineClamped {
+                return Err(record_deadline(
+                    GiveUpPhase::AttemptClamped {
+                        provider: provider_label,
+                        permit_wait,
+                        attempt: attempt_elapsed,
+                    },
+                    round,
+                ));
             }
 
             if outcome == RpcAttemptOutcome::Timeout {
@@ -1180,14 +1192,7 @@ where
         if let Some(d) = deadline {
             let remaining_ms = d.saturating_duration_since(Instant::now()).as_millis() as u64;
             if remaining_ms == 0 {
-                return Err(record_deadline(
-                    call_start.elapsed(),
-                    "before_backoff",
-                    None,
-                    Duration::ZERO,
-                    Duration::ZERO,
-                    round,
-                ));
+                return Err(record_deadline(GiveUpPhase::BeforeBackoff, round));
             }
             sleep_ms = sleep_ms.min(remaining_ms);
         }

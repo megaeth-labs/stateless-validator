@@ -379,11 +379,8 @@ fn record_upstream_attempt(
 /// Time an upstream attempt spent queued behind our own concurrency cap, labeled `(method)`.
 const UPSTREAM_PERMIT_WAIT_SECONDS: &str = "debug_trace_upstream_permit_wait_seconds";
 
-/// Records how long an upstream attempt waited for a concurrency permit.
-///
-/// This wait sits inside the caller's deadline, so without it "the endpoint was slow" and
-/// "we were queued behind `--witness-max-concurrent-requests`" are the same observation —
-/// and they have opposite fixes.
+/// Records how long an upstream attempt waited for a concurrency permit; the rationale
+/// for metering the wait apart from the attempt lives on `RpcMetrics::on_rpc_permit_wait`.
 fn record_upstream_permit_wait(method: &'static str, wait_secs: f64) {
     histogram!(UPSTREAM_PERMIT_WAIT_SECONDS, "method" => method).record(wait_secs);
 }
@@ -650,12 +647,12 @@ fn pre_register_all_metrics() {
 
     // Data Fetch Layer: upstream RPC. The attempt series (`upstream_requests_total` /
     // `upstream_duration_seconds`) carry a dynamic per-endpoint `provider` label, so they first
-    // appear on the initial attempt; only the method-keyed deadline-exceeded counter is
-    // pre-registrable here.
+    // appear on the initial attempt; only the method-keyed series are pre-registrable here.
     for method in
         ["eth_getHeaderByHash", "eth_getBlockByHash", "mega_getWitness", "eth_getCodeByHash"]
     {
         counter!(UPSTREAM_DEADLINE_EXCEEDED_TOTAL, "method" => method).increment(0);
+        let _ = histogram!(UPSTREAM_PERMIT_WAIT_SECONDS, "method" => method);
     }
 
     // Request Layer: parameter shapes (per opts-taking method)
