@@ -1,5 +1,6 @@
-//! Vendored from reth v1.6.0 (commit d8451e54e, crates/evm/execution-errors/src/trie.rs (SparseTrieError portion)), trimmed to the
-//! serial sparse trie needed by withdrawal MPT witness verification.
+//! Vendored from reth v1.6.0 (commit d8451e54e, crates/evm/execution-errors/src/trie.rs
+//! (SparseTrieError portion)), trimmed to the serial sparse trie needed by withdrawal MPT witness
+//! verification.
 //!
 //! reth v2.3.0's sparse tries moved to a V2 node model that merges extension
 //! nodes into their child branches; an extension whose child branch is absent
@@ -13,6 +14,7 @@
 //! test modules and metrics are not carried over. Do not edit otherwise.
 
 use alloc::boxed::Box;
+
 use alloy_primitives::B256;
 use reth_trie_common::Nibbles;
 use thiserror::Error;

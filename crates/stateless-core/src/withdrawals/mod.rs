@@ -10,7 +10,9 @@
 //! absent (a minimal exclusion proof), a shape reth v2.3.0's V2 sparse tries cannot
 //! represent.
 
-#[allow(dead_code)]
+// Vendored verbatim (see its module docs): unused API surface and pre-let-chains
+// style are expected, so both lints are silenced instead of editing the copy.
+#[allow(dead_code, clippy::collapsible_if)]
 mod sparse_trie;
 
 use std::{
@@ -27,8 +29,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use self::sparse_trie::{
-    SerialSparseTrie, SparseTrie, SparseTrieInterface, TrieMasks,
-    provider::DefaultTrieNodeProvider,
+    SerialSparseTrie, SparseTrie, SparseTrieInterface, TrieMasks, provider::DefaultTrieNodeProvider,
 };
 
 /// L2 contract `L2ToL1MessagePasser`, storing commitments to withdrawal transactions.
@@ -343,8 +344,7 @@ mod tests {
 
         // Root extension covering the first 63 nibbles of SLOT.
         let ext_key = Nibbles::unpack(SLOT).slice(0..63);
-        let ext =
-            TrieNode::Extension(ExtensionNode::new(ext_key, RlpNode::word_rlp(&branch_hash)));
+        let ext = TrieNode::Extension(ExtensionNode::new(ext_key, RlpNode::word_rlp(&branch_hash)));
         let mut ext_rlp = Vec::new();
         ext.encode(&mut ext_rlp);
         let pre_root = keccak256(&ext_rlp);

@@ -14,9 +14,10 @@
 
 //! Traits and default implementations related to retrieval of blinded trie nodes.
 
-use alloy_primitives::{Bytes, B256};
-use super::SparseTrieError;
+use alloy_primitives::{B256, Bytes};
 use reth_trie_common::{Nibbles, TrieMask};
+
+use super::SparseTrieError;
 
 /// Factory for instantiating trie node providers.
 #[auto_impl::auto_impl(&)]

@@ -1,5 +1,5 @@
-//! Vendored from reth v1.6.0 (commit d8451e54e, crates/trie/sparse/src/trie.rs (non-test portion)), trimmed to the
-//! serial sparse trie needed by withdrawal MPT witness verification.
+//! Vendored from reth v1.6.0 (commit d8451e54e, crates/trie/sparse/src/trie.rs (non-test portion)),
+//! trimmed to the serial sparse trie needed by withdrawal MPT witness verification.
 //!
 //! reth v2.3.0's sparse tries moved to a V2 node model that merges extension
 //! nodes into their child branches; an extension whose child branch is absent
@@ -12,11 +12,6 @@
 //! Local changes: import paths only (crate-relative + vendored errors);
 //! test modules and metrics are not carried over. Do not edit otherwise.
 
-use super::{
-    provider::{RevealedNode, TrieNodeProvider},
-    LeafLookup, LeafLookupError, RevealedSparseNode, SparseTrieInterface, SparseTrieUpdates,
-    TrieMasks,
-};
 use alloc::{
     borrow::Cow,
     boxed::Box,
@@ -25,20 +20,25 @@ use alloc::{
     vec,
     vec::Vec,
 };
+
 use alloy_primitives::{
-    hex, keccak256,
+    B256, hex, keccak256,
     map::{Entry, HashMap, HashSet},
-    B256,
 };
 use alloy_rlp::Decodable;
-use super::{SparseTrieErrorKind, SparseTrieResult};
 use reth_trie_common::{
+    BranchNodeCompact, BranchNodeRef, CHILD_INDEX_RANGE, EMPTY_ROOT_HASH, ExtensionNodeRef,
+    LeafNodeRef, Nibbles, RlpNode, TrieMask, TrieNode,
     prefix_set::{PrefixSet, PrefixSetMut},
-    BranchNodeCompact, BranchNodeRef, ExtensionNodeRef, LeafNodeRef, Nibbles, RlpNode, TrieMask,
-    TrieNode, CHILD_INDEX_RANGE, EMPTY_ROOT_HASH,
 };
 use smallvec::SmallVec;
 use tracing::trace;
+
+use super::{
+    LeafLookup, LeafLookupError, RevealedSparseNode, SparseTrieErrorKind, SparseTrieInterface,
+    SparseTrieResult, SparseTrieUpdates, TrieMasks,
+    provider::{RevealedNode, TrieNodeProvider},
+};
 
 /// The level below which the sparse trie hashes are calculated in
 /// [`SerialSparseTrie::update_subtrie_hashes`].
@@ -160,22 +160,14 @@ impl<T: SparseTrieInterface> SparseTrie<T> {
     ///
     /// Returns `None` if the trie is blinded.
     pub const fn as_revealed_ref(&self) -> Option<&T> {
-        if let Self::Revealed(revealed) = self {
-            Some(revealed)
-        } else {
-            None
-        }
+        if let Self::Revealed(revealed) = self { Some(revealed) } else { None }
     }
 
     /// Returns a mutable reference to the underlying revealed sparse trie.
     ///
     /// Returns `None` if the trie is blinded.
     pub fn as_revealed_mut(&mut self) -> Option<&mut T> {
-        if let Self::Revealed(revealed) = self {
-            Some(revealed)
-        } else {
-            None
-        }
+        if let Self::Revealed(revealed) = self { Some(revealed) } else { None }
     }
 
     /// Wipes the trie by removing all nodes and values,
@@ -912,11 +904,7 @@ impl SparseTrieInterface for SerialSparseTrie {
         // Take the current prefix set
         let mut prefix_set = core::mem::take(&mut self.prefix_set).freeze();
         let rlp_node = self.rlp_node_allocate(&mut prefix_set);
-        if let Some(root_hash) = rlp_node.as_hash() {
-            root_hash
-        } else {
-            keccak256(rlp_node)
-        }
+        if let Some(root_hash) = rlp_node.as_hash() { root_hash } else { keccak256(rlp_node) }
     }
 
     fn update_subtrie_hashes(&mut self) {
@@ -1930,4 +1918,3 @@ impl SparseTrieUpdates {
         self.wiped |= other.wiped;
     }
 }
-

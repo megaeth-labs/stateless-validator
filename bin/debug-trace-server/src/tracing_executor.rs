@@ -367,19 +367,10 @@ fn trace_block_with_tracing_inspector(
                             return_value,
                             opts.config,
                         );
-
-                        // Convert DefaultFrame to JSON and fix returnValue serialization.
-                        // alloy-rpc-types-trace 1.1.2 serializes Bytes with "0x" prefix,
-                        // but mega-reth uses v1.0.23 which serializes without prefix.
-                        let mut frame_value = serde_json::to_value(frame).unwrap();
-                        if let Some(rv) = frame_value.get_mut("returnValue") &&
-                            let Some(s) = rv.as_str()
-                        {
-                            *rv = serde_json::Value::String(
-                                s.strip_prefix("0x").unwrap_or(s).to_string(),
-                            );
-                        }
-                        GethTrace::JS(frame_value)
+                        // alloy-rpc-types-trace 2.x serializes `returnValue` with a "0x"
+                        // prefix on both sides, so the frame is emitted as-is (the 1.x
+                        // era needed a prefix-stripping shim to match mega-reth).
+                        GethTrace::from(frame)
                     }
                 };
 
@@ -472,14 +463,10 @@ fn trace_tx_with_tracing_inspector(
             let inspector = executor.inspector_mut();
             inspector.set_transaction_gas_limit(tx_gas_limit);
             let frame = inspector.geth_builder().geth_traces(gas_used, return_value, opts.config);
-
-            let mut frame_value = serde_json::to_value(frame).unwrap();
-            if let Some(rv) = frame_value.get_mut("returnValue") &&
-                let Some(s) = rv.as_str()
-            {
-                *rv = serde_json::Value::String(s.strip_prefix("0x").unwrap_or(s).to_string());
-            }
-            Ok(GethTrace::JS(frame_value))
+            // alloy-rpc-types-trace 2.x serializes `returnValue` with a "0x" prefix on
+            // both sides, so the frame is emitted as-is (the 1.x era needed a
+            // prefix-stripping shim to match mega-reth).
+            Ok(frame.into())
         }
     }
 }

@@ -14,18 +14,16 @@
 
 //! Traits for sparse trie implementations.
 
+use alloc::{borrow::Cow, vec, vec::Vec};
 use core::fmt::Debug;
 
-use alloc::{borrow::Cow, vec, vec::Vec};
 use alloy_primitives::{
-    map::{HashMap, HashSet},
     B256,
+    map::{HashMap, HashSet},
 };
-use reth_trie_common::{BranchNodeCompact, TrieMask};
-use super::SparseTrieResult;
-use reth_trie_common::{Nibbles, TrieNode};
+use reth_trie_common::{BranchNodeCompact, Nibbles, TrieMask, TrieNode};
 
-use super::provider::TrieNodeProvider;
+use super::{SparseTrieResult, provider::TrieNodeProvider};
 
 /// Trait defining common operations for revealed sparse trie implementations.
 ///
