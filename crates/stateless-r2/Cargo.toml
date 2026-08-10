@@ -18,7 +18,9 @@ hmac.workspace = true
 percent-encoding.workspace = true
 # Pinned explicitly (not workspace-inherited): `put_object` exposes `&reqwest::Client`, so the
 # reqwest major is part of this crate's API and must match mega-reth's workspace (0.12). Bumping
-# it is a coordinated two-repo change that a workspace-wide bump must not ride over.
+# it is a coordinated two-repo change that a workspace-wide bump must not ride over — this
+# workspace itself moved to 0.13 (alloy 2.x transports), which is fine: no reqwest types
+# cross between this crate and the alloy-facing code.
 # No `http2` feature: R2's bare S3 endpoint negotiates HTTP/1.1 only (ALPN-verified live),
 # so h2 buys these paths nothing today. Revisit alongside the R2 custom-domain work, which
 # does ride an h2-capable stack.

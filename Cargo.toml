@@ -32,6 +32,7 @@ alloy-provider = { version = "2.0.5", features = [
     "reqwest-rustls-tls",
 ], default-features = false }
 alloy-rlp = { version = "0.3.13", default-features = false }
+alloy-rpc-client = { version = "2.0.5", default-features = false }
 alloy-rpc-types-eth = { version = "2.0.5", default-features = false }
 alloy-rpc-types-trace = "2.0.5"
 alloy-serde = { version = "2.0.5", default-features = false }
@@ -95,7 +96,7 @@ pin-project-lite = "0.2"
 quick_cache = { version = "0.6", default-features = false }
 rayon = "1.11"
 redb = "4.0"
-reqwest = { version = "0.12", default-features = false }
+reqwest = { version = "0.13", default-features = false }
 rolling-file = "0.2"
 rustc-hash = { version = "2.1", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["alloc", "derive"] }
