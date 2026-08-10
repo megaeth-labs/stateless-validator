@@ -1,4 +1,4 @@
-//! Direct-from-R2 historical witness source.
+//! Direct-from-R2 witness source.
 //!
 //! Fetches the primary witness object straight from the R2 bucket over the S3 API and decodes
 //! it with the **light** decoder — the trace server never verifies the witness proof, so the
@@ -30,7 +30,7 @@ use crate::metrics;
 /// caller's deadline clamps the loop harder anyway.
 const MAX_ATTEMPTS: usize = 3;
 
-/// Failure outcome of an R2 historical witness fetch.
+/// Failure outcome of an R2 witness fetch.
 #[derive(Debug, thiserror::Error)]
 pub enum R2WitnessError {
     /// The signed GET failed (absent object, transport, throttle, unexpected status, or
@@ -69,9 +69,15 @@ impl R2WitnessError {
             Self::DecodePanicked { .. } => "decode_panicked",
         }
     }
+
+    /// Whether the object was absent from the bucket — the one failure the frontier probe
+    /// treats as expected rather than alarming.
+    pub(crate) const fn is_missing(&self) -> bool {
+        matches!(self, Self::Get(R2GetError::Missing { .. }))
+    }
 }
 
-/// Fetches and light-decodes historical witnesses straight from an R2 bucket.
+/// Fetches and light-decodes witnesses straight from an R2 bucket.
 /// The fetcher's `Debug` redacts the credentials.
 #[derive(Debug)]
 pub struct R2WitnessSource {

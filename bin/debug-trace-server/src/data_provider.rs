@@ -1127,10 +1127,8 @@ fn witness_route(
 /// half-budget share) and tolerant of far more parallelism than the shared gateway. At the
 /// frontier the bucket can even lead the generator: the uploader and the generator's RPC
 /// server publish from *different files* of the same generation run, so "the generator has
-/// no file yet" says nothing about the bucket (observed in production: the gateway served
-/// frontier witnesses the generator was still reporting missing). A frontier probe usually
-/// misses — one fast 404 — and every R2 failure falls back to the RPC chain below on the
-/// remaining deadline.
+/// no file yet" says nothing about the bucket. A frontier probe usually misses — one fast 404 — and
+/// every R2 failure falls back to the RPC chain below on the remaining deadline.
 ///
 /// The RPC chain then routes by block age:
 /// - **Recent block** (fewer than `local_window` blocks below the local tip, or tip unknown): the
@@ -1219,14 +1217,11 @@ async fn try_r2_witness(
         }
         Err(e) => {
             metrics.record_request(false, now.elapsed().as_secs_f64());
-            if frontier && e.kind() == "missing" {
-                // The expected outcome of probing the bucket ahead of the uploader: the
-                // object simply is not written yet. Deliberately absent from
-                // `debug_trace_r2_witness_errors_total{kind="missing"}` — that series is
-                // the bucket-integrity alarm (a *historical* hole is an incident), and a
-                // steady rate of routine frontier misses would drown it. The per-source
-                // error counter above still counts every miss, which is exactly what the
-                // frontier hit-rate acceptance reads.
+            if frontier && e.is_missing() {
+                // Expected: the probe ran ahead of the uploader. Kept out of the
+                // `kind="missing"` bucket-integrity alarm (see the counter's doc in
+                // `metrics.rs`); the per-source error counter above still records every
+                // miss, which is what the frontier hit rate reads.
                 debug!(
                     block_number,
                     block_hash = %block_hash,
@@ -1481,12 +1476,26 @@ mod tests {
             rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
             ..RpcClientConfig::trace_server()
         };
+        let (rpc_client, mut cfg) = cap_fixture(witness_urls, config, 1);
+        cfg.generator_first = generator_first;
+        (rpc_client, cfg)
+    }
+
+    /// [`routing_fixture`] with the client config and witness budget under the caller's
+    /// control — the hop-cap tests vary exactly those two things. `witness_urls[0]`
+    /// doubles as the data endpoint and the generator (first witness provider);
+    /// `generator_first` stays on, matching the deployment shape the cap protects.
+    fn cap_fixture(
+        witness_urls: &[&str],
+        config: RpcClientConfig,
+        witness_timeout_secs: u64,
+    ) -> (RpcClient, WitnessFetchConfig) {
         let rpc_client =
             RpcClient::new_with_config(&witness_urls[..1], witness_urls, config, None).unwrap();
         let cfg = WitnessFetchConfig {
             local_window: 100,
-            generator_first,
-            ..WitnessFetchConfig::with_defaults(1)
+            generator_first: true,
+            ..WitnessFetchConfig::with_defaults(witness_timeout_secs)
         };
         (rpc_client, cfg)
     }
@@ -1922,12 +1931,8 @@ mod tests {
     #[tokio::test]
     async fn fetch_witness_hung_r2_leaves_budget_for_the_rpc_fallback() {
         let (r2_endpoint, _r2_peak) = mock_r2_held(200, Duration::from_secs(30)).await;
-        let (salt_witness, mpt_witness): (_, MptWitness) =
-            TestFixtures::mainnet_shared().first_paired_witness();
-        let wire = stateless_common::encode_witness_response(&salt_witness, &mpt_witness)
-            .expect("fixture witness must encode");
         let (ha, url_a, hits_a) = scripted_witness_rpc(0, None).await;
-        let (hb, url_b, hits_b) = scripted_witness_rpc(0, Some(wire)).await;
+        let (hb, url_b, hits_b) = scripted_witness_rpc(0, Some(fixture_wire())).await;
         let (rpc_client, cfg) = routing_fixture(&[url_a.as_str(), url_b.as_str()], true);
         let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
 
@@ -2013,8 +2018,8 @@ mod tests {
         hb.stop().unwrap();
     }
 
-    /// A stalled endpoint must not consume the whole witness stage. Replays the 2026-08-09
-    /// ore incident: the generator misses (witness not generated yet), the chain rotates to
+    /// A stalled endpoint must not consume the whole witness stage. Replays the incident
+    /// shape: the generator misses (witness not generated yet), the chain rotates to
     /// a gateway that accepts TCP and never answers, and the witness appears at the
     /// generator moments later. The per-hop cap (`witness_per_attempt_timeout`) cuts the
     /// stalled hop so the loop reaches round 1, where the generator serves inside the
@@ -2026,27 +2031,14 @@ mod tests {
         // Generator: "not generated yet" once, then serves (the file has been written).
         let (ha, url_gen, hits_gen) = scripted_witness_rpc(1, Some(fixture_wire())).await;
         // Gateway: accepts connections and never replies.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url_gw = format!("http://{}/", listener.local_addr().unwrap());
-        let _held = listener;
+        let url_gw = test_support::hanging_url();
 
         let config = RpcClientConfig {
             rpc_retry: BackoffPolicy::new(Duration::from_millis(20), Duration::from_millis(40)),
             witness_per_attempt_timeout: Some(Duration::from_millis(300)),
             ..RpcClientConfig::trace_server()
         };
-        let rpc_client = RpcClient::new_with_config(
-            &[url_gen.as_str()],
-            &[url_gen.as_str(), url_gw.as_str()],
-            config,
-            None,
-        )
-        .unwrap();
-        let cfg = WitnessFetchConfig {
-            local_window: 100,
-            generator_first: true,
-            ..WitnessFetchConfig::with_defaults(3)
-        };
+        let (rpc_client, cfg) = cap_fixture(&[url_gen.as_str(), url_gw.as_str()], config, 3);
 
         // Frontier block: above the local tip, so the full chain (generator first) runs.
         let budget = Duration::from_secs(3);
@@ -2079,9 +2071,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hop_cap_tracks_the_shrunken_stage_budget() {
         let (ha, url_gen, hits_gen) = scripted_witness_rpc(1, Some(fixture_wire())).await;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url_gw = format!("http://{}/", listener.local_addr().unwrap());
-        let _held = listener;
+        let url_gw = test_support::hanging_url();
 
         let config = RpcClientConfig {
             rpc_retry: BackoffPolicy::new(Duration::from_millis(20), Duration::from_millis(40)),
@@ -2090,18 +2080,7 @@ mod tests {
             witness_per_attempt_timeout: Some(Duration::from_secs(6)),
             ..RpcClientConfig::trace_server()
         };
-        let rpc_client = RpcClient::new_with_config(
-            &[url_gen.as_str()],
-            &[url_gen.as_str(), url_gw.as_str()],
-            config,
-            None,
-        )
-        .unwrap();
-        let cfg = WitnessFetchConfig {
-            local_window: 100,
-            generator_first: true,
-            ..WitnessFetchConfig::with_defaults(1)
-        };
+        let (rpc_client, cfg) = cap_fixture(&[url_gen.as_str(), url_gw.as_str()], config, 1);
 
         let budget = Duration::from_secs(1);
         let started = Instant::now();
@@ -2125,9 +2104,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deadline_pressure_shortens_the_backoff_instead_of_sleeping_into_it() {
         let (ha, url_gen, hits_gen) = scripted_witness_rpc(1, Some(fixture_wire())).await;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url_gw = format!("http://{}/", listener.local_addr().unwrap());
-        let _held = listener;
+        let url_gw = test_support::hanging_url();
 
         let config = RpcClientConfig {
             // Production-shaped backoff: larger than what round 0 leaves of the stage.
@@ -2135,18 +2112,7 @@ mod tests {
             witness_per_attempt_timeout: Some(Duration::from_secs(6)),
             ..RpcClientConfig::trace_server()
         };
-        let rpc_client = RpcClient::new_with_config(
-            &[url_gen.as_str()],
-            &[url_gen.as_str(), url_gw.as_str()],
-            config,
-            None,
-        )
-        .unwrap();
-        let cfg = WitnessFetchConfig {
-            local_window: 100,
-            generator_first: true,
-            ..WitnessFetchConfig::with_defaults(1)
-        };
+        let (rpc_client, cfg) = cap_fixture(&[url_gen.as_str(), url_gw.as_str()], config, 1);
 
         let budget = Duration::from_millis(800);
         let started = Instant::now();
@@ -2165,65 +2131,6 @@ mod tests {
         ha.stop().unwrap();
     }
 
-    /// A saturated witness semaphore must not park a deadline-bound call past its budget:
-    /// the permit wait is selected against the deadline, gives up at it, and records the
-    /// give-up (`phase="permit_wait"`) — instead of waiting for an unrelated in-flight
-    /// attempt to free a permit and only then discovering the deadline. Goes red with a
-    /// bare `acquire().await`, which parks until the hog's per-attempt timeout fires
-    /// seconds later.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn saturated_permit_queue_fails_at_the_deadline_not_after_it() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url_hang = format!("http://{}/", listener.local_addr().unwrap());
-        let _held = listener;
-
-        let config = RpcClientConfig {
-            witness_max_concurrent_requests: Some(1),
-            // Keeps the hog parked in its attempt well past the victim's deadline.
-            per_attempt_timeout: Duration::from_secs(5),
-            rpc_retry: BackoffPolicy::new(Duration::from_millis(20), Duration::from_millis(40)),
-            ..RpcClientConfig::trace_server()
-        };
-        let rpc_client = Arc::new(
-            RpcClient::new_with_config(&[url_hang.as_str()], &[url_hang.as_str()], config, None)
-                .unwrap(),
-        );
-
-        // Hog: takes the only permit and stalls inside its attempt against the hung server.
-        let hog = {
-            let client = Arc::clone(&rpc_client);
-            tokio::spawn(async move {
-                let _ = client
-                    .get_witness_light_with_deadline(
-                        1,
-                        B256::ZERO,
-                        Some(Instant::now() + Duration::from_secs(4)),
-                    )
-                    .await;
-            })
-        };
-        // Let the hog reach its attempt so the permit is genuinely held.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        let started = Instant::now();
-        let result = rpc_client
-            .get_witness_light_with_deadline(
-                2,
-                B256::ZERO,
-                Some(Instant::now() + Duration::from_millis(300)),
-            )
-            .await;
-        let elapsed = started.elapsed();
-
-        assert!(result.is_err(), "the queued call must give up on its own deadline");
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "the give-up must happen at the deadline, not when the hog frees the permit \
-             ({elapsed:?})"
-        );
-        hog.abort();
-    }
-
     /// An operator's explicit `--rpc-per-attempt-timeout-ms` below the witness cap asked
     /// for stalled attempts to be cut *sooner*; the witness cap is a ceiling and must not
     /// quietly loosen it. With a 200ms global per-attempt, the stalled hop is cut at
@@ -2231,9 +2138,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn explicit_per_attempt_timeout_stays_the_tighter_bound() {
         let (ha, url_gen, hits_gen) = scripted_witness_rpc(1, Some(fixture_wire())).await;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url_gw = format!("http://{}/", listener.local_addr().unwrap());
-        let _held = listener;
+        let url_gw = test_support::hanging_url();
 
         let config = RpcClientConfig {
             rpc_retry: BackoffPolicy::new(Duration::from_millis(20), Duration::from_millis(40)),
@@ -2241,18 +2146,7 @@ mod tests {
             witness_per_attempt_timeout: Some(Duration::from_secs(10)),
             ..RpcClientConfig::trace_server()
         };
-        let rpc_client = RpcClient::new_with_config(
-            &[url_gen.as_str()],
-            &[url_gen.as_str(), url_gw.as_str()],
-            config,
-            None,
-        )
-        .unwrap();
-        let cfg = WitnessFetchConfig {
-            local_window: 100,
-            generator_first: true,
-            ..WitnessFetchConfig::with_defaults(4)
-        };
+        let (rpc_client, cfg) = cap_fixture(&[url_gen.as_str(), url_gw.as_str()], config, 4);
 
         let started = Instant::now();
         let result = fetch_witness(

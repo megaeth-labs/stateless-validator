@@ -143,7 +143,7 @@ The background chain-sync prefetch routes by freshness against the last observed
 | `bin/debug-trace-server/src/rpc_middleware.rs`                                                 | Concurrent execution of inbound JSON-RPC batch entries                               |
 | `bin/debug-trace-server/src/data_provider.rs`                                                  | Block data fetching with single-flight coalescing                                    |
 | `bin/debug-trace-server/src/block_data_cache.rs`                                               | Bounded in-memory `BlockData` cache keyed by block hash                              |
-| `bin/debug-trace-server/src/r2_witness.rs`                                                     | Direct-from-R2 historical witness source (light decode, deadline-aware)              |
+| `bin/debug-trace-server/src/r2_witness.rs`                                                     | Direct-from-R2 witness source (light decode, deadline-aware)                         |
 | `bin/debug-trace-server/src/server_db.rs`                                                      | Defines + implements the bin-local `BlockStore` trait (backed by `stateless-db`)     |
 
 ## Test Organization

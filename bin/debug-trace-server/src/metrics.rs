@@ -413,13 +413,16 @@ pub fn record_request_shape(method: &'static str, shape: &'static str) {
     counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => shape).increment(1);
 }
 
-/// R2 historical-witness GET retries (one increment per retried attempt).
+/// R2 witness GET retries (one increment per retried attempt).
 const R2_WITNESS_RETRIES_TOTAL: &str = "debug_trace_r2_witness_retries_total";
 
-/// R2 historical-witness fetch failures, labeled by `kind`
+/// R2 witness fetch failures, labeled by `kind`
 /// (see `crate::r2_witness::R2WitnessError::KINDS`). Failures here are not user-visible
 /// errors — the witness stage falls back to the RPC chain — so this counter is the signal
-/// that the R2 fast path is degrading.
+/// that the R2 fast path is degrading. `kind="missing"` stays the bucket-integrity alarm:
+/// a frontier probe's miss is the expected ran-ahead-of-the-uploader outcome and is
+/// deliberately not counted here (it still lands on
+/// `witness_errors_total{source="witness_r2_frontier"}`).
 const R2_WITNESS_ERRORS_TOTAL: &str = "debug_trace_r2_witness_errors_total";
 
 /// Records one retried R2 witness GET attempt.

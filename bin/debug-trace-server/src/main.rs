@@ -477,13 +477,15 @@ fn validate_args(args: &Args) -> Result<()> {
             );
         }
     }
-    // The R2 historical route anchors block age to the local DB tip, so without --data-dir
-    // it can never fire. An operator who configured R2 asked for that route explicitly —
-    // fail closed instead of silently running the RPC-only setup R2 exists to replace.
+    // The R2 route anchors block age (frontier vs historical) to the local DB tip. Without
+    // --data-dir every block would classify as frontier — the probe would still run, but a
+    // genuine bucket hole would be demoted to an "expected frontier miss" and never reach
+    // the `kind="missing"` bucket-integrity alarm. An operator who configured R2 asked for
+    // the real route explicitly — fail closed instead of running a blind approximation.
     if args.r2_endpoint.is_some() && args.data_dir.is_none() {
         eyre::bail!(
-            "--r2-endpoint requires --data-dir: the R2 historical witness route anchors \
-             block age to the local DB tip and can never fire in stateless mode"
+            "--r2-endpoint requires --data-dir: the R2 witness route anchors block age \
+             (frontier vs historical) to the local DB tip"
         );
     }
     Ok(())
@@ -553,12 +555,9 @@ async fn main() -> Result<()> {
         data_max_concurrent_requests: args.data_max_concurrent_requests,
         witness_max_concurrent_requests: args.witness_max_concurrent_requests,
         per_attempt_timeout,
-        // Half the witness stage budget, mirroring the R2 pre-try's half-budget rule: no
-        // single witness hop — generator, gateway, or R2 — may consume more than half the
-        // stage, so one stalled endpoint always leaves budget for another rotation. Derived
-        // rather than flagged: it moves with --witness-timeout. A ceiling, not the final
-        // cap — the client tightens it per fetch to `min(cap, per-attempt timeout,
-        // remaining stage / 2)`, covering old-block-clamped stages and post-R2 remainders.
+        // Half the witness stage, so no single hop can consume it whole; derived rather
+        // than flagged so it moves with --witness-timeout. A ceiling, not the final cap —
+        // see `RpcClientConfig::witness_per_attempt_timeout` for the full contract.
         witness_per_attempt_timeout: Some(std::time::Duration::from_secs(args.witness_timeout) / 2),
         ..rpc_defaults
     }
@@ -590,7 +589,7 @@ async fn main() -> Result<()> {
         ),
     }
 
-    // Direct-from-R2 historical witness source. Clap's `requires` wiring makes the four
+    // Direct-from-R2 witness source. Clap's `requires` wiring makes the four
     // `--r2-*` flags all-or-nothing and `validate_args` rejects empty values and the
     // data-dir-less combination, so matching on the quad only splits "configured" from
     // "absent". Shares the RPC path's per-attempt timeout and retry pacing.
