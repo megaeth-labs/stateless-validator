@@ -447,7 +447,7 @@ const CANONICAL_HASH_RESOLUTION_TOTAL: &str = "debug_trace_canonical_hash_resolu
 /// fetches that teach the memo's depth gate the tip when no other tip source exists.
 /// `source = "tag"` (`"ok"` | `"error"`) counts `latest`/`finalized`/`safe` resolutions,
 /// which bind number → hash in their single header fetch instead of resolving through
-/// the tiers above — without it the counter would go dark for tag traffic.
+/// the tiers above.
 pub fn record_canonical_hash_resolution(source: &'static str, outcome: &'static str) {
     counter!(CANONICAL_HASH_RESOLUTION_TOTAL, "source" => source, "outcome" => outcome)
         .increment(1);

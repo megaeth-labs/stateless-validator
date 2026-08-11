@@ -295,27 +295,13 @@ mod tests {
     };
 
     use alloy_primitives::B256;
-    use stateless_common::{BackoffPolicy, RpcClientConfig, RpcMetrics, witness_encoding};
-    use stateless_core::withdrawals::MptWitness;
-    use stateless_test_utils::fixtures::TestFixtures;
+    use stateless_common::{BackoffPolicy, RpcClientConfig, RpcMetrics};
 
     use super::*;
     use crate::{
-        data_provider::test_support::{scripted_witness_rpc, start_mock_rpc},
+        data_provider::test_support::{fixture_wire, scripted_witness_rpc, start_mock_rpc},
         server_db::test_support::{StubBlockStore, make_block_meta},
     };
-
-    /// A real `(number, hash, wire response, expected light witness)` from the synthetic
-    /// fixtures, encoded with the production wire format.
-    fn fixture_wire() -> (u64, BlockHash, String, LightWitness) {
-        let fixtures = TestFixtures::synthetic();
-        let (number, hash) = fixtures.paired_blocks().into_iter().next().expect("paired fixture");
-        let salt = &fixtures.salt_witnesses[&hash];
-        let mpt: MptWitness = fixtures.mpt_witness(&hash);
-        let wire =
-            witness_encoding::encode_witness_response(salt, &mpt).expect("encode fixture witness");
-        (number, hash, wire, LightWitness::from(salt))
-    }
 
     /// Fetcher over the given witness endpoints with millisecond retry backoff, a dummy
     /// RPC endpoint, and the given routing switch, generator grace, and RPC metrics.

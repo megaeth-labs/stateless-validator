@@ -223,12 +223,11 @@ impl RpcContext {
     /// The shared by-number prelude, encoding the reorg-safety invariant once for both
     /// by-number handlers: resolve tag -> number -> canonical hash (local index first)
     /// *before* the cache lookup, all on one request deadline; on a miss, fetch block data
-    /// by the resolved hash on the remaining budget, reusing the resolved number so the
-    /// fetch pipeline skips its number-discovery header round trip. A tag resolution
-    /// already binds number -> hash in its one upstream response, so it skips the
-    /// canonical-hash step entirely. Slow prelude stages are warned about here, where they
-    /// are measured; trace/serialize timing lives in [`compute_block_trace`] and
-    /// cache-insert timing in [`insert_cache`].
+    /// by the resolved hash + number on the remaining budget (a tag resolution already
+    /// bound number -> hash in its one upstream response, so it skips the canonical-hash
+    /// step). Slow prelude stages are warned about here, where they are measured;
+    /// trace/serialize timing lives in [`compute_block_trace`] and cache-insert timing in
+    /// [`insert_cache`].
     async fn lookup_block_by_number(
         &self,
         method: &'static str,
@@ -1040,7 +1039,7 @@ mod tests {
         };
 
         let chain_spec = ChainSpec::from_genesis(
-            TestFixtures::synthetic().load_genesis().expect("fixture genesis"),
+            TestFixtures::synthetic_shared().load_genesis().expect("fixture genesis"),
         );
 
         // Request-attributable: healthy cached data plus an unparsable mux config.
