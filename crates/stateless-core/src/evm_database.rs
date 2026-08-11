@@ -110,6 +110,9 @@ where
                     nonce: acc.nonce,
                     code_hash: acc.codehash.unwrap_or(KECCAK_EMPTY),
                     code,
+                    // Witness state is keyed by address only; the id-based storage
+                    // lookup fast path is never used.
+                    account_id: None,
                 }))
             }
             None => Ok(None),

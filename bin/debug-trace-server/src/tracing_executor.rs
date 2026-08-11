@@ -34,7 +34,6 @@ use alloy_rpc_types_trace::{
         FourByteFrame, GethDebugBuiltInTracerType, GethDebugTracerConfig, GethDebugTracerType,
         GethDebugTracingOptions, GethTrace, NoopFrame, TraceResult,
         call::{CallConfig, FlatCallConfig},
-        mux::MuxConfig,
         pre_state::{AccountState, PreStateConfig, PreStateFrame},
     },
     parity::LocalizedTransactionTrace,
@@ -175,6 +174,7 @@ fn tx_info_at(block: &Block<OpTransaction>, tx: &OpTransaction, index: usize) ->
         block_hash: Some(block.header.hash),
         block_number: Some(block.header.number),
         base_fee: block.header.base_fee_per_gas,
+        block_timestamp: Some(block.header.timestamp),
     }
 }
 
@@ -226,24 +226,19 @@ fn tx_replay_failure(
     ValidationError::BlockReplayFailed(e)
 }
 
-/// Builds a [`MuxInspector`] from an already-parsed config (request-attributable on
-/// failure).
-fn mux_inspector(config: MuxConfig) -> Result<MuxInspector, TraceError> {
-    MuxInspector::try_from_config(config)
-        .map_err(|e| request_error("MuxInspector creation failed", e))
-}
-
 /// Parses the mux `tracerConfig` and builds its inspector — the one home for the mux
-/// construction path shared by the block and transaction dispatchers.
-fn mux_config_and_inspector(
-    tracer_config: &GethDebugTracerConfig,
-) -> Result<(MuxConfig, MuxInspector), TraceError> {
+/// construction path shared by the block and transaction dispatchers. Per-tx resets
+/// clone the pristine inspector instead of re-parsing the config.
+fn mux_inspector(tracer_config: &GethDebugTracerConfig) -> Result<MuxInspector, TraceError> {
     let config = tracer_config
         .clone()
         .into_mux_config()
         .map_err(|e| request_error("invalid muxTracer tracerConfig", e))?;
-    let inspector = mux_inspector(config.clone())?;
-    Ok((config, inspector))
+    // Since alloy 2.x, an unknown tracer name inside a mux config parses (as a JS
+    // tracer key) and is only rejected here by the inspector — still config-attributable,
+    // so the context matches the serde-failure wording.
+    MuxInspector::try_from_config(config)
+        .map_err(|e| request_error("invalid muxTracer tracerConfig", e))
 }
 
 /// Parses a config-reading builtin's `tracerConfig` into its [`TracerKind`] — the one
@@ -273,9 +268,14 @@ fn builtin_tracer_kind(
             .into_flat_call_config()
             .map(TracerKind::FlatCall)
             .map_err(|e| request_error("invalid flatCallTracer tracerConfig", e)),
+        // Unsupported: normally rejected by `RequestShape::classify` (-32602) before
+        // the executor runs; the dispatchers route it here so the message has one home.
+        GethDebugBuiltInTracerType::Erc7562Tracer => {
+            Err(request_error("Unsupported tracer", "erc7562Tracer"))
+        }
         // Not TracingInspector tracers: the dispatchers execute these in their own arms
-        // (mux via `mux_config_and_inspector`) and never route them here; kept total —
-        // a request error rather than a panic.
+        // (mux via `mux_inspector`) and never route them here; kept total — a request
+        // error rather than a panic.
         GethDebugBuiltInTracerType::FourByteTracer |
         GethDebugBuiltInTracerType::NoopTracer |
         GethDebugBuiltInTracerType::MuxTracer => {
@@ -325,6 +325,78 @@ macro_rules! replay_preceding_txs {
 }
 
 // TracingInspector-based helpers (shared by Call, PreState, FlatCall, Default)
+/// Extracts the traced transaction's frame from the executor's inspector — the one
+/// home for the four `TracerKind` frame builders, shared by the block and
+/// single-transaction paths (whose executor types are macro-local, like
+/// [`setup_executor!`]'s).
+///
+/// Evaluates to `Result<GethTrace, ValidationError>`. The `FlatCall` arm takes the
+/// inspector by value (leaving a fresh one behind, which doubles as its per-tx
+/// reset); every other arm leaves the recorded inspector in place for the caller to
+/// reset. `$info` is only evaluated by the `FlatCall` arm.
+macro_rules! extract_trace_frame {
+    ($executor:ident, $tracer:expr, $result_and_state:expr, $tx_gas_limit:expr, $info:expr) => {{
+        let result_and_state = &$result_and_state;
+        match $tracer {
+            TracerKind::Call(call_config) => {
+                let gas_used = result_and_state.result.tx_gas_used();
+                let inspector = $executor.inspector_mut();
+                inspector.set_transaction_gas_limit($tx_gas_limit);
+                Ok(GethTrace::from(
+                    inspector.geth_builder().geth_call_traces(*call_config, gas_used),
+                ))
+            }
+            TracerKind::PreState(prestate_config) => {
+                $executor.inspector_mut().set_transaction_gas_limit($tx_gas_limit);
+                let frame_result = {
+                    let db = $executor.evm.db();
+                    let inspector = $executor.inspector();
+                    inspector.geth_builder().geth_prestate_traces(
+                        result_and_state,
+                        prestate_config,
+                        db,
+                    )
+                };
+                match frame_result {
+                    Ok(frame) => {
+                        let final_frame = if prestate_config.is_diff_mode() {
+                            let db = $executor.evm.db();
+                            add_accessed_unchanged_accounts(frame, &result_and_state.state, db)
+                        } else {
+                            frame
+                        };
+                        Ok(GethTrace::from(final_frame))
+                    }
+                    Err(e) => Err(frame_build_error("PreState trace failed", e)),
+                }
+            }
+            TracerKind::FlatCall(_) => {
+                // Take the inspector rather than cloning its recorded trace arena.
+                let frame: alloy_rpc_types_trace::geth::call::FlatCallFrame =
+                    core::mem::replace($executor.inspector_mut(), $tracer.create_inspector())
+                        .with_transaction_gas_limit($tx_gas_limit)
+                        .into_parity_builder()
+                        .into_localized_transaction_traces($info);
+                Ok(GethTrace::from(frame))
+            }
+            TracerKind::Default(opts) => {
+                let gas_used = result_and_state.result.tx_gas_used();
+                let return_value = result_and_state.result.output().cloned().unwrap_or_default();
+                let inspector = $executor.inspector_mut();
+                inspector.set_transaction_gas_limit($tx_gas_limit);
+                // alloy-rpc-types-trace 2.x serializes `returnValue` with a "0x" prefix
+                // on both sides, so the frame is emitted as-is (the 1.x era needed a
+                // prefix-stripping shim to match mega-reth).
+                Ok(GethTrace::from(inspector.geth_builder().geth_traces(
+                    gas_used,
+                    return_value,
+                    opts.config,
+                )))
+            }
+        }
+    }};
+}
+
 /// Traces all transactions in a block using a `TracingInspector`-based tracer.
 ///
 /// Handles executor creation, pre-execution, tx loop, trace extraction, inspector
@@ -347,86 +419,23 @@ fn trace_block_with_tracing_inspector(
 
         match executor.run_transaction(recovered_tx) {
             Ok(outcome) => {
-                let state_changes = outcome.inner.state.clone();
-
-                let trace_result = match tracer {
-                    TracerKind::Call(call_config) => {
-                        let gas_used = outcome.inner.result.gas_used();
-                        let inspector = executor.inspector_mut();
-                        inspector.set_transaction_gas_limit(tx.inner.gas_limit());
-                        let frame =
-                            inspector.geth_builder().geth_call_traces(*call_config, gas_used);
-                        GethTrace::from(frame)
-                    }
-                    TracerKind::PreState(prestate_config) => {
-                        let result_and_state = revm::context::result::ResultAndState {
-                            result: outcome.inner.result,
-                            state: outcome.inner.state,
-                        };
-                        executor.inspector_mut().set_transaction_gas_limit(tx.inner.gas_limit());
-                        let frame_result = {
-                            let db = executor.evm.db();
-                            let inspector = executor.inspector();
-                            inspector.geth_builder().geth_prestate_traces(
-                                &result_and_state,
-                                prestate_config,
-                                db,
-                            )
-                        };
-                        match frame_result {
-                            Ok(frame) => {
-                                let final_frame = if prestate_config.is_diff_mode() {
-                                    let db = executor.evm.db();
-                                    add_accessed_unchanged_accounts(frame, &state_changes, db)
-                                } else {
-                                    frame
-                                };
-                                GethTrace::from(final_frame)
-                            }
-                            Err(e) => return Err(frame_build_error("PreState trace failed", e)),
-                        }
-                    }
-                    TracerKind::FlatCall(_) => {
-                        let info = tx_info_at(block, tx, index);
-                        let frame: alloy_rpc_types_trace::geth::call::FlatCallFrame = executor
-                            .inspector()
-                            .clone()
-                            .with_transaction_gas_limit(tx.inner.gas_limit())
-                            .into_parity_builder()
-                            .into_localized_transaction_traces(info);
-                        GethTrace::from(frame)
-                    }
-                    TracerKind::Default(opts) => {
-                        let gas_used = outcome.inner.result.gas_used();
-                        let return_value =
-                            outcome.inner.result.output().cloned().unwrap_or_default();
-                        let inspector = executor.inspector_mut();
-                        inspector.set_transaction_gas_limit(tx.inner.gas_limit());
-                        let frame = inspector.geth_builder().geth_traces(
-                            gas_used,
-                            return_value,
-                            opts.config,
-                        );
-
-                        // Convert DefaultFrame to JSON and fix returnValue serialization.
-                        // alloy-rpc-types-trace 1.1.2 serializes Bytes with "0x" prefix,
-                        // but mega-reth uses v1.0.23 which serializes without prefix.
-                        let mut frame_value = serde_json::to_value(frame).unwrap();
-                        if let Some(rv) = frame_value.get_mut("returnValue") &&
-                            let Some(s) = rv.as_str()
-                        {
-                            *rv = serde_json::Value::String(
-                                s.strip_prefix("0x").unwrap_or(s).to_string(),
-                            );
-                        }
-                        GethTrace::JS(frame_value)
-                    }
-                };
+                let result_and_state = outcome.inner.result_and_state;
+                let trace_result = extract_trace_frame!(
+                    executor,
+                    tracer,
+                    result_and_state,
+                    tx.inner.gas_limit(),
+                    tx_info_at(block, tx, index)
+                )?;
 
                 results.push(TraceResult::Success { result: trace_result, tx_hash: Some(tx_hash) });
 
-                *executor.inspector_mut() = tracer.create_inspector();
-                executor.evm.db_mut().commit(state_changes);
+                // The FlatCall arm already left a fresh inspector behind when it took
+                // the recorded one.
+                if !matches!(tracer, TracerKind::FlatCall(_)) {
+                    *executor.inspector_mut() = tracer.create_inspector();
+                }
+                executor.evm.db_mut().commit(result_and_state.state);
             }
             Err(e) => return Err(tx_replay_failure(index, tx_hash, e)),
         }
@@ -436,8 +445,8 @@ fn trace_block_with_tracing_inspector(
 
 /// Traces a single transaction using a `TracingInspector`-based tracer.
 ///
-/// Creates executor, applies pre-execution, replays preceding txs, resets
-/// inspector, runs the target tx, and extracts the trace.
+/// Creates executor, applies pre-execution, replays preceding txs (without
+/// recording), installs the real tracer, runs the target tx, and extracts the trace.
 fn trace_tx_with_tracing_inspector(
     env: &TracingEnv<'_>,
     block: &Block<OpTransaction>,
@@ -447,7 +456,9 @@ fn trace_tx_with_tracing_inspector(
     tx_index: usize,
     tracer: &TracerKind,
 ) -> Result<GethTrace, TraceError> {
-    setup_executor!(env, state, tracer.create_inspector() => executor);
+    // Preceding transactions only rebuild state; a none-config inspector skips
+    // recording their every step just to discard it.
+    setup_executor!(env, state, TracingInspector::new(TracingInspectorConfig::none()) => executor);
     replay_preceding_txs!(executor, env, tx_index);
 
     *executor.inspector_mut() = tracer.create_inspector();
@@ -459,72 +470,14 @@ fn trace_tx_with_tracing_inspector(
     let outcome =
         executor.run_transaction(recovered_target).map_err(ValidationError::BlockReplayFailed)?;
 
-    match tracer {
-        TracerKind::Call(call_config) => {
-            let gas_used = outcome.inner.result.gas_used();
-            let inspector = executor.inspector_mut();
-            inspector.set_transaction_gas_limit(tx_gas_limit);
-            let frame = inspector.geth_builder().geth_call_traces(*call_config, gas_used);
-            Ok(frame.into())
-        }
-        TracerKind::PreState(prestate_config) => {
-            let state_changes = outcome.inner.state.clone();
-            let result_and_state = revm::context::result::ResultAndState {
-                result: outcome.inner.result,
-                state: outcome.inner.state,
-            };
-
-            executor.inspector_mut().set_transaction_gas_limit(tx_gas_limit);
-            let frame_result = {
-                let db = executor.evm.db();
-                let inspector = executor.inspector();
-                inspector.geth_builder().geth_prestate_traces(
-                    &result_and_state,
-                    prestate_config,
-                    db,
-                )
-            };
-
-            match frame_result {
-                Ok(frame) => {
-                    let final_frame = if prestate_config.is_diff_mode() {
-                        let db = executor.evm.db();
-                        add_accessed_unchanged_accounts(frame, &state_changes, db)
-                    } else {
-                        frame
-                    };
-                    Ok(final_frame.into())
-                }
-                Err(e) => Err(frame_build_error("PreState trace failed", e).into()),
-            }
-        }
-        TracerKind::FlatCall(_) => {
-            let info = tx_info_at(block, target_tx, tx_index);
-            let frame: alloy_rpc_types_trace::geth::call::FlatCallFrame = executor
-                .inspector()
-                .clone()
-                .with_transaction_gas_limit(tx_gas_limit)
-                .into_parity_builder()
-                .into_localized_transaction_traces(info);
-            Ok(frame.into())
-        }
-        TracerKind::Default(opts) => {
-            let gas_used = outcome.inner.result.gas_used();
-            let return_value = outcome.inner.result.output().cloned().unwrap_or_default();
-
-            let inspector = executor.inspector_mut();
-            inspector.set_transaction_gas_limit(tx_gas_limit);
-            let frame = inspector.geth_builder().geth_traces(gas_used, return_value, opts.config);
-
-            let mut frame_value = serde_json::to_value(frame).unwrap();
-            if let Some(rv) = frame_value.get_mut("returnValue") &&
-                let Some(s) = rv.as_str()
-            {
-                *rv = serde_json::Value::String(s.strip_prefix("0x").unwrap_or(s).to_string());
-            }
-            Ok(GethTrace::JS(frame_value))
-        }
-    }
+    extract_trace_frame!(
+        executor,
+        tracer,
+        outcome.inner.result_and_state,
+        tx_gas_limit,
+        tx_info_at(block, target_tx, tx_index)
+    )
+    .map_err(TraceError::from)
 }
 
 // Public API - Geth-style Tracing
@@ -564,10 +517,12 @@ pub fn trace_block(
                     .collect(),
 
                 // Strict parse in `builtin_tracer_kind` — see its doc for why the
-                // executor re-rejects what the boundary gate already screens.
+                // executor re-rejects what the boundary gate already screens. The
+                // unsupported erc7562Tracer errors there before any execution.
                 GethDebugBuiltInTracerType::CallTracer |
                 GethDebugBuiltInTracerType::PreStateTracer |
-                GethDebugBuiltInTracerType::FlatCallTracer => trace_block_with_tracing_inspector(
+                GethDebugBuiltInTracerType::FlatCallTracer |
+                GethDebugBuiltInTracerType::Erc7562Tracer => trace_block_with_tracing_inspector(
                     &env,
                     block,
                     &mut state,
@@ -587,7 +542,7 @@ pub fn trace_block(
                             Ok(outcome) => {
                                 let frame = FourByteFrame::from(executor.inspector());
                                 *executor.inspector_mut() = FourByteInspector::default();
-                                executor.evm.db_mut().commit(outcome.inner.state);
+                                executor.evm.db_mut().commit(outcome.inner.result_and_state.state);
                                 results.push(TraceResult::Success {
                                     result: frame.into(),
                                     tx_hash: Some(tx_hash),
@@ -600,7 +555,8 @@ pub fn trace_block(
                 }
 
                 GethDebugBuiltInTracerType::MuxTracer => {
-                    let (mux_config, inspector) = mux_config_and_inspector(tracer_config)?;
+                    let inspector = mux_inspector(tracer_config)?;
+                    let template = inspector.clone();
 
                     setup_executor!(&env, &mut state, inspector => executor);
 
@@ -613,12 +569,7 @@ pub fn trace_block(
 
                         match executor.run_transaction(recovered_tx) {
                             Ok(outcome) => {
-                                let result = outcome.inner.result;
-                                let state_changes = outcome.inner.state.clone();
-                                let result_and_state = revm::context::result::ResultAndState {
-                                    result,
-                                    state: outcome.inner.state,
-                                };
+                                let result_and_state = outcome.inner.result_and_state;
 
                                 let mux_result = {
                                     let db = executor.evm.db();
@@ -626,9 +577,8 @@ pub fn trace_block(
                                     inspector.try_into_mux_frame(&result_and_state, db, info)
                                 };
 
-                                *executor.inspector_mut() =
-                                    MuxInspector::try_from_config(mux_config.clone()).unwrap();
-                                executor.evm.db_mut().commit(state_changes);
+                                *executor.inspector_mut() = template.clone();
+                                executor.evm.db_mut().commit(result_and_state.state);
 
                                 match mux_result {
                                     Ok(frame) => {
@@ -695,12 +645,8 @@ pub fn trace_block(
 
                     match executor.run_transaction(recovered_tx) {
                         Ok(outcome) => {
-                            let result = outcome.inner.result;
-                            let state_changes = outcome.inner.state.clone();
-                            let result_and_state = revm::context::result::ResultAndState {
-                                result,
-                                state: outcome.inner.state,
-                            };
+                            let result_and_state = outcome.inner.result_and_state;
+                            let state_changes = result_and_state.state.clone();
 
                             let evm_env_ref = env.evm_env.clone();
                             let tx_env = TxEnv::default();
@@ -778,7 +724,6 @@ pub fn trace_transaction(
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
     let GethDebugTracingOptions { tracer, tracer_config, .. } = &opts;
-    let target_tx = &env.transactions[tx_index];
     let recovered_target = &target_tx.inner.inner;
     let info = tx_info_at(block, target_tx, tx_index);
 
@@ -790,10 +735,12 @@ pub fn trace_transaction(
                 }
 
                 // Strict parse in `builtin_tracer_kind` — see its doc for why the
-                // executor re-rejects what the boundary gate already screens.
+                // executor re-rejects what the boundary gate already screens. The
+                // unsupported erc7562Tracer errors there before any execution.
                 GethDebugBuiltInTracerType::CallTracer |
                 GethDebugBuiltInTracerType::PreStateTracer |
-                GethDebugBuiltInTracerType::FlatCallTracer => trace_tx_with_tracing_inspector(
+                GethDebugBuiltInTracerType::FlatCallTracer |
+                GethDebugBuiltInTracerType::Erc7562Tracer => trace_tx_with_tracing_inspector(
                     &env,
                     block,
                     &mut state,
@@ -815,21 +762,18 @@ pub fn trace_transaction(
                 }
 
                 GethDebugBuiltInTracerType::MuxTracer => {
-                    let (mux_config, inspector) = mux_config_and_inspector(tracer_config)?;
+                    let inspector = mux_inspector(tracer_config)?;
+                    let template = inspector.clone();
 
                     setup_executor!(&env, &mut state, inspector => executor);
                     replay_preceding_txs!(executor, &env, tx_index);
 
-                    *executor.inspector_mut() = mux_inspector(mux_config)?;
+                    *executor.inspector_mut() = template;
 
                     let outcome = executor
                         .run_transaction(recovered_target)
                         .map_err(ValidationError::BlockReplayFailed)?;
-                    let result = outcome.inner.result;
-                    let result_and_state = revm::context::result::ResultAndState {
-                        result,
-                        state: outcome.inner.state,
-                    };
+                    let result_and_state = outcome.inner.result_and_state;
 
                     let db = executor.evm.db();
                     let inspector = executor.inspector();
@@ -856,9 +800,7 @@ pub fn trace_transaction(
                 let outcome = executor
                     .run_transaction(recovered_target)
                     .map_err(ValidationError::BlockReplayFailed)?;
-                let result = outcome.inner.result;
-                let result_and_state =
-                    revm::context::result::ResultAndState { result, state: outcome.inner.state };
+                let result_and_state = outcome.inner.result_and_state;
 
                 let evm_env_ref = env.evm_env.clone();
                 let tx_env = TxEnv::default();
@@ -904,16 +846,17 @@ pub fn parity_trace_block(
 
         match executor.run_transaction(recovered_tx) {
             Ok(outcome) => {
-                let state_changes = outcome.inner.state;
-                let traces = executor
-                    .inspector()
-                    .clone()
-                    .into_parity_builder()
-                    .into_localized_transaction_traces(info);
+                let state_changes = outcome.inner.result_and_state.state;
+                // Taking the inspector (rather than cloning its recorded trace arena)
+                // doubles as the per-tx reset.
+                let traces = core::mem::replace(
+                    executor.inspector_mut(),
+                    TracingInspector::new(TracingInspectorConfig::default_parity()),
+                )
+                .into_parity_builder()
+                .into_localized_transaction_traces(info);
                 all_traces.extend(traces);
 
-                *executor.inspector_mut() =
-                    TracingInspector::new(TracingInspectorConfig::default_parity());
                 executor.evm.db_mut().commit(state_changes);
             }
             Err(e) => {
@@ -947,7 +890,9 @@ pub fn parity_trace_transaction(
     let cache_db = CacheDB::new(&witness_db);
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
-    let inspector = TracingInspector::new(TracingInspectorConfig::default_parity());
+    // Preceding transactions only rebuild state; a none-config inspector skips
+    // recording their every step just to discard it.
+    let inspector = TracingInspector::new(TracingInspectorConfig::none());
     setup_executor!(&env, &mut state, inspector => executor);
     replay_preceding_txs!(executor, &env, tx_index);
 
@@ -959,11 +904,14 @@ pub fn parity_trace_transaction(
 
     match executor.run_transaction(recovered_tx) {
         Ok(_outcome) => {
-            let traces = executor
-                .inspector()
-                .clone()
-                .into_parity_builder()
-                .into_localized_transaction_traces(info);
+            // Take the inspector rather than cloning its recorded trace arena; this
+            // executor serves no further transactions.
+            let traces = core::mem::replace(
+                executor.inspector_mut(),
+                TracingInspector::new(TracingInspectorConfig::default_parity()),
+            )
+            .into_parity_builder()
+            .into_localized_transaction_traces(info);
             Ok(traces)
         }
         Err(e) => Err(ValidationError::BlockReplayFailed(e).into()),
@@ -1161,11 +1109,17 @@ mod tests {
 
             let err = trace_block(&chain_spec, &block, witness.clone(), &contracts, opts.clone())
                 .expect_err("malformed config must fail the block trace");
-            assert!(matches!(&err, TraceError::Request(msg) if msg.contains("tracerConfig")));
+            assert!(
+                matches!(&err, TraceError::Request(msg) if msg.contains("tracerConfig")),
+                "got: {err:?}"
+            );
 
             let err = trace_transaction(&chain_spec, &block, 0, witness.clone(), &contracts, opts)
                 .expect_err("malformed config must fail the tx trace");
-            assert!(matches!(&err, TraceError::Request(msg) if msg.contains("tracerConfig")));
+            assert!(
+                matches!(&err, TraceError::Request(msg) if msg.contains("tracerConfig")),
+                "got: {err:?}"
+            );
         }
 
         // Control: a well-formed config on the same inputs still traces.

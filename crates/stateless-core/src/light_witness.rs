@@ -50,8 +50,9 @@ pub struct LightWitness {
     /// Bucket subtree levels (same as SaltProof.levels).
     ///
     /// Routed through [`salt::fx_hashmap_serde`] so we don't have to enable
-    /// `hashbrown/serde` (which transitively pulls in `serde_core 1.0.221+`
-    /// and breaks downstream `alloy-tx-macros 1.0.23`).
+    /// `hashbrown/serde` (introduced when its transitive `serde_core 1.0.221+`
+    /// broke the then-current `alloy-tx-macros 1.0.23`; the indirection stays
+    /// so the workspace keeps control over what `hashbrown` pulls in).
     #[serde(with = "salt::fx_hashmap_serde")]
     pub levels: FxHashMap<BucketId, u8>,
 }
