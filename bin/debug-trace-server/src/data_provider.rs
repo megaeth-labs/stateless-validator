@@ -350,7 +350,8 @@ pub(crate) struct DataProvider {
     /// duration of the fetch; the primary task removes it after `.await` completes.
     in_flight: DashMap<B256, BlockDataFuture>,
     /// Bounded in-memory memo of depth-final number → canonical-hash bindings, filled by
-    /// upstream resolutions for heights the sync window no longer (or never) covers.
+    /// upstream resolutions for heights the sync window no longer (or never) covers and
+    /// by `finalized`-tag bindings (final by definition, so exempt from the depth gate).
     /// Restart-cold by design: the first request per height after a restart pays one
     /// upstream header fetch, and a stale entry cannot outlive the process. Shared with
     /// the chain-sync hooks (see [`CanonicalHashMemo`]).
@@ -625,7 +626,9 @@ impl DataProvider {
     /// the wrong height matches the hash, so the outcome is a miss/error rather than a
     /// wrong witness — and the served `BlockData` content is keyed and fetched purely by
     /// `block_hash` either way. A new `known_number` source therefore only needs to be
-    /// hash-consistent, not trusted.
+    /// hash-consistent, not trusted — and the pipeline enforces it: a number the fetched
+    /// block's own header disagrees with fails the request instead of serving a witness
+    /// routed by the wrong height.
     pub(crate) async fn get_block_data(
         &self,
         block_hash: B256,
@@ -741,6 +744,14 @@ impl DataProvider {
     /// from [`Self::fetch_deadline`], so a stuck upstream surfaces as a typed
     /// [`DataProviderError::Timeout`] rather than hanging the RPC caller forever — and tag
     /// resolution cannot double the request's total budget.
+    ///
+    /// A tag resolution is still a number → hash binding, so it counts into the
+    /// canonical-hash-resolution metric under source `"tag"` — the counter stays a
+    /// complete picture of how bindings were made even though this path never enters
+    /// [`Self::resolve_canonical_hash`]. A `finalized` binding — final by definition,
+    /// which the depth gate could never establish for a height that is itself the
+    /// observed tip — also feeds the canonical-hash memo, so later numeric requests at
+    /// that height resolve locally.
     pub async fn resolve_block_number(
         &self,
         tag: BlockNumberOrTag,
@@ -754,8 +765,18 @@ impl DataProvider {
                 let header = self
                     .rpc_client
                     .get_header_with_deadline(BlockId::Number(tag), true, Some(deadline))
-                    .await?;
+                    .await
+                    .inspect_err(|_| record_canonical_hash_resolution("tag", "error"))?;
+                record_canonical_hash_resolution("tag", "ok");
                 self.observe_tip(header.number);
+                // `finalized` is final by definition — a stronger guarantee than the
+                // depth gate, and one its own tip observation would defeat by raising
+                // the hint to this very height. `safe` is deliberately not memoized:
+                // how far it can still reorg is upstream policy this server cannot
+                // assert.
+                if matches!(tag, BlockNumberOrTag::Finalized) {
+                    self.canonical_hash_memo.insert(header.number, header.hash);
+                }
                 Ok((header.number, Some(header.hash)))
             }
         }
@@ -998,10 +1019,10 @@ async fn do_fetch_block_data(
     // the block number — from `known_number` when the caller already resolved it, else via
     // one header fetch — because only witness routing (source selection and the deadline
     // heuristic below) consumes it; a caller-supplied number can misroute at worst, never
-    // mis-serve, as every fetch stays keyed by `block_hash`. The full-block fetch needs
-    // only the hash, so it starts immediately instead of idling behind the discovery
-    // round trip. The tip is read once and shared by the deadline heuristic and the
-    // witness-source routing.
+    // mis-serve: every fetch stays keyed by `block_hash`, and the fetched block's own
+    // header re-checks the number below. The full-block fetch needs only the hash, so it
+    // starts immediately instead of idling behind the discovery round trip. The tip is
+    // read once and shared by the deadline heuristic and the witness-source routing.
     let db_tip = db_tip_height(db.as_deref());
     let (witness_timed, block_timed) = tokio::join!(
         async {
@@ -1055,6 +1076,18 @@ async fn do_fetch_block_data(
     let (block_number, fetch_header_ms, (witness, _mpt_witness)) = witness_result?;
     let fetch_witness_ms = witness_elapsed.as_millis().saturating_sub(fetch_header_ms);
     let block = block_result?;
+    // The block is upstream's direct answer for `block_hash`, so its header is the
+    // authority on this hash's height, while `block_number` arrived caller-asserted (or
+    // via the separate discovery fetch). Disagreement means the (number, hash) pair
+    // drifted — fail typed rather than serve (and cache under this hash) a trace built
+    // on a witness routed by the wrong height.
+    if block.header.number != block_number {
+        return Err(eyre::eyre!(
+            "block {block_hash} is at height {}, not the supplied {block_number}",
+            block.header.number
+        )
+        .into());
+    }
     let fetch_full_block_ms = block_elapsed.as_millis();
 
     // Step 3: Extract code hashes and fetch contracts.
@@ -1445,6 +1478,30 @@ pub(crate) mod test_support {
         let url = format!("http://{}", server.local_addr().unwrap());
         (server.start(module), url, hits)
     }
+
+    /// Serves `eth_getBlockByHash` with `block` and `mega_getBlockWitness` with `wire`
+    /// unconditionally — deliberately ignoring the requested keys, like a witness source
+    /// that resolves by number alone with no hash filter.
+    pub(crate) async fn block_and_witness_rpc(
+        block: Block<Transaction>,
+        wire: String,
+    ) -> (ServerHandle, String) {
+        let mut module = RpcModule::new((block, wire));
+        module
+            .register_method("eth_getBlockByHash", |_p, (block, _), _| {
+                Ok::<_, ErrorObjectOwned>(block.clone())
+            })
+            .unwrap();
+        module
+            .register_method("mega_getBlockWitness", |_p, (_, wire), _| {
+                Ok::<_, ErrorObjectOwned>(wire.clone())
+            })
+            .unwrap();
+        let server =
+            jsonrpsee::server::ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        (server.start(module), url)
+    }
 }
 
 #[cfg(test)]
@@ -1458,7 +1515,9 @@ mod tests {
     };
 
     use super::{
-        test_support::{consistent_header, scripted_witness_rpc, start_mock_rpc},
+        test_support::{
+            block_and_witness_rpc, consistent_header, scripted_witness_rpc, start_mock_rpc,
+        },
         *,
     };
     use crate::server_db::test_support::StubBlockStore;
@@ -2169,6 +2228,39 @@ mod tests {
         );
     }
 
+    /// A `finalized`-tag resolution feeds the canonical-hash memo: the binding is final
+    /// by definition, and the depth gate alone could never admit it (its own tip
+    /// observation raises the hint to that very height). `latest` and `safe` must not
+    /// memoize — `latest` can reorg, and `safe`'s reorg depth is upstream policy this
+    /// server does not assert. Pinned by stopping the upstream: a numeric resolution at
+    /// the same height must then serve from the memo (finalized) or fail (the rest).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_finalized_tag_resolutions_feed_the_memo() {
+        let (handle, url, _hits) = start_mock_rpc(200).await;
+        let unfed = provider_at(&url, None);
+        let fed = provider_at(&url, None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        for tag in [BlockNumberOrTag::Latest, BlockNumberOrTag::Safe] {
+            unfed.resolve_block_number(tag, deadline).await.unwrap();
+        }
+        let bound = fed.resolve_block_number(BlockNumberOrTag::Finalized, deadline).await.unwrap();
+        assert_eq!(bound, (200, Some(consistent_header(200).hash)));
+
+        handle.stop().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        assert_eq!(
+            fed.resolve_canonical_hash(200, deadline).await.unwrap(),
+            consistent_header(200).hash,
+            "the finalized binding must serve from the memo with the upstream gone"
+        );
+        let deadline = Instant::now() + Duration::from_millis(300);
+        assert!(
+            unfed.resolve_canonical_hash(200, deadline).await.is_err(),
+            "latest/safe resolutions must not memoize"
+        );
+    }
+
     /// The fetch pipeline's number-discovery header round trip runs only when the caller
     /// could not supply the number: a known number skips it entirely; the plain by-hash
     /// entry still pays it. Pinned by per-method mock counters — the fetch itself times
@@ -2208,6 +2300,44 @@ mod tests {
             1,
             "the raw by-hash entry still discovers the number upstream"
         );
+    }
+
+    /// The `known_number` contract is enforced, not just documented: the fetched block is
+    /// upstream's answer for the requested hash, so a supplied number its header
+    /// disagrees with must fail the fetch — never produce (and cache) a `BlockData` whose
+    /// witness was routed by another block's height. The mock deliberately serves the
+    /// witness whatever keys are asked, modeling a source with no hash filter; the
+    /// matching pair is the success control.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drifted_known_number_fails_instead_of_serving() {
+        let (block, _witness, contract_cache) = fixture_block_and_cache();
+        let (number, hash) = (block.header.number, block.header.hash);
+        let fixtures = TestFixtures::synthetic();
+        let mpt: MptWitness = fixtures.mpt_witness(&hash);
+        let wire = stateless_common::encode_witness_response(&fixtures.salt_witnesses[&hash], &mpt)
+            .expect("fixture witness must encode");
+        let (handle, url) = block_and_witness_rpc(block, wire).await;
+        let provider = provider_with_tiers(&url, None, None, contract_cache);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let data = provider
+            .get_block_data(hash, Some(number), deadline)
+            .await
+            .expect("a consistent (number, hash) pair must serve");
+        assert_eq!(data.block.header.number, number);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let err = provider
+            .get_block_data(hash, Some(number + 1), deadline)
+            .await
+            .err()
+            .expect("a drifted known_number must fail, not serve");
+        assert!(
+            matches!(err, DataProviderError::Internal(_)) &&
+                err.to_string().contains("not the supplied"),
+            "a drifted known_number must fail typed, got: {err:?}"
+        );
+        handle.stop().unwrap();
     }
 
     /// Cancellation of the primary fetch task (e.g. client disconnect) must not leak an

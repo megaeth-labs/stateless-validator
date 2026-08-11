@@ -103,6 +103,7 @@ The HTTP response cache is keyed by `(resource, block hash, tracer variant)` —
 Entries hold the reply's raw JSON bytes, serialized exactly once from the trace output and spliced verbatim into every response — a hit shares the bytes by `Arc` instead of re-parsing and re-serializing the JSON tree.
 By-number requests resolve their canonical hash before the lookup (local index, then an in-memory memo, then upstream `eth_getHeaderByNumber`), so a reorged height resolves to the new hash and misses cleanly.
 Tag requests (`latest`/`finalized`/`safe`) bind number → hash in their single upstream header fetch, and every resolved (number, hash) pair — tag, canonical-hash resolution, or transaction lookup — is handed to the fetch pipeline, which then skips its own number-discovery header round trip (only raw by-hash requests still pay it).
+The pipeline cross-checks the handed number against the fetched block's own header, so a drifted (number, hash) pair fails typed instead of serving a witness routed by the wrong height.
 Cacheable shapes are the five built-in tracers (`callTracer`, `prestateTracer`, `4byteTracer`, `noopTracer`, `flatCallTracer`, keyed by their parsed, typed `tracerConfig` — equivalent configs collapse onto one entry) and the bare default struct-logger request (no tracer, no `tracerConfig`, default flags).
 JS tracers, `muxTracer`, and struct-logger requests with non-default flags bypass the cache and are recomputed on every request.
 A type-malformed `tracerConfig` on a config-reading builtin (`callTracer`/`prestateTracer`/`flatCallTracer`) is rejected with `-32602 invalid params` instead of being silently traced with default settings.
@@ -125,7 +126,7 @@ Disable with `--response-compression-disabled`; the flag is read at startup, so 
 
 **Canonical-hash memo:**
 `CANONICAL_CHAIN` stays a bounded, contiguous sync window; heights outside it resolve number → hash upstream once, and the hash-verified answer is memoized in a bounded in-memory LRU.
-Only depth-final heights are memoized (more than a safety depth below the observed tip, so a memoized binding can no longer reorg); shallow and above-tip heights resolve upstream on every request.
+Only depth-final heights are memoized — more than a safety depth below the observed tip, or bound by a `finalized`-tag resolution (final by definition) — so a memoized binding can no longer reorg; shallow and above-tip heights resolve upstream on every request.
 The observed tip comes from the local window and `latest`-tag lookups; when neither exists (stateless mode with numeric-only traffic), a throttled upstream `eth_blockNumber` seed learns it, so the memo fills there too.
 Resolution order is window → memo → upstream, so historical heights resolve locally after first touch for the lifetime of the process; a restart clears the memo, and reorg bisection reads only the window.
 In local cache mode chain sync also clears the memo on a stale reset and on any reorg at least the safety depth deep; in stateless mode the depth margin alone carries the safety argument (assumed deeper reorgs never happen on the target chain).
