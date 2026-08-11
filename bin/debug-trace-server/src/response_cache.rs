@@ -779,6 +779,14 @@ mod tests {
         let shape = RequestShape::classify(&malformed);
         assert_eq!(shape.label(), "call_tracer");
         assert!(shape.cache_variant().is_none());
+
+        // The unsupported erc7562Tracer likewise: registered label, neither cacheable
+        // nor bypass (the gate rejects it before execution).
+        let shape =
+            RequestShape::classify(&builtin_opts(GethDebugBuiltInTracerType::Erc7562Tracer));
+        assert_eq!(shape.label(), "erc7562_tracer");
+        assert!(crate::metrics::REQUEST_SHAPES.contains(&shape.label()));
+        assert!(shape.cache_variant().is_none());
     }
 
     /// Key identity (Eq + Hash, exercised through a `HashSet`) discriminates on every

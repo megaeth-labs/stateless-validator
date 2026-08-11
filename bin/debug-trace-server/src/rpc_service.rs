@@ -347,18 +347,17 @@ fn classify_and_gate(
 ) -> Result<Option<ResponseVariant>, jsonrpsee::types::ErrorObjectOwned> {
     let shape = RequestShape::classify(opts);
     metrics::record_request_shape(method_name, shape.label());
-    match &shape {
+    // Exhaustive on purpose, like `classify` itself: a future shape variant must make
+    // an explicit gate decision here instead of silently passing through.
+    let message = match &shape {
+        RequestShape::Cacheable(_) | RequestShape::Bypass(_) => return Ok(shape.cache_variant()),
         RequestShape::InvalidTracerConfig { label, error } => {
-            metrics::record_rpc_error(method_name);
-            return Err(invalid_params_err(format!("invalid tracerConfig for {label}: {error}")));
+            format!("invalid tracerConfig for {label}: {error}")
         }
-        RequestShape::Unsupported { label } => {
-            metrics::record_rpc_error(method_name);
-            return Err(invalid_params_err(format!("unsupported tracer: {label}")));
-        }
-        _ => {}
-    }
-    Ok(shape.cache_variant())
+        RequestShape::Unsupported { label } => format!("unsupported tracer: {label}"),
+    };
+    metrics::record_rpc_error(method_name);
+    Err(invalid_params_err(message))
 }
 
 /// Maps a [`DataProviderError`] to a JSON-RPC error object.
@@ -1124,6 +1123,19 @@ mod tests {
         }))
         .unwrap();
         assert!(classify_and_gate("test_method", &opts).unwrap().is_some());
+    }
+
+    #[test]
+    fn unsupported_tracer_maps_to_invalid_params() {
+        let opts: GethDebugTracingOptions =
+            serde_json::from_value(serde_json::json!({"tracer": "erc7562Tracer"})).unwrap();
+        let err = classify_and_gate("test_method", &opts).unwrap_err();
+        assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
+        assert!(
+            err.message().contains("unsupported tracer: erc7562_tracer"),
+            "message: {}",
+            err.message(),
+        );
     }
 
     #[test]

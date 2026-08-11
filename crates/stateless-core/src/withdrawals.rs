@@ -217,22 +217,14 @@ impl Linearizer<'_> {
             TrieNode::Leaf(leaf) => {
                 let full = path.join(&leaf.key);
                 // The leaf is the region's only occupant: a removal of any other path
-                // is a proven no-op, a write at `full` supersedes the leaf.
-                let mut finals: Vec<(Nibbles, &[u8])> = Vec::with_capacity(updates.len() + 1);
-                let mut survivor = Some((full, leaf.value.as_slice()));
-                for (update_path, update) in updates {
-                    if *update_path == full {
-                        survivor = None;
-                    }
-                    if let Some(value) = update {
-                        finals.push((*update_path, value));
-                    }
+                // is a proven no-op, and a write at `full` supersedes the leaf (its
+                // replacement, if any, is the first entry of `rest`).
+                let (before, rest) = updates.split_at(updates.partition_point(|(p, _)| p < &full));
+                add_insert_leaves(hb, before);
+                if rest.first().is_none_or(|(p, _)| p != &full) {
+                    hb.add_leaf(full, &leaf.value);
                 }
-                finals.extend(survivor);
-                finals.sort_unstable_by_key(|(path, _)| *path);
-                for (leaf_path, value) in finals {
-                    hb.add_leaf(leaf_path, value);
-                }
+                add_insert_leaves(hb, rest);
                 Ok(())
             }
             TrieNode::Extension(ext) => {
@@ -395,18 +387,14 @@ fn add_insert_leaves(hb: &mut HashBuilder, updates: &Updates) {
 /// Splits sorted `updates` around the region prefixed by `prefix`:
 /// `(diverging before, under prefix, diverging after)`.
 ///
-/// Sound because for 64-nibble update paths and a shorter `prefix`, every path
-/// under the prefix compares greater than any diverging-lower path and smaller
-/// than any diverging-higher path, so the region is one contiguous run.
+/// The prefixed region is one contiguous run in sorted order, so two partition
+/// points delimit it.
 fn split_at_prefix<'u>(
     updates: &'u Updates,
     prefix: &Nibbles,
 ) -> (&'u Updates, &'u Updates, &'u Updates) {
     let lo = updates.partition_point(|(p, _)| p < prefix);
-    let mut hi = lo;
-    while hi < updates.len() && updates[hi].0.starts_with(prefix) {
-        hi += 1;
-    }
+    let hi = lo + updates[lo..].partition_point(|(p, _)| p.starts_with(prefix));
     (&updates[..lo], &updates[lo..hi], &updates[hi..])
 }
 
