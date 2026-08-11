@@ -31,7 +31,7 @@ use std::{
 use alloy_primitives::B256;
 use alloy_rpc_types_trace::geth::{
     CallConfig, FlatCallConfig, GethDebugTracerConfig, GethDebugTracingOptions,
-    GethDefaultTracingOptions, PreStateConfig,
+    GethDefaultTracingOptions, PreStateConfig, erc7562::Erc7562Config,
 };
 use quick_cache::{Lifecycle, Weighter, sync::Cache};
 use tracing::debug;
@@ -130,6 +130,30 @@ impl From<FlatCallConfig> for FlatCallConfigKey {
     }
 }
 
+/// Hashable mirror of alloy's [`Erc7562Config`]. The ignored-opcode list is folded
+/// into a 256-bit set, so permutations and duplicates of the same opcodes collapse
+/// onto one cache entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Erc7562ConfigKey {
+    stack_top_items_size: Option<u64>,
+    ignored_opcodes: [u64; 4],
+    with_log: Option<bool>,
+}
+
+impl From<Erc7562Config> for Erc7562ConfigKey {
+    fn from(config: Erc7562Config) -> Self {
+        let mut ignored_opcodes = [0u64; 4];
+        for opcode in config.ignored_opcodes {
+            ignored_opcodes[usize::from(opcode) / 64] |= 1 << (opcode % 64);
+        }
+        Self {
+            stack_top_items_size: config.stack_top_items_size,
+            ignored_opcodes,
+            with_log: config.with_log,
+        }
+    }
+}
+
 /// Cache variant: which whitelisted request shape produced the response, discriminated by
 /// the *parsed* tracer config — a small closed key space per tracer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -149,6 +173,8 @@ pub enum ResponseVariant {
     FourByteTracer,
     /// noopTracer never reads `tracerConfig`; same collapse.
     NoopTracer,
+    /// erc7562Tracer with its parsed config.
+    Erc7562Tracer(Erc7562ConfigKey),
 }
 
 impl ResponseVariant {
@@ -161,8 +187,17 @@ impl ResponseVariant {
             Self::FlatCallTracer(_) => "flat_call_tracer",
             Self::FourByteTracer => "four_byte_tracer",
             Self::NoopTracer => "noop_tracer",
+            Self::Erc7562Tracer(_) => "erc7562_tracer",
         }
     }
+}
+
+/// [`Erc7562Config`] analog of alloy's `into_*_config` conversions (which exist only
+/// for the older builtins): a null config is the default, anything else must parse.
+pub(crate) fn into_erc7562_config(
+    config: GethDebugTracerConfig,
+) -> Result<Erc7562Config, serde_json::Error> {
+    if config.is_null() { Ok(Erc7562Config::default()) } else { config.from_value() }
 }
 
 /// Classification of a trace request's parameters — the single source of truth shared by
@@ -182,25 +217,18 @@ pub enum RequestShape {
         /// The deserialization failure.
         error: serde_json::Error,
     },
-    /// A builtin tracer this server does not implement: the request must be rejected
-    /// before any block data is fetched or executed.
-    Unsupported {
-        /// Shape label of the unsupported tracer.
-        label: &'static str,
-    },
 }
 
 impl RequestShape {
     /// Classifies the request parameters, parsing the typed tracer config exactly once.
     ///
-    /// Cacheable: the five known built-in tracers (keyed by their *parsed* config) and the
+    /// Cacheable: the six known built-in tracers (keyed by their *parsed* config) and the
     /// bare default struct-logger request (no tracer, no `tracerConfig`, default
     /// `opts.config` — those flags change struct-logger output).
     ///
     /// Bypassed: JS tracers (the response depends on the tracer source, which has no place
     /// in a bounded key), `muxTracer`, and struct-logger requests with non-default
-    /// `opts.config`. The unimplemented `erc7562Tracer` classifies as [`Self::Unsupported`]
-    /// and is rejected at the gate.
+    /// `opts.config`.
     pub fn classify(opts: &GethDebugTracingOptions) -> Self {
         use alloy_rpc_types_trace::geth::{GethDebugBuiltInTracerType, GethDebugTracerType};
 
@@ -239,12 +267,15 @@ impl RequestShape {
                 GethDebugBuiltInTracerType::NoopTracer => {
                     Self::Cacheable(ResponseVariant::NoopTracer)
                 }
+                GethDebugBuiltInTracerType::Erc7562Tracer => Self::config_variant(
+                    opts,
+                    into_erc7562_config,
+                    "erc7562_tracer",
+                    |config: Erc7562Config| ResponseVariant::Erc7562Tracer(config.into()),
+                ),
                 // Exhaustive on purpose: a future alloy builtin variant must make an
                 // explicit cache-whitelist decision here instead of silently bypassing.
                 GethDebugBuiltInTracerType::MuxTracer => Self::Bypass("mux_tracer"),
-                GethDebugBuiltInTracerType::Erc7562Tracer => {
-                    Self::Unsupported { label: "erc7562_tracer" }
-                }
             },
             Some(GethDebugTracerType::JsTracer(_)) => Self::Bypass("js_tracer"),
         }
@@ -270,7 +301,7 @@ impl RequestShape {
         match self {
             Self::Cacheable(variant) => variant.label(),
             Self::Bypass(label) => label,
-            Self::InvalidTracerConfig { label, .. } | Self::Unsupported { label } => label,
+            Self::InvalidTracerConfig { label, .. } => label,
         }
     }
 
@@ -743,6 +774,7 @@ mod tests {
             builtin_opts(GethDebugBuiltInTracerType::NoopTracer),
             builtin_opts(GethDebugBuiltInTracerType::FlatCallTracer),
             builtin_opts(GethDebugBuiltInTracerType::MuxTracer),
+            builtin_opts(GethDebugBuiltInTracerType::Erc7562Tracer),
             GethDebugTracingOptions {
                 tracer: Some(GethDebugTracerType::JsTracer("{}".to_string())),
                 ..Default::default()
@@ -778,14 +810,6 @@ mod tests {
             with_config(GethDebugBuiltInTracerType::CallTracer, json!({"onlyTopCall": "yes"}));
         let shape = RequestShape::classify(&malformed);
         assert_eq!(shape.label(), "call_tracer");
-        assert!(shape.cache_variant().is_none());
-
-        // The unsupported erc7562Tracer likewise: registered label, neither cacheable
-        // nor bypass (the gate rejects it before execution).
-        let shape =
-            RequestShape::classify(&builtin_opts(GethDebugBuiltInTracerType::Erc7562Tracer));
-        assert_eq!(shape.label(), "erc7562_tracer");
-        assert!(crate::metrics::REQUEST_SHAPES.contains(&shape.label()));
         assert!(shape.cache_variant().is_none());
     }
 

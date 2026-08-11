@@ -338,9 +338,9 @@ fn invalid_params_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
 }
 
 /// Classifies `opts`, records the request-shape metric, and rejects a type-malformed
-/// `tracerConfig` on a config-reading builtin — or an unsupported tracer — with
-/// `-32602 invalid params`, before any block data is fetched or executed. Returns the
-/// cache variant (`Some` only for cacheable shapes).
+/// `tracerConfig` on a config-reading builtin with `-32602 invalid params`, before any
+/// block data is fetched or executed. Returns the cache variant (`Some` only for
+/// cacheable shapes).
 fn classify_and_gate(
     method_name: &'static str,
     opts: &GethDebugTracingOptions,
@@ -354,7 +354,6 @@ fn classify_and_gate(
         RequestShape::InvalidTracerConfig { label, error } => {
             format!("invalid tracerConfig for {label}: {error}")
         }
-        RequestShape::Unsupported { label } => format!("unsupported tracer: {label}"),
     };
     metrics::record_rpc_error(method_name);
     Err(invalid_params_err(message))
@@ -1125,17 +1124,30 @@ mod tests {
         assert!(classify_and_gate("test_method", &opts).unwrap().is_some());
     }
 
+    /// The erc7562 tracer classifies like the other config-reading builtins: a
+    /// type-malformed config is rejected with `-32602` at the gate, a well-formed one
+    /// yields a cacheable variant.
     #[test]
-    fn unsupported_tracer_maps_to_invalid_params() {
-        let opts: GethDebugTracingOptions =
-            serde_json::from_value(serde_json::json!({"tracer": "erc7562Tracer"})).unwrap();
+    fn erc7562_tracer_classifies_and_gates() {
+        let opts: GethDebugTracingOptions = serde_json::from_value(serde_json::json!({
+            "tracer": "erc7562Tracer",
+            "tracerConfig": {"withLog": "yes-please"},
+        }))
+        .unwrap();
         let err = classify_and_gate("test_method", &opts).unwrap_err();
         assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
         assert!(
-            err.message().contains("unsupported tracer: erc7562_tracer"),
+            err.message().contains("invalid tracerConfig for erc7562_tracer"),
             "message: {}",
             err.message(),
         );
+
+        let opts: GethDebugTracingOptions = serde_json::from_value(serde_json::json!({
+            "tracer": "erc7562Tracer",
+            "tracerConfig": {"withLog": true},
+        }))
+        .unwrap();
+        assert!(classify_and_gate("test_method", &opts).unwrap().is_some());
     }
 
     #[test]
