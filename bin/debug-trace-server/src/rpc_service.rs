@@ -720,6 +720,10 @@ impl TraceRpcServer for RpcContext {
     async fn trace_block(&self, block_number: BlockNumberOrTag) -> RpcResult<RawJson> {
         let _guard = self.watch_dog.start_request(METHOD_TRACE_BLOCK, format!("{block_number}"));
         let start = Instant::now();
+        // Opts-less, so every request is the default shape — recorded here because this
+        // method never passes `classify_and_gate`, and the accounting identity needs an
+        // arrival for it too.
+        metrics::record_request_shape(METHOD_TRACE_BLOCK, "default");
 
         // `trace_block` takes no tracer options, so its variant is always `Default`.
         let data = match self
@@ -765,6 +769,9 @@ impl TraceRpcServer for RpcContext {
     async fn trace_parity_transaction(&self, tx_hash: B256) -> RpcResult<RawJson> {
         let _guard = self.watch_dog.start_request(METHOD_TRACE_TRANSACTION, format!("{tx_hash}"));
         let start = Instant::now();
+        // Opts-less arrival, mirroring `trace_block` — without it every null/served
+        // response here would count against a zero arrival side.
+        metrics::record_request_shape(METHOD_TRACE_TRANSACTION, "default");
 
         // Return null instead of error when tx not found or unreachable (matches mega-reth);
         // surface genuine Internal failures as -32000. Branches on the typed variant so any

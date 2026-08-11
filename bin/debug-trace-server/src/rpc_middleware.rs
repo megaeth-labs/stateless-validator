@@ -24,7 +24,7 @@ use std::{
     borrow::Cow,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -123,6 +123,9 @@ fn stamp_entry_cpu(mut rp: MethodResponse, entry_cpu: &AtomicU64) -> MethodRespo
 struct CancelGuard {
     /// `None` once the request produced a response, which disarms the drop.
     method: Option<&'static str>,
+    /// Batch-wide "the server aborted this batch itself" flag; a drop with it set is not
+    /// a client hangup and records nothing. `None` for single calls.
+    server_abort: Option<Arc<AtomicBool>>,
 }
 
 impl CancelGuard {
@@ -131,7 +134,13 @@ impl CancelGuard {
             method: Some(crate::metrics::resolve_method(crate::metrics::strip_timed_prefix(
                 method,
             ))),
+            server_abort: None,
         }
+    }
+
+    /// Guard for one batch entry, sharing the batch's server-abort flag.
+    fn for_entry(method: &str, server_abort: Arc<AtomicBool>) -> Self {
+        Self { server_abort: Some(server_abort), ..Self::new(method) }
     }
 
     /// Marks the request as answered, so dropping the guard records nothing.
@@ -139,19 +148,33 @@ impl CancelGuard {
         self.method = None;
     }
 
-    /// Whether dropping now would count a cancellation.
-    #[cfg(test)]
-    fn armed(&self) -> bool {
-        self.method.is_some()
+    /// The method a drop right now would count as cancelled, if any.
+    fn drop_outcome(&self) -> Option<&'static str> {
+        self.method
+            .filter(|_| !self.server_abort.as_ref().is_some_and(|f| f.load(Ordering::Relaxed)))
     }
 }
 
 impl Drop for CancelGuard {
     fn drop(&mut self) {
-        if let Some(method) = self.method {
+        if let Some(method) = self.drop_outcome() {
             crate::metrics::record_request_cancelled(method);
         }
     }
+}
+
+/// Settles `guard` for a produced response, funneling an error response no handler
+/// accounted for into the `rejected` arrival/outcome pair — the framework answers
+/// unknown methods and malformed top-level params before any handler (and its counters)
+/// can run.
+fn settle_response(rp: &MethodResponse, handler_reported: bool, guard: CancelGuard) {
+    if rp.is_error() &&
+        !handler_reported &&
+        let Some(method) = guard.drop_outcome()
+    {
+        crate::metrics::record_framework_rejection(method);
+    }
+    guard.settle();
 }
 
 /// Passes single calls and notifications through untouched; overrides only `batch`.
@@ -181,8 +204,8 @@ where
         let service = self.service.clone();
         let guard = CancelGuard::new(request.method_name());
         async move {
-            let rp = service.call(request).await;
-            guard.settle();
+            let (rp, reported) = crate::metrics::track_handler_errors(service.call(request)).await;
+            settle_response(&rp, reported, guard);
             rp
         }
     }
@@ -203,6 +226,14 @@ where
             let mut got_notification = false;
             let mut entries = batch.into_iter();
             let entry_cpu = Arc::new(AtomicU64::new(0));
+            // Set before a server-side early return (response over the size cap) so the
+            // aborted entries' guards do not read as client hangups. The books of such a
+            // batch are deliberately approximate rather than misclassified: killed
+            // in-flight entries keep their arrival with no outcome, and entries never
+            // started — by the abort or by a client teardown — are on neither side of
+            // the accounting identity (`cancelled` correspondingly undercounts torn-down
+            // oversized batches).
+            let server_abort = Arc::new(AtomicBool::new(false));
 
             // Refill-and-drain: at most `concurrency` entries are alive as spawned
             // tasks, converted to owned form lazily at spawn time — an oversized batch
@@ -218,12 +249,15 @@ where
                     match entry {
                         Ok(BatchEntry::Call(req)) => {
                             let service = service.clone();
-                            let guard = CancelGuard::new(req.method_name());
+                            let guard =
+                                CancelGuard::for_entry(req.method_name(), server_abort.clone());
                             let req = owned_request(req);
                             tasks.spawn(CpuSampled::new(
                                 async move {
-                                    let rp = service.call(req).await;
-                                    guard.settle();
+                                    let (rp, reported) =
+                                        crate::metrics::track_handler_errors(service.call(req))
+                                            .await;
+                                    settle_response(&rp, reported, guard);
                                     Some(rp)
                                 },
                                 entry_cpu.clone(),
@@ -241,8 +275,12 @@ where
                             ));
                         }
                         Err(err) => {
+                            // A client-visible error entry no handler will ever see —
+                            // account for it like the other framework rejections.
+                            crate::metrics::record_framework_rejection("unknown");
                             let (err, id) = err.into_parts();
                             if let Err(err) = batch_rp.append(MethodResponse::error(id, err)) {
+                                server_abort.store(true, Ordering::Relaxed);
                                 return stamp_entry_cpu(err, &entry_cpu);
                             }
                         }
@@ -251,6 +289,7 @@ where
                 match tasks.join_next().await {
                     Some(Ok(Some(rp))) => {
                         if let Err(err) = batch_rp.append(rp) {
+                            server_abort.store(true, Ordering::Relaxed);
                             return stamp_entry_cpu(err, &entry_cpu);
                         }
                     }
@@ -378,14 +417,21 @@ mod tests {
         serde_json::from_str(&post_text(addr, body).await).unwrap()
     }
 
-    /// The cancel guard is armed on creation and disarmed by `settle`, so only a request
-    /// that never produced a response can be counted as cancelled. Unknown methods collapse
-    /// to the bounded `"unknown"` label rather than letting client input drive cardinality.
+    /// The cancel guard counts a drop as a cancellation only while armed — not after
+    /// `settle`, and not once the batch flagged a server-side abort (a size-cap early
+    /// return is not a client hangup). Unknown methods collapse to the bounded
+    /// `"unknown"` label rather than letting client input drive cardinality.
     #[test]
-    fn cancel_guard_arms_until_settled() {
+    fn cancel_guard_counts_only_client_abandonment() {
         let g = CancelGuard::new("debug_traceBlockByNumber");
-        assert!(g.armed(), "a fresh guard must count a drop as a cancellation");
-        assert_eq!(g.method, Some("debug_traceBlockByNumber"));
+        assert_eq!(g.drop_outcome(), Some("debug_traceBlockByNumber"));
+        g.settle();
+
+        let abort = Arc::new(AtomicBool::new(false));
+        let g = CancelGuard::for_entry("trace_block", abort.clone());
+        assert_eq!(g.drop_outcome(), Some("trace_block"), "client teardown must count");
+        abort.store(true, Ordering::Relaxed);
+        assert_eq!(g.drop_outcome(), None, "a server-side abort must not count");
         g.settle();
 
         // `timed_` aliases share the underlying method's label.
@@ -395,6 +441,21 @@ mod tests {
         );
         // Arbitrary client input must not widen label cardinality.
         assert_eq!(CancelGuard::new("not_a_method").method, Some("unknown"));
+    }
+
+    /// `track_handler_errors` reports whether the handler recorded its own error, which
+    /// is what keeps the middleware fallback from double-counting handler errors while
+    /// still catching responses the framework produced on its own.
+    #[tokio::test]
+    async fn handler_error_tracking_separates_self_reported_errors() {
+        let ((), reported) = crate::metrics::track_handler_errors(async {}).await;
+        assert!(!reported, "nothing recorded => the fallback owns the outcome");
+
+        let ((), reported) = crate::metrics::track_handler_errors(async {
+            crate::metrics::record_rpc_error("trace_block", crate::metrics::ErrorReason::Internal);
+        })
+        .await;
+        assert!(reported, "a handler-recorded error must disarm the fallback");
     }
 
     fn batch_of(method: &str, n: u64) -> String {

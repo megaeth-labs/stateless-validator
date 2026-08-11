@@ -135,6 +135,10 @@ pub enum ErrorReason {
     TraceFailed,
     /// Transport decode, DB, or another internal fault.
     Internal,
+    /// Answered by the framework before the handler ran (unknown method, malformed
+    /// top-level params, unparseable batch entry) — recorded by the RPC middleware's
+    /// fallback, never by a handler.
+    Rejected,
 }
 
 impl ErrorReason {
@@ -147,6 +151,7 @@ impl ErrorReason {
             Self::InvalidParams => "invalid_params",
             Self::TraceFailed => "trace_failed",
             Self::Internal => "internal",
+            Self::Rejected => "rejected",
         }
     }
 
@@ -158,6 +163,7 @@ impl ErrorReason {
         Self::InvalidParams,
         Self::TraceFailed,
         Self::Internal,
+        Self::Rejected,
     ];
 }
 
@@ -441,7 +447,9 @@ fn record_upstream_deadline_exceeded(method: &'static str) {
 /// shapes bypass the response cache.
 const REQUEST_SHAPE_TOTAL: &str = "debug_trace_request_shape_total";
 
-/// Every label emitted by `RequestShape::label`, for pre-registration and tests.
+/// Every label emitted by `RequestShape::label`, for pre-registration and tests — plus
+/// `rejected`, recorded by the RPC middleware for requests the framework answered before
+/// the handler ran (see [`record_framework_rejection`]).
 pub const REQUEST_SHAPES: &[&str] = &[
     "default",
     "call_tracer",
@@ -452,6 +460,7 @@ pub const REQUEST_SHAPES: &[&str] = &[
     "struct_logger_config",
     "js_tracer",
     "mux_tracer",
+    "rejected",
 ];
 
 /// Records one request of the given parameter shape for `method`.
@@ -737,6 +746,14 @@ fn pre_register_all_metrics() {
             counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => *shape).increment(0);
         }
     }
+    // The opts-less Parity pair arrives as `default` (or `rejected` via the middleware
+    // fallback) — their arrival series must exist for the accounting identity to be
+    // subtractable from boot.
+    for method in [METHOD_TRACE_BLOCK, METHOD_TRACE_TRANSACTION] {
+        for shape in ["default", "rejected"] {
+            counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => shape).increment(0);
+        }
+    }
 
     // Data Fetch Layer: canonical number → hash resolution
     for (source, outcome) in [
@@ -829,8 +846,42 @@ pub fn record_rpc_request(method: &str, duration_secs: f64) {
 /// which is what makes "no client saw a timeout" a checkable statement rather than an
 /// inference from three subtracted counters.
 pub fn record_rpc_error(method: &str, reason: ErrorReason) {
+    // Tell the RPC middleware's fallback this error response is already accounted for.
+    let _ = ERROR_SELF_REPORTED.try_with(|reported| reported.set(true));
     let method = resolve_method(strip_timed_prefix(method));
     counter!(RPC_ERRORS_TOTAL, "method" => method, "reason" => reason.as_str()).increment(1);
+}
+
+tokio::task_local! {
+    /// Whether the current request's handler already recorded its error outcome.
+    /// Scoped per request by [`track_handler_errors`]; [`record_rpc_error`] sets it.
+    static ERROR_SELF_REPORTED: std::cell::Cell<bool>;
+}
+
+/// Runs one request future with error-outcome tracking, returning its response and
+/// whether the handler self-reported an error via [`record_rpc_error`].
+///
+/// This is what lets the RPC middleware close the last accounting gap: an error response
+/// produced without a handler record (unknown method, malformed top-level params — the
+/// framework answers before the handler runs) is otherwise invisible to every counter.
+pub async fn track_handler_errors<F: Future>(fut: F) -> (F::Output, bool) {
+    ERROR_SELF_REPORTED
+        .scope(std::cell::Cell::new(false), async move {
+            let out = fut.await;
+            let reported = ERROR_SELF_REPORTED.with(|reported| reported.get());
+            (out, reported)
+        })
+        .await
+}
+
+/// Records a request the framework rejected before its handler ran, as the balanced pair
+/// `request_shape_total{shape="rejected"}` + `rpc_errors_total{reason="rejected"}` — an
+/// arrival and an outcome, so the accounting identity holds for requests no handler saw.
+pub fn record_framework_rejection(method: &str) {
+    let method = resolve_method(strip_timed_prefix(method));
+    record_request_shape(method, "rejected");
+    counter!(RPC_ERRORS_TOTAL, "method" => method, "reason" => ErrorReason::Rejected.as_str())
+        .increment(1);
 }
 
 /// Records a request whose handler future was dropped before producing a response —
