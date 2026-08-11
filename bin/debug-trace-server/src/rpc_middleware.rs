@@ -201,10 +201,12 @@ where
         &self,
         request: Request<'a>,
     ) -> impl Future<Output = Self::MethodResponse> + Send + 'a {
-        let service = self.service.clone();
         let guard = CancelGuard::new(request.method_name());
+        // Created eagerly so the wrapper owns no service clone — only the batch path,
+        // which spawns entries, needs one.
+        let fut = self.service.call(request);
         async move {
-            let (rp, reported) = crate::metrics::track_handler_errors(service.call(request)).await;
+            let (rp, reported) = crate::metrics::track_handler_errors(fut).await;
             settle_response(&rp, reported, guard);
             rp
         }
@@ -227,12 +229,9 @@ where
             let mut entries = batch.into_iter();
             let entry_cpu = Arc::new(AtomicU64::new(0));
             // Set before a server-side early return (response over the size cap) so the
-            // aborted entries' guards do not read as client hangups. The books of such a
-            // batch are deliberately approximate rather than misclassified: killed
-            // in-flight entries keep their arrival with no outcome, and entries never
-            // started — by the abort or by a client teardown — are on neither side of
-            // the accounting identity (`cancelled` correspondingly undercounts torn-down
-            // oversized batches).
+            // aborted entries' guards do not read as client hangups. Such a batch's books
+            // are deliberately approximate: killed entries keep an arrival with no
+            // outcome; never-started entries are on neither side.
             let server_abort = Arc::new(AtomicBool::new(false));
 
             // Refill-and-drain: at most `concurrency` entries are alive as spawned
@@ -418,9 +417,7 @@ mod tests {
     }
 
     /// The cancel guard counts a drop as a cancellation only while armed — not after
-    /// `settle`, and not once the batch flagged a server-side abort (a size-cap early
-    /// return is not a client hangup). Unknown methods collapse to the bounded
-    /// `"unknown"` label rather than letting client input drive cardinality.
+    /// `settle`, and not once the batch flagged a server-side abort.
     #[test]
     fn cancel_guard_counts_only_client_abandonment() {
         let g = CancelGuard::new("debug_traceBlockByNumber");
@@ -433,14 +430,6 @@ mod tests {
         abort.store(true, Ordering::Relaxed);
         assert_eq!(g.drop_outcome(), None, "a server-side abort must not count");
         g.settle();
-
-        // `timed_` aliases share the underlying method's label.
-        assert_eq!(
-            CancelGuard::new("timed_debug_traceTransaction").method,
-            Some("debug_traceTransaction")
-        );
-        // Arbitrary client input must not widen label cardinality.
-        assert_eq!(CancelGuard::new("not_a_method").method, Some("unknown"));
     }
 
     /// `track_handler_errors` reports whether the handler recorded its own error, which

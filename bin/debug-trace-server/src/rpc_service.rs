@@ -372,12 +372,8 @@ fn data_provider_error_to_rpc_error(e: &DataProviderError) -> jsonrpsee::types::
     }
 }
 
-/// The `reason` label for a [`DataProviderError`].
-///
-/// Split out from [`data_provider_error_to_rpc_error`] because the JSON-RPC code is coarser
-/// than the label on purpose: three distinct reasons share `-32001`, and telling a blown
-/// witness deadline apart from a genuinely unknown transaction is exactly what the metric
-/// is for.
+/// The `reason` label for a [`DataProviderError`] — deliberately finer than the JSON-RPC
+/// code, which folds three of these into `-32001` (see [`ErrorReason`]).
 fn error_reason(e: &DataProviderError) -> ErrorReason {
     match e {
         DataProviderError::Timeout { stage: TimeoutStage::Witness, .. } => {
@@ -510,13 +506,16 @@ fn insert_cache(
 /// Serializes a result into its [`RawJson`] reply body and records the response-size
 /// metric — the shared epilogue of the uncached transaction handlers (the block-level
 /// twin lives in `compute_block_trace`, which folds the same serialization into its
-/// stage timing and maps failures to [`TraceError`] instead).
+/// stage timing and maps failures to [`TraceError`] instead). A failure records its own
+/// error outcome, so callers must count the request as served only after this returns.
 fn serialize_reply<T: serde::Serialize>(
     result: &T,
     method_name: &'static str,
 ) -> RpcResult<RawJson> {
-    let json =
-        RawJson::try_new(result).map_err(|e| rpc_err(format!("Serialization failed: {e}")))?;
+    let json = RawJson::try_new(result).map_err(|e| {
+        metrics::record_rpc_error(method_name, ErrorReason::Internal);
+        rpc_err(format!("Serialization failed: {e}"))
+    })?;
     ResponseSizeMetrics::new_for_method(method_name).record(json.byte_len());
     Ok(json)
 }
@@ -672,6 +671,10 @@ impl DebugTraceRpcServer for RpcContext {
         EvmExecutionMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION)
             .record(evm_start.elapsed().as_secs_f64(), 1);
 
+        // Serialize before counting the request as served: a failure records an error,
+        // and one request must land in exactly one bucket.
+        let json = serialize_reply(&result, METHOD_DEBUG_TRACE_TRANSACTION)?;
+
         let elapsed = start.elapsed();
         metrics::record_rpc_request(METHOD_DEBUG_TRACE_TRANSACTION, elapsed.as_secs_f64());
 
@@ -686,10 +689,14 @@ impl DebugTraceRpcServer for RpcContext {
             );
         }
 
-        serialize_reply(&result, METHOD_DEBUG_TRACE_TRANSACTION)
+        Ok(json)
     }
 
     async fn get_cache_status(&self) -> RpcResult<serde_json::Value> {
+        // Arrival + served, so the one method outside the trace pipeline still balances
+        // against the middleware's cancelled/rejected terms.
+        metrics::record_request_shape(metrics::METHOD_DEBUG_GET_CACHE_STATUS, "default");
+        metrics::record_rpc_request(metrics::METHOD_DEBUG_GET_CACHE_STATUS, 0.0);
         Ok(serde_json::json!({
             "responseCache": cache_section(self.response_cache.as_ref().map(ResponseCache::stats)),
             "blockDataCache": cache_section(self.data_provider.block_data_cache_stats()),
@@ -783,10 +790,8 @@ impl TraceRpcServer for RpcContext {
                 DataProviderError::TransactionPending(_) |
                 DataProviderError::Timeout { .. }),
             ) => {
-                // A null result is still a served request, so it must be counted as one or
-                // the accounting identity silently loses it. The degraded failure stays
-                // visible on its own counter — a timeout hidden behind `null` is precisely
-                // the case that used to be invisible from both sides.
+                // A null result is still a served request — count it as one, and keep
+                // the degraded cause visible on its own counter.
                 metrics::record_null_result(METHOD_TRACE_TRANSACTION, error_reason(&e));
                 metrics::record_rpc_request(
                     METHOD_TRACE_TRANSACTION,
@@ -795,8 +800,7 @@ impl TraceRpcServer for RpcContext {
                 return Ok(RawJson::null());
             }
             Err(e @ DataProviderError::Internal(_)) => {
-                metrics::record_rpc_error(METHOD_TRACE_TRANSACTION, error_reason(&e));
-                return Err(rpc_err("internal error".to_string()));
+                return Err(data_provider_failure(METHOD_TRACE_TRANSACTION, &e));
             }
         };
 
@@ -814,6 +818,10 @@ impl TraceRpcServer for RpcContext {
         EvmExecutionMetrics::new_for_method(METHOD_TRACE_TRANSACTION)
             .record(evm_start.elapsed().as_secs_f64(), 1);
 
+        // Serialize before counting the request as served: a failure records an error,
+        // and one request must land in exactly one bucket.
+        let json = serialize_reply(&result, METHOD_TRACE_TRANSACTION)?;
+
         let elapsed = start.elapsed();
         metrics::record_rpc_request(METHOD_TRACE_TRANSACTION, elapsed.as_secs_f64());
 
@@ -828,47 +836,13 @@ impl TraceRpcServer for RpcContext {
             );
         }
 
-        serialize_reply(&result, METHOD_TRACE_TRANSACTION)
+        Ok(json)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// Every `DataProviderError` maps to a distinct, stable `reason` label, and the two
-    /// deadline stages stay separable — the whole point of the label is that a blown
-    /// witness deadline is not the same event as an unknown transaction, even though both
-    /// leave as `-32001`.
-    #[test]
-    fn error_reason_separates_deadlines_from_not_found() {
-        use std::time::Duration;
-
-        use crate::data_provider::TimeoutStage;
-
-        let witness = DataProviderError::Timeout {
-            stage: TimeoutStage::Witness,
-            elapsed: Duration::from_secs(8),
-        };
-        let block = DataProviderError::Timeout {
-            stage: TimeoutStage::Block,
-            elapsed: Duration::from_secs(13),
-        };
-        let missing = DataProviderError::TransactionNotFound(B256::ZERO);
-        let pending = DataProviderError::TransactionPending(B256::ZERO);
-        let internal = DataProviderError::Internal(std::sync::Arc::new(eyre::eyre!("boom")));
-
-        assert_eq!(error_reason(&witness), ErrorReason::DeadlineWitness);
-        assert_eq!(error_reason(&block), ErrorReason::DeadlineBlock);
-        assert_eq!(error_reason(&missing), ErrorReason::NotFound);
-        assert_eq!(error_reason(&pending), ErrorReason::NotFound);
-        assert_eq!(error_reason(&internal), ErrorReason::Internal);
-
-        // All three of these share one JSON-RPC code, which is exactly why the label exists.
-        for e in [&witness, &block, &missing] {
-            assert_eq!(data_provider_error_to_rpc_error(e).code(), ERROR_CODE_NOT_FOUND);
-        }
-    }
-
     /// `ErrorReason::ALL` must stay in step with the enum, and the labels must be unique —
     /// a duplicate would silently merge two outcomes into one series.
     #[test]
@@ -903,36 +877,44 @@ mod tests {
         assert_eq!(SLOW_REQUEST_THRESHOLD.as_secs(), 5);
     }
 
-    /// Each `DataProviderError` variant maps to a specific JSON-RPC error code. Missing /
-    /// timeout cases must surface as `-32001` (resource not found); `Internal` falls through
-    /// to `-32000`. Lives here rather than in `data_provider.rs` because the data layer
-    /// shouldn't import `jsonrpsee` types.
+    /// Each `DataProviderError` variant maps to a specific JSON-RPC error code and a
+    /// distinct, stable `reason` label — the deadline stages stay separable from
+    /// `not_found` even though all three share `-32001`. Lives here rather than in
+    /// `data_provider.rs` because the data layer shouldn't import `jsonrpsee` types.
     #[test]
     fn data_provider_error_to_rpc_error_code_mapping() {
         use crate::data_provider::TimeoutStage;
 
         let tx_hash = B256::from([0x11; 32]);
 
-        let not_found_variants: [DataProviderError; 4] = [
-            DataProviderError::TransactionNotFound(tx_hash),
-            DataProviderError::TransactionPending(tx_hash),
-            DataProviderError::Timeout {
-                stage: TimeoutStage::Witness,
-                elapsed: Duration::from_secs(8),
-            },
-            DataProviderError::Timeout {
-                stage: TimeoutStage::Block,
-                elapsed: Duration::from_secs(13),
-            },
+        let not_found_variants: [(DataProviderError, ErrorReason); 4] = [
+            (DataProviderError::TransactionNotFound(tx_hash), ErrorReason::NotFound),
+            (DataProviderError::TransactionPending(tx_hash), ErrorReason::NotFound),
+            (
+                DataProviderError::Timeout {
+                    stage: TimeoutStage::Witness,
+                    elapsed: Duration::from_secs(8),
+                },
+                ErrorReason::DeadlineWitness,
+            ),
+            (
+                DataProviderError::Timeout {
+                    stage: TimeoutStage::Block,
+                    elapsed: Duration::from_secs(13),
+                },
+                ErrorReason::DeadlineBlock,
+            ),
         ];
 
-        for variant in not_found_variants {
+        for (variant, reason) in not_found_variants {
             let err = data_provider_error_to_rpc_error(&variant);
             assert_eq!(err.code(), -32001, "variant {variant:?} must map to resource-not-found");
             assert_eq!(err.message(), variant.to_string().as_str());
+            assert_eq!(error_reason(&variant), reason);
         }
 
         let internal: DataProviderError = eyre::eyre!("boom").into();
+        assert_eq!(error_reason(&internal), ErrorReason::Internal);
         let err = data_provider_error_to_rpc_error(&internal);
         assert_eq!(err.code(), -32000);
         assert_eq!(err.message(), "internal error");

@@ -650,28 +650,20 @@ fn pre_register_all_metrics() {
 
     // Request Layer: the accounting identity's error/cancellation terms. Pre-registering the
     // full (method x reason) grid means a dashboard can subtract zeros instead of missing
-    // series, and `rate(...{reason="deadline_witness"})` alerts on absence from boot.
-    for method in [
-        METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
-        METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
-        METHOD_DEBUG_TRACE_TRANSACTION,
-        METHOD_TRACE_BLOCK,
-        METHOD_TRACE_TRANSACTION,
-    ] {
-        counter!(RPC_REQUESTS_CANCELLED_TOTAL, "method" => method).increment(0);
+    // series, and `rate(...{reason="deadline_witness"})` alerts on absence from boot. Every
+    // known method participates — the middleware's cancelled/rejected terms cover them all.
+    for method in ALL_METHODS {
+        counter!(RPC_REQUESTS_CANCELLED_TOTAL, "method" => *method).increment(0);
         for reason in ErrorReason::ALL {
-            counter!(RPC_ERRORS_TOTAL, "method" => method, "reason" => reason.as_str())
+            counter!(RPC_ERRORS_TOTAL, "method" => *method, "reason" => reason.as_str())
                 .increment(0);
         }
     }
-    // Only the Parity `trace_*` pair degrades a failure to a null result.
-    for method in [METHOD_TRACE_TRANSACTION, METHOD_TRACE_BLOCK] {
-        for reason in
-            [ErrorReason::DeadlineWitness, ErrorReason::DeadlineBlock, ErrorReason::NotFound]
-        {
-            counter!(RPC_NULL_RESULTS_TOTAL, "method" => method, "reason" => reason.as_str())
-                .increment(0);
-        }
+    // Only Parity `trace_transaction` degrades a failure to a null result.
+    for reason in [ErrorReason::DeadlineWitness, ErrorReason::DeadlineBlock, ErrorReason::NotFound]
+    {
+        counter!(RPC_NULL_RESULTS_TOTAL, "method" => METHOD_TRACE_TRANSACTION, "reason" => reason.as_str())
+            .increment(0);
     }
 
     // Request Layer: global
@@ -746,10 +738,9 @@ fn pre_register_all_metrics() {
             counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => *shape).increment(0);
         }
     }
-    // The opts-less Parity pair arrives as `default` (or `rejected` via the middleware
-    // fallback) — their arrival series must exist for the accounting identity to be
-    // subtractable from boot.
-    for method in [METHOD_TRACE_BLOCK, METHOD_TRACE_TRANSACTION] {
+    // Arrival series for the opts-less methods: "default" at handler entry, "rejected"
+    // via the middleware fallback.
+    for method in [METHOD_TRACE_BLOCK, METHOD_TRACE_TRANSACTION, METHOD_DEBUG_GET_CACHE_STATUS] {
         for shape in ["default", "rejected"] {
             counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => shape).increment(0);
         }
@@ -842,9 +833,7 @@ pub fn record_rpc_request(method: &str, duration_secs: f64) {
 ///
 /// Together with [`record_rpc_request`], [`record_request_cancelled`] and
 /// [`record_request_shape`] this closes the per-method accounting identity
-/// `request_shape_total = rpc_requests_total + rpc_errors_total + requests_cancelled_total`,
-/// which is what makes "no client saw a timeout" a checkable statement rather than an
-/// inference from three subtracted counters.
+/// `request_shape_total = rpc_requests_total + rpc_errors_total + requests_cancelled_total`.
 pub fn record_rpc_error(method: &str, reason: ErrorReason) {
     // Tell the RPC middleware's fallback this error response is already accounted for.
     let _ = ERROR_SELF_REPORTED.try_with(|reported| reported.set(true));
@@ -864,6 +853,9 @@ tokio::task_local! {
 /// This is what lets the RPC middleware close the last accounting gap: an error response
 /// produced without a handler record (unknown method, malformed top-level params — the
 /// framework answers before the handler runs) is otherwise invisible to every counter.
+/// The task-local is load-bearing only for the `-32602` ambiguity — the framework's
+/// param-parse rejection and a handler's `tracerConfig` rejection share the code, so no
+/// response-code inspection could tell them apart.
 pub async fn track_handler_errors<F: Future>(fut: F) -> (F::Output, bool) {
     ERROR_SELF_REPORTED
         .scope(std::cell::Cell::new(false), async move {
@@ -877,11 +869,10 @@ pub async fn track_handler_errors<F: Future>(fut: F) -> (F::Output, bool) {
 /// Records a request the framework rejected before its handler ran, as the balanced pair
 /// `request_shape_total{shape="rejected"}` + `rpc_errors_total{reason="rejected"}` — an
 /// arrival and an outcome, so the accounting identity holds for requests no handler saw.
-pub fn record_framework_rejection(method: &str) {
-    let method = resolve_method(strip_timed_prefix(method));
+/// Takes the already-resolved label, like [`record_request_cancelled`].
+pub fn record_framework_rejection(method: &'static str) {
     record_request_shape(method, "rejected");
-    counter!(RPC_ERRORS_TOTAL, "method" => method, "reason" => ErrorReason::Rejected.as_str())
-        .increment(1);
+    record_rpc_error(method, ErrorReason::Rejected);
 }
 
 /// Records a request whose handler future was dropped before producing a response —
@@ -889,8 +880,8 @@ pub fn record_framework_rejection(method: &str) {
 ///
 /// Recorded from the RPC middleware rather than the handlers: it is the only layer that
 /// observes every entry (single calls *and* batch entries) and still sees the drop.
-pub fn record_request_cancelled(method: &str) {
-    let method = resolve_method(strip_timed_prefix(method));
+/// Takes the already-resolved label — the middleware's guard is the one resolution point.
+pub fn record_request_cancelled(method: &'static str) {
     counter!(RPC_REQUESTS_CANCELLED_TOTAL, "method" => method).increment(1);
 }
 
