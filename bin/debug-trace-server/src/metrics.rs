@@ -823,6 +823,12 @@ pub fn strip_timed_prefix(method: &str) -> &str {
     method.strip_prefix(TIMED_PREFIX).unwrap_or(method)
 }
 
+/// Resolves a wire method name (possibly `timed_`-prefixed, possibly arbitrary client
+/// input) to its bounded `&'static str` metric label.
+pub fn method_label(method: &str) -> &'static str {
+    resolve_method(strip_timed_prefix(method))
+}
+
 /// Records a successful RPC request.
 pub fn record_rpc_request(method: &str, duration_secs: f64) {
     let method = resolve_method(strip_timed_prefix(method));

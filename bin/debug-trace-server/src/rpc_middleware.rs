@@ -120,6 +120,10 @@ fn stamp_entry_cpu(mut rp: MethodResponse, entry_cpu: &AtomicU64) -> MethodRespo
 /// `rpc_errors_total`, `request_duration_seconds`) is by definition never reached. Placing
 /// the guard here rather than in the handlers is what makes it cover batch entries too —
 /// this layer is the only one that sees every entry.
+///
+/// Constructed *inside* the request future, so it arms on the first poll — the same poll
+/// that runs the handler's synchronous prefix and records the arrival. A future dropped
+/// before ever being polled therefore records neither side of the accounting identity.
 struct CancelGuard {
     /// `None` once the request produced a response, which disarms the drop.
     method: Option<&'static str>,
@@ -129,17 +133,12 @@ struct CancelGuard {
 }
 
 impl CancelGuard {
-    fn new(method: &str) -> Self {
-        Self {
-            method: Some(crate::metrics::resolve_method(crate::metrics::strip_timed_prefix(
-                method,
-            ))),
-            server_abort: None,
-        }
+    fn new(method: &'static str) -> Self {
+        Self { method: Some(method), server_abort: None }
     }
 
     /// Guard for one batch entry, sharing the batch's server-abort flag.
-    fn for_entry(method: &str, server_abort: Arc<AtomicBool>) -> Self {
+    fn for_entry(method: &'static str, server_abort: Arc<AtomicBool>) -> Self {
         Self { server_abort: Some(server_abort), ..Self::new(method) }
     }
 
@@ -201,11 +200,12 @@ where
         &self,
         request: Request<'a>,
     ) -> impl Future<Output = Self::MethodResponse> + Send + 'a {
-        let guard = CancelGuard::new(request.method_name());
+        let method = crate::metrics::method_label(request.method_name());
         // Created eagerly so the wrapper owns no service clone — only the batch path,
         // which spawns entries, needs one.
         let fut = self.service.call(request);
         async move {
+            let guard = CancelGuard::new(method);
             let (rp, reported) = crate::metrics::track_handler_errors(fut).await;
             settle_response(&rp, reported, guard);
             rp
@@ -248,11 +248,12 @@ where
                     match entry {
                         Ok(BatchEntry::Call(req)) => {
                             let service = service.clone();
-                            let guard =
-                                CancelGuard::for_entry(req.method_name(), server_abort.clone());
+                            let method = crate::metrics::method_label(req.method_name());
+                            let server_abort = server_abort.clone();
                             let req = owned_request(req);
                             tasks.spawn(CpuSampled::new(
                                 async move {
+                                    let guard = CancelGuard::for_entry(method, server_abort);
                                     let (rp, reported) =
                                         crate::metrics::track_handler_errors(service.call(req))
                                             .await;

@@ -239,11 +239,11 @@ impl RpcContext {
         let deadline = self.data_provider.fetch_deadline();
 
         let t0 = Instant::now();
-        let block_num =
-            self.data_provider.resolve_block_number(block_number, deadline).await.map_err(|e| {
-                metrics::record_rpc_error(method, error_reason(&e));
-                rpc_err(format!("Failed to resolve block number: {e}"))
-            })?;
+        let block_num = self
+            .data_provider
+            .resolve_block_number(block_number, deadline)
+            .await
+            .map_err(|e| data_provider_failure(method, &e))?;
         let resolve_ms = t0.elapsed().as_millis();
         tracing::Span::current().record("block_number", block_num);
 
@@ -366,6 +366,7 @@ fn data_provider_error_to_rpc_error(e: &DataProviderError) -> jsonrpsee::types::
         DataProviderError::Timeout { .. } => {
             ErrorObjectOwned::owned(ERROR_CODE_NOT_FOUND, e.to_string(), None::<()>)
         }
+        DataProviderError::UnsupportedBlockTag(_) => invalid_params_err(e.to_string()),
         DataProviderError::Internal(_) => {
             ErrorObjectOwned::owned(ERROR_CODE_INTERNAL, "internal error".to_string(), None::<()>)
         }
@@ -383,6 +384,7 @@ fn error_reason(e: &DataProviderError) -> ErrorReason {
         DataProviderError::TransactionNotFound(_) | DataProviderError::TransactionPending(_) => {
             ErrorReason::NotFound
         }
+        DataProviderError::UnsupportedBlockTag(_) => ErrorReason::InvalidParams,
         DataProviderError::Internal(_) => ErrorReason::Internal,
     }
 }
@@ -799,7 +801,9 @@ impl TraceRpcServer for RpcContext {
                 );
                 return Ok(RawJson::null());
             }
-            Err(e @ DataProviderError::Internal(_)) => {
+            Err(
+                e @ (DataProviderError::Internal(_) | DataProviderError::UnsupportedBlockTag(_)),
+            ) => {
                 return Err(data_provider_failure(METHOD_TRACE_TRANSACTION, &e));
             }
         };
@@ -912,6 +916,10 @@ mod tests {
             assert_eq!(err.message(), variant.to_string().as_str());
             assert_eq!(error_reason(&variant), reason);
         }
+
+        let pending = DataProviderError::UnsupportedBlockTag(BlockNumberOrTag::Pending);
+        assert_eq!(error_reason(&pending), ErrorReason::InvalidParams, "client input, not a fault");
+        assert_eq!(data_provider_error_to_rpc_error(&pending).code(), -32602);
 
         let internal: DataProviderError = eyre::eyre!("boom").into();
         assert_eq!(error_reason(&internal), ErrorReason::Internal);
