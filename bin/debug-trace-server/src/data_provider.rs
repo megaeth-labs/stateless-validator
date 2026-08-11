@@ -666,8 +666,9 @@ impl DataProvider {
         // typed errors (e.g. a `Timeout` from contract resolution) so we don't then burn the
         // remaining deadline on an RPC call that is guaranteed to hit the same timeout.
         if let Some(db) = &self.db &&
-            let Some(data) =
-                self.get_block_data_from_db(db.as_ref(), block_hash, deadline).await?
+            let Some(data) = self
+                .get_block_data_from_db(db.as_ref(), block_hash, known_number, deadline)
+                .await?
         {
             trace!(
                 block_hash = %block_hash,
@@ -812,13 +813,14 @@ impl DataProvider {
     /// - `Ok(Some(data))` — block found and fully resolved.
     /// - `Ok(None)` — block not in DB (expected cache miss) OR backend read error (logged and
     ///   treated as a miss so the caller falls through to RPC).
-    /// - `Err(..)` — typed `DataProviderError` from contract resolution (e.g. `Timeout`). These
-    ///   must surface immediately; falling through to RPC would just time out again on the shared
-    ///   deadline with confusing double-wait behavior.
+    /// - `Err(..)` — typed `DataProviderError` from the drift check or contract resolution (e.g.
+    ///   `Timeout`). These must surface immediately; falling through to RPC would just time out
+    ///   again on the shared deadline with confusing double-wait behavior.
     async fn get_block_data_from_db(
         &self,
         db: &dyn BlockStore,
         block_hash: alloy_primitives::BlockHash,
+        known_number: Option<u64>,
         deadline: Instant,
     ) -> DataProviderResult<Option<BlockData>> {
         let overall_start = Instant::now();
@@ -840,6 +842,9 @@ impl DataProvider {
                 return Ok(None);
             }
         };
+        // Fast-path twin of the exit check: fail a drifted pair off the stored header
+        // before contract resolution can burn the remaining deadline upstream.
+        check_known_number(&block, block_hash, known_number)?;
         let db_read_secs = start.elapsed().as_secs_f64();
         let db_read_ms = start.elapsed().as_millis();
 
@@ -2403,6 +2408,35 @@ mod tests {
                 });
             assert_eq!(data.block.header.number, number);
         }
+    }
+
+    /// The DB tier rejects a drifted pair off the stored header before contract
+    /// resolution can burn the deadline upstream: with an empty contract cache and a
+    /// hanging upstream, the typed drift error must land instead of a timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn db_tier_drift_fails_before_contract_resolution() {
+        let BlockData { block, witness, .. } = test_support::fixture_block_data();
+        let (number, hash) = (block.header.number, block.header.hash);
+        let store =
+            Arc::new(StubBlockStore { block_data: Some((block, witness)), ..Default::default() });
+        let provider = provider_with_tiers(
+            &test_support::hanging_url(),
+            Some(store as Arc<dyn BlockStore>),
+            None,
+            test_support::noop_contract_cache(),
+        );
+
+        let started = Instant::now();
+        let err = provider
+            .get_block_data(hash, Some(number + 1), started + Duration::from_secs(2))
+            .await
+            .err()
+            .expect("a drifted pair must fail");
+        assert_drift_error(&err, "db tier with a cold contract cache");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "must fail before contract resolution reaches upstream"
+        );
     }
 
     /// Cancellation of the primary fetch task (e.g. client disconnect) must not leak an
