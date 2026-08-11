@@ -629,7 +629,10 @@ impl DataProvider {
     /// hash-consistent, not trusted — and the pipeline enforces it: a number the fetched
     /// block's own header disagrees with fails the request the moment the block lands,
     /// cancelling the witness fetch (which at a hash-filtering source could only retry
-    /// to its deadline) instead of serving a witness routed by the wrong height.
+    /// to its deadline) instead of serving a witness routed by the wrong height. The
+    /// check binds every serve tier — memory and DB hits, coalesced waiters, and the
+    /// fresh fetch — so the outcome of a drifted pair does not depend on cache
+    /// temperature.
     pub(crate) async fn get_block_data(
         &self,
         block_hash: B256,
@@ -642,6 +645,7 @@ impl DataProvider {
         if let Some(cache) = &self.block_data_cache &&
             let Some(data) = cache.get(&block_hash)
         {
+            check_known_number(&data, block_hash, known_number)?;
             trace!(
                 block_hash = %block_hash,
                 source = "memory",
@@ -660,6 +664,7 @@ impl DataProvider {
             let Some(data) =
                 self.get_block_data_from_db(db.as_ref(), block_hash, deadline).await?
         {
+            check_known_number(&data, block_hash, known_number)?;
             trace!(
                 block_hash = %block_hash,
                 source = "database",
@@ -683,6 +688,9 @@ impl DataProvider {
             "Fetching block data from RPC"
         );
         let data = self.fetch_block_data_single_flight(block_hash, known_number, deadline).await?;
+        // The fetch pipeline enforced the contract for the primary; this re-check covers
+        // coalesced waiters that joined a primary holding a different number.
+        check_known_number(&data, block_hash, known_number)?;
 
         trace!(
             block_hash = %block_hash,
@@ -1128,6 +1136,25 @@ async fn do_fetch_block_data(
 /// that routed the fetch.
 fn drifted_number_error(block_hash: B256, actual: u64, supplied: u64) -> DataProviderError {
     eyre::eyre!("block {block_hash} is at height {actual}, not the supplied {supplied}").into()
+}
+
+/// Enforces the `known_number` contract on a served result regardless of tier: the
+/// caller's number must agree with the served block's own header, so a drifted pair
+/// fails identically whether the data came from a memory hit, the DB, a coalesced
+/// in-flight fetch, or a fresh fetch — never a success that a cold cache would have
+/// rejected. The served entry itself is correct for its hash and stays cached; only
+/// this caller's request fails.
+fn check_known_number(
+    data: &BlockData,
+    block_hash: B256,
+    known_number: Option<u64>,
+) -> DataProviderResult<()> {
+    if let Some(number) = known_number &&
+        data.block.header.number != number
+    {
+        return Err(drifted_number_error(block_hash, data.block.header.number, number));
+    }
+    Ok(())
 }
 
 /// Reads the local DB's canonical tip height, `None` when no DB is configured or the tip is
@@ -2385,6 +2412,61 @@ mod tests {
              ({elapsed:?})"
         );
         handle.stop().unwrap();
+    }
+
+    /// The `known_number` contract must not depend on which tier serves: a warm memory
+    /// or DB hit fails a drifted pair exactly like the cold fetch would, instead of
+    /// turning it into a success that a cold cache would have rejected. The hanging
+    /// upstream proves the check needs no network; the matching pair stays the success
+    /// control on both tiers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drifted_known_number_fails_on_warm_tiers_too() {
+        let (block, witness, contract_cache) = fixture_block_and_cache();
+        let (number, hash) = (block.header.number, block.header.hash);
+
+        let cache = Arc::new(BlockDataCache::new(1024 * 1024 * 1024));
+        cache.insert(
+            hash,
+            Arc::new(BlockData {
+                block: block.clone(),
+                witness: witness.clone(),
+                contracts: HashMap::default(),
+            }),
+        );
+        let memory = provider_with_tiers(
+            &test_support::hanging_url(),
+            None,
+            Some(cache),
+            Arc::clone(&contract_cache),
+        );
+        let store =
+            Arc::new(StubBlockStore { block_data: Some((block, witness)), ..Default::default() });
+        let db = provider_with_tiers(
+            &test_support::hanging_url(),
+            Some(store as Arc<dyn BlockStore>),
+            None,
+            contract_cache,
+        );
+
+        for (provider, tier) in [(&memory, "memory"), (&db, "db")] {
+            let deadline = Instant::now() + Duration::from_millis(300);
+            let err = provider
+                .get_block_data(hash, Some(number + 1), deadline)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("a drifted known_number must fail on the {tier} tier"));
+            assert!(
+                matches!(err, DataProviderError::Internal(_)) &&
+                    err.to_string().contains("not the supplied"),
+                "the {tier} tier must fail typed, got: {err:?}"
+            );
+            let deadline = Instant::now() + Duration::from_millis(300);
+            let data =
+                provider.get_block_data(hash, Some(number), deadline).await.unwrap_or_else(|e| {
+                    panic!("the matching pair must serve on the {tier} tier: {e:?}")
+                });
+            assert_eq!(data.block.header.number, number);
+        }
     }
 
     /// Cancellation of the primary fetch task (e.g. client disconnect) must not leak an
