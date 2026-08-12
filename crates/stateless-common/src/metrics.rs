@@ -121,8 +121,8 @@ pub trait RpcMetrics: Send + Sync {
     /// Default: no-op. Implement to track retry volume separately from logical errors.
     fn on_rpc_retry(&self, _method: RpcMethod) {}
 
-    /// Called once per provider attempt with the time spent waiting for a concurrency
-    /// permit before the attempt could start.
+    /// Called once per permit-queue wait: before each attempt starts, and for a wait the
+    /// caller's deadline cut short (which therefore yielded no attempt).
     ///
     /// Separates "the endpoint was slow" from "we were queued behind our own concurrency
     /// cap" — two causes with opposite fixes that are otherwise indistinguishable, because
