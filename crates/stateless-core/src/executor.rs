@@ -10,8 +10,10 @@
 //!   transaction replay, and state root comparison
 //! - [`validate_block_deriving_updates`]: Variant returning the replay-derived SALT state updates
 //!   for embedders that compare against an independently verified per-block changeset
-//! - [`create_evm_env`]: Creates EVM execution environment from block header and chain
-//!   specification
+//! - [`create_block_execution_env`]: Single home for the per-block execution environment —
+//!   [`EvmEnv`], block executor factory, and hardfork-derived block limits — shared by
+//!   [`replay_block`] and the debug-trace-server's tracing executor ([`create_evm_env`] is its
+//!   EvmEnv sub-step)
 //! - [`replay_block`]: Replays block transactions to compute state changes
 //!
 //! [`replay_block`] / [`validate_block`] are generic over [`BlockInput`], the minimal block
@@ -45,8 +47,8 @@ use alloy_primitives::{
 };
 use alloy_rpc_types_eth::{Block, BlockTransactions};
 use mega_evm::{
-    BlockLimits, ExternalEnvFactory, MegaBlockExecutionCtx, MegaBlockExecutorFactory,
-    MegaEvmFactory, MegaHardforks, MegaSpecId,
+    BlockLimits, ExternalEnvFactory, MegaBlockExecutionCtx, MegaBlockExecutor,
+    MegaBlockExecutorFactory, MegaContext, MegaEvm, MegaEvmFactory, MegaHardforks, MegaSpecId,
 };
 use op_alloy_consensus::OpTxEnvelope;
 use op_alloy_rpc_types::Transaction as OpTransaction;
@@ -55,7 +57,10 @@ use revm::inspector::inspectors::TracerEip3155;
 use revm::{
     DatabaseRef,
     context::{BlockEnv, CfgEnv},
-    database::states::{BundleAccount, StateBuilder, bundle_state::BundleRetention},
+    database::{
+        State,
+        states::{BundleAccount, StateBuilder, bundle_state::BundleRetention},
+    },
     primitives::{B256, KECCAK_EMPTY, U256},
     state::Bytecode,
 };
@@ -287,6 +292,95 @@ pub fn create_evm_env(
     EvmEnv::new(cfg_env, block_env)
 }
 
+/// The assembled per-block execution environment — [`create_block_execution_env`]'s output,
+/// named so the assembled shape is spelled once and callers hold one value instead of
+/// respelling the factory's generics.
+pub struct BlockExecutionEnv<ENV> {
+    /// EVM configuration + block environment.
+    pub evm_env: EvmEnv<MegaSpecId>,
+    /// Block executor factory wired with the chain spec and the external-env factory.
+    pub executor_factory:
+        MegaBlockExecutorFactory<ChainSpec, MegaEvmFactory<ENV>, OpAlloyReceiptBuilder>,
+    /// Execution context carrying parent linkage, extra data, and the hardfork-derived
+    /// [`BlockLimits`].
+    pub ctx: MegaBlockExecutionCtx,
+}
+
+/// The block executor [`BlockExecutionEnv::start_executor_with_inspector`] produces: a
+/// [`MegaBlockExecutor`] over the caller's `state` and `inspector`, wired to the env's
+/// external-env factory.
+pub type EnvExecutor<'a, DB, I, ENV> = MegaBlockExecutor<
+    ChainSpec,
+    MegaEvm<&'a mut State<DB>, I, <ENV as ExternalEnvFactory>::EnvTypes>,
+    OpAlloyReceiptBuilder,
+>;
+
+impl<ENV> BlockExecutionEnv<ENV>
+where
+    ENV: ExternalEnvFactory + Clone,
+{
+    /// Creates a block executor over `state` with `inspector` and applies the pre-execution
+    /// changes — the executor prologue shared by every tracing dispatch arm (validation's
+    /// transaction replay runs the same prologue inline). Living here, the executor's
+    /// concrete type is spelled once next to the env that produces it; callers bind the
+    /// result by inference.
+    pub fn start_executor_with_inspector<'a, DB, I>(
+        &self,
+        state: &'a mut State<DB>,
+        inspector: I,
+    ) -> Result<EnvExecutor<'a, DB, I, ENV>, ValidationError>
+    where
+        DB: alloy_evm::Database + 'a,
+        I: revm::Inspector<MegaContext<&'a mut State<DB>, ENV::EnvTypes>> + 'a,
+    {
+        let mut executor = self.executor_factory.create_executor_with_inspector(
+            state,
+            self.ctx.clone(),
+            self.evm_env.clone(),
+            inspector,
+        );
+        executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
+        Ok(executor)
+    }
+}
+
+/// Builds the full mega-evm execution environment for one block: the [`EvmEnv`], the block
+/// executor factory, and the execution context carrying the hardfork-derived [`BlockLimits`].
+///
+/// This is the single home of the hardfork → limits mapping, shared by [`replay_block`] and
+/// the debug-trace-server's tracing executor, so validation and tracing cannot drift apart.
+/// Without an active MegaETH hardfork the limits fall back to unlimited *except* the header's
+/// own gas limit — execution enforces the block's declared gas ceiling either way.
+pub fn create_block_execution_env<ENV>(
+    chain_spec: &ChainSpec,
+    header: &alloy_consensus::Header,
+    ext_env: ENV,
+) -> BlockExecutionEnv<ENV>
+where
+    ENV: ExternalEnvFactory + Clone,
+{
+    let evm_env = create_evm_env(header, chain_spec);
+    let executor_factory = MegaBlockExecutorFactory::new(
+        chain_spec.clone(),
+        MegaEvmFactory::new().with_external_env_factory(ext_env),
+        OpAlloyReceiptBuilder::default(),
+    );
+
+    let block_limits = if let Some(hardfork) = chain_spec.hardfork(header.timestamp) {
+        BlockLimits::from_hardfork_and_block_gas_limit(hardfork, header.gas_limit)
+    } else {
+        BlockLimits::no_limits().with_block_gas_limit(header.gas_limit)
+    };
+    let execution_context = MegaBlockExecutionCtx::new(
+        header.parent_hash,
+        header.parent_beacon_block_root,
+        header.extra_data.clone(),
+        block_limits,
+    );
+
+    BlockExecutionEnv { evm_env, executor_factory, ctx: execution_context }
+}
+
 /// Minimal projection of a block that [`replay_block`] / [`validate_block`] need: the consensus
 /// header (every execution/validation field lives there), the block hash (diagnostics only), and
 /// the recovered `(transaction, sender)` pairs.
@@ -389,33 +483,14 @@ where
 
     // Setup execution environment
     let mut state = StateBuilder::new().with_database_ref(db).with_bundle_update().build();
-    let evm_env = create_evm_env(header, chain_spec);
-
-    let executor_factory = MegaBlockExecutorFactory::new(
-        chain_spec.clone(),
-        MegaEvmFactory::new().with_external_env_factory(env_oracle),
-        OpAlloyReceiptBuilder::default(),
-    );
-
-    let hardfork = chain_spec.hardfork(header.timestamp);
     debug!(
         block_number = header.number,
         block_hash = ?block.block_hash(),
-        hardfork = ?hardfork,
+        hardfork = ?chain_spec.hardfork(header.timestamp),
         "Replay block"
     );
-    let block_limits = if let Some(hardfork) = hardfork {
-        BlockLimits::from_hardfork_and_block_gas_limit(hardfork, header.gas_limit)
-    } else {
-        BlockLimits::no_limits().with_block_gas_limit(header.gas_limit)
-    };
-
-    let execution_context = MegaBlockExecutionCtx::new(
-        header.parent_hash,
-        header.parent_beacon_block_root,
-        header.extra_data.clone(),
-        block_limits,
-    );
+    let BlockExecutionEnv { evm_env, executor_factory, ctx: execution_context } =
+        create_block_execution_env(chain_spec, header, env_oracle);
 
     // Plain execution path, shared by the non-tracer std branch and the no_std build.
     // Extracted as a closure so the body lives in one place — any future change to the
@@ -911,6 +986,78 @@ mod tests {
             #[cfg(feature = "std")]
             None,
         )
+    }
+
+    /// Empty-witness external env for tests that only exercise environment assembly.
+    fn empty_ext_env(block_number: u64) -> WitnessExternalEnv {
+        WitnessExternalEnv::from_light_witness(&crate::LightWitness::default(), block_number)
+            .unwrap()
+    }
+
+    /// Without an active MegaETH hardfork, `create_block_execution_env` must still cap
+    /// execution by the header's own gas limit (everything else unlimited). The trace server
+    /// once drifted to fully-unlimited on this branch; both binaries now share this mapping.
+    #[test]
+    fn execution_env_no_hardfork_fallback_caps_block_gas() {
+        let header =
+            alloy_consensus::Header { gas_limit: 12_345, ..alloy_consensus::Header::default() };
+        // `ChainSpec::default()` schedules no hardforks → the fallback branch.
+        let ctx = create_block_execution_env(
+            &ChainSpec::default(),
+            &header,
+            empty_ext_env(header.number),
+        )
+        .ctx;
+        assert_eq!(
+            ctx.block_limits,
+            BlockLimits::no_limits().with_block_gas_limit(12_345),
+            "fallback limits must be unlimited except the header's own gas limit",
+        );
+    }
+
+    /// With an active hardfork, the limits must be exactly the hardfork-derived set.
+    #[test]
+    fn execution_env_uses_hardfork_limits_when_active() {
+        let spec = chain_spec();
+        // Far-future timestamp: every hardfork scheduled by the fixture genesis is active.
+        let header = alloy_consensus::Header {
+            timestamp: u64::MAX,
+            gas_limit: 30_000_000,
+            ..alloy_consensus::Header::default()
+        };
+        let hardfork =
+            spec.hardfork(header.timestamp).expect("fixture genesis schedules hardforks");
+        let ctx = create_block_execution_env(&spec, &header, empty_ext_env(header.number)).ctx;
+        assert_eq!(
+            ctx.block_limits,
+            BlockLimits::from_hardfork_and_block_gas_limit(hardfork, header.gas_limit),
+        );
+    }
+
+    /// `start_executor_with_inspector` is the executor prologue shared with the trace
+    /// server's dispatch arms; run it over an empty state from core's own tests so the
+    /// wiring (executor construction + pre-execution changes) is exercised here, not only
+    /// through the trace-server binary.
+    #[test]
+    fn execution_env_starts_executor_with_inspector() {
+        // Far-future timestamp: the fixture genesis's hardforks (incl. Regolith, which
+        // mega-evm asserts is active) are all in effect.
+        let header = alloy_consensus::Header {
+            timestamp: u64::MAX,
+            gas_limit: 30_000_000,
+            // Post-Cancun headers must carry it; the EIP-4788 pre-execution call reads it.
+            parent_beacon_block_root: Some(B256::ZERO),
+            ..alloy_consensus::Header::default()
+        };
+        let env = create_block_execution_env(&chain_spec(), &header, empty_ext_env(header.number));
+        let mut state = StateBuilder::new()
+            .with_database_ref(revm::database::EmptyDB::default())
+            .with_bundle_update()
+            .build();
+        let executor = env
+            .start_executor_with_inspector(&mut state, revm::inspector::NoOpInspector)
+            .expect("executor prologue over an empty state must succeed");
+        drop(executor);
     }
 
     /// The fixture witness for `hash` with the first byte of one witnessed (non-metadata)

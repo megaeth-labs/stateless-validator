@@ -24,9 +24,8 @@
 //! ## Parity-style (trace_* methods)
 //! - `LocalizedTransactionTrace` - Flat call traces with block/tx context
 
-use alloy_consensus::Transaction;
+use alloy_consensus::{Transaction, transaction::Recovered};
 use alloy_evm::{Evm as EvmTrait, block::BlockExecutor};
-use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{B256, map::HashMap};
 use alloy_rpc_types_eth::{Block, BlockTransactions, TransactionInfo};
 use alloy_rpc_types_trace::{
@@ -40,9 +39,7 @@ use alloy_rpc_types_trace::{
     parity::LocalizedTransactionTrace,
 };
 use eyre::Result;
-use mega_evm::{
-    BlockLimits, MegaBlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory, MegaHardforks,
-};
+use op_alloy_consensus::OpTxEnvelope;
 use op_alloy_network::TransactionResponse;
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use revm::{
@@ -58,7 +55,7 @@ use revm_inspectors::tracing::{
 use stateless_core::{
     chain_spec::ChainSpec,
     evm_database::{WitnessDatabase, WitnessExternalEnv},
-    executor::{ValidationError, create_evm_env},
+    executor::{BlockExecutionEnv, ValidationError, create_block_execution_env},
     light_witness::{LightWitness, LightWitnessExecutor},
 };
 use tracing::{instrument, trace, warn};
@@ -102,13 +99,9 @@ struct TracingEnv<'a> {
     /// so the witness DB can never be paired with a different block's header.
     header: &'a alloy_consensus::Header,
     transactions: &'a [OpTransaction],
-    executor_factory: MegaBlockExecutorFactory<
-        ChainSpec,
-        MegaEvmFactory<WitnessExternalEnv>,
-        OpAlloyReceiptBuilder,
-    >,
-    block_ctx: MegaBlockExecutionCtx,
-    evm_env: alloy_evm::EvmEnv<mega_evm::MegaSpecId>,
+    /// Shared with `replay_block`: the same env, factory, hardfork → limits mapping, and
+    /// extra_data (system transactions) the validator executes with.
+    exec: BlockExecutionEnv<WitnessExternalEnv>,
     light_witness_executor: LightWitnessExecutor,
 }
 
@@ -126,38 +119,9 @@ impl<'a> TracingEnv<'a> {
             .map_err(ValidationError::EnvOracleConstructionFailed)?;
 
         let light_witness_executor = LightWitnessExecutor::from(light_witness);
-        let evm_env = create_evm_env(&block.header.inner, chain_spec);
+        let exec = create_block_execution_env(chain_spec, &block.header.inner, ext_env);
 
-        let evm_factory = MegaEvmFactory::new().with_external_env_factory(ext_env);
-        let executor_factory = MegaBlockExecutorFactory::new(
-            chain_spec.clone(),
-            evm_factory,
-            OpAlloyReceiptBuilder::default(),
-        );
-
-        let hardfork = chain_spec.hardfork(block.header.timestamp);
-        let block_limits = if let Some(hardfork) = hardfork {
-            BlockLimits::from_hardfork_and_block_gas_limit(hardfork, block.header.gas_limit)
-        } else {
-            BlockLimits::no_limits()
-        };
-
-        // Use actual extra_data (contains system transactions) to match validator behavior.
-        let block_ctx = MegaBlockExecutionCtx::new(
-            block.header.parent_hash,
-            block.header.parent_beacon_block_root,
-            block.header.extra_data.clone(),
-            block_limits,
-        );
-
-        Ok(Self {
-            header: &block.header.inner,
-            transactions,
-            executor_factory,
-            block_ctx,
-            evm_env,
-            light_witness_executor,
-        })
+        Ok(Self { header: &block.header.inner, transactions, exec, light_witness_executor })
     }
 
     fn create_witness_db<'b>(
@@ -241,9 +205,47 @@ fn mux_config_and_inspector(
     let config = tracer_config
         .clone()
         .into_mux_config()
-        .map_err(|_| TraceError::Request("Invalid mux tracer config".into()))?;
+        .map_err(|e| request_error("invalid muxTracer tracerConfig", e))?;
     let inspector = mux_inspector(config.clone())?;
     Ok((config, inspector))
+}
+
+/// Parses a config-reading builtin's `tracerConfig` into its [`TracerKind`] — the one
+/// home for the strict-parse contract shared by the block and transaction dispatchers.
+///
+/// Defense in depth: RPC handlers already reject malformed configs via
+/// `RequestShape::classify` (-32602) before the executor runs, so from the current entry
+/// points this rejection is unreachable — but a malformed config must never silently
+/// trace with default settings if a future entry point skips the boundary gate. The
+/// executor guarantees only that much: its rejection surfaces as a request-attributable
+/// [`TraceError`], not as the gate's `-32602` wire code.
+fn builtin_tracer_kind(
+    builtin: GethDebugBuiltInTracerType,
+    tracer_config: &GethDebugTracerConfig,
+) -> Result<TracerKind, TraceError> {
+    let config = tracer_config.clone();
+    match builtin {
+        GethDebugBuiltInTracerType::CallTracer => config
+            .into_call_config()
+            .map(TracerKind::Call)
+            .map_err(|e| request_error("invalid callTracer tracerConfig", e)),
+        GethDebugBuiltInTracerType::PreStateTracer => config
+            .into_pre_state_config()
+            .map(TracerKind::PreState)
+            .map_err(|e| request_error("invalid prestateTracer tracerConfig", e)),
+        GethDebugBuiltInTracerType::FlatCallTracer => config
+            .into_flat_call_config()
+            .map(TracerKind::FlatCall)
+            .map_err(|e| request_error("invalid flatCallTracer tracerConfig", e)),
+        // Not TracingInspector tracers: the dispatchers execute these in their own arms
+        // (mux via `mux_config_and_inspector`) and never route them here; kept total —
+        // a request error rather than a panic.
+        GethDebugBuiltInTracerType::FourByteTracer |
+        GethDebugBuiltInTracerType::NoopTracer |
+        GethDebugBuiltInTracerType::MuxTracer => {
+            Err(request_error("tracer takes no typed tracerConfig here", builtin))
+        }
+    }
 }
 
 /// Builds a [`JsInspector`] for one transaction context (request-attributable on failure).
@@ -264,26 +266,23 @@ fn make_tx_ctx(info: &TransactionInfo) -> TransactionContext {
     }
 }
 
-macro_rules! setup_executor {
-    ($env:expr, $state:expr, $inspector:expr => $executor:ident) => {
-        let mut $executor = $env.executor_factory.create_executor_with_inspector(
-            $state,
-            $env.block_ctx.clone(),
-            $env.evm_env.clone(),
-            $inspector,
-        );
-        $executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
-    };
-}
-
-macro_rules! replay_preceding_txs {
-    ($executor:expr, $env:expr, $tx_index:expr) => {
-        for tx in $env.transactions.iter().take($tx_index) {
-            $executor
-                .execute_transaction(&tx.inner.inner)
-                .map_err(ValidationError::BlockReplayFailed)?;
-        }
-    };
+/// Replays the transactions preceding `tx_index` through `executor` (discarding their
+/// output) so the target transaction executes against its true intra-block prestate.
+fn replay_preceding_txs<E>(
+    executor: &mut E,
+    env: &TracingEnv<'_>,
+    tx_index: usize,
+) -> Result<(), ValidationError>
+where
+    E: BlockExecutor,
+    for<'t> &'t Recovered<OpTxEnvelope>: alloy_evm::block::ExecutableTx<E>,
+{
+    for tx in env.transactions.iter().take(tx_index) {
+        executor
+            .execute_transaction(&tx.inner.inner)
+            .map_err(ValidationError::BlockReplayFailed)?;
+    }
+    Ok(())
 }
 
 // TracingInspector-based helpers (shared by Call, PreState, FlatCall, Default)
@@ -299,7 +298,7 @@ fn trace_block_with_tracing_inspector(
     >,
     tracer: &TracerKind,
 ) -> Result<Vec<TraceResult>, ValidationError> {
-    setup_executor!(env, state, tracer.create_inspector() => executor);
+    let mut executor = env.exec.start_executor_with_inspector(state, tracer.create_inspector())?;
 
     let mut results = Vec::with_capacity(env.transactions.len());
     for (index, tx) in env.transactions.iter().enumerate() {
@@ -409,8 +408,8 @@ fn trace_tx_with_tracing_inspector(
     tx_index: usize,
     tracer: &TracerKind,
 ) -> Result<GethTrace, TraceError> {
-    setup_executor!(env, state, tracer.create_inspector() => executor);
-    replay_preceding_txs!(executor, env, tx_index);
+    let mut executor = env.exec.start_executor_with_inspector(state, tracer.create_inspector())?;
+    replay_preceding_txs(&mut executor, env, tx_index)?;
 
     *executor.inspector_mut() = tracer.create_inspector();
 
@@ -525,43 +524,21 @@ pub fn trace_block(
                     })
                     .collect(),
 
-                // The `unwrap_or_default()` on these three config parses is unreachable in
-                // practice: RPC handlers reject malformed configs via
-                // `RequestShape::classify` (-32602) before reaching the executor.
-                GethDebugBuiltInTracerType::CallTracer => {
-                    let call_config = tracer_config.clone().into_call_config().unwrap_or_default();
-                    trace_block_with_tracing_inspector(
-                        &env,
-                        block,
-                        &mut state,
-                        &TracerKind::Call(call_config),
-                    )?
-                }
-
-                GethDebugBuiltInTracerType::PreStateTracer => {
-                    let prestate_config =
-                        tracer_config.clone().into_pre_state_config().unwrap_or_default();
-                    trace_block_with_tracing_inspector(
-                        &env,
-                        block,
-                        &mut state,
-                        &TracerKind::PreState(prestate_config),
-                    )?
-                }
-
-                GethDebugBuiltInTracerType::FlatCallTracer => {
-                    let flat_call_config =
-                        tracer_config.clone().into_flat_call_config().unwrap_or_default();
-                    trace_block_with_tracing_inspector(
-                        &env,
-                        block,
-                        &mut state,
-                        &TracerKind::FlatCall(flat_call_config),
-                    )?
-                }
+                // Strict parse in `builtin_tracer_kind` — see its doc for why the
+                // executor re-rejects what the boundary gate already screens.
+                GethDebugBuiltInTracerType::CallTracer |
+                GethDebugBuiltInTracerType::PreStateTracer |
+                GethDebugBuiltInTracerType::FlatCallTracer => trace_block_with_tracing_inspector(
+                    &env,
+                    block,
+                    &mut state,
+                    &builtin_tracer_kind(*builtin, tracer_config)?,
+                )?,
 
                 GethDebugBuiltInTracerType::FourByteTracer => {
-                    setup_executor!(&env, &mut state, FourByteInspector::default() => executor);
+                    let mut executor = env
+                        .exec
+                        .start_executor_with_inspector(&mut state, FourByteInspector::default())?;
 
                     let mut results = Vec::with_capacity(env.transactions.len());
                     for (index, tx) in env.transactions.iter().enumerate() {
@@ -588,7 +565,8 @@ pub fn trace_block(
                 GethDebugBuiltInTracerType::MuxTracer => {
                     let (mux_config, inspector) = mux_config_and_inspector(tracer_config)?;
 
-                    setup_executor!(&env, &mut state, inspector => executor);
+                    let mut executor =
+                        env.exec.start_executor_with_inspector(&mut state, inspector)?;
 
                     let mut results = Vec::with_capacity(env.transactions.len());
                     for (index, tx) in env.transactions.iter().enumerate() {
@@ -653,7 +631,7 @@ pub fn trace_block(
                 let inspector =
                     js_inspector(code.clone(), config_json.clone(), make_tx_ctx(&first_info))?;
 
-                setup_executor!(&env, &mut state, inspector => executor);
+                let mut executor = env.exec.start_executor_with_inspector(&mut state, inspector)?;
 
                 let mut results = Vec::with_capacity(env.transactions.len());
                 for (index, tx) in env.transactions.iter().enumerate() {
@@ -688,7 +666,7 @@ pub fn trace_block(
                                 state: outcome.inner.state,
                             };
 
-                            let evm_env_ref = env.evm_env.clone();
+                            let evm_env_ref = env.exec.evm_env.clone();
                             let tx_env = TxEnv::default();
                             let json_result = {
                                 let (db, js_inspector, _) =
@@ -775,47 +753,23 @@ pub fn trace_transaction(
                     Ok(GethTrace::NoopTracer(NoopFrame::default()))
                 }
 
-                // The `unwrap_or_default()` on these three config parses is unreachable in
-                // practice: RPC handlers reject malformed configs via
-                // `RequestShape::classify` (-32602) before reaching the executor.
-                GethDebugBuiltInTracerType::CallTracer => {
-                    let call_config = tracer_config.clone().into_call_config().unwrap_or_default();
-                    trace_tx_with_tracing_inspector(
-                        &env,
-                        block,
-                        &mut state,
-                        tx_index,
-                        &TracerKind::Call(call_config),
-                    )
-                }
-
-                GethDebugBuiltInTracerType::PreStateTracer => {
-                    let prestate_config =
-                        tracer_config.clone().into_pre_state_config().unwrap_or_default();
-                    trace_tx_with_tracing_inspector(
-                        &env,
-                        block,
-                        &mut state,
-                        tx_index,
-                        &TracerKind::PreState(prestate_config),
-                    )
-                }
-
-                GethDebugBuiltInTracerType::FlatCallTracer => {
-                    let flat_call_config =
-                        tracer_config.clone().into_flat_call_config().unwrap_or_default();
-                    trace_tx_with_tracing_inspector(
-                        &env,
-                        block,
-                        &mut state,
-                        tx_index,
-                        &TracerKind::FlatCall(flat_call_config),
-                    )
-                }
+                // Strict parse in `builtin_tracer_kind` — see its doc for why the
+                // executor re-rejects what the boundary gate already screens.
+                GethDebugBuiltInTracerType::CallTracer |
+                GethDebugBuiltInTracerType::PreStateTracer |
+                GethDebugBuiltInTracerType::FlatCallTracer => trace_tx_with_tracing_inspector(
+                    &env,
+                    block,
+                    &mut state,
+                    tx_index,
+                    &builtin_tracer_kind(*builtin, tracer_config)?,
+                ),
 
                 GethDebugBuiltInTracerType::FourByteTracer => {
-                    setup_executor!(&env, &mut state, FourByteInspector::default() => executor);
-                    replay_preceding_txs!(executor, &env, tx_index);
+                    let mut executor = env
+                        .exec
+                        .start_executor_with_inspector(&mut state, FourByteInspector::default())?;
+                    replay_preceding_txs(&mut executor, &env, tx_index)?;
 
                     *executor.inspector_mut() = FourByteInspector::default();
 
@@ -829,8 +783,9 @@ pub fn trace_transaction(
                 GethDebugBuiltInTracerType::MuxTracer => {
                     let (mux_config, inspector) = mux_config_and_inspector(tracer_config)?;
 
-                    setup_executor!(&env, &mut state, inspector => executor);
-                    replay_preceding_txs!(executor, &env, tx_index);
+                    let mut executor =
+                        env.exec.start_executor_with_inspector(&mut state, inspector)?;
+                    replay_preceding_txs(&mut executor, &env, tx_index)?;
 
                     *executor.inspector_mut() = mux_inspector(mux_config)?;
 
@@ -859,8 +814,8 @@ pub fn trace_transaction(
                 let inspector =
                     js_inspector(code.clone(), config_json.clone(), make_tx_ctx(&info))?;
 
-                setup_executor!(&env, &mut state, inspector => executor);
-                replay_preceding_txs!(executor, &env, tx_index);
+                let mut executor = env.exec.start_executor_with_inspector(&mut state, inspector)?;
+                replay_preceding_txs(&mut executor, &env, tx_index)?;
 
                 *executor.inspector_mut() =
                     js_inspector(code.clone(), config_json, make_tx_ctx(&info))?;
@@ -872,7 +827,7 @@ pub fn trace_transaction(
                 let result_and_state =
                     revm::context::result::ResultAndState { result, state: outcome.inner.state };
 
-                let evm_env_ref = env.evm_env.clone();
+                let evm_env_ref = env.exec.evm_env.clone();
                 let tx_env = TxEnv::default();
                 let (db, js_inspector, _) = EvmTrait::components_mut(&mut executor.evm);
                 js_inspector
@@ -906,7 +861,7 @@ pub fn parity_trace_block(
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
     let inspector = TracingInspector::new(TracingInspectorConfig::default_parity());
-    setup_executor!(&env, &mut state, inspector => executor);
+    let mut executor = env.exec.start_executor_with_inspector(&mut state, inspector)?;
 
     let mut all_traces = Vec::new();
 
@@ -960,8 +915,8 @@ pub fn parity_trace_transaction(
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
     let inspector = TracingInspector::new(TracingInspectorConfig::default_parity());
-    setup_executor!(&env, &mut state, inspector => executor);
-    replay_preceding_txs!(executor, &env, tx_index);
+    let mut executor = env.exec.start_executor_with_inspector(&mut state, inspector)?;
+    replay_preceding_txs(&mut executor, &env, tx_index)?;
 
     *executor.inspector_mut() = TracingInspector::new(TracingInspectorConfig::default_parity());
 
@@ -1115,8 +1070,9 @@ mod tests {
 
         use crate::data_provider::{BlockData, test_support::fixture_block_data};
 
-        let chain_spec =
-            ChainSpec::from_genesis(TestFixtures::synthetic().load_genesis().expect("genesis"));
+        let chain_spec = ChainSpec::from_genesis(
+            TestFixtures::synthetic_shared().load_genesis().expect("genesis"),
+        );
         let BlockData { block, witness, contracts } = fixture_block_data();
 
         let err = trace_block(
@@ -1137,5 +1093,58 @@ mod tests {
         let err = trace_block(&chain_spec, &block, witness, &contracts, opts)
             .expect_err("an unparsable mux config must be rejected");
         assert!(matches!(err, TraceError::Request(_)), "got: {err:?}");
+    }
+
+    /// Defense in depth behind the RPC boundary gate: a type-malformed `tracerConfig` on
+    /// a config-reading builtin is rejected with [`TraceError::Request`] by the executor
+    /// itself — on both the block and the single-transaction paths — never silently
+    /// traced with default settings, while a well-formed config still traces. (The RPC
+    /// layer's own `-32602` rejection is pinned by
+    /// `invalid_tracer_config_maps_to_invalid_params` in `rpc_service`.)
+    #[test]
+    fn malformed_tracer_config_is_rejected_not_defaulted() {
+        use stateless_test_utils::fixtures::TestFixtures;
+
+        use crate::data_provider::{BlockData, test_support::fixture_block_data};
+
+        let chain_spec =
+            ChainSpec::from_genesis(TestFixtures::synthetic().load_genesis().expect("genesis"));
+        let BlockData { block, witness, contracts } = fixture_block_data();
+
+        let malformed = [
+            (GethDebugBuiltInTracerType::CallTracer, serde_json::json!({"onlyTopCall": "yes"})),
+            (GethDebugBuiltInTracerType::PreStateTracer, serde_json::json!({"diffMode": "yes"})),
+            (
+                GethDebugBuiltInTracerType::FlatCallTracer,
+                serde_json::json!({"convertParityErrors": "yes"}),
+            ),
+            (GethDebugBuiltInTracerType::MuxTracer, serde_json::json!({"notATracer": {}})),
+        ];
+        for (tracer, config) in malformed {
+            let opts = GethDebugTracingOptions {
+                tracer: Some(GethDebugTracerType::BuiltInTracer(tracer)),
+                tracer_config: GethDebugTracerConfig(config),
+                ..Default::default()
+            };
+
+            let err = trace_block(&chain_spec, &block, witness.clone(), &contracts, opts.clone())
+                .expect_err("malformed config must fail the block trace");
+            assert!(matches!(&err, TraceError::Request(msg) if msg.contains("tracerConfig")));
+
+            let err = trace_transaction(&chain_spec, &block, 0, witness.clone(), &contracts, opts)
+                .expect_err("malformed config must fail the tx trace");
+            assert!(matches!(&err, TraceError::Request(msg) if msg.contains("tracerConfig")));
+        }
+
+        // Control: a well-formed config on the same inputs still traces.
+        let opts = GethDebugTracingOptions {
+            tracer: Some(GethDebugTracerType::BuiltInTracer(
+                GethDebugBuiltInTracerType::CallTracer,
+            )),
+            tracer_config: GethDebugTracerConfig(serde_json::json!({"onlyTopCall": true})),
+            ..Default::default()
+        };
+        trace_block(&chain_spec, &block, witness, &contracts, opts)
+            .expect("a well-formed config must trace");
     }
 }

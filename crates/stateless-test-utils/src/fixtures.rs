@@ -121,6 +121,13 @@ impl TestFixtures {
         Self::load(&workspace_root().join("test_data/synthetic"))
     }
 
+    /// Shared synthetic fixtures, parsed once per test binary — the [`Self::synthetic`]
+    /// twin of [`Self::mainnet_shared`].
+    pub fn synthetic_shared() -> &'static Self {
+        static FIXTURES: LazyLock<TestFixtures> = LazyLock::new(TestFixtures::synthetic);
+        &FIXTURES
+    }
+
     /// Decodes the bincode-legacy MPT witness for `hash`, typically as
     /// `stateless_core::withdrawals::MptWitness` (a type this crate cannot name).
     pub fn mpt_witness<T: DeserializeOwned>(&self, hash: &BlockHash) -> T {
