@@ -301,6 +301,7 @@ The validator and trace server each have their own `redb`-backed database, shari
 | `BLOCK_RECORDS`   | `(BlockNumber, BlockHash)` | `()`                                                   | Trace server (pruning index) |
 
 In both binaries, `CANONICAL_CHAIN` is a bounded contiguous window — exactly the range reorg bisection trusts.
+`CONTRACTS` rows are self-validating on read: an entry that fails to decode or whose bytecode no longer hashes back to its key (disk corruption, or a `Bytecode` encoding change in a dependency upgrade) is treated as a cache miss and transparently re-fetched from RPC, so existing data dirs survive release upgrades without manual clearing.
 
 ### SALT Witness Cryptography
 

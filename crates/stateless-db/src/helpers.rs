@@ -4,6 +4,7 @@ use alloy_primitives::{B256, BlockHash, BlockNumber, map::HashMap};
 use redb::{ReadableDatabase, ReadableTable};
 use revm::state::Bytecode;
 use stateless_core::db::{BlockMeta, ContractLookup, StoreResult, StoreResultExt};
+use tracing::warn;
 
 use crate::{
     serialize::{decode_from_slice, encode_to_vec},
@@ -174,6 +175,13 @@ pub fn write_reset_to_anchor(database: &Database, anchor: &BlockMeta) -> StoreRe
 }
 
 /// Retrieves cached contract bytecodes. Returns `(found, missing)`.
+///
+/// The disk tier is self-validating: a row that no longer decodes (serde layout drift in
+/// an upgraded dependency, on-disk corruption) or whose decoded bytecode no longer hashes
+/// back to its key is reported as missing instead of failing the lookup. Both binaries
+/// re-fetch misses through the hash-verified RPC tier and write the result back over the
+/// stale row, so such rows degrade to a one-time re-fetch instead of halting the node.
+/// Storage-engine errors still propagate.
 pub fn read_contracts(database: &Database, hashes: &[B256]) -> StoreResult<ContractLookup> {
     let read_txn = database.begin_read().store_err()?;
     let Some(table) = open_read_table(&read_txn, CONTRACTS)? else {
@@ -184,12 +192,29 @@ pub fn read_contracts(database: &Database, hashes: &[B256]) -> StoreResult<Contr
     let mut missing = Vec::new();
 
     for &hash in hashes {
-        match table.get(hash.0).store_err()? {
-            Some(data) => {
-                let bytecode: Bytecode = decode_from_slice(data.value().as_slice())?;
+        let Some(data) = table.get(hash.0).store_err()? else {
+            missing.push(hash);
+            continue;
+        };
+        match decode_from_slice::<Bytecode>(data.value().as_slice()) {
+            Ok(bytecode) if bytecode.hash_slow() == hash => {
                 found.insert(hash, bytecode);
             }
-            None => missing.push(hash),
+            Ok(_) => {
+                warn!(
+                    code_hash = %hash,
+                    "stored contract bytecode does not hash back to its key; treating as a miss"
+                );
+                missing.push(hash);
+            }
+            Err(error) => {
+                warn!(
+                    code_hash = %hash,
+                    %error,
+                    "stored contract bytecode failed to decode; treating as a miss"
+                );
+                missing.push(hash);
+            }
         }
     }
 
@@ -215,9 +240,10 @@ pub fn write_add_contracts(database: &Database, codes: &[(B256, Bytecode)]) -> S
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::Bytes;
+    use alloy_primitives::{Bytes, b256, keccak256};
 
     use super::*;
+    use crate::serialize::BINCODE_LZ4_MARKER;
 
     fn temp_db() -> (tempfile::TempDir, Database) {
         let dir = tempfile::tempdir().unwrap();
@@ -287,12 +313,18 @@ mod tests {
         assert_eq!(read_block_hash(&db, 5).unwrap(), None);
     }
 
+    /// Keyed the same way the write path verifies: `Bytecode::hash_slow()`.
+    fn contract_entry(code: &'static [u8]) -> (B256, Bytecode) {
+        let bytecode = Bytecode::new_raw(Bytes::from_static(code));
+        (bytecode.hash_slow(), bytecode)
+    }
+
     #[test]
     fn contracts_roundtrip_and_missing_report() {
         let (_dir, db) = temp_db();
 
-        let a = (B256::from([1u8; 32]), Bytecode::new_raw(Bytes::from_static(&[0x60])));
-        let b = (B256::from([2u8; 32]), Bytecode::new_raw(Bytes::from_static(&[0x61])));
+        let a = contract_entry(&[0x60]);
+        let b = contract_entry(&[0x61]);
         let missing_hash = B256::from([3u8; 32]);
 
         write_add_contracts(&db, &[]).unwrap();
@@ -303,5 +335,112 @@ mod tests {
         assert_eq!(found.len(), 2);
         assert_eq!(found[&a.0].bytes_slice(), a.1.bytes_slice());
         assert_eq!(found[&b.0].bytes_slice(), b.1.bytes_slice());
+    }
+
+    /// Inserts a raw pre-encoded row into CONTRACTS, bypassing `write_add_contracts` —
+    /// stands in for a row written by an older binary (or corrupted on disk).
+    fn insert_raw_contract_row(db: &Database, key: B256, row: Vec<u8>) {
+        let write_txn = db.begin_write().unwrap();
+        {
+            let mut table = write_txn.open_table(CONTRACTS).unwrap();
+            table.insert(key.0, row).unwrap();
+        }
+        write_txn.commit().unwrap();
+    }
+
+    /// Wraps raw bincode bytes into the stored row format (marker byte + lz4), exactly as
+    /// `encode_to_vec` would, without re-encoding the payload.
+    fn to_stored_row(bincode_bytes: &[u8]) -> Vec<u8> {
+        let mut row = vec![BINCODE_LZ4_MARKER];
+        row.extend(lz4_flex::compress_prepend_size(bincode_bytes));
+        row
+    }
+
+    // The two fixtures below are `bincode::serde::encode_to_vec(&Bytecode::new_raw(code),
+    // bincode::config::standard())` captured under revm-bytecode 6.2.2 (revm 27.x), whose
+    // derived serde enum was ordered `Eip7702 = 0, LegacyAnalyzed = 1`. revm-bytecode 11.x
+    // serializes through `BytecodeSerde`, ordered `LegacyAnalyzed = 0, Eip7702 = 1`, so
+    // rows persisted by pre-upgrade binaries carry the wrong variant tag today.
+
+    /// revm-bytecode 6.2.2 encoding of `Bytecode::new_raw(&[0x60, 0x80, 0x60, 0x40, 0x52])`.
+    /// Under 11.x its `0x01` tag selects `Eip7702`, whose 20-byte address read fails against
+    /// the 6-byte (stop-padded) bytecode field: the typical decode-failure shape.
+    const REVM6_ROW_TYPICAL: &[u8] = &[
+        0x01, 0x06, 0x60, 0x80, 0x60, 0x40, 0x52, 0x00, 0x05, 0x13, 0x62, 0x69, 0x74, 0x76, 0x65,
+        0x63, 0x3a, 0x3a, 0x6f, 0x72, 0x64, 0x65, 0x72, 0x3a, 0x3a, 0x4c, 0x73, 0x62, 0x30, 0x08,
+        0x00, 0x05, 0x01, 0x00,
+    ];
+    const REVM6_ROW_TYPICAL_CODE: &[u8] = &[0x60, 0x80, 0x60, 0x40, 0x52];
+
+    /// revm-bytecode 6.2.2 encoding of `Bytecode::new_raw(&[0x5f; 19])`. The 19-byte code is
+    /// stop-padded to a 20-byte field, so under 11.x it decodes *successfully* into an
+    /// `Eip7702` delegation to a garbage address — only the hash re-check catches it.
+    const REVM6_ROW_MISDECODES: &[u8] = &[
+        0x01, 0x14, 0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x5f,
+        0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x5f, 0x00, 0x13, 0x13, 0x62, 0x69, 0x74, 0x76, 0x65, 0x63,
+        0x3a, 0x3a, 0x6f, 0x72, 0x64, 0x65, 0x72, 0x3a, 0x3a, 0x4c, 0x73, 0x62, 0x30, 0x08, 0x00,
+        0x13, 0x03, 0x00, 0x00, 0x00,
+    ];
+    const REVM6_ROW_MISDECODES_CODE: &[u8] = &[0x5f; 19];
+
+    #[test]
+    fn stale_revm6_contract_row_is_a_miss_not_an_error() {
+        let (_dir, db) = temp_db();
+
+        // The pre-upgrade key convention (6.2.2 `hash_slow()`, captured alongside the
+        // fixture) is still plain keccak256 of the original bytecode — the key itself
+        // survives the upgrade, only the value layout drifted.
+        let hash = keccak256(REVM6_ROW_TYPICAL_CODE);
+        assert_eq!(hash, b256!("1c3374235d773b2189aed115aa13143020fcdbbe86e38f358cf3e4771b2f0244"));
+        let row = to_stored_row(REVM6_ROW_TYPICAL);
+        assert!(
+            decode_from_slice::<Bytecode>(&row).is_err(),
+            "fixture must fail to decode under the current Bytecode serde layout",
+        );
+        insert_raw_contract_row(&db, hash, row);
+
+        let (found, missing) = read_contracts(&db, &[hash]).unwrap();
+        assert!(found.is_empty());
+        assert_eq!(missing, vec![hash], "stale row must surface as a miss, not an error");
+
+        // The caller's miss handling re-fetches and writes back; the row then heals.
+        let refetched = Bytecode::new_raw(Bytes::from_static(REVM6_ROW_TYPICAL_CODE));
+        write_add_contracts(&db, &[(hash, refetched.clone())]).unwrap();
+        let (found, missing) = read_contracts(&db, &[hash]).unwrap();
+        assert!(missing.is_empty());
+        assert_eq!(found[&hash].bytes_slice(), refetched.bytes_slice());
+    }
+
+    #[test]
+    fn stale_revm6_contract_row_misdecoding_as_eip7702_is_a_miss() {
+        let (_dir, db) = temp_db();
+
+        let hash = keccak256(REVM6_ROW_MISDECODES_CODE);
+        let row = to_stored_row(REVM6_ROW_MISDECODES);
+        // This row *does* decode under the current layout — into an EIP-7702 delegation
+        // to a garbage address — so only the hash re-check can reject it.
+        let misdecoded = decode_from_slice::<Bytecode>(&row)
+            .expect("fixture must silently decode under the current Bytecode serde layout");
+        assert_ne!(misdecoded.hash_slow(), hash);
+        insert_raw_contract_row(&db, hash, row);
+
+        let (found, missing) = read_contracts(&db, &[hash]).unwrap();
+        assert!(found.is_empty());
+        assert_eq!(missing, vec![hash], "mis-decoded row must surface as a miss");
+    }
+
+    #[test]
+    fn hash_mismatched_contract_row_is_a_miss() {
+        let (_dir, db) = temp_db();
+
+        // A row that decodes fine but was stored under the wrong key (key corruption, or
+        // any future silent mis-decode) is rejected by the hash re-check.
+        let wrong_key = B256::from([7u8; 32]);
+        let bytecode = Bytecode::new_raw(Bytes::from_static(&[0x60, 0x00]));
+        write_add_contracts(&db, &[(wrong_key, bytecode)]).unwrap();
+
+        let (found, missing) = read_contracts(&db, &[wrong_key]).unwrap();
+        assert!(found.is_empty());
+        assert_eq!(missing, vec![wrong_key]);
     }
 }

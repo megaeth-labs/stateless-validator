@@ -220,12 +220,14 @@ mod tests {
     fn test_contracts_roundtrip() {
         let (_dir, store) = temp_store();
 
-        let hash1 = B256::from([1u8; 32]);
-        let hash2 = B256::from([2u8; 32]);
-        let hash3 = B256::from([3u8; 32]);
-
         let bytecode1 = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
         let bytecode2 = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x01]));
+
+        // The read path re-checks that stored bytecode hashes back to its key, so
+        // stored entries must be keyed by their real code hashes.
+        let hash1 = bytecode1.hash_slow();
+        let hash2 = bytecode2.hash_slow();
+        let hash3 = B256::from([3u8; 32]);
 
         store.add_contracts(&[(hash1, bytecode1.clone()), (hash2, bytecode2.clone())]).unwrap();
 
@@ -276,8 +278,8 @@ mod tests {
         let (_dir, store) = temp_store();
         let cache = ContractCache::new(Arc::new(store));
 
-        let hash = B256::from([1u8; 32]);
         let bytecode = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
+        let hash = bytecode.hash_slow();
 
         cache.insert(&[(hash, bytecode.clone())]).unwrap();
 
@@ -292,8 +294,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.redb");
 
-        let hash = B256::from([1u8; 32]);
         let bytecode = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
+        // The disk tier re-checks that stored bytecode hashes back to its key, so the
+        // stored entry must be keyed by its real code hash.
+        let hash = bytecode.hash_slow();
 
         {
             let store = ValidatorDB::new(&db_path).unwrap();

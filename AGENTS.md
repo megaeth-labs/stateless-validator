@@ -69,7 +69,7 @@ The pipeline owns the reorg seams: `DivergenceLookups` (the bisection contract) 
 
 - **`ANCHOR_BLOCK`** — Trusted starting point (block number, hash, state root, withdrawals root).
 - **`CANONICAL_CHAIN`** — Validated chain progression (block number → hash, state root, withdrawals root); a bounded contiguous window in both binaries, and exactly what reorg bisection trusts.
-- **`CONTRACTS`** — Persistent tier of the contract bytecode cache (code hash → bincode+lz4 bytecode). The in-memory tier is the bounded `ContractCache` on top.
+- **`CONTRACTS`** — Persistent tier of the contract bytecode cache (code hash → bincode+lz4 bytecode). The in-memory tier is the bounded `ContractCache` on top. Rows are self-validating on read: decode failures and keccak mismatches surface as misses (re-fetched from RPC and overwritten), not errors, so encoding drift across upgrades never bricks a data dir.
 - **`GENESIS_CONFIG`** — Hardfork activation rules (validator only).
 - **`BLOCK_DATA`** — Full block content (trace server only).
 - **`WITNESSES`** — Light witness data (trace server only).

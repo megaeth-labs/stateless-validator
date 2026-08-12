@@ -5851,6 +5851,7 @@ dependencies = [
  "serde_json",
  "stateless-core",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]

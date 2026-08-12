@@ -428,9 +428,11 @@ mod tests {
     fn test_server_db_contract_codes() {
         let (_dir, db) = temp_server_db();
 
-        let hash1 = B256::from([1u8; 32]);
-        let hash2 = B256::from([2u8; 32]);
         let bytecode = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
+        // The read path re-checks that stored bytecode hashes back to its key, so the
+        // stored entry must be keyed by its real code hash.
+        let hash1 = bytecode.hash_slow();
+        let hash2 = B256::from([2u8; 32]);
 
         ContractStore::add_contracts(&db, &[(hash1, bytecode.clone())]).unwrap();
 

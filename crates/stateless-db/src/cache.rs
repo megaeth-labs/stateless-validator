@@ -121,7 +121,9 @@ impl ContractCache {
     ///
     /// Returns `(found, missing)`. Memory hits are trusted and not re-verified; the
     /// caller should use a verified RPC fetch (`RpcClient::get_codes(.., verify=true)`)
-    /// to populate the cache so all entries arrive pre-verified.
+    /// to populate the cache so all entries arrive pre-verified. The disk tier
+    /// self-validates on read: a stale or corrupt row surfaces as missing (see
+    /// `read_contracts`), and the caller's re-fetch + insert overwrites it.
     pub fn get(&self, hashes: &[B256]) -> StoreResult<ContractLookup> {
         let mut found: HashMap<B256, Bytecode> = HashMap::default();
         found.reserve(hashes.len());
