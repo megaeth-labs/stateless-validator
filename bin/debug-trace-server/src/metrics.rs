@@ -376,11 +376,10 @@ fn record_upstream_attempt(
         .record(duration_secs);
 }
 
-/// Time an upstream attempt spent queued behind our own concurrency cap, labeled `(method)`.
+/// Time an upstream call spent queued behind our own concurrency cap, labeled `(method)`.
 const UPSTREAM_PERMIT_WAIT_SECONDS: &str = "debug_trace_upstream_permit_wait_seconds";
 
-/// Records how long an upstream attempt waited for a concurrency permit; the rationale
-/// for metering the wait apart from the attempt lives on `RpcMetrics::on_rpc_permit_wait`.
+/// Records one permit-queue wait sample; semantics on `RpcMetrics::on_rpc_permit_wait`.
 fn record_upstream_permit_wait(method: &'static str, wait_secs: f64) {
     histogram!(UPSTREAM_PERMIT_WAIT_SECONDS, "method" => method).record(wait_secs);
 }

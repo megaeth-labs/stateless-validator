@@ -954,34 +954,15 @@ fn endpoint_label(url: &str, idx: usize) -> Arc<str> {
     }
 }
 
-/// Runs a round-robin RPC call with round-level exponential backoff and an optional deadline.
-///
-/// Each round attempts every provider once in round-robin starting at `rr_start`. If any
-/// provider succeeds, returns the result. If every provider in a round fails, sleeps for
-/// round-level exponential backoff (capped at `policy.max`, with jitter up to 50%) and starts
-/// a new round with the backoff doubled.
-///
-/// When `deadline` is `Some`, the loop returns [`RpcDeadlineExceeded`] once the deadline
-/// elapses, and clamps each inter-round sleep so it does not overshoot. When `deadline` is
-/// `None`, retry is unbounded — the function never returns an error.
-///
-/// Used by both the data-method `call()` (rotates `rr_start` per call for load balancing) and
-/// `get_witness()` (pins `rr_start=0` for primary-failover).
-///
-/// `providers`/`provider_labels` may be parallel slices of the caller's full configured list;
-/// attempts are identified in logs and errors by their label alone, which bakes in the
-/// endpoint's index in the full list at construction, so slicing never misattributes an
-/// attempt.
 /// Where a deadline-bound logical call's budget ran out, for the give-up WARN in
-/// `round_robin_with_backoff`. Only [`Self::AttemptClamped`] carries measurements: the
-/// other phases never ran an attempt, and omitting their fields keeps "not applicable"
-/// distinguishable from a genuinely zero measurement in the log.
+/// `round_robin_with_backoff`. Fields appear only on the phases that measured them, so
+/// "not applicable" stays distinguishable from a genuinely zero measurement in the log.
 enum GiveUpPhase<'a> {
     /// The deadline had already passed before the next attempt could start.
     BeforeAttempt,
-    /// The permit queue swallowed the remaining budget before a permit freed;
-    /// `permit_wait` is the time spent queued behind our own concurrency cap.
-    PermitWait { provider: &'a str, permit_wait: Duration },
+    /// The deadline elapsed while still queued for a concurrency permit, so no provider was
+    /// ever contacted — the loss is queue wait behind our own cap, not endpoint latency.
+    PermitWaitClamped { permit_wait: Duration },
     /// The running attempt was cut because the deadline elapsed alongside it;
     /// `permit_wait` / `attempt` split the lost hop into queue wait vs call time.
     AttemptClamped { provider: &'a str, permit_wait: Duration, attempt: Duration },
@@ -994,13 +975,32 @@ impl GiveUpPhase<'_> {
     fn as_str(&self) -> &'static str {
         match self {
             GiveUpPhase::BeforeAttempt => "before_attempt",
-            GiveUpPhase::PermitWait { .. } => "permit_wait",
+            GiveUpPhase::PermitWaitClamped { .. } => "permit_wait_clamped",
             GiveUpPhase::AttemptClamped { .. } => "attempt_clamped",
             GiveUpPhase::BeforeBackoff => "before_backoff",
         }
     }
 }
 
+/// Runs a round-robin RPC call with round-level exponential backoff and an optional deadline.
+///
+/// Each round attempts every provider once in round-robin starting at `rr_start`. If any
+/// provider succeeds, returns the result. If every provider in a round fails, sleeps for
+/// round-level exponential backoff (capped at `policy.max`, with jitter up to 50%) and starts
+/// a new round with the backoff doubled.
+///
+/// When `deadline` is `Some`, the loop returns [`RpcDeadlineExceeded`] once the deadline
+/// elapses, and clamps each permit wait, attempt, and inter-round sleep so none of them
+/// overshoots it. When `deadline` is `None`, retry is unbounded — the function never
+/// returns an error.
+///
+/// Used by both the data-method `call()` (rotates `rr_start` per call for load balancing) and
+/// `get_witness()` (pins `rr_start=0` for primary-failover).
+///
+/// `providers`/`provider_labels` may be parallel slices of the caller's full configured list;
+/// attempts are identified in logs and errors by their label alone, which bakes in the
+/// endpoint's index in the full list at construction, so slicing never misattributes an
+/// attempt.
 // 10-argument retry primitive. Each field plays a distinct role (providers, their metric/log
 // labels, concurrency, backoff policy, per-attempt timeout, starting provider, method label,
 // metrics sink, deadline, per-attempt closure) and bundling them into a struct would be ceremony
@@ -1043,42 +1043,30 @@ where
     let call_start = Instant::now();
     // Records the logical-call deadline give-up (once) and builds the typed error. Called
     // from every site that abandons the call on a blown deadline, so the "request timed
-    // out" metric and the returned error stay in lockstep; measurements appear in the WARN
-    // only for the phase that has them (see [`GiveUpPhase`]).
+    // out" metric and the returned error stay in lockstep.
     let record_deadline = |phase: GiveUpPhase<'_>, round: u32| -> RpcDeadlineExceeded {
         let elapsed = call_start.elapsed();
         if let Some(m) = metrics {
             m.on_rpc_deadline_exceeded(method, elapsed.as_secs_f64());
         }
-        let phase_label = phase.as_str();
-        match phase {
-            GiveUpPhase::AttemptClamped { provider, permit_wait, attempt } => warn!(
-                method = method.as_str(),
-                phase = phase_label,
-                provider,
-                round,
-                elapsed_ms = elapsed.as_millis() as u64,
-                permit_wait_ms = permit_wait.as_millis() as u64,
-                attempt_ms = attempt.as_millis() as u64,
-                "RPC logical call gave up on its deadline",
-            ),
-            GiveUpPhase::PermitWait { provider, permit_wait } => warn!(
-                method = method.as_str(),
-                phase = phase_label,
-                provider,
-                round,
-                elapsed_ms = elapsed.as_millis() as u64,
-                permit_wait_ms = permit_wait.as_millis() as u64,
-                "RPC logical call gave up on its deadline",
-            ),
-            GiveUpPhase::BeforeAttempt | GiveUpPhase::BeforeBackoff => warn!(
-                method = method.as_str(),
-                phase = phase_label,
-                round,
-                elapsed_ms = elapsed.as_millis() as u64,
-                "RPC logical call gave up on its deadline",
-            ),
-        }
+        let (provider, permit_wait, attempt) = match &phase {
+            GiveUpPhase::BeforeAttempt | GiveUpPhase::BeforeBackoff => (None, None, None),
+            GiveUpPhase::PermitWaitClamped { permit_wait } => (None, Some(*permit_wait), None),
+            GiveUpPhase::AttemptClamped { provider, permit_wait, attempt } => {
+                (Some(*provider), Some(*permit_wait), Some(*attempt))
+            }
+        };
+        // tracing skips `None`-valued fields, so each phase logs exactly its own field set.
+        warn!(
+            method = method.as_str(),
+            phase = phase.as_str(),
+            provider,
+            round,
+            elapsed_ms = elapsed.as_millis() as u64,
+            permit_wait_ms = permit_wait.map(|d| d.as_millis() as u64),
+            attempt_ms = attempt.map(|d| d.as_millis() as u64),
+            "RPC logical call gave up on its deadline",
+        );
         RpcDeadlineExceeded { method, elapsed }
     };
 
@@ -1092,42 +1080,38 @@ where
         let warn_level = round >= WARN_AT_ROUND;
 
         for offset in 0..n {
+            let queued = Instant::now();
             // Bail before eating the next permit if the deadline already fired — avoids
             // queueing behind the semaphore just to immediately bail.
             if let Some(d) = deadline &&
-                Instant::now() >= d
+                queued >= d
             {
                 return Err(record_deadline(GiveUpPhase::BeforeAttempt, round));
             }
             let slot = (rr_start + offset) % n;
             let provider_label: &str = &provider_labels[slot];
-            // The wait sits inside the caller's deadline; `RpcMetrics::on_rpc_permit_wait`
-            // documents why it is metered apart from the attempt itself.
-            let queued = Instant::now();
-            // A deadline bounds the queue wait too: under saturation the caller's budget
-            // must stay available for its own fallback instead of draining in the queue —
-            // and a parked acquire would otherwise return long after the caller's deadline.
-            let permit = match deadline {
-                None => semaphore.acquire().await,
-                Some(d) => match tokio::time::timeout_at(d.into(), semaphore.acquire()).await {
-                    Ok(acquired) => acquired,
-                    Err(_elapsed) => {
-                        let permit_wait = queued.elapsed();
-                        if let Some(m) = metrics {
-                            m.on_rpc_permit_wait(method, permit_wait.as_secs_f64());
-                        }
-                        return Err(record_deadline(
-                            GiveUpPhase::PermitWait { provider: provider_label, permit_wait },
-                            round,
-                        ));
-                    }
-                },
-            }
-            .expect("semaphore closed unexpectedly");
+            // The wait sits inside the caller's deadline (metering rationale:
+            // `RpcMetrics::on_rpc_permit_wait`), so the acquire is clamped to it — on a
+            // saturated semaphore the whole budget can die queued right here. A cut-short
+            // wait still records its sample; dropping it would censor the histogram exactly
+            // when the queue is at its worst.
+            let acquired = match deadline {
+                Some(d) => tokio::time::timeout_at(d.into(), semaphore.acquire()).await,
+                None => Ok(semaphore.acquire().await),
+            };
             let permit_wait = queued.elapsed();
             if let Some(m) = metrics {
                 m.on_rpc_permit_wait(method, permit_wait.as_secs_f64());
             }
+            let permit = match acquired {
+                Ok(acquire_result) => acquire_result.expect("semaphore closed unexpectedly"),
+                Err(_) => {
+                    return Err(record_deadline(
+                        GiveUpPhase::PermitWaitClamped { permit_wait },
+                        round,
+                    ));
+                }
+            };
             // Per-attempt timing: record each provider call individually so histograms
             // and success/error counters reflect what actually happened in the retry loop
             // rather than always showing "success" with the cumulative logical-call time.
@@ -1162,7 +1146,6 @@ where
                     )),
                 };
             let attempt_elapsed = attempt_start.elapsed();
-            let attempt_duration = attempt_elapsed.as_secs_f64();
             drop(permit);
 
             let (err, mut outcome) = match attempt {
@@ -1172,7 +1155,7 @@ where
                             method,
                             provider_label,
                             RpcAttemptOutcome::Success,
-                            attempt_duration,
+                            attempt_elapsed.as_secs_f64(),
                         );
                     }
                     return Ok(v);
@@ -1181,10 +1164,8 @@ where
             };
 
             // A per-attempt timeout that also blew the overall deadline is deadline pressure,
-            // not a provider stall: the attempt window was clamped to the little budget left,
-            // so the provider never got a fair round trip and blaming it for a stall would be
-            // wrong — but the attempt did run and did consume the budget, so it must not be
-            // dropped either. Reclassify before the single recording site below.
+            // not a provider stall (see `RpcAttemptOutcome::DeadlineClamped`); reclassify
+            // before the single recording site below.
             if outcome == RpcAttemptOutcome::Timeout &&
                 let Some(d) = deadline &&
                 Instant::now() >= d
@@ -1195,7 +1176,7 @@ where
             // Record the failed attempt against its endpoint with the reason (error vs a genuine
             // stall vs an attempt the caller's deadline cut short).
             if let Some(m) = metrics {
-                m.on_rpc_attempt(method, provider_label, outcome, attempt_duration);
+                m.on_rpc_attempt(method, provider_label, outcome, attempt_elapsed.as_secs_f64());
             }
 
             if outcome == RpcAttemptOutcome::DeadlineClamped {
@@ -1988,19 +1969,14 @@ mod tests {
         let (hb, url_b) = start_ordered_witness_rpc('B', order.clone()).await;
         let (hc, url_c) = start_ordered_witness_rpc('C', order.clone()).await;
 
-        let metrics = Arc::new(CapturingMetrics::default());
-        let config = RpcClientConfig {
-            rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
-            ..Default::default()
-        }
-        .with_metrics(metrics.clone());
-        let client = RpcClient::new_with_config(
+        let (client, metrics) = metered_client(
             &[url_a.as_str()],
             &[url_a.as_str(), url_b.as_str(), url_c.as_str()],
-            config,
-            None,
-        )
-        .unwrap();
+            RpcClientConfig {
+                rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
+                ..Default::default()
+            },
+        );
 
         let deadline = Instant::now() + Duration::from_millis(120);
         let result = client
@@ -2206,10 +2182,10 @@ mod tests {
 
     /// A saturated concurrency semaphore must not park a deadline-bound call past its
     /// budget: the permit wait is selected against the deadline and gives up at it
-    /// (`phase="permit_wait"`), instead of waiting for an unrelated in-flight attempt to
-    /// free a permit and only then discovering the deadline. Goes red with a bare
-    /// `acquire().await`, which parks until the hog's per-attempt timeout fires seconds
-    /// later.
+    /// (`phase="permit_wait_clamped"`), instead of waiting for an unrelated in-flight
+    /// attempt to free a permit and only then discovering the deadline. Goes red with a
+    /// bare `acquire().await`, which parks until the hog's per-attempt timeout fires
+    /// seconds later.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn saturated_permit_queue_fails_at_the_deadline_not_after_it() {
         // Stalled provider: accepts connections, never answers (kept alive in scope).
@@ -2372,6 +2348,7 @@ mod tests {
     struct CapturingMetrics {
         attempts: std::sync::Mutex<Vec<(RpcMethod, String, RpcAttemptOutcome)>>,
         deadlines: std::sync::Mutex<Vec<RpcMethod>>,
+        permit_waits: std::sync::Mutex<Vec<RpcMethod>>,
     }
 
     impl RpcMetrics for CapturingMetrics {
@@ -2385,11 +2362,51 @@ mod tests {
             self.attempts.lock().unwrap().push((method, provider.to_owned(), outcome));
         }
 
+        fn on_rpc_permit_wait(&self, method: RpcMethod, _wait_secs: f64) {
+            self.permit_waits.lock().unwrap().push(method);
+        }
+
         fn on_rpc_deadline_exceeded(&self, method: RpcMethod, _elapsed_secs: f64) {
             self.deadlines.lock().unwrap().push(method);
         }
 
         fn on_witness_fetch(&self, _breakdown: WitnessSizeBreakdown) {}
+    }
+
+    /// Builds an [`RpcClient`] wired to a fresh [`CapturingMetrics`] — the shared scaffolding
+    /// of the metrics-attribution tests.
+    fn metered_client(
+        data: &[&str],
+        witness: &[&str],
+        config: RpcClientConfig,
+    ) -> (RpcClient, Arc<CapturingMetrics>) {
+        let metrics = Arc::new(CapturingMetrics::default());
+        let client =
+            RpcClient::new_with_config(data, witness, config.with_metrics(metrics.clone()), None)
+                .unwrap();
+        (client, metrics)
+    }
+
+    /// Calls `get_latest_block_number` with `budget` and asserts the typed give-up plus exactly
+    /// one recorded deadline; the outer timeout turns a hung give-up into a clean failure.
+    async fn expect_deadline_give_up(
+        client: &RpcClient,
+        metrics: &CapturingMetrics,
+        budget: Duration,
+    ) {
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get_latest_block_number_with_deadline(Some(Instant::now() + budget)),
+        )
+        .await
+        .expect("call must give up at its deadline instead of hanging")
+        .expect_err("call must exceed its deadline");
+        assert_eq!(err.method, RpcMethod::EthBlockNumber);
+        assert_eq!(
+            *metrics.deadlines.lock().unwrap(),
+            vec![RpcMethod::EthBlockNumber],
+            "exactly one give-up per logical call",
+        );
     }
 
     /// Each provider attempt reports its own endpoint label and outcome: a failing primary
@@ -2400,20 +2417,15 @@ mod tests {
         let (ha, url_a, _) = start_counting_block_number_rpc(7, usize::MAX).await; // always errors
         let (hb, url_b) = start_block_number_rpc(7).await;
 
-        let metrics = Arc::new(CapturingMetrics::default());
-        let config = RpcClientConfig {
-            rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
-            ..Default::default()
-        }
-        .with_metrics(metrics.clone());
         // Data round-robin starts at index 0, so the failing A is tried before the healthy B.
-        let client = RpcClient::new_with_config(
+        let (client, metrics) = metered_client(
             &[url_a.as_str(), url_b.as_str()],
             &[url_a.as_str()],
-            config,
-            None,
-        )
-        .unwrap();
+            RpcClientConfig {
+                rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
+                ..Default::default()
+            },
+        );
 
         assert_eq!(client.get_latest_block_number().await, 7);
 
@@ -2440,39 +2452,59 @@ mod tests {
     }
 
     /// A logical call that exhausts its deadline records exactly one `on_rpc_deadline_exceeded`
-    /// (the operator-facing "request timed out" signal), on top of the per-attempt `Error`s.
+    /// (the operator-facing "request timed out" signal), on top of the per-attempt failures.
     #[tokio::test]
     async fn test_metrics_record_deadline_exceeded_once() {
         let (h, url, _) = start_counting_block_number_rpc(1, usize::MAX).await; // always errors
 
-        let metrics = Arc::new(CapturingMetrics::default());
-        let config = RpcClientConfig {
-            rpc_retry: BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(10)),
-            ..Default::default()
-        }
-        .with_metrics(metrics.clone());
-        let client =
-            RpcClient::new_with_config(&[url.as_str()], &[url.as_str()], config, None).unwrap();
-
-        let deadline = Instant::now() + Duration::from_millis(150);
-        let err = client
-            .get_latest_block_number_with_deadline(Some(deadline))
-            .await
-            .expect_err("always-erroring provider must exceed the deadline");
-        assert_eq!(err.method, RpcMethod::EthBlockNumber);
-
-        assert_eq!(
-            *metrics.deadlines.lock().unwrap(),
-            vec![RpcMethod::EthBlockNumber],
-            "exactly one give-up per logical call",
+        let (client, metrics) = metered_client(
+            &[url.as_str()],
+            &[url.as_str()],
+            RpcClientConfig {
+                rpc_retry: BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(10)),
+                ..Default::default()
+            },
         );
+
+        expect_deadline_give_up(&client, &metrics, Duration::from_millis(150)).await;
+        // Not asserted as all-`Error`: near the deadline a laggy response can legitimately be
+        // clamped into `Timeout`/`DeadlineClamped` (exact attribution is pinned by
+        // `test_metrics_record_per_provider_attempt_outcomes`).
         let attempts = metrics.attempts.lock().unwrap();
         assert!(
-            !attempts.is_empty() && attempts.iter().all(|(_, _, o)| *o == RpcAttemptOutcome::Error),
-            "every attempt errored before the deadline: {attempts:?}",
+            !attempts.is_empty() &&
+                attempts.iter().all(|(_, _, o)| *o != RpcAttemptOutcome::Success),
+            "every recorded attempt failed before the give-up: {attempts:?}",
         );
 
         h.stop().unwrap();
+    }
+
+    /// A call whose whole budget dies queued for a concurrency permit gives up at its deadline
+    /// instead of blocking until an unrelated permit frees, and still records the give-up plus
+    /// the cut-short permit-wait sample.
+    #[tokio::test]
+    async fn test_deadline_bounds_permit_wait() {
+        let (client, metrics) = metered_client(
+            &[LOCALHOST_A],
+            &[LOCALHOST_A],
+            RpcClientConfig { data_max_concurrent_requests: Some(1), ..Default::default() },
+        );
+
+        // Hold the single data permit for the whole test: the call stays queued and nothing
+        // is ever dialed.
+        let _held = client.data_concurrency.acquire().await.unwrap();
+
+        expect_deadline_give_up(&client, &metrics, Duration::from_millis(20)).await;
+        assert_eq!(
+            *metrics.permit_waits.lock().unwrap(),
+            vec![RpcMethod::EthBlockNumber],
+            "the cut-short wait still records a permit-wait sample",
+        );
+        assert!(
+            metrics.attempts.lock().unwrap().is_empty(),
+            "no attempt ran — the whole budget died in the permit queue",
+        );
     }
 
     /// A stalled witness fetch's failure log must carry `block_number` even at the default `warn`

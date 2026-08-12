@@ -67,14 +67,10 @@ pub enum RpcAttemptOutcome {
     /// request but did not answer within the budget (a stall).
     Timeout,
     /// The attempt was abandoned because the *logical call's* deadline elapsed while it
-    /// was still running.
-    ///
-    /// Deliberately separate from [`Self::Timeout`]: the attempt window was clamped to
-    /// whatever budget was left, so the provider never got a fair round trip and blaming
-    /// it for a stall would be wrong. But the attempt did happen and did consume that
-    /// budget, and recording nothing at all — as this path used to — makes a provider that
-    /// swallows the entire remaining budget indistinguishable from one that was never
-    /// called.
+    /// was still running. Separate from [`Self::Timeout`]: the attempt window was clamped
+    /// to the remaining budget, so the provider never got a fair round trip — but the
+    /// attempt did consume that budget, and dropping it would make a provider that
+    /// swallows the entire remaining budget indistinguishable from one never called.
     DeadlineClamped,
 }
 
@@ -121,8 +117,8 @@ pub trait RpcMetrics: Send + Sync {
     /// Default: no-op. Implement to track retry volume separately from logical errors.
     fn on_rpc_retry(&self, _method: RpcMethod) {}
 
-    /// Called once per provider attempt with the time spent waiting for a concurrency
-    /// permit before the attempt could start.
+    /// Called once per permit-queue wait: before each attempt starts, and for a wait the
+    /// caller's deadline cut short (which therefore yielded no attempt).
     ///
     /// Separates "the endpoint was slow" from "we were queued behind our own concurrency
     /// cap" — two causes with opposite fixes that are otherwise indistinguishable, because
