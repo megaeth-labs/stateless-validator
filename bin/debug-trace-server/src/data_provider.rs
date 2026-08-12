@@ -1136,7 +1136,9 @@ enum R2Band {
     /// The bucket's state is unknowable from a stale tip, so a `missing` records on its
     /// own [`crate::r2_witness::KIND_MISSING_ABOVE_TIP`] series: visible (a real hole in
     /// the catch-up gap still surfaces there) without flooding the below-band
-    /// bucket-integrity alarm with routine uploader lag on every catch-up.
+    /// bucket-integrity alarm with routine uploader lag on every catch-up. Like the
+    /// frontier, the probe is speculative — the object is not guaranteed to exist yet —
+    /// and gets only the [`R2_FRONTIER_BUDGET_DIVISOR`] budget share.
     AboveTip,
     /// At least the band *below* the tip: the object must exist, so a `missing` is a
     /// bucket hole and feeds the `kind="missing"` bucket-integrity alarm.
@@ -1261,10 +1263,15 @@ async fn try_r2_witness(
     deadline: Instant,
 ) -> Option<(LightWitness, MptWitness)> {
     let source = if band == R2Band::Frontier { "witness_r2_frontier" } else { "witness_r2" };
-    let divisor = if band == R2Band::Frontier {
-        R2_FRONTIER_BUDGET_DIVISOR
-    } else {
+    // Only the historical band gets the half share: there R2 is the primary source and
+    // the object must exist. Both near-tip bands are speculative — in-band the uploader
+    // may lag, above-band (a stale local tip: a deliberate tip buffer, or a catch-up) the
+    // object is not guaranteed to exist yet — so neither may burn half of a near-head
+    // request's budget on degraded R2.
+    let divisor = if band == R2Band::Historical {
         R2_WITNESS_BUDGET_DIVISOR
+    } else {
+        R2_FRONTIER_BUDGET_DIVISOR
     };
     let now = Instant::now();
     let r2_deadline = now + deadline.saturating_duration_since(now) / divisor;
@@ -2310,29 +2317,36 @@ mod tests {
         let (rpc_client, cfg) = routing_fixture(&[url_gen.as_str()], true);
         let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
 
-        // Frontier block (tip itself), 1.6s stage: the probe's slice is 200ms (an eighth),
-        // where the historical share would be 800ms.
-        let budget = Duration::from_millis(1600);
-        let started = Instant::now();
-        let result = fetch_witness(
-            &rpc_client,
-            &cfg,
-            Some(&r2),
-            Some(5000),
-            5000,
-            B256::ZERO,
-            started + budget,
-        )
-        .await;
-        let elapsed = started.elapsed();
+        // 1.6s stage: a speculative probe's slice is 200ms (an eighth), where the
+        // historical share would be 800ms. Both near-tip bands are speculative: the tip
+        // itself (in-band) and a block above a stale tip (above-band).
+        for block_number in [5000, 6000] {
+            let budget = Duration::from_millis(1600);
+            let started = Instant::now();
+            let result = fetch_witness(
+                &rpc_client,
+                &cfg,
+                Some(&r2),
+                Some(5000),
+                block_number,
+                B256::ZERO,
+                started + budget,
+            )
+            .await;
+            let elapsed = started.elapsed();
 
-        assert!(result.is_ok(), "the generator must serve after the probe: {:?}", result.err());
-        assert!(hits_gen.load(Ordering::Relaxed) >= 1, "the RPC chain must be reached");
-        assert!(
-            elapsed < Duration::from_millis(600),
-            "the frontier probe must be cut at its eighth-share slice, not the historical \
-             half ({elapsed:?})"
-        );
+            assert!(
+                result.is_ok(),
+                "the generator must serve block {block_number} after the probe: {:?}",
+                result.err()
+            );
+            assert!(hits_gen.load(Ordering::Relaxed) >= 1, "the RPC chain must be reached");
+            assert!(
+                elapsed < Duration::from_millis(600),
+                "a speculative probe must be cut at its eighth-share slice, not the \
+                 historical half (block {block_number}: {elapsed:?})"
+            );
+        }
 
         ha.stop().unwrap();
     }
