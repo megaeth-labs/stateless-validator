@@ -24,6 +24,11 @@
 //!   With `None` the loop retries forever — this is the validator's background-sync contract. The
 //!   non-`_with_deadline` methods delegate to the deadline version with `None`.
 //!   `set_validated_blocks` is single-attempt, but still bounded by `per_attempt_timeout`.
+//! - **Attempt bounds**: every provider attempt is capped by
+//!   [`RpcClientConfig::per_attempt_timeout`] (a provider that accepts TCP but never replies
+//!   rotates instead of wedging the loop), and the connect phase alone by
+//!   [`RpcClientConfig::connect_timeout`] — an unreachable host whose handshake gets no answer
+//!   fails fast instead of consuming the whole attempt budget.
 
 use std::{
     collections::HashMap,
@@ -36,7 +41,8 @@ use std::{
 };
 
 use alloy_primitives::{B256, Bytes, U64};
-use alloy_provider::{Provider, ProviderBuilder, RootProvider};
+use alloy_provider::{Provider, RootProvider};
+use alloy_rpc_client::ClientBuilder;
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag, Header};
 use eyre::{Context, Result, ensure, eyre};
 use futures::future;
@@ -146,6 +152,14 @@ pub struct RpcClientConfig {
     /// transfer at a value below its duration would re-cut it every round and wedge the
     /// fetch permanently instead of merely making it slow.
     pub witness_per_attempt_timeout: Option<Duration>,
+    /// Bound on the TCP connect phase of a single HTTP attempt, applied to every provider
+    /// through the shared HTTP client. Separate from `per_attempt_timeout` so an unreachable
+    /// endpoint — a dead host, or a firewall silently dropping the handshake — fails and
+    /// rotates within seconds, while an established connection keeps the full per-attempt
+    /// budget for a slow multi-megabyte transfer. (A refused connection fails in
+    /// milliseconds on its own; this bounds the no-reply case, which otherwise consumes the
+    /// entire `per_attempt_timeout` on every attempt.)
+    pub connect_timeout: Duration,
 }
 
 impl Default for RpcClientConfig {
@@ -164,6 +178,9 @@ impl Default for RpcClientConfig {
             // stalled (TCP-accept-no-reply) provider is detected within reasonable time.
             per_attempt_timeout: Duration::from_secs(20),
             witness_per_attempt_timeout: None,
+            // 3s accommodates a WAN handshake that loses its first SYN (the retransmit fires
+            // at ~1s) while keeping the cost of an unreachable provider to a quick rotation.
+            connect_timeout: Duration::from_secs(3),
         }
     }
 }
@@ -178,6 +195,7 @@ impl std::fmt::Debug for RpcClientConfig {
             .field("rpc_retry", &self.rpc_retry)
             .field("per_attempt_timeout", &self.per_attempt_timeout)
             .field("witness_per_attempt_timeout", &self.witness_per_attempt_timeout)
+            .field("connect_timeout", &self.connect_timeout)
             .finish()
     }
 }
@@ -304,25 +322,36 @@ impl RpcClient {
             return Err(eyre!("At least one witness API URL must be provided"));
         }
 
+        // One shared HTTP client for every provider (connection pools are keyed per host), so
+        // the connect-phase bound applies uniformly to data, witness, and report endpoints.
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(config.connect_timeout)
+            .build()
+            .context("Failed to build HTTP client")?;
+
         let data_providers = data_apis
             .iter()
             .map(|url| -> Result<RootProvider<Optimism>> {
-                Ok(ProviderBuilder::<_, _, Optimism>::default()
-                    .connect_http(url.parse().context("Failed to parse data API URL")?))
+                Ok(RootProvider::new(ClientBuilder::default().http_with_client(
+                    http_client.clone(),
+                    url.parse().context("Failed to parse data API URL")?,
+                )))
             })
             .collect::<Result<Vec<_>>>()?;
 
         let witness_providers = witness_apis
             .iter()
             .map(|url| -> Result<RootProvider> {
-                Ok(ProviderBuilder::default()
-                    .connect_http(url.parse().context("Failed to parse witness API URL")?))
+                Ok(RootProvider::new(ClientBuilder::default().http_with_client(
+                    http_client.clone(),
+                    url.parse().context("Failed to parse witness API URL")?,
+                )))
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // URLs above are already validated by `connect_http`, so labels only ever derive from
-        // well-formed endpoints; the parallel-by-index vectors feed the retry loop's per-endpoint
-        // metrics and logs.
+        // URLs above are already validated during provider construction, so labels only ever
+        // derive from well-formed endpoints; the parallel-by-index vectors feed the retry
+        // loop's per-endpoint metrics and logs.
         let data_provider_labels =
             data_apis.iter().enumerate().map(|(i, url)| endpoint_label(url, i)).collect();
         let witness_provider_labels =
@@ -330,8 +359,10 @@ impl RpcClient {
 
         let report_provider = report_api
             .map(|url| -> Result<RootProvider> {
-                Ok(ProviderBuilder::default()
-                    .connect_http(url.parse().context("Failed to parse report API URL")?))
+                Ok(RootProvider::new(ClientBuilder::default().http_with_client(
+                    http_client.clone(),
+                    url.parse().context("Failed to parse report API URL")?,
+                )))
             })
             .transpose()?;
         let report_provider_label = report_api.map(|url| endpoint_label(url, 0));
@@ -2344,6 +2375,84 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(3), client.get_latest_block_number())
             .await
             .expect("call must return — per-attempt timeout should rotate past stalled provider");
+        assert_eq!(result, healthy_latest);
+
+        handle.stop().unwrap();
+    }
+
+    /// An endpoint whose TCP handshake gets no answer (a dead host, or a firewall silently
+    /// dropping SYNs) must fail within `connect_timeout` and rotate, not burn the entire
+    /// `per_attempt_timeout` on every attempt. Simulated with a backlog-1 listener whose
+    /// accept queue is pre-filled: further handshakes are dropped at the connect phase.
+    /// (A closed port answers with RST and fails instantly — that case needs no bound.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_connect_timeout_rotates_past_unreachable_provider() {
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = sock.listen(1).unwrap();
+        let unreachable_addr = listener.local_addr().unwrap();
+        let unreachable_url = format!("http://{unreachable_addr}/");
+        // Keep the listener alive (in scope) without ever accepting, so parked handshakes
+        // stay queued for the whole test.
+        let _listener = listener;
+
+        // Saturate the accept queue: connect until handshakes stop completing. Established
+        // streams are parked in `queue_filler` to keep their slots occupied; the first
+        // connect that hangs proves further handshakes get no reply.
+        let mut queue_filler = Vec::new();
+        loop {
+            match tokio::time::timeout(
+                Duration::from_millis(250),
+                tokio::net::TcpStream::connect(unreachable_addr),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => queue_filler.push(stream),
+                _ => break,
+            }
+            if queue_filler.len() >= 64 {
+                // The kernel keeps completing handshakes far past the requested backlog, so
+                // the no-reply condition cannot be reproduced on this host. On Linux — the
+                // CI platform, where a backlog-1 listener saturates within a few connects —
+                // that is a hard failure: this is the only regression test of
+                // `connect_timeout`, and a silent skip would let a regression ship behind a
+                // green check. Other dev platforms keep the loud skip.
+                if cfg!(target_os = "linux") {
+                    panic!(
+                        "accept queue did not saturate after 64 connects — \
+                         the connect-timeout path was never exercised"
+                    );
+                }
+                eprintln!("skipping: accept queue did not saturate");
+                return;
+            }
+        }
+
+        // Healthy provider as the second endpoint. Round-robin starts at index 0 so the
+        // call hits the unreachable provider first, has to time out the connect, then
+        // rotates.
+        let healthy_latest = 7777u64;
+        let (handle, healthy_url) = start_block_number_rpc(healthy_latest).await;
+
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(20)),
+            connect_timeout: Duration::from_millis(200),
+            // Deliberately enormous: if the connect phase were bounded only by the attempt
+            // budget, the outer timeout below would fire long before this elapses.
+            per_attempt_timeout: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let client = RpcClient::new_with_config(
+            &[&unreachable_url, &healthy_url],
+            &[&healthy_url],
+            config,
+            None,
+        )
+        .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), client.get_latest_block_number())
+            .await
+            .expect("connect timeout must rotate past the unreachable provider");
         assert_eq!(result, healthy_latest);
 
         handle.stop().unwrap();

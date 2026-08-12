@@ -12,6 +12,7 @@ exclude.workspace = true
 alloy-consensus.workspace = true
 alloy-primitives.workspace = true
 alloy-provider.workspace = true
+alloy-rpc-client.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-trie.workspace = true
 
@@ -35,7 +36,7 @@ clap.workspace = true
 eyre.workspace = true
 fastrand = { workspace = true, features = ["std"] }
 futures.workspace = true
-# Enables gzip/brotli on alloy-provider's reqwest 0.12 (Cargo feature unification) for witness/data fetches; not referenced in code.
+# Also enables gzip/brotli on the shared reqwest 0.12 client (Cargo feature unification) for witness/data fetches.
 reqwest = { workspace = true, features = ["gzip", "brotli"] }
 rolling-file.workspace = true
 serde.workspace = true
