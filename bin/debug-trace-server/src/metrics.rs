@@ -139,6 +139,11 @@ pub enum ErrorReason {
     /// top-level params, unparsable batch entry) — recorded by the RPC middleware's
     /// fallback, never by a handler.
     Rejected,
+    /// An error response with a non-framework code left the server without a
+    /// handler-recorded reason — a handler ran but bypassed the error funnel. This series
+    /// sitting at nonzero is a code-drift alarm, not an operating state: it keeps a future
+    /// funnel bypass visible instead of silently absorbed into [`Self::Rejected`].
+    Unattributed,
 }
 
 impl ErrorReason {
@@ -152,6 +157,7 @@ impl ErrorReason {
             Self::TraceFailed => "trace_failed",
             Self::Internal => "internal",
             Self::Rejected => "rejected",
+            Self::Unattributed => "unattributed",
         }
     }
 
@@ -164,6 +170,7 @@ impl ErrorReason {
         Self::TraceFailed,
         Self::Internal,
         Self::Rejected,
+        Self::Unattributed,
     ];
 }
 
@@ -641,21 +648,25 @@ impl ChainSyncMetrics {
 
 /// Pre-registers all metrics so they appear in Prometheus from startup (with zero values).
 fn pre_register_all_metrics() {
-    // Request Layer: RPC method metrics
+    // Request Layer: RPC method metrics — every method that can record a served request,
+    // including the cache-status endpoint outside the trace pipeline.
     let _ = RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
     let _ = RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
     let _ = RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION);
     let _ = RpcMethodMetrics::new_for_method(METHOD_TRACE_BLOCK);
     let _ = RpcMethodMetrics::new_for_method(METHOD_TRACE_TRANSACTION);
+    let _ = RpcMethodMetrics::new_for_method(METHOD_DEBUG_GET_CACHE_STATUS);
 
     // Request Layer: the accounting identity's error/cancellation terms. Pre-registering the
     // full (method x reason) grid means a dashboard can subtract zeros instead of missing
     // series, and `rate(...{reason="deadline_witness"})` alerts on absence from boot. Every
-    // known method participates — the middleware's cancelled/rejected terms cover them all.
-    for method in ALL_METHODS {
-        counter!(RPC_REQUESTS_CANCELLED_TOTAL, "method" => *method).increment(0);
+    // known method participates — the middleware's cancelled/rejected terms cover them all —
+    // plus the `unknown` fold target `resolve_method` maps arbitrary client method names
+    // onto, which those same middleware terms label.
+    for method in ALL_METHODS.iter().copied().chain(["unknown"]) {
+        counter!(RPC_REQUESTS_CANCELLED_TOTAL, "method" => method).increment(0);
         for reason in ErrorReason::ALL {
-            counter!(RPC_ERRORS_TOTAL, "method" => *method, "reason" => reason.as_str())
+            counter!(RPC_ERRORS_TOTAL, "method" => method, "reason" => reason.as_str())
                 .increment(0);
         }
     }
@@ -745,6 +756,8 @@ fn pre_register_all_metrics() {
             counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => shape).increment(0);
         }
     }
+    // The `unknown` fold target only ever arrives through the middleware's rejected pair.
+    counter!(REQUEST_SHAPE_TOTAL, "method" => "unknown", "shape" => "rejected").increment(0);
 
     // Data Fetch Layer: canonical number → hash resolution
     for (source, outcome) in [

@@ -695,14 +695,19 @@ impl DebugTraceRpcServer for RpcContext {
     }
 
     async fn get_cache_status(&self) -> RpcResult<serde_json::Value> {
+        let start = Instant::now();
         // Arrival + served, so the one method outside the trace pipeline still balances
         // against the middleware's cancelled/rejected terms.
         metrics::record_request_shape(metrics::METHOD_DEBUG_GET_CACHE_STATUS, "default");
-        metrics::record_rpc_request(metrics::METHOD_DEBUG_GET_CACHE_STATUS, 0.0);
-        Ok(serde_json::json!({
+        let status = serde_json::json!({
             "responseCache": cache_section(self.response_cache.as_ref().map(ResponseCache::stats)),
             "blockDataCache": cache_section(self.data_provider.block_data_cache_stats()),
-        }))
+        });
+        metrics::record_rpc_request(
+            metrics::METHOD_DEBUG_GET_CACHE_STATUS,
+            start.elapsed().as_secs_f64(),
+        );
+        Ok(status)
     }
 }
 
