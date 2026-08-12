@@ -138,6 +138,16 @@ const R2_WITNESS_BUDGET_DIVISOR: u32 = 2;
 /// so probing it first only burns a failover round trip.
 pub const DEFAULT_WITNESS_LOCAL_WINDOW: u64 = 4096;
 
+/// Near-tip band (in blocks) inside which an R2 witness `missing` is the expected
+/// probe-ahead outcome — the uploader may plausibly not have PUT the object yet — rather
+/// than a bucket hole. Sized to comfortably cover the uploader's PUT latency plus the local
+/// DB tip's own sync lag (a few seconds each; chain sync's `GENERATOR_WITNESS_GRACE` is the
+/// time-based analog), and kept far below [`DEFAULT_WITNESS_LOCAL_WINDOW`]: routing asks
+/// "may the generator have pruned this?", this asks "may the uploader not have reached it
+/// yet?", and gating the `kind="missing"` alarm on the routing window would silence
+/// bucket-integrity alerting across its whole 4096-block span.
+const R2_FRONTIER_WINDOW: u64 = 32;
+
 /// Default deadline for the full block-fetch pipeline (header + witness + block + contracts)
 /// in seconds (13 seconds).
 ///
@@ -1101,6 +1111,14 @@ fn is_historical(db_tip: Option<u64>, block_number: u64, local_window: u64) -> b
     }
 }
 
+/// Whether a block sits in the [`R2_FRONTIER_WINDOW`] near-tip band, where an R2 `missing`
+/// is expected probe-ahead rather than a bucket hole. Unknown tip counts as frontier: with
+/// no anchor, nothing is known to be uploaded (`validate_args` requires `--data-dir` for R2
+/// precisely so this stays a cold-start transient, not the steady state).
+fn is_r2_frontier(db_tip: Option<u64>, block_number: u64) -> bool {
+    !is_historical(db_tip, block_number, R2_FRONTIER_WINDOW)
+}
+
 /// Witness route for a block: how many leading witness endpoints to skip, plus the metrics
 /// source label. Historical blocks skip the internal generator at index 0 — but only with a
 /// fallback endpoint to skip to (`can_skip_generator`, so the skip-aware fetch never sees an
@@ -1151,7 +1169,7 @@ async fn fetch_witness(
     deadline: Instant,
 ) -> DataProviderResult<(LightWitness, MptWitness)> {
     if let Some(r2) = r2_witness {
-        let frontier = !is_historical(db_tip, block_number, cfg.local_window);
+        let frontier = is_r2_frontier(db_tip, block_number);
         if let Some(witness) =
             try_r2_witness(r2, frontier, block_number, block_hash, deadline).await
         {
@@ -1195,10 +1213,11 @@ async fn fetch_witness(
 /// One R2 attempt for a witness, on [`R2_WITNESS_BUDGET_DIVISOR`]'s share of the remaining
 /// budget. `None` on any failure — the caller falls back to the RPC chain.
 ///
-/// `frontier` selects the metrics source label (`witness_r2_frontier` vs `witness_r2`), so
-/// the frontier probe's hit rate stays separable from historical R2 traffic — the probe is
-/// speculative and its miss rate is expected to dominate, which must not read as historical
-/// R2 health degrading.
+/// `frontier` ([`is_r2_frontier`]: the near-tip band, not the routing window) selects the
+/// metrics source label (`witness_r2_frontier` vs `witness_r2`) and the `missing` handling:
+/// only inside the band is a miss the expected speculative-probe outcome, kept separable so
+/// its dominant miss rate does not read as R2 health degrading. Beyond the band the object
+/// must exist, so a miss counts toward the `kind="missing"` bucket-integrity alarm.
 async fn try_r2_witness(
     r2: &R2WitnessSource,
     frontier: bool,
@@ -1451,6 +1470,26 @@ mod tests {
         assert!(!is_historical(Some(4095), 0, 4096));
         assert!(!is_historical(Some(u64::MAX), u64::MAX, 4096), "overflowing horizon is recent");
         assert!(is_historical(Some(100), 50, 0), "zero window: everything at/below tip");
+    }
+
+    /// The R2 frontier band is the uploader-lag grace, not the routing window: a block that
+    /// is recent for routing but past the band must count an R2 miss as a bucket hole (the
+    /// `kind="missing"` alarm), not an expected probe-ahead miss.
+    #[test]
+    fn test_r2_frontier_band_is_narrower_than_routing() {
+        assert!(is_r2_frontier(None, 100), "unknown tip: nothing known to be uploaded");
+        assert!(is_r2_frontier(Some(5000), 5000), "the tip itself");
+        assert!(is_r2_frontier(Some(5000), 5100), "above the local tip");
+        assert!(is_r2_frontier(Some(5000), 5000 - R2_FRONTIER_WINDOW + 1), "just inside");
+        assert!(!is_r2_frontier(Some(5000), 5000 - R2_FRONTIER_WINDOW), "just past the band");
+        // The band a routing-window gate would have silenced: recent for routing, far past
+        // any plausible uploader lag.
+        let recent_not_tip = 4000;
+        assert!(!is_r2_frontier(Some(5000), recent_not_tip), "a hole here must alarm");
+        assert!(
+            !is_historical(Some(5000), recent_not_tip, DEFAULT_WITNESS_LOCAL_WINDOW),
+            "yet the same block is recent for witness routing",
+        );
     }
 
     /// Route selection: the skip-generator chain and the `witness_historical` label apply
