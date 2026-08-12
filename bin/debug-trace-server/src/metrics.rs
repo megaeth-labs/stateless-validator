@@ -136,7 +136,7 @@ pub enum ErrorReason {
     /// Transport decode, DB, or another internal fault.
     Internal,
     /// Answered by the framework before the handler ran (unknown method, malformed
-    /// top-level params, unparseable batch entry) — recorded by the RPC middleware's
+    /// top-level params, unparsable batch entry) — recorded by the RPC middleware's
     /// fallback, never by a handler.
     Rejected,
 }
