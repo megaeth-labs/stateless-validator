@@ -643,6 +643,8 @@ fn pre_register_all_metrics() {
     for kind in crate::r2_witness::R2WitnessError::KINDS {
         counter!(R2_WITNESS_ERRORS_TOTAL, "kind" => *kind).increment(0);
     }
+    counter!(R2_WITNESS_ERRORS_TOTAL, "kind" => crate::r2_witness::KIND_MISSING_ABOVE_TIP)
+        .increment(0);
     let _ = histogram!(R2_WITNESS_QUEUE_WAIT_SECONDS);
 
     // Data Fetch Layer: single-flight
