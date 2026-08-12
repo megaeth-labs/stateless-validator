@@ -67,14 +67,10 @@ pub enum RpcAttemptOutcome {
     /// request but did not answer within the budget (a stall).
     Timeout,
     /// The attempt was abandoned because the *logical call's* deadline elapsed while it
-    /// was still running.
-    ///
-    /// Deliberately separate from [`Self::Timeout`]: the attempt window was clamped to
-    /// whatever budget was left, so the provider never got a fair round trip and blaming
-    /// it for a stall would be wrong. But the attempt did happen and did consume that
-    /// budget, and recording nothing at all — as this path used to — makes a provider that
-    /// swallows the entire remaining budget indistinguishable from one that was never
-    /// called.
+    /// was still running. Separate from [`Self::Timeout`]: the attempt window was clamped
+    /// to the remaining budget, so the provider never got a fair round trip — but the
+    /// attempt did consume that budget, and dropping it would make a provider that
+    /// swallows the entire remaining budget indistinguishable from one never called.
     DeadlineClamped,
 }
 
