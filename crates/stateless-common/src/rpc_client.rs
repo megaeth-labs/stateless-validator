@@ -443,6 +443,20 @@ impl RpcClient {
         deadline: Option<Instant>,
         f: impl Fn(RootProvider<Optimism>) -> BoxFuture<Result<T>>,
     ) -> std::result::Result<T, RpcDeadlineExceeded> {
+        self.call_with_deadline_at(method, deadline, false, f).await
+    }
+
+    /// [`Self::call_with_deadline`] with the caller's give-up disposition explicit:
+    /// `best_effort = true` demotes the deadline give-up WARN to debug (the caller has
+    /// declared deadline failure an expected outcome, not an incident) while metrics stay
+    /// untouched.
+    async fn call_with_deadline_at<T: Send + 'static>(
+        &self,
+        method: RpcMethod,
+        deadline: Option<Instant>,
+        best_effort: bool,
+        f: impl Fn(RootProvider<Optimism>) -> BoxFuture<Result<T>>,
+    ) -> std::result::Result<T, RpcDeadlineExceeded> {
         // Safety: constructor guarantees at least one data provider.
         let n = self.data_providers.len();
         // Skip the atomic op when there's a single provider — avoids pointless contention.
@@ -458,6 +472,7 @@ impl RpcClient {
             method,
             self.config.metrics.as_ref(),
             deadline,
+            best_effort,
             |provider, _provider_label| f(provider.clone()),
         )
         .await
@@ -560,7 +575,26 @@ impl RpcClient {
         &self,
         deadline: Option<Instant>,
     ) -> std::result::Result<u64, RpcDeadlineExceeded> {
-        self.call_with_deadline(RpcMethod::EthBlockNumber, deadline, move |provider| {
+        self.latest_block_number_at(deadline, false).await
+    }
+
+    /// [`Self::get_latest_block_number_with_deadline`] for best-effort probes: a deadline
+    /// give-up logs at debug instead of WARN, because the caller degrades the failure
+    /// itself (e.g. the trace server's throttled tip seed skips one memoization round).
+    /// The deadline-exceeded metric still fires — only the operator-paging log is demoted.
+    pub async fn get_latest_block_number_best_effort(
+        &self,
+        deadline: Option<Instant>,
+    ) -> std::result::Result<u64, RpcDeadlineExceeded> {
+        self.latest_block_number_at(deadline, true).await
+    }
+
+    async fn latest_block_number_at(
+        &self,
+        deadline: Option<Instant>,
+        best_effort: bool,
+    ) -> std::result::Result<u64, RpcDeadlineExceeded> {
+        self.call_with_deadline_at(RpcMethod::EthBlockNumber, deadline, best_effort, |provider| {
             Box::pin(async move {
                 provider.get_block_number().await.context("Failed to get block number").map_err(
                     |e| {
@@ -780,6 +814,7 @@ impl RpcClient {
             RpcMethod::MegaGetBlockWitness,
             self.config.metrics.as_ref(),
             deadline,
+            false,
             |provider, provider_label| {
                 Box::pin(async move {
                     fetch_witness_with(&provider, &provider_label, number, hash, decode, trace_msg)
@@ -1053,11 +1088,12 @@ const MIN_RESERVE_HALF_ATTEMPT: Duration = Duration::from_millis(25);
 /// attempts are identified in logs and errors by their label alone, which bakes in the
 /// endpoint's index in the full list at construction, so slicing never misattributes an
 /// attempt.
-// 10-argument retry primitive. Each field plays a distinct role (providers, their metric/log
+// 11-argument retry primitive. Each field plays a distinct role (providers, their metric/log
 // labels, concurrency, backoff policy, per-attempt cap policy, starting provider, method label,
-// metrics sink, deadline, per-attempt closure) and bundling them into a struct would be ceremony
-// without encapsulation — there are exactly two call sites in this crate. Prefer clarity at the
-// definition over fewer commas at the call. `provider_labels` is parallel to `providers` by index.
+// metrics sink, deadline, give-up disposition, per-attempt closure) and bundling them into a struct
+// would be ceremony without encapsulation — there are exactly two call sites in this crate. Prefer
+// clarity at the definition over fewer commas at the call. `provider_labels` is parallel to
+// `providers` by index.
 #[allow(clippy::too_many_arguments)]
 async fn round_robin_with_backoff<N, T>(
     providers: &[RootProvider<N>],
@@ -1069,6 +1105,7 @@ async fn round_robin_with_backoff<N, T>(
     method: RpcMethod,
     metrics: Option<&Arc<dyn RpcMetrics>>,
     deadline: Option<Instant>,
+    best_effort: bool,
     f: impl Fn(RootProvider<N>, Arc<str>) -> BoxFuture<Result<T>>,
 ) -> std::result::Result<T, RpcDeadlineExceeded>
 where
@@ -1109,7 +1146,10 @@ where
             }
         };
         // tracing skips `None`-valued fields, so each phase logs exactly its own field set.
-        warn!(
+        // Best-effort callers degrade the failure themselves, so their give-up is not the
+        // operator-paging signal — it logs at debug while the metric above still fires.
+        log_at!(
+            !best_effort,
             method = method.as_str(),
             phase = phase.as_str(),
             provider,
@@ -2679,6 +2719,84 @@ mod tests {
         assert!(
             metrics.attempts.lock().unwrap().is_empty(),
             "no attempt ran — the whole budget died in the permit queue",
+        );
+    }
+
+    /// A best-effort caller's deadline give-up must not log the operator-paging WARN.
+    /// The normal path first proves the capture works (same `log_at!` expansion, so the
+    /// same `warn!` callsite the absence assertion depends on), then the best-effort path
+    /// must leave the WARN buffer empty — its give-up logs at debug. Uses the held-permit
+    /// give-up, so no endpoint is ever contacted and both give-ups are deterministic.
+    #[tokio::test]
+    async fn test_best_effort_give_up_logs_quietly() {
+        #[derive(Clone)]
+        struct SharedBuf(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedBuf {
+            type Writer = SharedBuf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(SharedBuf(buf.clone()))
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let config =
+            RpcClientConfig { data_max_concurrent_requests: Some(1), ..Default::default() };
+        let client =
+            RpcClient::new_with_config(&[LOCALHOST_A], &[LOCALHOST_A], config, None).unwrap();
+        // Hold the single data permit so every call below gives up at its deadline.
+        let _held = client.data_concurrency.acquire().await.unwrap();
+        let deadline = || Some(Instant::now() + Duration::from_millis(20));
+
+        // Positive control, self-healing against the interest-cache race: concurrent
+        // subscriber-less tests can re-cache `never` for the WARN callsite, so rebuild
+        // and retry until the control WARN is captured instead of flaking.
+        let mut control_seen = false;
+        for attempt in 0..20 {
+            if attempt > 0 {
+                tracing::callsite::rebuild_interest_cache();
+            }
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                client.get_latest_block_number_with_deadline(deadline()),
+            )
+            .await
+            .expect("give-up must not hang")
+            .expect_err("held permit must exceed the deadline");
+            if String::from_utf8_lossy(&buf.lock().unwrap()).contains("gave up on its deadline") {
+                control_seen = true;
+                break;
+            }
+        }
+        assert!(control_seen, "positive control: the normal give-up WARN was never captured");
+
+        buf.lock().unwrap().clear();
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get_latest_block_number_best_effort(deadline()),
+        )
+        .await
+        .expect("give-up must not hang")
+        .expect_err("held permit must exceed the deadline");
+        let logs = String::from_utf8_lossy(&buf.lock().unwrap()).to_string();
+        assert!(
+            !logs.contains("gave up on its deadline"),
+            "best-effort give-up must log at debug, not WARN: {logs}",
         );
     }
 
