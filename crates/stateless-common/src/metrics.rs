@@ -57,7 +57,12 @@ impl RpcMethod {
 /// every non-success into one opaque error count. `Error` and `Timeout` are
 /// both retriable failures; the split lets operators tell a provider that
 /// answered with an error from one that stalled and had to be timed out.
+///
+/// `#[non_exhaustive]`: new outcomes appear as the retry loop learns to classify more
+/// failure modes ([`Self::DeadlineClamped`] arrived exactly that way), and a downstream
+/// exhaustive `match` must not turn the next one into a breaking change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RpcAttemptOutcome {
     /// The provider returned a usable response.
     Success,
