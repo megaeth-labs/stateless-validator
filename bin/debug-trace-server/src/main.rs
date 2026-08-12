@@ -3,10 +3,10 @@
 //! # Overview
 //! A standalone RPC server for `debug_*` and `trace_*` methods using stateless execution.
 //! Data can be fetched from upstream RPC endpoints or from a local database with chain sync.
-//! Request-serving witness fetches route by block age: historical blocks skip the internal
-//! generator endpoint (which only retains a small recent window) and go straight to the
-//! fallback endpoints — or, with the `--r2-*` flags, straight to the R2 bucket with the RPC
-//! chain as fallback. Chain-sync prefetch always uses the full chain.
+//! With the `--r2-*` flags every request-serving witness fetch tries the R2 bucket first,
+//! falling back to the RPC chain; the chain itself routes by block age — historical blocks
+//! skip the internal generator endpoint (which only retains a small recent window) and go
+//! straight to the fallback endpoints. Chain-sync prefetch always uses the full chain.
 //!
 //! # Architecture
 //! ```text
@@ -158,9 +158,9 @@ struct Args {
     #[clap(long, env = "DEBUG_TRACE_SERVER_START_BLOCK")]
     start_block: Option<String>,
 
-    /// Witness fetch timeout in seconds. Half of it also caps any single witness-chain
-    /// attempt (and the R2 pre-try), so one stalled endpoint can never consume the whole
-    /// stage and starve the retry rotation.
+    /// Witness fetch timeout in seconds. No single witness-chain attempt may run longer
+    /// than half of what the stage has left when the chain starts, so one stalled endpoint
+    /// can never consume the whole stage and starve the retry rotation.
     #[clap(
         long,
         env = "DEBUG_TRACE_SERVER_WITNESS_TIMEOUT",
@@ -477,11 +477,10 @@ fn validate_args(args: &Args) -> Result<()> {
             );
         }
     }
-    // The R2 route anchors block age (frontier vs historical) to the local DB tip. Without
-    // --data-dir every block would classify as frontier — the probe would still run, but a
-    // genuine bucket hole would be demoted to an "expected frontier miss" and never reach
-    // the `kind="missing"` bucket-integrity alarm. An operator who configured R2 asked for
-    // the real route explicitly — fail closed instead of running a blind approximation.
+    // The R2 route anchors block age (frontier vs historical) to the local DB tip; without
+    // --data-dir every block would classify as frontier and a genuine bucket hole would
+    // never reach the `kind="missing"` alarm. An operator who configured R2 asked for the
+    // real route — fail closed instead of running a blind approximation.
     if args.r2_endpoint.is_some() && args.data_dir.is_none() {
         eyre::bail!(
             "--r2-endpoint requires --data-dir: the R2 witness route anchors block age \
@@ -555,9 +554,9 @@ async fn main() -> Result<()> {
         data_max_concurrent_requests: args.data_max_concurrent_requests,
         witness_max_concurrent_requests: args.witness_max_concurrent_requests,
         per_attempt_timeout,
-        // Half the witness stage, so no single hop can consume it whole; derived rather
-        // than flagged so it moves with --witness-timeout. A ceiling, not the final cap —
-        // see `RpcClientConfig::witness_per_attempt_timeout` for the full contract.
+        // Derived rather than flagged so it moves with --witness-timeout; a ceiling the
+        // per-entry halving normally undercuts — the full contract lives on
+        // `RpcClientConfig::witness_per_attempt_timeout`.
         witness_per_attempt_timeout: Some(std::time::Duration::from_secs(args.witness_timeout) / 2),
         ..rpc_defaults
     }

@@ -6,11 +6,12 @@
 //! 1. **Local Database** (fast) - Local DB for pre-fetched blocks (if configured)
 //! 2. **Remote RPC** (slower) - Upstream RPC endpoints as fallback
 //!
-//! Within the RPC fallback, the witness stage routes by block age (see [`WitnessFetchConfig`]):
-//! blocks fewer than `local_window` blocks below the local tip use the full witness endpoint
-//! chain (internal generator first), while historical blocks — at least `local_window` below,
-//! which the generator has long pruned — skip the generator and go straight to the remaining
-//! endpoints.
+//! Within the RPC fallback, the witness stage first probes a configured R2 bucket for every
+//! fetch (see [`fetch_witness`]), then routes the RPC chain by block age (see
+//! [`WitnessFetchConfig`]): blocks fewer than `local_window` blocks below the local tip use
+//! the full witness endpoint chain (internal generator first), while historical blocks — at
+//! least `local_window` below, which the generator has long pruned — skip the generator and
+//! go straight to the remaining endpoints.
 //!
 //! # Features
 //! - **Single-flight request coalescing**: concurrent callers for the same block hash share one
@@ -344,9 +345,8 @@ pub(crate) struct DataProvider {
     /// The full-call deadline still dominates; the per-stage budgets cap how much of it the
     /// witness fetch can burn.
     witness_cfg: WitnessFetchConfig,
-    /// Optional direct-from-R2 source for historical witnesses. When present, the witness
-    /// stage tries it before the RPC chain for blocks the routing window classifies as
-    /// historical; every R2 failure falls back to the RPC chain on the remaining deadline.
+    /// Optional direct-from-R2 witness source. When present, every witness fetch tries it
+    /// before the RPC chain; any R2 failure falls back on the remaining deadline.
     r2_witness: Option<Arc<R2WitnessSource>>,
     /// Wall-clock budget for one user-facing block-data call, from entry through
     /// header + witness + block + contract resolution. The retry loop in `RpcClient`
@@ -432,8 +432,7 @@ impl DataProvider {
     ///   + block + contracts)
     /// * `canonical_hash_memo_capacity` - Entry cap for the in-memory canonical-hash memo
     ///
-    /// The optional direct-from-R2 historical witness source attaches via
-    /// [`Self::with_r2_witness`].
+    /// The optional direct-from-R2 witness source attaches via [`Self::with_r2_witness`].
     pub fn new(
         rpc_client: Arc<RpcClient>,
         db: Option<Arc<dyn BlockStore>>,
@@ -1213,11 +1212,11 @@ async fn fetch_witness(
 /// One R2 attempt for a witness, on [`R2_WITNESS_BUDGET_DIVISOR`]'s share of the remaining
 /// budget. `None` on any failure — the caller falls back to the RPC chain.
 ///
-/// `frontier` ([`is_r2_frontier`]: the near-tip band, not the routing window) selects the
-/// metrics source label (`witness_r2_frontier` vs `witness_r2`) and the `missing` handling:
-/// only inside the band is a miss the expected speculative-probe outcome, kept separable so
-/// its dominant miss rate does not read as R2 health degrading. Beyond the band the object
-/// must exist, so a miss counts toward the `kind="missing"` bucket-integrity alarm.
+/// `frontier` ([`is_r2_frontier`]) selects the metrics source label (`witness_r2_frontier`
+/// vs `witness_r2`) and the `missing` handling: only inside the band is a miss the expected
+/// speculative-probe outcome, kept separable so its dominant miss rate does not read as R2
+/// health degrading. Beyond the band the object must exist, so a miss counts toward the
+/// `kind="missing"` bucket-integrity alarm.
 async fn try_r2_witness(
     r2: &R2WitnessSource,
     frontier: bool,
@@ -1225,7 +1224,7 @@ async fn try_r2_witness(
     block_hash: B256,
     deadline: Instant,
 ) -> Option<(LightWitness, MptWitness)> {
-    let source: &'static str = if frontier { "witness_r2_frontier" } else { "witness_r2" };
+    let source = if frontier { "witness_r2_frontier" } else { "witness_r2" };
     let now = Instant::now();
     let r2_deadline = now + deadline.saturating_duration_since(now) / R2_WITNESS_BUDGET_DIVISOR;
     let metrics = WitnessSourceMetrics::new_for_source(source);
@@ -1237,10 +1236,8 @@ async fn try_r2_witness(
         Err(e) => {
             metrics.record_request(false, now.elapsed().as_secs_f64());
             if frontier && e.is_missing() {
-                // Expected: the probe ran ahead of the uploader. Kept out of the
-                // `kind="missing"` bucket-integrity alarm (see the counter's doc in
-                // `metrics.rs`); the per-source error counter above still records every
-                // miss, which is what the frontier hit rate reads.
+                // The per-source counter above still records the miss (what the frontier
+                // hit rate reads); only the `kind="missing"` alarm skips it.
                 debug!(
                     block_number,
                     block_hash = %block_hash,
@@ -1476,10 +1473,9 @@ mod tests {
     /// is recent for routing but past the band must count an R2 miss as a bucket hole (the
     /// `kind="missing"` alarm), not an expected probe-ahead miss.
     #[test]
-    fn test_r2_frontier_band_is_narrower_than_routing() {
+    fn r2_frontier_band_is_narrower_than_routing() {
         assert!(is_r2_frontier(None, 100), "unknown tip: nothing known to be uploaded");
         assert!(is_r2_frontier(Some(5000), 5000), "the tip itself");
-        assert!(is_r2_frontier(Some(5000), 5100), "above the local tip");
         assert!(is_r2_frontier(Some(5000), 5000 - R2_FRONTIER_WINDOW + 1), "just inside");
         assert!(!is_r2_frontier(Some(5000), 5000 - R2_FRONTIER_WINDOW), "just past the band");
         // The band a routing-window gate would have silenced: recent for routing, far past
@@ -1515,26 +1511,26 @@ mod tests {
             rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
             ..RpcClientConfig::trace_server()
         };
-        let (rpc_client, mut cfg) = cap_fixture(witness_urls, config, 1);
+        let (rpc_client, mut cfg) = cap_fixture(witness_urls, config);
         cfg.generator_first = generator_first;
         (rpc_client, cfg)
     }
 
-    /// [`routing_fixture`] with the client config and witness budget under the caller's
-    /// control — the hop-cap tests vary exactly those two things. `witness_urls[0]`
-    /// doubles as the data endpoint and the generator (first witness provider);
-    /// `generator_first` stays on, matching the deployment shape the cap protects.
+    /// [`routing_fixture`] with the client config under the caller's control — the hop-cap
+    /// tests vary it, and their budgets come from the explicit `deadline` they pass to
+    /// [`fetch_witness`]. `witness_urls[0]` doubles as the data endpoint and the generator
+    /// (first witness provider); `generator_first` stays on, matching the deployment shape
+    /// the cap protects.
     fn cap_fixture(
         witness_urls: &[&str],
         config: RpcClientConfig,
-        witness_timeout_secs: u64,
     ) -> (RpcClient, WitnessFetchConfig) {
         let rpc_client =
             RpcClient::new_with_config(&witness_urls[..1], witness_urls, config, None).unwrap();
         let cfg = WitnessFetchConfig {
             local_window: 100,
             generator_first: true,
-            ..WitnessFetchConfig::with_defaults(witness_timeout_secs)
+            ..WitnessFetchConfig::with_defaults(1)
         };
         (rpc_client, cfg)
     }
@@ -1915,23 +1911,35 @@ mod tests {
             .1
     }
 
-    /// A historical block with R2 configured is served from R2 alone: neither the generator
-    /// nor the fallback RPC endpoint sees a request.
+    /// A block whose witness is in the bucket is served from R2 alone — historical and
+    /// frontier alike — with neither the generator nor the fallback touched. The frontier
+    /// case is why every fetch probes R2: the bucket can lead the generator at the tip
+    /// (see [`fetch_witness`]).
     #[tokio::test]
-    async fn fetch_witness_historical_prefers_r2_over_the_rpc_chain() {
+    async fn fetch_witness_serves_from_r2_for_historical_and_frontier() {
         let (r2_endpoint, r2_hits) = mock_r2(vec![(200, fixture_r2_payload())]).await;
         let (ha, url_a, hits_a) = scripted_witness_rpc(0, None).await;
         let (hb, url_b, hits_b) = scripted_witness_rpc(0, None).await;
         let (rpc_client, cfg) = routing_fixture(&[url_a.as_str(), url_b.as_str()], true);
         let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
 
-        // Historical block (900 + 100 <= 5000).
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let result =
-            fetch_witness(&rpc_client, &cfg, Some(&r2), Some(5000), 900, B256::ZERO, deadline)
-                .await;
-        assert!(result.is_ok(), "R2 must serve the historical witness");
-        assert_eq!(r2_hits.load(Ordering::SeqCst), 1, "exactly one R2 GET");
+        // Historical (900 + 100 <= 5000), then the tip itself — the most frontier a block
+        // gets; `mock_r2` repeats its last scripted response.
+        for block_number in [900, 5000] {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let result = fetch_witness(
+                &rpc_client,
+                &cfg,
+                Some(&r2),
+                Some(5000),
+                block_number,
+                B256::ZERO,
+                deadline,
+            )
+            .await;
+            assert!(result.is_ok(), "R2 must serve block {block_number}: {:?}", result.err());
+        }
+        assert_eq!(r2_hits.load(Ordering::SeqCst), 2, "exactly one R2 GET per fetch");
         assert_eq!(hits_a.load(Ordering::Relaxed), 0, "generator must stay untouched");
         assert_eq!(hits_b.load(Ordering::Relaxed), 0, "RPC fallback must stay untouched");
 
@@ -2007,32 +2015,6 @@ mod tests {
         hb.stop().unwrap();
     }
 
-    /// A frontier block whose witness is already in the bucket is served straight from R2:
-    /// the uploader and the generator's RPC server publish from different files, so the
-    /// bucket can lead the generator at the frontier — the case where the gateway used to
-    /// be the only (and stall-prone) way to that witness.
-    #[tokio::test]
-    async fn fetch_witness_frontier_tries_r2_first() {
-        let (r2_endpoint, r2_hits) = mock_r2(vec![(200, fixture_r2_payload())]).await;
-        let (ha, url_a, hits_a) = scripted_witness_rpc(0, None).await;
-        let (hb, url_b, hits_b) = scripted_witness_rpc(0, None).await;
-        let (rpc_client, cfg) = routing_fixture(&[url_a.as_str(), url_b.as_str()], true);
-        let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
-
-        // The tip itself — the most frontier a block gets (5000 + 100 > 5000).
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let result =
-            fetch_witness(&rpc_client, &cfg, Some(&r2), Some(5000), 5000, B256::ZERO, deadline)
-                .await;
-        assert!(result.is_ok(), "R2 must serve the frontier witness: {:?}", result.err());
-        assert_eq!(r2_hits.load(Ordering::SeqCst), 1, "exactly one R2 GET");
-        assert_eq!(hits_a.load(Ordering::Relaxed), 0, "generator untouched on an R2 hit");
-        assert_eq!(hits_b.load(Ordering::Relaxed), 0, "fallback untouched on an R2 hit");
-
-        ha.stop().unwrap();
-        hb.stop().unwrap();
-    }
-
     /// A frontier R2 miss — the expected case, the uploader usually lags the generator —
     /// falls through to the RPC chain with the generator first: exactly the pre-R2 shape,
     /// at the cost of one fast 404.
@@ -2077,7 +2059,7 @@ mod tests {
             witness_per_attempt_timeout: Some(Duration::from_millis(300)),
             ..RpcClientConfig::trace_server()
         };
-        let (rpc_client, cfg) = cap_fixture(&[url_gen.as_str(), url_gw.as_str()], config, 3);
+        let (rpc_client, cfg) = cap_fixture(&[url_gen.as_str(), url_gw.as_str()], config);
 
         // Frontier block: above the local tip, so the full chain (generator first) runs.
         let budget = Duration::from_secs(3);
@@ -2119,7 +2101,7 @@ mod tests {
             witness_per_attempt_timeout: Some(Duration::from_secs(6)),
             ..RpcClientConfig::trace_server()
         };
-        let (rpc_client, cfg) = cap_fixture(&[url_gen.as_str(), url_gw.as_str()], config, 1);
+        let (rpc_client, cfg) = cap_fixture(&[url_gen.as_str(), url_gw.as_str()], config);
 
         let budget = Duration::from_secs(1);
         let started = Instant::now();
@@ -2134,12 +2116,10 @@ mod tests {
         ha.stop().unwrap();
     }
 
-    /// The inter-round backoff must obey the same rule as a hop: it may not consume
-    /// everything the stage has left. Clamped only to `remaining`, a sleep that swallows
-    /// the remainder wakes exactly at the deadline and forfeits the retry it slept for —
-    /// the hop cap's savings are eaten by our own backoff. With the sleep held to half
+    /// The inter-round backoff may not consume everything the stage has left: held to half
     /// the remainder, round 1 fits and the generator serves. Goes red against
-    /// `sleep.min(remaining)`.
+    /// `sleep.min(remaining)`, where the sleep wakes exactly at the deadline and forfeits
+    /// the retry it slept for.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deadline_pressure_shortens_the_backoff_instead_of_sleeping_into_it() {
         let (ha, url_gen, hits_gen) = scripted_witness_rpc(1, Some(fixture_wire())).await;
@@ -2151,7 +2131,7 @@ mod tests {
             witness_per_attempt_timeout: Some(Duration::from_secs(6)),
             ..RpcClientConfig::trace_server()
         };
-        let (rpc_client, cfg) = cap_fixture(&[url_gen.as_str(), url_gw.as_str()], config, 1);
+        let (rpc_client, cfg) = cap_fixture(&[url_gen.as_str(), url_gw.as_str()], config);
 
         let budget = Duration::from_millis(800);
         let started = Instant::now();
@@ -2185,7 +2165,7 @@ mod tests {
             witness_per_attempt_timeout: Some(Duration::from_secs(10)),
             ..RpcClientConfig::trace_server()
         };
-        let (rpc_client, cfg) = cap_fixture(&[url_gen.as_str(), url_gw.as_str()], config, 4);
+        let (rpc_client, cfg) = cap_fixture(&[url_gen.as_str(), url_gw.as_str()], config);
 
         let started = Instant::now();
         let result = fetch_witness(

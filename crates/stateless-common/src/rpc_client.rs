@@ -133,13 +133,13 @@ pub struct RpcClientConfig {
     /// budget sits below `per_attempt_timeout`, so `min(per_attempt, remaining)` always
     /// resolves to `remaining` and the first stalled endpoint can legally consume the
     /// entire stage — leaving no budget for another rotation, which is what turns one slow
-    /// hop into a client-visible timeout. The trace server sets half its witness stage
-    /// budget, so any single hop leaves at least half the stage for the rest of the chain.
-    /// The value is a ceiling, not the effective cap: each deadline-bound witness chain
-    /// entry tightens it to `min(cap, per_attempt_timeout, remaining / 2)`, so an
-    /// operator's stricter global per-attempt timeout is honored, and a stage that
-    /// already lost budget (the old-block clamp, a slow R2 pre-try) still keeps one
-    /// rotation possible instead of letting the first stalled hop consume what is left.
+    /// hop into a client-visible timeout. Each deadline-bound witness chain entry tightens
+    /// the value to `min(cap, per_attempt_timeout, remaining / 2)`: a stricter global
+    /// per-attempt timeout is honored, and a stage that entered the chain with less budget
+    /// than the cap still keeps one rotation possible. The `remaining / 2` term makes this
+    /// value a ceiling rather than the operative cap whenever the caller's deadline stays
+    /// within the budget the ceiling was derived from — it binds only when an outer
+    /// deadline can exceed that budget.
     ///
     /// Deadline-less witness fetches (the chain-sync prefetch) deliberately keep the
     /// general cap: with unbounded rounds, cutting a deterministically-slow-but-honest
@@ -1240,10 +1240,8 @@ where
             if remaining_ms == 0 {
                 return Err(record_deadline(GiveUpPhase::BeforeBackoff, round));
             }
-            // Never sleep into more than half of what is left: clamped to `remaining`,
-            // a backoff that swallows the remainder wakes exactly at the deadline and
-            // forfeits the very retry it was sleeping for — the sleep exists solely to
-            // enable another attempt, so it must never be the thing that prevents one.
+            // Half of what is left, not all of it: a sleep that swallows the remainder
+            // wakes exactly at the deadline and forfeits the retry it was sleeping for.
             sleep_ms = sleep_ms.min((remaining_ms / 2).max(1));
         }
         log_at!(
@@ -2180,63 +2178,49 @@ mod tests {
         handle.stop().unwrap();
     }
 
-    /// A saturated concurrency semaphore must not park a deadline-bound call past its
-    /// budget: the permit wait is selected against the deadline and gives up at it
-    /// (`phase="permit_wait_clamped"`), instead of waiting for an unrelated in-flight
-    /// attempt to free a permit and only then discovering the deadline. Goes red with a
-    /// bare `acquire().await`, which parks until the hog's per-attempt timeout fires
-    /// seconds later.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn saturated_permit_queue_fails_at_the_deadline_not_after_it() {
-        // Stalled provider: accepts connections, never answers (kept alive in scope).
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/", listener.local_addr().unwrap());
-        let _held = listener;
-
-        let config = RpcClientConfig {
-            witness_max_concurrent_requests: Some(1),
-            // Keeps the hog parked in its attempt well past the victim's deadline.
-            per_attempt_timeout: Duration::from_secs(5),
-            rpc_retry: BackoffPolicy::new(Duration::from_millis(20), Duration::from_millis(40)),
-            ..RpcClientConfig::trace_server()
-        };
-        let client = Arc::new(
-            RpcClient::new_with_config(&[url.as_str()], &[url.as_str()], config, None).unwrap(),
+    /// The witness path's own semaphore feeds the same deadline-clamped acquire as the
+    /// data path: a witness call queued on a saturated `witness_concurrency` gives up at
+    /// its deadline — with the give-up and the cut-short permit-wait sample recorded —
+    /// instead of parking until an unrelated in-flight attempt frees a permit.
+    /// `test_deadline_bounds_permit_wait` pins the same clamp on the data semaphore.
+    #[tokio::test]
+    async fn test_witness_deadline_bounds_permit_wait() {
+        let (client, metrics) = metered_client(
+            &[LOCALHOST_A],
+            &[LOCALHOST_A],
+            RpcClientConfig { witness_max_concurrent_requests: Some(1), ..Default::default() },
         );
+        // Hold the single witness permit for the whole test: the call stays queued and
+        // nothing is ever dialed.
+        let _held = client.witness_concurrency.acquire().await.unwrap();
 
-        // Hog: takes the only permit and stalls inside its attempt.
-        let hog = {
-            let client = Arc::clone(&client);
-            tokio::spawn(async move {
-                let _ = client
-                    .get_witness_light_with_deadline(
-                        1,
-                        B256::ZERO,
-                        Some(Instant::now() + Duration::from_secs(4)),
-                    )
-                    .await;
-            })
-        };
-        // Let the hog reach its attempt so the permit is genuinely held.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        let started = Instant::now();
-        let result = client
-            .get_witness_light_with_deadline(
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get_witness_light_with_deadline(
                 2,
                 B256::ZERO,
-                Some(Instant::now() + Duration::from_millis(300)),
-            )
-            .await;
-        let elapsed = started.elapsed();
+                Some(Instant::now() + Duration::from_millis(20)),
+            ),
+        )
+        .await
+        .expect("call must give up at its deadline instead of hanging")
+        .expect_err("no permit ever frees, so the call must exceed its deadline");
+        assert_eq!(err.method, RpcMethod::MegaGetBlockWitness);
 
-        assert!(result.is_err(), "the queued call must give up on its own deadline");
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "the give-up must happen at the deadline, not when the hog frees the permit \
-             ({elapsed:?})"
+        assert_eq!(
+            *metrics.deadlines.lock().unwrap(),
+            vec![RpcMethod::MegaGetBlockWitness],
+            "exactly one give-up per logical call",
         );
-        hog.abort();
+        assert_eq!(
+            *metrics.permit_waits.lock().unwrap(),
+            vec![RpcMethod::MegaGetBlockWitness],
+            "the cut-short wait still records a permit-wait sample",
+        );
+        assert!(
+            metrics.attempts.lock().unwrap().is_empty(),
+            "no attempt ran — the whole budget died in the permit queue",
+        );
     }
 
     /// A provider that accepts the TCP connection but never replies must be detected by the

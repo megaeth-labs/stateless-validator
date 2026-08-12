@@ -421,9 +421,9 @@ const R2_WITNESS_RETRIES_TOTAL: &str = "debug_trace_r2_witness_retries_total";
 /// that the R2 fast path is degrading. `kind="missing"` stays the bucket-integrity alarm:
 /// a frontier probe's miss is the expected ran-ahead-of-the-uploader outcome and is
 /// deliberately not counted here (it still lands on
-/// `witness_errors_total{source="witness_r2_frontier"}`). Frontier means the near-tip
-/// `data_provider::R2_FRONTIER_WINDOW` band, not the routing window: a miss anywhere past
-/// the band — including blocks still recent for witness routing — does count here.
+/// `witness_errors_total{source="witness_r2_frontier"}`); frontier = the near-tip
+/// `data_provider::R2_FRONTIER_WINDOW` band, deliberately narrower than the routing
+/// window (see its doc).
 const R2_WITNESS_ERRORS_TOTAL: &str = "debug_trace_r2_witness_errors_total";
 
 /// Records one retried R2 witness GET attempt.
@@ -638,7 +638,7 @@ fn pre_register_all_metrics() {
     let _ = DataSourceMetrics::new_for_source("witness_r2");
     let _ = DataSourceMetrics::new_for_source("witness_r2_frontier");
 
-    // Data Fetch Layer: R2 historical witness source
+    // Data Fetch Layer: R2 witness source
     counter!(R2_WITNESS_RETRIES_TOTAL).increment(0);
     for kind in crate::r2_witness::R2WitnessError::KINDS {
         counter!(R2_WITNESS_ERRORS_TOTAL, "kind" => *kind).increment(0);
