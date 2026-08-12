@@ -223,9 +223,11 @@ impl RpcContext {
     /// The shared by-number prelude, encoding the reorg-safety invariant once for both
     /// by-number handlers: resolve tag -> number -> canonical hash (local index first)
     /// *before* the cache lookup, all on one request deadline; on a miss, fetch block data
-    /// by the resolved hash on the remaining budget. Slow prelude stages are warned about
-    /// here, where they are measured; trace/serialize timing lives in
-    /// [`compute_block_trace`] and cache-insert timing in [`insert_cache`].
+    /// by the resolved hash + number on the remaining budget (a tag resolution already
+    /// bound number -> hash in its one upstream response, so it skips the canonical-hash
+    /// step). Slow prelude stages are warned about here, where they are measured;
+    /// trace/serialize timing lives in [`compute_block_trace`] and cache-insert timing in
+    /// [`insert_cache`].
     async fn lookup_block_by_number(
         &self,
         method: &'static str,
@@ -237,7 +239,7 @@ impl RpcContext {
         let deadline = self.data_provider.fetch_deadline();
 
         let t0 = Instant::now();
-        let block_num =
+        let (block_num, tag_hash) =
             self.data_provider.resolve_block_number(block_number, deadline).await.map_err(|e| {
                 metrics::record_rpc_error(method);
                 rpc_err(format!("Failed to resolve block number: {e}"))
@@ -246,11 +248,15 @@ impl RpcContext {
         tracing::Span::current().record("block_number", block_num);
 
         let t1 = Instant::now();
-        let block_hash =
-            self.data_provider.resolve_canonical_hash(block_num, deadline).await.map_err(|e| {
-                metrics::record_rpc_error(method);
-                data_provider_error_to_rpc_error(&e)
-            })?;
+        let block_hash = match tag_hash {
+            Some(hash) => hash,
+            None => self.data_provider.resolve_canonical_hash(block_num, deadline).await.map_err(
+                |e| {
+                    metrics::record_rpc_error(method);
+                    data_provider_error_to_rpc_error(&e)
+                },
+            )?,
+        };
         let resolve_hash_ms = t1.elapsed().as_millis();
 
         if let Some(cached) =
@@ -262,12 +268,12 @@ impl RpcContext {
         let t2 = Instant::now();
         let data = self
             .data_provider
-            .get_block_data_by_hash_with_deadline(block_hash, deadline)
+            .get_block_data(block_hash, Some(block_num), deadline)
             .await
             .map_err(|e| {
-                metrics::record_rpc_error(method);
-                data_provider_error_to_rpc_error(&e)
-            })?;
+            metrics::record_rpc_error(method);
+            data_provider_error_to_rpc_error(&e)
+        })?;
         let fetch_ms = t2.elapsed().as_millis();
 
         if resolve_ms >= SLOW_STAGE_THRESHOLD_MS ||
@@ -1033,7 +1039,7 @@ mod tests {
         };
 
         let chain_spec = ChainSpec::from_genesis(
-            TestFixtures::synthetic().load_genesis().expect("fixture genesis"),
+            TestFixtures::synthetic_shared().load_genesis().expect("fixture genesis"),
         );
 
         // Request-attributable: healthy cached data plus an unparsable mux config.
