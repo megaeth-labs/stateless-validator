@@ -133,13 +133,13 @@ pub struct RpcClientConfig {
     /// budget sits below `per_attempt_timeout`, so `min(per_attempt, remaining)` always
     /// resolves to `remaining` and the first stalled endpoint can legally consume the
     /// entire stage — leaving no budget for another rotation, which is what turns one slow
-    /// hop into a client-visible timeout. Each deadline-bound witness chain entry tightens
-    /// the value to `min(cap, per_attempt_timeout, remaining / 2)`: a stricter global
-    /// per-attempt timeout is honored, and a stage that entered the chain with less budget
-    /// than the cap still keeps one rotation possible. The `remaining / 2` term makes this
-    /// value a ceiling rather than the operative cap whenever the caller's deadline stays
-    /// within the budget the ceiling was derived from — it binds only when an outer
-    /// deadline can exceed that budget.
+    /// hop into a client-visible timeout. Deadline-bound witness attempts therefore run
+    /// under `AttemptCap::ReserveHalf`: each attempt's window is
+    /// `min(cap, per_attempt_timeout, remaining / 2)`, with the halving recomputed as the
+    /// attempt starts — after any concurrency-permit wait — so neither a stalled hop nor a
+    /// long permit queue can consume everything the call has left. The configured value is
+    /// a ceiling rather than the operative cap whenever the caller's deadline stays within
+    /// the budget it was derived from — the halving term is then always at least as tight.
     ///
     /// Deadline-less witness fetches (the chain-sync prefetch) deliberately keep the
     /// general cap: with unbounded rounds, cutting a deterministically-slow-but-honest
@@ -422,7 +422,7 @@ impl RpcClient {
             &self.data_provider_labels,
             &self.data_concurrency,
             &self.config.rpc_retry,
-            self.config.per_attempt_timeout,
+            AttemptCap::Fixed(self.config.per_attempt_timeout),
             rr_start,
             method,
             self.config.metrics.as_ref(),
@@ -726,23 +726,25 @@ impl RpcClient {
             "witness provider range ({providers:?}) must select at least one of {} providers",
             self.witness_providers.len()
         );
-        // Tightest of three bounds — `witness_per_attempt_timeout` documents the full
-        // contract. Code-local specifics: the half-of-remaining term is frozen once at
-        // chain entry (not per attempt), so one rotation stays possible without
-        // geometrically starving later rounds; a deadline-less fetch keeps the general
-        // cap, since it must be able to out-wait transfers slower than the witness cap.
-        let per_attempt = match (deadline, self.config.witness_per_attempt_timeout) {
-            (Some(d), Some(cap)) => cap
-                .min(self.config.per_attempt_timeout)
-                .min(d.saturating_duration_since(Instant::now()) / 2),
-            _ => self.config.per_attempt_timeout,
+        // Deadline-bound witness attempts run under the reserve-half policy: the tightest of
+        // the configured ceiling, the general per-attempt timeout, and — recomputed at each
+        // attempt, after any permit wait — half of what the call still has, so neither a
+        // stalled hop nor a long permit queue can leave the rotation nothing
+        // (`witness_per_attempt_timeout` documents the full contract). A deadline-less fetch
+        // keeps the general cap, since it must be able to out-wait transfers slower than the
+        // witness cap.
+        let attempt_cap = match (deadline, self.config.witness_per_attempt_timeout) {
+            (Some(_), Some(cap)) => {
+                AttemptCap::ReserveHalf { ceiling: cap.min(self.config.per_attempt_timeout) }
+            }
+            _ => AttemptCap::Fixed(self.config.per_attempt_timeout),
         };
         round_robin_with_backoff(
             &self.witness_providers[providers.clone()],
             &self.witness_provider_labels[providers],
             &self.witness_concurrency,
             &self.config.rpc_retry,
-            per_attempt,
+            attempt_cap,
             0,
             RpcMethod::MegaGetBlockWitness,
             self.config.metrics.as_ref(),
@@ -982,6 +984,25 @@ impl GiveUpPhase<'_> {
     }
 }
 
+/// Per-attempt time-cap policy for [`round_robin_with_backoff`].
+enum AttemptCap {
+    /// Every attempt gets `min(cap, remaining budget)` — the general shape: the cap detects
+    /// a stalled provider, and near the deadline an attempt may use everything left.
+    Fixed(Duration),
+    /// Deadline-bound attempts get `min(ceiling, remaining / 2)`, recomputed when the
+    /// attempt starts — after any permit wait — so no single hop can consume everything the
+    /// call still has, however long it queued. Once half the remainder drops below
+    /// [`MIN_RESERVE_HALF_ATTEMPT`] the reserve stops buying a useful follow-up hop, and
+    /// the attempt takes the remainder whole (the fixed-cap shape). Without a deadline the
+    /// ceiling alone applies.
+    ReserveHalf { ceiling: Duration },
+}
+
+/// Smallest attempt window worth reserving budget past: below this a witness round trip
+/// cannot complete anyway, so [`AttemptCap::ReserveHalf`] hands the tail to one final
+/// attempt instead of splitting it into unwinnable micro-attempts.
+const MIN_RESERVE_HALF_ATTEMPT: Duration = Duration::from_millis(25);
+
 /// Runs a round-robin RPC call with round-level exponential backoff and an optional deadline.
 ///
 /// Each round attempts every provider once in round-robin starting at `rr_start`. If any
@@ -1002,7 +1023,7 @@ impl GiveUpPhase<'_> {
 /// endpoint's index in the full list at construction, so slicing never misattributes an
 /// attempt.
 // 10-argument retry primitive. Each field plays a distinct role (providers, their metric/log
-// labels, concurrency, backoff policy, per-attempt timeout, starting provider, method label,
+// labels, concurrency, backoff policy, per-attempt cap policy, starting provider, method label,
 // metrics sink, deadline, per-attempt closure) and bundling them into a struct would be ceremony
 // without encapsulation — there are exactly two call sites in this crate. Prefer clarity at the
 // definition over fewer commas at the call. `provider_labels` is parallel to `providers` by index.
@@ -1012,7 +1033,7 @@ async fn round_robin_with_backoff<N, T>(
     provider_labels: &[Arc<str>],
     semaphore: &Semaphore,
     policy: &BackoffPolicy,
-    per_attempt_timeout: Duration,
+    attempt_cap: AttemptCap,
     rr_start: usize,
     method: RpcMethod,
     metrics: Option<&Arc<dyn RpcMetrics>>,
@@ -1116,13 +1137,23 @@ where
             // and success/error counters reflect what actually happened in the retry loop
             // rather than always showing "success" with the cumulative logical-call time.
             let attempt_start = Instant::now();
-            // Bound every attempt by `per_attempt_timeout` — applied even with `deadline =
-            // None` so a provider that accepts the TCP connection but never replies cannot
-            // wedge the retry loop. With `deadline = Some(d)` the attempt is further capped
-            // by `d - now` so we never sleep past the caller's budget.
-            let attempt_timeout = match deadline {
-                Some(d) => d.saturating_duration_since(Instant::now()).min(per_attempt_timeout),
-                None => per_attempt_timeout,
+            // Bound every attempt by the cap policy — applied even with `deadline = None`
+            // so a provider that accepts the TCP connection but never replies cannot wedge
+            // the retry loop. With `deadline = Some(d)` the window is further clamped so we
+            // never sleep past the caller's budget; `ReserveHalf` recomputes its halving
+            // here, post-permit, so queue time already spent cannot inflate the window.
+            let attempt_timeout = match (deadline, &attempt_cap) {
+                (None, AttemptCap::Fixed(cap) | AttemptCap::ReserveHalf { ceiling: cap }) => *cap,
+                (Some(d), AttemptCap::Fixed(cap)) => {
+                    d.saturating_duration_since(Instant::now()).min(*cap)
+                }
+                (Some(d), AttemptCap::ReserveHalf { ceiling }) => {
+                    let remaining = d.saturating_duration_since(Instant::now());
+                    let half = remaining / 2;
+                    // Below the useful minimum the reserve no longer buys a follow-up hop;
+                    // hand the tail to this attempt whole instead of micro-slicing it.
+                    if half >= MIN_RESERVE_HALF_ATTEMPT { half } else { remaining }.min(*ceiling)
+                }
             };
             // Classify the attempt into a value or a (typed error, reason) pair, so the failure
             // reason — a returned error vs a per-attempt stall — survives to the metrics and logs.
@@ -2221,6 +2252,57 @@ mod tests {
             metrics.attempts.lock().unwrap().is_empty(),
             "no attempt ran — the whole budget died in the permit queue",
         );
+    }
+
+    /// A long permit wait must not defeat the rotation reserve: `ReserveHalf` recomputes
+    /// its halving after the permit is acquired, so a call that spent most of its budget
+    /// queued still splits what is left across providers. Goes red with the cap frozen at
+    /// chain entry — post-queue `min(entry_cap, remaining)` hands the stalled primary
+    /// everything that is left and the fallback is never tried.
+    #[tokio::test]
+    async fn test_reserve_half_recomputes_after_permit_wait() {
+        // Primary stalls (accepts, never answers); the fallback answers junk fast — any
+        // completed round trip against it proves the rotation reached it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url_a = format!("http://{}/", listener.local_addr().unwrap());
+        let _held_open = listener;
+        let order = Arc::new(std::sync::Mutex::new(Vec::<char>::new()));
+        let (hb, url_b) = start_ordered_witness_rpc('B', order).await;
+
+        let (client, metrics) = metered_client(
+            &[url_b.as_str()],
+            &[url_a.as_str(), url_b.as_str()],
+            RpcClientConfig {
+                witness_max_concurrent_requests: Some(1),
+                witness_per_attempt_timeout: Some(Duration::from_millis(300)),
+                rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
+                ..Default::default()
+            },
+        );
+
+        // Hold the only witness permit for 500ms of the call's 800ms budget.
+        let permit = Arc::clone(&client.witness_concurrency).acquire_owned().await.unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            drop(permit);
+        });
+
+        let deadline = Instant::now() + Duration::from_millis(800);
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get_witness_light_with_deadline(1, B256::ZERO, Some(deadline)),
+        )
+        .await
+        .expect("call must give up by its deadline");
+
+        let attempts = metrics.attempts.lock().unwrap();
+        let providers: std::collections::HashSet<&str> =
+            attempts.iter().map(|(_, p, _)| p.as_str()).collect();
+        assert!(
+            providers.len() >= 2,
+            "post-queue halving must leave the fallback a window: {attempts:?}",
+        );
+        hb.stop().unwrap();
     }
 
     /// A provider that accepts the TCP connection but never replies must be detected by the

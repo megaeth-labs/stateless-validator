@@ -41,6 +41,11 @@ pub enum R2WitnessError {
     /// witness in R2. Deterministic; not retried.
     #[error("R2 witness for block {number} (key {key}) failed to decode: {source}")]
     Decode { number: u64, key: String, source: WitnessDecodingError },
+    /// The decode outran what was left of the caller's deadline — an oversized or
+    /// pathological object. The caller falls back with its reserved share of the stage;
+    /// the blocking decode itself cannot be cancelled and finishes in the background.
+    #[error("R2 witness decode for block {number} (key {key}) outran the deadline")]
+    DecodeTimeout { number: u64, key: String },
     /// The decode task panicked. This is a bug in our own decoder, not a problem with the
     /// data in R2, so it is kept out of [`Self::Decode`].
     #[error("R2 witness decode task for block {number} (key {key}) panicked: {source}")]
@@ -57,6 +62,7 @@ impl R2WitnessError {
         "connect",
         "deadline",
         "decode",
+        "decode_timeout",
         "decode_panicked",
     ];
 
@@ -66,6 +72,7 @@ impl R2WitnessError {
         match self {
             Self::Get(e) => e.kind(),
             Self::Decode { .. } => "decode",
+            Self::DecodeTimeout { .. } => "decode_timeout",
             Self::DecodePanicked { .. } => "decode_panicked",
         }
     }
@@ -135,18 +142,36 @@ impl R2WitnessSource {
         // reported on its own series instead of being subtracted the way the validator's
         // throughput pipeline does.
         metrics::record_r2_witness_queue_wait(fetched.queue_wait.as_secs_f64());
-        let bytes = fetched.bytes;
+        decode_light_with_deadline(fetched.bytes, number, hash, deadline).await
+    }
+}
 
-        // zstd + bincode over a multi-MB witness is CPU-bound; keep it off the runtime.
-        let key = || keys::block_object_key(number, hash);
-        match tokio::task::spawn_blocking(move || decode_witness_payload_light(&bytes)).await {
-            Ok(Ok(witness)) => {
-                trace!(number, "R2 witness fetched and light-decoded");
-                Ok(witness)
-            }
-            Ok(Err(source)) => Err(R2WitnessError::Decode { number, key: key(), source }),
-            Err(source) => Err(R2WitnessError::DecodePanicked { number, key: key(), source }),
+/// Light-decodes `bytes` on the blocking pool, bounded by the same `deadline` as the GET —
+/// an oversized or pathological object must not eat the RPC fallback's share of the stage.
+/// On timeout the blocking task is abandoned (it cannot be cancelled) and finishes in the
+/// background.
+async fn decode_light_with_deadline(
+    bytes: bytes::Bytes,
+    number: u64,
+    hash: B256,
+    deadline: Instant,
+) -> Result<(LightWitness, MptWitness), R2WitnessError> {
+    let key = || keys::block_object_key(number, hash);
+    // A GET that lands right at the deadline gets no decode at all — nothing would wait
+    // for it.
+    if Instant::now() >= deadline {
+        return Err(R2WitnessError::DecodeTimeout { number, key: key() });
+    }
+    // zstd + bincode over a multi-MB witness is CPU-bound; keep it off the runtime.
+    let decode = tokio::task::spawn_blocking(move || decode_witness_payload_light(&bytes));
+    match tokio::time::timeout_at(deadline.into(), decode).await {
+        Ok(Ok(Ok(witness))) => {
+            trace!(number, "R2 witness fetched and light-decoded");
+            Ok(witness)
         }
+        Ok(Ok(Err(source))) => Err(R2WitnessError::Decode { number, key: key(), source }),
+        Ok(Err(source)) => Err(R2WitnessError::DecodePanicked { number, key: key(), source }),
+        Err(_) => Err(R2WitnessError::DecodeTimeout { number, key: key() }),
     }
 }
 
@@ -246,5 +271,23 @@ mod tests {
         let err = source(&endpoint).get_witness_light(1, B256::ZERO, deadline()).await.unwrap_err();
         assert!(matches!(err, R2WitnessError::Decode { .. }), "{err}");
         assert_eq!(err.kind(), "decode");
+    }
+
+    /// A decode that outruns the deadline is abandoned so the caller falls back on its
+    /// reserved budget share, instead of the object holding the witness stage hostage.
+    /// Driven through the extracted decode step with the deadline already gone — the
+    /// GET-succeeds-then-decode-overruns timing cannot be scripted deterministically.
+    #[tokio::test]
+    async fn decode_past_the_deadline_surfaces_decode_timeout() {
+        let (salt_witness, mpt_witness): (_, MptWitness) =
+            TestFixtures::mainnet_shared().first_paired_witness();
+        let (_, payload) = stateless_common::encode_witness_payload(&salt_witness, &mpt_witness)
+            .expect("fixture witness must encode");
+
+        let err = decode_light_with_deadline(payload.into(), 1, B256::ZERO, Instant::now())
+            .await
+            .expect_err("an already-elapsed deadline must abandon the decode");
+        assert!(matches!(err, R2WitnessError::DecodeTimeout { .. }), "{err}");
+        assert_eq!(err.kind(), "decode_timeout");
     }
 }

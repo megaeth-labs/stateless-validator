@@ -1111,11 +1111,16 @@ fn is_historical(db_tip: Option<u64>, block_number: u64, local_window: u64) -> b
 }
 
 /// Whether a block sits in the [`R2_FRONTIER_WINDOW`] near-tip band, where an R2 `missing`
-/// is expected probe-ahead rather than a bucket hole. Unknown tip counts as frontier: with
-/// no anchor, nothing is known to be uploaded (`validate_args` requires `--data-dir` for R2
-/// precisely so this stays a cold-start transient, not the steady state).
+/// is expected probe-ahead rather than a bucket hole. The band is two-sided: blocks more
+/// than the band *above* the local tip get no exemption either — with a healthy tip they
+/// cannot resolve at all (the tip tracks the real head), so reaching here means chain sync
+/// is behind, and a stale tip says nothing about uploader lag for blocks in the catch-up
+/// gap; fail toward the alarm. Unknown tip counts as frontier: with no anchor, nothing is
+/// known to be uploaded (`validate_args` requires `--data-dir` for R2 precisely so this
+/// stays a cold-start transient, not the steady state).
 fn is_r2_frontier(db_tip: Option<u64>, block_number: u64) -> bool {
-    !is_historical(db_tip, block_number, R2_FRONTIER_WINDOW)
+    !is_historical(db_tip, block_number, R2_FRONTIER_WINDOW) &&
+        db_tip.is_none_or(|tip| block_number <= tip.saturating_add(R2_FRONTIER_WINDOW))
 }
 
 /// Witness route for a block: how many leading witness endpoints to skip, plus the metrics
@@ -1478,6 +1483,12 @@ mod tests {
         assert!(is_r2_frontier(Some(5000), 5000), "the tip itself");
         assert!(is_r2_frontier(Some(5000), 5000 - R2_FRONTIER_WINDOW + 1), "just inside");
         assert!(!is_r2_frontier(Some(5000), 5000 - R2_FRONTIER_WINDOW), "just past the band");
+        assert!(is_r2_frontier(Some(5000), 5000 + R2_FRONTIER_WINDOW), "just above, in band");
+        // A stale, catching-up tip must not silence holes across the whole gap above it.
+        assert!(
+            !is_r2_frontier(Some(5000), 5000 + R2_FRONTIER_WINDOW + 1),
+            "far above a stale tip is unknown territory, not uploader lag",
+        );
         // The band a routing-window gate would have silenced: recent for routing, far past
         // any plausible uploader lag.
         let recent_not_tip = 4000;
