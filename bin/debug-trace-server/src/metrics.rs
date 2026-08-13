@@ -483,13 +483,18 @@ pub fn record_request_shape(method: &'static str, shape: &'static str) {
     counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => shape).increment(1);
 }
 
-/// R2 historical-witness GET retries (one increment per retried attempt).
+/// R2 witness GET retries (one increment per retried attempt).
 const R2_WITNESS_RETRIES_TOTAL: &str = "debug_trace_r2_witness_retries_total";
 
-/// R2 historical-witness fetch failures, labeled by `kind`
+/// R2 witness fetch failures, labeled by `kind`
 /// (see `crate::r2_witness::R2WitnessError::KINDS`). Failures here are not user-visible
 /// errors — the witness stage falls back to the RPC chain — so this counter is the signal
-/// that the R2 fast path is degrading.
+/// that the R2 fast path is degrading. `kind="missing"` stays the bucket-integrity alarm:
+/// a frontier probe's miss is the expected ran-ahead-of-the-uploader outcome and is
+/// deliberately not counted here (it still lands on
+/// `witness_errors_total{source="witness_r2_frontier"}`); frontier = the near-tip
+/// `data_provider::R2_FRONTIER_WINDOW` band, deliberately narrower than the routing
+/// window (see its doc).
 const R2_WITNESS_ERRORS_TOTAL: &str = "debug_trace_r2_witness_errors_total";
 
 /// Records one retried R2 witness GET attempt.
@@ -727,12 +732,15 @@ fn pre_register_all_metrics() {
     let _ = DataSourceMetrics::new_for_source("witness_generator");
     let _ = DataSourceMetrics::new_for_source("witness_historical");
     let _ = DataSourceMetrics::new_for_source("witness_r2");
+    let _ = DataSourceMetrics::new_for_source("witness_r2_frontier");
 
-    // Data Fetch Layer: R2 historical witness source
+    // Data Fetch Layer: R2 witness source
     counter!(R2_WITNESS_RETRIES_TOTAL).increment(0);
     for kind in crate::r2_witness::R2WitnessError::KINDS {
         counter!(R2_WITNESS_ERRORS_TOTAL, "kind" => *kind).increment(0);
     }
+    counter!(R2_WITNESS_ERRORS_TOTAL, "kind" => crate::r2_witness::KIND_MISSING_ABOVE_TIP)
+        .increment(0);
     let _ = histogram!(R2_WITNESS_QUEUE_WAIT_SECONDS);
 
     // Data Fetch Layer: single-flight
@@ -792,6 +800,7 @@ fn pre_register_all_metrics() {
     let _ = WitnessSourceMetrics::new_for_source("witness_generator");
     let _ = WitnessSourceMetrics::new_for_source("witness_historical");
     let _ = WitnessSourceMetrics::new_for_source("witness_r2");
+    let _ = WitnessSourceMetrics::new_for_source("witness_r2_frontier");
 
     // Execution Layer (per method)
     let _ = EvmExecutionMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);

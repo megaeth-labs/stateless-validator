@@ -3,10 +3,10 @@
 //! # Overview
 //! A standalone RPC server for `debug_*` and `trace_*` methods using stateless execution.
 //! Data can be fetched from upstream RPC endpoints or from a local database with chain sync.
-//! Request-serving witness fetches route by block age: historical blocks skip the internal
-//! generator endpoint (which only retains a small recent window) and go straight to the
-//! fallback endpoints — or, with the `--r2-*` flags, straight to the R2 bucket with the RPC
-//! chain as fallback. Chain-sync prefetch always uses the full chain.
+//! With the `--r2-*` flags every request-serving witness fetch tries the R2 bucket first,
+//! falling back to the RPC chain; the chain itself routes by block age — historical blocks
+//! skip the internal generator endpoint (which only retains a small recent window) and go
+//! straight to the fallback endpoints. Chain-sync prefetch always uses the full chain.
 //!
 //! # Architecture
 //! ```text
@@ -158,7 +158,9 @@ struct Args {
     #[clap(long, env = "DEBUG_TRACE_SERVER_START_BLOCK")]
     start_block: Option<String>,
 
-    /// Witness fetch timeout in seconds.
+    /// Witness fetch timeout in seconds. No single witness-chain attempt may run longer
+    /// than half of what the stage has left when the chain starts, so one stalled endpoint
+    /// can never consume the whole stage and starve the retry rotation.
     #[clap(
         long,
         env = "DEBUG_TRACE_SERVER_WITNESS_TIMEOUT",
@@ -311,9 +313,10 @@ struct Args {
     witness_old_block_timeout: Option<u64>,
 
     /// R2 S3 endpoint origin, e.g. `https://<account>.r2.cloudflarestorage.com` (no bucket
-    /// path). With `--r2-bucket` and the credential flags, historical witnesses are fetched
-    /// straight from the bucket, with the RPC witness chain as fallback; frontier blocks keep
-    /// the generator path. Requires a local DB (`--data-dir`) to anchor block age.
+    /// path). With `--r2-bucket` and the credential flags, every witness fetch tries the
+    /// bucket first, with the RPC witness chain as fallback — frontier probes usually miss
+    /// (one fast 404) while historical fetches are served here. Requires a local DB
+    /// (`--data-dir`) to anchor block age.
     #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ENDPOINT", requires_all = ["r2_bucket", "r2_access_key_id", "r2_secret_access_key"])]
     r2_endpoint: Option<String>,
 
@@ -474,13 +477,14 @@ fn validate_args(args: &Args) -> Result<()> {
             );
         }
     }
-    // The R2 historical route anchors block age to the local DB tip, so without --data-dir
-    // it can never fire. An operator who configured R2 asked for that route explicitly —
-    // fail closed instead of silently running the RPC-only setup R2 exists to replace.
+    // The R2 route anchors block age (frontier vs historical) to the local DB tip; without
+    // --data-dir every block would classify as frontier and a genuine bucket hole would
+    // never reach the `kind="missing"` alarm. An operator who configured R2 asked for the
+    // real route — fail closed instead of running a blind approximation.
     if args.r2_endpoint.is_some() && args.data_dir.is_none() {
         eyre::bail!(
-            "--r2-endpoint requires --data-dir: the R2 historical witness route anchors \
-             block age to the local DB tip and can never fire in stateless mode"
+            "--r2-endpoint requires --data-dir: the R2 witness route anchors block age \
+             (frontier vs historical) to the local DB tip"
         );
     }
     Ok(())
@@ -550,6 +554,10 @@ async fn main() -> Result<()> {
         data_max_concurrent_requests: args.data_max_concurrent_requests,
         witness_max_concurrent_requests: args.witness_max_concurrent_requests,
         per_attempt_timeout,
+        // Derived rather than flagged so it moves with --witness-timeout; a ceiling the
+        // per-entry halving normally undercuts — the full contract lives on
+        // `RpcClientConfig::witness_per_attempt_timeout`.
+        witness_per_attempt_timeout: Some(std::time::Duration::from_secs(args.witness_timeout) / 2),
         ..rpc_defaults
     }
     .with_metrics(Arc::new(metrics::TraceRpcMetrics));
@@ -580,7 +588,7 @@ async fn main() -> Result<()> {
         ),
     }
 
-    // Direct-from-R2 historical witness source. Clap's `requires` wiring makes the four
+    // Direct-from-R2 witness source. Clap's `requires` wiring makes the four
     // `--r2-*` flags all-or-nothing and `validate_args` rejects empty values and the
     // data-dir-less combination, so matching on the quad only splits "configured" from
     // "absent". Shares the RPC path's per-attempt timeout and retry pacing.
