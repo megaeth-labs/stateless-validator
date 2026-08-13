@@ -444,6 +444,14 @@ fn record_upstream_attempt(
         .record(duration_secs);
 }
 
+/// Time an upstream call spent queued behind our own concurrency cap, labeled `(method)`.
+const UPSTREAM_PERMIT_WAIT_SECONDS: &str = "debug_trace_upstream_permit_wait_seconds";
+
+/// Records one permit-queue wait sample; semantics on `RpcMetrics::on_rpc_permit_wait`.
+fn record_upstream_permit_wait(method: &'static str, wait_secs: f64) {
+    histogram!(UPSTREAM_PERMIT_WAIT_SECONDS, "method" => method).record(wait_secs);
+}
+
 /// Records one logical upstream call giving up because its overall deadline elapsed.
 fn record_upstream_deadline_exceeded(method: &'static str) {
     counter!(UPSTREAM_DEADLINE_EXCEEDED_TOTAL, "method" => method).increment(1);
@@ -734,12 +742,12 @@ fn pre_register_all_metrics() {
 
     // Data Fetch Layer: upstream RPC. The attempt series (`upstream_requests_total` /
     // `upstream_duration_seconds`) carry a dynamic per-endpoint `provider` label, so they first
-    // appear on the initial attempt; only the method-keyed deadline-exceeded counter is
-    // pre-registrable here.
+    // appear on the initial attempt; only the method-keyed series are pre-registrable here.
     for method in
         ["eth_getHeaderByHash", "eth_getBlockByHash", "mega_getWitness", "eth_getCodeByHash"]
     {
         counter!(UPSTREAM_DEADLINE_EXCEEDED_TOTAL, "method" => method).increment(0);
+        let _ = histogram!(UPSTREAM_PERMIT_WAIT_SECONDS, "method" => method);
     }
 
     // Request Layer: parameter shapes (per opts-taking method)
@@ -960,6 +968,10 @@ impl stateless_common::RpcMetrics for TraceRpcMetrics {
             outcome.as_str(),
             duration_secs,
         );
+    }
+
+    fn on_rpc_permit_wait(&self, method: stateless_common::metrics::RpcMethod, wait_secs: f64) {
+        record_upstream_permit_wait(upstream_label_for(method), wait_secs);
     }
 
     fn on_rpc_deadline_exceeded(

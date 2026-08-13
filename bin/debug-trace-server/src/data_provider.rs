@@ -500,7 +500,9 @@ impl DataProvider {
             *next = now + TIP_SEED_MIN_INTERVAL;
         }
         let deadline = deadline.min(now + TIP_SEED_TIMEOUT);
-        match self.rpc_client.get_latest_block_number_with_deadline(Some(deadline)).await {
+        // Best-effort: a deadline give-up here logs at debug in the retry loop instead of
+        // the operator-paging WARN — this probe's failure is degraded right below.
+        match self.rpc_client.get_latest_block_number_best_effort(Some(deadline)).await {
             Ok(tip) => {
                 record_canonical_hash_resolution("tip_seed", "ok");
                 self.observe_tip(tip);
