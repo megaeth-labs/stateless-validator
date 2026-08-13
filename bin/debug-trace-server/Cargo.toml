@@ -70,6 +70,7 @@ alloy-signer-local.workspace = true
 dotenvy.workspace = true
 flate2.workspace = true
 http-body-util.workspace = true
+metrics-util.workspace = true
 
 # HTTP client for integration tests
 reqwest = { workspace = true, features = ["blocking", "json"] }

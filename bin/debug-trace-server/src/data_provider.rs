@@ -217,6 +217,9 @@ pub enum DataProviderError {
     TransactionNotFound(B256),
     #[error("transaction {0} is pending")]
     TransactionPending(B256),
+    /// A block tag this server does not serve (`pending`) — client input, not a fault.
+    #[error("block tag {0} not supported")]
+    UnsupportedBlockTag(BlockNumberOrTag),
     #[error("{stage} fetch exceeded deadline after {elapsed:?}")]
     Timeout { stage: TimeoutStage, elapsed: Duration },
     /// Wrapped in `Arc` so [`shared_to_result`] can clone the pointer across coalesced
@@ -760,7 +763,9 @@ impl DataProvider {
         match tag {
             BlockNumberOrTag::Number(n) => Ok((n, None)),
             BlockNumberOrTag::Earliest => Ok((0, None)),
-            BlockNumberOrTag::Pending => Err(eyre::eyre!("Pending block not supported").into()),
+            BlockNumberOrTag::Pending => {
+                Err(DataProviderError::UnsupportedBlockTag(BlockNumberOrTag::Pending))
+            }
             BlockNumberOrTag::Latest | BlockNumberOrTag::Finalized | BlockNumberOrTag::Safe => {
                 let header = self
                     .rpc_client
@@ -986,6 +991,7 @@ fn shared_to_result(
         }
         DataProviderError::TransactionNotFound(h) => DataProviderError::TransactionNotFound(*h),
         DataProviderError::TransactionPending(h) => DataProviderError::TransactionPending(*h),
+        DataProviderError::UnsupportedBlockTag(t) => DataProviderError::UnsupportedBlockTag(*t),
         DataProviderError::Internal(e) => DataProviderError::Internal(Arc::clone(e)),
     })
 }
@@ -2138,8 +2144,8 @@ mod tests {
     /// `test_contract_hash_display`.
     #[test]
     fn error_and_hash_formatting() {
-        let pending = "Pending block not supported";
-        assert!(pending.contains("Pending") && pending.contains("not supported"));
+        let pending = DataProviderError::UnsupportedBlockTag(BlockNumberOrTag::Pending).to_string();
+        assert!(pending.contains("pending") && pending.contains("not supported"));
 
         let hash = B256::ZERO;
         let err = eyre::eyre!("Failed to fetch contract code {}: test error", hash).to_string();
