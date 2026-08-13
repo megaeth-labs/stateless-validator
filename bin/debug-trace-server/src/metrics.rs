@@ -72,18 +72,24 @@ const ALL_METHODS: &[&str] = &[
     METHOD_TRACE_TRANSACTION,
 ];
 
-fn resolve_method(method: &str) -> &'static str {
+/// Maps an arbitrary method string onto one of the known `&'static str` labels, so a
+/// caller that only has a borrowed name can still label a metric without allocating.
+/// Unknown methods collapse to `"unknown"`, keeping label cardinality bounded against
+/// arbitrary client input.
+pub fn resolve_method(method: &str) -> &'static str {
     ALL_METHODS.iter().find(|&&m| m == method).copied().unwrap_or("unknown")
 }
 
 /// RPC method metrics with method label.
+///
+/// `rpc_errors_total` deliberately does *not* live here: it needs a second `reason` label
+/// (see [`ErrorReason`]) and is emitted through [`record_rpc_error`] instead, so the two
+/// label sets never collide on one metric name.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
 pub struct RpcMethodMetrics {
     /// Total number of RPC requests
     rpc_requests_total: Counter,
-    /// Total number of RPC errors
-    rpc_errors_total: Counter,
     /// Duration of RPC method calls in seconds
     request_duration_seconds: Histogram,
 }
@@ -99,11 +105,73 @@ impl RpcMethodMetrics {
         self.rpc_requests_total.increment(1);
         self.request_duration_seconds.record(duration_secs);
     }
+}
 
-    /// Records an RPC error.
-    pub fn record_error(&self) {
-        self.rpc_errors_total.increment(1);
+/// Client-visible error outcomes, labeled `(method, reason)`.
+const RPC_ERRORS_TOTAL: &str = "debug_trace_rpc_errors_total";
+/// Requests abandoned by the client before the handler produced a response, labeled `(method)`.
+const RPC_REQUESTS_CANCELLED_TOTAL: &str = "debug_trace_requests_cancelled_total";
+/// Requests answered with a JSON `null` result because an underlying failure was
+/// deliberately degraded rather than surfaced, labeled `(method, reason)`.
+const RPC_NULL_RESULTS_TOTAL: &str = "debug_trace_null_results_total";
+
+/// Why a request failed, as seen by the client.
+///
+/// Exists because a single unlabeled error counter cannot answer the one question that
+/// matters operationally — "did anyone get a timeout?" — since a malformed `tracerConfig`
+/// (`-32602`), a missing transaction (`-32001`), a blown deadline (`-32001`) and a trace
+/// execution failure (`-32000`) otherwise collapse into the same series.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorReason {
+    /// The witness sub-deadline elapsed — the frontier-witness case operators must alert on.
+    DeadlineWitness,
+    /// The block-pipeline deadline elapsed (header, full block, contracts, tag resolution).
+    DeadlineBlock,
+    /// Deterministically absent: unknown transaction, or a transaction still pending.
+    NotFound,
+    /// Rejected at the boundary before any fetch — currently a type-malformed `tracerConfig`.
+    InvalidParams,
+    /// The tracer ran and failed, or its output could not be serialized.
+    TraceFailed,
+    /// Transport decode, DB, or another internal fault.
+    Internal,
+    /// Answered by the framework before the handler ran (unknown method, malformed
+    /// top-level params, unparsable batch entry) — recorded by the RPC middleware's
+    /// fallback, never by a handler.
+    Rejected,
+    /// An error response with a non-framework code left the server without a
+    /// handler-recorded reason — a handler ran but bypassed the error funnel. This series
+    /// sitting at nonzero is a code-drift alarm, not an operating state: it keeps a future
+    /// funnel bypass visible instead of silently absorbed into [`Self::Rejected`].
+    Unattributed,
+}
+
+impl ErrorReason {
+    /// The `reason` label value.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeadlineWitness => "deadline_witness",
+            Self::DeadlineBlock => "deadline_block",
+            Self::NotFound => "not_found",
+            Self::InvalidParams => "invalid_params",
+            Self::TraceFailed => "trace_failed",
+            Self::Internal => "internal",
+            Self::Rejected => "rejected",
+            Self::Unattributed => "unattributed",
+        }
     }
+
+    /// Every variant, for pre-registration and tests.
+    pub const ALL: &'static [Self] = &[
+        Self::DeadlineWitness,
+        Self::DeadlineBlock,
+        Self::NotFound,
+        Self::InvalidParams,
+        Self::TraceFailed,
+        Self::Internal,
+        Self::Rejected,
+        Self::Unattributed,
+    ];
 }
 
 /// Global RPC metrics (singleton).
@@ -394,7 +462,9 @@ fn record_upstream_deadline_exceeded(method: &'static str) {
 /// shapes bypass the response cache.
 const REQUEST_SHAPE_TOTAL: &str = "debug_trace_request_shape_total";
 
-/// Every label emitted by `RequestShape::label`, for pre-registration and tests.
+/// Every label emitted by `RequestShape::label`, for pre-registration and tests — plus
+/// `rejected`, recorded by the RPC middleware for requests the framework answered before
+/// the handler ran (see [`record_framework_rejection`]).
 pub const REQUEST_SHAPES: &[&str] = &[
     "default",
     "call_tracer",
@@ -405,6 +475,7 @@ pub const REQUEST_SHAPES: &[&str] = &[
     "struct_logger_config",
     "js_tracer",
     "mux_tracer",
+    "rejected",
 ];
 
 /// Records one request of the given parameter shape for `method`.
@@ -458,6 +529,9 @@ const CANONICAL_HASH_RESOLUTION_TOTAL: &str = "debug_trace_canonical_hash_resolu
 /// error, and upstream has no miss — a missing block is an error from the retry loop).
 /// `source = "tip_seed"` (`"ok"` | `"error"`) counts the throttled `eth_blockNumber`
 /// fetches that teach the memo's depth gate the tip when no other tip source exists.
+/// `source = "tag"` (`"ok"` | `"error"`) counts `latest`/`finalized`/`safe` resolutions,
+/// which bind number → hash in their single header fetch instead of resolving through
+/// the tiers above.
 pub fn record_canonical_hash_resolution(source: &'static str, outcome: &'static str) {
     counter!(CANONICAL_HASH_RESOLUTION_TOTAL, "source" => source, "outcome" => outcome)
         .increment(1);
@@ -590,12 +664,34 @@ impl ChainSyncMetrics {
 
 /// Pre-registers all metrics so they appear in Prometheus from startup (with zero values).
 fn pre_register_all_metrics() {
-    // Request Layer: RPC method metrics
+    // Request Layer: RPC method metrics — every method that can record a served request,
+    // including the cache-status endpoint outside the trace pipeline.
     let _ = RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER);
     let _ = RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
     let _ = RpcMethodMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION);
     let _ = RpcMethodMetrics::new_for_method(METHOD_TRACE_BLOCK);
     let _ = RpcMethodMetrics::new_for_method(METHOD_TRACE_TRANSACTION);
+    let _ = RpcMethodMetrics::new_for_method(METHOD_DEBUG_GET_CACHE_STATUS);
+
+    // Request Layer: the accounting identity's error/cancellation terms. Pre-registering the
+    // full (method x reason) grid means a dashboard can subtract zeros instead of missing
+    // series, and `rate(...{reason="deadline_witness"})` alerts on absence from boot. Every
+    // known method participates — the middleware's cancelled/rejected terms cover them all —
+    // plus the `unknown` fold target `resolve_method` maps arbitrary client method names
+    // onto, which those same middleware terms label.
+    for method in ALL_METHODS.iter().copied().chain(["unknown"]) {
+        counter!(RPC_REQUESTS_CANCELLED_TOTAL, "method" => method).increment(0);
+        for reason in ErrorReason::ALL {
+            counter!(RPC_ERRORS_TOTAL, "method" => method, "reason" => reason.as_str())
+                .increment(0);
+        }
+    }
+    // Only Parity `trace_transaction` degrades a failure to a null result.
+    for reason in [ErrorReason::DeadlineWitness, ErrorReason::DeadlineBlock, ErrorReason::NotFound]
+    {
+        counter!(RPC_NULL_RESULTS_TOTAL, "method" => METHOD_TRACE_TRANSACTION, "reason" => reason.as_str())
+            .increment(0);
+    }
 
     // Request Layer: global
     let _ = RpcGlobalMetrics::create();
@@ -672,6 +768,15 @@ fn pre_register_all_metrics() {
             counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => *shape).increment(0);
         }
     }
+    // Arrival series for the opts-less methods: "default" at handler entry, "rejected"
+    // via the middleware fallback.
+    for method in [METHOD_TRACE_BLOCK, METHOD_TRACE_TRANSACTION, METHOD_DEBUG_GET_CACHE_STATUS] {
+        for shape in ["default", "rejected"] {
+            counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => shape).increment(0);
+        }
+    }
+    // The `unknown` fold target only ever arrives through the middleware's rejected pair.
+    counter!(REQUEST_SHAPE_TOTAL, "method" => "unknown", "shape" => "rejected").increment(0);
 
     // Data Fetch Layer: canonical number → hash resolution
     for (source, outcome) in [
@@ -684,6 +789,8 @@ fn pre_register_all_metrics() {
         ("upstream", "error"),
         ("tip_seed", "ok"),
         ("tip_seed", "error"),
+        ("tag", "ok"),
+        ("tag", "error"),
     ] {
         counter!(CANONICAL_HASH_RESOLUTION_TOTAL, "source" => source, "outcome" => outcome)
             .increment(0);
@@ -751,16 +858,82 @@ pub fn strip_timed_prefix(method: &str) -> &str {
     method.strip_prefix(TIMED_PREFIX).unwrap_or(method)
 }
 
+/// Resolves a wire method name (possibly `timed_`-prefixed, possibly arbitrary client
+/// input) to its bounded `&'static str` metric label.
+pub fn method_label(method: &str) -> &'static str {
+    resolve_method(strip_timed_prefix(method))
+}
+
 /// Records a successful RPC request.
 pub fn record_rpc_request(method: &str, duration_secs: f64) {
     let method = resolve_method(strip_timed_prefix(method));
     RpcMethodMetrics::new_for_method(method).record_request(duration_secs);
 }
 
-/// Records an RPC error for a specific method.
-pub fn record_rpc_error(method: &str) {
+/// Records a client-visible RPC error, attributed to `reason`.
+///
+/// Together with [`record_rpc_request`], [`record_request_cancelled`] and
+/// [`record_request_shape`] this closes the per-method accounting identity
+/// `request_shape_total = rpc_requests_total + rpc_errors_total + requests_cancelled_total`.
+pub fn record_rpc_error(method: &str, reason: ErrorReason) {
+    // Tell the RPC middleware's fallback this error response is already accounted for.
+    let _ = ERROR_SELF_REPORTED.try_with(|reported| reported.set(true));
     let method = resolve_method(strip_timed_prefix(method));
-    RpcMethodMetrics::new_for_method(method).record_error();
+    counter!(RPC_ERRORS_TOTAL, "method" => method, "reason" => reason.as_str()).increment(1);
+}
+
+tokio::task_local! {
+    /// Whether the current request's handler already recorded its error outcome.
+    /// Scoped per request by [`track_handler_errors`]; [`record_rpc_error`] sets it.
+    static ERROR_SELF_REPORTED: std::cell::Cell<bool>;
+}
+
+/// Runs one request future with error-outcome tracking, returning its response and
+/// whether the handler self-reported an error via [`record_rpc_error`].
+///
+/// This is what lets the RPC middleware close the last accounting gap: an error response
+/// produced without a handler record (unknown method, malformed top-level params — the
+/// framework answers before the handler runs) is otherwise invisible to every counter.
+/// The task-local is load-bearing only for the `-32602` ambiguity — the framework's
+/// param-parse rejection and a handler's `tracerConfig` rejection share the code, so no
+/// response-code inspection could tell them apart.
+pub async fn track_handler_errors<F: Future>(fut: F) -> (F::Output, bool) {
+    ERROR_SELF_REPORTED
+        .scope(std::cell::Cell::new(false), async move {
+            let out = fut.await;
+            let reported = ERROR_SELF_REPORTED.with(|reported| reported.get());
+            (out, reported)
+        })
+        .await
+}
+
+/// Records a request the framework rejected before its handler ran, as the balanced pair
+/// `request_shape_total{shape="rejected"}` + `rpc_errors_total{reason="rejected"}` — an
+/// arrival and an outcome, so the accounting identity holds for requests no handler saw.
+/// Takes the already-resolved label, like [`record_request_cancelled`].
+pub fn record_framework_rejection(method: &'static str) {
+    record_request_shape(method, "rejected");
+    record_rpc_error(method, ErrorReason::Rejected);
+}
+
+/// Records a request whose handler future was dropped before producing a response —
+/// in practice a client that hung up or timed out on its own side.
+///
+/// Recorded from the RPC middleware rather than the handlers: it is the only layer that
+/// observes every entry (single calls *and* batch entries) and still sees the drop.
+/// Takes the already-resolved label — the middleware's guard is the one resolution point.
+pub fn record_request_cancelled(method: &'static str) {
+    counter!(RPC_REQUESTS_CANCELLED_TOTAL, "method" => method).increment(1);
+}
+
+/// Records a request answered with a JSON `null` result after an underlying failure was
+/// deliberately degraded (the Parity `trace_*` compatibility behaviour).
+///
+/// The request still counts as served by [`record_rpc_request`], so the accounting identity
+/// holds; this counter is what keeps the swallowed failure visible instead of silent.
+pub fn record_null_result(method: &str, reason: ErrorReason) {
+    let method = resolve_method(strip_timed_prefix(method));
+    counter!(RPC_NULL_RESULTS_TOTAL, "method" => method, "reason" => reason.as_str()).increment(1);
 }
 
 /// Maps an [`RpcMethod`] to the `method` label used by the upstream attempt metrics.

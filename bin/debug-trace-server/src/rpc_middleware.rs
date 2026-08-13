@@ -24,7 +24,7 @@ use std::{
     borrow::Cow,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -113,6 +113,103 @@ fn stamp_entry_cpu(mut rp: MethodResponse, entry_cpu: &AtomicU64) -> MethodRespo
     rp
 }
 
+/// Counts a request whose future was dropped before it produced a response.
+///
+/// The drop is the only observable trace of a client hanging up: jsonrpsee cancels the
+/// handler by dropping its future, and every completion-time metric (`rpc_requests_total`,
+/// `rpc_errors_total`, `request_duration_seconds`) is by definition never reached. Placing
+/// the guard here rather than in the handlers is what makes it cover batch entries too —
+/// this layer is the only one that sees every entry.
+///
+/// Constructed *inside* the request future, so it arms on the first poll — the same poll
+/// that runs the handler's synchronous prefix and records the arrival. A future dropped
+/// before ever being polled therefore records neither side of the accounting identity.
+struct CancelGuard {
+    /// `None` once the request produced a response, which disarms the drop.
+    method: Option<&'static str>,
+    /// Batch-wide "the server aborted this batch itself" flag; a drop with it set is not
+    /// a client hangup and records nothing. `None` for single calls.
+    server_abort: Option<Arc<AtomicBool>>,
+}
+
+impl CancelGuard {
+    fn new(method: &'static str) -> Self {
+        Self { method: Some(method), server_abort: None }
+    }
+
+    /// Guard for one batch entry, sharing the batch's server-abort flag. Spelled out
+    /// rather than `..Self::new(method)`: `CancelGuard` implements `Drop` and its fields
+    /// are `Copy`, so a functional-record-update source would be dropped *armed* right
+    /// here, phantom-counting every batch entry as cancelled at creation.
+    fn for_entry(method: &'static str, server_abort: Arc<AtomicBool>) -> Self {
+        Self { method: Some(method), server_abort: Some(server_abort) }
+    }
+
+    /// Marks the request as answered, so dropping the guard records nothing.
+    fn settle(mut self) {
+        self.method = None;
+    }
+
+    /// The method a drop right now would count as cancelled, if any.
+    fn drop_outcome(&self) -> Option<&'static str> {
+        self.method
+            .filter(|_| !self.server_abort.as_ref().is_some_and(|f| f.load(Ordering::Relaxed)))
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if let Some(method) = self.drop_outcome() {
+            crate::metrics::record_request_cancelled(method);
+        }
+    }
+}
+
+/// Settles `guard` for a produced response, accounting any error response no handler
+/// recorded — split by who produced it, which the response code reveals:
+///
+/// - A framework code (parse / invalid-request / method-not-found / invalid-params) means the
+///   framework answered before any handler (and its counters) could run, so no arrival exists:
+///   recorded as the balanced `rejected` arrival/outcome pair. An unrecorded `-32602` is always the
+///   framework's — a handler rejecting a `tracerConfig` with the same code records it through the
+///   funnel first (the task-local exists for exactly that ambiguity).
+/// - Any other code means a handler ran (and recorded its arrival at entry) but bypassed the error
+///   funnel: recorded error-side only as `reason="unattributed"`, so the drift stays visible on its
+///   own series instead of absorbed into `rejected` — and the identity stays closed instead of
+///   gaining a phantom arrival.
+fn settle_response(rp: &MethodResponse, handler_reported: bool, guard: CancelGuard) {
+    use jsonrpsee::types::error::{
+        INVALID_PARAMS_CODE, INVALID_REQUEST_CODE, METHOD_NOT_FOUND_CODE, OVERSIZED_RESPONSE_CODE,
+        PARSE_ERROR_CODE,
+    };
+    if rp.is_error() &&
+        !handler_reported &&
+        let Some(method) = guard.drop_outcome()
+    {
+        match rp.as_error_code() {
+            Some(
+                PARSE_ERROR_CODE |
+                INVALID_REQUEST_CODE |
+                METHOD_NOT_FOUND_CODE |
+                INVALID_PARAMS_CODE,
+            ) |
+            None => crate::metrics::record_framework_rejection(method),
+            // The framework swapped a handler's *Ok* for the oversized-response error
+            // after the handler already recorded arrival + served: the books are balanced,
+            // and recording again here would both over-count the identity and false-fire
+            // the drift alarm. Unreachable while the server pins the response cap to
+            // u32::MAX — load-bearing the day a real `--max-response-size` lands. The
+            // client-saw-error / books-say-served mismatch is accepted like the other
+            // documented approximations.
+            Some(OVERSIZED_RESPONSE_CODE) => {}
+            Some(_) => {
+                crate::metrics::record_rpc_error(method, crate::metrics::ErrorReason::Unattributed)
+            }
+        }
+    }
+    guard.settle();
+}
+
 /// Passes single calls and notifications through untouched; overrides only `batch`.
 #[derive(Clone)]
 pub(crate) struct ConcurrentBatch<S> {
@@ -137,7 +234,16 @@ where
         &self,
         request: Request<'a>,
     ) -> impl Future<Output = Self::MethodResponse> + Send + 'a {
-        self.service.call(request)
+        let method = crate::metrics::method_label(request.method_name());
+        // Created eagerly so the wrapper owns no service clone — only the batch path,
+        // which spawns entries, needs one.
+        let fut = self.service.call(request);
+        async move {
+            let guard = CancelGuard::new(method);
+            let (rp, reported) = crate::metrics::track_handler_errors(fut).await;
+            settle_response(&rp, reported, guard);
+            rp
+        }
     }
 
     fn notification<'a>(
@@ -156,6 +262,11 @@ where
             let mut got_notification = false;
             let mut entries = batch.into_iter();
             let entry_cpu = Arc::new(AtomicU64::new(0));
+            // Set before a server-side early return (response over the size cap) so the
+            // aborted entries' guards do not read as client hangups. Such a batch's books
+            // are deliberately approximate: killed entries keep an arrival with no
+            // outcome; never-started entries are on neither side.
+            let server_abort = Arc::new(AtomicBool::new(false));
 
             // Refill-and-drain: at most `concurrency` entries are alive as spawned
             // tasks, converted to owned form lazily at spawn time — an oversized batch
@@ -171,9 +282,18 @@ where
                     match entry {
                         Ok(BatchEntry::Call(req)) => {
                             let service = service.clone();
+                            let method = crate::metrics::method_label(req.method_name());
+                            let server_abort = server_abort.clone();
                             let req = owned_request(req);
                             tasks.spawn(CpuSampled::new(
-                                async move { Some(service.call(req).await) },
+                                async move {
+                                    let guard = CancelGuard::for_entry(method, server_abort);
+                                    let (rp, reported) =
+                                        crate::metrics::track_handler_errors(service.call(req))
+                                            .await;
+                                    settle_response(&rp, reported, guard);
+                                    Some(rp)
+                                },
                                 entry_cpu.clone(),
                             ));
                         }
@@ -189,8 +309,12 @@ where
                             ));
                         }
                         Err(err) => {
+                            // A client-visible error entry no handler will ever see —
+                            // account for it like the other framework rejections.
+                            crate::metrics::record_framework_rejection("unknown");
                             let (err, id) = err.into_parts();
                             if let Err(err) = batch_rp.append(MethodResponse::error(id, err)) {
+                                server_abort.store(true, Ordering::Relaxed);
                                 return stamp_entry_cpu(err, &entry_cpu);
                             }
                         }
@@ -199,6 +323,7 @@ where
                 match tasks.join_next().await {
                     Some(Ok(Some(rp))) => {
                         if let Err(err) = batch_rp.append(rp) {
+                            server_abort.store(true, Ordering::Relaxed);
                             return stamp_entry_cpu(err, &entry_cpu);
                         }
                     }
@@ -282,10 +407,11 @@ mod tests {
         module
     }
 
-    /// Server running [`test_module`]'s methods behind [`ConcurrentBatchLayer`] at the
-    /// given bound and response cap, with the timing layer sealing
-    /// `x-execution-time-ns` like production.
-    async fn spawn(
+    /// Server running `module`'s methods behind [`ConcurrentBatchLayer`] at the given
+    /// bound and response cap, with the timing layer sealing `x-execution-time-ns` like
+    /// production.
+    async fn spawn_with(
+        module: RpcModule<()>,
         concurrency: usize,
         max_response_body_size: usize,
     ) -> (SocketAddr, ServerHandle) {
@@ -299,7 +425,15 @@ mod tests {
             .await
             .unwrap();
         let addr = server.local_addr().unwrap();
-        (addr, server.start(test_module()))
+        (addr, server.start(module))
+    }
+
+    /// [`spawn_with`] running [`test_module`].
+    async fn spawn(
+        concurrency: usize,
+        max_response_body_size: usize,
+    ) -> (SocketAddr, ServerHandle) {
+        spawn_with(test_module(), concurrency, max_response_body_size).await
     }
 
     /// The same server without the layer — jsonrpsee's stock sequential batch path.
@@ -324,6 +458,37 @@ mod tests {
 
     async fn post_raw(addr: SocketAddr, body: String) -> Value {
         serde_json::from_str(&post_text(addr, body).await).unwrap()
+    }
+
+    /// The cancel guard counts a drop as a cancellation only while armed — not after
+    /// `settle`, and not once the batch flagged a server-side abort.
+    #[test]
+    fn cancel_guard_counts_only_client_abandonment() {
+        let g = CancelGuard::new("debug_traceBlockByNumber");
+        assert_eq!(g.drop_outcome(), Some("debug_traceBlockByNumber"));
+        g.settle();
+
+        let abort = Arc::new(AtomicBool::new(false));
+        let g = CancelGuard::for_entry("trace_block", abort.clone());
+        assert_eq!(g.drop_outcome(), Some("trace_block"), "client teardown must count");
+        abort.store(true, Ordering::Relaxed);
+        assert_eq!(g.drop_outcome(), None, "a server-side abort must not count");
+        g.settle();
+    }
+
+    /// `track_handler_errors` reports whether the handler recorded its own error, which
+    /// is what keeps the middleware fallback from double-counting handler errors while
+    /// still catching responses the framework produced on its own.
+    #[tokio::test]
+    async fn handler_error_tracking_separates_self_reported_errors() {
+        let ((), reported) = crate::metrics::track_handler_errors(async {}).await;
+        assert!(!reported, "nothing recorded => the fallback owns the outcome");
+
+        let ((), reported) = crate::metrics::track_handler_errors(async {
+            crate::metrics::record_rpc_error("trace_block", crate::metrics::ErrorReason::Internal);
+        })
+        .await;
+        assert!(reported, "a handler-recorded error must disarm the fallback");
     }
 
     fn batch_of(method: &str, n: u64) -> String {
@@ -469,6 +634,195 @@ mod tests {
 
         assert!(rp.is_object(), "over-limit batch collapses to one error: {rp}");
         assert!(rp["error"]["code"].is_i64());
+    }
+
+    /// Handlers following the real handlers' accounting contract — arrival recorded at
+    /// entry, then exactly one outcome — plus one that deliberately bypasses the error
+    /// funnel, mimicking the drift `reason="unattributed"` exists to catch. Registered
+    /// under real method names so `method_label` resolves them like production traffic.
+    fn contract_module() -> RpcModule<()> {
+        use jsonrpsee::types::ErrorObjectOwned;
+
+        use crate::metrics::{self, ErrorReason};
+        let mut module = RpcModule::new(());
+        // Served.
+        module
+            .register_async_method(metrics::METHOD_TRACE_BLOCK, |_, _, _| async {
+                metrics::record_request_shape(metrics::METHOD_TRACE_BLOCK, "default");
+                metrics::record_rpc_request(metrics::METHOD_TRACE_BLOCK, 0.001);
+                "ok"
+            })
+            .unwrap();
+        // Failed, recorded through the error funnel.
+        module
+            .register_async_method(metrics::METHOD_TRACE_TRANSACTION, |_, _, _| async {
+                metrics::record_request_shape(metrics::METHOD_TRACE_TRANSACTION, "default");
+                metrics::record_rpc_error(metrics::METHOD_TRACE_TRANSACTION, ErrorReason::NotFound);
+                Err::<&str, _>(ErrorObjectOwned::owned(-32001, "not found", None::<()>))
+            })
+            .unwrap();
+        // Funnel bypass: an arrival, then an error the handler never records.
+        module
+            .register_async_method(metrics::METHOD_DEBUG_TRACE_TRANSACTION, |_, _, _| async {
+                metrics::record_request_shape(metrics::METHOD_DEBUG_TRACE_TRANSACTION, "default");
+                Err::<&str, _>(ErrorObjectOwned::owned(-32000, "boom", None::<()>))
+            })
+            .unwrap();
+        // Cancellation target: an arrival, then outlives any client patience.
+        module
+            .register_async_method(metrics::METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, |_, _, _| async {
+                metrics::record_request_shape(
+                    metrics::METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+                    "default",
+                );
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                "never"
+            })
+            .unwrap();
+        module
+    }
+
+    /// End-to-end pin of the accounting identity `shape = requests + errors + cancelled`
+    /// per method — the contract that otherwise lives only in AGENTS.md prose. One pass
+    /// drives every terminal path through a real server: served (single call and batch
+    /// entry; a batch notification rides along to pin that notifications contribute to
+    /// neither side — jsonrpsee never dispatches a handler for them), a funnel-recorded
+    /// error, a funnel *bypass* (must land error-side on `unattributed`, never in
+    /// `rejected`), framework rejections (unknown method, malformed batch entry), and a
+    /// client hangup. The whole server runs on a
+    /// current-thread runtime inside `metrics::with_local_recorder`, so every sample —
+    /// handlers, middleware, guards — lands in this test's recorder and concurrently
+    /// running tests stay invisible to it.
+    #[test]
+    fn accounting_identity_holds_end_to_end() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        const SHAPE: &str = "debug_trace_request_shape_total";
+        // The derive-based served counter keeps its raw dotted scope name here — the
+        // dot-to-underscore rename happens in the Prometheus exporter, not the recorder.
+        const SERVED: &str = "debug_trace.rpc_requests_total";
+        const ERRORS: &str = "debug_trace_rpc_errors_total";
+        const CANCELLED: &str = "debug_trace_requests_cancelled_total";
+
+        type Acc = std::collections::HashMap<(String, Vec<(String, String)>), u64>;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // `Snapshotter::snapshot` *drains* the recorder (each counter swaps to zero), so
+        // every observation funnels through one accumulator that survives repeated polls.
+        let drain_into = |acc: &mut Acc| {
+            for (ck, _, _, value) in snapshotter.snapshot().into_vec() {
+                if let DebugValue::Counter(v) = value {
+                    let key = ck.key();
+                    let labels: Vec<(String, String)> = key
+                        .labels()
+                        .map(|l| (l.key().to_string(), l.value().to_string()))
+                        .collect();
+                    *acc.entry((key.name().to_string(), labels)).or_default() += v;
+                }
+            }
+        };
+        // Sums every accumulated counter matching `metric` and all of `labels` (a subset
+        // match, so a method-only query sums across shapes/reasons).
+        let read = |acc: &Acc, metric: &str, labels: &[(&str, &str)]| -> u64 {
+            acc.iter()
+                .filter(|((name, ls), _)| {
+                    name.as_str() == metric &&
+                        labels.iter().all(|(lk, lv)| {
+                            ls.iter().any(|(k, v)| k.as_str() == *lk && v.as_str() == *lv)
+                        })
+                })
+                .map(|(_, v)| *v)
+                .sum()
+        };
+        let mut acc = Acc::new();
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let (addr, _handle) = spawn_with(contract_module(), 16, u32::MAX as usize).await;
+                let single = |method: &str| {
+                    json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": []}).to_string()
+                };
+
+                // Served; funnel-recorded error; funnel bypass; unknown method.
+                for method in ["trace_block", "trace_transaction", "debug_traceTransaction", "nope"]
+                {
+                    post_text(addr, single(method)).await;
+                }
+                // Batch: served entry, unknown method, malformed entry, notification.
+                let batch = r#"[
+                    {"jsonrpc": "2.0", "id": 1, "method": "trace_block", "params": []},
+                    {"jsonrpc": "2.0", "id": 2, "method": "nope", "params": []},
+                    42,
+                    {"jsonrpc": "2.0", "method": "trace_block", "params": []}
+                ]"#;
+                post_text(addr, batch.to_string()).await;
+                // Client hangup: the handler sleeps far past the client's timeout, so the
+                // dropped call future is the request's only trace.
+                let _ = reqwest::Client::new()
+                    .post(format!("http://{addr}"))
+                    .timeout(Duration::from_millis(100))
+                    .header("content-type", "application/json")
+                    .body(single("debug_traceBlockByNumber"))
+                    .send()
+                    .await;
+                // The drop lands only once the connection teardown reaches the server.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    drain_into(&mut acc);
+                    if read(&acc, CANCELLED, &[("method", "debug_traceBlockByNumber")]) > 0 {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "cancellation was never recorded");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+        });
+        drain_into(&mut acc);
+
+        // Terminal-path pins: each scenario landed on exactly the series it must.
+        assert_eq!(
+            read(&acc, ERRORS, &[("method", "trace_transaction"), ("reason", "not_found")]),
+            1
+        );
+        assert_eq!(
+            read(&acc, ERRORS, &[("method", "debug_traceTransaction"), ("reason", "unattributed")]),
+            1,
+            "a funnel bypass must land on its own drift series, error-side only",
+        );
+        assert_eq!(
+            read(&acc, ERRORS, &[("method", "debug_traceTransaction"), ("reason", "rejected")]),
+            0,
+            "a funnel bypass must not be absorbed into the framework's `rejected`",
+        );
+        // Three framework rejections: the unknown single call, the unknown batch entry,
+        // and the malformed batch entry — each a balanced arrival/outcome pair.
+        assert_eq!(read(&acc, SHAPE, &[("method", "unknown"), ("shape", "rejected")]), 3);
+        assert_eq!(read(&acc, ERRORS, &[("method", "unknown"), ("reason", "rejected")]), 3);
+        assert_eq!(read(&acc, CANCELLED, &[("method", "debug_traceBlockByNumber")]), 1);
+
+        // The identity itself, per method touched by the pass.
+        for method in [
+            "trace_block",
+            "trace_transaction",
+            "debug_traceTransaction",
+            "debug_traceBlockByNumber",
+            "unknown",
+        ] {
+            let m = [("method", method)];
+            let shape = read(&acc, SHAPE, &m);
+            let served = read(&acc, SERVED, &m);
+            let errors = read(&acc, ERRORS, &m);
+            let cancelled = read(&acc, CANCELLED, &m);
+            assert!(shape > 0, "the pass never touched {method}");
+            assert_eq!(
+                shape,
+                served + errors + cancelled,
+                "identity broken for {method}: shape={shape} served={served} \
+                 errors={errors} cancelled={cancelled}",
+            );
+        }
     }
 
     /// The tail branches mirrored from jsonrpsee's sequential batch implementation
