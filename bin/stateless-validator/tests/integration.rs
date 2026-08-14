@@ -182,6 +182,57 @@ fn witness_endpoint_is_optional_at_parse_time() {
     assert!(parse(&["--witness-source", "r2"]).unwrap().witness_endpoint.is_empty());
 }
 
+/// The custom-domain R2 target is mutually exclusive with the S3 endpoint, and the Access
+/// token pair is all-or-nothing on top of it.
+#[test]
+fn r2_custom_domain_target_wiring() {
+    let _guard = stateless_test_utils::env::env_lock();
+    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
+
+    assert_eq!(
+        parse(&["--r2-custom-domain", "https://witness.example.com"])
+            .unwrap()
+            .r2_custom_domain
+            .as_deref(),
+        Some("https://witness.example.com")
+    );
+    assert!(
+        parse(&[
+            "--r2-custom-domain",
+            "https://witness.example.com",
+            "--r2-endpoint",
+            "https://acc.r2.cloudflarestorage.com",
+        ])
+        .is_err(),
+        "custom domain + S3 endpoint must fail parsing"
+    );
+    assert!(
+        parse(&[
+            "--r2-custom-domain",
+            "https://witness.example.com",
+            "--r2-access-client-id",
+            "tok",
+        ])
+        .is_err(),
+        "Access client id without secret must fail"
+    );
+    assert!(
+        parse(&["--r2-access-client-id", "tok", "--r2-access-client-secret", "sk"]).is_err(),
+        "Access token pair without the domain must fail"
+    );
+    assert!(
+        parse(&[
+            "--r2-custom-domain",
+            "https://witness.example.com",
+            "--r2-access-client-id",
+            "tok",
+            "--r2-access-client-secret",
+            "sk",
+        ])
+        .is_ok()
+    );
+}
+
 /// `canonical_chain_max_length` must reject 0 at parse time. A value of 0 would make
 /// `advance_chain` prune the entire canonical chain on every successful advance,
 /// rolling the pipeline back to the anchor each round and looping forever.

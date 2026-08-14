@@ -96,9 +96,26 @@ pub struct CommandLineArgs {
     pub witness_source: WitnessSource,
 
     /// R2 S3 endpoint origin, e.g. `https://<account>.r2.cloudflarestorage.com` (no bucket path).
-    /// Required when `--witness-source r2`.
-    #[clap(long, env = "STATELESS_VALIDATOR_R2_ENDPOINT")]
+    /// Required when `--witness-source r2`, unless `--r2-custom-domain` is used instead.
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_ENDPOINT", conflicts_with = "r2_custom_domain")]
     pub r2_endpoint: Option<String>,
+
+    /// Cloudflare custom domain fronting the witness bucket, e.g. `https://witness.example.com`
+    /// (bare origin — objects are fetched as `/{key}`). Alternative to the `--r2-endpoint`
+    /// credential quad with `--witness-source r2`: GETs go unsigned through the CDN edge, which
+    /// multiplexes them over HTTP/2 and can serve the immutable witness objects from edge cache.
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_CUSTOM_DOMAIN")]
+    pub r2_custom_domain: Option<String>,
+
+    /// Cloudflare Access service-token client id, sent as `CF-Access-Client-Id` on every
+    /// custom-domain GET. Omit when the domain is locked by an IP allowlist instead.
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_ID", requires_all = ["r2_custom_domain", "r2_access_client_secret"])]
+    pub r2_access_client_id: Option<String>,
+
+    /// Cloudflare Access service-token client secret, sent as `CF-Access-Client-Secret`. Prefer
+    /// the env var over the flag.
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_SECRET", requires_all = ["r2_custom_domain", "r2_access_client_id"])]
+    pub r2_access_client_secret: Option<RedactedSecret>,
 
     /// R2 bucket holding the witnesses (e.g. `witness-mainnet`). Required when `--witness-source
     /// r2`.
@@ -282,27 +299,57 @@ pub async fn run() -> Result<()> {
                      straight from the R2 bucket, and there is no RPC witness fallback"
                 );
             }
-            let endpoint = require_r2(&args.r2_endpoint, "--r2-endpoint")?;
-            let bucket = require_r2(&args.r2_bucket, "--r2-bucket")?;
-            let access_key_id = require_r2(&args.r2_access_key_id, "--r2-access-key-id")?;
-            let secret_access_key =
-                require_r2(&args.r2_secret_access_key, "--r2-secret-access-key")?;
-            // Log the parsed origin, not the raw flag value — the raw string is operator
-            // input and this line is info-level.
-            let (origin, _) = stateless_r2::endpoint::parse_endpoint(endpoint);
-            info!(endpoint = %origin, bucket, "Witness source: R2 (direct S3)");
-            Some(Arc::new(R2WitnessClient::new(
-                endpoint,
-                bucket.to_string(),
-                access_key_id.to_string(),
-                secret_access_key.to_string(),
-                stateless_r2::fetch::FetchTimeouts {
-                    per_attempt: per_attempt_timeout,
-                    connect: Duration::from_millis(args.r2_connect_timeout_ms),
-                },
-                rpc_config.rpc_retry.clone(),
-                args.witness_max_concurrent_requests,
-            )?))
+            let timeouts = stateless_r2::fetch::FetchTimeouts {
+                per_attempt: per_attempt_timeout,
+                connect: Duration::from_millis(args.r2_connect_timeout_ms),
+            };
+            let client =
+                if let Some(domain) = optional_r2(&args.r2_custom_domain, "--r2-custom-domain")? {
+                    let access = match (
+                        optional_r2(&args.r2_access_client_id, "--r2-access-client-id")?,
+                        optional_r2(&args.r2_access_client_secret, "--r2-access-client-secret")?,
+                    ) {
+                        (Some(client_id), Some(client_secret)) => {
+                            Some(stateless_r2::fetch::CfAccessCredentials {
+                                client_id: client_id.to_string(),
+                                client_secret: client_secret.to_string(),
+                            })
+                        }
+                        _ => None,
+                    };
+                    let cf_access = access.is_some();
+                    // Log the parsed origin, not the raw flag value — the raw string is operator
+                    // input and this line is info-level.
+                    let (origin, _) = stateless_r2::endpoint::parse_endpoint(domain);
+                    info!(domain = %origin, cf_access, "Witness source: R2 (custom domain)");
+                    R2WitnessClient::new_custom_domain(
+                        domain,
+                        access,
+                        timeouts,
+                        rpc_config.rpc_retry.clone(),
+                        args.witness_max_concurrent_requests,
+                    )?
+                } else {
+                    let endpoint = require_r2(&args.r2_endpoint, "--r2-endpoint")?;
+                    let bucket = require_r2(&args.r2_bucket, "--r2-bucket")?;
+                    let access_key_id = require_r2(&args.r2_access_key_id, "--r2-access-key-id")?;
+                    let secret_access_key =
+                        require_r2(&args.r2_secret_access_key, "--r2-secret-access-key")?;
+                    // Log the parsed origin, not the raw flag value — the raw string is operator
+                    // input and this line is info-level.
+                    let (origin, _) = stateless_r2::endpoint::parse_endpoint(endpoint);
+                    info!(endpoint = %origin, bucket, "Witness source: R2 (direct S3)");
+                    R2WitnessClient::new(
+                        endpoint,
+                        bucket.to_string(),
+                        access_key_id.to_string(),
+                        secret_access_key.to_string(),
+                        timeouts,
+                        rpc_config.rpc_retry.clone(),
+                        args.witness_max_concurrent_requests,
+                    )?
+                };
+            Some(Arc::new(client))
         }
     };
 
@@ -411,6 +458,19 @@ fn require_r2<'a, T: AsRef<str>>(value: &'a Option<T>, flag: &str) -> Result<&'a
         .ok_or_else(|| eyre::eyre!("{flag} is required with --witness-source r2"))
 }
 
+/// Reads an optional `--r2-*` argument: absent selects the other target, but set-and-empty
+/// (the shape of a failed env injection) is a hard error rather than a silent fallthrough
+/// to a target the operator did not pick.
+fn optional_r2<'a, T: AsRef<str>>(value: &'a Option<T>, flag: &str) -> Result<Option<&'a str>> {
+    match value.as_ref().map(AsRef::as_ref) {
+        None => Ok(None),
+        Some("") => Err(eyre::eyre!(
+            "{flag} is set but empty (empty env var injection?): unset it or give it a value"
+        )),
+        Some(v) => Ok(Some(v)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +483,17 @@ mod tests {
         assert_eq!(
             require_r2(&Some("https://x".to_string()), "--r2-endpoint").unwrap(),
             "https://x"
+        );
+    }
+
+    #[test]
+    fn optional_r2_distinguishes_absent_from_empty() {
+        assert_eq!(optional_r2(&None::<String>, "--r2-custom-domain").unwrap(), None);
+        // An env var set to the empty string must fail loudly, not select the S3 target.
+        assert!(optional_r2(&Some(String::new()), "--r2-custom-domain").is_err());
+        assert_eq!(
+            optional_r2(&Some("https://w.example.com".to_string()), "--r2-custom-domain").unwrap(),
+            Some("https://w.example.com")
         );
     }
 }

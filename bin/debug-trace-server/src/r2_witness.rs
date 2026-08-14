@@ -18,7 +18,7 @@ use alloy_primitives::B256;
 use stateless_common::{BackoffPolicy, WitnessDecodingError, decode_witness_payload_light};
 use stateless_core::{LightWitness, withdrawals::MptWitness};
 use stateless_r2::{
-    fetch::{FetchTimeouts, R2GetError, R2ObjectFetcher, RetryPacing},
+    fetch::{CfAccessCredentials, FetchTimeouts, R2GetError, R2ObjectFetcher, RetryPacing},
     keys,
 };
 use tokio::task::JoinError;
@@ -127,6 +127,27 @@ impl R2WitnessSource {
         Ok(Self { fetcher })
     }
 
+    /// Builds a source that fetches unsigned through a Cloudflare custom domain fronting
+    /// the bucket (h2-multiplexed, edge-cacheable), with optional Cloudflare Access
+    /// service-token headers. The remaining parameters mean what they mean on [`Self::new`].
+    pub fn new_custom_domain(
+        domain: &str,
+        access: Option<CfAccessCredentials>,
+        timeouts: FetchTimeouts,
+        retry_backoff: BackoffPolicy,
+        max_concurrent_requests: Option<usize>,
+    ) -> eyre::Result<Self> {
+        let fetcher = R2ObjectFetcher::new_custom_domain(
+            domain,
+            access,
+            timeouts,
+            RetryPacing { initial: retry_backoff.initial, max: retry_backoff.max },
+            max_concurrent_requests,
+        )
+        .map_err(|e| eyre::eyre!(e))?;
+        Ok(Self { fetcher })
+    }
+
     /// Fetches and light-decodes the witness for `(number, hash)` under `deadline`.
     pub async fn get_witness_light(
         &self,
@@ -216,6 +237,37 @@ mod tests {
 
     fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(5)
+    }
+
+    /// The custom-domain source serves the same decode path end-to-end, requesting the bare
+    /// `/{key}` layout (no bucket segment, no SigV4 authorization).
+    #[tokio::test]
+    async fn custom_domain_source_decodes_and_requests_bare_key() {
+        let (salt_witness, mpt_witness): (_, MptWitness) =
+            TestFixtures::mainnet_shared().first_paired_witness();
+        let (_, payload) = stateless_common::encode_witness_payload(&salt_witness, &mpt_witness)
+            .expect("fixture witness must encode");
+
+        let (domain, _, heads) =
+            stateless_test_utils::mock_r2::mock_r2_capturing(vec![(200, payload)]).await;
+        let source = R2WitnessSource::new_custom_domain(
+            &domain,
+            None,
+            FetchTimeouts {
+                per_attempt: Duration::from_secs(5),
+                connect: stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT,
+            },
+            BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(20)),
+            None,
+        )
+        .unwrap();
+        source
+            .get_witness_light(1, B256::ZERO, deadline())
+            .await
+            .expect("valid object must fetch and decode");
+        let head = heads.lock().unwrap()[0].to_lowercase();
+        assert!(head.starts_with("get /block/0_999/1."), "bucketless key layout: {head}");
+        assert!(!head.contains("authorization:"), "custom-domain GET must be unsigned: {head}");
     }
 
     /// A fixture witness encoded with the uploader's `encode_witness_payload` must

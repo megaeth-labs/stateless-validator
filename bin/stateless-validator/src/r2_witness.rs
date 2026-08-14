@@ -26,7 +26,7 @@ use stateless_common::{
 };
 use stateless_core::withdrawals::MptWitness;
 use stateless_r2::{
-    fetch::{FetchTimeouts, R2GetError, R2ObjectFetcher, RetryPacing},
+    fetch::{CfAccessCredentials, FetchTimeouts, R2GetError, R2ObjectFetcher, RetryPacing},
     keys,
 };
 use tokio::task::JoinError;
@@ -128,6 +128,27 @@ impl R2WitnessClient {
             bucket,
             access_key_id,
             secret_access_key,
+            timeouts,
+            RetryPacing { initial: retry_backoff.initial, max: retry_backoff.max },
+            max_concurrent_requests,
+        )
+        .map_err(|e| eyre::eyre!(e))?;
+        Ok(Self { fetcher })
+    }
+
+    /// Builds a client that fetches unsigned through a Cloudflare custom domain fronting the
+    /// bucket (h2-multiplexed, edge-cacheable), with optional Cloudflare Access service-token
+    /// headers. The remaining parameters mean what they mean on [`Self::new`].
+    pub fn new_custom_domain(
+        domain: &str,
+        access: Option<CfAccessCredentials>,
+        timeouts: FetchTimeouts,
+        retry_backoff: BackoffPolicy,
+        max_concurrent_requests: Option<usize>,
+    ) -> eyre::Result<Self> {
+        let fetcher = R2ObjectFetcher::new_custom_domain(
+            domain,
+            access,
             timeouts,
             RetryPacing { initial: retry_backoff.initial, max: retry_backoff.max },
             max_concurrent_requests,

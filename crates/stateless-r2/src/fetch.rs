@@ -1,11 +1,21 @@
-//! Signed `GET` of witness objects with retry, backoff, and concurrency capping.
+//! `GET` of witness objects with retry, backoff, and concurrency capping.
 //!
 //! [`R2ObjectFetcher`] is the transport core shared by every R2 witness *reader* — the
 //! validator's pipeline source and the debug-trace-server's historical witness source.
-//! It owns exactly the parts whose behavior must not drift between readers: the SigV4-signed
-//! `GET`, the response classification ([`R2GetError`]), the retry loop with jittered
+//! It owns exactly the parts whose behavior must not drift between readers: the `GET`
+//! itself, the response classification ([`R2GetError`]), the retry loop with jittered
 //! exponential backoff, and the in-flight concurrency cap. Everything reader-specific stays
 //! with the caller: payload decoding (full vs light), metrics, and failure pacing policies.
+//!
+//! The fetcher reaches the bucket through one of two targets:
+//! - the bare **S3 API endpoint** ([`R2ObjectFetcher::new`]) — SigV4-signed GETs of
+//!   `/{bucket}/{key}`; the endpoint negotiates HTTP/1.1 only, so every in-flight GET holds its own
+//!   connection;
+//! - a **Cloudflare custom domain** fronting the bucket ([`R2ObjectFetcher::new_custom_domain`]) —
+//!   unsigned GETs of `/{key}` through the CDN edge, which negotiates h2 (many in-flight GETs
+//!   multiplex over a few connections) and can serve the immutable witness objects from edge cache.
+//!   Access control is the domain's business: an IP allowlist needs nothing from this client, and
+//!   Cloudflare Access service tokens ride along as headers via [`CfAccessCredentials`].
 //!
 //! The loop is optionally deadline-aware (see [`R2ObjectFetcher::get_block_object`]).
 
@@ -25,7 +35,7 @@ use crate::{
     client::is_throttle_status,
     endpoint::parse_endpoint,
     keys,
-    sigv4::{SigV4Signer, encode_uri_path},
+    sigv4::{Header, SigV4Signer, encode_key_path, encode_uri_path},
 };
 
 /// Cap on the response body carried inside `Throttled`/`Status` errors.
@@ -184,19 +194,59 @@ pub struct FetchedObject {
     pub queue_wait: Duration,
 }
 
-/// Fetches witness objects from an R2 bucket over the S3 API with SigV4-signed GETs.
+/// Cloudflare Access service-token credentials, sent as the `CF-Access-Client-Id` /
+/// `CF-Access-Client-Secret` headers on every custom-domain GET.
 ///
-/// Cloning is cheap — the `reqwest::Client` and signer are internally reference-counted /
-/// small. `Debug` is safe to derive: [`SigV4Signer`]'s own `Debug` redacts the credentials.
+/// `Debug` redacts both halves: the id alone is enough to look up the token, so it gets the
+/// same treatment as the secret.
+#[derive(Clone)]
+pub struct CfAccessCredentials {
+    /// The service token's client id.
+    pub client_id: String,
+    /// The service token's client secret.
+    pub client_secret: String,
+}
+
+impl std::fmt::Debug for CfAccessCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CfAccessCredentials")
+            .field("client_id", &"[redacted]")
+            .field("client_secret", &"[redacted]")
+            .finish()
+    }
+}
+
+/// How a [`R2ObjectFetcher`] reaches the bucket. `Debug` is safe to derive: both credential
+/// holders redact themselves.
+#[derive(Clone, Debug)]
+enum Target {
+    /// SigV4-signed GETs of `/{bucket}/{key}` against the bare S3 API endpoint.
+    S3 {
+        signer: SigV4Signer,
+        /// Endpoint origin (`scheme://host`, no trailing slash).
+        endpoint: String,
+        /// SigV4 canonical host (`host[:port]`).
+        host: String,
+        bucket: String,
+    },
+    /// Unsigned GETs of `/{key}` against a Cloudflare custom domain fronting the bucket.
+    CustomDomain {
+        /// Domain origin (`scheme://host`, no trailing slash).
+        origin: String,
+        /// Optional Cloudflare Access service-token headers.
+        access: Option<CfAccessCredentials>,
+    },
+}
+
+/// Fetches witness objects from an R2 bucket — SigV4-signed over the S3 API, or unsigned
+/// through a Cloudflare custom domain (see the module docs for the two targets).
+///
+/// Cloning is cheap — the `reqwest::Client` and the target's credential holders are
+/// internally reference-counted / small. `Debug` is safe to derive: [`Target`] redacts.
 #[derive(Clone, Debug)]
 pub struct R2ObjectFetcher {
     http: Client,
-    signer: SigV4Signer,
-    /// Endpoint origin (`scheme://host`, no trailing slash).
-    endpoint: String,
-    /// SigV4 canonical host (`host[:port]`).
-    host: String,
-    bucket: String,
+    target: Target,
     /// Hard cap on a single GET attempt; with a deadline, each attempt uses
     /// `min(timeouts.per_attempt, remaining)`.
     per_attempt_timeout: Duration,
@@ -248,10 +298,69 @@ impl R2ObjectFetcher {
             .map_err(|e| format!("Failed to build R2 HTTP client: {e}"))?;
         Ok(Self {
             http,
-            signer: SigV4Signer::new(access_key_id, secret_access_key),
-            endpoint: origin,
-            host,
-            bucket,
+            target: Target::S3 {
+                signer: SigV4Signer::new(access_key_id, secret_access_key),
+                endpoint: origin,
+                host,
+                bucket,
+            },
+            per_attempt_timeout: timeouts.per_attempt,
+            pacing,
+            concurrency: Arc::new(Semaphore::new(
+                max_concurrent_requests.unwrap_or(Semaphore::MAX_PERMITS).max(1),
+            )),
+        })
+    }
+
+    /// Builds a fetcher that GETs objects unsigned through a Cloudflare custom domain
+    /// fronting the bucket (`https://<domain>/{key}` — no bucket path segment, the domain is
+    /// bucket-scoped).
+    ///
+    /// `access` attaches Cloudflare Access service-token headers to every GET; leave it
+    /// `None` when the domain is locked by an IP allowlist instead. The remaining parameters
+    /// mean exactly what they mean on [`Self::new`]. Fails if the domain is not a bare
+    /// `scheme://host[:port]` origin — the object path is appended by this fetcher, and a
+    /// path-bearing domain would silently double it.
+    ///
+    /// The domain rides Cloudflare's h2-capable edge, so this client differs from the S3 one
+    /// in its HTTP/2 posture (all three knobs are inert on an endpoint that only offers
+    /// http/1.1 via ALPN, which also keeps this constructor honest against a non-h2 origin):
+    /// - adaptive flow-control windows — the defaults are sized well under the bandwidth-delay
+    ///   product of an intercontinental path, and would cap a multi-MB tail object far below the
+    ///   link's actual capacity;
+    /// - keep-alive pings, including while idle — the single multiplexed connection must survive
+    ///   the gaps between request waves, or every wave re-pays the TLS handshake and
+    ///   congestion-window ramp that connection reuse exists to avoid.
+    pub fn new_custom_domain(
+        domain: &str,
+        access: Option<CfAccessCredentials>,
+        timeouts: FetchTimeouts,
+        pacing: RetryPacing,
+        max_concurrent_requests: Option<usize>,
+    ) -> Result<Self, String> {
+        let (origin, host) = parse_endpoint(domain);
+        if host.is_empty() {
+            // The raw input is not echoed: a rejected shape may carry inline credentials
+            // (userinfo), and this message ends up in startup logs.
+            return Err("Invalid R2 custom domain: expected a bare scheme://host origin (no \
+                 path/query/userinfo), e.g. https://witness.example.com"
+                .to_string());
+        }
+        let http = Client::builder()
+            .timeout(timeouts.per_attempt)
+            .connect_timeout(timeouts.connect)
+            // An unexpected 3xx here is a misconfigured domain (e.g. Cloudflare Access
+            // bouncing an unauthenticated client to its login page); following it would bury
+            // that signal under an HTML body, so surface the 3xx as a `Status` error.
+            .redirect(reqwest::redirect::Policy::none())
+            .http2_adaptive_window(true)
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .http2_keep_alive_while_idle(true)
+            .build()
+            .map_err(|e| format!("Failed to build R2 HTTP client: {e}"))?;
+        Ok(Self {
+            http,
+            target: Target::CustomDomain { origin, access },
             per_attempt_timeout: timeouts.per_attempt,
             pacing,
             concurrency: Arc::new(Semaphore::new(
@@ -334,17 +443,42 @@ impl R2ObjectFetcher {
         }
     }
 
-    /// Performs one SigV4-signed GET and classifies the response. No retry.
+    /// Builds one attempt's request URL and headers for this fetcher's target: the signed
+    /// S3 layout (`/{bucket}/{key}` + SigV4 headers) or the unsigned custom-domain layout
+    /// (`/{key}` + optional Access headers).
+    fn request_parts(&self, key: &str) -> (String, Vec<Header>) {
+        match &self.target {
+            Target::S3 { signer, endpoint, host, bucket } => {
+                let canonical_uri = encode_uri_path(bucket, key);
+                let url = format!("{endpoint}{canonical_uri}");
+                // Signed-payload mode with an empty body: x-amz-content-sha256 = sha256("").
+                let signed = signer.sign("GET", host, &canonical_uri, "", &[], b"", Utc::now());
+                (url, signed)
+            }
+            Target::CustomDomain { origin, access } => {
+                let url = format!("{origin}{}", encode_key_path(key));
+                let headers = access
+                    .as_ref()
+                    .map(|a| {
+                        vec![
+                            ("CF-Access-Client-Id".to_string(), a.client_id.clone()),
+                            ("CF-Access-Client-Secret".to_string(), a.client_secret.clone()),
+                        ]
+                    })
+                    .unwrap_or_default();
+                (url, headers)
+            }
+        }
+    }
+
+    /// Performs one GET against this fetcher's target and classifies the response. No retry.
     async fn get_object(
         &self,
         number: u64,
         key: &str,
         deadline: Option<Instant>,
     ) -> Result<Bytes, R2GetError> {
-        let canonical_uri = encode_uri_path(&self.bucket, key);
-        let url = format!("{}{}", self.endpoint, canonical_uri);
-        // Signed-payload mode with an empty body: x-amz-content-sha256 = sha256("").
-        let signed = self.signer.sign("GET", &self.host, &canonical_uri, "", &[], b"", Utc::now());
+        let (url, headers) = self.request_parts(key);
 
         let mut request = self.http.get(&url);
         // Clamp the attempt to the remaining budget; an already-expired deadline degrades to
@@ -354,7 +488,7 @@ impl R2ObjectFetcher {
                 deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
             request = request.timeout(self.per_attempt_timeout.min(remaining));
         }
-        for (name, value) in signed {
+        for (name, value) in headers {
             request = request.header(name, value);
         }
         let transport = |source: reqwest::Error| {
@@ -388,7 +522,9 @@ impl R2ObjectFetcher {
         // parsing the S3 XML error code. A 404 with no parseable code (a proxy's bare 404, a
         // truncated body) still counts as Missing: for a correctly configured endpoint that is
         // by far the likeliest cause, and misreading a config error as Missing only changes
-        // the caller's metric kind, not the retry behavior.
+        // the caller's metric kind, not the retry behavior. Custom-domain 404s carry no S3
+        // XML at all, so they classify as Missing through that same arm — also the right
+        // default there, where an absent object is the only routine 404.
         if code == 404 && s3_error_code(&body).is_none_or(|c| c == "NoSuchKey") {
             return Err(R2GetError::Missing { number, key: key.to_string() });
         }
@@ -414,7 +550,7 @@ fn s3_error_code(body: &str) -> Option<&str> {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use stateless_test_utils::mock_r2::{mock_r2, mock_r2_held};
+    use stateless_test_utils::mock_r2::{mock_r2, mock_r2_capturing, mock_r2_held};
 
     use super::*;
 
@@ -673,6 +809,105 @@ mod tests {
             started.elapsed(),
         );
         let _ = holder.await;
+    }
+
+    fn custom_fetcher(domain: &str, access: Option<CfAccessCredentials>) -> R2ObjectFetcher {
+        R2ObjectFetcher::new_custom_domain(domain, access, test_timeouts(), test_pacing(), None)
+            .unwrap()
+    }
+
+    #[test]
+    fn custom_domain_rejects_origin_with_path() {
+        // The fetcher appends the object path itself; a path-bearing domain would silently
+        // double it, so construction must fail fast (same policy as the S3 endpoint).
+        let err = R2ObjectFetcher::new_custom_domain(
+            "https://witness.example.com/witness-mainnet",
+            None,
+            test_timeouts(),
+            test_pacing(),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("Invalid R2 custom domain"), "{err}");
+    }
+
+    /// The custom-domain wire shape: `GET /{key}` with no bucket segment, no SigV4
+    /// `authorization`, and no Access headers unless configured.
+    #[tokio::test]
+    async fn custom_domain_gets_bare_key_path_unsigned() {
+        let (domain, hits, heads) = mock_r2_capturing(vec![(200, "witness bytes")]).await;
+        let fetched = custom_fetcher(&domain, None)
+            .get_block_object(2500, "0xblock", MAX_ATTEMPTS, None, || ())
+            .await
+            .expect("200 must succeed");
+        assert_eq!(fetched.bytes.as_ref(), b"witness bytes");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let head = heads.lock().unwrap()[0].to_lowercase();
+        assert!(head.starts_with("get /block/2000_2999/2500.0xblock http/1.1\r\n"), "{head}");
+        assert!(!head.contains("authorization:"), "custom-domain GET must be unsigned: {head}");
+        assert!(!head.contains("cf-access-client-id:"), "no Access headers configured: {head}");
+    }
+
+    /// The S3 wire shape stays what it was: `GET /{bucket}/{key}` carrying a SigV4
+    /// `authorization` header — pinned so the custom-domain arm can never bleed into it.
+    #[tokio::test]
+    async fn s3_get_prefixes_the_bucket_and_signs() {
+        let (endpoint, _, heads) = mock_r2_capturing(vec![(200, "witness bytes")]).await;
+        fetcher(&endpoint)
+            .get_block_object(2500, "0xblock", MAX_ATTEMPTS, None, || ())
+            .await
+            .expect("200 must succeed");
+        let head = heads.lock().unwrap()[0].to_lowercase();
+        assert!(
+            head.starts_with("get /witness-test/block/2000_2999/2500.0xblock http/1.1\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("authorization: aws4-hmac-sha256"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn custom_domain_sends_access_headers_when_configured() {
+        let (domain, _, heads) = mock_r2_capturing(vec![(200, "ok")]).await;
+        let access = CfAccessCredentials {
+            client_id: "tok-3f1.access".to_string(),
+            client_secret: "sec-9a2".to_string(),
+        };
+        custom_fetcher(&domain, Some(access))
+            .get_block_object(1, "0xhash", 1, None, || ())
+            .await
+            .expect("200 must succeed");
+        let head = heads.lock().unwrap()[0].to_lowercase();
+        assert!(head.contains("cf-access-client-id: tok-3f1.access"), "{head}");
+        assert!(head.contains("cf-access-client-secret: sec-9a2"), "{head}");
+        assert!(!head.contains("authorization:"), "{head}");
+    }
+
+    /// A custom-domain 404 carries no S3 XML; the bare body must classify as `Missing`.
+    #[tokio::test]
+    async fn custom_domain_bare_404_is_missing() {
+        let (domain, hits) = mock_r2(vec![(404, "<html>not found</html>")]).await;
+        let err = custom_fetcher(&domain, None)
+            .get_block_object(1, "0xhash", MAX_ATTEMPTS, None, || ())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, R2GetError::Missing { .. }), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "404 must not be retried");
+    }
+
+    /// Neither Access half may leak through `Debug` — the fetcher (and its target) end up in
+    /// startup logs via `Debug` formatting.
+    #[test]
+    fn access_credentials_never_leak_through_debug() {
+        let access = CfAccessCredentials {
+            client_id: "tok-3f1.access".to_string(),
+            client_secret: "sec-9a2".to_string(),
+        };
+        let direct = format!("{access:?}");
+        let via_fetcher = format!("{:?}", custom_fetcher("https://w.example.com", Some(access)));
+        for rendered in [direct, via_fetcher] {
+            assert!(!rendered.contains("tok-3f1"), "{rendered}");
+            assert!(!rendered.contains("sec-9a2"), "{rendered}");
+        }
     }
 
     /// Six concurrent fetches against a limit of 2 must never exceed two in-flight GETs.
