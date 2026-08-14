@@ -96,8 +96,11 @@ use crate::chain_sync::{TraceFetcher, TraceHooks, TraceProcessor};
 /// Command line arguments for the debug-trace-server.
 #[derive(Parser, Debug)]
 #[clap(name = "debug-trace-server", about = "Debug/Trace RPC Server")]
-// The two R2 read targets are mutually exclusive; the shared tuning flags hang off the group.
-#[clap(group(clap::ArgGroup::new("r2_target").args(["r2_endpoint", "r2_custom_domain"])))]
+// Anchor for the shared R2 tuning flags: `requires = "r2_target"` means "either target".
+// Mutual exclusion of the two targets is enforced in `validate_args`, not here — clap
+// cannot name env-sourced arguments in conflict errors, and a blank env line would
+// otherwise fail with an unactionable message.
+#[clap(group(clap::ArgGroup::new("r2_target").args(["r2_endpoint", "r2_custom_domain"]).multiple(true)))]
 struct Args {
     /// RPC server listen address.
     #[clap(long, env = "DEBUG_TRACE_SERVER_ADDR", default_value = "0.0.0.0:8545")]
@@ -326,15 +329,19 @@ struct Args {
     /// `https://witness.example.com` (bare origin — objects are fetched as `/{key}`).
     /// Alternative to the `--r2-endpoint` credential quad: GETs go unsigned through the CDN
     /// edge, which multiplexes them over HTTP/2 and can serve the immutable witness objects
-    /// from edge cache. Same routing and fallback semantics as the S3 target, including the
-    /// `--data-dir` requirement.
+    /// from edge cache. Client-side routing, budgets, and fallback match the S3 target
+    /// (including the `--data-dir` requirement); edge behavior is zone configuration —
+    /// **any cache rule making these objects cacheable must set 404s to bypass cache**,
+    /// or a pre-upload frontier miss gets pinned for the negative-cache TTL and a cached
+    /// 404 can false-fire the below-band `missing` bucket-integrity alarm.
     #[clap(long, env = "DEBUG_TRACE_SERVER_R2_CUSTOM_DOMAIN")]
     r2_custom_domain: Option<String>,
 
     /// Cloudflare Access service-token client id, sent as `CF-Access-Client-Id` on every
     /// custom-domain GET. Omit when the domain is locked by an IP allowlist instead.
+    /// Redacted like the secret: the id alone is enough to look up the token.
     #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ACCESS_CLIENT_ID", requires_all = ["r2_custom_domain", "r2_access_client_secret"])]
-    r2_access_client_id: Option<String>,
+    r2_access_client_id: Option<RedactedSecret>,
 
     /// Cloudflare Access service-token client secret, sent as `CF-Access-Client-Secret`.
     /// Prefer the env var over the flag so the secret stays out of shell history and
@@ -356,9 +363,10 @@ struct Args {
     r2_secret_access_key: Option<RedactedSecret>,
 
     /// R2 connection-establishment timeout (milliseconds). A healthy handshake to the local
-    /// anycast edge is tens of ms; hangs past this are the per-IP connection-budget
-    /// mitigation's signature and surface as retryable `connect`-kind errors, falling back
-    /// to the RPC chain fast.
+    /// anycast edge is tens of ms. On the S3 endpoint, hangs past this are the per-IP
+    /// connection-budget mitigation's signature; on a custom domain they are ordinary
+    /// network/TLS faults. Either way they surface as retryable `connect`-kind errors,
+    /// falling back to the RPC chain fast.
     #[clap(
         long,
         env = "DEBUG_TRACE_SERVER_R2_CONNECT_TIMEOUT_MS",
@@ -492,7 +500,7 @@ fn validate_args(args: &Args) -> Result<()> {
         ("--r2-access-key-id", args.r2_access_key_id.as_deref()),
         ("--r2-secret-access-key", args.r2_secret_access_key.as_ref().map(|s| s.as_ref())),
         ("--r2-custom-domain", args.r2_custom_domain.as_deref()),
-        ("--r2-access-client-id", args.r2_access_client_id.as_deref()),
+        ("--r2-access-client-id", args.r2_access_client_id.as_ref().map(|s| s.as_ref())),
         ("--r2-access-client-secret", args.r2_access_client_secret.as_ref().map(|s| s.as_ref())),
     ];
     for (flag, value) in r2_values {
@@ -501,6 +509,15 @@ fn validate_args(args: &Args) -> Result<()> {
                 "{flag} is set but empty (empty env var injection?): unset it or give it a value"
             );
         }
+    }
+    // Enforced here rather than via clap conflicts so the error names both flags even when
+    // they arrive through env vars (and after the empty-value check above, so a blank env
+    // line gets its own message instead of a phantom conflict).
+    if args.r2_endpoint.is_some() && args.r2_custom_domain.is_some() {
+        eyre::bail!(
+            "--r2-endpoint and --r2-custom-domain are mutually exclusive R2 targets: \
+             configure exactly one"
+        );
     }
     // The R2 route anchors block age (frontier vs historical) to the local DB tip; without
     // --data-dir every block would classify as frontier and a genuine bucket hole would
@@ -625,7 +642,7 @@ async fn main() -> Result<()> {
     let r2_witness_source = if let Some(domain) = &args.r2_custom_domain {
         let access = match (&args.r2_access_client_id, &args.r2_access_client_secret) {
             (Some(client_id), Some(secret)) => Some(stateless_r2::fetch::CfAccessCredentials {
-                client_id: client_id.clone(),
+                client_id: client_id.as_ref().to_string(),
                 client_secret: secret.as_ref().to_string(),
             }),
             _ => None,
@@ -1560,21 +1577,29 @@ mod tests {
             domain.iter().copied().chain(["--r2-connect-timeout-ms", "2000"]).collect();
         assert_eq!(parse_args(&with_tuning).r2_connect_timeout_ms, 2000);
 
-        // The two read targets are mutually exclusive.
-        assert!(
-            Args::try_parse_from(base.iter().copied().chain(domain).chain([
-                "--r2-endpoint",
-                "https://acc.r2.cloudflarestorage.com",
-                "--r2-bucket",
-                "witness-mainnet",
-                "--r2-access-key-id",
-                "ak",
-                "--r2-secret-access-key",
-                "sk",
-            ]))
-            .is_err(),
-            "custom domain + S3 endpoint must fail parsing"
-        );
+        // The two read targets are mutually exclusive — rejected by `validate_args` with an
+        // error naming both flags (clap conflicts cannot name env-sourced arguments).
+        let both = Args::try_parse_from(
+            base.iter()
+                .copied()
+                .chain(domain)
+                .chain([
+                    "--r2-endpoint",
+                    "https://acc.r2.cloudflarestorage.com",
+                    "--r2-bucket",
+                    "witness-mainnet",
+                    "--r2-access-key-id",
+                    "ak",
+                    "--r2-secret-access-key",
+                    "sk",
+                    "--data-dir",
+                    "/tmp/dts-test",
+                ])
+                .collect::<Vec<_>>(),
+        )
+        .expect("both targets must parse; rejection happens post-parse");
+        let err = validate_args(&both).unwrap_err().to_string();
+        assert!(err.contains("--r2-endpoint") && err.contains("--r2-custom-domain"), "{err}");
 
         // Access pair: each half requires the other, and both require the domain.
         assert!(
@@ -1599,7 +1624,7 @@ mod tests {
             .copied()
             .chain(["--r2-access-client-id", "tok", "--r2-access-client-secret", "sk"])
             .collect();
-        assert_eq!(parse_args(&full).r2_access_client_id.as_deref(), Some("tok"));
+        assert_eq!(parse_args(&full).r2_access_client_id.as_ref().map(|s| s.as_ref()), Some("tok"));
     }
 
     /// Custom-domain misconfigurations fail the same startup validation as the S3 flags:
@@ -1645,6 +1670,24 @@ mod tests {
             .is_err(),
             "empty access secret must fail"
         );
+        // A blank custom-domain env line over a working S3 config must get the named
+        // empty-value error, not a phantom target conflict.
+        let blank_over_s3 = build(&[
+            "--r2-endpoint",
+            "https://acc.r2.cloudflarestorage.com",
+            "--r2-bucket",
+            "witness-mainnet",
+            "--r2-access-key-id",
+            "ak",
+            "--r2-secret-access-key",
+            "sk",
+            "--r2-custom-domain",
+            "",
+            dir[0],
+            dir[1],
+        ]);
+        let err = validate_args(&blank_over_s3).unwrap_err().to_string();
+        assert!(err.contains("--r2-custom-domain") && err.contains("empty"), "{err}");
     }
 
     /// R2 misconfigurations fail startup validation: an empty value on any `--r2-*` flag

@@ -20,9 +20,12 @@ percent-encoding.workspace = true
 # reqwest major is part of this crate's API and must match mega-reth's workspace (0.12). Bumping
 # it is a coordinated two-repo change that a workspace-wide bump must not ride over.
 # `http2` enables ALPN h2 for endpoints that offer it. R2's bare S3 endpoint negotiates
-# HTTP/1.1 only (by design — ALPN-verified live; the feature is a no-op there), but R2
-# **custom domains** ride the regular CDN stack and do speak h2, where many in-flight GETs
-# multiplex over a few connections instead of holding one each.
+# HTTP/1.1 only (by design — ALPN-verified live; the S3 fetcher additionally pins
+# `http1_only`), but R2 **custom domains** ride the regular CDN stack and do speak h2,
+# where many in-flight GETs multiplex over a few connections instead of holding one each.
+# Note: Cargo feature unification propagates `http2` to every reqwest client in consuming
+# workspaces (including mega-reth's on the coordinated bump) — those clients start
+# *offering* h2 via ALPN, which servers are free to decline.
 reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls"] }
 sha2.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }

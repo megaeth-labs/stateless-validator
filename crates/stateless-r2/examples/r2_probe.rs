@@ -178,31 +178,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let timeouts =
         FetchTimeouts { per_attempt: Duration::from_secs(30), connect: DEFAULT_CONNECT_TIMEOUT };
     let pacing = RetryPacing { initial: Duration::from_millis(1), max: Duration::from_millis(2) };
+    // A half-set pair silently probing unauthenticated would defeat the probe's purpose of
+    // validating credentials, so it is a hard error (the binaries get this check from clap).
+    let access = match (
+        env::var("R2_PROBE_ACCESS_CLIENT_ID").ok(),
+        env::var("R2_PROBE_ACCESS_CLIENT_SECRET").ok(),
+    ) {
+        (Some(client_id), Some(client_secret)) => {
+            println!("[access] sending CF Access service-token headers");
+            Some(CfAccessCredentials { client_id, client_secret })
+        }
+        (None, None) => None,
+        _ => {
+            return Err(
+                "set both R2_PROBE_ACCESS_CLIENT_ID and R2_PROBE_ACCESS_CLIENT_SECRET, or neither"
+                    .into(),
+            );
+        }
+    };
     for &conc in &ladder {
         // A fresh fetcher per rung so each level starts on a cold connection pool —
         // production behavior through the production client, custom-domain mode included.
         let (tag, fetcher) = match &custom_domain {
-            Some(domain) => {
-                let access = match (
-                    env::var("R2_PROBE_ACCESS_CLIENT_ID").ok(),
-                    env::var("R2_PROBE_ACCESS_CLIENT_SECRET").ok(),
-                ) {
-                    (Some(client_id), Some(client_secret)) => {
-                        Some(CfAccessCredentials { client_id, client_secret })
-                    }
-                    _ => None,
-                };
-                (
-                    "custom",
-                    R2ObjectFetcher::new_custom_domain(
-                        domain,
-                        access,
-                        timeouts,
-                        pacing,
-                        Some(conc),
-                    ),
-                )
-            }
+            Some(domain) => (
+                "custom",
+                R2ObjectFetcher::new_custom_domain(
+                    domain,
+                    access.clone(),
+                    timeouts,
+                    pacing,
+                    Some(conc),
+                ),
+            ),
             None => (
                 "s3",
                 R2ObjectFetcher::new(

@@ -42,12 +42,14 @@ use crate::{
 const MAX_ERROR_BODY_BYTES: usize = 1024;
 
 /// Default bound on connection establishment (DNS + TCP + TLS). A healthy handshake to the
-/// local anycast edge is ~10-50ms; Cloudflare's per-IP connection mitigation manifests as
-/// handshakes that hang without erroring, so anything past this is that signature (the one
-/// legitimate slow case — a lost SYN retried at the kernel's 1s RTO — is cheaper to abort
-/// and retry on a fresh attempt than to wait out). Keeps a mitigated endpoint from eating
-/// the caller's whole budget before its fallback gets a turn. Operators tune it via the
-/// binaries' `--r2-connect-timeout-ms`.
+/// local anycast edge is ~10-50ms. On the S3 target — where HTTP/1.1 means one connection
+/// per in-flight GET — Cloudflare's per-IP connection mitigation manifests as handshakes
+/// that hang without erroring, so anything past this is that signature (the one legitimate
+/// slow case — a lost SYN retried at the kernel's 1s RTO — is cheaper to abort and retry on
+/// a fresh attempt than to wait out); on the custom-domain target, which holds only a few
+/// multiplexed connections, a slow handshake is ordinary DNS/TCP/TLS trouble. Either way
+/// the bound keeps a wedged endpoint from eating the caller's whole budget before its
+/// fallback gets a turn. Operators tune it via the binaries' `--r2-connect-timeout-ms`.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The two HTTP-level bounds a fetcher applies to every GET attempt, threaded together so
@@ -82,9 +84,10 @@ pub enum R2GetError {
     /// [`R2ObjectFetcher::new`]). Bodies are best-effort and capped.
     Status { number: u64, key: String, status: u16, body: String },
     /// Connection establishment failed or exceeded the connect timeout — distinct from
-    /// [`Self::Transport`] because a hung handshake to the local anycast edge is the
-    /// signature of the per-IP connection-budget mitigation, and operators alert on this
-    /// kind to detect it.
+    /// [`Self::Transport`] because on the S3 target a hung handshake to the local anycast
+    /// edge is the signature of the per-IP connection-budget mitigation, and operators
+    /// alert on this kind to detect it. On the custom-domain target (a few multiplexed h2
+    /// connections) this kind is ordinary DNS/TCP/TLS/edge trouble.
     Connect { number: u64, key: String, source: reqwest::Error },
     /// The caller's deadline expired while the fetch was still queued for a concurrency
     /// permit — under saturation the queue wait must not eat the budget the caller reserved
@@ -294,6 +297,10 @@ impl R2ObjectFetcher {
             // cross-host hops, and a same-host hop invalidates the signed URI), so following one
             // just turns the real cause into a baffling 403. Surface the 3xx as a `Status` error.
             .redirect(reqwest::redirect::Policy::none())
+            // Pin the S3 target to HTTP/1.1 in the client rather than relying on the server's
+            // ALPN choice: the endpoint only speaks h1.1 today, and this keeps the signed
+            // path's wire behavior fixed even if that ever changes upstream.
+            .http1_only()
             .build()
             .map_err(|e| format!("Failed to build R2 HTTP client: {e}"))?;
         Ok(Self {
@@ -880,6 +887,49 @@ mod tests {
         assert!(head.contains("cf-access-client-id: tok-3f1.access"), "{head}");
         assert!(head.contains("cf-access-client-secret: sec-9a2"), "{head}");
         assert!(!head.contains("authorization:"), "{head}");
+    }
+
+    /// The custom-domain client shares the no-redirect policy: a 3xx (the shape of a
+    /// Cloudflare Access login bounce) must surface as `Status`, not be followed into an
+    /// HTML page.
+    #[tokio::test]
+    async fn custom_domain_redirects_are_not_followed() {
+        let (domain, hits) = mock_r2(vec![(302, "login bounce")]).await;
+        let err = custom_fetcher(&domain, None)
+            .get_block_object(1, "0xhash", MAX_ATTEMPTS, None, || ())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, R2GetError::Status { status: 302, .. }), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// Credentials are rebuilt per attempt: the retry after a throttle must still carry the
+    /// Access pair (custom domain) / a fresh SigV4 authorization (S3) — pinned so a future
+    /// hoist of header construction out of the attempt loop cannot silently strip retries.
+    #[tokio::test]
+    async fn retries_resend_credentials() {
+        let (domain, hits, heads) = mock_r2_capturing(vec![(503, "slow"), (200, "ok")]).await;
+        let access = CfAccessCredentials {
+            client_id: "tok-3f1.access".to_string(),
+            client_secret: "sec-9a2".to_string(),
+        };
+        custom_fetcher(&domain, Some(access))
+            .get_block_object(1, "0xhash", MAX_ATTEMPTS, None, || ())
+            .await
+            .expect("retry must succeed");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let retry_head = heads.lock().unwrap()[1].to_lowercase();
+        assert!(retry_head.contains("cf-access-client-id: tok-3f1.access"), "{retry_head}");
+        assert!(retry_head.contains("cf-access-client-secret: sec-9a2"), "{retry_head}");
+
+        let (endpoint, hits, heads) = mock_r2_capturing(vec![(503, "slow"), (200, "ok")]).await;
+        fetcher(&endpoint)
+            .get_block_object(1, "0xhash", MAX_ATTEMPTS, None, || ())
+            .await
+            .expect("retry must succeed");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let retry_head = heads.lock().unwrap()[1].to_lowercase();
+        assert!(retry_head.contains("authorization: aws4-hmac-sha256"), "{retry_head}");
     }
 
     /// A custom-domain 404 carries no S3 XML; the bare body must classify as `Missing`.

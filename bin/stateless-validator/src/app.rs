@@ -96,44 +96,52 @@ pub struct CommandLineArgs {
     pub witness_source: WitnessSource,
 
     /// R2 S3 endpoint origin, e.g. `https://<account>.r2.cloudflarestorage.com` (no bucket path).
-    /// Required when `--witness-source r2`, unless `--r2-custom-domain` is used instead.
-    #[clap(long, env = "STATELESS_VALIDATOR_R2_ENDPOINT", conflicts_with = "r2_custom_domain")]
+    /// Required when `--witness-source r2`, unless `--r2-custom-domain` is used instead
+    /// (mutually exclusive — rejected at startup with an error naming both).
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_ENDPOINT")]
     pub r2_endpoint: Option<String>,
 
     /// Cloudflare custom domain fronting the witness bucket, e.g. `https://witness.example.com`
     /// (bare origin — objects are fetched as `/{key}`). Alternative to the `--r2-endpoint`
     /// credential quad with `--witness-source r2`: GETs go unsigned through the CDN edge, which
     /// multiplexes them over HTTP/2 and can serve the immutable witness objects from edge cache.
+    /// ⚠ R2 mode has no RPC fallback and retries a missing witness until the uploader wins the
+    /// race, so **any edge cache rule making these objects cacheable must set 404s to bypass
+    /// cache** — an edge-cached 404 would otherwise pin every pre-upload frontier miss for the
+    /// negative-cache TTL and stall tip-following for minutes at a time.
     #[clap(long, env = "STATELESS_VALIDATOR_R2_CUSTOM_DOMAIN")]
     pub r2_custom_domain: Option<String>,
 
     /// Cloudflare Access service-token client id, sent as `CF-Access-Client-Id` on every
     /// custom-domain GET. Omit when the domain is locked by an IP allowlist instead.
+    /// Redacted like the secret: the id alone is enough to look up the token.
     #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_ID", requires_all = ["r2_custom_domain", "r2_access_client_secret"])]
-    pub r2_access_client_id: Option<String>,
+    pub r2_access_client_id: Option<RedactedSecret>,
 
     /// Cloudflare Access service-token client secret, sent as `CF-Access-Client-Secret`. Prefer
     /// the env var over the flag.
     #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_SECRET", requires_all = ["r2_custom_domain", "r2_access_client_id"])]
     pub r2_access_client_secret: Option<RedactedSecret>,
 
-    /// R2 bucket holding the witnesses (e.g. `witness-mainnet`). Required when `--witness-source
-    /// r2`.
+    /// R2 bucket holding the witnesses (e.g. `witness-mainnet`). Required for the S3-endpoint
+    /// target of `--witness-source r2` (not used with `--r2-custom-domain`).
     #[clap(long, env = "STATELESS_VALIDATOR_R2_BUCKET")]
     pub r2_bucket: Option<String>,
 
-    /// R2 access key id (Object Read). Required when `--witness-source r2`.
+    /// R2 access key id (Object Read). Required for the S3-endpoint target of
+    /// `--witness-source r2` (not used with `--r2-custom-domain`).
     #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_KEY_ID")]
     pub r2_access_key_id: Option<String>,
 
-    /// R2 secret access key. Required when `--witness-source r2`. Prefer the env var over the
-    /// flag.
+    /// R2 secret access key. Required for the S3-endpoint target of `--witness-source r2`
+    /// (not used with `--r2-custom-domain`). Prefer the env var over the flag.
     #[clap(long, env = "STATELESS_VALIDATOR_R2_SECRET_ACCESS_KEY")]
     pub r2_secret_access_key: Option<RedactedSecret>,
 
     /// R2 connection-establishment timeout (milliseconds). A healthy handshake to the local
-    /// anycast edge is tens of ms; hangs past this are the per-IP connection-budget
-    /// mitigation's signature and surface as retryable `connect`-kind errors.
+    /// anycast edge is tens of ms. On the S3 endpoint, hangs past this are the per-IP
+    /// connection-budget mitigation's signature; on a custom domain they are ordinary
+    /// network/TLS faults. Either way they surface as retryable `connect`-kind errors.
     #[clap(
         long,
         env = "STATELESS_VALIDATOR_R2_CONNECT_TIMEOUT_MS",
@@ -283,6 +291,7 @@ pub async fn run() -> Result<()> {
     // In R2 mode the RpcClient's witness providers are never used, but its constructor requires
     // a non-empty list — hand it the data endpoints as a placeholder.
     let data_apis: Vec<&str> = args.rpc_endpoint.iter().map(String::as_str).collect();
+    reject_dual_r2_targets(&args.r2_endpoint, &args.r2_custom_domain)?;
     let r2_witness = match args.witness_source {
         WitnessSource::Rpc => {
             if args.witness_endpoint.is_empty() {
@@ -458,6 +467,21 @@ fn require_r2<'a, T: AsRef<str>>(value: &'a Option<T>, flag: &str) -> Result<&'a
         .ok_or_else(|| eyre::eyre!("{flag} is required with --witness-source r2"))
 }
 
+/// Rejects both R2 targets configured at once, by name. Enforced here rather than via clap
+/// conflicts because clap cannot name env-sourced arguments in conflict errors — a leftover
+/// env line would fail with an unactionable message. Set-but-empty values don't count as
+/// configured here; they get their own named error from the R2 setup path.
+fn reject_dual_r2_targets(endpoint: &Option<String>, custom_domain: &Option<String>) -> Result<()> {
+    let set = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.is_empty());
+    if set(endpoint) && set(custom_domain) {
+        return Err(eyre::eyre!(
+            "--r2-endpoint and --r2-custom-domain are mutually exclusive R2 targets: \
+             configure exactly one"
+        ));
+    }
+    Ok(())
+}
+
 /// Reads an optional `--r2-*` argument: absent selects the other target, but set-and-empty
 /// (the shape of a failed env injection) is a hard error rather than a silent fallthrough
 /// to a target the operator did not pick.
@@ -484,6 +508,20 @@ mod tests {
             require_r2(&Some("https://x".to_string()), "--r2-endpoint").unwrap(),
             "https://x"
         );
+    }
+
+    #[test]
+    fn dual_r2_targets_are_rejected_by_name() {
+        let endpoint = Some("https://acc.r2.cloudflarestorage.com".to_string());
+        let domain = Some("https://w.example.com".to_string());
+        let err = reject_dual_r2_targets(&endpoint, &domain).unwrap_err().to_string();
+        assert!(err.contains("--r2-endpoint") && err.contains("--r2-custom-domain"), "{err}");
+
+        assert!(reject_dual_r2_targets(&endpoint, &None).is_ok());
+        assert!(reject_dual_r2_targets(&None, &domain).is_ok());
+        // A blank env line does not count as a configured target — it must not turn a
+        // working single-target config into a phantom conflict.
+        assert!(reject_dual_r2_targets(&Some(String::new()), &domain).is_ok());
     }
 
     #[test]

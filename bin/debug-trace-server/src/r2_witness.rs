@@ -1,6 +1,7 @@
 //! Direct-from-R2 witness source.
 //!
-//! Fetches the primary witness object straight from the R2 bucket over the S3 API and decodes
+//! Fetches the primary witness object straight from the R2 bucket — via SigV4-signed S3
+//! GETs or unsigned GETs through a Cloudflare custom domain, per construction — and decodes
 //! it with the **light** decoder — the trace server never verifies the witness proof, so the
 //! full decode's per-point elliptic-curve work would buy nothing (see
 //! `stateless_core::light_witness`). The transport core is `stateless-r2`'s
@@ -40,8 +41,8 @@ pub(crate) const KIND_MISSING_ABOVE_TIP: &str = "missing_above_tip";
 /// Failure outcome of an R2 witness fetch.
 #[derive(Debug, thiserror::Error)]
 pub enum R2WitnessError {
-    /// The signed GET failed (absent object, transport, throttle, unexpected status, or
-    /// out of deadline while queued).
+    /// The GET failed (absent object, transport, throttle, unexpected status, or out of
+    /// deadline while queued).
     #[error(transparent)]
     Get(#[from] R2GetError),
     /// The object was fetched but its bytes did not decode to a witness tuple — a corrupt

@@ -196,6 +196,9 @@ fn r2_custom_domain_target_wiring() {
             .as_deref(),
         Some("https://witness.example.com")
     );
+    // Both targets parse — mutual exclusion is enforced at startup with an error naming
+    // both flags (clap conflicts cannot name env-sourced arguments; see
+    // `reject_dual_r2_targets` and its unit test in app.rs).
     assert!(
         parse(&[
             "--r2-custom-domain",
@@ -203,8 +206,8 @@ fn r2_custom_domain_target_wiring() {
             "--r2-endpoint",
             "https://acc.r2.cloudflarestorage.com",
         ])
-        .is_err(),
-        "custom domain + S3 endpoint must fail parsing"
+        .is_ok(),
+        "both targets must parse; rejection happens post-parse"
     );
     assert!(
         parse(&[
