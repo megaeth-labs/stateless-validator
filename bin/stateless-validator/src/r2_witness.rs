@@ -38,7 +38,7 @@ use crate::metrics;
 
 /// Throttle applied before surfacing any deterministic (non-retryable) failure: the pipeline
 /// fetcher (`stateless-core/src/pipeline/fetcher.rs`) re-enqueues failed fetches with no delay,
-/// so returning instantly would hot-loop signed GETs against R2. Delete this once the fetcher
+/// so returning instantly would hot-loop GETs against R2. Delete this once the fetcher
 /// grows per-block re-enqueue backoff. Test builds shrink it so the failure-path tests run in
 /// milliseconds.
 const DETERMINISTIC_FAILURE_THROTTLE: Duration =

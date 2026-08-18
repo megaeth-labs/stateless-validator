@@ -27,7 +27,10 @@ use std::{
 
 use bytes::Bytes;
 use chrono::Utc;
-use reqwest::Client;
+use reqwest::{
+    Client,
+    header::{HeaderMap, HeaderName, HeaderValue},
+};
 use tokio::sync::Semaphore;
 use tracing::warn;
 
@@ -63,7 +66,8 @@ pub struct FetchTimeouts {
     pub connect: Duration,
 }
 
-/// Failure outcome of a signed witness-object `GET`, after the fetcher's own retries.
+/// Failure outcome of a witness-object `GET`, after the fetcher's own retries. Shared by both
+/// targets: the classification happens on the response, below the signed/unsigned split.
 ///
 /// Decode failures are deliberately absent: the fetcher stops at bytes, and each reader
 /// classifies its own decode errors.
@@ -210,6 +214,34 @@ pub struct CfAccessCredentials {
     pub client_secret: String,
 }
 
+impl CfAccessCredentials {
+    /// Builds the two Access headers, marked sensitive so they are never HPACK-indexed and
+    /// stay redacted in header debug output.
+    ///
+    /// Fails when a value cannot be an HTTP header value — a trailing newline picked up from a
+    /// secret file or an unquoted env line is the usual cause. The offending value is never
+    /// echoed: it is the credential. Validating here turns what would otherwise be a builder
+    /// error raised per GET — classified retryable and so retried forever, with no startup
+    /// failure — into one named error at construction.
+    fn into_header_map(self) -> Result<HeaderMap, String> {
+        let mut headers = HeaderMap::new();
+        for (name, value, flag) in [
+            ("cf-access-client-id", self.client_id, "--r2-access-client-id"),
+            ("cf-access-client-secret", self.client_secret, "--r2-access-client-secret"),
+        ] {
+            let mut value = HeaderValue::from_str(&value).map_err(|_| {
+                format!(
+                    "{flag} is not a valid HTTP header value (control characters — a trailing \
+                     newline from the secret store is the usual cause)"
+                )
+            })?;
+            value.set_sensitive(true);
+            headers.insert(HeaderName::from_static(name), value);
+        }
+        Ok(headers)
+    }
+}
+
 impl std::fmt::Debug for CfAccessCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CfAccessCredentials")
@@ -219,8 +251,9 @@ impl std::fmt::Debug for CfAccessCredentials {
     }
 }
 
-/// How a [`R2ObjectFetcher`] reaches the bucket. `Debug` is safe to derive: both credential
-/// holders redact themselves.
+/// How a [`R2ObjectFetcher`] reaches the bucket. `Debug` is safe to derive: the only credential
+/// holder left ([`SigV4Signer`]) redacts itself, and Access tokens live on the client's default
+/// headers rather than here.
 #[derive(Clone, Debug)]
 enum Target {
     /// SigV4-signed GETs of `/{bucket}/{key}` against the bare S3 API endpoint.
@@ -233,11 +266,12 @@ enum Target {
         bucket: String,
     },
     /// Unsigned GETs of `/{key}` against a Cloudflare custom domain fronting the bucket.
+    ///
+    /// Any Cloudflare Access service token is attached by the client's default headers, so it
+    /// cannot be bypassed by a request path that does not go through `request_parts`.
     CustomDomain {
         /// Domain origin (`scheme://host`, no trailing slash).
         origin: String,
-        /// Optional Cloudflare Access service-token headers.
-        access: Option<CfAccessCredentials>,
     },
 }
 
@@ -258,7 +292,27 @@ fn parse_target_origin(
              e.g. {example}"
         ));
     }
+    // A scheme reqwest cannot drive would pass startup and then fail inside `send()` as a
+    // builder error — classified retryable, so a permanently broken URL would be retried
+    // forever instead of failing once here.
+    if !origin.starts_with("https://") && !origin.starts_with("http://") {
+        return Err(format!(
+            "Invalid R2 {label}: only http and https are supported, e.g. {example}"
+        ));
+    }
     Ok((origin, host))
+}
+
+/// Whether `host[:port]` names the loopback interface, where plaintext `http` is the mock and
+/// port-forward shape rather than a credential exposure.
+fn is_loopback_host(host: &str) -> bool {
+    let bare = match host.strip_prefix('[') {
+        // IPv6 literal, `[::1]` or `[::1]:8080`.
+        Some(rest) => rest.split(']').next().unwrap_or(rest),
+        None => host.split(':').next().unwrap_or(host),
+    };
+    bare.eq_ignore_ascii_case("localhost") ||
+        bare.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// The HTTP client settings both targets share; each constructor adds its own wire posture.
@@ -285,7 +339,7 @@ fn concurrency_permits(max_concurrent_requests: Option<usize>) -> Arc<Semaphore>
 /// through a Cloudflare custom domain (see the module docs for the two targets).
 ///
 /// Cloning is cheap — the `reqwest::Client` and the target's credential holders are
-/// internally reference-counted / small. `Debug` is safe to derive: [`Target`] redacts.
+/// internally reference-counted / small. `Debug` is safe to derive: the target redacts.
 #[derive(Clone, Debug)]
 pub struct R2ObjectFetcher {
     http: Client,
@@ -385,17 +439,41 @@ impl R2ObjectFetcher {
         pacing: RetryPacing,
         max_concurrent_requests: Option<usize>,
     ) -> Result<Self, String> {
-        let (origin, _host) =
+        let (origin, host) =
             parse_target_origin(domain, "custom domain", "https://witness.example.com")?;
-        let http = base_client(timeouts)
+        // An Access service token is a bearer credential; plaintext would put it on the wire in
+        // the clear on every GET. Loopback stays allowed — that is the mock and port-forward
+        // shape, not an exposure.
+        if access.is_some() && origin.starts_with("http://") && !is_loopback_host(&host) {
+            return Err("Refusing to send Cloudflare Access credentials over plaintext http:// \
+                 to a non-loopback host: give --r2-custom-domain an https:// origin"
+                .to_string());
+        }
+        let mut builder = base_client(timeouts)
+            // Cloudflare's Browser Integrity Check, on by default on many zones, challenges
+            // requests that carry no user agent — which would arrive here as a non-retryable
+            // 403 on every GET. It also makes this traffic attributable in zone analytics.
+            .user_agent(concat!("stateless-r2/", env!("CARGO_PKG_VERSION")))
             .http2_adaptive_window(true)
             .http2_keep_alive_interval(Duration::from_secs(30))
             .http2_keep_alive_while_idle(true)
-            .build()
-            .map_err(|e| format!("Failed to build R2 HTTP client: {e}"))?;
+            // Keep-alive pings hold the connection open at the protocol level, but the pool
+            // reaps idle connections on a 90s default of its own — shorter than the gaps
+            // between request waves that this single multiplexed connection exists to survive.
+            .pool_idle_timeout(None)
+            // Stated rather than inherited: with keep-alive pings on, this is what bounds how
+            // long a blackholed connection keeps accepting doomed streams.
+            .http2_keep_alive_timeout(Duration::from_secs(20));
+        if let Some(access) = access {
+            // On the client, not per attempt: authentication is then a property of every
+            // request this fetcher makes, and an unusable credential fails here by name
+            // instead of once per GET as a retryable transport error.
+            builder = builder.default_headers(access.into_header_map()?);
+        }
+        let http = builder.build().map_err(|e| format!("Failed to build R2 HTTP client: {e}"))?;
         Ok(Self {
             http,
-            target: Target::CustomDomain { origin, access },
+            target: Target::CustomDomain { origin },
             per_attempt_timeout: timeouts.per_attempt,
             pacing,
             concurrency: concurrency_permits(max_concurrent_requests),
@@ -488,18 +566,10 @@ impl R2ObjectFetcher {
                 let signed = signer.sign("GET", host, &canonical_uri, "", &[], b"", Utc::now());
                 (url, signed)
             }
-            Target::CustomDomain { origin, access } => {
-                let url = format!("{origin}{}", encode_key_path(key));
-                let headers = access
-                    .as_ref()
-                    .map(|a| {
-                        vec![
-                            ("CF-Access-Client-Id".to_string(), a.client_id.clone()),
-                            ("CF-Access-Client-Secret".to_string(), a.client_secret.clone()),
-                        ]
-                    })
-                    .unwrap_or_default();
-                (url, headers)
+            // No per-attempt headers: any Access token is on the client's default headers,
+            // so it rides every request without this seam having to remember it.
+            Target::CustomDomain { origin } => {
+                (format!("{origin}{}", encode_key_path(key)), Vec::new())
             }
         }
     }
@@ -847,6 +917,104 @@ mod tests {
     fn custom_fetcher(domain: &str, access: Option<CfAccessCredentials>) -> R2ObjectFetcher {
         R2ObjectFetcher::new_custom_domain(domain, access, test_timeouts(), test_pacing(), None)
             .unwrap()
+    }
+
+    /// A credential that cannot be a header value fails at construction, by flag name and
+    /// without echoing the value. Left to `send()` it becomes a reqwest builder error, which
+    /// classifies as retryable `Transport` — so every GET would burn the full retry ramp
+    /// forever and no startup failure would ever name the real cause.
+    #[test]
+    fn access_credential_with_a_control_byte_fails_construction_without_echoing_it() {
+        let err = R2ObjectFetcher::new_custom_domain(
+            "https://witness.example.com",
+            Some(CfAccessCredentials {
+                client_id: "tok-3f1.access".to_string(),
+                // The shape of `$(cat secret.txt)` or an unquoted env-file line.
+                client_secret: "sec-9a2\n".to_string(),
+            }),
+            test_timeouts(),
+            test_pacing(),
+            None,
+        )
+        .expect_err("a trailing newline cannot be a header value");
+        assert!(err.contains("--r2-access-client-secret"), "{err}");
+        assert!(!err.contains("sec-9a2"), "the secret must never reach a log line: {err}");
+    }
+
+    /// Access tokens are bearer credentials, so a plaintext non-loopback origin is refused
+    /// rather than putting them on the wire in the clear on every GET.
+    #[test]
+    fn access_credentials_are_refused_over_plaintext_to_a_remote_host() {
+        let access = || {
+            Some(CfAccessCredentials {
+                client_id: "tok-3f1.access".to_string(),
+                client_secret: "sec-9a2".to_string(),
+            })
+        };
+        let err = R2ObjectFetcher::new_custom_domain(
+            "http://witness.example.com",
+            access(),
+            test_timeouts(),
+            test_pacing(),
+            None,
+        )
+        .expect_err("plaintext + credentials to a remote host must be refused");
+        assert!(err.contains("plaintext"), "{err}");
+
+        // Loopback stays usable: that is the mock and port-forward shape, and every
+        // custom-domain test here depends on it.
+        for loopback in ["http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080"] {
+            R2ObjectFetcher::new_custom_domain(
+                loopback,
+                access(),
+                test_timeouts(),
+                test_pacing(),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("{loopback} must be allowed: {e}"));
+        }
+        // Plaintext without credentials has nothing to leak.
+        custom_fetcher("http://witness.example.com", None);
+    }
+
+    /// A scheme reqwest cannot drive is rejected at construction on both targets; left alone it
+    /// surfaces per GET as a retryable transport error, retrying a permanently broken URL.
+    #[test]
+    fn non_http_schemes_are_rejected_on_both_targets() {
+        let custom = R2ObjectFetcher::new_custom_domain(
+            "ftp://witness.example.com",
+            None,
+            test_timeouts(),
+            test_pacing(),
+            None,
+        )
+        .expect_err("ftp is not drivable");
+        assert!(custom.contains("only http and https"), "{custom}");
+
+        let s3 = R2ObjectFetcher::new(
+            "ftp://acc.r2.cloudflarestorage.com",
+            "witness-mainnet".to_string(),
+            "ak".to_string(),
+            "sk".to_string(),
+            test_timeouts(),
+            test_pacing(),
+            None,
+        )
+        .expect_err("ftp is not drivable");
+        assert!(s3.contains("only http and https"), "{s3}");
+    }
+
+    /// Cloudflare's Browser Integrity Check challenges user-agent-less requests, which would
+    /// arrive as a non-retryable 403 on every GET — and the validator's R2 mode has no fallback.
+    #[tokio::test]
+    async fn custom_domain_sends_a_user_agent() {
+        let (domain, _hits, heads) = mock_r2_capturing(vec![(200, "witness bytes")]).await;
+        custom_fetcher(&domain, None)
+            .get_block_object(2500, "0xblock", MAX_ATTEMPTS, None, || ())
+            .await
+            .expect("200 must succeed");
+        let head = heads.lock().unwrap()[0].to_lowercase();
+        assert!(head.contains("user-agent: stateless-r2/"), "{head}");
     }
 
     #[test]

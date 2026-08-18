@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 
 use eyre::Result;
-use metrics::{Counter, Gauge, Histogram, counter, histogram};
+use metrics::{Counter, Gauge, Histogram, counter, gauge, histogram};
 use metrics_derive::Metrics;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 pub use stateless_common::{
@@ -517,6 +517,23 @@ const R2_WITNESS_QUEUE_WAIT_SECONDS: &str = "debug_trace_r2_witness_queue_wait_s
 /// Records the queued share of one R2 witness fetch.
 pub fn record_r2_witness_queue_wait(seconds: f64) {
     histogram!(R2_WITNESS_QUEUE_WAIT_SECONDS).record(seconds);
+}
+
+/// Which R2 target this process was configured with, as a constant-1 info gauge labeled
+/// `target`. The R2 series above carry no target dimension, so during a fleet rollout — some
+/// hosts on the custom domain, some still on the S3 endpoint — a spike in
+/// `debug_trace_r2_witness_errors_total` cannot be attributed to one or the other. Joining on
+/// this gauge supplies that dimension without changing the established metric contract.
+const R2_TARGET_INFO: &str = "debug_trace_r2_target_info";
+
+/// Label value for the SigV4-signed bare S3 endpoint target.
+pub const R2_TARGET_S3: &str = "s3";
+/// Label value for the unsigned Cloudflare custom-domain target.
+pub const R2_TARGET_CUSTOM_DOMAIN: &str = "custom_domain";
+
+/// Publishes the configured R2 target once at startup.
+pub fn record_r2_target(target: &'static str) {
+    gauge!(R2_TARGET_INFO, "target" => target).set(1.0);
 }
 
 /// Canonical number → hash resolution counter, labeled `(source, outcome)` — how often

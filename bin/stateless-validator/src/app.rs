@@ -23,7 +23,8 @@ pub enum WitnessSource {
     /// `mega_getBlockWitness` RPC.
     #[default]
     Rpc,
-    /// Straight from the R2 bucket over the S3 API. Requires the `--r2-*` flags.
+    /// Straight from the R2 bucket: either the signed S3 API (`--r2-endpoint` and its
+    /// credential quad) or an unsigned Cloudflare custom domain (`--r2-custom-domain`).
     R2,
 }
 
@@ -140,8 +141,12 @@ pub struct CommandLineArgs {
 
     /// R2 connection-establishment timeout (milliseconds). A healthy handshake to the local
     /// anycast edge is tens of ms. On the S3 endpoint, hangs past this are the per-IP
-    /// connection-budget mitigation's signature; on a custom domain they are ordinary
-    /// network/TLS faults. Either way they surface as retryable `connect`-kind errors.
+    /// connection-budget mitigation's signature and keep landing in the connect phase, since
+    /// every in-flight GET holds its own connection; they surface as retryable `connect`-kind
+    /// errors. The custom domain pools a single h2 connection, so this bounds its first
+    /// handshake and any reconnect — a path that breaks after that surfaces as `transport`
+    /// against the per-attempt budget until the keep-alive ping reaps the connection, and in
+    /// R2 mode there is no RPC chain to fall back to.
     #[clap(
         long,
         env = "STATELESS_VALIDATOR_R2_CONNECT_TIMEOUT_MS",
@@ -291,7 +296,15 @@ pub async fn run() -> Result<()> {
     // In R2 mode the RpcClient's witness providers are never used, but its constructor requires
     // a non-empty list — hand it the data endpoints as a placeholder.
     let data_apis: Vec<&str> = args.rpc_endpoint.iter().map(String::as_str).collect();
-    reject_dual_r2_targets(&args.r2_endpoint, &args.r2_custom_domain)?;
+    reject_conflicting_r2_targets(
+        &args.r2_endpoint,
+        &args.r2_custom_domain,
+        &[
+            ("--r2-bucket", args.r2_bucket.is_some()),
+            ("--r2-access-key-id", args.r2_access_key_id.is_some()),
+            ("--r2-secret-access-key", args.r2_secret_access_key.is_some()),
+        ],
+    )?;
     let r2_witness = match args.witness_source {
         WitnessSource::Rpc => {
             if args.witness_endpoint.is_empty() {
@@ -425,7 +438,7 @@ fn require_r2<'a, T: AsRef<str>>(value: &'a Option<T>, flag: &str) -> Result<&'a
 /// Builds the R2 witness client for `--witness-source r2`: the custom-domain target when
 /// `--r2-custom-domain` is set, the SigV4-signed S3 target otherwise.
 ///
-/// Which target wins is already settled by [`reject_dual_r2_targets`], so this only reads the
+/// Which target wins is already settled by [`reject_conflicting_r2_targets`], so this reads the
 /// one that was chosen — a set-but-empty flag belonging to the *other* target is not seen here.
 fn build_r2_client(
     args: &CommandLineArgs,
@@ -447,6 +460,7 @@ fn build_r2_client(
             retry,
             args.witness_max_concurrent_requests,
         )?;
+        metrics::record_r2_target(metrics::R2_TARGET_CUSTOM_DOMAIN);
         info!(domain = %client.origin(), cf_access, "Witness source: R2 (custom domain)");
         return Ok(client);
     }
@@ -463,23 +477,50 @@ fn build_r2_client(
         retry,
         args.witness_max_concurrent_requests,
     )?;
+    metrics::record_r2_target(metrics::R2_TARGET_S3);
     info!(endpoint = %client.origin(), bucket, "Witness source: R2 (direct S3)");
     Ok(client)
 }
 
-/// Rejects both R2 targets configured at once, by name. Enforced here rather than via clap
-/// conflicts because clap cannot name env-sourced arguments in conflict errors — a leftover
-/// env line would fail with an unactionable message. Set-but-empty values don't count as
-/// configured here; they get their own named error from the R2 setup path.
-fn reject_dual_r2_targets(endpoint: &Option<String>, custom_domain: &Option<String>) -> Result<()> {
-    let set = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.is_empty());
-    if set(endpoint) && set(custom_domain) {
+/// Rejects an R2 configuration that names more than one target, by flag name.
+///
+/// Enforced here rather than via clap conflicts because this workspace builds clap without its
+/// `error-context` feature (see the root `Cargo.toml`), so a clap conflict prints a generic
+/// message naming no argument — unactionable for an operator whose only clue is an env file.
+///
+/// Two shapes are rejected. Both targets configured is the obvious one. The subtler one is a
+/// leftover from the migration the README documents as the custom domain "replacing" the four
+/// S3 flags: those flags are then dead configuration, and reading past them in silence leaves
+/// an operator believing credentials are in use that are not. Leftovers count by *presence*,
+/// so a blank `..._R2_ENDPOINT=` line is caught too — that is the failed-env-injection shape,
+/// and it is invisible to the set-but-empty check, which only ever runs on the chosen target.
+fn reject_conflicting_r2_targets(
+    endpoint: &Option<String>,
+    custom_domain: &Option<String>,
+    s3_only_flags: &[(&str, bool)],
+) -> Result<()> {
+    let configured = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.is_empty());
+    if configured(endpoint) && configured(custom_domain) {
         return Err(eyre::eyre!(
             "--r2-endpoint and --r2-custom-domain are mutually exclusive R2 targets: \
              configure exactly one"
         ));
     }
-    Ok(())
+    if custom_domain.is_none() {
+        return Ok(());
+    }
+    let leftovers: Vec<&str> = std::iter::once(("--r2-endpoint", endpoint.is_some()))
+        .chain(s3_only_flags.iter().copied())
+        .filter_map(|(flag, present)| present.then_some(flag))
+        .collect();
+    if leftovers.is_empty() {
+        return Ok(());
+    }
+    Err(eyre::eyre!(
+        "--r2-custom-domain replaces the S3 target: unset the leftover {} (ignoring them \
+         silently would hide which credentials are actually in use)",
+        leftovers.join(", ")
+    ))
 }
 
 /// Reads an optional `--r2-*` argument: absent selects the other target, but set-and-empty
@@ -511,17 +552,37 @@ mod tests {
     }
 
     #[test]
-    fn dual_r2_targets_are_rejected_by_name() {
+    fn conflicting_r2_targets_are_rejected_by_name() {
         let endpoint = Some("https://acc.r2.cloudflarestorage.com".to_string());
         let domain = Some("https://w.example.com".to_string());
-        let err = reject_dual_r2_targets(&endpoint, &domain).unwrap_err().to_string();
+        let clean: &[(&str, bool)] = &[];
+
+        let err = reject_conflicting_r2_targets(&endpoint, &domain, clean).unwrap_err().to_string();
         assert!(err.contains("--r2-endpoint") && err.contains("--r2-custom-domain"), "{err}");
 
-        assert!(reject_dual_r2_targets(&endpoint, &None).is_ok());
-        assert!(reject_dual_r2_targets(&None, &domain).is_ok());
-        // A blank env line does not count as a configured target — it must not turn a
-        // working single-target config into a phantom conflict.
-        assert!(reject_dual_r2_targets(&Some(String::new()), &domain).is_ok());
+        // One target, nothing left over from the other.
+        assert!(reject_conflicting_r2_targets(&endpoint, &None, clean).is_ok());
+        assert!(reject_conflicting_r2_targets(&None, &domain, clean).is_ok());
+
+        // S3 flags left set alongside the custom domain are dead configuration — the README
+        // calls the domain a replacement for them — so they are named, and only the ones
+        // actually set are.
+        let leftovers: &[(&str, bool)] = &[
+            ("--r2-bucket", true),
+            ("--r2-access-key-id", false),
+            ("--r2-secret-access-key", false),
+        ];
+        let err = reject_conflicting_r2_targets(&None, &domain, leftovers).unwrap_err().to_string();
+        assert!(err.contains("--r2-bucket"), "{err}");
+        assert!(!err.contains("--r2-access-key-id"), "only the flags actually set: {err}");
+
+        // A blank `..._R2_ENDPOINT=` line counts as presence, not as a configured target: it is
+        // reported as a leftover. It used to be read past in silence, which left the operator
+        // believing the S3 endpoint was still in play.
+        let err = reject_conflicting_r2_targets(&Some(String::new()), &domain, clean)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--r2-endpoint"), "{err}");
     }
 
     #[test]

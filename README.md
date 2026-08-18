@@ -35,7 +35,7 @@ The workspace contains two binaries and five library crates:
 | `stateless-db`         | `crates/stateless-db`         | redb-backed persistence: table definitions, read/write helpers, bounded `ContractCache`                                                                                              |
 | `stateless-common`     | `crates/stateless-common`     | Shared utilities: RPC client, logging, metrics                                                                                                                                       |
 | `stateless-test-utils` | `crates/stateless-test-utils` | Test fixtures (blocks, witnesses, contracts) and env-var lock for integration tests                                                                                                  |
-| `stateless-r2`         | `crates/stateless-r2`         | Shared R2 (S3) witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT/GET with retry; consumed by mega-reth's witness uploaders (write), this repo's validator, and the trace server's witness source (read) |
+| `stateless-r2`         | `crates/stateless-r2`         | Shared R2 witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT, and the retrying witness-object GET fetcher over either the signed S3 API or an unsigned Cloudflare custom domain; consumed by mega-reth's witness uploaders (write), this repo's validator, and the trace server's witness source (read) |
 | `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers                                                                                                                                 |
 | `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                                                                                                                        |
 
@@ -74,9 +74,9 @@ cargo run --release --bin stateless-validator -- \
 - `--genesis-file`: Path to genesis JSON file containing hardfork activation configuration (required on first run, stored in database for subsequent runs)
 - `--start-block`: Trusted block hash to initialize validation from (required for first-time setup)
 - `--end-block`: Inclusive end block; validate up to this height, then stop cleanly (useful to slice a fixed range across multiple servers)
-- `--witness-source`: Where to fetch witnesses from: `rpc` (default) or `r2` (straight from the R2 bucket over the S3 API)
+- `--witness-source`: Where to fetch witnesses from: `rpc` (default) or `r2` (straight from the R2 bucket, over either the signed S3 API or a Cloudflare custom domain)
 - `--r2-endpoint`, `--r2-bucket`, `--r2-access-key-id`, `--r2-secret-access-key`: R2 connection settings for the S3-endpoint target of `--witness-source r2`, all four required together (prefer the env var for the secret)
-- `--r2-custom-domain`: alternative R2 target for `--witness-source r2` that replaces the four flags above — unsigned HTTP/2 GETs through a Cloudflare custom domain fronting the bucket (mutually exclusive with `--r2-endpoint`; optional `--r2-access-client-id`/`--r2-access-client-secret` attach Cloudflare Access service-token headers; the domain's cache rule must set 404s to bypass cache, since R2 mode has no RPC fallback and a cached pre-upload 404 would stall tip-following)
+- `--r2-custom-domain`: alternative R2 target for `--witness-source r2` that replaces the four flags above — unsigned HTTP/2 GETs through a Cloudflare custom domain fronting the bucket (mutually exclusive with `--r2-endpoint`, and any of the four left set is rejected at startup by name rather than silently ignored; optional `--r2-access-client-id`/`--r2-access-client-secret` attach Cloudflare Access service-token headers, which require an `https://` domain unless it is loopback; the domain's cache rule must set 404s to bypass cache, since R2 mode has no RPC fallback and a cached pre-upload 404 would stall tip-following)
 - `--report-validation-endpoint`: RPC endpoint URL for reporting validated blocks via `mega_setValidatedBlocks` (disabled if not provided)
 - `--metrics-enabled`: Enable Prometheus metrics endpoint (disabled by default)
 - `--metrics-port`: Port for Prometheus metrics HTTP endpoint (default: 9090)
@@ -160,6 +160,9 @@ A `missing` classifies by band: in-band is expected probe-ahead (excluded from `
 The bucket is the same store the public gateway serves witnesses from, so at the frontier it can lead the generator (whose RPC server publishes from a different file than the uploader reads); the route needs a local DB (`--data-dir`) to anchor block age.
 `--r2-custom-domain` selects the alternative R2 target (mutually exclusive with `--r2-endpoint`, rejected at startup with an error naming both): unsigned GETs of `/{key}` through a Cloudflare custom domain fronting the bucket, which negotiates HTTP/2 — many in-flight GETs multiplex over a few connections instead of holding one connection each against the HTTP/1.1-only S3 endpoint — and can serve the immutable witness objects from edge cache; optional `--r2-access-client-id`/`--r2-access-client-secret` attach Cloudflare Access service-token headers.
 Client-side routing, budgets, and fallback match the S3 target; edge behavior is zone configuration, and **any cache rule making these objects cacheable must set 404s to bypass cache** — an edge-cached 404 would otherwise pin a pre-upload frontier miss for the negative-cache TTL and can false-fire the below-band `kind="missing"` bucket-integrity alarm.
+The client sends a `User-Agent`, because Cloudflare's Browser Integrity Check — on by default on many zones — challenges requests without one, and that arrives here as a non-retryable 403 on every GET.
+Keep `--r2-max-concurrent-requests` at or below the edge's per-connection stream limit (Cloudflare's is 100): above it, GETs queue inside the HTTP/2 connection where the wait counts against the per-attempt timeout and never reaches `debug_trace_r2_witness_queue_wait_seconds`.
+The configured target is published as the constant-1 gauge `debug_trace_r2_target_info{target}` (`r2_target_info` on the validator), so the target-less R2 series can be attributed to one target or the other during a rollout.
 Any single witness-chain RPC attempt under a deadline is additionally capped at the tightest of: half the witness stage budget, the global per-attempt timeout, and — only while the round still has an untried provider to rotate to — half of what the call still has as the attempt starts (recomputed after any permit wait).
 The round's last hop, and every hop of a single-provider chain, takes the remainder whole under the ceiling instead, so a stalled endpoint (or a saturated concurrency permit — waits are deadline-bounded too) can never consume the stage while a rotation is still worth reserving for, and a slow-but-honest transfer is never structurally condemned; the witness decode runs outside the attempt window, bounded by the request deadline alone.
 `--r2-max-concurrent-requests` caps in-flight GETs separately from `--witness-max-concurrent-requests` — the RPC cap sizes a shared gateway, R2 tolerates far more.
@@ -180,7 +183,8 @@ Each command-line flag has an equivalent environment variable:
 - `STATELESS_VALIDATOR_START_BLOCK` → `--start-block`
 - `STATELESS_VALIDATOR_END_BLOCK` → `--end-block`
 - `STATELESS_VALIDATOR_WITNESS_SOURCE` → `--witness-source`
-- `STATELESS_VALIDATOR_R2_ENDPOINT` / `_R2_BUCKET` / `_R2_ACCESS_KEY_ID` / `_R2_SECRET_ACCESS_KEY` → `--r2-*`
+- `STATELESS_VALIDATOR_R2_ENDPOINT` / `_R2_BUCKET` / `_R2_ACCESS_KEY_ID` / `_R2_SECRET_ACCESS_KEY` → `--r2-*` (the signed S3 target)
+- `STATELESS_VALIDATOR_R2_CUSTOM_DOMAIN` / `_R2_ACCESS_CLIENT_ID` / `_R2_ACCESS_CLIENT_SECRET` → `--r2-custom-domain` and its Cloudflare Access pair
 - `STATELESS_VALIDATOR_REPORT_VALIDATION_ENDPOINT` → `--report-validation-endpoint`
 - `STATELESS_VALIDATOR_METRICS_ENABLED` → `--metrics-enabled` (set to `true` to enable)
 - `STATELESS_VALIDATOR_METRICS_PORT` → `--metrics-port`

@@ -92,6 +92,7 @@ pub mod names {
     metric!(WITNESS_FETCH_R2_TIME, "witness_fetch_r2_time_seconds");
     metric!(R2_WITNESS_RETRY_ATTEMPTS_TOTAL, "r2_witness_retry_attempts_total");
     metric!(R2_WITNESS_ERRORS_TOTAL, "r2_witness_errors_total");
+    metric!(R2_TARGET_INFO, "r2_target_info");
 
     // Contract cache
     metric!(CONTRACT_CACHE_HITS, "contract_cache_hits_total");
@@ -192,6 +193,11 @@ fn register_metric_descriptions() {
         "R2 witness GET retry attempts (before final outcome)"
     );
     describe_counter!(
+        names::R2_TARGET_INFO,
+        "Configured R2 target, as a constant-1 gauge labeled `target` (join to give the \
+         target-less R2 series a target dimension during a rollout)"
+    );
+    describe_gauge!(
         names::R2_WITNESS_ERRORS_TOTAL,
         "R2 witness fetches that surfaced an error to the pipeline, by kind"
     );
@@ -235,6 +241,21 @@ fn init_r2_witness_counters() {
     for kind in R2WitnessError::KINDS {
         counter!(names::R2_WITNESS_ERRORS_TOTAL, "kind" => *kind).increment(0);
     }
+}
+
+/// Label value for the SigV4-signed bare S3 endpoint target.
+pub const R2_TARGET_S3: &str = "s3";
+/// Label value for the unsigned Cloudflare custom-domain target.
+pub const R2_TARGET_CUSTOM_DOMAIN: &str = "custom_domain";
+
+/// Publishes the configured R2 target once at startup.
+///
+/// The R2 series carry no target dimension, so during a fleet rollout — some hosts on the
+/// custom domain, some still on the S3 endpoint — a spike in `r2_witness_errors_total` cannot
+/// be attributed to either. Joining on this gauge supplies that dimension without changing the
+/// established metric contract.
+pub fn record_r2_target(target: &'static str) {
+    gauge!(names::R2_TARGET_INFO, "target" => target).set(1.0);
 }
 
 /// Record validation timing and block statistics after successful validation.
