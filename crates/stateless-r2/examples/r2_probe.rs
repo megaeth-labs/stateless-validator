@@ -17,11 +17,6 @@
 //!
 //! Block hashes are resolved through the gateway so the probe needs no local node.
 //!
-//! Because the probe drives the production fetcher, its requests carry the production header
-//! set — notably **no `User-Agent`**. That makes it the right acceptance tool for a
-//! Cloudflare-fronted domain: a `curl` check can pass where production fails, since curl
-//! sends a UA and Cloudflare's Browser Integrity Check challenges requests without one.
-//!
 //! ```text
 //! export DEBUG_TRACE_SERVER_WITNESS_ENDPOINT=...  # gateway URL for hash resolution
 //! # S3 mode:
@@ -37,7 +32,6 @@
 //! ```
 
 use std::{
-    collections::BTreeMap,
     env,
     error::Error,
     sync::{Arc, Mutex},
@@ -67,14 +61,9 @@ async fn resolve_hashes(
 ) -> Result<Vec<(u64, String)>, Box<dyn Error>> {
     let client = reqwest::Client::new();
     let mut out = Vec::new();
-    let end = start + count;
     let mut n = start;
-    // Driven by the block range rather than by `out.len()`: a gateway that answers a batch
-    // with fewer items than requested must still terminate the loop instead of walking `n`
-    // forward into an empty range and indexing off the end of it.
-    while n < end {
-        let chunk: Vec<u64> = (n..(n + 100).min(end)).collect();
-        // Non-empty while `n < end`, so the last-element index cannot underflow.
+    while (out.len() as u64) < count {
+        let chunk: Vec<u64> = (n..(n + 100).min(start + count)).collect();
         n = chunk[chunk.len() - 1] + 1;
         let body: Vec<serde_json::Value> = chunk
             .iter()
@@ -97,56 +86,33 @@ async fn resolve_hashes(
         let resp: Vec<serde_json::Value> = serde_json::from_slice(&raw)?;
         for item in resp {
             let id = item["id"].as_u64().ok_or("batch item without id")? as usize;
-            // The id is echoed by the gateway, so it is untrusted input into this index.
-            let number = *chunk
-                .get(id)
-                .ok_or_else(|| format!("gateway echoed out-of-range batch id {id}"))?;
             let hash = item["result"]["hash"]
                 .as_str()
-                .ok_or_else(|| format!("no hash for block {number}"))?;
-            out.push((number, hash.to_string()));
+                .ok_or_else(|| format!("no hash for block {}", chunk[id]))?;
+            out.push((chunk[id], hash.to_string()));
         }
     }
     out.sort();
-    // A gateway that repeats an id would otherwise inflate the per-rung GET count.
-    out.dedup();
     Ok(out)
 }
 
-/// One concurrency rung's measurements.
-struct LevelStats {
-    wall: f64,
-    /// Per-GET latency in ms with the fetcher's own queue wait subtracted, sorted. Folding
-    /// queue wait in would report the probe's self-imposed cap as R2 slowness, and would make
-    /// a tighter rung look slower than a looser one on an identical link.
-    lat: Vec<f64>,
-    /// Per-GET time in ms spent waiting on the concurrency cap, sorted.
-    queue: Vec<f64>,
-    fails: usize,
-    bytes: u64,
-    /// Failure count and one sample message per `R2GetError` kind, so a wall of failures says
-    /// *why* rather than only how many.
-    errors: BTreeMap<&'static str, (usize, String)>,
-}
-
-async fn run_level(fetcher: &R2ObjectFetcher, blocks: &[(u64, String)]) -> LevelStats {
-    let samples = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+async fn run_level(
+    fetcher: &R2ObjectFetcher,
+    blocks: &[(u64, String)],
+) -> (f64, Vec<f64>, usize, u64) {
+    let lat = Arc::new(Mutex::new(Vec::new()));
     let mut fails = 0usize;
     let mut bytes = 0u64;
-    let mut errors: BTreeMap<&'static str, (usize, String)> = BTreeMap::new();
     let t0 = Instant::now();
     let mut tasks = tokio::task::JoinSet::new();
     for (number, hash) in blocks.iter().cloned() {
         let fetcher = fetcher.clone();
-        let samples = Arc::clone(&samples);
+        let lat = Arc::clone(&lat);
         tasks.spawn(async move {
             let t = Instant::now();
             let r = fetcher.get_block_object(number, hash, 1, None, || ()).await;
             r.map(|f| {
-                let net = t.elapsed().saturating_sub(f.queue_wait);
-                let mut s = samples.lock().unwrap();
-                s.0.push(net.as_secs_f64() * 1000.0);
-                s.1.push(f.queue_wait.as_secs_f64() * 1000.0);
+                lat.lock().unwrap().push(t.elapsed().as_secs_f64() * 1000.0);
                 f.bytes.len() as u64
             })
         });
@@ -154,39 +120,27 @@ async fn run_level(fetcher: &R2ObjectFetcher, blocks: &[(u64, String)]) -> Level
     while let Some(res) = tasks.join_next().await {
         match res.unwrap() {
             Ok(b) => bytes += b,
-            Err(e) => {
-                fails += 1;
-                errors.entry(e.kind()).or_insert_with(|| (0, e.to_string())).0 += 1;
-            }
+            Err(_) => fails += 1,
         }
     }
     let wall = t0.elapsed().as_secs_f64();
-    let (mut lat, mut queue) = Arc::try_unwrap(samples).unwrap().into_inner().unwrap();
+    let mut lat = Arc::try_unwrap(lat).unwrap().into_inner().unwrap();
     lat.sort_by(f64::total_cmp);
-    queue.sort_by(f64::total_cmp);
-    LevelStats { wall, lat, queue, fails, bytes, errors }
+    (wall, lat, fails, bytes)
 }
 
-fn report(tag: &str, conc: usize, s: &LevelStats, n: usize) {
+fn report(tag: &str, conc: usize, wall: f64, lat: &[f64], fails: usize, bytes: u64, n: usize) {
     println!(
-        "[{tag} conc={conc:3}] wall={:6.0}ms  ok={:3} fail={:3}  {:5.1} wit/s           {:6.2}MB  p50/p90/p99/max={:.0}/{:.0}/{:.0}/{:.0}ms  queue p50/max={:.0}/{:.0}ms",
-        s.wall * 1000.0,
-        n - s.fails,
-        s.fails,
-        (n - s.fails) as f64 / s.wall,
-        s.bytes as f64 / 1e6,
-        pct(&s.lat, 0.5),
-        pct(&s.lat, 0.9),
-        pct(&s.lat, 0.99),
-        s.lat.last().copied().unwrap_or(f64::NAN),
-        pct(&s.queue, 0.5),
-        s.queue.last().copied().unwrap_or(f64::NAN),
+        "[{tag} conc={conc:3}] wall={:6.0}ms  ok={:3} fail={fails:3}  {:5.1} wit/s           {:6.2}MB  p50/p90/p99/max={:.0}/{:.0}/{:.0}/{:.0}ms",
+        wall * 1000.0,
+        n - fails,
+        (n - fails) as f64 / wall,
+        bytes as f64 / 1e6,
+        pct(lat, 0.5),
+        pct(lat, 0.9),
+        pct(lat, 0.99),
+        lat.last().copied().unwrap_or(f64::NAN),
     );
-    // Without this a failed rung prints only a count, leaving a rejected token, an unattached
-    // domain, a wrong bucket and an unreachable host indistinguishable from each other.
-    for (kind, (count, sample)) in &s.errors {
-        println!("           fail kind={kind:9} n={count:3}  e.g. {sample}");
-    }
 }
 
 #[tokio::main]
@@ -211,11 +165,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // An unauthenticated GET is enough to learn the ALPN outcome — the error response
     // still carries the negotiated version.
-    // Redirects disabled to match the production fetcher: an Access-protected domain answers
-    // an unauthenticated GET with a 302 to the login page, and following it would report the
-    // login host's negotiated version instead of the domain under test.
-    let probe_client =
-        reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
+    let probe_client = reqwest::Client::builder().build()?;
     match probe_client.get(&alpn_target).send().await {
         Ok(resp) => println!("[alpn] negotiated {:?}, status {}", resp.version(), resp.status()),
         Err(e) => println!("[alpn] probe request failed: {e}"),
@@ -224,18 +174,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("[prep] resolving {count} hashes from block {start} via gateway ...");
     let blocks = resolve_hashes(&gateway, start, count).await?;
     println!("[prep] resolved {}", blocks.len());
-    if blocks.is_empty() {
-        return Err(
-            "gateway resolved no block hashes: check the endpoint and the block range".into()
-        );
-    }
-    if (blocks.len() as u64) < count {
-        println!(
-            "[prep] WARNING: gateway returned {} of {count} requested blocks; every rung runs \
-             that many GETs",
-            blocks.len()
-        );
-    }
 
     let timeouts =
         FetchTimeouts { per_attempt: Duration::from_secs(30), connect: DEFAULT_CONNECT_TIMEOUT };
@@ -286,8 +224,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             ),
         };
         let fetcher = fetcher.map_err(|e| -> Box<dyn Error> { e.into() })?;
-        let stats = run_level(&fetcher, &blocks).await;
-        report(tag, conc, &stats, blocks.len());
+        let (wall, lat, fails, bytes) = run_level(&fetcher, &blocks).await;
+        report(tag, conc, wall, &lat, fails, bytes, blocks.len());
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     Ok(())
