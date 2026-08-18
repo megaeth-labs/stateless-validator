@@ -526,11 +526,6 @@ pub fn record_r2_witness_queue_wait(seconds: f64) {
 /// this gauge supplies that dimension without changing the established metric contract.
 const R2_TARGET_INFO: &str = "debug_trace_r2_target_info";
 
-/// Label value for the SigV4-signed bare S3 endpoint target.
-pub const R2_TARGET_S3: &str = "s3";
-/// Label value for the unsigned Cloudflare custom-domain target.
-pub const R2_TARGET_CUSTOM_DOMAIN: &str = "custom_domain";
-
 /// Publishes the configured R2 target once at startup.
 pub fn record_r2_target(target: &'static str) {
     gauge!(R2_TARGET_INFO, "target" => target).set(1.0);

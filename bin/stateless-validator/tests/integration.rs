@@ -197,8 +197,8 @@ fn r2_custom_domain_target_wiring() {
         Some("https://witness.example.com")
     );
     // Both targets parse — mutual exclusion is enforced at startup with an error naming
-    // both flags (clap's own rejection would name neither — no `error-context`; see
-    // `reject_dual_r2_targets` and its unit test in app.rs).
+    // both flags, which clap's own rejection could not do (see `reject_conflicting_r2_targets`
+    // and its unit test in app.rs).
     assert!(
         parse(&[
             "--r2-custom-domain",

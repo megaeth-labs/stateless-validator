@@ -111,6 +111,11 @@ impl R2WitnessClient {
         self.fetcher.origin()
     }
 
+    /// The configured target's metric label (see [`R2ObjectFetcher::target_label`]).
+    pub const fn target_label(&self) -> &'static str {
+        self.fetcher.target_label()
+    }
+
     /// Builds a client from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
     ///
     /// `timeouts` bounds each individual GET (end-to-end and connect). `retry_backoff` paces the

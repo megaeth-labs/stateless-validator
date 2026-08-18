@@ -296,9 +296,18 @@ pub async fn run() -> Result<()> {
     // In R2 mode the RpcClient's witness providers are never used, but its constructor requires
     // a non-empty list — hand it the data endpoints as a placeholder.
     let data_apis: Vec<&str> = args.rpc_endpoint.iter().map(String::as_str).collect();
+    reject_empty_r2_values(&[
+        ("--r2-endpoint", args.r2_endpoint.as_deref()),
+        ("--r2-bucket", args.r2_bucket.as_deref()),
+        ("--r2-access-key-id", args.r2_access_key_id.as_deref()),
+        ("--r2-secret-access-key", args.r2_secret_access_key.as_ref().map(AsRef::as_ref)),
+        ("--r2-custom-domain", args.r2_custom_domain.as_deref()),
+        ("--r2-access-client-id", args.r2_access_client_id.as_ref().map(AsRef::as_ref)),
+        ("--r2-access-client-secret", args.r2_access_client_secret.as_ref().map(AsRef::as_ref)),
+    ])?;
     reject_conflicting_r2_targets(
-        &args.r2_endpoint,
-        &args.r2_custom_domain,
+        args.r2_endpoint.as_deref(),
+        args.r2_custom_domain.as_deref(),
         &[
             ("--r2-bucket", args.r2_bucket.is_some()),
             ("--r2-access-key-id", args.r2_access_key_id.is_some()),
@@ -427,11 +436,11 @@ fn override_ms(ms: Option<u64>, default: Duration) -> Duration {
 }
 
 /// Unwraps a required `--r2-*` argument, erroring with the flag name when it is absent.
+///
+/// Defined through [`optional_r2`] so both readers agree on what an empty value means: it is
+/// reported as a failed env injection, not as an absent flag.
 fn require_r2<'a, T: AsRef<str>>(value: &'a Option<T>, flag: &str) -> Result<&'a str> {
-    value
-        .as_ref()
-        .map(AsRef::as_ref)
-        .filter(|v| !v.is_empty())
+    optional_r2(value, flag)?
         .ok_or_else(|| eyre::eyre!("{flag} is required with --witness-source r2"))
 }
 
@@ -460,7 +469,7 @@ fn build_r2_client(
             retry,
             args.witness_max_concurrent_requests,
         )?;
-        metrics::record_r2_target(metrics::R2_TARGET_CUSTOM_DOMAIN);
+        metrics::record_r2_target(client.target_label());
         info!(domain = %client.origin(), cf_access, "Witness source: R2 (custom domain)");
         return Ok(client);
     }
@@ -477,9 +486,26 @@ fn build_r2_client(
         retry,
         args.witness_max_concurrent_requests,
     )?;
-    metrics::record_r2_target(metrics::R2_TARGET_S3);
+    metrics::record_r2_target(client.target_label());
     info!(endpoint = %client.origin(), bucket, "Witness source: R2 (direct S3)");
     Ok(client)
+}
+
+/// Rejects any `--r2-*` flag that is present but empty — the shape of a failed env injection.
+///
+/// Runs over every R2 flag before target selection, matching the trace server's order, so an
+/// empty value is diagnosed as itself rather than read as a configured target or as a leftover
+/// from one. Without this pass a blank `..._R2_CUSTOM_DOMAIN=` beside a working S3 config gets
+/// told to unset the S3 config.
+fn reject_empty_r2_values(values: &[(&str, Option<&str>)]) -> Result<()> {
+    for (flag, value) in values {
+        if value.is_some_and(str::is_empty) {
+            return Err(eyre::eyre!(
+                "{flag} is set but empty (empty env var injection?): unset it or give it a value"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Rejects an R2 configuration that names more than one target, by flag name.
@@ -488,31 +514,27 @@ fn build_r2_client(
 /// `error-context` feature (see the root `Cargo.toml`), so a clap conflict prints a generic
 /// message naming no argument — unactionable for an operator whose only clue is an env file.
 ///
-/// Two shapes are rejected. Both targets configured is the obvious one. The subtler one is a
-/// leftover from the migration the README documents as the custom domain "replacing" the four
-/// S3 flags: those flags are then dead configuration, and reading past them in silence leaves
-/// an operator believing credentials are in use that are not. Leftovers count by *presence*,
-/// so a blank `..._R2_ENDPOINT=` line is caught too — that is the failed-env-injection shape,
-/// and it is invisible to the set-but-empty check, which only ever runs on the chosen target.
+/// Presence is the only predicate: [`reject_empty_r2_values`] has already rejected empty
+/// values, so anything still set is something the operator meant. Two shapes are rejected —
+/// both targets at once, and S3 flags left behind by the migration the README documents as the
+/// custom domain "replacing" them, which are dead configuration that would otherwise be read
+/// past in silence.
 fn reject_conflicting_r2_targets(
-    endpoint: &Option<String>,
-    custom_domain: &Option<String>,
+    endpoint: Option<&str>,
+    custom_domain: Option<&str>,
     s3_only_flags: &[(&str, bool)],
 ) -> Result<()> {
-    let configured = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.is_empty());
-    if configured(endpoint) && configured(custom_domain) {
+    if custom_domain.is_none() {
+        return Ok(());
+    }
+    if endpoint.is_some() {
         return Err(eyre::eyre!(
             "--r2-endpoint and --r2-custom-domain are mutually exclusive R2 targets: \
              configure exactly one"
         ));
     }
-    if custom_domain.is_none() {
-        return Ok(());
-    }
-    let leftovers: Vec<&str> = std::iter::once(("--r2-endpoint", endpoint.is_some()))
-        .chain(s3_only_flags.iter().copied())
-        .filter_map(|(flag, present)| present.then_some(flag))
-        .collect();
+    let leftovers: Vec<&str> =
+        s3_only_flags.iter().filter(|(_, set)| *set).map(|(flag, _)| *flag).collect();
     if leftovers.is_empty() {
         return Ok(());
     }
@@ -553,36 +575,52 @@ mod tests {
 
     #[test]
     fn conflicting_r2_targets_are_rejected_by_name() {
-        let endpoint = Some("https://acc.r2.cloudflarestorage.com".to_string());
-        let domain = Some("https://w.example.com".to_string());
+        let endpoint = Some("https://acc.r2.cloudflarestorage.com");
+        let domain = Some("https://w.example.com");
         let clean: &[(&str, bool)] = &[];
 
-        let err = reject_conflicting_r2_targets(&endpoint, &domain, clean).unwrap_err().to_string();
+        let err = reject_conflicting_r2_targets(endpoint, domain, clean).unwrap_err().to_string();
         assert!(err.contains("--r2-endpoint") && err.contains("--r2-custom-domain"), "{err}");
 
         // One target, nothing left over from the other.
-        assert!(reject_conflicting_r2_targets(&endpoint, &None, clean).is_ok());
-        assert!(reject_conflicting_r2_targets(&None, &domain, clean).is_ok());
+        assert!(reject_conflicting_r2_targets(endpoint, None, clean).is_ok());
+        assert!(reject_conflicting_r2_targets(None, domain, clean).is_ok());
 
         // S3 flags left set alongside the custom domain are dead configuration — the README
-        // calls the domain a replacement for them — so they are named, and only the ones
-        // actually set are.
+        // calls the domain a replacement for them — and only the ones actually set are named.
         let leftovers: &[(&str, bool)] = &[
             ("--r2-bucket", true),
             ("--r2-access-key-id", false),
             ("--r2-secret-access-key", false),
         ];
-        let err = reject_conflicting_r2_targets(&None, &domain, leftovers).unwrap_err().to_string();
+        let err = reject_conflicting_r2_targets(None, domain, leftovers).unwrap_err().to_string();
         assert!(err.contains("--r2-bucket"), "{err}");
         assert!(!err.contains("--r2-access-key-id"), "only the flags actually set: {err}");
+    }
 
-        // A blank `..._R2_ENDPOINT=` line counts as presence, not as a configured target: it is
-        // reported as a leftover. It used to be read past in silence, which left the operator
-        // believing the S3 endpoint was still in play.
-        let err = reject_conflicting_r2_targets(&Some(String::new()), &domain, clean)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("--r2-endpoint"), "{err}");
+    /// Empty values are diagnosed as themselves, before target selection can read a blank line
+    /// as a configured target or as a leftover from one.
+    #[test]
+    fn empty_r2_values_are_rejected_before_target_selection() {
+        assert!(
+            reject_empty_r2_values(&[
+                ("--r2-endpoint", Some("https://acc.r2.cloudflarestorage.com")),
+                ("--r2-bucket", None),
+            ])
+            .is_ok()
+        );
+
+        let err = reject_empty_r2_values(&[
+            ("--r2-endpoint", Some("https://acc.r2.cloudflarestorage.com")),
+            ("--r2-bucket", Some("witness-mainnet")),
+            ("--r2-custom-domain", Some("")),
+        ])
+        .unwrap_err()
+        .to_string();
+        // Regression guard: a blank custom-domain line beside a working S3 config once reached
+        // the leftover branch and told the operator to unset that working S3 config.
+        assert!(err.contains("--r2-custom-domain") && err.contains("set but empty"), "{err}");
+        assert!(!err.contains("--r2-endpoint"), "must not blame the working S3 config: {err}");
     }
 
     #[test]

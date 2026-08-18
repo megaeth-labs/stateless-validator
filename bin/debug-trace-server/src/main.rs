@@ -500,9 +500,10 @@ fn validate_args(args: &Args) -> Result<()> {
              --witness-endpoint: list the generator once, via the dedicated flag"
         );
     }
-    // Clap's `requires` wiring makes the `--r2-*` flags all-or-nothing, but it checks
-    // presence, not content: an env var injected as the empty string (a secret that failed
-    // to materialize is the common shape) would otherwise build a live source whose every
+    // Emptiness is swept first, before the target checks below, so a blank env line is
+    // diagnosed as itself rather than read as a configured target: an env var injected as the
+    // empty string (a secret that failed to materialize is the common shape) would otherwise
+    // build a live source whose every
     // GET reports `kind="missing"` — the exact counter operators watch for
     // bucket-completeness gaps. Reject emptiness before a bad deploy can read as data loss.
     let r2_values = [
@@ -530,10 +531,9 @@ fn validate_args(args: &Args) -> Result<()> {
              configure exactly one"
         );
     }
-    // Named here rather than left to clap's `requires`: this workspace builds clap without its
-    // `error-context` feature, so a `requires` violation prints "one or more required arguments
-    // were not provided" naming nothing — and the shapes that trip it are exactly the ones an
-    // operator hits while following the README's S3 → custom-domain migration.
+    // Named here rather than left to clap's `requires` (see the note on `Args`): the shapes
+    // that trip these rules are exactly the ones an operator hits while following the README's
+    // S3 → custom-domain migration, where an unnamed flag is no help at all.
     let s3_flags = [
         ("--r2-endpoint", args.r2_endpoint.is_some()),
         ("--r2-bucket", args.r2_bucket.is_some()),
@@ -679,9 +679,9 @@ async fn main() -> Result<()> {
     // Direct-from-R2 witness source — unsigned through a Cloudflare custom domain when
     // configured (h2-multiplexed, edge-cacheable), otherwise SigV4-signed against the bare
     // S3 endpoint. `validate_args` is what keeps the two targets mutually exclusive (clap's
-    // group deliberately allows both so the error can name them), and it also rejects empty
-    // values and the data-dir-less combination; clap keeps the four S3 flags all-or-nothing.
-    // Shares the RPC path's per-attempt timeout and retry pacing.
+    // group deliberately allows both so the error can name them); it also rejects empty
+    // values, S3 flags left over from the other target, an incomplete S3 quad, and the
+    // data-dir-less combination. Shares the RPC path's per-attempt timeout and retry pacing.
     let r2_timeouts = stateless_r2::fetch::FetchTimeouts {
         per_attempt: per_attempt_timeout,
         connect: std::time::Duration::from_millis(args.r2_connect_timeout_ms),
@@ -702,7 +702,7 @@ async fn main() -> Result<()> {
             rpc_retry,
             args.r2_max_concurrent_requests,
         )?;
-        metrics::record_r2_target(metrics::R2_TARGET_CUSTOM_DOMAIN);
+        metrics::record_r2_target(source.target_label());
         info!(
             domain = %source.origin(),
             cf_access, "Historical witness source: R2 (custom domain), RPC chain as fallback"
@@ -720,7 +720,7 @@ async fn main() -> Result<()> {
             rpc_retry,
             args.r2_max_concurrent_requests,
         )?;
-        metrics::record_r2_target(metrics::R2_TARGET_S3);
+        metrics::record_r2_target(source.target_label());
         info!(
             endpoint = %source.origin(),
             bucket, "Historical witness source: R2 (direct S3), RPC chain as fallback"
@@ -1574,11 +1574,8 @@ mod tests {
         );
         let _ = parse_args(&[]); // no R2 flags stays valid
 
-        // Dropping any one flag=value pair of the quad breaks the group.
-        // Dropping any one flag=value pair of the quad is rejected — by `validate_args`, which
-        // can name the missing flag. Clap's `requires` used to do it, but this workspace builds
-        // clap without `error-context`, so it could only say "one or more required arguments
-        // were not provided" — unactionable for an operator whose config lives in an env file.
+        // Dropping any one flag=value pair of the quad is rejected by `validate_args`, which
+        // names the missing flag; clap's `requires` used to do it but could not (see `Args`).
         for skip in 0..4 {
             let partial: Vec<&str> = full
                 .chunks(2)
@@ -1627,8 +1624,7 @@ mod tests {
         }
 
         // The two read targets are mutually exclusive — rejected by `validate_args` with an
-        // error naming both flags (clap's own rejection would name neither: this workspace
-        // has no `error-context` feature).
+        // error naming both flags (clap's own rejection would name neither — see `Args`).
         let both = Args::try_parse_from(
             base.iter()
                 .copied()

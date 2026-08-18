@@ -105,6 +105,11 @@ impl R2WitnessSource {
         self.fetcher.origin()
     }
 
+    /// The configured target's metric label (see [`R2ObjectFetcher::target_label`]).
+    pub const fn target_label(&self) -> &'static str {
+        self.fetcher.target_label()
+    }
+
     /// Builds a source from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
     ///
     /// `timeouts` bounds each individual GET end-to-end and in its connect phase (further

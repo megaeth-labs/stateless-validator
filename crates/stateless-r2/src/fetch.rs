@@ -38,7 +38,7 @@ use crate::{
     client::is_throttle_status,
     endpoint::parse_endpoint,
     keys,
-    sigv4::{Header, SigV4Signer, encode_key_path, encode_uri_path},
+    sigv4::{SigV4Signer, encode_key_path, encode_uri_path},
 };
 
 /// Cap on the response body carried inside `Throttled`/`Status` errors.
@@ -370,6 +370,18 @@ impl R2ObjectFetcher {
         }
     }
 
+    /// Stable lowercase label for the configured target, for callers' metric labels.
+    ///
+    /// Lives here for the same reason [`R2GetError::kind`] does: the vocabulary belongs to the
+    /// enum it names, so a renamed or added target cannot leave a binary publishing a stale
+    /// string that nothing would flag.
+    pub const fn target_label(&self) -> &'static str {
+        match &self.target {
+            Target::S3 { .. } => "s3",
+            Target::CustomDomain { .. } => "custom_domain",
+        }
+    }
+
     /// Builds a fetcher from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
     ///
     /// `timeouts` bounds each individual GET (end-to-end and connect phase). `pacing`
@@ -554,22 +566,24 @@ impl R2ObjectFetcher {
         }
     }
 
-    /// Builds one attempt's request URL and headers for this fetcher's target: the signed
-    /// S3 layout (`/{bucket}/{key}` + SigV4 headers) or the unsigned custom-domain layout
-    /// (`/{key}` + optional Access headers).
-    fn request_parts(&self, key: &str) -> (String, Vec<Header>) {
+    /// Builds one attempt's request for this fetcher's target: the signed S3 layout
+    /// (`/{bucket}/{key}` plus freshly-signed SigV4 headers) or the unsigned custom-domain
+    /// layout (`/{key}`, whose only credentials are the client's default headers).
+    ///
+    /// Called per attempt because a SigV4 signature is timestamped and cannot be reused.
+    fn request(&self, key: &str) -> reqwest::RequestBuilder {
         match &self.target {
             Target::S3 { signer, endpoint, host, bucket } => {
                 let canonical_uri = encode_uri_path(bucket, key);
-                let url = format!("{endpoint}{canonical_uri}");
                 // Signed-payload mode with an empty body: x-amz-content-sha256 = sha256("").
                 let signed = signer.sign("GET", host, &canonical_uri, "", &[], b"", Utc::now());
-                (url, signed)
+                signed.into_iter().fold(
+                    self.http.get(format!("{endpoint}{canonical_uri}")),
+                    |request, (name, value)| request.header(name, value),
+                )
             }
-            // No per-attempt headers: any Access token is on the client's default headers,
-            // so it rides every request without this seam having to remember it.
             Target::CustomDomain { origin } => {
-                (format!("{origin}{}", encode_key_path(key)), Vec::new())
+                self.http.get(format!("{origin}{}", encode_key_path(key)))
             }
         }
     }
@@ -581,18 +595,13 @@ impl R2ObjectFetcher {
         key: &str,
         deadline: Option<Instant>,
     ) -> Result<Bytes, R2GetError> {
-        let (url, headers) = self.request_parts(key);
-
-        let mut request = self.http.get(&url);
+        let mut request = self.request(key);
         // Clamp the attempt to the remaining budget; an already-expired deadline degrades to
         // a floor timeout whose transport error the retry loop then surfaces as out-of-time.
         if let Some(deadline) = deadline {
             let remaining =
                 deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
             request = request.timeout(self.per_attempt_timeout.min(remaining));
-        }
-        for (name, value) in headers {
-            request = request.header(name, value);
         }
         let transport = |source: reqwest::Error| {
             let key = key.to_string();

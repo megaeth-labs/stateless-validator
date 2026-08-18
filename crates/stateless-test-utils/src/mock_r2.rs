@@ -55,13 +55,13 @@ pub async fn mock_r2(responses: Vec<(u16, impl Into<Vec<u8>>)>) -> (String, Arc<
     (endpoint, hits)
 }
 
-/// [`mock_r2`] that additionally captures each request's head (request line + headers, read
-/// up to the blank line that terminates it), for tests asserting the wire shape — the request
-/// path and which auth headers were (or were not) sent.
 /// Cap on a captured request head, so a client that never terminates its headers cannot grow
 /// the buffer without bound.
 const MAX_CAPTURED_HEAD_BYTES: usize = 64 * 1024;
 
+/// [`mock_r2`] that additionally captures each request's head (request line + headers, read
+/// up to the blank line that terminates it), for tests asserting the wire shape — the request
+/// path and which auth headers were (or were not) sent.
 pub async fn mock_r2_capturing(
     responses: Vec<(u16, impl Into<Vec<u8>>)>,
 ) -> (String, Arc<AtomicUsize>, Arc<std::sync::Mutex<Vec<String>>>) {
