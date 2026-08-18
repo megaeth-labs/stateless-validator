@@ -5775,7 +5775,6 @@ dependencies = [
  "hmac",
  "percent-encoding",
  "reqwest",
- "serde_json",
  "sha2 0.10.9",
  "stateless-test-utils",
  "tokio",

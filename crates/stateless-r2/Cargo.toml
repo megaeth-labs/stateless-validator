@@ -33,6 +33,5 @@ tracing = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 # misc
-serde_json.workspace = true
 stateless-test-utils = { path = "../stateless-test-utils" }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
