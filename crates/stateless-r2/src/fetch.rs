@@ -241,6 +241,46 @@ enum Target {
     },
 }
 
+/// Parses a target's bare origin, rejecting anything that is not `scheme://host[:port]`.
+///
+/// `label` and `example` name the flag the caller owns, so each target keeps its own error.
+/// The raw input is never echoed back: a rejected shape may carry inline credentials
+/// (userinfo), and this message ends up in startup logs.
+fn parse_target_origin(
+    input: &str,
+    label: &str,
+    example: &str,
+) -> Result<(String, String), String> {
+    let (origin, host) = parse_endpoint(input);
+    if host.is_empty() {
+        return Err(format!(
+            "Invalid R2 {label}: expected a bare scheme://host origin (no path/query/userinfo), \
+             e.g. {example}"
+        ));
+    }
+    Ok((origin, host))
+}
+
+/// The HTTP client settings both targets share; each constructor adds its own wire posture.
+///
+/// Neither target may follow a redirect. A SigV4-signed GET cannot survive one — reqwest strips
+/// `authorization` on cross-host hops and a same-host hop invalidates the signed URI, so
+/// following just turns the real cause into a baffling 403. A 3xx from a custom domain is
+/// itself the signal (Cloudflare Access bouncing an unauthenticated client to its login page),
+/// which following would bury under an HTML body. Both surface the 3xx as a `Status` error.
+fn base_client(timeouts: FetchTimeouts) -> reqwest::ClientBuilder {
+    Client::builder()
+        .timeout(timeouts.per_attempt)
+        .connect_timeout(timeouts.connect)
+        .redirect(reqwest::redirect::Policy::none())
+}
+
+/// Permits for the in-flight GET cap: `None` = unlimited, `Some(0)` clamps to 1 — a
+/// zero-permit semaphore would wedge every fetch on `acquire()` forever.
+fn concurrency_permits(max_concurrent_requests: Option<usize>) -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(max_concurrent_requests.unwrap_or(Semaphore::MAX_PERMITS).max(1)))
+}
+
 /// Fetches witness objects from an R2 bucket — SigV4-signed over the S3 API, or unsigned
 /// through a Cloudflare custom domain (see the module docs for the two targets).
 ///
@@ -265,6 +305,17 @@ impl R2ObjectFetcher {
         self.pacing
     }
 
+    /// This fetcher's target origin (`scheme://host[:port]`).
+    ///
+    /// Callers log this instead of the flag they were given: the raw operator string can carry
+    /// inline credentials (userinfo), and these lines are info-level.
+    pub fn origin(&self) -> &str {
+        match &self.target {
+            Target::S3 { endpoint, .. } => endpoint,
+            Target::CustomDomain { origin, .. } => origin,
+        }
+    }
+
     /// Builds a fetcher from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
     ///
     /// `timeouts` bounds each individual GET (end-to-end and connect phase). `pacing`
@@ -282,21 +333,12 @@ impl R2ObjectFetcher {
         pacing: RetryPacing,
         max_concurrent_requests: Option<usize>,
     ) -> Result<Self, String> {
-        let (origin, host) = parse_endpoint(endpoint);
-        if host.is_empty() {
-            // The raw input is not echoed: a rejected shape may carry inline credentials
-            // (userinfo), and this message ends up in startup logs.
-            return Err("Invalid R2 endpoint: expected a bare scheme://host origin (no \
-                 path/query/userinfo), e.g. https://<account>.r2.cloudflarestorage.com"
-                .to_string());
-        }
-        let http = Client::builder()
-            .timeout(timeouts.per_attempt)
-            .connect_timeout(timeouts.connect)
-            // A SigV4-signed GET can never survive a redirect (reqwest strips `authorization` on
-            // cross-host hops, and a same-host hop invalidates the signed URI), so following one
-            // just turns the real cause into a baffling 403. Surface the 3xx as a `Status` error.
-            .redirect(reqwest::redirect::Policy::none())
+        let (origin, host) = parse_target_origin(
+            endpoint,
+            "endpoint",
+            "https://<account>.r2.cloudflarestorage.com",
+        )?;
+        let http = base_client(timeouts)
             // Pin the S3 target to HTTP/1.1 in the client rather than relying on the server's
             // ALPN choice: the endpoint only speaks h1.1 today, and this keeps the signed
             // path's wire behavior fixed even if that ever changes upstream.
@@ -313,9 +355,7 @@ impl R2ObjectFetcher {
             },
             per_attempt_timeout: timeouts.per_attempt,
             pacing,
-            concurrency: Arc::new(Semaphore::new(
-                max_concurrent_requests.unwrap_or(Semaphore::MAX_PERMITS).max(1),
-            )),
+            concurrency: concurrency_permits(max_concurrent_requests),
         })
     }
 
@@ -345,21 +385,9 @@ impl R2ObjectFetcher {
         pacing: RetryPacing,
         max_concurrent_requests: Option<usize>,
     ) -> Result<Self, String> {
-        let (origin, host) = parse_endpoint(domain);
-        if host.is_empty() {
-            // The raw input is not echoed: a rejected shape may carry inline credentials
-            // (userinfo), and this message ends up in startup logs.
-            return Err("Invalid R2 custom domain: expected a bare scheme://host origin (no \
-                 path/query/userinfo), e.g. https://witness.example.com"
-                .to_string());
-        }
-        let http = Client::builder()
-            .timeout(timeouts.per_attempt)
-            .connect_timeout(timeouts.connect)
-            // An unexpected 3xx here is a misconfigured domain (e.g. Cloudflare Access
-            // bouncing an unauthenticated client to its login page); following it would bury
-            // that signal under an HTML body, so surface the 3xx as a `Status` error.
-            .redirect(reqwest::redirect::Policy::none())
+        let (origin, _host) =
+            parse_target_origin(domain, "custom domain", "https://witness.example.com")?;
+        let http = base_client(timeouts)
             .http2_adaptive_window(true)
             .http2_keep_alive_interval(Duration::from_secs(30))
             .http2_keep_alive_while_idle(true)
@@ -370,9 +398,7 @@ impl R2ObjectFetcher {
             target: Target::CustomDomain { origin, access },
             per_attempt_timeout: timeouts.per_attempt,
             pacing,
-            concurrency: Arc::new(Semaphore::new(
-                max_concurrent_requests.unwrap_or(Semaphore::MAX_PERMITS).max(1),
-            )),
+            concurrency: concurrency_permits(max_concurrent_requests),
         })
     }
 

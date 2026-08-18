@@ -632,21 +632,22 @@ async fn main() -> Result<()> {
 
     // Direct-from-R2 witness source — unsigned through a Cloudflare custom domain when
     // configured (h2-multiplexed, edge-cacheable), otherwise SigV4-signed against the bare
-    // S3 endpoint. Clap keeps the two targets mutually exclusive and the four S3 flags
-    // all-or-nothing, and `validate_args` rejects empty values and the data-dir-less
-    // combination. Shares the RPC path's per-attempt timeout and retry pacing.
+    // S3 endpoint. `validate_args` is what keeps the two targets mutually exclusive (clap's
+    // group deliberately allows both so the error can name them), and it also rejects empty
+    // values and the data-dir-less combination; clap keeps the four S3 flags all-or-nothing.
+    // Shares the RPC path's per-attempt timeout and retry pacing.
     let r2_timeouts = stateless_r2::fetch::FetchTimeouts {
         per_attempt: per_attempt_timeout,
         connect: std::time::Duration::from_millis(args.r2_connect_timeout_ms),
     };
-    let r2_witness_source = if let Some(domain) = &args.r2_custom_domain {
-        let access = match (&args.r2_access_client_id, &args.r2_access_client_secret) {
-            (Some(client_id), Some(secret)) => Some(stateless_r2::fetch::CfAccessCredentials {
-                client_id: client_id.as_ref().to_string(),
-                client_secret: secret.as_ref().to_string(),
-            }),
-            _ => None,
-        };
+    let r2_source = if let Some(domain) = &args.r2_custom_domain {
+        let access =
+            args.r2_access_client_id.as_ref().zip(args.r2_access_client_secret.as_ref()).map(
+                |(client_id, secret)| stateless_r2::fetch::CfAccessCredentials {
+                    client_id: client_id.as_ref().to_string(),
+                    client_secret: secret.as_ref().to_string(),
+                },
+            );
         let cf_access = access.is_some();
         let source = R2WitnessSource::new_custom_domain(
             domain,
@@ -655,43 +656,32 @@ async fn main() -> Result<()> {
             rpc_retry,
             args.r2_max_concurrent_requests,
         )?;
-        // Log the parsed origin, not the raw flag value — the raw string is
-        // operator input and this line is info-level.
-        let (origin, _) = stateless_r2::endpoint::parse_endpoint(domain);
         info!(
-            domain = %origin,
+            domain = %source.origin(),
             cf_access, "Historical witness source: R2 (custom domain), RPC chain as fallback"
         );
-        Some(Arc::new(source))
+        Some(source)
+    } else if let (Some(endpoint), Some(bucket), Some(access_key_id), Some(secret)) =
+        (&args.r2_endpoint, &args.r2_bucket, &args.r2_access_key_id, &args.r2_secret_access_key)
+    {
+        let source = R2WitnessSource::new(
+            endpoint,
+            bucket.clone(),
+            access_key_id.clone(),
+            secret.as_ref().to_string(),
+            r2_timeouts,
+            rpc_retry,
+            args.r2_max_concurrent_requests,
+        )?;
+        info!(
+            endpoint = %source.origin(),
+            bucket, "Historical witness source: R2 (direct S3), RPC chain as fallback"
+        );
+        Some(source)
     } else {
-        match (
-            &args.r2_endpoint,
-            &args.r2_bucket,
-            &args.r2_access_key_id,
-            &args.r2_secret_access_key,
-        ) {
-            (Some(endpoint), Some(bucket), Some(access_key_id), Some(secret)) => {
-                let source = R2WitnessSource::new(
-                    endpoint,
-                    bucket.clone(),
-                    access_key_id.clone(),
-                    secret.as_ref().to_string(),
-                    r2_timeouts,
-                    rpc_retry,
-                    args.r2_max_concurrent_requests,
-                )?;
-                // Log the parsed origin, not the raw flag value — the raw string is
-                // operator input and this line is info-level.
-                let (origin, _) = stateless_r2::endpoint::parse_endpoint(endpoint);
-                info!(
-                    endpoint = %origin,
-                    bucket, "Historical witness source: R2 (direct S3), RPC chain as fallback"
-                );
-                Some(Arc::new(source))
-            }
-            _ => None,
-        }
+        None
     };
+    let r2_witness_source = r2_source.map(Arc::new);
 
     let validator_db = init_validator_db(&args, &rpc_client).await?;
 
@@ -1632,32 +1622,27 @@ mod tests {
     #[test]
     fn validate_args_rejects_custom_domain_misconfigurations() {
         let _guard = stateless_test_utils::env::env_lock();
-        let build = |extra: &[&str]| {
-            let base = [
-                "debug-trace-server",
-                "--rpc-endpoint",
-                "http://r",
-                "--witness-endpoint",
-                "http://w",
-            ];
-            Args::try_parse_from(base.iter().chain(extra)).unwrap()
-        };
         let dir = ["--data-dir", "/tmp/dts-test"];
 
         assert!(
-            validate_args(&build(&["--r2-custom-domain", "https://w.example.com", dir[0], dir[1]]))
-                .is_ok()
+            validate_args(&parse_args(&[
+                "--r2-custom-domain",
+                "https://w.example.com",
+                dir[0],
+                dir[1]
+            ]))
+            .is_ok()
         );
         assert!(
-            validate_args(&build(&["--r2-custom-domain", "https://w.example.com"])).is_err(),
+            validate_args(&parse_args(&["--r2-custom-domain", "https://w.example.com"])).is_err(),
             "custom domain without --data-dir must fail"
         );
         assert!(
-            validate_args(&build(&["--r2-custom-domain", "", dir[0], dir[1]])).is_err(),
+            validate_args(&parse_args(&["--r2-custom-domain", "", dir[0], dir[1]])).is_err(),
             "empty custom domain must fail"
         );
         assert!(
-            validate_args(&build(&[
+            validate_args(&parse_args(&[
                 "--r2-custom-domain",
                 "https://w.example.com",
                 "--r2-access-client-id",
@@ -1672,7 +1657,7 @@ mod tests {
         );
         // A blank custom-domain env line over a working S3 config must get the named
         // empty-value error, not a phantom target conflict.
-        let blank_over_s3 = build(&[
+        let blank_over_s3 = parse_args(&[
             "--r2-endpoint",
             "https://acc.r2.cloudflarestorage.com",
             "--r2-bucket",

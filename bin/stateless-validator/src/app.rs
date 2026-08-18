@@ -269,7 +269,7 @@ pub async fn run() -> Result<()> {
         info!("Metrics disabled");
     }
 
-    let work_dir = PathBuf::from(args.data_dir);
+    let work_dir = PathBuf::from(&args.data_dir);
     std::fs::create_dir_all(&work_dir)
         .map_err(|e| eyre::eyre!("Failed to create data dir {}: {e}", work_dir.display()))?;
 
@@ -312,52 +312,7 @@ pub async fn run() -> Result<()> {
                 per_attempt: per_attempt_timeout,
                 connect: Duration::from_millis(args.r2_connect_timeout_ms),
             };
-            let client =
-                if let Some(domain) = optional_r2(&args.r2_custom_domain, "--r2-custom-domain")? {
-                    let access = match (
-                        optional_r2(&args.r2_access_client_id, "--r2-access-client-id")?,
-                        optional_r2(&args.r2_access_client_secret, "--r2-access-client-secret")?,
-                    ) {
-                        (Some(client_id), Some(client_secret)) => {
-                            Some(stateless_r2::fetch::CfAccessCredentials {
-                                client_id: client_id.to_string(),
-                                client_secret: client_secret.to_string(),
-                            })
-                        }
-                        _ => None,
-                    };
-                    let cf_access = access.is_some();
-                    // Log the parsed origin, not the raw flag value — the raw string is operator
-                    // input and this line is info-level.
-                    let (origin, _) = stateless_r2::endpoint::parse_endpoint(domain);
-                    info!(domain = %origin, cf_access, "Witness source: R2 (custom domain)");
-                    R2WitnessClient::new_custom_domain(
-                        domain,
-                        access,
-                        timeouts,
-                        rpc_config.rpc_retry.clone(),
-                        args.witness_max_concurrent_requests,
-                    )?
-                } else {
-                    let endpoint = require_r2(&args.r2_endpoint, "--r2-endpoint")?;
-                    let bucket = require_r2(&args.r2_bucket, "--r2-bucket")?;
-                    let access_key_id = require_r2(&args.r2_access_key_id, "--r2-access-key-id")?;
-                    let secret_access_key =
-                        require_r2(&args.r2_secret_access_key, "--r2-secret-access-key")?;
-                    // Log the parsed origin, not the raw flag value — the raw string is operator
-                    // input and this line is info-level.
-                    let (origin, _) = stateless_r2::endpoint::parse_endpoint(endpoint);
-                    info!(endpoint = %origin, bucket, "Witness source: R2 (direct S3)");
-                    R2WitnessClient::new(
-                        endpoint,
-                        bucket.to_string(),
-                        access_key_id.to_string(),
-                        secret_access_key.to_string(),
-                        timeouts,
-                        rpc_config.rpc_retry.clone(),
-                        args.witness_max_concurrent_requests,
-                    )?
-                };
+            let client = build_r2_client(&args, timeouts, rpc_config.rpc_retry.clone())?;
             Some(Arc::new(client))
         }
     };
@@ -465,6 +420,51 @@ fn require_r2<'a, T: AsRef<str>>(value: &'a Option<T>, flag: &str) -> Result<&'a
         .map(AsRef::as_ref)
         .filter(|v| !v.is_empty())
         .ok_or_else(|| eyre::eyre!("{flag} is required with --witness-source r2"))
+}
+
+/// Builds the R2 witness client for `--witness-source r2`: the custom-domain target when
+/// `--r2-custom-domain` is set, the SigV4-signed S3 target otherwise.
+///
+/// Which target wins is already settled by [`reject_dual_r2_targets`], so this only reads the
+/// one that was chosen — a set-but-empty flag belonging to the *other* target is not seen here.
+fn build_r2_client(
+    args: &CommandLineArgs,
+    timeouts: stateless_r2::fetch::FetchTimeouts,
+    retry: BackoffPolicy,
+) -> Result<R2WitnessClient> {
+    if let Some(domain) = optional_r2(&args.r2_custom_domain, "--r2-custom-domain")? {
+        let access = optional_r2(&args.r2_access_client_id, "--r2-access-client-id")?
+            .zip(optional_r2(&args.r2_access_client_secret, "--r2-access-client-secret")?)
+            .map(|(client_id, client_secret)| stateless_r2::fetch::CfAccessCredentials {
+                client_id: client_id.to_string(),
+                client_secret: client_secret.to_string(),
+            });
+        let cf_access = access.is_some();
+        let client = R2WitnessClient::new_custom_domain(
+            domain,
+            access,
+            timeouts,
+            retry,
+            args.witness_max_concurrent_requests,
+        )?;
+        info!(domain = %client.origin(), cf_access, "Witness source: R2 (custom domain)");
+        return Ok(client);
+    }
+    let endpoint = require_r2(&args.r2_endpoint, "--r2-endpoint")?;
+    let bucket = require_r2(&args.r2_bucket, "--r2-bucket")?;
+    let access_key_id = require_r2(&args.r2_access_key_id, "--r2-access-key-id")?;
+    let secret_access_key = require_r2(&args.r2_secret_access_key, "--r2-secret-access-key")?;
+    let client = R2WitnessClient::new(
+        endpoint,
+        bucket.to_string(),
+        access_key_id.to_string(),
+        secret_access_key.to_string(),
+        timeouts,
+        retry,
+        args.witness_max_concurrent_requests,
+    )?;
+    info!(endpoint = %client.origin(), bucket, "Witness source: R2 (direct S3)");
+    Ok(client)
 }
 
 /// Rejects both R2 targets configured at once, by name. Enforced here rather than via clap

@@ -106,6 +106,11 @@ pub struct R2WitnessClient {
 }
 
 impl R2WitnessClient {
+    /// The configured target's origin, for startup logging (see [`R2ObjectFetcher::origin`]).
+    pub fn origin(&self) -> &str {
+        self.fetcher.origin()
+    }
+
     /// Builds a client from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
     ///
     /// `timeouts` bounds each individual GET (end-to-end and connect). `retry_backoff` paces the
