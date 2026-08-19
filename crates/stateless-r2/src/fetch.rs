@@ -21,7 +21,10 @@
 
 use std::{
     fmt::Display,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -303,6 +306,30 @@ fn parse_target_origin(
     Ok((origin, host))
 }
 
+/// Idle connections the pool may keep per host when `--r2-max-concurrent-requests` is unset.
+///
+/// Only binds on the degraded HTTP/1.1 path: an h2 pool holds a single connection whatever this
+/// says. There it is what stops `pool_idle_timeout(None)` — set so the multiplexed connection
+/// survives the gaps between request waves — from letting idle sockets accumulate without
+/// bound, which reqwest's `pool_max_idle_per_host` default of `usize::MAX` otherwise allows.
+const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 64;
+
+/// `negotiated_version` before any response has been seen.
+const VERSION_UNOBSERVED: u8 = 0;
+/// Protocol labels, indexed by the code stored in `negotiated_version`.
+const VERSION_LABELS: [&str; 7] = ["", "http/0.9", "http/1.0", "http/1.1", "h2", "h3", "other"];
+
+fn version_code(version: reqwest::Version) -> u8 {
+    match version {
+        v if v == reqwest::Version::HTTP_09 => 1,
+        v if v == reqwest::Version::HTTP_10 => 2,
+        v if v == reqwest::Version::HTTP_11 => 3,
+        v if v == reqwest::Version::HTTP_2 => 4,
+        v if v == reqwest::Version::HTTP_3 => 5,
+        _ => 6,
+    }
+}
+
 /// Whether `host[:port]` names the loopback interface, where plaintext `http` is the mock and
 /// port-forward shape rather than a credential exposure.
 fn is_loopback_host(host: &str) -> bool {
@@ -350,6 +377,9 @@ pub struct R2ObjectFetcher {
     pacing: RetryPacing,
     /// Caps concurrent GETs across all fetches sharing this fetcher.
     concurrency: Arc<Semaphore>,
+    /// Protocol the first response actually used, [`VERSION_UNOBSERVED`] until one arrives.
+    /// Shared across clones so the degradation warning fires once per fetcher, not per clone.
+    negotiated_version: Arc<AtomicU8>,
 }
 
 impl R2ObjectFetcher {
@@ -379,6 +409,48 @@ impl R2ObjectFetcher {
         match &self.target {
             Target::S3 { .. } => "s3",
             Target::CustomDomain { .. } => "custom_domain",
+        }
+    }
+
+    /// The protocol the first response on this fetcher actually used, once one has arrived.
+    ///
+    /// Answers "did the custom domain really give us h2", which the configured target alone
+    /// cannot: version selection is pure ALPN, so a degraded origin looks identical from the
+    /// configuration side.
+    pub fn negotiated_http_version(&self) -> Option<&'static str> {
+        match self.negotiated_version.load(Ordering::Relaxed) {
+            VERSION_UNOBSERVED => None,
+            code => Some(VERSION_LABELS[code as usize]),
+        }
+    }
+
+    /// Records the protocol of the first response, warning once if a custom domain did not
+    /// negotiate HTTP/2.
+    ///
+    /// There is deliberately no `http2_prior_knowledge` — it would break the plaintext loopback
+    /// path the mocks and port-forwards rely on — so an h1-only peer simply answers normally and
+    /// nothing else notices. That is the trap worth naming: the three h2 knobs go inert, while
+    /// `pool_idle_timeout(None)` stays in force over an HTTP/1.1 pool, and the target gauge goes
+    /// on asserting the target that was *configured*. Warned once rather than per GET, which at
+    /// this call rate would be thousands of lines a minute.
+    fn observe_version(&self, version: reqwest::Version) {
+        let code = version_code(version);
+        if self
+            .negotiated_version
+            .compare_exchange(VERSION_UNOBSERVED, code, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        if version != reqwest::Version::HTTP_2 {
+            warn!(
+                negotiated = VERSION_LABELS[code as usize],
+                origin = self.origin(),
+                "R2 custom domain did not negotiate HTTP/2: the multiplexing this target exists \
+                 for is unavailable, its h2 tuning is inert, and connection reuse now follows \
+                 HTTP/1.1 pooling. Check that the domain is proxied by Cloudflare and that the \
+                 zone has HTTP/2 enabled."
+            );
         }
     }
 
@@ -422,6 +494,7 @@ impl R2ObjectFetcher {
             per_attempt_timeout: timeouts.per_attempt,
             pacing,
             concurrency: concurrency_permits(max_concurrent_requests),
+            negotiated_version: Arc::new(AtomicU8::new(VERSION_UNOBSERVED)),
         })
     }
 
@@ -473,6 +546,12 @@ impl R2ObjectFetcher {
             // reaps idle connections on a 90s default of its own — shorter than the gaps
             // between request waves that this single multiplexed connection exists to survive.
             .pool_idle_timeout(None)
+            // Paired with the line above: without an idle timeout, an unbounded idle pool would
+            // never release a socket. Inert on h2 (one connection); the bound that matters is
+            // on the h1.1 path this client silently falls back to against a non-h2 origin.
+            .pool_max_idle_per_host(
+                max_concurrent_requests.unwrap_or(MAX_IDLE_CONNECTIONS_PER_HOST),
+            )
             // Stated rather than inherited: with keep-alive pings on, this is what bounds how
             // long a blackholed connection keeps accepting doomed streams.
             .http2_keep_alive_timeout(Duration::from_secs(20));
@@ -489,6 +568,7 @@ impl R2ObjectFetcher {
             per_attempt_timeout: timeouts.per_attempt,
             pacing,
             concurrency: concurrency_permits(max_concurrent_requests),
+            negotiated_version: Arc::new(AtomicU8::new(VERSION_UNOBSERVED)),
         })
     }
 
@@ -612,6 +692,9 @@ impl R2ObjectFetcher {
             }
         };
         let response = request.send().await.map_err(transport)?;
+        if matches!(self.target, Target::CustomDomain { .. }) {
+            self.observe_version(response.version());
+        }
 
         let status = response.status();
         if status.is_success() {
@@ -1011,6 +1094,27 @@ mod tests {
         )
         .expect_err("ftp is not drivable");
         assert!(s3.contains("only http and https"), "{s3}");
+    }
+
+    /// The custom-domain target degrades to HTTP/1.1 in silence against any origin that does
+    /// not offer h2 over ALPN — and every mock in this suite is exactly such an origin, so the
+    /// green tests here *are* the degraded path. Pinning that keeps it visible: the protocol
+    /// actually negotiated is observable, rather than inferred from the configured target.
+    #[tokio::test]
+    async fn custom_domain_reports_the_protocol_it_actually_negotiated() {
+        let (domain, _hits) = mock_r2(vec![(200, "witness bytes")]).await;
+        let fetcher = custom_fetcher(&domain, None);
+        assert_eq!(fetcher.negotiated_http_version(), None, "nothing observed before a request");
+
+        fetcher
+            .get_block_object(2500, "0xblock", MAX_ATTEMPTS, None, || ())
+            .await
+            .expect("200 must succeed");
+        assert_eq!(
+            fetcher.negotiated_http_version(),
+            Some("http/1.1"),
+            "the plaintext mock cannot offer h2, and that must be visible rather than assumed"
+        );
     }
 
     /// Cloudflare's Browser Integrity Check challenges user-agent-less requests, which would

@@ -531,6 +531,20 @@ pub fn record_r2_target(target: &'static str) {
     gauge!(R2_TARGET_INFO, "target" => target).set(1.0);
 }
 
+/// The protocol the R2 custom-domain target actually negotiated, as a constant-1 info gauge
+/// labeled `version`, published once the first response has been seen.
+///
+/// Separate from the target gauge on purpose: that one answers "what was configured" and can be
+/// published at startup, while this one is only knowable after a request. Folding both into one
+/// gauge would mean publishing it twice with different label sets, leaving the startup series
+/// stuck at 1 forever alongside the corrected one.
+const R2_NEGOTIATED_VERSION_INFO: &str = "debug_trace_r2_negotiated_http_version_info";
+
+/// Publishes the protocol the custom-domain target negotiated.
+pub fn record_r2_negotiated_version(version: &'static str) {
+    gauge!(R2_NEGOTIATED_VERSION_INFO, "version" => version).set(1.0);
+}
+
 /// Canonical number → hash resolution counter, labeled `(source, outcome)` — how often
 /// by-number requests resolve their canonical hash from the local DB index vs upstream,
 /// and how often resolution misses or fails.

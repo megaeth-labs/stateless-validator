@@ -111,6 +111,18 @@ impl R2WitnessClient {
         self.fetcher.origin()
     }
 
+    /// Publishes the protocol the transport actually negotiated, once per process.
+    ///
+    /// Only knowable after a response, so it cannot ride along with the startup target gauge.
+    /// There is one R2 source per process, which is why a process-wide `Once` is the whole
+    /// bookkeeping needed.
+    fn publish_negotiated_version(&self) {
+        static PUBLISHED: std::sync::Once = std::sync::Once::new();
+        if let Some(version) = self.fetcher.negotiated_http_version() {
+            PUBLISHED.call_once(|| metrics::record_r2_negotiated_version(version));
+        }
+    }
+
     /// The configured target's metric label (see [`R2ObjectFetcher::target_label`]).
     pub const fn target_label(&self) -> &'static str {
         self.fetcher.target_label()
@@ -220,6 +232,7 @@ impl R2WitnessClient {
                 trace!(number, "R2 witness fetched and decoded");
                 // Queue wait on the self-imposed concurrency cap is subtracted: folded in, it
                 // would masquerade as R2 slowness.
+                self.publish_negotiated_version();
                 metrics::on_r2_witness_fetch_success(
                     started.elapsed().saturating_sub(fetched.queue_wait).as_secs_f64(),
                     WitnessSizeBreakdown::new(&witness.0, &witness.1),

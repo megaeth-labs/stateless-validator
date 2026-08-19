@@ -93,6 +93,7 @@ pub mod names {
     metric!(R2_WITNESS_RETRY_ATTEMPTS_TOTAL, "r2_witness_retry_attempts_total");
     metric!(R2_WITNESS_ERRORS_TOTAL, "r2_witness_errors_total");
     metric!(R2_TARGET_INFO, "r2_target_info");
+    metric!(R2_NEGOTIATED_VERSION_INFO, "r2_negotiated_http_version_info");
 
     // Contract cache
     metric!(CONTRACT_CACHE_HITS, "contract_cache_hits_total");
@@ -197,6 +198,11 @@ fn register_metric_descriptions() {
         "R2 witness fetches that surfaced an error to the pipeline, by kind"
     );
     describe_gauge!(
+        names::R2_NEGOTIATED_VERSION_INFO,
+        "Protocol the R2 custom-domain target negotiated, as a constant-1 gauge labeled \
+         `version` (h2 is the point of that target; http/1.1 means it silently degraded)"
+    );
+    describe_gauge!(
         names::R2_TARGET_INFO,
         "Configured R2 target, as a constant-1 gauge labeled `target` (join to give the \
          target-less R2 series a target dimension during a rollout)"
@@ -251,6 +257,17 @@ fn init_r2_witness_counters() {
 /// established metric contract.
 pub fn record_r2_target(target: &'static str) {
     gauge!(names::R2_TARGET_INFO, "target" => target).set(1.0);
+}
+
+/// The protocol the R2 custom-domain target actually negotiated, as a constant-1 info gauge
+/// labeled `version`, published once the first response has been seen.
+///
+/// Separate from the target gauge on purpose: that one answers "what was configured" and can be
+/// published at startup, while this one is only knowable after a request. Folding both into one
+/// gauge would mean publishing it twice with different label sets, leaving the startup series
+/// stuck at 1 forever alongside the corrected one.
+pub fn record_r2_negotiated_version(version: &'static str) {
+    gauge!(names::R2_NEGOTIATED_VERSION_INFO, "version" => version).set(1.0);
 }
 
 /// Record validation timing and block statistics after successful validation.
