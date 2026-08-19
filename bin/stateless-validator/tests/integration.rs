@@ -196,9 +196,10 @@ fn r2_custom_domain_target_wiring() {
             .as_deref(),
         Some("https://witness.example.com")
     );
-    // Both targets parse — mutual exclusion is enforced at startup with an error naming
-    // both flags, which clap's own rejection could not do (see `reject_conflicting_r2_targets`
-    // and its unit test in app.rs).
+    // Every R2 coherence rule is enforced after parsing, by `stateless_common::validate_r2_flags`,
+    // so that each error can name the flag — clap's own rejections cannot, this workspace having
+    // built it without `error-context`. Parsing therefore accepts all of these shapes; the rules
+    // and their messages are covered by that function's own tests.
     assert!(
         parse(&[
             "--r2-custom-domain",
@@ -216,12 +217,12 @@ fn r2_custom_domain_target_wiring() {
             "--r2-access-client-id",
             "tok",
         ])
-        .is_err(),
-        "Access client id without secret must fail"
+        .is_ok(),
+        "a half-set Access pair must parse; it is rejected by name post-parse"
     );
     assert!(
-        parse(&["--r2-access-client-id", "tok", "--r2-access-client-secret", "sk"]).is_err(),
-        "Access token pair without the domain must fail"
+        parse(&["--r2-access-client-id", "tok", "--r2-access-client-secret", "sk"]).is_ok(),
+        "an Access pair without the domain must parse; it is rejected by name post-parse"
     );
     assert!(
         parse(&[

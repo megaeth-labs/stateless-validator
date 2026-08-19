@@ -13,6 +13,8 @@ pub use witness_encoding::{
     decode_witness_response, decode_witness_response_light, encode_witness_payload,
     encode_witness_response,
 };
+pub mod r2_args;
+pub use r2_args::{R2Flag, R2Flags, R2Target, R2TuningFlag, validate_r2_flags};
 pub mod secret;
 pub use secret::RedactedSecret;
 pub mod witness_size;

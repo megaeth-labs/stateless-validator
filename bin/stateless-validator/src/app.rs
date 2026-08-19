@@ -8,7 +8,8 @@ use alloy_rpc_types_eth::BlockId;
 use clap::{Parser, ValueEnum};
 use eyre::Result;
 use stateless_common::{
-    BackoffPolicy, RedactedSecret, RpcClient, RpcClientConfig, logging::LogArgs,
+    BackoffPolicy, R2Flag, R2Flags, R2Target, RedactedSecret, RpcClient, RpcClientConfig,
+    logging::LogArgs, validate_r2_flags,
 };
 use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::BlockMeta};
 use stateless_db::ContractCache;
@@ -116,12 +117,12 @@ pub struct CommandLineArgs {
     /// Cloudflare Access service-token client id, sent as `CF-Access-Client-Id` on every
     /// custom-domain GET. Omit when the domain is locked by an IP allowlist instead.
     /// Redacted like the secret: the id alone is enough to look up the token.
-    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_ID", requires_all = ["r2_custom_domain", "r2_access_client_secret"])]
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_ID")]
     pub r2_access_client_id: Option<RedactedSecret>,
 
     /// Cloudflare Access service-token client secret, sent as `CF-Access-Client-Secret`. Prefer
     /// the env var over the flag.
-    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_SECRET", requires_all = ["r2_custom_domain", "r2_access_client_id"])]
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_SECRET")]
     pub r2_access_client_secret: Option<RedactedSecret>,
 
     /// R2 bucket holding the witnesses (e.g. `witness-mainnet`). Required for the S3-endpoint
@@ -147,13 +148,18 @@ pub struct CommandLineArgs {
     /// handshake and any reconnect — a path that breaks after that surfaces as `transport`
     /// against the per-attempt budget until the keep-alive ping reaps the connection, and in
     /// R2 mode there is no RPC chain to fall back to.
+    ///
+    /// Left as an `Option` rather than defaulted by clap so that "explicitly set" stays
+    /// distinguishable: setting it with no R2 target configured is rejected by name instead
+    /// of being silently ignored. [`DEFAULT_CONNECT_TIMEOUT`] applies when it is absent.
+    ///
+    /// [`DEFAULT_CONNECT_TIMEOUT`]: stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT
     #[clap(
         long,
         env = "STATELESS_VALIDATOR_R2_CONNECT_TIMEOUT_MS",
-        default_value_t = stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT.as_millis() as u64,
         value_parser = clap::value_parser!(u64).range(100..),
     )]
-    pub r2_connect_timeout_ms: u64,
+    pub r2_connect_timeout_ms: Option<u64>,
 
     /// Optional inclusive end block: validate up to this height, then stop cleanly. Used to slice
     /// a fixed block range across multiple servers. Omit to follow the chain tip indefinitely.
@@ -296,24 +302,6 @@ pub async fn run() -> Result<()> {
     // In R2 mode the RpcClient's witness providers are never used, but its constructor requires
     // a non-empty list — hand it the data endpoints as a placeholder.
     let data_apis: Vec<&str> = args.rpc_endpoint.iter().map(String::as_str).collect();
-    reject_empty_r2_values(&[
-        ("--r2-endpoint", args.r2_endpoint.as_deref()),
-        ("--r2-bucket", args.r2_bucket.as_deref()),
-        ("--r2-access-key-id", args.r2_access_key_id.as_deref()),
-        ("--r2-secret-access-key", args.r2_secret_access_key.as_ref().map(AsRef::as_ref)),
-        ("--r2-custom-domain", args.r2_custom_domain.as_deref()),
-        ("--r2-access-client-id", args.r2_access_client_id.as_ref().map(AsRef::as_ref)),
-        ("--r2-access-client-secret", args.r2_access_client_secret.as_ref().map(AsRef::as_ref)),
-    ])?;
-    reject_conflicting_r2_targets(
-        args.r2_endpoint.as_deref(),
-        args.r2_custom_domain.as_deref(),
-        &[
-            ("--r2-bucket", args.r2_bucket.is_some()),
-            ("--r2-access-key-id", args.r2_access_key_id.is_some()),
-            ("--r2-secret-access-key", args.r2_secret_access_key.is_some()),
-        ],
-    )?;
     let r2_witness = match args.witness_source {
         WitnessSource::Rpc => {
             if args.witness_endpoint.is_empty() {
@@ -332,7 +320,9 @@ pub async fn run() -> Result<()> {
             }
             let timeouts = stateless_r2::fetch::FetchTimeouts {
                 per_attempt: per_attempt_timeout,
-                connect: Duration::from_millis(args.r2_connect_timeout_ms),
+                connect: Duration::from_millis(args.r2_connect_timeout_ms.unwrap_or_else(|| {
+                    stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT.as_millis() as u64
+                })),
             };
             let client = build_r2_client(&args, timeouts, rpc_config.rpc_retry.clone())?;
             Some(Arc::new(client))
@@ -435,15 +425,6 @@ fn override_ms(ms: Option<u64>, default: Duration) -> Duration {
     ms.map(Duration::from_millis).unwrap_or(default)
 }
 
-/// Unwraps a required `--r2-*` argument, erroring with the flag name when it is absent.
-///
-/// Defined through [`optional_r2`] so both readers agree on what an empty value means: it is
-/// reported as a failed env injection, not as an absent flag.
-fn require_r2<'a, T: AsRef<str>>(value: &'a Option<T>, flag: &str) -> Result<&'a str> {
-    optional_r2(value, flag)?
-        .ok_or_else(|| eyre::eyre!("{flag} is required with --witness-source r2"))
-}
-
 /// Builds the R2 witness client for `--witness-source r2`: the custom-domain target when
 /// `--r2-custom-domain` is set, the SigV4-signed S3 target otherwise.
 ///
@@ -454,183 +435,82 @@ fn build_r2_client(
     timeouts: stateless_r2::fetch::FetchTimeouts,
     retry: BackoffPolicy,
 ) -> Result<R2WitnessClient> {
-    if let Some(domain) = optional_r2(&args.r2_custom_domain, "--r2-custom-domain")? {
-        let access = optional_r2(&args.r2_access_client_id, "--r2-access-client-id")?
-            .zip(optional_r2(&args.r2_access_client_secret, "--r2-access-client-secret")?)
-            .map(|(client_id, client_secret)| stateless_r2::fetch::CfAccessCredentials {
-                client_id: client_id.to_string(),
-                client_secret: client_secret.to_string(),
-            });
-        let cf_access = access.is_some();
-        let client = R2WitnessClient::new_custom_domain(
-            domain,
-            access,
-            timeouts,
-            retry,
-            args.witness_max_concurrent_requests,
-        )?;
-        metrics::record_r2_target(client.target_label());
-        info!(domain = %client.origin(), cf_access, "Witness source: R2 (custom domain)");
-        return Ok(client);
-    }
-    let endpoint = require_r2(&args.r2_endpoint, "--r2-endpoint")?;
-    let bucket = require_r2(&args.r2_bucket, "--r2-bucket")?;
-    let access_key_id = require_r2(&args.r2_access_key_id, "--r2-access-key-id")?;
-    let secret_access_key = require_r2(&args.r2_secret_access_key, "--r2-secret-access-key")?;
-    let client = R2WitnessClient::new(
-        endpoint,
-        bucket.to_string(),
-        access_key_id.to_string(),
-        secret_access_key.to_string(),
-        timeouts,
-        retry,
-        args.witness_max_concurrent_requests,
-    )?;
+    // Every coherence rule lives in the shared validator, so the reads below rest on an
+    // invariant that was actually checked: no empty values, exactly one target, and an Access
+    // pair that is either whole or absent.
+    let client = match validate_r2_flags(&r2_flags(args))? {
+        R2Target::None => {
+            return Err(eyre::eyre!(
+                "--witness-source r2 needs an R2 target: configure --r2-custom-domain, or \
+                 --r2-endpoint with its credential quad"
+            ));
+        }
+        R2Target::CustomDomain => {
+            let domain = args.r2_custom_domain.as_deref().expect("custom-domain target");
+            let access =
+                args.r2_access_client_id.as_ref().zip(args.r2_access_client_secret.as_ref()).map(
+                    |(client_id, client_secret)| stateless_r2::fetch::CfAccessCredentials {
+                        client_id: client_id.as_ref().to_string(),
+                        client_secret: client_secret.as_ref().to_string(),
+                    },
+                );
+            let cf_access = access.is_some();
+            let client = R2WitnessClient::new_custom_domain(
+                domain,
+                access,
+                timeouts,
+                retry,
+                args.witness_max_concurrent_requests,
+            )?;
+            info!(domain = %client.origin(), cf_access, "Witness source: R2 (custom domain)");
+            client
+        }
+        R2Target::S3 => {
+            let take = |v: &Option<String>| v.clone().expect("S3 target");
+            let client = R2WitnessClient::new(
+                args.r2_endpoint.as_deref().expect("S3 target"),
+                take(&args.r2_bucket),
+                take(&args.r2_access_key_id),
+                args.r2_secret_access_key.as_ref().expect("S3 target").as_ref().to_string(),
+                timeouts,
+                retry,
+                args.witness_max_concurrent_requests,
+            )?;
+            info!(
+                endpoint = %client.origin(),
+                bucket = args.r2_bucket.as_deref().unwrap_or_default(),
+                "Witness source: R2 (direct S3)"
+            );
+            client
+        }
+    };
     metrics::record_r2_target(client.target_label());
-    info!(endpoint = %client.origin(), bucket, "Witness source: R2 (direct S3)");
     Ok(client)
 }
 
-/// Rejects any `--r2-*` flag that is present but empty — the shape of a failed env injection.
-///
-/// Runs over every R2 flag before target selection, matching the trace server's order, so an
-/// empty value is diagnosed as itself rather than read as a configured target or as a leftover
-/// from one. Without this pass a blank `..._R2_CUSTOM_DOMAIN=` beside a working S3 config gets
-/// told to unset the S3 config.
-fn reject_empty_r2_values(values: &[(&str, Option<&str>)]) -> Result<()> {
-    for (flag, value) in values {
-        if value.is_some_and(str::is_empty) {
-            return Err(eyre::eyre!(
-                "{flag} is set but empty (empty env var injection?): unset it or give it a value"
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Rejects an R2 configuration that names more than one target, by flag name.
-///
-/// Enforced here rather than via clap conflicts because this workspace builds clap without its
-/// `error-context` feature (see the root `Cargo.toml`), so a clap conflict prints a generic
-/// message naming no argument — unactionable for an operator whose only clue is an env file.
-///
-/// Presence is the only predicate: [`reject_empty_r2_values`] has already rejected empty
-/// values, so anything still set is something the operator meant. Two shapes are rejected —
-/// both targets at once, and S3 flags left behind by the migration the README documents as the
-/// custom domain "replacing" them, which are dead configuration that would otherwise be read
-/// past in silence.
-fn reject_conflicting_r2_targets(
-    endpoint: Option<&str>,
-    custom_domain: Option<&str>,
-    s3_only_flags: &[(&str, bool)],
-) -> Result<()> {
-    if custom_domain.is_none() {
-        return Ok(());
-    }
-    if endpoint.is_some() {
-        return Err(eyre::eyre!(
-            "--r2-endpoint and --r2-custom-domain are mutually exclusive R2 targets: \
-             configure exactly one"
-        ));
-    }
-    let leftovers: Vec<&str> =
-        s3_only_flags.iter().filter(|(_, set)| *set).map(|(flag, _)| *flag).collect();
-    if leftovers.is_empty() {
-        return Ok(());
-    }
-    Err(eyre::eyre!(
-        "--r2-custom-domain replaces the S3 target: unset the leftover {} (ignoring them \
-         silently would hide which credentials are actually in use)",
-        leftovers.join(", ")
-    ))
-}
-
-/// Reads an optional `--r2-*` argument: absent selects the other target, but set-and-empty
-/// (the shape of a failed env injection) is a hard error rather than a silent fallthrough
-/// to a target the operator did not pick.
-fn optional_r2<'a, T: AsRef<str>>(value: &'a Option<T>, flag: &str) -> Result<Option<&'a str>> {
-    match value.as_ref().map(AsRef::as_ref) {
-        None => Ok(None),
-        Some("") => Err(eyre::eyre!(
-            "{flag} is set but empty (empty env var injection?): unset it or give it a value"
-        )),
-        Some(v) => Ok(Some(v)),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn require_r2_rejects_absent_and_empty_values() {
-        assert!(require_r2(&None::<String>, "--r2-endpoint").is_err());
-        // An env var set to the empty string must not pass as configured.
-        assert!(require_r2(&Some(String::new()), "--r2-endpoint").is_err());
-        assert_eq!(
-            require_r2(&Some("https://x".to_string()), "--r2-endpoint").unwrap(),
-            "https://x"
-        );
-    }
-
-    #[test]
-    fn conflicting_r2_targets_are_rejected_by_name() {
-        let endpoint = Some("https://acc.r2.cloudflarestorage.com");
-        let domain = Some("https://w.example.com");
-        let clean: &[(&str, bool)] = &[];
-
-        let err = reject_conflicting_r2_targets(endpoint, domain, clean).unwrap_err().to_string();
-        assert!(err.contains("--r2-endpoint") && err.contains("--r2-custom-domain"), "{err}");
-
-        // One target, nothing left over from the other.
-        assert!(reject_conflicting_r2_targets(endpoint, None, clean).is_ok());
-        assert!(reject_conflicting_r2_targets(None, domain, clean).is_ok());
-
-        // S3 flags left set alongside the custom domain are dead configuration — the README
-        // calls the domain a replacement for them — and only the ones actually set are named.
-        let leftovers: &[(&str, bool)] = &[
-            ("--r2-bucket", true),
-            ("--r2-access-key-id", false),
-            ("--r2-secret-access-key", false),
-        ];
-        let err = reject_conflicting_r2_targets(None, domain, leftovers).unwrap_err().to_string();
-        assert!(err.contains("--r2-bucket"), "{err}");
-        assert!(!err.contains("--r2-access-key-id"), "only the flags actually set: {err}");
-    }
-
-    /// Empty values are diagnosed as themselves, before target selection can read a blank line
-    /// as a configured target or as a leftover from one.
-    #[test]
-    fn empty_r2_values_are_rejected_before_target_selection() {
-        assert!(
-            reject_empty_r2_values(&[
-                ("--r2-endpoint", Some("https://acc.r2.cloudflarestorage.com")),
-                ("--r2-bucket", None),
-            ])
-            .is_ok()
-        );
-
-        let err = reject_empty_r2_values(&[
-            ("--r2-endpoint", Some("https://acc.r2.cloudflarestorage.com")),
-            ("--r2-bucket", Some("witness-mainnet")),
-            ("--r2-custom-domain", Some("")),
-        ])
-        .unwrap_err()
-        .to_string();
-        // Regression guard: a blank custom-domain line beside a working S3 config once reached
-        // the leftover branch and told the operator to unset that working S3 config.
-        assert!(err.contains("--r2-custom-domain") && err.contains("set but empty"), "{err}");
-        assert!(!err.contains("--r2-endpoint"), "must not blame the working S3 config: {err}");
-    }
-
-    #[test]
-    fn optional_r2_distinguishes_absent_from_empty() {
-        assert_eq!(optional_r2(&None::<String>, "--r2-custom-domain").unwrap(), None);
-        // An env var set to the empty string must fail loudly, not select the S3 target.
-        assert!(optional_r2(&Some(String::new()), "--r2-custom-domain").is_err());
-        assert_eq!(
-            optional_r2(&Some("https://w.example.com".to_string()), "--r2-custom-domain").unwrap(),
-            Some("https://w.example.com")
-        );
+/// This binary's `--r2-*` flags, in the spellings its operators use.
+fn r2_flags(args: &CommandLineArgs) -> R2Flags<'_> {
+    R2Flags {
+        endpoint: R2Flag::new("--r2-endpoint", args.r2_endpoint.as_deref()),
+        bucket: R2Flag::new("--r2-bucket", args.r2_bucket.as_deref()),
+        access_key_id: R2Flag::new("--r2-access-key-id", args.r2_access_key_id.as_deref()),
+        secret_access_key: R2Flag::new(
+            "--r2-secret-access-key",
+            args.r2_secret_access_key.as_ref().map(AsRef::as_ref),
+        ),
+        custom_domain: R2Flag::new("--r2-custom-domain", args.r2_custom_domain.as_deref()),
+        access_client_id: R2Flag::new(
+            "--r2-access-client-id",
+            args.r2_access_client_id.as_ref().map(AsRef::as_ref),
+        ),
+        access_client_secret: R2Flag::new(
+            "--r2-access-client-secret",
+            args.r2_access_client_secret.as_ref().map(AsRef::as_ref),
+        ),
+        // Empty on purpose. The orphan-tuning rule exists for a binary that validates R2 flags
+        // on every startup; here they are only read under `--witness-source r2`, where a target
+        // is mandatory, so the rule could never fire. Under `--witness-source rpc` every
+        // `--r2-*` flag is inert by design — see the call site in `run`.
+        tuning: &[],
     }
 }
