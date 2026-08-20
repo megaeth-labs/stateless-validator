@@ -1265,6 +1265,29 @@ mod tests {
         assert!(!err.contains("sec-9a2"), "the secret must never reach a log line: {err}");
     }
 
+    /// An IPv6 loopback origin is still loopback. `Url::host_str` keeps the brackets on an
+    /// IPv6 host, so the origin `parse_endpoint` rebuilds stays a parseable authority and the
+    /// loopback check still recognises it — a plaintext port-forward to `[::1]` is the same
+    /// mock shape as `127.0.0.1` and must not be refused as an exposure.
+    #[test]
+    fn ipv6_loopback_origins_survive_the_round_trip() {
+        let creds = || {
+            Some(CfAccessCredentials {
+                client_id: "tok-3f1.access".to_string(),
+                client_secret: "sec-9a2".to_string(),
+            })
+        };
+        for origin in ["http://[::1]:8080", "http://[::1]"] {
+            let f = try_custom_fetcher(origin, creds())
+                .unwrap_or_else(|e| panic!("{origin} must be accepted as loopback: {e}"));
+            assert_eq!(f.origin(), origin, "brackets must survive the origin rebuild");
+        }
+        // The non-loopback IPv6 case still refuses plaintext credentials.
+        let err = try_custom_fetcher("http://[2001:db8::1]:8080", creds())
+            .expect_err("a public IPv6 host over plaintext must be refused");
+        assert!(err.contains("plaintext"), "{err}");
+    }
+
     /// Access tokens are bearer credentials, so a plaintext non-loopback origin is refused
     /// rather than putting them on the wire in the clear on every GET.
     #[test]
