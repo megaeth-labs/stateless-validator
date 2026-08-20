@@ -57,7 +57,7 @@ use eyre::Result;
 use jsonrpsee::server::{Server, ServerConfig, middleware::rpc::RpcServiceBuilder};
 use stateless_common::{
     R2CountFlag, R2Flag, R2Flags, R2TuningFlag, RedactedSecret, RpcClient, RpcClientConfig,
-    logging::LogArgs, validate_r2_flags,
+    logging::LogArgs, parse_r2_connections, validate_r2_flags,
 };
 use stateless_core::{
     BisectResolver, ChainStore, ContractStore, DivergenceLookups, PipelineConfig,
@@ -406,11 +406,15 @@ struct Args {
     /// One `reqwest::Client` holds exactly one HTTP/2 connection and hyper opens no second one
     /// when the first saturates, so this is the only way past the edge's per-connection stream
     /// limit — and the only way a dropped connection stops taking every GET riding it down
-    /// with it. `--r2-max-concurrent-requests` remains the cap across all of them and is split
-    /// evenly, so raising this alone spreads the same concurrency thinner rather than lifting
-    /// the ceiling.
+    /// with it. `--r2-max-concurrent-requests` remains the cap across all of them, split evenly
+    /// and rounded up, so raising this alone spreads the same concurrency thinner rather than
+    /// lifting the ceiling; a count larger than that cap is rejected, since the surplus
+    /// connections could never be filled.
+    ///
+    /// Taken as text and parsed after clap so a blank env line is rejected by name rather than
+    /// through clap's unnamed value error.
     #[clap(long, env = "DEBUG_TRACE_SERVER_R2_CONNECTIONS")]
-    r2_connections: Option<usize>,
+    r2_connections: Option<String>,
 
     /// Chain-sync pipeline tip buffer: stay this many blocks behind the upstream head so the
     /// fetcher does not race the witness generator — a fetch issued the moment a block appears
@@ -514,7 +518,11 @@ fn r2_flags<'a>(args: &'a Args, tuning: &'a [R2TuningFlag<'a>]) -> R2Flags<'a> {
             "--r2-access-client-secret",
             args.r2_access_client_secret.as_ref().map(AsRef::as_ref),
         ),
-        connections: R2CountFlag::new("--r2-connections", args.r2_connections),
+        connections: R2Flag::new("--r2-connections", args.r2_connections.as_deref()),
+        max_concurrent_requests: R2CountFlag::new(
+            "--r2-max-concurrent-requests",
+            args.r2_max_concurrent_requests,
+        ),
         tuning,
     }
 }
@@ -695,7 +703,9 @@ async fn main() -> Result<()> {
             r2_timeouts,
             rpc_retry,
             args.r2_max_concurrent_requests,
-            args.r2_connections.unwrap_or(1),
+            // Validated by `validate_r2_flags` during startup argument checking, which names
+            // the flag on anything this could reject.
+            parse_r2_connections(R2Flag::new("--r2-connections", args.r2_connections.as_deref()))?,
         )?;
         metrics::record_r2_target(source.target_label());
         metrics::record_r2_connections(source.connections());
@@ -1622,7 +1632,7 @@ mod tests {
             .collect();
         assert_eq!(parse_args(&with_tuning).r2_connect_timeout_ms, Some(2000));
         assert_eq!(parse_args(&with_tuning).r2_max_concurrent_requests, Some(48));
-        assert_eq!(parse_args(&with_tuning).r2_connections, Some(8));
+        assert_eq!(parse_args(&with_tuning).r2_connections.as_deref(), Some("8"));
         for orphan in [
             ["--r2-connect-timeout-ms", "2000"],
             ["--r2-max-concurrent-requests", "48"],

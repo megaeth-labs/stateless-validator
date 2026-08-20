@@ -9,7 +9,7 @@ use clap::{Parser, ValueEnum};
 use eyre::Result;
 use stateless_common::{
     BackoffPolicy, R2CountFlag, R2Flag, R2Flags, R2Target, RedactedSecret, RpcClient,
-    RpcClientConfig, logging::LogArgs, validate_r2_flags,
+    RpcClientConfig, logging::LogArgs, parse_r2_connections, validate_r2_flags,
 };
 use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::BlockMeta};
 use stateless_db::ContractCache;
@@ -150,8 +150,10 @@ pub struct CommandLineArgs {
     /// R2 mode there is no RPC chain to fall back to.
     ///
     /// Left as an `Option` rather than defaulted by clap so that "explicitly set" stays
-    /// distinguishable: setting it with no R2 target configured is rejected by name instead
-    /// of being silently ignored. [`DEFAULT_CONNECT_TIMEOUT`] applies when it is absent.
+    /// distinguishable; [`DEFAULT_CONNECT_TIMEOUT`] applies when it is absent. Unlike the trace
+    /// server, this binary does not reject it for having no R2 target: under
+    /// `--witness-source rpc` every `--r2-*` flag is inert by design, and under
+    /// `--witness-source r2` a target is mandatory, so the rule could never fire.
     ///
     /// [`DEFAULT_CONNECT_TIMEOUT`]: stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT
     #[clap(
@@ -167,10 +169,15 @@ pub struct CommandLineArgs {
     /// when the first saturates, so this is the only way past the edge's per-connection stream
     /// limit — and the only way one dropped connection stops taking every in-flight GET with
     /// it, which matters here because R2 mode has no RPC fallback.
-    /// `--witness-max-concurrent-requests` is still the cap across all of them, so raising this
-    /// alone spreads the same concurrency thinner rather than raising the ceiling.
+    /// `--witness-max-concurrent-requests` is still the cap across all of them, split evenly
+    /// and rounded up, so raising this alone spreads the same concurrency thinner rather than
+    /// raising the ceiling; a count larger than that cap is rejected, since the surplus
+    /// connections could never be filled.
+    ///
+    /// Taken as text and parsed after clap so a blank env line stays inert under
+    /// `--witness-source rpc` instead of aborting startup with clap's unnamed value error.
     #[clap(long, env = "STATELESS_VALIDATOR_R2_CONNECTIONS")]
-    pub r2_connections: Option<usize>,
+    pub r2_connections: Option<String>,
 
     /// Optional inclusive end block: validate up to this height, then stop cleanly. Used to slice
     /// a fixed block range across multiple servers. Omit to follow the chain tip indefinitely.
@@ -444,8 +451,9 @@ fn override_ms(ms: Option<u64>, default: Duration) -> Duration {
 /// Builds the R2 witness client for `--witness-source r2`: the custom-domain target when
 /// `--r2-custom-domain` is set, the SigV4-signed S3 target otherwise.
 ///
-/// Which target wins is already settled by [`reject_conflicting_r2_targets`], so this reads the
-/// one that was chosen — a set-but-empty flag belonging to the *other* target is not seen here.
+/// Which target wins is already settled by the [`validate_r2_flags`] call below, so the arms
+/// read the one that was chosen — a set-but-empty flag belonging to the *other* target is
+/// rejected there rather than reaching a constructor.
 fn build_r2_client(
     args: &CommandLineArgs,
     timeouts: stateless_r2::fetch::FetchTimeouts,
@@ -477,7 +485,12 @@ fn build_r2_client(
                 timeouts,
                 retry,
                 args.witness_max_concurrent_requests,
-                args.r2_connections.unwrap_or(1),
+                // Validated by the `validate_r2_flags` call above, which names the flag on
+                // anything this could reject.
+                parse_r2_connections(R2Flag::new(
+                    "--r2-connections",
+                    args.r2_connections.as_deref(),
+                ))?,
             )?;
             metrics::record_r2_connections(client.connections());
             info!(
@@ -530,7 +543,11 @@ fn r2_flags(args: &CommandLineArgs) -> R2Flags<'_> {
             "--r2-access-client-secret",
             args.r2_access_client_secret.as_ref().map(AsRef::as_ref),
         ),
-        connections: R2CountFlag::new("--r2-connections", args.r2_connections),
+        connections: R2Flag::new("--r2-connections", args.r2_connections.as_deref()),
+        max_concurrent_requests: R2CountFlag::new(
+            "--witness-max-concurrent-requests",
+            args.witness_max_concurrent_requests,
+        ),
         // Empty on purpose. The orphan-tuning rule exists for a binary that validates R2 flags
         // on every startup; here they are only read under `--witness-source r2`, where a target
         // is mandatory, so the rule could never fire. Under `--witness-source rpc` every

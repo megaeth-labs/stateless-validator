@@ -238,13 +238,55 @@ fn r2_custom_domain_target_wiring() {
     assert_eq!(
         parse(&["--r2-custom-domain", "https://witness.example.com", "--r2-connections", "8"])
             .unwrap()
-            .r2_connections,
-        Some(8)
+            .r2_connections
+            .as_deref(),
+        Some("8")
     );
     assert!(
         parse(&["--r2-custom-domain", "https://witness.example.com", "--r2-connections", "0"])
             .is_ok(),
         "zero connections must parse; it is rejected by name post-parse"
+    );
+}
+
+/// Under the default `--witness-source rpc` the `--r2-*` flags are inert, and a blank value —
+/// what a templated env file renders for a variable a given role does not set — must stay
+/// inert too.
+///
+/// This pins the parse layer specifically. `--r2-connections` is text rather than a number for
+/// exactly this reason: parsed by clap, a blank line aborts startup before `run` can decide the
+/// flags are irrelevant, and it aborts with clap's unnamed value error because this workspace
+/// builds clap without `error-context`. The gating of the rules themselves lives in `run` —
+/// `validate_r2_flags` is reached only through `build_r2_client`, from the `WitnessSource::R2`
+/// arm — which this test cannot observe.
+#[test]
+fn rpc_mode_tolerates_blank_and_conflicting_r2_values() {
+    let _guard = stateless_test_utils::env::env_lock();
+    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
+
+    for blank in [
+        ["--r2-bucket", ""],
+        ["--r2-custom-domain", ""],
+        ["--r2-connections", ""],
+        ["--r2-access-client-id", ""],
+    ] {
+        assert!(
+            parse(&["--witness-source", "rpc"]).is_ok() && parse(&blank).is_ok(),
+            "a blank {} must parse so it can stay inert in rpc mode",
+            blank[0]
+        );
+    }
+    assert!(
+        parse(&[
+            "--witness-source",
+            "rpc",
+            "--r2-endpoint",
+            "https://acc.r2.cloudflarestorage.com",
+            "--r2-custom-domain",
+            "https://witness.example.com",
+        ])
+        .is_ok(),
+        "conflicting targets must parse in rpc mode; they are never read there"
     );
 }
 

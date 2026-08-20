@@ -230,8 +230,13 @@ impl R2WitnessClient {
         let fetched = self
             .fetcher
             .get_block_object(number, hash, MAX_ATTEMPTS, None, metrics::on_r2_witness_retry)
-            .await?;
-        let bytes = fetched.bytes;
+            .await;
+        // Published on every outcome rather than on a decoded witness: the protocol is settled
+        // the moment any response lands, and a configuration 403 or an undecodable payload is
+        // exactly when "did this target actually come up on h2?" is the question being asked.
+        self.publish_negotiated_version();
+        let fetched = fetched?;
+        let (bytes, queue_wait) = (fetched.bytes, fetched.queue_wait);
 
         // zstd + bincode over a multi-MB witness is CPU-bound; keep it off the runtime.
         let key = || keys::block_object_key(number, hash);
@@ -240,9 +245,8 @@ impl R2WitnessClient {
                 trace!(number, "R2 witness fetched and decoded");
                 // Queue wait on the self-imposed concurrency cap is subtracted: folded in, it
                 // would masquerade as R2 slowness.
-                self.publish_negotiated_version();
                 metrics::on_r2_witness_fetch_success(
-                    started.elapsed().saturating_sub(fetched.queue_wait).as_secs_f64(),
+                    started.elapsed().saturating_sub(queue_wait).as_secs_f64(),
                     WitnessSizeBreakdown::new(&witness.0, &witness.1),
                 );
                 Ok(witness)

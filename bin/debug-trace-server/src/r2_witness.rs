@@ -195,13 +195,17 @@ impl R2WitnessSource {
                 Some(deadline),
                 metrics::record_r2_witness_retry,
             )
-            .await?;
+            .await;
+        // Published on every outcome rather than only past the `?`: the protocol is settled the
+        // moment any response lands, and a configuration 403 or a run of frontier 404s is
+        // exactly when "did this target actually come up on h2?" is the question being asked.
+        self.publish_negotiated_version();
+        let fetched = fetched?;
         // The caller's end-to-end duration metric deliberately keeps this queue wait in —
         // on the request path the user really did wait through it — so the queued share is
         // reported on its own series instead of being subtracted the way the validator's
         // throughput pipeline does.
         metrics::record_r2_witness_queue_wait(fetched.queue_wait.as_secs_f64());
-        self.publish_negotiated_version();
         decode_light_with_deadline(fetched.bytes, number, hash, deadline).await
     }
 }

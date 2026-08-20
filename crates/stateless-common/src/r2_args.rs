@@ -50,10 +50,10 @@ impl<'a> R2TuningFlag<'a> {
     }
 }
 
-/// A tuning flag whose *value* the rules need, not just its presence.
+/// A flag whose numeric *value* the rules need, not just its presence.
 #[derive(Clone, Copy)]
 pub struct R2CountFlag<'a> {
-    /// The flag as an operator writes it, e.g. `--r2-connections`.
+    /// The flag as an operator writes it, e.g. `--r2-max-concurrent-requests`.
     pub name: &'a str,
     /// The parsed count, `None` when the operator left it alone.
     pub value: Option<usize>,
@@ -82,8 +82,11 @@ pub struct R2Flags<'a> {
     pub access_client_id: R2Flag<'a>,
     /// Cloudflare Access service-token client secret (custom domain only).
     pub access_client_secret: R2Flag<'a>,
-    /// How many HTTP/2 connections the custom-domain target spreads its GETs over.
-    pub connections: R2CountFlag<'a>,
+    /// How many HTTP/2 connections the custom-domain target spreads its GETs over, unparsed
+    /// (see [`parse_r2_connections`] for why it arrives as a string).
+    pub connections: R2Flag<'a>,
+    /// The in-flight GET cap these connections divide, whatever the binary calls it.
+    pub max_concurrent_requests: R2CountFlag<'a>,
     /// Flags that only mean something once a target is configured.
     pub tuning: &'a [R2TuningFlag<'a>],
 }
@@ -104,8 +107,8 @@ pub enum R2Target {
 /// Rejects, each by flag name: a present-but-empty value, both targets at once, S3 flags left
 /// behind by the documented migration to a custom domain, an incomplete S3 credential quad, a
 /// half-configured Cloudflare Access pair or one attached to no custom domain, a connection
-/// count of zero or one attached to a target that cannot spread over connections, and tuning
-/// flags set with no target to tune.
+/// count that is zero, unparseable, attached to a target that cannot spread over connections,
+/// or larger than the cap it divides, and tuning flags set with no target to tune.
 ///
 /// Emptiness is swept first so a blank env line is diagnosed as itself, rather than read as a
 /// configured target or as a leftover from one — without that ordering, a blank
@@ -121,6 +124,7 @@ pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Target> {
         flags.custom_domain,
         flags.access_client_id,
         flags.access_client_secret,
+        flags.connections,
     ];
 
     for flag in all_values {
@@ -197,21 +201,56 @@ pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Target> {
     Ok(target)
 }
 
-/// The connection count is a custom-domain concept and must name at least one connection.
+/// Parses the connection count, defaulting to a single connection when it is not set.
+///
+/// It travels as a string rather than as a `usize` in the argument struct so that a blank line
+/// — what a templated env file renders for an unset variable — is diagnosed here, by name, at
+/// the point the R2 flags are actually read. Parsed by clap it would abort startup with clap's
+/// unnamed "invalid value for one of the arguments" (this workspace builds clap without
+/// `error-context`), and it would abort it even on a binary that never reads the R2 flags in
+/// the mode it was started in.
+pub fn parse_r2_connections(flag: R2Flag<'_>) -> Result<usize> {
+    let Some(raw) = flag.value else { return Ok(1) };
+    let Ok(count) = raw.parse::<usize>() else {
+        bail!("{} must be a whole number of connections, got {raw:?}", flag.name);
+    };
+    if count == 0 {
+        bail!("{} must be at least 1", flag.name);
+    }
+    Ok(count)
+}
+
+/// The connection count is a custom-domain concept, must name at least one connection, and
+/// cannot name more connections than the in-flight cap can fill.
 ///
 /// Rejected rather than clamped on the S3 target: there, one client already opens a socket per
 /// concurrent request, so a count set there is a belief about the deployment that is not true,
 /// and honouring it silently would leave the operator expecting a spread they did not get.
+/// Rejected rather than clamped against the cap for the same reason — and because clamping
+/// would quietly hand back fewer connections than the published gauge reports.
 fn validate_connections(flags: &R2Flags<'_>, target: R2Target) -> Result<()> {
-    let Some(value) = flags.connections.value else { return Ok(()) };
-    if value == 0 {
-        bail!("{} must be at least 1", flags.connections.name);
+    if flags.connections.value.is_none() {
+        return Ok(());
     }
+    let count = parse_r2_connections(flags.connections)?;
     if target == R2Target::S3 {
         bail!(
             "{} applies only to {}: the S3 target already opens a connection per in-flight GET",
             flags.connections.name,
             flags.custom_domain.name
+        );
+    }
+    // The cap is split across the connections, so more connections than permits leaves some of
+    // them permanently idle — and the split rounds up, which past this point would be the one
+    // way the fetcher-wide total could exceed the cap by more than a rounding residue.
+    if let Some(max) = flags.max_concurrent_requests.value &&
+        count > max
+    {
+        bail!(
+            "{} ({count}) exceeds {} ({max}): the cap is split across the connections, so more \
+             connections than permits leaves some of them idle",
+            flags.connections.name,
+            flags.max_concurrent_requests.name
         );
     }
     Ok(())
@@ -265,7 +304,8 @@ mod tests {
         domain: Option<&'a str>,
         access_id: Option<&'a str>,
         access_secret: Option<&'a str>,
-        connections: Option<usize>,
+        connections: Option<&'a str>,
+        max_concurrent: Option<usize>,
         tuning: &'a [R2TuningFlag<'a>],
     }
 
@@ -280,7 +320,11 @@ mod tests {
                 custom_domain: R2Flag::new("--r2-custom-domain", self.domain),
                 access_client_id: R2Flag::new("--r2-access-client-id", self.access_id),
                 access_client_secret: R2Flag::new("--r2-access-client-secret", self.access_secret),
-                connections: R2CountFlag::new("--r2-connections", self.connections),
+                connections: R2Flag::new("--r2-connections", self.connections),
+                max_concurrent_requests: R2CountFlag::new(
+                    "--r2-max-concurrent-requests",
+                    self.max_concurrent,
+                ),
                 tuning: self.tuning,
             }
         }
@@ -294,24 +338,61 @@ mod tests {
         }
     }
 
-    /// Zero connections would build a fetcher that can carry nothing; the S3 target cannot
-    /// spread over connections at all. Both are named rather than clamped or ignored, because
+    /// Every way a connection count can be wrong is named. Zero builds a fetcher that can
+    /// carry nothing; the S3 target cannot spread over connections at all; more connections
+    /// than permits leaves some of them idle. Named rather than clamped or ignored, because
     /// either silence leaves the operator believing in a spread they did not get.
     #[test]
-    fn connections_must_be_positive_and_belong_to_the_custom_domain() {
-        let zero = Cfg { domain: DOMAIN, connections: Some(0), ..Cfg::default() }.err();
+    fn connections_must_be_positive_belong_to_the_custom_domain_and_fit_the_cap() {
+        let zero = Cfg { domain: DOMAIN, connections: Some("0"), ..Cfg::default() }.err();
         assert!(zero.contains("--r2-connections") && zero.contains("at least 1"), "{zero}");
 
-        let on_s3 = Cfg { connections: Some(4), ..s3() }.err();
+        let junk = Cfg { domain: DOMAIN, connections: Some("eight"), ..Cfg::default() }.err();
+        assert!(junk.contains("--r2-connections") && junk.contains("whole number"), "{junk}");
+
+        let on_s3 = Cfg { connections: Some("4"), ..s3() }.err();
         assert!(
             on_s3.contains("--r2-connections") && on_s3.contains("--r2-custom-domain"),
             "{on_s3}"
         );
 
-        let orphan = Cfg { connections: Some(4), ..Cfg::default() }.err();
+        let orphan = Cfg { connections: Some("4"), ..Cfg::default() }.err();
         assert!(orphan.contains("--r2-connections"), "{orphan}");
 
-        assert!(Cfg { domain: DOMAIN, connections: Some(8), ..Cfg::default() }.validate().is_ok());
+        let over_cap = Cfg {
+            domain: DOMAIN,
+            connections: Some("8"),
+            max_concurrent: Some(4),
+            ..Cfg::default()
+        }
+        .err();
+        assert!(
+            over_cap.contains("--r2-connections") &&
+                over_cap.contains("--r2-max-concurrent-requests"),
+            "more connections than permits must name both flags: {over_cap}"
+        );
+
+        assert!(
+            Cfg {
+                domain: DOMAIN,
+                connections: Some("8"),
+                max_concurrent: Some(48),
+                ..Cfg::default()
+            }
+            .validate()
+            .is_ok()
+        );
+    }
+
+    /// A blank line is what a templated env file renders for an unset variable, so it must be
+    /// diagnosed as itself rather than as a bad number — and, on a binary that reads the R2
+    /// flags in only one mode, must not reach clap at all.
+    #[test]
+    fn a_blank_connection_count_is_named_as_an_empty_value() {
+        let blank = Cfg { domain: DOMAIN, connections: Some(""), ..Cfg::default() }.err();
+        assert!(blank.contains("--r2-connections") && blank.contains("empty"), "{blank}");
+        assert_eq!(parse_r2_connections(R2Flag::new("--r2-connections", None)).unwrap(), 1);
+        assert_eq!(parse_r2_connections(R2Flag::new("--r2-connections", Some("8"))).unwrap(), 8);
     }
 
     /// A complete, valid S3 configuration.
