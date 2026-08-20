@@ -200,52 +200,29 @@ fn r2_custom_domain_target_wiring() {
     // so that each error can name the flag — clap's own rejections cannot, this workspace having
     // built it without `error-context`. Parsing therefore accepts all of these shapes; the rules
     // and their messages are covered by that function's own tests.
-    assert!(
-        parse(&[
+    const DOMAIN: &str = "https://witness.example.com";
+    for shape in [
+        &["--r2-custom-domain", DOMAIN, "--r2-endpoint", "https://acc.r2.cloudflarestorage.com"][..],
+        &["--r2-custom-domain", DOMAIN, "--r2-access-client-id", "tok"],
+        &["--r2-access-client-id", "tok", "--r2-access-client-secret", "sk"],
+        &[
             "--r2-custom-domain",
-            "https://witness.example.com",
-            "--r2-endpoint",
-            "https://acc.r2.cloudflarestorage.com",
-        ])
-        .is_ok(),
-        "both targets must parse; rejection happens post-parse"
-    );
-    assert!(
-        parse(&[
-            "--r2-custom-domain",
-            "https://witness.example.com",
-            "--r2-access-client-id",
-            "tok",
-        ])
-        .is_ok(),
-        "a half-set Access pair must parse; it is rejected by name post-parse"
-    );
-    assert!(
-        parse(&["--r2-access-client-id", "tok", "--r2-access-client-secret", "sk"]).is_ok(),
-        "an Access pair without the domain must parse; it is rejected by name post-parse"
-    );
-    assert!(
-        parse(&[
-            "--r2-custom-domain",
-            "https://witness.example.com",
+            DOMAIN,
             "--r2-access-client-id",
             "tok",
             "--r2-access-client-secret",
             "sk",
-        ])
-        .is_ok()
-    );
+        ],
+        &["--r2-custom-domain", DOMAIN, "--r2-connections", "0"],
+    ] {
+        assert!(parse(shape).is_ok(), "{shape:?} must parse; rejection happens post-parse");
+    }
     assert_eq!(
-        parse(&["--r2-custom-domain", "https://witness.example.com", "--r2-connections", "8"])
+        parse(&["--r2-custom-domain", DOMAIN, "--r2-connections", "8"])
             .unwrap()
             .r2_connections
             .as_deref(),
         Some("8")
-    );
-    assert!(
-        parse(&["--r2-custom-domain", "https://witness.example.com", "--r2-connections", "0"])
-            .is_ok(),
-        "zero connections must parse; it is rejected by name post-parse"
     );
 }
 
@@ -264,6 +241,7 @@ fn rpc_mode_tolerates_blank_and_conflicting_r2_values() {
     let _guard = stateless_test_utils::env::env_lock();
     let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
 
+    assert!(parse(&["--witness-source", "rpc"]).is_ok());
     for blank in [
         ["--r2-bucket", ""],
         ["--r2-custom-domain", ""],
@@ -271,7 +249,7 @@ fn rpc_mode_tolerates_blank_and_conflicting_r2_values() {
         ["--r2-access-client-id", ""],
     ] {
         assert!(
-            parse(&["--witness-source", "rpc"]).is_ok() && parse(&blank).is_ok(),
+            parse(&blank).is_ok(),
             "a blank {} must parse so it can stay inert in rpc mode",
             blank[0]
         );

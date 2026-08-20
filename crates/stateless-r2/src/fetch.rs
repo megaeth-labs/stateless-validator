@@ -22,8 +22,8 @@
 use std::{
     fmt::Display,
     sync::{
-        Arc,
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -34,7 +34,7 @@ use reqwest::{
     Client,
     header::{HeaderMap, HeaderName, HeaderValue},
 };
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::warn;
 
 use crate::{
@@ -319,19 +319,14 @@ const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 64;
 /// and was read off the wire on the zone this target was built for.
 pub const CLOUDFLARE_MAX_CONCURRENT_STREAMS: usize = 100;
 
-/// `negotiated_version` before any response has been seen.
-const VERSION_UNOBSERVED: u8 = 0;
-/// Protocol labels, indexed by the code stored in `negotiated_version`.
-const VERSION_LABELS: [&str; 7] = ["", "http/0.9", "http/1.0", "http/1.1", "h2", "h3", "other"];
-
-fn version_code(version: reqwest::Version) -> u8 {
+fn version_label(version: reqwest::Version) -> &'static str {
     match version {
-        v if v == reqwest::Version::HTTP_09 => 1,
-        v if v == reqwest::Version::HTTP_10 => 2,
-        v if v == reqwest::Version::HTTP_11 => 3,
-        v if v == reqwest::Version::HTTP_2 => 4,
-        v if v == reqwest::Version::HTTP_3 => 5,
-        _ => 6,
+        v if v == reqwest::Version::HTTP_09 => "http/0.9",
+        v if v == reqwest::Version::HTTP_10 => "http/1.0",
+        v if v == reqwest::Version::HTTP_11 => "http/1.1",
+        v if v == reqwest::Version::HTTP_2 => "h2",
+        v if v == reqwest::Version::HTTP_3 => "h3",
+        _ => "other",
     }
 }
 
@@ -372,37 +367,97 @@ struct Connection {
     permits: Semaphore,
 }
 
+/// One fetcher-wide budget divided across `connections`, rounded up.
+///
+/// The single home for that rounding, because three things derive from it — each connection's
+/// permits, its idle-socket bound, and the share the startup advisory reports — and an
+/// advisory that named a share the semaphores did not hand out would be worse than none.
+/// Rounding *up* is deliberate: rounding down would round some connection to zero, and a
+/// connection that can carry nothing is worse than a fetcher-wide total that overshoots by
+/// less than the connection count. Callers normalise `connections` to at least 1 first.
+fn per_connection(budget: usize, connections: usize) -> usize {
+    budget.div_ceil(connections)
+}
+
 /// Each connection's share of the in-flight GET cap: `None` = unlimited, `Some(0)` clamps to 1
 /// — a zero-permit semaphore would wedge every fetch on `acquire()` forever.
-///
-/// The share rounds *up*, so with a cap that does not divide evenly the fetcher-wide total
-/// exceeds it by less than the connection count. Rounding down would round some connection to
-/// zero, and a connection that can carry nothing is worse than a cap overshot by a handful.
 fn per_connection_permits(max_concurrent_requests: Option<usize>, connections: usize) -> usize {
     max_concurrent_requests
-        .map_or(Semaphore::MAX_PERMITS, |max| max.div_ceil(connections.max(1)))
+        .map_or(Semaphore::MAX_PERMITS, |max| per_connection(max, connections.max(1)))
         .max(1)
 }
 
-/// Builds `connections` clients, each with its share of the in-flight budget.
+/// A version callback that prints as its presence, so the fetcher keeps deriving `Debug`.
+#[derive(Clone)]
+struct VersionObserver(Arc<dyn Fn(&'static str) + Send + Sync>);
+
+impl std::fmt::Debug for VersionObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<observer>")
+    }
+}
+
+/// The connections a fetcher spreads its GETs over, and the cursor that rotates between them.
 ///
-/// `connections` is the number of HTTP/2 connections the GETs are spread over, because one
-/// `reqwest::Client` is one connection to a host and hyper will not open a second when the
-/// first saturates. Anything past one connection therefore has to be asked for explicitly;
-/// `0` is read as `1` rather than rejected, matching how the concurrency cap treats `Some(0)`.
-fn connection_pool(
-    build: impl Fn() -> reqwest::Result<Client>,
-    connections: usize,
-    max_concurrent_requests: Option<usize>,
-) -> Result<Arc<[Connection]>, String> {
-    let permits = per_connection_permits(max_concurrent_requests, connections);
-    (0..connections.max(1))
-        .map(|_| {
-            build()
-                .map(|http| Connection { http, permits: Semaphore::new(permits) })
-                .map_err(|e| format!("Failed to build R2 HTTP client: {e}"))
+/// One object rather than a slice beside a loose counter: the modulo that wraps the cursor is
+/// only meaningful against this slice's length, so the two cannot be allowed to drift apart or
+/// be cloned separately.
+#[derive(Debug)]
+struct ConnectionPool {
+    connections: Box<[Connection]>,
+    next: AtomicUsize,
+}
+
+impl ConnectionPool {
+    /// Builds `connections` clients, each with its share of the in-flight budget.
+    ///
+    /// `connections` is the number of HTTP/2 connections the GETs are spread over, because one
+    /// `reqwest::Client` is one connection to a host and hyper will not open a second when the
+    /// first saturates. Anything past one connection therefore has to be asked for explicitly;
+    /// `0` is read as `1` rather than rejected, matching how the cap treats `Some(0)`.
+    fn build(
+        build: impl Fn() -> reqwest::Result<Client>,
+        connections: usize,
+        max_concurrent_requests: Option<usize>,
+    ) -> Result<Self, String> {
+        let permits = per_connection_permits(max_concurrent_requests, connections);
+        let connections = (0..connections.max(1))
+            .map(|_| {
+                build()
+                    .map(|http| Connection { http, permits: Semaphore::new(permits) })
+                    .map_err(|e| format!("Failed to build R2 HTTP client: {e}"))
+            })
+            .collect::<Result<Box<[Connection]>, _>>()?;
+        Ok(Self { connections, next: AtomicUsize::new(0) })
+    }
+
+    fn len(&self) -> usize {
+        self.connections.len()
+    }
+
+    /// A connection with a free permit and that permit, or `None` when every connection is
+    /// full — starting the search at the rotating cursor, so an unloaded pool still rotates.
+    ///
+    /// Work-conserving on purpose. Committing to the cursor's connection and then waiting on
+    /// *its* semaphore would partition one budget of `max` into `N` budgets of `max/N`, which
+    /// queues distinctly worse at the same offered load, and would leave a GET waiting behind
+    /// a connection whose permits are held by a slow transfer while another sits idle.
+    fn try_acquire(&self) -> Option<(&Connection, SemaphorePermit<'_>)> {
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        (0..self.len()).find_map(|offset| {
+            let connection = &self.connections[(start + offset) % self.len()];
+            connection.permits.try_acquire().ok().map(|permit| (connection, permit))
         })
-        .collect()
+    }
+
+    /// The connection a fetch waits on when every one of them is full.
+    ///
+    /// The cursor's own pick rather than any notion of "least loaded": under saturation the
+    /// connection with the most free capacity is the one that just dropped every GET riding
+    /// it, so choosing by capacity would steer the wait straight into the fault.
+    fn on_deck(&self) -> &Connection {
+        &self.connections[self.next.fetch_add(1, Ordering::Relaxed) % self.len()]
+    }
 }
 
 /// Fetches witness objects from an R2 bucket — SigV4-signed over the S3 API, or unsigned
@@ -413,19 +468,21 @@ fn connection_pool(
 #[derive(Clone, Debug)]
 pub struct R2ObjectFetcher {
     /// The connections this fetcher spreads its GETs over, each with its own permits. One
-    /// entry unless the caller asked for more; see [`connection_pool`].
-    connections: Arc<[Connection]>,
-    /// Round-robin cursor over `connections`, shared across clones so that clones of one
-    /// fetcher keep spreading over the same connections instead of each starting at zero.
-    next_connection: Arc<AtomicUsize>,
+    /// entry unless the caller asked for more. Shared across clones, so clones keep rotating
+    /// over the same connections instead of each starting at zero.
+    pool: Arc<ConnectionPool>,
     target: Target,
     /// Hard cap on a single GET attempt; with a deadline, each attempt uses
     /// `min(timeouts.per_attempt, remaining)`.
     per_attempt_timeout: Duration,
     pacing: RetryPacing,
-    /// Protocol the first response actually used, [`VERSION_UNOBSERVED`] until one arrives.
-    /// Shared across clones so the degradation warning fires once per fetcher, not per clone.
-    negotiated_version: Arc<AtomicU8>,
+    /// Protocol the first response actually used, empty until one arrives. Shared across
+    /// clones so the degradation warning fires once per fetcher, not per clone.
+    negotiated_version: Arc<OnceLock<&'static str>>,
+    /// Notified with that protocol the once it is learned, for callers that publish it.
+    /// Pushed rather than polled: the fact is knowable exactly once, and a caller that had to
+    /// poll would need its own dedup and would have to remember to poll on failure paths too.
+    on_version_observed: Option<VersionObserver>,
 }
 
 impl R2ObjectFetcher {
@@ -464,9 +521,29 @@ impl R2ObjectFetcher {
     /// cannot: version selection is pure ALPN, so a degraded origin looks identical from the
     /// configuration side.
     pub fn negotiated_http_version(&self) -> Option<&'static str> {
-        match self.negotiated_version.load(Ordering::Relaxed) {
-            VERSION_UNOBSERVED => None,
-            code => Some(VERSION_LABELS[code as usize]),
+        self.negotiated_version.get().copied()
+    }
+
+    /// Registers a callback invoked once, with the protocol of the first response this fetcher
+    /// receives. Chained after construction so the targets that cannot degrade need not pass it.
+    #[must_use]
+    pub fn on_version_observed(
+        mut self,
+        observe: impl Fn(&'static str) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_version_observed = Some(VersionObserver(Arc::new(observe)));
+        self
+    }
+
+    /// The protocol this target is built to speak, so a response that used another one is a
+    /// degradation rather than a surprise. Keeps the check off the response path's control
+    /// flow: without it the observation has to be gated on the target, purely because the
+    /// warning text names one.
+    const fn expected_version(&self) -> reqwest::Version {
+        match self.target {
+            // Pinned `http1_only` at construction, so ALPN cannot move it.
+            Target::S3 { .. } => reqwest::Version::HTTP_11,
+            Target::CustomDomain { .. } => reqwest::Version::HTTP_2,
         }
     }
 
@@ -480,17 +557,16 @@ impl R2ObjectFetcher {
     /// on asserting the target that was *configured*. Warned once rather than per GET, which at
     /// this call rate would be thousands of lines a minute.
     fn observe_version(&self, version: reqwest::Version) {
-        let code = version_code(version);
-        if self
-            .negotiated_version
-            .compare_exchange(VERSION_UNOBSERVED, code, Ordering::Relaxed, Ordering::Relaxed)
-            .is_err()
-        {
-            return;
+        let label = version_label(version);
+        if self.negotiated_version.set(label).is_err() {
+            return; // another response was first; it already warned and notified
         }
-        if version != reqwest::Version::HTTP_2 {
+        if let Some(observe) = &self.on_version_observed {
+            (observe.0)(label);
+        }
+        if version != self.expected_version() {
             warn!(
-                negotiated = VERSION_LABELS[code as usize],
+                negotiated = label,
                 origin = self.origin(),
                 "R2 custom domain did not negotiate HTTP/2: the multiplexing this target exists \
                  for is unavailable, its h2 tuning is inert, and connection reuse now follows \
@@ -522,24 +598,13 @@ impl R2ObjectFetcher {
         connections: usize,
     ) -> Option<usize> {
         max_concurrent_requests
-            .map(|max| max.div_ceil(connections.max(1)))
+            .map(|max| per_connection(max, connections.max(1)))
             .filter(|share| *share > CLOUDFLARE_MAX_CONCURRENT_STREAMS)
-    }
-
-    /// The next connection in round-robin order.
-    ///
-    /// Taken per attempt rather than per fetch, so a retry lands on a different connection than
-    /// the attempt that just failed. With one connection per client, retrying onto the same
-    /// connection is retrying into the same fault — and a dropped connection fails every GET
-    /// riding it at once, so the retry is exactly when spreading matters most.
-    fn next_connection(&self) -> &Connection {
-        let index = self.next_connection.fetch_add(1, Ordering::Relaxed);
-        &self.connections[index % self.connections.len()]
     }
 
     /// How many HTTP/2 connections this fetcher spreads its GETs over.
     pub fn connections(&self) -> usize {
-        self.connections.len()
+        self.pool.len()
     }
 
     /// Builds a fetcher from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
@@ -568,7 +633,7 @@ impl R2ObjectFetcher {
         // pool already opens a socket per concurrent request, so spreading over more clients
         // would buy nothing here. Spreading is a custom-domain concern, where multiplexing
         // means one client is one connection.
-        let connections = connection_pool(
+        let pool = ConnectionPool::build(
             || {
                 base_client(timeouts)
                     // Pin the S3 target to HTTP/1.1 in the client rather than relying on the
@@ -581,8 +646,7 @@ impl R2ObjectFetcher {
             max_concurrent_requests,
         )?;
         Ok(Self {
-            connections,
-            next_connection: Arc::new(AtomicUsize::new(0)),
+            pool: Arc::new(pool),
             target: Target::S3 {
                 signer: SigV4Signer::new(access_key_id, secret_access_key),
                 endpoint: origin,
@@ -591,7 +655,8 @@ impl R2ObjectFetcher {
             },
             per_attempt_timeout: timeouts.per_attempt,
             pacing,
-            negotiated_version: Arc::new(AtomicU8::new(VERSION_UNOBSERVED)),
+            negotiated_version: Arc::new(OnceLock::new()),
+            on_version_observed: None,
         })
     }
 
@@ -643,9 +708,13 @@ impl R2ObjectFetcher {
         // Built once and cloned per client: `into_header_map` validates the credential, and
         // failing that validation is a property of the credential, not of a given connection.
         let headers = access.map(CfAccessCredentials::into_header_map).transpose()?;
-        // Each client's own idle bound, since the fetcher now holds several of them.
-        let idle_per_client = max_concurrent_requests
-            .map_or(MAX_IDLE_CONNECTIONS_PER_HOST, |max| max.div_ceil(connections.max(1)));
+        let connections = connections.max(1);
+        // Each client's own idle bound: the fetcher-wide bound divided the same way the permits
+        // are, so holding more clients cannot multiply the sockets the h1.1 fallback may keep.
+        let idle_per_client = per_connection(
+            max_concurrent_requests.unwrap_or(MAX_IDLE_CONNECTIONS_PER_HOST),
+            connections,
+        );
         let build = || {
             let mut builder = base_client(timeouts)
                 // Cloudflare's Browser Integrity Check, on by default on many zones, challenges
@@ -690,12 +759,12 @@ impl R2ObjectFetcher {
             );
         }
         Ok(Self {
-            connections: connection_pool(build, connections, max_concurrent_requests)?,
-            next_connection: Arc::new(AtomicUsize::new(0)),
+            pool: Arc::new(ConnectionPool::build(build, connections, max_concurrent_requests)?),
             target: Target::CustomDomain { origin },
             per_attempt_timeout: timeouts.per_attempt,
             pacing,
-            negotiated_version: Arc::new(AtomicU8::new(VERSION_UNOBSERVED)),
+            negotiated_version: Arc::new(OnceLock::new()),
+            on_version_observed: None,
         })
     }
 
@@ -729,21 +798,35 @@ impl R2ObjectFetcher {
             // Permit scoped to the GET itself — holding it across the backoff sleep would
             // waste capacity other fetches could use.
             let outcome = {
-                let connection = self.next_connection();
                 let queued = Instant::now();
-                // A deadline bounds the queue wait too: under saturation the caller's budget
-                // must stay available for its fallback, not drain waiting for a permit.
-                let permit = match deadline {
-                    None => connection.permits.acquire().await,
-                    Some(d) => {
-                        match tokio::time::timeout_at(d.into(), connection.permits.acquire()).await
-                        {
-                            Ok(acquired) => acquired,
-                            Err(_) => return Err(R2GetError::Deadline { number, key }),
-                        }
+                // The connection is chosen per attempt, not per fetch, so a retry lands on a
+                // different one than the attempt that just failed: one client is one
+                // connection, so retrying onto the same one retries into the same fault.
+                let taken = match self.pool.try_acquire() {
+                    Some(taken) => Some(taken),
+                    // Every connection full. Wait on the cursor's pick — a deadline bounds
+                    // that wait too, since under saturation the caller's budget must stay
+                    // available for its fallback rather than drain here.
+                    None => {
+                        let connection = self.pool.on_deck();
+                        let waited = match deadline {
+                            None => connection.permits.acquire().await,
+                            Some(d) => {
+                                match tokio::time::timeout_at(
+                                    d.into(),
+                                    connection.permits.acquire(),
+                                )
+                                .await
+                                {
+                                    Ok(acquired) => acquired,
+                                    Err(_) => return Err(R2GetError::Deadline { number, key }),
+                                }
+                            }
+                        };
+                        Some((connection, waited.expect("semaphore is never closed")))
                     }
-                }
-                .expect("semaphore is never closed");
+                };
+                let (connection, permit) = taken.expect("both arms yield a connection");
                 queue_wait += queued.elapsed();
                 let _permit = permit;
                 self.get_object(connection, number, &key, deadline).await
@@ -823,9 +906,7 @@ impl R2ObjectFetcher {
             }
         };
         let response = request.send().await.map_err(transport)?;
-        if matches!(self.target, Target::CustomDomain { .. }) {
-            self.observe_version(response.version());
-        }
+        self.observe_version(response.version());
 
         let status = response.status();
         if status.is_success() {
@@ -1137,9 +1218,31 @@ mod tests {
         let _ = holder.await;
     }
 
-    fn custom_fetcher(domain: &str, access: Option<CfAccessCredentials>) -> R2ObjectFetcher {
+    fn try_custom_fetcher(
+        domain: &str,
+        access: Option<CfAccessCredentials>,
+    ) -> Result<R2ObjectFetcher, String> {
         R2ObjectFetcher::new_custom_domain(domain, access, test_timeouts(), test_pacing(), None, 1)
-            .unwrap()
+    }
+
+    fn custom_fetcher(domain: &str, access: Option<CfAccessCredentials>) -> R2ObjectFetcher {
+        try_custom_fetcher(domain, access).unwrap()
+    }
+
+    fn custom_fetcher_with(
+        domain: &str,
+        max: Option<usize>,
+        connections: usize,
+    ) -> R2ObjectFetcher {
+        R2ObjectFetcher::new_custom_domain(
+            domain,
+            None,
+            test_timeouts(),
+            test_pacing(),
+            max,
+            connections,
+        )
+        .unwrap()
     }
 
     /// A credential that cannot be a header value fails at construction, by flag name and
@@ -1148,17 +1251,13 @@ mod tests {
     /// forever and no startup failure would ever name the real cause.
     #[test]
     fn access_credential_with_a_control_byte_fails_construction_without_echoing_it() {
-        let err = R2ObjectFetcher::new_custom_domain(
+        let err = try_custom_fetcher(
             "https://witness.example.com",
             Some(CfAccessCredentials {
                 client_id: "tok-3f1.access".to_string(),
                 // The shape of `$(cat secret.txt)` or an unquoted env-file line.
                 client_secret: "sec-9a2\n".to_string(),
             }),
-            test_timeouts(),
-            test_pacing(),
-            None,
-            1,
         )
         .expect_err("a trailing newline cannot be a header value");
         assert!(err.contains("--r2-access-client-secret"), "{err}");
@@ -1175,29 +1274,15 @@ mod tests {
                 client_secret: "sec-9a2".to_string(),
             })
         };
-        let err = R2ObjectFetcher::new_custom_domain(
-            "http://witness.example.com",
-            access(),
-            test_timeouts(),
-            test_pacing(),
-            None,
-            1,
-        )
-        .expect_err("plaintext + credentials to a remote host must be refused");
+        let err = try_custom_fetcher("http://witness.example.com", access())
+            .expect_err("plaintext + credentials to a remote host must be refused");
         assert!(err.contains("plaintext"), "{err}");
 
         // Loopback stays usable: that is the mock and port-forward shape, and every
         // custom-domain test here depends on it.
         for loopback in ["http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080"] {
-            R2ObjectFetcher::new_custom_domain(
-                loopback,
-                access(),
-                test_timeouts(),
-                test_pacing(),
-                None,
-                1,
-            )
-            .unwrap_or_else(|e| panic!("{loopback} must be allowed: {e}"));
+            try_custom_fetcher(loopback, access())
+                .unwrap_or_else(|e| panic!("{loopback} must be allowed: {e}"));
         }
         // Plaintext without credentials has nothing to leak.
         custom_fetcher("http://witness.example.com", None);
@@ -1207,15 +1292,8 @@ mod tests {
     /// surfaces per GET as a retryable transport error, retrying a permanently broken URL.
     #[test]
     fn non_http_schemes_are_rejected_on_both_targets() {
-        let custom = R2ObjectFetcher::new_custom_domain(
-            "ftp://witness.example.com",
-            None,
-            test_timeouts(),
-            test_pacing(),
-            None,
-            1,
-        )
-        .expect_err("ftp is not drivable");
+        let custom =
+            try_custom_fetcher("ftp://witness.example.com", None).expect_err("ftp is not drivable");
         assert!(custom.contains("only http and https"), "{custom}");
 
         let s3 = R2ObjectFetcher::new(
@@ -1299,24 +1377,37 @@ mod tests {
     /// takes every GET riding it down together.
     #[tokio::test]
     async fn connections_are_handed_out_round_robin() {
-        let fetcher = R2ObjectFetcher::new_custom_domain(
-            "https://witness.example.com",
-            None,
-            test_timeouts(),
-            test_pacing(),
-            Some(12),
-            3,
-        )
-        .unwrap();
+        let fetcher = custom_fetcher_with("https://witness.example.com", Some(12), 3);
         assert_eq!(fetcher.connections(), 3);
+        let taken: Vec<_> = (0..6).map(|_| fetcher.pool.try_acquire().expect("free")).collect();
         let cycle: Vec<*const Connection> =
-            (0..6).map(|_| std::ptr::from_ref(fetcher.next_connection())).collect();
+            taken.iter().map(|(connection, _)| std::ptr::from_ref(*connection)).collect();
         assert_eq!(cycle[..3], cycle[3..], "the cursor wraps rather than drifting");
         assert_eq!(
             cycle[..3].iter().collect::<std::collections::HashSet<_>>().len(),
             3,
             "consecutive attempts land on distinct connections"
         );
+    }
+
+    /// A full connection is skipped rather than queued behind.
+    ///
+    /// Committing to the cursor's pick and then waiting on its semaphore would partition one
+    /// budget of `max` into `N` budgets of `max/N` — distinctly worse queueing at the same
+    /// offered load — and would strand a GET behind a connection whose permits are held by a
+    /// slow transfer while another connection sits idle.
+    #[tokio::test]
+    async fn a_saturated_connection_is_skipped_while_another_has_room() {
+        // Two connections, one permit each.
+        let fetcher = custom_fetcher_with("https://witness.example.com", Some(2), 2);
+        let (first, _first_permit) = fetcher.pool.try_acquire().expect("both free");
+
+        let (second, _second_permit) = fetcher.pool.try_acquire().expect("one still free");
+        assert!(!std::ptr::eq(first, second), "the free connection is the one handed out");
+
+        assert!(fetcher.pool.try_acquire().is_none(), "with both full, nothing is handed out");
+        // And the cursor still names one to wait on rather than deadlocking the caller.
+        assert!(fetcher.pool.on_deck().permits.try_acquire().is_err());
     }
 
     /// Cloudflare's Browser Integrity Check challenges user-agent-less requests, which would
@@ -1336,15 +1427,8 @@ mod tests {
     fn custom_domain_rejects_origin_with_path() {
         // The fetcher appends the object path itself; a path-bearing domain would silently
         // double it, so construction must fail fast (same policy as the S3 endpoint).
-        let err = R2ObjectFetcher::new_custom_domain(
-            "https://witness.example.com/witness-mainnet",
-            None,
-            test_timeouts(),
-            test_pacing(),
-            None,
-            1,
-        )
-        .unwrap_err();
+        let err =
+            try_custom_fetcher("https://witness.example.com/witness-mainnet", None).unwrap_err();
         assert!(err.contains("Invalid R2 custom domain"), "{err}");
     }
 

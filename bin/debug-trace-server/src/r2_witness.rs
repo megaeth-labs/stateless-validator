@@ -99,22 +99,16 @@ pub struct R2WitnessSource {
     fetcher: R2ObjectFetcher,
 }
 
+/// The fetcher's pacing view of a `BackoffPolicy` — the adapter-layer conversion that keeps
+/// `stateless-r2` free of a dependency on this workspace's backoff type.
+fn pacing(backoff: &BackoffPolicy) -> RetryPacing {
+    RetryPacing { initial: backoff.initial, max: backoff.max }
+}
+
 impl R2WitnessSource {
     /// The configured target's origin, for startup logging (see [`R2ObjectFetcher::origin`]).
     pub fn origin(&self) -> &str {
         self.fetcher.origin()
-    }
-
-    /// Publishes the protocol the transport actually negotiated, once per process.
-    ///
-    /// Only knowable after a response, so it cannot ride along with the startup target gauge.
-    /// There is one R2 source per process, which is why a process-wide `Once` is the whole
-    /// bookkeeping needed.
-    fn publish_negotiated_version(&self) {
-        static PUBLISHED: std::sync::Once = std::sync::Once::new();
-        if let Some(version) = self.fetcher.negotiated_http_version() {
-            PUBLISHED.call_once(|| metrics::record_r2_negotiated_version(version));
-        }
     }
 
     /// The configured target's metric label (see [`R2ObjectFetcher::target_label`]).
@@ -149,7 +143,7 @@ impl R2WitnessSource {
             access_key_id,
             secret_access_key,
             timeouts,
-            RetryPacing { initial: retry_backoff.initial, max: retry_backoff.max },
+            pacing(&retry_backoff),
             max_concurrent_requests,
         )
         .map_err(|e| eyre::eyre!(e))?;
@@ -171,10 +165,11 @@ impl R2WitnessSource {
             domain,
             access,
             timeouts,
-            RetryPacing { initial: retry_backoff.initial, max: retry_backoff.max },
+            pacing(&retry_backoff),
             max_concurrent_requests,
             connections,
         )
+        .map(|fetcher| fetcher.on_version_observed(metrics::record_r2_negotiated_version))
         .map_err(|e| eyre::eyre!(e))?;
         Ok(Self { fetcher })
     }
@@ -195,12 +190,7 @@ impl R2WitnessSource {
                 Some(deadline),
                 metrics::record_r2_witness_retry,
             )
-            .await;
-        // Published on every outcome rather than only past the `?`: the protocol is settled the
-        // moment any response lands, and a configuration 403 or a run of frontier 404s is
-        // exactly when "did this target actually come up on h2?" is the question being asked.
-        self.publish_negotiated_version();
-        let fetched = fetched?;
+            .await?;
         // The caller's end-to-end duration metric deliberately keeps this queue wait in —
         // on the request path the user really did wait through it — so the queued share is
         // reported on its own series instead of being subtracted the way the validator's

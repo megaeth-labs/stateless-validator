@@ -105,22 +105,16 @@ pub struct R2WitnessClient {
     fetcher: R2ObjectFetcher,
 }
 
+/// The fetcher's pacing view of a `BackoffPolicy` — the adapter-layer conversion that keeps
+/// `stateless-r2` free of a dependency on this workspace's backoff type.
+fn pacing(backoff: &BackoffPolicy) -> RetryPacing {
+    RetryPacing { initial: backoff.initial, max: backoff.max }
+}
+
 impl R2WitnessClient {
     /// The configured target's origin, for startup logging (see [`R2ObjectFetcher::origin`]).
     pub fn origin(&self) -> &str {
         self.fetcher.origin()
-    }
-
-    /// Publishes the protocol the transport actually negotiated, once per process.
-    ///
-    /// Only knowable after a response, so it cannot ride along with the startup target gauge.
-    /// There is one R2 source per process, which is why a process-wide `Once` is the whole
-    /// bookkeeping needed.
-    fn publish_negotiated_version(&self) {
-        static PUBLISHED: std::sync::Once = std::sync::Once::new();
-        if let Some(version) = self.fetcher.negotiated_http_version() {
-            PUBLISHED.call_once(|| metrics::record_r2_negotiated_version(version));
-        }
     }
 
     /// The configured target's metric label (see [`R2ObjectFetcher::target_label`]).
@@ -160,7 +154,7 @@ impl R2WitnessClient {
             access_key_id,
             secret_access_key,
             timeouts,
-            RetryPacing { initial: retry_backoff.initial, max: retry_backoff.max },
+            pacing(&retry_backoff),
             max_concurrent_requests,
         )
         .map_err(|e| eyre::eyre!(e))?;
@@ -182,10 +176,11 @@ impl R2WitnessClient {
             domain,
             access,
             timeouts,
-            RetryPacing { initial: retry_backoff.initial, max: retry_backoff.max },
+            pacing(&retry_backoff),
             max_concurrent_requests,
             connections,
         )
+        .map(|fetcher| fetcher.on_version_observed(metrics::record_r2_negotiated_version))
         .map_err(|e| eyre::eyre!(e))?;
         Ok(Self { fetcher })
     }
@@ -230,12 +225,7 @@ impl R2WitnessClient {
         let fetched = self
             .fetcher
             .get_block_object(number, hash, MAX_ATTEMPTS, None, metrics::on_r2_witness_retry)
-            .await;
-        // Published on every outcome rather than on a decoded witness: the protocol is settled
-        // the moment any response lands, and a configuration 403 or an undecodable payload is
-        // exactly when "did this target actually come up on h2?" is the question being asked.
-        self.publish_negotiated_version();
-        let fetched = fetched?;
+            .await?;
         let (bytes, queue_wait) = (fetched.bytes, fetched.queue_wait);
 
         // zstd + bincode over a multi-MB witness is CPU-bound; keep it off the runtime.

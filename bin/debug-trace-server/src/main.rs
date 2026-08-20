@@ -56,8 +56,8 @@ use clap::Parser;
 use eyre::Result;
 use jsonrpsee::server::{Server, ServerConfig, middleware::rpc::RpcServiceBuilder};
 use stateless_common::{
-    R2CountFlag, R2Flag, R2Flags, R2TuningFlag, RedactedSecret, RpcClient, RpcClientConfig,
-    logging::LogArgs, parse_r2_connections, validate_r2_flags,
+    R2CountFlag, R2Flag, R2Flags, R2Target, R2TuningFlag, RedactedSecret, RpcClient,
+    RpcClientConfig, logging::LogArgs, validate_r2_flags,
 };
 use stateless_core::{
     BisectResolver, ChainStore, ContractStore, DivergenceLookups, PipelineConfig,
@@ -498,7 +498,6 @@ fn witness_endpoint_chain(args: &Args) -> Vec<&str> {
         .collect()
 }
 
-/// Validates cross-flag invariants that clap cannot express per-field.
 /// This binary's `--r2-*` flags, in the spellings its operators use.
 fn r2_flags<'a>(args: &'a Args, tuning: &'a [R2TuningFlag<'a>]) -> R2Flags<'a> {
     R2Flags {
@@ -527,7 +526,9 @@ fn r2_flags<'a>(args: &'a Args, tuning: &'a [R2TuningFlag<'a>]) -> R2Flags<'a> {
     }
 }
 
-fn validate_args(args: &Args) -> Result<()> {
+/// Validates cross-flag invariants that clap cannot express per-field, and reports which R2
+/// target the flags select so the construction below does not have to decide it a second time.
+fn validate_args(args: &Args) -> Result<R2Target> {
     // Early, flag-named mirror of `PipelineConfig::validate` (see its doc for the rationale);
     // only meaningful with chain sync, where `blocks_to_keep` becomes the stale-reset
     // threshold.
@@ -563,24 +564,24 @@ fn validate_args(args: &Args) -> Result<()> {
             args.r2_max_concurrent_requests.is_some(),
         ),
     ];
-    validate_r2_flags(&r2_flags(args, &tuning))?;
+    let target = validate_r2_flags(&r2_flags(args, &tuning))?;
     // The R2 route anchors block age (frontier vs historical) to the local DB tip; without
     // --data-dir every block would classify as frontier and a genuine bucket hole would
     // never reach the `kind="missing"` alarm. An operator who configured R2 asked for the
     // real route — fail closed instead of running a blind approximation.
-    if (args.r2_endpoint.is_some() || args.r2_custom_domain.is_some()) && args.data_dir.is_none() {
+    if target != R2Target::None && args.data_dir.is_none() {
         eyre::bail!(
             "the R2 witness route requires --data-dir: it anchors block age \
              (frontier vs historical) to the local DB tip"
         );
     }
-    Ok(())
+    Ok(target)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    validate_args(&args)?;
+    let r2_target = validate_args(&args)?;
     let _log_guard = args.log.init_tracing()?;
 
     info!(
@@ -605,7 +606,7 @@ async fn main() -> Result<()> {
         witness_timeout_secs = args.witness_timeout,
         witness_old_block_timeout_secs = old_block_witness_timeout_secs(&args),
         witness_local_window = args.witness_local_window,
-        r2_witness_configured = args.r2_endpoint.is_some() || args.r2_custom_domain.is_some(),
+        r2_witness_configured = r2_target != R2Target::None,
         tip_buffer = args.tip_buffer,
         response_cache_disabled = args.response_cache_disabled,
         response_cache_max_size = args.response_cache_max_size,
@@ -677,65 +678,69 @@ async fn main() -> Result<()> {
 
     // Direct-from-R2 witness source — unsigned through a Cloudflare custom domain when
     // configured (h2-multiplexed, edge-cacheable), otherwise SigV4-signed against the bare
-    // S3 endpoint. `validate_args` is what keeps the two targets mutually exclusive (clap's
-    // group deliberately allows both so the error can name them); it also rejects empty
-    // values, S3 flags left over from the other target, an incomplete S3 quad, and the
-    // data-dir-less combination. Shares the RPC path's per-attempt timeout and retry pacing.
+    // S3 endpoint. Which one is settled by `validate_args`, whose verdict is matched on below:
+    // clap carries no constraint at all here, so parsing accepts both targets and the shared
+    // validator rejects by name — along with empty values, S3 flags left over from the other
+    // target, an incomplete S3 quad, and the data-dir-less combination. Shares the RPC path's
+    // per-attempt timeout and retry pacing.
     let r2_timeouts = stateless_r2::fetch::FetchTimeouts {
         per_attempt: per_attempt_timeout,
-        connect: std::time::Duration::from_millis(
-            args.r2_connect_timeout_ms
-                .unwrap_or_else(|| stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT.as_millis() as u64),
-        ),
+        connect: args
+            .r2_connect_timeout_ms
+            .map_or(stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT, std::time::Duration::from_millis),
     };
-    let r2_source = if let Some(domain) = &args.r2_custom_domain {
-        let access =
-            args.r2_access_client_id.as_ref().zip(args.r2_access_client_secret.as_ref()).map(
-                |(client_id, secret)| stateless_r2::fetch::CfAccessCredentials {
-                    client_id: client_id.as_ref().to_string(),
-                    client_secret: secret.as_ref().to_string(),
-                },
+    // Dispatch on the target the shared validator already selected. Re-deriving it from the
+    // flags here would be a second copy of the precedence rule, which is the drift this PR
+    // exists to end; the reads inside each arm rest on what that validator proved.
+    let r2_source = match r2_target {
+        R2Target::None => None,
+        R2Target::CustomDomain { connections } => {
+            let domain = args.r2_custom_domain.as_deref().expect("custom-domain target");
+            let access =
+                args.r2_access_client_id.as_ref().zip(args.r2_access_client_secret.as_ref()).map(
+                    |(client_id, secret)| stateless_r2::fetch::CfAccessCredentials {
+                        client_id: client_id.as_ref().to_string(),
+                        client_secret: secret.as_ref().to_string(),
+                    },
+                );
+            let cf_access = access.is_some();
+            let source = R2WitnessSource::new_custom_domain(
+                domain,
+                access,
+                r2_timeouts,
+                rpc_retry,
+                args.r2_max_concurrent_requests,
+                connections,
+            )?;
+            metrics::record_r2_target(source.target_label());
+            metrics::record_r2_connections(source.connections());
+            info!(
+                domain = %source.origin(),
+                cf_access,
+                connections = source.connections(),
+                "Historical witness source: R2 (custom domain), RPC chain as fallback"
             );
-        let cf_access = access.is_some();
-        let source = R2WitnessSource::new_custom_domain(
-            domain,
-            access,
-            r2_timeouts,
-            rpc_retry,
-            args.r2_max_concurrent_requests,
-            // Validated by `validate_r2_flags` during startup argument checking, which names
-            // the flag on anything this could reject.
-            parse_r2_connections(R2Flag::new("--r2-connections", args.r2_connections.as_deref()))?,
-        )?;
-        metrics::record_r2_target(source.target_label());
-        metrics::record_r2_connections(source.connections());
-        info!(
-            domain = %source.origin(),
-            cf_access,
-            connections = source.connections(),
-            "Historical witness source: R2 (custom domain), RPC chain as fallback"
-        );
-        Some(source)
-    } else if let (Some(endpoint), Some(bucket), Some(access_key_id), Some(secret)) =
-        (&args.r2_endpoint, &args.r2_bucket, &args.r2_access_key_id, &args.r2_secret_access_key)
-    {
-        let source = R2WitnessSource::new(
-            endpoint,
-            bucket.clone(),
-            access_key_id.clone(),
-            secret.as_ref().to_string(),
-            r2_timeouts,
-            rpc_retry,
-            args.r2_max_concurrent_requests,
-        )?;
-        metrics::record_r2_target(source.target_label());
-        info!(
-            endpoint = %source.origin(),
-            bucket, "Historical witness source: R2 (direct S3), RPC chain as fallback"
-        );
-        Some(source)
-    } else {
-        None
+            Some(source)
+        }
+        R2Target::S3 => {
+            let take = |v: &Option<String>| v.clone().expect("S3 target");
+            let source = R2WitnessSource::new(
+                args.r2_endpoint.as_deref().expect("S3 target"),
+                take(&args.r2_bucket),
+                take(&args.r2_access_key_id),
+                args.r2_secret_access_key.as_ref().expect("S3 target").as_ref().to_string(),
+                r2_timeouts,
+                rpc_retry,
+                args.r2_max_concurrent_requests,
+            )?;
+            metrics::record_r2_target(source.target_label());
+            info!(
+                endpoint = %source.origin(),
+                bucket = args.r2_bucket.as_deref().unwrap_or_default(),
+                "Historical witness source: R2 (direct S3), RPC chain as fallback"
+            );
+            Some(source)
+        }
     };
     let r2_witness_source = r2_source.map(Arc::new);
 
@@ -1549,10 +1554,11 @@ mod tests {
         );
     }
 
-    /// The `--r2-*` group is all-or-nothing: any subset missing a member must fail parsing,
-    /// the full quad must parse, and none-of-them stays valid.
+    /// The S3 `--r2-*` set is all-or-nothing: any subset missing a member is rejected by
+    /// `validate_args` naming what is absent, the full quad passes, and none-of-them stays
+    /// valid. Rejection is post-parse throughout — clap carries no constraint here.
     #[test]
-    fn r2_flag_group_is_all_or_nothing() {
+    fn r2_s3_flag_set_is_all_or_nothing() {
         // Parsing reads every `#[clap(env = ...)]` variable, so serialize with the
         // env-mutating tests.
         let _guard = stateless_test_utils::env::env_lock();
@@ -1614,10 +1620,9 @@ mod tests {
             parse_args(&domain).r2_custom_domain.as_deref(),
             Some("https://witness.example.com")
         );
-        // Both tuning flags moved from `requires = "r2_endpoint"` to the `r2_target` group,
-        // so each must be accepted with the custom domain and still rejected with no target
-        // at all — the whole point of the group, and the direction a revert would break
-        // silently for every custom-domain deployment.
+        // The shared tuning flags belong to whichever target is configured, so each must be
+        // accepted with the custom domain and still rejected by name with no target at all —
+        // the direction a revert would break silently for every custom-domain deployment.
         let with_tuning: Vec<&str> = domain
             .iter()
             .copied()

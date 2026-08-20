@@ -9,7 +9,7 @@ use clap::{Parser, ValueEnum};
 use eyre::Result;
 use stateless_common::{
     BackoffPolicy, R2CountFlag, R2Flag, R2Flags, R2Target, RedactedSecret, RpcClient,
-    RpcClientConfig, logging::LogArgs, parse_r2_connections, validate_r2_flags,
+    RpcClientConfig, logging::LogArgs, validate_r2_flags,
 };
 use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::BlockMeta};
 use stateless_db::ContractCache;
@@ -343,9 +343,9 @@ pub async fn run() -> Result<()> {
             }
             let timeouts = stateless_r2::fetch::FetchTimeouts {
                 per_attempt: per_attempt_timeout,
-                connect: Duration::from_millis(args.r2_connect_timeout_ms.unwrap_or_else(|| {
-                    stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT.as_millis() as u64
-                })),
+                connect: args
+                    .r2_connect_timeout_ms
+                    .map_or(stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT, Duration::from_millis),
             };
             let client = build_r2_client(&args, timeouts, rpc_config.rpc_retry.clone())?;
             Some(Arc::new(client))
@@ -469,7 +469,7 @@ fn build_r2_client(
                  --r2-endpoint with its credential quad"
             ));
         }
-        R2Target::CustomDomain => {
+        R2Target::CustomDomain { connections } => {
             let domain = args.r2_custom_domain.as_deref().expect("custom-domain target");
             let access =
                 args.r2_access_client_id.as_ref().zip(args.r2_access_client_secret.as_ref()).map(
@@ -485,12 +485,7 @@ fn build_r2_client(
                 timeouts,
                 retry,
                 args.witness_max_concurrent_requests,
-                // Validated by the `validate_r2_flags` call above, which names the flag on
-                // anything this could reject.
-                parse_r2_connections(R2Flag::new(
-                    "--r2-connections",
-                    args.r2_connections.as_deref(),
-                ))?,
+                connections,
             )?;
             metrics::record_r2_connections(client.connections());
             info!(

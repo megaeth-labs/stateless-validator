@@ -98,8 +98,11 @@ pub enum R2Target {
     None,
     /// SigV4-signed GETs against the bare S3 endpoint.
     S3,
-    /// Unsigned GETs through a Cloudflare custom domain.
-    CustomDomain,
+    /// Unsigned GETs through a Cloudflare custom domain, spread over this many HTTP/2
+    /// connections. Carried on the verdict rather than left for the caller to parse again:
+    /// the count is validated here, and a caller that re-derived it would be a second place
+    /// the same rule lives.
+    CustomDomain { connections: usize },
 }
 
 /// Validates one binary's `--r2-*` flags and reports which target they select.
@@ -155,7 +158,7 @@ pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Target> {
                     leftovers.join(", ")
                 );
             }
-            R2Target::CustomDomain
+            R2Target::CustomDomain { connections: 1 }
         }
         (false, true) => {
             let missing = names_of(&s3_credentials, |f| !f.is_set());
@@ -180,7 +183,7 @@ pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Target> {
     };
 
     validate_access_pair(flags, target)?;
-    validate_connections(flags, target)?;
+    let connections = validate_connections(flags, target)?;
 
     // The connection count joins the tuning flags here rather than being reported on its own,
     // so an operator who orphaned several of them is told about all of them at once.
@@ -198,7 +201,10 @@ pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Target> {
         );
     }
 
-    Ok(target)
+    Ok(match target {
+        R2Target::CustomDomain { .. } => R2Target::CustomDomain { connections },
+        settled => settled,
+    })
 }
 
 /// Parses the connection count, defaulting to a single connection when it is not set.
@@ -209,7 +215,7 @@ pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Target> {
 /// unnamed "invalid value for one of the arguments" (this workspace builds clap without
 /// `error-context`), and it would abort it even on a binary that never reads the R2 flags in
 /// the mode it was started in.
-pub fn parse_r2_connections(flag: R2Flag<'_>) -> Result<usize> {
+fn parse_r2_connections(flag: R2Flag<'_>) -> Result<usize> {
     let Some(raw) = flag.value else { return Ok(1) };
     let Ok(count) = raw.parse::<usize>() else {
         bail!("{} must be a whole number of connections, got {raw:?}", flag.name);
@@ -228,11 +234,11 @@ pub fn parse_r2_connections(flag: R2Flag<'_>) -> Result<usize> {
 /// and honouring it silently would leave the operator expecting a spread they did not get.
 /// Rejected rather than clamped against the cap for the same reason — and because clamping
 /// would quietly hand back fewer connections than the published gauge reports.
-fn validate_connections(flags: &R2Flags<'_>, target: R2Target) -> Result<()> {
-    if flags.connections.value.is_none() {
-        return Ok(());
-    }
+fn validate_connections(flags: &R2Flags<'_>, target: R2Target) -> Result<usize> {
     let count = parse_r2_connections(flags.connections)?;
+    if flags.connections.value.is_none() {
+        return Ok(count);
+    }
     if target == R2Target::S3 {
         bail!(
             "{} applies only to {}: the S3 target already opens a connection per in-flight GET",
@@ -253,7 +259,7 @@ fn validate_connections(flags: &R2Flags<'_>, target: R2Target) -> Result<()> {
             flags.max_concurrent_requests.name
         );
     }
-    Ok(())
+    Ok(count)
 }
 
 /// The Cloudflare Access pair is all-or-nothing and belongs to the custom-domain target only.
@@ -275,7 +281,7 @@ fn validate_access_pair(flags: &R2Flags<'_>, target: R2Target) -> Result<()> {
         }
         (true, true) => {}
     }
-    if target != R2Target::CustomDomain {
+    if !matches!(target, R2Target::CustomDomain { .. }) {
         bail!(
             "{} and {} apply only to {}: configure that target, or unset the pair",
             id.name,
@@ -413,7 +419,7 @@ mod tests {
         assert_eq!(s3().validate().unwrap(), R2Target::S3);
         assert_eq!(
             Cfg { domain: DOMAIN, ..Cfg::default() }.validate().unwrap(),
-            R2Target::CustomDomain
+            R2Target::CustomDomain { connections: 1 }
         );
         assert_eq!(Cfg::default().validate().unwrap(), R2Target::None);
     }
@@ -477,7 +483,7 @@ mod tests {
             access_secret: Some("sec"),
             ..Cfg::default()
         };
-        assert_eq!(whole.validate().unwrap(), R2Target::CustomDomain);
+        assert_eq!(whole.validate().unwrap(), R2Target::CustomDomain { connections: 1 });
     }
 
     /// A tuning flag with no target to tune is named rather than silently ignored — it was

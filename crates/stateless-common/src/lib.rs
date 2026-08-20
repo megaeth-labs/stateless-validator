@@ -14,9 +14,7 @@ pub use witness_encoding::{
     encode_witness_response,
 };
 pub mod r2_args;
-pub use r2_args::{
-    R2CountFlag, R2Flag, R2Flags, R2Target, R2TuningFlag, parse_r2_connections, validate_r2_flags,
-};
+pub use r2_args::{R2CountFlag, R2Flag, R2Flags, R2Target, R2TuningFlag, validate_r2_flags};
 pub mod secret;
 pub use secret::RedactedSecret;
 pub mod witness_size;
