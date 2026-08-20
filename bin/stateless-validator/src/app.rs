@@ -197,6 +197,11 @@ pub struct CommandLineArgs {
 
     /// Maximum concurrent in-flight witness fetches, independent of the data cap. Omit for
     /// unlimited. Applies to both RPC witness calls and, with `--witness-source r2`, R2 GETs.
+    ///
+    /// Against `--r2-custom-domain` this is also what bounds the GETs multiplexed onto the
+    /// HTTP/2 connection, so keep it at or below the edge's per-connection stream limit
+    /// (Cloudflare's is 100): above it the surplus queues inside the connection instead, where
+    /// the wait is unobservable and still counts against the per-attempt timeout.
     #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_MAX_CONCURRENT_REQUESTS")]
     pub witness_max_concurrent_requests: Option<usize>,
 

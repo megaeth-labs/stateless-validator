@@ -393,9 +393,11 @@ struct Args {
     /// tolerates far higher parallelism.
     ///
     /// On the custom-domain target keep this at or below the edge's per-connection stream
-    /// limit (Cloudflare's is 100): anything above it queues inside the HTTP/2 connection
-    /// rather than on this semaphore, where the wait counts against the per-attempt timeout
-    /// and never reaches `debug_trace_r2_witness_queue_wait_seconds`.
+    /// limit (Cloudflare's is 100, advertised in its `SETTINGS_MAX_CONCURRENT_STREAMS`):
+    /// anything above it queues inside the HTTP/2 connection rather than on this semaphore,
+    /// where the wait counts against the per-attempt timeout and never reaches
+    /// `debug_trace_r2_witness_queue_wait_seconds`. The fetcher warns at startup when the
+    /// configured value exceeds the limit.
     #[clap(long, env = "DEBUG_TRACE_SERVER_R2_MAX_CONCURRENT_REQUESTS")]
     r2_max_concurrent_requests: Option<usize>,
 

@@ -314,6 +314,11 @@ fn parse_target_origin(
 /// bound, which reqwest's `pool_max_idle_per_host` default of `usize::MAX` otherwise allows.
 const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 64;
 
+/// Streams a Cloudflare edge accepts on one HTTP/2 connection: its advertised
+/// `SETTINGS_MAX_CONCURRENT_STREAMS`, which is Cloudflare's default since HTTP/2 Rapid Reset
+/// and was read off the wire on the zone this target was built for.
+pub const CLOUDFLARE_MAX_CONCURRENT_STREAMS: usize = 100;
+
 /// `negotiated_version` before any response has been seen.
 const VERSION_UNOBSERVED: u8 = 0;
 /// Protocol labels, indexed by the code stored in `negotiated_version`.
@@ -454,6 +459,25 @@ impl R2ObjectFetcher {
         }
     }
 
+    /// The configured concurrency, when it over-subscribes the edge's per-connection stream
+    /// limit — that is, when the limit rather than this fetcher's semaphore is what bounds the
+    /// GETs actually in flight.
+    ///
+    /// One client holds exactly one HTTP/2 connection, and hyper never opens a second one to
+    /// relieve a saturated one: `is_open` on a pooled h2 connection reports liveness, not
+    /// stream capacity, and the dispatch channel behind it is unbounded. So a request past the
+    /// limit does not fail and does not get its own connection — it waits inside the
+    /// connection, where the wait is invisible to the caller's queue-wait metric and still
+    /// counts against the per-attempt timeout.
+    ///
+    /// Exactly *at* the limit is the intended sizing, not a misconfiguration: every permit maps
+    /// to a stream slot and nothing queues. Unlimited is not flagged either — it is the
+    /// unconfigured default, and a warning that fires on a default is one operators learn to
+    /// skip.
+    fn concurrency_over_edge_stream_limit(max_concurrent_requests: Option<usize>) -> Option<usize> {
+        max_concurrent_requests.filter(|n| *n > CLOUDFLARE_MAX_CONCURRENT_STREAMS)
+    }
+
     /// Builds a fetcher from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
     ///
     /// `timeouts` bounds each individual GET (end-to-end and connect phase). `pacing`
@@ -560,6 +584,17 @@ impl R2ObjectFetcher {
             // request this fetcher makes, and an unusable credential fails here by name
             // instead of once per GET as a retryable transport error.
             builder = builder.default_headers(access.into_header_map()?);
+        }
+        if let Some(configured) = Self::concurrency_over_edge_stream_limit(max_concurrent_requests)
+        {
+            warn!(
+                configured,
+                edge_stream_limit = CLOUDFLARE_MAX_CONCURRENT_STREAMS,
+                "R2 custom-domain concurrency over-subscribes the edge's per-connection HTTP/2 \
+                 stream limit: the surplus queues inside the connection rather than on the \
+                 semaphore, where the wait escapes the queue-wait metric and still counts \
+                 against the per-attempt timeout."
+            );
         }
         let http = builder.build().map_err(|e| format!("Failed to build R2 HTTP client: {e}"))?;
         Ok(Self {
@@ -1115,6 +1150,22 @@ mod tests {
             Some("http/1.1"),
             "the plaintext mock cannot offer h2, and that must be visible rather than assumed"
         );
+    }
+
+    /// The advisory covers over-subscription only. Exactly at the limit every permit maps to
+    /// a stream slot, which is the sizing the flag documentation asks for — warning there would
+    /// fire on a correct configuration, and warning on unlimited would fire on the default.
+    #[test]
+    fn edge_stream_limit_advisory_covers_over_subscription_only() {
+        let over = R2ObjectFetcher::concurrency_over_edge_stream_limit;
+        assert_eq!(over(None), None, "unlimited is the default, not a misconfiguration");
+        assert_eq!(over(Some(CLOUDFLARE_MAX_CONCURRENT_STREAMS)), None, "at the limit is exact");
+        assert_eq!(
+            over(Some(CLOUDFLARE_MAX_CONCURRENT_STREAMS + 1)),
+            Some(CLOUDFLARE_MAX_CONCURRENT_STREAMS + 1),
+            "one past the limit is one GET queued where the queue cannot be seen"
+        );
+        assert_eq!(over(Some(4096)), Some(4096));
     }
 
     /// Cloudflare's Browser Integrity Check challenges user-agent-less requests, which would
