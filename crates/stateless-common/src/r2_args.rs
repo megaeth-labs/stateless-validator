@@ -110,7 +110,7 @@ pub enum R2Target {
 /// Rejects, each by flag name: a present-but-empty value, both targets at once, S3 flags left
 /// behind by the documented migration to a custom domain, an incomplete S3 credential quad, a
 /// half-configured Cloudflare Access pair or one attached to no custom domain, a connection
-/// count that is zero, unparseable, attached to a target that cannot spread over connections,
+/// count that is zero, unparsable, attached to a target that cannot spread over connections,
 /// or larger than the cap it divides, and tuning flags set with no target to tune.
 ///
 /// Emptiness is swept first so a blank env line is diagnosed as itself, rather than read as a
