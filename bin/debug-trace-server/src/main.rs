@@ -56,8 +56,8 @@ use clap::Parser;
 use eyre::Result;
 use jsonrpsee::server::{Server, ServerConfig, middleware::rpc::RpcServiceBuilder};
 use stateless_common::{
-    R2Flag, R2Flags, R2TuningFlag, RedactedSecret, RpcClient, RpcClientConfig, logging::LogArgs,
-    validate_r2_flags,
+    R2CountFlag, R2Flag, R2Flags, R2TuningFlag, RedactedSecret, RpcClient, RpcClientConfig,
+    logging::LogArgs, validate_r2_flags,
 };
 use stateless_core::{
     BisectResolver, ChainStore, ContractStore, DivergenceLookups, PipelineConfig,
@@ -401,6 +401,17 @@ struct Args {
     #[clap(long, env = "DEBUG_TRACE_SERVER_R2_MAX_CONCURRENT_REQUESTS")]
     r2_max_concurrent_requests: Option<usize>,
 
+    /// HTTP/2 connections the custom-domain target spreads its GETs over (default: 1).
+    ///
+    /// One `reqwest::Client` holds exactly one HTTP/2 connection and hyper opens no second one
+    /// when the first saturates, so this is the only way past the edge's per-connection stream
+    /// limit — and the only way a dropped connection stops taking every GET riding it down
+    /// with it. `--r2-max-concurrent-requests` remains the cap across all of them and is split
+    /// evenly, so raising this alone spreads the same concurrency thinner rather than lifting
+    /// the ceiling.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_CONNECTIONS")]
+    r2_connections: Option<usize>,
+
     /// Chain-sync pipeline tip buffer: stay this many blocks behind the upstream head so the
     /// fetcher does not race the witness generator — a fetch issued the moment a block appears
     /// typically arrives before its witness is written and burns a failed round plus a backoff
@@ -503,6 +514,7 @@ fn r2_flags<'a>(args: &'a Args, tuning: &'a [R2TuningFlag<'a>]) -> R2Flags<'a> {
             "--r2-access-client-secret",
             args.r2_access_client_secret.as_ref().map(AsRef::as_ref),
         ),
+        connections: R2CountFlag::new("--r2-connections", args.r2_connections),
         tuning,
     }
 }
@@ -683,11 +695,15 @@ async fn main() -> Result<()> {
             r2_timeouts,
             rpc_retry,
             args.r2_max_concurrent_requests,
+            args.r2_connections.unwrap_or(1),
         )?;
         metrics::record_r2_target(source.target_label());
+        metrics::record_r2_connections(source.connections());
         info!(
             domain = %source.origin(),
-            cf_access, "Historical witness source: R2 (custom domain), RPC chain as fallback"
+            cf_access,
+            connections = source.connections(),
+            "Historical witness source: R2 (custom domain), RPC chain as fallback"
         );
         Some(source)
     } else if let (Some(endpoint), Some(bucket), Some(access_key_id), Some(secret)) =
@@ -1595,12 +1611,23 @@ mod tests {
         let with_tuning: Vec<&str> = domain
             .iter()
             .copied()
-            .chain(["--r2-connect-timeout-ms", "2000", "--r2-max-concurrent-requests", "48"])
+            .chain([
+                "--r2-connect-timeout-ms",
+                "2000",
+                "--r2-max-concurrent-requests",
+                "48",
+                "--r2-connections",
+                "8",
+            ])
             .collect();
         assert_eq!(parse_args(&with_tuning).r2_connect_timeout_ms, Some(2000));
         assert_eq!(parse_args(&with_tuning).r2_max_concurrent_requests, Some(48));
-        for orphan in [["--r2-connect-timeout-ms", "2000"], ["--r2-max-concurrent-requests", "48"]]
-        {
+        assert_eq!(parse_args(&with_tuning).r2_connections, Some(8));
+        for orphan in [
+            ["--r2-connect-timeout-ms", "2000"],
+            ["--r2-max-concurrent-requests", "48"],
+            ["--r2-connections", "8"],
+        ] {
             let err = validate_args(&parse_args(&orphan)).unwrap_err().to_string();
             assert!(
                 err.contains(orphan[0]),
@@ -1639,6 +1666,39 @@ mod tests {
             domain.iter().copied().chain(["--r2-access-client-id", "tok"]).collect();
         let err = validate_args(&parse_args(&half)).unwrap_err().to_string();
         assert!(err.contains("--r2-access-client-secret"), "client id without secret: {err}");
+
+        // The connection count is a multiplexing concept: zero of them builds a transport that
+        // can carry nothing, and the HTTP/1.1 S3 target already opens a socket per in-flight
+        // GET, so honouring a count there would promise a spread that never happens.
+        let zero: Vec<&str> = domain.iter().copied().chain(["--r2-connections", "0"]).collect();
+        let err = validate_args(&parse_args(&zero)).unwrap_err().to_string();
+        assert!(err.contains("--r2-connections") && err.contains("at least 1"), "{err}");
+
+        let on_s3 = Args::try_parse_from(
+            base.iter()
+                .copied()
+                .chain([
+                    "--r2-endpoint",
+                    "https://acc.r2.cloudflarestorage.com",
+                    "--r2-bucket",
+                    "witness-mainnet",
+                    "--r2-access-key-id",
+                    "ak",
+                    "--r2-secret-access-key",
+                    "sk",
+                    "--r2-connections",
+                    "8",
+                    "--data-dir",
+                    "/tmp/dts-test",
+                ])
+                .collect::<Vec<_>>(),
+        )
+        .expect("rejection happens post-parse");
+        let err = validate_args(&on_s3).unwrap_err().to_string();
+        assert!(
+            err.contains("--r2-connections") && err.contains("--r2-custom-domain"),
+            "a connection count on the S3 target must be rejected by name: {err}"
+        );
 
         let orphan_pair = ["--r2-access-client-id", "tok", "--r2-access-client-secret", "sk"];
         let err = validate_args(&parse_args(&orphan_pair)).unwrap_err().to_string();

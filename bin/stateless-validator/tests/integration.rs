@@ -235,6 +235,17 @@ fn r2_custom_domain_target_wiring() {
         ])
         .is_ok()
     );
+    assert_eq!(
+        parse(&["--r2-custom-domain", "https://witness.example.com", "--r2-connections", "8"])
+            .unwrap()
+            .r2_connections,
+        Some(8)
+    );
+    assert!(
+        parse(&["--r2-custom-domain", "https://witness.example.com", "--r2-connections", "0"])
+            .is_ok(),
+        "zero connections must parse; it is rejected by name post-parse"
+    );
 }
 
 /// `canonical_chain_max_length` must reject 0 at parse time. A value of 0 would make

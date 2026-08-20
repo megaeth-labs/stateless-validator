@@ -8,8 +8,8 @@ use alloy_rpc_types_eth::BlockId;
 use clap::{Parser, ValueEnum};
 use eyre::Result;
 use stateless_common::{
-    BackoffPolicy, R2Flag, R2Flags, R2Target, RedactedSecret, RpcClient, RpcClientConfig,
-    logging::LogArgs, validate_r2_flags,
+    BackoffPolicy, R2CountFlag, R2Flag, R2Flags, R2Target, RedactedSecret, RpcClient,
+    RpcClientConfig, logging::LogArgs, validate_r2_flags,
 };
 use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::BlockMeta};
 use stateless_db::ContractCache;
@@ -160,6 +160,17 @@ pub struct CommandLineArgs {
         value_parser = clap::value_parser!(u64).range(100..),
     )]
     pub r2_connect_timeout_ms: Option<u64>,
+
+    /// HTTP/2 connections the custom-domain target spreads its GETs over (default: 1).
+    ///
+    /// One `reqwest::Client` holds exactly one HTTP/2 connection and hyper opens no second one
+    /// when the first saturates, so this is the only way past the edge's per-connection stream
+    /// limit — and the only way one dropped connection stops taking every in-flight GET with
+    /// it, which matters here because R2 mode has no RPC fallback.
+    /// `--witness-max-concurrent-requests` is still the cap across all of them, so raising this
+    /// alone spreads the same concurrency thinner rather than raising the ceiling.
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_CONNECTIONS")]
+    pub r2_connections: Option<usize>,
 
     /// Optional inclusive end block: validate up to this height, then stop cleanly. Used to slice
     /// a fixed block range across multiple servers. Omit to follow the chain tip indefinitely.
@@ -466,8 +477,15 @@ fn build_r2_client(
                 timeouts,
                 retry,
                 args.witness_max_concurrent_requests,
+                args.r2_connections.unwrap_or(1),
             )?;
-            info!(domain = %client.origin(), cf_access, "Witness source: R2 (custom domain)");
+            metrics::record_r2_connections(client.connections());
+            info!(
+                domain = %client.origin(),
+                cf_access,
+                connections = client.connections(),
+                "Witness source: R2 (custom domain)"
+            );
             client
         }
         R2Target::S3 => {
@@ -512,6 +530,7 @@ fn r2_flags(args: &CommandLineArgs) -> R2Flags<'_> {
             "--r2-access-client-secret",
             args.r2_access_client_secret.as_ref().map(AsRef::as_ref),
         ),
+        connections: R2CountFlag::new("--r2-connections", args.r2_connections),
         // Empty on purpose. The orphan-tuning rule exists for a binary that validates R2 flags
         // on every startup; here they are only read under `--witness-source r2`, where a target
         // is mandatory, so the rule could never fire. Under `--witness-source rpc` every

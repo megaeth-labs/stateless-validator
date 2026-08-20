@@ -23,7 +23,7 @@ use std::{
     fmt::Display,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -361,10 +361,48 @@ fn base_client(timeouts: FetchTimeouts) -> reqwest::ClientBuilder {
         .redirect(reqwest::redirect::Policy::none())
 }
 
-/// Permits for the in-flight GET cap: `None` = unlimited, `Some(0)` clamps to 1 — a
-/// zero-permit semaphore would wedge every fetch on `acquire()` forever.
-fn concurrency_permits(max_concurrent_requests: Option<usize>) -> Arc<Semaphore> {
-    Arc::new(Semaphore::new(max_concurrent_requests.unwrap_or(Semaphore::MAX_PERMITS).max(1)))
+/// One HTTP client and the permits bounding what that client may carry.
+///
+/// Paired rather than kept as two parallel lists because a permit is only meaningful against
+/// the connection it was taken for: the cap that binds is per connection — the edge limits
+/// concurrent streams per connection, and one client holds exactly one connection.
+#[derive(Debug)]
+struct Connection {
+    http: Client,
+    permits: Semaphore,
+}
+
+/// Each connection's share of the in-flight GET cap: `None` = unlimited, `Some(0)` clamps to 1
+/// — a zero-permit semaphore would wedge every fetch on `acquire()` forever.
+///
+/// The share rounds *up*, so with a cap that does not divide evenly the fetcher-wide total
+/// exceeds it by less than the connection count. Rounding down would round some connection to
+/// zero, and a connection that can carry nothing is worse than a cap overshot by a handful.
+fn per_connection_permits(max_concurrent_requests: Option<usize>, connections: usize) -> usize {
+    max_concurrent_requests
+        .map_or(Semaphore::MAX_PERMITS, |max| max.div_ceil(connections.max(1)))
+        .max(1)
+}
+
+/// Builds `connections` clients, each with its share of the in-flight budget.
+///
+/// `connections` is the number of HTTP/2 connections the GETs are spread over, because one
+/// `reqwest::Client` is one connection to a host and hyper will not open a second when the
+/// first saturates. Anything past one connection therefore has to be asked for explicitly;
+/// `0` is read as `1` rather than rejected, matching how the concurrency cap treats `Some(0)`.
+fn connection_pool(
+    build: impl Fn() -> reqwest::Result<Client>,
+    connections: usize,
+    max_concurrent_requests: Option<usize>,
+) -> Result<Arc<[Connection]>, String> {
+    let permits = per_connection_permits(max_concurrent_requests, connections);
+    (0..connections.max(1))
+        .map(|_| {
+            build()
+                .map(|http| Connection { http, permits: Semaphore::new(permits) })
+                .map_err(|e| format!("Failed to build R2 HTTP client: {e}"))
+        })
+        .collect()
 }
 
 /// Fetches witness objects from an R2 bucket — SigV4-signed over the S3 API, or unsigned
@@ -374,14 +412,17 @@ fn concurrency_permits(max_concurrent_requests: Option<usize>) -> Arc<Semaphore>
 /// internally reference-counted / small. `Debug` is safe to derive: the target redacts.
 #[derive(Clone, Debug)]
 pub struct R2ObjectFetcher {
-    http: Client,
+    /// The connections this fetcher spreads its GETs over, each with its own permits. One
+    /// entry unless the caller asked for more; see [`connection_pool`].
+    connections: Arc<[Connection]>,
+    /// Round-robin cursor over `connections`, shared across clones so that clones of one
+    /// fetcher keep spreading over the same connections instead of each starting at zero.
+    next_connection: Arc<AtomicUsize>,
     target: Target,
     /// Hard cap on a single GET attempt; with a deadline, each attempt uses
     /// `min(timeouts.per_attempt, remaining)`.
     per_attempt_timeout: Duration,
     pacing: RetryPacing,
-    /// Caps concurrent GETs across all fetches sharing this fetcher.
-    concurrency: Arc<Semaphore>,
     /// Protocol the first response actually used, [`VERSION_UNOBSERVED`] until one arrives.
     /// Shared across clones so the degradation warning fires once per fetcher, not per clone.
     negotiated_version: Arc<AtomicU8>,
@@ -459,23 +500,46 @@ impl R2ObjectFetcher {
         }
     }
 
-    /// The configured concurrency, when it over-subscribes the edge's per-connection stream
-    /// limit — that is, when the limit rather than this fetcher's semaphore is what bounds the
-    /// GETs actually in flight.
+    /// Each connection's share of the configured concurrency, when that share over-subscribes
+    /// the edge's per-connection stream limit — that is, when the limit rather than this
+    /// fetcher's semaphores is what bounds the GETs actually in flight.
     ///
     /// One client holds exactly one HTTP/2 connection, and hyper never opens a second one to
     /// relieve a saturated one: `is_open` on a pooled h2 connection reports liveness, not
     /// stream capacity, and the dispatch channel behind it is unbounded. So a request past the
-    /// limit does not fail and does not get its own connection — it waits inside the
+    /// limit does not fail and does not get a connection of its own — it waits inside the
     /// connection, where the wait is invisible to the caller's queue-wait metric and still
-    /// counts against the per-attempt timeout.
+    /// counts against the per-attempt timeout. Spreading the same concurrency over more
+    /// connections is what actually raises the ceiling, which is why this is measured per
+    /// connection rather than against the fetcher-wide total.
     ///
     /// Exactly *at* the limit is the intended sizing, not a misconfiguration: every permit maps
     /// to a stream slot and nothing queues. Unlimited is not flagged either — it is the
     /// unconfigured default, and a warning that fires on a default is one operators learn to
     /// skip.
-    fn concurrency_over_edge_stream_limit(max_concurrent_requests: Option<usize>) -> Option<usize> {
-        max_concurrent_requests.filter(|n| *n > CLOUDFLARE_MAX_CONCURRENT_STREAMS)
+    fn concurrency_over_edge_stream_limit(
+        max_concurrent_requests: Option<usize>,
+        connections: usize,
+    ) -> Option<usize> {
+        max_concurrent_requests
+            .map(|max| max.div_ceil(connections.max(1)))
+            .filter(|share| *share > CLOUDFLARE_MAX_CONCURRENT_STREAMS)
+    }
+
+    /// The next connection in round-robin order.
+    ///
+    /// Taken per attempt rather than per fetch, so a retry lands on a different connection than
+    /// the attempt that just failed. With one connection per client, retrying onto the same
+    /// connection is retrying into the same fault — and a dropped connection fails every GET
+    /// riding it at once, so the retry is exactly when spreading matters most.
+    fn next_connection(&self) -> &Connection {
+        let index = self.next_connection.fetch_add(1, Ordering::Relaxed);
+        &self.connections[index % self.connections.len()]
+    }
+
+    /// How many HTTP/2 connections this fetcher spreads its GETs over.
+    pub fn connections(&self) -> usize {
+        self.connections.len()
     }
 
     /// Builds a fetcher from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
@@ -500,15 +564,25 @@ impl R2ObjectFetcher {
             "endpoint",
             "https://<account>.r2.cloudflarestorage.com",
         )?;
-        let http = base_client(timeouts)
-            // Pin the S3 target to HTTP/1.1 in the client rather than relying on the server's
-            // ALPN choice: the endpoint only speaks h1.1 today, and this keeps the signed
-            // path's wire behavior fixed even if that ever changes upstream.
-            .http1_only()
-            .build()
-            .map_err(|e| format!("Failed to build R2 HTTP client: {e}"))?;
+        // A single connection's worth of clients: the signed endpoint speaks HTTP/1.1, whose
+        // pool already opens a socket per concurrent request, so spreading over more clients
+        // would buy nothing here. Spreading is a custom-domain concern, where multiplexing
+        // means one client is one connection.
+        let connections = connection_pool(
+            || {
+                base_client(timeouts)
+                    // Pin the S3 target to HTTP/1.1 in the client rather than relying on the
+                    // server's ALPN choice: the endpoint only speaks h1.1 today, and this keeps
+                    // the signed path's wire behavior fixed even if that ever changes upstream.
+                    .http1_only()
+                    .build()
+            },
+            1,
+            max_concurrent_requests,
+        )?;
         Ok(Self {
-            http,
+            connections,
+            next_connection: Arc::new(AtomicUsize::new(0)),
             target: Target::S3 {
                 signer: SigV4Signer::new(access_key_id, secret_access_key),
                 endpoint: origin,
@@ -517,7 +591,6 @@ impl R2ObjectFetcher {
             },
             per_attempt_timeout: timeouts.per_attempt,
             pacing,
-            concurrency: concurrency_permits(max_concurrent_requests),
             negotiated_version: Arc::new(AtomicU8::new(VERSION_UNOBSERVED)),
         })
     }
@@ -531,6 +604,14 @@ impl R2ObjectFetcher {
     /// mean exactly what they mean on [`Self::new`]. Fails if the domain is not a bare
     /// `scheme://host[:port]` origin — the object path is appended by this fetcher, and a
     /// path-bearing domain would silently double it.
+    ///
+    /// `connections` is how many HTTP/2 connections the GETs are spread over, and
+    /// `max_concurrent_requests` is the in-flight cap across all of them. One is the multiplexed
+    /// shape this target exists for; more than one is how a caller gets past the edge's
+    /// per-connection stream limit, since one client is one connection and hyper opens no
+    /// second one when the first saturates. It is also how a caller stops one connection from
+    /// being a single point of failure: when a connection drops, every GET riding it fails
+    /// together, which matters where R2 has no fallback.
     ///
     /// The domain rides Cloudflare's h2-capable edge, so this client differs from the S3 one
     /// in its HTTP/2 posture (all three knobs are inert on an endpoint that only offers
@@ -547,6 +628,7 @@ impl R2ObjectFetcher {
         timeouts: FetchTimeouts,
         pacing: RetryPacing,
         max_concurrent_requests: Option<usize>,
+        connections: usize,
     ) -> Result<Self, String> {
         let (origin, host) =
             parse_target_origin(domain, "custom domain", "https://witness.example.com")?;
@@ -558,51 +640,61 @@ impl R2ObjectFetcher {
                  to a non-loopback host: give --r2-custom-domain an https:// origin"
                 .to_string());
         }
-        let mut builder = base_client(timeouts)
-            // Cloudflare's Browser Integrity Check, on by default on many zones, challenges
-            // requests that carry no user agent — which would arrive here as a non-retryable
-            // 403 on every GET. It also makes this traffic attributable in zone analytics.
-            .user_agent(concat!("stateless-r2/", env!("CARGO_PKG_VERSION")))
-            .http2_adaptive_window(true)
-            .http2_keep_alive_interval(Duration::from_secs(30))
-            .http2_keep_alive_while_idle(true)
-            // Keep-alive pings hold the connection open at the protocol level, but the pool
-            // reaps idle connections on a 90s default of its own — shorter than the gaps
-            // between request waves that this single multiplexed connection exists to survive.
-            .pool_idle_timeout(None)
-            // Paired with the line above: without an idle timeout, an unbounded idle pool would
-            // never release a socket. Inert on h2 (one connection); the bound that matters is
-            // on the h1.1 path this client silently falls back to against a non-h2 origin.
-            .pool_max_idle_per_host(
-                max_concurrent_requests.unwrap_or(MAX_IDLE_CONNECTIONS_PER_HOST),
-            )
-            // Stated rather than inherited: with keep-alive pings on, this is what bounds how
-            // long a blackholed connection keeps accepting doomed streams.
-            .http2_keep_alive_timeout(Duration::from_secs(20));
-        if let Some(access) = access {
-            // On the client, not per attempt: authentication is then a property of every
-            // request this fetcher makes, and an unusable credential fails here by name
-            // instead of once per GET as a retryable transport error.
-            builder = builder.default_headers(access.into_header_map()?);
-        }
-        if let Some(configured) = Self::concurrency_over_edge_stream_limit(max_concurrent_requests)
+        // Built once and cloned per client: `into_header_map` validates the credential, and
+        // failing that validation is a property of the credential, not of a given connection.
+        let headers = access.map(CfAccessCredentials::into_header_map).transpose()?;
+        // Each client's own idle bound, since the fetcher now holds several of them.
+        let idle_per_client = max_concurrent_requests
+            .map_or(MAX_IDLE_CONNECTIONS_PER_HOST, |max| max.div_ceil(connections.max(1)));
+        let build = || {
+            let mut builder = base_client(timeouts)
+                // Cloudflare's Browser Integrity Check, on by default on many zones, challenges
+                // requests that carry no user agent — which would arrive here as a non-retryable
+                // 403 on every GET. It also makes this traffic attributable in zone analytics.
+                .user_agent(concat!("stateless-r2/", env!("CARGO_PKG_VERSION")))
+                .http2_adaptive_window(true)
+                .http2_keep_alive_interval(Duration::from_secs(30))
+                .http2_keep_alive_while_idle(true)
+                // Keep-alive pings hold the connection open at the protocol level, but the pool
+                // reaps idle connections on a 90s default of its own — shorter than the gaps
+                // between request waves that these multiplexed connections exist to survive.
+                .pool_idle_timeout(None)
+                // Paired with the line above: without an idle timeout, an unbounded idle pool
+                // would never release a socket. Inert on h2 (one connection per client); the
+                // bound that matters is on the h1.1 path this client silently falls back to
+                // against a non-h2 origin.
+                .pool_max_idle_per_host(idle_per_client)
+                // Stated rather than inherited: with keep-alive pings on, this is what bounds
+                // how long a blackholed connection keeps accepting doomed streams.
+                .http2_keep_alive_timeout(Duration::from_secs(20));
+            if let Some(headers) = &headers {
+                // On the client, not per attempt: authentication is then a property of every
+                // request this fetcher makes, and an unusable credential fails at construction
+                // instead of once per GET as a retryable transport error.
+                builder = builder.default_headers(headers.clone());
+            }
+            builder.build()
+        };
+        if let Some(per_connection) =
+            Self::concurrency_over_edge_stream_limit(max_concurrent_requests, connections)
         {
             warn!(
-                configured,
+                per_connection,
+                connections = connections.max(1),
                 edge_stream_limit = CLOUDFLARE_MAX_CONCURRENT_STREAMS,
                 "R2 custom-domain concurrency over-subscribes the edge's per-connection HTTP/2 \
                  stream limit: the surplus queues inside the connection rather than on the \
                  semaphore, where the wait escapes the queue-wait metric and still counts \
-                 against the per-attempt timeout."
+                 against the per-attempt timeout. Lower the concurrency or raise the \
+                 connection count."
             );
         }
-        let http = builder.build().map_err(|e| format!("Failed to build R2 HTTP client: {e}"))?;
         Ok(Self {
-            http,
+            connections: connection_pool(build, connections, max_concurrent_requests)?,
+            next_connection: Arc::new(AtomicUsize::new(0)),
             target: Target::CustomDomain { origin },
             per_attempt_timeout: timeouts.per_attempt,
             pacing,
-            concurrency: concurrency_permits(max_concurrent_requests),
             negotiated_version: Arc::new(AtomicU8::new(VERSION_UNOBSERVED)),
         })
     }
@@ -637,13 +729,15 @@ impl R2ObjectFetcher {
             // Permit scoped to the GET itself — holding it across the backoff sleep would
             // waste capacity other fetches could use.
             let outcome = {
+                let connection = self.next_connection();
                 let queued = Instant::now();
                 // A deadline bounds the queue wait too: under saturation the caller's budget
                 // must stay available for its fallback, not drain waiting for a permit.
                 let permit = match deadline {
-                    None => self.concurrency.acquire().await,
+                    None => connection.permits.acquire().await,
                     Some(d) => {
-                        match tokio::time::timeout_at(d.into(), self.concurrency.acquire()).await {
+                        match tokio::time::timeout_at(d.into(), connection.permits.acquire()).await
+                        {
                             Ok(acquired) => acquired,
                             Err(_) => return Err(R2GetError::Deadline { number, key }),
                         }
@@ -652,7 +746,7 @@ impl R2ObjectFetcher {
                 .expect("semaphore is never closed");
                 queue_wait += queued.elapsed();
                 let _permit = permit;
-                self.get_object(number, &key, deadline).await
+                self.get_object(connection, number, &key, deadline).await
             };
             match outcome {
                 Ok(bytes) => return Ok(FetchedObject { bytes, queue_wait }),
@@ -686,19 +780,20 @@ impl R2ObjectFetcher {
     /// layout (`/{key}`, whose only credentials are the client's default headers).
     ///
     /// Called per attempt because a SigV4 signature is timestamped and cannot be reused.
-    fn request(&self, key: &str) -> reqwest::RequestBuilder {
+    fn request(&self, connection: &Connection, key: &str) -> reqwest::RequestBuilder {
+        let http = &connection.http;
         match &self.target {
             Target::S3 { signer, endpoint, host, bucket } => {
                 let canonical_uri = encode_uri_path(bucket, key);
                 // Signed-payload mode with an empty body: x-amz-content-sha256 = sha256("").
                 let signed = signer.sign("GET", host, &canonical_uri, "", &[], b"", Utc::now());
                 signed.into_iter().fold(
-                    self.http.get(format!("{endpoint}{canonical_uri}")),
+                    http.get(format!("{endpoint}{canonical_uri}")),
                     |request, (name, value)| request.header(name, value),
                 )
             }
             Target::CustomDomain { origin } => {
-                self.http.get(format!("{origin}{}", encode_key_path(key)))
+                http.get(format!("{origin}{}", encode_key_path(key)))
             }
         }
     }
@@ -706,11 +801,12 @@ impl R2ObjectFetcher {
     /// Performs one GET against this fetcher's target and classifies the response. No retry.
     async fn get_object(
         &self,
+        connection: &Connection,
         number: u64,
         key: &str,
         deadline: Option<Instant>,
     ) -> Result<Bytes, R2GetError> {
-        let mut request = self.request(key);
+        let mut request = self.request(connection, key);
         // Clamp the attempt to the remaining budget; an already-expired deadline degrades to
         // a floor timeout whose transport error the retry loop then surfaces as out-of-time.
         if let Some(deadline) = deadline {
@@ -1042,7 +1138,7 @@ mod tests {
     }
 
     fn custom_fetcher(domain: &str, access: Option<CfAccessCredentials>) -> R2ObjectFetcher {
-        R2ObjectFetcher::new_custom_domain(domain, access, test_timeouts(), test_pacing(), None)
+        R2ObjectFetcher::new_custom_domain(domain, access, test_timeouts(), test_pacing(), None, 1)
             .unwrap()
     }
 
@@ -1062,6 +1158,7 @@ mod tests {
             test_timeouts(),
             test_pacing(),
             None,
+            1,
         )
         .expect_err("a trailing newline cannot be a header value");
         assert!(err.contains("--r2-access-client-secret"), "{err}");
@@ -1084,6 +1181,7 @@ mod tests {
             test_timeouts(),
             test_pacing(),
             None,
+            1,
         )
         .expect_err("plaintext + credentials to a remote host must be refused");
         assert!(err.contains("plaintext"), "{err}");
@@ -1097,6 +1195,7 @@ mod tests {
                 test_timeouts(),
                 test_pacing(),
                 None,
+                1,
             )
             .unwrap_or_else(|e| panic!("{loopback} must be allowed: {e}"));
         }
@@ -1114,6 +1213,7 @@ mod tests {
             test_timeouts(),
             test_pacing(),
             None,
+            1,
         )
         .expect_err("ftp is not drivable");
         assert!(custom.contains("only http and https"), "{custom}");
@@ -1152,20 +1252,71 @@ mod tests {
         );
     }
 
-    /// The advisory covers over-subscription only. Exactly at the limit every permit maps to
-    /// a stream slot, which is the sizing the flag documentation asks for — warning there would
-    /// fire on a correct configuration, and warning on unlimited would fire on the default.
+    /// The advisory covers over-subscription only, and measures it per connection — spreading
+    /// the same concurrency over more connections is precisely the fix, so it must clear the
+    /// warning. Exactly at the limit every permit maps to a stream slot, which is the sizing
+    /// the flag documentation asks for; warning there would fire on a correct configuration,
+    /// and warning on unlimited would fire on the default.
     #[test]
-    fn edge_stream_limit_advisory_covers_over_subscription_only() {
+    fn edge_stream_limit_advisory_covers_per_connection_over_subscription() {
         let over = R2ObjectFetcher::concurrency_over_edge_stream_limit;
-        assert_eq!(over(None), None, "unlimited is the default, not a misconfiguration");
-        assert_eq!(over(Some(CLOUDFLARE_MAX_CONCURRENT_STREAMS)), None, "at the limit is exact");
+        const LIMIT: usize = CLOUDFLARE_MAX_CONCURRENT_STREAMS;
+        assert_eq!(over(None, 1), None, "unlimited is the default, not a misconfiguration");
+        assert_eq!(over(Some(LIMIT), 1), None, "at the limit is the intended sizing");
         assert_eq!(
-            over(Some(CLOUDFLARE_MAX_CONCURRENT_STREAMS + 1)),
-            Some(CLOUDFLARE_MAX_CONCURRENT_STREAMS + 1),
+            over(Some(LIMIT + 1), 1),
+            Some(LIMIT + 1),
             "one past the limit is one GET queued where the queue cannot be seen"
         );
-        assert_eq!(over(Some(4096)), Some(4096));
+        assert_eq!(over(Some(4 * LIMIT), 4), None, "spreading it over four connections fits");
+        assert_eq!(
+            over(Some(4 * LIMIT + 4), 4),
+            Some(LIMIT + 1),
+            "the warning reports the per-connection share, not the configured total"
+        );
+        assert_eq!(over(Some(LIMIT + 1), 0), Some(LIMIT + 1), "zero connections is read as one");
+    }
+
+    /// The cap is fetcher-wide and the semaphores are per connection, so the split has to round
+    /// up: rounding down would give some connection zero permits and wedge every GET routed to
+    /// it, which is a worse failure than a total that overshoots by less than the connection
+    /// count.
+    #[test]
+    fn concurrency_splits_across_connections_rounding_up() {
+        assert_eq!(per_connection_permits(Some(48), 8), 6, "an even split is exact");
+        assert_eq!(per_connection_permits(Some(3), 4), 1, "never zero, so no connection wedges");
+        assert_eq!(per_connection_permits(Some(0), 1), 1, "a zero cap clamps rather than wedges");
+        assert_eq!(per_connection_permits(Some(10), 0), 10, "zero connections is read as one");
+        assert_eq!(
+            per_connection_permits(None, 8),
+            Semaphore::MAX_PERMITS,
+            "unlimited stays unlimited per connection rather than being divided into a cap"
+        );
+    }
+
+    /// Round-robin, and per attempt rather than per fetch: a retry has to be able to leave a
+    /// connection that just failed, since one connection is one client and a dropped connection
+    /// takes every GET riding it down together.
+    #[tokio::test]
+    async fn connections_are_handed_out_round_robin() {
+        let fetcher = R2ObjectFetcher::new_custom_domain(
+            "https://witness.example.com",
+            None,
+            test_timeouts(),
+            test_pacing(),
+            Some(12),
+            3,
+        )
+        .unwrap();
+        assert_eq!(fetcher.connections(), 3);
+        let cycle: Vec<*const Connection> =
+            (0..6).map(|_| std::ptr::from_ref(fetcher.next_connection())).collect();
+        assert_eq!(cycle[..3], cycle[3..], "the cursor wraps rather than drifting");
+        assert_eq!(
+            cycle[..3].iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "consecutive attempts land on distinct connections"
+        );
     }
 
     /// Cloudflare's Browser Integrity Check challenges user-agent-less requests, which would
@@ -1191,6 +1342,7 @@ mod tests {
             test_timeouts(),
             test_pacing(),
             None,
+            1,
         )
         .unwrap_err();
         assert!(err.contains("Invalid R2 custom domain"), "{err}");

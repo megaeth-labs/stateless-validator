@@ -128,6 +128,12 @@ impl R2WitnessClient {
         self.fetcher.target_label()
     }
 
+    /// How many HTTP/2 connections the transport spreads its GETs over, for startup logging
+    /// (see [`R2ObjectFetcher::connections`]).
+    pub fn connections(&self) -> usize {
+        self.fetcher.connections()
+    }
+
     /// Builds a client from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
     ///
     /// `timeouts` bounds each individual GET (end-to-end and connect). `retry_backoff` paces the
@@ -170,6 +176,7 @@ impl R2WitnessClient {
         timeouts: FetchTimeouts,
         retry_backoff: BackoffPolicy,
         max_concurrent_requests: Option<usize>,
+        connections: usize,
     ) -> eyre::Result<Self> {
         let fetcher = R2ObjectFetcher::new_custom_domain(
             domain,
@@ -177,6 +184,7 @@ impl R2WitnessClient {
             timeouts,
             RetryPacing { initial: retry_backoff.initial, max: retry_backoff.max },
             max_concurrent_requests,
+            connections,
         )
         .map_err(|e| eyre::eyre!(e))?;
         Ok(Self { fetcher })
@@ -355,6 +363,7 @@ mod tests {
             test_timeouts(),
             test_backoff(),
             None,
+            1,
         )
         .unwrap();
         let (decoded_salt, _) =
@@ -375,6 +384,7 @@ mod tests {
             test_timeouts(),
             test_backoff(),
             None,
+            1,
         )
         .unwrap_err();
         assert!(err.to_string().contains("Invalid R2 custom domain"));

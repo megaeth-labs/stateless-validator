@@ -50,6 +50,22 @@ impl<'a> R2TuningFlag<'a> {
     }
 }
 
+/// A tuning flag whose *value* the rules need, not just its presence.
+#[derive(Clone, Copy)]
+pub struct R2CountFlag<'a> {
+    /// The flag as an operator writes it, e.g. `--r2-connections`.
+    pub name: &'a str,
+    /// The parsed count, `None` when the operator left it alone.
+    pub value: Option<usize>,
+}
+
+impl<'a> R2CountFlag<'a> {
+    /// Names a count flag and its parsed value.
+    pub const fn new(name: &'a str, value: Option<usize>) -> Self {
+        Self { name, value }
+    }
+}
+
 /// One binary's `--r2-*` flags, as parsed.
 pub struct R2Flags<'a> {
     /// Bare S3 endpoint origin; selects the signed target.
@@ -66,6 +82,8 @@ pub struct R2Flags<'a> {
     pub access_client_id: R2Flag<'a>,
     /// Cloudflare Access service-token client secret (custom domain only).
     pub access_client_secret: R2Flag<'a>,
+    /// How many HTTP/2 connections the custom-domain target spreads its GETs over.
+    pub connections: R2CountFlag<'a>,
     /// Flags that only mean something once a target is configured.
     pub tuning: &'a [R2TuningFlag<'a>],
 }
@@ -85,7 +103,8 @@ pub enum R2Target {
 ///
 /// Rejects, each by flag name: a present-but-empty value, both targets at once, S3 flags left
 /// behind by the documented migration to a custom domain, an incomplete S3 credential quad, a
-/// half-configured Cloudflare Access pair or one attached to no custom domain, and tuning
+/// half-configured Cloudflare Access pair or one attached to no custom domain, a connection
+/// count of zero or one attached to a target that cannot spread over connections, and tuning
 /// flags set with no target to tune.
 ///
 /// Emptiness is swept first so a blank env line is diagnosed as itself, rather than read as a
@@ -157,9 +176,17 @@ pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Target> {
     };
 
     validate_access_pair(flags, target)?;
+    validate_connections(flags, target)?;
 
-    let orphan_tuning: Vec<&str> =
-        flags.tuning.iter().filter(|flag| flag.set).map(|flag| flag.name).collect();
+    // The connection count joins the tuning flags here rather than being reported on its own,
+    // so an operator who orphaned several of them is told about all of them at once.
+    let orphan_tuning: Vec<&str> = flags
+        .tuning
+        .iter()
+        .filter(|flag| flag.set)
+        .map(|flag| flag.name)
+        .chain(flags.connections.value.map(|_| flags.connections.name))
+        .collect();
     if target == R2Target::None && !orphan_tuning.is_empty() {
         bail!(
             "{} only applies once an R2 target is configured: set one, or unset the flag",
@@ -168,6 +195,26 @@ pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Target> {
     }
 
     Ok(target)
+}
+
+/// The connection count is a custom-domain concept and must name at least one connection.
+///
+/// Rejected rather than clamped on the S3 target: there, one client already opens a socket per
+/// concurrent request, so a count set there is a belief about the deployment that is not true,
+/// and honouring it silently would leave the operator expecting a spread they did not get.
+fn validate_connections(flags: &R2Flags<'_>, target: R2Target) -> Result<()> {
+    let Some(value) = flags.connections.value else { return Ok(()) };
+    if value == 0 {
+        bail!("{} must be at least 1", flags.connections.name);
+    }
+    if target == R2Target::S3 {
+        bail!(
+            "{} applies only to {}: the S3 target already opens a connection per in-flight GET",
+            flags.connections.name,
+            flags.custom_domain.name
+        );
+    }
+    Ok(())
 }
 
 /// The Cloudflare Access pair is all-or-nothing and belongs to the custom-domain target only.
@@ -218,6 +265,7 @@ mod tests {
         domain: Option<&'a str>,
         access_id: Option<&'a str>,
         access_secret: Option<&'a str>,
+        connections: Option<usize>,
         tuning: &'a [R2TuningFlag<'a>],
     }
 
@@ -232,6 +280,7 @@ mod tests {
                 custom_domain: R2Flag::new("--r2-custom-domain", self.domain),
                 access_client_id: R2Flag::new("--r2-access-client-id", self.access_id),
                 access_client_secret: R2Flag::new("--r2-access-client-secret", self.access_secret),
+                connections: R2CountFlag::new("--r2-connections", self.connections),
                 tuning: self.tuning,
             }
         }
@@ -243,6 +292,26 @@ mod tests {
         fn err(&'a self) -> String {
             self.validate().unwrap_err().to_string()
         }
+    }
+
+    /// Zero connections would build a fetcher that can carry nothing; the S3 target cannot
+    /// spread over connections at all. Both are named rather than clamped or ignored, because
+    /// either silence leaves the operator believing in a spread they did not get.
+    #[test]
+    fn connections_must_be_positive_and_belong_to_the_custom_domain() {
+        let zero = Cfg { domain: DOMAIN, connections: Some(0), ..Cfg::default() }.err();
+        assert!(zero.contains("--r2-connections") && zero.contains("at least 1"), "{zero}");
+
+        let on_s3 = Cfg { connections: Some(4), ..s3() }.err();
+        assert!(
+            on_s3.contains("--r2-connections") && on_s3.contains("--r2-custom-domain"),
+            "{on_s3}"
+        );
+
+        let orphan = Cfg { connections: Some(4), ..Cfg::default() }.err();
+        assert!(orphan.contains("--r2-connections"), "{orphan}");
+
+        assert!(Cfg { domain: DOMAIN, connections: Some(8), ..Cfg::default() }.validate().is_ok());
     }
 
     /// A complete, valid S3 configuration.

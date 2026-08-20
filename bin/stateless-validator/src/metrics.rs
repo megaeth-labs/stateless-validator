@@ -94,6 +94,7 @@ pub mod names {
     metric!(R2_WITNESS_ERRORS_TOTAL, "r2_witness_errors_total");
     metric!(R2_TARGET_INFO, "r2_target_info");
     metric!(R2_NEGOTIATED_VERSION_INFO, "r2_negotiated_http_version_info");
+    metric!(R2_CONNECTIONS, "r2_connections");
 
     // Contract cache
     metric!(CONTRACT_CACHE_HITS, "contract_cache_hits_total");
@@ -268,6 +269,16 @@ pub fn record_r2_target(target: &'static str) {
 /// stuck at 1 forever alongside the corrected one.
 pub fn record_r2_negotiated_version(version: &'static str) {
     gauge!(names::R2_NEGOTIATED_VERSION_INFO, "version" => version).set(1.0);
+}
+
+/// How many HTTP/2 connections the custom-domain target spreads its GETs over.
+///
+/// A plain value rather than an info label: it is the divisor for the per-connection stream
+/// budget, so a dashboard reads it against `--witness-max-concurrent-requests` and against the
+/// edge's limit rather than grouping by it. Published only for the custom-domain target, where
+/// one client is one connection and the count is a real property of the transport.
+pub fn record_r2_connections(connections: usize) {
+    gauge!(names::R2_CONNECTIONS).set(connections as f64);
 }
 
 /// Record validation timing and block statistics after successful validation.

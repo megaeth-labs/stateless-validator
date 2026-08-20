@@ -122,6 +122,12 @@ impl R2WitnessSource {
         self.fetcher.target_label()
     }
 
+    /// How many HTTP/2 connections the transport spreads its GETs over, for startup logging
+    /// (see [`R2ObjectFetcher::connections`]).
+    pub fn connections(&self) -> usize {
+        self.fetcher.connections()
+    }
+
     /// Builds a source from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
     ///
     /// `timeouts` bounds each individual GET end-to-end and in its connect phase (further
@@ -159,6 +165,7 @@ impl R2WitnessSource {
         timeouts: FetchTimeouts,
         retry_backoff: BackoffPolicy,
         max_concurrent_requests: Option<usize>,
+        connections: usize,
     ) -> eyre::Result<Self> {
         let fetcher = R2ObjectFetcher::new_custom_domain(
             domain,
@@ -166,6 +173,7 @@ impl R2WitnessSource {
             timeouts,
             RetryPacing { initial: retry_backoff.initial, max: retry_backoff.max },
             max_concurrent_requests,
+            connections,
         )
         .map_err(|e| eyre::eyre!(e))?;
         Ok(Self { fetcher })
@@ -283,6 +291,7 @@ mod tests {
             },
             BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(20)),
             None,
+            1,
         )
         .unwrap();
         source

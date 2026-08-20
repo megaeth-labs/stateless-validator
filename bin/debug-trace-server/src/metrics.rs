@@ -531,6 +531,19 @@ pub fn record_r2_target(target: &'static str) {
     gauge!(R2_TARGET_INFO, "target" => target).set(1.0);
 }
 
+/// How many HTTP/2 connections the custom-domain target spreads its GETs over.
+///
+/// A plain value rather than an info label: it is the divisor for the per-connection stream
+/// budget, so a dashboard wants to read it against `--r2-max-concurrent-requests` and against
+/// the edge's limit, not group by it. Published only for the custom-domain target, where one
+/// client is one connection and the count is therefore a real property of the transport.
+const R2_CONNECTIONS: &str = "debug_trace_r2_connections";
+
+/// Publishes the custom-domain connection count once at startup.
+pub fn record_r2_connections(connections: usize) {
+    gauge!(R2_CONNECTIONS).set(connections as f64);
+}
+
 /// The protocol the R2 custom-domain target actually negotiated, as a constant-1 info gauge
 /// labeled `version`, published once the first response has been seen.
 ///
