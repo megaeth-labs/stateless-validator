@@ -435,28 +435,31 @@ impl ConnectionPool {
         self.connections.len()
     }
 
-    /// A connection with a free permit and that permit, or `None` when every connection is
-    /// full — starting the search at the rotating cursor, so an unloaded pool still rotates.
+    /// A connection with a free permit and that permit, or — when every connection is full —
+    /// the one to wait on.
     ///
     /// Work-conserving on purpose. Committing to the cursor's connection and then waiting on
     /// *its* semaphore would partition one budget of `max` into `N` budgets of `max/N`, which
     /// queues distinctly worse at the same offered load, and would leave a GET waiting behind
     /// a connection whose permits are held by a slow transfer while another sits idle.
-    fn try_acquire(&self) -> Option<(&Connection, SemaphorePermit<'_>)> {
-        let start = self.next.fetch_add(1, Ordering::Relaxed);
-        (0..self.len()).find_map(|offset| {
-            let connection = &self.connections[(start + offset) % self.len()];
-            connection.permits.try_acquire().ok().map(|permit| (connection, permit))
-        })
-    }
-
-    /// The connection a fetch waits on when every one of them is full.
     ///
-    /// The cursor's own pick rather than any notion of "least loaded": under saturation the
-    /// connection with the most free capacity is the one that just dropped every GET riding
-    /// it, so choosing by capacity would steer the wait straight into the fault.
-    fn on_deck(&self) -> &Connection {
-        &self.connections[self.next.fetch_add(1, Ordering::Relaxed) % self.len()]
+    /// The connection to wait on is the cursor's own pick, not the one with the most room:
+    /// under saturation that one is whichever just dropped every GET riding it, so choosing by
+    /// capacity would steer the wait straight into the fault.
+    ///
+    /// Exactly one cursor step per attempt, both outcomes included. Stepping again on the
+    /// full path would advance the cursor by two under saturation, and any stride sharing a
+    /// factor with the connection count then reaches only some of the connections — at 16
+    /// connections, a stride of two leaves half of them never waited on.
+    fn acquire_or_wait_on(&self) -> Result<(&Connection, SemaphorePermit<'_>), &Connection> {
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        for offset in 0..self.len() {
+            let connection = &self.connections[(start + offset) % self.len()];
+            if let Ok(permit) = connection.permits.try_acquire() {
+                return Ok((connection, permit));
+            }
+        }
+        Err(&self.connections[start % self.len()])
     }
 }
 
@@ -802,13 +805,12 @@ impl R2ObjectFetcher {
                 // The connection is chosen per attempt, not per fetch, so a retry lands on a
                 // different one than the attempt that just failed: one client is one
                 // connection, so retrying onto the same one retries into the same fault.
-                let taken = match self.pool.try_acquire() {
-                    Some(taken) => Some(taken),
-                    // Every connection full. Wait on the cursor's pick — a deadline bounds
-                    // that wait too, since under saturation the caller's budget must stay
-                    // available for its fallback rather than drain here.
-                    None => {
-                        let connection = self.pool.on_deck();
+                let (connection, permit) = match self.pool.acquire_or_wait_on() {
+                    Ok(taken) => taken,
+                    // Every connection full. A deadline bounds this wait too, since under
+                    // saturation the caller's budget must stay available for its fallback
+                    // rather than drain here.
+                    Err(connection) => {
                         let waited = match deadline {
                             None => connection.permits.acquire().await,
                             Some(d) => {
@@ -823,10 +825,9 @@ impl R2ObjectFetcher {
                                 }
                             }
                         };
-                        Some((connection, waited.expect("semaphore is never closed")))
+                        (connection, waited.expect("semaphore is never closed"))
                     }
                 };
-                let (connection, permit) = taken.expect("both arms yield a connection");
                 queue_wait += queued.elapsed();
                 let _permit = permit;
                 self.get_object(connection, number, &key, deadline).await
@@ -1379,7 +1380,8 @@ mod tests {
     async fn connections_are_handed_out_round_robin() {
         let fetcher = custom_fetcher_with("https://witness.example.com", Some(12), 3);
         assert_eq!(fetcher.connections(), 3);
-        let taken: Vec<_> = (0..6).map(|_| fetcher.pool.try_acquire().expect("free")).collect();
+        let taken: Vec<_> =
+            (0..6).map(|_| fetcher.pool.acquire_or_wait_on().expect("free")).collect();
         let cycle: Vec<*const Connection> =
             taken.iter().map(|(connection, _)| std::ptr::from_ref(*connection)).collect();
         assert_eq!(cycle[..3], cycle[3..], "the cursor wraps rather than drifting");
@@ -1388,6 +1390,49 @@ mod tests {
             3,
             "consecutive attempts land on distinct connections"
         );
+    }
+
+    /// The deployment shape this flag exists for — 16 connections under a cap of 1024 — must
+    /// spread evenly, both while filling and once saturated.
+    ///
+    /// The saturated half is the one worth pinning. Handing out a connection and choosing the
+    /// one to wait on used to be two calls, so a saturated attempt stepped the cursor twice,
+    /// and a stride sharing a factor with the connection count reaches only some of them:
+    /// at 16 connections a stride of two left half of them never waited on, while the other
+    /// half took every waiter.
+    #[tokio::test]
+    async fn a_saturated_pool_spreads_evenly_over_every_connection() {
+        const CONNECTIONS: usize = 16;
+        const CAP: usize = 1024;
+        let share = CAP / CONNECTIONS;
+
+        let fetcher = custom_fetcher_with("https://witness.example.com", Some(CAP), CONNECTIONS);
+        let base = std::ptr::from_ref(&fetcher.pool.connections[0]) as usize;
+        let index = |c: &Connection| {
+            (std::ptr::from_ref(c) as usize - base) / std::mem::size_of::<Connection>()
+        };
+
+        // Filling to the cap: the permits divide exactly, so every connection must end at its
+        // share — anything else means the cap leaked or a connection was skipped.
+        let mut held = Vec::new();
+        let mut taken = [0usize; CONNECTIONS];
+        for _ in 0..CAP {
+            let (connection, permit) =
+                fetcher.pool.acquire_or_wait_on().expect("room below the cap");
+            taken[index(connection)] += 1;
+            held.push(permit);
+        }
+        assert_eq!(taken, [share; CONNECTIONS], "the cap must divide evenly across connections");
+
+        // Saturated: every further arrival is told which connection to wait on, and those must
+        // rotate over all of them rather than a subset.
+        let mut waiting = [0usize; CONNECTIONS];
+        for _ in 0..CONNECTIONS * 4 {
+            let connection =
+                fetcher.pool.acquire_or_wait_on().expect_err("the cap is fully subscribed");
+            waiting[index(connection)] += 1;
+        }
+        assert_eq!(waiting, [4; CONNECTIONS], "waiters must rotate over every connection");
     }
 
     /// A full connection is skipped rather than queued behind.
@@ -1400,14 +1445,17 @@ mod tests {
     async fn a_saturated_connection_is_skipped_while_another_has_room() {
         // Two connections, one permit each.
         let fetcher = custom_fetcher_with("https://witness.example.com", Some(2), 2);
-        let (first, _first_permit) = fetcher.pool.try_acquire().expect("both free");
+        let (first, _first_permit) = fetcher.pool.acquire_or_wait_on().expect("both free");
 
-        let (second, _second_permit) = fetcher.pool.try_acquire().expect("one still free");
+        let (second, _second_permit) = fetcher.pool.acquire_or_wait_on().expect("one still free");
         assert!(!std::ptr::eq(first, second), "the free connection is the one handed out");
 
-        assert!(fetcher.pool.try_acquire().is_none(), "with both full, nothing is handed out");
+        assert!(
+            fetcher.pool.acquire_or_wait_on().is_err(),
+            "with both full, nothing is handed out"
+        );
         // And the cursor still names one to wait on rather than deadlocking the caller.
-        assert!(fetcher.pool.on_deck().permits.try_acquire().is_err());
+        assert!(fetcher.pool.acquire_or_wait_on().unwrap_err().permits.try_acquire().is_err());
     }
 
     /// Cloudflare's Browser Integrity Check challenges user-agent-less requests, which would
