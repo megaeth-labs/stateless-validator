@@ -218,6 +218,23 @@ struct Args {
     )]
     batch_item_concurrency: u32,
 
+    /// Maximum simultaneous inbound connections; further ones are answered `429` before any
+    /// handler runs (default: jsonrpsee's own 100, so leaving this unset changes nothing).
+    ///
+    /// This is the only admission control the server has today, and it was never chosen — it
+    /// is the framework default. It also counts the wrong thing: the limit that matters is
+    /// concurrent *work*, and one HTTP/2 connection carries as many concurrent requests as the
+    /// peer's stream limit allows, so a single h2 client passes this gate untouched while a
+    /// hundred HTTP/1.1 clients doing one request each are turned away. Exposed so an operator
+    /// can size it, and so a capacity measurement is not silently bounded by it.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_MAX_CONNECTIONS",
+        default_value_t = DEFAULT_MAX_CONNECTIONS,
+        value_parser = clap::value_parser!(u32).range(1..),
+    )]
+    max_connections: u32,
+
     /// Estimated number of items in response cache (for initial capacity). Must be at
     /// least 1 — disable the cache with `--response-cache-disabled`, not with 0.
     #[clap(
@@ -439,6 +456,13 @@ struct Args {
 /// Database filename for the trace server's local storage.
 const TRACE_SERVER_DB_FILENAME: &str = "trace_server.redb";
 
+/// Simultaneous inbound connections allowed by default.
+///
+/// jsonrpsee's own default, restated here so the number is visible at the flag rather than
+/// buried in a dependency — leaving `--max-connections` unset must keep behaving exactly as
+/// before this flag existed.
+const DEFAULT_MAX_CONNECTIONS: u32 = 100;
+
 /// Default number of blocks to keep in database.
 const DEFAULT_BLOCKS_TO_KEEP: u64 = 1000;
 
@@ -608,6 +632,7 @@ async fn main() -> Result<()> {
         witness_local_window = args.witness_local_window,
         r2_witness_configured = r2_target != R2Target::None,
         tip_buffer = args.tip_buffer,
+        max_connections = args.max_connections,
         response_cache_disabled = args.response_cache_disabled,
         response_cache_max_size = args.response_cache_max_size,
         response_cache_estimated_items = args.response_cache_estimated_items,
@@ -883,7 +908,10 @@ async fn main() -> Result<()> {
 
     // Start server
     let max_response_body_size = u32::MAX;
-    let config = ServerConfig::builder().max_response_body_size(max_response_body_size).build();
+    let config = ServerConfig::builder()
+        .max_response_body_size(max_response_body_size)
+        .max_connections(args.max_connections)
+        .build();
     let rpc_middleware = RpcServiceBuilder::new().layer(rpc_middleware::ConcurrentBatchLayer::new(
         args.batch_item_concurrency as usize,
         max_response_body_size as usize,
@@ -1604,6 +1632,20 @@ mod tests {
             let err = validate_args(&parse_args(&partial)).unwrap_err().to_string();
             assert!(err.contains(dropped), "missing {dropped} must be named: {err}");
         }
+    }
+
+    /// The connection cap is the one admission control the server has, so its default must
+    /// not move when the flag is added, and it must be settable well past that default — a
+    /// capacity measurement bounded by an unchosen framework default measures the default.
+    #[test]
+    fn max_connections_defaults_to_the_framework_value_and_is_raisable() {
+        let _guard = stateless_test_utils::env::env_lock();
+        assert_eq!(parse_args(&[]).max_connections, DEFAULT_MAX_CONNECTIONS);
+        assert_eq!(parse_args(&["--max-connections", "4096"]).max_connections, 4096);
+        assert!(
+            Args::try_parse_from(["debug-trace-server", "--max-connections", "0"]).is_err(),
+            "zero connections would accept nothing at all"
+        );
     }
 
     /// The custom-domain R2 target: stands alone (no credential quad), unlocks the shared

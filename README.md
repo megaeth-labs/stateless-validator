@@ -114,6 +114,9 @@ Disable the cache with `--response-cache-disabled`; `--response-cache-estimated-
 Entries of an inbound JSON-RPC batch request execute concurrently as independent runtime tasks, so a batch answers near its slowest entry instead of the sum of its entries — including CPU-bound entries, since EVM tracing runs synchronously inline and merely interleaved futures would serialize behind it (jsonrpsee's built-in batch path is strictly sequential).
 Each entry still goes through the regular per-request pipeline — response cache, single-flight, witness routing, and per-method metrics apply unchanged — and responses may arrive in any order, matched by `id` as JSON-RPC 2.0 permits.
 `--batch-item-concurrency` (default 16) bounds how many entries of one batch run at once, so a single huge batch cannot monopolize downstream resources against concurrently served requests; set it to 1 to restore sequential execution.
+`--max-connections` (default 100) caps simultaneous inbound connections, answering further ones with `429` before any handler runs — the only admission control the server has, and until it was exposed here it was jsonrpsee's default rather than a chosen number.
+What it bounds depends on the transport: HTTP/1.1 carries one request per connection at a time, so today the cap is effectively a concurrency limit, while a single HTTP/2 connection would pass it carrying as many concurrent requests as its stream limit allows.
+Raise it to measure capacity that this cap would otherwise bound; the connection count is visible with `ss -tan state established '( sport = :<port> )'`.
 The `debug_trace_batch_size` histogram records entries per inbound batch, and CPU burned inside spawned entries is folded back into `x-execution-time-ns` and the request CPU metric, so batch requests do not under-report their cost.
 
 **Response compression:**
