@@ -330,6 +330,16 @@ impl RpcClient {
         // the connect-phase bound applies uniformly to data, witness, and report endpoints.
         let http_client = reqwest::Client::builder()
             .connect_timeout(config.connect_timeout)
+            // Pinned to HTTP/1.1 on purpose. `stateless-r2` turns on reqwest's `http2` feature
+            // for the R2 custom-domain target and Cargo unifies features workspace-wide, so
+            // without this pin every JSON-RPC provider here would start offering h2 — and the
+            // endpoints accept it. That would put the multi-MB witness payloads on one shared
+            // connection per host under hyper's fixed 5MB connection / 2MB stream windows with
+            // adaptive sizing off, capping throughput at roughly window/RTT over the
+            // intercontinental links this client runs across. Moving the RPC path to h2 is a
+            // change worth measuring on its own, not a side effect of a feature added for a
+            // different client.
+            .http1_only()
             .build()
             .context("Failed to build HTTP client")?;
 

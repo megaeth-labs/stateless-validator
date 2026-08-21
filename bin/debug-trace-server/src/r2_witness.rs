@@ -1,6 +1,7 @@
 //! Direct-from-R2 witness source.
 //!
-//! Fetches the primary witness object straight from the R2 bucket over the S3 API and decodes
+//! Fetches the primary witness object straight from the R2 bucket — via SigV4-signed S3
+//! GETs or unsigned GETs through a Cloudflare custom domain, per construction — and decodes
 //! it with the **light** decoder — the trace server never verifies the witness proof, so the
 //! full decode's per-point elliptic-curve work would buy nothing (see
 //! `stateless_core::light_witness`). The transport core is `stateless-r2`'s
@@ -18,7 +19,7 @@ use alloy_primitives::B256;
 use stateless_common::{BackoffPolicy, WitnessDecodingError, decode_witness_payload_light};
 use stateless_core::{LightWitness, withdrawals::MptWitness};
 use stateless_r2::{
-    fetch::{FetchTimeouts, R2GetError, R2ObjectFetcher, RetryPacing},
+    fetch::{CfAccessCredentials, FetchTimeouts, R2GetError, R2ObjectFetcher, RetryPacing},
     keys,
 };
 use tokio::task::JoinError;
@@ -40,8 +41,8 @@ pub(crate) const KIND_MISSING_ABOVE_TIP: &str = "missing_above_tip";
 /// Failure outcome of an R2 witness fetch.
 #[derive(Debug, thiserror::Error)]
 pub enum R2WitnessError {
-    /// The signed GET failed (absent object, transport, throttle, unexpected status, or
-    /// out of deadline while queued).
+    /// The GET failed (absent object, transport, throttle, unexpected status, or out of
+    /// deadline while queued).
     #[error(transparent)]
     Get(#[from] R2GetError),
     /// The object was fetched but its bytes did not decode to a witness tuple — a corrupt
@@ -98,7 +99,29 @@ pub struct R2WitnessSource {
     fetcher: R2ObjectFetcher,
 }
 
+/// The fetcher's pacing view of a `BackoffPolicy` — the adapter-layer conversion that keeps
+/// `stateless-r2` free of a dependency on this workspace's backoff type.
+fn pacing(backoff: &BackoffPolicy) -> RetryPacing {
+    RetryPacing { initial: backoff.initial, max: backoff.max }
+}
+
 impl R2WitnessSource {
+    /// The configured target's origin, for startup logging (see [`R2ObjectFetcher::origin`]).
+    pub fn origin(&self) -> &str {
+        self.fetcher.origin()
+    }
+
+    /// The configured target's metric label (see [`R2ObjectFetcher::target_label`]).
+    pub const fn target_label(&self) -> &'static str {
+        self.fetcher.target_label()
+    }
+
+    /// How many HTTP/2 connections the transport spreads its GETs over, for startup logging
+    /// (see [`R2ObjectFetcher::connections`]).
+    pub fn connections(&self) -> usize {
+        self.fetcher.connections()
+    }
+
     /// Builds a source from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
     ///
     /// `timeouts` bounds each individual GET end-to-end and in its connect phase (further
@@ -120,9 +143,33 @@ impl R2WitnessSource {
             access_key_id,
             secret_access_key,
             timeouts,
-            RetryPacing { initial: retry_backoff.initial, max: retry_backoff.max },
+            pacing(&retry_backoff),
             max_concurrent_requests,
         )
+        .map_err(|e| eyre::eyre!(e))?;
+        Ok(Self { fetcher })
+    }
+
+    /// Builds a source that fetches unsigned through a Cloudflare custom domain fronting
+    /// the bucket (h2-multiplexed, edge-cacheable), with optional Cloudflare Access
+    /// service-token headers. The remaining parameters mean what they mean on [`Self::new`].
+    pub fn new_custom_domain(
+        domain: &str,
+        access: Option<CfAccessCredentials>,
+        timeouts: FetchTimeouts,
+        retry_backoff: BackoffPolicy,
+        max_concurrent_requests: Option<usize>,
+        connections: usize,
+    ) -> eyre::Result<Self> {
+        let fetcher = R2ObjectFetcher::new_custom_domain(
+            domain,
+            access,
+            timeouts,
+            pacing(&retry_backoff),
+            max_concurrent_requests,
+            connections,
+        )
+        .map(|fetcher| fetcher.on_version_observed(metrics::record_r2_negotiated_version))
         .map_err(|e| eyre::eyre!(e))?;
         Ok(Self { fetcher })
     }
@@ -216,6 +263,38 @@ mod tests {
 
     fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(5)
+    }
+
+    /// The custom-domain source serves the same decode path end-to-end, requesting the bare
+    /// `/{key}` layout (no bucket segment, no SigV4 authorization).
+    #[tokio::test]
+    async fn custom_domain_source_decodes_and_requests_bare_key() {
+        let (salt_witness, mpt_witness): (_, MptWitness) =
+            TestFixtures::mainnet_shared().first_paired_witness();
+        let (_, payload) = stateless_common::encode_witness_payload(&salt_witness, &mpt_witness)
+            .expect("fixture witness must encode");
+
+        let (domain, _, heads) =
+            stateless_test_utils::mock_r2::mock_r2_capturing(vec![(200, payload)]).await;
+        let source = R2WitnessSource::new_custom_domain(
+            &domain,
+            None,
+            FetchTimeouts {
+                per_attempt: Duration::from_secs(5),
+                connect: stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT,
+            },
+            BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(20)),
+            None,
+            1,
+        )
+        .unwrap();
+        source
+            .get_witness_light(1, B256::ZERO, deadline())
+            .await
+            .expect("valid object must fetch and decode");
+        let head = heads.lock().unwrap()[0].to_lowercase();
+        assert!(head.starts_with("get /block/0_999/1."), "bucketless key layout: {head}");
+        assert!(!head.contains("authorization:"), "custom-domain GET must be unsigned: {head}");
     }
 
     /// A fixture witness encoded with the uploader's `encode_witness_payload` must

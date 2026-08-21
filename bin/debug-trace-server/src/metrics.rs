@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 
 use eyre::Result;
-use metrics::{Counter, Gauge, Histogram, counter, histogram};
+use metrics::{Counter, Gauge, Histogram, counter, gauge, histogram};
 use metrics_derive::Metrics;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 pub use stateless_common::{
@@ -517,6 +517,45 @@ const R2_WITNESS_QUEUE_WAIT_SECONDS: &str = "debug_trace_r2_witness_queue_wait_s
 /// Records the queued share of one R2 witness fetch.
 pub fn record_r2_witness_queue_wait(seconds: f64) {
     histogram!(R2_WITNESS_QUEUE_WAIT_SECONDS).record(seconds);
+}
+
+/// Which R2 target this process was configured with, as a constant-1 info gauge labeled
+/// `target`. The R2 series above carry no target dimension, so during a fleet rollout — some
+/// hosts on the custom domain, some still on the S3 endpoint — a spike in
+/// `debug_trace_r2_witness_errors_total` cannot be attributed to one or the other. Joining on
+/// this gauge supplies that dimension without changing the established metric contract.
+const R2_TARGET_INFO: &str = "debug_trace_r2_target_info";
+
+/// Publishes the configured R2 target once at startup.
+pub fn record_r2_target(target: &'static str) {
+    gauge!(R2_TARGET_INFO, "target" => target).set(1.0);
+}
+
+/// How many HTTP/2 connections the custom-domain target spreads its GETs over.
+///
+/// A plain value rather than an info label: it is the divisor for the per-connection stream
+/// budget, so a dashboard wants to read it against `--r2-max-concurrent-requests` and against
+/// the edge's limit, not group by it. Published only for the custom-domain target, where one
+/// client is one connection and the count is therefore a real property of the transport.
+const R2_CONNECTIONS: &str = "debug_trace_r2_connections";
+
+/// Publishes the custom-domain connection count once at startup.
+pub fn record_r2_connections(connections: usize) {
+    gauge!(R2_CONNECTIONS).set(connections as f64);
+}
+
+/// The protocol the R2 custom-domain target actually negotiated, as a constant-1 info gauge
+/// labeled `version`, published once the first response has been seen.
+///
+/// Separate from the target gauge on purpose: that one answers "what was configured" and can be
+/// published at startup, while this one is only knowable after a request. Folding both into one
+/// gauge would mean publishing it twice with different label sets, leaving the startup series
+/// stuck at 1 forever alongside the corrected one.
+const R2_NEGOTIATED_VERSION_INFO: &str = "debug_trace_r2_negotiated_http_version_info";
+
+/// Publishes the protocol the custom-domain target negotiated.
+pub fn record_r2_negotiated_version(version: &'static str) {
+    gauge!(R2_NEGOTIATED_VERSION_INFO, "version" => version).set(1.0);
 }
 
 /// Canonical number → hash resolution counter, labeled `(source, outcome)` — how often

@@ -1,6 +1,7 @@
 //! Direct-from-R2 witness source.
 //!
-//! Fetches the primary witness object straight from the R2 bucket over the S3 API and returns
+//! Fetches the primary witness object straight from the R2 bucket — via SigV4-signed S3 GETs
+//! or unsigned GETs through a Cloudflare custom domain, per construction — and returns
 //! the same `(SaltWitness, MptWitness)` tuple the RPC path yields. The transport core is
 //! [`R2ObjectFetcher`] from `stateless-r2`, shared with the debug-trace-server's historical
 //! witness source; this adapter owns what is validator-specific: the **full** payload decode
@@ -15,7 +16,8 @@
 //! `--end-block` slice over history, a permanently absent object means the run never
 //! completes and never fails: alert on `r2_witness_errors_total{kind="missing"}` staying hot
 //! for the same block, and use the object key from the error's log line to check/backfill
-//! the bucket.
+//! the bucket. On the custom-domain target, "appears once the uploader wins" additionally
+//! assumes the edge does not cache 404s — see the `--r2-custom-domain` flag docs.
 
 use std::time::{Duration, Instant};
 
@@ -26,7 +28,7 @@ use stateless_common::{
 };
 use stateless_core::withdrawals::MptWitness;
 use stateless_r2::{
-    fetch::{FetchTimeouts, R2GetError, R2ObjectFetcher, RetryPacing},
+    fetch::{CfAccessCredentials, FetchTimeouts, R2GetError, R2ObjectFetcher, RetryPacing},
     keys,
 };
 use tokio::task::JoinError;
@@ -36,7 +38,7 @@ use crate::metrics;
 
 /// Throttle applied before surfacing any deterministic (non-retryable) failure: the pipeline
 /// fetcher (`stateless-core/src/pipeline/fetcher.rs`) re-enqueues failed fetches with no delay,
-/// so returning instantly would hot-loop signed GETs against R2. Delete this once the fetcher
+/// so returning instantly would hot-loop GETs against R2. Delete this once the fetcher
 /// grows per-block re-enqueue backoff. Test builds shrink it so the failure-path tests run in
 /// milliseconds.
 const DETERMINISTIC_FAILURE_THROTTLE: Duration =
@@ -50,7 +52,7 @@ const MAX_ATTEMPTS: usize = 9;
 /// Failure outcome of an R2 witness fetch.
 #[derive(Debug, thiserror::Error)]
 pub enum R2WitnessError {
-    /// The signed GET failed (absent object, transport, throttle, or unexpected status —
+    /// The GET failed (absent object, transport, throttle, or unexpected status —
     /// see [`R2GetError`], and the module docs for the `Missing` operator note).
     #[error(transparent)]
     Get(#[from] R2GetError),
@@ -95,14 +97,37 @@ impl R2WitnessError {
     }
 }
 
-/// Fetches witness objects straight from an R2 bucket over the S3 API with SigV4-signed GETs.
+/// Fetches witness objects straight from an R2 bucket — SigV4-signed over the S3 API, or
+/// unsigned through a Cloudflare custom domain, per construction.
 /// The fetcher's `Debug` redacts the credentials.
 #[derive(Debug)]
 pub struct R2WitnessClient {
     fetcher: R2ObjectFetcher,
 }
 
+/// The fetcher's pacing view of a `BackoffPolicy` — the adapter-layer conversion that keeps
+/// `stateless-r2` free of a dependency on this workspace's backoff type.
+fn pacing(backoff: &BackoffPolicy) -> RetryPacing {
+    RetryPacing { initial: backoff.initial, max: backoff.max }
+}
+
 impl R2WitnessClient {
+    /// The configured target's origin, for startup logging (see [`R2ObjectFetcher::origin`]).
+    pub fn origin(&self) -> &str {
+        self.fetcher.origin()
+    }
+
+    /// The configured target's metric label (see [`R2ObjectFetcher::target_label`]).
+    pub const fn target_label(&self) -> &'static str {
+        self.fetcher.target_label()
+    }
+
+    /// How many HTTP/2 connections the transport spreads its GETs over, for startup logging
+    /// (see [`R2ObjectFetcher::connections`]).
+    pub fn connections(&self) -> usize {
+        self.fetcher.connections()
+    }
+
     /// Builds a client from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
     ///
     /// `timeouts` bounds each individual GET (end-to-end and connect). `retry_backoff` paces the
@@ -129,9 +154,33 @@ impl R2WitnessClient {
             access_key_id,
             secret_access_key,
             timeouts,
-            RetryPacing { initial: retry_backoff.initial, max: retry_backoff.max },
+            pacing(&retry_backoff),
             max_concurrent_requests,
         )
+        .map_err(|e| eyre::eyre!(e))?;
+        Ok(Self { fetcher })
+    }
+
+    /// Builds a client that fetches unsigned through a Cloudflare custom domain fronting the
+    /// bucket (h2-multiplexed, edge-cacheable), with optional Cloudflare Access service-token
+    /// headers. The remaining parameters mean what they mean on [`Self::new`].
+    pub fn new_custom_domain(
+        domain: &str,
+        access: Option<CfAccessCredentials>,
+        timeouts: FetchTimeouts,
+        retry_backoff: BackoffPolicy,
+        max_concurrent_requests: Option<usize>,
+        connections: usize,
+    ) -> eyre::Result<Self> {
+        let fetcher = R2ObjectFetcher::new_custom_domain(
+            domain,
+            access,
+            timeouts,
+            pacing(&retry_backoff),
+            max_concurrent_requests,
+            connections,
+        )
+        .map(|fetcher| fetcher.on_version_observed(metrics::record_r2_negotiated_version))
         .map_err(|e| eyre::eyre!(e))?;
         Ok(Self { fetcher })
     }
@@ -177,7 +226,7 @@ impl R2WitnessClient {
             .fetcher
             .get_block_object(number, hash, MAX_ATTEMPTS, None, metrics::on_r2_witness_retry)
             .await?;
-        let bytes = fetched.bytes;
+        let (bytes, queue_wait) = (fetched.bytes, fetched.queue_wait);
 
         // zstd + bincode over a multi-MB witness is CPU-bound; keep it off the runtime.
         let key = || keys::block_object_key(number, hash);
@@ -187,7 +236,7 @@ impl R2WitnessClient {
                 // Queue wait on the self-imposed concurrency cap is subtracted: folded in, it
                 // would masquerade as R2 slowness.
                 metrics::on_r2_witness_fetch_success(
-                    started.elapsed().saturating_sub(fetched.queue_wait).as_secs_f64(),
+                    started.elapsed().saturating_sub(queue_wait).as_secs_f64(),
                     WitnessSizeBreakdown::new(&witness.0, &witness.1),
                 );
                 Ok(witness)
@@ -289,6 +338,50 @@ mod tests {
         assert_eq!(decoded_salt, salt_witness);
         assert_eq!(decoded_mpt, mpt_witness);
         assert_eq!(hits.load(Ordering::SeqCst), 1, "a successful fetch must take exactly one GET");
+    }
+
+    /// The custom-domain client serves the same full-decode path end-to-end, requesting the
+    /// bare `/{key}` layout (no bucket segment, no SigV4 authorization).
+    #[tokio::test]
+    async fn custom_domain_client_decodes_and_requests_bare_key() {
+        let (salt_witness, mpt_witness): (_, MptWitness) =
+            TestFixtures::mainnet_shared().first_paired_witness();
+        let (_, payload) = stateless_common::encode_witness_payload(&salt_witness, &mpt_witness)
+            .expect("fixture witness must encode");
+
+        let (domain, _, heads) =
+            stateless_test_utils::mock_r2::mock_r2_capturing(vec![(200, payload)]).await;
+        let client = R2WitnessClient::new_custom_domain(
+            &domain,
+            None,
+            test_timeouts(),
+            test_backoff(),
+            None,
+            1,
+        )
+        .unwrap();
+        let (decoded_salt, _) =
+            client.get_witness(1, B256::ZERO).await.expect("valid object must fetch and decode");
+        assert_eq!(decoded_salt, salt_witness);
+        let head = heads.lock().unwrap()[0].to_lowercase();
+        assert!(head.starts_with("get /block/0_999/1."), "bucketless key layout: {head}");
+        assert!(!head.contains("authorization:"), "custom-domain GET must be unsigned: {head}");
+    }
+
+    /// Construction errors from the shared fetcher's custom-domain arm surface through the
+    /// same eyre conversion as the S3 arm.
+    #[test]
+    fn custom_domain_rejects_origin_with_path() {
+        let err = R2WitnessClient::new_custom_domain(
+            "https://witness.example.com/witness-mainnet",
+            None,
+            test_timeouts(),
+            test_backoff(),
+            None,
+            1,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Invalid R2 custom domain"));
     }
 
     #[tokio::test]

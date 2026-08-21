@@ -1,43 +1,61 @@
-//! Signed `GET` of witness objects with retry, backoff, and concurrency capping.
+//! `GET` of witness objects with retry, backoff, and concurrency capping.
 //!
 //! [`R2ObjectFetcher`] is the transport core shared by every R2 witness *reader* — the
 //! validator's pipeline source and the debug-trace-server's historical witness source.
-//! It owns exactly the parts whose behavior must not drift between readers: the SigV4-signed
-//! `GET`, the response classification ([`R2GetError`]), the retry loop with jittered
+//! It owns exactly the parts whose behavior must not drift between readers: the `GET`
+//! itself, the response classification ([`R2GetError`]), the retry loop with jittered
 //! exponential backoff, and the in-flight concurrency cap. Everything reader-specific stays
 //! with the caller: payload decoding (full vs light), metrics, and failure pacing policies.
+//!
+//! The fetcher reaches the bucket through one of two targets:
+//! - the bare **S3 API endpoint** ([`R2ObjectFetcher::new`]) — SigV4-signed GETs of
+//!   `/{bucket}/{key}`; the endpoint negotiates HTTP/1.1 only, so every in-flight GET holds its own
+//!   connection;
+//! - a **Cloudflare custom domain** fronting the bucket ([`R2ObjectFetcher::new_custom_domain`]) —
+//!   unsigned GETs of `/{key}` through the CDN edge, which negotiates h2 (many in-flight GETs
+//!   multiplex over a few connections) and can serve the immutable witness objects from edge cache.
+//!   Access control is the domain's business: an IP allowlist needs nothing from this client, and
+//!   Cloudflare Access service tokens ride along as headers via [`CfAccessCredentials`].
 //!
 //! The loop is optionally deadline-aware (see [`R2ObjectFetcher::get_block_object`]).
 
 use std::{
     fmt::Display,
-    sync::Arc,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use chrono::Utc;
-use reqwest::Client;
-use tokio::sync::Semaphore;
+use reqwest::{
+    Client,
+    header::{HeaderMap, HeaderName, HeaderValue},
+};
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::warn;
 
 use crate::{
     client::is_throttle_status,
     endpoint::parse_endpoint,
     keys,
-    sigv4::{SigV4Signer, encode_uri_path},
+    sigv4::{SigV4Signer, encode_key_path, encode_uri_path},
 };
 
 /// Cap on the response body carried inside `Throttled`/`Status` errors.
 const MAX_ERROR_BODY_BYTES: usize = 1024;
 
 /// Default bound on connection establishment (DNS + TCP + TLS). A healthy handshake to the
-/// local anycast edge is ~10-50ms; Cloudflare's per-IP connection mitigation manifests as
-/// handshakes that hang without erroring, so anything past this is that signature (the one
-/// legitimate slow case — a lost SYN retried at the kernel's 1s RTO — is cheaper to abort
-/// and retry on a fresh attempt than to wait out). Keeps a mitigated endpoint from eating
-/// the caller's whole budget before its fallback gets a turn. Operators tune it via the
-/// binaries' `--r2-connect-timeout-ms`.
+/// local anycast edge is ~10-50ms. On the S3 target — where HTTP/1.1 means one connection
+/// per in-flight GET — Cloudflare's per-IP connection mitigation manifests as handshakes
+/// that hang without erroring, so anything past this is that signature (the one legitimate
+/// slow case — a lost SYN retried at the kernel's 1s RTO — is cheaper to abort and retry on
+/// a fresh attempt than to wait out); on the custom-domain target, which holds only a few
+/// multiplexed connections, a slow handshake is ordinary DNS/TCP/TLS trouble. Either way
+/// the bound keeps a wedged endpoint from eating the caller's whole budget before its
+/// fallback gets a turn. Operators tune it via the binaries' `--r2-connect-timeout-ms`.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The two HTTP-level bounds a fetcher applies to every GET attempt, threaded together so
@@ -51,7 +69,8 @@ pub struct FetchTimeouts {
     pub connect: Duration,
 }
 
-/// Failure outcome of a signed witness-object `GET`, after the fetcher's own retries.
+/// Failure outcome of a witness-object `GET`, after the fetcher's own retries. Shared by both
+/// targets: the classification happens on the response, below the signed/unsigned split.
 ///
 /// Decode failures are deliberately absent: the fetcher stops at bytes, and each reader
 /// classifies its own decode errors.
@@ -72,9 +91,10 @@ pub enum R2GetError {
     /// [`R2ObjectFetcher::new`]). Bodies are best-effort and capped.
     Status { number: u64, key: String, status: u16, body: String },
     /// Connection establishment failed or exceeded the connect timeout — distinct from
-    /// [`Self::Transport`] because a hung handshake to the local anycast edge is the
-    /// signature of the per-IP connection-budget mitigation, and operators alert on this
-    /// kind to detect it.
+    /// [`Self::Transport`] because on the S3 target a hung handshake to the local anycast
+    /// edge is the signature of the per-IP connection-budget mitigation, and operators
+    /// alert on this kind to detect it. On the custom-domain target (a few multiplexed h2
+    /// connections) this kind is ordinary DNS/TCP/TLS/edge trouble.
     Connect { number: u64, key: String, source: reqwest::Error },
     /// The caller's deadline expired while the fetch was still queued for a concurrency
     /// permit — under saturation the queue wait must not eat the budget the caller reserved
@@ -184,25 +204,288 @@ pub struct FetchedObject {
     pub queue_wait: Duration,
 }
 
-/// Fetches witness objects from an R2 bucket over the S3 API with SigV4-signed GETs.
+/// Cloudflare Access service-token credentials, sent as the `CF-Access-Client-Id` /
+/// `CF-Access-Client-Secret` headers on every custom-domain GET.
 ///
-/// Cloning is cheap — the `reqwest::Client` and signer are internally reference-counted /
-/// small. `Debug` is safe to derive: [`SigV4Signer`]'s own `Debug` redacts the credentials.
+/// `Debug` redacts both halves: the id alone is enough to look up the token, so it gets the
+/// same treatment as the secret.
+#[derive(Clone)]
+pub struct CfAccessCredentials {
+    /// The service token's client id.
+    pub client_id: String,
+    /// The service token's client secret.
+    pub client_secret: String,
+}
+
+impl CfAccessCredentials {
+    /// Builds the two Access headers, marked sensitive so they are never HPACK-indexed and
+    /// stay redacted in header debug output.
+    ///
+    /// Fails when a value cannot be an HTTP header value — a trailing newline picked up from a
+    /// secret file or an unquoted env line is the usual cause. The offending value is never
+    /// echoed: it is the credential. Validating here turns what would otherwise be a builder
+    /// error raised per GET — classified retryable and so retried forever, with no startup
+    /// failure — into one named error at construction.
+    fn into_header_map(self) -> Result<HeaderMap, String> {
+        let mut headers = HeaderMap::new();
+        for (name, value, flag) in [
+            ("cf-access-client-id", self.client_id, "--r2-access-client-id"),
+            ("cf-access-client-secret", self.client_secret, "--r2-access-client-secret"),
+        ] {
+            let mut value = HeaderValue::from_str(&value).map_err(|_| {
+                format!(
+                    "{flag} is not a valid HTTP header value (control characters — a trailing \
+                     newline from the secret store is the usual cause)"
+                )
+            })?;
+            value.set_sensitive(true);
+            headers.insert(HeaderName::from_static(name), value);
+        }
+        Ok(headers)
+    }
+}
+
+impl std::fmt::Debug for CfAccessCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CfAccessCredentials")
+            .field("client_id", &"[redacted]")
+            .field("client_secret", &"[redacted]")
+            .finish()
+    }
+}
+
+/// How a [`R2ObjectFetcher`] reaches the bucket. `Debug` is safe to derive: the only credential
+/// holder left ([`SigV4Signer`]) redacts itself, and Access tokens live on the client's default
+/// headers rather than here.
+#[derive(Clone, Debug)]
+enum Target {
+    /// SigV4-signed GETs of `/{bucket}/{key}` against the bare S3 API endpoint.
+    S3 {
+        signer: SigV4Signer,
+        /// Endpoint origin (`scheme://host`, no trailing slash).
+        endpoint: String,
+        /// SigV4 canonical host (`host[:port]`).
+        host: String,
+        bucket: String,
+    },
+    /// Unsigned GETs of `/{key}` against a Cloudflare custom domain fronting the bucket.
+    ///
+    /// Any Cloudflare Access service token is attached by the client's default headers, so it
+    /// cannot be bypassed by a request path that does not go through `request_parts`.
+    CustomDomain {
+        /// Domain origin (`scheme://host`, no trailing slash).
+        origin: String,
+    },
+}
+
+/// Parses a target's bare origin, rejecting anything that is not `scheme://host[:port]`.
+///
+/// `label` and `example` name the flag the caller owns, so each target keeps its own error.
+/// The raw input is never echoed back: a rejected shape may carry inline credentials
+/// (userinfo), and this message ends up in startup logs.
+fn parse_target_origin(
+    input: &str,
+    label: &str,
+    example: &str,
+) -> Result<(String, String), String> {
+    let (origin, host) = parse_endpoint(input);
+    if host.is_empty() {
+        return Err(format!(
+            "Invalid R2 {label}: expected a bare scheme://host origin (no path/query/userinfo), \
+             e.g. {example}"
+        ));
+    }
+    // A scheme reqwest cannot drive would pass startup and then fail inside `send()` as a
+    // builder error — classified retryable, so a permanently broken URL would be retried
+    // forever instead of failing once here.
+    if !origin.starts_with("https://") && !origin.starts_with("http://") {
+        return Err(format!(
+            "Invalid R2 {label}: only http and https are supported, e.g. {example}"
+        ));
+    }
+    Ok((origin, host))
+}
+
+/// Idle connections the pool may keep per host when `--r2-max-concurrent-requests` is unset.
+///
+/// Only binds on the degraded HTTP/1.1 path: an h2 pool holds a single connection whatever this
+/// says. There it is what stops `pool_idle_timeout(None)` — set so the multiplexed connection
+/// survives the gaps between request waves — from letting idle sockets accumulate without
+/// bound, which reqwest's `pool_max_idle_per_host` default of `usize::MAX` otherwise allows.
+const MAX_IDLE_CONNECTIONS_PER_HOST: usize = 64;
+
+/// Streams a Cloudflare edge accepts on one HTTP/2 connection: its advertised
+/// `SETTINGS_MAX_CONCURRENT_STREAMS`, which is Cloudflare's default since HTTP/2 Rapid Reset
+/// and was read off the wire on the zone this target was built for.
+pub const CLOUDFLARE_MAX_CONCURRENT_STREAMS: usize = 100;
+
+fn version_label(version: reqwest::Version) -> &'static str {
+    match version {
+        v if v == reqwest::Version::HTTP_09 => "http/0.9",
+        v if v == reqwest::Version::HTTP_10 => "http/1.0",
+        v if v == reqwest::Version::HTTP_11 => "http/1.1",
+        v if v == reqwest::Version::HTTP_2 => "h2",
+        v if v == reqwest::Version::HTTP_3 => "h3",
+        _ => "other",
+    }
+}
+
+/// Whether `host[:port]` names the loopback interface, where plaintext `http` is the mock and
+/// port-forward shape rather than a credential exposure.
+fn is_loopback_host(host: &str) -> bool {
+    let bare = match host.strip_prefix('[') {
+        // IPv6 literal, `[::1]` or `[::1]:8080`.
+        Some(rest) => rest.split(']').next().unwrap_or(rest),
+        None => host.split(':').next().unwrap_or(host),
+    };
+    bare.eq_ignore_ascii_case("localhost") ||
+        bare.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The HTTP client settings both targets share; each constructor adds its own wire posture.
+///
+/// Neither target may follow a redirect. A SigV4-signed GET cannot survive one — reqwest strips
+/// `authorization` on cross-host hops and a same-host hop invalidates the signed URI, so
+/// following just turns the real cause into a baffling 403. A 3xx from a custom domain is
+/// itself the signal (Cloudflare Access bouncing an unauthenticated client to its login page),
+/// which following would bury under an HTML body. Both surface the 3xx as a `Status` error.
+fn base_client(timeouts: FetchTimeouts) -> reqwest::ClientBuilder {
+    Client::builder()
+        .timeout(timeouts.per_attempt)
+        .connect_timeout(timeouts.connect)
+        .redirect(reqwest::redirect::Policy::none())
+}
+
+/// One HTTP client and the permits bounding what that client may carry.
+///
+/// Paired rather than kept as two parallel lists because a permit is only meaningful against
+/// the connection it was taken for: the cap that binds is per connection — the edge limits
+/// concurrent streams per connection, and one client holds exactly one connection.
+#[derive(Debug)]
+struct Connection {
+    http: Client,
+    permits: Semaphore,
+}
+
+/// One fetcher-wide budget divided across `connections`, rounded up.
+///
+/// The single home for that rounding, because three things derive from it — each connection's
+/// permits, its idle-socket bound, and the share the startup advisory reports — and an
+/// advisory that named a share the semaphores did not hand out would be worse than none.
+/// Rounding *up* is deliberate: rounding down would round some connection to zero, and a
+/// connection that can carry nothing is worse than a fetcher-wide total that overshoots by
+/// less than the connection count. Callers normalise `connections` to at least 1 first.
+fn per_connection(budget: usize, connections: usize) -> usize {
+    budget.div_ceil(connections)
+}
+
+/// Each connection's share of the in-flight GET cap: `None` = unlimited, `Some(0)` clamps to 1
+/// — a zero-permit semaphore would wedge every fetch on `acquire()` forever.
+fn per_connection_permits(max_concurrent_requests: Option<usize>, connections: usize) -> usize {
+    max_concurrent_requests
+        .map_or(Semaphore::MAX_PERMITS, |max| per_connection(max, connections.max(1)))
+        .max(1)
+}
+
+/// A version callback that prints as its presence, so the fetcher keeps deriving `Debug`.
+#[derive(Clone)]
+struct VersionObserver(Arc<dyn Fn(&'static str) + Send + Sync>);
+
+impl std::fmt::Debug for VersionObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<observer>")
+    }
+}
+
+/// The connections a fetcher spreads its GETs over, and the cursor that rotates between them.
+///
+/// One object rather than a slice beside a loose counter: the modulo that wraps the cursor is
+/// only meaningful against this slice's length, so the two cannot be allowed to drift apart or
+/// be cloned separately.
+#[derive(Debug)]
+struct ConnectionPool {
+    connections: Box<[Connection]>,
+    next: AtomicUsize,
+}
+
+impl ConnectionPool {
+    /// Builds `connections` clients, each with its share of the in-flight budget.
+    ///
+    /// `connections` is the number of HTTP/2 connections the GETs are spread over, because one
+    /// `reqwest::Client` is one connection to a host and hyper will not open a second when the
+    /// first saturates. Anything past one connection therefore has to be asked for explicitly;
+    /// `0` is read as `1` rather than rejected, matching how the cap treats `Some(0)`.
+    fn build(
+        build: impl Fn() -> reqwest::Result<Client>,
+        connections: usize,
+        max_concurrent_requests: Option<usize>,
+    ) -> Result<Self, String> {
+        let permits = per_connection_permits(max_concurrent_requests, connections);
+        let connections = (0..connections.max(1))
+            .map(|_| {
+                build()
+                    .map(|http| Connection { http, permits: Semaphore::new(permits) })
+                    .map_err(|e| format!("Failed to build R2 HTTP client: {e}"))
+            })
+            .collect::<Result<Box<[Connection]>, _>>()?;
+        Ok(Self { connections, next: AtomicUsize::new(0) })
+    }
+
+    fn len(&self) -> usize {
+        self.connections.len()
+    }
+
+    /// A connection with a free permit and that permit, or — when every connection is full —
+    /// the one to wait on.
+    ///
+    /// Work-conserving on purpose. Committing to the cursor's connection and then waiting on
+    /// *its* semaphore would partition one budget of `max` into `N` budgets of `max/N`, which
+    /// queues distinctly worse at the same offered load, and would leave a GET waiting behind
+    /// a connection whose permits are held by a slow transfer while another sits idle.
+    ///
+    /// The connection to wait on is the cursor's own pick, not the one with the most room:
+    /// under saturation that one is whichever just dropped every GET riding it, so choosing by
+    /// capacity would steer the wait straight into the fault.
+    ///
+    /// Exactly one cursor step per attempt, both outcomes included. Stepping again on the
+    /// full path would advance the cursor by two under saturation, and any stride sharing a
+    /// factor with the connection count then reaches only some of the connections — at 16
+    /// connections, a stride of two leaves half of them never waited on.
+    fn acquire_or_wait_on(&self) -> Result<(&Connection, SemaphorePermit<'_>), &Connection> {
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        for offset in 0..self.len() {
+            let connection = &self.connections[(start + offset) % self.len()];
+            if let Ok(permit) = connection.permits.try_acquire() {
+                return Ok((connection, permit));
+            }
+        }
+        Err(&self.connections[start % self.len()])
+    }
+}
+
+/// Fetches witness objects from an R2 bucket — SigV4-signed over the S3 API, or unsigned
+/// through a Cloudflare custom domain (see the module docs for the two targets).
+///
+/// Cloning is cheap — the `reqwest::Client` and the target's credential holders are
+/// internally reference-counted / small. `Debug` is safe to derive: the target redacts.
 #[derive(Clone, Debug)]
 pub struct R2ObjectFetcher {
-    http: Client,
-    signer: SigV4Signer,
-    /// Endpoint origin (`scheme://host`, no trailing slash).
-    endpoint: String,
-    /// SigV4 canonical host (`host[:port]`).
-    host: String,
-    bucket: String,
+    /// The connections this fetcher spreads its GETs over, each with its own permits. One
+    /// entry unless the caller asked for more. Shared across clones, so clones keep rotating
+    /// over the same connections instead of each starting at zero.
+    pool: Arc<ConnectionPool>,
+    target: Target,
     /// Hard cap on a single GET attempt; with a deadline, each attempt uses
     /// `min(timeouts.per_attempt, remaining)`.
     per_attempt_timeout: Duration,
     pacing: RetryPacing,
-    /// Caps concurrent GETs across all fetches sharing this fetcher.
-    concurrency: Arc<Semaphore>,
+    /// Protocol the first response actually used, empty until one arrives. Shared across
+    /// clones so the degradation warning fires once per fetcher, not per clone.
+    negotiated_version: Arc<OnceLock<&'static str>>,
+    /// Notified with that protocol the once it is learned, for callers that publish it.
+    /// Pushed rather than polled: the fact is knowable exactly once, and a caller that had to
+    /// poll would need its own dedup and would have to remember to poll on failure paths too.
+    on_version_observed: Option<VersionObserver>,
 }
 
 impl R2ObjectFetcher {
@@ -210,6 +493,121 @@ impl R2ObjectFetcher {
     /// policies must stay in sync with the retry ramp (e.g. pausing the ramp's `max`).
     pub const fn pacing(&self) -> RetryPacing {
         self.pacing
+    }
+
+    /// This fetcher's target origin (`scheme://host[:port]`).
+    ///
+    /// Callers log this instead of the flag they were given: the raw operator string can carry
+    /// inline credentials (userinfo), and these lines are info-level.
+    pub fn origin(&self) -> &str {
+        match &self.target {
+            Target::S3 { endpoint, .. } => endpoint,
+            Target::CustomDomain { origin, .. } => origin,
+        }
+    }
+
+    /// Stable lowercase label for the configured target, for callers' metric labels.
+    ///
+    /// Lives here for the same reason [`R2GetError::kind`] does: the vocabulary belongs to the
+    /// enum it names, so a renamed or added target cannot leave a binary publishing a stale
+    /// string that nothing would flag.
+    pub const fn target_label(&self) -> &'static str {
+        match &self.target {
+            Target::S3 { .. } => "s3",
+            Target::CustomDomain { .. } => "custom_domain",
+        }
+    }
+
+    /// The protocol the first response on this fetcher actually used, once one has arrived.
+    ///
+    /// Answers "did the custom domain really give us h2", which the configured target alone
+    /// cannot: version selection is pure ALPN, so a degraded origin looks identical from the
+    /// configuration side.
+    pub fn negotiated_http_version(&self) -> Option<&'static str> {
+        self.negotiated_version.get().copied()
+    }
+
+    /// Registers a callback invoked once, with the protocol of the first response this fetcher
+    /// receives. Chained after construction so the targets that cannot degrade need not pass it.
+    #[must_use]
+    pub fn on_version_observed(
+        mut self,
+        observe: impl Fn(&'static str) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_version_observed = Some(VersionObserver(Arc::new(observe)));
+        self
+    }
+
+    /// The protocol this target is built to speak, so a response that used another one is a
+    /// degradation rather than a surprise. Keeps the check off the response path's control
+    /// flow: without it the observation has to be gated on the target, purely because the
+    /// warning text names one.
+    const fn expected_version(&self) -> reqwest::Version {
+        match self.target {
+            // Pinned `http1_only` at construction, so ALPN cannot move it.
+            Target::S3 { .. } => reqwest::Version::HTTP_11,
+            Target::CustomDomain { .. } => reqwest::Version::HTTP_2,
+        }
+    }
+
+    /// Records the protocol of the first response, warning once if a custom domain did not
+    /// negotiate HTTP/2.
+    ///
+    /// There is deliberately no `http2_prior_knowledge` — it would break the plaintext loopback
+    /// path the mocks and port-forwards rely on — so an h1-only peer simply answers normally and
+    /// nothing else notices. That is the trap worth naming: the three h2 knobs go inert, while
+    /// `pool_idle_timeout(None)` stays in force over an HTTP/1.1 pool, and the target gauge goes
+    /// on asserting the target that was *configured*. Warned once rather than per GET, which at
+    /// this call rate would be thousands of lines a minute.
+    fn observe_version(&self, version: reqwest::Version) {
+        let label = version_label(version);
+        if self.negotiated_version.set(label).is_err() {
+            return; // another response was first; it already warned and notified
+        }
+        if let Some(observe) = &self.on_version_observed {
+            (observe.0)(label);
+        }
+        if version != self.expected_version() {
+            warn!(
+                negotiated = label,
+                origin = self.origin(),
+                "R2 custom domain did not negotiate HTTP/2: the multiplexing this target exists \
+                 for is unavailable, its h2 tuning is inert, and connection reuse now follows \
+                 HTTP/1.1 pooling. Check that the domain is proxied by Cloudflare and that the \
+                 zone has HTTP/2 enabled."
+            );
+        }
+    }
+
+    /// Each connection's share of the configured concurrency, when that share over-subscribes
+    /// the edge's per-connection stream limit — that is, when the limit rather than this
+    /// fetcher's semaphores is what bounds the GETs actually in flight.
+    ///
+    /// One client holds exactly one HTTP/2 connection, and hyper never opens a second one to
+    /// relieve a saturated one: `is_open` on a pooled h2 connection reports liveness, not
+    /// stream capacity, and the dispatch channel behind it is unbounded. So a request past the
+    /// limit does not fail and does not get a connection of its own — it waits inside the
+    /// connection, where the wait is invisible to the caller's queue-wait metric and still
+    /// counts against the per-attempt timeout. Spreading the same concurrency over more
+    /// connections is what actually raises the ceiling, which is why this is measured per
+    /// connection rather than against the fetcher-wide total.
+    ///
+    /// Exactly *at* the limit is the intended sizing, not a misconfiguration: every permit maps
+    /// to a stream slot and nothing queues. Unlimited is not flagged either — it is the
+    /// unconfigured default, and a warning that fires on a default is one operators learn to
+    /// skip.
+    fn concurrency_over_edge_stream_limit(
+        max_concurrent_requests: Option<usize>,
+        connections: usize,
+    ) -> Option<usize> {
+        max_concurrent_requests
+            .map(|max| per_connection(max, connections.max(1)))
+            .filter(|share| *share > CLOUDFLARE_MAX_CONCURRENT_STREAMS)
+    }
+
+    /// How many HTTP/2 connections this fetcher spreads its GETs over.
+    pub fn connections(&self) -> usize {
+        self.pool.len()
     }
 
     /// Builds a fetcher from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
@@ -229,34 +627,147 @@ impl R2ObjectFetcher {
         pacing: RetryPacing,
         max_concurrent_requests: Option<usize>,
     ) -> Result<Self, String> {
-        let (origin, host) = parse_endpoint(endpoint);
-        if host.is_empty() {
-            // The raw input is not echoed: a rejected shape may carry inline credentials
-            // (userinfo), and this message ends up in startup logs.
-            return Err("Invalid R2 endpoint: expected a bare scheme://host origin (no \
-                 path/query/userinfo), e.g. https://<account>.r2.cloudflarestorage.com"
-                .to_string());
-        }
-        let http = Client::builder()
-            .timeout(timeouts.per_attempt)
-            .connect_timeout(timeouts.connect)
-            // A SigV4-signed GET can never survive a redirect (reqwest strips `authorization` on
-            // cross-host hops, and a same-host hop invalidates the signed URI), so following one
-            // just turns the real cause into a baffling 403. Surface the 3xx as a `Status` error.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| format!("Failed to build R2 HTTP client: {e}"))?;
+        let (origin, host) = parse_target_origin(
+            endpoint,
+            "endpoint",
+            "https://<account>.r2.cloudflarestorage.com",
+        )?;
+        // A single connection's worth of clients: the signed endpoint speaks HTTP/1.1, whose
+        // pool already opens a socket per concurrent request, so spreading over more clients
+        // would buy nothing here. Spreading is a custom-domain concern, where multiplexing
+        // means one client is one connection.
+        let pool = ConnectionPool::build(
+            || {
+                base_client(timeouts)
+                    // Pin the S3 target to HTTP/1.1 in the client rather than relying on the
+                    // server's ALPN choice: the endpoint only speaks h1.1 today, and this keeps
+                    // the signed path's wire behavior fixed even if that ever changes upstream.
+                    .http1_only()
+                    .build()
+            },
+            1,
+            max_concurrent_requests,
+        )?;
         Ok(Self {
-            http,
-            signer: SigV4Signer::new(access_key_id, secret_access_key),
-            endpoint: origin,
-            host,
-            bucket,
+            pool: Arc::new(pool),
+            target: Target::S3 {
+                signer: SigV4Signer::new(access_key_id, secret_access_key),
+                endpoint: origin,
+                host,
+                bucket,
+            },
             per_attempt_timeout: timeouts.per_attempt,
             pacing,
-            concurrency: Arc::new(Semaphore::new(
-                max_concurrent_requests.unwrap_or(Semaphore::MAX_PERMITS).max(1),
-            )),
+            negotiated_version: Arc::new(OnceLock::new()),
+            on_version_observed: None,
+        })
+    }
+
+    /// Builds a fetcher that GETs objects unsigned through a Cloudflare custom domain
+    /// fronting the bucket (`https://<domain>/{key}` — no bucket path segment, the domain is
+    /// bucket-scoped).
+    ///
+    /// `access` attaches Cloudflare Access service-token headers to every GET; leave it
+    /// `None` when the domain is locked by an IP allowlist instead. The remaining parameters
+    /// mean exactly what they mean on [`Self::new`]. Fails if the domain is not a bare
+    /// `scheme://host[:port]` origin — the object path is appended by this fetcher, and a
+    /// path-bearing domain would silently double it.
+    ///
+    /// `connections` is how many HTTP/2 connections the GETs are spread over, and
+    /// `max_concurrent_requests` is the in-flight cap across all of them. One is the multiplexed
+    /// shape this target exists for; more than one is how a caller gets past the edge's
+    /// per-connection stream limit, since one client is one connection and hyper opens no
+    /// second one when the first saturates. It is also how a caller stops one connection from
+    /// being a single point of failure: when a connection drops, every GET riding it fails
+    /// together, which matters where R2 has no fallback.
+    ///
+    /// The domain rides Cloudflare's h2-capable edge, so this client differs from the S3 one
+    /// in its HTTP/2 posture (all three knobs are inert on an endpoint that only offers
+    /// http/1.1 via ALPN, which also keeps this constructor honest against a non-h2 origin):
+    /// - adaptive flow-control windows — the defaults are sized well under the bandwidth-delay
+    ///   product of an intercontinental path, and would cap a multi-MB tail object far below the
+    ///   link's actual capacity;
+    /// - keep-alive pings, including while idle — the single multiplexed connection must survive
+    ///   the gaps between request waves, or every wave re-pays the TLS handshake and
+    ///   congestion-window ramp that connection reuse exists to avoid.
+    pub fn new_custom_domain(
+        domain: &str,
+        access: Option<CfAccessCredentials>,
+        timeouts: FetchTimeouts,
+        pacing: RetryPacing,
+        max_concurrent_requests: Option<usize>,
+        connections: usize,
+    ) -> Result<Self, String> {
+        let (origin, host) =
+            parse_target_origin(domain, "custom domain", "https://witness.example.com")?;
+        // An Access service token is a bearer credential; plaintext would put it on the wire in
+        // the clear on every GET. Loopback stays allowed — that is the mock and port-forward
+        // shape, not an exposure.
+        if access.is_some() && origin.starts_with("http://") && !is_loopback_host(&host) {
+            return Err("Refusing to send Cloudflare Access credentials over plaintext http:// \
+                 to a non-loopback host: give --r2-custom-domain an https:// origin"
+                .to_string());
+        }
+        // Built once and cloned per client: `into_header_map` validates the credential, and
+        // failing that validation is a property of the credential, not of a given connection.
+        let headers = access.map(CfAccessCredentials::into_header_map).transpose()?;
+        let connections = connections.max(1);
+        // Each client's own idle bound: the fetcher-wide bound divided the same way the permits
+        // are, so holding more clients cannot multiply the sockets the h1.1 fallback may keep.
+        let idle_per_client = per_connection(
+            max_concurrent_requests.unwrap_or(MAX_IDLE_CONNECTIONS_PER_HOST),
+            connections,
+        );
+        let build = || {
+            let mut builder = base_client(timeouts)
+                // Cloudflare's Browser Integrity Check, on by default on many zones, challenges
+                // requests that carry no user agent — which would arrive here as a non-retryable
+                // 403 on every GET. It also makes this traffic attributable in zone analytics.
+                .user_agent(concat!("stateless-r2/", env!("CARGO_PKG_VERSION")))
+                .http2_adaptive_window(true)
+                .http2_keep_alive_interval(Duration::from_secs(30))
+                .http2_keep_alive_while_idle(true)
+                // Keep-alive pings hold the connection open at the protocol level, but the pool
+                // reaps idle connections on a 90s default of its own — shorter than the gaps
+                // between request waves that these multiplexed connections exist to survive.
+                .pool_idle_timeout(None)
+                // Paired with the line above: without an idle timeout, an unbounded idle pool
+                // would never release a socket. Inert on h2 (one connection per client); the
+                // bound that matters is on the h1.1 path this client silently falls back to
+                // against a non-h2 origin.
+                .pool_max_idle_per_host(idle_per_client)
+                // Stated rather than inherited: with keep-alive pings on, this is what bounds
+                // how long a blackholed connection keeps accepting doomed streams.
+                .http2_keep_alive_timeout(Duration::from_secs(20));
+            if let Some(headers) = &headers {
+                // On the client, not per attempt: authentication is then a property of every
+                // request this fetcher makes, and an unusable credential fails at construction
+                // instead of once per GET as a retryable transport error.
+                builder = builder.default_headers(headers.clone());
+            }
+            builder.build()
+        };
+        if let Some(per_connection) =
+            Self::concurrency_over_edge_stream_limit(max_concurrent_requests, connections)
+        {
+            warn!(
+                per_connection,
+                connections = connections.max(1),
+                edge_stream_limit = CLOUDFLARE_MAX_CONCURRENT_STREAMS,
+                "R2 custom-domain concurrency over-subscribes the edge's per-connection HTTP/2 \
+                 stream limit: the surplus queues inside the connection rather than on the \
+                 semaphore, where the wait escapes the queue-wait metric and still counts \
+                 against the per-attempt timeout. Lower the concurrency or raise the \
+                 connection count."
+            );
+        }
+        Ok(Self {
+            pool: Arc::new(ConnectionPool::build(build, connections, max_concurrent_requests)?),
+            target: Target::CustomDomain { origin },
+            per_attempt_timeout: timeouts.per_attempt,
+            pacing,
+            negotiated_version: Arc::new(OnceLock::new()),
+            on_version_observed: None,
         })
     }
 
@@ -291,21 +802,35 @@ impl R2ObjectFetcher {
             // waste capacity other fetches could use.
             let outcome = {
                 let queued = Instant::now();
-                // A deadline bounds the queue wait too: under saturation the caller's budget
-                // must stay available for its fallback, not drain waiting for a permit.
-                let permit = match deadline {
-                    None => self.concurrency.acquire().await,
-                    Some(d) => {
-                        match tokio::time::timeout_at(d.into(), self.concurrency.acquire()).await {
-                            Ok(acquired) => acquired,
-                            Err(_) => return Err(R2GetError::Deadline { number, key }),
-                        }
+                // The connection is chosen per attempt, not per fetch, so a retry lands on a
+                // different one than the attempt that just failed: one client is one
+                // connection, so retrying onto the same one retries into the same fault.
+                let (connection, permit) = match self.pool.acquire_or_wait_on() {
+                    Ok(taken) => taken,
+                    // Every connection full. A deadline bounds this wait too, since under
+                    // saturation the caller's budget must stay available for its fallback
+                    // rather than drain here.
+                    Err(connection) => {
+                        let waited = match deadline {
+                            None => connection.permits.acquire().await,
+                            Some(d) => {
+                                match tokio::time::timeout_at(
+                                    d.into(),
+                                    connection.permits.acquire(),
+                                )
+                                .await
+                                {
+                                    Ok(acquired) => acquired,
+                                    Err(_) => return Err(R2GetError::Deadline { number, key }),
+                                }
+                            }
+                        };
+                        (connection, waited.expect("semaphore is never closed"))
                     }
-                }
-                .expect("semaphore is never closed");
+                };
                 queue_wait += queued.elapsed();
                 let _permit = permit;
-                self.get_object(number, &key, deadline).await
+                self.get_object(connection, number, &key, deadline).await
             };
             match outcome {
                 Ok(bytes) => return Ok(FetchedObject { bytes, queue_wait }),
@@ -334,28 +859,44 @@ impl R2ObjectFetcher {
         }
     }
 
-    /// Performs one SigV4-signed GET and classifies the response. No retry.
+    /// Builds one attempt's request for this fetcher's target: the signed S3 layout
+    /// (`/{bucket}/{key}` plus freshly-signed SigV4 headers) or the unsigned custom-domain
+    /// layout (`/{key}`, whose only credentials are the client's default headers).
+    ///
+    /// Called per attempt because a SigV4 signature is timestamped and cannot be reused.
+    fn request(&self, connection: &Connection, key: &str) -> reqwest::RequestBuilder {
+        let http = &connection.http;
+        match &self.target {
+            Target::S3 { signer, endpoint, host, bucket } => {
+                let canonical_uri = encode_uri_path(bucket, key);
+                // Signed-payload mode with an empty body: x-amz-content-sha256 = sha256("").
+                let signed = signer.sign("GET", host, &canonical_uri, "", &[], b"", Utc::now());
+                signed.into_iter().fold(
+                    http.get(format!("{endpoint}{canonical_uri}")),
+                    |request, (name, value)| request.header(name, value),
+                )
+            }
+            Target::CustomDomain { origin } => {
+                http.get(format!("{origin}{}", encode_key_path(key)))
+            }
+        }
+    }
+
+    /// Performs one GET against this fetcher's target and classifies the response. No retry.
     async fn get_object(
         &self,
+        connection: &Connection,
         number: u64,
         key: &str,
         deadline: Option<Instant>,
     ) -> Result<Bytes, R2GetError> {
-        let canonical_uri = encode_uri_path(&self.bucket, key);
-        let url = format!("{}{}", self.endpoint, canonical_uri);
-        // Signed-payload mode with an empty body: x-amz-content-sha256 = sha256("").
-        let signed = self.signer.sign("GET", &self.host, &canonical_uri, "", &[], b"", Utc::now());
-
-        let mut request = self.http.get(&url);
+        let mut request = self.request(connection, key);
         // Clamp the attempt to the remaining budget; an already-expired deadline degrades to
         // a floor timeout whose transport error the retry loop then surfaces as out-of-time.
         if let Some(deadline) = deadline {
             let remaining =
                 deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1));
             request = request.timeout(self.per_attempt_timeout.min(remaining));
-        }
-        for (name, value) in signed {
-            request = request.header(name, value);
         }
         let transport = |source: reqwest::Error| {
             let key = key.to_string();
@@ -366,6 +907,7 @@ impl R2ObjectFetcher {
             }
         };
         let response = request.send().await.map_err(transport)?;
+        self.observe_version(response.version());
 
         let status = response.status();
         if status.is_success() {
@@ -388,7 +930,9 @@ impl R2ObjectFetcher {
         // parsing the S3 XML error code. A 404 with no parseable code (a proxy's bare 404, a
         // truncated body) still counts as Missing: for a correctly configured endpoint that is
         // by far the likeliest cause, and misreading a config error as Missing only changes
-        // the caller's metric kind, not the retry behavior.
+        // the caller's metric kind, not the retry behavior. Custom-domain 404s carry no S3
+        // XML at all, so they classify as Missing through that same arm — also the right
+        // default there, where an absent object is the only routine 404.
         if code == 404 && s3_error_code(&body).is_none_or(|c| c == "NoSuchKey") {
             return Err(R2GetError::Missing { number, key: key.to_string() });
         }
@@ -414,7 +958,7 @@ fn s3_error_code(body: &str) -> Option<&str> {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use stateless_test_utils::mock_r2::{mock_r2, mock_r2_held};
+    use stateless_test_utils::mock_r2::{mock_r2, mock_r2_capturing, mock_r2_held};
 
     use super::*;
 
@@ -673,6 +1217,412 @@ mod tests {
             started.elapsed(),
         );
         let _ = holder.await;
+    }
+
+    fn try_custom_fetcher(
+        domain: &str,
+        access: Option<CfAccessCredentials>,
+    ) -> Result<R2ObjectFetcher, String> {
+        R2ObjectFetcher::new_custom_domain(domain, access, test_timeouts(), test_pacing(), None, 1)
+    }
+
+    fn custom_fetcher(domain: &str, access: Option<CfAccessCredentials>) -> R2ObjectFetcher {
+        try_custom_fetcher(domain, access).unwrap()
+    }
+
+    fn custom_fetcher_with(
+        domain: &str,
+        max: Option<usize>,
+        connections: usize,
+    ) -> R2ObjectFetcher {
+        R2ObjectFetcher::new_custom_domain(
+            domain,
+            None,
+            test_timeouts(),
+            test_pacing(),
+            max,
+            connections,
+        )
+        .unwrap()
+    }
+
+    /// A credential that cannot be a header value fails at construction, by flag name and
+    /// without echoing the value. Left to `send()` it becomes a reqwest builder error, which
+    /// classifies as retryable `Transport` — so every GET would burn the full retry ramp
+    /// forever and no startup failure would ever name the real cause.
+    #[test]
+    fn access_credential_with_a_control_byte_fails_construction_without_echoing_it() {
+        let err = try_custom_fetcher(
+            "https://witness.example.com",
+            Some(CfAccessCredentials {
+                client_id: "tok-3f1.access".to_string(),
+                // The shape of `$(cat secret.txt)` or an unquoted env-file line.
+                client_secret: "sec-9a2\n".to_string(),
+            }),
+        )
+        .expect_err("a trailing newline cannot be a header value");
+        assert!(err.contains("--r2-access-client-secret"), "{err}");
+        assert!(!err.contains("sec-9a2"), "the secret must never reach a log line: {err}");
+    }
+
+    /// An IPv6 loopback origin is still loopback. `Url::host_str` keeps the brackets on an
+    /// IPv6 host, so the origin `parse_endpoint` rebuilds stays a parseable authority and the
+    /// loopback check still recognises it — a plaintext port-forward to `[::1]` is the same
+    /// mock shape as `127.0.0.1` and must not be refused as an exposure.
+    #[test]
+    fn ipv6_loopback_origins_survive_the_round_trip() {
+        let creds = || {
+            Some(CfAccessCredentials {
+                client_id: "tok-3f1.access".to_string(),
+                client_secret: "sec-9a2".to_string(),
+            })
+        };
+        for origin in ["http://[::1]:8080", "http://[::1]"] {
+            let f = try_custom_fetcher(origin, creds())
+                .unwrap_or_else(|e| panic!("{origin} must be accepted as loopback: {e}"));
+            assert_eq!(f.origin(), origin, "brackets must survive the origin rebuild");
+        }
+        // The non-loopback IPv6 case still refuses plaintext credentials.
+        let err = try_custom_fetcher("http://[2001:db8::1]:8080", creds())
+            .expect_err("a public IPv6 host over plaintext must be refused");
+        assert!(err.contains("plaintext"), "{err}");
+    }
+
+    /// Access tokens are bearer credentials, so a plaintext non-loopback origin is refused
+    /// rather than putting them on the wire in the clear on every GET.
+    #[test]
+    fn access_credentials_are_refused_over_plaintext_to_a_remote_host() {
+        let access = || {
+            Some(CfAccessCredentials {
+                client_id: "tok-3f1.access".to_string(),
+                client_secret: "sec-9a2".to_string(),
+            })
+        };
+        let err = try_custom_fetcher("http://witness.example.com", access())
+            .expect_err("plaintext + credentials to a remote host must be refused");
+        assert!(err.contains("plaintext"), "{err}");
+
+        // Loopback stays usable: that is the mock and port-forward shape, and every
+        // custom-domain test here depends on it.
+        for loopback in ["http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080"] {
+            try_custom_fetcher(loopback, access())
+                .unwrap_or_else(|e| panic!("{loopback} must be allowed: {e}"));
+        }
+        // Plaintext without credentials has nothing to leak.
+        custom_fetcher("http://witness.example.com", None);
+    }
+
+    /// A scheme reqwest cannot drive is rejected at construction on both targets; left alone it
+    /// surfaces per GET as a retryable transport error, retrying a permanently broken URL.
+    #[test]
+    fn non_http_schemes_are_rejected_on_both_targets() {
+        let custom =
+            try_custom_fetcher("ftp://witness.example.com", None).expect_err("ftp is not drivable");
+        assert!(custom.contains("only http and https"), "{custom}");
+
+        let s3 = R2ObjectFetcher::new(
+            "ftp://acc.r2.cloudflarestorage.com",
+            "witness-mainnet".to_string(),
+            "ak".to_string(),
+            "sk".to_string(),
+            test_timeouts(),
+            test_pacing(),
+            None,
+        )
+        .expect_err("ftp is not drivable");
+        assert!(s3.contains("only http and https"), "{s3}");
+    }
+
+    /// The custom-domain target degrades to HTTP/1.1 in silence against any origin that does
+    /// not offer h2 over ALPN — and every mock in this suite is exactly such an origin, so the
+    /// green tests here *are* the degraded path. Pinning that keeps it visible: the protocol
+    /// actually negotiated is observable, rather than inferred from the configured target.
+    #[tokio::test]
+    async fn custom_domain_reports_the_protocol_it_actually_negotiated() {
+        let (domain, _hits) = mock_r2(vec![(200, "witness bytes")]).await;
+        let fetcher = custom_fetcher(&domain, None);
+        assert_eq!(fetcher.negotiated_http_version(), None, "nothing observed before a request");
+
+        fetcher
+            .get_block_object(2500, "0xblock", MAX_ATTEMPTS, None, || ())
+            .await
+            .expect("200 must succeed");
+        assert_eq!(
+            fetcher.negotiated_http_version(),
+            Some("http/1.1"),
+            "the plaintext mock cannot offer h2, and that must be visible rather than assumed"
+        );
+    }
+
+    /// The advisory covers over-subscription only, and measures it per connection — spreading
+    /// the same concurrency over more connections is precisely the fix, so it must clear the
+    /// warning. Exactly at the limit every permit maps to a stream slot, which is the sizing
+    /// the flag documentation asks for; warning there would fire on a correct configuration,
+    /// and warning on unlimited would fire on the default.
+    #[test]
+    fn edge_stream_limit_advisory_covers_per_connection_over_subscription() {
+        let over = R2ObjectFetcher::concurrency_over_edge_stream_limit;
+        const LIMIT: usize = CLOUDFLARE_MAX_CONCURRENT_STREAMS;
+        assert_eq!(over(None, 1), None, "unlimited is the default, not a misconfiguration");
+        assert_eq!(over(Some(LIMIT), 1), None, "at the limit is the intended sizing");
+        assert_eq!(
+            over(Some(LIMIT + 1), 1),
+            Some(LIMIT + 1),
+            "one past the limit is one GET queued where the queue cannot be seen"
+        );
+        assert_eq!(over(Some(4 * LIMIT), 4), None, "spreading it over four connections fits");
+        assert_eq!(
+            over(Some(4 * LIMIT + 4), 4),
+            Some(LIMIT + 1),
+            "the warning reports the per-connection share, not the configured total"
+        );
+        assert_eq!(over(Some(LIMIT + 1), 0), Some(LIMIT + 1), "zero connections is read as one");
+    }
+
+    /// The cap is fetcher-wide and the semaphores are per connection, so the split has to round
+    /// up: rounding down would give some connection zero permits and wedge every GET routed to
+    /// it, which is a worse failure than a total that overshoots by less than the connection
+    /// count.
+    #[test]
+    fn concurrency_splits_across_connections_rounding_up() {
+        assert_eq!(per_connection_permits(Some(48), 8), 6, "an even split is exact");
+        assert_eq!(per_connection_permits(Some(3), 4), 1, "never zero, so no connection wedges");
+        assert_eq!(per_connection_permits(Some(0), 1), 1, "a zero cap clamps rather than wedges");
+        assert_eq!(per_connection_permits(Some(10), 0), 10, "zero connections is read as one");
+        assert_eq!(
+            per_connection_permits(None, 8),
+            Semaphore::MAX_PERMITS,
+            "unlimited stays unlimited per connection rather than being divided into a cap"
+        );
+    }
+
+    /// Round-robin, and per attempt rather than per fetch: a retry has to be able to leave a
+    /// connection that just failed, since one connection is one client and a dropped connection
+    /// takes every GET riding it down together.
+    #[tokio::test]
+    async fn connections_are_handed_out_round_robin() {
+        let fetcher = custom_fetcher_with("https://witness.example.com", Some(12), 3);
+        assert_eq!(fetcher.connections(), 3);
+        let taken: Vec<_> =
+            (0..6).map(|_| fetcher.pool.acquire_or_wait_on().expect("free")).collect();
+        let cycle: Vec<*const Connection> =
+            taken.iter().map(|(connection, _)| std::ptr::from_ref(*connection)).collect();
+        assert_eq!(cycle[..3], cycle[3..], "the cursor wraps rather than drifting");
+        assert_eq!(
+            cycle[..3].iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "consecutive attempts land on distinct connections"
+        );
+    }
+
+    /// The deployment shape this flag exists for — 16 connections under a cap of 1024 — must
+    /// spread evenly, both while filling and once saturated.
+    ///
+    /// The saturated half is the one worth pinning. Handing out a connection and choosing the
+    /// one to wait on used to be two calls, so a saturated attempt stepped the cursor twice,
+    /// and a stride sharing a factor with the connection count reaches only some of them:
+    /// at 16 connections a stride of two left half of them never waited on, while the other
+    /// half took every waiter.
+    #[tokio::test]
+    async fn a_saturated_pool_spreads_evenly_over_every_connection() {
+        const CONNECTIONS: usize = 16;
+        const CAP: usize = 1024;
+        let share = CAP / CONNECTIONS;
+
+        let fetcher = custom_fetcher_with("https://witness.example.com", Some(CAP), CONNECTIONS);
+        let base = std::ptr::from_ref(&fetcher.pool.connections[0]) as usize;
+        let index = |c: &Connection| {
+            (std::ptr::from_ref(c) as usize - base) / std::mem::size_of::<Connection>()
+        };
+
+        // Filling to the cap: the permits divide exactly, so every connection must end at its
+        // share — anything else means the cap leaked or a connection was skipped.
+        let mut held = Vec::new();
+        let mut taken = [0usize; CONNECTIONS];
+        for _ in 0..CAP {
+            let (connection, permit) =
+                fetcher.pool.acquire_or_wait_on().expect("room below the cap");
+            taken[index(connection)] += 1;
+            held.push(permit);
+        }
+        assert_eq!(taken, [share; CONNECTIONS], "the cap must divide evenly across connections");
+
+        // Saturated: every further arrival is told which connection to wait on, and those must
+        // rotate over all of them rather than a subset.
+        let mut waiting = [0usize; CONNECTIONS];
+        for _ in 0..CONNECTIONS * 4 {
+            let connection =
+                fetcher.pool.acquire_or_wait_on().expect_err("the cap is fully subscribed");
+            waiting[index(connection)] += 1;
+        }
+        assert_eq!(waiting, [4; CONNECTIONS], "waiters must rotate over every connection");
+    }
+
+    /// A full connection is skipped rather than queued behind.
+    ///
+    /// Committing to the cursor's pick and then waiting on its semaphore would partition one
+    /// budget of `max` into `N` budgets of `max/N` — distinctly worse queueing at the same
+    /// offered load — and would strand a GET behind a connection whose permits are held by a
+    /// slow transfer while another connection sits idle.
+    #[tokio::test]
+    async fn a_saturated_connection_is_skipped_while_another_has_room() {
+        // Two connections, one permit each.
+        let fetcher = custom_fetcher_with("https://witness.example.com", Some(2), 2);
+        let (first, _first_permit) = fetcher.pool.acquire_or_wait_on().expect("both free");
+
+        let (second, _second_permit) = fetcher.pool.acquire_or_wait_on().expect("one still free");
+        assert!(!std::ptr::eq(first, second), "the free connection is the one handed out");
+
+        assert!(
+            fetcher.pool.acquire_or_wait_on().is_err(),
+            "with both full, nothing is handed out"
+        );
+        // And the cursor still names one to wait on rather than deadlocking the caller.
+        assert!(fetcher.pool.acquire_or_wait_on().unwrap_err().permits.try_acquire().is_err());
+    }
+
+    /// Cloudflare's Browser Integrity Check challenges user-agent-less requests, which would
+    /// arrive as a non-retryable 403 on every GET — and the validator's R2 mode has no fallback.
+    #[tokio::test]
+    async fn custom_domain_sends_a_user_agent() {
+        let (domain, _hits, heads) = mock_r2_capturing(vec![(200, "witness bytes")]).await;
+        custom_fetcher(&domain, None)
+            .get_block_object(2500, "0xblock", MAX_ATTEMPTS, None, || ())
+            .await
+            .expect("200 must succeed");
+        let head = heads.lock().unwrap()[0].to_lowercase();
+        assert!(head.contains("user-agent: stateless-r2/"), "{head}");
+    }
+
+    #[test]
+    fn custom_domain_rejects_origin_with_path() {
+        // The fetcher appends the object path itself; a path-bearing domain would silently
+        // double it, so construction must fail fast (same policy as the S3 endpoint).
+        let err =
+            try_custom_fetcher("https://witness.example.com/witness-mainnet", None).unwrap_err();
+        assert!(err.contains("Invalid R2 custom domain"), "{err}");
+    }
+
+    /// The custom-domain wire shape: `GET /{key}` with no bucket segment, no SigV4
+    /// `authorization`, and no Access headers unless configured.
+    #[tokio::test]
+    async fn custom_domain_gets_bare_key_path_unsigned() {
+        let (domain, hits, heads) = mock_r2_capturing(vec![(200, "witness bytes")]).await;
+        let fetched = custom_fetcher(&domain, None)
+            .get_block_object(2500, "0xblock", MAX_ATTEMPTS, None, || ())
+            .await
+            .expect("200 must succeed");
+        assert_eq!(fetched.bytes.as_ref(), b"witness bytes");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let head = heads.lock().unwrap()[0].to_lowercase();
+        assert!(head.starts_with("get /block/2000_2999/2500.0xblock http/1.1\r\n"), "{head}");
+        assert!(!head.contains("authorization:"), "custom-domain GET must be unsigned: {head}");
+        assert!(!head.contains("cf-access-client-id:"), "no Access headers configured: {head}");
+    }
+
+    /// The S3 wire shape stays what it was: `GET /{bucket}/{key}` carrying a SigV4
+    /// `authorization` header — pinned so the custom-domain arm can never bleed into it.
+    #[tokio::test]
+    async fn s3_get_prefixes_the_bucket_and_signs() {
+        let (endpoint, _, heads) = mock_r2_capturing(vec![(200, "witness bytes")]).await;
+        fetcher(&endpoint)
+            .get_block_object(2500, "0xblock", MAX_ATTEMPTS, None, || ())
+            .await
+            .expect("200 must succeed");
+        let head = heads.lock().unwrap()[0].to_lowercase();
+        assert!(
+            head.starts_with("get /witness-test/block/2000_2999/2500.0xblock http/1.1\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("authorization: aws4-hmac-sha256"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn custom_domain_sends_access_headers_when_configured() {
+        let (domain, _, heads) = mock_r2_capturing(vec![(200, "ok")]).await;
+        let access = CfAccessCredentials {
+            client_id: "tok-3f1.access".to_string(),
+            client_secret: "sec-9a2".to_string(),
+        };
+        custom_fetcher(&domain, Some(access))
+            .get_block_object(1, "0xhash", 1, None, || ())
+            .await
+            .expect("200 must succeed");
+        let head = heads.lock().unwrap()[0].to_lowercase();
+        assert!(head.contains("cf-access-client-id: tok-3f1.access"), "{head}");
+        assert!(head.contains("cf-access-client-secret: sec-9a2"), "{head}");
+        assert!(!head.contains("authorization:"), "{head}");
+    }
+
+    /// The custom-domain client shares the no-redirect policy: a 3xx (the shape of a
+    /// Cloudflare Access login bounce) must surface as `Status`, not be followed into an
+    /// HTML page.
+    #[tokio::test]
+    async fn custom_domain_redirects_are_not_followed() {
+        let (domain, hits) = mock_r2(vec![(302, "login bounce")]).await;
+        let err = custom_fetcher(&domain, None)
+            .get_block_object(1, "0xhash", MAX_ATTEMPTS, None, || ())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, R2GetError::Status { status: 302, .. }), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    /// Credentials are rebuilt per attempt: the retry after a throttle must still carry the
+    /// Access pair (custom domain) / a fresh SigV4 authorization (S3) — pinned so a future
+    /// hoist of header construction out of the attempt loop cannot silently strip retries.
+    #[tokio::test]
+    async fn retries_resend_credentials() {
+        let (domain, hits, heads) = mock_r2_capturing(vec![(503, "slow"), (200, "ok")]).await;
+        let access = CfAccessCredentials {
+            client_id: "tok-3f1.access".to_string(),
+            client_secret: "sec-9a2".to_string(),
+        };
+        custom_fetcher(&domain, Some(access))
+            .get_block_object(1, "0xhash", MAX_ATTEMPTS, None, || ())
+            .await
+            .expect("retry must succeed");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let retry_head = heads.lock().unwrap()[1].to_lowercase();
+        assert!(retry_head.contains("cf-access-client-id: tok-3f1.access"), "{retry_head}");
+        assert!(retry_head.contains("cf-access-client-secret: sec-9a2"), "{retry_head}");
+
+        let (endpoint, hits, heads) = mock_r2_capturing(vec![(503, "slow"), (200, "ok")]).await;
+        fetcher(&endpoint)
+            .get_block_object(1, "0xhash", MAX_ATTEMPTS, None, || ())
+            .await
+            .expect("retry must succeed");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let retry_head = heads.lock().unwrap()[1].to_lowercase();
+        assert!(retry_head.contains("authorization: aws4-hmac-sha256"), "{retry_head}");
+    }
+
+    /// A custom-domain 404 carries no S3 XML; the bare body must classify as `Missing`.
+    #[tokio::test]
+    async fn custom_domain_bare_404_is_missing() {
+        let (domain, hits) = mock_r2(vec![(404, "<html>not found</html>")]).await;
+        let err = custom_fetcher(&domain, None)
+            .get_block_object(1, "0xhash", MAX_ATTEMPTS, None, || ())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, R2GetError::Missing { .. }), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "404 must not be retried");
+    }
+
+    /// Neither Access half may leak through `Debug` — the fetcher (and its target) end up in
+    /// startup logs via `Debug` formatting.
+    #[test]
+    fn access_credentials_never_leak_through_debug() {
+        let access = CfAccessCredentials {
+            client_id: "tok-3f1.access".to_string(),
+            client_secret: "sec-9a2".to_string(),
+        };
+        let direct = format!("{access:?}");
+        let via_fetcher = format!("{:?}", custom_fetcher("https://w.example.com", Some(access)));
+        for rendered in [direct, via_fetcher] {
+            assert!(!rendered.contains("tok-3f1"), "{rendered}");
+            assert!(!rendered.contains("sec-9a2"), "{rendered}");
+        }
     }
 
     /// Six concurrent fetches against a limit of 2 must never exceed two in-flight GETs.

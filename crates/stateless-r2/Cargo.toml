@@ -19,10 +19,16 @@ percent-encoding.workspace = true
 # Pinned explicitly (not workspace-inherited): `put_object` exposes `&reqwest::Client`, so the
 # reqwest major is part of this crate's API and must match mega-reth's workspace (0.12). Bumping
 # it is a coordinated two-repo change that a workspace-wide bump must not ride over.
-# No `http2` feature: R2's bare S3 endpoint negotiates HTTP/1.1 only (ALPN-verified live),
-# so h2 buys these paths nothing today. Revisit alongside the R2 custom-domain work, which
-# does ride an h2-capable stack.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# `http2` enables ALPN h2 for endpoints that offer it. R2's bare S3 endpoint negotiates
+# HTTP/1.1 only (by design — ALPN-verified live; the S3 fetcher additionally pins
+# `http1_only`), but R2 **custom domains** ride the regular CDN stack and do speak h2,
+# where many in-flight GETs multiplex over a few connections instead of holding one each.
+# Note: Cargo feature unification propagates `http2` to every reqwest client in this workspace
+# and in consuming ones (including mega-reth's on the coordinated bump) — those clients start
+# *offering* h2 via ALPN, and an endpoint that accepts it gets one shared, non-adaptive h2
+# connection per host. Clients that should not move must say so: this crate's S3 fetcher and
+# `stateless-common`'s shared JSON-RPC client both pin `http1_only`.
+reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls"] }
 sha2.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true, features = ["std"] }

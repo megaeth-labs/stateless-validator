@@ -8,7 +8,8 @@ use alloy_rpc_types_eth::BlockId;
 use clap::{Parser, ValueEnum};
 use eyre::Result;
 use stateless_common::{
-    BackoffPolicy, RedactedSecret, RpcClient, RpcClientConfig, logging::LogArgs,
+    BackoffPolicy, R2CountFlag, R2Flag, R2Flags, R2Target, RedactedSecret, RpcClient,
+    RpcClientConfig, logging::LogArgs, validate_r2_flags,
 };
 use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::BlockMeta};
 use stateless_db::ContractCache;
@@ -23,7 +24,8 @@ pub enum WitnessSource {
     /// `mega_getBlockWitness` RPC.
     #[default]
     Rpc,
-    /// Straight from the R2 bucket over the S3 API. Requires the `--r2-*` flags.
+    /// Straight from the R2 bucket: either the signed S3 API (`--r2-endpoint` and its
+    /// credential quad) or an unsigned Cloudflare custom domain (`--r2-custom-domain`).
     R2,
 }
 
@@ -96,34 +98,86 @@ pub struct CommandLineArgs {
     pub witness_source: WitnessSource,
 
     /// R2 S3 endpoint origin, e.g. `https://<account>.r2.cloudflarestorage.com` (no bucket path).
-    /// Required when `--witness-source r2`.
+    /// Required when `--witness-source r2`, unless `--r2-custom-domain` is used instead
+    /// (mutually exclusive — rejected at startup with an error naming both).
     #[clap(long, env = "STATELESS_VALIDATOR_R2_ENDPOINT")]
     pub r2_endpoint: Option<String>,
 
-    /// R2 bucket holding the witnesses (e.g. `witness-mainnet`). Required when `--witness-source
-    /// r2`.
+    /// Cloudflare custom domain fronting the witness bucket, e.g. `https://witness.example.com`
+    /// (bare origin — objects are fetched as `/{key}`). Alternative to the `--r2-endpoint`
+    /// credential quad with `--witness-source r2`: GETs go unsigned through the CDN edge, which
+    /// multiplexes them over HTTP/2 and can serve the immutable witness objects from edge cache.
+    /// ⚠ R2 mode has no RPC fallback and retries a missing witness until the uploader wins the
+    /// race, so **any edge cache rule making these objects cacheable must set 404s to bypass
+    /// cache** — an edge-cached 404 would otherwise pin every pre-upload frontier miss for the
+    /// negative-cache TTL and stall tip-following for minutes at a time.
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_CUSTOM_DOMAIN")]
+    pub r2_custom_domain: Option<String>,
+
+    /// Cloudflare Access service-token client id, sent as `CF-Access-Client-Id` on every
+    /// custom-domain GET. Omit when the domain is locked by an IP allowlist instead.
+    /// Redacted like the secret: the id alone is enough to look up the token.
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_ID")]
+    pub r2_access_client_id: Option<RedactedSecret>,
+
+    /// Cloudflare Access service-token client secret, sent as `CF-Access-Client-Secret`. Prefer
+    /// the env var over the flag.
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_SECRET")]
+    pub r2_access_client_secret: Option<RedactedSecret>,
+
+    /// R2 bucket holding the witnesses (e.g. `witness-mainnet`). Required for the S3-endpoint
+    /// target of `--witness-source r2` (not used with `--r2-custom-domain`).
     #[clap(long, env = "STATELESS_VALIDATOR_R2_BUCKET")]
     pub r2_bucket: Option<String>,
 
-    /// R2 access key id (Object Read). Required when `--witness-source r2`.
+    /// R2 access key id (Object Read). Required for the S3-endpoint target of
+    /// `--witness-source r2` (not used with `--r2-custom-domain`).
     #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_KEY_ID")]
     pub r2_access_key_id: Option<String>,
 
-    /// R2 secret access key. Required when `--witness-source r2`. Prefer the env var over the
-    /// flag.
+    /// R2 secret access key. Required for the S3-endpoint target of `--witness-source r2`
+    /// (not used with `--r2-custom-domain`). Prefer the env var over the flag.
     #[clap(long, env = "STATELESS_VALIDATOR_R2_SECRET_ACCESS_KEY")]
     pub r2_secret_access_key: Option<RedactedSecret>,
 
     /// R2 connection-establishment timeout (milliseconds). A healthy handshake to the local
-    /// anycast edge is tens of ms; hangs past this are the per-IP connection-budget
-    /// mitigation's signature and surface as retryable `connect`-kind errors.
+    /// anycast edge is tens of ms. On the S3 endpoint, hangs past this are the per-IP
+    /// connection-budget mitigation's signature and keep landing in the connect phase, since
+    /// every in-flight GET holds its own connection; they surface as retryable `connect`-kind
+    /// errors. The custom domain pools a single h2 connection, so this bounds its first
+    /// handshake and any reconnect — a path that breaks after that surfaces as `transport`
+    /// against the per-attempt budget until the keep-alive ping reaps the connection, and in
+    /// R2 mode there is no RPC chain to fall back to.
+    ///
+    /// Left as an `Option` rather than defaulted by clap so that "explicitly set" stays
+    /// distinguishable; [`DEFAULT_CONNECT_TIMEOUT`] applies when it is absent. Unlike the trace
+    /// server, this binary does not reject it for having no R2 target: under
+    /// `--witness-source rpc` every `--r2-*` flag is inert by design, and under
+    /// `--witness-source r2` a target is mandatory, so the rule could never fire.
+    ///
+    /// [`DEFAULT_CONNECT_TIMEOUT`]: stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT
     #[clap(
         long,
         env = "STATELESS_VALIDATOR_R2_CONNECT_TIMEOUT_MS",
-        default_value_t = stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT.as_millis() as u64,
         value_parser = clap::value_parser!(u64).range(100..),
     )]
-    pub r2_connect_timeout_ms: u64,
+    pub r2_connect_timeout_ms: Option<u64>,
+
+    /// HTTP/2 connections the custom-domain target spreads its GETs over (default: 1).
+    ///
+    /// One `reqwest::Client` holds exactly one HTTP/2 connection and hyper opens no second one
+    /// when the first saturates, so this is the only way past the edge's per-connection stream
+    /// limit — and the only way one dropped connection stops taking every in-flight GET with
+    /// it, which matters here because R2 mode has no RPC fallback.
+    /// `--witness-max-concurrent-requests` is still the cap across all of them, split evenly
+    /// and rounded up, so raising this alone spreads the same concurrency thinner rather than
+    /// raising the ceiling; a count larger than that cap is rejected, since the surplus
+    /// connections could never be filled.
+    ///
+    /// Taken as text and parsed after clap so a blank env line stays inert under
+    /// `--witness-source rpc` instead of aborting startup with clap's unnamed value error.
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_CONNECTIONS")]
+    pub r2_connections: Option<String>,
 
     /// Optional inclusive end block: validate up to this height, then stop cleanly. Used to slice
     /// a fixed block range across multiple servers. Omit to follow the chain tip indefinitely.
@@ -161,6 +215,11 @@ pub struct CommandLineArgs {
 
     /// Maximum concurrent in-flight witness fetches, independent of the data cap. Omit for
     /// unlimited. Applies to both RPC witness calls and, with `--witness-source r2`, R2 GETs.
+    ///
+    /// Against `--r2-custom-domain` this is also what bounds the GETs multiplexed onto the
+    /// HTTP/2 connection, so keep it at or below the edge's per-connection stream limit
+    /// (Cloudflare's is 100): above it the surplus queues inside the connection instead, where
+    /// the wait is unobservable and still counts against the per-attempt timeout.
     #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_MAX_CONCURRENT_REQUESTS")]
     pub witness_max_concurrent_requests: Option<usize>,
 
@@ -244,7 +303,7 @@ pub async fn run() -> Result<()> {
         info!("Metrics disabled");
     }
 
-    let work_dir = PathBuf::from(args.data_dir);
+    let work_dir = PathBuf::from(&args.data_dir);
     std::fs::create_dir_all(&work_dir)
         .map_err(|e| eyre::eyre!("Failed to create data dir {}: {e}", work_dir.display()))?;
 
@@ -282,27 +341,14 @@ pub async fn run() -> Result<()> {
                      straight from the R2 bucket, and there is no RPC witness fallback"
                 );
             }
-            let endpoint = require_r2(&args.r2_endpoint, "--r2-endpoint")?;
-            let bucket = require_r2(&args.r2_bucket, "--r2-bucket")?;
-            let access_key_id = require_r2(&args.r2_access_key_id, "--r2-access-key-id")?;
-            let secret_access_key =
-                require_r2(&args.r2_secret_access_key, "--r2-secret-access-key")?;
-            // Log the parsed origin, not the raw flag value — the raw string is operator
-            // input and this line is info-level.
-            let (origin, _) = stateless_r2::endpoint::parse_endpoint(endpoint);
-            info!(endpoint = %origin, bucket, "Witness source: R2 (direct S3)");
-            Some(Arc::new(R2WitnessClient::new(
-                endpoint,
-                bucket.to_string(),
-                access_key_id.to_string(),
-                secret_access_key.to_string(),
-                stateless_r2::fetch::FetchTimeouts {
-                    per_attempt: per_attempt_timeout,
-                    connect: Duration::from_millis(args.r2_connect_timeout_ms),
-                },
-                rpc_config.rpc_retry.clone(),
-                args.witness_max_concurrent_requests,
-            )?))
+            let timeouts = stateless_r2::fetch::FetchTimeouts {
+                per_attempt: per_attempt_timeout,
+                connect: args
+                    .r2_connect_timeout_ms
+                    .map_or(stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT, Duration::from_millis),
+            };
+            let client = build_r2_client(&args, timeouts, rpc_config.rpc_retry.clone())?;
+            Some(Arc::new(client))
         }
     };
 
@@ -402,27 +448,105 @@ fn override_ms(ms: Option<u64>, default: Duration) -> Duration {
     ms.map(Duration::from_millis).unwrap_or(default)
 }
 
-/// Unwraps a required `--r2-*` argument, erroring with the flag name when it is absent.
-fn require_r2<'a, T: AsRef<str>>(value: &'a Option<T>, flag: &str) -> Result<&'a str> {
-    value
-        .as_ref()
-        .map(AsRef::as_ref)
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| eyre::eyre!("{flag} is required with --witness-source r2"))
+/// Builds the R2 witness client for `--witness-source r2`: the custom-domain target when
+/// `--r2-custom-domain` is set, the SigV4-signed S3 target otherwise.
+///
+/// Which target wins is already settled by the [`validate_r2_flags`] call below, so the arms
+/// read the one that was chosen — a set-but-empty flag belonging to the *other* target is
+/// rejected there rather than reaching a constructor.
+fn build_r2_client(
+    args: &CommandLineArgs,
+    timeouts: stateless_r2::fetch::FetchTimeouts,
+    retry: BackoffPolicy,
+) -> Result<R2WitnessClient> {
+    // Every coherence rule lives in the shared validator, so the reads below rest on an
+    // invariant that was actually checked: no empty values, exactly one target, and an Access
+    // pair that is either whole or absent.
+    let client = match validate_r2_flags(&r2_flags(args))? {
+        R2Target::None => {
+            return Err(eyre::eyre!(
+                "--witness-source r2 needs an R2 target: configure --r2-custom-domain, or \
+                 --r2-endpoint with its credential quad"
+            ));
+        }
+        R2Target::CustomDomain { connections } => {
+            let domain = args.r2_custom_domain.as_deref().expect("custom-domain target");
+            let access =
+                args.r2_access_client_id.as_ref().zip(args.r2_access_client_secret.as_ref()).map(
+                    |(client_id, client_secret)| stateless_r2::fetch::CfAccessCredentials {
+                        client_id: client_id.as_ref().to_string(),
+                        client_secret: client_secret.as_ref().to_string(),
+                    },
+                );
+            let cf_access = access.is_some();
+            let client = R2WitnessClient::new_custom_domain(
+                domain,
+                access,
+                timeouts,
+                retry,
+                args.witness_max_concurrent_requests,
+                connections,
+            )?;
+            metrics::record_r2_connections(client.connections());
+            info!(
+                domain = %client.origin(),
+                cf_access,
+                connections = client.connections(),
+                "Witness source: R2 (custom domain)"
+            );
+            client
+        }
+        R2Target::S3 => {
+            let take = |v: &Option<String>| v.clone().expect("S3 target");
+            let client = R2WitnessClient::new(
+                args.r2_endpoint.as_deref().expect("S3 target"),
+                take(&args.r2_bucket),
+                take(&args.r2_access_key_id),
+                args.r2_secret_access_key.as_ref().expect("S3 target").as_ref().to_string(),
+                timeouts,
+                retry,
+                args.witness_max_concurrent_requests,
+            )?;
+            info!(
+                endpoint = %client.origin(),
+                bucket = args.r2_bucket.as_deref().unwrap_or_default(),
+                "Witness source: R2 (direct S3)"
+            );
+            client
+        }
+    };
+    metrics::record_r2_target(client.target_label());
+    Ok(client)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn require_r2_rejects_absent_and_empty_values() {
-        assert!(require_r2(&None::<String>, "--r2-endpoint").is_err());
-        // An env var set to the empty string must not pass as configured.
-        assert!(require_r2(&Some(String::new()), "--r2-endpoint").is_err());
-        assert_eq!(
-            require_r2(&Some("https://x".to_string()), "--r2-endpoint").unwrap(),
-            "https://x"
-        );
+/// This binary's `--r2-*` flags, in the spellings its operators use.
+fn r2_flags(args: &CommandLineArgs) -> R2Flags<'_> {
+    R2Flags {
+        endpoint: R2Flag::new("--r2-endpoint", args.r2_endpoint.as_deref()),
+        bucket: R2Flag::new("--r2-bucket", args.r2_bucket.as_deref()),
+        access_key_id: R2Flag::new("--r2-access-key-id", args.r2_access_key_id.as_deref()),
+        secret_access_key: R2Flag::new(
+            "--r2-secret-access-key",
+            args.r2_secret_access_key.as_ref().map(AsRef::as_ref),
+        ),
+        custom_domain: R2Flag::new("--r2-custom-domain", args.r2_custom_domain.as_deref()),
+        access_client_id: R2Flag::new(
+            "--r2-access-client-id",
+            args.r2_access_client_id.as_ref().map(AsRef::as_ref),
+        ),
+        access_client_secret: R2Flag::new(
+            "--r2-access-client-secret",
+            args.r2_access_client_secret.as_ref().map(AsRef::as_ref),
+        ),
+        connections: R2Flag::new("--r2-connections", args.r2_connections.as_deref()),
+        max_concurrent_requests: R2CountFlag::new(
+            "--witness-max-concurrent-requests",
+            args.witness_max_concurrent_requests,
+        ),
+        // Empty on purpose. The orphan-tuning rule exists for a binary that validates R2 flags
+        // on every startup; here they are only read under `--witness-source r2`, where a target
+        // is mandatory, so the rule could never fire. Under `--witness-source rpc` every
+        // `--r2-*` flag is inert by design — see the call site in `run`.
+        tuning: &[],
     }
 }

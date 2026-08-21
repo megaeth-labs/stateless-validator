@@ -182,6 +182,92 @@ fn witness_endpoint_is_optional_at_parse_time() {
     assert!(parse(&["--witness-source", "r2"]).unwrap().witness_endpoint.is_empty());
 }
 
+/// The custom-domain R2 target is mutually exclusive with the S3 endpoint, and the Access
+/// token pair is all-or-nothing on top of it.
+#[test]
+fn r2_custom_domain_target_wiring() {
+    let _guard = stateless_test_utils::env::env_lock();
+    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
+
+    assert_eq!(
+        parse(&["--r2-custom-domain", "https://witness.example.com"])
+            .unwrap()
+            .r2_custom_domain
+            .as_deref(),
+        Some("https://witness.example.com")
+    );
+    // Every R2 coherence rule is enforced after parsing, by `stateless_common::validate_r2_flags`,
+    // so that each error can name the flag — clap's own rejections cannot, this workspace having
+    // built it without `error-context`. Parsing therefore accepts all of these shapes; the rules
+    // and their messages are covered by that function's own tests.
+    const DOMAIN: &str = "https://witness.example.com";
+    for shape in [
+        &["--r2-custom-domain", DOMAIN, "--r2-endpoint", "https://acc.r2.cloudflarestorage.com"][..],
+        &["--r2-custom-domain", DOMAIN, "--r2-access-client-id", "tok"],
+        &["--r2-access-client-id", "tok", "--r2-access-client-secret", "sk"],
+        &[
+            "--r2-custom-domain",
+            DOMAIN,
+            "--r2-access-client-id",
+            "tok",
+            "--r2-access-client-secret",
+            "sk",
+        ],
+        &["--r2-custom-domain", DOMAIN, "--r2-connections", "0"],
+    ] {
+        assert!(parse(shape).is_ok(), "{shape:?} must parse; rejection happens post-parse");
+    }
+    assert_eq!(
+        parse(&["--r2-custom-domain", DOMAIN, "--r2-connections", "8"])
+            .unwrap()
+            .r2_connections
+            .as_deref(),
+        Some("8")
+    );
+}
+
+/// Under the default `--witness-source rpc` the `--r2-*` flags are inert, and a blank value —
+/// what a templated env file renders for a variable a given role does not set — must stay
+/// inert too.
+///
+/// This pins the parse layer specifically. `--r2-connections` is text rather than a number for
+/// exactly this reason: parsed by clap, a blank line aborts startup before `run` can decide the
+/// flags are irrelevant, and it aborts with clap's unnamed value error because this workspace
+/// builds clap without `error-context`. The gating of the rules themselves lives in `run` —
+/// `validate_r2_flags` is reached only through `build_r2_client`, from the `WitnessSource::R2`
+/// arm — which this test cannot observe.
+#[test]
+fn rpc_mode_tolerates_blank_and_conflicting_r2_values() {
+    let _guard = stateless_test_utils::env::env_lock();
+    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
+
+    assert!(parse(&["--witness-source", "rpc"]).is_ok());
+    for blank in [
+        ["--r2-bucket", ""],
+        ["--r2-custom-domain", ""],
+        ["--r2-connections", ""],
+        ["--r2-access-client-id", ""],
+    ] {
+        assert!(
+            parse(&blank).is_ok(),
+            "a blank {} must parse so it can stay inert in rpc mode",
+            blank[0]
+        );
+    }
+    assert!(
+        parse(&[
+            "--witness-source",
+            "rpc",
+            "--r2-endpoint",
+            "https://acc.r2.cloudflarestorage.com",
+            "--r2-custom-domain",
+            "https://witness.example.com",
+        ])
+        .is_ok(),
+        "conflicting targets must parse in rpc mode; they are never read there"
+    );
+}
+
 /// `canonical_chain_max_length` must reject 0 at parse time. A value of 0 would make
 /// `advance_chain` prune the entire canonical chain on every successful advance,
 /// rolling the pipeline back to the anchor each round and looping forever.

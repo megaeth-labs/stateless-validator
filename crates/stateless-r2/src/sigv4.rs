@@ -172,6 +172,18 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
 pub fn encode_uri_path(bucket: &str, key: &str) -> String {
     let mut path = String::from("/");
     path.push_str(&encode_segment(bucket));
+    path.push_str(&encode_key_path(key));
+    path
+}
+
+/// Percent-encodes an object key into an absolute URL path with **no bucket segment** — the
+/// custom-domain layout, where the domain itself is bucket-scoped and objects live at
+/// `https://<domain>/{key}`.
+///
+/// Uses the same segment encoding as [`encode_uri_path`], so the two layouts can never
+/// disagree on how a key's bytes appear on the wire.
+pub fn encode_key_path(key: &str) -> String {
+    let mut path = String::new();
     for segment in key.split('/') {
         path.push('/');
         path.push_str(&encode_segment(segment));
@@ -220,6 +232,19 @@ mod tests {
         // Defensive: a space and a colon must be percent-encoded, the `/` separators must not.
         let path = encode_uri_path("b", "a b/c:d");
         assert_eq!(path, "/b/a%20b/c%3Ad");
+    }
+
+    /// The custom-domain layout is the S3 layout minus the bucket segment — same segment
+    /// encoding, so the two can never disagree on how a key's bytes appear on the wire.
+    #[test]
+    fn encode_key_path_is_the_bucketless_uri_path() {
+        assert_eq!(
+            encode_key_path("block/2000_2999/2045.0x23758c4d28eed6"),
+            "/block/2000_2999/2045.0x23758c4d28eed6"
+        );
+        for key in ["block/2000_2999/2045.0xabc", "a b/c:d"] {
+            assert_eq!(encode_uri_path("bucket", key), format!("/bucket{}", encode_key_path(key)));
+        }
     }
 
     #[test]
