@@ -37,6 +37,7 @@ use quick_cache::{Lifecycle, Weighter, sync::Cache};
 use tracing::debug;
 
 use crate::{
+    admission::TraceWeight,
     metrics::{CACHE_TYPE_DEBUG_TRACE, CACHE_TYPE_TRACE, CacheMetrics, CacheStats},
     raw_json::RawJson,
 };
@@ -256,6 +257,33 @@ impl RequestShape {
     }
 
     /// Metrics shape label for this request.
+    /// How much memory this request's tracer is expected to want, for the admission gate's
+    /// heavy sub-cap.
+    ///
+    /// Matched structurally rather than on [`Self::label`] so that adding a tracer forces a
+    /// decision here instead of silently defaulting to cheap. Every bypassed shape counts as
+    /// heavy by construction: a shape bypasses the cache precisely because its output is not
+    /// determined by a bounded key, which is the same reason its size is not bounded either.
+    pub fn weight(&self) -> TraceWeight {
+        match self {
+            Self::Cacheable(variant) => match variant {
+                // `Default` is the struct logger, which emits a record per executed opcode —
+                // the largest output of any shape here, and the only thing separating it from
+                // its `Bypass("struct_logger_config")` sibling below is a flag that changes
+                // its size, not its kind. Classifying the two differently would let the
+                // heaviest traffic in through the cheap door.
+                ResponseVariant::Default | ResponseVariant::PrestateTracer(_) => TraceWeight::Heavy,
+                ResponseVariant::CallTracer(_) |
+                ResponseVariant::FlatCallTracer(_) |
+                ResponseVariant::FourByteTracer |
+                ResponseVariant::NoopTracer => TraceWeight::Normal,
+            },
+            Self::Bypass(_) => TraceWeight::Heavy,
+            // Rejected before it can execute, so it never reaches a permit.
+            Self::InvalidTracerConfig { .. } => TraceWeight::Normal,
+        }
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             Self::Cacheable(variant) => variant.label(),

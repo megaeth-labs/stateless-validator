@@ -197,10 +197,11 @@ fn settle_response(rp: &MethodResponse, handler_reported: bool, guard: CancelGua
             // The framework swapped a handler's *Ok* for the oversized-response error
             // after the handler already recorded arrival + served: the books are balanced,
             // and recording again here would both over-count the identity and false-fire
-            // the drift alarm. Unreachable while the server pins the response cap to
-            // u32::MAX — load-bearing the day a real `--max-response-size` lands. The
-            // client-saw-error / books-say-served mismatch is accepted like the other
-            // documented approximations.
+            // the drift alarm. Reachable since `--max-batch-response-size` became a real
+            // bound: an entry body that passes the per-response check can still push the
+            // assembled batch past the framework's cap. The client-saw-error /
+            // books-say-served mismatch is accepted like the other documented
+            // approximations.
             Some(OVERSIZED_RESPONSE_CODE) => {}
             Some(_) => {
                 crate::metrics::record_rpc_error(method, crate::metrics::ErrorReason::Unattributed)
@@ -415,8 +416,21 @@ mod tests {
         concurrency: usize,
         max_response_body_size: usize,
     ) -> (SocketAddr, ServerHandle) {
+        spawn_with_limits(module, concurrency, max_response_body_size, None).await
+    }
+
+    /// [`spawn_with`] plus an optional admission gate, installed *below* the batch layer
+    /// exactly as production does — so these tests exercise the real layer order rather than
+    /// a replica of it.
+    async fn spawn_with_limits(
+        module: RpcModule<()>,
+        concurrency: usize,
+        max_response_body_size: usize,
+        limiter: Option<Arc<crate::admission::AdmissionLimiter>>,
+    ) -> (SocketAddr, ServerHandle) {
         let rpc_middleware = RpcServiceBuilder::new()
-            .layer(ConcurrentBatchLayer::new(concurrency, max_response_body_size));
+            .layer(ConcurrentBatchLayer::new(concurrency, max_response_body_size))
+            .option_layer(limiter.map(crate::admission::AdmissionLayer::new));
         let http_middleware = tower::ServiceBuilder::new().layer(crate::timing::TimingHeaderLayer);
         let server = Server::builder()
             .set_rpc_middleware(rpc_middleware)
@@ -636,6 +650,46 @@ mod tests {
         assert!(rp["error"]["code"].is_i64());
     }
 
+    // Accounting-series names, shared by every test that reads the identity.
+    const SHAPE: &str = "debug_trace_request_shape_total";
+    // The derive-based served counter keeps its raw dotted scope name here — the
+    // dot-to-underscore rename happens in the Prometheus exporter, not the recorder.
+    const SERVED: &str = "debug_trace.rpc_requests_total";
+    const ERRORS: &str = "debug_trace_rpc_errors_total";
+    const CANCELLED: &str = "debug_trace_requests_cancelled_total";
+
+    type Acc = std::collections::HashMap<(String, Vec<(String, String)>), u64>;
+
+    /// Folds one drain of `snapshotter` into `acc`.
+    ///
+    /// `Snapshotter::snapshot` *drains* the recorder (each counter swaps to zero), so every
+    /// observation has to funnel through one accumulator that survives repeated polls.
+    fn drain(snapshotter: &metrics_util::debugging::Snapshotter, acc: &mut Acc) {
+        use metrics_util::debugging::DebugValue;
+        for (ck, _, _, value) in snapshotter.snapshot().into_vec() {
+            if let DebugValue::Counter(v) = value {
+                let key = ck.key();
+                let labels: Vec<(String, String)> =
+                    key.labels().map(|l| (l.key().to_string(), l.value().to_string())).collect();
+                *acc.entry((key.name().to_string(), labels)).or_default() += v;
+            }
+        }
+    }
+
+    /// Sums every accumulated counter matching `metric` and all of `labels` (a subset match,
+    /// so a method-only query sums across shapes and reasons).
+    fn read(acc: &Acc, metric: &str, labels: &[(&str, &str)]) -> u64 {
+        acc.iter()
+            .filter(|((name, ls), _)| {
+                name.as_str() == metric &&
+                    labels.iter().all(|(lk, lv)| {
+                        ls.iter().any(|(k, v)| k.as_str() == *lk && v.as_str() == *lv)
+                    })
+            })
+            .map(|(_, v)| *v)
+            .sum()
+    }
+
     /// Handlers following the real handlers' accounting contract — arrival recorded at
     /// entry, then exactly one outcome — plus one that deliberately bypasses the error
     /// funnel, mimicking the drift `reason="unattributed"` exists to catch. Registered
@@ -682,6 +736,181 @@ mod tests {
         module
     }
 
+    /// A gated method slow enough to hold its capacity while siblings arrive, and the one
+    /// exempt method. Both follow the real handlers' accounting contract: arrival recorded at
+    /// entry, then exactly one outcome.
+    fn admission_module() -> RpcModule<()> {
+        use crate::metrics;
+        let mut module = RpcModule::new(());
+        module
+            .register_async_method(metrics::METHOD_TRACE_BLOCK, |_, _, _| async {
+                metrics::record_request_shape(metrics::METHOD_TRACE_BLOCK, "default");
+                tokio::time::sleep(Duration::from_millis(SLOW_MS)).await;
+                metrics::record_rpc_request(metrics::METHOD_TRACE_BLOCK, 0.001);
+                "ok"
+            })
+            .unwrap();
+        module
+            .register_async_method(metrics::METHOD_DEBUG_GET_CACHE_STATUS, |_, _, _| async {
+                metrics::record_request_shape(metrics::METHOD_DEBUG_GET_CACHE_STATUS, "default");
+                metrics::record_rpc_request(metrics::METHOD_DEBUG_GET_CACHE_STATUS, 0.001);
+                "status"
+            })
+            .unwrap();
+        module
+            .register_alias(
+                metrics::TIMED_METHOD_DEBUG_GET_CACHE_STATUS,
+                metrics::METHOD_DEBUG_GET_CACHE_STATUS,
+            )
+            .unwrap();
+        module
+    }
+
+    /// Every entry of a batch admits on its own account.
+    ///
+    /// This is the layer-order pin. `ConcurrentBatch` must sit *outside* the admission layer,
+    /// because it decomposes batches into per-entry `call`s rather than delegating to an inner
+    /// `batch`. Swap the two `.layer()` calls in `main` and an N-entry batch passes the gate as
+    /// a single unit — no compile error, no other test failing, and the one traffic shape that
+    /// has actually exhausted this server sails straight through. Here that shows up as all
+    /// four entries succeeding against a gate with room for one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn batch_entries_are_individually_gated() {
+        let limiter = crate::admission::AdmissionLimiter::new(1, 0, 1);
+        let (addr, _handle) =
+            spawn_with_limits(admission_module(), 4, u32::MAX as usize, Some(limiter)).await;
+
+        let batch = r#"[
+            {"jsonrpc": "2.0", "id": 1, "method": "trace_block", "params": []},
+            {"jsonrpc": "2.0", "id": 2, "method": "trace_block", "params": []},
+            {"jsonrpc": "2.0", "id": 3, "method": "trace_block", "params": []},
+            {"jsonrpc": "2.0", "id": 4, "method": "trace_block", "params": []}
+        ]"#;
+        let response = post_raw(addr, batch.to_string()).await;
+        let entries = response.as_array().expect("a batch answers with an array");
+        assert_eq!(entries.len(), 4);
+
+        let shed = entries
+            .iter()
+            .filter(|e| e["error"]["code"] == json!(crate::admission::QUEUE_FULL_CODE))
+            .count();
+        let served = entries.iter().filter(|e| e["result"].is_string()).count();
+        assert!(served >= 1, "the gate's one unit of capacity must serve someone: {response}");
+        assert!(
+            shed >= 1,
+            "entries admit individually, so a gate with room for one must shed the rest: \
+             {response}"
+        );
+        assert_eq!(shed + served, 4, "every entry landed on exactly one outcome: {response}");
+    }
+
+    /// The shed response carries mega-reth's `ConcurrencyLimiter` contract byte for byte, so
+    /// whatever already backs off for the node backs off for us.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shed_response_matches_the_queue_full_contract() {
+        let limiter = crate::admission::AdmissionLimiter::new(1, 0, 1);
+        let (addr, _handle) =
+            spawn_with_limits(admission_module(), 4, u32::MAX as usize, Some(limiter)).await;
+
+        let call =
+            json!({"jsonrpc": "2.0", "id": 1, "method": "trace_block", "params": []}).to_string();
+        let held = tokio::spawn(post_raw(addr, call.clone()));
+        tokio::time::sleep(Duration::from_millis(SLOW_MS / 4)).await;
+        let shed = post_raw(addr, call).await;
+
+        assert_eq!(shed["error"]["code"], json!(crate::admission::QUEUE_FULL_CODE));
+        assert_eq!(shed["error"]["message"], json!(crate::admission::QUEUE_FULL_MESSAGE));
+        assert_eq!(shed["id"], json!(1), "a shed response still answers the request it refused");
+        held.await.unwrap();
+    }
+
+    /// The one exempt method keeps answering while the gate is shedding everything else.
+    ///
+    /// Also pins that the exemption is matched on the `timed_`-stripped name: the gateway adds
+    /// that prefix by default, so an exemption written against the bare wire name would never
+    /// match in production and the operator's only introspection endpoint would be shed
+    /// exactly when it is needed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn exempt_method_answers_while_shedding() {
+        let limiter = crate::admission::AdmissionLimiter::new(1, 0, 1);
+        let (addr, _handle) =
+            spawn_with_limits(admission_module(), 4, u32::MAX as usize, Some(limiter)).await;
+
+        let held = tokio::spawn(post_raw(
+            addr,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "trace_block", "params": []}).to_string(),
+        ));
+        tokio::time::sleep(Duration::from_millis(SLOW_MS / 4)).await;
+
+        for method in ["debug_getCacheStatus", "timed_debug_getCacheStatus"] {
+            let response = post_raw(
+                addr,
+                json!({"jsonrpc": "2.0", "id": 2, "method": method, "params": []}).to_string(),
+            )
+            .await;
+            assert_eq!(response["result"], json!("status"), "{method} must stay reachable");
+        }
+        held.await.unwrap();
+    }
+
+    /// Shedding keeps the books balanced, and does not read as drift.
+    ///
+    /// Two things are pinned. The balanced pair: a shed records one arrival
+    /// (`shape="shed"`) and one outcome (`reason="overloaded"`), so the identity closes for a
+    /// request no handler ever saw. And `reason="unattributed"` staying at zero: `-32013` is
+    /// not a framework code, so if the shed were recorded outside `track_handler_errors`'
+    /// task-local scope, `settle_response` would charge every one of them to the drift alarm
+    /// as well — silently doubling the error side and paging on a healthy server.
+    #[test]
+    fn admission_shed_keeps_the_identity_closed() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let mut acc = Acc::new();
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        metrics::with_local_recorder(&recorder, || {
+            rt.block_on(async {
+                let limiter = crate::admission::AdmissionLimiter::new(1, 0, 1);
+                let (addr, _handle) =
+                    spawn_with_limits(admission_module(), 4, u32::MAX as usize, Some(limiter))
+                        .await;
+                let call =
+                    json!({"jsonrpc": "2.0", "id": 1, "method": "trace_block", "params": []})
+                        .to_string();
+                // One holds the single unit of capacity; the rest arrive while it does.
+                let calls: Vec<_> =
+                    (0..4).map(|_| tokio::spawn(post_raw(addr, call.clone()))).collect();
+                for call in calls {
+                    call.await.unwrap();
+                }
+            })
+        });
+        drain(&snapshotter, &mut acc);
+
+        let method = [("method", "trace_block")];
+        let shed = read(&acc, SHAPE, &[("method", "trace_block"), ("shape", "shed")]);
+        assert!(shed >= 1, "a gate with room for one must have shed something");
+        assert_eq!(
+            shed,
+            read(&acc, ERRORS, &[("method", "trace_block"), ("reason", "overloaded")]),
+            "every shed arrival has exactly one matching outcome"
+        );
+        assert_eq!(
+            read(&acc, ERRORS, &[("reason", "unattributed")]),
+            0,
+            "a shed must never also land on the drift alarm"
+        );
+        assert_eq!(
+            read(&acc, SHAPE, &method),
+            read(&acc, SERVED, &method) +
+                read(&acc, ERRORS, &method) +
+                read(&acc, CANCELLED, &method),
+            "shape = served + errors + cancelled"
+        );
+    }
+
     /// End-to-end pin of the accounting identity `shape = requests + errors + cancelled`
     /// per method — the contract that otherwise lives only in AGENTS.md prose. One pass
     /// drives every terminal path through a real server: served (single call and batch
@@ -695,47 +924,12 @@ mod tests {
     /// running tests stay invisible to it.
     #[test]
     fn accounting_identity_holds_end_to_end() {
-        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-
-        const SHAPE: &str = "debug_trace_request_shape_total";
-        // The derive-based served counter keeps its raw dotted scope name here — the
-        // dot-to-underscore rename happens in the Prometheus exporter, not the recorder.
-        const SERVED: &str = "debug_trace.rpc_requests_total";
-        const ERRORS: &str = "debug_trace_rpc_errors_total";
-        const CANCELLED: &str = "debug_trace_requests_cancelled_total";
-
-        type Acc = std::collections::HashMap<(String, Vec<(String, String)>), u64>;
+        use metrics_util::debugging::DebuggingRecorder;
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        // `Snapshotter::snapshot` *drains* the recorder (each counter swaps to zero), so
-        // every observation funnels through one accumulator that survives repeated polls.
-        let drain_into = |acc: &mut Acc| {
-            for (ck, _, _, value) in snapshotter.snapshot().into_vec() {
-                if let DebugValue::Counter(v) = value {
-                    let key = ck.key();
-                    let labels: Vec<(String, String)> = key
-                        .labels()
-                        .map(|l| (l.key().to_string(), l.value().to_string()))
-                        .collect();
-                    *acc.entry((key.name().to_string(), labels)).or_default() += v;
-                }
-            }
-        };
-        // Sums every accumulated counter matching `metric` and all of `labels` (a subset
-        // match, so a method-only query sums across shapes/reasons).
-        let read = |acc: &Acc, metric: &str, labels: &[(&str, &str)]| -> u64 {
-            acc.iter()
-                .filter(|((name, ls), _)| {
-                    name.as_str() == metric &&
-                        labels.iter().all(|(lk, lv)| {
-                            ls.iter().any(|(k, v)| k.as_str() == *lk && v.as_str() == *lv)
-                        })
-                })
-                .map(|(_, v)| *v)
-                .sum()
-        };
         let mut acc = Acc::new();
+        let drain_into = |acc: &mut Acc| drain(&snapshotter, acc);
 
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         metrics::with_local_recorder(&recorder, || {

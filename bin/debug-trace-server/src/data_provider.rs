@@ -540,6 +540,37 @@ impl DataProvider {
         Instant::now() + self.block_fetch_timeout
     }
 
+    /// The instant past which waiting for an inbound execution permit stops being useful.
+    ///
+    /// A request that queues past this has spent the budget its witness stage still needs, so
+    /// letting it start would only trade a rejection for a deadline error — which is the
+    /// outcome the admission gate exists to prevent. Derived from the two configured budgets
+    /// rather than being its own knob, so it tracks whatever they are set to.
+    ///
+    /// The reserve normally *is* the witness budget, but falls back to half the request's
+    /// budget when the witness timeout does not fit inside it. `--witness-timeout` may legally
+    /// be set at or above `--block-fetch-timeout` — the witness sub-deadline is a `min` against
+    /// the outer one, so a larger value simply never binds — and reserving all of it would
+    /// leave a permit wait of zero, silently turning `--admission-max-queue` into a no-op: the
+    /// server would shed hard at exactly `max_concurrent` while the permit-wait histogram read
+    /// zero, pointing an operator at client load rather than at their own timeout setting.
+    /// Half is the share the witness stage already reserves for its own fallbacks.
+    pub(crate) fn permit_cutoff(&self, deadline: Instant) -> Instant {
+        deadline.checked_sub(self.permit_reserve()).unwrap_or_else(Instant::now)
+    }
+
+    /// The share of a request's budget held back from the admission queue for the work itself.
+    fn permit_reserve(&self) -> Duration {
+        let witness = self.witness_cfg.witness_timeout;
+        if witness < self.block_fetch_timeout { witness } else { self.block_fetch_timeout / 2 }
+    }
+
+    /// The longest a request may wait for an execution permit under the configured budgets —
+    /// published at startup so an operator can see what `--admission-max-queue` actually buys.
+    pub(crate) fn max_permit_wait(&self) -> Duration {
+        self.block_fetch_timeout.saturating_sub(self.permit_reserve())
+    }
+
     /// Resolves a block number to its canonical block hash.
     ///
     /// This is what makes number-keyed requests safe to serve from the hash-keyed response
@@ -635,8 +666,9 @@ impl DataProvider {
     pub async fn get_block_data_by_hash(
         &self,
         block_hash: B256,
+        deadline: Instant,
     ) -> DataProviderResult<Arc<BlockData>> {
-        self.get_block_data(block_hash, None, self.fetch_deadline()).await
+        self.get_block_data(block_hash, None, deadline).await
     }
 
     /// Tiered block-data lookup: memory cache → local DB → single-flight RPC fetch, all
@@ -734,9 +766,9 @@ impl DataProvider {
     pub async fn get_block_data_for_tx(
         &self,
         tx_hash: B256,
+        deadline: Instant,
     ) -> DataProviderResult<(Arc<BlockData>, usize)> {
         trace!(tx_hash = %tx_hash, "Looking up transaction");
-        let deadline = self.fetch_deadline();
 
         // Fetch the transaction to find its block. The outer result is `Err(Deadline)`; the
         // inner is `Err` for "tx exists but has no block_hash" (pending) — classify explicitly
@@ -1823,6 +1855,52 @@ mod tests {
         )
     }
 
+    /// The admission queue keeps a usable share of the budget under any legal timeout pair.
+    ///
+    /// `--witness-timeout` may legally be set at or above `--block-fetch-timeout` — the witness
+    /// sub-deadline is a `min` against the outer one, so a larger value simply never binds. A
+    /// reserve of the raw witness timeout would then swallow the whole budget and leave a
+    /// permit wait of zero, silently reducing `--admission-max-queue` to a no-op: the server
+    /// would shed hard at exactly `max_concurrent` while the permit-wait histogram read zero,
+    /// pointing an operator at client load rather than at their own timeout setting.
+    #[test]
+    fn permit_reserve_never_swallows_the_whole_budget() {
+        let reserve = |witness_secs: u64, fetch_secs: u64| {
+            let provider = DataProvider::new(
+                Arc::new(
+                    RpcClient::new_with_config(
+                        &["http://127.0.0.1:1"],
+                        &["http://127.0.0.1:1"],
+                        RpcClientConfig::trace_server(),
+                        None,
+                    )
+                    .unwrap(),
+                ),
+                None,
+                None,
+                test_support::noop_contract_cache(),
+                WitnessFetchConfig::with_defaults(witness_secs),
+                Duration::from_secs(fetch_secs),
+                1024,
+            );
+            (provider.max_permit_wait(), provider.permit_cutoff(provider.fetch_deadline()))
+        };
+
+        // The ordinary case: the witness stage keeps its full budget, the queue gets the rest.
+        let (wait, cutoff) = reserve(8, 13);
+        assert_eq!(wait, Duration::from_secs(5), "13s budget less the 8s witness reserve");
+        assert!(cutoff > Instant::now(), "a request may still wait");
+
+        // The inverted case: the reserve is capped at half, so the queue keeps the other half.
+        let (wait, cutoff) = reserve(20, 13);
+        assert_eq!(wait, Duration::from_secs(13) - Duration::from_secs(13) / 2);
+        assert!(cutoff > Instant::now(), "the queue is still usable, not silently inert");
+
+        // Equal budgets are the boundary of the old behaviour and must stay usable too.
+        let (wait, _) = reserve(13, 13);
+        assert_eq!(wait, Duration::from_secs(13) / 2);
+    }
+
     /// [`provider_with_tiers`] with no memory cache and an empty noop-backed contract
     /// cache.
     fn provider_with(url: &str, db: Option<Arc<dyn BlockStore>>) -> DataProvider {
@@ -1849,8 +1927,14 @@ mod tests {
             contract_cache,
         );
 
-        let first = provider.get_block_data_by_hash(hash).await.expect("db-served fetch");
-        let second = provider.get_block_data_by_hash(hash).await.expect("memory-served fetch");
+        let first = provider
+            .get_block_data_by_hash(hash, provider.fetch_deadline())
+            .await
+            .expect("db-served fetch");
+        let second = provider
+            .get_block_data_by_hash(hash, provider.fetch_deadline())
+            .await
+            .expect("memory-served fetch");
 
         assert_eq!(
             store.block_reads.load(Ordering::Relaxed),
@@ -1878,7 +1962,10 @@ mod tests {
             provider_with_tiers(&test_support::hanging_url(), None, Some(cache), contract_cache);
 
         let start = std::time::Instant::now();
-        let data = provider.get_block_data_by_hash(hash).await.expect("memory hit");
+        let data = provider
+            .get_block_data_by_hash(hash, provider.fetch_deadline())
+            .await
+            .expect("memory hit");
         assert!(
             start.elapsed() < Duration::from_millis(500),
             "memory hit must not reach the hanging upstream"
@@ -1900,8 +1987,14 @@ mod tests {
             contract_cache,
         );
 
-        provider.get_block_data_by_hash(hash).await.expect("first db read");
-        provider.get_block_data_by_hash(hash).await.expect("second db read");
+        provider
+            .get_block_data_by_hash(hash, provider.fetch_deadline())
+            .await
+            .expect("first db read");
+        provider
+            .get_block_data_by_hash(hash, provider.fetch_deadline())
+            .await
+            .expect("second db read");
         assert_eq!(store.block_reads.load(Ordering::Relaxed), 2);
     }
 
@@ -2616,7 +2709,9 @@ mod tests {
 
         let provider = provider_at(&url, None);
         let start = std::time::Instant::now();
-        let result = provider.get_block_data_by_hash(B256::from([0x42; 32])).await;
+        let result = provider
+            .get_block_data_by_hash(B256::from([0x42; 32]), provider.fetch_deadline())
+            .await;
         let elapsed = start.elapsed();
 
         let err = match result {
@@ -2923,7 +3018,9 @@ mod tests {
         let block_hash = B256::from([0xAB; 32]);
         let handle = {
             let provider = Arc::clone(&provider);
-            tokio::spawn(async move { provider.get_block_data_by_hash(block_hash).await })
+            tokio::spawn(async move {
+                provider.get_block_data_by_hash(block_hash, provider.fetch_deadline()).await
+            })
         };
 
         // Give the spawned task enough scheduling turns to reach `shared.await` and register
