@@ -201,8 +201,10 @@ fn settle_response(rp: &MethodResponse, handler_reported: bool, guard: CancelGua
             // bound: an entry body that passes the per-response check can still push the
             // assembled batch past the framework's cap. The client-saw-error /
             // books-say-served mismatch is accepted like the other documented
-            // approximations.
-            Some(OVERSIZED_RESPONSE_CODE) => {}
+            // approximations — but the oversized counter is not part of the identity, so it
+            // is recorded here too rather than leaving these invisible to the one series an
+            // operator would alert on.
+            Some(OVERSIZED_RESPONSE_CODE) => crate::metrics::record_response_oversized(method),
             Some(_) => {
                 crate::metrics::record_rpc_error(method, crate::metrics::ErrorReason::Unattributed)
             }

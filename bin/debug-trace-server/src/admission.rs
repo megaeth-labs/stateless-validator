@@ -248,6 +248,13 @@ pub(crate) struct AdmissionLimiter {
     execution: Arc<ResizableSemaphore>,
     /// A smaller budget the memory-hungry tracer shapes must pass first.
     heavy: Arc<ResizableSemaphore>,
+    /// Heavy requests that have reached the permit stage and not yet finished.
+    ///
+    /// Bounded separately from `in_flight` because the two have different bottlenecks. The
+    /// admitted budget is class-blind by design — the gate runs before anything parses the
+    /// tracer — so without this a flood of heavy requests fills it while blocking on a sub-cap
+    /// a fraction of its size, and ordinary traffic is shed with most execution permits idle.
+    heavy_in_flight: AtomicUsize,
 }
 
 impl AdmissionLimiter {
@@ -259,6 +266,7 @@ impl AdmissionLimiter {
             max_queue: AtomicU64::new(max_queue),
             execution: Arc::new(ResizableSemaphore::new(max_concurrent)),
             heavy: Arc::new(ResizableSemaphore::new(heavy_max_concurrent)),
+            heavy_in_flight: AtomicUsize::new(0),
         });
         limiter.publish_limits();
         limiter
@@ -270,6 +278,18 @@ impl AdmissionLimiter {
     /// sentinel that wrapped here would make the gate shed *everything*.
     fn capacity(&self) -> u64 {
         self.max_queue.load(Ordering::Relaxed).saturating_add(self.execution.limit())
+    }
+
+    /// How many heavy requests may be at the permit stage at once.
+    ///
+    /// The heavy class is allowed to queue in the same proportion to its execution budget as
+    /// the process as a whole — `max_queue / max_concurrent` waiters per slot — so it can
+    /// absorb a burst without being able to crowd ordinary traffic out of admission. It also
+    /// makes `--admission-max-queue 0` mean execute-or-shed for heavy requests too, which a
+    /// share of the shared budget did not.
+    fn heavy_capacity(&self) -> u64 {
+        let queue_per_slot = self.max_queue() / self.execution.limit().max(1);
+        self.heavy.limit().saturating_mul(queue_per_slot.saturating_add(1))
     }
 
     pub(crate) fn max_concurrent(&self) -> u64 {
@@ -362,7 +382,9 @@ impl AdmissionLimiter {
     ///
     /// A heavy shape takes the sub-cap permit *first*. Acquiring it second would let heavy
     /// requests occupy execution permits while waiting for each other, starving ordinary
-    /// traffic behind work that is not running.
+    /// traffic behind work that is not running. It is also refused outright once the heavy
+    /// class already holds its share of the budget, rather than joining a queue that only its
+    /// own sub-cap drains — see [`Self::heavy_capacity`].
     pub(crate) async fn acquire_execution(
         self: &Arc<Self>,
         method: &'static str,
@@ -370,16 +392,39 @@ impl AdmissionLimiter {
         cutoff: Instant,
     ) -> Result<ExecutionPermit, AdmissionError> {
         let started = Instant::now();
-        let heavy_permit = if heavy { Some(acquire_by(&self.heavy, cutoff).await?) } else { None };
+        let heavy_permit = if heavy {
+            let _slot = self.enter_heavy()?;
+            let permit = HeavyPermit::new(acquire_by(&self.heavy, cutoff).await?);
+            Some((permit, _slot))
+        } else {
+            None
+        };
         let permit = acquire_by(&self.execution, cutoff).await?;
         metrics::record_admission_permit_wait(started.elapsed().as_secs_f64());
 
         let gauges = AdmissionMetrics::new_for_method(method);
         gauges.executing_delta(1.0);
-        if heavy_permit.is_some() {
-            metrics::record_admission_heavy_delta(1.0);
-        }
         Ok(ExecutionPermit { _permit: permit, heavy: heavy_permit, gauges })
+    }
+
+    /// Claims one of the heavy class's slots, or refuses when it already holds its share.
+    fn enter_heavy(self: &Arc<Self>) -> Result<HeavySlot, AdmissionError> {
+        let capacity = self.heavy_capacity();
+        let mut current = self.heavy_in_flight.load(Ordering::Relaxed);
+        loop {
+            if current as u64 >= capacity {
+                return Err(AdmissionError::Overloaded);
+            }
+            match self.heavy_in_flight.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(HeavySlot { limiter: Arc::clone(self) }),
+                Err(actual) => current = actual,
+            }
+        }
     }
 }
 
@@ -398,6 +443,41 @@ async fn acquire_by(
     Ok(DebtAwarePermit { permit: Some(permit), owner: Arc::clone(semaphore) })
 }
 
+/// Holds one of the heavy class's share of the admitted budget.
+pub(crate) struct HeavySlot {
+    limiter: Arc<AdmissionLimiter>,
+}
+
+impl Drop for HeavySlot {
+    fn drop(&mut self) {
+        self.limiter.heavy_in_flight.fetch_sub(1, Ordering::Release);
+    }
+}
+
+/// A heavy sub-cap permit, counted on the occupancy gauge for as long as it is held.
+///
+/// The gauge is raised here rather than once *both* permits are in hand, so it cannot read
+/// zero while every heavy permit is reserved and further heavy requests are blocked on them —
+/// the state an operator is most likely to be staring at. Raised at the same moment the
+/// limiter's own counter is, so the Prometheus view and the admin RPC cannot disagree.
+struct HeavyPermit {
+    /// Held for its `Drop`, which returns the sub-cap permit.
+    _permit: DebtAwarePermit,
+}
+
+impl HeavyPermit {
+    fn new(permit: DebtAwarePermit) -> Self {
+        metrics::record_admission_heavy_delta(1.0);
+        Self { _permit: permit }
+    }
+}
+
+impl Drop for HeavyPermit {
+    fn drop(&mut self) {
+        metrics::record_admission_heavy_delta(-1.0);
+    }
+}
+
 /// Holds one unit of admitted capacity for the whole request.
 pub(crate) struct InFlightGuard {
     limiter: Arc<AdmissionLimiter>,
@@ -412,19 +492,22 @@ impl Drop for InFlightGuard {
 }
 
 /// Holds the right to fetch and replay one block.
-#[derive(Debug)]
 pub(crate) struct ExecutionPermit {
     _permit: DebtAwarePermit,
-    heavy: Option<DebtAwarePermit>,
+    /// The sub-cap permit and the budget slot, both released with this one.
+    heavy: Option<(HeavyPermit, HeavySlot)>,
     gauges: AdmissionMetrics,
+}
+
+impl std::fmt::Debug for ExecutionPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecutionPermit").field("heavy", &self.heavy.is_some()).finish()
+    }
 }
 
 impl Drop for ExecutionPermit {
     fn drop(&mut self) {
         self.gauges.executing_delta(-1.0);
-        if self.heavy.is_some() {
-            metrics::record_admission_heavy_delta(-1.0);
-        }
     }
 }
 
@@ -674,6 +757,87 @@ mod tests {
             AdmissionError::Overloaded,
             "the shrink was honoured once the permits came back"
         );
+    }
+
+    /// A flood of heavy requests cannot crowd ordinary traffic out of admission.
+    ///
+    /// The regression this pins: the admitted budget is class-blind, so heavy requests used to
+    /// fill it while blocking on a sub-cap a fraction of its size. Twelve of them would take
+    /// all twelve admitted slots, one would execute, and an ordinary request was then shed with
+    /// three execution permits sitting idle — a priority inversion handed to whoever sends the
+    /// most expensive shape.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_heavy_flood_cannot_shed_ordinary_traffic() {
+        // 4 + 8 = 12 admitted; 4 execution permits; 1 heavy at a time, so heavy gets
+        // 1 * (1 + 8/4) = 3 of the budget.
+        let limiter = AdmissionLimiter::new(4, 8, 1);
+        assert_eq!(limiter.heavy_capacity(), 3);
+
+        let mut admitted = Vec::new();
+        let mut waiters = tokio::task::JoinSet::new();
+        for _ in 0..12 {
+            admitted.push(limiter.try_admit(METHOD).expect("admitted by the class-blind gate"));
+            let limiter = Arc::clone(&limiter);
+            waiters.spawn(async move { limiter.acquire_execution(METHOD, true, far()).await });
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // One heavy request runs and two wait; the other nine were refused at the class gate
+        // instead of parking on a sub-cap only they can drain.
+        assert_eq!(limiter.heavy_executing(), 1);
+        assert!(limiter.heavy_in_flight.load(Ordering::Relaxed) <= 3);
+
+        // Which is the point: an ordinary request still gets a permit, because the execution
+        // permits the heavy flood was not using are still reachable.
+        let ordinary = limiter
+            .acquire_execution(METHOD, false, far())
+            .await
+            .expect("ordinary traffic is not starved by a heavy flood");
+        drop(ordinary);
+        waiters.abort_all();
+    }
+
+    /// `--admission-max-queue 0` means execute-or-shed for heavy requests too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_zero_queue_leaves_heavy_requests_nowhere_to_wait() {
+        let limiter = AdmissionLimiter::new(8, 0, 2);
+        assert_eq!(limiter.heavy_capacity(), 2, "no queue means no heavy waiters either");
+
+        let _first = limiter.acquire_execution(METHOD, true, far()).await.expect("first heavy");
+        let _second = limiter.acquire_execution(METHOD, true, far()).await.expect("second heavy");
+        let started = Instant::now();
+        let refused = limiter.acquire_execution(METHOD, true, far()).await;
+        assert_eq!(refused.unwrap_err(), AdmissionError::Overloaded);
+        // Promptness is the assertion that discriminates: sharing the class-blind budget also
+        // ends in `Overloaded`, but only after parking on the sub-cap until the cutoff — which
+        // is the queueing this configuration says it does not want.
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "refused outright, not parked on a full sub-cap until the deadline"
+        );
+    }
+
+    /// The heavy occupancy gauge is raised the moment the sub-cap permit is taken, not once
+    /// both permits are in hand — otherwise it reads zero while every heavy permit is reserved
+    /// and further heavy requests are blocked on them, disagreeing with the admin RPC.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn heavy_occupancy_is_visible_while_waiting_for_an_execution_permit() {
+        let limiter = AdmissionLimiter::new(1, 8, 1);
+        let _blocker = limiter.acquire_execution(METHOD, false, far()).await.expect("blocker");
+
+        let waiting = {
+            let limiter = Arc::clone(&limiter);
+            tokio::spawn(async move { limiter.acquire_execution(METHOD, true, far()).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            limiter.heavy_executing(),
+            1,
+            "the sub-cap permit is held and must be visible as such, not only once the \
+             execution permit follows"
+        );
+        waiting.abort();
     }
 
     /// Occupancy stays truthful while a shrink's debt is outstanding.

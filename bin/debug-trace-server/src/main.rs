@@ -567,6 +567,16 @@ const DEFAULT_ADMISSION_MAX_QUEUE: u64 = 8192;
 /// this figure times `--max-response-size` is what to check against the host's memory limit.
 const DEFAULT_ADMISSION_HEAVY_MAX_CONCURRENT: u64 = 8;
 
+/// How much room `--max-batch-response-size` must leave above `--max-response-size`.
+///
+/// Our own check measures the bare result body; the framework's cap measures the whole
+/// JSON-RPC response, envelope and client-supplied `id` included. Set the two caps equal and a
+/// body that passes our check can still be swapped for an oversized-response error by the
+/// framework — after the handler has already counted the request as served. Requiring this
+/// much headroom keeps that swap out of reach for any sane `id`, and turns a config that would
+/// have mis-accounted silently into a startup message.
+const RESPONSE_ENVELOPE_HEADROOM: u64 = 64 * 1024;
+
 /// Parses a human-readable size string into bytes.
 ///
 /// Accepts suffixes: `KB` (1024), `MB` (1024²), `GB` (1024³). Case-insensitive.
@@ -708,14 +718,17 @@ fn validate_args(args: &Args) -> Result<R2Target> {
         );
     }
     // The batch builder holds whole entry bodies, so a batch cap below one entry's cap could
-    // never assemble even a single maximal response.
-    if args.max_batch_response_size < args.max_response_size {
+    // never assemble even a single maximal response — and it must clear it by enough for the
+    // JSON-RPC envelope, or the framework can reject a body our own check just passed.
+    let required_batch_cap = args.max_response_size.saturating_add(RESPONSE_ENVELOPE_HEADROOM);
+    if args.max_batch_response_size < required_batch_cap {
         eyre::bail!(
-            "--max-batch-response-size ({}) must be at least --max-response-size ({}): a batch \
-             holds whole entry bodies, so a smaller batch cap could not assemble even one \
-             maximal entry",
+            "--max-batch-response-size ({}) must be at least --max-response-size ({}) plus {} \
+             bytes of headroom: a batch holds whole entry bodies, and the framework's cap counts \
+             the JSON-RPC envelope and request id that our own size check does not",
             args.max_batch_response_size,
-            args.max_response_size
+            args.max_response_size,
+            RESPONSE_ENVELOPE_HEADROOM
         );
     }
     admin_bind_addr(args)?;
@@ -1812,11 +1825,20 @@ mod tests {
     /// A batch holds whole entry bodies, so a batch cap under one entry's cap could never
     /// assemble even a single maximal response.
     #[test]
-    fn batch_response_cap_must_cover_one_response() {
+    fn batch_response_cap_must_cover_one_response_plus_its_envelope() {
         let args =
             parse_args(&["--max-response-size", "512MB", "--max-batch-response-size", "256MB"]);
         let err = validate_args(&args).expect_err("a batch cap below the entry cap").to_string();
         assert!(err.contains("--max-batch-response-size"), "{err}");
+
+        // Equal caps are the trap: our own check measures the bare body while the framework's
+        // measures the envelope too, so a body that just passes ours can still be swapped for
+        // an oversized error after the handler counted the request as served.
+        let equal =
+            parse_args(&["--max-response-size", "512MB", "--max-batch-response-size", "512MB"]);
+        let err = validate_args(&equal).expect_err("equal caps leave no envelope room").to_string();
+        assert!(err.contains("headroom"), "the error must explain why equal is not enough: {err}");
+
         assert!(validate_args(&parse_args(&["--max-response-size", "512MB"])).is_ok());
     }
 
