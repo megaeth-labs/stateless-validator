@@ -768,6 +768,57 @@ mod tests {
         module
     }
 
+    /// A notification never reaches a handler, so it must not consume admission capacity.
+    ///
+    /// Pinned because the opposite is an inviting misreading: a JSON-RPC message with no `id`
+    /// looks like it should be gated like any other call. jsonrpsee answers it in
+    /// `RpcService::notification` without dispatching the method at all, so gating one would
+    /// spend a slot on work that never happens — and, since a notification cannot carry an
+    /// error response, shedding one could only be silent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_notification_never_reaches_a_handler_or_takes_capacity() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static HANDLER_RAN: AtomicBool = AtomicBool::new(false);
+        HANDLER_RAN.store(false, Ordering::SeqCst);
+
+        let mut module = RpcModule::new(());
+        module
+            .register_async_method(crate::metrics::METHOD_TRACE_BLOCK, |_, _, _| async {
+                HANDLER_RAN.store(true, Ordering::SeqCst);
+                "ok"
+            })
+            .unwrap();
+
+        // A gate with no capacity at all: anything that were gated would be shed.
+        let limiter = crate::admission::AdmissionLimiter::new(1, 0, 1);
+        let _held = limiter
+            .acquire_execution(
+                crate::metrics::METHOD_TRACE_BLOCK,
+                false,
+                Instant::now() + Duration::from_secs(30),
+            )
+            .await
+            .expect("the test holds the only execution permit");
+        let (addr, _handle) =
+            spawn_with_limits(module, 4, u32::MAX as usize, Some(Arc::clone(&limiter))).await;
+
+        let body = post_text(
+            addr,
+            json!({"jsonrpc": "2.0", "method": "trace_block", "params": []}).to_string(),
+        )
+        .await;
+
+        // jsonrpsee answers a notification-only request with a bare `null` — no result, no
+        // error, nothing that could carry a shed.
+        assert!(
+            body.is_empty() || body == "null",
+            "a notification gets no real response: {body:?}"
+        );
+        assert!(!HANDLER_RAN.load(Ordering::SeqCst), "the framework never dispatched the method");
+        assert_eq!(limiter.in_flight(), 0, "and it never took a unit of admitted capacity");
+    }
+
     /// Every entry of a batch admits on its own account.
     ///
     /// This is the layer-order pin. `ConcurrentBatch` must sit *outside* the admission layer,

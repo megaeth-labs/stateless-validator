@@ -146,11 +146,16 @@ impl ResizableSemaphore {
                 self.sem.add_permits((growth - cancelled) as usize);
             }
         } else if permits < previous {
-            let wanted = (previous - permits) as usize;
-            let removed = self.sem.forget_permits(wanted);
-            if removed < wanted {
-                self.debt.fetch_add((wanted - removed) as u64, Ordering::SeqCst);
-            }
+            let wanted = previous - permits;
+            // The debt is published *before* any permit is removed, and the part that could
+            // be removed immediately is cancelled after. A release landing in between then
+            // sees a debt that is at worst too large and forgets its permit — the
+            // conservative direction. Published after the removal instead, that same release
+            // would observe zero debt, hand its permit back, and let a queued request through
+            // above the limit the shrink just set.
+            self.debt.fetch_add(wanted, Ordering::SeqCst);
+            let removed = self.sem.forget_permits(wanted as usize) as u64;
+            self.cancel_debt(removed);
         }
     }
 
@@ -838,6 +843,61 @@ mod tests {
              execution permit follows"
         );
         waiting.abort();
+    }
+
+    /// Resizing concurrently with acquire/release must not leak or duplicate permits.
+    ///
+    /// The debt protocol has two writers on the hot path (a release settling debt) and one on
+    /// the admin path (a resize), so its failure mode is drift rather than a crash: a permit
+    /// forgotten twice shrinks the budget permanently, one returned when it should have been
+    /// forgotten inflates it. Neither shows up until much later, so this asserts the books
+    /// balance exactly once everything quiesces.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_resizes_and_releases_keep_the_budget_exact() {
+        let limiter = AdmissionLimiter::new(8, 64, 8);
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let limiter = Arc::clone(&limiter);
+            tasks.spawn(async move {
+                for _ in 0..200 {
+                    if let Ok(permit) = limiter.acquire_execution(METHOD, false, far()).await {
+                        tokio::task::yield_now().await;
+                        drop(permit);
+                    }
+                }
+            });
+        }
+        {
+            let limiter = Arc::clone(&limiter);
+            tasks.spawn(async move {
+                for round in 0..200u64 {
+                    limiter.set_max_concurrent(1 + round % 8);
+                    tokio::task::yield_now().await;
+                }
+            });
+        }
+        // Bounded: a protocol that loses permits starves every acquirer, and the failure would
+        // otherwise be a hung job rather than a red test.
+        let drain = async {
+            while let Some(joined) = tasks.join_next().await {
+                joined.expect("no task panicked");
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(20), drain)
+            .await
+            .expect("permits stopped circulating — the debt protocol lost some");
+
+        // Quiesced: everything handed out came back, and the semaphore holds exactly the
+        // configured limit — no permit lost to a double-forget, none conjured by a release
+        // that should have forgotten one.
+        limiter.set_max_concurrent(8);
+        assert_eq!(limiter.executing(), 0, "every permit was returned");
+        assert_eq!(limiter.execution.debt.load(Ordering::SeqCst), 0, "no debt outstanding");
+        assert_eq!(
+            limiter.execution.sem.available_permits(),
+            8,
+            "the budget is exactly the configured limit"
+        );
     }
 
     /// Occupancy stays truthful while a shrink's debt is outstanding.

@@ -567,15 +567,21 @@ const DEFAULT_ADMISSION_MAX_QUEUE: u64 = 8192;
 /// this figure times `--max-response-size` is what to check against the host's memory limit.
 const DEFAULT_ADMISSION_HEAVY_MAX_CONCURRENT: u64 = 8;
 
+/// Cap on an inbound request body, pinned rather than left to the framework's default so the
+/// envelope headroom below can be derived from it instead of guessed.
+const MAX_REQUEST_BODY_SIZE: u32 = 10 * 1024 * 1024;
+
 /// How much room `--max-batch-response-size` must leave above `--max-response-size`.
 ///
 /// Our own check measures the bare result body; the framework's cap measures the whole
 /// JSON-RPC response, envelope and client-supplied `id` included. Set the two caps equal and a
 /// body that passes our check can still be swapped for an oversized-response error by the
-/// framework — after the handler has already counted the request as served. Requiring this
-/// much headroom keeps that swap out of reach for any sane `id`, and turns a config that would
-/// have mis-accounted silently into a startup message.
-const RESPONSE_ENVELOPE_HEADROOM: u64 = 64 * 1024;
+/// framework — after the handler has already counted the request as served.
+///
+/// Derived rather than assumed: the only unbounded part of the envelope is the `id`, which the
+/// client sends inside the request body, so [`MAX_REQUEST_BODY_SIZE`] bounds it outright. A
+/// fixed guess would hold for sane ids and quietly fail for a client that pads one.
+const RESPONSE_ENVELOPE_HEADROOM: u64 = MAX_REQUEST_BODY_SIZE as u64 + 1024;
 
 /// Parses a human-readable size string into bytes.
 ///
@@ -1130,7 +1136,10 @@ async fn main() -> Result<()> {
         );
         u32::MAX
     });
-    let config = ServerConfig::builder().max_response_body_size(max_response_body_size).build();
+    let config = ServerConfig::builder()
+        .max_response_body_size(max_response_body_size)
+        .max_request_body_size(MAX_REQUEST_BODY_SIZE)
+        .build();
     // Order is load-bearing: the batch layer is outermost, so the admission layer below it
     // sees single calls *and* every batch entry. Reversed, an N-entry batch would pass the
     // gate as one unit — which is the traffic shape that has actually taken this server down.
