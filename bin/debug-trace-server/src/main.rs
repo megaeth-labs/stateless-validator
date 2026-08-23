@@ -710,18 +710,18 @@ fn validate_args(args: &Args) -> Result<R2Target> {
              (frontier vs historical) to the local DB tip"
         );
     }
-    // A batch's entries admit independently, so a gate narrower than one batch's concurrent
-    // entries would shed part of every batch on a completely idle server.
-    let admission_capacity = args.admission_max_concurrent.saturating_add(args.admission_max_queue);
-    if !args.admission_disabled && admission_capacity < u64::from(args.batch_item_concurrency) {
-        eyre::bail!(
-            "--admission-max-concurrent ({}) + --admission-max-queue ({}) must be at least \
-             --batch-item-concurrency ({}): one batch's entries admit independently, so a \
-             smaller gate sheds part of every batch even on an idle server",
-            args.admission_max_concurrent,
-            args.admission_max_queue,
-            args.batch_item_concurrency
-        );
+    // Shared with the admin RPC's setter, so the startup gate and the runtime gate cannot
+    // enforce different rules.
+    if !args.admission_disabled {
+        admission::check_capacity_covers_batch(
+            admission::Limit::new("--admission-max-concurrent", args.admission_max_concurrent),
+            admission::Limit::new("--admission-max-queue", args.admission_max_queue),
+            admission::Limit::new(
+                "--batch-item-concurrency",
+                u64::from(args.batch_item_concurrency),
+            ),
+        )
+        .map_err(|e| eyre::eyre!(e))?;
     }
     // The batch builder holds whole entry bodies, so a batch cap below one entry's cap could
     // never assemble even a single maximal response — and it must clear it by enough for the
@@ -1161,22 +1161,18 @@ async fn main() -> Result<()> {
 
     // The bound admin address, kept only for the record; the listener itself is owned by its
     // own thread for the process's lifetime (see `admin::spawn`).
-    let _admin_addr = match (admin_bind_addr(&args)?, admission) {
+    match (admin_bind_addr(&args)?, admission) {
         (Some(admin_addr), Some(limiter)) => {
-            Some(admin::spawn(admin_addr, limiter, u64::from(args.batch_item_concurrency))?)
+            admin::spawn(admin_addr, limiter, u64::from(args.batch_item_concurrency))?;
         }
         (Some(_), None) => {
             warn!("--admin-addr is set but --admission-disabled: no limits to serve, skipping");
-            None
         }
-        (None, _) => {
-            warn!(
-                "--admin-addr not set: admission limits are fixed for this process's lifetime \
-                 and can only be changed by restarting"
-            );
-            None
-        }
-    };
+        (None, _) => warn!(
+            "--admin-addr not set: admission limits are fixed for this process's lifetime and \
+             can only be changed by restarting"
+        ),
+    }
 
     info!(listen_addr = %addr, "Server started");
     handle.stopped().await;
@@ -1190,23 +1186,24 @@ async fn main() -> Result<()> {
 /// the failure mode of an omission here is an unprotected endpoint, discovered under load.
 /// `debug_getCacheStatus` is the one deliberate exemption; see `metrics::GATED_METHODS`.
 fn assert_admission_covers_module(module: &jsonrpsee::server::RpcModule<()>) {
-    if let Some(name) = ungated_method(module.method_names()) {
+    if let Some(name) = unregistered_method(module.method_names()) {
         panic!(
-            "method {name} is registered but neither gated by admission control nor \
-             deliberately exempt; add it to metrics::GATED_METHODS or to the exemption list"
+            "method {name} is registered on the RPC module but absent from \
+             metrics::ALL_METHODS, so admission control lets it through ungated and its \
+             metrics collapse onto the `unknown` label; add it there"
         );
     }
 }
 
-/// The first registered method that is neither gated nor deliberately exempt, if any.
-fn ungated_method<'a>(names: impl Iterator<Item = &'a str>) -> Option<&'a str> {
-    // The one endpoint that does no I/O and reports what the server is doing; see
-    // `metrics::GATED_METHODS` for why it is exempt.
-    const EXEMPT: &[&str] =
-        &[metrics::METHOD_DEBUG_GET_CACHE_STATUS, metrics::TIMED_METHOD_DEBUG_GET_CACHE_STATUS];
-    names
-        .filter(|name| !EXEMPT.contains(name))
-        .find(|name| !metrics::is_gated(metrics::method_label(name)))
+/// The first method registered on the module that `metrics` does not know about, if any.
+///
+/// Gating is derived — everything in `metrics::ALL_METHODS` is gated unless it is in
+/// `metrics::GATE_EXEMPT_METHODS` — so a registered method can no longer be *accidentally*
+/// ungated by omission from a second list. What can still happen is registering a method the
+/// metrics registry has never heard of, which both bypasses the gate and collapses its metrics
+/// onto `unknown`. That is the one condition worth failing startup over.
+fn unregistered_method<'a>(mut names: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    names.find(|name| !metrics::is_registered(name))
 }
 
 /// Initializes the validator database if data_dir is provided.
@@ -1710,19 +1707,27 @@ mod tests {
     /// The admission allowlist is spelled by name, so a method added later would silently
     /// never be gated — an unprotected endpoint, discovered under load.
     #[test]
-    fn every_registered_method_is_gated_or_deliberately_exempt() {
-        let registered: Vec<&str> = metrics::ALL_METHOD_NAMES
+    fn every_registered_method_is_known_to_metrics() {
+        let registered: Vec<&str> = metrics::ALL_METHODS
             .iter()
             .copied()
             .chain(metrics::TIMED_METHOD_ALIASES.iter().map(|(alias, _)| *alias))
             .collect();
-        assert_eq!(ungated_method(registered.iter().copied()), None);
+        assert_eq!(unregistered_method(registered.iter().copied()), None);
 
         assert_eq!(
-            ungated_method(["debug_traceBlockByNumber", "debug_newThing"].into_iter()),
+            unregistered_method(["debug_traceBlockByNumber", "debug_newThing"].into_iter()),
             Some("debug_newThing"),
-            "an unrecognized method must be reported, not folded into `unknown` and ignored"
+            "a method metrics has never heard of must be reported, not silently ungated"
         );
+
+        // Gating is derived, so the exemption is spelled once and both spellings resolve alike.
+        assert!(metrics::is_gated(metrics::METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER));
+        for name in
+            [metrics::METHOD_DEBUG_GET_CACHE_STATUS, metrics::TIMED_METHOD_DEBUG_GET_CACHE_STATUS]
+        {
+            assert!(!metrics::is_gated(metrics::method_label(name)), "{name} stays exempt");
+        }
     }
 
     #[test]

@@ -37,7 +37,6 @@ use quick_cache::{Lifecycle, Weighter, sync::Cache};
 use tracing::debug;
 
 use crate::{
-    admission::TraceWeight,
     metrics::{CACHE_TYPE_DEBUG_TRACE, CACHE_TYPE_TRACE, CacheMetrics, CacheStats},
     raw_json::RawJson,
 };
@@ -166,6 +165,26 @@ impl ResponseVariant {
     }
 }
 
+/// How much of the process's memory budget a request's tracer is expected to want.
+///
+/// Lives beside [`RequestShape`], which produces it, rather than beside the gate that consumes
+/// it: the classification is a property of the request, and the dependency should point from
+/// the policy layer to the domain rather than back.
+///
+/// The distinction exists because one execution budget cannot serve both: sized for the
+/// `callTracer` traffic that has been measured clean it admits hundreds of concurrent blocks,
+/// and hundreds of concurrent `prestateTracer` traces over large blocks is the shape that has
+/// already OOM-killed this server once. [`TraceWeight::Heavy`] requests pass a second, much
+/// smaller budget first, so the worst-case resident set is a number an operator can compute
+/// rather than a property of what clients happen to ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceWeight {
+    /// Bounded output per transaction; the request's cost is dominated by the fetch.
+    Normal,
+    /// Output can run to hundreds of megabytes on a large block.
+    Heavy,
+}
+
 /// Classification of a trace request's parameters — the single source of truth shared by
 /// the cache whitelist, the shape metrics, and malformed-config rejection.
 #[derive(Debug)]
@@ -256,7 +275,6 @@ impl RequestShape {
         }
     }
 
-    /// Metrics shape label for this request.
     /// How much memory this request's tracer is expected to want, for the admission gate's
     /// heavy sub-cap.
     ///
@@ -284,6 +302,7 @@ impl RequestShape {
         }
     }
 
+    /// Metrics shape label for this request.
     pub fn label(&self) -> &'static str {
         match self {
             Self::Cacheable(variant) => variant.label(),

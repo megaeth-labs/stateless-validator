@@ -355,6 +355,31 @@ where
     }
 }
 
+/// JSON-RPC POST helpers shared by every in-crate test that drives a real server.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::net::SocketAddr;
+
+    use serde_json::Value;
+
+    pub(crate) async fn post_text(addr: SocketAddr, body: String) -> String {
+        reqwest::Client::new()
+            .post(format!("http://{addr}"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    }
+
+    pub(crate) async fn post_raw(addr: SocketAddr, body: String) -> Value {
+        serde_json::from_str(&post_text(addr, body).await).unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -368,7 +393,7 @@ mod tests {
     };
     use serde_json::{Value, json};
 
-    use super::*;
+    use super::{test_support::*, *};
 
     const SLOW_MS: u64 = 200;
     const SPIN_MS: u64 = 40;
@@ -457,23 +482,6 @@ mod tests {
         let server = Server::builder().build("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr().unwrap();
         (addr, server.start(test_module()))
-    }
-
-    async fn post_text(addr: SocketAddr, body: String) -> String {
-        reqwest::Client::new()
-            .post(format!("http://{addr}"))
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await
-            .unwrap()
-            .text()
-            .await
-            .unwrap()
-    }
-
-    async fn post_raw(addr: SocketAddr, body: String) -> Value {
-        serde_json::from_str(&post_text(addr, body).await).unwrap()
     }
 
     /// The cancel guard counts a drop as a cancellation only while armed — not after
@@ -795,7 +803,7 @@ mod tests {
         let _held = limiter
             .acquire_execution(
                 crate::metrics::METHOD_TRACE_BLOCK,
-                false,
+                crate::response_cache::TraceWeight::Normal,
                 Instant::now() + Duration::from_secs(30),
             )
             .await

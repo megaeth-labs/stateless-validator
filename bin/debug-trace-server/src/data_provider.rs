@@ -95,6 +95,15 @@ impl WitnessFetchConfig {
     }
 }
 
+/// The share of a request's budget held back from the admission queue for the work itself.
+///
+/// A free function rather than a method: it is two `Duration`s in and one out, and reaching it
+/// through a `DataProvider` would make its tests stand up an RPC client and four caches to
+/// assert a subtraction.
+fn permit_reserve(witness_timeout: Duration, block_fetch_timeout: Duration) -> Duration {
+    if witness_timeout < block_fetch_timeout { witness_timeout } else { block_fetch_timeout / 2 }
+}
+
 /// Block data bundle containing all information needed for stateless execution.
 ///
 /// This struct aggregates the block, its witness (state proof), and all
@@ -561,8 +570,7 @@ impl DataProvider {
 
     /// The share of a request's budget held back from the admission queue for the work itself.
     fn permit_reserve(&self) -> Duration {
-        let witness = self.witness_cfg.witness_timeout;
-        if witness < self.block_fetch_timeout { witness } else { self.block_fetch_timeout / 2 }
+        permit_reserve(self.witness_cfg.witness_timeout, self.block_fetch_timeout)
     }
 
     /// The longest a request may wait for an execution permit under the configured budgets —
@@ -1865,40 +1873,33 @@ mod tests {
     /// pointing an operator at client load rather than at their own timeout setting.
     #[test]
     fn permit_reserve_never_swallows_the_whole_budget() {
-        let reserve = |witness_secs: u64, fetch_secs: u64| {
-            let provider = DataProvider::new(
-                Arc::new(
-                    RpcClient::new_with_config(
-                        &["http://127.0.0.1:1"],
-                        &["http://127.0.0.1:1"],
-                        RpcClientConfig::trace_server(),
-                        None,
-                    )
-                    .unwrap(),
-                ),
-                None,
-                None,
-                test_support::noop_contract_cache(),
-                WitnessFetchConfig::with_defaults(witness_secs),
-                Duration::from_secs(fetch_secs),
-                1024,
+        let secs = Duration::from_secs;
+        for (witness, block_fetch, expected_reserve, note) in [
+            (8u64, 13u64, secs(8), "the ordinary case: the witness stage keeps its full budget"),
+            (20, 13, secs(13) / 2, "inverted: capped at half, so the queue keeps the other half"),
+            (13, 13, secs(13) / 2, "equal budgets are the boundary and must stay usable"),
+        ] {
+            let reserve = permit_reserve(secs(witness), secs(block_fetch));
+            assert_eq!(reserve, expected_reserve, "{note}");
+            assert!(
+                reserve < secs(block_fetch),
+                "{note}: a reserve equal to the whole budget would leave a zero-length permit \
+                 wait, silently reducing --admission-max-queue to a no-op"
             );
-            (provider.max_permit_wait(), provider.permit_cutoff(provider.fetch_deadline()))
-        };
+        }
+    }
 
-        // The ordinary case: the witness stage keeps its full budget, the queue gets the rest.
-        let (wait, cutoff) = reserve(8, 13);
-        assert_eq!(wait, Duration::from_secs(5), "13s budget less the 8s witness reserve");
-        assert!(cutoff > Instant::now(), "a request may still wait");
-
-        // The inverted case: the reserve is capped at half, so the queue keeps the other half.
-        let (wait, cutoff) = reserve(20, 13);
-        assert_eq!(wait, Duration::from_secs(13) - Duration::from_secs(13) / 2);
-        assert!(cutoff > Instant::now(), "the queue is still usable, not silently inert");
-
-        // Equal budgets are the boundary of the old behaviour and must stay usable too.
-        let (wait, _) = reserve(13, 13);
-        assert_eq!(wait, Duration::from_secs(13) / 2);
+    /// The provider hands that same reserve to the cutoff a request actually waits against.
+    #[test]
+    fn permit_cutoff_leaves_the_queue_usable() {
+        let provider = provider_with_tiers(
+            "http://127.0.0.1:1",
+            None,
+            None,
+            test_support::noop_contract_cache(),
+        );
+        assert!(provider.max_permit_wait() > Duration::ZERO, "the queue is not a no-op");
+        assert!(provider.permit_cutoff(provider.fetch_deadline()) > Instant::now());
     }
 
     /// [`provider_with_tiers`] with no memory cache and an empty noop-backed contract

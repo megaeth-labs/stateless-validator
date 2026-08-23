@@ -28,16 +28,18 @@ use eyre::{Result, eyre};
 use jsonrpsee::{
     core::RpcResult,
     proc_macros::rpc,
-    server::{Server, ServerConfig},
-    types::{ErrorObjectOwned, error::INVALID_PARAMS_CODE},
+    server::{Server, ServerConfig, ServerHandle},
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tracing::{info, warn};
 
-use crate::admission::AdmissionLimiter;
+use crate::{
+    admission::{AdmissionLimiter, Limit, check_capacity_covers_batch},
+    rpc_service::invalid_params_err,
+};
 
 /// A snapshot of the gate: what it is enforcing, and what it currently holds.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConcurrencyLimitInfo {
     /// Requests admitted but not yet holding an execution permit.
@@ -94,10 +96,6 @@ impl AdminApi {
     }
 }
 
-fn invalid_params(message: impl Into<String>) -> ErrorObjectOwned {
-    ErrorObjectOwned::owned(INVALID_PARAMS_CODE, message.into(), None::<()>)
-}
-
 #[jsonrpsee::core::async_trait]
 impl AdminRpcServer for AdminApi {
     async fn get_concurrency_limit(&self) -> RpcResult<ConcurrencyLimitInfo> {
@@ -114,29 +112,28 @@ impl AdminRpcServer for AdminApi {
         // left running to release one. Refused rather than clamped: silently substituting a
         // different limit than the one asked for is worse than saying no.
         if max_concurrent == Some(0) {
-            return Err(invalid_params(
+            return Err(invalid_params_err(
                 "maxConcurrent must be at least 1: zero would park every request with nothing \
                  running to release a permit",
             ));
         }
         if heavy_max_concurrent == Some(0) {
-            return Err(invalid_params(
+            return Err(invalid_params_err(
                 "heavyMaxConcurrent must be at least 1: zero would park every heavy-tracer \
                  request with nothing running to release a permit",
             ));
         }
-        let resulting_concurrent = max_concurrent.unwrap_or_else(|| self.limiter.max_concurrent());
-        let resulting_queue = max_queue_size.unwrap_or_else(|| self.limiter.max_queue());
-        let resulting_capacity = resulting_concurrent.saturating_add(resulting_queue);
-        if resulting_capacity < self.batch_item_concurrency {
-            return Err(invalid_params(format!(
-                "maxConcurrent ({resulting_concurrent}) + maxQueueSize ({resulting_queue}) must \
-                 be at least the batch item concurrency ({}): one batch's entries admit \
-                 independently, so a smaller gate sheds part of every batch even on an idle \
-                 server",
-                self.batch_item_concurrency
-            )));
-        }
+        // The same rule startup enforces, in this caller's vocabulary — see
+        // `admission::check_capacity_covers_batch`.
+        check_capacity_covers_batch(
+            Limit::new(
+                "maxConcurrent",
+                max_concurrent.unwrap_or_else(|| self.limiter.max_concurrent()),
+            ),
+            Limit::new("maxQueueSize", max_queue_size.unwrap_or_else(|| self.limiter.max_queue())),
+            Limit::new("the batch item concurrency", self.batch_item_concurrency),
+        )
+        .map_err(invalid_params_err)?;
 
         let before = self.snapshot();
         if let Some(permits) = max_concurrent {
@@ -178,40 +175,17 @@ pub(crate) fn spawn(
     let (tx, rx) = std::sync::mpsc::channel();
     thread::Builder::new()
         .name("dts-admin".to_owned())
-        .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(runtime) => runtime,
-                Err(e) => {
-                    let _ = tx.send(Err(eyre!("failed to build the admin runtime: {e}")));
-                    return;
-                }
-            };
-            runtime.block_on(async move {
-                // A handful of connections is all an operator or a probe needs, and this port
-                // is unauthenticated.
-                let config = ServerConfig::builder().max_connections(8).build();
-                let server = match Server::builder().set_config(config).build(addr).await {
-                    Ok(server) => server,
-                    Err(e) => {
-                        let _ = tx.send(Err(eyre!("failed to bind --admin-addr ({addr}): {e}")));
-                        return;
-                    }
-                };
-                let bound = match server.local_addr() {
-                    Ok(bound) => bound,
-                    Err(e) => {
-                        let _ = tx.send(Err(eyre!("admin listener has no local address: {e}")));
-                        return;
-                    }
-                };
-                let api = AdminApi { limiter, batch_item_concurrency };
-                let handle = server.start(api.into_rpc());
+        .spawn(move || match bind(addr, limiter, batch_item_concurrency) {
+            Ok((runtime, bound, handle)) => {
                 if tx.send(Ok(bound)).is_err() {
                     warn!("admin listener started but its caller is gone; shutting it down");
                     return;
                 }
-                handle.stopped().await;
-            });
+                runtime.block_on(handle.stopped());
+            }
+            Err(e) => {
+                let _ = tx.send(Err(e));
+            }
         })
         .map_err(|e| eyre!("failed to spawn the admin listener thread: {e}"))?;
 
@@ -221,9 +195,41 @@ pub(crate) fn spawn(
     Ok(bound)
 }
 
+/// Builds the admin runtime and starts the listener on it, returning both so the caller's
+/// thread can own them for the process's lifetime.
+///
+/// Split out so every failure funnels through one `?` chain instead of three hand-written
+/// send-and-return arms, each of which had to remember to do both.
+fn bind(
+    addr: SocketAddr,
+    limiter: Arc<AdmissionLimiter>,
+    batch_item_concurrency: u64,
+) -> Result<(tokio::runtime::Runtime, SocketAddr, ServerHandle)> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| eyre!("failed to build the admin runtime: {e}"))?;
+    let (bound, handle) = runtime.block_on(async {
+        // A handful of connections is all an operator or a probe needs, and this port is
+        // unauthenticated.
+        let config = ServerConfig::builder().max_connections(8).build();
+        let server = Server::builder()
+            .set_config(config)
+            .build(addr)
+            .await
+            .map_err(|e| eyre!("failed to bind --admin-addr ({addr}): {e}"))?;
+        let bound =
+            server.local_addr().map_err(|e| eyre!("admin listener has no local address: {e}"))?;
+        let api = AdminApi { limiter, batch_item_concurrency };
+        Ok::<_, eyre::Report>((bound, server.start(api.into_rpc())))
+    })?;
+    Ok((runtime, bound, handle))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{response_cache::TraceWeight, rpc_middleware::test_support::post_raw};
 
     const BATCH_ITEM_CONCURRENCY: u64 = 16;
 
@@ -234,14 +240,10 @@ mod tests {
         }
     }
 
-    fn block_on<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
-    }
-
-    #[test]
-    fn get_reports_limits_and_occupancy() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_reports_limits_and_occupancy() {
         let api = api(4, 32, 2);
-        let info = block_on(api.get_concurrency_limit()).expect("get");
+        let info = api.get_concurrency_limit().await.expect("get");
         assert_eq!(info.max_concurrent, 4);
         assert_eq!(info.max_queue_size, 32);
         assert_eq!(info.heavy_max_concurrent, 2);
@@ -249,10 +251,10 @@ mod tests {
         assert_eq!(info.executing_requests, 0);
     }
 
-    #[test]
-    fn set_applies_only_the_fields_given() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_applies_only_the_fields_given() {
         let api = api(4, 32, 2);
-        let info = block_on(api.set_concurrency_limit(Some(9), None, None)).expect("set");
+        let info = api.set_concurrency_limit(Some(9), None, None).await.expect("set");
         assert_eq!(info.max_concurrent, 9);
         assert_eq!(info.max_queue_size, 32, "an omitted field is left alone");
         assert_eq!(info.heavy_max_concurrent, 2);
@@ -262,13 +264,15 @@ mod tests {
     /// Zero execution permits would park every subsequent request with nothing left running
     /// to release one — a state only a restart recovers from. Refused rather than clamped:
     /// quietly enforcing a different limit than the one asked for is its own failure.
-    #[test]
-    fn set_rejects_zero_permits() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_rejects_zero_permits() {
         let api = api(4, 32, 2);
         for (concurrent, heavy) in [(Some(0), None), (None, Some(0))] {
-            let err = block_on(api.set_concurrency_limit(concurrent, None, heavy))
+            let err = api
+                .set_concurrency_limit(concurrent, None, heavy)
+                .await
                 .expect_err("zero permits must be refused");
-            assert_eq!(err.code(), INVALID_PARAMS_CODE);
+            assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
         }
         assert_eq!(api.limiter.max_concurrent(), 4, "a refused write changes nothing");
         assert_eq!(api.limiter.heavy_max_concurrent(), 2);
@@ -276,65 +280,61 @@ mod tests {
 
     /// The same rule startup enforces: a gate narrower than one batch's concurrent entries
     /// sheds part of every batch even on an idle server, so the setter refuses to create it.
-    #[test]
-    fn set_rejects_a_gate_narrower_than_one_batch() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_rejects_a_gate_narrower_than_one_batch() {
         let api = api(4, 32, 2);
-        let err = block_on(api.set_concurrency_limit(Some(1), Some(1), None))
+        let err = api
+            .set_concurrency_limit(Some(1), Some(1), None)
+            .await
             .expect_err("2 total is below the batch item concurrency");
-        assert_eq!(err.code(), INVALID_PARAMS_CODE);
+        assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE);
         assert_eq!(api.limiter.max_concurrent(), 4);
         assert_eq!(api.limiter.max_queue(), 32);
 
-        block_on(api.set_concurrency_limit(Some(1), Some(BATCH_ITEM_CONCURRENCY - 1), None))
+        api.set_concurrency_limit(Some(1), Some(BATCH_ITEM_CONCURRENCY - 1), None)
+            .await
             .expect("exactly at the floor is allowed");
     }
 
     /// Lowering a limit below current occupancy must not abort anything — it stops admitting
     /// until the excess drains. The opposite would make a routine retune a client-visible
     /// incident.
-    #[test]
-    fn lowering_a_limit_does_not_abort_in_flight_work() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lowering_a_limit_does_not_abort_in_flight_work() {
         let api = api(4, 32, 2);
-        block_on(async {
-            let cutoff = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            let held = api
-                .limiter
-                .acquire_execution(crate::metrics::METHOD_TRACE_BLOCK, false, cutoff)
-                .await
-                .expect("permit");
-            api.set_concurrency_limit(Some(1), None, None).await.expect("set");
-            assert_eq!(api.limiter.executing(), 1, "the in-flight request kept its permit");
-            drop(held);
-        });
+        let cutoff = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let held = api
+            .limiter
+            .acquire_execution(crate::metrics::METHOD_TRACE_BLOCK, TraceWeight::Normal, cutoff)
+            .await
+            .expect("permit");
+        api.set_concurrency_limit(Some(1), None, None).await.expect("set");
+        assert_eq!(api.limiter.executing(), 1, "the in-flight request kept its permit");
+        drop(held);
     }
 
     /// The listener binds, serves the namespace, and a write over the wire reaches the
     /// limiter the request path reads.
-    #[test]
-    fn admin_listener_binds_and_serves() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admin_listener_binds_and_serves() {
         let limiter = AdmissionLimiter::new(4, 32, 2);
         let addr = spawn("127.0.0.1:0".parse().unwrap(), Arc::clone(&limiter), 16)
             .expect("the admin listener binds");
 
-        let post = |body: &str| {
-            reqwest::blocking::Client::new()
-                .post(format!("http://{addr}"))
-                .header("content-type", "application/json")
-                .body(body.to_owned())
-                .send()
-                .unwrap()
-                .json::<serde_json::Value>()
-                .unwrap()
-        };
-
-        let got =
-            post(r#"{"jsonrpc":"2.0","id":1,"method":"admin_getConcurrencyLimit","params":[]}"#);
+        let got = post_raw(
+            addr,
+            r#"{"jsonrpc":"2.0","id":1,"method":"admin_getConcurrencyLimit","params":[]}"#.into(),
+        )
+        .await;
         assert_eq!(got["result"]["maxConcurrent"], serde_json::json!(4));
         assert_eq!(got["result"]["maxQueueSize"], serde_json::json!(32));
 
-        let set = post(
-            r#"{"jsonrpc":"2.0","id":2,"method":"admin_setConcurrencyLimit","params":[64,128,3]}"#,
-        );
+        let set = post_raw(
+            addr,
+            r#"{"jsonrpc":"2.0","id":2,"method":"admin_setConcurrencyLimit","params":[64,128,3]}"#
+                .into(),
+        )
+        .await;
         assert_eq!(set["result"]["maxConcurrent"], serde_json::json!(64));
         assert_eq!(limiter.max_concurrent(), 64, "the wire write reached the live limiter");
         assert_eq!(limiter.max_queue(), 128);

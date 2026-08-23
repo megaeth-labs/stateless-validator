@@ -62,7 +62,10 @@ use jsonrpsee::server::middleware::rpc::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tower::Layer;
 
-use crate::metrics::{self, AdmissionMetrics};
+use crate::{
+    metrics::{self, AdmissionMetrics},
+    response_cache::TraceWeight,
+};
 
 /// JSON-RPC error code for a request turned away by the gate.
 ///
@@ -74,9 +77,12 @@ pub(crate) const QUEUE_FULL_CODE: i32 = -32013;
 /// The message paired with [`QUEUE_FULL_CODE`], byte-identical to mega-reth's.
 pub(crate) const QUEUE_FULL_MESSAGE: &str = "Request queue is full";
 
-/// Builds the shed error response body.
-fn queue_full_error() -> jsonrpsee::types::ErrorObjectOwned {
-    jsonrpsee::types::ErrorObjectOwned::owned(QUEUE_FULL_CODE, QUEUE_FULL_MESSAGE, None::<()>)
+/// Builds the shed error response body — the single construction site for the shed contract.
+///
+/// `borrowed` rather than `owned`: the message is a `&'static str`, so this allocates nothing
+/// on the one path that by definition runs while the process is already under strain.
+pub(crate) fn queue_full_error() -> jsonrpsee::types::ErrorObjectOwned {
+    jsonrpsee::types::ErrorObject::borrowed(QUEUE_FULL_CODE, QUEUE_FULL_MESSAGE, None)
 }
 
 /// A permit count that can be raised and lowered while requests are in flight, without
@@ -188,6 +194,76 @@ impl ResizableSemaphore {
     fn checked_out(&self) -> usize {
         self.checked_out.load(Ordering::Relaxed)
     }
+
+    /// Acquires one permit, giving up at `cutoff`.
+    async fn acquire(self: &Arc<Self>, cutoff: Instant) -> Result<DebtAwarePermit, AdmissionError> {
+        let sem = Arc::clone(&self.sem);
+        let permit = tokio::time::timeout_at(cutoff.into(), sem.acquire_owned())
+            .await
+            .map_err(|_| AdmissionError::Overloaded)?
+            // The semaphore is never closed for the process's lifetime.
+            .map_err(|_| AdmissionError::Overloaded)?;
+        self.checked_out.fetch_add(1, Ordering::Acquire);
+        Ok(DebtAwarePermit { permit: Some(permit), owner: Arc::clone(self) })
+    }
+}
+
+/// How a caller spells a limit, so a shared rule can name it in the caller's own vocabulary —
+/// CLI flags at startup, JSON fields over the admin RPC. The same shape as
+/// `stateless_common::R2Flag`, and for the same reason: the rule and its rationale exist once
+/// while each entry point still produces an error its own audience recognizes.
+pub(crate) struct Limit<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) value: u64,
+}
+
+impl<'a> Limit<'a> {
+    pub(crate) fn new(name: &'a str, value: u64) -> Self {
+        Self { name, value }
+    }
+}
+
+/// Rejects a gate too narrow to admit one batch's worth of concurrent entries.
+///
+/// A batch's entries admit independently, so a total below `--batch-item-concurrency` sheds
+/// part of every batch on a completely idle server. Enforced identically at startup and on the
+/// admin RPC, because a rule written twice is a rule that drifts.
+pub(crate) fn check_capacity_covers_batch(
+    concurrent: Limit<'_>,
+    queue: Limit<'_>,
+    batch: Limit<'_>,
+) -> Result<(), String> {
+    if concurrent.value.saturating_add(queue.value) >= batch.value {
+        return Ok(());
+    }
+    Err(format!(
+        "{} ({}) + {} ({}) must be at least {} ({}): one batch's entries admit independently, \
+         so a smaller gate sheds part of every batch even on an idle server",
+        concurrent.name, concurrent.value, queue.name, queue.value, batch.name, batch.value
+    ))
+}
+
+/// Claims one unit of a bounded counter, or reports that the bound is already reached.
+///
+/// The lock-free half of admission, shared by the process-wide gate and the heavy-class gate:
+/// the subtle part is the pair of orderings (`Acquire` on the claim, `Release` in the guard
+/// that releases it), and a second copy would let those drift with nothing to catch it.
+fn try_claim(counter: &AtomicUsize, capacity: u64) -> bool {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        if current as u64 >= capacity {
+            return false;
+        }
+        match counter.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 /// Tokio panics past this, and the admin RPC takes operator input.
@@ -210,29 +286,6 @@ impl Drop for DebtAwarePermit {
                 permit.forget();
             }
         }
-    }
-}
-
-/// How much of the process's memory budget a request's tracer is expected to want.
-///
-/// The distinction exists because one execution budget cannot serve both: sized for the
-/// `callTracer` traffic that has been measured clean it admits hundreds of concurrent
-/// blocks, and hundreds of concurrent `prestateTracer` traces over large blocks is the
-/// shape that has already OOM-killed this server once. [`TraceWeight::Heavy`] requests pass
-/// a second, much smaller budget first, so the worst-case resident set is a number an
-/// operator can compute rather than a property of what clients happen to ask for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TraceWeight {
-    /// Bounded output per transaction; the request's cost is dominated by the fetch.
-    Normal,
-    /// Output can run to hundreds of megabytes on a large block.
-    Heavy,
-}
-
-impl TraceWeight {
-    /// Whether this request must pass the heavy sub-cap.
-    pub(crate) fn is_heavy(self) -> bool {
-        matches!(self, Self::Heavy)
     }
 }
 
@@ -356,26 +409,11 @@ impl AdmissionLimiter {
     /// `None` means shed. This is the "can this request be served at all" question answered
     /// before any parsing, fetching or tracing happens.
     fn try_admit(self: &Arc<Self>, method: &'static str) -> Option<InFlightGuard> {
-        let capacity = self.capacity();
-        let mut current = self.in_flight.load(Ordering::Relaxed);
-        loop {
-            if current as u64 >= capacity {
-                return None;
-            }
-            match self.in_flight.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    let gauges = AdmissionMetrics::new_for_method(method);
-                    gauges.in_flight_delta(1.0);
-                    return Some(InFlightGuard { limiter: Arc::clone(self), gauges });
-                }
-                Err(actual) => current = actual,
-            }
-        }
+        try_claim(&self.in_flight, self.capacity()).then(|| {
+            let gauges = AdmissionMetrics::new_for_method(method);
+            gauges.in_flight_delta(1.0);
+            InFlightGuard { limiter: Arc::clone(self), gauges }
+        })
     }
 
     /// Waits for the permits this request needs to fetch and replay a block.
@@ -393,18 +431,18 @@ impl AdmissionLimiter {
     pub(crate) async fn acquire_execution(
         self: &Arc<Self>,
         method: &'static str,
-        heavy: bool,
+        weight: TraceWeight,
         cutoff: Instant,
     ) -> Result<ExecutionPermit, AdmissionError> {
         let started = Instant::now();
-        let heavy_permit = if heavy {
+        let heavy_permit = if weight == TraceWeight::Heavy {
             let _slot = self.enter_heavy()?;
-            let permit = HeavyPermit::new(acquire_by(&self.heavy, cutoff).await?);
+            let permit = HeavyPermit::new(self.heavy.acquire(cutoff).await?);
             Some((permit, _slot))
         } else {
             None
         };
-        let permit = acquire_by(&self.execution, cutoff).await?;
+        let permit = self.execution.acquire(cutoff).await?;
         metrics::record_admission_permit_wait(started.elapsed().as_secs_f64());
 
         let gauges = AdmissionMetrics::new_for_method(method);
@@ -414,38 +452,10 @@ impl AdmissionLimiter {
 
     /// Claims one of the heavy class's slots, or refuses when it already holds its share.
     fn enter_heavy(self: &Arc<Self>) -> Result<HeavySlot, AdmissionError> {
-        let capacity = self.heavy_capacity();
-        let mut current = self.heavy_in_flight.load(Ordering::Relaxed);
-        loop {
-            if current as u64 >= capacity {
-                return Err(AdmissionError::Overloaded);
-            }
-            match self.heavy_in_flight.compare_exchange_weak(
-                current,
-                current + 1,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return Ok(HeavySlot { limiter: Arc::clone(self) }),
-                Err(actual) => current = actual,
-            }
-        }
+        try_claim(&self.heavy_in_flight, self.heavy_capacity())
+            .then(|| HeavySlot { limiter: Arc::clone(self) })
+            .ok_or(AdmissionError::Overloaded)
     }
-}
-
-/// Acquires one permit, giving up at `cutoff`.
-async fn acquire_by(
-    semaphore: &Arc<ResizableSemaphore>,
-    cutoff: Instant,
-) -> Result<DebtAwarePermit, AdmissionError> {
-    let sem = Arc::clone(&semaphore.sem);
-    let permit = tokio::time::timeout_at(cutoff.into(), sem.acquire_owned())
-        .await
-        .map_err(|_| AdmissionError::Overloaded)?
-        // The semaphore is never closed for the process's lifetime.
-        .map_err(|_| AdmissionError::Overloaded)?;
-    semaphore.checked_out.fetch_add(1, Ordering::Acquire);
-    Ok(DebtAwarePermit { permit: Some(permit), owner: Arc::clone(semaphore) })
 }
 
 /// Holds one of the heavy class's share of the admitted budget.
@@ -607,8 +617,22 @@ mod tests {
     const METHOD: &str = METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER;
 
     /// A cutoff far enough away that a test never trips the deadline clamp by accident.
-    fn far() -> Instant {
+    pub(crate) fn far() -> Instant {
         Instant::now() + Duration::from_secs(30)
+    }
+
+    /// Takes `n` ordinary execution permits and hands them back for the caller to hold.
+    async fn hold(limiter: &Arc<AdmissionLimiter>, n: usize) -> Vec<ExecutionPermit> {
+        let mut held = Vec::with_capacity(n);
+        for _ in 0..n {
+            held.push(
+                limiter
+                    .acquire_execution(METHOD, TraceWeight::Normal, far())
+                    .await
+                    .expect("permit"),
+            );
+        }
+        held
     }
 
     #[test]
@@ -633,8 +657,8 @@ mod tests {
         assert!(limiter.try_admit(METHOD).is_some());
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn queue_is_zero_means_execute_or_shed() {
+    #[test]
+    fn queue_is_zero_means_execute_or_shed() {
         let limiter = AdmissionLimiter::new(1, 0, 1);
         let _first = limiter.try_admit(METHOD).expect("the one execution slot is admissible");
         assert!(limiter.try_admit(METHOD).is_none(), "with no queue there is nowhere to wait");
@@ -643,18 +667,22 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn heavy_requests_pass_both_budgets() {
         let limiter = AdmissionLimiter::new(8, 8, 1);
-        let heavy = limiter.acquire_execution(METHOD, true, far()).await.expect("first heavy");
+        let heavy = limiter
+            .acquire_execution(METHOD, TraceWeight::Heavy, far())
+            .await
+            .expect("first heavy");
         assert_eq!(limiter.executing(), 1);
 
         // The sub-cap is full, so a second heavy request waits even though seven ordinary
         // execution permits are free.
-        let blocked = limiter.acquire_execution(METHOD, true, Instant::now()).await;
+        let blocked = limiter.acquire_execution(METHOD, TraceWeight::Heavy, Instant::now()).await;
         assert_eq!(blocked.unwrap_err(), AdmissionError::Overloaded);
 
         // An ordinary request is unaffected by the heavy sub-cap.
-        let _normal = limiter.acquire_execution(METHOD, false, far()).await.expect("normal");
+        let _normal =
+            limiter.acquire_execution(METHOD, TraceWeight::Normal, far()).await.expect("normal");
         drop(heavy);
-        limiter.acquire_execution(METHOD, true, far()).await.expect("sub-cap freed");
+        limiter.acquire_execution(METHOD, TraceWeight::Heavy, far()).await.expect("sub-cap freed");
     }
 
     /// A request that queued past the point where its remaining budget could still cover the
@@ -663,11 +691,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn permit_wait_gives_up_at_the_cutoff() {
         let limiter = AdmissionLimiter::new(1, 8, 1);
-        let _held = limiter.acquire_execution(METHOD, false, far()).await.expect("first");
+        let _held =
+            limiter.acquire_execution(METHOD, TraceWeight::Normal, far()).await.expect("first");
 
         let started = Instant::now();
         let refused = limiter
-            .acquire_execution(METHOD, false, Instant::now() + Duration::from_millis(50))
+            .acquire_execution(
+                METHOD,
+                TraceWeight::Normal,
+                Instant::now() + Duration::from_millis(50),
+            )
             .await;
         assert_eq!(refused.unwrap_err(), AdmissionError::Overloaded);
         assert!(started.elapsed() < Duration::from_secs(5), "it gave up, it did not hang");
@@ -686,8 +719,10 @@ mod tests {
                 let limiter = Arc::clone(&limiter);
                 tasks.spawn(async move {
                     for _ in 0..250 {
-                        let permit =
-                            limiter.acquire_execution(METHOD, false, far()).await.expect("permit");
+                        let permit = limiter
+                            .acquire_execution(METHOD, TraceWeight::Normal, far())
+                            .await
+                            .expect("permit");
                         drop(permit);
                         tokio::task::yield_now().await;
                     }
@@ -709,12 +744,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn raising_the_limit_wakes_parked_waiters() {
         let limiter = AdmissionLimiter::new(1, 64, 1);
-        let _held = limiter.acquire_execution(METHOD, false, far()).await.expect("first");
+        let _held =
+            limiter.acquire_execution(METHOD, TraceWeight::Normal, far()).await.expect("first");
 
         let mut waiters = tokio::task::JoinSet::new();
         for _ in 0..4 {
             let limiter = Arc::clone(&limiter);
-            waiters.spawn(async move { limiter.acquire_execution(METHOD, false, far()).await });
+            waiters.spawn(async move {
+                limiter.acquire_execution(METHOD, TraceWeight::Normal, far()).await
+            });
         }
         // Let them all reach the wait before the capacity appears.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -739,13 +777,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shrinking_below_checked_out_permits_settles_on_release() {
         let limiter = AdmissionLimiter::new(4, 64, 1);
-        let held: Vec<_> = {
-            let mut held = Vec::new();
-            for _ in 0..4 {
-                held.push(limiter.acquire_execution(METHOD, false, far()).await.expect("permit"));
-            }
-            held
-        };
+        let held = hold(&limiter, 4).await;
         assert_eq!(limiter.executing(), 4);
 
         limiter.set_max_concurrent(1);
@@ -753,9 +785,16 @@ mod tests {
 
         // Releasing three must not make three permits available again: they pay off the debt.
         drop(held);
-        let _one = limiter.acquire_execution(METHOD, false, far()).await.expect("the one permit");
+        let _one = limiter
+            .acquire_execution(METHOD, TraceWeight::Normal, far())
+            .await
+            .expect("the one permit");
         let second = limiter
-            .acquire_execution(METHOD, false, Instant::now() + Duration::from_millis(50))
+            .acquire_execution(
+                METHOD,
+                TraceWeight::Normal,
+                Instant::now() + Duration::from_millis(50),
+            )
             .await;
         assert_eq!(
             second.unwrap_err(),
@@ -783,7 +822,9 @@ mod tests {
         for _ in 0..12 {
             admitted.push(limiter.try_admit(METHOD).expect("admitted by the class-blind gate"));
             let limiter = Arc::clone(&limiter);
-            waiters.spawn(async move { limiter.acquire_execution(METHOD, true, far()).await });
+            waiters.spawn(async move {
+                limiter.acquire_execution(METHOD, TraceWeight::Heavy, far()).await
+            });
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -795,7 +836,7 @@ mod tests {
         // Which is the point: an ordinary request still gets a permit, because the execution
         // permits the heavy flood was not using are still reachable.
         let ordinary = limiter
-            .acquire_execution(METHOD, false, far())
+            .acquire_execution(METHOD, TraceWeight::Normal, far())
             .await
             .expect("ordinary traffic is not starved by a heavy flood");
         drop(ordinary);
@@ -808,10 +849,16 @@ mod tests {
         let limiter = AdmissionLimiter::new(8, 0, 2);
         assert_eq!(limiter.heavy_capacity(), 2, "no queue means no heavy waiters either");
 
-        let _first = limiter.acquire_execution(METHOD, true, far()).await.expect("first heavy");
-        let _second = limiter.acquire_execution(METHOD, true, far()).await.expect("second heavy");
+        let _first = limiter
+            .acquire_execution(METHOD, TraceWeight::Heavy, far())
+            .await
+            .expect("first heavy");
+        let _second = limiter
+            .acquire_execution(METHOD, TraceWeight::Heavy, far())
+            .await
+            .expect("second heavy");
         let started = Instant::now();
-        let refused = limiter.acquire_execution(METHOD, true, far()).await;
+        let refused = limiter.acquire_execution(METHOD, TraceWeight::Heavy, far()).await;
         assert_eq!(refused.unwrap_err(), AdmissionError::Overloaded);
         // Promptness is the assertion that discriminates: sharing the class-blind budget also
         // ends in `Overloaded`, but only after parking on the sub-cap until the cutoff — which
@@ -828,11 +875,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn heavy_occupancy_is_visible_while_waiting_for_an_execution_permit() {
         let limiter = AdmissionLimiter::new(1, 8, 1);
-        let _blocker = limiter.acquire_execution(METHOD, false, far()).await.expect("blocker");
+        let _blocker =
+            limiter.acquire_execution(METHOD, TraceWeight::Normal, far()).await.expect("blocker");
 
         let waiting = {
             let limiter = Arc::clone(&limiter);
-            tokio::spawn(async move { limiter.acquire_execution(METHOD, true, far()).await })
+            tokio::spawn(async move {
+                limiter.acquire_execution(METHOD, TraceWeight::Heavy, far()).await
+            })
         };
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -860,7 +910,9 @@ mod tests {
             let limiter = Arc::clone(&limiter);
             tasks.spawn(async move {
                 for _ in 0..200 {
-                    if let Ok(permit) = limiter.acquire_execution(METHOD, false, far()).await {
+                    if let Ok(permit) =
+                        limiter.acquire_execution(METHOD, TraceWeight::Normal, far()).await
+                    {
                         tokio::task::yield_now().await;
                         drop(permit);
                     }
@@ -911,12 +963,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn occupancy_stays_truthful_while_a_shrink_is_outstanding() {
         let limiter = AdmissionLimiter::new(4, 64, 4);
-        let mut admitted = Vec::new();
-        let mut held = Vec::new();
-        for _ in 0..4 {
-            admitted.push(limiter.try_admit(METHOD).expect("admit"));
-            held.push(limiter.acquire_execution(METHOD, false, far()).await.expect("permit"));
-        }
+        let _admitted: Vec<_> = (0..4).map(|_| limiter.try_admit(METHOD).expect("admit")).collect();
+        let mut held = hold(&limiter, 4).await;
         assert_eq!(limiter.executing(), 4);
 
         limiter.set_max_concurrent(1);
@@ -935,8 +983,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn heavy_occupancy_is_reported_separately() {
         let limiter = AdmissionLimiter::new(8, 8, 2);
-        let _heavy = limiter.acquire_execution(METHOD, true, far()).await.expect("heavy");
-        let _normal = limiter.acquire_execution(METHOD, false, far()).await.expect("normal");
+        let _heavy =
+            limiter.acquire_execution(METHOD, TraceWeight::Heavy, far()).await.expect("heavy");
+        let _normal =
+            limiter.acquire_execution(METHOD, TraceWeight::Normal, far()).await.expect("normal");
         assert_eq!(limiter.executing(), 2, "both hold an ordinary execution permit");
         assert_eq!(limiter.heavy_executing(), 1, "only one holds a heavy permit");
     }
@@ -946,10 +996,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_heavy_request_that_times_out_releases_its_sub_cap_permit() {
         let limiter = AdmissionLimiter::new(1, 8, 1);
-        let _blocker = limiter.acquire_execution(METHOD, false, far()).await.expect("blocker");
+        let _blocker =
+            limiter.acquire_execution(METHOD, TraceWeight::Normal, far()).await.expect("blocker");
 
         let refused = limiter
-            .acquire_execution(METHOD, true, Instant::now() + Duration::from_millis(50))
+            .acquire_execution(
+                METHOD,
+                TraceWeight::Heavy,
+                Instant::now() + Duration::from_millis(50),
+            )
             .await;
         assert_eq!(refused.unwrap_err(), AdmissionError::Overloaded);
         assert_eq!(
@@ -964,18 +1019,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn growing_cancels_outstanding_debt_first() {
         let limiter = AdmissionLimiter::new(4, 64, 1);
-        let mut held = Vec::new();
-        for _ in 0..4 {
-            held.push(limiter.acquire_execution(METHOD, false, far()).await.expect("permit"));
-        }
+        let held = hold(&limiter, 4).await;
         limiter.set_max_concurrent(1); // 4 checked out, 3 of debt
         limiter.set_max_concurrent(4); // back where we started; debt must simply vanish
         drop(held);
 
-        let mut regained = Vec::new();
-        for _ in 0..4 {
-            regained.push(limiter.acquire_execution(METHOD, false, far()).await.expect("permit"));
-        }
+        let _regained = hold(&limiter, 4).await;
         assert_eq!(limiter.executing(), 4, "all four permits came back, none forgotten twice");
     }
 
@@ -985,7 +1034,8 @@ mod tests {
         let _admitted: Vec<_> = (0..3).map(|_| limiter.try_admit(METHOD).expect("admit")).collect();
         assert_eq!(limiter.queued(), 3, "admitted, none executing yet");
 
-        let _permit = limiter.acquire_execution(METHOD, false, far()).await.expect("permit");
+        let _permit =
+            limiter.acquire_execution(METHOD, TraceWeight::Normal, far()).await.expect("permit");
         assert_eq!(limiter.executing(), 1);
         assert_eq!(limiter.queued(), 2);
     }

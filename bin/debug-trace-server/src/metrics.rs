@@ -63,11 +63,7 @@ pub const CACHE_TYPE_TRACE: &str = "trace_block";
 pub const CACHE_TYPE_BLOCK_DATA: &str = "block_data";
 
 // All known RPC methods (for resolving &str → &'static str)
-/// [`ALL_METHODS`] exposed for the admission-coverage test in `main`.
-#[cfg(test)]
-pub const ALL_METHOD_NAMES: &[&str] = ALL_METHODS;
-
-const ALL_METHODS: &[&str] = &[
+pub const ALL_METHODS: &[&str] = &[
     METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
     METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
     METHOD_DEBUG_TRACE_TRANSACTION,
@@ -76,30 +72,29 @@ const ALL_METHODS: &[&str] = &[
     METHOD_TRACE_TRANSACTION,
 ];
 
-/// The methods the inbound admission gate applies to: everything that fetches a block and
-/// runs a tracer, i.e. everything whose cost is a block-unit.
+/// Methods the inbound admission gate deliberately lets through.
 ///
-/// `debug_getCacheStatus` is deliberately absent — it is pure atomic reads, touches neither
-/// upstream nor EVM, and shedding the one endpoint an operator uses to ask what the server
-/// is doing, precisely while it is shedding, would be self-defeating. Unknown methods are
-/// absent too: the framework answers them `-32601` in microseconds, so gating buys nothing
-/// and would replace that with a misleading `-32013`.
+/// `debug_getCacheStatus` is pure atomic reads — it touches neither upstream nor EVM — and
+/// shedding the one endpoint an operator uses to ask what the server is doing, precisely while
+/// it is shedding, would be self-defeating.
 ///
-/// This is the single source of truth for the allowlist: the admission layer gates exactly
-/// these, and [`pre_register_all_metrics`] registers the `shed` arrival series for exactly
-/// these. Callers must resolve the wire name through [`method_label`] first, so `timed_`
-/// aliases are covered.
-pub const GATED_METHODS: &[&str] = &[
-    METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
-    METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
-    METHOD_DEBUG_TRACE_TRANSACTION,
-    METHOD_TRACE_BLOCK,
-    METHOD_TRACE_TRANSACTION,
-];
+/// This is the only place the exemption is written. Gating is *derived* from it rather than
+/// enumerated separately, so a method added to [`ALL_METHODS`] is gated by default and cannot
+/// be forgotten; the `timed_` aliases need no entry because [`is_gated`] resolves through
+/// [`method_label`] first.
+pub const GATE_EXEMPT_METHODS: &[&str] = &[METHOD_DEBUG_GET_CACHE_STATUS];
 
 /// Whether the admission gate applies to an already-resolved method label.
+///
+/// Unknown methods are not gated: the framework answers them `-32601` in microseconds, so
+/// gating buys nothing and would replace that with a misleading `-32013`.
 pub fn is_gated(method: &'static str) -> bool {
-    GATED_METHODS.contains(&method)
+    ALL_METHODS.contains(&method) && !GATE_EXEMPT_METHODS.contains(&method)
+}
+
+/// The methods the gate applies to — [`ALL_METHODS`] minus [`GATE_EXEMPT_METHODS`].
+pub fn gated_methods() -> impl Iterator<Item = &'static str> {
+    ALL_METHODS.iter().copied().filter(|m| !GATE_EXEMPT_METHODS.contains(m))
 }
 
 /// Maps an arbitrary method string onto one of the known `&'static str` labels, so a
@@ -107,7 +102,16 @@ pub fn is_gated(method: &'static str) -> bool {
 /// Unknown methods collapse to `"unknown"`, keeping label cardinality bounded against
 /// arbitrary client input.
 pub fn resolve_method(method: &str) -> &'static str {
-    ALL_METHODS.iter().find(|&&m| m == method).copied().unwrap_or("unknown")
+    ALL_METHODS.iter().find(|&&m| m == method).copied().unwrap_or(UNKNOWN_METHOD)
+}
+
+/// The label every unregistered method folds onto, bounding cardinality against arbitrary
+/// client input.
+pub const UNKNOWN_METHOD: &str = "unknown";
+
+/// Whether this wire name is one of the methods this server registers (`timed_` alias or not).
+pub fn is_registered(method: &str) -> bool {
+    method_label(method) != UNKNOWN_METHOD
 }
 
 /// RPC method metrics with method label.
@@ -948,7 +952,7 @@ fn pre_register_all_metrics() {
 
     // Request Layer: admission gate. Occupancy is per gated method; the limit gauges are
     // global and are re-published on every admin write.
-    for method in GATED_METHODS.iter().copied() {
+    for method in gated_methods() {
         let _ = AdmissionMetrics::new_for_method(method);
     }
     let _ = histogram!(ADMISSION_PERMIT_WAIT_SECONDS);
@@ -957,7 +961,7 @@ fn pre_register_all_metrics() {
     // Request Layer: responses discarded for exceeding `--max-response-size`. Every method
     // that can produce a trace body participates; a nonzero value here is the signal that
     // clients are asking for more than the process is willing to materialize.
-    for method in GATED_METHODS.iter().copied() {
+    for method in gated_methods() {
         counter!(RESPONSE_OVERSIZED_TOTAL, "method" => method).increment(0);
     }
 
@@ -1023,7 +1027,7 @@ const BUCKET_SPECS: &[(&str, &[f64])] = &[
     ("debug_trace_reorg_depth", REORG_DEPTH_BUCKETS),
     ("debug_trace_witness_bytes", BYTE_BUCKETS),
     ("debug_trace_body_cpu_time_seconds", BODY_CPU_TIME_BUCKETS),
-    ("debug_trace_admission_permit_wait_seconds", ADMISSION_WAIT_BUCKETS),
+    (ADMISSION_PERMIT_WAIT_SECONDS, ADMISSION_WAIT_BUCKETS),
 ];
 
 /// Initializes the Prometheus metrics exporter.

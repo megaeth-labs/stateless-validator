@@ -20,7 +20,7 @@ use stateless_core::chain_spec::ChainSpec;
 use tracing::{trace, warn};
 
 use crate::{
-    admission::{AdmissionError, AdmissionLimiter, ExecutionPermit, TraceWeight},
+    admission::{AdmissionError, AdmissionLimiter, ExecutionPermit},
     data_provider::{
         BlockData, DataProvider, DataProviderError, SLOW_STAGE_THRESHOLD_MS, TimeoutStage,
     },
@@ -31,7 +31,7 @@ use crate::{
         ResponseSizeMetrics, RpcGlobalMetrics, SingleFlightMetrics,
     },
     raw_json::RawJson,
-    response_cache::{CachedResource, RequestShape, ResponseCache, ResponseVariant},
+    response_cache::{CachedResource, RequestShape, ResponseCache, ResponseVariant, TraceWeight},
     tracing_executor::TraceError,
 };
 
@@ -312,6 +312,37 @@ impl RpcContext {
         Ok(BlockLookup::Fetched(data, permit))
     }
 
+    /// [`Self::lookup_block_by_number`]'s by-hash sibling: the requested hash *is* the cache
+    /// key, so there is no resolution step, but the rest of the order is identical and is the
+    /// part worth not re-deriving per handler — consult the cache, then take an execution
+    /// permit only on a miss, then fetch under the same deadline the permit wait was clamped to.
+    async fn lookup_block_by_hash(
+        &self,
+        method: &'static str,
+        resource: CachedResource,
+        variant: Option<ResponseVariant>,
+        weight: TraceWeight,
+        block_hash: B256,
+        start: Instant,
+    ) -> Result<BlockLookup, jsonrpsee::types::ErrorObjectOwned> {
+        if let Some(cached) =
+            check_cache(&self.response_cache, resource, block_hash, variant, method, start)
+        {
+            return Ok(BlockLookup::Cached(cached));
+        }
+
+        // Minted once and used for both the permit wait and the fetch, so the queue is carved
+        // out of the request's budget rather than added on top of it.
+        let deadline = self.data_provider.fetch_deadline();
+        let permit = self.acquire_execution(method, weight, deadline).await?;
+        let data = self
+            .data_provider
+            .get_block_data_by_hash(block_hash, deadline)
+            .await
+            .map_err(|e| data_provider_failure(method, &e))?;
+        Ok(BlockLookup::Fetched(data, permit))
+    }
+
     /// Waits for an execution permit, or refuses when the wait would outlast the budget.
     ///
     /// `deadline` must be the same one the request's fetch will run under, so the wait is
@@ -326,7 +357,7 @@ impl RpcContext {
     ) -> Result<Option<ExecutionPermit>, jsonrpsee::types::ErrorObjectOwned> {
         let Some(limiter) = &self.admission else { return Ok(None) };
         let cutoff = self.data_provider.permit_cutoff(deadline);
-        match limiter.acquire_execution(method, weight.is_heavy(), cutoff).await {
+        match limiter.acquire_execution(method, weight, cutoff).await {
             Ok(permit) => Ok(Some(permit)),
             Err(AdmissionError::Overloaded) => Err(overloaded_err(method)),
         }
@@ -374,10 +405,10 @@ fn rpc_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
 }
 
 /// Creates a JSON-RPC invalid-params error (code -32602).
-fn invalid_params_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
+pub(crate) fn invalid_params_err(msg: impl Into<String>) -> jsonrpsee::types::ErrorObjectOwned {
     jsonrpsee::types::ErrorObjectOwned::owned(
         jsonrpsee::types::error::INVALID_PARAMS_CODE,
-        msg,
+        msg.into(),
         None::<()>,
     )
 }
@@ -407,11 +438,7 @@ fn classify_and_gate(
 /// sides itself through `metrics::record_admission_shed`.
 fn overloaded_err(method: &'static str) -> jsonrpsee::types::ErrorObjectOwned {
     metrics::record_rpc_error(method, ErrorReason::Overloaded);
-    jsonrpsee::types::ErrorObjectOwned::owned(
-        crate::admission::QUEUE_FULL_CODE,
-        crate::admission::QUEUE_FULL_MESSAGE,
-        None::<()>,
-    )
+    crate::admission::queue_full_error()
 }
 
 /// Maps a [`DataProviderError`] to a JSON-RPC error object.
@@ -488,8 +515,8 @@ fn compute_block_trace<T: serde::Serialize>(
     // Request-attributable, not data-attributable: the block is fine, the client asked for
     // more output than this process will hand back. That discriminant is what keeps an
     // oversized request from evicting a perfectly good block from the data cache.
-    let json = check_response_size(json, method_name, max_response_size)
-        .map_err(|e| TraceError::Request(e.to_string()))?;
+    let json =
+        check_response_size(json, method_name, max_response_size).map_err(TraceError::Request)?;
 
     let serialize_ms = start.elapsed().as_millis() - trace_ms;
     let response_size = json.byte_len();
@@ -590,7 +617,7 @@ fn serialize_reply<T: serde::Serialize>(
         // `TraceFailed` rather than `Internal`: the tracer ran and its output could not be
         // returned, which is exactly what that reason means. `Internal` stays "our fault".
         metrics::record_rpc_error(method_name, ErrorReason::TraceFailed);
-        rpc_err(e.to_string())
+        rpc_err(e)
     })?;
     ResponseSizeMetrics::new_for_method(method_name).record(json.byte_len());
     Ok(json)
@@ -608,7 +635,7 @@ fn check_response_size(
     json: RawJson,
     method_name: &'static str,
     max_response_size: usize,
-) -> Result<RawJson, ResponseTooLarge> {
+) -> Result<RawJson, String> {
     let bytes = json.byte_len();
     if bytes <= max_response_size {
         return Ok(json);
@@ -621,24 +648,12 @@ fn check_response_size(
         max_response_size,
         "discarded a response over the configured size limit"
     );
-    Err(ResponseTooLarge { bytes, max_response_size })
-}
-
-/// The over-limit rejection, rendered once so both serialization points word it identically.
-struct ResponseTooLarge {
-    bytes: usize,
-    max_response_size: usize,
-}
-
-impl std::fmt::Display for ResponseTooLarge {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "response of {} bytes exceeds the {}-byte limit; use a lighter tracer, or request \
-             fewer blocks per batch",
-            self.bytes, self.max_response_size
-        )
-    }
+    // Worded here rather than at the two call sites, so both serialization points say the same
+    // thing; each still classifies the failure its own way.
+    Err(format!(
+        "response of {bytes} bytes exceeds the {max_response_size}-byte limit; use a lighter \
+         tracer, or request fewer blocks per batch"
+    ))
 }
 
 /// Records metrics and logs for a completed request.
@@ -719,30 +734,20 @@ impl DebugTraceRpcServer for RpcContext {
         let opts = opts.unwrap_or_default();
         let (variant, weight) = classify_and_gate(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, &opts)?;
 
-        // Check cache — the requested hash IS the key; no resolution step.
-        if let Some(cached) = check_cache(
-            &self.response_cache,
-            CachedResource::DebugTraceBlock,
-            block_hash,
-            variant,
-            METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
-            start,
-        ) {
-            return Ok(cached);
-        }
-
-        // Minted once and used for both the permit wait and the fetch, so the queue is carved
-        // out of the request's budget rather than added on top of it — total client latency
-        // stays bounded by `--block-fetch-timeout` however long the wait was.
-        let deadline = self.data_provider.fetch_deadline();
-        let _permit =
-            self.acquire_execution(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, weight, deadline).await?;
-
-        let data = self
-            .data_provider
-            .get_block_data_by_hash(block_hash, deadline)
-            .await
-            .map_err(|e| data_provider_failure(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, &e))?;
+        let (data, _permit) = match self
+            .lookup_block_by_hash(
+                METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
+                CachedResource::DebugTraceBlock,
+                variant,
+                weight,
+                block_hash,
+                start,
+            )
+            .await?
+        {
+            BlockLookup::Cached(cached) => return Ok(cached),
+            BlockLookup::Fetched(data, permit) => (data, permit),
+        };
         let block_num = data.block.header.number;
         let result = self.compute_debug_trace(&data, METHOD_DEBUG_TRACE_BLOCK_BY_HASH, opts)?;
 
@@ -1298,7 +1303,7 @@ mod tests {
         let _held = limiter
             .acquire_execution(
                 METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
-                false,
+                crate::response_cache::TraceWeight::Normal,
                 Instant::now() + Duration::from_secs(30),
             )
             .await
@@ -1320,7 +1325,7 @@ mod tests {
         let _held = limiter
             .acquire_execution(
                 METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
-                false,
+                crate::response_cache::TraceWeight::Normal,
                 Instant::now() + Duration::from_secs(30),
             )
             .await
