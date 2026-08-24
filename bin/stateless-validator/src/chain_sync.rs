@@ -194,6 +194,8 @@ where
         let block_hash = task.block.header.hash;
         let tx_count = task.block.transactions.len() as u64;
         let gas_used = task.block.header.gas_used;
+        let block_size = task.block.header.size.map(|s| s.to::<u64>());
+        let salt_kvs = task.salt_witness.kvs.len();
         let start = std::time::Instant::now();
 
         let fail = |error: String, transient: bool| ValidationFailure {
@@ -268,9 +270,24 @@ where
 
         match &validation_result {
             Ok(stats) => {
-                debug!(block_number, "Successfully validated block");
+                let validation_time = start.elapsed().as_secs_f64();
+                debug!(
+                    block_number,
+                    %block_hash,
+                    tx_count,
+                    gas_used,
+                    block_size,
+                    salt_kvs,
+                    validation_time,
+                    block_replay_time = stats.block_replay_time,
+                    witness_verification_time = stats.witness_verification_time,
+                    salt_update_time = stats.salt_update_time,
+                    state_reads = stats.state_reads,
+                    state_writes = stats.state_writes,
+                    "Successfully validated block"
+                );
                 metrics::on_validation_success(
-                    start.elapsed().as_secs_f64(),
+                    validation_time,
                     stats.witness_verification_time,
                     stats.block_replay_time,
                     stats.salt_update_time,
