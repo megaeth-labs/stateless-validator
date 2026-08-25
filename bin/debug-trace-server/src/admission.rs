@@ -102,7 +102,6 @@ pub(crate) fn queue_full_error() -> jsonrpsee::types::ErrorObjectOwned {
 /// `debt` and settled lazily — a permit released while a debt is outstanding is forgotten
 /// instead of returned. So a shrink takes effect as soon as it can and never blocks, and
 /// the limit is honoured from the next release onward.
-#[derive(Debug)]
 struct ResizableSemaphore {
     sem: Arc<Semaphore>,
     /// The configured limit — authoritative for reporting, and reached by the semaphore
@@ -120,6 +119,21 @@ struct ResizableSemaphore {
     checked_out: AtomicUsize,
     /// Serializes resizes against each other. Never taken on the acquire/release path.
     resize: Mutex<()>,
+    /// Test-only seam: fires between a shrink's debt publish and its permit removal, so the
+    /// nanoseconds-wide window a concurrent release can land in is drivable deterministically
+    /// instead of raced against.
+    #[cfg(test)]
+    shrink_window_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl std::fmt::Debug for ResizableSemaphore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResizableSemaphore")
+            .field("limit", &self.limit)
+            .field("debt", &self.debt)
+            .field("checked_out", &self.checked_out)
+            .finish()
+    }
 }
 
 impl ResizableSemaphore {
@@ -131,6 +145,8 @@ impl ResizableSemaphore {
             debt: AtomicU64::new(0),
             checked_out: AtomicUsize::new(0),
             resize: Mutex::new(()),
+            #[cfg(test)]
+            shrink_window_hook: Mutex::new(None),
         }
     }
 
@@ -154,15 +170,27 @@ impl ResizableSemaphore {
             }
         } else if permits < previous {
             let wanted = previous - permits;
-            // The debt is published *before* any permit is removed, and the part that could
-            // be removed immediately is cancelled after. A release landing in between then
-            // sees a debt that is at worst too large and forgets its permit — the
-            // conservative direction. Published after the removal instead, that same release
-            // would observe zero debt, hand its permit back, and let a queued request through
-            // above the limit the shrink just set.
+            // The debt is published *before* any permit is removed: published after instead,
+            // a release landing in between would observe zero debt, hand its permit back,
+            // and let a queued request through above the limit the shrink just set. The
+            // price of that ordering is the settlement below — a release inside the window
+            // sees a debt that is at worst too large and forgets a permit `forget_permits`
+            // was about to remove anyway, so the cancel is compared against what the removal
+            // actually took and the overlap is returned. Without that, every such release
+            // would leak one permit permanently, sliding real capacity below the configured
+            // limit with nothing but a restart to recover it.
             self.debt.fetch_add(wanted, Ordering::SeqCst);
+            #[cfg(test)]
+            if let Some(hook) =
+                self.shrink_window_hook.lock().unwrap_or_else(|e| e.into_inner()).take()
+            {
+                hook();
+            }
             let removed = self.sem.forget_permits(wanted as usize) as u64;
-            self.cancel_debt(removed);
+            let cancelled = self.cancel_debt(removed);
+            if removed > cancelled {
+                self.sem.add_permits((removed - cancelled) as usize);
+            }
         }
     }
 
@@ -796,6 +824,40 @@ mod tests {
             second.unwrap_err(),
             AdmissionError::Overloaded,
             "the shrink was honoured once the permits came back"
+        );
+    }
+
+    /// A release landing inside the shrink window must not leak a permit.
+    ///
+    /// The regression this pins: between the debt publish and the permit removal, a release
+    /// pays one unit of debt by forgetting a permit that `forget_permits` was about to
+    /// remove anyway. Settled without comparing the cancel against the removal, that
+    /// overlap removed one permit too many — permanently, since growth only re-adds the
+    /// difference between limits, so repeated retunes under load slid real capacity below
+    /// the configured value with no error surface. The window is nanoseconds wide, so the
+    /// test drives it through a deterministic hook rather than racing tasks at it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_release_inside_the_shrink_window_leaks_no_permit() {
+        let limiter = AdmissionLimiter::new(10, 64, 1);
+        let mut held = hold(&limiter, 10).await;
+        // Leave the shrink free permits to remove: five stay checked out, five come back.
+        held.truncate(5);
+        assert_eq!(limiter.executing(), 5);
+
+        // One holder releases exactly inside the window.
+        let released = held.pop().expect("a permit to release in the window");
+        *limiter.execution.shrink_window_hook.lock().unwrap() =
+            Some(Box::new(move || drop(released)));
+
+        limiter.set_max_concurrent(5);
+        held.clear();
+
+        assert_eq!(limiter.executing(), 0, "every permit was returned");
+        assert_eq!(limiter.execution.debt.load(Ordering::SeqCst), 0, "no debt outstanding");
+        assert_eq!(
+            limiter.execution.sem.available_permits(),
+            5,
+            "the in-window release must not shrink the budget below the configured limit"
         );
     }
 

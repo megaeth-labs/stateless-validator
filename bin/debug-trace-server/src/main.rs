@@ -737,6 +737,22 @@ fn validate_args(args: &Args) -> Result<R2Target> {
             RESPONSE_ENVELOPE_HEADROOM
         );
     }
+    // The framework's response cap is a u32, and an over-cap batch bound is merely clamped
+    // (batch truncation is a documented approximation) — but the per-response cap must fit
+    // under that ceiling with the envelope, or bodies between the two would pass our own
+    // check and still be swapped for the framework's oversized-response error after being
+    // counted served, silently blunting `--max-response-size` above ~4 GiB.
+    let framework_ceiling = u64::from(u32::MAX);
+    if args.max_response_size.saturating_add(RESPONSE_ENVELOPE_HEADROOM) > framework_ceiling {
+        eyre::bail!(
+            "--max-response-size ({}) plus {} bytes of envelope headroom must fit the JSON-RPC \
+             framework's u32 response ceiling ({}): a larger cap would accept bodies the \
+             framework then rejects as oversized after they were counted served",
+            args.max_response_size,
+            RESPONSE_ENVELOPE_HEADROOM,
+            framework_ceiling
+        );
+    }
     admin_bind_addr(args)?;
     Ok(target)
 }
@@ -1855,6 +1871,21 @@ mod tests {
         assert!(err.contains("headroom"), "the error must explain why equal is not enough: {err}");
 
         assert!(validate_args(&parse_args(&["--max-response-size", "512MB"])).is_ok());
+    }
+
+    /// The framework's response cap is a u32, so a per-response cap near or above 4 GiB
+    /// would be silently undercut: bodies between the ceiling and the cap pass our own check
+    /// and are then swapped for the framework's oversized-response error after being counted
+    /// served. Rejected at startup, by name.
+    #[test]
+    fn response_cap_must_fit_the_framework_ceiling() {
+        let args = parse_args(&["--max-response-size", "5GB", "--max-batch-response-size", "11GB"]);
+        let err = validate_args(&args).expect_err("5GB cannot fit a u32 ceiling").to_string();
+        assert!(err.contains("--max-response-size"), "the error must name the flag: {err}");
+        assert!(err.contains("ceiling"), "and say what it collided with: {err}");
+
+        let ok = parse_args(&["--max-response-size", "2GB", "--max-batch-response-size", "3GB"]);
+        assert!(validate_args(&ok).is_ok(), "well under the ceiling stays accepted");
     }
 
     /// Batch concurrency knob: default, CLI/env override, and the zero rejection.
