@@ -213,15 +213,24 @@ pub struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_DATA_MAX_CONCURRENT_REQUESTS")]
     pub data_max_concurrent_requests: Option<usize>,
 
-    /// Maximum concurrent in-flight witness fetches, independent of the data cap. Omit for
-    /// unlimited. Applies to both RPC witness calls and, with `--witness-source r2`, R2 GETs.
-    ///
-    /// Against `--r2-custom-domain` this is also what bounds the GETs multiplexed onto the
-    /// HTTP/2 connection, so keep it at or below the edge's per-connection stream limit
-    /// (Cloudflare's is 100): above it the surplus queues inside the connection instead, where
-    /// the wait is unobservable and still counts against the per-attempt timeout.
+    /// Maximum concurrent in-flight RPC witness fetches, independent of the data cap. Omit
+    /// for unlimited. Applies to `--witness-source rpc` only; R2 GETs are capped by
+    /// `--r2-max-concurrent-requests`, which is a separate budget against a separate service.
     #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_MAX_CONCURRENT_REQUESTS")]
     pub witness_max_concurrent_requests: Option<usize>,
+
+    /// Maximum concurrent in-flight R2 witness GETs. Omit for unlimited. Deliberately
+    /// separate from `--witness-max-concurrent-requests`: that one sizes what we ask of the
+    /// RPC gateway, while R2 is a different service that tolerates far higher parallelism,
+    /// and under `--witness-source r2` the RPC witness path is not used at all.
+    ///
+    /// Against `--r2-custom-domain` this is what bounds the GETs multiplexed onto each HTTP/2
+    /// connection, so keep the per-connection share (this value divided by
+    /// `--r2-connections`) at or below the edge's per-connection stream limit (Cloudflare's
+    /// is 100): above it the surplus queues inside the connection instead, where the wait is
+    /// unobservable and still counts against the per-attempt timeout.
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_MAX_CONCURRENT_REQUESTS")]
+    pub r2_max_concurrent_requests: Option<usize>,
 
     /// Fetcher caught-up poll interval (milliseconds). Also rate-limits `eth_blockNumber`.
     /// Lower values reduce tip-following lag at the cost of more RPC traffic when caught up.
@@ -341,6 +350,7 @@ pub async fn run() -> Result<()> {
                      straight from the R2 bucket, and there is no RPC witness fallback"
                 );
             }
+            check_r2_concurrency_migration(&args)?;
             let timeouts = stateless_r2::fetch::FetchTimeouts {
                 per_attempt: per_attempt_timeout,
                 connect: args
@@ -484,7 +494,7 @@ fn build_r2_client(
                 access,
                 timeouts,
                 retry,
-                args.witness_max_concurrent_requests,
+                args.r2_max_concurrent_requests,
                 connections,
             )?;
             metrics::record_r2_connections(client.connections());
@@ -505,7 +515,7 @@ fn build_r2_client(
                 args.r2_secret_access_key.as_ref().expect("S3 target").as_ref().to_string(),
                 timeouts,
                 retry,
-                args.witness_max_concurrent_requests,
+                args.r2_max_concurrent_requests,
             )?;
             info!(
                 endpoint = %client.origin(),
@@ -517,6 +527,31 @@ fn build_r2_client(
     };
     metrics::record_r2_target(client.target_label());
     Ok(client)
+}
+
+/// Rejects the pre-split spelling of the R2 concurrency cap.
+///
+/// `--witness-max-concurrent-requests` used to cap R2 GETs as well as RPC witness calls.
+/// Now that the two budgets are separate, carrying the old spelling forward would leave R2
+/// uncapped -- and `--witness-source r2` has no RPC fallback, so the fetcher would point its
+/// whole in-flight window at the bucket. Silently dropping a cap an operator wrote down is
+/// worse than refusing to start, so this refuses by name, the way a leftover S3 credential is.
+///
+/// Inert outside `--witness-source r2`: under `rpc` the old spelling still means exactly what
+/// it says, and every `--r2-*` flag is unread.
+pub fn check_r2_concurrency_migration(args: &CommandLineArgs) -> Result<()> {
+    if args.witness_source != WitnessSource::R2 {
+        return Ok(());
+    }
+    if args.witness_max_concurrent_requests.is_some() && args.r2_max_concurrent_requests.is_none() {
+        return Err(eyre::eyre!(
+            "--witness-max-concurrent-requests no longer caps R2 GETs under --witness-source \
+             r2; it now sizes the RPC witness path only. Set --r2-max-concurrent-requests to \
+             the value you want R2 capped at (and unset --witness-max-concurrent-requests, \
+             which is unread in this mode)."
+        ));
+    }
+    Ok(())
 }
 
 /// This binary's `--r2-*` flags, in the spellings its operators use.
@@ -540,8 +575,8 @@ fn r2_flags(args: &CommandLineArgs) -> R2Flags<'_> {
         ),
         connections: R2Flag::new("--r2-connections", args.r2_connections.as_deref()),
         max_concurrent_requests: R2CountFlag::new(
-            "--witness-max-concurrent-requests",
-            args.witness_max_concurrent_requests,
+            "--r2-max-concurrent-requests",
+            args.r2_max_concurrent_requests,
         ),
         // Empty on purpose. The orphan-tuning rule exists for a binary that validates R2 flags
         // on every startup; here they are only read under `--witness-source r2`, where a target
