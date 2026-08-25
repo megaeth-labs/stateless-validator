@@ -116,6 +116,46 @@ Each entry still goes through the regular per-request pipeline — response cach
 `--batch-item-concurrency` (default 16) bounds how many entries of one batch run at once, so a single huge batch cannot monopolize downstream resources against concurrently served requests; set it to 1 to restore sequential execution.
 The `debug_trace_batch_size` histogram records entries per inbound batch, and CPU burned inside spawned entries is folded back into `x-execution-time-ns` and the request CPU metric, so batch requests do not under-report their cost.
 
+**Admission control:**
+Every request is checked against a process-wide capacity budget before any work happens, so an offered load beyond what this server can serve is refused immediately instead of degrading everything already in flight.
+Without it the only backpressure is that all runtime workers are busy tracing, which starves chain sync, the accept loop and the metrics exporter along with the requests themselves; the outbound witness/data/R2 caps bound what we ask of others, never what clients ask of us.
+Refused requests are answered `-32013 "Request queue is full"`, matching mega-reth's `ConcurrencyLimiter` byte for byte so a client or gateway that already backs off for the node backs off for this server too.
+The gate has two stages.
+Arrival is a non-blocking check against `--admission-max-concurrent` + `--admission-max-queue`: past that total, the request is shed on the spot.
+An admitted request then waits for one of `--admission-max-concurrent` execution permits, taken only once the response cache has missed — a cache hit costs microseconds and is never queued behind a cold trace — and given up if the wait would leave too little of the request's budget for the witness fetch, which is what turns a full queue into a prompt rejection rather than a deadline error.
+The wait is carved *out of* the request's `--block-fetch-timeout` budget rather than added on top of it, so total client latency stays bounded by that flag however long the queue was; the derived maximum wait (`--block-fetch-timeout` less the witness reserve) is logged at startup as `max_permit_wait_ms`.
+Entries of a JSON-RPC batch admit individually, so one large batch is metered like the equivalent single calls rather than passing as one unit.
+`debug_getCacheStatus` (and its `timed_` alias) is the sole exemption: it does no I/O, and shedding the one endpoint that reports what the server is doing, precisely while it is shedding, would be self-defeating.
+Sizing is not a core count — roughly 2% of a trace request is CPU, the rest is waiting on the upstream node and R2 — so derive `--admission-max-concurrent` from measured service time (`throughput x mean_handler_seconds`), and read `--admission-max-queue` as latency: queue depth over service rate is how long a request waits, so at 1000 blocks/s a 1000-deep queue is one second.
+The defaults sit above the highest occupancy this server has been measured serving cleanly, so they bound a previously unbounded process without throttling a known-good workload; tighten them once `debug_trace_admission_in_flight` and `debug_trace_admission_permit_wait_seconds` show what production actually does.
+Memory-hungry tracers additionally pass `--admission-heavy-max-concurrent`, a much smaller budget: one such response has been measured near a gigabyte.
+That set is `prestateTracer`, JS tracers, `muxTracer`, and **every struct-logger request** — both the bare default (a `debug_trace*` call with no `tracer`) and one with non-default flags, since the flags change the size of that output rather than its kind, and a struct logger emits a record per executed opcode.
+Note the consequence: an opts-less `debug_traceBlockByNumber` is a heavy request, so a client that sends no tracer is limited to `--admission-heavy-max-concurrent` at a time; raise that flag if such traffic is a normal part of your workload.
+Heavy requests also get their own share of the admitted budget — they may queue in the same proportion to their execution budget as the process as a whole — so a flood of them is refused at that share rather than filling the class-blind admitted budget and shedding ordinary traffic that has idle permits waiting.
+Startup logs both `heavy_max_concurrent x max_response_size` and `max_concurrent x max_response_size` — the first bounds the shapes that can actually reach the response cap, the second is the theoretical ceiling if every admitted request returned a maximal body — so they can be checked against the host's memory limit.
+Neither covers a tracer's *intermediate* allocations, which nothing here bounds; a per-transaction-count gate would be needed for that and is not implemented.
+Watch `debug_trace_rpc_errors_total{reason="overloaded"}` for shedding, `debug_trace_admission_in_flight` / `debug_trace_admission_executing` for occupancy (queue depth is their difference), and the `debug_trace_admission_max_*` gauges for what is actually in effect, since the limits are changeable at runtime.
+Disable the whole mechanism with `--admission-disabled`.
+
+**Response size limits:**
+`--max-response-size` (default 256MB) caps one serialized reply and `--max-batch-response-size` (default 1GB) caps a whole assembled batch response; both bodies are discarded rather than returned, and an over-limit single response is counted on `debug_trace_response_oversized_total{method}`.
+They bound different things: a batch retains every completed entry's body until the batch finishes, so its memory is the sum of its entries rather than the largest of them, and left unbounded that accumulation — not any single response — is what has previously exhausted this process.
+The single-response check runs where this server serializes the reply, so an over-limit body is dropped before it can be copied again into the JSON-RPC envelope; the framework's own cap is the backstop.
+
+**Runtime retuning:**
+`--admin-addr` (e.g. `127.0.0.1:8546`, off unless set) starts a second RPC listener serving `admin_getConcurrencyLimit` and `admin_setConcurrencyLimit`, which change the admission limits without a restart:
+
+```bash
+curl -s http://127.0.0.1:8546 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"admin_setConcurrencyLimit","params":[256,4096,4]}'
+```
+
+Parameters are `[maxConcurrent, maxQueueSize, heavyMaxConcurrent]`, each optional — omitted fields are left alone — and the call returns the resulting limits plus current occupancy.
+Lowering a limit below current occupancy aborts nothing; it stops admitting until the excess drains.
+Zero execution permits is refused, since it would park every subsequent request with nothing left running to release one.
+The listener carries no admission or accounting middleware, so a saturated public port can never shed the call that relieves it, and it runs on its own thread and runtime, so inline EVM tracing on the main runtime cannot starve it — the moment it is needed most.
+It has no authentication and its setters can throttle request serving, so a non-loopback bind is refused at startup; reach it through a port-forward or a sidecar.
+
 **Response compression:**
 Responses negotiate gzip/zstd per request via the client's `Accept-Encoding` header; clients that do not send it keep receiving identity bodies, so nothing changes for consumers that have not opted in.
 Bodies under 4 KiB are always served identity: compressing them would cost a per-response encoder allocation and downgrade `Content-Length` to chunked framing for a few dozen saved bytes.
@@ -171,6 +211,16 @@ Whether the domain actually delivered HTTP/2 is a separate question — selectio
 Any single witness-chain RPC attempt under a deadline is additionally capped at the tightest of: half the witness stage budget, the global per-attempt timeout, and — only while the round still has an untried provider to rotate to — half of what the call still has as the attempt starts (recomputed after any permit wait).
 The round's last hop, and every hop of a single-provider chain, takes the remainder whole under the ceiling instead, so a stalled endpoint (or a saturated concurrency permit — waits are deadline-bounded too) can never consume the stage while a rotation is still worth reserving for, and a slow-but-honest transfer is never structurally condemned; the witness decode runs outside the attempt window, bounded by the request deadline alone.
 `--r2-max-concurrent-requests` caps in-flight GETs separately from `--witness-max-concurrent-requests` — the RPC cap sizes a shared gateway, R2 tolerates far more.
+
+**Admission and response-size knobs** (each also settable via its `DEBUG_TRACE_SERVER_*` env var):
+- `--admission-max-concurrent`: Requests that may fetch and replay a block at once (default: 640; must be at least 1).
+- `--admission-max-queue`: Requests that may wait for a permit on top of those executing (default: 8192; `0` means execute-or-shed).
+- `--admission-heavy-max-concurrent`: Concurrent memory-hungry tracer requests (default: 8; sized from memory, not throughput).
+- `--admission-disabled`: Kill switch restoring unbounded concurrent work.
+- `--max-response-size` / `--max-batch-response-size`: Caps on one reply body and on a whole assembled batch response (defaults: 256MB / 1GB).
+- `--admin-addr`: Loopback-only listener for `admin_*` retuning (off unless set).
+
+`--admission-max-concurrent` + `--admission-max-queue` must be at least `--batch-item-concurrency`, and `--max-batch-response-size` at least `--max-response-size`; both are checked at startup and named in the error.
 
 **Witness routing and sync knobs** (each also settable via its `DEBUG_TRACE_SERVER_*` env var):
 - `--witness-local-window`: Block-age threshold for the historical witness route (default: 4096; should match the generator's `BACKUP`).

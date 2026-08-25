@@ -63,7 +63,7 @@ pub const CACHE_TYPE_TRACE: &str = "trace_block";
 pub const CACHE_TYPE_BLOCK_DATA: &str = "block_data";
 
 // All known RPC methods (for resolving &str → &'static str)
-const ALL_METHODS: &[&str] = &[
+pub const ALL_METHODS: &[&str] = &[
     METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
     METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
     METHOD_DEBUG_TRACE_TRANSACTION,
@@ -72,12 +72,47 @@ const ALL_METHODS: &[&str] = &[
     METHOD_TRACE_TRANSACTION,
 ];
 
+/// Methods the inbound admission gate deliberately lets through.
+///
+/// `debug_getCacheStatus` is pure atomic reads — it touches neither upstream nor EVM — and
+/// shedding the one endpoint an operator uses to ask what the server is doing, precisely while
+/// it is shedding, would be self-defeating.
+///
+/// This is the only place the exemption is written. Gating is *derived* from it rather than
+/// enumerated separately, so a method added to [`ALL_METHODS`] is gated by default and cannot
+/// be forgotten; the `timed_` aliases need no entry because [`is_gated`] resolves through
+/// [`method_label`] first.
+pub const GATE_EXEMPT_METHODS: &[&str] = &[METHOD_DEBUG_GET_CACHE_STATUS];
+
+/// Whether the admission gate applies to an already-resolved method label.
+///
+/// Unknown methods are not gated: the framework answers them `-32601` in microseconds, so
+/// gating buys nothing and would replace that with a misleading `-32013`.
+pub fn is_gated(method: &'static str) -> bool {
+    ALL_METHODS.contains(&method) && !GATE_EXEMPT_METHODS.contains(&method)
+}
+
+/// The methods the gate applies to — [`ALL_METHODS`] filtered through [`is_gated`], so the
+/// rule has exactly one spelling.
+pub fn gated_methods() -> impl Iterator<Item = &'static str> {
+    ALL_METHODS.iter().copied().filter(|&m| is_gated(m))
+}
+
 /// Maps an arbitrary method string onto one of the known `&'static str` labels, so a
 /// caller that only has a borrowed name can still label a metric without allocating.
 /// Unknown methods collapse to `"unknown"`, keeping label cardinality bounded against
 /// arbitrary client input.
 pub fn resolve_method(method: &str) -> &'static str {
-    ALL_METHODS.iter().find(|&&m| m == method).copied().unwrap_or("unknown")
+    ALL_METHODS.iter().find(|&&m| m == method).copied().unwrap_or(UNKNOWN_METHOD)
+}
+
+/// The label every unregistered method folds onto, bounding cardinality against arbitrary
+/// client input.
+pub const UNKNOWN_METHOD: &str = "unknown";
+
+/// Whether this wire name is one of the methods this server registers (`timed_` alias or not).
+pub fn is_registered(method: &str) -> bool {
+    method_label(method) != UNKNOWN_METHOD
 }
 
 /// RPC method metrics with method label.
@@ -139,6 +174,11 @@ pub enum ErrorReason {
     /// top-level params, unparsable batch entry) — recorded by the RPC middleware's
     /// fallback, never by a handler.
     Rejected,
+    /// Shed by the inbound admission gate: the request arrived while queue + execution
+    /// capacity was already full, or waited for an execution permit until so little of its
+    /// budget remained that the witness stage could no longer fit. Answered `-32013`
+    /// without the tracer ever running.
+    Overloaded,
     /// An error response with a non-framework code left the server without a
     /// handler-recorded reason — a handler ran but bypassed the error funnel. This series
     /// sitting at nonzero is a code-drift alarm, not an operating state: it keeps a future
@@ -157,6 +197,7 @@ impl ErrorReason {
             Self::TraceFailed => "trace_failed",
             Self::Internal => "internal",
             Self::Rejected => "rejected",
+            Self::Overloaded => "overloaded",
             Self::Unattributed => "unattributed",
         }
     }
@@ -170,6 +211,7 @@ impl ErrorReason {
         Self::TraceFailed,
         Self::Internal,
         Self::Rejected,
+        Self::Overloaded,
         Self::Unattributed,
     ];
 }
@@ -464,7 +506,10 @@ const REQUEST_SHAPE_TOTAL: &str = "debug_trace_request_shape_total";
 
 /// Every label emitted by `RequestShape::label`, for pre-registration and tests — plus
 /// `rejected`, recorded by the RPC middleware for requests the framework answered before
-/// the handler ran (see [`record_framework_rejection`]).
+/// the handler ran (see [`record_framework_rejection`]). `shed` (see
+/// [`record_admission_shed`]) is deliberately absent: its series exists for exactly the
+/// gated methods, so pre-registration derives it from [`gated_methods`] instead of crossing
+/// it with every method here.
 pub const REQUEST_SHAPES: &[&str] = &[
     "default",
     "call_tracer",
@@ -701,6 +746,89 @@ impl ChainSyncMetrics {
     }
 }
 
+/// Inbound admission-gate occupancy, labeled `(method)`.
+///
+/// Two independent gauges rather than a queued/executing pair, because the two phases are
+/// raised in different places: `in_flight` by the RPC middleware for the whole request,
+/// `executing` by the handler for the span it holds an execution permit. Queue depth is
+/// `in_flight - executing`, derived at query time.
+///
+/// Both are lowered by RAII guards: a request cancelled while queued, or midway through
+/// execution, must not leave a gauge stuck high forever.
+#[derive(Clone, Metrics)]
+#[metrics(scope = "debug_trace")]
+pub struct AdmissionMetrics {
+    /// Requests admitted by the gate and not yet finished.
+    admission_in_flight: Gauge,
+    /// Requests holding an execution permit.
+    admission_executing: Gauge,
+}
+
+impl AdmissionMetrics {
+    /// Creates admission metrics for a specific RPC method.
+    pub fn new_for_method(method: &'static str) -> Self {
+        Self::new_with_labels(&[("method", method)])
+    }
+
+    /// Adjusts the admitted-and-unfinished gauge.
+    pub fn in_flight_delta(&self, delta: f64) {
+        self.admission_in_flight.increment(delta);
+    }
+
+    /// Adjusts the holding-an-execution-permit gauge.
+    pub fn executing_delta(&self, delta: f64) {
+        self.admission_executing.increment(delta);
+    }
+}
+
+/// Requests holding a permit from the heavy-shape sub-cap. Unlabeled: the sub-cap is a
+/// single process-wide budget, and which method asked for it is already on
+/// `admission_executing`.
+const ADMISSION_HEAVY_EXECUTING: &str = "debug_trace_admission_heavy_executing";
+
+/// Time a request spent waiting for an execution permit. Unlabeled, following the
+/// `debug_trace_r2_witness_queue_wait_seconds` precedent: under a single global limiter the
+/// wait is method-independent, and the method dimension is already on the gauges.
+///
+/// Biased by construction: only waits that ended in a permit are sampled. A wait that ended
+/// in a client hangup lands on `requests_cancelled_total`, and one clamped by the deadline
+/// lands on `rpc_errors_total{reason="overloaded"}`.
+const ADMISSION_PERMIT_WAIT_SECONDS: &str = "debug_trace_admission_permit_wait_seconds";
+
+/// The limits currently in effect. Published at startup and on every admin write — these are
+/// runtime-mutable, so without them a dashboard cannot tell what the gate is actually
+/// enforcing, and a shed spike is unattributable to the change that caused it.
+const ADMISSION_MAX_CONCURRENT: &str = "debug_trace_admission_max_concurrent";
+/// See [`ADMISSION_MAX_CONCURRENT`].
+const ADMISSION_MAX_QUEUE: &str = "debug_trace_admission_max_queue";
+/// See [`ADMISSION_MAX_CONCURRENT`].
+const ADMISSION_HEAVY_MAX_CONCURRENT: &str = "debug_trace_admission_heavy_max_concurrent";
+
+/// Responses discarded for exceeding `--max-response-size`, labeled `(method)`.
+const RESPONSE_OVERSIZED_TOTAL: &str = "debug_trace_response_oversized_total";
+
+/// Records the wait one request spent queued for an execution permit.
+pub fn record_admission_permit_wait(seconds: f64) {
+    histogram!(ADMISSION_PERMIT_WAIT_SECONDS).record(seconds);
+}
+
+/// Publishes the limits currently in effect.
+pub fn record_admission_limits(max_concurrent: u64, max_queue: u64, heavy_max_concurrent: u64) {
+    gauge!(ADMISSION_MAX_CONCURRENT).set(max_concurrent as f64);
+    gauge!(ADMISSION_MAX_QUEUE).set(max_queue as f64);
+    gauge!(ADMISSION_HEAVY_MAX_CONCURRENT).set(heavy_max_concurrent as f64);
+}
+
+/// Adjusts the heavy sub-cap occupancy gauge.
+pub fn record_admission_heavy_delta(delta: f64) {
+    gauge!(ADMISSION_HEAVY_EXECUTING).increment(delta);
+}
+
+/// Records one response discarded for exceeding the configured size cap.
+pub fn record_response_oversized(method: &'static str) {
+    counter!(RESPONSE_OVERSIZED_TOTAL, "method" => method).increment(1);
+}
+
 /// Pre-registers all metrics so they appear in Prometheus from startup (with zero values).
 fn pre_register_all_metrics() {
     // Request Layer: RPC method metrics — every method that can record a served request,
@@ -807,8 +935,8 @@ fn pre_register_all_metrics() {
             counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => *shape).increment(0);
         }
     }
-    // Arrival series for the opts-less methods: "default" at handler entry, "rejected"
-    // via the middleware fallback.
+    // Arrival series for the opts-less methods: "default" at handler entry, "rejected" via
+    // the middleware fallback.
     for method in [METHOD_TRACE_BLOCK, METHOD_TRACE_TRANSACTION, METHOD_DEBUG_GET_CACHE_STATUS] {
         for shape in ["default", "rejected"] {
             counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => shape).increment(0);
@@ -816,6 +944,20 @@ fn pre_register_all_metrics() {
     }
     // The `unknown` fold target only ever arrives through the middleware's rejected pair.
     counter!(REQUEST_SHAPE_TOTAL, "method" => "unknown", "shape" => "rejected").increment(0);
+
+    // Request Layer: admission gate. The `shed` arrival series, the occupancy gauges, and
+    // the oversized-response counter (a nonzero value there is the signal that clients are
+    // asking for more than the process is willing to materialize) all exist for exactly the
+    // methods that can fetch, replay, and produce a trace body — so all three derive from
+    // `gated_methods()` and gate coverage has one spelling instead of a per-list one. The
+    // limit gauges are global and are re-published on every admin write.
+    for method in gated_methods() {
+        counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => "shed").increment(0);
+        let _ = AdmissionMetrics::new_for_method(method);
+        counter!(RESPONSE_OVERSIZED_TOTAL, "method" => method).increment(0);
+    }
+    let _ = histogram!(ADMISSION_PERMIT_WAIT_SECONDS);
+    gauge!(ADMISSION_HEAVY_EXECUTING).set(0.0);
 
     // Data Fetch Layer: canonical number → hash resolution
     for (source, outcome) in [
@@ -864,6 +1006,13 @@ const BLOCK_DISTANCE_BUCKETS: &[f64] = &[0.0, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0
 /// combined across replicas or alerted on cleanly.
 const BODY_CPU_TIME_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5];
 
+/// Wait for an inbound execution permit, seconds. Spans "uncontended" (microseconds) to the
+/// deadline clamp (seconds). Explicit buckets for the same reason as
+/// [`BODY_CPU_TIME_BUCKETS`]: without them the exporter renders per-instance summary
+/// quantiles that cannot be aggregated across replicas.
+const ADMISSION_WAIT_BUCKETS: &[f64] =
+    &[0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+
 /// (metric_name, buckets) pairs applied via `set_buckets_for_metric` at startup.
 const BUCKET_SPECS: &[(&str, &[f64])] = &[
     ("debug_trace_evm_block_tx_count", TX_COUNT_BUCKETS),
@@ -872,6 +1021,7 @@ const BUCKET_SPECS: &[(&str, &[f64])] = &[
     ("debug_trace_reorg_depth", REORG_DEPTH_BUCKETS),
     ("debug_trace_witness_bytes", BYTE_BUCKETS),
     ("debug_trace_body_cpu_time_seconds", BODY_CPU_TIME_BUCKETS),
+    (ADMISSION_PERMIT_WAIT_SECONDS, ADMISSION_WAIT_BUCKETS),
 ];
 
 /// Initializes the Prometheus metrics exporter.
@@ -953,6 +1103,21 @@ pub async fn track_handler_errors<F: Future>(fut: F) -> (F::Output, bool) {
 pub fn record_framework_rejection(method: &'static str) {
     record_request_shape(method, "rejected");
     record_rpc_error(method, ErrorReason::Rejected);
+}
+
+/// Records a request the admission gate turned away before its handler ran, as the balanced
+/// pair `request_shape_total{shape="shed"}` + `rpc_errors_total{reason="overloaded"}` — an
+/// arrival and an outcome, so the accounting identity holds for requests no handler saw.
+/// Takes the already-resolved label, like [`record_framework_rejection`].
+///
+/// Must be called from inside the request future, never from a layer's synchronous prefix:
+/// [`record_rpc_error`] sets the `ERROR_SELF_REPORTED` task-local that tells the middleware
+/// fallback this `-32013` is already accounted for, and that task-local only exists inside
+/// [`track_handler_errors`]' scope. Recorded outside it, every shed would both double-count
+/// the error side and false-fire the `unattributed` drift alarm.
+pub fn record_admission_shed(method: &'static str) {
+    record_request_shape(method, "shed");
+    record_rpc_error(method, ErrorReason::Overloaded);
 }
 
 /// Records a request whose handler future was dropped before producing a response —

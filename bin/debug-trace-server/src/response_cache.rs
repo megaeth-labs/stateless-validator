@@ -165,6 +165,26 @@ impl ResponseVariant {
     }
 }
 
+/// How much of the process's memory budget a request's tracer is expected to want.
+///
+/// Lives beside [`RequestShape`], which produces it, rather than beside the gate that consumes
+/// it: the classification is a property of the request, and the dependency should point from
+/// the policy layer to the domain rather than back.
+///
+/// The distinction exists because one execution budget cannot serve both: sized for the
+/// `callTracer` traffic that has been measured clean it admits hundreds of concurrent blocks,
+/// and hundreds of concurrent `prestateTracer` traces over large blocks is the shape that has
+/// already OOM-killed this server once. [`TraceWeight::Heavy`] requests pass a second, much
+/// smaller budget first, so the worst-case resident set is a number an operator can compute
+/// rather than a property of what clients happen to ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraceWeight {
+    /// Bounded output per transaction; the request's cost is dominated by the fetch.
+    Normal,
+    /// Output can run to hundreds of megabytes on a large block.
+    Heavy,
+}
+
 /// Classification of a trace request's parameters — the single source of truth shared by
 /// the cache whitelist, the shape metrics, and malformed-config rejection.
 #[derive(Debug)]
@@ -252,6 +272,33 @@ impl RequestShape {
         match parse(opts.tracer_config.clone()) {
             Ok(config) => Self::Cacheable(wrap(config)),
             Err(error) => Self::InvalidTracerConfig { label, error },
+        }
+    }
+
+    /// How much memory this request's tracer is expected to want, for the admission gate's
+    /// heavy sub-cap.
+    ///
+    /// Matched structurally rather than on [`Self::label`] so that adding a tracer forces a
+    /// decision here instead of silently defaulting to cheap. Every bypassed shape counts as
+    /// heavy by construction: a shape bypasses the cache precisely because its output is not
+    /// determined by a bounded key, which is the same reason its size is not bounded either.
+    pub fn weight(&self) -> TraceWeight {
+        match self {
+            Self::Cacheable(variant) => match variant {
+                // `Default` is the struct logger, which emits a record per executed opcode —
+                // the largest output of any shape here, and the only thing separating it from
+                // its `Bypass("struct_logger_config")` sibling below is a flag that changes
+                // its size, not its kind. Classifying the two differently would let the
+                // heaviest traffic in through the cheap door.
+                ResponseVariant::Default | ResponseVariant::PrestateTracer(_) => TraceWeight::Heavy,
+                ResponseVariant::CallTracer(_) |
+                ResponseVariant::FlatCallTracer(_) |
+                ResponseVariant::FourByteTracer |
+                ResponseVariant::NoopTracer => TraceWeight::Normal,
+            },
+            Self::Bypass(_) => TraceWeight::Heavy,
+            // Rejected before it can execute, so it never reaches a permit.
+            Self::InvalidTracerConfig { .. } => TraceWeight::Normal,
         }
     }
 

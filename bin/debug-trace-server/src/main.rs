@@ -45,6 +45,7 @@
 //! - **Local cache mode**: With `data_dir`, enables chain sync to pre-fetch blocks into local DB
 
 use std::{
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -68,6 +69,8 @@ use tokio::task;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
+mod admin;
+mod admission;
 mod block_data_cache;
 mod body_metrics;
 mod chain_sync;
@@ -85,6 +88,7 @@ mod server_db;
 mod timing;
 mod tracing_executor;
 
+use admission::AdmissionLimiter;
 use block_data_cache::{
     BLOCK_DATA_CACHE_SHARDS, BlockDataCache, DEFAULT_BLOCK_DATA_CACHE_MAX_BYTES,
 };
@@ -217,6 +221,102 @@ struct Args {
         value_parser = clap::value_parser!(u32).range(1..),
     )]
     batch_item_concurrency: u32,
+
+    /// Requests that may be fetching and replaying a block at once.
+    ///
+    /// This is the process's real work budget: every other concurrency knob here caps what
+    /// we ask of someone else. Sizing is not a core count — only about 2% of a trace
+    /// request is CPU, the rest is waiting on the upstream node and R2 — so derive it from
+    /// measured service time instead: `throughput x mean_handler_seconds`. The default sits
+    /// just above the highest occupancy this server has been measured serving cleanly, so it
+    /// bounds a previously unbounded process without throttling a known-good workload.
+    ///
+    /// A response-cache hit never takes one of these.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_ADMISSION_MAX_CONCURRENT",
+        default_value_t = DEFAULT_ADMISSION_MAX_CONCURRENT,
+        value_parser = clap::value_parser!(u64).range(1..),
+    )]
+    admission_max_concurrent: u64,
+
+    /// Requests that may wait for an execution permit on top of those holding one.
+    ///
+    /// A latency knob, not a memory one: queue depth divided by the service rate is how long
+    /// a request waits, so `queue = rate x acceptable_wait`. At 1000 blocks/s a 1000-deep
+    /// queue is one second of waiting. `0` means execute-or-shed with no waiting at all.
+    /// Beyond `max_concurrent + max_queue` admitted requests, arrivals are refused
+    /// immediately with `-32013` rather than queued indefinitely.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_ADMISSION_MAX_QUEUE",
+        default_value_t = DEFAULT_ADMISSION_MAX_QUEUE,
+    )]
+    admission_max_queue: u64,
+
+    /// Requests running a memory-hungry tracer that may execute at once, on top of needing
+    /// an ordinary execution permit.
+    ///
+    /// `prestateTracer`, JS tracers, `muxTracer` and struct-logger requests with non-default
+    /// flags can each produce hundreds of megabytes from one large block — a single such
+    /// response has been measured at over 900 MB. This sub-cap, multiplied by
+    /// `--max-response-size`, is what makes the process's worst-case resident set a number
+    /// an operator can compute; size it from available memory, not from throughput.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_ADMISSION_HEAVY_MAX_CONCURRENT",
+        default_value_t = DEFAULT_ADMISSION_HEAVY_MAX_CONCURRENT,
+        value_parser = clap::value_parser!(u64).range(1..),
+    )]
+    admission_heavy_max_concurrent: u64,
+
+    /// Disables inbound admission control entirely (kill switch).
+    ///
+    /// Restores the pre-gate behaviour: every request executes immediately and the process
+    /// accepts unbounded concurrent work.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_ADMISSION_DISABLED")]
+    admission_disabled: bool,
+
+    /// Maximum serialized size of a single RPC response body.
+    ///
+    /// Checked where this server serializes the reply, so an over-limit body is discarded
+    /// before it can be copied again into the JSON-RPC envelope and, for a batch, retained
+    /// there until every entry finishes — that accumulation, not any single response, is what
+    /// has previously exhausted memory on this server. Over-limit responses are answered with
+    /// an error and counted on `debug_trace_response_oversized_total`.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_MAX_RESPONSE_SIZE",
+        default_value = "256MB",
+        value_parser = parse_size,
+    )]
+    max_response_size: u64,
+
+    /// Maximum assembled size of one JSON-RPC batch response.
+    ///
+    /// A different bound from `--max-response-size`, because it bounds a different thing: the
+    /// batch builder retains every completed entry's body until the whole batch finishes, so a
+    /// batch's memory is the *sum* of its entries, not the largest of them. Left unbounded
+    /// this is the dominant term — entries are capped individually while their accumulation is
+    /// not, and a batch's entry count is limited only by the request body size. A batch that
+    /// exceeds this is answered with a single oversized-response error.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_MAX_BATCH_RESPONSE_SIZE",
+        default_value = "1GB",
+        value_parser = parse_size,
+    )]
+    max_batch_response_size: u64,
+
+    /// Address of the loopback-only admin RPC listener (e.g. `127.0.0.1:8546`).
+    ///
+    /// Serves `admin_getConcurrencyLimit` / `admin_setConcurrencyLimit`, which retune the
+    /// admission gate without a restart. Omitted, no admin listener runs and the limits are
+    /// fixed for the process's lifetime. This port has no authentication and its setters can
+    /// throttle request serving, so a non-loopback bind is refused at startup; reach it
+    /// through a port-forward or a sidecar.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_ADMIN_ADDR")]
+    admin_addr: Option<String>,
 
     /// Estimated number of items in response cache (for initial capacity). Must be at
     /// least 1 — disable the cache with `--response-cache-disabled`, not with 0.
@@ -448,6 +548,41 @@ const DEFAULT_PRUNER_INTERVAL_SECS: u64 = 300;
 /// Default floor of recent block bodies that size-based pruning never removes.
 const DEFAULT_SIZE_PRUNE_MIN_RETAIN: u64 = 256;
 
+/// Default execution-permit budget.
+///
+/// Just above the highest per-handler occupancy this server has been measured sustaining
+/// with zero failures, computed by Little's law from that run's request-duration counters
+/// rather than from its offered concurrency — the two differ by 3x, and the offered figure
+/// would over-provision by the same factor. Deliberately above every clean measurement
+/// rather than at a knee: no saturation point has been established for this workload, and a
+/// default that throttles a known-good one is a worse failure than a loose bound.
+const DEFAULT_ADMISSION_MAX_CONCURRENT: u64 = 640;
+
+/// Default queue depth — roughly four seconds of backlog at the throughput measured on the
+/// cold path, which keeps a full queue comfortably inside the block-fetch deadline.
+const DEFAULT_ADMISSION_MAX_QUEUE: u64 = 8192;
+
+/// Default budget for memory-hungry tracers. Derived from memory rather than throughput: a
+/// single `prestateTracer` response over a large block has been measured near a gigabyte, so
+/// this figure times `--max-response-size` is what to check against the host's memory limit.
+const DEFAULT_ADMISSION_HEAVY_MAX_CONCURRENT: u64 = 8;
+
+/// Cap on an inbound request body, pinned rather than left to the framework's default so the
+/// envelope headroom below can be derived from it instead of guessed.
+const MAX_REQUEST_BODY_SIZE: u32 = 10 * 1024 * 1024;
+
+/// How much room `--max-batch-response-size` must leave above `--max-response-size`.
+///
+/// Our own check measures the bare result body; the framework's cap measures the whole
+/// JSON-RPC response, envelope and client-supplied `id` included. Set the two caps equal and a
+/// body that passes our check can still be swapped for an oversized-response error by the
+/// framework — after the handler has already counted the request as served.
+///
+/// Derived rather than assumed: the only unbounded part of the envelope is the `id`, which the
+/// client sends inside the request body, so [`MAX_REQUEST_BODY_SIZE`] bounds it outright. A
+/// fixed guess would hold for sane ids and quietly fail for a client that pads one.
+const RESPONSE_ENVELOPE_HEADROOM: u64 = MAX_REQUEST_BODY_SIZE as u64 + 1024;
+
 /// Parses a human-readable size string into bytes.
 ///
 /// Accepts suffixes: `KB` (1024), `MB` (1024²), `GB` (1024³). Case-insensitive.
@@ -575,7 +710,81 @@ fn validate_args(args: &Args) -> Result<R2Target> {
              (frontier vs historical) to the local DB tip"
         );
     }
+    // Shared with the admin RPC's setter, so the startup gate and the runtime gate cannot
+    // enforce different rules.
+    if !args.admission_disabled {
+        admission::check_capacity_covers_batch(
+            admission::Limit::new("--admission-max-concurrent", args.admission_max_concurrent),
+            admission::Limit::new("--admission-max-queue", args.admission_max_queue),
+            admission::Limit::new(
+                "--batch-item-concurrency",
+                u64::from(args.batch_item_concurrency),
+            ),
+        )
+        .map_err(|e| eyre::eyre!(e))?;
+    }
+    // The batch builder holds whole entry bodies, so a batch cap below one entry's cap could
+    // never assemble even a single maximal response — and it must clear it by enough for the
+    // JSON-RPC envelope, or the framework can reject a body our own check just passed.
+    let required_batch_cap = args.max_response_size.saturating_add(RESPONSE_ENVELOPE_HEADROOM);
+    if args.max_batch_response_size < required_batch_cap {
+        eyre::bail!(
+            "--max-batch-response-size ({}) must be at least --max-response-size ({}) plus {} \
+             bytes of headroom: a batch holds whole entry bodies, and the framework's cap counts \
+             the JSON-RPC envelope and request id that our own size check does not",
+            args.max_batch_response_size,
+            args.max_response_size,
+            RESPONSE_ENVELOPE_HEADROOM
+        );
+    }
+    // The framework's response cap is a u32, and an over-cap batch bound is merely clamped
+    // (batch truncation is a documented approximation) — but the per-response cap must fit
+    // under that ceiling with the envelope, or bodies between the two would pass our own
+    // check and still be swapped for the framework's oversized-response error after being
+    // counted served, silently blunting `--max-response-size` above ~4 GiB.
+    let framework_ceiling = u64::from(u32::MAX);
+    if args.max_response_size.saturating_add(RESPONSE_ENVELOPE_HEADROOM) > framework_ceiling {
+        eyre::bail!(
+            "--max-response-size ({}) plus {} bytes of envelope headroom must fit the JSON-RPC \
+             framework's u32 response ceiling ({}): a larger cap would accept bodies the \
+             framework then rejects as oversized after they were counted served",
+            args.max_response_size,
+            RESPONSE_ENVELOPE_HEADROOM,
+            framework_ceiling
+        );
+    }
+    admin_bind_addr(args)?;
     Ok(target)
+}
+
+/// Parses `--admin-addr`, returning `None` when no admin listener was requested.
+///
+/// Pure, so `validate_args` can fail fast on a bad value at startup and `main` can ask again
+/// for the parsed address without threading it through — the same shape
+/// `old_block_witness_timeout_secs` already uses.
+fn admin_bind_addr(args: &Args) -> Result<Option<SocketAddr>> {
+    let Some(raw) = args.admin_addr.as_deref() else { return Ok(None) };
+    let raw = raw.trim();
+    // What a templated env file renders for a variable a role does not set.
+    if raw.is_empty() {
+        eyre::bail!(
+            "--admin-addr was set to an empty value; omit it entirely to run without an \
+             admin listener"
+        );
+    }
+    // Deliberately an address literal, not a hostname: a name could resolve to a routable
+    // address later, defeating the loopback check below.
+    let addr: SocketAddr = raw.parse().map_err(|e| {
+        eyre::eyre!("--admin-addr ({raw}) must be an address and port, e.g. 127.0.0.1:8546: {e}")
+    })?;
+    if !addr.ip().is_loopback() {
+        eyre::bail!(
+            "--admin-addr ({addr}) must bind loopback: this port has no authentication and \
+             its setters can throttle request serving. Bind 127.0.0.1 or [::1] and reach it \
+             through a port-forward or a sidecar"
+        );
+    }
+    Ok(Some(addr))
 }
 
 #[tokio::main]
@@ -613,6 +822,13 @@ async fn main() -> Result<()> {
         response_cache_estimated_items = args.response_cache_estimated_items,
         response_compression_disabled = args.response_compression_disabled,
         batch_item_concurrency = args.batch_item_concurrency,
+        admission_disabled = args.admission_disabled,
+        admission_max_concurrent = args.admission_max_concurrent,
+        admission_max_queue = args.admission_max_queue,
+        admission_heavy_max_concurrent = args.admission_heavy_max_concurrent,
+        max_response_size = args.max_response_size,
+        max_batch_response_size = args.max_batch_response_size,
+        admin_addr = ?args.admin_addr,
         "Server configuration"
     );
 
@@ -865,8 +1081,50 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Inbound admission gate. `None` disables it entirely: no layer is installed and every
+    // request executes on arrival, as it did before this existed.
+    let admission = (!args.admission_disabled).then(|| {
+        AdmissionLimiter::new(
+            args.admission_max_concurrent,
+            args.admission_max_queue,
+            args.admission_heavy_max_concurrent,
+        )
+    });
+    match &admission {
+        // Pairing a concurrency cap with a response-size cap is what makes the worst case a
+        // number at all, and it is worth an operator seeing it at startup rather than
+        // discovering it under load. Both products are logged, because they answer different
+        // questions: the heavy one bounds the shapes that can actually reach the response cap,
+        // while the overall one is the theoretical ceiling if every admitted request returned
+        // a maximal body. Neither covers a tracer's intermediate allocations, which are not
+        // bounded by anything here.
+        Some(limiter) => info!(
+            max_concurrent = limiter.max_concurrent(),
+            max_queue = limiter.max_queue(),
+            heavy_max_concurrent = limiter.heavy_max_concurrent(),
+            max_permit_wait_ms = data_provider.max_permit_wait().as_millis() as u64,
+            max_response_size = args.max_response_size,
+            max_batch_response_size = args.max_batch_response_size,
+            worst_case_heavy_response_bytes =
+                limiter.heavy_max_concurrent().saturating_mul(args.max_response_size),
+            worst_case_response_bytes =
+                limiter.max_concurrent().saturating_mul(args.max_response_size),
+            "Admission control enabled"
+        ),
+        None => warn!(
+            "--admission-disabled: this process accepts unbounded concurrent work and has no \
+             upper bound on the memory a burst of large traces can pin"
+        ),
+    }
+
     // Create RPC context and module
-    let ctx = RpcContext::new(data_provider, chain_spec, response_cache);
+    let ctx = RpcContext::new(
+        data_provider,
+        chain_spec,
+        response_cache,
+        admission.clone(),
+        args.max_response_size as usize,
+    );
 
     // Spawn watch dog checker to monitor long-running requests
     let watch_dog = ctx.watch_dog().clone();
@@ -880,14 +1138,34 @@ async fn main() -> Result<()> {
     });
 
     let module = ctx.into_rpc_module()?;
+    assert_admission_covers_module(&module);
 
-    // Start server
-    let max_response_body_size = u32::MAX;
-    let config = ServerConfig::builder().max_response_body_size(max_response_body_size).build();
-    let rpc_middleware = RpcServiceBuilder::new().layer(rpc_middleware::ConcurrentBatchLayer::new(
-        args.batch_item_concurrency as usize,
-        max_response_body_size as usize,
-    ));
+    // Start server. One value feeds the framework's cap and the batch layer's assembly cap —
+    // `rpc_middleware` requires those two to stay in step — while the per-response check at
+    // our own serialization point is the separate, tighter bound that stops a single body
+    // from ever being built up twice more.
+    let max_response_body_size = u32::try_from(args.max_batch_response_size).unwrap_or_else(|_| {
+        warn!(
+            requested = args.max_batch_response_size,
+            applied = u32::MAX,
+            "--max-batch-response-size exceeds the JSON-RPC framework's cap; clamping"
+        );
+        u32::MAX
+    });
+    let config = ServerConfig::builder()
+        .max_response_body_size(max_response_body_size)
+        .max_request_body_size(MAX_REQUEST_BODY_SIZE)
+        .build();
+    // Order is load-bearing: the batch layer is outermost, so the admission layer below it
+    // sees single calls *and* every batch entry. Reversed, an N-entry batch would pass the
+    // gate as one unit — which is the traffic shape that has actually taken this server down.
+    // `batch_entries_are_individually_gated` fails if these are swapped.
+    let rpc_middleware = RpcServiceBuilder::new()
+        .layer(rpc_middleware::ConcurrentBatchLayer::new(
+            args.batch_item_concurrency as usize,
+            max_response_body_size as usize,
+        ))
+        .option_layer(admission.clone().map(admission::AdmissionLayer::new));
     let server = Server::builder()
         .set_config(config)
         .set_rpc_middleware(rpc_middleware)
@@ -897,10 +1175,51 @@ async fn main() -> Result<()> {
     let addr = server.local_addr()?;
     let handle = server.start(module);
 
+    // The bound admin address, kept only for the record; the listener itself is owned by its
+    // own thread for the process's lifetime (see `admin::spawn`).
+    match (admin_bind_addr(&args)?, admission) {
+        (Some(admin_addr), Some(limiter)) => {
+            admin::spawn(admin_addr, limiter, u64::from(args.batch_item_concurrency))?;
+        }
+        (Some(_), None) => {
+            warn!("--admin-addr is set but --admission-disabled: no limits to serve, skipping");
+        }
+        (None, _) => warn!(
+            "--admin-addr not set: admission limits are fixed for this process's lifetime and \
+             can only be changed by restarting"
+        ),
+    }
+
     info!(listen_addr = %addr, "Server started");
     handle.stopped().await;
 
     Ok(())
+}
+
+/// Fails fast if a registered method escapes the admission gate's allowlist.
+///
+/// The allowlist is spelled by name, so a method added later would silently never be gated —
+/// the failure mode of an omission here is an unprotected endpoint, discovered under load.
+/// `debug_getCacheStatus` is the one deliberate exemption; see `metrics::GATE_EXEMPT_METHODS`.
+fn assert_admission_covers_module(module: &jsonrpsee::server::RpcModule<()>) {
+    if let Some(name) = unregistered_method(module.method_names()) {
+        panic!(
+            "method {name} is registered on the RPC module but absent from \
+             metrics::ALL_METHODS, so admission control lets it through ungated and its \
+             metrics collapse onto the `unknown` label; add it there"
+        );
+    }
+}
+
+/// The first method registered on the module that `metrics` does not know about, if any.
+///
+/// Gating is derived — everything in `metrics::ALL_METHODS` is gated unless it is in
+/// `metrics::GATE_EXEMPT_METHODS` — so a registered method can no longer be *accidentally*
+/// ungated by omission from a second list. What can still happen is registering a method the
+/// metrics registry has never heard of, which both bypasses the gate and collapses its metrics
+/// onto `unknown`. That is the one condition worth failing startup over.
+fn unregistered_method<'a>(mut names: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    names.find(|name| !metrics::is_registered(name))
 }
 
 /// Initializes the validator database if data_dir is provided.
@@ -1399,6 +1718,174 @@ mod tests {
             || parse_args(&[]).response_compression_disabled,
         );
         assert!(disabled_via_env);
+    }
+
+    /// The admission allowlist is spelled by name, so a method added later would silently
+    /// never be gated — an unprotected endpoint, discovered under load.
+    #[test]
+    fn every_registered_method_is_known_to_metrics() {
+        let registered: Vec<&str> = metrics::ALL_METHODS
+            .iter()
+            .copied()
+            .chain(metrics::TIMED_METHOD_ALIASES.iter().map(|(alias, _)| *alias))
+            .collect();
+        assert_eq!(unregistered_method(registered.iter().copied()), None);
+
+        assert_eq!(
+            unregistered_method(["debug_traceBlockByNumber", "debug_newThing"].into_iter()),
+            Some("debug_newThing"),
+            "a method metrics has never heard of must be reported, not silently ungated"
+        );
+
+        // Gating is derived, so the exemption is spelled once and both spellings resolve alike.
+        assert!(metrics::is_gated(metrics::METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER));
+        for name in
+            [metrics::METHOD_DEBUG_GET_CACHE_STATUS, metrics::TIMED_METHOD_DEBUG_GET_CACHE_STATUS]
+        {
+            assert!(!metrics::is_gated(metrics::method_label(name)), "{name} stays exempt");
+        }
+    }
+
+    #[test]
+    fn admission_flag_defaults_and_env() {
+        let guard = stateless_test_utils::env::env_lock();
+
+        let args = parse_args(&[]);
+        assert_eq!(args.admission_max_concurrent, DEFAULT_ADMISSION_MAX_CONCURRENT);
+        assert_eq!(args.admission_max_queue, DEFAULT_ADMISSION_MAX_QUEUE);
+        assert_eq!(args.admission_heavy_max_concurrent, DEFAULT_ADMISSION_HEAVY_MAX_CONCURRENT);
+        assert!(!args.admission_disabled);
+        assert_eq!(args.max_response_size, 256 * 1024 * 1024);
+        assert_eq!(args.max_batch_response_size, 1024 * 1024 * 1024);
+        assert!(args.admin_addr.is_none());
+
+        // Zero execution permits would park every request forever; zero queue is a legitimate
+        // "execute or shed" configuration and must stay accepted.
+        let base =
+            ["debug-trace-server", "--rpc-endpoint", "http://r", "--witness-endpoint", "http://w"];
+        for flag in ["--admission-max-concurrent", "--admission-heavy-max-concurrent"] {
+            assert!(
+                Args::try_parse_from(base.iter().chain(&[flag, "0"])).is_err(),
+                "{flag} 0 must be rejected at parse time"
+            );
+        }
+        assert_eq!(parse_args(&["--admission-max-queue", "0"]).admission_max_queue, 0);
+
+        // Env attributes are what container deployments actually use, and a typo in one ships
+        // silently — a default-looking value with nothing pointing at the cause. Each case
+        // names its own accessor, so a new variable cannot be misrouted by a catch-all arm.
+        let assert_env_reaches = |var: &str, value: &str, field: fn(&Args) -> u64| {
+            let read = stateless_test_utils::env::with_env_var(&guard, var, value, || {
+                field(&parse_args(&[]))
+            });
+            assert_eq!(read.to_string(), value, "{var} did not reach its field");
+        };
+        assert_env_reaches("DEBUG_TRACE_SERVER_ADMISSION_MAX_CONCURRENT", "77", |args| {
+            args.admission_max_concurrent
+        });
+        assert_env_reaches("DEBUG_TRACE_SERVER_ADMISSION_MAX_QUEUE", "78", |args| {
+            args.admission_max_queue
+        });
+        assert_env_reaches("DEBUG_TRACE_SERVER_ADMISSION_HEAVY_MAX_CONCURRENT", "79", |args| {
+            args.admission_heavy_max_concurrent
+        });
+
+        let sizes = stateless_test_utils::env::with_env_var(
+            &guard,
+            "DEBUG_TRACE_SERVER_MAX_RESPONSE_SIZE",
+            "64MB",
+            || parse_args(&[]).max_response_size,
+        );
+        assert_eq!(sizes, 64 * 1024 * 1024);
+    }
+
+    /// The admin port has no authentication and its setters can throttle request serving, so a
+    /// non-loopback bind is refused by name rather than warned about.
+    #[test]
+    fn admin_addr_must_be_a_loopback_literal() {
+        for accepted in ["127.0.0.1:8546", "127.0.0.5:1", "[::1]:8546"] {
+            let args = parse_args(&["--admin-addr", accepted]);
+            assert!(admin_bind_addr(&args).is_ok(), "{accepted} should be accepted");
+        }
+
+        // A hostname is refused even when it resolves to loopback today: it could resolve
+        // elsewhere later, which would defeat the check silently.
+        for rejected in ["0.0.0.0:8546", "10.1.2.3:8546", "[::]:8546", "localhost:8546", "8546"] {
+            let args = parse_args(&["--admin-addr", rejected]);
+            let err = admin_bind_addr(&args).unwrap_err().to_string();
+            assert!(err.contains("--admin-addr"), "the error must name the flag: {err}");
+        }
+
+        // What a templated env file renders for a variable a role does not set.
+        let args = parse_args(&["--admin-addr", "  "]);
+        assert!(admin_bind_addr(&args).unwrap_err().to_string().contains("--admin-addr"));
+
+        assert!(admin_bind_addr(&parse_args(&[])).unwrap().is_none(), "absent means disabled");
+    }
+
+    /// A gate with less total capacity than one batch's concurrent entries sheds part of every
+    /// batch on a completely idle server — caught at startup, by name.
+    #[test]
+    fn admission_capacity_must_cover_one_batch() {
+        let args = parse_args(&[
+            "--batch-item-concurrency",
+            "16",
+            "--admission-max-concurrent",
+            "4",
+            "--admission-max-queue",
+            "4",
+        ]);
+        let err = validate_args(&args).expect_err("8 of capacity cannot serve a 16-wide batch");
+        let err = err.to_string();
+        assert!(err.contains("--admission-max-concurrent"), "{err}");
+        assert!(err.contains("--batch-item-concurrency"), "{err}");
+
+        // The kill switch takes the rule out of play along with the gate.
+        let args = parse_args(&[
+            "--batch-item-concurrency",
+            "16",
+            "--admission-max-concurrent",
+            "4",
+            "--admission-max-queue",
+            "4",
+            "--admission-disabled",
+        ]);
+        assert!(validate_args(&args).is_ok());
+    }
+
+    /// A batch holds whole entry bodies, so a batch cap under one entry's cap could never
+    /// assemble even a single maximal response.
+    #[test]
+    fn batch_response_cap_must_cover_one_response_plus_its_envelope() {
+        let args =
+            parse_args(&["--max-response-size", "512MB", "--max-batch-response-size", "256MB"]);
+        let err = validate_args(&args).expect_err("a batch cap below the entry cap").to_string();
+        assert!(err.contains("--max-batch-response-size"), "{err}");
+
+        // Equal caps are the trap: our own check measures the bare body while the framework's
+        // measures the envelope too, so a body that just passes ours can still be swapped for
+        // an oversized error after the handler counted the request as served.
+        let equal =
+            parse_args(&["--max-response-size", "512MB", "--max-batch-response-size", "512MB"]);
+        let err = validate_args(&equal).expect_err("equal caps leave no envelope room").to_string();
+        assert!(err.contains("headroom"), "the error must explain why equal is not enough: {err}");
+
+        assert!(validate_args(&parse_args(&["--max-response-size", "512MB"])).is_ok());
+    }
+
+    /// The framework's response cap is a u32, so a per-response cap near or above 4 GiB
+    /// would be silently undercut: bodies between the ceiling and the cap pass our own check
+    /// and are then swapped for the framework's oversized-response error after being counted
+    /// served. Rejected at startup, by name.
+    #[test]
+    fn response_cap_must_fit_the_framework_ceiling() {
+        let args = parse_args(&["--max-response-size", "5GB", "--max-batch-response-size", "11GB"]);
+        let err = validate_args(&args).expect_err("5GB cannot fit a u32 ceiling").to_string();
+        assert!(err.contains("--max-response-size"), "the error must name the flag: {err}");
+        assert!(err.contains("ceiling"), "and say what it collided with: {err}");
+
+        let ok = parse_args(&["--max-response-size", "2GB", "--max-batch-response-size", "3GB"]);
+        assert!(validate_args(&ok).is_ok(), "well under the ceiling stays accepted");
     }
 
     /// Batch concurrency knob: default, CLI/env override, and the zero rejection.
