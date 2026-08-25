@@ -124,7 +124,11 @@ impl AdminRpcServer for AdminApi {
             ));
         }
         // The same rule startup enforces, in this caller's vocabulary — see
-        // `admission::check_capacity_covers_batch`.
+        // `admission::check_capacity_covers_batch`. This validate-then-apply section must
+        // stay await-free: the admin server runs on a current-thread runtime, so staying
+        // synchronous is what makes read-check-apply atomic across concurrent admin calls —
+        // an await point would let two writes each pass this check against limits the other
+        // is about to change.
         check_capacity_covers_batch(
             Limit::new(
                 "maxConcurrent",
@@ -229,7 +233,10 @@ fn bind(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{response_cache::TraceWeight, rpc_middleware::test_support::post_raw};
+    use crate::{
+        response_cache::TraceWeight,
+        rpc_middleware::test_support::{far, post_raw},
+    };
 
     const BATCH_ITEM_CONCURRENCY: u64 = 16;
 
@@ -302,10 +309,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lowering_a_limit_does_not_abort_in_flight_work() {
         let api = api(4, 32, 2);
-        let cutoff = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let held = api
             .limiter
-            .acquire_execution(crate::metrics::METHOD_TRACE_BLOCK, TraceWeight::Normal, cutoff)
+            .acquire_execution(crate::metrics::METHOD_TRACE_BLOCK, TraceWeight::Normal, far())
             .await
             .expect("permit");
         api.set_concurrency_limit(Some(1), None, None).await.expect("set");

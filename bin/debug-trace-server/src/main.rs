@@ -1184,7 +1184,7 @@ async fn main() -> Result<()> {
 ///
 /// The allowlist is spelled by name, so a method added later would silently never be gated —
 /// the failure mode of an omission here is an unprotected endpoint, discovered under load.
-/// `debug_getCacheStatus` is the one deliberate exemption; see `metrics::GATED_METHODS`.
+/// `debug_getCacheStatus` is the one deliberate exemption; see `metrics::GATE_EXEMPT_METHODS`.
 fn assert_admission_covers_module(module: &jsonrpsee::server::RpcModule<()>) {
     if let Some(name) = unregistered_method(module.method_names()) {
         panic!(
@@ -1756,22 +1756,23 @@ mod tests {
         assert_eq!(parse_args(&["--admission-max-queue", "0"]).admission_max_queue, 0);
 
         // Env attributes are what container deployments actually use, and a typo in one ships
-        // silently — a default-looking value with nothing pointing at the cause.
-        for (var, flag_value) in [
-            ("DEBUG_TRACE_SERVER_ADMISSION_MAX_CONCURRENT", "77"),
-            ("DEBUG_TRACE_SERVER_ADMISSION_MAX_QUEUE", "78"),
-            ("DEBUG_TRACE_SERVER_ADMISSION_HEAVY_MAX_CONCURRENT", "79"),
-        ] {
-            let read = stateless_test_utils::env::with_env_var(&guard, var, flag_value, || {
-                let args = parse_args(&[]);
-                match var {
-                    "DEBUG_TRACE_SERVER_ADMISSION_MAX_CONCURRENT" => args.admission_max_concurrent,
-                    "DEBUG_TRACE_SERVER_ADMISSION_MAX_QUEUE" => args.admission_max_queue,
-                    _ => args.admission_heavy_max_concurrent,
-                }
+        // silently — a default-looking value with nothing pointing at the cause. Each case
+        // names its own accessor, so a new variable cannot be misrouted by a catch-all arm.
+        let assert_env_reaches = |var: &str, value: &str, field: fn(&Args) -> u64| {
+            let read = stateless_test_utils::env::with_env_var(&guard, var, value, || {
+                field(&parse_args(&[]))
             });
-            assert_eq!(read.to_string(), flag_value, "{var} did not reach its field");
-        }
+            assert_eq!(read.to_string(), value, "{var} did not reach its field");
+        };
+        assert_env_reaches("DEBUG_TRACE_SERVER_ADMISSION_MAX_CONCURRENT", "77", |args| {
+            args.admission_max_concurrent
+        });
+        assert_env_reaches("DEBUG_TRACE_SERVER_ADMISSION_MAX_QUEUE", "78", |args| {
+            args.admission_max_queue
+        });
+        assert_env_reaches("DEBUG_TRACE_SERVER_ADMISSION_HEAVY_MAX_CONCURRENT", "79", |args| {
+            args.admission_heavy_max_concurrent
+        });
 
         let sizes = stateless_test_utils::env::with_env_var(
             &guard,

@@ -56,6 +56,7 @@ use std::{
     time::Instant,
 };
 
+use futures::future::Either;
 use jsonrpsee::server::middleware::rpc::{
     Batch, MethodResponse, Notification, Request, RpcServiceT,
 };
@@ -566,28 +567,28 @@ where
         request: Request<'a>,
     ) -> impl Future<Output = Self::MethodResponse> + Send + 'a {
         let method = metrics::method_label(request.method_name());
-        let gated = metrics::is_gated(method);
+        // An ungated call hands back the inner future untouched — no service clone, no
+        // wrapper — so the exempt cache-status polls and unknown methods pay nothing here.
+        if !metrics::is_gated(method) {
+            return Either::Left(self.service.call(request));
+        }
         let service = self.service.clone();
         let limiter = Arc::clone(&self.limiter);
-        // Everything that decides an outcome runs inside this block, never in the prefix
+        // The shed decision and its recording run inside this block, never in the prefix
         // above: `record_admission_shed` reaches for the `ERROR_SELF_REPORTED` task-local
         // that tells the batch layer's fallback this `-32013` is already accounted for, and
         // that scope only exists once the future is being polled. Recorded from the prefix,
         // every shed would double-count its error and false-fire the `unattributed` alarm.
-        async move {
-            if !gated {
-                return service.call(request).await;
-            }
+        Either::Right(async move {
             let Some(guard) = limiter.try_admit(method) else {
                 metrics::record_admission_shed(method);
-                let id = request.id.clone();
-                return MethodResponse::error(id, queue_full_error())
+                return MethodResponse::error(request.id, queue_full_error())
                     .with_extensions(request.extensions);
             };
             let response = service.call(request).await;
             drop(guard);
             response
-        }
+        })
     }
 
     fn notification<'a>(
@@ -612,14 +613,9 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::metrics::METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER;
+    use crate::{metrics::METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, rpc_middleware::test_support::far};
 
     const METHOD: &str = METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER;
-
-    /// A cutoff far enough away that a test never trips the deadline clamp by accident.
-    pub(crate) fn far() -> Instant {
-        Instant::now() + Duration::from_secs(30)
-    }
 
     /// Takes `n` ordinary execution permits and hands them back for the caller to hold.
     async fn hold(limiter: &Arc<AdmissionLimiter>, n: usize) -> Vec<ExecutionPermit> {

@@ -312,37 +312,6 @@ impl RpcContext {
         Ok(BlockLookup::Fetched(data, permit))
     }
 
-    /// [`Self::lookup_block_by_number`]'s by-hash sibling: the requested hash *is* the cache
-    /// key, so there is no resolution step, but the rest of the order is identical and is the
-    /// part worth not re-deriving per handler — consult the cache, then take an execution
-    /// permit only on a miss, then fetch under the same deadline the permit wait was clamped to.
-    async fn lookup_block_by_hash(
-        &self,
-        method: &'static str,
-        resource: CachedResource,
-        variant: Option<ResponseVariant>,
-        weight: TraceWeight,
-        block_hash: B256,
-        start: Instant,
-    ) -> Result<BlockLookup, jsonrpsee::types::ErrorObjectOwned> {
-        if let Some(cached) =
-            check_cache(&self.response_cache, resource, block_hash, variant, method, start)
-        {
-            return Ok(BlockLookup::Cached(cached));
-        }
-
-        // Minted once and used for both the permit wait and the fetch, so the queue is carved
-        // out of the request's budget rather than added on top of it.
-        let deadline = self.data_provider.fetch_deadline();
-        let permit = self.acquire_execution(method, weight, deadline).await?;
-        let data = self
-            .data_provider
-            .get_block_data_by_hash(block_hash, deadline)
-            .await
-            .map_err(|e| data_provider_failure(method, &e))?;
-        Ok(BlockLookup::Fetched(data, permit))
-    }
-
     /// Waits for an execution permit, or refuses when the wait would outlast the budget.
     ///
     /// `deadline` must be the same one the request's fetch will run under, so the wait is
@@ -734,20 +703,29 @@ impl DebugTraceRpcServer for RpcContext {
         let opts = opts.unwrap_or_default();
         let (variant, weight) = classify_and_gate(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, &opts)?;
 
-        let (data, _permit) = match self
-            .lookup_block_by_hash(
-                METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
-                CachedResource::DebugTraceBlock,
-                variant,
-                weight,
-                block_hash,
-                start,
-            )
-            .await?
-        {
-            BlockLookup::Cached(cached) => return Ok(cached),
-            BlockLookup::Fetched(data, permit) => (data, permit),
-        };
+        // Check cache — the requested hash IS the key; no resolution step.
+        if let Some(cached) = check_cache(
+            &self.response_cache,
+            CachedResource::DebugTraceBlock,
+            block_hash,
+            variant,
+            METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
+            start,
+        ) {
+            return Ok(cached);
+        }
+
+        // Minted once and used for both the permit wait and the fetch, so the queue is carved
+        // out of the request's budget rather than added on top of it; the permit is held
+        // through the replay below.
+        let deadline = self.data_provider.fetch_deadline();
+        let _permit =
+            self.acquire_execution(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, weight, deadline).await?;
+        let data = self
+            .data_provider
+            .get_block_data_by_hash(block_hash, deadline)
+            .await
+            .map_err(|e| data_provider_failure(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, &e))?;
         let block_num = data.block.header.number;
         let result = self.compute_debug_trace(&data, METHOD_DEBUG_TRACE_BLOCK_BY_HASH, opts)?;
 
@@ -1304,7 +1282,7 @@ mod tests {
             .acquire_execution(
                 METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
                 crate::response_cache::TraceWeight::Normal,
-                Instant::now() + Duration::from_secs(30),
+                crate::rpc_middleware::test_support::far(),
             )
             .await
             .expect("the test holds the gate's only permit");
@@ -1326,7 +1304,7 @@ mod tests {
             .acquire_execution(
                 METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
                 crate::response_cache::TraceWeight::Normal,
-                Instant::now() + Duration::from_secs(30),
+                crate::rpc_middleware::test_support::far(),
             )
             .await
             .expect("the test holds the gate's only permit");

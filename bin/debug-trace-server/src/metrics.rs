@@ -92,9 +92,10 @@ pub fn is_gated(method: &'static str) -> bool {
     ALL_METHODS.contains(&method) && !GATE_EXEMPT_METHODS.contains(&method)
 }
 
-/// The methods the gate applies to — [`ALL_METHODS`] minus [`GATE_EXEMPT_METHODS`].
+/// The methods the gate applies to — [`ALL_METHODS`] filtered through [`is_gated`], so the
+/// rule has exactly one spelling.
 pub fn gated_methods() -> impl Iterator<Item = &'static str> {
-    ALL_METHODS.iter().copied().filter(|m| !GATE_EXEMPT_METHODS.contains(m))
+    ALL_METHODS.iter().copied().filter(|&m| is_gated(m))
 }
 
 /// Maps an arbitrary method string onto one of the known `&'static str` labels, so a
@@ -503,11 +504,12 @@ fn record_upstream_deadline_exceeded(method: &'static str) {
 /// shapes bypass the response cache.
 const REQUEST_SHAPE_TOTAL: &str = "debug_trace_request_shape_total";
 
-/// Every label emitted by `RequestShape::label`, for pre-registration and tests — plus the
-/// two the request never reached a tracer for: `rejected`, recorded by the RPC middleware
-/// for requests the framework answered before the handler ran (see
-/// [`record_framework_rejection`]), and `shed`, recorded by the admission layer for
-/// requests turned away before the handler ran (see [`record_admission_shed`]).
+/// Every label emitted by `RequestShape::label`, for pre-registration and tests — plus
+/// `rejected`, recorded by the RPC middleware for requests the framework answered before
+/// the handler ran (see [`record_framework_rejection`]). `shed` (see
+/// [`record_admission_shed`]) is deliberately absent: its series exists for exactly the
+/// gated methods, so pre-registration derives it from [`gated_methods`] instead of crossing
+/// it with every method here.
 pub const REQUEST_SHAPES: &[&str] = &[
     "default",
     "call_tracer",
@@ -519,7 +521,6 @@ pub const REQUEST_SHAPES: &[&str] = &[
     "js_tracer",
     "mux_tracer",
     "rejected",
-    "shed",
 ];
 
 /// Records one request of the given parameter shape for `method`.
@@ -935,35 +936,28 @@ fn pre_register_all_metrics() {
         }
     }
     // Arrival series for the opts-less methods: "default" at handler entry, "rejected" via
-    // the middleware fallback, plus "shed" for the two the admission gate applies to. The
-    // three opts-taking methods get "shed" from `REQUEST_SHAPES` above; `debug_getCacheStatus`
-    // is exempt from the gate (see `GATED_METHODS`) so it has no `shed` series at all.
-    for method in [METHOD_TRACE_BLOCK, METHOD_TRACE_TRANSACTION] {
-        for shape in ["default", "rejected", "shed"] {
+    // the middleware fallback.
+    for method in [METHOD_TRACE_BLOCK, METHOD_TRACE_TRANSACTION, METHOD_DEBUG_GET_CACHE_STATUS] {
+        for shape in ["default", "rejected"] {
             counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => shape).increment(0);
         }
-    }
-    for shape in ["default", "rejected"] {
-        counter!(REQUEST_SHAPE_TOTAL, "method" => METHOD_DEBUG_GET_CACHE_STATUS, "shape" => shape)
-            .increment(0);
     }
     // The `unknown` fold target only ever arrives through the middleware's rejected pair.
     counter!(REQUEST_SHAPE_TOTAL, "method" => "unknown", "shape" => "rejected").increment(0);
 
-    // Request Layer: admission gate. Occupancy is per gated method; the limit gauges are
-    // global and are re-published on every admin write.
+    // Request Layer: admission gate. The `shed` arrival series, the occupancy gauges, and
+    // the oversized-response counter (a nonzero value there is the signal that clients are
+    // asking for more than the process is willing to materialize) all exist for exactly the
+    // methods that can fetch, replay, and produce a trace body — so all three derive from
+    // `gated_methods()` and gate coverage has one spelling instead of a per-list one. The
+    // limit gauges are global and are re-published on every admin write.
     for method in gated_methods() {
+        counter!(REQUEST_SHAPE_TOTAL, "method" => method, "shape" => "shed").increment(0);
         let _ = AdmissionMetrics::new_for_method(method);
+        counter!(RESPONSE_OVERSIZED_TOTAL, "method" => method).increment(0);
     }
     let _ = histogram!(ADMISSION_PERMIT_WAIT_SECONDS);
     gauge!(ADMISSION_HEAVY_EXECUTING).set(0.0);
-
-    // Request Layer: responses discarded for exceeding `--max-response-size`. Every method
-    // that can produce a trace body participates; a nonzero value here is the signal that
-    // clients are asking for more than the process is willing to materialize.
-    for method in gated_methods() {
-        counter!(RESPONSE_OVERSIZED_TOTAL, "method" => method).increment(0);
-    }
 
     // Data Fetch Layer: canonical number → hash resolution
     for (source, outcome) in [

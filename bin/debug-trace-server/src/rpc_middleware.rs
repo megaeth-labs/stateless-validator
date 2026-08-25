@@ -378,6 +378,12 @@ pub(crate) mod test_support {
     pub(crate) async fn post_raw(addr: SocketAddr, body: String) -> Value {
         serde_json::from_str(&post_text(addr, body).await).unwrap()
     }
+
+    /// A permit cutoff far enough away that a test never trips the deadline clamp by
+    /// accident.
+    pub(crate) fn far() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(30)
+    }
 }
 
 #[cfg(test)]
@@ -787,14 +793,17 @@ mod tests {
     async fn a_notification_never_reaches_a_handler_or_takes_capacity() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        static HANDLER_RAN: AtomicBool = AtomicBool::new(false);
-        HANDLER_RAN.store(false, Ordering::SeqCst);
+        let handler_ran = Arc::new(AtomicBool::new(false));
 
         let mut module = RpcModule::new(());
+        let flag = Arc::clone(&handler_ran);
         module
-            .register_async_method(crate::metrics::METHOD_TRACE_BLOCK, |_, _, _| async {
-                HANDLER_RAN.store(true, Ordering::SeqCst);
-                "ok"
+            .register_async_method(crate::metrics::METHOD_TRACE_BLOCK, move |_, _, _| {
+                let flag = Arc::clone(&flag);
+                async move {
+                    flag.store(true, Ordering::SeqCst);
+                    "ok"
+                }
             })
             .unwrap();
 
@@ -804,7 +813,7 @@ mod tests {
             .acquire_execution(
                 crate::metrics::METHOD_TRACE_BLOCK,
                 crate::response_cache::TraceWeight::Normal,
-                Instant::now() + Duration::from_secs(30),
+                far(),
             )
             .await
             .expect("the test holds the only execution permit");
@@ -823,7 +832,7 @@ mod tests {
             body.is_empty() || body == "null",
             "a notification gets no real response: {body:?}"
         );
-        assert!(!HANDLER_RAN.load(Ordering::SeqCst), "the framework never dispatched the method");
+        assert!(!handler_ran.load(Ordering::SeqCst), "the framework never dispatched the method");
         assert_eq!(limiter.in_flight(), 0, "and it never took a unit of admitted capacity");
     }
 
@@ -990,7 +999,6 @@ mod tests {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let mut acc = Acc::new();
-        let drain_into = |acc: &mut Acc| drain(&snapshotter, acc);
 
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         metrics::with_local_recorder(&recorder, || {
@@ -1025,7 +1033,7 @@ mod tests {
                 // The drop lands only once the connection teardown reaches the server.
                 let deadline = Instant::now() + Duration::from_secs(10);
                 loop {
-                    drain_into(&mut acc);
+                    drain(&snapshotter, &mut acc);
                     if read(&acc, CANCELLED, &[("method", "debug_traceBlockByNumber")]) > 0 {
                         break;
                     }
@@ -1034,7 +1042,7 @@ mod tests {
                 }
             })
         });
-        drain_into(&mut acc);
+        drain(&snapshotter, &mut acc);
 
         // Terminal-path pins: each scenario landed on exactly the series it must.
         assert_eq!(
