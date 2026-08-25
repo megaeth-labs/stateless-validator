@@ -175,6 +175,12 @@ fn witness_source_flag_and_env() {
 /// for `r2`), so the parse itself must accept its absence in both modes.
 #[test]
 fn witness_endpoint_is_optional_at_parse_time() {
+    // `try_parse_from` reads the environment for every `#[clap(env = ...)]` field, so this
+    // is an env-touching test and must hold the lock like every other one in this binary --
+    // without it, a sibling test's `with_env_var` can both set
+    // `STATELESS_VALIDATOR_WITNESS_ENDPOINT` under this parse (a spurious failure) and
+    // realloc `environ` while clap reads it.
+    let _guard = stateless_test_utils::env::env_lock();
     let parse =
         |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS_NO_WITNESS.iter().chain(extra));
 
