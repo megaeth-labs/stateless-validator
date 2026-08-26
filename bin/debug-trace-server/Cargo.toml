@@ -12,7 +12,6 @@ exclude.workspace = true
 alloy-consensus.workspace = true
 alloy-evm.workspace = true
 alloy-genesis.workspace = true
-alloy-op-evm.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-rpc-types-trace.workspace = true
