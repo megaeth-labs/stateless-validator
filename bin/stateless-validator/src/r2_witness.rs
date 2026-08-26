@@ -136,7 +136,7 @@ impl R2WitnessClient {
     /// `--rpc-initial-backoff-ms` / `--rpc-max-backoff-ms`, so one pair of flags tunes both
     /// paths. `max_concurrent_requests` caps the number of GETs in flight at once (`None` =
     /// unlimited, `Some(0)` clamps to 1 — same semantics as the RPC witness semaphore; in R2
-    /// mode this client is the only enforcement of `--witness-max-concurrent-requests`). Fails
+    /// mode this client is the only enforcement of `--r2-max-concurrent-requests`). Fails
     /// if the endpoint is not a bare `scheme://host[:port]` origin or the HTTP client cannot be
     /// built.
     pub fn new(

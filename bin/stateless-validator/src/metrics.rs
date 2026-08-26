@@ -274,7 +274,7 @@ pub fn record_r2_negotiated_version(version: &'static str) {
 /// How many HTTP/2 connections the custom-domain target spreads its GETs over.
 ///
 /// A plain value rather than an info label: it is the divisor for the per-connection stream
-/// budget, so a dashboard reads it against `--witness-max-concurrent-requests` and against the
+/// budget, so a dashboard reads it against `--r2-max-concurrent-requests` and against the
 /// edge's limit rather than grouping by it. Published only for the custom-domain target, where
 /// one client is one connection and the count is a real property of the transport.
 pub fn record_r2_connections(connections: usize) {

@@ -169,7 +169,7 @@ pub struct CommandLineArgs {
     /// when the first saturates, so this is the only way past the edge's per-connection stream
     /// limit — and the only way one dropped connection stops taking every in-flight GET with
     /// it, which matters here because R2 mode has no RPC fallback.
-    /// `--witness-max-concurrent-requests` is still the cap across all of them, split evenly
+    /// `--r2-max-concurrent-requests` is still the cap across all of them, split evenly
     /// and rounded up, so raising this alone spreads the same concurrency thinner rather than
     /// raising the ceiling; a count larger than that cap is rejected, since the surplus
     /// connections could never be filled.
