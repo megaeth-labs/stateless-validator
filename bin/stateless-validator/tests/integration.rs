@@ -143,65 +143,6 @@ fn r2_max_concurrent_requests_flag_and_env() {
     );
 }
 
-/// The R2 and RPC witness caps are separate budgets against separate services, so setting one
-/// must not move the other.
-#[test]
-fn witness_and_r2_concurrency_caps_are_independent() {
-    let _guard = stateless_test_utils::env::env_lock();
-    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
-
-    let a = parse(&["--witness-max-concurrent-requests", "7"]).unwrap();
-    assert_eq!(a.witness_max_concurrent_requests, Some(7));
-    assert_eq!(a.r2_max_concurrent_requests, None);
-
-    let b = parse(&["--r2-max-concurrent-requests", "9"]).unwrap();
-    assert_eq!(b.r2_max_concurrent_requests, Some(9));
-    assert_eq!(b.witness_max_concurrent_requests, None);
-
-    let both =
-        parse(&["--witness-max-concurrent-requests", "7", "--r2-max-concurrent-requests", "9"])
-            .unwrap();
-    assert_eq!(both.witness_max_concurrent_requests, Some(7));
-    assert_eq!(both.r2_max_concurrent_requests, Some(9));
-}
-
-/// Carrying the pre-split spelling into `--witness-source r2` must fail by name rather than
-/// leave R2 uncapped: that mode has no RPC fallback, so an uncapped fetcher aims its whole
-/// in-flight window at the bucket.
-#[test]
-fn r2_mode_refuses_the_pre_split_concurrency_spelling() {
-    let _guard = stateless_test_utils::env::env_lock();
-    let parse = |extra: &[&str]| {
-        CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra)).expect("parses")
-    };
-
-    let stale = parse(&["--witness-source", "r2", "--witness-max-concurrent-requests", "48"]);
-    let err = stateless_validator::check_r2_concurrency_migration(&stale)
-        .expect_err("the old spelling must be refused in r2 mode");
-    let msg = err.to_string();
-    assert!(msg.contains("--witness-max-concurrent-requests"), "{msg}");
-    assert!(msg.contains("--r2-max-concurrent-requests"), "{msg}");
-
-    // Migrated: the new spelling alone is accepted.
-    let migrated = parse(&["--witness-source", "r2", "--r2-max-concurrent-requests", "48"]);
-    assert!(stateless_validator::check_r2_concurrency_migration(&migrated).is_ok());
-
-    // Both set is accepted too -- the RPC cap is simply unread in this mode.
-    let both = parse(&[
-        "--witness-source",
-        "r2",
-        "--witness-max-concurrent-requests",
-        "16",
-        "--r2-max-concurrent-requests",
-        "48",
-    ]);
-    assert!(stateless_validator::check_r2_concurrency_migration(&both).is_ok());
-
-    // Under `rpc` the old spelling still means what it says, so the rule stays inert.
-    let rpc = parse(&["--witness-source", "rpc", "--witness-max-concurrent-requests", "48"]);
-    assert!(stateless_validator::check_r2_concurrency_migration(&rpc).is_ok());
-}
-
 #[test]
 fn tip_buffer_flag_and_env() {
     assert_optional_numeric_flag::<u64>("--tip-buffer", "STATELESS_VALIDATOR_TIP_BUFFER", |a| {

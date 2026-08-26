@@ -11,8 +11,7 @@ pub(crate) mod validator_db;
 pub(crate) mod workers;
 
 pub use app::{
-    CommandLineArgs, VALIDATOR_DB_FILENAME, WitnessSource, check_r2_concurrency_migration,
-    load_or_create_chain_spec, run,
+    CommandLineArgs, VALIDATOR_DB_FILENAME, WitnessSource, load_or_create_chain_spec, run,
 };
 pub use chain_sync::{ValidationTask, ValidatorFetcher, ValidatorHooks, ValidatorProcessor};
 pub use r2_witness::{R2WitnessClient, R2WitnessError};

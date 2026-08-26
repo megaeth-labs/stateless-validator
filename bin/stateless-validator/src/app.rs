@@ -215,7 +215,7 @@ pub struct CommandLineArgs {
 
     /// Maximum concurrent in-flight RPC witness fetches, independent of the data cap. Omit
     /// for unlimited. Applies to `--witness-source rpc` only; R2 GETs are capped by
-    /// `--r2-max-concurrent-requests`, which is a separate budget against a separate service.
+    /// `--r2-max-concurrent-requests`.
     #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_MAX_CONCURRENT_REQUESTS")]
     pub witness_max_concurrent_requests: Option<usize>,
 
@@ -350,7 +350,6 @@ pub async fn run() -> Result<()> {
                      straight from the R2 bucket, and there is no RPC witness fallback"
                 );
             }
-            check_r2_concurrency_migration(&args)?;
             let timeouts = stateless_r2::fetch::FetchTimeouts {
                 per_attempt: per_attempt_timeout,
                 connect: args
@@ -469,6 +468,16 @@ fn build_r2_client(
     timeouts: stateless_r2::fetch::FetchTimeouts,
     retry: BackoffPolicy,
 ) -> Result<R2WitnessClient> {
+    // `--witness-max-concurrent-requests` capped R2 GETs too before the caps were split.
+    // Refuse the pre-split spelling by name rather than leave R2 uncapped: this mode has no
+    // RPC fallback, so an uncapped fetcher aims its whole in-flight window at the bucket.
+    if args.witness_max_concurrent_requests.is_some() && args.r2_max_concurrent_requests.is_none() {
+        return Err(eyre::eyre!(
+            "--witness-max-concurrent-requests no longer caps R2 GETs under --witness-source \
+             r2 (it now sizes only the RPC witness path): set --r2-max-concurrent-requests \
+             instead"
+        ));
+    }
     // Every coherence rule lives in the shared validator, so the reads below rest on an
     // invariant that was actually checked: no empty values, exactly one target, and an Access
     // pair that is either whole or absent.
@@ -529,31 +538,6 @@ fn build_r2_client(
     Ok(client)
 }
 
-/// Rejects the pre-split spelling of the R2 concurrency cap.
-///
-/// `--witness-max-concurrent-requests` used to cap R2 GETs as well as RPC witness calls.
-/// Now that the two budgets are separate, carrying the old spelling forward would leave R2
-/// uncapped -- and `--witness-source r2` has no RPC fallback, so the fetcher would point its
-/// whole in-flight window at the bucket. Silently dropping a cap an operator wrote down is
-/// worse than refusing to start, so this refuses by name, the way a leftover S3 credential is.
-///
-/// Inert outside `--witness-source r2`: under `rpc` the old spelling still means exactly what
-/// it says, and every `--r2-*` flag is unread.
-pub fn check_r2_concurrency_migration(args: &CommandLineArgs) -> Result<()> {
-    if args.witness_source != WitnessSource::R2 {
-        return Ok(());
-    }
-    if args.witness_max_concurrent_requests.is_some() && args.r2_max_concurrent_requests.is_none() {
-        return Err(eyre::eyre!(
-            "--witness-max-concurrent-requests no longer caps R2 GETs under --witness-source \
-             r2; it now sizes the RPC witness path only. Set --r2-max-concurrent-requests to \
-             the value you want R2 capped at (and unset --witness-max-concurrent-requests, \
-             which is unread in this mode)."
-        ));
-    }
-    Ok(())
-}
-
 /// This binary's `--r2-*` flags, in the spellings its operators use.
 fn r2_flags(args: &CommandLineArgs) -> R2Flags<'_> {
     R2Flags {
@@ -583,5 +567,70 @@ fn r2_flags(args: &CommandLineArgs) -> R2Flags<'_> {
         // is mandatory, so the rule could never fire. Under `--witness-source rpc` every
         // `--r2-*` flag is inert by design — see the call site in `run`.
         tuning: &[],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Argv for `--witness-source r2` with a loopback custom-domain target, so
+    /// [`build_r2_client`] — the seam every R2-mode rule is gated behind — runs the rules
+    /// from the path production takes.
+    fn parse_r2(extra: &[&str]) -> CommandLineArgs {
+        let argv = [
+            "stateless-validator",
+            "--data-dir",
+            "/tmp/x",
+            "--rpc-endpoint",
+            "http://rpc",
+            "--witness-source",
+            "r2",
+            "--r2-custom-domain",
+            "http://127.0.0.1:9000",
+        ];
+        CommandLineArgs::try_parse_from(argv.iter().chain(extra)).expect("parses")
+    }
+
+    fn build(args: &CommandLineArgs) -> Result<R2WitnessClient> {
+        let timeouts = stateless_r2::fetch::FetchTimeouts {
+            per_attempt: Duration::from_secs(1),
+            connect: Duration::from_secs(1),
+        };
+        let retry =
+            BackoffPolicy { initial: Duration::from_millis(1), max: Duration::from_millis(1) };
+        build_r2_client(args, timeouts, retry)
+    }
+
+    /// Carrying the pre-split spelling of the R2 concurrency cap into `--witness-source r2`
+    /// must fail by name rather than leave R2 uncapped: that mode has no RPC fallback, so an
+    /// uncapped fetcher aims its whole in-flight window at the bucket. Outside r2 mode the
+    /// rule is unreachable by construction — `build_r2_client` is only called from the
+    /// `WitnessSource::R2` arm, the same call-site gating as every other R2 rule.
+    #[test]
+    fn r2_mode_refuses_the_pre_split_concurrency_spelling() {
+        let _guard = stateless_test_utils::env::env_lock();
+
+        let stale = parse_r2(&["--witness-max-concurrent-requests", "48"]);
+        let msg =
+            build(&stale).expect_err("the old spelling must be refused in r2 mode").to_string();
+        assert!(msg.contains("--witness-max-concurrent-requests"), "{msg}");
+        assert!(msg.contains("--r2-max-concurrent-requests"), "{msg}");
+
+        // Migrated: the new spelling alone is accepted.
+        build(&parse_r2(&["--r2-max-concurrent-requests", "48"]))
+            .expect("migrated spelling builds");
+
+        // Both set is accepted — the RPC cap is simply unread in this mode — and each
+        // spelling lands on its own field.
+        let both = parse_r2(&[
+            "--witness-max-concurrent-requests",
+            "16",
+            "--r2-max-concurrent-requests",
+            "48",
+        ]);
+        assert_eq!(both.witness_max_concurrent_requests, Some(16));
+        assert_eq!(both.r2_max_concurrent_requests, Some(48));
+        build(&both).expect("both caps set builds");
     }
 }
