@@ -28,6 +28,7 @@ revm.workspace = true
 
 # stateless
 stateless-core = { path = "../stateless-core" }
+stateless-r2 = { path = "../stateless-r2" }
 
 # misc
 base64.workspace = true

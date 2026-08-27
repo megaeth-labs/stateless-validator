@@ -2,12 +2,13 @@
 //!
 //! Fetches the primary witness object straight from the R2 bucket — via SigV4-signed S3 GETs
 //! or unsigned GETs through a Cloudflare custom domain, per construction — and returns
-//! the same `(SaltWitness, MptWitness)` tuple the RPC path yields. The transport core is
-//! [`R2ObjectFetcher`] from `stateless-r2`, shared with the debug-trace-server's historical
-//! witness source; this adapter owns what is validator-specific: the **full** payload decode
-//! (proof verification needs the elliptic-curve points the light decode skips), the validator
-//! metrics, and the surfaced-failure pacing the pipeline fetcher relies on. The object body is
-//! `zstd(bincode-legacy((SaltWitness, MptWitness)))`, which
+//! the same `(SaltWitness, MptWitness)` tuple the RPC path yields. The failure taxonomy and
+//! the transport wrapper are [`stateless_common::r2_witness`], shared with the
+//! debug-trace-server's adapter; the transport core below that is `stateless-r2`'s
+//! [`R2ObjectFetcher`]. This adapter owns what is validator-specific: the **full** payload
+//! decode (proof verification needs the elliptic-curve points the light decode skips), the
+//! validator metrics, and the surfaced-failure pacing the pipeline fetcher relies on. The
+//! object body is `zstd(bincode-legacy((SaltWitness, MptWitness)))`, which
 //! [`stateless_common::decode_witness_payload`] inverts exactly.
 //!
 //! Operator note on missing objects: the pipeline retries a `Missing` witness indefinitely
@@ -18,20 +19,22 @@
 //! for the same block, and use the object key from the error's log line to check/backfill
 //! the bucket. On the custom-domain target, "appears once the uploader wins" additionally
 //! assumes the edge does not cache 404s — see the `--r2-custom-domain` flag docs.
+//!
+//! [`R2ObjectFetcher`]: stateless_r2::fetch::R2ObjectFetcher
 
 use std::time::{Duration, Instant};
 
 use alloy_primitives::B256;
 use salt::SaltWitness;
+pub use stateless_common::R2WitnessError;
 use stateless_common::{
-    BackoffPolicy, WitnessDecodingError, WitnessSizeBreakdown, decode_witness_payload,
+    BackoffPolicy, R2WitnessTransport, WitnessSizeBreakdown, decode_witness_payload,
 };
 use stateless_core::withdrawals::MptWitness;
 use stateless_r2::{
-    fetch::{CfAccessCredentials, FetchTimeouts, R2GetError, R2ObjectFetcher, RetryPacing},
+    fetch::{CfAccessCredentials, FetchTimeouts},
     keys,
 };
-use tokio::task::JoinError;
 use tracing::trace;
 
 use crate::metrics;
@@ -49,92 +52,34 @@ const DETERMINISTIC_FAILURE_THROTTLE: Duration =
 /// unboundedly, so there is no operator flag to mirror.
 const MAX_ATTEMPTS: usize = 9;
 
-/// Failure outcome of an R2 witness fetch.
-#[derive(Debug, thiserror::Error)]
-pub enum R2WitnessError {
-    /// The GET failed (absent object, transport, throttle, or unexpected status —
-    /// see [`R2GetError`], and the module docs for the `Missing` operator note).
-    #[error(transparent)]
-    Get(#[from] R2GetError),
-    /// The object was fetched but its bytes did not decode to a `(SaltWitness, MptWitness)` tuple
-    /// — a corrupt witness in R2. Deterministic; not retried.
-    #[error("R2 witness for block {number} (key {key}) failed to decode: {source}")]
-    Decode { number: u64, key: String, source: WitnessDecodingError },
-    /// The decode task panicked. This is a bug in our own decoder, not a problem with the data in
-    /// R2, so it is kept out of [`Self::Decode`].
-    #[error("R2 witness decode task for block {number} (key {key}) panicked: {source}")]
-    DecodePanicked { number: u64, key: String, source: JoinError },
-}
-
-impl R2WitnessError {
-    /// Every label [`Self::kind`] can produce, for metrics pre-registration
-    /// (`crate::metrics::init_metrics` zero-inits the error counter per kind).
-    pub const KINDS: &'static [&'static str] = &[
-        "missing",
-        "transport",
-        "throttled",
-        "status",
-        "connect",
-        "deadline",
-        "decode",
-        "decode_panicked",
-    ];
-
-    /// Stable lowercase label for this variant — the `kind` label on the R2 witness error
-    /// counter. Every value returned here must appear in [`Self::KINDS`].
-    pub const fn kind(&self) -> &'static str {
-        match self {
-            Self::Get(e) => e.kind(),
-            Self::Decode { .. } => "decode",
-            Self::DecodePanicked { .. } => "decode_panicked",
-        }
-    }
-
-    /// Whether an immediate retry against the same endpoint could plausibly succeed (transport
-    /// blips, 429, 5xx). Every other variant is deterministic and is surfaced without retrying.
-    const fn is_retryable(&self) -> bool {
-        matches!(self, Self::Get(e) if e.is_retryable())
-    }
-}
-
 /// Fetches witness objects straight from an R2 bucket — SigV4-signed over the S3 API, or
 /// unsigned through a Cloudflare custom domain, per construction.
-/// The fetcher's `Debug` redacts the credentials.
+/// The transport's `Debug` redacts the credentials.
 #[derive(Debug)]
 pub struct R2WitnessClient {
-    fetcher: R2ObjectFetcher,
-    /// The configured in-flight GET cap, retained here because the fetcher decomposes it into
-    /// per-connection permits and cannot report the configured value back.
-    max_concurrent_requests: Option<usize>,
-}
-
-/// The fetcher's pacing view of a `BackoffPolicy` — the adapter-layer conversion that keeps
-/// `stateless-r2` free of a dependency on this workspace's backoff type.
-fn pacing(backoff: &BackoffPolicy) -> RetryPacing {
-    RetryPacing { initial: backoff.initial, max: backoff.max }
+    transport: R2WitnessTransport,
 }
 
 impl R2WitnessClient {
-    /// The configured target's origin, for startup logging (see [`R2ObjectFetcher::origin`]).
+    /// The configured target's origin, for startup logging.
     pub fn origin(&self) -> &str {
-        self.fetcher.origin()
+        self.transport.origin()
     }
 
-    /// The configured target's metric label (see [`R2ObjectFetcher::target_label`]).
+    /// The configured target's metric label.
     pub const fn target_label(&self) -> &'static str {
-        self.fetcher.target_label()
+        self.transport.target_label()
     }
 
-    /// How many HTTP/2 connections the transport spreads its GETs over, for startup logging
-    /// (see [`R2ObjectFetcher::connections`]).
+    /// How many HTTP/2 connections the transport spreads its GETs over, for startup logging.
     pub fn connections(&self) -> usize {
-        self.fetcher.connections()
+        self.transport.connections()
     }
 
     /// The configured cap on in-flight GETs (`None` = unlimited; see [`Self::new`] for the
     /// exact semantics), for startup logging.
     pub fn max_concurrent_requests(&self) -> Option<usize> {
-        self.max_concurrent_requests
+        self.transport.max_concurrent_requests()
     }
 
     /// Builds a client from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
@@ -157,17 +102,16 @@ impl R2WitnessClient {
         retry_backoff: BackoffPolicy,
         max_concurrent_requests: Option<usize>,
     ) -> eyre::Result<Self> {
-        let fetcher = R2ObjectFetcher::new(
+        R2WitnessTransport::new(
             endpoint,
             bucket,
             access_key_id,
             secret_access_key,
             timeouts,
-            pacing(&retry_backoff),
+            retry_backoff,
             max_concurrent_requests,
         )
-        .map_err(|e| eyre::eyre!(e))?;
-        Ok(Self { fetcher, max_concurrent_requests })
+        .map(|transport| Self { transport })
     }
 
     /// Builds a client that fetches unsigned through a Cloudflare custom domain fronting the
@@ -181,17 +125,16 @@ impl R2WitnessClient {
         max_concurrent_requests: Option<usize>,
         connections: usize,
     ) -> eyre::Result<Self> {
-        let fetcher = R2ObjectFetcher::new_custom_domain(
+        R2WitnessTransport::new_custom_domain(
             domain,
             access,
             timeouts,
-            pacing(&retry_backoff),
+            retry_backoff,
             max_concurrent_requests,
             connections,
+            metrics::record_r2_negotiated_version,
         )
-        .map(|fetcher| fetcher.on_version_observed(metrics::record_r2_negotiated_version))
-        .map_err(|e| eyre::eyre!(e))?;
-        Ok(Self { fetcher, max_concurrent_requests })
+        .map(|transport| Self { transport })
     }
 
     /// Fetches and decodes the witness for `(number, hash)` from R2.
@@ -215,7 +158,7 @@ impl R2WitnessClient {
             // fetch cycle would restart its ramp at `initial`, re-bursting GETs into the
             // same brownout the exhausted ramp just backed away from.
             let pause = if e.is_retryable() {
-                self.fetcher.pacing().max
+                self.transport.fetcher().pacing().max
             } else {
                 DETERMINISTIC_FAILURE_THROTTLE
             };
@@ -232,7 +175,8 @@ impl R2WitnessClient {
     ) -> Result<(SaltWitness, MptWitness), R2WitnessError> {
         let started = Instant::now();
         let fetched = self
-            .fetcher
+            .transport
+            .fetcher()
             .get_block_object(number, hash, MAX_ATTEMPTS, None, metrics::on_r2_witness_retry)
             .await?;
         let (bytes, queue_wait) = (fetched.bytes, fetched.queue_wait);
@@ -260,6 +204,7 @@ impl R2WitnessClient {
 mod tests {
     use std::{str::FromStr, sync::atomic::Ordering};
 
+    use stateless_r2::fetch::R2GetError;
     use stateless_test_utils::{fixtures::TestFixtures, mock_r2::mock_r2};
 
     use super::*;
@@ -308,7 +253,7 @@ mod tests {
         client_with_backoff(endpoint, test_backoff()).get_witness(1, B256::ZERO).await
     }
 
-    /// Construction errors from the shared fetcher must surface through the eyre conversion.
+    /// Construction errors from the shared transport must surface through the eyre conversion.
     #[test]
     fn rejects_endpoint_with_path() {
         let err = R2WitnessClient::new(
@@ -322,13 +267,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("Invalid R2 endpoint"));
-    }
-
-    /// Every fetch-level kind must appear in this adapter's pre-registered [`KINDS`] — a new
-    /// `R2GetError` kind escaping metric pre-registration would drift silently otherwise.
-    #[test]
-    fn kinds_cover_all_fetch_kinds() {
-        assert!(R2GetError::KINDS.iter().all(|k| R2WitnessError::KINDS.contains(k)));
     }
 
     /// The only test of the success path (fetch → `spawn_blocking` decode): a fixture witness
@@ -377,7 +315,7 @@ mod tests {
         assert!(!head.contains("authorization:"), "custom-domain GET must be unsigned: {head}");
     }
 
-    /// Construction errors from the shared fetcher's custom-domain arm surface through the
+    /// Construction errors from the shared transport's custom-domain arm surface through the
     /// same eyre conversion as the S3 arm.
     #[test]
     fn custom_domain_rejects_origin_with_path() {

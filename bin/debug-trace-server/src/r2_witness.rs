@@ -4,25 +4,28 @@
 //! GETs or unsigned GETs through a Cloudflare custom domain, per construction — and decodes
 //! it with the **light** decoder — the trace server never verifies the witness proof, so the
 //! full decode's per-point elliptic-curve work would buy nothing (see
-//! `stateless_core::light_witness`). The transport core is `stateless-r2`'s
-//! [`R2ObjectFetcher`], shared with the validator's pipeline reader.
+//! `stateless_core::light_witness`). The failure taxonomy and the transport wrapper are
+//! [`stateless_common::r2_witness`], shared with the validator's adapter; the transport
+//! core below that is `stateless-r2`'s [`R2ObjectFetcher`].
 //!
 //! This adapter is request-serving, which shapes it differently from the validator's:
 //! every fetch runs under the caller's witness-stage deadline, failures surface immediately
 //! with **no pacing pause** (the caller's next move is the RPC fallback chain, not a blind
 //! re-enqueue), and the retry budget is small — a throttled R2 should hand over to the RPC
 //! chain quickly instead of burning the witness budget on backoff sleeps.
+//!
+//! [`R2ObjectFetcher`]: stateless_r2::fetch::R2ObjectFetcher
 
 use std::time::Instant;
 
 use alloy_primitives::B256;
-use stateless_common::{BackoffPolicy, WitnessDecodingError, decode_witness_payload_light};
+pub use stateless_common::R2WitnessError;
+use stateless_common::{BackoffPolicy, R2WitnessTransport, decode_witness_payload_light};
 use stateless_core::{LightWitness, withdrawals::MptWitness};
 use stateless_r2::{
-    fetch::{CfAccessCredentials, FetchTimeouts, R2GetError, R2ObjectFetcher, RetryPacing},
+    fetch::{CfAccessCredentials, FetchTimeouts},
     keys,
 };
-use tokio::task::JoinError;
 use tracing::trace;
 
 use crate::metrics;
@@ -38,88 +41,27 @@ const MAX_ATTEMPTS: usize = 3;
 /// below-band `kind="missing"` bucket-integrity alarm.
 pub(crate) const KIND_MISSING_ABOVE_TIP: &str = "missing_above_tip";
 
-/// Failure outcome of an R2 witness fetch.
-#[derive(Debug, thiserror::Error)]
-pub enum R2WitnessError {
-    /// The GET failed (absent object, transport, throttle, unexpected status, or out of
-    /// deadline while queued).
-    #[error(transparent)]
-    Get(#[from] R2GetError),
-    /// The object was fetched but its bytes did not decode to a witness tuple — a corrupt
-    /// witness in R2. Deterministic; not retried.
-    #[error("R2 witness for block {number} (key {key}) failed to decode: {source}")]
-    Decode { number: u64, key: String, source: WitnessDecodingError },
-    /// The decode outran what was left of the caller's deadline — an oversized or
-    /// pathological object. The caller falls back with its reserved share of the stage;
-    /// the blocking decode itself cannot be cancelled and finishes in the background.
-    #[error("R2 witness decode for block {number} (key {key}) outran the deadline")]
-    DecodeTimeout { number: u64, key: String },
-    /// The decode task panicked. This is a bug in our own decoder, not a problem with the
-    /// data in R2, so it is kept out of [`Self::Decode`].
-    #[error("R2 witness decode task for block {number} (key {key}) panicked: {source}")]
-    DecodePanicked { number: u64, key: String, source: JoinError },
-}
-
-impl R2WitnessError {
-    /// Every label [`Self::kind`] can produce, for metrics pre-registration.
-    pub const KINDS: &'static [&'static str] = &[
-        "missing",
-        "transport",
-        "throttled",
-        "status",
-        "connect",
-        "deadline",
-        "decode",
-        "decode_timeout",
-        "decode_panicked",
-    ];
-
-    /// Stable lowercase label for this variant — the `kind` label on the R2 witness error
-    /// counter. Every value returned here must appear in [`Self::KINDS`].
-    pub const fn kind(&self) -> &'static str {
-        match self {
-            Self::Get(e) => e.kind(),
-            Self::Decode { .. } => "decode",
-            Self::DecodeTimeout { .. } => "decode_timeout",
-            Self::DecodePanicked { .. } => "decode_panicked",
-        }
-    }
-
-    /// Whether the object was absent from the bucket — the one failure the frontier probe
-    /// treats as expected rather than alarming.
-    pub(crate) const fn is_missing(&self) -> bool {
-        matches!(self, Self::Get(R2GetError::Missing { .. }))
-    }
-}
-
 /// Fetches and light-decodes witnesses straight from an R2 bucket.
-/// The fetcher's `Debug` redacts the credentials.
+/// The transport's `Debug` redacts the credentials.
 #[derive(Debug)]
 pub struct R2WitnessSource {
-    fetcher: R2ObjectFetcher,
-}
-
-/// The fetcher's pacing view of a `BackoffPolicy` — the adapter-layer conversion that keeps
-/// `stateless-r2` free of a dependency on this workspace's backoff type.
-fn pacing(backoff: &BackoffPolicy) -> RetryPacing {
-    RetryPacing { initial: backoff.initial, max: backoff.max }
+    transport: R2WitnessTransport,
 }
 
 impl R2WitnessSource {
-    /// The configured target's origin, for startup logging (see [`R2ObjectFetcher::origin`]).
+    /// The configured target's origin, for startup logging.
     pub fn origin(&self) -> &str {
-        self.fetcher.origin()
+        self.transport.origin()
     }
 
-    /// The configured target's metric label (see [`R2ObjectFetcher::target_label`]).
+    /// The configured target's metric label.
     pub const fn target_label(&self) -> &'static str {
-        self.fetcher.target_label()
+        self.transport.target_label()
     }
 
-    /// How many HTTP/2 connections the transport spreads its GETs over, for startup logging
-    /// (see [`R2ObjectFetcher::connections`]).
+    /// How many HTTP/2 connections the transport spreads its GETs over, for startup logging.
     pub fn connections(&self) -> usize {
-        self.fetcher.connections()
+        self.transport.connections()
     }
 
     /// Builds a source from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
@@ -137,17 +79,16 @@ impl R2WitnessSource {
         retry_backoff: BackoffPolicy,
         max_concurrent_requests: Option<usize>,
     ) -> eyre::Result<Self> {
-        let fetcher = R2ObjectFetcher::new(
+        R2WitnessTransport::new(
             endpoint,
             bucket,
             access_key_id,
             secret_access_key,
             timeouts,
-            pacing(&retry_backoff),
+            retry_backoff,
             max_concurrent_requests,
         )
-        .map_err(|e| eyre::eyre!(e))?;
-        Ok(Self { fetcher })
+        .map(|transport| Self { transport })
     }
 
     /// Builds a source that fetches unsigned through a Cloudflare custom domain fronting
@@ -161,17 +102,16 @@ impl R2WitnessSource {
         max_concurrent_requests: Option<usize>,
         connections: usize,
     ) -> eyre::Result<Self> {
-        let fetcher = R2ObjectFetcher::new_custom_domain(
+        R2WitnessTransport::new_custom_domain(
             domain,
             access,
             timeouts,
-            pacing(&retry_backoff),
+            retry_backoff,
             max_concurrent_requests,
             connections,
+            metrics::record_r2_negotiated_version,
         )
-        .map(|fetcher| fetcher.on_version_observed(metrics::record_r2_negotiated_version))
-        .map_err(|e| eyre::eyre!(e))?;
-        Ok(Self { fetcher })
+        .map(|transport| Self { transport })
     }
 
     /// Fetches and light-decodes the witness for `(number, hash)` under `deadline`.
@@ -182,7 +122,8 @@ impl R2WitnessSource {
         deadline: Instant,
     ) -> Result<(LightWitness, MptWitness), R2WitnessError> {
         let fetched = self
-            .fetcher
+            .transport
+            .fetcher()
             .get_block_object(
                 number,
                 hash,
@@ -257,6 +198,7 @@ pub(crate) mod test_support {
 mod tests {
     use std::{sync::atomic::Ordering, time::Duration};
 
+    use stateless_r2::fetch::R2GetError;
     use stateless_test_utils::{fixtures::TestFixtures, mock_r2::mock_r2};
 
     use super::{test_support::source, *};
@@ -342,13 +284,6 @@ mod tests {
         let err = source(&endpoint).get_witness_light(1, B256::ZERO, deadline()).await.unwrap_err();
         assert!(matches!(err, R2WitnessError::Get(R2GetError::Throttled { .. })), "{err}");
         assert_eq!(hits.load(Ordering::SeqCst), MAX_ATTEMPTS);
-    }
-
-    /// Every fetch-level kind must appear in this adapter's pre-registered [`KINDS`] — a new
-    /// `R2GetError` kind escaping metric pre-registration would drift silently otherwise.
-    #[test]
-    fn kinds_cover_all_fetch_kinds() {
-        assert!(R2GetError::KINDS.iter().all(|k| R2WitnessError::KINDS.contains(k)));
     }
 
     #[tokio::test]
