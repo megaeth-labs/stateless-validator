@@ -1643,17 +1643,14 @@ mod tests {
     };
 
     use alloy_primitives::BlockHash;
-    use jsonrpsee::{
-        RpcModule,
-        server::{ServerBuilder, ServerHandle},
-        types::ErrorObjectOwned,
-    };
+    use jsonrpsee::{server::ServerHandle, types::ErrorObjectOwned};
     use stateless_core::{
         PipelineConfig, block_fetcher,
         db::{BlockMeta, StoreResult},
         find_divergence_point,
         pipeline::{BlockFetcher, DivergenceLookups},
     };
+    use stateless_test_utils::mock_rpc::{header_stub, parse_hex_u64, serve};
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -1691,31 +1688,6 @@ mod tests {
 
     fn err_obj(msg: &'static str) -> ErrorObjectOwned {
         ErrorObjectOwned::owned::<()>(-32000, msg, None)
-    }
-
-    fn parse_hex_u64(s: &str) -> u64 {
-        u64::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16).unwrap()
-    }
-
-    /// Minimal valid [`Header`] with `hash`/`number` populated; all other fields default.
-    fn header_stub(number: u64, hash: BlockHash) -> Header {
-        Header {
-            hash,
-            inner: alloy_consensus::Header { number, ..Default::default() },
-            ..Default::default()
-        }
-    }
-
-    /// Starts a jsonrpsee server bound to a random port and registers methods via `register`.
-    async fn serve<Ctx: Send + Sync + 'static>(
-        ctx: Ctx,
-        register: impl FnOnce(&mut RpcModule<Ctx>),
-    ) -> (ServerHandle, String) {
-        let mut module = RpcModule::new(ctx);
-        register(&mut module);
-        let server = ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", server.local_addr().unwrap());
-        (server.start(module), url)
     }
 
     /// Serves `eth_getHeaderByNumber` with headers derived from `hashes`.

@@ -10,6 +10,7 @@ exclude.workspace = true
 
 [dependencies]
 # alloy
+alloy-consensus.workspace = true
 alloy-genesis.workspace = true
 alloy-primitives.workspace = true
 alloy-rpc-types-eth.workspace = true
@@ -23,6 +24,7 @@ op-alloy-rpc-types.workspace = true
 # misc
 bincode.workspace = true
 eyre.workspace = true
+jsonrpsee.workspace = true
 # `serde` declared here (not inherited from sibling crates' feature unification): the fixtures
 # deserialize `Bytecode` from JSON, and this crate must also build standalone as a dev-dependency
 # of crates that pull in no other revm user (e.g. `stateless-r2`).

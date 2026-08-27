@@ -11,10 +11,7 @@ use std::{
 use alloy_primitives::{B256, BlockHash};
 use alloy_rpc_types_eth::Block;
 use clap::Parser;
-use jsonrpsee::{
-    RpcModule,
-    server::{ServerBuilder, ServerConfigBuilder},
-};
+use jsonrpsee::server::ServerConfigBuilder;
 use jsonrpsee_types::error::{
     CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
 };
@@ -24,7 +21,11 @@ use stateless_core::{
     pipeline::run_pipeline, withdrawals::MptWitness,
 };
 use stateless_db::ContractCache;
-use stateless_test_utils::{fixtures::TestFixtures, logging::init_test_logging};
+use stateless_test_utils::{
+    fixtures::TestFixtures,
+    logging::init_test_logging,
+    mock_rpc::{parse_hex_u64, serve_with_config},
+};
 use stateless_validator::{
     CommandLineArgs, VALIDATOR_DB_FILENAME, ValidatorDB, ValidatorFetcher, ValidatorHooks,
     ValidatorProcessor, load_or_create_chain_spec, run_with_signals,
@@ -378,157 +379,159 @@ fn setup_test_db(fx: &TestFixtures) -> eyre::Result<(Arc<ValidatorDB>, tempfile:
 async fn setup_mock_rpc_server(
     state: MockServerState,
 ) -> (jsonrpsee::server::ServerHandle, String) {
-    let mut module = RpcModule::new(state);
+    let cfg = ServerConfigBuilder::default().max_response_body_size(MAX_RESPONSE_BODY_SIZE).build();
+    serve_with_config(cfg, state, |module| {
+        module
+            .register_method("eth_getBlockByNumber", |params, ctx, _| {
+                let (hex_number, full_block): (String, bool) = params.parse().map_err(|e| {
+                    make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
+                })?;
+                let block_number = parse_hex_u64(&hex_number);
 
-    module
-        .register_method("eth_getBlockByNumber", |params, ctx, _| {
-            let (hex_number, full_block): (String, bool) = params
-                .parse()
-                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
-            let block_number = u64::from_str_radix(&hex_number[2..], 16).unwrap_or(0);
+                let block = ctx
+                    .fixtures
+                    .block_numbers
+                    .get(&block_number)
+                    .and_then(|hash| ctx.fixtures.blocks.get(hash))
+                    .ok_or_else(|| {
+                        make_rpc_error(
+                            CALL_EXECUTION_FAILED_CODE,
+                            format!("Block {block_number} not found"),
+                        )
+                    })?;
 
-            let block = ctx
-                .fixtures
-                .block_numbers
-                .get(&block_number)
-                .and_then(|hash| ctx.fixtures.blocks.get(hash))
-                .ok_or_else(|| {
-                    make_rpc_error(
-                        CALL_EXECUTION_FAILED_CODE,
-                        format!("Block {block_number} not found"),
-                    )
+                Ok::<_, ErrorObject<'static>>(shape_block(block, full_block))
+            })
+            .unwrap();
+
+        module
+            .register_method("eth_getBlockByHash", |params, ctx, _| {
+                let (hash, full_block): (B256, bool) = params.parse().map_err(|e| {
+                    make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
                 })?;
 
-            Ok::<_, ErrorObject<'static>>(shape_block(block, full_block))
-        })
-        .unwrap();
-
-    module
-        .register_method("eth_getBlockByHash", |params, ctx, _| {
-            let (hash, full_block): (B256, bool) = params
-                .parse()
-                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
-
-            let block_hash = BlockHash::from(hash.0);
-            let block = ctx.fixtures.blocks.get(&block_hash).ok_or_else(|| {
-                make_rpc_error(CALL_EXECUTION_FAILED_CODE, format!("Block {hash} not found"))
-            })?;
-
-            Ok::<_, ErrorObject<'static>>(shape_block(block, full_block))
-        })
-        .unwrap();
-
-    module
-        .register_method("eth_blockNumber", |_params, ctx, _| {
-            let (&max_num, _) = ctx.fixtures.block_numbers.last_key_value().unwrap();
-            Ok::<String, ErrorObjectOwned>(format!("0x{max_num:x}"))
-        })
-        .unwrap();
-
-    module
-        .register_method("eth_getHeaderByNumber", |params, ctx, _| {
-            let (hex_number,): (String,) = params.parse().unwrap();
-            let block_number = u64::from_str_radix(&hex_number[2..], 16).unwrap_or(0);
-
-            let block = ctx
-                .fixtures
-                .block_numbers
-                .get(&block_number)
-                .and_then(|hash| ctx.fixtures.blocks.get(hash))
-                .ok_or_else(|| {
-                    make_rpc_error(
-                        CALL_EXECUTION_FAILED_CODE,
-                        format!("Block {block_number} not found"),
-                    )
+                let block_hash = BlockHash::from(hash.0);
+                let block = ctx.fixtures.blocks.get(&block_hash).ok_or_else(|| {
+                    make_rpc_error(CALL_EXECUTION_FAILED_CODE, format!("Block {hash} not found"))
                 })?;
 
-            Ok::<_, ErrorObject<'static>>(block.header.clone())
-        })
-        .unwrap();
+                Ok::<_, ErrorObject<'static>>(shape_block(block, full_block))
+            })
+            .unwrap();
 
-    module
-        .register_method("eth_getHeaderByHash", |params, ctx, _| {
-            let (hash,): (B256,) = params
-                .parse()
-                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
+        module
+            .register_method("eth_blockNumber", |_params, ctx, _| {
+                let (&max_num, _) = ctx.fixtures.block_numbers.last_key_value().unwrap();
+                Ok::<String, ErrorObjectOwned>(format!("0x{max_num:x}"))
+            })
+            .unwrap();
 
-            let block_hash = BlockHash::from(hash.0);
-            let block = ctx.fixtures.blocks.get(&block_hash).ok_or_else(|| {
-                make_rpc_error(CALL_EXECUTION_FAILED_CODE, format!("Block {hash} not found"))
-            })?;
+        module
+            .register_method("eth_getHeaderByNumber", |params, ctx, _| {
+                let (hex_number,): (String,) = params.parse().unwrap();
+                let block_number = parse_hex_u64(&hex_number);
 
-            Ok::<_, ErrorObject<'static>>(block.header.clone())
-        })
-        .unwrap();
+                let block = ctx
+                    .fixtures
+                    .block_numbers
+                    .get(&block_number)
+                    .and_then(|hash| ctx.fixtures.blocks.get(hash))
+                    .ok_or_else(|| {
+                        make_rpc_error(
+                            CALL_EXECUTION_FAILED_CODE,
+                            format!("Block {block_number} not found"),
+                        )
+                    })?;
 
-    module
-        .register_method("eth_getCodeByHash", |params, ctx, _| {
-            let (hash,): (B256,) = params
-                .parse()
-                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
+                Ok::<_, ErrorObject<'static>>(block.header.clone())
+            })
+            .unwrap();
 
-            let code = ctx.fixtures.contracts.get(&hash).cloned().unwrap_or_default();
-            Ok::<_, ErrorObject<'static>>(code.original_bytes())
-        })
-        .unwrap();
+        module
+            .register_method("eth_getHeaderByHash", |params, ctx, _| {
+                let (hash,): (B256,) = params.parse().map_err(|e| {
+                    make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
+                })?;
 
-    module
-        .register_method("mega_getBlockWitness", |params, ctx, _| {
-            let (keys,): (WitnessRequestKeys,) = params
-                .parse()
-                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
-            let block_hash = BlockHash::from(keys.block_hash.0);
+                let block_hash = BlockHash::from(hash.0);
+                let block = ctx.fixtures.blocks.get(&block_hash).ok_or_else(|| {
+                    make_rpc_error(CALL_EXECUTION_FAILED_CODE, format!("Block {hash} not found"))
+                })?;
 
-            let salt_witness =
-                ctx.fixtures.salt_witnesses.get(&block_hash).cloned().ok_or_else(|| {
+                Ok::<_, ErrorObject<'static>>(block.header.clone())
+            })
+            .unwrap();
+
+        module
+            .register_method("eth_getCodeByHash", |params, ctx, _| {
+                let (hash,): (B256,) = params.parse().map_err(|e| {
+                    make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
+                })?;
+
+                let code = ctx.fixtures.contracts.get(&hash).cloned().unwrap_or_default();
+                Ok::<_, ErrorObject<'static>>(code.original_bytes())
+            })
+            .unwrap();
+
+        module
+            .register_method("mega_getBlockWitness", |params, ctx, _| {
+                let (keys,): (WitnessRequestKeys,) = params.parse().map_err(|e| {
+                    make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
+                })?;
+                let block_hash = BlockHash::from(keys.block_hash.0);
+
+                let salt_witness =
+                    ctx.fixtures.salt_witnesses.get(&block_hash).cloned().ok_or_else(|| {
+                        make_rpc_error(
+                            CALL_EXECUTION_FAILED_CODE,
+                            format!("Witness for block {block_hash} not found"),
+                        )
+                    })?;
+
+                let mpt_witness = ctx.mpt_witnesses.get(&block_hash).cloned().ok_or_else(|| {
                     make_rpc_error(
                         CALL_EXECUTION_FAILED_CODE,
                         format!("Witness for block {block_hash} not found"),
                     )
                 })?;
 
-            let mpt_witness = ctx.mpt_witnesses.get(&block_hash).cloned().ok_or_else(|| {
-                make_rpc_error(
-                    CALL_EXECUTION_FAILED_CODE,
-                    format!("Witness for block {block_hash} not found"),
-                )
-            })?;
+                let encoded =
+                    encode_witness_response(&salt_witness, &mpt_witness).map_err(|e| {
+                        make_rpc_error(
+                            CALL_EXECUTION_FAILED_CODE,
+                            format!("Failed to encode witness: {e}"),
+                        )
+                    })?;
 
-            let encoded = encode_witness_response(&salt_witness, &mpt_witness).map_err(|e| {
-                make_rpc_error(CALL_EXECUTION_FAILED_CODE, format!("Failed to encode witness: {e}"))
-            })?;
+                Ok::<_, ErrorObject<'static>>(encoded)
+            })
+            .unwrap();
 
-            Ok::<_, ErrorObject<'static>>(encoded)
-        })
-        .unwrap();
-
-    module
-        .register_method("mega_setValidatedBlocks", |params, ctx, _| {
-            use std::sync::atomic::Ordering;
-            let (first_block, last_block): ((u64, String), (u64, String)) = params.parse().unwrap();
-            if ctx
-                .reject_reports
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-            {
-                return Err(make_rpc_error(
-                    CALL_EXECUTION_FAILED_CODE,
-                    "transient report failure (scripted)".to_string(),
-                ));
-            }
-            ctx.validated_reports.lock().unwrap().push((first_block.0, last_block.0));
-            let last_hash: BlockHash = last_block.1.parse().unwrap();
-            Ok::<serde_json::Value, ErrorObjectOwned>(serde_json::json!({
-                "accepted": true,
-                "lastValidatedBlock": [last_block.0, last_hash]
-            }))
-        })
-        .unwrap();
-
-    let cfg = ServerConfigBuilder::default().max_response_body_size(MAX_RESPONSE_BODY_SIZE).build();
-    let server = ServerBuilder::default().set_config(cfg).build("0.0.0.0:0").await.unwrap();
-    let url = format!("http://{}", server.local_addr().unwrap());
-    (server.start(module), url)
+        module
+            .register_method("mega_setValidatedBlocks", |params, ctx, _| {
+                use std::sync::atomic::Ordering;
+                let (first_block, last_block): ((u64, String), (u64, String)) =
+                    params.parse().unwrap();
+                if ctx
+                    .reject_reports
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+                {
+                    return Err(make_rpc_error(
+                        CALL_EXECUTION_FAILED_CODE,
+                        "transient report failure (scripted)".to_string(),
+                    ));
+                }
+                ctx.validated_reports.lock().unwrap().push((first_block.0, last_block.0));
+                let last_hash: BlockHash = last_block.1.parse().unwrap();
+                Ok::<serde_json::Value, ErrorObjectOwned>(serde_json::json!({
+                    "accepted": true,
+                    "lastValidatedBlock": [last_block.0, last_hash]
+                }))
+            })
+            .unwrap();
+    })
+    .await
 }
 
 /// Synthetic data integration test: validates consecutive blocks via the streaming pipeline.
