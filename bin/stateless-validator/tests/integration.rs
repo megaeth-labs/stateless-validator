@@ -135,6 +135,15 @@ fn witness_max_concurrent_requests_flag_and_env() {
 }
 
 #[test]
+fn r2_max_concurrent_requests_flag_and_env() {
+    assert_optional_numeric_flag::<usize>(
+        "--r2-max-concurrent-requests",
+        "STATELESS_VALIDATOR_R2_MAX_CONCURRENT_REQUESTS",
+        |a| a.r2_max_concurrent_requests,
+    );
+}
+
+#[test]
 fn tip_buffer_flag_and_env() {
     assert_optional_numeric_flag::<u64>("--tip-buffer", "STATELESS_VALIDATOR_TIP_BUFFER", |a| {
         a.tip_buffer

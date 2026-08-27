@@ -169,7 +169,7 @@ pub struct CommandLineArgs {
     /// when the first saturates, so this is the only way past the edge's per-connection stream
     /// limit — and the only way one dropped connection stops taking every in-flight GET with
     /// it, which matters here because R2 mode has no RPC fallback.
-    /// `--witness-max-concurrent-requests` is still the cap across all of them, split evenly
+    /// `--r2-max-concurrent-requests` is still the cap across all of them, split evenly
     /// and rounded up, so raising this alone spreads the same concurrency thinner rather than
     /// raising the ceiling; a count larger than that cap is rejected, since the surplus
     /// connections could never be filled.
@@ -213,15 +213,24 @@ pub struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_DATA_MAX_CONCURRENT_REQUESTS")]
     pub data_max_concurrent_requests: Option<usize>,
 
-    /// Maximum concurrent in-flight witness fetches, independent of the data cap. Omit for
-    /// unlimited. Applies to both RPC witness calls and, with `--witness-source r2`, R2 GETs.
-    ///
-    /// Against `--r2-custom-domain` this is also what bounds the GETs multiplexed onto the
-    /// HTTP/2 connection, so keep it at or below the edge's per-connection stream limit
-    /// (Cloudflare's is 100): above it the surplus queues inside the connection instead, where
-    /// the wait is unobservable and still counts against the per-attempt timeout.
+    /// Maximum concurrent in-flight RPC witness fetches, independent of the data cap. Omit
+    /// for unlimited. Applies to `--witness-source rpc` only; R2 GETs are capped by
+    /// `--r2-max-concurrent-requests`.
     #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_MAX_CONCURRENT_REQUESTS")]
     pub witness_max_concurrent_requests: Option<usize>,
+
+    /// Maximum concurrent in-flight R2 witness GETs. Omit for unlimited. Deliberately
+    /// separate from `--witness-max-concurrent-requests`: that one sizes what we ask of the
+    /// RPC gateway, while R2 is a different service that tolerates far higher parallelism,
+    /// and under `--witness-source r2` the RPC witness path is not used at all.
+    ///
+    /// Against `--r2-custom-domain` this is what bounds the GETs multiplexed onto each HTTP/2
+    /// connection, so keep the per-connection share (this value divided by
+    /// `--r2-connections`) at or below the edge's per-connection stream limit (Cloudflare's
+    /// is 100): above it the surplus queues inside the connection instead, where the wait is
+    /// unobservable and still counts against the per-attempt timeout.
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_MAX_CONCURRENT_REQUESTS")]
+    pub r2_max_concurrent_requests: Option<usize>,
 
     /// Fetcher caught-up poll interval (milliseconds). Also rate-limits `eth_blockNumber`.
     /// Lower values reduce tip-following lag at the cost of more RPC traffic when caught up.
@@ -459,6 +468,20 @@ fn build_r2_client(
     timeouts: stateless_r2::fetch::FetchTimeouts,
     retry: BackoffPolicy,
 ) -> Result<R2WitnessClient> {
+    // `--witness-max-concurrent-requests` capped R2 GETs too before the caps were split.
+    // Refuse the pre-split spelling by name rather than leave R2 uncapped: this mode has no
+    // RPC fallback, so an uncapped fetcher aims its whole in-flight window at the bucket.
+    // Both spellings together stay legal — one env template can feed rpc-mode and r2-mode
+    // roles alike, each mode reading only its own cap — so only old-spelling-alone is refused.
+    // The message names the env spelling too: the deployments this guard exists for configure
+    // through env files, where the flag spelling alone costs a name-translation round trip.
+    if args.witness_max_concurrent_requests.is_some() && args.r2_max_concurrent_requests.is_none() {
+        return Err(eyre::eyre!(
+            "--witness-max-concurrent-requests no longer caps R2 GETs under --witness-source \
+             r2 (it now sizes only the RPC witness path): set --r2-max-concurrent-requests \
+             (env STATELESS_VALIDATOR_R2_MAX_CONCURRENT_REQUESTS) instead"
+        ));
+    }
     // Every coherence rule lives in the shared validator, so the reads below rest on an
     // invariant that was actually checked: no empty values, exactly one target, and an Access
     // pair that is either whole or absent.
@@ -484,7 +507,7 @@ fn build_r2_client(
                 access,
                 timeouts,
                 retry,
-                args.witness_max_concurrent_requests,
+                args.r2_max_concurrent_requests,
                 connections,
             )?;
             metrics::record_r2_connections(client.connections());
@@ -492,6 +515,7 @@ fn build_r2_client(
                 domain = %client.origin(),
                 cf_access,
                 connections = client.connections(),
+                max_concurrent_requests = ?client.max_concurrent_requests(),
                 "Witness source: R2 (custom domain)"
             );
             client
@@ -505,11 +529,12 @@ fn build_r2_client(
                 args.r2_secret_access_key.as_ref().expect("S3 target").as_ref().to_string(),
                 timeouts,
                 retry,
-                args.witness_max_concurrent_requests,
+                args.r2_max_concurrent_requests,
             )?;
             info!(
                 endpoint = %client.origin(),
                 bucket = args.r2_bucket.as_deref().unwrap_or_default(),
+                max_concurrent_requests = ?client.max_concurrent_requests(),
                 "Witness source: R2 (direct S3)"
             );
             client
@@ -540,13 +565,120 @@ fn r2_flags(args: &CommandLineArgs) -> R2Flags<'_> {
         ),
         connections: R2Flag::new("--r2-connections", args.r2_connections.as_deref()),
         max_concurrent_requests: R2CountFlag::new(
-            "--witness-max-concurrent-requests",
-            args.witness_max_concurrent_requests,
+            "--r2-max-concurrent-requests",
+            args.r2_max_concurrent_requests,
         ),
         // Empty on purpose. The orphan-tuning rule exists for a binary that validates R2 flags
         // on every startup; here they are only read under `--witness-source r2`, where a target
         // is mandatory, so the rule could never fire. Under `--witness-source rpc` every
         // `--r2-*` flag is inert by design — see the call site in `run`.
         tuning: &[],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A loopback custom-domain target, the default shape for rules that are target-agnostic.
+    const CUSTOM_DOMAIN_TARGET: &[&str] = &["--r2-custom-domain", "http://127.0.0.1:9000"];
+
+    /// The signed S3 target: the endpoint plus its credential quad.
+    const S3_TARGET: &[&str] = &[
+        "--r2-endpoint",
+        "https://acc.r2.cloudflarestorage.com",
+        "--r2-bucket",
+        "witness",
+        "--r2-access-key-id",
+        "key-id",
+        "--r2-secret-access-key",
+        "secret",
+    ];
+
+    /// Argv for `--witness-source r2` with the given target flags, so [`build_r2_client`] —
+    /// the seam every R2-mode rule is gated behind — runs the rules from the path production
+    /// takes.
+    fn parse_r2_with_target(target: &[&str], extra: &[&str]) -> CommandLineArgs {
+        let argv = [
+            "stateless-validator",
+            "--data-dir",
+            "/tmp/x",
+            "--rpc-endpoint",
+            "http://rpc",
+            "--witness-source",
+            "r2",
+        ];
+        CommandLineArgs::try_parse_from(argv.iter().chain(target).chain(extra)).expect("parses")
+    }
+
+    fn parse_r2(extra: &[&str]) -> CommandLineArgs {
+        parse_r2_with_target(CUSTOM_DOMAIN_TARGET, extra)
+    }
+
+    fn build(args: &CommandLineArgs) -> Result<R2WitnessClient> {
+        let timeouts = stateless_r2::fetch::FetchTimeouts {
+            per_attempt: Duration::from_secs(1),
+            connect: Duration::from_secs(1),
+        };
+        let retry =
+            BackoffPolicy { initial: Duration::from_millis(1), max: Duration::from_millis(1) };
+        build_r2_client(args, timeouts, retry)
+    }
+
+    /// Carrying the pre-split spelling of the R2 concurrency cap into `--witness-source r2`
+    /// must fail by name rather than leave R2 uncapped: that mode has no RPC fallback, so an
+    /// uncapped fetcher aims its whole in-flight window at the bucket. Outside r2 mode the
+    /// rule is unreachable by construction — `build_r2_client` is only called from the
+    /// `WitnessSource::R2` arm, the same call-site gating as every other R2 rule.
+    #[test]
+    fn r2_mode_refuses_the_pre_split_concurrency_spelling() {
+        let _guard = stateless_test_utils::env::env_lock();
+
+        let stale = parse_r2(&["--witness-max-concurrent-requests", "48"]);
+        let msg =
+            build(&stale).expect_err("the old spelling must be refused in r2 mode").to_string();
+        assert!(msg.contains("--witness-max-concurrent-requests"), "{msg}");
+        assert!(msg.contains("--r2-max-concurrent-requests"), "{msg}");
+        // The env spelling too: the deployments this guard exists for configure through env
+        // files, and the flag spelling alone would cost a name-translation round trip.
+        assert!(msg.contains("STATELESS_VALIDATOR_R2_MAX_CONCURRENT_REQUESTS"), "{msg}");
+
+        // Migrated: the new spelling alone is accepted.
+        build(&parse_r2(&["--r2-max-concurrent-requests", "48"]))
+            .expect("migrated spelling builds");
+
+        // Both set is accepted — the RPC cap is simply unread in this mode — and each
+        // spelling lands on its own field.
+        let both = parse_r2(&[
+            "--witness-max-concurrent-requests",
+            "16",
+            "--r2-max-concurrent-requests",
+            "48",
+        ]);
+        assert_eq!(both.witness_max_concurrent_requests, Some(16));
+        assert_eq!(both.r2_max_concurrent_requests, Some(48));
+        build(&both).expect("both caps set builds");
+    }
+
+    /// The migration guard fires on the flags alone, so its test above would still pass with
+    /// the constructors wired to the old field. This is the assertion that observes which cap
+    /// actually reaches the client — with both spellings set it must be the R2 one, not the
+    /// RPC one — on both target arms, plus the uncapped default, so a revert of either arm's
+    /// wiring fails here by value.
+    #[test]
+    fn the_r2_cap_not_the_rpc_one_reaches_the_client() {
+        let _guard = stateless_test_utils::env::env_lock();
+
+        for target in [CUSTOM_DOMAIN_TARGET, S3_TARGET] {
+            let both = parse_r2_with_target(
+                target,
+                &["--witness-max-concurrent-requests", "16", "--r2-max-concurrent-requests", "48"],
+            );
+            let capped = build(&both).expect("both caps set builds");
+            assert_eq!(capped.max_concurrent_requests(), Some(48), "{target:?}");
+
+            let uncapped = build(&parse_r2_with_target(target, &[])).expect("no caps builds");
+            assert_eq!(uncapped.max_concurrent_requests(), None, "{target:?}");
+        }
     }
 }

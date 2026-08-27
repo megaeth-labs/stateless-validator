@@ -103,6 +103,9 @@ impl R2WitnessError {
 #[derive(Debug)]
 pub struct R2WitnessClient {
     fetcher: R2ObjectFetcher,
+    /// The configured in-flight GET cap, retained here because the fetcher decomposes it into
+    /// per-connection permits and cannot report the configured value back.
+    max_concurrent_requests: Option<usize>,
 }
 
 /// The fetcher's pacing view of a `BackoffPolicy` — the adapter-layer conversion that keeps
@@ -128,6 +131,12 @@ impl R2WitnessClient {
         self.fetcher.connections()
     }
 
+    /// The configured cap on in-flight GETs (`None` = unlimited; see [`Self::new`] for the
+    /// exact semantics), for startup logging.
+    pub fn max_concurrent_requests(&self) -> Option<usize> {
+        self.max_concurrent_requests
+    }
+
     /// Builds a client from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
     ///
     /// `timeouts` bounds each individual GET (end-to-end and connect). `retry_backoff` paces the
@@ -136,7 +145,7 @@ impl R2WitnessClient {
     /// `--rpc-initial-backoff-ms` / `--rpc-max-backoff-ms`, so one pair of flags tunes both
     /// paths. `max_concurrent_requests` caps the number of GETs in flight at once (`None` =
     /// unlimited, `Some(0)` clamps to 1 — same semantics as the RPC witness semaphore; in R2
-    /// mode this client is the only enforcement of `--witness-max-concurrent-requests`). Fails
+    /// mode this client is the only enforcement of `--r2-max-concurrent-requests`). Fails
     /// if the endpoint is not a bare `scheme://host[:port]` origin or the HTTP client cannot be
     /// built.
     pub fn new(
@@ -158,7 +167,7 @@ impl R2WitnessClient {
             max_concurrent_requests,
         )
         .map_err(|e| eyre::eyre!(e))?;
-        Ok(Self { fetcher })
+        Ok(Self { fetcher, max_concurrent_requests })
     }
 
     /// Builds a client that fetches unsigned through a Cloudflare custom domain fronting the
@@ -182,7 +191,7 @@ impl R2WitnessClient {
         )
         .map(|fetcher| fetcher.on_version_observed(metrics::record_r2_negotiated_version))
         .map_err(|e| eyre::eyre!(e))?;
-        Ok(Self { fetcher })
+        Ok(Self { fetcher, max_concurrent_requests })
     }
 
     /// Fetches and decodes the witness for `(number, hash)` from R2.
