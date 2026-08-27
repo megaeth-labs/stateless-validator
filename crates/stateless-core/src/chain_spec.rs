@@ -667,4 +667,52 @@ mod tests {
             .unwrap();
         let _ = ChainSpec::from_genesis(genesis);
     }
+
+    /// Every fork in the canonical [`mega_mainnet_hardforks()`] ladder must be scheduled by
+    /// the shipped mainnet genesis file, minus an explicit not-yet-scheduled allowlist.
+    ///
+    /// The schema tests above all run on synthetic genesis JSON, so none of them can notice
+    /// the shipped data file missing a fork — the shape of a real production failure: the
+    /// pinned mega-evm already supports the fork, genesis never schedules it, chain-spec
+    /// loading stays green, and every block past the activation timestamp fails to replay.
+    /// A fork added to the ladder without its genesis field fails here at test time instead
+    /// of at the activation boundary.
+    #[cfg(feature = "std")]
+    #[test]
+    fn mainnet_genesis_schedules_every_canonical_hardfork() {
+        use stateless_test_utils::fixtures::TestFixtures;
+
+        // Ladder forks mainnet has deliberately not scheduled yet — empty today, every fork
+        // through Rex6 is live. An entry here must actually be unscheduled: once its genesis
+        // field lands, the assertion below demands the entry's removal, so the allowlist
+        // cannot rot into shadowing the check.
+        const NOT_YET_SCHEDULED: &[&str] = &[];
+
+        let genesis = TestFixtures::mainnet_shared().load_genesis().expect("mainnet genesis");
+        let spec = ChainSpec::from_genesis(genesis);
+        let scheduled: Vec<(&str, ForkCondition)> =
+            spec.hardforks.forks_iter().map(|(fork, condition)| (fork.name(), condition)).collect();
+
+        let ladder = mega_mainnet_hardforks();
+        for (fork, _) in ladder.forks_iter() {
+            let activation =
+                scheduled.iter().find(|(name, _)| *name == fork.name()).map(|(_, c)| *c);
+            if NOT_YET_SCHEDULED.contains(&fork.name()) {
+                assert_eq!(
+                    activation,
+                    None,
+                    "{} is scheduled now — remove it from NOT_YET_SCHEDULED",
+                    fork.name()
+                );
+            } else {
+                assert!(
+                    matches!(activation, Some(ForkCondition::Timestamp(_))),
+                    "mainnet genesis does not schedule {} (activation: {activation:?}); add \
+                     its genesis field, or allowlist it in NOT_YET_SCHEDULED if it is \
+                     genuinely not scheduled yet",
+                    fork.name()
+                );
+            }
+        }
+    }
 }
