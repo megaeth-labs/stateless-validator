@@ -471,11 +471,15 @@ fn build_r2_client(
     // `--witness-max-concurrent-requests` capped R2 GETs too before the caps were split.
     // Refuse the pre-split spelling by name rather than leave R2 uncapped: this mode has no
     // RPC fallback, so an uncapped fetcher aims its whole in-flight window at the bucket.
+    // Both spellings together stay legal — one env template can feed rpc-mode and r2-mode
+    // roles alike, each mode reading only its own cap — so only old-spelling-alone is refused.
+    // The message names the env spelling too: the deployments this guard exists for configure
+    // through env files, where the flag spelling alone costs a name-translation round trip.
     if args.witness_max_concurrent_requests.is_some() && args.r2_max_concurrent_requests.is_none() {
         return Err(eyre::eyre!(
             "--witness-max-concurrent-requests no longer caps R2 GETs under --witness-source \
              r2 (it now sizes only the RPC witness path): set --r2-max-concurrent-requests \
-             instead"
+             (env STATELESS_VALIDATOR_R2_MAX_CONCURRENT_REQUESTS) instead"
         ));
     }
     // Every coherence rule lives in the shared validator, so the reads below rest on an
@@ -511,6 +515,7 @@ fn build_r2_client(
                 domain = %client.origin(),
                 cf_access,
                 connections = client.connections(),
+                max_concurrent_requests = ?client.max_concurrent_requests(),
                 "Witness source: R2 (custom domain)"
             );
             client
@@ -529,6 +534,7 @@ fn build_r2_client(
             info!(
                 endpoint = %client.origin(),
                 bucket = args.r2_bucket.as_deref().unwrap_or_default(),
+                max_concurrent_requests = ?client.max_concurrent_requests(),
                 "Witness source: R2 (direct S3)"
             );
             client
@@ -574,10 +580,25 @@ fn r2_flags(args: &CommandLineArgs) -> R2Flags<'_> {
 mod tests {
     use super::*;
 
-    /// Argv for `--witness-source r2` with a loopback custom-domain target, so
-    /// [`build_r2_client`] — the seam every R2-mode rule is gated behind — runs the rules
-    /// from the path production takes.
-    fn parse_r2(extra: &[&str]) -> CommandLineArgs {
+    /// A loopback custom-domain target, the default shape for rules that are target-agnostic.
+    const CUSTOM_DOMAIN_TARGET: &[&str] = &["--r2-custom-domain", "http://127.0.0.1:9000"];
+
+    /// The signed S3 target: the endpoint plus its credential quad.
+    const S3_TARGET: &[&str] = &[
+        "--r2-endpoint",
+        "https://acc.r2.cloudflarestorage.com",
+        "--r2-bucket",
+        "witness",
+        "--r2-access-key-id",
+        "key-id",
+        "--r2-secret-access-key",
+        "secret",
+    ];
+
+    /// Argv for `--witness-source r2` with the given target flags, so [`build_r2_client`] —
+    /// the seam every R2-mode rule is gated behind — runs the rules from the path production
+    /// takes.
+    fn parse_r2_with_target(target: &[&str], extra: &[&str]) -> CommandLineArgs {
         let argv = [
             "stateless-validator",
             "--data-dir",
@@ -586,10 +607,12 @@ mod tests {
             "http://rpc",
             "--witness-source",
             "r2",
-            "--r2-custom-domain",
-            "http://127.0.0.1:9000",
         ];
-        CommandLineArgs::try_parse_from(argv.iter().chain(extra)).expect("parses")
+        CommandLineArgs::try_parse_from(argv.iter().chain(target).chain(extra)).expect("parses")
+    }
+
+    fn parse_r2(extra: &[&str]) -> CommandLineArgs {
+        parse_r2_with_target(CUSTOM_DOMAIN_TARGET, extra)
     }
 
     fn build(args: &CommandLineArgs) -> Result<R2WitnessClient> {
@@ -616,6 +639,9 @@ mod tests {
             build(&stale).expect_err("the old spelling must be refused in r2 mode").to_string();
         assert!(msg.contains("--witness-max-concurrent-requests"), "{msg}");
         assert!(msg.contains("--r2-max-concurrent-requests"), "{msg}");
+        // The env spelling too: the deployments this guard exists for configure through env
+        // files, and the flag spelling alone would cost a name-translation round trip.
+        assert!(msg.contains("STATELESS_VALIDATOR_R2_MAX_CONCURRENT_REQUESTS"), "{msg}");
 
         // Migrated: the new spelling alone is accepted.
         build(&parse_r2(&["--r2-max-concurrent-requests", "48"]))
@@ -632,5 +658,27 @@ mod tests {
         assert_eq!(both.witness_max_concurrent_requests, Some(16));
         assert_eq!(both.r2_max_concurrent_requests, Some(48));
         build(&both).expect("both caps set builds");
+    }
+
+    /// The migration guard fires on the flags alone, so its test above would still pass with
+    /// the constructors wired to the old field. This is the assertion that observes which cap
+    /// actually reaches the client — with both spellings set it must be the R2 one, not the
+    /// RPC one — on both target arms, plus the uncapped default, so a revert of either arm's
+    /// wiring fails here by value.
+    #[test]
+    fn the_r2_cap_not_the_rpc_one_reaches_the_client() {
+        let _guard = stateless_test_utils::env::env_lock();
+
+        for target in [CUSTOM_DOMAIN_TARGET, S3_TARGET] {
+            let both = parse_r2_with_target(
+                target,
+                &["--witness-max-concurrent-requests", "16", "--r2-max-concurrent-requests", "48"],
+            );
+            let capped = build(&both).expect("both caps set builds");
+            assert_eq!(capped.max_concurrent_requests(), Some(48), "{target:?}");
+
+            let uncapped = build(&parse_r2_with_target(target, &[])).expect("no caps builds");
+            assert_eq!(uncapped.max_concurrent_requests(), None, "{target:?}");
+        }
     }
 }

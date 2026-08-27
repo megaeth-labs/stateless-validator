@@ -103,6 +103,9 @@ impl R2WitnessError {
 #[derive(Debug)]
 pub struct R2WitnessClient {
     fetcher: R2ObjectFetcher,
+    /// The configured in-flight GET cap, retained here because the fetcher decomposes it into
+    /// per-connection permits and cannot report the configured value back.
+    max_concurrent_requests: Option<usize>,
 }
 
 /// The fetcher's pacing view of a `BackoffPolicy` — the adapter-layer conversion that keeps
@@ -126,6 +129,12 @@ impl R2WitnessClient {
     /// (see [`R2ObjectFetcher::connections`]).
     pub fn connections(&self) -> usize {
         self.fetcher.connections()
+    }
+
+    /// The configured cap on in-flight GETs (`None` = unlimited; see [`Self::new`] for the
+    /// exact semantics), for startup logging.
+    pub fn max_concurrent_requests(&self) -> Option<usize> {
+        self.max_concurrent_requests
     }
 
     /// Builds a client from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
@@ -158,7 +167,7 @@ impl R2WitnessClient {
             max_concurrent_requests,
         )
         .map_err(|e| eyre::eyre!(e))?;
-        Ok(Self { fetcher })
+        Ok(Self { fetcher, max_concurrent_requests })
     }
 
     /// Builds a client that fetches unsigned through a Cloudflare custom domain fronting the
@@ -182,7 +191,7 @@ impl R2WitnessClient {
         )
         .map(|fetcher| fetcher.on_version_observed(metrics::record_r2_negotiated_version))
         .map_err(|e| eyre::eyre!(e))?;
-        Ok(Self { fetcher })
+        Ok(Self { fetcher, max_concurrent_requests })
     }
 
     /// Fetches and decodes the witness for `(number, hash)` from R2.
