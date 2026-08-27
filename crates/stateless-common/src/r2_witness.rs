@@ -8,8 +8,12 @@
 //! labels, and the transport wrapper (construction, target accessors) — so the two
 //! adapters cannot drift apart on it.
 
-use stateless_r2::fetch::{
-    CfAccessCredentials, FetchTimeouts, R2GetError, R2ObjectFetcher, RetryPacing,
+use std::time::Instant;
+
+use alloy_primitives::B256;
+use stateless_r2::{
+    fetch::{CfAccessCredentials, FetchTimeouts, R2GetError, R2ObjectFetcher, RetryPacing},
+    keys,
 };
 use tokio::task::JoinError;
 
@@ -65,8 +69,8 @@ impl R2WitnessError {
         }
     }
 
-    /// Whether the object was absent from the bucket — the one failure the trace server's
-    /// frontier probe treats as expected rather than alarming.
+    /// Whether the object was absent from the bucket — the one failure a caller probing
+    /// ahead of the uploader treats as expected rather than alarming.
     pub const fn is_missing(&self) -> bool {
         matches!(self, Self::Get(R2GetError::Missing { .. }))
     }
@@ -76,6 +80,41 @@ impl R2WitnessError {
     /// without retrying.
     pub const fn is_retryable(&self) -> bool {
         matches!(self, Self::Get(e) if e.is_retryable())
+    }
+}
+
+/// Decodes a fetched witness object with `decode` on the blocking pool — zstd + bincode over
+/// a multi-MB witness is CPU-bound and must stay off the runtime — mapping both failure modes
+/// onto [`R2WitnessError`].
+///
+/// `deadline` is the caller's budget for the decode: `Some` bounds it (an oversized or
+/// pathological object must not eat what the caller reserved for its fallback, and an already
+/// elapsed deadline skips the decode entirely — nothing would wait for it), while `None` lets
+/// it run to completion. A decode abandoned on the deadline cannot be cancelled and finishes
+/// in the background.
+pub async fn decode_on_blocking_pool<T: Send + 'static>(
+    bytes: impl AsRef<[u8]> + Send + 'static,
+    number: u64,
+    hash: B256,
+    deadline: Option<Instant>,
+    decode: impl FnOnce(&[u8]) -> Result<T, WitnessDecodingError> + Send + 'static,
+) -> Result<T, R2WitnessError> {
+    let key = || keys::block_object_key(number, hash);
+    if deadline.is_some_and(|d| Instant::now() >= d) {
+        return Err(R2WitnessError::DecodeTimeout { number, key: key() });
+    }
+    let task = tokio::task::spawn_blocking(move || decode(bytes.as_ref()));
+    let joined = match deadline {
+        Some(d) => match tokio::time::timeout_at(d.into(), task).await {
+            Ok(joined) => joined,
+            Err(_) => return Err(R2WitnessError::DecodeTimeout { number, key: key() }),
+        },
+        None => task.await,
+    };
+    match joined {
+        Ok(Ok(decoded)) => Ok(decoded),
+        Ok(Err(source)) => Err(R2WitnessError::Decode { number, key: key(), source }),
+        Err(source) => Err(R2WitnessError::DecodePanicked { number, key: key(), source }),
     }
 }
 
@@ -184,7 +223,20 @@ impl R2WitnessTransport {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+
+    fn test_timeouts() -> FetchTimeouts {
+        FetchTimeouts {
+            per_attempt: Duration::from_secs(5),
+            connect: stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT,
+        }
+    }
+
+    fn test_backoff() -> BackoffPolicy {
+        BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(20))
+    }
 
     /// Every fetch-level kind must appear in the pre-registered [`R2WitnessError::KINDS`]
     /// — a new [`R2GetError`] kind escaping metric pre-registration would drift silently
@@ -192,5 +244,56 @@ mod tests {
     #[test]
     fn kinds_cover_all_fetch_kinds() {
         assert!(R2GetError::KINDS.iter().all(|k| R2WitnessError::KINDS.contains(k)));
+    }
+
+    /// Construction errors from the underlying fetcher must surface through the eyre
+    /// conversion, on both targets — one copy here covers both binaries' adapters.
+    #[test]
+    fn construction_rejects_a_target_carrying_a_path() {
+        let s3 = R2WitnessTransport::new(
+            "https://acc.r2.cloudflarestorage.com/witness-mainnet",
+            "witness-mainnet".to_string(),
+            "ak".to_string(),
+            "sk".to_string(),
+            test_timeouts(),
+            test_backoff(),
+            None,
+        )
+        .unwrap_err();
+        assert!(s3.to_string().contains("Invalid R2 endpoint"), "{s3}");
+
+        let custom_domain = R2WitnessTransport::new_custom_domain(
+            "https://witness.example.com/witness-mainnet",
+            None,
+            test_timeouts(),
+            test_backoff(),
+            None,
+            1,
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(custom_domain.to_string().contains("Invalid R2 custom domain"), "{custom_domain}");
+    }
+
+    /// A decode whose deadline is already gone is abandoned before it starts — nothing
+    /// would wait for it — while a deadline-less decode runs to completion.
+    #[tokio::test]
+    async fn decode_respects_an_elapsed_deadline_and_runs_without_one() {
+        let elapsed = |_: &[u8]| -> Result<usize, WitnessDecodingError> {
+            panic!("an elapsed deadline must not start the decode")
+        };
+        let err =
+            decode_on_blocking_pool(vec![0_u8; 8], 1, B256::ZERO, Some(Instant::now()), elapsed)
+                .await
+                .expect_err("an already-elapsed deadline must abandon the decode");
+        assert!(matches!(err, R2WitnessError::DecodeTimeout { .. }), "{err}");
+        assert_eq!(err.kind(), "decode_timeout");
+
+        let decoded = decode_on_blocking_pool(vec![7_u8; 4], 1, B256::ZERO, None, |bytes| {
+            Ok::<usize, WitnessDecodingError>(bytes.len())
+        })
+        .await
+        .expect("a deadline-less decode must run");
+        assert_eq!(decoded, 4);
     }
 }

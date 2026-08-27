@@ -1512,8 +1512,10 @@ pub(crate) mod test_support {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use jsonrpsee::{server::ServerHandle, types::ErrorObjectOwned};
-    pub(crate) use stateless_test_utils::mock_rpc::consistent_header;
-    use stateless_test_utils::{fixtures::TestFixtures, mock_rpc::serve};
+    use stateless_test_utils::{
+        fixtures::TestFixtures,
+        mock_rpc::{consistent_header, serve},
+    };
 
     use super::*;
 
@@ -1686,12 +1688,11 @@ mod tests {
     use stateless_test_utils::{
         fixtures::TestFixtures,
         mock_r2::{mock_r2, mock_r2_held},
+        mock_rpc::consistent_header,
     };
 
     use super::{
-        test_support::{
-            block_and_witness_rpc, consistent_header, scripted_witness_rpc, start_mock_rpc,
-        },
+        test_support::{block_and_witness_rpc, scripted_witness_rpc, start_mock_rpc},
         *,
     };
     use crate::server_db::test_support::StubBlockStore;
