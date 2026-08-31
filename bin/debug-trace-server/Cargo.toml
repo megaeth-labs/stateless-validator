@@ -78,4 +78,4 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 zstd.workspace = true
 
 # stateless
-stateless-test-utils = { path = "../../crates/stateless-test-utils" }
+stateless-test-utils = { path = "../../crates/stateless-test-utils", features = ["mock-rpc"] }

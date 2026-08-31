@@ -57,8 +57,8 @@ use clap::Parser;
 use eyre::Result;
 use jsonrpsee::server::{Server, ServerConfig, middleware::rpc::RpcServiceBuilder};
 use stateless_common::{
-    R2CountFlag, R2Flag, R2Flags, R2Target, R2TuningFlag, RedactedSecret, RpcClient,
-    RpcClientConfig, logging::LogArgs, validate_r2_flags,
+    R2CountFlag, R2Flag, R2Flags, R2Target, R2TuningFlag, R2WitnessTransport, RedactedSecret,
+    RpcClient, RpcClientConfig, logging::LogArgs, validate_r2_flags,
 };
 use stateless_core::{
     BisectResolver, ChainStore, ContractStore, DivergenceLookups, PipelineConfig,
@@ -920,27 +920,28 @@ async fn main() -> Result<()> {
                     },
                 );
             let cf_access = access.is_some();
-            let source = R2WitnessSource::new_custom_domain(
+            let transport = R2WitnessTransport::new_custom_domain(
                 domain,
                 access,
                 r2_timeouts,
                 rpc_retry,
                 args.r2_max_concurrent_requests,
                 connections,
+                metrics::record_r2_negotiated_version,
             )?;
-            metrics::record_r2_target(source.target_label());
-            metrics::record_r2_connections(source.connections());
+            metrics::record_r2_target(transport.target_label());
+            metrics::record_r2_connections(transport.connections());
             info!(
-                domain = %source.origin(),
+                domain = %transport.origin(),
                 cf_access,
-                connections = source.connections(),
+                connections = transport.connections(),
                 "Historical witness source: R2 (custom domain), RPC chain as fallback"
             );
-            Some(source)
+            Some(R2WitnessSource::new(transport))
         }
         R2Target::S3 => {
             let take = |v: &Option<String>| v.clone().expect("S3 target");
-            let source = R2WitnessSource::new(
+            let transport = R2WitnessTransport::new(
                 args.r2_endpoint.as_deref().expect("S3 target"),
                 take(&args.r2_bucket),
                 take(&args.r2_access_key_id),
@@ -949,13 +950,13 @@ async fn main() -> Result<()> {
                 rpc_retry,
                 args.r2_max_concurrent_requests,
             )?;
-            metrics::record_r2_target(source.target_label());
+            metrics::record_r2_target(transport.target_label());
             info!(
-                endpoint = %source.origin(),
+                endpoint = %transport.origin(),
                 bucket = args.r2_bucket.as_deref().unwrap_or_default(),
                 "Historical witness source: R2 (direct S3), RPC chain as fallback"
             );
-            Some(source)
+            Some(R2WitnessSource::new(transport))
         }
     };
     let r2_witness_source = r2_source.map(Arc::new);

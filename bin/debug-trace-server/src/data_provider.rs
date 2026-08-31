@@ -1511,8 +1511,11 @@ impl ContractStore for NoopContractStore {
 pub(crate) mod test_support {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use jsonrpsee::{RpcModule, server::ServerHandle, types::ErrorObjectOwned};
-    use stateless_test_utils::fixtures::TestFixtures;
+    use jsonrpsee::{server::ServerHandle, types::ErrorObjectOwned};
+    use stateless_test_utils::{
+        fixtures::TestFixtures,
+        mock_rpc::{consistent_header, serve},
+    };
 
     use super::*;
 
@@ -1555,13 +1558,6 @@ pub(crate) mod test_support {
         (number, hash, wire, LightWitness::from(salt))
     }
 
-    /// Minimal self-consistent RPC `Header` for `number`: `hash` is the real `hash_slow()`
-    /// of the inner header, so `verify_hash = true` fetches accept it.
-    pub(crate) fn consistent_header(number: u64) -> alloy_rpc_types_eth::Header {
-        let inner = alloy_consensus::Header { number, ..Default::default() };
-        alloy_rpc_types_eth::Header { hash: inner.hash_slow(), inner, ..Default::default() }
-    }
-
     /// Per-method call counters for [`start_mock_rpc`], so round-trip-shape tests can
     /// assert which upstream calls a path made (and which it skipped).
     #[derive(Default)]
@@ -1572,14 +1568,6 @@ pub(crate) mod test_support {
         pub(crate) header_by_number: AtomicUsize,
         /// `eth_getHeaderByHash` calls (the fetch pipeline's number discovery).
         pub(crate) header_by_hash: AtomicUsize,
-    }
-
-    /// Boots a jsonrpsee server for `module` on an ephemeral port.
-    async fn serve<C: Send + Sync + 'static>(module: RpcModule<C>) -> (ServerHandle, String) {
-        let server =
-            jsonrpsee::server::ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", server.local_addr().unwrap());
-        (server.start(module), url)
     }
 
     /// The simulated generator's "witness not generated yet" miss, shared by every mock
@@ -1594,33 +1582,34 @@ pub(crate) mod test_support {
     /// call per method in [`MockRpcHits`].
     pub(crate) async fn start_mock_rpc(tip: u64) -> (ServerHandle, String, Arc<MockRpcHits>) {
         let hits = Arc::new(MockRpcHits::default());
-        let mut module = RpcModule::new(hits.clone());
-        module
-            .register_method("eth_getHeaderByNumber", move |params, hits, _| {
-                hits.header_by_number.fetch_add(1, Ordering::Relaxed);
-                // Parse as the client's own wire type so the mock can't drift from it.
-                let (tag,): (BlockNumberOrTag,) = params.parse().unwrap();
-                let n = tag.as_number().unwrap_or(tip);
-                Ok::<_, ErrorObjectOwned>(consistent_header(n))
-            })
-            .unwrap();
-        module
-            .register_method("eth_getHeaderByHash", move |params, hits, _| {
-                hits.header_by_hash.fetch_add(1, Ordering::Relaxed);
-                // Echo the requested hash (the client cross-checks it against the
-                // request); the content is a `tip` header, enough for number discovery.
-                let (hash,): (B256,) = params.parse().unwrap();
-                let header = alloy_rpc_types_eth::Header { hash, ..consistent_header(tip) };
-                Ok::<_, ErrorObjectOwned>(header)
-            })
-            .unwrap();
-        module
-            .register_method("eth_blockNumber", move |_params, hits, _| {
-                hits.block_number.fetch_add(1, Ordering::Relaxed);
-                Ok::<_, ErrorObjectOwned>(format!("{tip:#x}"))
-            })
-            .unwrap();
-        let (handle, url) = serve(module).await;
+        let (handle, url) = serve(hits.clone(), |module| {
+            module
+                .register_method("eth_getHeaderByNumber", move |params, hits, _| {
+                    hits.header_by_number.fetch_add(1, Ordering::Relaxed);
+                    // Parse as the client's own wire type so the mock can't drift from it.
+                    let (tag,): (BlockNumberOrTag,) = params.parse().unwrap();
+                    let n = tag.as_number().unwrap_or(tip);
+                    Ok::<_, ErrorObjectOwned>(consistent_header(n))
+                })
+                .unwrap();
+            module
+                .register_method("eth_getHeaderByHash", move |params, hits, _| {
+                    hits.header_by_hash.fetch_add(1, Ordering::Relaxed);
+                    // Echo the requested hash (the client cross-checks it against the
+                    // request); the content is a `tip` header, enough for number discovery.
+                    let (hash,): (B256,) = params.parse().unwrap();
+                    let header = alloy_rpc_types_eth::Header { hash, ..consistent_header(tip) };
+                    Ok::<_, ErrorObjectOwned>(header)
+                })
+                .unwrap();
+            module
+                .register_method("eth_blockNumber", move |_params, hits, _| {
+                    hits.block_number.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, ErrorObjectOwned>(format!("{tip:#x}"))
+                })
+                .unwrap();
+        })
+        .await;
         (handle, url, hits)
     }
 
@@ -1632,17 +1621,18 @@ pub(crate) mod test_support {
         wire: Option<String>,
     ) -> (ServerHandle, String, Arc<AtomicUsize>) {
         let hits = Arc::new(AtomicUsize::new(0));
-        let mut module = RpcModule::new((hits.clone(), wire));
-        module
-            .register_method("mega_getBlockWitness", move |_p, (hits, wire), _| {
-                let call = hits.fetch_add(1, Ordering::Relaxed);
-                match wire {
-                    Some(wire) if call >= misses_before_serve => Ok(wire.clone()),
-                    _ => Err(witness_not_generated()),
-                }
-            })
-            .unwrap();
-        let (handle, url) = serve(module).await;
+        let (handle, url) = serve((hits.clone(), wire), |module| {
+            module
+                .register_method("mega_getBlockWitness", move |_p, (hits, wire), _| {
+                    let call = hits.fetch_add(1, Ordering::Relaxed);
+                    match wire {
+                        Some(wire) if call >= misses_before_serve => Ok(wire.clone()),
+                        _ => Err(witness_not_generated()),
+                    }
+                })
+                .unwrap();
+        })
+        .await;
         (handle, url, hits)
     }
 
@@ -1655,18 +1645,19 @@ pub(crate) mod test_support {
         block: Block<Transaction>,
         wire: Option<String>,
     ) -> (ServerHandle, String) {
-        let mut module = RpcModule::new((block, wire));
-        module
-            .register_method("eth_getBlockByHash", |_p, (block, _), _| {
-                Ok::<_, ErrorObjectOwned>(block.clone())
-            })
-            .unwrap();
-        module
-            .register_method("mega_getBlockWitness", |_p, (_, wire), _| {
-                wire.clone().ok_or_else(witness_not_generated)
-            })
-            .unwrap();
-        serve(module).await
+        serve((block, wire), |module| {
+            module
+                .register_method("eth_getBlockByHash", |_p, (block, _), _| {
+                    Ok::<_, ErrorObjectOwned>(block.clone())
+                })
+                .unwrap();
+            module
+                .register_method("mega_getBlockWitness", |_p, (_, wire), _| {
+                    wire.clone().ok_or_else(witness_not_generated)
+                })
+                .unwrap();
+        })
+        .await
     }
 
     /// Serves `wire` after `delay` on every call — a healthy-but-slow witness endpoint.
@@ -1675,18 +1666,17 @@ pub(crate) mod test_support {
         wire: String,
     ) -> (ServerHandle, String, Arc<AtomicUsize>) {
         let hits = Arc::new(AtomicUsize::new(0));
-        let mut module = RpcModule::new((hits.clone(), wire));
-        module
-            .register_async_method("mega_getBlockWitness", move |_p, ctx, _| async move {
-                ctx.0.fetch_add(1, Ordering::Relaxed);
-                tokio::time::sleep(delay).await;
-                Ok::<_, ErrorObjectOwned>(ctx.1.clone())
-            })
-            .unwrap();
-        let server =
-            jsonrpsee::server::ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", server.local_addr().unwrap());
-        (server.start(module), url, hits)
+        let (handle, url) = serve((hits.clone(), wire), |module| {
+            module
+                .register_async_method("mega_getBlockWitness", move |_p, ctx, _| async move {
+                    ctx.0.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(delay).await;
+                    Ok::<_, ErrorObjectOwned>(ctx.1.clone())
+                })
+                .unwrap();
+        })
+        .await;
+        (handle, url, hits)
     }
 }
 
@@ -1698,12 +1688,11 @@ mod tests {
     use stateless_test_utils::{
         fixtures::TestFixtures,
         mock_r2::{mock_r2, mock_r2_held},
+        mock_rpc::consistent_header,
     };
 
     use super::{
-        test_support::{
-            block_and_witness_rpc, consistent_header, scripted_witness_rpc, start_mock_rpc,
-        },
+        test_support::{block_and_witness_rpc, scripted_witness_rpc, start_mock_rpc},
         *,
     };
     use crate::server_db::test_support::StubBlockStore;

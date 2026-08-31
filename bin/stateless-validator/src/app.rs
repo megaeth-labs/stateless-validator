@@ -8,8 +8,8 @@ use alloy_rpc_types_eth::BlockId;
 use clap::{Parser, ValueEnum};
 use eyre::Result;
 use stateless_common::{
-    BackoffPolicy, R2CountFlag, R2Flag, R2Flags, R2Target, RedactedSecret, RpcClient,
-    RpcClientConfig, logging::LogArgs, validate_r2_flags,
+    BackoffPolicy, R2CountFlag, R2Flag, R2Flags, R2Target, R2WitnessTransport, RedactedSecret,
+    RpcClient, RpcClientConfig, logging::LogArgs, validate_r2_flags,
 };
 use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::BlockMeta};
 use stateless_db::ContractCache;
@@ -356,8 +356,8 @@ pub async fn run() -> Result<()> {
                     .r2_connect_timeout_ms
                     .map_or(stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT, Duration::from_millis),
             };
-            let client = build_r2_client(&args, timeouts, rpc_config.rpc_retry.clone())?;
-            Some(Arc::new(client))
+            let transport = build_r2_transport(&args, timeouts, rpc_config.rpc_retry.clone())?;
+            Some(Arc::new(R2WitnessClient::new(transport)))
         }
     };
 
@@ -457,17 +457,17 @@ fn override_ms(ms: Option<u64>, default: Duration) -> Duration {
     ms.map(Duration::from_millis).unwrap_or(default)
 }
 
-/// Builds the R2 witness client for `--witness-source r2`: the custom-domain target when
+/// Builds the R2 witness transport for `--witness-source r2`: the custom-domain target when
 /// `--r2-custom-domain` is set, the SigV4-signed S3 target otherwise.
 ///
 /// Which target wins is already settled by the [`validate_r2_flags`] call below, so the arms
 /// read the one that was chosen — a set-but-empty flag belonging to the *other* target is
 /// rejected there rather than reaching a constructor.
-fn build_r2_client(
+fn build_r2_transport(
     args: &CommandLineArgs,
     timeouts: stateless_r2::fetch::FetchTimeouts,
     retry: BackoffPolicy,
-) -> Result<R2WitnessClient> {
+) -> Result<R2WitnessTransport> {
     // `--witness-max-concurrent-requests` capped R2 GETs too before the caps were split.
     // Refuse the pre-split spelling by name rather than leave R2 uncapped: this mode has no
     // RPC fallback, so an uncapped fetcher aims its whole in-flight window at the bucket.
@@ -485,7 +485,7 @@ fn build_r2_client(
     // Every coherence rule lives in the shared validator, so the reads below rest on an
     // invariant that was actually checked: no empty values, exactly one target, and an Access
     // pair that is either whole or absent.
-    let client = match validate_r2_flags(&r2_flags(args))? {
+    let transport = match validate_r2_flags(&r2_flags(args))? {
         R2Target::None => {
             return Err(eyre::eyre!(
                 "--witness-source r2 needs an R2 target: configure --r2-custom-domain, or \
@@ -502,27 +502,28 @@ fn build_r2_client(
                     },
                 );
             let cf_access = access.is_some();
-            let client = R2WitnessClient::new_custom_domain(
+            let transport = R2WitnessTransport::new_custom_domain(
                 domain,
                 access,
                 timeouts,
                 retry,
                 args.r2_max_concurrent_requests,
                 connections,
+                metrics::record_r2_negotiated_version,
             )?;
-            metrics::record_r2_connections(client.connections());
+            metrics::record_r2_connections(transport.connections());
             info!(
-                domain = %client.origin(),
+                domain = %transport.origin(),
                 cf_access,
-                connections = client.connections(),
-                max_concurrent_requests = ?client.max_concurrent_requests(),
+                connections = transport.connections(),
+                max_concurrent_requests = ?transport.max_concurrent_requests(),
                 "Witness source: R2 (custom domain)"
             );
-            client
+            transport
         }
         R2Target::S3 => {
             let take = |v: &Option<String>| v.clone().expect("S3 target");
-            let client = R2WitnessClient::new(
+            let transport = R2WitnessTransport::new(
                 args.r2_endpoint.as_deref().expect("S3 target"),
                 take(&args.r2_bucket),
                 take(&args.r2_access_key_id),
@@ -532,16 +533,16 @@ fn build_r2_client(
                 args.r2_max_concurrent_requests,
             )?;
             info!(
-                endpoint = %client.origin(),
+                endpoint = %transport.origin(),
                 bucket = args.r2_bucket.as_deref().unwrap_or_default(),
-                max_concurrent_requests = ?client.max_concurrent_requests(),
+                max_concurrent_requests = ?transport.max_concurrent_requests(),
                 "Witness source: R2 (direct S3)"
             );
-            client
+            transport
         }
     };
-    metrics::record_r2_target(client.target_label());
-    Ok(client)
+    metrics::record_r2_target(transport.target_label());
+    Ok(transport)
 }
 
 /// This binary's `--r2-*` flags, in the spellings its operators use.
@@ -595,7 +596,7 @@ mod tests {
         "secret",
     ];
 
-    /// Argv for `--witness-source r2` with the given target flags, so [`build_r2_client`] —
+    /// Argv for `--witness-source r2` with the given target flags, so [`build_r2_transport`] —
     /// the seam every R2-mode rule is gated behind — runs the rules from the path production
     /// takes.
     fn parse_r2_with_target(target: &[&str], extra: &[&str]) -> CommandLineArgs {
@@ -615,20 +616,20 @@ mod tests {
         parse_r2_with_target(CUSTOM_DOMAIN_TARGET, extra)
     }
 
-    fn build(args: &CommandLineArgs) -> Result<R2WitnessClient> {
+    fn build(args: &CommandLineArgs) -> Result<R2WitnessTransport> {
         let timeouts = stateless_r2::fetch::FetchTimeouts {
             per_attempt: Duration::from_secs(1),
             connect: Duration::from_secs(1),
         };
         let retry =
             BackoffPolicy { initial: Duration::from_millis(1), max: Duration::from_millis(1) };
-        build_r2_client(args, timeouts, retry)
+        build_r2_transport(args, timeouts, retry)
     }
 
     /// Carrying the pre-split spelling of the R2 concurrency cap into `--witness-source r2`
     /// must fail by name rather than leave R2 uncapped: that mode has no RPC fallback, so an
     /// uncapped fetcher aims its whole in-flight window at the bucket. Outside r2 mode the
-    /// rule is unreachable by construction — `build_r2_client` is only called from the
+    /// rule is unreachable by construction — `build_r2_transport` is only called from the
     /// `WitnessSource::R2` arm, the same call-site gating as every other R2 rule.
     #[test]
     fn r2_mode_refuses_the_pre_split_concurrency_spelling() {
@@ -662,11 +663,11 @@ mod tests {
 
     /// The migration guard fires on the flags alone, so its test above would still pass with
     /// the constructors wired to the old field. This is the assertion that observes which cap
-    /// actually reaches the client — with both spellings set it must be the R2 one, not the
-    /// RPC one — on both target arms, plus the uncapped default, so a revert of either arm's
-    /// wiring fails here by value.
+    /// actually reaches the transport the fetcher runs on — with both spellings set it must be
+    /// the R2 one, not the RPC one — on both target arms, plus the uncapped default, so a
+    /// revert of either arm's wiring fails here by value.
     #[test]
-    fn the_r2_cap_not_the_rpc_one_reaches_the_client() {
+    fn the_r2_cap_not_the_rpc_one_reaches_the_transport() {
         let _guard = stateless_test_utils::env::env_lock();
 
         for target in [CUSTOM_DOMAIN_TARGET, S3_TARGET] {

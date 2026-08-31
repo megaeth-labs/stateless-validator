@@ -28,6 +28,7 @@ revm.workspace = true
 
 # stateless
 stateless-core = { path = "../stateless-core" }
+stateless-r2 = { path = "../stateless-r2" }
 
 # misc
 base64.workspace = true
@@ -50,7 +51,7 @@ zstd.workspace = true
 [dev-dependencies]
 jsonrpsee.workspace = true
 kanal.workspace = true
-stateless-test-utils = { path = "../stateless-test-utils" }
+stateless-test-utils = { path = "../stateless-test-utils", features = ["mock-rpc"] }
 tokio-util.workspace = true
 
 [[bench]]
