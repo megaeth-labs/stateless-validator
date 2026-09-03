@@ -26,7 +26,7 @@
 use std::{collections::BTreeMap, vec::Vec};
 
 pub use alloy_primitives::Bytes;
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, FixedBytes, U256};
 use revm::primitives::KECCAK_EMPTY;
 use salt::{SaltKey, SaltValue};
 
@@ -67,12 +67,31 @@ impl PlainKey {
     /// - Unknown: preserved raw bytes from decode
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            PlainKey::Account(addr) => addr.as_slice().to_vec(),
-            PlainKey::Storage(addr, slot) => {
-                addr.concat_const::<SLOT_KEY_LEN, STORAGE_SLOT_KEY_LEN>(*slot).as_slice().to_vec()
-            }
+            PlainKey::Account(addr) => Self::account_key_bytes(addr).to_vec(),
+            PlainKey::Storage(addr, slot) => Self::storage_key_bytes(*addr, *slot).to_vec(),
             PlainKey::Unknown(data) => data.clone(),
         }
+    }
+
+    /// Encoding of an account key — the raw address bytes.
+    ///
+    /// Same bytes as `PlainKey::Account(address).encode()` without the heap allocation,
+    /// for per-state-read hot paths.
+    #[inline]
+    pub(crate) fn account_key_bytes(address: &Address) -> &[u8] {
+        address.as_slice()
+    }
+
+    /// Stack-allocated encoding of a storage-slot key — address (20) ++ slot (32).
+    ///
+    /// Same bytes as `PlainKey::Storage(address, slot).encode()` without the heap
+    /// allocation, for per-state-read hot paths.
+    #[inline]
+    pub(crate) fn storage_key_bytes(
+        address: Address,
+        slot: B256,
+    ) -> FixedBytes<STORAGE_SLOT_KEY_LEN> {
+        address.concat_const::<SLOT_KEY_LEN, STORAGE_SLOT_KEY_LEN>(slot)
     }
 
     /// Decodes a byte slice into a PlainKey.
@@ -237,6 +256,22 @@ mod tests {
 
     fn kvs(entries: Vec<Option<SaltValue>>) -> BTreeMap<SaltKey, Option<SaltValue>> {
         entries.into_iter().enumerate().map(|(i, v)| (SaltKey::from((0u32, i as u64)), v)).collect()
+    }
+
+    /// The allocation-free encoders the witness read path uses must produce exactly what
+    /// `encode()` produces — `encode()` delegates to them today, and this pins that contract
+    /// against a future edit that stops delegating and lets the two drift into looking up
+    /// different keys.
+    #[test]
+    fn stack_key_encodings_match_encode() {
+        let addr = Address::from([0x11; 20]);
+        assert_eq!(PlainKey::account_key_bytes(&addr), PlainKey::Account(addr).encode().as_slice());
+        for slot in [B256::ZERO, B256::from([0xAB; 32]), B256::from(U256::from(7))] {
+            assert_eq!(
+                PlainKey::storage_key_bytes(addr, slot).as_slice(),
+                PlainKey::Storage(addr, slot).encode().as_slice(),
+            );
+        }
     }
 
     #[test]
