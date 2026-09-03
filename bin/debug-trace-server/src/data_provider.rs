@@ -45,7 +45,9 @@ use futures::{FutureExt, future::Shared};
 use op_alloy_rpc_types::Transaction;
 use quick_cache::sync::Cache;
 use revm::state::Bytecode;
-use stateless_common::{CodeFetchError, RpcClient, RpcDeadlineExceeded, WitnessSizeBreakdown};
+use stateless_common::{
+    CodeFetchError, RpcClient, RpcDeadlineExceeded, WitnessFetchError, WitnessSizeBreakdown,
+};
 use stateless_core::{
     ContractStore, LightWitness, StoreResult, db::StoreError, withdrawals::MptWitness,
 };
@@ -274,6 +276,18 @@ impl From<RpcDeadlineExceeded> for DataProviderError {
             _ => TimeoutStage::Block,
         };
         DataProviderError::Timeout { stage, elapsed: e.elapsed }
+    }
+}
+
+impl From<WitnessFetchError> for DataProviderError {
+    fn from(e: WitnessFetchError) -> Self {
+        match e {
+            // Only a blown deadline is a timeout. A range failure is a wiring bug in this
+            // process — routing it to `Timeout { Witness }` would fire the `deadline_witness`
+            // alarm, which must mean "an upstream witness fetch ran out of budget".
+            WitnessFetchError::Deadline(d) => d.into(),
+            WitnessFetchError::NoProviderInRange { .. } => eyre::eyre!("{e}").into(),
+        }
     }
 }
 
@@ -3067,5 +3081,27 @@ mod tests {
         }
         .into();
         assert!(matches!(block_err, DataProviderError::Timeout { stage: TimeoutStage::Block, .. }));
+    }
+
+    /// A witness fetch whose provider range is unsatisfiable is a wiring bug, not a blown
+    /// budget: it must land on `Internal`, never on `Timeout { Witness }`. That bucket feeds
+    /// the `deadline_witness` error reason, whose whole value is meaning "an upstream witness
+    /// fetch ran out of time" — a wiring bug landing there would page for the wrong incident.
+    /// The deadline variant still classifies by method, exactly as before.
+    #[test]
+    fn witness_range_failure_is_internal_not_a_witness_timeout() {
+        let range_err: DataProviderError =
+            WitnessFetchError::NoProviderInRange { skip: 2, configured: 1 }.into();
+        assert!(matches!(range_err, DataProviderError::Internal(_)), "got {range_err:?}");
+
+        let deadline_err: DataProviderError = WitnessFetchError::Deadline(RpcDeadlineExceeded {
+            method: stateless_common::RpcMethod::MegaGetBlockWitness,
+            elapsed: Duration::from_secs(3),
+        })
+        .into();
+        assert!(matches!(
+            deadline_err,
+            DataProviderError::Timeout { stage: TimeoutStage::Witness, .. }
+        ));
     }
 }

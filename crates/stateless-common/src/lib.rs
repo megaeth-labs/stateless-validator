@@ -4,7 +4,7 @@ pub use metrics::{RpcMethod, RpcMetrics};
 pub mod rpc_client;
 pub use rpc_client::{
     BackoffPolicy, CodeFetchError, RpcClient, RpcClientConfig, RpcDeadlineExceeded,
-    SetValidatedBlocksResponse, WitnessRequestKeys,
+    SetValidatedBlocksResponse, WitnessFetchError, WitnessRequestKeys,
 };
 pub mod witness_encoding;
 pub use witness_encoding::{

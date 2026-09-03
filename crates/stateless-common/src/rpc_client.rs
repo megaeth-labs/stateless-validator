@@ -254,6 +254,24 @@ pub struct SetValidatedBlocksResponse {
     pub last_validated_block: (U64, B256),
 }
 
+/// Error returned by the witness fetches that take a caller-computed provider range.
+///
+/// `NoProviderInRange` is a wiring failure, not a transport one: either the caller's `skip`
+/// selected past the configured witness endpoints, or the client carries none at all (a
+/// deployment that sources witnesses elsewhere — the validator's R2 mode). Both binaries
+/// reject an empty witness configuration at startup, so it stays unreachable in production;
+/// it is a typed error rather than an `assert!` so a routing bug fails one request instead of
+/// the process.
+#[derive(Debug, thiserror::Error)]
+pub enum WitnessFetchError {
+    #[error(
+        "witness fetch selected providers {skip}.. of {configured} configured — no witness provider in range"
+    )]
+    NoProviderInRange { skip: usize, configured: usize },
+    #[error(transparent)]
+    Deadline(#[from] RpcDeadlineExceeded),
+}
+
 /// Errors returned by [`RpcClient::get_codes`] / [`RpcClient::get_codes_with_deadline`].
 ///
 /// - `VerificationFailure` is deterministic (upstream returned bytecode whose keccak does not match
@@ -320,7 +338,10 @@ impl RpcClient {
     /// # Arguments
     /// * `data_apis` - HTTP URLs of the standard JSON-RPC endpoints for blocks and contract data
     ///   (tried in order, non-empty)
-    /// * `witness_apis` - HTTP URLs of the witness RPC endpoints (tried in order, non-empty)
+    /// * `witness_apis` - HTTP URLs of the witness RPC endpoints (tried in order). May be empty
+    ///   when the deployment sources witnesses elsewhere (the validator's R2 witness mode); a
+    ///   witness call on such a client returns [`WitnessFetchError::NoProviderInRange`] instead of
+    ///   silently retrying against the wrong endpoints
     /// * `config` - Configuration controlling verification, retry, and concurrency behavior
     /// * `report_api` - Optional HTTP URL of the endpoint for reporting validated blocks
     pub fn new_with_config(
@@ -331,9 +352,6 @@ impl RpcClient {
     ) -> Result<Self> {
         if data_apis.is_empty() {
             return Err(eyre!("At least one data API URL must be provided"));
-        }
-        if witness_apis.is_empty() {
-            return Err(eyre!("At least one witness API URL must be provided"));
         }
 
         // One shared HTTP client for every provider (connection pools are keyed per host), so
@@ -726,7 +744,8 @@ impl RpcClient {
                 decode_witness_response,
                 "Witness decoded",
             )
-            .await?;
+            .await
+            .map_err(deadline_only)?;
 
         if let Some(ref metrics) = self.config.metrics {
             metrics.on_witness_fetch(WitnessSizeBreakdown::new(&witness.0, &witness.1));
@@ -757,7 +776,9 @@ impl RpcClient {
         hash: B256,
         deadline: Option<Instant>,
     ) -> std::result::Result<(LightWitness, MptWitness), RpcDeadlineExceeded> {
-        self.get_witness_light_with_deadline_from(0, number, hash, deadline).await
+        self.get_witness_light_with_deadline_from(0, number, hash, deadline)
+            .await
+            .map_err(deadline_only)
     }
 
     /// Like [`Self::get_witness_light_with_deadline`], but skips the first `skip` witness
@@ -766,15 +787,16 @@ impl RpcClient {
     /// position in the full configured witness endpoint list, and the shared witness
     /// concurrency cap still applies.
     ///
-    /// # Panics
-    /// Panics if `skip >= witness_provider_count()` — at least one provider must remain.
+    /// Returns [`WitnessFetchError::NoProviderInRange`] when `skip` selects past the
+    /// configured witness endpoints — a routing bug fails this one request rather than the
+    /// process.
     pub async fn get_witness_light_with_deadline_from(
         &self,
         skip: usize,
         number: u64,
         hash: B256,
         deadline: Option<Instant>,
-    ) -> std::result::Result<(LightWitness, MptWitness), RpcDeadlineExceeded> {
+    ) -> std::result::Result<(LightWitness, MptWitness), WitnessFetchError> {
         self.witness_round_robin(
             skip..self.witness_providers.len(),
             number,
@@ -809,7 +831,7 @@ impl RpcClient {
             "Witness light-decoded",
         )
         .await
-        .expect("None deadline cannot time out")
+        .expect("pinned 0..1 range and a None deadline cannot fail")
     }
 
     /// Shared `mega_getBlockWitness` retry loop: primary-failover rounds (always start from
@@ -821,8 +843,8 @@ impl RpcClient {
     /// the logged endpoint labels stay aligned with the full configured list because each
     /// label bakes in its original index (see [`endpoint_label`]).
     ///
-    /// # Panics
-    /// Panics if `providers` is empty or out of bounds — at least one provider must remain.
+    /// An empty or out-of-bounds `providers` range is a wiring failure, surfaced as
+    /// [`WitnessFetchError::NoProviderInRange`] rather than a panic.
     // A `warn`-level span (not the usual `info`) so it stays enabled at the default `warn` log
     // filter: the generic retry loop's per-attempt failure logs then inherit `block_number`,
     // which they cannot see otherwise, so an endpoint stall/error is traceable to its block.
@@ -835,12 +857,11 @@ impl RpcClient {
         deadline: Option<Instant>,
         decode: fn(&str) -> std::result::Result<T, crate::WitnessDecodingError>,
         trace_msg: &'static str,
-    ) -> std::result::Result<T, RpcDeadlineExceeded> {
-        assert!(
-            !providers.is_empty() && providers.end <= self.witness_providers.len(),
-            "witness provider range ({providers:?}) must select at least one of {} providers",
-            self.witness_providers.len()
-        );
+    ) -> std::result::Result<T, WitnessFetchError> {
+        let configured = self.witness_providers.len();
+        if providers.is_empty() || providers.end > configured {
+            return Err(WitnessFetchError::NoProviderInRange { skip: providers.start, configured });
+        }
         // Deadline-bound witness attempts run under the reserve-half policy: the tightest of
         // the configured ceiling, the general per-attempt timeout, and — recomputed at each
         // attempt, after any permit wait — half of what the call still has, so neither a
@@ -876,6 +897,7 @@ impl RpcClient {
             },
         )
         .await
+        .map_err(WitnessFetchError::Deadline)
     }
 
     /// Reports a range of validated blocks via the dedicated report endpoint.
@@ -1613,6 +1635,19 @@ async fn verify_block_on_blocking_pool(block: Block<Transaction>) -> Result<Bloc
     .context("block verification task panicked")?
 }
 
+/// Unwraps a [`WitnessFetchError`] from a full-range witness fetch, where
+/// [`WitnessFetchError::NoProviderInRange`] cannot occur: `0..len` is empty only when the
+/// client carries no witness providers at all, which both binaries reject at startup.
+fn deadline_only(e: WitnessFetchError) -> RpcDeadlineExceeded {
+    match e {
+        WitnessFetchError::Deadline(d) => d,
+        WitnessFetchError::NoProviderInRange { skip, configured } => unreachable!(
+            "full-range witness fetch on a client with no witness providers \
+             (skip={skip}, configured={configured})"
+        ),
+    }
+}
+
 /// Verifies structural integrity of a block fetched from RPC.
 ///
 /// Checks:
@@ -1833,11 +1868,12 @@ mod tests {
                 .to_string()
                 .contains("At least one data API")
         );
-        assert!(
-            RpcClient::new(&[LOCALHOST_A], &[])
-                .unwrap_err()
-                .to_string()
-                .contains("At least one witness API")
+        // An empty witness list is a legal configuration (the validator's R2 witness mode);
+        // a witness call on such a client returns `NoProviderInRange` instead.
+        assert_eq!(
+            RpcClient::new(&[LOCALHOST_A], &[]).unwrap().witness_provider_count(),
+            0,
+            "an empty witness list must construct"
         );
 
         for endpoints in [&[LOCALHOST_B][..], &[LOCALHOST_B, "http://localhost:8547"]] {
@@ -2116,6 +2152,32 @@ mod tests {
         hb.stop().unwrap();
     }
 
+    /// A `skip` past the configured witness endpoints — or a client built with none at all —
+    /// is a wiring failure, and must fail this one request rather than take the process down.
+    #[tokio::test]
+    async fn witness_fetch_out_of_range_returns_a_typed_error() {
+        let client = RpcClient::new(&[LOCALHOST_A], &[LOCALHOST_B]).unwrap();
+        let err = client
+            .get_witness_light_with_deadline_from(1, 7, B256::ZERO, None)
+            .await
+            .expect_err("skip == provider count leaves no provider");
+        assert!(
+            matches!(err, WitnessFetchError::NoProviderInRange { skip: 1, configured: 1 }),
+            "unexpected error: {err:?}"
+        );
+
+        // Same variant covers the no-witness-providers deployment (R2 mode).
+        let witnessless = RpcClient::new(&[LOCALHOST_A], &[]).unwrap();
+        let err = witnessless
+            .get_witness_light_with_deadline_from(0, 7, B256::ZERO, None)
+            .await
+            .expect_err("a client with no witness providers cannot fetch a witness");
+        assert!(
+            matches!(err, WitnessFetchError::NoProviderInRange { skip: 0, configured: 0 }),
+            "unexpected error: {err:?}"
+        );
+    }
+
     /// `get_witness` pins `rr_start = 0`, so every round visits the primary first and only
     /// falls through to the backup on failure. We can't easily make the primary succeed in
     /// a unit test (a valid witness payload needs real cryptographic proof material), but
@@ -2267,15 +2329,6 @@ mod tests {
         ha.stop().unwrap();
         hb.stop().unwrap();
         hc.stop().unwrap();
-    }
-
-    /// Skipping every configured witness provider is a caller bug and must panic loudly
-    /// instead of silently retrying over an empty provider set.
-    #[tokio::test]
-    #[should_panic(expected = "must select at least one")]
-    async fn test_witness_fetch_skip_of_all_providers_panics() {
-        let client = RpcClient::new(&[LOCALHOST_A], &[LOCALHOST_B]).unwrap();
-        let _ = client.get_witness_light_with_deadline_from(1, 1, BlockHash::ZERO, None).await;
     }
 
     /// Serves `mega_getBlockWitness` returning a stub that decodes-fails, while recording
