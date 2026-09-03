@@ -1,6 +1,6 @@
 //! Advancer stage: reorders processed blocks, detects reorgs, persists progress.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use eyre::Result;
 use tokio_util::sync::CancellationToken;
@@ -78,8 +78,8 @@ where
 /// and advances the canonical chain.
 pub(crate) async fn chain_advancer<F, S, H, R>(
     fetcher: &F,
-    store: &S,
-    hooks: &H,
+    store: Arc<S>,
+    hooks: Arc<H>,
     resolver: &R,
     result_rx: kanal::Receiver<WorkerResult<H::Output>>,
     initial_tip: BlockMeta,
@@ -87,7 +87,7 @@ pub(crate) async fn chain_advancer<F, S, H, R>(
 ) -> Result<PipelineOutcome>
 where
     F: BlockFetcher,
-    S: ChainStore,
+    S: ChainStore + 'static,
     H: PipelineHooks,
     R: ReorgResolver<F, S>,
 {
@@ -103,7 +103,6 @@ where
     // Reused across iterations to avoid per-iteration allocations; typical batch
     // size is small (<= `concurrent_workers`) and stable.
     let mut batch: Vec<H::Output> = Vec::new();
-    let mut metas: Vec<BlockMeta> = Vec::new();
 
     loop {
         let item = tokio::select! {
@@ -127,7 +126,6 @@ where
         buffer.insert(item.block_number(), item);
 
         batch.clear();
-        metas.clear();
         while let Some(item) = buffer.remove(&next_expected) {
             if item.parent_hash() != current_tip.block_hash {
                 debug!(
@@ -139,7 +137,7 @@ where
 
                 // Strategy is scenario-supplied (see `ReorgResolver`); `Floor` rolls back,
                 // `Fatal`/`Retry` end the cycle.
-                let rollback_to = match resolver.resolve(fetcher, store, persisted_tip).await? {
+                let rollback_to = match resolver.resolve(fetcher, &store, persisted_tip).await? {
                     ReorgResolution::Floor(floor) => {
                         debug!(block = next_expected, floor, "Resolved reorg floor");
                         floor
@@ -179,17 +177,37 @@ where
             }
             current_tip = item.to_block_meta();
             next_expected += 1;
-            metas.push(current_tip.clone());
             batch.push(item);
         }
 
         if !batch.is_empty() {
-            hooks.pre_advance(&batch)?;
-            store.advance_chain(&metas)?;
+            // The hooks' pre-advance persistence and the store commit are synchronous,
+            // potentially multi-ms disk work — run them off the async runtime so they can't
+            // stall other tasks (the trace server shares this runtime with its RPC handlers).
+            let advance_store = store.clone();
+            let advance_hooks = hooks.clone();
+            let owned_batch = std::mem::take(&mut batch);
+            let advanced = tokio::task::spawn_blocking(move || {
+                let metas: Vec<BlockMeta> =
+                    owned_batch.iter().map(|item| item.to_block_meta()).collect();
+                advance_hooks.pre_advance(&owned_batch)?;
+                advance_store.advance_chain(&metas)?;
+                Ok::<_, eyre::Report>(owned_batch)
+            })
+            .await;
+            batch = match advanced {
+                Ok(buf) => buf?,
+                // A panic in the store/hooks must propagate unchanged, exactly as it did
+                // when these calls ran inline on this task.
+                Err(join_err) => match join_err.try_into_panic() {
+                    Ok(payload) => std::panic::resume_unwind(payload),
+                    Err(join_err) => return Err(join_err.into()),
+                },
+            };
             persisted_tip = current_tip.block_number;
             debug!(
                 tip = current_tip.block_number,
-                advanced = metas.len(),
+                advanced = batch.len(),
                 buffered = buffer.len(),
                 "Chain advanced"
             );

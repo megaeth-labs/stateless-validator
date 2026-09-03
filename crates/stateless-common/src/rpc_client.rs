@@ -452,15 +452,24 @@ impl RpcClient {
         })
     }
 
+    /// The data provider this call's first round starts at: rotated per call so healthy
+    /// endpoints share load evenly. Within a round the order is fixed (start → start+1 → …).
+    ///
+    /// Safety: the constructor guarantees at least one data provider. The atomic op is
+    /// skipped for a single provider — pointless contention otherwise.
+    fn next_data_rr_start(&self) -> usize {
+        let n = self.data_providers.len();
+        if n > 1 { self.data_rr_counter.fetch_add(1, Ordering::Relaxed) % n } else { 0 }
+    }
+
     /// Deadline-aware counterpart of [`Self::call`].
     ///
     /// With `deadline = Some(..)` the retry loop returns [`RpcDeadlineExceeded`] once the
     /// deadline passes, clamping each inter-round sleep so it doesn't overshoot. With
     /// `None` this is equivalent to [`Self::call`] and never returns `Err`.
     ///
-    /// Each call performs rounds of "try every data provider once in round-robin order".
-    /// The starting provider rotates per call via an atomic counter so healthy endpoints
-    /// share load evenly; within a round the order is fixed (start → start+1 → …).
+    /// Each call performs rounds of "try every data provider once in round-robin order",
+    /// starting at [`Self::next_data_rr_start`].
     async fn call_with_deadline<T: Send + 'static>(
         &self,
         method: RpcMethod,
@@ -481,18 +490,13 @@ impl RpcClient {
         best_effort: bool,
         f: impl Fn(RootProvider<Optimism>) -> BoxFuture<Result<T>>,
     ) -> std::result::Result<T, RpcDeadlineExceeded> {
-        // Safety: constructor guarantees at least one data provider.
-        let n = self.data_providers.len();
-        // Skip the atomic op when there's a single provider — avoids pointless contention.
-        let rr_start =
-            if n > 1 { self.data_rr_counter.fetch_add(1, Ordering::Relaxed) % n } else { 0 };
         round_robin_with_backoff(
             &self.data_providers,
             &self.data_provider_labels,
             &self.data_concurrency,
             &self.config.rpc_retry,
             AttemptCap::Fixed(self.config.per_attempt_timeout),
-            rr_start,
+            self.next_data_rr_start(),
             method,
             self.config.metrics.as_ref(),
             deadline,
@@ -554,6 +558,13 @@ impl RpcClient {
     }
 
     /// Deadline-aware counterpart of [`Self::get_block`].
+    ///
+    /// Verification is the retry loop's *finalize* step, not part of the attempt window: it
+    /// is per-transaction ECDSA recovery and re-encoding over a whole block — CPU-bound work
+    /// that would otherwise both burn the rotation reserve and read as a provider stall,
+    /// classifying a healthy endpoint serving a large block as stalled (see
+    /// [`round_robin_with_backoff`]). A verification failure still counts as that provider's
+    /// error, so a tampered block rotates exactly as a transport failure does.
     pub async fn get_block_with_deadline(
         &self,
         block_id: BlockId,
@@ -561,15 +572,29 @@ impl RpcClient {
         deadline: Option<Instant>,
     ) -> std::result::Result<Block<Transaction>, RpcDeadlineExceeded> {
         let verify = !self.config.skip_block_verification;
-        self.call_with_deadline(RpcMethod::EthGetBlock, deadline, move |provider| {
-            Box::pin(async move {
-                let block = do_get_block_unchecked(&provider, block_id, full_txs).await?;
-                if verify {
-                    verify_block_integrity(&block)?;
-                }
-                Ok(block)
-            })
-        })
+        round_robin_with_backoff(
+            &self.data_providers,
+            &self.data_provider_labels,
+            &self.data_concurrency,
+            &self.config.rpc_retry,
+            AttemptCap::Fixed(self.config.per_attempt_timeout),
+            self.next_data_rr_start(),
+            RpcMethod::EthGetBlock,
+            self.config.metrics.as_ref(),
+            deadline,
+            false,
+            move |provider, _provider_label| {
+                Box::pin(async move { do_get_block_unchecked(&provider, block_id, full_txs).await })
+            },
+            move |block, _provider_label| {
+                Box::pin(async move {
+                    if !verify {
+                        return Ok(block);
+                    }
+                    verify_block_on_blocking_pool(block).await
+                })
+            },
+        )
         .await
     }
 
@@ -1573,6 +1598,21 @@ async fn decode_witness_wire<T: Send + 'static>(
     Ok(result)
 }
 
+/// [`RpcClient::get_block_with_deadline`]'s finalize half: [`verify_block_integrity`] on the
+/// blocking pool (per-transaction ECDSA recovery plus a re-encode of every envelope is
+/// CPU-bound over a full block), handing the block back untouched on success.
+///
+/// A failure here is an integrity failure from this provider — the retry loop records it as
+/// that provider's `Error` and rotates, exactly like a transport error.
+async fn verify_block_on_blocking_pool(block: Block<Transaction>) -> Result<Block<Transaction>> {
+    tokio::task::spawn_blocking(move || -> Result<Block<Transaction>> {
+        verify_block_integrity(&block)?;
+        Ok(block)
+    })
+    .await
+    .context("block verification task panicked")?
+}
+
 /// Verifies structural integrity of a block fetched from RPC.
 ///
 /// Checks:
@@ -1660,7 +1700,7 @@ mod tests {
         find_divergence_point,
         pipeline::{BlockFetcher, DivergenceLookups},
     };
-    use stateless_test_utils::mock_rpc::{header_stub, parse_hex_u64, serve};
+    use stateless_test_utils::mock_rpc::{consistent_header, header_stub, parse_hex_u64, serve};
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -1977,6 +2017,71 @@ mod tests {
 
         ha.stop().unwrap();
         hb.stop().unwrap();
+    }
+
+    /// A block with no transactions, so [`verify_block_integrity`] reduces to its header-hash
+    /// check and the fixture needs no signed transactions.
+    fn block_stub(header: alloy_rpc_types_eth::Header) -> Block<Transaction> {
+        Block {
+            header,
+            uncles: Vec::new(),
+            transactions: alloy_rpc_types_eth::BlockTransactions::Hashes(Vec::new()),
+            withdrawals: None,
+        }
+    }
+
+    /// Block verification is the retry loop's finalize step rather than part of the attempt
+    /// window (so a large block cannot read as a provider stall), and this pins the property
+    /// that move must not cost: an integrity failure is still that provider's error, so the
+    /// call rotates to the next provider instead of surfacing the bad block.
+    #[tokio::test]
+    async fn block_verification_failure_rotates_to_the_next_provider() {
+        let bad_hits = Arc::new(AtomicUsize::new(0));
+        let (bad_handle, bad_url) = serve(Arc::clone(&bad_hits), |m| {
+            m.register_method("eth_getBlockByNumber", |_params, hits, _| {
+                hits.fetch_add(1, Ordering::Relaxed);
+                // A hash the header does not actually hash to — the first integrity check.
+                Ok::<_, ErrorObjectOwned>(block_stub(header_stub(7, BlockHash::from([9u8; 32]))))
+            })
+            .unwrap();
+        })
+        .await;
+        let good_hits = Arc::new(AtomicUsize::new(0));
+        let (good_handle, good_url) = serve(Arc::clone(&good_hits), |m| {
+            m.register_method("eth_getBlockByNumber", |_params, hits, _| {
+                hits.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, ErrorObjectOwned>(block_stub(consistent_header(7)))
+            })
+            .unwrap();
+        })
+        .await;
+
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
+            ..Default::default()
+        };
+        let client = RpcClient::new_with_config(
+            &[bad_url.as_str(), good_url.as_str()],
+            &[good_url.as_str()],
+            config,
+            None,
+        )
+        .unwrap();
+
+        let block = client
+            .get_block_with_deadline(BlockId::number(7), false, None)
+            .await
+            .expect("None deadline cannot time out");
+        assert_eq!(
+            block.header.hash,
+            consistent_header(7).hash,
+            "the verified block must come from the second provider"
+        );
+        assert_eq!(bad_hits.load(Ordering::Relaxed), 1, "the tampering provider must be tried");
+        assert_eq!(good_hits.load(Ordering::Relaxed), 1, "rotation must reach the good provider");
+
+        bad_handle.stop().unwrap();
+        good_handle.stop().unwrap();
     }
 
     /// After every provider in a round fails, the helper sleeps and starts a new round.
