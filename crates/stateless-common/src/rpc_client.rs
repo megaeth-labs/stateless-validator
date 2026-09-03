@@ -1599,13 +1599,19 @@ fn verify_block_integrity(block: &Block<Transaction>) -> Result<()> {
 
     // Verify transaction hashes and transactions root
     if let BlockTransactions::Full(ref transactions) = block.transactions {
+        // Encode each envelope exactly once: keccak of the encoding is the tx hash, and the
+        // same bytes feed the ordered trie for the transactions-root check.
+        let mut encoded_txs: Vec<Vec<u8>> = Vec::with_capacity(transactions.len());
         for tx in transactions {
-            let tx_envelope = tx.inner.clone().into_inner();
+            let tx_envelope = tx.inner.inner.inner();
+            let mut encoded = Vec::with_capacity(tx_envelope.encode_2718_len());
+            tx_envelope.encode_2718(&mut encoded);
+            let computed_hash = alloy_primitives::keccak256(&encoded);
             ensure!(
-                tx_envelope.trie_hash() == *tx_envelope.hash(),
+                computed_hash == *tx_envelope.hash(),
                 "Transaction hash mismatch: expected {:?}, computed {:?}",
                 tx_envelope.hash(),
-                tx_envelope.trie_hash()
+                computed_hash
             );
 
             let recovered = tx_envelope
@@ -1618,10 +1624,11 @@ fn verify_block_integrity(block: &Block<Transaction>) -> Result<()> {
                 tx.from(),
                 recovered
             );
+            encoded_txs.push(encoded);
         }
 
-        let computed_tx_root = ordered_trie_root_with_encoder(transactions, |tx, buf| {
-            tx.inner.clone().into_inner().encode_2718(buf)
+        let computed_tx_root = ordered_trie_root_with_encoder(&encoded_txs, |tx_bytes, buf| {
+            buf.extend_from_slice(tx_bytes)
         });
         ensure!(
             computed_tx_root == block.header.transactions_root,

@@ -546,8 +546,18 @@ where
     let logs_bloom =
         execution_result.receipts.iter().fold(Bloom::ZERO, |acc, receipt| acc | receipt.bloom());
 
-    // Gas used is the cumulative gas used of the last receipt
-    let gas_used = execution_result.receipts.last().map(|r| r.cumulative_gas_used()).unwrap_or(0);
+    // `BlockExecutionResult::gas_used` is defined by mega-evm's `finish()` as
+    // `receipts.last().cumulative_gas_used()` — the exact expression the header check
+    // read before switching to this field, so the two cannot disagree regardless of how
+    // system transactions are accounted. The assertion pins that upstream definition: a
+    // future mega-evm that accounts gas outside the receipt chain fails loudly in every
+    // debug/test run instead of silently changing the header check.
+    let gas_used = execution_result.gas_used;
+    debug_assert_eq!(
+        gas_used,
+        execution_result.receipts.last().map(|r| r.cumulative_gas_used()).unwrap_or(0),
+        "mega-evm gas_used no longer equals the last receipt's cumulative gas"
+    );
 
     let receipts_root = calculate_receipt_root(&execution_result.receipts);
 
@@ -1105,6 +1115,39 @@ mod tests {
     /// returned updates must reproduce the header's state root when fed through the SALT trie
     /// update, locking its equivalence with the `validate_block` path the helpers were
     /// extracted from.
+    /// The header check reads `BlockExecutionResult::gas_used`; mega-evm defines that field
+    /// as the last receipt's cumulative gas, the expression the check read before. A
+    /// `debug_assert_eq!` at the derivation site pins the two against each other on every
+    /// replay; this pins the surviving value against what a real mainnet header claims, so a
+    /// mega-evm that starts accounting gas outside the receipt chain fails here rather than
+    /// as a consensus divergence in production.
+    #[test]
+    fn replayed_gas_used_matches_the_mainnet_header() {
+        let _logging = init_test_logging("stateless_core");
+        let fx = TestFixtures::mainnet_shared();
+        let paired = fx.paired_blocks();
+        assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
+        for (number, hash) in paired {
+            let block = &fx.blocks[&hash];
+            let salt_witness = fx.salt_witnesses[&hash].clone();
+            let header = block.consensus_header();
+            let ext_env = WitnessExternalEnv::new(&salt_witness, header.number)
+                .expect("witness carries bucket metadata");
+            let witness = Witness::from(salt_witness);
+            witness
+                .verify()
+                .unwrap_or_else(|e| panic!("witness verification failed for {number}: {e:?}"));
+            let witness_db =
+                WitnessDatabase { header, witness: &witness, contracts: &fx.contracts };
+            let (_, output) = replay_block(&chain_spec(), block, &witness_db, ext_env)
+                .unwrap_or_else(|e| panic!("replay failed for {number} ({hash}): {e:?}"));
+            assert_eq!(
+                output.gas_used, block.header.gas_used,
+                "replayed gas_used disagrees with the header for {number} ({hash})"
+            );
+        }
+    }
+
     #[test]
     fn validate_block_deriving_updates_mainnet_fixtures() {
         let _logging = init_test_logging("stateless_core");
