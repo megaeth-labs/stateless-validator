@@ -331,8 +331,6 @@ pub async fn run() -> Result<()> {
         ..rpc_defaults
     }
     .with_metrics(Arc::new(metrics::ValidatorMetrics));
-    // In R2 mode the RpcClient's witness providers are never used, but its constructor requires
-    // a non-empty list — hand it the data endpoints as a placeholder.
     let data_apis: Vec<&str> = args.rpc_endpoint.iter().map(String::as_str).collect();
     let r2_witness = match args.witness_source {
         WitnessSource::Rpc => {
@@ -361,8 +359,11 @@ pub async fn run() -> Result<()> {
         }
     };
 
+    // In R2 mode the client carries no witness providers: witnesses come straight from R2, and
+    // a witness RPC call that slipped through fails structurally instead of quietly asking the
+    // data endpoints for `mega_getBlockWitness`.
     let witness_apis: Vec<&str> = if r2_witness.is_some() {
-        data_apis.clone()
+        Vec::new()
     } else {
         args.witness_endpoint.iter().map(String::as_str).collect()
     };
