@@ -293,13 +293,6 @@ impl StateReader for LightWitnessExecutor {
     }
 }
 
-impl LightWitnessExecutor {
-    /// Get the underlying kvs map
-    pub fn kvs(&self) -> &BTreeMap<SaltKey, Option<SaltValue>> {
-        &self.light_witness.kvs
-    }
-}
-
 #[cfg(test)]
 mod tests {
     // `std` is the `alloc` alias in no_std builds, where the prelude carries

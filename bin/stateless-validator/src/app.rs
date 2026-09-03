@@ -15,7 +15,7 @@ use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::Block
 use stateless_db::ContractCache;
 use tracing::{info, warn};
 
-use crate::{metrics, r2_witness::R2WitnessClient, validator_db::ValidatorDB, workers};
+use crate::{metrics, r2_witness::R2WitnessClient, runner, validator_db::ValidatorDB};
 
 /// Where the validator sources witnesses from.
 #[derive(ValueEnum, Clone, Debug, PartialEq, Eq, Default)]
@@ -291,7 +291,7 @@ pub struct CommandLineArgs {
 ///
 /// Parses CLI args, initializes tracing and metrics, constructs the RPC client and
 /// validator DB, loads or initializes the chain spec + anchor, then hands off to
-/// [`workers::run_with_signals`].
+/// [`runner::run_with_signals`].
 pub async fn run() -> Result<()> {
     let args = CommandLineArgs::parse();
     let _log_guard = args.log.init_tracing()?;
@@ -434,13 +434,13 @@ pub async fn run() -> Result<()> {
         info!(end_block = end, "Validating up to end block, then stopping");
     }
 
-    let result = workers::run_with_signals(
+    let result = runner::run_with_signals(
         client,
         r2_witness,
         validator_db,
         contract_cache,
         chain_spec,
-        args.report_validation_endpoint,
+        args.report_validation_endpoint.is_some(),
         pipeline_config,
     )
     .await;

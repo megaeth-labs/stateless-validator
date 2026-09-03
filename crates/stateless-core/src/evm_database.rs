@@ -5,6 +5,7 @@
 //! validation.
 
 use std::{
+    collections::BTreeMap,
     format,
     string::{String, ToString},
     vec::Vec,
@@ -225,8 +226,16 @@ impl WitnessExternalEnv {
         salt_witness: &SaltWitness,
         block_number: BlockNumber,
     ) -> Result<Self, WitnessDatabaseError> {
-        let bucket_capacities = salt_witness
-            .kvs
+        Self::from_metadata_kvs(&salt_witness.kvs, block_number)
+    }
+
+    /// Shared constructor body: scans the metadata key range of a witness's `kvs` map and
+    /// collects the bucket capacities (both witness types expose the same map layout).
+    fn from_metadata_kvs(
+        kvs: &BTreeMap<SaltKey, Option<SaltValue>>,
+        block_number: BlockNumber,
+    ) -> Result<Self, WitnessDatabaseError> {
+        let bucket_capacities = kvs
             .range(METADATA_KEYS_RANGE)
             .map(|(key, value)| Self::parse_metadata_entry(key, value))
             .collect::<Result<HashMap<_, _>, _>>()?;
@@ -260,13 +269,7 @@ impl WitnessExternalEnv {
         light_witness: &LightWitness,
         block_number: BlockNumber,
     ) -> Result<Self, WitnessDatabaseError> {
-        let bucket_capacities = light_witness
-            .kvs
-            .range(METADATA_KEYS_RANGE)
-            .map(|(key, value)| Self::parse_metadata_entry(key, value))
-            .collect::<Result<HashMap<_, _>, _>>()?;
-
-        Ok(Self { block_number, bucket_capacities })
+        Self::from_metadata_kvs(&light_witness.kvs, block_number)
     }
 }
 

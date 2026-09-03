@@ -190,6 +190,42 @@ pub struct RetryPacing {
     pub max: Duration,
 }
 
+impl RetryPacing {
+    /// Starts executing this pacing, from `initial`.
+    pub fn schedule(&self) -> BackoffSchedule {
+        BackoffSchedule {
+            current_ms: self.initial.as_millis() as u64,
+            max_ms: self.max.as_millis() as u64,
+        }
+    }
+}
+
+/// Stepping state for a [`RetryPacing`] — the arithmetic every retry loop that paces this
+/// way needs, in one place.
+///
+/// Owns the three invariants those loops rely on: up to 50% random jitter per sleep (keeps
+/// parallel clients from retrying in lockstep through a shared outage), the `max` cap, and
+/// a 1 ms floor so a zero-duration pacing cannot turn a retry loop into a busy-loop.
+///
+/// Deadline handling stays with the caller: whether an overrunning sleep is clamped or
+/// gives up is policy, not arithmetic.
+#[derive(Clone, Copy, Debug)]
+pub struct BackoffSchedule {
+    current_ms: u64,
+    max_ms: u64,
+}
+
+impl BackoffSchedule {
+    /// Returns the next sleep in milliseconds (jittered, capped, floored at 1 ms) and
+    /// advances the doubling state.
+    pub fn next_sleep_ms(&mut self) -> u64 {
+        let jitter_ms = fastrand::u64(0..=self.current_ms / 2);
+        let sleep_ms = (self.current_ms + jitter_ms).min(self.max_ms).max(1);
+        self.current_ms = (self.current_ms * 2).min(self.max_ms);
+        sleep_ms
+    }
+}
+
 /// A successfully fetched object body plus the time the fetch spent queued on the
 /// concurrency cap.
 ///
@@ -791,8 +827,7 @@ impl R2ObjectFetcher {
         on_retry: impl Fn(),
     ) -> Result<FetchedObject, R2GetError> {
         let key = keys::block_object_key(number, hash);
-        let max_backoff_ms = self.pacing.max.as_millis() as u64;
-        let mut backoff_ms = self.pacing.initial.as_millis() as u64;
+        let mut backoff = self.pacing.schedule();
         let mut attempt = 0usize;
         let mut queue_wait = Duration::ZERO;
 
@@ -838,10 +873,7 @@ impl R2ObjectFetcher {
                     if !e.is_retryable() || attempt >= max_attempts {
                         return Err(e);
                     }
-                    // Jittered doubling; `.max(1)` keeps a zero-duration policy from
-                    // busy-looping.
-                    let jitter_ms = fastrand::u64(0..=backoff_ms / 2);
-                    let sleep_ms = (backoff_ms + jitter_ms).min(max_backoff_ms).max(1);
+                    let sleep_ms = backoff.next_sleep_ms();
                     if deadline
                         .is_some_and(|d| Instant::now() + Duration::from_millis(sleep_ms) >= d)
                     {
@@ -853,7 +885,6 @@ impl R2ObjectFetcher {
                         "R2 witness GET failed, backing off",
                     );
                     tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
-                    backoff_ms = (backoff_ms * 2).min(max_backoff_ms);
                 }
             }
         }

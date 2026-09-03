@@ -46,7 +46,6 @@ jsonrpsee.workspace = true
 libc.workspace = true
 metrics.workspace = true
 metrics-derive.workspace = true
-metrics-exporter-prometheus.workspace = true
 pin-project-lite.workspace = true
 quick_cache.workspace = true
 rayon.workspace = true

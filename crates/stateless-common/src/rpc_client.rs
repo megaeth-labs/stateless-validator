@@ -52,6 +52,7 @@ use revm::state::Bytecode;
 use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
 use stateless_core::{LightWitness, withdrawals::MptWitness};
+use stateless_r2::fetch::{BackoffSchedule, RetryPacing};
 use tokio::sync::Semaphore;
 use tracing::{instrument, trace, warn};
 
@@ -63,9 +64,9 @@ use crate::{
 
 /// Exponential-backoff policy used by [`RpcClient`]'s round-level retry loop.
 ///
-/// `initial` is the first sleep duration; each round doubles it up to `max`.
-/// The loop itself lives in [`round_robin_with_backoff`]; this type only describes
-/// the sleep schedule.
+/// `initial` is the first sleep duration; each round doubles it up to `max`. The loop
+/// itself lives in [`round_robin_with_backoff`]; this type only describes the sleep
+/// schedule, which it steps through [`Self::schedule`].
 #[derive(Debug, Clone)]
 pub struct BackoffPolicy {
     /// First retry sleep. Each subsequent retry doubles up to `max`.
@@ -78,6 +79,15 @@ impl BackoffPolicy {
     /// Creates a new policy with the given `initial` and `max` sleep durations.
     pub const fn new(initial: Duration, max: Duration) -> Self {
         Self { initial, max }
+    }
+
+    /// Starts executing the schedule from `initial`.
+    ///
+    /// The schedule itself lives in `stateless-r2` next to [`RetryPacing`], the pacing pair
+    /// its GET loop steps: that crate must stay free of upward dependencies, so it is the
+    /// only home both retry loops can reach.
+    pub fn schedule(&self) -> BackoffSchedule {
+        RetryPacing { initial: self.initial, max: self.max }.schedule()
     }
 }
 
@@ -1151,9 +1161,7 @@ where
     const WARN_AT_ROUND: u32 = 3;
 
     let n = providers.len();
-    let max_backoff_ms = policy.max.as_millis() as u64;
-    let initial_backoff_ms = policy.initial.as_millis() as u64;
-    let mut round_backoff_ms = initial_backoff_ms;
+    let mut backoff = policy.schedule();
     let mut round = 0u32;
     let call_start = Instant::now();
     // Records the logical-call deadline give-up (once) and builds the typed error. Called
@@ -1393,11 +1401,7 @@ where
         // `last_err` is always `Some` here: `n >= 1` is enforced by the `RpcClient`
         // constructor and we only reach this point after `n` iterations that each set it.
         let last_err = last_err.expect("last_err set when every provider failed this round");
-        let jitter_ms = fastrand::u64(0..=round_backoff_ms / 2);
-        // `.max(1)` prevents a hot-spin loop if a caller constructs a zero-backoff policy
-        // (`BackoffPolicy::new(Duration::ZERO, Duration::ZERO)`): the computed sleep would
-        // otherwise be `0` and the retry loop would busy-wait on every round.
-        let mut sleep_ms = (round_backoff_ms + jitter_ms).min(max_backoff_ms).max(1);
+        let mut sleep_ms = backoff.next_sleep_ms();
         // Clamp the sleep so it doesn't overshoot the caller's deadline — if no time is
         // left we bail immediately rather than sleeping past the deadline and then bailing.
         if let Some(d) = deadline {
@@ -1419,7 +1423,6 @@ where
             "All providers failed this round, backing off",
         );
         tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-        round_backoff_ms = (round_backoff_ms * 2).min(max_backoff_ms);
         round += 1;
     }
 }
