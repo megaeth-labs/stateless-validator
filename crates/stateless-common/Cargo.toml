@@ -36,7 +36,7 @@ bincode.workspace = true
 clap.workspace = true
 eyre.workspace = true
 futures.workspace = true
-metrics-exporter-prometheus.workspace = true
+metrics-exporter-prometheus = { workspace = true, optional = true }
 # Also enables gzip/brotli on the shared reqwest 0.12 client (Cargo feature unification) for witness/data fetches.
 reqwest = { workspace = true, features = ["gzip", "brotli"] }
 rolling-file.workspace = true
@@ -53,6 +53,11 @@ jsonrpsee.workspace = true
 kanal.workspace = true
 stateless-test-utils = { path = "../stateless-test-utils", features = ["mock-rpc"] }
 tokio-util.workspace = true
+
+[features]
+# The Prometheus exporter installer; on only in the binaries, so library consumers
+# (mega-reth) do not build the exporter for a function they never call.
+prometheus-exporter = ["dep:metrics-exporter-prometheus"]
 
 [[bench]]
 harness = false

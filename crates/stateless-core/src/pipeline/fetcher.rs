@@ -21,9 +21,9 @@ struct FetcherState<F: BlockFetcher> {
     /// Next block to spawn fresh.
     next_block: u64,
     tasks: JoinSet<(u64, Result<F::Output>)>,
-    /// Task id → block, for panic recovery (`JoinError` only carries the id) and
-    /// block-in-flight lookups (`recover_gaps` scans the values; the set is bounded by
-    /// `max_in_flight`, so a linear scan is negligible next to the awaited fetches).
+    /// Task id → block, for panic recovery (`JoinError` only carries the id); its values are
+    /// the in-flight set `recover_gaps` scans (O(`max_in_flight`²) per completion —
+    /// microseconds next to the awaited fetch).
     task_to_block: HashMap<Id, u64>,
     /// Successful blocks, waiting for `base_block` to catch up.
     sent: HashSet<u64>,

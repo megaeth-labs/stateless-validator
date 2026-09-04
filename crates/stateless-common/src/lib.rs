@@ -3,9 +3,17 @@ pub mod metrics;
 pub use metrics::{RpcMethod, RpcMetrics};
 pub mod rpc_client;
 pub use rpc_client::{
-    BackoffPolicy, CodeFetchError, RpcClient, RpcClientConfig, RpcDeadlineExceeded,
-    SetValidatedBlocksResponse, WitnessRequestKeys,
+    CodeFetchError, RpcClient, RpcClientConfig, RpcDeadlineExceeded, SetValidatedBlocksResponse,
+    WitnessRequestKeys,
 };
+/// Exponential-backoff policy used by [`RpcClient`]'s round-level retry loop: `initial` is the
+/// first sleep duration; each round doubles it up to `max`.
+///
+/// The same pair paces the R2 GET loop, so the type is defined in `stateless-r2` (which must
+/// stay free of upward dependencies) and re-exported here under the name this crate's API
+/// uses; the retry loop steps it through
+/// [`RetryPacing::schedule`](stateless_r2::fetch::RetryPacing::schedule).
+pub use stateless_r2::fetch::RetryPacing as BackoffPolicy;
 pub mod witness_encoding;
 pub use witness_encoding::{
     WITNESS_RESPONSE_VERSION_PREFIX, WITNESS_ZSTD_LEVEL, WitnessDecodingError,

@@ -212,12 +212,12 @@ impl MegaethGenesisHardforks {
 
     /// Convert the MegaETH genesis hardforks into a vector of hardforks and their conditions.
     ///
-    /// The literal below is the single source of the canonical MegaETH activation order —
-    /// [`ChainSpec::from_genesis`] merges it as-is, so new hardforks must be inserted at
-    /// their activation position and appended to the expected list in
-    /// `test_mega_hardforks_iterate_in_activation_order`, which pins the order (fork
-    /// selection by timestamp walks `forks_iter()` in insertion order, so a wrong order
-    /// here means wrong hardfork params — consensus divergence — with lookups still green).
+    /// The literal below is the single source of the canonical MegaETH activation order:
+    /// [`ChainSpec::from_genesis`] merges it as-is, and fork selection by timestamp walks
+    /// `forks_iter()` in insertion order, so a wrong order here means wrong hardfork params
+    /// (consensus divergence) with lookups still green. Insert a new hardfork at its
+    /// activation position both here and in the [`mega_mainnet_hardforks`] ladder;
+    /// `test_mega_hardforks_iterate_in_activation_order` pins the two against each other.
     pub fn into_vec(self) -> Vec<(Box<dyn Hardfork>, ForkCondition)> {
         vec![
             (MegaHardfork::MiniRex.boxed(), self.mini_rex_time.map(ForkCondition::Timestamp)),
@@ -298,9 +298,11 @@ impl MegaethGenesisSequencerRegistryRex6Config {
 /// placeholder activation.
 ///
 /// Not an activation schedule — the real activations come from genesis
-/// ([`MegaethGenesisHardforks::into_vec`], which also fixes their order). This is the
-/// membership list `mainnet_genesis_schedules_every_canonical_hardfork` checks the shipped
-/// mainnet genesis against, so a fork the executor supports cannot go unscheduled unnoticed.
+/// ([`MegaethGenesisHardforks::into_vec`]). This is the membership-and-order reference:
+/// `mainnet_genesis_schedules_every_canonical_hardfork` checks the shipped mainnet genesis
+/// schedules every fork here, so a fork the executor supports cannot go unscheduled
+/// unnoticed, and `test_mega_hardforks_iterate_in_activation_order` checks `into_vec`
+/// yields them in this order.
 pub fn mega_mainnet_hardforks() -> ChainHardforks {
     ChainHardforks::new(vec![
         (MegaHardfork::MiniRex.boxed(), ForkCondition::Timestamp(0)),
@@ -379,11 +381,8 @@ mod tests {
         assert_eq!(spec.hardforks.fork(MegaHardfork::MiniRex), ForkCondition::Timestamp(3));
     }
 
-    /// Fork selection by timestamp walks `forks_iter()` in insertion order, so the
-    /// `into_vec` literal IS the consensus activation order. This pins the relative order
-    /// of every MegaETH fork end-to-end through `from_genesis`; a new hardfork must be
-    /// inserted at its activation position in `into_vec` and appended to the expected
-    /// list here.
+    /// Pins the order [`MegaethGenesisHardforks::into_vec`] documents, end-to-end through
+    /// `from_genesis`, against the [`mega_mainnet_hardforks`] ladder.
     #[test]
     fn test_mega_hardforks_iterate_in_activation_order() {
         let mut genesis = Genesis::default();
@@ -404,29 +403,18 @@ mod tests {
         genesis.config.extra_fields.insert_value("rex6MinRotationDelay".to_string(), 7200).unwrap();
         let spec = ChainSpec::from_genesis(genesis);
 
-        let expected = [
-            MegaHardfork::MiniRex,
-            MegaHardfork::MiniRex1,
-            MegaHardfork::MiniRex2,
-            MegaHardfork::Rex,
-            MegaHardfork::Rex1,
-            MegaHardfork::Rex2,
-            MegaHardfork::Rex3,
-            MegaHardfork::Rex4,
-            MegaHardfork::Rex5,
-            MegaHardfork::Rex6,
-        ];
+        let expected: Vec<&str> =
+            mega_mainnet_hardforks().forks_iter().map(|(hardfork, _)| hardfork.name()).collect();
         let mega_order: Vec<&str> = spec
             .hardforks
             .forks_iter()
             .map(|(hardfork, _)| hardfork.name())
-            .filter(|name| expected.iter().any(|mega| mega.name() == *name))
+            .filter(|name| expected.contains(name))
             .collect();
         assert_eq!(
-            mega_order,
-            expected.iter().map(|mega| mega.name()).collect::<Vec<_>>(),
-            "MegaETH forks must iterate in canonical activation order — fix the \
-             `into_vec` literal, not this list"
+            mega_order, expected,
+            "MegaETH forks must iterate in the ladder's order — fix the `into_vec` literal \
+             (or the ladder), not this test"
         );
     }
 

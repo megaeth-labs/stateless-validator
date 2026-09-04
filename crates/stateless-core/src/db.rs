@@ -32,14 +32,26 @@ pub struct BlockMeta {
 impl BlockMeta {
     /// Projects an RPC header into the meta of the block it seals — a header's roots are that
     /// block's post-state. A missing `withdrawals_root` defaults to zero, the tip-observation
-    /// policy both binaries use; callers that must instead *reject* such headers (e.g. anchor
-    /// initialization from an operator-supplied hash) build the meta explicitly.
+    /// policy both binaries use; anchor initialization, which must instead *reject* such a
+    /// header, goes through [`Self::try_from_header`].
     pub fn from_header(header: &alloy_rpc_types_eth::Header) -> Self {
+        Self::with_withdrawals_root(header, header.withdrawals_root.unwrap_or_default())
+    }
+
+    /// Strict [`Self::from_header`]: `None` when the header carries no `withdrawals_root`.
+    pub fn try_from_header(header: &alloy_rpc_types_eth::Header) -> Option<Self> {
+        header.withdrawals_root.map(|root| Self::with_withdrawals_root(header, root))
+    }
+
+    fn with_withdrawals_root(
+        header: &alloy_rpc_types_eth::Header,
+        post_withdrawals_root: B256,
+    ) -> Self {
         Self {
             block_number: header.number,
             block_hash: header.hash,
             post_state_root: header.state_root,
-            post_withdrawals_root: header.withdrawals_root.unwrap_or_default(),
+            post_withdrawals_root,
         }
     }
 }

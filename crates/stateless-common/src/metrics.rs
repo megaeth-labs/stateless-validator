@@ -1,12 +1,9 @@
 //! RPC metrics types shared by both binaries.
 //!
 //! Provides [`RpcMethod`] for identifying RPC calls, [`RpcMetrics`] as a
-//! callback trait for tracking RPC performance, and the shared Prometheus
-//! exporter installer ([`install_prometheus_exporter`]).
-
-use std::net::SocketAddr;
-
-use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+//! callback trait for tracking RPC performance, and — behind the
+//! `prometheus-exporter` feature — the shared exporter installer
+//! (`install_prometheus_exporter`).
 
 use crate::witness_size::WitnessSizeBreakdown;
 
@@ -15,10 +12,13 @@ use crate::witness_size::WitnessSizeBreakdown;
 ///
 /// Shared by both binaries; each keeps its own metric names, descriptions, and
 /// pre-registration after this returns.
+#[cfg(feature = "prometheus-exporter")]
 pub fn install_prometheus_exporter(
-    addr: SocketAddr,
+    addr: std::net::SocketAddr,
     bucket_specs: &[(&str, &[f64])],
 ) -> eyre::Result<()> {
+    use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+
     let builder = bucket_specs.iter().fold(PrometheusBuilder::new(), |b, &(name, buckets)| {
         b.set_buckets_for_metric(Matcher::Full(name.to_owned()), buckets)
             .expect("valid bucket config")

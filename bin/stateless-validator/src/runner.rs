@@ -43,9 +43,9 @@ pub async fn run_with_signals(
     validator_db: Arc<ValidatorDB>,
     contract_cache: Arc<ContractCache>,
     chain_spec: Arc<ChainSpec>,
-    report_validation: bool,
     pipeline_config: PipelineConfig,
 ) -> Result<()> {
+    let report_validation = client.reports_validation();
     let config = Arc::new(pipeline_config);
     let is_slice_run = config.sync_target.is_some();
     info!(
