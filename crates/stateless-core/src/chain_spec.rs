@@ -15,9 +15,6 @@ use mega_evm::{
 use reth_ethereum_forks::ChainHardforks;
 use reth_optimism_chainspec::OpChainSpec;
 
-/// Default blob gas price update fraction for Cancun (from EIP-4844)
-pub const BLOB_GASPRICE_UPDATE_FRACTION: u64 = 3338477;
-
 /// Chain specification for the Optimism network.
 ///
 /// Defines when various Ethereum and Optimism hardforks are activated.
@@ -74,10 +71,8 @@ impl ChainSpec {
     /// Ordering rules:
     /// - [`OpChainSpec`] already yields Optimism/Ethereum hardforks in the correct order, so they
     ///   do not require reordering.
-    /// - MegaETH hardforks are extracted from the genesis `extra_fields` and explicitly ordered to
-    ///   match the canonical sequence defined by [`mega_mainnet_hardforks()`]. Any remaining,
-    ///   unknown MegaETH hardforks are preserved and appended after the known ones so nothing is
-    ///   dropped.
+    /// - MegaETH hardforks are extracted from the genesis `extra_fields`;
+    ///   [`MegaethGenesisHardforks::into_vec`] yields them in canonical activation order.
     /// - The MegaETH set is then merged with the Optimism/Ethereum set to build a single
     ///   [`ChainHardforks`] that drives fork activation.
     ///
@@ -120,7 +115,7 @@ impl ChainSpec {
             );
         }
 
-        let mut megaeth_hardforks = megaeth_hardforks.into_vec();
+        let megaeth_hardforks = megaeth_hardforks.into_vec();
 
         // Rex5 SequencerRegistry bootstrap, required iff `rex5Time` is scheduled. Parsed from
         // the same flat schema mega-reth uses (`rex5InitialSequencer` / `rex5InitialAdmin` as
@@ -167,20 +162,9 @@ impl ChainSpec {
             .map(|(f, b)| (dyn_clone::clone_box(f), b))
             .collect();
 
-        let hardfork_order = mega_mainnet_hardforks();
-        let mut all_hardforks = Vec::with_capacity(op_hardforks.len() + megaeth_hardforks.len());
-        for (order, _) in hardfork_order.forks_iter() {
-            if let Some(mega_hardfork_index) =
-                megaeth_hardforks.iter().position(|(hardfork, _)| **hardfork == *order)
-            {
-                all_hardforks.push(megaeth_hardforks.remove(mega_hardfork_index));
-            }
-        }
-
-        // append the remaining unknown hardforks to ensure we don't filter any out
-        all_hardforks.append(&mut megaeth_hardforks);
-
-        // we merge megaeth_hardforks with op_hardforks
+        // `into_vec` yields the MegaETH hardforks already in canonical activation order,
+        // so the merge is a straight concatenation.
+        let mut all_hardforks = megaeth_hardforks;
         all_hardforks.append(&mut op_hardforks);
 
         Self {
@@ -227,6 +211,13 @@ impl MegaethGenesisHardforks {
     }
 
     /// Convert the MegaETH genesis hardforks into a vector of hardforks and their conditions.
+    ///
+    /// The literal below is the single source of the canonical MegaETH activation order:
+    /// [`ChainSpec::from_genesis`] merges it as-is, and fork selection by timestamp walks
+    /// `forks_iter()` in insertion order, so a wrong order here means wrong hardfork params
+    /// (consensus divergence) with lookups still green. Insert a new hardfork at its
+    /// activation position both here and in the [`mega_mainnet_hardforks`] ladder;
+    /// `test_mega_hardforks_iterate_in_activation_order` pins the two against each other.
     pub fn into_vec(self) -> Vec<(Box<dyn Hardfork>, ForkCondition)> {
         vec![
             (MegaHardfork::MiniRex.boxed(), self.mini_rex_time.map(ForkCondition::Timestamp)),
@@ -303,7 +294,15 @@ impl MegaethGenesisSequencerRegistryRex6Config {
     }
 }
 
-/// Build a fresh `ChainHardforks` describing MegaETH's canonical hardfork sequence.
+/// MegaETH's canonical hardfork ladder: every fork the pinned mega-evm knows about, at a
+/// placeholder activation.
+///
+/// Not an activation schedule — the real activations come from genesis
+/// ([`MegaethGenesisHardforks::into_vec`]). This is the membership-and-order reference:
+/// `mainnet_genesis_schedules_every_canonical_hardfork` checks the shipped mainnet genesis
+/// schedules every fork here, so a fork the executor supports cannot go unscheduled
+/// unnoticed, and `test_mega_hardforks_iterate_in_activation_order` checks `into_vec`
+/// yields them in this order.
 pub fn mega_mainnet_hardforks() -> ChainHardforks {
     ChainHardforks::new(vec![
         (MegaHardfork::MiniRex.boxed(), ForkCondition::Timestamp(0)),
@@ -380,6 +379,48 @@ mod tests {
         assert_eq!(spec.hardforks.fork(OpHardfork::Holocene), ForkCondition::Timestamp(3));
         assert_eq!(spec.hardforks.fork(OpHardfork::Isthmus), ForkCondition::Timestamp(6));
         assert_eq!(spec.hardforks.fork(MegaHardfork::MiniRex), ForkCondition::Timestamp(3));
+    }
+
+    /// Pins the order [`MegaethGenesisHardforks::into_vec`] documents, end-to-end through
+    /// `from_genesis`, against the [`mega_mainnet_hardforks`] ladder.
+    #[test]
+    fn test_mega_hardforks_iterate_in_activation_order() {
+        let mut genesis = Genesis::default();
+        for (field, ts) in [
+            ("miniRexTime", 1u64),
+            ("miniRex1Time", 2),
+            ("miniRex2Time", 3),
+            ("rexTime", 4),
+            ("rex1Time", 5),
+            ("rex2Time", 6),
+            ("rex3Time", 7),
+            ("rex4Time", 8),
+        ] {
+            genesis.config.extra_fields.insert_value(field.to_string(), ts).unwrap();
+        }
+        schedule_valid_rex5(&mut genesis, 9);
+        genesis.config.extra_fields.insert_value("rex6Time".to_string(), 10).unwrap();
+        genesis.config.extra_fields.insert_value("rex6MinRotationDelay".to_string(), 7200).unwrap();
+        let spec = ChainSpec::from_genesis(genesis);
+
+        let expected: Vec<&str> =
+            mega_mainnet_hardforks().forks_iter().map(|(hardfork, _)| hardfork.name()).collect();
+        // `from_genesis` concatenates the MegaETH forks ahead of the Optimism/Ethereum ones, so
+        // they are the leading `expected.len()` entries. Taking that prefix rather than
+        // filtering by ladder membership keeps the check symmetric: a fork added to `into_vec`
+        // alone shifts the prefix and fails here, where a membership filter would have dropped
+        // it and passed.
+        let mega_order: Vec<&str> = spec
+            .hardforks
+            .forks_iter()
+            .map(|(hardfork, _)| hardfork.name())
+            .take(expected.len())
+            .collect();
+        assert_eq!(
+            mega_order, expected,
+            "the leading MegaETH forks must match the ladder exactly, in order — a new hardfork \
+             belongs in both `into_vec` and `mega_mainnet_hardforks`; fix those, not this test"
+        );
     }
 
     #[test]

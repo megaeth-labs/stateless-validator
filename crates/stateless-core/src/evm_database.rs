@@ -5,6 +5,7 @@
 //! validation.
 
 use std::{
+    collections::BTreeMap,
     format,
     string::{String, ToString},
     vec::Vec,
@@ -210,23 +211,24 @@ impl WitnessExternalEnv {
     /// * `salt_witness` - The SALT witness containing bucket metadata
     /// * `block_number` - The block number for validation checks
     ///
-    /// # Returns
-    ///
-    /// Returns `Ok(WitnessExternalEnv)` if all metadata is valid, or an error if:
-    /// - Any metadata key has a `None` value (malformed witness)
-    /// - Metadata cannot be parsed as `BucketMeta` (corrupt witness)
-    ///
     /// # Errors
     ///
-    /// This method enforces strict witness validation and will fail if:
-    /// - A metadata key is present but has no value
-    /// - A metadata value cannot be deserialized into valid `BucketMeta`
+    /// Fails on a malformed witness: a metadata key with no value, or a metadata value that
+    /// does not deserialize into a valid `BucketMeta`.
     pub fn new(
         salt_witness: &SaltWitness,
         block_number: BlockNumber,
     ) -> Result<Self, WitnessDatabaseError> {
-        let bucket_capacities = salt_witness
-            .kvs
+        Self::from_metadata_kvs(&salt_witness.kvs, block_number)
+    }
+
+    /// Shared constructor body: scans the metadata key range of a witness's `kvs` map and
+    /// collects the bucket capacities (both witness types expose the same map layout).
+    fn from_metadata_kvs(
+        kvs: &BTreeMap<SaltKey, Option<SaltValue>>,
+        block_number: BlockNumber,
+    ) -> Result<Self, WitnessDatabaseError> {
+        let bucket_capacities = kvs
             .range(METADATA_KEYS_RANGE)
             .map(|(key, value)| Self::parse_metadata_entry(key, value))
             .collect::<Result<HashMap<_, _>, _>>()?;
@@ -252,21 +254,13 @@ impl WitnessExternalEnv {
         Ok((bucket_id, meta.capacity))
     }
 
-    /// Creates a new external environment provider from a LightWitness.
-    ///
-    /// This is the fast version of `new()` that works with `LightWitness`
-    /// for improved deserialization performance.
+    /// [`Self::new`] over a [`LightWitness`]: the same metadata scan, the light witness
+    /// only being cheaper to decode.
     pub fn from_light_witness(
         light_witness: &LightWitness,
         block_number: BlockNumber,
     ) -> Result<Self, WitnessDatabaseError> {
-        let bucket_capacities = light_witness
-            .kvs
-            .range(METADATA_KEYS_RANGE)
-            .map(|(key, value)| Self::parse_metadata_entry(key, value))
-            .collect::<Result<HashMap<_, _>, _>>()?;
-
-        Ok(Self { block_number, bucket_capacities })
+        Self::from_metadata_kvs(&light_witness.kvs, block_number)
     }
 }
 

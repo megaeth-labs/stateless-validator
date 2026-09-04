@@ -29,6 +29,33 @@ pub struct BlockMeta {
     pub post_withdrawals_root: B256,
 }
 
+impl BlockMeta {
+    /// Projects an RPC header into the meta of the block it seals — a header's roots are that
+    /// block's post-state. A missing `withdrawals_root` defaults to zero, the tip-observation
+    /// policy both binaries use; anchor initialization, which must instead *reject* such a
+    /// header, goes through [`Self::try_from_header`].
+    pub fn from_header(header: &alloy_rpc_types_eth::Header) -> Self {
+        Self::with_withdrawals_root(header, header.withdrawals_root.unwrap_or_default())
+    }
+
+    /// Strict [`Self::from_header`]: `None` when the header carries no `withdrawals_root`.
+    pub fn try_from_header(header: &alloy_rpc_types_eth::Header) -> Option<Self> {
+        header.withdrawals_root.map(|root| Self::with_withdrawals_root(header, root))
+    }
+
+    fn with_withdrawals_root(
+        header: &alloy_rpc_types_eth::Header,
+        post_withdrawals_root: B256,
+    ) -> Self {
+        Self {
+            block_number: header.number,
+            block_hash: header.hash,
+            post_state_root: header.state_root,
+            post_withdrawals_root,
+        }
+    }
+}
+
 /// Errors returned by persistence trait methods.
 ///
 /// This is the single typed error at the library/binary boundary: every
@@ -107,7 +134,9 @@ pub trait ContractStore: Send + Sync {
 /// pipeline's [`ReorgResolver`](crate::pipeline::ReorgResolver) seam, which each scenario supplies.
 /// History-owning stores additionally implement
 /// [`DivergenceLookups`](crate::pipeline::DivergenceLookups) so the pipeline can bisect them.
-pub trait ChainStore: ContractStore {
+/// Deliberately independent of [`ContractStore`]: a chain-cursor store (e.g. an embedder whose
+/// bytecode integrity is enforced at ingest) need not stub contract persistence.
+pub trait ChainStore: Send + Sync {
     fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>>;
     fn get_anchor(&self) -> StoreResult<Option<BlockMeta>>;
     fn advance_chain(&self, blocks: &[BlockMeta]) -> StoreResult<()>;
@@ -135,6 +164,44 @@ mod tests {
         }
     }
     impl core::error::Error for TestErr {}
+
+    /// An RPC header for block `number` whose hash and roots are distinguishable bytes.
+    fn rpc_header(number: u64, withdrawals_root: Option<B256>) -> alloy_rpc_types_eth::Header {
+        alloy_rpc_types_eth::Header {
+            hash: BlockHash::from([0xAA; 32]),
+            inner: alloy_consensus::Header {
+                number,
+                state_root: B256::from([0xBB; 32]),
+                withdrawals_root,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn from_header_projects_the_sealed_block_meta() {
+        let root = B256::from([0xCC; 32]);
+        let header = rpc_header(7, Some(root));
+        let meta = BlockMeta::from_header(&header);
+        assert_eq!(
+            meta,
+            BlockMeta {
+                block_number: 7,
+                block_hash: BlockHash::from([0xAA; 32]),
+                post_state_root: B256::from([0xBB; 32]),
+                post_withdrawals_root: root,
+            }
+        );
+        assert_eq!(BlockMeta::try_from_header(&header), Some(meta));
+    }
+
+    #[test]
+    fn missing_withdrawals_root_defaults_in_from_header_and_rejects_in_try_from_header() {
+        let header = rpc_header(7, None);
+        assert_eq!(BlockMeta::from_header(&header).post_withdrawals_root, B256::ZERO);
+        assert_eq!(BlockMeta::try_from_header(&header), None);
+    }
 
     #[test]
     fn test_block_meta_equality() {

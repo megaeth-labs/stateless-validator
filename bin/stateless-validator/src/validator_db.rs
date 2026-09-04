@@ -58,18 +58,6 @@ impl ValidatorDB {
 
         Ok(Self { database, max_chain_length })
     }
-
-    #[cfg(test)]
-    fn set_anchor_block(&self, tip: &BlockMeta) -> StoreResult<()> {
-        use stateless_db::block_meta_to_tuple;
-        let write_txn = self.database.begin_write().store_err()?;
-        {
-            let mut table = write_txn.open_table(ANCHOR_BLOCK).store_err()?;
-            table.insert("anchor", block_meta_to_tuple(tip)).store_err()?;
-        }
-        write_txn.commit().store_err()?;
-        Ok(())
-    }
 }
 
 impl ContractStore for ValidatorDB {
@@ -158,20 +146,12 @@ mod tests {
     use stateless_db::ContractCache;
 
     use super::*;
+    use crate::test_support::make_block_meta;
 
     fn temp_store() -> (tempfile::TempDir, ValidatorDB) {
         let dir = tempfile::tempdir().unwrap();
         let store = ValidatorDB::new(dir.path().join("test.redb")).unwrap();
         (dir, store)
-    }
-
-    fn make_block_meta(number: u64) -> BlockMeta {
-        BlockMeta {
-            block_number: number,
-            block_hash: BlockHash::from([number as u8; 32]),
-            post_state_root: B256::from([(number + 100) as u8; 32]),
-            post_withdrawals_root: B256::from([(number + 200) as u8; 32]),
-        }
     }
 
     #[test]
@@ -186,7 +166,7 @@ mod tests {
             post_state_root: B256::from([2u8; 32]),
             post_withdrawals_root: B256::from([3u8; 32]),
         };
-        store.set_anchor_block(&tip).unwrap();
+        store.reset_to_anchor(&tip).unwrap();
 
         let loaded = ChainStore::get_anchor(&store).unwrap().unwrap();
         assert_eq!(loaded, tip);

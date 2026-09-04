@@ -27,7 +27,7 @@ op-alloy-rpc-types.workspace = true
 revm = { workspace = true, features = ["serde"] }
 
 # stateless
-stateless-common = { path = "../../crates/stateless-common" }
+stateless-common = { path = "../../crates/stateless-common", features = ["prometheus-exporter"] }
 stateless-core = { path = "../../crates/stateless-core" }
 stateless-db = { path = "../../crates/stateless-db" }
 stateless-r2 = { path = "../../crates/stateless-r2" }
@@ -36,7 +36,6 @@ stateless-r2 = { path = "../../crates/stateless-r2" }
 clap = { workspace = true, features = ["env"] }
 eyre.workspace = true
 metrics.workspace = true
-metrics-exporter-prometheus.workspace = true
 redb.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
