@@ -165,6 +165,44 @@ mod tests {
     }
     impl core::error::Error for TestErr {}
 
+    /// An RPC header for block `number` whose hash and roots are distinguishable bytes.
+    fn rpc_header(number: u64, withdrawals_root: Option<B256>) -> alloy_rpc_types_eth::Header {
+        alloy_rpc_types_eth::Header {
+            hash: BlockHash::from([0xAA; 32]),
+            inner: alloy_consensus::Header {
+                number,
+                state_root: B256::from([0xBB; 32]),
+                withdrawals_root,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn from_header_projects_the_sealed_block_meta() {
+        let root = B256::from([0xCC; 32]);
+        let header = rpc_header(7, Some(root));
+        let meta = BlockMeta::from_header(&header);
+        assert_eq!(
+            meta,
+            BlockMeta {
+                block_number: 7,
+                block_hash: BlockHash::from([0xAA; 32]),
+                post_state_root: B256::from([0xBB; 32]),
+                post_withdrawals_root: root,
+            }
+        );
+        assert_eq!(BlockMeta::try_from_header(&header), Some(meta));
+    }
+
+    #[test]
+    fn missing_withdrawals_root_defaults_in_from_header_and_rejects_in_try_from_header() {
+        let header = rpc_header(7, None);
+        assert_eq!(BlockMeta::from_header(&header).post_withdrawals_root, B256::ZERO);
+        assert_eq!(BlockMeta::try_from_header(&header), None);
+    }
+
     #[test]
     fn test_block_meta_equality() {
         let a = BlockMeta {
