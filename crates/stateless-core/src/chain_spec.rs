@@ -405,16 +405,21 @@ mod tests {
 
         let expected: Vec<&str> =
             mega_mainnet_hardforks().forks_iter().map(|(hardfork, _)| hardfork.name()).collect();
+        // `from_genesis` concatenates the MegaETH forks ahead of the Optimism/Ethereum ones, so
+        // they are the leading `expected.len()` entries. Taking that prefix rather than
+        // filtering by ladder membership keeps the check symmetric: a fork added to `into_vec`
+        // alone shifts the prefix and fails here, where a membership filter would have dropped
+        // it and passed.
         let mega_order: Vec<&str> = spec
             .hardforks
             .forks_iter()
             .map(|(hardfork, _)| hardfork.name())
-            .filter(|name| expected.contains(name))
+            .take(expected.len())
             .collect();
         assert_eq!(
             mega_order, expected,
-            "MegaETH forks must iterate in the ladder's order — fix the `into_vec` literal \
-             (or the ladder), not this test"
+            "the leading MegaETH forks must match the ladder exactly, in order — a new hardfork \
+             belongs in both `into_vec` and `mega_mainnet_hardforks`; fix those, not this test"
         );
     }
 
