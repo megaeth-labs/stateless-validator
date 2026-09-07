@@ -1,0 +1,78 @@
+name: Release Candidate
+
+# Trunk-first release start. Dispatch with a version: the shared action bumps
+# the version file on the default branch, drafts the changelog entry, and
+# opens a candidate PR. When that
+# PR merges, the `cut` job creates `release-vX.Y.Z` at the merge commit. No
+# tag is created here — see release-settle / release-publish.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (X.Y.Z)"
+        required: true
+        type: string
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  propose:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: app-token
+        with:
+          client-id: ${{ vars.MEGA_MAXWELL_CLIENT_ID }}
+          private-key: ${{ secrets.MEGA_MAXWELL_PK }}
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+
+      - uses: megaeth-labs/.github/.github/actions/release-candidate@main
+        with:
+          stage: propose
+          token: ${{ steps.app-token.outputs.token }}
+          version: ${{ inputs.version }}
+          version_file: Cargo.toml
+          version_pattern: toml
+          changelog_file: CHANGELOG.md
+          # Cargo.lock carries the workspace crate versions too.
+          bump_command: cargo update --workspace
+
+  cut:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'chore/release-candidate-') &&
+      github.event.pull_request.user.login == 'mega-maxwell[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: app-token
+        with:
+          client-id: ${{ vars.MEGA_MAXWELL_CLIENT_ID }}
+          private-key: ${{ secrets.MEGA_MAXWELL_PK }}
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: megaeth-labs/.github/.github/actions/release-candidate@main
+        with:
+          stage: cut
+          token: ${{ steps.app-token.outputs.token }}
+          version_file: Cargo.toml
+          version_pattern: toml
