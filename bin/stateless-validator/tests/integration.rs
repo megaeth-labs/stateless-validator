@@ -12,9 +12,7 @@ use alloy_primitives::{B256, BlockHash};
 use alloy_rpc_types_eth::Block;
 use clap::Parser;
 use jsonrpsee::server::ServerConfigBuilder;
-use jsonrpsee_types::error::{
-    CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
-};
+use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned};
 use stateless_common::{RpcClient, RpcClientConfig, WitnessRequestKeys, encode_witness_response};
 use stateless_core::{
     BisectResolver, ChainStore, ContractStore, PipelineConfig, db::BlockMeta,
@@ -368,11 +366,6 @@ fn make_rpc_error(code: i32, msg: String) -> ErrorObject<'static> {
     ErrorObject::owned(code, msg, None::<()>)
 }
 
-/// Invalid-params RPC error for a failed `params.parse()`.
-fn invalid_params(e: impl std::fmt::Display) -> ErrorObject<'static> {
-    make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}"))
-}
-
 fn shape_block(
     block: &Block<op_alloy_rpc_types::Transaction>,
     full_block: bool,
@@ -392,19 +385,9 @@ fn setup_test_db(fx: &TestFixtures) -> eyre::Result<(Arc<ValidatorDB>, tempfile:
     let temp_dir = tempfile::tempdir()?;
     let db = ValidatorDB::new(temp_dir.path().join(VALIDATOR_DB_FILENAME))?;
 
-    let (block_num, block_hash) = fx.min_block();
-    let block = &fx.blocks[&block_hash];
-    let withdrawals_root = block
-        .header
-        .withdrawals_root
+    let (_, block_hash) = fx.min_block();
+    let anchor = BlockMeta::try_from_header(&fx.blocks[&block_hash].header)
         .ok_or_else(|| eyre::eyre!("Block {block_hash} missing withdrawals_root"))?;
-
-    let anchor = BlockMeta {
-        block_number: block_num,
-        block_hash,
-        post_state_root: block.header.state_root,
-        post_withdrawals_root: withdrawals_root,
-    };
     db.reset_to_anchor(&anchor)?;
 
     Ok((Arc::new(db), temp_dir))
@@ -418,8 +401,7 @@ async fn setup_mock_rpc_server(
     serve_with_config(cfg, state, |module| {
         module
             .register_method("eth_getBlockByNumber", |params, ctx, _| {
-                let (hex_number, full_block): (String, bool) =
-                    params.parse().map_err(invalid_params)?;
+                let (hex_number, full_block): (String, bool) = params.parse()?;
                 let block = ctx.block_by_number_hex(&hex_number)?;
                 Ok::<_, ErrorObject<'static>>(shape_block(block, full_block))
             })
@@ -427,7 +409,7 @@ async fn setup_mock_rpc_server(
 
         module
             .register_method("eth_getBlockByHash", |params, ctx, _| {
-                let (hash, full_block): (B256, bool) = params.parse().map_err(invalid_params)?;
+                let (hash, full_block): (B256, bool) = params.parse()?;
                 Ok::<_, ErrorObject<'static>>(shape_block(ctx.block_by_hash(hash)?, full_block))
             })
             .unwrap();
@@ -441,21 +423,21 @@ async fn setup_mock_rpc_server(
 
         module
             .register_method("eth_getHeaderByNumber", |params, ctx, _| {
-                let (hex_number,): (String,) = params.parse().map_err(invalid_params)?;
+                let (hex_number,): (String,) = params.parse()?;
                 Ok::<_, ErrorObject<'static>>(ctx.block_by_number_hex(&hex_number)?.header.clone())
             })
             .unwrap();
 
         module
             .register_method("eth_getHeaderByHash", |params, ctx, _| {
-                let (hash,): (B256,) = params.parse().map_err(invalid_params)?;
+                let (hash,): (B256,) = params.parse()?;
                 Ok::<_, ErrorObject<'static>>(ctx.block_by_hash(hash)?.header.clone())
             })
             .unwrap();
 
         module
             .register_method("eth_getCodeByHash", |params, ctx, _| {
-                let (hash,): (B256,) = params.parse().map_err(invalid_params)?;
+                let (hash,): (B256,) = params.parse()?;
 
                 let code = ctx.fixtures.contracts.get(&hash).cloned().unwrap_or_default();
                 Ok::<_, ErrorObject<'static>>(code.original_bytes())
@@ -464,7 +446,7 @@ async fn setup_mock_rpc_server(
 
         module
             .register_method("mega_getBlockWitness", |params, ctx, _| {
-                let (keys,): (WitnessRequestKeys,) = params.parse().map_err(invalid_params)?;
+                let (keys,): (WitnessRequestKeys,) = params.parse()?;
                 let block_hash = BlockHash::from(keys.block_hash.0);
 
                 let salt_witness =
@@ -611,16 +593,9 @@ async fn run_end_block_slice(
     cfg.concurrent_workers = 1;
     cfg.sync_target = Some(max_block_number);
 
-    let result = run_with_signals(
-        client,
-        None,
-        Arc::clone(&validator_db),
-        contract_cache,
-        chain_spec,
-        true,
-        cfg,
-    )
-    .await;
+    let result =
+        run_with_signals(client, None, Arc::clone(&validator_db), contract_cache, chain_spec, cfg)
+            .await;
 
     handle.stop().unwrap();
 

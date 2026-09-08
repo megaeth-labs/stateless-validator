@@ -166,7 +166,6 @@ mod tests {
             post_state_root: B256::from([2u8; 32]),
             post_withdrawals_root: B256::from([3u8; 32]),
         };
-        // The production anchor write path — no test-only shortcut around the helper layer.
         store.reset_to_anchor(&tip).unwrap();
 
         let loaded = ChainStore::get_anchor(&store).unwrap().unwrap();
