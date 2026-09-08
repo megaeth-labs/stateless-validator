@@ -40,7 +40,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy_primitives::{B256, Bytes, U64};
+use alloy_primitives::{B256, Bytes, U64, keccak256};
 use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_client::ClientBuilder;
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag, Header};
@@ -1575,14 +1575,14 @@ fn verify_block_integrity(block: &Block<Transaction>) -> Result<()> {
 
     // Verify transaction hashes and transactions root
     if let BlockTransactions::Full(ref transactions) = block.transactions {
-        // Encode each envelope exactly once: keccak of the encoding is the tx hash, and the
-        // same bytes feed the ordered trie for the transactions-root check.
-        let mut encoded_txs: Vec<Vec<u8>> = Vec::with_capacity(transactions.len());
+        // The RPC `hash` field seeds the envelope's cached hash, so it is only trusted once keccak
+        // of the envelope's own encoding reproduces it; the same bytes then feed the ordered trie
+        // for the transactions-root check.
+        let mut encoded_txs = Vec::with_capacity(transactions.len());
         for tx in transactions {
             let tx_envelope = tx.inner.inner.inner();
-            let mut encoded = Vec::with_capacity(tx_envelope.encode_2718_len());
-            tx_envelope.encode_2718(&mut encoded);
-            let computed_hash = alloy_primitives::keccak256(&encoded);
+            let encoded = tx_envelope.encoded_2718();
+            let computed_hash = keccak256(&encoded);
             ensure!(
                 computed_hash == *tx_envelope.hash(),
                 "Transaction hash mismatch: expected {:?}, computed {:?}",
@@ -1636,7 +1636,10 @@ mod tests {
         find_divergence_point,
         pipeline::{BlockFetcher, DivergenceLookups},
     };
-    use stateless_test_utils::mock_rpc::{header_stub, parse_hex_u64, serve};
+    use stateless_test_utils::{
+        fixtures::TestFixtures,
+        mock_rpc::{header_stub, parse_hex_u64, serve},
+    };
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -2983,5 +2986,31 @@ mod tests {
             }
         }
         assert!(found, "witness failure log must carry the block_number span field, got:\n{logs}");
+    }
+
+    /// The deserializer seeds each envelope's cached hash from the RPC `hash` field, so
+    /// `trie_hash()` reproduces the claim by construction; only keccak over the envelope's own
+    /// encoding can tell a hash that does not belong to the bytes. Forging one hash leaves the
+    /// transactions root intact, so the hash check is the only thing that rejects the block.
+    /// The first transaction is the deposit (`Sealed`) and the last a signed envelope.
+    #[test]
+    fn verify_block_integrity_rejects_a_forged_transaction_hash() {
+        let fx = TestFixtures::mainnet_shared();
+        let block = fx
+            .paired_blocks()
+            .iter()
+            .map(|(_, hash)| &fx.blocks[hash])
+            .find(|block| !block.transactions.is_empty())
+            .expect("a paired mainnet fixture with transactions");
+        verify_block_integrity(block).expect("untampered fixture block verifies");
+
+        let last = block.transactions.len() - 1;
+        for index in [0, last] {
+            let mut json = serde_json::to_value(block).unwrap();
+            json["transactions"][index]["hash"] = serde_json::to_value(B256::ZERO).unwrap();
+            let forged: Block<Transaction> = serde_json::from_value(json).unwrap();
+            let err = verify_block_integrity(&forged).unwrap_err();
+            assert!(err.to_string().contains("Transaction hash mismatch"), "tx {index}: {err:?}");
+        }
     }
 }
