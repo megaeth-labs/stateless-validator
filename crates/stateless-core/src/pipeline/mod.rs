@@ -93,8 +93,8 @@ where
 
         let outcome = chain_advancer(
             &*fetcher,
-            &*store,
-            &*hooks,
+            store.clone(),
+            hooks.clone(),
             &resolver,
             result_rx,
             initial_tip,

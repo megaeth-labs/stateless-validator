@@ -175,7 +175,7 @@ async fn run_advancer(
     tip: BlockMeta,
     rpc_hashes: HashMap<u64, BlockHash>,
     blocks: Vec<AdvancerStep>,
-) -> (Result<PipelineOutcome>, MockStore) {
+) -> (Result<PipelineOutcome>, Arc<MockStore>) {
     run_advancer_with_resolver(tip, rpc_hashes, blocks, &BisectResolver).await
 }
 
@@ -184,10 +184,10 @@ async fn run_advancer_with_resolver<R: ReorgResolver<MockFetcher, MockStore>>(
     rpc_hashes: HashMap<u64, BlockHash>,
     blocks: Vec<AdvancerStep>,
     resolver: &R,
-) -> (Result<PipelineOutcome>, MockStore) {
-    let store = MockStore::new(tip.clone());
+) -> (Result<PipelineOutcome>, Arc<MockStore>) {
+    let store = Arc::new(MockStore::new(tip.clone()));
     let fetcher = MockFetcher { hashes: rpc_hashes };
-    let hooks = NoopHooks;
+    let hooks = Arc::new(NoopHooks);
     let (tx, rx) = kanal::bounded(16);
 
     {
@@ -210,7 +210,8 @@ async fn run_advancer_with_resolver<R: ReorgResolver<MockFetcher, MockStore>>(
     }
 
     let result =
-        chain_advancer(&fetcher, &store, &hooks, resolver, rx, tip, CancellationToken::new()).await;
+        chain_advancer(&fetcher, store.clone(), hooks, resolver, rx, tip, CancellationToken::new())
+            .await;
     (result, store)
 }
 
@@ -274,9 +275,9 @@ impl PipelineHooks for BadBlockHooks {
 /// but specialized — generalizing the original would cascade through ~6 helper types for
 /// a single test case.
 async fn run_bad_block_advancer(tip: BlockMeta, blocks: Vec<BadBlock>) -> Result<PipelineOutcome> {
-    let store = MockStore::new(tip.clone());
+    let store = Arc::new(MockStore::new(tip.clone()));
     let fetcher = MockFetcher { hashes: HashMap::default() };
-    let hooks = BadBlockHooks;
+    let hooks = Arc::new(BadBlockHooks);
     let (tx, rx) = kanal::bounded::<
         std::result::Result<BadBlock, (Arc<dyn std::error::Error + Send + Sync>, ErrorAction)>,
     >(16);
@@ -288,8 +289,55 @@ async fn run_bad_block_advancer(tip: BlockMeta, blocks: Vec<BadBlock>) -> Result
         }
     }
 
-    chain_advancer(&fetcher, &store, &hooks, &BisectResolver, rx, tip, CancellationToken::new())
-        .await
+    chain_advancer(&fetcher, store, hooks, &BisectResolver, rx, tip, CancellationToken::new()).await
+}
+
+/// Hooks whose `pre_advance` panics — the advance step now runs on the blocking pool, and a
+/// panic there arrives as a `JoinError` rather than unwinding this task on its own.
+struct PanickingHooks;
+impl PipelineHooks for PanickingHooks {
+    type Output = MockBlock;
+
+    fn pre_advance(&self, _items: &[Self::Output]) -> Result<()> {
+        panic!("pre_advance exploded");
+    }
+}
+
+/// Moving the advance step onto the blocking pool must not turn a store/hooks panic into an
+/// ordinary `Err` — a corrupted persistence layer has to keep taking the process down exactly
+/// as it did when these calls ran inline. Pins the `try_into_panic` → `resume_unwind` branch.
+#[tokio::test]
+async fn test_chain_advancer_propagates_hook_panics() {
+    let tip = make_tip(10);
+    let store = Arc::new(MockStore::new(tip.clone()));
+    let fetcher = MockFetcher { hashes: HashMap::default() };
+    let hooks = Arc::new(PanickingHooks);
+    let parent = tip.block_hash;
+    let (tx, rx) = kanal::bounded::<
+        std::result::Result<MockBlock, (Arc<dyn std::error::Error + Send + Sync>, ErrorAction)>,
+    >(16);
+    tx.to_async().send(Ok(make_block(11, parent))).await.unwrap();
+
+    // Run it in its own task so the unwind is observable: a `JoinError` that `is_panic()`
+    // means the advancer panicked, an `Ok(Err(..))` would mean it swallowed the panic into
+    // the error channel.
+    let joined = tokio::spawn(async move {
+        chain_advancer(&fetcher, store, hooks, &BisectResolver, rx, tip, CancellationToken::new())
+            .await
+    })
+    .await;
+    let join_err = match joined {
+        Err(e) => e,
+        Ok(outcome) => panic!("a panicking hook must unwind the advancer, got {outcome:?}"),
+    };
+    assert!(join_err.is_panic(), "the advancer must fail by panic, not by JoinError::Cancelled");
+    let payload = join_err.into_panic();
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    assert!(message.contains("pre_advance exploded"), "panic payload preserved: {message}");
 }
 
 /// Covers the `verify_continuity` → Fatal branch in `chain_advancer` (`advancer.rs:109`).
@@ -344,9 +392,9 @@ async fn test_chain_advancer_transient_error_returns_retry_outcome() {
 #[tokio::test]
 async fn test_chain_advancer_shutdown() {
     let tip = make_tip(10);
-    let store = MockStore::new(tip.clone());
+    let store = Arc::new(MockStore::new(tip.clone()));
     let fetcher = MockFetcher { hashes: HashMap::default() };
-    let hooks = NoopHooks;
+    let hooks = Arc::new(NoopHooks);
     let (_tx, rx) = kanal::bounded::<
         std::result::Result<MockBlock, (Arc<dyn std::error::Error + Send + Sync>, ErrorAction)>,
     >(16);
@@ -354,7 +402,7 @@ async fn test_chain_advancer_shutdown() {
     shutdown.cancel();
 
     let outcome =
-        chain_advancer(&fetcher, &store, &hooks, &BisectResolver, rx, tip, shutdown).await.unwrap();
+        chain_advancer(&fetcher, store, hooks, &BisectResolver, rx, tip, shutdown).await.unwrap();
     assert!(matches!(outcome, PipelineOutcome::Shutdown));
 }
 
