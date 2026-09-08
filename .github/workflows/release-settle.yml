@@ -1,0 +1,46 @@
+name: Release Settle
+
+# Propose settling a release candidate. Dispatch from any branch with the
+# version and the full SHA of the release-branch tip; the shared action
+# verifies it, generates release notes from the commits since the previous
+# tag, writes them to the changelog, and opens a settle PR onto the release
+# branch. Merging that PR is the settlement decision (release-publish tags it).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to settle (X.Y.Z)"
+        required: true
+        type: string
+      commit:
+        description: "Full SHA of the release-branch tip being settled"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  settle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: app-token
+        with:
+          client-id: ${{ vars.MEGA_MAXWELL_CLIENT_ID }}
+          private-key: ${{ secrets.MEGA_MAXWELL_PK }}
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: megaeth-labs/.github/.github/actions/release-settle@main
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          version: ${{ inputs.version }}
+          commit: ${{ inputs.commit }}
+          version_file: Cargo.toml
+          version_pattern: toml
+          changelog_file: CHANGELOG.md

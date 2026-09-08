@@ -1,0 +1,44 @@
+name: Release Publish
+
+# Publishes a settled release when its settle PR merges into the release
+# branch: annotated tag at the merge commit (once) and a GitHub Release with
+# the changelog section as notes. Merging the settle PR is the release approval (the
+# `release-*` branch ruleset requires a reviewed PR), so no environment gate
+# is needed; add the CI app as a bypass actor on the `v*` tag ruleset.
+#
+# This file must exist on the release branch (it does, when the branch is cut
+# from a default branch that has it).
+
+on:
+  pull_request:
+    types: [closed]
+    branches: ["release-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: >-
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'chore/release-settle-') &&
+      github.event.pull_request.user.login == 'mega-maxwell[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: app-token
+        with:
+          client-id: ${{ vars.MEGA_MAXWELL_CLIENT_ID }}
+          private-key: ${{ secrets.MEGA_MAXWELL_PK }}
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: megaeth-labs/.github/.github/actions/release-publish@main
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          version_file: Cargo.toml
+          version_pattern: toml
+          changelog_file: CHANGELOG.md
