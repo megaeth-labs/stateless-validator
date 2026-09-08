@@ -234,7 +234,6 @@ impl BlockProcessor for ValidatorProcessor {
                 task.salt_witness,
                 task.mpt_witness,
                 &contracts,
-                None,
             )
         })
         .await
