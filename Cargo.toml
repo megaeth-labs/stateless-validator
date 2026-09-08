@@ -47,13 +47,13 @@ mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", tag = "v1.6.1
 salt = { git = "https://github.com/megaeth-labs/salt.git", tag = "v1.0.5", default-features = false }
 
 # kona (private repo; consumed only by the opt-in `kona` feature of stateless-validator)
-kona-driver = { git = "https://github.com/megaeth-labs/mega-kona.git", branch = "develop", package = "kona-driver", default-features = false }
-kona-executor = { git = "https://github.com/megaeth-labs/mega-kona.git", branch = "develop", package = "kona-executor", default-features = false }
-kona-genesis = { git = "https://github.com/megaeth-labs/mega-kona.git", branch = "develop", package = "kona-genesis", features = ["serde"], default-features = false }
-kona-megaevm = { git = "https://github.com/megaeth-labs/mega-kona.git", branch = "develop", package = "kona-megaevm", default-features = false }
-kona-mpt = { git = "https://github.com/megaeth-labs/mega-kona.git", branch = "develop", package = "kona-mpt", default-features = false }
-kona-proof = { git = "https://github.com/megaeth-labs/mega-kona.git", branch = "develop", package = "kona-proof", default-features = false }
-kona-registry = { git = "https://github.com/megaeth-labs/mega-kona.git", branch = "develop", package = "kona-registry", default-features = false }
+kona-driver = { git = "https://github.com/megaeth-labs/mega-kona.git", rev = "20500dfb6c14fb0ed20ccd2a2a0dab388907c5b6", package = "kona-driver", default-features = false }
+kona-executor = { git = "https://github.com/megaeth-labs/mega-kona.git", rev = "20500dfb6c14fb0ed20ccd2a2a0dab388907c5b6", package = "kona-executor", default-features = false }
+kona-genesis = { git = "https://github.com/megaeth-labs/mega-kona.git", rev = "20500dfb6c14fb0ed20ccd2a2a0dab388907c5b6", package = "kona-genesis", features = ["serde"], default-features = false }
+kona-megaevm = { git = "https://github.com/megaeth-labs/mega-kona.git", rev = "20500dfb6c14fb0ed20ccd2a2a0dab388907c5b6", package = "kona-megaevm", default-features = false }
+kona-mpt = { git = "https://github.com/megaeth-labs/mega-kona.git", rev = "20500dfb6c14fb0ed20ccd2a2a0dab388907c5b6", package = "kona-mpt", default-features = false }
+kona-proof = { git = "https://github.com/megaeth-labs/mega-kona.git", rev = "20500dfb6c14fb0ed20ccd2a2a0dab388907c5b6", package = "kona-proof", default-features = false }
+kona-registry = { git = "https://github.com/megaeth-labs/mega-kona.git", rev = "20500dfb6c14fb0ed20ccd2a2a0dab388907c5b6", package = "kona-registry", default-features = false }
 
 # op
 op-alloy-consensus = { version = "0.18.12", default-features = false }
