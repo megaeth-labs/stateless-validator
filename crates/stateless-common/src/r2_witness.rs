@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use alloy_primitives::B256;
 use stateless_r2::{
-    fetch::{CfAccessCredentials, FetchTimeouts, R2GetError, R2ObjectFetcher, RetryPacing},
+    fetch::{CfAccessCredentials, FetchTimeouts, R2GetError, R2ObjectFetcher},
     keys,
 };
 use tokio::task::JoinError;
@@ -129,12 +129,6 @@ pub struct R2WitnessTransport {
     max_concurrent_requests: Option<usize>,
 }
 
-/// The fetcher's pacing view of a [`BackoffPolicy`] — the adapter-layer conversion that
-/// keeps `stateless-r2` free of a dependency on this workspace's backoff type.
-fn pacing(backoff: &BackoffPolicy) -> RetryPacing {
-    RetryPacing { initial: backoff.initial, max: backoff.max }
-}
-
 impl R2WitnessTransport {
     /// Builds a transport from an R2 endpoint origin, bucket, and bucket-scoped S3
     /// credentials.
@@ -158,7 +152,7 @@ impl R2WitnessTransport {
             access_key_id,
             secret_access_key,
             timeouts,
-            pacing(&retry_backoff),
+            retry_backoff,
             max_concurrent_requests,
         )
         .map_err(|e| eyre::eyre!(e))?;
@@ -183,7 +177,7 @@ impl R2WitnessTransport {
             domain,
             access,
             timeouts,
-            pacing(&retry_backoff),
+            retry_backoff,
             max_concurrent_requests,
             connections,
         )

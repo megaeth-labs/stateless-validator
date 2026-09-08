@@ -30,16 +30,10 @@
 //! The module integrates with the Salt witness system for state reconstruction
 //! and uses Revm for transaction execution.
 
-#[cfg(feature = "std")]
-use std::time::Instant;
 use std::{boxed::Box, collections::BTreeMap, fmt::Debug, vec::Vec};
 
 use alloy_consensus::{TxReceipt, proofs::calculate_receipt_root, transaction::Recovered};
-use alloy_eips::eip2718::Encodable2718;
-use alloy_evm::{
-    EvmEnv,
-    block::{BlockExecutor, ExecutableTx},
-};
+use alloy_evm::{EvmEnv, block::BlockExecutor};
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{
     Address, Bloom, keccak256,
@@ -486,9 +480,32 @@ where
     let BlockExecutionEnv { evm_env, executor_factory, ctx: execution_context } =
         create_block_execution_env(chain_spec, header, env_oracle);
 
-    let executor = executor_factory.create_executor(&mut state, execution_context, evm_env);
-    let (receipts_root, logs_bloom, gas_used) =
-        execute_transactions(executor, block.txs_recovered())?;
+    let mut executor = executor_factory.create_executor(&mut state, execution_context, evm_env);
+    executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
+    for recovered_tx in block.txs_recovered() {
+        executor.execute_transaction(recovered_tx).map_err(ValidationError::BlockReplayFailed)?;
+    }
+    let execution_result =
+        executor.apply_post_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
+
+    // Compute logs bloom by ORing all receipt blooms together
+    let logs_bloom =
+        execution_result.receipts.iter().fold(Bloom::ZERO, |acc, receipt| acc | receipt.bloom());
+
+    // `BlockExecutionResult::gas_used` is defined by mega-evm's `finish()` as
+    // `receipts.last().cumulative_gas_used()` — the exact expression the header check
+    // read before switching to this field, so the two cannot disagree regardless of how
+    // system transactions are accounted. The assertion pins that upstream definition: a
+    // future mega-evm that accounts gas outside the receipt chain fails loudly in every
+    // debug/test run instead of silently changing the header check.
+    let gas_used = execution_result.gas_used;
+    debug_assert_eq!(
+        gas_used,
+        execution_result.receipts.last().map(|r| r.cumulative_gas_used()).unwrap_or(0),
+        "mega-evm gas_used no longer equals the last receipt's cumulative gas"
+    );
+
+    let receipts_root = calculate_receipt_root(&execution_result.receipts);
 
     // Merge transitions into bundle_state
     state.merge_transitions(BundleRetention::PlainState);
@@ -520,48 +537,6 @@ where
             state_writes,
         },
     ))
-}
-
-/// Executes a stream of recovered transactions using the given block executor.
-fn execute_transactions<'a, E, I>(
-    mut executor: E,
-    transactions: I,
-) -> Result<(B256, Bloom, u64), ValidationError>
-where
-    E: BlockExecutor<Transaction = OpTxEnvelope>,
-    E::Receipt: Encodable2718 + TxReceipt,
-    I: Iterator<Item = Recovered<&'a OpTxEnvelope>>,
-    for<'b> Recovered<&'b OpTxEnvelope>: ExecutableTx<E>,
-{
-    executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
-
-    for recovered_tx in transactions {
-        executor.execute_transaction(recovered_tx).map_err(ValidationError::BlockReplayFailed)?;
-    }
-
-    let execution_result =
-        executor.apply_post_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
-
-    // Compute logs bloom by ORing all receipt blooms together
-    let logs_bloom =
-        execution_result.receipts.iter().fold(Bloom::ZERO, |acc, receipt| acc | receipt.bloom());
-
-    // `BlockExecutionResult::gas_used` is defined by mega-evm's `finish()` as
-    // `receipts.last().cumulative_gas_used()` — the exact expression the header check
-    // read before switching to this field, so the two cannot disagree regardless of how
-    // system transactions are accounted. The assertion pins that upstream definition: a
-    // future mega-evm that accounts gas outside the receipt chain fails loudly in every
-    // debug/test run instead of silently changing the header check.
-    let gas_used = execution_result.gas_used;
-    debug_assert_eq!(
-        gas_used,
-        execution_result.receipts.last().map(|r| r.cumulative_gas_used()).unwrap_or(0),
-        "mega-evm gas_used no longer equals the last receipt's cumulative gas"
-    );
-
-    let receipts_root = calculate_receipt_root(&execution_result.receipts);
-
-    Ok((receipts_root, logs_bloom, gas_used))
 }
 
 /// Extracts the withdrawal-contract storage updates (only changed slots) from the replayed
@@ -696,7 +671,7 @@ fn verify_replay_outputs(
 /// measured"). On error the elapsed time is discarded with the stage's result.
 fn timed<T, E>(f: impl FnOnce() -> Result<T, E>) -> Result<(T, f64), E> {
     #[cfg(feature = "std")]
-    let start = Instant::now();
+    let start = std::time::Instant::now();
     let result = f()?;
     #[cfg(feature = "std")]
     let elapsed = start.elapsed().as_secs_f64();

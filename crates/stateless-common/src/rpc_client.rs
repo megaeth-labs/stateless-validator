@@ -52,44 +52,15 @@ use revm::state::Bytecode;
 use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
 use stateless_core::{LightWitness, withdrawals::MptWitness};
-use stateless_r2::fetch::{BackoffSchedule, RetryPacing};
 use tokio::sync::Semaphore;
 use tracing::{instrument, trace, warn};
 
 use crate::{
+    BackoffPolicy,
     metrics::{RpcAttemptOutcome, RpcMethod, RpcMetrics},
     witness_encoding::{decode_witness_response, decode_witness_response_light},
     witness_size::WitnessSizeBreakdown,
 };
-
-/// Exponential-backoff policy used by [`RpcClient`]'s round-level retry loop.
-///
-/// `initial` is the first sleep duration; each round doubles it up to `max`. The loop
-/// itself lives in [`round_robin_with_backoff`]; this type only describes the sleep
-/// schedule, which it steps through [`Self::schedule`].
-#[derive(Debug, Clone)]
-pub struct BackoffPolicy {
-    /// First retry sleep. Each subsequent retry doubles up to `max`.
-    pub initial: Duration,
-    /// Upper bound on any single retry sleep.
-    pub max: Duration,
-}
-
-impl BackoffPolicy {
-    /// Creates a new policy with the given `initial` and `max` sleep durations.
-    pub const fn new(initial: Duration, max: Duration) -> Self {
-        Self { initial, max }
-    }
-
-    /// Starts executing the schedule from `initial`.
-    ///
-    /// The schedule itself lives in `stateless-r2` next to [`RetryPacing`], the pacing pair
-    /// its GET loop steps: that crate must stay free of upward dependencies, so it is the
-    /// only home both retry loops can reach.
-    pub fn schedule(&self) -> BackoffSchedule {
-        RetryPacing { initial: self.initial, max: self.max }.schedule()
-    }
-}
 
 /// Error returned by the `_with_deadline` RPC methods when a caller-supplied
 /// deadline elapses before any provider succeeds.
@@ -428,6 +399,11 @@ impl RpcClient {
     /// Returns the number of configured witness endpoints.
     pub fn witness_provider_count(&self) -> usize {
         self.witness_providers.len()
+    }
+
+    /// Returns whether a validation report endpoint is configured.
+    pub fn reports_validation(&self) -> bool {
+        self.report_provider.is_some()
     }
 
     /// Returns the credential-stripped `{idx}:{host}` metric/log label of the witness
