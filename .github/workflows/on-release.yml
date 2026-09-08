@@ -1,0 +1,71 @@
+name: On Release
+
+# Publish target for a stateless-validator release: the two binaries as
+# downloads on the GitHub Release page, with a SHA256SUMS file. Runs when the
+# release pipeline publishes the Release (release-publish creates it after
+# the tag), and on demand for a rehearsal on a tag ref:
+#   gh workflow run on-release.yml --ref vX.Y.Z -f dry_run=true
+# The tag being released is always the run's own ref; there is no tag input.
+#
+# The internal archive to Artifact Registry stays in release.yaml and
+# release-tracing.yaml, which the same tag push fires.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and checksum everything; attach nothing"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ github.ref_name }}
+  # A release event is never a dry run; a dispatch defaults to one.
+  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+
+jobs:
+  binaries:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write # release-assets attaches to the Release
+    steps:
+      - name: Require a tag ref
+        run: |
+          [[ "$GITHUB_REF_TYPE" == "tag" ]] || { echo "::error::this workflow publishes the run's own ref, which must be a tag (got $GITHUB_REF_TYPE $GITHUB_REF_NAME); dispatch it with --ref vX.Y.Z"; exit 1; }
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+
+      - uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a # v1
+
+      - name: Build
+        run: cargo build --release --locked --bin stateless-validator --bin debug-trace-server
+
+      - name: Report binary versions
+        # Informational: stateless-validator's CLI does not carry a clap
+        # version, so this cannot be a gate the way it is for mega-evme.
+        run: |
+          for b in stateless-validator debug-trace-server; do
+            echo "$b: $(target/release/$b --version 2>/dev/null || echo '<no --version>')  ($(stat -c %s target/release/$b) bytes)"
+          done
+
+      - uses: megaeth-labs/.github/.github/actions/release-assets@main
+        with:
+          tag: ${{ env.TAG }}
+          files: |
+            target/release/stateless-validator
+            target/release/debug-trace-server
+          dry_run: ${{ env.DRY_RUN }}
