@@ -15,7 +15,7 @@ use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::Block
 use stateless_db::ContractCache;
 use tracing::{info, warn};
 
-use crate::{metrics, r2_witness::R2WitnessClient, validator_db::ValidatorDB, workers};
+use crate::{metrics, r2_witness::R2WitnessClient, runner, validator_db::ValidatorDB};
 
 /// Where the validator sources witnesses from.
 #[derive(ValueEnum, Clone, Debug, PartialEq, Eq, Default)]
@@ -291,7 +291,7 @@ pub struct CommandLineArgs {
 ///
 /// Parses CLI args, initializes tracing and metrics, constructs the RPC client and
 /// validator DB, loads or initializes the chain spec + anchor, then hands off to
-/// [`workers::run_with_signals`].
+/// [`runner::run_with_signals`].
 pub async fn run() -> Result<()> {
     let args = CommandLineArgs::parse();
     let _log_guard = args.log.init_tracing()?;
@@ -356,7 +356,7 @@ pub async fn run() -> Result<()> {
                     .r2_connect_timeout_ms
                     .map_or(stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT, Duration::from_millis),
             };
-            let transport = build_r2_transport(&args, timeouts, rpc_config.rpc_retry.clone())?;
+            let transport = build_r2_transport(&args, timeouts, rpc_config.rpc_retry)?;
             Some(Arc::new(R2WitnessClient::new(transport)))
         }
     };
@@ -392,14 +392,8 @@ pub async fn run() -> Result<()> {
         // surfaces as "no forward progress" rather than an arbitrarily bounded retry error.
         let header = client.get_header(BlockId::Hash(block_hash.into()), true).await;
 
-        let anchor = BlockMeta {
-            block_number: header.number,
-            block_hash: header.hash,
-            post_state_root: header.state_root,
-            post_withdrawals_root: header
-                .withdrawals_root
-                .ok_or_else(|| eyre::eyre!("Block {} is missing withdrawals_root", block_hash))?,
-        };
+        let anchor = BlockMeta::try_from_header(&header)
+            .ok_or_else(|| eyre::eyre!("Block {} is missing withdrawals_root", block_hash))?;
         validator_db.reset_to_anchor(&anchor)?;
 
         info!(
@@ -434,13 +428,12 @@ pub async fn run() -> Result<()> {
         info!(end_block = end, "Validating up to end block, then stopping");
     }
 
-    let result = workers::run_with_signals(
+    let result = runner::run_with_signals(
         client,
         r2_witness,
         validator_db,
         contract_cache,
         chain_spec,
-        args.report_validation_endpoint,
         pipeline_config,
     )
     .await;

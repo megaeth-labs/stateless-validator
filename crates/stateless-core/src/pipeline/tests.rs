@@ -2,7 +2,6 @@ use std::{sync::Arc, time::Duration};
 
 use alloy_primitives::{B256, BlockHash, BlockNumber, map::HashMap};
 use eyre::{Result, anyhow};
-use revm::state::Bytecode;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -79,15 +78,6 @@ impl MockStore {
         let mut chain = std::collections::BTreeMap::new();
         chain.insert(anchor.block_number, anchor.clone());
         Self { chain: std::sync::Mutex::new(chain), anchor }
-    }
-}
-
-impl crate::ContractStore for MockStore {
-    fn get_contracts(&self, _: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
-        Ok((HashMap::default(), vec![]))
-    }
-    fn add_contracts(&self, _: &[(B256, Bytecode)]) -> StoreResult<()> {
-        Ok(())
     }
 }
 

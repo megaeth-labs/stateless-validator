@@ -56,30 +56,11 @@ use tokio::sync::Semaphore;
 use tracing::{instrument, trace, warn};
 
 use crate::{
+    BackoffPolicy,
     metrics::{RpcAttemptOutcome, RpcMethod, RpcMetrics},
     witness_encoding::{decode_witness_response, decode_witness_response_light},
     witness_size::WitnessSizeBreakdown,
 };
-
-/// Exponential-backoff policy used by [`RpcClient`]'s round-level retry loop.
-///
-/// `initial` is the first sleep duration; each round doubles it up to `max`.
-/// The loop itself lives in [`round_robin_with_backoff`]; this type only describes
-/// the sleep schedule.
-#[derive(Debug, Clone)]
-pub struct BackoffPolicy {
-    /// First retry sleep. Each subsequent retry doubles up to `max`.
-    pub initial: Duration,
-    /// Upper bound on any single retry sleep.
-    pub max: Duration,
-}
-
-impl BackoffPolicy {
-    /// Creates a new policy with the given `initial` and `max` sleep durations.
-    pub const fn new(initial: Duration, max: Duration) -> Self {
-        Self { initial, max }
-    }
-}
 
 /// Error returned by the `_with_deadline` RPC methods when a caller-supplied
 /// deadline elapses before any provider succeeds.
@@ -418,6 +399,11 @@ impl RpcClient {
     /// Returns the number of configured witness endpoints.
     pub fn witness_provider_count(&self) -> usize {
         self.witness_providers.len()
+    }
+
+    /// Returns whether a validation report endpoint is configured.
+    pub fn reports_validation(&self) -> bool {
+        self.report_provider.is_some()
     }
 
     /// Returns the credential-stripped `{idx}:{host}` metric/log label of the witness
@@ -1151,9 +1137,7 @@ where
     const WARN_AT_ROUND: u32 = 3;
 
     let n = providers.len();
-    let max_backoff_ms = policy.max.as_millis() as u64;
-    let initial_backoff_ms = policy.initial.as_millis() as u64;
-    let mut round_backoff_ms = initial_backoff_ms;
+    let mut backoff = policy.schedule();
     let mut round = 0u32;
     let call_start = Instant::now();
     // Records the logical-call deadline give-up (once) and builds the typed error. Called
@@ -1393,11 +1377,7 @@ where
         // `last_err` is always `Some` here: `n >= 1` is enforced by the `RpcClient`
         // constructor and we only reach this point after `n` iterations that each set it.
         let last_err = last_err.expect("last_err set when every provider failed this round");
-        let jitter_ms = fastrand::u64(0..=round_backoff_ms / 2);
-        // `.max(1)` prevents a hot-spin loop if a caller constructs a zero-backoff policy
-        // (`BackoffPolicy::new(Duration::ZERO, Duration::ZERO)`): the computed sleep would
-        // otherwise be `0` and the retry loop would busy-wait on every round.
-        let mut sleep_ms = (round_backoff_ms + jitter_ms).min(max_backoff_ms).max(1);
+        let mut sleep_ms = backoff.next_sleep_ms();
         // Clamp the sleep so it doesn't overshoot the caller's deadline — if no time is
         // left we bail immediately rather than sleeping past the deadline and then bailing.
         if let Some(d) = deadline {
@@ -1419,7 +1399,6 @@ where
             "All providers failed this round, backing off",
         );
         tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
-        round_backoff_ms = (round_backoff_ms * 2).min(max_backoff_ms);
         round += 1;
     }
 }

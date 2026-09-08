@@ -61,7 +61,7 @@ use revm::{
         State,
         states::{BundleAccount, StateBuilder, bundle_state::BundleRetention},
     },
-    primitives::{B256, KECCAK_EMPTY, U256},
+    primitives::{B256, KECCAK_EMPTY, U256, eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN},
     state::Bytecode,
 };
 use salt::{EphemeralSaltState, SaltValue, SaltWitness, StateRoot, StateUpdates, Witness};
@@ -69,7 +69,7 @@ use thiserror::Error;
 use tracing::debug;
 
 use crate::{
-    chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec},
+    chain_spec::ChainSpec,
     data_types::{Account, PlainKey, PlainValue},
     evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv},
     withdrawals::{self, ADDRESS_L2_TO_L1_MESSAGE_PASSER, MptWitness},
@@ -263,10 +263,6 @@ impl ValidationOptions {
 /// - Chain configuration with appropriate spec ID for the block number
 /// - Block environment with gas limits, timestamps, and fee parameters
 /// - Blob gas pricing if excess blob gas is present in the header
-///
-/// Creates an EVM environment from a block header and chain specification.
-///
-/// This function sets up the configuration and block environment needed for EVM execution.
 pub fn create_evm_env(
     header: &alloy_consensus::Header,
     chain_spec: &ChainSpec,
@@ -286,7 +282,8 @@ pub fn create_evm_env(
     };
 
     if let Some(excess_blob_gas) = header.excess_blob_gas {
-        block_env.set_blob_excess_gas_and_price(excess_blob_gas, BLOB_GASPRICE_UPDATE_FRACTION);
+        block_env
+            .set_blob_excess_gas_and_price(excess_blob_gas, BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN);
     }
 
     EvmEnv::new(cfg_env, block_env)

@@ -853,7 +853,7 @@ async fn main() -> Result<()> {
         .rpc_per_attempt_timeout_ms
         .map(std::time::Duration::from_millis)
         .unwrap_or(rpc_defaults.per_attempt_timeout);
-    let rpc_retry = rpc_defaults.rpc_retry.clone();
+    let rpc_retry = rpc_defaults.rpc_retry;
     let rpc_config = RpcClientConfig {
         data_max_concurrent_requests: args.data_max_concurrent_requests,
         witness_max_concurrent_requests: args.witness_max_concurrent_requests,
@@ -1264,14 +1264,8 @@ async fn init_validator_db(
         rpc_client.get_header(BlockId::latest(), false).await
     };
 
-    let anchor = BlockMeta {
-        block_number: header.number,
-        block_hash: header.hash,
-        post_state_root: header.state_root,
-        post_withdrawals_root: header
-            .withdrawals_root
-            .ok_or_else(|| eyre::eyre!("Block {} is missing withdrawals_root", header.hash))?,
-    };
+    let anchor = BlockMeta::try_from_header(&header)
+        .ok_or_else(|| eyre::eyre!("Block {} is missing withdrawals_root", header.hash))?;
     ChainStore::reset_to_anchor(&*db, &anchor)
         .map_err(|e| eyre::eyre!("Failed to reset anchor: {}", e))?;
 

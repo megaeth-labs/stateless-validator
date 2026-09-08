@@ -308,15 +308,6 @@ pub(crate) mod test_support {
         pub tip_reads: AtomicUsize,
     }
 
-    impl ContractStore for StubBlockStore {
-        fn get_contracts(&self, _: &[B256]) -> StoreResult<(HashMap<B256, Bytecode>, Vec<B256>)> {
-            Ok((HashMap::default(), vec![]))
-        }
-        fn add_contracts(&self, _: &[(B256, Bytecode)]) -> StoreResult<()> {
-            Ok(())
-        }
-    }
-
     impl ChainStore for StubBlockStore {
         fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>> {
             self.tip_reads.fetch_add(1, Ordering::Relaxed);

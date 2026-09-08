@@ -15,9 +15,6 @@ use mega_evm::{
 use reth_ethereum_forks::ChainHardforks;
 use reth_optimism_chainspec::OpChainSpec;
 
-/// Default blob gas price update fraction for Cancun (from EIP-4844)
-pub const BLOB_GASPRICE_UPDATE_FRACTION: u64 = 3338477;
-
 /// Chain specification for the Optimism network.
 ///
 /// Defines when various Ethereum and Optimism hardforks are activated.
@@ -74,10 +71,8 @@ impl ChainSpec {
     /// Ordering rules:
     /// - [`OpChainSpec`] already yields Optimism/Ethereum hardforks in the correct order, so they
     ///   do not require reordering.
-    /// - MegaETH hardforks are extracted from the genesis `extra_fields` and explicitly ordered to
-    ///   match the canonical sequence defined by [`mega_mainnet_hardforks()`]. Any remaining,
-    ///   unknown MegaETH hardforks are preserved and appended after the known ones so nothing is
-    ///   dropped.
+    /// - MegaETH hardforks are extracted from the genesis `extra_fields`;
+    ///   [`MegaethGenesisHardforks::into_vec`] yields them in canonical activation order.
     /// - The MegaETH set is then merged with the Optimism/Ethereum set to build a single
     ///   [`ChainHardforks`] that drives fork activation.
     ///
@@ -120,7 +115,7 @@ impl ChainSpec {
             );
         }
 
-        let mut megaeth_hardforks = megaeth_hardforks.into_vec();
+        let megaeth_hardforks = megaeth_hardforks.into_vec();
 
         // Rex5 SequencerRegistry bootstrap, required iff `rex5Time` is scheduled. Parsed from
         // the same flat schema mega-reth uses (`rex5InitialSequencer` / `rex5InitialAdmin` as
@@ -167,20 +162,9 @@ impl ChainSpec {
             .map(|(f, b)| (dyn_clone::clone_box(f), b))
             .collect();
 
-        let hardfork_order = mega_mainnet_hardforks();
-        let mut all_hardforks = Vec::with_capacity(op_hardforks.len() + megaeth_hardforks.len());
-        for (order, _) in hardfork_order.forks_iter() {
-            if let Some(mega_hardfork_index) =
-                megaeth_hardforks.iter().position(|(hardfork, _)| **hardfork == *order)
-            {
-                all_hardforks.push(megaeth_hardforks.remove(mega_hardfork_index));
-            }
-        }
-
-        // append the remaining unknown hardforks to ensure we don't filter any out
-        all_hardforks.append(&mut megaeth_hardforks);
-
-        // we merge megaeth_hardforks with op_hardforks
+        // `into_vec` yields the MegaETH hardforks already in canonical activation order,
+        // so the merge is a straight concatenation.
+        let mut all_hardforks = megaeth_hardforks;
         all_hardforks.append(&mut op_hardforks);
 
         Self {
@@ -227,6 +211,14 @@ impl MegaethGenesisHardforks {
     }
 
     /// Convert the MegaETH genesis hardforks into a vector of hardforks and their conditions.
+    ///
+    /// Fork selection never reads this order: mega-evm resolves the active fork through
+    /// [`MegaHardforks::mega_fork_activation`], a name-keyed lookup on [`ChainHardforks`], so
+    /// insertion order cannot change which hardfork params a block gets. What the literal
+    /// must agree with is mega-evm's own [`MegaHardfork`] declaration, in membership and
+    /// order: the chain-spec tests pin it against `MegaHardfork::VARIANTS`, so a fork the
+    /// pinned mega-evm supports cannot go unscheduled unnoticed. Add a new fork here at its
+    /// declaration position, with its genesis field above.
     pub fn into_vec(self) -> Vec<(Box<dyn Hardfork>, ForkCondition)> {
         vec![
             (MegaHardfork::MiniRex.boxed(), self.mini_rex_time.map(ForkCondition::Timestamp)),
@@ -303,25 +295,12 @@ impl MegaethGenesisSequencerRegistryRex6Config {
     }
 }
 
-/// Build a fresh `ChainHardforks` describing MegaETH's canonical hardfork sequence.
-pub fn mega_mainnet_hardforks() -> ChainHardforks {
-    ChainHardforks::new(vec![
-        (MegaHardfork::MiniRex.boxed(), ForkCondition::Timestamp(0)),
-        (MegaHardfork::MiniRex1.boxed(), ForkCondition::Timestamp(0)),
-        (MegaHardfork::MiniRex2.boxed(), ForkCondition::Timestamp(0)),
-        (MegaHardfork::Rex.boxed(), ForkCondition::Timestamp(0)),
-        (MegaHardfork::Rex1.boxed(), ForkCondition::Timestamp(0)),
-        (MegaHardfork::Rex2.boxed(), ForkCondition::Timestamp(0)),
-        (MegaHardfork::Rex3.boxed(), ForkCondition::Timestamp(0)),
-        (MegaHardfork::Rex4.boxed(), ForkCondition::Timestamp(0)),
-        (MegaHardfork::Rex5.boxed(), ForkCondition::Timestamp(0)),
-        (MegaHardfork::Rex6.boxed(), ForkCondition::Timestamp(0)),
-    ])
-}
-
 #[cfg(test)]
 mod tests {
-    use std::string::ToString;
+    use std::{
+        format,
+        string::{String, ToString},
+    };
 
     use alloy_serde::OtherFields;
 
@@ -380,6 +359,56 @@ mod tests {
         assert_eq!(spec.hardforks.fork(OpHardfork::Holocene), ForkCondition::Timestamp(3));
         assert_eq!(spec.hardforks.fork(OpHardfork::Isthmus), ForkCondition::Timestamp(6));
         assert_eq!(spec.hardforks.fork(MegaHardfork::MiniRex), ForkCondition::Timestamp(3));
+    }
+
+    /// Pins [`MegaethGenesisHardforks::into_vec`], end-to-end through `from_genesis`, against
+    /// mega-evm's own `MegaHardfork` declaration: every variant the pinned mega-evm declares
+    /// comes out scheduled, in declaration order. A variant `into_vec` lacks, duplicates, or
+    /// misplaces fails here, whichever end of the ladder it sits at.
+    #[test]
+    fn test_mega_hardforks_iterate_in_activation_order() {
+        let mut genesis = Genesis::default();
+        for (index, fork) in MegaHardfork::VARIANTS.iter().enumerate() {
+            let activation = index as u64 + 1;
+            if *fork == MegaHardfork::Rex5 {
+                // `from_genesis` refuses a scheduled Rex5 without its bootstrap seeds.
+                schedule_valid_rex5(&mut genesis, activation);
+            } else {
+                genesis
+                    .config
+                    .extra_fields
+                    .insert_value(genesis_time_field(*fork), activation)
+                    .unwrap();
+            }
+        }
+        // Likewise required alongside `rex6Time`.
+        genesis.config.extra_fields.insert_value("rex6MinRotationDelay".to_string(), 7200).unwrap();
+        let spec = ChainSpec::from_genesis(genesis);
+
+        let expected: Vec<&str> = MegaHardfork::VARIANTS.iter().map(|fork| fork.name()).collect();
+        // `expected` is the complete MegaETH membership, so filtering by it drops only the
+        // Optimism/Ethereum forks `from_genesis` merges in after the MegaETH ones; a MegaETH
+        // fork `into_vec` omits is missing from `mega_order`, not filtered out of it.
+        let mega_order: Vec<&str> = spec
+            .hardforks
+            .forks_iter()
+            .map(|(hardfork, _)| hardfork.name())
+            .filter(|name| expected.contains(name))
+            .collect();
+        assert_eq!(
+            mega_order, expected,
+            "the scheduled MegaETH forks must match mega-evm's `MegaHardfork` declaration \
+             exactly, in order — a new variant needs its `MegaethGenesisHardforks` field and \
+             its `into_vec` entry at the declaration position; fix those, not this test"
+        );
+    }
+
+    /// The genesis `config` field that schedules `fork`, under the naming every MegaETH fork
+    /// follows: the variant name with its first letter lowercased, plus `Time`
+    /// (`MiniRex1` → `miniRex1Time`).
+    fn genesis_time_field(fork: MegaHardfork) -> String {
+        let (head, tail) = fork.name().split_at(1);
+        format!("{}{tail}Time", head.to_ascii_lowercase())
     }
 
     #[test]
@@ -668,49 +697,44 @@ mod tests {
         let _ = ChainSpec::from_genesis(genesis);
     }
 
-    /// Every fork in the canonical [`mega_mainnet_hardforks()`] ladder must be scheduled by
+    /// Every fork the pinned mega-evm declares (`MegaHardfork::VARIANTS`) must be scheduled by
     /// the shipped mainnet genesis file, minus an explicit not-yet-scheduled allowlist.
     ///
     /// The schema tests above all run on synthetic genesis JSON, so none of them can notice
     /// the shipped data file missing a fork — the shape of a real production failure: the
     /// pinned mega-evm already supports the fork, genesis never schedules it, chain-spec
     /// loading stays green, and every block past the activation timestamp fails to replay.
-    /// A fork added to the ladder without its genesis field fails here at test time instead
-    /// of at the activation boundary.
+    /// A mega-evm bump that brings a new fork without its genesis field fails here at test
+    /// time instead of at the activation boundary.
     #[cfg(feature = "std")]
     #[test]
     fn mainnet_genesis_schedules_every_canonical_hardfork() {
         use stateless_test_utils::fixtures::TestFixtures;
 
-        // Ladder forks mainnet has deliberately not scheduled yet — empty today, every fork
-        // through Rex6 is live. An entry here must actually be unscheduled: once its genesis
-        // field lands, the assertion below demands the entry's removal, so the allowlist
-        // cannot rot into shadowing the check.
-        const NOT_YET_SCHEDULED: &[&str] = &[];
+        // Forks mainnet has deliberately not scheduled yet — empty today, every fork through
+        // Rex6 is live. An entry here must actually be unscheduled: once its genesis field
+        // lands, the assertion below demands the entry's removal, so the allowlist cannot rot
+        // into shadowing the check.
+        const NOT_YET_SCHEDULED: &[MegaHardfork] = &[];
 
         let genesis = TestFixtures::mainnet_shared().load_genesis().expect("mainnet genesis");
         let spec = ChainSpec::from_genesis(genesis);
-        let scheduled: Vec<(&str, ForkCondition)> =
-            spec.hardforks.forks_iter().map(|(fork, condition)| (fork.name(), condition)).collect();
 
-        let ladder = mega_mainnet_hardforks();
-        for (fork, _) in ladder.forks_iter() {
-            let activation =
-                scheduled.iter().find(|(name, _)| *name == fork.name()).map(|(_, c)| *c);
-            if NOT_YET_SCHEDULED.contains(&fork.name()) {
+        for fork in MegaHardfork::VARIANTS {
+            // The same name-keyed lookup fork selection resolves through at runtime.
+            let activation = spec.hardforks.fork(*fork);
+            if NOT_YET_SCHEDULED.contains(fork) {
                 assert_eq!(
                     activation,
-                    None,
-                    "{} is scheduled now — remove it from NOT_YET_SCHEDULED",
-                    fork.name()
+                    ForkCondition::Never,
+                    "{fork} is scheduled now — remove it from NOT_YET_SCHEDULED"
                 );
             } else {
                 assert!(
-                    matches!(activation, Some(ForkCondition::Timestamp(_))),
-                    "mainnet genesis does not schedule {} (activation: {activation:?}); add \
+                    matches!(activation, ForkCondition::Timestamp(_)),
+                    "mainnet genesis does not schedule {fork} (activation: {activation:?}); add \
                      its genesis field, or allowlist it in NOT_YET_SCHEDULED if it is \
-                     genuinely not scheduled yet",
-                    fork.name()
+                     genuinely not scheduled yet"
                 );
             }
         }
