@@ -8,6 +8,11 @@ name: Release Publish
 #
 # This file must exist on the release branch (it does, when the branch is cut
 # from a default branch that has it).
+#
+# Only settlement by PR reaches this workflow. release-settle.yml settles
+# directly (`settle_mode: direct`, gated by the `release` environment) and
+# publishes from its own job, so nothing here fires unless this repo goes
+# back to PR mode; the job gate rejects any settle PR the app did not open.
 
 on:
   pull_request:
