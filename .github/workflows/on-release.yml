@@ -20,8 +20,12 @@ name: On Release
 # same bytes:
 #   assets   — both binaries + SHA256SUMS as downloads on the Release page
 #   registry — both binaries to the MegaETH Artifact Registry (generic repo
-#              megaeth-generic-registry: <binary>/<X.Y.Z>/<binary>), which
-#              replaces the former release.yaml / release-tracing.yaml
+#              megaeth-generic-registry), replacing the former release.yaml /
+#              release-tracing.yaml. The layout is the one deployment reads:
+#              release-info pins <artifact>/<commit>/<profile>/<version> and
+#              the Ansible role downloads exactly that path, so the package
+#              version is the commit SHA and the file sits under
+#              release/vX.Y.Z/ — <binary>/<sha>/release/vX.Y.Z/<binary>.
 #
 # GCP_AUTH_KEY lives in the `publish` environment, whose deployment policy
 # allows only v* tag refs: a job can read it only when the run's ref is a
@@ -147,7 +151,8 @@ jobs:
           location: asia-northeast1
           repository: megaeth-generic-registry
           package: stateless-validator
-          version: ${{ env.TAG }}
+          version: ${{ github.sha }}
+          path: release/${{ env.TAG }}
           dry_run: ${{ env.DRY_RUN }}
 
       - uses: megaeth-labs/.github/.github/actions/release-upload-artifact@main
@@ -159,7 +164,8 @@ jobs:
           location: asia-northeast1
           repository: megaeth-generic-registry
           package: debug-trace-server
-          version: ${{ env.TAG }}
+          version: ${{ github.sha }}
+          path: release/${{ env.TAG }}
           dry_run: ${{ env.DRY_RUN }}
 
       - run: |
