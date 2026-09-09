@@ -16,8 +16,16 @@ name: On Release
 # run; release-settle warns when the tip lacks a workflow main has.
 # A rehearsal likewise only works on a tag whose tree has this file.
 #
-# The internal archive to Artifact Registry stays in release.yaml and
-# release-tracing.yaml, which the same tag push fires.
+# Targets, fed by one build so the Release page and the registry carry the
+# same bytes:
+#   assets   — both binaries + SHA256SUMS as downloads on the Release page
+#   registry — both binaries to the MegaETH Artifact Registry (generic repo
+#              megaeth-generic-registry: <binary>/<X.Y.Z>/<binary>), which
+#              replaces the former release.yaml / release-tracing.yaml
+#
+# GCP_AUTH_KEY lives in the `publish` environment, whose deployment policy
+# allows only v* tag refs: a job can read it only when the run's ref is a
+# release tag, never from a branch build.
 
 on:
   release:
@@ -46,11 +54,9 @@ env:
   DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
 
 jobs:
-  binaries:
+  build:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    permissions:
-      contents: write # release-assets attaches to the Release
     steps:
       - name: Require a tag ref
         run: |
@@ -88,6 +94,27 @@ jobs:
           version: ${{ env.TAG }}
           dry_run: ${{ env.DRY_RUN }}
 
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: binaries
+          path: |
+            target/release/stateless-validator
+            target/release/debug-trace-server
+          if-no-files-found: error
+          retention-days: 1
+
+  assets:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # release-assets attaches to the Release
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: binaries
+          path: target/release
+
       - uses: megaeth-labs/.github/.github/actions/release-assets@main
         with:
           tag: ${{ env.TAG }}
@@ -95,3 +122,46 @@ jobs:
             target/release/stateless-validator
             target/release/debug-trace-server
           dry_run: ${{ env.DRY_RUN }}
+
+  registry:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: publish
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: binaries
+          path: target/release
+
+      - uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          credentials_json: ${{ secrets.GCP_AUTH_KEY }}
+
+      - uses: megaeth-labs/.github/.github/actions/release-upload-artifact@main
+        id: validator
+        with:
+          file: target/release/stateless-validator
+          kind: artifact-registry
+          project: devops-production-464602
+          location: asia-northeast1
+          repository: megaeth-generic-registry
+          package: stateless-validator
+          version: ${{ env.TAG }}
+          dry_run: ${{ env.DRY_RUN }}
+
+      - uses: megaeth-labs/.github/.github/actions/release-upload-artifact@main
+        id: dts
+        with:
+          file: target/release/debug-trace-server
+          kind: artifact-registry
+          project: devops-production-464602
+          location: asia-northeast1
+          repository: megaeth-generic-registry
+          package: debug-trace-server
+          version: ${{ env.TAG }}
+          dry_run: ${{ env.DRY_RUN }}
+
+      - run: |
+          echo "stateless-validator ${{ env.TAG }}: registry=${{ steps.validator.outputs.status }} ${{ steps.validator.outputs.uri }} sha256=${{ steps.validator.outputs.sha256 }}"
+          echo "debug-trace-server  ${{ env.TAG }}: registry=${{ steps.dts.outputs.status }} ${{ steps.dts.outputs.uri }} sha256=${{ steps.dts.outputs.sha256 }}"
