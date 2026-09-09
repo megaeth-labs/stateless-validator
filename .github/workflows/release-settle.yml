@@ -1,10 +1,19 @@
 name: Release Settle
 
-# Propose settling a release candidate. Dispatch from any branch with the
+# Settle a release candidate. Dispatch from the default branch with the
 # version and the full SHA of the release-branch tip; the shared action
 # verifies it, generates release notes from the commits since the previous
-# tag, writes them to the changelog, and opens a settle PR onto the release
-# branch. Merging that PR is the settlement decision (release-publish tags it).
+# tag, commits them to the changelog on the release branch, and publishes:
+# annotated tag at that commit, GitHub Release with the notes (on-release.yml
+# then attaches the binaries; release.yaml / release-tracing.yaml archive to
+# Artifact Registry on the tag push).
+#
+# The dispatch is the settlement decision, gated twice: the `release`
+# environment on the job (its required reviewers approve the run before it
+# starts; its deployment branch policy allows only the default branch) and
+# `settlers` in the action (the dispatching actor must be a repository
+# admin). The app is a bypass actor on the release-branch and `v*` tag
+# rulesets, which is what lets the settle commit and the tag land.
 
 on:
   workflow_dispatch:
@@ -18,8 +27,8 @@ on:
         required: true
         type: string
 
-# One settle per version: two dispatches for the same version would both
-# force-push the same settle branch. Queue, never cancel.
+# One settle per version: two dispatches for the same version would race on
+# the release branch. Queue, never cancel.
 concurrency:
   group: ${{ github.workflow }}-${{ inputs.version }}
   cancel-in-progress: false
@@ -30,6 +39,7 @@ permissions:
 jobs:
   settle:
     runs-on: ubuntu-latest
+    environment: release
     steps:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         id: app-token
@@ -50,3 +60,5 @@ jobs:
           version_file: Cargo.toml
           version_pattern: toml
           changelog_file: CHANGELOG.md
+          settle_mode: direct
+          settlers: admin
