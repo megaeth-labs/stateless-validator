@@ -18,6 +18,12 @@ on:
         required: true
         type: string
 
+# One settle per version: two dispatches for the same version would both
+# force-push the same settle branch. Queue, never cancel.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.version }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 

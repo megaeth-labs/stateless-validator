@@ -69,30 +69,19 @@ jobs:
       - name: Build
         run: cargo build --release --locked --bin stateless-validator --bin debug-trace-server
 
-      - name: Verify the binaries
-        # stateless-validator carries a clap version (`#[clap(version)]`), so
-        # it is a gate: the built binary must report the tag's version, which
-        # also catches a tag / Cargo.toml mismatch nothing else checks here.
-        # debug-trace-server has no version flag; `--help` proves it loads and
-        # runs (a missing library or a crash fails the step) without gating.
-        run: |
-          set -euo pipefail
-          expected="stateless-validator ${TAG#v}"
-          actual="$(target/release/stateless-validator --version)"
-          if [[ "$actual" != "$expected" ]]; then
-            if [[ "$DRY_RUN" == "true" ]]; then
-              # A rehearsal reports what a real run would refuse, and carries on.
-              echo "::warning::built binary reports '$actual', expected '$expected' — a real release would stop here"
-            else
-              echo "::error::built binary reports '$actual', expected '$expected'; refusing to publish a mislabeled binary"
-              exit 1
-            fi
-          fi
-          target/release/debug-trace-server --help > /dev/null
-          for b in stateless-validator debug-trace-server; do
-            echo "$b: $(stat -c %s target/release/$b) bytes"
-          done
-          echo "$actual"
+      # stateless-validator carries a clap version (`#[clap(version)]`), so
+      # it is a gate: the built binary must report the tag's version, which
+      # also catches a tag / Cargo.toml mismatch nothing else checks here.
+      - uses: megaeth-labs/.github/.github/actions/release-verify-version@main
+        with:
+          command: target/release/stateless-validator --version
+          version: ${{ env.TAG }}
+          dry_run: ${{ env.DRY_RUN }}
+
+      - name: Check debug-trace-server runs
+        # No version flag to gate on; `--help` proves it loads and runs (a
+        # missing library or a crash fails the step, dry run or not).
+        run: target/release/debug-trace-server --help > /dev/null
 
       - uses: megaeth-labs/.github/.github/actions/release-assets@main
         with:

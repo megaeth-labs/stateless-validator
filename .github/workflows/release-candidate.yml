@@ -23,6 +23,14 @@ permissions:
 jobs:
   propose:
     if: github.event_name == 'workflow_dispatch'
+    # One proposal at a time: two dispatches would race on the candidate
+    # branch. Job-level, not workflow-level: every PR closing on the default
+    # branch also starts this workflow, and a workflow-wide group would let
+    # that noise evict a queued release run (one pending run per group).
+    # A skipped job holds no slot in a job-level group.
+    concurrency:
+      group: ${{ github.workflow }}-propose
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
@@ -57,6 +65,11 @@ jobs:
       github.event.pull_request.merged == true &&
       startsWith(github.event.pull_request.head.ref, 'chore/release-candidate-') &&
       github.event.pull_request.user.login == 'mega-maxwell[bot]'
+    # One cut at a time, never cancelled: pull_request.closed does not refire.
+    # Job-level for the reason given on `propose`.
+    concurrency:
+      group: ${{ github.workflow }}-cut
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
