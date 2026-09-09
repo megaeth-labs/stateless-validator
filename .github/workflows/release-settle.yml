@@ -8,12 +8,12 @@ name: Release Settle
 # then attaches the binaries; release.yaml / release-tracing.yaml archive to
 # Artifact Registry on the tag push).
 #
-# The dispatch is the settlement decision, gated twice: the `release`
-# environment on the job (its required reviewers approve the run before it
-# starts; its deployment branch policy allows only the default branch) and
-# `settlers` in the action (the dispatching actor must be a repository
-# admin). The app is a bypass actor on the release-branch and `v*` tag
-# rulesets, which is what lets the settle commit and the tag land.
+# The dispatch is the settlement decision, gated by the `release` environment
+# on the job: its required reviewers approve the run before it starts, and
+# its deployment branch policy allows only the default branch. The app is a
+# bypass actor on the release-branch and `v*` tag rulesets, which is what
+# lets the settle commit and the tag land. `settlers` (default `any`) is left
+# unset: the environment's reviewers are the only gate.
 
 on:
   workflow_dispatch:
@@ -61,4 +61,3 @@ jobs:
           version_pattern: toml
           changelog_file: CHANGELOG.md
           settle_mode: direct
-          settlers: admin
