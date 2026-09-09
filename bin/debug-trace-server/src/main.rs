@@ -102,7 +102,7 @@ use crate::chain_sync::{TraceFetcher, TraceHooks, TraceProcessor};
 
 /// Command line arguments for the debug-trace-server.
 #[derive(Parser, Debug)]
-#[clap(name = "debug-trace-server", about = "Debug/Trace RPC Server")]
+#[clap(name = "debug-trace-server", version, about = "Debug/Trace RPC Server")]
 // Every `--r2-*` coherence rule is enforced after parsing, by
 // `stateless_common::validate_r2_flags`, rather than through clap attributes: this workspace
 // builds clap without its `error-context` feature (root `Cargo.toml`), so every clap rejection
