@@ -78,10 +78,14 @@ jobs:
           version: ${{ env.TAG }}
           dry_run: ${{ env.DRY_RUN }}
 
-      - name: Check debug-trace-server runs
-        # No version flag to gate on; `--help` proves it loads and runs (a
-        # missing library or a crash fails the step, dry run or not).
-        run: target/release/debug-trace-server --help > /dev/null
+      # debug-trace-server carries a clap version too (added for this gate).
+      # The workspace builds clap without its `help` feature, so `--version`
+      # is the only flag either binary answers; `--help` is an error.
+      - uses: megaeth-labs/.github/.github/actions/release-verify-version@main
+        with:
+          command: target/release/debug-trace-server --version
+          version: ${{ env.TAG }}
+          dry_run: ${{ env.DRY_RUN }}
 
       - uses: megaeth-labs/.github/.github/actions/release-assets@main
         with:
