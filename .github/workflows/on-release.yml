@@ -7,6 +7,14 @@ name: On Release
 #   gh workflow run on-release.yml --ref vX.Y.Z -f dry_run=true
 # The tag being released is always the run's own ref; there is no tag input.
 #
+# This file must exist on the release branch: a `release` event resolves the
+# workflow from the tagged commit's tree, not from the default branch, and the
+# tag sits on the release branch. A branch cut from a default branch that has
+# this file carries it; a branch cut before it landed needs it cherry-picked
+# (via its own PR — the `release-*` ruleset requires one) before the settle PR
+# merges, or the Release publishes with nothing attached and no failed run.
+# A rehearsal likewise only works on a tag whose tree has this file.
+#
 # The internal archive to Artifact Registry stays in release.yaml and
 # release-tracing.yaml, which the same tag push fires.
 
@@ -20,6 +28,13 @@ on:
         required: false
         type: boolean
         default: true
+
+# One run per tag: a release run and a dispatch on the same tag both end in a
+# `--clobber` upload (delete-then-upload), so overlapping runs would race.
+# Never cancel an upload mid-flight; queue instead.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -54,13 +69,30 @@ jobs:
       - name: Build
         run: cargo build --release --locked --bin stateless-validator --bin debug-trace-server
 
-      - name: Report binary versions
-        # Informational: stateless-validator's CLI does not carry a clap
-        # version, so this cannot be a gate the way it is for mega-evme.
+      - name: Verify the binaries
+        # stateless-validator carries a clap version (`#[clap(version)]`), so
+        # it is a gate: the built binary must report the tag's version, which
+        # also catches a tag / Cargo.toml mismatch nothing else checks here.
+        # debug-trace-server has no version flag; `--help` proves it loads and
+        # runs (a missing library or a crash fails the step) without gating.
         run: |
+          set -euo pipefail
+          expected="stateless-validator ${TAG#v}"
+          actual="$(target/release/stateless-validator --version)"
+          if [[ "$actual" != "$expected" ]]; then
+            if [[ "$DRY_RUN" == "true" ]]; then
+              # A rehearsal reports what a real run would refuse, and carries on.
+              echo "::warning::built binary reports '$actual', expected '$expected' — a real release would stop here"
+            else
+              echo "::error::built binary reports '$actual', expected '$expected'; refusing to publish a mislabeled binary"
+              exit 1
+            fi
+          fi
+          target/release/debug-trace-server --help > /dev/null
           for b in stateless-validator debug-trace-server; do
-            echo "$b: $(target/release/$b --version 2>/dev/null || echo '<no --version>')  ($(stat -c %s target/release/$b) bytes)"
+            echo "$b: $(stat -c %s target/release/$b) bytes"
           done
+          echo "$actual"
 
       - uses: megaeth-labs/.github/.github/actions/release-assets@main
         with:
