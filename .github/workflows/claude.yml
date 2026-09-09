@@ -80,7 +80,7 @@ jobs:
         id: app-token
         with:
           client-id: ${{ vars.MEGA_MAXWELL_CLIENT_ID }}
-          private-key: ${{ secrets.MEGA_CI_APP_PK }}
+          private-key: ${{ secrets.MEGA_MAXWELL_PK }}
           owner: megaeth-labs
           repositories: stateless-validator
 
