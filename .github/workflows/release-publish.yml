@@ -14,6 +14,12 @@ on:
     types: [closed]
     branches: ["release-v*"]
 
+# One publish per release branch: the tag guard and the tag push are two
+# steps, so a re-run must queue behind a run in flight, never overlap it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.base.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 

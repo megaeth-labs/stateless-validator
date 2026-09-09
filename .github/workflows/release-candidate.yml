@@ -17,6 +17,12 @@ on:
     types: [closed]
     branches: [main]
 
+# One candidate at a time: two dispatches would race on the candidate branch,
+# and a cut runs on its own merge and must never be cancelled half-way.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
