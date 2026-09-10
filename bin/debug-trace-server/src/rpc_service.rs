@@ -299,7 +299,7 @@ impl RpcContext {
             crate::tracing_executor::trace_block(
                 &self.chain_spec,
                 &data.block,
-                data.witness.clone(),
+                &data.witness,
                 &data.contracts,
                 opts,
             )
@@ -633,7 +633,7 @@ impl DebugTraceRpcServer for RpcContext {
             &self.chain_spec,
             &data.block,
             tx_index,
-            data.witness.clone(),
+            &data.witness,
             &data.contracts,
             opts,
         )
@@ -715,7 +715,7 @@ impl TraceRpcServer for RpcContext {
             crate::tracing_executor::parity_trace_block(
                 &self.chain_spec,
                 &data.block,
-                data.witness.clone(),
+                &data.witness,
                 &data.contracts,
             )
         })
@@ -762,7 +762,7 @@ impl TraceRpcServer for RpcContext {
             &self.chain_spec,
             &data.block,
             tx_index,
-            data.witness.clone(),
+            &data.witness,
             &data.contracts,
         )
         .map_err(|e| {
@@ -1055,7 +1055,7 @@ mod tests {
 
         // Data-attributable: the same block cached with a witness that cannot replay it.
         let mut data = fixture_block_data();
-        data.witness = empty_light_witness();
+        data.witness = empty_light_witness().into();
         let left = entries_left_after_failed_trace(chain_spec, data, None).await;
         assert_eq!(left, 0, "a data error must evict the poisoned entry");
     }

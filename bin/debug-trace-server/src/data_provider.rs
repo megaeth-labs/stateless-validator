@@ -46,7 +46,8 @@ use quick_cache::sync::Cache;
 use revm::state::Bytecode;
 use stateless_common::{CodeFetchError, RpcClient, RpcDeadlineExceeded, WitnessSizeBreakdown};
 use stateless_core::{
-    ContractStore, LightWitness, StoreResult, db::StoreError, withdrawals::MptWitness,
+    ContractStore, LightWitness, LightWitnessExecutor, StoreResult, db::StoreError,
+    withdrawals::MptWitness,
 };
 use stateless_db::ContractCache;
 use tracing::{debug, instrument, trace, warn};
@@ -110,8 +111,11 @@ impl WitnessFetchConfig {
 pub struct BlockData {
     /// The block with full transaction data.
     pub block: Block<Transaction>,
-    /// Light witness without expensive EC point validation.
-    pub witness: LightWitness,
+    /// The witness wrapped in its execution form. Built once per block here, so every
+    /// trace request served from this `BlockData` shares one witness and one
+    /// direct-lookup table instead of deep-cloning the maps and rebuilding the table
+    /// per request.
+    pub witness: LightWitnessExecutor,
     /// Contract bytecodes keyed by code hash, required for EVM execution.
     /// `Bytecode` is internally reference-counted, so values share their underlying allocation
     /// with the `ContractCache` (and across `BlockData` clones) via cheap refcount-bump clones.
@@ -835,7 +839,7 @@ impl DataProvider {
             );
         }
 
-        Ok(Some(BlockData { block, witness, contracts }))
+        Ok(Some(BlockData { block, witness: LightWitnessExecutor::from(witness), contracts }))
     }
 
     /// Single-flight fetch via [`futures::future::Shared`]: concurrent callers for the same
@@ -1045,7 +1049,7 @@ async fn do_fetch_block_data(
         );
     }
 
-    Ok(BlockData { block, witness, contracts })
+    Ok(BlockData { block, witness: LightWitnessExecutor::from(witness), contracts })
 }
 
 /// Reads the local DB's canonical tip height, `None` when no DB is configured or the tip is
@@ -1316,7 +1320,7 @@ pub(crate) mod test_support {
         let witness = LightWitness::from(&fixtures.salt_witnesses[&hash]);
         let contracts: HashMap<B256, Bytecode> =
             fixtures.contracts.iter().map(|(h, code)| (*h, code.clone())).collect();
-        BlockData { block, witness, contracts }
+        BlockData { block, witness: LightWitnessExecutor::from(witness), contracts }
     }
 
     /// Minimal self-consistent RPC `Header` for `number`: `hash` is the real `hash_slow()`
@@ -1463,6 +1467,7 @@ mod tests {
     /// code hash the witness references, so DB-served fetches never fall through to RPC.
     fn fixture_block_and_cache() -> (Block<Transaction>, LightWitness, Arc<ContractCache>) {
         let BlockData { block, witness, contracts } = test_support::fixture_block_data();
+        let witness = witness.light_witness().clone();
         let contract_cache = test_support::noop_contract_cache();
         let codes: Vec<(B256, Bytecode)> = crate::tracing_executor::extract_code_hashes(&witness)
             .into_iter()
@@ -1555,7 +1560,10 @@ mod tests {
         let (block, witness, contract_cache) = fixture_block_and_cache();
         let hash = block.header.hash;
         let cache = Arc::new(BlockDataCache::new(1024 * 1024 * 1024));
-        cache.insert(hash, Arc::new(BlockData { block, witness, contracts: HashMap::default() }));
+        cache.insert(
+            hash,
+            Arc::new(BlockData { block, witness: witness.into(), contracts: HashMap::default() }),
+        );
         let provider =
             provider_with_tiers(&test_support::hanging_url(), None, Some(cache), contract_cache);
 
