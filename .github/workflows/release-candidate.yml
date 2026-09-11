@@ -13,6 +13,11 @@ on:
         description: "Version to release (X.Y.Z)"
         required: true
         type: string
+      base_commit:
+        description: "Commit to release (blank: the tip of the default branch)"
+        required: false
+        type: string
+        default: ""
   pull_request:
     types: [closed]
     branches: [main]
@@ -53,6 +58,7 @@ jobs:
           stage: propose
           token: ${{ steps.app-token.outputs.token }}
           version: ${{ inputs.version }}
+          base_commit: ${{ inputs.base_commit }}
           version_file: Cargo.toml
           version_pattern: toml
           changelog_file: CHANGELOG.md
