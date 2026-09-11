@@ -5,6 +5,11 @@ name: Release Candidate
 # opens a candidate PR. When that
 # PR merges, the `cut` job creates `release-vX.Y.Z` at the merge commit. No
 # tag is created here — see release-settle / release-publish.
+#
+# To release a commit that is not the tip of the default branch, dispatch with
+# `base_commit` as well: `propose` creates `release-vX.Y.Z` at that commit and
+# aims the candidate PR at it, so that PR never touches the default branch and
+# the `cut` job below does not run.
 
 on:
   workflow_dispatch:
@@ -13,6 +18,11 @@ on:
         description: "Version to release (X.Y.Z)"
         required: true
         type: string
+      base_commit:
+        description: "Commit to release (blank: the tip of the default branch)"
+        required: false
+        type: string
+        default: ""
   pull_request:
     types: [closed]
     branches: [main]
@@ -53,6 +63,7 @@ jobs:
           stage: propose
           token: ${{ steps.app-token.outputs.token }}
           version: ${{ inputs.version }}
+          base_commit: ${{ inputs.base_commit }}
           version_file: Cargo.toml
           version_pattern: toml
           changelog_file: CHANGELOG.md
