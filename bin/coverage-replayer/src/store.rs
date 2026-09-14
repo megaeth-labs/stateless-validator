@@ -10,7 +10,7 @@ use std::{collections::HashMap, path::Path};
 
 use alloy_primitives::B256;
 use eyre::{Result, ensure};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use crate::bitset::BitSet;
@@ -79,8 +79,11 @@ pub struct BlockRecord {
     pub error: Option<String>,
 }
 
-pub struct Store {
-    db: Database,
+/// The redb handle type selects the API: [`Database`] for writers (backfill,
+/// set-cover, merge output), [`ReadOnlyDatabase`] for pure readers (inspect,
+/// merge inputs) — the write methods do not exist on a read-only store.
+pub struct Store<D = Database> {
+    db: D,
 }
 
 impl Store {
@@ -143,71 +146,6 @@ impl Store {
         txn.commit()?;
 
         Ok(Self { db })
-    }
-
-    /// Reads the stamped symbol filter, if any.
-    pub fn symbol_filter(&self) -> Result<Option<String>> {
-        let txn = self.db.begin_read()?;
-        let meta = txn.open_table(META)?;
-        let filter =
-            meta.get("symbol_filter")?.map(|g| String::from_utf8_lossy(g.value()).into_owned());
-        drop(meta);
-        drop(txn);
-        Ok(filter)
-    }
-
-    /// Opens an existing store WITHOUT the binary-id namespace check, for
-    /// read-only inspection of data produced by another build (e.g. analyzing
-    /// a store copied from a server). Returns the store and its binary_id.
-    pub fn open_readonly(path: &Path) -> Result<(Self, String)> {
-        ensure!(path.exists(), "store {} does not exist", path.display());
-        let db = Database::open(path)?;
-        let store = Self { db };
-        let txn = store.db.begin_read()?;
-        let meta = txn.open_table(META)?;
-        check_schema_version(&meta, path)?;
-        let binary_id = meta
-            .get("binary_id")?
-            .map(|g| String::from_utf8_lossy(g.value()).into_owned())
-            .unwrap_or_else(|| "<unset>".into());
-        drop(meta);
-        drop(txn);
-        Ok((store, binary_id))
-    }
-
-    /// Loads the whole dispatcher state into memory (counters, patterns, blocks).
-    pub fn load(&self) -> Result<StoreSnapshot> {
-        let txn = self.db.begin_read()?;
-        Ok(StoreSnapshot {
-            counters: read_table(&txn, COUNTERS)?,
-            patterns: read_table(&txn, PATTERNS)?,
-            blocks: read_table(&txn, BLOCKS)?,
-        })
-    }
-
-    /// [`Self::load`] variant for `backfill`: counters and patterns in full
-    /// (they are the working set and bounded by the universe), but block
-    /// records only for the range being scanned. The BLOCKS table grows by
-    /// one row per block ever scanned — a full-history store holds tens of
-    /// millions of rows, and the judge only needs the current range's
-    /// statuses for its todo filter.
-    pub fn load_for_range(&self, blocks: std::ops::RangeInclusive<u64>) -> Result<StoreSnapshot> {
-        let txn = self.db.begin_read()?;
-        let t = txn.open_table(BLOCKS)?;
-        let mut in_range = HashMap::new();
-        for row in t.range(blocks)? {
-            let (k, v) = row?;
-            let (value, _): (BlockRecord, _) =
-                bincode::serde::decode_from_slice(v.value(), BINCODE_CONFIG)
-                    .map_err(|e| eyre::eyre!("decode BlockRecord: {e}"))?;
-            in_range.insert(k.value(), value);
-        }
-        drop(t);
-        Ok(StoreSnapshot {
-            counters: read_table(&txn, COUNTERS)?,
-            patterns: read_table(&txn, PATTERNS)?,
-            blocks: in_range,
-        })
     }
 
     /// Persists one judged block: its record, any new counters, and the
@@ -274,6 +212,93 @@ impl Store {
             txn.commit()?;
         }
         Ok(())
+    }
+}
+
+impl Store<ReadOnlyDatabase> {
+    /// Opens an existing store WITHOUT the binary-id namespace check, for
+    /// read-only inspection of data produced by another build (e.g. analyzing
+    /// a store copied from a server). Returns the store and its binary_id.
+    ///
+    /// The file is opened without write access under a shared lock, so a
+    /// store the caller cannot write (e.g. root-owned on a server) opens fine
+    /// and is never modified. In exchange, a store held open by a writer or
+    /// left unclean by a crash is refused rather than waited on or repaired.
+    pub fn open_readonly(path: &Path) -> Result<(Self, String)> {
+        ensure!(path.exists(), "store {} does not exist", path.display());
+        let db = ReadOnlyDatabase::open(path).map_err(|e| match e {
+            redb::DatabaseError::DatabaseAlreadyOpen => eyre::eyre!(
+                "store {} is held open read-write (a running backfill?) — wait for it to \
+                 exit, or read a copy",
+                path.display()
+            ),
+            redb::DatabaseError::RepairAborted => eyre::eyre!(
+                "store {} was not shut down cleanly and needs a repair, which a read-only \
+                 open never performs — a read-write open (e.g. the next backfill on this \
+                 data-dir) repairs it",
+                path.display()
+            ),
+            e => eyre::eyre!("open store {} read-only: {e}", path.display()),
+        })?;
+        let store = Self { db };
+        let txn = store.db.begin_read()?;
+        let meta = txn.open_table(META)?;
+        check_schema_version(&meta, path)?;
+        let binary_id = meta
+            .get("binary_id")?
+            .map(|g| String::from_utf8_lossy(g.value()).into_owned())
+            .unwrap_or_else(|| "<unset>".into());
+        drop(meta);
+        drop(txn);
+        Ok((store, binary_id))
+    }
+}
+
+impl<D: ReadableDatabase> Store<D> {
+    /// Reads the stamped symbol filter, if any.
+    pub fn symbol_filter(&self) -> Result<Option<String>> {
+        let txn = self.db.begin_read()?;
+        let meta = txn.open_table(META)?;
+        let filter =
+            meta.get("symbol_filter")?.map(|g| String::from_utf8_lossy(g.value()).into_owned());
+        drop(meta);
+        drop(txn);
+        Ok(filter)
+    }
+
+    /// Loads the whole dispatcher state into memory (counters, patterns, blocks).
+    pub fn load(&self) -> Result<StoreSnapshot> {
+        let txn = self.db.begin_read()?;
+        Ok(StoreSnapshot {
+            counters: read_table(&txn, COUNTERS)?,
+            patterns: read_table(&txn, PATTERNS)?,
+            blocks: read_table(&txn, BLOCKS)?,
+        })
+    }
+
+    /// [`Self::load`] variant for `backfill`: counters and patterns in full
+    /// (they are the working set and bounded by the universe), but block
+    /// records only for the range being scanned. The BLOCKS table grows by
+    /// one row per block ever scanned — a full-history store holds tens of
+    /// millions of rows, and the judge only needs the current range's
+    /// statuses for its todo filter.
+    pub fn load_for_range(&self, blocks: std::ops::RangeInclusive<u64>) -> Result<StoreSnapshot> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(BLOCKS)?;
+        let mut in_range = HashMap::new();
+        for row in t.range(blocks)? {
+            let (k, v) = row?;
+            let (value, _): (BlockRecord, _) =
+                bincode::serde::decode_from_slice(v.value(), BINCODE_CONFIG)
+                    .map_err(|e| eyre::eyre!("decode BlockRecord: {e}"))?;
+            in_range.insert(k.value(), value);
+        }
+        drop(t);
+        Ok(StoreSnapshot {
+            counters: read_table(&txn, COUNTERS)?,
+            patterns: read_table(&txn, PATTERNS)?,
+            blocks: in_range,
+        })
     }
 }
 
@@ -503,6 +528,43 @@ mod tests {
         assert!(err.to_string().contains("schema"), "open: {err}");
         let err = Store::open_readonly(&path).err().expect("must fail");
         assert!(err.to_string().contains("schema"), "open_readonly: {err}");
+    }
+
+    /// `inspect` and `merge` read stores the caller does not own (root-owned
+    /// on a server, a read-only copy): the read-only open must need no write
+    /// access and leave the file byte-identical.
+    #[cfg(unix)]
+    #[test]
+    fn open_readonly_needs_no_write_access_and_never_writes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.redb");
+        {
+            let store = Store::open(&path, "megaevm:aaa:fx1", Some("mega_evm")).unwrap();
+            store.commit_block(7, &block(BlockStatus::Ok), &[], None).unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        {
+            let (store, binary_id) = Store::open_readonly(&path).expect("open a read-only file");
+            assert_eq!(binary_id, "megaevm:aaa:fx1");
+            assert_eq!(store.symbol_filter().unwrap().as_deref(), Some("mega_evm"));
+            assert_eq!(store.load().unwrap().blocks.len(), 1);
+        }
+        assert!(std::fs::read(&path).unwrap() == before, "read-only open modified the store");
+    }
+
+    /// A live writer holds redb's exclusive lock; the read-only open must be
+    /// refused with an actionable message, not a bare lock error.
+    #[test]
+    fn open_readonly_refuses_store_held_by_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.redb");
+        let _writer = Store::open(&path, "id", None).unwrap();
+        let err = Store::open_readonly(&path).err().expect("must fail while a writer holds it");
+        assert!(err.to_string().contains("held open read-write"), "got: {err}");
     }
 
     #[test]
