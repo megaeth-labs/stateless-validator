@@ -1560,7 +1560,7 @@ async fn decode_witness_wire<T: Send + 'static>(
 /// 4. **Transactions Root**: Computes the Merkle root of all transactions and verifies it matches
 ///    the `transactions_root` in the block header
 fn verify_block_integrity(block: &Block<Transaction>) -> Result<()> {
-    use alloy_consensus::transaction::SignerRecoverable;
+    use alloy_consensus::transaction::{Recovered, SignerRecoverable};
     use alloy_rpc_types_eth::BlockTransactions;
     use alloy_trie::root::ordered_trie_root_with_encoder;
     use op_alloy_network::{TransactionResponse, eip2718::Encodable2718};
@@ -1580,7 +1580,10 @@ fn verify_block_integrity(block: &Block<Transaction>) -> Result<()> {
         // for the transactions-root check.
         let mut encoded_txs = Vec::with_capacity(transactions.len());
         for tx in transactions {
-            let tx_envelope = tx.inner.inner.inner();
+            // The op and eth RPC wrappers both expose `inner`; under them sits the consensus
+            // envelope paired with the signer the provider claims.
+            let recovered_tx: &Recovered<_> = &tx.inner.inner;
+            let tx_envelope = recovered_tx.inner();
             let encoded = tx_envelope.encoded_2718();
             let computed_hash = keccak256(&encoded);
             ensure!(
@@ -1590,15 +1593,15 @@ fn verify_block_integrity(block: &Block<Transaction>) -> Result<()> {
                 computed_hash
             );
 
-            let recovered = tx_envelope
+            let recovered_signer = tx_envelope
                 .recover_signer()
                 .map_err(|err| eyre!("Failed to recover signer: {}", err))?;
 
             ensure!(
-                recovered == tx.from(),
+                recovered_signer == tx.from(),
                 "Transaction signer mismatch: expected {:?}, got {:?}",
                 tx.from(),
-                recovered
+                recovered_signer
             );
             encoded_txs.push(encoded);
         }
@@ -2992,9 +2995,12 @@ mod tests {
     /// `trie_hash()` reproduces the claim by construction; only keccak over the envelope's own
     /// encoding can tell a hash that does not belong to the bytes. Forging one hash leaves the
     /// transactions root intact, so the hash check is the only thing that rejects the block.
-    /// The first transaction is the deposit (`Sealed`) and the last a signed envelope.
+    /// Index 0 is asserted to be the deposit (`Sealed`) and the last index a signed envelope, so
+    /// a fixture change cannot silently drop either `trie_hash` override from coverage.
     #[test]
     fn verify_block_integrity_rejects_a_forged_transaction_hash() {
+        use alloy_rpc_types_eth::BlockTransactions;
+
         let fx = TestFixtures::mainnet_shared();
         let block = fx
             .paired_blocks()
@@ -3004,8 +3010,12 @@ mod tests {
             .expect("a paired mainnet fixture with transactions");
         verify_block_integrity(block).expect("untampered fixture block verifies");
 
-        let last = block.transactions.len() - 1;
-        for index in [0, last] {
+        let BlockTransactions::Full(txs) = &block.transactions else {
+            panic!("fixture blocks carry full transactions");
+        };
+        let last = txs.len() - 1;
+        for (index, is_deposit) in [(0, true), (last, false)] {
+            assert_eq!(txs[index].inner.inner.inner().is_deposit(), is_deposit, "tx {index}");
             let mut json = serde_json::to_value(block).unwrap();
             json["transactions"][index]["hash"] = serde_json::to_value(B256::ZERO).unwrap();
             let forged: Block<Transaction> = serde_json::from_value(json).unwrap();
