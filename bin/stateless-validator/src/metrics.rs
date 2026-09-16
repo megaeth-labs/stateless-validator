@@ -19,7 +19,7 @@ pub use stateless_common::{
 };
 use tracing::info;
 
-use crate::r2_witness::R2WitnessError;
+use crate::r2_witness::{KIND_MISSING_FRONTIER, R2WitnessError};
 
 /// Metrics callback implementation for RPC client.
 ///
@@ -90,7 +90,7 @@ pub mod names {
     metric!(CODE_FETCH_TIME, "code_fetch_time_seconds");
     metric!(WITNESS_FETCH_RPC_TIME, "witness_fetch_rpc_time_seconds");
 
-    // R2 witness source (`--witness-source r2`)
+    // R2 witness source (`--witness-source r2` / `r2-then-rpc`)
     metric!(WITNESS_FETCH_R2_TIME, "witness_fetch_r2_time_seconds");
     metric!(R2_WITNESS_RETRY_ATTEMPTS_TOTAL, "r2_witness_retry_attempts_total");
     metric!(R2_WITNESS_ERRORS_TOTAL, "r2_witness_errors_total");
@@ -190,7 +190,10 @@ fn register_metric_descriptions() {
     );
     describe_counter!(
         names::R2_WITNESS_ERRORS_TOTAL,
-        "R2 witness fetches that surfaced an error to the pipeline, by kind"
+        "R2 witness fetches that failed, by kind (`missing_frontier` is a miss within the \
+         frontier band below the polled head — the uploader still catching up — so \
+         `missing` only counts objects that must exist); under `--witness-source \
+         r2-then-rpc` each one is a block that fell back to the RPC witness path"
     );
     describe_gauge!(
         names::R2_NEGOTIATED_VERSION_INFO,
@@ -234,11 +237,11 @@ fn init_rpc_method_counters() {
     }
 }
 
-/// Pre-register the R2 witness-source counters (every error kind) so they appear in Prometheus
-/// output from startup, like the RPC method counters above.
+/// Pre-register the R2 witness-source counters (every error kind, plus the synthetic frontier
+/// label) so they appear in Prometheus output from startup, like the RPC method counters above.
 fn init_r2_witness_counters() {
     counter!(names::R2_WITNESS_RETRY_ATTEMPTS_TOTAL).increment(0);
-    for kind in R2WitnessError::KINDS {
+    for kind in R2WitnessError::KINDS.iter().chain(&[KIND_MISSING_FRONTIER]) {
         counter!(names::R2_WITNESS_ERRORS_TOTAL, "kind" => *kind).increment(0);
     }
 }
@@ -382,7 +385,7 @@ pub fn on_witness_fetch(b: WitnessSizeBreakdown) {
     histogram!(names::MPT_WITNESS_SIZE).record(b.mpt_size as f64);
 }
 
-// R2 witness source metrics (`--witness-source r2`)
+// R2 witness source metrics (`--witness-source r2` / `r2-then-rpc`)
 
 /// Record a successful R2 witness fetch: duration (see [`names::WITNESS_FETCH_R2_TIME`]'s
 /// description for what it covers) plus the same size breakdown as [`on_witness_fetch`], so the
@@ -397,8 +400,7 @@ pub fn on_r2_witness_retry() {
     counter!(names::R2_WITNESS_RETRY_ATTEMPTS_TOTAL).increment(1);
 }
 
-/// Record an R2 witness fetch that surfaced an error to the pipeline, labelled by
-/// [`R2WitnessError::kind`].
+/// Record a failed R2 witness fetch, labelled by [`crate::r2_witness::error_kind`].
 pub fn on_r2_witness_error(kind: &'static str) {
     counter!(names::R2_WITNESS_ERRORS_TOTAL, "kind" => kind).increment(1);
 }

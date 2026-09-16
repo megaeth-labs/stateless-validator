@@ -19,6 +19,17 @@ use tokio::task::JoinError;
 
 use crate::{BackoffPolicy, WitnessDecodingError};
 
+/// Near-tip band (in blocks) inside which an R2 witness `missing` is the expected
+/// probe-ahead outcome — the uploader may plausibly not have PUT the object yet — rather
+/// than a bucket hole. Sized to comfortably cover the uploader's PUT latency plus the lag of
+/// whatever tip the reader measures against (the trace server's local DB tip, the
+/// validator's last polled remote head), a few seconds each.
+///
+/// Both readers gate their `kind="missing"` bucket-integrity alarm on it: a miss inside the
+/// band is recorded apart from the alarm, a miss below it means the object must exist and
+/// does not.
+pub const R2_FRONTIER_WINDOW: u64 = 32;
+
 /// Failure outcome of an R2 witness fetch, shared by both binaries' adapters.
 ///
 /// A binary whose fetches pass no deadline never produces [`Self::DecodeTimeout`] (or the
