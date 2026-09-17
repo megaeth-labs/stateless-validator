@@ -1085,11 +1085,6 @@ mod tests {
         }
     }
 
-    /// `validate_block_deriving_updates` must succeed on every paired mainnet fixture — anchored to
-    /// the parent whenever it is in the fixture set, the embedder's real call shape — and the
-    /// returned updates must reproduce the header's state root when fed through the SALT trie
-    /// update, locking its equivalence with the `validate_block` path the helpers were
-    /// extracted from.
     /// The header check reads `BlockExecutionResult::gas_used`; mega-evm defines that field
     /// as the last receipt's cumulative gas, the expression the check read before. A
     /// `debug_assert_eq!` at the derivation site pins the two against each other on every
@@ -1123,6 +1118,11 @@ mod tests {
         }
     }
 
+    /// `validate_block_deriving_updates` must succeed on every paired mainnet fixture — anchored to
+    /// the parent whenever it is in the fixture set, the embedder's real call shape — and the
+    /// returned updates must reproduce the header's state root when fed through the SALT trie
+    /// update, locking its equivalence with the `validate_block` path the helpers were
+    /// extracted from.
     #[test]
     fn validate_block_deriving_updates_mainnet_fixtures() {
         let _logging = init_test_logging("stateless_core");
