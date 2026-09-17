@@ -466,6 +466,27 @@ impl RpcClient {
         best_effort: bool,
         f: impl Fn(RootProvider<Optimism>) -> BoxFuture<Result<T>>,
     ) -> std::result::Result<T, RpcDeadlineExceeded> {
+        self.call_with_finish(method, deadline, best_effort, f, |v| Box::pin(async move { Ok(v) }))
+            .await
+    }
+
+    /// [`Self::call_with_deadline_at`] with the retry loop's *finalize* step exposed: `f` runs
+    /// under the per-attempt window, `finish` after it, bounded by the deadline alone. Post-
+    /// transport CPU work belongs in `finish` so it neither burns the rotation reserve nor
+    /// reads as a provider stall, while a failure there still counts as that provider's error
+    /// and rotates.
+    ///
+    /// This is the data path's single funnel into [`round_robin_with_backoff`] — every data
+    /// method's provider rotation, concurrency and attempt-cap policy is assembled here and
+    /// nowhere else. The witness path has its own funnel in [`Self::witness_round_robin`].
+    async fn call_with_finish<W: Send + 'static, T: Send + 'static>(
+        &self,
+        method: RpcMethod,
+        deadline: Option<Instant>,
+        best_effort: bool,
+        f: impl Fn(RootProvider<Optimism>) -> BoxFuture<Result<W>>,
+        finish: impl Fn(W) -> BoxFuture<Result<T>>,
+    ) -> std::result::Result<T, RpcDeadlineExceeded> {
         round_robin_with_backoff(
             &self.data_providers,
             &self.data_provider_labels,
@@ -478,7 +499,7 @@ impl RpcClient {
             deadline,
             best_effort,
             |provider, _provider_label| f(provider.clone()),
-            |v, _provider_label| Box::pin(async move { Ok(v) }),
+            |v, _provider_label| finish(v),
         )
         .await
     }
@@ -548,26 +569,16 @@ impl RpcClient {
         deadline: Option<Instant>,
     ) -> std::result::Result<Block<Transaction>, RpcDeadlineExceeded> {
         let verify = !self.config.skip_block_verification;
-        round_robin_with_backoff(
-            &self.data_providers,
-            &self.data_provider_labels,
-            &self.data_concurrency,
-            &self.config.rpc_retry,
-            AttemptCap::Fixed(self.config.per_attempt_timeout),
-            self.next_data_rr_start(),
+        self.call_with_finish(
             RpcMethod::EthGetBlock,
-            self.config.metrics.as_ref(),
             deadline,
             false,
-            move |provider, _provider_label| {
+            move |provider| {
                 Box::pin(async move { do_get_block_unchecked(&provider, block_id, full_txs).await })
             },
-            move |block, _provider_label| {
+            move |block| {
                 Box::pin(async move {
-                    if !verify {
-                        return Ok(block);
-                    }
-                    verify_block_on_blocking_pool(block).await
+                    if verify { verify_block_on_blocking_pool(block).await } else { Ok(block) }
                 })
             },
         )
@@ -2012,31 +2023,34 @@ mod tests {
         }
     }
 
+    /// A counting `eth_getBlockByNumber` endpoint that serves `header` on every call, in
+    /// [`start_counting_block_number_rpc`]'s `(handle, url, hits)` shape.
+    async fn start_counting_block_rpc(
+        header: alloy_rpc_types_eth::Header,
+    ) -> (ServerHandle, String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (handle, url) = serve((header, hits.clone()), |m| {
+            m.register_method("eth_getBlockByNumber", |_params, (header, hits), _| {
+                hits.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, ErrorObjectOwned>(block_stub(header.clone()))
+            })
+            .unwrap();
+        })
+        .await;
+        (handle, url, hits)
+    }
+
     /// Block verification is the retry loop's finalize step rather than part of the attempt
     /// window (so a large block cannot read as a provider stall), and this pins the property
     /// that move must not cost: an integrity failure is still that provider's error, so the
     /// call rotates to the next provider instead of surfacing the bad block.
     #[tokio::test]
     async fn block_verification_failure_rotates_to_the_next_provider() {
-        let bad_hits = Arc::new(AtomicUsize::new(0));
-        let (bad_handle, bad_url) = serve(Arc::clone(&bad_hits), |m| {
-            m.register_method("eth_getBlockByNumber", |_params, hits, _| {
-                hits.fetch_add(1, Ordering::Relaxed);
-                // A hash the header does not actually hash to — the first integrity check.
-                Ok::<_, ErrorObjectOwned>(block_stub(header_stub(7, BlockHash::from([9u8; 32]))))
-            })
-            .unwrap();
-        })
-        .await;
-        let good_hits = Arc::new(AtomicUsize::new(0));
-        let (good_handle, good_url) = serve(Arc::clone(&good_hits), |m| {
-            m.register_method("eth_getBlockByNumber", |_params, hits, _| {
-                hits.fetch_add(1, Ordering::Relaxed);
-                Ok::<_, ErrorObjectOwned>(block_stub(consistent_header(7)))
-            })
-            .unwrap();
-        })
-        .await;
+        // A hash the header does not actually hash to — the first integrity check.
+        let (bad_handle, bad_url, bad_hits) =
+            start_counting_block_rpc(header_stub(7, BlockHash::from([9u8; 32]))).await;
+        let (good_handle, good_url, good_hits) =
+            start_counting_block_rpc(consistent_header(7)).await;
 
         let config = RpcClientConfig {
             rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),

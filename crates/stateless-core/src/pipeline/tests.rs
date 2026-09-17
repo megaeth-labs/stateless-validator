@@ -331,13 +331,8 @@ async fn test_chain_advancer_propagates_hook_panics() {
         Ok(outcome) => panic!("a panicking hook must unwind the advancer, got {outcome:?}"),
     };
     assert!(join_err.is_panic(), "the advancer must fail by panic, not by JoinError::Cancelled");
-    let payload = join_err.into_panic();
-    let message = payload
-        .downcast_ref::<&str>()
-        .map(|s| (*s).to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_default();
-    assert!(message.contains("pre_advance exploded"), "panic payload preserved: {message}");
+    let payload = join_err.into_panic().downcast::<&str>().expect("literal panic payload");
+    assert_eq!(*payload, "pre_advance exploded", "the panic payload must survive the pool hop");
 }
 
 /// Covers the `verify_continuity` → Fatal branch in `chain_advancer` (`advancer.rs:109`).

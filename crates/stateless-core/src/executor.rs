@@ -1090,7 +1090,8 @@ mod tests {
     /// `debug_assert_eq!` at the derivation site pins the two against each other on every
     /// replay; this pins the surviving value against what a real mainnet header claims, so a
     /// mega-evm that starts accounting gas outside the receipt chain fails here rather than
-    /// as a consensus divergence in production.
+    /// as a consensus divergence in production. It goes through `verify_and_replay`, the same
+    /// front half `validate_block` runs, so the pinned value cannot drift from the real one.
     #[test]
     fn replayed_gas_used_matches_the_mainnet_header() {
         let _logging = init_test_logging("stateless_core");
@@ -1099,20 +1100,15 @@ mod tests {
         assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
         for (number, hash) in paired {
             let block = &fx.blocks[&hash];
-            let salt_witness = fx.salt_witnesses[&hash].clone();
-            let header = block.consensus_header();
-            let ext_env = WitnessExternalEnv::new(&salt_witness, header.number)
-                .expect("witness carries bucket metadata");
-            let witness = Witness::from(salt_witness);
-            witness
-                .verify()
-                .unwrap_or_else(|e| panic!("witness verification failed for {number}: {e:?}"));
-            let witness_db =
-                WitnessDatabase { header, witness: &witness, contracts: &fx.contracts };
-            let (_, output) = replay_block(&chain_spec(), block, &witness_db, ext_env)
-                .unwrap_or_else(|e| panic!("replay failed for {number} ({hash}): {e:?}"));
+            let replay = verify_and_replay(
+                &chain_spec(),
+                block,
+                fx.salt_witnesses[&hash].clone(),
+                &fx.contracts,
+            )
+            .unwrap_or_else(|e| panic!("verify + replay failed for {number} ({hash}): {e:?}"));
             assert_eq!(
-                output.gas_used, block.header.gas_used,
+                replay.output.gas_used, block.header.gas_used,
                 "replayed gas_used disagrees with the header for {number} ({hash})"
             );
         }
