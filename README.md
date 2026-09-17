@@ -209,7 +209,7 @@ A count of zero, a non-numeric or blank one, one set alongside the S3 endpoint (
 The configured target is published as the constant-1 gauge `debug_trace_r2_target_info{target}` (`r2_target_info` on the validator), so the target-less R2 series can be attributed to one target or the other during a rollout.
 Whether the domain actually delivered HTTP/2 is a separate question — selection is pure ALPN, so a misconfigured zone degrades to HTTP/1.1 with the h2 tuning inert — and is answered by `..._r2_negotiated_http_version_info{version}` plus a one-time warning naming the protocol that was negotiated.
 Any single witness-chain RPC attempt under a deadline is additionally capped at the tightest of: half the witness stage budget, the global per-attempt timeout, and — only while the round still has an untried provider to rotate to — half of what the call still has as the attempt starts (recomputed after any permit wait).
-The round's last hop, and every hop of a single-provider chain, takes the remainder whole under the ceiling instead, so a stalled endpoint (or a saturated concurrency permit — waits are deadline-bounded too) can never consume the stage while a rotation is still worth reserving for, and a slow-but-honest transfer is never structurally condemned; the witness decode runs outside the attempt window, bounded by the request deadline alone.
+The round's last hop, and every hop of a single-provider chain, takes the remainder whole under the ceiling instead, so a stalled endpoint (or a saturated concurrency permit — waits are deadline-bounded too) can never consume the stage while a rotation is still worth reserving for, and a slow-but-honest transfer is never structurally condemned; the witness decode — and `eth_getBlock`'s integrity verification, which runs on the blocking pool — runs outside the attempt window, bounded by the request deadline alone.
 `--r2-max-concurrent-requests` caps in-flight GETs separately from `--witness-max-concurrent-requests` — the RPC cap sizes a shared gateway, R2 tolerates far more.
 
 **Admission and response-size knobs** (each also settable via its `DEBUG_TRACE_SERVER_*` env var):
@@ -320,7 +320,7 @@ Both binaries share a generic three-stage pipeline defined in `stateless-core`:
                           Reorders out-of-order results (BTreeMap)
                           Verifies parent-hash continuity
                           Detects reorgs → rollback + restart
-                          Persists via ChainStore::advance_chain()
+                          Persists via ChainStore::advance_chain() (on the blocking pool)
 
  Outer loop (run_pipeline):
    Reorg → ReorgResolver decides floor → rollback → restart pipeline

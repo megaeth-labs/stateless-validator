@@ -33,7 +33,7 @@ use stateless_db::{
 /// trait — the pruner works on the concrete [`ServerDB`] — leaving this the read/append
 /// seam shared with `DataProvider` and chain sync.
 pub trait BlockStore: ChainStore + DivergenceLookups {
-    fn store_block_data(&self, blocks: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()>;
+    fn store_block_data(&self, blocks: &[(&Block<Transaction>, &LightWitness)]) -> StoreResult<()>;
     fn get_block_and_witness(
         &self,
         block_hash: BlockHash,
@@ -65,9 +65,13 @@ impl ServerDB {
     }
 
     /// Stores block data and witnesses.
+    ///
+    /// Takes the pairs by reference: every field is read straight into an encode below, so an
+    /// owned slice would make each caller deep-copy a block and its witness (a node-by-node
+    /// `BTreeMap` clone) to buy nothing.
     pub fn store_block_data(
         &self,
-        tasks: &[(Block<Transaction>, LightWitness)],
+        tasks: &[(&Block<Transaction>, &LightWitness)],
     ) -> StoreResult<()> {
         if tasks.is_empty() {
             return Ok(());
@@ -275,7 +279,7 @@ impl DivergenceLookups for ServerDB {
 }
 
 impl BlockStore for ServerDB {
-    fn store_block_data(&self, blocks: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
+    fn store_block_data(&self, blocks: &[(&Block<Transaction>, &LightWitness)]) -> StoreResult<()> {
         ServerDB::store_block_data(self, blocks)
     }
 
@@ -340,7 +344,7 @@ pub(crate) mod test_support {
     }
 
     impl BlockStore for StubBlockStore {
-        fn store_block_data(&self, _: &[(Block<Transaction>, LightWitness)]) -> StoreResult<()> {
+        fn store_block_data(&self, _: &[(&Block<Transaction>, &LightWitness)]) -> StoreResult<()> {
             Ok(())
         }
         fn get_block_and_witness(
@@ -491,7 +495,8 @@ mod tests {
         let blocks_data: Vec<_> = (1..=10)
             .map(|n| (make_test_block(n, B256::from([n as u8; 32])), empty_light_witness()))
             .collect();
-        db.store_block_data(&blocks_data).unwrap();
+        let pairs: Vec<_> = blocks_data.iter().map(|(b, w)| (b, w)).collect();
+        db.store_block_data(&pairs).unwrap();
 
         let metas: Vec<BlockMeta> = (1..=10).map(make_block_meta).collect();
         ChainStore::advance_chain(&db, &metas).unwrap();
@@ -521,7 +526,7 @@ mod tests {
         let block = make_test_block(10, block_hash);
         let witness = empty_light_witness();
 
-        db.store_block_data(&[(block.clone(), witness)]).unwrap();
+        db.store_block_data(&[(&block, &witness)]).unwrap();
 
         let (retrieved_block, _retrieved_witness) =
             db.get_block_and_witness(BlockHash::from(block_hash)).unwrap();
@@ -563,7 +568,8 @@ mod tests {
                 (block, witness)
             })
             .collect();
-        db.store_block_data(&blocks_data).unwrap();
+        let pairs: Vec<_> = blocks_data.iter().map(|(b, w)| (b, w)).collect();
+        db.store_block_data(&pairs).unwrap();
 
         let metas: Vec<BlockMeta> = (1..=5).map(make_block_meta).collect();
         ChainStore::advance_chain(&db, &metas).unwrap();
