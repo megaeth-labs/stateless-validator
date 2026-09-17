@@ -17,13 +17,26 @@
 //! witness gateway reads this same bucket — so what it covers is our own path failing (the
 //! CDN edge, an Access token, HTTP/2, the credentials, this fetcher), not the bucket failing.
 //!
-//! Operator note on missing objects: a `missing` inside the [`R2_FRONTIER_WINDOW`] below the
-//! last polled remote head is the uploader still catching up and lands on
-//! `r2_witness_errors_total{kind="missing_frontier"}`; a `missing` deeper than that is a
-//! bucket hole and feeds `kind="missing"`. A true hole does not resolve by falling back, it
-//! moves the retry onto the shared gateway, so alert on that counter and use the object key
-//! from the error's log line to check or backfill the bucket. On the custom-domain target it
-//! additionally assumes the edge does not cache 404s — see the `--r2-custom-domain` docs.
+//! Operator note on missing objects, and on which counter is worth watching in which mode.
+//! A `missing` inside the [`R2_FRONTIER_WINDOW`] below the last polled remote head is the
+//! uploader still catching up and lands on
+//! `r2_witness_errors_total{kind="missing_frontier"}`; deeper than that the object must
+//! exist, so it feeds `kind="missing"`.
+//!
+//! While following the tip those bands do not both apply: the fetcher works at
+//! `head - tip_buffer`, and every deployed buffer is far inside a 32-block window, so every
+//! miss is a frontier miss and `kind="missing"` stays at zero by construction. Frontier
+//! misses are routine and numerous there, which is exactly why they are kept off that
+//! counter, and what to watch instead is their rate. `kind="missing"` earns its name during
+//! catch-up and fixed `--end-block` backfills, where blocks sit far below the head.
+//!
+//! A hole that first appears near the tip is therefore not detected here: the block is
+//! fetched once, falls back, and is never probed again. That is deliberate rather than an
+//! oversight — the fallback already served the block, so this process has nothing to act on,
+//! and re-probing to keep a counter honest belongs with whatever watches the uploader. A
+//! true hole does not resolve by falling back either, it moves the retry onto the shared
+//! gateway. On the custom-domain target all of this additionally assumes the edge does not
+//! cache 404s — see the `--r2-custom-domain` docs.
 //!
 //! [`R2ObjectFetcher`]: stateless_r2::fetch::R2ObjectFetcher
 
@@ -48,9 +61,10 @@ use crate::metrics;
 const MAX_ATTEMPTS: usize = 3;
 
 /// Synthetic `kind` label for a `missing` inside the frontier band — the uploader has not
-/// reached the block yet, the expected near-tip outcome. Kept off [`R2WitnessError::KINDS`]
-/// (no error variant produces it); [`error_kind`] derives it so the `kind="missing"`
-/// bucket-integrity alarm only ever counts objects that must exist.
+/// reached the block yet, the expected near-tip outcome, and a common one. Kept off
+/// [`R2WitnessError::KINDS`] (no error variant produces it); [`error_kind`] derives it so
+/// `kind="missing"` keeps counting only objects that must exist, instead of being buried
+/// under the routine near-tip misses of a tip-following run.
 pub(crate) const KIND_MISSING_FRONTIER: &str = "missing_frontier";
 
 /// The `kind` label an R2 witness failure is recorded under: [`R2WitnessError::kind`], except
@@ -60,6 +74,10 @@ pub(crate) const KIND_MISSING_FRONTIER: &str = "missing_frontier";
 /// The validator only fetches at or below the head it last polled, so unlike the trace
 /// server there is no above-tip band: a block is either near enough to the head for the
 /// uploader to plausibly still be behind it, or deep enough that the object must exist.
+///
+/// Which of the two a run sees is decided by how far behind it is, not by chance: a
+/// tip-following run works inside the band and produces only frontier misses, a catch-up or
+/// backfill run works below it. See the module docs for what that means for alerting.
 pub(crate) fn error_kind(
     e: &R2WitnessError,
     number: u64,

@@ -207,9 +207,11 @@ fn register_metric_descriptions() {
     describe_counter!(
         names::R2_WITNESS_ERRORS_TOTAL,
         "R2 witness fetches that failed, each one a block that fell back to the RPC witness \
-         path, by kind (`missing_frontier` is a miss within the frontier band below the \
-         polled head — the uploader still catching up — so `missing` only counts objects \
-         that must exist)"
+         path, by kind. `missing_frontier` is a miss within the frontier band below the \
+         polled head, where the uploader may still be catching up; it is routine and \
+         carries every miss of a tip-following run, which is what keeps `missing` counting \
+         only objects that must exist — a signal that earns its name during catch-up and \
+         `--end-block` backfills"
     );
     describe_gauge!(
         names::R2_NEGOTIATED_VERSION_INFO,
