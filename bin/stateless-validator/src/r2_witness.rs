@@ -11,8 +11,9 @@
 //! object body is `zstd(bincode-legacy((SaltWitness, MptWitness)))`, which
 //! [`stateless_common::decode_witness_payload`] inverts exactly.
 //!
-//! Every failure surfaces at once, with a short retry budget and no pacing pause: the block's
-//! next stop is the `--witness-endpoint` RPC chain, and it should not wait for it. That
+//! Every failure surfaces at once, with a short retry budget, a bounded total, and no pacing
+//! pause: the block's next stop is the `--witness-endpoint` RPC chain, and it should not wait
+//! for it any longer than the fast path is worth. That
 //! fallback is a second *path* to the same bytes rather than a second copy of them — the
 //! witness gateway reads this same bucket — so what it covers is our own path failing (the
 //! CDN edge, an Access token, HTTP/2, the credentials, this fetcher), not the bucket failing.
@@ -40,7 +41,7 @@
 //!
 //! [`R2ObjectFetcher`]: stateless_r2::fetch::R2ObjectFetcher
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alloy_primitives::B256;
 use salt::SaltWitness;
@@ -58,6 +59,10 @@ use crate::metrics;
 /// failures. Small on purpose: the RPC witness chain waits behind this one, so a throttled R2
 /// should hand the block over rather than spend its time on backoff sleeps. Not an operator
 /// flag — the RPC witness path retries unboundedly, so there is nothing to mirror.
+///
+/// The count alone does not bound the stage, since an endpoint that accepts a connection and
+/// then stalls spends a full per-attempt timeout on each try; [`R2WitnessClient::new`]'s
+/// `stage_timeout` is what bounds the sum.
 const MAX_ATTEMPTS: usize = 3;
 
 /// Synthetic `kind` label for a `missing` inside the frontier band — the uploader has not
@@ -93,22 +98,35 @@ pub(crate) fn error_kind(
 #[derive(Debug)]
 pub struct R2WitnessClient {
     transport: R2WitnessTransport,
+    stage_timeout: Duration,
 }
 
 impl R2WitnessClient {
     /// Wraps an already-built transport. Construction (and the startup logging that reads
     /// the configured target off it) lives at the wiring site, which owns the flags.
-    pub const fn new(transport: R2WitnessTransport) -> Self {
-        Self { transport }
+    ///
+    /// `stage_timeout` bounds the whole fast path per block: the wait for a concurrency
+    /// permit plus every GET attempt. Without it, [`MAX_ATTEMPTS`] against an endpoint that
+    /// accepts connections and then stalls costs that many full per-attempt timeouts before
+    /// the block reaches RPC, and blocks queued behind the concurrency cap wait through
+    /// several such holders — which is the brownout the fallback exists to absorb, absorbed
+    /// far too slowly to keep the pipeline moving.
+    ///
+    /// One per-attempt timeout is the budget the wiring site passes, so a healthy fetch
+    /// (sub-second) and every fast failure mode still fit the full retry count comfortably,
+    /// while a stall costs the fast path no more wall clock than a single upstream hop.
+    pub const fn new(transport: R2WitnessTransport, stage_timeout: Duration) -> Self {
+        Self { transport, stage_timeout }
     }
 
     /// Fetches and decodes the witness for `(number, hash)` from R2. `remote_head` is the
     /// chain head the caller last polled, which classifies a miss (see [`error_kind`]).
     ///
     /// Transport/429/5xx failures are retried internally up to [`MAX_ATTEMPTS`], paced by the
-    /// backoff policy given at construction. Everything else surfaces on the first attempt,
-    /// and nothing pauses before returning: the caller's next move is the RPC witness path,
-    /// which should not wait behind a failure that has already been recorded here.
+    /// backoff policy given at construction and bounded in total by the `stage_timeout` given
+    /// there. Everything else surfaces on the first attempt, and nothing pauses before
+    /// returning: the caller's next move is the RPC witness path, which should not wait behind
+    /// a failure that has already been recorded here.
     pub async fn get_witness(
         &self,
         number: u64,
@@ -141,15 +159,26 @@ impl R2WitnessClient {
         hash: B256,
     ) -> Result<(SaltWitness, MptWitness), R2WitnessError> {
         let started = Instant::now();
+        // The deadline covers the permit wait and every attempt, so a stalling endpoint
+        // cannot hold the block past what the fast path is worth.
+        let deadline = started + self.stage_timeout;
         let fetched = self
             .transport
             .fetcher()
-            .get_block_object(number, hash, MAX_ATTEMPTS, None, metrics::on_r2_witness_retry)
+            .get_block_object(
+                number,
+                hash,
+                MAX_ATTEMPTS,
+                Some(deadline),
+                metrics::on_r2_witness_retry,
+            )
             .await?;
         let (bytes, queue_wait) = (fetched.bytes, fetched.queue_wait);
 
-        // No deadline: the pipeline fetcher has no per-block budget to protect, so a slow
-        // decode must finish rather than be abandoned and re-fetched.
+        // The decode deliberately runs outside that deadline. It is our own CPU on bytes
+        // already in hand, so it finishes; abandoning it would only re-fetch the same witness
+        // over RPC and decode it again. What the deadline is there to bound is waiting on a
+        // remote that may never answer.
         let witness = decode_on_blocking_pool(bytes, number, hash, None, |bytes| {
             decode_witness_payload(bytes)
         })
@@ -174,7 +203,10 @@ mod tests {
         fetch::{FetchTimeouts, R2GetError},
         keys,
     };
-    use stateless_test_utils::{fixtures::TestFixtures, mock_r2::mock_r2};
+    use stateless_test_utils::{
+        fixtures::TestFixtures,
+        mock_r2::{mock_r2, mock_r2_held},
+    };
 
     use super::*;
 
@@ -205,6 +237,10 @@ mod tests {
         }
     }
 
+    /// A stage budget far above anything these tests spend, so each one exercises the
+    /// behaviour it names rather than the deadline. The deadline has its own test.
+    const TEST_STAGE_TIMEOUT: Duration = Duration::from_secs(5);
+
     fn client(endpoint: &str) -> R2WitnessClient {
         let transport = R2WitnessTransport::new(
             endpoint,
@@ -216,7 +252,7 @@ mod tests {
             None,
         )
         .unwrap();
-        R2WitnessClient::new(transport)
+        R2WitnessClient::new(transport, TEST_STAGE_TIMEOUT)
     }
 
     /// One fetch with no remote head polled yet.
@@ -263,7 +299,7 @@ mod tests {
             |_| {},
         )
         .unwrap();
-        let (decoded_salt, _) = R2WitnessClient::new(transport)
+        let (decoded_salt, _) = R2WitnessClient::new(transport, TEST_STAGE_TIMEOUT)
             .get_witness(1, B256::ZERO, None)
             .await
             .expect("valid object must fetch and decode");
@@ -310,6 +346,46 @@ mod tests {
                 started.elapsed(),
             );
         }
+    }
+
+    /// An endpoint that accepts the connection and then stalls must not hold the block for
+    /// [`MAX_ATTEMPTS`] full per-attempt timeouts before the RPC chain gets it. The stage
+    /// budget covers the permit wait and every attempt together, so the block leaves for RPC
+    /// on that budget rather than on a multiple of it.
+    ///
+    /// Driven with a per-attempt timeout an order of magnitude above the stage budget, which
+    /// is the shape that goes wrong: without the aggregate bound the first attempt alone
+    /// would outlast the assertion.
+    #[tokio::test]
+    async fn a_stalling_endpoint_is_abandoned_on_the_stage_budget() {
+        let stage = Duration::from_millis(200);
+        let (endpoint, _peak) = mock_r2_held(200, Duration::from_secs(30)).await;
+        let transport = R2WitnessTransport::new(
+            &endpoint,
+            "witness-test".to_string(),
+            "ak".to_string(),
+            "sk".to_string(),
+            FetchTimeouts {
+                per_attempt: Duration::from_secs(5),
+                connect: stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT,
+            },
+            test_backoff(),
+            None,
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let err = R2WitnessClient::new(transport, stage)
+            .get_witness(1, B256::ZERO, None)
+            .await
+            .expect_err("a stalling endpoint must not serve");
+        let elapsed = started.elapsed();
+        assert!(elapsed >= stage, "gave up before spending the budget ({elapsed:?}): {err}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the stage outlived its budget ({elapsed:?}), so the block waited on a multiple \
+             of it before reaching RPC: {err}",
+        );
     }
 
     /// A `missing` within the frontier band below the polled head — or with no head polled

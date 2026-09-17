@@ -529,7 +529,7 @@ async fn r2_backed_fetcher(
         None,
     )
     .unwrap();
-    let r2 = Arc::new(R2WitnessClient::new(transport));
+    let r2 = Arc::new(R2WitnessClient::new(transport, Duration::from_secs(5)));
     (ValidatorFetcher::new(client, Some(r2)), witness_requests, handle)
 }
 

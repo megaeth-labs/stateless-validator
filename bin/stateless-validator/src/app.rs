@@ -245,7 +245,9 @@ pub struct CommandLineArgs {
     pub rpc_max_backoff_ms: Option<u64>,
 
     /// Per-attempt RPC timeout (milliseconds). Must be ≥ 100ms. With an R2 target configured
-    /// this also bounds each R2 witness GET.
+    /// it also bounds each R2 witness GET, and the R2 fast path as a whole: one block's
+    /// permit wait plus all of its GET attempts share a single budget of this size before the
+    /// block falls back to the RPC witness chain.
     #[clap(
         long,
         env = "STATELESS_VALIDATOR_RPC_PER_ATTEMPT_TIMEOUT_MS",
@@ -324,8 +326,11 @@ pub async fn run() -> Result<()> {
             .r2_connect_timeout_ms
             .map_or(stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT, Duration::from_millis),
     };
+    // The whole R2 fast path per block gets one per-attempt timeout, permit wait included:
+    // a healthy fetch is sub-second, and a stalling endpoint must not cost the block more
+    // wall clock than a single upstream hop before the RPC chain takes over.
     let r2_witness = build_r2_transport(&args, r2_timeouts, rpc_config.rpc_retry)?
-        .map(|transport| Arc::new(R2WitnessClient::new(transport)));
+        .map(|transport| Arc::new(R2WitnessClient::new(transport, per_attempt_timeout)));
     let client = Arc::new(RpcClient::new_with_config(
         &data_apis,
         &witness_apis,
