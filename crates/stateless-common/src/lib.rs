@@ -22,10 +22,10 @@ pub use witness_encoding::{
     encode_witness_response,
 };
 pub mod r2_args;
-pub use r2_args::{R2CountFlag, R2Flag, R2Flags, R2Target, R2TuningFlag, validate_r2_flags};
+pub use r2_args::{R2Config, R2CountFlag, R2Flag, R2Flags, R2TuningFlag, validate_r2_flags};
 pub mod r2_witness;
 pub use r2_witness::{
-    R2_FRONTIER_WINDOW, R2WitnessError, R2WitnessTransport, decode_on_blocking_pool,
+    R2_FRONTIER_WINDOW, R2Metrics, R2WitnessError, R2WitnessTransport, decode_on_blocking_pool,
 };
 pub mod secret;
 pub use secret::RedactedSecret;

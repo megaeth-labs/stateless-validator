@@ -11,7 +11,7 @@ use std::{
 use eyre::Result;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 pub use stateless_common::{
-    DEFAULT_METRICS_PORT, WitnessSizeBreakdown,
+    DEFAULT_METRICS_PORT, R2Metrics, WitnessSizeBreakdown,
     metrics::{
         BYTE_BUCKETS, REORG_DEPTH_BUCKETS, RpcAttemptOutcome, RpcMethod, RpcMetrics,
         install_prometheus_exporter,
@@ -49,6 +49,22 @@ impl RpcMetrics for ValidatorMetrics {
 
     fn on_witness_fetch(&self, breakdown: WitnessSizeBreakdown) {
         on_witness_fetch(breakdown);
+    }
+}
+
+/// What the shared R2 transport constructor publishes about the target it built. The same
+/// facade carries the RPC callbacks above, so a binary hands one object to both.
+impl R2Metrics for ValidatorMetrics {
+    fn on_target(&self, target: &'static str) {
+        record_r2_target(target);
+    }
+
+    fn on_connections(&self, connections: usize) {
+        record_r2_connections(connections);
+    }
+
+    fn on_negotiated_version(&self, version: &'static str) {
+        record_r2_negotiated_version(version);
     }
 }
 
@@ -90,7 +106,7 @@ pub mod names {
     metric!(CODE_FETCH_TIME, "code_fetch_time_seconds");
     metric!(WITNESS_FETCH_RPC_TIME, "witness_fetch_rpc_time_seconds");
 
-    // R2 witness source (`--witness-source r2` / `r2-then-rpc`)
+    // R2 witness source (live once the `--r2-*` flags configure a target)
     metric!(WITNESS_FETCH_R2_TIME, "witness_fetch_r2_time_seconds");
     metric!(R2_WITNESS_RETRY_ATTEMPTS_TOTAL, "r2_witness_retry_attempts_total");
     metric!(R2_WITNESS_ERRORS_TOTAL, "r2_witness_errors_total");
@@ -190,10 +206,10 @@ fn register_metric_descriptions() {
     );
     describe_counter!(
         names::R2_WITNESS_ERRORS_TOTAL,
-        "R2 witness fetches that failed, by kind (`missing_frontier` is a miss within the \
-         frontier band below the polled head — the uploader still catching up — so \
-         `missing` only counts objects that must exist); under `--witness-source \
-         r2-then-rpc` each one is a block that fell back to the RPC witness path"
+        "R2 witness fetches that failed, each one a block that fell back to the RPC witness \
+         path, by kind (`missing_frontier` is a miss within the frontier band below the \
+         polled head — the uploader still catching up — so `missing` only counts objects \
+         that must exist)"
     );
     describe_gauge!(
         names::R2_NEGOTIATED_VERSION_INFO,
@@ -252,7 +268,7 @@ fn init_r2_witness_counters() {
 /// custom domain, some still on the S3 endpoint — a spike in `r2_witness_errors_total` cannot
 /// be attributed to either. Joining on this gauge supplies that dimension without changing the
 /// established metric contract.
-pub fn record_r2_target(target: &'static str) {
+fn record_r2_target(target: &'static str) {
     gauge!(names::R2_TARGET_INFO, "target" => target).set(1.0);
 }
 
@@ -263,7 +279,7 @@ pub fn record_r2_target(target: &'static str) {
 /// published at startup, while this one is only knowable after a request. Folding both into one
 /// gauge would mean publishing it twice with different label sets, leaving the startup series
 /// stuck at 1 forever alongside the corrected one.
-pub fn record_r2_negotiated_version(version: &'static str) {
+fn record_r2_negotiated_version(version: &'static str) {
     gauge!(names::R2_NEGOTIATED_VERSION_INFO, "version" => version).set(1.0);
 }
 
@@ -273,7 +289,7 @@ pub fn record_r2_negotiated_version(version: &'static str) {
 /// budget, so a dashboard reads it against `--r2-max-concurrent-requests` and against the
 /// edge's limit rather than grouping by it. Published only for the custom-domain target, where
 /// one client is one connection and the count is a real property of the transport.
-pub fn record_r2_connections(connections: usize) {
+fn record_r2_connections(connections: usize) {
     gauge!(names::R2_CONNECTIONS).set(connections as f64);
 }
 
@@ -385,7 +401,7 @@ pub fn on_witness_fetch(b: WitnessSizeBreakdown) {
     histogram!(names::MPT_WITNESS_SIZE).record(b.mpt_size as f64);
 }
 
-// R2 witness source metrics (`--witness-source r2` / `r2-then-rpc`)
+// R2 witness source metrics (live once the `--r2-*` flags configure a target)
 
 /// Record a successful R2 witness fetch: duration (see [`names::WITNESS_FETCH_R2_TIME`]'s
 /// description for what it covers) plus the same size breakdown as [`on_witness_fetch`], so the

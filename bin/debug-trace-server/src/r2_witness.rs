@@ -156,7 +156,7 @@ mod tests {
             ),
             None,
             1,
-            metrics::record_r2_negotiated_version,
+            |_| {},
         )
         .unwrap();
         R2WitnessSource::new(transport)

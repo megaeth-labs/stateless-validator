@@ -10,11 +10,9 @@ pub(crate) mod r2_witness;
 pub(crate) mod runner;
 pub(crate) mod validator_db;
 
-pub use app::{
-    CommandLineArgs, VALIDATOR_DB_FILENAME, WitnessSource, load_or_create_chain_spec, run,
-};
+pub use app::{CommandLineArgs, VALIDATOR_DB_FILENAME, load_or_create_chain_spec, run};
 pub use chain_sync::{ValidationTask, ValidatorFetcher, ValidatorHooks, ValidatorProcessor};
-pub use r2_witness::{R2FailurePolicy, R2WitnessClient, R2WitnessError};
+pub use r2_witness::{R2WitnessClient, R2WitnessError};
 pub use runner::run_with_signals;
 pub use validator_db::ValidatorDB;
 

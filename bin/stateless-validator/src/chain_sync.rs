@@ -28,17 +28,14 @@ use stateless_db::ContractCache;
 use tokio::task;
 use tracing::{debug, error};
 
-use crate::{
-    metrics,
-    r2_witness::{R2FailurePolicy, R2WitnessClient},
-};
+use crate::{metrics, r2_witness::R2WitnessClient};
 
 /// Fetcher for the validator: fetches blocks + witnesses, wraps in [`ValidationTask`], and records
 /// remote chain height for metrics.
 ///
-/// Blocks, headers, and contract code always come from the data RPC; the witness comes from
-/// `mega_getBlockWitness` (default), straight from R2 ([`R2WitnessClient`]), or from R2 with
-/// the RPC path as fallback — the client's [`R2FailurePolicy`] says which.
+/// Blocks, headers, and contract code always come from the data RPC. The witness comes from
+/// `mega_getBlockWitness`, or from R2 first with that RPC path behind it when the `--r2-*`
+/// flags configure a target ([`R2WitnessClient`]).
 pub struct ValidatorFetcher {
     rpc_client: Arc<RpcClient>,
     /// `Some` ⇒ fetch witnesses from R2 first; `None` ⇒ RPC only.
@@ -51,8 +48,8 @@ pub struct ValidatorFetcher {
 }
 
 impl ValidatorFetcher {
-    /// A fetcher over `rpc_client`, with witnesses from `r2_witness` when given (its policy
-    /// decides whether RPC stays behind it as the fallback) and from RPC otherwise.
+    /// A fetcher over `rpc_client`, trying `r2_witness` first when given and falling back to
+    /// the client's RPC witness chain, or going straight to that chain otherwise.
     pub fn new(rpc_client: Arc<RpcClient>, r2_witness: Option<Arc<R2WitnessClient>>) -> Self {
         Self { rpc_client, r2_witness, remote_head: AtomicU64::new(0) }
     }
@@ -65,28 +62,24 @@ impl ValidatorFetcher {
         }
     }
 
-    /// The witness for `(block_number, block_hash)` from whichever source is configured.
+    /// The witness for `(block_number, block_hash)`: from R2 when a target is configured,
+    /// otherwise straight from the RPC witness chain.
     ///
-    /// The RPC witness path retries internally until it succeeds. An R2 fetch is fallible;
-    /// what a failure means is the client's policy: under [`R2FailurePolicy::Surface`] it
-    /// surfaces as a fetch error and the pipeline re-enqueues the block, under
-    /// [`R2FailurePolicy::FallBackToRpc`] the block is fetched over RPC instead (the client has
-    /// already recorded and logged the failure).
+    /// An R2 fetch is fallible and any failure hands the block to that same chain, which
+    /// retries internally until it succeeds. The R2 client has already recorded and logged
+    /// what went wrong, so nothing is returned about it here — as far as the pipeline is
+    /// concerned this stays as infallible as the RPC-only path always was.
     async fn fetch_witness(
         &self,
         block_number: u64,
         block_hash: B256,
-    ) -> Result<(SaltWitness, MptWitness)> {
-        let Some(r2) = &self.r2_witness else {
-            return Ok(self.rpc_client.get_witness(block_number, block_hash).await);
-        };
-        match r2.get_witness(block_number, block_hash, self.remote_head()).await {
-            Ok(witness) => Ok(witness),
-            Err(_) if r2.policy() == R2FailurePolicy::FallBackToRpc => {
-                Ok(self.rpc_client.get_witness(block_number, block_hash).await)
-            }
-            Err(e) => Err(e.into()),
+    ) -> (SaltWitness, MptWitness) {
+        if let Some(r2) = &self.r2_witness &&
+            let Ok(witness) = r2.get_witness(block_number, block_hash, self.remote_head()).await
+        {
+            return witness;
         }
+        self.rpc_client.get_witness(block_number, block_hash).await
     }
 }
 
@@ -98,9 +91,8 @@ impl BlockFetcher for ValidatorFetcher {
         // Fetch by hash (not number) so a reorg between the hash lookup and the block fetch
         // surfaces as a hash mismatch rather than silently swapping the block under us.
         let block_fut = self.rpc_client.get_block(BlockId::Hash(block_hash.into()), true);
-        let (witness, block) =
+        let ((salt_witness, mpt_witness), block) =
             tokio::join!(self.fetch_witness(block_number, block_hash), block_fut);
-        let (salt_witness, mpt_witness) = witness?;
         Ok(ValidationTask { block, salt_witness, mpt_witness })
     }
 

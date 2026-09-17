@@ -11,27 +11,23 @@
 //! object body is `zstd(bincode-legacy((SaltWitness, MptWitness)))`, which
 //! [`stateless_common::decode_witness_payload`] inverts exactly.
 //!
-//! What happens after a fetch fails is the [`R2FailurePolicy`] chosen at the wiring site.
-//! Under `--witness-source r2` R2 is the sole source: the pipeline retries a `Missing`
-//! witness indefinitely (each attempt throttled by [`DETERMINISTIC_FAILURE_THROTTLE`]),
-//! which near the tip is exactly right — the object appears once the uploader wins the
-//! race. Under `--witness-source r2-then-rpc` the RPC witness path waits behind R2, so a
-//! failure surfaces at once, with a short retry budget and no pause, and the pipeline
-//! fetcher takes the block over RPC — the trace server's R2-first shape.
+//! Every failure surfaces at once, with a short retry budget and no pacing pause: the block's
+//! next stop is the `--witness-endpoint` RPC chain, and it should not wait for it. That
+//! fallback is a second *path* to the same bytes rather than a second copy of them — the
+//! witness gateway reads this same bucket — so what it covers is our own path failing (the
+//! CDN edge, an Access token, HTTP/2, the credentials, this fetcher), not the bucket failing.
 //!
-//! Operator note on missing objects: a `missing` inside the [`R2_FRONTIER_WINDOW`] below
-//! the last polled remote head is the uploader still catching up and lands on
+//! Operator note on missing objects: a `missing` inside the [`R2_FRONTIER_WINDOW`] below the
+//! last polled remote head is the uploader still catching up and lands on
 //! `r2_witness_errors_total{kind="missing_frontier"}`; a `missing` deeper than that is a
-//! bucket hole and feeds `kind="missing"`. On a fixed `--end-block` slice over history under
-//! `--witness-source r2`, a permanently absent object means the run never completes and
-//! never fails: alert on `kind="missing"`, and use the object key from the error's log line
-//! to check/backfill the bucket. On the custom-domain target, "appears once the uploader
-//! wins" additionally assumes the edge does not cache 404s — see the `--r2-custom-domain`
-//! flag docs.
+//! bucket hole and feeds `kind="missing"`. A true hole does not resolve by falling back, it
+//! moves the retry onto the shared gateway, so alert on that counter and use the object key
+//! from the error's log line to check or backfill the bucket. On the custom-domain target it
+//! additionally assumes the edge does not cache 404s — see the `--r2-custom-domain` docs.
 //!
 //! [`R2ObjectFetcher`]: stateless_r2::fetch::R2ObjectFetcher
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use alloy_primitives::B256;
 use salt::SaltWitness;
@@ -45,46 +41,17 @@ use tracing::{debug, trace, warn};
 
 use crate::metrics;
 
-/// Throttle applied before surfacing any deterministic (non-retryable) failure under
-/// [`R2FailurePolicy::Surface`]: the pipeline fetcher
-/// (`stateless-core/src/pipeline/fetcher.rs`) re-enqueues failed fetches with no delay, so
-/// returning instantly would hot-loop GETs against R2. Delete this once the fetcher grows
-/// per-block re-enqueue backoff. Test builds shrink it so the failure-path tests run in
-/// milliseconds.
-const DETERMINISTIC_FAILURE_THROTTLE: Duration =
-    if cfg!(test) { Duration::from_millis(5) } else { Duration::from_secs(2) };
+/// Total GET attempts (first try + retries) per fetch, for retryable (transport/429/5xx)
+/// failures. Small on purpose: the RPC witness chain waits behind this one, so a throttled R2
+/// should hand the block over rather than spend its time on backoff sleeps. Not an operator
+/// flag — the RPC witness path retries unboundedly, so there is nothing to mirror.
+const MAX_ATTEMPTS: usize = 3;
 
 /// Synthetic `kind` label for a `missing` inside the frontier band — the uploader has not
 /// reached the block yet, the expected near-tip outcome. Kept off [`R2WitnessError::KINDS`]
 /// (no error variant produces it); [`error_kind`] derives it so the `kind="missing"`
 /// bucket-integrity alarm only ever counts objects that must exist.
 pub(crate) const KIND_MISSING_FRONTIER: &str = "missing_frontier";
-
-/// What the pipeline does with an R2 failure, and therefore how hard the client tries before
-/// surfacing one. Chosen by `--witness-source`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum R2FailurePolicy {
-    /// R2 is the sole witness source (`--witness-source r2`): the pipeline fetcher
-    /// re-enqueues a failed block with no delay, so the client retries retryable failures
-    /// through a long budget and pauses before surfacing anything.
-    Surface,
-    /// The RPC witness path waits behind R2 (`--witness-source r2-then-rpc`): a failure hands
-    /// the block to RPC at once, so the retry budget is short and nothing pauses — a throttled
-    /// R2 should hand over quickly instead of holding the block on backoff sleeps.
-    FallBackToRpc,
-}
-
-impl R2FailurePolicy {
-    /// Total GET attempts (first try + retries) per fetch for retryable (transport/429/5xx)
-    /// failures before the error surfaces. Local constants rather than flags: the RPC witness
-    /// path retries unboundedly, so there is no operator setting to mirror.
-    const fn max_attempts(self) -> usize {
-        match self {
-            Self::Surface => 9,
-            Self::FallBackToRpc => 3,
-        }
-    }
-}
 
 /// The `kind` label an R2 witness failure is recorded under: [`R2WitnessError::kind`], except
 /// that a `missing` inside the [`R2_FRONTIER_WINDOW`] below `remote_head` — or with no head
@@ -108,34 +75,22 @@ pub(crate) fn error_kind(
 #[derive(Debug)]
 pub struct R2WitnessClient {
     transport: R2WitnessTransport,
-    policy: R2FailurePolicy,
 }
 
 impl R2WitnessClient {
     /// Wraps an already-built transport. Construction (and the startup logging that reads
     /// the configured target off it) lives at the wiring site, which owns the flags.
-    pub const fn new(transport: R2WitnessTransport, policy: R2FailurePolicy) -> Self {
-        Self { transport, policy }
-    }
-
-    /// What the pipeline does with a failure this client surfaces.
-    pub const fn policy(&self) -> R2FailurePolicy {
-        self.policy
+    pub const fn new(transport: R2WitnessTransport) -> Self {
+        Self { transport }
     }
 
     /// Fetches and decodes the witness for `(number, hash)` from R2. `remote_head` is the
     /// chain head the caller last polled, which classifies a miss (see [`error_kind`]).
     ///
-    /// Transport/429/5xx failures are retried internally, paced by the `retry_backoff` policy
-    /// given at construction, up to the [`R2FailurePolicy`]'s attempt budget. Under
-    /// [`R2FailurePolicy::Surface`] every surfaced failure pauses before returning (the
-    /// pipeline fetcher re-enqueues failed fetches with zero delay, so returning instantly
-    /// would hot-loop GETs against R2): deterministic failures wait the fixed
-    /// [`DETERMINISTIC_FAILURE_THROTTLE`], and exhausted retryable failures wait the policy's
-    /// `max` backoff — without that, the next fetch cycle would restart its ramp at `initial`,
-    /// re-bursting GETs into the same brownout the exhausted ramp just backed away from.
-    /// Under [`R2FailurePolicy::FallBackToRpc`] failures return at once: the caller's next
-    /// move is the RPC witness path, and it should not wait for it.
+    /// Transport/429/5xx failures are retried internally up to [`MAX_ATTEMPTS`], paced by the
+    /// backoff policy given at construction. Everything else surfaces on the first attempt,
+    /// and nothing pauses before returning: the caller's next move is the RPC witness path,
+    /// which should not wait behind a failure that has already been recorded here.
     pub async fn get_witness(
         &self,
         number: u64,
@@ -146,28 +101,16 @@ impl R2WitnessClient {
         if let Err(e) = &result {
             let kind = error_kind(e, number, remote_head);
             metrics::on_r2_witness_error(kind);
-            match self.policy {
-                R2FailurePolicy::Surface => {
-                    // The pipeline fetcher logs the surfaced error when it re-enqueues.
-                    let pause = if e.is_retryable() {
-                        self.transport.fetcher().pacing().max
-                    } else {
-                        DETERMINISTIC_FAILURE_THROTTLE
-                    };
-                    tokio::time::sleep(pause).await;
-                }
-                R2FailurePolicy::FallBackToRpc if kind == KIND_MISSING_FRONTIER => {
-                    debug!(number, %hash, "Frontier witness not in R2 yet; fetching over RPC");
-                }
-                R2FailurePolicy::FallBackToRpc => {
-                    warn!(
-                        number,
-                        %hash,
-                        kind,
-                        error = %e,
-                        "R2 witness fetch failed, falling back to the RPC witness path",
-                    );
-                }
+            if kind == KIND_MISSING_FRONTIER {
+                debug!(number, %hash, "Frontier witness not in R2 yet; fetching over RPC");
+            } else {
+                warn!(
+                    number,
+                    %hash,
+                    kind,
+                    error = %e,
+                    "R2 witness fetch failed, falling back to the RPC witness path",
+                );
             }
         }
         result
@@ -183,13 +126,7 @@ impl R2WitnessClient {
         let fetched = self
             .transport
             .fetcher()
-            .get_block_object(
-                number,
-                hash,
-                self.policy.max_attempts(),
-                None,
-                metrics::on_r2_witness_retry,
-            )
+            .get_block_object(number, hash, MAX_ATTEMPTS, None, metrics::on_r2_witness_retry)
             .await?;
         let (bytes, queue_wait) = (fetched.bytes, fetched.queue_wait);
 
@@ -212,7 +149,7 @@ impl R2WitnessClient {
 
 #[cfg(test)]
 mod tests {
-    use std::{str::FromStr, sync::atomic::Ordering};
+    use std::{str::FromStr, sync::atomic::Ordering, time::Duration};
 
     use stateless_common::BackoffPolicy;
     use stateless_r2::{
@@ -243,38 +180,30 @@ mod tests {
         BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(20))
     }
 
-    fn client_with(
-        endpoint: &str,
-        retry_backoff: BackoffPolicy,
-        policy: R2FailurePolicy,
-    ) -> R2WitnessClient {
+    fn test_timeouts() -> FetchTimeouts {
+        FetchTimeouts {
+            per_attempt: Duration::from_secs(5),
+            connect: stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT,
+        }
+    }
+
+    fn client(endpoint: &str) -> R2WitnessClient {
         let transport = R2WitnessTransport::new(
             endpoint,
             "witness-test".to_string(),
             "ak".to_string(),
             "sk".to_string(),
-            FetchTimeouts {
-                per_attempt: Duration::from_secs(5),
-                connect: stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT,
-            },
-            retry_backoff,
+            test_timeouts(),
+            test_backoff(),
             None,
         )
         .unwrap();
-        R2WitnessClient::new(transport, policy)
+        R2WitnessClient::new(transport)
     }
 
-    /// One fetch under the given policy, with no remote head polled.
-    async fn fetch_with(
-        endpoint: &str,
-        policy: R2FailurePolicy,
-    ) -> Result<(SaltWitness, MptWitness), R2WitnessError> {
-        client_with(endpoint, test_backoff(), policy).get_witness(1, B256::ZERO, None).await
-    }
-
-    /// One fetch under the sole-source policy — the shape most tests exercise.
+    /// One fetch with no remote head polled yet.
     async fn fetch(endpoint: &str) -> Result<(SaltWitness, MptWitness), R2WitnessError> {
-        fetch_with(endpoint, R2FailurePolicy::Surface).await
+        client(endpoint).get_witness(1, B256::ZERO, None).await
     }
 
     /// The only test of the success path (fetch → `spawn_blocking` decode): a fixture witness
@@ -309,18 +238,14 @@ mod tests {
         let transport = R2WitnessTransport::new_custom_domain(
             &domain,
             None,
-            FetchTimeouts {
-                per_attempt: Duration::from_secs(5),
-                connect: stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT,
-            },
+            test_timeouts(),
             test_backoff(),
             None,
             1,
-            metrics::record_r2_negotiated_version,
+            |_| {},
         )
         .unwrap();
-        let client = R2WitnessClient::new(transport, R2FailurePolicy::Surface);
-        let (decoded_salt, _) = client
+        let (decoded_salt, _) = R2WitnessClient::new(transport)
             .get_witness(1, B256::ZERO, None)
             .await
             .expect("valid object must fetch and decode");
@@ -338,60 +263,18 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1, "a corrupt object must not be re-downloaded");
     }
 
-    /// Every deterministic failure must be throttled before surfacing (see
-    /// [`DETERMINISTIC_FAILURE_THROTTLE`] for why).
+    /// Every failure hands the block to the RPC witness chain, so none of them may pause on
+    /// the way out and the retryable ones stop at a small budget. A pause here would be spent
+    /// before the fallback even starts, on every block R2 cannot serve.
     #[tokio::test]
-    async fn deterministic_failures_are_throttled_before_surfacing() {
-        for (status, body) in [(403, ""), (404, ""), (200, "garbage")] {
-            let (endpoint, _) = mock_r2(vec![(status, body)]).await;
-            let started = std::time::Instant::now();
-            fetch(&endpoint).await.unwrap_err();
-            assert!(
-                started.elapsed() >= DETERMINISTIC_FAILURE_THROTTLE,
-                "status {status} surfaced without the deterministic-failure throttle",
-            );
-        }
-    }
-
-    /// Exhausted retryable failures must pause the policy's `max` backoff before surfacing:
-    /// the pipeline fetcher re-enqueues with zero delay, so without the pause the next fetch
-    /// cycle would re-burst a fresh ramp (starting at `initial`) into the same brownout.
-    #[tokio::test]
-    async fn exhausted_retries_pause_max_backoff_before_surfacing() {
-        let (endpoint, hits) = mock_r2(vec![(503, "overloaded")]).await;
-        // The ramp's 8 in-loop sleeps double from 1ms and never reach the 400ms cap
-        // (1+2+…+128 = 255ms before jitter, ≤382ms with the ≤50% jitter), so of the asserted
-        // lower bound, ≥400ms is attributable to the exhaustion pause alone.
-        let (initial, max) = (Duration::from_millis(1), Duration::from_millis(400));
-        let client =
-            client_with(&endpoint, BackoffPolicy::new(initial, max), R2FailurePolicy::Surface);
-        let started = std::time::Instant::now();
-        let err = client.get_witness(1, B256::ZERO, None).await.unwrap_err();
-        assert!(
-            matches!(err, R2WitnessError::Get(R2GetError::Throttled { status: 503, .. })),
-            "{err}"
-        );
-        assert_eq!(hits.load(Ordering::SeqCst), R2FailurePolicy::Surface.max_attempts());
-        assert!(
-            started.elapsed() >= Duration::from_millis(255) + max,
-            "exhausted retries surfaced without the max-backoff pause ({:?})",
-            started.elapsed(),
-        );
-    }
-
-    /// Under the fallback policy a failure is the RPC path's cue, so it must surface at once:
-    /// a short retry budget for retryable failures and no pause of any kind — neither the
-    /// deterministic-failure throttle nor the exhausted-retry pause, both of which exist only
-    /// to pace the sole-source pipeline's blind re-enqueue.
-    #[tokio::test]
-    async fn fallback_policy_hands_over_after_a_short_budget_without_pausing() {
+    async fn failures_surface_immediately_for_the_rpc_fallback() {
         let (endpoint, hits) = mock_r2(vec![(503, "overloaded")]).await;
         let started = std::time::Instant::now();
-        let err = fetch_with(&endpoint, R2FailurePolicy::FallBackToRpc).await.unwrap_err();
+        let err = fetch(&endpoint).await.unwrap_err();
         assert!(matches!(err, R2WitnessError::Get(R2GetError::Throttled { .. })), "{err}");
-        assert_eq!(hits.load(Ordering::SeqCst), R2FailurePolicy::FallBackToRpc.max_attempts());
-        // The two in-loop backoff sleeps of `test_backoff` total well under 100ms; the
-        // sole-source policy would have added its `max` pause on top.
+        assert_eq!(hits.load(Ordering::SeqCst), MAX_ATTEMPTS, "retryable failures use the budget");
+        // The two in-loop backoff sleeps of `test_backoff` total well under this; anything
+        // larger is a pacing pause that no longer belongs here.
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "an exhausted retryable failure paused before surfacing ({:?})",
@@ -401,10 +284,10 @@ mod tests {
         for (status, body) in [(403, ""), (404, ""), (200, "garbage")] {
             let (endpoint, hits) = mock_r2(vec![(status, body)]).await;
             let started = std::time::Instant::now();
-            fetch_with(&endpoint, R2FailurePolicy::FallBackToRpc).await.unwrap_err();
+            fetch(&endpoint).await.unwrap_err();
             assert_eq!(hits.load(Ordering::SeqCst), 1, "status {status} must not be retried");
             assert!(
-                started.elapsed() < DETERMINISTIC_FAILURE_THROTTLE,
+                started.elapsed() < Duration::from_millis(100),
                 "status {status} paused before surfacing ({:?})",
                 started.elapsed(),
             );

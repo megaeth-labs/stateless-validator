@@ -8,7 +8,7 @@
 //! labels, and the transport wrapper (construction, target accessors) — so the two
 //! adapters cannot drift apart on it.
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use alloy_primitives::B256;
 use stateless_r2::{
@@ -17,7 +17,7 @@ use stateless_r2::{
 };
 use tokio::task::JoinError;
 
-use crate::{BackoffPolicy, WitnessDecodingError};
+use crate::{BackoffPolicy, R2Config, WitnessDecodingError};
 
 /// Near-tip band (in blocks) inside which an R2 witness `missing` is the expected
 /// probe-ahead outcome — the uploader may plausibly not have PUT the object yet — rather
@@ -129,6 +129,25 @@ pub async fn decode_on_blocking_pool<T: Send + 'static>(
     }
 }
 
+/// What the shared transport constructor publishes about the target it built, implemented by
+/// each binary so the constructor never needs to know a metric-name prefix.
+///
+/// Mirrors [`RpcMetrics`](crate::RpcMetrics), which does the same for the RPC client: the
+/// binaries own their metric names, this crate owns when the values are known.
+pub trait R2Metrics: Send + Sync {
+    /// The configured target's label, known at startup.
+    fn on_target(&self, target: &'static str);
+
+    /// How many HTTP/2 connections the custom-domain target spreads its GETs over. Not called
+    /// for the S3 target, where one client already opens a socket per in-flight GET and the
+    /// count is not a property of the transport.
+    fn on_connections(&self, connections: usize);
+
+    /// The protocol the custom domain actually negotiated. Only knowable once a response has
+    /// been seen, so this fires from the fetcher rather than at startup.
+    fn on_negotiated_version(&self, version: &'static str);
+}
+
 /// The shared transport of the two R2 witness adapters: an [`R2ObjectFetcher`] plus the
 /// construction and target accessors both binaries would otherwise duplicate verbatim.
 /// The fetcher's `Debug` redacts the credentials.
@@ -195,6 +214,56 @@ impl R2WitnessTransport {
         .map(|fetcher| fetcher.on_version_observed(on_version_observed))
         .map_err(|e| eyre::eyre!(e))?;
         Ok(Self { fetcher, max_concurrent_requests })
+    }
+
+    /// Builds the transport a validated [`R2Config`] selects, or `None` when no R2 target is
+    /// configured, publishing what it built through `metrics`.
+    ///
+    /// This is the one place either binary turns a verdict into a transport. Written out per
+    /// binary, each arm needed an `expect()` per field restating what `validate_r2_flags`
+    /// had already proved, and the two copies could disagree with those rules about which
+    /// flags a target requires; the verdict carries its values, so nothing is asserted twice.
+    ///
+    /// The caller logs what it built from the accessors below, in its own words: the two
+    /// binaries describe the same transport differently, one as the whole witness source and
+    /// one as the fast path in front of an RPC chain.
+    pub fn from_config(
+        config: R2Config,
+        timeouts: FetchTimeouts,
+        retry_backoff: BackoffPolicy,
+        max_concurrent_requests: Option<usize>,
+        metrics: Arc<dyn R2Metrics>,
+    ) -> eyre::Result<Option<Self>> {
+        let transport = match config {
+            R2Config::None => return Ok(None),
+            R2Config::CustomDomain { domain, access, connections } => {
+                let observer = Arc::clone(&metrics);
+                let transport = Self::new_custom_domain(
+                    &domain,
+                    access,
+                    timeouts,
+                    retry_backoff,
+                    max_concurrent_requests,
+                    connections,
+                    move |version| observer.on_negotiated_version(version),
+                )?;
+                // Read back off the transport rather than echoing the configured count: the
+                // gauge must report the connections that exist.
+                metrics.on_connections(transport.connections());
+                transport
+            }
+            R2Config::S3 { endpoint, bucket, access_key_id, secret_access_key } => Self::new(
+                &endpoint,
+                bucket,
+                access_key_id,
+                secret_access_key,
+                timeouts,
+                retry_backoff,
+                max_concurrent_requests,
+            )?,
+        };
+        metrics.on_target(transport.target_label());
+        Ok(Some(transport))
     }
 
     /// The underlying fetcher, for the adapter's own GETs and pacing reads.

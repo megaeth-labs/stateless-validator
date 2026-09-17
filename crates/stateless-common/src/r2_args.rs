@@ -13,6 +13,7 @@
 //! in the spelling the calling binary uses for it.
 
 use eyre::{Result, bail};
+use stateless_r2::fetch::CfAccessCredentials;
 
 /// One `--r2-*` flag carrying a value: the spelling this binary gives it, and what it parsed.
 #[derive(Clone, Copy)]
@@ -91,18 +92,78 @@ pub struct R2Flags<'a> {
     pub tuning: &'a [R2TuningFlag<'a>],
 }
 
-/// Which target a validated flag set selects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum R2Target {
+/// What a validated flag set selects, carrying the values that selection proved present.
+///
+/// The verdict carries the values rather than just naming the target, so a caller never
+/// re-reads the argument struct to recover them. Read back out of the flags, every caller
+/// would need an `expect()` per field asserting what these rules already proved, and each copy
+/// is a place that can disagree with the rules about which flags a target actually requires.
+#[derive(Clone)]
+pub enum R2Config {
     /// No R2 flags configured; the caller decides whether that is fatal for its mode.
     None,
     /// SigV4-signed GETs against the bare S3 endpoint.
-    S3,
+    S3 {
+        /// Bare endpoint origin, no bucket path.
+        endpoint: String,
+        /// Bucket holding the witness objects.
+        bucket: String,
+        /// Object-read access key id.
+        access_key_id: String,
+        /// Its secret.
+        secret_access_key: String,
+    },
     /// Unsigned GETs through a Cloudflare custom domain, spread over this many HTTP/2
-    /// connections. Carried on the verdict rather than left for the caller to parse again:
-    /// the count is validated here, and a caller that re-derived it would be a second place
-    /// the same rule lives.
-    CustomDomain { connections: usize },
+    /// connections.
+    CustomDomain {
+        /// Bare domain origin; objects are fetched as `/{key}`.
+        domain: String,
+        /// Cloudflare Access service token, when the domain is behind one.
+        access: Option<CfAccessCredentials>,
+        /// How many HTTP/2 connections to spread GETs over. Validated here, so a caller that
+        /// re-derived it would be a second place the same rule lives.
+        connections: usize,
+    },
+}
+
+impl R2Config {
+    /// Whether any R2 target is configured at all.
+    pub const fn is_configured(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// `Debug` redacts the S3 secret, matching the argument structs, which carry it in a
+/// [`RedactedSecret`](crate::RedactedSecret); the Access token redacts itself.
+impl std::fmt::Debug for R2Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::S3 { endpoint, bucket, access_key_id, .. } => f
+                .debug_struct("S3")
+                .field("endpoint", endpoint)
+                .field("bucket", bucket)
+                .field("access_key_id", access_key_id)
+                .field("secret_access_key", &"[redacted]")
+                .finish(),
+            Self::CustomDomain { domain, access, connections } => f
+                .debug_struct("CustomDomain")
+                .field("domain", domain)
+                .field("access", access)
+                .field("connections", connections)
+                .finish(),
+        }
+    }
+}
+
+/// The target a flag set selects, with the values that selection proved present, still
+/// borrowed from the argument struct. The rules below take this rather than an owned
+/// [`R2Config`] so the per-target checks run before anything is cloned.
+#[derive(Clone, Copy)]
+enum Selected<'a> {
+    None,
+    S3 { endpoint: &'a str, bucket: &'a str, access_key_id: &'a str, secret_access_key: &'a str },
+    CustomDomain { domain: &'a str },
 }
 
 /// Validates one binary's `--r2-*` flags and reports which target they select.
@@ -117,7 +178,7 @@ pub enum R2Target {
 /// configured target or as a leftover from one — without that ordering, a blank
 /// `..._R2_CUSTOM_DOMAIN=` beside a working S3 configuration gets told to unset the S3
 /// configuration.
-pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Target> {
+pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Config> {
     let s3_credentials = [flags.bucket, flags.access_key_id, flags.secret_access_key];
     let all_values = [
         flags.endpoint,
@@ -139,14 +200,16 @@ pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Target> {
         }
     }
 
-    // Past the sweep, presence is the only predicate: anything still set was meant.
-    let target = match (flags.custom_domain.is_set(), flags.endpoint.is_set()) {
-        (true, true) => bail!(
+    // Past the sweep, presence is the only predicate: anything still set was meant. Each arm
+    // binds the values it proves in the same `let` that proves them, so the verdict is built
+    // below without a single `expect()` restating a check made here.
+    let selected = match (flags.custom_domain.value, flags.endpoint.value) {
+        (Some(_), Some(_)) => bail!(
             "{} and {} are mutually exclusive R2 targets: configure exactly one",
             flags.endpoint.name,
             flags.custom_domain.name
         ),
-        (true, false) => {
+        (Some(domain), None) => {
             // The domain replaces the S3 target, so anything left of it is dead configuration;
             // reading past it in silence would hide which credentials are actually in use.
             let leftovers = names_of(&s3_credentials, R2Flag::is_set);
@@ -158,32 +221,33 @@ pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Target> {
                     leftovers.join(", ")
                 );
             }
-            R2Target::CustomDomain { connections: 1 }
+            Selected::CustomDomain { domain }
         }
-        (false, true) => {
-            let missing = names_of(&s3_credentials, |f| !f.is_set());
-            if !missing.is_empty() {
+        (None, Some(endpoint)) => {
+            let (Some(bucket), Some(access_key_id), Some(secret_access_key)) =
+                (flags.bucket.value, flags.access_key_id.value, flags.secret_access_key.value)
+            else {
                 bail!(
                     "{} needs the whole S3 credential set; missing: {}",
                     flags.endpoint.name,
-                    missing.join(", ")
+                    names_of(&s3_credentials, |f| !f.is_set()).join(", ")
                 );
-            }
-            R2Target::S3
+            };
+            Selected::S3 { endpoint, bucket, access_key_id, secret_access_key }
         }
-        (false, false) => {
+        (None, None) => {
             // A partial quad with no endpoint builds nothing, so say what is missing rather
             // than starting with the R2 route quietly disabled.
             let present = names_of(&s3_credentials, R2Flag::is_set);
             if !present.is_empty() {
                 bail!("{} is required alongside {}", flags.endpoint.name, present.join(", "));
             }
-            R2Target::None
+            Selected::None
         }
     };
 
-    validate_access_pair(flags, target)?;
-    let connections = validate_connections(flags, target)?;
+    validate_access_pair(flags, selected)?;
+    let connections = validate_connections(flags, selected)?;
 
     // The connection count joins the tuning flags here rather than being reported on its own,
     // so an operator who orphaned several of them is told about all of them at once.
@@ -194,16 +258,33 @@ pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Target> {
         .map(|flag| flag.name)
         .chain(flags.connections.value.map(|_| flags.connections.name))
         .collect();
-    if target == R2Target::None && !orphan_tuning.is_empty() {
+    if matches!(selected, Selected::None) && !orphan_tuning.is_empty() {
         bail!(
             "{} only applies once an R2 target is configured: set one, or unset the flag",
             orphan_tuning.join(", ")
         );
     }
 
-    Ok(match target {
-        R2Target::CustomDomain { .. } => R2Target::CustomDomain { connections },
-        settled => settled,
+    Ok(match selected {
+        Selected::None => R2Config::None,
+        Selected::S3 { endpoint, bucket, access_key_id, secret_access_key } => R2Config::S3 {
+            endpoint: endpoint.to_owned(),
+            bucket: bucket.to_owned(),
+            access_key_id: access_key_id.to_owned(),
+            secret_access_key: secret_access_key.to_owned(),
+        },
+        // `validate_access_pair` proved the pair whole-or-absent, so the zip is honest rather
+        // than a half-set pair silently collapsing to an unauthenticated client.
+        Selected::CustomDomain { domain } => R2Config::CustomDomain {
+            domain: domain.to_owned(),
+            access: flags.access_client_id.value.zip(flags.access_client_secret.value).map(
+                |(client_id, client_secret)| CfAccessCredentials {
+                    client_id: client_id.to_owned(),
+                    client_secret: client_secret.to_owned(),
+                },
+            ),
+            connections,
+        },
     })
 }
 
@@ -234,12 +315,12 @@ fn parse_r2_connections(flag: R2Flag<'_>) -> Result<usize> {
 /// and honouring it silently would leave the operator expecting a spread they did not get.
 /// Rejected rather than clamped against the cap for the same reason — and because clamping
 /// would quietly hand back fewer connections than the published gauge reports.
-fn validate_connections(flags: &R2Flags<'_>, target: R2Target) -> Result<usize> {
+fn validate_connections(flags: &R2Flags<'_>, selected: Selected<'_>) -> Result<usize> {
     let count = parse_r2_connections(flags.connections)?;
     if flags.connections.value.is_none() {
         return Ok(count);
     }
-    if target == R2Target::S3 {
+    if matches!(selected, Selected::S3 { .. }) {
         bail!(
             "{} applies only to {}: the S3 target already opens a connection per in-flight GET",
             flags.connections.name,
@@ -269,7 +350,7 @@ fn validate_connections(flags: &R2Flags<'_>, target: R2Target) -> Result<usize> 
 /// legitimate configuration (an IP-allowlisted domain), so a half-set pair would otherwise
 /// build a working but silently *unauthenticated* client — and on the custom-domain target the
 /// edge answers unauthenticated GETs with a non-retryable 403.
-fn validate_access_pair(flags: &R2Flags<'_>, target: R2Target) -> Result<()> {
+fn validate_access_pair(flags: &R2Flags<'_>, selected: Selected<'_>) -> Result<()> {
     let (id, secret) = (flags.access_client_id, flags.access_client_secret);
     match (id.is_set(), secret.is_set()) {
         (false, false) => return Ok(()),
@@ -281,7 +362,7 @@ fn validate_access_pair(flags: &R2Flags<'_>, target: R2Target) -> Result<()> {
         }
         (true, true) => {}
     }
-    if !matches!(target, R2Target::CustomDomain { .. }) {
+    if !matches!(selected, Selected::CustomDomain { .. }) {
         bail!(
             "{} and {} apply only to {}: configure that target, or unset the pair",
             id.name,
@@ -335,7 +416,7 @@ mod tests {
             }
         }
 
-        fn validate(&'a self) -> Result<R2Target> {
+        fn validate(&'a self) -> Result<R2Config> {
             validate_r2_flags(&self.flags())
         }
 
@@ -414,14 +495,42 @@ mod tests {
 
     const DOMAIN: Option<&str> = Some("https://w.example.com");
 
+    /// The verdict names the target *and* hands back the values that selection proved, so a
+    /// caller never re-reads the argument struct. Asserting the values here is what keeps the
+    /// callers' `expect()`-free construction honest.
     #[test]
-    fn selects_the_configured_target() {
-        assert_eq!(s3().validate().unwrap(), R2Target::S3);
+    fn selects_the_configured_target_and_carries_its_values() {
+        let R2Config::S3 { endpoint, bucket, access_key_id, secret_access_key } =
+            s3().validate().unwrap()
+        else {
+            panic!("a complete quad selects the S3 target");
+        };
+        assert_eq!(endpoint, "https://acc.r2.cloudflarestorage.com");
         assert_eq!(
-            Cfg { domain: DOMAIN, ..Cfg::default() }.validate().unwrap(),
-            R2Target::CustomDomain { connections: 1 }
+            (bucket.as_str(), access_key_id.as_str(), secret_access_key.as_str()),
+            ("b", "k", "s")
         );
-        assert_eq!(Cfg::default().validate().unwrap(), R2Target::None);
+
+        let R2Config::CustomDomain { domain, access, connections } =
+            Cfg { domain: DOMAIN, ..Cfg::default() }.validate().unwrap()
+        else {
+            panic!("a domain selects the custom-domain target");
+        };
+        assert_eq!(domain, DOMAIN.unwrap());
+        assert!(access.is_none(), "no Access pair configured");
+        assert_eq!(connections, 1, "the default single connection");
+
+        assert!(!Cfg::default().validate().unwrap().is_configured());
+    }
+
+    /// The S3 secret must not reach a log line through the verdict's `Debug`; the args structs
+    /// already hold it in a `RedactedSecret`, and this type would otherwise undo that.
+    #[test]
+    fn debug_redacts_the_s3_secret() {
+        let rendered = format!("{:?}", s3().validate().unwrap());
+        assert!(!rendered.contains("\"s\""), "the secret reached Debug: {rendered}");
+        assert!(rendered.contains("[redacted]"), "{rendered}");
+        assert!(rendered.contains("acc.r2.cloudflarestorage.com"), "non-secrets stay: {rendered}");
     }
 
     /// Emptiness is diagnosed before target selection can read a blank line as a configured
@@ -483,7 +592,11 @@ mod tests {
             access_secret: Some("sec"),
             ..Cfg::default()
         };
-        assert_eq!(whole.validate().unwrap(), R2Target::CustomDomain { connections: 1 });
+        let R2Config::CustomDomain { access, .. } = whole.validate().unwrap() else {
+            panic!("a whole pair on a domain selects the custom-domain target");
+        };
+        let access = access.expect("a whole Access pair must reach the verdict");
+        assert_eq!((access.client_id.as_str(), access.client_secret.as_str()), ("tok", "sec"));
     }
 
     /// A tuning flag with no target to tune is named rather than silently ignored — it was
