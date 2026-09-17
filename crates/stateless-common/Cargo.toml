@@ -51,6 +51,7 @@ zstd.workspace = true
 [dev-dependencies]
 jsonrpsee.workspace = true
 kanal.workspace = true
+serde_json.workspace = true
 stateless-test-utils = { path = "../stateless-test-utils", features = ["mock-rpc"] }
 tokio-util.workspace = true
 

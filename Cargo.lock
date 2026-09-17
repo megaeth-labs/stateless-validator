@@ -5691,6 +5691,7 @@ dependencies = [
  "rolling-file",
  "salt",
  "serde",
+ "serde_json",
  "stateless-core",
  "stateless-r2",
  "stateless-test-utils",
