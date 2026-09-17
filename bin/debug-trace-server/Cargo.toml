@@ -29,7 +29,7 @@ revm.workspace = true
 revm-inspectors.workspace = true
 
 # stateless
-stateless-common = { path = "../../crates/stateless-common" }
+stateless-common = { path = "../../crates/stateless-common", features = ["prometheus-exporter"] }
 stateless-core = { path = "../../crates/stateless-core" }
 stateless-db = { path = "../../crates/stateless-db" }
 stateless-r2 = { path = "../../crates/stateless-r2" }

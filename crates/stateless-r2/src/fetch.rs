@@ -176,12 +176,12 @@ impl std::error::Error for R2GetError {
     }
 }
 
-/// Retry pacing for retryable GET failures: first sleep `initial` (with up to 50% jitter),
+/// Retry pacing for retryable failures: first sleep `initial` (with up to 50% jitter),
 /// doubling up to `max`.
 ///
-/// A plain pair rather than a reference to any binary's backoff-policy type, so this crate
-/// stays free of upward dependencies; callers build it from whatever flags govern their
-/// retry pacing.
+/// Shared by this crate's GET loop and the RPC client's round-robin loop (which re-exports
+/// it as its backoff policy); it lives here because this crate must stay free of upward
+/// dependencies. Stepped through [`Self::schedule`].
 #[derive(Clone, Copy, Debug)]
 pub struct RetryPacing {
     /// First inter-attempt sleep.
@@ -191,6 +191,11 @@ pub struct RetryPacing {
 }
 
 impl RetryPacing {
+    /// Creates a pacing with the given `initial` and `max` sleep durations.
+    pub const fn new(initial: Duration, max: Duration) -> Self {
+        Self { initial, max }
+    }
+
     /// Starts executing this pacing, from `initial`.
     pub fn schedule(&self) -> BackoffSchedule {
         BackoffSchedule {
@@ -209,7 +214,7 @@ impl RetryPacing {
 ///
 /// Deadline handling stays with the caller: whether an overrunning sleep is clamped or
 /// gives up is policy, not arithmetic.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct BackoffSchedule {
     current_ms: u64,
     max_ms: u64,

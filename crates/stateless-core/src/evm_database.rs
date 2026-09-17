@@ -211,17 +211,10 @@ impl WitnessExternalEnv {
     /// * `salt_witness` - The SALT witness containing bucket metadata
     /// * `block_number` - The block number for validation checks
     ///
-    /// # Returns
-    ///
-    /// Returns `Ok(WitnessExternalEnv)` if all metadata is valid, or an error if:
-    /// - Any metadata key has a `None` value (malformed witness)
-    /// - Metadata cannot be parsed as `BucketMeta` (corrupt witness)
-    ///
     /// # Errors
     ///
-    /// This method enforces strict witness validation and will fail if:
-    /// - A metadata key is present but has no value
-    /// - A metadata value cannot be deserialized into valid `BucketMeta`
+    /// Fails on a malformed witness: a metadata key with no value, or a metadata value that
+    /// does not deserialize into a valid `BucketMeta`.
     pub fn new(
         salt_witness: &SaltWitness,
         block_number: BlockNumber,
@@ -261,10 +254,8 @@ impl WitnessExternalEnv {
         Ok((bucket_id, meta.capacity))
     }
 
-    /// Creates a new external environment provider from a LightWitness.
-    ///
-    /// This is the fast version of `new()` that works with `LightWitness`
-    /// for improved deserialization performance.
+    /// [`Self::new`] over a [`LightWitness`]: the same metadata scan, the light witness
+    /// only being cheaper to decode.
     pub fn from_light_witness(
         light_witness: &LightWitness,
         block_number: BlockNumber,
