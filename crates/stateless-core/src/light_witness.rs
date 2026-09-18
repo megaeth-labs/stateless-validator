@@ -180,7 +180,7 @@ impl StateReader for LightWitness {
     fn metadata(&self, bucket_id: BucketId) -> Result<BucketMeta, Self::Error> {
         let metadata_key = bucket_metadata_key(bucket_id);
         match self.kvs.get(&metadata_key) {
-            Some(Some(salt_value)) => BucketMeta::try_from(salt_value.clone())
+            Some(Some(salt_value)) => BucketMeta::try_from(salt_value)
                 .map_err(|_| LightWitnessError { message: "Failed to decode metadata" }),
             // A well-formed witness never maps a metadata key to a deletion,
             // but witness bytes are network input (and the light decode
