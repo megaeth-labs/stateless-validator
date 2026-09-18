@@ -8,11 +8,12 @@
 //! [`stateless_common::r2_witness`], shared with the validator's adapter; the transport
 //! core below that is `stateless-r2`'s [`R2ObjectFetcher`].
 //!
-//! This adapter is request-serving, which shapes it differently from the validator's:
-//! every fetch runs under the caller's witness-stage deadline, failures surface immediately
-//! with **no pacing pause** (the caller's next move is the RPC fallback chain, not a blind
-//! re-enqueue), and the retry budget is small — a throttled R2 should hand over to the RPC
-//! chain quickly instead of burning the witness budget on backoff sleeps.
+//! This adapter is request-serving, so its deadline is the caller's: every fetch runs under
+//! the request's witness-stage deadline, the decode included, where the validator's pipeline
+//! adapter uses a fixed per-block stage budget that stops at the GET. Like the validator's,
+//! failures surface immediately with no pause and on a small retry budget, since the caller's
+//! next move is the RPC fallback chain — a throttled R2 should hand over quickly instead of
+//! burning the witness budget on backoff sleeps.
 //!
 //! [`R2ObjectFetcher`]: stateless_r2::fetch::R2ObjectFetcher
 

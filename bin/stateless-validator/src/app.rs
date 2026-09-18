@@ -322,9 +322,10 @@ pub async fn run() -> Result<()> {
     let witness_apis = witness_apis(&args)?;
     let r2_timeouts = stateless_r2::fetch::FetchTimeouts {
         per_attempt: per_attempt_timeout,
-        connect: args
-            .r2_connect_timeout_ms
-            .map_or(stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT, Duration::from_millis),
+        connect: override_ms(
+            args.r2_connect_timeout_ms,
+            stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT,
+        ),
     };
     // The whole R2 fast path per block gets one per-attempt timeout, permit wait included:
     // a healthy fetch is sub-second, and a stalling endpoint must not cost the block more
@@ -433,31 +434,23 @@ fn witness_apis(args: &CommandLineArgs) -> Result<Vec<&str>> {
 /// Builds the direct-from-R2 witness transport when the `--r2-*` flags configure a target, or
 /// `None` when they configure nothing and witnesses come from the RPC chain alone.
 ///
-/// The presence of a target is the whole switch: there is no mode flag, because every rule a
-/// mode flag would have gated is already a rule about the flags themselves. A half-configured
-/// target, a blank env line, or a tuning flag with nothing to tune is rejected by name in
-/// [`validate_r2_flags`] rather than read as "no R2 configured" and silently downgraded to the
-/// RPC path.
+/// The presence of a target is the whole switch. A half-configured target, a blank env line,
+/// or a tuning flag with nothing to tune is rejected by name in [`validate_r2_flags`] rather
+/// than read as "no R2 configured" and silently downgraded to the RPC path.
 fn build_r2_transport(
     args: &CommandLineArgs,
     timeouts: stateless_r2::fetch::FetchTimeouts,
     retry: BackoffPolicy,
 ) -> Result<Option<R2WitnessTransport>> {
-    // Flags that mean nothing without a target. Listing them is what turns "set with no R2
-    // configured" into a named startup error instead of a silently dropped setting.
-    let tuning = [
-        R2TuningFlag::new("--r2-connect-timeout-ms", args.r2_connect_timeout_ms.is_some()),
-        R2TuningFlag::new(
-            "--r2-max-concurrent-requests",
-            args.r2_max_concurrent_requests.is_some(),
-        ),
-    ];
+    // The one R2 flag whose value the shared rules never see, listed so that setting it with
+    // no target is a named startup error rather than a silently dropped setting.
+    let tuning =
+        [R2TuningFlag::new("--r2-connect-timeout-ms", args.r2_connect_timeout_ms.is_some())];
     let config = validate_r2_flags(&r2_flags(args, &tuning))?;
     let transport = R2WitnessTransport::from_config(
         config,
         timeouts,
         retry,
-        args.r2_max_concurrent_requests,
         Arc::new(metrics::ValidatorMetrics),
     )?;
     let Some(transport) = transport else {
@@ -571,8 +564,9 @@ mod tests {
     }
 
     /// The two concurrency caps size different services, so the R2 one must be what reaches
-    /// the R2 transport even with both set. Asserted on both target arms, plus the uncapped
-    /// default, so a revert of either arm's wiring fails here by value.
+    /// the R2 transport even with both set. The cap travels on the verdict, so this pins the
+    /// one line that feeds it — the count flag in `r2_flags` — by value, on both target arms
+    /// plus the uncapped default.
     #[test]
     fn the_r2_cap_not_the_rpc_one_reaches_the_transport() {
         let _guard = stateless_test_utils::env::env_lock();
@@ -595,11 +589,9 @@ mod tests {
         }
     }
 
-    /// Two diagnostics this binary gained by validating the R2 flags on every startup instead
-    /// of only inside a mode: a tuning flag with no target to tune, and a blank env line
-    /// beside no other R2 configuration. Both used to be accepted and silently dropped, which
-    /// under an inferred switch would mean running the RPC-only path while the operator
-    /// believed R2 was on.
+    /// The R2 flags are validated on every startup, so a tuning flag with no target to tune
+    /// and a blank env line beside no other R2 configuration are both named. Accepted
+    /// silently, either would run the RPC-only path while the operator believed R2 was on.
     #[test]
     fn r2_flags_are_validated_even_with_no_target_configured() {
         let _guard = stateless_test_utils::env::env_lock();

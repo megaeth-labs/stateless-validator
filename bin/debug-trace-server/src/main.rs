@@ -688,17 +688,12 @@ fn validate_args(args: &Args) -> Result<R2Config> {
     }
     // Every R2 coherence rule — empty values, target exclusion, leftovers from the other
     // target, an incomplete credential quad, the Access pair, and tuning flags with nothing to
-    // tune — comes from the shared validator, so the two binaries cannot drift apart on them
-    // again. Unlike the validator, this one checks on every startup: the check predates the
-    // custom-domain work here and operators already rely on a bad `--r2-*` value failing fast
-    // rather than surfacing later as `kind="missing"`, the counter watched for bucket gaps.
-    let tuning = [
-        R2TuningFlag::new("--r2-connect-timeout-ms", args.r2_connect_timeout_ms.is_some()),
-        R2TuningFlag::new(
-            "--r2-max-concurrent-requests",
-            args.r2_max_concurrent_requests.is_some(),
-        ),
-    ];
+    // tune — comes from the shared validator, so the two binaries cannot drift apart on them.
+    // It runs on every startup, so a bad `--r2-*` value fails fast rather than surfacing later
+    // as `kind="missing"`, the counter watched for bucket gaps. The connect timeout is the one
+    // R2 flag whose value those rules never see, so it is listed here to be named when orphaned.
+    let tuning =
+        [R2TuningFlag::new("--r2-connect-timeout-ms", args.r2_connect_timeout_ms.is_some())];
     let config = validate_r2_flags(&r2_flags(args, &tuning))?;
     // The R2 route anchors block age (frontier vs historical) to the local DB tip; without
     // --data-dir every block would classify as frontier and a genuine bucket hole would
@@ -895,25 +890,19 @@ async fn main() -> Result<()> {
 
     // Direct-from-R2 witness source — unsigned through a Cloudflare custom domain when
     // configured (h2-multiplexed, edge-cacheable), otherwise SigV4-signed against the bare
-    // S3 endpoint. Which one is settled by `validate_args`, whose verdict is matched on below:
-    // clap carries no constraint at all here, so parsing accepts both targets and the shared
-    // validator rejects by name — along with empty values, S3 flags left over from the other
-    // target, an incomplete S3 quad, and the data-dir-less combination. Shares the RPC path's
-    // per-attempt timeout and retry pacing.
+    // S3 endpoint. Which one, and with what values, is the verdict `validate_args` already
+    // reached: clap carries no constraint here, so the shared validator is what rejects a bad
+    // combination, by name. Shares the RPC path's per-attempt timeout and retry pacing.
     let r2_timeouts = stateless_r2::fetch::FetchTimeouts {
         per_attempt: per_attempt_timeout,
         connect: args
             .r2_connect_timeout_ms
             .map_or(stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT, std::time::Duration::from_millis),
     };
-    // Built from the verdict the shared validator already reached, which carries the values
-    // it proved: re-reading them off the argument struct here would be a second copy of the
-    // rule about which flags each target requires, and the validator binary holds the other.
     let r2_transport = R2WitnessTransport::from_config(
         r2_config,
         r2_timeouts,
         rpc_retry,
-        args.r2_max_concurrent_requests,
         Arc::new(metrics::TraceRpcMetrics),
     )?;
     if let Some(transport) = &r2_transport {

@@ -407,7 +407,7 @@ pub fn on_witness_fetch(b: WitnessSizeBreakdown) {
 
 /// Record a successful R2 witness fetch: duration (see [`names::WITNESS_FETCH_R2_TIME`]'s
 /// description for what it covers) plus the same size breakdown as [`on_witness_fetch`], so the
-/// witness-size histograms stay populated in R2 mode.
+/// witness-size histograms count the blocks R2 serves as well as the ones RPC does.
 pub fn on_r2_witness_fetch_success(duration: f64, breakdown: WitnessSizeBreakdown) {
     histogram!(names::WITNESS_FETCH_R2_TIME).record(duration);
     on_witness_fetch(breakdown);

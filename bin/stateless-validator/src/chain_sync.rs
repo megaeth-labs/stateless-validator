@@ -40,10 +40,10 @@ pub struct ValidatorFetcher {
     rpc_client: Arc<RpcClient>,
     /// `Some` ⇒ fetch witnesses from R2 first; `None` ⇒ RPC only.
     r2_witness: Option<Arc<R2WitnessClient>>,
-    /// The chain head [`Self::latest_block_number`] last observed (`0` until the first poll),
-    /// which the R2 client reads to tell a frontier miss from a bucket hole. The pipeline
-    /// polls the head before it spawns any fetch, so a fetch never sees the unpolled state
-    /// outside tests.
+    /// The chain head [`Self::latest_block_number`] last observed, which the R2 client reads
+    /// to tell a frontier miss from a bucket hole. It is `0` until the first poll, which
+    /// classifies every miss as a frontier one; the pipeline polls the head before it spawns
+    /// any fetch, so outside tests a fetch never sees that state.
     remote_head: AtomicU64,
 }
 
@@ -52,14 +52,6 @@ impl ValidatorFetcher {
     /// the client's RPC witness chain, or going straight to that chain otherwise.
     pub fn new(rpc_client: Arc<RpcClient>, r2_witness: Option<Arc<R2WitnessClient>>) -> Self {
         Self { rpc_client, r2_witness, remote_head: AtomicU64::new(0) }
-    }
-
-    /// The head last observed by [`Self::latest_block_number`], if any.
-    fn remote_head(&self) -> Option<u64> {
-        match self.remote_head.load(Ordering::Relaxed) {
-            0 => None,
-            head => Some(head),
-        }
     }
 
     /// The witness for `(block_number, block_hash)`: from R2 when a target is configured,
@@ -74,8 +66,9 @@ impl ValidatorFetcher {
         block_number: u64,
         block_hash: B256,
     ) -> (SaltWitness, MptWitness) {
+        let remote_head = self.remote_head.load(Ordering::Relaxed);
         if let Some(r2) = &self.r2_witness &&
-            let Ok(witness) = r2.get_witness(block_number, block_hash, self.remote_head()).await
+            let Ok(witness) = r2.get_witness(block_number, block_hash, remote_head).await
         {
             return witness;
         }

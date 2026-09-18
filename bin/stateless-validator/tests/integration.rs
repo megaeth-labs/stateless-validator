@@ -166,14 +166,14 @@ fn end_block_flag_and_env() {
     });
 }
 
-/// `--witness-source` selected between an RPC-only, an R2-only and an R2-then-RPC mode; the
-/// R2 flags themselves now carry that choice, so the flag is gone rather than kept as a no-op.
+/// `--witness-source` selected between an RPC-only and an R2-only mode; the R2 flags
+/// themselves now carry that choice, so the flag is gone rather than kept as a no-op.
 /// Pinned here because it was an env-settable flag: this is the assertion that says the
 /// removal was meant, and that a stale `--witness-source r2` fails loudly on the command line.
 #[test]
 fn the_witness_source_mode_flag_is_gone() {
     let _guard = stateless_test_utils::env::env_lock();
-    for value in ["rpc", "r2", "r2-then-rpc"] {
+    for value in ["rpc", "r2"] {
         assert!(
             CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(&["--witness-source", value]))
                 .is_err(),
@@ -194,7 +194,6 @@ fn witness_endpoint_is_optional_at_parse_time() {
         |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS_NO_WITNESS.iter().chain(extra));
 
     assert!(parse(&[]).unwrap().witness_endpoint.is_empty());
-    assert!(parse(&["--r2-custom-domain", "https://witness.example.com"]).is_ok());
 }
 
 /// The custom-domain R2 target is mutually exclusive with the S3 endpoint, and the Access
@@ -246,9 +245,9 @@ fn r2_custom_domain_target_wiring() {
 /// being rejected by clap, whose messages name no argument in this workspace (built without
 /// `error-context`). `--r2-connections` travels as text for exactly that reason.
 ///
-/// This pins the parse layer alone. Both shapes are now *rejected*, by name, once the rules
-/// run: with no mode flag left to make the R2 flags inert, `app.rs` validates them on every
-/// startup, and `r2_flags_are_validated_even_with_no_target_configured` covers that side.
+/// This pins the parse layer alone. Both shapes are rejected, by name, once the rules run,
+/// which `app.rs` does on every startup; `r2_flags_are_validated_even_with_no_target_configured`
+/// covers that side.
 #[test]
 fn blank_and_conflicting_r2_values_reach_the_post_parse_rules() {
     let _guard = stateless_test_utils::env::env_lock();
@@ -533,23 +532,25 @@ async fn r2_backed_fetcher(
     (ValidatorFetcher::new(client, Some(r2)), witness_requests, handle)
 }
 
-/// The synthetic fixtures' first paired block, and its witness encoded as the R2 object body
-/// (the uploader's wire format).
-fn first_paired_block_and_r2_payload() -> (u64, Vec<u8>) {
-    let fx = TestFixtures::synthetic();
-    let (number, _) = fx.paired_blocks()[0];
-    let (salt_witness, mpt_witness): (_, MptWitness) = fx.first_paired_witness();
-    let (_, payload) =
-        encode_witness_payload(&salt_witness, &mpt_witness).expect("fixture witness must encode");
-    (number, payload)
+/// The synthetic fixtures' first paired block number: the block every R2 fetcher test fetches.
+fn first_paired_block() -> u64 {
+    TestFixtures::synthetic_shared().paired_blocks()[0].0
+}
+
+/// That block's witness encoded as the R2 object body (the uploader's wire format), for the
+/// one test in which R2 actually serves it.
+fn first_paired_r2_payload() -> Vec<u8> {
+    let (salt_witness, mpt_witness): (_, MptWitness) =
+        TestFixtures::synthetic_shared().first_paired_witness();
+    encode_witness_payload(&salt_witness, &mpt_witness).expect("fixture witness must encode").1
 }
 
 /// With an R2 target configured, a block whose witness is in the bucket is served from R2
 /// alone: one GET, and the RPC witness path is never asked.
 #[tokio::test]
 async fn a_bucket_hit_is_served_without_touching_the_rpc_witness_path() {
-    let (number, payload) = first_paired_block_and_r2_payload();
-    let (r2_endpoint, r2_hits) = mock_r2(vec![(200, payload)]).await;
+    let number = first_paired_block();
+    let (r2_endpoint, r2_hits) = mock_r2(vec![(200, first_paired_r2_payload())]).await;
     let (fetcher, witness_requests, handle) = r2_backed_fetcher(&r2_endpoint).await;
 
     let task = fetcher.fetch(number).await.expect("R2 must serve the block");
@@ -564,7 +565,7 @@ async fn a_bucket_hit_is_served_without_touching_the_rpc_witness_path() {
 /// the witness.
 #[tokio::test]
 async fn an_r2_miss_falls_back_to_the_rpc_witness_path() {
-    let (number, _) = first_paired_block_and_r2_payload();
+    let number = first_paired_block();
     let (r2_endpoint, r2_hits) = mock_r2(vec![(404, "<Code>NoSuchKey</Code>")]).await;
     let (fetcher, witness_requests, handle) = r2_backed_fetcher(&r2_endpoint).await;
 
@@ -580,7 +581,7 @@ async fn an_r2_miss_falls_back_to_the_rpc_witness_path() {
 /// stall forever without the RPC path behind it. One GET, no re-download, one RPC call.
 #[tokio::test]
 async fn a_corrupt_object_falls_back_instead_of_stalling_the_block() {
-    let (number, _) = first_paired_block_and_r2_payload();
+    let number = first_paired_block();
     let (r2_endpoint, r2_hits) = mock_r2(vec![(200, "not a zstd witness")]).await;
     let (fetcher, witness_requests, handle) = r2_backed_fetcher(&r2_endpoint).await;
 

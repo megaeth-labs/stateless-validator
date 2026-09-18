@@ -1,12 +1,15 @@
 //! Shared core of the two binaries' direct-from-R2 witness adapters.
 //!
-//! Each binary reads witness objects straight from the R2 bucket through
-//! [`R2ObjectFetcher`], but decodes and paces them differently: the trace server
-//! light-decodes under a request deadline with no failure pauses, the validator
-//! full-decodes with surfaced-failure pacing for its pipeline fetcher. What lives here is
-//! the part that is identical by construction — the failure taxonomy with its metric
-//! labels, and the transport wrapper (construction, target accessors) — so the two
-//! adapters cannot drift apart on it.
+//! Both binaries read witness objects straight from the R2 bucket through
+//! [`R2ObjectFetcher`], try it before their RPC witness chain, and hand any failure to that
+//! chain on a small retry budget with no pause before surfacing. What still differs is how
+//! each reads a fetched object and how long it may take: the trace server light-decodes
+//! under the caller's request deadline, decode included, while the validator full-decodes
+//! (proof verification needs the curve points the light decode skips) on a fixed per-block
+//! stage budget that stops at the GET. What lives here is the part that is identical by
+//! construction — the failure taxonomy with its metric labels, and the transport wrapper
+//! (construction from a validated verdict, target accessors) — so the two adapters cannot
+//! drift apart on it.
 
 use std::{sync::Arc, time::Instant};
 
@@ -32,8 +35,8 @@ pub const R2_FRONTIER_WINDOW: u64 = 32;
 
 /// Failure outcome of an R2 witness fetch, shared by both binaries' adapters.
 ///
-/// A binary whose fetches pass no deadline never produces [`Self::DecodeTimeout`] (or the
-/// fetch-level `deadline` kind); its pre-registered series for those kinds stay at zero.
+/// A binary whose decode runs without a deadline never produces [`Self::DecodeTimeout`]; its
+/// pre-registered series for that kind stays at zero.
 #[derive(Debug, thiserror::Error)]
 pub enum R2WitnessError {
     /// The GET failed (absent object, transport, throttle, unexpected status, or out of
@@ -84,13 +87,6 @@ impl R2WitnessError {
     /// ahead of the uploader treats as expected rather than alarming.
     pub const fn is_missing(&self) -> bool {
         matches!(self, Self::Get(R2GetError::Missing { .. }))
-    }
-
-    /// Whether an immediate retry against the same endpoint could plausibly succeed
-    /// (transport blips, 429, 5xx). Every other variant is deterministic and is surfaced
-    /// without retrying.
-    pub const fn is_retryable(&self) -> bool {
-        matches!(self, Self::Get(e) if e.is_retryable())
     }
 }
 
@@ -219,24 +215,19 @@ impl R2WitnessTransport {
     /// Builds the transport a validated [`R2Config`] selects, or `None` when no R2 target is
     /// configured, publishing what it built through `metrics`.
     ///
-    /// This is the one place either binary turns a verdict into a transport. Written out per
-    /// binary, each arm needed an `expect()` per field restating what `validate_r2_flags`
-    /// had already proved, and the two copies could disagree with those rules about which
-    /// flags a target requires; the verdict carries its values, so nothing is asserted twice.
-    ///
-    /// The caller logs what it built from the accessors below, in its own words: the two
-    /// binaries describe the same transport differently, one as the whole witness source and
-    /// one as the fast path in front of an RPC chain.
+    /// This is the one place either binary turns a verdict into a transport, taking every
+    /// target-dependent value — the in-flight cap included — from the verdict rather than
+    /// from the caller's flags. The caller logs what it built from the accessors below, in its
+    /// own words.
     pub fn from_config(
         config: R2Config,
         timeouts: FetchTimeouts,
         retry_backoff: BackoffPolicy,
-        max_concurrent_requests: Option<usize>,
         metrics: Arc<dyn R2Metrics>,
     ) -> eyre::Result<Option<Self>> {
         let transport = match config {
             R2Config::None => return Ok(None),
-            R2Config::CustomDomain { domain, access, connections } => {
+            R2Config::CustomDomain { domain, access, connections, max_concurrent_requests } => {
                 let observer = Arc::clone(&metrics);
                 let transport = Self::new_custom_domain(
                     &domain,
@@ -252,11 +243,17 @@ impl R2WitnessTransport {
                 metrics.on_connections(transport.connections());
                 transport
             }
-            R2Config::S3 { endpoint, bucket, access_key_id, secret_access_key } => Self::new(
-                &endpoint,
+            R2Config::S3 {
+                endpoint,
                 bucket,
                 access_key_id,
                 secret_access_key,
+                max_concurrent_requests,
+            } => Self::new(
+                &endpoint,
+                bucket,
+                access_key_id,
+                secret_access_key.as_ref().to_owned(),
                 timeouts,
                 retry_backoff,
                 max_concurrent_requests,
@@ -266,7 +263,7 @@ impl R2WitnessTransport {
         Ok(Some(transport))
     }
 
-    /// The underlying fetcher, for the adapter's own GETs and pacing reads.
+    /// The underlying fetcher, for the adapter's own GETs.
     pub fn fetcher(&self) -> &R2ObjectFetcher {
         &self.fetcher
     }

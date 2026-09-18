@@ -15,6 +15,8 @@
 use eyre::{Result, bail};
 use stateless_r2::fetch::CfAccessCredentials;
 
+use crate::RedactedSecret;
+
 /// One `--r2-*` flag carrying a value: the spelling this binary gives it, and what it parsed.
 #[derive(Clone, Copy)]
 pub struct R2Flag<'a> {
@@ -98,9 +100,13 @@ pub struct R2Flags<'a> {
 /// re-reads the argument struct to recover them. Read back out of the flags, every caller
 /// would need an `expect()` per field asserting what these rules already proved, and each copy
 /// is a place that can disagree with the rules about which flags a target actually requires.
-#[derive(Clone)]
+/// The in-flight cap travels the same way: the rules validate it against the connection count,
+/// so the cap a transport is built with has to be the one they checked.
+///
+/// `Debug` is safe to derive: both credentials redact themselves.
+#[derive(Debug)]
 pub enum R2Config {
-    /// No R2 flags configured; the caller decides whether that is fatal for its mode.
+    /// No R2 flags configured; the caller runs without an R2 route.
     None,
     /// SigV4-signed GETs against the bare S3 endpoint.
     S3 {
@@ -111,18 +117,20 @@ pub enum R2Config {
         /// Object-read access key id.
         access_key_id: String,
         /// Its secret.
-        secret_access_key: String,
+        secret_access_key: RedactedSecret,
+        /// Cap on in-flight GETs (`None` = unlimited).
+        max_concurrent_requests: Option<usize>,
     },
-    /// Unsigned GETs through a Cloudflare custom domain, spread over this many HTTP/2
-    /// connections.
+    /// Unsigned GETs through a Cloudflare custom domain.
     CustomDomain {
         /// Bare domain origin; objects are fetched as `/{key}`.
         domain: String,
         /// Cloudflare Access service token, when the domain is behind one.
         access: Option<CfAccessCredentials>,
-        /// How many HTTP/2 connections to spread GETs over. Validated here, so a caller that
-        /// re-derived it would be a second place the same rule lives.
+        /// How many HTTP/2 connections to spread GETs over.
         connections: usize,
+        /// Cap on in-flight GETs across all of them (`None` = unlimited).
+        max_concurrent_requests: Option<usize>,
     },
 }
 
@@ -130,29 +138,6 @@ impl R2Config {
     /// Whether any R2 target is configured at all.
     pub const fn is_configured(&self) -> bool {
         !matches!(self, Self::None)
-    }
-}
-
-/// `Debug` redacts the S3 secret, matching the argument structs, which carry it in a
-/// [`RedactedSecret`](crate::RedactedSecret); the Access token redacts itself.
-impl std::fmt::Debug for R2Config {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::None => f.write_str("None"),
-            Self::S3 { endpoint, bucket, access_key_id, .. } => f
-                .debug_struct("S3")
-                .field("endpoint", endpoint)
-                .field("bucket", bucket)
-                .field("access_key_id", access_key_id)
-                .field("secret_access_key", &"[redacted]")
-                .finish(),
-            Self::CustomDomain { domain, access, connections } => f
-                .debug_struct("CustomDomain")
-                .field("domain", domain)
-                .field("access", access)
-                .field("connections", connections)
-                .finish(),
-        }
     }
 }
 
@@ -201,8 +186,7 @@ pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Config> {
     }
 
     // Past the sweep, presence is the only predicate: anything still set was meant. Each arm
-    // binds the values it proves in the same `let` that proves them, so the verdict is built
-    // below without a single `expect()` restating a check made here.
+    // binds the values it proves in the same `let` that proves them.
     let selected = match (flags.custom_domain.value, flags.endpoint.value) {
         (Some(_), Some(_)) => bail!(
             "{} and {} are mutually exclusive R2 targets: configure exactly one",
@@ -249,14 +233,17 @@ pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Config> {
     validate_access_pair(flags, selected)?;
     let connections = validate_connections(flags, selected)?;
 
-    // The connection count joins the tuning flags here rather than being reported on its own,
-    // so an operator who orphaned several of them is told about all of them at once.
+    // The connection count and the in-flight cap join the tuning flags here rather than being
+    // reported on their own, so an operator who orphaned several of them is told about all of
+    // them at once. Both arrive as values these rules read anyway, so neither needs a binary to
+    // list it a second time as a tuning flag.
     let orphan_tuning: Vec<&str> = flags
         .tuning
         .iter()
         .filter(|flag| flag.set)
         .map(|flag| flag.name)
         .chain(flags.connections.value.map(|_| flags.connections.name))
+        .chain(flags.max_concurrent_requests.value.map(|_| flags.max_concurrent_requests.name))
         .collect();
     if matches!(selected, Selected::None) && !orphan_tuning.is_empty() {
         bail!(
@@ -265,13 +252,15 @@ pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Config> {
         );
     }
 
+    let max_concurrent_requests = flags.max_concurrent_requests.value;
     Ok(match selected {
         Selected::None => R2Config::None,
         Selected::S3 { endpoint, bucket, access_key_id, secret_access_key } => R2Config::S3 {
             endpoint: endpoint.to_owned(),
             bucket: bucket.to_owned(),
             access_key_id: access_key_id.to_owned(),
-            secret_access_key: secret_access_key.to_owned(),
+            secret_access_key: secret_access_key.into(),
+            max_concurrent_requests,
         },
         // `validate_access_pair` proved the pair whole-or-absent, so the zip is honest rather
         // than a half-set pair silently collapsing to an unauthenticated client.
@@ -284,6 +273,7 @@ pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Config> {
                 },
             ),
             connections,
+            max_concurrent_requests,
         },
     })
 }
@@ -294,8 +284,7 @@ pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Config> {
 /// — what a templated env file renders for an unset variable — is diagnosed here, by name, at
 /// the point the R2 flags are actually read. Parsed by clap it would abort startup with clap's
 /// unnamed "invalid value for one of the arguments" (this workspace builds clap without
-/// `error-context`), and it would abort it even on a binary that never reads the R2 flags in
-/// the mode it was started in.
+/// `error-context`).
 fn parse_r2_connections(flag: R2Flag<'_>) -> Result<usize> {
     let Some(raw) = flag.value else { return Ok(1) };
     let Ok(count) = raw.parse::<usize>() else {
@@ -472,8 +461,7 @@ mod tests {
     }
 
     /// A blank line is what a templated env file renders for an unset variable, so it must be
-    /// diagnosed as itself rather than as a bad number — and, on a binary that reads the R2
-    /// flags in only one mode, must not reach clap at all.
+    /// diagnosed as itself, by name, rather than as a bad number.
     #[test]
     fn a_blank_connection_count_is_named_as_an_empty_value() {
         let blank = Cfg { domain: DOMAIN, connections: Some(""), ..Cfg::default() }.err();
@@ -495,23 +483,29 @@ mod tests {
 
     const DOMAIN: Option<&str> = Some("https://w.example.com");
 
-    /// The verdict names the target *and* hands back the values that selection proved, so a
-    /// caller never re-reads the argument struct. Asserting the values here is what keeps the
-    /// callers' `expect()`-free construction honest.
+    /// The verdict names the target *and* hands back the values that selection proved,
+    /// including the cap the connection-count rule was checked against. Asserting them here is
+    /// what keeps the callers' construction honest.
     #[test]
     fn selects_the_configured_target_and_carries_its_values() {
-        let R2Config::S3 { endpoint, bucket, access_key_id, secret_access_key } =
-            s3().validate().unwrap()
+        let R2Config::S3 {
+            endpoint,
+            bucket,
+            access_key_id,
+            secret_access_key,
+            max_concurrent_requests,
+        } = Cfg { max_concurrent: Some(48), ..s3() }.validate().unwrap()
         else {
             panic!("a complete quad selects the S3 target");
         };
         assert_eq!(endpoint, "https://acc.r2.cloudflarestorage.com");
         assert_eq!(
-            (bucket.as_str(), access_key_id.as_str(), secret_access_key.as_str()),
+            (bucket.as_str(), access_key_id.as_str(), secret_access_key.as_ref()),
             ("b", "k", "s")
         );
+        assert_eq!(max_concurrent_requests, Some(48));
 
-        let R2Config::CustomDomain { domain, access, connections } =
+        let R2Config::CustomDomain { domain, access, connections, max_concurrent_requests } =
             Cfg { domain: DOMAIN, ..Cfg::default() }.validate().unwrap()
         else {
             panic!("a domain selects the custom-domain target");
@@ -519,6 +513,7 @@ mod tests {
         assert_eq!(domain, DOMAIN.unwrap());
         assert!(access.is_none(), "no Access pair configured");
         assert_eq!(connections, 1, "the default single connection");
+        assert_eq!(max_concurrent_requests, None, "uncapped unless set");
 
         assert!(!Cfg::default().validate().unwrap().is_configured());
     }
@@ -606,6 +601,14 @@ mod tests {
         let set: &[R2TuningFlag<'_>] = &[R2TuningFlag::new("--r2-connect-timeout-ms", true)];
         let err = Cfg { tuning: set, ..Cfg::default() }.err();
         assert!(err.contains("--r2-connect-timeout-ms"), "{err}");
+
+        // The cap is judged by the rules themselves, from the value they already read, so no
+        // binary has to list it as a tuning flag for an orphaned one to be named.
+        let err = Cfg { max_concurrent: Some(48), ..Cfg::default() }.err();
+        assert!(err.contains("--r2-max-concurrent-requests"), "{err}");
+        assert!(
+            Cfg { domain: DOMAIN, max_concurrent: Some(48), ..Cfg::default() }.validate().is_ok()
+        );
 
         // Fine with a target, and fine when left at its default.
         assert!(Cfg { domain: DOMAIN, tuning: set, ..Cfg::default() }.validate().is_ok());

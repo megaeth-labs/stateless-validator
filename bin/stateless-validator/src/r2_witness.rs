@@ -7,16 +7,16 @@
 //! debug-trace-server's adapter; the transport core below that is `stateless-r2`'s
 //! [`R2ObjectFetcher`]. This adapter owns what is validator-specific: the **full** payload
 //! decode (proof verification needs the elliptic-curve points the light decode skips), the
-//! validator metrics, and the surfaced-failure pacing the pipeline fetcher relies on. The
-//! object body is `zstd(bincode-legacy((SaltWitness, MptWitness)))`, which
+//! validator metrics, the per-block stage budget, and how a miss is classified against the
+//! polled head. The object body is `zstd(bincode-legacy((SaltWitness, MptWitness)))`, which
 //! [`stateless_common::decode_witness_payload`] inverts exactly.
 //!
-//! Every failure surfaces at once, with a short retry budget, a bounded total, and no pacing
-//! pause: the block's next stop is the `--witness-endpoint` RPC chain, and it should not wait
-//! for it any longer than the fast path is worth. That
-//! fallback is a second *path* to the same bytes rather than a second copy of them — the
-//! witness gateway reads this same bucket — so what it covers is our own path failing (the
-//! CDN edge, an Access token, HTTP/2, the credentials, this fetcher), not the bucket failing.
+//! Every failure surfaces at once, on a short retry budget within a bounded total and with no
+//! pause before returning: the block's next stop is the `--witness-endpoint` RPC chain, and
+//! it should not wait for it any longer than the fast path is worth. That fallback is a
+//! second *path* to the same bytes rather than a second copy of them — the witness gateway
+//! reads this same bucket — so what it covers is our own path failing (the CDN edge, an
+//! Access token, HTTP/2, the credentials, this fetcher), not the bucket failing.
 //!
 //! Operator note on missing objects, and on which counter is worth watching in which mode.
 //! A `missing` inside the [`R2_FRONTIER_WINDOW`] below the last polled remote head is the
@@ -57,12 +57,11 @@ use crate::metrics;
 
 /// Total GET attempts (first try + retries) per fetch, for retryable (transport/429/5xx)
 /// failures. Small on purpose: the RPC witness chain waits behind this one, so a throttled R2
-/// should hand the block over rather than spend its time on backoff sleeps. Not an operator
-/// flag — the RPC witness path retries unboundedly, so there is nothing to mirror.
-///
-/// The count alone does not bound the stage, since an endpoint that accepts a connection and
-/// then stalls spends a full per-attempt timeout on each try; [`R2WitnessClient::new`]'s
-/// `stage_timeout` is what bounds the sum.
+/// should hand the block over after a couple of retries rather than work through a long
+/// ramp. The retries are spaced by the `--rpc-*-backoff-ms` ramp — up to about two seconds in
+/// total at its defaults — and everything, sleeps included, stays inside the stage budget
+/// given to [`R2WitnessClient::new`]. Not an operator flag — the RPC witness path retries
+/// unboundedly, so there is nothing to mirror.
 const MAX_ATTEMPTS: usize = 3;
 
 /// Synthetic `kind` label for a `missing` inside the frontier band — the uploader has not
@@ -73,22 +72,16 @@ const MAX_ATTEMPTS: usize = 3;
 pub(crate) const KIND_MISSING_FRONTIER: &str = "missing_frontier";
 
 /// The `kind` label an R2 witness failure is recorded under: [`R2WitnessError::kind`], except
-/// that a `missing` inside the [`R2_FRONTIER_WINDOW`] below `remote_head` — or with no head
-/// polled yet, when nothing is known to be uploaded — is [`KIND_MISSING_FRONTIER`].
+/// that a `missing` inside the [`R2_FRONTIER_WINDOW`] below `remote_head` is
+/// [`KIND_MISSING_FRONTIER`]. A head of `0` — what the fetcher holds before its first poll —
+/// puts every block inside the band, which is right: nothing is known to be uploaded yet.
 ///
 /// The validator only fetches at or below the head it last polled, so unlike the trace
 /// server there is no above-tip band: a block is either near enough to the head for the
-/// uploader to plausibly still be behind it, or deep enough that the object must exist.
-///
-/// Which of the two a run sees is decided by how far behind it is, not by chance: a
-/// tip-following run works inside the band and produces only frontier misses, a catch-up or
-/// backfill run works below it. See the module docs for what that means for alerting.
-pub(crate) fn error_kind(
-    e: &R2WitnessError,
-    number: u64,
-    remote_head: Option<u64>,
-) -> &'static str {
-    let frontier = remote_head.is_none_or(|head| number.saturating_add(R2_FRONTIER_WINDOW) >= head);
+/// uploader to plausibly still be behind it, or deep enough that the object must exist. See
+/// the module docs for which of the two a run actually sees.
+pub(crate) fn error_kind(e: &R2WitnessError, number: u64, remote_head: u64) -> &'static str {
+    let frontier = number.saturating_add(R2_FRONTIER_WINDOW) >= remote_head;
     if e.is_missing() && frontier { KIND_MISSING_FRONTIER } else { e.kind() }
 }
 
@@ -111,16 +104,13 @@ impl R2WitnessClient {
     /// the block reaches RPC, and blocks queued behind the concurrency cap wait through
     /// several such holders — which is the brownout the fallback exists to absorb, absorbed
     /// far too slowly to keep the pipeline moving.
-    ///
-    /// One per-attempt timeout is the budget the wiring site passes, so a healthy fetch
-    /// (sub-second) and every fast failure mode still fit the full retry count comfortably,
-    /// while a stall costs the fast path no more wall clock than a single upstream hop.
     pub const fn new(transport: R2WitnessTransport, stage_timeout: Duration) -> Self {
         Self { transport, stage_timeout }
     }
 
     /// Fetches and decodes the witness for `(number, hash)` from R2. `remote_head` is the
-    /// chain head the caller last polled, which classifies a miss (see [`error_kind`]).
+    /// chain head the caller last polled (`0` before the first poll), which classifies a miss
+    /// (see [`error_kind`]).
     ///
     /// Transport/429/5xx failures are retried internally up to [`MAX_ATTEMPTS`], paced by the
     /// backoff policy given at construction and bounded in total by the `stage_timeout` given
@@ -131,7 +121,7 @@ impl R2WitnessClient {
         &self,
         number: u64,
         hash: B256,
-        remote_head: Option<u64>,
+        remote_head: u64,
     ) -> Result<(SaltWitness, MptWitness), R2WitnessError> {
         let result = self.get_witness_inner(number, hash).await;
         if let Err(e) = &result {
@@ -159,8 +149,6 @@ impl R2WitnessClient {
         hash: B256,
     ) -> Result<(SaltWitness, MptWitness), R2WitnessError> {
         let started = Instant::now();
-        // The deadline covers the permit wait and every attempt, so a stalling endpoint
-        // cannot hold the block past what the fast path is worth.
         let deadline = started + self.stage_timeout;
         let fetched = self
             .transport
@@ -241,8 +229,8 @@ mod tests {
     /// behaviour it names rather than the deadline. The deadline has its own test.
     const TEST_STAGE_TIMEOUT: Duration = Duration::from_secs(5);
 
-    fn client(endpoint: &str) -> R2WitnessClient {
-        let transport = R2WitnessTransport::new(
+    fn transport(endpoint: &str) -> R2WitnessTransport {
+        R2WitnessTransport::new(
             endpoint,
             "witness-test".to_string(),
             "ak".to_string(),
@@ -251,13 +239,16 @@ mod tests {
             test_backoff(),
             None,
         )
-        .unwrap();
-        R2WitnessClient::new(transport, TEST_STAGE_TIMEOUT)
+        .unwrap()
+    }
+
+    fn client(endpoint: &str) -> R2WitnessClient {
+        R2WitnessClient::new(transport(endpoint), TEST_STAGE_TIMEOUT)
     }
 
     /// One fetch with no remote head polled yet.
     async fn fetch(endpoint: &str) -> Result<(SaltWitness, MptWitness), R2WitnessError> {
-        client(endpoint).get_witness(1, B256::ZERO, None).await
+        client(endpoint).get_witness(1, B256::ZERO, 0).await
     }
 
     /// The only test of the success path (fetch → `spawn_blocking` decode): a fixture witness
@@ -300,7 +291,7 @@ mod tests {
         )
         .unwrap();
         let (decoded_salt, _) = R2WitnessClient::new(transport, TEST_STAGE_TIMEOUT)
-            .get_witness(1, B256::ZERO, None)
+            .get_witness(1, B256::ZERO, 0)
             .await
             .expect("valid object must fetch and decode");
         assert_eq!(decoded_salt, salt_witness);
@@ -359,24 +350,14 @@ mod tests {
     #[tokio::test]
     async fn a_stalling_endpoint_is_abandoned_on_the_stage_budget() {
         let stage = Duration::from_millis(200);
+        // The shape that goes wrong needs a per-attempt timeout well above the stage budget;
+        // anything closer and a single attempt would end the stage on its own.
+        assert!(test_timeouts().per_attempt >= 10 * stage);
         let (endpoint, _peak) = mock_r2_held(200, Duration::from_secs(30)).await;
-        let transport = R2WitnessTransport::new(
-            &endpoint,
-            "witness-test".to_string(),
-            "ak".to_string(),
-            "sk".to_string(),
-            FetchTimeouts {
-                per_attempt: Duration::from_secs(5),
-                connect: stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT,
-            },
-            test_backoff(),
-            None,
-        )
-        .unwrap();
 
         let started = std::time::Instant::now();
-        let err = R2WitnessClient::new(transport, stage)
-            .get_witness(1, B256::ZERO, None)
+        let err = R2WitnessClient::new(transport(&endpoint), stage)
+            .get_witness(1, B256::ZERO, 0)
             .await
             .expect_err("a stalling endpoint must not serve");
         let elapsed = started.elapsed();
@@ -396,19 +377,19 @@ mod tests {
     fn error_kind_splits_frontier_misses_from_bucket_holes() {
         let missing = R2WitnessError::Get(R2GetError::Missing { number: 1, key: "k".into() });
         let head = 5000;
-        assert_eq!(error_kind(&missing, 100, None), KIND_MISSING_FRONTIER, "no head polled yet");
-        assert_eq!(error_kind(&missing, head, Some(head)), KIND_MISSING_FRONTIER, "the head");
+        assert_eq!(error_kind(&missing, 100, 0), KIND_MISSING_FRONTIER, "no head polled yet");
+        assert_eq!(error_kind(&missing, head, head), KIND_MISSING_FRONTIER, "the head");
         assert_eq!(
-            error_kind(&missing, head - R2_FRONTIER_WINDOW, Some(head)),
+            error_kind(&missing, head - R2_FRONTIER_WINDOW, head),
             KIND_MISSING_FRONTIER,
             "the band's deep edge is still inside it",
         );
         assert_eq!(
-            error_kind(&missing, head - R2_FRONTIER_WINDOW - 1, Some(head)),
+            error_kind(&missing, head - R2_FRONTIER_WINDOW - 1, head),
             "missing",
             "one past the band is a hole",
         );
-        assert_eq!(error_kind(&missing, 100, Some(head)), "missing", "deep history is a hole");
+        assert_eq!(error_kind(&missing, 100, head), "missing", "deep history is a hole");
 
         let throttled = R2WitnessError::Get(R2GetError::Throttled {
             number: 1,
@@ -416,6 +397,6 @@ mod tests {
             status: 503,
             body: String::new(),
         });
-        assert_eq!(error_kind(&throttled, head, Some(head)), "throttled", "only misses split");
+        assert_eq!(error_kind(&throttled, head, head), "throttled", "only misses split");
     }
 }
