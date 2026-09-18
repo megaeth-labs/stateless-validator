@@ -18,6 +18,7 @@
 //! - `NoopTracer` - No-op for testing
 //! - `MuxTracer` - Multiple tracers combined
 //! - `FlatCallTracer` - Flat call traces
+//! - `Erc7562Tracer` - ERC-7562 validation-scope traces
 //! - `JsTracer` - Custom JavaScript tracers
 //! - Default struct logger - Detailed opcode-level traces
 //!
@@ -34,6 +35,8 @@ use alloy_rpc_types_trace::{
         FourByteFrame, GethDebugBuiltInTracerType, GethDebugTracerConfig, GethDebugTracerType,
         GethDebugTracingOptions, GethTrace, NoopFrame, TraceResult,
         call::{CallConfig, FlatCallConfig},
+        erc7562::Erc7562Config,
+        mux::MuxConfig,
         pre_state::{AccountState, PreStateConfig, PreStateFrame},
     },
     parity::LocalizedTransactionTrace,
@@ -70,12 +73,13 @@ pub fn extract_code_hashes(witness: &LightWitness) -> Vec<B256> {
 // TracerKind - Unified enum for TracingInspector-based tracers
 /// Represents a tracer variant that uses `TracingInspector` under the hood.
 ///
-/// Unifies CallTracer, PreStateTracer, FlatCallTracer, and the default struct logger
-/// to reduce code duplication in `trace_block` and `trace_transaction`.
+/// Unifies CallTracer, PreStateTracer, FlatCallTracer, Erc7562Tracer, and the default
+/// struct logger to reduce code duplication in `trace_block` and `trace_transaction`.
 enum TracerKind {
     Call(CallConfig),
     PreState(PreStateConfig),
     FlatCall(FlatCallConfig),
+    Erc7562(Erc7562Config),
     Default(GethDebugTracingOptions),
 }
 
@@ -85,6 +89,7 @@ impl TracerKind {
             Self::Call(cfg) => TracingInspectorConfig::from_geth_call_config(cfg),
             Self::PreState(cfg) => TracingInspectorConfig::from_geth_prestate_config(cfg),
             Self::FlatCall(cfg) => TracingInspectorConfig::from_flat_call_config(cfg),
+            Self::Erc7562(cfg) => TracingInspectorConfig::from_geth_erc7562_config(cfg),
             Self::Default(opts) => TracingInspectorConfig::from_geth_config(&opts.config),
         }
     }
@@ -268,10 +273,10 @@ fn builtin_tracer_kind(
             .into_flat_call_config()
             .map(TracerKind::FlatCall)
             .map_err(|e| request_error("invalid flatCallTracer tracerConfig", e)),
-        // Unsupported: normally rejected by `RequestShape::classify` (-32602) before
-        // the executor runs; the dispatchers route it here so the message has one home.
         GethDebugBuiltInTracerType::Erc7562Tracer => {
-            Err(request_error("Unsupported tracer", "erc7562Tracer"))
+            crate::response_cache::into_erc7562_config(config)
+                .map(TracerKind::Erc7562)
+                .map_err(|e| request_error("invalid erc7562Tracer tracerConfig", e))
         }
         // Not TracingInspector tracers: the dispatchers execute these in their own arms
         // (mux via `mux_inspector`) and never route them here; kept total — a request
@@ -378,6 +383,17 @@ macro_rules! extract_trace_frame {
                         .into_parity_builder()
                         .into_localized_transaction_traces($info);
                 Ok(GethTrace::from(frame))
+            }
+            TracerKind::Erc7562(cfg) => {
+                let gas_used = result_and_state.result.tx_gas_used();
+                $executor.inspector_mut().set_transaction_gas_limit($tx_gas_limit);
+                let db = $executor.evm.db();
+                let inspector = $executor.inspector();
+                Ok(GethTrace::from(inspector.geth_builder().geth_erc7562_traces(
+                    cfg.clone(),
+                    gas_used,
+                    db,
+                )))
             }
             TracerKind::Default(opts) => {
                 let gas_used = result_and_state.result.tx_gas_used();
@@ -517,8 +533,7 @@ pub fn trace_block(
                     .collect(),
 
                 // Strict parse in `builtin_tracer_kind` — see its doc for why the
-                // executor re-rejects what the boundary gate already screens. The
-                // unsupported erc7562Tracer errors there before any execution.
+                // executor re-rejects what the boundary gate already screens.
                 GethDebugBuiltInTracerType::CallTracer |
                 GethDebugBuiltInTracerType::PreStateTracer |
                 GethDebugBuiltInTracerType::FlatCallTracer |
@@ -735,8 +750,7 @@ pub fn trace_transaction(
                 }
 
                 // Strict parse in `builtin_tracer_kind` — see its doc for why the
-                // executor re-rejects what the boundary gate already screens. The
-                // unsupported erc7562Tracer errors there before any execution.
+                // executor re-rejects what the boundary gate already screens.
                 GethDebugBuiltInTracerType::CallTracer |
                 GethDebugBuiltInTracerType::PreStateTracer |
                 GethDebugBuiltInTracerType::FlatCallTracer |
@@ -763,12 +777,15 @@ pub fn trace_transaction(
 
                 GethDebugBuiltInTracerType::MuxTracer => {
                     let inspector = mux_inspector(tracer_config)?;
-                    let template = inspector.clone();
 
-                    setup_executor!(&env, &mut state, inspector => executor);
+                    // Preceding transactions only rebuild state; an empty mux inspector
+                    // records nothing for them.
+                    let replay_inspector = MuxInspector::try_from_config(MuxConfig::default())
+                        .map_err(|e| request_error("empty mux inspector", e))?;
+                    setup_executor!(&env, &mut state, replay_inspector => executor);
                     replay_preceding_txs!(executor, &env, tx_index);
 
-                    *executor.inspector_mut() = template;
+                    *executor.inspector_mut() = inspector;
 
                     let outcome = executor
                         .run_transaction(recovered_target)
@@ -788,10 +805,16 @@ pub fn trace_transaction(
 
             GethDebugTracerType::JsTracer(code) => {
                 let config_json = tracer_config.clone().into_json();
-                let inspector =
-                    js_inspector(code.clone(), config_json.clone(), make_tx_ctx(&info))?;
 
-                setup_executor!(&env, &mut state, inspector => executor);
+                // Preceding transactions only rebuild state; a hook-less tracer (no
+                // `step`/`enter`/`exit`) never re-enters Boa for their execution, so
+                // the user's JS runs only for the target transaction.
+                let replay_inspector = js_inspector(
+                    "{result: function() { return null; }, fault: function() {}}".to_string(),
+                    serde_json::Value::Null,
+                    make_tx_ctx(&info),
+                )?;
+                setup_executor!(&env, &mut state, replay_inspector => executor);
                 replay_preceding_txs!(executor, &env, tx_index);
 
                 *executor.inspector_mut() =
@@ -1099,6 +1122,7 @@ mod tests {
                 serde_json::json!({"convertParityErrors": "yes"}),
             ),
             (GethDebugBuiltInTracerType::MuxTracer, serde_json::json!({"notATracer": {}})),
+            (GethDebugBuiltInTracerType::Erc7562Tracer, serde_json::json!({"withLog": "yes"})),
         ];
         for (tracer, config) in malformed {
             let opts = GethDebugTracingOptions {
@@ -1132,5 +1156,37 @@ mod tests {
         };
         trace_block(&chain_spec, &block, witness, &contracts, opts)
             .expect("a well-formed config must trace");
+    }
+
+    /// The erc7562 tracer executes end-to-end on both the block and the transaction
+    /// paths and produces its own frame kind.
+    #[test]
+    fn erc7562_tracer_traces_block_and_transaction() {
+        use stateless_test_utils::fixtures::TestFixtures;
+
+        use crate::data_provider::{BlockData, test_support::fixture_block_data};
+
+        let chain_spec =
+            ChainSpec::from_genesis(TestFixtures::synthetic().load_genesis().expect("genesis"));
+        let BlockData { block, witness, contracts } = fixture_block_data();
+        let opts = GethDebugTracingOptions {
+            tracer: Some(GethDebugTracerType::BuiltInTracer(
+                GethDebugBuiltInTracerType::Erc7562Tracer,
+            )),
+            tracer_config: GethDebugTracerConfig(serde_json::json!({"withLog": true})),
+            ..Default::default()
+        };
+
+        let results = trace_block(&chain_spec, &block, witness.clone(), &contracts, opts.clone())
+            .expect("erc7562 block trace succeeds");
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|r| matches!(
+            r,
+            TraceResult::Success { result: GethTrace::Erc7562Tracer(_), .. }
+        )));
+
+        let trace = trace_transaction(&chain_spec, &block, 0, witness, &contracts, opts)
+            .expect("erc7562 tx trace succeeds");
+        assert!(matches!(trace, GethTrace::Erc7562Tracer(_)));
     }
 }
