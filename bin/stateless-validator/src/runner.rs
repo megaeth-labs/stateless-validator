@@ -60,7 +60,7 @@ pub async fn run_with_signals(
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .map_err(|e| eyre::eyre!("Failed to register SIGTERM handler: {e}"))?;
 
-    let fetcher = Arc::new(ValidatorFetcher { rpc_client: client.clone(), r2_witness });
+    let fetcher = Arc::new(ValidatorFetcher::new(client.clone(), r2_witness));
     let processor =
         Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client.clone() });
     let hooks = Arc::new(ValidatorHooks);

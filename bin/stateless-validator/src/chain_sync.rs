@@ -4,7 +4,10 @@
 //! [`ValidatorHooks`] (metrics integration) for the shared pipeline in
 //! [`stateless_core::pipeline::run_pipeline`].
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 use alloy_primitives::{B256, BlockHash, BlockNumber};
 use alloy_rpc_types_eth::{Block, BlockId};
@@ -30,12 +33,47 @@ use crate::{metrics, r2_witness::R2WitnessClient};
 /// Fetcher for the validator: fetches blocks + witnesses, wraps in [`ValidationTask`], and records
 /// remote chain height for metrics.
 ///
-/// Blocks, headers, and contract code always come from the data RPC; the witness comes from
-/// `mega_getBlockWitness` (default) or straight from R2 ([`R2WitnessClient`]).
+/// Blocks, headers, and contract code always come from the data RPC. The witness comes from
+/// `mega_getBlockWitness`, or from R2 first with that RPC path behind it when the `--r2-*`
+/// flags configure a target ([`R2WitnessClient`]).
 pub struct ValidatorFetcher {
-    pub rpc_client: Arc<RpcClient>,
-    /// `Some` ⇒ fetch witnesses directly from R2; `None` ⇒ RPC.
-    pub r2_witness: Option<Arc<R2WitnessClient>>,
+    rpc_client: Arc<RpcClient>,
+    /// `Some` ⇒ fetch witnesses from R2 first; `None` ⇒ RPC only.
+    r2_witness: Option<Arc<R2WitnessClient>>,
+    /// The chain head [`Self::latest_block_number`] last observed, which the R2 client reads
+    /// to tell a frontier miss from a bucket hole. It is `0` until the first poll, which
+    /// classifies every miss as a frontier one; the pipeline polls the head before it spawns
+    /// any fetch, so outside tests a fetch never sees that state.
+    remote_head: AtomicU64,
+}
+
+impl ValidatorFetcher {
+    /// A fetcher over `rpc_client`, trying `r2_witness` first when given and falling back to
+    /// the client's RPC witness chain, or going straight to that chain otherwise.
+    pub fn new(rpc_client: Arc<RpcClient>, r2_witness: Option<Arc<R2WitnessClient>>) -> Self {
+        Self { rpc_client, r2_witness, remote_head: AtomicU64::new(0) }
+    }
+
+    /// The witness for `(block_number, block_hash)`: from R2 when a target is configured,
+    /// otherwise straight from the RPC witness chain.
+    ///
+    /// An R2 fetch is fallible and any failure hands the block to that same chain, which
+    /// retries internally until it succeeds. The R2 client has already recorded and logged
+    /// what went wrong, so nothing is returned about it here — as far as the pipeline is
+    /// concerned this stays as infallible as the RPC-only path always was.
+    async fn fetch_witness(
+        &self,
+        block_number: u64,
+        block_hash: B256,
+    ) -> (SaltWitness, MptWitness) {
+        let remote_head = self.remote_head.load(Ordering::Relaxed);
+        if let Some(r2) = &self.r2_witness &&
+            let Ok(witness) = r2.get_witness(block_number, block_hash, remote_head).await
+        {
+            return witness;
+        }
+        self.rpc_client.get_witness(block_number, block_hash).await
+    }
 }
 
 impl BlockFetcher for ValidatorFetcher {
@@ -46,22 +84,14 @@ impl BlockFetcher for ValidatorFetcher {
         // Fetch by hash (not number) so a reorg between the hash lookup and the block fetch
         // surfaces as a hash mismatch rather than silently swapping the block under us.
         let block_fut = self.rpc_client.get_block(BlockId::Hash(block_hash.into()), true);
-        // The RPC witness path retries internally until it succeeds; an R2 fetch is fallible —
-        // a 404 (`Missing`) or decode failure surfaces as a fetch error and the pipeline
-        // re-enqueues.
-        let witness_fut = async {
-            match &self.r2_witness {
-                Some(r2) => Ok::<_, eyre::Report>(r2.get_witness(block_number, block_hash).await?),
-                None => Ok(self.rpc_client.get_witness(block_number, block_hash).await),
-            }
-        };
-        let (witness, block) = tokio::join!(witness_fut, block_fut);
-        let (salt_witness, mpt_witness) = witness?;
+        let ((salt_witness, mpt_witness), block) =
+            tokio::join!(self.fetch_witness(block_number, block_hash), block_fut);
         Ok(ValidationTask { block, salt_witness, mpt_witness })
     }
 
     async fn latest_block_number(&self) -> Result<u64> {
         let n = self.rpc_client.get_latest_block_number().await;
+        self.remote_head.store(n, Ordering::Relaxed);
         metrics::set_remote_chain_height(n);
         Ok(n)
     }

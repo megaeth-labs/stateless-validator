@@ -45,7 +45,9 @@ use futures::{FutureExt, future::Shared};
 use op_alloy_rpc_types::Transaction;
 use quick_cache::sync::Cache;
 use revm::state::Bytecode;
-use stateless_common::{CodeFetchError, RpcClient, RpcDeadlineExceeded, WitnessSizeBreakdown};
+use stateless_common::{
+    CodeFetchError, R2_FRONTIER_WINDOW, RpcClient, RpcDeadlineExceeded, WitnessSizeBreakdown,
+};
 use stateless_core::{
     ContractStore, LightWitness, StoreResult, db::StoreError, withdrawals::MptWitness,
 };
@@ -156,16 +158,6 @@ const R2_FRONTIER_BUDGET_DIVISOR: u32 = 8;
 /// at least this far below the tip are guaranteed misses on the internal generator endpoint,
 /// so probing it first only burns a failover round trip.
 pub const DEFAULT_WITNESS_LOCAL_WINDOW: u64 = 4096;
-
-/// Near-tip band (in blocks) inside which an R2 witness `missing` is the expected
-/// probe-ahead outcome — the uploader may plausibly not have PUT the object yet — rather
-/// than a bucket hole. Sized to comfortably cover the uploader's PUT latency plus the local
-/// DB tip's own sync lag (a few seconds each; chain sync's `GENERATOR_WITNESS_GRACE` is the
-/// time-based analog), and kept far below [`DEFAULT_WITNESS_LOCAL_WINDOW`]: routing asks
-/// "may the generator have pruned this?", this asks "may the uploader not have reached it
-/// yet?", and gating the `kind="missing"` alarm on the routing window would silence
-/// bucket-integrity alerting across its whole 4096-block span.
-const R2_FRONTIER_WINDOW: u64 = 32;
 
 /// Default deadline for the full block-fetch pipeline (header + witness + block + contracts)
 /// in seconds (13 seconds).
@@ -1250,6 +1242,13 @@ fn is_historical(db_tip: Option<u64>, block_number: u64, local_window: u64) -> b
 
 /// Which band a block falls in for the R2 probe, deciding its metrics label, its budget
 /// share, and how a `missing` is classified.
+///
+/// The band is the shared [`R2_FRONTIER_WINDOW`], measured here against the local DB tip
+/// (chain sync's `GENERATOR_WITNESS_GRACE` is the time-based analog) and kept far below
+/// [`DEFAULT_WITNESS_LOCAL_WINDOW`]: routing asks "may the generator have pruned this?",
+/// the band asks "may the uploader not have reached it yet?", and gating the
+/// `kind="missing"` alarm on the routing window would silence bucket-integrity alerting
+/// across its whole 4096-block span.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum R2Band {
     /// Within [`R2_FRONTIER_WINDOW`] of the local tip on either side (or no tip yet — the
