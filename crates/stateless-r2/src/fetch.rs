@@ -36,7 +36,7 @@ use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 use tokio::sync::{Semaphore, SemaphorePermit};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::{
     client::is_throttle_status,
@@ -880,7 +880,10 @@ impl R2ObjectFetcher {
                         return Err(e);
                     }
                     on_retry();
-                    warn!(
+                    // Debug rather than warn: every caller counts each retry through
+                    // `on_retry` and logs one line per failed fetch with the final error, so
+                    // a per-attempt warning would only multiply that line during a brownout.
+                    debug!(
                         number, %key, attempt, sleep_ms, error = %e,
                         "R2 witness GET failed, backing off",
                     );
