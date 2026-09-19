@@ -909,7 +909,7 @@ async fn main() -> Result<()> {
         info!(
             target = transport.target_label(),
             origin = %transport.origin(),
-            bucket = ?args.r2_bucket,
+            bucket = %args.r2_bucket.as_deref().unwrap_or("-"),
             cf_access = args.r2_access_client_id.is_some(),
             connections = transport.connections(),
             "Historical witness source: R2, RPC chain as fallback"

@@ -463,7 +463,7 @@ fn build_r2_transport(
     info!(
         target = transport.target_label(),
         origin = %transport.origin(),
-        bucket = ?args.r2_bucket,
+        bucket = %args.r2_bucket.as_deref().unwrap_or("-"),
         cf_access = args.r2_access_client_id.is_some(),
         connections = transport.connections(),
         max_concurrent_requests = ?transport.max_concurrent_requests(),
