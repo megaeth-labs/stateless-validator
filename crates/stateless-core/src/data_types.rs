@@ -59,7 +59,10 @@ pub enum PlainKey {
 }
 
 impl PlainKey {
-    /// Encodes the key into a byte vector.
+    /// Encodes the key into a byte vector — the owned form, for callers that must *keep* the
+    /// key (a map key, a stored key). A lookup that only borrows the bytes for the duration of
+    /// the call should use [`Self::account_key_bytes`] / [`Self::storage_key_bytes`], which
+    /// this delegates to; the choice is about ownership, not about how hot the path is.
     ///
     /// # Returns
     /// - Account: 20-byte address
@@ -75,8 +78,8 @@ impl PlainKey {
 
     /// Encoding of an account key — the raw address bytes.
     ///
-    /// Same bytes as `PlainKey::Account(address).encode()` without the heap allocation,
-    /// for per-state-read hot paths.
+    /// The primary definition of this encoding; [`Self::encode`] is the owned form derived
+    /// from it, so the two cannot disagree about what key a lookup targets.
     #[inline]
     pub(crate) fn account_key_bytes(address: &Address) -> &[u8] {
         address.as_slice()
@@ -84,8 +87,8 @@ impl PlainKey {
 
     /// Stack-allocated encoding of a storage-slot key — address (20) ++ slot (32).
     ///
-    /// Same bytes as `PlainKey::Storage(address, slot).encode()` without the heap
-    /// allocation, for per-state-read hot paths.
+    /// The primary definition of this encoding; [`Self::encode`] is the owned form derived
+    /// from it, so the two cannot disagree about what key a lookup targets.
     #[inline]
     pub(crate) fn storage_key_bytes(
         address: Address,
@@ -258,20 +261,25 @@ mod tests {
         entries.into_iter().enumerate().map(|(i, v)| (SaltKey::from((0u32, i as u64)), v)).collect()
     }
 
-    /// The allocation-free encoders the witness read path uses must produce exactly what
-    /// `encode()` produces — `encode()` delegates to them today, and this pins that contract
-    /// against a future edit that stops delegating and lets the two drift into looking up
-    /// different keys.
+    /// Both forms of each key encoding must produce one specific byte layout: the witness read
+    /// path uses the borrowing form and `encode()` the owning one, and they have to name the
+    /// same SALT entry. Each is asserted against the literal bytes rather than against the
+    /// other, so the pin still holds if `encode()` ever stops delegating — comparing the two
+    /// would pass by construction while they delegate, and prove nothing.
     #[test]
     fn stack_key_encodings_match_encode() {
-        let addr = Address::from([0x11; 20]);
-        assert_eq!(PlainKey::account_key_bytes(&addr), PlainKey::Account(addr).encode().as_slice());
-        for slot in [B256::ZERO, B256::from([0xAB; 32]), B256::from(U256::from(7))] {
-            assert_eq!(
-                PlainKey::storage_key_bytes(addr, slot).as_slice(),
-                PlainKey::Storage(addr, slot).encode().as_slice(),
-            );
-        }
+        let addr = Address::from([0x11; ACCOUNT_ADDRESS_LEN]);
+        let slot = B256::from([0xAB; SLOT_KEY_LEN]);
+
+        let expected_account = [0x11u8; ACCOUNT_ADDRESS_LEN];
+        assert_eq!(PlainKey::account_key_bytes(&addr), expected_account);
+        assert_eq!(PlainKey::Account(addr).encode(), expected_account);
+
+        // Address first, then slot — a swapped concatenation would look up a different entry.
+        let mut expected_storage = [0xABu8; STORAGE_SLOT_KEY_LEN];
+        expected_storage[..ACCOUNT_ADDRESS_LEN].fill(0x11);
+        assert_eq!(PlainKey::storage_key_bytes(addr, slot).as_slice(), expected_storage);
+        assert_eq!(PlainKey::Storage(addr, slot).encode(), expected_storage);
     }
 
     #[test]
