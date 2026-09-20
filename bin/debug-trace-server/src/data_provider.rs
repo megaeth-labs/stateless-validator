@@ -964,8 +964,9 @@ impl DataProvider {
                 let r2_witness = self.r2_witness.clone();
                 // The band anchors on the chain, not on how far this process has ingested:
                 // a reader lagging the chain does not make an overdue object any less
-                // overdue. `tip_hint` is the best estimate available here, and `0` (none
-                // learned yet) lands everything in the frontier, which is the safe side.
+                // overdue. This is half the estimate — the fetch raises it by the DB tip,
+                // which it reads anyway — and `0` here lands everything in the frontier,
+                // the safe side, until something is learned.
                 let chain_tip = self.tip_hint.load(Ordering::Relaxed);
                 let block_data_cache = self.block_data_cache.clone();
                 let fut: BlockDataFetchFuture = Box::pin(async move {
@@ -1289,8 +1290,9 @@ fn witness_route(
 /// so the full decode's per-point elliptic-curve work bought nothing. The recorded size is
 /// the light lower bound (excludes the never-decoded parent commitments).
 // Two tips rather than one, because they answer different questions: `db_tip` routes and
-// clamps the budget, `chain_tip` bands. A params struct would add a type to keep in sync
-// without encapsulating anything, as on `do_fetch_block_data` above.
+// clamps the budget, while banding takes the higher of the two (see below). A params struct
+// would add a type to keep in sync without encapsulating anything, as on
+// `do_fetch_block_data` above.
 #[allow(clippy::too_many_arguments)]
 async fn fetch_witness(
     rpc_client: &RpcClient,
@@ -1303,7 +1305,13 @@ async fn fetch_witness(
     deadline: Instant,
 ) -> DataProviderResult<(LightWitness, MptWitness)> {
     if let Some(r2) = r2_witness {
-        let band = r2_band(chain_tip, block_number);
+        // Neither observation alone is the chain tip, and each leads the other in a different
+        // mode: `chain_tip` (the caller's `tip_hint`) only learns heights that by-number and
+        // tag traffic reveal, so a server asked only for hashes or transactions never raises
+        // it at all, while `db_tip` only learns what sync has ingested and falls behind
+        // through a catch-up. Both are bounded by the real chain, so the higher is the better
+        // estimate and a miss still bands on the safe side.
+        let band = r2_band(chain_tip.max(db_tip.unwrap_or(0)), block_number);
         if let Some(witness) = try_r2_witness(r2, band, block_number, block_hash, deadline).await {
             return Ok(witness);
         }
@@ -2553,7 +2561,6 @@ mod tests {
     /// catch-up the two diverge: with the DB at 4000 and the chain head known to be 5000,
     /// block 4500 is 500 blocks — 500 seconds — below the head, so R2 is its primary source
     /// and gets the historical half-share of the stage.
-
     #[tokio::test]
     async fn the_band_follows_the_chain_tip_not_the_ingested_tip() {
         let (r2_endpoint, _r2_hits) = mock_r2_held(200, Duration::from_millis(700)).await;
@@ -2585,6 +2592,42 @@ mod tests {
         assert!(
             elapsed < Duration::from_millis(900),
             "and still be cut at that share rather than waiting out the hung R2 ({elapsed:?})",
+        );
+
+        ha.stop().unwrap();
+    }
+
+    /// And it follows the chain even when only the DB knows where the chain is. `tip_hint`
+    /// is raised by by-number and tag resolutions alone, so a server asked only for block
+    /// hashes and transactions leaves it at `0` for its whole life — which would band every
+    /// block frontier, cut every historical probe to the speculative eighth, and keep real
+    /// bucket holes out of `kind="missing"` indefinitely. The DB tip carries it instead.
+    #[tokio::test]
+    async fn an_unraised_tip_hint_bands_on_the_db_tip_instead() {
+        let (r2_endpoint, _r2_hits) = mock_r2_held(200, Duration::from_millis(700)).await;
+        let (ha, url_gen, _hits_gen) = scripted_witness_rpc(0, Some(fixture_wire())).await;
+        let (rpc_client, cfg) = routing_fixture(&[url_gen.as_str()], true);
+        let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
+
+        let started = Instant::now();
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            Some(&r2),
+            Some(5000),
+            0,
+            4000,
+            B256::ZERO,
+            started + Duration::from_secs(2),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_ok(), "the RPC chain must serve after R2: {:?}", result.err());
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "a block 1000 below the DB tip must get the historical half-share ({elapsed:?}); \
+             cut this early means an unraised tip hint banded it frontier",
         );
 
         ha.stop().unwrap();

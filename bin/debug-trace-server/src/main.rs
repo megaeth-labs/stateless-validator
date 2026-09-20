@@ -693,14 +693,15 @@ fn validate_args(args: &Args) -> Result<R2Config> {
     let tuning =
         [R2TuningFlag::new("--r2-connect-timeout-ms", args.r2_connect_timeout_ms.is_some())];
     let config = validate_r2_flags(&r2_flags(args, &tuning))?;
-    // R2 rides the witness stage, whose old-block budget clamp and generator-skip routing both
-    // read the local DB tip and fall to their conservative branch without --data-dir. (The band
-    // itself no longer needs one — that anchors on the chain head.) An operator who configured
-    // R2 asked for the real route, so fail closed rather than run a degraded one.
+    // R2 rides the witness stage, whose old-block budget clamp and generator-skip routing read
+    // the local DB tip — and so does the band, which takes the higher of that and the tip
+    // observed from request traffic. Without --data-dir each falls to its conservative branch.
+    // An operator who configured R2 asked for the real route, so fail closed rather than run a
+    // degraded one.
     if config.is_configured() && args.data_dir.is_none() {
         eyre::bail!(
-            "the R2 witness route requires --data-dir: its witness stage budget and \
-             routing read the local DB tip"
+            "the R2 witness route requires --data-dir: its banding, budget and routing \
+             all read the local DB tip"
         );
     }
     // Shared with the admin RPC's setter, so the startup gate and the runtime gate cannot
