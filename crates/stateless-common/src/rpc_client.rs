@@ -1590,7 +1590,13 @@ async fn decode_witness_wire<T: Send + 'static>(
 /// CPU-bound over a full block), handing the block back untouched on success.
 ///
 /// A failure here is an integrity failure from this provider — the retry loop records it as
-/// that provider's `Error` and rotates, exactly like a transport error.
+/// that provider's `Error` and rotates, exactly like a transport error. A panic inside
+/// [`verify_block_integrity`] is folded into that same path rather than unwinding the caller,
+/// matching [`decode_witness_wire`]: both turn provider-supplied bytes into typed values, so a
+/// panic there says this provider's data is bad and rotating is the useful answer (under a
+/// `None` deadline that retries forever). This is deliberately the opposite of the chain
+/// advancer, where a store panic stays fatal because it means the persistence layer is corrupt
+/// and every later block would build on it.
 async fn verify_block_on_blocking_pool(block: Block<Transaction>) -> Result<Block<Transaction>> {
     tokio::task::spawn_blocking(move || -> Result<Block<Transaction>> {
         verify_block_integrity(&block)?;
