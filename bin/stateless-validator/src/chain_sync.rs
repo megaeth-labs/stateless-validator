@@ -41,9 +41,8 @@ pub struct ValidatorFetcher {
     /// `Some` ⇒ fetch witnesses from R2 first; `None` ⇒ RPC only.
     r2_witness: Option<Arc<R2WitnessClient>>,
     /// The chain head [`Self::latest_block_number`] last observed, which the R2 client reads
-    /// to tell a frontier miss from a bucket hole. It is `0` until the first poll, which
-    /// classifies every miss as a frontier one; the pipeline polls the head before it spawns
-    /// any fetch, so outside tests a fetch never sees that state.
+    /// to tell a frontier miss from a bucket hole. `0` until the first poll bands every miss
+    /// as frontier.
     remote_head: AtomicU64,
 }
 
@@ -57,10 +56,9 @@ impl ValidatorFetcher {
     /// The witness for `(block_number, block_hash)`: from R2 when a target is configured,
     /// otherwise straight from the RPC witness chain.
     ///
-    /// An R2 fetch is fallible and any failure hands the block to that same chain, which
-    /// retries internally until it succeeds. The R2 client has already recorded and logged
-    /// what went wrong, so nothing is returned about it here — as far as the pipeline is
-    /// concerned this stays as infallible as the RPC-only path always was.
+    /// An R2 fetch is fallible and any failure hands the block to the RPC chain, which retries
+    /// until it succeeds. The R2 client already recorded and logged what went wrong, so the
+    /// pipeline sees the same infallible witness fetch it always did.
     async fn fetch_witness(
         &self,
         block_number: u64,

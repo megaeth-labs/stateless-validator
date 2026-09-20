@@ -1303,8 +1303,6 @@ async fn fetch_witness(
     deadline: Instant,
 ) -> DataProviderResult<(LightWitness, MptWitness)> {
     if let Some(r2) = r2_witness {
-        // `db_tip` routes (may the generator have pruned this?) while `chain_tip` bands
-        // (has the uploader had time to reach this?) — different questions, different tips.
         let band = r2_band(chain_tip, block_number);
         if let Some(witness) = try_r2_witness(r2, band, block_number, block_hash, deadline).await {
             return Ok(witness);
@@ -1362,10 +1360,8 @@ async fn try_r2_witness(
     deadline: Instant,
 ) -> Option<(LightWitness, MptWitness)> {
     let source = if band == R2Band::Frontier { "witness_r2_frontier" } else { "witness_r2" };
-    // Only the historical band gets the half share: there R2 is the primary source and the
-    // object must exist. The frontier band is speculative — the uploader may not have
-    // reached the block — so it may not burn half of a near-head request's budget on
-    // degraded R2.
+    // Only the historical band gets the half share: there R2 is primary and the object must
+    // exist. A frontier probe is speculative, so it may not burn half a near-head budget.
     let divisor = if band == R2Band::Historical {
         R2_WITNESS_BUDGET_DIVISOR
     } else {
@@ -1381,7 +1377,7 @@ async fn try_r2_witness(
         }
         Err(e) => {
             metrics.record_request(false, now.elapsed().as_secs_f64());
-            if band == R2Band::Frontier && e.is_missing() {
+            if e.is_frontier_miss(band) {
                 // The per-source counter above still records the miss (what the frontier
                 // hit rate reads); only the `kind="missing"` alarm skips it.
                 debug!(
@@ -1691,19 +1687,11 @@ mod tests {
         assert!(!is_historical(Some(4095), 0, 4096));
         assert!(!is_historical(Some(u64::MAX), u64::MAX, 4096), "overflowing horizon is recent");
         assert!(is_historical(Some(100), 50, 0), "zero window: everything at/below tip");
-    }
-
-    /// The R2 frontier band is the uploader-lag grace, not the routing window: a block that
-    /// is recent for routing but past the band must count an R2 miss as a bucket hole (the
-    /// `kind="missing"` alarm), not an expected probe-ahead miss. The band's own edges are
-    /// pinned once, next to the classifier, in `stateless-common`.
-    #[test]
-    fn r2_frontier_band_is_narrower_than_routing() {
-        let recent_not_tip = 4000;
-        assert_eq!(r2_band(5000, recent_not_tip), R2Band::Historical, "a hole here must alarm",);
+        // The deployed window is the wide one, and the R2 frontier band is not: a block 1000
+        // below the tip is a bucket hole for the band while still recent for routing.
         assert!(
-            !is_historical(Some(5000), recent_not_tip, DEFAULT_WITNESS_LOCAL_WINDOW),
-            "yet the same block is recent for witness routing",
+            !is_historical(Some(5000), 4000, DEFAULT_WITNESS_LOCAL_WINDOW),
+            "the routing window is far wider than the R2 band",
         );
     }
 
@@ -2565,10 +2553,7 @@ mod tests {
     /// catch-up the two diverge: with the DB at 4000 and the chain head known to be 5000,
     /// block 4500 is 500 blocks — 500 seconds — below the head, so R2 is its primary source
     /// and gets the historical half-share of the stage.
-    ///
-    /// Read from the DB tip instead, that block sits above it and would be cut at the
-    /// speculative eighth, which is also what used to route its genuine misses away from the
-    /// `kind="missing"` bucket-integrity alarm for the whole length of a catch-up.
+
     #[tokio::test]
     async fn the_band_follows_the_chain_tip_not_the_ingested_tip() {
         let (r2_endpoint, _r2_hits) = mock_r2_held(200, Duration::from_millis(700)).await;

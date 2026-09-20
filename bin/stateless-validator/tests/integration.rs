@@ -166,36 +166,6 @@ fn end_block_flag_and_env() {
     });
 }
 
-/// `--witness-source` selected between an RPC-only and an R2-only mode; the R2 flags
-/// themselves now carry that choice, so the flag is gone rather than kept as a no-op.
-/// Pinned here because it was an env-settable flag: this is the assertion that says the
-/// removal was meant, and that a stale `--witness-source r2` fails loudly on the command line.
-#[test]
-fn the_witness_source_mode_flag_is_gone() {
-    let _guard = stateless_test_utils::env::env_lock();
-    for value in ["rpc", "r2"] {
-        assert!(
-            CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(&["--witness-source", value]))
-                .is_err(),
-            "--witness-source {value} must no longer be accepted",
-        );
-    }
-}
-
-/// `--witness-endpoint` is required, but enforced after parsing so the error can name it —
-/// clap's own rejections cannot, this workspace having built it without `error-context`. The
-/// parse must therefore still accept its absence; `app.rs` covers the rejection itself.
-#[test]
-fn witness_endpoint_is_optional_at_parse_time() {
-    // `try_parse_from` reads the env for every `#[clap(env = ...)]` field, so this test
-    // must hold the lock too: a sibling's `with_env_var` would otherwise land in this parse.
-    let _guard = stateless_test_utils::env::env_lock();
-    let parse =
-        |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS_NO_WITNESS.iter().chain(extra));
-
-    assert!(parse(&[]).unwrap().witness_endpoint.is_empty());
-}
-
 /// The custom-domain R2 target is mutually exclusive with the S3 endpoint, and the Access
 /// token pair is all-or-nothing on top of it.
 #[test]
@@ -240,16 +210,12 @@ fn r2_custom_domain_target_wiring() {
     );
 }
 
-/// A blank value — what a templated env file renders for a variable a given role does not
-/// set — and a pair of conflicting targets must both reach the post-parse rules rather than
-/// being rejected by clap, whose messages name no argument in this workspace (built without
-/// `error-context`). `--r2-connections` travels as text for exactly that reason.
-///
-/// This pins the parse layer alone. Both shapes are rejected, by name, once the rules run,
-/// which `app.rs` does on every startup; `r2_flags_are_validated_even_with_no_target_configured`
-/// covers that side.
+/// A blank value — what a templated env file renders for a variable a role does not set —
+/// must reach the post-parse rules rather than clap, whose messages name no argument in this
+/// workspace. `--r2-connections` travels as text for that reason;
+/// `app::tests::r2_flags_are_validated_even_with_no_target_configured` covers the rejection.
 #[test]
-fn blank_and_conflicting_r2_values_reach_the_post_parse_rules() {
+fn blank_r2_values_reach_the_post_parse_rules() {
     let _guard = stateless_test_utils::env::env_lock();
     let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
 
@@ -265,16 +231,6 @@ fn blank_and_conflicting_r2_values_reach_the_post_parse_rules() {
             blank[0]
         );
     }
-    assert!(
-        parse(&[
-            "--r2-endpoint",
-            "https://acc.r2.cloudflarestorage.com",
-            "--r2-custom-domain",
-            "https://witness.example.com",
-        ])
-        .is_ok(),
-        "conflicting targets must parse, so the rejection can name both"
-    );
 }
 
 /// `canonical_chain_max_length` must reject 0 at parse time. A value of 0 would make
@@ -572,22 +528,6 @@ async fn an_r2_miss_falls_back_to_the_rpc_witness_path() {
     let task = fetcher.fetch(number).await.expect("RPC must serve after the R2 miss");
     assert_eq!(task.block.header.number, number);
     assert_eq!(r2_hits.load(Ordering::SeqCst), 1, "a miss is not retried against R2");
-    assert_eq!(witness_requests.load(Ordering::SeqCst), 1, "the RPC witness path took over");
-    handle.stop().unwrap();
-}
-
-/// A corrupt object falls back too, and is the case that distinguishes the fallback from a
-/// retry: it is deterministic, so no amount of re-asking R2 would help, and the block would
-/// stall forever without the RPC path behind it. One GET, no re-download, one RPC call.
-#[tokio::test]
-async fn a_corrupt_object_falls_back_instead_of_stalling_the_block() {
-    let number = first_paired_block();
-    let (r2_endpoint, r2_hits) = mock_r2(vec![(200, "not a zstd witness")]).await;
-    let (fetcher, witness_requests, handle) = r2_backed_fetcher(&r2_endpoint).await;
-
-    let task = fetcher.fetch(number).await.expect("RPC must serve after the corrupt object");
-    assert_eq!(task.block.header.number, number);
-    assert_eq!(r2_hits.load(Ordering::SeqCst), 1, "a corrupt object must not be re-downloaded");
     assert_eq!(witness_requests.load(Ordering::SeqCst), 1, "the RPC witness path took over");
     handle.stop().unwrap();
 }

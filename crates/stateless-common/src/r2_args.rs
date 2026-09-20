@@ -96,12 +96,10 @@ pub struct R2Flags<'a> {
 
 /// What a validated flag set selects, carrying the values that selection proved present.
 ///
-/// The verdict carries the values rather than just naming the target, so a caller never
-/// re-reads the argument struct to recover them. Read back out of the flags, every caller
-/// would need an `expect()` per field asserting what these rules already proved, and each copy
-/// is a place that can disagree with the rules about which flags a target actually requires.
-/// The in-flight cap travels the same way: the rules validate it against the connection count,
-/// so the cap a transport is built with has to be the one they checked.
+/// Values, not just the target name — including the in-flight cap, which these rules check
+/// against the connection count. Read back out of the flags instead, every caller would need
+/// an `expect()` per field and could disagree with the rules about which flags a target
+/// requires.
 ///
 /// `Debug` is safe to derive: both credentials redact themselves.
 #[derive(Debug)]
@@ -141,9 +139,8 @@ impl R2Config {
     }
 }
 
-/// The target a flag set selects, with the values that selection proved present, still
-/// borrowed from the argument struct. The rules below take this rather than an owned
-/// [`R2Config`] so the per-target checks run before anything is cloned.
+/// [`R2Config`] still borrowed from the argument struct, so the per-target checks run before
+/// anything is cloned.
 #[derive(Clone, Copy)]
 enum Selected<'a> {
     None,

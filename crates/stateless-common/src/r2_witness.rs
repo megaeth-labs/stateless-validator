@@ -2,14 +2,11 @@
 //!
 //! Both binaries read witness objects straight from the R2 bucket through
 //! [`R2ObjectFetcher`], try it before their RPC witness chain, and hand any failure to that
-//! chain on a small retry budget with no pause before surfacing. What still differs is how
-//! each reads a fetched object and how long it may take: the trace server light-decodes
-//! under the caller's request deadline, decode included, while the validator full-decodes
-//! (proof verification needs the curve points the light decode skips) on a fixed per-block
-//! stage budget that stops at the GET. What lives here is the part that is identical by
-//! construction — the failure taxonomy with its metric labels, and the transport wrapper
-//! (construction from a validated verdict, target accessors) — so the two adapters cannot
-//! drift apart on it.
+//! chain on a small retry budget with no pause. They differ in how they read an object and how
+//! long it may take: the trace server light-decodes under the caller's request deadline, the
+//! validator full-decodes (proof verification needs the curve points) on a fixed per-block
+//! stage budget that stops at the GET. What lives here is identical by construction — the
+//! failure taxonomy with its metric labels, the band rules, and the transport wrapper.
 
 use std::{sync::Arc, time::Instant};
 
@@ -127,6 +124,14 @@ impl R2WitnessError {
     /// ahead of the uploader treats as expected rather than alarming.
     pub const fn is_missing(&self) -> bool {
         matches!(self, Self::Get(R2GetError::Missing { .. }))
+    }
+
+    /// Whether this is the routine near-tip outcome: an absent object banded
+    /// [`R2Band::Frontier`], so the uploader may not have reached the block yet. Both readers
+    /// keep these off `..._r2_witness_errors_total` so it stays an error rate, and both
+    /// classify through this one conjunction, as they band through [`r2_band`].
+    pub const fn is_frontier_miss(&self, band: R2Band) -> bool {
+        self.is_missing() && matches!(band, R2Band::Frontier)
     }
 }
 
@@ -252,13 +257,9 @@ impl R2WitnessTransport {
         Ok(Self { fetcher, max_concurrent_requests })
     }
 
-    /// Builds the transport a validated [`R2Config`] selects, or `None` when no R2 target is
-    /// configured, publishing what it built through `metrics`.
-    ///
-    /// This is the one place either binary turns a verdict into a transport, taking every
-    /// target-dependent value — the in-flight cap included — from the verdict rather than
-    /// from the caller's flags. The caller logs what it built from the accessors below, in its
-    /// own words.
+    /// Builds the transport a validated [`R2Config`] selects, or `None` when no target is
+    /// configured, publishing what it built through `metrics`. Every target-dependent value —
+    /// the in-flight cap included — comes from the verdict, never from the caller's flags.
     pub fn from_config(
         config: R2Config,
         timeouts: FetchTimeouts,
@@ -370,6 +371,23 @@ mod tests {
         assert_eq!(r2_band(TIP, 4000), Historical, "a hole this deep must alarm");
         // A horizon that would overflow counts as frontier rather than wrapping into one.
         assert_eq!(r2_band(u64::MAX, u64::MAX), Frontier);
+    }
+
+    /// The other half of the split, and the half both binaries used to spell for themselves:
+    /// only an absent object leaves the error counter, and only inside the band.
+    #[test]
+    fn only_a_missing_inside_the_band_is_a_frontier_miss() {
+        let missing = R2WitnessError::Get(R2GetError::Missing { number: 1, key: "k".into() });
+        assert!(missing.is_frontier_miss(R2Band::Frontier));
+        assert!(!missing.is_frontier_miss(R2Band::Historical), "a hole this deep must alarm");
+
+        let throttled = R2WitnessError::Get(R2GetError::Throttled {
+            number: 1,
+            key: "k".into(),
+            status: 503,
+            body: String::new(),
+        });
+        assert!(!throttled.is_frontier_miss(R2Band::Frontier), "only an absent object can split");
     }
 
     /// Every fetch-level kind must appear in the pre-registered [`R2WitnessError::KINDS`]

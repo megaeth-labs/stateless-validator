@@ -52,8 +52,6 @@ impl RpcMetrics for ValidatorMetrics {
     }
 }
 
-/// What the shared R2 transport constructor publishes about the target it built. The same
-/// facade carries the RPC callbacks above, so a binary hands one object to both.
 impl R2Metrics for ValidatorMetrics {
     fn on_target(&self, target: &'static str) {
         record_r2_target(target);
@@ -207,18 +205,13 @@ fn register_metric_descriptions() {
     );
     describe_counter!(
         names::R2_WITNESS_ERRORS_TOTAL,
-        "R2 witness fetches that failed, each one a block that fell back to the RPC witness \
-         path, by kind. Routine near-tip misses are counted separately (see \
-         `r2_witness_frontier_misses_total`), so this stays an error rate and `missing` \
-         means a hole in objects that must exist — a signal that earns its name during \
-         catch-up and `--end-block` backfills"
+        "Failed R2 witness fetches by kind, each a block that fell back to RPC. Excludes \
+         near-tip misses (`r2_witness_frontier_misses_total`), so `missing` is a bucket hole"
     );
     describe_counter!(
         names::R2_WITNESS_FRONTIER_MISSES_TOTAL,
-        "R2 witness fetches that found no object within the frontier band below the polled \
-         head — the uploader has not reached the block yet. Routine and numerous on a \
-         tip-following run, which is why they are kept off `r2_witness_errors_total`; their \
-         rate is the signal to watch there"
+        "R2 witness fetches with no object inside the frontier band below the polled head: \
+         the uploader has not reached the block yet. Routine, so not counted as an error"
     );
     describe_gauge!(
         names::R2_NEGOTIATED_VERSION_INFO,

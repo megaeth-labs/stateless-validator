@@ -880,9 +880,8 @@ impl R2ObjectFetcher {
                         return Err(e);
                     }
                     on_retry();
-                    // Debug rather than warn: every caller counts each retry through
-                    // `on_retry` and logs one line per failed fetch with the final error, so
-                    // a per-attempt warning would only multiply that line during a brownout.
+                    // Debug, not warn: callers count retries via `on_retry` and log one line
+                    // per failed fetch, so per-attempt warnings only multiply it in a brownout.
                     debug!(
                         number, %key, attempt, sleep_ms, error = %e,
                         "R2 witness GET failed, backing off",

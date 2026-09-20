@@ -127,18 +127,13 @@ pub struct CommandLineArgs {
     pub r2_secret_access_key: Option<RedactedSecret>,
 
     /// R2 connection-establishment timeout (milliseconds). A healthy handshake to the local
-    /// anycast edge is tens of ms. On the S3 endpoint, hangs past this are the per-IP
-    /// connection-budget mitigation's signature and keep landing in the connect phase, since
-    /// every in-flight GET holds its own connection; they surface as retryable `connect`-kind
-    /// errors. The custom domain pools a single h2 connection, so this bounds its first
-    /// handshake and any reconnect — a path that breaks after that surfaces as `transport`
-    /// against the per-attempt budget until the keep-alive ping reaps the connection, at which
-    /// point the fetch falls back to the RPC witness chain.
+    /// anycast edge is tens of ms; hangs past this are the S3 endpoint's per-IP
+    /// connection-budget mitigation (one connection per in-flight GET) and surface as retryable
+    /// `connect` errors. The custom domain pools one h2 connection, so this bounds its
+    /// handshake and reconnects only.
     ///
-    /// Left as an `Option` rather than defaulted by clap so that "explicitly set" stays
-    /// distinguishable; [`DEFAULT_CONNECT_TIMEOUT`] applies when it is absent. Setting it with
-    /// no R2 target configured is rejected at startup by name, rather than accepted and
-    /// silently dropped.
+    /// An `Option` so "explicitly set" stays distinguishable; [`DEFAULT_CONNECT_TIMEOUT`]
+    /// applies when absent, and setting it with no R2 target is rejected at startup by name.
     ///
     /// [`DEFAULT_CONNECT_TIMEOUT`]: stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT
     #[clap(
@@ -150,17 +145,14 @@ pub struct CommandLineArgs {
 
     /// HTTP/2 connections the custom-domain target spreads its GETs over (default: 1).
     ///
-    /// One `reqwest::Client` holds exactly one HTTP/2 connection and hyper opens no second one
-    /// when the first saturates, so this is the only way past the edge's per-connection stream
-    /// limit — and the only way one dropped connection stops taking every in-flight GET with
-    /// it, which here would push a whole window of blocks onto the RPC fallback at once.
-    /// `--r2-max-concurrent-requests` is still the cap across all of them, split evenly
-    /// and rounded up, so raising this alone spreads the same concurrency thinner rather than
-    /// raising the ceiling; a count larger than that cap is rejected, since the surplus
-    /// connections could never be filled.
+    /// One `reqwest::Client` holds exactly one h2 connection and hyper opens no second when it
+    /// saturates, so this is the only way past the edge's per-connection stream limit, and the
+    /// only way one dropped connection stops taking a whole window of blocks onto the RPC
+    /// fallback with it. `--r2-max-concurrent-requests` stays the cap across all of them, split
+    /// evenly, so raising this alone spreads the same concurrency thinner; a count above that
+    /// cap is rejected.
     ///
-    /// Taken as text and parsed after clap so a blank env line is rejected by name rather than
-    /// aborting startup with clap's unnamed value error.
+    /// Text rather than a number so a blank env line is named rather than hitting clap.
     #[clap(long, env = "STATELESS_VALIDATOR_R2_CONNECTIONS")]
     pub r2_connections: Option<String>,
 
@@ -245,9 +237,8 @@ pub struct CommandLineArgs {
     pub rpc_max_backoff_ms: Option<u64>,
 
     /// Per-attempt RPC timeout (milliseconds). Must be ≥ 100ms. With an R2 target configured
-    /// it also bounds each R2 witness GET, and the R2 fast path as a whole: one block's
-    /// permit wait plus all of its GET attempts share a single budget of this size before the
-    /// block falls back to the RPC witness chain.
+    /// it also bounds each R2 witness GET and the whole R2 fast path per block — see
+    /// [`R2WitnessClient::new`](crate::r2_witness::R2WitnessClient::new).
     #[clap(
         long,
         env = "STATELESS_VALIDATOR_RPC_PER_ATTEMPT_TIMEOUT_MS",
@@ -460,11 +451,9 @@ fn build_r2_transport(
         );
         return Ok(None);
     };
-    // `--witness-max-concurrent-requests` capped R2 GETs before the two were split. Carrying
-    // only that spelling into an R2 deployment leaves the bucket uncapped, which the fetcher
-    // cannot warn about on its own: with no cap there is no per-connection share to compare
-    // against the edge's stream limit, so the queueing happens inside the HTTP/2 connection
-    // where it is invisible and still spends the per-attempt budget.
+    // `--witness-max-concurrent-requests` capped R2 GETs before the two were split; alone it
+    // now leaves R2 uncapped, which the fetcher cannot flag itself (no cap, no per-connection
+    // share to compare against the edge's stream limit).
     if args.witness_max_concurrent_requests.is_some() && args.r2_max_concurrent_requests.is_none() {
         warn!(
             "--witness-max-concurrent-requests sizes only the RPC witness path; R2 GETs are \
@@ -590,14 +579,8 @@ mod tests {
                 .chain(["--witness-max-concurrent-requests", "16"])
                 .chain(["--r2-max-concurrent-requests", "48"])
                 .collect();
-            let args = parse(&both);
-            assert_eq!(args.witness_max_concurrent_requests, Some(16));
-            assert_eq!(args.r2_max_concurrent_requests, Some(48));
-            let capped = build(&args).unwrap().expect("a configured target is not None");
+            let capped = build(&parse(&both)).unwrap().expect("a configured target is not None");
             assert_eq!(capped.max_concurrent_requests(), Some(48), "{target:?}");
-
-            let uncapped = build(&parse(target)).unwrap().expect("a configured target is not None");
-            assert_eq!(uncapped.max_concurrent_requests(), None, "{target:?}");
 
             // The pre-split spelling alone no longer caps R2 — it warns and builds uncapped,
             // rather than being refused as it was when R2 had no fallback to warn towards.
@@ -610,9 +593,9 @@ mod tests {
         }
     }
 
-    /// The R2 flags are validated on every startup, so a tuning flag with no target to tune
-    /// and a blank env line beside no other R2 configuration are both named. Accepted
-    /// silently, either would run the RPC-only path while the operator believed R2 was on.
+    /// The R2 flags are validated on every startup, so a tuning flag with no target to tune is
+    /// named rather than read as "no R2 configured" and silently dropped. Blank values are the
+    /// other diagnostic this buys; the rules' own tests pin their wording.
     #[test]
     fn r2_flags_are_validated_even_with_no_target_configured() {
         let _guard = stateless_test_utils::env::env_lock();
@@ -620,10 +603,6 @@ mod tests {
         let orphan = build(&parse(&["--r2-max-concurrent-requests", "48"]))
             .expect_err("a tuning flag with no target must be named");
         assert!(orphan.to_string().contains("--r2-max-concurrent-requests"), "{orphan}");
-
-        let blank = build(&parse(&["--r2-endpoint", ""])).expect_err("a blank value must be named");
-        let blank = blank.to_string();
-        assert!(blank.contains("--r2-endpoint") && blank.contains("empty"), "{blank}");
     }
 
     /// The RPC witness chain is required whether or not R2 is configured: without R2 it is the

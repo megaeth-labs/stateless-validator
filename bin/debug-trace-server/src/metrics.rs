@@ -1156,8 +1156,6 @@ fn upstream_label_for(method: stateless_common::metrics::RpcMethod) -> &'static 
 #[derive(Default)]
 pub struct TraceRpcMetrics;
 
-/// What the shared R2 transport constructor publishes about the target it built. The same
-/// facade carries the RPC callbacks below, so the binary hands one object to both.
 impl stateless_common::R2Metrics for TraceRpcMetrics {
     fn on_target(&self, target: &'static str) {
         record_r2_target(target);

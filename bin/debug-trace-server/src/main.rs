@@ -686,23 +686,21 @@ fn validate_args(args: &Args) -> Result<R2Config> {
              --witness-endpoint: list the generator once, via the dedicated flag"
         );
     }
-    // Every R2 coherence rule — empty values, target exclusion, leftovers from the other
-    // target, an incomplete credential quad, the Access pair, and tuning flags with nothing to
-    // tune — comes from the shared validator, so the two binaries cannot drift apart on them.
-    // It runs on every startup, so a bad `--r2-*` value fails fast rather than surfacing later
-    // as `kind="missing"`, the counter watched for bucket gaps. The connect timeout is the one
-    // R2 flag whose value those rules never see, so it is listed here to be named when orphaned.
+    // Every R2 coherence rule comes from the shared validator, so the two binaries cannot
+    // drift. A bad `--r2-*` value fails fast here rather than surfacing later as
+    // `kind="missing"`. The connect timeout is the one R2 flag those rules never see, so it is
+    // listed here to be named when orphaned.
     let tuning =
         [R2TuningFlag::new("--r2-connect-timeout-ms", args.r2_connect_timeout_ms.is_some())];
     let config = validate_r2_flags(&r2_flags(args, &tuning))?;
-    // The R2 route anchors block age (frontier vs historical) to the local DB tip; without
-    // --data-dir every block would classify as frontier and a genuine bucket hole would
-    // never reach the `kind="missing"` alarm. An operator who configured R2 asked for the
-    // real route — fail closed instead of running a blind approximation.
+    // R2 rides the witness stage, whose old-block budget clamp and generator-skip routing both
+    // read the local DB tip and fall to their conservative branch without --data-dir. (The band
+    // itself no longer needs one — that anchors on the chain head.) An operator who configured
+    // R2 asked for the real route, so fail closed rather than run a degraded one.
     if config.is_configured() && args.data_dir.is_none() {
         eyre::bail!(
-            "the R2 witness route requires --data-dir: it anchors block age \
-             (frontier vs historical) to the local DB tip"
+            "the R2 witness route requires --data-dir: its witness stage budget and \
+             routing read the local DB tip"
         );
     }
     // Shared with the admin RPC's setter, so the startup gate and the runtime gate cannot
