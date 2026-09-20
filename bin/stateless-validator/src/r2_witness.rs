@@ -71,18 +71,11 @@ const MAX_ATTEMPTS: usize = 3;
 /// simply not have reached it yet. Those are counted on their own series; everything else is
 /// an error, which is what keeps `r2_witness_errors_total` an error rate.
 ///
-/// `remote_head` is `0` before the first poll, which reaches the shared classifier as "no tip
-/// known" — every block is a frontier block then, which is right: nothing is known to be
-/// uploaded yet. The `Option` is load-bearing rather than ceremony here, since `Some(0)` would
-/// instead put every block past the window into [`R2Band::AboveTip`].
-///
-/// Only [`R2Band::Historical`] is a hole. [`R2Band::AboveTip`] is unreachable for this reader —
-/// the pipeline spawns fetches at `head - tip_buffer` against the same poll that set
-/// `remote_head`, so a fetched block is never above it — and it would mean the same thing as a
-/// frontier block anyway: the uploader may not have got there.
+/// `remote_head` is `0` before the first poll, which the shared classifier reads as "no tip
+/// learned" and puts every block in the frontier — which is right: nothing is known to be
+/// uploaded yet.
 fn is_frontier_miss(e: &R2WitnessError, number: u64, remote_head: u64) -> bool {
-    let tip = (remote_head != 0).then_some(remote_head);
-    e.is_missing() && r2_band(tip, number) != R2Band::Historical
+    e.is_missing() && r2_band(remote_head, number) == R2Band::Frontier
 }
 
 /// Fetches witness objects straight from an R2 bucket — SigV4-signed over the S3 API, or

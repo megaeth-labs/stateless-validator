@@ -31,13 +31,6 @@ use crate::metrics;
 /// caller's deadline clamps the loop harder anyway.
 const MAX_ATTEMPTS: usize = 3;
 
-/// Synthetic `kind` label for a `missing` above the frontier band — a catch-up-gap probe
-/// whose bucket state is unknowable from the stale local tip. Kept off
-/// [`R2WitnessError::KINDS`] (no error variant produces it); the band classifier in
-/// `data_provider` records it so catch-up bursts stay visible without flooding the
-/// below-band `kind="missing"` bucket-integrity alarm.
-pub(crate) const KIND_MISSING_ABOVE_TIP: &str = "missing_above_tip";
-
 /// Fetches and light-decodes witnesses straight from an R2 bucket.
 /// The transport's `Debug` redacts the credentials.
 #[derive(Debug)]
