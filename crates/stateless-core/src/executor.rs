@@ -30,16 +30,10 @@
 //! The module integrates with the Salt witness system for state reconstruction
 //! and uses Revm for transaction execution.
 
-#[cfg(feature = "std")]
-use std::time::Instant;
 use std::{boxed::Box, collections::BTreeMap, fmt::Debug, vec::Vec};
 
 use alloy_consensus::{TxReceipt, proofs::calculate_receipt_root, transaction::Recovered};
-use alloy_eips::eip2718::Encodable2718;
-use alloy_evm::{
-    EvmEnv,
-    block::{BlockExecutor, ExecutableTx},
-};
+use alloy_evm::{EvmEnv, block::BlockExecutor};
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{
     Address, Bloom, keccak256,
@@ -486,9 +480,23 @@ where
     let BlockExecutionEnv { evm_env, executor_factory, ctx: execution_context } =
         create_block_execution_env(chain_spec, header, env_oracle);
 
-    let executor = executor_factory.create_executor(&mut state, execution_context, evm_env);
-    let (receipts_root, logs_bloom, gas_used) =
-        execute_transactions(executor, block.txs_recovered())?;
+    let mut executor = executor_factory.create_executor(&mut state, execution_context, evm_env);
+    executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
+    for recovered_tx in block.txs_recovered() {
+        executor.execute_transaction(recovered_tx).map_err(ValidationError::BlockReplayFailed)?;
+    }
+    let execution_result =
+        executor.apply_post_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
+
+    // Compute logs bloom by ORing all receipt blooms together
+    let logs_bloom =
+        execution_result.receipts.iter().fold(Bloom::ZERO, |acc, receipt| acc | receipt.bloom());
+
+    // mega-evm's `finish()` defines this field as the last receipt's cumulative gas, so
+    // reading it keeps one derivation of the value rather than a copy of the expression.
+    let gas_used = execution_result.gas_used;
+
+    let receipts_root = calculate_receipt_root(&execution_result.receipts);
 
     // Merge transitions into bundle_state
     state.merge_transitions(BundleRetention::PlainState);
@@ -520,48 +528,6 @@ where
             state_writes,
         },
     ))
-}
-
-/// Executes a stream of recovered transactions using the given block executor.
-fn execute_transactions<'a, E, I>(
-    mut executor: E,
-    transactions: I,
-) -> Result<(B256, Bloom, u64), ValidationError>
-where
-    E: BlockExecutor<Transaction = OpTxEnvelope>,
-    E::Receipt: Encodable2718 + TxReceipt,
-    I: Iterator<Item = Recovered<&'a OpTxEnvelope>>,
-    for<'b> Recovered<&'b OpTxEnvelope>: ExecutableTx<E>,
-{
-    executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
-
-    for recovered_tx in transactions {
-        executor.execute_transaction(recovered_tx).map_err(ValidationError::BlockReplayFailed)?;
-    }
-
-    let execution_result =
-        executor.apply_post_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
-
-    // Compute logs bloom by ORing all receipt blooms together
-    let logs_bloom =
-        execution_result.receipts.iter().fold(Bloom::ZERO, |acc, receipt| acc | receipt.bloom());
-
-    // `BlockExecutionResult::gas_used` is defined by mega-evm's `finish()` as
-    // `receipts.last().cumulative_gas_used()` — the exact expression the header check
-    // read before switching to this field, so the two cannot disagree regardless of how
-    // system transactions are accounted. The assertion pins that upstream definition: a
-    // future mega-evm that accounts gas outside the receipt chain fails loudly in every
-    // debug/test run instead of silently changing the header check.
-    let gas_used = execution_result.gas_used;
-    debug_assert_eq!(
-        gas_used,
-        execution_result.receipts.last().map(|r| r.cumulative_gas_used()).unwrap_or(0),
-        "mega-evm gas_used no longer equals the last receipt's cumulative gas"
-    );
-
-    let receipts_root = calculate_receipt_root(&execution_result.receipts);
-
-    Ok((receipts_root, logs_bloom, gas_used))
 }
 
 /// Extracts the withdrawal-contract storage updates (only changed slots) from the replayed
@@ -696,7 +662,7 @@ fn verify_replay_outputs(
 /// measured"). On error the elapsed time is discarded with the stage's result.
 fn timed<T, E>(f: impl FnOnce() -> Result<T, E>) -> Result<(T, f64), E> {
     #[cfg(feature = "std")]
-    let start = Instant::now();
+    let start = std::time::Instant::now();
     let result = f()?;
     #[cfg(feature = "std")]
     let elapsed = start.elapsed().as_secs_f64();
@@ -1097,6 +1063,10 @@ mod tests {
         assert!(matches!(err, ValidationError::BlockIncomplete), "{err:?}");
     }
 
+    /// `validate_block` must succeed on every paired mainnet fixture. This is the full
+    /// consensus surface against real headers — the post-state root, plus the withdrawals
+    /// root, receipts root, logs bloom and `gas_used` that `verify_replay_outputs` checks —
+    /// so a replayed value that stops matching what a mainnet header claims fails here.
     #[test]
     fn validate_block_mainnet_fixtures() {
         let _logging = init_test_logging("stateless_core");
@@ -1115,39 +1085,6 @@ mod tests {
     /// returned updates must reproduce the header's state root when fed through the SALT trie
     /// update, locking its equivalence with the `validate_block` path the helpers were
     /// extracted from.
-    /// The header check reads `BlockExecutionResult::gas_used`; mega-evm defines that field
-    /// as the last receipt's cumulative gas, the expression the check read before. A
-    /// `debug_assert_eq!` at the derivation site pins the two against each other on every
-    /// replay; this pins the surviving value against what a real mainnet header claims, so a
-    /// mega-evm that starts accounting gas outside the receipt chain fails here rather than
-    /// as a consensus divergence in production.
-    #[test]
-    fn replayed_gas_used_matches_the_mainnet_header() {
-        let _logging = init_test_logging("stateless_core");
-        let fx = TestFixtures::mainnet_shared();
-        let paired = fx.paired_blocks();
-        assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
-        for (number, hash) in paired {
-            let block = &fx.blocks[&hash];
-            let salt_witness = fx.salt_witnesses[&hash].clone();
-            let header = block.consensus_header();
-            let ext_env = WitnessExternalEnv::new(&salt_witness, header.number)
-                .expect("witness carries bucket metadata");
-            let witness = Witness::from(salt_witness);
-            witness
-                .verify()
-                .unwrap_or_else(|e| panic!("witness verification failed for {number}: {e:?}"));
-            let witness_db =
-                WitnessDatabase { header, witness: &witness, contracts: &fx.contracts };
-            let (_, output) = replay_block(&chain_spec(), block, &witness_db, ext_env)
-                .unwrap_or_else(|e| panic!("replay failed for {number} ({hash}): {e:?}"));
-            assert_eq!(
-                output.gas_used, block.header.gas_used,
-                "replayed gas_used disagrees with the header for {number} ({hash})"
-            );
-        }
-    }
-
     #[test]
     fn validate_block_deriving_updates_mainnet_fixtures() {
         let _logging = init_test_logging("stateless_core");

@@ -40,7 +40,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use alloy_primitives::{B256, Bytes, U64};
+use alloy_primitives::{B256, Bytes, U64, keccak256};
 use alloy_provider::{Provider, RootProvider};
 use alloy_rpc_client::ClientBuilder;
 use alloy_rpc_types_eth::{Block, BlockId, BlockNumberOrTag, Header};
@@ -52,44 +52,15 @@ use revm::state::Bytecode;
 use salt::SaltWitness;
 use serde::{Deserialize, Serialize};
 use stateless_core::{LightWitness, withdrawals::MptWitness};
-use stateless_r2::fetch::{BackoffSchedule, RetryPacing};
 use tokio::sync::Semaphore;
 use tracing::{instrument, trace, warn};
 
 use crate::{
+    BackoffPolicy,
     metrics::{RpcAttemptOutcome, RpcMethod, RpcMetrics},
     witness_encoding::{decode_witness_response, decode_witness_response_light},
     witness_size::WitnessSizeBreakdown,
 };
-
-/// Exponential-backoff policy used by [`RpcClient`]'s round-level retry loop.
-///
-/// `initial` is the first sleep duration; each round doubles it up to `max`. The loop
-/// itself lives in [`round_robin_with_backoff`]; this type only describes the sleep
-/// schedule, which it steps through [`Self::schedule`].
-#[derive(Debug, Clone)]
-pub struct BackoffPolicy {
-    /// First retry sleep. Each subsequent retry doubles up to `max`.
-    pub initial: Duration,
-    /// Upper bound on any single retry sleep.
-    pub max: Duration,
-}
-
-impl BackoffPolicy {
-    /// Creates a new policy with the given `initial` and `max` sleep durations.
-    pub const fn new(initial: Duration, max: Duration) -> Self {
-        Self { initial, max }
-    }
-
-    /// Starts executing the schedule from `initial`.
-    ///
-    /// The schedule itself lives in `stateless-r2` next to [`RetryPacing`], the pacing pair
-    /// its GET loop steps: that crate must stay free of upward dependencies, so it is the
-    /// only home both retry loops can reach.
-    pub fn schedule(&self) -> BackoffSchedule {
-        RetryPacing { initial: self.initial, max: self.max }.schedule()
-    }
-}
 
 /// Error returned by the `_with_deadline` RPC methods when a caller-supplied
 /// deadline elapses before any provider succeeds.
@@ -430,6 +401,11 @@ impl RpcClient {
         self.witness_providers.len()
     }
 
+    /// Returns whether a validation report endpoint is configured.
+    pub fn reports_validation(&self) -> bool {
+        self.report_provider.is_some()
+    }
+
     /// Returns the credential-stripped `{idx}:{host}` metric/log label of the witness
     /// endpoint at `idx`, or `None` when out of range. Use this instead of the raw
     /// configured URL wherever an endpoint identity is logged.
@@ -490,6 +466,27 @@ impl RpcClient {
         best_effort: bool,
         f: impl Fn(RootProvider<Optimism>) -> BoxFuture<Result<T>>,
     ) -> std::result::Result<T, RpcDeadlineExceeded> {
+        self.call_with_finish(method, deadline, best_effort, f, |v| Box::pin(async move { Ok(v) }))
+            .await
+    }
+
+    /// [`Self::call_with_deadline_at`] with the retry loop's *finalize* step exposed: `f` runs
+    /// under the per-attempt window, `finish` after it, bounded by the deadline alone. Post-
+    /// transport CPU work belongs in `finish` so it neither burns the rotation reserve nor
+    /// reads as a provider stall, while a failure there still counts as that provider's error
+    /// and rotates.
+    ///
+    /// This is the data path's single funnel into [`round_robin_with_backoff`] — every data
+    /// method's provider rotation, concurrency and attempt-cap policy is assembled here and
+    /// nowhere else. The witness path has its own funnel in [`Self::witness_round_robin`].
+    async fn call_with_finish<W: Send + 'static, T: Send + 'static>(
+        &self,
+        method: RpcMethod,
+        deadline: Option<Instant>,
+        best_effort: bool,
+        f: impl Fn(RootProvider<Optimism>) -> BoxFuture<Result<W>>,
+        finish: impl Fn(W) -> BoxFuture<Result<T>>,
+    ) -> std::result::Result<T, RpcDeadlineExceeded> {
         round_robin_with_backoff(
             &self.data_providers,
             &self.data_provider_labels,
@@ -502,7 +499,7 @@ impl RpcClient {
             deadline,
             best_effort,
             |provider, _provider_label| f(provider.clone()),
-            |v, _provider_label| Box::pin(async move { Ok(v) }),
+            |v, _provider_label| finish(v),
         )
         .await
     }
@@ -572,26 +569,16 @@ impl RpcClient {
         deadline: Option<Instant>,
     ) -> std::result::Result<Block<Transaction>, RpcDeadlineExceeded> {
         let verify = !self.config.skip_block_verification;
-        round_robin_with_backoff(
-            &self.data_providers,
-            &self.data_provider_labels,
-            &self.data_concurrency,
-            &self.config.rpc_retry,
-            AttemptCap::Fixed(self.config.per_attempt_timeout),
-            self.next_data_rr_start(),
+        self.call_with_finish(
             RpcMethod::EthGetBlock,
-            self.config.metrics.as_ref(),
             deadline,
             false,
-            move |provider, _provider_label| {
+            move |provider| {
                 Box::pin(async move { do_get_block_unchecked(&provider, block_id, full_txs).await })
             },
-            move |block, _provider_label| {
+            move |block| {
                 Box::pin(async move {
-                    if !verify {
-                        return Ok(block);
-                    }
-                    verify_block_on_blocking_pool(block).await
+                    if verify { verify_block_on_blocking_pool(block).await } else { Ok(block) }
                 })
             },
         )
@@ -1603,7 +1590,13 @@ async fn decode_witness_wire<T: Send + 'static>(
 /// CPU-bound over a full block), handing the block back untouched on success.
 ///
 /// A failure here is an integrity failure from this provider — the retry loop records it as
-/// that provider's `Error` and rotates, exactly like a transport error.
+/// that provider's `Error` and rotates, exactly like a transport error. A panic inside
+/// [`verify_block_integrity`] is folded into that same path rather than unwinding the caller,
+/// matching [`decode_witness_wire`]: both turn provider-supplied bytes into typed values, so a
+/// panic there says this provider's data is bad and rotating is the useful answer (under a
+/// `None` deadline that retries forever). This is deliberately the opposite of the chain
+/// advancer, where a store panic stays fatal because it means the persistence layer is corrupt
+/// and every later block would build on it.
 async fn verify_block_on_blocking_pool(block: Block<Transaction>) -> Result<Block<Transaction>> {
     tokio::task::spawn_blocking(move || -> Result<Block<Transaction>> {
         verify_block_integrity(&block)?;
@@ -1624,7 +1617,7 @@ async fn verify_block_on_blocking_pool(block: Block<Transaction>) -> Result<Bloc
 /// 4. **Transactions Root**: Computes the Merkle root of all transactions and verifies it matches
 ///    the `transactions_root` in the block header
 fn verify_block_integrity(block: &Block<Transaction>) -> Result<()> {
-    use alloy_consensus::transaction::SignerRecoverable;
+    use alloy_consensus::transaction::{Recovered, SignerRecoverable};
     use alloy_rpc_types_eth::BlockTransactions;
     use alloy_trie::root::ordered_trie_root_with_encoder;
     use op_alloy_network::{TransactionResponse, eip2718::Encodable2718};
@@ -1639,14 +1632,17 @@ fn verify_block_integrity(block: &Block<Transaction>) -> Result<()> {
 
     // Verify transaction hashes and transactions root
     if let BlockTransactions::Full(ref transactions) = block.transactions {
-        // Encode each envelope exactly once: keccak of the encoding is the tx hash, and the
-        // same bytes feed the ordered trie for the transactions-root check.
-        let mut encoded_txs: Vec<Vec<u8>> = Vec::with_capacity(transactions.len());
+        // The RPC `hash` field seeds the envelope's cached hash, so it is only trusted once keccak
+        // of the envelope's own encoding reproduces it; the same bytes then feed the ordered trie
+        // for the transactions-root check.
+        let mut encoded_txs = Vec::with_capacity(transactions.len());
         for tx in transactions {
-            let tx_envelope = tx.inner.inner.inner();
-            let mut encoded = Vec::with_capacity(tx_envelope.encode_2718_len());
-            tx_envelope.encode_2718(&mut encoded);
-            let computed_hash = alloy_primitives::keccak256(&encoded);
+            // The op and eth RPC wrappers both expose `inner`; under them sits the consensus
+            // envelope paired with the signer the provider claims.
+            let recovered_tx: &Recovered<_> = &tx.inner.inner;
+            let tx_envelope = recovered_tx.inner();
+            let encoded = tx_envelope.encoded_2718();
+            let computed_hash = keccak256(&encoded);
             ensure!(
                 computed_hash == *tx_envelope.hash(),
                 "Transaction hash mismatch: expected {:?}, computed {:?}",
@@ -1654,15 +1650,15 @@ fn verify_block_integrity(block: &Block<Transaction>) -> Result<()> {
                 computed_hash
             );
 
-            let recovered = tx_envelope
+            let recovered_signer = tx_envelope
                 .recover_signer()
                 .map_err(|err| eyre!("Failed to recover signer: {}", err))?;
 
             ensure!(
-                recovered == tx.from(),
+                recovered_signer == tx.from(),
                 "Transaction signer mismatch: expected {:?}, got {:?}",
                 tx.from(),
-                recovered
+                recovered_signer
             );
             encoded_txs.push(encoded);
         }
@@ -1700,7 +1696,10 @@ mod tests {
         find_divergence_point,
         pipeline::{BlockFetcher, DivergenceLookups},
     };
-    use stateless_test_utils::mock_rpc::{consistent_header, header_stub, parse_hex_u64, serve};
+    use stateless_test_utils::{
+        fixtures::TestFixtures,
+        mock_rpc::{consistent_header, header_stub, parse_hex_u64, serve},
+    };
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -2022,12 +2021,24 @@ mod tests {
     /// A block with no transactions, so [`verify_block_integrity`] reduces to its header-hash
     /// check and the fixture needs no signed transactions.
     fn block_stub(header: alloy_rpc_types_eth::Header) -> Block<Transaction> {
-        Block {
-            header,
-            uncles: Vec::new(),
-            transactions: alloy_rpc_types_eth::BlockTransactions::Hashes(Vec::new()),
-            withdrawals: None,
-        }
+        Block { header, ..Default::default() }
+    }
+
+    /// A counting `eth_getBlockByNumber` endpoint that serves `header` on every call, in
+    /// [`start_counting_block_number_rpc`]'s `(handle, url, hits)` shape.
+    async fn start_counting_block_rpc(
+        header: alloy_rpc_types_eth::Header,
+    ) -> (ServerHandle, String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (handle, url) = serve((header, hits.clone()), |m| {
+            m.register_method("eth_getBlockByNumber", |_params, (header, hits), _| {
+                hits.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, ErrorObjectOwned>(block_stub(header.clone()))
+            })
+            .unwrap();
+        })
+        .await;
+        (handle, url, hits)
     }
 
     /// Block verification is the retry loop's finalize step rather than part of the attempt
@@ -2036,25 +2047,11 @@ mod tests {
     /// call rotates to the next provider instead of surfacing the bad block.
     #[tokio::test]
     async fn block_verification_failure_rotates_to_the_next_provider() {
-        let bad_hits = Arc::new(AtomicUsize::new(0));
-        let (bad_handle, bad_url) = serve(Arc::clone(&bad_hits), |m| {
-            m.register_method("eth_getBlockByNumber", |_params, hits, _| {
-                hits.fetch_add(1, Ordering::Relaxed);
-                // A hash the header does not actually hash to — the first integrity check.
-                Ok::<_, ErrorObjectOwned>(block_stub(header_stub(7, BlockHash::from([9u8; 32]))))
-            })
-            .unwrap();
-        })
-        .await;
-        let good_hits = Arc::new(AtomicUsize::new(0));
-        let (good_handle, good_url) = serve(Arc::clone(&good_hits), |m| {
-            m.register_method("eth_getBlockByNumber", |_params, hits, _| {
-                hits.fetch_add(1, Ordering::Relaxed);
-                Ok::<_, ErrorObjectOwned>(block_stub(consistent_header(7)))
-            })
-            .unwrap();
-        })
-        .await;
+        // A hash the header does not actually hash to — the first integrity check.
+        let (bad_handle, bad_url, bad_hits) =
+            start_counting_block_rpc(header_stub(7, BlockHash::from([9u8; 32]))).await;
+        let (good_handle, good_url, good_hits) =
+            start_counting_block_rpc(consistent_header(7)).await;
 
         let config = RpcClientConfig {
             rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
@@ -3112,5 +3109,38 @@ mod tests {
             }
         }
         assert!(found, "witness failure log must carry the block_number span field, got:\n{logs}");
+    }
+
+    /// The deserializer seeds each envelope's cached hash from the RPC `hash` field, so
+    /// `trie_hash()` reproduces the claim by construction; only keccak over the envelope's own
+    /// encoding can tell a hash that does not belong to the bytes. Forging one hash leaves the
+    /// transactions root intact, so the hash check is the only thing that rejects the block.
+    /// Index 0 is asserted to be the deposit (`Sealed`) and the last index a signed envelope, so
+    /// a fixture change cannot silently drop either `trie_hash` override from coverage.
+    #[test]
+    fn verify_block_integrity_rejects_a_forged_transaction_hash() {
+        use alloy_rpc_types_eth::BlockTransactions;
+
+        let fx = TestFixtures::mainnet_shared();
+        let block = fx
+            .paired_blocks()
+            .iter()
+            .map(|(_, hash)| &fx.blocks[hash])
+            .find(|block| !block.transactions.is_empty())
+            .expect("a paired mainnet fixture with transactions");
+        verify_block_integrity(block).expect("untampered fixture block verifies");
+
+        let BlockTransactions::Full(txs) = &block.transactions else {
+            panic!("fixture blocks carry full transactions");
+        };
+        let last = txs.len() - 1;
+        for (index, is_deposit) in [(0, true), (last, false)] {
+            assert_eq!(txs[index].inner.inner.inner().is_deposit(), is_deposit, "tx {index}");
+            let mut json = serde_json::to_value(block).unwrap();
+            json["transactions"][index]["hash"] = serde_json::to_value(B256::ZERO).unwrap();
+            let forged: Block<Transaction> = serde_json::from_value(json).unwrap();
+            let err = verify_block_integrity(&forged).unwrap_err();
+            assert!(err.to_string().contains("Transaction hash mismatch"), "tx {index}: {err:?}");
+        }
     }
 }

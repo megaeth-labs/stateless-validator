@@ -43,9 +43,9 @@ pub async fn run_with_signals(
     validator_db: Arc<ValidatorDB>,
     contract_cache: Arc<ContractCache>,
     chain_spec: Arc<ChainSpec>,
-    report_validation: bool,
     pipeline_config: PipelineConfig,
 ) -> Result<()> {
+    let report_validation = client.reports_validation();
     let config = Arc::new(pipeline_config);
     let is_slice_run = config.sync_target.is_some();
     info!(
@@ -60,7 +60,7 @@ pub async fn run_with_signals(
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
         .map_err(|e| eyre::eyre!("Failed to register SIGTERM handler: {e}"))?;
 
-    let fetcher = Arc::new(ValidatorFetcher { rpc_client: client.clone(), r2_witness });
+    let fetcher = Arc::new(ValidatorFetcher::new(client.clone(), r2_witness));
     let processor =
         Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client.clone() });
     let hooks = Arc::new(ValidatorHooks);

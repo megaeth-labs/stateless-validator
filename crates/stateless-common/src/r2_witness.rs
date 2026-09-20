@@ -1,28 +1,79 @@
 //! Shared core of the two binaries' direct-from-R2 witness adapters.
 //!
-//! Each binary reads witness objects straight from the R2 bucket through
-//! [`R2ObjectFetcher`], but decodes and paces them differently: the trace server
-//! light-decodes under a request deadline with no failure pauses, the validator
-//! full-decodes with surfaced-failure pacing for its pipeline fetcher. What lives here is
-//! the part that is identical by construction — the failure taxonomy with its metric
-//! labels, and the transport wrapper (construction, target accessors) — so the two
-//! adapters cannot drift apart on it.
+//! Both binaries read witness objects straight from the R2 bucket through
+//! [`R2ObjectFetcher`], try it before their RPC witness chain, and hand any failure to that
+//! chain on a small retry budget with no pause. They differ in how they read an object and how
+//! long it may take: the trace server light-decodes under the caller's request deadline, the
+//! validator full-decodes (proof verification needs the curve points) on a fixed per-block
+//! stage budget that stops at the GET. What lives here is identical by construction — the
+//! failure taxonomy with its metric labels, the band rules, and the transport wrapper.
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use alloy_primitives::B256;
 use stateless_r2::{
-    fetch::{CfAccessCredentials, FetchTimeouts, R2GetError, R2ObjectFetcher, RetryPacing},
+    fetch::{CfAccessCredentials, FetchTimeouts, R2GetError, R2ObjectFetcher},
     keys,
 };
 use tokio::task::JoinError;
 
-use crate::{BackoffPolicy, WitnessDecodingError};
+use crate::{BackoffPolicy, R2Config, WitnessDecodingError};
+
+/// Near-tip band (in blocks) inside which an R2 witness `missing` is the expected
+/// probe-ahead outcome — the uploader may plausibly not have PUT the object yet — rather
+/// than a bucket hole.
+///
+/// MegaETH produces one block per second, so this is also the grace in wall-clock terms: an
+/// object still absent 32 seconds after its block existed means the witness generation
+/// pipeline is behind, not that we asked too early. That is the number to reason about when
+/// retuning it, and it doubles as the alarm's detection latency.
+///
+/// Both readers gate their `kind="missing"` bucket-integrity alarm on it: a miss inside the
+/// band is recorded apart from the alarm, a miss below it means the object must exist and
+/// does not.
+pub const R2_FRONTIER_WINDOW: u64 = 32;
+
+/// Which band a block falls in relative to the chain tip, which is what decides whether an
+/// absent object is expected or a hole.
+///
+/// Both readers serve witnesses out of the same bucket, filled by the same uploader, so this
+/// question has one answer and the answer is about the chain: how long ago did this block
+/// exist, and has the uploader had time to reach it. It is deliberately *not* about how far
+/// either reader has ingested — a reader lagging the chain does not make a week-old object
+/// any less overdue. Both therefore anchor on their best estimate of the real chain head.
+///
+/// What each reader does with a band still differs (the trace server spends a different share
+/// of its request budget per band), but the arithmetic is one rule, here, so the two cannot
+/// drift on where the edge sits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum R2Band {
+    /// Within [`R2_FRONTIER_WINDOW`] of the tip, above it, or with no tip known at all: the
+    /// uploader may plausibly not have PUT the object yet, so a `missing` is the expected
+    /// probe-ahead outcome rather than a bucket hole.
+    Frontier,
+    /// At least the window *below* the tip: the object must exist, so a `missing` is a bucket
+    /// hole and belongs on the integrity alarm.
+    Historical,
+}
+
+/// Classifies `block_number` against `tip`, the reader's best estimate of the chain head.
+/// `0` means it has not learned one yet, which lands everything in
+/// [`R2Band::Frontier`] — nothing is known to be uploaded, so nothing can be called a hole.
+///
+/// The edge is exclusive: a block exactly the window below the tip is already
+/// [`R2Band::Historical`], so the integrity alarm covers it. Blocks *above* the tip are
+/// frontier too — a tip estimate that lags reality must not turn a fresh block into a hole.
+pub fn r2_band(tip: u64, block_number: u64) -> R2Band {
+    match block_number.checked_add(R2_FRONTIER_WINDOW) {
+        Some(horizon) if horizon <= tip => R2Band::Historical,
+        _ => R2Band::Frontier,
+    }
+}
 
 /// Failure outcome of an R2 witness fetch, shared by both binaries' adapters.
 ///
-/// A binary whose fetches pass no deadline never produces [`Self::DecodeTimeout`] (or the
-/// fetch-level `deadline` kind); its pre-registered series for those kinds stay at zero.
+/// A binary whose decode runs without a deadline never produces [`Self::DecodeTimeout`]; its
+/// pre-registered series for that kind stays at zero.
 #[derive(Debug, thiserror::Error)]
 pub enum R2WitnessError {
     /// The GET failed (absent object, transport, throttle, unexpected status, or out of
@@ -75,11 +126,12 @@ impl R2WitnessError {
         matches!(self, Self::Get(R2GetError::Missing { .. }))
     }
 
-    /// Whether an immediate retry against the same endpoint could plausibly succeed
-    /// (transport blips, 429, 5xx). Every other variant is deterministic and is surfaced
-    /// without retrying.
-    pub const fn is_retryable(&self) -> bool {
-        matches!(self, Self::Get(e) if e.is_retryable())
+    /// Whether this is the routine near-tip outcome: an absent object banded
+    /// [`R2Band::Frontier`], so the uploader may not have reached the block yet. Both readers
+    /// keep these off `..._r2_witness_errors_total` so it stays an error rate, and both
+    /// classify through this one conjunction, as they band through [`r2_band`].
+    pub const fn is_frontier_miss(&self, band: R2Band) -> bool {
+        self.is_missing() && matches!(band, R2Band::Frontier)
     }
 }
 
@@ -118,6 +170,25 @@ pub async fn decode_on_blocking_pool<T: Send + 'static>(
     }
 }
 
+/// What the shared transport constructor publishes about the target it built, implemented by
+/// each binary so the constructor never needs to know a metric-name prefix.
+///
+/// Mirrors [`RpcMetrics`](crate::RpcMetrics), which does the same for the RPC client: the
+/// binaries own their metric names, this crate owns when the values are known.
+pub trait R2Metrics: Send + Sync {
+    /// The configured target's label, known at startup.
+    fn on_target(&self, target: &'static str);
+
+    /// How many HTTP/2 connections the custom-domain target spreads its GETs over. Not called
+    /// for the S3 target, where one client already opens a socket per in-flight GET and the
+    /// count is not a property of the transport.
+    fn on_connections(&self, connections: usize);
+
+    /// The protocol the custom domain actually negotiated. Only knowable once a response has
+    /// been seen, so this fires from the fetcher rather than at startup.
+    fn on_negotiated_version(&self, version: &'static str);
+}
+
 /// The shared transport of the two R2 witness adapters: an [`R2ObjectFetcher`] plus the
 /// construction and target accessors both binaries would otherwise duplicate verbatim.
 /// The fetcher's `Debug` redacts the credentials.
@@ -127,12 +198,6 @@ pub struct R2WitnessTransport {
     /// The configured in-flight GET cap, retained here because the fetcher decomposes it
     /// into per-connection permits and cannot report the configured value back.
     max_concurrent_requests: Option<usize>,
-}
-
-/// The fetcher's pacing view of a [`BackoffPolicy`] — the adapter-layer conversion that
-/// keeps `stateless-r2` free of a dependency on this workspace's backoff type.
-fn pacing(backoff: &BackoffPolicy) -> RetryPacing {
-    RetryPacing { initial: backoff.initial, max: backoff.max }
 }
 
 impl R2WitnessTransport {
@@ -158,7 +223,7 @@ impl R2WitnessTransport {
             access_key_id,
             secret_access_key,
             timeouts,
-            pacing(&retry_backoff),
+            retry_backoff,
             max_concurrent_requests,
         )
         .map_err(|e| eyre::eyre!(e))?;
@@ -183,7 +248,7 @@ impl R2WitnessTransport {
             domain,
             access,
             timeouts,
-            pacing(&retry_backoff),
+            retry_backoff,
             max_concurrent_requests,
             connections,
         )
@@ -192,7 +257,54 @@ impl R2WitnessTransport {
         Ok(Self { fetcher, max_concurrent_requests })
     }
 
-    /// The underlying fetcher, for the adapter's own GETs and pacing reads.
+    /// Builds the transport a validated [`R2Config`] selects, or `None` when no target is
+    /// configured, publishing what it built through `metrics`. Every target-dependent value —
+    /// the in-flight cap included — comes from the verdict, never from the caller's flags.
+    pub fn from_config(
+        config: R2Config,
+        timeouts: FetchTimeouts,
+        retry_backoff: BackoffPolicy,
+        metrics: Arc<dyn R2Metrics>,
+    ) -> eyre::Result<Option<Self>> {
+        let transport = match config {
+            R2Config::None => return Ok(None),
+            R2Config::CustomDomain { domain, access, connections, max_concurrent_requests } => {
+                let observer = Arc::clone(&metrics);
+                let transport = Self::new_custom_domain(
+                    &domain,
+                    access,
+                    timeouts,
+                    retry_backoff,
+                    max_concurrent_requests,
+                    connections,
+                    move |version| observer.on_negotiated_version(version),
+                )?;
+                // Read back off the transport rather than echoing the configured count: the
+                // gauge must report the connections that exist.
+                metrics.on_connections(transport.connections());
+                transport
+            }
+            R2Config::S3 {
+                endpoint,
+                bucket,
+                access_key_id,
+                secret_access_key,
+                max_concurrent_requests,
+            } => Self::new(
+                &endpoint,
+                bucket,
+                access_key_id,
+                secret_access_key.as_ref().to_owned(),
+                timeouts,
+                retry_backoff,
+                max_concurrent_requests,
+            )?,
+        };
+        metrics.on_target(transport.target_label());
+        Ok(Some(transport))
+    }
+
+    /// The underlying fetcher, for the adapter's own GETs.
     pub fn fetcher(&self) -> &R2ObjectFetcher {
         &self.fetcher
     }
@@ -236,6 +348,46 @@ mod tests {
 
     fn test_backoff() -> BackoffPolicy {
         BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(20))
+    }
+
+    /// The band edge is one rule for both readers, so neither can drift on it: exclusive at
+    /// the deep end (a block exactly the window below the tip must alarm), and everything at
+    /// or above the tip — including a tip of `0`, meaning none learned yet — is frontier,
+    /// because nothing there is known to be uploaded.
+    #[test]
+    fn the_band_edge_is_one_rule_for_both_readers() {
+        use R2Band::*;
+        const TIP: u64 = 5000;
+
+        assert_eq!(r2_band(0, 100), Frontier, "no tip learned: nothing known to be uploaded");
+        assert_eq!(r2_band(TIP, TIP), Frontier, "the tip itself");
+        assert_eq!(r2_band(TIP, TIP - R2_FRONTIER_WINDOW + 1), Frontier, "just inside");
+        assert_eq!(r2_band(TIP, TIP - R2_FRONTIER_WINDOW), Historical, "just past the band");
+        assert_eq!(
+            r2_band(TIP, TIP + R2_FRONTIER_WINDOW + 1),
+            Frontier,
+            "a tip estimate that lags reality must not make a fresh block a hole",
+        );
+        assert_eq!(r2_band(TIP, 4000), Historical, "a hole this deep must alarm");
+        // A horizon that would overflow counts as frontier rather than wrapping into one.
+        assert_eq!(r2_band(u64::MAX, u64::MAX), Frontier);
+    }
+
+    /// The other half of the split, and the half both binaries used to spell for themselves:
+    /// only an absent object leaves the error counter, and only inside the band.
+    #[test]
+    fn only_a_missing_inside_the_band_is_a_frontier_miss() {
+        let missing = R2WitnessError::Get(R2GetError::Missing { number: 1, key: "k".into() });
+        assert!(missing.is_frontier_miss(R2Band::Frontier));
+        assert!(!missing.is_frontier_miss(R2Band::Historical), "a hole this deep must alarm");
+
+        let throttled = R2WitnessError::Get(R2GetError::Throttled {
+            number: 1,
+            key: "k".into(),
+            status: 503,
+            body: String::new(),
+        });
+        assert!(!throttled.is_frontier_miss(R2Band::Frontier), "only an absent object can split");
     }
 
     /// Every fetch-level kind must appear in the pre-registered [`R2WitnessError::KINDS`]

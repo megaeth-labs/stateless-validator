@@ -68,15 +68,23 @@ cargo run --release --bin stateless-validator -- \
 - `--witness-endpoint`: MegaETH JSON-RPC API endpoint URL(s) to retrieve witness data.
   Multiple endpoints can be provided via repeated flags or as a comma-separated list (tried in order on failure).
   The env var `STATELESS_VALIDATOR_WITNESS_ENDPOINT` accepts the same comma-separated form (e.g. `http://a:8545,http://b:8545`).
-  Required with `--witness-source rpc` (the default); ignored with `--witness-source r2`.
+  Always required: without the `--r2-*` flags it is the only witness path, and with them it is the fallback every R2 failure lands on.
 
 **Optional Arguments:**
 - `--genesis-file`: Path to genesis JSON file containing hardfork activation configuration (required on first run, stored in database for subsequent runs)
 - `--start-block`: Trusted block hash to initialize validation from (required for first-time setup)
 - `--end-block`: Inclusive end block; validate up to this height, then stop cleanly (useful to slice a fixed range across multiple servers)
-- `--witness-source`: Where to fetch witnesses from: `rpc` (default) or `r2` (straight from the R2 bucket, over either the signed S3 API or a Cloudflare custom domain)
-- `--r2-endpoint`, `--r2-bucket`, `--r2-access-key-id`, `--r2-secret-access-key`: R2 connection settings for the S3-endpoint target of `--witness-source r2`, all four required together (prefer the env var for the secret)
-- `--r2-custom-domain`: alternative R2 target for `--witness-source r2` that replaces the four flags above — unsigned HTTP/2 GETs through a Cloudflare custom domain fronting the bucket (mutually exclusive with `--r2-endpoint`, and any of the four left set is rejected at startup by name rather than silently ignored; optional `--r2-access-client-id`/`--r2-access-client-secret` attach Cloudflare Access service-token headers, which require an `https://` domain unless it is loopback; the domain's cache rule must set 404s to bypass cache, since R2 mode has no RPC fallback and a cached pre-upload 404 would stall tip-following)
+- `--r2-endpoint`, `--r2-bucket`, `--r2-access-key-id`, `--r2-secret-access-key`: R2 connection settings for the signed S3 target, all four required together (prefer the env var for the secret).
+  Configuring a target is the whole switch: there is no mode flag, and with one configured every witness fetch tries the bucket before the `--witness-endpoint` chain.
+  Bulk history then streams from R2 at object-storage parallelism while any R2 failure — a frontier miss the uploader has not reached, a throttle, a corrupt object — hands that one block to RPC instead of stalling it, so the gateway only ever sees the blocks R2 could not serve.
+  That fallback is a second *path* to the same bytes rather than a second copy of them (the witness gateway reads this same bucket), so what it covers is the client path failing, not the bucket.
+  Every R2 failure is recorded and is exactly one fallback. A `missing` within 32 blocks — MegaETH runs one block per second, so also 32 seconds — of the last polled head is the uploader still catching up and is counted on its own `stateless_validator_r2_witness_frontier_misses_total`, so `stateless_validator_r2_witness_errors_total{kind}` stays an error rate and its `kind="missing"` means a hole in objects that must exist.
+  Which of the two a run produces follows from how far behind it is: a tip-following validator fetches inside that window, so all of its misses are frontier misses — routine and numerous — and `kind="missing"` stays at zero; watch the frontier rate there instead.
+  `kind="missing"` is the bucket-integrity signal during catch-up and fixed `--end-block` backfills, where blocks sit far below the head. A hole that first appears near the tip is not caught here, since the block is fetched once, falls back and is never re-probed; that belongs to whatever monitors the uploader.
+  With no `--r2-*` flag set at all, witnesses come from the RPC chain alone; a half-configured target, a blank value, or a tuning flag with no target is rejected at startup by name rather than read as "no R2 configured".
+  "Blank value" covers the flags that travel as text; the two numeric tuning flags are parsed by clap, so a blank one aborts earlier with clap's unnamed error (see AGENTS.md for the full rule).
+  The R2 attempt for one block is bounded in total by a single `--rpc-per-attempt-timeout-ms`, permit wait included, so an endpoint that accepts connections and then stalls costs the block one upstream hop's wall clock rather than one per retry before the RPC chain takes over.
+- `--r2-custom-domain`: alternative R2 target that replaces the four flags above — unsigned HTTP/2 GETs through a Cloudflare custom domain fronting the bucket (mutually exclusive with `--r2-endpoint`, and any of the four left set is rejected at startup by name rather than silently ignored; optional `--r2-access-client-id`/`--r2-access-client-secret` attach Cloudflare Access service-token headers, which require an `https://` domain unless it is loopback; the domain's cache rule must set 404s to bypass cache, or a cached pre-upload 404 pushes those blocks onto the RPC path for the negative-cache TTL and false-fires the `kind="missing"` alarm once they age past the frontier band)
 - `--report-validation-endpoint`: RPC endpoint URL for reporting validated blocks via `mega_setValidatedBlocks` (disabled if not provided)
 - `--metrics-enabled`: Enable Prometheus metrics endpoint (disabled by default)
 - `--metrics-port`: Port for Prometheus metrics HTTP endpoint (default: 9090)
@@ -195,9 +203,10 @@ Without `--witness-generator-endpoint`, historical routing is disabled and the e
 **Direct-from-R2 witnesses:**
 With `--r2-endpoint`, `--r2-bucket`, `--r2-access-key-id`, and `--r2-secret-access-key` (all four together), every request-serving witness fetch tries a SigV4-signed GET against the bucket before the RPC witness chain.
 Object storage tolerates far higher parallelism than a shared RPC gateway and the bucket holds full history, so bulk backfill traffic stops competing with everything else on the public endpoint; any R2 failure (missing object, throttle, transport, corrupt payload — counted in `debug_trace_r2_witness_errors_total{kind}`) falls back to the RPC chain on the remaining witness budget, and the R2 attempt is capped at half that budget so a hung endpoint can never starve the fallback.
-Frontier probes usually miss — the uploader typically lags the generator — and cost one fast 404; the frontier band is a small near-tip window (32 blocks of uploader-lag grace on either side of the local tip — far narrower than the 4096-block routing window, and a stale, catching-up tip cannot silence holes above it), hits there are labeled `witness_r2_frontier` (vs `witness_r2` past the band) so their hit rate stays separable, and the speculative probe runs on an eighth of the remaining stage (vs half for blocks R2 must hold), so degraded R2 cannot burn half of every near-tip request's budget before the RPC chain runs.
-A `missing` classifies by band: in-band is expected probe-ahead (excluded from `debug_trace_r2_witness_errors_total{kind="missing"}`), below-band feeds that bucket-integrity alarm (the object must exist there), and above-band — only reachable behind a stale catching-up tip — lands on its own `kind="missing_above_tip"` series so catch-up windows stay visible without flooding the alarm.
-The bucket is the same store the public gateway serves witnesses from, so at the frontier it can lead the generator (whose RPC server publishes from a different file than the uploader reads); the route needs a local DB (`--data-dir`) to anchor block age.
+Frontier probes usually miss — the uploader typically lags the generator — and cost one fast 404; the frontier band is a small near-tip window (32 blocks of uploader-lag grace around this process's best estimate of the chain head — far narrower than the 4096-block routing window, which asks a different question), hits there are labeled `witness_r2_frontier` (vs `witness_r2` past the band) so their hit rate stays separable, and the speculative probe runs on an eighth of the remaining stage (vs half for blocks R2 must hold), so degraded R2 cannot burn half of every near-tip request's budget before the RPC chain runs.
+A `missing` classifies by band: in-band is expected probe-ahead (excluded from `debug_trace_r2_witness_errors_total{kind="missing"}`), and below-band feeds that bucket-integrity alarm, since the object must exist there.
+The band takes the higher of the tip observed from request traffic and the local DB tip — neither is the chain tip alone, since the first is raised only by by-number and tag lookups and the second only by what sync has ingested.
+The bucket is the same store the public gateway serves witnesses from, so at the frontier it can lead the generator (whose RPC server publishes from a different file than the uploader reads); the route requires a local DB (`--data-dir`), whose tip its witness stage reads for the old-block budget and generator routing.
 `--r2-custom-domain` selects the alternative R2 target (mutually exclusive with `--r2-endpoint`, rejected at startup with an error naming both): unsigned GETs of `/{key}` through a Cloudflare custom domain fronting the bucket, which negotiates HTTP/2 — many in-flight GETs multiplex over a few connections instead of holding one connection each against the HTTP/1.1-only S3 endpoint — and can serve the immutable witness objects from edge cache; optional `--r2-access-client-id`/`--r2-access-client-secret` attach Cloudflare Access service-token headers.
 Client-side routing, budgets, and fallback match the S3 target; edge behavior is zone configuration, and **any cache rule making these objects cacheable must set 404s to bypass cache** — an edge-cached 404 would otherwise pin a pre-upload frontier miss for the negative-cache TTL and can false-fire the below-band `kind="missing"` bucket-integrity alarm.
 The client sends a `User-Agent`, because Cloudflare's Browser Integrity Check — on by default on many zones — challenges requests without one, and that arrives here as a non-retryable 403 on every GET.
@@ -237,7 +246,6 @@ Each command-line flag has an equivalent environment variable:
 - `STATELESS_VALIDATOR_GENESIS_FILE` → `--genesis-file`
 - `STATELESS_VALIDATOR_START_BLOCK` → `--start-block`
 - `STATELESS_VALIDATOR_END_BLOCK` → `--end-block`
-- `STATELESS_VALIDATOR_WITNESS_SOURCE` → `--witness-source`
 - `STATELESS_VALIDATOR_R2_ENDPOINT` / `_R2_BUCKET` / `_R2_ACCESS_KEY_ID` / `_R2_SECRET_ACCESS_KEY` → `--r2-*` (the signed S3 target)
 - `STATELESS_VALIDATOR_R2_CUSTOM_DOMAIN` / `_R2_ACCESS_CLIENT_ID` / `_R2_ACCESS_CLIENT_SECRET` → `--r2-custom-domain` and its Cloudflare Access pair
 - `STATELESS_VALIDATOR_REPORT_VALIDATION_ENDPOINT` → `--report-validation-endpoint`
@@ -403,6 +411,13 @@ Metrics are available at `http://0.0.0.0:<port>/metrics`.
 | `stateless_validator_rpc_requests_total`                | Counter   | Total RPC requests (with `method` label)            |
 | `stateless_validator_rpc_errors_total`                  | Counter   | RPC errors (with `method` label)                    |
 | `stateless_validator_rpc_retry_attempts_total`          | Counter   | RPC transient retries (with `method` label)         |
+| `stateless_validator_witness_fetch_r2_time_seconds`     | Histogram | R2 witness fetch + decode time                      |
+| `stateless_validator_r2_witness_retry_attempts_total`   | Counter   | R2 witness GET retries (before the final outcome)   |
+| `stateless_validator_r2_witness_errors_total`           | Counter   | Failed R2 witness fetches, each one block that fell back to RPC (with `kind` label; `missing` is a hole below the frontier window) |
+| `stateless_validator_r2_witness_frontier_misses_total`  | Counter   | Near-tip misses where the uploader has not reached the block yet; routine on a tip-following run, kept off the error counter, and its rate is the signal there |
+| `stateless_validator_r2_target_info`                    | Gauge     | Configured R2 target, constant 1 (with `target` label) |
+| `stateless_validator_r2_negotiated_http_version_info`   | Gauge     | Protocol the custom domain negotiated, constant 1 (with `version` label) |
+| `stateless_validator_r2_connections`                    | Gauge     | HTTP/2 connections the custom-domain target spreads GETs over |
 | `stateless_validator_contract_cache_hits_total`         | Counter   | Contract cache hits                                 |
 | `stateless_validator_contract_cache_misses_total`       | Counter   | Contract cache misses                               |
 

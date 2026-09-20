@@ -186,16 +186,22 @@ where
             // stall other tasks (the trace server shares this runtime with its RPC handlers).
             let advance_store = store.clone();
             let advance_hooks = hooks.clone();
-            let owned_batch = std::mem::take(&mut batch);
-            let advanced = tokio::task::spawn_blocking(move || {
+            let mut owned_batch = std::mem::take(&mut batch);
+            let advanced = owned_batch.len();
+            let drained = tokio::task::spawn_blocking(move || {
                 let metas: Vec<BlockMeta> =
                     owned_batch.iter().map(|item| item.to_block_meta()).collect();
                 advance_hooks.pre_advance(&owned_batch)?;
                 advance_store.advance_chain(&metas)?;
+                // Free the processed blocks here rather than handing them back: in the trace
+                // server each one owns a full block plus its witness, and dropping them on the
+                // async task would put the work this hop exists to avoid back on the runtime.
+                // Clearing keeps the allocation, so the buffer is still reused.
+                owned_batch.clear();
                 Ok::<_, eyre::Report>(owned_batch)
             })
             .await;
-            batch = match advanced {
+            batch = match drained {
                 Ok(buf) => buf?,
                 // A panic in the store/hooks must propagate unchanged, exactly as it did
                 // when these calls ran inline on this task.
@@ -207,7 +213,7 @@ where
             persisted_tip = current_tip.block_number;
             debug!(
                 tip = current_tip.block_number,
-                advanced = batch.len(),
+                advanced,
                 buffered = buffer.len(),
                 "Chain advanced"
             );
