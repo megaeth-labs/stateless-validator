@@ -8,11 +8,12 @@
 //! [`stateless_common::r2_witness`], shared with the validator's adapter; the transport
 //! core below that is `stateless-r2`'s [`R2ObjectFetcher`].
 //!
-//! This adapter is request-serving, which shapes it differently from the validator's:
-//! every fetch runs under the caller's witness-stage deadline, failures surface immediately
-//! with **no pacing pause** (the caller's next move is the RPC fallback chain, not a blind
-//! re-enqueue), and the retry budget is small — a throttled R2 should hand over to the RPC
-//! chain quickly instead of burning the witness budget on backoff sleeps.
+//! This adapter is request-serving, so its deadline is the caller's: every fetch runs under
+//! the request's witness-stage deadline, the decode included, where the validator's pipeline
+//! adapter uses a fixed per-block stage budget that stops at the GET. Like the validator's,
+//! failures surface immediately with no pause and on a small retry budget, since the caller's
+//! next move is the RPC fallback chain — a throttled R2 should hand over quickly instead of
+//! burning the witness budget on backoff sleeps.
 //!
 //! [`R2ObjectFetcher`]: stateless_r2::fetch::R2ObjectFetcher
 
@@ -29,13 +30,6 @@ use crate::metrics;
 /// Total GET attempts per fetch: small because the RPC chain waits as fallback, and the
 /// caller's deadline clamps the loop harder anyway.
 const MAX_ATTEMPTS: usize = 3;
-
-/// Synthetic `kind` label for a `missing` above the frontier band — a catch-up-gap probe
-/// whose bucket state is unknowable from the stale local tip. Kept off
-/// [`R2WitnessError::KINDS`] (no error variant produces it); the band classifier in
-/// `data_provider` records it so catch-up bursts stay visible without flooding the
-/// below-band `kind="missing"` bucket-integrity alarm.
-pub(crate) const KIND_MISSING_ABOVE_TIP: &str = "missing_above_tip";
 
 /// Fetches and light-decodes witnesses straight from an R2 bucket.
 /// The transport's `Debug` redacts the credentials.
@@ -156,7 +150,7 @@ mod tests {
             ),
             None,
             1,
-            metrics::record_r2_negotiated_version,
+            |_| {},
         )
         .unwrap();
         R2WitnessSource::new(transport)

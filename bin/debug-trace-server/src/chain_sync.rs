@@ -235,7 +235,7 @@ impl PipelineHooks for TraceHooks {
     type Output = TraceProcessedBlock;
 
     fn pre_advance(&self, items: &[TraceProcessedBlock]) -> eyre::Result<()> {
-        let pairs: Vec<_> = items.iter().map(|i| (i.block.clone(), i.witness.clone())).collect();
+        let pairs: Vec<_> = items.iter().map(|i| (&i.block, &i.witness)).collect();
         Ok(self.db.store_block_data(&pairs)?)
     }
 

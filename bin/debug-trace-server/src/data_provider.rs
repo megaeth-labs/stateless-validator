@@ -46,7 +46,8 @@ use op_alloy_rpc_types::Transaction;
 use quick_cache::sync::Cache;
 use revm::state::Bytecode;
 use stateless_common::{
-    CodeFetchError, RpcClient, RpcDeadlineExceeded, WitnessFetchError, WitnessSizeBreakdown,
+    CodeFetchError, R2Band, RpcClient, RpcDeadlineExceeded, WitnessFetchError,
+    WitnessSizeBreakdown, r2_band,
 };
 use stateless_core::{
     ContractStore, LightWitness, StoreResult, db::StoreError, withdrawals::MptWitness,
@@ -158,16 +159,6 @@ const R2_FRONTIER_BUDGET_DIVISOR: u32 = 8;
 /// at least this far below the tip are guaranteed misses on the internal generator endpoint,
 /// so probing it first only burns a failover round trip.
 pub const DEFAULT_WITNESS_LOCAL_WINDOW: u64 = 4096;
-
-/// Near-tip band (in blocks) inside which an R2 witness `missing` is the expected
-/// probe-ahead outcome — the uploader may plausibly not have PUT the object yet — rather
-/// than a bucket hole. Sized to comfortably cover the uploader's PUT latency plus the local
-/// DB tip's own sync lag (a few seconds each; chain sync's `GENERATOR_WITNESS_GRACE` is the
-/// time-based analog), and kept far below [`DEFAULT_WITNESS_LOCAL_WINDOW`]: routing asks
-/// "may the generator have pruned this?", this asks "may the uploader not have reached it
-/// yet?", and gating the `kind="missing"` alarm on the routing window would silence
-/// bucket-integrity alerting across its whole 4096-block span.
-const R2_FRONTIER_WINDOW: u64 = 32;
 
 /// Default deadline for the full block-fetch pipeline (header + witness + block + contracts)
 /// in seconds (13 seconds).
@@ -984,6 +975,12 @@ impl DataProvider {
                 let contract_cache = Arc::clone(&self.contract_cache);
                 let witness_cfg = self.witness_cfg;
                 let r2_witness = self.r2_witness.clone();
+                // The band anchors on the chain, not on how far this process has ingested:
+                // a reader lagging the chain does not make an overdue object any less
+                // overdue. This is half the estimate — the fetch raises it by the DB tip,
+                // which it reads anyway — and `0` here lands everything in the frontier,
+                // the safe side, until something is learned.
+                let chain_tip = self.tip_hint.load(Ordering::Relaxed);
                 let block_data_cache = self.block_data_cache.clone();
                 let fut: BlockDataFetchFuture = Box::pin(async move {
                     let data = do_fetch_block_data(
@@ -992,6 +989,7 @@ impl DataProvider {
                         contract_cache,
                         witness_cfg,
                         r2_witness,
+                        chain_tip,
                         block_hash,
                         known_number,
                         deadline,
@@ -1089,6 +1087,7 @@ async fn do_fetch_block_data(
     contract_cache: Arc<ContractCache>,
     witness_cfg: WitnessFetchConfig,
     r2_witness: Option<Arc<R2WitnessSource>>,
+    chain_tip: u64,
     block_hash: B256,
     known_number: Option<u64>,
     deadline: Instant,
@@ -1123,6 +1122,7 @@ async fn do_fetch_block_data(
             &witness_cfg,
             r2_witness.as_deref(),
             db_tip,
+            chain_tip,
             block_number,
             block_hash,
             witness_deadline,
@@ -1262,40 +1262,6 @@ fn is_historical(db_tip: Option<u64>, block_number: u64, local_window: u64) -> b
     }
 }
 
-/// Which band a block falls in for the R2 probe, deciding its metrics label, its budget
-/// share, and how a `missing` is classified.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum R2Band {
-    /// Within [`R2_FRONTIER_WINDOW`] of the local tip on either side (or no tip yet — the
-    /// cold-start transient `validate_args`' `--data-dir` requirement bounds): the
-    /// uploader may plausibly not have PUT the object yet, so a `missing` is the expected
-    /// probe-ahead outcome and the speculative probe gets only the
-    /// [`R2_FRONTIER_BUDGET_DIVISOR`] budget share.
-    Frontier,
-    /// More than the band *above* the local tip — only reachable when chain sync is
-    /// behind, since a healthy tip tracks the real head and blocks past it do not resolve.
-    /// The bucket's state is unknowable from a stale tip, so a `missing` records on its
-    /// own [`crate::r2_witness::KIND_MISSING_ABOVE_TIP`] series: visible (a real hole in
-    /// the catch-up gap still surfaces there) without flooding the below-band
-    /// bucket-integrity alarm with routine uploader lag on every catch-up. Like the
-    /// frontier, the probe is speculative — the object is not guaranteed to exist yet —
-    /// and gets only the [`R2_FRONTIER_BUDGET_DIVISOR`] budget share.
-    AboveTip,
-    /// At least the band *below* the tip: the object must exist, so a `missing` is a
-    /// bucket hole and feeds the `kind="missing"` bucket-integrity alarm.
-    Historical,
-}
-
-/// Classifies `block_number` against the local tip; see [`R2Band`] for the semantics.
-fn r2_band(db_tip: Option<u64>, block_number: u64) -> R2Band {
-    match db_tip {
-        None => R2Band::Frontier,
-        Some(tip) if block_number > tip.saturating_add(R2_FRONTIER_WINDOW) => R2Band::AboveTip,
-        Some(_) if is_historical(db_tip, block_number, R2_FRONTIER_WINDOW) => R2Band::Historical,
-        Some(_) => R2Band::Frontier,
-    }
-}
-
 /// Witness route for a block: how many leading witness endpoints to skip, plus the metrics
 /// source label. Historical blocks skip the internal generator at index 0 — but only with a
 /// fallback endpoint to skip to (`can_skip_generator`, so the skip-aware fetch never sees an
@@ -1336,17 +1302,29 @@ fn witness_route(
 /// Uses the zero-validation light decode: the trace server never verifies the witness proof,
 /// so the full decode's per-point elliptic-curve work bought nothing. The recorded size is
 /// the light lower bound (excludes the never-decoded parent commitments).
+// Two tips rather than one, because they answer different questions: `db_tip` routes and
+// clamps the budget, while banding takes the higher of the two (see below). A params struct
+// would add a type to keep in sync without encapsulating anything, as on
+// `do_fetch_block_data` above.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_witness(
     rpc_client: &RpcClient,
     cfg: &WitnessFetchConfig,
     r2_witness: Option<&R2WitnessSource>,
     db_tip: Option<u64>,
+    chain_tip: u64,
     block_number: u64,
     block_hash: B256,
     deadline: Instant,
 ) -> DataProviderResult<(LightWitness, MptWitness)> {
     if let Some(r2) = r2_witness {
-        let band = r2_band(db_tip, block_number);
+        // Neither observation alone is the chain tip, and each leads the other in a different
+        // mode: `chain_tip` (the caller's `tip_hint`) only learns heights that by-number and
+        // tag traffic reveal, so a server asked only for hashes or transactions never raises
+        // it at all, while `db_tip` only learns what sync has ingested and falls behind
+        // through a catch-up. Both are bounded by the real chain, so the higher is the better
+        // estimate and a miss still bands on the safe side.
+        let band = r2_band(chain_tip.max(db_tip.unwrap_or(0)), block_number);
         if let Some(witness) = try_r2_witness(r2, band, block_number, block_hash, deadline).await {
             return Ok(witness);
         }
@@ -1391,11 +1369,10 @@ async fn fetch_witness(
 /// back to the RPC chain.
 ///
 /// `band` ([`r2_band`]) also selects the metrics source label (`witness_r2_frontier`
-/// inside the band vs `witness_r2` outside) and the `missing` classification: in-band, a
+/// inside the band vs `witness_r2` below it) and the `missing` classification: in-band, a
 /// miss is the expected speculative-probe outcome, kept separable so its dominant miss
 /// rate does not read as R2 health degrading; below the band the object must exist and a
-/// miss feeds the `kind="missing"` bucket-integrity alarm; above the band (stale tip) it
-/// lands on its own `missing_above_tip` series.
+/// miss feeds the `kind="missing"` bucket-integrity alarm.
 async fn try_r2_witness(
     r2: &R2WitnessSource,
     band: R2Band,
@@ -1404,11 +1381,8 @@ async fn try_r2_witness(
     deadline: Instant,
 ) -> Option<(LightWitness, MptWitness)> {
     let source = if band == R2Band::Frontier { "witness_r2_frontier" } else { "witness_r2" };
-    // Only the historical band gets the half share: there R2 is the primary source and
-    // the object must exist. Both near-tip bands are speculative — in-band the uploader
-    // may lag, above-band (a stale local tip: a deliberate tip buffer, or a catch-up) the
-    // object is not guaranteed to exist yet — so neither may burn half of a near-head
-    // request's budget on degraded R2.
+    // Only the historical band gets the half share: there R2 is primary and the object must
+    // exist. A frontier probe is speculative, so it may not burn half a near-head budget.
     let divisor = if band == R2Band::Historical {
         R2_WITNESS_BUDGET_DIVISOR
     } else {
@@ -1424,7 +1398,7 @@ async fn try_r2_witness(
         }
         Err(e) => {
             metrics.record_request(false, now.elapsed().as_secs_f64());
-            if band == R2Band::Frontier && e.is_missing() {
+            if e.is_frontier_miss(band) {
                 // The per-source counter above still records the miss (what the frontier
                 // hit rate reads); only the `kind="missing"` alarm skips it.
                 debug!(
@@ -1433,16 +1407,11 @@ async fn try_r2_witness(
                     "Frontier witness not in R2 yet; trying the RPC chain",
                 );
             } else {
-                let kind = if band == R2Band::AboveTip && e.is_missing() {
-                    crate::r2_witness::KIND_MISSING_ABOVE_TIP
-                } else {
-                    e.kind()
-                };
-                crate::metrics::record_r2_witness_error(kind);
+                crate::metrics::record_r2_witness_error(e.kind());
                 warn!(
                     block_number,
                     block_hash = %block_hash,
-                    kind,
+                    kind = e.kind(),
                     error = %e,
                     "R2 witness fetch failed, falling back to the RPC chain",
                 );
@@ -1739,37 +1708,11 @@ mod tests {
         assert!(!is_historical(Some(4095), 0, 4096));
         assert!(!is_historical(Some(u64::MAX), u64::MAX, 4096), "overflowing horizon is recent");
         assert!(is_historical(Some(100), 50, 0), "zero window: everything at/below tip");
-    }
-
-    /// The R2 frontier band is the uploader-lag grace, not the routing window: a block that
-    /// is recent for routing but past the band must count an R2 miss as a bucket hole (the
-    /// `kind="missing"` alarm), not an expected probe-ahead miss.
-    #[test]
-    fn r2_frontier_band_is_narrower_than_routing() {
-        use R2Band::*;
-        assert_eq!(r2_band(None, 100), Frontier, "unknown tip: nothing known to be uploaded");
-        assert_eq!(r2_band(Some(5000), 5000), Frontier, "the tip itself");
-        assert_eq!(r2_band(Some(5000), 5000 - R2_FRONTIER_WINDOW + 1), Frontier, "just inside");
-        assert_eq!(
-            r2_band(Some(5000), 5000 - R2_FRONTIER_WINDOW),
-            Historical,
-            "just past the band"
-        );
-        assert_eq!(r2_band(Some(5000), 5000 + R2_FRONTIER_WINDOW), Frontier, "just above, in band");
-        // A stale, catching-up tip must not flood the bucket-integrity alarm for the gap
-        // above it — nor silence it: the gap gets its own missing_above_tip series.
-        assert_eq!(
-            r2_band(Some(5000), 5000 + R2_FRONTIER_WINDOW + 1),
-            AboveTip,
-            "far above a stale tip is unknown territory, not uploader lag",
-        );
-        // The band a routing-window gate would have silenced: recent for routing, far past
-        // any plausible uploader lag.
-        let recent_not_tip = 4000;
-        assert_eq!(r2_band(Some(5000), recent_not_tip), Historical, "a hole here must alarm");
+        // The deployed window is the wide one, and the R2 frontier band is not: a block 1000
+        // below the tip is a bucket hole for the band while still recent for routing.
         assert!(
-            !is_historical(Some(5000), recent_not_tip, DEFAULT_WITNESS_LOCAL_WINDOW),
-            "yet the same block is recent for witness routing",
+            !is_historical(Some(5000), 4000, DEFAULT_WITNESS_LOCAL_WINDOW),
+            "the routing window is far wider than the R2 band",
         );
     }
 
@@ -2176,18 +2119,22 @@ mod tests {
         let (hb, url_b, hits_b) = scripted_witness_rpc(0, None).await;
         let (rpc_client, cfg) = routing_fixture(&[url_a.as_str(), url_b.as_str()], true);
         let db_tip = Some(5000);
+        let chain_tip = 5000;
 
         // Historical block (900 + 100 <= 5000): the generator endpoint must stay untouched.
         let deadline = Instant::now() + Duration::from_millis(150);
         let result =
-            fetch_witness(&rpc_client, &cfg, None, db_tip, 900, B256::ZERO, deadline).await;
+            fetch_witness(&rpc_client, &cfg, None, db_tip, chain_tip, 900, B256::ZERO, deadline)
+                .await;
         assert!(result.is_err(), "the mock only returns errors, so the deadline must fire");
         assert_eq!(hits_a.load(Ordering::Relaxed), 0, "historical fetch must skip the generator");
         assert!(hits_b.load(Ordering::Relaxed) >= 1, "the fallback endpoint must be tried");
 
         // Recent block (the tip itself): the full chain, generator first.
         let deadline = Instant::now() + Duration::from_millis(150);
-        let _ = fetch_witness(&rpc_client, &cfg, None, db_tip, 5000, B256::ZERO, deadline).await;
+        let _ =
+            fetch_witness(&rpc_client, &cfg, None, db_tip, chain_tip, 5000, B256::ZERO, deadline)
+                .await;
         assert!(hits_a.load(Ordering::Relaxed) >= 1, "recent fetch must probe the generator");
 
         ha.stop().unwrap();
@@ -2206,7 +2153,8 @@ mod tests {
         // Historical block (900 + 100 <= 5000) with no fallback endpoint configured.
         let deadline = Instant::now() + Duration::from_millis(150);
         let result =
-            fetch_witness(&rpc_client, &cfg, None, Some(5000), 900, B256::ZERO, deadline).await;
+            fetch_witness(&rpc_client, &cfg, None, Some(5000), 5000, 900, B256::ZERO, deadline)
+                .await;
         assert!(result.is_err(), "the mock only returns errors, so the deadline must fire");
         assert!(
             hits_a.load(Ordering::Relaxed) >= 1,
@@ -2229,7 +2177,8 @@ mod tests {
         // endpoint stays in the rotation.
         let deadline = Instant::now() + Duration::from_millis(150);
         let result =
-            fetch_witness(&rpc_client, &cfg, None, Some(5000), 900, B256::ZERO, deadline).await;
+            fetch_witness(&rpc_client, &cfg, None, Some(5000), 5000, 900, B256::ZERO, deadline)
+                .await;
         assert!(result.is_err(), "the mock only returns errors, so the deadline must fire");
         assert!(hits_a.load(Ordering::Relaxed) >= 1, "first endpoint must not be skipped");
 
@@ -2275,6 +2224,7 @@ mod tests {
                 &cfg,
                 Some(&r2),
                 Some(5000),
+                5000,
                 block_number,
                 B256::ZERO,
                 deadline,
@@ -2301,9 +2251,17 @@ mod tests {
         let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
 
         let deadline = Instant::now() + Duration::from_millis(150);
-        let result =
-            fetch_witness(&rpc_client, &cfg, Some(&r2), Some(5000), 900, B256::ZERO, deadline)
-                .await;
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            Some(&r2),
+            Some(5000),
+            5000,
+            900,
+            B256::ZERO,
+            deadline,
+        )
+        .await;
         assert!(result.is_err(), "the RPC mock only returns errors, so the deadline must fire");
         assert_eq!(r2_hits.load(Ordering::SeqCst), 1, "the R2 miss must not be retried");
         assert_eq!(hits_a.load(Ordering::Relaxed), 0, "the fallback still skips the generator");
@@ -2333,6 +2291,7 @@ mod tests {
             &cfg,
             Some(&r2),
             Some(5000),
+            5000,
             900,
             B256::ZERO,
             started + budget,
@@ -2370,9 +2329,17 @@ mod tests {
         let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        let result =
-            fetch_witness(&rpc_client, &cfg, Some(&r2), Some(5000), 5000, B256::ZERO, deadline)
-                .await;
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            Some(&r2),
+            Some(5000),
+            5000,
+            5000,
+            B256::ZERO,
+            deadline,
+        )
+        .await;
         assert!(result.is_ok(), "generator must serve after the R2 miss: {:?}", result.err());
         assert_eq!(r2_hits.load(Ordering::SeqCst), 1, "the frontier probe is a single GET");
         assert!(hits_a.load(Ordering::Relaxed) >= 1, "the generator follows the R2 miss");
@@ -2407,9 +2374,17 @@ mod tests {
         // Frontier block: above the local tip, so the full chain (generator first) runs.
         let budget = Duration::from_secs(3);
         let started = Instant::now();
-        let result =
-            fetch_witness(&rpc_client, &cfg, None, Some(5000), 5001, B256::ZERO, started + budget)
-                .await;
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            None,
+            Some(5000),
+            5000,
+            5001,
+            B256::ZERO,
+            started + budget,
+        )
+        .await;
         let elapsed = started.elapsed();
 
         assert!(result.is_ok(), "round 1 must serve inside the budget: {:?}", result.err());
@@ -2452,9 +2427,17 @@ mod tests {
 
         let budget = Duration::from_secs(1);
         let started = Instant::now();
-        let result =
-            fetch_witness(&rpc_client, &cfg, None, Some(5000), 5001, B256::ZERO, started + budget)
-                .await;
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            None,
+            Some(5000),
+            5000,
+            5001,
+            B256::ZERO,
+            started + budget,
+        )
+        .await;
 
         assert!(result.is_ok(), "round 1 must fit inside the shrunken stage: {:?}", result.err());
         assert!(started.elapsed() < budget, "must not ride the deadline ({:?})", started.elapsed());
@@ -2487,9 +2470,17 @@ mod tests {
 
         let budget = Duration::from_millis(800);
         let started = Instant::now();
-        let result =
-            fetch_witness(&rpc_client, &cfg, None, Some(5000), 5001, B256::ZERO, started + budget)
-                .await;
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            None,
+            Some(5000),
+            5000,
+            5001,
+            B256::ZERO,
+            started + budget,
+        )
+        .await;
 
         assert!(
             result.is_ok(),
@@ -2523,9 +2514,17 @@ mod tests {
 
         let budget = Duration::from_secs(1);
         let started = Instant::now();
-        let result =
-            fetch_witness(&rpc_client, &cfg, None, Some(5000), 5001, B256::ZERO, started + budget)
-                .await;
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            None,
+            Some(5000),
+            5000,
+            5001,
+            B256::ZERO,
+            started + budget,
+        )
+        .await;
 
         assert!(result.is_ok(), "a 600ms serve must fit a 1s stage: {:?}", result.err());
         assert_eq!(hits.load(Ordering::Relaxed), 1, "one attempt, served whole");
@@ -2552,15 +2551,99 @@ mod tests {
 
         let budget = Duration::from_secs(1);
         let started = Instant::now();
-        let result =
-            fetch_witness(&rpc_client, &cfg, None, Some(5000), 5001, B256::ZERO, started + budget)
-                .await;
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            None,
+            Some(5000),
+            5000,
+            5001,
+            B256::ZERO,
+            started + budget,
+        )
+        .await;
 
         assert!(result.is_ok(), "the last hop must get the whole remainder: {:?}", result.err());
         assert_eq!(hits_gw.load(Ordering::Relaxed), 1, "served on the first gateway attempt");
 
         ha.stop().unwrap();
         hb.stop().unwrap();
+    }
+
+    /// The band follows the chain tip, not how far this process has ingested. During a
+    /// catch-up the two diverge: with the DB at 4000 and the chain head known to be 5000,
+    /// block 4500 is 500 blocks — 500 seconds — below the head, so R2 is its primary source
+    /// and gets the historical half-share of the stage.
+    #[tokio::test]
+    async fn the_band_follows_the_chain_tip_not_the_ingested_tip() {
+        let (r2_endpoint, _r2_hits) = mock_r2_held(200, Duration::from_millis(700)).await;
+        let (ha, url_gen, hits_gen) = scripted_witness_rpc(0, Some(fixture_wire())).await;
+        let (rpc_client, cfg) = routing_fixture(&[url_gen.as_str()], true);
+        let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
+
+        let started = Instant::now();
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            Some(&r2),
+            Some(4000),
+            5000,
+            4500,
+            B256::ZERO,
+            started + Duration::from_secs(2),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_ok(), "the RPC chain must serve after R2: {:?}", result.err());
+        assert!(hits_gen.load(Ordering::Relaxed) >= 1, "the RPC chain must be reached");
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "an overdue block must get the historical half-share ({elapsed:?}); cut this \
+             early means the band read the ingested tip and judged it speculative",
+        );
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "and still be cut at that share rather than waiting out the hung R2 ({elapsed:?})",
+        );
+
+        ha.stop().unwrap();
+    }
+
+    /// And it follows the chain even when only the DB knows where the chain is. `tip_hint`
+    /// is raised by by-number and tag resolutions alone, so a server asked only for block
+    /// hashes and transactions leaves it at `0` for its whole life — which would band every
+    /// block frontier, cut every historical probe to the speculative eighth, and keep real
+    /// bucket holes out of `kind="missing"` indefinitely. The DB tip carries it instead.
+    #[tokio::test]
+    async fn an_unraised_tip_hint_bands_on_the_db_tip_instead() {
+        let (r2_endpoint, _r2_hits) = mock_r2_held(200, Duration::from_millis(700)).await;
+        let (ha, url_gen, _hits_gen) = scripted_witness_rpc(0, Some(fixture_wire())).await;
+        let (rpc_client, cfg) = routing_fixture(&[url_gen.as_str()], true);
+        let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
+
+        let started = Instant::now();
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            Some(&r2),
+            Some(5000),
+            0,
+            4000,
+            B256::ZERO,
+            started + Duration::from_secs(2),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_ok(), "the RPC chain must serve after R2: {:?}", result.err());
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "a block 1000 below the DB tip must get the historical half-share ({elapsed:?}); \
+             cut this early means an unraised tip hint banded it frontier",
+        );
+
+        ha.stop().unwrap();
     }
 
     /// The frontier probe runs on the speculative eighth of the stage, not the historical
@@ -2574,9 +2657,9 @@ mod tests {
         let (rpc_client, cfg) = routing_fixture(&[url_gen.as_str()], true);
         let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
 
-        // 1.6s stage: a speculative probe's slice is 200ms (an eighth), where the
-        // historical share would be 800ms. Both near-tip bands are speculative: the tip
-        // itself (in-band) and a block above a stale tip (above-band).
+        // On a 1s stage a speculative probe's slice is an eighth, where the historical
+        // share would be a half. Both the tip itself and a block above it are speculative:
+        // the uploader may not have reached either.
         for block_number in [5000, 6000] {
             let budget = Duration::from_millis(1600);
             let started = Instant::now();
@@ -2585,6 +2668,7 @@ mod tests {
                 &cfg,
                 Some(&r2),
                 Some(5000),
+                5000,
                 block_number,
                 B256::ZERO,
                 started + budget,
@@ -2631,6 +2715,7 @@ mod tests {
             &cfg,
             None,
             Some(5000),
+            5000,
             5001,
             B256::ZERO,
             started + Duration::from_secs(4),

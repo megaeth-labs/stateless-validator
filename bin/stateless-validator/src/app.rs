@@ -5,10 +5,10 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use alloy_genesis::Genesis;
 use alloy_primitives::BlockHash;
 use alloy_rpc_types_eth::BlockId;
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use eyre::Result;
 use stateless_common::{
-    BackoffPolicy, R2CountFlag, R2Flag, R2Flags, R2Target, R2WitnessTransport, RedactedSecret,
+    BackoffPolicy, R2CountFlag, R2Flag, R2Flags, R2TuningFlag, R2WitnessTransport, RedactedSecret,
     RpcClient, RpcClientConfig, logging::LogArgs, validate_r2_flags,
 };
 use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::BlockMeta};
@@ -16,18 +16,6 @@ use stateless_db::ContractCache;
 use tracing::{info, warn};
 
 use crate::{metrics, r2_witness::R2WitnessClient, runner, validator_db::ValidatorDB};
-
-/// Where the validator sources witnesses from.
-#[derive(ValueEnum, Clone, Debug, PartialEq, Eq, Default)]
-#[clap(rename_all = "lowercase")]
-pub enum WitnessSource {
-    /// `mega_getBlockWitness` RPC.
-    #[default]
-    Rpc,
-    /// Straight from the R2 bucket: either the signed S3 API (`--r2-endpoint` and its
-    /// credential quad) or an unsigned Cloudflare custom domain (`--r2-custom-domain`).
-    R2,
-}
 
 /// Database filename for the validator.
 pub const VALIDATOR_DB_FILENAME: &str = "validator.redb";
@@ -84,7 +72,8 @@ pub struct CommandLineArgs {
     /// Accepts repeated flags (`--witness-endpoint a --witness-endpoint b`) or a comma-separated
     /// list (`--witness-endpoint a,b`, also via the env var).
     ///
-    /// Required when `--witness-source rpc` (the default); ignored when `--witness-source r2`.
+    /// Always required. With the `--r2-*` flags configured it is the fallback path behind R2;
+    /// without them it is the only witness path.
     #[clap(
         long,
         env = "STATELESS_VALIDATOR_WITNESS_ENDPOINT",
@@ -93,24 +82,21 @@ pub struct CommandLineArgs {
     )]
     pub witness_endpoint: Vec<String>,
 
-    /// Where to source witnesses from: `rpc` (default) or `r2` (requires the `--r2-*` flags).
-    #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_SOURCE", value_enum, default_value_t = WitnessSource::Rpc)]
-    pub witness_source: WitnessSource,
-
     /// R2 S3 endpoint origin, e.g. `https://<account>.r2.cloudflarestorage.com` (no bucket path).
-    /// Required when `--witness-source r2`, unless `--r2-custom-domain` is used instead
-    /// (mutually exclusive — rejected at startup with an error naming both).
+    /// Configuring it (with its credential quad) turns on the R2 witness route: every witness
+    /// fetch tries the bucket before the `--witness-endpoint` chain. `--r2-custom-domain` is
+    /// the alternative target, mutually exclusive with it and rejected at startup by name.
     #[clap(long, env = "STATELESS_VALIDATOR_R2_ENDPOINT")]
     pub r2_endpoint: Option<String>,
 
     /// Cloudflare custom domain fronting the witness bucket, e.g. `https://witness.example.com`
     /// (bare origin — objects are fetched as `/{key}`). Alternative to the `--r2-endpoint`
-    /// credential quad with `--witness-source r2`: GETs go unsigned through the CDN edge, which
-    /// multiplexes them over HTTP/2 and can serve the immutable witness objects from edge cache.
-    /// ⚠ R2 mode has no RPC fallback and retries a missing witness until the uploader wins the
-    /// race, so **any edge cache rule making these objects cacheable must set 404s to bypass
-    /// cache** — an edge-cached 404 would otherwise pin every pre-upload frontier miss for the
-    /// negative-cache TTL and stall tip-following for minutes at a time.
+    /// credential quad: GETs go unsigned through the CDN edge, which multiplexes them over
+    /// HTTP/2 and can serve the immutable witness objects from edge cache.
+    /// ⚠ **Any edge cache rule making these objects cacheable must set 404s to bypass cache.**
+    /// A pre-upload frontier miss is the routine near-tip outcome, so an edge-cached 404 would
+    /// pin those blocks onto the RPC fallback for the negative-cache TTL and false-fire the
+    /// `kind="missing"` bucket-integrity alarm once they age past the frontier band.
     #[clap(long, env = "STATELESS_VALIDATOR_R2_CUSTOM_DOMAIN")]
     pub r2_custom_domain: Option<String>,
 
@@ -126,34 +112,28 @@ pub struct CommandLineArgs {
     pub r2_access_client_secret: Option<RedactedSecret>,
 
     /// R2 bucket holding the witnesses (e.g. `witness-mainnet`). Required for the S3-endpoint
-    /// target of `--witness-source r2` (not used with `--r2-custom-domain`).
+    /// target (not used with `--r2-custom-domain`).
     #[clap(long, env = "STATELESS_VALIDATOR_R2_BUCKET")]
     pub r2_bucket: Option<String>,
 
-    /// R2 access key id (Object Read). Required for the S3-endpoint target of
-    /// `--witness-source r2` (not used with `--r2-custom-domain`).
+    /// R2 access key id (Object Read). Required for the S3-endpoint target (not used with
+    /// `--r2-custom-domain`).
     #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_KEY_ID")]
     pub r2_access_key_id: Option<String>,
 
-    /// R2 secret access key. Required for the S3-endpoint target of `--witness-source r2`
-    /// (not used with `--r2-custom-domain`). Prefer the env var over the flag.
+    /// R2 secret access key. Required for the S3-endpoint target (not used with
+    /// `--r2-custom-domain`). Prefer the env var over the flag.
     #[clap(long, env = "STATELESS_VALIDATOR_R2_SECRET_ACCESS_KEY")]
     pub r2_secret_access_key: Option<RedactedSecret>,
 
     /// R2 connection-establishment timeout (milliseconds). A healthy handshake to the local
-    /// anycast edge is tens of ms. On the S3 endpoint, hangs past this are the per-IP
-    /// connection-budget mitigation's signature and keep landing in the connect phase, since
-    /// every in-flight GET holds its own connection; they surface as retryable `connect`-kind
-    /// errors. The custom domain pools a single h2 connection, so this bounds its first
-    /// handshake and any reconnect — a path that breaks after that surfaces as `transport`
-    /// against the per-attempt budget until the keep-alive ping reaps the connection, and in
-    /// R2 mode there is no RPC chain to fall back to.
+    /// anycast edge is tens of ms; hangs past this are the S3 endpoint's per-IP
+    /// connection-budget mitigation (one connection per in-flight GET) and surface as retryable
+    /// `connect` errors. The custom domain pools one h2 connection, so this bounds its
+    /// handshake and reconnects only.
     ///
-    /// Left as an `Option` rather than defaulted by clap so that "explicitly set" stays
-    /// distinguishable; [`DEFAULT_CONNECT_TIMEOUT`] applies when it is absent. Unlike the trace
-    /// server, this binary does not reject it for having no R2 target: under
-    /// `--witness-source rpc` every `--r2-*` flag is inert by design, and under
-    /// `--witness-source r2` a target is mandatory, so the rule could never fire.
+    /// An `Option` so "explicitly set" stays distinguishable; [`DEFAULT_CONNECT_TIMEOUT`]
+    /// applies when absent, and setting it with no R2 target is rejected at startup by name.
     ///
     /// [`DEFAULT_CONNECT_TIMEOUT`]: stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT
     #[clap(
@@ -165,17 +145,14 @@ pub struct CommandLineArgs {
 
     /// HTTP/2 connections the custom-domain target spreads its GETs over (default: 1).
     ///
-    /// One `reqwest::Client` holds exactly one HTTP/2 connection and hyper opens no second one
-    /// when the first saturates, so this is the only way past the edge's per-connection stream
-    /// limit — and the only way one dropped connection stops taking every in-flight GET with
-    /// it, which matters here because R2 mode has no RPC fallback.
-    /// `--r2-max-concurrent-requests` is still the cap across all of them, split evenly
-    /// and rounded up, so raising this alone spreads the same concurrency thinner rather than
-    /// raising the ceiling; a count larger than that cap is rejected, since the surplus
-    /// connections could never be filled.
+    /// One `reqwest::Client` holds exactly one h2 connection and hyper opens no second when it
+    /// saturates, so this is the only way past the edge's per-connection stream limit, and the
+    /// only way one dropped connection stops taking a whole window of blocks onto the RPC
+    /// fallback with it. `--r2-max-concurrent-requests` stays the cap across all of them, split
+    /// evenly, so raising this alone spreads the same concurrency thinner; a count above that
+    /// cap is rejected.
     ///
-    /// Taken as text and parsed after clap so a blank env line stays inert under
-    /// `--witness-source rpc` instead of aborting startup with clap's unnamed value error.
+    /// Text rather than a number so a blank env line is named rather than hitting clap.
     #[clap(long, env = "STATELESS_VALIDATOR_R2_CONNECTIONS")]
     pub r2_connections: Option<String>,
 
@@ -214,15 +191,15 @@ pub struct CommandLineArgs {
     pub data_max_concurrent_requests: Option<usize>,
 
     /// Maximum concurrent in-flight RPC witness fetches, independent of the data cap. Omit
-    /// for unlimited. Applies to `--witness-source rpc` only; R2 GETs are capped by
+    /// for unlimited. Sizes the RPC witness path only; R2 GETs are capped separately by
     /// `--r2-max-concurrent-requests`.
     #[clap(long, env = "STATELESS_VALIDATOR_WITNESS_MAX_CONCURRENT_REQUESTS")]
     pub witness_max_concurrent_requests: Option<usize>,
 
     /// Maximum concurrent in-flight R2 witness GETs. Omit for unlimited. Deliberately
     /// separate from `--witness-max-concurrent-requests`: that one sizes what we ask of the
-    /// RPC gateway, while R2 is a different service that tolerates far higher parallelism,
-    /// and under `--witness-source r2` the RPC witness path is not used at all.
+    /// RPC gateway, while R2 is a different service that tolerates far higher parallelism.
+    /// Both apply, each to its own path.
     ///
     /// Against `--r2-custom-domain` this is what bounds the GETs multiplexed onto each HTTP/2
     /// connection, so keep the per-connection share (this value divided by
@@ -249,18 +226,19 @@ pub struct CommandLineArgs {
     pub tip_buffer: Option<u64>,
 
     /// Initial round-level RPC retry backoff (milliseconds). Applied after every provider in a
-    /// round has failed; doubles each round up to `--rpc-max-backoff-ms`. With
-    /// `--witness-source r2` this also paces R2 witness GET retries.
+    /// round has failed; doubles each round up to `--rpc-max-backoff-ms`. With an R2 target
+    /// configured this also paces R2 witness GET retries.
     #[clap(long, env = "STATELESS_VALIDATOR_RPC_INITIAL_BACKOFF_MS")]
     pub rpc_initial_backoff_ms: Option<u64>,
 
-    /// Cap on round-level RPC retry backoff (milliseconds). With `--witness-source r2` this
+    /// Cap on round-level RPC retry backoff (milliseconds). With an R2 target configured this
     /// also caps R2 witness GET retry backoff.
     #[clap(long, env = "STATELESS_VALIDATOR_RPC_MAX_BACKOFF_MS")]
     pub rpc_max_backoff_ms: Option<u64>,
 
-    /// Per-attempt RPC timeout (milliseconds). Must be ≥ 100ms. With `--witness-source r2` this
-    /// also bounds each R2 witness GET.
+    /// Per-attempt RPC timeout (milliseconds). Must be ≥ 100ms. With an R2 target configured
+    /// it also bounds each R2 witness GET and the whole R2 fast path per block — see
+    /// [`R2WitnessClient::new`](crate::r2_witness::R2WitnessClient::new).
     #[clap(
         long,
         env = "STATELESS_VALIDATOR_RPC_PER_ATTEMPT_TIMEOUT_MS",
@@ -332,41 +310,19 @@ pub async fn run() -> Result<()> {
     }
     .with_metrics(Arc::new(metrics::ValidatorMetrics));
     let data_apis: Vec<&str> = args.rpc_endpoint.iter().map(String::as_str).collect();
-    let r2_witness = match args.witness_source {
-        WitnessSource::Rpc => {
-            if args.witness_endpoint.is_empty() {
-                return Err(eyre::eyre!(
-                    "--witness-endpoint is required with --witness-source rpc (the default)"
-                ));
-            }
-            None
-        }
-        WitnessSource::R2 => {
-            if !args.witness_endpoint.is_empty() {
-                warn!(
-                    "--witness-endpoint is ignored with --witness-source r2: witnesses come \
-                     straight from the R2 bucket, and there is no RPC witness fallback"
-                );
-            }
-            let timeouts = stateless_r2::fetch::FetchTimeouts {
-                per_attempt: per_attempt_timeout,
-                connect: args
-                    .r2_connect_timeout_ms
-                    .map_or(stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT, Duration::from_millis),
-            };
-            let transport = build_r2_transport(&args, timeouts, rpc_config.rpc_retry.clone())?;
-            Some(Arc::new(R2WitnessClient::new(transport)))
-        }
+    let witness_apis = witness_apis(&args)?;
+    let r2_timeouts = stateless_r2::fetch::FetchTimeouts {
+        per_attempt: per_attempt_timeout,
+        connect: override_ms(
+            args.r2_connect_timeout_ms,
+            stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT,
+        ),
     };
-
-    // In R2 mode the client carries no witness providers: witnesses come straight from R2, and
-    // a witness RPC call that slipped through fails structurally instead of quietly asking the
-    // data endpoints for `mega_getBlockWitness`.
-    let witness_apis: Vec<&str> = if r2_witness.is_some() {
-        Vec::new()
-    } else {
-        args.witness_endpoint.iter().map(String::as_str).collect()
-    };
+    // The whole R2 fast path per block gets one per-attempt timeout, permit wait included:
+    // a healthy fetch is sub-second, and a stalling endpoint must not cost the block more
+    // wall clock than a single upstream hop before the RPC chain takes over.
+    let r2_witness = build_r2_transport(&args, r2_timeouts, rpc_config.rpc_retry)?
+        .map(|transport| Arc::new(R2WitnessClient::new(transport, per_attempt_timeout)));
     let client = Arc::new(RpcClient::new_with_config(
         &data_apis,
         &witness_apis,
@@ -393,14 +349,8 @@ pub async fn run() -> Result<()> {
         // surfaces as "no forward progress" rather than an arbitrarily bounded retry error.
         let header = client.get_header(BlockId::Hash(block_hash.into()), true).await;
 
-        let anchor = BlockMeta {
-            block_number: header.number,
-            block_hash: header.hash,
-            post_state_root: header.state_root,
-            post_withdrawals_root: header
-                .withdrawals_root
-                .ok_or_else(|| eyre::eyre!("Block {} is missing withdrawals_root", block_hash))?,
-        };
+        let anchor = BlockMeta::try_from_header(&header)
+            .ok_or_else(|| eyre::eyre!("Block {} is missing withdrawals_root", block_hash))?;
         validator_db.reset_to_anchor(&anchor)?;
 
         info!(
@@ -441,7 +391,6 @@ pub async fn run() -> Result<()> {
         validator_db,
         contract_cache,
         chain_spec,
-        args.report_validation_endpoint.is_some(),
         pipeline_config,
     )
     .await;
@@ -458,96 +407,75 @@ fn override_ms(ms: Option<u64>, default: Duration) -> Duration {
     ms.map(Duration::from_millis).unwrap_or(default)
 }
 
-/// Builds the R2 witness transport for `--witness-source r2`: the custom-domain target when
-/// `--r2-custom-domain` is set, the SigV4-signed S3 target otherwise.
+/// The RPC witness endpoints, which are always required.
 ///
-/// Which target wins is already settled by the [`validate_r2_flags`] call below, so the arms
-/// read the one that was chosen — a set-but-empty flag belonging to the *other* target is
-/// rejected there rather than reaching a constructor.
+/// Checked here rather than by clap's `required`: this workspace builds clap without its
+/// `error-context` feature, so a clap rejection names no argument, and these deployments are
+/// configured through env files where an unnamed error costs a translation round trip.
+fn witness_apis(args: &CommandLineArgs) -> Result<Vec<&str>> {
+    if args.witness_endpoint.is_empty() {
+        return Err(eyre::eyre!(
+            "--witness-endpoint is required (env STATELESS_VALIDATOR_WITNESS_ENDPOINT): it is \
+             the witness path, and the fallback behind R2 when the --r2-* flags configure one"
+        ));
+    }
+    Ok(args.witness_endpoint.iter().map(String::as_str).collect())
+}
+
+/// Builds the direct-from-R2 witness transport when the `--r2-*` flags configure a target, or
+/// `None` when they configure nothing and witnesses come from the RPC chain alone.
+///
+/// The presence of a target is the whole switch. A half-configured target, a blank env line,
+/// or a tuning flag with nothing to tune is rejected by name in [`validate_r2_flags`] rather
+/// than read as "no R2 configured" and silently downgraded to the RPC path.
 fn build_r2_transport(
     args: &CommandLineArgs,
     timeouts: stateless_r2::fetch::FetchTimeouts,
     retry: BackoffPolicy,
-) -> Result<R2WitnessTransport> {
-    // `--witness-max-concurrent-requests` capped R2 GETs too before the caps were split.
-    // Refuse the pre-split spelling by name rather than leave R2 uncapped: this mode has no
-    // RPC fallback, so an uncapped fetcher aims its whole in-flight window at the bucket.
-    // Both spellings together stay legal — one env template can feed rpc-mode and r2-mode
-    // roles alike, each mode reading only its own cap — so only old-spelling-alone is refused.
-    // The message names the env spelling too: the deployments this guard exists for configure
-    // through env files, where the flag spelling alone costs a name-translation round trip.
-    if args.witness_max_concurrent_requests.is_some() && args.r2_max_concurrent_requests.is_none() {
-        return Err(eyre::eyre!(
-            "--witness-max-concurrent-requests no longer caps R2 GETs under --witness-source \
-             r2 (it now sizes only the RPC witness path): set --r2-max-concurrent-requests \
-             (env STATELESS_VALIDATOR_R2_MAX_CONCURRENT_REQUESTS) instead"
-        ));
-    }
-    // Every coherence rule lives in the shared validator, so the reads below rest on an
-    // invariant that was actually checked: no empty values, exactly one target, and an Access
-    // pair that is either whole or absent.
-    let transport = match validate_r2_flags(&r2_flags(args))? {
-        R2Target::None => {
-            return Err(eyre::eyre!(
-                "--witness-source r2 needs an R2 target: configure --r2-custom-domain, or \
-                 --r2-endpoint with its credential quad"
-            ));
-        }
-        R2Target::CustomDomain { connections } => {
-            let domain = args.r2_custom_domain.as_deref().expect("custom-domain target");
-            let access =
-                args.r2_access_client_id.as_ref().zip(args.r2_access_client_secret.as_ref()).map(
-                    |(client_id, client_secret)| stateless_r2::fetch::CfAccessCredentials {
-                        client_id: client_id.as_ref().to_string(),
-                        client_secret: client_secret.as_ref().to_string(),
-                    },
-                );
-            let cf_access = access.is_some();
-            let transport = R2WitnessTransport::new_custom_domain(
-                domain,
-                access,
-                timeouts,
-                retry,
-                args.r2_max_concurrent_requests,
-                connections,
-                metrics::record_r2_negotiated_version,
-            )?;
-            metrics::record_r2_connections(transport.connections());
-            info!(
-                domain = %transport.origin(),
-                cf_access,
-                connections = transport.connections(),
-                max_concurrent_requests = ?transport.max_concurrent_requests(),
-                "Witness source: R2 (custom domain)"
-            );
-            transport
-        }
-        R2Target::S3 => {
-            let take = |v: &Option<String>| v.clone().expect("S3 target");
-            let transport = R2WitnessTransport::new(
-                args.r2_endpoint.as_deref().expect("S3 target"),
-                take(&args.r2_bucket),
-                take(&args.r2_access_key_id),
-                args.r2_secret_access_key.as_ref().expect("S3 target").as_ref().to_string(),
-                timeouts,
-                retry,
-                args.r2_max_concurrent_requests,
-            )?;
-            info!(
-                endpoint = %transport.origin(),
-                bucket = args.r2_bucket.as_deref().unwrap_or_default(),
-                max_concurrent_requests = ?transport.max_concurrent_requests(),
-                "Witness source: R2 (direct S3)"
-            );
-            transport
-        }
+) -> Result<Option<R2WitnessTransport>> {
+    // The one R2 flag whose value the shared rules never see, listed so that setting it with
+    // no target is a named startup error rather than a silently dropped setting.
+    let tuning =
+        [R2TuningFlag::new("--r2-connect-timeout-ms", args.r2_connect_timeout_ms.is_some())];
+    let config = validate_r2_flags(&r2_flags(args, &tuning))?;
+    let transport = R2WitnessTransport::from_config(
+        config,
+        timeouts,
+        retry,
+        Arc::new(metrics::ValidatorMetrics),
+    )?;
+    let Some(transport) = transport else {
+        info!(
+            witness_endpoints = ?args.witness_endpoint,
+            "Witness source: RPC only (no --r2-* target configured)"
+        );
+        return Ok(None);
     };
-    metrics::record_r2_target(transport.target_label());
-    Ok(transport)
+    // `--witness-max-concurrent-requests` capped R2 GETs before the two were split; alone it
+    // now leaves R2 uncapped, which the fetcher cannot flag itself (no cap, no per-connection
+    // share to compare against the edge's stream limit).
+    if args.witness_max_concurrent_requests.is_some() && args.r2_max_concurrent_requests.is_none() {
+        warn!(
+            "--witness-max-concurrent-requests sizes only the RPC witness path; R2 GETs are \
+             uncapped. Set --r2-max-concurrent-requests (env \
+             STATELESS_VALIDATOR_R2_MAX_CONCURRENT_REQUESTS) to bound them."
+        );
+    }
+    info!(
+        target = transport.target_label(),
+        origin = %transport.origin(),
+        bucket = %args.r2_bucket.as_deref().unwrap_or("-"),
+        cf_access = args.r2_access_client_id.is_some(),
+        connections = transport.connections(),
+        max_concurrent_requests = ?transport.max_concurrent_requests(),
+        witness_endpoints = ?args.witness_endpoint,
+        "Witness source: R2 first, --witness-endpoint chain as fallback"
+    );
+    Ok(Some(transport))
 }
 
 /// This binary's `--r2-*` flags, in the spellings its operators use.
-fn r2_flags(args: &CommandLineArgs) -> R2Flags<'_> {
+fn r2_flags<'a>(args: &'a CommandLineArgs, tuning: &'a [R2TuningFlag<'a>]) -> R2Flags<'a> {
     R2Flags {
         endpoint: R2Flag::new("--r2-endpoint", args.r2_endpoint.as_deref()),
         bucket: R2Flag::new("--r2-bucket", args.r2_bucket.as_deref()),
@@ -570,11 +498,7 @@ fn r2_flags(args: &CommandLineArgs) -> R2Flags<'_> {
             "--r2-max-concurrent-requests",
             args.r2_max_concurrent_requests,
         ),
-        // Empty on purpose. The orphan-tuning rule exists for a binary that validates R2 flags
-        // on every startup; here they are only read under `--witness-source r2`, where a target
-        // is mandatory, so the rule could never fire. Under `--witness-source rpc` every
-        // `--r2-*` flag is inert by design — see the call site in `run`.
-        tuning: &[],
+        tuning,
     }
 }
 
@@ -597,27 +521,23 @@ mod tests {
         "secret",
     ];
 
-    /// Argv for `--witness-source r2` with the given target flags, so [`build_r2_transport`] —
-    /// the seam every R2-mode rule is gated behind — runs the rules from the path production
-    /// takes.
-    fn parse_r2_with_target(target: &[&str], extra: &[&str]) -> CommandLineArgs {
+    /// Argv with both required endpoints, so a parse depends only on the flags under test.
+    fn parse(extra: &[&str]) -> CommandLineArgs {
         let argv = [
             "stateless-validator",
             "--data-dir",
             "/tmp/x",
             "--rpc-endpoint",
             "http://rpc",
-            "--witness-source",
-            "r2",
+            "--witness-endpoint",
+            "http://w",
         ];
-        CommandLineArgs::try_parse_from(argv.iter().chain(target).chain(extra)).expect("parses")
+        CommandLineArgs::try_parse_from(argv.iter().chain(extra)).expect("parses")
     }
 
-    fn parse_r2(extra: &[&str]) -> CommandLineArgs {
-        parse_r2_with_target(CUSTOM_DOMAIN_TARGET, extra)
-    }
-
-    fn build(args: &CommandLineArgs) -> Result<R2WitnessTransport> {
+    /// Runs the R2 rules from the path production takes, with fast transport parameters (no
+    /// test here fetches anything).
+    fn build(args: &CommandLineArgs) -> Result<Option<R2WitnessTransport>> {
         let timeouts = stateless_r2::fetch::FetchTimeouts {
             per_attempt: Duration::from_secs(1),
             connect: Duration::from_secs(1),
@@ -627,60 +547,77 @@ mod tests {
         build_r2_transport(args, timeouts, retry)
     }
 
-    /// Carrying the pre-split spelling of the R2 concurrency cap into `--witness-source r2`
-    /// must fail by name rather than leave R2 uncapped: that mode has no RPC fallback, so an
-    /// uncapped fetcher aims its whole in-flight window at the bucket. Outside r2 mode the
-    /// rule is unreachable by construction — `build_r2_transport` is only called from the
-    /// `WitnessSource::R2` arm, the same call-site gating as every other R2 rule.
+    /// The presence of a target is the whole switch. No `--r2-*` flag at all is the ordinary
+    /// RPC-only deployment and must build nothing, without being an error; either target
+    /// builds a transport, and the transport reports which one it is.
     #[test]
-    fn r2_mode_refuses_the_pre_split_concurrency_spelling() {
+    fn a_configured_target_is_the_only_switch() {
         let _guard = stateless_test_utils::env::env_lock();
 
-        let stale = parse_r2(&["--witness-max-concurrent-requests", "48"]);
-        let msg =
-            build(&stale).expect_err("the old spelling must be refused in r2 mode").to_string();
-        assert!(msg.contains("--witness-max-concurrent-requests"), "{msg}");
-        assert!(msg.contains("--r2-max-concurrent-requests"), "{msg}");
-        // The env spelling too: the deployments this guard exists for configure through env
-        // files, and the flag spelling alone would cost a name-translation round trip.
-        assert!(msg.contains("STATELESS_VALIDATOR_R2_MAX_CONCURRENT_REQUESTS"), "{msg}");
+        assert!(build(&parse(&[])).expect("no R2 flags is a valid configuration").is_none());
 
-        // Migrated: the new spelling alone is accepted.
-        build(&parse_r2(&["--r2-max-concurrent-requests", "48"]))
-            .expect("migrated spelling builds");
-
-        // Both set is accepted — the RPC cap is simply unread in this mode — and each
-        // spelling lands on its own field.
-        let both = parse_r2(&[
-            "--witness-max-concurrent-requests",
-            "16",
-            "--r2-max-concurrent-requests",
-            "48",
-        ]);
-        assert_eq!(both.witness_max_concurrent_requests, Some(16));
-        assert_eq!(both.r2_max_concurrent_requests, Some(48));
-        build(&both).expect("both caps set builds");
+        for (target, label) in [(CUSTOM_DOMAIN_TARGET, "custom_domain"), (S3_TARGET, "s3")] {
+            let transport = build(&parse(target))
+                .expect("a configured target builds")
+                .expect("a configured target is not None");
+            assert_eq!(transport.target_label(), label);
+        }
     }
 
-    /// The migration guard fires on the flags alone, so its test above would still pass with
-    /// the constructors wired to the old field. This is the assertion that observes which cap
-    /// actually reaches the transport the fetcher runs on — with both spellings set it must be
-    /// the R2 one, not the RPC one — on both target arms, plus the uncapped default, so a
-    /// revert of either arm's wiring fails here by value.
+    /// The two concurrency caps size different services, so the R2 one must be what reaches
+    /// the R2 transport even with both set. The cap travels on the verdict, so this pins the
+    /// one line that feeds it — the count flag in `r2_flags` — by value, on both target arms
+    /// plus the uncapped default.
     #[test]
     fn the_r2_cap_not_the_rpc_one_reaches_the_transport() {
         let _guard = stateless_test_utils::env::env_lock();
 
         for target in [CUSTOM_DOMAIN_TARGET, S3_TARGET] {
-            let both = parse_r2_with_target(
-                target,
-                &["--witness-max-concurrent-requests", "16", "--r2-max-concurrent-requests", "48"],
-            );
-            let capped = build(&both).expect("both caps set builds");
+            let both: Vec<&str> = target
+                .iter()
+                .copied()
+                .chain(["--witness-max-concurrent-requests", "16"])
+                .chain(["--r2-max-concurrent-requests", "48"])
+                .collect();
+            let capped = build(&parse(&both)).unwrap().expect("a configured target is not None");
             assert_eq!(capped.max_concurrent_requests(), Some(48), "{target:?}");
 
-            let uncapped = build(&parse_r2_with_target(target, &[])).expect("no caps builds");
-            assert_eq!(uncapped.max_concurrent_requests(), None, "{target:?}");
+            // The pre-split spelling alone no longer caps R2 — it warns and builds uncapped,
+            // rather than being refused as it was when R2 had no fallback to warn towards.
+            let old_spelling: Vec<&str> =
+                target.iter().copied().chain(["--witness-max-concurrent-requests", "16"]).collect();
+            let stale = build(&parse(&old_spelling))
+                .expect("the old spelling alone still builds")
+                .expect("a configured target is not None");
+            assert_eq!(stale.max_concurrent_requests(), None, "{target:?}");
         }
+    }
+
+    /// The R2 flags are validated on every startup, so a tuning flag with no target to tune is
+    /// named rather than read as "no R2 configured" and silently dropped. Blank values are the
+    /// other diagnostic this buys; the rules' own tests pin their wording.
+    #[test]
+    fn r2_flags_are_validated_even_with_no_target_configured() {
+        let _guard = stateless_test_utils::env::env_lock();
+
+        let orphan = build(&parse(&["--r2-max-concurrent-requests", "48"]))
+            .expect_err("a tuning flag with no target must be named");
+        assert!(orphan.to_string().contains("--r2-max-concurrent-requests"), "{orphan}");
+    }
+
+    /// The RPC witness chain is required whether or not R2 is configured: without R2 it is the
+    /// only witness path, and with R2 it is the fallback every failure lands on.
+    #[test]
+    fn witness_endpoints_are_always_required() {
+        let _guard = stateless_test_utils::env::env_lock();
+
+        let argv = ["stateless-validator", "--data-dir", "/tmp/x", "--rpc-endpoint", "http://rpc"];
+        let without = CommandLineArgs::try_parse_from(argv.iter().chain(CUSTOM_DOMAIN_TARGET))
+            .expect("parses; the requirement is enforced after parsing, by name");
+        let err = witness_apis(&without).expect_err("R2 does not replace the witness chain");
+        assert!(err.to_string().contains("--witness-endpoint"), "{err}");
+        assert!(err.to_string().contains("STATELESS_VALIDATOR_WITNESS_ENDPOINT"), "{err}");
+
+        assert_eq!(witness_apis(&parse(&[])).unwrap(), ["http://w"]);
     }
 }
