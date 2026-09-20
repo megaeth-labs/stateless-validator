@@ -1928,7 +1928,8 @@ mod tests {
         let blocks: Vec<_> = (1..=500u64)
             .map(|n| (make_test_block(n, block_hash(n)), empty_light_witness()))
             .collect();
-        db.store_block_data(&blocks).unwrap();
+        let pairs: Vec<_> = blocks.iter().map(|(b, w)| (b, w)).collect();
+        db.store_block_data(&pairs).unwrap();
         let metas: Vec<BlockMeta> = (1..=500u64)
             .map(|n| BlockMeta {
                 block_number: n,

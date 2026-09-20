@@ -492,8 +492,9 @@ where
     let logs_bloom =
         execution_result.receipts.iter().fold(Bloom::ZERO, |acc, receipt| acc | receipt.bloom());
 
-    // Gas used is the cumulative gas used of the last receipt
-    let gas_used = execution_result.receipts.last().map(|r| r.cumulative_gas_used()).unwrap_or(0);
+    // mega-evm's `finish()` defines this field as the last receipt's cumulative gas, so
+    // reading it keeps one derivation of the value rather than a copy of the expression.
+    let gas_used = execution_result.gas_used;
 
     let receipts_root = calculate_receipt_root(&execution_result.receipts);
 
@@ -1062,6 +1063,10 @@ mod tests {
         assert!(matches!(err, ValidationError::BlockIncomplete), "{err:?}");
     }
 
+    /// `validate_block` must succeed on every paired mainnet fixture. This is the full
+    /// consensus surface against real headers — the post-state root, plus the withdrawals
+    /// root, receipts root, logs bloom and `gas_used` that `verify_replay_outputs` checks —
+    /// so a replayed value that stops matching what a mainnet header claims fails here.
     #[test]
     fn validate_block_mainnet_fixtures() {
         let _logging = init_test_logging("stateless_core");
