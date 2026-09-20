@@ -13,7 +13,7 @@ use stateless_common::{
 };
 use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::BlockMeta};
 use stateless_db::ContractCache;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{metrics, r2_witness::R2WitnessClient, runner, validator_db::ValidatorDB};
 
@@ -460,6 +460,18 @@ fn build_r2_transport(
         );
         return Ok(None);
     };
+    // `--witness-max-concurrent-requests` capped R2 GETs before the two were split. Carrying
+    // only that spelling into an R2 deployment leaves the bucket uncapped, which the fetcher
+    // cannot warn about on its own: with no cap there is no per-connection share to compare
+    // against the edge's stream limit, so the queueing happens inside the HTTP/2 connection
+    // where it is invisible and still spends the per-attempt budget.
+    if args.witness_max_concurrent_requests.is_some() && args.r2_max_concurrent_requests.is_none() {
+        warn!(
+            "--witness-max-concurrent-requests sizes only the RPC witness path; R2 GETs are \
+             uncapped. Set --r2-max-concurrent-requests (env \
+             STATELESS_VALIDATOR_R2_MAX_CONCURRENT_REQUESTS) to bound them."
+        );
+    }
     info!(
         target = transport.target_label(),
         origin = %transport.origin(),
@@ -586,6 +598,15 @@ mod tests {
 
             let uncapped = build(&parse(target)).unwrap().expect("a configured target is not None");
             assert_eq!(uncapped.max_concurrent_requests(), None, "{target:?}");
+
+            // The pre-split spelling alone no longer caps R2 — it warns and builds uncapped,
+            // rather than being refused as it was when R2 had no fallback to warn towards.
+            let old_spelling: Vec<&str> =
+                target.iter().copied().chain(["--witness-max-concurrent-requests", "16"]).collect();
+            let stale = build(&parse(&old_spelling))
+                .expect("the old spelling alone still builds")
+                .expect("a configured target is not None");
+            assert_eq!(stale.max_concurrent_requests(), None, "{target:?}");
         }
     }
 

@@ -33,6 +33,44 @@ use crate::{BackoffPolicy, R2Config, WitnessDecodingError};
 /// does not.
 pub const R2_FRONTIER_WINDOW: u64 = 32;
 
+/// Which band a block falls in relative to the tip its reader measures against, which is what
+/// decides whether an absent object is expected or a hole.
+///
+/// The band is [`R2_FRONTIER_WINDOW`] wide on either side of the tip. What each reader *does*
+/// with a band differs — the trace server spends a different share of its request budget per
+/// band, and the validator has no band above its tip to reach — but the arithmetic is one rule,
+/// here, so the two cannot drift on where the edges sit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum R2Band {
+    /// Within the window of the tip on either side, or no tip known at all: the uploader may
+    /// plausibly not have PUT the object yet, so a `missing` is the expected probe-ahead
+    /// outcome rather than a bucket hole.
+    Frontier,
+    /// More than the window *above* the tip. Only reachable by a reader whose tip can lag the
+    /// real chain head; the bucket's state there is unknowable from that tip, so a `missing`
+    /// is neither expected nor evidence of a hole.
+    AboveTip,
+    /// At least the window *below* the tip: the object must exist, so a `missing` is a bucket
+    /// hole and belongs on the integrity alarm.
+    Historical,
+}
+
+/// Classifies `block_number` against `tip` — the reader's own notion of the chain tip, `None`
+/// when it has not learned one yet. See [`R2Band`] for what each band means.
+///
+/// The deep edge is exclusive and the top edge inclusive: a block exactly the window below the
+/// tip is already [`R2Band::Historical`], so the integrity alarm covers it.
+pub fn r2_band(tip: Option<u64>, block_number: u64) -> R2Band {
+    let Some(tip) = tip else { return R2Band::Frontier };
+    if block_number > tip.saturating_add(R2_FRONTIER_WINDOW) {
+        R2Band::AboveTip
+    } else if block_number.checked_add(R2_FRONTIER_WINDOW).is_some_and(|horizon| horizon <= tip) {
+        R2Band::Historical
+    } else {
+        R2Band::Frontier
+    }
+}
+
 /// Failure outcome of an R2 witness fetch, shared by both binaries' adapters.
 ///
 /// A binary whose decode runs without a deadline never produces [`Self::DecodeTimeout`]; its
@@ -307,6 +345,30 @@ mod tests {
 
     fn test_backoff() -> BackoffPolicy {
         BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(20))
+    }
+
+    /// The band edges are one rule for both readers, so neither can drift on them: the deep
+    /// edge is exclusive (a block exactly the window below the tip must alarm), the top edge
+    /// inclusive, and an unknown tip puts everything in the frontier because nothing is known
+    /// to be uploaded yet.
+    #[test]
+    fn band_edges_are_one_rule_for_both_readers() {
+        use R2Band::*;
+        const TIP: u64 = 5000;
+
+        assert_eq!(r2_band(None, 100), Frontier, "unknown tip: nothing known to be uploaded");
+        assert_eq!(r2_band(Some(TIP), TIP), Frontier, "the tip itself");
+        assert_eq!(r2_band(Some(TIP), TIP - R2_FRONTIER_WINDOW + 1), Frontier, "just inside");
+        assert_eq!(r2_band(Some(TIP), TIP - R2_FRONTIER_WINDOW), Historical, "just past the band");
+        assert_eq!(r2_band(Some(TIP), TIP + R2_FRONTIER_WINDOW), Frontier, "just above, in band");
+        assert_eq!(
+            r2_band(Some(TIP), TIP + R2_FRONTIER_WINDOW + 1),
+            AboveTip,
+            "far above a stale tip is unknown territory, not uploader lag",
+        );
+        assert_eq!(r2_band(Some(TIP), 4000), Historical, "a hole this deep must alarm");
+        // A horizon that would overflow counts as frontier rather than wrapping into one.
+        assert_eq!(r2_band(Some(u64::MAX), u64::MAX), Frontier);
     }
 
     /// Every fetch-level kind must appear in the pre-registered [`R2WitnessError::KINDS`]

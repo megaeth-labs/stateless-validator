@@ -19,7 +19,7 @@ pub use stateless_common::{
 };
 use tracing::info;
 
-use crate::r2_witness::{KIND_MISSING_FRONTIER, R2WitnessError};
+use crate::r2_witness::R2WitnessError;
 
 /// Metrics callback implementation for RPC client.
 ///
@@ -110,6 +110,7 @@ pub mod names {
     metric!(WITNESS_FETCH_R2_TIME, "witness_fetch_r2_time_seconds");
     metric!(R2_WITNESS_RETRY_ATTEMPTS_TOTAL, "r2_witness_retry_attempts_total");
     metric!(R2_WITNESS_ERRORS_TOTAL, "r2_witness_errors_total");
+    metric!(R2_WITNESS_FRONTIER_MISSES_TOTAL, "r2_witness_frontier_misses_total");
     metric!(R2_TARGET_INFO, "r2_target_info");
     metric!(R2_NEGOTIATED_VERSION_INFO, "r2_negotiated_http_version_info");
     metric!(R2_CONNECTIONS, "r2_connections");
@@ -207,11 +208,17 @@ fn register_metric_descriptions() {
     describe_counter!(
         names::R2_WITNESS_ERRORS_TOTAL,
         "R2 witness fetches that failed, each one a block that fell back to the RPC witness \
-         path, by kind. `missing_frontier` is a miss within the frontier band below the \
-         polled head, where the uploader may still be catching up; it is routine and \
-         carries every miss of a tip-following run, which is what keeps `missing` counting \
-         only objects that must exist — a signal that earns its name during catch-up and \
-         `--end-block` backfills"
+         path, by kind. Routine near-tip misses are counted separately (see \
+         `r2_witness_frontier_misses_total`), so this stays an error rate and `missing` \
+         means a hole in objects that must exist — a signal that earns its name during \
+         catch-up and `--end-block` backfills"
+    );
+    describe_counter!(
+        names::R2_WITNESS_FRONTIER_MISSES_TOTAL,
+        "R2 witness fetches that found no object within the frontier band below the polled \
+         head — the uploader has not reached the block yet. Routine and numerous on a \
+         tip-following run, which is why they are kept off `r2_witness_errors_total`; their \
+         rate is the signal to watch there"
     );
     describe_gauge!(
         names::R2_NEGOTIATED_VERSION_INFO,
@@ -255,11 +262,13 @@ fn init_rpc_method_counters() {
     }
 }
 
-/// Pre-register the R2 witness-source counters (every error kind, plus the synthetic frontier
-/// label) so they appear in Prometheus output from startup, like the RPC method counters above.
+/// Pre-register the R2 witness-source counters (every error kind, plus the retry and
+/// frontier-miss totals) so they appear in Prometheus output from startup, like the RPC method
+/// counters above.
 fn init_r2_witness_counters() {
     counter!(names::R2_WITNESS_RETRY_ATTEMPTS_TOTAL).increment(0);
-    for kind in R2WitnessError::KINDS.iter().chain(&[KIND_MISSING_FRONTIER]) {
+    counter!(names::R2_WITNESS_FRONTIER_MISSES_TOTAL).increment(0);
+    for kind in R2WitnessError::KINDS {
         counter!(names::R2_WITNESS_ERRORS_TOTAL, "kind" => *kind).increment(0);
     }
 }
@@ -418,7 +427,13 @@ pub fn on_r2_witness_retry() {
     counter!(names::R2_WITNESS_RETRY_ATTEMPTS_TOTAL).increment(1);
 }
 
-/// Record a failed R2 witness fetch, labelled by [`crate::r2_witness::error_kind`].
+/// Record a failed R2 witness fetch, labelled by [`R2WitnessError::kind`].
 pub fn on_r2_witness_error(kind: &'static str) {
     counter!(names::R2_WITNESS_ERRORS_TOTAL, "kind" => kind).increment(1);
+}
+
+/// Record an R2 witness fetch that found no object near the polled head — the uploader still
+/// catching up. Deliberately not an error: see [`names::R2_WITNESS_FRONTIER_MISSES_TOTAL`].
+pub fn on_r2_witness_frontier_miss() {
+    counter!(names::R2_WITNESS_FRONTIER_MISSES_TOTAL).increment(1);
 }

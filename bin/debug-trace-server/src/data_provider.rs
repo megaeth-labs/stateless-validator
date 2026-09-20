@@ -46,7 +46,7 @@ use op_alloy_rpc_types::Transaction;
 use quick_cache::sync::Cache;
 use revm::state::Bytecode;
 use stateless_common::{
-    CodeFetchError, R2_FRONTIER_WINDOW, RpcClient, RpcDeadlineExceeded, WitnessSizeBreakdown,
+    CodeFetchError, R2Band, RpcClient, RpcDeadlineExceeded, WitnessSizeBreakdown, r2_band,
 };
 use stateless_core::{
     ContractStore, LightWitness, StoreResult, db::StoreError, withdrawals::MptWitness,
@@ -1240,47 +1240,6 @@ fn is_historical(db_tip: Option<u64>, block_number: u64, local_window: u64) -> b
     }
 }
 
-/// Which band a block falls in for the R2 probe, deciding its metrics label, its budget
-/// share, and how a `missing` is classified.
-///
-/// The band is the shared [`R2_FRONTIER_WINDOW`], measured here against the local DB tip
-/// (chain sync's `GENERATOR_WITNESS_GRACE` is the time-based analog) and kept far below
-/// [`DEFAULT_WITNESS_LOCAL_WINDOW`]: routing asks "may the generator have pruned this?",
-/// the band asks "may the uploader not have reached it yet?", and gating the
-/// `kind="missing"` alarm on the routing window would silence bucket-integrity alerting
-/// across its whole 4096-block span.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum R2Band {
-    /// Within [`R2_FRONTIER_WINDOW`] of the local tip on either side (or no tip yet — the
-    /// cold-start transient `validate_args`' `--data-dir` requirement bounds): the
-    /// uploader may plausibly not have PUT the object yet, so a `missing` is the expected
-    /// probe-ahead outcome and the speculative probe gets only the
-    /// [`R2_FRONTIER_BUDGET_DIVISOR`] budget share.
-    Frontier,
-    /// More than the band *above* the local tip — only reachable when chain sync is
-    /// behind, since a healthy tip tracks the real head and blocks past it do not resolve.
-    /// The bucket's state is unknowable from a stale tip, so a `missing` records on its
-    /// own [`crate::r2_witness::KIND_MISSING_ABOVE_TIP`] series: visible (a real hole in
-    /// the catch-up gap still surfaces there) without flooding the below-band
-    /// bucket-integrity alarm with routine uploader lag on every catch-up. Like the
-    /// frontier, the probe is speculative — the object is not guaranteed to exist yet —
-    /// and gets only the [`R2_FRONTIER_BUDGET_DIVISOR`] budget share.
-    AboveTip,
-    /// At least the band *below* the tip: the object must exist, so a `missing` is a
-    /// bucket hole and feeds the `kind="missing"` bucket-integrity alarm.
-    Historical,
-}
-
-/// Classifies `block_number` against the local tip; see [`R2Band`] for the semantics.
-fn r2_band(db_tip: Option<u64>, block_number: u64) -> R2Band {
-    match db_tip {
-        None => R2Band::Frontier,
-        Some(tip) if block_number > tip.saturating_add(R2_FRONTIER_WINDOW) => R2Band::AboveTip,
-        Some(_) if is_historical(db_tip, block_number, R2_FRONTIER_WINDOW) => R2Band::Historical,
-        Some(_) => R2Band::Frontier,
-    }
-}
-
 /// Witness route for a block: how many leading witness endpoints to skip, plus the metrics
 /// source label. Historical blocks skip the internal generator at index 0 — but only with a
 /// fallback endpoint to skip to (`can_skip_generator`, so the skip-aware fetch never sees an
@@ -1728,30 +1687,16 @@ mod tests {
 
     /// The R2 frontier band is the uploader-lag grace, not the routing window: a block that
     /// is recent for routing but past the band must count an R2 miss as a bucket hole (the
-    /// `kind="missing"` alarm), not an expected probe-ahead miss.
+    /// `kind="missing"` alarm), not an expected probe-ahead miss. The band's own edges are
+    /// pinned once, next to the classifier, in `stateless-common`.
     #[test]
     fn r2_frontier_band_is_narrower_than_routing() {
-        use R2Band::*;
-        assert_eq!(r2_band(None, 100), Frontier, "unknown tip: nothing known to be uploaded");
-        assert_eq!(r2_band(Some(5000), 5000), Frontier, "the tip itself");
-        assert_eq!(r2_band(Some(5000), 5000 - R2_FRONTIER_WINDOW + 1), Frontier, "just inside");
-        assert_eq!(
-            r2_band(Some(5000), 5000 - R2_FRONTIER_WINDOW),
-            Historical,
-            "just past the band"
-        );
-        assert_eq!(r2_band(Some(5000), 5000 + R2_FRONTIER_WINDOW), Frontier, "just above, in band");
-        // A stale, catching-up tip must not flood the bucket-integrity alarm for the gap
-        // above it — nor silence it: the gap gets its own missing_above_tip series.
-        assert_eq!(
-            r2_band(Some(5000), 5000 + R2_FRONTIER_WINDOW + 1),
-            AboveTip,
-            "far above a stale tip is unknown territory, not uploader lag",
-        );
-        // The band a routing-window gate would have silenced: recent for routing, far past
-        // any plausible uploader lag.
         let recent_not_tip = 4000;
-        assert_eq!(r2_band(Some(5000), recent_not_tip), Historical, "a hole here must alarm");
+        assert_eq!(
+            r2_band(Some(5000), recent_not_tip),
+            R2Band::Historical,
+            "a hole here must alarm",
+        );
         assert!(
             !is_historical(Some(5000), recent_not_tip, DEFAULT_WITNESS_LOCAL_WINDOW),
             "yet the same block is recent for witness routing",

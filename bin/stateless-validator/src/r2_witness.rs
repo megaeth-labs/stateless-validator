@@ -19,17 +19,17 @@
 //! Access token, HTTP/2, the credentials, this fetcher), not the bucket failing.
 //!
 //! Operator note on missing objects, and on which counter is worth watching in which mode.
-//! A `missing` inside the [`R2_FRONTIER_WINDOW`] below the last polled remote head is the
-//! uploader still catching up and lands on
-//! `r2_witness_errors_total{kind="missing_frontier"}`; deeper than that the object must
-//! exist, so it feeds `kind="missing"`.
+//! A `missing` inside the [`R2_FRONTIER_WINDOW`][w] below the last polled remote head is the
+//! uploader still catching up and lands on `r2_witness_frontier_misses_total`, its own series
+//! so that `r2_witness_errors_total` stays an error rate; deeper than that the object must
+//! exist, so it feeds `r2_witness_errors_total{kind="missing"}`.
 //!
 //! While following the tip those bands do not both apply: the fetcher works at
 //! `head - tip_buffer`, and every deployed buffer is far inside a 32-block window, so every
 //! miss is a frontier miss and `kind="missing"` stays at zero by construction. Frontier
-//! misses are routine and numerous there, which is exactly why they are kept off that
-//! counter, and what to watch instead is their rate. `kind="missing"` earns its name during
-//! catch-up and fixed `--end-block` backfills, where blocks sit far below the head.
+//! misses are routine and numerous there, which is exactly why they are kept off the error
+//! counter, and what to watch instead is their own rate. `kind="missing"` earns its name
+//! during catch-up and fixed `--end-block` backfills, where blocks sit far below the head.
 //!
 //! A hole that first appears near the tip is therefore not detected here: the block is
 //! fetched once, falls back, and is never probed again. That is deliberate rather than an
@@ -40,6 +40,7 @@
 //! cache 404s — see the `--r2-custom-domain` docs.
 //!
 //! [`R2ObjectFetcher`]: stateless_r2::fetch::R2ObjectFetcher
+//! [w]: stateless_common::R2_FRONTIER_WINDOW
 
 use std::time::{Duration, Instant};
 
@@ -47,8 +48,8 @@ use alloy_primitives::B256;
 use salt::SaltWitness;
 pub use stateless_common::R2WitnessError;
 use stateless_common::{
-    R2_FRONTIER_WINDOW, R2WitnessTransport, WitnessSizeBreakdown, decode_on_blocking_pool,
-    decode_witness_payload,
+    R2Band, R2WitnessTransport, WitnessSizeBreakdown, decode_on_blocking_pool,
+    decode_witness_payload, r2_band,
 };
 use stateless_core::withdrawals::MptWitness;
 use tracing::{debug, trace, warn};
@@ -64,25 +65,24 @@ use crate::metrics;
 /// unboundedly, so there is nothing to mirror.
 const MAX_ATTEMPTS: usize = 3;
 
-/// Synthetic `kind` label for a `missing` inside the frontier band — the uploader has not
-/// reached the block yet, the expected near-tip outcome, and a common one. Kept off
-/// [`R2WitnessError::KINDS`] (no error variant produces it); [`error_kind`] derives it so
-/// `kind="missing"` keeps counting only objects that must exist, instead of being buried
-/// under the routine near-tip misses of a tip-following run.
-pub(crate) const KIND_MISSING_FRONTIER: &str = "missing_frontier";
-
-/// The `kind` label an R2 witness failure is recorded under: [`R2WitnessError::kind`], except
-/// that a `missing` inside the [`R2_FRONTIER_WINDOW`] below `remote_head` is
-/// [`KIND_MISSING_FRONTIER`]. A head of `0` — what the fetcher holds before its first poll —
-/// puts every block inside the band, which is right: nothing is known to be uploaded yet.
+/// Whether a failure is the routine near-tip outcome: the object is absent and the block sits
+/// within [`R2_FRONTIER_WINDOW`](stateless_common::R2_FRONTIER_WINDOW) of the head the
+/// fetcher last polled, so the uploader may
+/// simply not have reached it yet. Those are counted on their own series; everything else is
+/// an error, which is what keeps `r2_witness_errors_total` an error rate.
 ///
-/// The validator only fetches at or below the head it last polled, so unlike the trace
-/// server there is no above-tip band: a block is either near enough to the head for the
-/// uploader to plausibly still be behind it, or deep enough that the object must exist. See
-/// the module docs for which of the two a run actually sees.
-pub(crate) fn error_kind(e: &R2WitnessError, number: u64, remote_head: u64) -> &'static str {
-    let frontier = number.saturating_add(R2_FRONTIER_WINDOW) >= remote_head;
-    if e.is_missing() && frontier { KIND_MISSING_FRONTIER } else { e.kind() }
+/// `remote_head` is `0` before the first poll, which reaches the shared classifier as "no tip
+/// known" — every block is a frontier block then, which is right: nothing is known to be
+/// uploaded yet. The `Option` is load-bearing rather than ceremony here, since `Some(0)` would
+/// instead put every block past the window into [`R2Band::AboveTip`].
+///
+/// Only [`R2Band::Historical`] is a hole. [`R2Band::AboveTip`] is unreachable for this reader —
+/// the pipeline spawns fetches at `head - tip_buffer` against the same poll that set
+/// `remote_head`, so a fetched block is never above it — and it would mean the same thing as a
+/// frontier block anyway: the uploader may not have got there.
+fn is_frontier_miss(e: &R2WitnessError, number: u64, remote_head: u64) -> bool {
+    let tip = (remote_head != 0).then_some(remote_head);
+    e.is_missing() && r2_band(tip, number) != R2Band::Historical
 }
 
 /// Fetches witness objects straight from an R2 bucket — SigV4-signed over the S3 API, or
@@ -110,7 +110,7 @@ impl R2WitnessClient {
 
     /// Fetches and decodes the witness for `(number, hash)` from R2. `remote_head` is the
     /// chain head the caller last polled (`0` before the first poll), which classifies a miss
-    /// (see [`error_kind`]).
+    /// (see [`is_frontier_miss`]).
     ///
     /// Transport/429/5xx failures are retried internally up to [`MAX_ATTEMPTS`], paced by the
     /// backoff policy given at construction and bounded in total by the `stage_timeout` given
@@ -125,15 +125,15 @@ impl R2WitnessClient {
     ) -> Result<(SaltWitness, MptWitness), R2WitnessError> {
         let result = self.get_witness_inner(number, hash).await;
         if let Err(e) = &result {
-            let kind = error_kind(e, number, remote_head);
-            metrics::on_r2_witness_error(kind);
-            if kind == KIND_MISSING_FRONTIER {
+            if is_frontier_miss(e, number, remote_head) {
+                metrics::on_r2_witness_frontier_miss();
                 debug!(number, %hash, "Frontier witness not in R2 yet; fetching over RPC");
             } else {
+                metrics::on_r2_witness_error(e.kind());
                 warn!(
                     number,
                     %hash,
-                    kind,
+                    kind = e.kind(),
                     error = %e,
                     "R2 witness fetch failed, falling back to the RPC witness path",
                 );
@@ -186,7 +186,7 @@ impl R2WitnessClient {
 mod tests {
     use std::{str::FromStr, sync::atomic::Ordering, time::Duration};
 
-    use stateless_common::BackoffPolicy;
+    use stateless_common::{BackoffPolicy, R2_FRONTIER_WINDOW};
     use stateless_r2::{
         fetch::{FetchTimeouts, R2GetError},
         keys,
@@ -370,26 +370,25 @@ mod tests {
     }
 
     /// A `missing` within the frontier band below the polled head — or with no head polled
-    /// yet — is the uploader still catching up and must stay off the `kind="missing"`
-    /// bucket-integrity alarm; deeper than the band the object must exist. Every other kind
-    /// is its own, wherever the block sits.
+    /// yet — is the uploader still catching up, so it must stay off the error counter; the
+    /// band's deep edge and everything under it is a hole that belongs on it. Every other
+    /// kind is an error wherever the block sits. The edges themselves are pinned once, in
+    /// `stateless-common` beside the classifier.
     #[test]
-    fn error_kind_splits_frontier_misses_from_bucket_holes() {
+    fn only_a_near_tip_miss_is_a_frontier_miss() {
         let missing = R2WitnessError::Get(R2GetError::Missing { number: 1, key: "k".into() });
         let head = 5000;
-        assert_eq!(error_kind(&missing, 100, 0), KIND_MISSING_FRONTIER, "no head polled yet");
-        assert_eq!(error_kind(&missing, head, head), KIND_MISSING_FRONTIER, "the head");
-        assert_eq!(
-            error_kind(&missing, head - R2_FRONTIER_WINDOW, head),
-            KIND_MISSING_FRONTIER,
-            "the band's deep edge is still inside it",
+        assert!(is_frontier_miss(&missing, 100, 0), "no head polled yet");
+        assert!(is_frontier_miss(&missing, head, head), "the head itself");
+        assert!(
+            is_frontier_miss(&missing, head - R2_FRONTIER_WINDOW + 1, head),
+            "just inside the band",
         );
-        assert_eq!(
-            error_kind(&missing, head - R2_FRONTIER_WINDOW - 1, head),
-            "missing",
-            "one past the band is a hole",
+        assert!(
+            !is_frontier_miss(&missing, head - R2_FRONTIER_WINDOW, head),
+            "the band's deep edge is already a hole",
         );
-        assert_eq!(error_kind(&missing, 100, head), "missing", "deep history is a hole");
+        assert!(!is_frontier_miss(&missing, 100, head), "deep history is a hole");
 
         let throttled = R2WitnessError::Get(R2GetError::Throttled {
             number: 1,
@@ -397,6 +396,6 @@ mod tests {
             status: 503,
             body: String::new(),
         });
-        assert_eq!(error_kind(&throttled, head, head), "throttled", "only misses split");
+        assert!(!is_frontier_miss(&throttled, head, head), "only an absent object can split");
     }
 }
