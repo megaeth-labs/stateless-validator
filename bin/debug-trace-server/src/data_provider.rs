@@ -3168,11 +3168,9 @@ mod tests {
         assert!(matches!(block_err, DataProviderError::Timeout { stage: TimeoutStage::Block, .. }));
     }
 
-    /// A witness fetch whose provider range is unsatisfiable is a wiring bug, not a blown
-    /// budget: it must land on `Internal`, never on `Timeout { Witness }`. That bucket feeds
-    /// the `deadline_witness` error reason, whose whole value is meaning "an upstream witness
-    /// fetch ran out of time" — a wiring bug landing there would page for the wrong incident.
-    /// The deadline variant still classifies by method, exactly as before.
+    /// A range failure is a wiring bug: it must land on `Internal`, never on the
+    /// `deadline_witness` alarm's `Timeout { Witness }` (rationale at the `From` impl). The
+    /// deadline arm is asserted too — it is the delegation that keeps that alarm working.
     #[test]
     fn witness_range_failure_is_internal_not_a_witness_timeout() {
         let range_err: DataProviderError =
