@@ -5,7 +5,8 @@
 //! It owns exactly the parts whose behavior must not drift between readers: the `GET`
 //! itself, the response classification ([`R2GetError`]), the retry loop with jittered
 //! exponential backoff, and the in-flight concurrency cap. Everything reader-specific stays
-//! with the caller: payload decoding (full vs light), metrics, and failure pacing policies.
+//! with the caller: payload decoding (full vs light), metrics, and the deadline each fetch
+//! runs under.
 //!
 //! The fetcher reaches the bucket through one of two targets:
 //! - the bare **S3 API endpoint** ([`R2ObjectFetcher::new`]) — SigV4-signed GETs of
@@ -35,7 +36,7 @@ use reqwest::{
     header::{HeaderMap, HeaderName, HeaderValue},
 };
 use tokio::sync::{Semaphore, SemaphorePermit};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::{
     client::is_throttle_status,
@@ -530,12 +531,6 @@ pub struct R2ObjectFetcher {
 }
 
 impl R2ObjectFetcher {
-    /// The retry pacing this fetcher was built with, for callers whose surfaced-failure
-    /// policies must stay in sync with the retry ramp (e.g. pausing the ramp's `max`).
-    pub const fn pacing(&self) -> RetryPacing {
-        self.pacing
-    }
-
     /// This fetcher's target origin (`scheme://host[:port]`).
     ///
     /// Callers log this instead of the flag they were given: the raw operator string can carry
@@ -885,7 +880,9 @@ impl R2ObjectFetcher {
                         return Err(e);
                     }
                     on_retry();
-                    warn!(
+                    // Debug, not warn: callers count retries via `on_retry` and log one line
+                    // per failed fetch, so per-attempt warnings only multiply it in a brownout.
+                    debug!(
                         number, %key, attempt, sleep_ms, error = %e,
                         "R2 witness GET failed, backing off",
                     );
@@ -1518,7 +1515,7 @@ mod tests {
     }
 
     /// Cloudflare's Browser Integrity Check challenges user-agent-less requests, which would
-    /// arrive as a non-retryable 403 on every GET — and the validator's R2 mode has no fallback.
+    /// arrive as a non-retryable 403 on every GET, sending every block to the RPC fallback.
     #[tokio::test]
     async fn custom_domain_sends_a_user_agent() {
         let (domain, _hits, heads) = mock_r2_capturing(vec![(200, "witness bytes")]).await;

@@ -571,7 +571,7 @@ pub fn record_r2_witness_queue_wait(seconds: f64) {
 const R2_TARGET_INFO: &str = "debug_trace_r2_target_info";
 
 /// Publishes the configured R2 target once at startup.
-pub fn record_r2_target(target: &'static str) {
+fn record_r2_target(target: &'static str) {
     gauge!(R2_TARGET_INFO, "target" => target).set(1.0);
 }
 
@@ -584,7 +584,7 @@ pub fn record_r2_target(target: &'static str) {
 const R2_CONNECTIONS: &str = "debug_trace_r2_connections";
 
 /// Publishes the custom-domain connection count once at startup.
-pub fn record_r2_connections(connections: usize) {
+fn record_r2_connections(connections: usize) {
     gauge!(R2_CONNECTIONS).set(connections as f64);
 }
 
@@ -598,7 +598,7 @@ pub fn record_r2_connections(connections: usize) {
 const R2_NEGOTIATED_VERSION_INFO: &str = "debug_trace_r2_negotiated_http_version_info";
 
 /// Publishes the protocol the custom-domain target negotiated.
-pub fn record_r2_negotiated_version(version: &'static str) {
+fn record_r2_negotiated_version(version: &'static str) {
     gauge!(R2_NEGOTIATED_VERSION_INFO, "version" => version).set(1.0);
 }
 
@@ -905,8 +905,6 @@ fn pre_register_all_metrics() {
     for kind in crate::r2_witness::R2WitnessError::KINDS {
         counter!(R2_WITNESS_ERRORS_TOTAL, "kind" => *kind).increment(0);
     }
-    counter!(R2_WITNESS_ERRORS_TOTAL, "kind" => crate::r2_witness::KIND_MISSING_ABOVE_TIP)
-        .increment(0);
     let _ = histogram!(R2_WITNESS_QUEUE_WAIT_SECONDS);
 
     // Data Fetch Layer: single-flight
@@ -1157,6 +1155,20 @@ fn upstream_label_for(method: stateless_common::metrics::RpcMethod) -> &'static 
 /// split for `mega_getWitness` and the reason (error vs timeout) for each failure.
 #[derive(Default)]
 pub struct TraceRpcMetrics;
+
+impl stateless_common::R2Metrics for TraceRpcMetrics {
+    fn on_target(&self, target: &'static str) {
+        record_r2_target(target);
+    }
+
+    fn on_connections(&self, connections: usize) {
+        record_r2_connections(connections);
+    }
+
+    fn on_negotiated_version(&self, version: &'static str) {
+        record_r2_negotiated_version(version);
+    }
+}
 
 impl stateless_common::RpcMetrics for TraceRpcMetrics {
     fn on_rpc_attempt(

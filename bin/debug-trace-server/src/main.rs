@@ -57,7 +57,7 @@ use clap::Parser;
 use eyre::Result;
 use jsonrpsee::server::{Server, ServerConfig, middleware::rpc::RpcServiceBuilder};
 use stateless_common::{
-    R2CountFlag, R2Flag, R2Flags, R2Target, R2TuningFlag, R2WitnessTransport, RedactedSecret,
+    R2Config, R2CountFlag, R2Flag, R2Flags, R2TuningFlag, R2WitnessTransport, RedactedSecret,
     RpcClient, RpcClientConfig, logging::LogArgs, validate_r2_flags,
 };
 use stateless_core::{
@@ -663,7 +663,7 @@ fn r2_flags<'a>(args: &'a Args, tuning: &'a [R2TuningFlag<'a>]) -> R2Flags<'a> {
 
 /// Validates cross-flag invariants that clap cannot express per-field, and reports which R2
 /// target the flags select so the construction below does not have to decide it a second time.
-fn validate_args(args: &Args) -> Result<R2Target> {
+fn validate_args(args: &Args) -> Result<R2Config> {
     // Early, flag-named mirror of `PipelineConfig::validate` (see its doc for the rationale);
     // only meaningful with chain sync, where `blocks_to_keep` becomes the stale-reset
     // threshold.
@@ -686,28 +686,22 @@ fn validate_args(args: &Args) -> Result<R2Target> {
              --witness-endpoint: list the generator once, via the dedicated flag"
         );
     }
-    // Every R2 coherence rule — empty values, target exclusion, leftovers from the other
-    // target, an incomplete credential quad, the Access pair, and tuning flags with nothing to
-    // tune — comes from the shared validator, so the two binaries cannot drift apart on them
-    // again. Unlike the validator, this one checks on every startup: the check predates the
-    // custom-domain work here and operators already rely on a bad `--r2-*` value failing fast
-    // rather than surfacing later as `kind="missing"`, the counter watched for bucket gaps.
-    let tuning = [
-        R2TuningFlag::new("--r2-connect-timeout-ms", args.r2_connect_timeout_ms.is_some()),
-        R2TuningFlag::new(
-            "--r2-max-concurrent-requests",
-            args.r2_max_concurrent_requests.is_some(),
-        ),
-    ];
-    let target = validate_r2_flags(&r2_flags(args, &tuning))?;
-    // The R2 route anchors block age (frontier vs historical) to the local DB tip; without
-    // --data-dir every block would classify as frontier and a genuine bucket hole would
-    // never reach the `kind="missing"` alarm. An operator who configured R2 asked for the
-    // real route — fail closed instead of running a blind approximation.
-    if target != R2Target::None && args.data_dir.is_none() {
+    // Every R2 coherence rule comes from the shared validator, so the two binaries cannot
+    // drift. A bad `--r2-*` value fails fast here rather than surfacing later as
+    // `kind="missing"`. The connect timeout is the one R2 flag those rules never see, so it is
+    // listed here to be named when orphaned.
+    let tuning =
+        [R2TuningFlag::new("--r2-connect-timeout-ms", args.r2_connect_timeout_ms.is_some())];
+    let config = validate_r2_flags(&r2_flags(args, &tuning))?;
+    // R2 rides the witness stage, whose old-block budget clamp and generator-skip routing read
+    // the local DB tip — and so does the band, which takes the higher of that and the tip
+    // observed from request traffic. Without --data-dir each falls to its conservative branch.
+    // An operator who configured R2 asked for the real route, so fail closed rather than run a
+    // degraded one.
+    if config.is_configured() && args.data_dir.is_none() {
         eyre::bail!(
-            "the R2 witness route requires --data-dir: it anchors block age \
-             (frontier vs historical) to the local DB tip"
+            "the R2 witness route requires --data-dir: its banding, budget and routing \
+             all read the local DB tip"
         );
     }
     // Shared with the admin RPC's setter, so the startup gate and the runtime gate cannot
@@ -754,7 +748,7 @@ fn validate_args(args: &Args) -> Result<R2Target> {
         );
     }
     admin_bind_addr(args)?;
-    Ok(target)
+    Ok(config)
 }
 
 /// Parses `--admin-addr`, returning `None` when no admin listener was requested.
@@ -790,7 +784,8 @@ fn admin_bind_addr(args: &Args) -> Result<Option<SocketAddr>> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let r2_target = validate_args(&args)?;
+    let r2_config = validate_args(&args)?;
+    let r2_configured = r2_config.is_configured();
     let _log_guard = args.log.init_tracing()?;
 
     info!(
@@ -815,7 +810,7 @@ async fn main() -> Result<()> {
         witness_timeout_secs = args.witness_timeout,
         witness_old_block_timeout_secs = old_block_witness_timeout_secs(&args),
         witness_local_window = args.witness_local_window,
-        r2_witness_configured = r2_target != R2Target::None,
+        r2_witness_configured = r2_configured,
         tip_buffer = args.tip_buffer,
         response_cache_disabled = args.response_cache_disabled,
         response_cache_max_size = args.response_cache_max_size,
@@ -894,72 +889,32 @@ async fn main() -> Result<()> {
 
     // Direct-from-R2 witness source — unsigned through a Cloudflare custom domain when
     // configured (h2-multiplexed, edge-cacheable), otherwise SigV4-signed against the bare
-    // S3 endpoint. Which one is settled by `validate_args`, whose verdict is matched on below:
-    // clap carries no constraint at all here, so parsing accepts both targets and the shared
-    // validator rejects by name — along with empty values, S3 flags left over from the other
-    // target, an incomplete S3 quad, and the data-dir-less combination. Shares the RPC path's
-    // per-attempt timeout and retry pacing.
+    // S3 endpoint. Which one, and with what values, is the verdict `validate_args` already
+    // reached: clap carries no constraint here, so the shared validator is what rejects a bad
+    // combination, by name. Shares the RPC path's per-attempt timeout and retry pacing.
     let r2_timeouts = stateless_r2::fetch::FetchTimeouts {
         per_attempt: per_attempt_timeout,
         connect: args
             .r2_connect_timeout_ms
             .map_or(stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT, std::time::Duration::from_millis),
     };
-    // Dispatch on the target the shared validator already selected. Re-deriving it from the
-    // flags here would be a second copy of the precedence rule, which is the drift this PR
-    // exists to end; the reads inside each arm rest on what that validator proved.
-    let r2_source = match r2_target {
-        R2Target::None => None,
-        R2Target::CustomDomain { connections } => {
-            let domain = args.r2_custom_domain.as_deref().expect("custom-domain target");
-            let access =
-                args.r2_access_client_id.as_ref().zip(args.r2_access_client_secret.as_ref()).map(
-                    |(client_id, secret)| stateless_r2::fetch::CfAccessCredentials {
-                        client_id: client_id.as_ref().to_string(),
-                        client_secret: secret.as_ref().to_string(),
-                    },
-                );
-            let cf_access = access.is_some();
-            let transport = R2WitnessTransport::new_custom_domain(
-                domain,
-                access,
-                r2_timeouts,
-                rpc_retry,
-                args.r2_max_concurrent_requests,
-                connections,
-                metrics::record_r2_negotiated_version,
-            )?;
-            metrics::record_r2_target(transport.target_label());
-            metrics::record_r2_connections(transport.connections());
-            info!(
-                domain = %transport.origin(),
-                cf_access,
-                connections = transport.connections(),
-                "Historical witness source: R2 (custom domain), RPC chain as fallback"
-            );
-            Some(R2WitnessSource::new(transport))
-        }
-        R2Target::S3 => {
-            let take = |v: &Option<String>| v.clone().expect("S3 target");
-            let transport = R2WitnessTransport::new(
-                args.r2_endpoint.as_deref().expect("S3 target"),
-                take(&args.r2_bucket),
-                take(&args.r2_access_key_id),
-                args.r2_secret_access_key.as_ref().expect("S3 target").as_ref().to_string(),
-                r2_timeouts,
-                rpc_retry,
-                args.r2_max_concurrent_requests,
-            )?;
-            metrics::record_r2_target(transport.target_label());
-            info!(
-                endpoint = %transport.origin(),
-                bucket = args.r2_bucket.as_deref().unwrap_or_default(),
-                "Historical witness source: R2 (direct S3), RPC chain as fallback"
-            );
-            Some(R2WitnessSource::new(transport))
-        }
-    };
-    let r2_witness_source = r2_source.map(Arc::new);
+    let r2_transport = R2WitnessTransport::from_config(
+        r2_config,
+        r2_timeouts,
+        rpc_retry,
+        Arc::new(metrics::TraceRpcMetrics),
+    )?;
+    if let Some(transport) = &r2_transport {
+        info!(
+            target = transport.target_label(),
+            origin = %transport.origin(),
+            bucket = %args.r2_bucket.as_deref().unwrap_or("-"),
+            cf_access = args.r2_access_client_id.is_some(),
+            connections = transport.connections(),
+            "Historical witness source: R2, RPC chain as fallback"
+        );
+    }
+    let r2_witness_source = r2_transport.map(|t| Arc::new(R2WitnessSource::new(t)));
 
     let validator_db = init_validator_db(&args, &rpc_client).await?;
 
