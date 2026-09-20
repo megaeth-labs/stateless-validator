@@ -8,7 +8,9 @@ use super::{
     BlockFetcher, BlockProcessor, DivergenceError, ErrorAction, PipelineConfig, PipelineHooks,
     PipelineOutcome, ProcessedBlock, ReorgResolution, ReorgResolver,
     advancer::{BisectResolver, chain_advancer},
-    block_fetcher, find_divergence_point, run_pipeline,
+    block_fetcher,
+    config::WorkerResult,
+    find_divergence_point, run_pipeline,
     worker::spawn_workers,
 };
 use crate::{ChainStore, DivergenceLookups, StoreResult, db::BlockMeta};
@@ -271,16 +273,17 @@ impl PipelineHooks for BadBlockHooks {
     type Output = BadBlock;
 }
 
-/// Run `chain_advancer` against a stream of `BadBlock` inputs. Modelled on `run_advancer`
-/// but specialized — generalizing the original would cascade through ~6 helper types for
-/// a single test case.
-async fn run_bad_block_advancer(tip: BlockMeta, blocks: Vec<BadBlock>) -> Result<PipelineOutcome> {
+/// Run `chain_advancer` against a stream of items produced by caller-supplied hooks. Modelled
+/// on `run_advancer`, which pins `NoopHooks`; this one varies the hooks, which is what the
+/// bad-block and panicking-hook cases each need.
+async fn run_advancer_with_hooks<H: PipelineHooks>(
+    tip: BlockMeta,
+    hooks: Arc<H>,
+    blocks: Vec<H::Output>,
+) -> Result<PipelineOutcome> {
     let store = Arc::new(MockStore::new(tip.clone()));
     let fetcher = MockFetcher { hashes: HashMap::default() };
-    let hooks = Arc::new(BadBlockHooks);
-    let (tx, rx) = kanal::bounded::<
-        std::result::Result<BadBlock, (Arc<dyn std::error::Error + Send + Sync>, ErrorAction)>,
-    >(16);
+    let (tx, rx) = kanal::bounded::<WorkerResult<H::Output>>(16);
 
     {
         let tx_async = tx.to_async();
@@ -309,22 +312,16 @@ impl PipelineHooks for PanickingHooks {
 #[tokio::test]
 async fn test_chain_advancer_propagates_hook_panics() {
     let tip = make_tip(10);
-    let store = Arc::new(MockStore::new(tip.clone()));
-    let fetcher = MockFetcher { hashes: HashMap::default() };
-    let hooks = Arc::new(PanickingHooks);
     let parent = tip.block_hash;
-    let (tx, rx) = kanal::bounded::<
-        std::result::Result<MockBlock, (Arc<dyn std::error::Error + Send + Sync>, ErrorAction)>,
-    >(16);
-    tx.to_async().send(Ok(make_block(11, parent))).await.unwrap();
 
     // Run it in its own task so the unwind is observable: a `JoinError` that `is_panic()`
     // means the advancer panicked, an `Ok(Err(..))` would mean it swallowed the panic into
     // the error channel.
-    let joined = tokio::spawn(async move {
-        chain_advancer(&fetcher, store, hooks, &BisectResolver, rx, tip, CancellationToken::new())
-            .await
-    })
+    let joined = tokio::spawn(run_advancer_with_hooks(
+        tip,
+        Arc::new(PanickingHooks),
+        vec![make_block(11, parent)],
+    ))
     .await;
     let join_err = match joined {
         Err(e) => e,
@@ -342,7 +339,7 @@ async fn test_chain_advancer_propagates_hook_panics() {
 async fn test_chain_advancer_verify_continuity_failure_halts() {
     let tip = make_tip(10);
     let blocks = vec![BadBlock(make_block(11, make_hash(10)))];
-    let result = run_bad_block_advancer(tip, blocks).await;
+    let result = run_advancer_with_hooks(tip, Arc::new(BadBlockHooks), blocks).await;
     match result.unwrap() {
         PipelineOutcome::Fatal(msg) => {
             assert!(

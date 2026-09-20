@@ -2021,12 +2021,7 @@ mod tests {
     /// A block with no transactions, so [`verify_block_integrity`] reduces to its header-hash
     /// check and the fixture needs no signed transactions.
     fn block_stub(header: alloy_rpc_types_eth::Header) -> Block<Transaction> {
-        Block {
-            header,
-            uncles: Vec::new(),
-            transactions: alloy_rpc_types_eth::BlockTransactions::Hashes(Vec::new()),
-            withdrawals: None,
-        }
+        Block { header, ..Default::default() }
     }
 
     /// A counting `eth_getBlockByNumber` endpoint that serves `header` on every call, in
