@@ -1,0 +1,101 @@
+//! coverage-replayer: derive the minimal set of mainnet blocks that maximizes
+//! mega-evm branch coverage.
+//!
+//! `backfill` replays a block range under LLVM branch instrumentation:
+//! resident worker subprocesses execute each block (reset counters → replay →
+//! capture), and a judge dedups the resulting per-block coverage bitmaps into
+//! "patterns" in a redb store. `set-cover` computes the minimal block set
+//! covering every branch counter ever observed, `report` renders an llvm-cov
+//! summary for that set, `inspect` prints store statistics, and `merge`
+//! combines per-machine shard stores from a distributed scan.
+//!
+//! ## Carrying a scan across a mega-evm bump
+//!
+//! Counter ids — and therefore every stored bitmap — belong to one
+//! instrumented build (see [`store::current_binary_id`]). When mega-evm or
+//! the toolchain moves, `backfill`, `set-cover` and `merge` all refuse the
+//! old store, and a full re-sweep of mainnet history costs weeks. What
+//! survives the bump is the *block numbers*, so the tool carries them over
+//! instead of the bitmaps:
+//!
+//! ```text
+//! inspect --dump-pool pool.txt   (old build; read-only, no binary-id check)
+//!   └─ cat pool*.txt | sort -un > union.txt     (across shards, if sharded)
+//!        └─ backfill --blocks-file union.txt    (new build, fresh data-dir)
+//!             └─ set-cover → report             (new minimal set)
+//! ```
+//!
+//! The pool is the antichain's representatives rather than the previous
+//! minimal set: a cover is minimal only for the universe that produced it and
+//! has no slack once a new build splits patterns the old one merged. `inspect`
+//! is the one subcommand that skips the binary-id check, so the pool can be
+//! extracted from an old store at any time — including long after the bump.
+
+mod backfill;
+mod bitset;
+mod inspect;
+mod llvm;
+mod merge;
+mod profile_rt;
+mod proto;
+mod r2;
+mod report;
+mod setcover;
+mod spool;
+mod store;
+mod worker;
+
+use clap::{Parser, Subcommand};
+use eyre::Result;
+use tracing_subscriber::EnvFilter;
+
+#[derive(Parser, Debug)]
+#[clap(name = "coverage-replayer", version, about)]
+struct Cli {
+    #[clap(subcommand)]
+    cmd: Cmd,
+}
+
+// The variants differ in size because `BackfillArgs` carries the whole
+// fetch/witness/R2 configuration while the others take a data-dir and a flag
+// or two. One `Cmd` is built per process, straight into a `match` — boxing it
+// would only add an allocation and a clap indirection.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Replay a block range, ingest branch-granular coverage bitmaps.
+    Backfill(backfill::BackfillArgs),
+    /// Compute the greedy minimal block set from the pattern store.
+    SetCover(setcover::SetCoverArgs),
+    /// Print an llvm-cov report for the currently selected set.
+    Report(report::ReportArgs),
+    /// Read-only store statistics (works on stores from other builds).
+    Inspect(inspect::InspectArgs),
+    /// Merge per-shard stores (disjoint ranges, same build) into one.
+    Merge(merge::MergeArgs),
+    /// Internal: resident worker subprocess (spawned by backfill).
+    #[clap(hide = true)]
+    InternalWorker(worker::WorkerArgs),
+}
+
+fn main() -> Result<()> {
+    profile_rt::suppress_default_profile();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    match Cli::parse().cmd {
+        Cmd::InternalWorker(args) => worker::run(args),
+        Cmd::Backfill(args) => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(backfill::run(args)),
+        Cmd::SetCover(args) => setcover::run(args),
+        Cmd::Report(args) => report::run(args),
+        Cmd::Inspect(args) => inspect::run(args),
+        Cmd::Merge(args) => merge::run(args),
+    }
+}

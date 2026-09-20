@@ -5,7 +5,7 @@ This file provides guidance to AI agents (e.g., Claude Code, Codex, Cursor, etc.
 ## Project Overview
 
 Stateless validator for MegaETH — validates blocks using SALT witness data without requiring full chain state.
-The workspace contains two binaries: `stateless-validator` (chain-following validator) and `debug-trace-server` (RPC server for debug/trace methods).
+The workspace contains three binaries: `stateless-validator` (chain-following validator), `debug-trace-server` (RPC server for debug/trace methods), and `coverage-replayer` (offline tool that derives the minimal mainnet block set maximizing mega-evm branch coverage).
 See `README.md` for detailed documentation and quickstart.
 
 ## Build & Development Commands
@@ -43,6 +43,7 @@ The project uses nightly `2026-02-03` toolchain (edition 2024, rust-version 1.95
 | `stateless-r2`         | `crates/stateless-r2`         | Shared R2 witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT, and the retrying witness-object GET fetcher over either the signed S3 API or an unsigned Cloudflare custom domain; consumed by mega-reth's uploaders (write) and both binaries' R2 witness sources (read) |
 | `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers (`app.rs` / `runner.rs` / `main.rs`)                                                                                                |
 | `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                                                                                                                            |
+| `coverage-replayer`    | `bin/coverage-replayer`       | Offline coverage tool: replays blocks under LLVM branch instrumentation (`backfill`, by range or `--blocks-file`), dedups per-block coverage bitmaps into patterns, and computes the minimal covering block set (`set-cover` / `report` / `inspect` / `merge`). `inspect --dump-pool` exports the candidate block pool that carries a scan across a mega-evm bump. Requires the instrumented `[profile.coverage]` build |
 
 Additional directories: `test_data/` (integration test fixtures including genesis config), `audits/` (security audit reports).
 
@@ -208,7 +209,7 @@ The background chain-sync prefetch routes by freshness against the last observed
 ## Test Organization
 
 Unit tests are embedded in source files alongside the code they test.
-Integration tests live in `bin/debug-trace-server/tests/` (6 modules: cache_metrics, block_tag, compression, consistency, performance, timing_header) and in `bin/stateless-validator/tests/integration.rs` (CLI parsing, mock-RPC pipeline, mainnet single-block validation).
+Integration tests live in `bin/debug-trace-server/tests/` (6 modules: cache_metrics, block_tag, compression, consistency, performance, timing_header), in `bin/stateless-validator/tests/integration.rs` (CLI parsing, mock-RPC pipeline, mainnet single-block validation), and in `bin/coverage-replayer/tests/replay_fixtures.rs` (worker replay glue over the `test_data/mainnet` fixtures).
 Test data (block JSON files, contract bytecode, witness data) is stored in `test_data/`.
 
 ## Version Control

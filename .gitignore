@@ -7,3 +7,9 @@
 
 # database
 validator-data
+
+# coverage-replayer run data & artifacts (transferred out-of-band, never via git)
+/data/
+*.profraw
+*.pid
+*.log
