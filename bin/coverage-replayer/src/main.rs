@@ -78,6 +78,46 @@ enum Cmd {
     InternalWorker(worker::WorkerArgs),
 }
 
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, Parser, error::ErrorKind};
+
+    use super::*;
+
+    /// `--help` is a clap *feature*, not something the derive gives you: with
+    /// `default-features = false` and the `help` feature trimmed, every
+    /// `--help` becomes `UnknownArgument` and errors lose their usage line.
+    /// This pins the workspace's clap features against that trim.
+    #[test]
+    fn help_is_available_on_the_root_and_on_subcommands() {
+        for argv in [
+            vec!["coverage-replayer", "--help"],
+            vec!["coverage-replayer", "inspect", "--help"],
+            vec!["coverage-replayer", "backfill", "--help"],
+        ] {
+            let err = Cli::try_parse_from(&argv).expect_err("--help exits via an Err");
+            assert_eq!(err.kind(), ErrorKind::DisplayHelp, "{argv:?} produced {err}");
+        }
+    }
+
+    /// The companion half: an unknown flag must name itself and print usage,
+    /// which needs `error-context` and `usage`.
+    #[test]
+    fn unknown_flags_report_the_offender_and_usage() {
+        let err = Cli::try_parse_from(["coverage-replayer", "inspect", "--bogus"])
+            .expect_err("unknown flag must fail");
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        let rendered = err.to_string();
+        assert!(rendered.contains("--bogus"), "error must name the flag: {rendered}");
+        assert!(rendered.contains("Usage:"), "error must carry usage: {rendered}");
+    }
+
+    #[test]
+    fn cli_definition_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+}
+
 fn main() -> Result<()> {
     profile_rt::suppress_default_profile();
     tracing_subscriber::fmt()

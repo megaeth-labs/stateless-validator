@@ -66,7 +66,7 @@ base64 = { version = "0.22", default-features = false }
 bincode = { version = "2.0", features = ["serde", "alloc"], default-features = false }
 bytes = "1.11"
 chrono = { version = "0.4", default-features = false }
-clap = { version = "4.6", features = ["derive", "env", "std"], default-features = false }
+clap = { version = "4.6", features = ["derive", "env", "error-context", "help", "std", "usage"], default-features = false }
 dashmap = { version = "6.1", default-features = false }
 dotenvy = "0.15"
 dyn-clone = "1.0"
