@@ -134,6 +134,20 @@ mod tests {
         assert!(rendered.contains("Usage:"), "error must carry usage: {rendered}");
     }
 
+    /// A pool is made of the antichain, so asking for one while skipping the
+    /// pass that computes it is a contradiction clap must reject up front —
+    /// not a run that silently writes nothing.
+    #[test]
+    fn pool_export_conflicts_with_skipping_the_cover_pass() {
+        let base = ["coverage-replayer", "inspect", "--data-dir", "/d"];
+        let parse = |extra: &[&str]| Cli::try_parse_from(base.iter().chain(extra.iter()));
+
+        let err = parse(&["--no-cover-preview", "--dump-pool", "/p"]).expect_err("must conflict");
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{err}");
+        parse(&["--no-cover-preview"]).expect("alone is fine");
+        parse(&["--dump-pool", "/p"]).expect("alone is fine");
+    }
+
     #[test]
     fn cli_definition_is_well_formed() {
         Cli::command().debug_assert();

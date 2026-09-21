@@ -39,6 +39,13 @@ pub struct InspectArgs {
     /// rebuild far better. Bitmaps die with the build; block numbers do not.
     #[clap(long)]
     pub dump_pool: Option<PathBuf>,
+    /// Skip the antichain statistics and the greedy selection preview. They
+    /// run the real set-cover algorithm, which on a full-history store is
+    /// about half of this command's time; everything else is a single pass
+    /// over the tables. Incompatible with `--dump-pool`, which is made of the
+    /// antichain.
+    #[clap(long, conflicts_with = "dump_pool")]
+    pub no_cover_preview: bool,
     /// With `--dump-pool`, additionally take up to this many other blocks per
     /// antichain pattern. Blocks that share a pattern under this build can
     /// split under another, so a few siblings buy slack against exactly the
@@ -180,7 +187,7 @@ pub fn run(args: InspectArgs) -> Result<()> {
     // ---- set-cover dry run: THE algorithm (select_cover), not a copy — the
     // antichain count and the selection preview cannot drift from a real
     // `set-cover` run (no incumbents, and no fs side effects here).
-    {
+    if !args.no_cover_preview {
         let outcome = select_cover(&snapshot.patterns, &Default::default());
         println!();
         println!(
@@ -382,6 +389,70 @@ mod tests {
             text.lines().take_while(|l| l.starts_with('#')).count() == 6,
             "every header line must be commented: {text}"
         );
+    }
+
+    /// `run` end to end over a real redb store: the pool must come out of the
+    /// same antichain the dry run computes, and `--no-cover-preview` must
+    /// leave the rest of the report working.
+    #[test]
+    fn run_exports_the_pool_from_a_real_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        {
+            let store =
+                Store::open(&data_dir.join("store.redb"), "megaevm:test:fx0", None).unwrap();
+            // 10 ⊃ 20 (dominated); 30 is unrelated. Counters 0..=3, dense = id.
+            for (block_number, bits) in [(10u64, vec![0u32, 1, 2]), (20, vec![0, 1]), (30, vec![3])]
+            {
+                let counters: Vec<(u64, crate::store::CounterInfo)> = bits
+                    .iter()
+                    .map(|&b| {
+                        let info = crate::store::CounterInfo {
+                            dense: b,
+                            symbol: "s".into(),
+                            func_hash: "h".into(),
+                            index: b,
+                        };
+                        (b as u64, info)
+                    })
+                    .collect();
+                store
+                    .commit_block(
+                        block_number,
+                        &block(block_number),
+                        &counters,
+                        Some((block_number, &pat(&bits, block_number))),
+                    )
+                    .unwrap();
+            }
+        }
+
+        let pool = dir.path().join("pool.txt");
+        run(InspectArgs {
+            data_dir: data_dir.clone(),
+            top: 3,
+            dump_pool: Some(pool.clone()),
+            pool_siblings: 0,
+            no_cover_preview: false,
+        })
+        .unwrap();
+        let blocks: Vec<u64> = std::fs::read_to_string(&pool)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(|l| l.parse().unwrap())
+            .collect();
+        assert_eq!(blocks, vec![10, 30], "block 20's pattern is dominated by block 10's");
+
+        run(InspectArgs {
+            data_dir,
+            top: 3,
+            dump_pool: None,
+            pool_siblings: 0,
+            no_cover_preview: true,
+        })
+        .unwrap();
     }
 
     /// Siblings come from the BLOCKS table, and which ones are kept must not
