@@ -30,12 +30,13 @@ pub struct WorkerResponse {
     pub gas_ok: bool,
     pub receipts_root_ok: bool,
     pub logs_bloom_ok: bool,
-    /// Stable 64-bit ids of all non-zero coverage counters (sorted, deduped),
-    /// restricted to symbols matching the configured filter.
+    /// Stable 64-bit ids of all covered items (sorted, deduped) within the
+    /// configured source scope — see `llvm.rs` for what an item is.
     pub counters: Vec<u64>,
-    /// Path of the per-block profraw written by the worker.
-    pub profraw: PathBuf,
-    /// Path of the sidecar TSV (zstd) mapping counter ids to symbol details.
+    /// Path of the per-block sparse profdata written by the worker; the judge
+    /// archives it when the block's pattern is new and not dominated.
+    pub profile: PathBuf,
+    /// Path of the sidecar TSV (zstd) mapping counter ids to item details.
     pub symbols_tsv: PathBuf,
     pub elapsed_ms: u64,
     pub tx_count: u64,

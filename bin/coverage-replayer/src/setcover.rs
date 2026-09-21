@@ -22,7 +22,7 @@ use tracing::info;
 use crate::{
     bitset::BitSet,
     spool::DataDir,
-    store::{Store, current_binary_id, elapsed_stats},
+    store::{Store, current_binary_id},
 };
 
 #[derive(Args, Debug, Clone)]
@@ -36,6 +36,14 @@ pub struct SetCoverArgs {
     /// Previous manifest whose blocks get tie-break preference (churn damping).
     #[clap(long)]
     pub incumbent_manifest: Option<PathBuf>,
+    /// Delete the archived profiles of dominated patterns once the manifest is
+    /// written. Off by default because it is irreversible and reaches past
+    /// this run: a pattern an EARLIER manifest selected can become dominated
+    /// by a later backfill, and deleting its profile breaks `report` on that
+    /// manifest for good — the pattern stays known, so it is never archived
+    /// again.
+    #[clap(long)]
+    pub prune_profiles: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -71,27 +79,9 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
     let binary_id = current_binary_id();
     // No filter check: set-cover consumes whatever universe the store holds.
     let store = Store::open(&dirs.store_path(), &binary_id, None)?;
-    let snapshot = store.load()?;
-
-    // E3 datapoint: worker wall-clock per successfully replayed block.
-    {
-        let mut v: Vec<u64> = snapshot
-            .blocks
-            .values()
-            .filter(|b| matches!(b.status, crate::store::BlockStatus::Ok))
-            .map(|b| b.elapsed_ms)
-            .collect();
-        if let Some((avg, p50, p95, max)) = elapsed_stats(&mut v) {
-            info!(
-                blocks = v.len(),
-                avg_ms = %format!("{avg:.0}"),
-                p50_ms = p50,
-                p95_ms = p95,
-                max_ms = max,
-                "per-block worker time (replay + profraw + bitmap)"
-            );
-        }
-    }
+    // Patterns only: selection never looks at a block record, and the hashes
+    // of the few selected representatives are point lookups afterwards.
+    let patterns = store.load_patterns()?;
 
     let incumbents: HashSet<u64> = match &args.incumbent_manifest {
         Some(path) => {
@@ -104,22 +94,13 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
         None => HashSet::new(),
     };
 
-    info!(
-        patterns = snapshot.patterns.len(),
-        incumbents = incumbents.len(),
-        "computing greedy set cover"
-    );
+    info!(patterns = patterns.len(), incumbents = incumbents.len(), "computing greedy set cover");
 
-    let outcome = select_cover(&snapshot.patterns, &incumbents);
-    // The pruned patterns' archived profiles are dead weight — delete them
-    // (the fs side effect lives here, outside the pure algorithm core).
-    for key in &outcome.pruned_dominated {
-        let _ = std::fs::remove_file(dirs.archived_profile(*key));
-    }
+    let outcome = select_cover(&patterns, &incumbents);
     info!(
         pruned = outcome.pruned_dominated.len(),
-        antichain = snapshot.patterns.len() - outcome.pruned_dominated.len(),
-        "dominated patterns excluded (their archived profiles deleted)"
+        antichain = patterns.len() - outcome.pruned_dominated.len(),
+        "dominated patterns excluded from the candidates"
     );
     // `selected` no longer contains these (select_cover drops them), so the
     // removal set itself is the only place they can be reported from.
@@ -129,16 +110,15 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
 
     let universe_counters = outcome.universe_counters;
     let covered_counters = outcome.covered_counters;
+    let representatives: Vec<u64> = outcome.selected.iter().map(|(_, rep, _)| *rep).collect();
+    let records = store.block_records(&representatives)?;
     let blocks: Vec<ManifestBlock> = outcome
         .selected
         .iter()
         .map(|(key, rep, gain)| {
-            let rec = &snapshot.patterns[key];
-            let hash = snapshot
-                .blocks
-                .get(rep)
-                .map(|b| format!("{:#x}", b.hash))
-                .unwrap_or_else(|| "0x0".into());
+            let rec = &patterns[key];
+            let hash =
+                records.get(rep).map(|b| format!("{:#x}", b.hash)).unwrap_or_else(|| "0x0".into());
             ManifestBlock {
                 number: *rep,
                 hash,
@@ -171,6 +151,17 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
     );
     for b in &manifest.blocks {
         info!(block = b.number, gain = b.gain, bits = b.bits, "selected");
+    }
+
+    // Only after the manifest is durably written: a failure above must not
+    // leave the store with neither the old profiles nor a new manifest.
+    if args.prune_profiles {
+        let removed = outcome
+            .pruned_dominated
+            .iter()
+            .filter(|key| std::fs::remove_file(dirs.archived_profile(**key)).is_ok())
+            .count();
+        info!(removed, "archived profiles of dominated patterns deleted (--prune-profiles)");
     }
     Ok(())
 }

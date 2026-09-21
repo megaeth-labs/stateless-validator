@@ -2,15 +2,19 @@
 //!
 //! All coverage data is namespaced by `binary_id` (a fingerprint of the
 //! instrumented mega-evm build: locked git rev + toolchain/host, see
-//! [`current_binary_id`]) and by the symbol filter: counter ids and dense
-//! indices are only meaningful for one instrumented build, and the filter
-//! defines which counters exist. On mismatch the store refuses to open.
+//! [`current_binary_id`]) and by the universe stamp (what a counter id means
+//! and which sources are in scope, see [`crate::llvm::universe_stamp`]):
+//! counter ids and dense indices are only meaningful for one instrumented
+//! build and one item definition. On mismatch the store refuses to open.
 
 use std::{collections::HashMap, path::Path};
 
 use alloy_primitives::B256;
 use eyre::{Result, ensure};
-use redb::{Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, ReadOnlyDatabase, ReadableDatabase, ReadableTable, ReadableTableMetadata,
+    TableDefinition,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::bitset::BitSet;
@@ -24,12 +28,20 @@ const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard
 const SCHEMA_VERSION: u32 = 1;
 
 /// Info about one coverage counter (id → dense index + provenance).
+///
+/// The three provenance fields are written for humans and never read back by
+/// any logic, which is why their *meaning* could change without a schema
+/// bump: the encoding is positional, so a legacy store (physical counters)
+/// still decodes — there `location` holds a PGO symbol, `kind` a function
+/// hash and `line` a counter index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CounterInfo {
     pub dense: u32,
-    pub symbol: String,
-    pub func_hash: String,
-    pub index: u32,
+    /// `<source path>:<line>:<col>` of the covered item.
+    pub location: String,
+    /// `region`, `branch-true` or `branch-false`.
+    pub kind: String,
+    pub line: u32,
 }
 
 /// One distinct coverage bitmap and its representative block.
@@ -88,11 +100,11 @@ pub struct Store<D = Database> {
 
 impl Store {
     /// Opens (or creates) the store and enforces the coverage namespace:
-    /// `binary_id` always, plus the symbol filter when the caller supplies one
-    /// (backfill/merge do — the filter defines which counters exist, so mixing
-    /// filters in one store would silently blend incompatible universes;
-    /// read-only consumers pass `None` to skip the filter check).
-    pub fn open(path: &Path, binary_id: &str, symbol_filter: Option<&str>) -> Result<Self> {
+    /// `binary_id` always, plus the universe stamp when the caller supplies
+    /// one (backfill/merge do — it defines what a counter id means, so mixing
+    /// stamps in one store would silently blend incompatible universes;
+    /// set-cover passes `None` and consumes whatever universe the store holds).
+    pub fn open(path: &Path, binary_id: &str, universe: Option<&str>) -> Result<Self> {
         let db = Database::create(path)?;
 
         // Ensure all tables exist, then check/stamp namespace metadata.
@@ -116,6 +128,7 @@ impl Store {
                         path.display(),
                     );
                     check_schema_version(&meta, path)?;
+                    check_complete(&meta, path)?;
                 }
                 None => {
                     meta.insert("binary_id", binary_id.as_bytes())?;
@@ -123,22 +136,19 @@ impl Store {
                 }
             }
 
-            if let Some(filter) = symbol_filter {
-                let existing = meta
-                    .get("symbol_filter")?
-                    .map(|guard| String::from_utf8_lossy(guard.value()).into_owned());
-                match existing {
+            if let Some(universe) = universe {
+                match stamped_universe(&meta)? {
                     Some(existing) => {
                         ensure!(
-                            existing == filter,
-                            "store {} was built with --symbol-filter {existing:?}, this run \
-                             uses {filter:?}. The filter defines the counter universe: use a \
-                             fresh data-dir for a different filter.",
+                            existing == universe,
+                            "store {} holds the counter universe {existing:?}, this run \
+                             produces {universe:?}. Counter ids from two universes must never \
+                             share a store: use a fresh data-dir.",
                             path.display(),
                         );
                     }
                     None => {
-                        meta.insert("symbol_filter", filter.as_bytes())?;
+                        meta.insert(UNIVERSE_KEY, universe.as_bytes())?;
                     }
                 }
             }
@@ -184,10 +194,31 @@ impl Store {
 
     /// Bulk-writes a merged snapshot into a fresh store, in batched
     /// transactions. Used by the `merge` subcommand.
+    ///
+    /// The tables are committed batch by batch, so a store interrupted halfway
+    /// is a perfectly valid, correctly stamped database holding a prefix of
+    /// the data — and set-cover would publish a cover of that prefix. The
+    /// marker set here makes every open refuse the store until the last batch
+    /// is in.
     pub fn write_bulk(&self, snapshot: &StoreSnapshot) -> Result<()> {
+        self.set_incomplete(true)?;
         self.write_table(COUNTERS, &snapshot.counters)?;
         self.write_table(PATTERNS, &snapshot.patterns)?;
         self.write_table(BLOCKS, &snapshot.blocks)?;
+        self.set_incomplete(false)
+    }
+
+    fn set_incomplete(&self, incomplete: bool) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut meta = txn.open_table(META)?;
+            if incomplete {
+                meta.insert(INCOMPLETE_KEY, b"bulk write in progress".as_slice())?;
+            } else {
+                meta.remove(INCOMPLETE_KEY)?;
+            }
+        }
+        txn.commit()?;
         Ok(())
     }
 
@@ -250,6 +281,7 @@ impl Store<ReadOnlyDatabase> {
         let txn = store.db.begin_read()?;
         let meta = txn.open_table(META)?;
         check_schema_version(&meta, path)?;
+        check_complete(&meta, path)?;
         let binary_id = meta
             .get("binary_id")?
             .map(|g| String::from_utf8_lossy(g.value()).into_owned())
@@ -261,15 +293,14 @@ impl Store<ReadOnlyDatabase> {
 }
 
 impl<D: ReadableDatabase> Store<D> {
-    /// Reads the stamped symbol filter, if any.
-    pub fn symbol_filter(&self) -> Result<Option<String>> {
+    /// Reads the stamped counter universe, if any (see [`stamped_universe`]).
+    pub fn universe(&self) -> Result<Option<String>> {
         let txn = self.db.begin_read()?;
         let meta = txn.open_table(META)?;
-        let filter =
-            meta.get("symbol_filter")?.map(|g| String::from_utf8_lossy(g.value()).into_owned());
+        let universe = stamped_universe(&meta)?;
         drop(meta);
         drop(txn);
-        Ok(filter)
+        Ok(universe)
     }
 
     /// Loads the whole dispatcher state into memory (counters, patterns, blocks).
@@ -313,24 +344,99 @@ impl<D: ReadableDatabase> Store<D> {
     /// from the whole history spans tens of millions of rows but names only
     /// tens of thousands of them.
     pub fn load_for_blocks(&self, blocks: &[u64]) -> Result<StoreSnapshot> {
+        let requested = self.block_records(blocks)?;
         let txn = self.db.begin_read()?;
-        let t = txn.open_table(BLOCKS)?;
-        let mut requested = HashMap::new();
-        for n in blocks {
-            if let Some(v) = t.get(n)? {
-                let (value, _): (BlockRecord, _) =
-                    bincode::serde::decode_from_slice(v.value(), BINCODE_CONFIG)
-                        .map_err(|e| eyre::eyre!("decode BlockRecord: {e}"))?;
-                requested.insert(*n, value);
-            }
-        }
-        drop(t);
         Ok(StoreSnapshot {
             counters: read_table(&txn, COUNTERS)?,
             patterns: read_table(&txn, PATTERNS)?,
             blocks: requested,
         })
     }
+
+    /// Point lookups into the BLOCKS table; blocks never scanned are absent.
+    pub fn block_records(&self, blocks: &[u64]) -> Result<HashMap<u64, BlockRecord>> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(BLOCKS)?;
+        let mut found = HashMap::new();
+        for n in blocks {
+            if let Some(v) = t.get(n)? {
+                let (value, _): (BlockRecord, _) =
+                    bincode::serde::decode_from_slice(v.value(), BINCODE_CONFIG)
+                        .map_err(|e| eyre::eyre!("decode BlockRecord: {e}"))?;
+                found.insert(*n, value);
+            }
+        }
+        Ok(found)
+    }
+
+    /// Visits every BLOCKS row in ascending block order without holding the
+    /// table: a full-history store has tens of millions of rows, and the
+    /// consumers of a full pass (`inspect`) only ever fold them into totals.
+    pub fn for_each_block(&self, mut visit: impl FnMut(u64, BlockRecord)) -> Result<()> {
+        let txn = self.db.begin_read()?;
+        let t = txn.open_table(BLOCKS)?;
+        for row in t.iter()? {
+            let (k, v) = row?;
+            let (record, _): (BlockRecord, _) =
+                bincode::serde::decode_from_slice(v.value(), BINCODE_CONFIG)
+                    .map_err(|e| eyre::eyre!("decode BlockRecord: {e}"))?;
+            visit(k.value(), record);
+        }
+        Ok(())
+    }
+
+    /// How many counters the store has ever registered.
+    pub fn counter_count(&self) -> Result<usize> {
+        let txn = self.db.begin_read()?;
+        Ok(txn.open_table(COUNTERS)?.len()? as usize)
+    }
+
+    /// The patterns alone — all set-cover selects from. The BLOCKS table is
+    /// one row per block ever scanned; decoding tens of millions of them to
+    /// look up a hundred hashes afterwards is most of a full `load`'s memory.
+    pub fn load_patterns(&self) -> Result<HashMap<u64, PatternRecord>> {
+        let txn = self.db.begin_read()?;
+        read_table(&txn, PATTERNS)
+    }
+}
+
+const INCOMPLETE_KEY: &str = "incomplete";
+
+/// Rejects the output of a bulk write (`merge`) that never finished.
+fn check_complete<T>(meta: &T, path: &Path) -> Result<()>
+where
+    T: redb::ReadableTable<&'static str, &'static [u8]>,
+{
+    ensure!(
+        meta.get(INCOMPLETE_KEY)?.is_none(),
+        "store {} is the output of a merge that did not finish — it holds only part of the \
+         data. Delete it and run the merge again.",
+        path.display(),
+    );
+    Ok(())
+}
+
+const UNIVERSE_KEY: &str = "universe";
+/// The stamp stores carried before counters became evaluated items: the
+/// substring filter on PGO symbol names that scoped the physical counters.
+const LEGACY_SYMBOL_FILTER_KEY: &str = "symbol_filter";
+
+/// The counter universe a store is stamped with. A legacy store has no
+/// universe key, only its symbol filter; it is reported under a label of its
+/// own, so it never compares equal to a current stamp — a run that would mix
+/// physical-counter ids with evaluated-item ids is refused like any other
+/// universe mismatch, while merging legacy shards with each other still works.
+fn stamped_universe<T>(meta: &T) -> Result<Option<String>>
+where
+    T: redb::ReadableTable<&'static str, &'static [u8]>,
+{
+    let read = |key: &str| -> Result<Option<String>> {
+        Ok(meta.get(key)?.map(|g| String::from_utf8_lossy(g.value()).into_owned()))
+    };
+    if let Some(universe) = read(UNIVERSE_KEY)? {
+        return Ok(Some(universe));
+    }
+    Ok(read(LEGACY_SYMBOL_FILTER_KEY)?.map(|filter| format!("physical-counters/v0:{filter}")))
 }
 
 /// Rejects a store whose record encoding predates/postdates this binary —
@@ -517,6 +623,38 @@ mod tests {
         );
     }
 
+    /// A merge killed between batches leaves a valid, correctly stamped redb
+    /// file holding a prefix of the data. Nothing may open it: set-cover
+    /// would otherwise publish a cover of that prefix.
+    #[test]
+    fn interrupted_bulk_write_is_refused_by_every_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.redb");
+        {
+            let store = Store::open(&path, "id", None).unwrap();
+            store.set_incomplete(true).unwrap(); // what write_bulk does first
+        }
+        let err = Store::open(&path, "id", None).err().expect("writer open must fail");
+        assert!(err.to_string().contains("did not finish"), "open: {err}");
+        let err = Store::open_readonly(&path).err().expect("read-only open must fail");
+        assert!(err.to_string().contains("did not finish"), "open_readonly: {err}");
+    }
+
+    /// The marker must be gone once the last table is in.
+    #[test]
+    fn completed_bulk_write_opens_normally() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.redb");
+        let snapshot = StoreSnapshot {
+            counters: HashMap::new(),
+            patterns: [(1, rec(&[0]))].into(),
+            blocks: [(5, block(BlockStatus::Ok))].into(),
+        };
+        Store::open(&path, "id", None).unwrap().write_bulk(&snapshot).unwrap();
+        let (store, _) = Store::open_readonly(&path).expect("a finished merge must open");
+        assert_eq!(store.load().unwrap().blocks.len(), 1);
+    }
+
     #[test]
     fn open_rejects_binary_id_mismatch() {
         let dir = tempfile::tempdir().unwrap();
@@ -527,14 +665,48 @@ mod tests {
     }
 
     #[test]
-    fn open_rejects_symbol_filter_mismatch() {
+    fn open_rejects_universe_mismatch() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store.redb");
-        drop(Store::open(&path, "id", Some("mega_evm")).unwrap());
-        // Same filter reopens fine; a different one is refused.
-        drop(Store::open(&path, "id", Some("mega_evm")).unwrap());
-        let err = Store::open(&path, "id", Some("revm")).err().expect("must fail");
-        assert!(err.to_string().contains("--symbol-filter"), "got: {err}");
+        drop(Store::open(&path, "id", Some("regions+branch-arms/v1:/src")).unwrap());
+        // Same stamp reopens fine; a different one is refused.
+        drop(Store::open(&path, "id", Some("regions+branch-arms/v1:/src")).unwrap());
+        let err = Store::open(&path, "id", Some("regions+branch-arms/v1:/other"))
+            .err()
+            .expect("must fail");
+        assert!(err.to_string().contains("counter universe"), "got: {err}");
+    }
+
+    /// A store filled before counters became evaluated items carries only the
+    /// symbol filter. Its ids are physical counters: a current run must be
+    /// refused rather than append evaluated-item ids next to them, yet the
+    /// store has to stay readable and mergeable with its own kind.
+    #[test]
+    fn legacy_physical_counter_store_is_recognized_and_never_mixed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.redb");
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut meta = txn.open_table(META).unwrap();
+                meta.insert("binary_id", "id".as_bytes()).unwrap();
+                meta.insert("schema_version", SCHEMA_VERSION.to_le_bytes().as_slice()).unwrap();
+                meta.insert("symbol_filter", "mega_evm".as_bytes()).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let err = Store::open(&path, "id", Some("regions+branch-arms/v1:/src"))
+            .err()
+            .expect("a current run must not write into a legacy store");
+        assert!(err.to_string().contains("physical-counters/v0:mega_evm"), "got: {err}");
+
+        let (store, _) = Store::open_readonly(&path).unwrap();
+        assert_eq!(store.universe().unwrap().as_deref(), Some("physical-counters/v0:mega_evm"));
+        drop(store);
+        // Its own label reopens it (what `merge` stamps a legacy output with).
+        drop(Store::open(&path, "id", Some("physical-counters/v0:mega_evm")).unwrap());
     }
 
     #[test]
@@ -572,7 +744,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store.redb");
         {
-            let store = Store::open(&path, "megaevm:aaa:fx1", Some("mega_evm")).unwrap();
+            let store = Store::open(&path, "megaevm:aaa:fx1", Some("universe/x")).unwrap();
             store.commit_block(7, &block(BlockStatus::Ok), &[], None).unwrap();
         }
         let before = std::fs::read(&path).unwrap();
@@ -581,7 +753,7 @@ mod tests {
         {
             let (store, binary_id) = Store::open_readonly(&path).expect("open a read-only file");
             assert_eq!(binary_id, "megaevm:aaa:fx1");
-            assert_eq!(store.symbol_filter().unwrap().as_deref(), Some("mega_evm"));
+            assert_eq!(store.universe().unwrap().as_deref(), Some("universe/x"));
             assert_eq!(store.load().unwrap().blocks.len(), 1);
         }
         assert!(std::fs::read(&path).unwrap() == before, "read-only open modified the store");
@@ -615,9 +787,9 @@ mod tests {
                         n,
                         CounterInfo {
                             dense: n as u32,
-                            symbol: "s".into(),
-                            func_hash: "h".into(),
-                            index: 0,
+                            location: "s".into(),
+                            kind: "h".into(),
+                            line: 0,
                         },
                     )],
                     Some((n, &pattern)),
@@ -649,9 +821,9 @@ mod tests {
                         n,
                         CounterInfo {
                             dense: n as u32,
-                            symbol: "s".into(),
-                            func_hash: "h".into(),
-                            index: 0,
+                            location: "s".into(),
+                            kind: "h".into(),
+                            line: 0,
                         },
                     )],
                     Some((n, &pattern)),

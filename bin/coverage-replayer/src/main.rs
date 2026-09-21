@@ -1,13 +1,18 @@
-//! coverage-replayer: derive the minimal set of mainnet blocks that maximizes
-//! mega-evm branch coverage.
+//! coverage-replayer: derive a small set of mainnet blocks that reproduces all
+//! the mega-evm coverage a scan of the chain observed.
 //!
 //! `backfill` replays a block range under LLVM branch instrumentation:
 //! resident worker subprocesses execute each block (reset counters → replay →
 //! capture), and a judge dedups the resulting per-block coverage bitmaps into
-//! "patterns" in a redb store. `set-cover` computes the minimal block set
-//! covering every branch counter ever observed, `report` renders an llvm-cov
-//! summary for that set, `inspect` prints store statistics, and `merge`
-//! combines per-machine shard stores from a distributed scan.
+//! "patterns" in a redb store. A bit is an *evaluated* coverage item — a
+//! region entry or a branch arm as llvm-cov computes it, not a physical
+//! counter (see `llvm.rs` for why that difference decides correctness).
+//! `set-cover` computes a small block set covering every item ever observed —
+//! greedy, then redundancy-eliminated: no selected block can be dropped, but
+//! the set is not guaranteed to be the smallest possible (that is NP-hard).
+//! `report` renders an llvm-cov summary for that set, `inspect` prints store
+//! statistics, and `merge` combines per-machine shard stores from a
+//! distributed scan.
 //!
 //! ## Carrying a scan across a mega-evm bump
 //!
@@ -65,13 +70,13 @@ struct Cli {
 enum Cmd {
     /// Replay a block range, ingest branch-granular coverage bitmaps.
     Backfill(backfill::BackfillArgs),
-    /// Compute the greedy minimal block set from the pattern store.
+    /// Compute the greedy covering block set from the pattern store.
     SetCover(setcover::SetCoverArgs),
     /// Print an llvm-cov report for the currently selected set.
     Report(report::ReportArgs),
     /// Read-only store statistics (works on stores from other builds).
     Inspect(inspect::InspectArgs),
-    /// Merge per-shard stores (disjoint ranges, same build) into one.
+    /// Merge per-shard stores (same build; shared blocks must agree) into one.
     Merge(merge::MergeArgs),
     /// Internal: resident worker subprocess (spawned by backfill).
     #[clap(hide = true)]

@@ -57,6 +57,10 @@ pub struct BackfillArgs {
     #[clap(long)]
     pub from: Option<u64>,
     /// Last block of the range (inclusive). Requires `--from`.
+    ///
+    /// Scan only blocks that are final. A resumed run skips cleanly replayed
+    /// blocks — and reuses spool entries — by block NUMBER, so a height
+    /// recorded just before a reorg keeps its orphaned hash and coverage.
     #[clap(long)]
     pub to: Option<u64>,
     /// Replay an explicit block list instead of a range: one decimal block
@@ -113,12 +117,19 @@ pub struct BackfillArgs {
     /// Concurrent block fetches.
     #[clap(long, default_value_t = 8)]
     pub fetch_concurrency: usize,
-    /// Substring filter on PGO symbol names (coverage universe scope).
-    #[clap(long, env = "COVERAGE_REPLAYER_SYMBOL_FILTER", default_value = "mega_evm")]
-    pub symbol_filter: String,
+    /// Source directories scoping the coverage universe — the same scope
+    /// `report` measures. Default: the mega-evm checkout this binary was built
+    /// against, found under `$HOME/.cargo/git/checkouts` (which `sudo`
+    /// changes). llvm-cov matches the absolute paths baked in at build time,
+    /// so the sources must sit where they sat for the build.
+    #[clap(long = "source-dir")]
+    pub source_dirs: Vec<PathBuf>,
     /// Explicit llvm-profdata path (default: auto-detect via rustc sysroot).
     #[clap(long)]
     pub llvm_profdata: Option<String>,
+    /// Explicit llvm-cov path (default: auto-detect via rustc sysroot).
+    #[clap(long)]
+    pub llvm_cov: Option<String>,
     /// Interval (seconds) for the "block still executing" progress warning.
     /// Blocks are NEVER timed out or skipped — a stuck block stays visibly
     /// stuck in the log until it completes.
@@ -231,11 +242,21 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         "backfill requires the instrumented build (see [profile.coverage] in Cargo.toml)"
     );
 
+    // Everything a worker needs at startup is validated here first (genesis
+    // now, the source scope and the LLVM tools below): see `load_chain_spec`.
+    crate::worker::load_chain_spec(&args.genesis_file)?;
+
     let dirs = Arc::new(DataDir::new(&args.data_dir));
     dirs.ensure_layout()?;
     let binary_id = current_binary_id();
     info!(binary_id, "opening store");
-    let store = Store::open(&dirs.store_path(), &binary_id, Some(&args.symbol_filter))?;
+    // Resolved once, here: every worker of the run must agree on the scope,
+    // and a scope that cannot work (sources missing, `sudo` moved $HOME) has
+    // to stop the run before any block is replayed.
+    let source_dirs = llvm::resolve_source_dirs(&args.source_dirs)?;
+    let universe = llvm::universe_stamp(&source_dirs);
+    info!(universe, "coverage universe");
+    let store = Store::open(&dirs.store_path(), &binary_id, Some(&universe))?;
     // Writers killed mid-write_atomic leave uniquely-named *.tmp files that
     // would otherwise accumulate forever across crashes. Sweep only AFTER
     // Store::open: its exclusive redb lock guarantees no other backfill is
@@ -250,8 +271,16 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         info!(swept, "removed stale tmp files from a previous crash");
     }
     let snapshot = selection.load_snapshot(&store)?;
-    let llvm_profdata = llvm::find_tool("llvm-profdata", args.llvm_profdata.as_deref())?;
-    info!(llvm_profdata = %llvm_profdata.display(), "llvm tools resolved");
+    let tools = WorkerTools {
+        llvm_profdata: llvm::find_tool("llvm-profdata", args.llvm_profdata.as_deref())?,
+        llvm_cov: llvm::find_tool("llvm-cov", args.llvm_cov.as_deref())?,
+        source_dirs,
+    };
+    info!(
+        llvm_profdata = %tools.llvm_profdata.display(),
+        llvm_cov = %tools.llvm_cov.display(),
+        "llvm tools resolved"
+    );
 
     // R2 witness source: witnesses come from the bucket, so the RPC witness
     // endpoints are unused — feed the data endpoints in as placeholders (the
@@ -345,9 +374,9 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         let tx = judged_tx.clone();
         let dirs = dirs.clone();
         let args = args.clone();
-        let llvm_profdata = llvm_profdata.clone();
+        let tools = tools.clone();
         manager_set.spawn(async move {
-            worker_manager(id, rx, tx, dirs, args, llvm_profdata).await;
+            worker_manager(id, rx, tx, dirs, args, tools).await;
         });
     }
     drop(dispatch_rx);
@@ -403,7 +432,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     drop(dispatch_tx);
 
     // ---- judge (this task) ----
-    let mut judge = JudgeState::new(snapshot, &store, dirs.clone(), total, llvm_profdata.clone());
+    let mut judge = JudgeState::new(snapshot, &store, dirs.clone(), total);
     while let Some(outcome) = judged_rx.recv().await {
         judge.ingest(outcome)?;
     }
@@ -411,6 +440,16 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     fetcher.await.ok();
     while manager_set.join_next().await.is_some() {}
     judge.final_summary();
+    // The judged channel closing only says every task is gone, not that every
+    // block arrived: a fetch task that panicked, or a manager that died,
+    // drops its block with nothing but a log line. Exiting 0 then would let
+    // automation run set-cover over an incomplete universe.
+    ensure!(
+        judge.processed == total,
+        "backfill ended with {} of {total} blocks judged — a fetch or worker task died (see the \
+         errors above). Nothing is lost: re-run the same selection to pick up the rest.",
+        judge.processed,
+    );
     Ok(())
 }
 
@@ -577,13 +616,22 @@ fn code_file_is_valid(path: &std::path::Path, hash: &B256) -> bool {
 /// Owns one resident worker child. A block is NEVER skipped: worker crashes
 /// respawn the child and retry the same block, indefinitely; long-running
 /// blocks are only warned about (see `slow_block_warn_secs`), never killed.
+/// What every worker of a run is launched with, resolved once by the
+/// dispatcher so they cannot disagree.
+#[derive(Clone)]
+struct WorkerTools {
+    llvm_profdata: PathBuf,
+    llvm_cov: PathBuf,
+    source_dirs: Vec<PathBuf>,
+}
+
 async fn worker_manager(
     id: usize,
     rx: kanal::AsyncReceiver<u64>,
     tx: tokio::sync::mpsc::Sender<WorkerResponse>,
     dirs: Arc<DataDir>,
     args: BackfillArgs,
-    llvm_profdata: PathBuf,
+    tools: WorkerTools,
 ) {
     let mut worker: Option<WorkerHandle> = None;
     let warn_after = Duration::from_secs(args.slow_block_warn_secs.max(1));
@@ -593,7 +641,7 @@ async fn worker_manager(
         let mut attempt = 0u64;
         let resp = loop {
             if worker.is_none() {
-                match WorkerHandle::spawn(&args, &dirs, &llvm_profdata) {
+                match WorkerHandle::spawn(&args, &dirs, &tools) {
                     Ok(w) => worker = Some(w),
                     Err(e) => {
                         warn!(worker = id, error = %format!("{e:#}"), "spawn worker failed; retrying in 1s");
@@ -647,9 +695,10 @@ struct WorkerHandle {
 }
 
 impl WorkerHandle {
-    fn spawn(args: &BackfillArgs, dirs: &DataDir, llvm_profdata: &PathBuf) -> Result<Self> {
+    fn spawn(args: &BackfillArgs, dirs: &DataDir, tools: &WorkerTools) -> Result<Self> {
         let exe = std::env::current_exe()?;
-        let mut child = tokio::process::Command::new(exe)
+        let mut command = tokio::process::Command::new(exe);
+        command
             .arg("internal-worker")
             .arg("--genesis-file")
             .arg(&args.genesis_file)
@@ -658,9 +707,13 @@ impl WorkerHandle {
             .arg("--tmp-dir")
             .arg(dirs.tmp())
             .arg("--llvm-profdata")
-            .arg(llvm_profdata)
-            .arg("--symbol-filter")
-            .arg(&args.symbol_filter)
+            .arg(&tools.llvm_profdata)
+            .arg("--llvm-cov")
+            .arg(&tools.llvm_cov);
+        for dir in &tools.source_dirs {
+            command.arg("--source-dir").arg(dir);
+        }
+        let mut child = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
@@ -782,9 +835,8 @@ struct JudgeState<'a> {
     new_patterns: u64,
     started: Instant,
     /// Worker wall-clock per successfully replayed block (spool load + replay
-    /// + profraw + bitmap extraction) — the E3 throughput measurement.
+    /// + profraw + item extraction) — the E3 throughput measurement.
     elapsed_ok_ms: ElapsedSampler,
-    llvm_profdata: PathBuf,
 }
 
 /// Bounded, deterministic reservoir for per-block timings: keeps every
@@ -829,7 +881,6 @@ impl<'a> JudgeState<'a> {
         store: &'a Store,
         dirs: Arc<DataDir>,
         total: u64,
-        llvm_profdata: PathBuf,
     ) -> Self {
         let mut counters = HashMap::with_capacity(snapshot.counters.len());
         let mut next_dense = 0u32;
@@ -859,7 +910,6 @@ impl<'a> JudgeState<'a> {
             new_patterns: 0,
             started: Instant::now(),
             elapsed_ok_ms: ElapsedSampler::new(),
-            llvm_profdata,
         }
     }
 
@@ -919,14 +969,14 @@ impl<'a> JudgeState<'a> {
         if !unknown.is_empty() {
             let details = read_symbols_tsv(&resp.symbols_tsv)?;
             for id in &unknown {
-                let (index, func_hash, symbol) = details
+                let (line, kind, location) = details
                     .get(id)
                     .cloned()
                     .ok_or_else(|| eyre::eyre!("counter {id:#x} missing from symbols tsv"))?;
                 let dense = self.next_dense;
                 self.next_dense += 1;
                 self.counters.insert(*id, dense);
-                new_counters.push((*id, CounterInfo { dense, symbol, func_hash, index }));
+                new_counters.push((*id, CounterInfo { dense, location, kind, line }));
             }
         }
 
@@ -982,30 +1032,26 @@ impl<'a> JudgeState<'a> {
             // committed — a crash in between leaves the block non-Ok, so a
             // re-run re-executes it and re-archives. Committing first would
             // permanently orphan a non-dominated pattern (block never
-            // retried, later same-bitmap profraws deleted, `report` fails on
+            // retried, later same-bitmap profiles deleted, `report` fails on
             // the missing profile). Archive failure aborts (fail-stop),
-            // keeping profraw + spool for forensics.
+            // keeping profile + spool for forensics.
             if !dominated {
-                archive_sparse_profile(
-                    &self.llvm_profdata,
-                    &resp.profraw,
-                    &self.dirs.archived_profile(key),
-                )
-                .wrap_err_with(|| {
-                    format!(
-                        "failed to archive sparse profdata for NEW pattern of block {} \
-                         (profraw kept at {}) — ABORTING before the pattern is committed",
-                        resp.block,
-                        resp.profraw.display(),
-                    )
-                })?;
+                archive_sparse_profile(&resp.profile, &self.dirs.archived_profile(key))
+                    .wrap_err_with(|| {
+                        format!(
+                            "failed to archive sparse profdata for NEW pattern of block {} \
+                             (profile kept at {}) — ABORTING before the pattern is committed",
+                            resp.block,
+                            resp.profile.display(),
+                        )
+                    })?;
             }
             self.patterns.insert(key, rec);
         }
 
         // Shared tail: commit, then clean up (the spool entry goes after the
         // commit — a leftover from a crash in between is harmless junk).
-        let _ = std::fs::remove_file(&resp.profraw);
+        let _ = std::fs::remove_file(&resp.profile);
         let record = block_record(&resp, BlockStatus::Ok, Some(key));
         let rec_ref = &self.patterns[&key];
         self.store.commit_block(resp.block, &record, &new_counters, Some((key, rec_ref)))?;
@@ -1016,6 +1062,7 @@ impl<'a> JudgeState<'a> {
 
     fn cleanup_tmp(&self, block: u64) {
         let _ = std::fs::remove_file(self.dirs.tmp().join(format!("block_{block}.profraw")));
+        let _ = std::fs::remove_file(self.dirs.tmp().join(format!("block_{block}.profdata")));
         let _ =
             std::fs::remove_file(self.dirs.tmp().join(format!("block_{block}.symbols.tsv.zst")));
     }
@@ -1081,40 +1128,16 @@ fn block_record(
     }
 }
 
-/// Converts a promoted block's profraw into a small zstd'd sparse profdata:
-/// `llvm-profdata merge -sparse` drops every zero-count function (and its
-/// name-table entry), which is almost all of them for a single block.
-fn archive_sparse_profile(
-    llvm_profdata: &std::path::Path,
-    profraw: &std::path::Path,
-    dest: &std::path::Path,
-) -> Result<()> {
-    let tmp = profraw.with_extension("profdata");
-    // llvm-profdata creates its -o output before reading inputs, so the tmp
-    // file exists even on failure; clean it up on every exit path.
-    let result = (|| -> Result<()> {
-        let out = std::process::Command::new(llvm_profdata)
-            .arg("merge")
-            .arg("-sparse")
-            .arg(profraw)
-            .arg("-o")
-            .arg(&tmp)
-            .output()
-            .wrap_err("spawn llvm-profdata")?;
-        ensure!(
-            out.status.success(),
-            "llvm-profdata merge -sparse failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let bytes = std::fs::read(&tmp)?;
-        write_atomic(dest, &zstd::encode_all(&bytes[..], 3)?)?;
-        Ok(())
-    })();
-    let _ = std::fs::remove_file(&tmp);
-    result
+/// Archives a promoted block's sparse profdata, zstd'd. The worker already
+/// produced it — `llvm-cov` needs a profdata to evaluate the block's items —
+/// so archiving is a compress-and-rename, with no LLVM tool on this side.
+fn archive_sparse_profile(profile: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    let bytes =
+        std::fs::read(profile).wrap_err_with(|| format!("read profile {}", profile.display()))?;
+    write_atomic(dest, &zstd::encode_all(&bytes[..], 3)?)
 }
 
-/// Parses a worker symbols sidecar: `id_hex \t index \t func_hash \t symbol`.
+/// Parses a worker items sidecar: `id_hex \t line \t kind \t location`.
 fn read_symbols_tsv(path: &std::path::Path) -> Result<HashMap<u64, (u32, String, String)>> {
     let compressed = std::fs::read(path).wrap_err_with(|| format!("read {}", path.display()))?;
     let raw = zstd::decode_all(&compressed[..])?;
@@ -1122,13 +1145,13 @@ fn read_symbols_tsv(path: &std::path::Path) -> Result<HashMap<u64, (u32, String,
     let mut map = HashMap::new();
     for line in text.lines() {
         let mut parts = line.splitn(4, '\t');
-        let (Some(id), Some(index), Some(func_hash), Some(symbol)) =
+        let (Some(id), Some(line), Some(kind), Some(location)) =
             (parts.next(), parts.next(), parts.next(), parts.next())
         else {
             continue;
         };
         let id = u64::from_str_radix(id, 16)?;
-        map.insert(id, (index.parse()?, func_hash.to_string(), symbol.to_string()));
+        map.insert(id, (line.parse()?, kind.to_string(), location.to_string()));
     }
     Ok(map)
 }
@@ -1238,7 +1261,7 @@ mod tests {
     }
 
     fn counter_info(dense: u32) -> CounterInfo {
-        CounterInfo { dense, symbol: "s".into(), func_hash: "h".into(), index: dense }
+        CounterInfo { dense, location: "s".into(), kind: "h".into(), line: dense }
     }
 
     fn seeded_pattern(ids: &[u64], denses: &[u32], rep: u64, elapsed: u64) -> (u64, PatternRecord) {
@@ -1268,7 +1291,7 @@ mod tests {
             receipts_root_ok: true,
             logs_bloom_ok: true,
             counters,
-            profraw: PathBuf::from("/nonexistent/test.profraw"),
+            profile: PathBuf::from("/nonexistent/test.profdata"),
             symbols_tsv: PathBuf::from("/nonexistent/test.tsv.zst"),
             elapsed_ms,
             tx_count: 1,
@@ -1290,7 +1313,7 @@ mod tests {
             patterns: patterns.into_iter().collect(),
             blocks: HashMap::new(),
         };
-        JudgeState::new(snapshot, store, dirs, 10, PathBuf::from("llvm-profdata"))
+        JudgeState::new(snapshot, store, dirs, 10)
     }
 
     #[test]

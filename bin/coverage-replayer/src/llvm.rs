@@ -1,10 +1,24 @@
-//! LLVM tool discovery and `.profraw` → non-zero-counter extraction.
+//! LLVM tool discovery and `.profraw` → covered-item extraction.
 //!
-//! Set cover never needs source mapping: the identity of a coverage counter is
-//! `(PGO function name, function hash, counter index)`, hashed to a stable u64.
-//! With `-Z coverage-options=branch` the branch true/false counters are plain
-//! counters too, so these ids are naturally branch-granular. `llvm-cov` is only
-//! used by the `report` subcommand.
+//! A coverage "counter" in this tool is an *evaluated* coverage item — a
+//! region entry or one arm of a branch, as `llvm-cov` computes it — and NOT a
+//! physical instrumentation counter. The distinction is load-bearing: rustc
+//! minimizes physical counters, so an `if`/`else` gets two of them (entry,
+//! then-arm) and the else-arm exists only as the expression `entry - then`.
+//! Over physical counters a block that takes only the else-arm shows
+//! `{entry}`, a strict subset of a then-only block's `{entry, then}`: it looks
+//! dominated, its profile is never archived, set-cover prunes it, and the
+//! "minimal" set silently loses a branch arm the scan had covered. No
+//! `-Z coverage-options` value turns that minimization off.
+//!
+//! So every block's profile goes through `llvm-cov export`, which evaluates
+//! the counter expressions against the binary's coverage map, and the items
+//! are read from its JSON: region-entry segments and branch arms with a
+//! non-zero count, keyed by source location. That is the same arithmetic
+//! `report` runs, so "covers every item ever observed" means what the report
+//! measures. The export is scoped to source directories — both because those
+//! define the universe, and because an unscoped export of this binary
+//! crashes llvm-cov (instantiation-group handling in some dependency files).
 
 use std::{
     hash::Hasher,
@@ -15,24 +29,106 @@ use std::{
 use eyre::{Context, Result, ensure};
 use rustc_hash::FxHasher;
 
-/// A non-zero counter observed in a profraw, with its stable id.
-#[derive(Debug, Clone)]
-pub struct CounterHit {
-    pub id: u64,
-    pub symbol: String,
-    pub func_hash: String,
-    pub index: u32,
+/// Version tag of the item definition below, stamped into every store (see
+/// [`universe_stamp`]). Bump it whenever the id or the set of item kinds
+/// changes: ids from two definitions must never share a store.
+const ITEM_UNIVERSE: &str = "regions+branch-arms/v1";
+
+/// What a covered item is, for the provenance columns of the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemKind {
+    /// A region-entry segment with a non-zero evaluated count.
+    Region,
+    /// The true arm of a branch region was taken.
+    BranchTrue,
+    /// The false arm of a branch region was taken.
+    BranchFalse,
 }
 
-/// Stable 64-bit id of a counter. FxHasher is seed-free and deterministic
-/// across processes, which is all we need (ids live in one binary namespace).
-pub fn counter_id(symbol: &str, func_hash: &str, index: u32) -> u64 {
+impl ItemKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Region => "region",
+            Self::BranchTrue => "branch-true",
+            Self::BranchFalse => "branch-false",
+        }
+    }
+}
+
+/// A covered item observed in one profile, with its stable id.
+#[derive(Debug, Clone)]
+pub struct CoveredItem {
+    pub id: u64,
+    /// `<path relative to its source dir>:<line>:<col>`.
+    pub location: String,
+    pub kind: ItemKind,
+    pub line: u32,
+}
+
+/// Stable 64-bit id of a covered item. FxHasher is seed-free and
+/// deterministic across processes and machines; the path is relative to its
+/// source dir, so the id does not depend on where a checkout lives.
+fn item_id(kind: ItemKind, rel_path: &str, span: [u32; 4]) -> u64 {
     let mut h = FxHasher::default();
-    h.write(symbol.as_bytes());
+    h.write(kind.as_str().as_bytes());
     h.write_u8(0xff);
-    h.write(func_hash.as_bytes());
-    h.write_u32(index);
+    h.write(rel_path.as_bytes());
+    h.write_u8(0xff);
+    for v in span {
+        h.write_u32(v);
+    }
     h.finish()
+}
+
+/// The universe stamp a store is namespaced by, next to `binary_id`: the item
+/// definition plus the source scope. Two runs whose stamps differ would fill
+/// one store with ids from different universes.
+pub fn universe_stamp(source_dirs: &[PathBuf]) -> String {
+    let mut dirs: Vec<String> = source_dirs.iter().map(|d| d.display().to_string()).collect();
+    dirs.sort();
+    format!("{ITEM_UNIVERSE}:{}", dirs.join(","))
+}
+
+/// Resolves the source scope: the explicit `--source-dir`s, or the mega-evm
+/// checkout this binary was built against. Every directory must exist —
+/// llvm-cov collects the files under it from disk, and a scope that matches
+/// nothing would turn every block into an empty bitmap.
+pub fn resolve_source_dirs(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let dirs = if explicit.is_empty() {
+        vec![detect_mega_evm_checkout().ok_or_else(|| {
+            eyre::eyre!(
+                "could not find the mega-evm checkout for the built-against rev under \
+                 $HOME/.cargo/git/checkouts (note that sudo changes $HOME); pass --source-dir"
+            )
+        })?]
+    } else {
+        explicit.to_vec()
+    };
+    for dir in &dirs {
+        ensure!(dir.is_dir(), "source dir {} does not exist", dir.display());
+    }
+    Ok(dirs)
+}
+
+/// Finds the cargo git checkout of the mega-evm rev this binary was BUILT
+/// against (embedded by build.rs) — no runtime Cargo.lock parsing, no cwd
+/// dependence, and the rev can never disagree with the instrumented build.
+pub fn detect_mega_evm_checkout() -> Option<PathBuf> {
+    let rev: String = env!("COVERAGE_MEGA_EVM_REV").chars().take(7).collect();
+    if rev.len() != 7 {
+        return None;
+    }
+    let home = std::env::var_os("HOME")?;
+    let checkouts = PathBuf::from(home).join(".cargo").join("git").join("checkouts");
+    for entry in std::fs::read_dir(checkouts).ok()?.flatten() {
+        if entry.file_name().to_string_lossy().starts_with("mega-evm-") {
+            let candidate = entry.path().join(&rev);
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 /// Locates an LLVM tool: explicit override → rustc sysroot → `$PATH`.
@@ -74,146 +170,218 @@ pub fn find_tool(name: &str, cli_override: Option<&str>) -> Result<PathBuf> {
     )
 }
 
-/// Runs `llvm-profdata merge --text` on a profraw and returns all non-zero
-/// counters whose PGO symbol name contains `symbol_filter`.
-pub fn extract_nonzero_counters(
+/// Turns one block's profraw into its covered items, leaving the sparse
+/// profdata next to it (returned) for the judge to archive.
+///
+/// `llvm-profdata merge -sparse` drops every zero-count function, which is
+/// almost all of them for a single block; `llvm-cov export` then evaluates
+/// the counter expressions of what is left. `exe` must be the instrumented
+/// binary that wrote the profraw — its coverage map is what gives the
+/// counters their meaning.
+pub fn extract_covered_items(
     llvm_profdata: &Path,
+    llvm_cov: &Path,
+    exe: &Path,
     profraw: &Path,
-    symbol_filter: &str,
-) -> Result<Vec<CounterHit>> {
+    source_dirs: &[PathBuf],
+) -> Result<(Vec<CoveredItem>, PathBuf)> {
+    let profdata = profraw.with_extension("profdata");
     let out = Command::new(llvm_profdata)
         .arg("merge")
-        .arg("--text")
+        .arg("-sparse")
         .arg(profraw)
         .arg("-o")
-        .arg("-")
+        .arg(&profdata)
         .output()
         .wrap_err("spawn llvm-profdata")?;
     ensure!(
         out.status.success(),
-        "llvm-profdata merge --text failed: {}",
+        "llvm-profdata merge -sparse failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let text = String::from_utf8_lossy(&out.stdout);
-    parse_proftext(&text, symbol_filter)
+
+    let out = Command::new(llvm_cov)
+        .arg("export")
+        .arg(exe)
+        .arg(format!("--instr-profile={}", profdata.display()))
+        .arg("--format=text")
+        // The per-function records are most of the output and carry nothing
+        // the file-level segments and branches do not.
+        .arg("--skip-functions")
+        .args(source_dirs)
+        .output()
+        .wrap_err("spawn llvm-cov")?;
+    ensure!(
+        out.status.success(),
+        "llvm-cov export failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let items = parse_export(&String::from_utf8_lossy(&out.stdout), source_dirs)?;
+    Ok((items, profdata))
 }
 
-/// Parses `llvm-profdata merge --text` output.
+/// Parses `llvm-cov export --format=text --skip-functions` output.
 ///
-/// Per-function block layout:
-/// ```text
-/// <PGO name>
-/// # Func Hash:
-/// <hash>
-/// # Num Counters:
-/// <n>
-/// # Counter Values:
-/// <v1>
-/// ...
-/// <vn>
-/// ```
-/// Unknown sections (e.g. MC/DC bitmaps, value profiling) are skipped by the
-/// line scanner because they never match the `# Func Hash:` anchor sequence.
-pub fn parse_proftext(text: &str, symbol_filter: &str) -> Result<Vec<CounterHit>> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut hits = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        if lines[i].trim_end() == "# Func Hash:" {
-            // Symbol is the closest preceding non-empty, non-comment line.
-            let Some(symbol) = lines[..i]
-                .iter()
-                .rev()
-                .map(|l| l.trim())
-                .find(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with(':'))
-            else {
-                i += 1;
-                continue;
-            };
-            let func_hash = lines.get(i + 1).map(|l| l.trim()).unwrap_or_default();
-            if lines.get(i + 2).map(|l| l.trim_end()) != Some("# Num Counters:") {
-                i += 1;
-                continue;
+/// Per file: `segments` are `[line, col, count, has_count, is_region_entry,
+/// is_gap]` and `branches` are `[line, col, end_line, end_col, true_count,
+/// false_count, ...]`. A generic function contributes one branch record per
+/// instantiation at the same source span; the arms are OR-ed across them,
+/// because the item is "this source arm was taken", not which instantiation
+/// took it.
+pub fn parse_export(json: &str, source_dirs: &[PathBuf]) -> Result<Vec<CoveredItem>> {
+    let root: serde_json::Value = serde_json::from_str(json).wrap_err("parse llvm-cov export")?;
+    let files = root["data"][0]["files"]
+        .as_array()
+        .ok_or_else(|| eyre::eyre!("llvm-cov export has no data[0].files"))?;
+    // A scope that matches nothing in the coverage map is a configuration
+    // error, not an empty block: llvm-cov matches the absolute paths baked in
+    // at BUILD time, so the sources must sit where they sat for the build.
+    ensure!(
+        !files.is_empty(),
+        "llvm-cov export matched no source file under {source_dirs:?} — the sources must be at \
+         the path the instrumented binary was built against"
+    );
+
+    let nonzero = |v: &serde_json::Value| {
+        v.as_u64().is_some_and(|n| n > 0) || v.as_f64().is_some_and(|n| n > 0.0)
+    };
+    let coord = |v: &serde_json::Value| v.as_u64().unwrap_or(0) as u32;
+
+    let mut items = Vec::new();
+    for file in files {
+        let filename = file["filename"].as_str().unwrap_or_default();
+        let rel = source_dirs
+            .iter()
+            .find_map(|dir| Path::new(filename).strip_prefix(dir).ok())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| filename.to_string());
+
+        let mut push = |kind: ItemKind, span: [u32; 4]| {
+            items.push(CoveredItem {
+                id: item_id(kind, &rel, span),
+                location: format!("{rel}:{}:{}", span[0], span[1]),
+                kind,
+                line: span[0],
+            });
+        };
+
+        for seg in file["segments"].as_array().into_iter().flatten() {
+            let (has_count, is_entry, is_gap) = (
+                seg[3].as_bool().unwrap_or(false),
+                seg[4].as_bool().unwrap_or(false),
+                seg[5].as_bool().unwrap_or(false),
+            );
+            if has_count && is_entry && !is_gap && nonzero(&seg[2]) {
+                push(ItemKind::Region, [coord(&seg[0]), coord(&seg[1]), 0, 0]);
             }
-            let n: usize = lines
-                .get(i + 3)
-                .and_then(|l| l.trim().parse().ok())
-                .ok_or_else(|| eyre::eyre!("bad Num Counters near line {i}"))?;
-            if lines.get(i + 4).map(|l| l.trim_end()) != Some("# Counter Values:") {
-                i += 1;
-                continue;
+        }
+        for br in file["branches"].as_array().into_iter().flatten() {
+            let span = [coord(&br[0]), coord(&br[1]), coord(&br[2]), coord(&br[3])];
+            if nonzero(&br[4]) {
+                push(ItemKind::BranchTrue, span);
             }
-            let keep = symbol.contains(symbol_filter);
-            for k in 0..n {
-                let Some(v) = lines.get(i + 5 + k) else { break };
-                if keep {
-                    let value: u128 = v.trim().parse().unwrap_or(0);
-                    if value != 0 {
-                        let index = k as u32;
-                        hits.push(CounterHit {
-                            id: counter_id(symbol, func_hash, index),
-                            symbol: symbol.to_string(),
-                            func_hash: func_hash.to_string(),
-                            index,
-                        });
-                    }
-                }
+            if nonzero(&br[5]) {
+                push(ItemKind::BranchFalse, span);
             }
-            i += 5 + n;
-        } else {
-            i += 1;
         }
     }
-    hits.sort_by_key(|h| h.id);
-    hits.dedup_by_key(|h| h.id);
-    Ok(hits)
+    items.sort_by_key(|i| i.id);
+    items.dedup_by_key(|i| i.id);
+    Ok(items)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
-    const SAMPLE: &str = "\
-# IR level Instrumentation Flag
-:ir
-_RNvCsabc_8mega_evm7branchy
-# Func Hash:
-1234567890
-# Num Counters:
-4
-# Counter Values:
-10
-0
-3
-0
+    // Real `llvm-cov export` output (LLVM 22, export format 3.1.0) of one
+    // `if x > 5 { .. } else { .. }` function, run once per arm.
+    const THEN_ONLY: &str = include_str!("../tests/data/export_then_only.json");
+    const ELSE_ONLY: &str = include_str!("../tests/data/export_else_only.json");
 
-_RNvCsdef_5other3foo
-# Func Hash:
-42
-# Num Counters:
-2
-# Counter Values:
-1
-1
-";
+    fn scope() -> Vec<PathBuf> {
+        vec![PathBuf::from("/tmp/covfix/src")]
+    }
+
+    fn ids(items: &[CoveredItem]) -> HashSet<u64> {
+        items.iter().map(|i| i.id).collect()
+    }
+
+    /// THE property physical counters violated. The two runs execute the same
+    /// function through different arms; over physical counters the else-only
+    /// run is `{entry}` ⊂ `{entry, then}` and gets pruned as dominated. Over
+    /// evaluated items each run must hold something the other lacks.
+    #[test]
+    fn opposite_branch_arms_never_dominate_each_other() {
+        let then_only = parse_export(THEN_ONLY, &scope()).unwrap();
+        let else_only = parse_export(ELSE_ONLY, &scope()).unwrap();
+        let (a, b) = (ids(&then_only), ids(&else_only));
+        assert!(!a.is_subset(&b) && !b.is_subset(&a), "one arm's items dominate the other's");
+
+        let arms = |items: &[CoveredItem]| -> Vec<ItemKind> {
+            items.iter().filter(|i| i.kind != ItemKind::Region).map(|i| i.kind).collect()
+        };
+        assert_eq!(arms(&then_only), vec![ItemKind::BranchTrue]);
+        assert_eq!(arms(&else_only), vec![ItemKind::BranchFalse]);
+    }
+
+    /// Only region ENTRIES with a count are items: the `[3,13,0,false,..]`
+    /// style closing segments and the zero-count arm's regions are not.
+    #[test]
+    fn counts_region_entries_with_a_nonzero_count_only() {
+        let then_only = parse_export(THEN_ONLY, &scope()).unwrap();
+        let regions: Vec<&str> = then_only
+            .iter()
+            .filter(|i| i.kind == ItemKind::Region)
+            .map(|i| i.location.as_str())
+            .collect();
+        // Line 3: the condition (col 8) and the then-arm (cols 16, 18) ran;
+        // the else-arm's regions (cols 43, 45) have count 0 and must be absent.
+        for expected in ["t.rs:3:8", "t.rs:3:16", "t.rs:3:18"] {
+            assert!(regions.contains(&expected), "missing {expected} in {regions:?}");
+        }
+        for absent in ["t.rs:3:43", "t.rs:3:45", "t.rs:3:13"] {
+            assert!(!regions.contains(&absent), "{absent} must not be an item: {regions:?}");
+        }
+    }
+
+    /// Ids must not depend on where the checkout lives, or shards scanned
+    /// under different homes could not be merged.
+    #[test]
+    fn ids_are_relative_to_the_source_dir() {
+        let moved = THEN_ONLY.replace("/tmp/covfix/src", "/somewhere/else/entirely");
+        let here = parse_export(THEN_ONLY, &scope()).unwrap();
+        let there = parse_export(&moved, &[PathBuf::from("/somewhere/else/entirely")]).unwrap();
+        assert_eq!(ids(&here), ids(&there));
+        assert!(here.iter().all(|i| i.location.starts_with("t.rs:")), "{:?}", here[0].location);
+    }
+
+    /// A generic function exports one branch record per instantiation at the
+    /// same span; an arm any instantiation took is one covered item.
+    #[test]
+    fn branch_arms_are_merged_across_instantiations() {
+        let json = r#"{"data":[{"files":[{"filename":"/s/a.rs","segments":[],
+            "branches":[[7,4,7,9,0,3,0,0,4],[7,4,7,9,2,0,1,1,4],[7,4,7,9,0,5,2,2,4]]}]}]}"#;
+        let items = parse_export(json, &[PathBuf::from("/s")]).unwrap();
+        let mut kinds: Vec<ItemKind> = items.iter().map(|i| i.kind).collect();
+        kinds.sort_by_key(|k| k.as_str());
+        assert_eq!(kinds, vec![ItemKind::BranchFalse, ItemKind::BranchTrue]);
+    }
+
+    /// A scope matching nothing is a misconfiguration (sources not at the
+    /// build-time path), and must not pass for a block that covered nothing.
+    #[test]
+    fn empty_file_list_is_an_error_not_an_empty_block() {
+        let err = parse_export(r#"{"data":[{"files":[]}]}"#, &scope()).expect_err("must fail");
+        assert!(err.to_string().contains("matched no source file"), "{err}");
+    }
 
     #[test]
-    fn parses_and_filters() {
-        let hits = parse_proftext(SAMPLE, "mega_evm").unwrap();
-        assert_eq!(hits.len(), 2);
-        let indices: Vec<u32> = {
-            let mut v: Vec<u32> = hits.iter().map(|h| h.index).collect();
-            v.sort();
-            v
-        };
-        assert_eq!(indices, vec![0, 2]);
-        for h in &hits {
-            assert!(h.symbol.contains("mega_evm"));
-            assert_eq!(h.id, counter_id(&h.symbol, &h.func_hash, h.index));
-        }
-
-        // No filter → both functions counted.
-        let all = parse_proftext(SAMPLE, "").unwrap();
-        assert_eq!(all.len(), 4);
+    fn universe_stamp_is_order_independent_and_versioned() {
+        let (a, b) = (PathBuf::from("/x/a"), PathBuf::from("/x/b"));
+        assert_eq!(universe_stamp(&[a.clone(), b.clone()]), universe_stamp(&[b, a]));
+        assert_eq!(universe_stamp(&[PathBuf::from("/x")]), "regions+branch-arms/v1:/x");
     }
 }

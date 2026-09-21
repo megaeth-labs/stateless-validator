@@ -33,7 +33,8 @@ use crate::{
     bitset::BitSet,
     spool::DataDir,
     store::{
-        CounterInfo, PatternRecord, Store, StoreSnapshot, current_binary_id, resolve_pattern_slot,
+        BlockStatus, CounterInfo, PatternRecord, Store, StoreSnapshot, current_binary_id,
+        resolve_pattern_slot,
     },
 };
 
@@ -63,7 +64,7 @@ pub fn run(args: MergeArgs) -> Result<()> {
     let expected_id = current_binary_id();
 
     let mut shard_snaps = Vec::with_capacity(args.shards.len());
-    let mut shard_filter: Option<String> = None;
+    let mut shard_universe: Option<String> = None;
     for (i, shard) in args.shards.iter().enumerate() {
         let dirs = DataDir::new(shard);
         let (store, binary_id) = Store::open_readonly(&dirs.store_path())
@@ -74,15 +75,17 @@ pub fn run(args: MergeArgs) -> Result<()> {
              all shards must be produced by the same instrumented build",
             shard.display(),
         );
-        // All shards must share one symbol filter — it defines the universe.
-        let filter = store.symbol_filter()?;
+        // All shards must share one universe stamp — it defines what a
+        // counter id means. Legacy physical-counter shards carry a label of
+        // their own, so they merge with each other and never with current ones.
+        let universe = store.universe()?;
         if i == 0 {
-            shard_filter = filter;
+            shard_universe = universe;
         } else {
             ensure!(
-                filter == shard_filter,
-                "shard {} was built with symbol filter {filter:?}, expected {shard_filter:?}; \
-                 shards with different filters hold incompatible universes",
+                universe == shard_universe,
+                "shard {} holds the counter universe {universe:?}, expected \
+                 {shard_universe:?}; ids from two universes cannot be merged",
                 shard.display(),
             );
         }
@@ -110,7 +113,7 @@ pub fn run(args: MergeArgs) -> Result<()> {
         "merge complete; writing output store"
     );
 
-    let out_store = Store::open(&out_dirs.store_path(), &expected_id, shard_filter.as_deref())?;
+    let out_store = Store::open(&out_dirs.store_path(), &expected_id, shard_universe.as_deref())?;
     out_store.write_bulk(&merged)?;
     info!(
         out = %out_dirs.store_path().display(),
@@ -226,17 +229,50 @@ fn merge_snapshots(shards: Vec<(String, StoreSnapshot)>) -> Result<StoreSnapshot
             }
         }
 
-        // Blocks: shards scan disjoint ranges, so a plain union. A duplicate
-        // (should not happen) carries an identical record; last write wins.
+        // Blocks: shards are meant to scan disjoint ranges, but hand-split
+        // scans overlap at the seams. A height seen twice is fine exactly when
+        // both shards saw the same block do the same thing; then it is one
+        // block, and the pattern hit each shard counted for it is one hit.
         // Pattern references follow their pattern through any re-keying; an
         // unknown key (block committed, pattern lost — cannot happen with the
         // archive-before-commit ordering) is kept verbatim rather than
         // silently detached.
+        let mut duplicates = 0u64;
         for (num, mut rec) in snap.blocks {
             if let Some(pk) = rec.pattern_key {
                 rec.pattern_key = Some(key_map.get(&pk).copied().unwrap_or(pk));
             }
-            blocks.insert(num, rec);
+            let Some(prev) = blocks.get(&num) else {
+                blocks.insert(num, rec);
+                continue;
+            };
+            let (prev_ok, rec_ok) = (prev.status == BlockStatus::Ok, rec.status == BlockStatus::Ok);
+            if prev_ok && rec_ok {
+                // Two clean replays of one height that disagree are two
+                // different blocks (a reorg between the scans) or a
+                // nondeterministic replay. Either way the manifest could name
+                // a height whose coverage it cannot reproduce.
+                ensure!(
+                    prev.hash == rec.hash && prev.pattern_key == rec.pattern_key,
+                    "block {num} is in shard {label} and in an earlier shard with different \
+                     results (hash {:#x} vs {:#x}, pattern {:?} vs {:?}) — overlapping shards \
+                     must agree on the blocks they share",
+                    rec.hash,
+                    prev.hash,
+                    rec.pattern_key,
+                    prev.pattern_key,
+                );
+                if let Some(pattern) = rec.pattern_key.and_then(|pk| patterns.get_mut(&pk)) {
+                    pattern.hit_count = pattern.hit_count.saturating_sub(1).max(1);
+                }
+                duplicates += 1;
+            } else if rec_ok {
+                // A quarantined record loses to a clean replay of the height.
+                blocks.insert(num, rec);
+            }
+        }
+        if duplicates > 0 {
+            warn!(shard = %label, duplicates, "blocks also present in an earlier shard — folded");
         }
     }
 
@@ -254,10 +290,10 @@ mod tests {
     use alloy_primitives::B256;
 
     use super::*;
-    use crate::store::{BlockRecord, BlockStatus, pattern_base_key};
+    use crate::store::{BlockRecord, pattern_base_key};
 
     fn info(dense: u32, sym: &str, idx: u32) -> CounterInfo {
-        CounterInfo { dense, symbol: sym.into(), func_hash: "h".into(), index: idx }
+        CounterInfo { dense, location: sym.into(), kind: "h".into(), line: idx }
     }
 
     fn pat(bitmap: BitSet, rep: u64, ms: u64, hits: u64) -> PatternRecord {
@@ -281,6 +317,60 @@ mod tests {
             tx_count: 0,
             elapsed_ms: ms,
             error: None,
+        }
+    }
+
+    fn one_pattern_shard(block: u64, record: BlockRecord, hits: u64) -> StoreSnapshot {
+        let key = pattern_base_key(&[100]);
+        StoreSnapshot {
+            counters: [(100, info(0, "a", 0))].into(),
+            patterns: [(key, pat(BitSet::from_indices([0]), block, 50, hits))].into(),
+            blocks: [(block, BlockRecord { pattern_key: Some(key), ..record })].into(),
+        }
+    }
+
+    /// Hand-split scans overlap at the seams. The same block replayed the same
+    /// way by two shards is one block — and one pattern hit, not two.
+    #[test]
+    fn identical_duplicate_block_is_folded_and_counted_once() {
+        let a = one_pattern_shard(7, blk(1, 50), 4);
+        let b = one_pattern_shard(7, blk(1, 90), 2);
+        let merged = merge_snapshots(vec![("A".into(), a), ("B".into(), b)]).expect("merge");
+        assert_eq!(merged.blocks.len(), 1);
+        let pattern = merged.patterns.values().next().unwrap();
+        assert_eq!(pattern.hit_count, 4 + 2 - 1, "the shared block must count once");
+    }
+
+    /// Same height, different hash: two forks. The manifest would name a
+    /// height whose coverage it cannot reproduce, so the merge must stop.
+    #[test]
+    fn conflicting_duplicate_block_is_rejected() {
+        let a = one_pattern_shard(7, blk(1, 50), 1);
+        let b = one_pattern_shard(7, blk(2, 50), 1);
+        let err = merge_snapshots(vec![("A".into(), a), ("B".into(), b)])
+            .err()
+            .expect("conflicting duplicates must fail");
+        assert!(err.to_string().contains("block 7"), "got: {err}");
+        assert!(err.to_string().contains("shard B"), "got: {err}");
+    }
+
+    /// A shard that quarantined a height another shard replayed cleanly must
+    /// not shadow the clean record, whichever order the shards come in.
+    #[test]
+    fn clean_record_wins_over_a_quarantined_one() {
+        let quarantined =
+            || BlockRecord { status: BlockStatus::Error, error: Some("boom".into()), ..blk(9, 0) };
+        for clean_first in [true, false] {
+            let clean = one_pattern_shard(7, blk(1, 50), 1);
+            let mut bad = one_pattern_shard(8, blk(3, 50), 1);
+            bad.blocks.insert(7, BlockRecord { pattern_key: None, ..quarantined() });
+            let shards = if clean_first {
+                vec![("clean".into(), clean), ("bad".into(), bad)]
+            } else {
+                vec![("bad".into(), bad), ("clean".into(), clean)]
+            };
+            let merged = merge_snapshots(shards).expect("merge");
+            assert_eq!(merged.blocks[&7].status, BlockStatus::Ok, "clean_first={clean_first}");
         }
     }
 

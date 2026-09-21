@@ -38,7 +38,7 @@ The workspace contains three binaries and five library crates:
 | `stateless-r2`         | `crates/stateless-r2`         | Shared R2 witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT, and the retrying witness-object GET fetcher over either the signed S3 API or an unsigned Cloudflare custom domain; consumed by mega-reth's witness uploaders (write), this repo's validator, and the trace server's witness source (read) |
 | `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers                                                                                                                                 |
 | `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                                                                                                                        |
-| `coverage-replayer`    | `bin/coverage-replayer`       | Offline coverage tool: replays mainnet blocks under LLVM branch instrumentation and derives the minimal block set maximizing mega-evm branch coverage |
+| `coverage-replayer`    | `bin/coverage-replayer`       | Offline coverage tool: replays mainnet blocks under LLVM branch instrumentation and derives a small (greedy) block set that reproduces all the mega-evm coverage the scan observed |
 
 Additional directories: `test_data/` (integration test fixtures including genesis config), `audits/` (security audit reports).
 

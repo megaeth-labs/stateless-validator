@@ -16,7 +16,7 @@ use crate::{
     bitset::BitSet,
     setcover::{CoverOutcome, select_cover},
     spool::DataDir,
-    store::{BlockStatus, Store, StoreSnapshot, elapsed_stats},
+    store::{BlockStatus, PatternRecord, Store, elapsed_stats},
 };
 
 #[derive(Args, Debug, Clone)]
@@ -57,53 +57,54 @@ pub struct InspectArgs {
 pub fn run(args: InspectArgs) -> Result<()> {
     let dirs = DataDir::new(&args.data_dir);
     let (store, binary_id) = Store::open_readonly(&dirs.store_path())?;
-    let snapshot = store.load()?;
+    let patterns = store.load_patterns()?;
+    let counter_count = store.counter_count()?;
 
     println!("binary_id: {binary_id}");
     println!();
 
-    // ---- blocks ----
-    let total = snapshot.blocks.len();
+    // ---- blocks: one streaming pass, folded into totals. The table is one
+    // row per block ever scanned; nothing here needs them all at once.
+    let mut total = 0usize;
     let mut ok = 0usize;
-    let mut divergent = 0usize;
-    let mut errors = 0usize;
-    let mut elapsed: Vec<u64> = Vec::with_capacity(total);
+    let mut elapsed: Vec<u64> = Vec::new();
     let mut txs = 0u64;
     let mut gas = 0u128;
-    for rec in snapshot.blocks.values() {
-        match rec.status {
-            BlockStatus::Ok => {
-                ok += 1;
-                elapsed.push(rec.elapsed_ms);
-                txs += rec.tx_count;
-                gas += rec.gas_used as u128;
-            }
-            BlockStatus::Divergent => divergent += 1,
-            BlockStatus::Error => errors += 1,
+    let mut quarantined: Vec<(u64, BlockStatus, String)> = Vec::new();
+    store.for_each_block(|number, rec| {
+        total += 1;
+        if rec.status == BlockStatus::Ok {
+            ok += 1;
+            elapsed.push(rec.elapsed_ms);
+            txs += rec.tx_count;
+            gas += rec.gas_used as u128;
+        } else {
+            quarantined.push((number, rec.status, rec.error.unwrap_or_default()));
         }
-    }
+    })?;
+    let divergent = quarantined.iter().filter(|q| q.1 == BlockStatus::Divergent).count();
+    let errors = quarantined.len() - divergent;
     println!("blocks: total={total} ok={ok} divergent={divergent} error={errors}");
     if let Some((avg, p50, p95, max)) = elapsed_stats(&mut elapsed) {
         println!("worker elapsed_ms: avg={avg:.0} p50={p50} p95={p95} max={max}");
         println!("txs total={txs}  gas total={gas}");
     }
-    if errors > 0 || divergent > 0 {
+    drop(elapsed);
+    if !quarantined.is_empty() {
         println!("quarantined blocks:");
-        for (n, rec) in &snapshot.blocks {
-            if rec.status != BlockStatus::Ok {
-                println!("  {n}: {:?} {}", rec.status, rec.error.as_deref().unwrap_or(""));
-            }
+        for (n, status, error) in &quarantined {
+            println!("  {n}: {status:?} {error}");
         }
     }
     println!();
 
     // ---- patterns ----
     let mut universe = BitSet::new();
-    for rec in snapshot.patterns.values() {
+    for rec in patterns.values() {
         universe.union_with(&rec.bitmap);
     }
     let universe_bits = universe.count_ones();
-    let mut hits: Vec<(&u64, &crate::store::PatternRecord)> = snapshot.patterns.iter().collect();
+    let mut hits: Vec<(&u64, &crate::store::PatternRecord)> = patterns.iter().collect();
     let singletons = hits.iter().filter(|(_, r)| r.hit_count == 1).count();
     let bits: Vec<u64> = hits.iter().map(|(_, r)| r.bits).collect();
     let (bits_min, bits_max) = (bits.iter().min().copied(), bits.iter().max().copied());
@@ -114,7 +115,7 @@ pub fn run(args: InspectArgs) -> Result<()> {
         singletons,
         100.0 * singletons as f64 / hits.len().max(1) as f64,
         universe_bits,
-        snapshot.counters.len(),
+        counter_count,
     );
     println!(
         "pattern bits: min={} avg={bits_avg:.0} max={}",
@@ -134,7 +135,7 @@ pub fn run(args: InspectArgs) -> Result<()> {
 
     // ---- counter rarity: how fragile is the universe? ----
     // Dense indices are contiguous, so a Vec beats a HashMap here.
-    let mut coverage_count: Vec<u32> = vec![0; snapshot.counters.len()];
+    let mut coverage_count: Vec<u32> = vec![0; counter_count];
     for (_, rec) in &hits {
         for dense in rec.bitmap.iter_ones() {
             if let Some(c) = coverage_count.get_mut(dense as usize) {
@@ -152,7 +153,7 @@ pub fn run(args: InspectArgs) -> Result<()> {
     // ---- growth curve: patterns & universe by first-seen block ----
     {
         let mut by_first: Vec<(&crate::store::PatternRecord, u64)> =
-            snapshot.patterns.values().map(|r| (r, r.first_block)).collect();
+            patterns.values().map(|r| (r, r.first_block)).collect();
         by_first.sort_by_key(|(_, fb)| *fb);
         if let (Some((_, lo)), Some((_, hi))) = (by_first.first(), by_first.last()) {
             let (lo, hi) = (*lo, (*hi).max(lo + 1));
@@ -188,19 +189,19 @@ pub fn run(args: InspectArgs) -> Result<()> {
     // antichain count and the selection preview cannot drift from a real
     // `set-cover` run (no incumbents, and no fs side effects here).
     if !args.no_cover_preview {
-        let outcome = select_cover(&snapshot.patterns, &Default::default());
+        let outcome = select_cover(&patterns, &Default::default());
         println!();
         println!(
             "antichain: {} of {} patterns are strictly dominated ({:.1}%) — prunable \
              along with their archived profiles",
             outcome.pruned_dominated.len(),
-            snapshot.patterns.len(),
-            100.0 * outcome.pruned_dominated.len() as f64 / snapshot.patterns.len().max(1) as f64
+            patterns.len(),
+            100.0 * outcome.pruned_dominated.len() as f64 / patterns.len().max(1) as f64
         );
         println!();
         println!("greedy selection preview (matches a real set-cover run, no incumbents):");
         for (key, rep, gain) in &outcome.selected {
-            println!("  {rep:>12}  gain={gain:<6} bits={}", snapshot.patterns[key].bits);
+            println!("  {rep:>12}  gain={gain:<6} bits={}", patterns[key].bits);
         }
         println!(
             "  => {} blocks cover {}/{}",
@@ -210,7 +211,9 @@ pub fn run(args: InspectArgs) -> Result<()> {
         );
 
         if let Some(path) = &args.dump_pool {
-            let written = write_pool(path, &snapshot, &outcome, args.pool_siblings, &binary_id)?;
+            let siblings = collect_siblings(&store, &patterns, &outcome, args.pool_siblings)?;
+            let written =
+                write_pool(path, &patterns, &outcome, &siblings, args.pool_siblings, &binary_id)?;
             println!();
             println!("candidate pool: {written} blocks written to {}", path.display());
         }
@@ -243,38 +246,17 @@ pub fn run(args: InspectArgs) -> Result<()> {
 /// its own shard's antichain), so the union errs toward keeping blocks.
 fn write_pool(
     path: &Path,
-    snapshot: &StoreSnapshot,
+    patterns: &HashMap<u64, PatternRecord>,
     outcome: &CoverOutcome,
-    siblings: usize,
+    siblings: &HashMap<u64, Vec<u64>>,
+    siblings_per_pattern: usize,
     binary_id: &str,
 ) -> Result<usize> {
     let dominated: HashSet<u64> = outcome.pruned_dominated.iter().copied().collect();
-    let antichain: Vec<u64> =
-        snapshot.patterns.keys().copied().filter(|k| !dominated.contains(k)).collect();
+    let antichain: Vec<u64> = patterns.keys().copied().filter(|k| !dominated.contains(k)).collect();
 
-    let mut blocks: BTreeSet<u64> =
-        antichain.iter().map(|k| snapshot.patterns[k].representative).collect();
-
-    if siblings > 0 {
-        let keep: HashSet<u64> = antichain.iter().copied().collect();
-        let mut extra: HashMap<u64, Vec<u64>> = HashMap::new();
-        for (number, rec) in &snapshot.blocks {
-            if rec.status != BlockStatus::Ok {
-                continue;
-            }
-            let Some(key) = rec.pattern_key else { continue };
-            if !keep.contains(&key) || snapshot.patterns[&key].representative == *number {
-                continue;
-            }
-            extra.entry(key).or_default().push(*number);
-        }
-        for mut candidates in extra.into_values() {
-            // Sort before truncating: which siblings a pool keeps must not
-            // depend on HashMap iteration order.
-            candidates.sort_unstable();
-            blocks.extend(candidates.into_iter().take(siblings));
-        }
-    }
+    let mut blocks: BTreeSet<u64> = antichain.iter().map(|k| patterns[k].representative).collect();
+    blocks.extend(siblings.values().flatten());
 
     let generated_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -286,11 +268,11 @@ fn write_pool(
     out.push_str(&format!("# generated_at_unix: {generated_at}\n"));
     out.push_str(&format!(
         "# patterns: {} total, {} antichain, {} dominated\n",
-        snapshot.patterns.len(),
+        patterns.len(),
         antichain.len(),
         dominated.len(),
     ));
-    out.push_str(&format!("# siblings_per_pattern: {siblings}\n"));
+    out.push_str(&format!("# siblings_per_pattern: {siblings_per_pattern}\n"));
     out.push_str(&format!("# blocks: {}\n", blocks.len()));
     for n in &blocks {
         out.push_str(&format!("{n}\n"));
@@ -299,10 +281,44 @@ fn write_pool(
     Ok(blocks.len())
 }
 
+/// Up to `per_pattern` blocks of each antichain pattern besides its
+/// representative — always the lowest-numbered ones, so a pool does not
+/// depend on iteration order. One streaming pass over BLOCKS, holding at most
+/// `per_pattern` numbers per pattern; skipped entirely for the default of 0.
+fn collect_siblings(
+    store: &Store<redb::ReadOnlyDatabase>,
+    patterns: &HashMap<u64, PatternRecord>,
+    outcome: &CoverOutcome,
+    per_pattern: usize,
+) -> Result<HashMap<u64, Vec<u64>>> {
+    let mut siblings: HashMap<u64, Vec<u64>> = HashMap::new();
+    if per_pattern == 0 {
+        return Ok(siblings);
+    }
+    let dominated: HashSet<u64> = outcome.pruned_dominated.iter().copied().collect();
+    store.for_each_block(|number, rec| {
+        let Some(key) = rec.pattern_key else { return };
+        if rec.status != BlockStatus::Ok || dominated.contains(&key) {
+            return;
+        }
+        let Some(pattern) = patterns.get(&key) else { return };
+        if pattern.representative == number {
+            return;
+        }
+        // Rows arrive in ascending block order, so the first `per_pattern`
+        // seen are the lowest.
+        let kept = siblings.entry(key).or_default();
+        if kept.len() < per_pattern {
+            kept.push(number);
+        }
+    })?;
+    Ok(siblings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{BlockRecord, PatternRecord};
+    use crate::store::BlockRecord;
 
     fn pat(bits: &[u32], rep: u64) -> PatternRecord {
         let bitmap = BitSet::from_indices(bits.iter().copied());
@@ -333,23 +349,14 @@ mod tests {
     /// full coverage with B and C alone, so A's block is exactly the kind the
     /// cover discards and the pool must keep — that gap is the whole reason
     /// the pool is the antichain rather than the manifest.
-    fn three_patterns() -> StoreSnapshot {
-        StoreSnapshot {
-            counters: HashMap::new(),
-            patterns: [
-                (1, pat(&[0, 1, 2, 3], 10)),
-                (2, pat(&[0, 1, 2, 4], 20)),
-                (3, pat(&[3, 4], 30)),
-            ]
-            .into(),
-            blocks: HashMap::new(),
-        }
+    fn three_patterns() -> HashMap<u64, PatternRecord> {
+        [(1, pat(&[0, 1, 2, 3], 10)), (2, pat(&[0, 1, 2, 4], 20)), (3, pat(&[3, 4], 30))].into()
     }
 
     #[test]
     fn pool_keeps_the_antichain_block_the_cover_drops() {
-        let snapshot = three_patterns();
-        let outcome = select_cover(&snapshot.patterns, &Default::default());
+        let patterns = three_patterns();
+        let outcome = select_cover(&patterns, &Default::default());
 
         let cover: Vec<u64> = outcome.selected.iter().map(|(_, rep, _)| *rep).collect();
         assert_eq!(cover, vec![20, 30], "greedy reaches full coverage without block 10");
@@ -357,7 +364,8 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.txt");
-        let written = write_pool(&path, &snapshot, &outcome, 0, "megaevm:test:fx0").unwrap();
+        let written =
+            write_pool(&path, &patterns, &outcome, &HashMap::new(), 0, "megaevm:test:fx0").unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
         let blocks: Vec<u64> =
@@ -374,11 +382,19 @@ mod tests {
     /// `backfill --blocks-file` must skip every line of it.
     #[test]
     fn pool_header_records_provenance_and_stays_commented() {
-        let snapshot = three_patterns();
-        let outcome = select_cover(&snapshot.patterns, &Default::default());
+        let patterns = three_patterns();
+        let outcome = select_cover(&patterns, &Default::default());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.txt");
-        write_pool(&path, &snapshot, &outcome, 0, "megaevm:19f3965962c4:fxdeadbeef").unwrap();
+        write_pool(
+            &path,
+            &patterns,
+            &outcome,
+            &HashMap::new(),
+            0,
+            "megaevm:19f3965962c4:fxdeadbeef",
+        )
+        .unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# binary_id: megaevm:19f3965962c4:fxdeadbeef"), "{text}");
@@ -410,9 +426,9 @@ mod tests {
                     .map(|&b| {
                         let info = crate::store::CounterInfo {
                             dense: b,
-                            symbol: "s".into(),
-                            func_hash: "h".into(),
-                            index: b,
+                            location: "s".into(),
+                            kind: "h".into(),
+                            line: b,
                         };
                         (b as u64, info)
                     })
@@ -455,27 +471,33 @@ mod tests {
         .unwrap();
     }
 
-    /// Siblings come from the BLOCKS table, and which ones are kept must not
-    /// depend on HashMap iteration order — two runs over the same store have
-    /// to name the same blocks or a pool stops being reproducible.
+    /// Siblings come from a streaming pass over the BLOCKS table of a real
+    /// store, and which ones are kept must not depend on anything but the
+    /// data — two runs over the same store have to name the same blocks or a
+    /// pool stops being reproducible.
     #[test]
     fn pool_siblings_are_the_lowest_and_deterministic() {
-        let mut snapshot = three_patterns();
-        // Pattern 1 (representative 10) also occurs at these blocks.
-        for n in [77, 11, 999, 54] {
-            snapshot.blocks.insert(n, block(1));
-        }
-        snapshot.blocks.insert(10, block(1));
-        // A second pattern with a sibling, so the test pins the per-pattern
-        // cap rather than a single pattern's behaviour.
-        snapshot.blocks.insert(31, block(3));
-
-        let outcome = select_cover(&snapshot.patterns, &Default::default());
         let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("store.redb");
+        let patterns = three_patterns();
+        {
+            let store = Store::open(&store_path, "id", None).unwrap();
+            // Pattern 1 (representative 10) also occurs at 11, 54, 77, 999;
+            // pattern 3 (representative 30) at 31 — a second pattern, so the
+            // test pins the per-pattern cap rather than one pattern's luck.
+            for (number, key) in
+                [(999u64, 1u64), (10, 1), (77, 1), (11, 1), (54, 1), (20, 2), (30, 3), (31, 3)]
+            {
+                store.commit_block(number, &block(key), &[], Some((key, &patterns[&key]))).unwrap();
+            }
+        }
+        let (store, _) = Store::open_readonly(&store_path).unwrap();
+        let outcome = select_cover(&patterns, &Default::default());
 
-        let read_pool = |siblings: usize, name: &str| -> Vec<u64> {
+        let read_pool = |per_pattern: usize, name: &str| -> Vec<u64> {
             let path = dir.path().join(name);
-            write_pool(&path, &snapshot, &outcome, siblings, "id").unwrap();
+            let siblings = collect_siblings(&store, &patterns, &outcome, per_pattern).unwrap();
+            write_pool(&path, &patterns, &outcome, &siblings, per_pattern, "id").unwrap();
             std::fs::read_to_string(&path)
                 .unwrap()
                 .lines()

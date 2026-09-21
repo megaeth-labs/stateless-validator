@@ -3,7 +3,7 @@
 //! Spawned by the dispatcher as `coverage-replayer internal-worker ...`. Reads
 //! one JSONL [`WorkerRequest`] per line from stdin, replays the block with
 //! per-block counter isolation (reset → execute → write profraw), extracts the
-//! non-zero counter ids, and answers with one JSONL [`WorkerResponse`].
+//! covered items, and answers with one JSONL [`WorkerResponse`].
 //!
 //! The worker deliberately does NOT verify the witness or recompute state
 //! roots — correctness is guaranteed by the production stateless validator.
@@ -45,18 +45,35 @@ pub struct WorkerArgs {
     /// Path to llvm-profdata.
     #[clap(long)]
     pub llvm_profdata: PathBuf,
-    /// Substring filter on PGO symbol names (crate scope of the coverage universe).
-    #[clap(long, default_value = "mega_evm")]
-    pub symbol_filter: String,
+    /// Path to llvm-cov.
+    #[clap(long)]
+    pub llvm_cov: PathBuf,
+    /// Source directories scoping the coverage universe (resolved by the
+    /// dispatcher, so every worker of a run agrees on them).
+    #[clap(long = "source-dir", required = true)]
+    pub source_dirs: Vec<PathBuf>,
+}
+
+/// Loads the chain spec a worker replays under. The dispatcher calls this
+/// too, before launching any worker: a worker that cannot start looks, from
+/// outside, exactly like one that crashed mid-block, and blocks are retried
+/// forever by policy — so a mistyped `--genesis-file` has to fail the run up
+/// front rather than wedge it in a respawn loop.
+pub fn load_chain_spec(genesis_file: &str) -> Result<ChainSpec> {
+    let genesis = serde_json::from_str::<alloy_genesis::Genesis>(
+        &std::fs::read_to_string(genesis_file)
+            .wrap_err_with(|| format!("read genesis {genesis_file}"))?,
+    )
+    .wrap_err_with(|| format!("parse genesis {genesis_file}"))?;
+    Ok(ChainSpec::from_genesis(genesis))
 }
 
 /// Entry point of the worker subprocess. Loops until stdin closes.
 pub fn run(args: WorkerArgs) -> Result<()> {
-    let genesis = serde_json::from_str::<alloy_genesis::Genesis>(
-        &std::fs::read_to_string(&args.genesis_file)
-            .wrap_err_with(|| format!("read genesis {}", args.genesis_file))?,
-    )?;
-    let chain_spec = ChainSpec::from_genesis(genesis);
+    let chain_spec = load_chain_spec(&args.genesis_file)?;
+    // llvm-cov reads the coverage map out of the binary that wrote the
+    // profile — this one.
+    let exe = std::env::current_exe().wrap_err("resolve the worker executable")?;
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
@@ -67,7 +84,7 @@ pub fn run(args: WorkerArgs) -> Result<()> {
         }
         let req: WorkerRequest = serde_json::from_str(&line)
             .map_err(|e| eyre::eyre!("bad worker request {line:?}: {e}"))?;
-        let resp = process_block(&args, &chain_spec, &req)
+        let resp = process_block(&args, &exe, &chain_spec, &req)
             .unwrap_or_else(|e| error_response(req.block, format!("{e:#}")));
         serde_json::to_writer(&mut stdout, &resp)?;
         stdout.write_all(b"\n")?;
@@ -86,7 +103,7 @@ fn error_response(block: u64, error: String) -> WorkerResponse {
         receipts_root_ok: false,
         logs_bloom_ok: false,
         counters: Vec::new(),
-        profraw: PathBuf::new(),
+        profile: PathBuf::new(),
         symbols_tsv: PathBuf::new(),
         elapsed_ms: 0,
         tx_count: 0,
@@ -96,6 +113,7 @@ fn error_response(block: u64, error: String) -> WorkerResponse {
 
 fn process_block(
     args: &WorkerArgs,
+    exe: &std::path::Path,
     chain_spec: &ChainSpec,
     req: &WorkerRequest,
 ) -> Result<WorkerResponse> {
@@ -135,15 +153,25 @@ fn process_block(
     let receipts_root_ok = output.receipts_root == header.receipts_root;
     let logs_bloom_ok = output.logs_bloom == header.logs_bloom;
 
-    let hits = llvm::extract_nonzero_counters(&args.llvm_profdata, &profraw, &args.symbol_filter)?;
+    let extracted = llvm::extract_covered_items(
+        &args.llvm_profdata,
+        &args.llvm_cov,
+        exe,
+        &profraw,
+        &args.source_dirs,
+    );
+    // The raw profile is large (the whole binary's counter array plus its
+    // name table) and the sparse profdata supersedes it either way.
+    let _ = std::fs::remove_file(&profraw);
+    let (hits, profile) = extracted?;
 
-    // Sidecar with full symbol details, read by the dispatcher only for ids it
+    // Sidecar with full item details, read by the dispatcher only for ids it
     // has never seen before (rare after warm-up).
     let symbols_tsv = args.tmp_dir.join(format!("block_{}.symbols.tsv.zst", req.block));
     let mut tsv = String::with_capacity(hits.len() * 96);
     for h in &hits {
         use std::fmt::Write as _;
-        let _ = writeln!(tsv, "{:016x}\t{}\t{}\t{}", h.id, h.index, h.func_hash, h.symbol);
+        let _ = writeln!(tsv, "{:016x}\t{}\t{}\t{}", h.id, h.line, h.kind.as_str(), h.location);
     }
     write_atomic(&symbols_tsv, &zstd::encode_all(tsv.as_bytes(), 1)?)?;
 
@@ -156,7 +184,7 @@ fn process_block(
         receipts_root_ok,
         logs_bloom_ok,
         counters: hits.into_iter().map(|h| h.id).collect(),
-        profraw,
+        profile,
         symbols_tsv,
         elapsed_ms: start.elapsed().as_millis() as u64,
         tx_count: block.transactions.len() as u64,

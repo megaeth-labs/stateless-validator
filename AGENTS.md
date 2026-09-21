@@ -5,7 +5,7 @@ This file provides guidance to AI agents (e.g., Claude Code, Codex, Cursor, etc.
 ## Project Overview
 
 Stateless validator for MegaETH — validates blocks using SALT witness data without requiring full chain state.
-The workspace contains three binaries: `stateless-validator` (chain-following validator), `debug-trace-server` (RPC server for debug/trace methods), and `coverage-replayer` (offline tool that derives the minimal mainnet block set maximizing mega-evm branch coverage).
+The workspace contains three binaries: `stateless-validator` (chain-following validator), `debug-trace-server` (RPC server for debug/trace methods), and `coverage-replayer` (offline tool that derives a small mainnet block set reproducing all the mega-evm coverage a chain scan observed).
 See `README.md` for detailed documentation and quickstart.
 
 ## Build & Development Commands
@@ -43,7 +43,7 @@ The project uses nightly `2026-02-03` toolchain (edition 2024, rust-version 1.95
 | `stateless-r2`         | `crates/stateless-r2`         | Shared R2 witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT, and the retrying witness-object GET fetcher over either the signed S3 API or an unsigned Cloudflare custom domain; consumed by mega-reth's uploaders (write) and both binaries' R2 witness sources (read) |
 | `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers (`app.rs` / `runner.rs` / `main.rs`)                                                                                                |
 | `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                                                                                                                            |
-| `coverage-replayer`    | `bin/coverage-replayer`       | Offline coverage tool: replays blocks under LLVM branch instrumentation (`backfill`, by range or `--blocks-file`), dedups per-block coverage bitmaps into patterns, and computes the minimal covering block set (`set-cover` / `report` / `inspect` / `merge`). `inspect --dump-pool` exports the candidate block pool that carries a scan across a mega-evm bump. Requires the instrumented `[profile.coverage]` build |
+| `coverage-replayer`    | `bin/coverage-replayer`       | Offline coverage tool: replays blocks under LLVM branch instrumentation (`backfill`, by range or `--blocks-file`), dedups per-block coverage bitmaps (evaluated llvm-cov regions and branch arms) into patterns, and computes a greedy covering block set (`set-cover` / `report` / `inspect` / `merge`). `inspect --dump-pool` exports the candidate block pool that carries a scan across a mega-evm bump. Requires the instrumented `[profile.coverage]` build |
 
 Additional directories: `test_data/` (integration test fixtures including genesis config), `audits/` (security audit reports).
 
@@ -281,8 +281,9 @@ When implementing a new feature or bug fix, consider these additional aspects:
     The upstream witness generator serializes `(SaltWitness, MptWitness)` with bincode legacy, then zstd-compresses, then base64-encodes, and sends as a `"v0:<base64>"` JSON-RPC string.
   - **Local DB storage** (contracts, light witnesses) uses `bincode::config::standard()` (varint encoding, more compact) with lz4 compression.
   - These two formats are **not interchangeable**. `legacy()` and `standard()` produce different binary layouts.
-- **All persistent state goes through `ValidatorDB`.**
-  Do not create separate database files or ad-hoc persistence; use the existing redb tables.
+- **All persistent validator state goes through `ValidatorDB`.**
+  Do not create separate database files or ad-hoc persistence inside the validator; use the existing redb tables.
+  Each binary owns its own store: the trace server has `ServerDB`, and `coverage-replayer` keeps an offline pattern store under its `--data-dir`.
 - **Keep documentation up to date.**
   When making changes, check whether related documentation (README, this file) needs updating.
 - **One sentence, one line.**
