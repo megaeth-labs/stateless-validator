@@ -1,0 +1,19 @@
+# Registry crates measured in addition to the mega-evm checkout: revm's
+# execution engine. mega-evm customizes the EVM *through* these — its host and
+# handler are type arguments of revm's generic interpreter and handler — so
+# "which EVM paths does mainnet exercise under mega-evm" lives in their source,
+# not in mega-evm's.
+#
+# One name per line. The rustc wrapper instruments exactly these (plus the
+# mega-evm checkout and this workspace), and build.rs resolves their locked
+# versions into the default `--source-dir` scope, so the two cannot drift.
+#
+# Deliberately absent: everything that is not execution. Cryptography (k256,
+# ecdsa, crypto-bigint, ...), encoding and type-level utility crates cost the
+# most to instrument — tiny functions in hot loops — and say nothing about how
+# a block executed.
+revm-interpreter
+revm-handler
+revm-context
+revm-context-interface
+op-revm

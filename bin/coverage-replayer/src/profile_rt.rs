@@ -60,12 +60,12 @@ pub fn suppress_default_profile() {}
 #[cfg(not(feature = "coverage"))]
 pub fn write_profraw(_path: &Path) -> Result<()> {
     eyre::bail!(
-        "this binary was built without the `coverage` feature; \
-         rebuild with RUSTFLAGS=\"-C instrument-coverage -Z coverage-options=branch\" \
+        "this binary was built without the `coverage` feature; rebuild with \
+         RUSTC_WRAPPER=\"$PWD/bin/coverage-replayer/cov-rustc-wrapper.sh\" \
          cargo build --profile coverage -p coverage-replayer --features coverage \
          --target \"$(rustc -vV | sed -n 's/host: //p')\" \
-         — the explicit --target is required: without it proc-macros are \
-         instrumented too and spray default_*.profraw files into the cwd"
+         — the explicit --target is required: it is how the wrapper tells the \
+         code to instrument from host artifacts"
     )
 }
 

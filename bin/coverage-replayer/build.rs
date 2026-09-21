@@ -46,7 +46,30 @@ fn main() {
         "coverage-replayer build: unexpected `rustc -vV` output: {rustc_vv:?}"
     );
 
+    // The registry crates measured next to mega-evm, as `name-version` — the
+    // name of their directory under the cargo registry, which is where
+    // llvm-cov will look for their sources. Versions come from the lockfile,
+    // so the default scope can never name a version the binary was not built
+    // against.
+    let lock = std::fs::read_to_string("../../Cargo.lock").unwrap_or_default();
+    let measured: Vec<String> = std::fs::read_to_string("measured-crates.txt")
+        .expect("coverage-replayer build: measured-crates.txt is missing")
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .flat_map(|name| {
+            let versions = locked_versions(&lock, name);
+            assert!(
+                !versions.is_empty(),
+                "coverage-replayer build: measured crate `{name}` is not in Cargo.lock"
+            );
+            versions.into_iter().map(move |v| format!("{name}-{v}"))
+        })
+        .collect();
+
     println!("cargo:rustc-env=COVERAGE_MEGA_EVM_REV={mega_evm}");
+    println!("cargo:rustc-env=COVERAGE_MEASURED_CRATES={}", measured.join(","));
+    println!("cargo:rerun-if-changed=measured-crates.txt");
     println!("cargo:rustc-env=COVERAGE_RUSTC_VERSION={toolchain}");
     // Re-run if the lockfile changes (mega-evm bump).
     println!("cargo:rerun-if-changed=../../Cargo.lock");
@@ -68,4 +91,18 @@ fn mega_evm_rev(lock: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Every locked version of the registry package `name` (normally one).
+fn locked_versions(lock: &str, name: &str) -> Vec<String> {
+    let mut versions = Vec::new();
+    let mut lines = lock.lines().map(str::trim);
+    while let Some(line) = lines.next() {
+        if line == format!("name = \"{name}\"") &&
+            let Some(version) = lines.next().and_then(|l| l.strip_prefix("version = "))
+        {
+            versions.push(version.trim_matches('"').to_string());
+        }
+    }
+    versions
 }

@@ -1,5 +1,6 @@
 //! coverage-replayer: derive a small set of mainnet blocks that reproduces all
-//! the mega-evm coverage a scan of the chain observed.
+//! the execution coverage a scan of the chain observed — of mega-evm, and of
+//! the revm execution engine it drives (`measured-crates.txt`).
 //!
 //! `backfill` replays a block range under LLVM branch instrumentation:
 //! resident worker subprocesses execute each block (reset counters → replay →

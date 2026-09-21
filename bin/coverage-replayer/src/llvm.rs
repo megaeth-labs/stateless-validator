@@ -19,6 +19,15 @@
 //! measures. The export is scoped to source directories — both because those
 //! define the universe, and because an unscoped export of this binary
 //! crashes llvm-cov (instantiation-group handling in some dependency files).
+//!
+//! The default scope is the mega-evm checkout plus revm's execution engine
+//! (`measured-crates.txt`). mega-evm shapes execution *through* revm — its
+//! host and handler are type arguments of revm's generic interpreter — so
+//! which EVM paths mainnet exercises is a fact about revm's source as much as
+//! mega-evm's. Scoping by directory is also what keeps the rest out: a filter
+//! on symbol names cannot, because a mangled name carries its generic
+//! arguments and its instantiating crate, and under one such filter more than
+//! a third of the universe turned out to be k256, generic-array and friends.
 
 use std::{
     hash::Hasher,
@@ -32,7 +41,7 @@ use rustc_hash::FxHasher;
 /// Version tag of the item definition below, stamped into every store (see
 /// [`universe_stamp`]). Bump it whenever the id or the set of item kinds
 /// changes: ids from two definitions must never share a store.
-const ITEM_UNIVERSE: &str = "regions+branch-arms/v1";
+const ITEM_UNIVERSE: &str = "regions+branch-arms/v2";
 
 /// What a covered item is, for the provenance columns of the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,20 +68,23 @@ impl ItemKind {
 #[derive(Debug, Clone)]
 pub struct CoveredItem {
     pub id: u64,
-    /// `<path relative to its source dir>:<line>:<col>`.
+    /// `<source dir name>/<path inside it>:<line>:<col>`.
     pub location: String,
     pub kind: ItemKind,
     pub line: u32,
 }
 
 /// Stable 64-bit id of a covered item. FxHasher is seed-free and
-/// deterministic across processes and machines; the path is relative to its
-/// source dir, so the id does not depend on where a checkout lives.
-fn item_id(kind: ItemKind, rel_path: &str, span: [u32; 4]) -> u64 {
+/// deterministic across processes and machines. `scoped_path` is the source
+/// dir's own name followed by the path inside it (`revm-handler-8.1.0/src/
+/// lib.rs`): the name keeps two scoped crates' `src/lib.rs` apart, and leaving
+/// out everything above it keeps the id independent of where a checkout or
+/// registry lives.
+fn item_id(kind: ItemKind, scoped_path: &str, span: [u32; 4]) -> u64 {
     let mut h = FxHasher::default();
     h.write(kind.as_str().as_bytes());
     h.write_u8(0xff);
-    h.write(rel_path.as_bytes());
+    h.write(scoped_path.as_bytes());
     h.write_u8(0xff);
     for v in span {
         h.write_u32(v);
@@ -89,18 +101,28 @@ pub fn universe_stamp(source_dirs: &[PathBuf]) -> String {
     format!("{ITEM_UNIVERSE}:{}", dirs.join(","))
 }
 
-/// Resolves the source scope: the explicit `--source-dir`s, or the mega-evm
-/// checkout this binary was built against. Every directory must exist —
+/// Resolves the source scope: the explicit `--source-dir`s, or the default —
+/// the mega-evm checkout this binary was built against plus the measured
+/// registry crates at their locked versions. Every directory must exist —
 /// llvm-cov collects the files under it from disk, and a scope that matches
 /// nothing would turn every block into an empty bitmap.
 pub fn resolve_source_dirs(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let dirs = if explicit.is_empty() {
-        vec![detect_mega_evm_checkout().ok_or_else(|| {
+        let mut dirs = vec![detect_mega_evm_checkout().ok_or_else(|| {
             eyre::eyre!(
                 "could not find the mega-evm checkout for the built-against rev under \
                  $HOME/.cargo/git/checkouts (note that sudo changes $HOME); pass --source-dir"
             )
-        })?]
+        })?];
+        for krate in env!("COVERAGE_MEASURED_CRATES").split(',').filter(|c| !c.is_empty()) {
+            dirs.push(detect_registry_crate(krate).ok_or_else(|| {
+                eyre::eyre!(
+                    "could not find the sources of {krate} under $HOME/.cargo/registry/src \
+                     (note that sudo changes $HOME); pass every --source-dir explicitly"
+                )
+            })?);
+        }
+        dirs
     } else {
         explicit.to_vec()
     };
@@ -108,6 +130,18 @@ pub fn resolve_source_dirs(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
         ensure!(dir.is_dir(), "source dir {} does not exist", dir.display());
     }
     Ok(dirs)
+}
+
+/// Finds `<name>-<version>` under the cargo registry's unpacked sources (the
+/// directory above it is named after the index, which is not ours to guess).
+fn detect_registry_crate(name_version: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let src = PathBuf::from(home).join(".cargo").join("registry").join("src");
+    std::fs::read_dir(src)
+        .ok()?
+        .flatten()
+        .map(|index| index.path().join(name_version))
+        .find(|candidate| candidate.is_dir())
 }
 
 /// Finds the cargo git checkout of the mega-evm rev this binary was BUILT
@@ -252,8 +286,10 @@ pub fn parse_export(json: &str, source_dirs: &[PathBuf]) -> Result<Vec<CoveredIt
         let filename = file["filename"].as_str().unwrap_or_default();
         let rel = source_dirs
             .iter()
-            .find_map(|dir| Path::new(filename).strip_prefix(dir).ok())
-            .map(|p| p.display().to_string())
+            .find_map(|dir| {
+                let inside = Path::new(filename).strip_prefix(dir).ok()?;
+                Some(Path::new(dir.file_name()?).join(inside).display().to_string())
+            })
             .unwrap_or_else(|| filename.to_string());
 
         let mut push = |kind: ItemKind, span: [u32; 4]| {
@@ -339,23 +375,42 @@ mod tests {
             .collect();
         // Line 3: the condition (col 8) and the then-arm (cols 16, 18) ran;
         // the else-arm's regions (cols 43, 45) have count 0 and must be absent.
-        for expected in ["t.rs:3:8", "t.rs:3:16", "t.rs:3:18"] {
+        for expected in ["src/t.rs:3:8", "src/t.rs:3:16", "src/t.rs:3:18"] {
             assert!(regions.contains(&expected), "missing {expected} in {regions:?}");
         }
-        for absent in ["t.rs:3:43", "t.rs:3:45", "t.rs:3:13"] {
+        for absent in ["src/t.rs:3:43", "src/t.rs:3:45", "src/t.rs:3:13"] {
             assert!(!regions.contains(&absent), "{absent} must not be an item: {regions:?}");
         }
     }
 
-    /// Ids must not depend on where the checkout lives, or shards scanned
-    /// under different homes could not be merged.
+    /// Ids must not depend on where the checkout or registry lives, or shards
+    /// scanned under different homes could not be merged.
     #[test]
-    fn ids_are_relative_to_the_source_dir() {
-        let moved = THEN_ONLY.replace("/tmp/covfix/src", "/somewhere/else/entirely");
+    fn ids_do_not_depend_on_where_the_source_dir_lives() {
+        let moved = THEN_ONLY.replace("/tmp/covfix/src", "/another/home/.cargo/src");
         let here = parse_export(THEN_ONLY, &scope()).unwrap();
-        let there = parse_export(&moved, &[PathBuf::from("/somewhere/else/entirely")]).unwrap();
+        let there = parse_export(&moved, &[PathBuf::from("/another/home/.cargo/src")]).unwrap();
         assert_eq!(ids(&here), ids(&there));
-        assert!(here.iter().all(|i| i.location.starts_with("t.rs:")), "{:?}", here[0].location);
+        assert!(here.iter().all(|i| i.location.starts_with("src/t.rs:")), "{}", here[0].location);
+    }
+
+    /// Two scoped crates both have a `src/lib.rs`. The same span in each is
+    /// two items: without the source dir's own name in the id they would
+    /// collapse into one, and covering either crate's line would "cover" both.
+    #[test]
+    fn same_inner_path_in_two_source_dirs_does_not_collide() {
+        let export = |dir: &str| {
+            format!(
+                r#"{{"data":[{{"files":[{{"filename":"{dir}/src/lib.rs",
+                   "segments":[[10,5,1,true,true,false]],"branches":[]}}]}}]}}"#
+            )
+        };
+        let dirs = [PathBuf::from("/r/revm-handler-8.1.0"), PathBuf::from("/r/revm-context-8.0.4")];
+        let a = parse_export(&export("/r/revm-handler-8.1.0"), &dirs).unwrap();
+        let b = parse_export(&export("/r/revm-context-8.0.4"), &dirs).unwrap();
+        assert_eq!((a.len(), b.len()), (1, 1));
+        assert_ne!(a[0].id, b[0].id);
+        assert_eq!(a[0].location, "revm-handler-8.1.0/src/lib.rs:10:5");
     }
 
     /// A generic function exports one branch record per instantiation at the
@@ -382,6 +437,6 @@ mod tests {
     fn universe_stamp_is_order_independent_and_versioned() {
         let (a, b) = (PathBuf::from("/x/a"), PathBuf::from("/x/b"));
         assert_eq!(universe_stamp(&[a.clone(), b.clone()]), universe_stamp(&[b, a]));
-        assert_eq!(universe_stamp(&[PathBuf::from("/x")]), "regions+branch-arms/v1:/x");
+        assert_eq!(universe_stamp(&[PathBuf::from("/x")]), "regions+branch-arms/v2:/x");
     }
 }

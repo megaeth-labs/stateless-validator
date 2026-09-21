@@ -47,6 +47,7 @@ tempfile.workspace = true
 
 [features]
 # Enables the FFI calls into the LLVM profiler runtime. Only meaningful when the
-# binary is built with RUSTFLAGS="-C instrument-coverage ..." (which links the
-# runtime); regular builds keep this off so the symbols are never referenced.
+# binary is built through `cov-rustc-wrapper.sh` (which instruments the measured
+# crates and thereby links the runtime); regular builds keep this off so the
+# symbols are never referenced.
 coverage = []

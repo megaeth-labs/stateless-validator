@@ -1,8 +1,20 @@
 //! Human-readable coverage report for the selected block set.
 //!
-//! This is the only place llvm-cov runs: merge the archived profraws of the
-//! selected representatives and print branch/region/line totals plus the
-//! per-file table filtered to the crates of interest.
+//! Merges the archived profiles of the selected representatives and prints
+//! llvm-cov's branch/region/line totals plus the per-file table for the
+//! measured scope.
+//!
+//! How to read it against the manifest: the cover is complete at the level
+//! the tool measures — every source region and branch arm any replayed block
+//! covered is covered by the selected set — and lines, functions and branches
+//! here match a report over the whole scan exactly. The *region* total can
+//! trail it by a region or two in a const-generic family (revm's
+//! `push::<N>`). llvm-cov summarizes a generic function by its best single
+//! instantiation rather than by the union across instantiations, so the same
+//! source regions, covered through different instantiations by different
+//! selected blocks, count for less than when one block's instantiation covers
+//! them all. No source region is missing in that case; the items are keyed by
+//! source span precisely so that which instantiation ran does not matter.
 
 use std::{path::PathBuf, process::Command};
 

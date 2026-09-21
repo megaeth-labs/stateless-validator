@@ -128,10 +128,11 @@ debug = true
 # Instrumented builds for coverage-replayer: coverage only cares about "was it
 # executed", so trade peak runtime speed for much faster builds (no LTO, many
 # codegen units). Do NOT add `-C link-dead-code` (it monomorphizes dead generic
-# code and fails const-eval asserts in revm). Pass an explicit --target so
-# RUSTFLAGS skips host artifacts (otherwise instrumented proc-macros make every
-# rustc invocation drop default_*.profraw files into the cwd). Build with:
-#   RUSTFLAGS="-C instrument-coverage -Z coverage-options=branch" \
+# code and fails const-eval asserts in revm). The instrumentation flags come
+# from a rustc wrapper rather than RUSTFLAGS, so that only the measured code is
+# instrumented (see the wrapper for why that matters); the explicit --target is
+# how it tells host artifacts apart. Build with:
+#   RUSTC_WRAPPER="$PWD/bin/coverage-replayer/cov-rustc-wrapper.sh" \
 #     cargo build --profile coverage -p coverage-replayer --features coverage \
 #       --target "$(rustc -vV | sed -n 's/host: //p')"
 [profile.coverage]
