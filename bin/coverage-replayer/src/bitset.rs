@@ -58,8 +58,9 @@ impl BitSet {
     }
 
     /// Short-circuits on the first word disproving subset-hood — this is the
-    /// inner kernel of the O(n²) dominance scans, where the overwhelmingly
-    /// common answer is "no".
+    /// inner kernel of the dominance scans (the judge's archive check,
+    /// set-cover's antichain split), where the overwhelmingly common answer
+    /// is "no".
     pub fn is_subset_of(&self, other: &BitSet) -> bool {
         self.words
             .iter()

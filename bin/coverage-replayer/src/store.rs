@@ -198,7 +198,13 @@ impl Store {
         rows: &HashMap<u64, T>,
     ) -> Result<()> {
         const BATCH: usize = 100_000;
-        let rows: Vec<_> = rows.iter().collect();
+        // Ascending key order is load-bearing for speed, not correctness: a
+        // `HashMap` iterates in random order, and random insertion dirties
+        // pages all over the B-tree on every batch, so each commit rewrites
+        // a slice of the whole tree. Sorted, every batch lands on the right
+        // edge and a commit costs what the batch holds.
+        let mut rows: Vec<_> = rows.iter().collect();
+        rows.sort_unstable_by_key(|(key, _)| **key);
         for chunk in rows.chunks(BATCH) {
             let txn = self.db.begin_write()?;
             {
