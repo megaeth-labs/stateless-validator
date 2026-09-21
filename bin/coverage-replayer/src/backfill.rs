@@ -529,7 +529,24 @@ async fn fetch_block(
     }
 
     if block_cache.is_none() {
-        *block_cache = Some(client.get_block(BlockId::number(n), true).await);
+        // Unchecked on purpose. The checked fetch recovers the signer of every
+        // transaction — secp256k1 work, in a binary whose every basic block
+        // bumps a shared coverage counter — and on blocks carrying tens of
+        // thousands of transactions that, not the download, is what the fetch
+        // stage spends its time on, with the concurrent fetches contending
+        // for the same counters. Nothing is lost by skipping it: a wrong
+        // sender or transaction set cannot reproduce the header's gas,
+        // receipts root and logs bloom, which the worker compares after
+        // replaying, and a divergence stops the run. The header hash is
+        // checked here because it is cheap and it is what the manifest
+        // publishes and the witness is addressed by.
+        let block = client.get_block_unchecked(BlockId::number(n), true).await;
+        ensure!(
+            block.header.hash_slow() == block.header.hash,
+            "block {n}: the RPC header does not hash to the hash it claims ({:#x})",
+            block.header.hash,
+        );
+        *block_cache = Some(block);
     }
     let block = block_cache.as_ref().expect("just filled");
     let hash = block.header.hash;
