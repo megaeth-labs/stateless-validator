@@ -78,6 +78,28 @@ enum Cmd {
     InternalWorker(worker::WorkerArgs),
 }
 
+fn main() -> Result<()> {
+    profile_rt::suppress_default_profile();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    match Cli::parse().cmd {
+        Cmd::InternalWorker(args) => worker::run(args),
+        Cmd::Backfill(args) => tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(backfill::run(args)),
+        Cmd::SetCover(args) => setcover::run(args),
+        Cmd::Report(args) => report::run(args),
+        Cmd::Inspect(args) => inspect::run(args),
+        Cmd::Merge(args) => merge::run(args),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::{CommandFactory, Parser, error::ErrorKind};
@@ -115,27 +137,5 @@ mod tests {
     #[test]
     fn cli_definition_is_well_formed() {
         Cli::command().debug_assert();
-    }
-}
-
-fn main() -> Result<()> {
-    profile_rt::suppress_default_profile();
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
-    match Cli::parse().cmd {
-        Cmd::InternalWorker(args) => worker::run(args),
-        Cmd::Backfill(args) => tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?
-            .block_on(backfill::run(args)),
-        Cmd::SetCover(args) => setcover::run(args),
-        Cmd::Report(args) => report::run(args),
-        Cmd::Inspect(args) => inspect::run(args),
-        Cmd::Merge(args) => merge::run(args),
     }
 }
