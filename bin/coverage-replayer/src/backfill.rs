@@ -114,8 +114,13 @@ pub struct BackfillArgs {
     /// Number of resident worker subprocesses (default: cores - 2).
     #[clap(long, env = "COVERAGE_REPLAYER_WORKERS")]
     pub workers: Option<usize>,
-    /// Concurrent block fetches.
-    #[clap(long, default_value_t = 8)]
+    /// Concurrent block fetches. Replay is fetch-bound, not compute-bound: a
+    /// block costs far longer to download (block JSON, witness, bytecode) than
+    /// to execute, most of all deep in history where blocks are large, so the
+    /// worker pool idles behind a handful of fetches. Raising this cannot
+    /// flood the disk — a full dispatch queue blocks the fetch loop, which
+    /// bounds the spool backlog whatever the value.
+    #[clap(long, default_value_t = 32)]
     pub fetch_concurrency: usize,
     /// Source directories scoping the coverage universe — the same scope
     /// `report` measures. Default: the mega-evm checkout this binary was built
