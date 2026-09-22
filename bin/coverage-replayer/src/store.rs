@@ -529,19 +529,29 @@ pub fn resolve_pattern_slot(
     }
 }
 
-/// Coverage namespace key: a fingerprint of the instrumented mega-evm build,
-/// NOT a whole-exe hash. Stays stable across dispatcher/orchestration edits
-/// (so the resident mode can continue a store built by `backfill`), and only
-/// changes when mega-evm's revision or the toolchain changes — exactly when
-/// the counter ids would actually shift. Captured at compile time by build.rs.
+/// Coverage namespace key: a fingerprint of the instrumented build being
+/// measured, NOT a whole-exe hash. Stays stable across dispatcher edits (so
+/// the resident mode can continue a store `backfill` started) and changes
+/// exactly when the measured sources or the toolchain do: mega-evm's
+/// revision, the locked versions of the measured dependencies, and
+/// `rustc -vV`. Captured at compile time by build.rs.
+///
+/// The dependency versions belong here because they are measured code, not
+/// merely linked code: a revm bump with mega-evm unchanged rewrites part of
+/// the coverage map, and `report` — which validates a manifest by this id
+/// alone — would otherwise accept profiles whose functions llvm-cov then
+/// silently drops, reporting the difference as uncovered.
 pub fn current_binary_id() -> String {
     use std::hash::Hasher;
     let mega_evm = env!("COVERAGE_MEGA_EVM_REV");
     let rustc = env!("COVERAGE_RUSTC_VERSION");
+    let measured = env!("COVERAGE_MEASURED_CRATES");
     let mut h = rustc_hash::FxHasher::default();
     h.write(mega_evm.as_bytes());
     h.write_u8(0xff);
     h.write(rustc.as_bytes());
+    h.write_u8(0xff);
+    h.write(measured.as_bytes());
     format!("megaevm:{}:fx{:016x}", &mega_evm[..mega_evm.len().min(12)], h.finish())
 }
 

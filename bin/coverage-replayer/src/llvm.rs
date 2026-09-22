@@ -92,13 +92,30 @@ fn item_id(kind: ItemKind, scoped_path: &str, span: [u32; 4]) -> u64 {
     h.finish()
 }
 
+/// A source root's label: its final component — `revm-handler-8.1.0` for a
+/// registry crate, the short rev for the mega-evm checkout. It identifies the
+/// root without saying where it lives, which is what lets shards scanned under
+/// different `$HOME`s carry the same item ids and the same universe stamp.
+/// [`resolve_source_dirs`] rejects a scope whose labels are not unique, so the
+/// lossy conversion and the fallback below cannot silently merge two roots.
+fn root_label(dir: &Path) -> String {
+    dir.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| dir.display().to_string())
+}
+
 /// The universe stamp a store is namespaced by, next to `binary_id`: the item
 /// definition plus the source scope. Two runs whose stamps differ would fill
 /// one store with ids from different universes.
+///
+/// Built from labels rather than paths, and sorted: `merge` compares stamps
+/// byte for byte, so shards of one distributed scan must stamp identically
+/// whatever home directory they ran under and whatever order their roots were
+/// listed in.
 pub fn universe_stamp(source_dirs: &[PathBuf]) -> String {
-    let mut dirs: Vec<String> = source_dirs.iter().map(|d| d.display().to_string()).collect();
-    dirs.sort();
-    format!("{ITEM_UNIVERSE}:{}", dirs.join(","))
+    let mut labels: Vec<String> = source_dirs.iter().map(|d| root_label(d)).collect();
+    labels.sort();
+    format!("{ITEM_UNIVERSE}:{}", labels.join(","))
 }
 
 /// Resolves the source scope: the explicit `--source-dir`s, or the default —
@@ -128,6 +145,31 @@ pub fn resolve_source_dirs(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
     };
     for dir in &dirs {
         ensure!(dir.is_dir(), "source dir {} does not exist", dir.display());
+    }
+    // Both the item ids and the universe stamp identify a root by its label,
+    // so two roots sharing one would have their coverage silently merged
+    // while the stamp still claimed two distinct roots.
+    for (i, dir) in dirs.iter().enumerate() {
+        let label = root_label(dir);
+        if let Some(other) = dirs[..i].iter().find(|d| root_label(d) == label) {
+            eyre::bail!(
+                "source dirs {} and {} share the final path component {label:?}, which is what \
+                 identifies a root — coverage from the two would collide. Pass roots whose last \
+                 component differs.",
+                other.display(),
+                dir.display(),
+            );
+        }
+        // Nested roots make "which root does this file belong to" depend on
+        // the order they were listed in, while the stamp is order-independent
+        // — the same scan would then produce two sets of ids under one stamp.
+        if let Some(outer) = dirs.iter().enumerate().find(|(j, d)| *j != i && dir.starts_with(d)) {
+            eyre::bail!(
+                "source dir {} lies inside {} — pass disjoint roots",
+                dir.display(),
+                outer.1.display(),
+            );
+        }
     }
     Ok(dirs)
 }
@@ -267,14 +309,26 @@ pub fn parse_export(json: &str, source_dirs: &[PathBuf]) -> Result<Vec<CoveredIt
     let files = root["data"][0]["files"]
         .as_array()
         .ok_or_else(|| eyre::eyre!("llvm-cov export has no data[0].files"))?;
-    // A scope that matches nothing in the coverage map is a configuration
-    // error, not an empty block: llvm-cov matches the absolute paths baked in
-    // at BUILD time, so the sources must sit where they sat for the build.
-    ensure!(
-        !files.is_empty(),
-        "llvm-cov export matched no source file under {source_dirs:?} — the sources must be at \
-         the path the instrumented binary was built against"
-    );
+    // Which files llvm-cov lists is decided by the coverage map and the scope,
+    // not by what this block executed — so every configured root contributes
+    // the same files on every block, and a root contributing none is a
+    // configuration error rather than an uneventful block. It has to be
+    // checked per root: llvm-cov answers a root it cannot match with a warning
+    // on stderr and a success exit, so a stale one would silently contribute
+    // no items at all while the store's stamp went on claiming its scope.
+    // Roots are matched as given, never canonicalized, because llvm-cov
+    // matches the absolute paths baked in at BUILD time — the sources must sit
+    // where they sat for the build, spelled the same way.
+    for dir in source_dirs {
+        ensure!(
+            files.iter().any(|file| {
+                file["filename"].as_str().is_some_and(|f| Path::new(f).starts_with(dir))
+            }),
+            "llvm-cov export matched no source file under {} — that root is not the one the \
+             instrumented binary was built against, so nothing under it would be measured",
+            dir.display(),
+        );
+    }
 
     let nonzero = |v: &serde_json::Value| {
         v.as_u64().is_some_and(|n| n > 0) || v.as_f64().is_some_and(|n| n > 0.0)
@@ -284,11 +338,13 @@ pub fn parse_export(json: &str, source_dirs: &[PathBuf]) -> Result<Vec<CoveredIt
     let mut items = Vec::new();
     for file in files {
         let filename = file["filename"].as_str().unwrap_or_default();
+        // Roots are disjoint (`resolve_source_dirs`), so at most one prefixes
+        // this file and the first match is the only match.
         let rel = source_dirs
             .iter()
             .find_map(|dir| {
                 let inside = Path::new(filename).strip_prefix(dir).ok()?;
-                Some(Path::new(dir.file_name()?).join(inside).display().to_string())
+                Some(Path::new(&root_label(dir)).join(inside).display().to_string())
             })
             .unwrap_or_else(|| filename.to_string());
 
@@ -395,22 +451,24 @@ mod tests {
     }
 
     /// Two scoped crates both have a `src/lib.rs`. The same span in each is
-    /// two items: without the source dir's own name in the id they would
-    /// collapse into one, and covering either crate's line would "cover" both.
+    /// two items: without the root's label in the id they would collapse into
+    /// one, and covering either crate's line would "cover" both.
     #[test]
     fn same_inner_path_in_two_source_dirs_does_not_collide() {
-        let export = |dir: &str| {
-            format!(
-                r#"{{"data":[{{"files":[{{"filename":"{dir}/src/lib.rs",
-                   "segments":[[10,5,1,true,true,false]],"branches":[]}}]}}]}}"#
-            )
-        };
+        let json = r#"{"data":[{"files":[
+            {"filename":"/r/revm-handler-8.1.0/src/lib.rs","segments":[[10,5,1,true,true,false]],"branches":[]},
+            {"filename":"/r/revm-context-8.0.4/src/lib.rs","segments":[[10,5,1,true,true,false]],"branches":[]}]}]}"#;
         let dirs = [PathBuf::from("/r/revm-handler-8.1.0"), PathBuf::from("/r/revm-context-8.0.4")];
-        let a = parse_export(&export("/r/revm-handler-8.1.0"), &dirs).unwrap();
-        let b = parse_export(&export("/r/revm-context-8.0.4"), &dirs).unwrap();
-        assert_eq!((a.len(), b.len()), (1, 1));
-        assert_ne!(a[0].id, b[0].id);
-        assert_eq!(a[0].location, "revm-handler-8.1.0/src/lib.rs:10:5");
+        let items = parse_export(json, &dirs).unwrap();
+
+        assert_eq!(items.len(), 2, "one item per root, not one shared: {items:?}");
+        assert_ne!(items[0].id, items[1].id);
+        let mut locations: Vec<&str> = items.iter().map(|i| i.location.as_str()).collect();
+        locations.sort_unstable();
+        assert_eq!(
+            locations,
+            ["revm-context-8.0.4/src/lib.rs:10:5", "revm-handler-8.1.0/src/lib.rs:10:5"]
+        );
     }
 
     /// A generic function exports one branch record per instantiation at the
@@ -425,6 +483,38 @@ mod tests {
         assert_eq!(kinds, vec![ItemKind::BranchFalse, ItemKind::BranchTrue]);
     }
 
+    /// llvm-cov lists the files of the coverage map that fall under the
+    /// scope, whatever the block executed — so a root that contributes none
+    /// is a stale path, and llvm-cov reports that with a warning and a
+    /// success exit. Every root has to be checked, not just the scope as a
+    /// whole: a valid mega-evm root alongside a stale revm one would
+    /// otherwise pass while measuring no revm at all.
+    #[test]
+    fn every_source_root_must_contribute_a_file() {
+        let json = r#"{"data":[{"files":[
+            {"filename":"/r/mega/src/a.rs","segments":[[1,1,1,true,true,false]],"branches":[]}]}]}"#;
+        let dirs = [PathBuf::from("/r/mega"), PathBuf::from("/r/revm-handler-8.1.0")];
+
+        let err = parse_export(json, &dirs).expect_err("a root with no file must fail");
+        assert!(err.to_string().contains("/r/revm-handler-8.1.0"), "must name the root: {err}");
+        assert!(err.to_string().contains("matched no source file"), "{err}");
+
+        // The same export is fine for the scope it does cover.
+        assert_eq!(parse_export(json, &dirs[..1]).unwrap().len(), 1);
+    }
+
+    /// A file with no covered region still counts as the root contributing:
+    /// the check is about the scope being matched, not about this block.
+    #[test]
+    fn a_root_whose_files_are_all_uncovered_still_counts() {
+        let json = r#"{"data":[{"files":[
+            {"filename":"/r/mega/src/a.rs","segments":[[1,1,1,true,true,false]],"branches":[]},
+            {"filename":"/r/revm/src/b.rs","segments":[[9,1,0,true,true,false]],"branches":[]}]}]}"#;
+        let dirs = [PathBuf::from("/r/mega"), PathBuf::from("/r/revm")];
+        let items = parse_export(json, &dirs).expect("an uncovered file still matches its root");
+        assert_eq!(items.len(), 1, "only the covered region is an item");
+    }
+
     /// A scope matching nothing is a misconfiguration (sources not at the
     /// build-time path), and must not pass for a block that covered nothing.
     #[test]
@@ -437,6 +527,46 @@ mod tests {
     fn universe_stamp_is_order_independent_and_versioned() {
         let (a, b) = (PathBuf::from("/x/a"), PathBuf::from("/x/b"));
         assert_eq!(universe_stamp(&[a.clone(), b.clone()]), universe_stamp(&[b, a]));
-        assert_eq!(universe_stamp(&[PathBuf::from("/x")]), "regions+branch-arms/v2:/x");
+        assert_eq!(universe_stamp(&[PathBuf::from("/x/mega")]), "regions+branch-arms/v2:mega");
+    }
+
+    /// `merge` compares stamps byte for byte, so shards of one distributed
+    /// scan must stamp identically however their homes are laid out — the
+    /// item ids already do not depend on it.
+    #[test]
+    fn universe_stamp_does_not_depend_on_where_the_roots_live() {
+        let alice = [
+            PathBuf::from("/home/alice/.cargo/git/co/30ce038"),
+            PathBuf::from("/home/alice/.cargo/registry/src/idx/revm-handler-8.1.0"),
+        ];
+        let root = [
+            PathBuf::from("/root/.cargo/registry/src/other/revm-handler-8.1.0"),
+            PathBuf::from("/root/.cargo/git/co/30ce038"),
+        ];
+        assert_eq!(universe_stamp(&alice), universe_stamp(&root));
+        assert_eq!(universe_stamp(&alice), "regions+branch-arms/v2:30ce038,revm-handler-8.1.0");
+    }
+
+    /// The scope gate. A label identifies a root in both the ids and the
+    /// stamp, so duplicates would merge two roots' coverage under one stamp
+    /// that still claimed two; nesting would make "which root owns this file"
+    /// depend on the order the roots were listed in, which the stamp — sorted
+    /// — cannot see.
+    #[test]
+    fn resolve_rejects_duplicate_labels_and_nested_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, nested) =
+            (dir.path().join("a/src"), dir.path().join("b/src"), dir.path().join("a/src/inner"));
+        for d in [&a, &b, &nested] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+
+        let err = resolve_source_dirs(&[a.clone(), b]).expect_err("duplicate label must fail");
+        assert!(err.to_string().contains("\"src\""), "must name the shared component: {err}");
+
+        let err = resolve_source_dirs(&[a.clone(), nested]).expect_err("nested root must fail");
+        assert!(err.to_string().contains("lies inside"), "{err}");
+
+        resolve_source_dirs(&[a, dir.path().join("b")]).expect("distinct disjoint roots are fine");
     }
 }

@@ -66,6 +66,10 @@ fn main() {
             versions.into_iter().map(move |v| format!("{name}-{v}"))
         })
         .collect();
+    // Sorted, because this list is hashed into `binary_id`: reordering
+    // measured-crates.txt must not look like a different instrumented build.
+    let mut measured = measured;
+    measured.sort();
 
     println!("cargo:rustc-env=COVERAGE_MEGA_EVM_REV={mega_evm}");
     println!("cargo:rustc-env=COVERAGE_MEASURED_CRATES={}", measured.join(","));

@@ -124,13 +124,28 @@ pub fn run(args: ReportArgs) -> Result<()> {
         "llvm-cov report failed: {}",
         String::from_utf8_lossy(&report.stderr)
     );
+    let table = String::from_utf8_lossy(&report.stdout);
+    // Same silent omission the export path guards against: llvm-cov answers a
+    // root it cannot match with a warning and a success exit, so a stale one
+    // drops out of the table while the totals still read as a whole-scope
+    // report. llvm-cov strips the longest common prefix from the paths it
+    // prints, so a root is looked for by the component that identifies it.
+    for dir in &source_dirs {
+        let label = dir.file_name().unwrap_or(dir.as_os_str()).to_string_lossy();
+        ensure!(
+            table.contains(label.as_ref()),
+            "llvm-cov reported no file under {} — that root is not the one this binary was \
+             built against, and the totals below would cover the rest of the scope only",
+            dir.display(),
+        );
+    }
 
     info!(
         blocks = manifest.blocks.len(),
         universe_counters = manifest.universe_counters,
         "coverage report for selected set (branch-granular counters: see manifest)"
     );
-    println!("{}", String::from_utf8_lossy(&report.stdout));
+    println!("{table}");
     println!("selected blocks:");
     for b in &manifest.blocks {
         println!(
