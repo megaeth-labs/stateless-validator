@@ -29,15 +29,9 @@
 //! and uses Revm for transaction execution.
 
 use std::{boxed::Box, collections::BTreeMap, fmt::Debug, vec::Vec};
-#[cfg(feature = "std")]
-use std::{io::Write, time::Instant};
 
 use alloy_consensus::{TxReceipt, proofs::calculate_receipt_root, transaction::Recovered};
-use alloy_eips::eip2718::Encodable2718;
-use alloy_evm::{
-    EvmEnv,
-    block::{BlockExecutor, ExecutableTx},
-};
+use alloy_evm::{EvmEnv, block::BlockExecutor};
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{
     Bloom, keccak256,
@@ -50,8 +44,6 @@ use mega_evm::{
 };
 use op_alloy_consensus::OpTxEnvelope;
 use op_alloy_rpc_types::Transaction as OpTransaction;
-#[cfg(feature = "std")]
-use revm::inspector::inspectors::TracerEip3155;
 use revm::{
     DatabaseRef,
     context::{BlockEnv, CfgEnv},
@@ -375,7 +367,6 @@ pub fn replay_block<B, DB, ENV, E>(
     block: &B,
     db: &DB,
     env_oracle: ENV,
-    #[cfg(feature = "std")] trace_writer: Option<Box<dyn Write>>,
 ) -> Result<(AddressMap<BundleAccount>, BlockExecutionOutput), ValidationError>
 where
     B: BlockInput,
@@ -419,28 +410,22 @@ where
         block_limits,
     );
 
-    // Plain execution path, shared by the non-tracer std branch and the no_std build.
-    // Extracted as a closure so the body lives in one place — any future change to the
-    // non-tracer path only needs to be made here.
-    let run_plain = |state: &mut _, ctx, env| {
-        let executor = executor_factory.create_executor(state, ctx, env);
-        execute_transactions(executor, block.txs_recovered())
-    };
+    let mut executor = executor_factory.create_executor(&mut state, execution_context, evm_env);
+    executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
+    for recovered_tx in block.txs_recovered() {
+        executor.execute_transaction(recovered_tx).map_err(ValidationError::BlockReplayFailed)?;
+    }
+    let execution_result =
+        executor.apply_post_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
 
-    #[cfg(feature = "std")]
-    let (receipts_root, logs_bloom, gas_used) = if let Some(writer) = trace_writer {
-        let executor = executor_factory.create_executor_with_inspector(
-            &mut state,
-            execution_context,
-            evm_env,
-            TracerEip3155::new(writer),
-        );
-        execute_transactions(executor, block.txs_recovered())?
-    } else {
-        run_plain(&mut state, execution_context, evm_env)?
-    };
-    #[cfg(not(feature = "std"))]
-    let (receipts_root, logs_bloom, gas_used) = run_plain(&mut state, execution_context, evm_env)?;
+    // Compute logs bloom by ORing all receipt blooms together
+    let logs_bloom =
+        execution_result.receipts.iter().fold(Bloom::ZERO, |acc, receipt| acc | receipt.bloom());
+
+    // Gas used is the cumulative gas used of the last receipt
+    let gas_used = execution_result.receipts.last().map(|r| r.cumulative_gas_used()).unwrap_or(0);
+
+    let receipts_root = calculate_receipt_root(&execution_result.receipts);
 
     // Merge transitions into bundle_state
     state.merge_transitions(BundleRetention::PlainState);
@@ -472,38 +457,6 @@ where
             state_writes,
         },
     ))
-}
-
-/// Executes a stream of recovered transactions using the given block executor.
-fn execute_transactions<'a, E, I>(
-    mut executor: E,
-    transactions: I,
-) -> Result<(B256, Bloom, u64), ValidationError>
-where
-    E: BlockExecutor<Transaction = OpTxEnvelope>,
-    E::Receipt: Encodable2718 + TxReceipt,
-    I: Iterator<Item = Recovered<&'a OpTxEnvelope>>,
-    for<'b> Recovered<&'b OpTxEnvelope>: ExecutableTx<E>,
-{
-    executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
-
-    for recovered_tx in transactions {
-        executor.execute_transaction(recovered_tx).map_err(ValidationError::BlockReplayFailed)?;
-    }
-
-    let execution_result =
-        executor.apply_post_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
-
-    // Compute logs bloom by ORing all receipt blooms together
-    let logs_bloom =
-        execution_result.receipts.iter().fold(Bloom::ZERO, |acc, receipt| acc | receipt.bloom());
-
-    // Gas used is the cumulative gas used of the last receipt
-    let gas_used = execution_result.receipts.last().map(|r| r.cumulative_gas_used()).unwrap_or(0);
-
-    let receipts_root = calculate_receipt_root(&execution_result.receipts);
-
-    Ok((receipts_root, logs_bloom, gas_used))
 }
 
 /// Extracts the withdrawal-contract storage updates (only changed slots) from the replayed
@@ -638,7 +591,7 @@ fn verify_replay_outputs(
 /// measured"). On error the elapsed time is discarded with the stage's result.
 fn timed<T, E>(f: impl FnOnce() -> Result<T, E>) -> Result<(T, f64), E> {
     #[cfg(feature = "std")]
-    let start = Instant::now();
+    let start = std::time::Instant::now();
     let result = f()?;
     #[cfg(feature = "std")]
     let elapsed = start.elapsed().as_secs_f64();
@@ -669,7 +622,6 @@ fn verify_and_replay<B: BlockInput>(
     block: &B,
     salt_witness: SaltWitness,
     contracts: &HashMap<B256, Bytecode>,
-    #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
 ) -> Result<VerifiedReplay, ValidationError> {
     let header = block.consensus_header();
 
@@ -687,14 +639,7 @@ fn verify_and_replay<B: BlockInput>(
     // Replay block transactions
     let ((accounts, output), block_replay_time) = timed(|| {
         let witness_db = WitnessDatabase { header, witness: &witness, contracts };
-        replay_block(
-            chain_spec,
-            block,
-            &witness_db,
-            ext_env,
-            #[cfg(feature = "std")]
-            writer,
-        )
+        replay_block(chain_spec, block, &witness_db, ext_env)
     })?;
 
     let stats = ValidationStats {
@@ -724,8 +669,6 @@ fn verify_and_replay<B: BlockInput>(
 /// * `salt_witness` - The salt witness data needed for state validation
 /// * `mpt_witness` - The MPT witness data for withdrawal verification
 /// * `contracts` - Contract bytecode cache for transaction execution
-/// * `writer` - Optional writer for EIP-3155 trace output. When provided, enables step-by-step EVM
-///   execution tracing in EIP-3155 format.
 ///
 /// # Returns
 ///
@@ -737,7 +680,6 @@ pub fn validate_block<B: BlockInput>(
     salt_witness: SaltWitness,
     mpt_witness: MptWitness,
     contracts: &HashMap<B256, Bytecode>,
-    #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
 ) -> Result<ValidationStats, ValidationError> {
     // A block carrying only transaction hashes can't be replayed — fail fast before paying
     // the witness proof verification. `replay_block` re-checks for direct callers.
@@ -747,14 +689,8 @@ pub fn validate_block<B: BlockInput>(
     let header = block.consensus_header();
 
     // Verify the witness proof and replay the block's transactions over it
-    let VerifiedReplay { witness, accounts, output, mut stats } = verify_and_replay(
-        chain_spec,
-        block,
-        salt_witness,
-        contracts,
-        #[cfg(feature = "std")]
-        writer,
-    )?;
+    let VerifiedReplay { witness, accounts, output, mut stats } =
+        verify_and_replay(chain_spec, block, salt_witness, contracts)?;
 
     // Extract and hash storage updates (only changed values)
     let withdrawal_storage = withdrawal_storage(&accounts);
@@ -814,7 +750,6 @@ pub fn validate_block_deriving_updates<B: BlockInput>(
     mpt_witness: MptWitness,
     contracts: &HashMap<B256, Bytecode>,
     options: ValidationOptions,
-    #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
 ) -> Result<(StateUpdates, ValidationStats), ValidationError> {
     // A block carrying only transaction hashes can't be replayed — fail fast before paying
     // the witness proof verification. `replay_block` re-checks for direct callers.
@@ -843,14 +778,8 @@ pub fn validate_block_deriving_updates<B: BlockInput>(
     }
 
     // Verify the witness proof and replay the block's transactions over it
-    let VerifiedReplay { witness, accounts, output, mut stats } = verify_and_replay(
-        chain_spec,
-        block,
-        salt_witness,
-        contracts,
-        #[cfg(feature = "std")]
-        writer,
-    )?;
+    let VerifiedReplay { witness, accounts, output, mut stats } =
+        verify_and_replay(chain_spec, block, salt_witness, contracts)?;
 
     // Check the header's claims (withdrawals root, receipts root, logs bloom, gas used)
     // before the more expensive state-update derivation.
@@ -892,8 +821,6 @@ mod tests {
             fx.mpt_witness(&hash),
             &fx.contracts,
             options,
-            #[cfg(feature = "std")]
-            None,
         )
     }
 
@@ -904,15 +831,7 @@ mod tests {
         salt_witness: SaltWitness,
         hash: B256,
     ) -> Result<ValidationStats, ValidationError> {
-        validate_block(
-            &chain_spec(),
-            block,
-            salt_witness,
-            fx.mpt_witness(&hash),
-            &fx.contracts,
-            #[cfg(feature = "std")]
-            None,
-        )
+        validate_block(&chain_spec(), block, salt_witness, fx.mpt_witness(&hash), &fx.contracts)
     }
 
     /// The fixture witness for `hash` with the first byte of one witnessed (non-metadata)
