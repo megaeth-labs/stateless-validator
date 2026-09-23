@@ -53,7 +53,7 @@ use stateless_core::{
     ContractStore, LightWitness, StoreResult, db::StoreError, withdrawals::MptWitness,
 };
 use stateless_db::ContractCache;
-use tracing::{debug, instrument, trace, warn};
+use tracing::{debug, error, instrument, trace, warn};
 
 use crate::{
     block_data_cache::BlockDataCache,
@@ -1345,19 +1345,35 @@ async fn fetch_witness(
         }
         Err(e) => {
             metrics.record_request(false, start.elapsed().as_secs_f64());
-            let budget = deadline.saturating_duration_since(start);
-            // Attribution-grade context for the next timeout incident: the effective stage
-            // budget, the route taken, and whether the old-block clamp applied — the client
-            // only ever sees the generic `-32001` message.
-            warn!(
-                block_number,
-                block_hash = %block_hash,
-                source,
-                old_block = is_old_block(db_tip, block_number),
-                budget_ms = budget.as_millis() as u64,
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "Witness fetch deadline exceeded",
-            );
+            match &e {
+                WitnessFetchError::Deadline(_) => {
+                    let budget = deadline.saturating_duration_since(start);
+                    // Attribution-grade context for the next timeout incident: the effective
+                    // stage budget, the route taken, and whether the old-block clamp applied —
+                    // the client only ever sees the generic `-32001` message.
+                    warn!(
+                        block_number,
+                        block_hash = %block_hash,
+                        source,
+                        old_block = is_old_block(db_tip, block_number),
+                        budget_ms = budget.as_millis() as u64,
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        "Witness fetch deadline exceeded",
+                    );
+                }
+                // A routing bug, not a timeout: no upstream attempt ran, so the deadline
+                // warning and its budget fields would misattribute it.
+                WitnessFetchError::NoProviderInRange { skip, configured } => {
+                    error!(
+                        block_number,
+                        block_hash = %block_hash,
+                        source,
+                        skip,
+                        configured,
+                        "Witness route selected no configured provider",
+                    );
+                }
+            }
             Err(e.into())
         }
     }
