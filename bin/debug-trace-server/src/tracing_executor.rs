@@ -108,23 +108,23 @@ struct TracingEnv<'a> {
     >,
     block_ctx: MegaBlockExecutionCtx,
     evm_env: alloy_evm::EvmEnv<mega_evm::MegaSpecId>,
-    light_witness_executor: LightWitnessExecutor,
+    light_witness_executor: &'a LightWitnessExecutor,
 }
 
 impl<'a> TracingEnv<'a> {
     fn new(
         chain_spec: &ChainSpec,
         block: &'a Block<OpTransaction>,
-        light_witness: LightWitness,
+        witness: &'a LightWitnessExecutor,
     ) -> Result<Self, ValidationError> {
         let BlockTransactions::Full(transactions) = &block.transactions else {
             return Err(ValidationError::BlockIncomplete);
         };
 
-        let ext_env = WitnessExternalEnv::from_light_witness(&light_witness, block.header.number)
-            .map_err(ValidationError::EnvOracleConstructionFailed)?;
+        let ext_env =
+            WitnessExternalEnv::from_light_witness(witness.light_witness(), block.header.number)
+                .map_err(ValidationError::EnvOracleConstructionFailed)?;
 
-        let light_witness_executor = LightWitnessExecutor::from(light_witness);
         let evm_env = create_evm_env(&block.header.inner, chain_spec);
 
         let evm_factory = MegaEvmFactory::new().with_external_env_factory(ext_env);
@@ -155,7 +155,7 @@ impl<'a> TracingEnv<'a> {
             executor_factory,
             block_ctx,
             evm_env,
-            light_witness_executor,
+            light_witness_executor: witness,
         })
     }
 
@@ -163,7 +163,7 @@ impl<'a> TracingEnv<'a> {
         &'b self,
         contracts: &'b HashMap<B256, Bytecode>,
     ) -> WitnessDatabase<'b, LightWitnessExecutor> {
-        WitnessDatabase { header: self.header, witness: &self.light_witness_executor, contracts }
+        WitnessDatabase { header: self.header, witness: self.light_witness_executor, contracts }
     }
 }
 
@@ -490,7 +490,7 @@ fn trace_tx_with_tracing_inspector(
 pub fn trace_block(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
-    witness: LightWitness,
+    witness: &LightWitnessExecutor,
     contracts: &HashMap<B256, Bytecode>,
     opts: GethDebugTracingOptions,
 ) -> Result<Vec<TraceResult>, TraceError> {
@@ -703,7 +703,7 @@ pub fn trace_transaction(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
     tx_index: usize,
-    light_witness: LightWitness,
+    light_witness: &LightWitnessExecutor,
     contracts: &HashMap<B256, Bytecode>,
     opts: GethDebugTracingOptions,
 ) -> Result<GethTrace, TraceError> {
@@ -826,7 +826,7 @@ pub fn trace_transaction(
 pub fn parity_trace_block(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
-    light_witness: LightWitness,
+    light_witness: &LightWitnessExecutor,
     contracts: &HashMap<B256, Bytecode>,
 ) -> Result<Vec<LocalizedTransactionTrace>, TraceError> {
     let env = TracingEnv::new(chain_spec, block, light_witness)?;
@@ -877,7 +877,7 @@ pub fn parity_trace_transaction(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
     tx_index: usize,
-    light_witness: LightWitness,
+    light_witness: &LightWitnessExecutor,
     contracts: &HashMap<B256, Bytecode>,
 ) -> Result<Vec<LocalizedTransactionTrace>, TraceError> {
     let env = TracingEnv::new(chain_spec, block, light_witness)?;
@@ -1058,7 +1058,7 @@ mod tests {
         let err = trace_block(
             &chain_spec,
             &block,
-            witness.clone(),
+            &witness,
             &HashMap::default(),
             GethDebugTracingOptions::default(),
         )
@@ -1070,7 +1070,7 @@ mod tests {
             tracer_config: GethDebugTracerConfig(serde_json::json!({"bogusTracer": {}})),
             ..Default::default()
         };
-        let err = trace_block(&chain_spec, &block, witness, &contracts, opts)
+        let err = trace_block(&chain_spec, &block, &witness, &contracts, opts)
             .expect_err("an unparsable mux config must be rejected");
         assert!(matches!(err, TraceError::Request(_)), "got: {err:?}");
     }
@@ -1107,14 +1107,14 @@ mod tests {
                 ..Default::default()
             };
 
-            let err = trace_block(&chain_spec, &block, witness.clone(), &contracts, opts.clone())
+            let err = trace_block(&chain_spec, &block, &witness, &contracts, opts.clone())
                 .expect_err("malformed config must fail the block trace");
             assert!(
                 matches!(&err, TraceError::Request(msg) if msg.contains("tracerConfig")),
                 "got: {err:?}"
             );
 
-            let err = trace_transaction(&chain_spec, &block, 0, witness.clone(), &contracts, opts)
+            let err = trace_transaction(&chain_spec, &block, 0, &witness, &contracts, opts)
                 .expect_err("malformed config must fail the tx trace");
             assert!(
                 matches!(&err, TraceError::Request(msg) if msg.contains("tracerConfig")),
@@ -1130,7 +1130,7 @@ mod tests {
             tracer_config: GethDebugTracerConfig(serde_json::json!({"onlyTopCall": true})),
             ..Default::default()
         };
-        trace_block(&chain_spec, &block, witness, &contracts, opts)
+        trace_block(&chain_spec, &block, &witness, &contracts, opts)
             .expect("a well-formed config must trace");
     }
 }

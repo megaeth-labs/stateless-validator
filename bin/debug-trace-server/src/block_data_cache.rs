@@ -81,7 +81,8 @@ const AUTHORIZATION_BYTES: u64 = 192;
 /// which quick_cache re-invokes on admission, promotion, and eviction, under a shard
 /// lock — never re-walks the payload.
 pub fn block_data_weight(data: &BlockData) -> u64 {
-    let witness = light_witness_memory_bytes(&data.witness) as u64;
+    let witness = (light_witness_memory_bytes(data.witness.light_witness()) +
+        data.witness.lookup_table_memory_bytes()) as u64;
     let contracts: u64 = data.contracts.values().map(bytecode_weight).sum();
     let block = BLOCK_FIXED_OVERHEAD +
         match &data.block.transactions {
@@ -246,7 +247,8 @@ mod tests {
     #[test]
     fn weigher_charges_witness_contracts_and_transactions() {
         let data = fixture_block_data();
-        let witness_bytes = light_witness_memory_bytes(&data.witness) as u64;
+        let witness_bytes = (light_witness_memory_bytes(data.witness.light_witness()) +
+            data.witness.lookup_table_memory_bytes()) as u64;
         let contract_bytes: u64 = data.contracts.values().map(bytecode_weight).sum();
 
         let weight = block_data_weight(&data);
