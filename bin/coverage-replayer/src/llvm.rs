@@ -296,6 +296,45 @@ pub fn extract_covered_items(
     Ok((items, profdata))
 }
 
+/// Fails unless every configured root prefixes at least one file llvm-cov
+/// listed.
+///
+/// Which files llvm-cov lists is decided by the coverage map and the scope,
+/// not by what a profile executed — so every root contributes the same files
+/// whatever was replayed, and a root contributing none is a configuration
+/// error rather than an uneventful block. It has to be checked per root:
+/// llvm-cov answers a root it cannot match with a warning on stderr and a
+/// success exit, so a stale one would silently contribute nothing while the
+/// store's stamp went on claiming its scope. Roots are matched as given, never
+/// canonicalized, because llvm-cov matches the absolute paths baked in at
+/// BUILD time — the sources must sit where they sat for the build, spelled
+/// the same way. The one definition both the per-block export and `report`
+/// check through.
+pub fn ensure_every_root_matched(filenames: &[&str], source_dirs: &[PathBuf]) -> Result<()> {
+    for dir in source_dirs {
+        ensure!(
+            filenames.iter().any(|f| Path::new(f).starts_with(dir)),
+            "llvm-cov matched no source file under {} — that root is not the one the \
+             instrumented binary was built against, so nothing under it is measured",
+            dir.display(),
+        );
+    }
+    Ok(())
+}
+
+/// [`ensure_every_root_matched`] over an `llvm-cov export` document — any
+/// flavour, `--summary-only` included, since every one lists `files[].filename`
+/// as absolute paths (unlike `llvm-cov report`, which strips their common
+/// prefix and so cannot tell which root a row came from).
+pub fn ensure_export_covers_every_root(json: &str, source_dirs: &[PathBuf]) -> Result<()> {
+    let root: serde_json::Value = serde_json::from_str(json).wrap_err("parse llvm-cov export")?;
+    let files = root["data"][0]["files"]
+        .as_array()
+        .ok_or_else(|| eyre::eyre!("llvm-cov export has no data[0].files"))?;
+    let filenames: Vec<&str> = files.iter().filter_map(|f| f["filename"].as_str()).collect();
+    ensure_every_root_matched(&filenames, source_dirs)
+}
+
 /// Parses `llvm-cov export --format=text --skip-functions` output.
 ///
 /// Per file: `segments` are `[line, col, count, has_count, is_region_entry,
@@ -309,26 +348,8 @@ pub fn parse_export(json: &str, source_dirs: &[PathBuf]) -> Result<Vec<CoveredIt
     let files = root["data"][0]["files"]
         .as_array()
         .ok_or_else(|| eyre::eyre!("llvm-cov export has no data[0].files"))?;
-    // Which files llvm-cov lists is decided by the coverage map and the scope,
-    // not by what this block executed — so every configured root contributes
-    // the same files on every block, and a root contributing none is a
-    // configuration error rather than an uneventful block. It has to be
-    // checked per root: llvm-cov answers a root it cannot match with a warning
-    // on stderr and a success exit, so a stale one would silently contribute
-    // no items at all while the store's stamp went on claiming its scope.
-    // Roots are matched as given, never canonicalized, because llvm-cov
-    // matches the absolute paths baked in at BUILD time — the sources must sit
-    // where they sat for the build, spelled the same way.
-    for dir in source_dirs {
-        ensure!(
-            files.iter().any(|file| {
-                file["filename"].as_str().is_some_and(|f| Path::new(f).starts_with(dir))
-            }),
-            "llvm-cov export matched no source file under {} — that root is not the one the \
-             instrumented binary was built against, so nothing under it would be measured",
-            dir.display(),
-        );
-    }
+    let filenames: Vec<&str> = files.iter().filter_map(|f| f["filename"].as_str()).collect();
+    ensure_every_root_matched(&filenames, source_dirs)?;
 
     let nonzero = |v: &serde_json::Value| {
         v.as_u64().is_some_and(|n| n > 0) || v.as_f64().is_some_and(|n| n > 0.0)
@@ -501,6 +522,24 @@ mod tests {
 
         // The same export is fine for the scope it does cover.
         assert_eq!(parse_export(json, &dirs[..1]).unwrap().len(), 1);
+    }
+
+    /// The case a label (or any substring) test gets wrong: a stale root named
+    /// `src` "appears" in every other root's paths. Matching is by path
+    /// prefix, so it is refused all the same — on the summary exports `report`
+    /// reads as much as on the per-block ones.
+    #[test]
+    fn a_stale_root_is_refused_even_when_its_name_appears_in_other_paths() {
+        let summary = r#"{"data":[{"files":[
+            {"filename":"/x/crates/mega-evm/src/evm.rs","summary":{}},
+            {"filename":"/x/crates/mega-evm/src/lib.rs","summary":{}}]}]}"#;
+        let valid = PathBuf::from("/x");
+        let stale = PathBuf::from("/y/src");
+
+        let err = ensure_export_covers_every_root(summary, &[valid.clone(), stale])
+            .expect_err("a root no file lies under must fail");
+        assert!(err.to_string().contains("/y/src"), "must name the stale root: {err}");
+        ensure_export_covers_every_root(summary, &[valid]).expect("the real root matches");
     }
 
     /// A file with no covered region still counts as the root contributing:

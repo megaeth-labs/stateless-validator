@@ -49,6 +49,14 @@ pub struct SetCoverArgs {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Manifest {
     pub binary_id: String,
+    /// The universe stamp of the store the cover was computed from — the
+    /// scope its blocks are guaranteed to cover. `report` refuses to measure
+    /// the set against any other scope: the archived profiles hold counters
+    /// for every instrumented crate, so llvm-cov would happily report a wider
+    /// scope than the cover was built for, and read the gap as uncovered code.
+    /// Absent in manifests written before it was recorded.
+    #[serde(default)]
+    pub universe: Option<String>,
     pub generated_at_unix: u64,
     pub universe_counters: u64,
     pub covered_counters: u64,
@@ -131,6 +139,9 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
 
     let manifest = Manifest {
         binary_id,
+        // What backfill stamped the store with, not a re-derivation from
+        // flags: it cannot drift from the scan that produced the profiles.
+        universe: store.universe()?,
         generated_at_unix: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
