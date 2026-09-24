@@ -152,7 +152,7 @@ pub struct CommandLineArgs {
     /// evenly, so raising this alone spreads the same concurrency thinner; a count above that
     /// cap is rejected.
     ///
-    /// Text rather than a number so a blank env line is named rather than hitting clap.
+    /// Text rather than a number so a blank env line is diagnosed by the R2 rules, not by clap.
     #[clap(long, env = "STATELESS_VALIDATOR_R2_CONNECTIONS")]
     pub r2_connections: Option<String>,
 
@@ -409,9 +409,8 @@ fn override_ms(ms: Option<u64>, default: Duration) -> Duration {
 
 /// The RPC witness endpoints, which are always required.
 ///
-/// Checked here rather than by clap's `required`: this workspace builds clap without its
-/// `error-context` feature, so a clap rejection names no argument, and these deployments are
-/// configured through env files where an unnamed error costs a translation round trip.
+/// Checked here rather than by clap's `required`, so the error names the env variable these
+/// deployments are configured through and says why the flag is needed even when R2 is set up.
 fn witness_apis(args: &CommandLineArgs) -> Result<Vec<&str>> {
     if args.witness_endpoint.is_empty() {
         return Err(eyre::eyre!(

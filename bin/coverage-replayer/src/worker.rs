@@ -3,7 +3,8 @@
 //! Spawned by the dispatcher as `coverage-replayer internal-worker ...`. Reads
 //! one JSONL [`WorkerRequest`] per line from stdin, replays the block with
 //! per-block counter isolation (reset → execute → write profraw), extracts the
-//! covered items, and answers with one JSONL [`WorkerResponse`].
+//! covered items, and answers with one JSONL [`WorkerResponse`] on stdout —
+//! which it holds exclusively (see [`protocol_channel`]).
 //!
 //! The worker deliberately does NOT verify the witness or recompute state
 //! roots — correctness is guaranteed by the production stateless validator.
@@ -12,6 +13,8 @@
 //! before it can poison the coverage store.
 
 use std::{
+    collections::HashSet,
+    fs::File,
     io::{BufRead, Write as _},
     path::PathBuf,
     time::Instant,
@@ -20,6 +23,7 @@ use std::{
 use alloy_rpc_types_eth::Block;
 use clap::Args;
 use eyre::{Context, Result};
+use mega_evm::{MegaPrecompiles, MegaSpecId};
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use stateless_core::{
     LightWitnessExecutor, WitnessDatabase, WitnessExternalEnv, chain_spec::ChainSpec, replay_block,
@@ -27,8 +31,8 @@ use stateless_core::{
 
 use crate::{
     llvm,
-    proto::{WorkerRequest, WorkerResponse},
-    spool::{self, SpoolEntry, write_atomic},
+    proto::{ItemDetail, WorkerRequest, WorkerResponse},
+    spool::{self, SpoolEntry},
 };
 
 #[derive(Args, Debug, Clone)]
@@ -39,7 +43,7 @@ pub struct WorkerArgs {
     /// Content-addressed contract bytecode directory.
     #[clap(long)]
     pub codes_dir: PathBuf,
-    /// Directory for per-block profraw / symbol sidecar files.
+    /// Directory for per-block profraw / profdata files.
     #[clap(long)]
     pub tmp_dir: PathBuf,
     /// Path to llvm-profdata.
@@ -70,13 +74,15 @@ pub fn load_chain_spec(genesis_file: &str) -> Result<ChainSpec> {
 
 /// Entry point of the worker subprocess. Loops until stdin closes.
 pub fn run(args: WorkerArgs) -> Result<()> {
+    let mut protocol = protocol_channel()?;
     let chain_spec = load_chain_spec(&args.genesis_file)?;
     // llvm-cov reads the coverage map out of the binary that wrote the
-    // profile — this one.
-    let exe = std::env::current_exe().wrap_err("resolve the worker executable")?;
+    // profile — this one, as it is running.
+    let exe = crate::profile_rt::own_executable()?;
+    warm_up();
 
+    let mut reported = HashSet::new();
     let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -84,13 +90,53 @@ pub fn run(args: WorkerArgs) -> Result<()> {
         }
         let req: WorkerRequest = serde_json::from_str(&line)
             .map_err(|e| eyre::eyre!("bad worker request {line:?}: {e}"))?;
-        let resp = process_block(&args, &exe, &chain_spec, &req)
+        let resp = process_block(&args, &exe, &chain_spec, &req, &mut reported)
             .unwrap_or_else(|e| error_response(req.block, format!("{e:#}")));
-        serde_json::to_writer(&mut stdout, &resp)?;
-        stdout.write_all(b"\n")?;
-        stdout.flush()?;
+        let mut frame = serde_json::to_vec(&resp)?;
+        frame.push(b'\n');
+        protocol.write_all(&frame)?;
     }
     Ok(())
+}
+
+/// Takes stdout for the protocol alone: returns a private duplicate of fd 1
+/// and points fd 1 itself at stderr.
+///
+/// The replay stack underneath is not ours, and anything in it that prints —
+/// a Rust `println!`, a C `printf` — writes to fd 1. On a shared channel such a
+/// print can land inside a response frame and tear it, and a torn frame stalls
+/// its block forever, since blocks are never killed. With the frames on a
+/// descriptor nothing else knows about, every stray print ends up in the
+/// worker's log instead. Runs before anything else in the worker, so nothing
+/// is buffered for fd 1 yet.
+fn protocol_channel() -> Result<File> {
+    use std::os::fd::AsFd;
+    let protocol = std::io::stdout().as_fd().try_clone_to_owned().wrap_err("duplicate stdout")?;
+    // SAFETY: dup2 on two descriptors that are open for the life of the
+    // process; it closes and replaces fd 1 atomically and touches no memory.
+    let rc = unsafe { libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) };
+    eyre::ensure!(rc != -1, "redirect stdout to stderr: {}", std::io::Error::last_os_error());
+    Ok(File::from(protocol))
+}
+
+/// Runs the process-lifetime initializers inside the measured code before any
+/// block is captured.
+///
+/// mega-evm and op-revm build each hardfork's precompile table lazily, once
+/// per process (`OnceBox::get_or_init`): mega-evm's `rex` and `mini_rex`,
+/// op-revm's `isthmus`, `granite` and `fjord`. Left to the blocks, those
+/// closures are covered by the first block a worker replays — and the first
+/// block of each later table it meets — so the same block records different
+/// coverage depending on where it fell in some worker's queue. Built here,
+/// they are covered by no block, and `process_block`'s counter reset
+/// discards the warm-up itself. The latest spec (`default()`) is included so
+/// a table that only it uses is built as well.
+fn warm_up() {
+    for spec in
+        [MegaSpecId::EQUIVALENCE, MegaSpecId::MINI_REX, MegaSpecId::REX, MegaSpecId::default()]
+    {
+        let _ = MegaPrecompiles::new_with_spec(spec);
+    }
 }
 
 fn error_response(block: u64, error: String) -> WorkerResponse {
@@ -104,7 +150,7 @@ fn error_response(block: u64, error: String) -> WorkerResponse {
         logs_bloom_ok: false,
         counters: Vec::new(),
         profile: PathBuf::new(),
-        symbols_tsv: PathBuf::new(),
+        new_items: Vec::new(),
         elapsed_ms: 0,
         tx_count: 0,
         gas_used: 0,
@@ -116,6 +162,7 @@ fn process_block(
     exe: &std::path::Path,
     chain_spec: &ChainSpec,
     req: &WorkerRequest,
+    reported: &mut HashSet<u64>,
 ) -> Result<WorkerResponse> {
     let start = Instant::now();
 
@@ -164,16 +211,16 @@ fn process_block(
     // name table) and the sparse profdata supersedes it either way.
     let _ = std::fs::remove_file(&profraw);
     let (hits, profile) = extracted?;
-
-    // Sidecar with full item details, read by the dispatcher only for ids it
-    // has never seen before (rare after warm-up).
-    let symbols_tsv = args.tmp_dir.join(format!("block_{}.symbols.tsv.zst", req.block));
-    let mut tsv = String::with_capacity(hits.len() * 96);
-    for h in &hits {
-        use std::fmt::Write as _;
-        let _ = writeln!(tsv, "{:016x}\t{}\t{}\t{}", h.id, h.line, h.kind.as_str(), h.location);
-    }
-    write_atomic(&symbols_tsv, &zstd::encode_all(tsv.as_bytes(), 1)?)?;
+    let new_items = hits
+        .iter()
+        .filter(|h| reported.insert(h.id))
+        .map(|h| ItemDetail {
+            id: h.id,
+            line: h.line,
+            kind: h.kind.as_str().to_string(),
+            location: h.location.clone(),
+        })
+        .collect();
 
     Ok(WorkerResponse {
         block: req.block,
@@ -185,7 +232,7 @@ fn process_block(
         logs_bloom_ok,
         counters: hits.into_iter().map(|h| h.id).collect(),
         profile,
-        symbols_tsv,
+        new_items,
         elapsed_ms: start.elapsed().as_millis() as u64,
         tx_count: block.transactions.len() as u64,
         gas_used: output.gas_used,

@@ -71,6 +71,28 @@ fn main() {
     let mut measured = measured;
     measured.sort();
 
+    // Where the build found its sources and its LLVM. llvm-cov matches the
+    // absolute source paths baked into the coverage map, so the default scope
+    // is looked up under the cargo home the build used, not under whatever
+    // $HOME the binary later runs with; and the LLVM tools that read this
+    // binary's profiles are the ones shipped with the toolchain that built it.
+    let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| {
+        let home = std::env::var("HOME")
+            .expect("coverage-replayer build: neither CARGO_HOME nor HOME is set");
+        format!("{home}/.cargo")
+    });
+    let sysroot = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .expect("coverage-replayer build: `rustc --print sysroot` failed");
+
+    println!("cargo:rustc-env=COVERAGE_CARGO_HOME={cargo_home}");
+    println!("cargo:rustc-env=COVERAGE_RUSTC_SYSROOT={sysroot}");
+    println!("cargo:rerun-if-env-changed=CARGO_HOME");
+    println!("cargo:rerun-if-env-changed=HOME");
     println!("cargo:rustc-env=COVERAGE_MEGA_EVM_REV={mega_evm}");
     println!("cargo:rustc-env=COVERAGE_MEASURED_CRATES={}", measured.join(","));
     println!("cargo:rerun-if-changed=measured-crates.txt");

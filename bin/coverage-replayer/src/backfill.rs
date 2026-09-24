@@ -11,9 +11,9 @@
 //! ```
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -32,7 +32,7 @@ use tracing::{info, warn};
 use crate::{
     bitset::BitSet,
     llvm,
-    proto::{WorkerRequest, WorkerResponse},
+    proto::{ItemDetail, WorkerRequest, WorkerResponse},
     spool::{DataDir, SpoolEntry, write_atomic},
     store::{
         BlockRecord, BlockStatus, CounterInfo, PatternRecord, Store, StoreSnapshot,
@@ -40,7 +40,7 @@ use crate::{
     },
 };
 
-/// Witness source selector (mirrors the validator's `--witness-source`).
+/// Where witnesses come from.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WitnessSource {
     /// `mega_getBlockWitness` RPC.
@@ -124,15 +124,18 @@ pub struct BackfillArgs {
     pub fetch_concurrency: usize,
     /// Source directories scoping the coverage universe — the same scope
     /// `report` measures. Default: the mega-evm checkout this binary was built
-    /// against, found under `$HOME/.cargo/git/checkouts` (which `sudo`
-    /// changes). llvm-cov matches the absolute paths baked in at build time,
-    /// so the sources must sit where they sat for the build.
+    /// against plus the crates in `measured-crates.txt` at their locked
+    /// versions, found under the cargo home the build used. llvm-cov matches
+    /// the absolute paths baked in at build time, so the sources must sit
+    /// where they sat for the build.
     #[clap(long = "source-dir")]
     pub source_dirs: Vec<PathBuf>,
-    /// Explicit llvm-profdata path (default: auto-detect via rustc sysroot).
+    /// Explicit llvm-profdata path (default: the `llvm-tools` of the toolchain
+    /// that built this binary).
     #[clap(long)]
     pub llvm_profdata: Option<String>,
-    /// Explicit llvm-cov path (default: auto-detect via rustc sysroot).
+    /// Explicit llvm-cov path (default: the `llvm-tools` of the toolchain that
+    /// built this binary).
     #[clap(long)]
     pub llvm_cov: Option<String>,
     /// Interval (seconds) for the "block still executing" progress warning.
@@ -252,12 +255,13 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     crate::worker::load_chain_spec(&args.genesis_file)?;
 
     let dirs = Arc::new(DataDir::new(&args.data_dir));
+    crate::profile_rt::ensure_literal_profile_dir(&dirs.tmp())?;
     dirs.ensure_layout()?;
     let binary_id = current_binary_id();
     info!(binary_id, "opening store");
     // Resolved once, here: every worker of the run must agree on the scope,
-    // and a scope that cannot work (sources missing, `sudo` moved $HOME) has
-    // to stop the run before any block is replayed.
+    // and a scope that cannot work (sources missing or ambiguous) has to stop
+    // the run before any block is replayed.
     let source_dirs = llvm::resolve_source_dirs(&args.source_dirs)?;
     let universe = llvm::universe_stamp(&source_dirs);
     info!(universe, "coverage universe");
@@ -388,6 +392,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     drop(judged_tx);
 
     // ---- fetch stage ----
+    let verified_codes = Arc::new(VerifiedCodes::default());
     let fetcher = {
         let dirs = dirs.clone();
         let client = client.clone();
@@ -405,6 +410,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
                 let dirs = dirs.clone();
                 let client = client.clone();
                 let r2 = r2.clone();
+                let verified_codes = verified_codes.clone();
                 // Retry until success — a block is never skipped. Transient
                 // RPC/IO failures resolve on retry; a persistent failure loops
                 // visibly in the log until the operator intervenes.
@@ -412,7 +418,15 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
                     let mut attempt = 0u64;
                     let mut block_cache = None;
                     loop {
-                        match fetch_block(&client, r2.as_deref(), &dirs, n, &mut block_cache).await
+                        match fetch_block(
+                            &client,
+                            r2.as_deref(),
+                            &dirs,
+                            &verified_codes,
+                            n,
+                            &mut block_cache,
+                        )
+                        .await
                         {
                             Ok(()) => break n,
                             Err(e) => {
@@ -485,6 +499,7 @@ async fn fetch_block(
     client: &RpcClient,
     r2: Option<&crate::r2::R2LightClient>,
     dirs: &DataDir,
+    verified_codes: &Arc<VerifiedCodes>,
     n: u64,
     block_cache: &mut Option<alloy_rpc_types_eth::Block<op_alloy_rpc_types::Transaction>>,
 ) -> Result<()> {
@@ -512,7 +527,7 @@ async fn fetch_block(
                 // The spool is good, but its contract codes live in separate
                 // files — re-resolve any missing or corrupt ones so the
                 // worker never wedges on a half-cleaned codes dir.
-                resolve_missing_codes(client, dirs, &entry.code_hashes).await?;
+                resolve_missing_codes(client, dirs, verified_codes, entry.code_hashes).await?;
                 return Ok(());
             }
             Err(e) => {
@@ -553,17 +568,15 @@ async fn fetch_block(
     // Zero-validation light fetch (from R2 or the witness RPC): no
     // elliptic-curve work is spent on the proof we never verify. Full
     // witnesses are NOT stored anywhere — when a selected block needs one, it
-    // is re-fetched on demand. NOTE: the RPC serves witnesses for the full
-    // history; the R2 bucket is subject to its lifecycle retention — confirm
-    // the bucket actually holds the target range before pointing an old-era
-    // scan at `--witness-source r2`, or the 404s will retry forever.
+    // is re-fetched on demand. Either source serves the full history: the
+    // bucket keeps every witness, and the witness RPC reads the same bucket.
     let (light_witness, _mpt_witness) = match r2 {
         Some(r2) => r2.get_witness_light(n, hash).await?,
         None => client.get_witness_light(n, hash).await,
     };
 
     let code_hashes = stateless_core::collect_code_hashes(&light_witness.kvs);
-    resolve_missing_codes(client, dirs, &code_hashes).await?;
+    resolve_missing_codes(client, dirs, verified_codes, code_hashes.clone()).await?;
 
     let entry = SpoolEntry { block_json: serde_json::to_vec(block)?, light_witness, code_hashes };
     let path = spool_path.clone();
@@ -587,33 +600,71 @@ fn validate_spool_entry(entry: &SpoolEntry, block: u64) -> Result<()> {
     Ok(())
 }
 
+/// The codes-dir files this run has already found content-valid, shared by
+/// every fetch task.
+///
+/// A deep-history block references thousands of contracts, nearly all of them
+/// verified for an earlier block already; re-reading and re-hashing each one
+/// for every block spends the fetch stage — the bottleneck — on settled work.
+/// A file verified once stays valid for the run: the codes dir only ever gains
+/// files (atomically renamed into place), and only an invalid file is deleted.
+#[derive(Default)]
+struct VerifiedCodes(Mutex<HashSet<B256>>);
+
+impl VerifiedCodes {
+    /// Of `code_hashes`, the ones with no content-valid file in `dirs` —
+    /// checking on disk only those this run has not verified yet, and
+    /// remembering the ones that pass.
+    fn missing(&self, dirs: &DataDir, code_hashes: &[B256]) -> Vec<B256> {
+        let unverified: Vec<B256> = {
+            let verified = self.0.lock().expect("verified-codes lock");
+            code_hashes.iter().filter(|h| !verified.contains(*h)).copied().collect()
+        };
+        let (valid, missing): (Vec<B256>, Vec<B256>) =
+            unverified.into_iter().partition(|h| code_file_is_valid(&dirs.code_file(h), h));
+        self.remember(valid);
+        missing
+    }
+
+    fn remember(&self, hashes: impl IntoIterator<Item = B256>) {
+        self.0.lock().expect("verified-codes lock").extend(hashes);
+    }
+}
+
 /// Fetches and persists any of `code_hashes` not already in the codes dir —
 /// where "in" means present AND content-valid: the files are content-
 /// addressed, so anything whose keccak doesn't match its name (truncated by
 /// a pre-fsync crash, damaged media) is deleted and refetched. Without this,
 /// a corrupt code file wedges the run across restarts: the worker replays
-/// wrong bytes, diverges, and the judge fail-stops — forever.
+/// wrong bytes, diverges, and the judge fail-stops — forever. The file work
+/// runs on the blocking pool, off the fetch tasks' runtime threads.
 async fn resolve_missing_codes(
     client: &RpcClient,
     dirs: &DataDir,
-    code_hashes: &[B256],
+    verified: &Arc<VerifiedCodes>,
+    code_hashes: Vec<B256>,
 ) -> Result<()> {
-    let mut missing: Vec<B256> = Vec::new();
-    for h in code_hashes {
-        if !code_file_is_valid(&dirs.code_file(h), h) {
-            missing.push(*h);
-        }
+    let missing = {
+        let (dirs, verified) = (dirs.clone(), verified.clone());
+        tokio::task::spawn_blocking(move || verified.missing(&dirs, &code_hashes)).await?
+    };
+    if missing.is_empty() {
+        return Ok(());
     }
-    if !missing.is_empty() {
-        let codes = client
-            .get_codes(&missing, true)
-            .await
-            .map_err(|e| eyre::eyre!("fetch {} bytecodes: {e}", missing.len()))?;
+    // Verified against their hashes by the fetch itself.
+    let codes = client
+        .get_codes(&missing, true)
+        .await
+        .map_err(|e| eyre::eyre!("fetch {} bytecodes: {e}", missing.len()))?;
+    let (dirs, verified) = (dirs.clone(), verified.clone());
+    tokio::task::spawn_blocking(move || {
         for (code_hash, bytecode) in codes {
             write_atomic(&dirs.code_file(&code_hash), &bytecode.original_bytes())?;
+            verified.remember([code_hash]);
         }
-    }
-    Ok(())
+        Ok::<_, eyre::Report>(())
+    })
+    .await?
 }
 
 /// Returns whether `path` holds exactly the bytes hashing to `hash`
@@ -718,8 +769,9 @@ struct WorkerHandle {
 
 impl WorkerHandle {
     fn spawn(args: &BackfillArgs, dirs: &DataDir, tools: &WorkerTools) -> Result<Self> {
-        let exe = std::env::current_exe()?;
-        let mut command = tokio::process::Command::new(exe);
+        // The running image, not the file it came from: a worker respawned
+        // after a rebuild must still be this build.
+        let mut command = tokio::process::Command::new(crate::profile_rt::own_executable()?);
         command
             .arg("internal-worker")
             .arg("--genesis-file")
@@ -762,62 +814,25 @@ impl WorkerHandle {
         self.stdin.flush().await?;
 
         let started = Instant::now();
-        let mut skipped_lines = 0u64;
-        let resp: WorkerResponse = loop {
-            let next = loop {
-                match tokio::time::timeout(warn_after, self.stdout.next_line()).await {
-                    Err(_still_running) => {
-                        // One factual message either way — a benign library
-                        // print must NOT flip this into "restart the run"
-                        // advice while a legitimately slow block executes.
-                        // The skipped count is the operator's clue: if the
-                        // block NEVER completes, the response frame may have
-                        // been torn by an interleaved (FFI) print — a
-                        // restart retries the block; check worker stderr.
-                        if skipped_lines > 0 {
-                            warn!(
-                                worker = worker_id,
-                                block = req.block,
-                                running_secs = started.elapsed().as_secs(),
-                                skipped_lines,
-                                "block still executing — waiting (blocks are never killed); \
-                                 stdout carried non-protocol lines: if this never completes, \
-                                 the response frame may have been torn by an interleaved print"
-                            );
-                        } else {
-                            warn!(
-                                worker = worker_id,
-                                block = req.block,
-                                running_secs = started.elapsed().as_secs(),
-                                "block still executing — waiting (blocks are never killed)"
-                            );
-                        }
-                    }
-                    Ok(next) => break next?,
-                }
-            };
-            let resp_line = next.ok_or_else(|| eyre::eyre!("worker closed stdout (crashed?)"))?;
-            // stdout is the protocol channel, but the replay stack underneath
-            // is not ours: a stray library print must not be treated as
-            // worker death (killing + retrying would deterministically hit
-            // the same print, wedging the block forever). Salvage a frame
-            // embedded anywhere in the line (an unterminated `print!` glues
-            // its bytes to the front of OUR response); skip pure garbage —
-            // loudly.
-            match parse_frame(&resp_line) {
-                Some(resp) => break resp,
-                None => {
-                    skipped_lines += 1;
-                    let head: String = resp_line.chars().take(200).collect();
-                    warn!(
-                        worker = worker_id,
-                        block = req.block,
-                        line = %head,
-                        "ignoring non-protocol line on worker stdout (library print?)"
-                    );
+        let frame = loop {
+            match tokio::time::timeout(warn_after, self.stdout.next_line()).await {
+                Err(_still_running) => warn!(
+                    worker = worker_id,
+                    block = req.block,
+                    running_secs = started.elapsed().as_secs(),
+                    "block still executing — waiting (blocks are never killed)"
+                ),
+                Ok(next) => {
+                    break next?.ok_or_else(|| eyre::eyre!("worker closed stdout (crashed?)"))?;
                 }
             }
         };
+        // Nothing but the worker's frames reaches this pipe
+        // (`worker::protocol_channel`), so a line that is not one means the
+        // worker is broken — handled like a crash: respawn, retry the block.
+        let resp: WorkerResponse = serde_json::from_str(&frame).wrap_err_with(|| {
+            format!("malformed worker frame: {}", frame.chars().take(200).collect::<String>())
+        })?;
         ensure!(resp.block == req.block, "response for wrong block");
         Ok(resp)
     }
@@ -825,23 +840,6 @@ impl WorkerHandle {
     async fn kill(&mut self) {
         let _ = self.child.kill().await;
     }
-}
-
-/// Extracts a [`WorkerResponse`] frame from a worker stdout line, tolerating
-/// foreign bytes around it: an unterminated library `print!` glues its output
-/// to the FRONT of the response on one line, and an interleaved write can
-/// trail bytes AFTER it. Tries a prefix-parse from every `{` in the line —
-/// garbage JSON cannot satisfy the response's required fields, so a
-/// successful parse IS a frame. Returns `None` for a line with no frame.
-fn parse_frame(line: &str) -> Option<WorkerResponse> {
-    use serde::Deserialize;
-    for (idx, _) in line.match_indices('{') {
-        let mut de = serde_json::Deserializer::from_str(&line[idx..]);
-        if let Ok(resp) = WorkerResponse::deserialize(&mut de) {
-            return Some(resp);
-        }
-    }
-    None
 }
 
 /// Single-consumer ingest: pattern dedup, promotion, persistence, progress.
@@ -989,16 +987,26 @@ impl<'a> JudgeState<'a> {
             resp.counters.iter().filter(|id| !self.counters.contains_key(id)).copied().collect();
         let mut new_counters: Vec<(u64, CounterInfo)> = Vec::new();
         if !unknown.is_empty() {
-            let details = read_symbols_tsv(&resp.symbols_tsv)?;
+            let details: HashMap<u64, &ItemDetail> =
+                resp.new_items.iter().map(|d| (d.id, d)).collect();
             for id in &unknown {
-                let (line, kind, location) = details
-                    .get(id)
-                    .cloned()
-                    .ok_or_else(|| eyre::eyre!("counter {id:#x} missing from symbols tsv"))?;
+                let d = details.get(id).ok_or_else(|| {
+                    eyre::eyre!(
+                        "item {id:#x} of block {} is new to the store, but its worker never \
+                         reported where it lives",
+                        resp.block
+                    )
+                })?;
                 let dense = self.next_dense;
                 self.next_dense += 1;
                 self.counters.insert(*id, dense);
-                new_counters.push((*id, CounterInfo { dense, location, kind, line }));
+                let info = CounterInfo {
+                    dense,
+                    location: d.location.clone(),
+                    kind: d.kind.clone(),
+                    line: d.line,
+                };
+                new_counters.push((*id, info));
             }
         }
 
@@ -1078,15 +1086,12 @@ impl<'a> JudgeState<'a> {
         let rec_ref = &self.patterns[&key];
         self.store.commit_block(resp.block, &record, &new_counters, Some((key, rec_ref)))?;
         let _ = std::fs::remove_file(self.dirs.spool_entry(resp.block));
-        let _ = std::fs::remove_file(&resp.symbols_tsv);
         Ok(())
     }
 
     fn cleanup_tmp(&self, block: u64) {
         let _ = std::fs::remove_file(self.dirs.tmp().join(format!("block_{block}.profraw")));
         let _ = std::fs::remove_file(self.dirs.tmp().join(format!("block_{block}.profdata")));
-        let _ =
-            std::fs::remove_file(self.dirs.tmp().join(format!("block_{block}.symbols.tsv.zst")));
     }
 
     fn progress_log(&self) {
@@ -1157,25 +1162,6 @@ fn archive_sparse_profile(profile: &std::path::Path, dest: &std::path::Path) -> 
     let bytes =
         std::fs::read(profile).wrap_err_with(|| format!("read profile {}", profile.display()))?;
     write_atomic(dest, &zstd::encode_all(&bytes[..], 3)?)
-}
-
-/// Parses a worker items sidecar: `id_hex \t line \t kind \t location`.
-fn read_symbols_tsv(path: &std::path::Path) -> Result<HashMap<u64, (u32, String, String)>> {
-    let compressed = std::fs::read(path).wrap_err_with(|| format!("read {}", path.display()))?;
-    let raw = zstd::decode_all(&compressed[..])?;
-    let text = String::from_utf8(raw)?;
-    let mut map = HashMap::new();
-    for line in text.lines() {
-        let mut parts = line.splitn(4, '\t');
-        let (Some(id), Some(line), Some(kind), Some(location)) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            continue;
-        };
-        let id = u64::from_str_radix(id, 16)?;
-        map.insert(id, (line.parse()?, kind.to_string(), location.to_string()));
-    }
-    Ok(map)
 }
 
 #[cfg(test)]
@@ -1314,7 +1300,7 @@ mod tests {
             logs_bloom_ok: true,
             counters,
             profile: PathBuf::from("/nonexistent/test.profdata"),
-            symbols_tsv: PathBuf::from("/nonexistent/test.tsv.zst"),
+            new_items: Vec::new(),
             elapsed_ms,
             tx_count: 1,
             gas_used: 21000,
@@ -1372,20 +1358,34 @@ mod tests {
         assert_eq!(rec.last_block, 300);
     }
 
+    /// An id the store has never seen is registered from the details its
+    /// worker sent along; one that arrives without them is a protocol breach
+    /// and must stop the run rather than enter the store without provenance.
     #[test]
-    fn parse_frame_salvages_embedded_responses() {
-        let frame = serde_json::to_string(&response(42, vec![1, 2], 100)).unwrap();
+    fn new_items_are_registered_from_the_details_their_worker_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Arc::new(DataDir::new(tmp.path()));
+        dirs.ensure_layout().unwrap();
+        let store = Store::open(&dirs.store_path(), "test-id", Some("f")).unwrap();
+        // A dominator over dense 0..=3, so the new pattern {1, 4} is dominated
+        // and archives no profile (id 4 will get dense 3, the next free one).
+        let (key, rec) = seeded_pattern(&[1, 2, 3, 4], &[0, 1, 2, 3], 100, 500);
+        let mut judge = judge_with(&store, dirs, vec![(key, rec)]);
 
-        // Clean frame.
-        assert_eq!(parse_frame(&frame).unwrap().block, 42);
-        // Unterminated library print! glued to the front.
-        assert_eq!(parse_frame(&format!("checking foo... {frame}")).unwrap().block, 42);
-        // Garbage (even JSON-looking) before AND after.
-        assert_eq!(parse_frame(&format!("{{\"note\":1}} {frame} trailing")).unwrap().block, 42);
-        // Pure garbage: no frame.
-        assert!(parse_frame("progress 5/10 {done}").is_none());
-        assert!(parse_frame("{\"block\":7}").is_none(), "missing required fields is not a frame");
-        assert!(parse_frame("").is_none());
+        let mut resp = response(200, vec![1, 4], 300);
+        resp.new_items = vec![ItemDetail {
+            id: 4,
+            line: 12,
+            kind: "branch-true".into(),
+            location: "30ce038/src/a.rs:12:5".into(),
+        }];
+        judge.ingest(resp).unwrap();
+        let stored = &judge.store.load().unwrap().counters[&4];
+        assert_eq!((stored.dense, stored.line), (3, 12));
+        assert_eq!(stored.location, "30ce038/src/a.rs:12:5");
+
+        let err = judge.ingest(response(201, vec![1, 5], 300)).expect_err("no detail for id 5");
+        assert!(err.to_string().contains("never reported where it lives"), "{err}");
     }
 
     #[test]
@@ -1417,6 +1417,26 @@ mod tests {
         let n = block.header.inner.number;
         assert!(validate_spool_entry(&entry(&fixture), n).is_ok());
         assert!(validate_spool_entry(&entry(&fixture), n + 1).is_err());
+    }
+
+    /// Codes this run verified are not read again — the point of the cache —
+    /// while unverified ones are checked on disk and missing ones reported.
+    #[test]
+    fn verified_codes_are_checked_on_disk_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = DataDir::new(tmp.path());
+        dirs.ensure_layout().unwrap();
+        let bytes = b"\x60\x80\x60\x40".to_vec();
+        let (good, absent) = (alloy_primitives::keccak256(&bytes), B256::repeat_byte(9));
+        std::fs::write(dirs.code_file(&good), &bytes).unwrap();
+
+        let verified = VerifiedCodes::default();
+        assert_eq!(verified.missing(&dirs, &[good, absent]), vec![absent]);
+        // Damage the verified file behind the cache's back: it is not re-read.
+        std::fs::write(dirs.code_file(&good), b"torn").unwrap();
+        assert_eq!(verified.missing(&dirs, &[good]), Vec::<B256>::new());
+        // A fresh run has no such memory and catches the damage.
+        assert_eq!(VerifiedCodes::default().missing(&dirs, &[good]), vec![good]);
     }
 
     #[test]

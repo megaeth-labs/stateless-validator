@@ -36,9 +36,25 @@ pub struct WorkerResponse {
     /// Path of the per-block sparse profdata written by the worker; the judge
     /// archives it when the block's pattern is new and not dominated.
     pub profile: PathBuf,
-    /// Path of the sidecar TSV (zstd) mapping counter ids to item details.
-    pub symbols_tsv: PathBuf,
+    /// Provenance of the covered items this worker process has not reported
+    /// before — all of them on its first block, next to none after that. The
+    /// judge needs it only for ids its store has never seen, and every earlier
+    /// response of this worker reached the judge first (one worker, one
+    /// ordered channel; any failed block stops the run).
+    pub new_items: Vec<ItemDetail>,
     pub elapsed_ms: u64,
     pub tx_count: u64,
     pub gas_used: u64,
+}
+
+/// Where a covered item lives, recorded in the store the first time its id is
+/// seen.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ItemDetail {
+    pub id: u64,
+    pub line: u32,
+    /// [`crate::llvm::ItemKind::as_str`].
+    pub kind: String,
+    /// `<source dir name>/<path inside it>:<line>:<col>`.
+    pub location: String,
 }

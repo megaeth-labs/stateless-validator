@@ -30,6 +30,7 @@
 //! a third of the universe turned out to be k256, generic-array and friends.
 
 use std::{
+    ffi::OsStr,
     hash::Hasher,
     path::{Path, PathBuf},
     process::Command,
@@ -39,9 +40,12 @@ use eyre::{Context, Result, ensure};
 use rustc_hash::FxHasher;
 
 /// Version tag of the item definition below, stamped into every store (see
-/// [`universe_stamp`]). Bump it whenever the id or the set of item kinds
-/// changes: ids from two definitions must never share a store.
-const ITEM_UNIVERSE: &str = "regions+branch-arms/v2";
+/// [`universe_stamp`]). Bump it whenever the id, the set of item kinds, or what
+/// a block's bitmap records changes: bitmaps from two definitions must never
+/// share a store, a merge or a manifest. v3: a worker builds its run-once
+/// tables before it captures anything (`worker::warm_up`), so no block is
+/// credited with them any more.
+const ITEM_UNIVERSE: &str = "regions+branch-arms/v3";
 
 /// What a covered item is, for the provenance columns of the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,19 +129,10 @@ pub fn universe_stamp(source_dirs: &[PathBuf]) -> String {
 /// nothing would turn every block into an empty bitmap.
 pub fn resolve_source_dirs(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let dirs = if explicit.is_empty() {
-        let mut dirs = vec![detect_mega_evm_checkout().ok_or_else(|| {
-            eyre::eyre!(
-                "could not find the mega-evm checkout for the built-against rev under \
-                 $HOME/.cargo/git/checkouts (note that sudo changes $HOME); pass --source-dir"
-            )
-        })?];
+        let cargo_home = Path::new(env!("COVERAGE_CARGO_HOME"));
+        let mut dirs = vec![detect_mega_evm_checkout(cargo_home)?];
         for krate in env!("COVERAGE_MEASURED_CRATES").split(',').filter(|c| !c.is_empty()) {
-            dirs.push(detect_registry_crate(krate).ok_or_else(|| {
-                eyre::eyre!(
-                    "could not find the sources of {krate} under $HOME/.cargo/registry/src \
-                     (note that sudo changes $HOME); pass every --source-dir explicitly"
-                )
-            })?);
+            dirs.push(detect_registry_crate(cargo_home, krate)?);
         }
         dirs
     } else {
@@ -174,40 +169,66 @@ pub fn resolve_source_dirs(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
-/// Finds `<name>-<version>` under the cargo registry's unpacked sources (the
-/// directory above it is named after the index, which is not ours to guess).
-fn detect_registry_crate(name_version: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let src = PathBuf::from(home).join(".cargo").join("registry").join("src");
-    std::fs::read_dir(src)
-        .ok()?
-        .flatten()
-        .map(|index| index.path().join(name_version))
-        .find(|candidate| candidate.is_dir())
+/// Finds `<name>-<version>` under the registry's unpacked sources of the cargo
+/// home the binary was built with. The directory above it is named after the
+/// index, which is not ours to guess — and cargo keeps one per index it has
+/// used, so the same version can sit under several. Only one of them is what
+/// the build compiled, and llvm-cov matches nothing under the others, so more
+/// than one candidate is a question for the operator rather than a pick.
+fn detect_registry_crate(cargo_home: &Path, name_version: &str) -> Result<PathBuf> {
+    let src = cargo_home.join("registry").join("src");
+    let candidates: Vec<PathBuf> = std::fs::read_dir(&src)
+        .map(|indexes| {
+            indexes.flatten().map(|index| index.path().join(name_version)).collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|candidate| candidate.is_dir())
+        .collect();
+    one_candidate(candidates, &format!("the sources of {name_version} under {}", src.display()))
 }
 
 /// Finds the cargo git checkout of the mega-evm rev this binary was BUILT
 /// against (embedded by build.rs) — no runtime Cargo.lock parsing, no cwd
 /// dependence, and the rev can never disagree with the instrumented build.
-pub fn detect_mega_evm_checkout() -> Option<PathBuf> {
+pub fn detect_mega_evm_checkout(cargo_home: &Path) -> Result<PathBuf> {
     let rev: String = env!("COVERAGE_MEGA_EVM_REV").chars().take(7).collect();
-    if rev.len() != 7 {
-        return None;
-    }
-    let home = std::env::var_os("HOME")?;
-    let checkouts = PathBuf::from(home).join(".cargo").join("git").join("checkouts");
-    for entry in std::fs::read_dir(checkouts).ok()?.flatten() {
-        if entry.file_name().to_string_lossy().starts_with("mega-evm-") {
-            let candidate = entry.path().join(&rev);
-            if candidate.is_dir() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    ensure!(rev.len() == 7, "the built-against mega-evm rev {rev:?} is too short to locate");
+    let checkouts = cargo_home.join("git").join("checkouts");
+    let candidates: Vec<PathBuf> = std::fs::read_dir(&checkouts)
+        .map(|repos| repos.flatten().collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|repo| repo.file_name().to_string_lossy().starts_with("mega-evm-"))
+        .map(|repo| repo.path().join(&rev))
+        .filter(|candidate| candidate.is_dir())
+        .collect();
+    one_candidate(candidates, &format!("the mega-evm {rev} checkout under {}", checkouts.display()))
 }
 
-/// Locates an LLVM tool: explicit override → rustc sysroot → `$PATH`.
+/// The one directory default scope detection found, or an error naming what
+/// to pass instead.
+fn one_candidate(mut candidates: Vec<PathBuf>, what: &str) -> Result<PathBuf> {
+    match candidates.len() {
+        1 => Ok(candidates.remove(0)),
+        0 => eyre::bail!(
+            "could not find {what} — the cargo home this binary was built with; pass every \
+             --source-dir explicitly"
+        ),
+        _ => eyre::bail!(
+            "found {what} more than once ({}) — only the one the build compiled is measurable; \
+             pass every --source-dir explicitly",
+            candidates.iter().map(|c| c.display().to_string()).collect::<Vec<_>>().join(", "),
+        ),
+    }
+}
+
+/// Locates an LLVM tool: explicit override → the sysroot of the toolchain that
+/// BUILT this binary → the sysroot of whatever `rustc` resolves to here →
+/// `$PATH`. The build's own toolchain comes first because its LLVM is the one
+/// whose profile and coverage-map formats the binary carries; the `rustc` on
+/// the current `$PATH` belongs to whichever toolchain the working directory
+/// selects, which outside the repository is usually another one.
 pub fn find_tool(name: &str, cli_override: Option<&str>) -> Result<PathBuf> {
     if let Some(p) = cli_override {
         let p = PathBuf::from(p);
@@ -215,20 +236,15 @@ pub fn find_tool(name: &str, cli_override: Option<&str>) -> Result<PathBuf> {
         return Ok(p);
     }
 
-    // rustc --print sysroot → <sysroot>/lib/rustlib/<triple>/bin/<tool>
-    if let Ok(out) = Command::new("rustc").args(["--print", "sysroot"]).output() &&
-        out.status.success()
-    {
-        let sysroot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
-        let rustlib = sysroot.join("lib").join("rustlib");
-        if let Ok(entries) = std::fs::read_dir(&rustlib) {
-            for entry in entries.flatten() {
-                let candidate = entry.path().join("bin").join(name);
-                if candidate.is_file() {
-                    return Ok(candidate);
-                }
-            }
-        }
+    let runtime_sysroot = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()));
+    let sysroots = [Some(PathBuf::from(env!("COVERAGE_RUSTC_SYSROOT"))), runtime_sysroot];
+    if let Some(tool) = find_in_sysroots(name, sysroots.iter().flatten()) {
+        return Ok(tool);
     }
 
     // PATH fallback
@@ -244,6 +260,21 @@ pub fn find_tool(name: &str, cli_override: Option<&str>) -> Result<PathBuf> {
     eyre::bail!(
         "{name} not found. Install the `llvm-tools` rustup component or pass an explicit path."
     )
+}
+
+/// The first `<sysroot>/lib/rustlib/<triple>/bin/<name>` that exists, trying
+/// the sysroots in order.
+fn find_in_sysroots<'a>(
+    name: &str,
+    sysroots: impl IntoIterator<Item = &'a PathBuf>,
+) -> Option<PathBuf> {
+    sysroots.into_iter().find_map(|sysroot| {
+        std::fs::read_dir(sysroot.join("lib").join("rustlib"))
+            .ok()?
+            .flatten()
+            .map(|triple| triple.path().join("bin").join(name))
+            .find(|candidate| candidate.is_file())
+    })
 }
 
 /// Turns one block's profraw into its covered items, leaving the sparse
@@ -262,20 +293,39 @@ pub fn extract_covered_items(
     source_dirs: &[PathBuf],
 ) -> Result<(Vec<CoveredItem>, PathBuf)> {
     let profdata = profraw.with_extension("profdata");
-    let out = Command::new(llvm_profdata)
+    merge_sparse(llvm_profdata, &[profraw], &profdata)?;
+    let items = covered_items(llvm_cov, exe, &profdata, source_dirs)?;
+    Ok((items, profdata))
+}
+
+/// `llvm-profdata merge -sparse`: raw profiles or profdata files in, one sparse
+/// profdata out — counts summed, zero-count functions dropped.
+pub fn merge_sparse(llvm_profdata: &Path, inputs: &[impl AsRef<OsStr>], out: &Path) -> Result<()> {
+    let merged = Command::new(llvm_profdata)
         .arg("merge")
         .arg("-sparse")
-        .arg(profraw)
+        .args(inputs)
         .arg("-o")
-        .arg(&profdata)
+        .arg(out)
         .output()
         .wrap_err("spawn llvm-profdata")?;
     ensure!(
-        out.status.success(),
+        merged.status.success(),
         "llvm-profdata merge -sparse failed: {}",
-        String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&merged.stderr)
     );
+    Ok(())
+}
 
+/// The covered items of `profdata` within `source_dirs`, evaluated against the
+/// coverage map of `exe` — the one extraction both a block's bitmap and
+/// `report`'s cross-check go through.
+pub fn covered_items(
+    llvm_cov: &Path,
+    exe: &Path,
+    profdata: &Path,
+    source_dirs: &[PathBuf],
+) -> Result<Vec<CoveredItem>> {
     let out = Command::new(llvm_cov)
         .arg("export")
         .arg(exe)
@@ -292,8 +342,7 @@ pub fn extract_covered_items(
         "llvm-cov export failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let items = parse_export(&String::from_utf8_lossy(&out.stdout), source_dirs)?;
-    Ok((items, profdata))
+    parse_export(&String::from_utf8_lossy(&out.stdout), source_dirs)
 }
 
 /// Fails unless every configured root prefixes at least one file llvm-cov
@@ -308,31 +357,20 @@ pub fn extract_covered_items(
 /// store's stamp went on claiming its scope. Roots are matched as given, never
 /// canonicalized, because llvm-cov matches the absolute paths baked in at
 /// BUILD time — the sources must sit where they sat for the build, spelled
-/// the same way. The one definition both the per-block export and `report`
-/// check through.
-pub fn ensure_every_root_matched(filenames: &[&str], source_dirs: &[PathBuf]) -> Result<()> {
+/// the same way.
+fn ensure_every_root_matched(filenames: &[&str], source_dirs: &[PathBuf]) -> Result<()> {
     for dir in source_dirs {
         ensure!(
             filenames.iter().any(|f| Path::new(f).starts_with(dir)),
-            "llvm-cov matched no source file under {} — that root is not the one the \
-             instrumented binary was built against, so nothing under it is measured",
+            "llvm-cov matched no source file under {} — either that root is not where the \
+             instrumented binary was built from, or its crate was compiled without \
+             instrumentation (after adding a crate to measured-crates.txt, `cargo clean -p` it \
+             first: cargo cannot see that the wrapper now instruments it), so nothing under it \
+             is measured",
             dir.display(),
         );
     }
     Ok(())
-}
-
-/// [`ensure_every_root_matched`] over an `llvm-cov export` document — any
-/// flavour, `--summary-only` included, since every one lists `files[].filename`
-/// as absolute paths (unlike `llvm-cov report`, which strips their common
-/// prefix and so cannot tell which root a row came from).
-pub fn ensure_export_covers_every_root(json: &str, source_dirs: &[PathBuf]) -> Result<()> {
-    let root: serde_json::Value = serde_json::from_str(json).wrap_err("parse llvm-cov export")?;
-    let files = root["data"][0]["files"]
-        .as_array()
-        .ok_or_else(|| eyre::eyre!("llvm-cov export has no data[0].files"))?;
-    let filenames: Vec<&str> = files.iter().filter_map(|f| f["filename"].as_str()).collect();
-    ensure_every_root_matched(&filenames, source_dirs)
 }
 
 /// Parses `llvm-cov export --format=text --skip-functions` output.
@@ -526,20 +564,19 @@ mod tests {
 
     /// The case a label (or any substring) test gets wrong: a stale root named
     /// `src` "appears" in every other root's paths. Matching is by path
-    /// prefix, so it is refused all the same — on the summary exports `report`
-    /// reads as much as on the per-block ones.
+    /// prefix, so it is refused all the same.
     #[test]
     fn a_stale_root_is_refused_even_when_its_name_appears_in_other_paths() {
-        let summary = r#"{"data":[{"files":[
-            {"filename":"/x/crates/mega-evm/src/evm.rs","summary":{}},
-            {"filename":"/x/crates/mega-evm/src/lib.rs","summary":{}}]}]}"#;
+        let json = r#"{"data":[{"files":[
+            {"filename":"/x/crates/mega-evm/src/evm.rs","segments":[],"branches":[]},
+            {"filename":"/x/crates/mega-evm/src/lib.rs","segments":[],"branches":[]}]}]}"#;
         let valid = PathBuf::from("/x");
         let stale = PathBuf::from("/y/src");
 
-        let err = ensure_export_covers_every_root(summary, &[valid.clone(), stale])
+        let err = parse_export(json, &[valid.clone(), stale])
             .expect_err("a root no file lies under must fail");
         assert!(err.to_string().contains("/y/src"), "must name the stale root: {err}");
-        ensure_export_covers_every_root(summary, &[valid]).expect("the real root matches");
+        parse_export(json, &[valid]).expect("the real root matches");
     }
 
     /// A file with no covered region still counts as the root contributing:
@@ -566,7 +603,7 @@ mod tests {
     fn universe_stamp_is_order_independent_and_versioned() {
         let (a, b) = (PathBuf::from("/x/a"), PathBuf::from("/x/b"));
         assert_eq!(universe_stamp(&[a.clone(), b.clone()]), universe_stamp(&[b, a]));
-        assert_eq!(universe_stamp(&[PathBuf::from("/x/mega")]), "regions+branch-arms/v2:mega");
+        assert_eq!(universe_stamp(&[PathBuf::from("/x/mega")]), "regions+branch-arms/v3:mega");
     }
 
     /// `merge` compares stamps byte for byte, so shards of one distributed
@@ -583,7 +620,54 @@ mod tests {
             PathBuf::from("/root/.cargo/git/co/30ce038"),
         ];
         assert_eq!(universe_stamp(&alice), universe_stamp(&root));
-        assert_eq!(universe_stamp(&alice), "regions+branch-arms/v2:30ce038,revm-handler-8.1.0");
+        assert_eq!(universe_stamp(&alice), "regions+branch-arms/v3:30ce038,revm-handler-8.1.0");
+    }
+
+    /// Cargo keeps one unpacked tree per registry index it has used, so a
+    /// version can sit under several. Only the one the build compiled is
+    /// measurable, and which one that was is not visible from here: the
+    /// default scope must refuse to guess rather than pick whichever the
+    /// directory listing returned first.
+    #[test]
+    fn default_scope_refuses_a_crate_found_under_two_registry_indexes() {
+        let home = tempfile::tempdir().unwrap();
+        let src = home.path().join("registry/src");
+        std::fs::create_dir_all(src.join("index-a/revm-handler-8.1.0")).unwrap();
+
+        let found = detect_registry_crate(home.path(), "revm-handler-8.1.0").unwrap();
+        assert_eq!(found, src.join("index-a/revm-handler-8.1.0"));
+
+        std::fs::create_dir_all(src.join("index-b/revm-handler-8.1.0")).unwrap();
+        let err = detect_registry_crate(home.path(), "revm-handler-8.1.0")
+            .expect_err("two candidates must not be resolved by listing order");
+        assert!(err.to_string().contains("more than once"), "{err}");
+        assert!(
+            err.to_string().contains("index-a") && err.to_string().contains("index-b"),
+            "{err}"
+        );
+
+        let err = detect_registry_crate(home.path(), "op-revm-8.1.0").expect_err("absent");
+        assert!(err.to_string().contains("could not find"), "{err}");
+    }
+
+    /// The build's own toolchain wins over whatever `rustc` the working
+    /// directory resolves to: its LLVM wrote the formats the binary carries.
+    #[test]
+    fn llvm_tools_come_from_the_first_sysroot_that_has_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (build, runtime) = (dir.path().join("build"), dir.path().join("runtime"));
+        for sysroot in [&build, &runtime] {
+            let bin = sysroot.join("lib/rustlib/x86_64-unknown-linux-gnu/bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("llvm-cov"), b"").unwrap();
+        }
+        let found = find_in_sysroots("llvm-cov", [&build, &runtime]).unwrap();
+        assert!(found.starts_with(&build), "{}", found.display());
+
+        let missing = dir.path().join("no-tools");
+        let found = find_in_sysroots("llvm-cov", [&missing, &runtime]).unwrap();
+        assert!(found.starts_with(&runtime), "falls through to the next sysroot");
+        assert_eq!(find_in_sysroots("llvm-profdata", [&build, &runtime]), None);
     }
 
     /// The scope gate. A label identifies a root in both the ids and the

@@ -7,7 +7,7 @@
 //! can reduce coverage. Minimality is best-effort on top of that, never at
 //! its expense.
 //!
-//! Selection is churn-damped: ties are broken in favor of blocks already in
+//! Selection is churn-damped: ties are broken in favor of patterns already in
 //! the incumbent manifest, then by freshness. A final redundancy-elimination
 //! pass drops any selected block whose bitmap is covered by the union of the
 //! others.
@@ -33,7 +33,10 @@ pub struct SetCoverArgs {
     /// Output manifest path (default: <data-dir>/manifest.json).
     #[clap(long)]
     pub manifest_out: Option<PathBuf>,
-    /// Previous manifest whose blocks get tie-break preference (churn damping).
+    /// Previous manifest whose patterns get tie-break preference (churn
+    /// damping). Matched by pattern rather than block: a pattern's
+    /// representative moves to the lightest block that produced it, so a later
+    /// backfill can change which block stands for an unchanged pattern.
     #[clap(long)]
     pub incumbent_manifest: Option<PathBuf>,
     /// Delete the archived profiles of dominated patterns once the manifest is
@@ -97,7 +100,15 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
                 &std::fs::read_to_string(path)
                     .wrap_err_with(|| format!("read incumbent manifest {}", path.display()))?,
             )?;
-            manifest.blocks.iter().map(|b| b.number).collect()
+            manifest
+                .blocks
+                .iter()
+                .map(|b| {
+                    u64::from_str_radix(&b.pattern, 16).wrap_err_with(|| {
+                        format!("bad pattern key {} in {}", b.pattern, path.display())
+                    })
+                })
+                .collect::<Result<_>>()?
         }
         None => HashSet::new(),
     };
@@ -193,8 +204,9 @@ pub struct CoverOutcome {
 }
 
 /// Pure greedy set cover with antichain pruning, incumbent-biased
-/// tie-breaking, and a final redundancy-elimination pass. No I/O — the fs
-/// side effects (deleting pruned profiles) belong to the caller.
+/// tie-breaking (`incumbents` are pattern keys), and a final
+/// redundancy-elimination pass. No I/O — the fs side effects (deleting pruned
+/// profiles) belong to the caller.
 pub fn select_cover(
     patterns: &std::collections::HashMap<u64, crate::store::PatternRecord>,
     incumbents: &HashSet<u64>,
@@ -217,13 +229,12 @@ pub fn select_cover(
     let mut selected: Vec<(u64, u64, u64)> = Vec::new();
     loop {
         let mut best: Option<(u64, bool, u64, usize)> = None; // (gain, incumbent, block, idx)
-        for (idx, (_key, rec)) in remaining.iter().enumerate() {
+        for (idx, (key, rec)) in remaining.iter().enumerate() {
             let gain = rec.bitmap.andnot_count(&covered);
             if gain == 0 {
                 continue;
             }
-            let candidate =
-                (gain, incumbents.contains(&rec.representative), rec.representative, idx);
+            let candidate = (gain, incumbents.contains(*key), rec.representative, idx);
             if best.is_none_or(|b| (candidate.0, candidate.1, candidate.2) > (b.0, b.1, b.2)) {
                 best = Some(candidate);
             }
@@ -370,12 +381,8 @@ mod tests {
         }
     }
 
-    fn cover(
-        patterns: &HashMap<u64, PatternRecord>,
-        incumbents: &[u64],
-    ) -> (Vec<u64>, CoverOutcome) {
-        let incumbents: HashSet<u64> = incumbents.iter().copied().collect();
-        let outcome = select_cover(patterns, &incumbents);
+    fn cover(patterns: &HashMap<u64, PatternRecord>) -> (Vec<u64>, CoverOutcome) {
+        let outcome = select_cover(patterns, &HashSet::new());
         let mut blocks: Vec<u64> = outcome.selected.iter().map(|(_, rep, _)| *rep).collect();
         blocks.sort_unstable();
         (blocks, outcome)
@@ -507,7 +514,7 @@ mod tests {
             (4, pat(&[5], 40)), // strict subset of 3 → pruned
         ]
         .into();
-        let (blocks, outcome) = cover(&patterns, &[]);
+        let (blocks, outcome) = cover(&patterns);
         assert_eq!(blocks, vec![10, 30]);
         assert_eq!(outcome.covered_counters, outcome.universe_counters);
         let mut pruned = outcome.pruned_dominated.clone();
@@ -521,21 +528,24 @@ mod tests {
     fn equal_bits_distinct_patterns_both_survive() {
         let patterns: HashMap<u64, PatternRecord> =
             [(1, pat(&[0, 1], 10)), (2, pat(&[2, 3], 20))].into();
-        let (blocks, outcome) = cover(&patterns, &[]);
+        let (blocks, outcome) = cover(&patterns);
         assert_eq!(blocks, vec![10, 20]);
         assert!(outcome.pruned_dominated.is_empty());
     }
 
-    /// On a gain tie, the incumbent block wins (churn damping).
+    /// On a gain tie, the incumbent pattern wins (churn damping) — whichever
+    /// block represents it now. The previous manifest selected pattern 1
+    /// through some block; a later backfill re-homed it to block 55, which no
+    /// manifest ever named, and it must still win the tie.
     #[test]
     fn incumbent_wins_gain_ties() {
         // Two disjoint equal-size patterns; both must be picked, but the
         // FIRST pick (order) must be the incumbent regardless of block number.
         let patterns: HashMap<u64, PatternRecord> =
-            [(1, pat(&[0, 1], 10)), (2, pat(&[2, 3], 99))].into();
-        let incumbents: HashSet<u64> = [10].into();
+            [(1, pat(&[0, 1], 55)), (2, pat(&[2, 3], 99))].into();
+        let incumbents: HashSet<u64> = [1].into();
         let outcome = select_cover(&patterns, &incumbents);
-        assert_eq!(outcome.selected[0].1, 10, "incumbent must be picked first on a tie");
+        assert_eq!(outcome.selected[0].1, 55, "incumbent must be picked first on a tie");
 
         // Without incumbency the higher block number wins the tie.
         let outcome = select_cover(&patterns, &HashSet::new());
@@ -552,7 +562,7 @@ mod tests {
             (3, pat(&[0, 1, 2], 30)), // dominates 1 and 2 → both pruned
         ]
         .into();
-        let (blocks, _) = cover(&patterns, &[]);
+        let (blocks, _) = cover(&patterns);
         assert_eq!(blocks, vec![30]);
     }
 
@@ -568,7 +578,7 @@ mod tests {
             (3, pat(&[3, 4, 5, 7], 30)),
         ]
         .into();
-        let (blocks, outcome) = cover(&patterns, &[]);
+        let (blocks, outcome) = cover(&patterns);
         assert_eq!(blocks, vec![20, 30]);
         assert!(outcome.redundant_removed.contains(&10));
         // Coverage is still complete without the removed pick.

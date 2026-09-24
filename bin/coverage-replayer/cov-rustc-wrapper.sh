@@ -20,9 +20,19 @@
 #     an instance compiled without the flag, so an uninstrumented workspace
 #     would silently lose exactly the code paths that matter. Nothing outside
 #     the workspace depends on mega-evm, so nothing else can instantiate it.
+# What need not be: the registry crates that depend on the measured revm crates
+# (alloy-evm, alloy-op-evm, revm, revm-inspector, a few reth crates). Whatever
+# they instantiate is over their own types, not mega-evm's, and mega-evm's
+# execution path does not run it: instrumenting them as well was measured to
+# leave every measured file's report unchanged, at a cost on every block.
 # Host artifacts (build scripts, proc-macros) are skipped: instrumented, each
 # run of theirs drops a default_*.profraw into the source tree. They are the
 # rustc invocations without `--target`, which is why the build line passes one.
+#
+# Cargo cannot see what this wrapper decides: a crate added to
+# measured-crates.txt is not recompiled, and stays uninstrumented, until
+# `cargo clean -p <crate>` (backfill then fails naming its source root).
+# Names are compared the way build.rs reads the file — trimmed, CRLF-safe.
 here=$(cd "$(dirname "$0")" && pwd)
 workspace=$(cd "$here/../.." && pwd)
 
@@ -37,7 +47,9 @@ if [ "$targeted" = yes ]; then
     */git/checkouts/mega-evm-* | "$workspace" | "$workspace"/*) instrument=yes ;;
     esac
     if [ "$instrument" = no ] && [ -n "${CARGO_PKG_NAME:-}" ] &&
-        grep -qx -- "$CARGO_PKG_NAME" "$here/measured-crates.txt"; then
+        tr -d '\r' <"$here/measured-crates.txt" |
+        sed 's/^[[:space:]]*//; s/[[:space:]]*$//' |
+            grep -qx -- "$CARGO_PKG_NAME"; then
         instrument=yes
     fi
 fi

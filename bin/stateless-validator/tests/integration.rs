@@ -181,9 +181,8 @@ fn r2_custom_domain_target_wiring() {
         Some("https://witness.example.com")
     );
     // Every R2 coherence rule is enforced after parsing, by `stateless_common::validate_r2_flags`,
-    // so that each error can name the flag — clap's own rejections cannot, this workspace having
-    // built it without `error-context`. Parsing therefore accepts all of these shapes; the rules
-    // and their messages are covered by that function's own tests.
+    // so that both binaries give the same verdict in the same words. Parsing therefore accepts all
+    // of these shapes; the rules and their messages are covered by that function's own tests.
     const DOMAIN: &str = "https://witness.example.com";
     for shape in [
         &["--r2-custom-domain", DOMAIN, "--r2-endpoint", "https://acc.r2.cloudflarestorage.com"][..],
