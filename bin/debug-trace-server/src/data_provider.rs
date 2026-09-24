@@ -46,13 +46,14 @@ use op_alloy_rpc_types::Transaction;
 use quick_cache::sync::Cache;
 use revm::state::Bytecode;
 use stateless_common::{
-    CodeFetchError, R2Band, RpcClient, RpcDeadlineExceeded, WitnessSizeBreakdown, r2_band,
+    CodeFetchError, R2Band, RpcClient, RpcDeadlineExceeded, WitnessFetchError,
+    WitnessSizeBreakdown, r2_band,
 };
 use stateless_core::{
     ContractStore, LightWitness, StoreResult, db::StoreError, withdrawals::MptWitness,
 };
 use stateless_db::ContractCache;
-use tracing::{debug, instrument, trace, warn};
+use tracing::{debug, error, instrument, trace, warn};
 
 use crate::{
     block_data_cache::BlockDataCache,
@@ -266,6 +267,18 @@ impl From<RpcDeadlineExceeded> for DataProviderError {
             _ => TimeoutStage::Block,
         };
         DataProviderError::Timeout { stage, elapsed: e.elapsed }
+    }
+}
+
+impl From<WitnessFetchError> for DataProviderError {
+    fn from(e: WitnessFetchError) -> Self {
+        match e {
+            // Only a blown deadline is a timeout. A range failure is a wiring bug in this
+            // process — routing it to `Timeout { Witness }` would fire the `deadline_witness`
+            // alarm, which must mean "an upstream witness fetch ran out of budget".
+            WitnessFetchError::Deadline(d) => d.into(),
+            WitnessFetchError::NoProviderInRange { .. } => eyre::eyre!("{e}").into(),
+        }
     }
 }
 
@@ -1332,19 +1345,35 @@ async fn fetch_witness(
         }
         Err(e) => {
             metrics.record_request(false, start.elapsed().as_secs_f64());
-            let budget = deadline.saturating_duration_since(start);
-            // Attribution-grade context for the next timeout incident: the effective stage
-            // budget, the route taken, and whether the old-block clamp applied — the client
-            // only ever sees the generic `-32001` message.
-            warn!(
-                block_number,
-                block_hash = %block_hash,
-                source,
-                old_block = is_old_block(db_tip, block_number),
-                budget_ms = budget.as_millis() as u64,
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "Witness fetch deadline exceeded",
-            );
+            match &e {
+                WitnessFetchError::Deadline(_) => {
+                    let budget = deadline.saturating_duration_since(start);
+                    // Attribution-grade context for the next timeout incident: the effective
+                    // stage budget, the route taken, and whether the old-block clamp applied —
+                    // the client only ever sees the generic `-32001` message.
+                    warn!(
+                        block_number,
+                        block_hash = %block_hash,
+                        source,
+                        old_block = is_old_block(db_tip, block_number),
+                        budget_ms = budget.as_millis() as u64,
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        "Witness fetch deadline exceeded",
+                    );
+                }
+                // A routing bug, not a timeout: no upstream attempt ran, so the deadline
+                // warning and its budget fields would misattribute it.
+                WitnessFetchError::NoProviderInRange { skip, configured } => {
+                    error!(
+                        block_number,
+                        block_hash = %block_hash,
+                        source,
+                        skip,
+                        configured,
+                        "Witness route selected no configured provider",
+                    );
+                }
+            }
             Err(e.into())
         }
     }
@@ -3153,5 +3182,25 @@ mod tests {
         }
         .into();
         assert!(matches!(block_err, DataProviderError::Timeout { stage: TimeoutStage::Block, .. }));
+    }
+
+    /// A range failure is a wiring bug: it must land on `Internal`, never on the
+    /// `deadline_witness` alarm's `Timeout { Witness }` (rationale at the `From` impl). The
+    /// deadline arm is asserted too — it is the delegation that keeps that alarm working.
+    #[test]
+    fn witness_range_failure_is_internal_not_a_witness_timeout() {
+        let range_err: DataProviderError =
+            WitnessFetchError::NoProviderInRange { skip: 2, configured: 1 }.into();
+        assert!(matches!(range_err, DataProviderError::Internal(_)), "got {range_err:?}");
+
+        let deadline_err: DataProviderError = WitnessFetchError::Deadline(RpcDeadlineExceeded {
+            method: stateless_common::RpcMethod::MegaGetBlockWitness,
+            elapsed: Duration::from_secs(3),
+        })
+        .into();
+        assert!(matches!(
+            deadline_err,
+            DataProviderError::Timeout { stage: TimeoutStage::Witness, .. }
+        ));
     }
 }
