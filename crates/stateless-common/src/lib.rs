@@ -4,7 +4,7 @@ pub use metrics::{RpcMethod, RpcMetrics};
 pub mod rpc_client;
 pub use rpc_client::{
     CodeFetchError, RpcClient, RpcClientConfig, RpcDeadlineExceeded, SetValidatedBlocksResponse,
-    WitnessRequestKeys,
+    WitnessFetchError, WitnessRequestKeys,
 };
 /// Exponential-backoff policy used by [`RpcClient`]'s round-level retry loop: `initial` is the
 /// first sleep duration; each round doubles it up to `max`.
