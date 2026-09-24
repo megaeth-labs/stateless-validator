@@ -38,6 +38,7 @@ use std::{
 
 use eyre::{Context, Result, ensure};
 use rustc_hash::FxHasher;
+use serde::{Deserialize, Serialize};
 
 /// Version tag of the item definition below, stamped into every store (see
 /// [`universe_stamp`]). Bump it whenever the id, the set of item kinds, or what
@@ -48,7 +49,8 @@ use rustc_hash::FxHasher;
 const ITEM_UNIVERSE: &str = "regions+branch-arms/v3";
 
 /// What a covered item is, for the provenance columns of the store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ItemKind {
     /// A region-entry segment with a non-zero evaluated count.
     Region,
@@ -68,8 +70,9 @@ impl ItemKind {
     }
 }
 
-/// A covered item observed in one profile, with its stable id.
-#[derive(Debug, Clone)]
+/// A covered item observed in one profile, with its stable id — also what a
+/// worker reports for ids new to it (see `proto::WorkerResponse::new_items`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoveredItem {
     pub id: u64,
     /// `<source dir name>/<path inside it>:<line>:<col>`.
@@ -186,7 +189,7 @@ impl Llvm {
     }
 
     /// Turns one block's profraw into its covered items, leaving the sparse
-    /// profdata next to it (returned) for the judge to archive.
+    /// profdata at `profdata` for the judge to archive.
     ///
     /// `llvm-profdata merge -sparse` drops every zero-count function, which is
     /// almost all of them for a single block; `llvm-cov export` then evaluates
@@ -197,11 +200,27 @@ impl Llvm {
         &self,
         exe: &Path,
         profraw: &Path,
-    ) -> Result<(Vec<CoveredItem>, PathBuf)> {
-        let profdata = profraw.with_extension("profdata");
-        self.merge_sparse(&[profraw], &profdata)?;
-        let items = self.covered_items(exe, &profdata)?;
-        Ok((items, profdata))
+        profdata: &Path,
+    ) -> Result<Vec<CoveredItem>> {
+        self.merge_sparse(&[profraw], profdata)?;
+        self.covered_items(exe, profdata)
+    }
+
+    /// `llvm-cov report` over the scope: the per-file table `report` prints.
+    pub fn report(&self, exe: &Path, profdata: &Path) -> Result<String> {
+        let out = Command::new(&self.cov)
+            .arg("report")
+            .arg(exe)
+            .arg(format!("--instr-profile={}", profdata.display()))
+            .args(&self.source_dirs)
+            .output()
+            .wrap_err("spawn llvm-cov")?;
+        ensure!(
+            out.status.success(),
+            "llvm-cov report failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     /// `llvm-profdata merge -sparse`: raw profiles or profdata files in, one

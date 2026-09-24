@@ -209,7 +209,7 @@ The background chain-sync prefetch routes by freshness against the last observed
 ## Test Organization
 
 Unit tests are embedded in source files alongside the code they test.
-Integration tests live in `bin/debug-trace-server/tests/` (6 modules: cache_metrics, block_tag, compression, consistency, performance, timing_header), in `bin/stateless-validator/tests/integration.rs` (CLI parsing, mock-RPC pipeline, mainnet single-block validation), and in `bin/coverage-replayer/tests/replay_fixtures.rs` (worker replay glue over the `test_data/mainnet` fixtures).
+Integration tests live in `bin/debug-trace-server/tests/` (6 modules: cache_metrics, block_tag, compression, consistency, performance, timing_header), in `bin/stateless-validator/tests/integration.rs` (CLI parsing, mock-RPC pipeline, mainnet single-block validation), and in `bin/coverage-replayer/tests/` (`replay_fixtures.rs`: worker replay glue over the `test_data/mainnet` fixtures; `worker_protocol.rs`: the worker subprocess's stdout protocol).
 Test data (block JSON files, contract bytecode, witness data) is stored in `test_data/`.
 
 ## Version Control

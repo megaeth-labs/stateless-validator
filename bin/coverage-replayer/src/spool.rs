@@ -28,6 +28,7 @@ const SPOOL_ZSTD_LEVEL: i32 = 1;
 pub struct SpoolEntry {
     /// The RPC block re-serialized as JSON (`Block<op_alloy_rpc_types::Transaction>`),
     /// the same shape `test_data/mainnet/blocks/*.json` uses.
+    #[serde(with = "as_bytes")]
     pub block_json: Vec<u8>,
     /// Execution witness (kvs + levels only, fast to decode).
     pub light_witness: LightWitness,
@@ -83,6 +84,37 @@ impl SpoolEntry {
     }
 }
 
+/// `Vec<u8>` through serde's byte-array hooks. bincode writes the same bytes
+/// either way — a length, then the bytes — but through the sequence hooks it
+/// does so one element at a time, for every byte of a multi-megabyte block.
+mod as_bytes {
+    use serde::{
+        Deserializer, Serializer,
+        de::{Error, Visitor},
+    };
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        struct Bytes;
+        impl Visitor<'_> for Bytes {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a byte array")
+            }
+            fn visit_bytes<E: Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
+                Ok(bytes.to_vec())
+            }
+            fn visit_byte_buf<E: Error>(self, bytes: Vec<u8>) -> Result<Vec<u8>, E> {
+                Ok(bytes)
+            }
+        }
+        deserializer.deserialize_byte_buf(Bytes)
+    }
+}
+
 /// A spool entry opened for replay (see [`SpoolEntry::open`]).
 pub struct Spooled {
     pub block: Block<OpTransaction>,
@@ -134,10 +166,14 @@ impl DataDir {
     pub fn spool_entry(&self, block: u64) -> PathBuf {
         self.spool().join(format!("{block}.bin"))
     }
-    /// Where a worker writes a block's raw profile; the sparse profdata it
-    /// becomes sits next to it (see `llvm::extract_covered_items`).
+    /// Where a worker writes a block's raw profile.
     pub fn block_profraw(&self, block: u64) -> PathBuf {
         self.tmp().join(format!("block_{block}.profraw"))
+    }
+    /// The sparse profdata a block's raw profile becomes — what the judge
+    /// archives when the block's pattern is new.
+    pub fn block_profdata(&self, block: u64) -> PathBuf {
+        self.tmp().join(format!("block_{block}.profdata"))
     }
     pub fn code_file(&self, hash: &B256) -> PathBuf {
         self.codes().join(format!("{hash:x}.bin"))
@@ -152,6 +188,58 @@ impl DataDir {
     /// same regardless of which block produced it (identical bitmap).
     pub fn archived_profile(&self, pattern_key: u64) -> PathBuf {
         self.archive_profiles().join(format!("{pattern_key:016x}.profdata.zst"))
+    }
+
+    /// Archives a new pattern's sparse profdata, zstd'd and durable — the
+    /// judge commits the pattern only once this has returned (see
+    /// [`write_atomic`]).
+    pub fn archive_profile(&self, pattern_key: u64, profdata: &Path) -> Result<()> {
+        let bytes =
+            fs::read(profdata).wrap_err_with(|| format!("read profile {}", profdata.display()))?;
+        write_atomic(&self.archived_profile(pattern_key), &zstd::encode_all(&bytes[..], 3)?)
+    }
+
+    /// An archived profile, inflated back to the sparse profdata
+    /// `llvm-profdata` merges.
+    pub fn read_archived_profile(&self, pattern_key: u64) -> Result<Vec<u8>> {
+        let path = self.archived_profile(pattern_key);
+        let compressed = fs::read(&path).wrap_err_with(|| {
+            format!("archived profile missing for pattern {pattern_key:016x}: {}", path.display())
+        })?;
+        zstd::decode_all(&compressed[..]).wrap_err_with(|| format!("decompress {}", path.display()))
+    }
+
+    /// Removes what a previous run left mid-flight: every per-block file in
+    /// `tmp/`, and the `*.tmp` files of writers killed inside `write_atomic`
+    /// (unique names, never reused, so they would accumulate forever).
+    ///
+    /// Only for the holder of the store's write lock: it is the one process
+    /// that writes under these directories, so nothing found there is live.
+    pub fn clear_leftovers(&self) -> usize {
+        let mut removed = remove_files(&self.tmp(), |_| true);
+        for dir in [self.spool(), self.codes(), self.archive_profiles()] {
+            removed += remove_files(&dir, |name| name.ends_with(".tmp"));
+        }
+        removed
+    }
+
+    /// Loads contract bytecodes for the given hashes from the codes dir.
+    /// Returns the same `HashMap` flavor `WitnessDatabase.contracts` expects.
+    pub fn load_contracts(
+        &self,
+        hashes: &[B256],
+    ) -> Result<alloy_primitives::map::HashMap<B256, revm::state::Bytecode>> {
+        let mut map = alloy_primitives::map::HashMap::with_capacity_and_hasher(
+            hashes.len(),
+            Default::default(),
+        );
+        for hash in hashes {
+            let path = self.code_file(hash);
+            let bytes = fs::read(&path)
+                .wrap_err_with(|| format!("missing contract code {}", path.display()))?;
+            map.insert(*hash, revm::state::Bytecode::new_raw(bytes.into()));
+        }
+        Ok(map)
     }
 }
 
@@ -215,41 +303,6 @@ fn write_renamed(path: &Path, bytes: &[u8], durable: bool) -> Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     result
-}
-
-impl DataDir {
-    /// Removes what a previous run left mid-flight: every per-block file in
-    /// `tmp/`, and the `*.tmp` files of writers killed inside `write_atomic`
-    /// (unique names, never reused, so they would accumulate forever).
-    ///
-    /// Only for the holder of the store's write lock: it is the one process
-    /// that writes under these directories, so nothing found there is live.
-    pub fn clear_leftovers(&self) -> usize {
-        let mut removed = remove_files(&self.tmp(), |_| true);
-        for dir in [self.spool(), self.codes(), self.archive_profiles()] {
-            removed += remove_files(&dir, |name| name.ends_with(".tmp"));
-        }
-        removed
-    }
-
-    /// Loads contract bytecodes for the given hashes from the codes dir.
-    /// Returns the same `HashMap` flavor `WitnessDatabase.contracts` expects.
-    pub fn load_contracts(
-        &self,
-        hashes: &[B256],
-    ) -> Result<alloy_primitives::map::HashMap<B256, revm::state::Bytecode>> {
-        let mut map = alloy_primitives::map::HashMap::with_capacity_and_hasher(
-            hashes.len(),
-            Default::default(),
-        );
-        for hash in hashes {
-            let path = self.code_file(hash);
-            let bytes = fs::read(&path)
-                .wrap_err_with(|| format!("missing contract code {}", path.display()))?;
-            map.insert(*hash, revm::state::Bytecode::new_raw(bytes.into()));
-        }
-        Ok(map)
-    }
 }
 
 /// Removes the files directly in `dir` whose name `matches`; returns how many.
@@ -328,6 +381,29 @@ mod tests {
         assert_eq!(SpoolEntry::open(&path, n).unwrap().block.header.inner.number, n);
         let err = SpoolEntry::open(&path, n + 1).err().expect("another block's entry");
         assert!(err.to_string().contains("expected"), "{err}");
+    }
+
+    /// The byte-array hooks change how fast `block_json` is written, not what
+    /// is written: an entry encoded before them must decode after them.
+    #[test]
+    fn block_json_bytes_encode_as_the_plain_vec_did() {
+        #[derive(Serialize)]
+        struct Plain {
+            block_json: Vec<u8>,
+            light_witness: LightWitness,
+            code_hashes: Vec<B256>,
+        }
+        let e = entry(&[7u8; 300]);
+        let plain = Plain {
+            block_json: e.block_json.clone(),
+            light_witness: LightWitness { kvs: Default::default(), levels: Default::default() },
+            code_hashes: e.code_hashes.clone(),
+        };
+        let as_bytes = bincode::serde::encode_to_vec(&e, BINCODE_CONFIG).unwrap();
+        assert_eq!(as_bytes, bincode::serde::encode_to_vec(&plain, BINCODE_CONFIG).unwrap());
+        let (back, _): (SpoolEntry, _) =
+            bincode::serde::decode_from_slice(&as_bytes, BINCODE_CONFIG).unwrap();
+        assert_eq!(back.block_json, e.block_json);
     }
 
     #[test]

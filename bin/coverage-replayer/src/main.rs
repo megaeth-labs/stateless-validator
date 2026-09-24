@@ -68,7 +68,7 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// Replay a block range, ingest branch-granular coverage bitmaps.
+    /// Replay blocks under coverage instrumentation and store what each covered.
     Backfill(backfill::BackfillArgs),
     /// Compute the greedy covering block set from the pattern store.
     SetCover(setcover::SetCoverArgs),

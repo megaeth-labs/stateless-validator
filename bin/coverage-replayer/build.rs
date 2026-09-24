@@ -56,7 +56,7 @@ fn main() {
     // llvm-cov will look for their sources. Versions come from the lockfile,
     // so the default scope can never name a version the binary was not built
     // against.
-    let measured: Vec<String> = std::fs::read_to_string("measured-crates.txt")
+    let mut measured: Vec<String> = std::fs::read_to_string("measured-crates.txt")
         .expect("coverage-replayer build: measured-crates.txt is missing")
         .lines()
         .map(str::trim)
@@ -72,7 +72,6 @@ fn main() {
         .collect();
     // Sorted, because this list is hashed into `binary_id`: reordering
     // measured-crates.txt must not look like a different instrumented build.
-    let mut measured = measured;
     measured.sort();
 
     // Where the build found its sources and its LLVM. llvm-cov matches the
@@ -92,17 +91,14 @@ fn main() {
     println!("cargo:rustc-env=COVERAGE_RUSTC_SYSROOT={sysroot}");
     println!("cargo:rerun-if-env-changed=CARGO_HOME");
     println!("cargo:rerun-if-env-changed=HOME");
-    // The lockfile as a whole. A profile names each instance of the measured
-    // generics by its symbol, which carries the cargo metadata of the crate
-    // instantiating it — a workspace crate — and that metadata moves with any
-    // dependency or version change. Two builds that differ there cannot read
-    // each other's profiles, so they must not share a store.
+    // The lockfile as a whole: why it belongs in `binary_id` is on
+    // `store::current_binary_id`.
     println!("cargo:rustc-env=COVERAGE_LOCKFILE_DIGEST={:016x}", fnv1a(lock.as_bytes()));
     println!("cargo:rustc-env=COVERAGE_MEGA_EVM_REV={mega_evm}");
     println!("cargo:rustc-env=COVERAGE_MEASURED_CRATES={}", measured.join(","));
     println!("cargo:rerun-if-changed=measured-crates.txt");
     println!("cargo:rustc-env=COVERAGE_RUSTC_VERSION={toolchain}");
-    // Re-run if the lockfile changes (mega-evm bump).
+    // Re-run when the lockfile changes: the rev, the versions and the digest come from it.
     println!("cargo:rerun-if-changed=../../Cargo.lock");
 }
 

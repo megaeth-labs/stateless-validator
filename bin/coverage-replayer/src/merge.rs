@@ -175,10 +175,10 @@ fn merge_snapshots(shards: Vec<(String, StoreSnapshot)>) -> Result<StoreSnapshot
             let rec = PatternRecord { bits: remapped.count_ones(), bitmap: remapped, ..*rec };
             if occupied {
                 patterns.get_mut(&key).expect("occupied slot").absorb(&rec);
-            } else {
-                patterns.insert(key, rec);
+                continue;
             }
-            if !occupied && key != stored_key {
+            patterns.insert(key, rec);
+            if key != stored_key {
                 warn!(
                     shard = %label,
                     stored = %format!("{stored_key:016x}"),

@@ -19,7 +19,7 @@
 //! Run-once initializers (the per-hardfork precompile tables) read as
 //! uncovered: no block is credited with them — see `worker::warm_up`.
 
-use std::{path::PathBuf, process::Command};
+use std::path::PathBuf;
 
 use clap::Args;
 use eyre::{Context, Result, ensure};
@@ -63,16 +63,11 @@ pub fn run(args: ReportArgs) -> Result<()> {
         .prefix("coverage-report-")
         .tempdir()
         .wrap_err("create a work dir for the report")?;
-    // Archived per-pattern profiles are zstd'd sparse profdata; inflate them
-    // for llvm-profdata (profdata files are valid merge inputs).
+    // Inflated archived profiles are sparse profdata: valid merge inputs.
     let mut profiles = Vec::new();
     for b in &manifest.blocks {
-        let z = dirs.archived_profile(b.pattern_key()?);
-        ensure!(z.exists(), "archived profile missing for pattern {}: {}", b.pattern, z.display());
-        let raw = zstd::decode_all(&std::fs::read(&z)?[..])
-            .wrap_err_with(|| format!("decompress {}", z.display()))?;
         let profile = work.path().join(format!("{}.profdata", b.pattern));
-        std::fs::write(&profile, &raw)?;
+        std::fs::write(&profile, dirs.read_archived_profile(b.pattern_key()?)?)?;
         profiles.push(profile);
     }
     let merged = work.path().join("selected.profdata");
@@ -84,23 +79,11 @@ pub fn run(args: ReportArgs) -> Result<()> {
         manifest.covered_counters,
     )?;
 
-    let report = Command::new(&llvm.cov)
-        .arg("report")
-        .arg(&exe)
-        .arg(format!("--instr-profile={}", merged.display()))
-        .args(&llvm.source_dirs)
-        .output()?;
-    ensure!(
-        report.status.success(),
-        "llvm-cov report failed: {}",
-        String::from_utf8_lossy(&report.stderr)
-    );
-    let table = String::from_utf8_lossy(&report.stdout);
-
+    let table = llvm.report(&exe, &merged)?;
     info!(
         blocks = manifest.blocks.len(),
-        universe_counters = manifest.universe_counters,
-        "coverage report for selected set (branch-granular counters: see manifest)"
+        items = manifest.universe_counters,
+        "coverage report for the selected set (items: evaluated regions and branch arms)"
     );
     println!("{table}");
     println!("selected blocks:");
@@ -116,13 +99,11 @@ pub fn run(args: ReportArgs) -> Result<()> {
 /// Whether the selected profiles, read through THIS binary's coverage map,
 /// still hold the coverage the cover recorded for them.
 ///
-/// A profile names each function instance by its symbol, and llvm-cov cannot
-/// match a profile to a build whose symbols differ: it reports that code
-/// uncovered. `binary_id` covers the causes it can see — the measured
-/// sources, the toolchain, the lockfile — but not features or compiler flags.
-/// Re-deriving the covered items is the direct check, whatever the cause: the
-/// same extraction the scan ran, so on the build that scanned it it
-/// reproduces the manifest's count exactly.
+/// llvm-cov cannot match a profile to a build whose symbols differ, and
+/// reports that code uncovered. `binary_id` catches the causes it can see
+/// (see `store::current_binary_id`); this catches any, by re-deriving the
+/// covered items through the same extraction the scan ran — on the build
+/// that scanned, that reproduces the manifest's count exactly.
 fn check_profiles_evaluate(evaluated: u64, recorded: u64) -> Result<()> {
     ensure!(
         evaluated == recorded,

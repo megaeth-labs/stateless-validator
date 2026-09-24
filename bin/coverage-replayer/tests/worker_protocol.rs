@@ -33,9 +33,8 @@ fn a_worker_answers_on_stdout_with_one_frame_per_request() {
 
     // A block whose spool entry does not exist: the worker must answer it,
     // as a failed block, rather than die.
-    let request = format!(r#"{{"block":7,"spool":"{}"}}"#, dir.path().join("7.bin").display());
     let mut stdin = worker.stdin.take().unwrap();
-    writeln!(stdin, "{request}").unwrap();
+    writeln!(stdin, r#"{{"block":7}}"#).unwrap();
     drop(stdin);
 
     let lines: Vec<String> =

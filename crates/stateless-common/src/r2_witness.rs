@@ -189,6 +189,13 @@ pub trait R2Metrics: Send + Sync {
     fn on_negotiated_version(&self, version: &'static str);
 }
 
+/// No metrics, for a consumer that publishes none.
+impl R2Metrics for () {
+    fn on_target(&self, _target: &'static str) {}
+    fn on_connections(&self, _connections: usize) {}
+    fn on_negotiated_version(&self, _version: &'static str) {}
+}
+
 /// The shared transport of the two R2 witness adapters: an [`R2ObjectFetcher`] plus the
 /// construction and target accessors both binaries would otherwise duplicate verbatim.
 /// The fetcher's `Debug` redacts the credentials.

@@ -14,7 +14,7 @@ use eyre::Result;
 
 use crate::{
     bitset::BitSet,
-    setcover::{CoverOutcome, select_cover},
+    setcover::select_cover,
     spool::DataDir,
     store::{BlockStatus, PatternRecord, Store, elapsed_stats},
 };
@@ -102,7 +102,7 @@ pub fn run(args: InspectArgs) -> Result<()> {
         universe.union_with(&rec.bitmap);
     }
     let universe_bits = universe.count_ones();
-    let mut hits: Vec<(&u64, &crate::store::PatternRecord)> = patterns.iter().collect();
+    let mut hits: Vec<(&u64, &PatternRecord)> = patterns.iter().collect();
     let singletons = hits.iter().filter(|(_, r)| r.hit_count == 1).count();
     let bits: Vec<u64> = hits.iter().map(|(_, r)| r.bits).collect();
     let (bits_min, bits_max) = (bits.iter().min().copied(), bits.iter().max().copied());
@@ -150,7 +150,7 @@ pub fn run(args: InspectArgs) -> Result<()> {
 
     // ---- growth curve: patterns & universe by first-seen block ----
     {
-        let mut by_first: Vec<(&crate::store::PatternRecord, u64)> =
+        let mut by_first: Vec<(&PatternRecord, u64)> =
             patterns.values().map(|r| (r, r.first_block)).collect();
         by_first.sort_by_key(|(_, fb)| *fb);
         if let (Some((_, lo)), Some((_, hi))) = (by_first.first(), by_first.last()) {
@@ -209,9 +209,10 @@ pub fn run(args: InspectArgs) -> Result<()> {
         );
 
         if let Some(path) = &args.dump_pool {
-            let siblings = collect_siblings(&store, &patterns, &outcome, args.pool_siblings)?;
+            let dominated: HashSet<u64> = outcome.pruned_dominated.iter().copied().collect();
+            let siblings = collect_siblings(&store, &patterns, &dominated, args.pool_siblings)?;
             let written =
-                write_pool(path, &patterns, &outcome, &siblings, args.pool_siblings, &binary_id)?;
+                write_pool(path, &patterns, &dominated, &siblings, args.pool_siblings, &binary_id)?;
             println!();
             println!("candidate pool: {written} blocks written to {}", path.display());
         }
@@ -244,12 +245,11 @@ pub fn run(args: InspectArgs) -> Result<()> {
 fn write_pool(
     path: &Path,
     patterns: &HashMap<u64, PatternRecord>,
-    outcome: &CoverOutcome,
+    dominated: &HashSet<u64>,
     siblings: &HashMap<u64, Vec<u64>>,
     siblings_per_pattern: usize,
     binary_id: &str,
 ) -> Result<usize> {
-    let dominated: HashSet<u64> = outcome.pruned_dominated.iter().copied().collect();
     let antichain: Vec<u64> = patterns.keys().copied().filter(|k| !dominated.contains(k)).collect();
 
     let mut blocks: BTreeSet<u64> = antichain.iter().map(|k| patterns[k].representative).collect();
@@ -282,14 +282,13 @@ fn write_pool(
 fn collect_siblings(
     store: &Store<redb::ReadOnlyDatabase>,
     patterns: &HashMap<u64, PatternRecord>,
-    outcome: &CoverOutcome,
+    dominated: &HashSet<u64>,
     per_pattern: usize,
 ) -> Result<HashMap<u64, Vec<u64>>> {
     let mut siblings: HashMap<u64, Vec<u64>> = HashMap::new();
     if per_pattern == 0 {
         return Ok(siblings);
     }
-    let dominated: HashSet<u64> = outcome.pruned_dominated.iter().copied().collect();
     store.blocks(.., |number, rec| {
         let Some(key) = rec.pattern_key else { return };
         if rec.status != BlockStatus::Ok || dominated.contains(&key) {
@@ -312,22 +311,17 @@ fn collect_siblings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::BlockRecord;
-
-    fn pat(bits: &[u32], rep: u64) -> PatternRecord {
-        PatternRecord::first_seen(BitSet::from_indices(bits.iter().copied()), rep, 100)
-    }
+    use crate::{
+        setcover::CoverOutcome,
+        store::{BlockRecord, test_support::pattern as pat},
+    };
 
     fn block(pattern_key: u64) -> BlockRecord {
-        BlockRecord {
-            hash: alloy_primitives::B256::ZERO,
-            status: BlockStatus::Ok,
-            pattern_key: Some(pattern_key),
-            gas_used: 0,
-            tx_count: 0,
-            elapsed_ms: 0,
-            error: None,
-        }
+        crate::store::test_support::block(BlockStatus::Ok, Some(pattern_key))
+    }
+
+    fn dominated(outcome: &CoverOutcome) -> HashSet<u64> {
+        outcome.pruned_dominated.iter().copied().collect()
     }
 
     /// A, B (equal bits, overlapping) and C, none dominated. Greedy reaches
@@ -349,8 +343,15 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.txt");
-        let written =
-            write_pool(&path, &patterns, &outcome, &HashMap::new(), 0, "megaevm:test:fx0").unwrap();
+        let written = write_pool(
+            &path,
+            &patterns,
+            &dominated(&outcome),
+            &HashMap::new(),
+            0,
+            "megaevm:test:fx0",
+        )
+        .unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
         let blocks: Vec<u64> =
@@ -374,7 +375,7 @@ mod tests {
         write_pool(
             &path,
             &patterns,
-            &outcome,
+            &dominated(&outcome),
             &HashMap::new(),
             0,
             "megaevm:19f3965962c4:fxdeadbeef",
@@ -423,10 +424,10 @@ mod tests {
                         &block(block_number),
                         &counters,
                         Some((block_number, &pat(&bits, block_number))),
-                        true,
                     )
                     .unwrap();
             }
+            store.flush().unwrap();
         }
 
         let pool = dir.path().join("pool.txt");
@@ -473,18 +474,18 @@ mod tests {
             for (number, key) in
                 [(999u64, 1u64), (10, 1), (77, 1), (11, 1), (54, 1), (20, 2), (30, 3), (31, 3)]
             {
-                store
-                    .commit_block(number, &block(key), &[], Some((key, &patterns[&key])), true)
-                    .unwrap();
+                store.commit_block(number, &block(key), &[], Some((key, &patterns[&key]))).unwrap();
             }
+            store.flush().unwrap();
         }
         let (store, _) = Store::open_readonly(&store_path).unwrap();
         let outcome = select_cover(&patterns, &Default::default());
 
         let read_pool = |per_pattern: usize, name: &str| -> Vec<u64> {
             let path = dir.path().join(name);
-            let siblings = collect_siblings(&store, &patterns, &outcome, per_pattern).unwrap();
-            write_pool(&path, &patterns, &outcome, &siblings, per_pattern, "id").unwrap();
+            let dominated = dominated(&outcome);
+            let siblings = collect_siblings(&store, &patterns, &dominated, per_pattern).unwrap();
+            write_pool(&path, &patterns, &dominated, &siblings, per_pattern, "id").unwrap();
             std::fs::read_to_string(&path)
                 .unwrap()
                 .lines()

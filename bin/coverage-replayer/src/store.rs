@@ -7,7 +7,11 @@
 //! meaningful for one build and one item definition. On mismatch the store
 //! refuses to open.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use alloy_primitives::B256;
 use eyre::{Result, ensure};
@@ -123,7 +127,12 @@ pub struct BlockRecord {
 /// merge inputs) — the write methods do not exist on a read-only store.
 pub struct Store<D = Database> {
     db: D,
+    /// Block commits so far (see [`Store::commit_block`]).
+    commits: AtomicU64,
 }
+
+/// Block commits between two flushes to disk (see [`Store::commit_block`]).
+const COMMITS_PER_FLUSH: u64 = 64;
 
 impl Store {
     /// Opens (or creates) the store and enforces the coverage namespace: the
@@ -141,18 +150,15 @@ impl Store {
             txn.open_table(PATTERNS)?;
             txn.open_table(BLOCKS)?;
 
-            let existing = meta
-                .get("binary_id")?
-                .map(|guard| String::from_utf8_lossy(guard.value()).into_owned());
-            match existing {
+            match read_meta(&meta, BINARY_ID_KEY)? {
                 Some(existing) => {
                     check_binary_id(path, &existing, binary_id)?;
                     check_schema_version(&meta, path)?;
                     check_complete(&meta, path)?;
                 }
                 None => {
-                    meta.insert("binary_id", binary_id.as_bytes())?;
-                    meta.insert("schema_version", SCHEMA_VERSION.to_le_bytes().as_slice())?;
+                    meta.insert(BINARY_ID_KEY, binary_id.as_bytes())?;
+                    meta.insert(SCHEMA_VERSION_KEY, SCHEMA_VERSION.to_le_bytes().as_slice())?;
                 }
             }
 
@@ -169,26 +175,27 @@ impl Store {
         }
         txn.commit()?;
 
-        Ok(Self { db })
+        Ok(Self { db, commits: AtomicU64::new(0) })
     }
 
     /// Persists one judged block: its record, any new counters, and the
     /// created/updated pattern — atomically in one transaction.
     ///
-    /// Unless `durable`, the commit skips the flush to disk: it becomes
-    /// durable with the next durable commit or [`Self::flush`], and a crash
-    /// before either rolls it back, whole — its block is then simply replayed
-    /// again. One flush per batch instead of one per block.
+    /// Only every [`COMMITS_PER_FLUSH`]th commit is flushed to disk; the ones
+    /// in between become durable with it, or with [`Self::flush`], and a crash
+    /// before then rolls them back whole — their blocks are then simply
+    /// replayed again. One flush per batch instead of one per block, so
+    /// whoever writes blocks flushes when done.
     pub fn commit_block(
         &self,
         block: u64,
         record: &BlockRecord,
         new_counters: &[(u64, CounterInfo)],
         pattern: Option<(u64, &PatternRecord)>,
-        durable: bool,
     ) -> Result<()> {
         let mut txn = self.db.begin_write()?;
-        if !durable {
+        let commit = self.commits.fetch_add(1, Ordering::Relaxed) + 1;
+        if !commit.is_multiple_of(COMMITS_PER_FLUSH) {
             txn.set_durability(Durability::None)?;
         }
         txn.open_table(BLOCKS)?.insert(block, encode(record)?.as_slice())?;
@@ -294,12 +301,12 @@ impl Store<ReadOnlyDatabase> {
             ),
             e => eyre::eyre!("open store {} read-only: {e}", path.display()),
         })?;
-        let store = Self { db };
+        let store = Self { db, commits: AtomicU64::new(0) };
         let txn = store.db.begin_read()?;
         let meta = txn.open_table(META)?;
         check_schema_version(&meta, path)?;
         check_complete(&meta, path)?;
-        let binary_id = read_meta(&meta, "binary_id")?.unwrap_or_else(|| "<unset>".into());
+        let binary_id = read_meta(&meta, BINARY_ID_KEY)?.unwrap_or_else(|| "<unset>".into());
         drop(meta);
         drop(txn);
         Ok((store, binary_id))
@@ -390,6 +397,8 @@ where
     Ok(())
 }
 
+const BINARY_ID_KEY: &str = "binary_id";
+const SCHEMA_VERSION_KEY: &str = "schema_version";
 const UNIVERSE_KEY: &str = "universe";
 
 fn read_meta<T>(meta: &T, key: &str) -> Result<Option<String>>
@@ -417,7 +426,7 @@ fn check_schema_version<T>(meta: &T, path: &Path) -> Result<()>
 where
     T: redb::ReadableTable<&'static str, &'static [u8]>,
 {
-    let stored = match meta.get("schema_version")? {
+    let stored = match meta.get(SCHEMA_VERSION_KEY)? {
         Some(guard) => u32::from_le_bytes(
             guard
                 .value()
@@ -509,11 +518,13 @@ pub fn resolve_pattern_slot(
 /// code (so a resumed run can continue a store `backfill` started) and
 /// changes whenever what a profile or a counter means could: mega-evm's
 /// revision, the measured crates and their versions, `rustc -vV`, and the
-/// lockfile — the dependency graph names the instances profiles are keyed
-/// by, so a build with other dependencies cannot read this store's archived
-/// profiles. Captured at compile time by build.rs. What it cannot see
-/// (features, compiler flags) `report` still catches, by re-deriving the
-/// covered items.
+/// lockfile. The lockfile because a profile names each instance of the
+/// measured generics by its symbol, which carries the cargo metadata of the
+/// workspace crate instantiating it — and that metadata moves with any
+/// dependency or version change, so a build with other dependencies cannot
+/// read this store's archived profiles. Captured at compile time by build.rs.
+/// What it cannot see (features, compiler flags) `report` still catches, by
+/// re-deriving the covered items.
 pub fn current_binary_id() -> String {
     use std::hash::Hasher;
     let mega_evm = env!("COVERAGE_MEGA_EVM_REV");
@@ -547,24 +558,40 @@ pub fn elapsed_stats(samples: &mut [u64]) -> Option<(f64, u64, u64, u64)> {
     ))
 }
 
+/// Record builders the modules' tests share.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
 
-    fn rec(bits: &[u32]) -> PatternRecord {
-        PatternRecord::first_seen(BitSet::from_indices(bits.iter().copied()), 1, 10)
+    /// A pattern over `bits` (dense indices), first seen at block `rep`.
+    pub(crate) fn pattern(bits: &[u32], rep: u64) -> PatternRecord {
+        PatternRecord::first_seen(BitSet::from_indices(bits.iter().copied()), rep, 100)
     }
 
-    fn block(status: BlockStatus) -> BlockRecord {
+    /// A block record with the given status and pattern.
+    pub(crate) fn block(status: BlockStatus, pattern_key: Option<u64>) -> BlockRecord {
         BlockRecord {
             hash: B256::ZERO,
             status,
-            pattern_key: None,
+            pattern_key,
             gas_used: 0,
             tx_count: 0,
             elapsed_ms: 0,
             error: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{test_support::pattern, *};
+
+    fn rec(bits: &[u32]) -> PatternRecord {
+        pattern(bits, 1)
+    }
+
+    fn block(status: BlockStatus) -> BlockRecord {
+        test_support::block(status, None)
     }
 
     /// The collision branch of the shared probing walk — the one path whose
@@ -691,7 +718,8 @@ mod tests {
         let path = dir.path().join("store.redb");
         {
             let store = Store::open(&path, "megaevm:aaa:fx1", "universe/x").unwrap();
-            store.commit_block(7, &block(BlockStatus::Ok), &[], None, true).unwrap();
+            store.commit_block(7, &block(BlockStatus::Ok), &[], None).unwrap();
+            store.flush().unwrap();
         }
         let before = std::fs::read(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
@@ -724,7 +752,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("store.redb"), "id", "u").unwrap();
         for n in [5u64, 10, 15, 20] {
-            store.commit_block(n, &block(BlockStatus::Ok), &[], None, true).unwrap();
+            store.commit_block(n, &block(BlockStatus::Ok), &[], None).unwrap();
         }
 
         // 5 and 20 are the extremes; 10 and 15 lie between them and must not

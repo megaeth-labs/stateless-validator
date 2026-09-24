@@ -31,8 +31,8 @@ use clap::Args;
 use eyre::{Context, Result, bail, ensure};
 use rustc_hash::FxHashMap;
 use stateless_common::{
-    R2CountFlag, R2Flag, R2Flags, R2Metrics, R2WitnessTransport, RedactedSecret, RpcClient,
-    RpcClientConfig, decode_on_blocking_pool, decode_witness_payload_light, validate_r2_flags,
+    R2CountFlag, R2Flag, R2Flags, R2WitnessTransport, RedactedSecret, RpcClient, RpcClientConfig,
+    decode_on_blocking_pool, decode_witness_payload_light, validate_r2_flags,
 };
 use stateless_core::{LightWitness, withdrawals::MptWitness};
 use stateless_r2::fetch::{DEFAULT_CONNECT_TIMEOUT, FetchTimeouts};
@@ -45,9 +45,9 @@ use tracing::{info, warn};
 
 use crate::{
     bitset::BitSet,
-    llvm::{Llvm, LlvmArgs},
-    proto::{ItemDetail, WorkerRequest, WorkerResponse},
-    spool::{DataDir, SpoolEntry, write_atomic, write_scratch},
+    llvm::{CoveredItem, Llvm, LlvmArgs},
+    proto::{WorkerRequest, WorkerResponse},
+    spool::{DataDir, SpoolEntry, write_scratch},
     store::{
         BlockRecord, BlockStatus, CounterInfo, PatternRecord, Store, current_binary_id,
         elapsed_stats, resolve_pattern_slot,
@@ -96,9 +96,7 @@ pub struct BackfillArgs {
     /// (no bucket path). Configuring it, with its bucket and credentials,
     /// turns on the R2 witness route: every witness is tried against the
     /// bucket first, and a block R2 cannot serve goes to `--witness-endpoint`.
-    /// There is no mode flag — the configured target is the switch, as in the
-    /// validator and the trace server, and a half-configured one is refused
-    /// by name.
+    /// A half-configured target is refused by name.
     #[clap(long, env = "COVERAGE_REPLAYER_R2_ENDPOINT")]
     pub r2_endpoint: Option<String>,
     /// R2 bucket holding the witnesses (e.g. `witness-mainnet`).
@@ -298,6 +296,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     let todo: Vec<u64> =
         selection.iter().filter(|n| statuses.get(n) != Some(&BlockStatus::Ok)).collect();
     let retrying = todo.iter().filter(|n| statuses.contains_key(n)).count();
+    drop(statuses);
     let total = todo.len() as u64;
     info!(
         selection = %selection.label(),
@@ -336,9 +335,6 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     let verified_codes = Arc::new(VerifiedCodes::default());
     let fetcher = {
         let dirs = dirs.clone();
-        let client = client.clone();
-        let r2 = r2.clone();
-        let dispatch_tx = dispatch_tx.clone();
         let fetch_concurrency = args.fetch_concurrency.max(1);
         tokio::spawn(async move {
             let mut inflight: JoinSet<u64> = JoinSet::new();
@@ -386,7 +382,6 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
             }
         })
     };
-    drop(dispatch_tx);
 
     // ---- judge (this task) ----
     let mut judge =
@@ -495,11 +490,6 @@ async fn fetch_block(
         // publishes and the witness is addressed by.
         let block = client.get_block_unchecked(BlockId::number(n), true).await;
         ensure!(
-            block.header.number == n,
-            "asked for block {n}, the RPC returned {}",
-            block.header.number
-        );
-        ensure!(
             block.header.hash_slow() == block.header.hash,
             "block {n}: the RPC header does not hash to the hash it claims ({:#x})",
             block.header.hash,
@@ -513,14 +503,16 @@ async fn fetch_block(
     // witnesses are NOT stored anywhere — when a selected block needs one, it
     // is re-fetched on demand. Either source serves the full history: the
     // bucket keeps every witness, and the witness RPC reads the same bucket.
-    let r2_witness = match r2 {
-        Some(r2) => r2_witness(r2, n, hash).await.map(Some).unwrap_or_else(|e| {
-            warn!(block = n, error = %format!("{e:#}"), "R2 witness failed; using the witness RPC");
-            None
-        }),
+    let from_r2 = match r2 {
+        Some(r2) => r2_witness(r2, n, hash)
+            .await
+            .inspect_err(|e| {
+                warn!(block = n, error = %format!("{e:#}"), "R2 witness failed; using the witness RPC")
+            })
+            .ok(),
         None => None,
     };
-    let (light_witness, _mpt_witness) = match r2_witness {
+    let (light_witness, _mpt_witness) = match from_r2 {
         Some(witness) => witness,
         None => client.get_witness_light(n, hash).await,
     };
@@ -540,22 +532,10 @@ async fn fetch_block(
     Ok(())
 }
 
-/// The R2 witness route, when the `--r2-*` flags configure a target. The
-/// rules are the ones the validator and the trace server apply
-/// (`validate_r2_flags`), so a half-configured target or a blank value is
-/// refused by name rather than read as "no R2". This binary offers the S3
-/// target only.
+/// The R2 witness route, when the `--r2-*` flags configure a target, judged
+/// by the rules the validator and the trace server share
+/// (`validate_r2_flags`). This binary offers the S3 target only.
 fn r2_transport(args: &BackfillArgs) -> Result<Option<R2WitnessTransport>> {
-    // The value itself is Debug-redacted, but a CLI-passed secret is still
-    // visible in the process list for the whole (multi-week) run.
-    if args.r2_secret_access_key.is_some() &&
-        std::env::var("COVERAGE_REPLAYER_R2_SECRET_ACCESS_KEY").is_err()
-    {
-        warn!(
-            "--r2-secret-access-key was passed on the command line — it is visible in `ps` for \
-             the lifetime of the process; prefer the COVERAGE_REPLAYER_R2_SECRET_ACCESS_KEY env var"
-        );
-    }
     let flags = R2Flags {
         endpoint: R2Flag::new("--r2-endpoint", args.r2_endpoint.as_deref()),
         bucket: R2Flag::new("--r2-bucket", args.r2_bucket.as_deref()),
@@ -571,12 +551,15 @@ fn r2_transport(args: &BackfillArgs) -> Result<Option<R2WitnessTransport>> {
         max_concurrent_requests: R2CountFlag::new("--r2-max-concurrent-requests", None),
         tuning: &[],
     };
-    let timeouts = FetchTimeouts { per_attempt: R2_BUDGET, connect: DEFAULT_CONNECT_TIMEOUT };
+    // Each attempt gets its share of the budget, so a stalled GET cannot use
+    // up the attempts that follow it.
+    let per_attempt = R2_BUDGET / R2_ATTEMPTS as u32;
+    let timeouts = FetchTimeouts { per_attempt, connect: DEFAULT_CONNECT_TIMEOUT };
     let transport = R2WitnessTransport::from_config(
         validate_r2_flags(&flags)?,
         timeouts,
         RpcClientConfig::default().rpc_retry,
-        Arc::new(NoMetrics),
+        Arc::new(()),
     )?;
     match &transport {
         Some(t) => {
@@ -587,10 +570,9 @@ fn r2_transport(args: &BackfillArgs) -> Result<Option<R2WitnessTransport>> {
     Ok(transport)
 }
 
-/// What R2 gets per block before the block goes to the witness RPC — a second
-/// path to the same bucket, so a stalled or failing R2 should hand over
-/// rather than hold the block: a few attempts inside one budget, the shape of
-/// the validator's R2 fast path.
+/// What R2 gets per block before the block goes to the witness RPC, a second
+/// path to the same bucket: a few attempts inside one budget, so a stalled
+/// or failing R2 hands the block over rather than holding it.
 const R2_ATTEMPTS: usize = 3;
 const R2_BUDGET: Duration = Duration::from_secs(60);
 
@@ -605,15 +587,6 @@ async fn r2_witness(
         decode_witness_payload_light(bytes)
     })
     .await?)
-}
-
-/// This offline tool publishes no metrics.
-struct NoMetrics;
-
-impl R2Metrics for NoMetrics {
-    fn on_target(&self, _target: &'static str) {}
-    fn on_connections(&self, _connections: usize) {}
-    fn on_negotiated_version(&self, _version: &'static str) {}
 }
 
 /// The codes-dir files this run has already found content-valid, shared by
@@ -686,7 +659,7 @@ async fn resolve_missing_codes(
 /// Returns whether `path` holds exactly the bytes hashing to `hash`
 /// (content-addressed check, same keccak the RPC fetch verifies). A present-
 /// but-invalid file is deleted so the caller refetches it.
-fn code_file_is_valid(path: &std::path::Path, hash: &B256) -> bool {
+fn code_file_is_valid(path: &Path, hash: &B256) -> bool {
     match std::fs::read(path) {
         Ok(bytes) if alloy_primitives::keccak256(&bytes) == *hash => true,
         Ok(_) => {
@@ -727,7 +700,7 @@ async fn worker_manager(
     let (dirs, warn_after) = (&setup.dirs, setup.warn_after);
 
     while let Ok(n) = rx.recv().await {
-        let req = WorkerRequest { block: n, spool: dirs.spool_entry(n) };
+        let req = WorkerRequest { block: n };
         let mut attempt = 0u64;
         let resp = loop {
             if worker.is_none() {
@@ -847,11 +820,6 @@ impl WorkerHandle {
     }
 }
 
-/// Judged blocks between two flushes of the store. A kill or crash rolls back
-/// at most this many — they are replayed again — for one flush per batch
-/// instead of one per block; every exit path of the judge flushes.
-const COMMITS_PER_FLUSH: u64 = 64;
-
 /// Single-consumer ingest: pattern dedup, promotion, persistence, progress.
 struct JudgeState<'a> {
     store: &'a Store,
@@ -860,7 +828,6 @@ struct JudgeState<'a> {
     /// it, so its size is also the size of the universe. Ids are hashes
     /// already, so the map need not hash them again.
     counters: FxHashMap<u64, u32>,
-    next_dense: u32,
     patterns: HashMap<u64, PatternRecord>,
     /// Keys of the patterns no pattern dominated when they arrived. A new
     /// pattern dominated by anything is dominated by one of these —
@@ -920,7 +887,6 @@ impl<'a> JudgeState<'a> {
         dirs: Arc<DataDir>,
         total: u64,
     ) -> Self {
-        let next_dense = counters.values().map(|info| info.dense + 1).max().unwrap_or(0);
         let counters: FxHashMap<u64, u32> =
             counters.into_iter().map(|(id, info)| (id, info.dense)).collect();
         let undominated = crate::setcover::split_antichain(&patterns)
@@ -933,7 +899,6 @@ impl<'a> JudgeState<'a> {
             store,
             dirs,
             counters,
-            next_dense,
             patterns,
             undominated,
             processed: 0,
@@ -955,7 +920,7 @@ impl<'a> JudgeState<'a> {
 
         if let Some(error) = &resp.error {
             let record = block_record(&resp, BlockStatus::Error, None);
-            self.store.commit_block(resp.block, &record, &[], None, false)?;
+            self.store.commit_block(resp.block, &record, &[], None)?;
             eyre::bail!(
                 "block {} failed to replay: {error} — ABORTING (no block may be skipped; \
                  spool kept at {}; a re-run will retry this block)",
@@ -967,7 +932,7 @@ impl<'a> JudgeState<'a> {
         let sane = resp.gas_ok && resp.receipts_root_ok && resp.logs_bloom_ok;
         if !sane {
             let record = block_record(&resp, BlockStatus::Divergent, None);
-            self.store.commit_block(resp.block, &record, &[], None, false)?;
+            self.store.commit_block(resp.block, &record, &[], None)?;
             eyre::bail!(
                 "SANITY FAILURE at block {} (gas_ok={} receipts_root_ok={} logs_bloom_ok={}) — \
                  execution diverged from the header; bitmap NOT ingested. ABORTING: this is \
@@ -992,7 +957,8 @@ impl<'a> JudgeState<'a> {
         self.elapsed_ok_ms.record(resp.elapsed_ms);
         // Resolve counter ids → dense indices, registering unseen ids from the
         // details their worker sent along.
-        let details: HashMap<u64, &ItemDetail> = resp.new_items.iter().map(|d| (d.id, d)).collect();
+        let details: HashMap<u64, &CoveredItem> =
+            resp.new_items.iter().map(|d| (d.id, d)).collect();
         let mut new_counters: Vec<(u64, CounterInfo)> = Vec::new();
         let mut dense = Vec::with_capacity(resp.counters.len());
         for id in &resp.counters {
@@ -1007,14 +973,14 @@ impl<'a> JudgeState<'a> {
                     resp.block
                 )
             })?;
-            let index = self.next_dense;
-            self.next_dense += 1;
+            // Dense indices are handed out in order, one per counter.
+            let index = self.counters.len() as u32;
             self.counters.insert(*id, index);
             dense.push(index);
             let info = CounterInfo {
                 dense: index,
                 location: d.location.clone(),
-                kind: d.kind.clone(),
+                kind: d.kind.as_str().to_string(),
                 line: d.line,
             };
             new_counters.push((*id, info));
@@ -1022,6 +988,7 @@ impl<'a> JudgeState<'a> {
 
         let rec =
             PatternRecord::first_seen(BitSet::from_indices(dense), resp.block, resp.elapsed_ms);
+        let profile = self.dirs.block_profdata(resp.block);
         // Worker counters arrive sorted and deduped, as the keying expects.
         let (key, occupied) = resolve_pattern_slot(&self.patterns, &resp.counters, &rec.bitmap);
 
@@ -1032,9 +999,9 @@ impl<'a> JudgeState<'a> {
         } else {
             // Dominated patterns (strict subset of an existing one) can never
             // beat their dominator in set cover — record the bitmap for dedup
-            // and stats, but skip the profile archive (93% of new patterns in
-            // practice). set-cover excludes them from candidates, so a
-            // selected block always has an archived profile.
+            // and stats, but skip the profile archive (most new patterns).
+            // set-cover excludes them from candidates, so a selected block
+            // always has an archived profile.
             let dominated = self.undominated.iter().any(|k| self.patterns[k].dominates(&rec));
             self.new_patterns += 1;
             info!(
@@ -1053,17 +1020,14 @@ impl<'a> JudgeState<'a> {
             // the missing profile). Archive failure aborts (fail-stop),
             // keeping profile + spool for forensics.
             if !dominated {
-                archive_sparse_profile(&resp.profile, &self.dirs.archived_profile(key))
-                    .wrap_err_with(|| {
-                        format!(
-                            "failed to archive sparse profdata for NEW pattern of block {} \
-                             (profile kept at {}) — ABORTING before the pattern is committed",
-                            resp.block,
-                            resp.profile.display(),
-                        )
-                    })?;
-            }
-            if !dominated {
+                self.dirs.archive_profile(key, &profile).wrap_err_with(|| {
+                    format!(
+                        "failed to archive sparse profdata for NEW pattern of block {} (profile \
+                         kept at {}) — ABORTING before the pattern is committed",
+                        resp.block,
+                        profile.display(),
+                    )
+                })?;
                 self.undominated.push(key);
             }
             self.patterns.insert(key, rec);
@@ -1071,17 +1035,10 @@ impl<'a> JudgeState<'a> {
 
         // Shared tail: commit, then clean up (the spool entry goes after the
         // commit — a leftover from a crash in between is harmless junk).
-        let _ = std::fs::remove_file(&resp.profile);
+        let _ = std::fs::remove_file(&profile);
         let record = block_record(&resp, BlockStatus::Ok, Some(key));
-        let rec_ref = &self.patterns[&key];
-        let durable = self.processed.is_multiple_of(COMMITS_PER_FLUSH);
-        self.store.commit_block(
-            resp.block,
-            &record,
-            &new_counters,
-            Some((key, rec_ref)),
-            durable,
-        )?;
+        let pattern = Some((key, &self.patterns[&key]));
+        self.store.commit_block(resp.block, &record, &new_counters, pattern)?;
         let _ = std::fs::remove_file(self.dirs.spool_entry(resp.block));
         Ok(())
     }
@@ -1147,15 +1104,6 @@ fn block_record(
     }
 }
 
-/// Archives a promoted block's sparse profdata, zstd'd. The worker already
-/// produced it — `llvm-cov` needs a profdata to evaluate the block's items —
-/// so archiving is a compress-and-rename, with no LLVM tool on this side.
-fn archive_sparse_profile(profile: &std::path::Path, dest: &std::path::Path) -> Result<()> {
-    let bytes =
-        std::fs::read(profile).wrap_err_with(|| format!("read profile {}", profile.display()))?;
-    write_atomic(dest, &zstd::encode_all(&bytes[..], 3)?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1216,16 +1164,15 @@ mod tests {
     }
 
     /// The witness RPC is the fallback behind R2 as well as the path without
-    /// it, so it is never optional; and the old mode flag no longer exists.
+    /// it, so it is never optional.
     #[test]
-    fn a_witness_endpoint_is_always_required_and_there_is_no_mode_flag() {
+    fn a_witness_endpoint_is_always_required() {
         let argv = ["backfill", "--rpc-endpoint", "http://rpc.invalid", "--genesis-file", "/g"];
         let err =
             <TestCli as clap::Parser>::try_parse_from(argv.iter().chain(&["--data-dir", "/d"]))
                 .err()
                 .expect("--witness-endpoint is required");
         assert!(err.to_string().contains("--witness-endpoint"), "{err}");
-        assert!(parse(&["--witness-source", "r2"]).is_err());
     }
 
     /// The list format is what carries a pool between builds, so its exact
@@ -1323,7 +1270,6 @@ mod tests {
             receipts_root_ok: true,
             logs_bloom_ok: true,
             counters,
-            profile: PathBuf::from("/nonexistent/test.profdata"),
             new_items: Vec::new(),
             elapsed_ms,
             tx_count: 1,
@@ -1332,9 +1278,8 @@ mod tests {
     }
 
     /// Judge harness on a real (temp) store, pre-seeded with counters for ids
-    /// 1/2/3 (dense 0/1/2) and one pattern. Only paths that need no
-    /// llvm-profdata are exercised (known-pattern dedup, dominated skip);
-    /// the archive path is covered by the instrumented E2E runs.
+    /// 1/2/3 (dense 0/1/2) and the given patterns. A test that reaches the
+    /// archive path writes the block's profdata into the data dir first.
     fn judge_with<'a>(
         store: &'a Store,
         dirs: Arc<DataDir>,
@@ -1393,10 +1338,10 @@ mod tests {
         let mut judge = judge_with(&store, dirs, vec![(key, rec)]);
 
         let mut resp = response(200, vec![1, 4], 300);
-        resp.new_items = vec![ItemDetail {
+        resp.new_items = vec![CoveredItem {
             id: 4,
             line: 12,
-            kind: "branch-true".into(),
+            kind: crate::llvm::ItemKind::BranchTrue,
             location: "30ce038/src/a.rs:12:5".into(),
         }];
         judge.ingest(resp).unwrap();
@@ -1507,10 +1452,8 @@ mod tests {
         let store = Store::open(&dirs.store_path(), "test-id", "f").unwrap();
         let mut judge = judge_with(&store, dirs.clone(), vec![]);
         let with_profile = |block: u64, counters: Vec<u64>| {
-            let mut resp = response(block, counters, 100);
-            resp.profile = dirs.tmp().join(format!("block_{block}.profdata"));
-            std::fs::write(&resp.profile, b"sparse profdata").unwrap();
-            resp
+            std::fs::write(dirs.block_profdata(block), b"sparse profdata").unwrap();
+            response(block, counters, 100)
         };
 
         judge.ingest(with_profile(100, vec![1, 2, 3])).unwrap();

@@ -29,7 +29,7 @@ use stateless_core::{
 
 use crate::{
     llvm::{Llvm, LlvmArgs},
-    proto::{ItemDetail, WorkerRequest, WorkerResponse},
+    proto::{WorkerRequest, WorkerResponse},
     spool::{DataDir, SpoolEntry, Spooled},
 };
 
@@ -139,7 +139,6 @@ fn error_response(block: u64, error: String) -> WorkerResponse {
         receipts_root_ok: false,
         logs_bloom_ok: false,
         counters: Vec::new(),
-        profile: PathBuf::new(),
         new_items: Vec::new(),
         elapsed_ms: 0,
         tx_count: 0,
@@ -157,7 +156,8 @@ fn process_block(
 ) -> Result<WorkerResponse> {
     let start = Instant::now();
 
-    let Spooled { block, light_witness, code_hashes } = SpoolEntry::open(&req.spool, req.block)?;
+    let Spooled { block, light_witness, code_hashes } =
+        SpoolEntry::open(&dirs.spool_entry(req.block), req.block)?;
     let header = &block.header.inner;
     let contracts = dirs.load_contracts(&code_hashes)?;
     let ext_env = WitnessExternalEnv::from_light_witness(&light_witness, header.number)
@@ -186,21 +186,13 @@ fn process_block(
     let receipts_root_ok = output.receipts_root == header.receipts_root;
     let logs_bloom_ok = output.logs_bloom == header.logs_bloom;
 
-    let extracted = llvm.extract_covered_items(exe, &profraw);
+    let extracted = llvm.extract_covered_items(exe, &profraw, &dirs.block_profdata(req.block));
     // The raw profile is large (the whole binary's counter array plus its
     // name table) and the sparse profdata supersedes it either way.
     let _ = std::fs::remove_file(&profraw);
-    let (hits, profile) = extracted?;
-    let new_items = hits
-        .iter()
-        .filter(|h| reported.insert(h.id))
-        .map(|h| ItemDetail {
-            id: h.id,
-            line: h.line,
-            kind: h.kind.as_str().to_string(),
-            location: h.location.clone(),
-        })
-        .collect();
+    let hits = extracted?;
+    let counters = hits.iter().map(|h| h.id).collect();
+    let new_items = hits.into_iter().filter(|h| reported.insert(h.id)).collect();
 
     Ok(WorkerResponse {
         block: req.block,
@@ -209,8 +201,7 @@ fn process_block(
         gas_ok,
         receipts_root_ok,
         logs_bloom_ok,
-        counters: hits.into_iter().map(|h| h.id).collect(),
-        profile,
+        counters,
         new_items,
         elapsed_ms: start.elapsed().as_millis() as u64,
         tx_count: block.transactions.len() as u64,

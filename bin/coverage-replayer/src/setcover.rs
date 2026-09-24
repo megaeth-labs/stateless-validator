@@ -359,11 +359,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::store::PatternRecord;
-
-    fn pat(bits: &[u32], rep: u64) -> PatternRecord {
-        PatternRecord::first_seen(BitSet::from_indices(bits.iter().copied()), rep, 100)
-    }
+    use crate::store::{PatternRecord, test_support::pattern as pat};
 
     fn cover(patterns: &HashMap<u64, PatternRecord>) -> (Vec<u64>, CoverOutcome) {
         let outcome = select_cover(patterns, &HashSet::new());
