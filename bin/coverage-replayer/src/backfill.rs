@@ -31,9 +31,10 @@ use clap::Args;
 use eyre::{Context, Result, bail, ensure};
 use rustc_hash::FxHashMap;
 use stateless_common::{
-    BackoffPolicy, R2WitnessTransport, RedactedSecret, RpcClient, decode_on_blocking_pool,
-    decode_witness_payload_light,
+    R2CountFlag, R2Flag, R2Flags, R2Metrics, R2WitnessTransport, RedactedSecret, RpcClient,
+    RpcClientConfig, decode_on_blocking_pool, decode_witness_payload_light, validate_r2_flags,
 };
+use stateless_core::{LightWitness, withdrawals::MptWitness};
 use stateless_r2::fetch::{DEFAULT_CONNECT_TIMEOUT, FetchTimeouts};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt},
@@ -52,16 +53,6 @@ use crate::{
         elapsed_stats, resolve_pattern_slot,
     },
 };
-
-/// Where witnesses come from.
-#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum WitnessSource {
-    /// `mega_getBlockWitness` RPC.
-    #[default]
-    Rpc,
-    /// Straight from the R2 bucket over the S3 API. Requires the `--r2-*` flags.
-    R2,
-}
 
 #[derive(Args, Debug, Clone)]
 pub struct BackfillArgs {
@@ -91,31 +82,33 @@ pub struct BackfillArgs {
         required = true
     )]
     pub rpc_endpoints: Vec<String>,
-    /// Witness RPC endpoint(s) (`mega_getBlockWitness`). Required with
-    /// `--witness-source rpc` (the default); ignored with `r2`.
+    /// Witness RPC endpoint(s) (`mega_getBlockWitness`). Always required: the
+    /// witness path, and the fallback behind R2 when the `--r2-*` flags
+    /// configure it.
     #[clap(
         long = "witness-endpoint",
         env = "COVERAGE_REPLAYER_WITNESS_ENDPOINT",
-        value_delimiter = ','
+        value_delimiter = ',',
+        required = true
     )]
     pub witness_endpoints: Vec<String>,
-    /// Where to source witnesses from: `rpc` (default) or `r2` (straight from
-    /// the R2 bucket over the S3 API; requires the `--r2-*` flags).
-    #[clap(long, env = "COVERAGE_REPLAYER_WITNESS_SOURCE", value_enum, default_value_t = WitnessSource::Rpc)]
-    pub witness_source: WitnessSource,
     /// R2 S3 endpoint origin, e.g. `https://<account>.r2.cloudflarestorage.com`
-    /// (no bucket path). Required when `--witness-source r2`.
+    /// (no bucket path). Configuring it, with its bucket and credentials,
+    /// turns on the R2 witness route: every witness is tried against the
+    /// bucket first, and a block R2 cannot serve goes to `--witness-endpoint`.
+    /// There is no mode flag — the configured target is the switch, as in the
+    /// validator and the trace server, and a half-configured one is refused
+    /// by name.
     #[clap(long, env = "COVERAGE_REPLAYER_R2_ENDPOINT")]
     pub r2_endpoint: Option<String>,
-    /// R2 bucket holding the witnesses (e.g. `witness-mainnet`). Required when
-    /// `--witness-source r2`.
+    /// R2 bucket holding the witnesses (e.g. `witness-mainnet`).
     #[clap(long, env = "COVERAGE_REPLAYER_R2_BUCKET")]
     pub r2_bucket: Option<String>,
-    /// R2 access key id (Object Read). Required when `--witness-source r2`.
+    /// R2 access key id (Object Read).
     #[clap(long, env = "COVERAGE_REPLAYER_R2_ACCESS_KEY_ID")]
     pub r2_access_key_id: Option<String>,
-    /// R2 secret access key. Required when `--witness-source r2`. Prefer the
-    /// env var over the flag. Redacted in `Debug` output.
+    /// R2 secret access key. Prefer the env var over the flag. Redacted in
+    /// `Debug` output.
     #[clap(long, env = "COVERAGE_REPLAYER_R2_SECRET_ACCESS_KEY")]
     pub r2_secret_access_key: Option<RedactedSecret>,
     /// Genesis JSON path (e.g. test_data/mainnet/genesis.json).
@@ -286,63 +279,10 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     }
     let statuses = selection.statuses(&store)?;
 
-    // R2 witness source: witnesses come from the bucket, so the RPC witness
-    // endpoints are unused — feed the data endpoints in as placeholders (the
-    // RpcClient requires a non-empty list).
-    let r2 = match args.witness_source {
-        WitnessSource::Rpc => {
-            ensure!(
-                !args.witness_endpoints.is_empty(),
-                "--witness-endpoint is required with --witness-source rpc"
-            );
-            None
-        }
-        WitnessSource::R2 => {
-            // The value itself is Debug-redacted, but a CLI-passed secret is
-            // still visible in the process list for the whole (multi-week)
-            // run. Detect "flag, not env" and nudge loudly.
-            if args.r2_secret_access_key.is_some() &&
-                std::env::var("COVERAGE_REPLAYER_R2_SECRET_ACCESS_KEY").is_err()
-            {
-                warn!(
-                    "--r2-secret-access-key was passed on the command line — it is visible in \
-                     `ps` for the lifetime of the process; prefer the \
-                     COVERAGE_REPLAYER_R2_SECRET_ACCESS_KEY env var"
-                );
-            }
-            let require = |v: Option<String>, flag: &str| {
-                v.filter(|s| !s.is_empty()).ok_or_else(|| {
-                    eyre::eyre!("{flag} is required (and non-empty) with --witness-source r2")
-                })
-            };
-            let transport = R2WitnessTransport::new(
-                &require(args.r2_endpoint.clone(), "--r2-endpoint")?,
-                require(args.r2_bucket.clone(), "--r2-bucket")?,
-                require(args.r2_access_key_id.clone(), "--r2-access-key-id")?,
-                require(
-                    args.r2_secret_access_key.as_ref().map(|s| s.as_ref().to_string()),
-                    "--r2-secret-access-key",
-                )?,
-                FetchTimeouts {
-                    per_attempt: Duration::from_secs(60),
-                    connect: DEFAULT_CONNECT_TIMEOUT,
-                },
-                // Never used: `fetch_block` makes one attempt per round, and the
-                // fetch loop's retry-forever is the pacing.
-                BackoffPolicy::new(Duration::ZERO, Duration::ZERO),
-                None,
-            )?;
-            info!(origin = %transport.origin(), "witness source: R2 (light decode)");
-            Some(Arc::new(transport))
-        }
-    };
-
-    let data_apis: Vec<String> = args.rpc_endpoints.clone();
-    let witness_apis: Vec<String> =
-        if r2.is_some() { data_apis.clone() } else { args.witness_endpoints.clone() };
+    let r2 = r2_transport(&args)?.map(Arc::new);
     let client = Arc::new(RpcClient::new(
-        &data_apis.iter().map(String::as_str).collect::<Vec<_>>(),
-        &witness_apis.iter().map(String::as_str).collect::<Vec<_>>(),
+        &args.rpc_endpoints.iter().map(String::as_str).collect::<Vec<_>>(),
+        &args.witness_endpoints.iter().map(String::as_str).collect::<Vec<_>>(),
     )?);
 
     let latest = client.get_latest_block_number().await;
@@ -500,8 +440,8 @@ async fn forward_fetched(
 /// entry. Skips work that already exists on disk (crash resume).
 ///
 /// `block_cache` holds the fetched block across the caller's retry rounds so
-/// a witness-side failure (e.g. R2 404 looping under retry-forever) does not
-/// re-download the full block every 5 seconds.
+/// a failure after it (a bytecode fetch, say) does not re-download the full
+/// block every 5 seconds.
 async fn fetch_block(
     client: &RpcClient,
     r2: Option<&R2WitnessTransport>,
@@ -573,14 +513,15 @@ async fn fetch_block(
     // witnesses are NOT stored anywhere — when a selected block needs one, it
     // is re-fetched on demand. Either source serves the full history: the
     // bucket keeps every witness, and the witness RPC reads the same bucket.
-    let (light_witness, _mpt_witness) = match r2 {
-        Some(r2) => {
-            let object = r2.fetcher().get_block_object(n, hash, 1, None, || {}).await?;
-            decode_on_blocking_pool(object.bytes, n, hash, None, |bytes| {
-                decode_witness_payload_light(bytes)
-            })
-            .await?
-        }
+    let r2_witness = match r2 {
+        Some(r2) => r2_witness(r2, n, hash).await.map(Some).unwrap_or_else(|e| {
+            warn!(block = n, error = %format!("{e:#}"), "R2 witness failed; using the witness RPC");
+            None
+        }),
+        None => None,
+    };
+    let (light_witness, _mpt_witness) = match r2_witness {
+        Some(witness) => witness,
         None => client.get_witness_light(n, hash).await,
     };
 
@@ -597,6 +538,82 @@ async fn fetch_block(
     })
     .await??;
     Ok(())
+}
+
+/// The R2 witness route, when the `--r2-*` flags configure a target. The
+/// rules are the ones the validator and the trace server apply
+/// (`validate_r2_flags`), so a half-configured target or a blank value is
+/// refused by name rather than read as "no R2". This binary offers the S3
+/// target only.
+fn r2_transport(args: &BackfillArgs) -> Result<Option<R2WitnessTransport>> {
+    // The value itself is Debug-redacted, but a CLI-passed secret is still
+    // visible in the process list for the whole (multi-week) run.
+    if args.r2_secret_access_key.is_some() &&
+        std::env::var("COVERAGE_REPLAYER_R2_SECRET_ACCESS_KEY").is_err()
+    {
+        warn!(
+            "--r2-secret-access-key was passed on the command line — it is visible in `ps` for \
+             the lifetime of the process; prefer the COVERAGE_REPLAYER_R2_SECRET_ACCESS_KEY env var"
+        );
+    }
+    let flags = R2Flags {
+        endpoint: R2Flag::new("--r2-endpoint", args.r2_endpoint.as_deref()),
+        bucket: R2Flag::new("--r2-bucket", args.r2_bucket.as_deref()),
+        access_key_id: R2Flag::new("--r2-access-key-id", args.r2_access_key_id.as_deref()),
+        secret_access_key: R2Flag::new(
+            "--r2-secret-access-key",
+            args.r2_secret_access_key.as_ref().map(AsRef::as_ref),
+        ),
+        custom_domain: R2Flag::new("--r2-custom-domain", None),
+        access_client_id: R2Flag::new("--r2-access-client-id", None),
+        access_client_secret: R2Flag::new("--r2-access-client-secret", None),
+        connections: R2Flag::new("--r2-connections", None),
+        max_concurrent_requests: R2CountFlag::new("--r2-max-concurrent-requests", None),
+        tuning: &[],
+    };
+    let timeouts = FetchTimeouts { per_attempt: R2_BUDGET, connect: DEFAULT_CONNECT_TIMEOUT };
+    let transport = R2WitnessTransport::from_config(
+        validate_r2_flags(&flags)?,
+        timeouts,
+        RpcClientConfig::default().rpc_retry,
+        Arc::new(NoMetrics),
+    )?;
+    match &transport {
+        Some(t) => {
+            info!(origin = %t.origin(), "witness source: R2 first, --witness-endpoint as fallback")
+        }
+        None => info!("witness source: --witness-endpoint (no --r2-* target configured)"),
+    }
+    Ok(transport)
+}
+
+/// What R2 gets per block before the block goes to the witness RPC — a second
+/// path to the same bucket, so a stalled or failing R2 should hand over
+/// rather than hold the block: a few attempts inside one budget, the shape of
+/// the validator's R2 fast path.
+const R2_ATTEMPTS: usize = 3;
+const R2_BUDGET: Duration = Duration::from_secs(60);
+
+async fn r2_witness(
+    r2: &R2WitnessTransport,
+    n: u64,
+    hash: B256,
+) -> Result<(LightWitness, MptWitness)> {
+    let deadline = Instant::now() + R2_BUDGET;
+    let object = r2.fetcher().get_block_object(n, hash, R2_ATTEMPTS, Some(deadline), || {}).await?;
+    Ok(decode_on_blocking_pool(object.bytes, n, hash, None, |bytes| {
+        decode_witness_payload_light(bytes)
+    })
+    .await?)
+}
+
+/// This offline tool publishes no metrics.
+struct NoMetrics;
+
+impl R2Metrics for NoMetrics {
+    fn on_target(&self, _target: &'static str) {}
+    fn on_connections(&self, _connections: usize) {}
+    fn on_negotiated_version(&self, _version: &'static str) {}
 }
 
 /// The codes-dir files this run has already found content-valid, shared by
@@ -1158,6 +1175,8 @@ mod tests {
             "backfill",
             "--rpc-endpoint",
             "http://rpc.invalid",
+            "--witness-endpoint",
+            "http://witness.invalid",
             "--genesis-file",
             "/genesis.json",
             "--data-dir",
@@ -1167,6 +1186,46 @@ mod tests {
         <TestCli as clap::Parser>::try_parse_from(argv)
             .map(|c| c.args)
             .map_err(|e| eyre::eyre!("{e}"))
+    }
+
+    /// A configured R2 target is the whole switch, judged by the rules the
+    /// validator and the trace server share: none configured means the
+    /// witness RPC alone, a complete one turns R2 on, and a partial one is
+    /// refused by name instead of silently read as "no R2".
+    #[test]
+    fn an_r2_target_is_the_switch_and_a_partial_one_is_refused() {
+        let none = parse(&[]).unwrap();
+        assert!(r2_transport(&none).unwrap().is_none());
+
+        let quad = [
+            "--r2-endpoint",
+            "https://acc.r2.cloudflarestorage.com",
+            "--r2-bucket",
+            "witness-test",
+            "--r2-access-key-id",
+            "ak",
+            "--r2-secret-access-key",
+            "sk",
+        ];
+        let complete = parse(&quad).unwrap();
+        assert!(r2_transport(&complete).unwrap().is_some());
+
+        let partial = parse(&quad[..4]).unwrap();
+        let err = r2_transport(&partial).expect_err("a half-configured target must fail");
+        assert!(err.to_string().contains("--r2-access-key-id"), "must name what is missing: {err}");
+    }
+
+    /// The witness RPC is the fallback behind R2 as well as the path without
+    /// it, so it is never optional; and the old mode flag no longer exists.
+    #[test]
+    fn a_witness_endpoint_is_always_required_and_there_is_no_mode_flag() {
+        let argv = ["backfill", "--rpc-endpoint", "http://rpc.invalid", "--genesis-file", "/g"];
+        let err =
+            <TestCli as clap::Parser>::try_parse_from(argv.iter().chain(&["--data-dir", "/d"]))
+                .err()
+                .expect("--witness-endpoint is required");
+        assert!(err.to_string().contains("--witness-endpoint"), "{err}");
+        assert!(parse(&["--witness-source", "r2"]).is_err());
     }
 
     /// The list format is what carries a pool between builds, so its exact
