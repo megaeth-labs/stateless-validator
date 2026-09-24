@@ -116,14 +116,12 @@ pub fn run(args: ReportArgs) -> Result<()> {
 /// Whether the selected profiles, read through THIS binary's coverage map,
 /// still hold the coverage the cover recorded for them.
 ///
-/// `binary_id` fingerprints the measured sources and the toolchain, but a
-/// profile names each function instance by its symbol, and the symbols of the
-/// measured generics — instantiated in the workspace — also carry the
-/// workspace crates' cargo metadata. A workspace version bump or dependency
-/// change therefore leaves `binary_id` alone while renaming instances;
-/// llvm-cov cannot match the old profiles to them and reports their code
-/// uncovered. Re-deriving the covered items is the direct check, whatever the
-/// cause: the same extraction the scan ran, so on the build that scanned it
+/// A profile names each function instance by its symbol, and llvm-cov cannot
+/// match a profile to a build whose symbols differ: it reports that code
+/// uncovered. `binary_id` covers the causes it can see — the measured
+/// sources, the toolchain, the lockfile — but not features or compiler flags.
+/// Re-deriving the covered items is the direct check, whatever the cause: the
+/// same extraction the scan ran, so on the build that scanned it it
 /// reproduces the manifest's count exactly.
 fn check_profiles_evaluate(evaluated: u64, recorded: u64) -> Result<()> {
     ensure!(

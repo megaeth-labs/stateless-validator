@@ -505,17 +505,15 @@ pub fn resolve_pattern_slot(
 }
 
 /// Coverage namespace key: a fingerprint of the instrumented build being
-/// measured, NOT a whole-exe hash. Stays stable across dispatcher edits (so
-/// the resident mode can continue a store `backfill` started) and changes
-/// exactly when the measured sources or the toolchain do: mega-evm's
-/// revision, the locked versions of the measured dependencies, and
-/// `rustc -vV`. Captured at compile time by build.rs.
-///
-/// The dependency versions belong here because they are measured code, not
-/// merely linked code: a revm bump with mega-evm unchanged rewrites part of
-/// the coverage map. The workspace crates are left out — editing the tool
-/// must not orphan a multi-week store — which is why `report` re-derives the
-/// covered items rather than trust this id alone.
+/// measured, NOT a whole-exe hash. Stays stable across edits to this tool's
+/// code (so a resumed run can continue a store `backfill` started) and
+/// changes whenever what a profile or a counter means could: mega-evm's
+/// revision, the measured crates and their versions, `rustc -vV`, and the
+/// lockfile — the dependency graph names the instances profiles are keyed
+/// by, so a build with other dependencies cannot read this store's archived
+/// profiles. Captured at compile time by build.rs. What it cannot see
+/// (features, compiler flags) `report` still catches, by re-deriving the
+/// covered items.
 pub fn current_binary_id() -> String {
     use std::hash::Hasher;
     let mega_evm = env!("COVERAGE_MEGA_EVM_REV");
@@ -527,6 +525,8 @@ pub fn current_binary_id() -> String {
     h.write(rustc.as_bytes());
     h.write_u8(0xff);
     h.write(measured.as_bytes());
+    h.write_u8(0xff);
+    h.write(env!("COVERAGE_LOCKFILE_DIGEST").as_bytes());
     format!("megaevm:{}:fx{:016x}", &mega_evm[..mega_evm.len().min(12)], h.finish())
 }
 

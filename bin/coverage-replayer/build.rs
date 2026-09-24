@@ -1,10 +1,11 @@
 //! Captures a fingerprint of the coverage-relevant build at compile time.
 //!
-//! The coverage namespace (counter ids) is determined by the measured code —
-//! mega-evm, the measured crates' versions — and the toolchain, NOT by this
-//! binary's orchestration code. Basing the store's `binary_id` on this
-//! fingerprint (rather than a whole-exe hash) means editing the dispatcher /
-//! adding subcommands does not invalidate an existing store.
+//! The coverage namespace (counter ids, and the symbols archived profiles are
+//! keyed by) is determined by the measured code, the toolchain and the
+//! dependency graph, NOT by this binary's orchestration code. Basing the
+//! store's `binary_id` on this fingerprint (rather than a whole-exe hash)
+//! means editing the dispatcher / adding subcommands does not invalidate an
+//! existing store.
 
 use std::process::Command;
 
@@ -91,12 +92,27 @@ fn main() {
     println!("cargo:rustc-env=COVERAGE_RUSTC_SYSROOT={sysroot}");
     println!("cargo:rerun-if-env-changed=CARGO_HOME");
     println!("cargo:rerun-if-env-changed=HOME");
+    // The lockfile as a whole. A profile names each instance of the measured
+    // generics by its symbol, which carries the cargo metadata of the crate
+    // instantiating it — a workspace crate — and that metadata moves with any
+    // dependency or version change. Two builds that differ there cannot read
+    // each other's profiles, so they must not share a store.
+    println!("cargo:rustc-env=COVERAGE_LOCKFILE_DIGEST={:016x}", fnv1a(lock.as_bytes()));
     println!("cargo:rustc-env=COVERAGE_MEGA_EVM_REV={mega_evm}");
     println!("cargo:rustc-env=COVERAGE_MEASURED_CRATES={}", measured.join(","));
     println!("cargo:rerun-if-changed=measured-crates.txt");
     println!("cargo:rustc-env=COVERAGE_RUSTC_VERSION={toolchain}");
     // Re-run if the lockfile changes (mega-evm bump).
     println!("cargo:rerun-if-changed=../../Cargo.lock");
+}
+
+/// FNV-1a, 64-bit: a stable digest without a dependency — the standard
+/// hasher's algorithm is free to change between releases, and shards built on
+/// different machines must agree on it.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
 }
 
 /// Extracts the full git revision of the `mega-evm` package from Cargo.lock.
