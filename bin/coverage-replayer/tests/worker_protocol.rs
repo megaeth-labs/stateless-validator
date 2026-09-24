@@ -10,14 +10,19 @@ use std::{
 fn a_worker_answers_on_stdout_with_one_frame_per_request() {
     let dir = tempfile::tempdir().unwrap();
     let genesis = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_data/mainnet/genesis.json");
+    // The worker resolves its tools at startup; this request fails before
+    // either would run, so placeholders are enough.
+    let tool = dir.path().join("llvm-tool");
+    std::fs::write(&tool, b"").unwrap();
     let mut worker = Command::new(env!("CARGO_BIN_EXE_coverage-replayer"))
         .arg("internal-worker")
         .args(["--genesis-file", genesis])
-        .arg("--codes-dir")
+        .arg("--data-dir")
         .arg(dir.path())
-        .arg("--tmp-dir")
-        .arg(dir.path())
-        .args(["--llvm-profdata", "/nonexistent", "--llvm-cov", "/nonexistent"])
+        .arg("--llvm-profdata")
+        .arg(&tool)
+        .arg("--llvm-cov")
+        .arg(&tool)
         .arg("--source-dir")
         .arg(dir.path())
         .stdin(Stdio::piped())
@@ -39,6 +44,5 @@ fn a_worker_answers_on_stdout_with_one_frame_per_request() {
     assert_eq!(lines.len(), 1, "exactly one frame and nothing else on stdout: {lines:?}");
     let frame: serde_json::Value = serde_json::from_str(&lines[0]).expect("a JSON frame");
     assert_eq!(frame["block"], 7);
-    assert_eq!(frame["ok"], false);
     assert!(frame["error"].as_str().is_some_and(|e| !e.is_empty()), "{frame}");
 }

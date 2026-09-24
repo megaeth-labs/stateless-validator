@@ -1,39 +1,43 @@
 //! Captures a fingerprint of the coverage-relevant build at compile time.
 //!
-//! The coverage namespace (counter ids) is determined by the instrumented
-//! mega-evm build, NOT by this binary's orchestration code. Basing the store's
-//! `binary_id` on this fingerprint (rather than a whole-exe hash) means editing
-//! the dispatcher / adding subcommands does not invalidate an existing store —
-//! only a real mega-evm or toolchain/target change does.
+//! The coverage namespace (counter ids) is determined by the measured code —
+//! mega-evm, the measured crates' versions — and the toolchain, NOT by this
+//! binary's orchestration code. Basing the store's `binary_id` on this
+//! fingerprint (rather than a whole-exe hash) means editing the dispatcher /
+//! adding subcommands does not invalidate an existing store.
 
 use std::process::Command;
 
+/// Runs the rustc cargo builds with (`$RUSTC`) and returns its stdout.
+fn rustc(args: &[&str]) -> String {
+    Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_else(|| panic!("coverage-replayer build: `rustc {}` failed", args.join(" ")))
+}
+
 fn main() {
+    let lock = std::fs::read_to_string("../../Cargo.lock")
+        .expect("coverage-replayer build: cannot read the workspace Cargo.lock");
     // mega-evm's locked git revision from the workspace lockfile. This is the
     // namespace anchor, so a missing rev is a hard build error rather than a
     // silent fallback: overriding mega-evm to a path dependency would
     // otherwise collapse genuinely different builds into one store namespace.
-    let mega_evm = std::fs::read_to_string("../../Cargo.lock")
-        .ok()
-        .and_then(|lock| mega_evm_rev(&lock))
-        .expect(
-            "coverage-replayer build: no git revision for `mega-evm` in Cargo.lock. \
+    let mega_evm = mega_evm_rev(&lock).expect(
+        "coverage-replayer build: no git revision for `mega-evm` in Cargo.lock. \
              The store namespace (binary_id) is anchored on that rev; if you are \
              deliberately overriding mega-evm with a path dependency, extend build.rs \
              to fingerprint the override instead of building with a broken namespace.",
-        );
+    );
 
     // `rustc -vV` includes `release:`, `host:`, and `LLVM version:` lines —
     // the plain `--version` string carries none of those, and both the host
     // triple and the LLVM version can shift counter ids. Fingerprint all
     // three lines.
-    let rustc_vv = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
-        .arg("-vV")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .expect("coverage-replayer build: `rustc -vV` failed");
+    let rustc_vv = rustc(&["-vV"]);
     let toolchain: String = rustc_vv
         .lines()
         .filter(|l| {
@@ -51,7 +55,6 @@ fn main() {
     // llvm-cov will look for their sources. Versions come from the lockfile,
     // so the default scope can never name a version the binary was not built
     // against.
-    let lock = std::fs::read_to_string("../../Cargo.lock").unwrap_or_default();
     let measured: Vec<String> = std::fs::read_to_string("measured-crates.txt")
         .expect("coverage-replayer build: measured-crates.txt is missing")
         .lines()
@@ -81,13 +84,8 @@ fn main() {
             .expect("coverage-replayer build: neither CARGO_HOME nor HOME is set");
         format!("{home}/.cargo")
     });
-    let sysroot = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
-        .args(["--print", "sysroot"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .expect("coverage-replayer build: `rustc --print sysroot` failed");
+    let sysroot = rustc(&["--print", "sysroot"]);
+    let sysroot = sysroot.trim();
 
     println!("cargo:rustc-env=COVERAGE_CARGO_HOME={cargo_home}");
     println!("cargo:rustc-env=COVERAGE_RUSTC_SYSROOT={sysroot}");

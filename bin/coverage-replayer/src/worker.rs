@@ -20,19 +20,17 @@ use std::{
     time::Instant,
 };
 
-use alloy_rpc_types_eth::Block;
 use clap::Args;
 use eyre::{Context, Result};
 use mega_evm::{MegaPrecompiles, MegaSpecId};
-use op_alloy_rpc_types::Transaction as OpTransaction;
 use stateless_core::{
     LightWitnessExecutor, WitnessDatabase, WitnessExternalEnv, chain_spec::ChainSpec, replay_block,
 };
 
 use crate::{
-    llvm,
+    llvm::{Llvm, LlvmArgs},
     proto::{ItemDetail, WorkerRequest, WorkerResponse},
-    spool::{self, SpoolEntry},
+    spool::{DataDir, SpoolEntry, Spooled},
 };
 
 #[derive(Args, Debug, Clone)]
@@ -40,22 +38,13 @@ pub struct WorkerArgs {
     /// Genesis JSON path used to reconstruct the ChainSpec.
     #[clap(long)]
     pub genesis_file: String,
-    /// Content-addressed contract bytecode directory.
+    /// The run's data directory: contract codes in, per-block profiles out.
     #[clap(long)]
-    pub codes_dir: PathBuf,
-    /// Directory for per-block profraw / profdata files.
-    #[clap(long)]
-    pub tmp_dir: PathBuf,
-    /// Path to llvm-profdata.
-    #[clap(long)]
-    pub llvm_profdata: PathBuf,
-    /// Path to llvm-cov.
-    #[clap(long)]
-    pub llvm_cov: PathBuf,
-    /// Source directories scoping the coverage universe (resolved by the
-    /// dispatcher, so every worker of a run agrees on them).
-    #[clap(long = "source-dir", required = true)]
-    pub source_dirs: Vec<PathBuf>,
+    pub data_dir: PathBuf,
+    /// Passed on by the dispatcher already resolved (`Llvm::to_args`), so
+    /// every worker of a run evaluates the same scope with the same tools.
+    #[clap(flatten)]
+    pub llvm: LlvmArgs,
 }
 
 /// Loads the chain spec a worker replays under. The dispatcher calls this
@@ -76,6 +65,8 @@ pub fn load_chain_spec(genesis_file: &str) -> Result<ChainSpec> {
 pub fn run(args: WorkerArgs) -> Result<()> {
     let mut protocol = protocol_channel()?;
     let chain_spec = load_chain_spec(&args.genesis_file)?;
+    let dirs = DataDir::new(&args.data_dir);
+    let llvm = args.llvm.resolve()?;
     // llvm-cov reads the coverage map out of the binary that wrote the
     // profile — this one, as it is running.
     let exe = crate::profile_rt::own_executable()?;
@@ -90,7 +81,7 @@ pub fn run(args: WorkerArgs) -> Result<()> {
         }
         let req: WorkerRequest = serde_json::from_str(&line)
             .map_err(|e| eyre::eyre!("bad worker request {line:?}: {e}"))?;
-        let resp = process_block(&args, &exe, &chain_spec, &req, &mut reported)
+        let resp = process_block(&dirs, &llvm, &exe, &chain_spec, &req, &mut reported)
             .unwrap_or_else(|e| error_response(req.block, format!("{e:#}")));
         let mut frame = serde_json::to_vec(&resp)?;
         frame.push(b'\n');
@@ -143,7 +134,6 @@ fn error_response(block: u64, error: String) -> WorkerResponse {
     WorkerResponse {
         block,
         block_hash: alloy_primitives::B256::ZERO,
-        ok: false,
         error: Some(error),
         gas_ok: false,
         receipts_root_ok: false,
@@ -158,7 +148,8 @@ fn error_response(block: u64, error: String) -> WorkerResponse {
 }
 
 fn process_block(
-    args: &WorkerArgs,
+    dirs: &DataDir,
+    llvm: &Llvm,
     exe: &std::path::Path,
     chain_spec: &ChainSpec,
     req: &WorkerRequest,
@@ -166,14 +157,9 @@ fn process_block(
 ) -> Result<WorkerResponse> {
     let start = Instant::now();
 
-    let SpoolEntry { block_json, light_witness, code_hashes, .. } =
-        SpoolEntry::read_from(&req.spool)?;
-    let block: Block<OpTransaction> =
-        serde_json::from_slice(&block_json).wrap_err("decode block json")?;
+    let Spooled { block, light_witness, code_hashes } = SpoolEntry::open(&req.spool, req.block)?;
     let header = &block.header.inner;
-    eyre::ensure!(header.number == req.block, "spool/request block number mismatch");
-
-    let contracts = spool::load_contracts(&args.codes_dir, &code_hashes)?;
+    let contracts = dirs.load_contracts(&code_hashes)?;
     let ext_env = WitnessExternalEnv::from_light_witness(&light_witness, header.number)
         .map_err(|e| eyre::eyre!("env oracle construction: {e}"))?;
     let executor = LightWitnessExecutor::from(light_witness);
@@ -182,7 +168,7 @@ fn process_block(
     // Per-block counter isolation: this worker handles one block at a time.
     crate::profile_rt::reset_counters();
     let result = replay_block(chain_spec, &block, &db, ext_env);
-    let profraw = args.tmp_dir.join(format!("block_{}.profraw", req.block));
+    let profraw = dirs.block_profraw(req.block);
     crate::profile_rt::write_profraw(&profraw)?;
 
     let output = match result {
@@ -200,13 +186,7 @@ fn process_block(
     let receipts_root_ok = output.receipts_root == header.receipts_root;
     let logs_bloom_ok = output.logs_bloom == header.logs_bloom;
 
-    let extracted = llvm::extract_covered_items(
-        &args.llvm_profdata,
-        &args.llvm_cov,
-        exe,
-        &profraw,
-        &args.source_dirs,
-    );
+    let extracted = llvm.extract_covered_items(exe, &profraw);
     // The raw profile is large (the whole binary's counter array plus its
     // name table) and the sparse profdata supersedes it either way.
     let _ = std::fs::remove_file(&profraw);
@@ -225,7 +205,6 @@ fn process_block(
     Ok(WorkerResponse {
         block: req.block,
         block_hash: block.header.hash,
-        ok: true,
         error: None,
         gas_ok,
         receipts_root_ok,

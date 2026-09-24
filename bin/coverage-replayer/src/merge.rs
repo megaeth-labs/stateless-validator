@@ -9,7 +9,8 @@
 //! shard B. Directly OR-ing bitmaps across shards would therefore be wrong.
 //!
 //! Two things ARE machine-stable, which makes the merge well-defined:
-//! - the 64-bit **counter id** (`(symbol, func_hash, index)` content hash), and
+//! - the 64-bit **counter id** (a hash of the item's kind, root-relative source path and span — see
+//!   `llvm::item_id`), and
 //! - the **pattern key** (`FxHash` of a pattern's sorted counter ids).
 //!
 //! So we: (1) build a unified id→dense map, (2) for each source pattern remap
@@ -65,29 +66,21 @@ pub fn run(args: MergeArgs) -> Result<()> {
 
     let mut shard_snaps = Vec::with_capacity(args.shards.len());
     let mut shard_universe: Option<String> = None;
-    for (i, shard) in args.shards.iter().enumerate() {
+    for shard in &args.shards {
         let dirs = DataDir::new(shard);
-        let (store, binary_id) = Store::open_readonly(&dirs.store_path())
+        let store = Store::open_for_build(&dirs.store_path(), &expected_id)
             .wrap_err_with(|| format!("open shard {}", shard.display()))?;
-        ensure!(
-            binary_id == expected_id,
-            "shard {} has binary_id {binary_id}, but this binary is {expected_id}; \
-             all shards must be produced by the same instrumented build",
-            shard.display(),
-        );
         // All shards must share one universe stamp — it defines what a
-        // counter id means. Legacy physical-counter shards carry a label of
-        // their own, so they merge with each other and never with current ones.
+        // counter id means.
         let universe = store.universe()?;
-        if i == 0 {
-            shard_universe = universe;
-        } else {
-            ensure!(
-                universe == shard_universe,
-                "shard {} holds the counter universe {universe:?}, expected \
-                 {shard_universe:?}; ids from two universes cannot be merged",
+        match &shard_universe {
+            None => shard_universe = Some(universe),
+            Some(first) => ensure!(
+                universe == *first,
+                "shard {} holds the counter universe {universe:?}, expected {first:?}; ids \
+                 from two universes cannot be merged",
                 shard.display(),
-            );
+            ),
         }
         let snap = store.load()?;
         info!(
@@ -101,19 +94,17 @@ pub fn run(args: MergeArgs) -> Result<()> {
     }
 
     let merged = merge_snapshots(shard_snaps)?;
-    let mut universe = BitSet::new();
-    for rec in merged.patterns.values() {
-        universe.union_with(&rec.bitmap);
-    }
+    // Every counter entered its store with the pattern holding it, so the
+    // counter count is the universe.
     info!(
-        counters = merged.counters.len(),
+        universe = merged.counters.len(),
         patterns = merged.patterns.len(),
         blocks = merged.blocks.len(),
-        universe = universe.count_ones(),
         "merge complete; writing output store"
     );
 
-    let out_store = Store::open(&out_dirs.store_path(), &expected_id, shard_universe.as_deref())?;
+    let universe = shard_universe.expect("at least one shard");
+    let out_store = Store::open(&out_dirs.store_path(), &expected_id, &universe)?;
     out_store.write_bulk(&merged)?;
     info!(
         out = %out_dirs.store_path().display(),
@@ -134,41 +125,31 @@ pub fn run(args: MergeArgs) -> Result<()> {
 /// assignment is deterministic for a given shard order (unseen ids are
 /// registered in sorted order per shard), but not canonical.
 fn merge_snapshots(shards: Vec<(String, StoreSnapshot)>) -> Result<StoreSnapshot> {
-    let mut id_to_dense: HashMap<u64, u32> = HashMap::new();
     let mut counters: HashMap<u64, CounterInfo> = HashMap::new();
     let mut patterns: HashMap<u64, PatternRecord> = HashMap::new();
     let mut blocks = HashMap::new();
 
     for (label, snap) in shards {
-        // source dense → counter id, and register unseen ids into the unified
-        // space. Registration goes in sorted-id order so the merged store is
-        // reproducible run-to-run (HashMap iteration order is randomized).
-        let mut src_dense_to_id: HashMap<u32, u64> = HashMap::with_capacity(snap.counters.len());
-        let mut max_src_dense = 0u32;
-        let mut shard_ids: Vec<u64> = Vec::with_capacity(snap.counters.len());
-        for (&id, info) in &snap.counters {
-            src_dense_to_id.insert(info.dense, id);
-            max_src_dense = max_src_dense.max(info.dense);
-            shard_ids.push(id);
-        }
+        // Register the shard's unseen ids into the unified space, in sorted-id
+        // order so the merged store is reproducible run-to-run (HashMap
+        // iteration order is randomized).
+        let mut shard_ids: Vec<u64> = snap.counters.keys().copied().collect();
         shard_ids.sort_unstable();
         for id in shard_ids {
-            if let std::collections::hash_map::Entry::Vacant(e) = id_to_dense.entry(id) {
-                let dense = counters.len() as u32;
-                e.insert(dense);
-                // dense re-pointed below after all ids are known (kept here for
-                // symbol/func_hash/index provenance).
-                counters.insert(id, CounterInfo { dense, ..snap.counters[&id].clone() });
-            }
+            let dense = counters.len() as u32;
+            counters
+                .entry(id)
+                .or_insert_with(|| CounterInfo { dense, ..snap.counters[&id].clone() });
         }
         // Flat per-shard remap tables (src dense → id / unified dense): one
         // array index per set bit in the remap loop instead of two hash
         // lookups — billions of bits at full-history scale.
+        let max_src_dense = snap.counters.values().map(|info| info.dense).max().unwrap_or(0);
         let mut flat_id: Vec<Option<u64>> = vec![None; max_src_dense as usize + 1];
         let mut flat_unified: Vec<u32> = vec![0; max_src_dense as usize + 1];
-        for (&src, &id) in &src_dense_to_id {
-            flat_id[src as usize] = Some(id);
-            flat_unified[src as usize] = id_to_dense[&id];
+        for (&id, info) in &snap.counters {
+            flat_id[info.dense as usize] = Some(id);
+            flat_unified[info.dense as usize] = counters[&id].dense;
         }
         // stored key → merged key, for rewriting the shard's block records:
         // a 64-bit collision can land a pattern on a different slot in the
@@ -189,31 +170,13 @@ fn merge_snapshots(shards: Vec<(String, StoreSnapshot)>) -> Result<StoreSnapshot
             }
             ids.sort_unstable();
 
-            // Re-key exactly as the judge does — same shared probing walk.
             let (key, occupied) = resolve_pattern_slot(&patterns, &ids, &remapped);
             key_map.insert(stored_key, key);
+            let rec = PatternRecord { bits: remapped.count_ones(), bitmap: remapped, ..*rec };
             if occupied {
-                let existing = patterns.get_mut(&key).expect("occupied slot");
-                existing.hit_count += rec.hit_count;
-                existing.first_block = existing.first_block.min(rec.first_block);
-                existing.last_block = existing.last_block.max(rec.last_block);
-                if rec.representative_elapsed_ms < existing.representative_elapsed_ms {
-                    existing.representative = rec.representative;
-                    existing.representative_elapsed_ms = rec.representative_elapsed_ms;
-                }
+                patterns.get_mut(&key).expect("occupied slot").absorb(&rec);
             } else {
-                patterns.insert(
-                    key,
-                    PatternRecord {
-                        bits: remapped.count_ones(),
-                        bitmap: remapped,
-                        first_block: rec.first_block,
-                        last_block: rec.last_block,
-                        hit_count: rec.hit_count,
-                        representative: rec.representative,
-                        representative_elapsed_ms: rec.representative_elapsed_ms,
-                    },
-                );
+                patterns.insert(key, rec);
             }
             if !occupied && key != stored_key {
                 warn!(
@@ -274,12 +237,6 @@ fn merge_snapshots(shards: Vec<(String, StoreSnapshot)>) -> Result<StoreSnapshot
         if duplicates > 0 {
             warn!(shard = %label, duplicates, "blocks also present in an earlier shard — folded");
         }
-    }
-
-    // Re-point every counter's dense to its final unified index (the clone
-    // above carried the source dense only for provenance fields).
-    for (id, info) in counters.iter_mut() {
-        info.dense = id_to_dense[id];
     }
 
     Ok(StoreSnapshot { counters, patterns, blocks })

@@ -22,11 +22,10 @@ pub struct WorkerResponse {
     pub block: u64,
     /// Block hash (zero when the spool entry could not be read).
     pub block_hash: B256,
-    /// Replay completed without an execution error.
-    pub ok: bool,
-    /// Execution error message when `ok == false`.
+    /// Why the block could not be replayed; `None` means it was.
     pub error: Option<String>,
-    /// Sanity comparison against the block header (only meaningful when `ok`).
+    /// Sanity comparison against the block header (only meaningful without
+    /// an `error`).
     pub gas_ok: bool,
     pub receipts_root_ok: bool,
     pub logs_bloom_ok: bool,

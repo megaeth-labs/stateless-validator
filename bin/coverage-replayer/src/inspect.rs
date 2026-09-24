@@ -57,21 +57,19 @@ pub struct InspectArgs {
 pub fn run(args: InspectArgs) -> Result<()> {
     let dirs = DataDir::new(&args.data_dir);
     let (store, binary_id) = Store::open_readonly(&dirs.store_path())?;
-    let patterns = store.load_patterns()?;
-    let counter_count = store.counter_count()?;
+    let patterns = store.patterns()?;
 
     println!("binary_id: {binary_id}");
     println!();
 
-    // ---- blocks: one streaming pass, folded into totals. The table is one
-    // row per block ever scanned; nothing here needs them all at once.
+    // ---- blocks: one streaming pass, folded into totals ----
     let mut total = 0usize;
     let mut ok = 0usize;
     let mut elapsed: Vec<u64> = Vec::new();
     let mut txs = 0u64;
     let mut gas = 0u128;
     let mut quarantined: Vec<(u64, BlockStatus, String)> = Vec::new();
-    store.for_each_block(|number, rec| {
+    store.blocks(.., |number, rec| {
         total += 1;
         if rec.status == BlockStatus::Ok {
             ok += 1;
@@ -110,12 +108,11 @@ pub fn run(args: InspectArgs) -> Result<()> {
     let (bits_min, bits_max) = (bits.iter().min().copied(), bits.iter().max().copied());
     let bits_avg = bits.iter().sum::<u64>() as f64 / bits.len().max(1) as f64;
     println!(
-        "patterns: {} (singletons={} = {:.1}%)  universe={} counters (of {} ever seen)",
+        "patterns: {} (singletons={} = {:.1}%)  universe={} counters",
         hits.len(),
         singletons,
         100.0 * singletons as f64 / hits.len().max(1) as f64,
         universe_bits,
-        counter_count,
     );
     println!(
         "pattern bits: min={} avg={bits_avg:.0} max={}",
@@ -134,8 +131,9 @@ pub fn run(args: InspectArgs) -> Result<()> {
     println!();
 
     // ---- counter rarity: how fragile is the universe? ----
-    // Dense indices are contiguous, so a Vec beats a HashMap here.
-    let mut coverage_count: Vec<u32> = vec![0; counter_count];
+    // Dense indices are contiguous from 0, one per universe item, so a Vec
+    // beats a HashMap here.
+    let mut coverage_count: Vec<u32> = vec![0; universe_bits as usize];
     for (_, rec) in &hits {
         for dense in rec.bitmap.iter_ones() {
             if let Some(c) = coverage_count.get_mut(dense as usize) {
@@ -222,8 +220,7 @@ pub fn run(args: InspectArgs) -> Result<()> {
     // ---- manifest ----
     let manifest_path = dirs.manifest_path();
     if manifest_path.exists() {
-        let manifest: crate::setcover::Manifest =
-            serde_json::from_str(&std::fs::read_to_string(&manifest_path)?)?;
+        let manifest = crate::setcover::Manifest::read(&manifest_path)?;
         println!();
         println!(
             "manifest: {} blocks cover {}/{} counters (generated_at_unix={})",
@@ -258,10 +255,7 @@ fn write_pool(
     let mut blocks: BTreeSet<u64> = antichain.iter().map(|k| patterns[k].representative).collect();
     blocks.extend(siblings.values().flatten());
 
-    let generated_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let generated_at = crate::setcover::unix_now();
     let mut out = String::new();
     out.push_str("# coverage-replayer candidate pool (antichain representatives)\n");
     out.push_str(&format!("# binary_id: {binary_id}\n"));
@@ -296,7 +290,7 @@ fn collect_siblings(
         return Ok(siblings);
     }
     let dominated: HashSet<u64> = outcome.pruned_dominated.iter().copied().collect();
-    store.for_each_block(|number, rec| {
+    store.blocks(.., |number, rec| {
         let Some(key) = rec.pattern_key else { return };
         if rec.status != BlockStatus::Ok || dominated.contains(&key) {
             return;
@@ -321,16 +315,7 @@ mod tests {
     use crate::store::BlockRecord;
 
     fn pat(bits: &[u32], rep: u64) -> PatternRecord {
-        let bitmap = BitSet::from_indices(bits.iter().copied());
-        PatternRecord {
-            bits: bitmap.count_ones(),
-            bitmap,
-            first_block: rep,
-            last_block: rep,
-            hit_count: 1,
-            representative: rep,
-            representative_elapsed_ms: 100,
-        }
+        PatternRecord::first_seen(BitSet::from_indices(bits.iter().copied()), rep, 100)
     }
 
     fn block(pattern_key: u64) -> BlockRecord {
@@ -416,8 +401,7 @@ mod tests {
         let data_dir = dir.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
         {
-            let store =
-                Store::open(&data_dir.join("store.redb"), "megaevm:test:fx0", None).unwrap();
+            let store = Store::open(&data_dir.join("store.redb"), "megaevm:test:fx0", "u").unwrap();
             // 10 ⊃ 20 (dominated); 30 is unrelated. Counters 0..=3, dense = id.
             for (block_number, bits) in [(10u64, vec![0u32, 1, 2]), (20, vec![0, 1]), (30, vec![3])]
             {
@@ -439,6 +423,7 @@ mod tests {
                         &block(block_number),
                         &counters,
                         Some((block_number, &pat(&bits, block_number))),
+                        true,
                     )
                     .unwrap();
             }
@@ -481,14 +466,16 @@ mod tests {
         let store_path = dir.path().join("store.redb");
         let patterns = three_patterns();
         {
-            let store = Store::open(&store_path, "id", None).unwrap();
+            let store = Store::open(&store_path, "id", "u").unwrap();
             // Pattern 1 (representative 10) also occurs at 11, 54, 77, 999;
             // pattern 3 (representative 30) at 31 — a second pattern, so the
             // test pins the per-pattern cap rather than one pattern's luck.
             for (number, key) in
                 [(999u64, 1u64), (10, 1), (77, 1), (11, 1), (54, 1), (20, 2), (30, 3), (31, 3)]
             {
-                store.commit_block(number, &block(key), &[], Some((key, &patterns[&key]))).unwrap();
+                store
+                    .commit_block(number, &block(key), &[], Some((key, &patterns[&key])), true)
+                    .unwrap();
             }
         }
         let (store, _) = Store::open_readonly(&store_path).unwrap();

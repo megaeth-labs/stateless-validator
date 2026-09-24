@@ -13,7 +13,9 @@ use std::{
 };
 
 use alloy_primitives::B256;
-use eyre::{Context, Result};
+use alloy_rpc_types_eth::Block;
+use eyre::{Context, Result, ensure};
+use op_alloy_rpc_types::Transaction as OpTransaction;
 use serde::{Deserialize, Serialize};
 use stateless_core::LightWitness;
 
@@ -47,7 +49,7 @@ impl SpoolEntry {
         encoder.include_checksum(true)?;
         std::io::Write::write_all(&mut encoder, &raw)?;
         let compressed = encoder.finish()?;
-        write_atomic(path, &compressed)
+        write_scratch(path, &compressed)
     }
 
     pub fn read_from(path: &Path) -> Result<Self> {
@@ -58,6 +60,34 @@ impl SpoolEntry {
             .map_err(|e| eyre::eyre!("decode spool entry {}: {e}", path.display()))?;
         Ok(entry)
     }
+
+    /// Reads the entry for `block` and parses its block, checking it is the
+    /// one asked for: everything the worker needs before it can replay. A
+    /// resumed run opens leftover entries through here too, so an entry the
+    /// worker could not use is refetched rather than failing the run.
+    pub fn open(path: &Path, block: u64) -> Result<Spooled> {
+        let entry = Self::read_from(path)?;
+        let parsed: Block<OpTransaction> = serde_json::from_slice(&entry.block_json)
+            .wrap_err_with(|| format!("spool entry {} holds no parsable block", path.display()))?;
+        ensure!(
+            parsed.header.inner.number == block,
+            "spool entry {} holds block {}, expected {block}",
+            path.display(),
+            parsed.header.inner.number,
+        );
+        Ok(Spooled {
+            block: parsed,
+            light_witness: entry.light_witness,
+            code_hashes: entry.code_hashes,
+        })
+    }
+}
+
+/// A spool entry opened for replay (see [`SpoolEntry::open`]).
+pub struct Spooled {
+    pub block: Block<OpTransaction>,
+    pub light_witness: LightWitness,
+    pub code_hashes: Vec<B256>,
 }
 
 /// Directory layout inside `--data-dir`.
@@ -104,6 +134,11 @@ impl DataDir {
     pub fn spool_entry(&self, block: u64) -> PathBuf {
         self.spool().join(format!("{block}.bin"))
     }
+    /// Where a worker writes a block's raw profile; the sparse profdata it
+    /// becomes sits next to it (see `llvm::extract_covered_items`).
+    pub fn block_profraw(&self, block: u64) -> PathBuf {
+        self.tmp().join(format!("block_{block}.profraw"))
+    }
     pub fn code_file(&self, hash: &B256) -> PathBuf {
         self.codes().join(format!("{hash:x}.bin"))
     }
@@ -127,12 +162,24 @@ impl DataDir {
 /// commit invariant: redb commits are fsynced, so if archived profiles were
 /// only in the page cache a power cut could persist the pattern while losing
 /// its profile — an orphan no re-run can repair (the block is already Ok).
-/// The same ordering keeps spool entries from surviving truncated.
 ///
 /// The tmp name embeds pid + a counter: concurrent writers of the SAME target
 /// (e.g. two fetch tasks resolving one shared contract hash) must not collide
 /// on the tmp path — last rename wins and both writers succeed.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_renamed(path, bytes, true)
+}
+
+/// [`write_atomic`] without the fsyncs, for what a power loss may take with
+/// it: spool entries and contract codes, which every run checks before use
+/// (the spool's frame checksum and block number, the codes' keccak) and
+/// refetches when damaged. Both are written once per block, so the flushes
+/// would be most of their cost.
+pub fn write_scratch(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_renamed(path, bytes, false)
+}
+
+fn write_renamed(path: &Path, bytes: &[u8], durable: bool) -> Result<()> {
     use std::{
         io::Write as _,
         sync::atomic::{AtomicU64, Ordering},
@@ -148,12 +195,15 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut f = fs::File::create(&tmp).wrap_err_with(|| format!("create {}", tmp.display()))?;
         f.write_all(bytes).wrap_err_with(|| format!("write {}", tmp.display()))?;
-        f.sync_all().wrap_err_with(|| format!("fsync {}", tmp.display()))?;
+        if durable {
+            f.sync_all().wrap_err_with(|| format!("fsync {}", tmp.display()))?;
+        }
         drop(f);
         fs::rename(&tmp, path).wrap_err_with(|| format!("rename to {}", path.display()))?;
         // Make the rename itself durable. Directory fsync is best-effort:
         // supported on Linux, may be a no-op/error elsewhere (macOS).
-        if let Some(parent) = path.parent() &&
+        if durable &&
+            let Some(parent) = path.parent() &&
             let Ok(dir) = fs::File::open(parent)
         {
             let _ = dir.sync_all();
@@ -167,58 +217,70 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
-/// Removes stale `*.tmp` files left by writers killed mid-`write_atomic`
-/// (their unique names are never reused, so they accumulate forever
-/// otherwise). Non-recursive.
-///
-/// `min_age` guards live writers: a healthy `write_atomic` holds its tmp for
-/// milliseconds, so anything older than the threshold is orphaned. Callers
-/// must still only sweep after acquiring the store lock (one backfill per
-/// data-dir) — the age filter is the second line of defense for processes
-/// that do NOT hold the lock (e.g. a concurrent `report` inflating profiles
-/// into the shared tmp dir).
-pub fn sweep_stale_tmp(dir: &Path, min_age: std::time::Duration) -> usize {
-    let Ok(entries) = fs::read_dir(dir) else { return 0 };
-    let mut removed = 0;
-    for entry in entries.flatten() {
-        if !entry.file_name().to_string_lossy().ends_with(".tmp") {
-            continue;
+impl DataDir {
+    /// Removes what a previous run left mid-flight: every per-block file in
+    /// `tmp/`, and the `*.tmp` files of writers killed inside `write_atomic`
+    /// (unique names, never reused, so they would accumulate forever).
+    ///
+    /// Only for the holder of the store's write lock: it is the one process
+    /// that writes under these directories, so nothing found there is live.
+    pub fn clear_leftovers(&self) -> usize {
+        let mut removed = remove_files(&self.tmp(), |_| true);
+        for dir in [self.spool(), self.codes(), self.archive_profiles()] {
+            removed += remove_files(&dir, |name| name.ends_with(".tmp"));
         }
-        let old_enough = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age >= min_age);
-        if old_enough && fs::remove_file(entry.path()).is_ok() {
-            removed += 1;
-        }
+        removed
     }
-    removed
+
+    /// Loads contract bytecodes for the given hashes from the codes dir.
+    /// Returns the same `HashMap` flavor `WitnessDatabase.contracts` expects.
+    pub fn load_contracts(
+        &self,
+        hashes: &[B256],
+    ) -> Result<alloy_primitives::map::HashMap<B256, revm::state::Bytecode>> {
+        let mut map = alloy_primitives::map::HashMap::with_capacity_and_hasher(
+            hashes.len(),
+            Default::default(),
+        );
+        for hash in hashes {
+            let path = self.code_file(hash);
+            let bytes = fs::read(&path)
+                .wrap_err_with(|| format!("missing contract code {}", path.display()))?;
+            map.insert(*hash, revm::state::Bytecode::new_raw(bytes.into()));
+        }
+        Ok(map)
+    }
 }
 
-/// Loads contract bytecodes for the given hashes from the codes dir.
-/// Returns the same `HashMap` flavor `WitnessDatabase.contracts` expects.
-pub fn load_contracts(
-    codes_dir: &Path,
-    hashes: &[B256],
-) -> Result<alloy_primitives::map::HashMap<B256, revm::state::Bytecode>> {
-    let mut map =
-        alloy_primitives::map::HashMap::with_capacity_and_hasher(hashes.len(), Default::default());
-    for hash in hashes {
-        let path = codes_dir.join(format!("{hash:x}.bin"));
-        let bytes = fs::read(&path)
-            .wrap_err_with(|| format!("missing contract code {}", path.display()))?;
-        map.insert(*hash, revm::state::Bytecode::new_raw(bytes.into()));
-    }
-    Ok(map)
+/// Removes the files directly in `dir` whose name `matches`; returns how many.
+fn remove_files(dir: &Path, matches: impl Fn(&str) -> bool) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else { return 0 };
+    entries
+        .flatten()
+        .filter(|e| matches(&e.file_name().to_string_lossy()))
+        .filter(|e| fs::remove_file(e.path()).is_ok())
+        .count()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
+
+    fn tmp_files(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count()
+    }
+
+    fn entry(block_json: &[u8]) -> SpoolEntry {
+        SpoolEntry {
+            block_json: block_json.to_vec(),
+            light_witness: LightWitness { kvs: Default::default(), levels: Default::default() },
+            code_hashes: vec![B256::repeat_byte(3)],
+        }
+    }
 
     /// Any single corrupted byte in a spool file must fail `read_from` (the
     /// zstd frame checksum) — most of the entry is opaque high-entropy bytes
@@ -228,12 +290,7 @@ mod tests {
     fn spool_checksum_rejects_any_byte_corruption() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("1.bin");
-        let entry = SpoolEntry {
-            block_json: vec![0xA5; 4096],
-            light_witness: LightWitness { kvs: Default::default(), levels: Default::default() },
-            code_hashes: vec![B256::repeat_byte(3)],
-        };
-        entry.write_to(&path).unwrap();
+        entry(&[0xA5; 4096]).write_to(&path).unwrap();
         assert!(SpoolEntry::read_from(&path).is_ok());
 
         let clean = fs::read(&path).unwrap();
@@ -246,13 +303,40 @@ mod tests {
         }
     }
 
+    /// A damaged inner block decodes fine as the envelope's opaque bytes, so
+    /// `open` must parse it; and an entry holding another block is not this
+    /// block's.
+    #[test]
+    fn open_rejects_an_unparsable_or_wrong_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("7.bin");
+        entry(b"not json").write_to(&path).unwrap();
+        assert!(SpoolEntry::open(&path, 7).is_err());
+
+        let fixture = fs::read_dir("../../test_data/mainnet/blocks")
+            .expect("fixture dir")
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|e| e == "json"))
+            .expect("at least one block fixture");
+        entry(&fs::read(&fixture).unwrap()).write_to(&path).unwrap();
+        let n = serde_json::from_slice::<Block<OpTransaction>>(&fs::read(&fixture).unwrap())
+            .unwrap()
+            .header
+            .inner
+            .number;
+        assert_eq!(SpoolEntry::open(&path, n).unwrap().block.header.inner.number, n);
+        let err = SpoolEntry::open(&path, n + 1).err().expect("another block's entry");
+        assert!(err.to_string().contains("expected"), "{err}");
+    }
+
     #[test]
     fn write_atomic_round_trips_and_leaves_no_tmp() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("out.bin");
         write_atomic(&target, b"payload").unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"payload");
-        assert_eq!(sweep_stale_tmp(dir.path(), Duration::ZERO), 0, "no tmp litter after success");
+        assert_eq!(tmp_files(dir.path()), 0, "no tmp litter after success");
     }
 
     #[test]
@@ -262,24 +346,25 @@ mod tests {
         let target = dir.path().join("occupied");
         fs::create_dir(&target).unwrap();
         assert!(write_atomic(&target, b"x").is_err());
-        assert_eq!(
-            sweep_stale_tmp(dir.path(), Duration::ZERO),
-            0,
-            "failed write must clean its tmp file"
-        );
+        assert_eq!(tmp_files(dir.path()), 0, "failed write must clean its tmp file");
     }
 
+    /// Everything in `tmp/` is per-block scratch; elsewhere only orphaned
+    /// `write_atomic` temps go, never the data next to them.
     #[test]
-    fn sweep_removes_only_old_tmp_files() {
+    fn clear_leftovers_takes_scratch_and_orphaned_temps_only() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("stale.bin.123.0.tmp"), b"junk").unwrap();
-        fs::write(dir.path().join("keep.bin"), b"data").unwrap();
-        // A generous min_age spares the freshly-written (live-looking) tmp…
-        assert_eq!(sweep_stale_tmp(dir.path(), Duration::from_secs(3600)), 0);
-        assert!(dir.path().join("stale.bin.123.0.tmp").exists());
-        // …zero age reaps it, leaving non-tmp files alone.
-        assert_eq!(sweep_stale_tmp(dir.path(), Duration::ZERO), 1);
-        assert!(dir.path().join("keep.bin").exists());
-        assert!(!dir.path().join("stale.bin.123.0.tmp").exists());
+        let dirs = DataDir::new(dir.path());
+        dirs.ensure_layout().unwrap();
+        fs::write(dirs.block_profraw(5), b"raw").unwrap();
+        fs::write(dirs.block_profraw(5).with_extension("profdata"), b"sparse").unwrap();
+        fs::write(dirs.codes().join("ab.bin.123.0.tmp"), b"junk").unwrap();
+        fs::write(dirs.code_file(&B256::repeat_byte(1)), b"code").unwrap();
+        fs::write(dirs.spool_entry(9), b"entry").unwrap();
+
+        assert_eq!(dirs.clear_leftovers(), 3);
+        assert_eq!(fs::read_dir(dirs.tmp()).unwrap().count(), 0);
+        assert!(dirs.code_file(&B256::repeat_byte(1)).exists());
+        assert!(dirs.spool_entry(9).exists());
     }
 }

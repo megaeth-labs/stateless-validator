@@ -30,7 +30,7 @@
 //! a third of the universe turned out to be k256, generic-array and friends.
 
 use std::{
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     hash::Hasher,
     path::{Path, PathBuf},
     process::Command,
@@ -122,12 +122,137 @@ pub fn universe_stamp(source_dirs: &[PathBuf]) -> String {
     format!("{ITEM_UNIVERSE}:{}", labels.join(","))
 }
 
+/// The coverage scope and the LLVM tools that evaluate it — shared by
+/// `backfill` (which hands its resolution on to every worker) and `report`.
+#[derive(clap::Args, Debug, Clone)]
+pub struct LlvmArgs {
+    /// Source directories scoping the coverage universe. `backfill` stamps its
+    /// store with them, and `report` refuses a manifest computed over any
+    /// other scope. Default: the mega-evm checkout this binary was built
+    /// against plus the crates in `measured-crates.txt` at their locked
+    /// versions, found under the cargo home the build used. llvm-cov matches
+    /// the absolute paths baked in at build time, so the sources must sit
+    /// where they sat for the build.
+    #[clap(long = "source-dir")]
+    pub source_dirs: Vec<PathBuf>,
+    /// Explicit llvm-profdata path (default: the `llvm-tools` of the
+    /// toolchain that built this binary).
+    #[clap(long)]
+    pub llvm_profdata: Option<PathBuf>,
+    /// Explicit llvm-cov path (default: the `llvm-tools` of the toolchain that
+    /// built this binary).
+    #[clap(long)]
+    pub llvm_cov: Option<PathBuf>,
+}
+
+impl LlvmArgs {
+    /// Resolves the scope and both tools, or fails naming what is missing.
+    pub fn resolve(&self) -> Result<Llvm> {
+        Ok(Llvm {
+            profdata: find_tool("llvm-profdata", self.llvm_profdata.as_deref())?,
+            cov: find_tool("llvm-cov", self.llvm_cov.as_deref())?,
+            source_dirs: resolve_source_dirs(&self.source_dirs)?,
+        })
+    }
+}
+
+/// A resolved [`LlvmArgs`]: the tools exist and the scope passed its checks.
+#[derive(Debug, Clone)]
+pub struct Llvm {
+    pub profdata: PathBuf,
+    pub cov: PathBuf,
+    pub source_dirs: Vec<PathBuf>,
+}
+
+impl Llvm {
+    /// The universe stamp of this scope (see [`universe_stamp`]).
+    pub fn universe(&self) -> String {
+        universe_stamp(&self.source_dirs)
+    }
+
+    /// The flags that pass this resolution on to a worker, so every worker of
+    /// a run evaluates exactly what the dispatcher resolved.
+    pub fn to_args(&self) -> Vec<OsString> {
+        let mut args: Vec<OsString> = vec![
+            "--llvm-profdata".into(),
+            self.profdata.clone().into(),
+            "--llvm-cov".into(),
+            self.cov.clone().into(),
+        ];
+        for dir in &self.source_dirs {
+            args.extend(["--source-dir".into(), dir.clone().into()]);
+        }
+        args
+    }
+
+    /// Turns one block's profraw into its covered items, leaving the sparse
+    /// profdata next to it (returned) for the judge to archive.
+    ///
+    /// `llvm-profdata merge -sparse` drops every zero-count function, which is
+    /// almost all of them for a single block; `llvm-cov export` then evaluates
+    /// the counter expressions of what is left. `exe` must be the
+    /// instrumented binary that wrote the profraw — its coverage map is what
+    /// gives the counters their meaning.
+    pub fn extract_covered_items(
+        &self,
+        exe: &Path,
+        profraw: &Path,
+    ) -> Result<(Vec<CoveredItem>, PathBuf)> {
+        let profdata = profraw.with_extension("profdata");
+        self.merge_sparse(&[profraw], &profdata)?;
+        let items = self.covered_items(exe, &profdata)?;
+        Ok((items, profdata))
+    }
+
+    /// `llvm-profdata merge -sparse`: raw profiles or profdata files in, one
+    /// sparse profdata out — counts summed, zero-count functions dropped.
+    pub fn merge_sparse(&self, inputs: &[impl AsRef<OsStr>], out: &Path) -> Result<()> {
+        let merged = Command::new(&self.profdata)
+            .arg("merge")
+            .arg("-sparse")
+            .args(inputs)
+            .arg("-o")
+            .arg(out)
+            .output()
+            .wrap_err("spawn llvm-profdata")?;
+        ensure!(
+            merged.status.success(),
+            "llvm-profdata merge -sparse failed: {}",
+            String::from_utf8_lossy(&merged.stderr)
+        );
+        Ok(())
+    }
+
+    /// The covered items of `profdata` within the scope, evaluated against
+    /// the coverage map of `exe` — the one extraction both a block's bitmap
+    /// and `report`'s cross-check go through.
+    pub fn covered_items(&self, exe: &Path, profdata: &Path) -> Result<Vec<CoveredItem>> {
+        let out = Command::new(&self.cov)
+            .arg("export")
+            .arg(exe)
+            .arg(format!("--instr-profile={}", profdata.display()))
+            .arg("--format=text")
+            // The per-function records are most of the output and carry
+            // nothing the file-level segments and branches do not.
+            .arg("--skip-functions")
+            .args(&self.source_dirs)
+            .output()
+            .wrap_err("spawn llvm-cov")?;
+        ensure!(
+            out.status.success(),
+            "llvm-cov export failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        parse_export(&String::from_utf8_lossy(&out.stdout), &self.source_dirs)
+    }
+}
+
 /// Resolves the source scope: the explicit `--source-dir`s, or the default —
 /// the mega-evm checkout this binary was built against plus the measured
 /// registry crates at their locked versions. Every directory must exist —
 /// llvm-cov collects the files under it from disk, and a scope that matches
 /// nothing would turn every block into an empty bitmap.
-pub fn resolve_source_dirs(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
+fn resolve_source_dirs(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let dirs = if explicit.is_empty() {
         let cargo_home = Path::new(env!("COVERAGE_CARGO_HOME"));
         let mut dirs = vec![detect_mega_evm_checkout(cargo_home)?];
@@ -191,7 +316,7 @@ fn detect_registry_crate(cargo_home: &Path, name_version: &str) -> Result<PathBu
 /// Finds the cargo git checkout of the mega-evm rev this binary was BUILT
 /// against (embedded by build.rs) — no runtime Cargo.lock parsing, no cwd
 /// dependence, and the rev can never disagree with the instrumented build.
-pub fn detect_mega_evm_checkout(cargo_home: &Path) -> Result<PathBuf> {
+fn detect_mega_evm_checkout(cargo_home: &Path) -> Result<PathBuf> {
     let rev: String = env!("COVERAGE_MEGA_EVM_REV").chars().take(7).collect();
     ensure!(rev.len() == 7, "the built-against mega-evm rev {rev:?} is too short to locate");
     let checkouts = cargo_home.join("git").join("checkouts");
@@ -229,11 +354,10 @@ fn one_candidate(mut candidates: Vec<PathBuf>, what: &str) -> Result<PathBuf> {
 /// whose profile and coverage-map formats the binary carries; the `rustc` on
 /// the current `$PATH` belongs to whichever toolchain the working directory
 /// selects, which outside the repository is usually another one.
-pub fn find_tool(name: &str, cli_override: Option<&str>) -> Result<PathBuf> {
+fn find_tool(name: &str, cli_override: Option<&Path>) -> Result<PathBuf> {
     if let Some(p) = cli_override {
-        let p = PathBuf::from(p);
         ensure!(p.exists(), "{name} override does not exist: {}", p.display());
-        return Ok(p);
+        return Ok(p.to_path_buf());
     }
 
     let runtime_sysroot = Command::new("rustc")
@@ -275,74 +399,6 @@ fn find_in_sysroots<'a>(
             .map(|triple| triple.path().join("bin").join(name))
             .find(|candidate| candidate.is_file())
     })
-}
-
-/// Turns one block's profraw into its covered items, leaving the sparse
-/// profdata next to it (returned) for the judge to archive.
-///
-/// `llvm-profdata merge -sparse` drops every zero-count function, which is
-/// almost all of them for a single block; `llvm-cov export` then evaluates
-/// the counter expressions of what is left. `exe` must be the instrumented
-/// binary that wrote the profraw — its coverage map is what gives the
-/// counters their meaning.
-pub fn extract_covered_items(
-    llvm_profdata: &Path,
-    llvm_cov: &Path,
-    exe: &Path,
-    profraw: &Path,
-    source_dirs: &[PathBuf],
-) -> Result<(Vec<CoveredItem>, PathBuf)> {
-    let profdata = profraw.with_extension("profdata");
-    merge_sparse(llvm_profdata, &[profraw], &profdata)?;
-    let items = covered_items(llvm_cov, exe, &profdata, source_dirs)?;
-    Ok((items, profdata))
-}
-
-/// `llvm-profdata merge -sparse`: raw profiles or profdata files in, one sparse
-/// profdata out — counts summed, zero-count functions dropped.
-pub fn merge_sparse(llvm_profdata: &Path, inputs: &[impl AsRef<OsStr>], out: &Path) -> Result<()> {
-    let merged = Command::new(llvm_profdata)
-        .arg("merge")
-        .arg("-sparse")
-        .args(inputs)
-        .arg("-o")
-        .arg(out)
-        .output()
-        .wrap_err("spawn llvm-profdata")?;
-    ensure!(
-        merged.status.success(),
-        "llvm-profdata merge -sparse failed: {}",
-        String::from_utf8_lossy(&merged.stderr)
-    );
-    Ok(())
-}
-
-/// The covered items of `profdata` within `source_dirs`, evaluated against the
-/// coverage map of `exe` — the one extraction both a block's bitmap and
-/// `report`'s cross-check go through.
-pub fn covered_items(
-    llvm_cov: &Path,
-    exe: &Path,
-    profdata: &Path,
-    source_dirs: &[PathBuf],
-) -> Result<Vec<CoveredItem>> {
-    let out = Command::new(llvm_cov)
-        .arg("export")
-        .arg(exe)
-        .arg(format!("--instr-profile={}", profdata.display()))
-        .arg("--format=text")
-        // The per-function records are most of the output and carry nothing
-        // the file-level segments and branches do not.
-        .arg("--skip-functions")
-        .args(source_dirs)
-        .output()
-        .wrap_err("spawn llvm-cov")?;
-    ensure!(
-        out.status.success(),
-        "llvm-cov export failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    parse_export(&String::from_utf8_lossy(&out.stdout), source_dirs)
 }
 
 /// Fails unless every configured root prefixes at least one file llvm-cov

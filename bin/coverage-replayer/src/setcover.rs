@@ -12,10 +12,13 @@
 //! pass drops any selected block whose bitmap is covered by the union of the
 //! others.
 
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use clap::Args;
-use eyre::{Context, Result, ensure};
+use eyre::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
@@ -57,9 +60,7 @@ pub struct Manifest {
     /// the set against any other scope: the archived profiles hold counters
     /// for every instrumented crate, so llvm-cov would happily report a wider
     /// scope than the cover was built for, and read the gap as uncovered code.
-    /// Absent in manifests written before it was recorded.
-    #[serde(default)]
-    pub universe: Option<String>,
+    pub universe: String,
     pub generated_at_unix: u64,
     pub universe_counters: u64,
     pub covered_counters: u64,
@@ -77,39 +78,44 @@ pub struct ManifestBlock {
     pub bits: u64,
 }
 
+impl Manifest {
+    pub fn read(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .wrap_err_with(|| format!("read manifest {}", path.display()))?;
+        serde_json::from_str(&text).wrap_err_with(|| format!("parse manifest {}", path.display()))
+    }
+}
+
+impl ManifestBlock {
+    /// The pattern key, which names the block's archived profile.
+    pub fn pattern_key(&self) -> Result<u64> {
+        u64::from_str_radix(&self.pattern, 16)
+            .wrap_err_with(|| format!("bad pattern key {:?} in manifest", self.pattern))
+    }
+}
+
+/// Seconds since the Unix epoch, for provenance stamps.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub fn run(args: SetCoverArgs) -> Result<()> {
     let dirs = DataDir::new(&args.data_dir);
-    // `Store::open` creates a missing store — on a mistyped --data-dir that
-    // would silently produce a 0-block manifest (and pin the fresh store to
-    // this binary_id). Require an existing store instead.
-    ensure!(
-        dirs.store_path().exists(),
-        "no store at {} — run backfill first (set-cover never creates one)",
-        dirs.store_path().display()
-    );
     let binary_id = current_binary_id();
-    // No filter check: set-cover consumes whatever universe the store holds.
-    let store = Store::open(&dirs.store_path(), &binary_id, None)?;
+    let store = Store::open_for_build(&dirs.store_path(), &binary_id)?;
     // Patterns only: selection never looks at a block record, and the hashes
     // of the few selected representatives are point lookups afterwards.
-    let patterns = store.load_patterns()?;
+    let patterns = store.patterns()?;
 
     let incumbents: HashSet<u64> = match &args.incumbent_manifest {
-        Some(path) => {
-            let manifest: Manifest = serde_json::from_str(
-                &std::fs::read_to_string(path)
-                    .wrap_err_with(|| format!("read incumbent manifest {}", path.display()))?,
-            )?;
-            manifest
-                .blocks
-                .iter()
-                .map(|b| {
-                    u64::from_str_radix(&b.pattern, 16).wrap_err_with(|| {
-                        format!("bad pattern key {} in {}", b.pattern, path.display())
-                    })
-                })
-                .collect::<Result<_>>()?
-        }
+        Some(path) => Manifest::read(path)?
+            .blocks
+            .iter()
+            .map(ManifestBlock::pattern_key)
+            .collect::<Result<_>>()?,
         None => HashSet::new(),
     };
 
@@ -153,10 +159,7 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
         // What backfill stamped the store with, not a re-derivation from
         // flags: it cannot drift from the scan that produced the profiles.
         universe: store.universe()?,
-        generated_at_unix: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0),
+        generated_at_unix: unix_now(),
         universe_counters,
         covered_counters,
         blocks,
@@ -198,7 +201,7 @@ pub struct CoverOutcome {
     pub pruned_dominated: Vec<u64>,
     /// Representatives dropped by the redundancy-elimination pass (for
     /// logging; no longer present in `selected`).
-    pub redundant_removed: std::collections::HashSet<u64>,
+    pub redundant_removed: Vec<u64>,
     pub universe_counters: u64,
     pub covered_counters: u64,
 }
@@ -247,32 +250,22 @@ pub fn select_cover(
 
     // Redundancy elimination: drop picks fully covered by the union of the
     // others (an early large pick can become redundant after later picks).
-    let mut removed: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let mut pruned = true;
-    while pruned {
-        pruned = false;
-        for i in 0..selected.len() {
-            let (key, rep, _) = selected[i];
-            if removed.contains(&rep) {
-                continue;
-            }
-            let mut others = BitSet::new();
-            for (j, (other_key, other_rep, _)) in selected.iter().enumerate() {
-                if i != j && !removed.contains(other_rep) {
-                    others.union_with(&patterns[other_key].bitmap);
-                }
-            }
-            if patterns[&key].bitmap.is_subset_of(&others) {
-                removed.insert(rep);
-                pruned = true;
-                break;
+    // One pass suffices: dropping a pick only shrinks the others' union, so a
+    // pick found necessary stays necessary.
+    let mut keep = vec![true; selected.len()];
+    for i in 0..selected.len() {
+        let mut others = BitSet::new();
+        for (j, (other_key, _, _)) in selected.iter().enumerate() {
+            if j != i && keep[j] {
+                others.union_with(&patterns[other_key].bitmap);
             }
         }
+        keep[i] = !patterns[&selected[i].0].bitmap.is_subset_of(&others);
     }
-
-    // The cover is final here: drop eliminated picks so every consumer sees
-    // the true selection (removed reps stay available for logging).
-    selected.retain(|(_, rep, _)| !removed.contains(rep));
+    let (kept, removed): (Vec<_>, Vec<_>) =
+        selected.into_iter().zip(keep).partition(|(_, keep)| *keep);
+    let selected: Vec<(u64, u64, u64)> = kept.into_iter().map(|(pick, _)| pick).collect();
+    let removed: Vec<u64> = removed.into_iter().map(|((_, rep, _), _)| rep).collect();
 
     CoverOutcome {
         selected,
@@ -303,7 +296,7 @@ pub fn select_cover(
 ///   superset of this candidate?" into "who contains its rarest counter?" — a superset must contain
 ///   every counter the candidate has, so the shortest posting list bounds the search, and a counter
 ///   no kept pattern has proves the candidate maximal outright.
-fn split_antichain(
+pub(crate) fn split_antichain(
     patterns: &std::collections::HashMap<u64, crate::store::PatternRecord>,
 ) -> (Vec<(&u64, &crate::store::PatternRecord)>, Vec<u64>) {
     let mut ordered: Vec<(&u64, &crate::store::PatternRecord)> = patterns.iter().collect();
@@ -369,16 +362,7 @@ mod tests {
     use crate::store::PatternRecord;
 
     fn pat(bits: &[u32], rep: u64) -> PatternRecord {
-        let bitmap = BitSet::from_indices(bits.iter().copied());
-        PatternRecord {
-            bits: bitmap.count_ones(),
-            bitmap,
-            first_block: rep,
-            last_block: rep,
-            hit_count: 1,
-            representative: rep,
-            representative_elapsed_ms: 100,
-        }
+        PatternRecord::first_seen(BitSet::from_indices(bits.iter().copied()), rep, 100)
     }
 
     fn cover(patterns: &HashMap<u64, PatternRecord>) -> (Vec<u64>, CoverOutcome) {

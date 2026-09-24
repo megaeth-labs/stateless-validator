@@ -26,7 +26,7 @@
 //!
 //! ```text
 //! inspect --dump-pool pool.txt   (old build; read-only, no binary-id check)
-//!   └─ cat pool*.txt | sort -un > union.txt     (across shards, if sharded)
+//!   └─ cat pool*.txt > union.txt     (across shards; the list is sorted and deduped on read)
 //!        └─ backfill --blocks-file union.txt    (new build, fresh data-dir)
 //!             └─ set-cover → report             (new minimal set)
 //! ```
@@ -44,7 +44,6 @@ mod llvm;
 mod merge;
 mod profile_rt;
 mod proto;
-mod r2;
 mod report;
 mod setcover;
 mod spool;

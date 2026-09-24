@@ -9,6 +9,14 @@
 //!                                                        ▼
 //!                                                  judge (single consumer, owns redb)
 //! ```
+//!
+//! No block is ever skipped, and none is ever killed: a scan is only a cover
+//! of what it replayed, so a gap would silently shrink the universe. A failed
+//! fetch is retried every few seconds and a crashed worker is respawned onto
+//! the same block, both indefinitely and loudly; a slow block is only warned
+//! about. What cannot be retried into success — a replay error, or execution
+//! that disagrees with the block's header — stops the run (fail-stop) with the
+//! block recorded, so the next run retries it.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -21,7 +29,12 @@ use alloy_primitives::B256;
 use alloy_rpc_types_eth::BlockId;
 use clap::Args;
 use eyre::{Context, Result, bail, ensure};
-use stateless_common::RpcClient;
+use rustc_hash::FxHashMap;
+use stateless_common::{
+    BackoffPolicy, R2WitnessTransport, RedactedSecret, RpcClient, decode_on_blocking_pool,
+    decode_witness_payload_light,
+};
+use stateless_r2::fetch::{DEFAULT_CONNECT_TIMEOUT, FetchTimeouts};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt},
     process::Child,
@@ -31,12 +44,12 @@ use tracing::{info, warn};
 
 use crate::{
     bitset::BitSet,
-    llvm,
+    llvm::{Llvm, LlvmArgs},
     proto::{ItemDetail, WorkerRequest, WorkerResponse},
-    spool::{DataDir, SpoolEntry, write_atomic},
+    spool::{DataDir, SpoolEntry, write_atomic, write_scratch},
     store::{
-        BlockRecord, BlockStatus, CounterInfo, PatternRecord, Store, StoreSnapshot,
-        current_binary_id, elapsed_stats, resolve_pattern_slot,
+        BlockRecord, BlockStatus, CounterInfo, PatternRecord, Store, current_binary_id,
+        elapsed_stats, resolve_pattern_slot,
     },
 };
 
@@ -104,7 +117,7 @@ pub struct BackfillArgs {
     /// R2 secret access key. Required when `--witness-source r2`. Prefer the
     /// env var over the flag. Redacted in `Debug` output.
     #[clap(long, env = "COVERAGE_REPLAYER_R2_SECRET_ACCESS_KEY")]
-    pub r2_secret_access_key: Option<crate::r2::RedactedSecret>,
+    pub r2_secret_access_key: Option<RedactedSecret>,
     /// Genesis JSON path (e.g. test_data/mainnet/genesis.json).
     #[clap(long, env = "COVERAGE_REPLAYER_GENESIS_FILE")]
     pub genesis_file: String,
@@ -122,34 +135,19 @@ pub struct BackfillArgs {
     /// bounds the spool backlog whatever the value.
     #[clap(long, default_value_t = 32)]
     pub fetch_concurrency: usize,
-    /// Source directories scoping the coverage universe — the same scope
-    /// `report` measures. Default: the mega-evm checkout this binary was built
-    /// against plus the crates in `measured-crates.txt` at their locked
-    /// versions, found under the cargo home the build used. llvm-cov matches
-    /// the absolute paths baked in at build time, so the sources must sit
-    /// where they sat for the build.
-    #[clap(long = "source-dir")]
-    pub source_dirs: Vec<PathBuf>,
-    /// Explicit llvm-profdata path (default: the `llvm-tools` of the toolchain
-    /// that built this binary).
-    #[clap(long)]
-    pub llvm_profdata: Option<String>,
-    /// Explicit llvm-cov path (default: the `llvm-tools` of the toolchain that
-    /// built this binary).
-    #[clap(long)]
-    pub llvm_cov: Option<String>,
+    #[clap(flatten)]
+    pub llvm: LlvmArgs,
     /// Interval (seconds) for the "block still executing" progress warning.
-    /// Blocks are NEVER timed out or skipped — a stuck block stays visibly
-    /// stuck in the log until it completes.
+    /// Blocks are never timed out — a stuck block stays visibly stuck in the
+    /// log until it completes.
     #[clap(long, default_value_t = 600)]
     pub slow_block_warn_secs: u64,
 }
 
 /// What this run was asked to replay. The two forms differ in how the store
-/// is consulted: a range scans the BLOCKS table between its ends, a list does
-/// one point lookup per member — which is what keeps resuming a pool drawn
-/// from the whole history cheap, since its extremes span every row ever
-/// written.
+/// is consulted: a range reads the block records between its ends, a list
+/// looks each member up — a pool drawn from the whole history spans every row
+/// ever written.
 enum Selection {
     Range(std::ops::RangeInclusive<u64>),
     List(Vec<u64>),
@@ -214,11 +212,20 @@ impl Selection {
         }
     }
 
-    fn load_snapshot(&self, store: &Store) -> Result<StoreSnapshot> {
+    /// How the store last judged each selected block — all the todo filter
+    /// needs, so a resumed full-range run holds a status per block rather
+    /// than a whole record.
+    fn statuses(&self, store: &Store) -> Result<HashMap<u64, BlockStatus>> {
+        let mut found = HashMap::new();
         match self {
-            Self::Range(r) => store.load_for_range(r.clone()),
-            Self::List(v) => store.load_for_blocks(v),
+            Self::Range(r) => store.blocks(r.clone(), |n, record| {
+                found.insert(n, record.status);
+            })?,
+            Self::List(v) => {
+                found.extend(store.block_records(v)?.into_iter().map(|(n, r)| (n, r.status)));
+            }
         }
+        Ok(found)
     }
 }
 
@@ -262,34 +269,22 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     // Resolved once, here: every worker of the run must agree on the scope,
     // and a scope that cannot work (sources missing or ambiguous) has to stop
     // the run before any block is replayed.
-    let source_dirs = llvm::resolve_source_dirs(&args.source_dirs)?;
-    let universe = llvm::universe_stamp(&source_dirs);
-    info!(universe, "coverage universe");
-    let store = Store::open(&dirs.store_path(), &binary_id, Some(&universe))?;
-    // Writers killed mid-write_atomic leave uniquely-named *.tmp files that
-    // would otherwise accumulate forever across crashes. Sweep only AFTER
-    // Store::open: its exclusive redb lock guarantees no other backfill is
-    // live on this data-dir (a doomed double-start must be refused before it
-    // can delete a live writer's tmp files); the age threshold protects
-    // non-locking processes like a concurrent `report`.
-    let swept: usize = [dirs.spool(), dirs.codes(), dirs.tmp(), dirs.archive_profiles()]
-        .iter()
-        .map(|d| crate::spool::sweep_stale_tmp(d, Duration::from_secs(3600)))
-        .sum();
-    if swept > 0 {
-        info!(swept, "removed stale tmp files from a previous crash");
-    }
-    let snapshot = selection.load_snapshot(&store)?;
-    let tools = WorkerTools {
-        llvm_profdata: llvm::find_tool("llvm-profdata", args.llvm_profdata.as_deref())?,
-        llvm_cov: llvm::find_tool("llvm-cov", args.llvm_cov.as_deref())?,
-        source_dirs,
-    };
+    let llvm = args.llvm.resolve()?;
+    let universe = llvm.universe();
     info!(
-        llvm_profdata = %tools.llvm_profdata.display(),
-        llvm_cov = %tools.llvm_cov.display(),
-        "llvm tools resolved"
+        universe,
+        llvm_profdata = %llvm.profdata.display(),
+        llvm_cov = %llvm.cov.display(),
+        "coverage universe"
     );
+    let store = Store::open(&dirs.store_path(), &binary_id, &universe)?;
+    // Only now: the store's exclusive lock makes this the one process
+    // writing under the data dir, so nothing left there is live.
+    let cleared = dirs.clear_leftovers();
+    if cleared > 0 {
+        info!(cleared, "removed files a previous run left mid-flight");
+    }
+    let statuses = selection.statuses(&store)?;
 
     // R2 witness source: witnesses come from the bucket, so the RPC witness
     // endpoints are unused — feed the data endpoints in as placeholders (the
@@ -320,7 +315,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
                     eyre::eyre!("{flag} is required (and non-empty) with --witness-source r2")
                 })
             };
-            let client = crate::r2::R2LightClient::new(
+            let transport = R2WitnessTransport::new(
                 &require(args.r2_endpoint.clone(), "--r2-endpoint")?,
                 require(args.r2_bucket.clone(), "--r2-bucket")?,
                 require(args.r2_access_key_id.clone(), "--r2-access-key-id")?,
@@ -328,10 +323,17 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
                     args.r2_secret_access_key.as_ref().map(|s| s.as_ref().to_string()),
                     "--r2-secret-access-key",
                 )?,
-                Duration::from_secs(60),
+                FetchTimeouts {
+                    per_attempt: Duration::from_secs(60),
+                    connect: DEFAULT_CONNECT_TIMEOUT,
+                },
+                // Never used: `fetch_block` makes one attempt per round, and the
+                // fetch loop's retry-forever is the pacing.
+                BackoffPolicy::new(Duration::ZERO, Duration::ZERO),
+                None,
             )?;
-            info!("witness source: R2 (light decode)");
-            Some(Arc::new(client))
+            info!(origin = %transport.origin(), "witness source: R2 (light decode)");
+            Some(Arc::new(transport))
         }
     };
 
@@ -353,11 +355,9 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
 
     // Work list: skip only blocks that previously replayed CLEANLY. Error /
     // Divergent records are retried — no block is ever permanently excluded.
-    let todo: Vec<u64> = selection
-        .iter()
-        .filter(|n| !matches!(snapshot.blocks.get(n), Some(r) if r.status == BlockStatus::Ok))
-        .collect();
-    let retrying = todo.iter().filter(|n| snapshot.blocks.contains_key(n)).count();
+    let todo: Vec<u64> =
+        selection.iter().filter(|n| statuses.get(n) != Some(&BlockStatus::Ok)).collect();
+    let retrying = todo.iter().filter(|n| statuses.contains_key(n)).count();
     let total = todo.len() as u64;
     info!(
         selection = %selection.label(),
@@ -377,16 +377,17 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     let (judged_tx, mut judged_rx) = tokio::sync::mpsc::channel::<WorkerResponse>(workers * 2);
 
     // ---- worker managers ----
+    let setup = Arc::new(WorkerSetup {
+        exe: crate::profile_rt::own_executable()?,
+        genesis_file: args.genesis_file.clone(),
+        dirs: dirs.clone(),
+        llvm,
+        warn_after: Duration::from_secs(args.slow_block_warn_secs.max(1)),
+    });
     let mut manager_set = JoinSet::new();
     for id in 0..workers {
-        let rx = dispatch_rx.clone();
-        let tx = judged_tx.clone();
-        let dirs = dirs.clone();
-        let args = args.clone();
-        let tools = tools.clone();
-        manager_set.spawn(async move {
-            worker_manager(id, rx, tx, dirs, args, tools).await;
-        });
+        let (rx, tx, setup) = (dispatch_rx.clone(), judged_tx.clone(), setup.clone());
+        manager_set.spawn(async move { worker_manager(id, rx, tx, setup).await });
     }
     drop(dispatch_rx);
     drop(judged_tx);
@@ -411,9 +412,6 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
                 let client = client.clone();
                 let r2 = r2.clone();
                 let verified_codes = verified_codes.clone();
-                // Retry until success — a block is never skipped. Transient
-                // RPC/IO failures resolve on retry; a persistent failure loops
-                // visibly in the log until the operator intervenes.
                 inflight.spawn(async move {
                     let mut attempt = 0u64;
                     let mut block_cache = None;
@@ -451,10 +449,19 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     drop(dispatch_tx);
 
     // ---- judge (this task) ----
-    let mut judge = JudgeState::new(snapshot, &store, dirs.clone(), total);
-    while let Some(outcome) = judged_rx.recv().await {
-        judge.ingest(outcome)?;
+    let mut judge =
+        JudgeState::new(store.counters()?, store.patterns()?, &store, dirs.clone(), total);
+    let judged: Result<()> = async {
+        while let Some(outcome) = judged_rx.recv().await {
+            judge.ingest(outcome)?;
+        }
+        Ok(())
     }
+    .await;
+    // Whatever ended the loop, what was judged is made durable before the
+    // run reports it.
+    store.flush()?;
+    judged?;
 
     fetcher.await.ok();
     while manager_set.join_next().await.is_some() {}
@@ -497,7 +504,7 @@ async fn forward_fetched(
 /// re-download the full block every 5 seconds.
 async fn fetch_block(
     client: &RpcClient,
-    r2: Option<&crate::r2::R2LightClient>,
+    r2: Option<&R2WitnessTransport>,
     dirs: &DataDir,
     verified_codes: &Arc<VerifiedCodes>,
     n: u64,
@@ -505,28 +512,19 @@ async fn fetch_block(
 ) -> Result<()> {
     let spool_path = dirs.spool_entry(n);
     if spool_path.exists() {
-        // Trust nothing left on disk: a spool the worker cannot use (crash
-        // artifact, a SpoolEntry layout change between binary versions, a
-        // corrupt inner block_json, or a wrong-numbered block) would
-        // otherwise poison the worker on EVERY restart — the judge
-        // fail-stops on it, the re-run skips the fetch because the file
-        // exists, and the block can never complete. Validate exactly what
-        // the worker will check and refetch on failure so every block
-        // eventually executes.
+        // An entry the worker cannot use (crash artifact, a layout change
+        // between binary versions) would fail-stop the run on every restart,
+        // since a re-run skips the fetch while the file exists. So it is
+        // opened exactly as the worker opens it, and refetched on failure.
         let existing = {
             let path = spool_path.clone();
-            tokio::task::spawn_blocking(move || {
-                let entry = SpoolEntry::read_from(&path)?;
-                validate_spool_entry(&entry, n)?;
-                Ok::<_, eyre::Report>(entry)
-            })
-            .await?
+            tokio::task::spawn_blocking(move || SpoolEntry::open(&path, n)).await?
         };
         match existing {
             Ok(entry) => {
-                // The spool is good, but its contract codes live in separate
-                // files — re-resolve any missing or corrupt ones so the
-                // worker never wedges on a half-cleaned codes dir.
+                // Its contract codes live in separate files — re-resolve any
+                // missing or corrupt ones so the worker never wedges on a
+                // half-cleaned codes dir.
                 resolve_missing_codes(client, dirs, verified_codes, entry.code_hashes).await?;
                 return Ok(());
             }
@@ -557,6 +555,11 @@ async fn fetch_block(
         // publishes and the witness is addressed by.
         let block = client.get_block_unchecked(BlockId::number(n), true).await;
         ensure!(
+            block.header.number == n,
+            "asked for block {n}, the RPC returned {}",
+            block.header.number
+        );
+        ensure!(
             block.header.hash_slow() == block.header.hash,
             "block {n}: the RPC header does not hash to the hash it claims ({:#x})",
             block.header.hash,
@@ -571,32 +574,28 @@ async fn fetch_block(
     // is re-fetched on demand. Either source serves the full history: the
     // bucket keeps every witness, and the witness RPC reads the same bucket.
     let (light_witness, _mpt_witness) = match r2 {
-        Some(r2) => r2.get_witness_light(n, hash).await?,
+        Some(r2) => {
+            let object = r2.fetcher().get_block_object(n, hash, 1, None, || {}).await?;
+            decode_on_blocking_pool(object.bytes, n, hash, None, |bytes| {
+                decode_witness_payload_light(bytes)
+            })
+            .await?
+        }
         None => client.get_witness_light(n, hash).await,
     };
 
     let code_hashes = stateless_core::collect_code_hashes(&light_witness.kvs);
     resolve_missing_codes(client, dirs, verified_codes, code_hashes.clone()).await?;
 
-    let entry = SpoolEntry { block_json: serde_json::to_vec(block)?, light_witness, code_hashes };
-    let path = spool_path.clone();
-    tokio::task::spawn_blocking(move || entry.write_to(&path)).await??;
-    Ok(())
-}
-
-/// Mirror of the worker's own requirements on a spool entry (see
-/// `worker::process_block`): the inner block JSON must parse and carry the
-/// expected block number. The bincode envelope decoding alone would pass a
-/// spool whose opaque `block_json` bytes are damaged — and the worker would
-/// then fail-stop the run on it, on every restart.
-fn validate_spool_entry(entry: &SpoolEntry, block: u64) -> Result<()> {
-    let parsed: alloy_rpc_types_eth::Block<op_alloy_rpc_types::Transaction> =
-        serde_json::from_slice(&entry.block_json).wrap_err("spool block_json does not parse")?;
-    ensure!(
-        parsed.header.inner.number == block,
-        "spool holds block {}, expected {block}",
-        parsed.header.inner.number
-    );
+    // Re-serializing a block of tens of thousands of transactions is real CPU
+    // work, so it goes to the blocking pool with the write. The block leaves
+    // the cache here, past everything a retry would want it for.
+    let block = block_cache.take().expect("just filled");
+    tokio::task::spawn_blocking(move || {
+        let block_json = serde_json::to_vec(&block)?;
+        SpoolEntry { block_json, light_witness, code_hashes }.write_to(&spool_path)
+    })
+    .await??;
     Ok(())
 }
 
@@ -659,7 +658,7 @@ async fn resolve_missing_codes(
     let (dirs, verified) = (dirs.clone(), verified.clone());
     tokio::task::spawn_blocking(move || {
         for (code_hash, bytecode) in codes {
-            write_atomic(&dirs.code_file(&code_hash), &bytecode.original_bytes())?;
+            write_scratch(&dirs.code_file(&code_hash), &bytecode.original_bytes())?;
             verified.remember([code_hash]);
         }
         Ok::<_, eyre::Report>(())
@@ -686,35 +685,36 @@ fn code_file_is_valid(path: &std::path::Path, hash: &B256) -> bool {
     }
 }
 
-/// Owns one resident worker child. A block is NEVER skipped: worker crashes
-/// respawn the child and retry the same block, indefinitely; long-running
-/// blocks are only warned about (see `slow_block_warn_secs`), never killed.
 /// What every worker of a run is launched with, resolved once by the
 /// dispatcher so they cannot disagree.
-#[derive(Clone)]
-struct WorkerTools {
-    llvm_profdata: PathBuf,
-    llvm_cov: PathBuf,
-    source_dirs: Vec<PathBuf>,
+struct WorkerSetup {
+    /// The running image, not the file it came from: a worker respawned after
+    /// a rebuild must still be this build (see `profile_rt::own_executable`).
+    exe: PathBuf,
+    genesis_file: String,
+    dirs: Arc<DataDir>,
+    llvm: Llvm,
+    /// Interval of the "block still executing" warning.
+    warn_after: Duration,
 }
 
+/// Owns one resident worker child, respawned onto the same block whenever it
+/// dies.
 async fn worker_manager(
     id: usize,
     rx: kanal::AsyncReceiver<u64>,
     tx: tokio::sync::mpsc::Sender<WorkerResponse>,
-    dirs: Arc<DataDir>,
-    args: BackfillArgs,
-    tools: WorkerTools,
+    setup: Arc<WorkerSetup>,
 ) {
     let mut worker: Option<WorkerHandle> = None;
-    let warn_after = Duration::from_secs(args.slow_block_warn_secs.max(1));
+    let (dirs, warn_after) = (&setup.dirs, setup.warn_after);
 
     while let Ok(n) = rx.recv().await {
         let req = WorkerRequest { block: n, spool: dirs.spool_entry(n) };
         let mut attempt = 0u64;
         let resp = loop {
             if worker.is_none() {
-                match WorkerHandle::spawn(&args, &dirs, &tools) {
+                match WorkerHandle::spawn(&setup) {
                     Ok(w) => worker = Some(w),
                     Err(e) => {
                         warn!(worker = id, error = %format!("{e:#}"), "spawn worker failed; retrying in 1s");
@@ -768,26 +768,14 @@ struct WorkerHandle {
 }
 
 impl WorkerHandle {
-    fn spawn(args: &BackfillArgs, dirs: &DataDir, tools: &WorkerTools) -> Result<Self> {
-        // The running image, not the file it came from: a worker respawned
-        // after a rebuild must still be this build.
-        let mut command = tokio::process::Command::new(crate::profile_rt::own_executable()?);
-        command
+    fn spawn(setup: &WorkerSetup) -> Result<Self> {
+        let mut child = tokio::process::Command::new(&setup.exe)
             .arg("internal-worker")
             .arg("--genesis-file")
-            .arg(&args.genesis_file)
-            .arg("--codes-dir")
-            .arg(dirs.codes())
-            .arg("--tmp-dir")
-            .arg(dirs.tmp())
-            .arg("--llvm-profdata")
-            .arg(&tools.llvm_profdata)
-            .arg("--llvm-cov")
-            .arg(&tools.llvm_cov);
-        for dir in &tools.source_dirs {
-            command.arg("--source-dir").arg(dir);
-        }
-        let mut child = command
+            .arg(&setup.genesis_file)
+            .arg("--data-dir")
+            .arg(&setup.dirs.root)
+            .args(setup.llvm.to_args())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
@@ -799,9 +787,9 @@ impl WorkerHandle {
         Ok(Self { child, stdin, stdout: tokio::io::BufReader::new(stdout).lines() })
     }
 
-    /// Sends one request and waits for the response with NO deadline: a slow
-    /// block only produces a periodic warning, never a kill. Errors here mean
-    /// the child actually died (closed stdout / bad frame), not slowness.
+    /// Sends one request and waits for the response with no deadline (see the
+    /// module doc). Errors here mean the child actually died (closed stdout /
+    /// bad frame), not slowness.
     async fn round_trip(
         &mut self,
         req: &WorkerRequest,
@@ -842,20 +830,32 @@ impl WorkerHandle {
     }
 }
 
+/// Judged blocks between two flushes of the store. A kill or crash rolls back
+/// at most this many — they are replayed again — for one flush per batch
+/// instead of one per block; every exit path of the judge flushes.
+const COMMITS_PER_FLUSH: u64 = 64;
+
 /// Single-consumer ingest: pattern dedup, promotion, persistence, progress.
 struct JudgeState<'a> {
     store: &'a Store,
     dirs: Arc<DataDir>,
-    counters: HashMap<u64, u32>,
+    /// Counter id → dense index. Every id enters with the pattern holding
+    /// it, so its size is also the size of the universe. Ids are hashes
+    /// already, so the map need not hash them again.
+    counters: FxHashMap<u64, u32>,
     next_dense: u32,
     patterns: HashMap<u64, PatternRecord>,
-    universe: BitSet,
+    /// Keys of the patterns no pattern dominated when they arrived. A new
+    /// pattern dominated by anything is dominated by one of these —
+    /// domination is transitive — so the check scans this set instead of
+    /// every pattern: all but a few percent of patterns arrive dominated.
+    undominated: Vec<u64>,
     processed: u64,
     total: u64,
     new_patterns: u64,
     started: Instant,
     /// Worker wall-clock per successfully replayed block (spool load + replay
-    /// + profraw + item extraction) — the E3 throughput measurement.
+    /// + profraw + item extraction).
     elapsed_ok_ms: ElapsedSampler,
 }
 
@@ -897,34 +897,28 @@ impl ElapsedSampler {
 
 impl<'a> JudgeState<'a> {
     fn new(
-        snapshot: crate::store::StoreSnapshot,
+        counters: HashMap<u64, CounterInfo>,
+        patterns: HashMap<u64, PatternRecord>,
         store: &'a Store,
         dirs: Arc<DataDir>,
         total: u64,
     ) -> Self {
-        let mut counters = HashMap::with_capacity(snapshot.counters.len());
-        let mut next_dense = 0u32;
-        for (id, info) in &snapshot.counters {
-            counters.insert(*id, info.dense);
-            next_dense = next_dense.max(info.dense + 1);
-        }
-        let mut universe = BitSet::new();
-        for rec in snapshot.patterns.values() {
-            universe.union_with(&rec.bitmap);
-        }
-        info!(
-            known_counters = counters.len(),
-            known_patterns = snapshot.patterns.len(),
-            universe = universe.count_ones(),
-            "judge state restored"
-        );
+        let next_dense = counters.values().map(|info| info.dense + 1).max().unwrap_or(0);
+        let counters: FxHashMap<u64, u32> =
+            counters.into_iter().map(|(id, info)| (id, info.dense)).collect();
+        let undominated = crate::setcover::split_antichain(&patterns)
+            .0
+            .into_iter()
+            .map(|(key, _)| *key)
+            .collect();
+        info!(universe = counters.len(), known_patterns = patterns.len(), "judge state restored");
         Self {
             store,
             dirs,
             counters,
             next_dense,
-            patterns: snapshot.patterns,
-            universe,
+            patterns,
+            undominated,
             processed: 0,
             total,
             new_patterns: 0,
@@ -942,15 +936,13 @@ impl<'a> JudgeState<'a> {
     fn ingest(&mut self, resp: WorkerResponse) -> Result<()> {
         self.processed += 1;
 
-        if !resp.ok {
+        if let Some(error) = &resp.error {
             let record = block_record(&resp, BlockStatus::Error, None);
-            self.store.commit_block(resp.block, &record, &[], None)?;
-            self.cleanup_tmp(resp.block);
+            self.store.commit_block(resp.block, &record, &[], None, false)?;
             eyre::bail!(
-                "block {} failed to replay: {} — ABORTING (no block may be skipped; \
+                "block {} failed to replay: {error} — ABORTING (no block may be skipped; \
                  spool kept at {}; a re-run will retry this block)",
                 resp.block,
-                resp.error.as_deref().unwrap_or("unknown"),
                 self.dirs.spool_entry(resp.block).display(),
             );
         }
@@ -958,8 +950,7 @@ impl<'a> JudgeState<'a> {
         let sane = resp.gas_ok && resp.receipts_root_ok && resp.logs_bloom_ok;
         if !sane {
             let record = block_record(&resp, BlockStatus::Divergent, None);
-            self.store.commit_block(resp.block, &record, &[], None)?;
-            self.cleanup_tmp(resp.block);
+            self.store.commit_block(resp.block, &record, &[], None, false)?;
             eyre::bail!(
                 "SANITY FAILURE at block {} (gas_ok={} receipts_root_ok={} logs_bloom_ok={}) — \
                  execution diverged from the header; bitmap NOT ingested. ABORTING: this is \
@@ -982,79 +973,58 @@ impl<'a> JudgeState<'a> {
 
     fn ingest_ok(&mut self, resp: WorkerResponse) -> Result<()> {
         self.elapsed_ok_ms.record(resp.elapsed_ms);
-        // Resolve counter ids → dense indices, registering unseen ids.
-        let unknown: Vec<u64> =
-            resp.counters.iter().filter(|id| !self.counters.contains_key(id)).copied().collect();
+        // Resolve counter ids → dense indices, registering unseen ids from the
+        // details their worker sent along.
+        let details: HashMap<u64, &ItemDetail> = resp.new_items.iter().map(|d| (d.id, d)).collect();
         let mut new_counters: Vec<(u64, CounterInfo)> = Vec::new();
-        if !unknown.is_empty() {
-            let details: HashMap<u64, &ItemDetail> =
-                resp.new_items.iter().map(|d| (d.id, d)).collect();
-            for id in &unknown {
-                let d = details.get(id).ok_or_else(|| {
-                    eyre::eyre!(
-                        "item {id:#x} of block {} is new to the store, but its worker never \
-                         reported where it lives",
-                        resp.block
-                    )
-                })?;
-                let dense = self.next_dense;
-                self.next_dense += 1;
-                self.counters.insert(*id, dense);
-                let info = CounterInfo {
-                    dense,
-                    location: d.location.clone(),
-                    kind: d.kind.clone(),
-                    line: d.line,
-                };
-                new_counters.push((*id, info));
+        let mut dense = Vec::with_capacity(resp.counters.len());
+        for id in &resp.counters {
+            if let Some(&known) = self.counters.get(id) {
+                dense.push(known);
+                continue;
             }
+            let d = details.get(id).ok_or_else(|| {
+                eyre::eyre!(
+                    "item {id:#x} of block {} is new to the store, but its worker never reported \
+                     where it lives",
+                    resp.block
+                )
+            })?;
+            let index = self.next_dense;
+            self.next_dense += 1;
+            self.counters.insert(*id, index);
+            dense.push(index);
+            let info = CounterInfo {
+                dense: index,
+                location: d.location.clone(),
+                kind: d.kind.clone(),
+                line: d.line,
+            };
+            new_counters.push((*id, info));
         }
 
-        let bitmap = BitSet::from_indices(resp.counters.iter().map(|id| self.counters[id]));
-
-        // Shared probing walk (worker counters arrive sorted and deduped) —
-        // the judge and merge MUST key identically; both go through
-        // `resolve_pattern_slot`.
-        let (key, occupied) = resolve_pattern_slot(&self.patterns, &resp.counters, &bitmap);
+        let rec =
+            PatternRecord::first_seen(BitSet::from_indices(dense), resp.block, resp.elapsed_ms);
+        // Worker counters arrive sorted and deduped, as the keying expects.
+        let (key, occupied) = resolve_pattern_slot(&self.patterns, &resp.counters, &rec.bitmap);
 
         if occupied {
-            // Known pattern: merge stats; re-home the representative to the
-            // lightest block seen (best fixture candidate; the profile is
-            // keyed by pattern, so nothing on disk moves).
-            let rec = self.patterns.get_mut(&key).expect("occupied slot");
-            rec.hit_count += 1;
-            // Completion order != block order under parallel workers, so both
-            // bounds need clamping (merge does the same min/max fold —
-            // sequential and merged stores must agree on provenance).
-            rec.first_block = rec.first_block.min(resp.block);
-            rec.last_block = rec.last_block.max(resp.block);
-            if resp.elapsed_ms < rec.representative_elapsed_ms {
-                rec.representative = resp.block;
-                rec.representative_elapsed_ms = resp.elapsed_ms;
-            }
+            // Known pattern: nothing on disk moves — the profile is keyed by
+            // pattern, whichever block now represents it.
+            self.patterns.get_mut(&key).expect("occupied slot").absorb(&rec);
         } else {
-            let rec = PatternRecord {
-                bits: bitmap.count_ones(),
-                bitmap,
-                first_block: resp.block,
-                last_block: resp.block,
-                hit_count: 1,
-                representative: resp.block,
-                representative_elapsed_ms: resp.elapsed_ms,
-            };
             // Dominated patterns (strict subset of an existing one) can never
             // beat their dominator in set cover — record the bitmap for dedup
             // and stats, but skip the profile archive (93% of new patterns in
             // practice). set-cover excludes them from candidates, so a
             // selected block always has an archived profile.
-            let dominated = self.patterns.values().any(|r| r.dominates(&rec));
-            self.universe.union_with(&rec.bitmap);
+            let dominated = self.undominated.iter().any(|k| self.patterns[k].dominates(&rec));
             self.new_patterns += 1;
             info!(
                 block = resp.block,
                 pattern = %format!("{key:016x}"),
                 bits = rec.bits,
-                universe = self.universe.count_ones(),
+                universe = self.counters.len(),
                 "NEW coverage pattern"
             );
             // Promote. Ordering is the durability invariant: the sparse
@@ -1076,6 +1046,9 @@ impl<'a> JudgeState<'a> {
                         )
                     })?;
             }
+            if !dominated {
+                self.undominated.push(key);
+            }
             self.patterns.insert(key, rec);
         }
 
@@ -1084,14 +1057,16 @@ impl<'a> JudgeState<'a> {
         let _ = std::fs::remove_file(&resp.profile);
         let record = block_record(&resp, BlockStatus::Ok, Some(key));
         let rec_ref = &self.patterns[&key];
-        self.store.commit_block(resp.block, &record, &new_counters, Some((key, rec_ref)))?;
+        let durable = self.processed.is_multiple_of(COMMITS_PER_FLUSH);
+        self.store.commit_block(
+            resp.block,
+            &record,
+            &new_counters,
+            Some((key, rec_ref)),
+            durable,
+        )?;
         let _ = std::fs::remove_file(self.dirs.spool_entry(resp.block));
         Ok(())
-    }
-
-    fn cleanup_tmp(&self, block: u64) {
-        let _ = std::fs::remove_file(self.dirs.tmp().join(format!("block_{block}.profraw")));
-        let _ = std::fs::remove_file(self.dirs.tmp().join(format!("block_{block}.profdata")));
     }
 
     fn progress_log(&self) {
@@ -1102,7 +1077,7 @@ impl<'a> JudgeState<'a> {
             processed = self.processed,
             total = self.total,
             patterns = self.patterns.len(),
-            universe = self.universe.count_ones(),
+            universe = self.counters.len(),
             rate = %format!("{rate:.1}/s"),
             eta = %format!("{:.0}s", eta_secs),
             "progress"
@@ -1114,7 +1089,7 @@ impl<'a> JudgeState<'a> {
             processed = self.processed,
             new_patterns = self.new_patterns,
             total_patterns = self.patterns.len(),
-            universe_counters = self.universe.count_ones(),
+            universe_counters = self.counters.len(),
             elapsed = %format!("{:.1}s", self.started.elapsed().as_secs_f64()),
             "backfill finished"
         );
@@ -1167,7 +1142,7 @@ fn archive_sparse_profile(profile: &std::path::Path, dest: &std::path::Path) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{StoreSnapshot, pattern_base_key};
+    use crate::store::pattern_base_key;
 
     /// `BackfillArgs` is a flattened `Args`, so parsing it in a test needs a
     /// `Parser` wrapper — which is also what exercises the real clap wiring
@@ -1277,23 +1252,13 @@ mod tests {
         let mut sorted = ids.to_vec();
         sorted.sort_unstable();
         let key = pattern_base_key(&sorted);
-        let rec = PatternRecord {
-            bits: bitmap.count_ones(),
-            bitmap,
-            first_block: rep,
-            last_block: rep,
-            hit_count: 1,
-            representative: rep,
-            representative_elapsed_ms: elapsed,
-        };
-        (key, rec)
+        (key, PatternRecord::first_seen(bitmap, rep, elapsed))
     }
 
     fn response(block: u64, counters: Vec<u64>, elapsed_ms: u64) -> WorkerResponse {
         WorkerResponse {
             block,
             block_hash: B256::repeat_byte(7),
-            ok: true,
             error: None,
             gas_ok: true,
             receipts_root_ok: true,
@@ -1316,12 +1281,8 @@ mod tests {
         dirs: Arc<DataDir>,
         patterns: Vec<(u64, PatternRecord)>,
     ) -> JudgeState<'a> {
-        let snapshot = StoreSnapshot {
-            counters: [(1u64, counter_info(0)), (2, counter_info(1)), (3, counter_info(2))].into(),
-            patterns: patterns.into_iter().collect(),
-            blocks: HashMap::new(),
-        };
-        JudgeState::new(snapshot, store, dirs, 10)
+        let counters = [(1u64, counter_info(0)), (2, counter_info(1)), (3, counter_info(2))];
+        JudgeState::new(counters.into(), patterns.into_iter().collect(), store, dirs, 10)
     }
 
     #[test]
@@ -1329,7 +1290,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Arc::new(DataDir::new(tmp.path()));
         dirs.ensure_layout().unwrap();
-        let store = Store::open(&dirs.store_path(), "test-id", Some("f")).unwrap();
+        let store = Store::open(&dirs.store_path(), "test-id", "f").unwrap();
         let (key, rec) = seeded_pattern(&[1, 2], &[0, 1], 100, 500);
         let mut judge = judge_with(&store, dirs, vec![(key, rec)]);
 
@@ -1366,7 +1327,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Arc::new(DataDir::new(tmp.path()));
         dirs.ensure_layout().unwrap();
-        let store = Store::open(&dirs.store_path(), "test-id", Some("f")).unwrap();
+        let store = Store::open(&dirs.store_path(), "test-id", "f").unwrap();
         // A dominator over dense 0..=3, so the new pattern {1, 4} is dominated
         // and archives no profile (id 4 will get dense 3, the next free one).
         let (key, rec) = seeded_pattern(&[1, 2, 3, 4], &[0, 1, 2, 3], 100, 500);
@@ -1386,37 +1347,6 @@ mod tests {
 
         let err = judge.ingest(response(201, vec![1, 5], 300)).expect_err("no detail for id 5");
         assert!(err.to_string().contains("never reported where it lives"), "{err}");
-    }
-
-    #[test]
-    fn spool_validation_rejects_wrong_or_damaged_block_json() {
-        let entry = |json: &[u8]| SpoolEntry {
-            block_json: json.to_vec(),
-            light_witness: stateless_core::LightWitness {
-                kvs: Default::default(),
-                levels: Default::default(),
-            },
-            code_hashes: vec![],
-        };
-
-        // Damaged inner JSON decodes fine as a bincode Vec<u8> but must fail
-        // validation.
-        assert!(validate_spool_entry(&entry(b"not json"), 7).is_err());
-
-        // A real fixture block validates against its own number and is
-        // rejected for any other.
-        let fixture_path = std::fs::read_dir("../../test_data/mainnet/blocks")
-            .expect("fixture dir")
-            .flatten()
-            .map(|e| e.path())
-            .find(|p| p.extension().is_some_and(|e| e == "json"))
-            .expect("at least one block fixture");
-        let fixture = std::fs::read(&fixture_path).expect("fixture");
-        let block: alloy_rpc_types_eth::Block<op_alloy_rpc_types::Transaction> =
-            serde_json::from_slice(&fixture).unwrap();
-        let n = block.header.inner.number;
-        assert!(validate_spool_entry(&entry(&fixture), n).is_ok());
-        assert!(validate_spool_entry(&entry(&fixture), n + 1).is_err());
     }
 
     /// Codes this run verified are not read again — the point of the cache —
@@ -1480,7 +1410,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Arc::new(DataDir::new(tmp.path()));
         dirs.ensure_layout().unwrap();
-        let store = Store::open(&dirs.store_path(), "test-id", Some("f")).unwrap();
+        let store = Store::open(&dirs.store_path(), "test-id", "f").unwrap();
         // Seed the dominator {1,2,3}.
         let (dom_key, dom_rec) = seeded_pattern(&[1, 2, 3], &[0, 1, 2], 100, 500);
         let mut judge = judge_with(&store, dirs.clone(), vec![(dom_key, dom_rec)]);
@@ -1496,7 +1426,7 @@ mod tests {
             "dominated pattern must not get an archived profile"
         );
         // Universe unchanged: the subset contributed nothing new.
-        assert_eq!(judge.universe.count_ones(), 3);
+        assert_eq!(judge.counters.len(), 3);
 
         // The store round-trips the newly committed pattern and block record
         // (the seeded dominator lived only in the in-memory snapshot).
@@ -1507,16 +1437,41 @@ mod tests {
         assert_eq!(snap.blocks[&200].pattern_key, Some(sub_key));
     }
 
+    /// The judge checks domination against the patterns that arrived
+    /// undominated, so a pattern that arrives undominated has to join them:
+    /// a later subset of it is dominated, and archives nothing.
+    #[test]
+    fn a_new_undominated_pattern_dominates_later_subsets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Arc::new(DataDir::new(tmp.path()));
+        dirs.ensure_layout().unwrap();
+        let store = Store::open(&dirs.store_path(), "test-id", "f").unwrap();
+        let mut judge = judge_with(&store, dirs.clone(), vec![]);
+        let with_profile = |block: u64, counters: Vec<u64>| {
+            let mut resp = response(block, counters, 100);
+            resp.profile = dirs.tmp().join(format!("block_{block}.profdata"));
+            std::fs::write(&resp.profile, b"sparse profdata").unwrap();
+            resp
+        };
+
+        judge.ingest(with_profile(100, vec![1, 2, 3])).unwrap();
+        assert!(dirs.archived_profile(pattern_base_key(&[1, 2, 3])).exists());
+        judge.ingest(with_profile(200, vec![1, 2])).unwrap();
+        assert!(
+            !dirs.archived_profile(pattern_base_key(&[1, 2])).exists(),
+            "{{1, 2}} is dominated by {{1, 2, 3}}, which arrived undominated"
+        );
+    }
+
     #[test]
     fn replay_error_and_divergence_fail_stop() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Arc::new(DataDir::new(tmp.path()));
         dirs.ensure_layout().unwrap();
-        let store = Store::open(&dirs.store_path(), "test-id", Some("f")).unwrap();
+        let store = Store::open(&dirs.store_path(), "test-id", "f").unwrap();
         let mut judge = judge_with(&store, dirs, vec![]);
 
         let mut bad = response(400, vec![1], 100);
-        bad.ok = false;
         bad.error = Some("boom".into());
         let err = judge.ingest(bad).unwrap_err();
         assert!(err.to_string().contains("ABORTING"), "{err}");

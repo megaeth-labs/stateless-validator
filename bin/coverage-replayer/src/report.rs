@@ -16,19 +16,16 @@
 //! them all. No source region is missing in that case; the items are keyed by
 //! source span precisely so that which instantiation ran does not matter.
 //!
-//! Run-once initializers — the per-hardfork precompile tables mega-evm and
-//! op-revm build lazily — read as uncovered: every worker builds them before
-//! it captures its first block (`worker::warm_up`), because they run once per
-//! process whatever the block, and crediting them to whichever block a worker
-//! happened to replay first made a block's coverage depend on scheduling.
+//! Run-once initializers (the per-hardfork precompile tables) read as
+//! uncovered: no block is credited with them — see `worker::warm_up`.
 
 use std::{path::PathBuf, process::Command};
 
 use clap::Args;
 use eyre::{Context, Result, ensure};
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::{llvm, setcover::Manifest, spool::DataDir};
+use crate::{llvm::LlvmArgs, setcover::Manifest, spool::DataDir};
 
 #[derive(Args, Debug, Clone)]
 pub struct ReportArgs {
@@ -38,23 +35,8 @@ pub struct ReportArgs {
     /// Manifest to report on (default: <data-dir>/manifest.json).
     #[clap(long)]
     pub manifest: Option<PathBuf>,
-    /// Source directories passed to llvm-cov as the report scope — they must be
-    /// the scope the scan used, which the manifest records and this checks.
-    /// Default: the same scope `backfill` defaults to, the mega-evm checkout
-    /// plus the crates in `measured-crates.txt`, found under the cargo home the
-    /// binary was built with.
-    ///
-    /// The scope is not just focus: reporting over the full coverage map
-    /// crashes llvm-cov (instantiation-group handling in some dependency
-    /// files).
-    #[clap(long = "source-dir")]
-    pub source_dirs: Vec<PathBuf>,
-    /// Explicit llvm-profdata path (default: auto-detect).
-    #[clap(long)]
-    pub llvm_profdata: Option<String>,
-    /// Explicit llvm-cov path (default: auto-detect).
-    #[clap(long)]
-    pub llvm_cov: Option<String>,
+    #[clap(flatten)]
+    pub llvm: LlvmArgs,
 }
 
 pub fn run(args: ReportArgs) -> Result<()> {
@@ -63,43 +45,29 @@ pub fn run(args: ReportArgs) -> Result<()> {
         "report must run from the instrumented build (its binary embeds the coverage map)"
     );
     let dirs = DataDir::new(&args.data_dir);
-    // Read-only over the data dir: a mistyped path must fail, not be scaffolded.
-    ensure!(
-        dirs.archive_profiles().is_dir() && dirs.tmp().is_dir(),
-        "{} holds no backfill data (no archive/profiles or tmp) — check --data-dir",
-        dirs.root.display()
-    );
     let manifest_path = args.manifest.unwrap_or_else(|| dirs.manifest_path());
-    let manifest: Manifest = serde_json::from_str(
-        &std::fs::read_to_string(&manifest_path)
-            .wrap_err_with(|| format!("read manifest {}", manifest_path.display()))?,
-    )?;
+    let manifest = Manifest::read(&manifest_path)?;
     ensure!(!manifest.blocks.is_empty(), "manifest has no blocks — run set-cover first");
-    let source_dirs = llvm::resolve_source_dirs(&args.source_dirs)?;
-    info!(dirs = ?source_dirs, "report scope");
+    let llvm = args.llvm.resolve()?;
+    info!(dirs = ?llvm.source_dirs, "report scope");
     check_manifest(
         &manifest,
         &manifest_path,
         &crate::store::current_binary_id(),
-        &llvm::universe_stamp(&source_dirs),
+        &llvm.universe(),
     )?;
 
-    let llvm_profdata = llvm::find_tool("llvm-profdata", args.llvm_profdata.as_deref())?;
-    let llvm_cov = llvm::find_tool("llvm-cov", args.llvm_cov.as_deref())?;
-
-    // A directory of this run's own, removed on every exit path: concurrent
-    // reports over one data dir would otherwise overwrite each other's inputs.
+    // A directory of this run's own, removed on every exit path. Outside the
+    // data dir: that belongs to whichever backfill holds its store.
     let work = tempfile::Builder::new()
-        .prefix("report-")
-        .tempdir_in(dirs.tmp())
-        .wrap_err_with(|| format!("create a work dir under {}", dirs.tmp().display()))?;
+        .prefix("coverage-report-")
+        .tempdir()
+        .wrap_err("create a work dir for the report")?;
     // Archived per-pattern profiles are zstd'd sparse profdata; inflate them
     // for llvm-profdata (profdata files are valid merge inputs).
     let mut profiles = Vec::new();
     for b in &manifest.blocks {
-        let key = u64::from_str_radix(&b.pattern, 16)
-            .wrap_err_with(|| format!("bad pattern key {}", b.pattern))?;
-        let z = dirs.archived_profile(key);
+        let z = dirs.archived_profile(b.pattern_key()?);
         ensure!(z.exists(), "archived profile missing for pattern {}: {}", b.pattern, z.display());
         let raw = zstd::decode_all(&std::fs::read(&z)?[..])
             .wrap_err_with(|| format!("decompress {}", z.display()))?;
@@ -108,19 +76,19 @@ pub fn run(args: ReportArgs) -> Result<()> {
         profiles.push(profile);
     }
     let merged = work.path().join("selected.profdata");
-    llvm::merge_sparse(&llvm_profdata, &profiles, &merged)?;
+    llvm.merge_sparse(&profiles, &merged)?;
 
     let exe = crate::profile_rt::own_executable()?;
     check_profiles_evaluate(
-        llvm::covered_items(&llvm_cov, &exe, &merged, &source_dirs)?.len() as u64,
+        llvm.covered_items(&exe, &merged)?.len() as u64,
         manifest.covered_counters,
     )?;
 
-    let report = Command::new(&llvm_cov)
+    let report = Command::new(&llvm.cov)
         .arg("report")
         .arg(&exe)
         .arg(format!("--instr-profile={}", merged.display()))
-        .args(&source_dirs)
+        .args(&llvm.source_dirs)
         .output()?;
     ensure!(
         report.status.success(),
@@ -162,9 +130,9 @@ fn check_profiles_evaluate(evaluated: u64, recorded: u64) -> Result<()> {
         evaluated == recorded,
         "the selected profiles evaluate to {evaluated} covered items under this binary, but the \
          cover recorded {recorded}: this binary's coverage map is not the one the scan measured \
-         (a rebuild renamed the instances the profiles are keyed by), so the report would \
-         misstate the coverage. Report with the binary that ran the scan, or re-run backfill \
-         with this one"
+         (a rebuild with other dependencies renamed the instances the profiles are keyed by), \
+         so the report would misstate the coverage. Report with the binary that ran the scan, \
+         or re-sweep the scan's blocks into a fresh data dir with this one"
     );
     Ok(())
 }
@@ -191,19 +159,13 @@ fn check_manifest(
         manifest_path.display(),
         manifest.binary_id,
     );
-    match &manifest.universe {
-        Some(covered) => ensure!(
-            covered == universe,
-            "manifest {} covers the universe {covered:?}, but this report measures {universe:?}: \
-             pass the --source-dir scope the scan used",
-            manifest_path.display(),
-        ),
-        None => warn!(
-            manifest = %manifest_path.display(),
-            "manifest predates recording its universe — the scope cannot be checked against \
-             the one it was computed over; re-run set-cover to record it"
-        ),
-    }
+    ensure!(
+        manifest.universe == universe,
+        "manifest {} covers the universe {:?}, but this report measures {universe:?}: pass the \
+         --source-dir scope the scan used",
+        manifest_path.display(),
+        manifest.universe,
+    );
     Ok(())
 }
 
@@ -213,10 +175,10 @@ mod tests {
 
     use super::*;
 
-    fn manifest(binary_id: &str, universe: Option<&str>) -> Manifest {
+    fn manifest(binary_id: &str, universe: &str) -> Manifest {
         Manifest {
             binary_id: binary_id.into(),
-            universe: universe.map(Into::into),
+            universe: universe.into(),
             generated_at_unix: 0,
             universe_counters: 1,
             covered_counters: 1,
@@ -231,7 +193,7 @@ mod tests {
     fn a_manifest_is_only_reported_over_the_scope_it_covers() {
         let path = Path::new("/d/manifest.json");
         let scan = "regions+branch-arms/v3:30ce038,revm-handler-8.1.0";
-        let m = manifest("id", Some(scan));
+        let m = manifest("id", scan);
 
         check_manifest(&m, path, "id", scan).expect("same scope, same build");
 
@@ -254,22 +216,5 @@ mod tests {
             let err = check_profiles_evaluate(evaluated, 13_060).expect_err("must refuse");
             assert!(err.to_string().contains("recorded 13060"), "{err}");
         }
-    }
-
-    /// Manifests written before the universe was recorded still report — the
-    /// build check applies, the scope cannot be checked, and a warning says so.
-    #[test]
-    fn a_manifest_without_a_universe_is_checked_on_build_alone() {
-        let m = manifest("id", None);
-        check_manifest(&m, Path::new("/d/m.json"), "id", "anything").expect("build matches");
-        let err = check_manifest(&m, Path::new("/d/m.json"), "other", "anything")
-            .expect_err("build differs");
-        assert!(err.to_string().contains("binary_id"), "{err}");
-
-        // And such a manifest still parses: the field is optional on disk.
-        let old = r#"{"binary_id":"id","generated_at_unix":0,"universe_counters":1,
-                      "covered_counters":1,"blocks":[]}"#;
-        let parsed: Manifest = serde_json::from_str(old).expect("pre-universe manifest parses");
-        assert_eq!(parsed.universe, None);
     }
 }
