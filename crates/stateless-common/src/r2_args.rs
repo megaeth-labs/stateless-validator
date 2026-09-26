@@ -7,10 +7,10 @@
 //! empty values twice, and the shared tuning flags were gated on one binary and silently
 //! ignored on the other.
 //!
-//! Enforced after parsing rather than through clap attributes because this workspace builds
-//! clap without its `error-context` feature, so a clap rejection names no argument — useless
-//! to an operator whose configuration is an env file. Every error raised here names the flag,
-//! in the spelling the calling binary uses for it.
+//! Enforced after parsing rather than through clap attributes: a blank env line reads as
+//! *presence* to clap, so clap would report a phantom conflict where the real fault is an empty
+//! value, and its wording would differ from rules it cannot express at all. Every error raised
+//! here names the flag, in the spelling the calling binary uses for it.
 
 use eyre::{Result, bail};
 use stateless_r2::fetch::CfAccessCredentials;
@@ -278,10 +278,9 @@ pub fn validate_r2_flags(flags: &R2Flags<'_>) -> Result<R2Config> {
 /// Parses the connection count, defaulting to a single connection when it is not set.
 ///
 /// It travels as a string rather than as a `usize` in the argument struct so that a blank line
-/// — what a templated env file renders for an unset variable — is diagnosed here, by name, at
-/// the point the R2 flags are actually read. Parsed by clap it would abort startup with clap's
-/// unnamed "invalid value for one of the arguments" (this workspace builds clap without
-/// `error-context`).
+/// — what a templated env file renders for an unset variable — is diagnosed here, with the rest
+/// of the R2 rules, like every other blank `--r2-*` value. Parsed by clap it would abort startup
+/// in clap's parser, before any of those rules run.
 fn parse_r2_connections(flag: R2Flag<'_>) -> Result<usize> {
     let Some(raw) = flag.value else { return Ok(1) };
     let Ok(count) = raw.parse::<usize>() else {
