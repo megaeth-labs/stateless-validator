@@ -1,5 +1,4 @@
-//! The worker subprocess speaks its protocol on stdout and nothing else does:
-//! drives the real binary as the dispatcher would and reads its answer.
+//! Drives the real worker binary as the dispatcher would: only protocol frames reach stdout.
 
 use std::{
     io::{BufRead, BufReader, Write},
@@ -10,8 +9,7 @@ use std::{
 fn a_worker_answers_on_stdout_with_one_frame_per_request() {
     let dir = tempfile::tempdir().unwrap();
     let genesis = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test_data/mainnet/genesis.json");
-    // The worker resolves its tools at startup; this request fails before
-    // either would run, so placeholders are enough.
+    // Placeholder tools pass startup resolution; this request fails before either runs.
     let tool = dir.path().join("llvm-tool");
     std::fs::write(&tool, b"").unwrap();
     let mut worker = Command::new(env!("CARGO_BIN_EXE_coverage-replayer"))
@@ -31,8 +29,7 @@ fn a_worker_answers_on_stdout_with_one_frame_per_request() {
         .spawn()
         .expect("spawn the worker");
 
-    // A block whose spool entry does not exist: the worker must answer it,
-    // as a failed block, rather than die.
+    // No spool entry for this block: the worker must answer it as failed rather than die.
     let mut stdin = worker.stdin.take().unwrap();
     writeln!(stdin, r#"{{"block":7}}"#).unwrap();
     drop(stdin);

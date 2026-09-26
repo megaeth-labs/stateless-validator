@@ -1,8 +1,5 @@
-//! Read-only store inspection: block/pattern/counter statistics.
-//!
-//! Unlike every other subcommand, `inspect` skips the binary-id namespace
-//! check so a store produced on another machine/build (e.g. copied from the
-//! server) can be analyzed locally. It never writes.
+//! Read-only store inspection: block/pattern/counter statistics. Unlike every other subcommand
+//! it skips the binary-id check, so another build's store can be analyzed. It never writes.
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -27,23 +24,15 @@ pub struct InspectArgs {
     /// How many top entries to print in rankings.
     #[clap(long, default_value_t = 10)]
     pub top: usize,
-    /// Also write the candidate block pool here, in the one-block-per-line
-    /// form `backfill --blocks-file` reads.
+    /// Also write the candidate block pool here, in the form `backfill --blocks-file` reads.
     ///
-    /// The pool is the ANTICHAIN's representatives, not the greedy cover.
-    /// The cover is minimal only for the counter universe of the build that
-    /// filled this store; a later build splits patterns this one merged, and
-    /// a cover carries no slack to absorb that. Everything left out was
-    /// strictly dominated — its coverage a subset of a kept block's — which
-    /// is the closest available stand-in for "adds nothing" and survives a
-    /// rebuild far better. Bitmaps die with the build; block numbers do not.
+    /// The pool is the ANTICHAIN's representatives, not the greedy cover: a cover is minimal
+    /// only for this build's universe and has no slack when a later build splits patterns this
+    /// one merged. Only strictly dominated patterns are left out.
     #[clap(long)]
     pub dump_pool: Option<PathBuf>,
-    /// Skip the antichain statistics and the greedy selection preview. They
-    /// run the real set-cover algorithm, which on a full-history store is
-    /// about half of this command's time; everything else is a single pass
-    /// over the tables. Incompatible with `--dump-pool`, which is made of the
-    /// antichain.
+    /// Skip the antichain statistics and the greedy selection preview (they run the real
+    /// set-cover). Incompatible with `--dump-pool`, which is made of the antichain.
     #[clap(long, conflicts_with = "dump_pool")]
     pub no_cover_preview: bool,
 }
@@ -124,9 +113,7 @@ pub fn run(args: InspectArgs) -> Result<()> {
     }
     println!();
 
-    // ---- set-cover dry run: THE algorithm (select_cover), not a copy — the
-    // antichain count and the selection preview cannot drift from a real
-    // `set-cover` run.
+    // ---- set-cover dry run: `select_cover` itself, so it cannot drift from `set-cover` ----
     if !args.no_cover_preview {
         let outcome = select_cover(&patterns);
         println!();
@@ -172,14 +159,9 @@ pub fn run(args: InspectArgs) -> Result<()> {
     Ok(())
 }
 
-/// Writes the candidate pool as a block list: `#` comment header carrying
-/// provenance, then one decimal block number per line, ascending. Returns
-/// how many blocks were written.
-///
-/// Concatenating several shards' pools and sorting is a valid union: block
-/// numbers are machine-stable, and a per-shard antichain is a superset of
-/// the global one (a pattern dominated only by one in another shard stays in
-/// its own shard's antichain), so the union errs toward keeping blocks.
+/// Writes the pool: a `#` provenance header, then one block number per line, ascending.
+/// Returns the block count. Several shards' pools concatenate into a valid union: a per-shard
+/// antichain is a superset of the global one, so the union errs toward keeping blocks.
 fn write_pool(
     path: &Path,
     patterns: &HashMap<u64, PatternRecord>,
@@ -218,10 +200,8 @@ mod tests {
         crate::store::test_support::block(BlockStatus::Ok, Some(pattern_key))
     }
 
-    /// A, B (equal bits, overlapping) and C, none dominated. Greedy reaches
-    /// full coverage with B and C alone, so A's block is exactly the kind the
-    /// cover discards and the pool must keep — that gap is the whole reason
-    /// the pool is the antichain rather than the manifest.
+    /// A, B (equal bits, overlapping) and C, none dominated: greedy covers all with B and C,
+    /// so A's block is one the cover discards and the pool must keep.
     fn three_patterns() -> HashMap<u64, PatternRecord> {
         [(1, pat(&[0, 1, 2, 3], 10)), (2, pat(&[0, 1, 2, 4], 20)), (3, pat(&[3, 4], 30))].into()
     }
@@ -250,8 +230,7 @@ mod tests {
         );
     }
 
-    /// The header is provenance a pool file carries across a rebuild, and
-    /// `backfill --blocks-file` must skip every line of it.
+    /// Every provenance header line must be a comment `backfill --blocks-file` skips.
     #[test]
     fn pool_header_records_provenance_and_stays_commented() {
         let patterns = three_patterns();
@@ -270,9 +249,7 @@ mod tests {
         );
     }
 
-    /// `run` end to end over a real redb store: the pool must come out of the
-    /// same antichain the dry run computes, and `--no-cover-preview` must
-    /// leave the rest of the report working.
+    /// `run` over a real store: the pool is the antichain, and `--no-cover-preview` still runs.
     #[test]
     fn run_exports_the_pool_from_a_real_store() {
         let dir = tempfile::tempdir().unwrap();

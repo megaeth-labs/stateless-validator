@@ -1,9 +1,6 @@
-//! Replays every mainnet fixture block through the exact execution path the
-//! coverage worker uses (LightWitness → WitnessDatabase → replay_block) and
-//! checks the gas/receipts-root/logs-bloom sanity triple against the header.
-//!
-//! Runs uninstrumented — it guards the replay glue in normal CI; coverage
-//! capture itself is exercised by the instrumented E2E runs.
+//! Replays every mainnet fixture block through the worker's execution path (LightWitness →
+//! WitnessDatabase → replay_block) and checks gas / receipts root / logs bloom against the
+//! header. Runs uninstrumented; coverage capture is exercised by the instrumented E2E runs.
 
 use stateless_core::{
     LightWitness, LightWitnessExecutor, WitnessDatabase, WitnessExternalEnv, chain_spec::ChainSpec,

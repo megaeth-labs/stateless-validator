@@ -1,11 +1,6 @@
-//! redb-backed persistence for the coverage-replayer dispatcher.
-//!
-//! All coverage data is namespaced by `binary_id` (a fingerprint of the
-//! measured build, see [`current_binary_id`]) and by the universe stamp (what
-//! a counter id means and which sources are in scope, see
-//! [`crate::llvm::universe_stamp`]): counter ids and dense indices are only
-//! meaningful for one build and one item definition. On mismatch the store
-//! refuses to open.
+//! redb-backed pattern store, namespaced by `binary_id` ([`current_binary_id`]) and the
+//! universe stamp ([`crate::llvm::universe_stamp`]): counter ids and dense indices mean
+//! something only within one namespace, so a store from another one refuses to open.
 
 use std::{
     collections::HashMap,
@@ -25,17 +20,14 @@ use crate::bitset::BitSet;
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 const COUNTERS: TableDefinition<u64, &[u8]> = TableDefinition::new("counters");
 const PATTERNS: TableDefinition<u64, &[u8]> = TableDefinition::new("patterns");
-/// One row per block ever scanned — tens of millions in a full-history store,
-/// against a working set (counters, patterns) bounded by the universe. So no
-/// reader loads it whole: [`Store::blocks`] streams a range,
-/// [`Store::block_records`] looks rows up by number.
+/// One row per block ever scanned; it grows with history, so no reader loads it whole:
+/// [`Store::blocks`] streams a range, [`Store::block_records`] looks rows up by number.
 const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("blocks");
 
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 const SCHEMA_VERSION: u32 = 1;
 
-/// Info about one coverage counter (id → dense index + provenance). The
-/// provenance fields are written for humans and never read back by any logic.
+/// One coverage counter: id → dense index, plus provenance for humans (never read by logic).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CounterInfo {
     pub dense: u32,
@@ -54,16 +46,13 @@ pub struct PatternRecord {
     pub first_block: u64,
     pub last_block: u64,
     pub hit_count: u64,
-    /// The lightest (min replay time) block seen exhibiting this pattern — the
-    /// best fixture candidate. Re-homed whenever a lighter block appears.
+    /// The lightest (min replay time) block seen with this pattern: the best fixture candidate.
     pub representative: u64,
-    /// Replay time of `representative`, to decide re-homing.
     pub representative_elapsed_ms: u64,
 }
 
 impl PatternRecord {
-    /// A pattern as one block exhibits it: that block is its whole range and
-    /// its representative.
+    /// A pattern as one block exhibits it: that block is its range and representative.
     pub fn first_seen(bitmap: BitSet, block: u64, elapsed_ms: u64) -> Self {
         Self {
             bits: bitmap.count_ones(),
@@ -76,9 +65,7 @@ impl PatternRecord {
         }
     }
 
-    /// Folds another record of the same bitmap into this one: hits add up,
-    /// the block range widens, and the representative moves to the lighter
-    /// block — whatever order the blocks arrived in.
+    /// Folds in another record of the same bitmap, whatever order the blocks arrived in.
     pub fn absorb(&mut self, other: &Self) {
         self.hit_count += other.hit_count;
         self.first_block = self.first_block.min(other.first_block);
@@ -89,10 +76,8 @@ impl PatternRecord {
         }
     }
 
-    /// Strict domination: `self` covers everything `other` does plus more.
-    /// The strictness (`bits >`, never `>=`) is load-bearing — equal-bits
-    /// distinct patterns must never dominate each other. Single definition
-    /// shared by the judge's archive-skip and set-cover's antichain prune.
+    /// Strict domination: `self` covers all of `other` and more (`bits >`, never `>=`: equal-bits
+    /// patterns must never dominate each other). Shared by the judge's archive skip and set-cover.
     pub fn dominates(&self, other: &Self) -> bool {
         self.bits > other.bits && other.bitmap.is_subset_of(&self.bitmap)
     }
@@ -120,12 +105,10 @@ pub struct BlockRecord {
     pub error: Option<String>,
 }
 
-/// The redb handle type selects the API: [`Database`] for the writer
-/// (backfill), [`ReadOnlyDatabase`] for pure readers (set-cover, inspect) —
-/// the write methods do not exist on a read-only store.
+/// The handle type selects the API: [`Database`] for the writer (backfill),
+/// [`ReadOnlyDatabase`] for readers (set-cover, inspect), which lack the write methods.
 pub struct Store<D = Database> {
     db: D,
-    /// Block commits so far (see [`Store::commit_block`]).
     commits: AtomicU64,
 }
 
@@ -133,14 +116,11 @@ pub struct Store<D = Database> {
 const COMMITS_PER_FLUSH: u64 = 64;
 
 impl Store {
-    /// Opens (or creates) the store and enforces the coverage namespace: the
-    /// `binary_id` and the universe stamp both have to match what the store
-    /// was created with (a fresh store is stamped with them), so counter ids
-    /// from two builds or two universes can never share it.
+    /// Opens (or creates and stamps) the store, refusing one stamped with another `binary_id`
+    /// or universe: counter ids from two builds or two universes can never share it.
     pub fn open(path: &Path, binary_id: &str, universe: &str) -> Result<Self> {
         let db = Database::create(path)?;
 
-        // Ensure all tables exist, then check/stamp namespace metadata.
         let txn = db.begin_write()?;
         {
             let mut meta = txn.open_table(META)?;
@@ -175,14 +155,11 @@ impl Store {
         Ok(Self { db, commits: AtomicU64::new(0) })
     }
 
-    /// Persists one judged block: its record, any new counters, and the
-    /// created/updated pattern — atomically in one transaction.
+    /// Persists one judged block (record, new counters, pattern) in one atomic transaction.
     ///
-    /// Only every [`COMMITS_PER_FLUSH`]th commit is flushed to disk; the ones
-    /// in between become durable with it, or with [`Self::flush`], and a crash
-    /// before then rolls them back whole — their blocks are then simply
-    /// replayed again. One flush per batch instead of one per block, so
-    /// whoever writes blocks flushes when done.
+    /// Only every [`COMMITS_PER_FLUSH`]th commit is flushed to disk; the ones in between become
+    /// durable with it or with [`Self::flush`], which a writer calls when done. A crash rolls
+    /// them back whole, and their blocks are simply replayed again.
     pub fn commit_block(
         &self,
         block: u64,
@@ -217,14 +194,9 @@ impl Store {
 }
 
 impl Store<ReadOnlyDatabase> {
-    /// Opens an existing store WITHOUT the binary-id namespace check, for
-    /// read-only inspection of data produced by another build (e.g. analyzing
-    /// a store copied from a server). Returns the store and its binary_id.
-    ///
-    /// The file is opened without write access under a shared lock, so a
-    /// store the caller cannot write (e.g. root-owned on a server) opens fine
-    /// and is never modified. In exchange, a store held open by a writer or
-    /// left unclean by a crash is refused rather than waited on or repaired.
+    /// Opens an existing store WITHOUT the binary-id check, returning it and its binary_id.
+    /// Needs no write access and never writes; in exchange, a store held open by a writer or
+    /// left unclean by a crash is refused, not waited on or repaired.
     pub fn open_readonly(path: &Path) -> Result<(Self, String)> {
         ensure!(path.exists(), "store {} does not exist", path.display());
         let db = ReadOnlyDatabase::open(path).map_err(|e| match e {
@@ -251,8 +223,7 @@ impl Store<ReadOnlyDatabase> {
         Ok((store, binary_id))
     }
 
-    /// [`Self::open_readonly`] for readers that interpret the store's dense
-    /// indices (set-cover): refuses a store another build filled.
+    /// [`Self::open_readonly`] for readers of dense indices: refuses a store another build filled.
     pub fn open_for_build(path: &Path, binary_id: &str) -> Result<Self> {
         let (store, stored) = Self::open_readonly(path)?;
         check_binary_id(path, &stored, binary_id)?;
@@ -280,8 +251,7 @@ impl<D: ReadableDatabase> Store<D> {
         read_table(&self.db.begin_read()?, PATTERNS)
     }
 
-    /// Visits the block records in `range`, in ascending block order, without
-    /// holding them (see [`BLOCKS`]).
+    /// Visits the block records in `range` in ascending order, without holding them.
     pub fn blocks(
         &self,
         range: impl std::ops::RangeBounds<u64>,
@@ -295,9 +265,7 @@ impl<D: ReadableDatabase> Store<D> {
         Ok(())
     }
 
-    /// Point lookups into BLOCKS, for a scattered set of blocks whose range
-    /// would span far more rows than it names; blocks never scanned are
-    /// absent from the result.
+    /// Point lookups for scattered blocks; blocks never scanned are absent from the result.
     pub fn block_records(&self, blocks: &[u64]) -> Result<HashMap<u64, BlockRecord>> {
         let txn = self.db.begin_read()?;
         let t = txn.open_table(BLOCKS)?;
@@ -332,10 +300,8 @@ fn check_binary_id(path: &Path, stored: &str, binary_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Rejects a store whose record encoding predates/postdates this binary —
-/// otherwise a format change surfaces as opaque bincode decode errors deep
-/// inside `read_table` instead of a clean mismatch message. Stores created
-/// before versioning are all schema 1.
+/// Rejects another record encoding with a clean message, not opaque bincode decode errors
+/// later. A store without a schema stamp is schema 1.
 fn check_schema_version<T>(meta: &T, path: &Path) -> Result<()>
 where
     T: redb::ReadableTable<&'static str, &'static [u8]>,
@@ -385,9 +351,7 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 /// Linear-probe step for pattern-key collisions (golden ratio).
 const PROBE_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 
-/// Base pattern key: FxHash64 of the pattern's counter ids in ascending
-/// order. Collisions between differing bitmaps are handled by
-/// [`resolve_pattern_slot`]'s linear probing.
+/// Base pattern key: FxHash64 of the ascending counter ids ([`resolve_pattern_slot`] probes).
 pub fn pattern_base_key(sorted_ids: &[u64]) -> u64 {
     use std::hash::Hasher;
     debug_assert!(sorted_ids.is_sorted());
@@ -398,11 +362,8 @@ pub fn pattern_base_key(sorted_ids: &[u64]) -> u64 {
     h.finish()
 }
 
-/// Walks the probe chain for `bitmap` starting at [`pattern_base_key`] of its
-/// sorted counter ids: returns `(slot_key, occupied)` where `occupied` means
-/// the slot already holds this exact bitmap (the caller folds into it with
-/// [`PatternRecord::absorb`]); otherwise the slot is vacant and the caller
-/// inserts.
+/// Walks the probe chain from [`pattern_base_key`]: returns `(slot_key, occupied)`, where
+/// `occupied` means the slot already holds this exact bitmap, and otherwise it is vacant.
 pub fn resolve_pattern_slot(
     patterns: &HashMap<u64, PatternRecord>,
     sorted_ids: &[u64],
@@ -418,18 +379,13 @@ pub fn resolve_pattern_slot(
     }
 }
 
-/// Coverage namespace key: a fingerprint of the instrumented build being
-/// measured, NOT a whole-exe hash. Stays stable across edits to this tool's
-/// code (so a resumed run can continue a store `backfill` started) and
-/// changes whenever what a profile or a counter means could: mega-evm's
-/// revision, the measured crates and their versions, `rustc -vV`, and the
-/// lockfile. The lockfile because a profile names each instance of the
-/// measured generics by its symbol, which carries the cargo metadata of the
-/// workspace crate instantiating it — and that metadata moves with any
-/// dependency or version change, so a build with other dependencies cannot
-/// read this store's archived profiles. Captured at compile time by build.rs.
-/// What it cannot see (features, compiler flags) `report` still catches, by
-/// re-deriving the covered items.
+/// Coverage namespace key: a fingerprint of the measured build, NOT a whole-exe hash, so edits
+/// to this tool's code keep a store resumable. It changes whenever what a profile or counter
+/// means could: mega-evm's revision, the measured crates and versions, `rustc -vV`, and the
+/// lockfile — a profile names each measured generic instance by a symbol carrying the cargo
+/// metadata of the instantiating crate, which moves with any dependency or version change, so
+/// other dependencies cannot read the archived profiles. Captured by build.rs; what it cannot
+/// see (features, compiler flags) `report` catches by re-deriving the covered items.
 pub fn current_binary_id() -> String {
     use std::hash::Hasher;
     let mega_evm = env!("COVERAGE_MEGA_EVM_REV");
@@ -446,9 +402,7 @@ pub fn current_binary_id() -> String {
     format!("megaevm:{}:fx{:016x}", &mega_evm[..mega_evm.len().min(12)], h.finish())
 }
 
-/// Sorted-sample summary for per-block worker times: `(avg, p50, p95, max)`.
-/// Returns `None` for an empty sample. Shared by the backfill summary and
-/// `inspect`.
+/// `(avg, p50, p95, max)` of per-block worker times (sorts in place); `None` if empty.
 pub fn elapsed_stats(samples: &mut [u64]) -> Option<(f64, u64, u64, u64)> {
     if samples.is_empty() {
         return None;
@@ -473,7 +427,6 @@ pub(crate) mod test_support {
         PatternRecord::first_seen(BitSet::from_indices(bits.iter().copied()), rep, 100)
     }
 
-    /// A block record with the given status and pattern.
     pub(crate) fn block(status: BlockStatus, pattern_key: Option<u64>) -> BlockRecord {
         BlockRecord {
             hash: B256::ZERO,
@@ -499,9 +452,7 @@ mod tests {
         test_support::block(status, None)
     }
 
-    /// The collision branch of the probing walk: a different bitmap at the
-    /// base key must step by exactly `PROBE_STEP`; the same bitmap parked one
-    /// step out must be found as occupied.
+    /// Probing steps by exactly `PROBE_STEP` past another bitmap, and finds its own as occupied.
     #[test]
     fn probe_collision_walks_probe_step() {
         let ids = [100u64, 200, 300];
@@ -522,7 +473,6 @@ mod tests {
             "the same bitmap must be found at its probed slot"
         );
 
-        // A second colliding stranger pushes the walk one more step.
         let other = rec(&[3, 4]);
         assert_eq!(
             resolve_pattern_slot(&patterns, &ids, &other.bitmap),
@@ -537,7 +487,6 @@ mod tests {
         drop(Store::open(&path, "megaevm:aaa:fx1", "u").unwrap());
         let err = Store::open(&path, "megaevm:bbb:fx2", "u").err().expect("must fail");
         assert!(err.to_string().contains("belongs to binary_id"), "got: {err}");
-        // Readers that interpret dense indices refuse it the same way.
         let err = Store::open_for_build(&path, "megaevm:bbb:fx2").err().expect("must fail");
         assert!(err.to_string().contains("belongs to binary_id"), "got: {err}");
     }
@@ -547,7 +496,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("store.redb");
         drop(Store::open(&path, "id", "regions+branch-arms/v1:/src").unwrap());
-        // Same stamp reopens fine; a different one is refused.
         drop(Store::open(&path, "id", "regions+branch-arms/v1:/src").unwrap());
         let err =
             Store::open(&path, "id", "regions+branch-arms/v1:/other").err().expect("must fail");
@@ -578,9 +526,7 @@ mod tests {
         assert!(err.to_string().contains("schema"), "open_readonly: {err}");
     }
 
-    /// `inspect` reads stores the caller does not own (root-owned
-    /// on a server, a read-only copy): the read-only open must need no write
-    /// access and leave the file byte-identical.
+    /// `inspect` reads stores the caller does not own: no write access, file left byte-identical.
     #[cfg(unix)]
     #[test]
     fn open_readonly_needs_no_write_access_and_never_writes() {
@@ -605,8 +551,7 @@ mod tests {
         assert!(std::fs::read(&path).unwrap() == before, "read-only open modified the store");
     }
 
-    /// A live writer holds redb's exclusive lock; the read-only open must be
-    /// refused with an actionable message, not a bare lock error.
+    /// A live writer's lock refuses the read-only open with an actionable message.
     #[test]
     fn open_readonly_refuses_store_held_by_writer() {
         let dir = tempfile::tempdir().unwrap();
@@ -616,9 +561,7 @@ mod tests {
         assert!(err.to_string().contains("held open read-write"), "got: {err}");
     }
 
-    /// A scattered pool's extremes span the whole history, so the point
-    /// lookups must return exactly the named rows — never the range between
-    /// them — while a range read returns exactly the range.
+    /// Point lookups return only the named rows, never the span between; a range, just the range.
     #[test]
     fn block_reads_return_exactly_what_was_asked_for() {
         let dir = tempfile::tempdir().unwrap();
@@ -627,8 +570,7 @@ mod tests {
             store.commit_block(n, &block(BlockStatus::Ok), &[], None).unwrap();
         }
 
-        // 5 and 20 are the extremes; 10 and 15 lie between them and must not
-        // come back. 99 was never scanned and is simply absent.
+        // 10 and 15 lie between the named extremes; 99 was never scanned.
         let mut named: Vec<u64> = store.block_records(&[5, 20, 99]).unwrap().into_keys().collect();
         named.sort_unstable();
         assert_eq!(named, vec![5, 20], "only the named rows, not the span between them");

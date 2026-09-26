@@ -1,33 +1,18 @@
 //! LLVM tool discovery and `.profraw` → covered-item extraction.
 //!
-//! A coverage "counter" in this tool is an *evaluated* coverage item — a
-//! region entry or one arm of a branch, as `llvm-cov` computes it — and NOT a
-//! physical instrumentation counter. The distinction is load-bearing: rustc
-//! minimizes physical counters, so an `if`/`else` gets two of them (entry,
-//! then-arm) and the else-arm exists only as the expression `entry - then`.
-//! Over physical counters a block that takes only the else-arm shows
-//! `{entry}`, a strict subset of a then-only block's `{entry, then}`: it looks
-//! dominated, its profile is never archived, set-cover prunes it, and the
-//! "minimal" set silently loses a branch arm the scan had covered. No
+//! A covered item is an *evaluated* region entry or branch arm, as `llvm-cov` computes
+//! it, NOT a physical counter. rustc minimizes physical counters: an `if`/`else` gets two
+//! (entry, then-arm) and the else-arm exists only as the expression `entry - then`. An
+//! else-only block's `{entry}` would then look dominated by a then-only block's
+//! `{entry, then}`, and the minimal set would silently lose an arm the scan covered. No
 //! `-Z coverage-options` value turns that minimization off.
 //!
-//! So every block's profile goes through `llvm-cov export`, which evaluates
-//! the counter expressions against the binary's coverage map, and the items
-//! are read from its JSON: region-entry segments and branch arms with a
-//! non-zero count, keyed by source location. That is the same arithmetic
-//! `report` runs, so "covers every item ever observed" means what the report
-//! measures. The export is scoped to source directories — both because those
-//! define the universe, and because an unscoped export of this binary
-//! crashes llvm-cov (instantiation-group handling in some dependency files).
-//!
-//! The default scope is the mega-evm checkout plus revm's execution engine
-//! (`measured-crates.txt`). mega-evm shapes execution *through* revm — its
-//! host and handler are type arguments of revm's generic interpreter — so
-//! which EVM paths mainnet exercises is a fact about revm's source as much as
-//! mega-evm's. Scoping by directory is also what keeps the rest out: a filter
-//! on symbol names cannot, because a mangled name carries its generic
-//! arguments and its instantiating crate, and under one such filter more than
-//! a third of the universe turned out to be k256, generic-array and friends.
+//! So every block's profile goes through `llvm-cov export`, which evaluates the counter
+//! expressions — the same arithmetic `report` runs. The export is scoped to source
+//! directories, which define the universe (an unscoped export of this binary also crashes
+//! llvm-cov). The default scope is the mega-evm checkout plus `measured-crates.txt`;
+//! scoping by directory, not symbol name, keeps other crates out, since a mangled name
+//! carries its generic arguments and instantiating crate.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -40,12 +25,9 @@ use eyre::{Context, Result, ensure};
 use rustc_hash::FxHasher;
 use serde::{Deserialize, Serialize};
 
-/// Version tag of the item definition below, stamped into every store (see
-/// [`universe_stamp`]). Bump it whenever the id, the set of item kinds, or what
-/// a block's bitmap records changes: bitmaps from two definitions must never
-/// share a store or a manifest. v3: a worker builds its run-once
-/// tables before it captures anything (`worker::warm_up`), so no block is
-/// credited with them any more.
+/// Version of the item definition, stamped into every store (see [`universe_stamp`]). Bump
+/// it whenever the id, the set of item kinds, or what a block's bitmap records changes (e.g.
+/// what `worker::warm_up` keeps out of it): two definitions must never share a store.
 const ITEM_UNIVERSE: &str = "regions+branch-arms/v3";
 
 /// What a covered item is, for the provenance columns of the store.
@@ -81,12 +63,9 @@ pub struct CoveredItem {
     pub line: u32,
 }
 
-/// Stable 64-bit id of a covered item. FxHasher is seed-free and
-/// deterministic across processes and machines. `scoped_path` is the source
-/// dir's own name followed by the path inside it (`revm-handler-8.1.0/src/
-/// lib.rs`): the name keeps two scoped crates' `src/lib.rs` apart, and leaving
-/// out everything above it keeps the id independent of where a checkout or
-/// registry lives.
+/// Stable 64-bit id of a covered item (FxHasher is seed-free and deterministic). `scoped_path`
+/// starts at the root's label (`revm-handler-8.1.0/src/lib.rs`): that keeps two crates'
+/// `src/lib.rs` apart, and dropping the path above it keeps ids independent of where roots live.
 fn item_id(kind: ItemKind, scoped_path: &str, span: [u32; 4]) -> u64 {
     let mut h = FxHasher::default();
     h.write(kind.as_str().as_bytes());
@@ -99,50 +78,37 @@ fn item_id(kind: ItemKind, scoped_path: &str, span: [u32; 4]) -> u64 {
     h.finish()
 }
 
-/// A source root's label: its final component — `revm-handler-8.1.0` for a
-/// registry crate, the short rev for the mega-evm checkout. It identifies the
-/// root without saying where it lives, which is what lets scans run under
-/// different `$HOME`s carry the same item ids and the same universe stamp.
-/// [`resolve_source_dirs`] rejects a scope whose labels are not unique, so the
-/// lossy conversion and the fallback below cannot silently merge two roots.
+/// A source root's label: its final component (`revm-handler-8.1.0`, or the mega-evm short
+/// rev), naming the root without where it lives. [`resolve_source_dirs`] rejects duplicate
+/// labels, so the lossy conversion and fallback below cannot merge two roots.
 fn root_label(dir: &Path) -> String {
     dir.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| dir.display().to_string())
 }
 
-/// The universe stamp a store is namespaced by, next to `binary_id`: the item
-/// definition plus the source scope. Two runs whose stamps differ would fill
-/// one store with ids from different universes.
-///
-/// Built from labels rather than paths, and sorted: stamps are compared byte
-/// for byte, so the same scope must stamp identically whatever home directory
-/// it was resolved under and whatever order its roots were listed in.
+/// The universe stamp a store is namespaced by, next to `binary_id`: the item definition
+/// plus the source scope. Built from sorted labels, not paths: stamps are compared byte for
+/// byte, so one scope must stamp identically whatever its home or root order.
 pub fn universe_stamp(source_dirs: &[PathBuf]) -> String {
     let mut labels: Vec<String> = source_dirs.iter().map(|d| root_label(d)).collect();
     labels.sort();
     format!("{ITEM_UNIVERSE}:{}", labels.join(","))
 }
 
-/// The coverage scope and the LLVM tools that evaluate it — shared by
-/// `backfill` (which hands its resolution on to every worker) and `report`.
+/// The coverage scope and the LLVM tools that evaluate it, shared by `backfill` and `report`.
 #[derive(clap::Args, Debug, Clone)]
 pub struct LlvmArgs {
-    /// Source directories scoping the coverage universe. `backfill` stamps its
-    /// store with them, and `report` refuses a manifest computed over any
-    /// other scope. Default: the mega-evm checkout this binary was built
-    /// against plus the crates in `measured-crates.txt` at their locked
-    /// versions, found under the cargo home the build used. llvm-cov matches
-    /// the absolute paths baked in at build time, so the sources must sit
-    /// where they sat for the build.
+    /// Source directories scoping the coverage universe; the store is stamped with them and
+    /// `report` refuses a manifest over any other scope. Default: the built-against mega-evm
+    /// checkout plus `measured-crates.txt` at their locked versions, under the build's cargo
+    /// home. Sources must sit at the absolute paths they had at build time.
     #[clap(long = "source-dir")]
     pub source_dirs: Vec<PathBuf>,
-    /// Explicit llvm-profdata path (default: the `llvm-tools` of the
-    /// toolchain that built this binary).
+    /// llvm-profdata path (default: the `llvm-tools` of the toolchain that built this binary).
     #[clap(long)]
     pub llvm_profdata: Option<PathBuf>,
-    /// Explicit llvm-cov path (default: the `llvm-tools` of the toolchain that
-    /// built this binary).
+    /// llvm-cov path (default: the `llvm-tools` of the toolchain that built this binary).
     #[clap(long)]
     pub llvm_cov: Option<PathBuf>,
 }
@@ -172,8 +138,7 @@ impl Llvm {
         universe_stamp(&self.source_dirs)
     }
 
-    /// The flags that pass this resolution on to a worker, so every worker of
-    /// a run evaluates exactly what the dispatcher resolved.
+    /// Flags passing this resolution to a worker, so workers evaluate exactly what was resolved.
     pub fn to_args(&self) -> Vec<OsString> {
         let mut args: Vec<OsString> = vec![
             "--llvm-profdata".into(),
@@ -187,14 +152,9 @@ impl Llvm {
         args
     }
 
-    /// Turns one block's profraw into its covered items, leaving the sparse
-    /// profdata at `profdata` for the judge to archive.
-    ///
-    /// `llvm-profdata merge -sparse` drops every zero-count function, which is
-    /// almost all of them for a single block; `llvm-cov export` then evaluates
-    /// the counter expressions of what is left. `exe` must be the
-    /// instrumented binary that wrote the profraw — its coverage map is what
-    /// gives the counters their meaning.
+    /// Turns one block's profraw into its covered items, leaving the sparse profdata at
+    /// `profdata` for the judge to archive. `exe` must be the instrumented binary that wrote
+    /// the profraw: its coverage map is what gives the counters their meaning.
     pub fn extract_covered_items(
         &self,
         exe: &Path,
@@ -241,17 +201,15 @@ impl Llvm {
         Ok(())
     }
 
-    /// The covered items of `profdata` within the scope, evaluated against
-    /// the coverage map of `exe` — the one extraction both a block's bitmap
-    /// and `report`'s cross-check go through.
+    /// The covered items of `profdata` within the scope, evaluated against `exe`'s coverage
+    /// map — the one extraction both a block's bitmap and `report`'s cross-check go through.
     pub fn covered_items(&self, exe: &Path, profdata: &Path) -> Result<Vec<CoveredItem>> {
         let out = Command::new(&self.cov)
             .arg("export")
             .arg(exe)
             .arg(format!("--instr-profile={}", profdata.display()))
             .arg("--format=text")
-            // The per-function records are most of the output and carry
-            // nothing the file-level segments and branches do not.
+            // Per-function records are most of the output and add nothing to the file level.
             .arg("--skip-functions")
             .args(&self.source_dirs)
             .output()
@@ -265,11 +223,9 @@ impl Llvm {
     }
 }
 
-/// Resolves the source scope: the explicit `--source-dir`s, or the default —
-/// the mega-evm checkout this binary was built against plus the measured
-/// registry crates at their locked versions. Every directory must exist —
-/// llvm-cov collects the files under it from disk, and a scope that matches
-/// nothing would turn every block into an empty bitmap.
+/// Resolves the source scope: the explicit `--source-dir`s, or the default (mega-evm
+/// checkout plus measured crates). Every directory must exist: a scope that matches nothing
+/// would turn every block into an empty bitmap.
 fn resolve_source_dirs(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let dirs = if explicit.is_empty() {
         let cargo_home = Path::new(env!("COVERAGE_CARGO_HOME"));
@@ -284,9 +240,8 @@ fn resolve_source_dirs(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
     for dir in &dirs {
         ensure!(dir.is_dir(), "source dir {} does not exist", dir.display());
     }
-    // Both the item ids and the universe stamp identify a root by its label,
-    // so two roots sharing one would have their coverage silently merged
-    // while the stamp still claimed two distinct roots.
+    // Ids and stamp identify a root by its label: two roots sharing one would have their
+    // coverage silently merged while the stamp still claimed two.
     for (i, dir) in dirs.iter().enumerate() {
         let label = root_label(dir);
         if let Some(other) = dirs[..i].iter().find(|d| root_label(d) == label) {
@@ -298,9 +253,8 @@ fn resolve_source_dirs(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
                 dir.display(),
             );
         }
-        // Nested roots make "which root does this file belong to" depend on
-        // the order they were listed in, while the stamp is order-independent
-        // — the same scan would then produce two sets of ids under one stamp.
+        // Nested roots make a file's owning root depend on listing order, which the
+        // order-independent stamp cannot see: one stamp, two sets of ids.
         if let Some(outer) = dirs.iter().enumerate().find(|(j, d)| *j != i && dir.starts_with(d)) {
             eyre::bail!(
                 "source dir {} lies inside {} — pass disjoint roots",
@@ -312,12 +266,9 @@ fn resolve_source_dirs(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
-/// Finds `<name>-<version>` under the registry's unpacked sources of the cargo
-/// home the binary was built with. The directory above it is named after the
-/// index, which is not ours to guess — and cargo keeps one per index it has
-/// used, so the same version can sit under several. Only one of them is what
-/// the build compiled, and llvm-cov matches nothing under the others, so more
-/// than one candidate is a question for the operator rather than a pick.
+/// Finds `<name>-<version>` under the registry sources of the build's cargo home. Cargo
+/// keeps one tree per index it has used, and llvm-cov matches only the one the build
+/// compiled, so more than one candidate is a question for the operator rather than a pick.
 fn detect_registry_crate(cargo_home: &Path, name_version: &str) -> Result<PathBuf> {
     let src = cargo_home.join("registry").join("src");
     let candidates: Vec<PathBuf> = std::fs::read_dir(&src)
@@ -331,9 +282,8 @@ fn detect_registry_crate(cargo_home: &Path, name_version: &str) -> Result<PathBu
     one_candidate(candidates, &format!("the sources of {name_version} under {}", src.display()))
 }
 
-/// Finds the cargo git checkout of the mega-evm rev this binary was BUILT
-/// against (embedded by build.rs) — no runtime Cargo.lock parsing, no cwd
-/// dependence, and the rev can never disagree with the instrumented build.
+/// Finds the cargo git checkout of the mega-evm rev this binary was BUILT against (embedded
+/// by build.rs), so the rev can never disagree with the instrumented build.
 fn detect_mega_evm_checkout(cargo_home: &Path) -> Result<PathBuf> {
     let rev: String = env!("COVERAGE_MEGA_EVM_REV").chars().take(7).collect();
     ensure!(rev.len() == 7, "the built-against mega-evm rev {rev:?} is too short to locate");
@@ -349,8 +299,7 @@ fn detect_mega_evm_checkout(cargo_home: &Path) -> Result<PathBuf> {
     one_candidate(candidates, &format!("the mega-evm {rev} checkout under {}", checkouts.display()))
 }
 
-/// The one directory default scope detection found, or an error naming what
-/// to pass instead.
+/// The one directory default scope detection found, or an error naming what to pass.
 fn one_candidate(mut candidates: Vec<PathBuf>, what: &str) -> Result<PathBuf> {
     match candidates.len() {
         1 => Ok(candidates.remove(0)),
@@ -366,12 +315,9 @@ fn one_candidate(mut candidates: Vec<PathBuf>, what: &str) -> Result<PathBuf> {
     }
 }
 
-/// Locates an LLVM tool: explicit override → the sysroot of the toolchain that
-/// BUILT this binary → the sysroot of whatever `rustc` resolves to here →
-/// `$PATH`. The build's own toolchain comes first because its LLVM is the one
-/// whose profile and coverage-map formats the binary carries; the `rustc` on
-/// the current `$PATH` belongs to whichever toolchain the working directory
-/// selects, which outside the repository is usually another one.
+/// Locates an LLVM tool: explicit override → the sysroot of the toolchain that BUILT this
+/// binary (its LLVM wrote the binary's profile and coverage-map formats) → the sysroot of
+/// whatever `rustc` resolves to here → `$PATH`.
 fn find_tool(name: &str, cli_override: Option<&Path>) -> Result<PathBuf> {
     if let Some(p) = cli_override {
         ensure!(p.exists(), "{name} override does not exist: {}", p.display());
@@ -389,7 +335,6 @@ fn find_tool(name: &str, cli_override: Option<&Path>) -> Result<PathBuf> {
         return Ok(tool);
     }
 
-    // PATH fallback
     if let Ok(out) = Command::new("which").arg(name).output() &&
         out.status.success()
     {
@@ -404,8 +349,7 @@ fn find_tool(name: &str, cli_override: Option<&Path>) -> Result<PathBuf> {
     )
 }
 
-/// The first `<sysroot>/lib/rustlib/<triple>/bin/<name>` that exists, trying
-/// the sysroots in order.
+/// The first `<sysroot>/lib/rustlib/<triple>/bin/<name>` that exists, in sysroot order.
 fn find_in_sysroots<'a>(
     name: &str,
     sysroots: impl IntoIterator<Item = &'a PathBuf>,
@@ -419,19 +363,10 @@ fn find_in_sysroots<'a>(
     })
 }
 
-/// Fails unless every configured root prefixes at least one file llvm-cov
-/// listed.
-///
-/// Which files llvm-cov lists is decided by the coverage map and the scope,
-/// not by what a profile executed — so every root contributes the same files
-/// whatever was replayed, and a root contributing none is a configuration
-/// error rather than an uneventful block. It has to be checked per root:
-/// llvm-cov answers a root it cannot match with a warning on stderr and a
-/// success exit, so a stale one would silently contribute nothing while the
-/// store's stamp went on claiming its scope. Roots are matched as given, never
-/// canonicalized, because llvm-cov matches the absolute paths baked in at
-/// BUILD time — the sources must sit where they sat for the build, spelled
-/// the same way.
+/// Fails unless every configured root prefixes at least one file llvm-cov listed. The
+/// listed files depend on the coverage map and scope, not on what ran, so a root with none
+/// is misconfigured — and llvm-cov only warns about it on stderr and exits successfully.
+/// Roots are never canonicalized: llvm-cov matches build-time absolute paths as spelled.
 fn ensure_every_root_matched(filenames: &[&str], source_dirs: &[PathBuf]) -> Result<()> {
     for dir in source_dirs {
         ensure!(
@@ -447,14 +382,10 @@ fn ensure_every_root_matched(filenames: &[&str], source_dirs: &[PathBuf]) -> Res
     Ok(())
 }
 
-/// Parses `llvm-cov export --format=text --skip-functions` output.
-///
-/// Per file: `segments` are `[line, col, count, has_count, is_region_entry,
-/// is_gap]` and `branches` are `[line, col, end_line, end_col, true_count,
-/// false_count, ...]`. A generic function contributes one branch record per
-/// instantiation at the same source span; the arms are OR-ed across them,
-/// because the item is "this source arm was taken", not which instantiation
-/// took it.
+/// Parses `llvm-cov export --format=text --skip-functions` output. Per file, `segments` are
+/// `[line, col, count, has_count, is_region_entry, is_gap]` and `branches` are `[line, col,
+/// end_line, end_col, true_count, false_count, ...]`. A generic function has one branch
+/// record per instantiation at one span; arms are OR-ed, as the item is the source arm.
 pub fn parse_export(json: &str, source_dirs: &[PathBuf]) -> Result<Vec<CoveredItem>> {
     let root: serde_json::Value = serde_json::from_str(json).wrap_err("parse llvm-cov export")?;
     let files = root["data"][0]["files"]
@@ -471,8 +402,7 @@ pub fn parse_export(json: &str, source_dirs: &[PathBuf]) -> Result<Vec<CoveredIt
     let mut items = Vec::new();
     for file in files {
         let filename = file["filename"].as_str().unwrap_or_default();
-        // Roots are disjoint (`resolve_source_dirs`), so at most one prefixes
-        // this file and the first match is the only match.
+        // Roots are disjoint (`resolve_source_dirs`), so the first match is the only one.
         let rel = source_dirs
             .iter()
             .find_map(|dir| {
@@ -534,10 +464,8 @@ mod tests {
         items.iter().map(|i| i.id).collect()
     }
 
-    /// THE property physical counters violated. The two runs execute the same
-    /// function through different arms; over physical counters the else-only
-    /// run is `{entry}` ⊂ `{entry, then}` and gets pruned as dominated. Over
-    /// evaluated items each run must hold something the other lacks.
+    /// THE property physical counters violate: two runs through opposite arms of one function
+    /// must each hold an item the other lacks.
     #[test]
     fn opposite_branch_arms_never_dominate_each_other() {
         let then_only = parse_export(THEN_ONLY, &scope()).unwrap();
@@ -552,8 +480,7 @@ mod tests {
         assert_eq!(arms(&else_only), vec![ItemKind::BranchFalse]);
     }
 
-    /// Only region ENTRIES with a count are items: the `[3,13,0,false,..]`
-    /// style closing segments and the zero-count arm's regions are not.
+    /// Only region ENTRIES with a count are items, not closing or zero-count segments.
     #[test]
     fn counts_region_entries_with_a_nonzero_count_only() {
         let then_only = parse_export(THEN_ONLY, &scope()).unwrap();
@@ -572,8 +499,7 @@ mod tests {
         }
     }
 
-    /// Ids must not depend on where the checkout or registry lives, or the
-    /// same scan run under two homes would disagree.
+    /// Ids must not depend on where the checkout or registry lives.
     #[test]
     fn ids_do_not_depend_on_where_the_source_dir_lives() {
         let moved = THEN_ONLY.replace("/tmp/covfix/src", "/another/home/.cargo/src");
@@ -583,9 +509,7 @@ mod tests {
         assert!(here.iter().all(|i| i.location.starts_with("src/t.rs:")), "{}", here[0].location);
     }
 
-    /// Two scoped crates both have a `src/lib.rs`. The same span in each is
-    /// two items: without the root's label in the id they would collapse into
-    /// one, and covering either crate's line would "cover" both.
+    /// The same span in two roots' `src/lib.rs` is two items, not one.
     #[test]
     fn same_inner_path_in_two_source_dirs_does_not_collide() {
         let json = r#"{"data":[{"files":[
@@ -604,8 +528,7 @@ mod tests {
         );
     }
 
-    /// A generic function exports one branch record per instantiation at the
-    /// same span; an arm any instantiation took is one covered item.
+    /// An arm taken by any instantiation of a generic function is one covered item.
     #[test]
     fn branch_arms_are_merged_across_instantiations() {
         let json = r#"{"data":[{"files":[{"filename":"/s/a.rs","segments":[],
@@ -616,12 +539,8 @@ mod tests {
         assert_eq!(kinds, vec![ItemKind::BranchFalse, ItemKind::BranchTrue]);
     }
 
-    /// llvm-cov lists the files of the coverage map that fall under the
-    /// scope, whatever the block executed — so a root that contributes none
-    /// is a stale path, and llvm-cov reports that with a warning and a
-    /// success exit. Every root has to be checked, not just the scope as a
-    /// whole: a valid mega-evm root alongside a stale revm one would
-    /// otherwise pass while measuring no revm at all.
+    /// Every root is checked, not just the scope as a whole: a valid mega-evm root must not
+    /// mask a stale revm one.
     #[test]
     fn every_source_root_must_contribute_a_file() {
         let json = r#"{"data":[{"files":[
@@ -636,9 +555,8 @@ mod tests {
         assert_eq!(parse_export(json, &dirs[..1]).unwrap().len(), 1);
     }
 
-    /// The case a label (or any substring) test gets wrong: a stale root named
-    /// `src` "appears" in every other root's paths. Matching is by path
-    /// prefix, so it is refused all the same.
+    /// Matching is by path prefix, not substring: a stale root `src` is refused even though
+    /// `src` appears in every other root's paths.
     #[test]
     fn a_stale_root_is_refused_even_when_its_name_appears_in_other_paths() {
         let json = r#"{"data":[{"files":[
@@ -653,8 +571,7 @@ mod tests {
         parse_export(json, &[valid]).expect("the real root matches");
     }
 
-    /// A file with no covered region still counts as the root contributing:
-    /// the check is about the scope being matched, not about this block.
+    /// A file with no covered region still counts as its root contributing.
     #[test]
     fn a_root_whose_files_are_all_uncovered_still_counts() {
         let json = r#"{"data":[{"files":[
@@ -665,8 +582,7 @@ mod tests {
         assert_eq!(items.len(), 1, "only the covered region is an item");
     }
 
-    /// A scope matching nothing is a misconfiguration (sources not at the
-    /// build-time path), and must not pass for a block that covered nothing.
+    /// A scope matching nothing is a misconfiguration, not a block that covered nothing.
     #[test]
     fn empty_file_list_is_an_error_not_an_empty_block() {
         let err = parse_export(r#"{"data":[{"files":[]}]}"#, &scope()).expect_err("must fail");
@@ -680,8 +596,7 @@ mod tests {
         assert_eq!(universe_stamp(&[PathBuf::from("/x/mega")]), "regions+branch-arms/v3:mega");
     }
 
-    /// Stamps are compared byte for byte, so one scope must stamp identically
-    /// however homes are laid out — the item ids already do not depend on it.
+    /// One scope must stamp identically however homes are laid out.
     #[test]
     fn universe_stamp_does_not_depend_on_where_the_roots_live() {
         let alice = [
@@ -696,11 +611,7 @@ mod tests {
         assert_eq!(universe_stamp(&alice), "regions+branch-arms/v3:30ce038,revm-handler-8.1.0");
     }
 
-    /// Cargo keeps one unpacked tree per registry index it has used, so a
-    /// version can sit under several. Only the one the build compiled is
-    /// measurable, and which one that was is not visible from here: the
-    /// default scope must refuse to guess rather than pick whichever the
-    /// directory listing returned first.
+    /// A crate under two registry indexes is refused, not resolved by listing order.
     #[test]
     fn default_scope_refuses_a_crate_found_under_two_registry_indexes() {
         let home = tempfile::tempdir().unwrap();
@@ -723,8 +634,7 @@ mod tests {
         assert!(err.to_string().contains("could not find"), "{err}");
     }
 
-    /// The build's own toolchain wins over whatever `rustc` the working
-    /// directory resolves to: its LLVM wrote the formats the binary carries.
+    /// The build's own toolchain wins over whatever `rustc` the working directory resolves to.
     #[test]
     fn llvm_tools_come_from_the_first_sysroot_that_has_them() {
         let dir = tempfile::tempdir().unwrap();
@@ -743,11 +653,7 @@ mod tests {
         assert_eq!(find_in_sysroots("llvm-profdata", [&build, &runtime]), None);
     }
 
-    /// The scope gate. A label identifies a root in both the ids and the
-    /// stamp, so duplicates would merge two roots' coverage under one stamp
-    /// that still claimed two; nesting would make "which root owns this file"
-    /// depend on the order the roots were listed in, which the stamp — sorted
-    /// — cannot see.
+    /// Duplicate labels and nested roots are refused (see `resolve_source_dirs`).
     #[test]
     fn resolve_rejects_duplicate_labels_and_nested_roots() {
         let dir = tempfile::tempdir().unwrap();

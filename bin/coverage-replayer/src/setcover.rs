@@ -1,15 +1,9 @@
 //! Greedy set cover over the stored coverage patterns.
 //!
-//! Completeness contract: the selected set ALWAYS covers the full universe —
-//! greedy runs until no candidate adds a counter, and neither the antichain
-//! prune (dominated patterns contribute no unique counters) nor the
-//! redundancy-elimination pass (only drops picks fully covered by the rest)
-//! can reduce coverage. Minimality is best-effort on top of that, never at
-//! its expense.
-//!
-//! Gain ties go to the higher block number, so a store always yields the same
-//! selection. A final redundancy-elimination pass drops any selected block
-//! whose bitmap is covered by the union of the others.
+//! The selection ALWAYS covers the full universe: greedy runs until no candidate adds a
+//! counter, dominated patterns add no unique counter, and redundancy elimination only drops
+//! picks the rest cover. Minimality is best-effort on top, never at its expense. Gain ties go
+//! to the higher block number, so a store always yields the same selection.
 
 use std::path::{Path, PathBuf};
 
@@ -37,11 +31,8 @@ pub struct SetCoverArgs {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Manifest {
     pub binary_id: String,
-    /// The universe stamp of the store the cover was computed from — the
-    /// scope its blocks are guaranteed to cover. `report` refuses to measure
-    /// the set against any other scope: the archived profiles hold counters
-    /// for every instrumented crate, so llvm-cov would happily report a wider
-    /// scope than the cover was built for, and read the gap as uncovered code.
+    /// Universe stamp of the source store: the scope the cover is guaranteed to cover, and the
+    /// only one `report` will measure it against (see `report::check_manifest`).
     pub universe: String,
     pub generated_at_unix: u64,
     pub universe_counters: u64,
@@ -88,8 +79,7 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
     let dirs = DataDir::new(&args.data_dir);
     let binary_id = current_binary_id();
     let store = Store::open_for_build(&dirs.store_path(), &binary_id)?;
-    // Patterns only: selection never looks at a block record, and the hashes
-    // of the few selected representatives are point lookups afterwards.
+    // Patterns only: selection needs no block records; the picks' hashes are looked up after.
     let patterns = store.patterns()?;
 
     info!(patterns = patterns.len(), "computing greedy set cover");
@@ -99,8 +89,6 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
         antichain = patterns.len() - outcome.pruned_dominated.len(),
         "dominated patterns excluded from the candidates"
     );
-    // `selected` no longer contains these (select_cover drops them), so the
-    // removal set itself is the only place they can be reported from.
     for rep in &outcome.redundant_removed {
         info!(block = rep, "selected early but redundant after later picks — removed");
     }
@@ -128,8 +116,7 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
 
     let manifest = Manifest {
         binary_id,
-        // What backfill stamped the store with, not a re-derivation from
-        // flags: it cannot drift from the scan that produced the profiles.
+        // The store's own stamp, so it cannot drift from the scan that produced the profiles.
         universe: store.universe()?,
         generated_at_unix: unix_now(),
         universe_counters,
@@ -154,21 +141,17 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
 
 /// Result of the pure set-cover algorithm.
 pub struct CoverOutcome {
-    /// The final cover in selection order: `(pattern_key, representative,
-    /// gain)`. Redundancy-eliminated picks are already removed.
+    /// The final cover in selection order: `(pattern_key, representative, gain)`.
     pub selected: Vec<(u64, u64, u64)>,
-    /// Pattern keys strictly dominated by another pattern (excluded from the
-    /// candidate pool).
+    /// Keys of the strictly dominated patterns, excluded from the candidates.
     pub pruned_dominated: Vec<u64>,
-    /// Representatives dropped by the redundancy-elimination pass (for
-    /// logging; no longer present in `selected`).
+    /// Representatives dropped by redundancy elimination (not in `selected`; for logging).
     pub redundant_removed: Vec<u64>,
     pub universe_counters: u64,
     pub covered_counters: u64,
 }
 
-/// Pure greedy set cover with antichain pruning and a final
-/// redundancy-elimination pass.
+/// Pure greedy set cover with antichain pruning and a final redundancy-elimination pass.
 pub fn select_cover(
     patterns: &std::collections::HashMap<u64, crate::store::PatternRecord>,
 ) -> CoverOutcome {
@@ -178,10 +161,8 @@ pub fn select_cover(
     }
     let universe_counters = universe.count_ones();
 
-    // Antichain prune: a strict subset of another pattern can never improve
-    // the cover — and if left in, it could win a gain tie-break and select a
-    // block whose profile was never archived (dominated patterns skip the
-    // archive at promotion time).
+    // Antichain prune: a dominated pattern never improves the cover, and could win a tie-break
+    // and select a block with no archived profile (the judge never archives a dominated one).
     let (mut remaining, pruned_dominated) = split_antichain(patterns);
 
     // Greedy: max gain; ties go to the higher block number.
@@ -205,10 +186,8 @@ pub fn select_cover(
         selected.push((*key, rec.representative, gain));
     }
 
-    // Redundancy elimination: drop picks fully covered by the union of the
-    // others (an early large pick can become redundant after later picks).
-    // One pass suffices: dropping a pick only shrinks the others' union, so a
-    // pick found necessary stays necessary.
+    // Redundancy elimination: drop picks the others' union covers. One pass suffices: dropping
+    // a pick only shrinks the others' union, so a pick found necessary stays necessary.
     let mut keep = vec![true; selected.len()];
     for i in 0..selected.len() {
         let mut others = BitSet::new();
@@ -233,26 +212,15 @@ pub fn select_cover(
     }
 }
 
-/// Splits the patterns into the antichain — those no other pattern strictly
-/// dominates — and the keys of the dominated rest.
+/// Splits the patterns into the antichain — those no other pattern strictly dominates — and
+/// the keys of the dominated rest.
 ///
-/// Patterns are visited in descending `bits` order, so every possible
-/// dominator of a pattern (it needs strictly more bits) is classified before
-/// the pattern is reached. Domination is transitive, so testing against the
-/// kept set alone is complete: a pruned dominator was itself dominated by a
-/// kept pattern, which then dominates the candidate too. The kept set is
-/// therefore exactly the maximal elements, whatever order ties are visited in.
-///
-/// The naive form of this — test each pattern against every earlier one — is
-/// quadratic in the pattern count, and at full-history scale that scan, not
-/// the greedy cover, is where the time goes. Two things cut it down:
-///
-/// - only kept patterns are ever scanned (the dominated majority never dominates anything a kept
-///   pattern does not), and
-/// - an inverted index from counter to the kept patterns containing it turns "who could be a
-///   superset of this candidate?" into "who contains its rarest counter?" — a superset must contain
-///   every counter the candidate has, so the shortest posting list bounds the search, and a counter
-///   no kept pattern has proves the candidate maximal outright.
+/// Patterns are visited in descending `bits`, so every possible dominator (it needs strictly
+/// more bits) is classified first. Domination is transitive, so testing against kept patterns
+/// alone is complete: a pruned dominator was itself dominated by a kept pattern, which then
+/// dominates the candidate too — the kept set is exactly the maximal elements, whatever the tie
+/// order. An inverted index bounds the search: a superset must contain the candidate's rarest
+/// counter, and a counter no kept pattern has proves the candidate maximal outright.
 pub(crate) fn split_antichain(
     patterns: &std::collections::HashMap<u64, crate::store::PatternRecord>,
 ) -> (Vec<(&u64, &crate::store::PatternRecord)>, Vec<u64>) {
@@ -265,8 +233,7 @@ pub(crate) fn split_antichain(
     let mut postings: Vec<Vec<u32>> = Vec::new();
 
     for (key, rec) in ordered {
-        // The shortest posting list among the candidate's counters; `None`
-        // once some counter turns out to be in no kept pattern at all.
+        // Shortest posting list among the candidate's counters, unless one is in no kept pattern.
         let mut shortest: Option<&[u32]> = None;
         let mut has_unseen_counter = false;
         for counter in rec.bitmap.iter_ones() {
@@ -325,9 +292,7 @@ mod tests {
         (blocks, outcome)
     }
 
-    /// The quadratic scan `split_antichain` replaced, kept as the oracle: it
-    /// is obviously correct (every pattern against every earlier kept one),
-    /// just unusable at scale.
+    /// Obviously correct quadratic oracle: every pattern against every earlier kept one.
     fn split_antichain_reference(patterns: &HashMap<u64, PatternRecord>) -> (Vec<u64>, Vec<u64>) {
         let mut ordered: Vec<(&u64, &PatternRecord)> = patterns.iter().collect();
         ordered.sort_by_key(|(_, r)| std::cmp::Reverse(r.bits));
@@ -363,10 +328,8 @@ mod tests {
         }
     }
 
-    /// Hub patterns plus many patterns derived from them by dropping
-    /// counters — the shape real stores have (a few percent maximal, the rest
-    /// dominated) — salted with unrelated patterns, equal-bitmap twins (which
-    /// must never dominate each other) and an empty pattern.
+    /// Hub patterns plus many derived by dropping counters (real stores are mostly dominated),
+    /// salted with unrelated patterns, equal-bitmap twins and an empty pattern.
     fn random_store(
         seed: u64,
         universe: u32,
@@ -406,8 +369,7 @@ mod tests {
         patterns
     }
 
-    /// The indexed split must classify every pattern exactly as the quadratic
-    /// oracle does, on stores shaped like real ones.
+    /// The indexed split classifies every pattern exactly as the quadratic oracle does.
     #[test]
     fn indexed_antichain_split_matches_the_quadratic_oracle() {
         for seed in 1..=12u64 {
@@ -426,8 +388,7 @@ mod tests {
         }
     }
 
-    /// An empty bitmap has no counter to look up, so it takes the fallback
-    /// scan: it is dominated by any non-empty pattern, and kept only alone.
+    /// An empty bitmap (the fallback scan) is dominated by any non-empty pattern, kept only alone.
     #[test]
     fn empty_pattern_is_dominated_unless_alone() {
         let alone: HashMap<u64, PatternRecord> = [(1, pat(&[], 10))].into();
@@ -459,8 +420,7 @@ mod tests {
         assert_eq!(pruned, vec![2, 4]);
     }
 
-    /// Equal-bits patterns with different bitmaps must BOTH survive the prune
-    /// (the guard is strictly `bits >`, never `>=`).
+    /// Equal-bits patterns with different bitmaps must BOTH survive the prune.
     #[test]
     fn equal_bits_distinct_patterns_both_survive() {
         let patterns: HashMap<u64, PatternRecord> =
@@ -470,8 +430,7 @@ mod tests {
         assert!(outcome.pruned_dominated.is_empty());
     }
 
-    /// On a gain tie the higher block number is picked first, so the
-    /// selection does not depend on map iteration order.
+    /// A gain tie goes to the higher block, not to whatever map iteration order yields.
     #[test]
     fn gain_ties_go_to_the_higher_block() {
         let patterns: HashMap<u64, PatternRecord> =
@@ -479,8 +438,7 @@ mod tests {
         assert_eq!(select_cover(&patterns).selected[0].1, 99);
     }
 
-    /// The {a,b}+{c} vs {a,b,c} shape: greedy picks the superset first and
-    /// the smaller earlier patterns are never selected at all.
+    /// {a,b} + {c} vs {a,b,c}: only the superset is selected.
     #[test]
     fn superset_pattern_makes_smaller_ones_redundant() {
         let patterns: HashMap<u64, PatternRecord> = [
@@ -493,12 +451,10 @@ mod tests {
         assert_eq!(blocks, vec![30]);
     }
 
-    /// Redundancy elimination: a first big pick that later picks fully cover
-    /// gets removed from the final set.
+    /// A first big pick that later picks fully cover is removed from the final set.
     #[test]
     fn redundancy_elimination_drops_covered_first_pick() {
-        // A = {0..5} (biggest, picked first). B = {0,1,2,6}, C = {3,4,5,7}.
-        // After B and C are picked (each adds a fresh counter), A ⊆ B∪C.
+        // A (biggest) is picked first; B and C each add a fresh counter, and then A ⊆ B∪C.
         let patterns: HashMap<u64, PatternRecord> = [
             (1, pat(&[0, 1, 2, 3, 4, 5], 10)),
             (2, pat(&[0, 1, 2, 6], 20)),
@@ -508,7 +464,6 @@ mod tests {
         let (blocks, outcome) = cover(&patterns);
         assert_eq!(blocks, vec![20, 30]);
         assert!(outcome.redundant_removed.contains(&10));
-        // Coverage is still complete without the removed pick.
         assert_eq!(outcome.covered_counters, outcome.universe_counters);
     }
 }

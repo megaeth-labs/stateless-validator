@@ -1,11 +1,6 @@
-//! Captures a fingerprint of the coverage-relevant build at compile time.
-//!
-//! The coverage namespace (counter ids, and the symbols archived profiles are
-//! keyed by) is determined by the measured code, the toolchain and the
-//! dependency graph, NOT by this binary's orchestration code. Basing the
-//! store's `binary_id` on this fingerprint (rather than a whole-exe hash)
-//! means editing the dispatcher / adding subcommands does not invalidate an
-//! existing store.
+//! Captures a fingerprint of the coverage-relevant build at compile time: the measured
+//! code, toolchain and dependency graph, NOT this binary's orchestration code, so the
+//! store's `binary_id` survives edits to the dispatcher or new subcommands.
 
 use std::process::Command;
 
@@ -23,10 +18,8 @@ fn rustc(args: &[&str]) -> String {
 fn main() {
     let lock = std::fs::read_to_string("../../Cargo.lock")
         .expect("coverage-replayer build: cannot read the workspace Cargo.lock");
-    // mega-evm's locked git revision from the workspace lockfile. This is the
-    // namespace anchor, so a missing rev is a hard build error rather than a
-    // silent fallback: overriding mega-evm to a path dependency would
-    // otherwise collapse genuinely different builds into one store namespace.
+    // mega-evm's locked git rev anchors the namespace, so a missing one (e.g. a path
+    // override) is a build error rather than distinct builds sharing one namespace.
     let mega_evm = mega_evm_rev(&lock).expect(
         "coverage-replayer build: no git revision for `mega-evm` in Cargo.lock. \
              The store namespace (binary_id) is anchored on that rev; if you are \
@@ -34,10 +27,8 @@ fn main() {
              to fingerprint the override instead of building with a broken namespace.",
     );
 
-    // `rustc -vV` includes `release:`, `host:`, and `LLVM version:` lines —
-    // the plain `--version` string carries none of those, and both the host
-    // triple and the LLVM version can shift counter ids. Fingerprint all
-    // three lines.
+    // `rustc -vV`, unlike `--version`, carries the host triple and LLVM version, both of
+    // which can shift counter ids.
     let rustc_vv = rustc(&["-vV"]);
     let toolchain: String = rustc_vv
         .lines()
@@ -51,11 +42,8 @@ fn main() {
         "coverage-replayer build: unexpected `rustc -vV` output: {rustc_vv:?}"
     );
 
-    // The registry crates measured next to mega-evm, as `name-version` — the
-    // name of their directory under the cargo registry, which is where
-    // llvm-cov will look for their sources. Versions come from the lockfile,
-    // so the default scope can never name a version the binary was not built
-    // against.
+    // The measured registry crates as `name-version`, their registry directory name, with
+    // versions from the lockfile so the default scope never names one that was not built.
     let mut measured: Vec<String> = std::fs::read_to_string("measured-crates.txt")
         .expect("coverage-replayer build: measured-crates.txt is missing")
         .lines()
@@ -70,15 +58,11 @@ fn main() {
             versions.into_iter().map(move |v| format!("{name}-{v}"))
         })
         .collect();
-    // Sorted, because this list is hashed into `binary_id`: reordering
-    // measured-crates.txt must not look like a different instrumented build.
+    // Sorted: this list is hashed into `binary_id`, and reordering the file must not change it.
     measured.sort();
 
-    // Where the build found its sources and its LLVM. llvm-cov matches the
-    // absolute source paths baked into the coverage map, so the default scope
-    // is looked up under the cargo home the build used, not under whatever
-    // $HOME the binary later runs with; and the LLVM tools that read this
-    // binary's profiles are the ones shipped with the toolchain that built it.
+    // Where the build found its sources and its LLVM: the default scope and the LLVM tools
+    // are looked up there, not under whatever $HOME the binary later runs with.
     let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| {
         let home = std::env::var("HOME")
             .expect("coverage-replayer build: neither CARGO_HOME nor HOME is set");
@@ -91,8 +75,7 @@ fn main() {
     println!("cargo:rustc-env=COVERAGE_RUSTC_SYSROOT={sysroot}");
     println!("cargo:rerun-if-env-changed=CARGO_HOME");
     println!("cargo:rerun-if-env-changed=HOME");
-    // The lockfile as a whole: why it belongs in `binary_id` is on
-    // `store::current_binary_id`.
+    // The lockfile as a whole: why it belongs in `binary_id` is on `store::current_binary_id`.
     println!("cargo:rustc-env=COVERAGE_LOCKFILE_DIGEST={:016x}", fnv1a(lock.as_bytes()));
     println!("cargo:rustc-env=COVERAGE_MEGA_EVM_REV={mega_evm}");
     println!("cargo:rustc-env=COVERAGE_MEASURED_CRATES={}", measured.join(","));
@@ -102,17 +85,15 @@ fn main() {
     println!("cargo:rerun-if-changed=../../Cargo.lock");
 }
 
-/// FNV-1a, 64-bit: a stable digest without a dependency — the standard
-/// hasher's algorithm is free to change between releases, and the same build
-/// on two machines must agree on it.
+/// FNV-1a, 64-bit: a dependency-free digest that, unlike the standard hasher, cannot change
+/// between releases — the same build on two machines must agree on it.
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes
         .iter()
         .fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
 }
 
-/// Extracts the full git revision of the `mega-evm` package from Cargo.lock.
-/// The source line looks like:
+/// The full git rev of `mega-evm` in Cargo.lock, from its source line:
 /// `source = "git+https://github.com/megaeth-labs/mega-evm.git?tag=vX#<rev>"`.
 fn mega_evm_rev(lock: &str) -> Option<String> {
     let mut in_mega = false;

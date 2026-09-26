@@ -1,11 +1,7 @@
 //! On-disk spool entries: everything a worker needs to replay one block.
 //!
-//! Lifecycle: written by the fetcher, consumed by a worker, deleted after
-//! judgment — for every block, including new-pattern representatives. Nothing
-//! block-sized is retained: the RPC serves blocks and witnesses for the full
-//! history, so resweeps and PR payload assembly re-fetch representatives by
-//! block number (recorded in the store). The only per-pattern artifact kept
-//! is a small sparse profdata for `report`.
+//! Every entry is deleted after judgment; representatives are re-fetched by block number, so
+//! the only per-pattern artifact kept is a small sparse profdata for `report`.
 
 use std::{
     fs,
@@ -20,14 +16,12 @@ use serde::{Deserialize, Serialize};
 use stateless_core::LightWitness;
 
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
-/// zstd level for spool entries. The witness payload inside is already
-/// compressed, and spool files live for minutes — favor speed.
+/// Spool entries are short-lived and their witness is already compressed: favor speed.
 const SPOOL_ZSTD_LEVEL: i32 = 1;
 
 #[derive(Serialize, Deserialize)]
 pub struct SpoolEntry {
-    /// The RPC block re-serialized as JSON (`Block<op_alloy_rpc_types::Transaction>`),
-    /// the same shape `test_data/mainnet/blocks/*.json` uses.
+    /// The RPC block re-serialized as JSON (`Block<op_alloy_rpc_types::Transaction>`).
     #[serde(with = "as_bytes")]
     pub block_json: Vec<u8>,
     /// Execution witness (kvs + levels only, fast to decode).
@@ -40,12 +34,8 @@ impl SpoolEntry {
     pub fn write_to(&self, path: &Path) -> Result<()> {
         let raw = bincode::serde::encode_to_vec(self, BINCODE_CONFIG)
             .map_err(|e| eyre::eyre!("encode spool entry: {e}"))?;
-        // Frame checksum (xxhash, ~free): most of the entry is opaque
-        // high-entropy bytes (block_json, witness kvs) where a media-level
-        // bit flip would decode "successfully" into wrong data — with the
-        // checksum, ANY byte corruption fails `read_from`, which the fetcher
-        // treats as delete-and-refetch. Old checksum-less spool files still
-        // decode (the flag is per-frame).
+        // Frame checksum: most of the entry is opaque bytes where a bit flip would decode into
+        // wrong data; with it, any corruption fails `read_from` and the entry is refetched.
         let mut encoder = zstd::stream::Encoder::new(Vec::new(), SPOOL_ZSTD_LEVEL)?;
         encoder.include_checksum(true)?;
         std::io::Write::write_all(&mut encoder, &raw)?;
@@ -62,10 +52,8 @@ impl SpoolEntry {
         Ok(entry)
     }
 
-    /// Reads the entry for `block` and parses its block, checking it is the
-    /// one asked for: everything the worker needs before it can replay. A
-    /// resumed run opens leftover entries through here too, so an entry the
-    /// worker could not use is refetched rather than failing the run.
+    /// Reads the entry and parses its block, checking it is `block`: the single validity check,
+    /// shared by the worker and a resumed run's fetcher, which refetches an entry that fails it.
     pub fn open(path: &Path, block: u64) -> Result<Spooled> {
         let entry = Self::read_from(path)?;
         let parsed: Block<OpTransaction> = serde_json::from_slice(&entry.block_json)
@@ -84,9 +72,8 @@ impl SpoolEntry {
     }
 }
 
-/// `Vec<u8>` through serde's byte-array hooks. bincode writes the same bytes
-/// either way — a length, then the bytes — but through the sequence hooks it
-/// does so one element at a time, for every byte of a multi-megabyte block.
+/// `Vec<u8>` through serde's byte-array hooks: the same bincode bytes as the sequence hooks,
+/// without going one element at a time over a multi-megabyte block.
 mod as_bytes {
     use serde::{
         Deserializer, Serializer,
@@ -129,9 +116,8 @@ pub struct DataDir {
 }
 
 impl DataDir {
-    /// Pure path arithmetic — creates nothing. Writers call
-    /// [`Self::ensure_layout`]; read-only consumers (inspect, report) must not
-    /// scaffold empty trees in a mistyped or foreign path.
+    /// Pure path arithmetic, so read-only consumers never scaffold a mistyped or foreign path;
+    /// writers call [`Self::ensure_layout`].
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
@@ -170,37 +156,28 @@ impl DataDir {
     pub fn block_profraw(&self, block: u64) -> PathBuf {
         self.tmp().join(format!("block_{block}.profraw"))
     }
-    /// The sparse profdata a block's raw profile becomes — what the judge
-    /// archives when the block's pattern is new.
+    /// Sparse profdata of a block's raw profile; the judge archives it for a new pattern.
     pub fn block_profdata(&self, block: u64) -> PathBuf {
         self.tmp().join(format!("block_{block}.profdata"))
     }
     pub fn code_file(&self, hash: &B256) -> PathBuf {
         self.codes().join(format!("{hash:x}.bin"))
     }
-    /// Per-pattern sparse profdata (zstd) — only executed functions survive
-    /// the `llvm-profdata merge -sparse` conversion, so this is small; raw
-    /// profraws carry the whole binary's counter array plus an incompressible
-    /// name table (~2 MB even zstd'd) and are never archived.
-    ///
-    /// Keyed by pattern (not block) so re-homing a pattern's representative to
-    /// a lighter block never moves or orphans its profile — the profile is the
-    /// same regardless of which block produced it (identical bitmap).
+    /// Per-pattern sparse profdata (zstd); raw profraws are never archived. Keyed by pattern,
+    /// not block, so re-homing a pattern's representative never moves or orphans its profile.
     pub fn archived_profile(&self, pattern_key: u64) -> PathBuf {
         self.archive_profiles().join(format!("{pattern_key:016x}.profdata.zst"))
     }
 
-    /// Archives a new pattern's sparse profdata, zstd'd and durable — the
-    /// judge commits the pattern only once this has returned (see
-    /// [`write_atomic`]).
+    /// Archives a new pattern's profdata durably; the judge commits the pattern only once this
+    /// has returned (see [`write_atomic`]).
     pub fn archive_profile(&self, pattern_key: u64, profdata: &Path) -> Result<()> {
         let bytes =
             fs::read(profdata).wrap_err_with(|| format!("read profile {}", profdata.display()))?;
         write_atomic(&self.archived_profile(pattern_key), &zstd::encode_all(&bytes[..], 3)?)
     }
 
-    /// An archived profile, inflated back to the sparse profdata
-    /// `llvm-profdata` merges.
+    /// An archived profile, inflated back to the sparse profdata `llvm-profdata` merges.
     pub fn read_archived_profile(&self, pattern_key: u64) -> Result<Vec<u8>> {
         let path = self.archived_profile(pattern_key);
         let compressed = fs::read(&path).wrap_err_with(|| {
@@ -209,12 +186,8 @@ impl DataDir {
         zstd::decode_all(&compressed[..]).wrap_err_with(|| format!("decompress {}", path.display()))
     }
 
-    /// Removes what a previous run left mid-flight: every per-block file in
-    /// `tmp/`, and the `*.tmp` files of writers killed inside `write_atomic`
-    /// (unique names, never reused, so they would accumulate forever).
-    ///
-    /// Only for the holder of the store's write lock: it is the one process
-    /// that writes under these directories, so nothing found there is live.
+    /// Removes what a previous run left mid-flight: all of `tmp/`, and orphaned `*.tmp` files.
+    /// Only for the store's write-lock holder: as the sole writer here, nothing it finds is live.
     pub fn clear_leftovers(&self) -> usize {
         let mut removed = remove_files(&self.tmp(), |_| true);
         for dir in [self.spool(), self.codes(), self.archive_profiles()] {
@@ -223,8 +196,7 @@ impl DataDir {
         removed
     }
 
-    /// Loads contract bytecodes for the given hashes from the codes dir.
-    /// Returns the same `HashMap` flavor `WitnessDatabase.contracts` expects.
+    /// Loads the bytecodes for `hashes` from the codes dir, as `WitnessDatabase.contracts` expects.
     pub fn load_contracts(
         &self,
         hashes: &[B256],
@@ -243,26 +215,16 @@ impl DataDir {
     }
 }
 
-/// Write via unique tmp file + rename so readers never observe partial files,
-/// fsynced so the result survives power loss, not just process crashes.
-///
-/// The fsync-before-rename is load-bearing for the judge's archive-before-
-/// commit invariant: redb commits are fsynced, so if archived profiles were
-/// only in the page cache a power cut could persist the pattern while losing
-/// its profile — an orphan no re-run can repair (the block is already Ok).
-///
-/// The tmp name embeds pid + a counter: concurrent writers of the SAME target
-/// (e.g. two fetch tasks resolving one shared contract hash) must not collide
-/// on the tmp path — last rename wins and both writers succeed.
+/// Writes via a unique tmp file, fsync and rename: readers never see a partial file, and
+/// concurrent writers of one target both succeed (last rename wins). The fsync is load-bearing
+/// for the judge's archive-before-commit order: redb commits are fsynced, so an unsynced profile
+/// could be lost to a power cut while its pattern persists, an orphan no re-run can repair.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     write_renamed(path, bytes, true)
 }
 
-/// [`write_atomic`] without the fsyncs, for what a power loss may take with
-/// it: spool entries and contract codes, which every run checks before use
-/// (the spool's frame checksum and block number, the codes' keccak) and
-/// refetches when damaged. Both are written once per block, so the flushes
-/// would be most of their cost.
+/// [`write_atomic`] without the fsyncs, for spool entries and contract codes: every run checks
+/// them before use (frame checksum and block number, keccak) and refetches damaged ones.
 pub fn write_scratch(path: &Path, bytes: &[u8]) -> Result<()> {
     write_renamed(path, bytes, false)
 }
@@ -288,8 +250,7 @@ fn write_renamed(path: &Path, bytes: &[u8], durable: bool) -> Result<()> {
         }
         drop(f);
         fs::rename(&tmp, path).wrap_err_with(|| format!("rename to {}", path.display()))?;
-        // Make the rename itself durable. Directory fsync is best-effort:
-        // supported on Linux, may be a no-op/error elsewhere (macOS).
+        // Make the rename durable too; best-effort, as directory fsync may fail off Linux.
         if durable &&
             let Some(parent) = path.parent() &&
             let Ok(dir) = fs::File::open(parent)
@@ -299,7 +260,6 @@ fn write_renamed(path: &Path, bytes: &[u8], durable: bool) -> Result<()> {
         Ok(())
     })();
     if result.is_err() {
-        // ENOSPC/rename failure: don't leave the tmp file behind.
         let _ = fs::remove_file(&tmp);
     }
     result
@@ -335,10 +295,7 @@ mod tests {
         }
     }
 
-    /// Any single corrupted byte in a spool file must fail `read_from` (the
-    /// zstd frame checksum) — most of the entry is opaque high-entropy bytes
-    /// where corruption would otherwise decode into silently wrong data, and
-    /// the fetcher's delete-and-refetch self-heal keys off this error.
+    /// Any single corrupted byte must fail `read_from`: the fetcher's refetch keys off it.
     #[test]
     fn spool_checksum_rejects_any_byte_corruption() {
         let dir = tempfile::tempdir().unwrap();
@@ -347,7 +304,6 @@ mod tests {
         assert!(SpoolEntry::read_from(&path).is_ok());
 
         let clean = fs::read(&path).unwrap();
-        // Flip one bit in the middle of the payload region.
         for at in [clean.len() / 2, clean.len() - 8] {
             let mut damaged = clean.clone();
             damaged[at] ^= 0x01;
@@ -356,9 +312,7 @@ mod tests {
         }
     }
 
-    /// A damaged inner block decodes fine as the envelope's opaque bytes, so
-    /// `open` must parse it; and an entry holding another block is not this
-    /// block's.
+    /// `open` must parse the block (opaque bytes to the envelope) and reject another block's.
     #[test]
     fn open_rejects_an_unparsable_or_wrong_block() {
         let dir = tempfile::tempdir().unwrap();
@@ -383,8 +337,7 @@ mod tests {
         assert!(err.to_string().contains("expected"), "{err}");
     }
 
-    /// The byte-array hooks change how fast `block_json` is written, not what
-    /// is written: an entry encoded before them must decode after them.
+    /// `as_bytes` must encode `block_json` exactly as a plain `Vec<u8>` field does.
     #[test]
     fn block_json_bytes_encode_as_the_plain_vec_did() {
         #[derive(Serialize)]
@@ -425,8 +378,7 @@ mod tests {
         assert_eq!(tmp_files(dir.path()), 0, "failed write must clean its tmp file");
     }
 
-    /// Everything in `tmp/` is per-block scratch; elsewhere only orphaned
-    /// `write_atomic` temps go, never the data next to them.
+    /// All of `tmp/` goes; elsewhere only orphaned write temps, never the data beside them.
     #[test]
     fn clear_leftovers_takes_scratch_and_orphaned_temps_only() {
         let dir = tempfile::tempdir().unwrap();

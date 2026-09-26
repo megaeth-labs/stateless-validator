@@ -1,16 +1,10 @@
-//! Resident coverage worker subprocess.
+//! Resident coverage worker subprocess (`internal-worker`): reads one JSONL [`WorkerRequest`] per
+//! stdin line, replays the block with per-block counter isolation, and answers with one
+//! [`WorkerResponse`] on stdout, which it holds exclusively (see [`protocol_channel`]).
 //!
-//! Spawned by the dispatcher as `coverage-replayer internal-worker ...`. Reads
-//! one JSONL [`WorkerRequest`] per line from stdin, replays the block with
-//! per-block counter isolation (reset → execute → write profraw), extracts the
-//! covered items, and answers with one JSONL [`WorkerResponse`] on stdout —
-//! which it holds exclusively (see [`protocol_channel`]).
-//!
-//! The worker deliberately does NOT verify the witness or recompute state
-//! roots — correctness is guaranteed by the production stateless validator.
-//! It only keeps the free sanity comparison of `gas_used` / `receipts_root` /
-//! `logs_bloom` against the block header, which catches chain-spec drift
-//! before it can poison the coverage store.
+//! It does not verify the witness or state roots (the production validator does); it only
+//! compares `gas_used` / `receipts_root` / `logs_bloom` with the header, which catches
+//! chain-spec drift before it can poison the coverage store.
 
 use std::{
     collections::HashSet,
@@ -41,17 +35,14 @@ pub struct WorkerArgs {
     /// The run's data directory: contract codes in, per-block profiles out.
     #[clap(long)]
     pub data_dir: PathBuf,
-    /// Passed on by the dispatcher already resolved (`Llvm::to_args`), so
-    /// every worker of a run evaluates the same scope with the same tools.
+    /// Resolved by the dispatcher (`Llvm::to_args`), so all workers share one scope and toolset.
     #[clap(flatten)]
     pub llvm: LlvmArgs,
 }
 
-/// Loads the chain spec a worker replays under. The dispatcher calls this
-/// too, before launching any worker: a worker that cannot start looks, from
-/// outside, exactly like one that crashed mid-block, and blocks are retried
-/// forever by policy — so a mistyped `--genesis-file` has to fail the run up
-/// front rather than wedge it in a respawn loop.
+/// Loads the chain spec a worker replays under. The dispatcher calls it up front too: a worker
+/// that cannot start looks like one that crashed mid-block, and blocks are retried forever, so a
+/// bad `--genesis-file` must fail the run rather than wedge it in a respawn loop.
 pub fn load_chain_spec(genesis_file: &str) -> Result<ChainSpec> {
     let genesis = serde_json::from_str::<alloy_genesis::Genesis>(
         &std::fs::read_to_string(genesis_file)
@@ -67,8 +58,7 @@ pub fn run(args: WorkerArgs) -> Result<()> {
     let chain_spec = load_chain_spec(&args.genesis_file)?;
     let dirs = DataDir::new(&args.data_dir);
     let llvm = args.llvm.resolve()?;
-    // llvm-cov reads the coverage map out of the binary that wrote the
-    // profile — this one, as it is running.
+    // llvm-cov reads the coverage map from the binary that wrote the profile: this one.
     let exe = crate::profile_rt::own_executable()?;
     warm_up();
 
@@ -90,16 +80,10 @@ pub fn run(args: WorkerArgs) -> Result<()> {
     Ok(())
 }
 
-/// Takes stdout for the protocol alone: returns a private duplicate of fd 1
-/// and points fd 1 itself at stderr.
-///
-/// The replay stack underneath is not ours, and anything in it that prints —
-/// a Rust `println!`, a C `printf` — writes to fd 1. On a shared channel such a
-/// print can land inside a response frame and tear it, and a torn frame stalls
-/// its block forever, since blocks are never killed. With the frames on a
-/// descriptor nothing else knows about, every stray print ends up in the
-/// worker's log instead. Runs before anything else in the worker, so nothing
-/// is buffered for fd 1 yet.
+/// Takes stdout for the protocol alone: returns a private duplicate of fd 1 and points fd 1 at
+/// stderr. Any print in the replay stack (`println!`, C `printf`) could otherwise tear a response
+/// frame and stall its block forever, since blocks are never killed. Runs first in the worker,
+/// so nothing is buffered for fd 1 yet.
 fn protocol_channel() -> Result<File> {
     use std::os::fd::AsFd;
     let protocol = std::io::stdout().as_fd().try_clone_to_owned().wrap_err("duplicate stdout")?;
@@ -110,18 +94,11 @@ fn protocol_channel() -> Result<File> {
     Ok(File::from(protocol))
 }
 
-/// Runs the process-lifetime initializers inside the measured code before any
-/// block is captured.
-///
-/// mega-evm and op-revm build each hardfork's precompile table lazily, once
-/// per process (`OnceBox::get_or_init`): mega-evm's `rex` and `mini_rex`,
-/// op-revm's `isthmus`, `granite` and `fjord`. Left to the blocks, those
-/// closures are covered by the first block a worker replays — and the first
-/// block of each later table it meets — so the same block records different
-/// coverage depending on where it fell in some worker's queue. Built here,
-/// they are covered by no block, and `process_block`'s counter reset
-/// discards the warm-up itself. The latest spec (`default()`) is included so
-/// a table that only it uses is built as well.
+/// Builds the per-hardfork precompile tables, which mega-evm and op-revm build once per process
+/// (`OnceBox::get_or_init`), before any block is captured. Left to the blocks, the first block
+/// to meet a table would be credited with it, so a block's coverage would depend on its place
+/// in a worker's queue; `process_block`'s counter reset discards the warm-up. `default()` adds
+/// the latest spec, for a table only it uses.
 fn warm_up() {
     for spec in
         [MegaSpecId::EQUIVALENCE, MegaSpecId::MINI_REX, MegaSpecId::REX, MegaSpecId::default()]
@@ -187,8 +164,7 @@ fn process_block(
     let logs_bloom_ok = output.logs_bloom == header.logs_bloom;
 
     let extracted = llvm.extract_covered_items(exe, &profraw, &dirs.block_profdata(req.block));
-    // The raw profile is large (the whole binary's counter array plus its
-    // name table) and the sparse profdata supersedes it either way.
+    // The raw profile is large, and the sparse profdata supersedes it either way.
     let _ = std::fs::remove_file(&profraw);
     let hits = extracted?;
     let counters = hits.iter().map(|h| h.id).collect();

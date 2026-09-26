@@ -1,8 +1,5 @@
-//! Dense bitset over the (append-only) dense counter-id space.
-//!
-//! Pattern bitmaps are small (tens of KB) and the id space only grows, so a
-//! plain `Vec<u64>` beats pulling in a compressed-bitmap dependency. Older
-//! bitmaps are simply shorter; all operations treat missing tail words as zero.
+//! Plain `Vec<u64>` bitset over the append-only dense counter-id space. Older bitmaps are
+//! simply shorter: all operations treat missing tail words as zero.
 
 use serde::{Deserialize, Serialize};
 
@@ -57,10 +54,7 @@ impl BitSet {
         }
     }
 
-    /// Short-circuits on the first word disproving subset-hood — this is the
-    /// inner kernel of the dominance scans (the judge's archive check,
-    /// set-cover's antichain split), where the overwhelmingly common answer
-    /// is "no".
+    /// Short-circuits on the first word disproving subset-hood: the dominance scans' hot kernel.
     pub fn is_subset_of(&self, other: &BitSet) -> bool {
         self.words
             .iter()

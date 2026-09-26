@@ -1,11 +1,6 @@
-//! Thin wrapper around the LLVM profiler runtime that `-C instrument-coverage`
-//! links into the binary.
-//!
-//! The three symbols below are the stable C API of compiler-rt's profiling
-//! runtime. They only exist when the binary is compiled with
-//! `-C instrument-coverage`, so all call sites are gated behind the `coverage`
-//! cargo feature; without it the stubs return an error telling the operator to
-//! use an instrumented build.
+//! Thin wrapper around the LLVM profiler runtime that `-C instrument-coverage` links in.
+//! Its C symbols exist only in an instrumented build, so they are gated behind the
+//! `coverage` feature; without it `write_profraw` tells the operator to rebuild.
 
 use std::path::Path;
 
@@ -38,16 +33,14 @@ pub fn write_profraw(path: &Path) -> Result<()> {
         ffi::__llvm_profile_set_filename(c_path.as_ptr());
         ffi::__llvm_profile_write_file()
     };
-    // Point the runtime back at /dev/null so the automatic at-exit write can't
-    // recreate a per-block profraw the judge may already have deleted.
+    // Re-point at /dev/null so the at-exit write can't recreate a profraw the judge deleted.
     suppress_default_profile();
     eyre::ensure!(rc == 0, "__llvm_profile_write_file returned {rc}");
     Ok(())
 }
 
-/// Sends the LLVM runtime's automatic at-exit profile write to /dev/null.
-/// Without this every instrumented process (dispatcher, set-cover, report)
-/// drops a stray `default_*.profraw` into the current directory on exit.
+/// Sends the runtime's automatic at-exit profile write to /dev/null, so an instrumented
+/// process does not drop a stray `default_*.profraw` into the current directory.
 #[cfg(feature = "coverage")]
 pub fn suppress_default_profile() {
     static DEV_NULL: &std::ffi::CStr = c"/dev/null";
@@ -74,10 +67,8 @@ pub const fn is_instrumented_build() -> bool {
     cfg!(feature = "coverage")
 }
 
-/// Refuses a profile directory whose path the runtime would rewrite: it reads
-/// `%p`, `%h`, `%m` and friends in a profile filename as patterns (pid, host,
-/// merge mode), so a `%` in `--data-dir` sends every block's profile somewhere
-/// other than where the worker then looks for it.
+/// Refuses a profile directory containing `%`: the runtime reads `%p`, `%h`, `%m`, ... in a
+/// profile filename as patterns, so the profile would land where the worker does not look.
 pub fn ensure_literal_profile_dir(dir: &Path) -> Result<()> {
     eyre::ensure!(
         !dir.as_os_str().as_encoded_bytes().contains(&b'%'),
@@ -88,17 +79,11 @@ pub fn ensure_literal_profile_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The image this process is running, as a path that stays valid after the
-/// file it was started from is replaced.
-///
-/// A rebuild during a long backfill swaps the file under `current_exe()`:
-/// `llvm-cov` would read the NEW binary's coverage map against profiles the
-/// old image wrote, and on Linux `current_exe()` itself turns into
-/// "<path> (deleted)", which cannot be spawned. `/proc/<pid>/exe` keeps
-/// naming the running image — it can be read and exec'd — so workers are
-/// started from, and profiles evaluated against, exactly the code that ran.
-/// The pid is spelled out because another process (llvm-cov, or a child
-/// mid-exec) resolves `/proc/self` to itself.
+/// The image this process is running, as a path that stays valid after the file it was
+/// started from is replaced. A rebuild mid-backfill would make llvm-cov read the NEW
+/// binary's coverage map, and on Linux turns `current_exe()` into an unspawnable
+/// "<path> (deleted)"; `/proc/<pid>/exe` still names the running image. The pid is explicit
+/// because another process (llvm-cov, a child mid-exec) resolves `/proc/self` to itself.
 pub fn own_executable() -> Result<std::path::PathBuf> {
     if cfg!(target_os = "linux") {
         Ok(std::path::PathBuf::from(format!("/proc/{}/exe", std::process::id())))

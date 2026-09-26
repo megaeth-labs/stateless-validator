@@ -1,23 +1,10 @@
-//! Human-readable coverage report for the selected block set.
+//! Human-readable coverage report for the selected block set: merges the archived profiles of
+//! its representatives and prints llvm-cov's totals and per-file table for the measured scope.
 //!
-//! Merges the archived profiles of the selected representatives and prints
-//! llvm-cov's branch/region/line totals plus the per-file table for the
-//! measured scope.
-//!
-//! How to read it against the manifest: the cover is complete at the level
-//! the tool measures — every source region and branch arm any replayed block
-//! covered is covered by the selected set — and lines, functions and branches
-//! here match a report over the whole scan exactly. The *region* total can
-//! trail it by a region or two in a const-generic family (revm's
-//! `push::<N>`). llvm-cov summarizes a generic function by its best single
-//! instantiation rather than by the union across instantiations, so the same
-//! source regions, covered through different instantiations by different
-//! selected blocks, count for less than when one block's instantiation covers
-//! them all. No source region is missing in that case; the items are keyed by
-//! source span precisely so that which instantiation ran does not matter.
-//!
-//! Run-once initializers (the per-hardfork precompile tables) read as
-//! uncovered: no block is credited with them — see `worker::warm_up`.
+//! Lines, functions and branches match a report over the whole scan exactly. The region total can
+//! trail slightly in a const-generic family (revm's `push::<N>`): llvm-cov summarizes a generic by
+//! its best single instantiation, not the union, though no source region is missing (items are
+//! keyed by source span). Run-once initializers read as uncovered; see `worker::warm_up`.
 
 use std::path::PathBuf;
 
@@ -57,8 +44,7 @@ pub fn run(args: ReportArgs) -> Result<()> {
         &llvm.universe(),
     )?;
 
-    // A directory of this run's own, removed on every exit path. Outside the
-    // data dir: that belongs to whichever backfill holds its store.
+    // Outside the data dir: that belongs to whichever backfill holds its store.
     let work = tempfile::Builder::new()
         .prefix("coverage-report-")
         .tempdir()
@@ -96,14 +82,8 @@ pub fn run(args: ReportArgs) -> Result<()> {
     Ok(())
 }
 
-/// Whether the selected profiles, read through THIS binary's coverage map,
-/// still hold the coverage the cover recorded for them.
-///
-/// llvm-cov cannot match a profile to a build whose symbols differ, and
-/// reports that code uncovered. `binary_id` catches the causes it can see
-/// (see `store::current_binary_id`); this catches any, by re-deriving the
-/// covered items through the same extraction the scan ran — on the build
-/// that scanned, that reproduces the manifest's count exactly.
+/// Whether the selected profiles, re-derived through THIS binary's coverage map, still evaluate
+/// to the recorded item count: catches any build mismatch `binary_id` cannot see.
 fn check_profiles_evaluate(evaluated: u64, recorded: u64) -> Result<()> {
     ensure!(
         evaluated == recorded,
@@ -116,15 +96,9 @@ fn check_profiles_evaluate(evaluated: u64, recorded: u64) -> Result<()> {
     Ok(())
 }
 
-/// Whether `manifest` may be reported by this binary over this scope.
-///
-/// Both halves guard against a report that runs fine and is wrong. The
-/// archived profiles only mean something against the coverage map of the
-/// build that wrote them: on a `binary_id` mismatch llvm-cov drops every
-/// function whose hash differs and reports it uncovered. And the cover only
-/// promises the scope it was computed over: the profiles hold counters for
-/// every instrumented crate, so a wider scope reports cleanly while reading
-/// whatever the cover never had to reach as uncovered code.
+/// Whether `manifest` may be reported by this binary over this scope; a mismatch in either would
+/// render cleanly but wrongly. Another build: llvm-cov reports every function whose hash differs
+/// as uncovered. A wider scope: code the cover never had to reach reads as uncovered.
 fn check_manifest(
     manifest: &Manifest,
     manifest_path: &std::path::Path,
@@ -165,9 +139,7 @@ mod tests {
         }
     }
 
-    /// A cover only promises the scope it was computed over. Reporting it over
-    /// another — wider, or with a root swapped — must be refused, not rendered
-    /// as a clean report whose gap reads as uncovered code.
+    /// A manifest is refused over another scope (wider, or a root swapped) or by another build.
     #[test]
     fn a_manifest_is_only_reported_over_the_scope_it_covers() {
         let path = Path::new("/d/manifest.json");
@@ -185,9 +157,7 @@ mod tests {
         assert!(err.to_string().contains("binary_id"), "{err}");
     }
 
-    /// Profiles that no longer evaluate to what the cover recorded — fewer items
-    /// through a renamed instance, or more — must stop the report rather than
-    /// print a table that misstates the coverage.
+    /// Profiles that evaluate to fewer or more items than the cover recorded must stop the report.
     #[test]
     fn a_report_refuses_profiles_that_no_longer_evaluate_to_the_recorded_cover() {
         check_profiles_evaluate(13_060, 13_060).expect("the scanning build reproduces the count");

@@ -1,27 +1,17 @@
-//! coverage-replayer: derive a small set of mainnet blocks that reproduces all
-//! the execution coverage a scan of the chain observed — of mega-evm, and of
-//! the revm execution engine it drives (`measured-crates.txt`).
+//! coverage-replayer: derive a small set of mainnet blocks reproducing all the execution coverage
+//! a chain scan observed, of mega-evm and the revm engine it drives (`measured-crates.txt`).
 //!
-//! `backfill` replays a block range under LLVM branch instrumentation:
-//! resident worker subprocesses execute each block (reset counters → replay →
-//! capture), and a judge dedups the resulting per-block coverage bitmaps into
-//! "patterns" in a redb store. A bit is an *evaluated* coverage item — a
-//! region entry or a branch arm as llvm-cov computes it, not a physical
-//! counter (see `llvm.rs` for why that difference decides correctness).
-//! `set-cover` computes a small block set covering every item ever observed —
-//! greedy, then redundancy-eliminated: no selected block can be dropped, but
-//! the set is not guaranteed to be the smallest possible (that is NP-hard).
-//! `report` renders an llvm-cov summary for that set, and `inspect` prints
-//! store statistics and exports the candidate pool.
+//! `backfill` replays blocks under LLVM branch instrumentation in resident worker subprocesses;
+//! a judge dedups the per-block bitmaps into "patterns" in a redb store. A bit is an *evaluated*
+//! item (a region entry or branch arm as llvm-cov computes it), not a physical counter: see
+//! `llvm.rs`. `set-cover` picks a greedy, irredundant (not necessarily minimum) block set covering
+//! every item, `report` renders llvm-cov output for it, and `inspect` prints store statistics and
+//! exports the candidate pool.
 //!
 //! ## Carrying a scan across a mega-evm bump
 //!
-//! Counter ids — and therefore every stored bitmap — belong to one
-//! instrumented build (see [`store::current_binary_id`]). When mega-evm or
-//! the toolchain moves, `backfill` and `set-cover` refuse the old store, and a
-//! full re-sweep of mainnet history costs days. What
-//! survives the bump is the *block numbers*, so the tool carries them over
-//! instead of the bitmaps:
+//! Bitmaps belong to one instrumented build ([`store::current_binary_id`]), so `backfill` and
+//! `set-cover` refuse an old store; the *block numbers* survive, so the tool carries those over:
 //!
 //! ```text
 //! inspect --dump-pool pool.txt   (old build; read-only, no binary-id check)
@@ -30,11 +20,8 @@
 //!             └─ set-cover → report             (new minimal set)
 //! ```
 //!
-//! The pool is the antichain's representatives rather than the previous
-//! minimal set: a cover is minimal only for the universe that produced it and
-//! has no slack once a new build splits patterns the old one merged. `inspect`
-//! is the one subcommand that skips the binary-id check, so the pool can be
-//! extracted from an old store at any time — including long after the bump.
+//! The pool is the antichain's representatives, not the old minimal set, which has no slack once a
+//! new build splits patterns. `inspect` alone skips the binary-id check, so it reads old stores.
 
 mod backfill;
 mod bitset;
@@ -101,10 +88,8 @@ mod tests {
 
     use super::*;
 
-    /// `--help` is a clap *feature*, not something the derive gives you: with
-    /// `default-features = false` and the `help` feature trimmed, every
-    /// `--help` becomes `UnknownArgument` and errors lose their usage line.
-    /// This pins the workspace's clap features against that trim.
+    /// `--help` needs clap's `help` feature, which `default-features = false` drops: this pins
+    /// the workspace's clap features against that trim.
     #[test]
     fn help_is_available_on_the_root_and_on_subcommands() {
         for argv in [
@@ -117,8 +102,7 @@ mod tests {
         }
     }
 
-    /// The companion half: an unknown flag must name itself and print usage,
-    /// which needs `error-context` and `usage`.
+    /// An unknown flag must name itself and print usage (clap's `error-context` and `usage`).
     #[test]
     fn unknown_flags_report_the_offender_and_usage() {
         let err = Cli::try_parse_from(["coverage-replayer", "inspect", "--bogus"])
@@ -129,9 +113,7 @@ mod tests {
         assert!(rendered.contains("Usage:"), "error must carry usage: {rendered}");
     }
 
-    /// A pool is made of the antichain, so asking for one while skipping the
-    /// pass that computes it is a contradiction clap must reject up front —
-    /// not a run that silently writes nothing.
+    /// The pool comes from the cover pass, so `--dump-pool` must conflict with skipping it.
     #[test]
     fn pool_export_conflicts_with_skipping_the_cover_pass() {
         let base = ["coverage-replayer", "inspect", "--data-dir", "/d"];

@@ -1,7 +1,4 @@
-//! Backfill driver: fetch a block range → spool → resident worker pool →
-//! judge (pattern dedup, promotion, persistence).
-//!
-//! Data flow (all stages run concurrently, no barriers):
+//! Backfill driver: fetch → spool → resident worker pool → judge, all running concurrently:
 //!
 //! ```text
 //! fetch tasks (F) ──spool file──▶ dispatch queue ──▶ worker managers (N, one child each)
@@ -10,13 +7,10 @@
 //!                                                  judge (single consumer, owns redb)
 //! ```
 //!
-//! No block is ever skipped, and none is ever killed: a scan is only a cover
-//! of what it replayed, so a gap would silently shrink the universe. A failed
-//! fetch is retried every few seconds and a crashed worker is respawned onto
-//! the same block, both indefinitely and loudly; a slow block is only warned
-//! about. What cannot be retried into success — a replay error, or execution
-//! that disagrees with the block's header — stops the run (fail-stop) with the
-//! block recorded, so the next run retries it.
+//! No block is ever skipped or killed: a scan covers only what it replayed, so a gap would
+//! silently shrink the universe. Failed fetches and crashed workers are retried forever and
+//! loudly; a slow block is only warned about. A replay error or a header divergence stops
+//! the run (fail-stop) with the block recorded, so the next run retries it.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -51,22 +45,17 @@ use crate::{
 
 #[derive(Args, Debug, Clone)]
 pub struct BackfillArgs {
-    /// First block of the range (inclusive). Requires `--to`; mutually
-    /// exclusive with `--blocks-file`.
+    /// First block of the range (inclusive). Requires `--to`; exclusive with `--blocks-file`.
     #[clap(long)]
     pub from: Option<u64>,
     /// Last block of the range (inclusive). Requires `--from`.
     ///
-    /// Scan only blocks that are final. A resumed run skips cleanly replayed
-    /// blocks — and reuses spool entries — by block NUMBER, so a height
-    /// recorded just before a reorg keeps its orphaned hash and coverage.
+    /// Scan only final blocks: a resumed run skips cleanly replayed blocks and reuses spool
+    /// entries by NUMBER, so a height recorded before a reorg keeps its orphaned hash.
     #[clap(long)]
     pub to: Option<u64>,
-    /// Replay an explicit block list instead of a range: one decimal block
-    /// number per line, `#` comments and blank lines ignored. This is the
-    /// form that consumes `inspect --dump-pool` output (and any manifest
-    /// converted to it), so a scattered candidate pool can be re-swept
-    /// without walking the history between its members.
+    /// Replay an explicit block list instead of a range: one decimal block number per
+    /// line, `#` comments and blank lines ignored (the `inspect --dump-pool` format).
     #[clap(long)]
     pub blocks_file: Option<PathBuf>,
     /// Data RPC endpoint(s) (blocks, bytecode).
@@ -94,27 +83,19 @@ pub struct BackfillArgs {
     /// Number of resident worker subprocesses (default: cores - 2).
     #[clap(long, env = "COVERAGE_REPLAYER_WORKERS")]
     pub workers: Option<usize>,
-    /// Concurrent block fetches. Replay is fetch-bound, not compute-bound: a
-    /// block costs far longer to download (block JSON, witness, bytecode) than
-    /// to execute, most of all deep in history where blocks are large, so the
-    /// worker pool idles behind a handful of fetches. Raising this cannot
-    /// flood the disk — a full dispatch queue blocks the fetch loop, which
-    /// bounds the spool backlog whatever the value.
+    /// Concurrent block fetches. Replay is fetch-bound, not compute-bound; raising this
+    /// cannot flood the disk, since a full dispatch queue blocks the fetch loop.
     #[clap(long, default_value_t = 32)]
     pub fetch_concurrency: usize,
     #[clap(flatten)]
     pub llvm: LlvmArgs,
-    /// Interval (seconds) for the "block still executing" progress warning.
-    /// Blocks are never timed out — a stuck block stays visibly stuck in the
-    /// log until it completes.
+    /// Interval (seconds) of the "block still executing" warning; blocks never time out.
     #[clap(long, default_value_t = 600)]
     pub slow_block_warn_secs: u64,
 }
 
-/// What this run was asked to replay. The two forms differ in how the store
-/// is consulted: a range reads the block records between its ends, a list
-/// looks each member up — a pool drawn from the whole history spans every row
-/// ever written.
+/// What this run was asked to replay. A range reads the store's records between its
+/// ends; a list looks each member up, as its span may cover the whole history.
 enum Selection {
     Range(std::ops::RangeInclusive<u64>),
     List(Vec<u64>),
@@ -157,8 +138,7 @@ impl Selection {
     fn highest(&self) -> u64 {
         match self {
             Self::Range(r) => *r.end(),
-            // `read_blocks_file` sorts, so the last entry is the maximum; an
-            // empty list never reaches here (`resolve` rejects it).
+            // Sorted by `read_blocks_file`; `resolve` rejects an empty list.
             Self::List(v) => v.last().copied().unwrap_or(0),
         }
     }
@@ -179,9 +159,7 @@ impl Selection {
         }
     }
 
-    /// How the store last judged each selected block — all the todo filter
-    /// needs, so a resumed full-range run holds a status per block rather
-    /// than a whole record.
+    /// How the store last judged each selected block: just the status the todo filter needs.
     fn statuses(&self, store: &Store) -> Result<HashMap<u64, BlockStatus>> {
         let mut found = HashMap::new();
         match self {
@@ -196,9 +174,8 @@ impl Selection {
     }
 }
 
-/// Parses a block list: one decimal block number per line, `#` comments and
-/// blank lines ignored. Sorted and deduplicated, so concatenating several
-/// shards' pools replays each block once, in history order.
+/// Parses a block list: one decimal number per line, `#` comments and blanks ignored.
+/// Sorted and deduplicated, so concatenated shard pools replay each block once, in order.
 fn read_blocks_file(path: &Path) -> Result<Vec<u64>> {
     let text = std::fs::read_to_string(path)
         .wrap_err_with(|| format!("read block list {}", path.display()))?;
@@ -224,8 +201,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         "backfill requires the instrumented build (see [profile.coverage] in Cargo.toml)"
     );
 
-    // Everything a worker needs at startup is validated here first (genesis
-    // now, the source scope and the LLVM tools below): see `load_chain_spec`.
+    // Validate what every worker needs at startup before spawning any: see `load_chain_spec`.
     crate::worker::load_chain_spec(&args.genesis_file)?;
 
     let dirs = Arc::new(DataDir::new(&args.data_dir));
@@ -233,9 +209,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     dirs.ensure_layout()?;
     let binary_id = current_binary_id();
     info!(binary_id, "opening store");
-    // Resolved once, here: every worker of the run must agree on the scope,
-    // and a scope that cannot work (sources missing or ambiguous) has to stop
-    // the run before any block is replayed.
+    // Resolved once: all workers must agree on the scope, and a bad one stops the run early.
     let llvm = args.llvm.resolve()?;
     let universe = llvm.universe();
     info!(
@@ -245,8 +219,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         "coverage universe"
     );
     let store = Store::open(&dirs.store_path(), &binary_id, &universe)?;
-    // Only now: the store's exclusive lock makes this the one process
-    // writing under the data dir, so nothing left there is live.
+    // Only now: the store's exclusive lock means nothing left under the data dir is live.
     let cleared = dirs.clear_leftovers();
     if cleared > 0 {
         info!(cleared, "removed files a previous run left mid-flight");
@@ -266,8 +239,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
          blocks",
     );
 
-    // Work list: skip only blocks that previously replayed CLEANLY. Error /
-    // Divergent records are retried — no block is ever permanently excluded.
+    // Skip only blocks that replayed cleanly; Error/Divergent records are retried.
     let todo: Vec<u64> =
         selection.iter().filter(|n| statuses.get(n) != Some(&BlockStatus::Ok)).collect();
     let retrying = todo.iter().filter(|n| statuses.contains_key(n)).count();
@@ -290,7 +262,6 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     let (dispatch_tx, dispatch_rx) = kanal::bounded_async::<u64>(workers * 2);
     let (judged_tx, mut judged_rx) = tokio::sync::mpsc::channel::<WorkerResponse>(workers * 2);
 
-    // ---- worker managers ----
     let setup = Arc::new(WorkerSetup {
         exe: crate::profile_rt::own_executable()?,
         genesis_file: args.genesis_file.clone(),
@@ -306,7 +277,6 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     drop(dispatch_rx);
     drop(judged_tx);
 
-    // ---- fetch stage ----
     let verified_codes = Arc::new(VerifiedCodes::default());
     let fetcher = {
         let dirs = dirs.clone();
@@ -350,7 +320,6 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         })
     };
 
-    // ---- judge (this task) ----
     let mut judge =
         JudgeState::new(store.counters()?, store.patterns()?, &store, dirs.clone(), total);
     let judged: Result<()> = async {
@@ -360,18 +329,15 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         Ok(())
     }
     .await;
-    // Whatever ended the loop, what was judged is made durable before the
-    // run reports it.
+    // Whatever ended the loop, make what was judged durable before reporting it.
     store.flush()?;
     judged?;
 
     fetcher.await.ok();
     while manager_set.join_next().await.is_some() {}
     judge.final_summary();
-    // The judged channel closing only says every task is gone, not that every
-    // block arrived: a fetch task that panicked, or a manager that died,
-    // drops its block with nothing but a log line. Exiting 0 then would let
-    // automation run set-cover over an incomplete universe.
+    // The channel closing only means every task is gone: a panicked fetch task or a dead
+    // manager drops its block with just a log line, so an incomplete run must not exit 0.
     ensure!(
         judge.processed == total,
         "backfill ended with {} of {total} blocks judged — a fetch or worker task died (see the \
@@ -392,18 +358,14 @@ async fn forward_fetched(
                 warn!(block = n, "dispatch queue closed, dropping fetched block");
             }
         }
-        // A panic in a fetch task is a code bug; the block stays absent from
-        // the store, so a re-run picks it up. Loud, not silent.
+        // A code bug; the block stays absent from the store, so a re-run picks it up.
         Err(e) => tracing::error!(error = %e, "fetch task panicked — block will need a re-run"),
     }
 }
 
-/// Fetches one block + witness, resolves missing bytecodes, writes the spool
-/// entry. Skips work that already exists on disk (crash resume).
-///
-/// `block_cache` holds the fetched block across the caller's retry rounds so
-/// a failure after it (a bytecode fetch, say) does not re-download the full
-/// block every 5 seconds.
+/// Fetches one block + witness, resolves missing bytecodes, writes the spool entry, and
+/// skips work already on disk (crash resume). `block_cache` keeps the block across the
+/// caller's retries so a later failure does not re-download it.
 async fn fetch_block(
     client: &RpcClient,
     dirs: &DataDir,
@@ -413,19 +375,15 @@ async fn fetch_block(
 ) -> Result<()> {
     let spool_path = dirs.spool_entry(n);
     if spool_path.exists() {
-        // An entry the worker cannot use (crash artifact, a layout change
-        // between binary versions) would fail-stop the run on every restart,
-        // since a re-run skips the fetch while the file exists. So it is
-        // opened exactly as the worker opens it, and refetched on failure.
+        // Opened exactly as the worker opens it, and refetched if unusable: a re-run skips
+        // the fetch while the file exists, so a bad entry would fail-stop every restart.
         let existing = {
             let path = spool_path.clone();
             tokio::task::spawn_blocking(move || SpoolEntry::open(&path, n)).await?
         };
         match existing {
             Ok(entry) => {
-                // Its contract codes live in separate files — re-resolve any
-                // missing or corrupt ones so the worker never wedges on a
-                // half-cleaned codes dir.
+                // Its codes live in separate files: re-resolve any missing or corrupt ones.
                 resolve_missing_codes(client, dirs, verified_codes, entry.code_hashes).await?;
                 return Ok(());
             }
@@ -443,17 +401,10 @@ async fn fetch_block(
     }
 
     if block_cache.is_none() {
-        // Unchecked on purpose. The checked fetch recovers the signer of every
-        // transaction — secp256k1 work, in a binary whose every basic block
-        // bumps a shared coverage counter — and on blocks carrying tens of
-        // thousands of transactions that, not the download, is what the fetch
-        // stage spends its time on, with the concurrent fetches contending
-        // for the same counters. Nothing is lost by skipping it: a wrong
-        // sender or transaction set cannot reproduce the header's gas,
-        // receipts root and logs bloom, which the worker compares after
-        // replaying, and a divergence stops the run. The header hash is
-        // checked here because it is cheap and it is what the manifest
-        // publishes and the witness is addressed by.
+        // Unchecked on purpose: recovering every transaction's signer can dominate the fetch
+        // stage in an instrumented binary. A wrong sender or transaction set cannot reproduce
+        // the header's gas, receipts root and logs bloom, which the worker checks after replay.
+        // The header hash is checked: it is cheap, and the manifest and witness lookup rely on it.
         let block = client.get_block_unchecked(BlockId::number(n), true).await;
         ensure!(
             block.header.hash_slow() == block.header.hash,
@@ -464,17 +415,13 @@ async fn fetch_block(
     }
     let block = block_cache.as_ref().expect("just filled");
     let hash = block.header.hash;
-    // Zero-validation light fetch: no elliptic-curve work is spent on the
-    // proof we never verify. Full witnesses are NOT stored anywhere — when a
-    // selected block needs one, it is re-fetched on demand.
+    // Light fetch: no elliptic-curve work is spent on a proof that is never verified.
     let (light_witness, _mpt_witness) = client.get_witness_light(n, hash).await;
 
     let code_hashes = stateless_core::collect_code_hashes(&light_witness.kvs);
     resolve_missing_codes(client, dirs, verified_codes, code_hashes.clone()).await?;
 
-    // Re-serializing a block of tens of thousands of transactions is real CPU
-    // work, so it goes to the blocking pool with the write. The block leaves
-    // the cache here, past everything a retry would want it for.
+    // Serializing a large block is real CPU work, so it runs on the blocking pool with the write.
     let block = block_cache.take().expect("just filled");
     tokio::task::spawn_blocking(move || {
         let block_json = serde_json::to_vec(&block)?;
@@ -484,21 +431,14 @@ async fn fetch_block(
     Ok(())
 }
 
-/// The codes-dir files this run has already found content-valid, shared by
-/// every fetch task.
-///
-/// A deep-history block references thousands of contracts, nearly all of them
-/// verified for an earlier block already; re-reading and re-hashing each one
-/// for every block spends the fetch stage — the bottleneck — on settled work.
-/// A file verified once stays valid for the run: the codes dir only ever gains
-/// files (atomically renamed into place), and only an invalid file is deleted.
+/// Code files this run already found content-valid, shared by every fetch task so no
+/// contract is re-hashed per block. A file verified once stays valid for the run: the
+/// codes dir only gains files (renamed into place), and only invalid ones are deleted.
 #[derive(Default)]
 struct VerifiedCodes(Mutex<HashSet<B256>>);
 
 impl VerifiedCodes {
-    /// Of `code_hashes`, the ones with no content-valid file in `dirs` —
-    /// checking on disk only those this run has not verified yet, and
-    /// remembering the ones that pass.
+    /// The `code_hashes` with no content-valid file; only unverified ones are read from disk.
     fn missing(&self, dirs: &DataDir, code_hashes: &[B256]) -> Vec<B256> {
         let unverified: Vec<B256> = {
             let verified = self.0.lock().expect("verified-codes lock");
@@ -515,13 +455,9 @@ impl VerifiedCodes {
     }
 }
 
-/// Fetches and persists any of `code_hashes` not already in the codes dir —
-/// where "in" means present AND content-valid: the files are content-
-/// addressed, so anything whose keccak doesn't match its name (truncated by
-/// a pre-fsync crash, damaged media) is deleted and refetched. Without this,
-/// a corrupt code file wedges the run across restarts: the worker replays
-/// wrong bytes, diverges, and the judge fail-stops — forever. The file work
-/// runs on the blocking pool, off the fetch tasks' runtime threads.
+/// Fetches and persists any of `code_hashes` without a content-valid file. The files are
+/// content-addressed, so one whose keccak mismatches its name is refetched; a corrupt file
+/// would otherwise diverge every replay and fail-stop the run across restarts.
 async fn resolve_missing_codes(
     client: &RpcClient,
     dirs: &DataDir,
@@ -551,9 +487,8 @@ async fn resolve_missing_codes(
     .await?
 }
 
-/// Returns whether `path` holds exactly the bytes hashing to `hash`
-/// (content-addressed check, same keccak the RPC fetch verifies). A present-
-/// but-invalid file is deleted so the caller refetches it.
+/// Whether `path` holds exactly the bytes hashing to `hash`. A present-but-invalid file is
+/// deleted so the caller refetches it.
 fn code_file_is_valid(path: &Path, hash: &B256) -> bool {
     match std::fs::read(path) {
         Ok(bytes) if alloy_primitives::keccak256(&bytes) == *hash => true,
@@ -570,11 +505,9 @@ fn code_file_is_valid(path: &Path, hash: &B256) -> bool {
     }
 }
 
-/// What every worker of a run is launched with, resolved once by the
-/// dispatcher so they cannot disagree.
+/// What every worker of a run is launched with, resolved once so they cannot disagree.
 struct WorkerSetup {
-    /// The running image, not the file it came from: a worker respawned after
-    /// a rebuild must still be this build (see `profile_rt::own_executable`).
+    /// The running image, so a worker respawned after a rebuild is still this build.
     exe: PathBuf,
     genesis_file: String,
     dirs: Arc<DataDir>,
@@ -583,8 +516,7 @@ struct WorkerSetup {
     warn_after: Duration,
 }
 
-/// Owns one resident worker child, respawned onto the same block whenever it
-/// dies.
+/// Owns one resident worker child, respawned onto the same block whenever it dies.
 async fn worker_manager(
     id: usize,
     rx: kanal::AsyncReceiver<u64>,
@@ -620,9 +552,7 @@ async fn worker_manager(
                         error = %format!("{e:#}"),
                         "worker died mid-block; respawning and retrying same block"
                     );
-                    // Escalate a repeating crash on ONE block: by policy it is
-                    // retried forever, but an operator must be able to find
-                    // the wedge from the error log alone.
+                    // Escalate so an operator can find a wedged block from the error log.
                     if attempt.is_multiple_of(10) {
                         tracing::error!(
                             worker = id,
@@ -672,9 +602,8 @@ impl WorkerHandle {
         Ok(Self { child, stdin, stdout: tokio::io::BufReader::new(stdout).lines() })
     }
 
-    /// Sends one request and waits for the response with no deadline (see the
-    /// module doc). Errors here mean the child actually died (closed stdout /
-    /// bad frame), not slowness.
+    /// Sends one request and waits for the response with no deadline; an error means the
+    /// child died (closed stdout, bad frame), never slowness.
     async fn round_trip(
         &mut self,
         req: &WorkerRequest,
@@ -700,9 +629,8 @@ impl WorkerHandle {
                 }
             }
         };
-        // Nothing but the worker's frames reaches this pipe
-        // (`worker::protocol_channel`), so a line that is not one means the
-        // worker is broken — handled like a crash: respawn, retry the block.
+        // Only worker frames reach this pipe (`worker::protocol_channel`), so anything
+        // else means a broken worker, handled like a crash.
         let resp: WorkerResponse = serde_json::from_str(&frame).wrap_err_with(|| {
             format!("malformed worker frame: {}", frame.chars().take(200).collect::<String>())
         })?;
@@ -719,29 +647,23 @@ impl WorkerHandle {
 struct JudgeState<'a> {
     store: &'a Store,
     dirs: Arc<DataDir>,
-    /// Counter id → dense index. Every id enters with the pattern holding
-    /// it, so its size is also the size of the universe. Ids are hashes
-    /// already, so the map need not hash them again.
+    /// Counter id → dense index; its size is the universe's. Ids are already hashes, so
+    /// the map need not hash them again.
     counters: FxHashMap<u64, u32>,
     patterns: HashMap<u64, PatternRecord>,
-    /// Keys of the patterns no pattern dominated when they arrived. A new
-    /// pattern dominated by anything is dominated by one of these —
-    /// domination is transitive — so the check scans this set instead of
-    /// every pattern: all but a few percent of patterns arrive dominated.
+    /// Keys of the patterns undominated on arrival. By transitivity, a new pattern
+    /// dominated by anything is dominated by one of these, so the check scans only this set.
     undominated: Vec<u64>,
     processed: u64,
     total: u64,
     new_patterns: u64,
     started: Instant,
-    /// Worker wall-clock per successfully replayed block (spool load + replay
-    /// + profraw + item extraction).
+    /// Worker wall-clock per successfully replayed block.
     elapsed_ok_ms: ElapsedSampler,
 }
 
-/// Bounded, deterministic reservoir for per-block timings: keeps every
-/// `stride`-th sample and doubles the stride when full. A full-history run
-/// would otherwise hold one u64 per block (hundreds of MB) just to print one
-/// avg/p50/p95 line at the end.
+/// Bounded, deterministic reservoir for per-block timings: keeps every `stride`-th sample
+/// and doubles the stride when full, so a full-history run does not hold one per block.
 struct ElapsedSampler {
     samples: Vec<u64>,
     stride: u64,
@@ -749,8 +671,7 @@ struct ElapsedSampler {
 }
 
 impl ElapsedSampler {
-    /// ~8 MB worst case; large enough that percentiles are exact for any
-    /// single-machine range and statistically indistinguishable beyond it.
+    /// Large enough for exact percentiles on any single-machine range.
     const CAP: usize = 1 << 20;
 
     fn new() -> Self {
@@ -804,12 +725,8 @@ impl<'a> JudgeState<'a> {
         }
     }
 
-    /// Fail-stop policy: replay errors and sanity divergences are recorded to
-    /// the store (spool kept for forensics) and then ABORT the whole run.
-    /// Rationale: every block has been independently verified to replay
-    /// cleanly, so any failure here is an infrastructure/chain-spec bug — a
-    /// gap must never be silently scanned past. The recorded non-Ok status is
-    /// retried automatically on the next run (see the todo filter).
+    /// Fail-stop: a replay error or divergence is recorded (spool kept for forensics) and
+    /// aborts the run; the next run retries the non-Ok block via the todo filter.
     fn ingest(&mut self, resp: WorkerResponse) -> Result<()> {
         self.processed += 1;
 
@@ -850,8 +767,7 @@ impl<'a> JudgeState<'a> {
 
     fn ingest_ok(&mut self, resp: WorkerResponse) -> Result<()> {
         self.elapsed_ok_ms.record(resp.elapsed_ms);
-        // Resolve counter ids → dense indices, registering unseen ids from the
-        // details their worker sent along.
+        // Counter ids → dense indices, registering unseen ids from their worker's details.
         let details: HashMap<u64, &CoveredItem> =
             resp.new_items.iter().map(|d| (d.id, d)).collect();
         let mut new_counters: Vec<(u64, CounterInfo)> = Vec::new();
@@ -868,7 +784,6 @@ impl<'a> JudgeState<'a> {
                     resp.block
                 )
             })?;
-            // Dense indices are handed out in order, one per counter.
             let index = self.counters.len() as u32;
             self.counters.insert(*id, index);
             dense.push(index);
@@ -888,15 +803,11 @@ impl<'a> JudgeState<'a> {
         let (key, occupied) = resolve_pattern_slot(&self.patterns, &resp.counters, &rec.bitmap);
 
         if occupied {
-            // Known pattern: nothing on disk moves — the profile is keyed by
-            // pattern, whichever block now represents it.
+            // Known pattern: nothing on disk moves, as profiles are keyed by pattern.
             self.patterns.get_mut(&key).expect("occupied slot").absorb(&rec);
         } else {
-            // Dominated patterns (strict subset of an existing one) can never
-            // beat their dominator in set cover — record the bitmap for dedup
-            // and stats, but skip the profile archive (most new patterns).
-            // set-cover excludes them from candidates, so a selected block
-            // always has an archived profile.
+            // A dominated pattern (strict subset of an existing one) is excluded from
+            // set-cover candidates, so its bitmap is recorded but its profile not archived.
             let dominated = self.undominated.iter().any(|k| self.patterns[k].dominates(&rec));
             self.new_patterns += 1;
             info!(
@@ -906,14 +817,10 @@ impl<'a> JudgeState<'a> {
                 universe = self.counters.len(),
                 "NEW coverage pattern"
             );
-            // Promote. Ordering is the durability invariant: the sparse
-            // profdata must be ON DISK before the pattern + Ok record are
-            // committed — a crash in between leaves the block non-Ok, so a
-            // re-run re-executes it and re-archives. Committing first would
-            // permanently orphan a non-dominated pattern (block never
-            // retried, later same-bitmap profiles deleted, `report` fails on
-            // the missing profile). Archive failure aborts (fail-stop),
-            // keeping profile + spool for forensics.
+            // Durability invariant: the profile must be ON DISK before the pattern and Ok
+            // record are committed. A crash in between leaves the block non-Ok, so a re-run
+            // re-archives it; committing first could orphan an undominated pattern with no
+            // profile for `report`. Archive failure aborts, keeping profile + spool.
             if !dominated {
                 self.dirs.archive_profile(key, &profile).wrap_err_with(|| {
                     format!(
@@ -928,8 +835,7 @@ impl<'a> JudgeState<'a> {
             self.patterns.insert(key, rec);
         }
 
-        // Shared tail: commit, then clean up (the spool entry goes after the
-        // commit — a leftover from a crash in between is harmless junk).
+        // The spool entry is removed only after the commit; a crash leftover is harmless.
         let _ = std::fs::remove_file(&profile);
         let record = block_record(&resp, BlockStatus::Ok, Some(key));
         let pattern = Some((key, &self.patterns[&key]));
@@ -979,10 +885,8 @@ impl<'a> JudgeState<'a> {
     }
 }
 
-/// Builds the per-block store record from a worker response. The judge's
-/// three commit paths (Ok / Divergent / Error) differ only in status and
-/// pattern key: on error paths `resp.gas_used` is 0 and on ok paths
-/// `resp.error` is `None`, so one constructor serves all.
+/// The per-block store record for any judge outcome: error responses have `gas_used` 0
+/// and ok ones no `error`, so only `status` and `pattern_key` differ.
 fn block_record(
     resp: &WorkerResponse,
     status: BlockStatus,
@@ -1004,9 +908,7 @@ mod tests {
     use super::*;
     use crate::store::pattern_base_key;
 
-    /// `BackfillArgs` is a flattened `Args`, so parsing it in a test needs a
-    /// `Parser` wrapper — which is also what exercises the real clap wiring
-    /// rather than a hand-built struct.
+    /// A `Parser` wrapper, so tests exercise the real clap wiring of the flattened args.
     #[derive(clap::Parser)]
     struct TestCli {
         #[clap(flatten)]
@@ -1031,10 +933,8 @@ mod tests {
             .map_err(|e| eyre::eyre!("{e}"))
     }
 
-    /// The list format is what carries a pool between builds, so its exact
-    /// tolerances are load-bearing: `#` comments (the header `--dump-pool`
-    /// writes), trailing comments, blank lines, and out-of-order duplicates
-    /// from concatenating several shards' pools.
+    /// The list format carries pools between builds, so `#` header and trailing comments,
+    /// blank lines, and out-of-order duplicates from concatenated shards must all parse.
     #[test]
     fn block_list_skips_comments_sorts_and_dedups() {
         let dir = tempfile::tempdir().unwrap();
@@ -1058,8 +958,7 @@ mod tests {
         assert!(err.to_string().contains(":2:"), "got: {err}");
     }
 
-    /// The two selection forms must be exclusive and complete — a run that
-    /// silently ignored one of them would sweep the wrong blocks.
+    /// Exactly one selection form must be given, or a run could sweep the wrong blocks.
     #[test]
     fn selection_requires_exactly_one_form() {
         let dir = tempfile::tempdir().unwrap();
@@ -1086,8 +985,7 @@ mod tests {
         assert!(err.to_string().contains("--from must be <= --to"), "got: {err}");
     }
 
-    /// `highest` feeds the chain-tip guard and `len` the "skipped" count, so
-    /// both forms must report them in the same units.
+    /// `highest` (tip guard) and `len` (skipped count) must mean the same for both forms.
     #[test]
     fn selection_reports_bounds_for_both_forms() {
         let dir = tempfile::tempdir().unwrap();
@@ -1133,9 +1031,8 @@ mod tests {
         }
     }
 
-    /// Judge harness on a real (temp) store, pre-seeded with counters for ids
-    /// 1/2/3 (dense 0/1/2) and the given patterns. A test that reaches the
-    /// archive path writes the block's profdata into the data dir first.
+    /// Judge on a temp store seeded with counters 1/2/3 (dense 0/1/2) and `patterns`; a
+    /// test reaching the archive path writes the block's profdata first.
     fn judge_with<'a>(
         store: &'a Store,
         dirs: Arc<DataDir>,
@@ -1169,8 +1066,7 @@ mod tests {
         assert_eq!(rec.representative, 200);
         assert_eq!(judge.patterns.len(), 1, "no new pattern was created");
 
-        // Completion order != block order: an EARLIER block finishing late
-        // must pull first_block down.
+        // An earlier block finishing late must pull first_block down.
         assert_eq!(rec.first_block, 100);
         judge.ingest(response(50, vec![1, 2], 900)).unwrap();
         let rec = &judge.patterns[&key];
@@ -1178,17 +1074,15 @@ mod tests {
         assert_eq!(rec.last_block, 300);
     }
 
-    /// An id the store has never seen is registered from the details its
-    /// worker sent along; one that arrives without them is a protocol breach
-    /// and must stop the run rather than enter the store without provenance.
+    /// Unseen ids are registered from their worker's details; one arriving without them is
+    /// a protocol breach and must stop the run.
     #[test]
     fn new_items_are_registered_from_the_details_their_worker_reported() {
         let tmp = tempfile::tempdir().unwrap();
         let dirs = Arc::new(DataDir::new(tmp.path()));
         dirs.ensure_layout().unwrap();
         let store = Store::open(&dirs.store_path(), "test-id", "f").unwrap();
-        // A dominator over dense 0..=3, so the new pattern {1, 4} is dominated
-        // and archives no profile (id 4 will get dense 3, the next free one).
+        // Dominator over dense 0..=3 (id 4 gets dense 3), so {1, 4} archives no profile.
         let (key, rec) = seeded_pattern(&[1, 2, 3, 4], &[0, 1, 2, 3], 100, 500);
         let mut judge = judge_with(&store, dirs, vec![(key, rec)]);
 
@@ -1208,8 +1102,7 @@ mod tests {
         assert!(err.to_string().contains("never reported where it lives"), "{err}");
     }
 
-    /// Codes this run verified are not read again — the point of the cache —
-    /// while unverified ones are checked on disk and missing ones reported.
+    /// Codes this run verified are not re-read; unverified ones are checked on disk.
     #[test]
     fn verified_codes_are_checked_on_disk_once() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1257,8 +1150,7 @@ mod tests {
         assert_eq!(s.seen, n);
         assert!(s.samples.len() <= ElapsedSampler::CAP, "bounded: {}", s.samples.len());
         assert!(s.stride > 1, "must have decimated");
-        // Still spans the full range (deterministic stride, no bias to
-        // either end): percentile estimates stay meaningful.
+        // Still spans the full range, so percentile estimates stay meaningful.
         let (min, max) = (s.samples.iter().min().unwrap(), s.samples.iter().max().unwrap());
         assert!(*min < n / 10, "min {} not near the start", min);
         assert!(*max > n - n / 10, "max {} not near the end", max);
@@ -1270,12 +1162,10 @@ mod tests {
         let dirs = Arc::new(DataDir::new(tmp.path()));
         dirs.ensure_layout().unwrap();
         let store = Store::open(&dirs.store_path(), "test-id", "f").unwrap();
-        // Seed the dominator {1,2,3}.
         let (dom_key, dom_rec) = seeded_pattern(&[1, 2, 3], &[0, 1, 2], 100, 500);
         let mut judge = judge_with(&store, dirs.clone(), vec![(dom_key, dom_rec)]);
 
-        // {1,2} is a strict subset → NEW pattern, dominated: bitmap recorded,
-        // profile NOT archived.
+        // {1,2} is a strict subset: a NEW, dominated pattern, so no profile is archived.
         judge.ingest(response(200, vec![1, 2], 300)).unwrap();
         assert_eq!(judge.patterns.len(), 2);
         let sub_key = pattern_base_key(&[1, 2]);
@@ -1284,11 +1174,9 @@ mod tests {
             !dirs.archived_profile(sub_key).exists(),
             "dominated pattern must not get an archived profile"
         );
-        // Universe unchanged: the subset contributed nothing new.
         assert_eq!(judge.counters.len(), 3);
 
-        // The store round-trips the newly committed pattern and block record
-        // (the seeded dominator lived only in the in-memory snapshot).
+        // The store holds the committed pattern and record (the seed lived only in memory).
         let patterns = judge.store.patterns().unwrap();
         assert_eq!(patterns.len(), 1);
         assert!(patterns.contains_key(&sub_key));
@@ -1297,9 +1185,8 @@ mod tests {
         assert_eq!(record.pattern_key, Some(sub_key));
     }
 
-    /// The judge checks domination against the patterns that arrived
-    /// undominated, so a pattern that arrives undominated has to join them:
-    /// a later subset of it is dominated, and archives nothing.
+    /// A pattern arriving undominated must join the set domination is checked against, so
+    /// a later subset of it archives nothing.
     #[test]
     fn a_new_undominated_pattern_dominates_later_subsets() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1343,8 +1230,7 @@ mod tests {
         assert_eq!(judge.store.block_records(&[401]).unwrap()[&401].status, BlockStatus::Divergent);
     }
 
-    /// The keying contract: sorted-id hashing, distinct sets → distinct keys
-    /// (up to 64-bit collisions).
+    /// Keys hash the sorted ids: equal sets agree, distinct sets differ (barring collisions).
     #[test]
     fn pattern_key_contract() {
         assert_eq!(pattern_base_key(&[1, 2, 3]), pattern_base_key(&[1, 2, 3]));
