@@ -30,12 +30,7 @@ use alloy_rpc_types_eth::BlockId;
 use clap::Args;
 use eyre::{Context, Result, bail, ensure};
 use rustc_hash::FxHashMap;
-use stateless_common::{
-    R2CountFlag, R2Flag, R2Flags, R2WitnessTransport, RedactedSecret, RpcClient, RpcClientConfig,
-    decode_on_blocking_pool, decode_witness_payload_light, validate_r2_flags,
-};
-use stateless_core::{LightWitness, withdrawals::MptWitness};
-use stateless_r2::fetch::{DEFAULT_CONNECT_TIMEOUT, FetchTimeouts};
+use stateless_common::RpcClient;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt},
     process::Child,
@@ -82,9 +77,7 @@ pub struct BackfillArgs {
         required = true
     )]
     pub rpc_endpoints: Vec<String>,
-    /// Witness RPC endpoint(s) (`mega_getBlockWitness`). Always required: the
-    /// witness path, and the fallback behind R2 when the `--r2-*` flags
-    /// configure it.
+    /// Witness RPC endpoint(s) (`mega_getBlockWitness`).
     #[clap(
         long = "witness-endpoint",
         env = "COVERAGE_REPLAYER_WITNESS_ENDPOINT",
@@ -92,23 +85,6 @@ pub struct BackfillArgs {
         required = true
     )]
     pub witness_endpoints: Vec<String>,
-    /// R2 S3 endpoint origin, e.g. `https://<account>.r2.cloudflarestorage.com`
-    /// (no bucket path). Configuring it, with its bucket and credentials,
-    /// turns on the R2 witness route: every witness is tried against the
-    /// bucket first, and a block R2 cannot serve goes to `--witness-endpoint`.
-    /// A half-configured target is refused by name.
-    #[clap(long, env = "COVERAGE_REPLAYER_R2_ENDPOINT")]
-    pub r2_endpoint: Option<String>,
-    /// R2 bucket holding the witnesses (e.g. `witness-mainnet`).
-    #[clap(long, env = "COVERAGE_REPLAYER_R2_BUCKET")]
-    pub r2_bucket: Option<String>,
-    /// R2 access key id (Object Read).
-    #[clap(long, env = "COVERAGE_REPLAYER_R2_ACCESS_KEY_ID")]
-    pub r2_access_key_id: Option<String>,
-    /// R2 secret access key. Prefer the env var over the flag. Redacted in
-    /// `Debug` output.
-    #[clap(long, env = "COVERAGE_REPLAYER_R2_SECRET_ACCESS_KEY")]
-    pub r2_secret_access_key: Option<RedactedSecret>,
     /// Genesis JSON path (e.g. test_data/mainnet/genesis.json).
     #[clap(long, env = "COVERAGE_REPLAYER_GENESIS_FILE")]
     pub genesis_file: String,
@@ -277,7 +253,6 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     }
     let statuses = selection.statuses(&store)?;
 
-    let r2 = r2_transport(&args)?.map(Arc::new);
     let client = Arc::new(RpcClient::new(
         &args.rpc_endpoints.iter().map(String::as_str).collect::<Vec<_>>(),
         &args.witness_endpoints.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -346,21 +321,13 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
                 }
                 let dirs = dirs.clone();
                 let client = client.clone();
-                let r2 = r2.clone();
                 let verified_codes = verified_codes.clone();
                 inflight.spawn(async move {
                     let mut attempt = 0u64;
                     let mut block_cache = None;
                     loop {
-                        match fetch_block(
-                            &client,
-                            r2.as_deref(),
-                            &dirs,
-                            &verified_codes,
-                            n,
-                            &mut block_cache,
-                        )
-                        .await
+                        match fetch_block(&client, &dirs, &verified_codes, n, &mut block_cache)
+                            .await
                         {
                             Ok(()) => break n,
                             Err(e) => {
@@ -439,7 +406,6 @@ async fn forward_fetched(
 /// block every 5 seconds.
 async fn fetch_block(
     client: &RpcClient,
-    r2: Option<&R2WitnessTransport>,
     dirs: &DataDir,
     verified_codes: &Arc<VerifiedCodes>,
     n: u64,
@@ -498,24 +464,10 @@ async fn fetch_block(
     }
     let block = block_cache.as_ref().expect("just filled");
     let hash = block.header.hash;
-    // Zero-validation light fetch (from R2 or the witness RPC): no
-    // elliptic-curve work is spent on the proof we never verify. Full
-    // witnesses are NOT stored anywhere — when a selected block needs one, it
-    // is re-fetched on demand. Either source serves the full history: the
-    // bucket keeps every witness, and the witness RPC reads the same bucket.
-    let from_r2 = match r2 {
-        Some(r2) => r2_witness(r2, n, hash)
-            .await
-            .inspect_err(|e| {
-                warn!(block = n, error = %format!("{e:#}"), "R2 witness failed; using the witness RPC")
-            })
-            .ok(),
-        None => None,
-    };
-    let (light_witness, _mpt_witness) = match from_r2 {
-        Some(witness) => witness,
-        None => client.get_witness_light(n, hash).await,
-    };
+    // Zero-validation light fetch: no elliptic-curve work is spent on the
+    // proof we never verify. Full witnesses are NOT stored anywhere — when a
+    // selected block needs one, it is re-fetched on demand.
+    let (light_witness, _mpt_witness) = client.get_witness_light(n, hash).await;
 
     let code_hashes = stateless_core::collect_code_hashes(&light_witness.kvs);
     resolve_missing_codes(client, dirs, verified_codes, code_hashes.clone()).await?;
@@ -530,63 +482,6 @@ async fn fetch_block(
     })
     .await??;
     Ok(())
-}
-
-/// The R2 witness route, when the `--r2-*` flags configure a target, judged
-/// by the rules the validator and the trace server share
-/// (`validate_r2_flags`). This binary offers the S3 target only.
-fn r2_transport(args: &BackfillArgs) -> Result<Option<R2WitnessTransport>> {
-    let flags = R2Flags {
-        endpoint: R2Flag::new("--r2-endpoint", args.r2_endpoint.as_deref()),
-        bucket: R2Flag::new("--r2-bucket", args.r2_bucket.as_deref()),
-        access_key_id: R2Flag::new("--r2-access-key-id", args.r2_access_key_id.as_deref()),
-        secret_access_key: R2Flag::new(
-            "--r2-secret-access-key",
-            args.r2_secret_access_key.as_ref().map(AsRef::as_ref),
-        ),
-        custom_domain: R2Flag::new("--r2-custom-domain", None),
-        access_client_id: R2Flag::new("--r2-access-client-id", None),
-        access_client_secret: R2Flag::new("--r2-access-client-secret", None),
-        connections: R2Flag::new("--r2-connections", None),
-        max_concurrent_requests: R2CountFlag::new("--r2-max-concurrent-requests", None),
-        tuning: &[],
-    };
-    // Each attempt gets its share of the budget, so a stalled GET cannot use
-    // up the attempts that follow it.
-    let per_attempt = R2_BUDGET / R2_ATTEMPTS as u32;
-    let timeouts = FetchTimeouts { per_attempt, connect: DEFAULT_CONNECT_TIMEOUT };
-    let transport = R2WitnessTransport::from_config(
-        validate_r2_flags(&flags)?,
-        timeouts,
-        RpcClientConfig::default().rpc_retry,
-        Arc::new(()),
-    )?;
-    match &transport {
-        Some(t) => {
-            info!(origin = %t.origin(), "witness source: R2 first, --witness-endpoint as fallback")
-        }
-        None => info!("witness source: --witness-endpoint (no --r2-* target configured)"),
-    }
-    Ok(transport)
-}
-
-/// What R2 gets per block before the block goes to the witness RPC, a second
-/// path to the same bucket: a few attempts inside one budget, so a stalled
-/// or failing R2 hands the block over rather than holding it.
-const R2_ATTEMPTS: usize = 3;
-const R2_BUDGET: Duration = Duration::from_secs(60);
-
-async fn r2_witness(
-    r2: &R2WitnessTransport,
-    n: u64,
-    hash: B256,
-) -> Result<(LightWitness, MptWitness)> {
-    let deadline = Instant::now() + R2_BUDGET;
-    let object = r2.fetcher().get_block_object(n, hash, R2_ATTEMPTS, Some(deadline), || {}).await?;
-    Ok(decode_on_blocking_pool(object.bytes, n, hash, None, |bytes| {
-        decode_witness_payload_light(bytes)
-    })
-    .await?)
 }
 
 /// The codes-dir files this run has already found content-valid, shared by
@@ -1136,45 +1031,6 @@ mod tests {
             .map_err(|e| eyre::eyre!("{e}"))
     }
 
-    /// A configured R2 target is the whole switch, judged by the rules the
-    /// validator and the trace server share: none configured means the
-    /// witness RPC alone, a complete one turns R2 on, and a partial one is
-    /// refused by name instead of silently read as "no R2".
-    #[test]
-    fn an_r2_target_is_the_switch_and_a_partial_one_is_refused() {
-        let none = parse(&[]).unwrap();
-        assert!(r2_transport(&none).unwrap().is_none());
-
-        let quad = [
-            "--r2-endpoint",
-            "https://acc.r2.cloudflarestorage.com",
-            "--r2-bucket",
-            "witness-test",
-            "--r2-access-key-id",
-            "ak",
-            "--r2-secret-access-key",
-            "sk",
-        ];
-        let complete = parse(&quad).unwrap();
-        assert!(r2_transport(&complete).unwrap().is_some());
-
-        let partial = parse(&quad[..4]).unwrap();
-        let err = r2_transport(&partial).expect_err("a half-configured target must fail");
-        assert!(err.to_string().contains("--r2-access-key-id"), "must name what is missing: {err}");
-    }
-
-    /// The witness RPC is the fallback behind R2 as well as the path without
-    /// it, so it is never optional.
-    #[test]
-    fn a_witness_endpoint_is_always_required() {
-        let argv = ["backfill", "--rpc-endpoint", "http://rpc.invalid", "--genesis-file", "/g"];
-        let err =
-            <TestCli as clap::Parser>::try_parse_from(argv.iter().chain(&["--data-dir", "/d"]))
-                .err()
-                .expect("--witness-endpoint is required");
-        assert!(err.to_string().contains("--witness-endpoint"), "{err}");
-    }
-
     /// The list format is what carries a pool between builds, so its exact
     /// tolerances are load-bearing: `#` comments (the header `--dump-pool`
     /// writes), trailing comments, blank lines, and out-of-order duplicates
@@ -1314,8 +1170,7 @@ mod tests {
         assert_eq!(judge.patterns.len(), 1, "no new pattern was created");
 
         // Completion order != block order: an EARLIER block finishing late
-        // must pull first_block down (merge min-folds the same way — the two
-        // must agree on provenance).
+        // must pull first_block down.
         assert_eq!(rec.first_block, 100);
         judge.ingest(response(50, vec![1, 2], 900)).unwrap();
         let rec = &judge.patterns[&key];
@@ -1345,7 +1200,7 @@ mod tests {
             location: "30ce038/src/a.rs:12:5".into(),
         }];
         judge.ingest(resp).unwrap();
-        let stored = &judge.store.load().unwrap().counters[&4];
+        let stored = &judge.store.counters().unwrap()[&4];
         assert_eq!((stored.dense, stored.line), (3, 12));
         assert_eq!(stored.location, "30ce038/src/a.rs:12:5");
 
@@ -1434,11 +1289,12 @@ mod tests {
 
         // The store round-trips the newly committed pattern and block record
         // (the seeded dominator lived only in the in-memory snapshot).
-        let snap = judge.store.load().unwrap();
-        assert_eq!(snap.patterns.len(), 1);
-        assert!(snap.patterns.contains_key(&sub_key));
-        assert_eq!(snap.blocks[&200].status, BlockStatus::Ok);
-        assert_eq!(snap.blocks[&200].pattern_key, Some(sub_key));
+        let patterns = judge.store.patterns().unwrap();
+        assert_eq!(patterns.len(), 1);
+        assert!(patterns.contains_key(&sub_key));
+        let record = &judge.store.block_records(&[200]).unwrap()[&200];
+        assert_eq!(record.status, BlockStatus::Ok);
+        assert_eq!(record.pattern_key, Some(sub_key));
     }
 
     /// The judge checks domination against the patterns that arrived
@@ -1478,19 +1334,17 @@ mod tests {
         let err = judge.ingest(bad).unwrap_err();
         assert!(err.to_string().contains("ABORTING"), "{err}");
         // The failure is recorded so a re-run retries the block.
-        let snap = judge.store.load().unwrap();
-        assert_eq!(snap.blocks[&400].status, BlockStatus::Error);
+        assert_eq!(judge.store.block_records(&[400]).unwrap()[&400].status, BlockStatus::Error);
 
         let mut divergent = response(401, vec![1], 100);
         divergent.gas_ok = false;
         let err = judge.ingest(divergent).unwrap_err();
         assert!(err.to_string().contains("SANITY FAILURE"), "{err}");
-        let snap = judge.store.load().unwrap();
-        assert_eq!(snap.blocks[&401].status, BlockStatus::Divergent);
+        assert_eq!(judge.store.block_records(&[401]).unwrap()[&401].status, BlockStatus::Divergent);
     }
 
-    /// The keying contract shared with merge: sorted-id hashing, distinct sets
-    /// → distinct keys (up to 64-bit collisions).
+    /// The keying contract: sorted-id hashing, distinct sets → distinct keys
+    /// (up to 64-bit collisions).
     #[test]
     fn pattern_key_contract() {
         assert_eq!(pattern_base_key(&[1, 2, 3]), pattern_base_key(&[1, 2, 3]));

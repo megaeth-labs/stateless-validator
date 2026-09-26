@@ -27,8 +27,8 @@ const COUNTERS: TableDefinition<u64, &[u8]> = TableDefinition::new("counters");
 const PATTERNS: TableDefinition<u64, &[u8]> = TableDefinition::new("patterns");
 /// One row per block ever scanned — tens of millions in a full-history store,
 /// against a working set (counters, patterns) bounded by the universe. So no
-/// reader loads it whole unless it must (`merge`): [`Store::blocks`] streams a
-/// range, [`Store::block_records`] looks rows up by number.
+/// reader loads it whole: [`Store::blocks`] streams a range,
+/// [`Store::block_records`] looks rows up by number.
 const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("blocks");
 
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
@@ -78,9 +78,7 @@ impl PatternRecord {
 
     /// Folds another record of the same bitmap into this one: hits add up,
     /// the block range widens, and the representative moves to the lighter
-    /// block. The judge and `merge` both fold through here, so a merged store
-    /// and a sequential scan agree on every statistic whatever order the
-    /// blocks arrived in.
+    /// block — whatever order the blocks arrived in.
     pub fn absorb(&mut self, other: &Self) {
         self.hit_count += other.hit_count;
         self.first_block = self.first_block.min(other.first_block);
@@ -122,9 +120,9 @@ pub struct BlockRecord {
     pub error: Option<String>,
 }
 
-/// The redb handle type selects the API: [`Database`] for writers (backfill,
-/// merge output), [`ReadOnlyDatabase`] for pure readers (set-cover, inspect,
-/// merge inputs) — the write methods do not exist on a read-only store.
+/// The redb handle type selects the API: [`Database`] for the writer
+/// (backfill), [`ReadOnlyDatabase`] for pure readers (set-cover, inspect) —
+/// the write methods do not exist on a read-only store.
 pub struct Store<D = Database> {
     db: D,
     /// Block commits so far (see [`Store::commit_block`]).
@@ -154,7 +152,6 @@ impl Store {
                 Some(existing) => {
                     check_binary_id(path, &existing, binary_id)?;
                     check_schema_version(&meta, path)?;
-                    check_complete(&meta, path)?;
                 }
                 None => {
                     meta.insert(BINARY_ID_KEY, binary_id.as_bytes())?;
@@ -217,63 +214,6 @@ impl Store {
         self.db.begin_write()?.commit()?;
         Ok(())
     }
-
-    /// Bulk-writes a merged snapshot into a fresh store, in batched
-    /// transactions. Used by the `merge` subcommand.
-    ///
-    /// The tables are committed batch by batch, so a store interrupted halfway
-    /// is a perfectly valid, correctly stamped database holding a prefix of
-    /// the data — and set-cover would publish a cover of that prefix. The
-    /// marker set here makes every open refuse the store until the last batch
-    /// is in.
-    pub fn write_bulk(&self, snapshot: &StoreSnapshot) -> Result<()> {
-        self.set_incomplete(true)?;
-        self.write_table(COUNTERS, &snapshot.counters)?;
-        self.write_table(PATTERNS, &snapshot.patterns)?;
-        self.write_table(BLOCKS, &snapshot.blocks)?;
-        self.set_incomplete(false)
-    }
-
-    fn set_incomplete(&self, incomplete: bool) -> Result<()> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut meta = txn.open_table(META)?;
-            if incomplete {
-                meta.insert(INCOMPLETE_KEY, b"bulk write in progress".as_slice())?;
-            } else {
-                meta.remove(INCOMPLETE_KEY)?;
-            }
-        }
-        txn.commit()?;
-        Ok(())
-    }
-
-    /// Writes one `u64 -> bincode(T)` table in batched transactions.
-    fn write_table<T: serde::Serialize>(
-        &self,
-        table: TableDefinition<u64, &[u8]>,
-        rows: &HashMap<u64, T>,
-    ) -> Result<()> {
-        const BATCH: usize = 100_000;
-        // Ascending key order is load-bearing for speed, not correctness: a
-        // `HashMap` iterates in random order, and random insertion dirties
-        // pages all over the B-tree on every batch, so each commit rewrites
-        // a slice of the whole tree. Sorted, every batch lands on the right
-        // edge and a commit costs what the batch holds.
-        let mut rows: Vec<_> = rows.iter().collect();
-        rows.sort_unstable_by_key(|(key, _)| **key);
-        for chunk in rows.chunks(BATCH) {
-            let txn = self.db.begin_write()?;
-            {
-                let mut t = txn.open_table(table)?;
-                for (key, value) in chunk {
-                    t.insert(**key, encode(value)?.as_slice())?;
-                }
-            }
-            txn.commit()?;
-        }
-        Ok(())
-    }
 }
 
 impl Store<ReadOnlyDatabase> {
@@ -305,7 +245,6 @@ impl Store<ReadOnlyDatabase> {
         let txn = store.db.begin_read()?;
         let meta = txn.open_table(META)?;
         check_schema_version(&meta, path)?;
-        check_complete(&meta, path)?;
         let binary_id = read_meta(&meta, BINARY_ID_KEY)?.unwrap_or_else(|| "<unset>".into());
         drop(meta);
         drop(txn);
@@ -313,7 +252,7 @@ impl Store<ReadOnlyDatabase> {
     }
 
     /// [`Self::open_readonly`] for readers that interpret the store's dense
-    /// indices (set-cover, merge): refuses a store another build filled.
+    /// indices (set-cover): refuses a store another build filled.
     pub fn open_for_build(path: &Path, binary_id: &str) -> Result<Self> {
         let (store, stored) = Self::open_readonly(path)?;
         check_binary_id(path, &stored, binary_id)?;
@@ -370,31 +309,6 @@ impl<D: ReadableDatabase> Store<D> {
         }
         Ok(found)
     }
-
-    /// The whole store — only `merge` needs the block table in memory.
-    pub fn load(&self) -> Result<StoreSnapshot> {
-        let mut blocks = HashMap::new();
-        self.blocks(.., |n, record| {
-            blocks.insert(n, record);
-        })?;
-        Ok(StoreSnapshot { counters: self.counters()?, patterns: self.patterns()?, blocks })
-    }
-}
-
-const INCOMPLETE_KEY: &str = "incomplete";
-
-/// Rejects the output of a bulk write (`merge`) that never finished.
-fn check_complete<T>(meta: &T, path: &Path) -> Result<()>
-where
-    T: redb::ReadableTable<&'static str, &'static [u8]>,
-{
-    ensure!(
-        meta.get(INCOMPLETE_KEY)?.is_none(),
-        "store {} is the output of a merge that did not finish — it holds only part of the \
-         data. Delete it and run the merge again.",
-        path.display(),
-    );
-    Ok(())
 }
 
 const BINARY_ID_KEY: &str = "binary_id";
@@ -468,14 +382,6 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     Ok(value)
 }
 
-/// In-memory image of a whole store — what `merge` reads and writes.
-#[derive(Clone)]
-pub struct StoreSnapshot {
-    pub counters: HashMap<u64, CounterInfo>,
-    pub patterns: HashMap<u64, PatternRecord>,
-    pub blocks: HashMap<u64, BlockRecord>,
-}
-
 /// Linear-probe step for pattern-key collisions (golden ratio).
 const PROBE_STEP: u64 = 0x9E37_79B9_7F4A_7C15;
 
@@ -496,8 +402,7 @@ pub fn pattern_base_key(sorted_ids: &[u64]) -> u64 {
 /// sorted counter ids: returns `(slot_key, occupied)` where `occupied` means
 /// the slot already holds this exact bitmap (the caller folds into it with
 /// [`PatternRecord::absorb`]); otherwise the slot is vacant and the caller
-/// inserts. The judge and `merge` both key through here — they must key
-/// identically, or a merged store diverges from a sequential run.
+/// inserts.
 pub fn resolve_pattern_slot(
     patterns: &HashMap<u64, PatternRecord>,
     sorted_ids: &[u64],
@@ -594,10 +499,9 @@ mod tests {
         test_support::block(status, None)
     }
 
-    /// The collision branch of the shared probing walk — the one path whose
-    /// judge/merge divergence would silently corrupt merged stores. A
-    /// different bitmap at the base key must step by exactly `PROBE_STEP`;
-    /// the same bitmap parked one step out must be found as occupied.
+    /// The collision branch of the probing walk: a different bitmap at the
+    /// base key must step by exactly `PROBE_STEP`; the same bitmap parked one
+    /// step out must be found as occupied.
     #[test]
     fn probe_collision_walks_probe_step() {
         let ids = [100u64, 200, 300];
@@ -624,38 +528,6 @@ mod tests {
             resolve_pattern_slot(&patterns, &ids, &other.bitmap),
             (base.wrapping_add(PROBE_STEP).wrapping_add(PROBE_STEP), false),
         );
-    }
-
-    /// A merge killed between batches leaves a valid, correctly stamped redb
-    /// file holding a prefix of the data. Nothing may open it: set-cover
-    /// would otherwise publish a cover of that prefix.
-    #[test]
-    fn interrupted_bulk_write_is_refused_by_every_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("store.redb");
-        {
-            let store = Store::open(&path, "id", "u").unwrap();
-            store.set_incomplete(true).unwrap(); // what write_bulk does first
-        }
-        let err = Store::open(&path, "id", "u").err().expect("writer open must fail");
-        assert!(err.to_string().contains("did not finish"), "open: {err}");
-        let err = Store::open_readonly(&path).err().expect("read-only open must fail");
-        assert!(err.to_string().contains("did not finish"), "open_readonly: {err}");
-    }
-
-    /// The marker must be gone once the last table is in.
-    #[test]
-    fn completed_bulk_write_opens_normally() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("store.redb");
-        let snapshot = StoreSnapshot {
-            counters: HashMap::new(),
-            patterns: [(1, rec(&[0]))].into(),
-            blocks: [(5, block(BlockStatus::Ok))].into(),
-        };
-        Store::open(&path, "id", "u").unwrap().write_bulk(&snapshot).unwrap();
-        let (store, _) = Store::open_readonly(&path).expect("a finished merge must open");
-        assert_eq!(store.load().unwrap().blocks.len(), 1);
     }
 
     #[test]
@@ -706,7 +578,7 @@ mod tests {
         assert!(err.to_string().contains("schema"), "open_readonly: {err}");
     }
 
-    /// `inspect` and `merge` read stores the caller does not own (root-owned
+    /// `inspect` reads stores the caller does not own (root-owned
     /// on a server, a read-only copy): the read-only open must need no write
     /// access and leave the file byte-identical.
     #[cfg(unix)]
@@ -728,7 +600,7 @@ mod tests {
             let (store, binary_id) = Store::open_readonly(&path).expect("open a read-only file");
             assert_eq!(binary_id, "megaevm:aaa:fx1");
             assert_eq!(store.universe().unwrap(), "universe/x");
-            assert_eq!(store.load().unwrap().blocks.len(), 1);
+            assert_eq!(store.block_records(&[7]).unwrap().len(), 1);
         }
         assert!(std::fs::read(&path).unwrap() == before, "read-only open modified the store");
     }
@@ -764,6 +636,5 @@ mod tests {
         let mut in_range = Vec::new();
         store.blocks(10..=15, |n, _| in_range.push(n)).unwrap();
         assert_eq!(in_range, vec![10, 15], "blocks limited to the range, in order");
-        assert_eq!(store.load().unwrap().blocks.len(), 4, "a full load is unaffected");
     }
 }

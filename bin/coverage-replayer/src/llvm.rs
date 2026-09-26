@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize};
 /// Version tag of the item definition below, stamped into every store (see
 /// [`universe_stamp`]). Bump it whenever the id, the set of item kinds, or what
 /// a block's bitmap records changes: bitmaps from two definitions must never
-/// share a store, a merge or a manifest. v3: a worker builds its run-once
+/// share a store or a manifest. v3: a worker builds its run-once
 /// tables before it captures anything (`worker::warm_up`), so no block is
 /// credited with them any more.
 const ITEM_UNIVERSE: &str = "regions+branch-arms/v3";
@@ -101,7 +101,7 @@ fn item_id(kind: ItemKind, scoped_path: &str, span: [u32; 4]) -> u64 {
 
 /// A source root's label: its final component — `revm-handler-8.1.0` for a
 /// registry crate, the short rev for the mega-evm checkout. It identifies the
-/// root without saying where it lives, which is what lets shards scanned under
+/// root without saying where it lives, which is what lets scans run under
 /// different `$HOME`s carry the same item ids and the same universe stamp.
 /// [`resolve_source_dirs`] rejects a scope whose labels are not unique, so the
 /// lossy conversion and the fallback below cannot silently merge two roots.
@@ -115,10 +115,9 @@ fn root_label(dir: &Path) -> String {
 /// definition plus the source scope. Two runs whose stamps differ would fill
 /// one store with ids from different universes.
 ///
-/// Built from labels rather than paths, and sorted: `merge` compares stamps
-/// byte for byte, so shards of one distributed scan must stamp identically
-/// whatever home directory they ran under and whatever order their roots were
-/// listed in.
+/// Built from labels rather than paths, and sorted: stamps are compared byte
+/// for byte, so the same scope must stamp identically whatever home directory
+/// it was resolved under and whatever order its roots were listed in.
 pub fn universe_stamp(source_dirs: &[PathBuf]) -> String {
     let mut labels: Vec<String> = source_dirs.iter().map(|d| root_label(d)).collect();
     labels.sort();
@@ -573,8 +572,8 @@ mod tests {
         }
     }
 
-    /// Ids must not depend on where the checkout or registry lives, or shards
-    /// scanned under different homes could not be merged.
+    /// Ids must not depend on where the checkout or registry lives, or the
+    /// same scan run under two homes would disagree.
     #[test]
     fn ids_do_not_depend_on_where_the_source_dir_lives() {
         let moved = THEN_ONLY.replace("/tmp/covfix/src", "/another/home/.cargo/src");
@@ -681,9 +680,8 @@ mod tests {
         assert_eq!(universe_stamp(&[PathBuf::from("/x/mega")]), "regions+branch-arms/v3:mega");
     }
 
-    /// `merge` compares stamps byte for byte, so shards of one distributed
-    /// scan must stamp identically however their homes are laid out — the
-    /// item ids already do not depend on it.
+    /// Stamps are compared byte for byte, so one scope must stamp identically
+    /// however homes are laid out — the item ids already do not depend on it.
     #[test]
     fn universe_stamp_does_not_depend_on_where_the_roots_live() {
         let alice = [

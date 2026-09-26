@@ -25,7 +25,6 @@ revm.workspace = true
 # stateless
 stateless-common = { path = "../../crates/stateless-common" }
 stateless-core = { path = "../../crates/stateless-core" }
-stateless-r2 = { path = "../../crates/stateless-r2" }
 
 # misc
 bincode.workspace = true

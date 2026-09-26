@@ -103,8 +103,8 @@ fn main() {
 }
 
 /// FNV-1a, 64-bit: a stable digest without a dependency — the standard
-/// hasher's algorithm is free to change between releases, and shards built on
-/// different machines must agree on it.
+/// hasher's algorithm is free to change between releases, and the same build
+/// on two machines must agree on it.
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes
         .iter()

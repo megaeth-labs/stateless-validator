@@ -130,8 +130,8 @@ pub struct DataDir {
 
 impl DataDir {
     /// Pure path arithmetic — creates nothing. Writers call
-    /// [`Self::ensure_layout`]; read-only consumers (inspect, merge's shard
-    /// inputs) must not scaffold empty trees in a mistyped or foreign path.
+    /// [`Self::ensure_layout`]; read-only consumers (inspect, report) must not
+    /// scaffold empty trees in a mistyped or foreign path.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }

@@ -7,15 +7,11 @@
 //! can reduce coverage. Minimality is best-effort on top of that, never at
 //! its expense.
 //!
-//! Selection is churn-damped: ties are broken in favor of patterns already in
-//! the incumbent manifest, then by freshness. A final redundancy-elimination
-//! pass drops any selected block whose bitmap is covered by the union of the
-//! others.
+//! Gain ties go to the higher block number, so a store always yields the same
+//! selection. A final redundancy-elimination pass drops any selected block
+//! whose bitmap is covered by the union of the others.
 
-use std::{
-    collections::HashSet,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 use eyre::{Context, Result};
@@ -36,20 +32,6 @@ pub struct SetCoverArgs {
     /// Output manifest path (default: <data-dir>/manifest.json).
     #[clap(long)]
     pub manifest_out: Option<PathBuf>,
-    /// Previous manifest whose patterns get tie-break preference (churn
-    /// damping). Matched by pattern rather than block: a pattern's
-    /// representative moves to the lightest block that produced it, so a later
-    /// backfill can change which block stands for an unchanged pattern.
-    #[clap(long)]
-    pub incumbent_manifest: Option<PathBuf>,
-    /// Delete the archived profiles of dominated patterns once the manifest is
-    /// written. Off by default because it is irreversible and reaches past
-    /// this run: a pattern an EARLIER manifest selected can become dominated
-    /// by a later backfill, and deleting its profile breaks `report` on that
-    /// manifest for good — the pattern stays known, so it is never archived
-    /// again.
-    #[clap(long)]
-    pub prune_profiles: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -110,18 +92,8 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
     // of the few selected representatives are point lookups afterwards.
     let patterns = store.patterns()?;
 
-    let incumbents: HashSet<u64> = match &args.incumbent_manifest {
-        Some(path) => Manifest::read(path)?
-            .blocks
-            .iter()
-            .map(ManifestBlock::pattern_key)
-            .collect::<Result<_>>()?,
-        None => HashSet::new(),
-    };
-
-    info!(patterns = patterns.len(), incumbents = incumbents.len(), "computing greedy set cover");
-
-    let outcome = select_cover(&patterns, &incumbents);
+    info!(patterns = patterns.len(), "computing greedy set cover");
+    let outcome = select_cover(&patterns);
     info!(
         pruned = outcome.pruned_dominated.len(),
         antichain = patterns.len() - outcome.pruned_dominated.len(),
@@ -177,17 +149,6 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
     for b in &manifest.blocks {
         info!(block = b.number, gain = b.gain, bits = b.bits, "selected");
     }
-
-    // Only after the manifest is durably written: a failure above must not
-    // leave the store with neither the old profiles nor a new manifest.
-    if args.prune_profiles {
-        let removed = outcome
-            .pruned_dominated
-            .iter()
-            .filter(|key| std::fs::remove_file(dirs.archived_profile(**key)).is_ok())
-            .count();
-        info!(removed, "archived profiles of dominated patterns deleted (--prune-profiles)");
-    }
     Ok(())
 }
 
@@ -197,7 +158,7 @@ pub struct CoverOutcome {
     /// gain)`. Redundancy-eliminated picks are already removed.
     pub selected: Vec<(u64, u64, u64)>,
     /// Pattern keys strictly dominated by another pattern (excluded from the
-    /// candidate pool; their archived profiles are safe to delete).
+    /// candidate pool).
     pub pruned_dominated: Vec<u64>,
     /// Representatives dropped by the redundancy-elimination pass (for
     /// logging; no longer present in `selected`).
@@ -206,13 +167,10 @@ pub struct CoverOutcome {
     pub covered_counters: u64,
 }
 
-/// Pure greedy set cover with antichain pruning, incumbent-biased
-/// tie-breaking (`incumbents` are pattern keys), and a final
-/// redundancy-elimination pass. No I/O — the fs side effects (deleting pruned
-/// profiles) belong to the caller.
+/// Pure greedy set cover with antichain pruning and a final
+/// redundancy-elimination pass.
 pub fn select_cover(
     patterns: &std::collections::HashMap<u64, crate::store::PatternRecord>,
-    incumbents: &HashSet<u64>,
 ) -> CoverOutcome {
     let mut universe = BitSet::new();
     for rec in patterns.values() {
@@ -226,23 +184,22 @@ pub fn select_cover(
     // archive at promotion time).
     let (mut remaining, pruned_dominated) = split_antichain(patterns);
 
-    // Greedy: max gain; ties prefer incumbents (churn damping), then the
-    // higher block number.
+    // Greedy: max gain; ties go to the higher block number.
     let mut covered = BitSet::new();
     let mut selected: Vec<(u64, u64, u64)> = Vec::new();
     loop {
-        let mut best: Option<(u64, bool, u64, usize)> = None; // (gain, incumbent, block, idx)
-        for (idx, (key, rec)) in remaining.iter().enumerate() {
+        let mut best: Option<(u64, u64, usize)> = None; // (gain, block, idx)
+        for (idx, (_key, rec)) in remaining.iter().enumerate() {
             let gain = rec.bitmap.andnot_count(&covered);
             if gain == 0 {
                 continue;
             }
-            let candidate = (gain, incumbents.contains(*key), rec.representative, idx);
-            if best.is_none_or(|b| (candidate.0, candidate.1, candidate.2) > (b.0, b.1, b.2)) {
+            let candidate = (gain, rec.representative, idx);
+            if best.is_none_or(|b| (candidate.0, candidate.1) > (b.0, b.1)) {
                 best = Some(candidate);
             }
         }
-        let Some((gain, _inc, _blk, idx)) = best else { break };
+        let Some((gain, _blk, idx)) = best else { break };
         let (key, rec) = remaining.swap_remove(idx);
         covered.union_with(&rec.bitmap);
         selected.push((*key, rec.representative, gain));
@@ -362,7 +319,7 @@ mod tests {
     use crate::store::{PatternRecord, test_support::pattern as pat};
 
     fn cover(patterns: &HashMap<u64, PatternRecord>) -> (Vec<u64>, CoverOutcome) {
-        let outcome = select_cover(patterns, &HashSet::new());
+        let outcome = select_cover(patterns);
         let mut blocks: Vec<u64> = outcome.selected.iter().map(|(_, rep, _)| *rep).collect();
         blocks.sort_unstable();
         (blocks, outcome)
@@ -513,23 +470,13 @@ mod tests {
         assert!(outcome.pruned_dominated.is_empty());
     }
 
-    /// On a gain tie, the incumbent pattern wins (churn damping) — whichever
-    /// block represents it now. The previous manifest selected pattern 1
-    /// through some block; a later backfill re-homed it to block 55, which no
-    /// manifest ever named, and it must still win the tie.
+    /// On a gain tie the higher block number is picked first, so the
+    /// selection does not depend on map iteration order.
     #[test]
-    fn incumbent_wins_gain_ties() {
-        // Two disjoint equal-size patterns; both must be picked, but the
-        // FIRST pick (order) must be the incumbent regardless of block number.
+    fn gain_ties_go_to_the_higher_block() {
         let patterns: HashMap<u64, PatternRecord> =
             [(1, pat(&[0, 1], 55)), (2, pat(&[2, 3], 99))].into();
-        let incumbents: HashSet<u64> = [1].into();
-        let outcome = select_cover(&patterns, &incumbents);
-        assert_eq!(outcome.selected[0].1, 55, "incumbent must be picked first on a tie");
-
-        // Without incumbency the higher block number wins the tie.
-        let outcome = select_cover(&patterns, &HashSet::new());
-        assert_eq!(outcome.selected[0].1, 99);
+        assert_eq!(select_cover(&patterns).selected[0].1, 99);
     }
 
     /// The {a,b}+{c} vs {a,b,c} shape: greedy picks the superset first and

@@ -14,7 +14,7 @@ use eyre::Result;
 
 use crate::{
     bitset::BitSet,
-    setcover::select_cover,
+    setcover::{CoverOutcome, select_cover},
     spool::DataDir,
     store::{BlockStatus, PatternRecord, Store, elapsed_stats},
 };
@@ -46,12 +46,6 @@ pub struct InspectArgs {
     /// antichain.
     #[clap(long, conflicts_with = "dump_pool")]
     pub no_cover_preview: bool,
-    /// With `--dump-pool`, additionally take up to this many other blocks per
-    /// antichain pattern. Blocks that share a pattern under this build can
-    /// split under another, so a few siblings buy slack against exactly the
-    /// case the representative alone would lose.
-    #[clap(long, default_value_t = 0)]
-    pub pool_siblings: usize,
 }
 
 pub fn run(args: InspectArgs) -> Result<()> {
@@ -130,64 +124,11 @@ pub fn run(args: InspectArgs) -> Result<()> {
     }
     println!();
 
-    // ---- counter rarity: how fragile is the universe? ----
-    // Dense indices are contiguous from 0, one per universe item, so a Vec
-    // beats a HashMap here.
-    let mut coverage_count: Vec<u32> = vec![0; universe_bits as usize];
-    for (_, rec) in &hits {
-        for dense in rec.bitmap.iter_ones() {
-            if let Some(c) = coverage_count.get_mut(dense as usize) {
-                *c += 1;
-            }
-        }
-    }
-    let rare1 = coverage_count.iter().filter(|&&c| c == 1).count();
-    let rare2 = coverage_count.iter().filter(|&&c| c > 0 && c <= 2).count();
-    println!(
-        "counter rarity: covered-by-exactly-1-pattern={rare1} ({:.1}% of universe), <=2 patterns={rare2}",
-        100.0 * rare1 as f64 / universe_bits.max(1) as f64
-    );
-
-    // ---- growth curve: patterns & universe by first-seen block ----
-    {
-        let mut by_first: Vec<(&PatternRecord, u64)> =
-            patterns.values().map(|r| (r, r.first_block)).collect();
-        by_first.sort_by_key(|(_, fb)| *fb);
-        if let (Some((_, lo)), Some((_, hi))) = (by_first.first(), by_first.last()) {
-            let (lo, hi) = (*lo, (*hi).max(lo + 1));
-            let buckets = 10u64;
-            let width = (hi - lo).div_ceil(buckets);
-            println!();
-            println!("growth by first-seen block ({buckets} buckets of {width} blocks):");
-            let mut cum = BitSet::new();
-            let mut idx = 0usize;
-            for b in 0..buckets {
-                // The last bucket takes everything left: with `(hi - lo)` an
-                // exact multiple of the bucket count, `end == hi` and a
-                // strict `<` would silently drop the patterns first seen at
-                // `hi` (at least one always exists).
-                let last = b + 1 == buckets;
-                let end = lo + width * (b + 1);
-                let mut new_patterns = 0u64;
-                while idx < by_first.len() && (last || by_first[idx].1 < end) {
-                    cum.union_with(&by_first[idx].0.bitmap);
-                    new_patterns += 1;
-                    idx += 1;
-                }
-                println!(
-                    "  ..{:>10}: +{new_patterns:<5} patterns, universe={}",
-                    end.min(hi),
-                    cum.count_ones()
-                );
-            }
-        }
-    }
-
     // ---- set-cover dry run: THE algorithm (select_cover), not a copy — the
     // antichain count and the selection preview cannot drift from a real
-    // `set-cover` run (no incumbents, and no fs side effects here).
+    // `set-cover` run.
     if !args.no_cover_preview {
-        let outcome = select_cover(&patterns, &Default::default());
+        let outcome = select_cover(&patterns);
         println!();
         println!(
             "antichain: {} of {} patterns are strictly dominated ({:.1}%) — prunable \
@@ -197,7 +138,7 @@ pub fn run(args: InspectArgs) -> Result<()> {
             100.0 * outcome.pruned_dominated.len() as f64 / patterns.len().max(1) as f64
         );
         println!();
-        println!("greedy selection preview (matches a real set-cover run, no incumbents):");
+        println!("greedy selection preview (matches a real set-cover run):");
         for (key, rep, gain) in &outcome.selected {
             println!("  {rep:>12}  gain={gain:<6} bits={}", patterns[key].bits);
         }
@@ -209,10 +150,7 @@ pub fn run(args: InspectArgs) -> Result<()> {
         );
 
         if let Some(path) = &args.dump_pool {
-            let dominated: HashSet<u64> = outcome.pruned_dominated.iter().copied().collect();
-            let siblings = collect_siblings(&store, &patterns, &dominated, args.pool_siblings)?;
-            let written =
-                write_pool(path, &patterns, &dominated, &siblings, args.pool_siblings, &binary_id)?;
+            let written = write_pool(path, &patterns, &outcome, &binary_id)?;
             println!();
             println!("candidate pool: {written} blocks written to {}", path.display());
         }
@@ -245,15 +183,12 @@ pub fn run(args: InspectArgs) -> Result<()> {
 fn write_pool(
     path: &Path,
     patterns: &HashMap<u64, PatternRecord>,
-    dominated: &HashSet<u64>,
-    siblings: &HashMap<u64, Vec<u64>>,
-    siblings_per_pattern: usize,
+    outcome: &CoverOutcome,
     binary_id: &str,
 ) -> Result<usize> {
+    let dominated: HashSet<u64> = outcome.pruned_dominated.iter().copied().collect();
     let antichain: Vec<u64> = patterns.keys().copied().filter(|k| !dominated.contains(k)).collect();
-
-    let mut blocks: BTreeSet<u64> = antichain.iter().map(|k| patterns[k].representative).collect();
-    blocks.extend(siblings.values().flatten());
+    let blocks: BTreeSet<u64> = antichain.iter().map(|k| patterns[k].representative).collect();
 
     let generated_at = crate::setcover::unix_now();
     let mut out = String::new();
@@ -266,7 +201,6 @@ fn write_pool(
         antichain.len(),
         dominated.len(),
     ));
-    out.push_str(&format!("# siblings_per_pattern: {siblings_per_pattern}\n"));
     out.push_str(&format!("# blocks: {}\n", blocks.len()));
     for n in &blocks {
         out.push_str(&format!("{n}\n"));
@@ -275,53 +209,13 @@ fn write_pool(
     Ok(blocks.len())
 }
 
-/// Up to `per_pattern` blocks of each antichain pattern besides its
-/// representative — always the lowest-numbered ones, so a pool does not
-/// depend on iteration order. One streaming pass over BLOCKS, holding at most
-/// `per_pattern` numbers per pattern; skipped entirely for the default of 0.
-fn collect_siblings(
-    store: &Store<redb::ReadOnlyDatabase>,
-    patterns: &HashMap<u64, PatternRecord>,
-    dominated: &HashSet<u64>,
-    per_pattern: usize,
-) -> Result<HashMap<u64, Vec<u64>>> {
-    let mut siblings: HashMap<u64, Vec<u64>> = HashMap::new();
-    if per_pattern == 0 {
-        return Ok(siblings);
-    }
-    store.blocks(.., |number, rec| {
-        let Some(key) = rec.pattern_key else { return };
-        if rec.status != BlockStatus::Ok || dominated.contains(&key) {
-            return;
-        }
-        let Some(pattern) = patterns.get(&key) else { return };
-        if pattern.representative == number {
-            return;
-        }
-        // Rows arrive in ascending block order, so the first `per_pattern`
-        // seen are the lowest.
-        let kept = siblings.entry(key).or_default();
-        if kept.len() < per_pattern {
-            kept.push(number);
-        }
-    })?;
-    Ok(siblings)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        setcover::CoverOutcome,
-        store::{BlockRecord, test_support::pattern as pat},
-    };
+    use crate::store::{BlockRecord, test_support::pattern as pat};
 
     fn block(pattern_key: u64) -> BlockRecord {
         crate::store::test_support::block(BlockStatus::Ok, Some(pattern_key))
-    }
-
-    fn dominated(outcome: &CoverOutcome) -> HashSet<u64> {
-        outcome.pruned_dominated.iter().copied().collect()
     }
 
     /// A, B (equal bits, overlapping) and C, none dominated. Greedy reaches
@@ -335,7 +229,7 @@ mod tests {
     #[test]
     fn pool_keeps_the_antichain_block_the_cover_drops() {
         let patterns = three_patterns();
-        let outcome = select_cover(&patterns, &Default::default());
+        let outcome = select_cover(&patterns);
 
         let cover: Vec<u64> = outcome.selected.iter().map(|(_, rep, _)| *rep).collect();
         assert_eq!(cover, vec![20, 30], "greedy reaches full coverage without block 10");
@@ -343,15 +237,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.txt");
-        let written = write_pool(
-            &path,
-            &patterns,
-            &dominated(&outcome),
-            &HashMap::new(),
-            0,
-            "megaevm:test:fx0",
-        )
-        .unwrap();
+        let written = write_pool(&path, &patterns, &outcome, "megaevm:test:fx0").unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
         let blocks: Vec<u64> =
@@ -369,26 +255,17 @@ mod tests {
     #[test]
     fn pool_header_records_provenance_and_stays_commented() {
         let patterns = three_patterns();
-        let outcome = select_cover(&patterns, &Default::default());
+        let outcome = select_cover(&patterns);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.txt");
-        write_pool(
-            &path,
-            &patterns,
-            &dominated(&outcome),
-            &HashMap::new(),
-            0,
-            "megaevm:19f3965962c4:fxdeadbeef",
-        )
-        .unwrap();
+        write_pool(&path, &patterns, &outcome, "megaevm:19f3965962c4:fxdeadbeef").unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# binary_id: megaevm:19f3965962c4:fxdeadbeef"), "{text}");
         assert!(text.contains("# patterns: 3 total, 3 antichain, 0 dominated"), "{text}");
-        assert!(text.contains("# siblings_per_pattern: 0"), "{text}");
         assert!(text.contains("# blocks: 3"), "{text}");
         assert!(
-            text.lines().take_while(|l| l.starts_with('#')).count() == 6,
+            text.lines().take_while(|l| l.starts_with('#')).count() == 5,
             "every header line must be commented: {text}"
         );
     }
@@ -435,7 +312,6 @@ mod tests {
             data_dir: data_dir.clone(),
             top: 3,
             dump_pool: Some(pool.clone()),
-            pool_siblings: 0,
             no_cover_preview: false,
         })
         .unwrap();
@@ -447,56 +323,6 @@ mod tests {
             .collect();
         assert_eq!(blocks, vec![10, 30], "block 20's pattern is dominated by block 10's");
 
-        run(InspectArgs {
-            data_dir,
-            top: 3,
-            dump_pool: None,
-            pool_siblings: 0,
-            no_cover_preview: true,
-        })
-        .unwrap();
-    }
-
-    /// Siblings come from a streaming pass over the BLOCKS table of a real
-    /// store, and which ones are kept must not depend on anything but the
-    /// data — two runs over the same store have to name the same blocks or a
-    /// pool stops being reproducible.
-    #[test]
-    fn pool_siblings_are_the_lowest_and_deterministic() {
-        let dir = tempfile::tempdir().unwrap();
-        let store_path = dir.path().join("store.redb");
-        let patterns = three_patterns();
-        {
-            let store = Store::open(&store_path, "id", "u").unwrap();
-            // Pattern 1 (representative 10) also occurs at 11, 54, 77, 999;
-            // pattern 3 (representative 30) at 31 — a second pattern, so the
-            // test pins the per-pattern cap rather than one pattern's luck.
-            for (number, key) in
-                [(999u64, 1u64), (10, 1), (77, 1), (11, 1), (54, 1), (20, 2), (30, 3), (31, 3)]
-            {
-                store.commit_block(number, &block(key), &[], Some((key, &patterns[&key]))).unwrap();
-            }
-            store.flush().unwrap();
-        }
-        let (store, _) = Store::open_readonly(&store_path).unwrap();
-        let outcome = select_cover(&patterns, &Default::default());
-
-        let read_pool = |per_pattern: usize, name: &str| -> Vec<u64> {
-            let path = dir.path().join(name);
-            let dominated = dominated(&outcome);
-            let siblings = collect_siblings(&store, &patterns, &dominated, per_pattern).unwrap();
-            write_pool(&path, &patterns, &dominated, &siblings, per_pattern, "id").unwrap();
-            std::fs::read_to_string(&path)
-                .unwrap()
-                .lines()
-                .filter(|l| !l.starts_with('#'))
-                .map(|l| l.parse().unwrap())
-                .collect()
-        };
-
-        assert_eq!(read_pool(0, "a.txt"), vec![10, 20, 30], "0 siblings = representatives only");
-        // Two lowest non-representative blocks of pattern 1: 11 and 54.
-        assert_eq!(read_pool(2, "b.txt"), vec![10, 11, 20, 30, 31, 54]);
-        assert_eq!(read_pool(2, "c.txt"), read_pool(2, "d.txt"), "same store, same pool");
+        run(InspectArgs { data_dir, top: 3, dump_pool: None, no_cover_preview: true }).unwrap();
     }
 }

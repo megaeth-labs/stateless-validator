@@ -11,22 +11,21 @@
 //! `set-cover` computes a small block set covering every item ever observed —
 //! greedy, then redundancy-eliminated: no selected block can be dropped, but
 //! the set is not guaranteed to be the smallest possible (that is NP-hard).
-//! `report` renders an llvm-cov summary for that set, `inspect` prints store
-//! statistics, and `merge` combines per-machine shard stores from a
-//! distributed scan.
+//! `report` renders an llvm-cov summary for that set, and `inspect` prints
+//! store statistics and exports the candidate pool.
 //!
 //! ## Carrying a scan across a mega-evm bump
 //!
 //! Counter ids — and therefore every stored bitmap — belong to one
 //! instrumented build (see [`store::current_binary_id`]). When mega-evm or
-//! the toolchain moves, `backfill`, `set-cover` and `merge` all refuse the
-//! old store, and a full re-sweep of mainnet history costs weeks. What
+//! the toolchain moves, `backfill` and `set-cover` refuse the old store, and a
+//! full re-sweep of mainnet history costs days. What
 //! survives the bump is the *block numbers*, so the tool carries them over
 //! instead of the bitmaps:
 //!
 //! ```text
 //! inspect --dump-pool pool.txt   (old build; read-only, no binary-id check)
-//!   └─ cat pool*.txt > union.txt     (across shards; the list is sorted and deduped on read)
+//!   └─ cat pool*.txt > union.txt     (across stores; sorted and deduped on read)
 //!        └─ backfill --blocks-file union.txt    (new build, fresh data-dir)
 //!             └─ set-cover → report             (new minimal set)
 //! ```
@@ -41,7 +40,6 @@ mod backfill;
 mod bitset;
 mod inspect;
 mod llvm;
-mod merge;
 mod profile_rt;
 mod proto;
 mod report;
@@ -61,11 +59,6 @@ struct Cli {
     cmd: Cmd,
 }
 
-// The variants differ in size because `BackfillArgs` carries the whole
-// fetch/witness/R2 configuration while the others take a data-dir and a flag
-// or two. One `Cmd` is built per process, straight into a `match` — boxing it
-// would only add an allocation and a clap indirection.
-#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Replay blocks under coverage instrumentation and store what each covered.
@@ -76,8 +69,6 @@ enum Cmd {
     Report(report::ReportArgs),
     /// Read-only store statistics (works on stores from other builds).
     Inspect(inspect::InspectArgs),
-    /// Merge per-shard stores (same build; shared blocks must agree) into one.
-    Merge(merge::MergeArgs),
     /// Internal: resident worker subprocess (spawned by backfill).
     #[clap(hide = true)]
     InternalWorker(worker::WorkerArgs),
@@ -101,7 +92,6 @@ fn main() -> Result<()> {
         Cmd::SetCover(args) => setcover::run(args),
         Cmd::Report(args) => report::run(args),
         Cmd::Inspect(args) => inspect::run(args),
-        Cmd::Merge(args) => merge::run(args),
     }
 }
 
