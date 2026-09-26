@@ -118,8 +118,8 @@ pub fn run(args: InspectArgs) -> Result<()> {
         let outcome = select_cover(&patterns);
         println!();
         println!(
-            "antichain: {} of {} patterns are strictly dominated ({:.1}%) — prunable \
-             along with their archived profiles",
+            "antichain: {} of {} patterns are strictly dominated ({:.1}%) — never cover \
+             candidates",
             outcome.pruned_dominated.len(),
             patterns.len(),
             100.0 * outcome.pruned_dominated.len() as f64 / patterns.len().max(1) as f64
