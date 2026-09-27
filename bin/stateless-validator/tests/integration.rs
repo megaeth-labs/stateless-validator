@@ -238,20 +238,20 @@ fn blank_r2_values_reach_the_post_parse_rules() {
 fn help_hides_r2_secret_values() {
     use stateless_test_utils::env::with_env_var;
     let guard = stateless_test_utils::env::env_lock();
-    let secrets = [
+    let vars = [
         ("STATELESS_VALIDATOR_R2_ACCESS_CLIENT_ID", "leaked-client-id"),
         ("STATELESS_VALIDATOR_R2_ACCESS_CLIENT_SECRET", "leaked-client-secret"),
         ("STATELESS_VALIDATOR_R2_SECRET_ACCESS_KEY", "leaked-secret-access-key"),
     ];
     // clap reads the env when the command is built, so build it with all three set.
-    let help = with_env_var(&guard, secrets[0].0, secrets[0].1, || {
-        with_env_var(&guard, secrets[1].0, secrets[1].1, || {
-            with_env_var(&guard, secrets[2].0, secrets[2].1, || {
+    let help = with_env_var(&guard, vars[0].0, vars[0].1, || {
+        with_env_var(&guard, vars[1].0, vars[1].1, || {
+            with_env_var(&guard, vars[2].0, vars[2].1, || {
                 CommandLineArgs::command().render_long_help().to_string()
             })
         })
     });
-    for (name, value) in secrets {
+    for (name, value) in vars {
         assert!(help.contains(name), "help must still name {name}");
         assert!(!help.contains(value), "help prints the value of {name}");
     }
