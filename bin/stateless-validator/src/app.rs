@@ -103,12 +103,12 @@ pub struct CommandLineArgs {
     /// Cloudflare Access service-token client id, sent as `CF-Access-Client-Id` on every
     /// custom-domain GET. Omit when the domain is locked by an IP allowlist instead.
     /// Redacted like the secret: the id alone is enough to look up the token.
-    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_ID")]
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_ID", hide_env_values = true)]
     pub r2_access_client_id: Option<RedactedSecret>,
 
     /// Cloudflare Access service-token client secret, sent as `CF-Access-Client-Secret`. Prefer
     /// the env var over the flag.
-    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_SECRET")]
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_SECRET", hide_env_values = true)]
     pub r2_access_client_secret: Option<RedactedSecret>,
 
     /// R2 bucket holding the witnesses (e.g. `witness-mainnet`). Required for the S3-endpoint
@@ -123,7 +123,7 @@ pub struct CommandLineArgs {
 
     /// R2 secret access key. Required for the S3-endpoint target (not used with
     /// `--r2-custom-domain`). Prefer the env var over the flag.
-    #[clap(long, env = "STATELESS_VALIDATOR_R2_SECRET_ACCESS_KEY")]
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_SECRET_ACCESS_KEY", hide_env_values = true)]
     pub r2_secret_access_key: Option<RedactedSecret>,
 
     /// R2 connection-establishment timeout (milliseconds). A healthy handshake to the local
