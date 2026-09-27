@@ -237,7 +237,16 @@ fn resolve_source_dirs(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
     } else {
         explicit.to_vec()
     };
+    // llvm-cov lists absolute paths, which a relative root never prefixes. `absolute` does
+    // not resolve symlinks (roots must match as spelled) and so keeps `..`, which no listed
+    // path contains either.
+    let dirs = dirs.iter().map(std::path::absolute).collect::<std::io::Result<Vec<_>>>()?;
     for dir in &dirs {
+        ensure!(
+            !dir.components().any(|c| c == std::path::Component::ParentDir),
+            "source dir {} contains `..`, so it can never match llvm-cov's paths — spell it without",
+            dir.display(),
+        );
         ensure!(dir.is_dir(), "source dir {} does not exist", dir.display());
     }
     // Ids and stamp identify a root by its label: two roots sharing one would have their
@@ -670,5 +679,21 @@ mod tests {
         assert!(err.to_string().contains("lies inside"), "{err}");
 
         resolve_source_dirs(&[a, dir.path().join("b")]).expect("distinct disjoint roots are fine");
+    }
+
+    /// A relative root is made absolute, since llvm-cov lists absolute paths; one with `..`,
+    /// which `absolute` keeps, is refused. Relies on cargo running tests from the package dir.
+    #[test]
+    fn resolve_makes_relative_roots_absolute() {
+        let here = std::env::current_dir().unwrap();
+        assert_eq!(resolve_source_dirs(&[PathBuf::from("src")]).unwrap(), [here.join("src")]);
+        assert_eq!(
+            resolve_source_dirs(&[PathBuf::from(".")]).unwrap(),
+            std::slice::from_ref(&here)
+        );
+
+        let up = Path::new("..").join(here.file_name().unwrap()).join("src");
+        let err = resolve_source_dirs(&[up]).expect_err("`..` must be refused");
+        assert!(err.to_string().contains("`..`"), "{err}");
     }
 }
