@@ -127,13 +127,6 @@ impl Selection {
         }
     }
 
-    fn iter(&self) -> Box<dyn Iterator<Item = u64> + '_> {
-        match self {
-            Self::Range(r) => Box::new(r.clone()),
-            Self::List(v) => Box::new(v.iter().copied()),
-        }
-    }
-
     fn len(&self) -> u64 {
         match self {
             Self::Range(r) => r.end() - r.start() + 1,
@@ -166,18 +159,40 @@ impl Selection {
         }
     }
 
-    /// How the store last judged each selected block: just the status the todo filter needs.
-    fn statuses(&self, store: &Store) -> Result<HashMap<u64, BlockStatus>> {
-        let mut found = HashMap::new();
+    /// The selected blocks without a clean replay in the store, in order (Error/Divergent
+    /// records are retried), and how many of them have a record. A range is walked against
+    /// the store's rows instead of loading them: a resumed full-history range has tens of
+    /// millions.
+    fn pending(&self, store: &Store) -> Result<(Vec<u64>, usize)> {
+        let (mut todo, mut retrying) = (Vec::new(), 0);
         match self {
-            Self::Range(r) => store.blocks(r.clone(), |n, record| {
-                found.insert(n, record.status);
-            })?,
+            Self::Range(r) => {
+                let mut next = *r.start();
+                store.blocks(r.clone(), |n, record| {
+                    todo.extend(next..n);
+                    if record.status != BlockStatus::Ok {
+                        todo.push(n);
+                        retrying += 1;
+                    }
+                    next = n + 1;
+                })?;
+                todo.extend(next..=*r.end());
+            }
             Self::List(v) => {
-                found.extend(store.block_records(v)?.into_iter().map(|(n, r)| (n, r.status)));
+                let records = store.block_records(v)?;
+                for &n in v {
+                    match records.get(&n) {
+                        Some(r) if r.status == BlockStatus::Ok => {}
+                        Some(_) => {
+                            todo.push(n);
+                            retrying += 1;
+                        }
+                        None => todo.push(n),
+                    }
+                }
             }
         }
-        Ok(found)
+        Ok((todo, retrying))
     }
 }
 
@@ -231,7 +246,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     if cleared > 0 {
         info!(cleared, "removed files a previous run left mid-flight");
     }
-    let statuses = selection.statuses(&store)?;
+    let (todo, retrying) = selection.pending(&store)?;
 
     ensure!(
         args.data_max_concurrent_requests >= 1,
@@ -255,11 +270,6 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
          blocks",
     );
 
-    // Skip only blocks that replayed cleanly; Error/Divergent records are retried.
-    let todo: Vec<u64> =
-        selection.iter().filter(|n| statuses.get(n) != Some(&BlockStatus::Ok)).collect();
-    let retrying = todo.iter().filter(|n| statuses.contains_key(n)).count();
-    drop(statuses);
     let total = todo.len() as u64;
     info!(
         selection = %selection.label(),
@@ -1015,7 +1025,7 @@ mod tests {
 
         let listed = Selection::resolve(&parse(&["--blocks-file", list]).unwrap()).unwrap();
         assert_eq!((listed.lowest(), listed.highest(), listed.len()), (7, 500, 3));
-        assert_eq!(listed.iter().collect::<Vec<_>>(), vec![7, 42, 500]);
+        assert!(matches!(&listed, Selection::List(v) if v == &[7, 42, 500]));
         assert_eq!(listed.label(), "3 listed blocks (7..=500)");
     }
 
@@ -1026,6 +1036,33 @@ mod tests {
         assert_eq!(parse(&[]).unwrap().data_max_concurrent_requests, 64);
         let raised = parse(&["--data-max-concurrent-requests", "256"]).unwrap();
         assert_eq!(raised.data_max_concurrent_requests, 256);
+    }
+
+    /// Blocks with no record and blocks that did not replay cleanly are pending, in order;
+    /// clean ones are skipped, and rows outside the selection are ignored.
+    #[test]
+    fn pending_skips_only_clean_replays() {
+        use crate::store::test_support::block;
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = DataDir::new(tmp.path());
+        dirs.ensure_layout().unwrap();
+        let store = Store::open(&dirs.store_path(), "test-id", "f").unwrap();
+        for (n, status) in [
+            (11, BlockStatus::Ok),
+            (12, BlockStatus::Error),
+            (14, BlockStatus::Ok),
+            (15, BlockStatus::Divergent),
+            (99, BlockStatus::Ok),
+        ] {
+            store.commit_block(n, &block(status, None), &[], None).unwrap();
+        }
+
+        let range = Selection::Range(10..=16);
+        assert_eq!(range.pending(&store).unwrap(), (vec![10, 12, 13, 15, 16], 2));
+        let tail_done = Selection::Range(14..=14);
+        assert_eq!(tail_done.pending(&store).unwrap(), (vec![], 0));
+        let list = Selection::List(vec![11, 12, 13, 99]);
+        assert_eq!(list.pending(&store).unwrap(), (vec![12, 13], 1));
     }
 
     fn counter_info(dense: u32) -> CounterInfo {
