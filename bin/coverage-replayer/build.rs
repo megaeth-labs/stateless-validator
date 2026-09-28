@@ -28,12 +28,13 @@ fn main() {
     );
 
     // `rustc -vV`, unlike `--version`, carries the host triple and LLVM version, both of
-    // which can shift counter ids.
+    // which can shift counter ids. The commit hash too: every nightly of a release cycle
+    // shares `release:` and often the LLVM version, yet may map coverage differently.
     let rustc_vv = rustc(&["-vV"]);
     let toolchain: String = rustc_vv
         .lines()
         .filter(|l| {
-            l.starts_with("release:") || l.starts_with("host:") || l.starts_with("LLVM version:")
+            ["release:", "commit-hash:", "host:", "LLVM version:"].iter().any(|k| l.starts_with(k))
         })
         .collect::<Vec<_>>()
         .join(";");
