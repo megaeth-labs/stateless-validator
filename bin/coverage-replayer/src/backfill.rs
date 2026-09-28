@@ -24,7 +24,7 @@ use alloy_rpc_types_eth::BlockId;
 use clap::Args;
 use eyre::{Context, Result, bail, ensure};
 use rustc_hash::FxHashMap;
-use stateless_common::RpcClient;
+use stateless_common::{RpcClient, RpcClientConfig};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt},
     process::Child,
@@ -87,6 +87,13 @@ pub struct BackfillArgs {
     /// cannot flood the disk, since a full dispatch queue blocks the fetch loop.
     #[clap(long, default_value_t = 32)]
     pub fetch_concurrency: usize,
+    /// Concurrent requests to the data endpoints, blocks and bytecode alike, across all
+    /// fetches. A block fetches every bytecode it lacks at once, so uncapped, one that
+    /// references many new contracts can burst past an endpoint's rate limit and stall the
+    /// scan in its retry loop. The default leaves room for a bytecode request beside every
+    /// block fetch in flight.
+    #[clap(long, env = "COVERAGE_REPLAYER_DATA_MAX_CONCURRENT_REQUESTS", default_value_t = 64)]
+    pub data_max_concurrent_requests: usize,
     #[clap(flatten)]
     pub llvm: LlvmArgs,
     /// Interval (seconds) of the "block still executing" warning; blocks never time out.
@@ -226,9 +233,18 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     }
     let statuses = selection.statuses(&store)?;
 
-    let client = Arc::new(RpcClient::new(
+    ensure!(
+        args.data_max_concurrent_requests >= 1,
+        "--data-max-concurrent-requests must be at least 1"
+    );
+    let client = Arc::new(RpcClient::new_with_config(
         &args.rpc_endpoints.iter().map(String::as_str).collect::<Vec<_>>(),
         &args.witness_endpoints.iter().map(String::as_str).collect::<Vec<_>>(),
+        RpcClientConfig {
+            data_max_concurrent_requests: Some(args.data_max_concurrent_requests),
+            ..RpcClientConfig::default()
+        },
+        None,
     )?);
 
     let latest = client.get_latest_block_number().await;
@@ -1001,6 +1017,15 @@ mod tests {
         assert_eq!((listed.lowest(), listed.highest(), listed.len()), (7, 500, 3));
         assert_eq!(listed.iter().collect::<Vec<_>>(), vec![7, 42, 500]);
         assert_eq!(listed.label(), "3 listed blocks (7..=500)");
+    }
+
+    /// Data requests are capped unless the operator raises the cap: uncapped, a block's
+    /// bytecode fetches would all start at once (see `resolve_missing_codes`).
+    #[test]
+    fn data_requests_are_capped_by_default() {
+        assert_eq!(parse(&[]).unwrap().data_max_concurrent_requests, 64);
+        let raised = parse(&["--data-max-concurrent-requests", "256"]).unwrap();
+        assert_eq!(raised.data_max_concurrent_requests, 256);
     }
 
     fn counter_info(dense: u32) -> CounterInfo {
