@@ -1,7 +1,12 @@
 name: Claude Code
 on:
   issue_comment:
-    types: [created]
+    # `edited` matters as much as `created`: mega-putin acks feedback with a
+    # placeholder the moment it picks the work up and rewrites that same
+    # comment into the real answer minutes later, so the answer only ever
+    # arrives as an edit. Jobs that must not re-fire on an edit pin
+    # `github.event.action == 'created'` themselves.
+    types: [created, edited]
   pull_request_review_comment:
     types: [created]
   pull_request_review:
@@ -15,6 +20,7 @@ jobs:
   interactive:
     if: |
       (github.event_name == 'issue_comment' &&
+       github.event.action == 'created' &&
        contains(github.event.comment.body, '@claude') &&
        (github.event.comment.author_association == 'MEMBER' ||
         github.event.comment.author_association == 'COLLABORATOR' ||
@@ -43,7 +49,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - uses: megaeth-labs/documentation/.github/actions/claude-interactive@main
+      - uses: megaeth-labs/.github/.github/actions/claude-interactive@main
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_bots: "mega-putin"
@@ -54,14 +60,18 @@ jobs:
     # rather than cancelling it, so a partial run never leaves comments/threads
     # in an inconsistent state.
     concurrency:
-      group: claude-pr-review-${{ github.event.pull_request.number }}
+      group: claude-pr-review-${{ github.event.pull_request.number || github.event.issue.number }}-${{ github.event_name == 'pull_request' && 'code' || 'comment' }}
       cancel-in-progress: false
     if: |
-      github.event_name == 'pull_request' &&
-      (github.event.action == 'opened' ||
-       github.event.action == 'synchronize' ||
-       github.event.action == 'ready_for_review' ||
-       github.event.action == 'reopened')
+      (github.event_name == 'pull_request' &&
+       (github.event.action == 'opened' ||
+        github.event.action == 'synchronize' ||
+        github.event.action == 'ready_for_review' ||
+        github.event.action == 'reopened')) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request != null &&
+       github.event.comment.user.login != 'mega-maxwell[bot]' &&
+       !contains(github.event.comment.body, 'claude-review:skip'))
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -70,14 +80,29 @@ jobs:
       id-token: write
       actions: read
     steps:
+      # Review under the CI app identity rather than the job token: it is what
+      # lets the action resolve stale review threads (the shared action gates
+      # --resolve-threads on github_identity_token being non-empty).
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          client-id: ${{ vars.MEGA_MAXWELL_CLIENT_ID }}
+          private-key: ${{ secrets.MEGA_MAXWELL_PK }}
+          owner: megaeth-labs
+          repositories: stateless-validator
+
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'issue_comment' && format('refs/pull/{0}/head', github.event.issue.number) || '' }}
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
           submodules: recursive
           fetch-depth: 1
 
-      - uses: megaeth-labs/documentation/.github/actions/claude-pr-review@main
+      - uses: megaeth-labs/.github/.github/actions/claude-pr-review@main
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_identity_token: ${{ steps.app-token.outputs.token }}
           allowed_bots: "mega-putin"
 
   label-check:
@@ -103,7 +128,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - uses: megaeth-labs/documentation/.github/actions/claude-label-check@main
+      - uses: megaeth-labs/.github/.github/actions/claude-label-check@main
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_bots: "mega-putin"
@@ -122,7 +147,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - uses: megaeth-labs/documentation/.github/actions/claude-issue-triage@main
+      - uses: megaeth-labs/.github/.github/actions/claude-issue-triage@main
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_bots: "mega-putin"
