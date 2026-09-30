@@ -1107,8 +1107,9 @@ mod tests {
 
         use crate::data_provider::{BlockData, test_support::fixture_block_data};
 
-        let chain_spec =
-            ChainSpec::from_genesis(TestFixtures::synthetic().load_genesis().expect("genesis"));
+        let chain_spec = ChainSpec::from_genesis(
+            TestFixtures::synthetic_shared().load_genesis().expect("genesis"),
+        );
         let BlockData { block, witness, contracts } = fixture_block_data();
 
         let malformed = [

@@ -1,7 +1,9 @@
 //! Test fixture loading utilities.
 //!
-//! Loads block, witness, and contract data from the `test_data/` directory layout
-//! used by integration tests across the workspace.
+//! Each fixture set ships packed as `test_data/<set>.tar.zst` and is parsed straight out of the
+//! archive into memory, once per test binary: see [`TestFixtures::mainnet_shared`] and
+//! [`TestFixtures::synthetic_shared`]. Nothing is unpacked to disk: `genesis.json`, which tests
+//! hand to the binaries by path, is kept out of the archive in `test_data/<set>/`.
 //!
 //! `stateless-test-utils` intentionally does NOT depend on `stateless-core` to avoid
 //! circular dev-dependencies. Callers that need `MptWitness` or `ChainSpec` can use the
@@ -11,7 +13,7 @@
 use std::{
     collections::BTreeMap,
     fs::File,
-    io::{BufRead, BufReader},
+    io::Read,
     path::{Path, PathBuf},
     sync::LazyLock,
 };
@@ -33,10 +35,12 @@ pub struct WitnessFileContent {
     pub salt_witness: SaltWitness,
 }
 
-/// Pre-loaded test fixtures from a `test_data/` directory.
+/// Pre-loaded test fixtures, parsed from a packed `test_data/<set>.tar.zst`.
 ///
-/// Layout: `genesis.json`, `contracts.txt` (one JSON `[hash, bytecode]` per line),
-/// `blocks/<number>.json`, `stateless/witness/<number>.<hash>.{salt,mpt}` (bincode-legacy).
+/// Archive layout, under `<set>/`: `contracts.txt` (one JSON `[hash, bytecode]` per line),
+/// `blocks/<number>[.<hash>].json`, `stateless/witness/<number>.<hash>.{salt,mpt}`
+/// (bincode-legacy). `data_dir` is the unpacked `test_data/<set>/`, where `genesis.json` stays
+/// for the tests that read it by path (see [`Self::load_genesis`]).
 ///
 /// `mpt_witness_bytes` stores raw bincode-legacy bytes; decode via [`Self::mpt_witness`]
 /// in crates that depend on `stateless-core`.
@@ -51,81 +55,92 @@ pub struct TestFixtures {
 }
 
 impl TestFixtures {
-    /// Load fixtures from a directory following the `test_data/` layout.
-    pub fn load(data_dir: &Path) -> Self {
+    /// The mainnet fixtures (`test_data/mainnet.tar.zst`), parsed once per test binary.
+    pub fn mainnet_shared() -> &'static Self {
+        static FIXTURES: LazyLock<TestFixtures> =
+            LazyLock::new(|| TestFixtures::from_archive("mainnet"));
+        &FIXTURES
+    }
+
+    /// The synthetic fixtures (`test_data/synthetic.tar.zst`), parsed once per test binary.
+    pub fn synthetic_shared() -> &'static Self {
+        static FIXTURES: LazyLock<TestFixtures> =
+            LazyLock::new(|| TestFixtures::from_archive("synthetic"));
+        &FIXTURES
+    }
+
+    /// Parses `test_data/<set>.tar.zst` entry by entry, straight from the decompressed stream,
+    /// so nothing is written to disk. Any entry outside the layout panics: skipping it would
+    /// silently shrink the set the fixture sweeps run over.
+    fn from_archive(set: &str) -> Self {
+        let test_data = workspace_root().join("test_data");
+        let archive = test_data.join(format!("{set}.tar.zst"));
+        let file =
+            File::open(&archive).unwrap_or_else(|e| panic!("open {}: {e}", archive.display()));
+        let decoder = zstd::stream::read::Decoder::new(file)
+            .unwrap_or_else(|e| panic!("zstd decoder for {}: {e}", archive.display()));
+
         let mut blocks = HashMap::default();
         let mut block_numbers = BTreeMap::new();
-        for path in read_dir_paths(&data_dir.join("blocks")) {
-            if path.extension().and_then(|s| s.to_str()) != Some("json") {
-                continue;
-            }
-            let Some(number) = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.split('.').next())
-                .and_then(|s| s.parse::<u64>().ok())
-            else {
-                continue;
-            };
-            let block: Block<Transaction> = load_json(&path).unwrap();
-            let hash = BlockHash::from(block.header.hash);
-            blocks.insert(hash, block);
-            block_numbers.insert(number, hash);
-        }
-
         let mut salt_witnesses = HashMap::default();
         let mut mpt_witness_bytes = HashMap::default();
-        for path in read_dir_paths(&data_dir.join("stateless/witness")) {
-            let Some(ext) = path.extension().and_then(|s| s.to_str()) else { continue };
-            let stem = path.file_stem().unwrap().to_str().unwrap();
-            let (_, hash) = parse_block_num_and_hash(stem).unwrap();
-            let bytes = std::fs::read(&path).unwrap();
-            match ext {
-                "salt" => {
-                    let (content, _): (WitnessFileContent, usize) =
-                        bincode::serde::decode_from_slice(&bytes, bincode::config::legacy())
-                            .unwrap_or_else(|e| panic!("decode SaltWitness {stem}: {e}"));
-                    salt_witnesses.insert(hash, content.salt_witness);
+        let mut contracts = HashMap::default();
+        let mut tar = tar::Archive::new(decoder);
+        let entries = tar.entries().unwrap_or_else(|e| panic!("read {}: {e}", archive.display()));
+        for entry in entries {
+            let mut entry = entry.unwrap_or_else(|e| panic!("read {}: {e}", archive.display()));
+            if entry.header().entry_type().is_dir() {
+                continue;
+            }
+            let path = entry.path().expect("entry path").to_string_lossy().into_owned();
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).unwrap_or_else(|e| panic!("read {path}: {e}"));
+
+            let name = path.strip_prefix(set).and_then(|p| p.strip_prefix('/')).unwrap_or("");
+            if let Some(file) = name.strip_prefix("blocks/") {
+                let number = file
+                    .strip_suffix(".json")
+                    .and_then(|stem| stem.split('.').next())
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or_else(|| panic!("unexpected block file {path}"));
+                let block: Block<Transaction> = serde_json::from_slice(&bytes)
+                    .unwrap_or_else(|e| panic!("parse block {path}: {e}"));
+                let hash = block.header.hash;
+                blocks.insert(hash, block);
+                block_numbers.insert(number, hash);
+            } else if let Some(file) = name.strip_prefix("stateless/witness/") {
+                let (stem, ext) = file
+                    .rsplit_once('.')
+                    .unwrap_or_else(|| panic!("unexpected witness file {path}"));
+                let (_, hash) =
+                    parse_block_num_and_hash(stem).unwrap_or_else(|e| panic!("{path}: {e}"));
+                match ext {
+                    "salt" => {
+                        let (content, _): (WitnessFileContent, usize) =
+                            bincode::serde::decode_from_slice(&bytes, bincode::config::legacy())
+                                .unwrap_or_else(|e| panic!("decode SaltWitness {path}: {e}"));
+                        salt_witnesses.insert(hash, content.salt_witness);
+                    }
+                    "mpt" => {
+                        mpt_witness_bytes.insert(hash, bytes);
+                    }
+                    _ => panic!("unexpected witness file {path}"),
                 }
-                "mpt" => {
-                    mpt_witness_bytes.insert(hash, bytes);
-                }
-                _ => {}
+            } else if name == "contracts.txt" {
+                contracts = parse_contracts(&bytes);
+            } else {
+                panic!("unexpected entry {path} in {}", archive.display());
             }
         }
 
         Self {
-            data_dir: data_dir.to_owned(),
+            data_dir: test_data.join(set),
             blocks,
             block_numbers,
             salt_witnesses,
             mpt_witness_bytes,
-            contracts: load_contracts(data_dir.join("contracts.txt")),
+            contracts,
         }
-    }
-
-    /// Load `test_data/mainnet/` relative to the workspace root.
-    pub fn mainnet() -> Self {
-        Self::load(&workspace_root().join("test_data/mainnet"))
-    }
-
-    /// Shared mainnet fixtures, parsed once per test binary — use instead of [`Self::mainnet`]
-    /// when several tests in the same binary read (and don't mutate) the fixture set.
-    pub fn mainnet_shared() -> &'static Self {
-        static FIXTURES: LazyLock<TestFixtures> = LazyLock::new(TestFixtures::mainnet);
-        &FIXTURES
-    }
-
-    /// Load `test_data/synthetic/` relative to the workspace root.
-    pub fn synthetic() -> Self {
-        Self::load(&workspace_root().join("test_data/synthetic"))
-    }
-
-    /// Shared synthetic fixtures, parsed once per test binary — the [`Self::synthetic`]
-    /// twin of [`Self::mainnet_shared`].
-    pub fn synthetic_shared() -> &'static Self {
-        static FIXTURES: LazyLock<TestFixtures> = LazyLock::new(TestFixtures::synthetic);
-        &FIXTURES
     }
 
     /// Decodes the bincode-legacy MPT witness for `hash`, typically as
@@ -179,12 +194,6 @@ fn workspace_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap()
 }
 
-fn read_dir_paths(dir: &Path) -> impl Iterator<Item = PathBuf> {
-    std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("read dir {}: {e}", dir.display()))
-        .map(|e| e.unwrap().path())
-}
-
 /// Parses `"{block_number}.{block_hash}"` from a filename stem.
 pub fn parse_block_num_and_hash(input: &str) -> Result<(BlockNumber, BlockHash)> {
     let (n, h) = input.split_once('.').ok_or_else(|| eyre::eyre!("Invalid format: {input}"))?;
@@ -198,18 +207,48 @@ pub fn load_json<T: DeserializeOwned>(path: impl AsRef<Path>) -> Result<T> {
     serde_json::from_slice(&bytes).with_context(|| format!("parse JSON from {}", path.display()))
 }
 
-/// Loads contract bytecodes from a file (one `[hash, bytecode]` JSON per line).
-pub fn load_contracts(path: impl AsRef<Path>) -> HashMap<B256, Bytecode> {
-    let path = path.as_ref();
-    let file = File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
-    BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| {
-            let (hash, bytecode): (B256, Bytecode) =
-                serde_json::from_str(&l).expect("parse contract");
-            (hash, bytecode)
-        })
+/// Parses `contracts.txt`: one JSON `[hash, bytecode]` per line.
+fn parse_contracts(bytes: &[u8]) -> HashMap<B256, Bytecode> {
+    bytes
+        .split(|&b| b == b'\n')
+        .filter(|line| !line.trim_ascii().is_empty())
+        .map(|line| serde_json::from_slice::<(B256, Bytecode)>(line).expect("parse contract"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    /// Each packed set parses completely: every witness belongs to a loaded block and comes with
+    /// its other half, every paired block's parent header is loaded (the anchored validations
+    /// derive the pre-state roots from it), and every loaded block is one or the other.
+    #[test]
+    fn packed_sets_are_complete() {
+        for (set, fx) in [
+            ("mainnet", TestFixtures::mainnet_shared()),
+            ("synthetic", TestFixtures::synthetic_shared()),
+        ] {
+            let paired = fx.paired_blocks();
+            assert!(!paired.is_empty(), "{set}: no paired blocks");
+            assert_eq!(paired.len(), fx.salt_witnesses.len(), "{set}: unpaired SALT witness");
+            assert_eq!(paired.len(), fx.mpt_witness_bytes.len(), "{set}: unpaired MPT witness");
+            assert_eq!(fx.blocks.len(), fx.block_numbers.len(), "{set}: duplicate block number");
+
+            let parents: HashSet<BlockHash> =
+                paired.iter().map(|(_, hash)| fx.blocks[hash].header.parent_hash).collect();
+            for parent in &parents {
+                assert!(fx.blocks.contains_key(parent), "{set}: parent {parent} not loaded");
+            }
+            for hash in fx.blocks.keys() {
+                assert!(
+                    fx.salt_witnesses.contains_key(hash) || parents.contains(hash),
+                    "{set}: block {hash} is neither paired nor a paired block's parent",
+                );
+            }
+            assert!(!fx.contracts.is_empty(), "{set}: no contracts");
+        }
+    }
 }
