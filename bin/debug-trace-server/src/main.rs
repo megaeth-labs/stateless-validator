@@ -104,11 +104,9 @@ use crate::chain_sync::{TraceFetcher, TraceHooks, TraceProcessor};
 #[derive(Parser, Debug)]
 #[clap(name = "debug-trace-server", version, about = "Debug/Trace RPC Server")]
 // Every `--r2-*` coherence rule is enforced after parsing, by
-// `stateless_common::validate_r2_flags`, rather than through clap attributes: this workspace
-// builds clap without its `error-context` feature (root `Cargo.toml`), so every clap rejection
-// is generic and names no argument — useless to an operator debugging an env file. A blank env
-// line also reads as *presence* to clap, so leaving exclusion to it would report a phantom
-// conflict where the real fault is an empty value.
+// `stateless_common::validate_r2_flags`, rather than through clap attributes: both binaries then
+// give the same verdict in the same words, and a blank env line — which clap reads as
+// *presence* — is diagnosed as the empty value it is instead of as a phantom conflict.
 struct Args {
     /// RPC server listen address.
     #[clap(long, env = "DEBUG_TRACE_SERVER_ADDR", default_value = "0.0.0.0:8545")]
@@ -444,13 +442,13 @@ struct Args {
     /// Cloudflare Access service-token client id, sent as `CF-Access-Client-Id` on every
     /// custom-domain GET. Omit when the domain is locked by an IP allowlist instead.
     /// Redacted like the secret: the id alone is enough to look up the token.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ACCESS_CLIENT_ID")]
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ACCESS_CLIENT_ID", hide_env_values = true)]
     r2_access_client_id: Option<RedactedSecret>,
 
     /// Cloudflare Access service-token client secret, sent as `CF-Access-Client-Secret`.
     /// Prefer the env var over the flag so the secret stays out of shell history and
     /// process listings.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ACCESS_CLIENT_SECRET")]
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ACCESS_CLIENT_SECRET", hide_env_values = true)]
     r2_access_client_secret: Option<RedactedSecret>,
 
     /// R2 bucket holding the archived witness objects. Requires `--r2-endpoint`.
@@ -463,7 +461,7 @@ struct Args {
 
     /// R2 secret access key. Requires `--r2-endpoint`. Prefer the env var over the flag so
     /// the secret stays out of shell history and process listings.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_SECRET_ACCESS_KEY")]
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_SECRET_ACCESS_KEY", hide_env_values = true)]
     r2_secret_access_key: Option<RedactedSecret>,
 
     /// R2 connection-establishment timeout (milliseconds). A healthy handshake to the local
@@ -511,8 +509,8 @@ struct Args {
     /// lifting the ceiling; a count larger than that cap is rejected, since the surplus
     /// connections could never be filled.
     ///
-    /// Taken as text and parsed after clap so a blank env line is rejected by name rather than
-    /// through clap's unnamed value error.
+    /// Taken as text and parsed after clap so a blank env line is diagnosed by the R2 rules,
+    /// like every other blank `--r2-*` value, rather than aborting in clap's parser first.
     #[clap(long, env = "DEBUG_TRACE_SERVER_R2_CONNECTIONS")]
     r2_connections: Option<String>,
 
@@ -2041,6 +2039,33 @@ mod tests {
             let dropped = full[skip * 2];
             let err = validate_args(&parse_args(&partial)).unwrap_err().to_string();
             assert!(err.contains(dropped), "missing {dropped} must be named: {err}");
+        }
+    }
+
+    /// `--help` prints an env-backed flag's current value unless the flag sets
+    /// `hide_env_values`, so every secret `RedactedSecret` keeps out of `Debug` must stay out
+    /// of the help text too.
+    #[test]
+    fn help_hides_r2_secret_values() {
+        use clap::CommandFactory;
+        use stateless_test_utils::env::with_env_var;
+        let guard = stateless_test_utils::env::env_lock();
+        let vars = [
+            ("DEBUG_TRACE_SERVER_R2_ACCESS_CLIENT_ID", "leaked-client-id"),
+            ("DEBUG_TRACE_SERVER_R2_ACCESS_CLIENT_SECRET", "leaked-client-secret"),
+            ("DEBUG_TRACE_SERVER_R2_SECRET_ACCESS_KEY", "leaked-secret-access-key"),
+        ];
+        // clap reads the env when the command is built, so build it with all three set.
+        let help = with_env_var(&guard, vars[0].0, vars[0].1, || {
+            with_env_var(&guard, vars[1].0, vars[1].1, || {
+                with_env_var(&guard, vars[2].0, vars[2].1, || {
+                    Args::command().render_long_help().to_string()
+                })
+            })
+        });
+        for (name, value) in vars {
+            assert!(help.contains(name), "help must still name {name}");
+            assert!(!help.contains(value), "help prints the value of {name}");
         }
     }
 

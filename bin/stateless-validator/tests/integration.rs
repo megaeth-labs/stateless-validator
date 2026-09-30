@@ -14,7 +14,7 @@ use std::{
 
 use alloy_primitives::{B256, BlockHash};
 use alloy_rpc_types_eth::Block;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use jsonrpsee::server::ServerConfigBuilder;
 use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned};
 use stateless_common::{
@@ -181,9 +181,8 @@ fn r2_custom_domain_target_wiring() {
         Some("https://witness.example.com")
     );
     // Every R2 coherence rule is enforced after parsing, by `stateless_common::validate_r2_flags`,
-    // so that each error can name the flag — clap's own rejections cannot, this workspace having
-    // built it without `error-context`. Parsing therefore accepts all of these shapes; the rules
-    // and their messages are covered by that function's own tests.
+    // so that both binaries give the same verdict in the same words. Parsing therefore accepts all
+    // of these shapes; the rules and their messages are covered by that function's own tests.
     const DOMAIN: &str = "https://witness.example.com";
     for shape in [
         &["--r2-custom-domain", DOMAIN, "--r2-endpoint", "https://acc.r2.cloudflarestorage.com"][..],
@@ -230,6 +229,31 @@ fn blank_r2_values_reach_the_post_parse_rules() {
             "a blank {} must parse, so the rules can name it rather than clap",
             blank[0]
         );
+    }
+}
+
+/// `--help` prints an env-backed flag's current value unless the flag sets `hide_env_values`,
+/// so every secret `RedactedSecret` keeps out of `Debug` must stay out of the help text too.
+#[test]
+fn help_hides_r2_secret_values() {
+    use stateless_test_utils::env::with_env_var;
+    let guard = stateless_test_utils::env::env_lock();
+    let vars = [
+        ("STATELESS_VALIDATOR_R2_ACCESS_CLIENT_ID", "leaked-client-id"),
+        ("STATELESS_VALIDATOR_R2_ACCESS_CLIENT_SECRET", "leaked-client-secret"),
+        ("STATELESS_VALIDATOR_R2_SECRET_ACCESS_KEY", "leaked-secret-access-key"),
+    ];
+    // clap reads the env when the command is built, so build it with all three set.
+    let help = with_env_var(&guard, vars[0].0, vars[0].1, || {
+        with_env_var(&guard, vars[1].0, vars[1].1, || {
+            with_env_var(&guard, vars[2].0, vars[2].1, || {
+                CommandLineArgs::command().render_long_help().to_string()
+            })
+        })
+    });
+    for (name, value) in vars {
+        assert!(help.contains(name), "help must still name {name}");
+        assert!(!help.contains(value), "help prints the value of {name}");
     }
 }
 

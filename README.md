@@ -27,7 +27,7 @@ The stateless approach eliminates the need for validators to run on high-end har
 
 ## Project Structure
 
-The workspace contains two binaries and five library crates:
+The workspace contains three binaries and five library crates:
 
 | Crate                  | Path                          | Purpose                                                                                                                                                                              |
 | ---------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -38,6 +38,7 @@ The workspace contains two binaries and five library crates:
 | `stateless-r2`         | `crates/stateless-r2`         | Shared R2 witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT, and the retrying witness-object GET fetcher over either the signed S3 API or an unsigned Cloudflare custom domain; consumed by mega-reth's witness uploaders (write), this repo's validator, and the trace server's witness source (read) |
 | `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers                                                                                                                                 |
 | `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                                                                                                                        |
+| `coverage-replayer`    | `bin/coverage-replayer`       | Offline coverage tool: replays mainnet blocks under LLVM branch instrumentation and derives a small (greedy) block set that reproduces all the execution coverage the scan observed, of mega-evm and the revm execution engine under it |
 
 Additional directories: `test_data/` (integration test fixtures including genesis config), `audits/` (security audit reports).
 
@@ -82,7 +83,7 @@ cargo run --release --bin stateless-validator -- \
   Which of the two a run produces follows from how far behind it is: a tip-following validator fetches inside that window, so all of its misses are frontier misses — routine and numerous — and `kind="missing"` stays at zero; watch the frontier rate there instead.
   `kind="missing"` is the bucket-integrity signal during catch-up and fixed `--end-block` backfills, where blocks sit far below the head. A hole that first appears near the tip is not caught here, since the block is fetched once, falls back and is never re-probed; that belongs to whatever monitors the uploader.
   With no `--r2-*` flag set at all, witnesses come from the RPC chain alone; a half-configured target, a blank value, or a tuning flag with no target is rejected at startup by name rather than read as "no R2 configured".
-  "Blank value" covers the flags that travel as text; the two numeric tuning flags are parsed by clap, so a blank one aborts earlier with clap's unnamed error (see AGENTS.md for the full rule).
+  "Blank value" covers the flags that travel as text; the two numeric tuning flags are parsed by clap, so a blank one aborts earlier, in clap's parser (see AGENTS.md for the full rule).
   The R2 attempt for one block is bounded in total by a single `--rpc-per-attempt-timeout-ms`, permit wait included, so an endpoint that accepts connections and then stalls costs the block one upstream hop's wall clock rather than one per retry before the RPC chain takes over.
 - `--r2-custom-domain`: alternative R2 target that replaces the four flags above — unsigned HTTP/2 GETs through a Cloudflare custom domain fronting the bucket (mutually exclusive with `--r2-endpoint`, and any of the four left set is rejected at startup by name rather than silently ignored; optional `--r2-access-client-id`/`--r2-access-client-secret` attach Cloudflare Access service-token headers, which require an `https://` domain unless it is loopback; the domain's cache rule must set 404s to bypass cache, or a cached pre-upload 404 pushes those blocks onto the RPC path for the negative-cache TTL and false-fires the `kind="missing"` alarm once they age past the frontier band)
 - `--report-validation-endpoint`: RPC endpoint URL for reporting validated blocks via `mega_setValidatedBlocks` (disabled if not provided)
