@@ -262,7 +262,7 @@ const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
 /// Mock RPC server backing state: all fields pre-decoded so the RPC handlers can respond
 /// synchronously. Wraps [`TestFixtures`] and pre-decodes MPT witnesses once.
 struct MockServerState {
-    fixtures: TestFixtures,
+    fixtures: &'static TestFixtures,
     mpt_witnesses: HashMap<BlockHash, MptWitness>,
     /// Every *accepted* `mega_setValidatedBlocks` call, as `(first_block, last_block)` numbers.
     validated_reports: Arc<Mutex<Vec<(u64, u64)>>>,
@@ -274,7 +274,7 @@ struct MockServerState {
 }
 
 impl MockServerState {
-    fn new(fixtures: TestFixtures) -> Self {
+    fn new(fixtures: &'static TestFixtures) -> Self {
         let mpt_witnesses = fixtures
             .mpt_witness_bytes
             .keys()
@@ -467,7 +467,7 @@ async fn setup_mock_rpc_server(
 async fn r2_backed_fetcher(
     r2_endpoint: &str,
 ) -> (ValidatorFetcher, Arc<AtomicUsize>, jsonrpsee::server::ServerHandle) {
-    let state = MockServerState::new(TestFixtures::synthetic());
+    let state = MockServerState::new(TestFixtures::synthetic_shared());
     let witness_requests = Arc::clone(&state.witness_requests);
     let (handle, url) = setup_mock_rpc_server(state).await;
     let client = Arc::new(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap());
@@ -537,12 +537,12 @@ async fn an_r2_miss_falls_back_to_the_rpc_witness_path() {
 async fn integration_test() {
     let _logging = init_test_logging("stateless_validator");
     debug!("=== Loading Synthetic Test Data ===");
-    let fx = TestFixtures::synthetic();
+    let fx = TestFixtures::synthetic_shared();
     let genesis_file = fx.data_dir.join("genesis.json");
 
     let max_block_number = fx.max_block().0;
     let sync_target = Some(max_block_number);
-    let (validator_db, _tmp) = setup_test_db(&fx).unwrap();
+    let (validator_db, _tmp) = setup_test_db(fx).unwrap();
     let contract_cache =
         Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
     let state = MockServerState::new(fx);
@@ -594,11 +594,11 @@ async fn integration_test() {
 async fn run_end_block_slice(
     reject_first_reports: usize,
 ) -> (eyre::Result<()>, Vec<(u64, u64)>, u64) {
-    let fx = TestFixtures::synthetic();
+    let fx = TestFixtures::synthetic_shared();
     let genesis_file = fx.data_dir.join("genesis.json");
 
     let max_block_number = fx.max_block().0;
-    let (validator_db, _tmp) = setup_test_db(&fx).unwrap();
+    let (validator_db, _tmp) = setup_test_db(fx).unwrap();
     let contract_cache =
         Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
     let state = MockServerState::new(fx);

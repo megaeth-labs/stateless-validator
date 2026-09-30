@@ -1072,7 +1072,7 @@ mod tests {
         let _logging = init_test_logging("stateless_core");
         let fx = TestFixtures::mainnet_shared();
         let paired = fx.paired_blocks();
-        assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
+        assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet.tar.zst");
         for (number, hash) in paired {
             let block = &fx.blocks[&hash];
             run_block(fx, block, fx.salt_witnesses[&hash].clone(), hash)
@@ -1090,7 +1090,7 @@ mod tests {
         let _logging = init_test_logging("stateless_core");
         let fx = TestFixtures::mainnet_shared();
         let paired = fx.paired_blocks();
-        assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
+        assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet.tar.zst");
         for (number, hash) in paired {
             let block = &fx.blocks[&hash];
             let options = match fx.blocks.get(&block.consensus_header().parent_hash) {

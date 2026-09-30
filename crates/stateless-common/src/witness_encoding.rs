@@ -137,13 +137,7 @@ mod tests {
     use super::*;
 
     fn first_fixture_witness() -> (SaltWitness, MptWitness) {
-        let fixtures = TestFixtures::mainnet();
-        let (_, hash) = fixtures
-            .paired_blocks()
-            .into_iter()
-            .next()
-            .expect("mainnet fixtures should contain paired witnesses");
-        (fixtures.salt_witnesses[&hash].clone(), fixtures.mpt_witness(&hash))
+        TestFixtures::mainnet_shared().first_paired_witness()
     }
 
     #[test]
