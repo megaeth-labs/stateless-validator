@@ -1,8 +1,10 @@
 # Changelog
 
-## v2.0.19
+## v2.0.19 (2026-09-30)
 
-_No changes recorded since the previous release._
+### Chores
+
+- deps: bump mega-evm to v1.7.2 on release-v2.0.19 ([#229](https://github.com/megaeth-labs/stateless-validator/pull/229))
 
 ## v2.0.18 (2026-09-09)
 
