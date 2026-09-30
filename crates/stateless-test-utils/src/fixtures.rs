@@ -2,8 +2,10 @@
 //!
 //! Each fixture set ships packed as `test_data/<set>.tar.zst` and is parsed straight out of the
 //! archive into memory, once per test binary: see [`TestFixtures::mainnet_shared`] and
-//! [`TestFixtures::synthetic_shared`]. Nothing is unpacked to disk: `genesis.json`, which tests
-//! hand to the binaries by path, is kept out of the archive in `test_data/<set>/`.
+//! [`TestFixtures::synthetic_shared`]. Nothing is unpacked to disk. Two files stay out of the
+//! archive, in `test_data/<set>/`: `genesis.json`, which tests hand to the binaries by path, and
+//! `manifest.txt`, one `<number>.<hash>` per paired block the archive must hold, so a repack
+//! cannot drop or swap a block unnoticed.
 //!
 //! `stateless-test-utils` intentionally does NOT depend on `stateless-core` to avoid
 //! circular dev-dependencies. Callers that need `MptWitness` or `ChainSpec` can use the
@@ -39,8 +41,8 @@ pub struct WitnessFileContent {
 ///
 /// Archive layout, under `<set>/`: `contracts.txt` (one JSON `[hash, bytecode]` per line),
 /// `blocks/<number>[.<hash>].json`, `stateless/witness/<number>.<hash>.{salt,mpt}`
-/// (bincode-legacy). `data_dir` is the unpacked `test_data/<set>/`, where `genesis.json` stays
-/// for the tests that read it by path (see [`Self::load_genesis`]).
+/// (bincode-legacy). `data_dir` is the unpacked `test_data/<set>/`, holding the set's
+/// `manifest.txt` and the `genesis.json` that tests read by path (see [`Self::load_genesis`]).
 ///
 /// `mpt_witness_bytes` stores raw bincode-legacy bytes; decode via [`Self::mpt_witness`]
 /// in crates that depend on `stateless-core`.
@@ -218,13 +220,14 @@ fn parse_contracts(bytes: &[u8]) -> HashMap<B256, Bytecode> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
 
     use super::*;
 
-    /// Each packed set parses completely: every witness belongs to a loaded block and comes with
-    /// its other half, every paired block's parent header is loaded (the anchored validations
-    /// derive the pre-state roots from it), and every loaded block is one or the other.
+    /// Each packed set holds exactly the paired blocks its `manifest.txt` lists, and parses
+    /// completely: every witness belongs to a loaded block and comes with its other half, every
+    /// paired block's parent header is loaded (the anchored validations derive the pre-state
+    /// roots from it), and every loaded block is one or the other.
     #[test]
     fn packed_sets_are_complete() {
         for (set, fx) in [
@@ -232,6 +235,14 @@ mod tests {
             ("synthetic", TestFixtures::synthetic_shared()),
         ] {
             let paired = fx.paired_blocks();
+            let packed: BTreeSet<(u64, BlockHash)> = paired.iter().copied().collect();
+            let listed = manifest(fx);
+            let missing: Vec<_> = listed.difference(&packed).collect();
+            let unlisted: Vec<_> = packed.difference(&listed).collect();
+            assert!(
+                missing.is_empty() && unlisted.is_empty(),
+                "{set}: archive differs from manifest.txt: missing {missing:?}, unlisted {unlisted:?}",
+            );
             assert!(!paired.is_empty(), "{set}: no paired blocks");
             assert_eq!(paired.len(), fx.salt_witnesses.len(), "{set}: unpaired SALT witness");
             assert_eq!(paired.len(), fx.mpt_witness_bytes.len(), "{set}: unpaired MPT witness");
@@ -250,5 +261,19 @@ mod tests {
             }
             assert!(!fx.contracts.is_empty(), "{set}: no contracts");
         }
+    }
+
+    /// Reads the set's `manifest.txt`: one `<number>.<hash>` per line.
+    fn manifest(fx: &TestFixtures) -> BTreeSet<(u64, BlockHash)> {
+        let path = fx.data_dir.join("manifest.txt");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                parse_block_num_and_hash(line.trim())
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+            })
+            .collect()
     }
 }
