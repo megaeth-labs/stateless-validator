@@ -34,7 +34,7 @@ jobs:
       - name: Run Codespell
         uses: codespell-project/actions-codespell@v2
         with:
-          skip: ./target
+          skip: ./target,*.zst
 
   test:
     runs-on: ubuntu-24.04
