@@ -195,6 +195,7 @@ The background chain-sync prefetch routes by freshness against the last observed
 | `crates/stateless-common/src/rpc_client.rs`                                                    | RPC client for blocks, witnesses, and bytecode                                       |
 | `crates/stateless-common/src/metrics.rs`                                                       | RpcMethod, RpcMetrics, RpcClientConfig                                               |
 | `bin/stateless-validator/src/{main,app,runner,chain_sync,validator_db,metrics}.rs`             | Thin entry, CLI/startup wiring, pipeline+reporter, fetcher/processor, DB             |
+| `bin/stateless-validator/src/block_list.rs`                                                    | `--block-list` replay of a sparse block set: list parsing, bounded fetch + validate, results/retry files |
 | `bin/debug-trace-server/src/chain_sync.rs`                                                     | TraceFetcher, TraceProcessor, TraceHooks                                             |
 | `bin/debug-trace-server/src/rpc_service.rs`                                                    | RPC method definitions and handlers                                                  |
 | `bin/debug-trace-server/src/rpc_middleware.rs`                                                 | Concurrent execution of inbound JSON-RPC batch entries                               |

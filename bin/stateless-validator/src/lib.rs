@@ -4,6 +4,7 @@
 //! and the integration tests under `tests/`. Internals stay `pub(crate)`.
 
 pub(crate) mod app;
+pub mod block_list;
 pub(crate) mod chain_sync;
 pub(crate) mod metrics;
 pub(crate) mod r2_witness;
