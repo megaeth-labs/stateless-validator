@@ -20,15 +20,18 @@ use stateless_core::chain_spec::ChainSpec;
 use tracing::{trace, warn};
 
 use crate::{
-    data_provider::{BlockData, DataProvider, DataProviderError, SLOW_STAGE_THRESHOLD_MS},
+    admission::{AdmissionError, AdmissionLimiter, ExecutionPermit},
+    data_provider::{
+        BlockData, DataProvider, DataProviderError, SLOW_STAGE_THRESHOLD_MS, TimeoutStage,
+    },
     metrics::{
-        self, BlockDataEvictionMetrics, CacheStats, DataSourceMetrics, EvmExecutionMetrics,
-        METHOD_DEBUG_TRACE_BLOCK_BY_HASH, METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
+        self, BlockDataEvictionMetrics, CacheStats, DataSourceMetrics, ErrorReason,
+        EvmExecutionMetrics, METHOD_DEBUG_TRACE_BLOCK_BY_HASH, METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
         METHOD_DEBUG_TRACE_TRANSACTION, METHOD_TRACE_BLOCK, METHOD_TRACE_TRANSACTION,
         ResponseSizeMetrics, RpcGlobalMetrics, SingleFlightMetrics,
     },
     raw_json::RawJson,
-    response_cache::{CachedResource, RequestShape, ResponseCache, ResponseVariant},
+    response_cache::{CachedResource, RequestShape, ResponseCache, ResponseVariant, TraceWeight},
     tracing_executor::TraceError,
 };
 
@@ -165,6 +168,10 @@ pub struct RpcContext {
     response_cache: Option<ResponseCache>,
     /// Watch dog for tracking in-flight requests.
     watch_dog: RpcWatchDog,
+    /// Inbound admission gate (`None` = disabled, every request executes immediately).
+    admission: Option<Arc<AdmissionLimiter>>,
+    /// Cap on a single serialized reply body (`--max-response-size`).
+    max_response_size: usize,
 }
 
 impl RpcContext {
@@ -173,8 +180,17 @@ impl RpcContext {
         data_provider: Arc<DataProvider>,
         chain_spec: Arc<ChainSpec>,
         response_cache: Option<ResponseCache>,
+        admission: Option<Arc<AdmissionLimiter>>,
+        max_response_size: usize,
     ) -> Self {
-        Self { data_provider, chain_spec, response_cache, watch_dog: RpcWatchDog::new() }
+        Self {
+            data_provider,
+            chain_spec,
+            response_cache,
+            watch_dog: RpcWatchDog::new(),
+            admission,
+            max_response_size,
+        }
     }
 
     /// Returns a reference to the watch dog for spawning the checker task.
@@ -195,7 +211,7 @@ impl RpcContext {
         block_hash: &B256,
         error: TraceError,
     ) -> jsonrpsee::types::ErrorObjectOwned {
-        metrics::record_rpc_error(method);
+        metrics::record_rpc_error(method, ErrorReason::TraceFailed);
         if matches!(error, TraceError::Data(_)) && self.data_provider.evict_block_data(block_hash) {
             BlockDataEvictionMetrics::new_for_method(method).record();
         }
@@ -223,34 +239,40 @@ impl RpcContext {
     /// The shared by-number prelude, encoding the reorg-safety invariant once for both
     /// by-number handlers: resolve tag -> number -> canonical hash (local index first)
     /// *before* the cache lookup, all on one request deadline; on a miss, fetch block data
-    /// by the resolved hash on the remaining budget. Slow prelude stages are warned about
-    /// here, where they are measured; trace/serialize timing lives in
-    /// [`compute_block_trace`] and cache-insert timing in [`insert_cache`].
+    /// by the resolved hash + number on the remaining budget (a tag resolution already
+    /// bound number -> hash in its one upstream response, so it skips the canonical-hash
+    /// step). Slow prelude stages are warned about here, where they are measured;
+    /// trace/serialize timing lives in [`compute_block_trace`] and cache-insert timing in
+    /// [`insert_cache`].
     async fn lookup_block_by_number(
         &self,
         method: &'static str,
         resource: CachedResource,
         variant: Option<ResponseVariant>,
+        weight: TraceWeight,
         block_number: BlockNumberOrTag,
         start: Instant,
     ) -> Result<BlockLookup, jsonrpsee::types::ErrorObjectOwned> {
         let deadline = self.data_provider.fetch_deadline();
 
         let t0 = Instant::now();
-        let block_num =
-            self.data_provider.resolve_block_number(block_number, deadline).await.map_err(|e| {
-                metrics::record_rpc_error(method);
-                rpc_err(format!("Failed to resolve block number: {e}"))
-            })?;
+        let (block_num, tag_hash) = self
+            .data_provider
+            .resolve_block_number(block_number, deadline)
+            .await
+            .map_err(|e| data_provider_failure(method, &e))?;
         let resolve_ms = t0.elapsed().as_millis();
         tracing::Span::current().record("block_number", block_num);
 
         let t1 = Instant::now();
-        let block_hash =
-            self.data_provider.resolve_canonical_hash(block_num, deadline).await.map_err(|e| {
-                metrics::record_rpc_error(method);
-                data_provider_error_to_rpc_error(&e)
-            })?;
+        let block_hash = match tag_hash {
+            Some(hash) => hash,
+            None => self
+                .data_provider
+                .resolve_canonical_hash(block_num, deadline)
+                .await
+                .map_err(|e| data_provider_failure(method, &e))?,
+        };
         let resolve_hash_ms = t1.elapsed().as_millis();
 
         if let Some(cached) =
@@ -259,15 +281,18 @@ impl RpcContext {
             return Ok(BlockLookup::Cached(cached));
         }
 
+        // Past the cache: this request is going to fetch and replay a block, so it needs an
+        // execution permit. Acquired *here* rather than at the gate so a cache hit — which
+        // costs microseconds — is never queued behind cold traces, and so the wait sits
+        // inside the deadline minted above instead of on top of it.
+        let permit = self.acquire_execution(method, weight, deadline).await?;
+
         let t2 = Instant::now();
         let data = self
             .data_provider
-            .get_block_data_by_hash_with_deadline(block_hash, deadline)
+            .get_block_data(block_hash, Some(block_num), deadline)
             .await
-            .map_err(|e| {
-                metrics::record_rpc_error(method);
-                data_provider_error_to_rpc_error(&e)
-            })?;
+            .map_err(|e| data_provider_failure(method, &e))?;
         let fetch_ms = t2.elapsed().as_millis();
 
         if resolve_ms >= SLOW_STAGE_THRESHOLD_MS ||
@@ -284,7 +309,27 @@ impl RpcContext {
             );
         }
 
-        Ok(BlockLookup::Fetched(data))
+        Ok(BlockLookup::Fetched(data, permit))
+    }
+
+    /// Waits for an execution permit, or refuses when the wait would outlast the budget.
+    ///
+    /// `deadline` must be the same one the request's fetch will run under, so the wait is
+    /// carved out of that budget rather than added on top of it.
+    ///
+    /// `Ok(None)` means admission control is disabled for this process.
+    async fn acquire_execution(
+        &self,
+        method: &'static str,
+        weight: TraceWeight,
+        deadline: Instant,
+    ) -> Result<Option<ExecutionPermit>, jsonrpsee::types::ErrorObjectOwned> {
+        let Some(limiter) = &self.admission else { return Ok(None) };
+        let cutoff = self.data_provider.permit_cutoff(deadline);
+        match limiter.acquire_execution(method, weight, cutoff).await {
+            Ok(permit) => Ok(Some(permit)),
+            Err(AdmissionError::Overloaded) => Err(overloaded_err(method)),
+        }
     }
 
     /// Runs the geth-style block-trace executor over `data` via [`compute_block_trace`] —
@@ -295,7 +340,7 @@ impl RpcContext {
         method: &'static str,
         opts: GethDebugTracingOptions,
     ) -> Result<RawJson, jsonrpsee::types::ErrorObjectOwned> {
-        compute_block_trace(data, method, || {
+        compute_block_trace(data, method, self.max_response_size, || {
             crate::tracing_executor::trace_block(
                 &self.chain_spec,
                 &data.block,
@@ -313,7 +358,7 @@ enum BlockLookup {
     /// Served straight from the response cache.
     Cached(RawJson),
     /// Cache miss: block data fetched by the resolved canonical hash, ready to trace.
-    Fetched(Arc<BlockData>),
+    Fetched(Arc<BlockData>, Option<ExecutionPermit>),
 }
 
 // Error Helpers
@@ -329,10 +374,10 @@ fn rpc_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
 }
 
 /// Creates a JSON-RPC invalid-params error (code -32602).
-fn invalid_params_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
+pub(crate) fn invalid_params_err(msg: impl Into<String>) -> jsonrpsee::types::ErrorObjectOwned {
     jsonrpsee::types::ErrorObjectOwned::owned(
         jsonrpsee::types::error::INVALID_PARAMS_CODE,
-        msg,
+        msg.into(),
         None::<()>,
     )
 }
@@ -344,20 +389,33 @@ fn invalid_params_err(msg: String) -> jsonrpsee::types::ErrorObjectOwned {
 fn classify_and_gate(
     method_name: &'static str,
     opts: &GethDebugTracingOptions,
-) -> Result<Option<ResponseVariant>, jsonrpsee::types::ErrorObjectOwned> {
+) -> Result<(Option<ResponseVariant>, TraceWeight), jsonrpsee::types::ErrorObjectOwned> {
     let shape = RequestShape::classify(opts);
     metrics::record_request_shape(method_name, shape.label());
     // Exhaustive on purpose, like `classify` itself: a future shape variant must make
     // an explicit gate decision here instead of silently passing through.
     let message = match &shape {
-        RequestShape::Cacheable(_) | RequestShape::Bypass(_) => return Ok(shape.cache_variant()),
+        RequestShape::Cacheable(_) | RequestShape::Bypass(_) => {
+            return Ok((shape.cache_variant(), shape.weight()));
+        }
         RequestShape::InvalidTracerConfig { label, error } => {
             format!("invalid tracerConfig for {label}: {error}")
         }
         RequestShape::Unsupported { label } => format!("unsupported tracer: {label}"),
     };
-    metrics::record_rpc_error(method_name);
+    metrics::record_rpc_error(method_name, ErrorReason::InvalidParams);
     Err(invalid_params_err(message))
+}
+
+/// Renders an admission refusal raised *after* the handler recorded its arrival.
+///
+/// Only the outcome side is recorded here: the arrival is the handler's own shape, already
+/// counted at entry, so the identity closes with `reason="overloaded"` alone. The
+/// middleware's own shed — the one that happens before any handler runs — records both
+/// sides itself through `metrics::record_admission_shed`.
+fn overloaded_err(method: &'static str) -> jsonrpsee::types::ErrorObjectOwned {
+    metrics::record_rpc_error(method, ErrorReason::Overloaded);
+    crate::admission::queue_full_error()
 }
 
 /// Maps a [`DataProviderError`] to a JSON-RPC error object.
@@ -373,10 +431,39 @@ fn data_provider_error_to_rpc_error(e: &DataProviderError) -> jsonrpsee::types::
         DataProviderError::Timeout { .. } => {
             ErrorObjectOwned::owned(ERROR_CODE_NOT_FOUND, e.to_string(), None::<()>)
         }
+        DataProviderError::UnsupportedBlockTag(_) => invalid_params_err(e.to_string()),
         DataProviderError::Internal(_) => {
             ErrorObjectOwned::owned(ERROR_CODE_INTERNAL, "internal error".to_string(), None::<()>)
         }
     }
+}
+
+/// The `reason` label for a [`DataProviderError`] — deliberately finer than the JSON-RPC
+/// code, which folds three of these into `-32001` (see [`ErrorReason`]).
+fn error_reason(e: &DataProviderError) -> ErrorReason {
+    match e {
+        DataProviderError::Timeout { stage: TimeoutStage::Witness, .. } => {
+            ErrorReason::DeadlineWitness
+        }
+        DataProviderError::Timeout { stage: TimeoutStage::Block, .. } => ErrorReason::DeadlineBlock,
+        DataProviderError::TransactionNotFound(_) | DataProviderError::TransactionPending(_) => {
+            ErrorReason::NotFound
+        }
+        DataProviderError::UnsupportedBlockTag(_) => ErrorReason::InvalidParams,
+        DataProviderError::Internal(_) => ErrorReason::Internal,
+    }
+}
+
+/// Records a [`DataProviderError`] against `method` and renders it as an RPC error.
+///
+/// Single funnel for every fetch-path failure so the counter and the returned code are
+/// emitted from one place and cannot drift apart as new call sites appear.
+fn data_provider_failure(
+    method: &str,
+    e: &DataProviderError,
+) -> jsonrpsee::types::ErrorObjectOwned {
+    metrics::record_rpc_error(method, error_reason(e));
+    data_provider_error_to_rpc_error(e)
 }
 
 // Trace Computation Helpers
@@ -389,6 +476,7 @@ fn data_provider_error_to_rpc_error(e: &DataProviderError) -> jsonrpsee::types::
 fn compute_block_trace<T: serde::Serialize>(
     data: &BlockData,
     method_name: &'static str,
+    max_response_size: usize,
     run: impl FnOnce() -> Result<T, TraceError>,
 ) -> Result<RawJson, TraceError> {
     let start = Instant::now();
@@ -401,6 +489,11 @@ fn compute_block_trace<T: serde::Serialize>(
 
     let json = RawJson::try_new(&results)
         .map_err(|e| TraceError::Request(format!("Serialization failed: {e}")))?;
+    // Request-attributable, not data-attributable: the block is fine, the client asked for
+    // more output than this process will hand back. That discriminant is what keeps an
+    // oversized request from evicting a perfectly good block from the data cache.
+    let json =
+        check_response_size(json, method_name, max_response_size).map_err(TraceError::Request)?;
 
     let serialize_ms = start.elapsed().as_millis() - trace_ms;
     let response_size = json.byte_len();
@@ -486,15 +579,58 @@ fn insert_cache(
 /// Serializes a result into its [`RawJson`] reply body and records the response-size
 /// metric — the shared epilogue of the uncached transaction handlers (the block-level
 /// twin lives in `compute_block_trace`, which folds the same serialization into its
-/// stage timing and maps failures to [`TraceError`] instead).
+/// stage timing and maps failures to [`TraceError`] instead). A failure records its own
+/// error outcome, so callers must count the request as served only after this returns.
 fn serialize_reply<T: serde::Serialize>(
     result: &T,
     method_name: &'static str,
+    max_response_size: usize,
 ) -> RpcResult<RawJson> {
-    let json =
-        RawJson::try_new(result).map_err(|e| rpc_err(format!("Serialization failed: {e}")))?;
+    let json = RawJson::try_new(result).map_err(|e| {
+        metrics::record_rpc_error(method_name, ErrorReason::Internal);
+        rpc_err(format!("Serialization failed: {e}"))
+    })?;
+    let json = check_response_size(json, method_name, max_response_size).map_err(|e| {
+        // `TraceFailed` rather than `Internal`: the tracer ran and its output could not be
+        // returned, which is exactly what that reason means. `Internal` stays "our fault".
+        metrics::record_rpc_error(method_name, ErrorReason::TraceFailed);
+        rpc_err(e)
+    })?;
     ResponseSizeMetrics::new_for_method(method_name).record(json.byte_len());
     Ok(json)
+}
+
+/// Discards a reply body that exceeds `--max-response-size`.
+///
+/// The body has necessarily been built by the time it can be measured, so this does not
+/// prevent the peak allocation of any one response. What it prevents is that body being
+/// copied again into the JSON-RPC envelope and — for a batch entry — retained there until
+/// every sibling entry finishes: it is that accumulation across a batch, not any single
+/// response, that has previously exhausted this process's memory. Dropping here also keeps
+/// the body out of the response cache, since the caller errors out before inserting.
+fn check_response_size(
+    json: RawJson,
+    method_name: &'static str,
+    max_response_size: usize,
+) -> Result<RawJson, String> {
+    let bytes = json.byte_len();
+    if bytes <= max_response_size {
+        return Ok(json);
+    }
+    drop(json);
+    metrics::record_response_oversized(method_name);
+    warn!(
+        method = method_name,
+        response_bytes = bytes,
+        max_response_size,
+        "discarded a response over the configured size limit"
+    );
+    // Worded here rather than at the two call sites, so both serialization points say the same
+    // thing; each still classifies the failure its own way.
+    Err(format!(
+        "response of {bytes} bytes exceeds the {max_response_size}-byte limit; use a lighter \
+         tracer, or request fewer blocks per batch"
+    ))
 }
 
 /// Records metrics and logs for a completed request.
@@ -527,20 +663,21 @@ impl DebugTraceRpcServer for RpcContext {
             .start_request(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, format!("{block_number}"));
         let start = Instant::now();
         let opts = opts.unwrap_or_default();
-        let variant = classify_and_gate(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, &opts)?;
+        let (variant, weight) = classify_and_gate(METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, &opts)?;
 
-        let data = match self
+        let (data, _permit) = match self
             .lookup_block_by_number(
                 METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER,
                 CachedResource::DebugTraceBlock,
                 variant,
+                weight,
                 block_number,
                 start,
             )
             .await?
         {
             BlockLookup::Cached(cached) => return Ok(cached),
-            BlockLookup::Fetched(data) => data,
+            BlockLookup::Fetched(data, permit) => (data, permit),
         };
 
         let result = self.compute_debug_trace(&data, METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER, opts)?;
@@ -572,7 +709,7 @@ impl DebugTraceRpcServer for RpcContext {
             self.watch_dog.start_request(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, format!("{block_hash}"));
         let start = Instant::now();
         let opts = opts.unwrap_or_default();
-        let variant = classify_and_gate(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, &opts)?;
+        let (variant, weight) = classify_and_gate(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, &opts)?;
 
         // Check cache — the requested hash IS the key; no resolution step.
         if let Some(cached) = check_cache(
@@ -586,10 +723,17 @@ impl DebugTraceRpcServer for RpcContext {
             return Ok(cached);
         }
 
-        let data = self.data_provider.get_block_data_by_hash(block_hash).await.map_err(|e| {
-            metrics::record_rpc_error(METHOD_DEBUG_TRACE_BLOCK_BY_HASH);
-            data_provider_error_to_rpc_error(&e)
-        })?;
+        // Minted once and used for both the permit wait and the fetch, so the queue is carved
+        // out of the request's budget rather than added on top of it; the permit is held
+        // through the replay below.
+        let deadline = self.data_provider.fetch_deadline();
+        let _permit =
+            self.acquire_execution(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, weight, deadline).await?;
+        let data = self
+            .data_provider
+            .get_block_data_by_hash(block_hash, deadline)
+            .await
+            .map_err(|e| data_provider_failure(METHOD_DEBUG_TRACE_BLOCK_BY_HASH, &e))?;
         let block_num = data.block.header.number;
         let result = self.compute_debug_trace(&data, METHOD_DEBUG_TRACE_BLOCK_BY_HASH, opts)?;
 
@@ -620,13 +764,18 @@ impl DebugTraceRpcServer for RpcContext {
         let opts = opts.unwrap_or_default();
         // Shape metric + malformed-config rejection; tx-level responses are not cached, so
         // the cache variant itself is unused.
-        let _ = classify_and_gate(METHOD_DEBUG_TRACE_TRANSACTION, &opts)?;
+        let (_, weight) = classify_and_gate(METHOD_DEBUG_TRACE_TRANSACTION, &opts)?;
 
-        let (data, tx_index) =
-            self.data_provider.get_block_data_for_tx(tx_hash).await.map_err(|e| {
-                metrics::record_rpc_error(METHOD_DEBUG_TRACE_TRANSACTION);
-                data_provider_error_to_rpc_error(&e)
-            })?;
+        // One deadline for the wait and the fetch; see `trace_block_by_hash`.
+        let deadline = self.data_provider.fetch_deadline();
+        let _permit =
+            self.acquire_execution(METHOD_DEBUG_TRACE_TRANSACTION, weight, deadline).await?;
+
+        let (data, tx_index) = self
+            .data_provider
+            .get_block_data_for_tx(tx_hash, deadline)
+            .await
+            .map_err(|e| data_provider_failure(METHOD_DEBUG_TRACE_TRANSACTION, &e))?;
 
         let evm_start = Instant::now();
         let result = crate::tracing_executor::trace_transaction(
@@ -647,6 +796,11 @@ impl DebugTraceRpcServer for RpcContext {
         EvmExecutionMetrics::new_for_method(METHOD_DEBUG_TRACE_TRANSACTION)
             .record(evm_start.elapsed().as_secs_f64(), 1);
 
+        // Serialize before counting the request as served: a failure records an error,
+        // and one request must land in exactly one bucket.
+        let json =
+            serialize_reply(&result, METHOD_DEBUG_TRACE_TRANSACTION, self.max_response_size)?;
+
         let elapsed = start.elapsed();
         metrics::record_rpc_request(METHOD_DEBUG_TRACE_TRANSACTION, elapsed.as_secs_f64());
 
@@ -661,14 +815,23 @@ impl DebugTraceRpcServer for RpcContext {
             );
         }
 
-        serialize_reply(&result, METHOD_DEBUG_TRACE_TRANSACTION)
+        Ok(json)
     }
 
     async fn get_cache_status(&self) -> RpcResult<serde_json::Value> {
-        Ok(serde_json::json!({
+        let start = Instant::now();
+        // Arrival + served, so the one method outside the trace pipeline still balances
+        // against the middleware's cancelled/rejected terms.
+        metrics::record_request_shape(metrics::METHOD_DEBUG_GET_CACHE_STATUS, "default");
+        let status = serde_json::json!({
             "responseCache": cache_section(self.response_cache.as_ref().map(ResponseCache::stats)),
             "blockDataCache": cache_section(self.data_provider.block_data_cache_stats()),
-        }))
+        });
+        metrics::record_rpc_request(
+            metrics::METHOD_DEBUG_GET_CACHE_STATUS,
+            start.elapsed().as_secs_f64(),
+        );
+        Ok(status)
     }
 }
 
@@ -695,23 +858,28 @@ impl TraceRpcServer for RpcContext {
     async fn trace_block(&self, block_number: BlockNumberOrTag) -> RpcResult<RawJson> {
         let _guard = self.watch_dog.start_request(METHOD_TRACE_BLOCK, format!("{block_number}"));
         let start = Instant::now();
+        // Opts-less, so every request is the default shape — recorded here because this
+        // method never passes `classify_and_gate`, and the accounting identity needs an
+        // arrival for it too.
+        metrics::record_request_shape(METHOD_TRACE_BLOCK, "default");
 
         // `trace_block` takes no tracer options, so its variant is always `Default`.
-        let data = match self
+        let (data, _permit) = match self
             .lookup_block_by_number(
                 METHOD_TRACE_BLOCK,
                 CachedResource::TraceBlock,
                 Some(ResponseVariant::Default),
+                TraceWeight::Normal,
                 block_number,
                 start,
             )
             .await?
         {
             BlockLookup::Cached(cached) => return Ok(cached),
-            BlockLookup::Fetched(data) => data,
+            BlockLookup::Fetched(data, permit) => (data, permit),
         };
 
-        let result = compute_block_trace(&data, METHOD_TRACE_BLOCK, || {
+        let result = compute_block_trace(&data, METHOD_TRACE_BLOCK, self.max_response_size, || {
             crate::tracing_executor::parity_trace_block(
                 &self.chain_spec,
                 &data.block,
@@ -740,22 +908,44 @@ impl TraceRpcServer for RpcContext {
     async fn trace_parity_transaction(&self, tx_hash: B256) -> RpcResult<RawJson> {
         let _guard = self.watch_dog.start_request(METHOD_TRACE_TRANSACTION, format!("{tx_hash}"));
         let start = Instant::now();
+        // Opts-less arrival, mirroring `trace_block` — without it every null/served
+        // response here would count against a zero arrival side.
+        metrics::record_request_shape(METHOD_TRACE_TRANSACTION, "default");
+
+        // Refused capacity is surfaced as a real error, never degraded to the `null` below:
+        // a client that reads `null` learns "no such transaction" and does not back off.
+        // One deadline for the wait and the fetch; see `trace_block_by_hash`.
+        let deadline = self.data_provider.fetch_deadline();
+        let _permit =
+            self.acquire_execution(METHOD_TRACE_TRANSACTION, TraceWeight::Normal, deadline).await?;
 
         // Return null instead of error when tx not found or unreachable (matches mega-reth);
         // surface genuine Internal failures as -32000. Branches on the typed variant so any
         // future `DataProviderError` addition must be classified explicitly at compile time.
-        let (data, tx_index) = match self.data_provider.get_block_data_for_tx(tx_hash).await {
-            Ok(result) => result,
-            Err(
-                DataProviderError::TransactionNotFound(_) |
-                DataProviderError::TransactionPending(_) |
-                DataProviderError::Timeout { .. },
-            ) => return Ok(RawJson::null()),
-            Err(DataProviderError::Internal(_)) => {
-                metrics::record_rpc_error(METHOD_TRACE_TRANSACTION);
-                return Err(rpc_err("internal error".to_string()));
-            }
-        };
+        let (data, tx_index) =
+            match self.data_provider.get_block_data_for_tx(tx_hash, deadline).await {
+                Ok(result) => result,
+                Err(
+                    e @ (DataProviderError::TransactionNotFound(_) |
+                    DataProviderError::TransactionPending(_) |
+                    DataProviderError::Timeout { .. }),
+                ) => {
+                    // A null result is still a served request — count it as one, and keep
+                    // the degraded cause visible on its own counter.
+                    metrics::record_null_result(METHOD_TRACE_TRANSACTION, error_reason(&e));
+                    metrics::record_rpc_request(
+                        METHOD_TRACE_TRANSACTION,
+                        start.elapsed().as_secs_f64(),
+                    );
+                    return Ok(RawJson::null());
+                }
+                Err(
+                    e
+                    @ (DataProviderError::Internal(_) | DataProviderError::UnsupportedBlockTag(_)),
+                ) => {
+                    return Err(data_provider_failure(METHOD_TRACE_TRANSACTION, &e));
+                }
+            };
 
         let evm_start = Instant::now();
         let result = crate::tracing_executor::parity_trace_transaction(
@@ -771,6 +961,10 @@ impl TraceRpcServer for RpcContext {
         EvmExecutionMetrics::new_for_method(METHOD_TRACE_TRANSACTION)
             .record(evm_start.elapsed().as_secs_f64(), 1);
 
+        // Serialize before counting the request as served: a failure records an error,
+        // and one request must land in exactly one bucket.
+        let json = serialize_reply(&result, METHOD_TRACE_TRANSACTION, self.max_response_size)?;
+
         let elapsed = start.elapsed();
         metrics::record_rpc_request(METHOD_TRACE_TRANSACTION, elapsed.as_secs_f64());
 
@@ -785,13 +979,25 @@ impl TraceRpcServer for RpcContext {
             );
         }
 
-        serialize_reply(&result, METHOD_TRACE_TRANSACTION)
+        Ok(json)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// `ErrorReason::ALL` must stay in step with the enum, and the labels must be unique —
+    /// a duplicate would silently merge two outcomes into one series.
+    #[test]
+    fn error_reason_labels_are_unique_and_complete() {
+        let labels: Vec<_> = ErrorReason::ALL.iter().map(|r| r.as_str()).collect();
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "duplicate reason label in {labels:?}");
+        assert!(labels.contains(&"deadline_witness"), "the alerting label must exist");
+    }
+
     use crate::response_cache::ResponseCacheConfig;
 
     #[test]
@@ -814,36 +1020,48 @@ mod tests {
         assert_eq!(SLOW_REQUEST_THRESHOLD.as_secs(), 5);
     }
 
-    /// Each `DataProviderError` variant maps to a specific JSON-RPC error code. Missing /
-    /// timeout cases must surface as `-32001` (resource not found); `Internal` falls through
-    /// to `-32000`. Lives here rather than in `data_provider.rs` because the data layer
-    /// shouldn't import `jsonrpsee` types.
+    /// Each `DataProviderError` variant maps to a specific JSON-RPC error code and a
+    /// distinct, stable `reason` label — the deadline stages stay separable from
+    /// `not_found` even though all three share `-32001`. Lives here rather than in
+    /// `data_provider.rs` because the data layer shouldn't import `jsonrpsee` types.
     #[test]
     fn data_provider_error_to_rpc_error_code_mapping() {
         use crate::data_provider::TimeoutStage;
 
         let tx_hash = B256::from([0x11; 32]);
 
-        let not_found_variants: [DataProviderError; 4] = [
-            DataProviderError::TransactionNotFound(tx_hash),
-            DataProviderError::TransactionPending(tx_hash),
-            DataProviderError::Timeout {
-                stage: TimeoutStage::Witness,
-                elapsed: Duration::from_secs(8),
-            },
-            DataProviderError::Timeout {
-                stage: TimeoutStage::Block,
-                elapsed: Duration::from_secs(13),
-            },
+        let not_found_variants: [(DataProviderError, ErrorReason); 4] = [
+            (DataProviderError::TransactionNotFound(tx_hash), ErrorReason::NotFound),
+            (DataProviderError::TransactionPending(tx_hash), ErrorReason::NotFound),
+            (
+                DataProviderError::Timeout {
+                    stage: TimeoutStage::Witness,
+                    elapsed: Duration::from_secs(8),
+                },
+                ErrorReason::DeadlineWitness,
+            ),
+            (
+                DataProviderError::Timeout {
+                    stage: TimeoutStage::Block,
+                    elapsed: Duration::from_secs(13),
+                },
+                ErrorReason::DeadlineBlock,
+            ),
         ];
 
-        for variant in not_found_variants {
+        for (variant, reason) in not_found_variants {
             let err = data_provider_error_to_rpc_error(&variant);
             assert_eq!(err.code(), -32001, "variant {variant:?} must map to resource-not-found");
             assert_eq!(err.message(), variant.to_string().as_str());
+            assert_eq!(error_reason(&variant), reason);
         }
 
+        let pending = DataProviderError::UnsupportedBlockTag(BlockNumberOrTag::Pending);
+        assert_eq!(error_reason(&pending), ErrorReason::InvalidParams, "client input, not a fault");
+        assert_eq!(data_provider_error_to_rpc_error(&pending).code(), -32602);
+
         let internal: DataProviderError = eyre::eyre!("boom").into();
+        assert_eq!(error_reason(&internal), ErrorReason::Internal);
         let err = data_provider_error_to_rpc_error(&internal);
         assert_eq!(err.code(), -32000);
         assert_eq!(err.message(), "internal error");
@@ -986,7 +1204,171 @@ mod tests {
             Duration::from_secs(1),
             1024,
         ));
-        RpcContext::new(provider, Arc::new(chain_spec), response_cache)
+        RpcContext::new(provider, Arc::new(chain_spec), response_cache, None, usize::MAX)
+    }
+
+    /// An over-limit body is discarded and counted, not returned.
+    ///
+    /// The cap cannot prevent the first allocation — the body has to exist before it can be
+    /// measured — so what it buys is that this body is never copied again into the JSON-RPC
+    /// envelope, nor retained by a batch until its siblings finish. That accumulation, not any
+    /// single response, is what has previously exhausted this process's memory.
+    #[test]
+    fn oversized_response_is_discarded() {
+        let body = serde_json::json!({ "trace": "x".repeat(4096) });
+        let serialized = RawJson::try_new(&body).expect("serialize").byte_len();
+
+        let ok = serialize_reply(&body, METHOD_DEBUG_TRACE_TRANSACTION, serialized)
+            .expect("exactly at the limit is allowed");
+        assert_eq!(ok.byte_len(), serialized);
+
+        let err = serialize_reply(&body, METHOD_DEBUG_TRACE_TRANSACTION, serialized - 1)
+            .expect_err("one byte over is refused");
+        assert_eq!(err.code(), ERROR_CODE_INTERNAL);
+        assert!(err.message().contains("exceeds"), "the message must say why: {}", err.message());
+        assert!(
+            err.message().contains("lighter tracer"),
+            "and what to do about it: {}",
+            err.message()
+        );
+    }
+
+    /// An over-limit block trace is request-attributable, never data-attributable.
+    ///
+    /// The discriminant matters: `TraceError::Data` drops the block from the block-data cache,
+    /// and a client asking for too much output is no reason to evict a perfectly good block
+    /// that other requests are about to want.
+    #[test]
+    fn oversized_block_trace_is_request_attributable() {
+        let data = crate::data_provider::test_support::fixture_block_data();
+        let body = serde_json::json!({ "trace": "x".repeat(4096) });
+        let err = compute_block_trace(&data, METHOD_TRACE_BLOCK, 16, || Ok(body))
+            .expect_err("over the limit");
+        assert!(
+            matches!(err, TraceError::Request(_)),
+            "an oversized response must not evict the block that produced it"
+        );
+    }
+
+    /// The public module never learns an `admin_` method. This repository is public and this
+    /// port faces customers; the admin namespace lives on its own loopback listener.
+    #[test]
+    fn public_module_registers_no_admin_methods() {
+        let module = test_context(None, None, ChainSpec::default())
+            .into_rpc_module()
+            .expect("the public module builds");
+        let admin: Vec<_> =
+            module.method_names().filter(|name| name.starts_with("admin_")).collect();
+        assert!(admin.is_empty(), "admin methods must not reach the public port: {admin:?}");
+    }
+
+    /// [`test_context`] with an admission gate installed.
+    fn admission_context(
+        response_cache: Option<ResponseCache>,
+        limiter: Arc<AdmissionLimiter>,
+    ) -> RpcContext {
+        let mut ctx = test_context(None, response_cache, ChainSpec::default());
+        ctx.admission = Some(limiter);
+        ctx
+    }
+
+    /// A response-cache hit must not need an execution permit.
+    ///
+    /// This is the whole reason the permit is taken in the handler rather than at the gate: a
+    /// hit costs microseconds and no upstream call, so queueing it behind cold traces spends
+    /// availability to buy nothing. Here the gate's only permit is already held, and the hit
+    /// is still served.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cache_hit_needs_no_execution_permit() {
+        let hash = B256::from([9u8; 32]);
+        let body = RawJson::try_new(&serde_json::json!({"cached": true})).expect("serialize");
+        let cache = ResponseCache::new(ResponseCacheConfig::new(1_000_000, 100));
+        cache.insert(CachedResource::DebugTraceBlock, hash, ResponseVariant::Default, &body);
+
+        let limiter = AdmissionLimiter::new(1, 8, 1);
+        let _held = limiter
+            .acquire_execution(
+                METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
+                crate::response_cache::TraceWeight::Normal,
+                crate::rpc_middleware::test_support::far(),
+            )
+            .await
+            .expect("the test holds the gate's only permit");
+
+        let ctx = admission_context(Some(cache), Arc::clone(&limiter));
+        let served = ctx.trace_block_by_hash(hash, None).await.expect("a hit is served");
+        assert!(served.shares_bytes_with(&body), "the cached bytes came back verbatim");
+        assert_eq!(limiter.executing(), 1, "the hit took no permit of its own");
+    }
+
+    /// A request that cannot get a permit before its budget runs out is refused, not started.
+    ///
+    /// The distinction the gate exists for: the client sees a retryable `-32013` rather than
+    /// waiting out the deadline for a `-32001` it could have been told about immediately.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn permit_wait_past_the_budget_is_refused_not_timed_out() {
+        let limiter = AdmissionLimiter::new(1, 8, 1);
+        let _held = limiter
+            .acquire_execution(
+                METHOD_DEBUG_TRACE_BLOCK_BY_HASH,
+                crate::response_cache::TraceWeight::Normal,
+                crate::rpc_middleware::test_support::far(),
+            )
+            .await
+            .expect("the test holds the gate's only permit");
+
+        let ctx = admission_context(None, Arc::clone(&limiter));
+        let started = Instant::now();
+        let err = ctx
+            .trace_block_by_hash(B256::from([3u8; 32]), None)
+            .await
+            .expect_err("no permit is available and none will be");
+        assert_eq!(err.code(), crate::admission::QUEUE_FULL_CODE);
+        assert_eq!(err.message(), crate::admission::QUEUE_FULL_MESSAGE);
+        assert!(started.elapsed() < Duration::from_secs(5), "refused promptly, not timed out");
+    }
+
+    /// Only the memory-hungry shapes pay the heavy sub-cap.
+    #[test]
+    fn heavy_shapes_are_the_ones_that_can_exhaust_memory() {
+        use alloy_rpc_types_trace::geth::{
+            GethDebugBuiltInTracerType, GethDebugTracerType, GethDefaultTracingOptions,
+        };
+
+        let weight_of = |opts: &GethDebugTracingOptions| RequestShape::classify(opts).weight();
+        let builtin = |tracer| GethDebugTracingOptions {
+            tracer: Some(GethDebugTracerType::BuiltInTracer(tracer)),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            weight_of(&GethDebugTracingOptions::default()),
+            TraceWeight::Heavy,
+            "no tracer means the struct logger, which emits a record per executed opcode"
+        );
+        assert_eq!(
+            weight_of(&builtin(GethDebugBuiltInTracerType::CallTracer)),
+            TraceWeight::Normal
+        );
+        assert_eq!(
+            weight_of(&builtin(GethDebugBuiltInTracerType::FourByteTracer)),
+            TraceWeight::Normal
+        );
+        assert_eq!(
+            weight_of(&builtin(GethDebugBuiltInTracerType::PreStateTracer)),
+            TraceWeight::Heavy,
+            "a prestate trace over a large block is the shape that has OOM-killed this server"
+        );
+        // A struct-logger request with non-default flags bypasses the cache, so its size is
+        // bounded by nothing we can see up front.
+        let flagged = GethDebugTracingOptions {
+            config: GethDefaultTracingOptions {
+                disable_storage: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(weight_of(&flagged), TraceWeight::Heavy);
     }
 
     /// [`test_context`] with the block-data cache merely toggled, for the cache-status
@@ -1039,7 +1421,7 @@ mod tests {
         };
 
         let chain_spec = ChainSpec::from_genesis(
-            TestFixtures::synthetic().load_genesis().expect("fixture genesis"),
+            TestFixtures::synthetic_shared().load_genesis().expect("fixture genesis"),
         );
 
         // Request-attributable: healthy cached data plus an unparsable mux config.
@@ -1122,7 +1504,7 @@ mod tests {
             "tracerConfig": {"onlyTopCall": true},
         }))
         .unwrap();
-        assert!(classify_and_gate("test_method", &opts).unwrap().is_some());
+        assert!(classify_and_gate("test_method", &opts).unwrap().0.is_some());
     }
 
     #[test]

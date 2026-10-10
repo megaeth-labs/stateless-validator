@@ -5,29 +5,38 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 
 use alloy_primitives::{B256, BlockHash};
 use alloy_rpc_types_eth::Block;
 use clap::Parser;
-use jsonrpsee::{
-    RpcModule,
-    server::{ServerBuilder, ServerConfigBuilder},
+use jsonrpsee::server::ServerConfigBuilder;
+use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned};
+use stateless_common::{
+    BackoffPolicy, R2WitnessTransport, RpcClient, RpcClientConfig, WitnessRequestKeys,
+    encode_witness_payload, encode_witness_response,
 };
-use jsonrpsee_types::error::{
-    CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
-};
-use stateless_common::{RpcClient, RpcClientConfig, WitnessRequestKeys, encode_witness_response};
 use stateless_core::{
-    BisectResolver, ChainStore, ContractStore, PipelineConfig, db::BlockMeta,
-    pipeline::run_pipeline, withdrawals::MptWitness,
+    BisectResolver, ChainStore, ContractStore, PipelineConfig,
+    db::BlockMeta,
+    pipeline::{BlockFetcher, run_pipeline},
+    withdrawals::MptWitness,
 };
 use stateless_db::ContractCache;
-use stateless_test_utils::{fixtures::TestFixtures, logging::init_test_logging};
+use stateless_test_utils::{
+    fixtures::TestFixtures,
+    logging::init_test_logging,
+    mock_r2::mock_r2,
+    mock_rpc::{parse_hex_u64, serve_with_config},
+};
 use stateless_validator::{
-    CommandLineArgs, VALIDATOR_DB_FILENAME, ValidatorDB, ValidatorFetcher, ValidatorHooks,
-    ValidatorProcessor, load_or_create_chain_spec, run_with_signals,
+    CommandLineArgs, R2WitnessClient, VALIDATOR_DB_FILENAME, ValidatorDB, ValidatorFetcher,
+    ValidatorHooks, ValidatorProcessor, load_or_create_chain_spec, run_with_signals,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -135,6 +144,15 @@ fn witness_max_concurrent_requests_flag_and_env() {
 }
 
 #[test]
+fn r2_max_concurrent_requests_flag_and_env() {
+    assert_optional_numeric_flag::<usize>(
+        "--r2-max-concurrent-requests",
+        "STATELESS_VALIDATOR_R2_MAX_CONCURRENT_REQUESTS",
+        |a| a.r2_max_concurrent_requests,
+    );
+}
+
+#[test]
 fn tip_buffer_flag_and_env() {
     assert_optional_numeric_flag::<u64>("--tip-buffer", "STATELESS_VALIDATOR_TIP_BUFFER", |a| {
         a.tip_buffer
@@ -148,38 +166,71 @@ fn end_block_flag_and_env() {
     });
 }
 
-/// `--witness-source` must default to `rpc`, parse both lowercase values (flag and env), and
-/// reject anything else at parse time.
+/// The custom-domain R2 target is mutually exclusive with the S3 endpoint, and the Access
+/// token pair is all-or-nothing on top of it.
 #[test]
-fn witness_source_flag_and_env() {
-    use stateless_validator::WitnessSource;
-
-    let guard = stateless_test_utils::env::env_lock();
+fn r2_custom_domain_target_wiring() {
+    let _guard = stateless_test_utils::env::env_lock();
     let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
 
-    assert_eq!(parse(&[]).unwrap().witness_source, WitnessSource::Rpc);
-    assert_eq!(parse(&["--witness-source", "rpc"]).unwrap().witness_source, WitnessSource::Rpc);
-    assert_eq!(parse(&["--witness-source", "r2"]).unwrap().witness_source, WitnessSource::R2);
-    assert!(parse(&["--witness-source", "s3"]).is_err());
-
-    let from_env = stateless_test_utils::env::with_env_var(
-        &guard,
-        "STATELESS_VALIDATOR_WITNESS_SOURCE",
-        "r2",
-        || parse(&[]).unwrap().witness_source,
+    assert_eq!(
+        parse(&["--r2-custom-domain", "https://witness.example.com"])
+            .unwrap()
+            .r2_custom_domain
+            .as_deref(),
+        Some("https://witness.example.com")
     );
-    assert_eq!(from_env, WitnessSource::R2);
+    // Every R2 coherence rule is enforced after parsing, by `stateless_common::validate_r2_flags`,
+    // so that each error can name the flag — clap's own rejections cannot, this workspace having
+    // built it without `error-context`. Parsing therefore accepts all of these shapes; the rules
+    // and their messages are covered by that function's own tests.
+    const DOMAIN: &str = "https://witness.example.com";
+    for shape in [
+        &["--r2-custom-domain", DOMAIN, "--r2-endpoint", "https://acc.r2.cloudflarestorage.com"][..],
+        &["--r2-custom-domain", DOMAIN, "--r2-access-client-id", "tok"],
+        &["--r2-access-client-id", "tok", "--r2-access-client-secret", "sk"],
+        &[
+            "--r2-custom-domain",
+            DOMAIN,
+            "--r2-access-client-id",
+            "tok",
+            "--r2-access-client-secret",
+            "sk",
+        ],
+        &["--r2-custom-domain", DOMAIN, "--r2-connections", "0"],
+    ] {
+        assert!(parse(shape).is_ok(), "{shape:?} must parse; rejection happens post-parse");
+    }
+    assert_eq!(
+        parse(&["--r2-custom-domain", DOMAIN, "--r2-connections", "8"])
+            .unwrap()
+            .r2_connections
+            .as_deref(),
+        Some("8")
+    );
 }
 
-/// `--witness-endpoint` is enforced at runtime per witness source (required for `rpc`, ignored
-/// for `r2`), so the parse itself must accept its absence in both modes.
+/// A blank value — what a templated env file renders for a variable a role does not set —
+/// must reach the post-parse rules rather than clap, whose messages name no argument in this
+/// workspace. `--r2-connections` travels as text for that reason;
+/// `app::tests::r2_flags_are_validated_even_with_no_target_configured` covers the rejection.
 #[test]
-fn witness_endpoint_is_optional_at_parse_time() {
-    let parse =
-        |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS_NO_WITNESS.iter().chain(extra));
+fn blank_r2_values_reach_the_post_parse_rules() {
+    let _guard = stateless_test_utils::env::env_lock();
+    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
 
-    assert!(parse(&[]).unwrap().witness_endpoint.is_empty());
-    assert!(parse(&["--witness-source", "r2"]).unwrap().witness_endpoint.is_empty());
+    for blank in [
+        ["--r2-bucket", ""],
+        ["--r2-custom-domain", ""],
+        ["--r2-connections", ""],
+        ["--r2-access-client-id", ""],
+    ] {
+        assert!(
+            parse(&blank).is_ok(),
+            "a blank {} must parse, so the rules can name it rather than clap",
+            blank[0]
+        );
+    }
 }
 
 /// `canonical_chain_max_length` must reject 0 at parse time. A value of 0 would make
@@ -211,16 +262,19 @@ const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
 /// Mock RPC server backing state: all fields pre-decoded so the RPC handlers can respond
 /// synchronously. Wraps [`TestFixtures`] and pre-decodes MPT witnesses once.
 struct MockServerState {
-    fixtures: TestFixtures,
+    fixtures: &'static TestFixtures,
     mpt_witnesses: HashMap<BlockHash, MptWitness>,
     /// Every *accepted* `mega_setValidatedBlocks` call, as `(first_block, last_block)` numbers.
     validated_reports: Arc<Mutex<Vec<(u64, u64)>>>,
     /// Number of upcoming `mega_setValidatedBlocks` calls to reject with an RPC error.
-    reject_reports: Arc<std::sync::atomic::AtomicUsize>,
+    reject_reports: Arc<AtomicUsize>,
+    /// Every `mega_getBlockWitness` call, so a test can tell whether the RPC witness path was
+    /// used at all.
+    witness_requests: Arc<AtomicUsize>,
 }
 
 impl MockServerState {
-    fn new(fixtures: TestFixtures) -> Self {
+    fn new(fixtures: &'static TestFixtures) -> Self {
         let mpt_witnesses = fixtures
             .mpt_witness_bytes
             .keys()
@@ -231,7 +285,38 @@ impl MockServerState {
             mpt_witnesses,
             validated_reports: Arc::default(),
             reject_reports: Arc::default(),
+            witness_requests: Arc::default(),
         }
+    }
+
+    /// Fixture block for a `0x…` hex block number, or the RPC error the handlers return
+    /// for unknown blocks. Shared by the by-number block and header handlers.
+    fn block_by_number_hex(
+        &self,
+        hex_number: &str,
+    ) -> Result<&Block<op_alloy_rpc_types::Transaction>, ErrorObject<'static>> {
+        let block_number = parse_hex_u64(hex_number);
+        self.fixtures
+            .block_numbers
+            .get(&block_number)
+            .and_then(|hash| self.fixtures.blocks.get(hash))
+            .ok_or_else(|| {
+                make_rpc_error(
+                    CALL_EXECUTION_FAILED_CODE,
+                    format!("Block {block_number} not found"),
+                )
+            })
+    }
+
+    /// Fixture block for a block hash, or the RPC error the handlers return for unknown
+    /// blocks. Shared by the by-hash block and header handlers.
+    fn block_by_hash(
+        &self,
+        hash: B256,
+    ) -> Result<&Block<op_alloy_rpc_types::Transaction>, ErrorObject<'static>> {
+        self.fixtures.blocks.get(&BlockHash::from(hash.0)).ok_or_else(|| {
+            make_rpc_error(CALL_EXECUTION_FAILED_CODE, format!("Block {hash} not found"))
+        })
     }
 }
 
@@ -258,19 +343,9 @@ fn setup_test_db(fx: &TestFixtures) -> eyre::Result<(Arc<ValidatorDB>, tempfile:
     let temp_dir = tempfile::tempdir()?;
     let db = ValidatorDB::new(temp_dir.path().join(VALIDATOR_DB_FILENAME))?;
 
-    let (block_num, block_hash) = fx.min_block();
-    let block = &fx.blocks[&block_hash];
-    let withdrawals_root = block
-        .header
-        .withdrawals_root
+    let (_, block_hash) = fx.min_block();
+    let anchor = BlockMeta::try_from_header(&fx.blocks[&block_hash].header)
         .ok_or_else(|| eyre::eyre!("Block {block_hash} missing withdrawals_root"))?;
-
-    let anchor = BlockMeta {
-        block_number: block_num,
-        block_hash,
-        post_state_root: block.header.state_root,
-        post_withdrawals_root: withdrawals_root,
-    };
     db.reset_to_anchor(&anchor)?;
 
     Ok((Arc::new(db), temp_dir))
@@ -280,157 +355,181 @@ fn setup_test_db(fx: &TestFixtures) -> eyre::Result<(Arc<ValidatorDB>, tempfile:
 async fn setup_mock_rpc_server(
     state: MockServerState,
 ) -> (jsonrpsee::server::ServerHandle, String) {
-    let mut module = RpcModule::new(state);
+    let cfg = ServerConfigBuilder::default().max_response_body_size(MAX_RESPONSE_BODY_SIZE).build();
+    serve_with_config(cfg, state, |module| {
+        module
+            .register_method("eth_getBlockByNumber", |params, ctx, _| {
+                let (hex_number, full_block): (String, bool) = params.parse()?;
+                let block = ctx.block_by_number_hex(&hex_number)?;
+                Ok::<_, ErrorObject<'static>>(shape_block(block, full_block))
+            })
+            .unwrap();
 
-    module
-        .register_method("eth_getBlockByNumber", |params, ctx, _| {
-            let (hex_number, full_block): (String, bool) = params
-                .parse()
-                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
-            let block_number = u64::from_str_radix(&hex_number[2..], 16).unwrap_or(0);
+        module
+            .register_method("eth_getBlockByHash", |params, ctx, _| {
+                let (hash, full_block): (B256, bool) = params.parse()?;
+                Ok::<_, ErrorObject<'static>>(shape_block(ctx.block_by_hash(hash)?, full_block))
+            })
+            .unwrap();
 
-            let block = ctx
-                .fixtures
-                .block_numbers
-                .get(&block_number)
-                .and_then(|hash| ctx.fixtures.blocks.get(hash))
-                .ok_or_else(|| {
-                    make_rpc_error(
-                        CALL_EXECUTION_FAILED_CODE,
-                        format!("Block {block_number} not found"),
-                    )
-                })?;
+        module
+            .register_method("eth_blockNumber", |_params, ctx, _| {
+                let (&max_num, _) = ctx.fixtures.block_numbers.last_key_value().unwrap();
+                Ok::<String, ErrorObjectOwned>(format!("0x{max_num:x}"))
+            })
+            .unwrap();
 
-            Ok::<_, ErrorObject<'static>>(shape_block(block, full_block))
-        })
-        .unwrap();
+        module
+            .register_method("eth_getHeaderByNumber", |params, ctx, _| {
+                let (hex_number,): (String,) = params.parse()?;
+                Ok::<_, ErrorObject<'static>>(ctx.block_by_number_hex(&hex_number)?.header.clone())
+            })
+            .unwrap();
 
-    module
-        .register_method("eth_getBlockByHash", |params, ctx, _| {
-            let (hash, full_block): (B256, bool) = params
-                .parse()
-                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
+        module
+            .register_method("eth_getHeaderByHash", |params, ctx, _| {
+                let (hash,): (B256,) = params.parse()?;
+                Ok::<_, ErrorObject<'static>>(ctx.block_by_hash(hash)?.header.clone())
+            })
+            .unwrap();
 
-            let block_hash = BlockHash::from(hash.0);
-            let block = ctx.fixtures.blocks.get(&block_hash).ok_or_else(|| {
-                make_rpc_error(CALL_EXECUTION_FAILED_CODE, format!("Block {hash} not found"))
-            })?;
+        module
+            .register_method("eth_getCodeByHash", |params, ctx, _| {
+                let (hash,): (B256,) = params.parse()?;
 
-            Ok::<_, ErrorObject<'static>>(shape_block(block, full_block))
-        })
-        .unwrap();
+                let code = ctx.fixtures.contracts.get(&hash).cloned().unwrap_or_default();
+                Ok::<_, ErrorObject<'static>>(code.original_bytes())
+            })
+            .unwrap();
 
-    module
-        .register_method("eth_blockNumber", |_params, ctx, _| {
-            let (&max_num, _) = ctx.fixtures.block_numbers.last_key_value().unwrap();
-            Ok::<String, ErrorObjectOwned>(format!("0x{max_num:x}"))
-        })
-        .unwrap();
+        module
+            .register_method("mega_getBlockWitness", |params, ctx, _| {
+                ctx.witness_requests.fetch_add(1, Ordering::SeqCst);
+                let (keys,): (WitnessRequestKeys,) = params.parse()?;
+                let block_hash = BlockHash::from(keys.block_hash.0);
 
-    module
-        .register_method("eth_getHeaderByNumber", |params, ctx, _| {
-            let (hex_number,): (String,) = params.parse().unwrap();
-            let block_number = u64::from_str_radix(&hex_number[2..], 16).unwrap_or(0);
+                let salt_witness =
+                    ctx.fixtures.salt_witnesses.get(&block_hash).cloned().ok_or_else(|| {
+                        make_rpc_error(
+                            CALL_EXECUTION_FAILED_CODE,
+                            format!("Witness for block {block_hash} not found"),
+                        )
+                    })?;
 
-            let block = ctx
-                .fixtures
-                .block_numbers
-                .get(&block_number)
-                .and_then(|hash| ctx.fixtures.blocks.get(hash))
-                .ok_or_else(|| {
-                    make_rpc_error(
-                        CALL_EXECUTION_FAILED_CODE,
-                        format!("Block {block_number} not found"),
-                    )
-                })?;
-
-            Ok::<_, ErrorObject<'static>>(block.header.clone())
-        })
-        .unwrap();
-
-    module
-        .register_method("eth_getHeaderByHash", |params, ctx, _| {
-            let (hash,): (B256,) = params
-                .parse()
-                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
-
-            let block_hash = BlockHash::from(hash.0);
-            let block = ctx.fixtures.blocks.get(&block_hash).ok_or_else(|| {
-                make_rpc_error(CALL_EXECUTION_FAILED_CODE, format!("Block {hash} not found"))
-            })?;
-
-            Ok::<_, ErrorObject<'static>>(block.header.clone())
-        })
-        .unwrap();
-
-    module
-        .register_method("eth_getCodeByHash", |params, ctx, _| {
-            let (hash,): (B256,) = params
-                .parse()
-                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
-
-            let code = ctx.fixtures.contracts.get(&hash).cloned().unwrap_or_default();
-            Ok::<_, ErrorObject<'static>>(code.original_bytes())
-        })
-        .unwrap();
-
-    module
-        .register_method("mega_getBlockWitness", |params, ctx, _| {
-            let (keys,): (WitnessRequestKeys,) = params
-                .parse()
-                .map_err(|e| make_rpc_error(INVALID_PARAMS_CODE, format!("Invalid params: {e}")))?;
-            let block_hash = BlockHash::from(keys.block_hash.0);
-
-            let salt_witness =
-                ctx.fixtures.salt_witnesses.get(&block_hash).cloned().ok_or_else(|| {
+                let mpt_witness = ctx.mpt_witnesses.get(&block_hash).cloned().ok_or_else(|| {
                     make_rpc_error(
                         CALL_EXECUTION_FAILED_CODE,
                         format!("Witness for block {block_hash} not found"),
                     )
                 })?;
 
-            let mpt_witness = ctx.mpt_witnesses.get(&block_hash).cloned().ok_or_else(|| {
-                make_rpc_error(
-                    CALL_EXECUTION_FAILED_CODE,
-                    format!("Witness for block {block_hash} not found"),
-                )
-            })?;
+                let encoded =
+                    encode_witness_response(&salt_witness, &mpt_witness).map_err(|e| {
+                        make_rpc_error(
+                            CALL_EXECUTION_FAILED_CODE,
+                            format!("Failed to encode witness: {e}"),
+                        )
+                    })?;
 
-            let encoded = encode_witness_response(&salt_witness, &mpt_witness).map_err(|e| {
-                make_rpc_error(CALL_EXECUTION_FAILED_CODE, format!("Failed to encode witness: {e}"))
-            })?;
+                Ok::<_, ErrorObject<'static>>(encoded)
+            })
+            .unwrap();
 
-            Ok::<_, ErrorObject<'static>>(encoded)
-        })
-        .unwrap();
+        module
+            .register_method("mega_setValidatedBlocks", |params, ctx, _| {
+                let (first_block, last_block): ((u64, String), (u64, String)) =
+                    params.parse().unwrap();
+                if ctx
+                    .reject_reports
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .is_ok()
+                {
+                    return Err(make_rpc_error(
+                        CALL_EXECUTION_FAILED_CODE,
+                        "transient report failure (scripted)".to_string(),
+                    ));
+                }
+                ctx.validated_reports.lock().unwrap().push((first_block.0, last_block.0));
+                let last_hash: BlockHash = last_block.1.parse().unwrap();
+                Ok::<serde_json::Value, ErrorObjectOwned>(serde_json::json!({
+                    "accepted": true,
+                    "lastValidatedBlock": [last_block.0, last_hash]
+                }))
+            })
+            .unwrap();
+    })
+    .await
+}
 
-    module
-        .register_method("mega_setValidatedBlocks", |params, ctx, _| {
-            use std::sync::atomic::Ordering;
-            let (first_block, last_block): ((u64, String), (u64, String)) = params.parse().unwrap();
-            if ctx
-                .reject_reports
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                .is_ok()
-            {
-                return Err(make_rpc_error(
-                    CALL_EXECUTION_FAILED_CODE,
-                    "transient report failure (scripted)".to_string(),
-                ));
-            }
-            ctx.validated_reports.lock().unwrap().push((first_block.0, last_block.0));
-            let last_hash: BlockHash = last_block.1.parse().unwrap();
-            Ok::<serde_json::Value, ErrorObjectOwned>(serde_json::json!({
-                "accepted": true,
-                "lastValidatedBlock": [last_block.0, last_hash]
-            }))
-        })
-        .unwrap();
+/// A [`ValidatorFetcher`] over the mock RPC (blocks, hashes, and the RPC witness path) with an
+/// [`R2WitnessClient`] on `r2_endpoint` in front of it, plus the mock's RPC witness request
+/// counter. Uses the synthetic fixtures' first paired block as the block under fetch.
+async fn r2_backed_fetcher(
+    r2_endpoint: &str,
+) -> (ValidatorFetcher, Arc<AtomicUsize>, jsonrpsee::server::ServerHandle) {
+    let state = MockServerState::new(TestFixtures::synthetic_shared());
+    let witness_requests = Arc::clone(&state.witness_requests);
+    let (handle, url) = setup_mock_rpc_server(state).await;
+    let client = Arc::new(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap());
+    let transport = R2WitnessTransport::new(
+        r2_endpoint,
+        "witness-test".to_string(),
+        "ak".to_string(),
+        "sk".to_string(),
+        stateless_r2::fetch::FetchTimeouts {
+            per_attempt: Duration::from_secs(5),
+            connect: stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT,
+        },
+        BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(5)),
+        None,
+    )
+    .unwrap();
+    let r2 = Arc::new(R2WitnessClient::new(transport, Duration::from_secs(5)));
+    (ValidatorFetcher::new(client, Some(r2)), witness_requests, handle)
+}
 
-    let cfg = ServerConfigBuilder::default().max_response_body_size(MAX_RESPONSE_BODY_SIZE).build();
-    let server = ServerBuilder::default().set_config(cfg).build("0.0.0.0:0").await.unwrap();
-    let url = format!("http://{}", server.local_addr().unwrap());
-    (server.start(module), url)
+/// The synthetic fixtures' first paired block number: the block every R2 fetcher test fetches.
+fn first_paired_block() -> u64 {
+    TestFixtures::synthetic_shared().paired_blocks()[0].0
+}
+
+/// That block's witness encoded as the R2 object body (the uploader's wire format), for the
+/// one test in which R2 actually serves it.
+fn first_paired_r2_payload() -> Vec<u8> {
+    let (salt_witness, mpt_witness): (_, MptWitness) =
+        TestFixtures::synthetic_shared().first_paired_witness();
+    encode_witness_payload(&salt_witness, &mpt_witness).expect("fixture witness must encode").1
+}
+
+/// With an R2 target configured, a block whose witness is in the bucket is served from R2
+/// alone: one GET, and the RPC witness path is never asked.
+#[tokio::test]
+async fn a_bucket_hit_is_served_without_touching_the_rpc_witness_path() {
+    let number = first_paired_block();
+    let (r2_endpoint, r2_hits) = mock_r2(vec![(200, first_paired_r2_payload())]).await;
+    let (fetcher, witness_requests, handle) = r2_backed_fetcher(&r2_endpoint).await;
+
+    let task = fetcher.fetch(number).await.expect("R2 must serve the block");
+    assert_eq!(task.block.header.number, number);
+    assert_eq!(r2_hits.load(Ordering::SeqCst), 1, "exactly one R2 GET");
+    assert_eq!(witness_requests.load(Ordering::SeqCst), 0, "RPC witness path must stay idle");
+    handle.stop().unwrap();
+}
+
+/// An R2 miss (the uploader has not reached the block) hands it to the RPC witness path
+/// instead of failing the fetch: one R2 GET, one RPC witness call, and the task still carries
+/// the witness.
+#[tokio::test]
+async fn an_r2_miss_falls_back_to_the_rpc_witness_path() {
+    let number = first_paired_block();
+    let (r2_endpoint, r2_hits) = mock_r2(vec![(404, "<Code>NoSuchKey</Code>")]).await;
+    let (fetcher, witness_requests, handle) = r2_backed_fetcher(&r2_endpoint).await;
+
+    let task = fetcher.fetch(number).await.expect("RPC must serve after the R2 miss");
+    assert_eq!(task.block.header.number, number);
+    assert_eq!(r2_hits.load(Ordering::SeqCst), 1, "a miss is not retried against R2");
+    assert_eq!(witness_requests.load(Ordering::SeqCst), 1, "the RPC witness path took over");
+    handle.stop().unwrap();
 }
 
 /// Synthetic data integration test: validates consecutive blocks via the streaming pipeline.
@@ -438,12 +537,12 @@ async fn setup_mock_rpc_server(
 async fn integration_test() {
     let _logging = init_test_logging("stateless_validator");
     debug!("=== Loading Synthetic Test Data ===");
-    let fx = TestFixtures::synthetic();
+    let fx = TestFixtures::synthetic_shared();
     let genesis_file = fx.data_dir.join("genesis.json");
 
     let max_block_number = fx.max_block().0;
     let sync_target = Some(max_block_number);
-    let (validator_db, _tmp) = setup_test_db(&fx).unwrap();
+    let (validator_db, _tmp) = setup_test_db(fx).unwrap();
     let contract_cache =
         Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
     let state = MockServerState::new(fx);
@@ -461,11 +560,7 @@ async fn integration_test() {
     let config = Arc::new(cfg);
 
     let shutdown = CancellationToken::new();
-    let fetcher = Arc::new(ValidatorFetcher {
-        rpc_client: client.clone(),
-        r2_witness: None,
-        on_remote_height: |_| {},
-    });
+    let fetcher = Arc::new(ValidatorFetcher::new(client.clone(), None));
     let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
     let hooks = Arc::new(ValidatorHooks);
 
@@ -499,11 +594,11 @@ async fn integration_test() {
 async fn run_end_block_slice(
     reject_first_reports: usize,
 ) -> (eyre::Result<()>, Vec<(u64, u64)>, u64) {
-    let fx = TestFixtures::synthetic();
+    let fx = TestFixtures::synthetic_shared();
     let genesis_file = fx.data_dir.join("genesis.json");
 
     let max_block_number = fx.max_block().0;
-    let (validator_db, _tmp) = setup_test_db(&fx).unwrap();
+    let (validator_db, _tmp) = setup_test_db(fx).unwrap();
     let contract_cache =
         Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
     let state = MockServerState::new(fx);
@@ -527,16 +622,9 @@ async fn run_end_block_slice(
     cfg.concurrent_workers = 1;
     cfg.sync_target = Some(max_block_number);
 
-    let result = run_with_signals(
-        client,
-        None,
-        Arc::clone(&validator_db),
-        contract_cache,
-        chain_spec,
-        Some(url.clone()),
-        cfg,
-    )
-    .await;
+    let result =
+        run_with_signals(client, None, Arc::clone(&validator_db), contract_cache, chain_spec, cfg)
+            .await;
 
     handle.stop().unwrap();
 
@@ -568,8 +656,8 @@ async fn run_end_block_slice_and_assert_tip_reported(
 #[tokio::test]
 async fn end_block_run_reports_final_tip() {
     // Logging is enabled only here and in `integration_test`: one representative run per mock
-    // shape keeps the suite output readable — the scripted-failure twins would otherwise print
-    // alarming ERROR lines that are just their test script.
+    // shape. The scripted-failure twins stay silent, since their ERROR lines are just their
+    // test script.
     let _logging = init_test_logging("stateless_validator");
     run_end_block_slice_and_assert_tip_reported(0).await;
 }

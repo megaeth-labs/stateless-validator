@@ -1,27 +1,28 @@
-//! Direct-from-R2 historical witness source.
+//! Direct-from-R2 witness source.
 //!
-//! Fetches the primary witness object straight from the R2 bucket over the S3 API and decodes
+//! Fetches the primary witness object straight from the R2 bucket — via SigV4-signed S3
+//! GETs or unsigned GETs through a Cloudflare custom domain, per construction — and decodes
 //! it with the **light** decoder — the trace server never verifies the witness proof, so the
 //! full decode's per-point elliptic-curve work would buy nothing (see
-//! `stateless_core::light_witness`). The transport core is `stateless-r2`'s
-//! [`R2ObjectFetcher`], shared with the validator's pipeline reader.
+//! `stateless_core::light_witness`). The failure taxonomy and the transport wrapper are
+//! [`stateless_common::r2_witness`], shared with the validator's adapter; the transport
+//! core below that is `stateless-r2`'s [`R2ObjectFetcher`].
 //!
-//! This adapter is request-serving, which shapes it differently from the validator's:
-//! every fetch runs under the caller's witness-stage deadline, failures surface immediately
-//! with **no pacing pause** (the caller's next move is the RPC fallback chain, not a blind
-//! re-enqueue), and the retry budget is small — a throttled R2 should hand over to the RPC
-//! chain quickly instead of burning the witness budget on backoff sleeps.
+//! This adapter is request-serving, so its deadline is the caller's: every fetch runs under
+//! the request's witness-stage deadline, the decode included, where the validator's pipeline
+//! adapter uses a fixed per-block stage budget that stops at the GET. Like the validator's,
+//! failures surface immediately with no pause and on a small retry budget, since the caller's
+//! next move is the RPC fallback chain — a throttled R2 should hand over quickly instead of
+//! burning the witness budget on backoff sleeps.
+//!
+//! [`R2ObjectFetcher`]: stateless_r2::fetch::R2ObjectFetcher
 
 use std::time::Instant;
 
 use alloy_primitives::B256;
-use stateless_common::{BackoffPolicy, WitnessDecodingError, decode_witness_payload_light};
+pub use stateless_common::R2WitnessError;
+use stateless_common::{R2WitnessTransport, decode_on_blocking_pool, decode_witness_payload_light};
 use stateless_core::{LightWitness, withdrawals::MptWitness};
-use stateless_r2::{
-    fetch::{FetchTimeouts, R2GetError, R2ObjectFetcher, RetryPacing},
-    keys,
-};
-use tokio::task::JoinError;
 use tracing::trace;
 
 use crate::metrics;
@@ -30,81 +31,18 @@ use crate::metrics;
 /// caller's deadline clamps the loop harder anyway.
 const MAX_ATTEMPTS: usize = 3;
 
-/// Failure outcome of an R2 historical witness fetch.
-#[derive(Debug, thiserror::Error)]
-pub enum R2WitnessError {
-    /// The signed GET failed (absent object, transport, throttle, unexpected status, or
-    /// out of deadline while queued).
-    #[error(transparent)]
-    Get(#[from] R2GetError),
-    /// The object was fetched but its bytes did not decode to a witness tuple — a corrupt
-    /// witness in R2. Deterministic; not retried.
-    #[error("R2 witness for block {number} (key {key}) failed to decode: {source}")]
-    Decode { number: u64, key: String, source: WitnessDecodingError },
-    /// The decode task panicked. This is a bug in our own decoder, not a problem with the
-    /// data in R2, so it is kept out of [`Self::Decode`].
-    #[error("R2 witness decode task for block {number} (key {key}) panicked: {source}")]
-    DecodePanicked { number: u64, key: String, source: JoinError },
-}
-
-impl R2WitnessError {
-    /// Every label [`Self::kind`] can produce, for metrics pre-registration.
-    pub const KINDS: &'static [&'static str] = &[
-        "missing",
-        "transport",
-        "throttled",
-        "status",
-        "connect",
-        "deadline",
-        "decode",
-        "decode_panicked",
-    ];
-
-    /// Stable lowercase label for this variant — the `kind` label on the R2 witness error
-    /// counter. Every value returned here must appear in [`Self::KINDS`].
-    pub const fn kind(&self) -> &'static str {
-        match self {
-            Self::Get(e) => e.kind(),
-            Self::Decode { .. } => "decode",
-            Self::DecodePanicked { .. } => "decode_panicked",
-        }
-    }
-}
-
-/// Fetches and light-decodes historical witnesses straight from an R2 bucket.
-/// The fetcher's `Debug` redacts the credentials.
+/// Fetches and light-decodes witnesses straight from an R2 bucket.
+/// The transport's `Debug` redacts the credentials.
 #[derive(Debug)]
 pub struct R2WitnessSource {
-    fetcher: R2ObjectFetcher,
+    transport: R2WitnessTransport,
 }
 
 impl R2WitnessSource {
-    /// Builds a source from an R2 endpoint origin, bucket, and bucket-scoped S3 credentials.
-    ///
-    /// `timeouts` bounds each individual GET end-to-end and in its connect phase (further
-    /// clamped by the caller's deadline), `retry_backoff` paces the retries, and
-    /// `max_concurrent_requests` caps in-flight GETs (`None` = unlimited; see the
-    /// `--r2-max-concurrent-requests` flag for why it is separate from the RPC cap).
-    pub fn new(
-        endpoint: &str,
-        bucket: String,
-        access_key_id: String,
-        secret_access_key: String,
-        timeouts: FetchTimeouts,
-        retry_backoff: BackoffPolicy,
-        max_concurrent_requests: Option<usize>,
-    ) -> eyre::Result<Self> {
-        let fetcher = R2ObjectFetcher::new(
-            endpoint,
-            bucket,
-            access_key_id,
-            secret_access_key,
-            timeouts,
-            RetryPacing { initial: retry_backoff.initial, max: retry_backoff.max },
-            max_concurrent_requests,
-        )
-        .map_err(|e| eyre::eyre!(e))?;
-        Ok(Self { fetcher })
+    /// Wraps an already-built transport. Construction (and the startup logging that reads
+    /// the configured target off it) lives at the wiring site, which owns the flags.
+    pub const fn new(transport: R2WitnessTransport) -> Self {
+        Self { transport }
     }
 
     /// Fetches and light-decodes the witness for `(number, hash)` under `deadline`.
@@ -115,7 +53,8 @@ impl R2WitnessSource {
         deadline: Instant,
     ) -> Result<(LightWitness, MptWitness), R2WitnessError> {
         let fetched = self
-            .fetcher
+            .transport
+            .fetcher()
             .get_block_object(
                 number,
                 hash,
@@ -129,18 +68,15 @@ impl R2WitnessSource {
         // reported on its own series instead of being subtracted the way the validator's
         // throughput pipeline does.
         metrics::record_r2_witness_queue_wait(fetched.queue_wait.as_secs_f64());
-        let bytes = fetched.bytes;
-
-        // zstd + bincode over a multi-MB witness is CPU-bound; keep it off the runtime.
-        let key = || keys::block_object_key(number, hash);
-        match tokio::task::spawn_blocking(move || decode_witness_payload_light(&bytes)).await {
-            Ok(Ok(witness)) => {
-                trace!(number, "R2 witness fetched and light-decoded");
-                Ok(witness)
-            }
-            Ok(Err(source)) => Err(R2WitnessError::Decode { number, key: key(), source }),
-            Err(source) => Err(R2WitnessError::DecodePanicked { number, key: key(), source }),
-        }
+        // The decode is bounded by the same deadline as the GET: an oversized or
+        // pathological object must not eat the RPC fallback's share of the stage.
+        let witness =
+            decode_on_blocking_pool(fetched.bytes, number, hash, Some(deadline), |bytes| {
+                decode_witness_payload_light(bytes)
+            })
+            .await?;
+        trace!(number, "R2 witness fetched and light-decoded");
+        Ok(witness)
     }
 }
 
@@ -148,11 +84,15 @@ impl R2WitnessSource {
 pub(crate) mod test_support {
     use std::time::Duration;
 
+    use stateless_common::BackoffPolicy;
+    use stateless_r2::fetch::FetchTimeouts;
+
     use super::*;
 
-    /// Test source pointed at a mock endpoint, with millisecond retry pacing.
-    pub(crate) fn source(endpoint: &str) -> R2WitnessSource {
-        R2WitnessSource::new(
+    /// Millisecond-scale retry pacing and a 5s per-GET budget, so the mock-backed tests run
+    /// fast (production passes the policy built from the `--rpc-*-backoff-ms` flags).
+    pub(crate) fn test_transport(endpoint: &str) -> R2WitnessTransport {
+        R2WitnessTransport::new(
             endpoint,
             "witness-test".to_string(),
             "ak".to_string(),
@@ -166,18 +106,60 @@ pub(crate) mod test_support {
         )
         .unwrap()
     }
+
+    /// Test source pointed at a mock endpoint.
+    pub(crate) fn source(endpoint: &str) -> R2WitnessSource {
+        R2WitnessSource::new(test_transport(endpoint))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::{sync::atomic::Ordering, time::Duration};
 
+    use stateless_r2::fetch::R2GetError;
     use stateless_test_utils::{fixtures::TestFixtures, mock_r2::mock_r2};
 
     use super::{test_support::source, *};
 
     fn deadline() -> Instant {
         Instant::now() + Duration::from_secs(5)
+    }
+
+    /// The custom-domain source serves the same decode path end-to-end, requesting the bare
+    /// `/{key}` layout (no bucket segment, no SigV4 authorization).
+    #[tokio::test]
+    async fn custom_domain_source_decodes_and_requests_bare_key() {
+        let (salt_witness, mpt_witness): (_, MptWitness) =
+            TestFixtures::mainnet_shared().first_paired_witness();
+        let (_, payload) = stateless_common::encode_witness_payload(&salt_witness, &mpt_witness)
+            .expect("fixture witness must encode");
+
+        let (domain, _, heads) =
+            stateless_test_utils::mock_r2::mock_r2_capturing(vec![(200, payload)]).await;
+        let transport = R2WitnessTransport::new_custom_domain(
+            &domain,
+            None,
+            stateless_r2::fetch::FetchTimeouts {
+                per_attempt: Duration::from_secs(5),
+                connect: stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT,
+            },
+            stateless_common::BackoffPolicy::new(
+                Duration::from_millis(5),
+                Duration::from_millis(20),
+            ),
+            None,
+            1,
+            |_| {},
+        )
+        .unwrap();
+        R2WitnessSource::new(transport)
+            .get_witness_light(1, B256::ZERO, deadline())
+            .await
+            .expect("valid object must fetch and decode");
+        let head = heads.lock().unwrap()[0].to_lowercase();
+        assert!(head.starts_with("get /block/0_999/1."), "bucketless key layout: {head}");
+        assert!(!head.contains("authorization:"), "custom-domain GET must be unsigned: {head}");
     }
 
     /// A fixture witness encoded with the uploader's `encode_witness_payload` must
@@ -227,18 +209,31 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), MAX_ATTEMPTS);
     }
 
-    /// Every fetch-level kind must appear in this adapter's pre-registered [`KINDS`] — a new
-    /// `R2GetError` kind escaping metric pre-registration would drift silently otherwise.
-    #[test]
-    fn kinds_cover_all_fetch_kinds() {
-        assert!(R2GetError::KINDS.iter().all(|k| R2WitnessError::KINDS.contains(k)));
-    }
-
     #[tokio::test]
     async fn undecodable_body_surfaces_decode_error() {
         let (endpoint, _) = mock_r2(vec![(200, "not a zstd witness")]).await;
         let err = source(&endpoint).get_witness_light(1, B256::ZERO, deadline()).await.unwrap_err();
         assert!(matches!(err, R2WitnessError::Decode { .. }), "{err}");
         assert_eq!(err.kind(), "decode");
+    }
+
+    /// A decode that outruns the deadline is abandoned so the caller falls back on its
+    /// reserved budget share, instead of the object holding the witness stage hostage.
+    /// Driven through the shared decode step with the deadline already gone — the
+    /// GET-succeeds-then-decode-overruns timing cannot be scripted deterministically.
+    #[tokio::test]
+    async fn decode_past_the_deadline_surfaces_decode_timeout() {
+        let (salt_witness, mpt_witness): (_, MptWitness) =
+            TestFixtures::mainnet_shared().first_paired_witness();
+        let (_, payload) = stateless_common::encode_witness_payload(&salt_witness, &mpt_witness)
+            .expect("fixture witness must encode");
+
+        let err = decode_on_blocking_pool(payload, 1, B256::ZERO, Some(Instant::now()), |bytes| {
+            decode_witness_payload_light(bytes)
+        })
+        .await
+        .expect_err("an already-elapsed deadline must abandon the decode")
+        .to_string();
+        assert!(err.contains("outran the deadline"), "{err}");
     }
 }
