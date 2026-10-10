@@ -1045,6 +1045,97 @@ mod tests {
         assert!(matches!(err, TraceError::Request(_)), "got: {err:?}");
     }
 
+    /// `trace_transaction` replays the preceding transactions under a recording-free
+    /// inspector and only then installs the real tracer, while `trace_block` keeps the tracer
+    /// installed throughout. The frame for transaction `k` must come out byte-identical either
+    /// way, for every transaction of every fixture block and on every inspector-based path —
+    /// the preceding replay may not leave anything behind in the executor that the recording
+    /// inspector would have shaped differently.
+    #[test]
+    fn single_transaction_trace_is_byte_identical_to_its_block_trace_frame() {
+        use stateless_test_utils::fixtures::TestFixtures;
+
+        let fixtures = TestFixtures::synthetic_shared();
+        let chain_spec = ChainSpec::from_genesis(fixtures.load_genesis().expect("genesis"));
+        let contracts: HashMap<B256, Bytecode> =
+            fixtures.contracts.iter().map(|(hash, code)| (*hash, code.clone())).collect();
+
+        let builtin = |tracer| GethDebugTracingOptions {
+            tracer: Some(GethDebugTracerType::BuiltInTracer(tracer)),
+            ..Default::default()
+        };
+        let geth_options = [
+            // The bare default is the struct logger.
+            GethDebugTracingOptions::default(),
+            builtin(GethDebugBuiltInTracerType::CallTracer),
+            builtin(GethDebugBuiltInTracerType::PreStateTracer),
+            builtin(GethDebugBuiltInTracerType::FlatCallTracer),
+        ];
+
+        let mut compared = 0usize;
+        let mut multi_tx_blocks = 0usize;
+        for (number, hash) in fixtures.paired_blocks() {
+            let block = &fixtures.blocks[&hash];
+            let witness = LightWitness::from(&fixtures.salt_witnesses[&hash]);
+            multi_tx_blocks += (block.transactions.len() > 1) as usize;
+
+            for opts in &geth_options {
+                let traces =
+                    trace_block(&chain_spec, block, witness.clone(), &contracts, opts.clone())
+                        .unwrap_or_else(|e| panic!("block {number}: trace_block: {e:?}"));
+                for (index, entry) in traces.iter().enumerate() {
+                    let TraceResult::Success { result, .. } = entry else {
+                        panic!("block {number} tx {index}: block trace failed: {entry:?}");
+                    };
+                    let single = trace_transaction(
+                        &chain_spec,
+                        block,
+                        index,
+                        witness.clone(),
+                        &contracts,
+                        opts.clone(),
+                    )
+                    .unwrap_or_else(|e| panic!("block {number} tx {index}: {e:?}"));
+                    assert_eq!(
+                        serde_json::to_string(&single).unwrap(),
+                        serde_json::to_string(result).unwrap(),
+                        "block {number} tx {index}: tracer {:?}",
+                        opts.tracer
+                    );
+                    compared += 1;
+                }
+            }
+
+            // The Parity path replays its preceding transactions the same way.
+            let block_parity = parity_trace_block(&chain_spec, block, witness.clone(), &contracts)
+                .unwrap_or_else(|e| panic!("block {number}: parity_trace_block: {e:?}"));
+            for index in 0..block.transactions.len() {
+                let single = parity_trace_transaction(
+                    &chain_spec,
+                    block,
+                    index,
+                    witness.clone(),
+                    &contracts,
+                )
+                .unwrap_or_else(|e| panic!("block {number} tx {index}: parity: {e:?}"));
+                let from_block: Vec<_> = block_parity
+                    .iter()
+                    .filter(|trace| trace.transaction_position == Some(index as u64))
+                    .collect();
+                assert_eq!(
+                    serde_json::to_string(&single.iter().collect::<Vec<_>>()).unwrap(),
+                    serde_json::to_string(&from_block).unwrap(),
+                    "block {number} tx {index}: parity"
+                );
+                compared += 1;
+            }
+        }
+
+        // Vacuity guard: the comparison must reach transactions that have predecessors.
+        assert!(multi_tx_blocks > 0, "no fixture block carries more than one transaction");
+        assert!(compared > 0, "nothing was compared");
+    }
+
     /// Defense in depth behind the RPC boundary gate: a type-malformed `tracerConfig` on
     /// a config-reading builtin is rejected with [`TraceError::Request`] by the executor
     /// itself — on both the block and the single-transaction paths — never silently

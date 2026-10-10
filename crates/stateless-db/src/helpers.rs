@@ -222,6 +222,11 @@ pub fn read_contracts(database: &Database, hashes: &[B256]) -> StoreResult<Contr
 }
 
 /// Stores contract bytecodes in the CONTRACTS table.
+///
+/// Every `(hash, bytecode)` pair must satisfy `hash == keccak256(bytecode)`: reads re-check it
+/// and treat a violating row as a miss, so a pair written here that breaks it would only ever
+/// cost a re-fetch. Callers hand this bytecode that already passed the hash-verified RPC tier,
+/// so the invariant is asserted in debug builds rather than re-hashed on every release write.
 pub fn write_add_contracts(database: &Database, codes: &[(B256, Bytecode)]) -> StoreResult<()> {
     if codes.is_empty() {
         return Ok(());
@@ -230,6 +235,11 @@ pub fn write_add_contracts(database: &Database, codes: &[(B256, Bytecode)]) -> S
     {
         let mut table = write_txn.open_table(CONTRACTS).store_err()?;
         for (hash, bytecode) in codes {
+            debug_assert_eq!(
+                bytecode.hash_slow(),
+                *hash,
+                "CONTRACTS rows are keyed by the bytecode hash"
+            );
             let encoded = encode_to_vec(bytecode)?;
             table.insert(hash.0, encoded).store_err()?;
         }
@@ -434,10 +444,11 @@ mod tests {
         let (_dir, db) = temp_db();
 
         // A row that decodes fine but was stored under the wrong key (key corruption, or
-        // any future silent mis-decode) is rejected by the hash re-check.
+        // any future silent mis-decode) is rejected by the hash re-check. Inserted raw:
+        // `write_add_contracts` refuses to produce such a row in the first place.
         let wrong_key = B256::from([7u8; 32]);
         let bytecode = Bytecode::new_raw(Bytes::from_static(&[0x60, 0x00]));
-        write_add_contracts(&db, &[(wrong_key, bytecode)]).unwrap();
+        insert_raw_contract_row(&db, wrong_key, encode_to_vec(&bytecode).unwrap());
 
         let (found, missing) = read_contracts(&db, &[wrong_key]).unwrap();
         assert!(found.is_empty());
