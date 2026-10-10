@@ -200,8 +200,6 @@ pub struct MegaethGenesisHardforks {
     pub rex_5_time: Option<u64>,
     /// Rex6 hardfork timestamp.
     pub rex_6_time: Option<u64>,
-    /// Rex7 hardfork timestamp.
-    pub rex_7_time: Option<u64>,
 }
 
 impl MegaethGenesisHardforks {
@@ -233,7 +231,6 @@ impl MegaethGenesisHardforks {
             (MegaHardfork::Rex4.boxed(), self.rex_4_time.map(ForkCondition::Timestamp)),
             (MegaHardfork::Rex5.boxed(), self.rex_5_time.map(ForkCondition::Timestamp)),
             (MegaHardfork::Rex6.boxed(), self.rex_6_time.map(ForkCondition::Timestamp)),
-            (MegaHardfork::Rex7.boxed(), self.rex_7_time.map(ForkCondition::Timestamp)),
         ]
         .into_iter()
         .filter_map(|(hardfork, condition)| condition.map(|c| (hardfork, c)))
@@ -427,8 +424,7 @@ mod tests {
           "rex3Time": 7,
           "rex4Time": 8,
           "rex5Time": 9,
-          "rex6Time": 10,
-          "rex7Time": 11
+          "rex6Time": 10
         }
         "#;
         let fields = serde_json::from_str::<OtherFields>(genesis_info).unwrap();
@@ -443,7 +439,6 @@ mod tests {
         assert_eq!(hardforks.rex_4_time, Some(8));
         assert_eq!(hardforks.rex_5_time, Some(9));
         assert_eq!(hardforks.rex_6_time, Some(10));
-        assert_eq!(hardforks.rex_7_time, Some(11));
     }
 
     #[test]
@@ -716,11 +711,11 @@ mod tests {
     fn mainnet_genesis_schedules_every_canonical_hardfork() {
         use stateless_test_utils::fixtures::TestFixtures;
 
-        // Forks mainnet has deliberately not scheduled yet — every fork through Rex6 is live;
-        // Rex7 is declared by the pinned mega-evm but has no mainnet activation. An entry here
-        // must actually be unscheduled: once its genesis field lands, the assertion below
-        // demands the entry's removal, so the allowlist cannot rot into shadowing the check.
-        const NOT_YET_SCHEDULED: &[MegaHardfork] = &[MegaHardfork::Rex7];
+        // Forks mainnet has deliberately not scheduled yet — empty today, every fork through
+        // Rex6 is live. An entry here must actually be unscheduled: once its genesis field
+        // lands, the assertion below demands the entry's removal, so the allowlist cannot rot
+        // into shadowing the check.
+        const NOT_YET_SCHEDULED: &[MegaHardfork] = &[];
 
         let genesis = TestFixtures::mainnet_shared().load_genesis().expect("mainnet genesis");
         let spec = ChainSpec::from_genesis(genesis);
