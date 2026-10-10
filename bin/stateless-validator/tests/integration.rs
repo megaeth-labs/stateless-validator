@@ -656,8 +656,8 @@ async fn run_end_block_slice_and_assert_tip_reported(
 #[tokio::test]
 async fn end_block_run_reports_final_tip() {
     // Logging is enabled only here and in `integration_test`: one representative run per mock
-    // shape keeps the suite output readable — the scripted-failure twins would otherwise print
-    // alarming ERROR lines that are just their test script.
+    // shape. The scripted-failure twins stay silent, since their ERROR lines are just their
+    // test script.
     let _logging = init_test_logging("stateless_validator");
     run_end_block_slice_and_assert_tip_reported(0).await;
 }

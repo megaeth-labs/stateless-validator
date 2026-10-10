@@ -2,10 +2,10 @@
 //!
 //! Each fixture set ships packed as `test_data/<set>.tar.zst` and is parsed straight out of the
 //! archive into memory, once per test binary: see [`TestFixtures::mainnet_shared`] and
-//! [`TestFixtures::synthetic_shared`]. Nothing is unpacked to disk. Two files stay out of the
-//! archive, in `test_data/<set>/`: `genesis.json`, which tests hand to the binaries by path, and
-//! `manifest.txt`, one `<number>.<hash>` per paired block the archive must hold, so a repack
-//! cannot drop or swap a block unnoticed.
+//! [`TestFixtures::synthetic_shared`]. Nothing is unpacked to disk. Two files that
+//! `TestFixtures` reads stay out of the archive, in `test_data/<set>/`: `genesis.json`, which
+//! tests hand to the binaries by path, and `manifest.txt`, one `<number>.<hash>` per paired
+//! block the archive must hold, so a repack cannot drop or swap a block unnoticed.
 //!
 //! `stateless-test-utils` intentionally does NOT depend on `stateless-core` to avoid
 //! circular dev-dependencies. Callers that need `MptWitness` or `ChainSpec` can use the
@@ -40,9 +40,10 @@ pub struct WitnessFileContent {
 /// Pre-loaded test fixtures, parsed from a packed `test_data/<set>.tar.zst`.
 ///
 /// Archive layout, under `<set>/`: `contracts.txt` (one JSON `[hash, bytecode]` per line),
-/// `blocks/<number>[.<hash>].json`, `stateless/witness/<number>.<hash>.{salt,mpt}`
-/// (bincode-legacy). `data_dir` is the unpacked `test_data/<set>/`, holding the set's
-/// `manifest.txt` and the `genesis.json` that tests read by path (see [`Self::load_genesis`]).
+/// `blocks/*.json` (keyed by each header's number and hash),
+/// `stateless/witness/<number>.<hash>.{salt,mpt}` (bincode-legacy). `data_dir` is the unpacked
+/// `test_data/<set>/`, holding the set's `manifest.txt` and the `genesis.json` that tests read by
+/// path (see [`Self::load_genesis`]).
 ///
 /// `mpt_witness_bytes` stores raw bincode-legacy bytes; decode via [`Self::mpt_witness`]
 /// in crates that depend on `stateless-core`.
@@ -99,17 +100,12 @@ impl TestFixtures {
             entry.read_to_end(&mut bytes).unwrap_or_else(|e| panic!("read {path}: {e}"));
 
             let name = path.strip_prefix(set).and_then(|p| p.strip_prefix('/')).unwrap_or("");
-            if let Some(file) = name.strip_prefix("blocks/") {
-                let number = file
-                    .strip_suffix(".json")
-                    .and_then(|stem| stem.split('.').next())
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .unwrap_or_else(|| panic!("unexpected block file {path}"));
+            if name.strip_prefix("blocks/").is_some_and(|file| file.ends_with(".json")) {
                 let block: Block<Transaction> = serde_json::from_slice(&bytes)
                     .unwrap_or_else(|e| panic!("parse block {path}: {e}"));
                 let hash = block.header.hash;
+                block_numbers.insert(block.header.number, hash);
                 blocks.insert(hash, block);
-                block_numbers.insert(number, hash);
             } else if let Some(file) = name.strip_prefix("stateless/witness/") {
                 let (stem, ext) = file
                     .rsplit_once('.')
