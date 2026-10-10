@@ -36,7 +36,9 @@ use stateless_test_utils::{
 };
 use stateless_validator::{
     CommandLineArgs, R2WitnessClient, VALIDATOR_DB_FILENAME, ValidatorDB, ValidatorFetcher,
-    ValidatorHooks, ValidatorProcessor, load_or_create_chain_spec, run_with_signals,
+    ValidatorHooks, ValidatorProcessor,
+    block_list::{self, BlockOutcome, ReplayConfig, Status},
+    load_or_create_chain_spec, run_with_signals,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -274,6 +276,57 @@ fn canonical_chain_max_length_rejects_zero() {
         || parse(&[]),
     );
     assert!(from_env_zero.is_err(), "env-var 0 must also be rejected");
+}
+
+/// `--block-list` replays sparse heights on its own: it excludes every flag that describes a
+/// contiguous, chain-following run or reports upstream, needs the genesis named explicitly, and
+/// its tuning flags are rejected without it rather than inherited and ignored.
+#[test]
+fn block_list_flag_combinations() {
+    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
+    let with_list = ["--block-list", "/tmp/pool.txt", "--genesis-file", "/tmp/genesis.json"];
+
+    let args = parse(&with_list).unwrap();
+    assert_eq!(args.block_list.as_deref(), Some(std::path::Path::new("/tmp/pool.txt")));
+    assert_eq!(parse(&[]).unwrap().block_list, None);
+
+    let tuned = parse(
+        &[
+            &with_list[..],
+            &[
+                "--block-list-timeout-secs",
+                "9",
+                "--block-list-concurrency",
+                "3",
+                "--block-list-output-dir",
+                "/tmp/out",
+            ],
+        ]
+        .concat(),
+    )
+    .unwrap();
+    assert_eq!(tuned.block_list_timeout_secs, Some(9));
+    assert_eq!(tuned.block_list_concurrency, Some(3));
+
+    // A stale genesis in the data dir must not be picked up silently.
+    assert!(parse(&["--block-list", "/tmp/pool.txt"]).is_err(), "genesis file is required");
+    // Chain-following and reporting flags cannot be combined with a sparse replay.
+    for conflicting in [
+        &["--start-block", "0x01"][..],
+        &["--end-block", "10"][..],
+        &["--report-validation-endpoint", "http://report"][..],
+    ] {
+        let argv = [&with_list[..], conflicting].concat();
+        assert!(parse(&argv).is_err(), "{conflicting:?} must conflict with --block-list");
+    }
+    // Tuning flags mean nothing without a list.
+    for orphan in [
+        &["--block-list-timeout-secs", "9"][..],
+        &["--block-list-concurrency", "3"][..],
+        &["--block-list-output-dir", "/tmp/out"][..],
+    ] {
+        assert!(parse(orphan).is_err(), "{orphan:?} must require --block-list");
+    }
 }
 
 const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
@@ -697,4 +750,99 @@ async fn end_block_run_fails_when_final_report_never_lands() {
     let err = result.expect_err("run must fail when the validated tail cannot be reported");
     assert!(err.to_string().contains("final validation report failed"), "{err}");
     assert!(reports.is_empty(), "mock rejected every report, yet some landed: {reports:?}");
+}
+
+/// Replays `blocks` over the mock RPC with a validator-shaped fetcher and processor, returning
+/// the outcomes in completion order and the summary. The DB has no anchor: block-list mode never
+/// needs one.
+async fn replay_over_mock(
+    blocks: Vec<u64>,
+    block_timeout: Duration,
+    concurrency: usize,
+) -> (Vec<BlockOutcome>, block_list::ReplaySummary) {
+    let fx = TestFixtures::synthetic_shared();
+    let genesis_file = fx.data_dir.join("genesis.json");
+    let temp_dir = tempfile::tempdir().unwrap();
+    let validator_db =
+        Arc::new(ValidatorDB::new(temp_dir.path().join(VALIDATOR_DB_FILENAME)).unwrap());
+    let contract_cache =
+        Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
+    let (handle, url) = setup_mock_rpc_server(MockServerState::new(fx)).await;
+    let client = Arc::new(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap());
+    let chain_spec = Arc::new(
+        load_or_create_chain_spec(&validator_db, Some(genesis_file.to_str().unwrap())).unwrap(),
+    );
+    let fetcher = Arc::new(ValidatorFetcher::new(client.clone(), None));
+    let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
+
+    let config =
+        ReplayConfig { concurrency, block_timeout, progress_every: Duration::from_secs(3600) };
+    let mut outcomes = Vec::new();
+    let summary = block_list::replay_block_list(fetcher, processor, blocks, &config, |outcome| {
+        outcomes.push(outcome.clone());
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    handle.stop().unwrap();
+    (outcomes, summary)
+}
+
+/// A sparse subset of the fixtures replays through the production fetch and validate path:
+/// every listed block is visited once, in any order, and nothing outside the list is touched.
+#[tokio::test]
+async fn block_list_replays_a_non_contiguous_subset() {
+    let fx = TestFixtures::synthetic_shared();
+    let every_other: Vec<u64> = fx.paired_blocks().into_iter().map(|(n, _)| n).step_by(2).collect();
+    assert!(every_other.len() >= 2, "the fixtures need at least three blocks to leave a gap");
+    let all: Vec<u64> = fx.paired_blocks().into_iter().map(|(n, _)| n).collect();
+    assert!(every_other.len() < all.len(), "the subset must skip some block");
+
+    let (outcomes, summary) =
+        replay_over_mock(every_other.clone(), Duration::from_secs(60), 4).await;
+
+    let mut seen: Vec<u64> = outcomes.iter().map(|o| o.number).collect();
+    seen.sort_unstable();
+    assert_eq!(seen, every_other, "exactly the listed blocks, each once");
+    for outcome in &outcomes {
+        assert_eq!(
+            outcome.status,
+            Status::Validated,
+            "block {} should validate: {:?}",
+            outcome.number,
+            outcome.message
+        );
+        assert_eq!(outcome.hash, Some(fx.block_numbers[&outcome.number]));
+    }
+    assert_eq!(
+        (summary.total, summary.validated, summary.failed.len()),
+        (seen.len(), seen.len(), 0)
+    );
+}
+
+/// A block no endpoint can serve is retried forever by the RPC client; the per-block timeout is
+/// what ends it. It must be recorded as `fetch_timeout`, listed for retry, and leave the blocks
+/// around it validated.
+#[tokio::test]
+async fn an_unfetchable_block_times_out_without_stopping_the_run() {
+    let fx = TestFixtures::synthetic_shared();
+    let paired: Vec<u64> = fx.paired_blocks().into_iter().map(|(n, _)| n).collect();
+    let (first, last) = (paired[0], *paired.last().unwrap());
+    let missing = fx.max_block().0 + 1_000;
+
+    let (outcomes, summary) =
+        replay_over_mock(vec![first, missing, last], Duration::from_secs(2), 2).await;
+
+    let status_of =
+        |n: u64| outcomes.iter().find(|o| o.number == n).map(|o| o.status).expect("outcome");
+    assert_eq!(status_of(first), Status::Validated);
+    assert_eq!(status_of(last), Status::Validated);
+    assert_eq!(status_of(missing), Status::FetchTimeout);
+    assert_eq!((summary.total, summary.validated, summary.failed.len()), (3, 2, 1));
+    assert_eq!(
+        block_list::parse_block_list(&summary.failed_list()).unwrap(),
+        vec![missing],
+        "the retry list names exactly the block that did not validate",
+    );
 }

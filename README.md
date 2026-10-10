@@ -75,6 +75,10 @@ cargo run --release --bin stateless-validator -- \
 - `--genesis-file`: Path to genesis JSON file containing hardfork activation configuration (required on first run, stored in database for subsequent runs)
 - `--start-block`: Trusted block hash to initialize validation from (required for first-time setup)
 - `--end-block`: Inclusive end block; validate up to this height, then stop cleanly (useful to slice a fixed range across multiple servers)
+- `--block-list`: Replay exactly the block numbers in this file instead of following the chain, then exit; see "Replaying a block list" below.
+  It excludes `--start-block`, `--end-block` and `--report-validation-endpoint`, and requires `--genesis-file`.
+- `--block-list-timeout-secs`, `--block-list-concurrency`, `--block-list-output-dir`: tuning for `--block-list` (per-stage timeout, default 300; blocks in flight, default twice the physical cores; where the output files go, default `--data-dir`).
+  They are rejected without `--block-list`.
 - `--r2-endpoint`, `--r2-bucket`, `--r2-access-key-id`, `--r2-secret-access-key`: R2 connection settings for the signed S3 target, all four required together (prefer the env var for the secret).
   Configuring a target is the whole switch: there is no mode flag, and with one configured every witness fetch tries the bucket before the `--witness-endpoint` chain.
   Bulk history then streams from R2 at object-storage parallelism while any R2 failure — a frontier miss the uploader has not reached, a throttle, a corrupt object — hands that one block to RPC instead of stalling it, so the gateway only ever sees the blocks R2 could not serve.
@@ -89,6 +93,36 @@ cargo run --release --bin stateless-validator -- \
 - `--report-validation-endpoint`: RPC endpoint URL for reporting validated blocks via `mega_setValidatedBlocks` (disabled if not provided)
 - `--metrics-enabled`: Enable Prometheus metrics endpoint (disabled by default)
 - `--metrics-port`: Port for Prometheus metrics HTTP endpoint (default: 9090)
+
+### Replaying a block list
+
+```bash
+cargo run --release --bin stateless-validator -- \
+  --data-dir /path/to/fresh-scratch-dir \
+  --genesis-file /path/to/genesis.json \
+  --rpc-endpoint <public-rpc-endpoint> \
+  --witness-endpoint <witness-rpc-endpoint> \
+  --block-list pool.txt
+```
+
+The file has one decimal block number per line.
+Blank lines and lines starting with `#` are skipped, so the candidate pool written by the coverage tooling works as is.
+Duplicates collapse, and a line that is neither a comment nor a number fails the run before any block is fetched.
+Each block goes through the same fetch (R2 first when configured, then the RPC witness chain) and the same validation as the chain-following mode, up to `--block-list-concurrency` at a time.
+Nothing is advanced or reported: the canonical chain is not touched, and `--report-validation-endpoint` is rejected because a sparse set of heights must never move the upstream validated pointer.
+Use a fresh `--data-dir`, since the run opens the validator database exclusively and caches contract bytecode there.
+The genesis file is required and always replaces any genesis stored in the data dir, so replaying blocks past a hardfork needs a genesis that schedules it.
+
+A pass means the witness verified and replaying the block reproduced its header (state root, withdrawals root, receipts root, logs bloom, gas used).
+It does not check that the witness's pre-state equals the parent block's post-state, because the parent is not part of the list.
+A block that fails is recorded and the run continues; the exit status is non-zero if any block did not validate.
+The RPC client retries transport errors indefinitely, so each of the fetch and the validation of a block is bounded by `--block-list-timeout-secs`, and a block that exceeds it is recorded as `fetch_timeout` or `process_timeout`.
+
+Two files are written to `--block-list-output-dir`, both overwritten on each run.
+`results.jsonl` has one object per block, in completion order, with `block`, `hash`, `status`, `ms`, `retryable` and the validator's error text in `message`.
+`failed.txt` lists the blocks that did not validate in the input format, so it can be passed back as `--block-list` to retry exactly those.
+The statuses are `validated`, `fetch_timeout`, `fetch_failed`, `process_timeout` and `validation_failed`.
+The end-of-run summary prints the totals, the rate in blocks per second and the slowest blocks.
 
 ### Running the Debug Trace Server
 
@@ -249,6 +283,7 @@ Each command-line flag has an equivalent environment variable:
 - `STATELESS_VALIDATOR_GENESIS_FILE` → `--genesis-file`
 - `STATELESS_VALIDATOR_START_BLOCK` → `--start-block`
 - `STATELESS_VALIDATOR_END_BLOCK` → `--end-block`
+- `STATELESS_VALIDATOR_BLOCK_LIST` / `_BLOCK_LIST_TIMEOUT_SECS` / `_BLOCK_LIST_CONCURRENCY` / `_BLOCK_LIST_OUTPUT_DIR` → `--block-list*`
 - `STATELESS_VALIDATOR_R2_ENDPOINT` / `_R2_BUCKET` / `_R2_ACCESS_KEY_ID` / `_R2_SECRET_ACCESS_KEY` → `--r2-*` (the signed S3 target)
 - `STATELESS_VALIDATOR_R2_CUSTOM_DOMAIN` / `_R2_ACCESS_CLIENT_ID` / `_R2_ACCESS_CLIENT_SECRET` → `--r2-custom-domain` and its Cloudflare Access pair
 - `STATELESS_VALIDATOR_REPORT_VALIDATION_ENDPOINT` → `--report-validation-endpoint`
@@ -349,6 +384,7 @@ The pipeline is configured via `PipelineConfig` and customized through trait imp
 | File                                                                                           | Purpose                                                                                                     |
 | ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
 | `crates/stateless-core/src/pipeline/{mod,config,traits,fetcher,divergence,advancer,worker}.rs` | Generic three-stage pipeline split by responsibility                                                        |
+| `bin/stateless-validator/src/block_list.rs`                                                    | `--block-list` replay: list parsing, bounded-concurrency fetch + validate, results and retry files |
 | `crates/stateless-core/src/executor.rs`                                                        | Block validation and EVM replay                                                                             |
 | `crates/stateless-core/src/db.rs`                                                              | Shared storage traits: `ChainStore`, `ContractStore`, `StoreError` (scenario stores live in their binaries) |
 | `crates/stateless-core/src/evm_database.rs`                                                    | `WitnessDatabase` implementing `revm::DatabaseRef`                                                          |

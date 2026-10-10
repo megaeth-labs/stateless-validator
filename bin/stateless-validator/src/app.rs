@@ -15,7 +15,14 @@ use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::Block
 use stateless_db::ContractCache;
 use tracing::{info, warn};
 
-use crate::{metrics, r2_witness::R2WitnessClient, runner, validator_db::ValidatorDB};
+use crate::{
+    block_list,
+    chain_sync::{ValidatorFetcher, ValidatorProcessor},
+    metrics,
+    r2_witness::R2WitnessClient,
+    runner,
+    validator_db::ValidatorDB,
+};
 
 /// Database filename for the validator.
 pub const VALIDATOR_DB_FILENAME: &str = "validator.redb";
@@ -170,6 +177,40 @@ pub struct CommandLineArgs {
     /// Required on first run, optional on subsequent runs (loads from database).
     #[clap(long, env = "STATELESS_VALIDATOR_GENESIS_FILE")]
     pub genesis_file: Option<String>,
+
+    /// Replay exactly the block numbers in this file (one per line; blank lines and lines
+    /// starting with `#` are skipped, so a candidate-pool file works as is), then exit.
+    /// Each block is fetched and validated on its own: the canonical chain is never touched,
+    /// nothing is reported upstream, and the witness pre-state is not checked against the
+    /// parent block. A block that does not validate is recorded and the run goes on; the exit
+    /// status is non-zero if any did. Use a fresh `--data-dir`.
+    /// Needs `--genesis-file`, which then always overrides any genesis stored in the data dir,
+    /// so a stale one cannot silently validate blocks past a hardfork it does not know.
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_BLOCK_LIST",
+        conflicts_with_all = ["start_block", "end_block", "report_validation_endpoint"],
+        requires = "genesis_file",
+    )]
+    pub block_list: Option<PathBuf>,
+
+    /// With `--block-list`: seconds allowed for fetching one block and its witness, and
+    /// separately for validating it, before the block is recorded as timed out (default 300).
+    /// The RPC client retries transport errors forever, so this is what lets a run end when an
+    /// endpoint cannot serve a block.
+    #[clap(long, env = "STATELESS_VALIDATOR_BLOCK_LIST_TIMEOUT_SECS", requires = "block_list")]
+    pub block_list_timeout_secs: Option<u64>,
+
+    /// With `--block-list`: how many blocks to fetch and validate at once (default: twice the
+    /// physical cores, the validator pipeline's own in-flight window).
+    #[clap(long, env = "STATELESS_VALIDATOR_BLOCK_LIST_CONCURRENCY", requires = "block_list")]
+    pub block_list_concurrency: Option<usize>,
+
+    /// With `--block-list`: directory for `results.jsonl` (one line per block, in completion
+    /// order) and `failed.txt` (the blocks that did not validate, in the input format, ready to
+    /// be passed back as `--block-list`). Both are overwritten. Default: `--data-dir`.
+    #[clap(long, env = "STATELESS_VALIDATOR_BLOCK_LIST_OUTPUT_DIR", requires = "block_list")]
+    pub block_list_output_dir: Option<PathBuf>,
 
     /// Endpoint for reporting validated blocks via mega_setValidatedBlocks RPC.
     /// If not provided, validation reporting is disabled.
@@ -339,6 +380,35 @@ pub async fn run() -> Result<()> {
     let chain_spec =
         Arc::new(load_or_create_chain_spec(&validator_db, args.genesis_file.as_deref())?);
     info!("Chain spec loaded successfully");
+
+    if let Some(list) = &args.block_list {
+        let config = block_list::ReplayConfig {
+            concurrency: args.block_list_concurrency.unwrap_or_else(|| {
+                stateless_core::PipelineConfig::default().fetcher_max_in_flight()
+            }),
+            block_timeout: Duration::from_secs(args.block_list_timeout_secs.unwrap_or(300)),
+            progress_every: Duration::from_secs(10),
+        };
+        let output_dir = args.block_list_output_dir.clone().unwrap_or_else(|| work_dir.clone());
+        std::fs::create_dir_all(&output_dir)
+            .map_err(|e| eyre::eyre!("Failed to create {}: {e}", output_dir.display()))?;
+        let results = output_dir.join("results.jsonl");
+        let failed = output_dir.join("failed.txt");
+
+        let fetcher = Arc::new(ValidatorFetcher::new(client.clone(), r2_witness));
+        let processor =
+            Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client.clone() });
+        let outcome = block_list::run(
+            list,
+            block_list::Output { results: &results, failed: &failed },
+            fetcher,
+            processor,
+            &config,
+        )
+        .await;
+        info!(elapsed = ?start.elapsed(), "Block list replay finished");
+        return outcome;
+    }
 
     if let Some(start_block_str) = &args.start_block {
         info!(start_block = %start_block_str, "Initializing from start block");
