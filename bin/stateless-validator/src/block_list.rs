@@ -241,14 +241,6 @@ async fn replay_one(
     };
 
     let hash = task.block.header.hash;
-    if task.block.header.number != number {
-        return BlockOutcome::new(number, Some(hash), Status::FetchFailed, started).with_message(
-            format!(
-                "asked for block {number} but the endpoint returned {}",
-                task.block.header.number
-            ),
-        );
-    }
 
     match tokio::time::timeout(timeout, processor.process(task)).await {
         Err(_) => BlockOutcome::new(number, Some(hash), Status::ProcessTimeout, started)
