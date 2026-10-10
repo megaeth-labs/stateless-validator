@@ -283,6 +283,10 @@ fn canonical_chain_max_length_rejects_zero() {
 /// its tuning flags are rejected without it rather than inherited and ignored.
 #[test]
 fn block_list_flag_combinations() {
+    // The conflict rules read the environment too: hold the lock so a test that has
+    // `STATELESS_VALIDATOR_END_BLOCK` (or another conflicting variable) set cannot leak into
+    // these parses.
+    let _env = stateless_test_utils::env::env_lock();
     let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
     let with_list = ["--block-list", "/tmp/pool.txt", "--genesis-file", "/tmp/genesis.json"];
 
@@ -343,6 +347,9 @@ struct MockServerState {
     /// Every `mega_getBlockWitness` call, so a test can tell whether the RPC witness path was
     /// used at all.
     witness_requests: Arc<AtomicUsize>,
+    /// Requested block number → the number whose block is served instead, to script an
+    /// endpoint that answers a by-number lookup with the wrong block.
+    number_aliases: HashMap<u64, u64>,
 }
 
 impl MockServerState {
@@ -358,6 +365,7 @@ impl MockServerState {
             validated_reports: Arc::default(),
             reject_reports: Arc::default(),
             witness_requests: Arc::default(),
+            number_aliases: HashMap::new(),
         }
     }
 
@@ -367,7 +375,8 @@ impl MockServerState {
         &self,
         hex_number: &str,
     ) -> Result<&Block<op_alloy_rpc_types::Transaction>, ErrorObject<'static>> {
-        let block_number = parse_hex_u64(hex_number);
+        let requested = parse_hex_u64(hex_number);
+        let block_number = self.number_aliases.get(&requested).copied().unwrap_or(requested);
         self.fixtures
             .block_numbers
             .get(&block_number)
@@ -759,6 +768,7 @@ async fn replay_over_mock(
     blocks: Vec<u64>,
     block_timeout: Duration,
     concurrency: usize,
+    number_aliases: HashMap<u64, u64>,
 ) -> (Vec<BlockOutcome>, block_list::ReplaySummary) {
     let fx = TestFixtures::synthetic_shared();
     let genesis_file = fx.data_dir.join("genesis.json");
@@ -767,7 +777,9 @@ async fn replay_over_mock(
         Arc::new(ValidatorDB::new(temp_dir.path().join(VALIDATOR_DB_FILENAME)).unwrap());
     let contract_cache =
         Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
-    let (handle, url) = setup_mock_rpc_server(MockServerState::new(fx)).await;
+    let mut state = MockServerState::new(fx);
+    state.number_aliases = number_aliases;
+    let (handle, url) = setup_mock_rpc_server(state).await;
     let client = Arc::new(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap());
     let chain_spec = Arc::new(
         load_or_create_chain_spec(&validator_db, Some(genesis_file.to_str().unwrap())).unwrap(),
@@ -800,7 +812,7 @@ async fn block_list_replays_a_non_contiguous_subset() {
     assert!(every_other.len() < all.len(), "the subset must skip some block");
 
     let (outcomes, summary) =
-        replay_over_mock(every_other.clone(), Duration::from_secs(60), 4).await;
+        replay_over_mock(every_other.clone(), Duration::from_secs(60), 4, HashMap::new()).await;
 
     let mut seen: Vec<u64> = outcomes.iter().map(|o| o.number).collect();
     seen.sort_unstable();
@@ -822,8 +834,9 @@ async fn block_list_replays_a_non_contiguous_subset() {
 }
 
 /// A block no endpoint can serve is retried forever by the RPC client; the per-block timeout is
-/// what ends it. It must be recorded as `fetch_timeout`, listed for retry, and leave the blocks
-/// around it validated.
+/// what ends it. It must be recorded as `fetch_timeout`, listed for retry, and not stop the run:
+/// with a single slot and the failing block first, the blocks behind it only run if a failure
+/// frees the slot and the run carries on.
 #[tokio::test]
 async fn an_unfetchable_block_times_out_without_stopping_the_run() {
     let fx = TestFixtures::synthetic_shared();
@@ -832,7 +845,8 @@ async fn an_unfetchable_block_times_out_without_stopping_the_run() {
     let missing = fx.max_block().0 + 1_000;
 
     let (outcomes, summary) =
-        replay_over_mock(vec![first, missing, last], Duration::from_secs(2), 2).await;
+        replay_over_mock(vec![missing, first, last], Duration::from_secs(2), 1, HashMap::new())
+            .await;
 
     let status_of =
         |n: u64| outcomes.iter().find(|o| o.number == n).map(|o| o.status).expect("outcome");
@@ -845,4 +859,25 @@ async fn an_unfetchable_block_times_out_without_stopping_the_run() {
         vec![missing],
         "the retry list names exactly the block that did not validate",
     );
+}
+
+/// An endpoint that answers the lookup for one height with another height's block must not turn
+/// into a pass for the height that was asked for. The RPC client refuses such a header and keeps
+/// retrying, so the block ends as `fetch_timeout`; the block served in its place is never
+/// validated on its behalf.
+#[tokio::test]
+async fn a_block_served_for_the_wrong_height_is_not_counted_as_validated() {
+    let fx = TestFixtures::synthetic_shared();
+    let paired: Vec<u64> = fx.paired_blocks().into_iter().map(|(n, _)| n).collect();
+    let (asked, served) = (paired[0], *paired.last().unwrap());
+    assert_ne!(asked, served);
+
+    let (outcomes, summary) =
+        replay_over_mock(vec![asked], Duration::from_secs(2), 1, HashMap::from([(asked, served)]))
+            .await;
+
+    let [outcome] = outcomes.as_slice() else { panic!("one outcome expected: {outcomes:?}") };
+    assert_eq!(outcome.status, Status::FetchTimeout, "{outcome:?}");
+    assert_eq!(outcome.hash, None, "no block was accepted for the height");
+    assert_eq!((summary.validated, summary.failed.len()), (0, 1));
 }
