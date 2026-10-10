@@ -100,6 +100,7 @@ rustc-hash = { version = "2.1", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.10", default-features = false }
+tar = { version = "0.4", default-features = false }
 tempfile = { version = "3.27", default-features = false }
 thiserror = { version = "2.0", default-features = false }
 tokio = { version = "1.51", features = ["rt-multi-thread", "signal"], default-features = false }
