@@ -30,7 +30,7 @@ cargo clippy --workspace --all-targets --all-features
 cargo sort --check --workspace --grouped --order package,workspace,lints,profile,bin,benches,dependencies,dev-dependencies,features
 ```
 
-The project uses nightly `2026-02-03` toolchain (edition 2024, rust-version 1.95).
+The project uses nightly `2026-02-03` toolchain (edition 2024, rust-version 1.94).
 
 ## Workspace Structure
 
@@ -70,7 +70,7 @@ The pipeline owns the reorg seams: `DivergenceLookups` (the bisection contract) 
 
 - **`ANCHOR_BLOCK`** — Trusted starting point (block number, hash, state root, withdrawals root).
 - **`CANONICAL_CHAIN`** — Validated chain progression (block number → hash, state root, withdrawals root); a bounded contiguous window in both binaries, and exactly what reorg bisection trusts.
-- **`CONTRACTS`** — Persistent tier of the contract bytecode cache (code hash → bincode+lz4 bytecode). The in-memory tier is the bounded `ContractCache` on top.
+- **`CONTRACTS`** — Persistent tier of the contract bytecode cache (code hash → bincode+lz4 bytecode). The in-memory tier is the bounded `ContractCache` on top. Rows are self-validating on read: decode failures and keccak mismatches surface as misses (re-fetched from RPC and overwritten), not errors, so encoding drift across upgrades never bricks a data dir.
 - **`GENESIS_CONFIG`** — Hardfork activation rules (validator only).
 - **`BLOCK_DATA`** — Full block content (trace server only).
 - **`WITNESSES`** — Light witness data (trace server only).
@@ -133,7 +133,7 @@ The Parity `trace_transaction` compatibility behaviour of answering `null` inste
 HTTP responses negotiate gzip/zstd compression per request via `Accept-Encoding` (kill switch: `--response-compression-disabled`); bodies under 4 KiB stay identity, the stack order lives in `http_middleware()` (compression outside the size/timing layers keeps `x-response-size` at the uncompressed size and `x-execution-time-ns` free of compression CPU), and response-cache hits re-compress per hit.
 Body-streaming cost is metered by the outermost middleware layer (`debug_trace_body_cpu_time_seconds` / `debug_trace_wire_bytes_total`, labeled by encoding), since every request-scoped measurement is sealed before the body streams.
 The response cache is keyed by `(resource, block hash, typed tracer variant)`; by-number handlers resolve number → canonical hash before the lookup (local `CANONICAL_CHAIN` first, upstream fallback).
-It only stores idempotent request shapes: the five built-in tracers (keyed by their parsed typed `tracerConfig`) and the bare default struct-logger request; JS tracers, `muxTracer`, and struct-logger requests with non-default flags bypass it entirely, and a type-malformed `tracerConfig` on call/prestate/flatCall is rejected with `-32602`.
+It only stores idempotent request shapes: the five supported built-in tracers (keyed by their parsed typed `tracerConfig`) and the bare default struct-logger request; JS tracers, `muxTracer`, and struct-logger requests with non-default flags bypass it entirely; the unimplemented `erc7562Tracer` and a type-malformed `tracerConfig` on call/prestate/flatCall are rejected with `-32602` before any block data is fetched.
 Canonical-hash resolution reads the bounded `CANONICAL_CHAIN` window first (local cache mode), then a bounded in-memory memo of upstream-resolved bindings (`--canonical-hash-memo-capacity`; only depth-final heights are memoized — via the depth gate or a `finalized`-tag binding — so a memoized binding can no longer reorg), and only then upstream — so historical heights resolve locally after first touch within a process lifetime.
 The memo's depth gate learns the tip from the window and `latest`-tag lookups, falling back to a throttled upstream `eth_blockNumber` seed (stateless mode with numeric-only traffic); chain sync clears the memo on stale resets and on reorgs at least the safety depth deep.
 Tag requests (`latest`/`finalized`/`safe`) bind number → hash in their single upstream header fetch instead of resolving the two separately, and every resolved (number, hash) pair — from a tag, a canonical-hash resolution, or a transaction lookup — is handed to the fetch pipeline, which then skips its own number-discovery header round trip (paid only by raw by-hash requests) and cross-checks the number against the served block's header on every tier, failing typed on a drifted pair (a cold fetch also cancels the doomed witness fetch).
@@ -190,7 +190,7 @@ The background chain-sync prefetch routes by freshness against the last observed
 | `crates/stateless-core/src/executor.rs`                                                        | Block validation and EVM replay (generic over the `BlockInput` projection)           |
 | `crates/stateless-core/src/evm_database.rs`                                                    | WitnessDatabase implementing `revm::DatabaseRef`                                     |
 | `crates/stateless-core/src/db.rs`                                                              | Shared storage traits (`ContractStore`, `ChainStore`) + `StoreError` / `StoreResult` |
-| `crates/stateless-core/src/withdrawals.rs`                                                     | Withdrawal validation and MPT witness handling                                       |
+| `crates/stateless-core/src/withdrawals.rs`                                                     | Withdrawal MPT witness verification (witness linearized into `alloy_trie::HashBuilder`)                                       |
 | `crates/stateless-db/src/{lib,tables,helpers,serialize,cache}.rs`                              | Shared redb tables, helpers, serialization, and `ContractCache`                      |
 | `crates/stateless-common/src/rpc_client.rs`                                                    | RPC client for blocks, witnesses, and bytecode                                       |
 | `crates/stateless-common/src/metrics.rs`                                                       | RpcMethod, RpcMetrics, RpcClientConfig                                               |

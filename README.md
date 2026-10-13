@@ -114,7 +114,7 @@ By-number requests resolve their canonical hash before the lookup (local index, 
 Tag requests (`latest`/`finalized`/`safe`) bind number → hash in their single upstream header fetch, and every resolved (number, hash) pair — tag, canonical-hash resolution, or transaction lookup — is handed to the fetch pipeline, which then skips its own number-discovery header round trip (only raw by-hash requests still pay it).
 The handed number is cross-checked against the served block's own header on every tier, so a drifted (number, hash) pair fails typed instead of serving a witness routed by the wrong height (a cold fetch also cancels the doomed witness fetch).
 Cacheable shapes are the five built-in tracers (`callTracer`, `prestateTracer`, `4byteTracer`, `noopTracer`, `flatCallTracer`, keyed by their parsed, typed `tracerConfig` — equivalent configs collapse onto one entry) and the bare default struct-logger request (no tracer, no `tracerConfig`, default flags).
-JS tracers, `muxTracer`, and struct-logger requests with non-default flags bypass the cache and are recomputed on every request.
+JS tracers, `muxTracer`, and struct-logger requests with non-default flags bypass the cache and are recomputed on every request; the unimplemented `erc7562Tracer` is rejected with `-32602` before any block data is fetched.
 A type-malformed `tracerConfig` on a config-reading builtin (`callTracer`/`prestateTracer`/`flatCallTracer`) is rejected with `-32602 invalid params` instead of being silently traced with default settings.
 Disable the cache with `--response-cache-disabled`; `--response-cache-estimated-items` must be at least 1 (the old `=0` disable convention is rejected at startup).
 
@@ -349,7 +349,7 @@ The pipeline is configured via `PipelineConfig` and customized through trait imp
 | `crates/stateless-core/src/executor.rs`                                                        | Block validation and EVM replay                                                                             |
 | `crates/stateless-core/src/db.rs`                                                              | Shared storage traits: `ChainStore`, `ContractStore`, `StoreError` (scenario stores live in their binaries) |
 | `crates/stateless-core/src/evm_database.rs`                                                    | `WitnessDatabase` implementing `revm::DatabaseRef`                                                          |
-| `crates/stateless-core/src/withdrawals.rs`                                                     | Withdrawal validation and MPT witness handling                                                              |
+| `crates/stateless-core/src/withdrawals.rs`                                                     | Withdrawal MPT witness verification (witness linearized into `alloy_trie::HashBuilder`)                                                              |
 | `crates/stateless-db/src/{lib,tables,helpers,serialize,cache}.rs`                              | Shared redb tables, helpers, serialization, and bounded `ContractCache`                                     |
 | `crates/stateless-common/src/rpc_client.rs`                                                    | `RpcClient`: multi-endpoint HTTP client for blocks, witnesses, and bytecode                                 |
 | `crates/stateless-common/src/metrics.rs`                                                       | `RpcMethod`, `RpcMetrics`, `RpcClientConfig`                                                                |
@@ -377,6 +377,7 @@ The validator and trace server each have their own `redb`-backed database, shari
 | `BLOCK_RECORDS`   | `(BlockNumber, BlockHash)` | `()`                                                   | Trace server (pruning index) |
 
 In both binaries, `CANONICAL_CHAIN` is a bounded contiguous window — exactly the range reorg bisection trusts.
+`CONTRACTS` rows are self-validating on read: an entry that fails to decode or whose bytecode no longer hashes back to its key (disk corruption, or a `Bytecode` encoding change in a dependency upgrade) is treated as a cache miss and transparently re-fetched from RPC, so existing data dirs survive release upgrades without manual clearing.
 
 ### SALT Witness Cryptography
 

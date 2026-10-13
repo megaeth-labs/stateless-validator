@@ -202,6 +202,12 @@ pub enum RequestShape {
         /// The deserialization failure.
         error: serde_json::Error,
     },
+    /// A builtin tracer this server does not implement: the request must be rejected
+    /// before any block data is fetched or executed.
+    Unsupported {
+        /// Shape label of the unsupported tracer.
+        label: &'static str,
+    },
 }
 
 impl RequestShape {
@@ -213,7 +219,8 @@ impl RequestShape {
     ///
     /// Bypassed: JS tracers (the response depends on the tracer source, which has no place
     /// in a bounded key), `muxTracer`, and struct-logger requests with non-default
-    /// `opts.config`.
+    /// `opts.config`. The unimplemented `erc7562Tracer` classifies as [`Self::Unsupported`]
+    /// and is rejected at the gate.
     pub fn classify(opts: &GethDebugTracingOptions) -> Self {
         use alloy_rpc_types_trace::geth::{GethDebugBuiltInTracerType, GethDebugTracerType};
 
@@ -255,6 +262,9 @@ impl RequestShape {
                 // Exhaustive on purpose: a future alloy builtin variant must make an
                 // explicit cache-whitelist decision here instead of silently bypassing.
                 GethDebugBuiltInTracerType::MuxTracer => Self::Bypass("mux_tracer"),
+                GethDebugBuiltInTracerType::Erc7562Tracer => {
+                    Self::Unsupported { label: "erc7562_tracer" }
+                }
             },
             Some(GethDebugTracerType::JsTracer(_)) => Self::Bypass("js_tracer"),
         }
@@ -298,7 +308,7 @@ impl RequestShape {
             },
             Self::Bypass(_) => TraceWeight::Heavy,
             // Rejected before it can execute, so it never reaches a permit.
-            Self::InvalidTracerConfig { .. } => TraceWeight::Normal,
+            Self::InvalidTracerConfig { .. } | Self::Unsupported { .. } => TraceWeight::Normal,
         }
     }
 
@@ -307,7 +317,7 @@ impl RequestShape {
         match self {
             Self::Cacheable(variant) => variant.label(),
             Self::Bypass(label) => label,
-            Self::InvalidTracerConfig { label, .. } => label,
+            Self::InvalidTracerConfig { label, .. } | Self::Unsupported { label } => label,
         }
     }
 
@@ -815,6 +825,14 @@ mod tests {
             with_config(GethDebugBuiltInTracerType::CallTracer, json!({"onlyTopCall": "yes"}));
         let shape = RequestShape::classify(&malformed);
         assert_eq!(shape.label(), "call_tracer");
+        assert!(shape.cache_variant().is_none());
+
+        // The unsupported erc7562Tracer likewise: registered label, neither cacheable
+        // nor bypass (the gate rejects it before execution).
+        let shape =
+            RequestShape::classify(&builtin_opts(GethDebugBuiltInTracerType::Erc7562Tracer));
+        assert_eq!(shape.label(), "erc7562_tracer");
+        assert!(crate::metrics::REQUEST_SHAPES.contains(&shape.label()));
         assert!(shape.cache_variant().is_none());
     }
 
