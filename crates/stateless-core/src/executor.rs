@@ -10,8 +10,10 @@
 //!   transaction replay, and state root comparison
 //! - [`validate_block_deriving_updates`]: Variant returning the replay-derived SALT state updates
 //!   for embedders that compare against an independently verified per-block changeset
-//! - [`create_evm_env`]: Creates EVM execution environment from block header and chain
-//!   specification
+//! - [`create_block_execution_env`]: Single home for the per-block execution environment —
+//!   [`EvmEnv`], block executor factory, and hardfork-derived block limits — shared by
+//!   [`replay_block`] and the debug-trace-server's tracing executor ([`create_evm_env`] is its
+//!   EvmEnv sub-step)
 //! - [`replay_block`]: Replays block transactions to compute state changes
 //!
 //! [`replay_block`] / [`validate_block`] are generic over [`BlockInput`], the minimal block
@@ -29,15 +31,9 @@
 //! and uses Revm for transaction execution.
 
 use std::{boxed::Box, collections::BTreeMap, fmt::Debug, vec::Vec};
-#[cfg(feature = "std")]
-use std::{io::Write, time::Instant};
 
 use alloy_consensus::{TxReceipt, proofs::calculate_receipt_root, transaction::Recovered};
-use alloy_eips::eip2718::Encodable2718;
-use alloy_evm::{
-    EvmEnv,
-    block::{BlockExecutor, ExecutableTx},
-};
+use alloy_evm::{EvmEnv, block::BlockExecutor};
 use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{
     Bloom, keccak256,
@@ -45,18 +41,19 @@ use alloy_primitives::{
 };
 use alloy_rpc_types_eth::{Block, BlockTransactions};
 use mega_evm::{
-    BlockLimits, ExternalEnvFactory, MegaBlockExecutionCtx, MegaBlockExecutorFactory,
-    MegaEvmFactory, MegaHardforks, MegaSpecId,
+    BlockLimits, ExternalEnvFactory, MegaBlockExecutionCtx, MegaBlockExecutor,
+    MegaBlockExecutorFactory, MegaContext, MegaEvm, MegaEvmFactory, MegaHardforks, MegaSpecId,
 };
 use op_alloy_consensus::OpTxEnvelope;
 use op_alloy_rpc_types::Transaction as OpTransaction;
-#[cfg(feature = "std")]
-use revm::inspector::inspectors::TracerEip3155;
 use revm::{
     DatabaseRef,
     context::{BlockEnv, CfgEnv},
-    database::states::{BundleAccount, StateBuilder, bundle_state::BundleRetention},
-    primitives::{B256, KECCAK_EMPTY, U256},
+    database::{
+        State,
+        states::{BundleAccount, StateBuilder, bundle_state::BundleRetention},
+    },
+    primitives::{B256, KECCAK_EMPTY, U256, eip4844::BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN},
     state::Bytecode,
 };
 use salt::{EphemeralSaltState, SaltValue, SaltWitness, StateRoot, StateUpdates, Witness};
@@ -64,7 +61,7 @@ use thiserror::Error;
 use tracing::debug;
 
 use crate::{
-    chain_spec::{BLOB_GASPRICE_UPDATE_FRACTION, ChainSpec},
+    chain_spec::ChainSpec,
     data_types::{Account, PlainKey, PlainValue},
     evm_database::{WitnessDatabase, WitnessDatabaseError, WitnessExternalEnv},
     withdrawals::{self, ADDRESS_L2_TO_L1_MESSAGE_PASSER, MptWitness},
@@ -258,10 +255,6 @@ impl ValidationOptions {
 /// - Chain configuration with appropriate spec ID for the block number
 /// - Block environment with gas limits, timestamps, and fee parameters
 /// - Blob gas pricing if excess blob gas is present in the header
-///
-/// Creates an EVM environment from a block header and chain specification.
-///
-/// This function sets up the configuration and block environment needed for EVM execution.
 pub fn create_evm_env(
     header: &alloy_consensus::Header,
     chain_spec: &ChainSpec,
@@ -283,10 +276,100 @@ pub fn create_evm_env(
     };
 
     if let Some(excess_blob_gas) = header.excess_blob_gas {
-        block_env.set_blob_excess_gas_and_price(excess_blob_gas, BLOB_GASPRICE_UPDATE_FRACTION);
+        block_env
+            .set_blob_excess_gas_and_price(excess_blob_gas, BLOB_BASE_FEE_UPDATE_FRACTION_CANCUN);
     }
 
     EvmEnv::new(cfg_env, block_env)
+}
+
+/// The assembled per-block execution environment — [`create_block_execution_env`]'s output,
+/// named so the assembled shape is spelled once and callers hold one value instead of
+/// respelling the factory's generics.
+pub struct BlockExecutionEnv<ENV> {
+    /// EVM configuration + block environment.
+    pub evm_env: EvmEnv<MegaSpecId>,
+    /// Block executor factory wired with the chain spec and the external-env factory.
+    pub executor_factory:
+        MegaBlockExecutorFactory<ChainSpec, MegaEvmFactory<ENV>, OpAlloyReceiptBuilder>,
+    /// Execution context carrying parent linkage, extra data, and the hardfork-derived
+    /// [`BlockLimits`].
+    pub ctx: MegaBlockExecutionCtx,
+}
+
+/// The block executor [`BlockExecutionEnv::start_executor_with_inspector`] produces: a
+/// [`MegaBlockExecutor`] over the caller's `state` and `inspector`, wired to the env's
+/// external-env factory.
+pub type EnvExecutor<'a, DB, I, ENV> = MegaBlockExecutor<
+    ChainSpec,
+    MegaEvm<&'a mut State<DB>, I, <ENV as ExternalEnvFactory>::EnvTypes>,
+    OpAlloyReceiptBuilder,
+>;
+
+impl<ENV> BlockExecutionEnv<ENV>
+where
+    ENV: ExternalEnvFactory + Clone,
+{
+    /// Creates a block executor over `state` with `inspector` and applies the pre-execution
+    /// changes — the executor prologue shared by every tracing dispatch arm (validation's
+    /// transaction replay runs the same prologue inline). Living here, the executor's
+    /// concrete type is spelled once next to the env that produces it; callers bind the
+    /// result by inference.
+    pub fn start_executor_with_inspector<'a, DB, I>(
+        &self,
+        state: &'a mut State<DB>,
+        inspector: I,
+    ) -> Result<EnvExecutor<'a, DB, I, ENV>, ValidationError>
+    where
+        DB: alloy_evm::Database + 'a,
+        I: revm::Inspector<MegaContext<&'a mut State<DB>, ENV::EnvTypes>> + 'a,
+    {
+        let mut executor = self.executor_factory.create_executor_with_inspector(
+            state,
+            self.ctx.clone(),
+            self.evm_env.clone(),
+            inspector,
+        );
+        executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
+        Ok(executor)
+    }
+}
+
+/// Builds the full mega-evm execution environment for one block: the [`EvmEnv`], the block
+/// executor factory, and the execution context carrying the hardfork-derived [`BlockLimits`].
+///
+/// This is the single home of the hardfork → limits mapping, shared by [`replay_block`] and
+/// the debug-trace-server's tracing executor, so validation and tracing cannot drift apart.
+/// Without an active MegaETH hardfork the limits fall back to unlimited *except* the header's
+/// own gas limit — execution enforces the block's declared gas ceiling either way.
+pub fn create_block_execution_env<ENV>(
+    chain_spec: &ChainSpec,
+    header: &alloy_consensus::Header,
+    ext_env: ENV,
+) -> BlockExecutionEnv<ENV>
+where
+    ENV: ExternalEnvFactory + Clone,
+{
+    let evm_env = create_evm_env(header, chain_spec);
+    let executor_factory = MegaBlockExecutorFactory::new(
+        chain_spec.clone(),
+        MegaEvmFactory::new().with_external_env_factory(ext_env),
+        OpAlloyReceiptBuilder::default(),
+    );
+
+    let block_limits = if let Some(hardfork) = chain_spec.hardfork(header.timestamp) {
+        BlockLimits::from_hardfork_and_block_gas_limit(hardfork, header.gas_limit)
+    } else {
+        BlockLimits::no_limits().with_block_gas_limit(header.gas_limit)
+    };
+    let execution_context = MegaBlockExecutionCtx::new(
+        header.parent_hash,
+        header.parent_beacon_block_root,
+        header.extra_data.clone(),
+        block_limits,
+    );
+
+    BlockExecutionEnv { evm_env, executor_factory, ctx: execution_context }
 }
 
 /// Minimal projection of a block that [`replay_block`] / [`validate_block`] need: the consensus
@@ -375,7 +458,6 @@ pub fn replay_block<B, DB, ENV, E>(
     block: &B,
     db: &DB,
     env_oracle: ENV,
-    #[cfg(feature = "std")] trace_writer: Option<Box<dyn Write>>,
 ) -> Result<(AddressMap<BundleAccount>, BlockExecutionOutput), ValidationError>
 where
     B: BlockInput,
@@ -391,56 +473,32 @@ where
 
     // Setup execution environment
     let mut state = StateBuilder::new().with_database_ref(db).with_bundle_update().build();
-    let evm_env = create_evm_env(header, chain_spec);
-
-    let executor_factory = MegaBlockExecutorFactory::new(
-        chain_spec.clone(),
-        MegaEvmFactory::new().with_external_env_factory(env_oracle),
-        OpAlloyReceiptBuilder::default(),
-    );
-
-    let hardfork = chain_spec.hardfork(header.timestamp);
     debug!(
         block_number = header.number,
         block_hash = ?block.block_hash(),
-        hardfork = ?hardfork,
+        hardfork = ?chain_spec.hardfork(header.timestamp),
         "Replay block"
     );
-    let block_limits = if let Some(hardfork) = hardfork {
-        BlockLimits::from_hardfork_and_block_gas_limit(hardfork, header.gas_limit)
-    } else {
-        BlockLimits::no_limits().with_block_gas_limit(header.gas_limit)
-    };
+    let BlockExecutionEnv { evm_env, executor_factory, ctx: execution_context } =
+        create_block_execution_env(chain_spec, header, env_oracle);
 
-    let execution_context = MegaBlockExecutionCtx::new(
-        header.parent_hash,
-        header.parent_beacon_block_root,
-        header.extra_data.clone(),
-        block_limits,
-    );
+    let mut executor = executor_factory.create_executor(&mut state, execution_context, evm_env);
+    executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
+    for recovered_tx in block.txs_recovered() {
+        executor.execute_transaction(recovered_tx).map_err(ValidationError::BlockReplayFailed)?;
+    }
+    let execution_result =
+        executor.apply_post_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
 
-    // Plain execution path, shared by the non-tracer std branch and the no_std build.
-    // Extracted as a closure so the body lives in one place — any future change to the
-    // non-tracer path only needs to be made here.
-    let run_plain = |state: &mut _, ctx, env| {
-        let executor = executor_factory.create_executor(state, ctx, env);
-        execute_transactions(executor, block.txs_recovered())
-    };
+    // Compute logs bloom by ORing all receipt blooms together
+    let logs_bloom =
+        execution_result.receipts.iter().fold(Bloom::ZERO, |acc, receipt| acc | receipt.bloom());
 
-    #[cfg(feature = "std")]
-    let (receipts_root, logs_bloom, gas_used) = if let Some(writer) = trace_writer {
-        let executor = executor_factory.create_executor_with_inspector(
-            &mut state,
-            execution_context,
-            evm_env,
-            TracerEip3155::new(writer),
-        );
-        execute_transactions(executor, block.txs_recovered())?
-    } else {
-        run_plain(&mut state, execution_context, evm_env)?
-    };
-    #[cfg(not(feature = "std"))]
-    let (receipts_root, logs_bloom, gas_used) = run_plain(&mut state, execution_context, evm_env)?;
+    // mega-evm's `finish()` defines this field as the last receipt's cumulative gas, so
+    // reading it keeps one derivation of the value rather than a copy of the expression.
+    let gas_used = execution_result.gas_used;
+
+    let receipts_root = calculate_receipt_root(&execution_result.receipts);
 
     // Merge transitions into bundle_state
     state.merge_transitions(BundleRetention::PlainState);
@@ -472,38 +530,6 @@ where
             state_writes,
         },
     ))
-}
-
-/// Executes a stream of recovered transactions using the given block executor.
-fn execute_transactions<'a, E, I>(
-    mut executor: E,
-    transactions: I,
-) -> Result<(B256, Bloom, u64), ValidationError>
-where
-    E: BlockExecutor<Transaction = OpTxEnvelope>,
-    E::Receipt: Encodable2718 + TxReceipt,
-    I: Iterator<Item = Recovered<&'a OpTxEnvelope>>,
-    for<'b> Recovered<&'b OpTxEnvelope>: ExecutableTx<E>,
-{
-    executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
-
-    for recovered_tx in transactions {
-        executor.execute_transaction(recovered_tx).map_err(ValidationError::BlockReplayFailed)?;
-    }
-
-    let execution_result =
-        executor.apply_post_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
-
-    // Compute logs bloom by ORing all receipt blooms together
-    let logs_bloom =
-        execution_result.receipts.iter().fold(Bloom::ZERO, |acc, receipt| acc | receipt.bloom());
-
-    // Gas used is the cumulative gas used of the last receipt
-    let gas_used = execution_result.receipts.last().map(|r| r.cumulative_gas_used()).unwrap_or(0);
-
-    let receipts_root = calculate_receipt_root(&execution_result.receipts);
-
-    Ok((receipts_root, logs_bloom, gas_used))
 }
 
 /// Extracts the withdrawal-contract storage updates (only changed slots) from the replayed
@@ -638,7 +664,7 @@ fn verify_replay_outputs(
 /// measured"). On error the elapsed time is discarded with the stage's result.
 fn timed<T, E>(f: impl FnOnce() -> Result<T, E>) -> Result<(T, f64), E> {
     #[cfg(feature = "std")]
-    let start = Instant::now();
+    let start = std::time::Instant::now();
     let result = f()?;
     #[cfg(feature = "std")]
     let elapsed = start.elapsed().as_secs_f64();
@@ -669,7 +695,6 @@ fn verify_and_replay<B: BlockInput>(
     block: &B,
     salt_witness: SaltWitness,
     contracts: &HashMap<B256, Bytecode>,
-    #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
 ) -> Result<VerifiedReplay, ValidationError> {
     let header = block.consensus_header();
 
@@ -687,14 +712,7 @@ fn verify_and_replay<B: BlockInput>(
     // Replay block transactions
     let ((accounts, output), block_replay_time) = timed(|| {
         let witness_db = WitnessDatabase { header, witness: &witness, contracts };
-        replay_block(
-            chain_spec,
-            block,
-            &witness_db,
-            ext_env,
-            #[cfg(feature = "std")]
-            writer,
-        )
+        replay_block(chain_spec, block, &witness_db, ext_env)
     })?;
 
     let stats = ValidationStats {
@@ -724,8 +742,6 @@ fn verify_and_replay<B: BlockInput>(
 /// * `salt_witness` - The salt witness data needed for state validation
 /// * `mpt_witness` - The MPT witness data for withdrawal verification
 /// * `contracts` - Contract bytecode cache for transaction execution
-/// * `writer` - Optional writer for EIP-3155 trace output. When provided, enables step-by-step EVM
-///   execution tracing in EIP-3155 format.
 ///
 /// # Returns
 ///
@@ -737,7 +753,6 @@ pub fn validate_block<B: BlockInput>(
     salt_witness: SaltWitness,
     mpt_witness: MptWitness,
     contracts: &HashMap<B256, Bytecode>,
-    #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
 ) -> Result<ValidationStats, ValidationError> {
     // A block carrying only transaction hashes can't be replayed — fail fast before paying
     // the witness proof verification. `replay_block` re-checks for direct callers.
@@ -747,14 +762,8 @@ pub fn validate_block<B: BlockInput>(
     let header = block.consensus_header();
 
     // Verify the witness proof and replay the block's transactions over it
-    let VerifiedReplay { witness, accounts, output, mut stats } = verify_and_replay(
-        chain_spec,
-        block,
-        salt_witness,
-        contracts,
-        #[cfg(feature = "std")]
-        writer,
-    )?;
+    let VerifiedReplay { witness, accounts, output, mut stats } =
+        verify_and_replay(chain_spec, block, salt_witness, contracts)?;
 
     // Extract and hash storage updates (only changed values)
     let withdrawal_storage = withdrawal_storage(&accounts);
@@ -814,7 +823,6 @@ pub fn validate_block_deriving_updates<B: BlockInput>(
     mpt_witness: MptWitness,
     contracts: &HashMap<B256, Bytecode>,
     options: ValidationOptions,
-    #[cfg(feature = "std")] writer: Option<Box<dyn Write>>,
 ) -> Result<(StateUpdates, ValidationStats), ValidationError> {
     // A block carrying only transaction hashes can't be replayed — fail fast before paying
     // the witness proof verification. `replay_block` re-checks for direct callers.
@@ -843,14 +851,8 @@ pub fn validate_block_deriving_updates<B: BlockInput>(
     }
 
     // Verify the witness proof and replay the block's transactions over it
-    let VerifiedReplay { witness, accounts, output, mut stats } = verify_and_replay(
-        chain_spec,
-        block,
-        salt_witness,
-        contracts,
-        #[cfg(feature = "std")]
-        writer,
-    )?;
+    let VerifiedReplay { witness, accounts, output, mut stats } =
+        verify_and_replay(chain_spec, block, salt_witness, contracts)?;
 
     // Check the header's claims (withdrawals root, receipts root, logs bloom, gas used)
     // before the more expensive state-update derivation.
@@ -892,8 +894,6 @@ mod tests {
             fx.mpt_witness(&hash),
             &fx.contracts,
             options,
-            #[cfg(feature = "std")]
-            None,
         )
     }
 
@@ -904,15 +904,79 @@ mod tests {
         salt_witness: SaltWitness,
         hash: B256,
     ) -> Result<ValidationStats, ValidationError> {
-        validate_block(
-            &chain_spec(),
-            block,
-            salt_witness,
-            fx.mpt_witness(&hash),
-            &fx.contracts,
-            #[cfg(feature = "std")]
-            None,
+        validate_block(&chain_spec(), block, salt_witness, fx.mpt_witness(&hash), &fx.contracts)
+    }
+
+    /// Empty-witness external env for tests that only exercise environment assembly.
+    fn empty_ext_env(block_number: u64) -> WitnessExternalEnv {
+        WitnessExternalEnv::from_light_witness(&crate::LightWitness::default(), block_number)
+            .unwrap()
+    }
+
+    /// Without an active MegaETH hardfork, `create_block_execution_env` must still cap
+    /// execution by the header's own gas limit (everything else unlimited). The trace server
+    /// once drifted to fully-unlimited on this branch; both binaries now share this mapping.
+    #[test]
+    fn execution_env_no_hardfork_fallback_caps_block_gas() {
+        let header =
+            alloy_consensus::Header { gas_limit: 12_345, ..alloy_consensus::Header::default() };
+        // `ChainSpec::default()` schedules no hardforks → the fallback branch.
+        let ctx = create_block_execution_env(
+            &ChainSpec::default(),
+            &header,
+            empty_ext_env(header.number),
         )
+        .ctx;
+        assert_eq!(
+            ctx.block_limits,
+            BlockLimits::no_limits().with_block_gas_limit(12_345),
+            "fallback limits must be unlimited except the header's own gas limit",
+        );
+    }
+
+    /// With an active hardfork, the limits must be exactly the hardfork-derived set.
+    #[test]
+    fn execution_env_uses_hardfork_limits_when_active() {
+        let spec = chain_spec();
+        // Far-future timestamp: every hardfork scheduled by the fixture genesis is active.
+        let header = alloy_consensus::Header {
+            timestamp: u64::MAX,
+            gas_limit: 30_000_000,
+            ..alloy_consensus::Header::default()
+        };
+        let hardfork =
+            spec.hardfork(header.timestamp).expect("fixture genesis schedules hardforks");
+        let ctx = create_block_execution_env(&spec, &header, empty_ext_env(header.number)).ctx;
+        assert_eq!(
+            ctx.block_limits,
+            BlockLimits::from_hardfork_and_block_gas_limit(hardfork, header.gas_limit),
+        );
+    }
+
+    /// `start_executor_with_inspector` is the executor prologue shared with the trace
+    /// server's dispatch arms; run it over an empty state from core's own tests so the
+    /// wiring (executor construction + pre-execution changes) is exercised here, not only
+    /// through the trace-server binary.
+    #[test]
+    fn execution_env_starts_executor_with_inspector() {
+        // Far-future timestamp: the fixture genesis's hardforks (incl. Regolith, which
+        // mega-evm asserts is active) are all in effect.
+        let header = alloy_consensus::Header {
+            timestamp: u64::MAX,
+            gas_limit: 30_000_000,
+            // Post-Cancun headers must carry it; the EIP-4788 pre-execution call reads it.
+            parent_beacon_block_root: Some(B256::ZERO),
+            ..alloy_consensus::Header::default()
+        };
+        let env = create_block_execution_env(&chain_spec(), &header, empty_ext_env(header.number));
+        let mut state = StateBuilder::new()
+            .with_database_ref(revm::database::EmptyDB::default())
+            .with_bundle_update()
+            .build();
+        let executor = env
+            .start_executor_with_inspector(&mut state, revm::inspector::NoOpInspector)
+            .expect("executor prologue over an empty state must succeed");
+        drop(executor);
     }
 
     /// The fixture witness for `hash` with the first byte of one witnessed (non-metadata)
@@ -1001,12 +1065,16 @@ mod tests {
         assert!(matches!(err, ValidationError::BlockIncomplete), "{err:?}");
     }
 
+    /// `validate_block` must succeed on every paired mainnet fixture. This is the full
+    /// consensus surface against real headers — the post-state root, plus the withdrawals
+    /// root, receipts root, logs bloom and `gas_used` that `verify_replay_outputs` checks —
+    /// so a replayed value that stops matching what a mainnet header claims fails here.
     #[test]
     fn validate_block_mainnet_fixtures() {
         let _logging = init_test_logging("stateless_core");
         let fx = TestFixtures::mainnet_shared();
         let paired = fx.paired_blocks();
-        assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
+        assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet.tar.zst");
         for (number, hash) in paired {
             let block = &fx.blocks[&hash];
             run_block(fx, block, fx.salt_witnesses[&hash].clone(), hash)
@@ -1024,7 +1092,7 @@ mod tests {
         let _logging = init_test_logging("stateless_core");
         let fx = TestFixtures::mainnet_shared();
         let paired = fx.paired_blocks();
-        assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet");
+        assert!(!paired.is_empty(), "no paired mainnet fixtures in test_data/mainnet.tar.zst");
         for (number, hash) in paired {
             let block = &fx.blocks[&hash];
             let options = match fx.blocks.get(&block.consensus_header().parent_hash) {

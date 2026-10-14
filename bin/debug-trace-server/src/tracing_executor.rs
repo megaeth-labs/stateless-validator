@@ -24,9 +24,8 @@
 //! ## Parity-style (trace_* methods)
 //! - `LocalizedTransactionTrace` - Flat call traces with block/tx context
 
-use alloy_consensus::Transaction;
+use alloy_consensus::{Transaction, transaction::Recovered};
 use alloy_evm::{Evm as EvmTrait, block::BlockExecutor};
-use alloy_op_evm::block::OpAlloyReceiptBuilder;
 use alloy_primitives::{B256, map::HashMap};
 use alloy_rpc_types_eth::{Block, BlockTransactions, TransactionInfo};
 use alloy_rpc_types_trace::{
@@ -39,9 +38,7 @@ use alloy_rpc_types_trace::{
     parity::LocalizedTransactionTrace,
 };
 use eyre::Result;
-use mega_evm::{
-    BlockLimits, MegaBlockExecutionCtx, MegaBlockExecutorFactory, MegaEvmFactory, MegaHardforks,
-};
+use op_alloy_consensus::OpTxEnvelope;
 use op_alloy_network::TransactionResponse;
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use revm::{
@@ -57,7 +54,7 @@ use revm_inspectors::tracing::{
 use stateless_core::{
     chain_spec::ChainSpec,
     evm_database::{WitnessDatabase, WitnessExternalEnv},
-    executor::{ValidationError, create_evm_env},
+    executor::{BlockExecutionEnv, ValidationError, create_block_execution_env},
     light_witness::{LightWitness, LightWitnessExecutor},
 };
 use tracing::{instrument, trace, warn};
@@ -101,13 +98,9 @@ struct TracingEnv<'a> {
     /// so the witness DB can never be paired with a different block's header.
     header: &'a alloy_consensus::Header,
     transactions: &'a [OpTransaction],
-    executor_factory: MegaBlockExecutorFactory<
-        ChainSpec,
-        MegaEvmFactory<WitnessExternalEnv>,
-        OpAlloyReceiptBuilder,
-    >,
-    block_ctx: MegaBlockExecutionCtx,
-    evm_env: alloy_evm::EvmEnv<mega_evm::MegaSpecId>,
+    /// Shared with `replay_block`: the same env, factory, hardfork → limits mapping, and
+    /// extra_data (system transactions) the validator executes with.
+    exec: BlockExecutionEnv<WitnessExternalEnv>,
     light_witness_executor: &'a LightWitnessExecutor,
 }
 
@@ -125,36 +118,12 @@ impl<'a> TracingEnv<'a> {
             WitnessExternalEnv::from_light_witness(witness.light_witness(), block.header.number)
                 .map_err(ValidationError::EnvOracleConstructionFailed)?;
 
-        let evm_env = create_evm_env(&block.header.inner, chain_spec);
-
-        let evm_factory = MegaEvmFactory::new().with_external_env_factory(ext_env);
-        let executor_factory = MegaBlockExecutorFactory::new(
-            chain_spec.clone(),
-            evm_factory,
-            OpAlloyReceiptBuilder::default(),
-        );
-
-        let hardfork = chain_spec.hardfork(block.header.timestamp);
-        let block_limits = if let Some(hardfork) = hardfork {
-            BlockLimits::from_hardfork_and_block_gas_limit(hardfork, block.header.gas_limit)
-        } else {
-            BlockLimits::no_limits()
-        };
-
-        // Use actual extra_data (contains system transactions) to match validator behavior.
-        let block_ctx = MegaBlockExecutionCtx::new(
-            block.header.parent_hash,
-            block.header.parent_beacon_block_root,
-            block.header.extra_data.clone(),
-            block_limits,
-        );
+        let exec = create_block_execution_env(chain_spec, &block.header.inner, ext_env);
 
         Ok(Self {
             header: &block.header.inner,
             transactions,
-            executor_factory,
-            block_ctx,
-            evm_env,
+            exec,
             light_witness_executor: witness,
         })
     }
@@ -302,33 +271,29 @@ fn make_tx_ctx(info: &TransactionInfo) -> TransactionContext {
     }
 }
 
-macro_rules! setup_executor {
-    ($env:expr, $state:expr, $inspector:expr => $executor:ident) => {
-        let mut $executor = $env.executor_factory.create_executor_with_inspector(
-            $state,
-            $env.block_ctx.clone(),
-            $env.evm_env.clone(),
-            $inspector,
-        );
-        $executor.apply_pre_execution_changes().map_err(ValidationError::BlockReplayFailed)?;
-    };
-}
-
-macro_rules! replay_preceding_txs {
-    ($executor:expr, $env:expr, $tx_index:expr) => {
-        for tx in $env.transactions.iter().take($tx_index) {
-            $executor
-                .execute_transaction(&tx.inner.inner)
-                .map_err(ValidationError::BlockReplayFailed)?;
-        }
-    };
+/// Replays the transactions preceding `tx_index` through `executor` (discarding their
+/// output) so the target transaction executes against its true intra-block prestate.
+fn replay_preceding_txs<E>(
+    executor: &mut E,
+    env: &TracingEnv<'_>,
+    tx_index: usize,
+) -> Result<(), ValidationError>
+where
+    E: BlockExecutor,
+    for<'t> &'t Recovered<OpTxEnvelope>: alloy_evm::block::ExecutableTx<E>,
+{
+    for tx in env.transactions.iter().take(tx_index) {
+        executor
+            .execute_transaction(&tx.inner.inner)
+            .map_err(ValidationError::BlockReplayFailed)?;
+    }
+    Ok(())
 }
 
 // TracingInspector-based helpers (shared by Call, PreState, FlatCall, Default)
 /// Extracts the traced transaction's frame from the executor's inspector — the one
 /// home for the four `TracerKind` frame builders, shared by the block and
-/// single-transaction paths (whose executor types are macro-local, like
-/// [`setup_executor!`]'s).
+/// single-transaction paths.
 ///
 /// Evaluates to `Result<GethTrace, ValidationError>`. The `FlatCall` arm takes the
 /// inspector by value (leaving a fresh one behind, which doubles as its per-tx
@@ -409,7 +374,7 @@ fn trace_block_with_tracing_inspector(
     >,
     tracer: &TracerKind,
 ) -> Result<Vec<TraceResult>, ValidationError> {
-    setup_executor!(env, state, tracer.create_inspector() => executor);
+    let mut executor = env.exec.start_executor_with_inspector(state, tracer.create_inspector())?;
 
     let mut results = Vec::with_capacity(env.transactions.len());
     for (index, tx) in env.transactions.iter().enumerate() {
@@ -458,8 +423,11 @@ fn trace_tx_with_tracing_inspector(
 ) -> Result<GethTrace, TraceError> {
     // Preceding transactions only rebuild state; a none-config inspector skips
     // recording their every step just to discard it.
-    setup_executor!(env, state, TracingInspector::new(TracingInspectorConfig::none()) => executor);
-    replay_preceding_txs!(executor, env, tx_index);
+    let mut executor = env.exec.start_executor_with_inspector(
+        state,
+        TracingInspector::new(TracingInspectorConfig::none()),
+    )?;
+    replay_preceding_txs(&mut executor, env, tx_index)?;
 
     *executor.inspector_mut() = tracer.create_inspector();
 
@@ -530,7 +498,9 @@ pub fn trace_block(
                 )?,
 
                 GethDebugBuiltInTracerType::FourByteTracer => {
-                    setup_executor!(&env, &mut state, FourByteInspector::default() => executor);
+                    let mut executor = env
+                        .exec
+                        .start_executor_with_inspector(&mut state, FourByteInspector::default())?;
 
                     let mut results = Vec::with_capacity(env.transactions.len());
                     for (index, tx) in env.transactions.iter().enumerate() {
@@ -558,7 +528,8 @@ pub fn trace_block(
                     let inspector = mux_inspector(tracer_config)?;
                     let template = inspector.clone();
 
-                    setup_executor!(&env, &mut state, inspector => executor);
+                    let mut executor =
+                        env.exec.start_executor_with_inspector(&mut state, inspector)?;
 
                     let mut results = Vec::with_capacity(env.transactions.len());
                     for (index, tx) in env.transactions.iter().enumerate() {
@@ -617,7 +588,7 @@ pub fn trace_block(
                 let inspector =
                     js_inspector(code.clone(), config_json.clone(), make_tx_ctx(&first_info))?;
 
-                setup_executor!(&env, &mut state, inspector => executor);
+                let mut executor = env.exec.start_executor_with_inspector(&mut state, inspector)?;
 
                 let mut results = Vec::with_capacity(env.transactions.len());
                 for (index, tx) in env.transactions.iter().enumerate() {
@@ -648,7 +619,7 @@ pub fn trace_block(
                             let result_and_state = outcome.inner.result_and_state;
                             let state_changes = result_and_state.state.clone();
 
-                            let evm_env_ref = env.evm_env.clone();
+                            let evm_env_ref = env.exec.evm_env.clone();
                             let tx_env = TxEnv::default();
                             let json_result = {
                                 let (db, js_inspector, _) =
@@ -749,8 +720,10 @@ pub fn trace_transaction(
                 ),
 
                 GethDebugBuiltInTracerType::FourByteTracer => {
-                    setup_executor!(&env, &mut state, FourByteInspector::default() => executor);
-                    replay_preceding_txs!(executor, &env, tx_index);
+                    let mut executor = env
+                        .exec
+                        .start_executor_with_inspector(&mut state, FourByteInspector::default())?;
+                    replay_preceding_txs(&mut executor, &env, tx_index)?;
 
                     *executor.inspector_mut() = FourByteInspector::default();
 
@@ -765,8 +738,9 @@ pub fn trace_transaction(
                     let inspector = mux_inspector(tracer_config)?;
                     let template = inspector.clone();
 
-                    setup_executor!(&env, &mut state, inspector => executor);
-                    replay_preceding_txs!(executor, &env, tx_index);
+                    let mut executor =
+                        env.exec.start_executor_with_inspector(&mut state, inspector)?;
+                    replay_preceding_txs(&mut executor, &env, tx_index)?;
 
                     *executor.inspector_mut() = template;
 
@@ -791,8 +765,8 @@ pub fn trace_transaction(
                 let inspector =
                     js_inspector(code.clone(), config_json.clone(), make_tx_ctx(&info))?;
 
-                setup_executor!(&env, &mut state, inspector => executor);
-                replay_preceding_txs!(executor, &env, tx_index);
+                let mut executor = env.exec.start_executor_with_inspector(&mut state, inspector)?;
+                replay_preceding_txs(&mut executor, &env, tx_index)?;
 
                 *executor.inspector_mut() =
                     js_inspector(code.clone(), config_json, make_tx_ctx(&info))?;
@@ -802,7 +776,7 @@ pub fn trace_transaction(
                     .map_err(ValidationError::BlockReplayFailed)?;
                 let result_and_state = outcome.inner.result_and_state;
 
-                let evm_env_ref = env.evm_env.clone();
+                let evm_env_ref = env.exec.evm_env.clone();
                 let tx_env = TxEnv::default();
                 let (db, js_inspector, _) = EvmTrait::components_mut(&mut executor.evm);
                 js_inspector
@@ -836,7 +810,7 @@ pub fn parity_trace_block(
     let mut state = State::builder().with_database_ref(&cache_db).build();
 
     let inspector = TracingInspector::new(TracingInspectorConfig::default_parity());
-    setup_executor!(&env, &mut state, inspector => executor);
+    let mut executor = env.exec.start_executor_with_inspector(&mut state, inspector)?;
 
     let mut all_traces = Vec::new();
 
@@ -893,8 +867,8 @@ pub fn parity_trace_transaction(
     // Preceding transactions only rebuild state; a none-config inspector skips
     // recording their every step just to discard it.
     let inspector = TracingInspector::new(TracingInspectorConfig::none());
-    setup_executor!(&env, &mut state, inspector => executor);
-    replay_preceding_txs!(executor, &env, tx_index);
+    let mut executor = env.exec.start_executor_with_inspector(&mut state, inspector)?;
+    replay_preceding_txs(&mut executor, &env, tx_index)?;
 
     *executor.inspector_mut() = TracingInspector::new(TracingInspectorConfig::default_parity());
 
@@ -1051,8 +1025,9 @@ mod tests {
 
         use crate::data_provider::{BlockData, test_support::fixture_block_data};
 
-        let chain_spec =
-            ChainSpec::from_genesis(TestFixtures::synthetic().load_genesis().expect("genesis"));
+        let chain_spec = ChainSpec::from_genesis(
+            TestFixtures::synthetic_shared().load_genesis().expect("genesis"),
+        );
         let BlockData { block, witness, contracts } = fixture_block_data();
 
         let err = trace_block(
@@ -1075,6 +1050,92 @@ mod tests {
         assert!(matches!(err, TraceError::Request(_)), "got: {err:?}");
     }
 
+    /// `trace_transaction` replays the preceding transactions under a recording-free
+    /// inspector and only then installs the real tracer, while `trace_block` keeps the tracer
+    /// installed throughout. The frame for transaction `k` must come out byte-identical either
+    /// way, for every transaction of every fixture block and on every inspector-based path —
+    /// the preceding replay may not leave anything behind in the executor that the recording
+    /// inspector would have shaped differently.
+    #[test]
+    fn single_transaction_trace_is_byte_identical_to_its_block_trace_frame() {
+        use stateless_test_utils::fixtures::TestFixtures;
+
+        let fixtures = TestFixtures::synthetic_shared();
+        let chain_spec = ChainSpec::from_genesis(fixtures.load_genesis().expect("genesis"));
+        let contracts: HashMap<B256, Bytecode> =
+            fixtures.contracts.iter().map(|(hash, code)| (*hash, code.clone())).collect();
+
+        let builtin = |tracer| GethDebugTracingOptions {
+            tracer: Some(GethDebugTracerType::BuiltInTracer(tracer)),
+            ..Default::default()
+        };
+        let geth_options = [
+            // The bare default is the struct logger.
+            GethDebugTracingOptions::default(),
+            builtin(GethDebugBuiltInTracerType::CallTracer),
+            builtin(GethDebugBuiltInTracerType::PreStateTracer),
+            builtin(GethDebugBuiltInTracerType::FlatCallTracer),
+        ];
+
+        let mut compared = 0usize;
+        let mut multi_tx_blocks = 0usize;
+        for (number, hash) in fixtures.paired_blocks() {
+            let block = &fixtures.blocks[&hash];
+            let witness =
+                LightWitnessExecutor::from(LightWitness::from(&fixtures.salt_witnesses[&hash]));
+            multi_tx_blocks += (block.transactions.len() > 1) as usize;
+
+            for opts in &geth_options {
+                let traces = trace_block(&chain_spec, block, &witness, &contracts, opts.clone())
+                    .unwrap_or_else(|e| panic!("block {number}: trace_block: {e:?}"));
+                for (index, entry) in traces.iter().enumerate() {
+                    let TraceResult::Success { result, .. } = entry else {
+                        panic!("block {number} tx {index}: block trace failed: {entry:?}");
+                    };
+                    let single = trace_transaction(
+                        &chain_spec,
+                        block,
+                        index,
+                        &witness,
+                        &contracts,
+                        opts.clone(),
+                    )
+                    .unwrap_or_else(|e| panic!("block {number} tx {index}: {e:?}"));
+                    assert_eq!(
+                        serde_json::to_string(&single).unwrap(),
+                        serde_json::to_string(result).unwrap(),
+                        "block {number} tx {index}: tracer {:?}",
+                        opts.tracer
+                    );
+                    compared += 1;
+                }
+            }
+
+            // The Parity path replays its preceding transactions the same way.
+            let block_parity = parity_trace_block(&chain_spec, block, &witness, &contracts)
+                .unwrap_or_else(|e| panic!("block {number}: parity_trace_block: {e:?}"));
+            for index in 0..block.transactions.len() {
+                let single =
+                    parity_trace_transaction(&chain_spec, block, index, &witness, &contracts)
+                        .unwrap_or_else(|e| panic!("block {number} tx {index}: parity: {e:?}"));
+                let from_block: Vec<_> = block_parity
+                    .iter()
+                    .filter(|trace| trace.transaction_position == Some(index as u64))
+                    .collect();
+                assert_eq!(
+                    serde_json::to_string(&single.iter().collect::<Vec<_>>()).unwrap(),
+                    serde_json::to_string(&from_block).unwrap(),
+                    "block {number} tx {index}: parity"
+                );
+                compared += 1;
+            }
+        }
+
+        // Vacuity guard: the comparison must reach transactions that have predecessors.
+        assert!(multi_tx_blocks > 0, "no fixture block carries more than one transaction");
+        assert!(compared > 0, "nothing was compared");
+    }
+
     /// Defense in depth behind the RPC boundary gate: a type-malformed `tracerConfig` on
     /// a config-reading builtin is rejected with [`TraceError::Request`] by the executor
     /// itself — on both the block and the single-transaction paths — never silently
@@ -1087,8 +1148,9 @@ mod tests {
 
         use crate::data_provider::{BlockData, test_support::fixture_block_data};
 
-        let chain_spec =
-            ChainSpec::from_genesis(TestFixtures::synthetic().load_genesis().expect("genesis"));
+        let chain_spec = ChainSpec::from_genesis(
+            TestFixtures::synthetic_shared().load_genesis().expect("genesis"),
+        );
         let BlockData { block, witness, contracts } = fixture_block_data();
 
         let malformed = [
