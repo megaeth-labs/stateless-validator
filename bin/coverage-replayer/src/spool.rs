@@ -277,6 +277,8 @@ fn remove_files(dir: &Path, matches: impl Fn(&str) -> bool) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use stateless_test_utils::fixtures::TestFixtures;
+
     use super::*;
 
     fn tmp_files(dir: &Path) -> usize {
@@ -320,18 +322,10 @@ mod tests {
         entry(b"not json").write_to(&path).unwrap();
         assert!(SpoolEntry::open(&path, 7).is_err());
 
-        let fixture = fs::read_dir("../../test_data/mainnet/blocks")
-            .expect("fixture dir")
-            .flatten()
-            .map(|e| e.path())
-            .find(|p| p.extension().is_some_and(|e| e == "json"))
-            .expect("at least one block fixture");
-        entry(&fs::read(&fixture).unwrap()).write_to(&path).unwrap();
-        let n = serde_json::from_slice::<Block<OpTransaction>>(&fs::read(&fixture).unwrap())
-            .unwrap()
-            .header
-            .inner
-            .number;
+        let fixtures = TestFixtures::mainnet_shared();
+        let (n, hash) =
+            fixtures.paired_blocks().into_iter().next().expect("at least one block fixture");
+        entry(&serde_json::to_vec(&fixtures.blocks[&hash]).unwrap()).write_to(&path).unwrap();
         assert_eq!(SpoolEntry::open(&path, n).unwrap().block.header.inner.number, n);
         let err = SpoolEntry::open(&path, n + 1).err().expect("another block's entry");
         assert!(err.to_string().contains("expected"), "{err}");
