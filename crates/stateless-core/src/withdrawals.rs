@@ -53,6 +53,26 @@ type LeafUpdate = Option<Vec<u8>>;
 /// Sorted (by path) pending updates, sliced narrower at every recursion step.
 type Updates = [(Nibbles, LeafUpdate)];
 
+/// Nibbles in a storage-trie key: slots are keyed by their 32-byte hash. [`Nibbles`] caps at
+/// this length and treats a longer path as an invariant violation (undefined behavior in
+/// release builds), so no path is ever built past it.
+const KEY_NIBBLES: usize = 64;
+
+/// `path` extended by `key`, or an error when the result would outgrow a storage-trie key.
+///
+/// Every join and push in the walk goes through this bound (directly, or via
+/// [`child_regions`] for branch children): the walk also runs over witness bytes that are only
+/// hash-linked to a claimed root, so a structurally impossible trie must be refused rather
+/// than followed.
+fn join_path(path: &Nibbles, key: &Nibbles) -> Result<Nibbles, WithdrawalValidationError> {
+    if path.len() + key.len() > KEY_NIBBLES {
+        return Err(trie_error(format!(
+            "node path at {path:?} extends past the {KEY_NIBBLES}-nibble key length"
+        )));
+    }
+    Ok(path.join(key))
+}
+
 /// Pre-state witness for the L2ToL1MessagePasser contract storage trie.
 ///
 /// Contains the storage root and trie nodes needed to verify storage state
@@ -87,7 +107,19 @@ impl MptWitness {
     /// * `MissingWithdrawalsRoot` - Header lacks `withdrawals_root` field
     /// * `PreStateRootMismatch` - Witness doesn't match expected pre-state root
     /// * `PostStateRootMismatch` - Computed post-state doesn't match header
-    /// * `TrieOperationFailed` - Malformed witness node, or an update the witness cannot prove
+    /// * `TrieOperationFailed` - Malformed or missing witness node (including the root), or an
+    ///   update the witness cannot prove
+    ///
+    /// # Untrusted witness bytes
+    ///
+    /// The first pass walks nodes that are only hash-linked to the *claimed* `storage_root`;
+    /// only a caller that anchors that root to the parent block (see `ValidationOptions`)
+    /// pins them to the chain. The walk therefore refuses any shape no 32-byte-keyed trie
+    /// has — a path past [`KEY_NIBBLES`], a leaf not ending at exactly that depth, an
+    /// extension with an empty key — as `TrieOperationFailed`. That keeps recursion depth
+    /// bounded by the key length and keeps the emitted keys prefix-free and strictly
+    /// increasing (children in nibble order, each strictly under its parent's path), which is
+    /// what `HashBuilder`'s ordering `assert!`s require.
     pub fn verify(
         &self,
         header: &Header,
@@ -161,9 +193,10 @@ impl Linearizer<'_> {
         } else if self.nodes.contains_key(&root) {
             self.emit_subtree(&mut hb, &RlpNode::word_rlp(&root), Nibbles::default(), updates)?;
         } else {
-            // The root node is absent, so the witness proves nothing; report the
-            // reconstruction as empty and let the pre-state check flag the mismatch.
-            return Ok(EMPTY_ROOT_HASH);
+            // The root node is absent, so the witness proves nothing about this trie. Say so
+            // here rather than hand back a root that was never computed, so no caller owes
+            // this walk a follow-up comparison to stay fail-closed.
+            return Err(trie_error(format!("witness lacks the root node {root}")));
         }
         Ok(hb.root())
     }
@@ -215,7 +248,12 @@ impl Linearizer<'_> {
                 Err(trie_error(format!("unexpected empty trie node at {path:?}")))
             }
             TrieNode::Leaf(leaf) => {
-                let full = path.join(&leaf.key);
+                let full = join_path(&path, &leaf.key)?;
+                if full.len() != KEY_NIBBLES {
+                    return Err(trie_error(format!(
+                        "leaf at {full:?} does not end at the {KEY_NIBBLES}-nibble key depth"
+                    )));
+                }
                 // The leaf is the region's only occupant: a removal of any other path
                 // is a proven no-op, and a write at `full` supersedes the leaf (its
                 // replacement, if any, is the first entry of `rest`).
@@ -228,7 +266,7 @@ impl Linearizer<'_> {
                 Ok(())
             }
             TrieNode::Extension(ext) => {
-                let boundary = path.join(&ext.key);
+                let boundary = extension_boundary(&path, &ext.key)?;
                 let (before, under, after) = split_at_prefix(updates, &boundary);
                 // Updates diverging inside the extension key are proven to target
                 // absent slots: removals are no-ops, inserts become fresh leaves.
@@ -240,7 +278,7 @@ impl Linearizer<'_> {
                 Ok(())
             }
             TrieNode::Branch(branch) => {
-                let regions = child_regions(&branch, &path, updates);
+                let regions = child_regions(&branch, &path, updates)?;
 
                 // A branch that ends up with a single surviving region collapses: the
                 // survivor merges upward. That is derived by the `HashBuilder` from
@@ -324,16 +362,16 @@ impl Linearizer<'_> {
         match node {
             TrieNode::EmptyRoot => Ok(false),
             TrieNode::Leaf(leaf) => {
-                let full = path.join(&leaf.key);
+                let full = join_path(&path, &leaf.key)?;
                 Ok(!removals.iter().any(|(p, _)| *p == full))
             }
             TrieNode::Extension(ext) => {
-                let boundary = path.join(&ext.key);
+                let boundary = extension_boundary(&path, &ext.key)?;
                 let (_, under, _) = split_at_prefix(removals, &boundary);
                 self.survives_removals(&ext.child, boundary, under)
             }
             TrieNode::Branch(branch) => {
-                for region in child_regions(&branch, &path, removals) {
+                for region in child_regions(&branch, &path, removals)? {
                     if self.region_survives(&region, path)? {
                         return Ok(true);
                     }
@@ -354,14 +392,36 @@ struct ChildRegion<'a> {
     updates: &'a Updates,
 }
 
+/// `path` extended by an extension node's `key`, refusing the shapes no trie has.
+///
+/// An extension always consumes at least one nibble: an empty key would let a chain of
+/// extensions recurse without descending, so it is rejected rather than followed.
+fn extension_boundary(path: &Nibbles, key: &Nibbles) -> Result<Nibbles, WithdrawalValidationError> {
+    if key.is_empty() {
+        return Err(trie_error(format!("extension with an empty key at {path:?}")));
+    }
+    join_path(path, key)
+}
+
 /// Partitions `updates` (sorted, all lying under `path`) into the branch's 16 child
 /// regions. Each region is a contiguous run because the paths are sorted and grouped
 /// by their nibble at depth `path.len()`.
+///
+/// Every update must land in some region. That holds because `children()` yields all 16
+/// nibble slots (`None` for unset ones), so the last slot's region takes whatever is left;
+/// should an alloy-trie upgrade ever narrow the iteration to populated children, the
+/// leftover is an error here rather than an update silently dropped from a release build.
 fn child_regions<'a>(
     branch: &BranchNode,
     path: &Nibbles,
     updates: &'a Updates,
-) -> Vec<ChildRegion<'a>> {
+) -> Result<Vec<ChildRegion<'a>>, WithdrawalValidationError> {
+    // A branch at the full key depth has no room for a nibble below it.
+    if path.len() >= KEY_NIBBLES {
+        return Err(trie_error(format!(
+            "branch at {path:?} sits at the full {KEY_NIBBLES}-nibble key depth"
+        )));
+    }
     let mut regions = Vec::with_capacity(16);
     let mut rest = updates;
     for (idx, child) in branch.as_ref().children() {
@@ -370,8 +430,13 @@ fn child_regions<'a>(
         rest = tail;
         regions.push(ChildRegion { idx, child: child.cloned(), updates: region });
     }
-    debug_assert!(rest.is_empty());
-    regions
+    if !rest.is_empty() {
+        return Err(trie_error(format!(
+            "{} update(s) fell outside the 16 child slots of the branch at {path:?}",
+            rest.len()
+        )));
+    }
+    Ok(regions)
 }
 
 /// Emits the inserted leaves of `updates` into `hb`. Only valid where the removals in
@@ -400,12 +465,15 @@ fn split_at_prefix<'u>(
 
 #[cfg(test)]
 mod tests {
-    use std::vec;
+    use std::{collections::BTreeMap, vec};
 
     use WithdrawalValidationError::*;
     use alloy_primitives::b256;
     use alloy_rlp::Encodable;
-    use alloy_trie::nodes::{BranchNode, ExtensionNode, LeafNode};
+    use alloy_trie::{
+        nodes::{BranchNode, ExtensionNode, LeafNode},
+        proof::ProofRetainer,
+    };
 
     use super::*;
 
@@ -483,7 +551,7 @@ mod tests {
     fn pre_state_mismatch() {
         assert!(matches!(
             run(BOGUS, vec![], Some(EMPTY_ROOT_HASH), &[]),
-            Err(PreStateRootMismatch { .. })
+            Err(TrieOperationFailed(_))
         ));
     }
 
@@ -500,7 +568,7 @@ mod tests {
     #[test]
     fn missing_nodes() {
         let (root, _) = leaf(42);
-        assert!(matches!(run(root, vec![], Some(root), &[]), Err(PreStateRootMismatch { .. })));
+        assert!(matches!(run(root, vec![], Some(root), &[]), Err(TrieOperationFailed(_))));
     }
 
     /// Attack: tampered node bytes → hash mismatch → treated as missing.
@@ -510,7 +578,7 @@ mod tests {
         let mut bytes = state[0].to_vec();
         *bytes.last_mut().unwrap() ^= 0x01;
         state[0] = Bytes::from(bytes);
-        assert!(matches!(run(root, state, Some(root), &[]), Err(PreStateRootMismatch { .. })));
+        assert!(matches!(run(root, state, Some(root), &[]), Err(TrieOperationFailed(_))));
     }
 
     /// Attack: update targets a slot whose subtree is missing.
@@ -519,7 +587,7 @@ mod tests {
         let (root, _) = leaf(42);
         assert!(matches!(
             run(root, vec![], Some(root), &[(SLOT, U256::from(99u64))]),
-            Err(PreStateRootMismatch { .. } | TrieOperationFailed(_))
+            Err(TrieOperationFailed(_))
         ));
     }
 
@@ -632,5 +700,242 @@ mod tests {
             run(root, state, Some(root), &[(SLOT_B, U256::from(9u64))]),
             Err(TrieOperationFailed(_))
         ));
+    }
+
+    /// Root of the storage trie holding `state`, built independently of [`Linearizer`]: every
+    /// leaf streamed into a `HashBuilder` in key order.
+    fn reference_root(state: &BTreeMap<B256, U256>) -> B256 {
+        let mut hb = HashBuilder::default();
+        for (slot, value) in state {
+            hb.add_leaf(Nibbles::unpack(slot), &alloy_rlp::encode_fixed_size(value));
+        }
+        hb.root()
+    }
+
+    /// The pre-state root of `state` and a minimal witness for it: the nodes on the paths to
+    /// `targets`, exactly as the proof retainer of the same builder emits them. An absent
+    /// target gets an exclusion proof — the path nodes down to where its key would diverge —
+    /// so the witness never contains the subtrees an insert or a no-op removal cannot read.
+    fn minimal_witness(state: &BTreeMap<B256, U256>, targets: &[B256]) -> (B256, Vec<Bytes>) {
+        let retainer = ProofRetainer::new(targets.iter().map(Nibbles::unpack).collect());
+        let mut hb = HashBuilder::default().with_proof_retainer(retainer);
+        for (slot, value) in state {
+            hb.add_leaf(Nibbles::unpack(slot), &alloy_rlp::encode_fixed_size(value));
+        }
+        let root = hb.root();
+        (root, hb.take_proof_nodes().into_inner().into_values().collect())
+    }
+
+    /// An insert into an empty branch slot whose nibble lies below, between, or above the
+    /// populated children (children sit at nibbles 1 and 2) must land in the post root:
+    /// `child_regions` has to hand every update to some slot, including the empty ones past
+    /// the last populated child.
+    #[test]
+    fn insert_into_empty_branch_slot_matches_reference_for_every_nibble() {
+        let (root, state) = two_leaf_branch();
+        let pre = BTreeMap::from([(SLOT, U256::from(7u64)), (SLOT_B, U256::from(8u64))]);
+        assert_eq!(root, reference_root(&pre), "fixture trie disagrees with the reference");
+
+        for first_nibble in [0x0u8, 0x3, 0x8, 0xF] {
+            let mut bytes = [0x11u8; 32];
+            bytes[0] = (first_nibble << 4) | 0x1;
+            let slot = B256::from(bytes);
+            let mut post = pre.clone();
+            post.insert(slot, U256::from(9u64));
+            run(root, state.clone(), Some(reference_root(&post)), &[(slot, U256::from(9u64))])
+                .unwrap_or_else(|e| panic!("insert at first nibble {first_nibble:#x}: {e:?}"));
+        }
+    }
+
+    /// An extension always consumes at least one nibble; an empty key is no trie's shape and
+    /// is refused instead of followed (a chain of them would recurse without descending).
+    #[test]
+    fn extension_with_empty_key_is_rejected() {
+        let leaf = leaf_node(Nibbles::unpack(SLOT), 7);
+        let ext = TrieNode::Extension(ExtensionNode::new(Nibbles::default(), rlp_of(&leaf)));
+        let ext_rlp = encoded(&ext);
+        let root = keccak256(&ext_rlp);
+        match run(root, vec![ext_rlp, encoded(&leaf)], Some(root), &[]) {
+            Err(TrieOperationFailed(msg)) if msg.contains("empty key") => {}
+            other => panic!("expected the empty-key rejection, got {other:?}"),
+        }
+    }
+
+    /// A leaf must end exactly at the 64-nibble key depth: anything shorter would make the
+    /// emitted key set non-prefix-free, which `HashBuilder` does not guard against.
+    #[test]
+    fn leaf_not_ending_at_key_depth_is_rejected() {
+        let short = encoded(&leaf_node(Nibbles::unpack(SLOT).slice(1..), 7));
+        let root = keccak256(&short);
+        match run(root, vec![short], Some(root), &[]) {
+            Err(TrieOperationFailed(msg)) if msg.contains("key depth") => {}
+            other => panic!("expected the key-depth rejection, got {other:?}"),
+        }
+    }
+
+    /// A path that would outgrow a storage-trie key is refused before any `Nibbles` is
+    /// built past its 64-nibble capacity: here a full-length leaf key hangs under a branch.
+    #[test]
+    fn path_past_the_key_length_is_rejected() {
+        let too_long = leaf_node(Nibbles::unpack(SLOT), 7);
+        let other = leaf_node(Nibbles::unpack(SLOT_B).slice(1..), 8);
+        let branch = TrieNode::Branch(BranchNode::new(
+            vec![rlp_of(&too_long), rlp_of(&other)],
+            0b0110.into(),
+        ));
+        let branch_rlp = encoded(&branch);
+        let root = keccak256(&branch_rlp);
+        let state = vec![branch_rlp, encoded(&too_long), encoded(&other)];
+        match run(root, state, Some(root), &[]) {
+            Err(TrieOperationFailed(msg)) if msg.contains("past the 64-nibble key length") => {}
+            other => panic!("expected the path-length rejection, got {other:?}"),
+        }
+    }
+
+    /// xorshift64*: a fixed seed keeps the differential run deterministic, and the failing
+    /// case index in an assertion message pinpoints a reproduction.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn slot(&mut self) -> B256 {
+            let mut bytes = [0u8; 32];
+            for chunk in bytes.chunks_mut(8) {
+                chunk.copy_from_slice(&self.next().to_be_bytes());
+            }
+            B256::from(bytes)
+        }
+
+        /// A slot sharing a random-length nibble prefix with `base`, so the tries grow
+        /// extensions and branches instead of a flat fan-out.
+        fn near(&mut self, base: &B256) -> B256 {
+            let keep = self.below(KEY_NIBBLES);
+            let fresh = Nibbles::unpack(self.slot());
+            let base = Nibbles::unpack(base);
+            let mut bytes = [0u8; 32];
+            for (i, byte) in bytes.iter_mut().enumerate() {
+                let nibble = |k: usize| {
+                    if k < keep { base.get_unchecked(k) } else { fresh.get_unchecked(k) }
+                };
+                *byte = (nibble(2 * i) << 4) | nibble(2 * i + 1);
+            }
+            B256::from(bytes)
+        }
+
+        fn value(&mut self) -> U256 {
+            if self.below(4) == 0 {
+                U256::from_limbs([self.next() | 1, self.next(), self.next(), self.next()])
+            } else {
+                U256::from(1 + self.below(1000) as u64)
+            }
+        }
+
+        fn pick(&mut self, state: &BTreeMap<B256, U256>) -> Option<B256> {
+            (!state.is_empty()).then(|| *state.keys().nth(self.below(state.len())).unwrap())
+        }
+    }
+
+    /// Differential test: random storage trie, reference roots from a `HashBuilder` over the
+    /// full pre- and post-state, a minimal (sometimes partial or padded) witness, a random mix
+    /// of inserts, overwrites, removals and removals of absent slots. Verification must either
+    /// reproduce the reference post root or fail closed with `TrieOperationFailed` — never a
+    /// root mismatch, which would be a plausible-but-wrong linearization.
+    ///
+    /// Two cases must not fail closed: a witness covering every key, and a minimal witness
+    /// when no update removes an existing slot (only a removal can collapse a branch onto a
+    /// sibling the exclusion proof leaves out).
+    #[test]
+    fn linearization_matches_hash_builder_reference() {
+        const CASES: usize = 6000;
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let (mut verified, mut failed_closed) = (0usize, 0usize);
+
+        for case in 0..CASES {
+            let mut pre = BTreeMap::new();
+            for _ in 0..rng.below(26) {
+                let slot = match rng.pick(&pre) {
+                    Some(base) if rng.below(4) != 0 => rng.near(&base),
+                    _ => rng.slot(),
+                };
+                pre.insert(slot, rng.value());
+            }
+
+            let mut updates = BTreeMap::new();
+            for _ in 0..rng.below(7) {
+                let slot = match rng.pick(&pre) {
+                    Some(base) => match rng.below(3) {
+                        0 => base,
+                        1 => rng.near(&base),
+                        _ => rng.slot(),
+                    },
+                    None => rng.slot(),
+                };
+                let value = if rng.below(2) == 0 { U256::ZERO } else { rng.value() };
+                updates.insert(slot, value);
+            }
+            let removes_existing =
+                updates.iter().any(|(slot, value)| value.is_zero() && pre.contains_key(slot));
+
+            let mut post = pre.clone();
+            for (slot, value) in &updates {
+                if value.is_zero() {
+                    post.remove(slot);
+                } else {
+                    post.insert(*slot, *value);
+                }
+            }
+
+            let update_slots: Vec<B256> = updates.keys().copied().collect();
+            let mode = rng.below(5);
+            let targets: Vec<B256> = match mode {
+                // Every key witnessed.
+                0 => pre.keys().chain(updates.keys()).copied().collect(),
+                // Partial: each update's proof kept with probability 1/2.
+                3 => update_slots.iter().copied().filter(|_| rng.below(2) == 0).collect(),
+                // Padded with proofs for existing slots the updates do not touch.
+                4 => update_slots.iter().copied().chain(rng.pick(&pre)).collect(),
+                // Minimal: exactly the updated slots.
+                _ => update_slots.clone(),
+            };
+            let (root, witness) = minimal_witness(&pre, &targets);
+            assert_eq!(root, reference_root(&pre), "case {case}: reference pre root");
+
+            let update_list: Vec<(B256, U256)> = updates.into_iter().collect();
+            let result = run(root, witness, Some(reference_root(&post)), &update_list);
+            let describe = || {
+                format!(
+                    "case {case}, mode {mode}: {} pre slots, updates {update_list:?}",
+                    pre.len()
+                )
+            };
+
+            match &result {
+                Ok(()) => verified += 1,
+                Err(TrieOperationFailed(_)) => {
+                    failed_closed += 1;
+                    assert_ne!(mode, 0, "a full witness must verify ({})", describe());
+                    assert!(
+                        removes_existing || mode == 3,
+                        "a minimal witness without removals must verify ({}): {result:?}",
+                        describe()
+                    );
+                }
+                Err(other) => panic!("wrong root accepted-or-rejected ({}): {other:?}", describe()),
+            }
+        }
+
+        // The run must exercise both outcomes, or the generator has gone vacuous.
+        assert!(verified > CASES / 2, "only {verified}/{CASES} cases verified");
+        assert!(failed_closed > 0, "no case exercised the fail-closed path");
     }
 }

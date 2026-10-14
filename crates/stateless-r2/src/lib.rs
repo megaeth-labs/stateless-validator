@@ -15,8 +15,8 @@
 //! - [`endpoint`] — parsing an R2 endpoint into the origin and `SigV4` canonical host;
 //! - [`client`] — a signed `PUT` helper that classifies the response into a small retry-friendly
 //!   error set ([`client::R2Error`]);
-//! - [`fetch`] — the retrying signed-`GET` witness-object fetcher shared by the readers
-//!   ([`fetch::R2ObjectFetcher`]).
+//! - [`fetch`] — the retrying witness-object `GET` fetcher shared by the readers, over either the
+//!   signed S3 API or an unsigned Cloudflare custom domain ([`fetch::R2ObjectFetcher`]).
 //!
 //! ## Object retention
 //!

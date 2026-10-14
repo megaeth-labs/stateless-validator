@@ -6,11 +6,12 @@
 //! 1. **Local Database** (fast) - Local DB for pre-fetched blocks (if configured)
 //! 2. **Remote RPC** (slower) - Upstream RPC endpoints as fallback
 //!
-//! Within the RPC fallback, the witness stage routes by block age (see [`WitnessFetchConfig`]):
-//! blocks fewer than `local_window` blocks below the local tip use the full witness endpoint
-//! chain (internal generator first), while historical blocks — at least `local_window` below,
-//! which the generator has long pruned — skip the generator and go straight to the remaining
-//! endpoints.
+//! Within the RPC fallback, the witness stage first probes a configured R2 bucket for every
+//! fetch (see [`fetch_witness`]), then routes the RPC chain by block age (see
+//! [`WitnessFetchConfig`]): blocks fewer than `local_window` blocks below the local tip use
+//! the full witness endpoint chain (internal generator first), while historical blocks — at
+//! least `local_window` below, which the generator has long pruned — skip the generator and
+//! go straight to the remaining endpoints.
 //!
 //! # Features
 //! - **Single-flight request coalescing**: concurrent callers for the same block hash share one
@@ -44,13 +45,16 @@ use futures::{FutureExt, future::Shared};
 use op_alloy_rpc_types::Transaction;
 use quick_cache::sync::Cache;
 use revm::state::Bytecode;
-use stateless_common::{CodeFetchError, RpcClient, RpcDeadlineExceeded, WitnessSizeBreakdown};
+use stateless_common::{
+    CodeFetchError, R2Band, RpcClient, RpcDeadlineExceeded, WitnessFetchError,
+    WitnessSizeBreakdown, r2_band,
+};
 use stateless_core::{
     ContractStore, LightWitness, LightWitnessExecutor, StoreResult, db::StoreError,
     withdrawals::MptWitness,
 };
 use stateless_db::ContractCache;
-use tracing::{debug, instrument, trace, warn};
+use tracing::{debug, error, instrument, trace, warn};
 
 use crate::{
     block_data_cache::BlockDataCache,
@@ -95,6 +99,15 @@ impl WitnessFetchConfig {
     }
 }
 
+/// The share of a request's budget held back from the admission queue for the work itself.
+///
+/// A free function rather than a method: it is two `Duration`s in and one out, and reaching it
+/// through a `DataProvider` would make its tests stand up an RPC client and four caches to
+/// assert a subtraction.
+fn permit_reserve(witness_timeout: Duration, block_fetch_timeout: Duration) -> Duration {
+    if witness_timeout < block_fetch_timeout { witness_timeout } else { block_fetch_timeout / 2 }
+}
+
 /// Block data bundle containing all information needed for stateless execution.
 ///
 /// This struct aggregates the block, its witness (state proof), and all
@@ -130,9 +143,18 @@ pub struct BlockData {
 /// normal.
 pub const DEFAULT_WITNESS_TIMEOUT_SECS: u64 = 8;
 
-/// The R2 attempt's share of the remaining witness budget: half, so a hung R2 endpoint can
-/// never starve the RPC fallback of its turn; a healthy R2 answers in a fraction of it.
+/// The R2 attempt's share of the remaining witness budget for blocks R2 should hold
+/// (at or below the frontier band): half, so a hung R2 endpoint can never starve the RPC
+/// fallback of its turn; a healthy R2 answers in a fraction of it.
 const R2_WITNESS_BUDGET_DIVISOR: u32 = 2;
+
+/// The frontier probe's much smaller share: an eighth of the remaining budget. The probe
+/// is speculative — the uploader usually lags the generator and a miss is the expected
+/// outcome — so degraded R2 (timing-out connects, throttling, each retried) must not be
+/// able to burn half the witness stage in front of the RPC chain on every near-tip
+/// request. An eighth still leaves comfortable headroom over a healthy single GET in
+/// every deployed region while bounding a degraded R2's damage to a sliver of the stage.
+const R2_FRONTIER_BUDGET_DIVISOR: u32 = 8;
 
 /// Default local-tip window (in blocks): witnesses at least this far below the local tip are
 /// historical and skip the internal generator endpoint (see [`witness_route`]).
@@ -221,6 +243,9 @@ pub enum DataProviderError {
     TransactionNotFound(B256),
     #[error("transaction {0} is pending")]
     TransactionPending(B256),
+    /// A block tag this server does not serve (`pending`) — client input, not a fault.
+    #[error("block tag {0} not supported")]
+    UnsupportedBlockTag(BlockNumberOrTag),
     #[error("{stage} fetch exceeded deadline after {elapsed:?}")]
     Timeout { stage: TimeoutStage, elapsed: Duration },
     /// Wrapped in `Arc` so [`shared_to_result`] can clone the pointer across coalesced
@@ -246,6 +271,18 @@ impl From<RpcDeadlineExceeded> for DataProviderError {
             _ => TimeoutStage::Block,
         };
         DataProviderError::Timeout { stage, elapsed: e.elapsed }
+    }
+}
+
+impl From<WitnessFetchError> for DataProviderError {
+    fn from(e: WitnessFetchError) -> Self {
+        match e {
+            // Only a blown deadline is a timeout. A range failure is a wiring bug in this
+            // process — routing it to `Timeout { Witness }` would fire the `deadline_witness`
+            // alarm, which must mean "an upstream witness fetch ran out of budget".
+            WitnessFetchError::Deadline(d) => d.into(),
+            WitnessFetchError::NoProviderInRange { .. } => eyre::eyre!("{e}").into(),
+        }
     }
 }
 
@@ -338,9 +375,8 @@ pub(crate) struct DataProvider {
     /// The full-call deadline still dominates; the per-stage budgets cap how much of it the
     /// witness fetch can burn.
     witness_cfg: WitnessFetchConfig,
-    /// Optional direct-from-R2 source for historical witnesses. When present, the witness
-    /// stage tries it before the RPC chain for blocks the routing window classifies as
-    /// historical; every R2 failure falls back to the RPC chain on the remaining deadline.
+    /// Optional direct-from-R2 witness source. When present, every witness fetch tries it
+    /// before the RPC chain; any R2 failure falls back on the remaining deadline.
     r2_witness: Option<Arc<R2WitnessSource>>,
     /// Wall-clock budget for one user-facing block-data call, from entry through
     /// header + witness + block + contract resolution. The retry loop in `RpcClient`
@@ -354,7 +390,8 @@ pub(crate) struct DataProvider {
     /// duration of the fetch; the primary task removes it after `.await` completes.
     in_flight: DashMap<B256, BlockDataFuture>,
     /// Bounded in-memory memo of depth-final number → canonical-hash bindings, filled by
-    /// upstream resolutions for heights the sync window no longer (or never) covers.
+    /// upstream resolutions for heights the sync window no longer (or never) covers and
+    /// by `finalized`-tag bindings.
     /// Restart-cold by design: the first request per height after a restart pays one
     /// upstream header fetch, and a stale entry cannot outlive the process. Shared with
     /// the chain-sync hooks (see [`CanonicalHashMemo`]).
@@ -390,6 +427,8 @@ impl CanonicalHashMemo {
         self.0.get(block_num)
     }
 
+    /// Caller asserts the binding can no longer reorg. Today's admitters: the depth gate
+    /// in `resolve_canonical_hash`, and `finalized`-tag resolutions (final by definition).
     pub(crate) fn insert(&self, block_num: u64, hash: B256) {
         self.0.insert(block_num, hash);
     }
@@ -402,8 +441,9 @@ impl CanonicalHashMemo {
     /// Reorg reaction: a reorg at least [`CANONICAL_MEMO_MIN_DEPTH`] deep breaches the
     /// margin every memoized binding relied on — some heights may now bind to orphaned
     /// hashes, and once the sync window slides past them nothing else would ever correct
-    /// the binding — so the whole memo goes. Shallower reorgs cannot touch memoized
-    /// (depth-final) heights by construction and keep the memo intact.
+    /// the binding — so the whole memo goes. Shallower reorgs keep the memo intact:
+    /// depth-gated entries are out of reach by construction, `finalized` entries by
+    /// upstream's finality promise.
     pub(crate) fn on_reorg(&self, depth: u64) {
         if depth >= CANONICAL_MEMO_MIN_DEPTH {
             warn!(depth, "Deep reorg; clearing the canonical-hash memo");
@@ -426,8 +466,7 @@ impl DataProvider {
     ///   + block + contracts)
     /// * `canonical_hash_memo_capacity` - Entry cap for the in-memory canonical-hash memo
     ///
-    /// The optional direct-from-R2 historical witness source attaches via
-    /// [`Self::with_r2_witness`].
+    /// The optional direct-from-R2 witness source attaches via [`Self::with_r2_witness`].
     pub fn new(
         rpc_client: Arc<RpcClient>,
         db: Option<Arc<dyn BlockStore>>,
@@ -497,7 +536,9 @@ impl DataProvider {
             *next = now + TIP_SEED_MIN_INTERVAL;
         }
         let deadline = deadline.min(now + TIP_SEED_TIMEOUT);
-        match self.rpc_client.get_latest_block_number_with_deadline(Some(deadline)).await {
+        // Best-effort: a deadline give-up here logs at debug in the retry loop instead of
+        // the operator-paging WARN — this probe's failure is degraded right below.
+        match self.rpc_client.get_latest_block_number_best_effort(Some(deadline)).await {
             Ok(tip) => {
                 record_canonical_hash_resolution("tip_seed", "ok");
                 self.observe_tip(tip);
@@ -515,6 +556,36 @@ impl DataProvider {
     /// contracts) so the whole request shares ONE budget.
     pub(crate) fn fetch_deadline(&self) -> Instant {
         Instant::now() + self.block_fetch_timeout
+    }
+
+    /// The instant past which waiting for an inbound execution permit stops being useful.
+    ///
+    /// A request that queues past this has spent the budget its witness stage still needs, so
+    /// letting it start would only trade a rejection for a deadline error — which is the
+    /// outcome the admission gate exists to prevent. Derived from the two configured budgets
+    /// rather than being its own knob, so it tracks whatever they are set to.
+    ///
+    /// The reserve normally *is* the witness budget, but falls back to half the request's
+    /// budget when the witness timeout does not fit inside it. `--witness-timeout` may legally
+    /// be set at or above `--block-fetch-timeout` — the witness sub-deadline is a `min` against
+    /// the outer one, so a larger value simply never binds — and reserving all of it would
+    /// leave a permit wait of zero, silently turning `--admission-max-queue` into a no-op: the
+    /// server would shed hard at exactly `max_concurrent` while the permit-wait histogram read
+    /// zero, pointing an operator at client load rather than at their own timeout setting.
+    /// Half is the share the witness stage already reserves for its own fallbacks.
+    pub(crate) fn permit_cutoff(&self, deadline: Instant) -> Instant {
+        deadline.checked_sub(self.permit_reserve()).unwrap_or_else(Instant::now)
+    }
+
+    /// The share of a request's budget held back from the admission queue for the work itself.
+    fn permit_reserve(&self) -> Duration {
+        permit_reserve(self.witness_cfg.witness_timeout, self.block_fetch_timeout)
+    }
+
+    /// The longest a request may wait for an execution permit under the configured budgets —
+    /// published at startup so an operator can see what `--admission-max-queue` actually buys.
+    pub(crate) fn max_permit_wait(&self) -> Duration {
+        self.block_fetch_timeout.saturating_sub(self.permit_reserve())
     }
 
     /// Resolves a block number to its canonical block hash.
@@ -607,21 +678,43 @@ impl DataProvider {
     }
 
     /// Gets block data by block hash with single-flight coalescing, minting its own
-    /// deadline. Entry point for callers without a shared budget; handlers that already
-    /// resolved a hash on a deadline use [`Self::get_block_data_by_hash_with_deadline`].
+    /// deadline. Entry point for callers without a shared budget; handlers on a shared
+    /// per-request budget use [`Self::get_block_data`] with the tail of their deadline.
     pub async fn get_block_data_by_hash(
         &self,
         block_hash: B256,
+        deadline: Instant,
     ) -> DataProviderResult<Arc<BlockData>> {
-        self.get_block_data_by_hash_with_deadline(block_hash, self.fetch_deadline()).await
+        self.get_block_data(block_hash, None, deadline).await
     }
 
-    /// Gets block data by block hash with single-flight coalescing on the caller's
-    /// `deadline` — the tail of the shared per-request budget minted by
-    /// [`Self::fetch_deadline`].
-    pub(crate) async fn get_block_data_by_hash_with_deadline(
+    /// Tiered block-data lookup: memory cache → local DB → single-flight RPC fetch, all
+    /// keyed by `block_hash`, bounded by the caller's `deadline` (the tail of the shared
+    /// per-request budget minted by [`Self::fetch_deadline`]).
+    ///
+    /// `known_number` (from a by-number resolution, tag binding, or transaction lookup)
+    /// spares a cold miss the fetch pipeline's number-discovery header round trip. It
+    /// only routes the witness fetch — data is keyed and fetched purely by `block_hash` —
+    /// so it need only be hash-consistent, not trusted: the served block's own header is
+    /// cross-checked against it here at the single exit, so a drifted pair fails typed
+    /// on every tier alike, coalesced waiters included.
+    pub(crate) async fn get_block_data(
         &self,
         block_hash: B256,
+        known_number: Option<u64>,
+        deadline: Instant,
+    ) -> DataProviderResult<Arc<BlockData>> {
+        let data = self.get_block_data_tiered(block_hash, known_number, deadline).await?;
+        check_known_number(&data.block, block_hash, known_number)?;
+        Ok(data)
+    }
+
+    /// Tier walk for [`Self::get_block_data`], which owns the `known_number` contract
+    /// check; here the number only routes the fetch.
+    async fn get_block_data_tiered(
+        &self,
+        block_hash: B256,
+        known_number: Option<u64>,
         deadline: Instant,
     ) -> DataProviderResult<Arc<BlockData>> {
         let start = Instant::now();
@@ -645,8 +738,9 @@ impl DataProvider {
         // typed errors (e.g. a `Timeout` from contract resolution) so we don't then burn the
         // remaining deadline on an RPC call that is guaranteed to hit the same timeout.
         if let Some(db) = &self.db &&
-            let Some(data) =
-                self.get_block_data_from_db(db.as_ref(), block_hash, deadline).await?
+            let Some(data) = self
+                .get_block_data_from_db(db.as_ref(), block_hash, known_number, deadline)
+                .await?
         {
             trace!(
                 block_hash = %block_hash,
@@ -670,7 +764,7 @@ impl DataProvider {
             source = "rpc",
             "Fetching block data from RPC"
         );
-        let data = self.fetch_block_data_single_flight(block_hash, deadline).await?;
+        let data = self.fetch_block_data_single_flight(block_hash, known_number, deadline).await?;
 
         trace!(
             block_hash = %block_hash,
@@ -689,9 +783,9 @@ impl DataProvider {
     pub async fn get_block_data_for_tx(
         &self,
         tx_hash: B256,
+        deadline: Instant,
     ) -> DataProviderResult<(Arc<BlockData>, usize)> {
         trace!(tx_hash = %tx_hash, "Looking up transaction");
-        let deadline = self.fetch_deadline();
 
         // Fetch the transaction to find its block. The outer result is `Err(Deadline)`; the
         // inner is `Err` for "tx exists but has no block_hash" (pending) — classify explicitly
@@ -713,40 +807,51 @@ impl DataProvider {
             "Transaction located in block"
         );
 
-        let data = self.get_block_data_by_hash_with_deadline(block_hash, deadline).await?;
+        // A mined tx carries its block number next to the hash; missing it is not a reason
+        // to fail the request, just to fall back to number discovery in the fetch pipeline.
+        let data = self.get_block_data(block_hash, tx.block_number, deadline).await?;
         Ok((data, tx_index))
     }
 
-    /// Resolves a block tag to a concrete block number on the caller's `deadline`.
+    /// Resolves a block tag to a concrete block number — and, for the upstream tags, the
+    /// canonical hash bound to it — on the caller's `deadline`.
     ///
-    /// Numeric tags are a pure local no-op. `Latest`, `Finalized`, and `Safe` must hit
-    /// upstream to learn the tip — there is no cache key until we have a concrete number,
-    /// so falling back to the cache on upstream failure is not an option. The `deadline` is
-    /// the shared per-request budget from [`Self::fetch_deadline`], so a stuck upstream
-    /// surfaces as a typed [`DataProviderError::Timeout`] rather than hanging the RPC
-    /// caller forever — and tag resolution cannot double the request's total budget.
+    /// Numeric tags are a pure local no-op and return no hash: their number → hash binding
+    /// comes from [`Self::resolve_canonical_hash`]. `Latest`/`Finalized`/`Safe` must hit
+    /// upstream to learn the tip, and that one hash-verified header fetch already carries
+    /// the hash, so it is returned instead of re-resolved by number. The shared `deadline`
+    /// (from [`Self::fetch_deadline`]) bounds the fetch, so a stuck upstream surfaces as a
+    /// typed [`DataProviderError::Timeout`]. Tag resolutions count into the
+    /// canonical-hash-resolution metric under source `"tag"`, and a `finalized` binding
+    /// also feeds the memo (see the inline comment).
     pub async fn resolve_block_number(
         &self,
         tag: BlockNumberOrTag,
         deadline: Instant,
-    ) -> DataProviderResult<u64> {
+    ) -> DataProviderResult<(u64, Option<B256>)> {
         match tag {
-            BlockNumberOrTag::Number(n) => Ok(n),
-            BlockNumberOrTag::Earliest => Ok(0),
-            BlockNumberOrTag::Pending => Err(eyre::eyre!("Pending block not supported").into()),
-            BlockNumberOrTag::Latest => {
-                let number =
-                    self.rpc_client.get_latest_block_number_with_deadline(Some(deadline)).await?;
-                self.observe_tip(number);
-                Ok(number)
+            BlockNumberOrTag::Number(n) => Ok((n, None)),
+            BlockNumberOrTag::Earliest => Ok((0, None)),
+            BlockNumberOrTag::Pending => {
+                Err(DataProviderError::UnsupportedBlockTag(BlockNumberOrTag::Pending))
             }
-            BlockNumberOrTag::Finalized | BlockNumberOrTag::Safe => {
+            BlockNumberOrTag::Latest | BlockNumberOrTag::Finalized | BlockNumberOrTag::Safe => {
                 let header = self
                     .rpc_client
-                    .get_header_with_deadline(BlockId::Number(tag), false, Some(deadline))
-                    .await?;
+                    .get_header_with_deadline(BlockId::Number(tag), true, Some(deadline))
+                    .await
+                    .inspect_err(|_| record_canonical_hash_resolution("tag", "error"))?;
+                record_canonical_hash_resolution("tag", "ok");
                 self.observe_tip(header.number);
-                Ok(header.number)
+                // `finalized` is final by definition — a stronger guarantee than the
+                // depth gate, and one its own tip observation would defeat by raising
+                // the hint to this very height. `safe` is deliberately not memoized:
+                // how far it can still reorg is upstream policy this server cannot
+                // assert.
+                if matches!(tag, BlockNumberOrTag::Finalized) {
+                    self.canonical_hash_memo.insert(header.number, header.hash);
+                }
+                Ok((header.number, Some(header.hash)))
             }
         }
     }
@@ -782,13 +887,14 @@ impl DataProvider {
     /// - `Ok(Some(data))` — block found and fully resolved.
     /// - `Ok(None)` — block not in DB (expected cache miss) OR backend read error (logged and
     ///   treated as a miss so the caller falls through to RPC).
-    /// - `Err(..)` — typed `DataProviderError` from contract resolution (e.g. `Timeout`). These
-    ///   must surface immediately; falling through to RPC would just time out again on the shared
-    ///   deadline with confusing double-wait behavior.
+    /// - `Err(..)` — typed `DataProviderError` from the drift check or contract resolution (e.g.
+    ///   `Timeout`). These must surface immediately; falling through to RPC would just time out
+    ///   again on the shared deadline with confusing double-wait behavior.
     async fn get_block_data_from_db(
         &self,
         db: &dyn BlockStore,
         block_hash: alloy_primitives::BlockHash,
+        known_number: Option<u64>,
         deadline: Instant,
     ) -> DataProviderResult<Option<BlockData>> {
         let overall_start = Instant::now();
@@ -810,6 +916,9 @@ impl DataProvider {
                 return Ok(None);
             }
         };
+        // Fast-path twin of the exit check: fail a drifted pair off the stored header
+        // before contract resolution can burn the remaining deadline upstream.
+        check_known_number(&block, block_hash, known_number)?;
         let db_read_secs = start.elapsed().as_secs_f64();
         let db_read_ms = start.elapsed().as_millis();
 
@@ -850,6 +959,7 @@ impl DataProvider {
     async fn fetch_block_data_single_flight(
         &self,
         block_hash: B256,
+        known_number: Option<u64>,
         deadline: Instant,
     ) -> DataProviderResult<Arc<BlockData>> {
         // `_guard` is only set on the primary path; coalesced waiters leave it `None`.
@@ -869,6 +979,12 @@ impl DataProvider {
                 let contract_cache = Arc::clone(&self.contract_cache);
                 let witness_cfg = self.witness_cfg;
                 let r2_witness = self.r2_witness.clone();
+                // The band anchors on the chain, not on how far this process has ingested:
+                // a reader lagging the chain does not make an overdue object any less
+                // overdue. This is half the estimate — the fetch raises it by the DB tip,
+                // which it reads anyway — and `0` here lands everything in the frontier,
+                // the safe side, until something is learned.
+                let chain_tip = self.tip_hint.load(Ordering::Relaxed);
                 let block_data_cache = self.block_data_cache.clone();
                 let fut: BlockDataFetchFuture = Box::pin(async move {
                     let data = do_fetch_block_data(
@@ -877,7 +993,9 @@ impl DataProvider {
                         contract_cache,
                         witness_cfg,
                         r2_witness,
+                        chain_tip,
                         block_hash,
+                        known_number,
                         deadline,
                     )
                     .await
@@ -949,6 +1067,7 @@ fn shared_to_result(
         }
         DataProviderError::TransactionNotFound(h) => DataProviderError::TransactionNotFound(*h),
         DataProviderError::TransactionPending(h) => DataProviderError::TransactionPending(*h),
+        DataProviderError::UnsupportedBlockTag(t) => DataProviderError::UnsupportedBlockTag(*t),
         DataProviderError::Internal(e) => DataProviderError::Internal(Arc::clone(e)),
     })
 }
@@ -956,71 +1075,90 @@ fn shared_to_result(
 /// Free function version of the fetch pipeline so it can be `.shared()` without borrowing `self`.
 ///
 /// Performs the complete RPC fetch sequence:
-/// 1. Fetch block header (without transactions) to get the block number.
-/// 2. Fetch witness and full block in parallel, each subject to the shared `deadline`. The witness
-///    stage also gets a sub-deadline: `min(deadline, now + witness_timeout)`, tightened further for
-///    old blocks (see `witness_deadline_for`).
-/// 3. The witness arrives as a `LightWitness` already (zero-validation light decode).
-/// 4. Extract code hashes from witness and fetch contract bytecodes (shares `deadline`).
+/// 1. Fetch witness and full block in parallel, each subject to the shared `deadline`. The witness
+///    arm first learns the block number — `known_number`, or one header fetch when the caller
+///    lacked it — while the hash-keyed full-block fetch starts immediately. The witness stage also
+///    gets a sub-deadline: `min(deadline, now + witness_timeout)`, tightened further for old blocks
+///    (see `witness_deadline_for`).
+/// 2. The witness arrives as a `LightWitness` already (zero-validation light decode).
+/// 3. Extract code hashes from witness and fetch contract bytecodes (shares `deadline`).
+// One call site, and `.shared()` requires owned handles (see above) — a params struct would add
+// a type to keep in sync without encapsulating anything.
+#[allow(clippy::too_many_arguments)]
 async fn do_fetch_block_data(
     rpc_client: Arc<RpcClient>,
     db: Option<Arc<dyn BlockStore>>,
     contract_cache: Arc<ContractCache>,
     witness_cfg: WitnessFetchConfig,
     r2_witness: Option<Arc<R2WitnessSource>>,
+    chain_tip: u64,
     block_hash: B256,
+    known_number: Option<u64>,
     deadline: Instant,
 ) -> DataProviderResult<BlockData> {
     let overall_start = Instant::now();
 
-    // Step 1: Fetch header first to get the block number.
-    let start = Instant::now();
-    let header = rpc_client
-        .get_header_with_deadline(BlockId::Hash(block_hash.into()), false, Some(deadline))
-        .await?;
-    let block_number = header.number;
-    let fetch_header_ms = start.elapsed().as_millis();
-
-    // Step 2: Pick the witness deadline based on "new vs old" heuristic, then run witness
-    // and full-block fetches in parallel. The tip is read once and shared by the deadline
-    // heuristic and the witness-source routing.
+    // Step 1: witness and full-block fetches in parallel. Only the witness arm needs the
+    // block number (source routing + the deadline heuristic), so it resolves
+    // `known_number` or one discovery header fetch while the hash-keyed block fetch
+    // starts immediately. `try_join!` lets the block arm's drift check cancel the
+    // witness arm, which against a hash-filtering source could only miss until its
+    // deadline. The tip is read once and shared by the heuristic and the routing.
     let db_tip = db_tip_height(db.as_deref());
-    let witness_deadline = witness_deadline_for(db_tip, block_number, &witness_cfg, deadline);
-    let (witness_timed, block_timed) = tokio::join!(
-        async {
-            let start = Instant::now();
-            let result = fetch_witness(
-                &rpc_client,
-                &witness_cfg,
-                r2_witness.as_deref(),
-                db_tip,
-                block_number,
-                header.hash,
-                witness_deadline,
-            )
-            .await;
-            (result, start.elapsed())
-        },
-        async {
-            let start = Instant::now();
-            let result = rpc_client
-                .get_block_with_deadline(BlockId::Hash(block_hash.into()), true, Some(deadline))
-                .await
-                .map_err(DataProviderError::from);
-            (result, start.elapsed())
-        },
-    );
+    let witness_arm = async {
+        let start = Instant::now();
+        let (block_number, fetch_header_ms) = match known_number {
+            Some(number) => (number, 0),
+            None => {
+                let header = rpc_client
+                    .get_header_with_deadline(
+                        BlockId::Hash(block_hash.into()),
+                        false,
+                        Some(deadline),
+                    )
+                    .await?;
+                (header.number, start.elapsed().as_millis())
+            }
+        };
+        let witness_deadline = witness_deadline_for(db_tip, block_number, &witness_cfg, deadline);
+        let witness = fetch_witness(
+            &rpc_client,
+            &witness_cfg,
+            r2_witness.as_deref(),
+            db_tip,
+            chain_tip,
+            block_number,
+            block_hash,
+            witness_deadline,
+        )
+        .await?;
+        Ok::<_, DataProviderError>((block_number, fetch_header_ms, witness, start.elapsed()))
+    };
+    let block_arm = async {
+        let start = Instant::now();
+        let block = rpc_client
+            .get_block_with_deadline(BlockId::Hash(block_hash.into()), true, Some(deadline))
+            .await
+            .map_err(DataProviderError::from)?;
+        // The fetched block is upstream's authority on this hash's height: a
+        // `known_number` it disagrees with is a drifted pair — fail typed, cancelling
+        // the witness arm.
+        check_known_number(&block, block_hash, known_number)?;
+        Ok((block, start.elapsed()))
+    };
+    let (
+        (block_number, fetch_header_ms, (witness, _mpt_witness), witness_elapsed),
+        (block, block_elapsed),
+    ) = tokio::try_join!(witness_arm, block_arm)?;
 
-    let (witness_result, witness_elapsed) = witness_timed;
-    let (block_result, block_elapsed) = block_timed;
-
-    let fetch_witness_ms = witness_elapsed.as_millis();
-    // Step 3: the light decode already produced a LightWitness — no conversion.
-    let (witness, _mpt_witness) = witness_result?;
-    let block = block_result?;
+    // Step 2: the light decode already produced a LightWitness — no conversion.
+    let fetch_witness_ms = witness_elapsed.as_millis().saturating_sub(fetch_header_ms);
+    // Guards the discovery arm, where the header-by-hash and block-by-hash answers could
+    // still disagree; with `known_number` the block arm already checked.
+    check_known_number(&block, block_hash, Some(block_number))?;
     let fetch_full_block_ms = block_elapsed.as_millis();
 
-    // Step 4: Extract code hashes and fetch contracts.
+    // Step 3: Extract code hashes and fetch contracts.
     let start = Instant::now();
     let code_hashes = crate::tracing_executor::extract_code_hashes(&witness);
     let num_contracts = code_hashes.len();
@@ -1050,6 +1188,29 @@ async fn do_fetch_block_data(
     }
 
     Ok(BlockData { block, witness: LightWitnessExecutor::from(witness), contracts })
+}
+
+/// Typed failure for a (number, hash) pair that drifted: `actual` is the fetched block's
+/// own height — upstream's answer for `block_hash` itself — and `supplied` the number
+/// that routed the fetch.
+fn drifted_number_error(block_hash: B256, actual: u64, supplied: u64) -> DataProviderError {
+    eyre::eyre!("block {block_hash} is at height {actual}, not the supplied {supplied}").into()
+}
+
+/// Cross-checks `known_number` against the served block's own header, so a drifted pair
+/// fails identically on every tier. A cached entry is still correct for its hash and
+/// stays put; only this caller's request fails.
+fn check_known_number(
+    block: &Block<Transaction>,
+    block_hash: B256,
+    known_number: Option<u64>,
+) -> DataProviderResult<()> {
+    if let Some(number) = known_number &&
+        block.header.number != number
+    {
+        return Err(drifted_number_error(block_hash, block.header.number, number));
+    }
+    Ok(())
 }
 
 /// Reads the local DB's canonical tip height, `None` when no DB is configured or the tip is
@@ -1122,37 +1283,55 @@ fn witness_route(
     }
 }
 
-/// Fetches witness data, routing by block age. The `deadline` is the witness stage's
-/// effective deadline (see [`witness_deadline_for`]).
+/// Fetches witness data. The `deadline` is the witness stage's effective deadline (see
+/// [`witness_deadline_for`]).
 ///
+/// **Every fetch tries R2 first** when a source is configured. The bucket is the very store
+/// the public gateway serves witnesses from, reached by a client that is bounded where the
+/// gateway hop is not (connect timeout, capped attempts, [`R2_WITNESS_BUDGET_DIVISOR`]'s
+/// half-budget share) and tolerant of far more parallelism than the shared gateway. At the
+/// frontier the bucket can even lead the generator: the uploader and the generator's RPC
+/// server publish from *different files* of the same generation run, so "the generator has
+/// no file yet" says nothing about the bucket. A frontier probe usually misses — one fast 404 — and
+/// every R2 failure falls back to the RPC chain below on the remaining deadline.
+///
+/// The RPC chain then routes by block age:
 /// - **Recent block** (fewer than `local_window` blocks below the local tip, or tip unknown): the
-///   full RPC witness endpoint chain, tried in order — the internal generator first, so near-tip
-///   witnesses stay on the fast internal path.
-/// - **Historical block** with an R2 source configured: R2 first — object storage tolerates far
-///   more parallelism than the shared RPC gateway, and the bucket holds full history while the
-///   generator prunes beyond its window. Every R2 failure (missing object, throttle-exhausted,
-///   transport, corrupt payload) falls back to the RPC chain below on the remaining deadline.
-/// - **Historical block** on the RPC chain, with a declared generator and a fallback endpoint
-///   configured: the same chain minus the generator, the guaranteed-miss probe
-///   [`DEFAULT_WITNESS_LOCAL_WINDOW`] describes.
+///   full chain in order — the internal generator first, so near-tip witnesses stay on the fast
+///   internal path.
+/// - **Historical block**, with a declared generator and a fallback endpoint configured: the same
+///   chain minus the generator, the guaranteed-miss probe [`DEFAULT_WITNESS_LOCAL_WINDOW`]
+///   describes.
 ///
 /// Uses the zero-validation light decode: the trace server never verifies the witness proof,
 /// so the full decode's per-point elliptic-curve work bought nothing. The recorded size is
 /// the light lower bound (excludes the never-decoded parent commitments).
+// Two tips rather than one, because they answer different questions: `db_tip` routes and
+// clamps the budget, while banding takes the higher of the two (see below). A params struct
+// would add a type to keep in sync without encapsulating anything, as on
+// `do_fetch_block_data` above.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_witness(
     rpc_client: &RpcClient,
     cfg: &WitnessFetchConfig,
     r2_witness: Option<&R2WitnessSource>,
     db_tip: Option<u64>,
+    chain_tip: u64,
     block_number: u64,
     block_hash: B256,
     deadline: Instant,
 ) -> DataProviderResult<(LightWitness, MptWitness)> {
-    if let Some(r2) = r2_witness &&
-        is_historical(db_tip, block_number, cfg.local_window) &&
-        let Some(witness) = try_r2_witness(r2, block_number, block_hash, deadline).await
-    {
-        return Ok(witness);
+    if let Some(r2) = r2_witness {
+        // Neither observation alone is the chain tip, and each leads the other in a different
+        // mode: `chain_tip` (the caller's `tip_hint`) only learns heights that by-number and
+        // tag traffic reveal, so a server asked only for hashes or transactions never raises
+        // it at all, while `db_tip` only learns what sync has ingested and falls behind
+        // through a catch-up. Both are bounded by the real chain, so the higher is the better
+        // estimate and a miss still bands on the safe side.
+        let band = r2_band(chain_tip.max(db_tip.unwrap_or(0)), block_number);
+        if let Some(witness) = try_r2_witness(r2, band, block_number, block_hash, deadline).await {
+            return Ok(witness);
+        }
     }
 
     let can_skip_generator = cfg.generator_first && rpc_client.witness_provider_count() >= 2;
@@ -1170,50 +1349,93 @@ async fn fetch_witness(
         }
         Err(e) => {
             metrics.record_request(false, start.elapsed().as_secs_f64());
-            let budget = deadline.saturating_duration_since(start);
-            // Attribution-grade context for the next timeout incident: the effective stage
-            // budget, the route taken, and whether the old-block clamp applied — the client
-            // only ever sees the generic `-32001` message.
-            warn!(
-                block_number,
-                block_hash = %block_hash,
-                source,
-                old_block = is_old_block(db_tip, block_number),
-                budget_ms = budget.as_millis() as u64,
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "Witness fetch deadline exceeded",
-            );
+            match &e {
+                WitnessFetchError::Deadline(_) => {
+                    let budget = deadline.saturating_duration_since(start);
+                    // Attribution-grade context for the next timeout incident: the effective
+                    // stage budget, the route taken, and whether the old-block clamp applied —
+                    // the client only ever sees the generic `-32001` message.
+                    warn!(
+                        block_number,
+                        block_hash = %block_hash,
+                        source,
+                        old_block = is_old_block(db_tip, block_number),
+                        budget_ms = budget.as_millis() as u64,
+                        elapsed_ms = start.elapsed().as_millis() as u64,
+                        "Witness fetch deadline exceeded",
+                    );
+                }
+                // A routing bug, not a timeout: no upstream attempt ran, so the deadline
+                // warning and its budget fields would misattribute it.
+                WitnessFetchError::NoProviderInRange { skip, configured } => {
+                    error!(
+                        block_number,
+                        block_hash = %block_hash,
+                        source,
+                        skip,
+                        configured,
+                        "Witness route selected no configured provider",
+                    );
+                }
+            }
             Err(e.into())
         }
     }
 }
 
-/// One R2 attempt for a historical witness, on [`R2_WITNESS_BUDGET_DIVISOR`]'s share of the
-/// remaining budget. `None` on any failure — the caller falls back to the RPC chain.
+/// One R2 attempt for a witness, on its band's share of the remaining budget
+/// ([`R2_FRONTIER_BUDGET_DIVISOR`] for the speculative frontier probe,
+/// [`R2_WITNESS_BUDGET_DIVISOR`] otherwise). `None` on any failure — the caller falls
+/// back to the RPC chain.
+///
+/// `band` ([`r2_band`]) also selects the metrics source label (`witness_r2_frontier`
+/// inside the band vs `witness_r2` below it) and the `missing` classification: in-band, a
+/// miss is the expected speculative-probe outcome, kept separable so its dominant miss
+/// rate does not read as R2 health degrading; below the band the object must exist and a
+/// miss feeds the `kind="missing"` bucket-integrity alarm.
 async fn try_r2_witness(
     r2: &R2WitnessSource,
+    band: R2Band,
     block_number: u64,
     block_hash: B256,
     deadline: Instant,
 ) -> Option<(LightWitness, MptWitness)> {
+    let source = if band == R2Band::Frontier { "witness_r2_frontier" } else { "witness_r2" };
+    // Only the historical band gets the half share: there R2 is primary and the object must
+    // exist. A frontier probe is speculative, so it may not burn half a near-head budget.
+    let divisor = if band == R2Band::Historical {
+        R2_WITNESS_BUDGET_DIVISOR
+    } else {
+        R2_FRONTIER_BUDGET_DIVISOR
+    };
     let now = Instant::now();
-    let r2_deadline = now + deadline.saturating_duration_since(now) / R2_WITNESS_BUDGET_DIVISOR;
-    let metrics = WitnessSourceMetrics::new_for_source("witness_r2");
+    let r2_deadline = now + deadline.saturating_duration_since(now) / divisor;
+    let metrics = WitnessSourceMetrics::new_for_source(source);
     match r2.get_witness_light(block_number, block_hash, r2_deadline).await {
         Ok(witness) => {
-            record_witness_success(&metrics, "witness_r2", now, &witness);
+            record_witness_success(&metrics, source, now, &witness);
             Some(witness)
         }
         Err(e) => {
             metrics.record_request(false, now.elapsed().as_secs_f64());
-            crate::metrics::record_r2_witness_error(e.kind());
-            warn!(
-                block_number,
-                block_hash = %block_hash,
-                kind = e.kind(),
-                error = %e,
-                "R2 witness fetch failed, falling back to the RPC chain",
-            );
+            if e.is_frontier_miss(band) {
+                // The per-source counter above still records the miss (what the frontier
+                // hit rate reads); only the `kind="missing"` alarm skips it.
+                debug!(
+                    block_number,
+                    block_hash = %block_hash,
+                    "Frontier witness not in R2 yet; trying the RPC chain",
+                );
+            } else {
+                crate::metrics::record_r2_witness_error(e.kind());
+                warn!(
+                    block_number,
+                    block_hash = %block_hash,
+                    kind = e.kind(),
+                    error = %e,
+                    "R2 witness fetch failed, falling back to the RPC chain",
+                );
+            }
             None
         }
     }
@@ -1292,8 +1514,11 @@ impl ContractStore for NoopContractStore {
 pub(crate) mod test_support {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use jsonrpsee::{RpcModule, server::ServerHandle, types::ErrorObjectOwned};
-    use stateless_test_utils::fixtures::TestFixtures;
+    use jsonrpsee::{server::ServerHandle, types::ErrorObjectOwned};
+    use stateless_test_utils::{
+        fixtures::TestFixtures,
+        mock_rpc::{consistent_header, serve},
+    };
 
     use super::*;
 
@@ -1312,9 +1537,9 @@ pub(crate) mod test_support {
     }
 
     /// Builds a real [`BlockData`] (block, light witness, full fixture contract map) from
-    /// the synthetic fixture set.
+    /// the shared synthetic fixture set.
     pub(crate) fn fixture_block_data() -> BlockData {
-        let fixtures = TestFixtures::synthetic();
+        let fixtures = TestFixtures::synthetic_shared();
         let (_, hash) = fixtures.paired_blocks().into_iter().next().expect("paired fixture");
         let block = fixtures.blocks[&hash].clone();
         let witness = LightWitness::from(&fixtures.salt_witnesses[&hash]);
@@ -1323,36 +1548,72 @@ pub(crate) mod test_support {
         BlockData { block, witness: LightWitnessExecutor::from(witness), contracts }
     }
 
-    /// Minimal self-consistent RPC `Header` for `number`: `hash` is the real `hash_slow()`
-    /// of the inner header, so `verify_hash = true` fetches accept it.
-    pub(crate) fn consistent_header(number: u64) -> alloy_rpc_types_eth::Header {
-        let inner = alloy_consensus::Header { number, ..Default::default() };
-        alloy_rpc_types_eth::Header { hash: inner.hash_slow(), inner, ..Default::default() }
+    /// The first paired synthetic block — the one [`fixture_block_data`] uses — as
+    /// `(number, hash, wire response, light witness)`, encoded with the production wire
+    /// format.
+    pub(crate) fn fixture_wire() -> (u64, B256, String, LightWitness) {
+        let fixtures = TestFixtures::synthetic_shared();
+        let (number, hash) = fixtures.paired_blocks().into_iter().next().expect("paired fixture");
+        let salt = &fixtures.salt_witnesses[&hash];
+        let mpt: MptWitness = fixtures.mpt_witness(&hash);
+        let wire =
+            stateless_common::encode_witness_response(salt, &mpt).expect("encode fixture witness");
+        (number, hash, wire, LightWitness::from(salt))
     }
 
-    /// Serves `eth_getHeaderByNumber` with a self-consistent header for any number, and
-    /// `eth_blockNumber` with `tip` — counting the latter's calls so tip-seed tests can
-    /// assert whether (and how often) the seed fired.
-    pub(crate) async fn start_mock_rpc(tip: u64) -> (ServerHandle, String, Arc<AtomicUsize>) {
-        let seed_hits = Arc::new(AtomicUsize::new(0));
-        let mut module = RpcModule::new(seed_hits.clone());
-        module
-            .register_method("eth_getHeaderByNumber", |params, _, _| {
-                let (hex,): (String,) = params.parse().unwrap();
-                let n = u64::from_str_radix(hex.strip_prefix("0x").unwrap_or(&hex), 16).unwrap();
-                Ok::<_, ErrorObjectOwned>(consistent_header(n))
-            })
-            .unwrap();
-        module
-            .register_method("eth_blockNumber", move |_params, seed_hits, _| {
-                seed_hits.fetch_add(1, Ordering::Relaxed);
-                Ok::<_, ErrorObjectOwned>(format!("{tip:#x}"))
-            })
-            .unwrap();
-        let server =
-            jsonrpsee::server::ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", server.local_addr().unwrap());
-        (server.start(module), url, seed_hits)
+    /// Per-method call counters for [`start_mock_rpc`], so round-trip-shape tests can
+    /// assert which upstream calls a path made (and which it skipped).
+    #[derive(Default)]
+    pub(crate) struct MockRpcHits {
+        /// `eth_blockNumber` calls (the tip seed).
+        pub(crate) block_number: AtomicUsize,
+        /// `eth_getHeaderByNumber` calls (numeric or tag).
+        pub(crate) header_by_number: AtomicUsize,
+        /// `eth_getHeaderByHash` calls (the fetch pipeline's number discovery).
+        pub(crate) header_by_hash: AtomicUsize,
+    }
+
+    /// The simulated generator's "witness not generated yet" miss, shared by every mock
+    /// witness source so the tests model one upstream wire shape.
+    fn witness_not_generated() -> ErrorObjectOwned {
+        ErrorObjectOwned::owned::<()>(-32602, "Failed to get witness: not generated yet", None)
+    }
+
+    /// Serves `eth_getHeaderByNumber` (numeric hex or the `latest`/`finalized`/`safe`
+    /// tags, tags answering at `tip`), `eth_getHeaderByHash` (a `tip` header, enough for
+    /// paths that only read the number), and `eth_blockNumber` with `tip` — counting every
+    /// call per method in [`MockRpcHits`].
+    pub(crate) async fn start_mock_rpc(tip: u64) -> (ServerHandle, String, Arc<MockRpcHits>) {
+        let hits = Arc::new(MockRpcHits::default());
+        let (handle, url) = serve(hits.clone(), |module| {
+            module
+                .register_method("eth_getHeaderByNumber", move |params, hits, _| {
+                    hits.header_by_number.fetch_add(1, Ordering::Relaxed);
+                    // Parse as the client's own wire type so the mock can't drift from it.
+                    let (tag,): (BlockNumberOrTag,) = params.parse().unwrap();
+                    let n = tag.as_number().unwrap_or(tip);
+                    Ok::<_, ErrorObjectOwned>(consistent_header(n))
+                })
+                .unwrap();
+            module
+                .register_method("eth_getHeaderByHash", move |params, hits, _| {
+                    hits.header_by_hash.fetch_add(1, Ordering::Relaxed);
+                    // Echo the requested hash (the client cross-checks it against the
+                    // request); the content is a `tip` header, enough for number discovery.
+                    let (hash,): (B256,) = params.parse().unwrap();
+                    let header = alloy_rpc_types_eth::Header { hash, ..consistent_header(tip) };
+                    Ok::<_, ErrorObjectOwned>(header)
+                })
+                .unwrap();
+            module
+                .register_method("eth_blockNumber", move |_params, hits, _| {
+                    hits.block_number.fetch_add(1, Ordering::Relaxed);
+                    Ok::<_, ErrorObjectOwned>(format!("{tip:#x}"))
+                })
+                .unwrap();
+        })
+        .await;
+        (handle, url, hits)
     }
 
     /// Serves `mega_getBlockWitness`: "not generated yet" errors for the first
@@ -1363,24 +1624,62 @@ pub(crate) mod test_support {
         wire: Option<String>,
     ) -> (ServerHandle, String, Arc<AtomicUsize>) {
         let hits = Arc::new(AtomicUsize::new(0));
-        let mut module = RpcModule::new((hits.clone(), wire));
-        module
-            .register_method("mega_getBlockWitness", move |_p, (hits, wire), _| {
-                let call = hits.fetch_add(1, Ordering::Relaxed);
-                match wire {
-                    Some(wire) if call >= misses_before_serve => Ok(wire.clone()),
-                    _ => Err(ErrorObjectOwned::owned::<()>(
-                        -32602,
-                        "Failed to get witness: not generated yet",
-                        None,
-                    )),
-                }
-            })
-            .unwrap();
-        let server =
-            jsonrpsee::server::ServerBuilder::default().build("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", server.local_addr().unwrap());
-        (server.start(module), url, hits)
+        let (handle, url) = serve((hits.clone(), wire), |module| {
+            module
+                .register_method("mega_getBlockWitness", move |_p, (hits, wire), _| {
+                    let call = hits.fetch_add(1, Ordering::Relaxed);
+                    match wire {
+                        Some(wire) if call >= misses_before_serve => Ok(wire.clone()),
+                        _ => Err(witness_not_generated()),
+                    }
+                })
+                .unwrap();
+        })
+        .await;
+        (handle, url, hits)
+    }
+
+    /// Serves `eth_getBlockByHash` with `block`, ignoring the requested hash, and
+    /// `mega_getBlockWitness` with `wire`: `Some` serves it whatever keys are asked —
+    /// a witness source that resolves by number alone with no hash filter — while
+    /// `None` always misses, like a real hash-filtering source facing keys it cannot
+    /// match.
+    pub(crate) async fn block_and_witness_rpc(
+        block: Block<Transaction>,
+        wire: Option<String>,
+    ) -> (ServerHandle, String) {
+        serve((block, wire), |module| {
+            module
+                .register_method("eth_getBlockByHash", |_p, (block, _), _| {
+                    Ok::<_, ErrorObjectOwned>(block.clone())
+                })
+                .unwrap();
+            module
+                .register_method("mega_getBlockWitness", |_p, (_, wire), _| {
+                    wire.clone().ok_or_else(witness_not_generated)
+                })
+                .unwrap();
+        })
+        .await
+    }
+
+    /// Serves `wire` after `delay` on every call — a healthy-but-slow witness endpoint.
+    pub(crate) async fn delayed_witness_rpc(
+        delay: Duration,
+        wire: String,
+    ) -> (ServerHandle, String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (handle, url) = serve((hits.clone(), wire), |module| {
+            module
+                .register_async_method("mega_getBlockWitness", move |_p, ctx, _| async move {
+                    ctx.0.fetch_add(1, Ordering::Relaxed);
+                    tokio::time::sleep(delay).await;
+                    Ok::<_, ErrorObjectOwned>(ctx.1.clone())
+                })
+                .unwrap();
+        })
+        .await;
+        (handle, url, hits)
     }
 }
 
@@ -1392,10 +1691,11 @@ mod tests {
     use stateless_test_utils::{
         fixtures::TestFixtures,
         mock_r2::{mock_r2, mock_r2_held},
+        mock_rpc::consistent_header,
     };
 
     use super::{
-        test_support::{consistent_header, scripted_witness_rpc, start_mock_rpc},
+        test_support::{block_and_witness_rpc, scripted_witness_rpc, start_mock_rpc},
         *,
     };
     use crate::server_db::test_support::StubBlockStore;
@@ -1428,6 +1728,12 @@ mod tests {
         assert!(!is_historical(Some(4095), 0, 4096));
         assert!(!is_historical(Some(u64::MAX), u64::MAX, 4096), "overflowing horizon is recent");
         assert!(is_historical(Some(100), 50, 0), "zero window: everything at/below tip");
+        // The deployed window is the wide one, and the R2 frontier band is not: a block 1000
+        // below the tip is a bucket hole for the band while still recent for routing.
+        assert!(
+            !is_historical(Some(5000), 4000, DEFAULT_WITNESS_LOCAL_WINDOW),
+            "the routing window is far wider than the R2 band",
+        );
     }
 
     /// Route selection: the skip-generator chain and the `witness_historical` label apply
@@ -1453,11 +1759,25 @@ mod tests {
             rpc_retry: BackoffPolicy::new(Duration::from_millis(1), Duration::from_millis(2)),
             ..RpcClientConfig::trace_server()
         };
+        let (rpc_client, mut cfg) = cap_fixture(witness_urls, config);
+        cfg.generator_first = generator_first;
+        (rpc_client, cfg)
+    }
+
+    /// [`routing_fixture`] with the client config under the caller's control — the hop-cap
+    /// tests vary it, and their budgets come from the explicit `deadline` they pass to
+    /// [`fetch_witness`]. `witness_urls[0]` doubles as the data endpoint and the generator
+    /// (first witness provider); `generator_first` stays on, matching the deployment shape
+    /// the cap protects.
+    fn cap_fixture(
+        witness_urls: &[&str],
+        config: RpcClientConfig,
+    ) -> (RpcClient, WitnessFetchConfig) {
         let rpc_client =
             RpcClient::new_with_config(&witness_urls[..1], witness_urls, config, None).unwrap();
         let cfg = WitnessFetchConfig {
             local_window: 100,
-            generator_first,
+            generator_first: true,
             ..WitnessFetchConfig::with_defaults(1)
         };
         (rpc_client, cfg)
@@ -1510,6 +1830,45 @@ mod tests {
         )
     }
 
+    /// The admission queue keeps a usable share of the budget under any legal timeout pair.
+    ///
+    /// `--witness-timeout` may legally be set at or above `--block-fetch-timeout` — the witness
+    /// sub-deadline is a `min` against the outer one, so a larger value simply never binds. A
+    /// reserve of the raw witness timeout would then swallow the whole budget and leave a
+    /// permit wait of zero, silently reducing `--admission-max-queue` to a no-op: the server
+    /// would shed hard at exactly `max_concurrent` while the permit-wait histogram read zero,
+    /// pointing an operator at client load rather than at their own timeout setting.
+    #[test]
+    fn permit_reserve_never_swallows_the_whole_budget() {
+        let secs = Duration::from_secs;
+        for (witness, block_fetch, expected_reserve, note) in [
+            (8u64, 13u64, secs(8), "the ordinary case: the witness stage keeps its full budget"),
+            (20, 13, secs(13) / 2, "inverted: capped at half, so the queue keeps the other half"),
+            (13, 13, secs(13) / 2, "equal budgets are the boundary and must stay usable"),
+        ] {
+            let reserve = permit_reserve(secs(witness), secs(block_fetch));
+            assert_eq!(reserve, expected_reserve, "{note}");
+            assert!(
+                reserve < secs(block_fetch),
+                "{note}: a reserve equal to the whole budget would leave a zero-length permit \
+                 wait, silently reducing --admission-max-queue to a no-op"
+            );
+        }
+    }
+
+    /// The provider hands that same reserve to the cutoff a request actually waits against.
+    #[test]
+    fn permit_cutoff_leaves_the_queue_usable() {
+        let provider = provider_with_tiers(
+            "http://127.0.0.1:1",
+            None,
+            None,
+            test_support::noop_contract_cache(),
+        );
+        assert!(provider.max_permit_wait() > Duration::ZERO, "the queue is not a no-op");
+        assert!(provider.permit_cutoff(provider.fetch_deadline()) > Instant::now());
+    }
+
     /// [`provider_with_tiers`] with no memory cache and an empty noop-backed contract
     /// cache.
     fn provider_with(url: &str, db: Option<Arc<dyn BlockStore>>) -> DataProvider {
@@ -1536,8 +1895,14 @@ mod tests {
             contract_cache,
         );
 
-        let first = provider.get_block_data_by_hash(hash).await.expect("db-served fetch");
-        let second = provider.get_block_data_by_hash(hash).await.expect("memory-served fetch");
+        let first = provider
+            .get_block_data_by_hash(hash, provider.fetch_deadline())
+            .await
+            .expect("db-served fetch");
+        let second = provider
+            .get_block_data_by_hash(hash, provider.fetch_deadline())
+            .await
+            .expect("memory-served fetch");
 
         assert_eq!(
             store.block_reads.load(Ordering::Relaxed),
@@ -1568,7 +1933,10 @@ mod tests {
             provider_with_tiers(&test_support::hanging_url(), None, Some(cache), contract_cache);
 
         let start = std::time::Instant::now();
-        let data = provider.get_block_data_by_hash(hash).await.expect("memory hit");
+        let data = provider
+            .get_block_data_by_hash(hash, provider.fetch_deadline())
+            .await
+            .expect("memory hit");
         assert!(
             start.elapsed() < Duration::from_millis(500),
             "memory hit must not reach the hanging upstream"
@@ -1590,8 +1958,14 @@ mod tests {
             contract_cache,
         );
 
-        provider.get_block_data_by_hash(hash).await.expect("first db read");
-        provider.get_block_data_by_hash(hash).await.expect("second db read");
+        provider
+            .get_block_data_by_hash(hash, provider.fetch_deadline())
+            .await
+            .expect("first db read");
+        provider
+            .get_block_data_by_hash(hash, provider.fetch_deadline())
+            .await
+            .expect("second db read");
         assert_eq!(store.block_reads.load(Ordering::Relaxed), 2);
     }
 
@@ -1626,7 +2000,7 @@ mod tests {
     /// self-consistent headers.
     #[tokio::test]
     async fn resolve_canonical_hash_resolves_upstream_without_db_or_on_db_miss() {
-        let (handle, url, _seed_hits) = start_mock_rpc(1_000_000).await;
+        let (handle, url, _hits) = start_mock_rpc(1_000_000).await;
 
         for db in [None, Some(None)] {
             let provider = provider_at(&url, db);
@@ -1650,7 +2024,7 @@ mod tests {
 
         use crate::server_db::test_support::make_block_meta;
 
-        let (handle, url, seed_hits) = start_mock_rpc(200).await;
+        let (handle, url, hits) = start_mock_rpc(200).await;
         let dir = tempfile::tempdir().unwrap();
         let server_db =
             Arc::new(crate::server_db::ServerDB::new(dir.path().join("t.redb")).unwrap());
@@ -1671,7 +2045,7 @@ mod tests {
         );
         assert_eq!(DivergenceLookups::get_earliest(&*server_db).unwrap().unwrap().0, 200);
         assert_eq!(
-            seed_hits.load(Ordering::Relaxed),
+            hits.block_number.load(Ordering::Relaxed),
             0,
             "a present window tip must gate the memo without an upstream tip seed"
         );
@@ -1693,7 +2067,7 @@ mod tests {
     /// upstream.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resolve_canonical_hash_seeds_tip_for_stateless_numeric_traffic() {
-        let (handle, url, seed_hits) = start_mock_rpc(500).await;
+        let (handle, url, hits) = start_mock_rpc(500).await;
         let provider = provider_at(&url, None);
         let deadline = Instant::now() + Duration::from_secs(2);
 
@@ -1701,14 +2075,18 @@ mod tests {
         // tip 500 admits it as depth-final.
         let deep = provider.resolve_canonical_hash(42, deadline).await.unwrap();
         assert_eq!(deep, consistent_header(42).hash);
-        assert_eq!(seed_hits.load(Ordering::Relaxed), 1, "cold hint must seed exactly once");
+        assert_eq!(
+            hits.block_number.load(Ordering::Relaxed),
+            1,
+            "cold hint must seed exactly once"
+        );
 
         // 400 passes on the seeded hint (500 - 64 = 436); 450 fails the gate and its
         // seed attempt lands inside the throttle window. Neither re-fetches the tip.
         let mid = provider.resolve_canonical_hash(400, deadline).await.unwrap();
         let shallow = provider.resolve_canonical_hash(450, deadline).await.unwrap();
         assert_eq!(shallow, consistent_header(450).hash);
-        assert_eq!(seed_hits.load(Ordering::Relaxed), 1, "further seeds must be throttled");
+        assert_eq!(hits.block_number.load(Ordering::Relaxed), 1, "further seeds must be throttled");
 
         // Upstream gone: both depth-final heights serve from the memo; the shallow one
         // was never memoized and must fail upstream.
@@ -1765,18 +2143,22 @@ mod tests {
         let (hb, url_b, hits_b) = scripted_witness_rpc(0, None).await;
         let (rpc_client, cfg) = routing_fixture(&[url_a.as_str(), url_b.as_str()], true);
         let db_tip = Some(5000);
+        let chain_tip = 5000;
 
         // Historical block (900 + 100 <= 5000): the generator endpoint must stay untouched.
         let deadline = Instant::now() + Duration::from_millis(150);
         let result =
-            fetch_witness(&rpc_client, &cfg, None, db_tip, 900, B256::ZERO, deadline).await;
+            fetch_witness(&rpc_client, &cfg, None, db_tip, chain_tip, 900, B256::ZERO, deadline)
+                .await;
         assert!(result.is_err(), "the mock only returns errors, so the deadline must fire");
         assert_eq!(hits_a.load(Ordering::Relaxed), 0, "historical fetch must skip the generator");
         assert!(hits_b.load(Ordering::Relaxed) >= 1, "the fallback endpoint must be tried");
 
         // Recent block (the tip itself): the full chain, generator first.
         let deadline = Instant::now() + Duration::from_millis(150);
-        let _ = fetch_witness(&rpc_client, &cfg, None, db_tip, 5000, B256::ZERO, deadline).await;
+        let _ =
+            fetch_witness(&rpc_client, &cfg, None, db_tip, chain_tip, 5000, B256::ZERO, deadline)
+                .await;
         assert!(hits_a.load(Ordering::Relaxed) >= 1, "recent fetch must probe the generator");
 
         ha.stop().unwrap();
@@ -1795,7 +2177,8 @@ mod tests {
         // Historical block (900 + 100 <= 5000) with no fallback endpoint configured.
         let deadline = Instant::now() + Duration::from_millis(150);
         let result =
-            fetch_witness(&rpc_client, &cfg, None, Some(5000), 900, B256::ZERO, deadline).await;
+            fetch_witness(&rpc_client, &cfg, None, Some(5000), 5000, 900, B256::ZERO, deadline)
+                .await;
         assert!(result.is_err(), "the mock only returns errors, so the deadline must fire");
         assert!(
             hits_a.load(Ordering::Relaxed) >= 1,
@@ -1818,12 +2201,21 @@ mod tests {
         // endpoint stays in the rotation.
         let deadline = Instant::now() + Duration::from_millis(150);
         let result =
-            fetch_witness(&rpc_client, &cfg, None, Some(5000), 900, B256::ZERO, deadline).await;
+            fetch_witness(&rpc_client, &cfg, None, Some(5000), 5000, 900, B256::ZERO, deadline)
+                .await;
         assert!(result.is_err(), "the mock only returns errors, so the deadline must fire");
         assert!(hits_a.load(Ordering::Relaxed) >= 1, "first endpoint must not be skipped");
 
         ha.stop().unwrap();
         hb.stop().unwrap();
+    }
+
+    /// Fixture witness encoded as the RPC wire string (`encode_witness_response`).
+    fn fixture_wire() -> String {
+        let (salt_witness, mpt_witness): (_, MptWitness) =
+            TestFixtures::mainnet_shared().first_paired_witness();
+        stateless_common::encode_witness_response(&salt_witness, &mpt_witness)
+            .expect("fixture witness must encode")
     }
 
     /// Fixture witness encoded as an R2 object body (the uploader's wire format).
@@ -1835,23 +2227,36 @@ mod tests {
             .1
     }
 
-    /// A historical block with R2 configured is served from R2 alone: neither the generator
-    /// nor the fallback RPC endpoint sees a request.
+    /// A block whose witness is in the bucket is served from R2 alone — historical and
+    /// frontier alike — with neither the generator nor the fallback touched. The frontier
+    /// case is why every fetch probes R2: the bucket can lead the generator at the tip
+    /// (see [`fetch_witness`]).
     #[tokio::test]
-    async fn fetch_witness_historical_prefers_r2_over_the_rpc_chain() {
+    async fn fetch_witness_serves_from_r2_for_historical_and_frontier() {
         let (r2_endpoint, r2_hits) = mock_r2(vec![(200, fixture_r2_payload())]).await;
         let (ha, url_a, hits_a) = scripted_witness_rpc(0, None).await;
         let (hb, url_b, hits_b) = scripted_witness_rpc(0, None).await;
         let (rpc_client, cfg) = routing_fixture(&[url_a.as_str(), url_b.as_str()], true);
         let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
 
-        // Historical block (900 + 100 <= 5000).
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let result =
-            fetch_witness(&rpc_client, &cfg, Some(&r2), Some(5000), 900, B256::ZERO, deadline)
-                .await;
-        assert!(result.is_ok(), "R2 must serve the historical witness");
-        assert_eq!(r2_hits.load(Ordering::SeqCst), 1, "exactly one R2 GET");
+        // Historical (900 + 100 <= 5000), then the tip itself — the most frontier a block
+        // gets; `mock_r2` repeats its last scripted response.
+        for block_number in [900, 5000] {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let result = fetch_witness(
+                &rpc_client,
+                &cfg,
+                Some(&r2),
+                Some(5000),
+                5000,
+                block_number,
+                B256::ZERO,
+                deadline,
+            )
+            .await;
+            assert!(result.is_ok(), "R2 must serve block {block_number}: {:?}", result.err());
+        }
+        assert_eq!(r2_hits.load(Ordering::SeqCst), 2, "exactly one R2 GET per fetch");
         assert_eq!(hits_a.load(Ordering::Relaxed), 0, "generator must stay untouched");
         assert_eq!(hits_b.load(Ordering::Relaxed), 0, "RPC fallback must stay untouched");
 
@@ -1870,9 +2275,17 @@ mod tests {
         let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
 
         let deadline = Instant::now() + Duration::from_millis(150);
-        let result =
-            fetch_witness(&rpc_client, &cfg, Some(&r2), Some(5000), 900, B256::ZERO, deadline)
-                .await;
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            Some(&r2),
+            Some(5000),
+            5000,
+            900,
+            B256::ZERO,
+            deadline,
+        )
+        .await;
         assert!(result.is_err(), "the RPC mock only returns errors, so the deadline must fire");
         assert_eq!(r2_hits.load(Ordering::SeqCst), 1, "the R2 miss must not be retried");
         assert_eq!(hits_a.load(Ordering::Relaxed), 0, "the fallback still skips the generator");
@@ -1890,12 +2303,8 @@ mod tests {
     #[tokio::test]
     async fn fetch_witness_hung_r2_leaves_budget_for_the_rpc_fallback() {
         let (r2_endpoint, _r2_peak) = mock_r2_held(200, Duration::from_secs(30)).await;
-        let (salt_witness, mpt_witness): (_, MptWitness) =
-            TestFixtures::mainnet_shared().first_paired_witness();
-        let wire = stateless_common::encode_witness_response(&salt_witness, &mpt_witness)
-            .expect("fixture witness must encode");
         let (ha, url_a, hits_a) = scripted_witness_rpc(0, None).await;
-        let (hb, url_b, hits_b) = scripted_witness_rpc(0, Some(wire)).await;
+        let (hb, url_b, hits_b) = scripted_witness_rpc(0, Some(fixture_wire())).await;
         let (rpc_client, cfg) = routing_fixture(&[url_a.as_str(), url_b.as_str()], true);
         let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
 
@@ -1906,6 +2315,7 @@ mod tests {
             &cfg,
             Some(&r2),
             Some(5000),
+            5000,
             900,
             B256::ZERO,
             started + budget,
@@ -1931,25 +2341,421 @@ mod tests {
         hb.stop().unwrap();
     }
 
-    /// Recent blocks never touch R2 (the bucket lags the generator at the frontier): the
-    /// full RPC chain with the generator first keeps serving them.
+    /// A frontier R2 miss — the expected case, the uploader usually lags the generator —
+    /// falls through to the RPC chain with the generator first: exactly the pre-R2 shape,
+    /// at the cost of one fast 404.
     #[tokio::test]
-    async fn fetch_witness_recent_block_ignores_r2() {
-        let (r2_endpoint, r2_hits) = mock_r2(vec![(200, "never fetched")]).await;
-        let (ha, url_a, hits_a) = scripted_witness_rpc(0, None).await;
-        let (hb, url_b, _hits_b) = scripted_witness_rpc(0, None).await;
+    async fn fetch_witness_frontier_r2_miss_falls_to_the_generator() {
+        let (r2_endpoint, r2_hits) = mock_r2(vec![(404, "<Code>NoSuchKey</Code>")]).await;
+        let (ha, url_a, hits_a) = scripted_witness_rpc(0, Some(fixture_wire())).await;
+        let (hb, url_b, hits_b) = scripted_witness_rpc(0, None).await;
         let (rpc_client, cfg) = routing_fixture(&[url_a.as_str(), url_b.as_str()], true);
         let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
 
-        // The tip itself is recent: R2 must stay untouched, the generator probed first.
-        let deadline = Instant::now() + Duration::from_millis(150);
-        let _ = fetch_witness(&rpc_client, &cfg, Some(&r2), Some(5000), 5000, B256::ZERO, deadline)
-            .await;
-        assert_eq!(r2_hits.load(Ordering::SeqCst), 0, "a recent block must not touch R2");
-        assert!(hits_a.load(Ordering::Relaxed) >= 1, "recent fetch must probe the generator");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            Some(&r2),
+            Some(5000),
+            5000,
+            5000,
+            B256::ZERO,
+            deadline,
+        )
+        .await;
+        assert!(result.is_ok(), "generator must serve after the R2 miss: {:?}", result.err());
+        assert_eq!(r2_hits.load(Ordering::SeqCst), 1, "the frontier probe is a single GET");
+        assert!(hits_a.load(Ordering::Relaxed) >= 1, "the generator follows the R2 miss");
+        assert_eq!(hits_b.load(Ordering::Relaxed), 0, "no gateway when the generator serves");
 
         ha.stop().unwrap();
         hb.stop().unwrap();
+    }
+
+    /// A stalled endpoint must not consume the whole witness stage. Replays the incident
+    /// shape: the generator misses (witness not generated yet), the chain rotates to
+    /// a gateway that accepts TCP and never answers, and the witness appears at the
+    /// generator moments later. The per-hop cap (`witness_per_attempt_timeout`) cuts the
+    /// stalled hop so the loop reaches round 1, where the generator serves inside the
+    /// original deadline. Goes red without the cap: `min(per_attempt = 20s, remaining)`
+    /// resolves to `remaining`, the stalled hop eats the entire budget, and round 1 never
+    /// happens — the caller sees a deadline instead of a witness.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_hop_is_capped_so_the_next_round_can_serve() {
+        // Generator: "not generated yet" once, then serves (the file has been written).
+        let (ha, url_gen, hits_gen) = scripted_witness_rpc(1, Some(fixture_wire())).await;
+        // Gateway: accepts connections and never replies.
+        let url_gw = test_support::hanging_url();
+
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(20), Duration::from_millis(40)),
+            witness_per_attempt_timeout: Some(Duration::from_millis(300)),
+            ..RpcClientConfig::trace_server()
+        };
+        let (rpc_client, cfg) = cap_fixture(&[url_gen.as_str(), url_gw.as_str()], config);
+
+        // Frontier block: above the local tip, so the full chain (generator first) runs.
+        let budget = Duration::from_secs(3);
+        let started = Instant::now();
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            None,
+            Some(5000),
+            5000,
+            5001,
+            B256::ZERO,
+            started + budget,
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_ok(), "round 1 must serve inside the budget: {:?}", result.err());
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "the stalled hop must be waited on up to its cap first ({elapsed:?})"
+        );
+        assert!(elapsed < budget, "the fetch must not ride the deadline ({elapsed:?})");
+        assert!(
+            hits_gen.load(Ordering::Relaxed) >= 2,
+            "the generator must be asked again after the stalled hop was cut"
+        );
+
+        ha.stop().unwrap();
+    }
+
+    /// The hop cap must bind against what the stage actually has left, not the configured
+    /// full stage: an old-block clamp or a slow R2 pre-try can shrink the stage below the
+    /// static cap, and a cap that stops binding exactly there lets one stalled hop consume
+    /// the entire remainder. Here the stage is 1s while the configured cap is 6s — entry
+    /// halving must cut the stalled hop at ~0.5s so round 1 still fits. Goes red if the
+    /// effective cap is only `min(configured, remaining)`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hop_cap_tracks_the_shrunken_stage_budget() {
+        let (ha, url_gen, hits_gen) = scripted_witness_rpc(1, Some(fixture_wire())).await;
+        let url_gw = test_support::hanging_url();
+        // A second fallback behind the stalled gateway: the halving reserve applies only
+        // to hops with an untried provider remaining, so the stall must not sit last.
+        let (hb, url_gw2, _hits_gw2) = scripted_witness_rpc(usize::MAX, None).await;
+
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(20), Duration::from_millis(40)),
+            // Deliberately larger than the whole stage below: only the live-remaining
+            // halving can save this fetch.
+            witness_per_attempt_timeout: Some(Duration::from_secs(6)),
+            ..RpcClientConfig::trace_server()
+        };
+        let (rpc_client, cfg) =
+            cap_fixture(&[url_gen.as_str(), url_gw.as_str(), url_gw2.as_str()], config);
+
+        let budget = Duration::from_secs(1);
+        let started = Instant::now();
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            None,
+            Some(5000),
+            5000,
+            5001,
+            B256::ZERO,
+            started + budget,
+        )
+        .await;
+
+        assert!(result.is_ok(), "round 1 must fit inside the shrunken stage: {:?}", result.err());
+        assert!(started.elapsed() < budget, "must not ride the deadline ({:?})", started.elapsed());
+        assert!(hits_gen.load(Ordering::Relaxed) >= 2, "round 1 must reach the generator");
+
+        ha.stop().unwrap();
+        hb.stop().unwrap();
+    }
+
+    /// The inter-round backoff may not consume everything the stage has left: held to half
+    /// the remainder, round 1 fits and the generator serves. Goes red against
+    /// `sleep.min(remaining)`, where the sleep wakes exactly at the deadline and forfeits
+    /// the retry it slept for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deadline_pressure_shortens_the_backoff_instead_of_sleeping_into_it() {
+        let (ha, url_gen, hits_gen) = scripted_witness_rpc(1, Some(fixture_wire())).await;
+        let url_gw = test_support::hanging_url();
+        // A second fallback behind the stalled gateway keeps the stall mid-round, where
+        // the halving reserve applies (the round's last hop takes the remainder whole).
+        let (hb, url_gw2, _hits_gw2) = scripted_witness_rpc(usize::MAX, None).await;
+
+        let config = RpcClientConfig {
+            // Production-shaped backoff: larger than what round 0 leaves of the stage.
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(600), Duration::from_millis(800)),
+            witness_per_attempt_timeout: Some(Duration::from_secs(6)),
+            ..RpcClientConfig::trace_server()
+        };
+        let (rpc_client, cfg) =
+            cap_fixture(&[url_gen.as_str(), url_gw.as_str(), url_gw2.as_str()], config);
+
+        let budget = Duration::from_millis(800);
+        let started = Instant::now();
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            None,
+            Some(5000),
+            5000,
+            5001,
+            B256::ZERO,
+            started + budget,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "the shortened backoff must leave room for round 1: {:?}",
+            result.err()
+        );
+        assert!(started.elapsed() < budget, "must not ride the deadline ({:?})", started.elapsed());
+        assert!(hits_gen.load(Ordering::Relaxed) >= 2, "round 1 must reach the generator");
+
+        ha.stop().unwrap();
+        hb.stop().unwrap();
+    }
+
+    /// A slow-but-honest single witness endpoint must still succeed: with no rotation to
+    /// reserve for, every hop takes the remainder whole (bounded by the ceiling), so a
+    /// transfer longer than half the stage completes exactly as it did before the hop cap
+    /// existed. Goes red under unconditional halving: the serve time never fits the
+    /// shrinking half-windows and a currently-succeeding fetch becomes a deterministic
+    /// client-visible timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_honest_single_provider_survives_the_reserve() {
+        let (ha, url, hits) =
+            test_support::delayed_witness_rpc(Duration::from_millis(600), fixture_wire()).await;
+
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(20), Duration::from_millis(40)),
+            witness_per_attempt_timeout: Some(Duration::from_secs(6)),
+            ..RpcClientConfig::trace_server()
+        };
+        let (rpc_client, cfg) = cap_fixture(&[url.as_str()], config);
+
+        let budget = Duration::from_secs(1);
+        let started = Instant::now();
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            None,
+            Some(5000),
+            5000,
+            5001,
+            B256::ZERO,
+            started + budget,
+        )
+        .await;
+
+        assert!(result.is_ok(), "a 600ms serve must fit a 1s stage: {:?}", result.err());
+        assert_eq!(hits.load(Ordering::Relaxed), 1, "one attempt, served whole");
+
+        ha.stop().unwrap();
+    }
+
+    /// The round's last hop takes the remainder whole: after the generator misses fast,
+    /// a fallback needing more than half of what is left must still be allowed to finish —
+    /// there is no further rotation to reserve for. Goes red under unconditional halving
+    /// (the serve is cut at the half-window and every retry gets less).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_honest_last_hop_takes_the_remainder() {
+        let (ha, url_gen, _hits_gen) = scripted_witness_rpc(usize::MAX, None).await;
+        let (hb, url_gw, hits_gw) =
+            test_support::delayed_witness_rpc(Duration::from_millis(600), fixture_wire()).await;
+
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(20), Duration::from_millis(40)),
+            witness_per_attempt_timeout: Some(Duration::from_secs(6)),
+            ..RpcClientConfig::trace_server()
+        };
+        let (rpc_client, cfg) = cap_fixture(&[url_gen.as_str(), url_gw.as_str()], config);
+
+        let budget = Duration::from_secs(1);
+        let started = Instant::now();
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            None,
+            Some(5000),
+            5000,
+            5001,
+            B256::ZERO,
+            started + budget,
+        )
+        .await;
+
+        assert!(result.is_ok(), "the last hop must get the whole remainder: {:?}", result.err());
+        assert_eq!(hits_gw.load(Ordering::Relaxed), 1, "served on the first gateway attempt");
+
+        ha.stop().unwrap();
+        hb.stop().unwrap();
+    }
+
+    /// The band follows the chain tip, not how far this process has ingested. During a
+    /// catch-up the two diverge: with the DB at 4000 and the chain head known to be 5000,
+    /// block 4500 is 500 blocks — 500 seconds — below the head, so R2 is its primary source
+    /// and gets the historical half-share of the stage.
+    #[tokio::test]
+    async fn the_band_follows_the_chain_tip_not_the_ingested_tip() {
+        let (r2_endpoint, _r2_hits) = mock_r2_held(200, Duration::from_millis(700)).await;
+        let (ha, url_gen, hits_gen) = scripted_witness_rpc(0, Some(fixture_wire())).await;
+        let (rpc_client, cfg) = routing_fixture(&[url_gen.as_str()], true);
+        let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
+
+        let started = Instant::now();
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            Some(&r2),
+            Some(4000),
+            5000,
+            4500,
+            B256::ZERO,
+            started + Duration::from_secs(2),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_ok(), "the RPC chain must serve after R2: {:?}", result.err());
+        assert!(hits_gen.load(Ordering::Relaxed) >= 1, "the RPC chain must be reached");
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "an overdue block must get the historical half-share ({elapsed:?}); cut this \
+             early means the band read the ingested tip and judged it speculative",
+        );
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "and still be cut at that share rather than waiting out the hung R2 ({elapsed:?})",
+        );
+
+        ha.stop().unwrap();
+    }
+
+    /// And it follows the chain even when only the DB knows where the chain is. `tip_hint`
+    /// is raised by by-number and tag resolutions alone, so a server asked only for block
+    /// hashes and transactions leaves it at `0` for its whole life — which would band every
+    /// block frontier, cut every historical probe to the speculative eighth, and keep real
+    /// bucket holes out of `kind="missing"` indefinitely. The DB tip carries it instead.
+    #[tokio::test]
+    async fn an_unraised_tip_hint_bands_on_the_db_tip_instead() {
+        let (r2_endpoint, _r2_hits) = mock_r2_held(200, Duration::from_millis(700)).await;
+        let (ha, url_gen, _hits_gen) = scripted_witness_rpc(0, Some(fixture_wire())).await;
+        let (rpc_client, cfg) = routing_fixture(&[url_gen.as_str()], true);
+        let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
+
+        let started = Instant::now();
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            Some(&r2),
+            Some(5000),
+            0,
+            4000,
+            B256::ZERO,
+            started + Duration::from_secs(2),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_ok(), "the RPC chain must serve after R2: {:?}", result.err());
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "a block 1000 below the DB tip must get the historical half-share ({elapsed:?}); \
+             cut this early means an unraised tip hint banded it frontier",
+        );
+
+        ha.stop().unwrap();
+    }
+
+    /// The frontier probe runs on the speculative eighth of the stage, not the historical
+    /// half: with R2 held past the frontier slice, the probe is abandoned early and the
+    /// generator serves with most of the stage intact. Goes red with one shared divisor —
+    /// the held probe then burns half the stage before the chain starts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frontier_probe_gets_only_the_speculative_budget_share() {
+        let (r2_endpoint, _r2_hits) = mock_r2_held(200, Duration::from_millis(700)).await;
+        let (ha, url_gen, hits_gen) = scripted_witness_rpc(0, Some(fixture_wire())).await;
+        let (rpc_client, cfg) = routing_fixture(&[url_gen.as_str()], true);
+        let r2 = crate::r2_witness::test_support::source(&r2_endpoint);
+
+        // On a 1s stage a speculative probe's slice is an eighth, where the historical
+        // share would be a half. Both the tip itself and a block above it are speculative:
+        // the uploader may not have reached either.
+        for block_number in [5000, 6000] {
+            let budget = Duration::from_millis(1600);
+            let started = Instant::now();
+            let result = fetch_witness(
+                &rpc_client,
+                &cfg,
+                Some(&r2),
+                Some(5000),
+                5000,
+                block_number,
+                B256::ZERO,
+                started + budget,
+            )
+            .await;
+            let elapsed = started.elapsed();
+
+            assert!(
+                result.is_ok(),
+                "the generator must serve block {block_number} after the probe: {:?}",
+                result.err()
+            );
+            assert!(hits_gen.load(Ordering::Relaxed) >= 1, "the RPC chain must be reached");
+            assert!(
+                elapsed < Duration::from_millis(600),
+                "a speculative probe must be cut at its eighth-share slice, not the \
+                 historical half (block {block_number}: {elapsed:?})"
+            );
+        }
+
+        ha.stop().unwrap();
+    }
+
+    /// An operator's explicit `--rpc-per-attempt-timeout-ms` below the witness cap asked
+    /// for stalled attempts to be cut *sooner*; the witness cap is a ceiling and must not
+    /// quietly loosen it. With a 200ms global per-attempt, the stalled hop is cut at
+    /// ~200ms and the fetch completes far inside the second — not at the witness cap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_per_attempt_timeout_stays_the_tighter_bound() {
+        let (ha, url_gen, hits_gen) = scripted_witness_rpc(1, Some(fixture_wire())).await;
+        let url_gw = test_support::hanging_url();
+
+        let config = RpcClientConfig {
+            rpc_retry: BackoffPolicy::new(Duration::from_millis(20), Duration::from_millis(40)),
+            per_attempt_timeout: Duration::from_millis(200),
+            witness_per_attempt_timeout: Some(Duration::from_secs(10)),
+            ..RpcClientConfig::trace_server()
+        };
+        let (rpc_client, cfg) = cap_fixture(&[url_gen.as_str(), url_gw.as_str()], config);
+
+        let started = Instant::now();
+        let result = fetch_witness(
+            &rpc_client,
+            &cfg,
+            None,
+            Some(5000),
+            5000,
+            5001,
+            B256::ZERO,
+            started + Duration::from_secs(4),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(result.is_ok(), "the fetch must succeed: {:?}", result.err());
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the 200ms global per-attempt must cut the stalled hop, not the witness cap \
+             ({elapsed:?})"
+        );
+        assert!(hits_gen.load(Ordering::Relaxed) >= 2, "round 1 must reach the generator");
+
+        ha.stop().unwrap();
     }
 
     /// Old-block witness budget honors the configurable timeout and clamps to
@@ -1992,8 +2798,8 @@ mod tests {
     /// `test_contract_hash_display`.
     #[test]
     fn error_and_hash_formatting() {
-        let pending = "Pending block not supported";
-        assert!(pending.contains("Pending") && pending.contains("not supported"));
+        let pending = DataProviderError::UnsupportedBlockTag(BlockNumberOrTag::Pending).to_string();
+        assert!(pending.contains("pending") && pending.contains("not supported"));
 
         let hash = B256::ZERO;
         let err = eyre::eyre!("Failed to fetch contract code {}: test error", hash).to_string();
@@ -2016,7 +2822,9 @@ mod tests {
 
         let provider = provider_at(&url, None);
         let start = std::time::Instant::now();
-        let result = provider.get_block_data_by_hash(B256::from([0x42; 32])).await;
+        let result = provider
+            .get_block_data_by_hash(B256::from([0x42; 32]), provider.fetch_deadline())
+            .await;
         let elapsed = start.elapsed();
 
         let err = match result {
@@ -2053,7 +2861,7 @@ mod tests {
             let elapsed = start.elapsed();
 
             let err = match result {
-                Ok(n) => panic!("hanging upstream must surface as an error for {tag:?}, got {n}"),
+                Ok(n) => panic!("hanging upstream must surface as an error for {tag:?}, got {n:?}"),
                 Err(e) => e,
             };
             assert!(
@@ -2065,6 +2873,233 @@ mod tests {
                 "timeout must fire quickly for {tag:?}; elapsed: {elapsed:?}"
             );
         }
+    }
+
+    /// Upstream tags resolve in one `eth_getHeaderByNumber` — no separate
+    /// `eth_blockNumber` — returning that header's hash and feeding the tip hint;
+    /// numeric/`Earliest` stay local and return no binding.
+    #[tokio::test]
+    async fn tag_resolution_binds_hash_in_its_single_round_trip() {
+        let tags = [BlockNumberOrTag::Latest, BlockNumberOrTag::Finalized, BlockNumberOrTag::Safe];
+        let (_handle, url, hits) = start_mock_rpc(200).await;
+        let provider = provider_at(&url, None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        for (i, tag) in tags.into_iter().enumerate() {
+            let resolved = provider.resolve_block_number(tag, deadline).await.unwrap();
+            assert_eq!(resolved, (200, Some(consistent_header(200).hash)), "for {tag:?}");
+            assert_eq!(hits.header_by_number.load(Ordering::Relaxed), i + 1, "one fetch, {tag:?}");
+        }
+        assert_eq!(hits.block_number.load(Ordering::Relaxed), 0, "no separate eth_blockNumber");
+        assert_eq!(provider.tip_hint.load(Ordering::Relaxed), 200, "tags must feed the tip hint");
+
+        let seven = provider.resolve_block_number(BlockNumberOrTag::Number(7), deadline).await;
+        assert_eq!(seven.unwrap(), (7, None));
+        let earliest = provider.resolve_block_number(BlockNumberOrTag::Earliest, deadline).await;
+        assert_eq!(earliest.unwrap(), (0, None));
+        assert_eq!(hits.header_by_number.load(Ordering::Relaxed), tags.len(), "numeric = local");
+    }
+
+    /// Only `finalized`-tag resolutions feed the canonical-hash memo; `latest`/`safe`
+    /// must not. Pinned by stopping the upstream: a numeric resolution at that height
+    /// then serves from the memo or fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_finalized_tag_resolutions_feed_the_memo() {
+        let (handle, url, _hits) = start_mock_rpc(200).await;
+        let unfed = provider_at(&url, None);
+        let fed = provider_at(&url, None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        for tag in [BlockNumberOrTag::Latest, BlockNumberOrTag::Safe] {
+            unfed.resolve_block_number(tag, deadline).await.unwrap();
+        }
+        let bound = fed.resolve_block_number(BlockNumberOrTag::Finalized, deadline).await.unwrap();
+        assert_eq!(bound, (200, Some(consistent_header(200).hash)));
+
+        handle.stop().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(300);
+        assert_eq!(
+            fed.resolve_canonical_hash(200, deadline).await.unwrap(),
+            consistent_header(200).hash,
+            "the finalized binding must serve from the memo with the upstream gone"
+        );
+        let deadline = Instant::now() + Duration::from_millis(300);
+        assert!(
+            unfed.resolve_canonical_hash(200, deadline).await.is_err(),
+            "latest/safe resolutions must not memoize"
+        );
+    }
+
+    /// A supplied `known_number` skips the fetch pipeline's number-discovery header
+    /// fetch; the raw by-hash entry still pays it. The fetch times out at the unserved
+    /// witness/block stages — only the per-method counters matter.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn known_number_skips_header_discovery() {
+        let (_handle, url, hits) = start_mock_rpc(200).await;
+        let provider = provider_with(&url, None);
+        let hash = B256::from([9u8; 32]);
+
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let err = provider
+            .get_block_data(hash, Some(200), deadline)
+            .await
+            .err()
+            .expect("unserved witness/block stages must time out");
+        assert!(matches!(err, DataProviderError::Timeout { .. }), "got: {err:?}");
+        assert_eq!(hits.header_by_hash.load(Ordering::Relaxed), 0, "skips header discovery");
+        assert_eq!(hits.header_by_number.load(Ordering::Relaxed), 0, "skips header-by-number");
+
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let err = provider
+            .get_block_data(hash, None, deadline)
+            .await
+            .err()
+            .expect("unserved witness/block stages must time out");
+        assert!(matches!(err, DataProviderError::Timeout { .. }), "got: {err:?}");
+        assert_eq!(hits.header_by_hash.load(Ordering::Relaxed), 1, "by-hash entry still pays it");
+    }
+
+    /// Structural assertion for the typed drift failure.
+    fn assert_drift_error(err: &DataProviderError, ctx: &str) {
+        assert!(
+            matches!(err, DataProviderError::Internal(_)) &&
+                err.to_string().contains("not the supplied"),
+            "{ctx}: expected the drift error, got: {err:?}"
+        );
+    }
+
+    /// Provider over a [`block_and_witness_rpc`] mock serving the first paired fixture
+    /// block; `serve_witness` picks the witness-source shape (no hash filter vs always
+    /// missing).
+    async fn drift_fixture(
+        serve_witness: bool,
+    ) -> (jsonrpsee::server::ServerHandle, DataProvider, u64, B256) {
+        let (block, _witness, contract_cache) = fixture_block_and_cache();
+        let (number, hash) = (block.header.number, block.header.hash);
+        let wire = serve_witness.then(|| test_support::fixture_wire().2);
+        let (handle, url) = block_and_witness_rpc(block, wire).await;
+        (handle, provider_with_tiers(&url, None, None, contract_cache), number, hash)
+    }
+
+    /// A `known_number` the fetched block's header disagrees with must fail, not serve —
+    /// the mock witness source has no hash filter, so only the cross-check stands in the
+    /// way. Matching pair = success control.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drifted_known_number_fails_instead_of_serving() {
+        let (handle, provider, number, hash) = drift_fixture(true).await;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let data = provider
+            .get_block_data(hash, Some(number), deadline)
+            .await
+            .expect("a consistent (number, hash) pair must serve");
+        assert_eq!(data.block.header.number, number);
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let err = provider
+            .get_block_data(hash, Some(number + 1), deadline)
+            .await
+            .err()
+            .expect("a drifted known_number must fail, not serve");
+        assert_drift_error(&err, "no-hash-filter source");
+        handle.stop().unwrap();
+    }
+
+    /// Against a hash-filtering witness source a drifted pair can only miss until the
+    /// witness deadline; the block arm's cross-check must cancel it — typed drift error
+    /// in block-fetch time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drifted_known_number_cancels_the_doomed_witness_fetch() {
+        let (handle, provider, number, hash) = drift_fixture(false).await;
+
+        let started = Instant::now();
+        let err = provider
+            .get_block_data(hash, Some(number + 1), started + Duration::from_secs(8))
+            .await
+            .err()
+            .expect("a drifted known_number must fail");
+        let elapsed = started.elapsed();
+        assert_drift_error(&err, "hash-filtering source");
+        assert!(elapsed < Duration::from_secs(3), "witness arm not cancelled ({elapsed:?})");
+        handle.stop().unwrap();
+    }
+
+    /// Warm memory/DB hits fail a drifted pair exactly like the cold fetch (the hanging
+    /// upstream proves no network is needed); the matching pair serves on both tiers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drifted_known_number_fails_on_warm_tiers_too() {
+        let (block, witness, contract_cache) = fixture_block_and_cache();
+        let (number, hash) = (block.header.number, block.header.hash);
+
+        let cache = Arc::new(BlockDataCache::new(1024 * 1024 * 1024));
+        cache.insert(
+            hash,
+            Arc::new(BlockData {
+                block: block.clone(),
+                witness: witness.clone().into(),
+                contracts: HashMap::default(),
+            }),
+        );
+        let memory = provider_with_tiers(
+            &test_support::hanging_url(),
+            None,
+            Some(cache),
+            Arc::clone(&contract_cache),
+        );
+        let store =
+            Arc::new(StubBlockStore { block_data: Some((block, witness)), ..Default::default() });
+        let db = provider_with_tiers(
+            &test_support::hanging_url(),
+            Some(store as Arc<dyn BlockStore>),
+            None,
+            contract_cache,
+        );
+
+        for (provider, tier) in [(&memory, "memory"), (&db, "db")] {
+            let deadline = Instant::now() + Duration::from_millis(300);
+            let err = provider
+                .get_block_data(hash, Some(number + 1), deadline)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("drifted pair must fail on the {tier} tier"));
+            assert_drift_error(&err, tier);
+            let deadline = Instant::now() + Duration::from_millis(300);
+            let data =
+                provider.get_block_data(hash, Some(number), deadline).await.unwrap_or_else(|e| {
+                    panic!("the matching pair must serve on the {tier} tier: {e:?}")
+                });
+            assert_eq!(data.block.header.number, number);
+        }
+    }
+
+    /// The DB tier rejects a drifted pair off the stored header before contract
+    /// resolution can burn the deadline upstream: with an empty contract cache and a
+    /// hanging upstream, the typed drift error must land instead of a timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn db_tier_drift_fails_before_contract_resolution() {
+        let BlockData { block, witness, .. } = test_support::fixture_block_data();
+        let witness = witness.light_witness().clone();
+        let (number, hash) = (block.header.number, block.header.hash);
+        let store =
+            Arc::new(StubBlockStore { block_data: Some((block, witness)), ..Default::default() });
+        let provider = provider_with_tiers(
+            &test_support::hanging_url(),
+            Some(store as Arc<dyn BlockStore>),
+            None,
+            test_support::noop_contract_cache(),
+        );
+
+        let started = Instant::now();
+        let err = provider
+            .get_block_data(hash, Some(number + 1), started + Duration::from_secs(2))
+            .await
+            .err()
+            .expect("a drifted pair must fail");
+        assert_drift_error(&err, "db tier with a cold contract cache");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "must fail before contract resolution reaches upstream"
+        );
     }
 
     /// Cancellation of the primary fetch task (e.g. client disconnect) must not leak an
@@ -2097,7 +3132,9 @@ mod tests {
         let block_hash = B256::from([0xAB; 32]);
         let handle = {
             let provider = Arc::clone(&provider);
-            tokio::spawn(async move { provider.get_block_data_by_hash(block_hash).await })
+            tokio::spawn(async move {
+                provider.get_block_data_by_hash(block_hash, provider.fetch_deadline()).await
+            })
         };
 
         // Give the spawned task enough scheduling turns to reach `shared.await` and register
@@ -2154,5 +3191,25 @@ mod tests {
         }
         .into();
         assert!(matches!(block_err, DataProviderError::Timeout { stage: TimeoutStage::Block, .. }));
+    }
+
+    /// A range failure is a wiring bug: it must land on `Internal`, never on the
+    /// `deadline_witness` alarm's `Timeout { Witness }` (rationale at the `From` impl). The
+    /// deadline arm is asserted too — it is the delegation that keeps that alarm working.
+    #[test]
+    fn witness_range_failure_is_internal_not_a_witness_timeout() {
+        let range_err: DataProviderError =
+            WitnessFetchError::NoProviderInRange { skip: 2, configured: 1 }.into();
+        assert!(matches!(range_err, DataProviderError::Internal(_)), "got {range_err:?}");
+
+        let deadline_err: DataProviderError = WitnessFetchError::Deadline(RpcDeadlineExceeded {
+            method: stateless_common::RpcMethod::MegaGetBlockWitness,
+            elapsed: Duration::from_secs(3),
+        })
+        .into();
+        assert!(matches!(
+            deadline_err,
+            DataProviderError::Timeout { stage: TimeoutStage::Witness, .. }
+        ));
     }
 }
