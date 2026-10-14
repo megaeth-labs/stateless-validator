@@ -101,7 +101,7 @@ struct TracingEnv<'a> {
     /// Shared with `replay_block`: the same env, factory, hardfork → limits mapping, and
     /// extra_data (system transactions) the validator executes with.
     exec: BlockExecutionEnv<WitnessExternalEnv>,
-    light_witness_executor: &'a LightWitnessExecutor,
+    witness: &'a LightWitnessExecutor,
 }
 
 impl<'a> TracingEnv<'a> {
@@ -120,19 +120,14 @@ impl<'a> TracingEnv<'a> {
 
         let exec = create_block_execution_env(chain_spec, &block.header.inner, ext_env);
 
-        Ok(Self {
-            header: &block.header.inner,
-            transactions,
-            exec,
-            light_witness_executor: witness,
-        })
+        Ok(Self { header: &block.header.inner, transactions, exec, witness })
     }
 
     fn create_witness_db<'b>(
         &'b self,
         contracts: &'b HashMap<B256, Bytecode>,
     ) -> WitnessDatabase<'b, LightWitnessExecutor> {
-        WitnessDatabase { header: self.header, witness: self.light_witness_executor, contracts }
+        WitnessDatabase { header: self.header, witness: self.witness, contracts }
     }
 }
 
@@ -674,11 +669,11 @@ pub fn trace_transaction(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
     tx_index: usize,
-    light_witness: &LightWitnessExecutor,
+    witness: &LightWitnessExecutor,
     contracts: &HashMap<B256, Bytecode>,
     opts: GethDebugTracingOptions,
 ) -> Result<GethTrace, TraceError> {
-    let env = TracingEnv::new(chain_spec, block, light_witness)?;
+    let env = TracingEnv::new(chain_spec, block, witness)?;
 
     if tx_index >= env.transactions.len() {
         return Err(ValidationError::BlockIncomplete.into());
@@ -800,10 +795,10 @@ pub fn trace_transaction(
 pub fn parity_trace_block(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
-    light_witness: &LightWitnessExecutor,
+    witness: &LightWitnessExecutor,
     contracts: &HashMap<B256, Bytecode>,
 ) -> Result<Vec<LocalizedTransactionTrace>, TraceError> {
-    let env = TracingEnv::new(chain_spec, block, light_witness)?;
+    let env = TracingEnv::new(chain_spec, block, witness)?;
 
     let witness_db = env.create_witness_db(contracts);
     let cache_db = CacheDB::new(&witness_db);
@@ -851,10 +846,10 @@ pub fn parity_trace_transaction(
     chain_spec: &ChainSpec,
     block: &Block<OpTransaction>,
     tx_index: usize,
-    light_witness: &LightWitnessExecutor,
+    witness: &LightWitnessExecutor,
     contracts: &HashMap<B256, Bytecode>,
 ) -> Result<Vec<LocalizedTransactionTrace>, TraceError> {
-    let env = TracingEnv::new(chain_spec, block, light_witness)?;
+    let env = TracingEnv::new(chain_spec, block, witness)?;
 
     if tx_index >= env.transactions.len() {
         return Err(ValidationError::BlockIncomplete.into());
