@@ -157,12 +157,7 @@ impl BlockFetcher for TraceFetcher {
     async fn latest_block_meta(&self) -> Result<BlockMeta> {
         let header =
             self.rpc_client.get_header(BlockId::Number(BlockNumberOrTag::Latest), false).await;
-        Ok(BlockMeta {
-            block_number: header.number,
-            block_hash: header.hash,
-            post_state_root: header.state_root,
-            post_withdrawals_root: header.withdrawals_root.unwrap_or_default(),
-        })
+        Ok(BlockMeta::from_header(&header))
     }
 }
 
@@ -207,12 +202,7 @@ impl BlockProcessor for TraceProcessor {
         &self,
         (block, witness): Self::Input,
     ) -> std::result::Result<TraceProcessedBlock, Self::Error> {
-        let meta = BlockMeta {
-            block_number: block.header.number,
-            block_hash: block.header.hash,
-            post_state_root: block.header.state_root,
-            post_withdrawals_root: block.header.withdrawals_root.unwrap_or_default(),
-        };
+        let meta = BlockMeta::from_header(&block.header);
         Ok(TraceProcessedBlock { block, witness, meta })
     }
 }
@@ -245,7 +235,7 @@ impl PipelineHooks for TraceHooks {
     type Output = TraceProcessedBlock;
 
     fn pre_advance(&self, items: &[TraceProcessedBlock]) -> eyre::Result<()> {
-        let pairs: Vec<_> = items.iter().map(|i| (i.block.clone(), i.witness.clone())).collect();
+        let pairs: Vec<_> = items.iter().map(|i| (&i.block, &i.witness)).collect();
         Ok(self.db.store_block_data(&pairs)?)
     }
 
@@ -295,27 +285,13 @@ mod tests {
     };
 
     use alloy_primitives::B256;
-    use stateless_common::{BackoffPolicy, RpcClientConfig, RpcMetrics, witness_encoding};
-    use stateless_core::withdrawals::MptWitness;
-    use stateless_test_utils::fixtures::TestFixtures;
+    use stateless_common::{BackoffPolicy, RpcClientConfig, RpcMetrics};
 
     use super::*;
     use crate::{
-        data_provider::test_support::{scripted_witness_rpc, start_mock_rpc},
+        data_provider::test_support::{fixture_wire, scripted_witness_rpc, start_mock_rpc},
         server_db::test_support::{StubBlockStore, make_block_meta},
     };
-
-    /// A real `(number, hash, wire response, expected light witness)` from the synthetic
-    /// fixtures, encoded with the production wire format.
-    fn fixture_wire() -> (u64, BlockHash, String, LightWitness) {
-        let fixtures = TestFixtures::synthetic();
-        let (number, hash) = fixtures.paired_blocks().into_iter().next().expect("paired fixture");
-        let salt = &fixtures.salt_witnesses[&hash];
-        let mpt: MptWitness = fixtures.mpt_witness(&hash);
-        let wire =
-            witness_encoding::encode_witness_response(salt, &mpt).expect("encode fixture witness");
-        (number, hash, wire, LightWitness::from(salt))
-    }
 
     /// Fetcher over the given witness endpoints with millisecond retry backoff, a dummy
     /// RPC endpoint, and the given routing switch, generator grace, and RPC metrics.

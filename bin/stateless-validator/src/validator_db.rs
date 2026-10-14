@@ -58,18 +58,6 @@ impl ValidatorDB {
 
         Ok(Self { database, max_chain_length })
     }
-
-    #[cfg(test)]
-    fn set_anchor_block(&self, tip: &BlockMeta) -> StoreResult<()> {
-        use stateless_db::block_meta_to_tuple;
-        let write_txn = self.database.begin_write().store_err()?;
-        {
-            let mut table = write_txn.open_table(ANCHOR_BLOCK).store_err()?;
-            table.insert("anchor", block_meta_to_tuple(tip)).store_err()?;
-        }
-        write_txn.commit().store_err()?;
-        Ok(())
-    }
 }
 
 impl ContractStore for ValidatorDB {
@@ -158,20 +146,12 @@ mod tests {
     use stateless_db::ContractCache;
 
     use super::*;
+    use crate::test_support::make_block_meta;
 
     fn temp_store() -> (tempfile::TempDir, ValidatorDB) {
         let dir = tempfile::tempdir().unwrap();
         let store = ValidatorDB::new(dir.path().join("test.redb")).unwrap();
         (dir, store)
-    }
-
-    fn make_block_meta(number: u64) -> BlockMeta {
-        BlockMeta {
-            block_number: number,
-            block_hash: BlockHash::from([number as u8; 32]),
-            post_state_root: B256::from([(number + 100) as u8; 32]),
-            post_withdrawals_root: B256::from([(number + 200) as u8; 32]),
-        }
     }
 
     #[test]
@@ -186,7 +166,7 @@ mod tests {
             post_state_root: B256::from([2u8; 32]),
             post_withdrawals_root: B256::from([3u8; 32]),
         };
-        store.set_anchor_block(&tip).unwrap();
+        store.reset_to_anchor(&tip).unwrap();
 
         let loaded = ChainStore::get_anchor(&store).unwrap().unwrap();
         assert_eq!(loaded, tip);
@@ -220,12 +200,14 @@ mod tests {
     fn test_contracts_roundtrip() {
         let (_dir, store) = temp_store();
 
-        let hash1 = B256::from([1u8; 32]);
-        let hash2 = B256::from([2u8; 32]);
-        let hash3 = B256::from([3u8; 32]);
-
         let bytecode1 = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
         let bytecode2 = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x01]));
+
+        // The read path re-checks that stored bytecode hashes back to its key, so
+        // stored entries must be keyed by their real code hashes.
+        let hash1 = bytecode1.hash_slow();
+        let hash2 = bytecode2.hash_slow();
+        let hash3 = B256::from([3u8; 32]);
 
         store.add_contracts(&[(hash1, bytecode1.clone()), (hash2, bytecode2.clone())]).unwrap();
 
@@ -276,8 +258,8 @@ mod tests {
         let (_dir, store) = temp_store();
         let cache = ContractCache::new(Arc::new(store));
 
-        let hash = B256::from([1u8; 32]);
         let bytecode = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
+        let hash = bytecode.hash_slow();
 
         cache.insert(&[(hash, bytecode.clone())]).unwrap();
 
@@ -292,8 +274,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.redb");
 
-        let hash = B256::from([1u8; 32]);
         let bytecode = Bytecode::new_raw(alloy_primitives::Bytes::from_static(&[0x60, 0x00]));
+        // The disk tier re-checks that stored bytecode hashes back to its key, so the
+        // stored entry must be keyed by its real code hash.
+        let hash = bytecode.hash_slow();
 
         {
             let store = ValidatorDB::new(&db_path).unwrap();
