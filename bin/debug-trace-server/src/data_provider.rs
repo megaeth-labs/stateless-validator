@@ -124,10 +124,8 @@ fn permit_reserve(witness_timeout: Duration, block_fetch_timeout: Duration) -> D
 pub struct BlockData {
     /// The block with full transaction data.
     pub block: Block<Transaction>,
-    /// The witness wrapped in its execution form. Built once per block here, so every
-    /// trace request served from this `BlockData` shares one witness and one
-    /// direct-lookup table instead of deep-cloning the maps and rebuilding the table
-    /// per request.
+    /// The witness in execution form (light witness plus direct-lookup table), built once
+    /// per block and shared by every trace request.
     pub witness: LightWitnessExecutor,
     /// Contract bytecodes keyed by code hash, required for EVM execution.
     /// `Bytecode` is internally reference-counted, so values share their underlying allocation
@@ -1536,15 +1534,23 @@ pub(crate) mod test_support {
         Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>))
     }
 
-    /// Builds a real [`BlockData`] (block, light witness, full fixture contract map) from
-    /// the shared synthetic fixture set.
-    pub(crate) fn fixture_block_data() -> BlockData {
+    /// The `(block, light witness, full fixture contract map)` triple behind
+    /// [`fixture_block_data`], before the witness is wrapped in its execution form — for
+    /// callers that need the plain `LightWitness` (e.g. the stub block store).
+    pub(crate) fn fixture_parts() -> (Block<Transaction>, LightWitness, HashMap<B256, Bytecode>) {
         let fixtures = TestFixtures::synthetic_shared();
         let (_, hash) = fixtures.paired_blocks().into_iter().next().expect("paired fixture");
         let block = fixtures.blocks[&hash].clone();
         let witness = LightWitness::from(&fixtures.salt_witnesses[&hash]);
         let contracts: HashMap<B256, Bytecode> =
             fixtures.contracts.iter().map(|(h, code)| (*h, code.clone())).collect();
+        (block, witness, contracts)
+    }
+
+    /// Builds a real [`BlockData`] (block, witness in execution form, full fixture contract
+    /// map) from the shared synthetic fixture set.
+    pub(crate) fn fixture_block_data() -> BlockData {
+        let (block, witness, contracts) = fixture_parts();
         BlockData { block, witness: LightWitnessExecutor::from(witness), contracts }
     }
 
@@ -1786,8 +1792,7 @@ mod tests {
     /// Builds a fixture `(block, witness)` pair plus a contract cache pre-loaded with every
     /// code hash the witness references, so DB-served fetches never fall through to RPC.
     fn fixture_block_and_cache() -> (Block<Transaction>, LightWitness, Arc<ContractCache>) {
-        let BlockData { block, witness, contracts } = test_support::fixture_block_data();
-        let witness = witness.light_witness().clone();
+        let (block, witness, contracts) = test_support::fixture_parts();
         let contract_cache = test_support::noop_contract_cache();
         let codes: Vec<(B256, Bytecode)> = crate::tracing_executor::extract_code_hashes(&witness)
             .into_iter()
@@ -3077,8 +3082,7 @@ mod tests {
     /// hanging upstream, the typed drift error must land instead of a timeout.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn db_tier_drift_fails_before_contract_resolution() {
-        let BlockData { block, witness, .. } = test_support::fixture_block_data();
-        let witness = witness.light_witness().clone();
+        let (block, witness, _) = test_support::fixture_parts();
         let (number, hash) = (block.header.number, block.header.hash);
         let store =
             Arc::new(StubBlockStore { block_data: Some((block, witness)), ..Default::default() });
