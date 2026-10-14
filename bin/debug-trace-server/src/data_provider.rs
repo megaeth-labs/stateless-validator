@@ -1080,6 +1080,8 @@ fn shared_to_result(
 ///    (see `witness_deadline_for`).
 /// 2. The witness arrives as a `LightWitness` already (zero-validation light decode).
 /// 3. Extract code hashes from witness and fetch contract bytecodes (shares `deadline`).
+/// 4. Wrap the witness in its execution form ([`LightWitnessExecutor`], whose direct-lookup table
+///    is built here once) and assemble the [`BlockData`] shared by every request for this block.
 // One call site, and `.shared()` requires owned handles (see above) — a params struct would add
 // a type to keep in sync without encapsulating anything.
 #[allow(clippy::too_many_arguments)]
