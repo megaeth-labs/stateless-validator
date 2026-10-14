@@ -33,6 +33,7 @@ use alloy_rpc_types_trace::{
         FourByteFrame, GethDebugBuiltInTracerType, GethDebugTracerConfig, GethDebugTracerType,
         GethDebugTracingOptions, GethTrace, NoopFrame, TraceResult,
         call::{CallConfig, FlatCallConfig},
+        mux::MuxConfig,
         pre_state::{AccountState, PreStateConfig, PreStateFrame},
     },
     parity::LocalizedTransactionTrace,
@@ -247,6 +248,10 @@ fn builtin_tracer_kind(
         }
     }
 }
+
+/// A JS tracer with no `step`/`enter`/`exit` hooks: [`JsInspector`] skips every opcode and
+/// call callback for it, so executing the preceding transactions under it never re-enters Boa.
+const REPLAY_ONLY_JS_TRACER: &str = "{result: function() { return null; }, fault: function() {}}";
 
 /// Builds a [`JsInspector`] for one transaction context (request-attributable on failure).
 fn js_inspector(
@@ -731,13 +736,16 @@ pub fn trace_transaction(
 
                 GethDebugBuiltInTracerType::MuxTracer => {
                     let inspector = mux_inspector(tracer_config)?;
-                    let template = inspector.clone();
 
+                    // Preceding transactions only rebuild state: an empty mux inspector
+                    // records nothing for them.
+                    let replay_inspector = MuxInspector::try_from_config(MuxConfig::default())
+                        .map_err(|e| request_error("empty muxTracer inspector", e))?;
                     let mut executor =
-                        env.exec.start_executor_with_inspector(&mut state, inspector)?;
+                        env.exec.start_executor_with_inspector(&mut state, replay_inspector)?;
                     replay_preceding_txs(&mut executor, &env, tx_index)?;
 
-                    *executor.inspector_mut() = template;
+                    *executor.inspector_mut() = inspector;
 
                     let outcome = executor
                         .run_transaction(recovered_target)
@@ -757,14 +765,22 @@ pub fn trace_transaction(
 
             GethDebugTracerType::JsTracer(code) => {
                 let config_json = tracer_config.clone().into_json();
-                let inspector =
-                    js_inspector(code.clone(), config_json.clone(), make_tx_ctx(&info))?;
+                // Built before the replay, so an invalid tracer fails fast instead of after
+                // every preceding transaction has been executed.
+                let inspector = js_inspector(code.clone(), config_json, make_tx_ctx(&info))?;
 
-                let mut executor = env.exec.start_executor_with_inspector(&mut state, inspector)?;
+                // Preceding transactions only rebuild state: a hook-less tracer never
+                // re-enters Boa for them, so the user's JS runs only for the target.
+                let replay_inspector = js_inspector(
+                    REPLAY_ONLY_JS_TRACER.to_string(),
+                    serde_json::Value::Null,
+                    make_tx_ctx(&info),
+                )?;
+                let mut executor =
+                    env.exec.start_executor_with_inspector(&mut state, replay_inspector)?;
                 replay_preceding_txs(&mut executor, &env, tx_index)?;
 
-                *executor.inspector_mut() =
-                    js_inspector(code.clone(), config_json, make_tx_ctx(&info))?;
+                *executor.inspector_mut() = inspector;
 
                 let outcome = executor
                     .run_transaction(recovered_target)
@@ -1070,6 +1086,25 @@ mod tests {
             builtin(GethDebugBuiltInTracerType::CallTracer),
             builtin(GethDebugBuiltInTracerType::PreStateTracer),
             builtin(GethDebugBuiltInTracerType::FlatCallTracer),
+            // Counts opcode steps: a step the replay seed leaked into the target's tracer
+            // would show up as a different count per transaction.
+            GethDebugTracingOptions {
+                tracer: Some(GethDebugTracerType::JsTracer(
+                    "{count: 0, step: function() { this.count++; }, \
+                      fault: function() {}, result: function() { return this.count; }}"
+                        .to_string(),
+                )),
+                ..Default::default()
+            },
+            GethDebugTracingOptions {
+                tracer: Some(GethDebugTracerType::BuiltInTracer(
+                    GethDebugBuiltInTracerType::MuxTracer,
+                )),
+                tracer_config: GethDebugTracerConfig(
+                    serde_json::json!({"callTracer": {}, "4byteTracer": null}),
+                ),
+                ..Default::default()
+            },
         ];
 
         let mut compared = 0usize;
@@ -1096,9 +1131,11 @@ mod tests {
                         opts.clone(),
                     )
                     .unwrap_or_else(|e| panic!("block {number} tx {index}: {e:?}"));
+                    // As JSON values: a mux frame is a hash map, so its key order differs
+                    // between two serializations of the same frame.
                     assert_eq!(
-                        serde_json::to_string(&single).unwrap(),
-                        serde_json::to_string(result).unwrap(),
+                        serde_json::to_value(&single).unwrap(),
+                        serde_json::to_value(result).unwrap(),
                         "block {number} tx {index}: tracer {:?}",
                         opts.tracer
                     );
@@ -1134,6 +1171,63 @@ mod tests {
         // Vacuity guard: the comparison must reach transactions that have predecessors.
         assert!(multi_tx_blocks > 0, "no fixture block carries more than one transaction");
         assert!(compared > 0, "nothing was compared");
+    }
+
+    /// The user's JS tracer is built before the preceding transactions are replayed, so an
+    /// invalid tracer on a late transaction fails as a request error up front instead of
+    /// after executing every predecessor. Withholding all bytecode makes that replay fail
+    /// as a data error, which tells the two orderings apart.
+    #[test]
+    fn invalid_js_tracer_is_rejected_before_the_preceding_replay() {
+        use stateless_test_utils::fixtures::TestFixtures;
+
+        let fixtures = TestFixtures::synthetic_shared();
+        let chain_spec = ChainSpec::from_genesis(fixtures.load_genesis().expect("genesis"));
+        let no_contracts = HashMap::default();
+        let js = |code: &str| GethDebugTracingOptions {
+            tracer: Some(GethDebugTracerType::JsTracer(code.to_string())),
+            ..Default::default()
+        };
+        let valid = js("{result: function() { return null; }, fault: function() {}}");
+        let invalid = js("this is not a tracer");
+
+        let mut exercised = 0usize;
+        for (number, hash) in fixtures.paired_blocks() {
+            let block = &fixtures.blocks[&hash];
+            let witness = LightWitness::from(&fixtures.salt_witnesses[&hash]);
+            let trace = |index: usize, opts: &GethDebugTracingOptions| {
+                trace_transaction(
+                    &chain_spec,
+                    block,
+                    index,
+                    witness.clone(),
+                    &no_contracts,
+                    opts.clone(),
+                )
+            };
+
+            // The first transaction that cannot execute without its bytecode; any later
+            // transaction therefore fails while replaying its predecessors.
+            let Some(failing) = (0..block.transactions.len())
+                .find(|&i| matches!(trace(i, &valid), Err(TraceError::Data(_))))
+            else {
+                continue;
+            };
+            let late = failing + 1;
+            if late >= block.transactions.len() {
+                continue;
+            }
+
+            let err = trace(late, &valid).expect_err("replaying the failing predecessor fails");
+            assert!(matches!(err, TraceError::Data(_)), "block {number}: got {err:?}");
+            let err = trace(late, &invalid).expect_err("an invalid tracer must be rejected");
+            assert!(
+                matches!(err, TraceError::Request(_)),
+                "block {number}: the tracer must be rejected before the replay, got {err:?}"
+            );
+            exercised += 1;
+        }
+        assert!(exercised > 0, "no fixture block has a transaction after the first failing one");
     }
 
     /// Defense in depth behind the RPC boundary gate: a type-malformed `tracerConfig` on
