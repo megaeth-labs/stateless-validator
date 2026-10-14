@@ -1,9 +1,34 @@
 //! RPC metrics types shared by both binaries.
 //!
-//! Provides [`RpcMethod`] for identifying RPC calls and [`RpcMetrics`] as a
-//! callback trait for tracking RPC performance.
+//! Provides [`RpcMethod`] for identifying RPC calls, [`RpcMetrics`] as a
+//! callback trait for tracking RPC performance, and — behind the
+//! `prometheus-exporter` feature — the shared exporter installer
+//! (`install_prometheus_exporter`).
 
 use crate::witness_size::WitnessSizeBreakdown;
+
+/// Installs the Prometheus exporter with an HTTP listener on `addr`, applying the given
+/// per-metric histogram buckets (`(metric_name, buckets)` pairs) before install.
+///
+/// Shared by both binaries; each keeps its own metric names, descriptions, and
+/// pre-registration after this returns.
+#[cfg(feature = "prometheus-exporter")]
+pub fn install_prometheus_exporter(
+    addr: std::net::SocketAddr,
+    bucket_specs: &[(&str, &[f64])],
+) -> eyre::Result<()> {
+    use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
+
+    let builder = bucket_specs.iter().fold(PrometheusBuilder::new(), |b, &(name, buckets)| {
+        b.set_buckets_for_metric(Matcher::Full(name.to_owned()), buckets)
+            .expect("valid bucket config")
+    });
+
+    builder
+        .with_http_listener(addr)
+        .install()
+        .map_err(|e| eyre::eyre!("Failed to install Prometheus exporter: {e}"))
+}
 
 /// Byte-size histogram buckets: 1 KB, 10 KB, 50 KB, 200 KB, 1 MB, 5 MB, 20 MB.
 pub const BYTE_BUCKETS: &[f64] =
@@ -57,7 +82,12 @@ impl RpcMethod {
 /// every non-success into one opaque error count. `Error` and `Timeout` are
 /// both retriable failures; the split lets operators tell a provider that
 /// answered with an error from one that stalled and had to be timed out.
+///
+/// `#[non_exhaustive]`: new outcomes appear as the retry loop learns to classify more
+/// failure modes ([`Self::DeadlineClamped`] arrived exactly that way), and a downstream
+/// exhaustive `match` must not turn the next one into a breaking change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RpcAttemptOutcome {
     /// The provider returned a usable response.
     Success,
@@ -66,6 +96,12 @@ pub enum RpcAttemptOutcome {
     /// The attempt hit the per-attempt timeout: the provider accepted the
     /// request but did not answer within the budget (a stall).
     Timeout,
+    /// The attempt was abandoned because the *logical call's* deadline elapsed while it
+    /// was still running. Separate from [`Self::Timeout`]: the attempt window was clamped
+    /// to the remaining budget, so the provider never got a fair round trip — but the
+    /// attempt did consume that budget, and dropping it would make a provider that
+    /// swallows the entire remaining budget indistinguishable from one never called.
+    DeadlineClamped,
 }
 
 impl RpcAttemptOutcome {
@@ -73,6 +109,7 @@ impl RpcAttemptOutcome {
     pub fn as_str(&self) -> &'static str {
         match self {
             RpcAttemptOutcome::Success => "success",
+            RpcAttemptOutcome::DeadlineClamped => "deadline_clamped",
             RpcAttemptOutcome::Error => "error",
             RpcAttemptOutcome::Timeout => "timeout",
         }
@@ -110,6 +147,15 @@ pub trait RpcMetrics: Send + Sync {
     /// Default: no-op. Implement to track retry volume separately from logical errors.
     fn on_rpc_retry(&self, _method: RpcMethod) {}
 
+    /// Called once per permit-queue wait: before each attempt starts, and for a wait the
+    /// caller's deadline cut short (which therefore yielded no attempt).
+    ///
+    /// Separates "the endpoint was slow" from "we were queued behind our own concurrency
+    /// cap" — two causes with opposite fixes that are otherwise indistinguishable, because
+    /// the permit wait sits inside the caller's deadline and emits no signal of its own.
+    /// Default: no-op.
+    fn on_rpc_permit_wait(&self, _method: RpcMethod, _wait_secs: f64) {}
+
     /// Called when a logical call gives up because its overall deadline elapsed.
     ///
     /// Distinct from a per-attempt [`RpcAttemptOutcome::Timeout`]: this counts
@@ -140,8 +186,10 @@ mod tests {
         assert_eq!(RpcAttemptOutcome::Success.as_str(), "success");
         assert_eq!(RpcAttemptOutcome::Error.as_str(), "error");
         assert_eq!(RpcAttemptOutcome::Timeout.as_str(), "timeout");
+        assert_eq!(RpcAttemptOutcome::DeadlineClamped.as_str(), "deadline_clamped");
         assert!(RpcAttemptOutcome::Success.is_success());
         assert!(!RpcAttemptOutcome::Error.is_success());
         assert!(!RpcAttemptOutcome::Timeout.is_success());
+        assert!(!RpcAttemptOutcome::DeadlineClamped.is_success());
     }
 }

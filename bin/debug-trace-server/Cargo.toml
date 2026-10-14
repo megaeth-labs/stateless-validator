@@ -20,7 +20,7 @@ alloy-rpc-types-trace.workspace = true
 mega-evm.workspace = true
 
 # op
-alloy-op-evm.workspace = true
+op-alloy-consensus.workspace = true
 op-alloy-network.workspace = true
 op-alloy-rpc-types.workspace = true
 
@@ -29,7 +29,7 @@ revm.workspace = true
 revm-inspectors.workspace = true
 
 # stateless
-stateless-common = { path = "../../crates/stateless-common" }
+stateless-common = { path = "../../crates/stateless-common", features = ["prometheus-exporter"] }
 stateless-core = { path = "../../crates/stateless-core" }
 stateless-db = { path = "../../crates/stateless-db" }
 stateless-r2 = { path = "../../crates/stateless-r2" }
@@ -46,7 +46,6 @@ jsonrpsee.workspace = true
 libc.workspace = true
 metrics.workspace = true
 metrics-derive.workspace = true
-metrics-exporter-prometheus.workspace = true
 pin-project-lite.workspace = true
 quick_cache.workspace = true
 rayon.workspace = true
@@ -54,7 +53,7 @@ redb.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "sync"] }
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tokio-util.workspace = true
 tower.workspace = true
 tower-http.workspace = true
@@ -69,6 +68,7 @@ alloy-signer-local.workspace = true
 dotenvy.workspace = true
 flate2.workspace = true
 http-body-util.workspace = true
+metrics-util.workspace = true
 
 # HTTP client for integration tests
 reqwest = { workspace = true, features = ["blocking", "json"] }
@@ -77,4 +77,4 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 zstd.workspace = true
 
 # stateless
-stateless-test-utils = { path = "../../crates/stateless-test-utils" }
+stateless-test-utils = { path = "../../crates/stateless-test-utils", features = ["mock-rpc"] }

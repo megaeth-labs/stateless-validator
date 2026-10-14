@@ -3,10 +3,10 @@
 //! # Overview
 //! A standalone RPC server for `debug_*` and `trace_*` methods using stateless execution.
 //! Data can be fetched from upstream RPC endpoints or from a local database with chain sync.
-//! Request-serving witness fetches route by block age: historical blocks skip the internal
-//! generator endpoint (which only retains a small recent window) and go straight to the
-//! fallback endpoints — or, with the `--r2-*` flags, straight to the R2 bucket with the RPC
-//! chain as fallback. Chain-sync prefetch always uses the full chain.
+//! With the `--r2-*` flags every request-serving witness fetch tries the R2 bucket first,
+//! falling back to the RPC chain; the chain itself routes by block age — historical blocks
+//! skip the internal generator endpoint (which only retains a small recent window) and go
+//! straight to the fallback endpoints. Chain-sync prefetch always uses the full chain.
 //!
 //! # Architecture
 //! ```text
@@ -45,6 +45,7 @@
 //! - **Local cache mode**: With `data_dir`, enables chain sync to pre-fetch blocks into local DB
 
 use std::{
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -55,7 +56,10 @@ use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::Result;
 use jsonrpsee::server::{Server, ServerConfig, middleware::rpc::RpcServiceBuilder};
-use stateless_common::{RedactedSecret, RpcClient, RpcClientConfig, logging::LogArgs};
+use stateless_common::{
+    R2Config, R2CountFlag, R2Flag, R2Flags, R2TuningFlag, R2WitnessTransport, RedactedSecret,
+    RpcClient, RpcClientConfig, logging::LogArgs, validate_r2_flags,
+};
 use stateless_core::{
     BisectResolver, ChainStore, ContractStore, DivergenceLookups, PipelineConfig,
     chain_spec::ChainSpec, db::BlockMeta, pipeline::run_pipeline,
@@ -65,6 +69,8 @@ use tokio::task;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
+mod admin;
+mod admission;
 mod block_data_cache;
 mod body_metrics;
 mod chain_sync;
@@ -82,6 +88,7 @@ mod server_db;
 mod timing;
 mod tracing_executor;
 
+use admission::AdmissionLimiter;
 use block_data_cache::{
     BLOCK_DATA_CACHE_SHARDS, BlockDataCache, DEFAULT_BLOCK_DATA_CACHE_MAX_BYTES,
 };
@@ -95,7 +102,13 @@ use crate::chain_sync::{TraceFetcher, TraceHooks, TraceProcessor};
 
 /// Command line arguments for the debug-trace-server.
 #[derive(Parser, Debug)]
-#[clap(name = "debug-trace-server", about = "Debug/Trace RPC Server")]
+#[clap(name = "debug-trace-server", version, about = "Debug/Trace RPC Server")]
+// Every `--r2-*` coherence rule is enforced after parsing, by
+// `stateless_common::validate_r2_flags`, rather than through clap attributes: this workspace
+// builds clap without its `error-context` feature (root `Cargo.toml`), so every clap rejection
+// is generic and names no argument — useless to an operator debugging an env file. A blank env
+// line also reads as *presence* to clap, so leaving exclusion to it would report a phantom
+// conflict where the real fault is an empty value.
 struct Args {
     /// RPC server listen address.
     #[clap(long, env = "DEBUG_TRACE_SERVER_ADDR", default_value = "0.0.0.0:8545")]
@@ -158,7 +171,9 @@ struct Args {
     #[clap(long, env = "DEBUG_TRACE_SERVER_START_BLOCK")]
     start_block: Option<String>,
 
-    /// Witness fetch timeout in seconds.
+    /// Witness fetch timeout in seconds. No single witness-chain attempt may run longer
+    /// than half of what the stage has left when the chain starts, so one stalled endpoint
+    /// can never consume the whole stage and starve the retry rotation.
     #[clap(
         long,
         env = "DEBUG_TRACE_SERVER_WITNESS_TIMEOUT",
@@ -206,6 +221,102 @@ struct Args {
         value_parser = clap::value_parser!(u32).range(1..),
     )]
     batch_item_concurrency: u32,
+
+    /// Requests that may be fetching and replaying a block at once.
+    ///
+    /// This is the process's real work budget: every other concurrency knob here caps what
+    /// we ask of someone else. Sizing is not a core count — only about 2% of a trace
+    /// request is CPU, the rest is waiting on the upstream node and R2 — so derive it from
+    /// measured service time instead: `throughput x mean_handler_seconds`. The default sits
+    /// just above the highest occupancy this server has been measured serving cleanly, so it
+    /// bounds a previously unbounded process without throttling a known-good workload.
+    ///
+    /// A response-cache hit never takes one of these.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_ADMISSION_MAX_CONCURRENT",
+        default_value_t = DEFAULT_ADMISSION_MAX_CONCURRENT,
+        value_parser = clap::value_parser!(u64).range(1..),
+    )]
+    admission_max_concurrent: u64,
+
+    /// Requests that may wait for an execution permit on top of those holding one.
+    ///
+    /// A latency knob, not a memory one: queue depth divided by the service rate is how long
+    /// a request waits, so `queue = rate x acceptable_wait`. At 1000 blocks/s a 1000-deep
+    /// queue is one second of waiting. `0` means execute-or-shed with no waiting at all.
+    /// Beyond `max_concurrent + max_queue` admitted requests, arrivals are refused
+    /// immediately with `-32013` rather than queued indefinitely.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_ADMISSION_MAX_QUEUE",
+        default_value_t = DEFAULT_ADMISSION_MAX_QUEUE,
+    )]
+    admission_max_queue: u64,
+
+    /// Requests running a memory-hungry tracer that may execute at once, on top of needing
+    /// an ordinary execution permit.
+    ///
+    /// `prestateTracer`, JS tracers, `muxTracer` and struct-logger requests with non-default
+    /// flags can each produce hundreds of megabytes from one large block — a single such
+    /// response has been measured at over 900 MB. This sub-cap, multiplied by
+    /// `--max-response-size`, is what makes the process's worst-case resident set a number
+    /// an operator can compute; size it from available memory, not from throughput.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_ADMISSION_HEAVY_MAX_CONCURRENT",
+        default_value_t = DEFAULT_ADMISSION_HEAVY_MAX_CONCURRENT,
+        value_parser = clap::value_parser!(u64).range(1..),
+    )]
+    admission_heavy_max_concurrent: u64,
+
+    /// Disables inbound admission control entirely (kill switch).
+    ///
+    /// Restores the pre-gate behaviour: every request executes immediately and the process
+    /// accepts unbounded concurrent work.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_ADMISSION_DISABLED")]
+    admission_disabled: bool,
+
+    /// Maximum serialized size of a single RPC response body.
+    ///
+    /// Checked where this server serializes the reply, so an over-limit body is discarded
+    /// before it can be copied again into the JSON-RPC envelope and, for a batch, retained
+    /// there until every entry finishes — that accumulation, not any single response, is what
+    /// has previously exhausted memory on this server. Over-limit responses are answered with
+    /// an error and counted on `debug_trace_response_oversized_total`.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_MAX_RESPONSE_SIZE",
+        default_value = "256MB",
+        value_parser = parse_size,
+    )]
+    max_response_size: u64,
+
+    /// Maximum assembled size of one JSON-RPC batch response.
+    ///
+    /// A different bound from `--max-response-size`, because it bounds a different thing: the
+    /// batch builder retains every completed entry's body until the whole batch finishes, so a
+    /// batch's memory is the *sum* of its entries, not the largest of them. Left unbounded
+    /// this is the dominant term — entries are capped individually while their accumulation is
+    /// not, and a batch's entry count is limited only by the request body size. A batch that
+    /// exceeds this is answered with a single oversized-response error.
+    #[clap(
+        long,
+        env = "DEBUG_TRACE_SERVER_MAX_BATCH_RESPONSE_SIZE",
+        default_value = "1GB",
+        value_parser = parse_size,
+    )]
+    max_batch_response_size: u64,
+
+    /// Address of the loopback-only admin RPC listener (e.g. `127.0.0.1:8546`).
+    ///
+    /// Serves `admin_getConcurrencyLimit` / `admin_setConcurrencyLimit`, which retune the
+    /// admission gate without a restart. Omitted, no admin listener runs and the limits are
+    /// fixed for the process's lifetime. This port has no authentication and its setters can
+    /// throttle request serving, so a non-loopback bind is refused at startup; reach it
+    /// through a port-forward or a sidecar.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_ADMIN_ADDR")]
+    admin_addr: Option<String>,
 
     /// Estimated number of items in response cache (for initial capacity). Must be at
     /// least 1 — disable the cache with `--response-cache-disabled`, not with 0.
@@ -311,44 +422,99 @@ struct Args {
     witness_old_block_timeout: Option<u64>,
 
     /// R2 S3 endpoint origin, e.g. `https://<account>.r2.cloudflarestorage.com` (no bucket
-    /// path). With `--r2-bucket` and the credential flags, historical witnesses are fetched
-    /// straight from the bucket, with the RPC witness chain as fallback; frontier blocks keep
-    /// the generator path. Requires a local DB (`--data-dir`) to anchor block age.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ENDPOINT", requires_all = ["r2_bucket", "r2_access_key_id", "r2_secret_access_key"])]
+    /// path). With `--r2-bucket` and the credential flags, every witness fetch tries the
+    /// bucket first, with the RPC witness chain as fallback — frontier probes usually miss
+    /// (one fast 404) while historical fetches are served here. Requires a local DB
+    /// (`--data-dir`) to anchor block age. Alternative target: `--r2-custom-domain`.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ENDPOINT")]
     r2_endpoint: Option<String>,
 
+    /// Cloudflare custom domain fronting the witness bucket, e.g.
+    /// `https://witness.example.com` (bare origin — objects are fetched as `/{key}`).
+    /// Alternative to the `--r2-endpoint` credential quad: GETs go unsigned through the CDN
+    /// edge, which multiplexes them over HTTP/2 and can serve the immutable witness objects
+    /// from edge cache. Client-side routing, budgets, and fallback match the S3 target
+    /// (including the `--data-dir` requirement); edge behavior is zone configuration —
+    /// **any cache rule making these objects cacheable must set 404s to bypass cache**,
+    /// or a pre-upload frontier miss gets pinned for the negative-cache TTL and a cached
+    /// 404 can false-fire the below-band `missing` bucket-integrity alarm.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_CUSTOM_DOMAIN")]
+    r2_custom_domain: Option<String>,
+
+    /// Cloudflare Access service-token client id, sent as `CF-Access-Client-Id` on every
+    /// custom-domain GET. Omit when the domain is locked by an IP allowlist instead.
+    /// Redacted like the secret: the id alone is enough to look up the token.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ACCESS_CLIENT_ID")]
+    r2_access_client_id: Option<RedactedSecret>,
+
+    /// Cloudflare Access service-token client secret, sent as `CF-Access-Client-Secret`.
+    /// Prefer the env var over the flag so the secret stays out of shell history and
+    /// process listings.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ACCESS_CLIENT_SECRET")]
+    r2_access_client_secret: Option<RedactedSecret>,
+
     /// R2 bucket holding the archived witness objects. Requires `--r2-endpoint`.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_BUCKET", requires = "r2_endpoint")]
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_BUCKET")]
     r2_bucket: Option<String>,
 
     /// R2 access key id (Object Read). Requires `--r2-endpoint`.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ACCESS_KEY_ID", requires = "r2_endpoint")]
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ACCESS_KEY_ID")]
     r2_access_key_id: Option<String>,
 
     /// R2 secret access key. Requires `--r2-endpoint`. Prefer the env var over the flag so
     /// the secret stays out of shell history and process listings.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_SECRET_ACCESS_KEY", requires = "r2_endpoint")]
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_SECRET_ACCESS_KEY")]
     r2_secret_access_key: Option<RedactedSecret>,
 
     /// R2 connection-establishment timeout (milliseconds). A healthy handshake to the local
-    /// anycast edge is tens of ms; hangs past this are the per-IP connection-budget
-    /// mitigation's signature and surface as retryable `connect`-kind errors, falling back
-    /// to the RPC chain fast.
+    /// anycast edge is tens of ms. On the S3 endpoint, hangs past this are the per-IP
+    /// connection-budget mitigation's signature and keep landing in the connect phase, since
+    /// every in-flight GET holds its own connection; they surface as retryable `connect`-kind
+    /// errors, falling back to the RPC chain fast. The custom domain pools a single h2
+    /// connection, so this bounds its first handshake and any reconnect — a path that breaks
+    /// after that surfaces as `transport` against the per-attempt budget instead, until the
+    /// keep-alive ping reaps the connection.
+    ///
+    /// An `Option` rather than a clap default so "explicitly set" stays distinguishable:
+    /// setting it with no R2 target configured is rejected by name instead of being silently
+    /// ignored. [`DEFAULT_CONNECT_TIMEOUT`] applies when it is absent.
+    ///
+    /// [`DEFAULT_CONNECT_TIMEOUT`]: stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT
     #[clap(
         long,
         env = "DEBUG_TRACE_SERVER_R2_CONNECT_TIMEOUT_MS",
-        default_value_t = stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT.as_millis() as u64,
         value_parser = clap::value_parser!(u64).range(100..),
-        requires = "r2_endpoint",
     )]
-    r2_connect_timeout_ms: u64,
+    r2_connect_timeout_ms: Option<u64>,
 
     /// Maximum concurrent in-flight R2 witness GETs. Omit for unlimited. Deliberately
     /// separate from
     /// `--witness-max-concurrent-requests`: that cap sizes the shared RPC gateway, while R2
     /// tolerates far higher parallelism.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_MAX_CONCURRENT_REQUESTS", requires = "r2_endpoint")]
+    ///
+    /// On the custom-domain target keep this at or below the edge's per-connection stream
+    /// limit (Cloudflare's is 100, advertised in its `SETTINGS_MAX_CONCURRENT_STREAMS`):
+    /// anything above it queues inside the HTTP/2 connection rather than on this semaphore,
+    /// where the wait counts against the per-attempt timeout and never reaches
+    /// `debug_trace_r2_witness_queue_wait_seconds`. The fetcher warns at startup when the
+    /// configured value exceeds the limit.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_MAX_CONCURRENT_REQUESTS")]
     r2_max_concurrent_requests: Option<usize>,
+
+    /// HTTP/2 connections the custom-domain target spreads its GETs over (default: 1).
+    ///
+    /// One `reqwest::Client` holds exactly one HTTP/2 connection and hyper opens no second one
+    /// when the first saturates, so this is the only way past the edge's per-connection stream
+    /// limit — and the only way a dropped connection stops taking every GET riding it down
+    /// with it. `--r2-max-concurrent-requests` remains the cap across all of them, split evenly
+    /// and rounded up, so raising this alone spreads the same concurrency thinner rather than
+    /// lifting the ceiling; a count larger than that cap is rejected, since the surplus
+    /// connections could never be filled.
+    ///
+    /// Taken as text and parsed after clap so a blank env line is rejected by name rather than
+    /// through clap's unnamed value error.
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_CONNECTIONS")]
+    r2_connections: Option<String>,
 
     /// Chain-sync pipeline tip buffer: stay this many blocks behind the upstream head so the
     /// fetcher does not race the witness generator — a fetch issued the moment a block appears
@@ -381,6 +547,41 @@ const DEFAULT_PRUNER_INTERVAL_SECS: u64 = 300;
 
 /// Default floor of recent block bodies that size-based pruning never removes.
 const DEFAULT_SIZE_PRUNE_MIN_RETAIN: u64 = 256;
+
+/// Default execution-permit budget.
+///
+/// Just above the highest per-handler occupancy this server has been measured sustaining
+/// with zero failures, computed by Little's law from that run's request-duration counters
+/// rather than from its offered concurrency — the two differ by 3x, and the offered figure
+/// would over-provision by the same factor. Deliberately above every clean measurement
+/// rather than at a knee: no saturation point has been established for this workload, and a
+/// default that throttles a known-good one is a worse failure than a loose bound.
+const DEFAULT_ADMISSION_MAX_CONCURRENT: u64 = 640;
+
+/// Default queue depth — roughly four seconds of backlog at the throughput measured on the
+/// cold path, which keeps a full queue comfortably inside the block-fetch deadline.
+const DEFAULT_ADMISSION_MAX_QUEUE: u64 = 8192;
+
+/// Default budget for memory-hungry tracers. Derived from memory rather than throughput: a
+/// single `prestateTracer` response over a large block has been measured near a gigabyte, so
+/// this figure times `--max-response-size` is what to check against the host's memory limit.
+const DEFAULT_ADMISSION_HEAVY_MAX_CONCURRENT: u64 = 8;
+
+/// Cap on an inbound request body, pinned rather than left to the framework's default so the
+/// envelope headroom below can be derived from it instead of guessed.
+const MAX_REQUEST_BODY_SIZE: u32 = 10 * 1024 * 1024;
+
+/// How much room `--max-batch-response-size` must leave above `--max-response-size`.
+///
+/// Our own check measures the bare result body; the framework's cap measures the whole
+/// JSON-RPC response, envelope and client-supplied `id` included. Set the two caps equal and a
+/// body that passes our check can still be swapped for an oversized-response error by the
+/// framework — after the handler has already counted the request as served.
+///
+/// Derived rather than assumed: the only unbounded part of the envelope is the `id`, which the
+/// client sends inside the request body, so [`MAX_REQUEST_BODY_SIZE`] bounds it outright. A
+/// fixed guess would hold for sane ids and quietly fail for a client that pads one.
+const RESPONSE_ENVELOPE_HEADROOM: u64 = MAX_REQUEST_BODY_SIZE as u64 + 1024;
 
 /// Parses a human-readable size string into bytes.
 ///
@@ -432,8 +633,37 @@ fn witness_endpoint_chain(args: &Args) -> Vec<&str> {
         .collect()
 }
 
-/// Validates cross-flag invariants that clap cannot express per-field.
-fn validate_args(args: &Args) -> Result<()> {
+/// This binary's `--r2-*` flags, in the spellings its operators use.
+fn r2_flags<'a>(args: &'a Args, tuning: &'a [R2TuningFlag<'a>]) -> R2Flags<'a> {
+    R2Flags {
+        endpoint: R2Flag::new("--r2-endpoint", args.r2_endpoint.as_deref()),
+        bucket: R2Flag::new("--r2-bucket", args.r2_bucket.as_deref()),
+        access_key_id: R2Flag::new("--r2-access-key-id", args.r2_access_key_id.as_deref()),
+        secret_access_key: R2Flag::new(
+            "--r2-secret-access-key",
+            args.r2_secret_access_key.as_ref().map(AsRef::as_ref),
+        ),
+        custom_domain: R2Flag::new("--r2-custom-domain", args.r2_custom_domain.as_deref()),
+        access_client_id: R2Flag::new(
+            "--r2-access-client-id",
+            args.r2_access_client_id.as_ref().map(AsRef::as_ref),
+        ),
+        access_client_secret: R2Flag::new(
+            "--r2-access-client-secret",
+            args.r2_access_client_secret.as_ref().map(AsRef::as_ref),
+        ),
+        connections: R2Flag::new("--r2-connections", args.r2_connections.as_deref()),
+        max_concurrent_requests: R2CountFlag::new(
+            "--r2-max-concurrent-requests",
+            args.r2_max_concurrent_requests,
+        ),
+        tuning,
+    }
+}
+
+/// Validates cross-flag invariants that clap cannot express per-field, and reports which R2
+/// target the flags select so the construction below does not have to decide it a second time.
+fn validate_args(args: &Args) -> Result<R2Config> {
     // Early, flag-named mirror of `PipelineConfig::validate` (see its doc for the rationale);
     // only meaningful with chain sync, where `blocks_to_keep` becomes the stale-reset
     // threshold.
@@ -456,40 +686,106 @@ fn validate_args(args: &Args) -> Result<()> {
              --witness-endpoint: list the generator once, via the dedicated flag"
         );
     }
-    // Clap's `requires` wiring makes the `--r2-*` flags all-or-nothing, but it checks
-    // presence, not content: an env var injected as the empty string (a secret that failed
-    // to materialize is the common shape) would otherwise build a live source whose every
-    // GET reports `kind="missing"` — the exact counter operators watch for
-    // bucket-completeness gaps. Reject emptiness before a bad deploy can read as data loss.
-    let r2_values = [
-        ("--r2-endpoint", args.r2_endpoint.as_deref()),
-        ("--r2-bucket", args.r2_bucket.as_deref()),
-        ("--r2-access-key-id", args.r2_access_key_id.as_deref()),
-        ("--r2-secret-access-key", args.r2_secret_access_key.as_ref().map(|s| s.as_ref())),
-    ];
-    for (flag, value) in r2_values {
-        if value.is_some_and(str::is_empty) {
-            eyre::bail!(
-                "{flag} is set but empty (empty env var injection?): unset it or give it a value"
-            );
-        }
-    }
-    // The R2 historical route anchors block age to the local DB tip, so without --data-dir
-    // it can never fire. An operator who configured R2 asked for that route explicitly —
-    // fail closed instead of silently running the RPC-only setup R2 exists to replace.
-    if args.r2_endpoint.is_some() && args.data_dir.is_none() {
+    // Every R2 coherence rule comes from the shared validator, so the two binaries cannot
+    // drift. A bad `--r2-*` value fails fast here rather than surfacing later as
+    // `kind="missing"`. The connect timeout is the one R2 flag those rules never see, so it is
+    // listed here to be named when orphaned.
+    let tuning =
+        [R2TuningFlag::new("--r2-connect-timeout-ms", args.r2_connect_timeout_ms.is_some())];
+    let config = validate_r2_flags(&r2_flags(args, &tuning))?;
+    // R2 rides the witness stage, whose old-block budget clamp and generator-skip routing read
+    // the local DB tip — and so does the band, which takes the higher of that and the tip
+    // observed from request traffic. Without --data-dir each falls to its conservative branch.
+    // An operator who configured R2 asked for the real route, so fail closed rather than run a
+    // degraded one.
+    if config.is_configured() && args.data_dir.is_none() {
         eyre::bail!(
-            "--r2-endpoint requires --data-dir: the R2 historical witness route anchors \
-             block age to the local DB tip and can never fire in stateless mode"
+            "the R2 witness route requires --data-dir: its banding, budget and routing \
+             all read the local DB tip"
         );
     }
-    Ok(())
+    // Shared with the admin RPC's setter, so the startup gate and the runtime gate cannot
+    // enforce different rules.
+    if !args.admission_disabled {
+        admission::check_capacity_covers_batch(
+            admission::Limit::new("--admission-max-concurrent", args.admission_max_concurrent),
+            admission::Limit::new("--admission-max-queue", args.admission_max_queue),
+            admission::Limit::new(
+                "--batch-item-concurrency",
+                u64::from(args.batch_item_concurrency),
+            ),
+        )
+        .map_err(|e| eyre::eyre!(e))?;
+    }
+    // The batch builder holds whole entry bodies, so a batch cap below one entry's cap could
+    // never assemble even a single maximal response — and it must clear it by enough for the
+    // JSON-RPC envelope, or the framework can reject a body our own check just passed.
+    let required_batch_cap = args.max_response_size.saturating_add(RESPONSE_ENVELOPE_HEADROOM);
+    if args.max_batch_response_size < required_batch_cap {
+        eyre::bail!(
+            "--max-batch-response-size ({}) must be at least --max-response-size ({}) plus {} \
+             bytes of headroom: a batch holds whole entry bodies, and the framework's cap counts \
+             the JSON-RPC envelope and request id that our own size check does not",
+            args.max_batch_response_size,
+            args.max_response_size,
+            RESPONSE_ENVELOPE_HEADROOM
+        );
+    }
+    // The framework's response cap is a u32, and an over-cap batch bound is merely clamped
+    // (batch truncation is a documented approximation) — but the per-response cap must fit
+    // under that ceiling with the envelope, or bodies between the two would pass our own
+    // check and still be swapped for the framework's oversized-response error after being
+    // counted served, silently blunting `--max-response-size` above ~4 GiB.
+    let framework_ceiling = u64::from(u32::MAX);
+    if args.max_response_size.saturating_add(RESPONSE_ENVELOPE_HEADROOM) > framework_ceiling {
+        eyre::bail!(
+            "--max-response-size ({}) plus {} bytes of envelope headroom must fit the JSON-RPC \
+             framework's u32 response ceiling ({}): a larger cap would accept bodies the \
+             framework then rejects as oversized after they were counted served",
+            args.max_response_size,
+            RESPONSE_ENVELOPE_HEADROOM,
+            framework_ceiling
+        );
+    }
+    admin_bind_addr(args)?;
+    Ok(config)
+}
+
+/// Parses `--admin-addr`, returning `None` when no admin listener was requested.
+///
+/// Pure, so `validate_args` can fail fast on a bad value at startup and `main` can ask again
+/// for the parsed address without threading it through — the same shape
+/// `old_block_witness_timeout_secs` already uses.
+fn admin_bind_addr(args: &Args) -> Result<Option<SocketAddr>> {
+    let Some(raw) = args.admin_addr.as_deref() else { return Ok(None) };
+    let raw = raw.trim();
+    // What a templated env file renders for a variable a role does not set.
+    if raw.is_empty() {
+        eyre::bail!(
+            "--admin-addr was set to an empty value; omit it entirely to run without an \
+             admin listener"
+        );
+    }
+    // Deliberately an address literal, not a hostname: a name could resolve to a routable
+    // address later, defeating the loopback check below.
+    let addr: SocketAddr = raw.parse().map_err(|e| {
+        eyre::eyre!("--admin-addr ({raw}) must be an address and port, e.g. 127.0.0.1:8546: {e}")
+    })?;
+    if !addr.ip().is_loopback() {
+        eyre::bail!(
+            "--admin-addr ({addr}) must bind loopback: this port has no authentication and \
+             its setters can throttle request serving. Bind 127.0.0.1 or [::1] and reach it \
+             through a port-forward or a sidecar"
+        );
+    }
+    Ok(Some(addr))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    validate_args(&args)?;
+    let r2_config = validate_args(&args)?;
+    let r2_configured = r2_config.is_configured();
     let _log_guard = args.log.init_tracing()?;
 
     info!(
@@ -514,13 +810,20 @@ async fn main() -> Result<()> {
         witness_timeout_secs = args.witness_timeout,
         witness_old_block_timeout_secs = old_block_witness_timeout_secs(&args),
         witness_local_window = args.witness_local_window,
-        r2_witness_configured = args.r2_endpoint.is_some(),
+        r2_witness_configured = r2_configured,
         tip_buffer = args.tip_buffer,
         response_cache_disabled = args.response_cache_disabled,
         response_cache_max_size = args.response_cache_max_size,
         response_cache_estimated_items = args.response_cache_estimated_items,
         response_compression_disabled = args.response_compression_disabled,
         batch_item_concurrency = args.batch_item_concurrency,
+        admission_disabled = args.admission_disabled,
+        admission_max_concurrent = args.admission_max_concurrent,
+        admission_max_queue = args.admission_max_queue,
+        admission_heavy_max_concurrent = args.admission_heavy_max_concurrent,
+        max_response_size = args.max_response_size,
+        max_batch_response_size = args.max_batch_response_size,
+        admin_addr = ?args.admin_addr,
         "Server configuration"
     );
 
@@ -545,11 +848,15 @@ async fn main() -> Result<()> {
         .rpc_per_attempt_timeout_ms
         .map(std::time::Duration::from_millis)
         .unwrap_or(rpc_defaults.per_attempt_timeout);
-    let rpc_retry = rpc_defaults.rpc_retry.clone();
+    let rpc_retry = rpc_defaults.rpc_retry;
     let rpc_config = RpcClientConfig {
         data_max_concurrent_requests: args.data_max_concurrent_requests,
         witness_max_concurrent_requests: args.witness_max_concurrent_requests,
         per_attempt_timeout,
+        // Derived rather than flagged so it moves with --witness-timeout; a ceiling the
+        // per-entry halving normally undercuts — the full contract lives on
+        // `RpcClientConfig::witness_per_attempt_timeout`.
+        witness_per_attempt_timeout: Some(std::time::Duration::from_secs(args.witness_timeout) / 2),
         ..rpc_defaults
     }
     .with_metrics(Arc::new(metrics::TraceRpcMetrics));
@@ -580,40 +887,34 @@ async fn main() -> Result<()> {
         ),
     }
 
-    // Direct-from-R2 historical witness source. Clap's `requires` wiring makes the four
-    // `--r2-*` flags all-or-nothing and `validate_args` rejects empty values and the
-    // data-dir-less combination, so matching on the quad only splits "configured" from
-    // "absent". Shares the RPC path's per-attempt timeout and retry pacing.
-    let r2_witness_source = match (
-        &args.r2_endpoint,
-        &args.r2_bucket,
-        &args.r2_access_key_id,
-        &args.r2_secret_access_key,
-    ) {
-        (Some(endpoint), Some(bucket), Some(access_key_id), Some(secret)) => {
-            let source = R2WitnessSource::new(
-                endpoint,
-                bucket.clone(),
-                access_key_id.clone(),
-                secret.as_ref().to_string(),
-                stateless_r2::fetch::FetchTimeouts {
-                    per_attempt: per_attempt_timeout,
-                    connect: std::time::Duration::from_millis(args.r2_connect_timeout_ms),
-                },
-                rpc_retry,
-                args.r2_max_concurrent_requests,
-            )?;
-            // Log the parsed origin, not the raw flag value — the raw string is
-            // operator input and this line is info-level.
-            let (origin, _) = stateless_r2::endpoint::parse_endpoint(endpoint);
-            info!(
-                endpoint = %origin,
-                bucket, "Historical witness source: R2 (direct S3), RPC chain as fallback"
-            );
-            Some(Arc::new(source))
-        }
-        _ => None,
+    // Direct-from-R2 witness source — unsigned through a Cloudflare custom domain when
+    // configured (h2-multiplexed, edge-cacheable), otherwise SigV4-signed against the bare
+    // S3 endpoint. Which one, and with what values, is the verdict `validate_args` already
+    // reached: clap carries no constraint here, so the shared validator is what rejects a bad
+    // combination, by name. Shares the RPC path's per-attempt timeout and retry pacing.
+    let r2_timeouts = stateless_r2::fetch::FetchTimeouts {
+        per_attempt: per_attempt_timeout,
+        connect: args
+            .r2_connect_timeout_ms
+            .map_or(stateless_r2::fetch::DEFAULT_CONNECT_TIMEOUT, std::time::Duration::from_millis),
     };
+    let r2_transport = R2WitnessTransport::from_config(
+        r2_config,
+        r2_timeouts,
+        rpc_retry,
+        Arc::new(metrics::TraceRpcMetrics),
+    )?;
+    if let Some(transport) = &r2_transport {
+        info!(
+            target = transport.target_label(),
+            origin = %transport.origin(),
+            bucket = %args.r2_bucket.as_deref().unwrap_or("-"),
+            cf_access = args.r2_access_client_id.is_some(),
+            connections = transport.connections(),
+            "Historical witness source: R2, RPC chain as fallback"
+        );
+    }
+    let r2_witness_source = r2_transport.map(|t| Arc::new(R2WitnessSource::new(t)));
 
     let validator_db = init_validator_db(&args, &rpc_client).await?;
 
@@ -736,8 +1037,50 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Inbound admission gate. `None` disables it entirely: no layer is installed and every
+    // request executes on arrival, as it did before this existed.
+    let admission = (!args.admission_disabled).then(|| {
+        AdmissionLimiter::new(
+            args.admission_max_concurrent,
+            args.admission_max_queue,
+            args.admission_heavy_max_concurrent,
+        )
+    });
+    match &admission {
+        // Pairing a concurrency cap with a response-size cap is what makes the worst case a
+        // number at all, and it is worth an operator seeing it at startup rather than
+        // discovering it under load. Both products are logged, because they answer different
+        // questions: the heavy one bounds the shapes that can actually reach the response cap,
+        // while the overall one is the theoretical ceiling if every admitted request returned
+        // a maximal body. Neither covers a tracer's intermediate allocations, which are not
+        // bounded by anything here.
+        Some(limiter) => info!(
+            max_concurrent = limiter.max_concurrent(),
+            max_queue = limiter.max_queue(),
+            heavy_max_concurrent = limiter.heavy_max_concurrent(),
+            max_permit_wait_ms = data_provider.max_permit_wait().as_millis() as u64,
+            max_response_size = args.max_response_size,
+            max_batch_response_size = args.max_batch_response_size,
+            worst_case_heavy_response_bytes =
+                limiter.heavy_max_concurrent().saturating_mul(args.max_response_size),
+            worst_case_response_bytes =
+                limiter.max_concurrent().saturating_mul(args.max_response_size),
+            "Admission control enabled"
+        ),
+        None => warn!(
+            "--admission-disabled: this process accepts unbounded concurrent work and has no \
+             upper bound on the memory a burst of large traces can pin"
+        ),
+    }
+
     // Create RPC context and module
-    let ctx = RpcContext::new(data_provider, chain_spec, response_cache);
+    let ctx = RpcContext::new(
+        data_provider,
+        chain_spec,
+        response_cache,
+        admission.clone(),
+        args.max_response_size as usize,
+    );
 
     // Spawn watch dog checker to monitor long-running requests
     let watch_dog = ctx.watch_dog().clone();
@@ -751,14 +1094,34 @@ async fn main() -> Result<()> {
     });
 
     let module = ctx.into_rpc_module()?;
+    assert_admission_covers_module(&module);
 
-    // Start server
-    let max_response_body_size = u32::MAX;
-    let config = ServerConfig::builder().max_response_body_size(max_response_body_size).build();
-    let rpc_middleware = RpcServiceBuilder::new().layer(rpc_middleware::ConcurrentBatchLayer::new(
-        args.batch_item_concurrency as usize,
-        max_response_body_size as usize,
-    ));
+    // Start server. One value feeds the framework's cap and the batch layer's assembly cap —
+    // `rpc_middleware` requires those two to stay in step — while the per-response check at
+    // our own serialization point is the separate, tighter bound that stops a single body
+    // from ever being built up twice more.
+    let max_response_body_size = u32::try_from(args.max_batch_response_size).unwrap_or_else(|_| {
+        warn!(
+            requested = args.max_batch_response_size,
+            applied = u32::MAX,
+            "--max-batch-response-size exceeds the JSON-RPC framework's cap; clamping"
+        );
+        u32::MAX
+    });
+    let config = ServerConfig::builder()
+        .max_response_body_size(max_response_body_size)
+        .max_request_body_size(MAX_REQUEST_BODY_SIZE)
+        .build();
+    // Order is load-bearing: the batch layer is outermost, so the admission layer below it
+    // sees single calls *and* every batch entry. Reversed, an N-entry batch would pass the
+    // gate as one unit — which is the traffic shape that has actually taken this server down.
+    // `batch_entries_are_individually_gated` fails if these are swapped.
+    let rpc_middleware = RpcServiceBuilder::new()
+        .layer(rpc_middleware::ConcurrentBatchLayer::new(
+            args.batch_item_concurrency as usize,
+            max_response_body_size as usize,
+        ))
+        .option_layer(admission.clone().map(admission::AdmissionLayer::new));
     let server = Server::builder()
         .set_config(config)
         .set_rpc_middleware(rpc_middleware)
@@ -768,10 +1131,51 @@ async fn main() -> Result<()> {
     let addr = server.local_addr()?;
     let handle = server.start(module);
 
+    // The bound admin address, kept only for the record; the listener itself is owned by its
+    // own thread for the process's lifetime (see `admin::spawn`).
+    match (admin_bind_addr(&args)?, admission) {
+        (Some(admin_addr), Some(limiter)) => {
+            admin::spawn(admin_addr, limiter, u64::from(args.batch_item_concurrency))?;
+        }
+        (Some(_), None) => {
+            warn!("--admin-addr is set but --admission-disabled: no limits to serve, skipping");
+        }
+        (None, _) => warn!(
+            "--admin-addr not set: admission limits are fixed for this process's lifetime and \
+             can only be changed by restarting"
+        ),
+    }
+
     info!(listen_addr = %addr, "Server started");
     handle.stopped().await;
 
     Ok(())
+}
+
+/// Fails fast if a registered method escapes the admission gate's allowlist.
+///
+/// The allowlist is spelled by name, so a method added later would silently never be gated —
+/// the failure mode of an omission here is an unprotected endpoint, discovered under load.
+/// `debug_getCacheStatus` is the one deliberate exemption; see `metrics::GATE_EXEMPT_METHODS`.
+fn assert_admission_covers_module(module: &jsonrpsee::server::RpcModule<()>) {
+    if let Some(name) = unregistered_method(module.method_names()) {
+        panic!(
+            "method {name} is registered on the RPC module but absent from \
+             metrics::ALL_METHODS, so admission control lets it through ungated and its \
+             metrics collapse onto the `unknown` label; add it there"
+        );
+    }
+}
+
+/// The first method registered on the module that `metrics` does not know about, if any.
+///
+/// Gating is derived — everything in `metrics::ALL_METHODS` is gated unless it is in
+/// `metrics::GATE_EXEMPT_METHODS` — so a registered method can no longer be *accidentally*
+/// ungated by omission from a second list. What can still happen is registering a method the
+/// metrics registry has never heard of, which both bypasses the gate and collapses its metrics
+/// onto `unknown`. That is the one condition worth failing startup over.
+fn unregistered_method<'a>(mut names: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    names.find(|name| !metrics::is_registered(name))
 }
 
 /// Initializes the validator database if data_dir is provided.
@@ -815,14 +1219,8 @@ async fn init_validator_db(
         rpc_client.get_header(BlockId::latest(), false).await
     };
 
-    let anchor = BlockMeta {
-        block_number: header.number,
-        block_hash: header.hash,
-        post_state_root: header.state_root,
-        post_withdrawals_root: header
-            .withdrawals_root
-            .ok_or_else(|| eyre::eyre!("Block {} is missing withdrawals_root", header.hash))?,
-    };
+    let anchor = BlockMeta::try_from_header(&header)
+        .ok_or_else(|| eyre::eyre!("Block {} is missing withdrawals_root", header.hash))?;
     ChainStore::reset_to_anchor(&*db, &anchor)
         .map_err(|e| eyre::eyre!("Failed to reset anchor: {}", e))?;
 
@@ -1272,6 +1670,174 @@ mod tests {
         assert!(disabled_via_env);
     }
 
+    /// The admission allowlist is spelled by name, so a method added later would silently
+    /// never be gated — an unprotected endpoint, discovered under load.
+    #[test]
+    fn every_registered_method_is_known_to_metrics() {
+        let registered: Vec<&str> = metrics::ALL_METHODS
+            .iter()
+            .copied()
+            .chain(metrics::TIMED_METHOD_ALIASES.iter().map(|(alias, _)| *alias))
+            .collect();
+        assert_eq!(unregistered_method(registered.iter().copied()), None);
+
+        assert_eq!(
+            unregistered_method(["debug_traceBlockByNumber", "debug_newThing"].into_iter()),
+            Some("debug_newThing"),
+            "a method metrics has never heard of must be reported, not silently ungated"
+        );
+
+        // Gating is derived, so the exemption is spelled once and both spellings resolve alike.
+        assert!(metrics::is_gated(metrics::METHOD_DEBUG_TRACE_BLOCK_BY_NUMBER));
+        for name in
+            [metrics::METHOD_DEBUG_GET_CACHE_STATUS, metrics::TIMED_METHOD_DEBUG_GET_CACHE_STATUS]
+        {
+            assert!(!metrics::is_gated(metrics::method_label(name)), "{name} stays exempt");
+        }
+    }
+
+    #[test]
+    fn admission_flag_defaults_and_env() {
+        let guard = stateless_test_utils::env::env_lock();
+
+        let args = parse_args(&[]);
+        assert_eq!(args.admission_max_concurrent, DEFAULT_ADMISSION_MAX_CONCURRENT);
+        assert_eq!(args.admission_max_queue, DEFAULT_ADMISSION_MAX_QUEUE);
+        assert_eq!(args.admission_heavy_max_concurrent, DEFAULT_ADMISSION_HEAVY_MAX_CONCURRENT);
+        assert!(!args.admission_disabled);
+        assert_eq!(args.max_response_size, 256 * 1024 * 1024);
+        assert_eq!(args.max_batch_response_size, 1024 * 1024 * 1024);
+        assert!(args.admin_addr.is_none());
+
+        // Zero execution permits would park every request forever; zero queue is a legitimate
+        // "execute or shed" configuration and must stay accepted.
+        let base =
+            ["debug-trace-server", "--rpc-endpoint", "http://r", "--witness-endpoint", "http://w"];
+        for flag in ["--admission-max-concurrent", "--admission-heavy-max-concurrent"] {
+            assert!(
+                Args::try_parse_from(base.iter().chain(&[flag, "0"])).is_err(),
+                "{flag} 0 must be rejected at parse time"
+            );
+        }
+        assert_eq!(parse_args(&["--admission-max-queue", "0"]).admission_max_queue, 0);
+
+        // Env attributes are what container deployments actually use, and a typo in one ships
+        // silently — a default-looking value with nothing pointing at the cause. Each case
+        // names its own accessor, so a new variable cannot be misrouted by a catch-all arm.
+        let assert_env_reaches = |var: &str, value: &str, field: fn(&Args) -> u64| {
+            let read = stateless_test_utils::env::with_env_var(&guard, var, value, || {
+                field(&parse_args(&[]))
+            });
+            assert_eq!(read.to_string(), value, "{var} did not reach its field");
+        };
+        assert_env_reaches("DEBUG_TRACE_SERVER_ADMISSION_MAX_CONCURRENT", "77", |args| {
+            args.admission_max_concurrent
+        });
+        assert_env_reaches("DEBUG_TRACE_SERVER_ADMISSION_MAX_QUEUE", "78", |args| {
+            args.admission_max_queue
+        });
+        assert_env_reaches("DEBUG_TRACE_SERVER_ADMISSION_HEAVY_MAX_CONCURRENT", "79", |args| {
+            args.admission_heavy_max_concurrent
+        });
+
+        let sizes = stateless_test_utils::env::with_env_var(
+            &guard,
+            "DEBUG_TRACE_SERVER_MAX_RESPONSE_SIZE",
+            "64MB",
+            || parse_args(&[]).max_response_size,
+        );
+        assert_eq!(sizes, 64 * 1024 * 1024);
+    }
+
+    /// The admin port has no authentication and its setters can throttle request serving, so a
+    /// non-loopback bind is refused by name rather than warned about.
+    #[test]
+    fn admin_addr_must_be_a_loopback_literal() {
+        for accepted in ["127.0.0.1:8546", "127.0.0.5:1", "[::1]:8546"] {
+            let args = parse_args(&["--admin-addr", accepted]);
+            assert!(admin_bind_addr(&args).is_ok(), "{accepted} should be accepted");
+        }
+
+        // A hostname is refused even when it resolves to loopback today: it could resolve
+        // elsewhere later, which would defeat the check silently.
+        for rejected in ["0.0.0.0:8546", "10.1.2.3:8546", "[::]:8546", "localhost:8546", "8546"] {
+            let args = parse_args(&["--admin-addr", rejected]);
+            let err = admin_bind_addr(&args).unwrap_err().to_string();
+            assert!(err.contains("--admin-addr"), "the error must name the flag: {err}");
+        }
+
+        // What a templated env file renders for a variable a role does not set.
+        let args = parse_args(&["--admin-addr", "  "]);
+        assert!(admin_bind_addr(&args).unwrap_err().to_string().contains("--admin-addr"));
+
+        assert!(admin_bind_addr(&parse_args(&[])).unwrap().is_none(), "absent means disabled");
+    }
+
+    /// A gate with less total capacity than one batch's concurrent entries sheds part of every
+    /// batch on a completely idle server — caught at startup, by name.
+    #[test]
+    fn admission_capacity_must_cover_one_batch() {
+        let args = parse_args(&[
+            "--batch-item-concurrency",
+            "16",
+            "--admission-max-concurrent",
+            "4",
+            "--admission-max-queue",
+            "4",
+        ]);
+        let err = validate_args(&args).expect_err("8 of capacity cannot serve a 16-wide batch");
+        let err = err.to_string();
+        assert!(err.contains("--admission-max-concurrent"), "{err}");
+        assert!(err.contains("--batch-item-concurrency"), "{err}");
+
+        // The kill switch takes the rule out of play along with the gate.
+        let args = parse_args(&[
+            "--batch-item-concurrency",
+            "16",
+            "--admission-max-concurrent",
+            "4",
+            "--admission-max-queue",
+            "4",
+            "--admission-disabled",
+        ]);
+        assert!(validate_args(&args).is_ok());
+    }
+
+    /// A batch holds whole entry bodies, so a batch cap under one entry's cap could never
+    /// assemble even a single maximal response.
+    #[test]
+    fn batch_response_cap_must_cover_one_response_plus_its_envelope() {
+        let args =
+            parse_args(&["--max-response-size", "512MB", "--max-batch-response-size", "256MB"]);
+        let err = validate_args(&args).expect_err("a batch cap below the entry cap").to_string();
+        assert!(err.contains("--max-batch-response-size"), "{err}");
+
+        // Equal caps are the trap: our own check measures the bare body while the framework's
+        // measures the envelope too, so a body that just passes ours can still be swapped for
+        // an oversized error after the handler counted the request as served.
+        let equal =
+            parse_args(&["--max-response-size", "512MB", "--max-batch-response-size", "512MB"]);
+        let err = validate_args(&equal).expect_err("equal caps leave no envelope room").to_string();
+        assert!(err.contains("headroom"), "the error must explain why equal is not enough: {err}");
+
+        assert!(validate_args(&parse_args(&["--max-response-size", "512MB"])).is_ok());
+    }
+
+    /// The framework's response cap is a u32, so a per-response cap near or above 4 GiB
+    /// would be silently undercut: bodies between the ceiling and the cap pass our own check
+    /// and are then swapped for the framework's oversized-response error after being counted
+    /// served. Rejected at startup, by name.
+    #[test]
+    fn response_cap_must_fit_the_framework_ceiling() {
+        let args = parse_args(&["--max-response-size", "5GB", "--max-batch-response-size", "11GB"]);
+        let err = validate_args(&args).expect_err("5GB cannot fit a u32 ceiling").to_string();
+        assert!(err.contains("--max-response-size"), "the error must name the flag: {err}");
+        assert!(err.contains("ceiling"), "and say what it collided with: {err}");
+
+        let ok = parse_args(&["--max-response-size", "2GB", "--max-batch-response-size", "3GB"]);
+        assert!(validate_args(&ok).is_ok(), "well under the ceiling stays accepted");
+    }
+
     /// Batch concurrency knob: default, CLI/env override, and the zero rejection.
     #[test]
     fn batch_item_concurrency_flag() {
@@ -1362,7 +1928,8 @@ mod tests {
         let blocks: Vec<_> = (1..=500u64)
             .map(|n| (make_test_block(n, block_hash(n)), empty_light_witness()))
             .collect();
-        db.store_block_data(&blocks).unwrap();
+        let pairs: Vec<_> = blocks.iter().map(|(b, w)| (b, w)).collect();
+        db.store_block_data(&pairs).unwrap();
         let metas: Vec<BlockMeta> = (1..=500u64)
             .map(|n| BlockMeta {
                 block_number: n,
@@ -1425,10 +1992,11 @@ mod tests {
         );
     }
 
-    /// The `--r2-*` group is all-or-nothing: any subset missing a member must fail parsing,
-    /// the full quad must parse, and none-of-them stays valid.
+    /// The S3 `--r2-*` set is all-or-nothing: any subset missing a member is rejected by
+    /// `validate_args` naming what is absent, the full quad passes, and none-of-them stays
+    /// valid. Rejection is post-parse throughout — clap carries no constraint here.
     #[test]
-    fn r2_flag_group_is_all_or_nothing() {
+    fn r2_s3_flag_set_is_all_or_nothing() {
         // Parsing reads every `#[clap(env = ...)]` variable, so serialize with the
         // env-mutating tests.
         let _guard = stateless_test_utils::env::env_lock();
@@ -1444,41 +2012,214 @@ mod tests {
         ];
 
         assert_eq!(parse_args(&full).r2_bucket.as_deref(), Some("witness-mainnet"));
-        assert_eq!(parse_args(&full).r2_connect_timeout_ms, 1000, "default connect timeout");
+        assert_eq!(
+            parse_args(&full).r2_connect_timeout_ms,
+            None,
+            "unset; the fetcher default applies"
+        );
         let with_timeout: Vec<&str> =
             full.iter().copied().chain(["--r2-connect-timeout-ms", "2000"]).collect();
-        assert_eq!(parse_args(&with_timeout).r2_connect_timeout_ms, 2000);
-        // Tuning flags are part of the fail-loud group: explicitly set without the
-        // endpoint they must be rejected, not silently ignored (defaults stay exempt).
-        let base =
-            ["debug-trace-server", "--rpc-endpoint", "http://r", "--witness-endpoint", "http://w"];
-        assert!(
-            Args::try_parse_from(base.iter().copied().chain(["--r2-connect-timeout-ms", "2000"]))
-                .is_err()
-        );
+        assert_eq!(parse_args(&with_timeout).r2_connect_timeout_ms, Some(2000));
+        // A tuning flag explicitly set with no target must be rejected rather than silently
+        // ignored — by name, from `validate_args`, with defaults staying exempt.
+        let err = validate_args(&parse_args(&["--r2-connect-timeout-ms", "2000"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--r2-connect-timeout-ms"), "{err}");
         let _ = parse_args(&[]); // no R2 flags stays valid
 
-        // Dropping any one flag=value pair of the quad breaks the group.
+        // Dropping any one flag=value pair of the quad is rejected by `validate_args`, which
+        // names the missing flag; clap's `requires` used to do it but could not (see `Args`).
         for skip in 0..4 {
             let partial: Vec<&str> = full
                 .chunks(2)
                 .enumerate()
                 .filter(|(i, _)| *i != skip)
                 .flat_map(|(_, pair)| pair.iter().copied())
+                .chain(["--data-dir", "/tmp/dts-test"])
                 .collect();
-            let base = [
-                "debug-trace-server",
-                "--rpc-endpoint",
-                "http://r",
-                "--witness-endpoint",
-                "http://w",
-            ];
+            let dropped = full[skip * 2];
+            let err = validate_args(&parse_args(&partial)).unwrap_err().to_string();
+            assert!(err.contains(dropped), "missing {dropped} must be named: {err}");
+        }
+    }
+
+    /// The custom-domain R2 target: stands alone (no credential quad), unlocks the shared
+    /// tuning flags, is mutually exclusive with the S3 endpoint, and carries the Access
+    /// token pair as an all-or-nothing add-on.
+    #[test]
+    fn r2_custom_domain_target_wiring() {
+        let _guard = stateless_test_utils::env::env_lock();
+        let base =
+            ["debug-trace-server", "--rpc-endpoint", "http://r", "--witness-endpoint", "http://w"];
+        let domain = ["--r2-custom-domain", "https://witness.example.com"];
+
+        assert_eq!(
+            parse_args(&domain).r2_custom_domain.as_deref(),
+            Some("https://witness.example.com")
+        );
+        // The shared tuning flags belong to whichever target is configured, so each must be
+        // accepted with the custom domain and still rejected by name with no target at all —
+        // the direction a revert would break silently for every custom-domain deployment.
+        let with_tuning: Vec<&str> = domain
+            .iter()
+            .copied()
+            .chain([
+                "--r2-connect-timeout-ms",
+                "2000",
+                "--r2-max-concurrent-requests",
+                "48",
+                "--r2-connections",
+                "8",
+            ])
+            .collect();
+        assert_eq!(parse_args(&with_tuning).r2_connect_timeout_ms, Some(2000));
+        assert_eq!(parse_args(&with_tuning).r2_max_concurrent_requests, Some(48));
+        assert_eq!(parse_args(&with_tuning).r2_connections.as_deref(), Some("8"));
+        for orphan in [
+            ["--r2-connect-timeout-ms", "2000"],
+            ["--r2-max-concurrent-requests", "48"],
+            ["--r2-connections", "8"],
+        ] {
+            let err = validate_args(&parse_args(&orphan)).unwrap_err().to_string();
             assert!(
-                Args::try_parse_from(base.iter().copied().chain(partial)).is_err(),
-                "missing {} must fail parsing",
-                full[skip * 2],
+                err.contains(orphan[0]),
+                "{orphan:?} without either R2 target must be rejected by name: {err}",
             );
         }
+
+        // The two read targets are mutually exclusive — rejected by `validate_args` with an
+        // error naming both flags (clap's own rejection would name neither — see `Args`).
+        let both = Args::try_parse_from(
+            base.iter()
+                .copied()
+                .chain(domain)
+                .chain([
+                    "--r2-endpoint",
+                    "https://acc.r2.cloudflarestorage.com",
+                    "--r2-bucket",
+                    "witness-mainnet",
+                    "--r2-access-key-id",
+                    "ak",
+                    "--r2-secret-access-key",
+                    "sk",
+                    "--data-dir",
+                    "/tmp/dts-test",
+                ])
+                .collect::<Vec<_>>(),
+        )
+        .expect("both targets must parse; rejection happens post-parse");
+        let err = validate_args(&both).unwrap_err().to_string();
+        assert!(err.contains("--r2-endpoint") && err.contains("--r2-custom-domain"), "{err}");
+
+        // Access pair: each half requires the other, and both require the domain — rejected by
+        // name, since a half-set pair would otherwise `zip` to `None` and build a working but
+        // silently unauthenticated client.
+        let half: Vec<&str> =
+            domain.iter().copied().chain(["--r2-access-client-id", "tok"]).collect();
+        let err = validate_args(&parse_args(&half)).unwrap_err().to_string();
+        assert!(err.contains("--r2-access-client-secret"), "client id without secret: {err}");
+
+        // The connection count is a multiplexing concept: zero of them builds a transport that
+        // can carry nothing, and the HTTP/1.1 S3 target already opens a socket per in-flight
+        // GET, so honouring a count there would promise a spread that never happens.
+        let zero: Vec<&str> = domain.iter().copied().chain(["--r2-connections", "0"]).collect();
+        let err = validate_args(&parse_args(&zero)).unwrap_err().to_string();
+        assert!(err.contains("--r2-connections") && err.contains("at least 1"), "{err}");
+
+        let on_s3 = Args::try_parse_from(
+            base.iter()
+                .copied()
+                .chain([
+                    "--r2-endpoint",
+                    "https://acc.r2.cloudflarestorage.com",
+                    "--r2-bucket",
+                    "witness-mainnet",
+                    "--r2-access-key-id",
+                    "ak",
+                    "--r2-secret-access-key",
+                    "sk",
+                    "--r2-connections",
+                    "8",
+                    "--data-dir",
+                    "/tmp/dts-test",
+                ])
+                .collect::<Vec<_>>(),
+        )
+        .expect("rejection happens post-parse");
+        let err = validate_args(&on_s3).unwrap_err().to_string();
+        assert!(
+            err.contains("--r2-connections") && err.contains("--r2-custom-domain"),
+            "a connection count on the S3 target must be rejected by name: {err}"
+        );
+
+        let orphan_pair = ["--r2-access-client-id", "tok", "--r2-access-client-secret", "sk"];
+        let err = validate_args(&parse_args(&orphan_pair)).unwrap_err().to_string();
+        assert!(err.contains("--r2-custom-domain"), "token pair without the domain: {err}");
+        let full: Vec<&str> = domain
+            .iter()
+            .copied()
+            .chain(["--r2-access-client-id", "tok", "--r2-access-client-secret", "sk"])
+            .collect();
+        assert_eq!(parse_args(&full).r2_access_client_id.as_ref().map(|s| s.as_ref()), Some("tok"));
+    }
+
+    /// Custom-domain misconfigurations fail the same startup validation as the S3 flags:
+    /// empty values and the data-dir-less combination.
+    #[test]
+    fn validate_args_rejects_custom_domain_misconfigurations() {
+        let _guard = stateless_test_utils::env::env_lock();
+        let dir = ["--data-dir", "/tmp/dts-test"];
+
+        assert!(
+            validate_args(&parse_args(&[
+                "--r2-custom-domain",
+                "https://w.example.com",
+                dir[0],
+                dir[1]
+            ]))
+            .is_ok()
+        );
+        assert!(
+            validate_args(&parse_args(&["--r2-custom-domain", "https://w.example.com"])).is_err(),
+            "custom domain without --data-dir must fail"
+        );
+        assert!(
+            validate_args(&parse_args(&["--r2-custom-domain", "", dir[0], dir[1]])).is_err(),
+            "empty custom domain must fail"
+        );
+        assert!(
+            validate_args(&parse_args(&[
+                "--r2-custom-domain",
+                "https://w.example.com",
+                "--r2-access-client-id",
+                "tok",
+                "--r2-access-client-secret",
+                "",
+                dir[0],
+                dir[1],
+            ]))
+            .is_err(),
+            "empty access secret must fail"
+        );
+        // A blank custom-domain env line over a working S3 config must get the named
+        // empty-value error, not a phantom target conflict.
+        let blank_over_s3 = parse_args(&[
+            "--r2-endpoint",
+            "https://acc.r2.cloudflarestorage.com",
+            "--r2-bucket",
+            "witness-mainnet",
+            "--r2-access-key-id",
+            "ak",
+            "--r2-secret-access-key",
+            "sk",
+            "--r2-custom-domain",
+            "",
+            dir[0],
+            dir[1],
+        ]);
+        let err = validate_args(&blank_over_s3).unwrap_err().to_string();
+        assert!(err.contains("--r2-custom-domain") && err.contains("empty"), "{err}");
     }
 
     /// R2 misconfigurations fail startup validation: an empty value on any `--r2-*` flag

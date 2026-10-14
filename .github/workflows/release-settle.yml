@@ -1,0 +1,63 @@
+name: Release Settle
+
+# Settle a release candidate. Dispatch from the default branch with the
+# version and the full SHA of the release-branch tip; the shared action
+# verifies it, generates release notes from the commits since the previous
+# tag, commits them to the changelog on the release branch, and publishes:
+# annotated tag at that commit, GitHub Release with the notes (on-release.yml
+# then attaches the binaries; release.yaml / release-tracing.yaml archive to
+# Artifact Registry on the tag push).
+#
+# The dispatch is the settlement decision, gated by the `release` environment
+# on the job: its required reviewers approve the run before it starts, and
+# its deployment branch policy allows only the default branch. The app is a
+# bypass actor on the release-branch and `v*` tag rulesets, which is what
+# lets the settle commit and the tag land. `settlers` (default `any`) is left
+# unset: the environment's reviewers are the only gate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to settle (X.Y.Z)"
+        required: true
+        type: string
+      commit:
+        description: "Full SHA of the release-branch tip being settled"
+        required: true
+        type: string
+
+# One settle per version: two dispatches for the same version would race on
+# the release branch. Queue, never cancel.
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  settle:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        id: app-token
+        with:
+          client-id: ${{ vars.MEGA_MAXWELL_CLIENT_ID }}
+          private-key: ${{ secrets.MEGA_MAXWELL_PK }}
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: megaeth-labs/.github/.github/actions/release-settle@main
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          version: ${{ inputs.version }}
+          commit: ${{ inputs.commit }}
+          version_file: Cargo.toml
+          version_pattern: toml
+          changelog_file: CHANGELOG.md
+          settle_mode: direct

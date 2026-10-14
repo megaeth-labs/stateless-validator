@@ -72,7 +72,7 @@ fn main() {
 /// The benched payloads, as `(source_label, uncompressed_payload)`: the bincode-legacy
 /// `(SaltWitness, MptWitness)` bytes that `encode_witness_payload` compresses.
 fn payloads() -> [(String, Vec<u8>); 2] {
-    let fixtures = TestFixtures::mainnet();
+    let fixtures = TestFixtures::mainnet_shared();
     // Round-trip via the production encoder so the wire format stays defined in one place.
     let (fixture_block, fixture_payload) = fixtures
         .paired_blocks()

@@ -10,10 +10,12 @@ use std::{
 
 use eyre::Result;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
-use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 pub use stateless_common::{
-    DEFAULT_METRICS_PORT, WitnessSizeBreakdown,
-    metrics::{BYTE_BUCKETS, REORG_DEPTH_BUCKETS, RpcAttemptOutcome, RpcMethod, RpcMetrics},
+    DEFAULT_METRICS_PORT, R2Metrics, WitnessSizeBreakdown,
+    metrics::{
+        BYTE_BUCKETS, REORG_DEPTH_BUCKETS, RpcAttemptOutcome, RpcMethod, RpcMetrics,
+        install_prometheus_exporter,
+    },
 };
 use tracing::info;
 
@@ -47,6 +49,20 @@ impl RpcMetrics for ValidatorMetrics {
 
     fn on_witness_fetch(&self, breakdown: WitnessSizeBreakdown) {
         on_witness_fetch(breakdown);
+    }
+}
+
+impl R2Metrics for ValidatorMetrics {
+    fn on_target(&self, target: &'static str) {
+        record_r2_target(target);
+    }
+
+    fn on_connections(&self, connections: usize) {
+        record_r2_connections(connections);
+    }
+
+    fn on_negotiated_version(&self, version: &'static str) {
+        record_r2_negotiated_version(version);
     }
 }
 
@@ -88,10 +104,14 @@ pub mod names {
     metric!(CODE_FETCH_TIME, "code_fetch_time_seconds");
     metric!(WITNESS_FETCH_RPC_TIME, "witness_fetch_rpc_time_seconds");
 
-    // R2 witness source (`--witness-source r2`)
+    // R2 witness source (live once the `--r2-*` flags configure a target)
     metric!(WITNESS_FETCH_R2_TIME, "witness_fetch_r2_time_seconds");
     metric!(R2_WITNESS_RETRY_ATTEMPTS_TOTAL, "r2_witness_retry_attempts_total");
     metric!(R2_WITNESS_ERRORS_TOTAL, "r2_witness_errors_total");
+    metric!(R2_WITNESS_FRONTIER_MISSES_TOTAL, "r2_witness_frontier_misses_total");
+    metric!(R2_TARGET_INFO, "r2_target_info");
+    metric!(R2_NEGOTIATED_VERSION_INFO, "r2_negotiated_http_version_info");
+    metric!(R2_CONNECTIONS, "r2_connections");
 
     // Contract cache
     metric!(CONTRACT_CACHE_HITS, "contract_cache_hits_total");
@@ -124,15 +144,7 @@ const BUCKET_SPECS: &[(&str, &[f64])] = &[
 
 /// Initialize the Prometheus metrics exporter at the given address.
 pub fn init_metrics(addr: SocketAddr) -> Result<()> {
-    let builder = BUCKET_SPECS.iter().fold(PrometheusBuilder::new(), |b, &(name, buckets)| {
-        b.set_buckets_for_metric(Matcher::Full(name.to_owned()), buckets)
-            .expect("valid bucket config")
-    });
-
-    builder
-        .with_http_listener(addr)
-        .install()
-        .map_err(|e| eyre::eyre!("Failed to install Prometheus exporter: {}", e))?;
+    install_prometheus_exporter(addr, BUCKET_SPECS)?;
 
     register_metric_descriptions();
     init_rpc_method_counters();
@@ -193,7 +205,23 @@ fn register_metric_descriptions() {
     );
     describe_counter!(
         names::R2_WITNESS_ERRORS_TOTAL,
-        "R2 witness fetches that surfaced an error to the pipeline, by kind"
+        "Failed R2 witness fetches by kind, each a block that fell back to RPC. Excludes \
+         near-tip misses (`r2_witness_frontier_misses_total`), so `missing` is a bucket hole"
+    );
+    describe_counter!(
+        names::R2_WITNESS_FRONTIER_MISSES_TOTAL,
+        "R2 witness fetches with no object inside the frontier band below the polled head: \
+         the uploader has not reached the block yet. Routine, so not counted as an error"
+    );
+    describe_gauge!(
+        names::R2_NEGOTIATED_VERSION_INFO,
+        "Protocol the R2 custom-domain target negotiated, as a constant-1 gauge labeled \
+         `version` (h2 is the point of that target; http/1.1 means it silently degraded)"
+    );
+    describe_gauge!(
+        names::R2_TARGET_INFO,
+        "Configured R2 target, as a constant-1 gauge labeled `target` (join to give the \
+         target-less R2 series a target dimension during a rollout)"
     );
 
     // Contract cache
@@ -215,7 +243,6 @@ fn init_rpc_method_counters() {
         RpcMethod::EthGetBlock,
         RpcMethod::EthBlockNumber,
         RpcMethod::EthGetHeader,
-        RpcMethod::EthGetTransactionByHash,
         RpcMethod::MegaGetBlockWitness,
         RpcMethod::MegaSetValidatedBlocks,
     ];
@@ -228,13 +255,46 @@ fn init_rpc_method_counters() {
     }
 }
 
-/// Pre-register the R2 witness-source counters (every error kind) so they appear in Prometheus
-/// output from startup, like the RPC method counters above.
+/// Pre-register the R2 witness-source counters (every error kind, plus the retry and
+/// frontier-miss totals) so they appear in Prometheus output from startup, like the RPC method
+/// counters above.
 fn init_r2_witness_counters() {
     counter!(names::R2_WITNESS_RETRY_ATTEMPTS_TOTAL).increment(0);
+    counter!(names::R2_WITNESS_FRONTIER_MISSES_TOTAL).increment(0);
     for kind in R2WitnessError::KINDS {
         counter!(names::R2_WITNESS_ERRORS_TOTAL, "kind" => *kind).increment(0);
     }
+}
+
+/// Publishes the configured R2 target once at startup.
+///
+/// The R2 series carry no target dimension, so during a fleet rollout — some hosts on the
+/// custom domain, some still on the S3 endpoint — a spike in `r2_witness_errors_total` cannot
+/// be attributed to either. Joining on this gauge supplies that dimension without changing the
+/// established metric contract.
+fn record_r2_target(target: &'static str) {
+    gauge!(names::R2_TARGET_INFO, "target" => target).set(1.0);
+}
+
+/// The protocol the R2 custom-domain target actually negotiated, as a constant-1 info gauge
+/// labeled `version`, published once the first response has been seen.
+///
+/// Separate from the target gauge on purpose: that one answers "what was configured" and can be
+/// published at startup, while this one is only knowable after a request. Folding both into one
+/// gauge would mean publishing it twice with different label sets, leaving the startup series
+/// stuck at 1 forever alongside the corrected one.
+fn record_r2_negotiated_version(version: &'static str) {
+    gauge!(names::R2_NEGOTIATED_VERSION_INFO, "version" => version).set(1.0);
+}
+
+/// How many HTTP/2 connections the custom-domain target spreads its GETs over.
+///
+/// A plain value rather than an info label: it is the divisor for the per-connection stream
+/// budget, so a dashboard reads it against `--r2-max-concurrent-requests` and against the
+/// edge's limit rather than grouping by it. Published only for the custom-domain target, where
+/// one client is one connection and the count is a real property of the transport.
+fn record_r2_connections(connections: usize) {
+    gauge!(names::R2_CONNECTIONS).set(connections as f64);
 }
 
 /// Record validation timing and block statistics after successful validation.
@@ -345,11 +405,11 @@ pub fn on_witness_fetch(b: WitnessSizeBreakdown) {
     histogram!(names::MPT_WITNESS_SIZE).record(b.mpt_size as f64);
 }
 
-// R2 witness source metrics (`--witness-source r2`)
+// R2 witness source metrics (live once the `--r2-*` flags configure a target)
 
 /// Record a successful R2 witness fetch: duration (see [`names::WITNESS_FETCH_R2_TIME`]'s
 /// description for what it covers) plus the same size breakdown as [`on_witness_fetch`], so the
-/// witness-size histograms stay populated in R2 mode.
+/// witness-size histograms count the blocks R2 serves as well as the ones RPC does.
 pub fn on_r2_witness_fetch_success(duration: f64, breakdown: WitnessSizeBreakdown) {
     histogram!(names::WITNESS_FETCH_R2_TIME).record(duration);
     on_witness_fetch(breakdown);
@@ -360,8 +420,13 @@ pub fn on_r2_witness_retry() {
     counter!(names::R2_WITNESS_RETRY_ATTEMPTS_TOTAL).increment(1);
 }
 
-/// Record an R2 witness fetch that surfaced an error to the pipeline, labelled by
-/// [`R2WitnessError::kind`].
+/// Record a failed R2 witness fetch, labelled by [`R2WitnessError::kind`].
 pub fn on_r2_witness_error(kind: &'static str) {
     counter!(names::R2_WITNESS_ERRORS_TOTAL, "kind" => kind).increment(1);
+}
+
+/// Record an R2 witness fetch that found no object near the polled head — the uploader still
+/// catching up. Deliberately not an error: see [`names::R2_WITNESS_FRONTIER_MISSES_TOTAL`].
+pub fn on_r2_witness_frontier_miss() {
+    counter!(names::R2_WITNESS_FRONTIER_MISSES_TOTAL).increment(1);
 }
