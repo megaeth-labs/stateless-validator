@@ -26,7 +26,7 @@ use quick_cache::{
     OptionsBuilder, Weighter,
     sync::{Cache, DefaultLifecycle},
 };
-use stateless_common::witness_size::light_witness_memory_bytes;
+use stateless_common::witness_size::light_witness_executor_memory_bytes;
 use stateless_db::bytecode_weight;
 use tracing::debug;
 
@@ -70,7 +70,8 @@ const AUTHORIZATION_BYTES: u64 = 192;
 
 /// Approximates the in-memory footprint of a [`BlockData`].
 ///
-/// Charges the witness KV/level payload, each contract's bytecode (same accounting as the
+/// Charges the witness (KV/level payload plus its direct-lookup table, via
+/// [`light_witness_executor_memory_bytes`]), each contract's bytecode (same accounting as the
 /// contract cache, via [`bytecode_weight`]), and a per-transaction envelope overhead plus
 /// calldata — the only unbounded variable-size block component. Allocator and map-node
 /// overhead is not counted, so true RSS can exceed the budget by tens of percent for
@@ -81,7 +82,7 @@ const AUTHORIZATION_BYTES: u64 = 192;
 /// which quick_cache re-invokes on admission, promotion, and eviction, under a shard
 /// lock — never re-walks the payload.
 pub fn block_data_weight(data: &BlockData) -> u64 {
-    let witness = light_witness_memory_bytes(&data.witness) as u64;
+    let witness = light_witness_executor_memory_bytes(&data.witness) as u64;
     let contracts: u64 = data.contracts.values().map(bytecode_weight).sum();
     let block = BLOCK_FIXED_OVERHEAD +
         match &data.block.transactions {
@@ -246,7 +247,7 @@ mod tests {
     #[test]
     fn weigher_charges_witness_contracts_and_transactions() {
         let data = fixture_block_data();
-        let witness_bytes = light_witness_memory_bytes(&data.witness) as u64;
+        let witness_bytes = light_witness_executor_memory_bytes(&data.witness) as u64;
         let contract_bytes: u64 = data.contracts.values().map(bytecode_weight).sum();
 
         let weight = block_data_weight(&data);
