@@ -103,12 +103,12 @@ pub struct CommandLineArgs {
     /// Cloudflare Access service-token client id, sent as `CF-Access-Client-Id` on every
     /// custom-domain GET. Omit when the domain is locked by an IP allowlist instead.
     /// Redacted like the secret: the id alone is enough to look up the token.
-    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_ID")]
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_ID", hide_env_values = true)]
     pub r2_access_client_id: Option<RedactedSecret>,
 
     /// Cloudflare Access service-token client secret, sent as `CF-Access-Client-Secret`. Prefer
     /// the env var over the flag.
-    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_SECRET")]
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_SECRET", hide_env_values = true)]
     pub r2_access_client_secret: Option<RedactedSecret>,
 
     /// R2 bucket holding the witnesses (e.g. `witness-mainnet`). Required for the S3-endpoint
@@ -123,7 +123,7 @@ pub struct CommandLineArgs {
 
     /// R2 secret access key. Required for the S3-endpoint target (not used with
     /// `--r2-custom-domain`). Prefer the env var over the flag.
-    #[clap(long, env = "STATELESS_VALIDATOR_R2_SECRET_ACCESS_KEY")]
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_SECRET_ACCESS_KEY", hide_env_values = true)]
     pub r2_secret_access_key: Option<RedactedSecret>,
 
     /// R2 connection-establishment timeout (milliseconds). A healthy handshake to the local
@@ -152,7 +152,7 @@ pub struct CommandLineArgs {
     /// evenly, so raising this alone spreads the same concurrency thinner; a count above that
     /// cap is rejected.
     ///
-    /// Text rather than a number so a blank env line is named rather than hitting clap.
+    /// Text rather than a number so a blank env line is diagnosed by the R2 rules, not by clap.
     #[clap(long, env = "STATELESS_VALIDATOR_R2_CONNECTIONS")]
     pub r2_connections: Option<String>,
 
@@ -409,9 +409,8 @@ fn override_ms(ms: Option<u64>, default: Duration) -> Duration {
 
 /// The RPC witness endpoints, which are always required.
 ///
-/// Checked here rather than by clap's `required`: this workspace builds clap without its
-/// `error-context` feature, so a clap rejection names no argument, and these deployments are
-/// configured through env files where an unnamed error costs a translation round trip.
+/// Checked here rather than by clap's `required`, so the error names the env variable these
+/// deployments are configured through and says why the flag is needed even when R2 is set up.
 fn witness_apis(args: &CommandLineArgs) -> Result<Vec<&str>> {
     if args.witness_endpoint.is_empty() {
         return Err(eyre::eyre!(
