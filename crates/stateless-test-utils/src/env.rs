@@ -21,20 +21,34 @@ pub fn env_lock() -> MutexGuard<'static, ()> {
     ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Sets `key` to `value`, runs `f`, then removes `key`. The `_guard` parameter is
+/// Sets `key` to `value`, runs `f`, then removes `key`. The `guard` parameter is
 /// compile-time proof that the caller holds [`env_lock`], so no other thread can
 /// observe the variable set (or a torn `environ`) during `f`.
 pub fn with_env_var<T>(
-    _guard: &MutexGuard<'_, ()>,
+    guard: &MutexGuard<'_, ()>,
     key: &str,
     value: &str,
     f: impl FnOnce() -> T,
 ) -> T {
-    // SAFETY: `_guard` proves the caller holds `env_lock()`, which serializes all env
-    // access in this binary, satisfying Rust 2024's no-concurrent-env-access rule.
-    unsafe { std::env::set_var(key, value) };
+    with_env_vars(guard, &[(key, value)], f)
+}
+
+/// [`with_env_var`] for several variables at once: all are set before `f` runs and all
+/// are removed after it.
+pub fn with_env_vars<T>(
+    _guard: &MutexGuard<'_, ()>,
+    vars: &[(&str, &str)],
+    f: impl FnOnce() -> T,
+) -> T {
+    for (key, value) in vars {
+        // SAFETY: `_guard` proves the caller holds `env_lock()`, which serializes all env
+        // access in this binary, satisfying Rust 2024's no-concurrent-env-access rule.
+        unsafe { std::env::set_var(key, value) };
+    }
     let result = f();
-    // SAFETY: same as above — still holding the guard.
-    unsafe { std::env::remove_var(key) };
+    for (key, _) in vars {
+        // SAFETY: same as above — still holding the guard.
+        unsafe { std::env::remove_var(key) };
+    }
     result
 }

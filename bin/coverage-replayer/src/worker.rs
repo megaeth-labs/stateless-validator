@@ -7,7 +7,6 @@
 //! chain-spec drift before it can poison the coverage store.
 
 use std::{
-    collections::HashSet,
     fs::File,
     io::{BufRead, Write as _},
     path::PathBuf,
@@ -17,6 +16,7 @@ use std::{
 use clap::Args;
 use eyre::{Context, Result};
 use mega_evm::{MegaPrecompiles, MegaSpecId};
+use rustc_hash::FxHashSet;
 use stateless_core::{
     LightWitnessExecutor, WitnessDatabase, WitnessExternalEnv, chain_spec::ChainSpec, replay_block,
 };
@@ -62,7 +62,7 @@ pub fn run(args: WorkerArgs) -> Result<()> {
     let exe = crate::profile_rt::own_executable()?;
     warm_up();
 
-    let mut reported = HashSet::new();
+    let mut reported = FxHashSet::default();
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let line = line?;
@@ -129,7 +129,7 @@ fn process_block(
     exe: &std::path::Path,
     chain_spec: &ChainSpec,
     req: &WorkerRequest,
-    reported: &mut HashSet<u64>,
+    reported: &mut FxHashSet<u64>,
 ) -> Result<WorkerResponse> {
     let start = Instant::now();
 
