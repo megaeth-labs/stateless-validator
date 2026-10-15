@@ -246,8 +246,6 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     if cleared > 0 {
         info!(cleared, "removed files a previous run left mid-flight");
     }
-    let (todo, retrying) = selection.pending(&store)?;
-
     ensure!(
         args.data_max_concurrent_requests >= 1,
         "--data-max-concurrent-requests must be at least 1"
@@ -269,6 +267,10 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         "block {highest} is beyond the chain tip {latest}; refusing to wait on unfetchable \
          blocks",
     );
+
+    // Only after the tip check: `pending` allocates one entry per unreplayed block of a range,
+    // so an absurd `--to` must be refused before that allocation is attempted.
+    let (todo, retrying) = selection.pending(&store)?;
 
     let total = todo.len() as u64;
     info!(
