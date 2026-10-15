@@ -30,6 +30,9 @@ cargo clippy --workspace --all-targets --all-features
 cargo sort --check --workspace --grouped --order package,workspace,lints,profile,bin,benches,dependencies,dev-dependencies,features
 ```
 
+Do not pass `--all-features` to `cargo test` or `cargo build`.
+The `coverage` feature of `coverage-replayer` links the LLVM profiler runtime, which only the instrumented build provides (see the `[profile.coverage]` comment in `Cargo.toml`); `cargo clippy --all-features` is fine because it only checks.
+
 The project uses nightly `2026-02-03` toolchain (edition 2024, rust-version 1.94).
 
 ## Workspace Structure
