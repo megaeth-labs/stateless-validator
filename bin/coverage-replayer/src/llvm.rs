@@ -167,60 +167,55 @@ impl Llvm {
 
     /// `llvm-cov report` over the scope: the per-file table `report` prints.
     pub fn report(&self, exe: &Path, profdata: &Path) -> Result<String> {
-        let out = Command::new(&self.cov)
-            .arg("report")
-            .arg(exe)
-            .arg(format!("--instr-profile={}", profdata.display()))
-            .args(&self.source_dirs)
-            .output()
-            .wrap_err("spawn llvm-cov")?;
-        ensure!(
-            out.status.success(),
-            "llvm-cov report failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let out = run_tool(
+            Command::new(&self.cov)
+                .arg("report")
+                .arg(exe)
+                .arg(format!("--instr-profile={}", profdata.display()))
+                .args(&self.source_dirs),
+            "llvm-cov report",
+        )?;
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 
     /// `llvm-profdata merge -sparse`: raw profiles or profdata files in, one
     /// sparse profdata out — counts summed, zero-count functions dropped.
     pub fn merge_sparse(&self, inputs: &[impl AsRef<OsStr>], out: &Path) -> Result<()> {
-        let merged = Command::new(&self.profdata)
-            .arg("merge")
-            .arg("-sparse")
-            .args(inputs)
-            .arg("-o")
-            .arg(out)
-            .output()
-            .wrap_err("spawn llvm-profdata")?;
-        ensure!(
-            merged.status.success(),
-            "llvm-profdata merge -sparse failed: {}",
-            String::from_utf8_lossy(&merged.stderr)
-        );
+        run_tool(
+            Command::new(&self.profdata)
+                .arg("merge")
+                .arg("-sparse")
+                .args(inputs)
+                .arg("-o")
+                .arg(out),
+            "llvm-profdata merge -sparse",
+        )?;
         Ok(())
     }
 
     /// The covered items of `profdata` within the scope, evaluated against `exe`'s coverage
     /// map — the one extraction both a block's bitmap and `report`'s cross-check go through.
     pub fn covered_items(&self, exe: &Path, profdata: &Path) -> Result<Vec<CoveredItem>> {
-        let out = Command::new(&self.cov)
-            .arg("export")
-            .arg(exe)
-            .arg(format!("--instr-profile={}", profdata.display()))
-            .arg("--format=text")
-            // Per-function records are most of the output and add nothing to the file level.
-            .arg("--skip-functions")
-            .args(&self.source_dirs)
-            .output()
-            .wrap_err("spawn llvm-cov")?;
-        ensure!(
-            out.status.success(),
-            "llvm-cov export failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let out = run_tool(
+            Command::new(&self.cov)
+                .arg("export")
+                .arg(exe)
+                .arg(format!("--instr-profile={}", profdata.display()))
+                .arg("--format=text")
+                // Per-function records are most of the output and add nothing to the file level.
+                .arg("--skip-functions")
+                .args(&self.source_dirs),
+            "llvm-cov export",
+        )?;
         parse_export(&String::from_utf8_lossy(&out.stdout), &self.source_dirs)
     }
+}
+
+/// Runs an LLVM tool to completion; a non-zero exit becomes an error carrying its stderr.
+fn run_tool(cmd: &mut Command, what: &str) -> Result<std::process::Output> {
+    let out = cmd.output().wrap_err_with(|| format!("spawn {what}"))?;
+    ensure!(out.status.success(), "{what} failed: {}", String::from_utf8_lossy(&out.stderr));
+    Ok(out)
 }
 
 /// Resolves the source scope: the explicit `--source-dir`s, or the default (mega-evm

@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use alloy_primitives::B256;
+use alloy_primitives::{B256, Bytes};
 use alloy_rpc_types_eth::Block;
 use eyre::{Context, Result, ensure};
 use op_alloy_rpc_types::Transaction as OpTransaction;
@@ -22,8 +22,7 @@ const SPOOL_ZSTD_LEVEL: i32 = 1;
 #[derive(Serialize, Deserialize)]
 pub struct SpoolEntry {
     /// The RPC block re-serialized as JSON (`Block<op_alloy_rpc_types::Transaction>`).
-    #[serde(with = "as_bytes")]
-    pub block_json: Vec<u8>,
+    pub block_json: Bytes,
     /// Execution witness (kvs + levels only, fast to decode).
     pub light_witness: LightWitness,
     /// Contract code hashes this block needs (resolved via the codes dir).
@@ -69,36 +68,6 @@ impl SpoolEntry {
             light_witness: entry.light_witness,
             code_hashes: entry.code_hashes,
         })
-    }
-}
-
-/// `Vec<u8>` through serde's byte-array hooks: the same bincode bytes as the sequence hooks,
-/// without going one element at a time over a multi-megabyte block.
-mod as_bytes {
-    use serde::{
-        Deserializer, Serializer,
-        de::{Error, Visitor},
-    };
-
-    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(bytes)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        struct Bytes;
-        impl Visitor<'_> for Bytes {
-            type Value = Vec<u8>;
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a byte array")
-            }
-            fn visit_bytes<E: Error>(self, bytes: &[u8]) -> Result<Vec<u8>, E> {
-                Ok(bytes.to_vec())
-            }
-            fn visit_byte_buf<E: Error>(self, bytes: Vec<u8>) -> Result<Vec<u8>, E> {
-                Ok(bytes)
-            }
-        }
-        deserializer.deserialize_byte_buf(Bytes)
     }
 }
 
@@ -291,7 +260,7 @@ mod tests {
 
     fn entry(block_json: &[u8]) -> SpoolEntry {
         SpoolEntry {
-            block_json: block_json.to_vec(),
+            block_json: Bytes::copy_from_slice(block_json),
             light_witness: LightWitness { kvs: Default::default(), levels: Default::default() },
             code_hashes: vec![B256::repeat_byte(3)],
         }
@@ -329,28 +298,6 @@ mod tests {
         assert_eq!(SpoolEntry::open(&path, n).unwrap().block.header.inner.number, n);
         let err = SpoolEntry::open(&path, n + 1).err().expect("another block's entry");
         assert!(err.to_string().contains("expected"), "{err}");
-    }
-
-    /// `as_bytes` must encode `block_json` exactly as a plain `Vec<u8>` field does.
-    #[test]
-    fn block_json_bytes_encode_as_the_plain_vec_did() {
-        #[derive(Serialize)]
-        struct Plain {
-            block_json: Vec<u8>,
-            light_witness: LightWitness,
-            code_hashes: Vec<B256>,
-        }
-        let e = entry(&[7u8; 300]);
-        let plain = Plain {
-            block_json: e.block_json.clone(),
-            light_witness: LightWitness { kvs: Default::default(), levels: Default::default() },
-            code_hashes: e.code_hashes.clone(),
-        };
-        let as_bytes = bincode::serde::encode_to_vec(&e, BINCODE_CONFIG).unwrap();
-        assert_eq!(as_bytes, bincode::serde::encode_to_vec(&plain, BINCODE_CONFIG).unwrap());
-        let (back, _): (SpoolEntry, _) =
-            bincode::serde::decode_from_slice(&as_bytes, BINCODE_CONFIG).unwrap();
-        assert_eq!(back.block_json, e.block_json);
     }
 
     #[test]

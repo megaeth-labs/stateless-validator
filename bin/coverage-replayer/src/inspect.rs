@@ -219,9 +219,8 @@ mod tests {
         let path = dir.path().join("pool.txt");
         let written = write_pool(&path, &patterns, &outcome, "megaevm:test:fx0").unwrap();
 
-        let text = std::fs::read_to_string(&path).unwrap();
-        let blocks: Vec<u64> =
-            text.lines().filter(|l| !l.starts_with('#')).map(|l| l.parse().unwrap()).collect();
+        // Read back through the reader `backfill --blocks-file` uses: the format contract.
+        let blocks = crate::backfill::read_blocks_file(&path).unwrap();
         assert_eq!(blocks, vec![10, 20, 30]);
         assert_eq!(written, 3);
         assert!(
@@ -292,12 +291,7 @@ mod tests {
             no_cover_preview: false,
         })
         .unwrap();
-        let blocks: Vec<u64> = std::fs::read_to_string(&pool)
-            .unwrap()
-            .lines()
-            .filter(|l| !l.starts_with('#'))
-            .map(|l| l.parse().unwrap())
-            .collect();
+        let blocks = crate::backfill::read_blocks_file(&pool).unwrap();
         assert_eq!(blocks, vec![10, 30], "block 20's pattern is dominated by block 10's");
 
         run(InspectArgs { data_dir, top: 3, dump_pool: None, no_cover_preview: true }).unwrap();

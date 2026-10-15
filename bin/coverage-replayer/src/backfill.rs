@@ -198,7 +198,7 @@ impl Selection {
 
 /// Parses a block list: one decimal number per line, `#` comments and blanks ignored.
 /// Sorted and deduplicated, so concatenated shard pools replay each block once, in order.
-fn read_blocks_file(path: &Path) -> Result<Vec<u64>> {
+pub(crate) fn read_blocks_file(path: &Path) -> Result<Vec<u64>> {
     let text = std::fs::read_to_string(path)
         .wrap_err_with(|| format!("read block list {}", path.display()))?;
     let mut blocks = Vec::new();
@@ -450,7 +450,7 @@ async fn fetch_block(
     // Serializing a large block is real CPU work, so it runs on the blocking pool with the write.
     let block = block_cache.take().expect("just filled");
     tokio::task::spawn_blocking(move || {
-        let block_json = serde_json::to_vec(&block)?;
+        let block_json = serde_json::to_vec(&block)?.into();
         SpoolEntry { block_json, light_witness, code_hashes }.write_to(&spool_path)
     })
     .await??;
@@ -1043,10 +1043,7 @@ mod tests {
     #[test]
     fn pending_skips_only_clean_replays() {
         use crate::store::test_support::block;
-        let tmp = tempfile::tempdir().unwrap();
-        let dirs = DataDir::new(tmp.path());
-        dirs.ensure_layout().unwrap();
-        let store = Store::open(&dirs.store_path(), "test-id", "f").unwrap();
+        let (_tmp, _dirs, store) = temp_store();
         for (n, status) in [
             (11, BlockStatus::Ok),
             (12, BlockStatus::Error),
@@ -1063,6 +1060,15 @@ mod tests {
         assert_eq!(tail_done.pending(&store).unwrap(), (vec![], 0));
         let list = Selection::List(vec![11, 12, 13, 99]);
         assert_eq!(list.pending(&store).unwrap(), (vec![12, 13], 1));
+    }
+
+    /// A fresh data dir with its store; the guard keeps the directory alive.
+    fn temp_store() -> (tempfile::TempDir, Arc<DataDir>, Store) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Arc::new(DataDir::new(tmp.path()));
+        dirs.ensure_layout().unwrap();
+        let store = Store::open(&dirs.store_path(), "test-id", "f").unwrap();
+        (tmp, dirs, store)
     }
 
     fn counter_info(dense: u32) -> CounterInfo {
@@ -1106,10 +1112,7 @@ mod tests {
 
     #[test]
     fn known_pattern_dedups_and_rehomes_to_lightest() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dirs = Arc::new(DataDir::new(tmp.path()));
-        dirs.ensure_layout().unwrap();
-        let store = Store::open(&dirs.store_path(), "test-id", "f").unwrap();
+        let (_tmp, dirs, store) = temp_store();
         let (key, rec) = seeded_pattern(&[1, 2], &[0, 1], 100, 500);
         let mut judge = judge_with(&store, dirs, vec![(key, rec)]);
 
@@ -1140,10 +1143,7 @@ mod tests {
     /// a protocol breach and must stop the run.
     #[test]
     fn new_items_are_registered_from_the_details_their_worker_reported() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dirs = Arc::new(DataDir::new(tmp.path()));
-        dirs.ensure_layout().unwrap();
-        let store = Store::open(&dirs.store_path(), "test-id", "f").unwrap();
+        let (_tmp, dirs, store) = temp_store();
         // Dominator over dense 0..=3 (id 4 gets dense 3), so {1, 4} archives no profile.
         let (key, rec) = seeded_pattern(&[1, 2, 3, 4], &[0, 1, 2, 3], 100, 500);
         let mut judge = judge_with(&store, dirs, vec![(key, rec)]);
@@ -1220,10 +1220,7 @@ mod tests {
 
     #[test]
     fn dominated_new_pattern_recorded_without_archive() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dirs = Arc::new(DataDir::new(tmp.path()));
-        dirs.ensure_layout().unwrap();
-        let store = Store::open(&dirs.store_path(), "test-id", "f").unwrap();
+        let (_tmp, dirs, store) = temp_store();
         let (dom_key, dom_rec) = seeded_pattern(&[1, 2, 3], &[0, 1, 2], 100, 500);
         let mut judge = judge_with(&store, dirs.clone(), vec![(dom_key, dom_rec)]);
 
@@ -1251,10 +1248,7 @@ mod tests {
     /// a later subset of it archives nothing.
     #[test]
     fn a_new_undominated_pattern_dominates_later_subsets() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dirs = Arc::new(DataDir::new(tmp.path()));
-        dirs.ensure_layout().unwrap();
-        let store = Store::open(&dirs.store_path(), "test-id", "f").unwrap();
+        let (_tmp, dirs, store) = temp_store();
         let mut judge = judge_with(&store, dirs.clone(), vec![]);
         let with_profile = |block: u64, counters: Vec<u64>| {
             std::fs::write(dirs.block_profdata(block), b"sparse profdata").unwrap();
@@ -1272,10 +1266,7 @@ mod tests {
 
     #[test]
     fn replay_error_and_divergence_fail_stop() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dirs = Arc::new(DataDir::new(tmp.path()));
-        dirs.ensure_layout().unwrap();
-        let store = Store::open(&dirs.store_path(), "test-id", "f").unwrap();
+        let (_tmp, dirs, store) = temp_store();
         let mut judge = judge_with(&store, dirs, vec![]);
 
         let mut bad = response(400, vec![1], 100);

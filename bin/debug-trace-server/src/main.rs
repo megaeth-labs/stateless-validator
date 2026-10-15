@@ -2048,21 +2048,15 @@ mod tests {
     #[test]
     fn help_hides_r2_secret_values() {
         use clap::CommandFactory;
-        use stateless_test_utils::env::with_env_var;
-        let guard = stateless_test_utils::env::env_lock();
+        use stateless_test_utils::env::{env_lock, with_env_vars};
+        let guard = env_lock();
         let vars = [
             ("DEBUG_TRACE_SERVER_R2_ACCESS_CLIENT_ID", "leaked-client-id"),
             ("DEBUG_TRACE_SERVER_R2_ACCESS_CLIENT_SECRET", "leaked-client-secret"),
             ("DEBUG_TRACE_SERVER_R2_SECRET_ACCESS_KEY", "leaked-secret-access-key"),
         ];
         // clap reads the env when the command is built, so build it with all three set.
-        let help = with_env_var(&guard, vars[0].0, vars[0].1, || {
-            with_env_var(&guard, vars[1].0, vars[1].1, || {
-                with_env_var(&guard, vars[2].0, vars[2].1, || {
-                    Args::command().render_long_help().to_string()
-                })
-            })
-        });
+        let help = with_env_vars(&guard, &vars, || Args::command().render_long_help().to_string());
         for (name, value) in vars {
             assert!(help.contains(name), "help must still name {name}");
             assert!(!help.contains(value), "help prints the value of {name}");
