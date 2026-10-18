@@ -104,7 +104,6 @@ use crate::chain_sync::{TraceFetcher, TraceHooks, TraceProcessor};
 /// malloc keeps freed memory in its per-thread arenas, so RSS climbs to several times the caches'
 /// accounted bytes while the live heap stays flat. `override_allocator_on_supported_platforms`
 /// routes the C dependencies (zstd, aws-lc) through it too.
-#[cfg(unix)]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
