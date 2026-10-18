@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 exclude.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+tikv-jemallocator.workspace = true
+
 [dependencies]
 # alloy
 alloy-consensus.workspace = true
