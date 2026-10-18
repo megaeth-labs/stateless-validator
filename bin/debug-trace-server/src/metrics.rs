@@ -5,15 +5,17 @@
 //!
 //! Uses `metrics-derive` for declarative metric definitions following mega-reth patterns.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, thread, time::Duration};
 
-use eyre::Result;
+use eyre::{Result, eyre};
 use metrics::{Counter, Gauge, Histogram, counter, gauge, histogram};
 use metrics_derive::Metrics;
 pub use stateless_common::{
     DEFAULT_METRICS_PORT,
     metrics::{BYTE_BUCKETS, REORG_DEPTH_BUCKETS, install_prometheus_exporter},
 };
+use tikv_jemalloc_ctl::{epoch, stats};
+use tracing::warn;
 
 /// Prefix for timed RPC method aliases.
 pub const TIMED_PREFIX: &str = "timed_";
@@ -751,8 +753,7 @@ impl ChainSyncMetrics {
 ///
 /// `allocated` is the live heap and `resident` the physical memory jemalloc holds, so a gap
 /// that widens while `allocated` stays flat is memory the allocator is keeping rather than a
-/// leak — which RSS minus the caches' accounted bytes could only suggest by inference.
-#[cfg(unix)]
+/// leak.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
 pub struct AllocatorMetrics {
@@ -772,13 +773,9 @@ pub struct AllocatorMetrics {
     jemalloc_retained_bytes: Gauge,
 }
 
-#[cfg(unix)]
 impl AllocatorMetrics {
     /// Advances jemalloc's stats epoch and publishes one sample.
     fn sample(&self) {
-        use tikv_jemalloc_ctl::{epoch, stats};
-        use tracing::warn;
-
         // jemalloc caches its statistics; they only refresh when the epoch advances.
         if let Err(error) = epoch::advance() {
             warn!(%error, "Failed to advance the jemalloc stats epoch");
@@ -801,23 +798,24 @@ impl AllocatorMetrics {
 }
 
 /// How often [`spawn_allocator_stats`] samples jemalloc.
-#[cfg(unix)]
-const ALLOCATOR_STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+const ALLOCATOR_STATS_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Samples jemalloc's heap statistics into [`AllocatorMetrics`] every
 /// [`ALLOCATOR_STATS_INTERVAL`] for the process's lifetime.
 ///
-/// On its own thread rather than a runtime task: inline EVM tracing can saturate the
-/// runtime's workers, which is exactly when memory is worth watching.
-#[cfg(unix)]
+/// On its own thread so the epoch refresh, which merges every arena's statistics under the
+/// arenas' locks, never runs on an async worker.
 fn spawn_allocator_stats() -> Result<()> {
     let metrics = AllocatorMetrics::default();
-    std::thread::Builder::new().name("jemalloc-stats".to_owned()).spawn(move || {
-        loop {
-            metrics.sample();
-            std::thread::sleep(ALLOCATOR_STATS_INTERVAL);
-        }
-    })?;
+    thread::Builder::new()
+        .name("jemalloc-stats".to_owned())
+        .spawn(move || {
+            loop {
+                metrics.sample();
+                thread::sleep(ALLOCATOR_STATS_INTERVAL);
+            }
+        })
+        .map_err(|e| eyre!("failed to spawn the jemalloc stats thread: {e}"))?;
     Ok(())
 }
 
@@ -1104,7 +1102,6 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
     // Pre-register all metrics
     pre_register_all_metrics();
 
-    #[cfg(unix)]
     spawn_allocator_stats()?;
 
     Ok(())
@@ -1316,7 +1313,6 @@ mod tests {
     /// The gauges only carry real numbers when jemalloc is the allocator this binary runs on
     /// and was built with statistics (`tikv-jemalloc-ctl`'s `stats` feature); without them
     /// every read fails and the dashboard silently shows nothing.
-    #[cfg(unix)]
     #[test]
     fn allocator_metrics_sample_the_live_heap() {
         use std::collections::HashMap;
