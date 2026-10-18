@@ -103,7 +103,9 @@ use crate::chain_sync::{TraceFetcher, TraceHooks, TraceProcessor};
 /// jemalloc rather than the system allocator: under response- and block-data-cache churn, glibc
 /// malloc keeps freed memory in its per-thread arenas, so RSS climbs to several times the caches'
 /// accounted bytes while the live heap stays flat. `override_allocator_on_supported_platforms`
-/// routes the C dependencies (zstd, aws-lc) through it too.
+/// routes the C dependencies (zstd, aws-lc) through it too. On Linux, `background_threads` purges
+/// freed pages off the request path; without it an arena only returns them while it keeps
+/// allocating, so memory freed by a burst stays resident in every arena that then goes quiet.
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

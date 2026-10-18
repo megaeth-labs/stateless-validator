@@ -1310,6 +1310,16 @@ mod tests {
         assert_eq!(resolve_method("nonexistent"), "unknown");
     }
 
+    /// Background purge threads are what return a burst's freed pages from arenas that then go
+    /// quiet; without the `background_threads` feature RSS stays well above the live heap after
+    /// load, and nothing else would notice the feature going missing. Linux only: jemalloc has no
+    /// background threads on macOS.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn jemalloc_purges_in_the_background() {
+        assert!(tikv_jemalloc_ctl::background_thread::read().unwrap());
+    }
+
     /// The gauges only carry real numbers when jemalloc is the allocator this binary runs on
     /// and was built with statistics (`tikv-jemalloc-ctl`'s `stats` feature); without them
     /// every read fails and the dashboard silently shows nothing.
