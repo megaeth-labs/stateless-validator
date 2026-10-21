@@ -16,7 +16,6 @@ use std::{
 use clap::Args;
 use eyre::{Context, Result};
 use mega_evm::{MegaPrecompiles, MegaSpecId};
-use rustc_hash::FxHashSet;
 use stateless_core::{
     LightWitnessExecutor, WitnessDatabase, WitnessExternalEnv, chain_spec::ChainSpec, replay_block,
 };
@@ -24,7 +23,7 @@ use stateless_core::{
 use crate::{
     llvm::{Llvm, LlvmArgs},
     proto::{WorkerRequest, WorkerResponse},
-    spool::{DataDir, SpoolEntry, Spooled},
+    spool::{DataDir, SpoolEntry},
 };
 
 #[derive(Args, Debug, Clone)]
@@ -62,7 +61,6 @@ pub fn run(args: WorkerArgs) -> Result<()> {
     let exe = crate::profile_rt::own_executable()?;
     warm_up();
 
-    let mut reported = FxHashSet::default();
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
         let line = line?;
@@ -71,7 +69,7 @@ pub fn run(args: WorkerArgs) -> Result<()> {
         }
         let req: WorkerRequest = serde_json::from_str(&line)
             .map_err(|e| eyre::eyre!("bad worker request {line:?}: {e}"))?;
-        let resp = process_block(&dirs, &llvm, &exe, &chain_spec, &req, &mut reported)
+        let resp = process_block(&dirs, &llvm, &exe, &chain_spec, &req)
             .unwrap_or_else(|e| error_response(req.block, format!("{e:#}")));
         let mut frame = serde_json::to_vec(&resp)?;
         frame.push(b'\n');
@@ -108,19 +106,7 @@ fn warm_up() {
 }
 
 fn error_response(block: u64, error: String) -> WorkerResponse {
-    WorkerResponse {
-        block,
-        block_hash: alloy_primitives::B256::ZERO,
-        error: Some(error),
-        gas_ok: false,
-        receipts_root_ok: false,
-        logs_bloom_ok: false,
-        counters: Vec::new(),
-        new_items: Vec::new(),
-        elapsed_ms: 0,
-        tx_count: 0,
-        gas_used: 0,
-    }
+    WorkerResponse { block, error: Some(error), ..Default::default() }
 }
 
 fn process_block(
@@ -129,11 +115,10 @@ fn process_block(
     exe: &std::path::Path,
     chain_spec: &ChainSpec,
     req: &WorkerRequest,
-    reported: &mut FxHashSet<u64>,
 ) -> Result<WorkerResponse> {
     let start = Instant::now();
 
-    let Spooled { block, light_witness, code_hashes } =
+    let (block, SpoolEntry { light_witness, code_hashes, .. }) =
         SpoolEntry::open(&dirs.spool_entry(req.block), req.block)?;
     let header = &block.header.inner;
     let contracts = dirs.load_contracts(&code_hashes)?;
@@ -159,26 +144,33 @@ fn process_block(
         }
     };
 
-    let gas_ok = output.gas_used == header.gas_used;
-    let receipts_root_ok = output.receipts_root == header.receipts_root;
-    let logs_bloom_ok = output.logs_bloom == header.logs_bloom;
+    let mismatches: Vec<String> = [
+        (output.gas_used != header.gas_used)
+            .then(|| format!("gas_used {} != header {}", output.gas_used, header.gas_used)),
+        (output.receipts_root != header.receipts_root).then(|| {
+            format!(
+                "receipts_root {:#x} != header {:#x}",
+                output.receipts_root, header.receipts_root
+            )
+        }),
+        (output.logs_bloom != header.logs_bloom).then(|| "logs_bloom != header".to_string()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let divergence = (!mismatches.is_empty()).then(|| mismatches.join(", "));
 
     let extracted = llvm.extract_covered_items(exe, &profraw, &dirs.block_profdata(req.block));
     // The raw profile is large, and the sparse profdata supersedes it either way.
     let _ = std::fs::remove_file(&profraw);
-    let hits = extracted?;
-    let counters = hits.iter().map(|h| h.id).collect();
-    let new_items = hits.into_iter().filter(|h| reported.insert(h.id)).collect();
+    let counters = extracted?;
 
     Ok(WorkerResponse {
         block: req.block,
         block_hash: block.header.hash,
         error: None,
-        gas_ok,
-        receipts_root_ok,
-        logs_bloom_ok,
+        divergence,
         counters,
-        new_items,
         elapsed_ms: start.elapsed().as_millis() as u64,
         tx_count: block.transactions.len() as u64,
         gas_used: output.gas_used,

@@ -2,7 +2,7 @@
 //! it skips the binary-id check, so another build's store can be analyzed. It never writes.
 
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -10,10 +10,9 @@ use clap::Args;
 use eyre::Result;
 
 use crate::{
-    bitset::BitSet,
-    setcover::{CoverOutcome, select_cover},
+    setcover::{antichain, select_cover, universe_size},
     spool::DataDir,
-    store::{BlockStatus, PatternRecord, Store, elapsed_stats},
+    store::{BlockStatus, ElapsedStats, PatternRecord, Store},
 };
 
 #[derive(Args, Debug, Clone)]
@@ -32,8 +31,8 @@ pub struct InspectArgs {
     #[clap(long)]
     pub dump_pool: Option<PathBuf>,
     /// Skip the antichain statistics and the greedy selection preview (they run the real
-    /// set-cover). Incompatible with `--dump-pool`, which is made of the antichain.
-    #[clap(long, conflicts_with = "dump_pool")]
+    /// set-cover).
+    #[clap(long)]
     pub no_cover_preview: bool,
 }
 
@@ -48,7 +47,7 @@ pub fn run(args: InspectArgs) -> Result<()> {
     // ---- blocks: one streaming pass, folded into totals ----
     let mut total = 0usize;
     let mut ok = 0usize;
-    let mut elapsed: Vec<u64> = Vec::new();
+    let mut elapsed = ElapsedStats::default();
     let mut txs = 0u64;
     let mut gas = 0u128;
     let mut quarantined: Vec<(u64, BlockStatus, String)> = Vec::new();
@@ -56,7 +55,7 @@ pub fn run(args: InspectArgs) -> Result<()> {
         total += 1;
         if rec.status == BlockStatus::Ok {
             ok += 1;
-            elapsed.push(rec.elapsed_ms);
+            elapsed.record(rec.elapsed_ms);
             txs += rec.tx_count;
             gas += rec.gas_used as u128;
         } else {
@@ -66,11 +65,10 @@ pub fn run(args: InspectArgs) -> Result<()> {
     let divergent = quarantined.iter().filter(|q| q.1 == BlockStatus::Divergent).count();
     let errors = quarantined.len() - divergent;
     println!("blocks: total={total} ok={ok} divergent={divergent} error={errors}");
-    if let Some((avg, p50, p95, max)) = elapsed_stats(&mut elapsed) {
+    if let Some((avg, p50, p95, max)) = elapsed.summary() {
         println!("worker elapsed_ms: avg={avg:.0} p50={p50} p95={p95} max={max}");
         println!("txs total={txs}  gas total={gas}");
     }
-    drop(elapsed);
     if !quarantined.is_empty() {
         println!("quarantined blocks:");
         for (n, status, error) in &quarantined {
@@ -80,11 +78,7 @@ pub fn run(args: InspectArgs) -> Result<()> {
     println!();
 
     // ---- patterns ----
-    let mut universe = BitSet::new();
-    for rec in patterns.values() {
-        universe.union_with(&rec.bitmap);
-    }
-    let universe_bits = universe.count_ones();
+    let universe_bits = universe_size(&patterns);
     let mut hits: Vec<(&u64, &PatternRecord)> = patterns.iter().collect();
     let singletons = hits.iter().filter(|(_, r)| r.hit_count == 1).count();
     let bits: Vec<u64> = hits.iter().map(|(_, r)| r.bits).collect();
@@ -114,15 +108,16 @@ pub fn run(args: InspectArgs) -> Result<()> {
     println!();
 
     // ---- set-cover dry run: `select_cover` itself, so it cannot drift from `set-cover` ----
+    let mut preview_antichain = None;
     if !args.no_cover_preview {
         let outcome = select_cover(&patterns);
+        let dominated = patterns.len() - outcome.antichain.len();
         println!();
         println!(
-            "antichain: {} of {} patterns are strictly dominated ({:.1}%) — never cover \
+            "antichain: {dominated} of {} patterns are strictly dominated ({:.1}%) — never cover \
              candidates",
-            outcome.pruned_dominated.len(),
             patterns.len(),
-            100.0 * outcome.pruned_dominated.len() as f64 / patterns.len().max(1) as f64
+            100.0 * dominated as f64 / patterns.len().max(1) as f64
         );
         println!();
         println!("greedy selection preview (matches a real set-cover run):");
@@ -130,17 +125,18 @@ pub fn run(args: InspectArgs) -> Result<()> {
             println!("  {rep:>12}  gain={gain:<6} bits={}", patterns[key].bits);
         }
         println!(
-            "  => {} blocks cover {}/{}",
+            "  => {} blocks cover all {} counters",
             outcome.selected.len(),
-            outcome.covered_counters,
             outcome.universe_counters
         );
+        preview_antichain = Some(outcome.antichain);
+    }
 
-        if let Some(path) = &args.dump_pool {
-            let written = write_pool(path, &patterns, &outcome, &binary_id)?;
-            println!();
-            println!("candidate pool: {written} blocks written to {}", path.display());
-        }
+    if let Some(path) = &args.dump_pool {
+        let antichain = preview_antichain.unwrap_or_else(|| antichain(&patterns));
+        let written = write_pool(path, &patterns, &antichain, &binary_id)?;
+        println!();
+        println!("candidate pool: {written} blocks written to {}", path.display());
     }
 
     // ---- manifest ----
@@ -149,9 +145,8 @@ pub fn run(args: InspectArgs) -> Result<()> {
         let manifest = crate::setcover::Manifest::read(&manifest_path)?;
         println!();
         println!(
-            "manifest: {} blocks cover {}/{} counters (generated_at_unix={})",
+            "manifest: {} blocks cover {} counters (generated_at_unix={})",
             manifest.blocks.len(),
-            manifest.covered_counters,
             manifest.universe_counters,
             manifest.generated_at_unix
         );
@@ -165,11 +160,9 @@ pub fn run(args: InspectArgs) -> Result<()> {
 fn write_pool(
     path: &Path,
     patterns: &HashMap<u64, PatternRecord>,
-    outcome: &CoverOutcome,
+    antichain: &[u64],
     binary_id: &str,
 ) -> Result<usize> {
-    let dominated: HashSet<u64> = outcome.pruned_dominated.iter().copied().collect();
-    let antichain: Vec<u64> = patterns.keys().copied().filter(|k| !dominated.contains(k)).collect();
     let blocks: BTreeSet<u64> = antichain.iter().map(|k| patterns[k].representative).collect();
 
     let generated_at = crate::setcover::unix_now();
@@ -181,7 +174,7 @@ fn write_pool(
         "# patterns: {} total, {} antichain, {} dominated\n",
         patterns.len(),
         antichain.len(),
-        dominated.len(),
+        patterns.len() - antichain.len(),
     ));
     out.push_str(&format!("# blocks: {}\n", blocks.len()));
     for n in &blocks {
@@ -194,7 +187,10 @@ fn write_pool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::{BlockRecord, test_support::pattern as pat};
+    use crate::store::{
+        BlockRecord,
+        test_support::{pattern as pat, temp_store},
+    };
 
     fn block(pattern_key: u64) -> BlockRecord {
         crate::store::test_support::block(BlockStatus::Ok, Some(pattern_key))
@@ -213,11 +209,11 @@ mod tests {
 
         let cover: Vec<u64> = outcome.selected.iter().map(|(_, rep, _)| *rep).collect();
         assert_eq!(cover, vec![20, 30], "greedy reaches full coverage without block 10");
-        assert!(outcome.pruned_dominated.is_empty(), "no pattern is dominated here");
+        assert_eq!(outcome.antichain.len(), patterns.len(), "no pattern is dominated here");
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.txt");
-        let written = write_pool(&path, &patterns, &outcome, "megaevm:test:fx0").unwrap();
+        let written = write_pool(&path, &patterns, &outcome.antichain, "megaevm:test:fx0").unwrap();
 
         // Read back through the reader `backfill --blocks-file` uses: the format contract.
         let blocks = crate::backfill::read_blocks_file(&path).unwrap();
@@ -233,10 +229,10 @@ mod tests {
     #[test]
     fn pool_header_records_provenance_and_stays_commented() {
         let patterns = three_patterns();
-        let outcome = select_cover(&patterns);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pool.txt");
-        write_pool(&path, &patterns, &outcome, "megaevm:19f3965962c4:fxdeadbeef").unwrap();
+        write_pool(&path, &patterns, &antichain(&patterns), "megaevm:19f3965962c4:fxdeadbeef")
+            .unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# binary_id: megaevm:19f3965962c4:fxdeadbeef"), "{text}");
@@ -248,52 +244,33 @@ mod tests {
         );
     }
 
-    /// `run` over a real store: the pool is the antichain, and `--no-cover-preview` still runs.
+    /// `run` over a real store: the pool is the antichain, with or without the cover preview.
     #[test]
     fn run_exports_the_pool_from_a_real_store() {
-        let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join("data");
-        std::fs::create_dir_all(&data_dir).unwrap();
-        {
-            let store = Store::open(&data_dir.join("store.redb"), "megaevm:test:fx0", "u").unwrap();
-            // 10 ⊃ 20 (dominated); 30 is unrelated. Counters 0..=3, dense = id.
-            for (block_number, bits) in [(10u64, vec![0u32, 1, 2]), (20, vec![0, 1]), (30, vec![3])]
-            {
-                let counters: Vec<(u64, crate::store::CounterInfo)> = bits
-                    .iter()
-                    .map(|&b| {
-                        let info = crate::store::CounterInfo {
-                            dense: b,
-                            location: "s".into(),
-                            kind: "h".into(),
-                            line: b,
-                        };
-                        (b as u64, info)
-                    })
-                    .collect();
-                store
-                    .commit_block(
-                        block_number,
-                        &block(block_number),
-                        &counters,
-                        Some((block_number, &pat(&bits, block_number))),
-                    )
-                    .unwrap();
-            }
-            store.flush().unwrap();
+        let (dir, dirs, store) = temp_store();
+        // 10 ⊃ 20 (dominated); 30 is unrelated. Counters 0..=3, dense = id.
+        for (block_number, bits) in [(10u64, vec![0u32, 1, 2]), (20, vec![0, 1]), (30, vec![3])] {
+            let counters: Vec<(u64, u32)> = bits.iter().map(|&b| (b as u64, b)).collect();
+            let pattern = pat(&bits, block_number);
+            store
+                .commit_block(
+                    block_number,
+                    &block(block_number),
+                    &counters,
+                    Some((block_number, &pattern)),
+                )
+                .unwrap();
         }
+        store.flush().unwrap();
+        drop(store);
 
-        let pool = dir.path().join("pool.txt");
-        run(InspectArgs {
-            data_dir: data_dir.clone(),
-            top: 3,
-            dump_pool: Some(pool.clone()),
-            no_cover_preview: false,
-        })
-        .unwrap();
-        let blocks = crate::backfill::read_blocks_file(&pool).unwrap();
-        assert_eq!(blocks, vec![10, 30], "block 20's pattern is dominated by block 10's");
-
-        run(InspectArgs { data_dir, top: 3, dump_pool: None, no_cover_preview: true }).unwrap();
+        for no_cover_preview in [false, true] {
+            let pool = dir.path().join(format!("pool-{no_cover_preview}.txt"));
+            let data_dir = dirs.root.clone();
+            run(InspectArgs { data_dir, top: 3, dump_pool: Some(pool.clone()), no_cover_preview })
+                .unwrap();
+            let blocks = crate::backfill::read_blocks_file(&pool).unwrap();
+            assert_eq!(blocks, vec![10, 30], "block 20's pattern is dominated by block 10's");
+        }
     }
 }

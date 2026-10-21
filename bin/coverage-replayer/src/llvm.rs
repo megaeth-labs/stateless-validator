@@ -23,16 +23,14 @@ use std::{
 
 use eyre::{Context, Result, ensure};
 use rustc_hash::FxHasher;
-use serde::{Deserialize, Serialize};
 
 /// Version of the item definition, stamped into every store (see [`universe_stamp`]). Bump
 /// it whenever the id, the set of item kinds, or what a block's bitmap records changes (e.g.
 /// what `worker::warm_up` keeps out of it): two definitions must never share a store.
 const ITEM_UNIVERSE: &str = "regions+branch-arms/v3";
 
-/// What a covered item is, for the provenance columns of the store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+/// What a covered item is; part of its id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemKind {
     /// A region-entry segment with a non-zero evaluated count.
     Region,
@@ -50,17 +48,6 @@ impl ItemKind {
             Self::BranchFalse => "branch-false",
         }
     }
-}
-
-/// A covered item observed in one profile, with its stable id — also what a
-/// worker reports for ids new to it (see `proto::WorkerResponse::new_items`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CoveredItem {
-    pub id: u64,
-    /// `<source dir name>/<path inside it>:<line>:<col>`.
-    pub location: String,
-    pub kind: ItemKind,
-    pub line: u32,
 }
 
 /// Stable 64-bit id of a covered item (FxHasher is seed-free and deterministic). `scoped_path`
@@ -152,7 +139,7 @@ impl Llvm {
         args
     }
 
-    /// Turns one block's profraw into its covered items, leaving the sparse profdata at
+    /// Turns one block's profraw into its covered items' ids, leaving the sparse profdata at
     /// `profdata` for the judge to archive. `exe` must be the instrumented binary that wrote
     /// the profraw: its coverage map is what gives the counters their meaning.
     pub fn extract_covered_items(
@@ -160,7 +147,7 @@ impl Llvm {
         exe: &Path,
         profraw: &Path,
         profdata: &Path,
-    ) -> Result<Vec<CoveredItem>> {
+    ) -> Result<Vec<u64>> {
         self.merge_sparse(&[profraw], profdata)?;
         self.covered_items(exe, profdata)
     }
@@ -193,9 +180,10 @@ impl Llvm {
         Ok(())
     }
 
-    /// The covered items of `profdata` within the scope, evaluated against `exe`'s coverage
-    /// map — the one extraction both a block's bitmap and `report`'s cross-check go through.
-    pub fn covered_items(&self, exe: &Path, profdata: &Path) -> Result<Vec<CoveredItem>> {
+    /// The ids of `profdata`'s covered items within the scope, evaluated against `exe`'s
+    /// coverage map — the one extraction both a block's bitmap and `report`'s cross-check go
+    /// through.
+    pub fn covered_items(&self, exe: &Path, profdata: &Path) -> Result<Vec<u64>> {
         let out = run_tool(
             Command::new(&self.cov)
                 .arg("export")
@@ -276,11 +264,10 @@ fn resolve_source_dirs(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
 fn detect_registry_crate(cargo_home: &Path, name_version: &str) -> Result<PathBuf> {
     let src = cargo_home.join("registry").join("src");
     let candidates: Vec<PathBuf> = std::fs::read_dir(&src)
-        .map(|indexes| {
-            indexes.flatten().map(|index| index.path().join(name_version)).collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
         .into_iter()
+        .flatten()
+        .flatten()
+        .map(|index| index.path().join(name_version))
         .filter(|candidate| candidate.is_dir())
         .collect();
     one_candidate(candidates, &format!("the sources of {name_version} under {}", src.display()))
@@ -293,9 +280,9 @@ fn detect_mega_evm_checkout(cargo_home: &Path) -> Result<PathBuf> {
     ensure!(rev.len() == 7, "the built-against mega-evm rev {rev:?} is too short to locate");
     let checkouts = cargo_home.join("git").join("checkouts");
     let candidates: Vec<PathBuf> = std::fs::read_dir(&checkouts)
-        .map(|repos| repos.flatten().collect::<Vec<_>>())
-        .unwrap_or_default()
         .into_iter()
+        .flatten()
+        .flatten()
         .filter(|repo| repo.file_name().to_string_lossy().starts_with("mega-evm-"))
         .map(|repo| repo.path().join(&rev))
         .filter(|candidate| candidate.is_dir())
@@ -386,11 +373,26 @@ fn ensure_every_root_matched(filenames: &[&str], source_dirs: &[PathBuf]) -> Res
     Ok(())
 }
 
-/// Parses `llvm-cov export --format=text --skip-functions` output. Per file, `segments` are
-/// `[line, col, count, has_count, is_region_entry, is_gap]` and `branches` are `[line, col,
-/// end_line, end_col, true_count, false_count, ...]`. A generic function has one branch
-/// record per instantiation at one span; arms are OR-ed, as the item is the source arm.
-pub fn parse_export(json: &str, source_dirs: &[PathBuf]) -> Result<Vec<CoveredItem>> {
+/// The ids of the covered items in `llvm-cov export` output, sorted and deduplicated. A generic
+/// function has one branch record per instantiation at one span; deduplicating the ids ORs
+/// their arms, as the item is the source arm.
+pub fn parse_export(json: &str, source_dirs: &[PathBuf]) -> Result<Vec<u64>> {
+    let mut ids = Vec::new();
+    visit_covered_items(json, source_dirs, |kind, path, span| ids.push(item_id(kind, path, span)))?;
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// Calls `visit` with the kind, root-scoped path and span of every covered item of an
+/// `llvm-cov export --format=text --skip-functions` output. Per file, `segments` are `[line,
+/// col, count, has_count, is_region_entry, is_gap]` and `branches` are `[line, col, end_line,
+/// end_col, true_count, false_count, ...]`.
+fn visit_covered_items(
+    json: &str,
+    source_dirs: &[PathBuf],
+    mut visit: impl FnMut(ItemKind, &str, [u32; 4]),
+) -> Result<()> {
     let root: serde_json::Value = serde_json::from_str(json).wrap_err("parse llvm-cov export")?;
     let files = root["data"][0]["files"]
         .as_array()
@@ -403,7 +405,6 @@ pub fn parse_export(json: &str, source_dirs: &[PathBuf]) -> Result<Vec<CoveredIt
     };
     let coord = |v: &serde_json::Value| v.as_u64().unwrap_or(0) as u32;
 
-    let mut items = Vec::new();
     for file in files {
         let filename = file["filename"].as_str().unwrap_or_default();
         // Roots are disjoint (`resolve_source_dirs`), so the first match is the only one.
@@ -415,15 +416,6 @@ pub fn parse_export(json: &str, source_dirs: &[PathBuf]) -> Result<Vec<CoveredIt
             })
             .unwrap_or_else(|| filename.to_string());
 
-        let mut push = |kind: ItemKind, span: [u32; 4]| {
-            items.push(CoveredItem {
-                id: item_id(kind, &rel, span),
-                location: format!("{rel}:{}:{}", span[0], span[1]),
-                kind,
-                line: span[0],
-            });
-        };
-
         for seg in file["segments"].as_array().into_iter().flatten() {
             let (has_count, is_entry, is_gap) = (
                 seg[3].as_bool().unwrap_or(false),
@@ -431,22 +423,20 @@ pub fn parse_export(json: &str, source_dirs: &[PathBuf]) -> Result<Vec<CoveredIt
                 seg[5].as_bool().unwrap_or(false),
             );
             if has_count && is_entry && !is_gap && nonzero(&seg[2]) {
-                push(ItemKind::Region, [coord(&seg[0]), coord(&seg[1]), 0, 0]);
+                visit(ItemKind::Region, &rel, [coord(&seg[0]), coord(&seg[1]), 0, 0]);
             }
         }
         for br in file["branches"].as_array().into_iter().flatten() {
             let span = [coord(&br[0]), coord(&br[1]), coord(&br[2]), coord(&br[3])];
             if nonzero(&br[4]) {
-                push(ItemKind::BranchTrue, span);
+                visit(ItemKind::BranchTrue, &rel, span);
             }
             if nonzero(&br[5]) {
-                push(ItemKind::BranchFalse, span);
+                visit(ItemKind::BranchFalse, &rel, span);
             }
         }
     }
-    items.sort_by_key(|i| i.id);
-    items.dedup_by_key(|i| i.id);
-    Ok(items)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -464,34 +454,48 @@ mod tests {
         vec![PathBuf::from("/tmp/covfix/src")]
     }
 
-    fn ids(items: &[CoveredItem]) -> HashSet<u64> {
-        items.iter().map(|i| i.id).collect()
+    fn ids(json: &str, dirs: &[PathBuf]) -> HashSet<u64> {
+        parse_export(json, dirs).unwrap().into_iter().collect()
+    }
+
+    /// `(kind, "<scoped path>:<line>:<col>")` of every covered item, sorted and deduplicated.
+    fn items(json: &str, dirs: &[PathBuf]) -> Vec<(ItemKind, String)> {
+        let mut items = Vec::new();
+        visit_covered_items(json, dirs, |kind, path, span| {
+            items.push((kind, format!("{path}:{}:{}", span[0], span[1])))
+        })
+        .unwrap();
+        items.sort_by(|a, b| (a.0.as_str(), &a.1).cmp(&(b.0.as_str(), &b.1)));
+        items.dedup();
+        items
     }
 
     /// THE property physical counters violate: two runs through opposite arms of one function
     /// must each hold an item the other lacks.
     #[test]
     fn opposite_branch_arms_never_dominate_each_other() {
-        let then_only = parse_export(THEN_ONLY, &scope()).unwrap();
-        let else_only = parse_export(ELSE_ONLY, &scope()).unwrap();
-        let (a, b) = (ids(&then_only), ids(&else_only));
+        let (a, b) = (ids(THEN_ONLY, &scope()), ids(ELSE_ONLY, &scope()));
         assert!(!a.is_subset(&b) && !b.is_subset(&a), "one arm's items dominate the other's");
 
-        let arms = |items: &[CoveredItem]| -> Vec<ItemKind> {
-            items.iter().filter(|i| i.kind != ItemKind::Region).map(|i| i.kind).collect()
+        let arms = |json: &str| -> Vec<ItemKind> {
+            items(json, &scope())
+                .into_iter()
+                .map(|(k, _)| k)
+                .filter(|k| *k != ItemKind::Region)
+                .collect()
         };
-        assert_eq!(arms(&then_only), vec![ItemKind::BranchTrue]);
-        assert_eq!(arms(&else_only), vec![ItemKind::BranchFalse]);
+        assert_eq!(arms(THEN_ONLY), vec![ItemKind::BranchTrue]);
+        assert_eq!(arms(ELSE_ONLY), vec![ItemKind::BranchFalse]);
     }
 
     /// Only region ENTRIES with a count are items, not closing or zero-count segments.
     #[test]
     fn counts_region_entries_with_a_nonzero_count_only() {
-        let then_only = parse_export(THEN_ONLY, &scope()).unwrap();
+        let then_only = items(THEN_ONLY, &scope());
         let regions: Vec<&str> = then_only
             .iter()
-            .filter(|i| i.kind == ItemKind::Region)
-            .map(|i| i.location.as_str())
+            .filter(|(kind, _)| *kind == ItemKind::Region)
+            .map(|(_, location)| location.as_str())
             .collect();
         // Line 3: the condition (col 8) and the then-arm (cols 16, 18) ran;
         // the else-arm's regions (cols 43, 45) have count 0 and must be absent.
@@ -507,10 +511,10 @@ mod tests {
     #[test]
     fn ids_do_not_depend_on_where_the_source_dir_lives() {
         let moved = THEN_ONLY.replace("/tmp/covfix/src", "/another/home/.cargo/src");
-        let here = parse_export(THEN_ONLY, &scope()).unwrap();
-        let there = parse_export(&moved, &[PathBuf::from("/another/home/.cargo/src")]).unwrap();
-        assert_eq!(ids(&here), ids(&there));
-        assert!(here.iter().all(|i| i.location.starts_with("src/t.rs:")), "{}", here[0].location);
+        let there = [PathBuf::from("/another/home/.cargo/src")];
+        assert_eq!(ids(THEN_ONLY, &scope()), ids(&moved, &there));
+        let here = items(THEN_ONLY, &scope());
+        assert!(here.iter().all(|(_, l)| l.starts_with("src/t.rs:")), "{here:?}");
     }
 
     /// The same span in two roots' `src/lib.rs` is two items, not one.
@@ -520,12 +524,8 @@ mod tests {
             {"filename":"/r/revm-handler-8.1.0/src/lib.rs","segments":[[10,5,1,true,true,false]],"branches":[]},
             {"filename":"/r/revm-context-8.0.4/src/lib.rs","segments":[[10,5,1,true,true,false]],"branches":[]}]}]}"#;
         let dirs = [PathBuf::from("/r/revm-handler-8.1.0"), PathBuf::from("/r/revm-context-8.0.4")];
-        let items = parse_export(json, &dirs).unwrap();
-
-        assert_eq!(items.len(), 2, "one item per root, not one shared: {items:?}");
-        assert_ne!(items[0].id, items[1].id);
-        let mut locations: Vec<&str> = items.iter().map(|i| i.location.as_str()).collect();
-        locations.sort_unstable();
+        assert_eq!(ids(json, &dirs).len(), 2, "one item per root, not one shared");
+        let locations: Vec<String> = items(json, &dirs).into_iter().map(|(_, l)| l).collect();
         assert_eq!(
             locations,
             ["revm-context-8.0.4/src/lib.rs:10:5", "revm-handler-8.1.0/src/lib.rs:10:5"]
@@ -537,9 +537,9 @@ mod tests {
     fn branch_arms_are_merged_across_instantiations() {
         let json = r#"{"data":[{"files":[{"filename":"/s/a.rs","segments":[],
             "branches":[[7,4,7,9,0,3,0,0,4],[7,4,7,9,2,0,1,1,4],[7,4,7,9,0,5,2,2,4]]}]}]}"#;
-        let items = parse_export(json, &[PathBuf::from("/s")]).unwrap();
-        let mut kinds: Vec<ItemKind> = items.iter().map(|i| i.kind).collect();
-        kinds.sort_by_key(|k| k.as_str());
+        let dirs = [PathBuf::from("/s")];
+        assert_eq!(ids(json, &dirs).len(), 2, "one item per arm, not per instantiation");
+        let kinds: Vec<ItemKind> = items(json, &dirs).into_iter().map(|(k, _)| k).collect();
         assert_eq!(kinds, vec![ItemKind::BranchFalse, ItemKind::BranchTrue]);
     }
 

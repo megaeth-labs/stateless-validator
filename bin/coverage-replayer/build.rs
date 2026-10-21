@@ -18,9 +18,10 @@ fn rustc(args: &[&str]) -> String {
 fn main() {
     let lock = std::fs::read_to_string("../../Cargo.lock")
         .expect("coverage-replayer build: cannot read the workspace Cargo.lock");
+    let packages = locked_packages(&lock);
     // mega-evm's locked git rev anchors the namespace, so a missing one (e.g. a path
     // override) is a build error rather than distinct builds sharing one namespace.
-    let mega_evm = mega_evm_rev(&lock).expect(
+    let mega_evm = mega_evm_rev(&packages).expect(
         "coverage-replayer build: no git revision for `mega-evm` in Cargo.lock. \
              The store namespace (binary_id) is anchored on that rev; if you are \
              deliberately overriding mega-evm with a path dependency, extend build.rs \
@@ -51,7 +52,8 @@ fn main() {
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .flat_map(|name| {
-            let versions = locked_versions(&lock, name);
+            let versions: Vec<&str> =
+                packages.iter().filter(|p| p.name == name).map(|p| p.version).collect();
             assert!(
                 !versions.is_empty(),
                 "coverage-replayer build: measured crate `{name}` is not in Cargo.lock"
@@ -72,16 +74,25 @@ fn main() {
     let sysroot = rustc(&["--print", "sysroot"]);
     let sysroot = sysroot.trim();
 
+    // The store namespace: why each input belongs in it is on `store::BINARY_ID`.
+    let measured = measured.join(",");
+    let mut fingerprint = Vec::new();
+    for part in [mega_evm.as_str(), &toolchain, &measured, &lock] {
+        fingerprint.extend_from_slice(part.as_bytes());
+        // Never a byte of UTF-8, so no two splits of the inputs hash alike.
+        fingerprint.push(0xff);
+    }
+    let binary_id =
+        format!("megaevm:{}:fnv{:016x}", &mega_evm[..mega_evm.len().min(12)], fnv1a(&fingerprint));
+
     println!("cargo:rustc-env=COVERAGE_CARGO_HOME={cargo_home}");
     println!("cargo:rustc-env=COVERAGE_RUSTC_SYSROOT={sysroot}");
     println!("cargo:rerun-if-env-changed=CARGO_HOME");
     println!("cargo:rerun-if-env-changed=HOME");
-    // The lockfile as a whole: why it belongs in `binary_id` is on `store::current_binary_id`.
-    println!("cargo:rustc-env=COVERAGE_LOCKFILE_DIGEST={:016x}", fnv1a(lock.as_bytes()));
+    println!("cargo:rustc-env=COVERAGE_BINARY_ID={binary_id}");
     println!("cargo:rustc-env=COVERAGE_MEGA_EVM_REV={mega_evm}");
-    println!("cargo:rustc-env=COVERAGE_MEASURED_CRATES={}", measured.join(","));
+    println!("cargo:rustc-env=COVERAGE_MEASURED_CRATES={measured}");
     println!("cargo:rerun-if-changed=measured-crates.txt");
-    println!("cargo:rustc-env=COVERAGE_RUSTC_VERSION={toolchain}");
     // Re-run when the lockfile changes: the rev, the versions and the digest come from it.
     println!("cargo:rerun-if-changed=../../Cargo.lock");
 }
@@ -94,33 +105,38 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         .fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
 }
 
-/// The full git rev of `mega-evm` in Cargo.lock, from its source line:
-/// `source = "git+https://github.com/megaeth-labs/mega-evm.git?tag=vX#<rev>"`.
-fn mega_evm_rev(lock: &str) -> Option<String> {
-    let mut in_mega = false;
-    for line in lock.lines() {
-        let line = line.trim();
-        if line == "name = \"mega-evm\"" {
-            in_mega = true;
-        } else if in_mega && line.starts_with("source = ") && line.contains("mega-evm.git") {
-            return line.rsplit('#').next().map(|s| s.trim_end_matches('"').to_string());
-        } else if line.starts_with("[[package]]") {
-            in_mega = false;
-        }
-    }
-    None
+/// One `[[package]]` entry of Cargo.lock.
+struct LockedPackage<'a> {
+    name: &'a str,
+    version: &'a str,
+    source: Option<&'a str>,
 }
 
-/// Every locked version of the registry package `name` (normally one).
-fn locked_versions(lock: &str, name: &str) -> Vec<String> {
-    let mut versions = Vec::new();
-    let mut lines = lock.lines().map(str::trim);
-    while let Some(line) = lines.next() {
-        if line == format!("name = \"{name}\"") &&
-            let Some(version) = lines.next().and_then(|l| l.strip_prefix("version = "))
-        {
-            versions.push(version.trim_matches('"').to_string());
-        }
-    }
-    versions
+/// Every `[[package]]` entry of Cargo.lock, read field by field rather than by line order.
+fn locked_packages(lock: &str) -> Vec<LockedPackage<'_>> {
+    lock.split("[[package]]")
+        .skip(1)
+        .map(|entry| {
+            let field = |key: &str| {
+                entry.lines().find_map(|line| {
+                    let value = line.trim().strip_prefix(key)?.strip_prefix(" = ")?;
+                    Some(value.trim_matches('"'))
+                })
+            };
+            LockedPackage {
+                name: field("name").unwrap_or_default(),
+                version: field("version").unwrap_or_default(),
+                source: field("source"),
+            }
+        })
+        .collect()
+}
+
+/// The full git rev of `mega-evm`, from its source:
+/// `git+https://github.com/megaeth-labs/mega-evm.git?tag=vX#<rev>`.
+fn mega_evm_rev(packages: &[LockedPackage<'_>]) -> Option<String> {
+    packages.iter().filter(|p| p.name == "mega-evm").find_map(|p| {
+        let (repo, rev) = p.source?.rsplit_once('#')?;
+        repo.contains("mega-evm.git").then(|| rev.to_string())
+    })
 }

@@ -137,7 +137,7 @@ debug = true
 # instrumented (see the wrapper for why that matters); the explicit --target is
 # how it tells host artifacts apart. Build with:
 #   RUSTC_WRAPPER="$PWD/bin/coverage-replayer/cov-rustc-wrapper.sh" \
-#     cargo build --profile coverage -p coverage-replayer --features coverage \
+#     cargo build --profile coverage -p coverage-replayer \
 #       --target "$(rustc -vV | sed -n 's/host: //p')"
 [profile.coverage]
 inherits = "release"

@@ -1,12 +1,13 @@
 //! Thin wrapper around the LLVM profiler runtime that `-C instrument-coverage` links in.
 //! Its C symbols exist only in an instrumented build, so they are gated behind the
-//! `coverage` feature; without it `write_profraw` tells the operator to rebuild.
+//! `coverage_replayer_instrumented` cfg, which `cov-rustc-wrapper.sh` sets exactly when it
+//! instruments this crate; without it `write_profraw` tells the operator to rebuild.
 
 use std::path::Path;
 
 use eyre::Result;
 
-#[cfg(feature = "coverage")]
+#[cfg(coverage_replayer_instrumented)]
 mod ffi {
     unsafe extern "C" {
         pub fn __llvm_profile_reset_counters();
@@ -16,16 +17,16 @@ mod ffi {
 }
 
 /// Resets all coverage counters of the current process to zero.
-#[cfg(feature = "coverage")]
+#[cfg(coverage_replayer_instrumented)]
 pub fn reset_counters() {
     unsafe { ffi::__llvm_profile_reset_counters() }
 }
 
-#[cfg(not(feature = "coverage"))]
+#[cfg(not(coverage_replayer_instrumented))]
 pub fn reset_counters() {}
 
 /// Writes the current counter values to `path` as a `.profraw` file.
-#[cfg(feature = "coverage")]
+#[cfg(coverage_replayer_instrumented)]
 pub fn write_profraw(path: &Path) -> Result<()> {
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|e| eyre::eyre!("profraw path contains NUL: {e}"))?;
@@ -41,21 +42,21 @@ pub fn write_profraw(path: &Path) -> Result<()> {
 
 /// Sends the runtime's automatic at-exit profile write to /dev/null, so an instrumented
 /// process does not drop a stray `default_*.profraw` into the current directory.
-#[cfg(feature = "coverage")]
+#[cfg(coverage_replayer_instrumented)]
 pub fn suppress_default_profile() {
     static DEV_NULL: &std::ffi::CStr = c"/dev/null";
     unsafe { ffi::__llvm_profile_set_filename(DEV_NULL.as_ptr()) }
 }
 
-#[cfg(not(feature = "coverage"))]
+#[cfg(not(coverage_replayer_instrumented))]
 pub fn suppress_default_profile() {}
 
-#[cfg(not(feature = "coverage"))]
+#[cfg(not(coverage_replayer_instrumented))]
 pub fn write_profraw(_path: &Path) -> Result<()> {
     eyre::bail!(
-        "this binary was built without the `coverage` feature; rebuild with \
+        "this binary was built without coverage instrumentation; rebuild with \
          RUSTC_WRAPPER=\"$PWD/bin/coverage-replayer/cov-rustc-wrapper.sh\" \
-         cargo build --profile coverage -p coverage-replayer --features coverage \
+         cargo build --profile coverage -p coverage-replayer \
          --target \"$(rustc -vV | sed -n 's/host: //p')\" \
          — the explicit --target is required: it is how the wrapper tells the \
          code to instrument from host artifacts"
@@ -64,7 +65,7 @@ pub fn write_profraw(_path: &Path) -> Result<()> {
 
 /// Whether this binary can capture coverage at all.
 pub const fn is_instrumented_build() -> bool {
-    cfg!(feature = "coverage")
+    cfg!(coverage_replayer_instrumented)
 }
 
 /// Refuses a profile directory containing `%`: the runtime reads `%p`, `%h`, `%m`, ... in a

@@ -10,7 +10,7 @@
 //!
 //! ## Carrying a scan across a mega-evm bump
 //!
-//! Bitmaps belong to one instrumented build ([`store::current_binary_id`]), so `backfill` and
+//! Bitmaps belong to one instrumented build ([`store::BINARY_ID`]), so `backfill` and
 //! `set-cover` refuse an old store; the *block numbers* survive, so the tool carries those over:
 //!
 //! ```text
@@ -111,18 +111,6 @@ mod tests {
         let rendered = err.to_string();
         assert!(rendered.contains("--bogus"), "error must name the flag: {rendered}");
         assert!(rendered.contains("Usage:"), "error must carry usage: {rendered}");
-    }
-
-    /// The pool comes from the cover pass, so `--dump-pool` must conflict with skipping it.
-    #[test]
-    fn pool_export_conflicts_with_skipping_the_cover_pass() {
-        let base = ["coverage-replayer", "inspect", "--data-dir", "/d"];
-        let parse = |extra: &[&str]| Cli::try_parse_from(base.iter().chain(extra.iter()));
-
-        let err = parse(&["--no-cover-preview", "--dump-pool", "/p"]).expect_err("must conflict");
-        assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{err}");
-        parse(&["--no-cover-preview"]).expect("alone is fine");
-        parse(&["--dump-pool", "/p"]).expect("alone is fine");
     }
 
     #[test]

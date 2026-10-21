@@ -5,7 +5,10 @@
 //! picks the rest cover. Minimality is best-effort on top, never at its expense. Gain ties go
 //! to the higher block number, so a store always yields the same selection.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use clap::Args;
 use eyre::{Context, Result};
@@ -15,7 +18,7 @@ use tracing::info;
 use crate::{
     bitset::BitSet,
     spool::DataDir,
-    store::{Store, current_binary_id},
+    store::{BINARY_ID, PatternRecord, Store},
 };
 
 #[derive(Args, Debug, Clone)]
@@ -35,8 +38,8 @@ pub struct Manifest {
     /// only one `report` will measure it against (see `report::check_manifest`).
     pub universe: String,
     pub generated_at_unix: u64,
+    /// Items in the universe, every one of which the cover covers (see the module docs).
     pub universe_counters: u64,
-    pub covered_counters: u64,
     pub blocks: Vec<ManifestBlock>,
 }
 
@@ -77,16 +80,15 @@ pub fn unix_now() -> u64 {
 
 pub fn run(args: SetCoverArgs) -> Result<()> {
     let dirs = DataDir::new(&args.data_dir);
-    let binary_id = current_binary_id();
-    let store = Store::open_for_build(&dirs.store_path(), &binary_id)?;
+    let store = Store::open_for_build(&dirs.store_path(), BINARY_ID)?;
     // Patterns only: selection needs no block records; the picks' hashes are looked up after.
     let patterns = store.patterns()?;
 
     info!(patterns = patterns.len(), "computing greedy set cover");
     let outcome = select_cover(&patterns);
     info!(
-        pruned = outcome.pruned_dominated.len(),
-        antichain = patterns.len() - outcome.pruned_dominated.len(),
+        pruned = patterns.len() - outcome.antichain.len(),
+        antichain = outcome.antichain.len(),
         "dominated patterns excluded from the candidates"
     );
     for rep in &outcome.redundant_removed {
@@ -94,7 +96,6 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
     }
 
     let universe_counters = outcome.universe_counters;
-    let covered_counters = outcome.covered_counters;
     let representatives: Vec<u64> = outcome.selected.iter().map(|(_, rep, _)| *rep).collect();
     let records = store.block_records(&representatives)?;
     let blocks: Vec<ManifestBlock> = outcome
@@ -115,12 +116,11 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
         .collect();
 
     let manifest = Manifest {
-        binary_id,
+        binary_id: BINARY_ID.into(),
         // The store's own stamp, so it cannot drift from the scan that produced the profiles.
         universe: store.universe()?,
         generated_at_unix: unix_now(),
         universe_counters,
-        covered_counters,
         blocks,
     };
 
@@ -128,8 +128,7 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
     crate::spool::write_atomic(&out, serde_json::to_string_pretty(&manifest)?.as_bytes())?;
     info!(
         selected = manifest.blocks.len(),
-        covered = covered_counters,
-        universe = universe_counters,
+        covered = universe_counters,
         out = %out.display(),
         "set cover written"
     );
@@ -143,48 +142,50 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
 pub struct CoverOutcome {
     /// The final cover in selection order: `(pattern_key, representative, gain)`.
     pub selected: Vec<(u64, u64, u64)>,
-    /// Keys of the strictly dominated patterns, excluded from the candidates.
-    pub pruned_dominated: Vec<u64>,
+    /// Keys of the antichain (see [`antichain`]): the only cover candidates.
+    pub antichain: Vec<u64>,
     /// Representatives dropped by redundancy elimination (not in `selected`; for logging).
     pub redundant_removed: Vec<u64>,
+    /// Size of the universe, which `selected` always covers in full.
     pub universe_counters: u64,
-    pub covered_counters: u64,
 }
 
-/// Pure greedy set cover with antichain pruning and a final redundancy-elimination pass.
-pub fn select_cover(
-    patterns: &std::collections::HashMap<u64, crate::store::PatternRecord>,
-) -> CoverOutcome {
+/// Number of counters any pattern covers: the universe.
+pub fn universe_size(patterns: &HashMap<u64, PatternRecord>) -> u64 {
     let mut universe = BitSet::new();
     for rec in patterns.values() {
         universe.union_with(&rec.bitmap);
     }
-    let universe_counters = universe.count_ones();
+    universe.count_ones()
+}
+
+/// Pure greedy set cover with antichain pruning and a final redundancy-elimination pass.
+pub fn select_cover(patterns: &HashMap<u64, PatternRecord>) -> CoverOutcome {
+    let universe_counters = universe_size(patterns);
 
     // Antichain prune: a dominated pattern never improves the cover, and could win a tie-break
     // and select a block with no archived profile (the judge never archives a dominated one).
-    let (mut remaining, pruned_dominated) = split_antichain(patterns);
+    let antichain = antichain(patterns);
+    let mut remaining: Vec<(u64, &PatternRecord)> =
+        antichain.iter().map(|key| (*key, &patterns[key])).collect();
 
-    // Greedy: max gain; ties go to the higher block number.
+    // Greedy: max gain; ties go to the higher block number (representatives are unique per
+    // pattern, so the `(gain, block)` key never ties).
     let mut covered = BitSet::new();
     let mut selected: Vec<(u64, u64, u64)> = Vec::new();
     loop {
-        let mut best: Option<(u64, u64, usize)> = None; // (gain, block, idx)
-        for (idx, (_key, rec)) in remaining.iter().enumerate() {
-            let gain = rec.bitmap.andnot_count(&covered);
-            if gain == 0 {
-                continue;
-            }
-            let candidate = (gain, rec.representative, idx);
-            if best.is_none_or(|b| (candidate.0, candidate.1) > (b.0, b.1)) {
-                best = Some(candidate);
-            }
-        }
-        let Some((gain, _blk, idx)) = best else { break };
+        let best = remaining
+            .iter()
+            .enumerate()
+            .map(|(idx, (_, rec))| (rec.bitmap.andnot_count(&covered), rec.representative, idx))
+            .filter(|&(gain, _, _)| gain > 0)
+            .max_by_key(|&(gain, block, _)| (gain, block));
+        let Some((gain, _, idx)) = best else { break };
         let (key, rec) = remaining.swap_remove(idx);
         covered.union_with(&rec.bitmap);
-        selected.push((*key, rec.representative, gain));
+        selected.push((key, rec.representative, gain));
     }
+    debug_assert_eq!(covered.count_ones(), universe_counters, "the antichain spans the universe");
 
     // Redundancy elimination: drop picks the others' union covers. One pass suffices: dropping
     // a pick only shrinks the others' union, so a pick found necessary stays necessary.
@@ -203,17 +204,10 @@ pub fn select_cover(
     let selected: Vec<(u64, u64, u64)> = kept.into_iter().map(|(pick, _)| pick).collect();
     let removed: Vec<u64> = removed.into_iter().map(|((_, rep, _), _)| rep).collect();
 
-    CoverOutcome {
-        selected,
-        pruned_dominated,
-        redundant_removed: removed,
-        universe_counters,
-        covered_counters: covered.count_ones(),
-    }
+    CoverOutcome { selected, antichain, redundant_removed: removed, universe_counters }
 }
 
-/// Splits the patterns into the antichain — those no other pattern strictly dominates — and
-/// the keys of the dominated rest.
+/// Keys of the antichain: the patterns no other pattern strictly dominates.
 ///
 /// Patterns are visited in descending `bits`, so every possible dominator (it needs strictly
 /// more bits) is classified first. Domination is transitive, so testing against kept patterns
@@ -221,14 +215,11 @@ pub fn select_cover(
 /// dominates the candidate too — the kept set is exactly the maximal elements, whatever the tie
 /// order. An inverted index bounds the search: a superset must contain the candidate's rarest
 /// counter, and a counter no kept pattern has proves the candidate maximal outright.
-pub(crate) fn split_antichain(
-    patterns: &std::collections::HashMap<u64, crate::store::PatternRecord>,
-) -> (Vec<(&u64, &crate::store::PatternRecord)>, Vec<u64>) {
-    let mut ordered: Vec<(&u64, &crate::store::PatternRecord)> = patterns.iter().collect();
+pub(crate) fn antichain(patterns: &HashMap<u64, PatternRecord>) -> Vec<u64> {
+    let mut ordered: Vec<(&u64, &PatternRecord)> = patterns.iter().collect();
     ordered.sort_by_key(|(_, r)| std::cmp::Reverse(r.bits));
 
-    let mut kept: Vec<(&u64, &crate::store::PatternRecord)> = Vec::new();
-    let mut pruned_dominated = Vec::new();
+    let mut kept: Vec<(&u64, &PatternRecord)> = Vec::new();
     // postings[counter] = indices into `kept` of the patterns containing it.
     let mut postings: Vec<Vec<u32>> = Vec::new();
 
@@ -260,9 +251,7 @@ pub(crate) fn split_antichain(
             }
         };
 
-        if dominated {
-            pruned_dominated.push(*key);
-        } else {
+        if !dominated {
             let index = kept.len() as u32;
             for counter in rec.bitmap.iter_ones() {
                 let counter = counter as usize;
@@ -275,7 +264,7 @@ pub(crate) fn split_antichain(
         }
     }
 
-    (kept, pruned_dominated)
+    kept.into_iter().map(|(key, _)| *key).collect()
 }
 
 #[cfg(test)]
@@ -293,7 +282,7 @@ mod tests {
     }
 
     /// Obviously correct quadratic oracle: every pattern against every earlier kept one.
-    fn split_antichain_reference(patterns: &HashMap<u64, PatternRecord>) -> (Vec<u64>, Vec<u64>) {
+    fn antichain_reference(patterns: &HashMap<u64, PatternRecord>) -> Vec<u64> {
         let mut ordered: Vec<(&u64, &PatternRecord)> = patterns.iter().collect();
         ordered.sort_by_key(|(_, r)| std::cmp::Reverse(r.bits));
         let mut keep = vec![true; ordered.len()];
@@ -305,13 +294,10 @@ mod tests {
                 }
             }
         }
-        let (mut kept, mut pruned) = (Vec::new(), Vec::new());
-        for (i, (key, _)) in ordered.iter().enumerate() {
-            if keep[i] { kept.push(**key) } else { pruned.push(**key) }
-        }
+        let mut kept: Vec<u64> =
+            ordered.iter().zip(keep).filter(|(_, keep)| *keep).map(|((key, _), _)| **key).collect();
         kept.sort_unstable();
-        pruned.sort_unstable();
-        (kept, pruned)
+        kept
     }
 
     /// xorshift64* — a deterministic stream without a dev-dependency.
@@ -369,22 +355,21 @@ mod tests {
         patterns
     }
 
-    /// The indexed split classifies every pattern exactly as the quadratic oracle does.
+    /// The indexed antichain keeps exactly the patterns the quadratic oracle does.
     #[test]
-    fn indexed_antichain_split_matches_the_quadratic_oracle() {
+    fn indexed_antichain_matches_the_quadratic_oracle() {
         for seed in 1..=12u64 {
             let patterns = random_store(seed, 96 + (seed as u32 * 17) % 160, 12, 900);
-            let (expect_kept, expect_pruned) = split_antichain_reference(&patterns);
+            let expect = antichain_reference(&patterns);
 
-            let (kept, pruned) = split_antichain(&patterns);
-            let mut kept: Vec<u64> = kept.iter().map(|(k, _)| **k).collect();
-            let mut pruned = pruned;
+            let mut kept = antichain(&patterns);
             kept.sort_unstable();
-            pruned.sort_unstable();
 
-            assert_eq!(kept, expect_kept, "kept set diverged (seed {seed})");
-            assert_eq!(pruned, expect_pruned, "pruned set diverged (seed {seed})");
-            assert!(!pruned.is_empty() && kept.len() > 1, "degenerate store (seed {seed})");
+            assert_eq!(kept, expect, "kept set diverged (seed {seed})");
+            assert!(
+                kept.len() < patterns.len() && kept.len() > 1,
+                "degenerate store (seed {seed})"
+            );
         }
     }
 
@@ -392,14 +377,11 @@ mod tests {
     #[test]
     fn empty_pattern_is_dominated_unless_alone() {
         let alone: HashMap<u64, PatternRecord> = [(1, pat(&[], 10))].into();
-        let (kept, pruned) = split_antichain(&alone);
-        assert_eq!((kept.len(), pruned.len()), (1, 0));
+        assert_eq!(antichain(&alone), vec![1]);
 
         let with_other: HashMap<u64, PatternRecord> =
             [(1, pat(&[], 10)), (2, pat(&[7], 20))].into();
-        let (kept, pruned) = split_antichain(&with_other);
-        assert_eq!(kept.iter().map(|(k, _)| **k).collect::<Vec<_>>(), vec![2]);
-        assert_eq!(pruned, vec![1]);
+        assert_eq!(antichain(&with_other), vec![2]);
     }
 
     /// Full coverage is always reached and dominated patterns never selected.
@@ -414,10 +396,10 @@ mod tests {
         .into();
         let (blocks, outcome) = cover(&patterns);
         assert_eq!(blocks, vec![10, 30]);
-        assert_eq!(outcome.covered_counters, outcome.universe_counters);
-        let mut pruned = outcome.pruned_dominated.clone();
-        pruned.sort_unstable();
-        assert_eq!(pruned, vec![2, 4]);
+        assert_eq!(outcome.universe_counters, 6);
+        let mut antichain = outcome.antichain.clone();
+        antichain.sort_unstable();
+        assert_eq!(antichain, vec![1, 3]);
     }
 
     /// Equal-bits patterns with different bitmaps must BOTH survive the prune.
@@ -427,7 +409,7 @@ mod tests {
             [(1, pat(&[0, 1], 10)), (2, pat(&[2, 3], 20))].into();
         let (blocks, outcome) = cover(&patterns);
         assert_eq!(blocks, vec![10, 20]);
-        assert!(outcome.pruned_dominated.is_empty());
+        assert_eq!(outcome.antichain.len(), 2);
     }
 
     /// A gain tie goes to the higher block, not to whatever map iteration order yields.
@@ -464,6 +446,5 @@ mod tests {
         let (blocks, outcome) = cover(&patterns);
         assert_eq!(blocks, vec![20, 30]);
         assert!(outcome.redundant_removed.contains(&10));
-        assert_eq!(outcome.covered_counters, outcome.universe_counters);
     }
 }

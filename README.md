@@ -433,9 +433,6 @@ cargo test -p stateless-core                  # core crate only
 cargo test -p stateless-core -- test_name     # single test
 ```
 
-Do not pass `--all-features` to `cargo test`.
-The `coverage` feature of `coverage-replayer` links the LLVM profiler runtime, which only the instrumented build provides (see the `[profile.coverage]` comment in `Cargo.toml`).
-
 ### Linting
 
 ```bash

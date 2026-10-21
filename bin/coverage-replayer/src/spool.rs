@@ -15,7 +15,6 @@ use op_alloy_rpc_types::Transaction as OpTransaction;
 use serde::{Deserialize, Serialize};
 use stateless_core::LightWitness;
 
-const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 /// Spool entries are short-lived and their witness is already compressed: favor speed.
 const SPOOL_ZSTD_LEVEL: i32 = 1;
 
@@ -31,8 +30,7 @@ pub struct SpoolEntry {
 
 impl SpoolEntry {
     pub fn write_to(&self, path: &Path) -> Result<()> {
-        let raw = bincode::serde::encode_to_vec(self, BINCODE_CONFIG)
-            .map_err(|e| eyre::eyre!("encode spool entry: {e}"))?;
+        let raw = crate::store::encode(self)?;
         // Frame checksum: most of the entry is opaque bytes where a bit flip would decode into
         // wrong data; with it, any corruption fails `read_from` and the entry is refetched.
         let mut encoder = zstd::stream::Encoder::new(Vec::new(), SPOOL_ZSTD_LEVEL)?;
@@ -42,18 +40,17 @@ impl SpoolEntry {
         write_scratch(path, &compressed)
     }
 
-    pub fn read_from(path: &Path) -> Result<Self> {
+    fn read_from(path: &Path) -> Result<Self> {
         let compressed =
             fs::read(path).wrap_err_with(|| format!("read spool entry {}", path.display()))?;
         let raw = zstd::decode_all(&compressed[..])?;
-        let (entry, _) = bincode::serde::decode_from_slice(&raw, BINCODE_CONFIG)
-            .map_err(|e| eyre::eyre!("decode spool entry {}: {e}", path.display()))?;
-        Ok(entry)
+        crate::store::decode(&raw)
+            .wrap_err_with(|| format!("decode spool entry {}", path.display()))
     }
 
     /// Reads the entry and parses its block, checking it is `block`: the single validity check,
     /// shared by the worker and a resumed run's fetcher, which refetches an entry that fails it.
-    pub fn open(path: &Path, block: u64) -> Result<Spooled> {
+    pub fn open(path: &Path, block: u64) -> Result<(Block<OpTransaction>, Self)> {
         let entry = Self::read_from(path)?;
         let parsed: Block<OpTransaction> = serde_json::from_slice(&entry.block_json)
             .wrap_err_with(|| format!("spool entry {} holds no parsable block", path.display()))?;
@@ -63,19 +60,8 @@ impl SpoolEntry {
             path.display(),
             parsed.header.inner.number,
         );
-        Ok(Spooled {
-            block: parsed,
-            light_witness: entry.light_witness,
-            code_hashes: entry.code_hashes,
-        })
+        Ok((parsed, entry))
     }
-}
-
-/// A spool entry opened for replay (see [`SpoolEntry::open`]).
-pub struct Spooled {
-    pub block: Block<OpTransaction>,
-    pub light_witness: LightWitness,
-    pub code_hashes: Vec<B256>,
 }
 
 /// Directory layout inside `--data-dir`.
@@ -295,7 +281,7 @@ mod tests {
         let (n, hash) =
             fixtures.paired_blocks().into_iter().next().expect("at least one block fixture");
         entry(&serde_json::to_vec(&fixtures.blocks[&hash]).unwrap()).write_to(&path).unwrap();
-        assert_eq!(SpoolEntry::open(&path, n).unwrap().block.header.inner.number, n);
+        assert_eq!(SpoolEntry::open(&path, n).unwrap().0.header.inner.number, n);
         let err = SpoolEntry::open(&path, n + 1).err().expect("another block's entry");
         assert!(err.to_string().contains("expected"), "{err}");
     }

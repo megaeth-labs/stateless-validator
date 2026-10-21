@@ -37,12 +37,7 @@ pub fn run(args: ReportArgs) -> Result<()> {
     ensure!(!manifest.blocks.is_empty(), "manifest has no blocks — run set-cover first");
     let llvm = args.llvm.resolve()?;
     info!(dirs = ?llvm.source_dirs, "report scope");
-    check_manifest(
-        &manifest,
-        &manifest_path,
-        &crate::store::current_binary_id(),
-        &llvm.universe(),
-    )?;
+    check_manifest(&manifest, &manifest_path, crate::store::BINARY_ID, &llvm.universe())?;
 
     // Outside the data dir: that belongs to whichever backfill holds its store.
     let work = tempfile::Builder::new()
@@ -62,7 +57,7 @@ pub fn run(args: ReportArgs) -> Result<()> {
     let exe = crate::profile_rt::own_executable()?;
     check_profiles_evaluate(
         llvm.covered_items(&exe, &merged)?.len() as u64,
-        manifest.covered_counters,
+        manifest.universe_counters,
     )?;
 
     let table = llvm.report(&exe, &merged)?;
@@ -134,7 +129,6 @@ mod tests {
             universe: universe.into(),
             generated_at_unix: 0,
             universe_counters: 1,
-            covered_counters: 1,
             blocks: Vec::new(),
         }
     }

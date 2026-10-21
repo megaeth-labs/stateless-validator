@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 exclude.workspace = true
 
+[lints.rust]
+# `cov-rustc-wrapper.sh` sets this cfg on the instrumented build of this crate: the one
+# build that links the LLVM profiler runtime `profile_rt` calls into.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_replayer_instrumented)"] }
+
 [dependencies]
 # alloy
 alloy-genesis.workspace = true
@@ -45,10 +50,3 @@ zstd.workspace = true
 
 [dev-dependencies]
 stateless-test-utils = { path = "../../crates/stateless-test-utils" }
-
-[features]
-# Enables the FFI calls into the LLVM profiler runtime. Only meaningful when the
-# binary is built through `cov-rustc-wrapper.sh` (which instruments the measured
-# crates and thereby links the runtime); regular builds keep this off so the
-# symbols are never referenced.
-coverage = []

@@ -15,6 +15,10 @@
 # default_*.profraw into the source tree; they are the rustc invocations without
 # `--target`, which is why the build line passes one.
 #
+# Instrumenting this tool's own crate links the profiler runtime into it, so that is also
+# where the `coverage_replayer_instrumented` cfg is set: `profile_rt` calls into the runtime
+# exactly when it is there.
+#
 # Cargo cannot see what this wrapper decides: a crate added to measured-crates.txt stays
 # uninstrumented until `cargo clean -p <crate>`. Names are compared the way build.rs reads
 # the file — trimmed, CRLF-safe.
@@ -40,6 +44,9 @@ if [ "$targeted" = yes ]; then
 fi
 
 if [ "$instrument" = yes ]; then
+    if [ "${CARGO_PKG_NAME:-}" = coverage-replayer ]; then
+        set -- "$@" --cfg coverage_replayer_instrumented
+    fi
     exec "$@" -C instrument-coverage -Z coverage-options=branch
 fi
 exec "$@"

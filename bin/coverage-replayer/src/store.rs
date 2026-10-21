@@ -1,9 +1,9 @@
-//! redb-backed pattern store, namespaced by `binary_id` ([`current_binary_id`]) and the
+//! redb-backed pattern store, namespaced by `binary_id` ([`BINARY_ID`]) and the
 //! universe stamp ([`crate::llvm::universe_stamp`]): counter ids and dense indices mean
 //! something only within one namespace, so a store from another one refuses to open.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::Path,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -13,30 +13,22 @@ use eyre::{Result, ensure};
 use redb::{
     Database, Durability, ReadOnlyDatabase, ReadableDatabase, ReadableTable, TableDefinition,
 };
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::bitset::BitSet;
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
-const COUNTERS: TableDefinition<u64, &[u8]> = TableDefinition::new("counters");
+/// Counter id → dense bit index. Indices are handed out in order of first sight and never
+/// change, so a stored bitmap stays valid as the universe grows.
+const COUNTERS: TableDefinition<u64, u32> = TableDefinition::new("counters");
 const PATTERNS: TableDefinition<u64, &[u8]> = TableDefinition::new("patterns");
 /// One row per block ever scanned; it grows with history, so no reader loads it whole:
 /// [`Store::blocks`] streams a range, [`Store::block_records`] looks rows up by number.
 const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("blocks");
 
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
-const SCHEMA_VERSION: u32 = 1;
-
-/// One coverage counter: id → dense index, plus provenance for humans (never read by logic).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CounterInfo {
-    pub dense: u32,
-    /// `<source path>:<line>:<col>` of the covered item.
-    pub location: String,
-    /// `region`, `branch-true` or `branch-false`.
-    pub kind: String,
-    pub line: u32,
-}
+const SCHEMA_VERSION: u32 = 2;
 
 /// One distinct coverage bitmap and its representative block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,10 +116,6 @@ impl Store {
         let txn = db.begin_write()?;
         {
             let mut meta = txn.open_table(META)?;
-            txn.open_table(COUNTERS)?;
-            txn.open_table(PATTERNS)?;
-            txn.open_table(BLOCKS)?;
-
             match read_meta(&meta, BINARY_ID_KEY)? {
                 Some(existing) => {
                     check_binary_id(path, &existing, binary_id)?;
@@ -149,6 +137,10 @@ impl Store {
                 ),
                 None => meta.insert(UNIVERSE_KEY, universe.as_bytes()).map(drop)?,
             }
+            // Only after the stamps: another schema's tables need not open as this one's types.
+            txn.open_table(COUNTERS)?;
+            txn.open_table(PATTERNS)?;
+            txn.open_table(BLOCKS)?;
         }
         txn.commit()?;
 
@@ -164,7 +156,7 @@ impl Store {
         &self,
         block: u64,
         record: &BlockRecord,
-        new_counters: &[(u64, CounterInfo)],
+        new_counters: &[(u64, u32)],
         pattern: Option<(u64, &PatternRecord)>,
     ) -> Result<()> {
         let mut txn = self.db.begin_write()?;
@@ -175,8 +167,8 @@ impl Store {
         txn.open_table(BLOCKS)?.insert(block, encode(record)?.as_slice())?;
         if !new_counters.is_empty() {
             let mut t = txn.open_table(COUNTERS)?;
-            for (id, info) in new_counters {
-                t.insert(*id, encode(info)?.as_slice())?;
+            for &(id, dense) in new_counters {
+                t.insert(id, dense)?;
             }
         }
         if let Some((key, rec)) = pattern {
@@ -241,14 +233,28 @@ impl<D: ReadableDatabase> Store<D> {
         })
     }
 
-    /// Every counter the store has registered, by id.
-    pub fn counters(&self) -> Result<HashMap<u64, CounterInfo>> {
-        read_table(&self.db.begin_read()?, COUNTERS)
+    /// Every counter the store has registered: id → dense index.
+    pub fn counters(&self) -> Result<FxHashMap<u64, u32>> {
+        let txn = self.db.begin_read()?;
+        txn.open_table(COUNTERS)?
+            .iter()?
+            .map(|row| {
+                let (id, dense) = row?;
+                Ok((id.value(), dense.value()))
+            })
+            .collect()
     }
 
     /// Every pattern, by key.
     pub fn patterns(&self) -> Result<HashMap<u64, PatternRecord>> {
-        read_table(&self.db.begin_read()?, PATTERNS)
+        let txn = self.db.begin_read()?;
+        txn.open_table(PATTERNS)?
+            .iter()?
+            .map(|row| {
+                let (key, record) = row?;
+                Ok((key.value(), decode(record.value())?))
+            })
+            .collect()
     }
 
     /// Visits the block records in `range` in ascending order, without holding them.
@@ -324,25 +330,13 @@ where
     Ok(())
 }
 
-/// Reads a whole `u64 -> bincode(T)` table into a map.
-fn read_table<T: serde::de::DeserializeOwned>(
-    txn: &redb::ReadTransaction,
-    table: TableDefinition<u64, &[u8]>,
-) -> Result<HashMap<u64, T>> {
-    let mut map = HashMap::new();
-    for row in txn.open_table(table)?.iter()? {
-        let (k, v) = row?;
-        map.insert(k.value(), decode(v.value())?);
-    }
-    Ok(map)
-}
-
-fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
+/// bincode (`standard`) encoding of the store's rows, also used for spool entries.
+pub(crate) fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
     bincode::serde::encode_to_vec(value, BINCODE_CONFIG)
         .map_err(|e| eyre::eyre!("encode {}: {e}", std::any::type_name::<T>()))
 }
 
-fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+pub(crate) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     let (value, _) = bincode::serde::decode_from_slice(bytes, BINCODE_CONFIG)
         .map_err(|e| eyre::eyre!("decode {}: {e}", std::any::type_name::<T>()))?;
     Ok(value)
@@ -384,43 +378,62 @@ pub fn resolve_pattern_slot(
 /// means could: mega-evm's revision, the measured crates and versions, `rustc -vV`, and the
 /// lockfile — a profile names each measured generic instance by a symbol carrying the cargo
 /// metadata of the instantiating crate, which moves with any dependency or version change, so
-/// other dependencies cannot read the archived profiles. Captured by build.rs; what it cannot
+/// other dependencies cannot read the archived profiles. Computed by build.rs; what it cannot
 /// see (features, compiler flags) `report` catches by re-deriving the covered items.
-pub fn current_binary_id() -> String {
-    use std::hash::Hasher;
-    let mega_evm = env!("COVERAGE_MEGA_EVM_REV");
-    let rustc = env!("COVERAGE_RUSTC_VERSION");
-    let measured = env!("COVERAGE_MEASURED_CRATES");
-    let mut h = rustc_hash::FxHasher::default();
-    h.write(mega_evm.as_bytes());
-    h.write_u8(0xff);
-    h.write(rustc.as_bytes());
-    h.write_u8(0xff);
-    h.write(measured.as_bytes());
-    h.write_u8(0xff);
-    h.write(env!("COVERAGE_LOCKFILE_DIGEST").as_bytes());
-    format!("megaevm:{}:fx{:016x}", &mega_evm[..mega_evm.len().min(12)], h.finish())
+pub const BINARY_ID: &str = env!("COVERAGE_BINARY_ID");
+
+/// Per-block worker times as a value → count histogram: exact percentiles in memory bounded by
+/// the distinct millisecond values seen, not by the number of blocks.
+#[derive(Debug, Default)]
+pub struct ElapsedStats {
+    counts: BTreeMap<u64, u64>,
+    blocks: u64,
+    total_ms: u64,
 }
 
-/// `(avg, p50, p95, max)` of per-block worker times (sorts in place); `None` if empty.
-pub fn elapsed_stats(samples: &mut [u64]) -> Option<(f64, u64, u64, u64)> {
-    if samples.is_empty() {
-        return None;
+impl ElapsedStats {
+    pub fn record(&mut self, elapsed_ms: u64) {
+        *self.counts.entry(elapsed_ms).or_default() += 1;
+        self.blocks += 1;
+        self.total_ms += elapsed_ms;
     }
-    samples.sort_unstable();
-    let avg = samples.iter().sum::<u64>() as f64 / samples.len() as f64;
-    Some((
-        avg,
-        samples[samples.len() / 2],
-        samples[(samples.len() * 95 / 100).min(samples.len() - 1)],
-        samples[samples.len() - 1],
-    ))
+
+    pub fn blocks(&self) -> u64 {
+        self.blocks
+    }
+
+    /// `(avg, p50, p95, max)`; `None` if nothing was recorded.
+    pub fn summary(&self) -> Option<(f64, u64, u64, u64)> {
+        let max = *self.counts.keys().next_back()?;
+        // The value at 0-based `rank` among the sorted samples.
+        let at = |rank: u64| {
+            let mut through = 0;
+            self.counts.iter().find_map(|(&ms, &n)| {
+                through += n;
+                (through > rank).then_some(ms)
+            })
+        };
+        let n = self.blocks;
+        Some((self.total_ms as f64 / n as f64, at(n / 2)?, at((n * 95 / 100).min(n - 1))?, max))
+    }
 }
 
 /// Record builders the modules' tests share.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::spool::DataDir;
+
+    /// A fresh data dir with its store; the guard keeps the directory alive.
+    pub(crate) fn temp_store() -> (tempfile::TempDir, Arc<DataDir>, Store) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dirs = Arc::new(DataDir::new(tmp.path()));
+        dirs.ensure_layout().unwrap();
+        let store = Store::open(&dirs.store_path(), "test-id", "f").unwrap();
+        (tmp, dirs, store)
+    }
 
     /// A pattern over `bits` (dense indices), first seen at block `rep`.
     pub(crate) fn pattern(bits: &[u32], rep: u64) -> PatternRecord {
@@ -559,6 +572,19 @@ mod tests {
         let _writer = Store::open(&path, "id", "u").unwrap();
         let err = Store::open_readonly(&path).err().expect("must fail while a writer holds it");
         assert!(err.to_string().contains("held open read-write"), "got: {err}");
+    }
+
+    /// The histogram's percentiles are the sorted samples' own, whatever order they arrive in.
+    #[test]
+    fn elapsed_stats_are_exact_percentiles() {
+        let mut stats = ElapsedStats::default();
+        assert_eq!(stats.summary(), None);
+        // 1..=100 twice, out of order: p50 is rank 100 of the 200 sorted samples, p95 rank 190.
+        for ms in (1..=100).rev().chain(1..=100) {
+            stats.record(ms);
+        }
+        assert_eq!(stats.blocks(), 200);
+        assert_eq!(stats.summary(), Some((50.5, 51, 96, 100)));
     }
 
     /// Point lookups return only the named rows, never the span between; a range, just the range.

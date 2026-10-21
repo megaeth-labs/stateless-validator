@@ -18,6 +18,8 @@ impl BitSet {
         for i in indices {
             s.insert(i);
         }
+        // Unordered indices grow the words by doubling; a long-lived bitmap keeps no slack.
+        s.words.shrink_to_fit();
         s
     }
 
