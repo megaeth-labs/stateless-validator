@@ -27,7 +27,7 @@ use rustc_hash::FxHasher;
 /// Version of the item definition, stamped into every store (see [`universe_stamp`]). Bump
 /// it whenever the id, the set of item kinds, or what a block's bitmap records changes (e.g.
 /// what `worker::warm_up` keeps out of it): two definitions must never share a store.
-const ITEM_UNIVERSE: &str = "regions+branch-arms/v3";
+const ITEM_UNIVERSE: &str = "regions+branch-arms/v4";
 
 /// What a covered item is; part of its id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -597,7 +597,7 @@ mod tests {
     fn universe_stamp_is_order_independent_and_versioned() {
         let (a, b) = (PathBuf::from("/x/a"), PathBuf::from("/x/b"));
         assert_eq!(universe_stamp(&[a.clone(), b.clone()]), universe_stamp(&[b, a]));
-        assert_eq!(universe_stamp(&[PathBuf::from("/x/mega")]), "regions+branch-arms/v3:mega");
+        assert_eq!(universe_stamp(&[PathBuf::from("/x/mega")]), "regions+branch-arms/v4:mega");
     }
 
     /// One scope must stamp identically however homes are laid out.
@@ -612,7 +612,7 @@ mod tests {
             PathBuf::from("/root/.cargo/git/co/30ce038"),
         ];
         assert_eq!(universe_stamp(&alice), universe_stamp(&root));
-        assert_eq!(universe_stamp(&alice), "regions+branch-arms/v3:30ce038,revm-handler-8.1.0");
+        assert_eq!(universe_stamp(&alice), "regions+branch-arms/v4:30ce038,revm-handler-8.1.0");
     }
 
     /// A crate under two registry indexes is refused, not resolved by listing order.

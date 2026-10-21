@@ -16,6 +16,7 @@ use std::{
 use clap::Args;
 use eyre::{Context, Result};
 use mega_evm::{MegaPrecompiles, MegaSpecId};
+use revm::{context_interface::cfg::GasParams, primitives::hardfork::SpecId};
 use stateless_core::{
     LightWitnessExecutor, WitnessDatabase, WitnessExternalEnv, chain_spec::ChainSpec, replay_block,
 };
@@ -92,16 +93,19 @@ fn protocol_channel() -> Result<File> {
     Ok(File::from(protocol))
 }
 
-/// Builds the per-hardfork precompile tables, which mega-evm and op-revm build once per process
-/// (`OnceBox::get_or_init`), before any block is captured. Left to the blocks, the first block
-/// to meet a table would be credited with it, so a block's coverage would depend on its place
-/// in a worker's queue; `process_block`'s counter reset discards the warm-up. `default()` adds
-/// the latest spec, for a table only it uses.
+/// Builds the measured code's run-once tables before any block is captured: the per-hardfork
+/// precompile tables mega-evm and op-revm build once per process (`OnceBox::get_or_init`), and
+/// revm's per-hardfork gas tables (`GasParams::new_spec`, one `OnceLock` per spec group), which
+/// every block's `CfgEnv` reaches. Left to the blocks, the first block to meet a table would be
+/// credited with it, so a block's coverage would depend on its place in a worker's queue;
+/// `process_block`'s counter reset discards the warm-up. Both spec sets are enumerated rather
+/// than listed, so a spec added by a dependency bump is warmed too.
 fn warm_up() {
-    for spec in
-        [MegaSpecId::EQUIVALENCE, MegaSpecId::MINI_REX, MegaSpecId::REX, MegaSpecId::default()]
-    {
+    for &spec in MegaSpecId::ALL {
         let _ = MegaPrecompiles::new_with_spec(spec);
+    }
+    for spec in (0..=u8::MAX).filter_map(SpecId::try_from_u8) {
+        let _ = GasParams::new_spec(spec);
     }
 }
 
@@ -175,4 +179,13 @@ fn process_block(
         tx_count: block.transactions.len() as u64,
         gas_used: output.gas_used,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every worker runs this before its first block: a panic here would crash-loop them all.
+    #[test]
+    fn warm_up_builds_every_table_without_panicking() {
+        super::warm_up();
+    }
 }
