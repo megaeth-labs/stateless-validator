@@ -190,6 +190,8 @@ A bounded in-memory `BlockData` cache keyed by block hash sits between the respo
 Block-number lookups still resolve number → hash against the DB or upstream first, so canonicality is never cached and reorgs need no invalidation here; when a trace fails for a data-attributable reason (the witness cannot replay the block), the entry is dropped so the next request refetches instead of replaying the poisoned data, and each such eviction is counted (`block_data_evictions_total`).
 Size it with `--block-data-cache-max-size` (default `1GB`; `0` disables); the cache uses a fixed 4 shards, so the largest cacheable entry is `max_bytes / 4` on every host (~256 MB at the default), and an insert the cache does not retain is counted (`cache_admission_rejects_total`) and logged rather than masquerading as a miss.
 The byte budget is an estimate of retained payload, not exact RSS: map/allocator overhead is under-counted, and contract bytecode is charged here *and* in the contract cache (the same refcounted allocations), so evicting an entry can free less than its accounted weight.
+A cached witness is charged as its KV/level payload plus the direct-lookup table built beside it once per block and shared by every trace request.
+The table stays resident as long as the entry does, so the same budget holds fewer blocks than the witness maps alone would suggest.
 Combined default memory across the four caches is roughly 3.1 GB — response cache 1 GB + block-data cache 1 GB + contract cache 512 MB + canonical-hash memo ~0.6 GB at its 8M-entry cap (it fills lazily; the measured working set is 50–130k heights, ~10 MB) — on top of ordinary heap; size hosts (or lower the knobs) accordingly.
 
 **Witness endpoints:**

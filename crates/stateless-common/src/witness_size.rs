@@ -5,13 +5,18 @@
 //! (`on_witness_fetch`) and the trace server's data provider.
 
 use salt::{SaltKey, SaltValue, SaltWitness};
-use stateless_core::{LightWitness, withdrawals::MptWitness};
+use stateless_core::{LightWitness, LightWitnessExecutor, withdrawals::MptWitness};
 
 /// Per-entry size of a SALT key-value pair, derived from the type layout so a `salt` bump
 /// that grows `SaltKey`/`SaltValue` is picked up automatically — this constant no longer
 /// only feeds metrics, it also enforces the block-data cache's byte budget. Map-node
 /// overhead is deliberately excluded.
 const SALT_KV_BYTES: usize = size_of::<(SaltKey, Option<SaltValue>)>();
+
+/// Per-entry size of a [`LightWitnessExecutor`] direct-lookup entry, excluding the plain-key
+/// bytes it owns: derived from the type layout like [`SALT_KV_BYTES`], map-node overhead
+/// likewise excluded.
+const LOOKUP_ENTRY_BYTES: usize = size_of::<(Vec<u8>, SaltKey)>();
 
 /// Per-commitment size for SALT parent commitments (64 bytes).
 const SALT_COMMITMENT_BYTES: usize = 64;
@@ -87,11 +92,37 @@ pub fn light_witness_memory_bytes(light: &LightWitness) -> usize {
     light.kvs.len() * SALT_KV_BYTES + light.levels.len() * SALT_LEVEL_BYTES
 }
 
+/// Approximate in-memory footprint of a [`LightWitnessExecutor`]: the wrapped
+/// [`LightWitness`] plus the direct-lookup table built beside it.
+///
+/// Use this, not [`light_witness_memory_bytes`], when weighing a witness that is retained in
+/// its execution form.
+pub fn light_witness_executor_memory_bytes(executor: &LightWitnessExecutor) -> usize {
+    let lookup_table: usize = executor.plain_keys().map(|k| k.len() + LOOKUP_ENTRY_BYTES).sum();
+    light_witness_memory_bytes(executor.light_witness()) + lookup_table
+}
+
 #[cfg(test)]
 mod tests {
     use stateless_test_utils::fixtures::TestFixtures;
 
     use super::*;
+
+    /// The executor footprint is the wrapped witness plus a non-empty lookup table, so a
+    /// cache weighing retained executors charges the table and not just the witness maps.
+    #[test]
+    fn executor_footprint_charges_the_lookup_table() {
+        let fixtures = TestFixtures::mainnet_shared();
+        let (_, hash) = fixtures.paired_blocks().into_iter().next().expect("paired fixture");
+        let executor =
+            LightWitnessExecutor::from(LightWitness::from(&fixtures.salt_witnesses[&hash]));
+
+        assert!(
+            light_witness_executor_memory_bytes(&executor) >
+                light_witness_memory_bytes(executor.light_witness()),
+            "a fixture witness must populate the lookup table"
+        );
+    }
 
     /// `new_light` must agree with the full breakdown on everything except
     /// the parent-commitments term it cannot know: same kv count and MPT
