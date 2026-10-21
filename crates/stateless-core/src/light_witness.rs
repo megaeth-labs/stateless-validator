@@ -300,12 +300,10 @@ impl LightWitnessExecutor {
         &self.light_witness
     }
 
-    /// Estimated heap bytes of the direct-lookup table, in the same
-    /// per-entry-term style as `light_witness_memory_bytes`: the plain-key
-    /// bytes plus the map entry (key header, `SaltKey`).
-    pub fn lookup_table_memory_bytes(&self) -> usize {
-        let entry = size_of::<Vec<u8>>() + size_of::<SaltKey>();
-        self.direct_lookup_tbl.keys().map(|k| k.len() + entry).sum()
+    /// The plain keys indexed by the direct-lookup table, one per non-meta
+    /// entry the witness holds a value for.
+    pub fn plain_keys(&self) -> impl Iterator<Item = &[u8]> {
+        self.direct_lookup_tbl.keys().map(Vec::as_slice)
     }
 }
 

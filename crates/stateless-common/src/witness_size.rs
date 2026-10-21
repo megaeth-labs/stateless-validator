@@ -13,6 +13,11 @@ use stateless_core::{LightWitness, LightWitnessExecutor, withdrawals::MptWitness
 /// overhead is deliberately excluded.
 const SALT_KV_BYTES: usize = size_of::<(SaltKey, Option<SaltValue>)>();
 
+/// Per-entry size of a [`LightWitnessExecutor`] direct-lookup entry, excluding the plain-key
+/// bytes it owns: derived from the type layout like [`SALT_KV_BYTES`], map-node overhead
+/// likewise excluded.
+const LOOKUP_ENTRY_BYTES: usize = size_of::<(Vec<u8>, SaltKey)>();
+
 /// Per-commitment size for SALT parent commitments (64 bytes).
 const SALT_COMMITMENT_BYTES: usize = 64;
 
@@ -93,7 +98,8 @@ pub fn light_witness_memory_bytes(light: &LightWitness) -> usize {
 /// Use this, not [`light_witness_memory_bytes`], when weighing a witness that is retained in
 /// its execution form.
 pub fn light_witness_executor_memory_bytes(executor: &LightWitnessExecutor) -> usize {
-    light_witness_memory_bytes(executor.light_witness()) + executor.lookup_table_memory_bytes()
+    let lookup_table: usize = executor.plain_keys().map(|k| k.len() + LOOKUP_ENTRY_BYTES).sum();
+    light_witness_memory_bytes(executor.light_witness()) + lookup_table
 }
 
 #[cfg(test)]
@@ -111,11 +117,10 @@ mod tests {
         let executor =
             LightWitnessExecutor::from(LightWitness::from(&fixtures.salt_witnesses[&hash]));
 
-        let table = executor.lookup_table_memory_bytes();
-        assert!(table > 0, "a fixture witness must populate the lookup table");
-        assert_eq!(
-            light_witness_executor_memory_bytes(&executor),
-            light_witness_memory_bytes(executor.light_witness()) + table
+        assert!(
+            light_witness_executor_memory_bytes(&executor) >
+                light_witness_memory_bytes(executor.light_witness()),
+            "a fixture witness must populate the lookup table"
         );
     }
 

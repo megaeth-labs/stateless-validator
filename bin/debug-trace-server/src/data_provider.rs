@@ -133,6 +133,18 @@ pub struct BlockData {
     pub contracts: HashMap<B256, Bytecode>,
 }
 
+impl BlockData {
+    /// Assembles a block's data, wrapping the witness in its execution form — the one place
+    /// its direct-lookup table is built.
+    pub fn new(
+        block: Block<Transaction>,
+        witness: LightWitness,
+        contracts: HashMap<B256, Bytecode>,
+    ) -> Self {
+        Self { block, witness: witness.into(), contracts }
+    }
+}
+
 /// Default timeout for a user-facing witness fetch in seconds (8 seconds).
 ///
 /// Applied as a sub-deadline on top of the outer block-fetch deadline: the witness stage
@@ -946,7 +958,7 @@ impl DataProvider {
             );
         }
 
-        Ok(Some(BlockData { block, witness: LightWitnessExecutor::from(witness), contracts }))
+        Ok(Some(BlockData::new(block, witness, contracts)))
     }
 
     /// Single-flight fetch via [`futures::future::Shared`]: concurrent callers for the same
@@ -1080,8 +1092,9 @@ fn shared_to_result(
 ///    (see `witness_deadline_for`).
 /// 2. The witness arrives as a `LightWitness` already (zero-validation light decode).
 /// 3. Extract code hashes from witness and fetch contract bytecodes (shares `deadline`).
-/// 4. Wrap the witness in its execution form ([`LightWitnessExecutor`], whose direct-lookup table
-///    is built here once) and assemble the [`BlockData`] shared by every request for this block.
+/// 4. Assemble the [`BlockData`] shared by every request for this block; [`BlockData::new`] wraps
+///    the witness in its execution form ([`LightWitnessExecutor`]), building its direct-lookup
+///    table once.
 // One call site, and `.shared()` requires owned handles (see above) — a params struct would add
 // a type to keep in sync without encapsulating anything.
 #[allow(clippy::too_many_arguments)]
@@ -1187,7 +1200,7 @@ async fn do_fetch_block_data(
         );
     }
 
-    Ok(BlockData { block, witness: LightWitnessExecutor::from(witness), contracts })
+    Ok(BlockData::new(block, witness, contracts))
 }
 
 /// Typed failure for a (number, hash) pair that drifted: `actual` is the fetched block's
@@ -1553,7 +1566,7 @@ pub(crate) mod test_support {
     /// map) from the shared synthetic fixture set.
     pub(crate) fn fixture_block_data() -> BlockData {
         let (block, witness, contracts) = fixture_parts();
-        BlockData { block, witness: LightWitnessExecutor::from(witness), contracts }
+        BlockData::new(block, witness, contracts)
     }
 
     /// The first paired synthetic block — the one [`fixture_block_data`] uses — as
@@ -1932,10 +1945,7 @@ mod tests {
         let (block, witness, contract_cache) = fixture_block_and_cache();
         let hash = block.header.hash;
         let cache = Arc::new(BlockDataCache::new(1024 * 1024 * 1024));
-        cache.insert(
-            hash,
-            Arc::new(BlockData { block, witness: witness.into(), contracts: HashMap::default() }),
-        );
+        cache.insert(hash, Arc::new(BlockData::new(block, witness, HashMap::default())));
         let provider =
             provider_with_tiers(&test_support::hanging_url(), None, Some(cache), contract_cache);
 
@@ -3041,11 +3051,7 @@ mod tests {
         let cache = Arc::new(BlockDataCache::new(1024 * 1024 * 1024));
         cache.insert(
             hash,
-            Arc::new(BlockData {
-                block: block.clone(),
-                witness: witness.clone().into(),
-                contracts: HashMap::default(),
-            }),
+            Arc::new(BlockData::new(block.clone(), witness.clone(), HashMap::default())),
         );
         let memory = provider_with_tiers(
             &test_support::hanging_url(),
