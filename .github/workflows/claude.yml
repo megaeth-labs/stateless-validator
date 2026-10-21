@@ -46,7 +46,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          persist-credentials: false
           submodules: recursive
           fetch-depth: 1
 
@@ -126,7 +125,6 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
-          persist-credentials: false
           submodules: recursive
           fetch-depth: 1
 
@@ -146,7 +144,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          persist-credentials: false
           submodules: recursive
           fetch-depth: 1
 
