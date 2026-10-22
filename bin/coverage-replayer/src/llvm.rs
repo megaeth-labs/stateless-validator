@@ -87,9 +87,10 @@ pub fn universe_stamp(source_dirs: &[PathBuf]) -> String {
 #[derive(clap::Args, Debug, Clone)]
 pub struct LlvmArgs {
     /// Source directories scoping the coverage universe; the store is stamped with them and
-    /// `report` refuses a manifest over any other scope. Default: the built-against mega-evm
-    /// checkout plus `measured-crates.txt` at their locked versions, under the build's cargo
-    /// home. Sources must sit at the absolute paths they had at build time.
+    /// `report` refuses a manifest over any other scope. Default: where the build found
+    /// mega-evm and `measured-crates.txt` at their locked sources, under the build's cargo home
+    /// (a registry crate's directory, or a git crate's whole checkout). Sources must sit at the
+    /// absolute paths they had at build time.
     #[clap(long = "source-dir")]
     pub source_dirs: Vec<PathBuf>,
     /// llvm-profdata path (default: the `llvm-tools` of the toolchain that built this binary).
@@ -206,17 +207,16 @@ fn run_tool(cmd: &mut Command, what: &str) -> Result<std::process::Output> {
     Ok(out)
 }
 
-/// Resolves the source scope: the explicit `--source-dir`s, or the default (mega-evm
-/// checkout plus measured crates). Every directory must exist: a scope that matches nothing
-/// would turn every block into an empty bitmap.
+/// Resolves the source scope: the explicit `--source-dir`s, or the default build.rs derived
+/// from the locked sources of mega-evm and the measured crates. Every directory must exist: a
+/// scope that matches nothing would turn every block into an empty bitmap.
 fn resolve_source_dirs(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let dirs = if explicit.is_empty() {
         let cargo_home = Path::new(env!("COVERAGE_CARGO_HOME"));
-        let mut dirs = vec![detect_mega_evm_checkout(cargo_home)?];
-        for krate in env!("COVERAGE_MEASURED_CRATES").split(',').filter(|c| !c.is_empty()) {
-            dirs.push(detect_registry_crate(cargo_home, krate)?);
-        }
-        dirs
+        env!("COVERAGE_DEFAULT_SCOPE")
+            .split(',')
+            .map(|root| detect_source_root(cargo_home, root))
+            .collect::<Result<Vec<_>>>()?
     } else {
         explicit.to_vec()
     };
@@ -258,36 +258,25 @@ fn resolve_source_dirs(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
-/// Finds `<name>-<version>` under the registry sources of the build's cargo home. Cargo
-/// keeps one tree per index it has used, and llvm-cov matches only the one the build
-/// compiled, so more than one candidate is a question for the operator rather than a pick.
-fn detect_registry_crate(cargo_home: &Path, name_version: &str) -> Result<PathBuf> {
-    let src = cargo_home.join("registry").join("src");
-    let candidates: Vec<PathBuf> = std::fs::read_dir(&src)
+/// Finds the one directory under `cargo_home` matching `root`, a relative path whose `*`
+/// stands for the directory cargo names after a source URL (see build.rs `source_root`):
+/// `registry/src/*/revm-handler-20.0.3`, or `git/checkouts/mega-evm-*/f78e75c`. Cargo keeps
+/// one tree per registry index and one clone per URL it has used, and llvm-cov matches only
+/// the one the build compiled, so more than one candidate is a question for the operator
+/// rather than a pick.
+fn detect_source_root(cargo_home: &Path, root: &str) -> Result<PathBuf> {
+    let (parent_and_prefix, rest) =
+        root.split_once('*').expect("build.rs writes one `*` into every default root");
+    let (parent, prefix) = parent_and_prefix.rsplit_once('/').unwrap_or(("", parent_and_prefix));
+    let candidates: Vec<PathBuf> = std::fs::read_dir(cargo_home.join(parent))
         .into_iter()
         .flatten()
         .flatten()
-        .map(|index| index.path().join(name_version))
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+        .map(|entry| entry.path().join(rest.trim_start_matches('/')))
         .filter(|candidate| candidate.is_dir())
         .collect();
-    one_candidate(candidates, &format!("the sources of {name_version} under {}", src.display()))
-}
-
-/// Finds the cargo git checkout of the mega-evm rev this binary was BUILT against (embedded
-/// by build.rs), so the rev can never disagree with the instrumented build.
-fn detect_mega_evm_checkout(cargo_home: &Path) -> Result<PathBuf> {
-    let rev: String = env!("COVERAGE_MEGA_EVM_REV").chars().take(7).collect();
-    ensure!(rev.len() == 7, "the built-against mega-evm rev {rev:?} is too short to locate");
-    let checkouts = cargo_home.join("git").join("checkouts");
-    let candidates: Vec<PathBuf> = std::fs::read_dir(&checkouts)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|repo| repo.file_name().to_string_lossy().starts_with("mega-evm-"))
-        .map(|repo| repo.path().join(&rev))
-        .filter(|candidate| candidate.is_dir())
-        .collect();
-    one_candidate(candidates, &format!("the mega-evm {rev} checkout under {}", checkouts.display()))
+    one_candidate(candidates, &format!("{root} under {}", cargo_home.display()))
 }
 
 /// The one directory default scope detection found, or an error naming what to pass.
@@ -621,12 +610,13 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let src = home.path().join("registry/src");
         std::fs::create_dir_all(src.join("index-a/revm-handler-8.1.0")).unwrap();
+        let root = "registry/src/*/revm-handler-8.1.0";
 
-        let found = detect_registry_crate(home.path(), "revm-handler-8.1.0").unwrap();
+        let found = detect_source_root(home.path(), root).unwrap();
         assert_eq!(found, src.join("index-a/revm-handler-8.1.0"));
 
         std::fs::create_dir_all(src.join("index-b/revm-handler-8.1.0")).unwrap();
-        let err = detect_registry_crate(home.path(), "revm-handler-8.1.0")
+        let err = detect_source_root(home.path(), root)
             .expect_err("two candidates must not be resolved by listing order");
         assert!(err.to_string().contains("more than once"), "{err}");
         assert!(
@@ -634,8 +624,33 @@ mod tests {
             "{err}"
         );
 
-        let err = detect_registry_crate(home.path(), "op-revm-8.1.0").expect_err("absent");
+        let err =
+            detect_source_root(home.path(), "registry/src/*/op-revm-8.1.0").expect_err("absent");
         assert!(err.to_string().contains("could not find"), "{err}");
+    }
+
+    /// A git crate's root is its clone's checkout at the locked rev, picked by the clone's name.
+    #[test]
+    fn default_scope_finds_a_git_checkout_by_repo_and_rev() {
+        let home = tempfile::tempdir().unwrap();
+        let checkouts = home.path().join("git/checkouts");
+        for dir in
+            ["optimism-852bcbde/f67d87c", "optimism-852bcbde/0000000", "mega-evm-86ab85a9/f67d87c"]
+        {
+            std::fs::create_dir_all(checkouts.join(dir)).unwrap();
+        }
+        let found = detect_source_root(home.path(), "git/checkouts/optimism-*/f67d87c").unwrap();
+        assert_eq!(found, checkouts.join("optimism-852bcbde/f67d87c"));
+    }
+
+    /// The default scope build.rs derived resolves against the cargo home this test binary was
+    /// built from, which holds every measured crate's sources: registry and git alike.
+    #[test]
+    fn the_default_scope_resolves_where_the_build_found_its_sources() {
+        let dirs = resolve_source_dirs(&[]).expect("every default root is found exactly once");
+        let roots = env!("COVERAGE_DEFAULT_SCOPE").split(',').count();
+        assert_eq!(dirs.len(), roots, "{dirs:?}");
+        assert!(roots >= 2, "mega-evm plus the measured crates: {roots}");
     }
 
     /// The build's own toolchain wins over whatever `rustc` the working directory resolves to.

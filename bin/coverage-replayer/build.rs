@@ -44,25 +44,27 @@ fn main() {
         "coverage-replayer build: unexpected `rustc -vV` output: {rustc_vv:?}"
     );
 
-    // The measured registry crates as `name-version`, their registry directory name, with
-    // versions from the lockfile so the default scope never names one that was not built.
-    let mut measured: Vec<String> = std::fs::read_to_string("measured-crates.txt")
-        .expect("coverage-replayer build: measured-crates.txt is missing")
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    // The default `--source-dir` scope: where the build found mega-evm and every measured crate,
+    // from their locked sources, so it never names a version or rev that was not built.
+    let measured = std::fs::read_to_string("measured-crates.txt")
+        .expect("coverage-replayer build: measured-crates.txt is missing");
+    let names = measured.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'));
+    let mut scope: Vec<String> = std::iter::once("mega-evm")
+        .chain(names)
         .flat_map(|name| {
-            let versions: Vec<&str> =
-                packages.iter().filter(|p| p.name == name).map(|p| p.version).collect();
+            let locked: Vec<&LockedPackage<'_>> =
+                packages.iter().filter(|p| p.name == name).collect();
             assert!(
-                !versions.is_empty(),
+                !locked.is_empty(),
                 "coverage-replayer build: measured crate `{name}` is not in Cargo.lock"
             );
-            versions.into_iter().map(move |v| format!("{name}-{v}"))
+            locked.into_iter().map(source_root)
         })
         .collect();
-    // Sorted: this list is hashed into `binary_id`, and reordering the file must not change it.
-    measured.sort();
+    // Sorted and deduped: crates of one git checkout share its root, and this list is hashed
+    // into `binary_id`, so reordering the file must not change it.
+    scope.sort();
+    scope.dedup();
 
     // Where the build found its sources and its LLVM: the default scope and the LLVM tools
     // are looked up there, not under whatever $HOME the binary later runs with.
@@ -75,9 +77,9 @@ fn main() {
     let sysroot = sysroot.trim();
 
     // The store namespace: why each input belongs in it is on `store::BINARY_ID`.
-    let measured = measured.join(",");
+    let scope = scope.join(",");
     let mut fingerprint = Vec::new();
-    for part in [mega_evm.as_str(), &toolchain, &measured, &lock] {
+    for part in [mega_evm.as_str(), &toolchain, &scope, &lock] {
         fingerprint.extend_from_slice(part.as_bytes());
         // Never a byte of UTF-8, so no two splits of the inputs hash alike.
         fingerprint.push(0xff);
@@ -90,8 +92,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_HOME");
     println!("cargo:rerun-if-env-changed=HOME");
     println!("cargo:rustc-env=COVERAGE_BINARY_ID={binary_id}");
-    println!("cargo:rustc-env=COVERAGE_MEGA_EVM_REV={mega_evm}");
-    println!("cargo:rustc-env=COVERAGE_MEASURED_CRATES={measured}");
+    println!("cargo:rustc-env=COVERAGE_DEFAULT_SCOPE={scope}");
     println!("cargo:rerun-if-changed=measured-crates.txt");
     // Re-run when the lockfile changes: the rev, the versions and the digest come from it.
     println!("cargo:rerun-if-changed=../../Cargo.lock");
@@ -130,6 +131,35 @@ fn locked_packages(lock: &str) -> Vec<LockedPackage<'_>> {
             }
         })
         .collect()
+}
+
+/// Where cargo keeps a locked package's sources, relative to the cargo home, with a `*` for the
+/// directory cargo names after the source URL: the registry index for a registry crate
+/// (`registry/src/*/revm-handler-20.0.3`), the clone for a git one, whose root is its whole
+/// checkout at the locked rev (`git/checkouts/optimism-*/f67d87c`). Only the instrumented
+/// crates of a checkout reach the coverage map, so the rest of it adds nothing to the scope.
+fn source_root(package: &LockedPackage<'_>) -> String {
+    let unsupported = || -> ! {
+        panic!(
+            "coverage-replayer build: measured crate `{}` has neither a registry nor a git source \
+             in Cargo.lock ({:?}), so no default scope can name it; extend build.rs",
+            package.name, package.source
+        )
+    };
+    match package.source {
+        Some(s) if s.starts_with("registry+") => {
+            format!("registry/src/*/{}-{}", package.name, package.version)
+        }
+        Some(s) if s.starts_with("git+") => {
+            // `git+https://host/org/<repo>[.git]?rev=..#<commit>`: cargo names the clone after
+            // `<repo>` and the checkout after the commit's first 7 hex digits.
+            let Some((url, commit)) = s.rsplit_once('#') else { unsupported() };
+            let repo = url.split(['?', '#']).next().unwrap_or(url).trim_end_matches('/');
+            let repo = repo.rsplit('/').next().unwrap_or(repo).trim_end_matches(".git");
+            format!("git/checkouts/{repo}-*/{}", &commit[..commit.len().min(7)])
+        }
+        _ => unsupported(),
+    }
 }
 
 /// The full git rev of `mega-evm`, from its source:
