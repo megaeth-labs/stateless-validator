@@ -467,7 +467,7 @@ async fn fetch_block(
 
 /// Code files this run already found content-valid, shared by every fetch task so no
 /// contract is re-hashed per block. A file verified once stays valid for the run: the
-/// codes dir only gains files (renamed into place), and only invalid ones are deleted.
+/// codes dir only gains files or has them replaced whole (renamed into place), never deleted.
 #[derive(Default)]
 struct VerifiedCodes(Mutex<HashSet<B256>>);
 
@@ -521,8 +521,9 @@ async fn resolve_missing_codes(
     .await?
 }
 
-/// Whether `path` holds exactly the bytes hashing to `hash`. A present-but-invalid file is
-/// deleted so the caller refetches it.
+/// Whether `path` holds exactly the bytes hashing to `hash`. An invalid file is left for the
+/// caller's refetch to replace by rename: deleting it here could race a concurrent fetch task
+/// that read the same bad bytes and has already renamed a repaired file into place.
 fn code_file_is_valid(path: &Path, hash: &B256) -> bool {
     match std::fs::read(path) {
         Ok(bytes) if alloy_primitives::keccak256(&bytes) == *hash => true,
@@ -530,9 +531,8 @@ fn code_file_is_valid(path: &Path, hash: &B256) -> bool {
             warn!(
                 code = %format!("{hash:x}"),
                 path = %path.display(),
-                "content-addressed code file fails its hash — deleting and refetching"
+                "content-addressed code file fails its hash — refetching"
             );
-            let _ = std::fs::remove_file(path);
             false
         }
         Err(_) => false,
@@ -1120,21 +1120,22 @@ mod tests {
         assert_eq!(VerifiedCodes::default().missing(&dirs, &[good]), vec![good]);
     }
 
+    /// A corrupt file reads as invalid but stays until the refetch's rename replaces it, so a
+    /// check racing that repair can never delete the repaired file.
     #[test]
-    fn corrupt_code_file_is_detected_and_removed() {
+    fn corrupt_code_file_is_detected_and_left_for_the_refetch() {
         let dir = tempfile::tempdir().unwrap();
         let bytes = b"\x60\x80\x60\x40".to_vec();
         let hash = alloy_primitives::keccak256(&bytes);
 
-        let good = dir.path().join("good.bin");
-        std::fs::write(&good, &bytes).unwrap();
-        assert!(code_file_is_valid(&good, &hash));
-        assert!(good.exists());
+        let code = dir.path().join("code.bin");
+        std::fs::write(&code, b"truncated").unwrap();
+        assert!(!code_file_is_valid(&code, &hash));
+        assert!(code.exists(), "the check must not delete what a concurrent fetch may repair");
 
-        let bad = dir.path().join("bad.bin");
-        std::fs::write(&bad, b"truncated").unwrap();
-        assert!(!code_file_is_valid(&bad, &hash));
-        assert!(!bad.exists(), "invalid content-addressed file must be deleted for refetch");
+        write_scratch(&code, &bytes).unwrap();
+        assert!(code_file_is_valid(&code, &hash), "the refetch replaces it in place");
+        assert!(code_file_is_valid(&code, &hash) && code.exists(), "checking never removes it");
 
         assert!(!code_file_is_valid(&dir.path().join("absent.bin"), &hash));
     }
