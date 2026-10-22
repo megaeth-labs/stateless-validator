@@ -23,6 +23,9 @@ pub struct WorkerResponse {
     pub divergence: Option<String>,
     /// Stable ids of all covered items in scope, sorted and deduped (see `llvm.rs`).
     pub counters: Vec<u64>,
+    /// Wall-clock of the replay alone, which picks a pattern's lightest representative: the
+    /// rest of `elapsed_ms` (spool decode, profile extraction) tracks load and profile size.
+    pub replay_ms: u64,
     pub elapsed_ms: u64,
     pub tx_count: u64,
     pub gas_used: u64,

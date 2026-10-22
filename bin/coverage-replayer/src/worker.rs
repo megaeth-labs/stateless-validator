@@ -133,7 +133,9 @@ fn process_block(
 
     // Per-block counter isolation: this worker handles one block at a time.
     crate::profile_rt::reset_counters();
+    let replay_start = Instant::now();
     let result = replay_block(chain_spec, &block, &db, ext_env);
+    let replay_ms = replay_start.elapsed().as_millis() as u64;
     let profraw = dirs.block_profraw(req.block);
     crate::profile_rt::write_profraw(&profraw)?;
 
@@ -175,6 +177,7 @@ fn process_block(
         error: None,
         divergence,
         counters,
+        replay_ms,
         elapsed_ms: start.elapsed().as_millis() as u64,
         tx_count: block.transactions.len() as u64,
         gas_used: output.gas_used,

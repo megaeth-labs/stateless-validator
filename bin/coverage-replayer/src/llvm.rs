@@ -268,15 +268,31 @@ fn detect_source_root(cargo_home: &Path, root: &str) -> Result<PathBuf> {
     let (parent_and_prefix, rest) =
         root.split_once('*').expect("build.rs writes one `*` into every default root");
     let (parent, prefix) = parent_and_prefix.rsplit_once('/').unwrap_or(("", parent_and_prefix));
-    let candidates: Vec<PathBuf> = std::fs::read_dir(cargo_home.join(parent))
-        .into_iter()
-        .flatten()
-        .flatten()
+    let rest = rest.trim_start_matches('/');
+    // A git root ends in its commit's 7-digit abbreviation, but cargo names the checkout with
+    // git's shortest unambiguous one, which `core.abbrev` or a clashing prefix lengthens: any
+    // checkout extending the abbreviation matches (two would be refused below as ambiguous).
+    let abbreviated_commit = rest.len() >= 7 && rest.bytes().all(|b| b.is_ascii_hexdigit());
+    let candidates: Vec<PathBuf> = read_dir_entries(&cargo_home.join(parent))
         .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
-        .map(|entry| entry.path().join(rest.trim_start_matches('/')))
+        .flat_map(|entry| {
+            if abbreviated_commit {
+                read_dir_entries(&entry.path())
+                    .filter(|checkout| checkout.file_name().to_string_lossy().starts_with(rest))
+                    .map(|checkout| checkout.path())
+                    .collect()
+            } else {
+                vec![entry.path().join(rest)]
+            }
+        })
         .filter(|candidate| candidate.is_dir())
         .collect();
     one_candidate(candidates, &format!("{root} under {}", cargo_home.display()))
+}
+
+/// The entries of `dir`; none if it cannot be read.
+fn read_dir_entries(dir: &Path) -> impl Iterator<Item = std::fs::DirEntry> {
+    std::fs::read_dir(dir).into_iter().flatten().flatten()
 }
 
 /// The one directory default scope detection found, or an error naming what to pass.
@@ -641,6 +657,21 @@ mod tests {
         }
         let found = detect_source_root(home.path(), "git/checkouts/optimism-*/f67d87c").unwrap();
         assert_eq!(found, checkouts.join("optimism-852bcbde/f67d87c"));
+    }
+
+    /// Cargo may abbreviate a checkout beyond 7 digits (`core.abbrev`, a clashing prefix): the
+    /// 7-digit root still finds it, and two checkouts extending it are refused as ambiguous.
+    #[test]
+    fn default_scope_finds_a_checkout_abbreviated_beyond_seven_digits() {
+        let home = tempfile::tempdir().unwrap();
+        let clone = home.path().join("git/checkouts/optimism-852bcbde");
+        std::fs::create_dir_all(clone.join("f67d87cd5c99")).unwrap();
+        let root = "git/checkouts/optimism-*/f67d87c";
+        assert_eq!(detect_source_root(home.path(), root).unwrap(), clone.join("f67d87cd5c99"));
+
+        std::fs::create_dir_all(clone.join("f67d87c00000")).unwrap();
+        let err = detect_source_root(home.path(), root).expect_err("two checkouts extend it");
+        assert!(err.to_string().contains("more than once"), "{err}");
     }
 
     /// The default scope build.rs derived resolves against the cargo home this test binary was

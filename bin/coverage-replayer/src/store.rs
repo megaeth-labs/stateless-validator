@@ -29,6 +29,10 @@ const BLOCKS: TableDefinition<u64, &[u8]> = TableDefinition::new("blocks");
 
 const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::standard();
 const SCHEMA_VERSION: u32 = 2;
+/// The oldest schema a read-only opener accepts. v2 changed only COUNTERS, which no read-only
+/// path reads (the judge is its one reader), so `inspect` still reads v1 stores, the ones whose
+/// pools carry a scan across builds.
+const OLDEST_READABLE_SCHEMA: u32 = 1;
 
 /// One distinct coverage bitmap and its representative block.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,7 +42,8 @@ pub struct PatternRecord {
     pub first_block: u64,
     pub last_block: u64,
     pub hit_count: u64,
-    /// The lightest (min replay time) block seen with this pattern: the best fixture candidate.
+    /// The lightest (min replay time, `WorkerResponse::replay_ms`) block seen with this pattern:
+    /// the best fixture candidate.
     pub representative: u64,
     pub representative_elapsed_ms: u64,
 }
@@ -119,7 +124,7 @@ impl Store {
             match read_meta(&meta, BINARY_ID_KEY)? {
                 Some(existing) => {
                     check_binary_id(path, &existing, binary_id)?;
-                    check_schema_version(&meta, path)?;
+                    check_schema_version(&meta, path, SCHEMA_VERSION)?;
                 }
                 None => {
                     meta.insert(BINARY_ID_KEY, binary_id.as_bytes())?;
@@ -208,7 +213,7 @@ impl Store<ReadOnlyDatabase> {
         let store = Self { db, commits: AtomicU64::new(0) };
         let txn = store.db.begin_read()?;
         let meta = txn.open_table(META)?;
-        check_schema_version(&meta, path)?;
+        check_schema_version(&meta, path, OLDEST_READABLE_SCHEMA)?;
         let binary_id = read_meta(&meta, BINARY_ID_KEY)?.unwrap_or_else(|| "<unset>".into());
         drop(meta);
         drop(txn);
@@ -306,9 +311,9 @@ fn check_binary_id(path: &Path, stored: &str, binary_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Rejects another record encoding with a clean message, not opaque bincode decode errors
-/// later. A store without a schema stamp is schema 1.
-fn check_schema_version<T>(meta: &T, path: &Path) -> Result<()>
+/// Rejects a record encoding outside `oldest..=SCHEMA_VERSION` with a clean message, not opaque
+/// bincode decode errors later. A store without a schema stamp is schema 1.
+fn check_schema_version<T>(meta: &T, path: &Path, oldest: u32) -> Result<()>
 where
     T: redb::ReadableTable<&'static str, &'static [u8]>,
 {
@@ -321,9 +326,14 @@ where
         ),
         None => 1,
     };
+    let accepted = if oldest == SCHEMA_VERSION {
+        format!("v{SCHEMA_VERSION}")
+    } else {
+        format!("v{oldest} to v{SCHEMA_VERSION}")
+    };
     ensure!(
-        stored == SCHEMA_VERSION,
-        "store {} has schema v{stored}, this binary reads v{SCHEMA_VERSION} — re-sweep into a \
+        (oldest..=SCHEMA_VERSION).contains(&stored),
+        "store {} has schema v{stored}, this binary reads {accepted} here — re-sweep into a \
          fresh data-dir (or use a binary matching the store)",
         path.display(),
     );
@@ -537,6 +547,35 @@ mod tests {
         assert!(err.to_string().contains("schema"), "open: {err}");
         let err = Store::open_readonly(&path).err().expect("must fail");
         assert!(err.to_string().contains("schema"), "open_readonly: {err}");
+    }
+
+    /// A v1 store differs only in COUNTERS: `inspect` reads its patterns and blocks, while the
+    /// writer, the one COUNTERS reader, still refuses it.
+    #[test]
+    fn a_v1_store_opens_read_only_but_not_for_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.redb");
+        {
+            let store = Store::open(&path, "id", "u").unwrap();
+            store.commit_block(7, &block(BlockStatus::Ok), &[], Some((1, &rec(&[0, 3])))).unwrap();
+            store.flush().unwrap();
+        }
+        {
+            let db = Database::open(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(META)
+                .unwrap()
+                .insert("schema_version", 1u32.to_le_bytes().as_slice())
+                .unwrap();
+            txn.commit().unwrap();
+        }
+
+        let (store, _) = Store::open_readonly(&path).expect("inspect reads a v1 store");
+        assert_eq!(store.patterns().unwrap().len(), 1);
+        assert_eq!(store.block_records(&[7]).unwrap().len(), 1);
+        drop(store);
+        let err = Store::open(&path, "id", "u").err().expect("the writer must refuse v1");
+        assert!(err.to_string().contains("schema v1"), "{err}");
     }
 
     /// `inspect` reads stores the caller does not own: no write access, file left byte-identical.

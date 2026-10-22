@@ -3,10 +3,23 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BitSet {
     words: Vec<u64>,
 }
+
+/// Set equality, as every other operation reads it: missing tail words are zero, so two equal
+/// sets whose word vectors differ only by trailing zero words compare equal. Pattern identity
+/// (`store::resolve_pattern_slot`) rests on this.
+impl PartialEq for BitSet {
+    fn eq(&self, other: &Self) -> bool {
+        let (long, short) =
+            if self.words.len() >= other.words.len() { (self, other) } else { (other, self) };
+        long.words.iter().enumerate().all(|(i, w)| *w == short.words.get(i).copied().unwrap_or(0))
+    }
+}
+
+impl Eq for BitSet {}
 
 impl BitSet {
     pub fn new() -> Self {
@@ -105,5 +118,15 @@ mod tests {
         let c = BitSet::from_indices([1]);
         assert_eq!(c.andnot_count(&a), 0);
         assert!(c.is_subset_of(&a));
+    }
+
+    /// Equality is set equality: trailing zero words never tell two equal sets apart.
+    #[test]
+    fn equality_ignores_trailing_zero_words() {
+        let padded = BitSet { words: vec![0b10, 0, 0] };
+        assert_eq!(padded, BitSet::from_indices([1]));
+        assert_eq!(BitSet::from_indices([1]), padded);
+        assert_ne!(padded, BitSet::from_indices([1, 64]));
+        assert_eq!(BitSet { words: vec![0] }, BitSet::new());
     }
 }

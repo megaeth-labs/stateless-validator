@@ -174,8 +174,8 @@ impl Selection {
     /// Divergent records are retried), and how many of them have a record. A range is walked
     /// against the store's rows instead of loading them, and its unscanned stretches stay
     /// ranges: a full-history range has tens of millions of rows, or of blocks yet to scan.
-    fn pending(&self, store: &Store) -> Result<(Vec<RangeInclusive<u64>>, usize)> {
-        let (mut todo, mut retrying) = (Vec::new(), 0);
+    fn pending(&self, store: &Store) -> Result<(Vec<RangeInclusive<u64>>, Vec<u64>)> {
+        let (mut todo, mut retrying) = (Vec::new(), Vec::new());
         match self {
             Self::Range(r) => {
                 let mut next = *r.start();
@@ -185,7 +185,7 @@ impl Selection {
                     }
                     if record.status != BlockStatus::Ok {
                         todo.push(n..=n);
-                        retrying += 1;
+                        retrying.push(n);
                     }
                     next = n + 1;
                 })?;
@@ -200,7 +200,7 @@ impl Selection {
                         Some(r) if r.status == BlockStatus::Ok => {}
                         Some(_) => {
                             todo.push(n..=n);
-                            retrying += 1;
+                            retrying.push(n);
                         }
                         None => todo.push(n..=n),
                     }
@@ -270,7 +270,13 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         None,
     )?);
 
-    let latest = client.get_latest_block_number().await;
+    // Listening from here on: the tip check retries forever while RPC is down, and the store
+    // is already open, so a signal must stop the run cleanly from this point.
+    let mut stop = std::pin::pin!(stop_signal());
+    let latest = tokio::select! {
+        latest = client.get_latest_block_number() => latest,
+        signal = &mut stop => bail!("stopped by {signal} before any block was judged"),
+    };
     let highest = selection.highest();
     ensure!(
         highest <= latest,
@@ -279,12 +285,13 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     );
 
     let (todo, retrying) = selection.pending(&store)?;
+    discard_spools(&dirs, &retrying);
     let total: u64 = todo.iter().map(|r| r.end() - r.start() + 1).sum();
     info!(
         selection = %selection.label(),
         todo = total,
         skipped = selection.len() - total,
-        retrying_quarantined = retrying,
+        retrying_quarantined = retrying.len(),
         "backfill starting"
     );
     if todo.is_empty() {
@@ -357,15 +364,31 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     let mut judge =
         JudgeState::new(store.counters()?, store.patterns()?, &store, dirs.clone(), total);
     let judged: Result<()> = async {
-        while let Some(outcome) = judged_rx.recv().await {
-            judge.ingest(outcome)?;
+        loop {
+            tokio::select! {
+                outcome = judged_rx.recv() => match outcome {
+                    Some(outcome) => judge.ingest(outcome)?,
+                    None => return Ok(()),
+                },
+                signal = &mut stop => bail!(
+                    "stopped by {signal} after {} of {total} blocks; what was judged is \
+                     flushed — re-run the same selection to resume",
+                    judge.processed,
+                ),
+            }
         }
-        Ok(())
     }
     .await;
-    // Whatever ended the loop, make what was judged durable before reporting it.
-    store.flush()?;
+    // Whatever ended the loop, make what was judged durable before reporting it; a flush
+    // failure must not hide why the loop ended.
+    let flushed = store.flush();
+    if judged.is_err() &&
+        let Err(e) = &flushed
+    {
+        tracing::error!(error = %format!("{e:#}"), "flushing the store after the abort failed");
+    }
     judged?;
+    flushed?;
 
     fetcher.await.ok();
     while manager_set.join_next().await.is_some() {}
@@ -379,6 +402,32 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         judge.processed,
     );
     Ok(())
+}
+
+/// Resolves on the first SIGINT or SIGTERM, naming it: the judge then stops, flushes and lets
+/// the store close cleanly, instead of dying with unflushed commits and a store that read-only
+/// openers refuse until a writer repairs it.
+async fn stop_signal() -> &'static str {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut interrupt), Ok(mut terminate)) =
+        (signal(SignalKind::interrupt()), signal(SignalKind::terminate()))
+    else {
+        warn!("cannot listen for SIGINT/SIGTERM; a signal will stop the run uncleanly");
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        _ = interrupt.recv() => "SIGINT",
+        _ = terminate.recv() => "SIGTERM",
+    }
+}
+
+/// Deletes the spool entries of blocks being retried, so they are refetched: a block that
+/// failed or diverged may have failed on its spooled bytes (a bad witness, a reorged hash),
+/// and replaying the same entry would fail every re-run alike.
+fn discard_spools(dirs: &DataDir, blocks: &[u64]) {
+    for &n in blocks {
+        let _ = std::fs::remove_file(dirs.spool_entry(n));
+    }
 }
 
 async fn forward_fetched(
@@ -456,13 +505,19 @@ async fn fetch_block(
     resolve_missing_codes(client, dirs, verified_codes, code_hashes.clone()).await?;
 
     // Serializing a large block is real CPU work, so it runs on the blocking pool with the write.
+    // The block comes back either way, so a failed write keeps it for the caller's retry.
     let block = block_cache.take().expect("just filled");
-    tokio::task::spawn_blocking(move || {
-        let block_json = serde_json::to_vec(&block)?.into();
-        SpoolEntry { block_json, light_witness, code_hashes }.write_to(&spool_path)
+    let (block, written) = tokio::task::spawn_blocking(move || {
+        let written = serde_json::to_vec(&block).map_err(eyre::Report::from).and_then(|json| {
+            SpoolEntry { block_json: json.into(), light_witness, code_hashes }.write_to(&spool_path)
+        });
+        (block, written)
     })
-    .await??;
-    Ok(())
+    .await?;
+    if written.is_err() {
+        *block_cache = Some(block);
+    }
+    written
 }
 
 /// Code files this run already found content-valid, shared by every fetch task so no
@@ -629,6 +684,9 @@ impl WorkerHandle {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true)
+            // Out of the terminal's process group: a Ctrl-C reaches only the dispatcher, which
+            // stops the run in order, rather than killing every worker under it at once.
+            .process_group(0)
             .spawn()
             .wrap_err("spawn internal-worker")?;
         let stdin = child.stdin.take().expect("piped stdin");
@@ -685,8 +743,9 @@ struct JudgeState<'a> {
     /// the map need not hash them again.
     counters: FxHashMap<u64, u32>,
     patterns: HashMap<u64, PatternRecord>,
-    /// Keys of the patterns undominated on arrival. By transitivity, a new pattern
-    /// dominated by anything is dominated by one of these, so the check scans only this set.
+    /// Keys of the antichain: the patterns no other dominates. By transitivity, a new pattern
+    /// dominated by anything is dominated by one of these, so the check scans only this set;
+    /// a new member evicts the members it dominates, so the set never outgrows the antichain.
     undominated: Vec<u64>,
     processed: u64,
     total: u64,
@@ -721,7 +780,7 @@ impl<'a> JudgeState<'a> {
     }
 
     /// Fail-stop: a replay error or divergence is recorded (spool kept for forensics) and
-    /// aborts the run; the next run retries the non-Ok block via the todo filter.
+    /// aborts the run; the next run refetches the non-Ok block and retries it.
     fn ingest(&mut self, resp: WorkerResponse) -> Result<()> {
         self.processed += 1;
 
@@ -730,7 +789,7 @@ impl<'a> JudgeState<'a> {
             self.store.commit_block(resp.block, &record, &[], None)?;
             eyre::bail!(
                 "block {} failed to replay: {error} — ABORTING (no block may be skipped; \
-                 spool kept at {}; a re-run will retry this block)",
+                 spool kept at {} until a re-run refetches and retries this block)",
                 resp.block,
                 self.dirs.spool_entry(resp.block).display(),
             );
@@ -742,7 +801,8 @@ impl<'a> JudgeState<'a> {
             eyre::bail!(
                 "SANITY FAILURE at block {} ({divergence}) — execution diverged from the header; \
                  bitmap NOT ingested. ABORTING: this is chain-spec drift or an execution bug, and \
-                 continuing would leave a silent coverage gap. Spool kept at {}.",
+                 continuing would leave a silent coverage gap. Spool kept at {} until a \
+                 re-run refetches and retries this block.",
                 resp.block,
                 self.dirs.spool_entry(resp.block).display(),
             );
@@ -769,7 +829,7 @@ impl<'a> JudgeState<'a> {
         }
 
         let rec =
-            PatternRecord::first_seen(BitSet::from_indices(dense), resp.block, resp.elapsed_ms);
+            PatternRecord::first_seen(BitSet::from_indices(dense), resp.block, resp.replay_ms);
         let profile = self.dirs.block_profdata(resp.block);
         // Worker counters arrive sorted and deduped, as the keying expects.
         let (key, occupied) = resolve_pattern_slot(&self.patterns, &resp.counters, &rec.bitmap);
@@ -802,6 +862,8 @@ impl<'a> JudgeState<'a> {
                         profile.display(),
                     )
                 })?;
+                let patterns = &self.patterns;
+                self.undominated.retain(|k| !rec.dominates(&patterns[k]));
                 self.undominated.push(key);
             }
             self.patterns.insert(key, rec);
@@ -1015,9 +1077,9 @@ mod tests {
             let (todo, retrying) = selection.pending(&store).unwrap();
             (todo.into_iter().flatten().collect::<Vec<u64>>(), retrying)
         };
-        assert_eq!(pending(Selection::Range(10..=16)), (vec![10, 12, 13, 15, 16], 2));
-        assert_eq!(pending(Selection::Range(14..=14)), (vec![], 0));
-        assert_eq!(pending(Selection::List(vec![11, 12, 13, 99])), (vec![12, 13], 1));
+        assert_eq!(pending(Selection::Range(10..=16)), (vec![10, 12, 13, 15, 16], vec![12, 15]));
+        assert_eq!(pending(Selection::Range(14..=14)), (vec![], vec![]));
+        assert_eq!(pending(Selection::List(vec![11, 12, 13, 99])), (vec![12, 13], vec![12]));
 
         // An unscanned stretch stays one range, however long.
         let (todo, _) = Selection::Range(100..=u64::MAX - 1).pending(&store).unwrap();
@@ -1032,12 +1094,13 @@ mod tests {
         (key, PatternRecord::first_seen(bitmap, rep, elapsed))
     }
 
-    fn response(block: u64, counters: Vec<u64>, elapsed_ms: u64) -> WorkerResponse {
+    fn response(block: u64, counters: Vec<u64>, replay_ms: u64) -> WorkerResponse {
         WorkerResponse {
             block,
             block_hash: B256::repeat_byte(7),
             counters,
-            elapsed_ms,
+            replay_ms,
+            elapsed_ms: replay_ms + 400,
             tx_count: 1,
             gas_used: 21000,
             ..Default::default()
@@ -1184,6 +1247,30 @@ mod tests {
             !dirs.archived_profile(pattern_base_key(&[1, 2])).exists(),
             "{{1, 2}} is dominated by {{1, 2, 3}}, which arrived undominated"
         );
+    }
+
+    /// A new member of the antichain evicts the members it dominates: the domination check
+    /// scans the antichain, not every pattern that was ever undominated on arrival.
+    #[test]
+    fn the_undominated_set_stays_an_antichain() {
+        let (_tmp, dirs, store) = temp_store();
+        let mut judge = judge_with(&store, dirs.clone(), vec![]);
+        for (block, counters) in [(100, vec![1]), (200, vec![2]), (300, vec![1, 2, 3])] {
+            std::fs::write(dirs.block_profdata(block), b"sparse profdata").unwrap();
+            judge.ingest(response(block, counters, 100)).unwrap();
+        }
+        assert_eq!(judge.undominated, vec![pattern_base_key(&[1, 2, 3])]);
+    }
+
+    /// A retried block's spool is deleted, so the re-run refetches what failed; others stay.
+    #[test]
+    fn retried_blocks_are_refetched() {
+        let (_tmp, dirs, _store) = temp_store();
+        for n in [7, 8] {
+            std::fs::write(dirs.spool_entry(n), b"entry").unwrap();
+        }
+        discard_spools(&dirs, &[7, 9]);
+        assert!(!dirs.spool_entry(7).exists() && dirs.spool_entry(8).exists());
     }
 
     #[test]
