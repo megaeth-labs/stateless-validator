@@ -1,0 +1,52 @@
+[package]
+name = "coverage-replayer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+exclude.workspace = true
+
+[lints.rust]
+# `cov-rustc-wrapper.sh` sets this cfg on the instrumented build of this crate: the one
+# build that links the LLVM profiler runtime `profile_rt` calls into.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage_replayer_instrumented)"] }
+
+[dependencies]
+# alloy
+alloy-genesis.workspace = true
+alloy-primitives.workspace = true
+alloy-rpc-types-eth.workspace = true
+
+# mega
+mega-evm = { workspace = true, default-features = false }
+
+# op
+op-alloy-rpc-types.workspace = true
+
+# revm
+revm.workspace = true
+
+# stateless
+stateless-common = { path = "../../crates/stateless-common" }
+stateless-core = { path = "../../crates/stateless-core" }
+
+# misc
+bincode.workspace = true
+clap.workspace = true
+eyre.workspace = true
+kanal.workspace = true
+libc.workspace = true
+num_cpus.workspace = true
+redb.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "process", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+stateless-test-utils = { path = "../../crates/stateless-test-utils" }
