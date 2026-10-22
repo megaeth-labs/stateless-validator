@@ -86,22 +86,46 @@ pub fn closure<'a>(
 /// The package names a manifest declares only as dev-dependencies (of any target): those a
 /// build of the package's library or binaries never compiles.
 pub fn dev_only_dependencies(manifest: &str) -> Vec<String> {
-    let (mut section, mut dev, mut other) = ("", Vec::new(), Vec::new());
+    let (mut dev, mut other) = (Vec::new(), Vec::new());
+    // In a dependency list (`[dependencies]`, `[target.'cfg(..)'.dev-dependencies]`, ..):
+    // whether it is the dev one. In one dependency's own table (`[dependencies.foo]`): which
+    // list holds it and where, so its `package = ".."` key can rename it.
+    let (mut list, mut own_table): (Option<bool>, Option<(bool, usize)>) = (None, None);
     for line in manifest.lines().map(str::trim) {
-        if line.starts_with('[') {
-            section = line.trim_matches(['[', ']']);
+        if let Some(header) = line.strip_prefix('[') {
+            (list, own_table) = (None, None);
+            let segments: Vec<&str> = header
+                .trim_end_matches(']')
+                .split('.')
+                .map(|segment| segment.trim().trim_matches(['"', '\'']))
+                .collect();
+            if let Some(at) = segments.iter().position(|s| s.ends_with("dependencies")) {
+                let is_dev = segments[at] == "dev-dependencies";
+                match segments.get(at + 1) {
+                    Some(name) => {
+                        let names = if is_dev { &mut dev } else { &mut other };
+                        names.push(name.to_string());
+                        own_table = Some((is_dev, names.len() - 1));
+                    }
+                    None => list = Some(is_dev),
+                }
+            }
             continue;
         }
         let Some((key, value)) = line.split_once('=') else { continue };
+        let quoted = |value: &str| value.trim().trim_matches('"').to_string();
+        if let Some((is_dev, at)) = own_table {
+            if key.trim() == "package" {
+                (if is_dev { &mut dev } else { &mut other })[at] = quoted(value);
+            }
+            continue;
+        }
+        let Some(is_dev) = list else { continue };
         // `name = ..`, `name.workspace = true`, or a rename through `package = "name"`.
         let renamed = value.split_once("package = \"").and_then(|(_, rest)| rest.split('"').next());
         let name =
             renamed.unwrap_or_else(|| key.trim().split('.').next().unwrap_or("")).to_string();
-        if section.ends_with("dev-dependencies") {
-            dev.push(name);
-        } else if section.ends_with("dependencies") {
-            other.push(name);
-        }
+        (if is_dev { &mut dev } else { &mut other }).push(name);
     }
     dev.retain(|name| !other.contains(name));
     dev
@@ -258,6 +282,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             shared = { path = \"../shared\" }\nboth = \"1\"\n\
             renamed = { package = \"tester\", version = \"1\" }\n";
         assert_eq!(dev_only_dependencies(manifest), ["shared", "tester"]);
+        // A dependency's own table counts like a line; its `package` key renames it.
+        let dotted = "[dependencies.both]\nversion = \"1\"\n[target.'cfg(unix)'.dev-dependencies]\n\
+            both = \"1\"\n[dev-dependencies.alias]\nversion = \"1\"\npackage = \"tester\"\n";
+        assert_eq!(dev_only_dependencies(dotted), ["tester"]);
 
         let packages = locked_packages(LOCK);
         let dev_only =

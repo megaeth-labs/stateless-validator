@@ -1208,15 +1208,20 @@ mod tests {
 
     /// Connection-establishment failures surface as `Connect` (the mitigation-detection
     /// kind) and are bounded by [`CONNECT_TIMEOUT`] rather than the full attempt timeout.
-    /// A closed loopback port refuses at once. 192.0.2.1 (TEST-NET-1) is unroutable: the
-    /// connect either errors immediately or blackholes until the connect timeout — both must
-    /// classify as `Connect`, fast. A transparent proxy (a VPN in TUN mode) accepts every TCP
-    /// connection, so there 192.0.2.1 never fails to connect and only the loopback case runs.
+    /// Loopback port 1 (tcpmux, which nothing serves) refuses at once. 192.0.2.1 (TEST-NET-1)
+    /// is unroutable: the connect either errors immediately or blackholes until the connect
+    /// timeout — both must classify as `Connect`, fast. A transparent proxy (a VPN in TUN mode)
+    /// accepts every TCP connection, so there 192.0.2.1 never fails to connect and only the
+    /// loopback case runs; under a proxy set in the environment, which the client honors,
+    /// neither connects anywhere but the proxy, and the test cannot run at all.
     #[tokio::test]
     async fn unreachable_endpoint_surfaces_connect_kind_fast() {
-        // Bound and released: nothing listens there now.
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
-        let mut endpoints = vec![format!("http://{closed}")];
+        let proxies = ["http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"];
+        if let Some(var) = proxies.iter().find(|var| std::env::var_os(var).is_some()) {
+            eprintln!("${var} routes every request through a proxy: skipped");
+            return;
+        }
+        let mut endpoints = vec!["http://127.0.0.1:1".to_string()];
         let unroutable = "192.0.2.1:81";
         let intercepted = tokio::time::timeout(
             DEFAULT_CONNECT_TIMEOUT * 2,

@@ -24,6 +24,8 @@ use std::{
 use eyre::{Context, Result, ensure};
 use rustc_hash::FxHasher;
 
+use crate::checkouts::{abbreviated_checkouts, entries};
+
 /// Version of the item definition, stamped into every store (see [`universe_stamp`]). Bump
 /// it whenever the id, the set of item kinds, or what a block's bitmap records changes (e.g.
 /// what `worker::warm_up` keeps out of it): two definitions must never share a store.
@@ -276,32 +278,20 @@ fn detect_source_root(cargo_home: &Path, root: &str) -> Result<PathBuf> {
     // ambiguous), and the crate's directory inside it, if named, follows.
     let (first, inside) = rest.split_once('/').unwrap_or((rest, ""));
     let abbreviated_commit = first.len() >= 7 && first.bytes().all(|b| b.is_ascii_hexdigit());
-    let candidates: Vec<PathBuf> = read_dir_entries(&cargo_home.join(parent))
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
-        .flat_map(|entry| {
-            if abbreviated_commit {
-                read_dir_entries(&entry.path())
-                    .filter(|checkout| checkout.file_name().to_string_lossy().starts_with(first))
-                    .map(|checkout| {
-                        if inside.is_empty() {
-                            checkout.path()
-                        } else {
-                            checkout.path().join(inside)
-                        }
-                    })
-                    .collect()
-            } else {
-                vec![entry.path().join(rest)]
-            }
-        })
-        .filter(|candidate| candidate.is_dir())
-        .collect();
+    let candidates: Vec<PathBuf> = if abbreviated_commit {
+        abbreviated_checkouts(&cargo_home.join(parent), prefix, first)
+            .into_iter()
+            .map(|checkout| if inside.is_empty() { checkout } else { checkout.join(inside) })
+            .filter(|candidate| candidate.is_dir())
+            .collect()
+    } else {
+        entries(&cargo_home.join(parent))
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+            .map(|entry| entry.path().join(rest))
+            .filter(|candidate| candidate.is_dir())
+            .collect()
+    };
     one_candidate(candidates, &format!("{root} under {}", cargo_home.display()))
-}
-
-/// The entries of `dir`; none if it cannot be read.
-fn read_dir_entries(dir: &Path) -> impl Iterator<Item = std::fs::DirEntry> {
-    std::fs::read_dir(dir).into_iter().flatten().flatten()
 }
 
 /// The one directory default scope detection found, or an error naming what to pass.

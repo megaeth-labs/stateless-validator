@@ -7,6 +7,8 @@ use std::{
     process::Command,
 };
 
+#[path = "build/checkouts.rs"]
+mod checkouts;
 #[path = "build/lockfile.rs"]
 mod lockfile;
 
@@ -161,18 +163,14 @@ fn source_root(package: &LockedPackage<'_>, cargo_home: &Path, whole_checkout: b
             if whole_checkout {
                 return checkout;
             }
-            match crate_dir_in_checkouts(
-                cargo_home,
-                repo,
-                &commit[..commit.len().min(7)],
-                package.name,
-            ) {
-                Some(dir) if dir.as_os_str().is_empty() => checkout,
-                Some(dir) => format!("{checkout}/{}", dir.display()),
-                None => {
+            let abbrev = &commit[..commit.len().min(7)];
+            match crate_dir_in_checkouts(cargo_home, repo, abbrev, package.name) {
+                Ok(dir) if dir.as_os_str().is_empty() => checkout,
+                Ok(dir) => format!("{checkout}/{}", dir.display()),
+                Err(why) => {
                     println!(
-                        "cargo:warning=coverage-replayer: no `{}` crate found in its {repo} \
-                         checkout; scoping it by the whole checkout",
+                        "cargo:warning=coverage-replayer: {why}; scoping `{}` by its whole {repo} \
+                         checkout",
                         package.name
                     );
                     checkout
@@ -183,50 +181,29 @@ fn source_root(package: &LockedPackage<'_>, cargo_home: &Path, whole_checkout: b
     }
 }
 
-/// The directory of crate `name` inside a checkout of `repo` at a commit cargo abbreviated to
-/// (at least) `abbrev`, relative to the checkout; `None` if no checkout or no crate is found.
+/// The directory of crate `name` inside the checkouts of `repo` at a commit cargo abbreviated
+/// to (at least) `abbrev`, relative to its checkout. Only one directory may declare the crate,
+/// across all such checkouts, so every machine building one Cargo.lock bakes in the same scope.
 fn crate_dir_in_checkouts(
     cargo_home: &Path,
     repo: &str,
     abbrev: &str,
     name: &str,
-) -> Option<PathBuf> {
-    let entries = |dir: &Path| std::fs::read_dir(dir).into_iter().flatten().flatten();
-    entries(&cargo_home.join("git").join("checkouts"))
-        .filter(|clone| clone.file_name().to_string_lossy().starts_with(&format!("{repo}-")))
-        .flat_map(|clone| entries(&clone.path()).collect::<Vec<_>>())
-        .filter(|checkout| checkout.file_name().to_string_lossy().starts_with(abbrev))
-        .find_map(|checkout| crate_dir_in(&checkout.path(), name))
-}
-
-/// The directory under `checkout` whose `Cargo.toml` declares package `name`, relative to it.
-fn crate_dir_in(checkout: &Path, name: &str) -> Option<PathBuf> {
-    let declares = |manifest: &Path| {
-        let Ok(text) = std::fs::read_to_string(manifest) else { return false };
-        let mut in_package = false;
-        text.lines().map(str::trim).any(|line| {
-            if line.starts_with('[') {
-                in_package = line == "[package]";
-                return false;
-            }
-            in_package && line == format!("name = \"{name}\"")
-        })
-    };
-    let mut pending = vec![PathBuf::new()];
-    while let Some(relative) = pending.pop() {
-        let dir = checkout.join(&relative);
-        if declares(&dir.join("Cargo.toml")) {
-            return Some(relative);
-        }
-        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let skip =
-                matches!(entry.file_name().to_str(), Some(".git" | "target" | "node_modules"));
-            if !skip && entry.file_type().is_ok_and(|t| t.is_dir()) {
-                pending.push(relative.join(entry.file_name()));
-            }
-        }
+) -> Result<PathBuf, String> {
+    let checkouts = checkouts::abbreviated_checkouts(
+        &cargo_home.join("git/checkouts"),
+        &format!("{repo}-"),
+        abbrev,
+    );
+    let mut found: Vec<PathBuf> =
+        checkouts.iter().flat_map(|checkout| checkouts::crate_dirs_in(checkout, name)).collect();
+    found.sort();
+    found.dedup();
+    match found.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err(format!("no `{name}` crate found in {} {repo} checkout(s)", checkouts.len())),
+        several => Err(format!("`{name}` is declared in several directories ({several:?})")),
     }
-    None
 }
 
 /// The full git rev of `mega-evm`, from its source:
