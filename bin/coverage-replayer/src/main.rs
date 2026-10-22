@@ -25,8 +25,13 @@
 
 mod backfill;
 mod bitset;
+// build.rs's Cargo.lock reading, included here only for its tests (see the file's docs).
 mod inspect;
 mod llvm;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../build/lockfile.rs"]
+mod lockfile;
 mod profile_rt;
 mod proto;
 mod report;

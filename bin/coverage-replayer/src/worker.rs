@@ -186,9 +186,68 @@ fn process_block(
 
 #[cfg(test)]
 mod tests {
+    /// Serializes the tests that run measured code: its counters are process-global.
+    static MEASURED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Every worker runs this before its first block: a panic here would crash-loop them all.
     #[test]
     fn warm_up_builds_every_table_without_panicking() {
+        let _measured = MEASURED.lock().unwrap_or_else(|e| e.into_inner());
         super::warm_up();
+    }
+
+    /// The guard behind `warm_up`: after it, a block's first replay covers exactly what its
+    /// second does, so no run-once table is left for a worker's first block to be credited
+    /// with. A dependency bump that adds one fails here, naming how many items it adds. It needs
+    /// the instrumented build (normal builds compile it out):
+    ///
+    /// ```text
+    /// RUSTC_WRAPPER="$PWD/bin/coverage-replayer/cov-rustc-wrapper.sh" cargo test \
+    ///   --profile coverage -p coverage-replayer --bins \
+    ///   --target "$(rustc -vV | sed -n 's/host: //p')" -- worker::tests
+    /// ```
+    #[cfg(coverage_replayer_instrumented)]
+    #[test]
+    fn a_block_replays_to_the_same_items_twice() {
+        use stateless_core::LightWitness;
+        use stateless_test_utils::fixtures::TestFixtures;
+
+        use super::*;
+
+        let _measured = MEASURED.lock().unwrap_or_else(|e| e.into_inner());
+        let fixtures = TestFixtures::mainnet_shared();
+        let chain_spec = ChainSpec::from_genesis(fixtures.load_genesis().unwrap());
+        let (number, hash) = fixtures.paired_blocks()[0];
+        let block = &fixtures.blocks[&hash];
+        let llvm = LlvmArgs { source_dirs: Vec::new(), llvm_profdata: None, llvm_cov: None }
+            .resolve()
+            .unwrap();
+        let exe = crate::profile_rt::own_executable().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        warm_up();
+        let replay = |round: &str| {
+            let light = LightWitness::from(&fixtures.salt_witnesses[&hash]);
+            let ext_env = WitnessExternalEnv::from_light_witness(&light, number).unwrap();
+            let executor = LightWitnessExecutor::from(light);
+            let header = &block.header.inner;
+            let db = WitnessDatabase { header, witness: &executor, contracts: &fixtures.contracts };
+            crate::profile_rt::reset_counters();
+            replay_block(&chain_spec, block, &db, ext_env).unwrap();
+            let profraw = dir.path().join(format!("{round}.profraw"));
+            crate::profile_rt::write_profraw(&profraw).unwrap();
+            let profdata = dir.path().join(format!("{round}.profdata"));
+            llvm.extract_covered_items(&exe, &profraw, &profdata).unwrap()
+        };
+        let (first, second) = (replay("first"), replay("second"));
+
+        let only_first = first.iter().filter(|id| second.binary_search(id).is_err()).count();
+        assert_eq!(
+            only_first, 0,
+            "block {number}'s first replay covers {only_first} items its second does not: a \
+             run-once table `warm_up` does not build"
+        );
+        assert_eq!(first, second, "replaying block {number} twice must cover the same items");
+        assert!(!first.is_empty(), "block {number} covered nothing in scope");
     }
 }
