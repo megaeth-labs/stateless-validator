@@ -1420,8 +1420,8 @@ mod tests {
     fn jemalloc_purges_in_the_background() {
         let conf = jemalloc_str(tikv_jemalloc_ctl::config::malloc_conf::read().unwrap());
         // jemalloc applies options left to right, so the last setting is the one in force.
-        let default = conf.split(',').filter_map(|opt| opt.strip_prefix("background_thread:"));
-        assert_eq!(default.last(), Some("true"), "compiled-in malloc_conf: {conf:?}");
+        let mut default = conf.split(',').filter_map(|opt| opt.strip_prefix("background_thread:"));
+        assert_eq!(default.next_back(), Some("true"), "compiled-in malloc_conf: {conf:?}");
     }
 
     /// Verifies that an endpoint flag accepts repeated flags, CSV values, and env var —
