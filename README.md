@@ -27,7 +27,7 @@ The stateless approach eliminates the need for validators to run on high-end har
 
 ## Project Structure
 
-The workspace contains two binaries and five library crates:
+The workspace contains three binaries and five library crates:
 
 | Crate                  | Path                          | Purpose                                                                                                                                                                              |
 | ---------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -38,6 +38,7 @@ The workspace contains two binaries and five library crates:
 | `stateless-r2`         | `crates/stateless-r2`         | Shared R2 witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT, and the retrying witness-object GET fetcher over either the signed S3 API or an unsigned Cloudflare custom domain; consumed by mega-reth's witness uploaders (write), this repo's validator, and the trace server's witness source (read) |
 | `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers                                                                                                                                 |
 | `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                                                                                                                        |
+| `coverage-replayer`    | `bin/coverage-replayer`       | Offline coverage tool: replays mainnet blocks under LLVM branch instrumentation and derives a small (greedy) block set that reproduces all the execution coverage the scan observed, of mega-evm and the revm execution engine under it |
 
 Additional directories: `test_data/` (integration test fixtures including genesis config), `audits/` (security audit reports).
 
@@ -82,7 +83,7 @@ cargo run --release --bin stateless-validator -- \
   Which of the two a run produces follows from how far behind it is: a tip-following validator fetches inside that window, so all of its misses are frontier misses — routine and numerous — and `kind="missing"` stays at zero; watch the frontier rate there instead.
   `kind="missing"` is the bucket-integrity signal during catch-up and fixed `--end-block` backfills, where blocks sit far below the head. A hole that first appears near the tip is not caught here, since the block is fetched once, falls back and is never re-probed; that belongs to whatever monitors the uploader.
   With no `--r2-*` flag set at all, witnesses come from the RPC chain alone; a half-configured target, a blank value, or a tuning flag with no target is rejected at startup by name rather than read as "no R2 configured".
-  "Blank value" covers the flags that travel as text; the two numeric tuning flags are parsed by clap, so a blank one aborts earlier with clap's unnamed error (see AGENTS.md for the full rule).
+  "Blank value" covers the flags that travel as text; the two numeric tuning flags are parsed by clap, so a blank one aborts earlier, in clap's parser (see AGENTS.md for the full rule).
   The R2 attempt for one block is bounded in total by a single `--rpc-per-attempt-timeout-ms`, permit wait included, so an endpoint that accepts connections and then stalls costs the block one upstream hop's wall clock rather than one per retry before the RPC chain takes over.
 - `--r2-custom-domain`: alternative R2 target that replaces the four flags above — unsigned HTTP/2 GETs through a Cloudflare custom domain fronting the bucket (mutually exclusive with `--r2-endpoint`, and any of the four left set is rejected at startup by name rather than silently ignored; optional `--r2-access-client-id`/`--r2-access-client-secret` attach Cloudflare Access service-token headers, which require an `https://` domain unless it is loopback; the domain's cache rule must set 404s to bypass cache, or a cached pre-upload 404 pushes those blocks onto the RPC path for the negative-cache TTL and false-fires the `kind="missing"` alarm once they age past the frontier band)
 - `--report-validation-endpoint`: RPC endpoint URL for reporting validated blocks via `mega_setValidatedBlocks` (disabled if not provided)
@@ -190,8 +191,11 @@ A bounded in-memory `BlockData` cache keyed by block hash sits between the respo
 Block-number lookups still resolve number → hash against the DB or upstream first, so canonicality is never cached and reorgs need no invalidation here; when a trace fails for a data-attributable reason (the witness cannot replay the block), the entry is dropped so the next request refetches instead of replaying the poisoned data, and each such eviction is counted (`block_data_evictions_total`).
 Size it with `--block-data-cache-max-size` (default `1GB`; `0` disables); the cache uses a fixed 4 shards, so the largest cacheable entry is `max_bytes / 4` on every host (~256 MB at the default), and an insert the cache does not retain is counted (`cache_admission_rejects_total`) and logged rather than masquerading as a miss.
 The byte budget is an estimate of retained payload, not exact RSS: map/allocator overhead is under-counted, and contract bytecode is charged here *and* in the contract cache (the same refcounted allocations), so evicting an entry can free less than its accounted weight.
+A cached witness is charged as its KV/level payload plus the direct-lookup table built beside it once per block and shared by every trace request.
+The table stays resident as long as the entry does, so the same budget holds fewer blocks than the witness maps alone would suggest.
 The server runs on jemalloc rather than the system allocator: under glibc malloc this cache churn left RSS at 2.5–3× the caches' accounted bytes and still rising, because freed memory stayed in malloc's per-thread arenas instead of returning to the OS.
 On Linux, jemalloc runs with background purge threads, so memory freed by a load burst returns to the OS within seconds even from arenas that then go quiet; set `MALLOC_CONF=background_thread:false` to disable them.
+The `Allocator: jemalloc` line logged at startup, with or without metrics, reports the settings that took effect (`background_thread`, `narenas`, and the compiled-in `malloc_conf` that `MALLOC_CONF` overrides).
 With `--metrics-enabled`, jemalloc's own accounting is exported every 10s as `debug_trace_jemalloc_{allocated,active,metadata,resident,mapped,retained}_bytes`: `allocated` is the live heap and `resident` the physical memory the allocator holds, so a gap that widens while `allocated` stays flat is allocator retention rather than a leak.
 Combined default memory across the four caches is roughly 3.1 GB — response cache 1 GB + block-data cache 1 GB + contract cache 512 MB + canonical-hash memo ~0.6 GB at its 8M-entry cap (it fills lazily; the measured working set is 50–130k heights, ~10 MB) — on top of ordinary heap and, in local cache mode, redb's page cache (up to 1 GiB); size hosts (or lower the knobs) accordingly.
 

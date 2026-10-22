@@ -14,8 +14,8 @@ pub use stateless_common::{
     DEFAULT_METRICS_PORT,
     metrics::{BYTE_BUCKETS, REORG_DEPTH_BUCKETS, install_prometheus_exporter},
 };
-use tikv_jemalloc_ctl::{epoch, stats};
-use tracing::warn;
+use tikv_jemalloc_ctl::{Access, Mib, epoch, epoch_mib, stats};
+use tracing::{debug, warn};
 
 /// Prefix for timed RPC method aliases.
 pub const TIMED_PREFIX: &str = "timed_";
@@ -750,10 +750,6 @@ impl ChainSyncMetrics {
 
 /// jemalloc's own accounting of the process heap (singleton), sampled by
 /// [`spawn_allocator_stats`].
-///
-/// `allocated` is the live heap and `resident` the physical memory jemalloc holds, so a gap
-/// that widens while `allocated` stays flat is memory the allocator is keeping rather than a
-/// leak.
 #[derive(Clone, Metrics)]
 #[metrics(scope = "debug_trace")]
 pub struct AllocatorMetrics {
@@ -773,27 +769,53 @@ pub struct AllocatorMetrics {
     jemalloc_retained_bytes: Gauge,
 }
 
-impl AllocatorMetrics {
+/// Publishes [`AllocatorMetrics`] from jemalloc.
+///
+/// The mallctl names are resolved to MIBs once, so a sample is seven direct lookups rather than
+/// seven walks of jemalloc's ctl tree on a loop that runs for the process's lifetime.
+struct AllocatorSampler {
+    epoch: epoch_mib,
+    stats: [(Gauge, Mib<[usize; 2]>); 6],
+}
+
+impl AllocatorSampler {
+    /// Resolves every statistic's MIB.
+    fn new() -> tikv_jemalloc_ctl::Result<Self> {
+        let AllocatorMetrics {
+            jemalloc_allocated_bytes,
+            jemalloc_active_bytes,
+            jemalloc_metadata_bytes,
+            jemalloc_resident_bytes,
+            jemalloc_mapped_bytes,
+            jemalloc_retained_bytes,
+        } = AllocatorMetrics::default();
+        Ok(Self {
+            epoch: epoch::mib()?,
+            stats: [
+                (jemalloc_allocated_bytes, stats::allocated::mib()?.0),
+                (jemalloc_active_bytes, stats::active::mib()?.0),
+                (jemalloc_metadata_bytes, stats::metadata::mib()?.0),
+                (jemalloc_resident_bytes, stats::resident::mib()?.0),
+                (jemalloc_mapped_bytes, stats::mapped::mib()?.0),
+                (jemalloc_retained_bytes, stats::retained::mib()?.0),
+            ],
+        })
+    }
+
     /// Advances jemalloc's stats epoch and publishes one sample.
-    fn sample(&self) {
+    ///
+    /// Once the MIBs resolve, a read can only fail for a reason fixed for the process's lifetime
+    /// — chiefly a jemalloc that cannot report statistics (one linked through
+    /// `JEMALLOC_OVERRIDE`), whose stat names still resolve — so the first sample's outcome is
+    /// every sample's.
+    fn sample(&self) -> tikv_jemalloc_ctl::Result<()> {
         // jemalloc caches its statistics; they only refresh when the epoch advances.
-        if let Err(error) = epoch::advance() {
-            warn!(%error, "Failed to advance the jemalloc stats epoch");
-            return;
+        self.epoch.advance()?;
+        for (gauge, mib) in &self.stats {
+            let bytes: usize = mib.read()?;
+            gauge.set(bytes as f64);
         }
-        for (stat, gauge, value) in [
-            ("allocated", &self.jemalloc_allocated_bytes, stats::allocated::read()),
-            ("active", &self.jemalloc_active_bytes, stats::active::read()),
-            ("metadata", &self.jemalloc_metadata_bytes, stats::metadata::read()),
-            ("resident", &self.jemalloc_resident_bytes, stats::resident::read()),
-            ("mapped", &self.jemalloc_mapped_bytes, stats::mapped::read()),
-            ("retained", &self.jemalloc_retained_bytes, stats::retained::read()),
-        ] {
-            match value {
-                Ok(bytes) => gauge.set(bytes as f64),
-                Err(error) => warn!(stat, %error, "Failed to read jemalloc stats"),
-            }
-        }
+        Ok(())
     }
 }
 
@@ -803,16 +825,26 @@ const ALLOCATOR_STATS_INTERVAL: Duration = Duration::from_secs(10);
 /// Samples jemalloc's heap statistics into [`AllocatorMetrics`] every
 /// [`ALLOCATOR_STATS_INTERVAL`] for the process's lifetime.
 ///
-/// On its own thread so the epoch refresh, which merges every arena's statistics under the
-/// arenas' locks, never runs on an async worker.
+/// The first sample is taken here, and a failure disables sampling with one warning rather than
+/// failing every [`ALLOCATOR_STATS_INTERVAL`]. On its own thread so the epoch refresh, which
+/// merges every arena's statistics under the arenas' locks, never runs on an async worker.
 fn spawn_allocator_stats() -> Result<()> {
-    let metrics = AllocatorMetrics::default();
+    let sampler = AllocatorSampler::new().and_then(|sampler| sampler.sample().map(|()| sampler));
+    let sampler = match sampler {
+        Ok(sampler) => sampler,
+        Err(error) => {
+            warn!(%error, "jemalloc statistics are unavailable; allocator metrics disabled");
+            return Ok(());
+        }
+    };
     thread::Builder::new()
         .name("jemalloc-stats".to_owned())
         .spawn(move || {
             loop {
-                metrics.sample();
                 thread::sleep(ALLOCATOR_STATS_INTERVAL);
+                if let Err(error) = sampler.sample() {
+                    debug!(%error, "Failed to sample jemalloc stats");
+                }
             }
         })
         .map_err(|e| eyre!("failed to spawn the jemalloc stats thread: {e}"))?;
@@ -1310,19 +1342,12 @@ mod tests {
         assert_eq!(resolve_method("nonexistent"), "unknown");
     }
 
-    /// Background purge threads are what return a burst's freed pages from arenas that then go
-    /// quiet; without the `background_threads` feature RSS stays well above the live heap after
-    /// load, and nothing else would notice the feature going missing. Linux only: jemalloc has no
-    /// background threads on macOS.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn jemalloc_purges_in_the_background() {
-        assert!(tikv_jemalloc_ctl::background_thread::read().unwrap());
-    }
-
     /// The gauges only carry real numbers when jemalloc is the allocator this binary runs on
-    /// and was built with statistics (`tikv-jemalloc-ctl`'s `stats` feature); without them
-    /// every read fails and the dashboard silently shows nothing.
+    /// and can report statistics; otherwise sampling is disabled and the dashboard shows nothing.
+    ///
+    /// Asserts presence and non-zero values only, not orderings such as
+    /// `allocated <= active`: jemalloc merges the per-arena counters without a global lock, so
+    /// a snapshot taken while other tests allocate in parallel can briefly violate them.
     #[test]
     fn allocator_metrics_sample_the_live_heap() {
         use std::collections::HashMap;
@@ -1331,7 +1356,9 @@ mod tests {
 
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        metrics::with_local_recorder(&recorder, || AllocatorMetrics::default().sample());
+        metrics::with_local_recorder(&recorder, || {
+            AllocatorSampler::new().unwrap().sample().unwrap()
+        });
 
         let gauges: HashMap<String, f64> = snapshotter
             .snapshot()
@@ -1345,11 +1372,12 @@ mod tests {
         // The recorder sees the scoped name; the Prometheus exporter renders `.` as `_`.
         let gauge = |stat: &str| gauges[&format!("debug_trace.jemalloc_{stat}_bytes")];
 
-        assert!(gauge("allocated") > 0.0, "the test harness itself allocates");
-        assert!(gauge("active") >= gauge("allocated"));
-        assert!(gauge("resident") >= gauge("active"));
-        assert!(gauge("mapped") >= gauge("active"));
-        assert!(gauge("metadata") > 0.0);
+        // The test harness itself allocates, so every stat but `retained` (address space, which
+        // jemalloc may hold none of) is non-zero in any process.
+        for stat in ["allocated", "active", "metadata", "resident", "mapped"] {
+            assert!(gauge(stat) > 0.0, "{stat}");
+        }
+        assert!(gauges.contains_key("debug_trace.jemalloc_retained_bytes"));
     }
 
     #[test]

@@ -1846,6 +1846,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "coverage-replayer"
+version = "2.0.20"
+dependencies = [
+ "alloy-genesis",
+ "alloy-primitives",
+ "alloy-rpc-types-eth",
+ "bincode",
+ "clap",
+ "eyre",
+ "kanal",
+ "libc",
+ "mega-evm",
+ "num_cpus",
+ "op-alloy-rpc-types",
+ "redb",
+ "revm",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "stateless-common",
+ "stateless-core",
+ "stateless-test-utils",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+ "zstd",
+]
+
+[[package]]
 name = "cow-utils"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

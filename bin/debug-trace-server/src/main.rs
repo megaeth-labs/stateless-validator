@@ -109,15 +109,33 @@ use crate::chain_sync::{TraceFetcher, TraceHooks, TraceProcessor};
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// Logs the allocator configuration in force, whether or not metrics are enabled: `MALLOC_CONF`
+/// can override the compiled-in defaults at deploy time, and nothing else shows what took
+/// effect. A field jemalloc cannot report (background threads on macOS) is omitted.
+fn log_allocator_config() {
+    use tikv_jemalloc_ctl::{background_thread, config, opt, version};
+
+    info!(
+        version = version::read().ok().map(jemalloc_str),
+        compiled_conf = config::malloc_conf::read().ok().map(jemalloc_str),
+        background_thread = background_thread::read().ok(),
+        narenas = opt::narenas::read().ok(),
+        "Allocator: jemalloc"
+    );
+}
+
+/// Strips the NUL terminator `tikv-jemalloc-ctl`'s string reads keep from the C string.
+fn jemalloc_str(s: &'static str) -> &'static str {
+    s.trim_end_matches('\0')
+}
+
 /// Command line arguments for the debug-trace-server.
 #[derive(Parser, Debug)]
 #[clap(name = "debug-trace-server", version, about = "Debug/Trace RPC Server")]
 // Every `--r2-*` coherence rule is enforced after parsing, by
-// `stateless_common::validate_r2_flags`, rather than through clap attributes: this workspace
-// builds clap without its `error-context` feature (root `Cargo.toml`), so every clap rejection
-// is generic and names no argument — useless to an operator debugging an env file. A blank env
-// line also reads as *presence* to clap, so leaving exclusion to it would report a phantom
-// conflict where the real fault is an empty value.
+// `stateless_common::validate_r2_flags`, rather than through clap attributes: both binaries then
+// give the same verdict in the same words, and a blank env line — which clap reads as
+// *presence* — is diagnosed as the empty value it is instead of as a phantom conflict.
 struct Args {
     /// RPC server listen address.
     #[clap(long, env = "DEBUG_TRACE_SERVER_ADDR", default_value = "0.0.0.0:8545")]
@@ -453,13 +471,13 @@ struct Args {
     /// Cloudflare Access service-token client id, sent as `CF-Access-Client-Id` on every
     /// custom-domain GET. Omit when the domain is locked by an IP allowlist instead.
     /// Redacted like the secret: the id alone is enough to look up the token.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ACCESS_CLIENT_ID")]
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ACCESS_CLIENT_ID", hide_env_values = true)]
     r2_access_client_id: Option<RedactedSecret>,
 
     /// Cloudflare Access service-token client secret, sent as `CF-Access-Client-Secret`.
     /// Prefer the env var over the flag so the secret stays out of shell history and
     /// process listings.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ACCESS_CLIENT_SECRET")]
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_ACCESS_CLIENT_SECRET", hide_env_values = true)]
     r2_access_client_secret: Option<RedactedSecret>,
 
     /// R2 bucket holding the archived witness objects. Requires `--r2-endpoint`.
@@ -472,7 +490,7 @@ struct Args {
 
     /// R2 secret access key. Requires `--r2-endpoint`. Prefer the env var over the flag so
     /// the secret stays out of shell history and process listings.
-    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_SECRET_ACCESS_KEY")]
+    #[clap(long, env = "DEBUG_TRACE_SERVER_R2_SECRET_ACCESS_KEY", hide_env_values = true)]
     r2_secret_access_key: Option<RedactedSecret>,
 
     /// R2 connection-establishment timeout (milliseconds). A healthy handshake to the local
@@ -520,8 +538,8 @@ struct Args {
     /// lifting the ceiling; a count larger than that cap is rejected, since the surplus
     /// connections could never be filled.
     ///
-    /// Taken as text and parsed after clap so a blank env line is rejected by name rather than
-    /// through clap's unnamed value error.
+    /// Taken as text and parsed after clap so a blank env line is diagnosed by the R2 rules,
+    /// like every other blank `--r2-*` value, rather than aborting in clap's parser first.
     #[clap(long, env = "DEBUG_TRACE_SERVER_R2_CONNECTIONS")]
     r2_connections: Option<String>,
 
@@ -801,6 +819,7 @@ async fn main() -> Result<()> {
         listen_addr = %args.addr,
         "Debug-trace-server starting"
     );
+    log_allocator_config();
     // The combined witness chain (generator first when configured) — the list actually fed to
     // the RPC client, not just the fallback flag values.
     let witness_apis = witness_endpoint_chain(&args);
@@ -1391,6 +1410,19 @@ fn run_prune_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Background purge threads are what return a burst's freed pages from arenas that then go
+    /// quiet, and nothing else would notice the `background_threads` feature going missing.
+    /// Linux only, like the feature. Reads the compiled-in default the feature sets rather than
+    /// the live setting, which the documented `MALLOC_CONF=background_thread:false` overrides.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn jemalloc_purges_in_the_background() {
+        let conf = jemalloc_str(tikv_jemalloc_ctl::config::malloc_conf::read().unwrap());
+        // jemalloc applies options left to right, so the last setting is the one in force.
+        let default = conf.split(',').filter_map(|opt| opt.strip_prefix("background_thread:"));
+        assert_eq!(default.last(), Some("true"), "compiled-in malloc_conf: {conf:?}");
+    }
 
     /// Verifies that an endpoint flag accepts repeated flags, CSV values, and env var —
     /// ensuring container deployments configured purely via env are not silently limited
@@ -2050,6 +2082,27 @@ mod tests {
             let dropped = full[skip * 2];
             let err = validate_args(&parse_args(&partial)).unwrap_err().to_string();
             assert!(err.contains(dropped), "missing {dropped} must be named: {err}");
+        }
+    }
+
+    /// `--help` prints an env-backed flag's current value unless the flag sets
+    /// `hide_env_values`, so every secret `RedactedSecret` keeps out of `Debug` must stay out
+    /// of the help text too.
+    #[test]
+    fn help_hides_r2_secret_values() {
+        use clap::CommandFactory;
+        use stateless_test_utils::env::{env_lock, with_env_vars};
+        let guard = env_lock();
+        let vars = [
+            ("DEBUG_TRACE_SERVER_R2_ACCESS_CLIENT_ID", "leaked-client-id"),
+            ("DEBUG_TRACE_SERVER_R2_ACCESS_CLIENT_SECRET", "leaked-client-secret"),
+            ("DEBUG_TRACE_SERVER_R2_SECRET_ACCESS_KEY", "leaked-secret-access-key"),
+        ];
+        // clap reads the env when the command is built, so build it with all three set.
+        let help = with_env_vars(&guard, &vars, || Args::command().render_long_help().to_string());
+        for (name, value) in vars {
+            assert!(help.contains(name), "help must still name {name}");
+            assert!(!help.contains(value), "help prints the value of {name}");
         }
     }
 

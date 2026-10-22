@@ -294,6 +294,19 @@ impl StateReader for LightWitnessExecutor {
     }
 }
 
+impl LightWitnessExecutor {
+    /// The wrapped witness.
+    pub fn light_witness(&self) -> &LightWitness {
+        &self.light_witness
+    }
+
+    /// The plain keys indexed by the direct-lookup table, one per non-meta
+    /// entry the witness holds a value for.
+    pub fn plain_keys(&self) -> impl Iterator<Item = &[u8]> {
+        self.direct_lookup_tbl.keys().map(Vec::as_slice)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // `std` is the `alloc` alias in no_std builds, where the prelude carries
