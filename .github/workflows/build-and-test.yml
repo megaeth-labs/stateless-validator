@@ -32,11 +32,6 @@ jobs:
         run: cargo fmt --all --check
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features
-      - name: Check coverage-replayer's instrumented-only code
-        # The cfg cov-rustc-wrapper.sh sets on the instrumented build, over the binary and its
-        # tests (the warm-up guard among them). Without codegen nothing links, so the profiler
-        # runtime that build provides is not needed here.
-        run: cargo rustc -p coverage-replayer --bin coverage-replayer --profile test -- --cfg coverage_replayer_instrumented -Zno-codegen
       - name: Run Codespell
         uses: codespell-project/actions-codespell@v2
         with:
@@ -58,6 +53,12 @@ jobs:
         run: cargo build
       - name: Run Test
         run: cargo test
+      - name: Check coverage-replayer's instrumented-only code
+        # The cfg cov-rustc-wrapper.sh sets on the instrumented build, over the binary and its
+        # tests (the warm-up guard among them). Without codegen nothing links, so the profiler
+        # runtime that build provides is not needed. It runs here, after the tests, because its
+        # test-profile dependencies are already built; in the lint job they cost minutes.
+        run: cargo rustc -p coverage-replayer --bin coverage-replayer --profile test -- --cfg coverage_replayer_instrumented -Zno-codegen
 
   no-std:
     runs-on: ubuntu-24.04
