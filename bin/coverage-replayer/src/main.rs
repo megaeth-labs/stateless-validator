@@ -25,8 +25,16 @@
 
 mod backfill;
 mod bitset;
+/// Cargo's checkout layout, shared with build.rs (see the file's docs).
+#[path = "../build/checkouts.rs"]
+mod checkouts;
 mod inspect;
 mod llvm;
+/// build.rs's Cargo.lock reading, included here only for its tests (see the file's docs).
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../build/lockfile.rs"]
+mod lockfile;
 mod profile_rt;
 mod proto;
 mod report;

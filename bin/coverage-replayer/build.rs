@@ -2,7 +2,17 @@
 //! code, toolchain and dependency graph, NOT this binary's orchestration code, so the
 //! store's `binary_id` survives edits to the dispatcher or new subcommands.
 
-use std::process::Command;
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+#[path = "build/checkouts.rs"]
+mod checkouts;
+#[path = "build/lockfile.rs"]
+mod lockfile;
+
+use lockfile::LockedPackage;
 
 /// Runs the rustc cargo builds with (`$RUSTC`) and returns its stdout.
 fn rustc(args: &[&str]) -> String {
@@ -16,12 +26,21 @@ fn rustc(args: &[&str]) -> String {
 }
 
 fn main() {
-    let lock = std::fs::read_to_string("../../Cargo.lock")
+    let workspace = Path::new("../..");
+    let lock = std::fs::read_to_string(workspace.join("Cargo.lock"))
         .expect("coverage-replayer build: cannot read the workspace Cargo.lock");
-    let packages = locked_packages(&lock);
+    let packages = lockfile::locked_packages(&lock);
+    let manifests = lockfile::workspace_manifests(workspace);
+    // What this binary compiles: only these packages' versions, sources and dependency edges
+    // reach the scope and the namespace, so another member's dependency bump changes neither.
+    let compiled = lockfile::closure(
+        &packages,
+        "coverage-replayer",
+        &lockfile::workspace_dev_only(&manifests),
+    );
     // mega-evm's locked git rev anchors the namespace, so a missing one (e.g. a path
     // override) is a build error rather than distinct builds sharing one namespace.
-    let mega_evm = mega_evm_rev(&packages).expect(
+    let mega_evm = mega_evm_rev(&compiled).expect(
         "coverage-replayer build: no git revision for `mega-evm` in Cargo.lock. \
              The store namespace (binary_id) is anchored on that rev; if you are \
              deliberately overriding mega-evm with a path dependency, extend build.rs \
@@ -44,28 +63,6 @@ fn main() {
         "coverage-replayer build: unexpected `rustc -vV` output: {rustc_vv:?}"
     );
 
-    // The default `--source-dir` scope: where the build found mega-evm and every measured crate,
-    // from their locked sources, so it never names a version or rev that was not built.
-    let measured = std::fs::read_to_string("measured-crates.txt")
-        .expect("coverage-replayer build: measured-crates.txt is missing");
-    let names = measured.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'));
-    let mut scope: Vec<String> = std::iter::once("mega-evm")
-        .chain(names)
-        .flat_map(|name| {
-            let locked: Vec<&LockedPackage<'_>> =
-                packages.iter().filter(|p| p.name == name).collect();
-            assert!(
-                !locked.is_empty(),
-                "coverage-replayer build: measured crate `{name}` is not in Cargo.lock"
-            );
-            locked.into_iter().map(source_root)
-        })
-        .collect();
-    // Sorted and deduped: crates of one git checkout share its root, and this list is hashed
-    // into `binary_id`, so reordering the file must not change it.
-    scope.sort();
-    scope.dedup();
-
     // Where the build found its sources and its LLVM: the default scope and the LLVM tools
     // are looked up there, not under whatever $HOME the binary later runs with.
     let cargo_home = std::env::var("CARGO_HOME").unwrap_or_else(|_| {
@@ -73,13 +70,39 @@ fn main() {
             .expect("coverage-replayer build: neither CARGO_HOME nor HOME is set");
         format!("{home}/.cargo")
     });
+
+    // The default `--source-dir` scope: where the build found mega-evm (its whole checkout,
+    // which the wrapper instruments) and every measured crate (its own directory), from their
+    // locked sources, so it never names a version or rev that was not built.
+    let measured = std::fs::read_to_string("measured-crates.txt")
+        .expect("coverage-replayer build: measured-crates.txt is missing");
+    let names = measured.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'));
+    let home = Path::new(&cargo_home);
+    let mut scope: Vec<String> = std::iter::once("mega-evm")
+        .chain(names)
+        .flat_map(|name| {
+            let locked: Vec<&LockedPackage<'_>> =
+                compiled.iter().copied().filter(|p| p.name == name).collect();
+            assert!(
+                !locked.is_empty(),
+                "coverage-replayer build: measured crate `{name}` is not a dependency of \
+                 coverage-replayer in Cargo.lock"
+            );
+            locked.into_iter().map(move |p| source_root(p, home, name == "mega-evm"))
+        })
+        .collect();
+    // Sorted and deduped: this list is hashed into `binary_id`, and reordering the file must
+    // not change it.
+    scope.sort();
+    scope.dedup();
     let sysroot = rustc(&["--print", "sysroot"]);
     let sysroot = sysroot.trim();
 
     // The store namespace: why each input belongs in it is on `store::BINARY_ID`.
     let scope = scope.join(",");
+    let locked = compiled.iter().map(|p| p.entry).collect::<Vec<_>>().join("\n");
     let mut fingerprint = Vec::new();
-    for part in [mega_evm.as_str(), &toolchain, &scope, &lock] {
+    for part in [mega_evm.as_str(), &toolchain, &scope, &locked] {
         fingerprint.extend_from_slice(part.as_bytes());
         // Never a byte of UTF-8, so no two splits of the inputs hash alike.
         fingerprint.push(0xff);
@@ -94,8 +117,13 @@ fn main() {
     println!("cargo:rustc-env=COVERAGE_BINARY_ID={binary_id}");
     println!("cargo:rustc-env=COVERAGE_DEFAULT_SCOPE={scope}");
     println!("cargo:rerun-if-changed=measured-crates.txt");
-    // Re-run when the lockfile changes: the rev, the versions and the digest come from it.
+    // Re-run when the lockfile or a member's dependencies change: the rev, the versions and
+    // the dependency closure come from them.
     println!("cargo:rerun-if-changed=../../Cargo.lock");
+    println!("cargo:rerun-if-changed=../../Cargo.toml");
+    for manifest in &manifests {
+        println!("cargo:rerun-if-changed={}", manifest.display());
+    }
 }
 
 /// FNV-1a, 64-bit: a dependency-free digest that, unlike the standard hasher, cannot change
@@ -106,39 +134,14 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         .fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
 }
 
-/// One `[[package]]` entry of Cargo.lock.
-struct LockedPackage<'a> {
-    name: &'a str,
-    version: &'a str,
-    source: Option<&'a str>,
-}
-
-/// Every `[[package]]` entry of Cargo.lock, read field by field rather than by line order.
-fn locked_packages(lock: &str) -> Vec<LockedPackage<'_>> {
-    lock.split("[[package]]")
-        .skip(1)
-        .map(|entry| {
-            let field = |key: &str| {
-                entry.lines().find_map(|line| {
-                    let value = line.trim().strip_prefix(key)?.strip_prefix(" = ")?;
-                    Some(value.trim_matches('"'))
-                })
-            };
-            LockedPackage {
-                name: field("name").unwrap_or_default(),
-                version: field("version").unwrap_or_default(),
-                source: field("source"),
-            }
-        })
-        .collect()
-}
-
 /// Where cargo keeps a locked package's sources, relative to the cargo home, with a `*` for the
 /// directory cargo names after the source URL: the registry index for a registry crate
-/// (`registry/src/*/revm-handler-20.0.3`), the clone for a git one, whose root is its whole
-/// checkout at the locked rev (`git/checkouts/optimism-*/f67d87c`). Only the instrumented
-/// crates of a checkout reach the coverage map, so the rest of it adds nothing to the scope.
-fn source_root(package: &LockedPackage<'_>) -> String {
+/// (`registry/src/*/revm-handler-20.0.3`), the clone for a git one, then the checkout at the
+/// locked rev and the crate's directory inside it (`git/checkouts/optimism-*/f67d87c/rust/
+/// op-revm`), or the `whole_checkout`. A crate's own directory spares llvm-cov walking every
+/// file of a monorepo on each export; if the build cannot find it, the checkout still scopes
+/// it correctly, as only instrumented crates reach the coverage map.
+fn source_root(package: &LockedPackage<'_>, cargo_home: &Path, whole_checkout: bool) -> String {
     let unsupported = || -> ! {
         panic!(
             "coverage-replayer build: measured crate `{}` has neither a registry nor a git source \
@@ -156,15 +159,56 @@ fn source_root(package: &LockedPackage<'_>) -> String {
             let Some((url, commit)) = s.rsplit_once('#') else { unsupported() };
             let repo = url.split(['?', '#']).next().unwrap_or(url).trim_end_matches('/');
             let repo = repo.rsplit('/').next().unwrap_or(repo).trim_end_matches(".git");
-            format!("git/checkouts/{repo}-*/{}", &commit[..commit.len().min(7)])
+            let abbrev = &commit[..commit.len().min(checkouts::ABBREV_LEN)];
+            let checkout = format!("git/checkouts/{repo}-*/{abbrev}");
+            if whole_checkout {
+                return checkout;
+            }
+            match crate_dir_in_checkouts(cargo_home, repo, abbrev, package.name) {
+                Ok(dir) if dir.as_os_str().is_empty() => checkout,
+                Ok(dir) => format!("{checkout}/{}", dir.display()),
+                Err(why) => {
+                    println!(
+                        "cargo:warning=coverage-replayer: {why}; scoping `{}` by its whole {repo} \
+                         checkout",
+                        package.name
+                    );
+                    checkout
+                }
+            }
         }
         _ => unsupported(),
     }
 }
 
+/// The directory of crate `name` inside the checkouts of `repo` at a commit cargo abbreviated
+/// to (at least) `abbrev`, relative to its checkout. Only one directory may declare the crate,
+/// across all such checkouts, so every machine building one Cargo.lock bakes in the same scope.
+fn crate_dir_in_checkouts(
+    cargo_home: &Path,
+    repo: &str,
+    abbrev: &str,
+    name: &str,
+) -> Result<PathBuf, String> {
+    let candidates = checkouts::abbreviated_checkouts(
+        &cargo_home.join("git/checkouts"),
+        &format!("{repo}-"),
+        abbrev,
+    );
+    let mut found: Vec<PathBuf> =
+        candidates.iter().flat_map(|checkout| checkouts::crate_dirs_in(checkout, name)).collect();
+    found.sort();
+    found.dedup();
+    match found.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err(format!("no `{name}` crate found in {} {repo} checkout(s)", candidates.len())),
+        several => Err(format!("`{name}` is declared in several directories ({several:?})")),
+    }
+}
+
 /// The full git rev of `mega-evm`, from its source:
 /// `git+https://github.com/megaeth-labs/mega-evm.git?tag=vX#<rev>`.
-fn mega_evm_rev(packages: &[LockedPackage<'_>]) -> Option<String> {
+fn mega_evm_rev(packages: &[&LockedPackage<'_>]) -> Option<String> {
     packages.iter().filter(|p| p.name == "mega-evm").find_map(|p| {
         let (repo, rev) = p.source?.rsplit_once('#')?;
         repo.contains("mega-evm.git").then(|| rev.to_string())

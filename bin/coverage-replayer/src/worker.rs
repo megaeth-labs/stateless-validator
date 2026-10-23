@@ -9,16 +9,20 @@
 use std::{
     fs::File,
     io::{BufRead, Write as _},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Instant,
 };
 
+use alloy_primitives::{B256, map::HashMap};
+use alloy_rpc_types_eth::Block;
 use clap::Args;
 use eyre::{Context, Result};
 use mega_evm::{MegaPrecompiles, MegaSpecId};
-use revm::{context_interface::cfg::GasParams, primitives::hardfork::SpecId};
+use op_alloy_rpc_types::Transaction as OpTransaction;
+use revm::{context_interface::cfg::GasParams, primitives::hardfork::SpecId, state::Bytecode};
 use stateless_core::{
-    LightWitnessExecutor, WitnessDatabase, WitnessExternalEnv, chain_spec::ChainSpec, replay_block,
+    LightWitness, LightWitnessExecutor, ValidationError, WitnessDatabase, WitnessExternalEnv,
+    chain_spec::ChainSpec, executor::BlockExecutionOutput, replay_block,
 };
 
 use crate::{
@@ -109,6 +113,37 @@ fn warm_up() {
     }
 }
 
+/// One captured replay: its outcome and its wall-clock.
+struct Captured {
+    output: std::result::Result<BlockExecutionOutput, ValidationError>,
+    replay_ms: u64,
+}
+
+/// Replays `block` from its witness with per-block counter isolation — the counters reset just
+/// before the replay and the profile written to `profraw` just after — so a profile holds that
+/// one replay. The worker's one capture sequence, shared with the warm-up guard so that the
+/// guard tests what a worker does.
+fn replay_captured(
+    chain_spec: &ChainSpec,
+    block: &Block<OpTransaction>,
+    light_witness: LightWitness,
+    contracts: &HashMap<B256, Bytecode>,
+    profraw: &Path,
+) -> Result<Captured> {
+    let header = &block.header.inner;
+    let ext_env = WitnessExternalEnv::from_light_witness(&light_witness, header.number)
+        .map_err(|e| eyre::eyre!("env oracle construction: {e}"))?;
+    let executor = LightWitnessExecutor::from(light_witness);
+    let db = WitnessDatabase { header, witness: &executor, contracts };
+    crate::profile_rt::reset_counters();
+    let start = Instant::now();
+    let result = replay_block(chain_spec, block, &db, ext_env);
+    let replay_ms = start.elapsed().as_millis() as u64;
+    crate::profile_rt::write_profraw(profraw)?;
+    // The post-state is dropped only now, outside both the timing and the profile.
+    Ok(Captured { output: result.map(|(_accounts, output)| output), replay_ms })
+}
+
 fn error_response(block: u64, error: String) -> WorkerResponse {
     WorkerResponse { block, error: Some(error), ..Default::default() }
 }
@@ -116,7 +151,7 @@ fn error_response(block: u64, error: String) -> WorkerResponse {
 fn process_block(
     dirs: &DataDir,
     llvm: &Llvm,
-    exe: &std::path::Path,
+    exe: &Path,
     chain_spec: &ChainSpec,
     req: &WorkerRequest,
 ) -> Result<WorkerResponse> {
@@ -126,21 +161,12 @@ fn process_block(
         SpoolEntry::open(&dirs.spool_entry(req.block), req.block)?;
     let header = &block.header.inner;
     let contracts = dirs.load_contracts(&code_hashes)?;
-    let ext_env = WitnessExternalEnv::from_light_witness(&light_witness, header.number)
-        .map_err(|e| eyre::eyre!("env oracle construction: {e}"))?;
-    let executor = LightWitnessExecutor::from(light_witness);
-    let db = WitnessDatabase { header, witness: &executor, contracts: &contracts };
-
-    // Per-block counter isolation: this worker handles one block at a time.
-    crate::profile_rt::reset_counters();
-    let replay_start = Instant::now();
-    let result = replay_block(chain_spec, &block, &db, ext_env);
-    let replay_ms = replay_start.elapsed().as_millis() as u64;
     let profraw = dirs.block_profraw(req.block);
-    crate::profile_rt::write_profraw(&profraw)?;
+    let Captured { output, replay_ms } =
+        replay_captured(chain_spec, &block, light_witness, &contracts, &profraw)?;
 
-    let output = match result {
-        Ok((_accounts, output)) => output,
+    let output = match output {
+        Ok(output) => output,
         Err(e) => {
             // Execution failed — the bitmap would be misleading, drop it.
             let _ = std::fs::remove_file(&profraw);
@@ -186,9 +212,72 @@ fn process_block(
 
 #[cfg(test)]
 mod tests {
+    /// Serializes the tests that run measured code: its counters are process-global.
+    static MEASURED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Every worker runs this before its first block: a panic here would crash-loop them all.
     #[test]
     fn warm_up_builds_every_table_without_panicking() {
+        let _measured = MEASURED.lock().unwrap_or_else(|e| e.into_inner());
         super::warm_up();
+    }
+
+    /// The guard behind `warm_up`: after it, every fixture block's first replay covers exactly
+    /// what its second does, so no run-once table that any of them reaches is left for a
+    /// worker's first block to be credited with. A dependency bump that adds one fails here,
+    /// naming the blocks and how many items each is credited with. It needs the instrumented
+    /// build (normal builds compile it out):
+    ///
+    /// ```text
+    /// RUSTC_WRAPPER="$PWD/bin/coverage-replayer/cov-rustc-wrapper.sh" cargo test \
+    ///   --profile coverage -p coverage-replayer --bins \
+    ///   --target "$(rustc -vV | sed -n 's/host: //p')" -- worker::tests
+    /// ```
+    #[cfg(coverage_replayer_instrumented)]
+    #[test]
+    fn every_fixture_block_replays_to_the_same_items_twice() {
+        use stateless_test_utils::fixtures::TestFixtures;
+
+        use super::*;
+
+        let _measured = MEASURED.lock().unwrap_or_else(|e| e.into_inner());
+        let fixtures = TestFixtures::mainnet_shared();
+        let chain_spec = ChainSpec::from_genesis(fixtures.load_genesis().unwrap());
+        let llvm = LlvmArgs { source_dirs: Vec::new(), llvm_profdata: None, llvm_cov: None }
+            .resolve()
+            .unwrap();
+        let exe = crate::profile_rt::own_executable().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        warm_up();
+        let covered = |hash: &B256, round: &str| -> Vec<u64> {
+            let profraw = dir.path().join(format!("{round}.profraw"));
+            let light = LightWitness::from(&fixtures.salt_witnesses[hash]);
+            let block = &fixtures.blocks[hash];
+            let captured =
+                replay_captured(&chain_spec, block, light, &fixtures.contracts, &profraw).unwrap();
+            captured.output.unwrap();
+            let profdata = dir.path().join(format!("{round}.profdata"));
+            llvm.extract_covered_items(&exe, &profraw, &profdata).unwrap()
+        };
+        let mut differing = Vec::new();
+        for (number, hash) in fixtures.paired_blocks() {
+            let (first, second) = (covered(&hash, "first"), covered(&hash, "second"));
+            assert!(!first.is_empty(), "block {number} covered nothing in scope");
+            let missing_from =
+                |a: &[u64], b: &[u64]| a.iter().filter(|id| b.binary_search(id).is_err()).count();
+            if first != second {
+                differing.push((
+                    number,
+                    missing_from(&first, &second),
+                    missing_from(&second, &first),
+                ));
+            }
+        }
+        assert!(
+            differing.is_empty(),
+            "(block, items only its first replay covers, items only its second does): {differing:?} \
+             — a run-once table `warm_up` does not build"
+        );
     }
 }
