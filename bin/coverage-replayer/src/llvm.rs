@@ -24,7 +24,7 @@ use std::{
 use eyre::{Context, Result, ensure};
 use rustc_hash::FxHasher;
 
-use crate::checkouts::{abbreviated_checkouts, entries};
+use crate::checkouts::{ABBREV_LEN, abbreviated_checkouts, entries};
 
 /// Version of the item definition, stamped into every store (see [`universe_stamp`]). Bump
 /// it whenever the id, the set of item kinds, or what a block's bitmap records changes (e.g.
@@ -277,20 +277,20 @@ fn detect_source_root(cargo_home: &Path, root: &str) -> Result<PathBuf> {
     // any checkout extending the abbreviation matches (two would be refused below as
     // ambiguous), and the crate's directory inside it, if named, follows.
     let (first, inside) = rest.split_once('/').unwrap_or((rest, ""));
-    let abbreviated_commit = first.len() >= 7 && first.bytes().all(|b| b.is_ascii_hexdigit());
-    let candidates: Vec<PathBuf> = if abbreviated_commit {
+    let abbreviated_commit =
+        first.len() >= ABBREV_LEN && first.bytes().all(|b| b.is_ascii_hexdigit());
+    let mut candidates: Vec<PathBuf> = if abbreviated_commit {
         abbreviated_checkouts(&cargo_home.join(parent), prefix, first)
             .into_iter()
             .map(|checkout| if inside.is_empty() { checkout } else { checkout.join(inside) })
-            .filter(|candidate| candidate.is_dir())
             .collect()
     } else {
         entries(&cargo_home.join(parent))
             .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
             .map(|entry| entry.path().join(rest))
-            .filter(|candidate| candidate.is_dir())
             .collect()
     };
+    candidates.retain(|candidate| candidate.is_dir());
     one_candidate(candidates, &format!("{root} under {}", cargo_home.display()))
 }
 

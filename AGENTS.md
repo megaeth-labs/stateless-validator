@@ -27,7 +27,7 @@ cargo check -p stateless-core
 # Lint (CI runs all of these)
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features
-cargo clippy --workspace --all-targets --all-features -- --cfg coverage_replayer_instrumented
+cargo clippy -p coverage-replayer --all-targets --all-features -- --cfg coverage_replayer_instrumented
 cargo sort --check --workspace --grouped --order package,workspace,lints,profile,bin,benches,dependencies,dev-dependencies,features
 ```
 

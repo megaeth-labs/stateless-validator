@@ -392,10 +392,14 @@ fn is_loopback_host(host: &str) -> bool {
 /// itself the signal (Cloudflare Access bouncing an unauthenticated client to its login page),
 /// which following would bury under an HTML body. Both surface the 3xx as a `Status` error.
 fn base_client(timeouts: FetchTimeouts) -> reqwest::ClientBuilder {
-    Client::builder()
+    let builder = Client::builder()
         .timeout(timeouts.per_attempt)
         .connect_timeout(timeouts.connect)
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::none());
+    // Operators may route R2 through a proxy; the tests' endpoints must be the ones dialed.
+    #[cfg(test)]
+    let builder = builder.no_proxy();
+    builder
 }
 
 /// One HTTP client and the permits bounding what that client may carry.
@@ -1212,15 +1216,10 @@ mod tests {
     /// is unroutable: the connect either errors immediately or blackholes until the connect
     /// timeout — both must classify as `Connect`, fast. A transparent proxy (a VPN in TUN mode)
     /// accepts every TCP connection, so there 192.0.2.1 never fails to connect and only the
-    /// loopback case runs; under a proxy set in the environment, which the client honors,
-    /// neither connects anywhere but the proxy, and the test cannot run at all.
+    /// loopback case runs. A proxy set in the environment cannot interfere: test clients
+    /// ignore it (see `base_client`).
     #[tokio::test]
     async fn unreachable_endpoint_surfaces_connect_kind_fast() {
-        let proxies = ["http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"];
-        if let Some(var) = proxies.iter().find(|var| std::env::var_os(var).is_some()) {
-            eprintln!("${var} routes every request through a proxy: skipped");
-            return;
-        }
         let mut endpoints = vec!["http://127.0.0.1:1".to_string()];
         let unroutable = "192.0.2.1:81";
         let intercepted = tokio::time::timeout(
@@ -1236,9 +1235,9 @@ mod tests {
         }
 
         for endpoint in endpoints {
-            let fetcher = fetcher_with(&endpoint, None, test_pacing());
+            let r2 = fetcher(&endpoint);
             let started = Instant::now();
-            let err = fetcher.get_block_object(1, "0xhash", 1, None, || ()).await.unwrap_err();
+            let err = r2.get_block_object(1, "0xhash", 1, None, || ()).await.unwrap_err();
             assert!(matches!(err, R2GetError::Connect { .. }), "{endpoint}: {err}");
             assert_eq!(err.kind(), "connect");
             assert!(

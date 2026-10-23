@@ -4,8 +4,12 @@
 
 use std::path::{Path, PathBuf};
 
+/// The commit abbreviation a default scope names a checkout by: git's minimum, which cargo's
+/// own checkout names start with.
+pub const ABBREV_LEN: usize = 7;
+
 /// The entries of `dir`; none if it cannot be read.
-pub fn entries(dir: &Path) -> impl Iterator<Item = std::fs::DirEntry> {
+pub fn entries(dir: &Path) -> impl Iterator<Item = std::fs::DirEntry> + use<> {
     std::fs::read_dir(dir).into_iter().flatten().flatten()
 }
 
@@ -16,7 +20,7 @@ pub fn entries(dir: &Path) -> impl Iterator<Item = std::fs::DirEntry> {
 pub fn abbreviated_checkouts(clones: &Path, clone_prefix: &str, abbrev: &str) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = entries(clones)
         .filter(|clone| clone.file_name().to_string_lossy().starts_with(clone_prefix))
-        .flat_map(|clone| entries(&clone.path()).collect::<Vec<_>>())
+        .flat_map(|clone| entries(&clone.path()))
         .filter(|checkout| checkout.file_name().to_string_lossy().starts_with(abbrev))
         .map(|checkout| checkout.path())
         .filter(|checkout| checkout.is_dir())
@@ -34,7 +38,7 @@ pub fn crate_dirs_in(checkout: &Path, name: &str) -> Vec<PathBuf> {
     while let Some(relative) = pending.pop() {
         let dir = checkout.join(&relative);
         if std::fs::read_to_string(dir.join("Cargo.toml"))
-            .is_ok_and(|manifest| declares_package(&manifest, name))
+            .is_ok_and(|manifest| package_name(&manifest) == Some(name))
         {
             found.push(relative.clone());
         }
@@ -50,19 +54,16 @@ pub fn crate_dirs_in(checkout: &Path, name: &str) -> Vec<PathBuf> {
     found
 }
 
-/// Whether a manifest's `[package]` table names `name`, however the line is spaced.
-#[allow(dead_code, reason = "build.rs's: the binary only resolves what build.rs found")]
-fn declares_package(manifest: &str, name: &str) -> bool {
+/// The name a manifest's `[package]` table gives, however the line is spaced.
+pub fn package_name(manifest: &str) -> Option<&str> {
     let mut in_package = false;
-    manifest.lines().map(str::trim).any(|line| {
+    manifest.lines().map(str::trim).find_map(|line| {
         if line.starts_with('[') {
             in_package = line.trim_matches(['[', ']']).trim() == "package";
-            return false;
+            return None;
         }
-        in_package &&
-            line.split_once('=').is_some_and(|(key, value)| {
-                key.trim() == "name" && value.trim().trim_matches('"') == name
-            })
+        let (key, value) = line.split_once('=').filter(|_| in_package)?;
+        (key.trim() == "name").then(|| value.trim().trim_matches('"'))
     })
 }
 

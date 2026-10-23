@@ -26,15 +26,17 @@ fn rustc(args: &[&str]) -> String {
 }
 
 fn main() {
-    let lock = std::fs::read_to_string("../../Cargo.lock")
+    let workspace = Path::new("../..");
+    let lock = std::fs::read_to_string(workspace.join("Cargo.lock"))
         .expect("coverage-replayer build: cannot read the workspace Cargo.lock");
     let packages = lockfile::locked_packages(&lock);
+    let manifests = lockfile::workspace_manifests(workspace);
     // What this binary compiles: only these packages' versions, sources and dependency edges
     // reach the scope and the namespace, so another member's dependency bump changes neither.
     let compiled = lockfile::closure(
         &packages,
         "coverage-replayer",
-        &lockfile::workspace_dev_only(Path::new("../..")),
+        &lockfile::workspace_dev_only(&manifests),
     );
     // mega-evm's locked git rev anchors the namespace, so a missing one (e.g. a path
     // override) is a build error rather than distinct builds sharing one namespace.
@@ -75,19 +77,18 @@ fn main() {
     let measured = std::fs::read_to_string("measured-crates.txt")
         .expect("coverage-replayer build: measured-crates.txt is missing");
     let names = measured.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'));
+    let home = Path::new(&cargo_home);
     let mut scope: Vec<String> = std::iter::once("mega-evm")
         .chain(names)
         .flat_map(|name| {
-            let locked: Vec<&&LockedPackage<'_>> =
-                compiled.iter().filter(|p| p.name == name).collect();
+            let locked: Vec<&LockedPackage<'_>> =
+                compiled.iter().copied().filter(|p| p.name == name).collect();
             assert!(
                 !locked.is_empty(),
                 "coverage-replayer build: measured crate `{name}` is not a dependency of \
                  coverage-replayer in Cargo.lock"
             );
-            let whole_checkout = name == "mega-evm";
-            let cargo_home = Path::new(&cargo_home);
-            locked.into_iter().map(move |p| source_root(p, cargo_home, whole_checkout))
+            locked.into_iter().map(move |p| source_root(p, home, name == "mega-evm"))
         })
         .collect();
     // Sorted and deduped: this list is hashed into `binary_id`, and reordering the file must
@@ -99,8 +100,7 @@ fn main() {
 
     // The store namespace: why each input belongs in it is on `store::BINARY_ID`.
     let scope = scope.join(",");
-    let locked: Vec<&str> = compiled.iter().map(|p| p.entry).collect();
-    let locked = locked.join("\n");
+    let locked = compiled.iter().map(|p| p.entry).collect::<Vec<_>>().join("\n");
     let mut fingerprint = Vec::new();
     for part in [mega_evm.as_str(), &toolchain, &scope, &locked] {
         fingerprint.extend_from_slice(part.as_bytes());
@@ -121,7 +121,7 @@ fn main() {
     // the dependency closure come from them.
     println!("cargo:rerun-if-changed=../../Cargo.lock");
     println!("cargo:rerun-if-changed=../../Cargo.toml");
-    for manifest in lockfile::workspace_manifests(Path::new("../..")) {
+    for manifest in &manifests {
         println!("cargo:rerun-if-changed={}", manifest.display());
     }
 }
@@ -159,11 +159,11 @@ fn source_root(package: &LockedPackage<'_>, cargo_home: &Path, whole_checkout: b
             let Some((url, commit)) = s.rsplit_once('#') else { unsupported() };
             let repo = url.split(['?', '#']).next().unwrap_or(url).trim_end_matches('/');
             let repo = repo.rsplit('/').next().unwrap_or(repo).trim_end_matches(".git");
-            let checkout = format!("git/checkouts/{repo}-*/{}", &commit[..commit.len().min(7)]);
+            let abbrev = &commit[..commit.len().min(checkouts::ABBREV_LEN)];
+            let checkout = format!("git/checkouts/{repo}-*/{abbrev}");
             if whole_checkout {
                 return checkout;
             }
-            let abbrev = &commit[..commit.len().min(7)];
             match crate_dir_in_checkouts(cargo_home, repo, abbrev, package.name) {
                 Ok(dir) if dir.as_os_str().is_empty() => checkout,
                 Ok(dir) => format!("{checkout}/{}", dir.display()),
@@ -190,18 +190,18 @@ fn crate_dir_in_checkouts(
     abbrev: &str,
     name: &str,
 ) -> Result<PathBuf, String> {
-    let checkouts = checkouts::abbreviated_checkouts(
+    let candidates = checkouts::abbreviated_checkouts(
         &cargo_home.join("git/checkouts"),
         &format!("{repo}-"),
         abbrev,
     );
     let mut found: Vec<PathBuf> =
-        checkouts.iter().flat_map(|checkout| checkouts::crate_dirs_in(checkout, name)).collect();
+        candidates.iter().flat_map(|checkout| checkouts::crate_dirs_in(checkout, name)).collect();
     found.sort();
     found.dedup();
     match found.as_slice() {
         [one] => Ok(one.clone()),
-        [] => Err(format!("no `{name}` crate found in {} {repo} checkout(s)", checkouts.len())),
+        [] => Err(format!("no `{name}` crate found in {} {repo} checkout(s)", candidates.len())),
         several => Err(format!("`{name}` is declared in several directories ({several:?})")),
     }
 }

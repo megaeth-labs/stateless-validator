@@ -137,10 +137,11 @@ fn replay_captured(
     let db = WitnessDatabase { header, witness: &executor, contracts };
     crate::profile_rt::reset_counters();
     let start = Instant::now();
-    let output = replay_block(chain_spec, block, &db, ext_env).map(|(_accounts, output)| output);
+    let result = replay_block(chain_spec, block, &db, ext_env);
     let replay_ms = start.elapsed().as_millis() as u64;
     crate::profile_rt::write_profraw(profraw)?;
-    Ok(Captured { output, replay_ms })
+    // The post-state is dropped only now, outside both the timing and the profile.
+    Ok(Captured { output: result.map(|(_accounts, output)| output), replay_ms })
 }
 
 fn error_response(block: u64, error: String) -> WorkerResponse {
@@ -150,7 +151,7 @@ fn error_response(block: u64, error: String) -> WorkerResponse {
 fn process_block(
     dirs: &DataDir,
     llvm: &Llvm,
-    exe: &std::path::Path,
+    exe: &Path,
     chain_spec: &ChainSpec,
     req: &WorkerRequest,
 ) -> Result<WorkerResponse> {

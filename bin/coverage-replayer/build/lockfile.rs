@@ -1,7 +1,13 @@
 //! Cargo.lock reading for build.rs, which `#[path]`-includes this file; the crate's tests
-//! include it too, as a build script cannot have tests of its own.
+//! include it too, as a build script cannot have tests of its own. Both include it beside
+//! `checkouts.rs`, whose manifest reading it shares.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
+
+use crate::checkouts::package_name;
 
 /// One `[[package]]` entry of Cargo.lock.
 pub struct LockedPackage<'a> {
@@ -27,16 +33,7 @@ pub fn locked_packages(lock: &str) -> Vec<LockedPackage<'_>> {
                     Some(value.trim_matches('"'))
                 })
             };
-            let dependencies = entry
-                .split_once("dependencies = [")
-                .and_then(|(_, list)| list.split(']').next())
-                .map(|list| {
-                    list.lines()
-                        .map(|line| line.trim().trim_end_matches(',').trim_matches('"'))
-                        .filter(|spec| !spec.is_empty())
-                        .collect()
-                })
-                .unwrap_or_default();
+            let dependencies = string_array(entry, "dependencies").unwrap_or_default();
             LockedPackage {
                 name: field("name").unwrap_or_default(),
                 version: field("version").unwrap_or_default(),
@@ -46,6 +43,13 @@ pub fn locked_packages(lock: &str) -> Vec<LockedPackage<'_>> {
             }
         })
         .collect()
+}
+
+/// The strings of the first `key = [..]` array in `text`, one per line or not.
+fn string_array<'a>(text: &'a str, key: &str) -> Option<Vec<&'a str>> {
+    let (_, list) = text.split_once(&format!("{key} = ["))?;
+    let items = list.split(']').next()?.split(',');
+    Some(items.map(|item| item.trim().trim_matches('"')).filter(|item| !item.is_empty()).collect())
 }
 
 /// The packages a build of `root` (a workspace member's binary) compiles, itself included, in
@@ -67,30 +71,30 @@ pub fn closure<'a>(
     reached[start] = true;
     while let Some(i) = stack.pop() {
         let package = &packages[i];
-        let skipped = package.source.is_none().then(|| dev_only.get(package.name)).flatten();
+        let skipped = dev_only.get(package.name).filter(|_| package.source.is_none());
         for spec in &package.dependencies {
-            let name = spec.split(' ').next().unwrap_or(spec);
-            if skipped.is_some_and(|dev| dev.iter().any(|d| d == name)) {
+            let dep = resolve(packages, spec);
+            if skipped.is_some_and(|dev| dev.iter().any(|d| d == packages[dep].name)) {
                 continue;
             }
-            let dep = resolve(packages, spec);
             if !reached[dep] {
                 reached[dep] = true;
                 stack.push(dep);
             }
         }
     }
-    packages.iter().zip(reached).filter(|(_, reached)| *reached).map(|(p, _)| p).collect()
+    packages.iter().zip(reached).filter_map(|(p, reached)| reached.then_some(p)).collect()
 }
 
 /// The package names a manifest declares only as dev-dependencies (of any target): those a
 /// build of the package's library or binaries never compiles.
 pub fn dev_only_dependencies(manifest: &str) -> Vec<String> {
-    let (mut dev, mut other) = (Vec::new(), Vec::new());
+    // Every declared dependency, and whether it was declared as a dev one.
+    let mut declared: Vec<(bool, String)> = Vec::new();
     // In a dependency list (`[dependencies]`, `[target.'cfg(..)'.dev-dependencies]`, ..):
-    // whether it is the dev one. In one dependency's own table (`[dependencies.foo]`): which
-    // list holds it and where, so its `package = ".."` key can rename it.
-    let (mut list, mut own_table): (Option<bool>, Option<(bool, usize)>) = (None, None);
+    // whether it is the dev one. In one dependency's own table (`[dependencies.foo]`): where
+    // it was declared, so its `package = ".."` key can rename it.
+    let (mut list, mut own_table): (Option<bool>, Option<usize>) = (None, None);
     for line in manifest.lines().map(str::trim) {
         if let Some(header) = line.strip_prefix('[') {
             (list, own_table) = (None, None);
@@ -103,9 +107,8 @@ pub fn dev_only_dependencies(manifest: &str) -> Vec<String> {
                 let is_dev = segments[at] == "dev-dependencies";
                 match segments.get(at + 1) {
                     Some(name) => {
-                        let names = if is_dev { &mut dev } else { &mut other };
-                        names.push(name.to_string());
-                        own_table = Some((is_dev, names.len() - 1));
+                        declared.push((is_dev, name.to_string()));
+                        own_table = Some(declared.len() - 1);
                     }
                     None => list = Some(is_dev),
                 }
@@ -113,59 +116,51 @@ pub fn dev_only_dependencies(manifest: &str) -> Vec<String> {
             continue;
         }
         let Some((key, value)) = line.split_once('=') else { continue };
-        let quoted = |value: &str| value.trim().trim_matches('"').to_string();
-        if let Some((is_dev, at)) = own_table {
+        if let Some(at) = own_table {
             if key.trim() == "package" {
-                (if is_dev { &mut dev } else { &mut other })[at] = quoted(value);
+                declared[at].1 = value.trim().trim_matches('"').to_string();
             }
             continue;
         }
         let Some(is_dev) = list else { continue };
         // `name = ..`, `name.workspace = true`, or a rename through `package = "name"`.
         let renamed = value.split_once("package = \"").and_then(|(_, rest)| rest.split('"').next());
-        let name =
-            renamed.unwrap_or_else(|| key.trim().split('.').next().unwrap_or("")).to_string();
-        (if is_dev { &mut dev } else { &mut other }).push(name);
+        let name = renamed.unwrap_or_else(|| key.trim().split('.').next().unwrap_or(""));
+        declared.push((is_dev, name.to_string()));
     }
-    dev.retain(|name| !other.contains(name));
-    dev
+    let normal = |name: &str| declared.iter().any(|(is_dev, n)| !is_dev && n == name);
+    declared
+        .iter()
+        .filter(|(is_dev, name)| *is_dev && !normal(name))
+        .map(|(_, n)| n.clone())
+        .collect()
 }
 
-fn read(path: &std::path::Path) -> String {
+fn read(path: &Path) -> String {
     std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("coverage-replayer build: read {}: {e}", path.display()))
 }
 
 /// The workspace members' manifests under `root` (the directory of the workspace
 /// `Cargo.toml`), as listed in its `members`.
-pub fn workspace_manifests(root: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let workspace = read(&root.join("Cargo.toml"));
-    let members = workspace
-        .split_once("members = [")
-        .and_then(|(_, list)| list.split(']').next())
-        .expect("coverage-replayer build: the workspace Cargo.toml lists no members");
-    members
-        .split(',')
-        .map(|member| member.trim().trim_matches('"'))
-        .filter(|member| !member.is_empty())
+pub fn workspace_manifests(root: &Path) -> Vec<PathBuf> {
+    string_array(&read(&root.join("Cargo.toml")), "members")
+        .expect("coverage-replayer build: the workspace Cargo.toml lists no members")
+        .into_iter()
         .map(|member| root.join(member).join("Cargo.toml"))
         .collect()
 }
 
-/// Each workspace member's package name and dev-only dependencies.
-pub fn workspace_dev_only(root: &std::path::Path) -> HashMap<String, Vec<String>> {
-    workspace_manifests(root)
-        .into_iter()
+/// Each workspace member's package name and dev-only dependencies, from its `manifests`.
+pub fn workspace_dev_only(manifests: &[PathBuf]) -> HashMap<String, Vec<String>> {
+    manifests
+        .iter()
         .map(|path| {
-            let manifest = read(&path);
-            let name = manifest
-                .lines()
-                .find_map(|line| line.trim().strip_prefix("name = "))
-                .map(|name| name.trim_matches('"').to_string())
-                .unwrap_or_else(|| {
-                    panic!("coverage-replayer build: {} has no package name", path.display())
-                });
-            (name, dev_only_dependencies(&manifest))
+            let manifest = read(path);
+            let name = package_name(&manifest).unwrap_or_else(|| {
+                panic!("coverage-replayer build: {} has no package name", path.display())
+            });
+            (name.to_string(), dev_only_dependencies(&manifest))
         })
         .collect()
 }
@@ -295,25 +290,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         assert!(reached.iter().any(|p| p.starts_with("op-revm ")), "{reached:?}");
     }
 
-    /// The real lockfile: coverage-replayer's closure holds every measured crate, and neither
-    /// another binary nor a member's test-only stack.
+    /// The real lockfile: coverage-replayer's closure follows its workspace dependencies, and
+    /// holds neither another binary nor a member's test-only stack. (That it holds every
+    /// measured crate, build.rs asserts on every build.)
     #[test]
-    fn the_workspace_closure_holds_the_measured_crates_and_not_test_stacks() {
-        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
+    fn the_workspace_closure_holds_neither_other_binaries_nor_test_stacks() {
+        let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
         let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
         let packages = locked_packages(&lock);
-        let reached = closure(&packages, "coverage-replayer", &workspace_dev_only(root));
+        let dev_only = workspace_dev_only(&workspace_manifests(root));
+        let reached = closure(&packages, "coverage-replayer", &dev_only);
         let has = |name: &str| reached.iter().any(|p| p.name == name);
-        for measured in
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/measured-crates.txt"))
-                .unwrap()
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        {
-            assert!(has(measured), "measured crate {measured} is not in the closure");
-        }
-        assert!(has("mega-evm") && has("stateless-common"));
+        assert!(has("stateless-common"));
         for absent in
             ["debug-trace-server", "stateless-validator", "stateless-test-utils", "jsonrpsee"]
         {
