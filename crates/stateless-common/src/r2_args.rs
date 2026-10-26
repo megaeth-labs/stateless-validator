@@ -1,9 +1,9 @@
 //! Validation of the `--r2-*` argument set, shared by the binaries' argument structs.
 //!
-//! These rules decide which R2 target the witness fetcher is built with, and both binaries
-//! enforce the same ones. They live here rather than in each binary because, written twice,
-//! they diverged three ways inside a single change: one side named every missing member of an
-//! incomplete credential quad while the other reported them one at a time, one side swept
+//! These rules decide which R2 target the witness fetcher is built with, and every binary that
+//! reads R2 enforces the same ones. They live here rather than in each binary because, written
+//! twice, they diverged three ways inside a single change: one side named every missing member of
+//! an incomplete credential quad while the other reported them one at a time, one side swept
 //! empty values twice, and the shared tuning flags were gated on one binary and silently
 //! ignored on the other.
 //!

@@ -26,11 +26,9 @@ use alloy_primitives::B256;
 use clap::Args;
 use eyre::Result;
 use stateless_common::{
-    BackoffPolicy, R2CountFlag, R2Flag, R2Flags, R2Metrics, R2TuningFlag, R2WitnessError,
-    R2WitnessTransport, RedactedSecret, RpcClient, decode_on_blocking_pool,
-    decode_witness_payload_light, r2_band,
-    r2_witness::{DEFAULT_CONNECT_TIMEOUT, FetchTimeouts},
-    validate_r2_flags,
+    BackoffPolicy, DEFAULT_CONNECT_TIMEOUT, FetchTimeouts, R2CountFlag, R2Flag, R2Flags,
+    R2TuningFlag, R2WitnessError, R2WitnessTransport, RedactedSecret, RpcClient,
+    decode_on_blocking_pool, decode_witness_payload_light, r2_band, validate_r2_flags,
 };
 use stateless_core::{LightWitness, withdrawals::MptWitness};
 use tracing::{debug, info, warn};
@@ -89,8 +87,9 @@ impl R2Args {
         let budget = Duration::from_millis(self.r2_timeout_ms.unwrap_or(DEFAULT_R2_TIMEOUT_MS));
         // Each GET may take the whole budget; the deadline clamps the later ones to what is left.
         let timeouts = FetchTimeouts { per_attempt: budget, connect: DEFAULT_CONNECT_TIMEOUT };
-        let transport =
-            R2WitnessTransport::from_config(config, timeouts, retry, Arc::new(NoMetrics))?;
+        // No metrics: this binary exports none, and `WitnessSource::log_summary` says which
+        // path served.
+        let transport = R2WitnessTransport::from_config(config, timeouts, retry, Arc::new(()))?;
         let Some(transport) = transport else {
             info!("witness source: the --witness-endpoint chain (no --r2-* target configured)");
             return Ok(None);
@@ -124,15 +123,6 @@ impl R2Args {
             tuning,
         }
     }
-}
-
-/// This binary exports no metrics; [`WitnessSource::log_summary`] says which path served.
-struct NoMetrics;
-
-impl R2Metrics for NoMetrics {
-    fn on_target(&self, _: &'static str) {}
-    fn on_connections(&self, _: usize) {}
-    fn on_negotiated_version(&self, _: &'static str) {}
 }
 
 /// The bucket a run reads first, and what one block may spend on it.
@@ -215,7 +205,13 @@ impl WitnessSource {
     fn note_failure(&self, number: u64, hash: B256, e: &R2WitnessError) {
         let failures = self.r2_failures.fetch_add(1, Ordering::Relaxed) + 1;
         if failures > WARN_FIRST && !failures.is_multiple_of(WARN_EVERY) {
-            debug!(number, %hash, kind = e.kind(), error = %e, "R2 witness fetch failed; fetching it over RPC");
+            debug!(
+                number,
+                %hash,
+                kind = e.kind(),
+                error = %e,
+                "R2 witness fetch failed; fetching it over RPC"
+            );
             return;
         }
         warn!(
@@ -252,7 +248,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use clap::CommandFactory;
-    use stateless_common::{RpcClientConfig, encode_witness_payload, encode_witness_response};
+    use stateless_common::{encode_witness_payload, encode_witness_response};
     use stateless_test_utils::{
         fixtures::TestFixtures,
         mock_r2::{mock_r2, mock_r2_held},
@@ -312,13 +308,7 @@ mod tests {
                 .unwrap();
         })
         .await;
-        let rpc = RpcClient::new_with_config(
-            &["http://rpc.invalid"],
-            &[&url],
-            RpcClientConfig::default(),
-            None,
-        )
-        .unwrap();
+        let rpc = RpcClient::new(&["http://rpc.invalid"], &[&url]).unwrap();
         (handle, Arc::new(rpc), hits)
     }
 

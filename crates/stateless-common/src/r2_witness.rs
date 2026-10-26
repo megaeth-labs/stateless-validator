@@ -13,13 +13,8 @@
 use std::{sync::Arc, time::Instant};
 
 use alloy_primitives::B256;
-/// The timeouts [`R2WitnessTransport::from_config`] takes, re-exported so an adapter can build
-/// a transport without depending on `stateless-r2` itself. For `coverage-replayer` that
-/// matters: its store namespace fingerprints its Cargo.lock entry, dependency list included,
-/// so a new direct dependency would orphan every existing store.
-pub use stateless_r2::fetch::{DEFAULT_CONNECT_TIMEOUT, FetchTimeouts};
 use stateless_r2::{
-    fetch::{CfAccessCredentials, R2GetError, R2ObjectFetcher},
+    fetch::{CfAccessCredentials, FetchTimeouts, R2GetError, R2ObjectFetcher},
     keys,
 };
 use tokio::task::JoinError;
@@ -77,7 +72,7 @@ pub fn r2_band(tip: u64, block_number: u64) -> R2Band {
     }
 }
 
-/// Failure outcome of an R2 witness fetch, shared by both binaries' adapters.
+/// Failure outcome of an R2 witness fetch, shared by every reader's adapter.
 ///
 /// A binary whose decode runs without a deadline never produces [`Self::DecodeTimeout`]; its
 /// pre-registered series for that kind stays at zero.
@@ -196,8 +191,15 @@ pub trait R2Metrics: Send + Sync {
     fn on_negotiated_version(&self, version: &'static str);
 }
 
-/// The shared transport of the two R2 witness adapters: an [`R2ObjectFetcher`] plus the
-/// construction and target accessors both binaries would otherwise duplicate verbatim.
+/// No metrics, for a reader that exports none.
+impl R2Metrics for () {
+    fn on_target(&self, _: &'static str) {}
+    fn on_connections(&self, _: usize) {}
+    fn on_negotiated_version(&self, _: &'static str) {}
+}
+
+/// The shared transport of the R2 witness adapters: an [`R2ObjectFetcher`] plus the
+/// construction and target accessors each binary would otherwise duplicate verbatim.
 /// The fetcher's `Debug` redacts the credentials.
 #[derive(Debug)]
 pub struct R2WitnessTransport {
@@ -357,7 +359,7 @@ mod tests {
         BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(20))
     }
 
-    /// The band edge is one rule for both readers, so neither can drift on it: exclusive at
+    /// The band edge is one rule for every reader, so none can drift on it: exclusive at
     /// the deep end (a block exactly the window below the tip must alarm), and everything at
     /// or above the tip — including a tip of `0`, meaning none learned yet — is frontier,
     /// because nothing there is known to be uploaded.
@@ -406,7 +408,7 @@ mod tests {
     }
 
     /// Construction errors from the underlying fetcher must surface through the eyre
-    /// conversion, on both targets — one copy here covers both binaries' adapters.
+    /// conversion, on both targets — one copy here covers every adapter.
     #[test]
     fn construction_rejects_a_target_carrying_a_path() {
         let s3 = R2WitnessTransport::new(
