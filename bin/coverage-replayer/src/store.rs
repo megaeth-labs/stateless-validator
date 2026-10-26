@@ -386,10 +386,12 @@ pub fn resolve_pattern_slot(
 /// Coverage namespace key: a fingerprint of the measured build, NOT a whole-exe hash, so edits
 /// to this tool's code keep a store resumable. It changes whenever what a profile or counter
 /// means could: mega-evm's revision, the measured crates and versions, `rustc -vV`, and the
-/// lockfile — a profile names each measured generic instance by a symbol carrying the cargo
-/// metadata of the instantiating crate, which moves with any dependency or version change, so
-/// other dependencies cannot read the archived profiles. Computed by build.rs; what it cannot
-/// see (features, compiler flags) `report` catches by re-deriving the covered items.
+/// Cargo.lock entries of everything this binary compiles — a profile names each measured
+/// generic instance by a symbol carrying the cargo metadata of the instantiating crate, which
+/// moves with any dependency or version change in its graph, so other dependencies cannot read
+/// the archived profiles. Lock entries outside that graph (another workspace member's
+/// dependencies) are left out, so their bumps keep a store usable. Computed by build.rs; what it
+/// cannot see (features, compiler flags) `report` catches by re-deriving the covered items.
 pub const BINARY_ID: &str = env!("COVERAGE_BINARY_ID");
 
 /// Per-block worker times as a value → count histogram: exact percentiles in memory bounded by

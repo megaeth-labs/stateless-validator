@@ -231,7 +231,11 @@ Size it with `--block-data-cache-max-size` (default `1GB`; `0` disables); the ca
 The byte budget is an estimate of retained payload, not exact RSS: map/allocator overhead is under-counted, and contract bytecode is charged here *and* in the contract cache (the same refcounted allocations), so evicting an entry can free less than its accounted weight.
 A cached witness is charged as its KV/level payload plus the direct-lookup table built beside it once per block and shared by every trace request.
 The table stays resident as long as the entry does, so the same budget holds fewer blocks than the witness maps alone would suggest.
-Combined default memory across the four caches is roughly 3.1 GB — response cache 1 GB + block-data cache 1 GB + contract cache 512 MB + canonical-hash memo ~0.6 GB at its 8M-entry cap (it fills lazily; the measured working set is 50–130k heights, ~10 MB) — on top of ordinary heap; size hosts (or lower the knobs) accordingly.
+The server runs on jemalloc rather than the system allocator: under glibc malloc this cache churn left RSS at 2.5–3× the caches' accounted bytes and still rising, because freed memory stayed in malloc's per-thread arenas instead of returning to the OS.
+On Linux, jemalloc runs with background purge threads, so memory freed by a load burst returns to the OS within seconds even from arenas that then go quiet; set `MALLOC_CONF=background_thread:false` to disable them.
+The `Allocator: jemalloc` line logged at startup, with or without metrics, reports the settings that took effect (`background_thread`, `narenas`, and the compiled-in `malloc_conf` that `MALLOC_CONF` overrides).
+With `--metrics-enabled`, jemalloc's own accounting is exported every 10s as `debug_trace_jemalloc_{allocated,active,metadata,resident,mapped,retained}_bytes`: `allocated` is the live heap and `resident` the physical memory the allocator holds, so a gap that widens while `allocated` stays flat is allocator retention rather than a leak.
+Combined default memory across the four caches is roughly 3.1 GB — response cache 1 GB + block-data cache 1 GB + contract cache 512 MB + canonical-hash memo ~0.6 GB at its 8M-entry cap (it fills lazily; the measured working set is 50–130k heights, ~10 MB) — on top of ordinary heap and, in local cache mode, redb's page cache (up to 1 GiB); size hosts (or lower the knobs) accordingly.
 
 **Witness endpoints:**
 Declare the internal witness generator via `--witness-generator-endpoint`; `--witness-endpoint` lists the durable fallbacks (e.g. an R2-backed witness service), tried in order.
@@ -480,6 +484,7 @@ cargo test -p stateless-core -- test_name     # single test
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features
+cargo clippy -p coverage-replayer --all-targets --all-features -- --cfg coverage_replayer_instrumented
 cargo sort --check --workspace --grouped --order package,workspace,lints,profile,bin,benches,dependencies,dev-dependencies,features
 ```
 
