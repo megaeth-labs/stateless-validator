@@ -11,8 +11,13 @@
 use std::{sync::Arc, time::Instant};
 
 use alloy_primitives::B256;
+/// The timeouts [`R2WitnessTransport::from_config`] takes, re-exported so an adapter can build
+/// a transport without depending on `stateless-r2` itself. For `coverage-replayer` that
+/// matters: its store namespace fingerprints its Cargo.lock entry, dependency list included,
+/// so a new direct dependency would orphan every existing store.
+pub use stateless_r2::fetch::{DEFAULT_CONNECT_TIMEOUT, FetchTimeouts};
 use stateless_r2::{
-    fetch::{CfAccessCredentials, FetchTimeouts, R2GetError, R2ObjectFetcher},
+    fetch::{CfAccessCredentials, R2GetError, R2ObjectFetcher},
     keys,
 };
 use tokio::task::JoinError;

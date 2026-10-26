@@ -42,6 +42,7 @@ use crate::{
         BINARY_ID, BlockRecord, BlockStatus, ElapsedStats, PatternRecord, Store,
         resolve_pattern_slot,
     },
+    witness::{R2Args, WitnessSource},
 };
 
 #[derive(Args, Debug, Clone)]
@@ -67,7 +68,8 @@ pub struct BackfillArgs {
         required = true
     )]
     pub rpc_endpoints: Vec<String>,
-    /// Witness RPC endpoint(s) (`mega_getBlockWitness`).
+    /// Witness RPC endpoint(s) (`mega_getBlockWitness`): the only witness path, or the fallback
+    /// behind the bucket when the `--r2-*` flags configure one.
     #[clap(
         long = "witness-endpoint",
         env = "COVERAGE_REPLAYER_WITNESS_ENDPOINT",
@@ -75,6 +77,8 @@ pub struct BackfillArgs {
         required = true
     )]
     pub witness_endpoints: Vec<String>,
+    #[clap(flatten)]
+    pub r2: R2Args,
     /// Genesis JSON path (e.g. test_data/mainnet/genesis.json).
     #[clap(long, env = "COVERAGE_REPLAYER_GENESIS_FILE")]
     pub genesis_file: String,
@@ -269,6 +273,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         },
         None,
     )?);
+    let r2 = args.r2.transport()?;
 
     // Listening from here on: the tip check retries forever while RPC is down, and the store
     // is already open, so a signal must stop the run cleanly from this point.
@@ -283,6 +288,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
         "block {highest} is beyond the chain tip {latest}; refusing to wait on unfetchable \
          blocks",
     );
+    let witnesses = Arc::new(WitnessSource::new(client.clone(), r2, latest));
 
     let (todo, retrying) = selection.pending(&store)?;
     discard_spools(&dirs, &retrying);
@@ -321,6 +327,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     let verified_codes = Arc::new(VerifiedCodes::default());
     let fetcher = {
         let dirs = dirs.clone();
+        let witnesses = witnesses.clone();
         let fetch_concurrency = args.fetch_concurrency;
         tokio::spawn(async move {
             let mut inflight: JoinSet<u64> = JoinSet::new();
@@ -332,13 +339,21 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
                 }
                 let dirs = dirs.clone();
                 let client = client.clone();
+                let witnesses = witnesses.clone();
                 let verified_codes = verified_codes.clone();
                 inflight.spawn(async move {
                     let mut attempt = 0u64;
                     let mut block_cache = None;
                     loop {
-                        match fetch_block(&client, &dirs, &verified_codes, n, &mut block_cache)
-                            .await
+                        match fetch_block(
+                            &client,
+                            &witnesses,
+                            &dirs,
+                            &verified_codes,
+                            n,
+                            &mut block_cache,
+                        )
+                        .await
                         {
                             Ok(()) => break n,
                             Err(e) => {
@@ -393,6 +408,7 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     fetcher.await.ok();
     while manager_set.join_next().await.is_some() {}
     judge.final_summary();
+    witnesses.log_summary();
     // The channel closing only means every task is gone: a panicked fetch task or a dead
     // manager drops its block with just a log line, so an incomplete run must not exit 0.
     ensure!(
@@ -451,6 +467,7 @@ async fn forward_fetched(
 /// caller's retries so a later failure does not re-download it.
 async fn fetch_block(
     client: &RpcClient,
+    witnesses: &WitnessSource,
     dirs: &DataDir,
     verified_codes: &Arc<VerifiedCodes>,
     n: u64,
@@ -499,7 +516,7 @@ async fn fetch_block(
     let block = block_cache.as_ref().expect("just filled");
     let hash = block.header.hash;
     // Light fetch: no elliptic-curve work is spent on a proof that is never verified.
-    let (light_witness, _mpt_witness) = client.get_witness_light(n, hash).await;
+    let (light_witness, _mpt_witness) = witnesses.get(n, hash).await;
 
     let code_hashes = stateless_core::collect_code_hashes(&light_witness.kvs);
     resolve_missing_codes(client, dirs, verified_codes, code_hashes.clone()).await?;
