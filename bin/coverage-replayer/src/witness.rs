@@ -6,23 +6,29 @@
 //! `zstd(bincode-legacy((SaltWitness, MptWitness)))`, so both paths light-decode to the same
 //! witness and which one served a block cannot change what its replay covers. Any R2 failure
 //! hands the block to the RPC chain at once, which retries until it succeeds: R2 can slow a scan
-//! down, never stop it. Only the S3 target is offered, since a scan runs from a host holding a
-//! bucket-scoped key and the custom domain's edge cache would buy it nothing.
+//! down, never stop it, and `--r2-timeout-ms` bounds by how much. Only the S3 target is offered,
+//! since a scan runs from a host holding a bucket-scoped key and the custom domain's edge cache
+//! would buy it nothing.
+//!
+//! A quarantined block's retry tries R2 first too. The RPC chain is a second path to the same
+//! bytes rather than a second copy (the witness gateway reads this bucket), so a witness that
+//! decodes but replays wrong would come back the same over RPC.
 
 use std::{
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use alloy_primitives::B256;
 use clap::Args;
 use eyre::Result;
 use stateless_common::{
-    R2CountFlag, R2Flag, R2Flags, R2Metrics, R2WitnessError, R2WitnessTransport, RedactedSecret,
-    RpcClient, RpcClientConfig, decode_on_blocking_pool, decode_witness_payload_light, r2_band,
+    BackoffPolicy, R2CountFlag, R2Flag, R2Flags, R2Metrics, R2TuningFlag, R2WitnessError,
+    R2WitnessTransport, RedactedSecret, RpcClient, decode_on_blocking_pool,
+    decode_witness_payload_light, r2_band,
     r2_witness::{DEFAULT_CONNECT_TIMEOUT, FetchTimeouts},
     validate_r2_flags,
 };
@@ -33,7 +39,16 @@ use tracing::{debug, info, warn};
 /// chain is the next stop.
 const MAX_ATTEMPTS: usize = 3;
 
-/// The `--r2-*` flags: the S3 target's credential quad.
+/// `--r2-timeout-ms` when unset. Witness objects run to tens of KB, so a healthy fetch takes well
+/// under a second, and a stalling endpoint costs each block this long before RPC takes over.
+const DEFAULT_R2_TIMEOUT_MS: u64 = 5_000;
+
+/// How many R2 failures are logged as warnings before the rest drop to one in [`WARN_EVERY`]:
+/// a bucket missing a whole range would otherwise warn once per block. The summary counts all.
+const WARN_FIRST: u64 = 10;
+const WARN_EVERY: u64 = 1_000;
+
+/// The `--r2-*` flags: the S3 target's credential quad, and the budget for trying it.
 #[derive(Args, Debug, Clone, Default)]
 pub struct R2Args {
     /// R2 S3 endpoint origin, e.g. `https://<account>.r2.cloudflarestorage.com` (no bucket
@@ -50,42 +65,48 @@ pub struct R2Args {
     /// R2 secret access key. Prefer the env var over the flag.
     #[clap(long, env = "COVERAGE_REPLAYER_R2_SECRET_ACCESS_KEY", hide_env_values = true)]
     pub r2_secret_access_key: Option<RedactedSecret>,
+    /// What one block may spend on R2, in milliseconds (default 5000): the wait for a
+    /// connection plus every GET and retry. Past it the block goes to the `--witness-endpoint`
+    /// chain, so this is the most a stalling R2 endpoint costs each block. Rejected when no R2
+    /// target is configured.
+    #[clap(
+        long,
+        env = "COVERAGE_REPLAYER_R2_TIMEOUT_MS",
+        value_parser = clap::value_parser!(u64).range(100..)
+    )]
+    pub r2_timeout_ms: Option<u64>,
 }
 
 impl R2Args {
-    /// Builds the R2 transport these flags configure, or `None` when they configure none.
+    /// Builds the R2 source these flags configure, or `None` when they configure none.
     ///
-    /// The shared rules judge them, so a half-configured quad or a blank env line fails the run
-    /// by name instead of quietly sending every witness over RPC.
-    pub fn transport(&self) -> Result<Option<R2WitnessTransport>> {
-        let config = validate_r2_flags(&self.flags())?;
-        let defaults = RpcClientConfig::default();
-        let timeouts = FetchTimeouts {
-            per_attempt: defaults.per_attempt_timeout,
-            connect: DEFAULT_CONNECT_TIMEOUT,
+    /// The shared rules judge the flags, so a half-configured quad, a blank env line or a
+    /// timeout with nothing to time fails the run by name instead of quietly sending every
+    /// witness over RPC. `retry` paces the GET retries, as it paces the RPC client's.
+    pub fn source(&self, retry: BackoffPolicy) -> Result<Option<R2Source>> {
+        let tuning = [R2TuningFlag::new("--r2-timeout-ms", self.r2_timeout_ms.is_some())];
+        let config = validate_r2_flags(&self.flags(&tuning))?;
+        let budget = Duration::from_millis(self.r2_timeout_ms.unwrap_or(DEFAULT_R2_TIMEOUT_MS));
+        // Each GET may take the whole budget; the deadline clamps the later ones to what is left.
+        let timeouts = FetchTimeouts { per_attempt: budget, connect: DEFAULT_CONNECT_TIMEOUT };
+        let transport =
+            R2WitnessTransport::from_config(config, timeouts, retry, Arc::new(NoMetrics))?;
+        let Some(transport) = transport else {
+            info!("witness source: the --witness-endpoint chain (no --r2-* target configured)");
+            return Ok(None);
         };
-        let transport = R2WitnessTransport::from_config(
-            config,
-            timeouts,
-            defaults.rpc_retry,
-            Arc::new(NoMetrics),
-        )?;
-        match &transport {
-            Some(t) => info!(
-                origin = %t.origin(),
-                bucket = %self.r2_bucket.as_deref().unwrap_or("-"),
-                "witness source: R2 first, the --witness-endpoint chain as fallback"
-            ),
-            None => {
-                info!("witness source: the --witness-endpoint chain (no --r2-* target configured)")
-            }
-        }
-        Ok(transport)
+        info!(
+            origin = %transport.origin(),
+            bucket = %self.r2_bucket.as_deref().unwrap_or("-"),
+            timeout = ?budget,
+            "witness source: R2 first, the --witness-endpoint chain as fallback"
+        );
+        Ok(Some(R2Source { transport, budget }))
     }
 
     /// These flags in the shared rules' terms. The custom-domain members stay unset: this binary
     /// does not offer that target.
-    fn flags(&self) -> R2Flags<'_> {
+    fn flags<'a>(&'a self, tuning: &'a [R2TuningFlag<'a>]) -> R2Flags<'a> {
         let unset = |name| R2Flag::new(name, None);
         R2Flags {
             endpoint: R2Flag::new("--r2-endpoint", self.r2_endpoint.as_deref()),
@@ -100,7 +121,7 @@ impl R2Args {
             access_client_secret: unset("--r2-access-client-secret"),
             connections: unset("--r2-connections"),
             max_concurrent_requests: R2CountFlag::new("--r2-max-concurrent-requests", None),
-            tuning: &[],
+            tuning,
         }
     }
 }
@@ -114,28 +135,67 @@ impl R2Metrics for NoMetrics {
     fn on_negotiated_version(&self, _: &'static str) {}
 }
 
-/// Light witnesses for the fetch tasks: from R2 first when a transport is given, else (and after
-/// any R2 failure) from the RPC witness chain. Counts which path served each block.
+/// The bucket a run reads first, and what one block may spend on it.
+pub struct R2Source {
+    transport: R2WitnessTransport,
+    budget: Duration,
+}
+
+impl R2Source {
+    /// One bounded R2 attempt for `(number, hash)`. Every GET and retry shares the budget, like
+    /// the validator's fast path, so a stalling endpoint costs the block one budget, not one per
+    /// attempt.
+    async fn fetch(
+        &self,
+        number: u64,
+        hash: B256,
+    ) -> Result<(LightWitness, MptWitness), R2WitnessError> {
+        let deadline = Instant::now() + self.budget;
+        let fetched = self
+            .transport
+            .fetcher()
+            .get_block_object(number, hash, MAX_ATTEMPTS, Some(deadline), || {})
+            .await?;
+        // Outside the deadline: our own CPU on bytes in hand, and abandoning it would only fetch
+        // and decode the same witness again over RPC.
+        decode_on_blocking_pool(fetched.bytes, number, hash, None, |bytes| {
+            decode_witness_payload_light(bytes)
+        })
+        .await
+    }
+}
+
+/// Light witnesses for the fetch tasks: from R2 first when a source is given, else (and after
+/// any R2 failure) from the RPC witness chain. Counts the fetches each path served.
 pub struct WitnessSource {
     rpc: Arc<RpcClient>,
-    r2: Option<R2WitnessTransport>,
+    r2: Option<R2Source>,
     /// The chain tip the run started under. It bands an R2 miss: near the tip an absent object
     /// is the uploader catching up, deeper it is a hole worth a warning.
     tip: u64,
     from_r2: AtomicU64,
     from_rpc: AtomicU64,
+    /// R2 failures outside the frontier band; each one's witness is in `from_rpc` too.
+    r2_failures: AtomicU64,
 }
 
 impl WitnessSource {
-    pub fn new(rpc: Arc<RpcClient>, r2: Option<R2WitnessTransport>, tip: u64) -> Self {
-        Self { rpc, r2, tip, from_r2: AtomicU64::new(0), from_rpc: AtomicU64::new(0) }
+    pub fn new(rpc: Arc<RpcClient>, r2: Option<R2Source>, tip: u64) -> Self {
+        Self {
+            rpc,
+            r2,
+            tip,
+            from_r2: AtomicU64::new(0),
+            from_rpc: AtomicU64::new(0),
+            r2_failures: AtomicU64::new(0),
+        }
     }
 
     /// The light witness of block `(number, hash)`. Never fails: an R2 failure is logged and
     /// the block goes to the RPC chain, which retries until it succeeds.
     pub async fn get(&self, number: u64, hash: B256) -> (LightWitness, MptWitness) {
         if let Some(r2) = &self.r2 {
-            match from_bucket(r2, number, hash).await {
+            match r2.fetch(number, hash).await {
                 Ok(witness) => {
                     self.from_r2.fetch_add(1, Ordering::Relaxed);
                     return witness;
@@ -143,79 +203,90 @@ impl WitnessSource {
                 Err(e) if e.is_frontier_miss(r2_band(self.tip, number)) => {
                     debug!(number, %hash, "witness not in R2 yet; fetching it over RPC");
                 }
-                Err(e) => warn!(
-                    number,
-                    %hash,
-                    kind = e.kind(),
-                    error = %e,
-                    "R2 witness fetch failed; fetching it over RPC"
-                ),
+                Err(e) => self.note_failure(number, hash, &e),
             }
         }
         self.from_rpc.fetch_add(1, Ordering::Relaxed);
         self.rpc.get_witness_light(number, hash).await
     }
 
-    /// Logs how many witnesses each path served. Spooled blocks are not counted: a resumed run
-    /// fetches no witness for them.
+    /// Counts an R2 failure, warning about the first [`WARN_FIRST`] and one in [`WARN_EVERY`]
+    /// after that.
+    fn note_failure(&self, number: u64, hash: B256, e: &R2WitnessError) {
+        let failures = self.r2_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if failures > WARN_FIRST && !failures.is_multiple_of(WARN_EVERY) {
+            debug!(number, %hash, kind = e.kind(), error = %e, "R2 witness fetch failed; fetching it over RPC");
+            return;
+        }
+        warn!(
+            number,
+            %hash,
+            kind = e.kind(),
+            error = %e,
+            failures,
+            "R2 witness fetch failed; fetching it over RPC"
+        );
+        if failures == WARN_FIRST {
+            warn!(
+                "further R2 failures are logged one in {WARN_EVERY}; the run's witness summary \
+                 counts them all"
+            );
+        }
+    }
+
+    /// Logs how many witness fetches each path served and how many R2 failures sent one to RPC.
+    /// These count fetches, not blocks: a block whose fetch is retried counts again, and a block
+    /// a resumed run finds spooled is not fetched at all.
     pub fn log_summary(&self) {
         info!(
             r2 = self.from_r2.load(Ordering::Relaxed),
             rpc = self.from_rpc.load(Ordering::Relaxed),
+            r2_failures = self.r2_failures.load(Ordering::Relaxed),
             "witnesses fetched"
         );
     }
-}
-
-/// One bounded R2 attempt for `(number, hash)`: the GETs share one per-attempt budget, like the
-/// validator's fast path, so a stalling endpoint costs a block one timeout before RPC takes over.
-async fn from_bucket(
-    r2: &R2WitnessTransport,
-    number: u64,
-    hash: B256,
-) -> Result<(LightWitness, MptWitness), R2WitnessError> {
-    let deadline = Instant::now() + RpcClientConfig::default().per_attempt_timeout;
-    let fetched =
-        r2.fetcher().get_block_object(number, hash, MAX_ATTEMPTS, Some(deadline), || {}).await?;
-    // Outside the deadline: our own CPU on bytes in hand, and abandoning it would only fetch and
-    // decode the same witness again over RPC.
-    decode_on_blocking_pool(fetched.bytes, number, hash, None, |bytes| {
-        decode_witness_payload_light(bytes)
-    })
-    .await
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicUsize;
 
-    use stateless_common::{encode_witness_payload, encode_witness_response};
-    use stateless_test_utils::{fixtures::TestFixtures, mock_r2::mock_r2, mock_rpc::serve};
+    use clap::CommandFactory;
+    use stateless_common::{RpcClientConfig, encode_witness_payload, encode_witness_response};
+    use stateless_test_utils::{
+        fixtures::TestFixtures,
+        mock_r2::{mock_r2, mock_r2_held},
+        mock_rpc::serve,
+    };
 
     use super::*;
 
-    /// A `Parser` wrapper, so tests exercise the real clap wiring of the flattened flags.
+    /// A `Parser` wrapper, so tests can read the real clap wiring of the flattened flags.
     #[derive(clap::Parser)]
     struct TestCli {
         #[clap(flatten)]
         r2: R2Args,
     }
 
-    fn parse(argv: &[&str]) -> R2Args {
-        <TestCli as clap::Parser>::try_parse_from(
-            std::iter::once("backfill").chain(argv.iter().copied()),
-        )
-        .expect("flags parse")
-        .r2
+    /// Millisecond-scale retry pacing, so the retry paths run fast.
+    fn retry() -> BackoffPolicy {
+        BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(20))
     }
 
+    /// A complete S3 quad against `endpoint`. Built directly rather than parsed: clap would read
+    /// the `COVERAGE_REPLAYER_R2_*` variables of whatever shell runs the tests.
     fn quad(endpoint: &str) -> R2Args {
         R2Args {
             r2_endpoint: Some(endpoint.to_string()),
             r2_bucket: Some("witness-test".to_string()),
             r2_access_key_id: Some("ak".to_string()),
             r2_secret_access_key: Some("sk".into()),
+            ..R2Args::default()
         }
+    }
+
+    fn source(args: &R2Args) -> Option<R2Source> {
+        args.source(retry()).expect("the flags are valid")
     }
 
     /// The fixture witness as the bucket stores it, as the witness RPC returns it, and as both
@@ -251,16 +322,23 @@ mod tests {
         (handle, Arc::new(rpc), hits)
     }
 
+    fn counts(source: &WitnessSource) -> [u64; 3] {
+        [&source.from_r2, &source.from_rpc, &source.r2_failures].map(|c| c.load(Ordering::Relaxed))
+    }
+
     /// The presence of a target is the whole switch, and the shared rules guard it: no flag at
-    /// all is the RPC-only run, while an incomplete quad or a blank value fails by name rather
-    /// than silently sending every witness over RPC.
+    /// all is the RPC-only run, while an incomplete quad, a blank value or a timeout with no
+    /// target fails by name rather than silently sending every witness over RPC.
     #[test]
     fn the_flags_select_r2_or_fail_by_name() {
-        assert!(parse(&[]).transport().unwrap().is_none(), "no --r2-* flag: RPC only");
-        assert!(quad("https://acc.r2.cloudflarestorage.com").transport().unwrap().is_some());
+        assert!(source(&R2Args::default()).is_none(), "no --r2-* flag: RPC only");
+        assert!(source(&quad("https://acc.r2.cloudflarestorage.com")).is_some());
 
-        let half = parse(&["--r2-endpoint", "https://acc.r2.cloudflarestorage.com"]);
-        let err = half.transport().expect_err("an incomplete quad must fail").to_string();
+        let half = R2Args {
+            r2_endpoint: Some("https://acc.r2.cloudflarestorage.com".to_string()),
+            ..R2Args::default()
+        };
+        let err = half.source(retry()).err().expect("an incomplete quad must fail").to_string();
         for missing in ["--r2-bucket", "--r2-access-key-id", "--r2-secret-access-key"] {
             assert!(err.contains(missing), "names {missing}: {err}");
         }
@@ -269,8 +347,32 @@ mod tests {
             r2_secret_access_key: Some("".into()),
             ..quad("https://acc.r2.cloudflarestorage.com")
         };
-        let err = blank.transport().expect_err("a blank value must fail").to_string();
+        let err = blank.source(retry()).err().expect("a blank value must fail").to_string();
         assert!(err.contains("--r2-secret-access-key") && err.contains("empty"), "{err}");
+
+        let orphan = R2Args { r2_timeout_ms: Some(1_000), ..R2Args::default() };
+        let err = orphan.source(retry()).err().expect("a timeout with no target").to_string();
+        assert!(err.contains("--r2-timeout-ms"), "{err}");
+    }
+
+    /// Each flag reads the env var the deployments set, and the secret's value stays out of
+    /// `--help`. Read off the clap command, so no test touches the process environment.
+    #[test]
+    fn each_flag_reads_its_env_var() {
+        let command = TestCli::command();
+        for (id, var) in [
+            ("r2_endpoint", "COVERAGE_REPLAYER_R2_ENDPOINT"),
+            ("r2_bucket", "COVERAGE_REPLAYER_R2_BUCKET"),
+            ("r2_access_key_id", "COVERAGE_REPLAYER_R2_ACCESS_KEY_ID"),
+            ("r2_secret_access_key", "COVERAGE_REPLAYER_R2_SECRET_ACCESS_KEY"),
+            ("r2_timeout_ms", "COVERAGE_REPLAYER_R2_TIMEOUT_MS"),
+        ] {
+            let arg = command.get_arguments().find(|a| a.get_id() == id).expect(id);
+            assert_eq!(arg.get_env().and_then(|v| v.to_str()), Some(var), "{id}");
+        }
+        let secret =
+            command.get_arguments().find(|a| a.get_id() == "r2_secret_access_key").unwrap();
+        assert!(secret.is_hide_env_values_set());
     }
 
     /// The secret must not reach `Debug` output, which a logged argument struct would print.
@@ -287,40 +389,59 @@ mod tests {
         let (payload, wire, expected) = fixture_witness();
         let (endpoint, r2_hits) = mock_r2(vec![(200, payload)]).await;
         let (_server, rpc, rpc_hits) = witness_rpc(wire).await;
-        let source = WitnessSource::new(rpc, quad(&endpoint).transport().unwrap(), 0);
+        let witnesses = WitnessSource::new(rpc, source(&quad(&endpoint)), 0);
 
-        assert_eq!(source.get(1, B256::ZERO).await, expected);
+        assert_eq!(witnesses.get(1, B256::ZERO).await, expected);
         assert_eq!(r2_hits.load(Ordering::SeqCst), 1);
         assert_eq!(rpc_hits.load(Ordering::SeqCst), 0, "a bucket hit must not reach RPC");
-        assert_eq!(source.from_r2.load(Ordering::Relaxed), 1);
-        assert_eq!(source.from_rpc.load(Ordering::Relaxed), 0);
+        assert_eq!(counts(&witnesses), [1, 0, 0]);
     }
 
     /// Every R2 failure, an absent object or a corrupt one alike, hands the block to the RPC
-    /// chain, which serves the same witness.
+    /// chain, which serves the same witness. Only a miss near the tip is not a failure.
     #[tokio::test]
     async fn an_r2_failure_falls_back_to_rpc() {
         let (_, wire, expected) = fixture_witness();
-        for (status, body) in [(404, "missing"), (200, "not a zstd witness")] {
+        for (status, body, tip, failures) in
+            [(404, "missing", 10_000, 1), (200, "not a zstd witness", 10_000, 1), (404, "", 0, 0)]
+        {
             let (endpoint, _) = mock_r2(vec![(status, body)]).await;
             let (_server, rpc, rpc_hits) = witness_rpc(wire.clone()).await;
-            let source = WitnessSource::new(rpc, quad(&endpoint).transport().unwrap(), 10_000);
+            let witnesses = WitnessSource::new(rpc, source(&quad(&endpoint)), tip);
 
-            assert_eq!(source.get(1, B256::ZERO).await, expected, "R2 answered {status}");
+            assert_eq!(witnesses.get(1, B256::ZERO).await, expected, "R2 answered {status}");
             assert_eq!(rpc_hits.load(Ordering::SeqCst), 1, "R2 answered {status}");
-            assert_eq!(source.from_r2.load(Ordering::Relaxed), 0);
-            assert_eq!(source.from_rpc.load(Ordering::Relaxed), 1);
+            assert_eq!(counts(&witnesses), [0, 1, failures], "R2 answered {status}, tip {tip}");
         }
     }
 
-    /// Without a transport the RPC chain serves everything.
+    /// An endpoint that accepts the connection and then stalls costs the block one
+    /// `--r2-timeout-ms`, after which RPC serves it.
+    #[tokio::test]
+    async fn a_stalling_bucket_costs_one_budget() {
+        let (_, wire, expected) = fixture_witness();
+        let (endpoint, _) = mock_r2_held(200, Duration::from_secs(30)).await;
+        let (_server, rpc, _) = witness_rpc(wire).await;
+        let args = R2Args { r2_timeout_ms: Some(200), ..quad(&endpoint) };
+        let witnesses = WitnessSource::new(rpc, source(&args), 10_000);
+
+        let started = Instant::now();
+        assert_eq!(witnesses.get(1, B256::ZERO).await, expected);
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(200), "gave up early: {elapsed:?}");
+        assert!(elapsed < Duration::from_secs(2), "outlived its budget: {elapsed:?}");
+        assert_eq!(counts(&witnesses), [0, 1, 1]);
+    }
+
+    /// Without a source the RPC chain serves everything.
     #[tokio::test]
     async fn without_r2_the_rpc_chain_serves() {
         let (_, wire, expected) = fixture_witness();
         let (_server, rpc, rpc_hits) = witness_rpc(wire).await;
-        let source = WitnessSource::new(rpc, None, 0);
+        let witnesses = WitnessSource::new(rpc, None, 0);
 
-        assert_eq!(source.get(1, B256::ZERO).await, expected);
+        assert_eq!(witnesses.get(1, B256::ZERO).await, expected);
         assert_eq!(rpc_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(counts(&witnesses), [0, 1, 0]);
     }
 }

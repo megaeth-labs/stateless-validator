@@ -1,12 +1,14 @@
-//! Shared core of the two binaries' direct-from-R2 witness adapters.
+//! Shared core of the direct-from-R2 witness adapters of the validator, the trace server and
+//! `coverage-replayer`.
 //!
-//! Both binaries read witness objects straight from the R2 bucket through
-//! [`R2ObjectFetcher`], try it before their RPC witness chain, and hand any failure to that
-//! chain on a small retry budget with no pause. They differ in how they read an object and how
-//! long it may take: the trace server light-decodes under the caller's request deadline, the
-//! validator full-decodes (proof verification needs the curve points) on a fixed per-block
-//! stage budget that stops at the GET. What lives here is identical by construction — the
-//! failure taxonomy with its metric labels, the band rules, and the transport wrapper.
+//! All three read witness objects straight from the R2 bucket through [`R2ObjectFetcher`], try
+//! it before their RPC witness chain, and hand any failure to that chain on a small retry budget
+//! with no pause. They differ in how they read an object and how long it may take: the trace
+//! server light-decodes under the caller's request deadline, the validator full-decodes (proof
+//! verification needs the curve points) on a fixed per-block stage budget that stops at the GET,
+//! and `coverage-replayer` light-decodes on a per-block budget of its own (`--r2-timeout-ms`).
+//! What lives here is identical by construction — the failure taxonomy with its metric labels,
+//! the band rules, and the transport wrapper.
 
 use std::{sync::Arc, time::Instant};
 

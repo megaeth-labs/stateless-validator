@@ -237,6 +237,12 @@ pub(crate) fn read_blocks_file(path: &Path) -> Result<Vec<u64>> {
 
 pub async fn run(args: BackfillArgs) -> Result<()> {
     let selection = Selection::resolve(&args)?;
+    let rpc_config = RpcClientConfig {
+        data_max_concurrent_requests: Some(args.data_max_concurrent_requests),
+        ..RpcClientConfig::default()
+    };
+    // Judged here, like the selection, so a bad `--r2-*` set fails before the data dir is touched.
+    let r2 = args.r2.source(rpc_config.rpc_retry)?;
     ensure!(
         crate::profile_rt::is_instrumented_build(),
         "backfill requires the instrumented build (see [profile.coverage] in Cargo.toml)"
@@ -267,13 +273,9 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     let client = Arc::new(RpcClient::new_with_config(
         &args.rpc_endpoints.iter().map(String::as_str).collect::<Vec<_>>(),
         &args.witness_endpoints.iter().map(String::as_str).collect::<Vec<_>>(),
-        RpcClientConfig {
-            data_max_concurrent_requests: Some(args.data_max_concurrent_requests),
-            ..RpcClientConfig::default()
-        },
+        rpc_config,
         None,
     )?);
-    let r2 = args.r2.transport()?;
 
     // Listening from here on: the tip check retries forever while RPC is down, and the store
     // is already open, so a signal must stop the run cleanly from this point.
@@ -402,13 +404,14 @@ pub async fn run(args: BackfillArgs) -> Result<()> {
     {
         tracing::error!(error = %format!("{e:#}"), "flushing the store after the abort failed");
     }
+    // Before any error returns: a stopped run's split is as worth knowing as a finished one's.
+    witnesses.log_summary();
     judged?;
     flushed?;
 
     fetcher.await.ok();
     while manager_set.join_next().await.is_some() {}
     judge.final_summary();
-    witnesses.log_summary();
     // The channel closing only means every task is gone: a panicked fetch task or a dead
     // manager drops its block with just a log line, so an incomplete run must not exit 0.
     ensure!(
