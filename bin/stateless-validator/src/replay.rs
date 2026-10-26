@@ -1,4 +1,6 @@
-//! Replay an explicit list of block numbers through the validator's own fetch and validate path.
+//! `--block-list` mode: replay an explicit list of block numbers through the validator's own
+//! fetch and validate path. Reading the list is [`stateless_common::block_list`]'s job; this module
+//! runs it: per-block timeouts, bounded concurrency, the results and retry files, the summary.
 //!
 //! The chain-following pipeline advances over a contiguous range, so it cannot visit a sparse
 //! set of heights. This mode instead drives [`ValidatorFetcher::fetch`] and
@@ -11,11 +13,9 @@
 //! that the witness's pre-state is the parent block's post-state.
 
 use std::{
-    any::Any,
     collections::BTreeMap,
     fs::File,
     io::{BufWriter, Write},
-    panic::AssertUnwindSafe,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -23,7 +23,6 @@ use std::{
 
 use alloy_primitives::BlockHash;
 use eyre::{Result, WrapErr, ensure};
-use futures::FutureExt;
 use stateless_common::{atomic_write::write_atomic, block_list::read_block_list};
 use stateless_core::{
     ErrorAction,
@@ -36,8 +35,6 @@ use crate::chain_sync::{ValidatorFetcher, ValidatorProcessor};
 
 /// How many of the slowest blocks the summary names.
 const SLOWEST_SHOWN: usize = 5;
-/// How many failures the printed summary spells out; all of them are in the results file.
-const FAILURES_SHOWN: usize = 20;
 /// Minimum gap between progress lines.
 const PROGRESS_EVERY: Duration = Duration::from_secs(10);
 /// The results file's name in the output directory.
@@ -60,7 +57,7 @@ pub enum Status {
     FetchFailed,
     /// Fetching succeeded but validating did not finish within the per-block timeout.
     ProcessTimeout,
-    /// The validator rejected the block, or its task panicked.
+    /// The validator rejected the block, or validating it panicked.
     ValidationFailed,
 }
 
@@ -95,20 +92,6 @@ pub struct BlockOutcome {
 }
 
 impl BlockOutcome {
-    fn new(number: u64, hash: Option<BlockHash>, status: Status, started: Instant) -> Self {
-        Self { number, hash, status, message: None, retryable: false, elapsed: started.elapsed() }
-    }
-
-    fn with_message(mut self, message: impl Into<String>) -> Self {
-        self.message = Some(message.into());
-        self
-    }
-
-    fn with_retryable(mut self, retryable: bool) -> Self {
-        self.retryable = retryable;
-        self
-    }
-
     /// One results-file line.
     pub fn to_json_line(&self) -> String {
         serde_json::json!({
@@ -181,7 +164,8 @@ impl ReplaySummary {
         text
     }
 
-    /// The human-readable end-of-run report.
+    /// The human-readable end-of-run report: totals, failures by status, the slowest blocks. Each
+    /// failure's own error is in the results file, and its number in the retry list.
     pub fn render(&self) -> String {
         let mut out = format!(
             "replayed {} blocks in {:.1}s ({:.1} blocks/s): {} validated, {} not validated\n",
@@ -206,19 +190,6 @@ impl ReplaySummary {
                 .collect();
             out.push_str(&format!("slowest: {}\n", slowest.join(", ")));
         }
-        let mut failed: Vec<&BlockOutcome> = self.failed.iter().collect();
-        failed.sort_by_key(|outcome| outcome.number);
-        for outcome in failed.iter().take(FAILURES_SHOWN) {
-            out.push_str(&format!(
-                "  {} {}: {}\n",
-                outcome.number,
-                outcome.status.as_str(),
-                outcome.message.as_deref().unwrap_or("-"),
-            ));
-        }
-        if failed.len() > FAILURES_SHOWN {
-            out.push_str(&format!("  ... and {} more\n", failed.len() - FAILURES_SHOWN));
-        }
         out
     }
 }
@@ -234,61 +205,43 @@ async fn replay_one(
     timeout: Duration,
 ) -> BlockOutcome {
     let started = Instant::now();
-    let task = match tokio::time::timeout(timeout, fetcher.fetch(number)).await {
-        Err(_) => {
-            return BlockOutcome::new(number, None, Status::FetchTimeout, started)
-                .with_message(format!("block and witness not fetched within {timeout:?}"))
-                .with_retryable(true);
-        }
-        Ok(Err(error)) => {
-            return BlockOutcome::new(number, None, Status::FetchFailed, started)
-                .with_message(format!("{error:#}"))
-                .with_retryable(true);
-        }
-        Ok(Ok(task)) => task,
-    };
-
-    let hash = task.block.header.hash;
-
-    let _slot = validate_slots.acquire().await.expect("the validate semaphore is never closed");
-    match tokio::time::timeout(timeout, processor.process(task)).await {
-        Err(_) => BlockOutcome::new(number, Some(hash), Status::ProcessTimeout, started)
-            .with_message(format!("not validated within {timeout:?}"))
-            .with_retryable(true),
-        Ok(Ok(_)) => BlockOutcome::new(number, Some(hash), Status::Validated, started),
-        Ok(Err(failure)) => {
-            let retryable = processor.error_action(&failure) == ErrorAction::Retry;
-            BlockOutcome::new(number, Some(hash), Status::ValidationFailed, started)
-                .with_message(failure.error)
-                .with_retryable(retryable)
-        }
-    }
-}
-
-/// Runs one block's replay, turning a panic inside it into that block's own outcome, timed from
-/// when the block started, rather than into a join error that no longer knows which block it was.
-async fn settle(number: u64, replay: impl Future<Output = BlockOutcome>) -> BlockOutcome {
-    let started = Instant::now();
-    AssertUnwindSafe(replay).catch_unwind().await.unwrap_or_else(|panic| {
-        BlockOutcome::new(number, None, Status::ValidationFailed, started)
-            .with_message(format!("replay panicked: {}", panic_message(&*panic)))
-    })
-}
-
-/// The text of a panic payload, for the two payload types `panic!` produces.
-fn panic_message(payload: &(dyn Any + Send)) -> &str {
-    payload
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("non-string panic payload")
+    let (hash, status, message, retryable) =
+        match tokio::time::timeout(timeout, fetcher.fetch(number)).await {
+            Err(_) => (
+                None,
+                Status::FetchTimeout,
+                Some(format!("block and witness not fetched within {timeout:?}")),
+                true,
+            ),
+            Ok(Err(error)) => (None, Status::FetchFailed, Some(format!("{error:#}")), true),
+            Ok(Ok(task)) => {
+                let hash = Some(task.block.header.hash);
+                let _slot = validate_slots.acquire().await.expect("never closed");
+                match tokio::time::timeout(timeout, processor.process(task)).await {
+                    Err(_) => (
+                        hash,
+                        Status::ProcessTimeout,
+                        Some(format!("not validated within {timeout:?}")),
+                        true,
+                    ),
+                    Ok(Ok(_)) => (hash, Status::Validated, None, false),
+                    Ok(Err(failure)) => {
+                        let retryable = processor.error_action(&failure) == ErrorAction::Retry;
+                        (hash, Status::ValidationFailed, Some(failure.error), retryable)
+                    }
+                }
+            }
+        };
+    BlockOutcome { number, hash, status, message, retryable, elapsed: started.elapsed() }
 }
 
 /// Replays `blocks` with up to `config.concurrency` in flight, handing each finished outcome to
 /// `sink` as it completes.
 ///
-/// A failing block never stops the run: it is recorded and the next one starts. The only early
-/// exit is `sink` returning an error, which means the results file can no longer be written.
+/// A failing block never stops the run: it is recorded and the next one starts. A panic while
+/// validating is already a failure of that block (`ValidatorProcessor::process` runs validation on
+/// the blocking pool and reports its panic), so a task that panics here hit a bug in this glue and
+/// ends the run, as does `sink` failing, which means the results file can no longer be written.
 pub async fn replay_block_list(
     fetcher: Arc<ValidatorFetcher>,
     processor: Arc<ValidatorProcessor>,
@@ -324,9 +277,9 @@ pub async fn replay_block_list(
         let (fetcher, processor) = (Arc::clone(&fetcher), Arc::clone(&processor));
         let validate_slots = Arc::clone(&validate_slots);
         let timeout = config.block_timeout;
-        tasks.spawn(settle(number, async move {
+        tasks.spawn(async move {
             replay_one(&fetcher, &processor, &validate_slots, number, timeout).await
-        }));
+        });
     };
     let mut pending = blocks.into_iter();
     let mut tasks = JoinSet::new();
@@ -337,8 +290,7 @@ pub async fn replay_block_list(
     let mut summary = ReplaySummary::default();
     let mut last_progress = Instant::now();
     while let Some(joined) = tasks.join_next().await {
-        // `settle` turns a panic into an outcome, so a join error can only be a cancellation.
-        let outcome = joined.wrap_err("a replay task was cancelled")?;
+        let outcome = joined.wrap_err("a replay task panicked or was cancelled")?;
         sink(&outcome)?;
         summary.record(&outcome);
         if let Some(number) = pending.next() {
@@ -452,7 +404,7 @@ mod tests {
         let report = summary.render();
         assert!(report.contains("5 validated, 2 not validated"), "got: {report}");
         assert!(report.contains("fetch_timeout: 1") && report.contains("validation_failed: 1"));
-        assert!(report.contains("13 validation_failed: boom 13"));
+        assert!(report.contains("slowest: 11 (300.0s)"), "got: {report}");
     }
 
     #[test]
@@ -461,20 +413,6 @@ mod tests {
         summary.record(&outcome(1, Status::Validated, 1));
         assert!(parse_block_list(&summary.failed_list()).unwrap().is_empty(), "nothing to retry");
         assert!(summary.failed_list().starts_with("# blocks that did not validate: 0"));
-    }
-
-    /// A panic is reported against the block that panicked, timed from that block's own start
-    /// rather than the run's, for both payload types `panic!` produces.
-    #[tokio::test]
-    async fn a_panicking_replay_becomes_its_own_blocks_failure() {
-        let outcome = settle(42, async { panic!("boom at 42") }).await;
-        assert_eq!((outcome.number, outcome.status), (42, Status::ValidationFailed));
-        assert!(outcome.message.as_deref().unwrap().contains("boom at 42"), "{outcome:?}");
-        assert!(!outcome.retryable, "a panic is a bug, not a transient failure");
-        assert!(outcome.elapsed < Duration::from_secs(5), "{:?}", outcome.elapsed);
-
-        let owned = settle(7, async { panic!("{}", String::from("owned payload")) }).await;
-        assert!(owned.message.unwrap().contains("owned payload"));
     }
 
     /// An interrupted run's retry list, passed back as `--block-list`, must fail the run.

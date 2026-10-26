@@ -36,9 +36,9 @@ use stateless_test_utils::{
 };
 use stateless_validator::{
     CommandLineArgs, R2WitnessClient, VALIDATOR_DB_FILENAME, ValidatorDB, ValidatorFetcher,
-    ValidatorHooks, ValidatorProcessor,
-    block_list::{self, BlockOutcome, ReplayConfig, Status},
-    load_or_create_chain_spec, run_with_signals,
+    ValidatorHooks, ValidatorProcessor, load_or_create_chain_spec,
+    replay::{self, BlockOutcome, ReplayConfig, Status},
+    run_with_signals,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -796,7 +796,7 @@ async fn replay_over_mock(
     block_timeout: Duration,
     concurrency: usize,
     number_aliases: HashMap<u64, u64>,
-) -> (Vec<BlockOutcome>, block_list::ReplaySummary) {
+) -> (Vec<BlockOutcome>, replay::ReplaySummary) {
     let temp_dir = tempfile::tempdir().unwrap();
     let mut state = MockServerState::new(TestFixtures::synthetic_shared());
     state.number_aliases = number_aliases;
@@ -805,7 +805,7 @@ async fn replay_over_mock(
 
     let config = ReplayConfig { concurrency, validate_concurrency: 1, block_timeout };
     let mut outcomes = Vec::new();
-    let summary = block_list::replay_block_list(fetcher, processor, blocks, &config, |outcome| {
+    let summary = replay::replay_block_list(fetcher, processor, blocks, &config, |outcome| {
         outcomes.push(outcome.clone());
         Ok(())
     })
@@ -913,8 +913,8 @@ async fn an_unreachable_head_fails_the_run_without_a_stale_retry_list() {
     let (fetcher, processor) = block_list_parts(dir, "http://127.0.0.1:1");
 
     let list = dir.join("list.txt");
-    let results = dir.join(block_list::RESULTS_FILE);
-    let failed = dir.join(block_list::RETRY_FILE);
+    let results = dir.join(replay::RESULTS_FILE);
+    let failed = dir.join(replay::RETRY_FILE);
     std::fs::write(&list, "1\n2\n").unwrap();
     // What a previous run left behind.
     std::fs::write(&results, "{\"block\":5}\n").unwrap();
@@ -927,7 +927,7 @@ async fn an_unreachable_head_fails_the_run_without_a_stale_retry_list() {
     };
     let err = tokio::time::timeout(
         Duration::from_secs(30),
-        block_list::run(&list, dir, fetcher, processor, &config),
+        replay::run(&list, dir, fetcher, processor, &config),
     )
     .await
     .expect("the head read must be bounded")

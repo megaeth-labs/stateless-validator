@@ -16,11 +16,10 @@ use stateless_db::ContractCache;
 use tracing::{info, warn};
 
 use crate::{
-    block_list,
     chain_sync::{ValidatorFetcher, ValidatorProcessor},
     metrics,
     r2_witness::R2WitnessClient,
-    runner,
+    replay, runner,
     validator_db::ValidatorDB,
 };
 
@@ -396,7 +395,7 @@ pub async fn run() -> Result<()> {
 
     if let Some(list) = &args.block_list {
         let pipeline_defaults = stateless_core::PipelineConfig::default();
-        let config = block_list::ReplayConfig {
+        let config = replay::ReplayConfig {
             concurrency: args
                 .block_list_concurrency
                 .unwrap_or_else(|| pipeline_defaults.fetcher_max_in_flight()),
@@ -408,7 +407,7 @@ pub async fn run() -> Result<()> {
         let fetcher = Arc::new(ValidatorFetcher::new(client.clone(), r2_witness));
         let processor =
             Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client.clone() });
-        let outcome = block_list::run(list, output_dir, fetcher, processor, &config).await;
+        let outcome = replay::run(list, output_dir, fetcher, processor, &config).await;
         info!(elapsed = ?start.elapsed(), "Block list replay finished");
         return outcome;
     }

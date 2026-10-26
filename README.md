@@ -392,7 +392,7 @@ The pipeline is configured via `PipelineConfig` and customized through trait imp
 | File                                                                                           | Purpose                                                                                                     |
 | ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
 | `crates/stateless-core/src/pipeline/{mod,config,traits,fetcher,divergence,advancer,worker}.rs` | Generic three-stage pipeline split by responsibility                                                        |
-| `bin/stateless-validator/src/block_list.rs`                                                    | `--block-list` replay: bounded-concurrency fetch + validate, results and retry files |
+| `bin/stateless-validator/src/replay.rs`                                                        | `--block-list` mode: bounded-concurrency fetch + validate, results and retry files |
 | `crates/stateless-core/src/executor.rs`                                                        | Block validation and EVM replay                                                                             |
 | `crates/stateless-core/src/db.rs`                                                              | Shared storage traits: `ChainStore`, `ContractStore`, `StoreError` (scenario stores live in their binaries) |
 | `crates/stateless-core/src/evm_database.rs`                                                    | `WitnessDatabase` implementing `revm::DatabaseRef`                                                          |
