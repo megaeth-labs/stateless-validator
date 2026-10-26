@@ -323,6 +323,11 @@ fn block_list_flag_combinations() {
         let argv = [&with_list[..], conflicting].concat();
         assert!(parse(&argv).is_err(), "{conflicting:?} must conflict with --block-list");
     }
+    // Zero would time every block out on its first poll, or never start one.
+    for zero in [&["--block-list-timeout-secs", "0"][..], &["--block-list-concurrency", "0"][..]] {
+        let argv = [&with_list[..], zero].concat();
+        assert!(parse(&argv).is_err(), "{zero:?} must be rejected");
+    }
     // Tuning flags mean nothing without a list.
     for orphan in [
         &["--block-list-timeout-secs", "9"][..],
@@ -853,6 +858,10 @@ async fn an_unfetchable_block_times_out_without_stopping_the_run() {
     assert_eq!(status_of(first), Status::Validated);
     assert_eq!(status_of(last), Status::Validated);
     assert_eq!(status_of(missing), Status::FetchTimeout);
+    // A timeout says nothing about the block, so it is marked for retry; a pass never is.
+    for outcome in &outcomes {
+        assert_eq!(outcome.retryable, outcome.number == missing, "{outcome:?}");
+    }
     assert_eq!((summary.total, summary.validated, summary.failed.len()), (3, 2, 1));
     assert_eq!(
         block_list::parse_block_list(&summary.failed_list()).unwrap(),
@@ -880,4 +889,54 @@ async fn a_block_served_for_the_wrong_height_is_not_counted_as_validated() {
     assert_eq!(outcome.status, Status::FetchTimeout, "{outcome:?}");
     assert_eq!(outcome.hash, None, "no block was accepted for the height");
     assert_eq!((summary.validated, summary.failed.len()), (0, 1));
+}
+
+/// The chain-head read before the first block retries forever like every RPC call, so it is
+/// bounded by the per-block timeout: an unreachable endpoint fails the run instead of hanging it.
+/// That failure, like any interruption, must not leave the previous run's retry list beside this
+/// run's results, where it would be passed back as `--block-list` in place of this run's.
+#[tokio::test]
+async fn an_unreachable_head_fails_the_run_without_a_stale_retry_list() {
+    let fx = TestFixtures::synthetic_shared();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let validator_db =
+        Arc::new(ValidatorDB::new(temp_dir.path().join(VALIDATOR_DB_FILENAME)).unwrap());
+    let contract_cache =
+        Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
+    let genesis_file = fx.data_dir.join("genesis.json");
+    let chain_spec = Arc::new(
+        load_or_create_chain_spec(&validator_db, Some(genesis_file.to_str().unwrap())).unwrap(),
+    );
+    // Nothing listens on port 1, so every attempt is refused and retried.
+    let unreachable = "http://127.0.0.1:1";
+    let client = Arc::new(RpcClient::new(&[unreachable], &[unreachable]).unwrap());
+    let fetcher = Arc::new(ValidatorFetcher::new(client.clone(), None));
+    let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
+
+    let list = temp_dir.path().join("list.txt");
+    let results = temp_dir.path().join("results.jsonl");
+    let failed = temp_dir.path().join("failed.txt");
+    std::fs::write(&list, "1\n2\n").unwrap();
+    // What a previous run left behind.
+    std::fs::write(&results, "{\"block\":5}\n").unwrap();
+    std::fs::write(&failed, "5\n9\n").unwrap();
+
+    let config = ReplayConfig {
+        concurrency: 2,
+        block_timeout: Duration::from_secs(1),
+        progress_every: Duration::from_secs(3600),
+    };
+    let output = block_list::Output { results: &results, failed: &failed };
+    let err = tokio::time::timeout(
+        Duration::from_secs(30),
+        block_list::run(&list, output, fetcher, processor, &config),
+    )
+    .await
+    .expect("the head read must be bounded")
+    .unwrap_err();
+
+    assert!(format!("{err:#}").contains("chain head"), "{err:#}");
+    assert_eq!(std::fs::read_to_string(&results).unwrap(), "", "results are truncated");
+    let retry = std::fs::read_to_string(&failed).unwrap();
+    assert!(block_list::parse_block_list(&retry).is_err(), "stale retry list left: {retry:?}");
 }

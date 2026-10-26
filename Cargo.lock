@@ -5946,6 +5946,7 @@ dependencies = [
  "alloy-rpc-types-eth",
  "clap",
  "eyre",
+ "futures",
  "jsonrpsee",
  "jsonrpsee-types",
  "metrics",

@@ -117,9 +117,12 @@ A pass means the witness verified and replaying the block reproduced its header 
 It does not check that the witness's pre-state equals the parent block's post-state, because the parent is not part of the list.
 A block that fails is recorded and the run continues; the exit status is non-zero if any block did not validate.
 The RPC client retries transport errors indefinitely, so each of the fetch and the validation of a block is bounded by `--block-list-timeout-secs`, and a block that exceeds it is recorded as `fetch_timeout` or `process_timeout`.
+The one chain-head read before the first block is bounded the same way, and fails the run when it times out.
 
 Two files are written to `--block-list-output-dir`, both overwritten on each run.
 `results.jsonl` has one object per block, in completion order, with `block`, `hash`, `status`, `ms`, `retryable` and the validator's error text in `message`.
+`retryable` is true for the fetch statuses and both timeouts, which say nothing about the block itself, and for a validation failure the validator judges transient (a store error rather than a mismatch).
+`failed.txt` is written when the run finishes; until then it holds only a comment, so an interrupted run never leaves the previous run's retry list beside its own results.
 `failed.txt` lists the blocks that did not validate in the input format, so it can be passed back as `--block-list` to retry exactly those.
 The statuses are `validated`, `fetch_timeout`, `fetch_failed`, `process_timeout` and `validation_failed`.
 The end-of-run summary prints the totals, the rate in blocks per second and the slowest blocks.

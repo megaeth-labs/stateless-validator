@@ -11,9 +11,11 @@
 //! that the witness's pre-state is the parent block's post-state.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    any::Any,
+    collections::BTreeSet,
     fs::File,
     io::{BufWriter, Write},
+    panic::AssertUnwindSafe,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
@@ -21,8 +23,9 @@ use std::{
 
 use alloy_primitives::BlockHash;
 use eyre::{Result, WrapErr, ensure};
+use futures::FutureExt;
 use stateless_core::pipeline::{BlockFetcher, BlockProcessor};
-use tokio::task::{Id, JoinSet};
+use tokio::task::JoinSet;
 use tracing::info;
 
 use crate::chain_sync::{ValidatorFetcher, ValidatorProcessor};
@@ -31,6 +34,10 @@ use crate::chain_sync::{ValidatorFetcher, ValidatorProcessor};
 const SLOWEST_SHOWN: usize = 5;
 /// How many failures the printed summary spells out; all of them are in the results file.
 const FAILURES_SHOWN: usize = 20;
+/// What the retry list holds until the run finishes. It parses as an empty list, which is an
+/// error, so an interrupted run's list fails loudly instead of retrying nothing or the wrong set.
+const RETRY_LIST_PENDING: &str =
+    "# the run did not finish: no retry list was written; see results.jsonl\n";
 
 /// Parses a block list: one decimal block number per line.
 ///
@@ -93,8 +100,9 @@ pub struct BlockOutcome {
     /// The validator's error text, verbatim. It is not parsed or bucketed: the error type is
     /// flattened to a string by the processor, and matching on its wording would break silently.
     pub message: Option<String>,
-    /// The processor's own verdict on whether the failure was transient (a store error rather
-    /// than a deterministic mismatch).
+    /// Whether a retry may pass: always for a fetch failure or a timeout, which say nothing about
+    /// the block itself, and for a validation failure when the processor judges it transient (a
+    /// store error rather than a deterministic mismatch).
     pub retryable: bool,
     pub elapsed: Duration,
 }
@@ -106,6 +114,11 @@ impl BlockOutcome {
 
     fn with_message(mut self, message: impl Into<String>) -> Self {
         self.message = Some(message.into());
+        self
+    }
+
+    fn with_retryable(mut self, retryable: bool) -> Self {
+        self.retryable = retryable;
         self
     }
 
@@ -231,11 +244,13 @@ async fn replay_one(
     let task = match tokio::time::timeout(timeout, fetcher.fetch(number)).await {
         Err(_) => {
             return BlockOutcome::new(number, None, Status::FetchTimeout, started)
-                .with_message(format!("block and witness not fetched within {timeout:?}"));
+                .with_message(format!("block and witness not fetched within {timeout:?}"))
+                .with_retryable(true);
         }
         Ok(Err(error)) => {
             return BlockOutcome::new(number, None, Status::FetchFailed, started)
-                .with_message(format!("{error:#}"));
+                .with_message(format!("{error:#}"))
+                .with_retryable(true);
         }
         Ok(Ok(task)) => task,
     };
@@ -244,16 +259,34 @@ async fn replay_one(
 
     match tokio::time::timeout(timeout, processor.process(task)).await {
         Err(_) => BlockOutcome::new(number, Some(hash), Status::ProcessTimeout, started)
-            .with_message(format!("not validated within {timeout:?}")),
+            .with_message(format!("not validated within {timeout:?}"))
+            .with_retryable(true),
         Ok(Ok(_)) => BlockOutcome::new(number, Some(hash), Status::Validated, started),
         Ok(Err(failure)) => {
-            let mut outcome =
-                BlockOutcome::new(number, Some(hash), Status::ValidationFailed, started)
-                    .with_message(failure.error);
-            outcome.retryable = failure.transient;
-            outcome
+            BlockOutcome::new(number, Some(hash), Status::ValidationFailed, started)
+                .with_message(failure.error)
+                .with_retryable(failure.transient)
         }
     }
+}
+
+/// Runs one block's replay, turning a panic inside it into that block's own outcome, timed from
+/// when the block started, rather than into a join error that no longer knows which block it was.
+async fn settle(number: u64, replay: impl Future<Output = BlockOutcome>) -> BlockOutcome {
+    let started = Instant::now();
+    AssertUnwindSafe(replay).catch_unwind().await.unwrap_or_else(|panic| {
+        BlockOutcome::new(number, None, Status::ValidationFailed, started)
+            .with_message(format!("replay panicked: {}", panic_message(&*panic)))
+    })
+}
+
+/// The text of a panic payload, for the two payload types `panic!` produces.
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 /// Replays `blocks` with up to `config.concurrency` in flight, handing each finished outcome to
@@ -275,43 +308,36 @@ pub async fn replay_block_list(
     // The fetcher records the head it last saw and the R2 client reads it to tell a block that
     // is simply not uploaded yet from a hole in the bucket. Seed it once; left at its initial
     // 0, every miss would band as "not uploaded yet" and a real hole would never be flagged.
-    let head = fetcher.latest_block_number().await?;
+    // The read retries forever like every RPC call, so it is bounded like a block's stages are.
+    let budget = config.block_timeout;
+    let head = tokio::time::timeout(budget, fetcher.latest_block_number())
+        .await
+        .wrap_err_with(|| format!("the chain head was not read within {budget:?}"))??;
     info!(blocks = total, head, concurrency = config.concurrency, "Replaying block list");
 
-    let mut pending = blocks.into_iter();
-    let mut tasks: JoinSet<BlockOutcome> = JoinSet::new();
-    let mut in_flight: HashMap<Id, u64> = HashMap::new();
-    let mut spawn_next = |tasks: &mut JoinSet<BlockOutcome>, in_flight: &mut HashMap<Id, u64>| {
-        if let Some(number) = pending.next() {
-            let (fetcher, processor) = (Arc::clone(&fetcher), Arc::clone(&processor));
-            let timeout = config.block_timeout;
-            let handle =
-                tasks.spawn(async move { replay_one(&fetcher, &processor, number, timeout).await });
-            in_flight.insert(handle.id(), number);
-        }
+    let spawn = |tasks: &mut JoinSet<BlockOutcome>, number: u64| {
+        let (fetcher, processor) = (Arc::clone(&fetcher), Arc::clone(&processor));
+        let timeout = config.block_timeout;
+        tasks.spawn(settle(number, async move {
+            replay_one(&fetcher, &processor, number, timeout).await
+        }));
     };
-    for _ in 0..config.concurrency {
-        spawn_next(&mut tasks, &mut in_flight);
+    let mut pending = blocks.into_iter();
+    let mut tasks = JoinSet::new();
+    for number in pending.by_ref().take(config.concurrency) {
+        spawn(&mut tasks, number);
     }
 
     let mut summary = ReplaySummary::default();
     let mut last_progress = Instant::now();
-    while let Some(joined) = tasks.join_next_with_id().await {
-        let outcome = match joined {
-            Ok((id, outcome)) => {
-                in_flight.remove(&id);
-                outcome
-            }
-            // A panic carries no block number of its own; the id maps it back.
-            Err(error) => {
-                let number = in_flight.remove(&error.id()).unwrap_or_default();
-                BlockOutcome::new(number, None, Status::ValidationFailed, started)
-                    .with_message(format!("replay task failed: {error}"))
-            }
-        };
+    while let Some(joined) = tasks.join_next().await {
+        // `settle` turns a panic into an outcome, so a join error can only be a cancellation.
+        let outcome = joined.wrap_err("a replay task was cancelled")?;
         sink(&outcome)?;
         summary.record(&outcome);
-        spawn_next(&mut tasks, &mut in_flight);
+        if let Some(number) = pending.next() {
+            spawn(&mut tasks, number);
+        }
 
         if last_progress.elapsed() >= config.progress_every {
             last_progress = Instant::now();
@@ -334,7 +360,9 @@ pub struct Output<'a> {
     /// One JSON object per block, in completion order, flushed as each lands so an interrupted
     /// run keeps what it had.
     pub results: &'a Path,
-    /// The retry list: the failed block numbers in the input format.
+    /// The retry list: the failed block numbers in the input format, written when the run
+    /// finishes. Until then it holds only a comment, so an interrupted run never leaves an
+    /// earlier run's list beside its own results.
     pub failed: &'a Path,
 }
 
@@ -357,6 +385,8 @@ pub async fn run(
         File::create(output.results)
             .wrap_err_with(|| format!("cannot create {}", output.results.display()))?,
     );
+    std::fs::write(output.failed, RETRY_LIST_PENDING)
+        .wrap_err_with(|| format!("cannot write {}", output.failed.display()))?;
     let summary = replay_block_list(fetcher, processor, blocks, config, |outcome| {
         writeln!(results, "{}", outcome.to_json_line())?;
         results.flush()?;
@@ -453,6 +483,25 @@ mod tests {
         summary.record(&outcome(1, Status::Validated, 1));
         assert!(parse_block_list(&summary.failed_list()).is_err(), "no numbers to retry");
         assert!(summary.failed_list().starts_with("# blocks that did not validate: 0"));
+    }
+
+    /// A panic is reported against the block that panicked, timed from that block's own start
+    /// rather than the run's, for both payload types `panic!` produces.
+    #[tokio::test]
+    async fn a_panicking_replay_becomes_its_own_blocks_failure() {
+        let outcome = settle(42, async { panic!("boom at 42") }).await;
+        assert_eq!((outcome.number, outcome.status), (42, Status::ValidationFailed));
+        assert!(outcome.message.as_deref().unwrap().contains("boom at 42"), "{outcome:?}");
+        assert!(!outcome.retryable, "a panic is a bug, not a transient failure");
+        assert!(outcome.elapsed < Duration::from_secs(5), "{:?}", outcome.elapsed);
+
+        let owned = settle(7, async { panic!("{}", String::from("owned payload")) }).await;
+        assert!(owned.message.unwrap().contains("owned payload"));
+    }
+
+    #[test]
+    fn the_pending_retry_list_parses_as_no_blocks() {
+        assert!(parse_block_list(RETRY_LIST_PENDING).is_err());
     }
 
     #[test]

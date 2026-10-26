@@ -197,13 +197,24 @@ pub struct CommandLineArgs {
     /// With `--block-list`: seconds allowed for fetching one block and its witness, and
     /// separately for validating it, before the block is recorded as timed out (default 300).
     /// The RPC client retries transport errors forever, so this is what lets a run end when an
-    /// endpoint cannot serve a block.
-    #[clap(long, env = "STATELESS_VALIDATOR_BLOCK_LIST_TIMEOUT_SECS", requires = "block_list")]
+    /// endpoint cannot serve a block; the one chain-head read before the first block is bounded
+    /// by it too. At least 1: zero would time every block out on its first poll.
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_BLOCK_LIST_TIMEOUT_SECS",
+        requires = "block_list",
+        value_parser = clap::value_parser!(u64).range(1..),
+    )]
     pub block_list_timeout_secs: Option<u64>,
 
     /// With `--block-list`: how many blocks to fetch and validate at once (default: twice the
-    /// physical cores, the validator pipeline's own in-flight window).
-    #[clap(long, env = "STATELESS_VALIDATOR_BLOCK_LIST_CONCURRENCY", requires = "block_list")]
+    /// physical cores, the validator pipeline's own in-flight window). At least 1.
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_BLOCK_LIST_CONCURRENCY",
+        requires = "block_list",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
+    )]
     pub block_list_concurrency: Option<usize>,
 
     /// With `--block-list`: directory for `results.jsonl` (one line per block, in completion

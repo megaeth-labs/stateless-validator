@@ -35,6 +35,7 @@ stateless-r2 = { path = "../../crates/stateless-r2" }
 # misc
 clap = { workspace = true, features = ["env"] }
 eyre.workspace = true
+futures = { workspace = true, features = ["std"] }
 metrics.workspace = true
 redb.workspace = true
 serde_json.workspace = true
