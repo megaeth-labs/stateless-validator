@@ -309,7 +309,10 @@ fn block_list_flag_combinations() {
         .concat(),
     )
     .unwrap();
-    assert_eq!(tuned.block_list_timeout_secs, Some(9));
+    assert_eq!(tuned.block_list_timeout_secs, 9);
+    // Unset, the timeout is the documented 300 s. That default does not count as setting the
+    // flag, or `parse(&[])` above would have failed its `requires`.
+    assert_eq!(parse(&with_list).unwrap().block_list_timeout_secs, 300);
     assert_eq!(tuned.block_list_concurrency, Some(3));
 
     // A stale genesis in the data dir must not be picked up silently.
@@ -766,34 +769,41 @@ async fn end_block_run_fails_when_final_report_never_lands() {
     assert!(reports.is_empty(), "mock rejected every report, yet some landed: {reports:?}");
 }
 
-/// Replays `blocks` over the mock RPC with a validator-shaped fetcher and processor, returning
-/// the outcomes in completion order and the summary. The DB has no anchor: block-list mode never
-/// needs one.
+/// A validator-shaped fetcher and processor over `url`, with their DB in `dir`. The DB has no
+/// anchor: block-list mode never needs one.
+fn block_list_parts(
+    dir: &std::path::Path,
+    url: &str,
+) -> (Arc<ValidatorFetcher>, Arc<ValidatorProcessor>) {
+    let genesis_file = TestFixtures::synthetic_shared().data_dir.join("genesis.json");
+    let validator_db = Arc::new(ValidatorDB::new(dir.join(VALIDATOR_DB_FILENAME)).unwrap());
+    let contract_cache =
+        Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
+    let chain_spec = Arc::new(
+        load_or_create_chain_spec(&validator_db, Some(genesis_file.to_str().unwrap())).unwrap(),
+    );
+    let client = Arc::new(RpcClient::new(&[url], &[url]).unwrap());
+    let fetcher = Arc::new(ValidatorFetcher::new(client.clone(), None));
+    let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
+    (fetcher, processor)
+}
+
+/// Replays `blocks` over the mock RPC, returning the outcomes in completion order and the
+/// summary. One block validates at a time whatever `concurrency` is, so a run with more blocks
+/// in flight than validate slots also exercises the wait for a slot.
 async fn replay_over_mock(
     blocks: Vec<u64>,
     block_timeout: Duration,
     concurrency: usize,
     number_aliases: HashMap<u64, u64>,
 ) -> (Vec<BlockOutcome>, block_list::ReplaySummary) {
-    let fx = TestFixtures::synthetic_shared();
-    let genesis_file = fx.data_dir.join("genesis.json");
     let temp_dir = tempfile::tempdir().unwrap();
-    let validator_db =
-        Arc::new(ValidatorDB::new(temp_dir.path().join(VALIDATOR_DB_FILENAME)).unwrap());
-    let contract_cache =
-        Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
-    let mut state = MockServerState::new(fx);
+    let mut state = MockServerState::new(TestFixtures::synthetic_shared());
     state.number_aliases = number_aliases;
     let (handle, url) = setup_mock_rpc_server(state).await;
-    let client = Arc::new(RpcClient::new(&[url.as_str()], &[url.as_str()]).unwrap());
-    let chain_spec = Arc::new(
-        load_or_create_chain_spec(&validator_db, Some(genesis_file.to_str().unwrap())).unwrap(),
-    );
-    let fetcher = Arc::new(ValidatorFetcher::new(client.clone(), None));
-    let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
+    let (fetcher, processor) = block_list_parts(temp_dir.path(), &url);
 
-    let config =
-        ReplayConfig { concurrency, block_timeout, progress_every: Duration::from_secs(3600) };
+    let config = ReplayConfig { concurrency, validate_concurrency: 1, block_timeout };
     let mut outcomes = Vec::new();
     let summary = block_list::replay_block_list(fetcher, processor, blocks, &config, |outcome| {
         outcomes.push(outcome.clone());
@@ -833,7 +843,7 @@ async fn block_list_replays_a_non_contiguous_subset() {
         assert_eq!(outcome.hash, Some(fx.block_numbers[&outcome.number]));
     }
     assert_eq!(
-        (summary.total, summary.validated, summary.failed.len()),
+        (summary.total, summary.validated(), summary.failed.len()),
         (seen.len(), seen.len(), 0)
     );
 }
@@ -862,7 +872,7 @@ async fn an_unfetchable_block_times_out_without_stopping_the_run() {
     for outcome in &outcomes {
         assert_eq!(outcome.retryable, outcome.number == missing, "{outcome:?}");
     }
-    assert_eq!((summary.total, summary.validated, summary.failed.len()), (3, 2, 1));
+    assert_eq!((summary.total, summary.validated(), summary.failed.len()), (3, 2, 1));
     assert_eq!(
         block_list::parse_block_list(&summary.failed_list()).unwrap(),
         vec![missing],
@@ -888,7 +898,7 @@ async fn a_block_served_for_the_wrong_height_is_not_counted_as_validated() {
     let [outcome] = outcomes.as_slice() else { panic!("one outcome expected: {outcomes:?}") };
     assert_eq!(outcome.status, Status::FetchTimeout, "{outcome:?}");
     assert_eq!(outcome.hash, None, "no block was accepted for the height");
-    assert_eq!((summary.validated, summary.failed.len()), (0, 1));
+    assert_eq!((summary.validated(), summary.failed.len()), (0, 1));
 }
 
 /// The chain-head read before the first block retries forever like every RPC call, so it is
@@ -897,25 +907,14 @@ async fn a_block_served_for_the_wrong_height_is_not_counted_as_validated() {
 /// run's results, where it would be passed back as `--block-list` in place of this run's.
 #[tokio::test]
 async fn an_unreachable_head_fails_the_run_without_a_stale_retry_list() {
-    let fx = TestFixtures::synthetic_shared();
     let temp_dir = tempfile::tempdir().unwrap();
-    let validator_db =
-        Arc::new(ValidatorDB::new(temp_dir.path().join(VALIDATOR_DB_FILENAME)).unwrap());
-    let contract_cache =
-        Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
-    let genesis_file = fx.data_dir.join("genesis.json");
-    let chain_spec = Arc::new(
-        load_or_create_chain_spec(&validator_db, Some(genesis_file.to_str().unwrap())).unwrap(),
-    );
+    let dir = temp_dir.path();
     // Nothing listens on port 1, so every attempt is refused and retried.
-    let unreachable = "http://127.0.0.1:1";
-    let client = Arc::new(RpcClient::new(&[unreachable], &[unreachable]).unwrap());
-    let fetcher = Arc::new(ValidatorFetcher::new(client.clone(), None));
-    let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
+    let (fetcher, processor) = block_list_parts(dir, "http://127.0.0.1:1");
 
-    let list = temp_dir.path().join("list.txt");
-    let results = temp_dir.path().join("results.jsonl");
-    let failed = temp_dir.path().join("failed.txt");
+    let list = dir.join("list.txt");
+    let results = dir.join(block_list::RESULTS_FILE);
+    let failed = dir.join(block_list::RETRY_FILE);
     std::fs::write(&list, "1\n2\n").unwrap();
     // What a previous run left behind.
     std::fs::write(&results, "{\"block\":5}\n").unwrap();
@@ -923,13 +922,12 @@ async fn an_unreachable_head_fails_the_run_without_a_stale_retry_list() {
 
     let config = ReplayConfig {
         concurrency: 2,
+        validate_concurrency: 1,
         block_timeout: Duration::from_secs(1),
-        progress_every: Duration::from_secs(3600),
     };
-    let output = block_list::Output { results: &results, failed: &failed };
     let err = tokio::time::timeout(
         Duration::from_secs(30),
-        block_list::run(&list, output, fetcher, processor, &config),
+        block_list::run(&list, dir, fetcher, processor, &config),
     )
     .await
     .expect("the head read must be bounded")

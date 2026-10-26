@@ -203,12 +203,14 @@ pub struct CommandLineArgs {
         long,
         env = "STATELESS_VALIDATOR_BLOCK_LIST_TIMEOUT_SECS",
         requires = "block_list",
+        default_value_t = 300,
         value_parser = clap::value_parser!(u64).range(1..),
     )]
-    pub block_list_timeout_secs: Option<u64>,
+    pub block_list_timeout_secs: u64,
 
-    /// With `--block-list`: how many blocks to fetch and validate at once (default: twice the
-    /// physical cores, the validator pipeline's own in-flight window). At least 1.
+    /// With `--block-list`: how many blocks to have in flight, fetching or validating (default:
+    /// twice the physical cores, the validator pipeline's own in-flight window). At most one per
+    /// physical core validates at a time, the pipeline's worker count. At least 1.
     #[clap(
         long,
         env = "STATELESS_VALIDATOR_BLOCK_LIST_CONCURRENCY",
@@ -393,30 +395,20 @@ pub async fn run() -> Result<()> {
     info!("Chain spec loaded successfully");
 
     if let Some(list) = &args.block_list {
+        let pipeline_defaults = stateless_core::PipelineConfig::default();
         let config = block_list::ReplayConfig {
-            concurrency: args.block_list_concurrency.unwrap_or_else(|| {
-                stateless_core::PipelineConfig::default().fetcher_max_in_flight()
-            }),
-            block_timeout: Duration::from_secs(args.block_list_timeout_secs.unwrap_or(300)),
-            progress_every: Duration::from_secs(10),
+            concurrency: args
+                .block_list_concurrency
+                .unwrap_or_else(|| pipeline_defaults.fetcher_max_in_flight()),
+            validate_concurrency: pipeline_defaults.concurrent_workers,
+            block_timeout: Duration::from_secs(args.block_list_timeout_secs),
         };
-        let output_dir = args.block_list_output_dir.clone().unwrap_or_else(|| work_dir.clone());
-        std::fs::create_dir_all(&output_dir)
-            .map_err(|e| eyre::eyre!("Failed to create {}: {e}", output_dir.display()))?;
-        let results = output_dir.join("results.jsonl");
-        let failed = output_dir.join("failed.txt");
+        let output_dir = args.block_list_output_dir.as_deref().unwrap_or(&work_dir);
 
         let fetcher = Arc::new(ValidatorFetcher::new(client.clone(), r2_witness));
         let processor =
             Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client.clone() });
-        let outcome = block_list::run(
-            list,
-            block_list::Output { results: &results, failed: &failed },
-            fetcher,
-            processor,
-            &config,
-        )
-        .await;
+        let outcome = block_list::run(list, output_dir, fetcher, processor, &config).await;
         info!(elapsed = ?start.elapsed(), "Block list replay finished");
         return outcome;
     }

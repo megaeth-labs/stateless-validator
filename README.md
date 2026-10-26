@@ -77,7 +77,7 @@ cargo run --release --bin stateless-validator -- \
 - `--end-block`: Inclusive end block; validate up to this height, then stop cleanly (useful to slice a fixed range across multiple servers)
 - `--block-list`: Replay exactly the block numbers in this file instead of following the chain, then exit; see "Replaying a block list" below.
   It excludes `--start-block`, `--end-block` and `--report-validation-endpoint`, and requires `--genesis-file`.
-- `--block-list-timeout-secs`, `--block-list-concurrency`, `--block-list-output-dir`: tuning for `--block-list` (per-stage timeout, default 300; blocks in flight, default twice the physical cores; where the output files go, default `--data-dir`).
+- `--block-list-timeout-secs`, `--block-list-concurrency`, `--block-list-output-dir`: tuning for `--block-list` (per-stage timeout, default 300; blocks in flight, default twice the physical cores, of which at most one per physical core validates at a time; where the output files go, default `--data-dir`).
   They are rejected without `--block-list`.
 - `--r2-endpoint`, `--r2-bucket`, `--r2-access-key-id`, `--r2-secret-access-key`: R2 connection settings for the signed S3 target, all four required together (prefer the env var for the secret).
   Configuring a target is the whole switch: there is no mode flag, and with one configured every witness fetch tries the bucket before the `--witness-endpoint` chain.
@@ -109,6 +109,7 @@ The file has one decimal block number per line.
 Blank lines and lines starting with `#` are skipped, so the candidate pool written by the coverage tooling works as is.
 Duplicates collapse, and a line that is neither a comment nor a number fails the run before any block is fetched.
 Each block goes through the same fetch (R2 first when configured, then the RPC witness chain) and the same validation as the chain-following mode, up to `--block-list-concurrency` at a time.
+Validation is CPU-bound, so as in the pipeline at most one block per physical core validates at once, and a fetched block waits for a free core before its validation timeout starts.
 Nothing is advanced or reported: the canonical chain is not touched, and `--report-validation-endpoint` is rejected because a sparse set of heights must never move the upstream validated pointer.
 Use a fresh `--data-dir`, since the run opens the validator database exclusively and caches contract bytecode there.
 The genesis file is required and always replaces any genesis stored in the data dir, so replaying blocks past a hardfork needs a genesis that schedules it.

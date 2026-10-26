@@ -12,7 +12,7 @@
 
 use std::{
     any::Any,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{BufWriter, Write},
     panic::AssertUnwindSafe,
@@ -24,8 +24,11 @@ use std::{
 use alloy_primitives::BlockHash;
 use eyre::{Result, WrapErr, ensure};
 use futures::FutureExt;
-use stateless_core::pipeline::{BlockFetcher, BlockProcessor};
-use tokio::task::JoinSet;
+use stateless_core::{
+    ErrorAction,
+    pipeline::{BlockFetcher, BlockProcessor},
+};
+use tokio::{sync::Semaphore, task::JoinSet};
 use tracing::info;
 
 use crate::chain_sync::{ValidatorFetcher, ValidatorProcessor};
@@ -34,6 +37,12 @@ use crate::chain_sync::{ValidatorFetcher, ValidatorProcessor};
 const SLOWEST_SHOWN: usize = 5;
 /// How many failures the printed summary spells out; all of them are in the results file.
 const FAILURES_SHOWN: usize = 20;
+/// Minimum gap between progress lines.
+const PROGRESS_EVERY: Duration = Duration::from_secs(10);
+/// The results file's name in the output directory.
+pub const RESULTS_FILE: &str = "results.jsonl";
+/// The retry list's name in the output directory.
+pub const RETRY_FILE: &str = "failed.txt";
 /// What the retry list holds until the run finishes. It parses as an empty list, which is an
 /// error, so an interrupted run's list fails loudly instead of retrying nothing or the wrong set.
 const RETRY_LIST_PENDING: &str =
@@ -139,21 +148,22 @@ impl BlockOutcome {
 /// Knobs for [`replay_block_list`].
 #[derive(Clone, Debug)]
 pub struct ReplayConfig {
-    /// Blocks fetched or validated at once.
+    /// Blocks in flight at once, fetching or validating.
     pub concurrency: usize,
+    /// Of those, how many validate at once. Validation is CPU-bound, so this is the pipeline's
+    /// worker count rather than its fetch window: a block whose fetch is done waits here, as it
+    /// would for a pipeline worker, instead of oversubscribing the cores.
+    pub validate_concurrency: usize,
     /// Bound on each of the fetch and the validation of one block. The RPC client retries
     /// transport errors forever, so without it a block the endpoints cannot serve would hold a
     /// slot, and the run, open indefinitely.
     pub block_timeout: Duration,
-    /// Minimum gap between progress lines.
-    pub progress_every: Duration,
 }
 
 /// Totals for a finished run.
 #[derive(Clone, Debug, Default)]
 pub struct ReplaySummary {
     pub total: usize,
-    pub validated: usize,
     pub failed: Vec<BlockOutcome>,
     pub elapsed: Duration,
     /// The slowest blocks, slowest first.
@@ -163,14 +173,16 @@ pub struct ReplaySummary {
 impl ReplaySummary {
     fn record(&mut self, outcome: &BlockOutcome) {
         self.total += 1;
-        if outcome.status == Status::Validated {
-            self.validated += 1;
-        } else {
+        if outcome.status != Status::Validated {
             self.failed.push(outcome.clone());
         }
         self.slowest.push((outcome.number, outcome.elapsed));
         self.slowest.sort_by_key(|&(_, elapsed)| std::cmp::Reverse(elapsed));
         self.slowest.truncate(SLOWEST_SHOWN);
+    }
+
+    pub fn validated(&self) -> usize {
+        self.total - self.failed.len()
     }
 
     /// Blocks per second over the whole run.
@@ -198,15 +210,15 @@ impl ReplaySummary {
             self.total,
             self.elapsed.as_secs_f64(),
             self.rate(),
-            self.validated,
+            self.validated(),
             self.failed.len(),
         );
-        let mut statuses: Vec<Status> = self.failed.iter().map(|outcome| outcome.status).collect();
-        statuses.sort_by_key(|status| status.as_str());
-        statuses.dedup();
-        for status in statuses {
-            let count = self.failed.iter().filter(|outcome| outcome.status == status).count();
-            out.push_str(&format!("  {}: {count}\n", status.as_str()));
+        let mut by_status = BTreeMap::new();
+        for outcome in &self.failed {
+            *by_status.entry(outcome.status.as_str()).or_insert(0usize) += 1;
+        }
+        for (status, count) in by_status {
+            out.push_str(&format!("  {status}: {count}\n"));
         }
         if !self.slowest.is_empty() {
             let slowest: Vec<String> = self
@@ -233,10 +245,13 @@ impl ReplaySummary {
     }
 }
 
-/// Fetches and validates one block, bounding each stage by `timeout`.
+/// Fetches and validates one block, bounding each stage by `timeout`. The validation runs under
+/// one of `validate_slots`, taken outside its timeout so the wait for a core is not counted
+/// against it.
 async fn replay_one(
     fetcher: &ValidatorFetcher,
     processor: &ValidatorProcessor,
+    validate_slots: &Semaphore,
     number: u64,
     timeout: Duration,
 ) -> BlockOutcome {
@@ -257,15 +272,17 @@ async fn replay_one(
 
     let hash = task.block.header.hash;
 
+    let _slot = validate_slots.acquire().await.expect("the validate semaphore is never closed");
     match tokio::time::timeout(timeout, processor.process(task)).await {
         Err(_) => BlockOutcome::new(number, Some(hash), Status::ProcessTimeout, started)
             .with_message(format!("not validated within {timeout:?}"))
             .with_retryable(true),
         Ok(Ok(_)) => BlockOutcome::new(number, Some(hash), Status::Validated, started),
         Ok(Err(failure)) => {
+            let retryable = processor.error_action(&failure) == ErrorAction::Retry;
             BlockOutcome::new(number, Some(hash), Status::ValidationFailed, started)
                 .with_message(failure.error)
-                .with_retryable(failure.transient)
+                .with_retryable(retryable)
         }
     }
 }
@@ -301,7 +318,10 @@ pub async fn replay_block_list(
     config: &ReplayConfig,
     mut sink: impl FnMut(&BlockOutcome) -> Result<()>,
 ) -> Result<ReplaySummary> {
-    ensure!(config.concurrency > 0, "concurrency must be at least 1");
+    ensure!(
+        config.concurrency > 0 && config.validate_concurrency > 0,
+        "concurrency must be at least 1"
+    );
     let started = Instant::now();
     let total = blocks.len();
 
@@ -313,13 +333,21 @@ pub async fn replay_block_list(
     let head = tokio::time::timeout(budget, fetcher.latest_block_number())
         .await
         .wrap_err_with(|| format!("the chain head was not read within {budget:?}"))??;
-    info!(blocks = total, head, concurrency = config.concurrency, "Replaying block list");
+    info!(
+        blocks = total,
+        head,
+        concurrency = config.concurrency,
+        validate_concurrency = config.validate_concurrency,
+        "Replaying block list"
+    );
 
+    let validate_slots = Arc::new(Semaphore::new(config.validate_concurrency));
     let spawn = |tasks: &mut JoinSet<BlockOutcome>, number: u64| {
         let (fetcher, processor) = (Arc::clone(&fetcher), Arc::clone(&processor));
+        let validate_slots = Arc::clone(&validate_slots);
         let timeout = config.block_timeout;
         tasks.spawn(settle(number, async move {
-            replay_one(&fetcher, &processor, number, timeout).await
+            replay_one(&fetcher, &processor, &validate_slots, number, timeout).await
         }));
     };
     let mut pending = blocks.into_iter();
@@ -339,7 +367,7 @@ pub async fn replay_block_list(
             spawn(&mut tasks, number);
         }
 
-        if last_progress.elapsed() >= config.progress_every {
+        if last_progress.elapsed() >= PROGRESS_EVERY {
             last_progress = Instant::now();
             info!(
                 done = summary.total,
@@ -355,22 +383,16 @@ pub async fn replay_block_list(
     Ok(summary)
 }
 
-/// Where a run writes its output, both files truncated at the start.
-pub struct Output<'a> {
-    /// One JSON object per block, in completion order, flushed as each lands so an interrupted
-    /// run keeps what it had.
-    pub results: &'a Path,
-    /// The retry list: the failed block numbers in the input format, written when the run
-    /// finishes. Until then it holds only a comment, so an interrupted run never leaves an
-    /// earlier run's list beside its own results.
-    pub failed: &'a Path,
-}
-
-/// Reads `list`, replays it, writes the output files, prints the summary, and fails when any
-/// block did not validate.
+/// Reads `list`, replays it, writes the output files to `output_dir` (created if missing), prints
+/// the summary, and fails when any block did not validate.
+///
+/// Both files are truncated at the start. [`RESULTS_FILE`] gets one JSON object per block, in
+/// completion order, flushed as each lands so an interrupted run keeps what it had. [`RETRY_FILE`]
+/// gets the failed block numbers in the input format when the run finishes; until then it holds
+/// only a comment, so an interrupted run never leaves an earlier run's list beside its own results.
 pub async fn run(
     list: &Path,
-    output: Output<'_>,
+    output_dir: &Path,
     fetcher: Arc<ValidatorFetcher>,
     processor: Arc<ValidatorProcessor>,
     config: &ReplayConfig,
@@ -381,12 +403,15 @@ pub async fn run(
         .wrap_err_with(|| format!("cannot read the block list {}", list.display()))?;
     let blocks = parse_block_list(&text)?;
 
+    std::fs::create_dir_all(output_dir)
+        .wrap_err_with(|| format!("cannot create {}", output_dir.display()))?;
+    let (results_path, retry_path) = (output_dir.join(RESULTS_FILE), output_dir.join(RETRY_FILE));
     let mut results = BufWriter::new(
-        File::create(output.results)
-            .wrap_err_with(|| format!("cannot create {}", output.results.display()))?,
+        File::create(&results_path)
+            .wrap_err_with(|| format!("cannot create {}", results_path.display()))?,
     );
-    std::fs::write(output.failed, RETRY_LIST_PENDING)
-        .wrap_err_with(|| format!("cannot write {}", output.failed.display()))?;
+    std::fs::write(&retry_path, RETRY_LIST_PENDING)
+        .wrap_err_with(|| format!("cannot write {}", retry_path.display()))?;
     let summary = replay_block_list(fetcher, processor, blocks, config, |outcome| {
         writeln!(results, "{}", outcome.to_json_line())?;
         results.flush()?;
@@ -394,11 +419,11 @@ pub async fn run(
     })
     .await?;
 
-    std::fs::write(output.failed, summary.failed_list())
-        .wrap_err_with(|| format!("cannot write {}", output.failed.display()))?;
+    std::fs::write(&retry_path, summary.failed_list())
+        .wrap_err_with(|| format!("cannot write {}", retry_path.display()))?;
     println!("{}", summary.render());
-    println!("results: {}", output.results.display());
-    println!("retry list: {}", output.failed.display());
+    println!("results: {}", results_path.display());
+    println!("retry list: {}", retry_path.display());
 
     ensure!(
         summary.failed.is_empty(),
@@ -463,7 +488,7 @@ mod tests {
         }
         summary.elapsed = Duration::from_secs(7);
 
-        assert_eq!((summary.total, summary.validated, summary.failed.len()), (7, 5, 2));
+        assert_eq!((summary.total, summary.validated(), summary.failed.len()), (7, 5, 2));
         assert_eq!(summary.slowest.len(), SLOWEST_SHOWN);
         assert_eq!(summary.slowest[0].0, 11);
         assert!((summary.rate() - 1.0).abs() < 1e-9);
