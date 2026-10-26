@@ -100,6 +100,35 @@ use server_db::{BlockStore, ServerDB};
 
 use crate::chain_sync::{TraceFetcher, TraceHooks, TraceProcessor};
 
+/// jemalloc rather than the system allocator: under response- and block-data-cache churn, glibc
+/// malloc keeps freed memory in its per-thread arenas, so RSS climbs to several times the caches'
+/// accounted bytes while the live heap stays flat. `override_allocator_on_supported_platforms`
+/// routes the C dependencies (zstd, aws-lc) through it too. On Linux, `background_threads` purges
+/// freed pages off the request path; without it an arena only returns them while it keeps
+/// allocating, so memory freed by a burst stays resident in every arena that then goes quiet.
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// Logs the allocator configuration in force, whether or not metrics are enabled: `MALLOC_CONF`
+/// can override the compiled-in defaults at deploy time, and nothing else shows what took
+/// effect. A field jemalloc cannot report (background threads on macOS) is omitted.
+fn log_allocator_config() {
+    use tikv_jemalloc_ctl::{background_thread, config, opt, version};
+
+    info!(
+        version = version::read().ok().map(jemalloc_str),
+        compiled_conf = config::malloc_conf::read().ok().map(jemalloc_str),
+        background_thread = background_thread::read().ok(),
+        narenas = opt::narenas::read().ok(),
+        "Allocator: jemalloc"
+    );
+}
+
+/// Strips the NUL terminator `tikv-jemalloc-ctl`'s string reads keep from the C string.
+fn jemalloc_str(s: &'static str) -> &'static str {
+    s.trim_end_matches('\0')
+}
+
 /// Command line arguments for the debug-trace-server.
 #[derive(Parser, Debug)]
 #[clap(name = "debug-trace-server", version, about = "Debug/Trace RPC Server")]
@@ -790,6 +819,7 @@ async fn main() -> Result<()> {
         listen_addr = %args.addr,
         "Debug-trace-server starting"
     );
+    log_allocator_config();
     // The combined witness chain (generator first when configured) — the list actually fed to
     // the RPC client, not just the fallback flag values.
     let witness_apis = witness_endpoint_chain(&args);
@@ -1380,6 +1410,19 @@ fn run_prune_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Background purge threads are what return a burst's freed pages from arenas that then go
+    /// quiet, and nothing else would notice the `background_threads` feature going missing.
+    /// Linux only, like the feature. Reads the compiled-in default the feature sets rather than
+    /// the live setting, which the documented `MALLOC_CONF=background_thread:false` overrides.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn jemalloc_purges_in_the_background() {
+        let conf = jemalloc_str(tikv_jemalloc_ctl::config::malloc_conf::read().unwrap());
+        // jemalloc applies options left to right, so the last setting is the one in force.
+        let mut default = conf.split(',').filter_map(|opt| opt.strip_prefix("background_thread:"));
+        assert_eq!(default.next_back(), Some("true"), "compiled-in malloc_conf: {conf:?}");
+    }
 
     /// Verifies that an endpoint flag accepts repeated flags, CSV values, and env var —
     /// ensuring container deployments configured purely via env are not silently limited
