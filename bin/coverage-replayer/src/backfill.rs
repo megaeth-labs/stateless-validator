@@ -25,7 +25,9 @@ use alloy_rpc_types_eth::BlockId;
 use clap::Args;
 use eyre::{Context, Result, bail, ensure};
 use rustc_hash::FxHashMap;
-use stateless_common::{RpcClient, RpcClientConfig};
+use stateless_common::{
+    RpcClient, RpcClientConfig, atomic_write::write_scratch, block_list::read_block_list,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt},
     process::Child,
@@ -37,7 +39,7 @@ use crate::{
     bitset::BitSet,
     llvm::{Llvm, LlvmArgs},
     proto::{WorkerRequest, WorkerResponse},
-    spool::{DataDir, SpoolEntry, write_scratch},
+    spool::{DataDir, SpoolEntry},
     store::{
         BINARY_ID, BlockRecord, BlockStatus, ElapsedStats, PatternRecord, Store,
         resolve_pattern_slot,
@@ -127,11 +129,7 @@ impl Selection {
                 ensure!(from <= to, "--from must be <= --to");
                 Ok(Self::Range(from..=to))
             }
-            (None, None, Some(path)) => {
-                let blocks = read_blocks_file(path)?;
-                ensure!(!blocks.is_empty(), "block list {} holds no block numbers", path.display());
-                Ok(Self::List(blocks))
-            }
+            (None, None, Some(path)) => Ok(Self::List(read_block_list(path)?)),
             (None, None, None) => bail!("pass either --from with --to, or --blocks-file"),
             (_, _, Some(_)) => bail!("--blocks-file cannot be combined with --from/--to"),
             _ => bail!("--from and --to must be given together"),
@@ -149,7 +147,7 @@ impl Selection {
     fn highest(&self) -> u64 {
         match self {
             Self::Range(r) => *r.end(),
-            // Sorted by `read_blocks_file`; `resolve` rejects an empty list.
+            // `read_block_list` sorts the list and refuses an empty one.
             Self::List(v) => v.last().copied().unwrap_or(0),
         }
     }
@@ -209,26 +207,6 @@ impl Selection {
         }
         Ok((todo, retrying))
     }
-}
-
-/// Parses a block list: one decimal number per line, `#` comments and blanks ignored.
-/// Sorted and deduplicated, so concatenated shard pools replay each block once, in order.
-pub(crate) fn read_blocks_file(path: &Path) -> Result<Vec<u64>> {
-    let text = std::fs::read_to_string(path)
-        .wrap_err_with(|| format!("read block list {}", path.display()))?;
-    let mut blocks = Vec::new();
-    for (i, line) in text.lines().enumerate() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        blocks.push(line.parse::<u64>().wrap_err_with(|| {
-            format!("{}:{}: not a block number: {line:?}", path.display(), i + 1)
-        })?);
-    }
-    blocks.sort_unstable();
-    blocks.dedup();
-    Ok(blocks)
 }
 
 pub async fn run(args: BackfillArgs) -> Result<()> {
@@ -961,31 +939,6 @@ mod tests {
         <TestCli as clap::Parser>::try_parse_from(argv)
             .map(|c| c.args)
             .map_err(|e| eyre::eyre!("{e}"))
-    }
-
-    /// The list format carries pools between builds, so `#` header and trailing comments,
-    /// blank lines, and out-of-order duplicates from concatenated shards must all parse.
-    #[test]
-    fn block_list_skips_comments_sorts_and_dedups() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pool.txt");
-        std::fs::write(
-            &path,
-            "# coverage-replayer candidate pool\n# blocks: 3\n\n  30 \n10\n20 # trailing\n10\n",
-        )
-        .unwrap();
-        assert_eq!(read_blocks_file(&path).unwrap(), vec![10, 20, 30]);
-    }
-
-    #[test]
-    fn block_list_rejects_a_non_number() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("pool.txt");
-        std::fs::write(&path, "10\n0x1f\n").unwrap();
-        let err = read_blocks_file(&path).expect_err("must fail");
-        assert!(err.to_string().contains("not a block number"), "got: {err}");
-        // The line number points at the offending line, not the file start.
-        assert!(err.to_string().contains(":2:"), "got: {err}");
     }
 
     /// Exactly one selection form must be given, or a run could sweep the wrong blocks.

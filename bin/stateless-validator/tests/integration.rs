@@ -19,7 +19,7 @@ use jsonrpsee::server::ServerConfigBuilder;
 use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned};
 use stateless_common::{
     BackoffPolicy, R2WitnessTransport, RpcClient, RpcClientConfig, WitnessRequestKeys,
-    encode_witness_payload, encode_witness_response,
+    block_list::parse_block_list, encode_witness_payload, encode_witness_response,
 };
 use stateless_core::{
     BisectResolver, ChainStore, ContractStore, PipelineConfig,
@@ -874,7 +874,7 @@ async fn an_unfetchable_block_times_out_without_stopping_the_run() {
     }
     assert_eq!((summary.total, summary.validated(), summary.failed.len()), (3, 2, 1));
     assert_eq!(
-        block_list::parse_block_list(&summary.failed_list()).unwrap(),
+        parse_block_list(&summary.failed_list()).unwrap(),
         vec![missing],
         "the retry list names exactly the block that did not validate",
     );
@@ -936,5 +936,5 @@ async fn an_unreachable_head_fails_the_run_without_a_stale_retry_list() {
     assert!(format!("{err:#}").contains("chain head"), "{err:#}");
     assert_eq!(std::fs::read_to_string(&results).unwrap(), "", "results are truncated");
     let retry = std::fs::read_to_string(&failed).unwrap();
-    assert!(block_list::parse_block_list(&retry).is_err(), "stale retry list left: {retry:?}");
+    assert!(parse_block_list(&retry).unwrap().is_empty(), "stale retry list left: {retry:?}");
 }

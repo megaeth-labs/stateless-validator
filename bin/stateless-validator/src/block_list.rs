@@ -12,7 +12,7 @@
 
 use std::{
     any::Any,
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs::File,
     io::{BufWriter, Write},
     panic::AssertUnwindSafe,
@@ -24,6 +24,7 @@ use std::{
 use alloy_primitives::BlockHash;
 use eyre::{Result, WrapErr, ensure};
 use futures::FutureExt;
+use stateless_common::{atomic_write::write_atomic, block_list::read_block_list};
 use stateless_core::{
     ErrorAction,
     pipeline::{BlockFetcher, BlockProcessor},
@@ -43,33 +44,10 @@ const PROGRESS_EVERY: Duration = Duration::from_secs(10);
 pub const RESULTS_FILE: &str = "results.jsonl";
 /// The retry list's name in the output directory.
 pub const RETRY_FILE: &str = "failed.txt";
-/// What the retry list holds until the run finishes. It parses as an empty list, which is an
-/// error, so an interrupted run's list fails loudly instead of retrying nothing or the wrong set.
+/// What the retry list holds until the run finishes. It holds no block numbers, so passing an
+/// interrupted run's list back fails loudly instead of retrying nothing or the wrong set.
 const RETRY_LIST_PENDING: &str =
     "# the run did not finish: no retry list was written; see results.jsonl\n";
-
-/// Parses a block list: one decimal block number per line.
-///
-/// Blank lines and lines starting with `#` are skipped, so a candidate-pool file with its
-/// comment header is accepted as is. Duplicates collapse, and the result is ascending, which
-/// keeps neighbouring blocks together for the witness bucket and the contract cache. A line that
-/// is neither a comment nor a number fails the whole parse naming its line, since silently
-/// dropping an entry would shrink the set the run claims to have covered.
-pub fn parse_block_list(text: &str) -> Result<Vec<u64>> {
-    let mut blocks = BTreeSet::new();
-    for (index, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let number = line
-            .parse::<u64>()
-            .wrap_err_with(|| format!("line {}: {line:?} is not a block number", index + 1))?;
-        blocks.insert(number);
-    }
-    ensure!(!blocks.is_empty(), "the block list contains no block numbers");
-    Ok(blocks.into_iter().collect())
-}
 
 /// How one block's replay ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -399,9 +377,7 @@ pub async fn run(
 ) -> Result<()> {
     // Read the whole list before touching the output files: the retry list written by an
     // earlier run is a legitimate input, and may live where this run's output will.
-    let text = std::fs::read_to_string(list)
-        .wrap_err_with(|| format!("cannot read the block list {}", list.display()))?;
-    let blocks = parse_block_list(&text)?;
+    let blocks = read_block_list(list)?;
 
     std::fs::create_dir_all(output_dir)
         .wrap_err_with(|| format!("cannot create {}", output_dir.display()))?;
@@ -410,8 +386,7 @@ pub async fn run(
         File::create(&results_path)
             .wrap_err_with(|| format!("cannot create {}", results_path.display()))?,
     );
-    std::fs::write(&retry_path, RETRY_LIST_PENDING)
-        .wrap_err_with(|| format!("cannot write {}", retry_path.display()))?;
+    write_atomic(&retry_path, RETRY_LIST_PENDING.as_bytes())?;
     let summary = replay_block_list(fetcher, processor, blocks, config, |outcome| {
         writeln!(results, "{}", outcome.to_json_line())?;
         results.flush()?;
@@ -419,8 +394,7 @@ pub async fn run(
     })
     .await?;
 
-    std::fs::write(&retry_path, summary.failed_list())
-        .wrap_err_with(|| format!("cannot write {}", retry_path.display()))?;
+    write_atomic(&retry_path, summary.failed_list().as_bytes())?;
     println!("{}", summary.render());
     println!("results: {}", results_path.display());
     println!("retry list: {}", retry_path.display());
@@ -436,6 +410,8 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
+    use stateless_common::block_list::parse_block_list;
+
     use super::*;
 
     fn outcome(number: u64, status: Status, ms: u64) -> BlockOutcome {
@@ -447,29 +423,6 @@ mod tests {
             retryable: false,
             elapsed: Duration::from_millis(ms),
         }
-    }
-
-    #[test]
-    fn a_pool_file_parses_with_its_comment_header() {
-        let text = "# coverage-replayer candidate pool\n# blocks: 3\n7\n\n  3  \n7\n12\r\n";
-        assert_eq!(parse_block_list(text).unwrap(), vec![3, 7, 12]);
-    }
-
-    #[test]
-    fn a_bad_line_fails_the_parse_and_names_its_line() {
-        let error = parse_block_list("1\n2\nxyz\n4\n").unwrap_err().to_string();
-        assert!(error.contains("line 3") && error.contains("xyz"), "got: {error}");
-        // A trailing comment is not a comment: only whole-line comments are skipped, and a
-        // half-parsed entry must not slip through as a smaller number.
-        assert!(parse_block_list("5 # five\n").is_err());
-        assert!(parse_block_list("-1\n").is_err());
-        assert!(parse_block_list("0x10\n").is_err());
-    }
-
-    #[test]
-    fn an_empty_list_is_an_error_not_a_vacuous_pass() {
-        assert!(parse_block_list("").is_err());
-        assert!(parse_block_list("# only a header\n\n").is_err());
     }
 
     #[test]
@@ -506,7 +459,7 @@ mod tests {
     fn a_run_with_no_failures_writes_an_empty_retry_list() {
         let mut summary = ReplaySummary::default();
         summary.record(&outcome(1, Status::Validated, 1));
-        assert!(parse_block_list(&summary.failed_list()).is_err(), "no numbers to retry");
+        assert!(parse_block_list(&summary.failed_list()).unwrap().is_empty(), "nothing to retry");
         assert!(summary.failed_list().starts_with("# blocks that did not validate: 0"));
     }
 
@@ -524,9 +477,14 @@ mod tests {
         assert!(owned.message.unwrap().contains("owned payload"));
     }
 
+    /// An interrupted run's retry list, passed back as `--block-list`, must fail the run.
     #[test]
-    fn the_pending_retry_list_parses_as_no_blocks() {
-        assert!(parse_block_list(RETRY_LIST_PENDING).is_err());
+    fn the_pending_retry_list_is_refused_as_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(RETRY_FILE);
+        write_atomic(&path, RETRY_LIST_PENDING.as_bytes()).unwrap();
+        let error = read_block_list(&path).unwrap_err().to_string();
+        assert!(error.contains("holds no block numbers"), "got: {error}");
     }
 
     #[test]

@@ -106,7 +106,7 @@ cargo run --release --bin stateless-validator -- \
 ```
 
 The file has one decimal block number per line.
-Blank lines and lines starting with `#` are skipped, so the candidate pool written by the coverage tooling works as is.
+Blank lines are skipped and `#` starts a comment, on a line of its own or after a number, so the candidate pool written by the coverage tooling works as is; `coverage-replayer backfill --blocks-file` reads the same format with the same parser.
 Duplicates collapse, and a line that is neither a comment nor a number fails the run before any block is fetched.
 Each block goes through the same fetch (R2 first when configured, then the RPC witness chain) and the same validation as the chain-following mode, up to `--block-list-concurrency` at a time.
 Validation is CPU-bound, so as in the pipeline at most one block per physical core validates at once, and a fetched block waits for a free core before its validation timeout starts.
@@ -123,7 +123,7 @@ The one chain-head read before the first block is bounded the same way, and fail
 Two files are written to `--block-list-output-dir`, both overwritten on each run.
 `results.jsonl` has one object per block, in completion order, with `block`, `hash`, `status`, `ms`, `retryable` and the validator's error text in `message`.
 `retryable` is true for the fetch statuses and both timeouts, which say nothing about the block itself, and for a validation failure the validator judges transient (a store error rather than a mismatch).
-`failed.txt` is written when the run finishes; until then it holds only a comment, so an interrupted run never leaves the previous run's retry list beside its own results.
+`failed.txt` is written when the run finishes, through a temporary file and a rename so a reader never sees half of it; until then it holds only a comment, so an interrupted run never leaves the previous run's retry list beside its own results.
 `failed.txt` lists the blocks that did not validate in the input format, so it can be passed back as `--block-list` to retry exactly those.
 The statuses are `validated`, `fetch_timeout`, `fetch_failed`, `process_timeout` and `validation_failed`.
 The end-of-run summary prints the totals, the rate in blocks per second and the slowest blocks.
@@ -392,7 +392,7 @@ The pipeline is configured via `PipelineConfig` and customized through trait imp
 | File                                                                                           | Purpose                                                                                                     |
 | ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
 | `crates/stateless-core/src/pipeline/{mod,config,traits,fetcher,divergence,advancer,worker}.rs` | Generic three-stage pipeline split by responsibility                                                        |
-| `bin/stateless-validator/src/block_list.rs`                                                    | `--block-list` replay: list parsing, bounded-concurrency fetch + validate, results and retry files |
+| `bin/stateless-validator/src/block_list.rs`                                                    | `--block-list` replay: bounded-concurrency fetch + validate, results and retry files |
 | `crates/stateless-core/src/executor.rs`                                                        | Block validation and EVM replay                                                                             |
 | `crates/stateless-core/src/db.rs`                                                              | Shared storage traits: `ChainStore`, `ContractStore`, `StoreError` (scenario stores live in their binaries) |
 | `crates/stateless-core/src/evm_database.rs`                                                    | `WitnessDatabase` implementing `revm::DatabaseRef`                                                          |
