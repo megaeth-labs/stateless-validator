@@ -24,6 +24,8 @@ use std::{
 use eyre::{Context, Result, ensure};
 use rustc_hash::FxHasher;
 
+use crate::checkouts::{ABBREV_LEN, abbreviated_checkouts, entries};
+
 /// Version of the item definition, stamped into every store (see [`universe_stamp`]). Bump
 /// it whenever the id, the set of item kinds, or what a block's bitmap records changes (e.g.
 /// what `worker::warm_up` keeps out of it): two definitions must never share a store.
@@ -89,8 +91,8 @@ pub struct LlvmArgs {
     /// Source directories scoping the coverage universe; the store is stamped with them and
     /// `report` refuses a manifest over any other scope. Default: where the build found
     /// mega-evm and `measured-crates.txt` at their locked sources, under the build's cargo home
-    /// (a registry crate's directory, or a git crate's whole checkout). Sources must sit at the
-    /// absolute paths they had at build time.
+    /// (a crate's own directory, in the registry or its git checkout; mega-evm's whole
+    /// checkout). Sources must sit at the absolute paths they had at build time.
     #[clap(long = "source-dir")]
     pub source_dirs: Vec<PathBuf>,
     /// llvm-profdata path (default: the `llvm-tools` of the toolchain that built this binary).
@@ -260,7 +262,8 @@ fn resolve_source_dirs(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
 
 /// Finds the one directory under `cargo_home` matching `root`, a relative path whose `*`
 /// stands for the directory cargo names after a source URL (see build.rs `source_root`):
-/// `registry/src/*/revm-handler-20.0.3`, or `git/checkouts/mega-evm-*/f78e75c`. Cargo keeps
+/// `registry/src/*/revm-handler-20.0.3`, `git/checkouts/mega-evm-*/f78e75c`, or a crate
+/// inside a checkout, `git/checkouts/optimism-*/f67d87c/rust/op-revm`. Cargo keeps
 /// one tree per registry index and one clone per URL it has used, and llvm-cov matches only
 /// the one the build compiled, so more than one candidate is a question for the operator
 /// rather than a pick.
@@ -269,30 +272,26 @@ fn detect_source_root(cargo_home: &Path, root: &str) -> Result<PathBuf> {
         root.split_once('*').expect("build.rs writes one `*` into every default root");
     let (parent, prefix) = parent_and_prefix.rsplit_once('/').unwrap_or(("", parent_and_prefix));
     let rest = rest.trim_start_matches('/');
-    // A git root ends in its commit's 7-digit abbreviation, but cargo names the checkout with
-    // git's shortest unambiguous one, which `core.abbrev` or a clashing prefix lengthens: any
-    // checkout extending the abbreviation matches (two would be refused below as ambiguous).
-    let abbreviated_commit = rest.len() >= 7 && rest.bytes().all(|b| b.is_ascii_hexdigit());
-    let candidates: Vec<PathBuf> = read_dir_entries(&cargo_home.join(parent))
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
-        .flat_map(|entry| {
-            if abbreviated_commit {
-                read_dir_entries(&entry.path())
-                    .filter(|checkout| checkout.file_name().to_string_lossy().starts_with(rest))
-                    .map(|checkout| checkout.path())
-                    .collect()
-            } else {
-                vec![entry.path().join(rest)]
-            }
-        })
-        .filter(|candidate| candidate.is_dir())
-        .collect();
+    // A git root continues with its commit's 7-digit abbreviation, but cargo names the checkout
+    // with git's shortest unambiguous one, which `core.abbrev` or a clashing prefix lengthens:
+    // any checkout extending the abbreviation matches (two would be refused below as
+    // ambiguous), and the crate's directory inside it, if named, follows.
+    let (first, inside) = rest.split_once('/').unwrap_or((rest, ""));
+    let abbreviated_commit =
+        first.len() >= ABBREV_LEN && first.bytes().all(|b| b.is_ascii_hexdigit());
+    let mut candidates: Vec<PathBuf> = if abbreviated_commit {
+        abbreviated_checkouts(&cargo_home.join(parent), prefix, first)
+            .into_iter()
+            .map(|checkout| if inside.is_empty() { checkout } else { checkout.join(inside) })
+            .collect()
+    } else {
+        entries(&cargo_home.join(parent))
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+            .map(|entry| entry.path().join(rest))
+            .collect()
+    };
+    candidates.retain(|candidate| candidate.is_dir());
     one_candidate(candidates, &format!("{root} under {}", cargo_home.display()))
-}
-
-/// The entries of `dir`; none if it cannot be read.
-fn read_dir_entries(dir: &Path) -> impl Iterator<Item = std::fs::DirEntry> {
-    std::fs::read_dir(dir).into_iter().flatten().flatten()
 }
 
 /// The one directory default scope detection found, or an error naming what to pass.
@@ -672,6 +671,18 @@ mod tests {
         std::fs::create_dir_all(clone.join("f67d87c00000")).unwrap();
         let err = detect_source_root(home.path(), root).expect_err("two checkouts extend it");
         assert!(err.to_string().contains("more than once"), "{err}");
+    }
+
+    /// A crate inside a checkout is found under the checkout, however far cargo abbreviated it.
+    #[test]
+    fn default_scope_finds_a_crate_inside_an_abbreviated_checkout() {
+        let home = tempfile::tempdir().unwrap();
+        let clone = home.path().join("git/checkouts/optimism-852bcbde");
+        std::fs::create_dir_all(clone.join("f67d87cd5c99/rust/op-revm")).unwrap();
+        let root = "git/checkouts/optimism-*/f67d87c/rust/op-revm";
+        let found = detect_source_root(home.path(), root).unwrap();
+        assert_eq!(found, clone.join("f67d87cd5c99/rust/op-revm"));
+        assert_eq!(root_label(&found), "op-revm");
     }
 
     /// The default scope build.rs derived resolves against the cargo home this test binary was

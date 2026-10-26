@@ -444,6 +444,7 @@ cargo test -p stateless-core -- test_name     # single test
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features
+cargo clippy -p coverage-replayer --all-targets --all-features -- --cfg coverage_replayer_instrumented
 cargo sort --check --workspace --grouped --order package,workspace,lints,profile,bin,benches,dependencies,dev-dependencies,features
 ```
 

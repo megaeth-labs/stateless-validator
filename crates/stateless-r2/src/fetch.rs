@@ -392,10 +392,14 @@ fn is_loopback_host(host: &str) -> bool {
 /// itself the signal (Cloudflare Access bouncing an unauthenticated client to its login page),
 /// which following would bury under an HTML body. Both surface the 3xx as a `Status` error.
 fn base_client(timeouts: FetchTimeouts) -> reqwest::ClientBuilder {
-    Client::builder()
+    let builder = Client::builder()
         .timeout(timeouts.per_attempt)
         .connect_timeout(timeouts.connect)
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::none());
+    // Operators may route R2 through a proxy; the tests' endpoints must be the ones dialed.
+    #[cfg(test)]
+    let builder = builder.no_proxy();
+    builder
 }
 
 /// One HTTP client and the permits bounding what that client may carry.
@@ -1208,20 +1212,40 @@ mod tests {
 
     /// Connection-establishment failures surface as `Connect` (the mitigation-detection
     /// kind) and are bounded by [`CONNECT_TIMEOUT`] rather than the full attempt timeout.
-    /// 192.0.2.1 (TEST-NET-1) is unroutable: the connect either errors immediately or
-    /// blackholes until the connect timeout — both must classify as `Connect`, fast.
+    /// Loopback port 1 (tcpmux, which nothing serves) refuses at once. 192.0.2.1 (TEST-NET-1)
+    /// is unroutable: the connect either errors immediately or blackholes until the connect
+    /// timeout — both must classify as `Connect`, fast. A transparent proxy (a VPN in TUN mode)
+    /// accepts every TCP connection, so there 192.0.2.1 never fails to connect and only the
+    /// loopback case runs. A proxy set in the environment cannot interfere: test clients
+    /// ignore it (see `base_client`).
     #[tokio::test]
     async fn unreachable_endpoint_surfaces_connect_kind_fast() {
-        let fetcher = fetcher_with("http://192.0.2.1:81", None, test_pacing());
-        let started = Instant::now();
-        let err = fetcher.get_block_object(1, "0xhash", 1, None, || ()).await.unwrap_err();
-        assert!(matches!(err, R2GetError::Connect { .. }), "{err}");
-        assert_eq!(err.kind(), "connect");
-        assert!(
-            started.elapsed() < DEFAULT_CONNECT_TIMEOUT + Duration::from_millis(500),
-            "connect failure must be bounded by the connect timeout ({:?})",
-            started.elapsed(),
-        );
+        let mut endpoints = vec!["http://127.0.0.1:1".to_string()];
+        let unroutable = "192.0.2.1:81";
+        let intercepted = tokio::time::timeout(
+            DEFAULT_CONNECT_TIMEOUT * 2,
+            tokio::net::TcpStream::connect(unroutable),
+        )
+        .await
+        .is_ok_and(|connected| connected.is_ok());
+        if intercepted {
+            eprintln!("{unroutable} accepts connections here (a transparent proxy?): skipped");
+        } else {
+            endpoints.push(format!("http://{unroutable}"));
+        }
+
+        for endpoint in endpoints {
+            let r2 = fetcher(&endpoint);
+            let started = Instant::now();
+            let err = r2.get_block_object(1, "0xhash", 1, None, || ()).await.unwrap_err();
+            assert!(matches!(err, R2GetError::Connect { .. }), "{endpoint}: {err}");
+            assert_eq!(err.kind(), "connect");
+            assert!(
+                started.elapsed() < DEFAULT_CONNECT_TIMEOUT + Duration::from_millis(500),
+                "{endpoint}: connect failure must be bounded by the connect timeout ({:?})",
+                started.elapsed(),
+            );
+        }
     }
 
     /// A fetch whose deadline expires while queued for a permit surfaces `Deadline`

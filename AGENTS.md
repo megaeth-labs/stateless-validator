@@ -27,6 +27,7 @@ cargo check -p stateless-core
 # Lint (CI runs all of these)
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features
+cargo clippy -p coverage-replayer --all-targets --all-features -- --cfg coverage_replayer_instrumented
 cargo sort --check --workspace --grouped --order package,workspace,lints,profile,bin,benches,dependencies,dev-dependencies,features
 ```
 
@@ -216,9 +217,10 @@ The background chain-sync prefetch routes by freshness against the last observed
 
 Unit tests are embedded in source files alongside the code they test.
 Integration tests live in `bin/debug-trace-server/tests/` (6 modules: cache_metrics, block_tag, compression, consistency, performance, timing_header), in `bin/stateless-validator/tests/integration.rs` (CLI parsing, mock-RPC pipeline, mainnet single-block validation), and in `bin/coverage-replayer/tests/` (`replay_fixtures.rs`: worker replay glue over the `test_data/mainnet` fixtures; `worker_protocol.rs`: the worker subprocess's stdout protocol).
+`coverage-replayer`'s warm-up guard (`worker::tests::every_fixture_block_replays_to_the_same_items_twice`: each fixture block's first replay must cover exactly what its second does) runs only in the instrumented build; its doc comment has the command, and CI lints it without linking.
 Test data (block JSON files, contract bytecode, witness data) is stored in `test_data/`.
 Both fixture sets ship their blocks, witnesses and contracts packed, as `test_data/mainnet.tar.zst` and `test_data/synthetic.tar.zst`.
-The mainnet set is 84 blocks that together reach every mega-evm and revm coverage item observed across a full mainnet replay, each with its parent's header.
+The mainnet set is 63 blocks that together reach every mega-evm and revm coverage item the latest `coverage-replayer` scan of mainnet observed, each with its parent's header.
 `TestFixtures::mainnet_shared()` / `synthetic_shared()` parse an archive straight into memory once per test binary, so nothing is unpacked to disk; only `genesis.json` (read by path), `manifest.txt` and mainnet's `bench/` stay unpacked in `test_data/<set>/`.
 Each `manifest.txt` lists, as `<number>.<hash>`, the paired blocks its archive must hold, and `packed_sets_are_complete` fails when the archive drops, adds or swaps one, so regenerate the two together.
 
