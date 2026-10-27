@@ -12,8 +12,7 @@ use alloy_primitives::B256;
 use eyre::Result;
 use stateless_common::RpcClient;
 use stateless_core::{
-    BisectResolver, ChainStore, PipelineConfig, chain_spec::ChainSpec, db::BlockMeta,
-    pipeline::run_pipeline,
+    BisectResolver, ChainStore, PipelineConfig, chain_spec::ChainSpec, pipeline::run_pipeline,
 };
 use stateless_db::ContractCache;
 use tokio::{signal, task};
@@ -214,7 +213,9 @@ async fn validation_reporter(
 /// after a reorg rollback is deliberately re-reported).
 ///
 /// Returns `true` when the round settled (report accepted, or nothing to report) and `false`
-/// when the attempt failed in a way a retry could resolve (logged here).
+/// when the report did not land (the caller retries). A rejection whose upstream cursor is
+/// below the local anchor cannot be closed by that retry: `CANONICAL_CHAIN` never retains a
+/// height below the anchor, so the only remedy is restarting with an earlier `--start-block`.
 async fn report_range_once(
     client: &RpcClient,
     validator_db: &ValidatorDB,
@@ -258,6 +259,25 @@ async fn report_range_once(
         Ok(response) => {
             let upstream_number = response.last_validated_block.0.to::<u64>();
             let upstream_hash = response.last_validated_block.1;
+
+            // The anchor is the first `CANONICAL_CHAIN` row (`reset_to_anchor` clears the table),
+            // `advance_chain` only appends above the tip, and rollback never deletes below the
+            // earliest retained row. A height below the anchor is therefore never local, and a
+            // covering report from the upstream pointer would claim blocks this process did not
+            // execute. Stay alive and say so; do not resubmit.
+            if upstream_number < anchor.block_number {
+                error!(
+                    local_anchor = anchor.block_number,
+                    local_anchor_hash = %anchor.block_hash,
+                    local_tip = tip.block_number,
+                    local_tip_hash = %tip.block_hash,
+                    upstream_last_validated = upstream_number,
+                    upstream_last_validated_hash = %upstream_hash,
+                    "validation gap: upstream last_validated is below the local anchor; restart with an earlier --start-block"
+                );
+                return false;
+            }
+
             warn!(
                 accepted = response.accepted,
                 local_anchor = anchor.block_number,
@@ -267,138 +287,6 @@ async fn report_range_once(
                 upstream_last_validated = upstream_number,
                 upstream_last_validated_hash = %upstream_hash,
                 "Report rejected"
-            );
-
-            if upstream_number < anchor.block_number {
-                warn!(
-                    local_anchor = anchor.block_number,
-                    local_anchor_hash = %anchor.block_hash,
-                    local_tip = tip.block_number,
-                    local_tip_hash = %tip.block_hash,
-                    upstream_last_validated = upstream_number,
-                    upstream_last_validated_hash = %upstream_hash,
-                    "validation gap detected; checking whether local chain can cover upstream last_validated"
-                );
-
-                return retry_report_from_upstream_pointer(
-                    client,
-                    validator_db,
-                    last_reported_block,
-                    &tip,
-                    upstream_number,
-                    upstream_hash,
-                )
-                .await;
-            }
-
-            false
-        }
-        Err(e) => {
-            error!(error = %e, "Failed to report blocks");
-            false
-        }
-    }
-}
-
-/// Tries to heal a rejected anchor→tip report by covering the receiver's current pointer.
-///
-/// `mega_setValidatedBlocks` accepts a range that covers the receiver's current validated block.
-/// If the receiver is behind our current anchor but its pointer is still retained in the local
-/// canonical-chain window, report that retained pointer as `first_block` so the receiver can
-/// catch up without waiting for a process restart. If the pointer is absent or has a different
-/// hash, keep the gap unresolved: this standalone validator must not claim to cover pre-anchor
-/// heights it did not execute.
-async fn retry_report_from_upstream_pointer(
-    client: &RpcClient,
-    validator_db: &ValidatorDB,
-    last_reported_block: &AtomicU64,
-    tip: &BlockMeta,
-    upstream_number: u64,
-    upstream_hash: B256,
-) -> bool {
-    match validator_db.get_block_hash(upstream_number) {
-        Ok(Some(local_hash))
-            if local_hash == alloy_primitives::BlockHash::from(upstream_hash.0) =>
-        {
-            warn!(
-                upstream_last_validated = upstream_number,
-                upstream_last_validated_hash = %upstream_hash,
-                local_tip = tip.block_number,
-                local_tip_hash = %tip.block_hash,
-                "validation gap can be covered by local chain; retrying report from upstream last_validated"
-            );
-            retry_covering_report(client, last_reported_block, tip, upstream_number, upstream_hash)
-                .await
-        }
-        Ok(Some(local_hash)) => {
-            error!(
-                upstream_last_validated = upstream_number,
-                upstream_last_validated_hash = %upstream_hash,
-                local_hash = %local_hash,
-                local_tip = tip.block_number,
-                local_tip_hash = %tip.block_hash,
-                "validation gap cannot be covered: upstream last_validated hash mismatches local canonical chain"
-            );
-            false
-        }
-        Ok(None) => {
-            error!(
-                upstream_last_validated = upstream_number,
-                upstream_last_validated_hash = %upstream_hash,
-                local_tip = tip.block_number,
-                local_tip_hash = %tip.block_hash,
-                local_hash = "missing",
-                "validation gap cannot be covered: upstream last_validated block is not retained locally"
-            );
-            false
-        }
-        Err(e) => {
-            warn!(
-                error = %e,
-                upstream_last_validated = upstream_number,
-                upstream_last_validated_hash = %upstream_hash,
-                "Failed to read upstream last_validated hash from local chain, retrying"
-            );
-            false
-        }
-    }
-}
-
-async fn retry_covering_report(
-    client: &RpcClient,
-    last_reported_block: &AtomicU64,
-    tip: &BlockMeta,
-    upstream_number: u64,
-    upstream_hash: B256,
-) -> bool {
-    match client
-        .set_validated_blocks(
-            (upstream_number, upstream_hash),
-            (tip.block_number, B256::from(tip.block_hash.0)),
-        )
-        .await
-    {
-        Ok(response) if response.accepted => {
-            debug!(
-                start = upstream_number,
-                start_hash = %upstream_hash,
-                tip = tip.block_number,
-                tip_hash = %tip.block_hash,
-                "Reported blocks after validation gap resync"
-            );
-            last_reported_block.store(tip.block_number, Ordering::Relaxed);
-            true
-        }
-        Ok(response) => {
-            warn!(
-                accepted = response.accepted,
-                upstream_last_validated = response.last_validated_block.0.to::<u64>(),
-                upstream_last_validated_hash = %response.last_validated_block.1,
-                attempted_start = upstream_number,
-                attempted_start_hash = %upstream_hash,
-                local_tip = tip.block_number,
-                local_tip_hash = %tip.block_hash,
-                "Validation gap resync report was rejected"
             );
             false
         }
@@ -413,66 +301,15 @@ async fn retry_covering_report(
 mod tests {
     use std::{
         collections::VecDeque,
-        future::Future,
-        io,
         sync::{Arc, Mutex, atomic::AtomicU64},
     };
 
     use jsonrpsee_types::ErrorObjectOwned;
     use stateless_common::RpcClientConfig;
-    use stateless_core::ChainStore;
     use stateless_test_utils::mock_rpc::serve;
-    use tracing::Level;
-    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
     use crate::test_support::make_block_meta;
-
-    #[derive(Clone)]
-    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
-
-    impl CapturedLogs {
-        fn new() -> Self {
-            Self(Arc::default())
-        }
-
-        fn contents(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
-    }
-
-    impl<'a> MakeWriter<'a> for CapturedLogs {
-        type Writer = CapturedLogWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            CapturedLogWriter(Arc::clone(&self.0))
-        }
-    }
-
-    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for CapturedLogWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    async fn with_log_capture<T>(future: impl Future<Output = T>) -> (T, String) {
-        let logs = CapturedLogs::new();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(logs.clone())
-            .with_ansi(false)
-            .with_max_level(Level::WARN)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let output = future.await;
-        (output, logs.contents())
-    }
 
     #[derive(Clone)]
     struct ReportResponse {
@@ -590,7 +427,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn rejected_gap_missing_local_hash_does_not_push_covering_range_and_is_not_fatal() {
+    async fn rejected_gap_below_anchor_does_not_push_covering_range_and_is_not_fatal() {
         let upstream_hash = B256::from([99u8; 32]);
         let (_dir, db) = setup_report_db();
         let (client, state, handle) =
@@ -601,27 +438,8 @@ mod tests {
         assert_eq!(last_reported.load(Ordering::Relaxed), 0);
 
         let calls = state.calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 1, "must not report a range from a missing local hash");
+        assert_eq!(calls.len(), 1, "must not report a covering range below the local anchor");
         assert_eq!(calls[0].0.0, 70);
-        handle.stop().unwrap();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn rejected_gap_logs_uncovered_validation_gap() {
-        let upstream_hash = B256::from([99u8; 32]);
-        let (_dir, db) = setup_report_db();
-        let (client, _state, handle) =
-            setup_report_client(vec![rejected_at(15, upstream_hash)]).await;
-
-        let (settled, captured) =
-            with_log_capture(report_range_once(&client, &db, &AtomicU64::new(0))).await;
-        assert!(!settled);
-        assert!(
-            captured.contains(
-                "validation gap cannot be covered: upstream last_validated block is not retained locally"
-            ),
-            "gap path must emit the uncovered-gap log, got: {captured}"
-        );
         handle.stop().unwrap();
     }
 }
