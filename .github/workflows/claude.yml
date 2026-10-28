@@ -90,6 +90,9 @@ jobs:
           private-key: ${{ secrets.MEGA_MAXWELL_PK }}
           owner: megaeth-labs
           repositories: stateless-validator
+          permission-contents: read
+          permission-pull-requests: write
+          permission-issues: write
 
       - uses: actions/checkout@v4
         with:

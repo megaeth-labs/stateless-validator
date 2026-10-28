@@ -2,8 +2,9 @@ name: On Release
 
 # Publish target for a stateless-validator release: the two binaries as
 # downloads on the GitHub Release page, with a SHA256SUMS file. Runs when the
-# release pipeline publishes the Release (release-settle creates it right
-# after the tag), and on demand for a rehearsal on a tag ref:
+# release pipeline publishes the Release (release-settle's publish job creates
+# it right after the tag, as the release app mega-gutenberg), and on demand for
+# a rehearsal on a tag ref:
 #   gh workflow run on-release.yml --ref vX.Y.Z -f dry_run=true
 # The tag being released is always the run's own ref; there is no tag input.
 #
@@ -11,9 +12,9 @@ name: On Release
 # workflow from the tagged commit's tree, not from the default branch, and the
 # tag sits on the release branch. A branch cut from a default branch that has
 # this file carries it; a branch cut before it landed needs it cherry-picked
-# (via its own PR — the `release-*` ruleset requires one) before release-settle
-# is dispatched, or the Release publishes with nothing attached and no failed
-# run; release-settle warns when the tip lacks a workflow main has.
+# (via its own PR — the `release-*` ruleset requires one) before the settle PR
+# is merged, or the Release publishes with nothing attached and no failed run;
+# release-settle warns when the settled commit lacks a workflow main has.
 # A rehearsal likewise only works on a tag whose tree has this file.
 #
 # Targets, fed by one build so the Release page and the registry carry the
