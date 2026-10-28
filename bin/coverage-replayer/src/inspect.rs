@@ -180,7 +180,7 @@ fn write_pool(
     for n in &blocks {
         out.push_str(&format!("{n}\n"));
     }
-    crate::spool::write_atomic(path, out.as_bytes())?;
+    stateless_common::atomic_write::write_atomic(path, out.as_bytes())?;
     Ok(blocks.len())
 }
 
@@ -216,7 +216,7 @@ mod tests {
         let written = write_pool(&path, &patterns, &outcome.antichain, "megaevm:test:fx0").unwrap();
 
         // Read back through the reader `backfill --blocks-file` uses: the format contract.
-        let blocks = crate::backfill::read_blocks_file(&path).unwrap();
+        let blocks = stateless_common::block_list::read_block_list(&path).unwrap();
         assert_eq!(blocks, vec![10, 20, 30]);
         assert_eq!(written, 3);
         assert!(
@@ -269,7 +269,7 @@ mod tests {
             let data_dir = dirs.root.clone();
             run(InspectArgs { data_dir, top: 3, dump_pool: Some(pool.clone()), no_cover_preview })
                 .unwrap();
-            let blocks = crate::backfill::read_blocks_file(&pool).unwrap();
+            let blocks = stateless_common::block_list::read_block_list(&pool).unwrap();
             assert_eq!(blocks, vec![10, 30], "block 20's pattern is dominated by block 10's");
         }
     }

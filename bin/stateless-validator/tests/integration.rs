@@ -19,7 +19,7 @@ use jsonrpsee::server::ServerConfigBuilder;
 use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned};
 use stateless_common::{
     BackoffPolicy, R2WitnessTransport, RpcClient, RpcClientConfig, WitnessRequestKeys,
-    encode_witness_payload, encode_witness_response,
+    block_list::parse_block_list, encode_witness_payload, encode_witness_response,
 };
 use stateless_core::{
     BisectResolver, ChainStore, ContractStore, PipelineConfig,
@@ -36,7 +36,9 @@ use stateless_test_utils::{
 };
 use stateless_validator::{
     CommandLineArgs, R2WitnessClient, VALIDATOR_DB_FILENAME, ValidatorDB, ValidatorFetcher,
-    ValidatorHooks, ValidatorProcessor, load_or_create_chain_spec, run_with_signals,
+    ValidatorHooks, ValidatorProcessor, load_or_create_chain_spec,
+    replay::{self, BlockOutcome, ReplayConfig, Status},
+    run_with_signals,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -276,6 +278,69 @@ fn canonical_chain_max_length_rejects_zero() {
     assert!(from_env_zero.is_err(), "env-var 0 must also be rejected");
 }
 
+/// `--block-list` replays sparse heights on its own: it excludes every flag that describes a
+/// contiguous, chain-following run or reports upstream, needs the genesis named explicitly, and
+/// its tuning flags are rejected without it rather than inherited and ignored.
+#[test]
+fn block_list_flag_combinations() {
+    // The conflict rules read the environment too: hold the lock so a test that has
+    // `STATELESS_VALIDATOR_END_BLOCK` (or another conflicting variable) set cannot leak into
+    // these parses.
+    let _env = stateless_test_utils::env::env_lock();
+    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
+    let with_list = ["--block-list", "/tmp/pool.txt", "--genesis-file", "/tmp/genesis.json"];
+
+    let args = parse(&with_list).unwrap();
+    assert_eq!(args.block_list.as_deref(), Some(std::path::Path::new("/tmp/pool.txt")));
+    assert_eq!(parse(&[]).unwrap().block_list, None);
+
+    let tuned = parse(
+        &[
+            &with_list[..],
+            &[
+                "--block-list-timeout-secs",
+                "9",
+                "--block-list-concurrency",
+                "3",
+                "--block-list-output-dir",
+                "/tmp/out",
+            ],
+        ]
+        .concat(),
+    )
+    .unwrap();
+    assert_eq!(tuned.block_list_timeout_secs, 9);
+    // Unset, the timeout is the documented 300 s. That default does not count as setting the
+    // flag, or `parse(&[])` above would have failed its `requires`.
+    assert_eq!(parse(&with_list).unwrap().block_list_timeout_secs, 300);
+    assert_eq!(tuned.block_list_concurrency, Some(3));
+
+    // A stale genesis in the data dir must not be picked up silently.
+    assert!(parse(&["--block-list", "/tmp/pool.txt"]).is_err(), "genesis file is required");
+    // Chain-following and reporting flags cannot be combined with a sparse replay.
+    for conflicting in [
+        &["--start-block", "0x01"][..],
+        &["--end-block", "10"][..],
+        &["--report-validation-endpoint", "http://report"][..],
+    ] {
+        let argv = [&with_list[..], conflicting].concat();
+        assert!(parse(&argv).is_err(), "{conflicting:?} must conflict with --block-list");
+    }
+    // Zero would time every block out on its first poll, or never start one.
+    for zero in [&["--block-list-timeout-secs", "0"][..], &["--block-list-concurrency", "0"][..]] {
+        let argv = [&with_list[..], zero].concat();
+        assert!(parse(&argv).is_err(), "{zero:?} must be rejected");
+    }
+    // Tuning flags mean nothing without a list.
+    for orphan in [
+        &["--block-list-timeout-secs", "9"][..],
+        &["--block-list-concurrency", "3"][..],
+        &["--block-list-output-dir", "/tmp/out"][..],
+    ] {
+        assert!(parse(orphan).is_err(), "{orphan:?} must require --block-list");
+    }
+}
+
 const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
 
 /// Mock RPC server backing state: all fields pre-decoded so the RPC handlers can respond
@@ -290,6 +355,9 @@ struct MockServerState {
     /// Every `mega_getBlockWitness` call, so a test can tell whether the RPC witness path was
     /// used at all.
     witness_requests: Arc<AtomicUsize>,
+    /// Requested block number → the number whose block is served instead, to script an
+    /// endpoint that answers a by-number lookup with the wrong block.
+    number_aliases: HashMap<u64, u64>,
 }
 
 impl MockServerState {
@@ -305,6 +373,7 @@ impl MockServerState {
             validated_reports: Arc::default(),
             reject_reports: Arc::default(),
             witness_requests: Arc::default(),
+            number_aliases: HashMap::new(),
         }
     }
 
@@ -314,7 +383,8 @@ impl MockServerState {
         &self,
         hex_number: &str,
     ) -> Result<&Block<op_alloy_rpc_types::Transaction>, ErrorObject<'static>> {
-        let block_number = parse_hex_u64(hex_number);
+        let requested = parse_hex_u64(hex_number);
+        let block_number = self.number_aliases.get(&requested).copied().unwrap_or(requested);
         self.fixtures
             .block_numbers
             .get(&block_number)
@@ -697,4 +767,174 @@ async fn end_block_run_fails_when_final_report_never_lands() {
     let err = result.expect_err("run must fail when the validated tail cannot be reported");
     assert!(err.to_string().contains("final validation report failed"), "{err}");
     assert!(reports.is_empty(), "mock rejected every report, yet some landed: {reports:?}");
+}
+
+/// A validator-shaped fetcher and processor over `url`, with their DB in `dir`. The DB has no
+/// anchor: block-list mode never needs one.
+fn block_list_parts(
+    dir: &std::path::Path,
+    url: &str,
+) -> (Arc<ValidatorFetcher>, Arc<ValidatorProcessor>) {
+    let genesis_file = TestFixtures::synthetic_shared().data_dir.join("genesis.json");
+    let validator_db = Arc::new(ValidatorDB::new(dir.join(VALIDATOR_DB_FILENAME)).unwrap());
+    let contract_cache =
+        Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
+    let chain_spec = Arc::new(
+        load_or_create_chain_spec(&validator_db, Some(genesis_file.to_str().unwrap())).unwrap(),
+    );
+    let client = Arc::new(RpcClient::new(&[url], &[url]).unwrap());
+    let fetcher = Arc::new(ValidatorFetcher::new(client.clone(), None));
+    let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
+    (fetcher, processor)
+}
+
+/// Replays `blocks` over the mock RPC, returning the outcomes in completion order and the
+/// summary. One block validates at a time whatever `concurrency` is, so a run with more blocks
+/// in flight than validate slots also exercises the wait for a slot.
+async fn replay_over_mock(
+    blocks: Vec<u64>,
+    block_timeout: Duration,
+    concurrency: usize,
+    number_aliases: HashMap<u64, u64>,
+) -> (Vec<BlockOutcome>, replay::ReplaySummary) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut state = MockServerState::new(TestFixtures::synthetic_shared());
+    state.number_aliases = number_aliases;
+    let (handle, url) = setup_mock_rpc_server(state).await;
+    let (fetcher, processor) = block_list_parts(temp_dir.path(), &url);
+
+    let config = ReplayConfig { concurrency, validate_concurrency: 1, block_timeout };
+    let mut outcomes = Vec::new();
+    let summary = replay::replay_block_list(fetcher, processor, blocks, &config, |outcome| {
+        outcomes.push(outcome.clone());
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    handle.stop().unwrap();
+    (outcomes, summary)
+}
+
+/// A sparse subset of the fixtures replays through the production fetch and validate path:
+/// every listed block is visited once, in any order, and nothing outside the list is touched.
+#[tokio::test]
+async fn block_list_replays_a_non_contiguous_subset() {
+    let fx = TestFixtures::synthetic_shared();
+    let every_other: Vec<u64> = fx.paired_blocks().into_iter().map(|(n, _)| n).step_by(2).collect();
+    assert!(every_other.len() >= 2, "the fixtures need at least three blocks to leave a gap");
+    let all: Vec<u64> = fx.paired_blocks().into_iter().map(|(n, _)| n).collect();
+    assert!(every_other.len() < all.len(), "the subset must skip some block");
+
+    let (outcomes, summary) =
+        replay_over_mock(every_other.clone(), Duration::from_secs(60), 4, HashMap::new()).await;
+
+    let mut seen: Vec<u64> = outcomes.iter().map(|o| o.number).collect();
+    seen.sort_unstable();
+    assert_eq!(seen, every_other, "exactly the listed blocks, each once");
+    for outcome in &outcomes {
+        assert_eq!(
+            outcome.status,
+            Status::Validated,
+            "block {} should validate: {:?}",
+            outcome.number,
+            outcome.message
+        );
+        assert_eq!(outcome.hash, Some(fx.block_numbers[&outcome.number]));
+    }
+    assert_eq!(
+        (summary.total, summary.validated(), summary.failed.len()),
+        (seen.len(), seen.len(), 0)
+    );
+}
+
+/// A block no endpoint can serve is retried forever by the RPC client; the per-block timeout is
+/// what ends it. It must be recorded as `fetch_timeout`, listed for retry, and not stop the run:
+/// with a single slot and the failing block first, the blocks behind it only run if a failure
+/// frees the slot and the run carries on.
+#[tokio::test]
+async fn an_unfetchable_block_times_out_without_stopping_the_run() {
+    let fx = TestFixtures::synthetic_shared();
+    let paired: Vec<u64> = fx.paired_blocks().into_iter().map(|(n, _)| n).collect();
+    let (first, last) = (paired[0], *paired.last().unwrap());
+    let missing = fx.max_block().0 + 1_000;
+
+    let (outcomes, summary) =
+        replay_over_mock(vec![missing, first, last], Duration::from_secs(2), 1, HashMap::new())
+            .await;
+
+    let status_of =
+        |n: u64| outcomes.iter().find(|o| o.number == n).map(|o| o.status).expect("outcome");
+    assert_eq!(status_of(first), Status::Validated);
+    assert_eq!(status_of(last), Status::Validated);
+    assert_eq!(status_of(missing), Status::FetchTimeout);
+    // A timeout says nothing about the block, so it is marked for retry; a pass never is.
+    for outcome in &outcomes {
+        assert_eq!(outcome.retryable, outcome.number == missing, "{outcome:?}");
+    }
+    assert_eq!((summary.total, summary.validated(), summary.failed.len()), (3, 2, 1));
+    assert_eq!(
+        parse_block_list(&summary.failed_list()).unwrap(),
+        vec![missing],
+        "the retry list names exactly the block that did not validate",
+    );
+}
+
+/// An endpoint that answers the lookup for one height with another height's block must not turn
+/// into a pass for the height that was asked for. The RPC client refuses such a header and keeps
+/// retrying, so the block ends as `fetch_timeout`; the block served in its place is never
+/// validated on its behalf.
+#[tokio::test]
+async fn a_block_served_for_the_wrong_height_is_not_counted_as_validated() {
+    let fx = TestFixtures::synthetic_shared();
+    let paired: Vec<u64> = fx.paired_blocks().into_iter().map(|(n, _)| n).collect();
+    let (asked, served) = (paired[0], *paired.last().unwrap());
+    assert_ne!(asked, served);
+
+    let (outcomes, summary) =
+        replay_over_mock(vec![asked], Duration::from_secs(2), 1, HashMap::from([(asked, served)]))
+            .await;
+
+    let [outcome] = outcomes.as_slice() else { panic!("one outcome expected: {outcomes:?}") };
+    assert_eq!(outcome.status, Status::FetchTimeout, "{outcome:?}");
+    assert_eq!(outcome.hash, None, "no block was accepted for the height");
+    assert_eq!((summary.validated(), summary.failed.len()), (0, 1));
+}
+
+/// The chain-head read before the first block retries forever like every RPC call, so it is
+/// bounded by the per-block timeout: an unreachable endpoint fails the run instead of hanging it.
+/// That failure, like any interruption, must not leave the previous run's retry list beside this
+/// run's results, where it would be passed back as `--block-list` in place of this run's.
+#[tokio::test]
+async fn an_unreachable_head_fails_the_run_without_a_stale_retry_list() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dir = temp_dir.path();
+    // Nothing listens on port 1, so every attempt is refused and retried.
+    let (fetcher, processor) = block_list_parts(dir, "http://127.0.0.1:1");
+
+    let list = dir.join("list.txt");
+    let results = dir.join(replay::RESULTS_FILE);
+    let failed = dir.join(replay::RETRY_FILE);
+    std::fs::write(&list, "1\n2\n").unwrap();
+    // What a previous run left behind.
+    std::fs::write(&results, "{\"block\":5}\n").unwrap();
+    std::fs::write(&failed, "5\n9\n").unwrap();
+
+    let config = ReplayConfig {
+        concurrency: 2,
+        validate_concurrency: 1,
+        block_timeout: Duration::from_secs(1),
+    };
+    let err = tokio::time::timeout(
+        Duration::from_secs(30),
+        replay::run(&list, dir, fetcher, processor, &config),
+    )
+    .await
+    .expect("the head read must be bounded")
+    .unwrap_err();
+
+    assert!(format!("{err:#}").contains("chain head"), "{err:#}");
+    assert_eq!(std::fs::read_to_string(&results).unwrap(), "", "results are truncated");
+    let retry = std::fs::read_to_string(&failed).unwrap();
+    assert!(parse_block_list(&retry).unwrap().is_empty(), "stale retry list left: {retry:?}");
 }

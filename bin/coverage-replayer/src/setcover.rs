@@ -125,7 +125,10 @@ pub fn run(args: SetCoverArgs) -> Result<()> {
     };
 
     let out = args.manifest_out.unwrap_or_else(|| dirs.manifest_path());
-    crate::spool::write_atomic(&out, serde_json::to_string_pretty(&manifest)?.as_bytes())?;
+    stateless_common::atomic_write::write_atomic(
+        &out,
+        serde_json::to_string_pretty(&manifest)?.as_bytes(),
+    )?;
     info!(
         selected = manifest.blocks.len(),
         covered = universe_counters,

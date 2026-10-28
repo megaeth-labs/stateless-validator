@@ -1,3 +1,5 @@
+pub mod atomic_write;
+pub mod block_list;
 pub mod logging;
 pub mod metrics;
 pub use metrics::{RpcMethod, RpcMetrics};
@@ -35,3 +37,6 @@ pub use witness_size::WitnessSizeBreakdown;
 
 /// Default port for Prometheus metrics HTTP endpoint.
 pub const DEFAULT_METRICS_PORT: u16 = 9090;
+
+#[cfg(test)]
+mod test_support;

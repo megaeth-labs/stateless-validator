@@ -15,7 +15,13 @@ use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::Block
 use stateless_db::ContractCache;
 use tracing::{info, warn};
 
-use crate::{metrics, r2_witness::R2WitnessClient, runner, validator_db::ValidatorDB};
+use crate::{
+    chain_sync::{ValidatorFetcher, ValidatorProcessor},
+    metrics,
+    r2_witness::R2WitnessClient,
+    replay, runner,
+    validator_db::ValidatorDB,
+};
 
 /// Database filename for the validator.
 pub const VALIDATOR_DB_FILENAME: &str = "validator.redb";
@@ -170,6 +176,53 @@ pub struct CommandLineArgs {
     /// Required on first run, optional on subsequent runs (loads from database).
     #[clap(long, env = "STATELESS_VALIDATOR_GENESIS_FILE")]
     pub genesis_file: Option<String>,
+
+    /// Replay exactly the block numbers in this file (one per line; blank lines and lines
+    /// starting with `#` are skipped, so a candidate-pool file works as is), then exit.
+    /// Each block is fetched and validated on its own: the canonical chain is never touched,
+    /// nothing is reported upstream, and the witness pre-state is not checked against the
+    /// parent block. A block that does not validate is recorded and the run goes on; the exit
+    /// status is non-zero if any did. Use a fresh `--data-dir`.
+    /// Needs `--genesis-file`, which then always overrides any genesis stored in the data dir,
+    /// so a stale one cannot silently validate blocks past a hardfork it does not know.
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_BLOCK_LIST",
+        conflicts_with_all = ["start_block", "end_block", "report_validation_endpoint"],
+        requires = "genesis_file",
+    )]
+    pub block_list: Option<PathBuf>,
+
+    /// With `--block-list`: seconds allowed for fetching one block and its witness, and
+    /// separately for validating it, before the block is recorded as timed out (default 300).
+    /// The RPC client retries transport errors forever, so this is what lets a run end when an
+    /// endpoint cannot serve a block; the one chain-head read before the first block is bounded
+    /// by it too. At least 1: zero would time every block out on its first poll.
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_BLOCK_LIST_TIMEOUT_SECS",
+        requires = "block_list",
+        default_value_t = 300,
+        value_parser = clap::value_parser!(u64).range(1..),
+    )]
+    pub block_list_timeout_secs: u64,
+
+    /// With `--block-list`: how many blocks to have in flight, fetching or validating (default:
+    /// twice the physical cores, the validator pipeline's own in-flight window). At most one per
+    /// physical core validates at a time, the pipeline's worker count. At least 1.
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_BLOCK_LIST_CONCURRENCY",
+        requires = "block_list",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
+    )]
+    pub block_list_concurrency: Option<usize>,
+
+    /// With `--block-list`: directory for `results.jsonl` (one line per block, in completion
+    /// order) and `failed.txt` (the blocks that did not validate, in the input format, ready to
+    /// be passed back as `--block-list`). Both are overwritten. Default: `--data-dir`.
+    #[clap(long, env = "STATELESS_VALIDATOR_BLOCK_LIST_OUTPUT_DIR", requires = "block_list")]
+    pub block_list_output_dir: Option<PathBuf>,
 
     /// Endpoint for reporting validated blocks via mega_setValidatedBlocks RPC.
     /// If not provided, validation reporting is disabled.
@@ -339,6 +392,25 @@ pub async fn run() -> Result<()> {
     let chain_spec =
         Arc::new(load_or_create_chain_spec(&validator_db, args.genesis_file.as_deref())?);
     info!("Chain spec loaded successfully");
+
+    if let Some(list) = &args.block_list {
+        let pipeline_defaults = stateless_core::PipelineConfig::default();
+        let config = replay::ReplayConfig {
+            concurrency: args
+                .block_list_concurrency
+                .unwrap_or_else(|| pipeline_defaults.fetcher_max_in_flight()),
+            validate_concurrency: pipeline_defaults.concurrent_workers,
+            block_timeout: Duration::from_secs(args.block_list_timeout_secs),
+        };
+        let output_dir = args.block_list_output_dir.as_deref().unwrap_or(&work_dir);
+
+        let fetcher = Arc::new(ValidatorFetcher::new(client.clone(), r2_witness));
+        let processor =
+            Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client.clone() });
+        let outcome = replay::run(list, output_dir, fetcher, processor, &config).await;
+        info!(elapsed = ?start.elapsed(), "Block list replay finished");
+        return outcome;
+    }
 
     if let Some(start_block_str) = &args.start_block {
         info!(start_block = %start_block_str, "Initializing from start block");

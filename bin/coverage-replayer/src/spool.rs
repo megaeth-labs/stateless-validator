@@ -13,6 +13,7 @@ use alloy_rpc_types_eth::Block;
 use eyre::{Context, Result, ensure};
 use op_alloy_rpc_types::Transaction as OpTransaction;
 use serde::{Deserialize, Serialize};
+use stateless_common::atomic_write::{TEMP_SUFFIX, write_atomic, write_scratch};
 use stateless_core::LightWitness;
 
 /// Spool entries are short-lived and their witness is already compressed: favor speed.
@@ -125,7 +126,9 @@ impl DataDir {
     }
 
     /// Archives a new pattern's profdata durably; the judge commits the pattern only once this
-    /// has returned (see [`write_atomic`]).
+    /// has returned. The fsync in [`write_atomic`] is load-bearing for that order: redb commits
+    /// are fsynced, so an unsynced profile could be lost to a power cut while its pattern
+    /// persists, an orphan no re-run can repair.
     pub fn archive_profile(&self, pattern_key: u64, profdata: &Path) -> Result<()> {
         let bytes =
             fs::read(profdata).wrap_err_with(|| format!("read profile {}", profdata.display()))?;
@@ -146,7 +149,7 @@ impl DataDir {
     pub fn clear_leftovers(&self) -> usize {
         let mut removed = remove_files(&self.tmp(), |_| true);
         for dir in [self.spool(), self.codes(), self.archive_profiles()] {
-            removed += remove_files(&dir, |name| name.ends_with(".tmp"));
+            removed += remove_files(&dir, |name| name.ends_with(TEMP_SUFFIX));
         }
         removed
     }
@@ -170,56 +173,6 @@ impl DataDir {
     }
 }
 
-/// Writes via a unique tmp file, fsync and rename: readers never see a partial file, and
-/// concurrent writers of one target both succeed (last rename wins). The fsync is load-bearing
-/// for the judge's archive-before-commit order: redb commits are fsynced, so an unsynced profile
-/// could be lost to a power cut while its pattern persists, an orphan no re-run can repair.
-pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_renamed(path, bytes, true)
-}
-
-/// [`write_atomic`] without the fsyncs, for spool entries and contract codes: every run checks
-/// them before use (frame checksum and block number, keccak) and refetches damaged ones.
-pub fn write_scratch(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_renamed(path, bytes, false)
-}
-
-fn write_renamed(path: &Path, bytes: &[u8], durable: bool) -> Result<()> {
-    use std::{
-        io::Write as _,
-        sync::atomic::{AtomicU64, Ordering},
-    };
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let unique = format!(
-        "{}.{}.{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed),
-    );
-    let tmp = path.with_file_name(unique);
-    let result = (|| -> Result<()> {
-        let mut f = fs::File::create(&tmp).wrap_err_with(|| format!("create {}", tmp.display()))?;
-        f.write_all(bytes).wrap_err_with(|| format!("write {}", tmp.display()))?;
-        if durable {
-            f.sync_all().wrap_err_with(|| format!("fsync {}", tmp.display()))?;
-        }
-        drop(f);
-        fs::rename(&tmp, path).wrap_err_with(|| format!("rename to {}", path.display()))?;
-        // Make the rename durable too; best-effort, as directory fsync may fail off Linux.
-        if durable &&
-            let Some(parent) = path.parent() &&
-            let Ok(dir) = fs::File::open(parent)
-        {
-            let _ = dir.sync_all();
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
-}
-
 /// Removes the files directly in `dir` whose name `matches`; returns how many.
 fn remove_files(dir: &Path, matches: impl Fn(&str) -> bool) -> usize {
     let Ok(entries) = fs::read_dir(dir) else { return 0 };
@@ -235,14 +188,6 @@ mod tests {
     use stateless_test_utils::fixtures::TestFixtures;
 
     use super::*;
-
-    fn tmp_files(dir: &Path) -> usize {
-        fs::read_dir(dir)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
-            .count()
-    }
 
     fn entry(block_json: &[u8]) -> SpoolEntry {
         SpoolEntry {
@@ -284,25 +229,6 @@ mod tests {
         assert_eq!(SpoolEntry::open(&path, n).unwrap().0.header.inner.number, n);
         let err = SpoolEntry::open(&path, n + 1).err().expect("another block's entry");
         assert!(err.to_string().contains("expected"), "{err}");
-    }
-
-    #[test]
-    fn write_atomic_round_trips_and_leaves_no_tmp() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("out.bin");
-        write_atomic(&target, b"payload").unwrap();
-        assert_eq!(fs::read(&target).unwrap(), b"payload");
-        assert_eq!(tmp_files(dir.path()), 0, "no tmp litter after success");
-    }
-
-    #[test]
-    fn write_atomic_failure_removes_tmp() {
-        let dir = tempfile::tempdir().unwrap();
-        // A directory at the target path makes the final rename fail.
-        let target = dir.path().join("occupied");
-        fs::create_dir(&target).unwrap();
-        assert!(write_atomic(&target, b"x").is_err());
-        assert_eq!(tmp_files(dir.path()), 0, "failed write must clean its tmp file");
     }
 
     /// All of `tmp/` goes; elsewhere only orphaned write temps, never the data beside them.

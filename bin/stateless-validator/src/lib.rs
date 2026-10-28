@@ -7,6 +7,7 @@ pub(crate) mod app;
 pub(crate) mod chain_sync;
 pub(crate) mod metrics;
 pub(crate) mod r2_witness;
+pub mod replay;
 pub(crate) mod runner;
 pub(crate) mod validator_db;
 
