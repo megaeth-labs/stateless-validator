@@ -34,9 +34,8 @@ const FINAL_REPORT_RETRY_DELAY: Duration = Duration::from_secs(1);
 ///
 /// Cleanly drains on SIGINT/SIGTERM and returns either the pipeline result or `Ok(())`
 /// on signal. Exception: on a fixed-range run (`--end-block`), a final validation report
-/// that cannot land (or a detected validation gap) fails the run — a slice has no later
-/// restart to re-report, so exiting 0 would let an orchestrator record the slice as
-/// complete while upstream never saw the tip.
+/// that cannot land fails the run — a slice has no later restart to re-report, so exiting 0
+/// would let an orchestrator record the slice as complete while upstream never saw the tip.
 pub async fn run_with_signals(
     client: Arc<RpcClient>,
     r2_witness: Option<Arc<R2WitnessClient>>,
@@ -136,29 +135,19 @@ pub async fn run_with_signals(
     if report_validation {
         let mut flush_failure: Option<eyre::Report> = None;
         for attempt in 1..=FINAL_REPORT_ATTEMPTS {
-            match report_range_once(&client, &validator_db, &last_reported).await {
-                Ok(true) => break,
-                Ok(false) if attempt < FINAL_REPORT_ATTEMPTS => {
-                    warn!(attempt, "Final validation report failed, retrying");
-                    tokio::time::sleep(FINAL_REPORT_RETRY_DELAY).await;
-                }
-                Ok(false) => {
-                    error!(
-                        attempts = FINAL_REPORT_ATTEMPTS,
-                        "Final validation report failed; the validated tail may be unreported \
-                         upstream"
-                    );
-                    flush_failure = Some(eyre::eyre!(
-                        "final validation report failed after {FINAL_REPORT_ATTEMPTS} attempts; \
-                         the validated tail may be unreported upstream"
-                    ));
-                }
-                // A detected validation gap is deterministic — retrying cannot resolve it.
-                Err(e) => {
-                    error!(error = %e, "Final validation report failed with a non-retryable error");
-                    flush_failure = Some(e);
-                    break;
-                }
+            if report_range_once(&client, &validator_db, &last_reported).await {
+                break;
+            } else if attempt < FINAL_REPORT_ATTEMPTS {
+                warn!(attempt, "Final validation report failed, retrying");
+                tokio::time::sleep(FINAL_REPORT_RETRY_DELAY).await;
+            } else {
+                error!(
+                    attempts = FINAL_REPORT_ATTEMPTS,
+                    "Final validation report failed; the validated tail may be unreported upstream"
+                );
+                flush_failure = Some(eyre::eyre!(
+                    "final validation report failed after {FINAL_REPORT_ATTEMPTS} attempts; the validated tail may be unreported upstream"
+                ));
             }
         }
         // A chain-following run re-reports anchor→tip on its next start, so an unreported tail
@@ -213,7 +202,9 @@ async fn validation_reporter(
             }
         }
 
-        report_range_once(&client, &validator_db, &last_reported_block).await?;
+        if !report_range_once(&client, &validator_db, &last_reported_block).await {
+            warn!("Validation report was not accepted; will retry on next interval");
+        }
     }
 }
 
@@ -221,20 +212,21 @@ async fn validation_reporter(
 /// differs from `last_reported_block` (updated on an accepted report; a tip that regressed
 /// after a reorg rollback is deliberately re-reported).
 ///
-/// Returns `Ok(true)` when the round settled (report accepted, or nothing to report) and
-/// `Ok(false)` when the attempt failed in a way a retry could resolve (logged here). The only
-/// `Err` is a detected validation gap, which is fatal to the reporter.
+/// Returns `true` when the round settled (report accepted, or nothing to report) and `false`
+/// when the report did not land (the caller retries). A rejection whose upstream cursor is
+/// below the local anchor cannot be closed by that retry: `CANONICAL_CHAIN` never retains a
+/// height below the anchor, so the only remedy is restarting with an earlier `--start-block`.
 async fn report_range_once(
     client: &RpcClient,
     validator_db: &ValidatorDB,
     last_reported_block: &AtomicU64,
-) -> Result<bool> {
+) -> bool {
     let (anchor, tip) = match (validator_db.get_anchor(), validator_db.get_canonical_tip()) {
         (Ok(Some(a)), Ok(Some(t))) => (a, t),
-        (Ok(None), _) | (_, Ok(None)) => return Ok(true),
+        (Ok(None), _) | (_, Ok(None)) => return true,
         (Err(e), _) | (_, Err(e)) => {
             warn!(error = %e, "Failed to read anchor/tip, retrying");
-            return Ok(false);
+            return false;
         }
     };
 
@@ -242,7 +234,7 @@ async fn report_range_once(
     // the reporter is the only writer while it runs, and the final flush reads it only after
     // joining the reporter task.
     if tip.block_number == last_reported_block.load(Ordering::Relaxed) {
-        return Ok(true);
+        return true;
     }
 
     let result = client
@@ -262,25 +254,192 @@ async fn report_range_once(
                 "Reported blocks"
             );
             last_reported_block.store(tip.block_number, Ordering::Relaxed);
-            Ok(true)
+            true
         }
         Ok(response) => {
-            if response.last_validated_block.0 < anchor.block_number {
-                return Err(eyre::eyre!(
-                    "Validation gap detected: upstream at block {}, but local chain starts at {}",
-                    response.last_validated_block.0,
-                    anchor.block_number
-                ));
+            let upstream_number = response.last_validated_block.0.to::<u64>();
+            let upstream_hash = response.last_validated_block.1;
+
+            // The anchor is the first `CANONICAL_CHAIN` row (`reset_to_anchor` clears the table),
+            // `advance_chain` only appends above the tip, and rollback never deletes below the
+            // earliest retained row. A height below the anchor is therefore never local, and a
+            // covering report from the upstream pointer would claim blocks this process did not
+            // execute. Stay alive and say so; do not resubmit.
+            if upstream_number < anchor.block_number {
+                error!(
+                    local_anchor = anchor.block_number,
+                    local_anchor_hash = %anchor.block_hash,
+                    local_tip = tip.block_number,
+                    local_tip_hash = %tip.block_hash,
+                    upstream_last_validated = upstream_number,
+                    upstream_last_validated_hash = %upstream_hash,
+                    "validation gap: upstream last_validated is below the local anchor; restart with an earlier --start-block"
+                );
+                return false;
             }
-            error!(
-                upstream_block = ?response.last_validated_block,
+
+            warn!(
+                accepted = response.accepted,
+                local_anchor = anchor.block_number,
+                local_anchor_hash = %anchor.block_hash,
+                local_tip = tip.block_number,
+                local_tip_hash = %tip.block_hash,
+                upstream_last_validated = upstream_number,
+                upstream_last_validated_hash = %upstream_hash,
                 "Report rejected"
             );
-            Ok(false)
+            false
         }
         Err(e) => {
             error!(error = %e, "Failed to report blocks");
-            Ok(false)
+            false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex, atomic::AtomicU64},
+    };
+
+    use jsonrpsee_types::ErrorObjectOwned;
+    use stateless_common::RpcClientConfig;
+    use stateless_test_utils::mock_rpc::serve;
+
+    use super::*;
+    use crate::test_support::make_block_meta;
+
+    #[derive(Clone)]
+    struct ReportResponse {
+        accepted: bool,
+        last_validated_block: (u64, B256),
+    }
+
+    type ReportCall = ((u64, B256), (u64, B256));
+
+    #[derive(Default)]
+    struct ReportServerState {
+        responses: Mutex<VecDeque<ReportResponse>>,
+        calls: Mutex<Vec<ReportCall>>,
+    }
+
+    async fn setup_report_client(
+        responses: Vec<ReportResponse>,
+    ) -> (Arc<RpcClient>, Arc<ReportServerState>, jsonrpsee::server::ServerHandle) {
+        let state = Arc::new(ReportServerState {
+            responses: Mutex::new(responses.into()),
+            calls: Mutex::default(),
+        });
+        let (handle, url) = serve(Arc::clone(&state), |module| {
+            module
+                .register_method("mega_setValidatedBlocks", |params, ctx, _| {
+                    let (first, last): ((u64, B256), (u64, B256)) = params.parse().unwrap();
+                    ctx.calls.lock().unwrap().push((first, last));
+                    let response = ctx
+                        .responses
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("test must script every report response");
+                    Ok::<serde_json::Value, ErrorObjectOwned>(serde_json::json!({
+                        "accepted": response.accepted,
+                        "lastValidatedBlock": [
+                            response.last_validated_block.0,
+                            response.last_validated_block.1,
+                        ],
+                    }))
+                })
+                .unwrap();
+        })
+        .await;
+        let client = Arc::new(
+            RpcClient::new_with_config(
+                &[url.as_str()],
+                &[url.as_str()],
+                RpcClientConfig::validator(),
+                Some(url.as_str()),
+            )
+            .unwrap(),
+        );
+        (client, state, handle)
+    }
+
+    fn setup_report_db() -> (tempfile::TempDir, ValidatorDB) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ValidatorDB::new(dir.path().join("validator.redb")).unwrap();
+        db.reset_to_anchor(&make_block_meta(70)).unwrap();
+
+        let blocks: Vec<_> = (71..=80).map(make_block_meta).collect();
+        db.advance_chain(&blocks).unwrap();
+        (dir, db)
+    }
+
+    async fn wait_for_report_calls(state: &ReportServerState, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if state.calls.lock().unwrap().len() >= expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("timed out waiting for report calls");
+    }
+
+    fn rejected_at(number: u64, hash: B256) -> ReportResponse {
+        ReportResponse { accepted: false, last_validated_block: (number, hash) }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_gap_below_anchor_does_not_push_covering_range_and_reporter_stays_alive() {
+        let (_dir, db) = setup_report_db();
+        let tip = make_block_meta(80);
+        let upstream_hash = B256::ZERO;
+        let responses = vec![rejected_at(0, upstream_hash); 4];
+        let (client, state, handle) = setup_report_client(responses).await;
+        let shutdown = CancellationToken::new();
+        let last_reported = Arc::new(AtomicU64::new(0));
+        let reporter = tokio::spawn(validation_reporter(
+            client,
+            Arc::new(db),
+            Duration::from_millis(50),
+            shutdown.clone(),
+            Arc::clone(&last_reported),
+        ));
+
+        wait_for_report_calls(&state, 1).await;
+        assert_eq!(last_reported.load(Ordering::Relaxed), 0);
+        assert!(!reporter.is_finished(), "reporter must keep looping after a validation gap");
+        shutdown.cancel();
+        reporter.await.unwrap().unwrap();
+
+        let calls = state.calls.lock().unwrap().clone();
+        assert!(!calls.is_empty());
+        assert!(
+            calls.iter().all(|call| call.0.0 == 70 && call.1.0 == 80),
+            "must not report a covering range below the local anchor: {calls:?}"
+        );
+        assert_eq!(calls[0].1, (80, B256::from(tip.block_hash.0)));
+        handle.stop().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_gap_below_anchor_does_not_push_covering_range_and_is_not_fatal() {
+        let upstream_hash = B256::from([99u8; 32]);
+        let (_dir, db) = setup_report_db();
+        let (client, state, handle) =
+            setup_report_client(vec![rejected_at(15, upstream_hash)]).await;
+        let last_reported = AtomicU64::new(0);
+
+        assert!(!report_range_once(&client, &db, &last_reported).await);
+        assert_eq!(last_reported.load(Ordering::Relaxed), 0);
+
+        let calls = state.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "must not report a covering range below the local anchor");
+        assert_eq!(calls[0].0.0, 70);
+        handle.stop().unwrap();
     }
 }
