@@ -41,6 +41,7 @@ mod report;
 mod setcover;
 mod spool;
 mod store;
+mod witness;
 mod worker;
 
 use clap::{Parser, Subcommand};
@@ -57,7 +58,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Cmd {
     /// Replay blocks under coverage instrumentation and store what each covered.
-    Backfill(backfill::BackfillArgs),
+    Backfill(Box<backfill::BackfillArgs>),
     /// Compute the greedy covering block set from the pattern store.
     SetCover(setcover::SetCoverArgs),
     /// Print an llvm-cov report for the currently selected set.
@@ -83,7 +84,7 @@ fn main() -> Result<()> {
         Cmd::Backfill(args) => tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
-            .block_on(backfill::run(args)),
+            .block_on(backfill::run(*args)),
         Cmd::SetCover(args) => setcover::run(args),
         Cmd::Report(args) => report::run(args),
         Cmd::Inspect(args) => inspect::run(args),

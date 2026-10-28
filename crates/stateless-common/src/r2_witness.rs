@@ -1,12 +1,14 @@
-//! Shared core of the two binaries' direct-from-R2 witness adapters.
+//! Shared core of the direct-from-R2 witness adapters of the validator, the trace server and
+//! `coverage-replayer`.
 //!
-//! Both binaries read witness objects straight from the R2 bucket through
-//! [`R2ObjectFetcher`], try it before their RPC witness chain, and hand any failure to that
-//! chain on a small retry budget with no pause. They differ in how they read an object and how
-//! long it may take: the trace server light-decodes under the caller's request deadline, the
-//! validator full-decodes (proof verification needs the curve points) on a fixed per-block
-//! stage budget that stops at the GET. What lives here is identical by construction — the
-//! failure taxonomy with its metric labels, the band rules, and the transport wrapper.
+//! All three read witness objects straight from the R2 bucket through [`R2ObjectFetcher`], try
+//! it before their RPC witness chain, and hand any failure to that chain on a small retry budget
+//! with no pause. They differ in how they read an object and how long it may take: the trace
+//! server light-decodes under the caller's request deadline, the validator full-decodes (proof
+//! verification needs the curve points) on a fixed per-block stage budget that stops at the GET,
+//! and `coverage-replayer` light-decodes on a per-block budget of its own (`--r2-timeout-ms`).
+//! What lives here is identical by construction — the failure taxonomy with its metric labels,
+//! the band rules, and the transport wrapper.
 
 use std::{sync::Arc, time::Instant};
 
@@ -70,7 +72,7 @@ pub fn r2_band(tip: u64, block_number: u64) -> R2Band {
     }
 }
 
-/// Failure outcome of an R2 witness fetch, shared by both binaries' adapters.
+/// Failure outcome of an R2 witness fetch, shared by every reader's adapter.
 ///
 /// A binary whose decode runs without a deadline never produces [`Self::DecodeTimeout`]; its
 /// pre-registered series for that kind stays at zero.
@@ -189,8 +191,15 @@ pub trait R2Metrics: Send + Sync {
     fn on_negotiated_version(&self, version: &'static str);
 }
 
-/// The shared transport of the two R2 witness adapters: an [`R2ObjectFetcher`] plus the
-/// construction and target accessors both binaries would otherwise duplicate verbatim.
+/// No metrics, for a reader that exports none.
+impl R2Metrics for () {
+    fn on_target(&self, _: &'static str) {}
+    fn on_connections(&self, _: usize) {}
+    fn on_negotiated_version(&self, _: &'static str) {}
+}
+
+/// The shared transport of the R2 witness adapters: an [`R2ObjectFetcher`] plus the
+/// construction and target accessors each binary would otherwise duplicate verbatim.
 /// The fetcher's `Debug` redacts the credentials.
 #[derive(Debug)]
 pub struct R2WitnessTransport {
@@ -350,7 +359,7 @@ mod tests {
         BackoffPolicy::new(Duration::from_millis(5), Duration::from_millis(20))
     }
 
-    /// The band edge is one rule for both readers, so neither can drift on it: exclusive at
+    /// The band edge is one rule for every reader, so none can drift on it: exclusive at
     /// the deep end (a block exactly the window below the tip must alarm), and everything at
     /// or above the tip — including a tip of `0`, meaning none learned yet — is frontier,
     /// because nothing there is known to be uploaded.
@@ -399,7 +408,7 @@ mod tests {
     }
 
     /// Construction errors from the underlying fetcher must surface through the eyre
-    /// conversion, on both targets — one copy here covers both binaries' adapters.
+    /// conversion, on both targets — one copy here covers every adapter.
     #[test]
     fn construction_rejects_a_target_carrying_a_path() {
         let s3 = R2WitnessTransport::new(
