@@ -301,3 +301,6 @@ When implementing a new feature or bug fix, consider these additional aspects:
   When making changes, check whether related documentation (README, this file) needs updating.
 - **One sentence, one line.**
   When writing Markdown files, put each sentence on a separate line.
+- **Every crate carries the license texts.**
+  The workspace is `MIT OR Apache-2.0`, and each crate directory holds symlinks to the root `LICENSE-APACHE` and `LICENSE-MIT`, which `cargo package` and `cargo vendor` resolve into the full texts (Cargo packages only the crate directory).
+  A new workspace crate needs both symlinks (`ln -s ../../LICENSE-APACHE ../../LICENSE-MIT <crate-dir>/`) and `license.workspace = true`.
