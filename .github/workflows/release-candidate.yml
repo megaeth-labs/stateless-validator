@@ -13,7 +13,7 @@ name: Release Candidate
 # `route` never selects `cut` for it.
 #
 # Every write is made by the release GitHub App (mega-gutenberg), which reads
-# MEGA_GUTENBERG_CLIENT_ID and MEGA_GUTENBERG_PK from repository scope, so no
+# MEGA_GUTENBERG_CLIENT_ID and MEGA_GUTENBERG_PK from organization scope, so no
 # job here declares an environment. The decision to release is made by merging
 # the candidate PR, not by a click on the run. `route` is read-only and uses
 # the job token.

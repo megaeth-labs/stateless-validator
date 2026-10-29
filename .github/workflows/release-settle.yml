@@ -15,7 +15,7 @@ name: Release Settle
 # eligible release branch.
 #
 # Every write is made by the release GitHub App (mega-gutenberg), which reads
-# MEGA_GUTENBERG_CLIENT_ID and MEGA_GUTENBERG_PK from repository scope, so
+# MEGA_GUTENBERG_CLIENT_ID and MEGA_GUTENBERG_PK from organization scope, so
 # the PR-creating jobs declare no environment. Only the publish job waits on
 # the `release` environment, whose required reviewers authorise the tag and the
 # GitHub Release. The app is a bypass actor on the `v*` tag ruleset only; the
