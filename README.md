@@ -497,4 +497,6 @@ Licensed under either of
 
 at your option.
 
+Every crate directory carries copies of both license texts, so a packaged or vendored crate keeps them.
+
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
