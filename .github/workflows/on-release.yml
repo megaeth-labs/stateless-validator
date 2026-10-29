@@ -27,9 +27,9 @@ name: On Release
 #              version is the commit SHA and the file sits under
 #              release/vX.Y.Z/ — <binary>/<sha>/release/vX.Y.Z/<binary>.
 #
-# GCP_AUTH_KEY lives in the `publish` environment, whose deployment policy
-# allows only v* tag refs: a job can read it only when the run's ref is a
-# release tag, never from a branch build.
+# GCP_AUTH_KEY lives in the `release` environment, which admits main,
+# release-v* branches and v* tags with required reviewer approval.
+# The registry job reads it when publishing artifacts for a release tag.
 
 on:
   release:
