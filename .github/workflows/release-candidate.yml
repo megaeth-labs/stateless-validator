@@ -2,14 +2,27 @@ name: Release Candidate
 
 # Trunk-first release start. Dispatch with a version: the shared action bumps
 # the version file on the default branch, drafts the changelog entry, and
-# opens a candidate PR. When that
-# PR merges, the `cut` job creates `release-vX.Y.Z` at the merge commit. No
-# tag is created here — see release-settle / release-publish.
+# opens a candidate PR. When that PR merges, the push to the default branch
+# starts this workflow again: `route` recognises the merged candidate PR and
+# `cut` creates `release-vX.Y.Z` at the merge commit. No tag is created here;
+# see release-settle.
 #
 # To release a commit that is not the tip of the default branch, dispatch with
 # `base_commit` as well: `propose` creates `release-vX.Y.Z` at that commit and
 # aims the candidate PR at it, so that PR never touches the default branch and
-# the `cut` job below does not run.
+# `route` never selects `cut` for it.
+#
+# Every write is made by the release GitHub App (mega-gutenberg), which reads
+# MEGA_GUTENBERG_CLIENT_ID and MEGA_GUTENBERG_PK from repository scope, so no
+# job here declares an environment. The decision to release is made by merging
+# the candidate PR, not by a click on the run. `route` is read-only and uses
+# the job token.
+#
+# The candidate PR carries no `compat:` label: the compatibility level is a
+# per-release judgement, so the reviewer adds it, and the required
+# Compatibility Label Check re-runs on `labeled`.
+#
+# Guide: https://github.com/megaeth-labs/.github/blob/main/.github/actions/RELEASE.md
 
 on:
   workflow_dispatch:
@@ -23,8 +36,7 @@ on:
         required: false
         type: string
         default: ""
-  pull_request:
-    types: [closed]
+  push:
     branches: [main]
 
 permissions:
@@ -34,9 +46,9 @@ jobs:
   propose:
     if: github.event_name == 'workflow_dispatch'
     # One proposal at a time: two dispatches would race on the candidate
-    # branch. Job-level, not workflow-level: every PR closing on the default
-    # branch also starts this workflow, and a workflow-wide group would let
-    # that noise evict a queued release run (one pending run per group).
+    # branch. Job-level, not workflow-level: every push to the default branch
+    # also starts this workflow, and a workflow-wide group would let that
+    # noise evict a queued release run (one pending run per group).
     # A skipped job holds no slot in a job-level group.
     concurrency:
       group: ${{ github.workflow }}-propose
@@ -44,16 +56,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
-        id: app-token
+        id: release-token
         with:
-          client-id: ${{ vars.MEGA_MAXWELL_CLIENT_ID }}
-          private-key: ${{ secrets.MEGA_MAXWELL_PK }}
+          client-id: ${{ vars.MEGA_GUTENBERG_CLIENT_ID }}
+          private-key: ${{ secrets.MEGA_GUTENBERG_PK }}
+          owner: megaeth-labs
+          repositories: stateless-validator
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
           persist-credentials: false
 
+      # For `bump_command`; picks up rust-toolchain.toml.
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           cache: false
@@ -61,7 +79,7 @@ jobs:
       - uses: megaeth-labs/.github/.github/actions/release-candidate@main
         with:
           stage: propose
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.release-token.outputs.token }}
           version: ${{ inputs.version }}
           base_commit: ${{ inputs.base_commit }}
           version_file: Cargo.toml
@@ -69,14 +87,40 @@ jobs:
           changelog_file: CHANGELOG.md
           # Cargo.lock carries the workspace crate versions too.
           bump_command: cargo update --workspace
+          # Every megaeth-labs git dependency (algebra, salt, mega-evm) is public,
+          # so the read-only job token resolves them.
+          dependency_token: ${{ github.token }}
+
+  # Read-only: decides from the pushed commit whether it is a merged candidate
+  # PR that targeted the default branch. One proposed with `base_commit` merges
+  # into the release branch propose already cut, and routes to nothing here.
+  route:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      action: ${{ steps.route.outputs.action }}
+      commit: ${{ steps.route.outputs.commit }}
+      pr_number: ${{ steps.route.outputs.pr_number }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: route
+        uses: megaeth-labs/.github/.github/actions/release-route@main
+        with:
+          kind: candidate
+          version_file: Cargo.toml
+          version_pattern: toml
 
   cut:
-    if: >-
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.merged == true &&
-      startsWith(github.event.pull_request.head.ref, 'chore/release-candidate-') &&
-      github.event.pull_request.user.login == 'mega-maxwell[bot]'
-    # One cut at a time, never cancelled: pull_request.closed does not refire.
+    needs: route
+    if: needs.route.outputs.action == 'cut'
+    # One cut at a time, never cancelled: a push does not refire.
     # Job-level for the reason given on `propose`.
     concurrency:
       group: ${{ github.workflow }}-cut
@@ -84,10 +128,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
-        id: app-token
+        id: release-token
         with:
-          client-id: ${{ vars.MEGA_MAXWELL_CLIENT_ID }}
-          private-key: ${{ secrets.MEGA_MAXWELL_PK }}
+          client-id: ${{ vars.MEGA_GUTENBERG_CLIENT_ID }}
+          private-key: ${{ secrets.MEGA_GUTENBERG_PK }}
+          owner: megaeth-labs
+          repositories: stateless-validator
+          permission-contents: write
+          permission-pull-requests: read
+          permission-workflows: write
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -97,6 +146,8 @@ jobs:
       - uses: megaeth-labs/.github/.github/actions/release-candidate@main
         with:
           stage: cut
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.release-token.outputs.token }}
+          commit: ${{ needs.route.outputs.commit }}
+          pr_number: ${{ needs.route.outputs.pr_number }}
           version_file: Cargo.toml
           version_pattern: toml

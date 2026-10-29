@@ -1,0 +1,32 @@
+name: App Token Lint
+
+# Fails a pull request that mints a GitHub App token the wrong way: a CI-app
+# token with write permissions it must not have, the CI app in a release
+# workflow, or a release-app (mega-gutenberg) token outside the `release`
+# environment. Read-only; no secrets. The rules are listed in the guide.
+#
+# Guide: https://github.com/megaeth-labs/.github/blob/main/.github/actions/app-token-lint/README.md
+
+on:
+  pull_request:
+    paths: [".github/workflows/**"]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  app-token-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # claude.yml mints a CI-app (Maxwell) token without `permission-*`, so
+      # lint only the release workflows.
+      - uses: megaeth-labs/.github/.github/actions/app-token-lint@main
+        with:
+          paths: .github/workflows/release-candidate.yml .github/workflows/release-settle.yml .github/workflows/on-release.yml .github/workflows/app-token-lint.yml
