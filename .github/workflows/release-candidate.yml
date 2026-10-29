@@ -91,6 +91,83 @@ jobs:
           # so the read-only job token resolves them.
           dependency_token: ${{ github.token }}
 
+  # Only trunk candidates follow trunk pushes; base_commit candidates belong
+  # to their release branch and must never pick up changes from trunk.
+  refresh-candidates:
+    if: github.event_name == 'push' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      prs: ${{ steps.candidates.outputs.prs }}
+    steps:
+      - id: candidates
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          prs="$(gh api --method GET --paginate --slurp \
+            "repos/$GITHUB_REPOSITORY/pulls" \
+            -f state=open -f base="$DEFAULT_BRANCH" -f per_page=100 \
+            --jq '[.[][] | select(.head.ref | startswith("chore/release-candidate-")) | select(.head.repo.full_name == .base.repo.full_name) | .number]')"
+          echo "prs=$(jq -c . <<< "$prs")" >> "$GITHUB_OUTPUT"
+
+  refresh:
+    needs: refresh-candidates
+    if: needs.refresh-candidates.outputs.prs != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        pr: ${{ fromJSON(needs.refresh-candidates.outputs.prs) }}
+    concurrency:
+      group: ${{ github.workflow }}-refresh-${{ matrix.pr }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      # Recheck after queueing: a candidate may have closed or changed base
+      # while another refresh held its concurrency slot.
+      - id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_NUMBER: ${{ matrix.pr }}
+        run: |
+          version="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" \
+            --jq 'select(.state == "open") | select(.base.ref == env.DEFAULT_BRANCH) | select(.head.repo.full_name == .base.repo.full_name) | .head.ref | select(startswith("chore/release-candidate-")) | ltrimstr("chore/release-candidate-")')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        if: steps.candidate.outputs.version != ''
+        id: release-token
+        with:
+          client-id: ${{ vars.MEGA_GUTENBERG_CLIENT_ID }}
+          private-key: ${{ secrets.MEGA_GUTENBERG_PK }}
+          owner: megaeth-labs
+          repositories: stateless-validator
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        if: steps.candidate.outputs.version != ''
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: megaeth-labs/.github/.github/actions/release-candidate@main
+        if: steps.candidate.outputs.version != ''
+        with:
+          stage: refresh
+          token: ${{ steps.release-token.outputs.token }}
+          version: ${{ steps.candidate.outputs.version }}
+          pr_number: ${{ matrix.pr }}
+          version_file: Cargo.toml
+          version_pattern: toml
+          changelog_file: CHANGELOG.md
+
   # Read-only: decides from the pushed commit whether it is a merged candidate
   # PR that targeted the default branch. One proposed with `base_commit` merges
   # into the release branch propose already cut, and routes to nothing here.
