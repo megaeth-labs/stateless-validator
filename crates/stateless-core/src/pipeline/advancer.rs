@@ -11,7 +11,7 @@ use crate::{
     db::BlockMeta,
     pipeline::{
         config::{ErrorAction, PipelineOutcome, ReorgEvent, WorkerResult},
-        divergence::{DivergenceLookups, find_divergence_point},
+        divergence::{DivergenceError, DivergenceLookups, find_divergence_point},
         traits::{BlockFetcher, PipelineHooks, ProcessedBlock},
     },
 };
@@ -63,13 +63,23 @@ where
     S: DivergenceLookups + Send + Sync,
 {
     async fn resolve(&self, fetcher: &F, store: &S, persisted_tip: u64) -> Result<ReorgResolution> {
-        match find_divergence_point(fetcher, store, persisted_tip).await {
-            Ok(v) => Ok(ReorgResolution::Floor(v)),
-            Err(e) if e.is_fatal() => Ok(ReorgResolution::Fatal(e.to_string())),
+        Ok(find_divergence_point(fetcher, store, persisted_tip)
+            .await
+            .map_or_else(ReorgResolution::from, ReorgResolution::Floor))
+    }
+}
+
+/// How a failed [`find_divergence_point`] ends the cycle: a fatal divergence halts, anything else
+/// retries. Shared by every resolver built on the bisection so they classify alike.
+impl From<DivergenceError> for ReorgResolution {
+    fn from(e: DivergenceError) -> Self {
+        if e.is_fatal() {
+            Self::Fatal(e.to_string())
+        } else {
             // A non-fatal divergence error is a transport hiccup during the bisection fetches —
             // an *intentional* transient signal, so route it through `Retry` (warn + sleep +
             // restart) instead of leaking an `Err` the outer loop logs as "unexpected error".
-            Err(e) => Ok(ReorgResolution::Retry(e.to_string())),
+            Self::Retry(e.to_string())
         }
     }
 }
@@ -147,11 +157,15 @@ where
                 };
 
                 let depth = persisted_tip.saturating_sub(rollback_to);
+                // Walked down from the tip and stopped at the first height the store does not
+                // hold (`ChainStore::get_block_hash`'s contiguity contract): a floor may lie below
+                // the retained rows, and the heights under them have nothing to report however
+                // many there are.
                 let mut reverted_hashes = Vec::new();
-                for n in (rollback_to + 1)..=persisted_tip {
+                for n in ((rollback_to + 1)..=persisted_tip).rev() {
                     match store.get_block_hash(n) {
                         Ok(Some(hash)) => reverted_hashes.push(hash),
-                        Ok(None) => {}
+                        Ok(None) => break,
                         Err(e) => warn!(
                             block_number = n,
                             error = %e,
@@ -159,6 +173,7 @@ where
                         ),
                     }
                 }
+                reverted_hashes.reverse();
 
                 return Ok(PipelineOutcome::Reorg(ReorgEvent {
                     rollback_to,

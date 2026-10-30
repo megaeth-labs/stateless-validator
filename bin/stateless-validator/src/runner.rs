@@ -1,30 +1,24 @@
 //! Pipeline + signal handling + optional validation reporter.
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
-use alloy_primitives::B256;
 use eyre::Result;
-use stateless_common::RpcClient;
-use stateless_core::{
-    BisectResolver, ChainStore, PipelineConfig, chain_spec::ChainSpec, pipeline::run_pipeline,
-};
+use stateless_common::{BlockRef, RpcClient};
+use stateless_core::{ChainStore, PipelineConfig, chain_spec::ChainSpec, pipeline::run_pipeline};
 use stateless_db::ContractCache;
 use tokio::{signal, task};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::{
+    anchor::ValidatorReorgResolver,
     chain_sync::{ValidatorFetcher, ValidatorHooks, ValidatorProcessor},
     r2_witness::R2WitnessClient,
     validator_db::ValidatorDB,
 };
 
+/// How often the reporter sends the validated chain upstream.
+const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 /// Attempts for the final shutdown report (first try + retries).
 const FINAL_REPORT_ATTEMPTS: usize = 3;
 /// Sleep between final-report attempts.
@@ -34,9 +28,8 @@ const FINAL_REPORT_RETRY_DELAY: Duration = Duration::from_secs(1);
 ///
 /// Cleanly drains on SIGINT/SIGTERM and returns either the pipeline result or `Ok(())`
 /// on signal. Exception: on a fixed-range run (`--end-block`), a final validation report
-/// that cannot land (or a detected validation gap) fails the run — a slice has no later
-/// restart to re-report, so exiting 0 would let an orchestrator record the slice as
-/// complete while upstream never saw the tip.
+/// that cannot land fails the run — a slice has no later restart to re-report, so exiting 0
+/// would let an orchestrator record the slice as complete while upstream never saw the tip.
 pub async fn run_with_signals(
     client: Arc<RpcClient>,
     r2_witness: Option<Arc<R2WitnessClient>>,
@@ -65,17 +58,16 @@ pub async fn run_with_signals(
         Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client.clone() });
     let hooks = Arc::new(ValidatorHooks);
 
-    // Last tip accepted upstream, shared between the periodic reporter and the final flush so
-    // the flush only covers the still-unreported tail instead of re-sending anchor→tip.
-    let last_reported = Arc::new(AtomicU64::new(0));
-
+    // Cancelled once the pipeline has stopped (and drained), so the reporter's final flush sees
+    // the last validated block. The reporter is the only task that ever reports: a receiver
+    // replaces its recorded chain with each accepted report, so a second sender racing it could
+    // land an older chain after a newer one.
+    let stop_reporting = CancellationToken::new();
     let reporter = if report_validation {
         Some(task::spawn(validation_reporter(
             Arc::clone(&client),
             Arc::clone(&validator_db),
-            Duration::from_secs(1),
-            shutdown.clone(),
-            Arc::clone(&last_reported),
+            stop_reporting.clone(),
         )))
     } else {
         info!("Validation reporter disabled");
@@ -93,7 +85,7 @@ pub async fn run_with_signals(
         hooks,
         config,
         shutdown.clone(),
-        BisectResolver,
+        ValidatorReorgResolver,
     ));
 
     // Signal wins → drain; pipeline wins → already done.
@@ -122,53 +114,23 @@ pub async fn run_with_signals(
         warn!(timeout = ?drain_timeout, "Pipeline did not drain within timeout");
     }
 
+    // The reporter finishes the round it may be in, then flushes the validated tail with bounded
+    // retries: blocks validated since its last accepted report would otherwise go unreported,
+    // and an `--end-block` slice run has no later restart to re-report them.
+    stop_reporting.cancel();
     if let Some(reporter) = reporter {
-        let _ = tokio::time::timeout(Duration::from_secs(3), reporter).await;
-    }
-
-    // Final report of the validated tail, sent after the pipeline (and any drain) has stopped
-    // and the periodic reporter was joined. The reporter exits the moment the pipeline does, so
-    // blocks validated since its last accepted report would otherwise go unreported — and an
-    // `--end-block` slice run has no later restart to re-report them, hence the bounded retries
-    // (the periodic loop's next tick is its retry). The shared `last_reported` makes this a
-    // no-op when the reporter already landed the tip; a reporter wedged past the 3s join above
-    // cannot regress upstream either way: reports apply through a forward-only cursor.
-    if report_validation {
-        let mut flush_failure: Option<eyre::Report> = None;
-        for attempt in 1..=FINAL_REPORT_ATTEMPTS {
-            match report_range_once(&client, &validator_db, &last_reported).await {
-                Ok(true) => break,
-                Ok(false) if attempt < FINAL_REPORT_ATTEMPTS => {
-                    warn!(attempt, "Final validation report failed, retrying");
-                    tokio::time::sleep(FINAL_REPORT_RETRY_DELAY).await;
-                }
-                Ok(false) => {
-                    error!(
-                        attempts = FINAL_REPORT_ATTEMPTS,
-                        "Final validation report failed; the validated tail may be unreported \
-                         upstream"
-                    );
-                    flush_failure = Some(eyre::eyre!(
-                        "final validation report failed after {FINAL_REPORT_ATTEMPTS} attempts; \
-                         the validated tail may be unreported upstream"
-                    ));
-                }
-                // A detected validation gap is deterministic — retrying cannot resolve it.
-                Err(e) => {
-                    error!(error = %e, "Final validation report failed with a non-retryable error");
-                    flush_failure = Some(e);
-                    break;
-                }
-            }
-        }
-        // A chain-following run re-reports anchor→tip on its next start, so an unreported tail
+        let flushed = reporter
+            .await
+            .unwrap_or_else(|e| Err(eyre::eyre!("validation reporter task panicked: {e}")));
+        // A chain-following run re-reports the chain on its next start, so an unreported tail
         // heals itself. An `--end-block` slice run has no later restart: fail the run so the
         // orchestrator cannot record the slice as complete. A pipeline error, if any, takes
-        // precedence (the flush failure was already logged above).
-        if let Some(e) = flush_failure &&
-            is_slice_run
-        {
-            result = result.and(Err(e));
+        // precedence.
+        if let Err(e) = flushed {
+            error!(error = %e, "Final validation report failed");
+            if is_slice_run {
+                result = result.and(Err(e));
+            }
         }
     }
 
@@ -189,98 +151,103 @@ pub async fn run_with_signals(
     result
 }
 
-/// Reports validated blocks to the dedicated report endpoint.
+/// Reports the validated chain `(anchor, validated]` to the dedicated report endpoint via
+/// `mega_setValidatedChain`, every [`REPORT_INTERVAL`] until `stop` fires, then flushes it once
+/// more with up to [`FINAL_REPORT_ATTEMPTS`] attempts.
 ///
-/// Periodically reads the canonical tip from ValidatorDB and reports the
-/// validated range to the upstream node. Exits as soon as `shutdown` fires;
-/// `run_with_signals` flushes the final tail afterwards, seeded by the shared
-/// `last_reported_block` so the flush skips what already landed here.
+/// Returns `Err` only when that final flush cannot land. Periodic rounds that fail are simply
+/// retried on the next tick with whatever the chain is by then.
 async fn validation_reporter(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
-    report_interval: Duration,
-    shutdown: CancellationToken,
-    last_reported_block: Arc<AtomicU64>,
+    stop: CancellationToken,
 ) -> Result<()> {
     info!("Starting validation reporter");
+    let mut reported = None;
 
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(report_interval) => {}
-            _ = shutdown.cancelled() => {
-                info!("Shutting down gracefully");
-                return Ok(());
-            }
+            _ = tokio::time::sleep(REPORT_INTERVAL) => {}
+            _ = stop.cancelled() => break,
         }
-
-        report_range_once(&client, &validator_db, &last_reported_block).await?;
+        report_chain_once(&client, &validator_db, &mut reported).await;
     }
+
+    for attempt in 1..=FINAL_REPORT_ATTEMPTS {
+        if report_chain_once(&client, &validator_db, &mut reported).await {
+            return Ok(());
+        }
+        if attempt < FINAL_REPORT_ATTEMPTS {
+            warn!(attempt, "Final validation report failed, retrying");
+            tokio::time::sleep(FINAL_REPORT_RETRY_DELAY).await;
+        }
+    }
+    Err(eyre::eyre!(
+        "final validation report failed after {FINAL_REPORT_ATTEMPTS} attempts; the validated \
+         tail may be unreported upstream"
+    ))
 }
 
-/// One reporter round: read anchor + tip and report the validated range upstream if the tip
-/// differs from `last_reported_block` (updated on an accepted report; a tip that regressed
-/// after a reorg rollback is deliberately re-reported).
+/// One reporter round: read the validated chain and send it upstream unless the receiver
+/// already accepted exactly this chain (`reported`, updated on acceptance).
 ///
-/// Returns `Ok(true)` when the round settled (report accepted, or nothing to report) and
-/// `Ok(false)` when the attempt failed in a way a retry could resolve (logged here). The only
-/// `Err` is a detected validation gap, which is fatal to the reporter.
-async fn report_range_once(
+/// The chain is compared by both ends, hashes included, so a chain that a reorg rewound — lower,
+/// or at the same height on a different block — is reported like any other. A chain with nothing
+/// validated above its anchor has nothing to report: the receiver takes only `anchor < validated`,
+/// and keeps what it had until the next block is validated.
+///
+/// Returns whether the round settled: the chain was accepted, had been already, or there is
+/// nothing to report. A refusal — the receiver does not (yet) hold both blocks on its canonical
+/// chain — and a failed call are logged here and settle nothing.
+async fn report_chain_once(
     client: &RpcClient,
     validator_db: &ValidatorDB,
-    last_reported_block: &AtomicU64,
-) -> Result<bool> {
-    let (anchor, tip) = match (validator_db.get_anchor(), validator_db.get_canonical_tip()) {
-        (Ok(Some(a)), Ok(Some(t))) => (a, t),
-        (Ok(None), _) | (_, Ok(None)) => return Ok(true),
-        (Err(e), _) | (_, Err(e)) => {
-            warn!(error = %e, "Failed to read anchor/tip, retrying");
-            return Ok(false);
+    reported: &mut Option<(BlockRef, BlockRef)>,
+) -> bool {
+    let chain = match validator_db.validated_chain() {
+        Ok(chain) => chain,
+        Err(e) => {
+            warn!(error = %e, "Failed to read the validated chain, retrying");
+            return false;
         }
     };
-
-    // Relaxed suffices: this is a single monotonic hint, and both users are already ordered —
-    // the reporter is the only writer while it runs, and the final flush reads it only after
-    // joining the reporter task.
-    if tip.block_number == last_reported_block.load(Ordering::Relaxed) {
-        return Ok(true);
+    let (Some(anchor), Some(validated)) = (chain.anchor, chain.validated) else {
+        return true;
+    };
+    let chain = (
+        BlockRef::new(anchor.block_number, anchor.block_hash),
+        BlockRef::new(validated.block_number, validated.block_hash),
+    );
+    if *reported == Some(chain) {
+        return true;
     }
 
-    let result = client
-        .set_validated_blocks(
-            (anchor.block_number, B256::from(anchor.block_hash.0)),
-            (tip.block_number, B256::from(tip.block_hash.0)),
-        )
-        .await;
-
-    match result {
+    match client.set_validated_chain(chain.0, chain.1).await {
         Ok(response) if response.accepted => {
             debug!(
                 anchor = anchor.block_number,
                 anchor_hash = %anchor.block_hash,
-                tip = tip.block_number,
-                tip_hash = %tip.block_hash,
-                "Reported blocks"
+                validated = validated.block_number,
+                validated_hash = %validated.block_hash,
+                "Reported validated chain"
             );
-            last_reported_block.store(tip.block_number, Ordering::Relaxed);
-            Ok(true)
+            *reported = Some(chain);
+            true
         }
         Ok(response) => {
-            if response.last_validated_block.0 < anchor.block_number {
-                return Err(eyre::eyre!(
-                    "Validation gap detected: upstream at block {}, but local chain starts at {}",
-                    response.last_validated_block.0,
-                    anchor.block_number
-                ));
-            }
-            error!(
-                upstream_block = ?response.last_validated_block,
-                "Report rejected"
+            warn!(
+                anchor = anchor.block_number,
+                validated = validated.block_number,
+                upstream_anchor = ?response.anchor.map(|b| b.block_number.to::<u64>()),
+                upstream_validated = ?response.validated.map(|b| b.block_number.to::<u64>()),
+                "Validated chain refused: the receiver does not hold both blocks on its canonical \
+                 chain"
             );
-            Ok(false)
+            false
         }
         Err(e) => {
-            error!(error = %e, "Failed to report blocks");
-            Ok(false)
+            error!(error = %e, "Failed to report the validated chain");
+            false
         }
     }
 }

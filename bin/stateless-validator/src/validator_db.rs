@@ -18,8 +18,9 @@ use stateless_core::{
 };
 use stateless_db::{
     ANCHOR_BLOCK, CANONICAL_CHAIN, CONTRACTS, DEFAULT_MAX_CHAIN_LENGTH, Database, GENESIS_CONFIG,
-    read_anchor, read_block_hash, read_canonical_tip, read_contracts, read_earliest_block,
-    write_add_contracts, write_advance_chain, write_reset_to_anchor, write_rollback_chain,
+    ValidatedChain, read_anchor, read_block_hash, read_canonical_tip, read_contracts,
+    read_earliest_block, read_validated_chain, write_add_contracts, write_advance_chain,
+    write_reset_to_anchor, write_rewind_validated_chain,
 };
 
 /// Minimal persistent storage backed by redb.
@@ -85,6 +86,12 @@ impl ValidatorDB {
         Ok(())
     }
 
+    /// The validated chain `(anchor, validated]`, both ends from one snapshot: what the reporter
+    /// sends upstream and what startup checks the anchor flags against.
+    pub fn validated_chain(&self) -> StoreResult<ValidatedChain> {
+        read_validated_chain(&self.database)
+    }
+
     /// Load the persisted genesis config, if any.
     pub fn load_genesis(&self) -> StoreResult<Option<Genesis>> {
         let read_txn = self.database.begin_read().store_err()?;
@@ -119,8 +126,12 @@ impl ChainStore for ValidatorDB {
         read_block_hash(&self.database, block_number)
     }
 
+    /// Rewinds the validated chain to `to_block`, never below the anchor; see
+    /// [`write_rewind_validated_chain`]. The anchor is a valid target even after its row was
+    /// pruned, which is how a reorg below the retained window but above the anchor restarts
+    /// validation from the anchor (`ValidatorReorgResolver`).
     fn rollback_chain(&self, to_block: BlockNumber) -> StoreResult<()> {
-        write_rollback_chain(&self.database, to_block)
+        write_rewind_validated_chain(&self.database, to_block)
     }
 
     fn reset_to_anchor(&self, anchor: &BlockMeta) -> StoreResult<()> {
@@ -328,6 +339,7 @@ mod tests {
     fn test_rollback_chain() {
         let (_dir, store) = temp_store();
 
+        store.reset_to_anchor(&make_block_meta(9)).unwrap();
         let blocks: Vec<BlockMeta> = (10..=15).map(make_block_meta).collect();
         ChainStore::advance_chain(&store, &blocks).unwrap();
 
@@ -342,6 +354,33 @@ mod tests {
 
         assert!(ChainStore::get_block_hash(&store, 10).unwrap().is_some());
         assert!(ChainStore::get_block_hash(&store, 12).unwrap().is_some());
+    }
+
+    /// The rollback the pipeline drives on a reorg keeps the anchor: rolling back to it leaves
+    /// nothing validated, even once retention has pruned the anchor's row, and nothing goes
+    /// below it.
+    #[test]
+    fn rollback_to_the_anchor_restarts_the_validated_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ValidatorDB::with_max_chain_length(dir.path().join("test.redb"), 3).unwrap();
+        let anchor = make_block_meta(4);
+        store.reset_to_anchor(&anchor).unwrap();
+        let blocks: Vec<BlockMeta> = (5..=10).map(make_block_meta).collect();
+        ChainStore::advance_chain(&store, &blocks).unwrap();
+        assert_eq!(
+            store.validated_chain().unwrap(),
+            ValidatedChain { anchor: Some(anchor.clone()), validated: Some(make_block_meta(10)) }
+        );
+        assert_eq!(DivergenceLookups::get_earliest(&store).unwrap().unwrap().0, 8);
+
+        assert!(ChainStore::rollback_chain(&store, 3).is_err(), "nothing goes below the anchor");
+
+        ChainStore::rollback_chain(&store, 4).unwrap();
+        assert_eq!(
+            store.validated_chain().unwrap(),
+            ValidatedChain { anchor: Some(anchor.clone()), validated: None }
+        );
+        assert_eq!(store.get_canonical_tip().unwrap(), Some(anchor));
     }
 
     #[test]

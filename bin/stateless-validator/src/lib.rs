@@ -3,6 +3,7 @@
 //! Exposes the items used by the binary entrypoint ([`main.rs`](../main/index.html))
 //! and the integration tests under `tests/`. Internals stay `pub(crate)`.
 
+pub(crate) mod anchor;
 pub(crate) mod app;
 pub(crate) mod chain_sync;
 pub(crate) mod metrics;

@@ -4,18 +4,18 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use alloy_genesis::Genesis;
 use alloy_primitives::BlockHash;
-use alloy_rpc_types_eth::BlockId;
 use clap::Parser;
 use eyre::Result;
 use stateless_common::{
     BackoffPolicy, R2CountFlag, R2Flag, R2Flags, R2TuningFlag, R2WitnessTransport, RedactedSecret,
     RpcClient, RpcClientConfig, logging::LogArgs, validate_r2_flags,
 };
-use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::BlockMeta};
+use stateless_core::{ContractStore, chain_spec::ChainSpec};
 use stateless_db::ContractCache;
 use tracing::{info, warn};
 
 use crate::{
+    anchor,
     chain_sync::{ValidatorFetcher, ValidatorProcessor},
     metrics,
     r2_witness::R2WitnessClient,
@@ -168,9 +168,20 @@ pub struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_END_BLOCK")]
     pub end_block: Option<u64>,
 
-    /// Optional trusted block hash to start validation from.
+    /// Trusted anchor block hash; validation starts at the block above it.
+    ///
+    /// Required when the data dir holds no validated chain yet. Omit it to resume the stored
+    /// chain: with one stored, it is accepted only together with `--force-anchor`, which replaces
+    /// that chain and clears its validated progress, even for the same anchor. The block must be
+    /// on the canonical chain of `--rpc-endpoint`; startup fails otherwise, naming the chain head
+    /// (the highest usable anchor).
     #[clap(long, env = "STATELESS_VALIDATOR_START_BLOCK")]
-    pub start_block: Option<String>,
+    pub start_block: Option<BlockHash>,
+
+    /// Replace the stored validated chain with one anchored at `--start-block`, clearing its
+    /// validated progress. Requires `--start-block`.
+    #[clap(long, env = "STATELESS_VALIDATOR_FORCE_ANCHOR")]
+    pub force_anchor: bool,
 
     /// Path to the genesis JSON file for chain configuration.
     /// Required on first run, optional on subsequent runs (loads from database).
@@ -188,7 +199,12 @@ pub struct CommandLineArgs {
     #[clap(
         long,
         env = "STATELESS_VALIDATOR_BLOCK_LIST",
-        conflicts_with_all = ["start_block", "end_block", "report_validation_endpoint"],
+        conflicts_with_all = [
+            "start_block",
+            "force_anchor",
+            "end_block",
+            "report_validation_endpoint",
+        ],
         requires = "genesis_file",
     )]
     pub block_list: Option<PathBuf>,
@@ -224,8 +240,9 @@ pub struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_BLOCK_LIST_OUTPUT_DIR", requires = "block_list")]
     pub block_list_output_dir: Option<PathBuf>,
 
-    /// Endpoint for reporting validated blocks via mega_setValidatedBlocks RPC.
-    /// If not provided, validation reporting is disabled.
+    /// Endpoint the validated chain `(anchor, validated]` is reported to, via
+    /// `mega_setValidatedChain` (typically a replay-full node). If not provided, validation
+    /// reporting is disabled.
     #[clap(long, env = "STATELESS_VALIDATOR_REPORT_VALIDATION_ENDPOINT")]
     pub report_validation_endpoint: Option<String>,
 
@@ -321,7 +338,8 @@ pub struct CommandLineArgs {
 /// Entry point for the validator binary.
 ///
 /// Parses CLI args, initializes tracing and metrics, constructs the RPC client and
-/// validator DB, loads or initializes the chain spec + anchor, then hands off to
+/// validator DB, loads or initializes the chain spec, applies the anchor flags to the stored
+/// validated chain ([`anchor::apply_startup_request`]), then hands off to
 /// [`runner::run_with_signals`].
 pub async fn run() -> Result<()> {
     let args = CommandLineArgs::parse();
@@ -412,36 +430,8 @@ pub async fn run() -> Result<()> {
         return outcome;
     }
 
-    if let Some(start_block_str) = &args.start_block {
-        info!(start_block = %start_block_str, "Initializing from start block");
-
-        let block_hash: BlockHash = start_block_str.parse()?;
-        // `get_header` retries transient failures forever at the RPC layer, so the binary
-        // stays stuck here until the endpoint is reachable — a permanent misconfiguration
-        // surfaces as "no forward progress" rather than an arbitrarily bounded retry error.
-        let header = client.get_header(BlockId::Hash(block_hash.into()), true).await;
-
-        let anchor = BlockMeta::try_from_header(&header)
-            .ok_or_else(|| eyre::eyre!("Block {} is missing withdrawals_root", block_hash))?;
-        validator_db.reset_to_anchor(&anchor)?;
-
-        info!(
-            block_hash = %header.hash,
-            block_number = header.number,
-            "Successfully initialized from start block"
-        );
-    } else {
-        let tip = validator_db.get_canonical_tip()?.ok_or_else(|| {
-            eyre::eyre!(
-                "No trusted starting point found. Specify a trusted block with --start-block <blockhash>"
-            )
-        })?;
-        info!(
-            block_number = tip.block_number,
-            block_hash = %tip.block_hash,
-            "Continuing from existing canonical chain"
-        );
-    }
+    anchor::apply_startup_request(&client, &validator_db, args.start_block, args.force_anchor)
+        .await?;
 
     // `#[non_exhaustive]` on `PipelineConfig` rules out the struct-update shorthand at the
     // crate boundary — mutate a default instance instead, which is the pattern the attribute

@@ -61,6 +61,14 @@ Both binaries share a generic three-stage pipeline defined in `stateless-core::p
 
 The outer loop (`run_pipeline`) handles reorg rollback + restart, stale-data anchor reset, and transient vs fatal error classification.
 On a detected reorg, the rollback floor comes from a pluggable `ReorgResolver`: the core `BisectResolver` walks local history via `find_divergence_point`, while an embedder with an externally-supplied floor (e.g. the mega-reth FullNode) provides its own.
+The validator uses `ValidatorReorgResolver` (`anchor.rs`), the same bisection with the anchor as its floor: a fork below the retained `CANONICAL_CHAIN` rows but above a still-canonical anchor rewinds to the anchor (its pruned row is restored), and a fork below the anchor halts, naming the remote head to re-anchor at.
+
+### Validated chain (stateless-validator)
+
+The validator's chain pointers follow the mega-reth chain-pointer requirements: the validated chain is `(anchor, validated]`, read in one snapshot by `ValidatorDB::validated_chain`, with `validated` absent while nothing above the anchor is validated.
+`--start-block` anchors a data dir with no chain; a stored chain resumes when neither anchor flag is given and is replaced only by `--start-block` with `--force-anchor` (either alone fails startup), and the anchor must be on the remote canonical chain (`anchor::resolve_canonical_anchor`).
+Reorgs never move the anchor: `ValidatorDB::rollback_chain` refuses to go below it.
+The reporter is the only task that calls `mega_setValidatedChain(anchor, validated)` — including the final flush after the pipeline drains — because the receiver replaces its recorded chain with every accepted report, so a second sender could land an older chain after a newer one; a refusal (`accepted: false`, the receiver lacks a block on its canonical chain) is retried, never fatal.
 
 ### Database
 
@@ -203,6 +211,7 @@ The background chain-sync prefetch routes by freshness against the last observed
 | `crates/stateless-common/src/rpc_client.rs`                                                    | RPC client for blocks, witnesses, and bytecode                                       |
 | `crates/stateless-common/src/metrics.rs`                                                       | RpcMethod, RpcMetrics, RpcClientConfig                                               |
 | `bin/stateless-validator/src/{main,app,runner,chain_sync,validator_db,metrics}.rs`             | Thin entry, CLI/startup wiring, pipeline+reporter, fetcher/processor, DB             |
+| `bin/stateless-validator/src/anchor.rs`                                                        | Anchor flags at startup (`--start-block` / `--force-anchor`), `ValidatorReorgResolver` |
 | `bin/stateless-validator/src/replay.rs`                                                        | `--block-list` mode: bounded fetch + validate of a sparse block set, results/retry files (the list format is `stateless_common::block_list`) |
 | `bin/debug-trace-server/src/chain_sync.rs`                                                     | TraceFetcher, TraceProcessor, TraceHooks                                             |
 | `bin/debug-trace-server/src/rpc_service.rs`                                                    | RPC method definitions and handlers                                                  |

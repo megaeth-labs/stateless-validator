@@ -73,13 +73,15 @@ impl PipelineHooks for NoopHooks {
 struct MockStore {
     chain: std::sync::Mutex<std::collections::BTreeMap<u64, BlockMeta>>,
     anchor: BlockMeta,
+    /// `get_block_hash` calls so far.
+    hash_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl MockStore {
     fn new(anchor: BlockMeta) -> Self {
         let mut chain = std::collections::BTreeMap::new();
         chain.insert(anchor.block_number, anchor.clone());
-        Self { chain: std::sync::Mutex::new(chain), anchor }
+        Self { chain: std::sync::Mutex::new(chain), anchor, hash_reads: Default::default() }
     }
 }
 
@@ -98,6 +100,7 @@ impl ChainStore for MockStore {
         Ok(())
     }
     fn get_block_hash(&self, n: BlockNumber) -> StoreResult<Option<BlockHash>> {
+        self.hash_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(self.chain.lock().unwrap().get(&n).map(|m| m.block_hash))
     }
     fn rollback_chain(&self, to_block: BlockNumber) -> StoreResult<()> {
@@ -480,6 +483,42 @@ async fn test_chain_advancer_uses_store_resolved_floor() {
         }
         other => panic!("Expected Reorg, got {other:?}"),
     }
+}
+
+/// A floor below the rows the store still holds reports the retained hashes above it, in
+/// ascending order, without reading the heights under them one by one.
+#[tokio::test]
+async fn test_chain_advancer_reverted_hashes_stop_below_the_retained_rows() {
+    let tip = make_tip(30);
+    let store = Arc::new(MockStore::new(make_tip(25)));
+    store.advance_chain(&(26..=30).map(make_tip).collect::<Vec<_>>()).unwrap();
+
+    let (tx, rx) = kanal::bounded(1);
+    tx.send(Ok(make_block(31, BlockHash::from([0xFF; 32])))).unwrap();
+    let result = chain_advancer(
+        &MockFetcher { hashes: HashMap::default() },
+        Arc::clone(&store),
+        Arc::new(NoopHooks),
+        &PreResolvedFloorResolver { floor: 0 },
+        rx,
+        tip,
+        CancellationToken::new(),
+    )
+    .await;
+
+    match result.unwrap() {
+        PipelineOutcome::Reorg(event) => {
+            assert_eq!((event.rollback_to, event.depth), (0, 30));
+            let retained: Vec<BlockHash> = (25..=30).map(make_hash).collect();
+            assert_eq!(event.reverted_hashes, retained);
+        }
+        other => panic!("Expected Reorg, got {other:?}"),
+    }
+    assert_eq!(
+        store.hash_reads.load(std::sync::atomic::Ordering::SeqCst),
+        7,
+        "the 6 retained rows and the first gap"
+    );
 }
 
 /// Regression for the `BisectResolver` transient-error path: a *non-fatal* `find_divergence_point`

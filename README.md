@@ -73,10 +73,14 @@ cargo run --release --bin stateless-validator -- \
 
 **Optional Arguments:**
 - `--genesis-file`: Path to genesis JSON file containing hardfork activation configuration (required on first run, stored in database for subsequent runs)
-- `--start-block`: Trusted block hash to initialize validation from (required for first-time setup)
+- `--start-block`: Trusted anchor block hash; validation starts at the block above it.
+  Required when the data dir holds no validated chain yet, and must be omitted to resume one (see "Restarting and re-anchoring" below).
+  The block must be on the canonical chain of `--rpc-endpoint`; otherwise startup fails, naming the chain head (the highest usable anchor) and, when the block's height is known, the canonical hash at that height.
+- `--force-anchor`: With `--start-block`, replace the stored validated chain with one anchored at that block, clearing its validated progress (even for the same anchor).
+  Either of the two flags alone is refused on a data dir that already holds a validated chain.
 - `--end-block`: Inclusive end block; validate up to this height, then stop cleanly (useful to slice a fixed range across multiple servers)
 - `--block-list`: Replay exactly the block numbers in this file instead of following the chain, then exit; see "Replaying a block list" below.
-  It excludes `--start-block`, `--end-block` and `--report-validation-endpoint`, and requires `--genesis-file`.
+  It excludes `--start-block`, `--force-anchor`, `--end-block` and `--report-validation-endpoint`, and requires `--genesis-file`.
 - `--block-list-timeout-secs`, `--block-list-concurrency`, `--block-list-output-dir`: tuning for `--block-list` (per-stage timeout, default 300; blocks in flight, default twice the physical cores, of which at most one per physical core validates at a time; where the output files go, default `--data-dir`).
   They are rejected without `--block-list`.
 - `--r2-endpoint`, `--r2-bucket`, `--r2-access-key-id`, `--r2-secret-access-key`: R2 connection settings for the signed S3 target, all four required together (prefer the env var for the secret).
@@ -90,7 +94,10 @@ cargo run --release --bin stateless-validator -- \
   "Blank value" covers the flags that travel as text; the two numeric tuning flags are parsed by clap, so a blank one aborts earlier, in clap's parser (see AGENTS.md for the full rule).
   The R2 attempt for one block is bounded in total by a single `--rpc-per-attempt-timeout-ms`, permit wait included, so an endpoint that accepts connections and then stalls costs the block one upstream hop's wall clock rather than one per retry before the RPC chain takes over.
 - `--r2-custom-domain`: alternative R2 target that replaces the four flags above — unsigned HTTP/2 GETs through a Cloudflare custom domain fronting the bucket (mutually exclusive with `--r2-endpoint`, and any of the four left set is rejected at startup by name rather than silently ignored; optional `--r2-access-client-id`/`--r2-access-client-secret` attach Cloudflare Access service-token headers, which require an `https://` domain unless it is loopback; the domain's cache rule must set 404s to bypass cache, or a cached pre-upload 404 pushes those blocks onto the RPC path for the negative-cache TTL and false-fires the `kind="missing"` alarm once they age past the frontier band)
-- `--report-validation-endpoint`: RPC endpoint URL for reporting validated blocks via `mega_setValidatedBlocks` (disabled if not provided)
+- `--report-validation-endpoint`: RPC endpoint URL (typically a replay-full node) the validated chain is reported to via `mega_setValidatedChain` (disabled if not provided).
+  Each report carries both ends of the validated chain `(anchor, validated]` as `{ blockNumber, blockHash }` objects, and is sent once a second while the chain has moved, plus once more on shutdown.
+  The receiver accepts it only when both blocks are on its own canonical chain, and then replaces what it recorded before, so the chain a reorg rewound is reported like any other; a refused report is retried with the chain as it is by the next round.
+  Nothing is reported while no block above the anchor has been validated, since the receiver takes only `anchor < validated`.
 - `--metrics-enabled`: Enable Prometheus metrics endpoint (disabled by default)
 - `--metrics-port`: Port for Prometheus metrics HTTP endpoint (default: 9090)
 
@@ -290,6 +297,7 @@ Each command-line flag has an equivalent environment variable:
 - `STATELESS_VALIDATOR_WITNESS_ENDPOINT` → `--witness-endpoint`
 - `STATELESS_VALIDATOR_GENESIS_FILE` → `--genesis-file`
 - `STATELESS_VALIDATOR_START_BLOCK` → `--start-block`
+- `STATELESS_VALIDATOR_FORCE_ANCHOR` → `--force-anchor` (set to `true` to enable)
 - `STATELESS_VALIDATOR_END_BLOCK` → `--end-block`
 - `STATELESS_VALIDATOR_BLOCK_LIST` / `_BLOCK_LIST_TIMEOUT_SECS` / `_BLOCK_LIST_CONCURRENCY` / `_BLOCK_LIST_OUTPUT_DIR` → `--block-list*`
 - `STATELESS_VALIDATOR_R2_ENDPOINT` / `_R2_BUCKET` / `_R2_ACCESS_KEY_ID` / `_R2_SECRET_ACCESS_KEY` → `--r2-*` (the signed S3 target)
@@ -326,7 +334,7 @@ The validator will:
 3. Initialize the canonical chain database with this trusted block
 4. Begin validation from this anchor point, applying the appropriate EVM rules based on hardfork activation
 
-For subsequent runs, you can omit both `--genesis-file` and `--start-block` to resume from the existing database:
+For subsequent runs, omit both `--genesis-file` and `--start-block` to resume from the existing database:
 
 ```bash
 cargo run --bin stateless-validator -- \
@@ -334,6 +342,26 @@ cargo run --bin stateless-validator -- \
   --rpc-endpoint https://your-rpc-endpoint.com \
   --witness-endpoint https://your-witness-endpoint.com
 ```
+
+### Restarting and re-anchoring
+
+The database records the validated chain `(anchor, validated]`: the trusted anchor, and the highest block validated above it (none right after anchoring).
+Startup treats the anchor flags as follows:
+
+| Database | Flags | Result |
+| --- | --- | --- |
+| no validated chain | `--start-block <hash>` (with or without `--force-anchor`) | anchors at the block; validation starts above it |
+| no validated chain | none | startup fails: a trusted starting point is required |
+| validated chain | none | resumes above `validated` (or above the anchor if nothing is validated yet) |
+| validated chain | `--start-block <hash> --force-anchor` | replaces the chain: anchors at the block, clears `validated` |
+| any | `--start-block` alone on a stored chain, or `--force-anchor` alone | startup fails |
+
+When the remote chain reorgs or rewinds — while the validator runs or while it is down — the validator rewinds its validated chain to the fork point on its own and validates again from there:
+
+- A fork above the anchor that the retained canonical-chain rows (`--canonical-chain-max-length`) still cover rewinds `validated` to the fork point, or to nothing when the fork point is the anchor.
+- A fork below those rows but above the anchor rewinds to the anchor, which is kept: every block above it is validated again.
+- A fork below the anchor halts the validator, since it keeps no block hashes below its anchor to locate the fork with and a new anchor is a trust decision.
+  The error names the remote head; restart with `--start-block <hash> --force-anchor` on a trusted block of the current chain.
 
 ## Scope and Trust Model
 
