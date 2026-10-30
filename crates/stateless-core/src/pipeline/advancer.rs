@@ -147,11 +147,15 @@ where
                 };
 
                 let depth = persisted_tip.saturating_sub(rollback_to);
+                // Walked down from the tip and stopped at the first height the store no longer
+                // holds: a floor can lie below the retained rows (the validator rewinding to an
+                // anchor whose rows retention pruned), and the heights under them have nothing
+                // to report however many there are.
                 let mut reverted_hashes = Vec::new();
-                for n in (rollback_to + 1)..=persisted_tip {
+                for n in ((rollback_to + 1)..=persisted_tip).rev() {
                     match store.get_block_hash(n) {
                         Ok(Some(hash)) => reverted_hashes.push(hash),
-                        Ok(None) => {}
+                        Ok(None) => break,
                         Err(e) => warn!(
                             block_number = n,
                             error = %e,
@@ -159,6 +163,7 @@ where
                         ),
                     }
                 }
+                reverted_hashes.reverse();
 
                 return Ok(PipelineOutcome::Reorg(ReorgEvent {
                     rollback_to,

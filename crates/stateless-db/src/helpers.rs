@@ -3,7 +3,7 @@
 use alloy_primitives::{B256, BlockHash, BlockNumber, map::HashMap};
 use redb::{ReadableDatabase, ReadableTable};
 use revm::state::Bytecode;
-use stateless_core::db::{BlockMeta, ContractLookup, StoreResult, StoreResultExt};
+use stateless_core::db::{BlockMeta, ContractLookup, StoreError, StoreResult, StoreResultExt};
 use tracing::warn;
 
 use crate::{
@@ -31,8 +31,17 @@ fn open_read_table<K: redb::Key + 'static, V: redb::Value + 'static>(
 
 /// Reads the canonical tip (highest block) from CANONICAL_CHAIN.
 pub fn read_canonical_tip(database: &Database) -> StoreResult<Option<BlockMeta>> {
-    let read_txn = database.begin_read().store_err()?;
-    let Some(chain) = open_read_table(&read_txn, CANONICAL_CHAIN)? else {
+    canonical_tip_in(&database.begin_read().store_err()?)
+}
+
+/// Reads the anchor block from ANCHOR_BLOCK.
+pub fn read_anchor(database: &Database) -> StoreResult<Option<BlockMeta>> {
+    anchor_in(&database.begin_read().store_err()?)
+}
+
+/// The canonical tip as `read_txn` sees it.
+fn canonical_tip_in(read_txn: &redb::ReadTransaction) -> StoreResult<Option<BlockMeta>> {
+    let Some(chain) = open_read_table(read_txn, CANONICAL_CHAIN)? else {
         return Ok(None);
     };
     Ok(chain.last().store_err()?.map(|(k, v)| {
@@ -46,13 +55,37 @@ pub fn read_canonical_tip(database: &Database) -> StoreResult<Option<BlockMeta>>
     }))
 }
 
-/// Reads the anchor block from ANCHOR_BLOCK.
-pub fn read_anchor(database: &Database) -> StoreResult<Option<BlockMeta>> {
-    let read_txn = database.begin_read().store_err()?;
-    let Some(table) = open_read_table(&read_txn, ANCHOR_BLOCK)? else {
+/// The anchor as `read_txn` sees it.
+fn anchor_in(read_txn: &redb::ReadTransaction) -> StoreResult<Option<BlockMeta>> {
+    let Some(table) = open_read_table(read_txn, ANCHOR_BLOCK)? else {
         return Ok(None);
     };
     Ok(table.get("anchor").store_err()?.map(|v| block_meta_from_tuple(v.value())))
+}
+
+/// The validated chain `(anchor, validated]`: `anchor` is the trusted block validation started
+/// from, and every block above it up to `validated` has been validated.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ValidatedChain {
+    /// The trusted block the chain starts from. `None` before one has been set.
+    pub anchor: Option<BlockMeta>,
+    /// The highest validated block, always above `anchor`. `None` while nothing above the
+    /// anchor has been validated, and whenever there is no anchor.
+    pub validated: Option<BlockMeta>,
+}
+
+/// Reads the validated chain from ANCHOR_BLOCK and CANONICAL_CHAIN in one transaction, so the two
+/// ends always describe the same chain.
+///
+/// `validated` is the canonical tip when that is above the anchor. The tip equals the anchor
+/// while nothing has been validated above it (the anchor's row is the chain's first row), which
+/// reads as `None`.
+pub fn read_validated_chain(database: &Database) -> StoreResult<ValidatedChain> {
+    let read_txn = database.begin_read().store_err()?;
+    let anchor = anchor_in(&read_txn)?;
+    let validated = canonical_tip_in(&read_txn)?
+        .filter(|tip| anchor.as_ref().is_some_and(|anchor| tip.block_number > anchor.block_number));
+    Ok(ValidatedChain { anchor, validated })
 }
 
 /// Looks up a single block hash from CANONICAL_CHAIN.
@@ -136,6 +169,57 @@ pub fn write_rollback_chain(database: &Database, to_block: BlockNumber) -> Store
             .store_err()?;
         for n in to_remove {
             chain.remove(n).store_err()?;
+        }
+    }
+    write_txn.commit().store_err()?;
+    Ok(())
+}
+
+/// Rewinds the validated chain to `to_block` in one write transaction: every CANONICAL_CHAIN row
+/// above it is dropped, leaving `to_block` as the highest validated block, or as no validated
+/// block at all when it is the anchor.
+///
+/// The anchor is a valid target even once retention has pruned its row: the row is restored, so
+/// the chain starts over from the anchor exactly as a freshly anchored one does. The anchor itself
+/// is never moved. A target below it, or one above it that the retained rows no longer reach,
+/// has no row to rewind to and is refused as [`StoreError::Corrupt`] with nothing written.
+pub fn write_rewind_validated_chain(database: &Database, to_block: BlockNumber) -> StoreResult<()> {
+    let write_txn = database.begin_write().store_err()?;
+    {
+        let anchor = {
+            let table = write_txn.open_table(ANCHOR_BLOCK).store_err()?;
+            table.get("anchor").store_err()?.map(|v| block_meta_from_tuple(v.value()))
+        };
+        let anchor = anchor.ok_or_else(|| {
+            StoreError::Corrupt(format!("cannot rewind to block {to_block}: no anchor is set"))
+        })?;
+        if to_block < anchor.block_number {
+            return Err(StoreError::Corrupt(format!(
+                "cannot rewind to block {to_block}: it is below the anchor {}",
+                anchor.block_number
+            )));
+        }
+
+        let mut chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
+        let to_remove: Vec<u64> = chain
+            .range((to_block + 1)..)
+            .store_err()?
+            .map(|r| r.map(|(k, _)| k.value()))
+            .collect::<std::result::Result<_, _>>()
+            .store_err()?;
+        for n in to_remove {
+            chain.remove(n).store_err()?;
+        }
+
+        if chain.get(to_block).store_err()?.is_none() {
+            if to_block != anchor.block_number {
+                return Err(StoreError::Corrupt(format!(
+                    "cannot rewind to block {to_block}: it is above the anchor {} but below the \
+                     retained canonical chain",
+                    anchor.block_number
+                )));
+            }
+            insert_chain_row(&mut chain, &anchor)?;
         }
     }
     write_txn.commit().store_err()?;
@@ -321,6 +405,73 @@ mod tests {
         assert!(read_block_hash(&db, 3).unwrap().is_some());
         assert_eq!(read_block_hash(&db, 4).unwrap(), None);
         assert_eq!(read_block_hash(&db, 5).unwrap(), None);
+    }
+
+    /// The validated chain reads both ends from one snapshot, and a chain whose only row is its
+    /// anchor has nothing validated yet.
+    #[test]
+    fn validated_chain_reports_the_tip_only_above_the_anchor() {
+        let (_dir, db) = temp_db();
+        assert_eq!(read_validated_chain(&db).unwrap(), ValidatedChain::default());
+
+        // A chain with no anchor reports no validated block either.
+        write_advance_chain(&db, &[meta(3)], None).unwrap();
+        assert_eq!(read_validated_chain(&db).unwrap(), ValidatedChain::default());
+
+        write_reset_to_anchor(&db, &meta(5)).unwrap();
+        assert_eq!(
+            read_validated_chain(&db).unwrap(),
+            ValidatedChain { anchor: Some(meta(5)), validated: None }
+        );
+
+        write_advance_chain(&db, &[meta(6), meta(7)], None).unwrap();
+        assert_eq!(
+            read_validated_chain(&db).unwrap(),
+            ValidatedChain { anchor: Some(meta(5)), validated: Some(meta(7)) }
+        );
+    }
+
+    /// A rewind inside the retained chain keeps the target as the validated tip, and a rewind to
+    /// the anchor leaves nothing validated, restoring the anchor's row if retention pruned it.
+    #[test]
+    fn rewind_keeps_the_anchor_and_restores_its_pruned_row() {
+        let (_dir, db) = temp_db();
+        write_reset_to_anchor(&db, &meta(5)).unwrap();
+        write_advance_chain(&db, &(6..=12).map(meta).collect::<Vec<_>>(), None).unwrap();
+
+        write_rewind_validated_chain(&db, 9).unwrap();
+        assert_eq!(read_validated_chain(&db).unwrap().validated, Some(meta(9)));
+        assert_eq!(read_block_hash(&db, 10).unwrap(), None);
+
+        // Prune the anchor's row (and more) away, as retention does on a long-running chain.
+        write_advance_chain(&db, &[meta(10)], Some(3)).unwrap();
+        assert_eq!(read_earliest_block(&db).unwrap().unwrap().0, 8);
+
+        write_rewind_validated_chain(&db, 5).unwrap();
+        assert_eq!(
+            read_validated_chain(&db).unwrap(),
+            ValidatedChain { anchor: Some(meta(5)), validated: None }
+        );
+        assert_eq!(read_canonical_tip(&db).unwrap(), Some(meta(5)));
+        assert_eq!(read_earliest_block(&db).unwrap(), Some((5, meta(5).block_hash)));
+    }
+
+    /// A target with no row to rewind to is refused and leaves the chain as it was.
+    #[test]
+    fn rewind_refuses_a_target_without_a_row() {
+        let (_dir, db) = temp_db();
+        assert!(matches!(write_rewind_validated_chain(&db, 3), Err(StoreError::Corrupt(_))));
+
+        write_reset_to_anchor(&db, &meta(5)).unwrap();
+        write_advance_chain(&db, &(6..=12).map(meta).collect::<Vec<_>>(), Some(3)).unwrap();
+        let before = read_validated_chain(&db).unwrap();
+
+        for target in [4, 7] {
+            let err = write_rewind_validated_chain(&db, target).unwrap_err();
+            assert!(matches!(err, StoreError::Corrupt(_)), "{target}: {err}");
+        }
+        assert_eq!(read_validated_chain(&db).unwrap(), before, "a refused rewind writes nothing");
+        assert_eq!(read_earliest_block(&db).unwrap().unwrap().0, 10);
     }
 
     /// Keyed the same way the write path verifies: `Bytecode::hash_slow()`.

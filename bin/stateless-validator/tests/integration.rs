@@ -16,10 +16,13 @@ use alloy_primitives::{B256, BlockHash};
 use alloy_rpc_types_eth::Block;
 use clap::{CommandFactory, Parser};
 use jsonrpsee::server::ServerConfigBuilder;
-use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned};
+use jsonrpsee_types::error::{
+    CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
+};
 use stateless_common::{
-    BackoffPolicy, R2WitnessTransport, RpcClient, RpcClientConfig, WitnessRequestKeys,
-    block_list::parse_block_list, encode_witness_payload, encode_witness_response,
+    BackoffPolicy, BlockRef, R2WitnessTransport, RpcClient, RpcClientConfig,
+    SetValidatedChainResponse, WitnessRequestKeys, block_list::parse_block_list,
+    encode_witness_payload, encode_witness_response,
 };
 use stateless_core::{
     BisectResolver, ChainStore, ContractStore, PipelineConfig,
@@ -319,7 +322,8 @@ fn block_list_flag_combinations() {
     assert!(parse(&["--block-list", "/tmp/pool.txt"]).is_err(), "genesis file is required");
     // Chain-following and reporting flags cannot be combined with a sparse replay.
     for conflicting in [
-        &["--start-block", "0x01"][..],
+        &["--start-block", TRUSTED_HASH][..],
+        &["--force-anchor"][..],
         &["--end-block", "10"][..],
         &["--report-validation-endpoint", "http://report"][..],
     ] {
@@ -341,6 +345,41 @@ fn block_list_flag_combinations() {
     }
 }
 
+/// A well-formed block hash, for flags that only need one to parse.
+const TRUSTED_HASH: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+/// `--start-block` is a block hash, checked when the flags are parsed, and `--force-anchor` is
+/// a plain switch; both bind their documented env vars. Which combinations a data dir accepts
+/// is decided at startup against the stored chain (`anchor::startup_action`).
+#[test]
+fn anchor_flags_parse() {
+    let guard = stateless_test_utils::env::env_lock();
+    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
+
+    let args = parse(&["--start-block", TRUSTED_HASH, "--force-anchor"]).unwrap();
+    assert_eq!(args.start_block, Some(TRUSTED_HASH.parse().unwrap()));
+    assert!(args.force_anchor);
+    let args = parse(&[]).unwrap();
+    assert_eq!((args.start_block, args.force_anchor), (None, false));
+    assert!(parse(&["--start-block", "0x01"]).is_err(), "a start block must be a full hash");
+
+    let from_env = stateless_test_utils::env::with_env_var(
+        &guard,
+        "STATELESS_VALIDATOR_START_BLOCK",
+        TRUSTED_HASH,
+        || {
+            stateless_test_utils::env::with_env_var(
+                &guard,
+                "STATELESS_VALIDATOR_FORCE_ANCHOR",
+                "true",
+                || parse(&[]).unwrap(),
+            )
+        },
+    );
+    assert_eq!(from_env.start_block, Some(TRUSTED_HASH.parse().unwrap()));
+    assert!(from_env.force_anchor);
+}
+
 const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
 
 /// Mock RPC server backing state: all fields pre-decoded so the RPC handlers can respond
@@ -348,10 +387,13 @@ const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
 struct MockServerState {
     fixtures: &'static TestFixtures,
     mpt_witnesses: HashMap<BlockHash, MptWitness>,
-    /// Every *accepted* `mega_setValidatedBlocks` call, as `(first_block, last_block)` numbers.
+    /// Every *accepted* `mega_setValidatedChain` call, as `(anchor, validated)` numbers.
     validated_reports: Arc<Mutex<Vec<(u64, u64)>>>,
-    /// Number of upcoming `mega_setValidatedBlocks` calls to reject with an RPC error.
+    /// Number of upcoming `mega_setValidatedChain` calls to reject with an RPC error.
     reject_reports: Arc<AtomicUsize>,
+    /// Number of upcoming `mega_setValidatedChain` calls to refuse with `accepted: false`, as a
+    /// receiver that does not hold the reported blocks yet answers.
+    refuse_reports: Arc<AtomicUsize>,
     /// Every `mega_getBlockWitness` call, so a test can tell whether the RPC witness path was
     /// used at all.
     witness_requests: Arc<AtomicUsize>,
@@ -372,6 +414,7 @@ impl MockServerState {
             mpt_witnesses,
             validated_reports: Arc::default(),
             reject_reports: Arc::default(),
+            refuse_reports: Arc::default(),
             witness_requests: Arc::default(),
             number_aliases: HashMap::new(),
         }
@@ -524,26 +567,45 @@ async fn setup_mock_rpc_server(
             })
             .unwrap();
 
+        // The receiver's contract: `anchor < validated` or invalid params, and both blocks on
+        // its canonical chain (here: the fixtures) or `accepted: false` with nothing recorded.
         module
-            .register_method("mega_setValidatedBlocks", |params, ctx, _| {
-                let (first_block, last_block): ((u64, String), (u64, String)) =
-                    params.parse().unwrap();
-                if ctx
-                    .reject_reports
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok()
-                {
+            .register_method("mega_setValidatedChain", |params, ctx, _| {
+                let (anchor, validated): (BlockRef, BlockRef) = params.parse()?;
+                let take = |counter: &AtomicUsize| {
+                    counter
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok()
+                };
+                if take(&ctx.reject_reports) {
                     return Err(make_rpc_error(
                         CALL_EXECUTION_FAILED_CODE,
                         "transient report failure (scripted)".to_string(),
                     ));
                 }
-                ctx.validated_reports.lock().unwrap().push((first_block.0, last_block.0));
-                let last_hash: BlockHash = last_block.1.parse().unwrap();
-                Ok::<serde_json::Value, ErrorObjectOwned>(serde_json::json!({
-                    "accepted": true,
-                    "lastValidatedBlock": [last_block.0, last_hash]
-                }))
+                if anchor.block_number >= validated.block_number {
+                    return Err(make_rpc_error(INVALID_PARAMS_CODE, "anchor >= validated".into()));
+                }
+                let canonical = |block: &BlockRef| {
+                    ctx.fixtures.block_numbers.get(&block.block_number.to()) ==
+                        Some(&block.block_hash)
+                };
+                if take(&ctx.refuse_reports) || !canonical(&anchor) || !canonical(&validated) {
+                    return Ok(SetValidatedChainResponse {
+                        accepted: false,
+                        anchor: None,
+                        validated: None,
+                    });
+                }
+                ctx.validated_reports
+                    .lock()
+                    .unwrap()
+                    .push((anchor.block_number.to(), validated.block_number.to()));
+                Ok::<_, ErrorObject<'static>>(SetValidatedChainResponse {
+                    accepted: true,
+                    anchor: Some(anchor),
+                    validated: Some(validated),
+                })
             })
             .unwrap();
     })
@@ -677,12 +739,21 @@ async fn integration_test() {
     info!("Mock RPC server has been shut down");
 }
 
+/// How the mock receiver answers the first report calls of a slice run.
+#[derive(Clone, Copy)]
+enum FirstReports {
+    /// Fail this many with an RPC error.
+    Fail(usize),
+    /// Refuse this many with `accepted: false`.
+    Refuse(usize),
+}
+
 /// Runs `run_with_signals` to the fixtures' max block (`--end-block` → `sync_target`) with
-/// reports wired to the mock, failing the first `reject_first_reports` calls. Returns the run
-/// result, the accepted reports, and the slice's end block.
+/// reports wired to the mock, which answers the first ones as `first` scripts. Returns the run
+/// result, the accepted reports, and the slice's anchor and end block.
 async fn run_end_block_slice(
-    reject_first_reports: usize,
-) -> (eyre::Result<()>, Vec<(u64, u64)>, u64) {
+    first: FirstReports,
+) -> (eyre::Result<()>, Vec<(u64, u64)>, (u64, u64)) {
     let fx = TestFixtures::synthetic_shared();
     let genesis_file = fx.data_dir.join("genesis.json");
 
@@ -692,7 +763,10 @@ async fn run_end_block_slice(
         Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
     let state = MockServerState::new(fx);
     let reports = Arc::clone(&state.validated_reports);
-    state.reject_reports.store(reject_first_reports, std::sync::atomic::Ordering::SeqCst);
+    match first {
+        FirstReports::Fail(n) => state.reject_reports.store(n, Ordering::SeqCst),
+        FirstReports::Refuse(n) => state.refuse_reports.store(n, Ordering::SeqCst),
+    }
     let (handle, url) = setup_mock_rpc_server(state).await;
     let client = Arc::new(
         RpcClient::new_with_config(
@@ -718,22 +792,20 @@ async fn run_end_block_slice(
     handle.stop().unwrap();
 
     let reports = reports.lock().unwrap().clone();
-    (result, reports, max_block_number)
+    (result, reports, (fx.min_block().0, max_block_number))
 }
 
-/// [`run_end_block_slice`] + asserts the run succeeded and the last accepted report covers the
-/// end block; returns all accepted reports.
-async fn run_end_block_slice_and_assert_tip_reported(
-    reject_first_reports: usize,
-) -> Vec<(u64, u64)> {
-    let (result, reports, max_block_number) = run_end_block_slice(reject_first_reports).await;
+/// [`run_end_block_slice`] + asserts the run succeeded and the last accepted report is the whole
+/// validated chain, from the anchor to the end block; returns all accepted reports.
+async fn run_end_block_slice_and_assert_tip_reported(first: FirstReports) -> Vec<(u64, u64)> {
+    let (result, reports, chain) = run_end_block_slice(first).await;
     result.unwrap();
 
-    let &(_, last_reported) =
+    let &last_reported =
         reports.last().expect("the run must report validated blocks before exiting");
     assert_eq!(
-        last_reported, max_block_number,
-        "the final report must cover the end block (got reports: {reports:?})",
+        last_reported, chain,
+        "the final report must be (anchor, end block) (got reports: {reports:?})",
     );
     reports
 }
@@ -748,25 +820,30 @@ async fn end_block_run_reports_final_tip() {
     // shape. The scripted-failure twins stay silent, since their ERROR lines are just their
     // test script.
     let _logging = init_test_logging("stateless_validator");
-    run_end_block_slice_and_assert_tip_reported(0).await;
+    run_end_block_slice_and_assert_tip_reported(FirstReports::Fail(0)).await;
 }
 
-/// Like [`end_block_run_reports_final_tip`], but the mock rejects the first report call: the
-/// final flush's bounded retry must still land the tip.
+/// Like [`end_block_run_reports_final_tip`], but the mock fails the first report call, or
+/// refuses it as a receiver that does not hold the blocks yet does: the final flush's bounded
+/// retry must still land the tip.
 #[tokio::test]
 async fn end_block_final_report_retries_after_transient_failure() {
-    run_end_block_slice_and_assert_tip_reported(1).await;
+    run_end_block_slice_and_assert_tip_reported(FirstReports::Fail(1)).await;
+    run_end_block_slice_and_assert_tip_reported(FirstReports::Refuse(1)).await;
 }
 
 /// If the final flush cannot land within its bounded retries, an `--end-block` slice run must
 /// fail rather than exit 0: the slice has no later restart to re-report, so a clean exit would
-/// let an orchestrator record the slice as complete while upstream never saw the tip.
+/// let an orchestrator record the slice as complete while upstream never saw the tip. A
+/// receiver that keeps refusing the chain is no different from one that keeps failing.
 #[tokio::test]
 async fn end_block_run_fails_when_final_report_never_lands() {
-    let (result, reports, _) = run_end_block_slice(usize::MAX).await;
-    let err = result.expect_err("run must fail when the validated tail cannot be reported");
-    assert!(err.to_string().contains("final validation report failed"), "{err}");
-    assert!(reports.is_empty(), "mock rejected every report, yet some landed: {reports:?}");
+    for first in [FirstReports::Fail(usize::MAX), FirstReports::Refuse(usize::MAX)] {
+        let (result, reports, _) = run_end_block_slice(first).await;
+        let err = result.expect_err("run must fail when the validated tail cannot be reported");
+        assert!(err.to_string().contains("final validation report failed"), "{err}");
+        assert!(reports.is_empty(), "mock answered no report, yet some landed: {reports:?}");
+    }
 }
 
 /// A validator-shaped fetcher and processor over `url`, with their DB in `dir`. The DB has no

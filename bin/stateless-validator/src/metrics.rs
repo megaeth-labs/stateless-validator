@@ -244,7 +244,7 @@ fn init_rpc_method_counters() {
         RpcMethod::EthBlockNumber,
         RpcMethod::EthGetHeader,
         RpcMethod::MegaGetBlockWitness,
-        RpcMethod::MegaSetValidatedBlocks,
+        RpcMethod::MegaSetValidatedChain,
     ];
     for method in methods {
         let method_str = method.as_str();
