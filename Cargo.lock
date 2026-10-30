@@ -1847,7 +1847,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "coverage-replayer"
-version = "2.0.20"
+version = "2.1.0"
 dependencies = [
  "alloy-genesis",
  "alloy-primitives",
@@ -2087,7 +2087,7 @@ dependencies = [
 
 [[package]]
 name = "debug-trace-server"
-version = "2.0.20"
+version = "2.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-evm",
@@ -5804,7 +5804,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stateless-common"
-version = "2.0.20"
+version = "2.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -5842,7 +5842,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-core"
-version = "2.0.20"
+version = "2.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -5881,7 +5881,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-db"
-version = "2.0.20"
+version = "2.1.0"
 dependencies = [
  "alloy-primitives",
  "alloy-rpc-types-eth",
@@ -5901,7 +5901,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-r2"
-version = "2.0.20"
+version = "2.1.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -5918,7 +5918,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-test-utils"
-version = "2.0.20"
+version = "2.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-genesis",
@@ -5941,7 +5941,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-validator"
-version = "2.0.20"
+version = "2.1.0"
 dependencies = [
  "alloy-genesis",
  "alloy-primitives",
