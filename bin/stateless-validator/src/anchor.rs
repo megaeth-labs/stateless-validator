@@ -19,7 +19,7 @@
 //!   cannot make on its own.
 
 use alloy_primitives::BlockHash;
-use alloy_rpc_types_eth::{BlockId, Header};
+use alloy_rpc_types_eth::BlockId;
 use eyre::{Result, eyre};
 use stateless_common::RpcClient;
 use stateless_core::{
@@ -33,50 +33,42 @@ use tracing::{info, warn};
 
 use crate::validator_db::ValidatorDB;
 
-/// What startup does with the stored validated chain, given the anchor flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StartupAction {
-    /// Continue the stored validated chain.
-    Resume,
-    /// Anchor a data dir that has no validated chain yet.
-    Initialize(BlockHash),
-    /// Replace the stored validated chain with one anchored at this block.
-    Reset(BlockHash),
-}
-
-/// Decides what startup does from the stored chain and `--start-block` / `--force-anchor`.
+/// Decides from the stored chain and `--start-block` / `--force-anchor` which block startup
+/// anchors at, or `None` to resume the stored chain.
 ///
 /// `--force-anchor` needs `--start-block`. A stored chain is resumed when neither is given and
 /// replaced only when both are, so a `--start-block` left in a deployment's environment cannot
 /// silently throw validated progress away on a restart. A data dir with no chain needs
 /// `--start-block`; `--force-anchor` is accepted there, as there is nothing to replace.
-pub(crate) fn startup_action(
+fn startup_anchor(
     stored: &ValidatedChain,
     start_block: Option<BlockHash>,
     force_anchor: bool,
-) -> Result<StartupAction> {
+) -> Result<Option<BlockHash>> {
     match (&stored.anchor, start_block, force_anchor) {
         (_, None, true) => Err(eyre!("--force-anchor requires --start-block")),
         (None, None, false) => Err(eyre!(
             "No trusted starting point found. Specify a trusted block with --start-block \
              <blockhash>"
         )),
-        (None, Some(hash), _) => Ok(StartupAction::Initialize(hash)),
-        (Some(_), None, false) => Ok(StartupAction::Resume),
+        (Some(_), None, false) => Ok(None),
         (Some(anchor), Some(_), false) => Err(eyre!(
             "the data dir already holds a validated chain (anchor {} {}, validated {}); omit \
              --start-block to resume it, or pass --force-anchor with --start-block to replace it \
              and clear its validated progress",
             anchor.block_number,
             anchor.block_hash,
-            describe(stored.validated.as_ref()),
+            stored.validated.as_ref().map_or_else(
+                || "none".to_string(),
+                |v| format!("{} {}", v.block_number, v.block_hash)
+            ),
         )),
-        (Some(_), Some(hash), true) => Ok(StartupAction::Reset(hash)),
+        (None, Some(hash), _) | (Some(_), Some(hash), true) => Ok(Some(hash)),
     }
 }
 
 /// Applies `--start-block` / `--force-anchor` to the validated chain in `validator_db` before the
-/// pipeline starts; see [`startup_action`] for which combinations are accepted.
+/// pipeline starts; see [`startup_anchor`] for which combinations are accepted.
 ///
 /// Initializing and resetting both anchor at the block `--start-block` names, which must be on
 /// the canonical chain of the `--rpc-endpoint`s, and leave nothing validated above it.
@@ -87,18 +79,13 @@ pub(crate) async fn apply_startup_request(
     force_anchor: bool,
 ) -> Result<()> {
     let stored = validator_db.validated_chain()?;
-    let hash = match startup_action(&stored, start_block, force_anchor)? {
-        StartupAction::Resume => {
-            let anchor = stored.anchor.as_ref().expect("a resumed chain has an anchor");
-            info!(
-                anchor = anchor.block_number,
-                anchor_hash = %anchor.block_hash,
-                validated = ?stored.validated.as_ref().map(|v| v.block_number),
-                "Resuming the stored validated chain"
-            );
-            return Ok(());
-        }
-        StartupAction::Initialize(hash) | StartupAction::Reset(hash) => hash,
+    let Some(hash) = startup_anchor(&stored, start_block, force_anchor)? else {
+        info!(
+            anchor = ?stored.anchor.as_ref().map(|a| (a.block_number, a.block_hash)),
+            validated = ?stored.validated.as_ref().map(|v| v.block_number),
+            "Resuming the stored validated chain"
+        );
+        return Ok(());
     };
 
     info!(start_block = %hash, "Checking --start-block against the canonical chain");
@@ -127,47 +114,37 @@ pub(crate) async fn apply_startup_request(
 /// only off the canonical chain, or that carries no withdrawals root fails with an error naming
 /// the chain head — the highest block that could be an anchor — and, when the block's height is
 /// known, the canonical hash at that height.
-pub(crate) async fn resolve_canonical_anchor(
-    client: &RpcClient,
-    hash: BlockHash,
-) -> Result<BlockMeta> {
+async fn resolve_canonical_anchor(client: &RpcClient, hash: BlockHash) -> Result<BlockMeta> {
     let header = client.find_header(BlockId::Hash(hash.into()), true).await;
     let canonical = match &header {
-        Some(header) => client.find_header(BlockId::Number(header.number.into()), false).await,
+        Some(header) => {
+            client.find_header(BlockId::Number(header.number.into()), false).await.map(|h| h.hash)
+        }
         None => None,
     };
-    if let Some(header) = header.as_ref().filter(|_| canonical_hash(&canonical) == Some(hash)) {
-        return BlockMeta::try_from_header(header).ok_or_else(|| {
-            eyre!("--start-block {hash} (block {}) has no withdrawals root", header.number)
-        });
-    }
+    let reason = match (&header, canonical) {
+        (Some(header), Some(canonical)) if canonical == hash => {
+            return BlockMeta::try_from_header(header).ok_or_else(|| {
+                eyre!("--start-block {hash} (block {}) has no withdrawals root", header.number)
+            });
+        }
+        (None, _) => "the endpoints do not know the block".to_string(),
+        (Some(header), Some(canonical)) => format!(
+            "it is block {}, but the canonical block at that height is {canonical}",
+            header.number
+        ),
+        (Some(header), None) => {
+            format!("it is block {}, above the canonical chain head", header.number)
+        }
+    };
 
     let head = client.get_header(BlockId::latest(), false).await;
-    let reason = match header {
-        None => "the endpoints do not know the block".to_string(),
-        Some(header) => match canonical_hash(&canonical) {
-            Some(canonical) => format!(
-                "it is block {}, but the canonical block at that height is {canonical}",
-                header.number
-            ),
-            None => format!("it is block {}, above the canonical chain head", header.number),
-        },
-    };
     Err(eyre!(
         "--start-block {hash} is not on the canonical chain of --rpc-endpoint: {reason}; the \
          chain head, the highest usable anchor, is block {} {}",
         head.number,
         head.hash
     ))
-}
-
-fn canonical_hash(header: &Option<Header>) -> Option<BlockHash> {
-    header.as_ref().map(|header| header.hash)
-}
-
-/// `number hash` of a block, or `none`.
-fn describe(block: Option<&BlockMeta>) -> String {
-    block.map_or_else(|| "none".to_string(), |b| format!("{} {}", b.block_number, b.block_hash))
 }
 
 /// The validator's [`ReorgResolver`]: the core bisection over the retained canonical chain, with
@@ -180,7 +157,7 @@ fn describe(block: Option<&BlockMeta>) -> String {
 /// - and the anchor is off it too, the fork lies below the anchor. The validator holds no hashes
 ///   there to locate it with, so it halts, naming the remote head an operator can re-anchor at with
 ///   `--start-block <hash> --force-anchor`.
-pub struct ValidatorReorgResolver;
+pub(crate) struct ValidatorReorgResolver;
 
 impl<F, S> ReorgResolver<F, S> for ValidatorReorgResolver
 where
@@ -196,9 +173,7 @@ where
                     local_hash,
                     remote_hash,
                 }) => (block_number, local_hash, remote_hash),
-                Err(e) if e.is_fatal() => return Ok(ReorgResolution::Fatal(e.to_string())),
-                // A transport hiccup during the bisection fetches: retry the cycle.
-                Err(e) => return Ok(ReorgResolution::Retry(e.to_string())),
+                Err(e) => return Ok(e.into()),
             };
 
         let anchor = match store.get_anchor() {
@@ -249,9 +224,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::collections::HashMap;
 
     use alloy_primitives::B256;
+    use alloy_rpc_types_eth::Header;
     use jsonrpsee::types::ErrorObjectOwned;
     use stateless_test_utils::mock_rpc::{consistent_header, parse_hex_u64, serve};
 
@@ -272,36 +248,30 @@ mod tests {
     /// Every combination of stored chain and anchor flags, against what the chain-pointer
     /// requirements ask of startup.
     #[test]
-    fn startup_action_follows_the_stored_chain_and_the_flags() {
+    fn startup_anchor_follows_the_stored_chain_and_the_flags() {
         let fresh = stored(None, None);
         let anchored = stored(Some(5), None);
         let validated = stored(Some(5), Some(9));
 
         for chain in [&fresh, &anchored, &validated] {
-            let err = startup_action(chain, None, true).unwrap_err().to_string();
+            let err = startup_anchor(chain, None, true).unwrap_err().to_string();
             assert!(err.contains("--force-anchor requires --start-block"), "{err}");
         }
 
-        let err = startup_action(&fresh, None, false).unwrap_err().to_string();
+        let err = startup_anchor(&fresh, None, false).unwrap_err().to_string();
         assert!(err.contains("--start-block"), "{err}");
         for force in [false, true] {
-            assert_eq!(
-                startup_action(&fresh, Some(hash(1)), force).unwrap(),
-                StartupAction::Initialize(hash(1))
-            );
+            assert_eq!(startup_anchor(&fresh, Some(hash(1)), force).unwrap(), Some(hash(1)));
         }
 
         for chain in [&anchored, &validated] {
-            assert_eq!(startup_action(chain, None, false).unwrap(), StartupAction::Resume);
-            let err = startup_action(chain, Some(hash(1)), false).unwrap_err().to_string();
+            assert_eq!(startup_anchor(chain, None, false).unwrap(), None, "resumes");
+            let err = startup_anchor(chain, Some(hash(1)), false).unwrap_err().to_string();
             assert!(err.contains("--force-anchor") && err.contains("resume"), "{err}");
-            assert_eq!(
-                startup_action(chain, Some(hash(1)), true).unwrap(),
-                StartupAction::Reset(hash(1))
-            );
+            assert_eq!(startup_anchor(chain, Some(hash(1)), true).unwrap(), Some(hash(1)));
         }
 
-        let err = startup_action(&validated, Some(hash(1)), false).unwrap_err().to_string();
+        let err = startup_anchor(&validated, Some(hash(1)), false).unwrap_err().to_string();
         assert!(err.contains("anchor 5") && err.contains("validated 9"), "{err}");
     }
 
@@ -441,7 +411,7 @@ mod tests {
         tip: u64,
         retain: u64,
         fork: u64,
-    ) -> (tempfile::TempDir, Arc<ValidatorDB>, Remote) {
+    ) -> (tempfile::TempDir, ValidatorDB, Remote) {
         let dir = tempfile::tempdir().unwrap();
         let db = ValidatorDB::with_max_chain_length(dir.path().join("test.redb"), retain).unwrap();
         db.reset_to_anchor(&make_block_meta(anchor)).unwrap();
@@ -452,7 +422,7 @@ mod tests {
                 (n, if n <= fork { local } else { BlockHash::repeat_byte(0xf0) })
             })
             .collect();
-        (dir, Arc::new(db), Remote(remote))
+        (dir, db, Remote(remote))
     }
 
     async fn resolve(db: &ValidatorDB, remote: &Remote, tip: u64) -> ReorgResolution {
@@ -475,7 +445,7 @@ mod tests {
     #[tokio::test]
     async fn a_fork_below_the_retained_chain_rewinds_to_the_anchor() {
         let (_dir, db, remote) = reorged(10, 30, 5, 15);
-        assert_eq!(DivergenceLookups::get_earliest(&*db).unwrap().unwrap().0, 26);
+        assert_eq!(DivergenceLookups::get_earliest(&db).unwrap().unwrap().0, 26);
 
         let ReorgResolution::Floor(floor) = resolve(&db, &remote, 30).await else {
             panic!("the anchor is still canonical, so the chain rewinds to it");

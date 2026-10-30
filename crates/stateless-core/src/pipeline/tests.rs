@@ -73,13 +73,15 @@ impl PipelineHooks for NoopHooks {
 struct MockStore {
     chain: std::sync::Mutex<std::collections::BTreeMap<u64, BlockMeta>>,
     anchor: BlockMeta,
+    /// `get_block_hash` calls so far.
+    hash_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl MockStore {
     fn new(anchor: BlockMeta) -> Self {
         let mut chain = std::collections::BTreeMap::new();
         chain.insert(anchor.block_number, anchor.clone());
-        Self { chain: std::sync::Mutex::new(chain), anchor }
+        Self { chain: std::sync::Mutex::new(chain), anchor, hash_reads: Default::default() }
     }
 }
 
@@ -98,6 +100,7 @@ impl ChainStore for MockStore {
         Ok(())
     }
     fn get_block_hash(&self, n: BlockNumber) -> StoreResult<Option<BlockHash>> {
+        self.hash_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(self.chain.lock().unwrap().get(&n).map(|m| m.block_hash))
     }
     fn rollback_chain(&self, to_block: BlockNumber) -> StoreResult<()> {
@@ -486,41 +489,15 @@ async fn test_chain_advancer_uses_store_resolved_floor() {
 /// ascending order, without reading the heights under them one by one.
 #[tokio::test]
 async fn test_chain_advancer_reverted_hashes_stop_below_the_retained_rows() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     let tip = make_tip(30);
-    let store_reads = Arc::new(AtomicUsize::new(0));
-    struct CountingStore(MockStore, Arc<AtomicUsize>);
-    let store = MockStore::new(make_tip(25));
+    let store = Arc::new(MockStore::new(make_tip(25)));
     store.advance_chain(&(26..=30).map(make_tip).collect::<Vec<_>>()).unwrap();
-    let store = CountingStore(store, Arc::clone(&store_reads));
-    impl ChainStore for CountingStore {
-        fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>> {
-            self.0.get_canonical_tip()
-        }
-        fn get_anchor(&self) -> StoreResult<Option<BlockMeta>> {
-            self.0.get_anchor()
-        }
-        fn advance_chain(&self, blocks: &[BlockMeta]) -> StoreResult<()> {
-            self.0.advance_chain(blocks)
-        }
-        fn get_block_hash(&self, n: BlockNumber) -> StoreResult<Option<BlockHash>> {
-            self.1.fetch_add(1, Ordering::SeqCst);
-            self.0.get_block_hash(n)
-        }
-        fn rollback_chain(&self, to_block: BlockNumber) -> StoreResult<()> {
-            self.0.rollback_chain(to_block)
-        }
-        fn reset_to_anchor(&self, anchor: &BlockMeta) -> StoreResult<()> {
-            self.0.reset_to_anchor(anchor)
-        }
-    }
 
     let (tx, rx) = kanal::bounded(1);
     tx.send(Ok(make_block(31, BlockHash::from([0xFF; 32])))).unwrap();
     let result = chain_advancer(
         &MockFetcher { hashes: HashMap::default() },
-        Arc::new(store),
+        Arc::clone(&store),
         Arc::new(NoopHooks),
         &PreResolvedFloorResolver { floor: 0 },
         rx,
@@ -537,7 +514,11 @@ async fn test_chain_advancer_reverted_hashes_stop_below_the_retained_rows() {
         }
         other => panic!("Expected Reorg, got {other:?}"),
     }
-    assert_eq!(store_reads.load(Ordering::SeqCst), 7, "the 6 retained rows and the first gap");
+    assert_eq!(
+        store.hash_reads.load(std::sync::atomic::Ordering::SeqCst),
+        7,
+        "the 6 retained rows and the first gap"
+    );
 }
 
 /// Regression for the `BisectResolver` transient-error path: a *non-fatal* `find_divergence_point`

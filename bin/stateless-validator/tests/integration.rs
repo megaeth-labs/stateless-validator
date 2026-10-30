@@ -363,18 +363,13 @@ fn anchor_flags_parse() {
     assert_eq!((args.start_block, args.force_anchor), (None, false));
     assert!(parse(&["--start-block", "0x01"]).is_err(), "a start block must be a full hash");
 
-    let from_env = stateless_test_utils::env::with_env_var(
+    let from_env = stateless_test_utils::env::with_env_vars(
         &guard,
-        "STATELESS_VALIDATOR_START_BLOCK",
-        TRUSTED_HASH,
-        || {
-            stateless_test_utils::env::with_env_var(
-                &guard,
-                "STATELESS_VALIDATOR_FORCE_ANCHOR",
-                "true",
-                || parse(&[]).unwrap(),
-            )
-        },
+        &[
+            ("STATELESS_VALIDATOR_START_BLOCK", TRUSTED_HASH),
+            ("STATELESS_VALIDATOR_FORCE_ANCHOR", "true"),
+        ],
+        || parse(&[]).unwrap(),
     );
     assert_eq!(from_env.start_block, Some(TRUSTED_HASH.parse().unwrap()));
     assert!(from_env.force_anchor);

@@ -60,6 +60,16 @@ fn anchor_in(read_txn: &redb::ReadTransaction) -> StoreResult<Option<BlockMeta>>
     let Some(table) = open_read_table(read_txn, ANCHOR_BLOCK)? else {
         return Ok(None);
     };
+    anchor_row(&table)
+}
+
+/// ANCHOR_BLOCK value tuple: `(block_number, block_hash, post_state_root, post_withdrawals_root)`.
+type AnchorRow = (u64, [u8; 32], [u8; 32], [u8; 32]);
+
+/// The anchor row of an ANCHOR_BLOCK table, opened by a read or a write transaction alike.
+fn anchor_row(
+    table: &impl ReadableTable<&'static str, AnchorRow>,
+) -> StoreResult<Option<BlockMeta>> {
     Ok(table.get("anchor").store_err()?.map(|v| block_meta_from_tuple(v.value())))
 }
 
@@ -161,15 +171,7 @@ pub fn write_rollback_chain(database: &Database, to_block: BlockNumber) -> Store
     let write_txn = database.begin_write().store_err()?;
     {
         let mut chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
-        let to_remove: Vec<u64> = chain
-            .range((to_block + 1)..)
-            .store_err()?
-            .map(|r| r.map(|(k, _)| k.value()))
-            .collect::<std::result::Result<_, _>>()
-            .store_err()?;
-        for n in to_remove {
-            chain.remove(n).store_err()?;
-        }
+        chain.retain_in((to_block + 1).., |_, _| false).store_err()?;
     }
     write_txn.commit().store_err()?;
     Ok(())
@@ -186,10 +188,7 @@ pub fn write_rollback_chain(database: &Database, to_block: BlockNumber) -> Store
 pub fn write_rewind_validated_chain(database: &Database, to_block: BlockNumber) -> StoreResult<()> {
     let write_txn = database.begin_write().store_err()?;
     {
-        let anchor = {
-            let table = write_txn.open_table(ANCHOR_BLOCK).store_err()?;
-            table.get("anchor").store_err()?.map(|v| block_meta_from_tuple(v.value()))
-        };
+        let anchor = anchor_row(&write_txn.open_table(ANCHOR_BLOCK).store_err()?)?;
         let anchor = anchor.ok_or_else(|| {
             StoreError::Corrupt(format!("cannot rewind to block {to_block}: no anchor is set"))
         })?;
@@ -201,15 +200,7 @@ pub fn write_rewind_validated_chain(database: &Database, to_block: BlockNumber) 
         }
 
         let mut chain = write_txn.open_table(CANONICAL_CHAIN).store_err()?;
-        let to_remove: Vec<u64> = chain
-            .range((to_block + 1)..)
-            .store_err()?
-            .map(|r| r.map(|(k, _)| k.value()))
-            .collect::<std::result::Result<_, _>>()
-            .store_err()?;
-        for n in to_remove {
-            chain.remove(n).store_err()?;
-        }
+        chain.retain_in((to_block + 1).., |_, _| false).store_err()?;
 
         if chain.get(to_block).store_err()?.is_none() {
             if to_block != anchor.block_number {

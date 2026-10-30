@@ -67,7 +67,6 @@ pub async fn run_with_signals(
         Some(task::spawn(validation_reporter(
             Arc::clone(&client),
             Arc::clone(&validator_db),
-            REPORT_INTERVAL,
             stop_reporting.clone(),
         )))
     } else {
@@ -153,7 +152,7 @@ pub async fn run_with_signals(
 }
 
 /// Reports the validated chain `(anchor, validated]` to the dedicated report endpoint via
-/// `mega_setValidatedChain`, every `report_interval` until `stop` fires, then flushes it once
+/// `mega_setValidatedChain`, every [`REPORT_INTERVAL`] until `stop` fires, then flushes it once
 /// more with up to [`FINAL_REPORT_ATTEMPTS`] attempts.
 ///
 /// Returns `Err` only when that final flush cannot land. Periodic rounds that fail are simply
@@ -161,7 +160,6 @@ pub async fn run_with_signals(
 async fn validation_reporter(
     client: Arc<RpcClient>,
     validator_db: Arc<ValidatorDB>,
-    report_interval: Duration,
     stop: CancellationToken,
 ) -> Result<()> {
     info!("Starting validation reporter");
@@ -169,7 +167,7 @@ async fn validation_reporter(
 
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(report_interval) => {}
+            _ = tokio::time::sleep(REPORT_INTERVAL) => {}
             _ = stop.cancelled() => break,
         }
         report_chain_once(&client, &validator_db, &mut reported).await;
