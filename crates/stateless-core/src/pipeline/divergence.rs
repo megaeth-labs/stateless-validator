@@ -35,7 +35,10 @@ pub trait DivergenceLookups {
 #[derive(Debug, thiserror::Error)]
 pub enum DivergenceError {
     /// Earliest local block doesn't match remote — reorg deeper than our history.
-    /// Requires manual restart with a new `--start-block`.
+    /// Requires re-anchoring the store on the current chain, which each binary does its own way:
+    /// the validator with `--start-block <hash> --force-anchor`, the trace server with
+    /// `--start-block` on an empty data dir (it ignores the flag once a chain is stored). The
+    /// validator's resolver handles this case itself while its anchor is still canonical.
     #[error(
         "Catastrophic reorg: earliest local block {block_number} hash mismatch \
          (local: {local_hash:?}, remote: {remote_hash:?}). Manual restart required."
@@ -43,7 +46,7 @@ pub enum DivergenceError {
     CatastrophicReorg { block_number: BlockNumber, local_hash: BlockHash, remote_hash: BlockHash },
 
     /// A block that should exist locally is missing — database is inconsistent.
-    /// Requires manual restart with a new `--start-block`.
+    /// Requires re-anchoring the store, as for [`Self::CatastrophicReorg`].
     #[error(
         "Local chain corrupt: block {block_number} missing during reorg resolution. \
          Manual restart required."

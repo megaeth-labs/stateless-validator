@@ -4,7 +4,7 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use alloy_genesis::Genesis;
 use alloy_primitives::BlockHash;
-use clap::Parser;
+use clap::{CommandFactory, Parser, error::ErrorKind};
 use eyre::Result;
 use stateless_common::{
     BackoffPolicy, R2CountFlag, R2Flag, R2Flags, R2TuningFlag, R2WitnessTransport, RedactedSecret,
@@ -180,6 +180,9 @@ pub struct CommandLineArgs {
 
     /// Replace the stored validated chain with one anchored at `--start-block`, clearing its
     /// validated progress. Requires `--start-block`.
+    ///
+    /// `STATELESS_VALIDATOR_FORCE_ANCHOR=false` is the same as leaving it out, `--block-list`
+    /// runs included (see [`CommandLineArgs::check_flag_values`]).
     #[clap(long, env = "STATELESS_VALIDATOR_FORCE_ANCHOR")]
     pub force_anchor: bool,
 
@@ -201,7 +204,6 @@ pub struct CommandLineArgs {
         env = "STATELESS_VALIDATOR_BLOCK_LIST",
         conflicts_with_all = [
             "start_block",
-            "force_anchor",
             "end_block",
             "report_validation_endpoint",
         ],
@@ -335,6 +337,35 @@ pub struct CommandLineArgs {
     pub log: LogArgs,
 }
 
+impl CommandLineArgs {
+    /// Parses the command line like [`Parser::parse`], then applies
+    /// [`Self::check_flag_values`], exiting with clap's usage error if either fails.
+    pub fn parse_checked() -> Self {
+        let args = Self::parse();
+        if let Err(err) = args.check_flag_values() {
+            err.exit();
+        }
+        args
+    }
+
+    /// The flag rules that depend on a value rather than on presence, which clap's relations
+    /// cannot express.
+    ///
+    /// clap counts a flag whose env var is set as given, whatever the value, so `--force-anchor`
+    /// among `--block-list`'s conflicts would refuse a block-list run whose environment carries
+    /// `STATELESS_VALIDATOR_FORCE_ANCHOR=false`, as a template shared with the chain-following
+    /// roles renders it. Only a switch that is on conflicts.
+    pub fn check_flag_values(&self) -> Result<(), clap::Error> {
+        if self.block_list.is_some() && self.force_anchor {
+            return Err(Self::command().error(
+                ErrorKind::ArgumentConflict,
+                "the argument '--block-list <BLOCK_LIST>' cannot be used with '--force-anchor'",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Entry point for the validator binary.
 ///
 /// Parses CLI args, initializes tracing and metrics, constructs the RPC client and
@@ -342,7 +373,7 @@ pub struct CommandLineArgs {
 /// validated chain ([`anchor::apply_startup_request`]), then hands off to
 /// [`runner::run_with_signals`].
 pub async fn run() -> Result<()> {
-    let args = CommandLineArgs::parse();
+    let args = CommandLineArgs::parse_checked();
     let _log_guard = args.log.init_tracing()?;
     let start = std::time::Instant::now();
 

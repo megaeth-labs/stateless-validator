@@ -81,6 +81,7 @@ cargo run --release --bin stateless-validator -- \
 - `--end-block`: Inclusive end block; validate up to this height, then stop cleanly (useful to slice a fixed range across multiple servers)
 - `--block-list`: Replay exactly the block numbers in this file instead of following the chain, then exit; see "Replaying a block list" below.
   It excludes `--start-block`, `--force-anchor`, `--end-block` and `--report-validation-endpoint`, and requires `--genesis-file`.
+  `STATELESS_VALIDATOR_FORCE_ANCHOR=false` counts as leaving `--force-anchor` out, so an env file shared with chain-following runs can carry it.
 - `--block-list-timeout-secs`, `--block-list-concurrency`, `--block-list-output-dir`: tuning for `--block-list` (per-stage timeout, default 300; blocks in flight, default twice the physical cores, of which at most one per physical core validates at a time; where the output files go, default `--data-dir`).
   They are rejected without `--block-list`.
 - `--r2-endpoint`, `--r2-bucket`, `--r2-access-key-id`, `--r2-secret-access-key`: R2 connection settings for the signed S3 target, all four required together (prefer the env var for the secret).
@@ -298,7 +299,7 @@ Each command-line flag has an equivalent environment variable:
 - `STATELESS_VALIDATOR_WITNESS_ENDPOINT` → `--witness-endpoint`
 - `STATELESS_VALIDATOR_GENESIS_FILE` → `--genesis-file`
 - `STATELESS_VALIDATOR_START_BLOCK` → `--start-block`
-- `STATELESS_VALIDATOR_FORCE_ANCHOR` → `--force-anchor` (set to `true` to enable)
+- `STATELESS_VALIDATOR_FORCE_ANCHOR` → `--force-anchor` (`true` to enable, `false` the same as unset)
 - `STATELESS_VALIDATOR_END_BLOCK` → `--end-block`
 - `STATELESS_VALIDATOR_BLOCK_LIST` / `_BLOCK_LIST_TIMEOUT_SECS` / `_BLOCK_LIST_CONCURRENCY` / `_BLOCK_LIST_OUTPUT_DIR` → `--block-list*`
 - `STATELESS_VALIDATOR_R2_ENDPOINT` / `_R2_BUCKET` / `_R2_ACCESS_KEY_ID` / `_R2_SECRET_ACCESS_KEY` → `--r2-*` (the signed S3 target)

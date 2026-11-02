@@ -289,8 +289,12 @@ fn block_list_flag_combinations() {
     // The conflict rules read the environment too: hold the lock so a test that has
     // `STATELESS_VALIDATOR_END_BLOCK` (or another conflicting variable) set cannot leak into
     // these parses.
-    let _env = stateless_test_utils::env::env_lock();
-    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
+    let env = stateless_test_utils::env::env_lock();
+    // What startup applies: clap's rules, then the value-dependent ones.
+    let parse = |extra: &[&str]| {
+        CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra))
+            .and_then(|args| args.check_flag_values().map(|()| args))
+    };
     let with_list = ["--block-list", "/tmp/pool.txt", "--genesis-file", "/tmp/genesis.json"];
 
     let args = parse(&with_list).unwrap();
@@ -330,6 +334,18 @@ fn block_list_flag_combinations() {
         let argv = [&with_list[..], conflicting].concat();
         assert!(parse(&argv).is_err(), "{conflicting:?} must conflict with --block-list");
     }
+    // A switch conflicts only when it is on: an env template shared with the chain-following
+    // roles may render `FORCE_ANCHOR=false`, and that must not stop a block-list run.
+    let force_anchor_env = |value| {
+        stateless_test_utils::env::with_env_var(
+            &env,
+            "STATELESS_VALIDATOR_FORCE_ANCHOR",
+            value,
+            || parse(&with_list),
+        )
+    };
+    assert!(!force_anchor_env("false").unwrap().force_anchor);
+    assert!(force_anchor_env("true").is_err(), "an enabled switch still conflicts");
     // Zero would time every block out on its first poll, or never start one.
     for zero in [&["--block-list-timeout-secs", "0"][..], &["--block-list-concurrency", "0"][..]] {
         let argv = [&with_list[..], zero].concat();
