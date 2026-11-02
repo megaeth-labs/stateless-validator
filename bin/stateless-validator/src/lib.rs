@@ -3,6 +3,7 @@
 //! Exposes the items used by the binary entrypoint ([`main.rs`](../main/index.html))
 //! and the integration tests under `tests/`. Internals stay `pub(crate)`.
 
+pub(crate) mod anchor;
 pub(crate) mod app;
 pub(crate) mod chain_sync;
 pub(crate) mod metrics;
@@ -22,6 +23,24 @@ pub use validator_db::ValidatorDB;
 pub(crate) mod test_support {
     use alloy_primitives::{B256, BlockHash};
     use stateless_core::db::BlockMeta;
+    use stateless_db::DEFAULT_MAX_CHAIN_LENGTH;
+
+    use crate::ValidatorDB;
+
+    /// A fresh `ValidatorDB` in a temp dir, with the default canonical-chain retention. Keep the
+    /// `TempDir` alive as long as the store.
+    pub(crate) fn temp_store() -> (tempfile::TempDir, ValidatorDB) {
+        temp_store_retaining(DEFAULT_MAX_CHAIN_LENGTH)
+    }
+
+    /// [`temp_store`], retaining at most `max_chain_length` canonical-chain rows.
+    pub(crate) fn temp_store_retaining(max_chain_length: u64) -> (tempfile::TempDir, ValidatorDB) {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            ValidatorDB::with_max_chain_length(dir.path().join("test.redb"), max_chain_length)
+                .unwrap();
+        (dir, store)
+    }
 
     /// A deterministic `BlockMeta` derived from `num` alone.
     pub(crate) fn make_block_meta(num: u64) -> BlockMeta {

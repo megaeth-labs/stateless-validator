@@ -9,7 +9,7 @@
 //! - **Multi-endpoint witness support**: accepts an ordered list of witness endpoints.
 //! - **Concurrency limiting**: two independent [`tokio::sync::Semaphore`]s cap in-flight requests —
 //!   one for data-endpoint calls (blocks/headers/code/tx), one for witness fetches — so a burst on
-//!   one path cannot starve the other. `set_validated_blocks` is unthrottled.
+//!   one path cannot starve the other. `set_validated_chain` is unthrottled.
 //! - **Retry model**: within a single logical call, each provider is attempted once per round. If
 //!   all providers in a round fail, the client sleeps for round-level exponential backoff (capped
 //!   at [`BackoffPolicy::max`](crate::BackoffPolicy)) and starts a new round. Load distribution
@@ -23,7 +23,7 @@
 //!   the wall-clock deadline passes (and clamps each inter-round sleep so it doesn't overshoot).
 //!   With `None` the loop retries forever — this is the validator's background-sync contract. The
 //!   non-`_with_deadline` methods delegate to the deadline version with `None`.
-//!   `set_validated_blocks` is single-attempt, but still bounded by `per_attempt_timeout`.
+//!   `set_validated_chain` is single-attempt, but still bounded by `per_attempt_timeout`.
 //! - **Attempt bounds**: every provider attempt is capped by
 //!   [`RpcClientConfig::per_attempt_timeout`] (a provider that accepts TCP but never replies
 //!   rotates instead of wedging the loop), and the connect phase alone by
@@ -217,12 +217,44 @@ pub struct WitnessRequestKeys {
     pub block_hash: B256,
 }
 
-/// Response from mega_setValidatedBlocks RPC call
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A `(number, hash)` block pointer as `mega_setValidatedChain` takes and reports it:
+/// `{ "blockNumber": <hex quantity>, "blockHash": <hash> }`.
+///
+/// Mirrors the receiver's own `BlockRef` (mega-reth `megaeth_rpc::validator_chain`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SetValidatedBlocksResponse {
+pub struct BlockRef {
+    /// Block number.
+    pub block_number: U64,
+    /// Block hash.
+    pub block_hash: B256,
+}
+
+impl BlockRef {
+    /// The pointer to block `number` with hash `hash`.
+    pub fn new(number: u64, hash: B256) -> Self {
+        Self { block_number: U64::from(number), block_hash: hash }
+    }
+}
+
+/// Response from `mega_setValidatedChain`: whether the receiver recorded the reported chain,
+/// and the validated chain `(anchor, validated]` it holds after the call.
+///
+/// The receiver checks only that `anchor < validated` (an invalid-params error otherwise) and
+/// that both blocks are on its durable canonical chain. A chain it does not hold (yet) is
+/// refused with `accepted: false` and nothing written; an accepted one replaces whatever it
+/// recorded before, so a report after a reorg may end below the previous one. On a refusal
+/// either end reads as `None` when the receiver has nothing for it, or no longer holds its block
+/// on its canonical chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetValidatedChainResponse {
+    /// Whether the receiver recorded the reported chain.
     pub accepted: bool,
-    pub last_validated_block: (U64, B256),
+    /// The receiver's anchor after the call.
+    pub anchor: Option<BlockRef>,
+    /// The receiver's highest validated block after the call.
+    pub validated: Option<BlockRef>,
 }
 
 /// Error returned by the witness fetches that take a caller-computed provider range.
@@ -699,6 +731,24 @@ impl RpcClient {
         self.get_header(BlockId::Number(BlockNumberOrTag::Number(block_number)), false).await.hash
     }
 
+    /// Like [`Self::get_header`], except that a block the endpoint answers `null` for is `None`
+    /// instead of a failure to retry. Transport and verification failures still retry forever.
+    ///
+    /// For lookups where "no such block" is itself the answer — checking an operator-supplied
+    /// block against the canonical chain — rather than for a block that must exist.
+    pub async fn find_header(&self, block_id: BlockId, verify_hash: bool) -> Option<Header> {
+        self.call_with_deadline(RpcMethod::EthGetHeader, None, move |provider| {
+            Box::pin(async move {
+                do_find_header(&provider, block_id, verify_hash).await.map_err(|e| {
+                    trace!(?block_id, error = %e, "find_header failed");
+                    e
+                })
+            })
+        })
+        .await
+        .expect("None deadline cannot time out")
+    }
+
     /// Gets execution witness data for a specific block. Retries forever.
     ///
     /// Uses primary-failover rather than round-robin: each round starts from provider 0
@@ -898,12 +948,14 @@ impl RpcClient {
         .await
     }
 
-    /// Reports a range of validated blocks via the dedicated report endpoint.
-    pub async fn set_validated_blocks(
+    /// Reports the validated chain `(anchor, validated]` via `mega_setValidatedChain` on the
+    /// dedicated report endpoint. `anchor` must be below `validated`; see
+    /// [`SetValidatedChainResponse`] for what the receiver checks and answers.
+    pub async fn set_validated_chain(
         &self,
-        first_block: (u64, B256),
-        last_block: (u64, B256),
-    ) -> Result<SetValidatedBlocksResponse> {
+        anchor: BlockRef,
+        validated: BlockRef,
+    ) -> Result<SetValidatedChainResponse> {
         let provider =
             self.report_provider.as_ref().ok_or_else(|| eyre!("Report provider not configured"))?;
         let attempt_start = Instant::now();
@@ -911,27 +963,27 @@ impl RpcClient {
         // way the retry loop does: returned error vs per-attempt stall.
         let (result, outcome) = match tokio::time::timeout(
             self.config.per_attempt_timeout,
-            provider.client().request::<_, SetValidatedBlocksResponse>(
-                "mega_setValidatedBlocks",
-                (first_block, last_block),
+            provider.client().request::<_, SetValidatedChainResponse>(
+                "mega_setValidatedChain",
+                (anchor, validated),
             ),
         )
         .await
         {
             Ok(Ok(response)) => (Ok(response), RpcAttemptOutcome::Success),
             Ok(Err(e)) => {
-                trace!(error = %e, "mega_setValidatedBlocks failed");
-                (Err(eyre!("Failed to set validated blocks: {e}")), RpcAttemptOutcome::Error)
+                trace!(error = %e, "mega_setValidatedChain failed");
+                (Err(eyre!("Failed to set validated chain: {e}")), RpcAttemptOutcome::Error)
             }
             Err(_) => {
                 warn!(
-                    method = RpcMethod::MegaSetValidatedBlocks.as_str(),
+                    method = RpcMethod::MegaSetValidatedChain.as_str(),
                     attempt_timeout_ms = self.config.per_attempt_timeout.as_millis() as u64,
                     "Report RPC stalled past per-attempt timeout",
                 );
                 (
                     Err(eyre!(
-                        "mega_setValidatedBlocks timed out after {:?} (per_attempt_timeout)",
+                        "mega_setValidatedChain timed out after {:?} (per_attempt_timeout)",
                         self.config.per_attempt_timeout
                     )),
                     RpcAttemptOutcome::Timeout,
@@ -941,7 +993,7 @@ impl RpcClient {
         if let Some(ref metrics) = self.config.metrics {
             let provider_label = self.report_provider_label.as_deref().unwrap_or("report");
             metrics.on_rpc_attempt(
-                RpcMethod::MegaSetValidatedBlocks,
+                RpcMethod::MegaSetValidatedChain,
                 provider_label,
                 outcome,
                 attempt_start.elapsed().as_secs_f64(),
@@ -1516,20 +1568,32 @@ async fn do_get_header(
     block_id: BlockId,
     verify_hash: bool,
 ) -> Result<Header> {
+    do_find_header(provider, block_id, verify_hash)
+        .await?
+        .ok_or_else(|| eyre!("Header {block_id:?} not found"))
+}
+
+/// [`do_get_header`], with a `null` answer — the endpoint has no such block — kept apart from
+/// failures as `Ok(None)`.
+async fn do_find_header(
+    provider: &RootProvider<Optimism>,
+    block_id: BlockId,
+    verify_hash: bool,
+) -> Result<Option<Header>> {
     let result = match block_id {
         BlockId::Hash(hash) => provider
             .client()
-            .request::<_, Header>("eth_getHeaderByHash", (hash.block_hash,))
+            .request::<_, Option<Header>>("eth_getHeaderByHash", (hash.block_hash,))
             .await
             .map_err(|e| eyre!("eth_getHeaderByHash for {} failed: {e}", hash.block_hash)),
         BlockId::Number(tag) => provider
             .client()
-            .request::<_, Header>("eth_getHeaderByNumber", (tag,))
+            .request::<_, Option<Header>>("eth_getHeaderByNumber", (tag,))
             .await
             .map_err(|e| eyre!("eth_getHeaderByNumber for {:?} failed: {e}", tag)),
     };
 
-    let header = result?;
+    let Some(header) = result? else { return Ok(None) };
 
     // Verify block_id matches the returned header
     match block_id {
@@ -1561,7 +1625,7 @@ async fn do_get_header(
         );
     }
 
-    Ok(header)
+    Ok(Some(header))
 }
 
 /// Shared single-attempt `mega_getBlockWitness` transport: one RPC round trip, returning
@@ -2701,14 +2765,14 @@ mod tests {
     /// still must have per-attempt timeout protection so the validation reporter task cannot
     /// wedge forever on a TCP-accept-no-reply endpoint.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_set_validated_blocks_times_out_stalled_report_provider() {
+    async fn test_set_validated_chain_times_out_stalled_report_provider() {
         // Stalled report endpoint: keep a listener open so TCP connects succeed, but never
         // accept/read/write from it. The HTTP request then waits forever without the timeout.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let stalled_report_url = format!("http://{}/", listener.local_addr().unwrap());
         let _listener = listener;
 
-        // Data/witness endpoints are unused by `set_validated_blocks`, but the client
+        // Data/witness endpoints are unused by `set_validated_chain`, but the client
         // constructor requires them to be configured.
         let (handle, data_url) = start_block_number_rpc(1).await;
 
@@ -2726,15 +2790,112 @@ mod tests {
 
         let err = tokio::time::timeout(
             Duration::from_secs(3),
-            client.set_validated_blocks((1, B256::ZERO), (2, B256::ZERO)),
+            client.set_validated_chain(BlockRef::new(1, B256::ZERO), BlockRef::new(2, B256::ZERO)),
         )
         .await
         .expect("report call must return after per-attempt timeout")
         .expect_err("stalled report endpoint should time out");
         assert!(
-            err.to_string().contains("mega_setValidatedBlocks timed out"),
+            err.to_string().contains("mega_setValidatedChain timed out"),
             "unexpected error: {err}"
         );
+
+        handle.stop().unwrap();
+    }
+
+    /// `mega_setValidatedChain` takes two positional `{ blockNumber, blockHash }` objects with the
+    /// number as a hex quantity — the receiver's `BlockRef` — and its reply carries either end as
+    /// such an object or `null`.
+    #[tokio::test]
+    async fn set_validated_chain_speaks_the_receivers_wire_shape() {
+        let (data, data_url) = start_block_number_rpc(1).await;
+        let received = Arc::new(std::sync::Mutex::new(None));
+        let (report, report_url) = serve(Arc::clone(&received), |m| {
+            m.register_method("mega_setValidatedChain", |params, received, _| {
+                let raw: serde_json::Value = params.parse().unwrap();
+                *received.lock().unwrap() = Some(raw);
+                Ok::<_, ErrorObjectOwned>(serde_json::json!({
+                    "accepted": false,
+                    "anchor": { "blockNumber": "0x5", "blockHash": B256::repeat_byte(5) },
+                    "validated": null,
+                }))
+            })
+            .unwrap();
+        })
+        .await;
+        let client = RpcClient::new_with_config(
+            &[&data_url],
+            &[&data_url],
+            RpcClientConfig::default(),
+            Some(&report_url),
+        )
+        .unwrap();
+
+        let response = client
+            .set_validated_chain(
+                BlockRef::new(10, B256::repeat_byte(0xa)),
+                BlockRef::new(26, B256::repeat_byte(0xb)),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            received.lock().unwrap().take().unwrap(),
+            serde_json::json!([
+                { "blockNumber": "0xa", "blockHash": B256::repeat_byte(0xa) },
+                { "blockNumber": "0x1a", "blockHash": B256::repeat_byte(0xb) },
+            ])
+        );
+        assert_eq!(
+            response,
+            SetValidatedChainResponse {
+                accepted: false,
+                anchor: Some(BlockRef::new(5, B256::repeat_byte(5))),
+                validated: None,
+            }
+        );
+
+        report.stop().unwrap();
+        data.stop().unwrap();
+    }
+
+    /// `find_header` reports a block the endpoint answers `null` for as `None` without retrying,
+    /// and a block it has as the header, by hash and by number alike.
+    #[tokio::test]
+    async fn find_header_reports_an_unknown_block_as_none() {
+        let known = consistent_header(7);
+        let (handle, url) = serve(known.clone(), |m| {
+            m.register_method("eth_getHeaderByHash", |params, known, _| {
+                let (hash,): (B256,) = params.parse().unwrap();
+                Ok::<_, ErrorObjectOwned>((hash == known.hash).then(|| known.clone()))
+            })
+            .unwrap();
+            m.register_method("eth_getHeaderByNumber", |params, known, _| {
+                let (hex,): (String,) = params.parse().unwrap();
+                Ok::<_, ErrorObjectOwned>((parse_hex_u64(&hex) == 7).then(|| known.clone()))
+            })
+            .unwrap();
+        })
+        .await;
+        let client = client_at(&url);
+
+        let by_hash = |hash: B256| client.find_header(BlockId::Hash(hash.into()), true);
+        let by_number = |n: u64| client.find_header(BlockId::Number(n.into()), false);
+        let found = tokio::time::timeout(Duration::from_secs(5), async {
+            (
+                by_hash(known.hash).await,
+                by_hash(B256::repeat_byte(0xee)).await,
+                by_number(7).await,
+                by_number(8).await,
+            )
+        })
+        .await
+        .expect("a null answer must not be retried");
+
+        assert_eq!(found.0.map(|h| h.hash), Some(known.hash));
+        assert!(found.1.is_none());
+        assert_eq!(found.2.map(|h| h.hash), Some(known.hash));
+        assert!(found.3.is_none());
 
         handle.stop().unwrap();
     }

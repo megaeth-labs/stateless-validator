@@ -140,6 +140,9 @@ pub trait ChainStore: Send + Sync {
     fn get_canonical_tip(&self) -> StoreResult<Option<BlockMeta>>;
     fn get_anchor(&self) -> StoreResult<Option<BlockMeta>>;
     fn advance_chain(&self, blocks: &[BlockMeta]) -> StoreResult<()>;
+    /// Hash of the block at `block_number`, or `None` once it is below what the store retains.
+    /// Retained hashes run contiguously down from the tip, so the reorg event's walk down from
+    /// the tip stops at the first `None`.
     fn get_block_hash(&self, block_number: BlockNumber) -> StoreResult<Option<BlockHash>>;
     fn rollback_chain(&self, to_block: BlockNumber) -> StoreResult<()>;
     /// Reset anchor + tip to `anchor`. Called by the pipeline only on the stale-reset path

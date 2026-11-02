@@ -5951,6 +5951,7 @@ dependencies = [
  "jsonrpsee",
  "jsonrpsee-types",
  "metrics",
+ "metrics-util",
  "op-alloy-rpc-types",
  "redb",
  "revm",

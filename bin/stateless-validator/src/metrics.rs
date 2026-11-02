@@ -104,6 +104,10 @@ pub mod names {
     metric!(CODE_FETCH_TIME, "code_fetch_time_seconds");
     metric!(WITNESS_FETCH_RPC_TIME, "witness_fetch_rpc_time_seconds");
 
+    // Validated-chain reports (live with `--report-validation-endpoint`)
+    metric!(VALIDATED_CHAIN_REPORTS, "validated_chain_reports_total");
+    metric!(REPORTED_VALIDATED_HEIGHT, "reported_validated_height");
+
     // R2 witness source (live once the `--r2-*` flags configure a target)
     metric!(WITNESS_FETCH_R2_TIME, "witness_fetch_r2_time_seconds");
     metric!(R2_WITNESS_RETRY_ATTEMPTS_TOTAL, "r2_witness_retry_attempts_total");
@@ -194,6 +198,19 @@ fn register_metric_descriptions() {
     describe_histogram!(names::CODE_FETCH_TIME, "Code fetch time (s)");
     describe_histogram!(names::WITNESS_FETCH_RPC_TIME, "Witness RPC fetch time (s)");
 
+    // Validated-chain reports
+    describe_counter!(
+        names::VALIDATED_CHAIN_REPORTS,
+        "mega_setValidatedChain reports by outcome: `accepted`, `refused` (the receiver does not \
+         hold both blocks on its canonical chain and recorded nothing) or `failed` (the call \
+         itself failed). A round with nothing new to report sends nothing and counts nothing"
+    );
+    describe_gauge!(
+        names::REPORTED_VALIDATED_HEIGHT,
+        "Validated block of the last chain the receiver accepted, 0 until one is. Flat while \
+         `local_chain_height` advances means reports are not landing"
+    );
+
     // R2 witness source
     describe_histogram!(
         names::WITNESS_FETCH_R2_TIME,
@@ -244,7 +261,7 @@ fn init_rpc_method_counters() {
         RpcMethod::EthBlockNumber,
         RpcMethod::EthGetHeader,
         RpcMethod::MegaGetBlockWitness,
-        RpcMethod::MegaSetValidatedBlocks,
+        RpcMethod::MegaSetValidatedChain,
     ];
     for method in methods {
         let method_str = method.as_str();
@@ -380,6 +397,52 @@ pub fn on_rpc_attempt(method: RpcMethod, outcome: RpcAttemptOutcome, duration_se
             histogram!(names::WITNESS_FETCH_RPC_TIME).record(duration_secs);
         }
         _ => {}
+    }
+}
+
+/// How one `mega_setValidatedChain` report ended: the `outcome` label of
+/// [`names::VALIDATED_CHAIN_REPORTS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportOutcome {
+    /// The receiver recorded the chain.
+    Accepted,
+    /// The receiver answered `accepted: false`: it does not hold both blocks on its canonical
+    /// chain, and recorded nothing.
+    Refused,
+    /// The call itself failed: transport or RPC error, or the per-attempt timeout.
+    Failed,
+}
+
+impl ReportOutcome {
+    pub(crate) const ALL: [Self; 3] = [Self::Accepted, Self::Refused, Self::Failed];
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Refused => "refused",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// Pre-registers the report series once the reporter starts, so a receiver that never accepts a
+/// report shows as `accepted` stuck at 0 and a reported height of 0 rather than as missing
+/// series. Not part of [`init_metrics`]: with reporting disabled, a published height of 0 would
+/// read as reports failing to land.
+pub fn init_validated_chain_reports() {
+    for outcome in ReportOutcome::ALL {
+        counter!(names::VALIDATED_CHAIN_REPORTS, "outcome" => outcome.as_str()).increment(0);
+    }
+    gauge!(names::REPORTED_VALIDATED_HEIGHT).set(0.0);
+}
+
+/// Records one report of the chain ending at `validated`. An accepted one also sets
+/// [`names::REPORTED_VALIDATED_HEIGHT`] to `validated`, which goes down when the report is of a
+/// chain a reorg rewound.
+pub fn on_validated_chain_report(outcome: ReportOutcome, validated: u64) {
+    counter!(names::VALIDATED_CHAIN_REPORTS, "outcome" => outcome.as_str()).increment(1);
+    if outcome == ReportOutcome::Accepted {
+        gauge!(names::REPORTED_VALIDATED_HEIGHT).set(validated as f64);
     }
 }
 
