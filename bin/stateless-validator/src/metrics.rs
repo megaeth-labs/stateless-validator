@@ -414,9 +414,9 @@ pub enum ReportOutcome {
 }
 
 impl ReportOutcome {
-    const ALL: [Self; 3] = [Self::Accepted, Self::Refused, Self::Failed];
+    pub(crate) const ALL: [Self; 3] = [Self::Accepted, Self::Refused, Self::Failed];
 
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
             Self::Refused => "refused",

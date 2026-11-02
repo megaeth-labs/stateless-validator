@@ -228,15 +228,7 @@ async fn report_chain_once(
         return true;
     }
 
-    let outcome = client.set_validated_chain(chain.0, chain.1).await;
-    let report_outcome = match &outcome {
-        Ok(response) if response.accepted => ReportOutcome::Accepted,
-        Ok(_) => ReportOutcome::Refused,
-        Err(_) => ReportOutcome::Failed,
-    };
-    metrics::on_validated_chain_report(report_outcome, validated.block_number);
-
-    match outcome {
+    let outcome = match client.set_validated_chain(chain.0, chain.1).await {
         Ok(response) if response.accepted => {
             debug!(
                 anchor = anchor.block_number,
@@ -246,7 +238,7 @@ async fn report_chain_once(
                 "Reported validated chain"
             );
             *reported = Some(chain);
-            true
+            ReportOutcome::Accepted
         }
         Ok(response) => {
             warn!(
@@ -257,13 +249,15 @@ async fn report_chain_once(
                 "Validated chain refused: the receiver does not hold both blocks on its canonical \
                  chain"
             );
-            false
+            ReportOutcome::Refused
         }
         Err(e) => {
             error!(error = %e, "Failed to report the validated chain");
-            false
+            ReportOutcome::Failed
         }
-    }
+    };
+    metrics::on_validated_chain_report(outcome, validated.block_number);
+    outcome == ReportOutcome::Accepted
 }
 
 #[cfg(test)]
@@ -277,7 +271,10 @@ mod tests {
     use stateless_test_utils::mock_rpc::serve;
 
     use super::*;
-    use crate::{metrics::names, test_support::make_block_meta};
+    use crate::{
+        metrics::names,
+        test_support::{make_block_meta, temp_store},
+    };
 
     /// How the mock receiver answers one `mega_setValidatedChain` call.
     #[derive(Clone, Copy)]
@@ -299,9 +296,9 @@ mod tests {
             match value {
                 DebugValue::Counter(n) if key.name() == names::VALIDATED_CHAIN_REPORTS => {
                     let outcome = key.labels().find(|l| l.key() == "outcome").unwrap();
-                    let slot = ["accepted", "refused", "failed"]
+                    let slot = ReportOutcome::ALL
                         .iter()
-                        .position(|o| *o == outcome.value())
+                        .position(|o| o.as_str() == outcome.value())
                         .unwrap();
                     counts[slot] += n;
                 }
@@ -341,8 +338,7 @@ mod tests {
         let client =
             RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::default(), Some(&url))
                 .unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let db = ValidatorDB::new(dir.path().join("test.redb")).unwrap();
+        let (_dir, db) = temp_store();
         db.reset_to_anchor(&make_block_meta(5)).unwrap();
         let mut reported = None;
         let mut round = |answer: Option<Answer>| {

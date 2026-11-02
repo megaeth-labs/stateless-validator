@@ -33,8 +33,10 @@ pub enum ReorgResolution {
 /// This is the single shared abstraction over the scenarios' different reorg models. Each scenario
 /// supplies the resolver matching how it maintains its chain, and passes it to
 /// [`run_pipeline`](crate::pipeline::run_pipeline):
-/// - History-owning scenarios (standalone validator, debug-trace-server) use the core
-///   [`BisectResolver`], which walks their [`DivergenceLookups`] against the remote fetcher.
+/// - The debug-trace-server uses the core [`BisectResolver`], which walks its [`DivergenceLookups`]
+///   against the remote fetcher.
+/// - The standalone validator wraps the same [`find_divergence_point`] bisection in its own
+///   resolver, which falls back to its anchor when the fork lies below the history it retains.
 /// - The mega-reth FullNode implements this trait in its own bin, returning the floor its host
 ///   (state-sync) already published — it never bisects and never touches the fetcher.
 pub trait ReorgResolver<F, S>: Send + Sync {
@@ -53,8 +55,8 @@ pub trait ReorgResolver<F, S>: Send + Sync {
 }
 
 /// Bisection resolver for history-owning stores: walks local history against the remote via
-/// [`find_divergence_point`]. Requires `S: DivergenceLookups`. Lives in core because both
-/// history-owning scenarios reuse it verbatim over the shared `find_divergence_point` algorithm.
+/// [`find_divergence_point`]. Requires `S: DivergenceLookups`. Lives in core next to that
+/// algorithm, which a resolver with its own fallback (the validator's) calls directly.
 pub struct BisectResolver;
 
 impl<F, S> ReorgResolver<F, S> for BisectResolver

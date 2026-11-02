@@ -232,7 +232,7 @@ mod tests {
     use stateless_test_utils::mock_rpc::{consistent_header, parse_hex_u64, serve};
 
     use super::*;
-    use crate::test_support::make_block_meta;
+    use crate::test_support::{make_block_meta, temp_store, temp_store_retaining};
 
     fn hash(byte: u8) -> BlockHash {
         BlockHash::repeat_byte(byte)
@@ -361,8 +361,7 @@ mod tests {
     async fn a_forced_reset_replaces_the_stored_chain() {
         let chain: Vec<Header> = (1..=4).map(|n| header(n, 0)).collect();
         let (handle, client) = remote(chain.clone(), vec![]).await;
-        let dir = tempfile::tempdir().unwrap();
-        let db = ValidatorDB::new(dir.path().join("test.redb")).unwrap();
+        let (_dir, db) = temp_store();
 
         apply_startup_request(&client, &db, Some(chain[0].hash), false).await.unwrap();
         let first = BlockMeta::try_from_header(&chain[0]).unwrap();
@@ -412,8 +411,7 @@ mod tests {
         retain: u64,
         fork: u64,
     ) -> (tempfile::TempDir, ValidatorDB, Remote) {
-        let dir = tempfile::tempdir().unwrap();
-        let db = ValidatorDB::with_max_chain_length(dir.path().join("test.redb"), retain).unwrap();
+        let (dir, db) = temp_store_retaining(retain);
         db.reset_to_anchor(&make_block_meta(anchor)).unwrap();
         db.advance_chain(&((anchor + 1)..=tip).map(make_block_meta).collect::<Vec<_>>()).unwrap();
         let remote = (0..=tip + 2)

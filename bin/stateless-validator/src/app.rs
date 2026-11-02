@@ -179,10 +179,9 @@ pub struct CommandLineArgs {
     pub start_block: Option<BlockHash>,
 
     /// Replace the stored validated chain with one anchored at `--start-block`, clearing its
-    /// validated progress. Requires `--start-block`.
+    /// validated progress. Requires `--start-block`, so a `--block-list` run cannot take it.
     ///
-    /// `STATELESS_VALIDATOR_FORCE_ANCHOR=false` is the same as leaving it out, `--block-list`
-    /// runs included (see [`CommandLineArgs::check_flag_values`]).
+    /// `STATELESS_VALIDATOR_FORCE_ANCHOR=false` is the same as leaving it out.
     #[clap(long, env = "STATELESS_VALIDATOR_FORCE_ANCHOR")]
     pub force_anchor: bool,
 
@@ -202,11 +201,7 @@ pub struct CommandLineArgs {
     #[clap(
         long,
         env = "STATELESS_VALIDATOR_BLOCK_LIST",
-        conflicts_with_all = [
-            "start_block",
-            "end_block",
-            "report_validation_endpoint",
-        ],
+        conflicts_with_all = ["start_block", "end_block", "report_validation_endpoint"],
         requires = "genesis_file",
     )]
     pub block_list: Option<PathBuf>,
@@ -338,28 +333,30 @@ pub struct CommandLineArgs {
 }
 
 impl CommandLineArgs {
-    /// Parses the command line like [`Parser::parse`], then applies
-    /// [`Self::check_flag_values`], exiting with clap's usage error if either fails.
-    pub fn parse_checked() -> Self {
-        let args = Self::parse();
-        if let Err(err) = args.check_flag_values() {
-            err.exit();
-        }
-        args
+    /// [`Parser::try_parse_from`], then the flag rules clap's relations cannot express: what
+    /// startup checks before it touches anything.
+    pub fn try_parse_checked_from<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let args = Self::try_parse_from(args)?;
+        args.check_flag_values()?;
+        Ok(args)
     }
 
-    /// The flag rules that depend on a value rather than on presence, which clap's relations
-    /// cannot express.
+    /// The rules that depend on a flag's value rather than its presence.
     ///
-    /// clap counts a flag whose env var is set as given, whatever the value, so `--force-anchor`
-    /// among `--block-list`'s conflicts would refuse a block-list run whose environment carries
-    /// `STATELESS_VALIDATOR_FORCE_ANCHOR=false`, as a template shared with the chain-following
-    /// roles renders it. Only a switch that is on conflicts.
-    pub fn check_flag_values(&self) -> Result<(), clap::Error> {
-        if self.block_list.is_some() && self.force_anchor {
+    /// clap counts a flag whose env var is set as given, whatever the value, so declaring
+    /// `--force-anchor` as requiring `--start-block` (or conflicting with `--block-list`) would
+    /// refuse `STATELESS_VALIDATOR_FORCE_ANCHOR=false`, which an env template shared across roles
+    /// renders. Only a switch that is on needs `--start-block`; as that conflicts with
+    /// `--block-list`, this also keeps the switch out of block-list runs.
+    fn check_flag_values(&self) -> Result<(), clap::Error> {
+        if self.force_anchor && self.start_block.is_none() {
             return Err(Self::command().error(
-                ErrorKind::ArgumentConflict,
-                "the argument '--block-list <BLOCK_LIST>' cannot be used with '--force-anchor'",
+                ErrorKind::MissingRequiredArgument,
+                "--force-anchor requires --start-block (and so cannot be used with --block-list)",
             ));
         }
         Ok(())
@@ -373,7 +370,8 @@ impl CommandLineArgs {
 /// validated chain ([`anchor::apply_startup_request`]), then hands off to
 /// [`runner::run_with_signals`].
 pub async fn run() -> Result<()> {
-    let args = CommandLineArgs::parse_checked();
+    let args = CommandLineArgs::try_parse_checked_from(std::env::args_os())
+        .unwrap_or_else(|err| err.exit());
     let _log_guard = args.log.init_tracing()?;
     let start = std::time::Instant::now();
 

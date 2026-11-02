@@ -14,7 +14,7 @@ use std::{
 
 use alloy_primitives::{B256, BlockHash};
 use alloy_rpc_types_eth::Block;
-use clap::{CommandFactory, Parser};
+use clap::CommandFactory;
 use jsonrpsee::server::ServerConfigBuilder;
 use jsonrpsee_types::error::{
     CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
@@ -74,7 +74,7 @@ fn assert_endpoint_accepts_multiple_forms(
 ) {
     let guard = stateless_test_utils::env::env_lock();
     let parse = |extra: &[&str]| {
-        extract(CommandLineArgs::try_parse_from(base.iter().chain(extra)).unwrap())
+        extract(CommandLineArgs::try_parse_checked_from(base.iter().chain(extra)).unwrap())
     };
 
     assert_eq!(parse(&[flag, "http://a,http://b"]), ["http://a", "http://b"]);
@@ -120,7 +120,7 @@ fn assert_optional_numeric_flag<T>(
 {
     let guard = stateless_test_utils::env::env_lock();
     let parse = |extra: &[&str]| {
-        extract(CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra)).unwrap())
+        extract(CommandLineArgs::try_parse_checked_from(BASE_ARGS.iter().chain(extra)).unwrap())
     };
 
     assert_eq!(parse(&[]), None);
@@ -176,7 +176,8 @@ fn end_block_flag_and_env() {
 #[test]
 fn r2_custom_domain_target_wiring() {
     let _guard = stateless_test_utils::env::env_lock();
-    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
+    let parse =
+        |extra: &[&str]| CommandLineArgs::try_parse_checked_from(BASE_ARGS.iter().chain(extra));
 
     assert_eq!(
         parse(&["--r2-custom-domain", "https://witness.example.com"])
@@ -221,7 +222,8 @@ fn r2_custom_domain_target_wiring() {
 #[test]
 fn blank_r2_values_reach_the_post_parse_rules() {
     let _guard = stateless_test_utils::env::env_lock();
-    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
+    let parse =
+        |extra: &[&str]| CommandLineArgs::try_parse_checked_from(BASE_ARGS.iter().chain(extra));
 
     for blank in [
         ["--r2-bucket", ""],
@@ -262,7 +264,8 @@ fn help_hides_r2_secret_values() {
 /// rolling the pipeline back to the anchor each round and looping forever.
 #[test]
 fn canonical_chain_max_length_rejects_zero() {
-    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
+    let parse =
+        |extra: &[&str]| CommandLineArgs::try_parse_checked_from(BASE_ARGS.iter().chain(extra));
 
     assert_eq!(parse(&[]).unwrap().canonical_chain_max_length, None);
     assert_eq!(
@@ -290,11 +293,8 @@ fn block_list_flag_combinations() {
     // `STATELESS_VALIDATOR_END_BLOCK` (or another conflicting variable) set cannot leak into
     // these parses.
     let env = stateless_test_utils::env::env_lock();
-    // What startup applies: clap's rules, then the value-dependent ones.
-    let parse = |extra: &[&str]| {
-        CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra))
-            .and_then(|args| args.check_flag_values().map(|()| args))
-    };
+    let parse =
+        |extra: &[&str]| CommandLineArgs::try_parse_checked_from(BASE_ARGS.iter().chain(extra));
     let with_list = ["--block-list", "/tmp/pool.txt", "--genesis-file", "/tmp/genesis.json"];
 
     let args = parse(&with_list).unwrap();
@@ -365,12 +365,13 @@ fn block_list_flag_combinations() {
 const TRUSTED_HASH: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
 
 /// `--start-block` is a block hash, checked when the flags are parsed, and `--force-anchor` is
-/// a plain switch; both bind their documented env vars. Which combinations a data dir accepts
-/// is decided at startup against the stored chain (`anchor::startup_anchor`).
+/// a switch that needs it; both bind their documented env vars. Which combinations a data dir
+/// accepts is decided at startup against the stored chain (`anchor::startup_anchor`).
 #[test]
 fn anchor_flags_parse() {
     let guard = stateless_test_utils::env::env_lock();
-    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
+    let parse =
+        |extra: &[&str]| CommandLineArgs::try_parse_checked_from(BASE_ARGS.iter().chain(extra));
 
     let args = parse(&["--start-block", TRUSTED_HASH, "--force-anchor"]).unwrap();
     assert_eq!(args.start_block, Some(TRUSTED_HASH.parse().unwrap()));
@@ -378,6 +379,7 @@ fn anchor_flags_parse() {
     let args = parse(&[]).unwrap();
     assert_eq!((args.start_block, args.force_anchor), (None, false));
     assert!(parse(&["--start-block", "0x01"]).is_err(), "a start block must be a full hash");
+    assert!(parse(&["--force-anchor"]).is_err(), "--force-anchor needs --start-block");
 
     let from_env = stateless_test_utils::env::with_env_vars(
         &guard,

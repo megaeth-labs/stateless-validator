@@ -157,13 +157,7 @@ mod tests {
     use stateless_db::ContractCache;
 
     use super::*;
-    use crate::test_support::make_block_meta;
-
-    fn temp_store() -> (tempfile::TempDir, ValidatorDB) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ValidatorDB::new(dir.path().join("test.redb")).unwrap();
-        (dir, store)
-    }
+    use crate::test_support::{make_block_meta, temp_store};
 
     #[test]
     fn test_anchor_block_roundtrip() {
@@ -354,33 +348,6 @@ mod tests {
 
         assert!(ChainStore::get_block_hash(&store, 10).unwrap().is_some());
         assert!(ChainStore::get_block_hash(&store, 12).unwrap().is_some());
-    }
-
-    /// The rollback the pipeline drives on a reorg keeps the anchor: rolling back to it leaves
-    /// nothing validated, even once retention has pruned the anchor's row, and nothing goes
-    /// below it.
-    #[test]
-    fn rollback_to_the_anchor_restarts_the_validated_chain() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ValidatorDB::with_max_chain_length(dir.path().join("test.redb"), 3).unwrap();
-        let anchor = make_block_meta(4);
-        store.reset_to_anchor(&anchor).unwrap();
-        let blocks: Vec<BlockMeta> = (5..=10).map(make_block_meta).collect();
-        ChainStore::advance_chain(&store, &blocks).unwrap();
-        assert_eq!(
-            store.validated_chain().unwrap(),
-            ValidatedChain { anchor: Some(anchor.clone()), validated: Some(make_block_meta(10)) }
-        );
-        assert_eq!(DivergenceLookups::get_earliest(&store).unwrap().unwrap().0, 8);
-
-        assert!(ChainStore::rollback_chain(&store, 3).is_err(), "nothing goes below the anchor");
-
-        ChainStore::rollback_chain(&store, 4).unwrap();
-        assert_eq!(
-            store.validated_chain().unwrap(),
-            ValidatedChain { anchor: Some(anchor.clone()), validated: None }
-        );
-        assert_eq!(store.get_canonical_tip().unwrap(), Some(anchor));
     }
 
     #[test]
