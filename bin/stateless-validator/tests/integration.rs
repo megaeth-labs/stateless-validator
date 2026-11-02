@@ -350,7 +350,7 @@ const TRUSTED_HASH: &str = "0x11111111111111111111111111111111111111111111111111
 
 /// `--start-block` is a block hash, checked when the flags are parsed, and `--force-anchor` is
 /// a plain switch; both bind their documented env vars. Which combinations a data dir accepts
-/// is decided at startup against the stored chain (`anchor::startup_action`).
+/// is decided at startup against the stored chain (`anchor::startup_anchor`).
 #[test]
 fn anchor_flags_parse() {
     let guard = stateless_test_utils::env::env_lock();

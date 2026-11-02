@@ -275,12 +275,12 @@ mod tests {
         assert!(err.contains("anchor 5") && err.contains("validated 9"), "{err}");
     }
 
-    /// A self-consistent header for `number` with a withdrawals root, distinguished by `salt`
-    /// so two headers at one height can name different blocks.
-    fn header(number: u64, salt: u8) -> Header {
+    /// A self-consistent header for `number` with a withdrawals root on `fork`, so two forks
+    /// have different blocks at one height: these tests keep the canonical chain on fork 0.
+    fn header(number: u64, fork: u8) -> Header {
         let mut header = consistent_header(number);
         header.inner.withdrawals_root = Some(B256::repeat_byte(0xaa));
-        header.inner.extra_data = vec![salt].into();
+        header.inner.extra_data = vec![fork].into();
         header.hash = header.inner.hash_slow();
         header
     }

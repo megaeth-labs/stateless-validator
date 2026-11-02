@@ -98,6 +98,7 @@ cargo run --release --bin stateless-validator -- \
   Each report carries both ends of the validated chain `(anchor, validated]` as `{ blockNumber, blockHash }` objects, and is sent once a second while the chain has moved, plus once more on shutdown.
   The receiver accepts it only when both blocks are on its own canonical chain, and then replaces what it recorded before, so the chain a reorg rewound is reported like any other; a refused report is retried with the chain as it is by the next round.
   Nothing is reported while no block above the anchor has been validated, since the receiver takes only `anchor < validated`.
+  Each report sent is counted by outcome on `stateless_validator_validated_chain_reports_total`, and `stateless_validator_reported_validated_height` holds the last accepted one, so a receiver that keeps refusing shows on a dashboard rather than only in the logs.
 - `--metrics-enabled`: Enable Prometheus metrics endpoint (disabled by default)
 - `--metrics-port`: Port for Prometheus metrics HTTP endpoint (default: 9090)
 
@@ -487,6 +488,8 @@ Metrics are available at `http://0.0.0.0:<port>/metrics`.
 | `stateless_validator_rpc_requests_total`                | Counter   | Total RPC requests (with `method` label)            |
 | `stateless_validator_rpc_errors_total`                  | Counter   | RPC errors (with `method` label)                    |
 | `stateless_validator_rpc_retry_attempts_total`          | Counter   | RPC transient retries (with `method` label)         |
+| `stateless_validator_validated_chain_reports_total`     | Counter   | `mega_setValidatedChain` reports sent (with `outcome` label: `accepted`, `refused` — the receiver lacks a block of the chain on its canonical chain — or `failed`); live with `--report-validation-endpoint` |
+| `stateless_validator_reported_validated_height`         | Gauge     | Validated block of the last chain the receiver accepted, 0 until one is; flat while `local_chain_height` advances means reports are not landing |
 | `stateless_validator_witness_fetch_r2_time_seconds`     | Histogram | R2 witness fetch + decode time                      |
 | `stateless_validator_r2_witness_retry_attempts_total`   | Counter   | R2 witness GET retries (before the final outcome)   |
 | `stateless_validator_r2_witness_errors_total`           | Counter   | Failed R2 witness fetches, each one block that fell back to RPC (with `kind` label; `missing` is a hole below the frontier window) |

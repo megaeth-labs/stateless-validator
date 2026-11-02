@@ -69,6 +69,7 @@ The validator's chain pointers follow the mega-reth chain-pointer requirements: 
 `--start-block` anchors a data dir with no chain; a stored chain resumes when neither anchor flag is given and is replaced only by `--start-block` with `--force-anchor` (either alone fails startup), and the anchor must be on the remote canonical chain (`anchor::resolve_canonical_anchor`).
 Reorgs never move the anchor: `ValidatorDB::rollback_chain` refuses to go below it.
 The reporter is the only task that calls `mega_setValidatedChain(anchor, validated)` — including the final flush after the pipeline drains — because the receiver replaces its recorded chain with every accepted report, so a second sender could land an older chain after a newer one; a refusal (`accepted: false`, the receiver lacks a block on its canonical chain) is retried, never fatal.
+Every report sent is counted by outcome on `validated_chain_reports_total{outcome}` and an accepted one sets `reported_validated_height`, because a refusal is a successful call to the RPC metrics: a receiver that keeps refusing (one that no longer holds the anchor's height, say) is otherwise visible only in the logs.
 
 ### Database
 

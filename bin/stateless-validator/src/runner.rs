@@ -13,6 +13,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     anchor::ValidatorReorgResolver,
     chain_sync::{ValidatorFetcher, ValidatorHooks, ValidatorProcessor},
+    metrics::{self, ReportOutcome},
     r2_witness::R2WitnessClient,
     validator_db::ValidatorDB,
 };
@@ -163,6 +164,7 @@ async fn validation_reporter(
     stop: CancellationToken,
 ) -> Result<()> {
     info!("Starting validation reporter");
+    metrics::init_validated_chain_reports();
     let mut reported = None;
 
     loop {
@@ -199,6 +201,10 @@ async fn validation_reporter(
 /// Returns whether the round settled: the chain was accepted, had been already, or there is
 /// nothing to report. A refusal — the receiver does not (yet) hold both blocks on its canonical
 /// chain — and a failed call are logged here and settle nothing.
+///
+/// Every call sent is counted by outcome ([`metrics::on_validated_chain_report`]), since a
+/// refusal is a successful RPC to the RPC metrics and a receiver that keeps refusing — say, one
+/// that no longer holds the anchor's height — would otherwise show only in the logs.
 async fn report_chain_once(
     client: &RpcClient,
     validator_db: &ValidatorDB,
@@ -222,7 +228,15 @@ async fn report_chain_once(
         return true;
     }
 
-    match client.set_validated_chain(chain.0, chain.1).await {
+    let outcome = client.set_validated_chain(chain.0, chain.1).await;
+    let report_outcome = match &outcome {
+        Ok(response) if response.accepted => ReportOutcome::Accepted,
+        Ok(_) => ReportOutcome::Refused,
+        Err(_) => ReportOutcome::Failed,
+    };
+    metrics::on_validated_chain_report(report_outcome, validated.block_number);
+
+    match outcome {
         Ok(response) if response.accepted => {
             debug!(
                 anchor = anchor.block_number,
@@ -249,5 +263,103 @@ async fn report_chain_once(
             error!(error = %e, "Failed to report the validated chain");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::VecDeque, sync::Mutex};
+
+    use jsonrpsee::types::ErrorObjectOwned;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use stateless_common::{RpcClientConfig, SetValidatedChainResponse};
+    use stateless_core::ChainStore;
+    use stateless_test_utils::mock_rpc::serve;
+
+    use super::*;
+    use crate::{metrics::names, test_support::make_block_meta};
+
+    /// How the mock receiver answers one `mega_setValidatedChain` call.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        Accept,
+        Refuse,
+        Fail,
+    }
+
+    /// The report series one `step` recorded: each `outcome` count, and the reported height if
+    /// it was set.
+    fn recorded(rt: &tokio::runtime::Runtime, step: impl Future) -> ([u64; 3], Option<f64>) {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        ::metrics::with_local_recorder(&recorder, || rt.block_on(step));
+        let (mut counts, mut height) = ([0; 3], None);
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            let key = key.key();
+            match value {
+                DebugValue::Counter(n) if key.name() == names::VALIDATED_CHAIN_REPORTS => {
+                    let outcome = key.labels().find(|l| l.key() == "outcome").unwrap();
+                    let slot = ["accepted", "refused", "failed"]
+                        .iter()
+                        .position(|o| *o == outcome.value())
+                        .unwrap();
+                    counts[slot] += n;
+                }
+                DebugValue::Gauge(v) if key.name() == names::REPORTED_VALIDATED_HEIGHT => {
+                    height = Some(v.into_inner());
+                }
+                _ => {}
+            }
+        }
+        (counts, height)
+    }
+
+    /// Each call sent counts once under its outcome, and only an accepted one moves the reported
+    /// height; a round with nothing new to report sends nothing and counts nothing.
+    #[test]
+    fn reports_are_counted_by_outcome() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let answers = Arc::new(Mutex::new(VecDeque::new()));
+        let (handle, url) = rt.block_on(serve(Arc::clone(&answers), |m| {
+            m.register_method("mega_setValidatedChain", |params, answers, _| {
+                let (anchor, validated): (BlockRef, BlockRef) = params.parse()?;
+                let accepted = match answers.lock().unwrap().pop_front().unwrap() {
+                    Answer::Accept => true,
+                    Answer::Refuse => false,
+                    Answer::Fail => {
+                        return Err(ErrorObjectOwned::owned(-32000, "scripted", None::<()>));
+                    }
+                };
+                Ok(SetValidatedChainResponse {
+                    accepted,
+                    anchor: accepted.then_some(anchor),
+                    validated: accepted.then_some(validated),
+                })
+            })
+            .unwrap();
+        }));
+        let client =
+            RpcClient::new_with_config(&[&url], &[&url], RpcClientConfig::default(), Some(&url))
+                .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db = ValidatorDB::new(dir.path().join("test.redb")).unwrap();
+        db.reset_to_anchor(&make_block_meta(5)).unwrap();
+        let mut reported = None;
+        let mut round = |answer: Option<Answer>| {
+            answers.lock().unwrap().extend(answer);
+            let settled = recorded(&rt, report_chain_once(&client, &db, &mut reported));
+            assert!(answers.lock().unwrap().is_empty(), "every scripted answer is used");
+            settled
+        };
+
+        assert_eq!(round(None), ([0, 0, 0], None), "nothing validated above the anchor yet");
+
+        db.advance_chain(&[make_block_meta(6), make_block_meta(7)]).unwrap();
+        assert_eq!(round(Some(Answer::Refuse)), ([0, 1, 0], None));
+        assert_eq!(round(Some(Answer::Fail)), ([0, 0, 1], None));
+        assert_eq!(round(Some(Answer::Accept)), ([1, 0, 0], Some(7.0)));
+        assert_eq!(round(None), ([0, 0, 0], None), "an accepted chain is not sent again");
+
+        rt.block_on(async { handle.stop().unwrap() });
     }
 }
