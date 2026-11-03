@@ -262,7 +262,7 @@ fn resolve_source_dirs(explicit: &[PathBuf]) -> Result<Vec<PathBuf>> {
 
 /// Finds the one directory under `cargo_home` matching `root`, a relative path whose `*`
 /// stands for the directory cargo names after a source URL (see build.rs `source_root`):
-/// `registry/src/*/revm-handler-20.0.3`, `git/checkouts/mega-evm-*/f78e75c`, or a crate
+/// `registry/src/*/revm-handler-20.0.3`, `git/checkouts/mega-evm-*/7574376`, or a crate
 /// inside a checkout, `git/checkouts/optimism-*/f67d87c/rust/op-revm`. Cargo keeps
 /// one tree per registry index and one clone per URL it has used, and llvm-cov matches only
 /// the one the build compiled, so more than one candidate is a question for the operator
