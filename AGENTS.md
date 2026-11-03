@@ -31,7 +31,7 @@ cargo clippy -p coverage-replayer --all-targets --all-features -- --cfg coverage
 cargo sort --check --workspace --grouped --order package,workspace,lints,profile,bin,benches,dependencies,dev-dependencies,features
 ```
 
-The project uses nightly `2026-02-03` toolchain (edition 2024, rust-version 1.94).
+The project uses nightly `2026-04-23` toolchain (edition 2024, rust-version 1.94).
 
 ## Workspace Structure
 
