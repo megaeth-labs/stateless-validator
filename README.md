@@ -532,3 +532,4 @@ at your option.
 Every crate directory links both license texts to the root files; `cargo package` and `cargo vendor` resolve the links, so a packaged or vendored crate keeps the full texts.
 
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+
