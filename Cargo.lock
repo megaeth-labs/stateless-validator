@@ -3539,7 +3539,7 @@ dependencies = [
 [[package]]
 name = "mega-evm"
 version = "1.7.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=7574376477f9731e6a4c9ab27cdc930d30cbe36d#7574376477f9731e6a4c9ab27cdc930d30cbe36d"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=c671ef05b4d1a2dc8737ee916d16792d787194e5#c671ef05b4d1a2dc8737ee916d16792d787194e5"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3567,7 +3567,7 @@ dependencies = [
 [[package]]
 name = "mega-system-contracts"
 version = "1.7.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=7574376477f9731e6a4c9ab27cdc930d30cbe36d#7574376477f9731e6a4c9ab27cdc930d30cbe36d"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=c671ef05b4d1a2dc8737ee916d16792d787194e5#c671ef05b4d1a2dc8737ee916d16792d787194e5"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
