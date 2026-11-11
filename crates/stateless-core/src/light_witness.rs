@@ -346,7 +346,9 @@ mod tests {
     #[test]
     fn round_trip_through_bincode() {
         let mut levels: FxHashMap<BucketId, u8> = HashMap::with_hasher(FxBuildHasher);
-        for (k, v) in [(0u32, 0u8), (42, 3), (1_000_000, 7), (BucketId::MAX, 255)] {
+        // Levels a prover can emit: 1 for a metadata bucket (id below 65,536) and
+        // 1..=5 for a data bucket. Newer salt revisions reject anything else on decode.
+        for (k, v) in [(0u32, 1u8), (65_578, 3), (1_000_000, 4), (BucketId::MAX, 5)] {
             levels.insert(k, v);
         }
         let original = LightWitness { kvs: BTreeMap::new(), levels };
