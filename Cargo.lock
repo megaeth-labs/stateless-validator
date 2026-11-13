@@ -522,7 +522,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-serde",
  "alloy-sol-types",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "serde",
  "serde_json",
  "serde_with",
@@ -686,7 +686,7 @@ checksum = "f0b7b1f0e528ae788d05937f5b351afae3b4c1e08f17a061d868bd28e56aa9e3"
 dependencies = [
  "alloy-json-rpc",
  "alloy-transport",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "reqwest",
  "serde_json",
  "tower",
@@ -1265,7 +1265,7 @@ dependencies = [
 [[package]]
 name = "banderwagon"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?tag=v1.0.6#945d5bdad8c1b8fd6900923858e4592d9e955cae"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=abf47a4cd786b4686d9837d064ae4554b24d3686#abf47a4cd786b4686d9837d064ae4554b24d3686"
 dependencies = [
  "ark-ec 0.5.0 (git+https://github.com/megaeth-labs/algebra.git?rev=80ca69c37f79d5d00750edc1602af81b5f456695)",
  "ark-ed-on-bls12-381-bandersnatch",
@@ -1846,6 +1846,36 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "coverage-replayer"
+version = "2.1.0"
+dependencies = [
+ "alloy-genesis",
+ "alloy-primitives",
+ "alloy-rpc-types-eth",
+ "bincode",
+ "clap",
+ "eyre",
+ "kanal",
+ "libc",
+ "mega-evm",
+ "num_cpus",
+ "op-alloy-rpc-types",
+ "redb",
+ "revm",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "stateless-common",
+ "stateless-core",
+ "stateless-test-utils",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+ "zstd",
+]
+
+[[package]]
 name = "cow-utils"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2057,7 +2087,7 @@ dependencies = [
 
 [[package]]
 name = "debug-trace-server"
-version = "2.0.20"
+version = "2.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-evm",
@@ -2102,6 +2132,8 @@ dependencies = [
  "stateless-test-utils",
  "tempfile",
  "thiserror 2.0.20",
+ "tikv-jemalloc-ctl",
+ "tikv-jemallocator",
  "tokio",
  "tokio-util",
  "tower",
@@ -3152,7 +3184,7 @@ dependencies = [
 [[package]]
 name = "ipa-multipoint"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?tag=v1.0.6#945d5bdad8c1b8fd6900923858e4592d9e955cae"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=abf47a4cd786b4686d9837d064ae4554b24d3686#abf47a4cd786b4686d9837d064ae4554b24d3686"
 dependencies = [
  "banderwagon",
  "hashbrown 0.16.1",
@@ -3507,7 +3539,7 @@ dependencies = [
 [[package]]
 name = "mega-evm"
 version = "1.7.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=29bfd9e0bcc9f59280f5850d666a88ce4cfd1a11#29bfd9e0bcc9f59280f5850d666a88ce4cfd1a11"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=7574376477f9731e6a4c9ab27cdc930d30cbe36d#7574376477f9731e6a4c9ab27cdc930d30cbe36d"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3535,7 +3567,7 @@ dependencies = [
 [[package]]
 name = "mega-system-contracts"
 version = "1.7.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=29bfd9e0bcc9f59280f5850d666a88ce4cfd1a11#29bfd9e0bcc9f59280f5850d666a88ce4cfd1a11"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=7574376477f9731e6a4c9ab27cdc930d30cbe36d#7574376477f9731e6a4c9ab27cdc930d30cbe36d"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -5270,7 +5302,7 @@ checksum = "dd29631678d6fb0903b69223673e122c32e9ae559d0960a38d574695ebc0ea15"
 [[package]]
 name = "salt"
 version = "1.0.6"
-source = "git+https://github.com/megaeth-labs/salt.git?tag=v1.0.6#945d5bdad8c1b8fd6900923858e4592d9e955cae"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=abf47a4cd786b4686d9837d064ae4554b24d3686#abf47a4cd786b4686d9837d064ae4554b24d3686"
 dependencies = [
  "auto_impl",
  "banderwagon",
@@ -5291,7 +5323,7 @@ dependencies = [
 [[package]]
 name = "salt-macros"
 version = "0.1.0"
-source = "git+https://github.com/megaeth-labs/salt.git?tag=v1.0.6#945d5bdad8c1b8fd6900923858e4592d9e955cae"
+source = "git+https://github.com/megaeth-labs/salt.git?rev=abf47a4cd786b4686d9837d064ae4554b24d3686#abf47a4cd786b4686d9837d064ae4554b24d3686"
 dependencies = [
  "rayon",
 ]
@@ -5772,7 +5804,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stateless-common"
-version = "2.0.20"
+version = "2.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-primitives",
@@ -5810,7 +5842,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-core"
-version = "2.0.20"
+version = "2.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -5849,7 +5881,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-db"
-version = "2.0.20"
+version = "2.1.0"
 dependencies = [
  "alloy-primitives",
  "alloy-rpc-types-eth",
@@ -5869,7 +5901,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-r2"
-version = "2.0.20"
+version = "2.1.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -5886,7 +5918,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-test-utils"
-version = "2.0.20"
+version = "2.1.0"
 dependencies = [
  "alloy-consensus",
  "alloy-genesis",
@@ -5909,7 +5941,7 @@ dependencies = [
 
 [[package]]
 name = "stateless-validator"
-version = "2.0.20"
+version = "2.1.0"
 dependencies = [
  "alloy-genesis",
  "alloy-primitives",
@@ -5919,6 +5951,7 @@ dependencies = [
  "jsonrpsee",
  "jsonrpsee-types",
  "metrics",
+ "metrics-util",
  "op-alloy-rpc-types",
  "redb",
  "revm",
@@ -6138,6 +6171,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d050e60b33d41c19108b32cea32164033a9013fe3b46cbd4457559bfbf77afaa"
 dependencies = [
  "num_cpus",
+]
+
+[[package]]
+name = "tikv-jemalloc-ctl"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a184c43b8ab2f41df2733b55556e3f5f632f4aeaa205b1bb018f574b7f5f142"
+dependencies = [
+ "libc",
+ "paste",
+ "tikv-jemalloc-sys",
+]
+
+[[package]]
+name = "tikv-jemalloc-sys"
+version = "0.7.1+5.3.1-0-g81034ce1f1373e37dc865038e1bc8eeecf559ce8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a2825c78386b4ae0314074867860ba9577875de945f05992c38815cbec327f0"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
+name = "tikv-jemallocator"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "249f09e49ab1609436f34c776e84231bead18d6a955f119f939bdc1d847561bd"
+dependencies = [
+ "libc",
+ "tikv-jemalloc-sys",
 ]
 
 [[package]]

@@ -5,15 +5,17 @@
 //!
 //! Uses `metrics-derive` for declarative metric definitions following mega-reth patterns.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, thread, time::Duration};
 
-use eyre::Result;
+use eyre::{Result, eyre};
 use metrics::{Counter, Gauge, Histogram, counter, gauge, histogram};
 use metrics_derive::Metrics;
 pub use stateless_common::{
     DEFAULT_METRICS_PORT,
     metrics::{BYTE_BUCKETS, REORG_DEPTH_BUCKETS, install_prometheus_exporter},
 };
+use tikv_jemalloc_ctl::{Access, Mib, epoch, epoch_mib, stats};
+use tracing::{debug, warn};
 
 /// Prefix for timed RPC method aliases.
 pub const TIMED_PREFIX: &str = "timed_";
@@ -746,6 +748,109 @@ impl ChainSyncMetrics {
     }
 }
 
+/// jemalloc's own accounting of the process heap (singleton), sampled by
+/// [`spawn_allocator_stats`].
+#[derive(Clone, Metrics)]
+#[metrics(scope = "debug_trace")]
+pub struct AllocatorMetrics {
+    /// Bytes allocated by the application: the live heap
+    jemalloc_allocated_bytes: Gauge,
+    /// Bytes in active pages, at least `allocated`; the excess is page-level fragmentation
+    jemalloc_active_bytes: Gauge,
+    /// Bytes dedicated to jemalloc's own metadata
+    jemalloc_metadata_bytes: Gauge,
+    /// Upper bound on bytes in physically resident pages mapped by jemalloc: active pages,
+    /// metadata, and dirty pages not yet returned to the OS
+    jemalloc_resident_bytes: Gauge,
+    /// Bytes in active extents mapped by jemalloc
+    jemalloc_mapped_bytes: Gauge,
+    /// Bytes of virtual mappings retained for reuse instead of unmapped; address space, mostly
+    /// not resident
+    jemalloc_retained_bytes: Gauge,
+}
+
+/// Publishes [`AllocatorMetrics`] from jemalloc.
+///
+/// The mallctl names are resolved to MIBs once, so a sample is seven direct lookups rather than
+/// seven walks of jemalloc's ctl tree on a loop that runs for the process's lifetime.
+struct AllocatorSampler {
+    epoch: epoch_mib,
+    stats: [(Gauge, Mib<[usize; 2]>); 6],
+}
+
+impl AllocatorSampler {
+    /// Resolves every statistic's MIB.
+    fn new() -> tikv_jemalloc_ctl::Result<Self> {
+        let AllocatorMetrics {
+            jemalloc_allocated_bytes,
+            jemalloc_active_bytes,
+            jemalloc_metadata_bytes,
+            jemalloc_resident_bytes,
+            jemalloc_mapped_bytes,
+            jemalloc_retained_bytes,
+        } = AllocatorMetrics::default();
+        Ok(Self {
+            epoch: epoch::mib()?,
+            stats: [
+                (jemalloc_allocated_bytes, stats::allocated::mib()?.0),
+                (jemalloc_active_bytes, stats::active::mib()?.0),
+                (jemalloc_metadata_bytes, stats::metadata::mib()?.0),
+                (jemalloc_resident_bytes, stats::resident::mib()?.0),
+                (jemalloc_mapped_bytes, stats::mapped::mib()?.0),
+                (jemalloc_retained_bytes, stats::retained::mib()?.0),
+            ],
+        })
+    }
+
+    /// Advances jemalloc's stats epoch and publishes one sample.
+    ///
+    /// Once the MIBs resolve, a read can only fail for a reason fixed for the process's lifetime
+    /// — chiefly a jemalloc that cannot report statistics (one linked through
+    /// `JEMALLOC_OVERRIDE`), whose stat names still resolve — so the first sample's outcome is
+    /// every sample's.
+    fn sample(&self) -> tikv_jemalloc_ctl::Result<()> {
+        // jemalloc caches its statistics; they only refresh when the epoch advances.
+        self.epoch.advance()?;
+        for (gauge, mib) in &self.stats {
+            let bytes: usize = mib.read()?;
+            gauge.set(bytes as f64);
+        }
+        Ok(())
+    }
+}
+
+/// How often [`spawn_allocator_stats`] samples jemalloc.
+const ALLOCATOR_STATS_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Samples jemalloc's heap statistics into [`AllocatorMetrics`] every
+/// [`ALLOCATOR_STATS_INTERVAL`] for the process's lifetime.
+///
+/// The first sample is taken here, and a failure disables sampling with one warning rather than
+/// failing every [`ALLOCATOR_STATS_INTERVAL`]. On its own thread so the epoch refresh, which
+/// merges every arena's statistics under the arenas' locks, never runs on an async worker.
+fn spawn_allocator_stats() -> Result<()> {
+    let sampler = AllocatorSampler::new().and_then(|sampler| sampler.sample().map(|()| sampler));
+    let sampler = match sampler {
+        Ok(sampler) => sampler,
+        Err(error) => {
+            warn!(%error, "jemalloc statistics are unavailable; allocator metrics disabled");
+            return Ok(());
+        }
+    };
+    thread::Builder::new()
+        .name("jemalloc-stats".to_owned())
+        .spawn(move || {
+            loop {
+                thread::sleep(ALLOCATOR_STATS_INTERVAL);
+                if let Err(error) = sampler.sample() {
+                    debug!(%error, "Failed to sample jemalloc stats");
+                }
+            }
+        })
+        .map_err(|e| eyre!("failed to spawn the jemalloc stats thread: {e}"))?;
+    Ok(())
+}
+
 /// Inbound admission-gate occupancy, labeled `(method)`.
 ///
 /// Two independent gauges rather than a queued/executing pair, because the two phases are
@@ -1029,6 +1134,8 @@ pub fn init_metrics(addr: SocketAddr) -> Result<()> {
     // Pre-register all metrics
     pre_register_all_metrics();
 
+    spawn_allocator_stats()?;
+
     Ok(())
 }
 
@@ -1233,6 +1340,44 @@ mod tests {
     #[test]
     fn test_resolve_method_unknown() {
         assert_eq!(resolve_method("nonexistent"), "unknown");
+    }
+
+    /// The gauges only carry real numbers when jemalloc is the allocator this binary runs on
+    /// and can report statistics; otherwise sampling is disabled and the dashboard shows nothing.
+    ///
+    /// Asserts presence and non-zero values only, not orderings such as
+    /// `allocated <= active`: jemalloc merges the per-arena counters without a global lock, so
+    /// a snapshot taken while other tests allocate in parallel can briefly violate them.
+    #[test]
+    fn allocator_metrics_sample_the_live_heap() {
+        use std::collections::HashMap;
+
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            AllocatorSampler::new().unwrap().sample().unwrap()
+        });
+
+        let gauges: HashMap<String, f64> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter_map(|(key, _, _, value)| match value {
+                DebugValue::Gauge(v) => Some((key.key().name().to_owned(), v.into_inner())),
+                _ => None,
+            })
+            .collect();
+        // The recorder sees the scoped name; the Prometheus exporter renders `.` as `_`.
+        let gauge = |stat: &str| gauges[&format!("debug_trace.jemalloc_{stat}_bytes")];
+
+        // The test harness itself allocates, so every stat but `retained` (address space, which
+        // jemalloc may hold none of) is non-zero in any process.
+        for stat in ["allocated", "active", "metadata", "resident", "mapped"] {
+            assert!(gauge(stat) > 0.0, "{stat}");
+        }
+        assert!(gauges.contains_key("debug_trace.jemalloc_retained_bytes"));
     }
 
     #[test]

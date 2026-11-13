@@ -18,8 +18,9 @@ use stateless_core::{
 };
 use stateless_db::{
     ANCHOR_BLOCK, CANONICAL_CHAIN, CONTRACTS, DEFAULT_MAX_CHAIN_LENGTH, Database, GENESIS_CONFIG,
-    read_anchor, read_block_hash, read_canonical_tip, read_contracts, read_earliest_block,
-    write_add_contracts, write_advance_chain, write_reset_to_anchor, write_rollback_chain,
+    ValidatedChain, read_anchor, read_block_hash, read_canonical_tip, read_contracts,
+    read_earliest_block, read_validated_chain, write_add_contracts, write_advance_chain,
+    write_reset_to_anchor, write_rewind_validated_chain,
 };
 
 /// Minimal persistent storage backed by redb.
@@ -85,6 +86,12 @@ impl ValidatorDB {
         Ok(())
     }
 
+    /// The validated chain `(anchor, validated]`, both ends from one snapshot: what the reporter
+    /// sends upstream and what startup checks the anchor flags against.
+    pub fn validated_chain(&self) -> StoreResult<ValidatedChain> {
+        read_validated_chain(&self.database)
+    }
+
     /// Load the persisted genesis config, if any.
     pub fn load_genesis(&self) -> StoreResult<Option<Genesis>> {
         let read_txn = self.database.begin_read().store_err()?;
@@ -119,8 +126,12 @@ impl ChainStore for ValidatorDB {
         read_block_hash(&self.database, block_number)
     }
 
+    /// Rewinds the validated chain to `to_block`, never below the anchor; see
+    /// [`write_rewind_validated_chain`]. The anchor is a valid target even after its row was
+    /// pruned, which is how a reorg below the retained window but above the anchor restarts
+    /// validation from the anchor (`ValidatorReorgResolver`).
     fn rollback_chain(&self, to_block: BlockNumber) -> StoreResult<()> {
-        write_rollback_chain(&self.database, to_block)
+        write_rewind_validated_chain(&self.database, to_block)
     }
 
     fn reset_to_anchor(&self, anchor: &BlockMeta) -> StoreResult<()> {
@@ -146,13 +157,7 @@ mod tests {
     use stateless_db::ContractCache;
 
     use super::*;
-    use crate::test_support::make_block_meta;
-
-    fn temp_store() -> (tempfile::TempDir, ValidatorDB) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = ValidatorDB::new(dir.path().join("test.redb")).unwrap();
-        (dir, store)
-    }
+    use crate::test_support::{make_block_meta, temp_store};
 
     #[test]
     fn test_anchor_block_roundtrip() {
@@ -328,6 +333,7 @@ mod tests {
     fn test_rollback_chain() {
         let (_dir, store) = temp_store();
 
+        store.reset_to_anchor(&make_block_meta(9)).unwrap();
         let blocks: Vec<BlockMeta> = (10..=15).map(make_block_meta).collect();
         ChainStore::advance_chain(&store, &blocks).unwrap();
 

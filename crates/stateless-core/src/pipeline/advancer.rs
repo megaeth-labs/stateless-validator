@@ -11,7 +11,7 @@ use crate::{
     db::BlockMeta,
     pipeline::{
         config::{ErrorAction, PipelineOutcome, ReorgEvent, WorkerResult},
-        divergence::{DivergenceLookups, find_divergence_point},
+        divergence::{DivergenceError, DivergenceLookups, find_divergence_point},
         traits::{BlockFetcher, PipelineHooks, ProcessedBlock},
     },
 };
@@ -33,8 +33,10 @@ pub enum ReorgResolution {
 /// This is the single shared abstraction over the scenarios' different reorg models. Each scenario
 /// supplies the resolver matching how it maintains its chain, and passes it to
 /// [`run_pipeline`](crate::pipeline::run_pipeline):
-/// - History-owning scenarios (standalone validator, debug-trace-server) use the core
-///   [`BisectResolver`], which walks their [`DivergenceLookups`] against the remote fetcher.
+/// - The debug-trace-server uses the core [`BisectResolver`], which walks its [`DivergenceLookups`]
+///   against the remote fetcher.
+/// - The standalone validator wraps the same [`find_divergence_point`] bisection in its own
+///   resolver, which falls back to its anchor when the fork lies below the history it retains.
 /// - The mega-reth FullNode implements this trait in its own bin, returning the floor its host
 ///   (state-sync) already published — it never bisects and never touches the fetcher.
 pub trait ReorgResolver<F, S>: Send + Sync {
@@ -53,8 +55,8 @@ pub trait ReorgResolver<F, S>: Send + Sync {
 }
 
 /// Bisection resolver for history-owning stores: walks local history against the remote via
-/// [`find_divergence_point`]. Requires `S: DivergenceLookups`. Lives in core because both
-/// history-owning scenarios reuse it verbatim over the shared `find_divergence_point` algorithm.
+/// [`find_divergence_point`]. Requires `S: DivergenceLookups`. Lives in core next to that
+/// algorithm, which a resolver with its own fallback (the validator's) calls directly.
 pub struct BisectResolver;
 
 impl<F, S> ReorgResolver<F, S> for BisectResolver
@@ -63,13 +65,23 @@ where
     S: DivergenceLookups + Send + Sync,
 {
     async fn resolve(&self, fetcher: &F, store: &S, persisted_tip: u64) -> Result<ReorgResolution> {
-        match find_divergence_point(fetcher, store, persisted_tip).await {
-            Ok(v) => Ok(ReorgResolution::Floor(v)),
-            Err(e) if e.is_fatal() => Ok(ReorgResolution::Fatal(e.to_string())),
+        Ok(find_divergence_point(fetcher, store, persisted_tip)
+            .await
+            .map_or_else(ReorgResolution::from, ReorgResolution::Floor))
+    }
+}
+
+/// How a failed [`find_divergence_point`] ends the cycle: a fatal divergence halts, anything else
+/// retries. Shared by every resolver built on the bisection so they classify alike.
+impl From<DivergenceError> for ReorgResolution {
+    fn from(e: DivergenceError) -> Self {
+        if e.is_fatal() {
+            Self::Fatal(e.to_string())
+        } else {
             // A non-fatal divergence error is a transport hiccup during the bisection fetches —
             // an *intentional* transient signal, so route it through `Retry` (warn + sleep +
             // restart) instead of leaking an `Err` the outer loop logs as "unexpected error".
-            Err(e) => Ok(ReorgResolution::Retry(e.to_string())),
+            Self::Retry(e.to_string())
         }
     }
 }
@@ -147,11 +159,15 @@ where
                 };
 
                 let depth = persisted_tip.saturating_sub(rollback_to);
+                // Walked down from the tip and stopped at the first height the store does not
+                // hold (`ChainStore::get_block_hash`'s contiguity contract): a floor may lie below
+                // the retained rows, and the heights under them have nothing to report however
+                // many there are.
                 let mut reverted_hashes = Vec::new();
-                for n in (rollback_to + 1)..=persisted_tip {
+                for n in ((rollback_to + 1)..=persisted_tip).rev() {
                     match store.get_block_hash(n) {
                         Ok(Some(hash)) => reverted_hashes.push(hash),
-                        Ok(None) => {}
+                        Ok(None) => break,
                         Err(e) => warn!(
                             block_number = n,
                             error = %e,
@@ -159,6 +175,7 @@ where
                         ),
                     }
                 }
+                reverted_hashes.reverse();
 
                 return Ok(PipelineOutcome::Reorg(ReorgEvent {
                     rollback_to,

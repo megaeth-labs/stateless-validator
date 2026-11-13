@@ -27,7 +27,7 @@ The stateless approach eliminates the need for validators to run on high-end har
 
 ## Project Structure
 
-The workspace contains two binaries and five library crates:
+The workspace contains three binaries and five library crates:
 
 | Crate                  | Path                          | Purpose                                                                                                                                                                              |
 | ---------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -38,6 +38,7 @@ The workspace contains two binaries and five library crates:
 | `stateless-r2`         | `crates/stateless-r2`         | Shared R2 witness primitives: SigV4 signer, object-key layout, endpoint parsing, signed PUT, and the retrying witness-object GET fetcher over either the signed S3 API or an unsigned Cloudflare custom domain; consumed by mega-reth's witness uploaders (write), this repo's validator, and the trace server's witness source (read) |
 | `stateless-validator`  | `bin/stateless-validator`     | Main binary: chain sync, parallel validation workers                                                                                                                                 |
 | `debug-trace-server`   | `bin/debug-trace-server`      | Standalone RPC server for debug/trace methods                                                                                                                                        |
+| `coverage-replayer`    | `bin/coverage-replayer`       | Offline coverage tool: replays mainnet blocks under LLVM branch instrumentation and derives a small (greedy) block set that reproduces all the execution coverage the scan observed, of mega-evm and the revm execution engine under it |
 
 Additional directories: `test_data/` (integration test fixtures including genesis config), `audits/` (security audit reports).
 
@@ -72,8 +73,17 @@ cargo run --release --bin stateless-validator -- \
 
 **Optional Arguments:**
 - `--genesis-file`: Path to genesis JSON file containing hardfork activation configuration (required on first run, stored in database for subsequent runs)
-- `--start-block`: Trusted block hash to initialize validation from (required for first-time setup)
+- `--start-block`: Trusted anchor block hash; validation starts at the block above it.
+  Required when the data dir holds no validated chain yet, and must be omitted to resume one (see "Restarting and re-anchoring" below).
+  The block must be on the canonical chain of `--rpc-endpoint`; otherwise startup fails, naming the chain head (the highest usable anchor) and, when the block's height is known, the canonical hash at that height.
+- `--force-anchor`: With `--start-block`, replace the stored validated chain with one anchored at that block, clearing its validated progress (even for the same anchor).
+  Either of the two flags alone is refused on a data dir that already holds a validated chain.
 - `--end-block`: Inclusive end block; validate up to this height, then stop cleanly (useful to slice a fixed range across multiple servers)
+- `--block-list`: Replay exactly the block numbers in this file instead of following the chain, then exit; see "Replaying a block list" below.
+  It excludes `--start-block`, `--force-anchor`, `--end-block` and `--report-validation-endpoint`, and requires `--genesis-file`.
+  `STATELESS_VALIDATOR_FORCE_ANCHOR=false` counts as leaving `--force-anchor` out, so an env file shared with chain-following runs can carry it.
+- `--block-list-timeout-secs`, `--block-list-concurrency`, `--block-list-output-dir`: tuning for `--block-list` (per-stage timeout, default 300; blocks in flight, default twice the physical cores, of which at most one per physical core validates at a time; where the output files go, default `--data-dir`).
+  They are rejected without `--block-list`.
 - `--r2-endpoint`, `--r2-bucket`, `--r2-access-key-id`, `--r2-secret-access-key`: R2 connection settings for the signed S3 target, all four required together (prefer the env var for the secret).
   Configuring a target is the whole switch: there is no mode flag, and with one configured every witness fetch tries the bucket before the `--witness-endpoint` chain.
   Bulk history then streams from R2 at object-storage parallelism while any R2 failure — a frontier miss the uploader has not reached, a throttle, a corrupt object — hands that one block to RPC instead of stalling it, so the gateway only ever sees the blocks R2 could not serve.
@@ -82,12 +92,50 @@ cargo run --release --bin stateless-validator -- \
   Which of the two a run produces follows from how far behind it is: a tip-following validator fetches inside that window, so all of its misses are frontier misses — routine and numerous — and `kind="missing"` stays at zero; watch the frontier rate there instead.
   `kind="missing"` is the bucket-integrity signal during catch-up and fixed `--end-block` backfills, where blocks sit far below the head. A hole that first appears near the tip is not caught here, since the block is fetched once, falls back and is never re-probed; that belongs to whatever monitors the uploader.
   With no `--r2-*` flag set at all, witnesses come from the RPC chain alone; a half-configured target, a blank value, or a tuning flag with no target is rejected at startup by name rather than read as "no R2 configured".
-  "Blank value" covers the flags that travel as text; the two numeric tuning flags are parsed by clap, so a blank one aborts earlier with clap's unnamed error (see AGENTS.md for the full rule).
+  "Blank value" covers the flags that travel as text; the two numeric tuning flags are parsed by clap, so a blank one aborts earlier, in clap's parser (see AGENTS.md for the full rule).
   The R2 attempt for one block is bounded in total by a single `--rpc-per-attempt-timeout-ms`, permit wait included, so an endpoint that accepts connections and then stalls costs the block one upstream hop's wall clock rather than one per retry before the RPC chain takes over.
 - `--r2-custom-domain`: alternative R2 target that replaces the four flags above — unsigned HTTP/2 GETs through a Cloudflare custom domain fronting the bucket (mutually exclusive with `--r2-endpoint`, and any of the four left set is rejected at startup by name rather than silently ignored; optional `--r2-access-client-id`/`--r2-access-client-secret` attach Cloudflare Access service-token headers, which require an `https://` domain unless it is loopback; the domain's cache rule must set 404s to bypass cache, or a cached pre-upload 404 pushes those blocks onto the RPC path for the negative-cache TTL and false-fires the `kind="missing"` alarm once they age past the frontier band)
-- `--report-validation-endpoint`: RPC endpoint URL for reporting validated blocks via `mega_setValidatedBlocks` (disabled if not provided)
+- `--report-validation-endpoint`: RPC endpoint URL (typically a replay-full node) the validated chain is reported to via `mega_setValidatedChain` (disabled if not provided).
+  Each report carries both ends of the validated chain `(anchor, validated]` as `{ blockNumber, blockHash }` objects, and is sent once a second while the chain has moved, plus once more on shutdown.
+  The receiver accepts it only when both blocks are on its own canonical chain, and then replaces what it recorded before, so the chain a reorg rewound is reported like any other; a refused report is retried with the chain as it is by the next round.
+  Nothing is reported while no block above the anchor has been validated, since the receiver takes only `anchor < validated`.
+  Each report sent is counted by outcome on `stateless_validator_validated_chain_reports_total`, and `stateless_validator_reported_validated_height` holds the last accepted one, so a receiver that keeps refusing shows on a dashboard rather than only in the logs.
 - `--metrics-enabled`: Enable Prometheus metrics endpoint (disabled by default)
 - `--metrics-port`: Port for Prometheus metrics HTTP endpoint (default: 9090)
+
+### Replaying a block list
+
+```bash
+cargo run --release --bin stateless-validator -- \
+  --data-dir /path/to/fresh-scratch-dir \
+  --genesis-file /path/to/genesis.json \
+  --rpc-endpoint <public-rpc-endpoint> \
+  --witness-endpoint <witness-rpc-endpoint> \
+  --block-list pool.txt
+```
+
+The file has one decimal block number per line.
+Blank lines are skipped and `#` starts a comment, on a line of its own or after a number, so the candidate pool written by the coverage tooling works as is; `coverage-replayer backfill --blocks-file` reads the same format with the same parser.
+Duplicates collapse, and a line that is neither a comment nor a number fails the run before any block is fetched.
+Each block goes through the same fetch (R2 first when configured, then the RPC witness chain) and the same validation as the chain-following mode, up to `--block-list-concurrency` at a time.
+Validation is CPU-bound, so as in the pipeline at most one block per physical core validates at once, and a fetched block waits for a free core before its validation timeout starts.
+Nothing is advanced or reported: the canonical chain is not touched, and `--report-validation-endpoint` is rejected because a sparse set of heights must never move the upstream validated pointer.
+Use a fresh `--data-dir`, since the run opens the validator database exclusively and caches contract bytecode there.
+The genesis file is required and always replaces any genesis stored in the data dir, so replaying blocks past a hardfork needs a genesis that schedules it.
+
+A pass means the witness verified and replaying the block reproduced its header (state root, withdrawals root, receipts root, logs bloom, gas used).
+It does not check that the witness's pre-state equals the parent block's post-state, because the parent is not part of the list.
+A block that fails is recorded and the run continues; the exit status is non-zero if any block did not validate.
+The RPC client retries transport errors indefinitely, so each of the fetch and the validation of a block is bounded by `--block-list-timeout-secs`, and a block that exceeds it is recorded as `fetch_timeout` or `process_timeout`.
+The one chain-head read before the first block is bounded the same way, and fails the run when it times out.
+
+Two files are written to `--block-list-output-dir`, both overwritten on each run.
+`results.jsonl` has one object per block, in completion order, with `block`, `hash`, `status`, `ms`, `retryable` and the validator's error text in `message`.
+`retryable` is true for the fetch statuses and both timeouts, which say nothing about the block itself, and for a validation failure the validator judges transient (a store error rather than a mismatch).
+`failed.txt` is written when the run finishes, through a temporary file and a rename so a reader never sees half of it; until then it holds only a comment, so an interrupted run never leaves the previous run's retry list beside its own results.
+`failed.txt` lists the blocks that did not validate in the input format, so it can be passed back as `--block-list` to retry exactly those.
+The statuses are `validated`, `fetch_timeout`, `fetch_failed`, `process_timeout` and `validation_failed`.
+The end-of-run summary prints the totals, the rate in blocks per second and the slowest blocks.
 
 ### Running the Debug Trace Server
 
@@ -190,7 +238,13 @@ A bounded in-memory `BlockData` cache keyed by block hash sits between the respo
 Block-number lookups still resolve number → hash against the DB or upstream first, so canonicality is never cached and reorgs need no invalidation here; when a trace fails for a data-attributable reason (the witness cannot replay the block), the entry is dropped so the next request refetches instead of replaying the poisoned data, and each such eviction is counted (`block_data_evictions_total`).
 Size it with `--block-data-cache-max-size` (default `1GB`; `0` disables); the cache uses a fixed 4 shards, so the largest cacheable entry is `max_bytes / 4` on every host (~256 MB at the default), and an insert the cache does not retain is counted (`cache_admission_rejects_total`) and logged rather than masquerading as a miss.
 The byte budget is an estimate of retained payload, not exact RSS: map/allocator overhead is under-counted, and contract bytecode is charged here *and* in the contract cache (the same refcounted allocations), so evicting an entry can free less than its accounted weight.
-Combined default memory across the four caches is roughly 3.1 GB — response cache 1 GB + block-data cache 1 GB + contract cache 512 MB + canonical-hash memo ~0.6 GB at its 8M-entry cap (it fills lazily; the measured working set is 50–130k heights, ~10 MB) — on top of ordinary heap; size hosts (or lower the knobs) accordingly.
+A cached witness is charged as its KV/level payload plus the direct-lookup table built beside it once per block and shared by every trace request.
+The table stays resident as long as the entry does, so the same budget holds fewer blocks than the witness maps alone would suggest.
+The server runs on jemalloc rather than the system allocator: under glibc malloc this cache churn left RSS at 2.5–3× the caches' accounted bytes and still rising, because freed memory stayed in malloc's per-thread arenas instead of returning to the OS.
+On Linux, jemalloc runs with background purge threads, so memory freed by a load burst returns to the OS within seconds even from arenas that then go quiet; set `MALLOC_CONF=background_thread:false` to disable them.
+The `Allocator: jemalloc` line logged at startup, with or without metrics, reports the settings that took effect (`background_thread`, `narenas`, and the compiled-in `malloc_conf` that `MALLOC_CONF` overrides).
+With `--metrics-enabled`, jemalloc's own accounting is exported every 10s as `debug_trace_jemalloc_{allocated,active,metadata,resident,mapped,retained}_bytes`: `allocated` is the live heap and `resident` the physical memory the allocator holds, so a gap that widens while `allocated` stays flat is allocator retention rather than a leak.
+Combined default memory across the four caches is roughly 3.1 GB — response cache 1 GB + block-data cache 1 GB + contract cache 512 MB + canonical-hash memo ~0.6 GB at its 8M-entry cap (it fills lazily; the measured working set is 50–130k heights, ~10 MB) — on top of ordinary heap and, in local cache mode, redb's page cache (up to 1 GiB); size hosts (or lower the knobs) accordingly.
 
 **Witness endpoints:**
 Declare the internal witness generator via `--witness-generator-endpoint`; `--witness-endpoint` lists the durable fallbacks (e.g. an R2-backed witness service), tried in order.
@@ -245,7 +299,9 @@ Each command-line flag has an equivalent environment variable:
 - `STATELESS_VALIDATOR_WITNESS_ENDPOINT` → `--witness-endpoint`
 - `STATELESS_VALIDATOR_GENESIS_FILE` → `--genesis-file`
 - `STATELESS_VALIDATOR_START_BLOCK` → `--start-block`
+- `STATELESS_VALIDATOR_FORCE_ANCHOR` → `--force-anchor` (`true` to enable, `false` the same as unset)
 - `STATELESS_VALIDATOR_END_BLOCK` → `--end-block`
+- `STATELESS_VALIDATOR_BLOCK_LIST` / `_BLOCK_LIST_TIMEOUT_SECS` / `_BLOCK_LIST_CONCURRENCY` / `_BLOCK_LIST_OUTPUT_DIR` → `--block-list*`
 - `STATELESS_VALIDATOR_R2_ENDPOINT` / `_R2_BUCKET` / `_R2_ACCESS_KEY_ID` / `_R2_SECRET_ACCESS_KEY` → `--r2-*` (the signed S3 target)
 - `STATELESS_VALIDATOR_R2_CUSTOM_DOMAIN` / `_R2_ACCESS_CLIENT_ID` / `_R2_ACCESS_CLIENT_SECRET` → `--r2-custom-domain` and its Cloudflare Access pair
 - `STATELESS_VALIDATOR_REPORT_VALIDATION_ENDPOINT` → `--report-validation-endpoint`
@@ -280,7 +336,7 @@ The validator will:
 3. Initialize the canonical chain database with this trusted block
 4. Begin validation from this anchor point, applying the appropriate EVM rules based on hardfork activation
 
-For subsequent runs, you can omit both `--genesis-file` and `--start-block` to resume from the existing database:
+For subsequent runs, omit both `--genesis-file` and `--start-block` to resume from the existing database:
 
 ```bash
 cargo run --bin stateless-validator -- \
@@ -288,6 +344,26 @@ cargo run --bin stateless-validator -- \
   --rpc-endpoint https://your-rpc-endpoint.com \
   --witness-endpoint https://your-witness-endpoint.com
 ```
+
+### Restarting and re-anchoring
+
+The database records the validated chain `(anchor, validated]`: the trusted anchor, and the highest block validated above it (none right after anchoring).
+Startup treats the anchor flags as follows:
+
+| Database | Flags | Result |
+| --- | --- | --- |
+| no validated chain | `--start-block <hash>` (with or without `--force-anchor`) | anchors at the block; validation starts above it |
+| no validated chain | none | startup fails: a trusted starting point is required |
+| validated chain | none | resumes above `validated` (or above the anchor if nothing is validated yet) |
+| validated chain | `--start-block <hash> --force-anchor` | replaces the chain: anchors at the block, clears `validated` |
+| any | `--start-block` alone on a stored chain, or `--force-anchor` alone | startup fails |
+
+When the remote chain reorgs or rewinds — while the validator runs or while it is down — the validator rewinds its validated chain to the fork point on its own and validates again from there:
+
+- A fork above the anchor that the retained canonical-chain rows (`--canonical-chain-max-length`) still cover rewinds `validated` to the fork point, or to nothing when the fork point is the anchor.
+- A fork below those rows but above the anchor rewinds to the anchor, which is kept: every block above it is validated again.
+- A fork below the anchor halts the validator, since it keeps no block hashes below its anchor to locate the fork with and a new anchor is a trust decision.
+  The error names the remote head; restart with `--start-block <hash> --force-anchor` on a trusted block of the current chain.
 
 ## Scope and Trust Model
 
@@ -346,6 +422,7 @@ The pipeline is configured via `PipelineConfig` and customized through trait imp
 | File                                                                                           | Purpose                                                                                                     |
 | ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
 | `crates/stateless-core/src/pipeline/{mod,config,traits,fetcher,divergence,advancer,worker}.rs` | Generic three-stage pipeline split by responsibility                                                        |
+| `bin/stateless-validator/src/replay.rs`                                                        | `--block-list` mode: bounded-concurrency fetch + validate, results and retry files |
 | `crates/stateless-core/src/executor.rs`                                                        | Block validation and EVM replay                                                                             |
 | `crates/stateless-core/src/db.rs`                                                              | Shared storage traits: `ChainStore`, `ContractStore`, `StoreError` (scenario stores live in their binaries) |
 | `crates/stateless-core/src/evm_database.rs`                                                    | `WitnessDatabase` implementing `revm::DatabaseRef`                                                          |
@@ -412,6 +489,8 @@ Metrics are available at `http://0.0.0.0:<port>/metrics`.
 | `stateless_validator_rpc_requests_total`                | Counter   | Total RPC requests (with `method` label)            |
 | `stateless_validator_rpc_errors_total`                  | Counter   | RPC errors (with `method` label)                    |
 | `stateless_validator_rpc_retry_attempts_total`          | Counter   | RPC transient retries (with `method` label)         |
+| `stateless_validator_validated_chain_reports_total`     | Counter   | `mega_setValidatedChain` reports sent (with `outcome` label: `accepted`, `refused` — the receiver lacks a block of the chain on its canonical chain — or `failed`); live with `--report-validation-endpoint` |
+| `stateless_validator_reported_validated_height`         | Gauge     | Validated block of the last chain the receiver accepted, 0 until one is; flat while `local_chain_height` advances means reports are not landing |
 | `stateless_validator_witness_fetch_r2_time_seconds`     | Histogram | R2 witness fetch + decode time                      |
 | `stateless_validator_r2_witness_retry_attempts_total`   | Counter   | R2 witness GET retries (before the final outcome)   |
 | `stateless_validator_r2_witness_errors_total`           | Counter   | Failed R2 witness fetches, each one block that fell back to RPC (with `kind` label; `missing` is a hole below the frontier window) |
@@ -437,9 +516,19 @@ cargo test -p stateless-core -- test_name     # single test
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features
+cargo clippy -p coverage-replayer --all-targets --all-features -- --cfg coverage_replayer_instrumented
 cargo sort --check --workspace --grouped --order package,workspace,lints,profile,bin,benches,dependencies,dev-dependencies,features
 ```
 
 ## License
 
-[Add your license information here]
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Every crate directory links both license texts to the root files; `cargo package` and `cargo vendor` resolve the links, so a packaged or vendored crate keeps the full texts.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

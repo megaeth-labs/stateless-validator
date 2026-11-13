@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "bin/coverage-replayer",
     "bin/debug-trace-server",
     "bin/stateless-validator",
     "crates/stateless-common",
@@ -11,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "2.0.20"
+version = "2.1.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT OR Apache-2.0"
@@ -40,8 +41,8 @@ alloy-signer-local = "2.0.5"
 alloy-trie = { version = "0.9.4", default-features = false }
 
 # mega
-mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "29bfd9e0bcc9f59280f5850d666a88ce4cfd1a11", default-features = false }
-salt = { git = "https://github.com/megaeth-labs/salt.git", tag = "v1.0.6", default-features = false }
+mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", rev = "7574376477f9731e6a4c9ab27cdc930d30cbe36d", default-features = false }
+salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "abf47a4cd786b4686d9837d064ae4554b24d3686", default-features = false }
 
 # op
 # Every crate below is pinned to the same Optimism monorepo revision as the mega-evm
@@ -68,7 +69,7 @@ base64 = { version = "0.22", default-features = false }
 bincode = { version = "2.0", features = ["serde", "alloc"], default-features = false }
 bytes = "1.11"
 chrono = { version = "0.4", default-features = false }
-clap = { version = "4.6", features = ["derive", "env", "std"], default-features = false }
+clap = { version = "4.6", features = ["derive", "env", "error-context", "help", "std", "usage"], default-features = false }
 dashmap = { version = "6.1", default-features = false }
 dotenvy = "0.15"
 dyn-clone = "1.0"
@@ -106,6 +107,8 @@ sha2 = { version = "0.10", default-features = false }
 tar = { version = "0.4", default-features = false }
 tempfile = { version = "3.27", default-features = false }
 thiserror = { version = "2.0", default-features = false }
+tikv-jemalloc-ctl = { version = "0.7", features = ["stats"], default-features = false }
+tikv-jemallocator = { version = "0.7", features = ["override_allocator_on_supported_platforms"], default-features = false }
 tokio = { version = "1.51", features = ["rt-multi-thread", "signal"], default-features = false }
 tokio-util = { version = "0.7", default-features = false }
 tower = "0.5"
@@ -127,3 +130,19 @@ opt-level = 3
 debug-assertions = true
 incremental = true
 debug = true
+
+# Instrumented builds for coverage-replayer: coverage only cares about "was it
+# executed", so trade peak runtime speed for much faster builds (no LTO, many
+# codegen units). Do NOT add `-C link-dead-code` (it monomorphizes dead generic
+# code and fails const-eval asserts in revm). The instrumentation flags come
+# from a rustc wrapper rather than RUSTFLAGS, so that only the measured code is
+# instrumented (see the wrapper for why that matters); the explicit --target is
+# how it tells host artifacts apart. Build with:
+#   RUSTC_WRAPPER="$PWD/bin/coverage-replayer/cov-rustc-wrapper.sh" \
+#     cargo build --profile coverage -p coverage-replayer \
+#       --target "$(rustc -vV | sed -n 's/host: //p')"
+[profile.coverage]
+inherits = "release"
+opt-level = 2
+lto = "off"
+codegen-units = 16

@@ -50,7 +50,8 @@ use stateless_common::{
     WitnessSizeBreakdown, r2_band,
 };
 use stateless_core::{
-    ContractStore, LightWitness, StoreResult, db::StoreError, withdrawals::MptWitness,
+    ContractStore, LightWitness, LightWitnessExecutor, StoreResult, db::StoreError,
+    withdrawals::MptWitness,
 };
 use stateless_db::ContractCache;
 use tracing::{debug, error, instrument, trace, warn};
@@ -123,12 +124,25 @@ fn permit_reserve(witness_timeout: Duration, block_fetch_timeout: Duration) -> D
 pub struct BlockData {
     /// The block with full transaction data.
     pub block: Block<Transaction>,
-    /// Light witness without expensive EC point validation.
-    pub witness: LightWitness,
+    /// The witness in execution form (light witness plus direct-lookup table), built once
+    /// per block and shared by every trace request.
+    pub witness: LightWitnessExecutor,
     /// Contract bytecodes keyed by code hash, required for EVM execution.
     /// `Bytecode` is internally reference-counted, so values share their underlying allocation
     /// with the `ContractCache` (and across `BlockData` clones) via cheap refcount-bump clones.
     pub contracts: HashMap<B256, Bytecode>,
+}
+
+impl BlockData {
+    /// Assembles a block's data, wrapping the witness in its execution form — the one place
+    /// its direct-lookup table is built.
+    pub fn new(
+        block: Block<Transaction>,
+        witness: LightWitness,
+        contracts: HashMap<B256, Bytecode>,
+    ) -> Self {
+        Self { block, witness: witness.into(), contracts }
+    }
 }
 
 /// Default timeout for a user-facing witness fetch in seconds (8 seconds).
@@ -944,7 +958,7 @@ impl DataProvider {
             );
         }
 
-        Ok(Some(BlockData { block, witness, contracts }))
+        Ok(Some(BlockData::new(block, witness, contracts)))
     }
 
     /// Single-flight fetch via [`futures::future::Shared`]: concurrent callers for the same
@@ -1078,6 +1092,9 @@ fn shared_to_result(
 ///    (see `witness_deadline_for`).
 /// 2. The witness arrives as a `LightWitness` already (zero-validation light decode).
 /// 3. Extract code hashes from witness and fetch contract bytecodes (shares `deadline`).
+/// 4. Assemble the [`BlockData`] shared by every request for this block; [`BlockData::new`] wraps
+///    the witness in its execution form ([`LightWitnessExecutor`]), building its direct-lookup
+///    table once.
 // One call site, and `.shared()` requires owned handles (see above) — a params struct would add
 // a type to keep in sync without encapsulating anything.
 #[allow(clippy::too_many_arguments)]
@@ -1183,7 +1200,7 @@ async fn do_fetch_block_data(
         );
     }
 
-    Ok(BlockData { block, witness, contracts })
+    Ok(BlockData::new(block, witness, contracts))
 }
 
 /// Typed failure for a (number, hash) pair that drifted: `actual` is the fetched block's
@@ -1532,16 +1549,24 @@ pub(crate) mod test_support {
         Arc::new(ContractCache::new(Arc::new(NoopContractStore) as Arc<dyn ContractStore>))
     }
 
-    /// Builds a real [`BlockData`] (block, light witness, full fixture contract map) from
-    /// the shared synthetic fixture set.
-    pub(crate) fn fixture_block_data() -> BlockData {
+    /// The `(block, light witness, full fixture contract map)` triple behind
+    /// [`fixture_block_data`], before the witness is wrapped in its execution form — for
+    /// callers that need the plain `LightWitness` (e.g. the stub block store).
+    pub(crate) fn fixture_parts() -> (Block<Transaction>, LightWitness, HashMap<B256, Bytecode>) {
         let fixtures = TestFixtures::synthetic_shared();
         let (_, hash) = fixtures.paired_blocks().into_iter().next().expect("paired fixture");
         let block = fixtures.blocks[&hash].clone();
         let witness = LightWitness::from(&fixtures.salt_witnesses[&hash]);
         let contracts: HashMap<B256, Bytecode> =
             fixtures.contracts.iter().map(|(h, code)| (*h, code.clone())).collect();
-        BlockData { block, witness, contracts }
+        (block, witness, contracts)
+    }
+
+    /// Builds a real [`BlockData`] (block, witness in execution form, full fixture contract
+    /// map) from the shared synthetic fixture set.
+    pub(crate) fn fixture_block_data() -> BlockData {
+        let (block, witness, contracts) = fixture_parts();
+        BlockData::new(block, witness, contracts)
     }
 
     /// The first paired synthetic block — the one [`fixture_block_data`] uses — as
@@ -1782,7 +1807,7 @@ mod tests {
     /// Builds a fixture `(block, witness)` pair plus a contract cache pre-loaded with every
     /// code hash the witness references, so DB-served fetches never fall through to RPC.
     fn fixture_block_and_cache() -> (Block<Transaction>, LightWitness, Arc<ContractCache>) {
-        let BlockData { block, witness, contracts } = test_support::fixture_block_data();
+        let (block, witness, contracts) = test_support::fixture_parts();
         let contract_cache = test_support::noop_contract_cache();
         let codes: Vec<(B256, Bytecode)> = crate::tracing_executor::extract_code_hashes(&witness)
             .into_iter()
@@ -1920,7 +1945,7 @@ mod tests {
         let (block, witness, contract_cache) = fixture_block_and_cache();
         let hash = block.header.hash;
         let cache = Arc::new(BlockDataCache::new(1024 * 1024 * 1024));
-        cache.insert(hash, Arc::new(BlockData { block, witness, contracts: HashMap::default() }));
+        cache.insert(hash, Arc::new(BlockData::new(block, witness, HashMap::default())));
         let provider =
             provider_with_tiers(&test_support::hanging_url(), None, Some(cache), contract_cache);
 
@@ -3026,11 +3051,7 @@ mod tests {
         let cache = Arc::new(BlockDataCache::new(1024 * 1024 * 1024));
         cache.insert(
             hash,
-            Arc::new(BlockData {
-                block: block.clone(),
-                witness: witness.clone(),
-                contracts: HashMap::default(),
-            }),
+            Arc::new(BlockData::new(block.clone(), witness.clone(), HashMap::default())),
         );
         let memory = provider_with_tiers(
             &test_support::hanging_url(),
@@ -3069,7 +3090,7 @@ mod tests {
     /// hanging upstream, the typed drift error must land instead of a timeout.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn db_tier_drift_fails_before_contract_resolution() {
-        let BlockData { block, witness, .. } = test_support::fixture_block_data();
+        let (block, witness, _) = test_support::fixture_parts();
         let (number, hash) = (block.header.number, block.header.hash);
         let store =
             Arc::new(StubBlockStore { block_data: Some((block, witness)), ..Default::default() });

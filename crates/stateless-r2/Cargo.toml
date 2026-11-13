@@ -37,4 +37,4 @@ tracing = { workspace = true, features = ["std"] }
 [dev-dependencies]
 # misc
 stateless-test-utils = { path = "../stateless-test-utils" }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }

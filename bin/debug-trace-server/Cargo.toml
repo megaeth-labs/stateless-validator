@@ -53,11 +53,18 @@ redb.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
+tikv-jemalloc-ctl.workspace = true
+tikv-jemallocator.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tokio-util.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
+
+# jemalloc's background purge threads exist only on Linux; elsewhere enabling them just prints a
+# warning at every startup.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { workspace = true, features = ["background_threads"] }
 
 [dev-dependencies]
 alloy-network.workspace = true

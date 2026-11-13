@@ -56,8 +56,8 @@ pub enum RpcMethod {
     EthGetTransactionByHash,
     /// mega_getBlockWitness (any witness provider)
     MegaGetBlockWitness,
-    /// mega_setValidatedBlocks
-    MegaSetValidatedBlocks,
+    /// mega_setValidatedChain
+    MegaSetValidatedChain,
 }
 
 impl RpcMethod {
@@ -70,7 +70,7 @@ impl RpcMethod {
             RpcMethod::EthBlockNumber => "eth_blockNumber",
             RpcMethod::EthGetTransactionByHash => "eth_getTransactionByHash",
             RpcMethod::MegaGetBlockWitness => "mega_getBlockWitness",
-            RpcMethod::MegaSetValidatedBlocks => "mega_setValidatedBlocks",
+            RpcMethod::MegaSetValidatedChain => "mega_setValidatedChain",
         }
     }
 }
@@ -178,7 +178,7 @@ mod tests {
         assert_eq!(RpcMethod::EthGetBlock.as_str(), "eth_getBlockByNumber");
         assert_eq!(RpcMethod::EthBlockNumber.as_str(), "eth_blockNumber");
         assert_eq!(RpcMethod::MegaGetBlockWitness.as_str(), "mega_getBlockWitness");
-        assert_eq!(RpcMethod::MegaSetValidatedBlocks.as_str(), "mega_setValidatedBlocks");
+        assert_eq!(RpcMethod::MegaSetValidatedChain.as_str(), "mega_setValidatedChain");
     }
 
     #[test]

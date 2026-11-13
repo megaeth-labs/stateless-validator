@@ -7,3 +7,6 @@
 
 # database
 validator-data
+
+# coverage-replayer run data (transferred out-of-band, never via git)
+/data/

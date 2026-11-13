@@ -4,18 +4,24 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use alloy_genesis::Genesis;
 use alloy_primitives::BlockHash;
-use alloy_rpc_types_eth::BlockId;
-use clap::Parser;
+use clap::{CommandFactory, Parser, error::ErrorKind};
 use eyre::Result;
 use stateless_common::{
     BackoffPolicy, R2CountFlag, R2Flag, R2Flags, R2TuningFlag, R2WitnessTransport, RedactedSecret,
     RpcClient, RpcClientConfig, logging::LogArgs, validate_r2_flags,
 };
-use stateless_core::{ChainStore, ContractStore, chain_spec::ChainSpec, db::BlockMeta};
+use stateless_core::{ContractStore, chain_spec::ChainSpec};
 use stateless_db::ContractCache;
 use tracing::{info, warn};
 
-use crate::{metrics, r2_witness::R2WitnessClient, runner, validator_db::ValidatorDB};
+use crate::{
+    anchor,
+    chain_sync::{ValidatorFetcher, ValidatorProcessor},
+    metrics,
+    r2_witness::R2WitnessClient,
+    replay, runner,
+    validator_db::ValidatorDB,
+};
 
 /// Database filename for the validator.
 pub const VALIDATOR_DB_FILENAME: &str = "validator.redb";
@@ -103,12 +109,12 @@ pub struct CommandLineArgs {
     /// Cloudflare Access service-token client id, sent as `CF-Access-Client-Id` on every
     /// custom-domain GET. Omit when the domain is locked by an IP allowlist instead.
     /// Redacted like the secret: the id alone is enough to look up the token.
-    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_ID")]
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_ID", hide_env_values = true)]
     pub r2_access_client_id: Option<RedactedSecret>,
 
     /// Cloudflare Access service-token client secret, sent as `CF-Access-Client-Secret`. Prefer
     /// the env var over the flag.
-    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_SECRET")]
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_ACCESS_CLIENT_SECRET", hide_env_values = true)]
     pub r2_access_client_secret: Option<RedactedSecret>,
 
     /// R2 bucket holding the witnesses (e.g. `witness-mainnet`). Required for the S3-endpoint
@@ -123,7 +129,7 @@ pub struct CommandLineArgs {
 
     /// R2 secret access key. Required for the S3-endpoint target (not used with
     /// `--r2-custom-domain`). Prefer the env var over the flag.
-    #[clap(long, env = "STATELESS_VALIDATOR_R2_SECRET_ACCESS_KEY")]
+    #[clap(long, env = "STATELESS_VALIDATOR_R2_SECRET_ACCESS_KEY", hide_env_values = true)]
     pub r2_secret_access_key: Option<RedactedSecret>,
 
     /// R2 connection-establishment timeout (milliseconds). A healthy handshake to the local
@@ -152,7 +158,7 @@ pub struct CommandLineArgs {
     /// evenly, so raising this alone spreads the same concurrency thinner; a count above that
     /// cap is rejected.
     ///
-    /// Text rather than a number so a blank env line is named rather than hitting clap.
+    /// Text rather than a number so a blank env line is diagnosed by the R2 rules, not by clap.
     #[clap(long, env = "STATELESS_VALIDATOR_R2_CONNECTIONS")]
     pub r2_connections: Option<String>,
 
@@ -162,17 +168,78 @@ pub struct CommandLineArgs {
     #[clap(long, env = "STATELESS_VALIDATOR_END_BLOCK")]
     pub end_block: Option<u64>,
 
-    /// Optional trusted block hash to start validation from.
+    /// Trusted anchor block hash; validation starts at the block above it.
+    ///
+    /// Required when the data dir holds no validated chain yet. Omit it to resume the stored
+    /// chain: with one stored, it is accepted only together with `--force-anchor`, which replaces
+    /// that chain and clears its validated progress, even for the same anchor. The block must be
+    /// on the canonical chain of `--rpc-endpoint`; startup fails otherwise, naming the chain head
+    /// (the highest usable anchor).
     #[clap(long, env = "STATELESS_VALIDATOR_START_BLOCK")]
-    pub start_block: Option<String>,
+    pub start_block: Option<BlockHash>,
+
+    /// Replace the stored validated chain with one anchored at `--start-block`, clearing its
+    /// validated progress. Requires `--start-block`, so a `--block-list` run cannot take it.
+    ///
+    /// `STATELESS_VALIDATOR_FORCE_ANCHOR=false` is the same as leaving it out.
+    #[clap(long, env = "STATELESS_VALIDATOR_FORCE_ANCHOR")]
+    pub force_anchor: bool,
 
     /// Path to the genesis JSON file for chain configuration.
     /// Required on first run, optional on subsequent runs (loads from database).
     #[clap(long, env = "STATELESS_VALIDATOR_GENESIS_FILE")]
     pub genesis_file: Option<String>,
 
-    /// Endpoint for reporting validated blocks via mega_setValidatedBlocks RPC.
-    /// If not provided, validation reporting is disabled.
+    /// Replay exactly the block numbers in this file (one per line; blank lines and lines
+    /// starting with `#` are skipped, so a candidate-pool file works as is), then exit.
+    /// Each block is fetched and validated on its own: the canonical chain is never touched,
+    /// nothing is reported upstream, and the witness pre-state is not checked against the
+    /// parent block. A block that does not validate is recorded and the run goes on; the exit
+    /// status is non-zero if any did. Use a fresh `--data-dir`.
+    /// Needs `--genesis-file`, which then always overrides any genesis stored in the data dir,
+    /// so a stale one cannot silently validate blocks past a hardfork it does not know.
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_BLOCK_LIST",
+        conflicts_with_all = ["start_block", "end_block", "report_validation_endpoint"],
+        requires = "genesis_file",
+    )]
+    pub block_list: Option<PathBuf>,
+
+    /// With `--block-list`: seconds allowed for fetching one block and its witness, and
+    /// separately for validating it, before the block is recorded as timed out (default 300).
+    /// The RPC client retries transport errors forever, so this is what lets a run end when an
+    /// endpoint cannot serve a block; the one chain-head read before the first block is bounded
+    /// by it too. At least 1: zero would time every block out on its first poll.
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_BLOCK_LIST_TIMEOUT_SECS",
+        requires = "block_list",
+        default_value_t = 300,
+        value_parser = clap::value_parser!(u64).range(1..),
+    )]
+    pub block_list_timeout_secs: u64,
+
+    /// With `--block-list`: how many blocks to have in flight, fetching or validating (default:
+    /// twice the physical cores, the validator pipeline's own in-flight window). At most one per
+    /// physical core validates at a time, the pipeline's worker count. At least 1.
+    #[clap(
+        long,
+        env = "STATELESS_VALIDATOR_BLOCK_LIST_CONCURRENCY",
+        requires = "block_list",
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..),
+    )]
+    pub block_list_concurrency: Option<usize>,
+
+    /// With `--block-list`: directory for `results.jsonl` (one line per block, in completion
+    /// order) and `failed.txt` (the blocks that did not validate, in the input format, ready to
+    /// be passed back as `--block-list`). Both are overwritten. Default: `--data-dir`.
+    #[clap(long, env = "STATELESS_VALIDATOR_BLOCK_LIST_OUTPUT_DIR", requires = "block_list")]
+    pub block_list_output_dir: Option<PathBuf>,
+
+    /// Endpoint the validated chain `(anchor, validated]` is reported to, via
+    /// `mega_setValidatedChain` (typically a replay-full node). If not provided, validation
+    /// reporting is disabled.
     #[clap(long, env = "STATELESS_VALIDATOR_REPORT_VALIDATION_ENDPOINT")]
     pub report_validation_endpoint: Option<String>,
 
@@ -265,13 +332,46 @@ pub struct CommandLineArgs {
     pub log: LogArgs,
 }
 
+impl CommandLineArgs {
+    /// [`Parser::try_parse_from`], then the flag rules clap's relations cannot express: what
+    /// startup checks before it touches anything.
+    pub fn try_parse_checked_from<I, T>(args: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let args = Self::try_parse_from(args)?;
+        args.check_flag_values()?;
+        Ok(args)
+    }
+
+    /// The rules that depend on a flag's value rather than its presence.
+    ///
+    /// clap counts a flag whose env var is set as given, whatever the value, so declaring
+    /// `--force-anchor` as requiring `--start-block` (or conflicting with `--block-list`) would
+    /// refuse `STATELESS_VALIDATOR_FORCE_ANCHOR=false`, which an env template shared across roles
+    /// renders. Only a switch that is on needs `--start-block`; as that conflicts with
+    /// `--block-list`, this also keeps the switch out of block-list runs.
+    fn check_flag_values(&self) -> Result<(), clap::Error> {
+        if self.force_anchor && self.start_block.is_none() {
+            return Err(Self::command().error(
+                ErrorKind::MissingRequiredArgument,
+                "--force-anchor requires --start-block (and so cannot be used with --block-list)",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Entry point for the validator binary.
 ///
 /// Parses CLI args, initializes tracing and metrics, constructs the RPC client and
-/// validator DB, loads or initializes the chain spec + anchor, then hands off to
+/// validator DB, loads or initializes the chain spec, applies the anchor flags to the stored
+/// validated chain ([`anchor::apply_startup_request`]), then hands off to
 /// [`runner::run_with_signals`].
 pub async fn run() -> Result<()> {
-    let args = CommandLineArgs::parse();
+    let args = CommandLineArgs::try_parse_checked_from(std::env::args_os())
+        .unwrap_or_else(|err| err.exit());
     let _log_guard = args.log.init_tracing()?;
     let start = std::time::Instant::now();
 
@@ -340,36 +440,27 @@ pub async fn run() -> Result<()> {
         Arc::new(load_or_create_chain_spec(&validator_db, args.genesis_file.as_deref())?);
     info!("Chain spec loaded successfully");
 
-    if let Some(start_block_str) = &args.start_block {
-        info!(start_block = %start_block_str, "Initializing from start block");
+    if let Some(list) = &args.block_list {
+        let pipeline_defaults = stateless_core::PipelineConfig::default();
+        let config = replay::ReplayConfig {
+            concurrency: args
+                .block_list_concurrency
+                .unwrap_or_else(|| pipeline_defaults.fetcher_max_in_flight()),
+            validate_concurrency: pipeline_defaults.concurrent_workers,
+            block_timeout: Duration::from_secs(args.block_list_timeout_secs),
+        };
+        let output_dir = args.block_list_output_dir.as_deref().unwrap_or(&work_dir);
 
-        let block_hash: BlockHash = start_block_str.parse()?;
-        // `get_header` retries transient failures forever at the RPC layer, so the binary
-        // stays stuck here until the endpoint is reachable — a permanent misconfiguration
-        // surfaces as "no forward progress" rather than an arbitrarily bounded retry error.
-        let header = client.get_header(BlockId::Hash(block_hash.into()), true).await;
-
-        let anchor = BlockMeta::try_from_header(&header)
-            .ok_or_else(|| eyre::eyre!("Block {} is missing withdrawals_root", block_hash))?;
-        validator_db.reset_to_anchor(&anchor)?;
-
-        info!(
-            block_hash = %header.hash,
-            block_number = header.number,
-            "Successfully initialized from start block"
-        );
-    } else {
-        let tip = validator_db.get_canonical_tip()?.ok_or_else(|| {
-            eyre::eyre!(
-                "No trusted starting point found. Specify a trusted block with --start-block <blockhash>"
-            )
-        })?;
-        info!(
-            block_number = tip.block_number,
-            block_hash = %tip.block_hash,
-            "Continuing from existing canonical chain"
-        );
+        let fetcher = Arc::new(ValidatorFetcher::new(client.clone(), r2_witness));
+        let processor =
+            Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client.clone() });
+        let outcome = replay::run(list, output_dir, fetcher, processor, &config).await;
+        info!(elapsed = ?start.elapsed(), "Block list replay finished");
+        return outcome;
     }
+
+    anchor::apply_startup_request(&client, &validator_db, args.start_block, args.force_anchor)
+        .await?;
 
     // `#[non_exhaustive]` on `PipelineConfig` rules out the struct-update shorthand at the
     // crate boundary — mutate a default instance instead, which is the pattern the attribute
@@ -409,9 +500,8 @@ fn override_ms(ms: Option<u64>, default: Duration) -> Duration {
 
 /// The RPC witness endpoints, which are always required.
 ///
-/// Checked here rather than by clap's `required`: this workspace builds clap without its
-/// `error-context` feature, so a clap rejection names no argument, and these deployments are
-/// configured through env files where an unnamed error costs a translation round trip.
+/// Checked here rather than by clap's `required`, so the error names the env variable these
+/// deployments are configured through and says why the flag is needed even when R2 is set up.
 fn witness_apis(args: &CommandLineArgs) -> Result<Vec<&str>> {
     if args.witness_endpoint.is_empty() {
         return Err(eyre::eyre!(

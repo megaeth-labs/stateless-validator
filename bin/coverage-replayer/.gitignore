@@ -1,0 +1,4 @@
+# Run artifacts of a local replay; scoped here so they never hide files elsewhere in the tree.
+*.profraw
+*.pid
+*.log

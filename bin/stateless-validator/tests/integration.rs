@@ -14,11 +14,14 @@ use std::{
 
 use alloy_primitives::{B256, BlockHash};
 use alloy_rpc_types_eth::Block;
-use clap::Parser;
+use clap::CommandFactory;
 use jsonrpsee::server::ServerConfigBuilder;
-use jsonrpsee_types::error::{CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned};
+use jsonrpsee_types::error::{
+    CALL_EXECUTION_FAILED_CODE, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_CODE,
+};
 use stateless_common::{
-    BackoffPolicy, R2WitnessTransport, RpcClient, RpcClientConfig, WitnessRequestKeys,
+    BackoffPolicy, BlockRef, R2WitnessTransport, RpcClient, RpcClientConfig,
+    SetValidatedChainResponse, WitnessRequestKeys, block_list::parse_block_list,
     encode_witness_payload, encode_witness_response,
 };
 use stateless_core::{
@@ -36,7 +39,9 @@ use stateless_test_utils::{
 };
 use stateless_validator::{
     CommandLineArgs, R2WitnessClient, VALIDATOR_DB_FILENAME, ValidatorDB, ValidatorFetcher,
-    ValidatorHooks, ValidatorProcessor, load_or_create_chain_spec, run_with_signals,
+    ValidatorHooks, ValidatorProcessor, load_or_create_chain_spec,
+    replay::{self, BlockOutcome, ReplayConfig, Status},
+    run_with_signals,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -69,7 +74,7 @@ fn assert_endpoint_accepts_multiple_forms(
 ) {
     let guard = stateless_test_utils::env::env_lock();
     let parse = |extra: &[&str]| {
-        extract(CommandLineArgs::try_parse_from(base.iter().chain(extra)).unwrap())
+        extract(CommandLineArgs::try_parse_checked_from(base.iter().chain(extra)).unwrap())
     };
 
     assert_eq!(parse(&[flag, "http://a,http://b"]), ["http://a", "http://b"]);
@@ -115,7 +120,7 @@ fn assert_optional_numeric_flag<T>(
 {
     let guard = stateless_test_utils::env::env_lock();
     let parse = |extra: &[&str]| {
-        extract(CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra)).unwrap())
+        extract(CommandLineArgs::try_parse_checked_from(BASE_ARGS.iter().chain(extra)).unwrap())
     };
 
     assert_eq!(parse(&[]), None);
@@ -171,7 +176,8 @@ fn end_block_flag_and_env() {
 #[test]
 fn r2_custom_domain_target_wiring() {
     let _guard = stateless_test_utils::env::env_lock();
-    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
+    let parse =
+        |extra: &[&str]| CommandLineArgs::try_parse_checked_from(BASE_ARGS.iter().chain(extra));
 
     assert_eq!(
         parse(&["--r2-custom-domain", "https://witness.example.com"])
@@ -181,9 +187,8 @@ fn r2_custom_domain_target_wiring() {
         Some("https://witness.example.com")
     );
     // Every R2 coherence rule is enforced after parsing, by `stateless_common::validate_r2_flags`,
-    // so that each error can name the flag — clap's own rejections cannot, this workspace having
-    // built it without `error-context`. Parsing therefore accepts all of these shapes; the rules
-    // and their messages are covered by that function's own tests.
+    // so that both binaries give the same verdict in the same words. Parsing therefore accepts all
+    // of these shapes; the rules and their messages are covered by that function's own tests.
     const DOMAIN: &str = "https://witness.example.com";
     for shape in [
         &["--r2-custom-domain", DOMAIN, "--r2-endpoint", "https://acc.r2.cloudflarestorage.com"][..],
@@ -217,7 +222,8 @@ fn r2_custom_domain_target_wiring() {
 #[test]
 fn blank_r2_values_reach_the_post_parse_rules() {
     let _guard = stateless_test_utils::env::env_lock();
-    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
+    let parse =
+        |extra: &[&str]| CommandLineArgs::try_parse_checked_from(BASE_ARGS.iter().chain(extra));
 
     for blank in [
         ["--r2-bucket", ""],
@@ -233,12 +239,33 @@ fn blank_r2_values_reach_the_post_parse_rules() {
     }
 }
 
+/// `--help` prints an env-backed flag's current value unless the flag sets `hide_env_values`,
+/// so every secret `RedactedSecret` keeps out of `Debug` must stay out of the help text too.
+#[test]
+fn help_hides_r2_secret_values() {
+    use stateless_test_utils::env::{env_lock, with_env_vars};
+    let guard = env_lock();
+    let vars = [
+        ("STATELESS_VALIDATOR_R2_ACCESS_CLIENT_ID", "leaked-client-id"),
+        ("STATELESS_VALIDATOR_R2_ACCESS_CLIENT_SECRET", "leaked-client-secret"),
+        ("STATELESS_VALIDATOR_R2_SECRET_ACCESS_KEY", "leaked-secret-access-key"),
+    ];
+    // clap reads the env when the command is built, so build it with all three set.
+    let help =
+        with_env_vars(&guard, &vars, || CommandLineArgs::command().render_long_help().to_string());
+    for (name, value) in vars {
+        assert!(help.contains(name), "help must still name {name}");
+        assert!(!help.contains(value), "help prints the value of {name}");
+    }
+}
+
 /// `canonical_chain_max_length` must reject 0 at parse time. A value of 0 would make
 /// `advance_chain` prune the entire canonical chain on every successful advance,
 /// rolling the pipeline back to the anchor each round and looping forever.
 #[test]
 fn canonical_chain_max_length_rejects_zero() {
-    let parse = |extra: &[&str]| CommandLineArgs::try_parse_from(BASE_ARGS.iter().chain(extra));
+    let parse =
+        |extra: &[&str]| CommandLineArgs::try_parse_checked_from(BASE_ARGS.iter().chain(extra));
 
     assert_eq!(parse(&[]).unwrap().canonical_chain_max_length, None);
     assert_eq!(
@@ -257,6 +284,115 @@ fn canonical_chain_max_length_rejects_zero() {
     assert!(from_env_zero.is_err(), "env-var 0 must also be rejected");
 }
 
+/// `--block-list` replays sparse heights on its own: it excludes every flag that describes a
+/// contiguous, chain-following run or reports upstream, needs the genesis named explicitly, and
+/// its tuning flags are rejected without it rather than inherited and ignored.
+#[test]
+fn block_list_flag_combinations() {
+    // The conflict rules read the environment too: hold the lock so a test that has
+    // `STATELESS_VALIDATOR_END_BLOCK` (or another conflicting variable) set cannot leak into
+    // these parses.
+    let env = stateless_test_utils::env::env_lock();
+    let parse =
+        |extra: &[&str]| CommandLineArgs::try_parse_checked_from(BASE_ARGS.iter().chain(extra));
+    let with_list = ["--block-list", "/tmp/pool.txt", "--genesis-file", "/tmp/genesis.json"];
+
+    let args = parse(&with_list).unwrap();
+    assert_eq!(args.block_list.as_deref(), Some(std::path::Path::new("/tmp/pool.txt")));
+    assert_eq!(parse(&[]).unwrap().block_list, None);
+
+    let tuned = parse(
+        &[
+            &with_list[..],
+            &[
+                "--block-list-timeout-secs",
+                "9",
+                "--block-list-concurrency",
+                "3",
+                "--block-list-output-dir",
+                "/tmp/out",
+            ],
+        ]
+        .concat(),
+    )
+    .unwrap();
+    assert_eq!(tuned.block_list_timeout_secs, 9);
+    // Unset, the timeout is the documented 300 s. That default does not count as setting the
+    // flag, or `parse(&[])` above would have failed its `requires`.
+    assert_eq!(parse(&with_list).unwrap().block_list_timeout_secs, 300);
+    assert_eq!(tuned.block_list_concurrency, Some(3));
+
+    // A stale genesis in the data dir must not be picked up silently.
+    assert!(parse(&["--block-list", "/tmp/pool.txt"]).is_err(), "genesis file is required");
+    // Chain-following and reporting flags cannot be combined with a sparse replay.
+    for conflicting in [
+        &["--start-block", TRUSTED_HASH][..],
+        &["--force-anchor"][..],
+        &["--end-block", "10"][..],
+        &["--report-validation-endpoint", "http://report"][..],
+    ] {
+        let argv = [&with_list[..], conflicting].concat();
+        assert!(parse(&argv).is_err(), "{conflicting:?} must conflict with --block-list");
+    }
+    // A switch conflicts only when it is on: an env template shared with the chain-following
+    // roles may render `FORCE_ANCHOR=false`, and that must not stop a block-list run.
+    let force_anchor_env = |value| {
+        stateless_test_utils::env::with_env_var(
+            &env,
+            "STATELESS_VALIDATOR_FORCE_ANCHOR",
+            value,
+            || parse(&with_list),
+        )
+    };
+    assert!(!force_anchor_env("false").unwrap().force_anchor);
+    assert!(force_anchor_env("true").is_err(), "an enabled switch still conflicts");
+    // Zero would time every block out on its first poll, or never start one.
+    for zero in [&["--block-list-timeout-secs", "0"][..], &["--block-list-concurrency", "0"][..]] {
+        let argv = [&with_list[..], zero].concat();
+        assert!(parse(&argv).is_err(), "{zero:?} must be rejected");
+    }
+    // Tuning flags mean nothing without a list.
+    for orphan in [
+        &["--block-list-timeout-secs", "9"][..],
+        &["--block-list-concurrency", "3"][..],
+        &["--block-list-output-dir", "/tmp/out"][..],
+    ] {
+        assert!(parse(orphan).is_err(), "{orphan:?} must require --block-list");
+    }
+}
+
+/// A well-formed block hash, for flags that only need one to parse.
+const TRUSTED_HASH: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+/// `--start-block` is a block hash, checked when the flags are parsed, and `--force-anchor` is
+/// a switch that needs it; both bind their documented env vars. Which combinations a data dir
+/// accepts is decided at startup against the stored chain (`anchor::startup_anchor`).
+#[test]
+fn anchor_flags_parse() {
+    let guard = stateless_test_utils::env::env_lock();
+    let parse =
+        |extra: &[&str]| CommandLineArgs::try_parse_checked_from(BASE_ARGS.iter().chain(extra));
+
+    let args = parse(&["--start-block", TRUSTED_HASH, "--force-anchor"]).unwrap();
+    assert_eq!(args.start_block, Some(TRUSTED_HASH.parse().unwrap()));
+    assert!(args.force_anchor);
+    let args = parse(&[]).unwrap();
+    assert_eq!((args.start_block, args.force_anchor), (None, false));
+    assert!(parse(&["--start-block", "0x01"]).is_err(), "a start block must be a full hash");
+    assert!(parse(&["--force-anchor"]).is_err(), "--force-anchor needs --start-block");
+
+    let from_env = stateless_test_utils::env::with_env_vars(
+        &guard,
+        &[
+            ("STATELESS_VALIDATOR_START_BLOCK", TRUSTED_HASH),
+            ("STATELESS_VALIDATOR_FORCE_ANCHOR", "true"),
+        ],
+        || parse(&[]).unwrap(),
+    );
+    assert_eq!(from_env.start_block, Some(TRUSTED_HASH.parse().unwrap()));
+    assert!(from_env.force_anchor);
+}
+
 const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
 
 /// Mock RPC server backing state: all fields pre-decoded so the RPC handlers can respond
@@ -264,13 +400,19 @@ const MAX_RESPONSE_BODY_SIZE: u32 = 1024 * 1024 * 100;
 struct MockServerState {
     fixtures: &'static TestFixtures,
     mpt_witnesses: HashMap<BlockHash, MptWitness>,
-    /// Every *accepted* `mega_setValidatedBlocks` call, as `(first_block, last_block)` numbers.
+    /// Every *accepted* `mega_setValidatedChain` call, as `(anchor, validated)` numbers.
     validated_reports: Arc<Mutex<Vec<(u64, u64)>>>,
-    /// Number of upcoming `mega_setValidatedBlocks` calls to reject with an RPC error.
+    /// Number of upcoming `mega_setValidatedChain` calls to reject with an RPC error.
     reject_reports: Arc<AtomicUsize>,
+    /// Number of upcoming `mega_setValidatedChain` calls to refuse with `accepted: false`, as a
+    /// receiver that does not hold the reported blocks yet answers.
+    refuse_reports: Arc<AtomicUsize>,
     /// Every `mega_getBlockWitness` call, so a test can tell whether the RPC witness path was
     /// used at all.
     witness_requests: Arc<AtomicUsize>,
+    /// Requested block number → the number whose block is served instead, to script an
+    /// endpoint that answers a by-number lookup with the wrong block.
+    number_aliases: HashMap<u64, u64>,
 }
 
 impl MockServerState {
@@ -285,7 +427,9 @@ impl MockServerState {
             mpt_witnesses,
             validated_reports: Arc::default(),
             reject_reports: Arc::default(),
+            refuse_reports: Arc::default(),
             witness_requests: Arc::default(),
+            number_aliases: HashMap::new(),
         }
     }
 
@@ -295,7 +439,8 @@ impl MockServerState {
         &self,
         hex_number: &str,
     ) -> Result<&Block<op_alloy_rpc_types::Transaction>, ErrorObject<'static>> {
-        let block_number = parse_hex_u64(hex_number);
+        let requested = parse_hex_u64(hex_number);
+        let block_number = self.number_aliases.get(&requested).copied().unwrap_or(requested);
         self.fixtures
             .block_numbers
             .get(&block_number)
@@ -435,26 +580,45 @@ async fn setup_mock_rpc_server(
             })
             .unwrap();
 
+        // The receiver's contract: `anchor < validated` or invalid params, and both blocks on
+        // its canonical chain (here: the fixtures) or `accepted: false` with nothing recorded.
         module
-            .register_method("mega_setValidatedBlocks", |params, ctx, _| {
-                let (first_block, last_block): ((u64, String), (u64, String)) =
-                    params.parse().unwrap();
-                if ctx
-                    .reject_reports
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok()
-                {
+            .register_method("mega_setValidatedChain", |params, ctx, _| {
+                let (anchor, validated): (BlockRef, BlockRef) = params.parse()?;
+                let take = |counter: &AtomicUsize| {
+                    counter
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok()
+                };
+                if take(&ctx.reject_reports) {
                     return Err(make_rpc_error(
                         CALL_EXECUTION_FAILED_CODE,
                         "transient report failure (scripted)".to_string(),
                     ));
                 }
-                ctx.validated_reports.lock().unwrap().push((first_block.0, last_block.0));
-                let last_hash: BlockHash = last_block.1.parse().unwrap();
-                Ok::<serde_json::Value, ErrorObjectOwned>(serde_json::json!({
-                    "accepted": true,
-                    "lastValidatedBlock": [last_block.0, last_hash]
-                }))
+                if anchor.block_number >= validated.block_number {
+                    return Err(make_rpc_error(INVALID_PARAMS_CODE, "anchor >= validated".into()));
+                }
+                let canonical = |block: &BlockRef| {
+                    ctx.fixtures.block_numbers.get(&block.block_number.to()) ==
+                        Some(&block.block_hash)
+                };
+                if take(&ctx.refuse_reports) || !canonical(&anchor) || !canonical(&validated) {
+                    return Ok(SetValidatedChainResponse {
+                        accepted: false,
+                        anchor: None,
+                        validated: None,
+                    });
+                }
+                ctx.validated_reports
+                    .lock()
+                    .unwrap()
+                    .push((anchor.block_number.to(), validated.block_number.to()));
+                Ok::<_, ErrorObject<'static>>(SetValidatedChainResponse {
+                    accepted: true,
+                    anchor: Some(anchor),
+                    validated: Some(validated),
+                })
             })
             .unwrap();
     })
@@ -588,12 +752,21 @@ async fn integration_test() {
     info!("Mock RPC server has been shut down");
 }
 
+/// How the mock receiver answers the first report calls of a slice run.
+#[derive(Clone, Copy)]
+enum FirstReports {
+    /// Fail this many with an RPC error.
+    Fail(usize),
+    /// Refuse this many with `accepted: false`.
+    Refuse(usize),
+}
+
 /// Runs `run_with_signals` to the fixtures' max block (`--end-block` → `sync_target`) with
-/// reports wired to the mock, failing the first `reject_first_reports` calls. Returns the run
-/// result, the accepted reports, and the slice's end block.
+/// reports wired to the mock, which answers the first ones as `first` scripts. Returns the run
+/// result, the accepted reports, and the slice's anchor and end block.
 async fn run_end_block_slice(
-    reject_first_reports: usize,
-) -> (eyre::Result<()>, Vec<(u64, u64)>, u64) {
+    first: FirstReports,
+) -> (eyre::Result<()>, Vec<(u64, u64)>, (u64, u64)) {
     let fx = TestFixtures::synthetic_shared();
     let genesis_file = fx.data_dir.join("genesis.json");
 
@@ -603,7 +776,10 @@ async fn run_end_block_slice(
         Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
     let state = MockServerState::new(fx);
     let reports = Arc::clone(&state.validated_reports);
-    state.reject_reports.store(reject_first_reports, std::sync::atomic::Ordering::SeqCst);
+    match first {
+        FirstReports::Fail(n) => state.reject_reports.store(n, Ordering::SeqCst),
+        FirstReports::Refuse(n) => state.refuse_reports.store(n, Ordering::SeqCst),
+    }
     let (handle, url) = setup_mock_rpc_server(state).await;
     let client = Arc::new(
         RpcClient::new_with_config(
@@ -629,22 +805,20 @@ async fn run_end_block_slice(
     handle.stop().unwrap();
 
     let reports = reports.lock().unwrap().clone();
-    (result, reports, max_block_number)
+    (result, reports, (fx.min_block().0, max_block_number))
 }
 
-/// [`run_end_block_slice`] + asserts the run succeeded and the last accepted report covers the
-/// end block; returns all accepted reports.
-async fn run_end_block_slice_and_assert_tip_reported(
-    reject_first_reports: usize,
-) -> Vec<(u64, u64)> {
-    let (result, reports, max_block_number) = run_end_block_slice(reject_first_reports).await;
+/// [`run_end_block_slice`] + asserts the run succeeded and the last accepted report is the whole
+/// validated chain, from the anchor to the end block; returns all accepted reports.
+async fn run_end_block_slice_and_assert_tip_reported(first: FirstReports) -> Vec<(u64, u64)> {
+    let (result, reports, chain) = run_end_block_slice(first).await;
     result.unwrap();
 
-    let &(_, last_reported) =
+    let &last_reported =
         reports.last().expect("the run must report validated blocks before exiting");
     assert_eq!(
-        last_reported, max_block_number,
-        "the final report must cover the end block (got reports: {reports:?})",
+        last_reported, chain,
+        "the final report must be (anchor, end block) (got reports: {reports:?})",
     );
     reports
 }
@@ -659,23 +833,198 @@ async fn end_block_run_reports_final_tip() {
     // shape. The scripted-failure twins stay silent, since their ERROR lines are just their
     // test script.
     let _logging = init_test_logging("stateless_validator");
-    run_end_block_slice_and_assert_tip_reported(0).await;
+    run_end_block_slice_and_assert_tip_reported(FirstReports::Fail(0)).await;
 }
 
-/// Like [`end_block_run_reports_final_tip`], but the mock rejects the first report call: the
-/// final flush's bounded retry must still land the tip.
+/// Like [`end_block_run_reports_final_tip`], but the mock fails the first report call, or
+/// refuses it as a receiver that does not hold the blocks yet does: the final flush's bounded
+/// retry must still land the tip.
 #[tokio::test]
 async fn end_block_final_report_retries_after_transient_failure() {
-    run_end_block_slice_and_assert_tip_reported(1).await;
+    run_end_block_slice_and_assert_tip_reported(FirstReports::Fail(1)).await;
+    run_end_block_slice_and_assert_tip_reported(FirstReports::Refuse(1)).await;
 }
 
 /// If the final flush cannot land within its bounded retries, an `--end-block` slice run must
 /// fail rather than exit 0: the slice has no later restart to re-report, so a clean exit would
-/// let an orchestrator record the slice as complete while upstream never saw the tip.
+/// let an orchestrator record the slice as complete while upstream never saw the tip. A
+/// receiver that keeps refusing the chain is no different from one that keeps failing.
 #[tokio::test]
 async fn end_block_run_fails_when_final_report_never_lands() {
-    let (result, reports, _) = run_end_block_slice(usize::MAX).await;
-    let err = result.expect_err("run must fail when the validated tail cannot be reported");
-    assert!(err.to_string().contains("final validation report failed"), "{err}");
-    assert!(reports.is_empty(), "mock rejected every report, yet some landed: {reports:?}");
+    for first in [FirstReports::Fail(usize::MAX), FirstReports::Refuse(usize::MAX)] {
+        let (result, reports, _) = run_end_block_slice(first).await;
+        let err = result.expect_err("run must fail when the validated tail cannot be reported");
+        assert!(err.to_string().contains("final validation report failed"), "{err}");
+        assert!(reports.is_empty(), "mock answered no report, yet some landed: {reports:?}");
+    }
+}
+
+/// A validator-shaped fetcher and processor over `url`, with their DB in `dir`. The DB has no
+/// anchor: block-list mode never needs one.
+fn block_list_parts(
+    dir: &std::path::Path,
+    url: &str,
+) -> (Arc<ValidatorFetcher>, Arc<ValidatorProcessor>) {
+    let genesis_file = TestFixtures::synthetic_shared().data_dir.join("genesis.json");
+    let validator_db = Arc::new(ValidatorDB::new(dir.join(VALIDATOR_DB_FILENAME)).unwrap());
+    let contract_cache =
+        Arc::new(ContractCache::new(Arc::clone(&validator_db) as Arc<dyn ContractStore>));
+    let chain_spec = Arc::new(
+        load_or_create_chain_spec(&validator_db, Some(genesis_file.to_str().unwrap())).unwrap(),
+    );
+    let client = Arc::new(RpcClient::new(&[url], &[url]).unwrap());
+    let fetcher = Arc::new(ValidatorFetcher::new(client.clone(), None));
+    let processor = Arc::new(ValidatorProcessor { chain_spec, contract_cache, rpc_client: client });
+    (fetcher, processor)
+}
+
+/// Replays `blocks` over the mock RPC, returning the outcomes in completion order and the
+/// summary. One block validates at a time whatever `concurrency` is, so a run with more blocks
+/// in flight than validate slots also exercises the wait for a slot.
+async fn replay_over_mock(
+    blocks: Vec<u64>,
+    block_timeout: Duration,
+    concurrency: usize,
+    number_aliases: HashMap<u64, u64>,
+) -> (Vec<BlockOutcome>, replay::ReplaySummary) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut state = MockServerState::new(TestFixtures::synthetic_shared());
+    state.number_aliases = number_aliases;
+    let (handle, url) = setup_mock_rpc_server(state).await;
+    let (fetcher, processor) = block_list_parts(temp_dir.path(), &url);
+
+    let config = ReplayConfig { concurrency, validate_concurrency: 1, block_timeout };
+    let mut outcomes = Vec::new();
+    let summary = replay::replay_block_list(fetcher, processor, blocks, &config, |outcome| {
+        outcomes.push(outcome.clone());
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    handle.stop().unwrap();
+    (outcomes, summary)
+}
+
+/// A sparse subset of the fixtures replays through the production fetch and validate path:
+/// every listed block is visited once, in any order, and nothing outside the list is touched.
+#[tokio::test]
+async fn block_list_replays_a_non_contiguous_subset() {
+    let fx = TestFixtures::synthetic_shared();
+    let every_other: Vec<u64> = fx.paired_blocks().into_iter().map(|(n, _)| n).step_by(2).collect();
+    assert!(every_other.len() >= 2, "the fixtures need at least three blocks to leave a gap");
+    let all: Vec<u64> = fx.paired_blocks().into_iter().map(|(n, _)| n).collect();
+    assert!(every_other.len() < all.len(), "the subset must skip some block");
+
+    let (outcomes, summary) =
+        replay_over_mock(every_other.clone(), Duration::from_secs(60), 4, HashMap::new()).await;
+
+    let mut seen: Vec<u64> = outcomes.iter().map(|o| o.number).collect();
+    seen.sort_unstable();
+    assert_eq!(seen, every_other, "exactly the listed blocks, each once");
+    for outcome in &outcomes {
+        assert_eq!(
+            outcome.status,
+            Status::Validated,
+            "block {} should validate: {:?}",
+            outcome.number,
+            outcome.message
+        );
+        assert_eq!(outcome.hash, Some(fx.block_numbers[&outcome.number]));
+    }
+    assert_eq!(
+        (summary.total, summary.validated(), summary.failed.len()),
+        (seen.len(), seen.len(), 0)
+    );
+}
+
+/// A block no endpoint can serve is retried forever by the RPC client; the per-block timeout is
+/// what ends it. It must be recorded as `fetch_timeout`, listed for retry, and not stop the run:
+/// with a single slot and the failing block first, the blocks behind it only run if a failure
+/// frees the slot and the run carries on.
+#[tokio::test]
+async fn an_unfetchable_block_times_out_without_stopping_the_run() {
+    let fx = TestFixtures::synthetic_shared();
+    let paired: Vec<u64> = fx.paired_blocks().into_iter().map(|(n, _)| n).collect();
+    let (first, last) = (paired[0], *paired.last().unwrap());
+    let missing = fx.max_block().0 + 1_000;
+
+    let (outcomes, summary) =
+        replay_over_mock(vec![missing, first, last], Duration::from_secs(2), 1, HashMap::new())
+            .await;
+
+    let status_of =
+        |n: u64| outcomes.iter().find(|o| o.number == n).map(|o| o.status).expect("outcome");
+    assert_eq!(status_of(first), Status::Validated);
+    assert_eq!(status_of(last), Status::Validated);
+    assert_eq!(status_of(missing), Status::FetchTimeout);
+    // A timeout says nothing about the block, so it is marked for retry; a pass never is.
+    for outcome in &outcomes {
+        assert_eq!(outcome.retryable, outcome.number == missing, "{outcome:?}");
+    }
+    assert_eq!((summary.total, summary.validated(), summary.failed.len()), (3, 2, 1));
+    assert_eq!(
+        parse_block_list(&summary.failed_list()).unwrap(),
+        vec![missing],
+        "the retry list names exactly the block that did not validate",
+    );
+}
+
+/// An endpoint that answers the lookup for one height with another height's block must not turn
+/// into a pass for the height that was asked for. The RPC client refuses such a header and keeps
+/// retrying, so the block ends as `fetch_timeout`; the block served in its place is never
+/// validated on its behalf.
+#[tokio::test]
+async fn a_block_served_for_the_wrong_height_is_not_counted_as_validated() {
+    let fx = TestFixtures::synthetic_shared();
+    let paired: Vec<u64> = fx.paired_blocks().into_iter().map(|(n, _)| n).collect();
+    let (asked, served) = (paired[0], *paired.last().unwrap());
+    assert_ne!(asked, served);
+
+    let (outcomes, summary) =
+        replay_over_mock(vec![asked], Duration::from_secs(2), 1, HashMap::from([(asked, served)]))
+            .await;
+
+    let [outcome] = outcomes.as_slice() else { panic!("one outcome expected: {outcomes:?}") };
+    assert_eq!(outcome.status, Status::FetchTimeout, "{outcome:?}");
+    assert_eq!(outcome.hash, None, "no block was accepted for the height");
+    assert_eq!((summary.validated(), summary.failed.len()), (0, 1));
+}
+
+/// The chain-head read before the first block retries forever like every RPC call, so it is
+/// bounded by the per-block timeout: an unreachable endpoint fails the run instead of hanging it.
+/// That failure, like any interruption, must not leave the previous run's retry list beside this
+/// run's results, where it would be passed back as `--block-list` in place of this run's.
+#[tokio::test]
+async fn an_unreachable_head_fails_the_run_without_a_stale_retry_list() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let dir = temp_dir.path();
+    // Nothing listens on port 1, so every attempt is refused and retried.
+    let (fetcher, processor) = block_list_parts(dir, "http://127.0.0.1:1");
+
+    let list = dir.join("list.txt");
+    let results = dir.join(replay::RESULTS_FILE);
+    let failed = dir.join(replay::RETRY_FILE);
+    std::fs::write(&list, "1\n2\n").unwrap();
+    // What a previous run left behind.
+    std::fs::write(&results, "{\"block\":5}\n").unwrap();
+    std::fs::write(&failed, "5\n9\n").unwrap();
+
+    let config = ReplayConfig {
+        concurrency: 2,
+        validate_concurrency: 1,
+        block_timeout: Duration::from_secs(1),
+    };
+    let err = tokio::time::timeout(
+        Duration::from_secs(30),
+        replay::run(&list, dir, fetcher, processor, &config),
+    )
+    .await
+    .expect("the head read must be bounded")
+    .unwrap_err();
+
+    assert!(format!("{err:#}").contains("chain head"), "{err:#}");
+    assert_eq!(std::fs::read_to_string(&results).unwrap(), "", "results are truncated");
+    let retry = std::fs::read_to_string(&failed).unwrap();
+    assert!(parse_block_list(&retry).unwrap().is_empty(), "stale retry list left: {retry:?}");
 }
