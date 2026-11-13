@@ -522,7 +522,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-serde",
  "alloy-sol-types",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "serde",
  "serde_json",
  "serde_with",
@@ -686,7 +686,7 @@ checksum = "f0b7b1f0e528ae788d05937f5b351afae3b4c1e08f17a061d868bd28e56aa9e3"
 dependencies = [
  "alloy-json-rpc",
  "alloy-transport",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "reqwest",
  "serde_json",
  "tower",
@@ -3539,7 +3539,7 @@ dependencies = [
 [[package]]
 name = "mega-evm"
 version = "1.7.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=7574376477f9731e6a4c9ab27cdc930d30cbe36d#7574376477f9731e6a4c9ab27cdc930d30cbe36d"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=044e76f9ef890de8e8885ddc5e47b8416f5e2c58#044e76f9ef890de8e8885ddc5e47b8416f5e2c58"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3567,7 +3567,7 @@ dependencies = [
 [[package]]
 name = "mega-system-contracts"
 version = "1.7.1"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=7574376477f9731e6a4c9ab27cdc930d30cbe36d#7574376477f9731e6a4c9ab27cdc930d30cbe36d"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?rev=044e76f9ef890de8e8885ddc5e47b8416f5e2c58#044e76f9ef890de8e8885ddc5e47b8416f5e2c58"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
