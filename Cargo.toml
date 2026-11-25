@@ -42,7 +42,7 @@ alloy-trie = { version = "0.9.4", default-features = false }
 
 # mega
 mega-evm = { git = "https://github.com/megaeth-labs/mega-evm.git", tag = "v1.7.3", default-features = false }
-salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "da2f46bfc5e8266c68945b48925e13f5532d089c", default-features = false }
+salt = { git = "https://github.com/megaeth-labs/salt.git", rev = "66d302ab617b30ac5d3fd4c5bdf960c4d64e3a3c", default-features = false }
 
 # op
 # Every crate below is pinned to the same Optimism monorepo revision as the mega-evm
