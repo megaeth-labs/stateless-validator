@@ -522,7 +522,7 @@ dependencies = [
  "alloy-rlp",
  "alloy-serde",
  "alloy-sol-types",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "serde",
  "serde_json",
  "serde_with",
@@ -686,7 +686,7 @@ checksum = "f0b7b1f0e528ae788d05937f5b351afae3b4c1e08f17a061d868bd28e56aa9e3"
 dependencies = [
  "alloy-json-rpc",
  "alloy-transport",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "reqwest",
  "serde_json",
  "tower",
@@ -736,6 +736,12 @@ name = "anstyle"
 version = "1.0.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5192cca8006f1fd4f7237516f40fa183bb07f8fbdfedaa0036de5ea9b0b45e78"
+
+[[package]]
+name = "anyhow"
+version = "1.0.105"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2cb931c189b85683d69a5cfad41d4d418671e1ac413dd209f3f2fc31e3cfd902"
 
 [[package]]
 name = "ark-bls12-381"
@@ -3538,8 +3544,8 @@ dependencies = [
 
 [[package]]
 name = "mega-evm"
-version = "1.7.3"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?tag=v1.7.3#59b8e391ee6c8ddfdaf9cf3081878965c9111353"
+version = "1.7.4"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?tag=v1.7.4#cdcc66e4a29ba4655d37d79d22f1f23b4bda44c4"
 dependencies = [
  "alloy-consensus",
  "alloy-eips",
@@ -3566,11 +3572,12 @@ dependencies = [
 
 [[package]]
 name = "mega-system-contracts"
-version = "1.7.3"
-source = "git+https://github.com/megaeth-labs/mega-evm.git?tag=v1.7.3#59b8e391ee6c8ddfdaf9cf3081878965c9111353"
+version = "1.7.4"
+source = "git+https://github.com/megaeth-labs/mega-evm.git?tag=v1.7.4#cdcc66e4a29ba4655d37d79d22f1f23b4bda44c4"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
+ "anyhow",
  "semver 1.0.27",
  "serde",
  "serde_json",
