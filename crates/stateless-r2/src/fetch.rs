@@ -84,8 +84,9 @@ pub enum R2GetError {
     /// Transport-level failure (connection reset/timeout) — the endpoint is effectively
     /// unreachable. Retried internally with backoff before surfacing.
     Transport { number: u64, key: String, source: reqwest::Error },
-    /// R2 asked us to slow down (429) or returned a server-side error (5xx, including R2's
-    /// 503 overload / SlowDown). Retried internally with backoff before surfacing.
+    /// R2 rate-limited us (429, `TooManyRequests`) or returned a server-side error (5xx,
+    /// including R2's 503 `ServiceUnavailable`, a temporary unavailability rather than a rate
+    /// limit). Retried internally with backoff before surfacing.
     Throttled { number: u64, key: String, status: u16, body: String },
     /// A non-success status unlikely to clear on retry: a 4xx other than 429 (e.g. 403 bad
     /// credentials, 404 NoSuchBucket) or a 3xx (redirects are never followed — see
@@ -1106,7 +1107,9 @@ mod tests {
 
     #[tokio::test]
     async fn throttled_5xx_retries_until_a_deterministic_answer() {
-        let (endpoint, hits) = mock_r2(vec![(503, "SlowDown"), (503, "SlowDown"), (403, "")]).await;
+        let (endpoint, hits) =
+            mock_r2(vec![(503, "ServiceUnavailable"), (503, "ServiceUnavailable"), (403, "")])
+                .await;
         let err = fetch(&endpoint).await.unwrap_err();
         assert!(matches!(err, R2GetError::Status { status: 403, .. }), "{err}");
         assert_eq!(hits.load(Ordering::SeqCst), 3, "5xx must be retried, 4xx must stop the loop");
@@ -1116,7 +1119,7 @@ mod tests {
     /// the throttled first attempt and the second must be at least 50ms (jitter only adds).
     #[tokio::test]
     async fn retries_are_paced_by_the_injected_pacing() {
-        let (endpoint, hits) = mock_r2(vec![(503, "SlowDown"), (404, "")]).await;
+        let (endpoint, hits) = mock_r2(vec![(503, "ServiceUnavailable"), (404, "")]).await;
         let fetcher = fetcher_with(
             &endpoint,
             None,
