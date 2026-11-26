@@ -2254,7 +2254,7 @@ mod tests {
         let log = order.lock().unwrap();
         assert_eq!(log.len(), 2 * CALLS, "each call runs one full round hitting both: {log:?}");
         // A at every even index, B at every odd index — primary strictly precedes backup.
-        for chunk in log.chunks_exact(2) {
+        for chunk in log.as_chunks::<2>().0 {
             assert_eq!(chunk, &['A', 'B'], "primary must be hit before backup each round");
         }
 

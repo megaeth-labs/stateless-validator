@@ -587,7 +587,7 @@ async fn setup_mock_rpc_server(
                 let (anchor, validated): (BlockRef, BlockRef) = params.parse()?;
                 let take = |counter: &AtomicUsize| {
                     counter
-                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                         .is_ok()
                 };
                 if take(&ctx.reject_reports) {

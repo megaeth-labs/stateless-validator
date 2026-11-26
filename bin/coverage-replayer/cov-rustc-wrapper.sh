@@ -10,7 +10,9 @@
 #     flag. Nothing outside the workspace depends on mega-evm, so nothing else can
 #     instantiate it.
 # Need not be: registry crates depending on the measured revm crates (alloy-evm, revm, a
-# few reth crates); what they instantiate is over their own types, off mega-evm's path.
+# few reth crates), or the upstream crates under vendor/, which sit inside the workspace
+# directory without being members; what they instantiate is over their own types, off
+# mega-evm's path.
 # Host artifacts (build scripts, proc-macros) are skipped, or each run drops a
 # default_*.profraw into the source tree; they are the rustc invocations without
 # `--target`, which is why the build line passes one.
@@ -33,6 +35,7 @@ done
 instrument=no
 if [ "$targeted" = yes ]; then
     case "${CARGO_MANIFEST_DIR:-}" in
+    "$workspace"/vendor/*) ;;
     */git/checkouts/mega-evm-* | "$workspace" | "$workspace"/*) instrument=yes ;;
     esac
     if [ "$instrument" = no ] && [ -n "${CARGO_PKG_NAME:-}" ] &&

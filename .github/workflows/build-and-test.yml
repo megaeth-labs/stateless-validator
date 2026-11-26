@@ -41,7 +41,9 @@ jobs:
       - name: Run Codespell
         uses: codespell-project/actions-codespell@v2
         with:
-          skip: ./target,*.zst
+          skip: ./target,*.zst,./vendor
+      - name: Check the vendored crate copies against vendor/SHA256SUMS
+        run: vendor/check.sh
 
   test:
     runs-on: ubuntu-24.04

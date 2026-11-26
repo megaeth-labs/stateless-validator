@@ -1520,6 +1520,45 @@ mod tests {
         );
     }
 
+    /// An unsupported tracer, on its own or as a `muxTracer` child, is refused with the same
+    /// `-32602` before any block data is looked up, on every opts-taking method. The block and
+    /// transaction named here are unavailable: the upstream of [`test_context`] never answers,
+    /// so a request that reached the lookup would fail with a lookup error instead.
+    #[tokio::test]
+    async fn unsupported_tracers_are_refused_before_block_lookup() {
+        let ctx = test_context(None, None, ChainSpec::default());
+        let unavailable = B256::repeat_byte(0xee);
+        for (opts, label) in [
+            (serde_json::json!({"tracer": "stateGasTracer"}), "state_gas_tracer"),
+            (
+                serde_json::json!({"tracer": "muxTracer", "tracerConfig": {"stateGasTracer": null}}),
+                "state_gas_tracer",
+            ),
+            (serde_json::json!({"tracer": "erc7562Tracer"}), "erc7562_tracer"),
+            (
+                serde_json::json!({"tracer": "muxTracer", "tracerConfig": {"erc7562Tracer": {}}}),
+                "erc7562_tracer",
+            ),
+        ] {
+            let opts: GethDebugTracingOptions = serde_json::from_value(opts).unwrap();
+            let errors = [
+                ctx.trace_block_by_hash(unavailable, Some(opts.clone())).await.unwrap_err(),
+                ctx.trace_block_by_number(BlockNumberOrTag::Number(u64::MAX), Some(opts.clone()))
+                    .await
+                    .unwrap_err(),
+                ctx.trace_transaction(unavailable, Some(opts.clone())).await.unwrap_err(),
+            ];
+            for err in errors {
+                assert_eq!(err.code(), jsonrpsee::types::error::INVALID_PARAMS_CODE, "{err:?}");
+                assert!(
+                    err.message().contains(&format!("unsupported tracer: {label}")),
+                    "message: {}",
+                    err.message(),
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_timed_alias_duplicate_rejected() {
         // Registering the same alias twice should fail

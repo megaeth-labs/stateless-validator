@@ -219,12 +219,14 @@ impl RequestShape {
     ///
     /// Bypassed: JS tracers (the response depends on the tracer source, which has no place
     /// in a bounded key), `muxTracer`, and struct-logger requests with non-default
-    /// `opts.config`. The unimplemented `erc7562Tracer` classifies as [`Self::Unsupported`]
-    /// and is rejected at the gate.
+    /// `opts.config`. The unimplemented `erc7562Tracer` and `stateGasTracer` classify as
+    /// [`Self::Unsupported`], on their own or as a `muxTracer` child, and are rejected at the
+    /// gate. The tracer is the one the executor runs, so an empty tracer name classifies as
+    /// the default struct logger, see [`crate::tracing_executor::requested_tracer`].
     pub fn classify(opts: &GethDebugTracingOptions) -> Self {
         use alloy_rpc_types_trace::geth::{GethDebugBuiltInTracerType, GethDebugTracerType};
 
-        match &opts.tracer {
+        match crate::tracing_executor::requested_tracer(opts) {
             None => {
                 let pure_default = opts.tracer_config.is_null() &&
                     opts.config == GethDefaultTracingOptions::default();
@@ -261,12 +263,31 @@ impl RequestShape {
                 }
                 // Exhaustive on purpose: a future alloy builtin variant must make an
                 // explicit cache-whitelist decision here instead of silently bypassing.
-                GethDebugBuiltInTracerType::MuxTracer => Self::Bypass("mux_tracer"),
+                GethDebugBuiltInTracerType::MuxTracer => Self::classify_mux(opts),
                 GethDebugBuiltInTracerType::Erc7562Tracer => {
                     Self::Unsupported { label: "erc7562_tracer" }
                 }
+                GethDebugBuiltInTracerType::StateGasTracer => {
+                    Self::Unsupported { label: "state_gas_tracer" }
+                }
             },
             Some(GethDebugTracerType::JsTracer(_)) => Self::Bypass("js_tracer"),
+        }
+    }
+
+    /// Classifies a `muxTracer` request: a child this server does not implement makes the
+    /// request [`Self::Unsupported`] under that tracer's own label, as if it had been sent on
+    /// its own; any other mux request bypasses the cache. The children are the keys of the
+    /// raw `tracerConfig` object, so a child with a `null` config counts, and a malformed
+    /// config still reaches the executor's own mux parse.
+    fn classify_mux(opts: &GethDebugTracingOptions) -> Self {
+        let children = &opts.tracer_config.0;
+        if children.get("erc7562Tracer").is_some() {
+            Self::Unsupported { label: "erc7562_tracer" }
+        } else if children.get("stateGasTracer").is_some() {
+            Self::Unsupported { label: "state_gas_tracer" }
+        } else {
+            Self::Bypass("mux_tracer")
         }
     }
 
@@ -777,6 +798,26 @@ mod tests {
         assert_eq!(unique.len(), variants.len());
     }
 
+    /// An empty tracer name classifies as the default struct logger, sharing its cache entry,
+    /// as an omitted one does; a non-empty JS tracer still bypasses the cache.
+    #[test]
+    fn classify_empty_tracer_name_as_the_default_struct_logger() {
+        let empty = GethDebugTracingOptions {
+            tracer: Some(GethDebugTracerType::JsTracer(String::new())),
+            ..Default::default()
+        };
+        let omitted = GethDebugTracingOptions::default();
+        assert_eq!(variant_of(&empty), ResponseVariant::Default);
+        assert_eq!(variant_of(&empty), variant_of(&omitted));
+        assert_eq!(RequestShape::classify(&empty).label(), "default");
+
+        let js = GethDebugTracingOptions {
+            tracer: Some(GethDebugTracerType::JsTracer("{}".to_string())),
+            ..Default::default()
+        };
+        assert!(matches!(RequestShape::classify(&js), RequestShape::Bypass("js_tracer")));
+    }
+
     /// The classification is the single source of truth: every label is registered for
     /// metrics, and "cacheable" is exactly the complement of the bypass/invalid shapes.
     #[test]
@@ -827,13 +868,43 @@ mod tests {
         assert_eq!(shape.label(), "call_tracer");
         assert!(shape.cache_variant().is_none());
 
-        // The unsupported erc7562Tracer likewise: registered label, neither cacheable
-        // nor bypass (the gate rejects it before execution).
-        let shape =
-            RequestShape::classify(&builtin_opts(GethDebugBuiltInTracerType::Erc7562Tracer));
-        assert_eq!(shape.label(), "erc7562_tracer");
-        assert!(crate::metrics::REQUEST_SHAPES.contains(&shape.label()));
-        assert!(shape.cache_variant().is_none());
+        // The unsupported erc7562Tracer and stateGasTracer likewise: registered label,
+        // neither cacheable nor bypass (the gate rejects them before execution).
+        for (tracer, label) in [
+            (GethDebugBuiltInTracerType::Erc7562Tracer, "erc7562_tracer"),
+            (GethDebugBuiltInTracerType::StateGasTracer, "state_gas_tracer"),
+        ] {
+            let shape = RequestShape::classify(&builtin_opts(tracer));
+            assert!(matches!(shape, RequestShape::Unsupported { .. }), "{label}");
+            assert_eq!(shape.label(), label);
+            assert!(crate::metrics::REQUEST_SHAPES.contains(&shape.label()));
+            assert!(shape.cache_variant().is_none());
+        }
+    }
+
+    /// A `muxTracer` with an unsupported child classifies as that child does on its own, under
+    /// the child's label, whatever its config and whatever other children it has; a mux
+    /// without one still bypasses the cache.
+    #[test]
+    fn classify_mux_with_unsupported_child_as_unsupported() {
+        let mux =
+            |config: serde_json::Value| with_config(GethDebugBuiltInTracerType::MuxTracer, config);
+        for (config, label) in [
+            (json!({"stateGasTracer": null}), "state_gas_tracer"),
+            (json!({"stateGasTracer": {}}), "state_gas_tracer"),
+            (json!({"callTracer": {}, "stateGasTracer": null}), "state_gas_tracer"),
+            (json!({"erc7562Tracer": null}), "erc7562_tracer"),
+            (json!({"erc7562Tracer": {}, "callTracer": {}}), "erc7562_tracer"),
+        ] {
+            let shape = RequestShape::classify(&mux(config.clone()));
+            assert!(matches!(shape, RequestShape::Unsupported { .. }), "{config}");
+            assert_eq!(shape.label(), label, "{config}");
+            assert!(shape.cache_variant().is_none(), "{config}");
+        }
+        for config in [json!({"callTracer": {}}), json!({"callTracer": {}, "4byteTracer": null})] {
+            let shape = RequestShape::classify(&mux(config.clone()));
+            assert!(matches!(shape, RequestShape::Bypass("mux_tracer")), "{config}");
+        }
     }
 
     /// Key identity (Eq + Hash, exercised through a `HashSet`) discriminates on every

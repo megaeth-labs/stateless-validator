@@ -522,6 +522,7 @@ pub const REQUEST_SHAPES: &[&str] = &[
     "js_tracer",
     "mux_tracer",
     "erc7562_tracer",
+    "state_gas_tracer",
     "rejected",
 ];
 
