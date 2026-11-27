@@ -6,9 +6,10 @@ name: Release Settle
 #            notes from the commits since the previous tag and open or update
 #            a reviewed `chore/release-settle-vX.Y.Z` PR onto the release
 #            branch with the changelog entry;
-#   publish  that settle PR was just merged: create the annotated tag at the
-#            merge commit and the GitHub Release with the changelog section
-#            as notes.
+#   publish  that settle PR was just merged: build both binaries, then create
+#            the annotated tag at the merge commit and the GitHub Release with
+#            the changelog section as notes, and the binaries plus a SHA256SUMS
+#            file as downloads.
 # Merging the settle PR is the release decision on a push. Dispatch with
 # `version` to publish a clean release branch (no settle PR needed), or to
 # refresh it when settlement is needed; a blank version refreshes every
@@ -21,6 +22,11 @@ name: Release Settle
 # GitHub Release. The app is a bypass actor on the `v*` tag ruleset only; the
 # `release-*` branch ruleset still requires the reviewed settle PR. `route` is
 # read-only and uses the job token.
+#
+# Releases are immutable once published, so the downloads cannot be added
+# afterwards: `build` makes them first and `release-publish` attaches them as
+# part of publishing. A failed build therefore publishes nothing, and a re-run
+# builds again before it can resume a half-finished publish.
 #
 # The settle PR carries no labels: the `compat:*` label required by the
 # Compatibility Label Check is a per-release judgement, so the reviewer adds
@@ -38,7 +44,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to refresh (X.Y.Z); blank: every eligible release branch"
+        description: "Version to settle (X.Y.Z); blank: refresh every eligible release branch"
         required: false
         type: string
         default: ""
@@ -58,6 +64,7 @@ jobs:
       settle_source: ${{ steps.route.outputs.settle_source }}
       targets: ${{ steps.route.outputs.targets }}
       release_branch: ${{ steps.route.outputs.release_branch }}
+      version: ${{ steps.route.outputs.version }}
       commit: ${{ steps.route.outputs.commit }}
       pr_number: ${{ steps.route.outputs.pr_number }}
     steps:
@@ -114,8 +121,67 @@ jobs:
           version_pattern: toml
           changelog_file: CHANGELOG.md
 
-  publish:
+  # The binaries the Release carries, and the ones on-release.yml archives to
+  # the registry. No environment and no release credentials: this compiles the
+  # commit being published, before the reviewer is asked to approve it.
+  # A dispatch from main runs this job in main's cache scope, so it gets no
+  # cache access: the routed commit's build scripts must not be able to write
+  # caches that later runs restore. CodeQL's cache-poisoning query does not
+  # model `cache-mode`.
+  build:
     needs: route
+    cache-mode: none
+    if: needs.route.outputs.action == 'publish'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.route.outputs.commit }}
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+
+      - uses: foundry-rs/foundry-toolchain@b00af27efadbc7b4ca8b82abbd903b17cc874d2a # v1
+        with:
+          cache: false
+
+      - name: Build
+        run: cargo build --release --locked --bin stateless-validator --bin debug-trace-server
+
+      # stateless-validator carries a clap version (`#[clap(version)]`), so
+      # it is a gate: the built binary must report the version being released,
+      # which also catches a release branch / Cargo.toml mismatch.
+      - uses: megaeth-labs/.github/.github/actions/release-verify-version@main
+        with:
+          command: target/release/stateless-validator --version
+          version: ${{ needs.route.outputs.version }}
+
+      # debug-trace-server carries a clap version too (added for this gate).
+      # The workspace builds clap without its `help` feature, so `--version`
+      # is the only flag either binary answers; `--help` is an error.
+      - uses: megaeth-labs/.github/.github/actions/release-verify-version@main
+        with:
+          command: target/release/debug-trace-server --version
+          version: ${{ needs.route.outputs.version }}
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-binaries
+          path: |
+            target/release/stateless-validator
+            target/release/debug-trace-server
+          if-no-files-found: error
+          # Must outlive the wait for the reviewer, which GitHub allows to run
+          # for 30 days.
+          retention-days: 30
+
+  publish:
+    needs: [route, build]
     if: needs.route.outputs.action == 'publish'
     # One publish per release branch: the tag guard and the tag push are two
     # steps, so a re-run must queue behind a run in flight, never overlap it.
@@ -141,6 +207,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # After the checkout, which cleans the workspace.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-binaries
+          path: release-binaries
+
       - uses: megaeth-labs/.github/.github/actions/release-publish@main
         with:
           token: ${{ steps.release-token.outputs.token }}
@@ -151,3 +223,6 @@ jobs:
           version_file: Cargo.toml
           version_pattern: toml
           changelog_file: CHANGELOG.md
+          asset_files: |
+            release-binaries/stateless-validator
+            release-binaries/debug-trace-server
